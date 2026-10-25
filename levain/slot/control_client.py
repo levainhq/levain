@@ -29,6 +29,7 @@ from typing import Callable, Iterator, Union
 
 from levain.slot import Refused
 from levain.slot.control import FrameMalformed, FrameTooLarge, encode_frame, read_frame
+from levain.slot.events import check_event
 
 #: CONTRACT §11 V23: the window a ``locked`` refusal is retried in.
 V23_SECONDS = 10.0
@@ -284,8 +285,9 @@ def _stream_frame(obj: dict) -> Frame | None:
         return Reset(obj["newest_seq"])
     if kind == "error" and type(obj.get("error")) is str:
         return StreamError(obj["error"])
-    if type(kind) is str and kind not in ("hello", "gap", "reset", "error") and _int(obj.get("seq")):
-        return Event(obj["seq"], kind, obj)
+    # a stored event is the server's levain-session-event/1 object, checked by the server's own checker
+    if kind not in ("hello", "gap", "reset", "error") and check_event(obj) is None:
+        return Event(obj["seq"], obj["kind"], obj)
     return None
 
 

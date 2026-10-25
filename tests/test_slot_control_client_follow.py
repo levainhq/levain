@@ -134,3 +134,12 @@ def test_refusals_by_name(served):
                                  {"kind": "error", "error": 7}, {"kind": "reset", "newest_seq": -1}])
 def test_a_frame_off_the_wire_shape_is_none(obj):
     assert CC._stream_frame(obj) is None
+
+
+@pytest.mark.parametrize("frame", [{"kind": "bogus", "seq": 1, "at": "2026-10-25T00:00:00Z"},
+                                   {"kind": "pool", "seq": 0, "at": "2026-10-25T00:00:00Z"},
+                                   {"kind": "state", "seq": 3}])
+def test_a_stored_event_off_the_session_event_schema_is_no_frame(frame):
+    """An event frame is checked against levain-session-event/1 (events.check_event, one home): an unknown kind, a
+    seq below 1 or a missing field is off the wire's shape, so the stream ends BROKEN with the cursor unmoved."""
+    assert CC._stream_frame(frame) is None
