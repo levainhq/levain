@@ -694,6 +694,80 @@ def test_quarantine_and_a_refused_envelope_are_counted_in_keys_status(monkeypatc
     assert len(ack["refs"]) == 2 and [q["field"] for q in ack["quarantined"]] == ["tokens_in"]
 
 
+def test_a_malformed_ack_triple_is_not_an_ack_and_never_raises():
+    # r1 F3 (a): `triple_of` takes only the on-disk triple shape (32-hex `ledger` and `epoch`, int `ref` >= 1); any
+    # other answer is None, never a raise (an unhashable `ledger` once raised TypeError and killed the sender)
+    t = ("a" * 32, "b" * 32, 1)
+    good = {"ledger": t[0], "epoch": t[1], "ref": 1}
+    assert K.read_lineage_ack({"ok": True, "acked": [good], "quarantined": []}, [t]) == ([t], {})
+    for v in [dict(good, ledger=[]), dict(good, epoch={}), dict(good, ledger="A" * 32), dict(good, epoch="b" * 31),
+              dict(good, ref=0), dict(good, ref=True), dict(good, ref="1"), dict(good, ref=[1])]:
+        assert K.read_lineage_ack({"ok": True, "acked": [v], "quarantined": []}, [t]) is None, v
+        assert K.read_lineage_ack({"ok": True, "acked": [good], "quarantined": [{"source": v, "field": "x"}]},
+                                  [t]) is None, v
+
+
+def _first_append(monkeypatch, change):
+    """CONTROL's first `LINEAGE-APPEND` answer passed through `change` (the rest as CONTROL gave them)."""
+    real = K.Keys._attach_call
+    n = {"n": 0}
+
+    async def call(self, att, op, args, wait=None):
+        ans = await real(self, att, op, args, wait)
+        if op == "LINEAGE-APPEND" and n["n"] == 0 and ans is not None:
+            n["n"] += 1
+            return change(ans)
+        return ans
+
+    monkeypatch.setattr(K.Keys, "_attach_call", call)
+    return n
+
+
+def test_a_malformed_ack_does_not_stop_the_sender(monkeypatch):
+    # r1 F3 (a): an ack whose triple's `ledger` is a list is not an ack: noted, the envelope sent again after
+    # `lineage_retry_s`, the outbox drains on the same attachment, and the FAILURE note clears after the good cycle
+    n = _first_append(monkeypatch, lambda a: dict(a, acked=[dict(a["acked"][0], ledger=[])] + a["acked"][1:]))
+
+    async def fn(ctl, k, led, spy):
+        att = k.attached
+        await until(lambda: led.outbox_size == 0, 10, "drained")
+        await until(lambda: k.lineage_failure is None, 5, "the note cleared")
+        return att is k.attached, k.lineage_status(), len(ctl.rows())
+
+    async def prefill(led):
+        await fill(led, [good_row(), good_row()])
+
+    same, status, rows = delivery(fn, prefill=prefill, lineage_retry_s=0.05)
+    assert n["n"] == 1 and same and rows == 2
+    assert status["envelopes_refused"] == 1 and status["outbox"] == 0 and status["failure"] is None
+
+
+def test_an_ack_the_ledger_cannot_take_is_retried_not_the_end_of_the_sender(monkeypatch):
+    # r1 F3 (b): an exception from `led.ack` is noted and the envelope retried after `lineage_retry_s` (the outbox
+    # still holds its triples), never the sender's exit
+    async def fn(ctl, k, led, spy):
+        await until(lambda: led.outbox_size == 0, 10, "drained")
+        await until(lambda: k.lineage_failure is None, 5, "the note cleared")
+        return calls["n"], k.lineage_status(), len(ctl.rows())
+
+    calls = {"n": 0}
+
+    async def prefill(led):
+        await fill(led, [good_row()])
+        real = led.ack
+
+        def ack(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise L.LedgerUnavailable("a test's failed ack")
+            return real(*a, **kw)
+
+        led.ack = ack
+
+    n, status, rows = delivery(fn, prefill=prefill, lineage_retry_s=0.05)
+    assert n >= 2 and status["outbox"] == 0 and status["failure"] is None and rows == 1
+
+
 def test_new_lines_are_sent_as_they_become_durable():
     # R4 §3: after the resend, each new payload line is sent once its line is durable (the ledger's listener)
     async def fn(ctl, k, led, spy):

@@ -371,6 +371,7 @@ def lineage_envelope(items: Sequence[Tuple[Tuple[str, str, int], object]],
 
 
 _LEDGER_FIELD = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
+_HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 
 
 def read_lineage_ack(ans: dict, sent: Sequence[Tuple[str, str, int]]
@@ -386,10 +387,16 @@ def read_lineage_ack(ans: dict, sent: Sequence[Tuple[str, str, int]]
     mine = set(sent)
 
     def triple_of(v: object) -> Optional[Tuple[str, str, int]]:
+        # r1 F3: the on-disk triple shape only (32-hex ledger and epoch, an int ref >= 1), checked before the
+        # membership test, so a malformed answer is None and never a raise (an unhashable value once was)
         if type(v) is not dict or set(v) != {"ledger", "epoch", "ref"}:
             return None
-        t = (v["ledger"], v["epoch"], v["ref"])
-        return t if type(t[2]) is int and t in mine else None
+        lid, ep, ref = v["ledger"], v["epoch"], v["ref"]
+        if type(lid) is not str or _HEX32.fullmatch(lid) is None or type(ep) is not str \
+                or _HEX32.fullmatch(ep) is None or type(ref) is not int or ref < 1:
+            return None
+        t = (lid, ep, ref)
+        return t if t in mine else None
 
     out: List[Tuple[str, str, int]] = []
     for v in acked:
@@ -1629,7 +1636,9 @@ class Keys:
         one fsync). An envelope CONTROL refuses (`lineage-record:envelope`: a keys bug; `lineage-unavailable`: its sink
         is poisoned until it restarts) or an answer that is not an ack is counted (`lineage_envelopes_refused`) and
         noted as a FAILURE (H6-8); no answer within V23 is noted only. Either way the envelope is sent again after
-        `lineage_retry_s`: the outbox keeps it, so nothing is lost and the attachment stays up. A ledger that fails the ack line stops the sender (the outbox waits for a healthy keys)."""
+        `lineage_retry_s`: the outbox keeps it, so nothing is lost and the attachment stays up. An ack the ledger does not
+        take or make durable is noted and its envelope sent again the same way (r1 F3); a cycle that ends with a clean
+        ack clears the FAILURE note."""
         led = self.ledger
         wake = self._lineage_wake
         if led is None or wake is None:
@@ -1660,10 +1669,20 @@ class Keys:
                     await asyncio.sleep(self.lineage_retry_s)
                     continue
                 triples, quarantined = read
-                await led.ack(triples, quarantined)
+                try:
+                    await led.ack(triples, quarantined)
+                except Exception as e:
+                    # r1 F3: the ack line was not taken or not made durable: noted, and the envelope sent again
+                    # after `lineage_retry_s` (the outbox still holds its triples), never the sender's exit
+                    self._lineage_trouble("the ack of %d record(s) was not counted (%s)" % (len(triples),
+                                                                                           type(e).__name__))
+                    await asyncio.sleep(self.lineage_retry_s)
+                    continue
                 if quarantined:
                     self._lineage_trouble("CONTROL quarantined %d record(s) (%s)" % (
                         len(quarantined), ",".join(sorted(set(quarantined.values())))))
+                else:
+                    self.lineage_failure = None   # r1 F3: a whole clean cycle clears the last FAILURE note
         except asyncio.CancelledError:
             raise
         except Exception as e:
