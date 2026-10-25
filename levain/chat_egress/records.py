@@ -36,10 +36,9 @@ store itself failed. `settled` hands the mark's effect to `lifecycle.settle(...,
 row beats the mark; the mark stays on its row for the card. This module keeps no reading set.
 
 ERRORS: a refused duplicate RETURNS False (it is counted, except the same FAILED mark again; it is not an effect
-failure). Input C0 never produces (a
-bad verdict or enum, a raw query in the path, an end row with no attempt to join, a second attempt with a different
-decision) raises `EgressRecordError`. A store failure (disk, lock timeout) raises sqlite3's own error. Either raise
-is an effect failure for lifecycle.
+failure). Input C0 never produces (a bad verdict or enum, a raw query in the path, an end row with no attempt to
+join, a second attempt with a different decision) raises `EgressRecordError`. A store failure (disk, lock timeout)
+raises sqlite3's own error. Either raise is an effect failure for lifecycle.
 
 SCHEMA CHECK: `CREATE ... IF NOT EXISTS` keeps whatever table or trigger body a file already holds. So the first
 open compares every `chat_egress_events` object in `sqlite_master` (table, triggers, indexes) with the ones
@@ -56,6 +55,7 @@ import logging
 import sqlite3
 import threading
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -295,7 +295,10 @@ class EgressRecords:
                                                 "module's schema (another revision made them); refusing the store")
                     conn.execute("COMMIT")
                 except BaseException:
-                    conn.execute("ROLLBACK")
+                    # a failed COMMIT may already have ended the transaction; the ROLLBACK's own error must not
+                    # replace the one being raised
+                    with suppress(sqlite3.Error):
+                        conn.execute("ROLLBACK")
                     raise
             except BaseException:
                 conn.close()
@@ -410,7 +413,9 @@ class EgressRecords:
     def settled(self, launch_id: str, request_id: str) -> Settled | None:
         """What one request's stored rows read as, through `lifecycle.settle` (None: the request has no row). The
         FAILED mark's effect is passed as `failed_effect=`, and a stored end row beats it; the mark stays on its row
-        (`rows`) for the card. This module keeps no reading set of its own.
+        (`rows`) for the card. This module keeps no reading set of its own. The `failed_effect` it passes is never
+        a WRITE_* effect: a failed row write stores no mark (`record_failure`), and `write_failed` and the
+        table's CHECK each refuse one.
 
         It reads one request by its id, so it never sees the `audit-missing` deny, whose `request_id` is NULL: that
         row is visible only through `rows(launch_id)`."""

@@ -477,3 +477,29 @@ def test_r15_10_a8_a_killed_service_leaves_an_attempt_that_reads_ambiguous(tmp_p
     assert after.settled(lid, done) is Settled.COMPLETED
     assert [(r.kind, r.verdict) for r in after.rows(lid, cut)] == [("egress_attempt", Verdict.ALLOW)]
     assert after.settled(lid, cut) is Settled.AMBIGUOUS
+
+
+def test_a_failed_schema_commit_is_the_error_raised_not_the_rollback_after_it(store):
+    """S5a-2 complement LOW (L3 r1): when the schema transaction's COMMIT fails and sqlite has already ended the
+    transaction, the ROLLBACK after it fails too ("no transaction is active"); that second error must not mask the
+    COMMIT's, which is the one the caller acts on."""
+
+    class CommitFails:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args):
+            if sql == "COMMIT":
+                self._conn.execute("ROLLBACK")            # the failed commit ends the transaction
+                raise sqlite3.OperationalError("disk I/O error (the planted COMMIT failure)")
+            return self._conn.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    class Opener:
+        def _connect(self):
+            return CommitFails(store._connect())
+
+    with pytest.raises(sqlite3.OperationalError, match="planted COMMIT failure"):
+        rec.EgressRecords(Opener())._connect()
