@@ -14,6 +14,32 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   problem instead of crashing. Run `levain chat setup` again after upgrading.
 - **The cockpit's `!N` badge breathes when a new decision waits on you.** It pulses for about half a minute, then sits
   still; never with reduced motion.
+- **`levain binding policy create|renew|revoke|list` signs the graduation policies** that let a standing binding run
+  below confirm (cooling-off or on-loop) without asking: the actions it may run at the risk Levain's manifest gives
+  them, the lowest rung, and an expiry at most 30 days out. A policy covers only while its signing keys are listed in
+  root's allowed-signers file and are not revoked; `create` prints what it hands over before anything is signed, and
+  the command it prints names its store and cockpit by absolute path, so it signs the same store from any directory.
+- **`levain binding graduate` takes the graduation steps a policy covers,** records each, and prints the one
+  `levain binding policy create` line for a step none covers. It needs the binding driver, which this release does not
+  wire, so for now it says nothing graduates. If a step fails (the authority log is locked, say), the steps already
+  taken are still printed, the failed one is named, and the command exits 1; a binding that changed while the run was
+  in progress (revoked, paused, fired, or graduated by another run) is reported as `stale` and nothing is written for it.
+- **The cockpit and the phone show the coordinator's review queue and morning card, read-only.** The cockpit shows them
+  on the Morning and Board tabs: what needs a look, newest first, how long ago, and which items only you clear. The phone
+  page has a Review tab with the morning card, the open items (what each is, what it says, how old it is) and the ones
+  you cleared; it reads one page at a time. Neither appears until the coordinator has been used. Opening them never
+  creates or changes the coordinator's store. They say when the review check last ran, or that it has not run yet or
+  could not read the queue, and never "Nothing is waiting on you" in those cases; a section the morning card could not
+  read says so instead of showing zero. A command too long for a cockpit row is cut with a visible "shortened" mark.
+  On Android the phone page says "your screen lock" where it said Face ID.
+- **`levain doctor` reports the brokered-spend install.** New rows: whether the dispatch route trust is pinned (and to
+  which key; `trust.pub` is checked with `ssh-keygen` the way Levain verifies a route map, so a damaged key file fails),
+  whether the keys service runs (an install with no egress slot says so instead of failing), the spend ledger's size,
+  and, for each brokered credential, the provider-side limit that bounds your invoice, counting only the dispatch routes
+  the keys service actually serves. OpenRouter's key limit and what remains of it are read when your account can open
+  the credential, with when it resets and whether it leaves BYOK usage out or is used up; Anthropic's and OpenAI's are
+  named as settings to make in the provider console. All provider reads together take at most ten seconds and never
+  fail the check. It says so when `ssh-keygen` cannot run or no credential is set at all.
 
 ### Fixed
 - **Two sessions making their first call at the same moment no longer have one call refused with `database is
@@ -58,6 +84,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Dispatch can acknowledge a run's result (`ARTIFACT-ACK`).** The control plane accepts the acknowledgement only for
   the artifact or verifier report the session actually published, or, with no digest named, for a run that failed to
   produce one. Nothing in dispatch sends it yet.
+- **Chat egress has a composed test suite and a report.** The suite runs the real glue and decider over the sandbox
+  runtime with real clients (curl, git, requests, pip, npm, uv) and sweeps every artifact of a run for leaked
+  credentials. `levain.chat_egress.report` reads one launch's rows and the glue's event file into the wall total (exact
+  after a clean end, marked unknown or crashed after a crash), per-reason counts, duplicate rows, and the path,
+  credential-in-query and cap counts. No `levain` command prints it yet.
 - **The reaper moves a finished dispatch session's retained work to trash** once its result is acknowledged, or after
   `dispatch_retain_days` (default 2 days, at least 1). A dispatch session you restored yourself is never moved to trash
   automatically again, even when the restore lands while the reaper is deciding, and the reaper finishes a discard that
