@@ -14,8 +14,8 @@ its sink holds (``membership``), rebuilt at :meth:`LineageSink.start` from the s
 whose triple is a member is acked without appending; order of arrival does not matter (no high-water).
 
 **Start** (:meth:`LineageSink.start`): the sink is opened `O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW` (0640: the
-directory's setgid gives it `levain-lineage`), `flock`ed exclusively (one CONTROL per sink, ``control-running``), read
-whole. A last line with no newline is a torn append (a crash inside the write): it was never acked, so it is cut off
+directory's setgid gives it `levain-lineage`), `flock`ed exclusively (one CONTROL per sink, ``control-running``), its
+mode set to 0640 whatever the umask or an earlier mode (`fchmod`, flushed), read whole. A last line with no newline is a torn append (a crash inside the write): it was never acked, so it is cut off
 (`ftruncate` to the last newline, then a full fsync) before anything is appended after it. Any other line that does
 not parse, is not its own canonical encoding, is not a lineage row (a full row must pass :func:`check_record`, as a
 fresh record must), breaks `seq`'s contiguity, or repeats a member's triple refuses the start `lineage-corrupt`:
@@ -276,6 +276,10 @@ class LineageSink:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     raise Refused("control-running", f"another CONTROL holds {self.path}") from None
+                # r1 F2: the create's mode is cut by the umask (0077 makes it 0600: EACCES for _levain_dispatch), and
+                # an existing sink keeps whatever mode it has; the mode is set on the locked regular file and flushed
+                os.fchmod(fd, SINK_MODE)
+                self._fsync(fd)
                 members, next_seq, keep = self._read(fd)
                 size = os.fstat(fd).st_size
                 if keep != size:

@@ -397,6 +397,25 @@ def test_lineage_corrupt_middle_refuses_start(tmp, damage):
     control.stop()
 
 
+@pytest.mark.parametrize("existing", [None, 0o600, 0o644])
+def test_lineage_sink_mode_is_set_whatever_the_umask(tmp, existing):
+    # r1 F2: under umask 0077 `os.open(..., 0o640)` alone made the sink 0600 (EACCES for _levain_dispatch, group
+    # levain-lineage), and an existing wrong-mode sink was never repaired: the start sets SINK_MODE on the open fd
+    d = tmp / "lineage"
+    d.mkdir()
+    if existing is not None:
+        (d / LN.SINK).write_bytes(b"")
+        os.chmod(d / LN.SINK, existing)
+    old = os.umask(0o077)
+    try:
+        sink = LN.LineageSink(d / LN.SINK)
+        sink.start()
+        sink.close()
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(os.stat(d / LN.SINK).st_mode) == LN.SINK_MODE == 0o640
+
+
 def test_lineage_one_control_per_sink(tmp):
     w = World(tmp)
     with pytest.raises(Refused) as e:
