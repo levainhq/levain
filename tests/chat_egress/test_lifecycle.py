@@ -25,7 +25,7 @@ from levain.chat_egress.lifecycle import Effect as F
 from levain.chat_egress.lifecycle import Event as E
 from levain.chat_egress.lifecycle import Settled
 from levain.chat_egress.lifecycle import State as S
-from levain.chat_egress.lifecycle import Step, Verdict as V
+from levain.chat_egress.lifecycle import Failure, Step, Verdict as V
 
 A_ALLOW = (F.WRITE_ATTEMPT, F.SEND_ALLOW)
 A_DENY = (F.WRITE_ATTEMPT, F.SEND_DENY)
@@ -40,7 +40,7 @@ def _absorb(s):
     return Step(s, (), None, False)
 
 
-# (state, event) -> the Step it must give. 8 states x 8 events, every pair listed.
+# (state, event) -> the Step it must give. 9 states x 8 events, every pair listed.
 EXPECTED: dict[tuple[S, E], Step] = {
     # DECIDING: the decider holds the frame and has not answered.
     (S.DECIDING, E.NEED_BODY): Step(S.AWAITING_BODY),
@@ -92,11 +92,12 @@ for _ev in E:
     EXPECTED[(S.OUTCOME, _ev)] = _absorb(S.OUTCOME)    # R15-27-3 / R15-28-4: no ended row after an outcome
     EXPECTED[(S.ENDED, _ev)] = _absorb(S.ENDED)        # C9: an allow on an ENDED card forwards nothing
     EXPECTED[(S.CLOSED, _ev)] = _absorb(S.CLOSED)
+    EXPECTED[(S.FAILED, _ev)] = _absorb(S.FAILED)      # L3 r1 F1: a failed effect absorbs everything after it
 
 
 def test_the_expected_table_is_whole():
     assert set(EXPECTED) == set(itertools.product(S, E))
-    assert len(EXPECTED) == 64
+    assert len(EXPECTED) == 72
 
 
 # --- C0: one red per (state, event) pair ------------------------------------------------------------------------
@@ -116,12 +117,12 @@ def test_c0_step_refuses_a_non_member():
 
 def test_pending_and_terminal_partition_the_states():
     assert lc.PENDING == {S.DECIDING, S.AWAITING_BODY, S.CARD_HELD}
-    assert lc.TERMINAL == {S.DENIED, S.OUTCOME, S.ENDED, S.CLOSED}
+    assert lc.TERMINAL == {S.DENIED, S.OUTCOME, S.ENDED, S.CLOSED, S.FAILED}
     assert lc.PENDING | lc.TERMINAL | {S.ALLOWED} == set(S)
 
 
 def test_a_terminal_state_never_leaves():
-    assert len(lc.TERMINAL) == 4
+    assert len(lc.TERMINAL) == 5
     for st, ev in itertools.product(lc.TERMINAL, E):
         r = lc.step(st, ev)
         assert r.state is st and r.effects == () and r.verdict is None
@@ -301,37 +302,64 @@ def test_r15_26_3_the_second_report_is_absorbed_not_stray(first):
     assert rows.count(F.WRITE_OUTCOME) + rows.count(F.WRITE_ENDED) == 1
 
 
+class _SeamLock:
+    """The transition-lock seam (L3 r1 F3): it wraps the machine's real lock and says, per thread, when that thread
+    has reached the acquire. A thread that signalled and has not finished is blocked IN the acquire, because the real
+    lock is held by the first transition until the test lets it go. No sleep decides anything."""
+
+    def __init__(self, real):
+        self.real = real
+        self.reached: dict[str, threading.Event] = {}
+
+    def reached_by(self, name):
+        return self.reached.setdefault(name, threading.Event())
+
+    def __enter__(self):
+        self.reached_by(threading.current_thread().name).set()
+        self.real.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.real.release()
+        return False
+
+
 def _held_race(pre, first, second):
-    """Fire `first` on one thread with its perform held open, then `second` on another. It returns (rows in the order
-    they were performed, whether `second` finished while `first`'s perform was still held). Deterministic: the
-    interleaving is forced, not hoped for."""
+    """Fire `first` on one thread with its first effect held open, then `second` on another. It returns (rows in the
+    order they were performed, whether `second` finished while `first` was still held). Deterministic: the test waits
+    until the second thread has reached the transition lock, then checks it has not got past it."""
     m = lc.RequestLifecycle()
     for e in pre:
         m.fire(e)
+    seam = _SeamLock(m._transition_lock)
+    m._transition_lock = seam
     rows: list[F] = []
     entered, release = threading.Event(), threading.Event()
 
-    def held(s):
-        entered.set()
-        assert release.wait(5)
-        rows.extend(s.effects)
+    def held(effect, s):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        rows.append(effect)
 
-    t1 = threading.Thread(target=lambda: m.fire(first, perform=held))
+    t1 = threading.Thread(target=lambda: m.fire(first, perform=held), name="first")
     t1.start()
     assert entered.wait(5)
     done = threading.Event()
 
     def second_fire():
-        m.fire(second, perform=lambda s: rows.extend(s.effects))
+        m.fire(second, perform=lambda effect, s: rows.append(effect))
         done.set()
 
-    t2 = threading.Thread(target=second_fire)
+    t2 = threading.Thread(target=second_fire, name="second")
     t2.start()
-    finished_early = done.wait(0.2)
+    reached = seam.reached_by("second").wait(5)      # the second fire is at the acquire...
+    finished_early = done.is_set() or not reached    # ...and, with the lock held by the first, has not got past it
     release.set()
     t1.join(5)
     t2.join(5)
     assert not t1.is_alive() and not t2.is_alive()
+    assert reached, "the second fire never reached the transition lock"
     return rows, finished_early
 
 
@@ -363,20 +391,149 @@ def test_fire_runs_perform_under_the_machines_lock():
     m = lc.RequestLifecycle()
     held = []
 
-    def perform(s):
-        held.append(m._lock.locked())
+    def perform(effect, s):
+        held.append((effect, m._transition_lock.locked()))
 
     m.fire(E.ALLOW, perform=perform)
-    assert held == [True]
+    assert held == [(F.WRITE_ATTEMPT, True), (F.SEND_ALLOW, True)]   # once per effect, in order, under the lock
 
 
 def test_fire_does_not_call_perform_for_an_effectless_step():
     m = lc.RequestLifecycle()
     calls = []
-    m.fire(E.CARD, perform=calls.append)
-    m.fire(E.BODY, perform=calls.append)            # stray
+    m.fire(E.CARD, perform=lambda *a: calls.append(a))
+    m.fire(E.BODY, perform=lambda *a: calls.append(a))   # stray
     assert calls == []
     assert m.state is S.CARD_HELD
+
+
+# --- L3 r1 F1 / F2 / F4 / F5: an effect that raises --------------------------------------------------------------
+
+class _Boom(Exception):
+    def __init__(self, effect):
+        super().__init__(f"{effect} failed")
+        self.effect = effect
+
+
+class _Perform:
+    """A composer's perform that records every effect it was asked for and raises on the ones named."""
+
+    def __init__(self, *raise_on):
+        self.raise_on = set(raise_on)
+        self.ran: list[F] = []
+
+    def __call__(self, effect, s):
+        self.ran.append(effect)
+        if effect in self.raise_on:
+            raise _Boom(effect)
+
+
+# How to reach each live state, and every (path, event) whose step has effects, with each effect position.
+_PATHS = {S.DECIDING: [], S.AWAITING_BODY: [E.NEED_BODY], S.CARD_HELD: [E.CARD], S.ALLOWED: [E.ALLOW]}
+_EFFECT_POSITIONS = [
+    (st, ev, i)
+    for st in _PATHS for ev in E
+    for i in range(len(lc.step(st, ev).effects))
+]
+
+
+@pytest.mark.parametrize(("st", "ev", "i"), _EFFECT_POSITIONS,
+                         ids=[f"{st}-{ev}-{lc.step(st, ev).effects[i]}" for st, ev, i in _EFFECT_POSITIONS])
+def test_f1_a_raise_at_each_effect_position_fails_the_request(st, ev, i):
+    """F1 / F5: the effect at position `i` raises. The exception propagates, the effects after it are skipped (F2: a
+    RELEASE still runs), the request is FAILED rather than the successor, every later event is absorbed with no
+    effect, and the rows that exist read FAILED."""
+    m, pre = _run(_PATHS[st])
+    want = lc.step(st, ev)
+    bad = want.effects[i]
+    p = _Perform(bad)
+    with pytest.raises(_Boom) as got:
+        m.fire(ev, perform=p)
+    assert got.value.effect is bad
+    released = F.RELEASE in want.effects and bad is not F.RELEASE
+    assert p.ran == list(want.effects[:i + 1]) + ([F.RELEASE] if released else [])
+    for later in E:                                  # no orphan ended / outcome row, no second verdict
+        q = _Perform()
+        assert m.fire(later, perform=q) == Step(S.FAILED) and q.ran == []
+    assert m.state is S.FAILED
+    done = want.effects[:i] + ((F.RELEASE,) if released else ())
+    assert m.failure == Failure(want, bad, done)
+    rows = _all_effects(pre) + list(done)
+    verdict = next((s.verdict for s in pre if s.verdict), None) or (want.verdict if F.WRITE_ATTEMPT in done else None)
+    assert lc.settle(verdict, F.WRITE_OUTCOME in rows, F.WRITE_ENDED in rows, failed=True) is Settled.FAILED
+
+
+def test_f1_the_reviewers_two_cases():
+    """complement 1 / codex 1, as written: a failed attempt write on an allow, then the client leaves (no ended row
+    without its attempt); a failed outcome write, then the abort (reads FAILED, never AMBIGUOUS)."""
+    m = lc.RequestLifecycle()
+    with pytest.raises(_Boom):
+        m.fire(E.ALLOW, perform=_Perform(F.WRITE_ATTEMPT))
+    q = _Perform()
+    m.fire(E.ENDED, perform=q)
+    m.fire(E.RESPONSE, perform=q)
+    assert q.ran == [] and m.state is S.FAILED
+    assert lc.settle(None, False, False, failed=True) is Settled.FAILED
+
+    m = lc.RequestLifecycle()
+    m.fire(E.ALLOW, perform=_Perform())
+    with pytest.raises(_Boom):
+        m.fire(E.RESPONSE, perform=_Perform(F.WRITE_OUTCOME))
+    q = _Perform()
+    m.fire(E.ENDED, perform=q)
+    assert q.ran == [] and m.state is S.FAILED
+    assert lc.settle(V.ALLOW, False, False, failed=True) is Settled.FAILED
+    assert lc.settle(V.ALLOW, False, False) is Settled.AMBIGUOUS     # what it read before F1 (no failed mark)
+
+
+@pytest.mark.parametrize("st", [S.DECIDING, S.AWAITING_BODY, S.CARD_HELD], ids=str)
+def test_f2_release_runs_when_everything_before_it_raises(st):
+    """F2: the client left while srt still waits on a decision. Every effect before RELEASE raises; RELEASE is still
+    performed, once. When RELEASE raises too, the FIRST exception propagates and carries RELEASE's as a note."""
+    m, _ = _run(_PATHS[st])
+    effects = lc.step(st, E.ENDED).effects
+    before = [f for f in effects if f is not F.RELEASE]
+    p = _Perform(*before)
+    with pytest.raises(_Boom) as got:
+        m.fire(E.ENDED, perform=p)
+    assert got.value.effect is before[0]
+    assert p.ran == [before[0], F.RELEASE]
+    assert m.failure.done == (F.RELEASE,)
+
+    m, _ = _run(_PATHS[st])
+    p = _Perform(before[0], F.RELEASE)
+    with pytest.raises(_Boom) as got:
+        m.fire(E.ENDED, perform=p)
+    assert got.value.effect is before[0] and p.ran.count(F.RELEASE) == 1
+    assert any("release" in n for n in getattr(got.value, "__notes__", []))
+    assert m.failure.done == () and m.state is S.FAILED
+
+
+def test_f4_only_committed_states_are_visible():
+    """F4: while ALLOW's effects run, `state` still reads the state before it, from another thread and from inside
+    perform itself (the getter takes no lock, so the callback does not deadlock). It reads ALLOWED only after both
+    effects returned."""
+    m = lc.RequestLifecycle()
+    m.fire(E.CARD)
+    seen_inside: list[S] = []
+    entered, release = threading.Event(), threading.Event()
+
+    def perform(effect, s):
+        seen_inside.append(m.state)
+        if effect is F.WRITE_ATTEMPT:
+            entered.set()
+            assert release.wait(5)
+
+    t = threading.Thread(target=lambda: m.fire(E.ALLOW, perform=perform))
+    t.start()
+    assert entered.wait(5)
+    seen_outside = m.state
+    release.set()
+    t.join(5)
+    assert not t.is_alive()
+    assert seen_outside is S.CARD_HELD
+    assert seen_inside == [S.CARD_HELD, S.CARD_HELD]
+    assert m.state is S.ALLOWED
 
 
 # --- settle: the read side (records and the card read rows, not the machine) --------------------------------------
@@ -405,6 +562,30 @@ def test_settle(key):
 def test_settle_refuses_a_non_member_verdict():
     with pytest.raises(ValueError):
         lc.settle("allow", False, False)            # type: ignore[arg-type]
+
+
+SETTLE_FAILED = {
+    (None, False, False): Settled.FAILED,        # the attempt write itself failed
+    (None, True, False): Settled.INCONSISTENT,   # rows without their attempt: no failure leaves them
+    (None, False, True): Settled.INCONSISTENT,
+    (V.DENY, False, False): Settled.FAILED,      # the deny frame failed after its attempt row
+    (V.DENY, False, True): Settled.INCONSISTENT,
+    (V.ALLOW, False, False): Settled.FAILED,     # never AMBIGUOUS
+    (V.ALLOW, True, False): Settled.FAILED,      # never a clean outcome
+    (V.ALLOW, False, True): Settled.FAILED,
+    (V.ALLOW, True, True): Settled.INCONSISTENT,
+    (V.UNDECIDED, False, False): Settled.FAILED,
+    (V.UNDECIDED, False, True): Settled.FAILED,
+    (V.UNDECIDED, True, False): Settled.INCONSISTENT,
+}
+
+
+def test_settle_reads_failed():
+    for key, want in SETTLE_FAILED.items():
+        assert lc.settle(*key, failed=True) is want, key
+    for key, want in SETTLE.items():                 # failed=False is the table above, unchanged
+        assert lc.settle(*key, failed=False) is want, key
+    assert lc.settle(None, False, False) is Settled.INCONSISTENT   # no attempt row and no failure: never written
 
 
 def test_every_machine_end_settles_consistently():
@@ -442,10 +623,13 @@ def test_c0_census_after_a_close_in_each_state(st):
     a smoke check, not the census row; the row's census (the decider's threads and tasks) is S5b's."""
     paths = {
         S.DECIDING: [], S.AWAITING_BODY: [E.NEED_BODY], S.CARD_HELD: [E.CARD], S.ALLOWED: [E.ALLOW],
-        S.DENIED: [E.DENY], S.OUTCOME: [E.ALLOW, E.RESPONSE], S.ENDED: [E.ENDED], S.CLOSED: [E.CLOSE],
+        S.DENIED: [E.DENY], S.OUTCOME: [E.ALLOW, E.RESPONSE], S.ENDED: [E.ENDED], S.CLOSED: [E.CLOSE], S.FAILED: [],
     }
     before = set(threading.enumerate())
     m, _ = _run(paths[st])
+    if st is S.FAILED:
+        with pytest.raises(_Boom):
+            m.fire(E.ALLOW, perform=_Perform(F.WRITE_ATTEMPT))
     assert m.state is st
     m.fire(E.CLOSE)
     assert set(threading.enumerate()) == before

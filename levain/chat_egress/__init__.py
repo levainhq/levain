@@ -8,5 +8,6 @@ Modules are split by owner so no two build sessions share a file. The leaf modul
   guard  the denied-address table srt's resolved-address guard is configured with, generated from
          `levain.broker.front`, and the decider's own address wall.
   lifecycle  C0 read per request: one egress request's state machine (attempt, then outcome XOR
-         ended-before-outcome), its effects and `settle` (AMBIGUOUS and the other read-side values).
+         ended-before-outcome; FAILED when an effect raised), its effects and `settle` (AMBIGUOUS, FAILED and the
+         other read-side values).
 """
