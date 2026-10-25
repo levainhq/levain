@@ -510,3 +510,118 @@ def test_the_older_levain_takes_the_planted_inert_loosen_this_replay_refuses(wor
     db = world.plant({"op": "loosen", "policy": policy})
     assert older_replay(world.tmp, db)["seq"] == snap.seq + 1
     assert "a graduation policy's terms are fixed" in world.replay_verdict(db)
+
+
+# --- S1 L3 r1 fixes (1025+16 S1_RULINGS_R1) --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("lapsed", [True, False])
+def test_a_graduation_expiry_moves_only_by_its_renew_never_inside_a_loosen(world, lapsed):
+    """Ruling 1 (codex MED): a loosen that extends a lapsed GP and adds GP2 computes to LOOSEN (the add), so the renew's
+    lapse rule never ran and the lapsed policy came back live under its old incarnation. Refused at append and at
+    replay, lapsed or live."""
+    snap = world.link({"op": "create_grant", "grant": grad(world, days=1 if lapsed else 10)})
+    if lapsed:
+        world.clock.now += timedelta(days=2)
+    policy = snap.policy.as_dict()
+    policy["grants"][GP] = {**policy["grants"][GP], "expires_at": utc_stamp(world.clock.now + timedelta(days=20))}
+    policy["grants"][GP2] = grad(world, GP2)
+    why = "a graduation policy's expiry moves only by its own renew link"
+    assert why in world.refused({"op": "loosen", "policy": policy})
+    assert why in world.replay_verdict(world.plant({"op": "loosen", "policy": policy}))
+
+
+def test_a_display_phone_key_signs_no_loosen_carrying_a_renew_and_an_opt_in(world):
+    """complement LOW 4: the renew and the opt-in together compute to LOOSEN, which needs rank 3."""
+    snap = world.link({"op": "create_grant", "grant": grad(world, days=10)})
+    policy = snap.policy.as_dict()
+    policy["grants"][GP] = {**policy["grants"][GP], "expires_at": utc_stamp(world.clock.now + timedelta(days=20))}
+    policy["grants"][OPT] = opt_in(world, "pk")
+    assert "a display-phone key cannot sign this loosen" in world.refused({"op": "loosen", "policy": policy}, "phone")
+
+
+def test_the_opt_in_is_never_renewed_by_either_gate(world):
+    """Ruling 2 (deepseek MED 1+2): the append-only gate read the opt-in's expires_at, which it has none of
+    (KeyError). One rule says which kind is never renewed, and both gates call it."""
+    snap = world.link({"op": "create_grant", "grant": opt_in(world, "pk")})
+    rec = renew(world, OPT)
+    assert "has no expiry, so it is never renewed" in world.refused(rec)
+    with pytest.raises(auth.AuthorityError, match="has no expiry, so it is never renewed"):
+        auth._append_only_checks(snap, rec, world.clock.now + timedelta(minutes=1))
+
+
+def test_the_laptop_cli_and_a_passkey_revoke_a_graduation_policy_and_the_opt_in(world):
+    """Ruling 3 (complement MED): the revoke path the CLI and the phone share took consent and inert grants only, so
+    the passkey revoke of a graduation policy the log accepts was unreachable. An egress grant stays refused."""
+    from levain.consent.grants import append_revoke, prepare_revoke, revoke_grant
+
+    CockpitDB(world.root).set_install_class("reported")
+    world.link({"op": "create_grant", "grant": grad(world)})
+    world.link({"op": "create_grant", "grant": grad(world, GP2)})
+    world.link({"op": "create_grant", "grant": opt_in(world, "pk")})
+    fp, sign = world.keys["laptop"]
+    revoke_grant(world.root, GP, signer_fp=fp, sign=sign, clock=world.clock)
+    for gid in (GP2, OPT):
+        link = prepare_revoke(world.root, gid, signer_fp=world.fp("pk"), clock=world.clock)
+        append_revoke(world.root, link, world.keys["pk"][1](link.message), clock=world.clock)
+    assert not {GP, GP2, OPT} & set(world.state().policy.grants)
+    egress = {"id": "eg-1", "entity": "e1", "remote_url": "git@github.com:x/y.git", "deploy_key_sha256": "ab" * 32,
+              "refspecs": ["refs/heads/main"], "verbs": ["push"],
+              "expires_at": utc_stamp(world.clock.now + timedelta(days=1))}
+    world.link({"op": "create_grant", "grant": egress})
+    from levain.cockpit.keys import KeyError_
+    # the refusal keeps its prefix (test_grant_phone.py: the phone maps it to not_found)
+    for gid in ("eg-1", GP):
+        with pytest.raises(KeyError_) as exc:
+            prepare_revoke(world.root, gid, signer_fp=world.fp("pk"), clock=world.clock)
+        assert str(exc.value).startswith("no consent grant")
+    with pytest.raises(KeyError_, match="no consent grant"):
+        revoke_grant(world.root, "eg-1", signer_fp=fp, sign=sign, clock=world.clock)
+
+
+def test_prepare_refuses_an_op_that_is_not_a_mapping(world):
+    """Ruling 4 (complement LOW 2): a list holding "op" passed the field check and raised AttributeError."""
+    conn = sqlite3.connect(world.db, isolation_level=None)
+    try:
+        with pytest.raises(auth.AuthorityError, match="an op is a mapping"):
+            auth.prepare(conn, ["op"], signer_fp=world.fp("laptop"), now=world.clock.now)
+    finally:
+        conn.close()
+
+
+def test_graduation_links_needs_one_signer_per_link(world):
+    """Ruling 5 (complement LOW 3): a snapshot whose signers do not line up with its links answers None, never the
+    signer of another link."""
+    import dataclasses
+
+    world.link({"op": "create_grant", "grant": grad(world)})
+    snap = world.link({"op": "create_grant", "grant": consent(world)})
+    assert auth.graduation_links(snap, GP) == (world.fp("laptop"), world.fp("laptop"))
+    assert auth.graduation_links(dataclasses.replace(snap, link_signers=snap.link_signers[1:]), GP) is None
+
+
+def test_a_grant_change_without_an_expiry_is_an_authority_error():
+    """Ruling 6 (deepseek LOW 3): an inert grant with no expires_at raised TypeError from the comparison."""
+    with_exp = {"id": "x-1", "kind": "push", "expires_at": utc_stamp(T0)}
+    without = {"id": "x-1", "kind": "push"}
+    for o, n in ((with_exp, without), (without, with_exp)):
+        with pytest.raises(auth.AuthorityError, match="carries no expires_at"):
+            auth._grant_change(o, n)
+
+
+def test_a_passkey_act_on_no_grant_names_the_passkey_rule_and_the_missing_grant(world):
+    """Ruling 6 (deepseek LOW 4)."""
+    for op in (renew(world, "gp-ffffffffffff"), {"op": "revoke_grant", "grant_id": "gp-ffffffffffff"}):
+        why = world.refused(op, "pk")
+        assert "a passkey key" in why and "no grant 'gp-ffffffffffff'" in why
+
+
+def test_a_graduation_policy_requires_its_store_id_and_the_opt_in_carries_none(world):
+    """Ruling 7 (S2 obs 2): coverage binds a policy to its store, so the log never takes one without a store_id, at
+    append or at replay; the opt-in's field set has no store_id either."""
+    bare = grad(world)
+    del bare["store_id"]
+    assert "must carry exactly" in world.refused({"op": "create_grant", "grant": bare})
+    assert "must carry exactly" in world.replay_verdict(world.plant({"op": "create_grant", "grant": bare}))
+    assert "store_id must be store-" in world.refused({"op": "create_grant", "grant": grad(world, store_id=None)})
+    assert "must carry exactly" in world.refused({"op": "create_grant",
+                                                  "grant": {**opt_in(world, "pk"), "store_id": STORE}})
