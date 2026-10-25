@@ -1443,3 +1443,20 @@ def test_a_control_stamped_event_records_with_the_stores_verified_at(store, repo
     verify(store, repo, job, 0, raw=raw, ev=tvr.event(r, at=at, verifier_report_digest=digest))
     [rec] = store.run_records(job.id)
     assert rec.verified_at == utc_stamp(datetime.fromtimestamp(SR.epoch_of(at), timezone.utc))
+
+
+def test_the_event_cursor_never_moves_backward_within_a_journal(store):
+    """RULINGS_OBS 9: within one journal the cursor only moves forward (a repeat of its seq is a no-op); another
+    journal's cursor is set only after drop_event_cursor, the reset's own path."""
+    store.set_event_cursor("j-1", 5)
+    store.set_event_cursor("j-1", 5)
+    with pytest.raises(DispatchError):
+        store.set_event_cursor("j-1", 3)
+    with pytest.raises(DispatchError):
+        store.set_event_cursor("j-2", 9)
+    assert store.event_cursor() == ("j-1", 5)
+    store.set_event_cursor("j-1", 8)
+    assert store.event_cursor() == ("j-1", 8)
+    store.drop_event_cursor()
+    store.set_event_cursor("j-2", 1)
+    assert store.event_cursor() == ("j-2", 1)

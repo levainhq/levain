@@ -794,12 +794,18 @@ class JobStore:
         return None if row is None else (row[0], row[1])
 
     def set_event_cursor(self, journal_id: str, seq: int) -> None:
-        """Persist the cursor past event ``seq`` of journal ``journal_id`` in its own write transaction."""
+        """Persist the cursor past event ``seq`` of journal ``journal_id`` in its own write transaction. Within one
+        journal the cursor never moves backward (the same seq again is a no-op); a cursor of another journal is set
+        only after :meth:`drop_event_cursor`. Either refusal is a :class:`DispatchError`, the cursor unchanged."""
         if type(journal_id) is not str or not journal_id or type(seq) is not int or seq < 0:
             raise DispatchError("an event cursor is a journal id and a seq >= 0")
         with self._write() as conn:
-            conn.execute("INSERT INTO event_cursor (one, journal_id, seq) VALUES (1, ?, ?) ON CONFLICT (one) "
-                         "DO UPDATE SET journal_id = excluded.journal_id, seq = excluded.seq", (journal_id, seq))
+            cur = conn.execute("INSERT INTO event_cursor (one, journal_id, seq) VALUES (1, ?, ?) ON CONFLICT (one) "
+                               "DO UPDATE SET seq = excluded.seq WHERE event_cursor.journal_id = excluded.journal_id "
+                               "AND excluded.seq >= event_cursor.seq", (journal_id, seq))
+            if cur.rowcount != 1:
+                raise DispatchError(f"the event cursor does not move to seq {seq} of journal {journal_id[:64]}: it "
+                                    "never moves backward, and another journal's starts after drop_event_cursor")
 
     def drop_event_cursor(self) -> None:
         """Forget the cursor (its journal is gone: the follower restarts from 0)."""
