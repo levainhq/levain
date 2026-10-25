@@ -322,7 +322,8 @@ def test_card_state_refuses_what_it_does_not_know():
 def test_the_page_draws_words_for_every_card_state_and_reads_the_queue_state_as_card_state_does():
     js = (Path(cards.__file__).parents[1] / "templates" / "web" / "dashboard_core.js").read_text()
     words = re.search(r"const EGRESS_WORDS = \{(.*?)\};", js, re.S).group(1)
-    assert set(re.findall(r"^\s*(\w+):", words, re.M)) == {s.value for s in CardState}
+    # The page alone draws "unreadable" (an egress record it could not read; S7 header fix r2): no CardState is it.
+    assert set(re.findall(r"^\s*(\w+):", words, re.M)) == {s.value for s in CardState} | {"unreadable"}
     from_queue = dict(re.findall(r'(\w+): "(\w+)"', re.search(r"const EGRESS_FROM_QUEUE = \{(.*?)\};", js).group(1)))
     assert from_queue == {qs: card_state(qs, None).value for qs in QUEUE_STATES}
     assert re.search(r'const EGRESS_TOOL = "levain_egress";', js)

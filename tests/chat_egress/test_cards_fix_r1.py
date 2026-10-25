@@ -321,7 +321,7 @@ def test_ended_covers_a_client_leaving_and_the_launch_or_service_closing():
 
 def test_every_card_state_has_words_and_in_flight_is_not_ambiguous():
     w = _words()
-    assert set(w) == {s.value for s in CardState}
+    assert set(w) == {s.value for s in CardState} | {"unreadable"}     # page-only: a record the page could not read
     assert "stopped" not in w["in_flight"] and "stopped" in w["ambiguous"]
 
 
