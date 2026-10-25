@@ -74,6 +74,14 @@ def open_regular_files(pid: int) -> list[Path]:
     return [p for p in paths if p.is_file()]
 
 
+def _held_bytes(p: Path) -> bytes:
+    """A held file's bytes; b"" for one closed since the listing (a closed descriptor holds no key)."""
+    try:
+        return p.read_bytes()
+    except FileNotFoundError:
+        return b""
+
+
 def test_the_ca_cert_is_on_disk_and_its_key_is_not(tmp_path) -> None:
     a = cam.new_egress_ca(tmp_path, now=NOW, start_id="s1")
     assert a.cert_path == tmp_path / "egress-ca" / "s1.pem" and a.cert_path.read_bytes() == a.cert_pem
@@ -184,7 +192,7 @@ def test_twenty_leaves_minted_leave_no_private_key_on_disk_or_open(tmp_path, mon
         bundle = Path(re.search(r"bundle=(\S+)", e.stderr.read_text()).group(1)).parent
         held = open_regular_files(os.getpid()) + open_regular_files(e.proc.pid)
         found = (private_key_files(state) + private_key_files(bundle)
-                 + [p for p in held if PRIVATE.search(p.read_bytes())])
+                 + [p for p in held if PRIVATE.search(_held_bytes(p))])
         print(f"RUN S8B custody: 20 leaves minted by {issuer.rfc4514_string()}; scanned {state}, {bundle} and "
               f"{len(held)} open files; private keys found: {found}")
         assert found == []
