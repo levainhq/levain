@@ -36,10 +36,24 @@ from pathlib import Path
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 
-__all__ = ["AutonomicDB", "StoreFormatError", "STORE_FORMAT", "default_store_dir"]
+__all__ = ["AutonomicDB", "StoreFormatError", "STORE_FORMAT", "STORE_FORMAT_V1", "STORE_FORMAT_V2",
+           "default_store_dir", "migrate_to_v2"]
 
-STORE_FORMAT = "levain-autonomic/1"
+STORE_FORMAT_V1 = "levain-autonomic/1"
+# the format of a store whose bindings fire below CONFIRM only under a signed graduation policy: an older binary
+# refuses it at its own format check rather than fire below CONFIRM unclamped
+STORE_FORMAT_V2 = "levain-autonomic/2"
+STORE_FORMAT = STORE_FORMAT_V1
 DB_NAME = "autonomic.db"
+
+# The graduation audit table: one row per step the engine took under a policy's authority. An audit record: it
+# authorizes nothing.
+_GRADUATION_STEPS = (
+    "CREATE TABLE IF NOT EXISTS graduation_steps (step INTEGER PRIMARY KEY, at TEXT NOT NULL, "
+    "old_id TEXT NOT NULL, new_id TEXT NOT NULL, family TEXT, from_posture TEXT NOT NULL, "
+    "to_posture TEXT NOT NULL, clean_count INTEGER NOT NULL, fire_count INTEGER NOT NULL, "
+    "policy_id TEXT NOT NULL, incarnation TEXT NOT NULL, authority_head TEXT NOT NULL)"
+)
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -76,6 +90,33 @@ _ADDED_COLUMNS = (
 
 class StoreFormatError(RuntimeError):
     """The database is not a store of this format (another marker, or not a store at all)."""
+
+
+def migrate_to_v2(conn: sqlite3.Connection) -> bool:
+    """Migrate a ``/1`` store to ``/2`` in place, inside the write transaction ``conn`` holds: add the
+    ``graduation_steps`` table and set the marker. ``True`` if it migrated, ``False`` for a store already ``/2``.
+    A store with no marker, or another one, raises :class:`StoreFormatError` and is left as it was. No other table
+    changes: a binding is read as it was written, and the rung it fires at is the gate's to decide, not this
+    function's.
+
+    The caller owns the transaction, so the table and the marker commit
+    together or not at all."""
+    if not conn.in_transaction:
+        raise RuntimeError("migrate_to_v2 runs inside its caller's write transaction")
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row is None:
+        raise StoreFormatError("the database has no store format marker: it is not migrated")
+    if row[0] == STORE_FORMAT_V2:
+        conn.execute(_GRADUATION_STEPS)
+        return False
+    if row[0] != STORE_FORMAT_V1:
+        raise StoreFormatError(f"store format {row[0]!r} is not {STORE_FORMAT_V1!r}: it is not migrated")
+    conn.execute(_GRADUATION_STEPS)
+    conn.execute("UPDATE meta SET value = ? WHERE key = 'format'", (STORE_FORMAT_V2,))
+    return True
 
 
 def default_store_dir() -> Path:
