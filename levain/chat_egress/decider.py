@@ -72,6 +72,8 @@ from levain.chat_egress.resolver import Resolver, ResolveError
 
 log = logging.getLogger("levain.chat_egress.decider")
 
+#: the card step's reason when an upload-pack body was past advert.UPLOAD_PACK_BODY_CAP (K1 counts it as a cap card)
+UPLOAD_PACK_OVER_CAP = "upload_pack_over_cap"
 THREAD_DECIDE = "levain-egress-decide"
 THREAD_LINK = "levain-egress-link"
 THREAD_OBS = "levain-egress-obs"
@@ -862,10 +864,14 @@ class Decider:
             if got is None:
                 return
             answer, from_queue = got
+            # the row's reason; the card itself shows v.why. Only the body clause of classify's R-9 card ("body" is the
+            # first why of a pack POST that is neither marked nor overridden) is the cap card when the body was cut;
+            # any other reason (a credential mark, `_method`, an override) keeps its own.
+            why = UPLOAD_PACK_OVER_CAP if r.body_cut and v.why == "body" else v.why
             if answer == "allowed":
-                r.step_name = f"card:{v.why}:allowed"
+                r.step_name = f"card:{why}:allowed"
                 return self._allow(r)
-            return self._deny(r, f"card:{v.why}:{answer}", 403, f"card: {answer}", withdraw=not from_queue)
+            return self._deny(r, f"card:{why}:{answer}", 403, f"card: {answer}", withdraw=not from_queue)
         finally:
             self._card_slots.release()
 
@@ -892,6 +898,13 @@ class Decider:
             rec.Attach.NOT_EVALUATED if r.rid is None else rec.Attach.NONE)
         marked = tuple(q for q in p.params if r.verdict is not None and q.folded in r.verdict.query_names)
         names = list(r.strip.stripped if r.strip is not None else ()) + list(shape.query_name_shapes(marked))
+        if r.verdict is not None and r.verdict.exemption in ("signed_url", "azure_sas"):
+            # an exemption lifted the mark, so no name was marked: keep the lifted NAMES (never a value) so K1 can count
+            # them. One rule for the signed-URL set, Azure SAS's `sig`, and both together (classify labels the combined read
+            # `azure_sas`); any other label lifted no name this code knows.
+            azure = r.verdict.exemption == "azure_sas"
+            names += [q.folded for q in p.params
+                      if q.folded in classify._SIGNED_URL_READ_EXEMPT or (azure and q.folded == "sig")]
         return rec.Attempt(
             host=p.canonical_host or wire.escape_text(p.host, wire.HOST_LIMIT),
             method=r.verdict.method if r.verdict is not None else p.method,
