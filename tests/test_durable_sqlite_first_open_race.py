@@ -99,9 +99,11 @@ def run_first_open_race(base: Path, trials: int = TRIALS) -> tuple[list, list]:
     """Two real processes, ``trials`` times, each making the first call on a store directory that does not hold
     ``limits.db`` yet. Returns (calls not answered ok, trials whose two ok calls were not both counted)."""
     sessions = ("sess-x", "sess-y")
-    workers = [_Worker(s) for s in sessions]
+    workers: list = []
     ok = False
     try:
+        for s in sessions:
+            workers.append(_Worker(s))
         assert [w.read() for w in workers] == ["ready", "ready"]
         failed, miscounted = [], []
         for i in range(trials):
@@ -122,8 +124,14 @@ def run_first_open_race(base: Path, trials: int = TRIALS) -> tuple[list, list]:
         ok = True
         return failed, miscounted
     finally:
-        for w in workers:
-            w.reap(ok)
+        first = None
+        for w in workers:   # reap every worker even when an earlier reap raises; raise the first failure after
+            try:
+                w.reap(ok)
+            except BaseException as exc:
+                first = first or exc
+        if first is not None:
+            raise first
 
 
 def test_two_first_calls_on_a_store_not_yet_created_are_both_counted(tmp_path):
