@@ -73,8 +73,10 @@ class Run:
         def ask(op: str, **kw) -> Dict[str, Any]:
             return _ok(control.handle(root, {"v": 1, "op": op, "id": 3, **kw}))
 
+        # the operator uid ControlThread was built with (c3_rig: os.getuid()), never routemaps' fixed 501:
+        # on a Linux CI runner the two differ and ATTACH answers claims-mismatch
         ask("ATTACH", lease_nonce=nonce, sudo_uid=DISPATCH_UID, session=session,
-            claims=d_attach_claims(self.ticket))
+            claims=d_attach_claims(self.ticket, operator_uid=R3.OP_UID))
         gen = ask("CAS", session=session, generation=0, fields={}, **{"from": R.ALLOCATED, "to": R.RENDERING})
         pid = os.getpid()
         front = {"uid": os.geteuid(), "pid": pid, "start": peer.start_of(pid)}
