@@ -181,3 +181,30 @@ def test_every_card_state_is_served_from_the_rows_and_drawn(tmp_path, monkeypatc
             "ended": ("ended", "ENDED")}
     for n, (state, label) in want.items():
         assert drawn[n][0] == state and drawn[n][1] == label and drawn[n][2].startswith(label), (n, drawn[n])
+
+
+@needs_browser
+@needs_ssh
+def test_a_card_whose_dispatch_store_cannot_be_read_heads_unreadable(tmp_path, monkeypatch):
+    # L3 r1 ruling 3: the header says UNREADABLE, never the queue's ALLOWED, for a card whose record cannot be read
+    home = tmp_path / "levain_home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    consent = home / "consent"
+    consent.mkdir(parents=True, mode=0o700)
+    keydir = tmp_path / "keys"
+    keydir.mkdir()
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", {"laptop": Key(keydir, "laptop")})
+    log.enrol("laptop", "laptop-presence")
+    q = ConsentQueue(consent, authority=log.source)
+    live = _launch(CoordStore(consent), live=True)
+    c = _card(live, "unreadable.example")
+    r = file_card(q, c, agent_session_id="s", cwd="/w")
+    payload, sig = signed(q, r, log.keys["laptop"], "allow")
+    q.answer(r.id, payload, sig)
+    (consent / "dispatch.db").write_bytes(b"this is not a sqlite file" * 400)
+    steps = [NARROW, {"eval": OPEN_DECISIONS}, {"until": _row(r.id)},
+             {"eval": f"{_row(r.id)}.querySelector('.consent-head .consent-audit').textContent"}]
+    with _serve(_install(tmp_path)[1], surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", steps)["values"]
+    assert "UNREADABLE" in out, out

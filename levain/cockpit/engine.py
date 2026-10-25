@@ -44,6 +44,7 @@ from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from levain.cockpit.registry import (
@@ -485,7 +486,8 @@ def _consent_rows_in(got: Any, egress_lookup: Callable[[str, str], tuple[Any, bo
     this panel is token-free on loopback. The row never carries the time left (the page counts down from
     ``expires_at``), so its version does not change every second. A ``levain_egress`` row also carries
     ``egress_state``, what the card became (``listing.egress_state_of`` over ``egress_lookup``, the computation the
-    body route serves), so a decided row's header can say it before its details open."""
+    body route serves; ``unreadable`` when the lookup could not answer), so a decided row's header can say it before
+    its details open. A pending row carries none."""
     from levain.consent.listing import egress_state_of
 
     rows: list[RowIn] = []
@@ -501,7 +503,7 @@ def _consent_rows_in(got: Any, egress_lookup: Callable[[str, str], tuple[Any, bo
                 "at": r.received_at}
             if e.decided_at is not None:
                 facets["decided_at"] = e.decided_at
-            word = egress_state_of(e, egress_lookup)
+            word = None if pending else egress_state_of(e, egress_lookup)   # a pending header never draws it
             if word is not None:
                 facets["egress_state"] = word
             rows.append(RowIn(
@@ -1432,7 +1434,10 @@ class Cockpit:
         fn = self._dec.consent
         if fn is None:
             return Absent("no consent queue")
-        for r in _consent_rows_in(fn(ctx.now), _egress_lookup_of(fn))[0]:
+        got = fn(ctx.now)
+        mine = SimpleNamespace(**{part: tuple(e for e in getattr(got, part) if f"{CONSENT_ROW_PREFIX}{e.request.id}" == row_id)
+                                  for part in ("pending", "undecided", "recent")})   # only this entry is built and looked up
+        for r in _consent_rows_in(mine, _egress_lookup_of(fn))[0]:
             if r.id == row_id:
                 return Read(rows=(r,))
         return Absent(f"decision {row_id!r} is gone")

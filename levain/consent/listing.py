@@ -206,6 +206,9 @@ def entry_body(entry: ConsentEntry, settled_lookup: Callable[[str, str], tuple[A
             **(_egress(entry, shown, settled_lookup) if settled_lookup is not None else {})}
 
 
+UNREADABLE = "unreadable"   # the listing's egress_state when a configured lookup could not answer (not a CardState)
+
+
 def _egress(entry: ConsentEntry, shown: object, lookup: Callable[[str, str], tuple[Any, bool]]) -> dict[str, str]:
     """``egress_state`` for a ``levain_egress`` card (nothing for another tool); ``egress_note`` when its egress rows
     cannot be read, so the page never shows a queue-only word as if the rows had been read. The decisions listing's
@@ -225,23 +228,42 @@ def _egress(entry: ConsentEntry, shown: object, lookup: Callable[[str, str], tup
 
 def egress_state_of(entry: ConsentEntry, lookup: Callable[[str, str], tuple[Any, bool]] | None) -> str | None:
     """The card's state word for a ``levain_egress`` entry, the one :func:`entry_body` serves as ``egress_state``;
-    None for another tool's entry, with no lookup, or when the rows cannot be read (the row then carries no word,
-    and the page draws the queue's own)."""
-    if lookup is None:
+    None for another tool's entry (its body is never read) or with no lookup configured. A lookup that was configured
+    and could not answer (the body unreadable, the egress rows unreadable) is :data:`UNREADABLE`, never a queue-only
+    word the page would draw as if the rows had been read."""
+    from levain.chat_egress.cards import EGRESS_TOOL
+
+    if lookup is None or entry.request.tool_name != EGRESS_TOOL:
         return None
-    return _egress(entry, filed_input(entry.request), lookup).get("egress_state")
+    try:
+        return _egress(entry, filed_input(entry.request), lookup).get("egress_state", UNREADABLE)
+    except Exception:  # noqa: BLE001 - one card that cannot be read is said so, never a dropped row
+        return UNREADABLE
 
 
 def egress_reading(reader: object) -> Callable[[str, str], tuple[Any, bool]] | None:
     """A read-only reading of the chat egress rows (``EgressReader.reading``) over the dispatch store beside the queue
     ``reader`` lists (``dispatch.db`` lives in the consent directory), or None for a reader naming no queue: never the
-    default queue's then, as the proposals route."""
+    default queue's then, as the proposals route. The reading is meant for ONE listing build (or one body read): the
+    first failure is kept and raised again for every later request, so a locked or corrupt store costs one failed read
+    per build, never one per card."""
     from levain.chat_egress.records import EgressReader
     from levain.consent.queue import default_queue_dir
 
     if not hasattr(reader, "directory"):
         return None
-    return EgressReader(reader.directory if reader.directory is not None else default_queue_dir()).reading
+    egress = EgressReader(reader.directory if reader.directory is not None else default_queue_dir())
+    failed: list[Exception] = []
+
+    def reading(launch_id: str, request_id: str) -> tuple[Any, bool]:
+        if failed:
+            raise failed[0]
+        try:
+            return egress.reading(launch_id, request_id)
+        except Exception as exc:  # noqa: BLE001 - kept for the rest of this build, raised to each caller
+            failed.append(exc)
+            raise
+    return reading
 
 
 def _check_directory(directory: Path) -> None:
