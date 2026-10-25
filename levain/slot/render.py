@@ -311,7 +311,9 @@ def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | Non
     the first): the blob against the ticket facts alloc carries (root's snapshot of CONTROL's record), refused by name
     before render acts. A session with no ticket has nothing to check here.
 
-    - ``ticket-facts-missing``: a ticket without its facts (an interrupted ``prepare``), or a verifier ticket whose
+    - ``ticket-facts-missing``: a ticket without its facts (an interrupted ``prepare``); facts lacking a field the
+      ticket's kind requires (an executor's or planner's ``route`` and ``model_requested``, a verifier's
+      ``verifier_steps``: 3c-8, so no gate below compares a field against an absent one); or a verifier ticket whose
       facts hold no resolved ``verifier`` entry (no driver is authorised without one);
     - ``ticket-kind-mismatch``: the alloc's kind and class are not what the ticket's kind renders as;
     - ``ticket-routes-mismatch``: the blob's routes are not exactly the ticket's ``route`` + ``egress_routes``;
@@ -324,6 +326,10 @@ def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | Non
         raise Refused("ticket-facts-missing", "alloc names a ticket without its facts")
     if RENDERS_AS.get(str(ticket_facts.get("kind"))) != (kind, slot_class):
         raise Refused("ticket-kind-mismatch", f"{ticket_facts.get('kind')!s:.16} is not {kind} {slot_class}")
+    required = ("verifier_steps",) if ticket_facts["kind"] == "verifier" else ("route", "model_requested")
+    for k in required:
+        if k not in ticket_facts:
+            raise Refused("ticket-facts-missing", f"a {ticket_facts['kind']} ticket's facts without {k}")
     want = sorted([*([ticket_facts["route"]] if "route" in ticket_facts else []),
                    *ticket_facts["egress_routes"]])                                   # type: ignore[misc]
     if sorted(blob.routes) != want:

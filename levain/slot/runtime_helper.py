@@ -1457,7 +1457,7 @@ def render_step2_policy(run: RenderRun) -> None:
     ``front:{uid, pending:true}`` (egress), fsync. DECISION: ``incarnation`` = the slot's ``lease_seq``, unique per
     lease of the slot (the contract types it nowhere; records.py reads it as a uint)."""
     ctx, a, blob = run.ctx, run.alloc, run.blob
-    facts = render_facts(ctx, a, blob)
+    facts = run.facts if run.facts is not None else render_facts(ctx, a, blob)
     RD.check_facts(blob, facts)
     run.facts = facts
     if run.egress:
@@ -1734,14 +1734,31 @@ def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]
         # §3.5's second gate, before step (1)'s CAS: a refusal here leaves the session ALLOCATED and acts on nothing
         RD.check_ticket(blob, a.kind, a.slot.slot_class, a.ticket, a.ticket_facts)
         run = RenderRun(ctx, a, blob)
+        # 3c-8 (1025-10 obs 2): step (2)'s checks read only alloc and the blob, so they run before the CAS too; a
+        # refusal among them leaves the session ALLOCATED, as the ticket gate does
+        run.facts = render_facts(ctx, a, blob)
+        RD.check_facts(blob, run.facts)
         try:
             for name, step in RENDER_STEPS:
                 ctx.seams.at(name)
                 step(run)
         except BaseException:
             kill_front(run)
+            if run.generation > 0:
+                revoke_failed_render(run)
             raise
     return {}
+
+
+def revoke_failed_render(run: RenderRun) -> None:
+    """3c-8 (1025-10 obs 2): a render refused after step (1)'s CAS answered left the session RENDERING (or past it),
+    which no later render can take up (step (1) CASes from ALLOCATED only), so root asks CONTROL to ``REVOKE`` it:
+    REVOKED is a state the reaper's END clears, as it would after the lease's EOF. Best effort: a REVOKE that fails
+    leaves the session to that EOF, and the render's own refusal is what the caller is answered."""
+    try:
+        run.ctx.call("REVOKE", session=run.alloc.session)
+    except Exception:   # noqa: BLE001 - the render's refusal is the answer; the lease EOF still revokes
+        pass
 
 
 # --- resume, status ---------------------------------------------------------------------------------------------------
