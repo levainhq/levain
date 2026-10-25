@@ -146,6 +146,7 @@
     if (!isObj(c)) return "cost not tracked";
     const usd = fmtUsd(c.usd), tok = fmtTokens(c.tokens);
     if (usd === null && tok === null) return "cost not tracked";
+    if (c.source === "transcript" && usd === null && tok !== null) return tok + " tokens from transcripts";   // spend read off the workers' transcripts: tokens, never a price
     const src = typeof c.source === "string" && c.source ? " " + c.source : "";
     return [usd, tok === null ? null : tok + " tok"].filter(Boolean).join(" · ") + src;
   }
