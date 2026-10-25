@@ -310,6 +310,36 @@ def test_refused_refuses_malformed_and_unhealthy(tmp_path):
     asyncio.run(go())
 
 
+def test_outbox_committed_counts_pending_lines_and_unresolved_ticketed_holds(tmp_path):
+    """r1 F1: `outbox_committed` is the outbox the ledger is committed to: durable payload lines with no ack, payload
+    lines queued but not durable, and every live ticketed hold not yet resolved (each resolves with exactly one
+    payload). An interactive hold commits nothing. keys checks its bound against this, so the outbox never passes it."""
+    path = ledger_path(tmp_path)
+
+    async def go():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        seen = [led.outbox_committed]
+        a = await Owner(led, meta={"lineage_base": BASE}).start()
+        b = await Owner(led).start()
+        seen.append(led.outbox_committed)                   # a's resolution is owed
+        _ref, fut = led.refused("s1", "r-a", "budget-exhausted", 1, {"lineage": {"n": 1}})
+        seen.append(led.outbox_committed)                   # + one queued line
+        await fut
+        seen.append(led.outbox_committed)                   # the line is durable: still one
+        await a.hold.durable()
+        a.hold.release({"lineage": dict(BASE, settled="no")})
+        seen.append(led.outbox_committed)                   # resolved, its line queued: counted once
+        await until(lambda: a.hold.state is L.RESOLVED)
+        seen.append((led.outbox_committed, led.outbox_size))
+        await a.finish()
+        await b.finish()
+        await led.aclose(5)
+        return seen
+
+    assert asyncio.run(go()) == [0, 1, 2, 2, 2, (2, 2)]
+
+
 def _q(led):
     out = []
     while True:

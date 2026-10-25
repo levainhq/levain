@@ -1027,6 +1027,8 @@ class Keys:
         self._refusals: Dict[Tuple[str, str], list] = {}
         self._lineage_wake: Optional[asyncio.Event] = None
         self.lineage_envelopes_refused = 0
+        #: r1 F1: refusal-window records not written because the outbox was at its bound
+        self.lineage_dropped = 0
         self.lineage_failure: Optional[str] = None
         if ledger is not None:
             ledger.on_outbox = self._lineage_due
@@ -1675,11 +1677,13 @@ class Keys:
     def lineage_status(self) -> dict:
         """keys' lineage status (H6-8; 3c-9 renders the doctor row from it): the outbox's size and bound, the records
         CONTROL quarantined (durable: the ledger's `lineage-acked` lines, so a restart keeps the count), the envelopes
-        CONTROL refused since start, and the last FAILURE note (None: none)."""
+        CONTROL refused since start, the refusal-window records dropped at a full outbox since start (r1 F1), and the
+        last FAILURE note (None: none)."""
         led = self.ledger
         return {"outbox": led.outbox_size if led is not None else 0, "outbox_max": self.lineage_outbox_max,
                 "quarantined": len(led.quarantined) if led is not None else 0,
-                "envelopes_refused": self.lineage_envelopes_refused, "failure": self.lineage_failure}
+                "envelopes_refused": self.lineage_envelopes_refused, "dropped": self.lineage_dropped,
+                "failure": self.lineage_failure}
 
     def _note_refusal(self, session: str, run: Optional[dict], name: str) -> None:
         """One refusal of a TICKETED `Q` made before any hold (so no hold row records it): counted in its (session,
@@ -1708,6 +1712,12 @@ class Keys:
         row = refused_row(run, reason=name, count=count, at=_stamp(first), ended_at=_stamp(time.time()))
         led = self.ledger
         if led is None:
+            return
+        if led.outbox_committed >= self.lineage_outbox_max:
+            # r1 F1 (bound): the outbox never passes `lineage_outbox_max`; a window's record that does not fit is
+            # counted (`lineage_status()["dropped"]`), never written. Refusals carry no money.
+            self.lineage_dropped += 1
+            self._lineage_trouble("the outbox is full: a refusal window's record was dropped (%d %s)" % (count, name))
             return
         try:
             # the ledger's reason grammar is the refusal's name without its `:<what>` (`body-unbounded:document`);
@@ -2739,9 +2749,10 @@ class Keys:
         if session in self.budget_stopped:
             raise norm.Refused("budget-overrun", "the session is stopped")
         if claims.get("run") is not None and self.ledger is not None \
-                and self.ledger.outbox_size >= self.lineage_outbox_max:
+                and self.ledger.outbox_committed >= self.lineage_outbox_max:
             # H6-11: a full lineage outbox refuses new TICKETED `Q`s until acks drain (an interactive session writes
-            # no lineage, so it is never refused for it)
+            # no lineage, so it is never refused for it). r1 F1: the measure counts the payloads already owed (lines
+            # not yet durable, ticketed holds not yet resolved), so concurrent admits cannot pass the bound
             raise norm.Refused("keys-unavailable", "the lineage outbox is full")
         return method, path, query, fwd, tpl, cred
 
@@ -2820,6 +2831,9 @@ class Keys:
 
         if reg.session in self.budget_stopped:
             raise norm.Refused("budget-overrun", "the session is stopped")
+        if run is not None and self.ledger.outbox_committed >= self.lineage_outbox_max:
+            # r1 F1: `_check_q`'s outbox check read again right before the admit (the body read sits between them)
+            raise norm.Refused("keys-unavailable", "the lineage outbox is full")
         try:
             return self.ledger.admit(scope, cap, bound, price_ref=price_ref, meta=meta)
         except ledger.Refused as e:

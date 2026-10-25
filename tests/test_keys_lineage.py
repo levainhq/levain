@@ -476,6 +476,30 @@ def test_lineage_outbox_full_refuses_ticketed(monkeypatch):
     assert _types(inter) == b"ARbe" and _types(again) == b"ARbe"
 
 
+def test_a_full_outbox_stays_at_its_bound_through_refusal_windows(monkeypatch):
+    # r1 F1 (bound): with the outbox at `lineage_outbox_max`, each ticketed `Q` is refused `keys-unavailable` and its
+    # window closes; the window's record does not fit, so it is COUNTED in `lineage_status()["dropped"]` and never
+    # written. Window after window, the outbox stays at its bound and no `refused` line reaches the file.
+    async def go(d):
+        async with KeysWorld(d, monkeypatch, lineage_outbox_max=2, refused_row_s=3600.0) as w:
+            await fill(w.ledger, [good_row(), good_row()])
+            sizes, names = [], set()
+            for _ in range(3):
+                for _ in range(4):
+                    names.add(_refused_name(await w.q(TICKETED)))
+                w.k.flush_refusals()
+                await until(lambda: not w.ledger._lines, 5, "drained")
+                sizes.append(w.ledger.outbox_size)
+            refused = [o for o in w.lines() if o["kind"] == "refused"]
+            return names, sizes, w.k.lineage_status(), len(refused)
+
+    names, sizes, status, refused = run_go(go)
+    assert names == {"keys-unavailable"}
+    assert sizes == [2, 2, 2] and status["outbox"] == 2
+    assert status["dropped"] == 3 and refused == 2      # the two prefilled lines only
+    assert "dropped" in (status["failure"] or "")
+
+
 # ---- delivery against a real CONTROL (R4 §3 "Delivery"; H6-8, H6-11, H6-19) -----------------------------------------
 
 class Ctl:

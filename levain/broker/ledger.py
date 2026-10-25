@@ -1299,6 +1299,14 @@ class Ledger:
         return len(self._outbox)
 
     @property
+    def outbox_committed(self) -> int:
+        """The outbox this ledger is committed to (r1 F1): `outbox_size`, plus every payload line queued but not yet
+        durable, plus every live ticketed hold not yet resolved (each resolves with exactly one payload). keys checks
+        its bound against this measure before anything that adds a payload, so the outbox never passes the bound."""
+        owed = sum(1 for h in self._live.values() if h.base is not None and h.outcome is None)
+        return len(self._outbox) + len(self._pending_outbox) + owed
+
+    @property
     def quarantined(self) -> Dict[Ref, str]:
         """Every durably acked quarantine: `{triple: field}` (H6-8's counter reads its size)."""
         return dict(self._quarantined)
