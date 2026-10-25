@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import inspect
 import threading
-from dataclasses import dataclass
 from functools import partial
 
 import pytest
 
-from levain.chat_egress import advert, parse
+from levain.chat_egress import advert, keys, parse
 from levain.chat_egress.advert import AdvertisementSet
 from levain.chat_egress.classify import GATED, OPEN_NETWORK, decide
 
@@ -27,14 +26,12 @@ GIT_HEADERS = {"content-type": REQ_CT, "accept": RES_CT, "git-protocol": "versio
 HOST = "git.example"
 
 
-@dataclass(frozen=True)
-class FakeRoute:
-    """The plan's fixed `RouteSnapshot` shape (S6 owns the definition)."""
-    record_id: str
-    canonical_host: str
-    credential_source: str
-    declared_repos: frozenset
-    attach: bool
+def FakeRoute(record_id, canonical_host, credential_source, declared_repos, attach):  # noqa: N802
+    """S6's real `keys.RouteSnapshot` with a fixed account and incarnation (both required since the integration
+    merge); the call shape S3a's fake had."""
+    return keys.RouteSnapshot(record_id=record_id, canonical_host=canonical_host, credential_source=credential_source,
+                              declared_repos=frozenset(declared_repos), attach=attach, credential_account="acct",
+                              incarnation="1:" + "0" * 64)
 
 
 def route(host=HOST, declared=("/o/declared.git",)):

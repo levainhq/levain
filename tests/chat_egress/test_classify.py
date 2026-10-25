@@ -13,24 +13,21 @@ need the composed run and stay red until S9: they are `xfail(strict=True)` at th
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 
 import pytest
 
-from levain.chat_egress import classify, parse
+from levain.chat_egress import classify, keys, parse
 from levain.chat_egress.classify import GATED, OPEN_NETWORK, decide
 
 AUDIT = "0b6f5f3e-3c1d-4c8e-9a3e-2d7b1f0c9a11"
 
 
-@dataclass(frozen=True)
-class FakeRoute:
-    """The plan's fixed `RouteSnapshot` shape (S6 owns the definition; S6 had not landed `keys.py` when S3a ran)."""
-    record_id: str
-    canonical_host: str
-    credential_source: str
-    declared_repos: frozenset
-    attach: bool
+def FakeRoute(record_id, canonical_host, credential_source, declared_repos, attach):  # noqa: N802
+    """S6's real `keys.RouteSnapshot` with a fixed account and incarnation (both required since the integration
+    merge); the call shape S3a's fake had."""
+    return keys.RouteSnapshot(record_id=record_id, canonical_host=canonical_host, credential_source=credential_source,
+                              declared_repos=frozenset(declared_repos), attach=attach, credential_account="acct",
+                              incarnation="1:" + "0" * 64)
 
 
 def frame(method="GET", host="public.example", port=443, path="/", query=None, headers=None, sni="default"):

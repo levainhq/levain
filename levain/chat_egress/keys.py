@@ -68,17 +68,18 @@ class RouteSnapshot:
     credential_source   the keychain item's service the value is read from at attach time (never the value)
     declared_repos      the repo path prefixes an upload-pack exchange may carry the key for
     attach              whether this route may attach at all (False: keyed for classification, never attaches)
-    credential_account  the keychain item's account (with the service, one item); None reads no value
+    credential_account  the keychain item's account (with the service, one item)
     incarnation         the record's `levain.authority.egress_key_incarnation` at launch, compared on every
-                        liveness check; None is never live (both default to None, so a route built without them is
-                        keyed and attaches nothing)"""
+                        liveness check
+    Every field is required (no default): a route always names its record's incarnation and keychain account. A
+    None in either is still read fail closed (no value is read, so nothing attaches)."""
     record_id: str
     canonical_host: str
     credential_source: str
     declared_repos: frozenset[str]
     attach: bool
-    credential_account: str | None = None
-    incarnation: str | None = None
+    credential_account: str | None
+    incarnation: str | None
 
 
 @dataclass(frozen=True, slots=True)

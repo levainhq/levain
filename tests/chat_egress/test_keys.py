@@ -123,10 +123,14 @@ def test_route_snapshot_is_the_fixed_type():
     assert isinstance(r.declared_repos, frozenset)
 
 
-def test_a_route_built_without_account_or_incarnation_attaches_nothing():
-    """The two fields default to None so a route built the old way still classifies as keyed; it never attaches."""
+def test_a_route_must_name_its_account_and_incarnation():
+    """Both fields are required (the integration merge): a route built the old way is a TypeError at construction.
+    A None in either is still read fail closed: keyed, nothing read, nothing attached."""
+    with pytest.raises(TypeError):
+        keys.RouteSnapshot(record_id="ek-000000000001", canonical_host="example.com",  # type: ignore[call-arg]
+                           credential_source=SOURCE, declared_repos=frozenset(), attach=True)
     bare = keys.RouteSnapshot(record_id="ek-000000000001", canonical_host="example.com", credential_source=SOURCE,
-                              declared_repos=frozenset(), attach=True)
+                              declared_repos=frozenset(), attach=True, credential_account=None, incarnation=None)
     store = FakeStore()
     d = _decide(bare, frame(path="/x"), store=store)
     assert d.keyed and d.credential is None and d.problem == "credential-unreadable" and store.reads == []

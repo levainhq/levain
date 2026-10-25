@@ -7,23 +7,21 @@ or `chat_egress_events`) are S9's runs: `xfail(strict=True)` at the bottom.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 
 import pytest
 
-from levain.chat_egress import parse, shape
+from levain.chat_egress import keys, parse, shape
 
 AUDIT = "0b6f5f3e-3c1d-4c8e-9a3e-2d7b1f0c9a11"
 TOKEN = r"<(?:0|1-4|5-8|9-16|17-32|33-64|65\+):[aA9\-%*]+>"
 
 
-@dataclass(frozen=True)
-class FakeRoute:
-    record_id: str
-    canonical_host: str
-    credential_source: str
-    declared_repos: frozenset
-    attach: bool
+def FakeRoute(record_id, canonical_host, credential_source, declared_repos, attach):  # noqa: N802
+    """S6's real `keys.RouteSnapshot` with a fixed account and incarnation (both required since the integration
+    merge); the call shape S3a's fake had."""
+    return keys.RouteSnapshot(record_id=record_id, canonical_host=canonical_host, credential_source=credential_source,
+                              declared_repos=frozenset(declared_repos), attach=attach, credential_account="acct",
+                              incarnation="1:" + "0" * 64)
 
 
 def route(declared=("/o/r.git",), host="git.example"):
