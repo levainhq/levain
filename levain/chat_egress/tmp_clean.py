@@ -21,24 +21,44 @@ log = logging.getLogger(__name__)
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 #: os.chmod can refuse to follow a symlink (lchmod: macOS, the BSDs). A Linux CPython has no lchmod, and its
-#: fchmodat(AT_SYMLINK_NOFOLLOW) stand-in raises ValueError / NotImplementedError where libc lacks it, so there the
-#: chmod is a plain one (see `_open_dir`) [judged by lane-chd2-s8d, 10-25, against CPython's posixmodule/os.py;
-#: not run on Linux]
+#: fchmodat(AT_SYMLINK_NOFOLLOW) stand-in raises ValueError / NotImplementedError where libc lacks it [judged by
+#: lane-chd2-s8d, 10-25, against CPython's posixmodule/os.py; not run on Linux]. There the entry is opened
+#: O_PATH|O_NOFOLLOW, checked a directory through that fd, and chmodded through `/proc/self/fd/<n>`, which names the
+#: opened inode, never a path the worker can swap; with no O_PATH or no /proc/self/fd no chmod is issued at all.
 _CHMOD_NOFOLLOW = os.chmod in os.supports_follow_symlinks
+_O_PATH: int | None = getattr(os, "O_PATH", None)
+_PROC_FD = "/proc/self/fd"
+_FD_CHMOD = _O_PATH is not None and os.path.isdir(_PROC_FD)
+
+
+class NoSafeChmod(OSError):
+    """An unreadable directory left as it is: this platform has no chmod that cannot follow a swapped-in symlink."""
+
+
+def _chmod_nofollow(dfd: int, name: str) -> None:
+    """`name` under `dfd` made 0700, never through a symlink: an entry that is not a directory when opened raises."""
+    if _CHMOD_NOFOLLOW:
+        os.chmod(name, 0o700, dir_fd=dfd, follow_symlinks=False)
+        return
+    if not _FD_CHMOD:
+        raise NoSafeChmod(f"{name}: no chmod here refuses a symlink")
+    fd = os.open(name, _O_PATH | os.O_NOFOLLOW, dir_fd=dfd)
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):        # a symlink swapped in after the lstat: never chmodded
+            raise NotADirectoryError(f"{name} is no longer a directory")
+        os.chmod(f"{_PROC_FD}/{fd}", 0o700)
+    finally:
+        os.close(fd)
 
 
 def _open_dir(dfd: int, name: str) -> int:
-    """`name` under `dfd` (lstat said a directory) opened O_NOFOLLOW. One its owner cannot read is made 0700 by name
-    and opened again; where os.chmod cannot refuse a symlink, a symlink swapped in after the lstat has its target's
-    mode changed by that chmod, and the second open still refuses it (O_NOFOLLOW)."""
+    """`name` under `dfd` (lstat said a directory) opened O_NOFOLLOW. One its owner cannot read is made 0700 without
+    following a symlink (`_chmod_nofollow`, which raises where it cannot) and opened again, O_NOFOLLOW again."""
     try:
         return os.open(name, _DIR_FLAGS, dir_fd=dfd)
     except PermissionError:
         pass
-    if _CHMOD_NOFOLLOW:
-        os.chmod(name, 0o700, dir_fd=dfd, follow_symlinks=False)
-    else:
-        os.chmod(name, 0o700, dir_fd=dfd)
+    _chmod_nofollow(dfd, name)
     return os.open(name, _DIR_FLAGS, dir_fd=dfd)
 
 
