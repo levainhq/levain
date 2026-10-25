@@ -61,9 +61,14 @@ def _write_cert(d: Path, name: str, pem: bytes) -> Path:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     try:
         os.fchmod(fd, 0o644)
-        os.write(fd, pem)
-    finally:
+        rest = memoryview(pem)
+        while rest:                                     # a short write is legal: the chat env must get the whole cert
+            rest = rest[os.write(fd, rest):]
+    except BaseException:
         os.close(fd)
+        path.unlink(missing_ok=True)                    # O_EXCL made it ours: no partial cert is left behind
+        raise
+    os.close(fd)
     return path
 
 

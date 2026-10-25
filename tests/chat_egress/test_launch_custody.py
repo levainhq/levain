@@ -82,6 +82,41 @@ def test_the_cert_is_never_written_through_a_symlink(tmp_path) -> None:
     assert target.read_bytes() == b"untouched"
 
 
+# --- S8D r1 fix item 3: a short os.write never leaves a truncated cert ------------------------------------------------
+
+def _short_writes(monkeypatch, *, fail_after: int | None = None) -> list[int]:
+    """os.write writing at most 7 bytes a call (a legal short write) to any fd but 0-2; after `fail_after` calls it
+    raises OSError(EIO). The counts written are returned."""
+    real, counts = os.write, []
+
+    def write(fd, data):
+        if fd in (0, 1, 2):
+            return real(fd, data)
+        if fail_after is not None and len(counts) >= fail_after:
+            raise OSError(5, "Input/output error")
+        counts.append(real(fd, bytes(data[:7])))
+        return counts[-1]
+    monkeypatch.setattr(os, "write", write)
+    return counts
+
+
+def test_a_short_write_still_lands_the_whole_cert(tmp_path, monkeypatch) -> None:
+    counts = _short_writes(monkeypatch)
+    a = cam.new_egress_ca(tmp_path, now=NOW, start_id="s4")
+    monkeypatch.undo()
+    print(f"RUN S8D fix 3 short write: {len(counts)} writes, {sum(counts)} of {len(a.cert_pem)} bytes")
+    assert a.cert_path.read_bytes() == a.cert_pem and len(counts) > 1
+    x509.load_pem_x509_certificate(a.cert_path.read_bytes())
+
+
+def test_a_write_that_fails_part_way_leaves_no_partial_cert(tmp_path, monkeypatch) -> None:
+    _short_writes(monkeypatch, fail_after=3)
+    with pytest.raises(OSError):
+        cam.new_egress_ca(tmp_path, now=NOW, start_id="s5")
+    monkeypatch.undo()
+    assert sorted(p.name for p in (tmp_path / "egress-ca").iterdir()) == []
+
+
 def test_control_the_scanner_finds_a_planted_key(tmp_path) -> None:
     a = cam.new_egress_ca(tmp_path, now=NOW, start_id="c")
     (tmp_path / "deep").mkdir()
