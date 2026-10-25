@@ -48,6 +48,7 @@ import hashlib
 import hmac
 import os
 import re
+import select
 import signal
 import socket
 import struct
@@ -170,6 +171,8 @@ REVOKED_TOKENS_MAX = 4096
 
 #: DECISION: a SESSION-EVENTS stream waits this long for a new event before it checks its peer for EOF again.
 STREAM_POLL_S = 0.25
+#: DECISION (L3 r1 fix 6): a SESSION-EVENTS peer none of whose bytes the stream could send for this long is dropped.
+STREAM_STALL_S = 30.0
 
 #: §4.9: each admin request's answer deadline per attempt; a missed one is sent again on the same connection.
 KEYS_ANSWER_S = 2.0
@@ -2671,8 +2674,10 @@ class ControlServer:
 
     def __init__(self, control: Control, path: Path, *,
                  peer_uid: Callable[[socket.socket], int | None] = kernel_peer_uid,
-                 max_connections: int = MAX_CONNECTIONS, frame_read_s: float = FRAME_READ_S) -> None:
+                 max_connections: int = MAX_CONNECTIONS, frame_read_s: float = FRAME_READ_S,
+                 stream_stall_s: float = STREAM_STALL_S) -> None:
         self.control = control
+        self.stream_stall_s = stream_stall_s
         self.path = Path(path)
         self._peer_uid = peer_uid
         self.max_connections = max_connections
@@ -2794,29 +2799,53 @@ class ControlServer:
         (L3 r1 fix 3)."""
         gap, replay, cursor = opening
         journal = self.control.events
-        if journal is None or (gap is not None and not self._send(sock, gap)):
+        # non-blocking from here to the close: macOS blocks a unix-socket send() on a full buffer even with
+        # MSG_DONTWAIT (measured 10-25), so only the fd's own O_NONBLOCK bounds :meth:`_stream_send`
+        sock.setblocking(False)
+        if journal is None or (gap is not None and not self._stream_send(sock, encode_frame(gap))):
             return
         for _seq, data in replay:
-            try:
-                sock.sendall(_LEN.pack(len(data)) + data)
-            except OSError:
+            if not self._stream_send(sock, _LEN.pack(len(data)) + data):
                 return
         while not self._stop.is_set():
             try:
                 got = journal.after(cursor, wait_s=STREAM_POLL_S)
             except Refused as e:
-                self._send(sock, {"kind": "error", "error": e.name})
+                self._stream_send(sock, encode_frame({"kind": "error", "error": e.name}))
                 return
             if got is None:
                 return
             for seq, data in got:
-                try:
-                    sock.sendall(_LEN.pack(len(data)) + data)
-                except OSError:
+                if not self._stream_send(sock, _LEN.pack(len(data)) + data):
                     return
                 cursor = seq
             if _peer_spoke_or_left(sock):
                 return
+
+    def _stream_send(self, sock: socket.socket, frame: bytes) -> bool:
+        """``frame`` on the stream's non-blocking socket, every wait bounded (L3 r1 fix 6): a full buffer is waited on
+        at most :data:`STREAM_POLL_S` at a time, and before each try the stream ends (False) on CONTROL's stop or on a
+        byte or EOF from the peer (its cancellation, read even while its buffer is full); it ends too once no byte has
+        gone out for ``stream_stall_s``."""
+        view = memoryview(frame)
+        room = select.poll()                     # poll, not select: a connection fd may be past FD_SETSIZE
+        room.register(sock, select.POLLOUT)
+        progress = time.monotonic()
+        while view:
+            if self._stop.is_set() or _peer_spoke_or_left(sock):
+                return False
+            try:
+                n = sock.send(view)
+            except (BlockingIOError, InterruptedError):
+                if time.monotonic() - progress >= self.stream_stall_s:
+                    return False
+                room.poll(STREAM_POLL_S * 1000)
+                continue
+            except OSError:
+                return False
+            view = view[n:]
+            progress = time.monotonic()
+        return True
 
     def stop(self) -> None:
         """Stop serving, as a crash would look to every session: no revoke on the way down."""

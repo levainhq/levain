@@ -169,3 +169,67 @@ def test_a_lost_journal_under_a_kept_meta_is_a_new_journal(erig, loss):
     jid2 = erig.events.journal_id
     erig.restart()
     assert erig.events.journal_id == jid2                              # the new journal holds lines now: kept
+
+
+# ---- item 6: a slow reader -------------------------------------------------------------------------------------------
+
+def _a_large_backlog(rig, n: int = 4000) -> None:
+    """``n`` pool events (fsync off: the test needs bytes on the wire, not durability), far past what the socket
+    buffers hold, so a peer that stops reading leaves the server's send waiting."""
+    rig.events._fsync = lambda _fd: None
+    for i in range(n):
+        rig.events.append({"kind": "pool", "egress_free": i, "none_free": i})
+
+
+def _until(cond, timeout: float) -> bool:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return cond()
+
+
+def _slow_reader(served) -> socket.socket:
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    c.connect(str(served.d / "c.sock"))
+    c.sendall(C.encode_frame({"v": 1, "op": "SESSION-EVENTS", "id": 3, "after_seq": 0}))
+    return c
+
+
+def _drain_to_eof(c: socket.socket) -> None:
+    c.settimeout(5)
+    while c.recv(1 << 16):
+        pass
+
+
+def test_a_reader_that_stops_reading_is_dropped(erig):
+    """A stream peer that stops reading is dropped once no byte has gone out for `stream_stall_s`: its thread and its
+    connection slot are freed (here 1 s; CONTROL's own default is STREAM_STALL_S)."""
+    served = Served(erig, stream_stall_s=1.0)
+    try:
+        _a_large_backlog(erig)
+        c = _slow_reader(served)
+        assert _until(lambda: served.conns() == 1, 5)
+        assert _until(lambda: served.conns() == 0, 10), "the slow reader is still served"
+        _drain_to_eof(c)                                               # the server closed it: EOF after the buffer
+        c.close()
+    finally:
+        served.stop()
+
+
+def test_a_cancel_byte_ends_a_stream_blocked_on_a_full_buffer(erig):
+    """The peer's byte (its cancellation) is read between bounded sends: a stream whose replay is waiting on a full
+    socket buffer ends promptly when the peer sends it, long before any stall bound."""
+    served = Served(erig, stream_stall_s=600.0)
+    try:
+        _a_large_backlog(erig)
+        c = _slow_reader(served)
+        assert _until(lambda: served.conns() == 1, 5)
+        time.sleep(0.5)                                                # the server is now waiting to send
+        c.sendall(b"x")
+        assert _until(lambda: served.conns() == 0, 5), "the cancelled stream is still served"
+        c.close()
+    finally:
+        served.stop()
