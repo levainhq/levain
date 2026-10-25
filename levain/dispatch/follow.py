@@ -83,7 +83,8 @@ Resolve = Callable[[Mapping[str, Any]], "VerifierCall | None"]
 class EventFollower:
     """``jobs`` holds the cursor and the records; ``stream(after_seq, journal_id)`` opens SESSION-EVENTS and
     ``connect()`` a ControlClient for the ACK; ``resolve`` maps a verifier's terminal event to its inputs. ``fault``
-    is the crash seam: called with ``("written", seq)`` after (1) and ``("acked", seq)`` after (2)."""
+    is the crash seam: called after (1) with ``("written", seq)``, or ``("repeat", seq)`` when the store already held
+    the event's outcome, and with ``("acked", seq)`` after (2)."""
 
     def __init__(self, jobs: JobStore, stream: Callable[[int, str | None], CC.EventStream],
                  connect: Callable[[], CC.ControlClient], resolve: Resolve, *,
@@ -195,11 +196,12 @@ class EventFollower:
         if call is None:
             raise FollowStopped("ticket-unresolved", f"event {ev.seq}: no verifier run dispatch minted holds this "
                                                      "ticket")
+        seam = "written"
         try:
             self.jobs.record_verification(call.run, envelope=call.envelope, event=body, repo=call.repo,
                                           tree=call.tree, model=call.model)
         except AlreadyRecorded:
-            pass                                       # an idempotent repeat: dispatch holds this outcome, so ACK
+            seam = "repeat"                            # an idempotent repeat: dispatch holds this outcome, so ACK
         except RecordConflict as e:
             raise FollowStopped("record-conflict", f"event {ev.seq}: {e}") from None
         except TransitionRefused as e:
@@ -211,7 +213,7 @@ class EventFollower:
             return
         except DispatchError as e:
             raise FollowStopped("record-refused", f"event {ev.seq}: {e}") from None
-        self._hit("written", ev.seq)
+        self._hit(seam, ev.seq)
         args: dict[str, object] = {"ticket": body["ticket"]}
         if "verifier_report_digest" in body:
             args["verifier_report_digest"] = body["verifier_report_digest"]

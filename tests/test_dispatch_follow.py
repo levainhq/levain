@@ -464,3 +464,22 @@ def test_a_close_landing_during_the_ack_call_ends_the_step_cancelled(store, repo
     assert not acked(served)
     cur = store.event_cursor()
     assert cur is None or cur[1] < _verifier_event_seq(served)
+
+
+def test_a_re_delivered_write_meets_the_repeat_seam_never_the_written_one(store, repo, served):  # noqa: F811
+    """deepseek LOW (verify r1): after a crash past the write, the re-delivered event is an AlreadyRecorded repeat and
+    the fault seam names it "repeat", so a seam armed on "written" for every call crashes only the first write."""
+    d = setup_verifier(store, repo, served)
+    hits: list = []
+
+    def fault(where: str, seq: int) -> None:
+        hits.append(where)
+        if where == "written":
+            raise Crash(where)
+
+    f = F.EventFollower.at(store, served.path, d.resolve, read_deadline=0.5, fault=fault)
+    with pytest.raises(Crash):
+        f.step()
+    assert f.step().outcome == CC.DEADLINE
+    assert hits == ["written", "repeat", "acked"] and acked(served)
+    f.close()
