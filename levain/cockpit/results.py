@@ -9,7 +9,7 @@ said only by a read that confirmed its source. An exception escaping a provider 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Union
 
 
 @dataclass(frozen=True)
@@ -63,4 +63,4 @@ class Fault:
     message: str
 
 
-Result = Read | Absent | Fault
+Result = Union[Read, Absent, Fault]
