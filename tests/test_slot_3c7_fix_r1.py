@@ -9,10 +9,12 @@
   sync over a broken connection, POOL on a poisoned journal or with no ticket store."""
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import socket
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,7 @@ from levain.contracts import canon
 from levain.slot import Refused
 from levain.slot import control as C
 from levain.slot import records as R
+from levain.slot import routemaps as RM
 from levain.slot import tickets as T
 from levain.slot.ids import SlotId
 from tests.test_pool import EXEC_FACTS, F2_DISPATCH, attach, entry, pool, rig, sync  # noqa: F401 - fixtures
@@ -45,9 +48,37 @@ def _blob(**kw) -> bytes:
     return canon.canonical_bytes({k: v for k, v in obj.items() if v is not None})
 
 
+#: the active verifier entry VER_FACTS names (3c-8: a verifier ticket carries the entry CONTROL resolved at mint)
+VER_ENTRY = {"verifier_id": "pytest-report", "verifier_artifact_digest": "sha256:" + "5" * 64,
+             "declared_kind": "black-box", "driver_template": "pytest_report",
+             "driver_template_digest": "sha256:" + "6" * 64, "steps": STEPS,
+             "steps_digest": "sha256:" + hashlib.sha256(canon.canonical_bytes(STEPS)).hexdigest(),
+             "driver_input": {}, "driver_input_digest": "sha256:" + "3" * 64}
+
+
+class Verifiers:
+    """A stand-in for CONTROL's verifier store with one active generation holding VER_ENTRY (3c-8; the signed
+    CONFIG-SUBMIT path is tests/test_slot_3c8.py's)."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.gen = RM.CheckedVerifiers(1, "0" * 64, "ab" * 16, {"pytest-report": VER_ENTRY})
+
+    def active(self):
+        return self.gen
+
+    def start_pass(self) -> None:
+        pass
+
+
 def _mint(d, facts: dict) -> str:
     d.n += 1
-    return d.tickets.mint(f"a-{d.n}", T.check_facts(facts), C.new_handle).ticket
+    resolved = None
+    if facts["kind"] == "verifier":
+        if d.w.control.verifiers is None:
+            d.w.control.verifiers = Verifiers()
+        resolved = d.w.control.verifiers.active().resolved(facts["verifier_id"])
+    return d.tickets.mint(f"a-{d.n}", T.check_facts(facts), C.new_handle, resolved=resolved).ticket
 
 
 # ---- HIGH 1: one ticket-facts shape -----------------------------------------------------------------------------
@@ -83,7 +114,9 @@ def test_verifier_ticketed_prepare_writes_its_facts(dispatch):
     line = d.prepare(ticket, "none", "verifier", "claude", "none")
     assert line["ok"], (line, w.last_err)
     a = w.alloc(line["session"])
-    assert a.ticket == ticket and a.ticket_facts == T.check_facts(VER_FACTS)
+    assert a.ticket == ticket
+    assert a.ticket_facts == dict(T.check_facts(VER_FACTS), verifier=d.w.control.verifiers.active().resolved(
+        "pytest-report"))
 
 
 # ---- HIGH 2 / obs 1: render's second gate -----------------------------------------------------------------------

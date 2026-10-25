@@ -10,6 +10,7 @@ row, named in each test that stands in for one.
 from __future__ import annotations
 
 import errno
+import hashlib
 import io
 import os
 import threading
@@ -21,6 +22,7 @@ from levain.contracts import canon
 from levain.slot import Refused
 from levain.slot import control as C
 from levain.slot import records as R
+from levain.slot import render as RD
 from levain.slot import runtime_helper as H
 from levain.slot import stage as ST
 from levain.slot import tickets as T
@@ -630,7 +632,7 @@ def test_none_class_no_front_no_handle(world, request):
                            "verifier_generation": 1, "verifier_id": "pytest-report",
                            "verifier_steps": [{"argv": ["pytest", "-q"], "wall_s": 60}],
                            "input_bundle_digest": "sha256:" + "2" * 64, "driver_input_digest": "sha256:" + "3" * 64})
-    ticket = tickets.mint("a-verifier-1", facts, C.new_handle).ticket
+    ticket = tickets.mint("a-verifier-1", facts, C.new_handle, resolved=VERIFIER_ENTRY).ticket
     tickets.bind(ticket, s)                                              # what ATTACH of the ticket-bound lease journals
     a = R.Alloc(session=s, slot=slot, lease_seq=1, slot_rev=1, slot_uid=893, slot_gid=893, kind="verifier",
                 vendor="claude", auth="none", operator_uid=OP_UID, supervisor_uid=DISPATCH_UID,
@@ -651,7 +653,7 @@ def test_none_class_no_front_no_handle(world, request):
     (world.L / "staging" / s).mkdir()
     world.stage(s)
     (world.L / "staging" / s / "driver_input.json").write_bytes(b"{}")
-    blob = _blob(routes=[], verifier_steps=[{"argv": ["pytest", "-q"], "wall_s": 60}], driver="pytest-report")
+    blob = _blob(routes=[], verifier_steps=[{"argv": ["pytest", "-q"], "wall_s": 60}], driver="output_compare")
     code, line = world.main(["render", s], blob, uid=DISPATCH_UID)
     assert line == {"ok": True}, world.last_err
     assert world.fronts.procs == {} and world.registered == [] and world.armed == []
@@ -666,10 +668,16 @@ def test_none_class_no_front_no_handle(world, request):
 
 #: a resolved verifier entry (§3.5 VERIFIER IDENTITY) as CONTROL adds it to a verifier ticket's facts, which alloc
 #: carries: render's ticket check holds the blob's driver to its `driver_template` (3c-7 fix r1)
+#: 3c-8: the entry CONTROL resolves at mint, consistent with the ticket's facts (`tickets.check_resolved`), naming a
+#: template this levain ships with its real digest (render's `driver-template-digest-mismatch`)
 VERIFIER_ENTRY = {"verifier_generation": 1, "verifier_id": "pytest-report",
                   "verifier_artifact_digest": "sha256:" + "5" * 64, "declared_kind": "black-box",
-                  "driver_template": "pytest-report", "driver_template_digest": "sha256:" + "6" * 64,
-                  "steps_digest": "sha256:" + "7" * 64, "driver_input_digest": "sha256:" + "3" * 64}
+                  "driver_template": "output_compare",
+                  "driver_template_digest": "sha256:" + hashlib.sha256(
+                      RD.read_driver_template("output_compare") or b"").hexdigest(),
+                  "steps_digest": "sha256:" + hashlib.sha256(canon.canonical_bytes(
+                      [{"argv": ["pytest", "-q"], "wall_s": 60}])).hexdigest(),
+                  "driver_input_digest": "sha256:" + "3" * 64}
 
 
 def test_render_refused_for_another_callers_session(world):

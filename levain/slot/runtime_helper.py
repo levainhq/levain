@@ -555,6 +555,8 @@ class Seams:
     grant_search: Callable[[str, int, Path, str, int], None] = grant_broker_search
     wake_reaper: Optional[Callable[[], None]] = None
     hook_templates: Mapping[str, RD.HookTemplate] = field(default_factory=dict)
+    #: a driver template's bytes by name (3c-8, render's ``driver-template-digest-mismatch``)
+    driver_template: Callable[[str], Optional[bytes]] = RD.read_driver_template
     front_module: str = FRONT_MODULE
     front_args: Callable[[str, SlotId], Sequence[str]] = stub_front_args
     lock_wait_s: float = LOCK_WAIT_S
@@ -1733,9 +1735,12 @@ def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]
             raise Refused("not-allocated", req.session)
         # §3.5's second gate, before step (1)'s CAS: a refusal here leaves the session ALLOCATED and acts on nothing
         RD.check_ticket(blob, a.kind, a.slot.slot_class, a.ticket, a.ticket_facts)
+        if a.ticket is not None and a.ticket_facts is not None and a.ticket_facts.get("kind") == "verifier":
+            RD.check_driver_template(a.ticket_facts["verifier"], ctx.seams.driver_template)   # type: ignore[arg-type]
         run = RenderRun(ctx, a, blob)
-        # 3c-8 (1025-10 obs 2): step (2)'s checks read only alloc and the blob, so they run before the CAS too; a
-        # refusal among them leaves the session ALLOCATED, as the ticket gate does
+        # 3c-8 (1025-10 obs 2): step (2)'s checks read alloc, the blob and root's own files (the base map, the hook
+        # templates), none of which the CAS changes, so they run before it too; a refusal among them leaves the
+        # session ALLOCATED, as the ticket gate does
         run.facts = render_facts(ctx, a, blob)
         RD.check_facts(blob, run.facts)
         try:

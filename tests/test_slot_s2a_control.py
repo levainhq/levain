@@ -47,7 +47,9 @@ SESSION2 = {"operator": {"LEASE-OPEN", "STATUS"},
                          # S1 3c-5 session 2: a ticket-bound lease (CONTRACT §3.1 step 1)
                          "LEASE-OPEN",
                          # S1 3c-7: the pool count (CONTRACT §3.3 dispatch row, §3.5 Pool)
-                         "POOL"}}
+                         "POOL",
+                         # S1 3c-8: the verifier generations (CONTRACT §3.3 dispatch row, §3.5 VERIFIER IDENTITY)
+                         "CONFIG-SUBMIT"}}
 
 
 def attach_claims(**kw) -> dict:
