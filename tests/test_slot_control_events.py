@@ -152,8 +152,8 @@ def _stream(rig, after: int) -> tuple:
     conn = C.Conn(DISPATCH_UID)
     hello = rig.control.handle(conn, {"v": 1, "op": "SESSION-EVENTS", "id": 7, "after_seq": after})
     assert hello["ok"], hello
-    gap, cursor = conn.stream
-    got = rig.events.after(cursor)
+    gap, replay, cursor = conn.stream
+    got = replay + rig.events.after(cursor)
     return hello, gap, [canon.parse(b) for _s, b in got]
 
 

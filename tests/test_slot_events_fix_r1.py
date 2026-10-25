@@ -5,6 +5,7 @@ Each test was RED on af2256d6 (the slice-2 tip) and names the ruling item it hol
 from __future__ import annotations
 
 import socket
+import time
 from pathlib import Path
 
 import pytest
@@ -110,4 +111,35 @@ def test_a_live_stream_ends_with_an_error_frame_when_the_journal_is_poisoned(ser
     assert _frame(c) == {"kind": "error", "error": "events-unavailable"}
     c.settimeout(5)
     assert c.recv(1) == b""
+    c.close()
+
+
+# ---- item 4: the replay is pinned when the stream opens --------------------------------------------------------------
+
+def test_a_prune_after_the_hello_never_drops_an_advertised_event(served):
+    """The opening's replay is read under the lock the hello is read under: a prune that runs between the answer and
+    the stream's first read (here: forced on the stream's first `after`) cannot drop events the hello advertised."""
+    rig = served.rig
+    bound_session(rig)
+    to_retained(rig)
+    cas(rig, R.RETAINED, R.TRASH)
+    cas(rig, R.TRASH, R.PURGED)                                         # its events are prunable from here on
+    kept = rig.kept()
+    real = rig.events.after
+    pruned = {"n": None}
+
+    def after(seq, **kw):
+        if pruned["n"] is None:
+            pruned["n"] = rig.events.prune()
+        return real(seq, **kw)
+
+    rig.events.after = after
+    c, hello = served.open(0)
+    assert (hello["oldest_seq"], hello["newest_seq"]) == (kept[0]["seq"], kept[-1]["seq"])
+    got = [_frame(c) for _ in kept]
+    assert got == kept
+    end = time.monotonic() + 5
+    while pruned["n"] is None and time.monotonic() < end:           # the stream's first `after` follows the replay
+        time.sleep(0.01)
+    assert pruned["n"], "the prune ran and dropped events"
     c.close()

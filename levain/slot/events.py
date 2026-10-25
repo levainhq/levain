@@ -393,10 +393,14 @@ class EventJournal:
                 "oldest_seq": self._kept[0].seq if self._kept else 0,
                 "newest_seq": self._kept[-1].seq if self._kept else 0}
 
-    def open_stream(self, after_seq: int) -> Tuple[Dict[str, object], Optional[Dict[str, object]], int]:
-        """``SESSION-EVENTS {after_seq}``'s opening, read at one instant: (the hello, the gap or None, the cursor the
-        stream continues from). The gap is due when an event with ``seq > after_seq`` was pruned: the cursor is older
-        than the oldest kept event and the journal's first seq (1) is past it."""
+    def open_stream(self, after_seq: int) -> Tuple[Dict[str, object], Optional[Dict[str, object]],
+                                                   List[Tuple[int, bytes]], int]:
+        """``SESSION-EVENTS {after_seq}``'s opening, read at one instant: (the hello, the gap or None, the replay = every
+        kept event with ``seq > after_seq`` as (seq, line), the cursor the stream continues from = the replay's last
+        seq, else ``after_seq``). The replay is copied under the lock the hello is read under (L3 r1 fix 4), so a
+        prune before the stream sends it cannot drop an event the hello advertised. The gap is due when an event with
+        ``seq > after_seq`` was pruned: the cursor is older than the oldest kept event and the journal's first seq (1)
+        is past it."""
         with self.lock:
             self._open_or_raise()
             hello = self._hello()
@@ -404,7 +408,8 @@ class EventJournal:
             gap = None
             if oldest and after_seq < oldest - 1:
                 gap = {"kind": "gap", "oldest_seq": oldest}
-            return hello, gap, after_seq
+            replay = [(k.seq, k.data) for k in self._kept if k.seq > after_seq]
+            return hello, gap, replay, replay[-1][0] if replay else after_seq
 
     def _open_or_raise(self) -> None:
         if self._poisoned:

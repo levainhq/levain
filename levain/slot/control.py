@@ -2125,8 +2125,8 @@ class Control:
         after = R._uint(args["after_seq"], "after_seq")
         if self.events is None:
             raise Refused("events-unavailable", "CONTROL keeps no event journal")
-        hello, gap, cursor = self.events.open_stream(after)
-        conn.stream = (gap, cursor)
+        hello, gap, replay, cursor = self.events.open_stream(after)
+        conn.stream = (gap, replay, cursor)
         return hello
 
     # -- the queue broker's verb ------------------------------------------------------------------------------
@@ -2786,14 +2786,21 @@ class ControlServer:
             except OSError:
                 pass
 
-    def _stream(self, sock: socket.socket, opening: "tuple[dict[str, object] | None, int]") -> None:
+    def _stream(self, sock: socket.socket,
+                opening: "tuple[dict[str, object] | None, list[tuple[int, bytes]], int]") -> None:
         """The SESSION-EVENTS stream (:meth:`Control._op_session_events`) until the peer sends anything or ends, the
-        journal closes (CONTROL's stop) or a send fails. The gap first, then events by ``seq``; a journal poisoned
-        under the stream ends it with ``{kind:"error", error:"events-unavailable"}`` (L3 r1 fix 3)."""
-        gap, cursor = opening
+        journal closes (CONTROL's stop) or a send fails. The gap first, then the replay the opening pinned, then events
+        by ``seq``; a journal poisoned under the stream ends it with ``{kind:"error", error:"events-unavailable"}``
+        (L3 r1 fix 3)."""
+        gap, replay, cursor = opening
         journal = self.control.events
         if journal is None or (gap is not None and not self._send(sock, gap)):
             return
+        for _seq, data in replay:
+            try:
+                sock.sendall(_LEN.pack(len(data)) + data)
+            except OSError:
+                return
         while not self._stop.is_set():
             try:
                 got = journal.after(cursor, wait_s=STREAM_POLL_S)
