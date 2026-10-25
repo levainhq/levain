@@ -109,19 +109,25 @@ def test_every_card_state_is_served_from_the_rows_and_drawn(tmp_path, monkeypatc
     records.write_attempt(live, cards["ended"][0]["request"], Verdict.UNDECIDED, GET)
     records.write_ended(live, cards["ended"][0]["request"])
 
-    # the pending card's client leaves right after the board first reads it: the server's next read says ENDED
+    # the pending card's client leaves right after the board first reads its BODY: the body route's next read says
+    # ENDED. (The decisions listing reads the rows too, for its row words; only the body route's reading is tripped.)
     pending_req = cards["pending"][0]["request"]
-    real = rec.EgressReader.reading
+    from levain.web_server import _Handler
+    real_lookup = _Handler._egress_lookup
     left: list[int] = []
 
-    def reading(self, launch_id, request_id):
-        got = real(self, launch_id, request_id)
-        if request_id == pending_req and not left:
-            left.append(1)
-            records.write_attempt(launch_id, request_id, Verdict.UNDECIDED, GET)
-            records.write_ended(launch_id, request_id)
-        return got
-    monkeypatch.setattr(rec.EgressReader, "reading", reading)
+    def lookup(self):
+        real = real_lookup(self)
+
+        def reading(launch_id, request_id):
+            got = real(launch_id, request_id)
+            if request_id == pending_req and not left:
+                left.append(1)
+                records.write_attempt(launch_id, request_id, Verdict.UNDECIDED, GET)
+                records.write_ended(launch_id, request_id)
+            return got
+        return reading
+    monkeypatch.setattr(_Handler, "_egress_lookup", lookup)
 
     shots = Path(os.environ.get("LEVAIN_S7_SHOTS") or tmp_path)
     shots.mkdir(parents=True, exist_ok=True)
@@ -167,8 +173,8 @@ def test_every_card_state_is_served_from_the_rows_and_drawn(tmp_path, monkeypatc
     assert left, "the server never read the pending card's rows"
     assert "ended" in vals, out                                     # its focus view: read again, not the cached body
     heads = json.loads(next(v for v in vals if isinstance(v, str) and v.startswith('{"in_flight"') and "[" not in v))
-    assert heads == {"in_flight": "ALLOWED", "completed": "ALLOWED", "ambiguous": "ALLOWED", "denied": "DENIED",
-                     "expired": "EXPIRED", "ended": "ENDED"}, heads   # the queue's word, as the card reads it
+    assert heads == {"in_flight": "IN FLIGHT", "completed": "COMPLETED", "ambiguous": "AMBIGUOUS", "denied": "DENIED",
+                     "expired": "EXPIRED", "ended": "ENDED"}, heads   # the card's word from the listing, not the queue's
     drawn = json.loads(next(v for v in vals if isinstance(v, str) and v.startswith('{"in_flight":[')))
     want = {"in_flight": ("in_flight", "IN FLIGHT"), "completed": ("completed", "COMPLETED"),
             "ambiguous": ("ambiguous", "AMBIGUOUS"), "denied": ("denied", "DENIED"), "expired": ("expired", "EXPIRED"),

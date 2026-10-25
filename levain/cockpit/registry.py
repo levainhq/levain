@@ -114,6 +114,9 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "tool": ("str", _is_str),
     "consent_state": ("enum", _enum("pending", "allowed", "denied", "expired", "withdrawn", "undecided")),
     "consent_tier": ("str", _is_str),
+    # an egress card's state word (chat_egress.cards.CardState), the one the body route serves; a fixed vocabulary
+    "egress_state": ("enum", _enum("pending", "allowed", "in_flight", "completed", "denied", "expired",
+                                   "denied_or_expired", "ended", "ambiguous", "failed", "inconsistent")),
     "decided_at": ("timestamp", _is_str),    # a decided request's time (an unswept one: its expiry); `at` stays the filing
     # Q-2b: an agent's question in the decisions panel; `agent`, `at` and `decided_at` are registered above. The
     # question's words are never a facet (the panel is token-free on loopback): only its number, whether it is

@@ -208,7 +208,8 @@ def entry_body(entry: ConsentEntry, settled_lookup: Callable[[str, str], tuple[A
 
 def _egress(entry: ConsentEntry, shown: object, lookup: Callable[[str, str], tuple[Any, bool]]) -> dict[str, str]:
     """``egress_state`` for a ``levain_egress`` card (nothing for another tool); ``egress_note`` when its egress rows
-    cannot be read, so the page never shows a queue-only word as if the rows had been read."""
+    cannot be read, so the page never shows a queue-only word as if the rows had been read. The decisions listing's
+    rows carry the same word (:func:`egress_state_of`, this function's own computation)."""
     from levain.chat_egress.cards import EGRESS_TOOL, card_state
 
     if entry.request.tool_name != EGRESS_TOOL:
@@ -220,6 +221,27 @@ def _egress(entry: ConsentEntry, shown: object, lookup: Callable[[str, str], tup
         return {"egress_state": card_state(entry.state, settled, in_flight=in_flight).value}
     except Exception as exc:  # noqa: BLE001 - an unreadable record is said on the card, never a dead consent body
         return {"egress_note": f"the egress record could not be read ({type(exc).__name__})"}
+
+
+def egress_state_of(entry: ConsentEntry, lookup: Callable[[str, str], tuple[Any, bool]] | None) -> str | None:
+    """The card's state word for a ``levain_egress`` entry, the one :func:`entry_body` serves as ``egress_state``;
+    None for another tool's entry, with no lookup, or when the rows cannot be read (the row then carries no word,
+    and the page draws the queue's own)."""
+    if lookup is None:
+        return None
+    return _egress(entry, filed_input(entry.request), lookup).get("egress_state")
+
+
+def egress_reading(reader: object) -> Callable[[str, str], tuple[Any, bool]] | None:
+    """A read-only reading of the chat egress rows (``EgressReader.reading``) over the dispatch store beside the queue
+    ``reader`` lists (``dispatch.db`` lives in the consent directory), or None for a reader naming no queue: never the
+    default queue's then, as the proposals route."""
+    from levain.chat_egress.records import EgressReader
+    from levain.consent.queue import default_queue_dir
+
+    if not hasattr(reader, "directory"):
+        return None
+    return EgressReader(reader.directory if reader.directory is not None else default_queue_dir()).reading
 
 
 def _check_directory(directory: Path) -> None:

@@ -4297,9 +4297,11 @@
       head.appendChild(left);
       if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
     } else {
-      // an egress card's header says what the card says it became (its body, once read, says it from the rows)
+      // an egress card's header says what the card became: the listing's egress_state (the server's reading of the
+      // rows), else, when the row carries none, the queue's state alone
       const word = c.tool === EGRESS_TOOL
-        ? egressLabel(Object.prototype.hasOwnProperty.call(EGRESS_FROM_QUEUE, c.state) ? EGRESS_FROM_QUEUE[c.state] : "inconsistent")
+        ? egressLabel(typeof c.egressState === "string" && Object.prototype.hasOwnProperty.call(EGRESS_WORDS, c.egressState) ? c.egressState
+          : Object.prototype.hasOwnProperty.call(EGRESS_FROM_QUEUE, c.state) ? EGRESS_FROM_QUEUE[c.state] : "inconsistent")
         : c.state;
       head.appendChild(el("span", "consent-audit", word));
     }

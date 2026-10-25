@@ -134,7 +134,7 @@ KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "
                                     "reason", "unapplied", "cancelled_by",
                                     "agent", "tool", "consent_state", "consent_tier", "decided_at",
                                     "question_n", "question_state", "question_options", "note_n", "note_state",
-                                    "note_open_total", "sign"})
+                                    "note_open_total", "sign", "egress_state"})
 QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
 QUESTION_DONE_HOURS = 24                # an answered question stays listed this long, as a decided request does
 NOTE_VERB = "note_dismiss"              # the cockpit verb a note row offers (verbs.py registers it)
@@ -467,7 +467,14 @@ def _decision_rows_in(got: Any) -> list[RowIn]:
     return rows
 
 
-def _consent_rows_in(got: Any) -> tuple[list[RowIn], int]:
+def _egress_lookup_of(reader: Any) -> Callable[[str, str], tuple[Any, bool]] | None:
+    from levain.consent.listing import egress_reading
+
+    return egress_reading(reader)
+
+
+def _consent_rows_in(got: Any, egress_lookup: Callable[[str, str], tuple[Any, bool]] | None = None
+                     ) -> tuple[list[RowIn], int]:
     """The consent queue's listing (``levain.consent.listing.ConsentListing``) as rows: ``consent:<request_id>``
     per request an agent waits on (pending, or undecided and waiting on a late ruling, however old), and per one
     decided in the last day, with the count of entries that did not
@@ -476,7 +483,11 @@ def _consent_rows_in(got: Any) -> tuple[list[RowIn], int]:
     ``decided_at``), and nothing of the request's body: the display, cwd, targets, answer commands and how it
     was answered are served only to a token holder (``/cockpit/consent/<id>.json``), since
     this panel is token-free on loopback. The row never carries the time left (the page counts down from
-    ``expires_at``), so its version does not change every second."""
+    ``expires_at``), so its version does not change every second. A ``levain_egress`` row also carries
+    ``egress_state``, what the card became (``listing.egress_state_of`` over ``egress_lookup``, the computation the
+    body route serves), so a decided row's header can say it before its details open."""
+    from levain.consent.listing import egress_state_of
+
     rows: list[RowIn] = []
     bad = 0
     for e in (*got.pending, *got.undecided, *got.recent):
@@ -490,6 +501,9 @@ def _consent_rows_in(got: Any) -> tuple[list[RowIn], int]:
                 "at": r.received_at}
             if e.decided_at is not None:
                 facets["decided_at"] = e.decided_at
+            word = egress_state_of(e, egress_lookup)
+            if word is not None:
+                facets["egress_state"] = word
             rows.append(RowIn(
                 id=f"{CONSENT_ROW_PREFIX}{r.id}", title=f"{agent} \u00b7 {tool}", facets=facets,
                 stored={"state": e.state, "expires_at": r.expires_at, "decided_at": e.decided_at, "request": r.id}))
@@ -1349,7 +1363,7 @@ class Cockpit:
         if dec.consent is not None:
             try:
                 got = dec.consent(ctx.now)
-                built, bad = _consent_rows_in(got)
+                built, bad = _consent_rows_in(got, _egress_lookup_of(dec.consent))
                 why = tuple((n, reason) for n, reason in (
                     (got.skipped + bad, "consent request whose seal or stamps do not check out"),) if n)
                 if got.overflow:
@@ -1418,7 +1432,7 @@ class Cockpit:
         fn = self._dec.consent
         if fn is None:
             return Absent("no consent queue")
-        for r in _consent_rows_in(fn(ctx.now))[0]:
+        for r in _consent_rows_in(fn(ctx.now), _egress_lookup_of(fn))[0]:
             if r.id == row_id:
                 return Read(rows=(r,))
         return Absent(f"decision {row_id!r} is gone")
