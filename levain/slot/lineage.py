@@ -54,6 +54,9 @@ SINK = "lineage.jsonl"
 FORMAT = "levain-dispatch-lineage/3"
 #: H6-11 / CONTRACT §3.3: the most records one `LINEAGE-APPEND` envelope carries (one group commit).
 ENVELOPE_MAX = 64
+#: H6-19: the most bytes one envelope's canonical encoding holds (the control frame cap, 64 KiB, less headroom for
+#: the frame's own keys). keys starts a new envelope at either bound; CONTROL refuses one over it.
+ENVELOPE_BYTES_MAX = 48 * 1024
 #: the sink file's mode at creation (CONTRACT §2.1 row: `_levain_control:levain-lineage` 0640).
 SINK_MODE = 0o640
 
@@ -121,7 +124,9 @@ def _or_null(check: Callable[[object], bool]) -> Callable[[object], bool]:
 
 
 #: every `/3` field keys sends, in the order the check reports the first bad one (SCHEMAS §2.1's block order; `seq`
-#: is CONTROL's and `source` is checked with the envelope, H6-14). Nullable exactly where SCHEMAS §2.1 writes `|null`.
+#: is CONTROL's and `source` is checked with the envelope, H6-14). Nullable exactly where SCHEMAS §2.1 writes `|null`,
+#: plus `model_answered` / `provider_answered` (H6-21: `string | "unknown" | null`; `null` = no upstream call, a
+#: refused or released row; `"unknown"` = the call happened and the response did not say).
 RECORD_CHECKS: Dict[str, Callable[[object], bool]] = {
     "format": lambda v: v == FORMAT and type(v) is str,
     "at": _ts,
@@ -134,8 +139,8 @@ RECORD_CHECKS: Dict[str, Callable[[object], bool]] = {
     "routemap_generation": _uint(1),
     "route_policy_digest": _str(_DIGEST),
     "model_requested": _str(_NAME),
-    "model_answered": _str(_ANSWERED),
-    "provider_answered": _str(_ANSWERED),
+    "model_answered": _or_null(_str(_ANSWERED)),
+    "provider_answered": _or_null(_str(_ANSWERED)),
     "tokens_in": _or_null(_uint()),
     "tokens_out": _or_null(_uint()),
     "cost_microdollars": _or_null(_uint()),
@@ -151,8 +156,8 @@ RECORD_CHECKS: Dict[str, Callable[[object], bool]] = {
 }
 #: a full record's keys as the sink holds it
 RECORD_KEYS = frozenset(RECORD_CHECKS) | {"seq", "source"}
-#: a quarantine row's keys (R4 §3)
-QUARANTINE_KEYS = frozenset({"format", "seq", "source", "quarantined", "session"})
+#: a quarantine row's keys (R4 §3 read through H6-20: no `session`, which no source carries)
+QUARANTINE_KEYS = frozenset({"format", "seq", "source", "quarantined"})
 
 
 def check_triple(v: object) -> Optional[Triple]:
@@ -172,9 +177,12 @@ def source_of(t: Triple) -> Dict[str, object]:
 
 
 def check_envelope(envelope: object) -> Tuple[Triple, ...]:
-    """H6-2 / H6-14: `{ledger_id, epoch, records}`, 1..:data:`ENVELOPE_MAX` records, each an object whose `source` is a
-    valid triple naming the envelope's `ledger_id` and `epoch`. Anything else refuses the WHOLE envelope
-    ``lineage-record:envelope`` (a keys bug: nothing is appended). Returns each element's triple, in order."""
+    """H6-2 / H6-14 / H6-19: `{ledger_id, epoch, records}`, 1..:data:`ENVELOPE_MAX` records and at most
+    :data:`ENVELOPE_BYTES_MAX` bytes canonically encoded, each record an object whose `source` is a valid triple naming
+    the envelope's `ledger_id` and `epoch`. Anything else refuses the WHOLE envelope ``lineage-record:envelope`` (a
+    keys bug: nothing is appended). CONTROL sees only an envelope that fit the frame (an over-cap frame closes the
+    connection before this runs); the byte bound refuses one that fit the frame but not H6-19. Returns each element's
+    triple, in order."""
     if not isinstance(envelope, dict) or set(envelope) != {"ledger_id", "epoch", "records"}:
         raise _envelope("the envelope is exactly {ledger_id, epoch, records}")
     ledger_id, epoch, records = envelope["ledger_id"], envelope["epoch"], envelope["records"]
@@ -184,6 +192,12 @@ def check_envelope(envelope: object) -> Tuple[Triple, ...]:
         raise _envelope("epoch")
     if type(records) is not list or not 1 <= len(records) <= ENVELOPE_MAX:
         raise _envelope(f"records is a list of 1..{ENVELOPE_MAX}")
+    try:
+        size = len(canon.canonical_bytes(envelope))
+    except (ContractError, ValueError, TypeError, RecursionError):
+        raise _envelope("the envelope does not encode canonically") from None
+    if size > ENVELOPE_BYTES_MAX:
+        raise _envelope(f"the envelope encodes to {size} bytes, over {ENVELOPE_BYTES_MAX} (H6-19)")
     triples = []
     for rec in records:
         t = check_triple(rec.get("source")) if isinstance(rec, dict) else None
@@ -218,8 +232,6 @@ def _row_triple(obj: object) -> Optional[Tuple[Triple, Optional[str]]]:
     if keys == QUARANTINE_KEYS:
         field = obj["quarantined"]
         if type(field) is not str or not (field == "record" or _FIELD_NAME.fullmatch(field)):
-            return None
-        if obj["session"] is not None and type(obj["session"]) is not str:
             return None
     elif keys == RECORD_KEYS:
         field = None
@@ -398,5 +410,5 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-__all__ = ["ENVELOPE_MAX", "FORMAT", "LineageSink", "QUARANTINE_KEYS", "RECORD_CHECKS", "RECORD_KEYS", "SINK",
+__all__ = ["ENVELOPE_BYTES_MAX", "ENVELOPE_MAX", "FORMAT", "LineageSink", "QUARANTINE_KEYS", "RECORD_CHECKS", "RECORD_KEYS", "SINK",
            "SINK_MODE", "Triple", "check_envelope", "check_record", "check_triple", "full_fsync", "source_of"]
