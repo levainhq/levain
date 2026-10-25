@@ -8,6 +8,12 @@ with no root, and a refusal is raised while planning, before the first step. The
 from __future__ import annotations
 
 
+#: The elevator by absolute path, the ONE home: a bare ``sudo`` would run whatever the operator's PATH finds first. This
+#: package ``__init__`` imports nothing, so root's ``/usr/bin/python3`` (3.9) and every importer can reach it. A host
+#: whose sudo is elsewhere fails closed.
+SUDO = "/usr/bin/sudo"
+
+
 class Refused(Exception):
     """A refusal BY NAME (CONTRACT §5): ``name`` is the stable, machine-readable reason; ``detail`` is
     for the human. Raised before any act."""

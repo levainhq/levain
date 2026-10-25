@@ -64,7 +64,7 @@ from pathlib import Path
 from typing import IO, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from levain.contracts import canon
-from levain.slot import Refused, adopt_preview, adopt_take, adopt_verify, bundlefmt
+from levain.slot import SUDO, Refused, adopt_preview, adopt_take, adopt_verify, bundlefmt
 from levain.slot.grammar import SESSION_RE
 
 TAKES = ("head", "wip", "none")
@@ -216,7 +216,6 @@ class Seams:
 
     def __post_init__(self) -> None:
         from levain.slot import layout
-        from levain.slot.supervisor import SUDO
 
         host = "darwin" if sys.platform == "darwin" else "linux"
         if self.helper is None:

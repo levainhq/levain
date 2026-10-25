@@ -67,6 +67,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from levain.launch import child_env
+from levain.slot import SUDO
 
 HostOS = Literal["darwin", "linux"]
 
@@ -335,7 +336,7 @@ _ECONNREFUSED = 111   # Linux; what a connect gets from `reject with tcp reset`
 def _probe_connect(hands_user: str, port: int, group: str | None, timeout: float) -> tuple[str, str]:
     """(what the hands user's connect to 127.0.0.1:``port`` printed, stderr), run with ``group`` as its
     gid when given."""
-    r = subprocess.run(["/usr/bin/sudo", "-n", "-u", hands_user, *(("-g", group) if group else ()), "/usr/bin/env", "-i",
+    r = subprocess.run([SUDO, "-n", "-u", hands_user, *(("-g", group) if group else ()), "/usr/bin/env", "-i",
                         f"PATH={SECURE_PATH}", _abs("python3"), "-I", "-c", _EGRESS_PROBE, str(port)],
                        capture_output=True, text=True, timeout=timeout, cwd="/", env=child_env())
     return (r.stdout or "").strip(), (r.stderr or "").strip() or f"exit {r.returncode}"
@@ -778,7 +779,7 @@ def plan_setup(
     else:  # pragma: no cover - guarded by the caller
         raise HandsSetupError(f"unsupported host {host!r}")
 
-    as_hands = ("/usr/bin/sudo", "-u", hands, "/usr/bin/env", "-i", f"HOME={home}", f"PATH={SECURE_PATH}")
+    as_hands = (SUDO, "-u", hands, "/usr/bin/env", "-i", f"HOME={home}", f"PATH={SECURE_PATH}")
     git, keygen = _abs("git"), _abs("ssh-keygen")
     key = deploy_key_path(home)
     # No safe.directory on either side (2026-10-07: "go with H"): every repository in the
@@ -1235,7 +1236,7 @@ def git_refuses_foreign_gitdir(operator: str) -> bool:
                 os.chmod(os.path.join(root, name), 0o755 if name in dirs else 0o644)
         os.chown(repo / ".git", nobody.pw_uid, nobody.pw_gid)
         os.chown(repo, op.pw_uid, op.pw_gid)
-        r = subprocess.run(["/usr/bin/sudo", "-u", operator, "/usr/bin/env", "-i", *[f"{k}={v}" for k, v in env.items()],
+        r = subprocess.run([SUDO, "-u", operator, "/usr/bin/env", "-i", *[f"{k}={v}" for k, v in env.items()],
                             _abs("git"), "-C", str(repo), "status"], capture_output=True, text=True, cwd="/", env=child_env())
         return r.returncode != 0 and "dubious ownership" in (r.stderr + r.stdout)
     finally:
@@ -1290,7 +1291,7 @@ def invoking_operator() -> str:
 def operator_git_identity(operator: str) -> dict[str, str]:
     """The operator's global ``user.name`` / ``user.email``, read as the operator."""
     found: dict[str, str] = {}
-    run_as = ["/usr/bin/sudo", "-u", operator] if os.geteuid() == 0 else []
+    run_as = [SUDO, "-u", operator] if os.geteuid() == 0 else []
     for key in ("user.name", "user.email"):
         r = subprocess.run([*run_as, "/usr/bin/env", f"HOME={_home_of(operator)}", _abs("git"),
                             "config", "--global", "--get", key], capture_output=True, text=True, cwd="/", env=child_env())

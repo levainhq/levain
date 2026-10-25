@@ -40,6 +40,7 @@ from typing import Protocol
 
 from levain.firing.hands import SECURE_PATH, WORKSPACE_ROOT, _abs
 from levain.launch import child_env
+from levain.slot import SUDO
 
 #: The only config keys ``ws-git`` accepts in a repository's own config. Every other key (fsmonitor,
 #: hooksPath, pager, editor, sshCommand, alias.*, filter.*, diff.*, include*, credential.*, ...) can
@@ -406,7 +407,7 @@ def cmd_ws_git(entity_dir: Path | str, repo: Path | str, args: list[str]) -> int
 
 def _as_hands(hands: Hands, *argv: str, env: tuple[str, ...] = (), group: str | None = None) -> list[str]:
     """``argv`` run as the hands user with a clean environment (and, with ``group``, that gid)."""
-    return ["/usr/bin/sudo", "-n", "-u", hands.user, *(("-g", group) if group else ()), "/usr/bin/env", "-i",
+    return [SUDO, "-n", "-u", hands.user, *(("-g", group) if group else ()), "/usr/bin/env", "-i",
             f"HOME={hands.home}", f"PATH={SECURE_PATH}", *env, *_start(), *argv]
 
 
@@ -961,7 +962,7 @@ def mask_repair_argv(hands: _HandsUser, since: float | None = None) -> list[str]
     in a VM through a Linux hands bash). Run as the hands user, the owner, after each hands command."""
     newer = ("-newerct", f"@{int(since)}") if since is not None else ()
     return [
-        "/usr/bin/sudo", "-n", "-u", hands.user, "/usr/bin/env", "-i", f"PATH={SECURE_PATH}", *_start(),
+        SUDO, "-n", "-u", hands.user, "/usr/bin/env", "-i", f"PATH={SECURE_PATH}", *_start(),
         _abs("find"), str(hands.workspace), "-user", hands.user, *newer,
         "-exec", _abs("setfacl"), "-m", "m::rX", "{}", "+",
     ]

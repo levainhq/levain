@@ -49,7 +49,7 @@ from typing import IO, Any, Callable, Collection, Dict, List, Mapping, Optional,
 from levain import unshowable
 from levain.launch import child_env
 from levain.contracts import ContractError, canon
-from levain.slot import Refused, layout
+from levain.slot import SUDO, Refused, layout
 from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import RENDER_FORMAT, parse_stdin
 
@@ -745,10 +745,6 @@ def _host() -> str:
     if sys.platform.startswith("linux"):
         return "linux"
     raise Refused("unsupported-host", sys.platform)
-
-
-# The elevator by absolute path: a bare name would run whatever ``sudo`` the operator's PATH finds first.
-SUDO = "/usr/bin/sudo"
 
 
 @dataclass(frozen=True)

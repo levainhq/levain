@@ -263,6 +263,7 @@ from levain.firing.gate import GATE_SETTINGS, GateSetting
 from levain.firing import landlock as _landlock
 from levain.firing import ssh_agent as _ssh_agent
 from levain.firing.ssh_agent import RUN_DIR as AGENT_RUN_DIR
+from levain.slot import SUDO
 
 __all__ = [
     "SANDBOX_EXEC",
@@ -3762,7 +3763,6 @@ builtin exit "$__levain_done"
 # The PATH a hands-user bash starts with: system and package-manager directories only, never a
 # directory under the operator's home (which the hands user cannot enter anyway).
 HANDS_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-SUDO = "/usr/bin/sudo"
 
 
 @dataclass(frozen=True)

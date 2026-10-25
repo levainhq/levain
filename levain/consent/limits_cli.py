@@ -50,6 +50,7 @@ from typing import Any, Callable, Iterator
 from levain.consent import limits as L
 from levain.consent.adapters import claude_code, codex
 from levain.consent.queue import ConsentQueue, authority_source, default_queue_dir
+from levain.slot import SUDO
 
 __all__ = ["add_parser", "run"]
 
@@ -131,10 +132,6 @@ def _parse_value(kind: str, text: str) -> int | float:
 
 
 # --- the slot limits (--slots: root's L/policy/limits) -------------------------------------------------------------
-
-#: sudo by its absolute path: a ``sudo`` found first on the operator's PATH (where an agent session running as the
-#: operator can put one) would be handed the password.
-SUDO = "/usr/bin/sudo"
 
 
 @dataclass(frozen=True)

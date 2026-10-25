@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from levain.slot import SUDO
 from levain.firing import hands
 from levain.firing.confinement import ConfinementError, load_confinement_config
 from levain.firing.hands import (
@@ -603,7 +604,7 @@ def test_doctor_says_who_bash_runs_as(tmp_path: Path, monkeypatch, system) -> No
         assert r.ok and not r.warn and "headless chat, --task and seats run the entity's bash" in r.detail
     else:
         assert r.ok and r.warn and "still runs the entity's bash as you" in r.detail
-    assert probes == [["sudo", "-n", "-u", rec["hands_user"], "/bin/test", "-w", rec["hands_workspace"]]]
+    assert probes == [[SUDO, "-n", "-u", rec["hands_user"], "/bin/test", "-w", rec["hands_workspace"]]]
 
 
 @pytest.mark.parametrize("missing", ["python3", "zsh"])
