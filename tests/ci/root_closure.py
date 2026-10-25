@@ -578,6 +578,18 @@ NOT_ROOT_TESTS = {
                                             "test_only_confined_executor", _CONFTEST_EXECUTOR),
     "tests/test_autonomic_journal_wiring.py": ("needs conftest's test_only_confined_executor fixture",
                                                "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_chainpath.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_firepath.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_gate_coverage.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_gate_coverage_r1.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_gate_coverage_r2.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_graduation.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
     "tests/test_autonomic_l3_fixes.py": ("its enrolled test key verifies only under conftest's autouse signers-owner "
                                          "fixture", "confirm_signers", _CONFTEST_SIGNERS),
     "tests/test_autonomic_l3_r2_fixes.py": ("its enrolled test key verifies only under conftest's autouse "
