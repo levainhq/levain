@@ -22,7 +22,8 @@ log = logging.getLogger(__name__)
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 #: os.chmod can refuse to follow a symlink (lchmod: macOS, the BSDs). A Linux CPython has no lchmod, and its
 #: fchmodat(AT_SYMLINK_NOFOLLOW) stand-in raises ValueError / NotImplementedError where libc lacks it, so there the
-#: chmod is a plain one (see `_open_dir`)
+#: chmod is a plain one (see `_open_dir`) [judged by lane-chd2-s8d, 10-25, against CPython's posixmodule/os.py;
+#: not run on Linux]
 _CHMOD_NOFOLLOW = os.chmod in os.supports_follow_symlinks
 
 

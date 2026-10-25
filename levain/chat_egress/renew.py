@@ -5,7 +5,8 @@ At launch, :func:`renew_due` reads each keyed route's expiry from the AUTHORITY 
 record in the replay the launch built its routes from: the expiry's one home; the route snapshot carries none) and
 names every record whose expiry falls within `RENEW_DUE` of now. `launch.start_egress` computes it before it
 allocates anything (a failure here refuses the launch) and hands a non-empty list to its `on_renew_due` callback once
-per launch, off the start path. The phone half (the push, the one-tap re-sign of a renewed record) is not here.
+per launch, on the callback's own thread after the launch is owned. The phone half (the push, the one-tap re-sign of a
+renewed record) is not here.
 """
 
 from __future__ import annotations
