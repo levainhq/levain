@@ -40,6 +40,20 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   SOCKS port cannot be held open by a slow client; a launch that fails to start, or a stop whose steps fail, leaves no
   sockets, pipes, threads or helper process behind; cleaning a launch's temporary files never follows a swapped-in
   symlink (Linux: an entry with no safe way to change it is left and reported). No chat launch uses it yet.
+- **The gateway control plane keeps a journal of dispatch session events.** Every state change of a dispatch session,
+  and its artifact once it is published, is written to disk before the change is acknowledged, and a reader can follow
+  them as a stream from any point it last saw. A restart re-sends any event a crash left unwritten. A stream whose
+  reader stops reading is closed after 30 seconds instead of holding a control-plane connection forever; a stream whose
+  cursor is ahead of the journal is told to start again; a stream on a journal that can no longer be written ends with
+  an error instead of waiting. If the journal file is lost while its identity file survives, the control plane starts a
+  new journal identity, so a reconnecting client resets rather than skipping events. Dispatch has no client for the
+  stream yet, so no command follows it.
+- **Dispatch can acknowledge a run's result (`ARTIFACT-ACK`).** The control plane accepts the acknowledgement only for
+  the artifact or verifier report the session actually published. Nothing in dispatch sends it yet.
+- **The reaper moves a finished dispatch session's retained work to trash** once its result is acknowledged, or after
+  `dispatch_retain_days` (default 2 days, at least 1). A dispatch session you restored yourself is never moved to trash
+  automatically again, even when the restore lands while the reaper is deciding, and the reaper finishes a discard that
+  was interrupted after the session reached trash.
 
 ## [0.11.25] — 2026-10-25
 

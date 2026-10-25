@@ -641,14 +641,18 @@ def _start(facts: StoreFacts, seams: StoreSeams, plan: Plan, forced: bool | None
           retry=seams.retry)
 
 
-def discard(facts: StoreFacts, seams: StoreSeams) -> str:
+def discard(facts: StoreFacts, seams: StoreSeams, guard: Callable[[], object] | None = None) -> str:
     """RETAINED -> TRASH. Refuses ``session-busy``, ``intent-in-flight``, ``not-retained:trash`` (a trash entry
     exists) or ``not-retained:absent`` (no whole retained object). Raises :class:`PhaseFailed` with the journal
     left at that phase (the verb run again, or :func:`reconcile_store`, finishes it; ``intent-in-flight`` is a
-    journal it cannot finish). Returns the target state."""
+    journal it cannot finish). ``guard``, when given, is called with the session lock held after a journal the
+    session holds is finished and before any check or move; a :class:`Refused` it raises ends the verb. Returns the
+    target state."""
     with session_lock(facts, seams):
         if _finish_journal(facts, seams, "discard"):
             return R.TRASH
+        if guard is not None:
+            guard()
         if os.path.lexists(facts.trash):
             raise Refused("not-retained:trash", facts.session)
         if not retained_whole(facts, seams):

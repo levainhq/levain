@@ -33,9 +33,10 @@ ticket and ``TOKEN-RESOLVE``'s ``run``, read from the ticket record and never fr
 ``LINEAGE-APPEND {envelope}`` into the lineage sink (:mod:`levain.slot.lineage`); S1 3c-7 root's ``SLOT-SYNC`` into
 the pool MIRROR (:class:`PoolMirror`, §3.5 Pool), the release of a bound ticket a sync shows over, ``RUN-TICKET-MINT``'s
 ``no-free-slot:<class>`` and dispatch's ``POOL``; S1 3c-8 dispatch's ``CONFIG-SUBMIT`` (the verifier generations,
-:class:`levain.slot.routemaps.ControlVerifiers`), the verifier ticket resolved at mint and re-checked at ``ATTACH``.
-The other dispatch verbs (§3.3, §3.5, §3.6) are later 3c sessions':
-until then every other peer, and every other verb of a known one, is refused ``verb-not-allowed-for-peer`` (see
+:class:`levain.slot.routemaps.ControlVerifiers`), the verifier ticket resolved at mint and re-checked at ``ATTACH``,
+§3.6's event journal (:mod:`levain.slot.events`) with dispatch's ``SESSION-EVENTS`` stream, and dispatch's
+``ARTIFACT-ACK`` (§3.5 Retention). Every other peer, and every other verb of a known one, is refused
+``verb-not-allowed-for-peer`` (see
 :data:`PEER_VERBS`). Every act on keys and the reaper wake are seams: :class:`KeysAdmin` supplies the keys ones when
 CONTROL is given one.
 """
@@ -47,6 +48,7 @@ import hashlib
 import hmac
 import os
 import re
+import select
 import signal
 import socket
 import struct
@@ -64,6 +66,7 @@ from levain.broker.stub import peer_uid as kernel_peer_uid
 from levain.contracts import ContractError, canon
 from levain.slot import FRAME_MAX, Refused
 from levain.slot import records as R
+from levain.slot import events as EV
 from levain.slot import lineage as LN
 from levain.slot import routemaps
 from levain.slot import tickets as T
@@ -77,7 +80,7 @@ _LEN = struct.Struct(">I")
 ROOT_UID = 0
 
 #: §3.3's verbs per peer, as built so far (3c-6b adds keys' ``LINEAGE-APPEND``, 3c-7 root's ``SLOT-SYNC`` and dispatch's
-#: ``POOL``, 3c-8 dispatch's ``CONFIG-SUBMIT``). Later 3c sessions add the rest of the ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
+#: ``POOL``, 3c-8 dispatch's ``CONFIG-SUBMIT``, ``SESSION-EVENTS`` and ``ARTIFACT-ACK``). The ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
 #: :meth:`Control.peer_kind` is given its uid, else ``foreign``). keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` / ``LINEAGE-APPEND`` are answered only on the connection that
 #: holds the current ``KEYS-ATTACH`` (else ``not-attached``).
 PEER_VERBS: Mapping[str, frozenset[str]] = {
@@ -86,7 +89,7 @@ PEER_VERBS: Mapping[str, frozenset[str]] = {
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS", "LINEAGE-APPEND"}),
     "dispatch": frozenset({"LEASE-OPEN", "ROUTE-SUBMIT", "RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS",
-                           "POOL", "CONFIG-SUBMIT"}),
+                           "POOL", "CONFIG-SUBMIT", "SESSION-EVENTS", "ARTIFACT-ACK"}),
     "foreign": frozenset(),
 }
 
@@ -112,6 +115,9 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "LINEAGE-APPEND": (frozenset({"envelope"}),) * 2,     # S1 3c-6b (H6-2): CONTRACT §3.3 keys row
     "ROUTE-SUBMIT": (frozenset({"map", "sig"}),) * 2,
     "CONFIG-SUBMIT": (frozenset({"item", "sig"}),) * 2,      # S1 3c-8: kind `verifier` (§3.5 VERIFIER IDENTITY)
+    "SESSION-EVENTS": (frozenset({"after_seq"}),) * 2,        # S1 3c-8: §3.6, the connection becomes the stream
+    # S1 3c-8: §3.5 Retention; at most one of the two digests (refused `bad-value` with both)
+    "ARTIFACT-ACK": (frozenset({"ticket", "artifact_digest", "verifier_report_digest"}), frozenset({"ticket"})),
     # the per-kind required fields are the §3.5 table's (tickets.check_facts), refused by field name
     "RUN-TICKET-MINT": (frozenset({"attempt_id"}) | T.MINT_FIELDS, frozenset({"attempt_id"})),
     "RUN-TICKET-CANCEL": (frozenset({"ticket"}),) * 2,
@@ -162,6 +168,11 @@ RETIRED_LEASES_MAX = 1024
 #: DECISION: the digests of dropped session tokens kept to answer ``TOKEN-RESOLVE`` ``token-revoked``; past this
 #: many the oldest is forgotten and answers ``token-unknown``, which keys refuses just as surely (``token-invalid``).
 REVOKED_TOKENS_MAX = 4096
+
+#: DECISION: a SESSION-EVENTS stream waits this long for a new event before it checks its peer for EOF again.
+STREAM_POLL_S = 0.25
+#: DECISION (L3 r1 fix 6): a SESSION-EVENTS peer none of whose bytes the stream could send for this long is dropped.
+STREAM_STALL_S = 30.0
 
 #: §4.9: each admin request's answer deadline per attempt; a missed one is sent again on the same connection.
 KEYS_ANSWER_S = 2.0
@@ -433,6 +444,9 @@ class Conn:
     sock: socket.socket | None = field(default=None, repr=False)
     attach_no: int | None = None
     after: list[Callable[[], object]] = field(default_factory=list, repr=False)
+    #: once ``SESSION-EVENTS`` answered: (the lead frame (gap or reset) or None, the pinned replay as (seq, line), the
+    #: cursor past it); the server then streams (§3.6, :meth:`levain.slot.events.EventJournal.open_stream`)
+    stream: "tuple[dict[str, object] | None, list[tuple[int, bytes]], int] | None" = None
 
 
 @dataclass(frozen=True)
@@ -865,7 +879,21 @@ class Control:
     ``None``: ``LINEAGE-APPEND`` refused ``lineage-unavailable``) · ``verifiers`` (a
     :class:`levain.slot.routemaps.ControlVerifiers`: ``CONFIG-SUBMIT``'s verifier generations, their start pass, and
     the verifier activation lock a verifier mint and a verifier ATTACH hold; ``None``: ``CONFIG-SUBMIT`` refused
-    ``config-verifier``, every verifier mint ``verifier-unknown``)."""
+    ``config-verifier``, every verifier mint ``verifier-unknown``) · ``events`` (a :class:`levain.slot.events.EventJournal`:
+    §3.6's journal, started by :meth:`start`; ``None``: no event is kept and ``SESSION-EVENTS`` is refused
+    ``events-unavailable``).
+
+    SESSION-EVENTS (§3.6, S1 3c-8): every generation of a TICKET-BEARING record (``claims.ticket``) whose stored
+    ``event_kind`` is ``state`` or ``artifact`` has its event appended to the journal while the session lock that wrote
+    it is still held, before the verb answers (:meth:`_write`, and ATTACH's generation 0). A generation whose append
+    failed (or whose record write failed past its rename) is OWED: the session's next write first appends it from the
+    record, and while that fails the write is refused ``events-unavailable``, so no later generation overwrites one
+    whose event is unwritten. The revoke path is the exception (DECISION): ``lease_live:false`` and a move into REVOKED
+    still land on an owed session, so a broken journal never keeps a session live. The ``lease_live:false`` write
+    carries the owed generation's ``event_kind``, so the generation it makes bears that event (appended with it, or owed
+    and repaired from it: L3 r1 fix 7); a move into REVOKED makes the REVOKED generation the one owed, and the
+    generation it overwrote never gets its event. CONTROL's start re-emits, from each record, the
+    event its generation is owed by its stored ``event_kind`` (PURGED records skipped)."""
 
     def __init__(self, store: StateStore, operator_uid: int, *,
                  qbroker_uid: int | None = None,
@@ -887,7 +915,8 @@ class Control:
                  dispatch_uid: int | None = None,
                  tickets: T.TicketStore | None = None,
                  lineage: LN.LineageSink | None = None,
-                 verifiers: routemaps.ControlVerifiers | None = None) -> None:
+                 verifiers: routemaps.ControlVerifiers | None = None,
+                 events: EV.EventJournal | None = None) -> None:
         if type(operator_uid) is not int or operator_uid <= ROOT_UID:
             raise Refused("bad-config", f"operator uid {operator_uid!r}")
         if qbroker_uid is not None and (type(qbroker_uid) is not int or qbroker_uid <= ROOT_UID
@@ -963,6 +992,14 @@ class Control:
         #: S1 3c-8: the verifier generations (CONFIG-SUBMIT); None refuses CONFIG-SUBMIT `config-verifier` and every
         #: verifier mint `verifier-unknown`
         self.verifiers = verifiers
+        #: S1 3c-8: §3.6's event journal; session -> the generation whose event is owed (see the class docstring)
+        self.events = events
+        if events is not None:
+            events.on_error = lambda e: self.seam_errors.append(("event-prune", "", e))
+        self._owed: dict[str, int] = {}
+        #: the (egress_free, none_free) of the last pool event, and the lock that orders a sync's count and append
+        self._pool_last: tuple[int, int] | None = None
+        self._pool_ev_mu = threading.Lock()
         #: (session, ref) -> the SPEND-OVERRUN record, oldest first (R4 §1.4, §4: the card's data; never a revoke).
         self._overruns: collections.OrderedDict[tuple[str, tuple], dict[str, object]] = collections.OrderedDict()
         #: the sessions keys reported FRONT-LOST for, oldest first, bounded (doctor / tests).
@@ -1023,6 +1060,8 @@ class Control:
                 self.tickets.close()
             if self.lineage is not None:
                 self.lineage.close()
+            if self.events is not None:
+                self.events.close()
             raise
 
     def _start_pass(self, wake: bool = True) -> None:
@@ -1041,6 +1080,11 @@ class Control:
             # S1 3c-6b: the sink read whole (membership, seq), its torn tail cut, before any LINEAGE-APPEND is served;
             # a corrupt sink refuses the start ``lineage-corrupt``
             self.lineage.start()
+        if self.events is not None:
+            # S1 3c-8 (§3.6): the journal read whole and pruned, then the repair, all before the revoke pass writes
+            self.events.start()
+            self.events.prune()
+            self._repair_events()
         for rec in sorted(self.store.all(), key=lambda r: r.session):
             if rec.state in R.LIVE_STATES:
                 self._revoke_after_eof(rec.session)
@@ -1064,14 +1108,133 @@ class Control:
             self.tickets.close()
         if self.lineage is not None:
             self.lineage.close()
+        if self.events is not None:
+            self.events.close()
 
     # -- the write primitive -------------------------------------------------------------------------------
 
     def _write(self, rec: R.SessionState, **changes: object) -> R.SessionState:
-        """``rec`` with ``changes`` at ``generation + 1``, durably (caller holds the session lock)."""
+        """``rec`` with ``changes`` at ``generation + 1``, durably, then its event (caller holds the session lock).
+        An owed event of ``rec``'s generation is appended first (the class docstring's fence)."""
+        changes = dict(changes)
+        lease_only = set(changes) == {"lease_live", "event_kind"}
+        if self._pay_owed(rec, revoke_path=changes.get("state") == R.REVOKED or lease_only) \
+                and lease_only and changes["event_kind"] == "none":
+            # L3 r1 fix 7 (complement 1): the revoke-after-EOF `lease_live` write over an owed generation carries that
+            # generation's kind, so the new generation bears its event (the start pass repairs it), never forgotten;
+            # a `state=REVOKED` write keeps the kind it names (L3 r2, deepseek 3)
+            changes["event_kind"] = rec.event_kind
         new = replace(rec, generation=rec.generation + 1, updated_at=R.timestamp(self._clock()), **changes)
-        self.store.put(new)
+        self._put(new)
         return new
+
+    def _put(self, new: R.SessionState) -> None:
+        """``store.put`` and the generation's event (caller holds the session lock). A write that failed past its
+        rename leaves its event owed."""
+        try:
+            self.store.put(new)
+        except R.NotDurable:
+            if self._event_of(new) is not None:
+                with self._mu:
+                    self._owed[new.session] = new.generation
+            raise
+        self._emit(new)
+
+    def _event_of(self, rec: R.SessionState) -> dict[str, object] | None:
+        """The §3.6 event ``rec``'s generation owes (without ``seq`` / ``at``), or None: a record with no ticket, a
+        generation stored ``event_kind: none``, or an ``artifact`` generation that cleared the field rather than set it
+        (§3.6: the CAS that SETS ``artifact_digest`` / ``artifact_failed``)."""
+        ticket = rec.claims.get("ticket")
+        if ticket is None or rec.event_kind == "none":
+            return None
+        ev: dict[str, object] = {"kind": rec.event_kind, "session": rec.session, "ticket": ticket,
+                                 "generation": rec.generation}
+        if rec.event_kind == "state":
+            ev["state"] = rec.state
+            names: tuple[str, ...] = ("verifier_report_digest", "verifier_report_refused")
+        else:
+            names = tuple(sorted(R.ARTIFACT_FIELDS))
+            if not R.ARTIFACT_FIELDS & set(rec.fields):
+                return None
+        for k in names:
+            if k in rec.fields:
+                ev[k] = rec.fields[k]
+        return ev
+
+    def _emit(self, rec: R.SessionState) -> None:
+        """Append ``rec``'s event (caller holds the session lock; the record is durable). A refused append is noted
+        and leaves the generation owed; the verb that wrote the record still answers what it did."""
+        ev = self._event_of(rec)
+        if ev is None or self.events is None:
+            return
+        try:
+            self.events.append(ev)
+        except Refused as e:
+            with self._mu:
+                self._owed[rec.session] = rec.generation
+            self.seam_errors.append(("event", rec.session, e))
+            return
+        with self._mu:
+            self._owed.pop(rec.session, None)
+
+    def _pay_owed(self, rec: R.SessionState, *, revoke_path: bool) -> bool:
+        """Before a write over ``rec`` (caller holds the session lock): an owed event of ``rec``'s own generation is
+        appended now; while it cannot be, the write is refused ``events-unavailable`` unless it is on the revoke path,
+        which goes on with True (the event still owed). An owed generation ``rec`` is no longer at (a reload moved the
+        record) is forgotten."""
+        with self._mu:
+            owed = self._owed.get(rec.session)
+        if owed is None:
+            return False
+        if owed != rec.generation:
+            with self._mu:
+                if self._owed.get(rec.session) == owed:
+                    del self._owed[rec.session]
+            return False
+        self._emit(rec)
+        with self._mu:
+            still = self._owed.get(rec.session) == rec.generation
+        if still and not revoke_path:
+            raise Refused("events-unavailable", f"{rec.session}: generation {rec.generation}'s event is unwritten")
+        return still
+
+    def _repair_events(self) -> None:
+        """§3.6's start pass: every non-PURGED ticket-bearing record whose generation owes an event the journal does
+        not hold gets it appended now (the crash between a record write and its append). A failed append leaves it
+        owed, as at runtime."""
+        assert self.events is not None
+        with self._mu:
+            self._owed.clear()
+        for rec in sorted(self.store.all(), key=lambda r: r.session):
+            if rec.state == R.PURGED or self._event_of(rec) is None:
+                continue
+            if self.events.last_generation(rec.session) < rec.generation:
+                self._emit(rec)
+
+    def owed_events(self) -> dict[str, int]:
+        """The sessions whose event is owed, and the generation (doctor / tests)."""
+        with self._mu:
+            return dict(self._owed)
+
+    def _emit_pool(self) -> None:
+        """A ``pool`` event after a SLOT-SYNC (§3.6: after a ``reusable`` commit, which root syncs), when the counts
+        POOL answers differ from the last pool event's (DECISION: a sync that changed nothing owes no event)."""
+        if self.events is None or self.tickets is None:
+            return
+        with self._pool_ev_mu:
+            try:
+                counts = self.tickets.pool_free(self.pool.free)
+            except Refused:
+                return                                   # a poisoned ticket journal answers no count
+            key = (int(counts["egress_free"]), int(counts["none_free"]))
+            if key == self._pool_last:
+                return
+            try:
+                self.events.append({"kind": "pool", "egress_free": key[0], "none_free": key[1]})
+            except Refused as e:
+                self.seam_errors.append(("event", "", e))
+                return
+            self._pool_last = key
 
     def _lease_live(self, session: str) -> bool:
         with self._mu:
@@ -1493,7 +1656,7 @@ class Control:
                         rec = R.SessionState(session=session, generation=0, state=R.ALLOCATED, claims=claims,
                                              lease_live=True, event_kind="state",
                                              updated_at=R.timestamp(self._clock()))
-                        self.store.put(rec)
+                        self._put(rec)                   # §3.6: generation 0 is a `state` event
                     except R.NotDurable as e:
                         # the record was renamed into place: it exists and the bind stands, so the ATTACH is SETTLED
                         # below as one that landed (fix 2, codex 4 + complement 1), then its failure is answered
@@ -1861,7 +2024,7 @@ class Control:
                 rec = R.SessionState(session=session, generation=0, state=R.REVOKED, claims={},
                                      lease_live=False, event_kind="state",
                                      updated_at=R.timestamp(self._clock()))
-                self.store.put(rec)
+                self._put(rec)                           # no claims, so no ticket: owes no event
                 revoked = True
             elif rec.state in R.LIVE_STATES:
                 rec = self._write(rec, state=R.REVOKED, event_kind="state",
@@ -1912,10 +2075,74 @@ class Control:
             seen.add(key)
             states.append(st)
         self.pool.merge(states)
-        if self.tickets is not None:
-            self.tickets.release_ended({(st.slot.slot_class, st.slot.index): (st.lease_seq, st.state)
-                                        for st in states})
+        try:
+            if self.tickets is not None:
+                self.tickets.release_ended({(st.slot.slot_class, st.slot.index): (st.lease_seq, st.state)
+                                            for st in states})
+        finally:
+            self._emit_pool()                            # S1 3c-8, §3.6: the merge stands, so its count does
         return {}
+
+    # -- SESSION-EVENTS (§3.6, S1 3c-8) ---------------------------------------------------------------------------
+
+    def _op_artifact_ack(self, conn: Conn, args: dict) -> dict[str, object]:
+        """§3.5 Retention ``ARTIFACT-ACK {ticket, artifact_digest? | verifier_report_digest?}`` -> ``{}``: dispatch has
+        read the session's result. The session is the record whose ``claims.ticket`` is ``ticket`` (``ticket-unknown``
+        when none is). An executor / planner ticket acks its artifact: the record must carry that same
+        ``artifact_digest``, or ``artifact_failed`` with no digest named; a VERIFIER ticket (claims ``kind`` verifier)
+        acks its report: the record's ``verifier_report_digest``, or ``verifier_report_refused`` with no digest named.
+        Anything else is ``artifact-not-published`` (the other kind's digest included). The ack is written as
+        ``artifact_acked: true`` (its own generation, ``event_kind: none``); an ack of a record already acked answers
+        ``{}`` and writes nothing. Then the reaper is woken, a repeat ack's too: its retention step moves the RETAINED session to TRASH
+        (§7.7 3c)."""
+        ticket = _handle(args["ticket"], "ticket")
+        named = sorted({"artifact_digest", "verifier_report_digest"} & set(args))
+        if len(named) > 1:
+            raise Refused("bad-value", "at most one of artifact_digest and verifier_report_digest")
+        digest = None
+        if named:
+            digest = args[named[0]]
+            if type(digest) is not str:
+                raise Refused("wrong-type", f"{named[0]} is a string")
+            if _DIGEST_RE.fullmatch(digest) is None:
+                raise Refused("bad-token", named[0])
+        found = [r.session for r in self.store.all()
+                 if isinstance(r.claims.get("ticket"), str) and hmac.compare_digest(str(r.claims["ticket"]), ticket)]
+        if len(found) != 1:
+            raise Refused("ticket-unknown")
+        session = found[0]
+        with self.store.lock(session):
+            rec = self.store.get(session)
+            if rec is None:
+                raise Refused("ticket-unknown")
+            if rec.claims.get("kind") == "verifier":
+                have, failed = "verifier_report_digest", "verifier_report_refused"
+            else:
+                have, failed = "artifact_digest", "artifact_failed"
+            if named and named[0] != have:
+                raise Refused("artifact-not-published", f"a {named[0]} for a ticket that acks its {have}")
+            published = (rec.fields.get(have) == digest) if digest is not None else (failed in rec.fields)
+            if not published:
+                raise Refused("artifact-not-published")
+            if rec.fields.get("artifact_acked") is not True:
+                self._write(rec, fields={**rec.fields, "artifact_acked": True}, event_kind="none")
+        self._wake()                                     # a repeat ack too: a wake lost after the first is made good
+        return {}
+
+    def _op_session_events(self, conn: Conn, args: dict) -> dict[str, object]:
+        """``SESSION-EVENTS {after_seq}``: answered with the stream's ``hello`` (``{kind:"hello", journal_id, oldest_seq,
+        newest_seq}`` beside ``id`` / ``ok``), after which the connection is the stream (:class:`ControlServer`): the
+        ``gap`` frame when one is due, then every kept event with ``seq > after_seq`` (read when the hello is), then
+        each new one as it is appended, one canonical JSON object per frame, byte-equal to its journal line; an
+        ``after_seq`` past the newest seq gets ``{kind:"reset", newest_seq}`` alone, and a journal poisoned under the
+        stream ``{kind:"error", error}`` last. Nothing the peer sends is read as a verb again: any byte, or its EOF,
+        ends the stream (DECISION). No journal, or a poisoned one: ``events-unavailable``."""
+        after = R._uint(args["after_seq"], "after_seq")
+        if self.events is None:
+            raise Refused("events-unavailable", "CONTROL keeps no event journal")
+        hello, lead, replay, cursor = self.events.open_stream(after)
+        conn.stream = (lead, replay, cursor)
+        return hello
 
     # -- the queue broker's verb ------------------------------------------------------------------------------
 
@@ -2438,6 +2665,17 @@ class Control:
 
 # --- the server ---------------------------------------------------------------------------------------------
 
+def _peer_spoke_or_left(sock: socket.socket) -> bool:
+    """A stream's peer has sent a byte or ended (or the socket failed): the stream ends. Never blocks."""
+    try:
+        sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)   # a byte or b"" (EOF): either ends the stream
+        return True
+    except (BlockingIOError, InterruptedError):
+        return False
+    except OSError:
+        return True
+
+
 class ControlServer:
     """:class:`Control` on a unix stream socket at ``path``, one thread per connection.
 
@@ -2448,8 +2686,10 @@ class ControlServer:
 
     def __init__(self, control: Control, path: Path, *,
                  peer_uid: Callable[[socket.socket], int | None] = kernel_peer_uid,
-                 max_connections: int = MAX_CONNECTIONS, frame_read_s: float = FRAME_READ_S) -> None:
+                 max_connections: int = MAX_CONNECTIONS, frame_read_s: float = FRAME_READ_S,
+                 stream_stall_s: float = STREAM_STALL_S) -> None:
         self.control = control
+        self.stream_stall_s = stream_stall_s
         self.path = Path(path)
         self._peer_uid = peer_uid
         self.max_connections = max_connections
@@ -2543,6 +2783,9 @@ class ControlServer:
                         act()
                     except Exception as e:   # noqa: BLE001 - an after-act's failure is noted, never the connection's
                         self.control.seam_errors.append(("after", "", e))
+                if conn.stream is not None:
+                    self._stream(sock, conn.stream)
+                    return
         finally:
             # The lease dies before the socket closes, so a peer that sees the close sees a dead lease; likewise the
             # attachment (§4.5: its EOF revokes every egress-class session).
@@ -2559,6 +2802,64 @@ class ControlServer:
                 sock.close()
             except OSError:
                 pass
+
+    def _stream(self, sock: socket.socket,
+                opening: "tuple[dict[str, object] | None, list[tuple[int, bytes]], int]") -> None:
+        """The SESSION-EVENTS stream (:meth:`Control._op_session_events`) until the peer sends anything or ends, the
+        journal closes (CONTROL's stop) or a send fails. The gap first, then the replay the opening pinned, then events
+        by ``seq`` (a reset lead frame is sent alone, then the stream ends); a journal poisoned under the stream ends
+        it with ``{kind:"error", error:"events-unavailable"}`` (L3 r1 fix 3)."""
+        lead, replay, cursor = opening
+        journal = self.control.events
+        # non-blocking from here to the close: macOS blocks a unix-socket send() on a full buffer even with
+        # MSG_DONTWAIT (measured 10-25), so only the fd's own O_NONBLOCK bounds :meth:`_stream_send`
+        sock.setblocking(False)
+        if journal is None or (lead is not None and not self._stream_send(sock, encode_frame(lead))):
+            return
+        if lead is not None and lead["kind"] == "reset":
+            return
+        for _seq, data in replay:
+            if not self._stream_send(sock, _LEN.pack(len(data)) + data):
+                return
+        while not self._stop.is_set():
+            try:
+                got = journal.after(cursor, wait_s=STREAM_POLL_S)
+            except Refused as e:
+                self._stream_send(sock, encode_frame({"kind": "error", "error": e.name}))
+                return
+            if got is None:
+                return
+            for seq, data in got:
+                if not self._stream_send(sock, _LEN.pack(len(data)) + data):
+                    return
+                cursor = seq
+            if _peer_spoke_or_left(sock):
+                return
+
+    def _stream_send(self, sock: socket.socket, frame: bytes) -> bool:
+        """``frame`` on the stream's non-blocking socket, every wait bounded (L3 r1 fix 6): a full buffer is waited on
+        at most :data:`STREAM_POLL_S` at a time, and before each try the stream ends (False) on CONTROL's stop or on a
+        byte or EOF from the peer (its cancellation, read even while its buffer is full); it ends too once no byte has
+        gone out for ``stream_stall_s``."""
+        view = memoryview(frame)
+        room = select.poll()                     # poll, not select: a connection fd may be past FD_SETSIZE
+        room.register(sock, select.POLLOUT)
+        progress = time.monotonic()
+        while view:
+            if self._stop.is_set() or _peer_spoke_or_left(sock):
+                return False
+            try:
+                n = sock.send(view)
+            except (BlockingIOError, InterruptedError):
+                if time.monotonic() - progress >= self.stream_stall_s:
+                    return False
+                room.poll(STREAM_POLL_S * 1000)
+                continue
+            except OSError:
+                return False
+            view = view[n:]
+            progress = time.monotonic()
+        return True
 
     def stop(self) -> None:
         """Stop serving, as a crash would look to every session: no revoke on the way down."""
@@ -2624,9 +2925,11 @@ def serve(config: ServeConfig) -> int:
     lineage = LN.LineageSink(Path(config.lineage_dir) / LN.SINK) if config.lineage_dir is not None else None
     # S1 3c-8: the verifier generations live beside the route maps (`L/routes/verifiers/`)
     verifiers = routemaps.ControlVerifiers(Path(config.routes_dir)) if config.routes_dir is not None else None
+    # S1 3c-8: §3.6's journal lives in the session store (`L/sessions/events.jsonl` + `events.meta`)
+    events = EV.EventJournal(Path(config.store_dir))
     control = Control(store, config.operator_uid, qbroker_uid=config.qbroker_uid, keys_uid=config.keys_uid,
                       keys_admin=admin, host=config.host, routes=routes, dispatch_uid=config.dispatch_uid,
-                      tickets=tickets, lineage=lineage, verifiers=verifiers)
+                      tickets=tickets, lineage=lineage, verifiers=verifiers, events=events)
     if config.peer_uid is not None:
         server = ControlServer(control, Path(config.socket_path), peer_uid=config.peer_uid)
     else:
