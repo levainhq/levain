@@ -3736,8 +3736,11 @@
         const keptNow = Array.isArray(kept) ? kept.filter((v) => inEnum.has(v)) : null;
         const dflt = Array.isArray(f.default) ? f.default.filter((v) => inEnum.has(v)) : [];
         const start = keptNow && (keptNow.length || !kept.length) ? keptNow : dflt;
+        // a declared default that names a seat (which the card does not draw) cannot start pressed: an empty pick is "everyone", so
+        // a send with nothing pressed is refused rather than widened (a pick the person makes themselves is a send like any other)
+        const seatDefault = !!seatPrefix && Array.isArray(f.default) && f.default.some((v) => typeof v === "string" && v.startsWith(seatPrefix));
         controls.push({ f: f, nodes: chips.concat([pick]), read: pressedNow, set: setTo, chips: chips, pickKey: pickKey, initial: start,
-                        default: dflt });
+                        default: dflt, seatDefault: seatDefault });
         continue;
       }
       if (f.kind === "multiselect") {
@@ -3791,6 +3794,10 @@
     const msg = el("span", "edit-msg", "");
     row.append(go, msg);
     box.appendChild(row);
+    const NO_SEAT_DEFAULT = "this card's default reader is a seat, which is messaged from its page; choose a reader. Nothing was sent";
+    if (chipCtl && chipCtl.seatDefault && !chipCtl.initial.length) { msg.className = "edit-msg"; msg.textContent = NO_SEAT_DEFAULT; }
+    // a landed send's "sent" goes at the next keystroke, so it never sits beside an unsent draft
+    box.addEventListener("input", () => { if (stay && msg.textContent === "sent") { msg.className = "edit-msg"; msg.textContent = ""; } });
 
     const setDisabled = (d) => {
       go.disabled = d;
@@ -3893,6 +3900,7 @@
     // definite refusal (a 4xx) forgets the draft's request, so the next send files and signs again; an answer that never
     // came keeps it. Any other verb posts as it always has.
     const fire = async (params, confirm, key) => {
+      if (!commitAction) return { ok: false, error: "read-only", message: "this page can no longer send; nothing was sent" };
       if (!spec.sign) return commitAction(action.verb, params, confirm, key, action.panel);
       const say = (t, k) => { msg.className = "edit-msg" + (k === "bad" ? " err" : k === "ok" ? "" : " busy"); msg.textContent = t; };
       const s = await signedCompose(action.verb, action.panel, params, say, row);
@@ -3905,8 +3913,10 @@
       return res;
     };
     go.addEventListener("click", () => {
+      if (stay && !commitAction) { setDisabled(true); msg.className = "edit-msg err"; msg.textContent = "this page can no longer send; nothing was sent"; return; }
       const c = collect();
-      if (stay && chipCtl && chipCtl.read().length !== 1) { msg.className = "edit-msg err"; msg.textContent = "no reader to send to; nothing was sent"; return; }
+      if (chipCtl && chipCtl.seatDefault && !chipCtl.read().length) { msg.className = "edit-msg err"; msg.textContent = NO_SEAT_DEFAULT; return; }
+      if (stay && (!chipCtl || chipCtl.read().length !== 1)) { msg.className = "edit-msg err"; msg.textContent = "no reader to send to; nothing was sent"; return; }
       if (c.error) { msg.className = "edit-msg err"; msg.textContent = c.error; return; }
       const sendKey = keyForSend(c.params);  // stable across a retry of THIS content (above)
       if (!spec.confirm_required) {
@@ -5127,7 +5137,10 @@
     for (const entry of (Array.isArray(currentView.layout) ? currentView.layout : [])) {
       const data = entry && ex[entry.id], act = data && data.action;
       if (!act || !act.verb || !verbs[act.verb] || !Array.isArray(act.fields)) continue;
-      const f = act.fields.find((x) => x && x.chips && typeof x.transient_prefix === "string" && x.transient_prefix);
+      // the compose panel is what it is: the cockpit's compose card (a form panel with a recipient field is not one), whose recipient
+      // field is the chips multiselect declaring the seat prefix
+      if (act.card !== true) continue;
+      const f = act.fields.find((x) => x && x.kind === "multiselect" && x.chips && typeof x.transient_prefix === "string" && x.transient_prefix);
       if (!f) continue;
       const id = f.transient_prefix + name;
       if ((Array.isArray(f.options) ? f.options : []).some((o) => (typeof o === "string" ? o : o && o.value) === id)) return { act, spec: verbs[act.verb], field: f, id };
@@ -5142,7 +5155,12 @@
     const r = seatRecipient(name);
     if (!r) { wrap.appendChild(el("div", "agent-msg-none ext-meta", "can't message this seat right now")); return wrap; }
     const fields = r.act.fields.map((f) => (f === r.field ? Object.assign({}, f, { options: [r.id], default: [r.id] }) : f));
-    const gone = (msg) => { msg.className = "edit-msg err"; msg.textContent = "this seat is gone; nothing was sent"; };
+    const gone = (msg) => {
+      msg.className = "edit-msg err"; msg.textContent = "this seat is gone; nothing was sent";
+      // the view still lists it: refresh the panel so a page opened again reads the roster as it is now
+      const V = window.LevainCockpitView;
+      if (V && typeof V.refetchPanel === "function" && r.act.panel) { try { Promise.resolve(V.refetchPanel(r.act.panel)).catch(() => {}); } catch (_) { /* a refetch that cannot run leaves the held box as it is */ } }
+    };
     wrap.appendChild(buildActionBox(Object.assign({}, r.act, { fields: fields }), r.spec, { pickKey: "seat-page:" + r.id, gone: gone }));
     return wrap;
   }

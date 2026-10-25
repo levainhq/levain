@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 
+
 from tests.test_cockpit_f12b_topology_view import NARROW, _paint, _value
 from tests.test_cockpit_flip_parity import _drive, _verb_posts, needs_browser
 from tests.test_cockpit_k7_build import BUILD, DESKTOP, _sessions_fixture
@@ -98,7 +99,7 @@ def test_a_departed_seat_refusal_holds_the_box_says_so_and_never_falls_back_to_e
                                    MBOX, MBOX, ADDR, PRESSED)}])
     frozen, draft, addr, pressed, refetched = json.loads(out["values"][-1])
     assert frozen is True and draft == "hello seat" and addr == "to seat:ledgerline", out["values"][-2:]
-    assert pressed == ["fanin"] and refetched is False, out["values"][-2:]     # no refetch: the box says so and holds
+    assert pressed == ["fanin"] and refetched is True, out["values"][-2:]      # the box holds, and the panel is asked for the roster as it is now
 
 
 
@@ -154,3 +155,73 @@ def test_the_box_on_a_signed_verb_signs_through_the_passkey_and_the_door_applies
     assert rig.applied and all(a == {"message": "hello seat", "for": ["seat:ledgerline"], "sign_request": "np-compose-0001"} for a in rig.applied), rig.applied
     assert [c[0] for c in rig.composed] == ["send_inbox"], rig.composed      # one draft, one request, filed once across the retry
     assert rig.verifies("np-compose-0001")
+
+
+CARD_BOX = "document.querySelector('[data-ck-compose=recipient]').closest('.tray-dump')"
+CARD_SEND = ("(() => { const b = %s; b.querySelector('.tray-dump-ta').value = 'hi'; b.querySelector('.tray-dump-btn').click(); "
+             "const y = document.querySelector('.verb-confirm'); if (y) y.click(); return 1; })()") % CARD_BOX
+CARD_MSG = "(%s.querySelector('.edit-msg') || {}).textContent" % CARD_BOX
+
+
+@needs_browser
+def test_a_card_whose_declared_default_is_a_seat_fails_closed_and_posts_nothing(tmp_path, monkeypatch):
+    # N1 (codex HIGH): the card draws no seat chip, so a default naming a seat left nothing pressed = an everyone-send
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    declared = {"default": ["seat:ledgerline"], "transient_prefix": "seat:", "gone_match": "no_live_seat"}
+    with _serve_inbox(src, ENUM, None, declared) as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/{BUILD}#write_token=T", [DESKTOP, {"until": "document.querySelector('[data-ck-compose=recipient]')"},
+                                                                {"eval": CARD_SEND}, {"eval": "JSON.stringify([%s, %s])" % (CARD_MSG, PRESSED)}])
+    said, pressed = json.loads(out["values"][-1])
+    assert _verb_posts(out) == [] and pressed == [] and said and "seat" in said and "nothing was sent" in said.lower(), out["values"][-1]
+
+
+@needs_browser
+def test_a_card_with_a_seat_default_still_sends_to_a_reader_the_person_presses(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    declared = {"default": ["seat:ledgerline"], "transient_prefix": "seat:", "gone_match": "no_live_seat"}
+    press = CHIPS + ".find(c => c.dataset.value === 'cli').click(); 1"
+    with _serve_inbox(src, ENUM, None, declared) as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/{BUILD}#write_token=T", [DESKTOP, {"until": "document.querySelector('[data-ck-compose=recipient]')"},
+                                                                {"eval": press}, {"eval": "window.__old = %s; 1" % CARD_BOX}, {"eval": CARD_SEND}, {"until": "%s !== window.__old" % CARD_BOX}])
+    real = [p for p in _verb_posts(out) if not p.get("dry_run")]
+    assert len(real) == 1 and real[0]["params"]["for"] == ["cli"], _verb_posts(out)
+
+
+@needs_browser
+def test_a_sent_stays_until_the_next_keystroke(tmp_path, monkeypatch):
+    # N6: "sent" must not sit beside a new, unsent draft
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    out = _out(tmp_path, src, [*_open("n3"), {"eval": TYPE}, {"until": MSG + " === 'sent'"},
+                               {"eval": "(() => { const ta = %s.querySelector('.tray-dump-ta'); ta.value = 'x'; ta.dispatchEvent(new Event('input', {bubbles: true})); return %s; })()" % (MBOX, MSG)}])
+    assert out["values"][-1] == "", out["values"][-2:]
+
+
+@needs_browser
+def test_a_form_panel_declaring_a_seat_is_never_the_seats_box(tmp_path, monkeypatch):
+    # N2: a panel's action that is not the compose card (a form with a recipient field naming the seat) is not the seat's message box
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    spy = ("window.__orig = window.LevainDashboard.render; window.LevainDashboard.render = (v, o) => { window.__v = v; window.__o = o; return window.__orig(v, o); }; 1")
+    notcard = "const v = window.__v; for (const d of Object.values(v.extra_panels)) { if (d && d.action) d.action.card = false; } window.__orig(v, window.__o); 1"
+    reopen = "document.querySelector('#levain-modal .modal-close').click(); 1"
+    out = _out(tmp_path, src, [{"eval": spy}, {"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"}, {"until": "window.__v"},
+                               {"eval": notcard}, *_open("n3"), {"eval": "JSON.stringify([!!%s, !!%s.querySelector('textarea'), %s])" % (MBOX, MBOX, NOTE)}])
+    has, ta, note = json.loads(out["values"][-1])
+    assert has is True and ta is False and note == "can't message this seat right now", out["values"][-1]
+
+
+@needs_browser
+def test_a_page_that_turned_read_only_drops_the_send_with_words_not_a_type_error(tmp_path, monkeypatch):
+    # N4: a page opened writable whose view is then rendered read-only (no commitAction) must not throw on Send
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    spy = ("window.__orig = window.LevainDashboard.render; window.LevainDashboard.render = (v, o) => { window.__v = v; return window.__orig(v, o); }; "
+           "window.__errs = []; window.addEventListener('error', e => window.__errs.push(String(e.message))); "
+           "window.addEventListener('unhandledrejection', e => window.__errs.push(String(e.reason))); 1")
+    refresh = "document.dispatchEvent(new Event('visibilitychange')); 1"
+    readonly = "window.__orig(window.__v, {}); 1"
+    probe = ("(() => { const b = %s; const ta = b && b.querySelector('.tray-dump-ta'); if (ta) { ta.value = 'x'; ta.dispatchEvent(new Event('input')); "
+             "b.querySelector('.tray-dump-btn').click(); const y = b.querySelector('.verb-confirm'); if (y) y.click(); } "
+             "return JSON.stringify([!!b, !!ta, (b && b.querySelector('.edit-msg') || {}).textContent, window.__errs]); })()") % MBOX
+    out = _out(tmp_path, src, [*_open("n3"), {"eval": spy}, {"eval": refresh}, {"until": "window.__v"}, {"eval": readonly}, {"until": "1", "ms": 500}, {"eval": probe}])
+    got, has_ta, said, errs = json.loads(out["values"][-1])
+    posts = [p for p in _verb_posts(out) if not p.get("dry_run")]
+    assert not [e for e in errs if "ResizeObserver" not in e] and posts == [] and (not has_ta or (said and "nothing was sent" in said)), out["values"][-1]
