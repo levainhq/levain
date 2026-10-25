@@ -56,7 +56,7 @@ TRANSPORT_CONFINED = "unmeasured"           # until arm (15o)'s record exists (R
 TEST_SEAMS_ENV = "LEVAIN_TEST_SEAMS"
 #: the glue's own test seams (its header's TEST SEAMS list); any other glue argument is never a seam
 GLUE_SEAMS = frozenset({"--tls-ports", "--http-ports", "--carve", "--resolve-map", "--upstream-ca", "--fifth-arg",
-                        "--terminate-ports"})
+                        "--terminate-ports", "--system-roots"})
 NODE_VERSION_TIMEOUT_S = 10.0
 SERVING_TIMEOUT_S = 10.0
 GLUE_EXIT_TIMEOUT_S = 10.0

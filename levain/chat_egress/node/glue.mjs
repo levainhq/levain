@@ -34,9 +34,12 @@
 // TEST SEAMS (never product; S8 passes none of them): --tls-ports, --http-ports (port stand-ins: macOS refuses a
 // non-root bind of 80/443), --carve (srt's allowedDomains literal-address carve-outs, for a 127.0.0.1 origin),
 // --resolve-map name=addr[,addr];..., --upstream-ca <pem>, --fifth-arg off and --terminate-ports (R15-14-3's
-// per-layer reds).
+// per-layer reds), --system-roots off (R15-16-Q2's env-alone red: srt's upstream trust left to Node's defaults).
+// The upstream trust (R15-16-Q2): `tls.rootCertificates` explicitly, beside the closed env (R15-12-B6), so an
+// inherited NODE_EXTRA_CA_CERTS never joins it; --upstream-ca replaces it with one test PEM.
 import { appendFileSync, readFileSync } from 'node:fs';
 import { randomUUID as cryptoRandomUUID } from 'node:crypto';
+import { rootCertificates } from 'node:tls';
 import { pathToFileURL } from 'node:url';
 
 // --- wire.py's bounds and reasons -------------------------------------------------------------------------------------
@@ -370,7 +373,8 @@ async function main(argv) {
     requireHostMatch: true, denyHeader: 'X-Deny-Reason', requestTargetAsSpelled: false,
     ambiguousRequestTarget: 'refuse', requireAsciiHost: true, foldHopByHop: true, plaintextHeaderSet: false,
     filterRequest, lookupFor: port => guard.lookupFor(port),
-    ...(up ? { tlsTerminateUpstreamCA: readFileSync(up, 'utf8') } : {}),
+    ...(up ? { tlsTerminateUpstreamCA: readFileSync(up, 'utf8') }
+      : opt('--system-roots', 'on') === 'off' ? {} : { tlsTerminateUpstreamCA: [...rootCertificates] }),
   });
   const accepted = new Set();
   const listener = createNetServer(s => {
