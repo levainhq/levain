@@ -13,7 +13,6 @@ need the composed run and stay red until S9: they are `xfail(strict=True)` at th
 
 from __future__ import annotations
 
-
 import pytest
 
 from levain.chat_egress import classify, keys, parse

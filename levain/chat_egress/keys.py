@@ -5,11 +5,10 @@ At LAUNCH, :func:`build_route_set` reads the authority log's replay ONCE and bui
 :class:`RouteSnapshot` per keyed host from the entity's LIVE setup records (`levain.authority.egress_key_live`): the
 record id and its incarnation (`levain.authority.egress_key_incarnation`: the link that brought the id in, and a
 digest of everything the record says but its expiry), the canonical host, the credential SOURCE and ACCOUNT (the
-keychain item's service and account; never the value), the declared repo paths
-(the signed record's list, and nothing else: a launch never reads the workspace's `.git/config`, which the sandbox can
-write; the workspace's remotes are read once at SETUP, Phill present, and signed into the record, K-8) and attach
-yes/no. A store holding two live records for one canonical host refuses the launch, naming both
-(:class:`LaunchRefused`; R15-21-4: no merge, no pick).
+keychain item's service and account; never the value), the declared repo paths (the signed record's list, and nothing
+else: a launch never reads the workspace's `.git/config`, which the sandbox can write; the workspace's remotes are read
+once at SETUP, Phill present, and signed into the record, K-8) and attach yes/no. A store holding two live records for
+one canonical host refuses the launch, naming both (:class:`LaunchRefused`; R15-21-4: no merge, no pick).
 
 PER REQUEST the composer does ONE :func:`lookup` by canonical host (R15-18-L1) and hands that one result to every
 reader: classify's keyed-route rules (S3a: "keyed" = in the snapshot, R15-23-4) and :func:`decide_key` here. The
@@ -23,9 +22,10 @@ the sandbox, an argv, an env, a record or a log), once per record incarnation pe
 and it is never in a repr.
 
 The key attaches only on (https, host, 443) (R15-10-A6, R15-12-B1 / B12): never on port 80, never on 8443. On a git
-exchange only for a repo in the declared set (R15-17-1; `advert.key_allowed` is that rule's one home and
-`decide_key` calls it): an undeclared repo, a redirected one included, goes keyless. `attach` takes the first value that applies (R15-28-3): `not-evaluated` (no audit value:
-denied before the lookup) -> `liveness-unreadable` -> `revoked` -> `none` -> `attached` ("chosen at decision", R15-26-2).
+exchange only for a repo in the declared set (R15-17-1; `advert.key_allowed` is that rule's one home and `decide_key`
+calls it): an undeclared repo, a redirected one included, goes keyless. `attach` takes the first value that applies
+(R15-28-3): `not-evaluated` (no audit value: denied before the lookup) -> `liveness-unreadable` -> `revoked` -> `none`
+-> `attached` ("chosen at decision", R15-26-2).
 """
 from __future__ import annotations
 
@@ -381,9 +381,9 @@ def decide_key(route: RouteSnapshot | None, parsed: Any, *, liveness: Liveness,
     (R15-28-3): no audit value -> `not-evaluated` (no liveness read); an unkeyed host -> `none`; then ONE liveness read
     of the route's record AND incarnation: no answer -> `liveness-unreadable`, not live (or another incarnation) ->
     `revoked`; then off (https, 443), a route that never attaches, or a request `advert.key_allowed` keeps keyless
-    (a git exchange for an undeclared repo, R15-17-1) -> `none`; else the value is read and `attached`. `credentials` is the launch's :class:`LaunchCredentials` (one
-    keychain read per record incarnation); anything else, a bare :class:`CredentialStore` included, is a TypeError at
-    the call, before any read."""
+    (a git exchange for an undeclared repo, a walled path, a path holding a `KEYLESS_ESCAPES` escape; R15-17-1) ->
+    `none`; else the value is read and `attached`. `credentials` is the launch's :class:`LaunchCredentials` (one keychain read per record incarnation); anything else, a bare
+    :class:`CredentialStore` included, is a TypeError at the call, before any read."""
     if not isinstance(credentials, LaunchCredentials):
         raise TypeError(f"decide_key takes the launch's LaunchCredentials, not {type(credentials).__name__}")
     if parsed.request_id is None:

@@ -282,8 +282,9 @@ def git_exchange(parsed: ParsedRequest) -> tuple[bool, str | None]:
       (2) a dumb-protocol shape under a `*.git` segment: `/HEAD`, `/objects/...`, `/info/packs`, `/info/alternates`;
       (3) the query carries `service` at all (missing value, duplicated, any value).
     The prefix is the path up to the git suffix (up to and including the `*.git` segment for (2)), as spelled in the
-    canonical path; "/" for a repo at the host's root. None (no declared repo can match, keyless) when: an `info/refs` path does not carry exactly one
-    `service` and it `git-upload-pack`; or only (3) holds (no repo path)."""
+    canonical path; "/" for a repo at the host's root, which is keyless in practice: setup refuses "/" as a declared
+    repo, so no route's declared set holds it. None (no declared repo can match, keyless) when: an `info/refs` path
+    does not carry exactly one `service` and it `git-upload-pack`; or only (3) holds (no repo path)."""
     path = parsed.canonical_path
     if path is None:
         return True, None
@@ -336,8 +337,8 @@ def key_allowed(parsed: ParsedRequest, route: "RouteSnapshot | None") -> bool:
     carries the held key only for a repo in the route's declared set (matched by prefix exactly as spelled, in R-2's
     canonical form). A walled path: False. A path holding a KEYLESS_ESCAPES escape (`%2F`, `%5C`, `%25`, `%3B`, any
     case): False, git exchange or not, declared repo or not (a server that decodes before routing would see a git path
-    this rule never read). Any other request: True (the snapshot's rule, S6's liveness and classify's `reattached` decide). The
-    discovery GET of an undeclared repo is keyless too."""
+    this rule never read). Any other request: True (the snapshot's rule, S6's liveness and classify's `reattached`
+    decide). The discovery GET of an undeclared repo is keyless too."""
     if route is None:
         return True
     if parsed.canonical_path is None:

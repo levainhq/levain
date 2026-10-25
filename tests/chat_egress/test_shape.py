@@ -7,7 +7,6 @@ or `chat_egress_events`) are S9's runs: `xfail(strict=True)` at the bottom.
 
 from __future__ import annotations
 
-
 import pytest
 
 from levain.chat_egress import keys, parse, shape
