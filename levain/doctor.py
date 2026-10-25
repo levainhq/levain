@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from levain.slot import SUDO
+
 
 def _supports_color() -> bool:
     return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -1403,7 +1405,7 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
     # No stat of the sudoers drop-in: /etc/sudoers.d is root-only on Linux (measured in CI), so the
     # operator cannot see it. Writing to the workspace AS the hands user tests the rule, the account
     # and its ownership of the workspace in one step.
-    ok, out = _probe(["sudo", "-n", "-u", cfg.hands_user, "/bin/test", "-w", str(cfg.hands_workspace)])
+    ok, out = _probe([SUDO, "-n", "-u", cfg.hands_user, "/bin/test", "-w", str(cfg.hands_workspace)])
     if not ok:
         return [CheckResult(name, False, f"{cfg.hands_user} cannot write its workspace "
                             f"{cfg.hands_workspace} ({out or 'refused'})", hint=redo)]
