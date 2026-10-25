@@ -476,7 +476,7 @@ def test_anneal_lock_drift_is_pending_only_alongside_a_levain_UPGRADE(
     monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: "anneal-memory")
     monkeypatch.setattr(manifest, "declared_set", lambda: None)
     monkeypatch.setattr(manifest, "discover_installed_set",
-                        lambda *_a: SimpleNamespace(levain=__version__, anneal="1.0.0"))
+                        lambda *_a: SimpleNamespace(levain=__version__, anneal=manifest.KNOWN_GOOD_ANNEAL))
     monkeypatch.setattr(manifest, "read_lock_status",
                         lambda _p: (SimpleNamespace(levain=lock_version, anneal=lock_anneal), "ok"))
     monkeypatch.setattr(manifest, "compute_drift", lambda *_a: SimpleNamespace(verdicts=verdicts))
