@@ -208,3 +208,49 @@ def test_a_card_whose_dispatch_store_cannot_be_read_heads_unreadable(tmp_path, m
     with _serve(_install(tmp_path)[1], surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", steps)["values"]
     assert "UNREADABLE" in out, out
+
+
+@needs_browser
+@needs_ssh
+def test_every_card_state_and_unreadable_heads_its_own_label(tmp_path, monkeypatch):
+    # L3 r2 (codex 6, complement LOW 1): every word the listing can serve goes through the real header draw. One decided
+    # row per word, each carrying that egress_state as the listing would serve it (the word is set per row here; how
+    # the rows decide it is the first test above), each allowed in the queue so a fallback to the queue word reads ALLOWED.
+    from levain.chat_egress.cards import CardState
+    from levain.consent import listing
+
+    home = tmp_path / "levain_home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    consent = home / "consent"
+    consent.mkdir(parents=True, mode=0o700)
+    keydir = tmp_path / "keys"
+    keydir.mkdir()
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", {"laptop": Key(keydir, "laptop")})
+    log.enrol("laptop", "laptop-presence")
+    q = ConsentQueue(consent, authority=log.source)
+    live = _launch(CoordStore(consent), live=True)
+    words = [s.value for s in CardState if s is not CardState.PENDING] + [listing.UNREADABLE]   # a pending row carries none
+    rows: dict[str, object] = {}
+    by_request: dict[str, str] = {}
+    for w in words:
+        c = _card(live, w.replace("_", "-") + ".example")
+        r = file_card(q, c, agent_session_id="s", cwd="/w")
+        payload, sig = signed(q, r, log.keys["laptop"], "allow")
+        q.answer(r.id, payload, sig)
+        rows[w] = r
+        by_request[c["request"]] = w
+    monkeypatch.setattr(listing, "egress_state_of",
+                        lambda entry, lookup: by_request[listing.filed_input(entry.request)["request"]])
+    more = "document.querySelector('#levain-modal .xmore')"      # the modal draws the first ten rows, then "show all N"
+    steps = [NARROW, {"eval": OPEN_DECISIONS},
+             {"until": more},
+             {"eval": f"(() => {{ {more}.click(); return 1; }})()"},
+             {"until": " && ".join(_row(rows[w].id) for w in words)},
+             {"eval": "JSON.stringify({" + ", ".join(
+                 f"{w}: ({_row(rows[w].id)}.querySelector('.consent-head .consent-audit') || {{}}).textContent"
+                 for w in words) + "})"}]
+    with _serve(_install(tmp_path)[1], surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", steps)["values"]
+    heads = json.loads(next(v for v in out if isinstance(v, str) and v.startswith("{") and "unreadable" in v))
+    assert heads == {w: w.replace("_", " ").upper() for w in words}, heads
