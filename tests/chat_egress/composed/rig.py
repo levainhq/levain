@@ -42,6 +42,7 @@ class RecordingOrigin:
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind(("127.0.0.1", 0))
         self._srv.listen(64)
+        self._srv.settimeout(0.2)          # the accept loop re-reads _stop; closing a listener does not wake accept everywhere
         self.port = self._srv.getsockname()[1]
         self._stop = False
         self._socks: list[socket.socket] = []
@@ -53,15 +54,20 @@ class RecordingOrigin:
         while not self._stop:
             try:
                 c, _ = self._srv.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 return
             t = threading.Thread(target=self._serve, args=(c,), daemon=True)
-            with self._lock:
+            with self._lock:               # register and start under one lock, serialized against close()'s snapshot
+                if self._stop:
+                    c.close()
+                    return
                 self.conns += 1
                 self.open_conns += 1
                 self._socks.append(c)
                 self._threads.append(t)
-            t.start()
+                t.start()
 
     @staticmethod
     def _recv(c: socket.socket) -> bytes:
@@ -130,7 +136,9 @@ class RecordingOrigin:
                 self.open_conns -= 1
 
     def close(self) -> None:
-        self._stop = True
+        with self._lock:
+            self._stop = True
+        self._t.join(5)
         try:
             self._srv.close()
         except OSError:
