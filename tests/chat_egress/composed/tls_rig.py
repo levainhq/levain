@@ -190,12 +190,15 @@ class TlsLaunch:
                 obj.do_handshake()
                 break
             except ssl.SSLWantReadError:
+                _within(s, deadline)
                 s.sendall(out.read())
+                _within(s, deadline)
                 d = s.recv(65536)
                 if not d:
                     inc.write_eof()                      # the next do_handshake raises SSLError: the failure is the answer
                 else:
                     inc.write(d)
+        _within(s, deadline)
         s.sendall(out.read())
         return _BioSocket(obj, inc, out, s, deadline)
 
@@ -227,6 +230,14 @@ class TlsLaunch:
             self.origin.close()
 
 
+def _within(s: socket.socket, deadline: float) -> None:
+    """Sets `s`'s timeout to what remains of `deadline`, so the next blocking call cannot outlast it."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("past the test's deadline")
+    s.settimeout(left)
+
+
 class _BioSocket:
     """Just enough socket for `read_response` / `sendall` / `close` over a hand-driven SSLObject."""
 
@@ -235,6 +246,7 @@ class _BioSocket:
 
     def sendall(self, data: bytes) -> None:
         self.obj.write(data)
+        _within(self.s, self.deadline)
         self.s.sendall(self.out.read())
 
     def recv(self, n: int) -> bytes:
@@ -244,7 +256,9 @@ class _BioSocket:
             try:
                 return self.obj.read(n)
             except ssl.SSLWantReadError:
+                _within(self.s, self.deadline)
                 self.s.sendall(self.out.read())
+                _within(self.s, self.deadline)
                 d = self.s.recv(65536)
                 if not d:
                     return b""

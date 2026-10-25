@@ -108,3 +108,49 @@ def test_tls_launch_close_refuses_a_stop_that_was_not_clean(tmp_path) -> None:
     with pytest.raises(AssertionError):
         L.close()
     assert closed == [1]
+
+
+def _silent_peer(client_timeout: float):
+    """A connected pair whose peer never speaks: a blocking read on the client side waits out the socket's own timeout."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    c = socket.create_connection(("127.0.0.1", srv.getsockname()[1]), timeout=client_timeout)
+    peer, _ = srv.accept()
+    srv.close()
+    return c, peer
+
+
+def test_the_no_sni_handshake_is_bounded_by_its_deadline_not_the_sockets_timeout() -> None:
+    """codex measured a 0.2 s deadline returning after ~0.97 s: the loop checked the deadline, then blocked in a recv
+    whose own timeout was longer."""
+    import ssl
+    import time
+    from .tls_rig import TlsLaunch
+    c, peer = _silent_peer(5.0)
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            TlsLaunch._no_sni(ssl.create_default_context(), c, t0 + 0.2)
+    finally:
+        c.close()
+        peer.close()
+    assert time.monotonic() - t0 < 0.7, time.monotonic() - t0
+
+
+def test_a_bio_socket_read_is_bounded_by_its_deadline_not_the_sockets_timeout() -> None:
+    import ssl
+    import time
+    from .tls_rig import _BioSocket
+    c, peer = _silent_peer(5.0)
+    inc, out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    obj = ssl.create_default_context().wrap_bio(inc, out, server_side=False)
+    t0 = time.monotonic()
+    b = _BioSocket(obj, inc, out, c, t0 + 0.2)
+    try:
+        with pytest.raises(TimeoutError):
+            b.recv(10)
+    finally:
+        c.close()
+        peer.close()
+    assert time.monotonic() - t0 < 0.7, time.monotonic() - t0
