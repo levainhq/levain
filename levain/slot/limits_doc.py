@@ -36,7 +36,8 @@ class LimitsDocError(ValueError):
     """A ``levain-limits/1`` document refused. ``code`` is the refusal's name: ``limits-oversize``,
     ``limits-malformed`` (not canonical JSON, not an object, not this format), ``limits-key:<key>`` (a top-level key
     or a kind no slot reads, or an agent with no block), ``limits-not-counted:<kind>`` (a token kind: a slot counts no
-    tokens) or ``limits-value:<block>[.<kind>]`` (a block not an object, a value not an integer in :data:`SLOT_RANGE`)."""
+    tokens) or ``limits-value:<block>[.<kind>]`` (a block not an object, null included; a value not an integer in
+    :data:`SLOT_RANGE`)."""
 
     def __init__(self, code: str, detail: str = "") -> None:
         super().__init__(f"{code} ({detail})" if detail else code)
@@ -57,9 +58,9 @@ def slot_values(doc: Any, agent: Optional[str]) -> Dict[str, float]:
         if key != "format" and key not in ("default", *AGENTS):
             raise LimitsDocError(f"limits-key:{key}"[:128])
     for block in ("default", *AGENTS):
-        got = doc.get(block)
-        if got is None:
+        if block not in doc:            # absent only by the key: an explicit null is a block that is not an object
             continue
+        got = doc[block]
         if not isinstance(got, dict):
             raise LimitsDocError(f"limits-value:{block}", "a block is an object")
         for kind, v in got.items():
@@ -104,10 +105,10 @@ def parse_limits_doc(doc: Any, agent: Optional[str], *, slot: bool = False) -> T
     out = dict(DEFAULTS)
     bad: List[str] = []
     for block in ("default",) if agent is None else ("default", agent):
-        got = doc.get(block)
-        if got is None:
+        if block not in doc:
             continue
-        if not isinstance(got, dict):
+        got = doc[block]
+        if not isinstance(got, dict):   # null too: skipped and named, never read as absent
             bad.append(block)
             continue
         for kind, v in got.items():
