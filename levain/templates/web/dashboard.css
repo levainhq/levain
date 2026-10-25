@@ -2503,9 +2503,10 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 @media (prefers-reduced-motion: no-preference) { .tv-task.waiting, .tv-rec { animation: tv-breathe 3.2s ease-in-out 3; } .tv-pulse { animation: tv-ring 2.6s ease-in-out 4; } .tv-needring:not(.calm) { animation: tv-needflash 1.4s ease-in-out 8; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
 @keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
 @keyframes tv-needflash { 50% { opacity: .2; } }
-/* the open decision mark breathes while it is drawn: slow, small, no blink. Infinite on purpose (it must last as long as the question is open); only the badge and the leader line, never the ring */
-@media (prefers-reduced-motion: no-preference) { .tv-needpulse { animation: tv-needpulse 4s ease-in-out infinite; } .tv-bz-lead.tv-needpulse { animation-name: tv-needlead; } }
-.tv-needbadge { transform-box: fill-box; transform-origin: center; }
+/* the open decision mark breathes: slow, small, no blink; only the badge and the leader line, never the ring. FINITE (8 cycles), like the rest of this block. Measured 10-25 in headless Chrome, 30 s per run, 3 runs per case,
+   with one open badge and with nine, against the same page with only this animation switched off: the whole browser process tree used about 5 to 6 points of one core more (the main thread about 2 points more),
+   above the 2% bar for keeping it infinite. A repaint re-creates the mark, which re-arms the 8 cycles. */
+@media (prefers-reduced-motion: no-preference) { .tv-needbadge { transform-box: fill-box; transform-origin: center; } .tv-needpulse { animation: tv-needpulse 4s ease-in-out 8; } .tv-bz-lead.tv-needpulse { animation-name: tv-needlead; } }
 @keyframes tv-needpulse { 50% { opacity: .68; transform: scale(1.07); } }
 @keyframes tv-needlead { 50% { opacity: .35; } }   /* the leader line only fades: scaling a line would walk its ends off the pill */
 .tv-replaying .tv-needpulse { animation: none; }

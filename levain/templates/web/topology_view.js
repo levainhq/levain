@@ -208,12 +208,12 @@
       return best;
     } catch (_) { return pad; }
   }
-  // The open mark breathes (Phill 10-25) for as long as it is drawn: the badge (and the desk's leader line) carry .tv-needpulse and the mark is drawn only while
-  // needs_open > 0, so answering the item removes the class with the mark. A repaint rebuilds the nodes; a negative delay off one shared clock keeps the breath in phase
+  // The open mark breathes (Phill 10-25) while it is drawn, for 8 cycles per paint (the cost is measured beside the keyframes in dashboard.css): the badge (and the desk's leader line) carry .tv-needpulse and the mark is drawn only while
+  // needs_open > 0, so answering the item removes the class with the mark; a repaint re-arms the cycles. A repaint rebuilds the nodes; a negative delay off one shared clock keeps the breath in phase
   // across repaints instead of restarting it. PULSE_MS is the keyframe period in dashboard.css (tv-needpulse).
   const PULSE_MS = 4000;
   const pulsePhase = () => "-" + Math.round(((typeof performance !== "undefined" && performance.now ? performance.now() : Date.now()) % PULSE_MS)) + "ms";
-  function needMark(nd,cx, cy, rr, ang, opts, label, owner, scale, deco, calm) {
+  function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale, deco, calm) {
     const g = sv("g", { "data-needs": String(nd.n) }, "tv-need");
     if (deco) g.appendChild(deco.art); else g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring" + (calm ? " calm" : "")));
     const { bx, by, txt, w, side } = needGeom(nd, cx, cy, rr, ang, scale, deco);
