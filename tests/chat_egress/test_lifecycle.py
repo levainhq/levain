@@ -1,0 +1,456 @@
+"""CH-D2 S5a-1: C0, the per-request machine (`levain.chat_egress.lifecycle`).
+
+Rows (classification: `project_memory/1024-20/chd2_s5a/ROWS.md`): C0 (one red per (state, event) pair; read per
+request, plan ruling P-2), C9 / R15-12-B7 / R15-14-5 (a client that leaves mid-hold: the card ENDED at the close, his
+later allow forwards nothing), R15-10-A3 (the 100 s hold), R15-10-A8 (attempt before the allow verdict; AMBIGUOUS is an
+allowed attempt with neither), R15-26-3 / R15-26-4 / R15-28-4 (outcome XOR ended-before-outcome, at most one; the race
+is one transition), R15-27-3 (no ended row after an outcome), R15-29-1 with R15-30-4 / R15-30-5 (exactly when the
+ended row is written).
+
+The expected table below is written out pair by pair. It does not import or derive anything from the module's own
+table.
+"""
+
+from __future__ import annotations
+
+import ast
+import itertools
+import threading
+from pathlib import Path
+
+import pytest
+
+from levain.chat_egress import lifecycle as lc
+from levain.chat_egress.lifecycle import Effect as F
+from levain.chat_egress.lifecycle import Event as E
+from levain.chat_egress.lifecycle import Settled
+from levain.chat_egress.lifecycle import State as S
+from levain.chat_egress.lifecycle import Step, Verdict as V
+
+A_ALLOW = (F.WRITE_ATTEMPT, F.SEND_ALLOW)
+A_DENY = (F.WRITE_ATTEMPT, F.SEND_DENY)
+ENDED_PENDING = (F.WRITE_ATTEMPT, F.WRITE_ENDED, F.RELEASE)
+
+
+def _stray(s):
+    return Step(s, (), None, True)
+
+
+def _absorb(s):
+    return Step(s, (), None, False)
+
+
+# (state, event) -> the Step it must give. 8 states x 8 events, every pair listed.
+EXPECTED: dict[tuple[S, E], Step] = {
+    # DECIDING: the decider holds the frame and has not answered.
+    (S.DECIDING, E.NEED_BODY): Step(S.AWAITING_BODY),
+    (S.DECIDING, E.BODY): _stray(S.DECIDING),
+    (S.DECIDING, E.CARD): Step(S.CARD_HELD),
+    (S.DECIDING, E.ALLOW): Step(S.ALLOWED, A_ALLOW, V.ALLOW),
+    (S.DECIDING, E.DENY): Step(S.DENIED, A_DENY, V.DENY),
+    (S.DECIDING, E.RESPONSE): _stray(S.DECIDING),
+    (S.DECIDING, E.ENDED): Step(S.ENDED, ENDED_PENDING, V.UNDECIDED),        # R15-30-5
+    (S.DECIDING, E.CLOSE): Step(S.CLOSED, (F.WRITE_ATTEMPT,), V.UNDECIDED),
+    # AWAITING_BODY: a need-body frame was sent; srt's body frame has not come.
+    (S.AWAITING_BODY, E.NEED_BODY): _stray(S.AWAITING_BODY),
+    (S.AWAITING_BODY, E.BODY): Step(S.DECIDING),
+    (S.AWAITING_BODY, E.CARD): _stray(S.AWAITING_BODY),
+    (S.AWAITING_BODY, E.ALLOW): _stray(S.AWAITING_BODY),
+    (S.AWAITING_BODY, E.DENY): Step(S.DENIED, A_DENY, V.DENY),               # body_timeout, a cap
+    (S.AWAITING_BODY, E.RESPONSE): _stray(S.AWAITING_BODY),
+    (S.AWAITING_BODY, E.ENDED): Step(S.ENDED, ENDED_PENDING, V.UNDECIDED),   # R15-30-5
+    (S.AWAITING_BODY, E.CLOSE): Step(S.CLOSED, (F.WRITE_ATTEMPT,), V.UNDECIDED),
+    # CARD_HELD: an operator card is up; the decision waits on him (or the hold's expiry, a DENY).
+    (S.CARD_HELD, E.NEED_BODY): _stray(S.CARD_HELD),
+    (S.CARD_HELD, E.BODY): _stray(S.CARD_HELD),
+    (S.CARD_HELD, E.CARD): _stray(S.CARD_HELD),
+    (S.CARD_HELD, E.ALLOW): Step(S.ALLOWED, A_ALLOW, V.ALLOW),
+    (S.CARD_HELD, E.DENY): Step(S.DENIED, A_DENY, V.DENY),
+    (S.CARD_HELD, E.RESPONSE): _stray(S.CARD_HELD),
+    (S.CARD_HELD, E.ENDED): Step(S.ENDED, (F.CARD_ENDED,) + ENDED_PENDING, V.UNDECIDED),  # C9, B7, R15-29-1 (a)
+    (S.CARD_HELD, E.CLOSE): Step(S.CLOSED, (F.CARD_ENDED, F.WRITE_ATTEMPT), V.UNDECIDED),
+    # ALLOWED: the allow was sent; `onResponse` has not fired.
+    (S.ALLOWED, E.NEED_BODY): _stray(S.ALLOWED),
+    (S.ALLOWED, E.BODY): _stray(S.ALLOWED),
+    (S.ALLOWED, E.CARD): _stray(S.ALLOWED),
+    (S.ALLOWED, E.ALLOW): _stray(S.ALLOWED),
+    (S.ALLOWED, E.DENY): _stray(S.ALLOWED),
+    (S.ALLOWED, E.RESPONSE): Step(S.OUTCOME, (F.WRITE_OUTCOME,)),
+    (S.ALLOWED, E.ENDED): Step(S.ENDED, (F.WRITE_ENDED,)),                   # R15-29-1 (b), R15-30-4
+    (S.ALLOWED, E.CLOSE): Step(S.CLOSED),                                    # settles AMBIGUOUS from the rows
+    # DENIED: owed no outcome. An ended report here is the deny-vs-abort race: absorbed (R15-29-1: none after a deny).
+    (S.DENIED, E.NEED_BODY): _absorb(S.DENIED),
+    (S.DENIED, E.BODY): _absorb(S.DENIED),
+    (S.DENIED, E.CARD): _absorb(S.DENIED),
+    (S.DENIED, E.ALLOW): _absorb(S.DENIED),
+    (S.DENIED, E.DENY): _absorb(S.DENIED),
+    (S.DENIED, E.RESPONSE): _stray(S.DENIED),                                # srt never fires onResponse on a deny
+    (S.DENIED, E.ENDED): _absorb(S.DENIED),
+    (S.DENIED, E.CLOSE): _absorb(S.DENIED),
+}
+for _ev in E:
+    EXPECTED[(S.OUTCOME, _ev)] = _absorb(S.OUTCOME)    # R15-27-3 / R15-28-4: no ended row after an outcome
+    EXPECTED[(S.ENDED, _ev)] = _absorb(S.ENDED)        # C9: an allow on an ENDED card forwards nothing
+    EXPECTED[(S.CLOSED, _ev)] = _absorb(S.CLOSED)
+
+
+def test_the_expected_table_is_whole():
+    assert set(EXPECTED) == set(itertools.product(S, E))
+    assert len(EXPECTED) == 64
+
+
+# --- C0: one red per (state, event) pair ------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("state", "event"), sorted(EXPECTED, key=lambda k: (list(S).index(k[0]), list(E).index(k[1]))),
+                         ids=lambda v: str(v))
+def test_c0_pair(state, event):
+    assert lc.step(state, event) == EXPECTED[(state, event)]
+
+
+def test_c0_step_refuses_a_non_member():
+    with pytest.raises(ValueError):
+        lc.step("deciding", E.ALLOW)          # type: ignore[arg-type]  # a str with the same value is not a State
+    with pytest.raises(ValueError):
+        lc.step(S.DECIDING, "allow")          # type: ignore[arg-type]
+
+
+def test_pending_and_terminal_partition_the_states():
+    assert lc.PENDING == {S.DECIDING, S.AWAITING_BODY, S.CARD_HELD}
+    assert lc.TERMINAL == {S.DENIED, S.OUTCOME, S.ENDED, S.CLOSED}
+    assert lc.PENDING | lc.TERMINAL | {S.ALLOWED} == set(S)
+
+
+def test_a_terminal_state_never_leaves():
+    assert len(lc.TERMINAL) == 4
+    for st, ev in itertools.product(lc.TERMINAL, E):
+        r = lc.step(st, ev)
+        assert r.state is st and r.effects == () and r.verdict is None
+
+
+def test_verdict_is_set_exactly_when_an_attempt_is_written():
+    for st, ev in itertools.product(S, E):
+        r = lc.step(st, ev)
+        assert (r.verdict is not None) == (F.WRITE_ATTEMPT in r.effects), (st, ev)
+
+
+def test_a_stray_step_has_no_effect_and_keeps_its_state():
+    for st, ev in itertools.product(S, E):
+        r = lc.step(st, ev)
+        if r.stray:
+            assert r.state is st and r.effects == ()
+
+
+# --- R15-10-A8: the attempt is committed before the allow verdict is sent ----------------------------------------
+
+@pytest.mark.parametrize("st", [S.DECIDING, S.CARD_HELD])
+def test_r15_10_a8_attempt_precedes_the_allow(st):
+    eff = lc.step(st, E.ALLOW).effects
+    assert eff.index(F.WRITE_ATTEMPT) < eff.index(F.SEND_ALLOW)
+
+
+def test_the_attempt_precedes_every_verdict_and_every_other_row():
+    for st, ev in itertools.product(S, E):
+        eff = lc.step(st, ev).effects
+        if F.WRITE_ATTEMPT in eff:
+            i = eff.index(F.WRITE_ATTEMPT)
+            for later in (F.SEND_ALLOW, F.SEND_DENY, F.WRITE_ENDED, F.RELEASE):
+                if later in eff:
+                    assert i < eff.index(later), (st, ev)
+
+
+def test_c9_the_card_ends_before_anything_else_at_the_close():
+    for ev in (E.ENDED, E.CLOSE):
+        eff = lc.step(S.CARD_HELD, ev).effects
+        assert eff[0] is F.CARD_ENDED
+
+
+# --- C9 / R15-12-B7 / R15-14-5: the client leaves mid-hold, then his allow ---------------------------------------
+
+def _run(events):
+    m = lc.RequestLifecycle()
+    out = [m.fire(e) for e in events]
+    return m, out
+
+
+def _all_effects(steps):
+    return [f for s in steps for f in s.effects]
+
+
+def test_c9_b7_client_leaves_mid_hold_then_his_allow_forwards_nothing():
+    m, steps = _run([E.CARD, E.ENDED, E.ALLOW])
+    eff = _all_effects(steps)
+    assert F.CARD_ENDED in eff                       # ENDED at the close, not at the hold's expiry
+    assert F.SEND_ALLOW not in eff                   # his allow forwards nothing
+    assert steps[-1] == Step(S.ENDED)                # absorbed, not a glue bug
+    assert eff.count(F.WRITE_ATTEMPT) == 1 and eff.count(F.WRITE_ENDED) == 1
+    assert steps[1].verdict is V.UNDECIDED
+    assert m.state is S.ENDED
+
+
+def test_c9_a_retry_raises_a_second_card_and_the_first_still_forwards_nothing():
+    first, second = lc.RequestLifecycle(), lc.RequestLifecycle()
+    first.fire(E.CARD)
+    second.fire(E.CARD)                              # the client's retry, while the first is still up
+    first.fire(E.ENDED)                              # the first client timed out
+    assert first.fire(E.ALLOW).effects == ()
+    assert second.fire(E.ALLOW).effects == A_ALLOW   # the retry is its own request
+    assert first.state is S.ENDED and second.state is S.ALLOWED
+
+
+def test_c9_hold_expiry_is_a_deny_and_writes_no_ended_row():
+    _, steps = _run([E.CARD, E.DENY, E.ENDED])       # expiry denies; the client then leaves
+    eff = _all_effects(steps)
+    assert eff == list(A_DENY)
+    assert steps[0].verdict is None and steps[1].verdict is V.DENY
+
+
+# --- R15-10-A3: the hold -----------------------------------------------------------------------------------------
+
+def test_r15_10_a3_hold_is_100s_under_claude_codes_120s_bash_default():
+    assert lc.EGRESS_CARD_HOLD_S == 100
+    assert lc.EGRESS_CARD_HOLD_S < 120
+
+
+# --- R15-29-1 with R15-30-4 / R15-30-5: exactly when the ended row is written ------------------------------------
+
+ROW_CASES = {
+    # the ruling's reds, as the decider sees them
+    "denied GET -> attempt only": ([E.DENY], V.DENY, False, False, Settled.DENIED),
+    "held card, client leaves -> attempt + ended": ([E.CARD, E.ENDED], V.UNDECIDED, False, True, Settled.ENDED),
+    "allowed, srt 403/502 locally after the wrapper's allow -> attempt + ended (R15-30-4)":
+        ([E.ALLOW, E.ENDED], V.ALLOW, False, True, Settled.ENDED),
+    "normal 200 -> attempt + outcome, no ended row (R15-27-3)":
+        ([E.ALLOW, E.RESPONSE, E.ENDED], V.ALLOW, True, False, Settled.COMPLETED),
+    # fold readings
+    "carded non-read denied, then the client leaves -> attempt only":
+        ([E.CARD, E.DENY, E.ENDED], V.DENY, False, False, Settled.DENIED),
+    "client leaves while the decider is still deciding -> ended (R15-30-5)":
+        ([E.ENDED], V.UNDECIDED, False, True, Settled.ENDED),
+    "client leaves while the body is awaited -> ended (R15-30-5)":
+        ([E.NEED_BODY, E.ENDED], V.UNDECIDED, False, True, Settled.ENDED),
+    "body read, then allowed, then 200": ([E.NEED_BODY, E.BODY, E.ALLOW, E.RESPONSE], V.ALLOW, True, False,
+                                          Settled.COMPLETED),
+    "allowed, launch ends before any report -> AMBIGUOUS (R15-10-A8)":
+        ([E.ALLOW, E.CLOSE], V.ALLOW, False, False, Settled.AMBIGUOUS),
+    "held card at launch end -> card ended, attempt undecided":
+        ([E.CARD, E.CLOSE], V.UNDECIDED, False, False, Settled.UNDECIDED),
+}
+
+
+@pytest.mark.parametrize("case", list(ROW_CASES), ids=list(ROW_CASES))
+def test_r15_29_1_rows_per_request(case):
+    events, verdict, outcome, ended, settled = ROW_CASES[case]
+    _, steps = _run(events)
+    eff = _all_effects(steps)
+    assert eff.count(F.WRITE_ATTEMPT) == 1
+    assert [s.verdict for s in steps if s.verdict is not None] == [verdict]
+    assert eff.count(F.WRITE_OUTCOME) == int(outcome)
+    assert eff.count(F.WRITE_ENDED) == int(ended)
+    assert lc.settle(verdict, outcome, ended) is settled
+
+
+def test_r15_29_1_never_an_ended_row_after_a_deny():
+    for pre in ([], [E.CARD], [E.NEED_BODY]):
+        _, steps = _run(pre + [E.DENY, E.ENDED, E.CLOSE])
+        assert F.WRITE_ENDED not in _all_effects(steps)
+
+
+# --- R15-26-4 / R15-28-4: up to two rows per request, over every sequence ----------------------------------------
+
+def test_r15_26_4_at_most_two_rows_over_every_sequence_up_to_length_5():
+    n = 0
+    for k in range(1, 6):
+        for seq in itertools.product(list(E), repeat=k):
+            st, attempts, terminal_rows = S.DECIDING, 0, 0
+            verdict = None
+            for ev in seq:
+                r = lc.step(st, ev)
+                st = r.state
+                attempts += r.effects.count(F.WRITE_ATTEMPT)
+                terminal_rows += r.effects.count(F.WRITE_OUTCOME) + r.effects.count(F.WRITE_ENDED)
+                if r.verdict is not None:
+                    verdict = r.verdict
+                # a row of either outcome kind is only ever written once an attempt exists
+                if terminal_rows:
+                    assert attempts == 1, seq
+            assert attempts <= 1 and terminal_rows <= 1, seq
+            assert (verdict is None) == (attempts == 0), seq
+            n += 1
+    assert n == sum(8 ** k for k in range(1, 6))
+
+
+def test_a_verdict_is_sent_at_most_once_over_every_sequence_up_to_length_5():
+    for k in range(1, 6):
+        for seq in itertools.product(list(E), repeat=k):
+            st, sent = S.DECIDING, 0
+            for ev in seq:
+                r = lc.step(st, ev)
+                st = r.state
+                sent += sum(r.effects.count(f) for f in (F.SEND_ALLOW, F.SEND_DENY, F.RELEASE))
+            assert sent <= 1, seq
+
+
+# --- R15-26-3: the outcome-vs-ended race is ONE transition --------------------------------------------------------
+
+@pytest.mark.parametrize("first", [E.RESPONSE, E.ENDED])
+def test_r15_26_3_the_second_report_is_absorbed_not_stray(first):
+    second = E.ENDED if first is E.RESPONSE else E.RESPONSE
+    _, steps = _run([E.ALLOW, first, second])
+    assert steps[2].effects == () and steps[2].stray is False
+    rows = _all_effects(steps)
+    assert rows.count(F.WRITE_OUTCOME) + rows.count(F.WRITE_ENDED) == 1
+
+
+def _held_race(pre, first, second):
+    """Fire `first` on one thread with its perform held open, then `second` on another. It returns (rows in the order
+    they were performed, whether `second` finished while `first`'s perform was still held). Deterministic: the
+    interleaving is forced, not hoped for."""
+    m = lc.RequestLifecycle()
+    for e in pre:
+        m.fire(e)
+    rows: list[F] = []
+    entered, release = threading.Event(), threading.Event()
+
+    def held(s):
+        entered.set()
+        assert release.wait(5)
+        rows.extend(s.effects)
+
+    t1 = threading.Thread(target=lambda: m.fire(first, perform=held))
+    t1.start()
+    assert entered.wait(5)
+    done = threading.Event()
+
+    def second_fire():
+        m.fire(second, perform=lambda s: rows.extend(s.effects))
+        done.set()
+
+    t2 = threading.Thread(target=second_fire)
+    t2.start()
+    finished_early = done.wait(0.2)
+    release.set()
+    t1.join(5)
+    t2.join(5)
+    assert not t1.is_alive() and not t2.is_alive()
+    return rows, finished_early
+
+
+@pytest.mark.parametrize(("first", "second"), [(E.RESPONSE, E.ENDED), (E.ENDED, E.RESPONSE)], ids=str)
+def test_r15_26_3_race_after_allow_writes_exactly_one_row(first, second):
+    """The obs drain's RESPONSE and the abort report race on one allowed request: whichever transition goes first
+    writes its row, and the other writes nothing (one transition, not a glue bug)."""
+    rows, early = _held_race([E.ALLOW], first, second)
+    assert rows == [F.WRITE_OUTCOME if first is E.RESPONSE else F.WRITE_ENDED]
+    assert early is False                            # the second waited on the first's transition
+
+
+def test_r15_10_a8_an_ended_row_racing_the_allow_waits_for_the_attempt_commit():
+    """His allow is mid-commit (attempt row, then the allow frame) when the client's abort report comes. The ended row
+    is performed AFTER the attempt and the allow, never interleaved before the attempt commits."""
+    rows, early = _held_race([E.CARD], E.ALLOW, E.ENDED)
+    assert rows == [F.WRITE_ATTEMPT, F.SEND_ALLOW, F.WRITE_ENDED]
+    assert early is False
+
+
+def test_c9_an_allow_racing_the_client_leaving_forwards_nothing_when_the_abort_goes_first():
+    rows, early = _held_race([E.CARD], E.ENDED, E.ALLOW)
+    assert rows == [F.CARD_ENDED] + list(ENDED_PENDING)
+    assert F.SEND_ALLOW not in rows
+    assert early is False
+
+
+def test_fire_runs_perform_under_the_machines_lock():
+    m = lc.RequestLifecycle()
+    held = []
+
+    def perform(s):
+        held.append(m._lock.locked())
+
+    m.fire(E.ALLOW, perform=perform)
+    assert held == [True]
+
+
+def test_fire_does_not_call_perform_for_an_effectless_step():
+    m = lc.RequestLifecycle()
+    calls = []
+    m.fire(E.CARD, perform=calls.append)
+    m.fire(E.BODY, perform=calls.append)            # stray
+    assert calls == []
+    assert m.state is S.CARD_HELD
+
+
+# --- settle: the read side (records and the card read rows, not the machine) --------------------------------------
+
+SETTLE = {
+    (V.DENY, False, False): Settled.DENIED,
+    (V.DENY, True, False): Settled.INCONSISTENT,
+    (V.DENY, False, True): Settled.INCONSISTENT,
+    (V.DENY, True, True): Settled.INCONSISTENT,
+    (V.ALLOW, False, False): Settled.AMBIGUOUS,
+    (V.ALLOW, True, False): Settled.COMPLETED,
+    (V.ALLOW, False, True): Settled.ENDED,
+    (V.ALLOW, True, True): Settled.INCONSISTENT,
+    (V.UNDECIDED, False, False): Settled.UNDECIDED,
+    (V.UNDECIDED, True, False): Settled.INCONSISTENT,
+    (V.UNDECIDED, False, True): Settled.ENDED,
+    (V.UNDECIDED, True, True): Settled.INCONSISTENT,
+}
+
+
+@pytest.mark.parametrize("key", list(SETTLE), ids=lambda k: f"{k[0]}-o{int(k[1])}-e{int(k[2])}")
+def test_settle(key):
+    assert lc.settle(*key) is SETTLE[key]
+
+
+def test_settle_refuses_a_non_member_verdict():
+    with pytest.raises(ValueError):
+        lc.settle("allow", False, False)            # type: ignore[arg-type]
+
+
+def test_every_machine_end_settles_consistently():
+    """Whatever sequence ran, the rows the machine asked for settle to a non-INCONSISTENT value."""
+    for k in range(1, 5):
+        for seq in itertools.product(list(E), repeat=k):
+            st, verdict, outcome, ended = S.DECIDING, None, False, False
+            for ev in seq:
+                r = lc.step(st, ev)
+                st = r.state
+                verdict = r.verdict or verdict
+                outcome |= F.WRITE_OUTCOME in r.effects
+                ended |= F.WRITE_ENDED in r.effects
+            if verdict is not None:
+                assert lc.settle(verdict, outcome, ended) is not Settled.INCONSISTENT, seq
+
+
+# --- C0's census, as far as lifecycle goes (the decider's census after a close is S5b's, P-2) ---------------------
+
+def test_c0_lifecycle_starts_no_thread_and_no_task():
+    """Lifecycle owns no thread, task, timer or socket; a close cannot leak one here. Structural, so it can fail."""
+    src = Path(lc.__file__).read_text()
+    tree = ast.parse(src)
+    imported = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    imported |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+    assert not imported & {"asyncio", "socket", "selectors", "subprocess", "concurrent", "multiprocessing"}
+    called = {n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
+              for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    assert not called & {"Thread", "Timer", "create_task", "ensure_future", "start_new_thread"}
+
+
+@pytest.mark.parametrize("st", list(S), ids=str)
+def test_c0_census_after_a_close_in_each_state(st):
+    """Drive a machine to each state, close it: the thread set is unchanged. This passes on any pure machine, so it is
+    a smoke check, not the census row; the row's census (the decider's threads and tasks) is S5b's."""
+    paths = {
+        S.DECIDING: [], S.AWAITING_BODY: [E.NEED_BODY], S.CARD_HELD: [E.CARD], S.ALLOWED: [E.ALLOW],
+        S.DENIED: [E.DENY], S.OUTCOME: [E.ALLOW, E.RESPONSE], S.ENDED: [E.ENDED], S.CLOSED: [E.CLOSE],
+    }
+    before = set(threading.enumerate())
+    m, _ = _run(paths[st])
+    assert m.state is st
+    m.fire(E.CLOSE)
+    assert set(threading.enumerate()) == before
+
+
+def test_the_package_docstring_names_lifecycle():
+    import levain.chat_egress as pkg
+    assert "lifecycle" in (pkg.__doc__ or "")
