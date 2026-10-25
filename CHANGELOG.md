@@ -14,8 +14,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   their waiting requests and ends their open change streams. A paired token opens what the shared write token opens
   and nothing more: every passkey-signed act still needs the passkey. Only token hashes are stored, in `cockpit.db`.
   `levain cockpit pair` mints a code from the box itself (it refuses to print one into a pipe unless given
-  `--print`), and `levain cockpit pair --revoke-all` ends every paired device. The pairing page, the devices panel
-  and the QR code are not in this release; until they are, a code is claimed by a client calling the route.
+  `--print`), and `levain cockpit pair --revoke-all` ends every paired device.
+- **The pairing page and the Devices panel (pairing P2).** The cockpit's Devices panel lists the paired devices, mints a
+  pairing link and revokes a device alone. A new device opens the offering device's `/pair#code=...` link (it also opens
+  from another site as a top-level navigation) and trades the code for its own key; "Pair it again" asks before it
+  replaces a key this browser already holds. No QR code is drawn: the link is the offer.
 
 ### Changed
 - **Levain now requires anneal-memory 1.0.2.** anneal 1.0.2 forms no association links and ignores the affect

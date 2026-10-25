@@ -5749,7 +5749,7 @@
       }
       const head = el("div", "ext-grouphead", "standing grants");
       const inert = typeof b.inert_note === "string" ? b.inert_note : "";
-      // why no passkey can revoke on this page (a ported cockpit, a localhost one), in the server's words
+      // why no passkey can revoke on this page (a localhost cockpit, or a pin on another name than the passkeys'), in the server's words
       const why = signList && typeof signList.grants_note === "string" && signList.grants_note ? signList.grants_note : "";
       slot.replaceChildren(head, ...said, ...(note ? [el("div", "consent-note ext-meta", note)] : []),
                            ...(why ? [el("div", "consent-note ext-meta grant-why", why)] : []),
