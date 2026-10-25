@@ -218,7 +218,10 @@ def test_a_wrapper_registered_after_close_began_is_closed_at_once() -> None:
         o = RecordingOrigin(tls=(str(leaf), str(key)))
         wrapped = threading.Event()
 
+        seen: list = []
+
         def after_wrap(_c) -> None:
+            seen.append(_c)
             wrapped.set()
             assert o.snapshotted.wait(10)
 
@@ -234,6 +237,7 @@ def test_a_wrapper_registered_after_close_began_is_closed_at_once() -> None:
         try:
             assert not [t for t in o._threads if t.is_alive()]
             assert o._socks == [] or all(s.fileno() == -1 for s in o._socks), o._socks
+            assert seen and seen[0].fileno() == -1, seen          # the late wrapper itself is closed, not left to refcounting
         finally:
             for s in box:
                 s.close()

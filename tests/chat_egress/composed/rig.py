@@ -126,6 +126,7 @@ class RecordingOrigin:
                     self.after_wrap(c)
                 with self._lock:
                     if self._stop:                               # close() snapshotted without this wrapper: close it here
+                        c.close()
                         return
                     self._socks.append(c)
             while True:
