@@ -7,10 +7,11 @@ the defaults and the slot ranges.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import math
+from typing import Any, Dict, List, Optional, Tuple
 
 __all__ = ["AGENTS", "DEFAULTS", "KINDS", "LIMITS_FORMAT", "REPEAT_WINDOW", "SLOT_KINDS", "SLOT_LIMITS_MAX",
-           "SLOT_RANGE", "POLICY_LIMITS", "LimitsDocError", "slot_doc", "slot_values"]
+           "SLOT_RANGE", "POLICY_LIMITS", "LimitsDocError", "parse_limits_doc", "slot_doc", "slot_values"]
 
 LIMITS_FORMAT = "levain-limits/1"
 # the document's name under L/policy/: root writes it (the install helper's set-limits), the queue broker reads it
@@ -75,6 +76,47 @@ def slot_values(doc: Any, agent: Optional[str]) -> Dict[str, float]:
     for block in ("default",) if agent is None else ("default", agent):
         out.update(doc.get(block) or {})       # each block checked an object above
     return out
+
+
+def _limit_value(kind: str, v: Any) -> Optional[float]:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:                            # an integer past float range raises here, and is a bad value like any other
+        if not math.isfinite(v) or v <= 0 or (kind != "active_hours" and v != int(v)):
+            return None
+        return float(v)
+    except (OverflowError, ValueError):
+        return None
+
+
+def parse_limits_doc(doc: Any, agent: Optional[str], *, slot: bool = False) -> Tuple[Dict[str, float], List[str]]:
+    """THE reading of a parsed ``levain-limits/1`` document, Q13's ``limits.json`` and a slot's ``L/policy/limits``
+    alike: (:data:`DEFAULTS` overlaid by the ``default`` block, then by ``agent``'s block; what was skipped).
+
+    ``slot=False`` (Q13's local file): a block that is not an object, or a kind or value :func:`_limit_value` refuses,
+    is skipped and named in the list; raises :class:`LimitsDocError` only when ``doc`` is not a ``levain-limits/1``
+    object. ``slot=True``: :func:`slot_values` (the whole document checked, its first fault raised; exactly
+    :data:`SLOT_KINDS`), and the list is empty. ``agent=None`` reads the ``default`` block only."""
+    if slot:
+        return slot_values(doc, agent), []
+    if not isinstance(doc, dict) or doc.get("format") != LIMITS_FORMAT:
+        raise LimitsDocError("limits-malformed", f"not a {LIMITS_FORMAT} object")
+    out = dict(DEFAULTS)
+    bad: List[str] = []
+    for block in ("default",) if agent is None else ("default", agent):
+        got = doc.get(block)
+        if got is None:
+            continue
+        if not isinstance(got, dict):
+            bad.append(block)
+            continue
+        for kind, v in got.items():
+            val = _limit_value(kind, v) if kind in DEFAULTS else None
+            if val is None:
+                bad.append(f"{block}.{kind}")
+            else:
+                out[kind] = val
+    return out, bad
 
 
 def slot_doc(data: bytes, *, canonical: bool = True) -> Dict[str, Any]:
