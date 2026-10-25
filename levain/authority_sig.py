@@ -2,8 +2,8 @@
 
 Split out of ``levain.authority`` so a process that only verifies a signature (root's route-map check in CONTROL and
 keys, ``levain.slot.routemaps``) imports this and the trust-anchor rule (``levain.trust_anchor``), never the
-authority store, its replay or ``levain.autonomic``. ``levain.authority`` re-exports every name here, and its own
-calls go through its own module attribute, so a patch of ``levain.authority.verify_link_sig`` reaches them.
+authority store, its replay or ``levain.autonomic``. ``levain.authority`` re-exports the names its own calls use, and
+those calls go through its own module attribute, so a patch of ``levain.authority.verify_link_sig`` reaches them.
 Stdlib only besides ``levain.trust_anchor``, and 3.9-valid: root's interpreter runs it.
 """
 
@@ -21,8 +21,8 @@ from typing import Any
 
 from levain.trust_anchor import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_problem
 
-__all__ = ["NAMESPACE", "AuthorityError", "VerifierUnavailable", "presence_missing", "sshsig_public_key",
-           "verify_link_sig"]
+__all__ = ["NAMESPACE", "AuthorityError", "VerifierUnavailable", "presence_missing", "public_key_fingerprint",
+           "sshsig_public_key", "verify_link_sig"]
 
 # never the cockpit's or the confirm gate's namespace: a link signature verifies as nothing else
 NAMESPACE = "levain-authority"
@@ -181,6 +181,40 @@ def _pipe_reading(data: bytes) -> int:
         os.close(w)
         raise
     return r
+
+
+_KEYGEN_FINGERPRINT = re.compile(r"[0-9]+ (SHA256:[A-Za-z0-9+/]{43}) .*")
+
+
+def public_key_fingerprint(public_key: Any, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                           timeout: float = 10.0) -> str | None:
+    """The ``SHA256:...`` fingerprint ssh-keygen reads for one public key line (``<type> <base64> [comment]``): the
+    reading :func:`verify_link_sig` compares a pinned fingerprint against, from the same verifier binary and
+    environment. ``None`` when ssh-keygen does not read the line as exactly one public key (a truncated or malformed blob among
+    them). The line reaches ssh-keygen on its stdin, never a file. Raises :class:`VerifierUnavailable` when the
+    verifier cannot run (that is never a verdict on the key)."""
+    if not isinstance(public_key, str) or len(public_key) > _MAX_SIGNATURE:
+        return None
+    line = public_key.strip()
+    if not line or "\n" in line or "\r" in line:
+        return None
+    try:
+        data = (line + "\n").encode("ascii")
+    except UnicodeError:
+        return None
+    problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
+    if problem is not None:
+        raise VerifierUnavailable(f"cannot read a public key's fingerprint: {problem}")
+    try:
+        cp = subprocess.run([str(keygen), "-l", "-E", "sha256", "-f", "-"], input=data, capture_output=True,
+                            timeout=timeout, env=dict(_VERIFY_ENV))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise VerifierUnavailable(f"ssh-keygen could not read a public key ({type(exc).__name__})") from None
+    if cp.returncode != 0:
+        return None
+    out = [ln for ln in (cp.stdout or b"").decode("utf-8", "replace").splitlines() if ln.strip()]
+    m = _KEYGEN_FINGERPRINT.fullmatch(out[0].strip()) if len(out) == 1 else None
+    return m.group(1) if m else None
 
 
 def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerprint: str,

@@ -65,7 +65,8 @@ DISPATCH_DIR, HEAD, CURRENT = "dispatch", "head", "current"
 KEYS_HEAD = ("keys", "routemap.head")
 #: the most a trust, head or `current` file may hold (DECISION: far above a real one; a larger file is refused)
 SMALL_FILE_MAX = 64 * 1024
-#: what keys reads of `L/routes/base.json` for the collision rule (keys' own `BASE_MAP_CAP`)
+#: CONTRACT §4.3's base route map, `L/routes/base.json` (its formats: `policy.BASE_MAP_FORMATS`): the most any reader
+#: of it reads (DECISION: far above a real map; a larger file is refused unread past the cap)
 BASE_MAP_MAX = 1024 * 1024
 #: the fault points of an activation, in the order they are passed (the fault-gate tests SIGKILL at each)
 FAULT_POINTS = ("before_head", "after_head", "after_current")
@@ -231,6 +232,33 @@ def base_route_policy_types(routes_dir: Path) -> Dict[str, str]:
     except Exception as e:   # noqa: BLE001 - any entry's failure, of whatever type, refuses the map whole (as keys)
         raise Refused("config-invalid:base", f"base.json does not parse whole ({type(e).__name__})") from None
     return {rid: pol.type for rid, pol in parsed.items()}
+
+
+def read_base_map(lib_root: str, known: Optional[Tuple[tuple, Dict[str, RoutePolicy]]] = None, *,
+                  parse: Callable[[object], Dict[str, RoutePolicy]] = parse_base_map
+                  ) -> Tuple[tuple, Dict[str, RoutePolicy]]:
+    """keys' read of `L/routes/base.json` under `lib_root`, the one reader of the map whole (keys at every `Q`, and
+    `levain doctor`): `(key, routes)`, where `key` is the opened file's (st_dev, st_ino, st_mtime_ns, st_size) and
+    `routes` the map parsed by `parse` (`policy.parse_base_map`: every entry, both formats, no id twice). When `known`
+    is an earlier result with the same key, it is returned as it is and the file is not read again. Opened as keys has
+    always opened it (a plain open, which follows a link). Raises OSError (FileNotFoundError when absent), PolicyError
+    (over `BASE_MAP_MAX`, or any entry that does not parse: the map is refused whole), ContractError, ValueError or
+    RecursionError (the bytes are not canonical JSON)."""
+    path = os.path.join(lib_root, "routes", "base.json")
+    with open(path, "rb") as f:
+        st = os.fstat(f.fileno())
+        key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+        if known is not None and known[0] == key:
+            return known
+        data = f.read(BASE_MAP_MAX + 1)
+    if len(data) > BASE_MAP_MAX:
+        raise PolicyError("over the size cap")
+    doc = canon.parse(data)
+    try:
+        parsed = parse(doc)
+    except Exception as e:   # noqa: BLE001 - any entry's parse failure, of whatever type, refuses the map whole
+        raise PolicyError(f"the map does not parse ({type(e).__name__})") from None
+    return key, parsed
 
 
 # --- the one checker -----------------------------------------------------------------------------------------------
@@ -998,6 +1026,6 @@ __all__ = ["CONFIG_FORMAT", "CONFIG_NAMESPACE", "CURRENT", "Checked", "CheckedVe
            "VERIFIER_ENTRY_KEYS", "VERIFIER_FORMAT", "VERIFIER_KIND", "check_verifier_item", "sha256_canonical",
            "HEAD", "ITEM_KEYS", "ITEM_MAX_BYTES", "KEYS_HEAD", "KEYS_HEAD_FORMAT", "KIND", "KeysRoutes", "Pin",
            "SIGNATURE_MAX", "TRUST_FORMAT", "TRUST_JSON", "TRUST_PUB", "Trust", "base_route_ids",
-           "base_route_policy_types",
+           "base_route_policy_types", "read_base_map",
            "base_route_types", "check_item",
            "item_digest", "pin_of", "policy_digest", "read_trust"]

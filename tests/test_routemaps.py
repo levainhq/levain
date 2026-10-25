@@ -1029,3 +1029,55 @@ def test_collision_unknown_ids_from_a_reload_that_reads_an_unverifiable_head(st)
     assert k.routes.ids_unknown is True and k.routes.route_ids() is None
     _base_with(st, "zz")
     assert _resolved(k, {"routes": ["zz"]}, "zz") == "keys-unavailable|route-collision"
+
+
+# --- the one base-map reader (3c-9 C fix r2 item 3): keys' read, shared with `levain doctor` ------------------------
+
+def _base_lib(tmp_path, routes=None) -> str:
+    from levain.slot import vendor_routes as VR
+    lib = tmp_path / "L"
+    (lib / "routes").mkdir(parents=True)
+    doc = {"format": VR.BASE_FORMAT, "routes": [VR.anthropic_route()] if routes is None else routes}
+    (lib / "routes" / "base.json").write_bytes(canon.canonical_bytes(doc))
+    return str(lib)
+
+
+def test_read_base_map_parses_whole_and_returns_the_opened_files_key(tmp_path):
+    lib = _base_lib(tmp_path)
+    key, routes = RM.read_base_map(lib)
+    st = os.stat(os.path.join(lib, "routes", "base.json"))
+    assert key == (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size) and list(routes) == ["anthropic"]
+    known = (key, {"sentinel": None})
+    assert RM.read_base_map(lib, known) is known          # the same file is not read again
+
+
+def test_read_base_map_refusals(tmp_path):
+    from levain.broker.policy import PolicyError
+    from levain.slot import vendor_routes as VR
+    with pytest.raises(FileNotFoundError):
+        RM.read_base_map(str(tmp_path / "none"))
+    lib = _base_lib(tmp_path, [VR.anthropic_route(), VR.anthropic_route()])
+    with pytest.raises(PolicyError):
+        RM.read_base_map(lib)                               # an id twice: the map refused whole
+    path = os.path.join(lib, "routes", "base.json")
+    with open(path, "wb") as f:
+        f.write(b" " * (RM.BASE_MAP_MAX + 1))
+    with pytest.raises(PolicyError):
+        RM.read_base_map(lib)
+
+
+def test_read_base_map_follows_a_link_as_keys_always_has(tmp_path):
+    lib = _base_lib(tmp_path)
+    path = os.path.join(lib, "routes", "base.json")
+    os.replace(path, path + ".real")
+    os.symlink(path + ".real", path)
+    assert list(RM.read_base_map(lib)[1]) == ["anthropic"]
+
+
+def test_keys_reads_the_base_map_through_the_one_reader(tmp_path, monkeypatch):
+    lib = _base_lib(tmp_path)
+    seen = []
+    real = RM.read_base_map
+    monkeypatch.setattr(RM, "read_base_map", lambda *a, **k: seen.append(a[0]) or real(*a, **k))
+    assert K.Keys(lib_root=lib)._base_route("anthropic").route == "anthropic"
+    assert seen == [lib] and not hasattr(K, "BASE_MAP_CAP")

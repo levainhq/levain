@@ -92,7 +92,7 @@ from levain.broker.creds import (COMMIT_FDS, REFRESH_CONNS, CredLifecycle, CredS
                                  FakeCredLifecycle, check_host, fresh, on_upstream_401, unexpired)
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of, peer_uid
-from levain.broker.policy import PolicyError, Price, RoutePolicy, parse_base_map
+from levain.broker.policy import Price, RoutePolicy, parse_base_map
 from levain.broker.redact import Scanner
 from levain.broker.upstream import (GRACE, StaleExchange, Upstream, _note, h11_bytes, open_exchange,
                                     pick_address)
@@ -222,10 +222,6 @@ _A = gwwire.encode(b"A")
 
 #: a brokered route's upstream is `https` (policy refuses any other scheme) and names no port
 UPSTREAM_PORT = 443
-#: CONTRACT §4.3's base route map, `L/routes/base.json` (its formats: `policy.BASE_MAP_FORMATS`): the size keys reads
-#: at most (DECISION: far above a real map; a larger file is refused unread past the cap)
-BASE_MAP_CAP = 1024 * 1024
-
 #: an upstream redirect is never followed: `upstream-redirect` (design 1.6); other 3xx (304) pass
 REDIRECTS = frozenset({301, 302, 303, 307, 308})
 #: the largest `b` frame keys writes (the wire's cap for `b`)
@@ -2687,26 +2683,12 @@ class Keys:
         differs from the last map that parsed whole, or None when the map has none. EVERY entry is parsed before one
         is selected: a map keys cannot read, any entry that does not parse, or any route id named twice anywhere in
         the map refuses `keys-unavailable` (logged), never a pass for the route asked about; a refused map is never
-        cached."""
+        cached. The read is `routemaps.read_base_map`, the one reader `levain doctor` shares."""
         if self.lib_root is None:
             raise norm.Refused("keys-unavailable", "no lib root")
-        path = os.path.join(self.lib_root, "routes", "base.json")
         try:
-            with open(path, "rb") as f:
-                st = os.fstat(f.fileno())
-                key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
-                if self._base is not None and self._base[0] == key:
-                    return self._base[1].get(route)
-                data = f.read(BASE_MAP_CAP + 1)
-            if len(data) > BASE_MAP_CAP:
-                raise PolicyError("over the size cap")
-            doc = canon.parse(data)
-            try:
-                parsed: Dict[str, RoutePolicy] = parse_base_map(doc)
-            except Exception as e:   # any entry's parse failure, of whatever type, refuses the map whole
-                raise PolicyError(f"the map does not parse ({type(e).__name__})") from None
-            self._base = (key, parsed)
-            return parsed.get(route)
+            self._base = routemaps.read_base_map(self.lib_root, self._base, parse=parse_base_map)
+            return self._base[1].get(route)
         except (OSError, ValueError, ContractError, RecursionError) as e:
             _note(logging.WARNING, "levain gw-keys: the base route map is unusable (%s)", type(e).__name__)
             raise norm.Refused("keys-unavailable", "base map") from None
