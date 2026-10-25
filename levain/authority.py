@@ -414,9 +414,9 @@ _FP = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 _RENEW_MAX = timedelta(days=30)
 _RENEW_SKEW = timedelta(minutes=10)
 
-# A graduation policy (14b DESIGN_REV3 §3): a signed envelope letting the named actions, each at the risk the running
-# manifest gives it, run at or above ``lowest_posture`` without a per-action signature until ``expires_at``. What
-# binds a writer of the levain home is the actions at their risk, the rung and the expiry; ``triggers``, ``families``
+# A graduation policy (14b DESIGN_REV3 §3): a signed envelope naming actions, each at a risk, the lowest rung an effect
+# it covers may run at (``lowest_posture``) and an expiry; what it covers is the coverage reader's (§4). What would
+# bind a writer of the levain home is the actions at their risk, the rung and the expiry; ``triggers``, ``families``
 # and ``store_id`` narrow what the honest engine reads (writable rows), and ``min_clean_fires`` is advisory (the
 # honest engine's walk). Its terms are fixed under its id: the one change is a renew (only a later expiry); anything
 # else is a revoke and a new id. It lasts at most GRADUATION_GRANT_MAX past its link, and a renew at most that past
@@ -428,7 +428,7 @@ _GRADUATION_FIELDS = frozenset({"id", "kind", "actions", "lowest_posture", "expi
 _GRADUATION_ID = re.compile(r"gp-[0-9a-f]{12}")
 # the rungs a policy may lower an effect to: never ABOVE_LOOP (levain.autonomic.posture.Posture names)
 _GRADUATION_POSTURES = ("COOLING_OFF", "ON_LOOP")
-# an action or trigger name, as a manifest or a binding spells it
+# the action and trigger names a policy may carry
 _GRADUATION_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}")
 _GRADUATION_FAMILY = re.compile(r"fam-[0-9a-f]{32}")
 _GRADUATION_STORE = re.compile(r"store-[0-9a-f]{32}")
@@ -1232,7 +1232,8 @@ def _apply_policy_op(policy: StandingPolicy, rec: Mapping[str, Any]) -> Standing
                 raise AuthorityError("a renew's signed_at must equal its at")
             if old <= signed:
                 raise AuthorityError(f"grant {gid!r} has expired ({data['grants'][gid]['expires_at']}) by this "
-                                     "renew's signing time; a lapsed grant is re-created at the laptop")
+                                     "renew's signing time; a lapsed grant is never renewed, only created "
+                                     "again (at the laptop, or a graduation policy by a passkey the opt-in names)")
             if new <= old:
                 raise AuthorityError("a renew must move the grant's expiry later")
             # a difference, never `signed + 30 days`, which overflows near year 9999
@@ -2072,7 +2073,8 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     if abs(now - signed) > _RENEW_SKEW:
         raise AuthorityError("a renew's signed_at must be within 10 minutes of now")
     if _parse_stamp(grant["expires_at"], "the grant's expires_at") <= now:
-        raise AuthorityError(f"grant {rec['grant_id']!r} has expired; a lapsed grant is re-created at the laptop")
+        raise AuthorityError(f"grant {rec['grant_id']!r} has expired; a lapsed grant is never renewed, only "
+                             "created again")
     if _parse_stamp(rec["expires_at"], "expires_at") - now > _RENEW_MAX:      # never now + 30 days: overflow
         raise AuthorityError("a renew may extend a grant at most 30 days from now")
     cap = _grant_kind(grant).max_life
