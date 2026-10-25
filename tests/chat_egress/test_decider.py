@@ -817,12 +817,17 @@ def test_a_lifted_read_stores_the_lifted_names_and_no_value(rig, host, query, ex
 
 # --- S9 r2 item B: the over-cap reason labels the over-cap card only ----------------------------------------------
 
-@pytest.mark.parametrize("query,why", [(None, "upload_pack_over_cap"), ("token=QV1", "credential_in_query")])
-def test_a_cut_pack_body_labels_its_row_by_the_card_it_filed(rig, query, why) -> None:
+@pytest.mark.parametrize("query,extra,why", [
+    (None, {}, "upload_pack_over_cap"),
+    ("token=QV1", {}, "credential_in_query"),
+    ("_method=DELETE", {}, "_method"),
+    (None, {"x-http-method-override": ["DELETE"]}, "override:x-http-method-override"),
+])
+def test_a_cut_pack_body_labels_its_row_by_the_card_it_filed(rig, query, extra, why) -> None:
     r = rig()
     _advertise(r)
     p, rid = r.srt.req("POST", path="/r.git/git-upload-pack", query=query,
-                       headers=UP_CT | {"transfer-encoding": ["chunked"]})
+                       headers=UP_CT | {"transfer-encoding": ["chunked"]} | extra)
     assert r.srt.wait(p)[0]["action"] == "need_body"
     r.srt.body(p, b"x" * (advert.UPLOAD_PACK_BODY_CAP + 1))
     assert _until(lambda: r.desk.filed)
