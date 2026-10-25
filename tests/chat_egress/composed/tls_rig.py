@@ -17,6 +17,7 @@ import datetime
 import socket
 import ssl
 import sys
+import time
 from pathlib import Path
 
 from cryptography import x509
@@ -32,7 +33,7 @@ from levain.coordinator.envelopes import EnvelopeStore
 from ..decider_rig import Desk, Live, Lookup
 from ..fixtures import env as envmod
 from ..test_launch import real_launch
-from .rig import RecordingOrigin
+from .rig import LeakyRelay, RecordingOrigin
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fixtures" / "spike_glue"))
 import decider_spike4 as spike  # noqa: E402  (its make_ca: an RSA CA srt's node-forge accepts)
@@ -77,6 +78,10 @@ def make_pki(d: Path, hosts: list[str]) -> tuple[Path, Path, Path]:
     return d / "ca.pem", d / "leaf.pem", d / "leaf.key"
 
 
+class ConnectRefused(AssertionError):
+    """The CONNECT itself was not answered 200: a probe about what follows the tunnel has no tunnel to probe."""
+
+
 class HeldStore:
     """A credential store holding one value per (source, account); counts its reads."""
 
@@ -116,8 +121,16 @@ class TlsLaunch:
         self.secret = secret
         self.desk = Desk()
         self.answer = answer
+        self.stopped: lm.StopResult | None = None
         ca, leaf, key = make_pki(tmp / "pki", [KEYED, UNKEYED])
         self.origin = RecordingOrigin(reflect=reflect, content_type=content_type, tls=(str(leaf), str(key)))
+        try:                                             # a constructor that fails after the origin started closes it
+            self._start(tmp, monkeypatch, ca, secret, mode, liveness)
+        except BaseException:
+            self.origin.close()
+            raise
+
+    def _start(self, tmp: Path, monkeypatch, ca: Path, secret: str | None, mode: str, liveness) -> None:
         self.store = HeldStore({(SOURCE, ACCOUNT): secret} if secret is not None else {})
         P = self.origin.port
         self.origin_port = P
@@ -146,7 +159,6 @@ class TlsLaunch:
                                           "--upstream-ca", str(ca)), lookup=Lookup()))
         self.http_port = self.e.http_port
         self.socks_port = self.e.socks_port
-        self.stopped: lm.StopResult | None = None
 
     # --- the client's side ---------------------------------------------------------------------------------------
 
@@ -157,26 +169,35 @@ class TlsLaunch:
         p = port or self.origin_port
         s.sendall(f"CONNECT {connect_host}:{p} HTTP/1.1\r\nHost: {connect_host}:{p}\r\n\r\n".encode())
         head = read_response(s)
+        if not head.startswith(b"HTTP/1.1 200"):
+            s.close()
+            raise ConnectRefused(head[:200])
         ctx = ssl.create_default_context(cadata=self.ca_pem.decode())
         ctx.check_hostname = False                       # the name checked is the leaf's, by CA; SNI is the test's variable
-        t = ctx.wrap_socket(s, server_hostname=sni) if sni else self._no_sni(ctx, s)
+        t = ctx.wrap_socket(s, server_hostname=sni) if sni else self._no_sni(ctx, s, time.monotonic() + timeout)
         return t, head
 
     @staticmethod
-    def _no_sni(ctx: ssl.SSLContext, s: socket.socket):
+    def _no_sni(ctx: ssl.SSLContext, s: socket.socket, deadline: float):
         """A handshake that sends no server_name extension (the client library refuses an empty name, so an
-        SSLObject over memory BIOs is driven by hand)."""
+        SSLObject over memory BIOs is driven by hand). A peer EOF fails the handshake; `deadline` bounds the loop."""
         inc, out = ssl.MemoryBIO(), ssl.MemoryBIO()
         obj = ctx.wrap_bio(inc, out, server_side=False)
         while True:
+            if time.monotonic() > deadline:
+                raise TimeoutError("no-SNI handshake past the test's deadline")
             try:
                 obj.do_handshake()
                 break
             except ssl.SSLWantReadError:
                 s.sendall(out.read())
-                inc.write(s.recv(65536))
+                d = s.recv(65536)
+                if not d:
+                    inc.write_eof()                      # the next do_handshake raises SSLError: the failure is the answer
+                else:
+                    inc.write(d)
         s.sendall(out.read())
-        return _BioSocket(obj, inc, out, s)
+        return _BioSocket(obj, inc, out, s, deadline)
 
     def raw(self, request: bytes, *, connect_host: str = UNKEYED, sni: str | None = UNKEYED) -> bytes:
         t, _ = self.tunnel(connect_host, sni)
@@ -200,7 +221,8 @@ class TlsLaunch:
 
     def close(self) -> None:
         try:
-            self.stop()
+            r = self.stop()
+            assert r.glue_exit == 0 and r.decider_clean and r.socks_clean and not r.failures, r
         finally:
             self.origin.close()
 
@@ -208,8 +230,8 @@ class TlsLaunch:
 class _BioSocket:
     """Just enough socket for `read_response` / `sendall` / `close` over a hand-driven SSLObject."""
 
-    def __init__(self, obj, inc, out, s) -> None:
-        self.obj, self.inc, self.out, self.s = obj, inc, out, s
+    def __init__(self, obj, inc, out, s, deadline: float) -> None:
+        self.obj, self.inc, self.out, self.s, self.deadline = obj, inc, out, s, deadline
 
     def sendall(self, data: bytes) -> None:
         self.obj.write(data)
@@ -217,6 +239,8 @@ class _BioSocket:
 
     def recv(self, n: int) -> bytes:
         while True:
+            if time.monotonic() > self.deadline:
+                raise TimeoutError("read past the test's deadline")
             try:
                 return self.obj.read(n)
             except ssl.SSLWantReadError:
@@ -225,8 +249,36 @@ class _BioSocket:
                 if not d:
                     return b""
                 self.inc.write(d)
-            except ssl.SSLZeroReturnError:
+            except ssl.SSLError:                         # a close_notify (ZeroReturn) or a truncated stream (EOF)
                 return b""
 
     def close(self) -> None:
         self.s.close()
+
+
+class LeakyTls(TlsLaunch):
+    """TEST-ONLY negative control: a `TlsLaunch` look-alike whose "proxy" is an open relay (`rig.LeakyRelay`) straight to
+    the TLS origin, so a probe's "reaches nothing" assertion can be shown RED. The client trusts the origin's own CA, so
+    the TLS the probe opens completes against the origin."""
+
+    def __init__(self, tmp: Path) -> None:
+        self.dir = tmp
+        self.secret = None
+        self.desk = Desk()
+        self.stopped = None
+        ca, leaf, key = make_pki(tmp / "pki", [KEYED, UNKEYED])
+        self.ca_pem = ca.read_bytes()
+        self.origin = RecordingOrigin(tls=(str(leaf), str(key)))
+        self.origin_port = self.origin.port
+        self.store = HeldStore({})
+        self._relays = [LeakyRelay(self.origin.port, "connect"), LeakyRelay(self.origin.port, "socks")]
+        self.http_port, self.socks_port = self._relays[0].port, self._relays[1].port
+        self.e = None
+
+    def stop(self) -> lm.StopResult:
+        return lm.StopResult(glue_exit=0, decider_clean=True, socks_clean=True, final_flush=None, order=())
+
+    def close(self) -> None:
+        for r in self._relays:
+            r.close()
+        self.origin.close()
