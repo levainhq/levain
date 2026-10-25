@@ -31,8 +31,9 @@ A transition commits only when every one of its effects succeeded (L3 r1 F1). If
 to FAILED instead of the successor: a terminal state that absorbs every later event with no effect, so no row is
 ever asked for on top of a failed one (no ended or outcome row without its attempt, no outcome lost behind a state
 that already reads OUTCOME). The exception still propagates. Unless `failure.done` holds a verdict frame or the
-RELEASE, the caller then owes srt an answer itself. The rows read FAILED through `settle(..., failed=True)`, never
-AMBIGUOUS and never a clean outcome. A RELEASE in a failed step is still performed (F2).
+RELEASE, the caller then owes srt an answer itself. `settle(..., failed_effect=)` reads the rows with the effect
+that failed: an end row that landed still reads as itself, an allow whose frame may or may not have left reads
+AMBIGUOUS, and anything else reads FAILED. A RELEASE in a failed step is still performed (F2).
 """
 
 from __future__ import annotations
@@ -98,6 +99,9 @@ class Settled(StrEnum):
     FAILED = "failed"            # an effect failed: the rows are a prefix of what C0 asked for (maybe no attempt)
     INCONSISTENT = "inconsistent"  # a combination C0 never asks for (a bug or a tampered store)
 
+
+#: what an attempt with no end row and no failure reads as
+_CLEAN = {Verdict.ALLOW: Settled.AMBIGUOUS, Verdict.DENY: Settled.DENIED, Verdict.UNDECIDED: Settled.UNDECIDED}
 
 PENDING = frozenset({State.DECIDING, State.AWAITING_BODY, State.CARD_HELD})
 TERMINAL = frozenset({State.DENIED, State.OUTCOME, State.ENDED, State.CLOSED, State.FAILED})
@@ -173,29 +177,39 @@ def step(state: State, event: Event) -> Step:
     return got if got is not None else Step(state, stray=True)
 
 
-def settle(verdict: Verdict | None, has_outcome: bool, has_ended: bool, *, failed: bool = False) -> Settled:
+def settle(verdict: Verdict | None, has_outcome: bool, has_ended: bool, *,
+           failed_effect: Effect | None = None) -> Settled:
     """What a request's rows read as. Read side: records and the card call this on stored rows, never on the
-    machine. `verdict` is the attempt row's, or None when there is no attempt row. `failed` says the request reached
-    FAILED (an effect raised); it reads FAILED unless the rows are a combination no failure can leave, which stays
-    INCONSISTENT. A request with no attempt row reads FAILED only when it failed and has no other row."""
+    machine. `verdict` is the attempt row's, or None when there is no attempt row. `failed_effect` is the effect whose
+    raise moved the request to FAILED (the records' FAILED mark), or None.
+
+    Precedence (the head's S5a-2 L2-7 ruling): a combination C0 never asks for is INCONSISTENT first. Then a stored
+    END row beats the mark, because the rows prove what was sent: ALLOW + outcome is COMPLETED, ALLOW or UNDECIDED +
+    ended is ENDED. An ALLOW with no end row whose failed effect is SEND_ALLOW is AMBIGUOUS: it is unknown whether the
+    allow frame left. Any other failed effect with no end row is FAILED. Without a failed effect the rows read as
+    they are; a request with no attempt row and no failure is INCONSISTENT (C0 never asks for it)."""
     if verdict is not None and type(verdict) is not Verdict:
         raise ValueError(f"not a lifecycle verdict: {verdict!r}")
+    if failed_effect is not None and type(failed_effect) is not Effect:
+        raise ValueError(f"not a lifecycle effect: {failed_effect!r}")
     if has_outcome and has_ended:
         return Settled.INCONSISTENT
     if verdict is None:
         # the attempt write itself failed (FAILED absorbs everything after it), or rows without their attempt
-        return Settled.FAILED if failed and not (has_outcome or has_ended) else Settled.INCONSISTENT
-    if verdict is Verdict.DENY:
-        if has_outcome or has_ended:
-            return Settled.INCONSISTENT
-        return Settled.FAILED if failed else Settled.DENIED
+        return Settled.FAILED if failed_effect is not None and not (has_outcome or has_ended) else Settled.INCONSISTENT
+    if verdict is Verdict.DENY and (has_outcome or has_ended):
+        return Settled.INCONSISTENT
     if verdict is Verdict.UNDECIDED and has_outcome:
         return Settled.INCONSISTENT          # nothing was forwarded, so there can be no outcome
-    if failed:
+    if has_outcome:
+        return Settled.COMPLETED             # ALLOW: the only verdict left that can hold an outcome
+    if has_ended:
+        return Settled.ENDED                 # ALLOW or UNDECIDED
+    if failed_effect is not None:
+        if verdict is Verdict.ALLOW and failed_effect is Effect.SEND_ALLOW:
+            return Settled.AMBIGUOUS
         return Settled.FAILED
-    if verdict is Verdict.ALLOW:
-        return Settled.COMPLETED if has_outcome else Settled.ENDED if has_ended else Settled.AMBIGUOUS
-    return Settled.ENDED if has_ended else Settled.UNDECIDED
+    return _CLEAN[verdict]
 
 
 class RequestLifecycle:

@@ -6,15 +6,20 @@ R15-28-5, R15-29-1, R15-29-3, R15-10-A8). Row classification: `project_memory/10
 Every request the DECIDER is asked about has its `egress_attempt` row (a glue wall never reaches the decider and has
 none) plus at most one END row: `egress_outcome` (`onResponse` fired) or `egress_ended_before_outcome` (the abort
 report came first; it names no cause). `lifecycle` decides which, in one transition; this module writes what it asks
-for and the table refuses every other shape, whoever writes:
+for, and the table refuses every other shape written through this module or by any writer with foreign keys on
+(`gseq` provenance, from the store's one sequence, is this module's; no trigger checks it):
   * UNIQUE (launch_id, request_id, kind). `request_id` is nullable: the `audit-missing` deny has no id, and SQLite
     treats NULLs as distinct, so two of those are both stored.
   * a second row of a kind for one request, or a second END row of either kind, is REFUSED: never stored, counted in
     the launch's `duplicate_rows` (K1 reads it, R15-29-3) and logged once per launch, at its first occurrence
-    (R15-28-5). The outcome-vs-abort race never gets here: C0 absorbs the loser.
+    (R15-28-5). The outcome-vs-abort race never gets here: C0 absorbs the loser. A second ATTEMPT whose decision
+    differs from the stored one is not a duplicate: it raises (the act would disagree with the record). A second
+    FAILED mark naming the same effect is a replay: False, not counted, not logged.
   * an outcome joins an ALLOW attempt; an ended row joins an ALLOW or UNDECIDED one (never a deny); `ended` is
-    `unknown`, always, in 1.0 (R15-17-9); the row has no transferred-byte field and no response-header value
-    (R15-12-B5, R15-21-3): `write_outcome` takes the observation and stores only its status and `declared_length`.
+    `unknown`, always, in 1.0 (R15-17-9); the row has no transferred-byte field and no raw response-header value
+    (R15-12-B5, R15-21-3): `write_outcome` stores the observation's status, its `declared_length` and the decider's
+    `content_type_class` enum (one of "git-upload-pack-advertisement", "other", "absent"), never the raw
+    Content-Type or Content-Length.
   * append-only, with the repo's `_frozen` / `_kept` / `_no_replace` triggers, and `gseq` from the dispatch store's one
     sequence.
   * the attempt row is committed (`BEGIN IMMEDIATE`, `synchronous = FULL`) before `write_attempt` returns, and the
@@ -27,11 +32,19 @@ at most one per request and beside whatever rows landed. `record_failure` writes
 a NON-database effect (the card's end, a verdict send, the release) and the store is still writable. When the effect
 that raised is one of this module's own row writes, NOTHING more is written: after a restart the rows that landed
 read as they are (an ALLOW attempt alone reads AMBIGUOUS; no attempt reads as no row), the honest reading when the
-store itself failed. `settled` hands the mark to `lifecycle.settle(..., failed=)`; this module keeps no reading set.
+store itself failed. `settled` hands the mark's effect to `lifecycle.settle(..., failed_effect=)`, where a stored end
+row beats the mark; the mark stays on its row for the card. This module keeps no reading set.
 
-ERRORS: a refused duplicate RETURNS False (it is counted, it is not an effect failure). Input C0 never produces (a
-bad verdict or enum, a raw query in the path, an end row with no attempt to join) raises `EgressRecordError`. A
-store failure (disk, lock timeout) raises sqlite3's own error. Either raise is an effect failure for lifecycle.
+ERRORS: a refused duplicate RETURNS False (it is counted, except the same FAILED mark again; it is not an effect
+failure). Input C0 never produces (a
+bad verdict or enum, a raw query in the path, an end row with no attempt to join, a second attempt with a different
+decision) raises `EgressRecordError`. A store failure (disk, lock timeout) raises sqlite3's own error. Either raise
+is an effect failure for lifecycle.
+
+SCHEMA CHECK: `CREATE ... IF NOT EXISTS` keeps whatever table or trigger body a file already holds. So the first
+open compares every `chat_egress_events` object in `sqlite_master` (table, triggers, indexes) with the ones
+`EGRESS_SCHEMA` makes, and refuses the store with `EgressRecordError` on any difference: a store made by another
+revision is refused at open, never half-enforced.
 
 The schema lives here, not in `CHAT_SCHEMA` (plan ruling P-7): `CHAT_SCHEMA` (`levain/coordinator/chat.py`) is on the
 unmerged CH-D1a branch, not on this base. `EGRESS_SCHEMA` is one tuple so it folds into it whole.
@@ -40,6 +53,7 @@ unmerged CH-D1a branch, not on this base. `EGRESS_SCHEMA` is one tuple so it fol
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -52,8 +66,8 @@ from levain.chat_egress.lifecycle import Effect, Failure, Settled, Verdict, sett
 from levain.contracts.canon import canonical
 from levain.coordinator.store import _append_only, _in, next_gseq
 
-__all__ = ["ATTEMPT", "Attach", "Attempt", "EGRESS_SCHEMA", "ENDED", "EgressRecordError", "EgressRecords",
-           "EgressRow", "FAILED", "KINDS", "OUTCOME"]
+__all__ = ["ATTEMPT", "Attach", "Attempt", "CONTENT_TYPE_CLASSES", "CT_ABSENT", "CT_ADVERTISEMENT", "CT_OTHER",
+           "EGRESS_SCHEMA", "ENDED", "EgressRecordError", "EgressRecords", "EgressRow", "FAILED", "KINDS", "OUTCOME"]
 
 log = logging.getLogger(__name__)
 
@@ -65,10 +79,18 @@ KINDS = (ATTEMPT, OUTCOME, ENDED, FAILED)
 _ENDS = (OUTCOME, ENDED)
 #: this module's own effects: a failure of one of them writes nothing more
 _WRITE_EFFECTS = frozenset({Effect.WRITE_ATTEMPT, Effect.WRITE_OUTCOME, Effect.WRITE_ENDED})
-#: the effects whose failure the FAILED mark records (derived, so a new lifecycle effect is markable by default)
+#: the effects whose failure the FAILED mark records. Derived, so a new lifecycle effect is markable in a fresh store.
+#: A store created before it holds the old CHECK; the schema check refuses that store at open, so the stale CHECK is
+#: never met as an IntegrityError inside the failure handler.
 _MARKED_EFFECTS = tuple(e for e in Effect if e not in _WRITE_EFFECTS)
 #: the one value `ended` takes in 1.0 (R15-17-9): the adopted surface has no body-end signal
 ENDED_UNKNOWN = "unknown"
+#: R15-21-3: the only thing stored about a response's Content-Type, as the decider classifies it (S3b's
+#: "content_type_class"). The raw value never reaches this module's rows.
+CT_ADVERTISEMENT = "git-upload-pack-advertisement"
+CT_OTHER = "other"
+CT_ABSENT = "absent"
+CONTENT_TYPE_CLASSES = (CT_ADVERTISEMENT, CT_OTHER, CT_ABSENT)
 
 
 class EgressRecordError(ValueError):
@@ -117,6 +139,7 @@ class EgressRow:
     status: int | None
     declared_length: int | None
     ended: str | None
+    content_type_class: str | None
     failed_effect: str | None
     at: str
 
@@ -139,6 +162,7 @@ EGRESS_SCHEMA: tuple[str, ...] = (
     # egress_outcome: what onResponse gives (status, the parsed Content-Length), never a byte count
     "status INTEGER CHECK (status BETWEEN 100 AND 599), declared_length INTEGER CHECK (declared_length >= 0), "
     f"ended TEXT CHECK (ended = '{ENDED_UNKNOWN}'), "
+    f"content_type_class TEXT CHECK ({_in('content_type_class', CONTENT_TYPE_CLASSES)}), "
     # egress_failed: which non-database effect raised (S5a-1 L3 F1); never a row write's own failure
     f"failed_effect TEXT CHECK ({_in('failed_effect', [e.value for e in _MARKED_EFFECTS])}), "
     "at TEXT NOT NULL, "
@@ -146,8 +170,9 @@ EGRESS_SCHEMA: tuple[str, ...] = (
     f"CHECK ((kind = '{ATTEMPT}') = ({_ALL_ATTEMPT})), "
     f"CHECK (kind = '{ATTEMPT}' OR ({_NO_ATTEMPT})), "
     "CHECK ((setup_record_id IS NOT NULL) = (attach = 'attached')), "
-    f"CHECK ((kind = '{OUTCOME}') = (status IS NOT NULL AND ended IS NOT NULL)), "
-    f"CHECK (kind = '{OUTCOME}' OR (status IS NULL AND declared_length IS NULL AND ended IS NULL)), "
+    f"CHECK ((kind = '{OUTCOME}') = (status IS NOT NULL AND ended IS NOT NULL AND content_type_class IS NOT NULL)), "
+    f"CHECK (kind = '{OUTCOME}' OR (status IS NULL AND declared_length IS NULL AND ended IS NULL "
+    "AND content_type_class IS NULL)), "
     f"CHECK ((kind = '{FAILED}') = (failed_effect IS NOT NULL)), "
     # a null id is the decider's audit-missing deny, and nothing else (R15-25-1)
     f"CHECK (request_id IS NOT NULL OR (kind = '{ATTEMPT}' AND verdict = 'deny' AND attach = 'not-evaluated' "
@@ -171,17 +196,17 @@ EGRESS_SCHEMA: tuple[str, ...] = (
 )
 
 _COLUMNS = ("gseq", "launch_id", "request_id", "kind", *_ATTEMPT_COLS[:6], "setup_record_id", "attach",
-            "open_network", "status", "declared_length", "ended", "failed_effect", "at")
+            "open_network", "status", "declared_length", "ended", "content_type_class", "failed_effect", "at")
 
 
 def _row(values: tuple[Any, ...]) -> EgressRow:
     # positional, in _COLUMNS order (a stored row, never a frame: test_one_parse's detector reads `["path"]` as one)
     (gseq, launch_id, request_id, kind, verdict, deciding_step, host, method, path, names, setup_record_id, attach,
-     open_network, status, declared_length, ended, failed_effect, at) = values
+     open_network, status, declared_length, ended, content_type_class, failed_effect, at) = values
     return EgressRow(gseq, launch_id, request_id, kind, None if verdict is None else Verdict(verdict), deciding_step,
                      host, method, path, names, setup_record_id, None if attach is None else Attach(attach),
                      None if open_network is None else bool(open_network), status, declared_length, ended,
-                     failed_effect, at)
+                     content_type_class, failed_effect, at)
 
 
 def _check_request_id(request_id: object) -> str:
@@ -202,6 +227,8 @@ def _check_attempt(request_id: str | None, verdict: Verdict, a: Attempt) -> tupl
         raise EgressRecordError("an attempt row's path never carries a query (R15-17-8)")
     if isinstance(a.names, str) or not all(isinstance(n, str) for n in a.names):
         raise EgressRecordError("an attempt row's names are a sequence of strings")
+    if type(a.open_network) is not bool:
+        raise EgressRecordError("an attempt row's open_network is a bool")
     if (a.setup_record_id is not None) != (a.attach is Attach.ATTACHED):
         raise EgressRecordError("an attempt names a setup record exactly when a key was attached")
     if request_id is None:
@@ -210,7 +237,34 @@ def _check_attempt(request_id: str | None, verdict: Verdict, a: Attempt) -> tupl
     else:
         _check_request_id(request_id)
     return (verdict.value, a.deciding_step, a.host, a.method, a.path, canonical(list(a.names)), a.setup_record_id,
-            a.attach.value, int(bool(a.open_network)))
+            a.attach.value, int(a.open_network))
+
+
+_OBJECTS_SQL = ("SELECT type, name, sql FROM sqlite_master WHERE tbl_name = 'chat_egress_events' "
+                "ORDER BY type, name")
+
+
+def _schema_objects(conn: sqlite3.Connection) -> list[tuple[str, str, str | None]]:
+    """Every `sqlite_master` object of the table (the table, its triggers, its indexes, autoindexes included)."""
+    return [tuple(r) for r in conn.execute(_OBJECTS_SQL)]  # type: ignore[misc]
+
+
+_EXPECTED: list[tuple[str, str, str | None]] | None = None
+
+
+def _expected_objects() -> list[tuple[str, str, str | None]]:
+    """The objects `EGRESS_SCHEMA` makes, read back from a scratch in-memory database built by this same SQLite, so
+    the comparison is of SQLite's own stored text, never a hand normalisation of it."""
+    global _EXPECTED
+    if _EXPECTED is None:
+        scratch = sqlite3.connect(":memory:")
+        try:
+            for stmt in EGRESS_SCHEMA:
+                scratch.execute(stmt)
+            _EXPECTED = _schema_objects(scratch)
+        finally:
+            scratch.close()
+    return _EXPECTED
 
 
 class EgressRecords:
@@ -236,6 +290,9 @@ class EgressRecords:
                 try:
                     for stmt in EGRESS_SCHEMA:
                         conn.execute(stmt)
+                    if _schema_objects(conn) != _expected_objects():
+                        raise EgressRecordError("this store's chat_egress_events table or triggers differ from this "
+                                                "module's schema (another revision made them); refusing the store")
                     conn.execute("COMMIT")
                 except BaseException:
                     conn.execute("ROLLBACK")
@@ -252,8 +309,17 @@ class EgressRecords:
         with write_transaction(self._connect) as conn:
             if request_id is not None:
                 taken = (_ENDS if kind in _ENDS else (kind,))
-                if conn.execute(f"SELECT 1 FROM chat_egress_events WHERE launch_id = ? AND request_id = ? AND kind "
-                                f"IN ({', '.join('?' * len(taken))})", (launch_id, request_id, *taken)).fetchone():
+                stored = conn.execute(f"SELECT {', '.join(('kind', *cols))} FROM chat_egress_events WHERE "
+                                      f"launch_id = ? AND request_id = ? AND kind IN ({', '.join('?' * len(taken))})",
+                                      (launch_id, request_id, *taken)).fetchone()
+                if stored is not None:
+                    same = stored[0] == kind and tuple(stored[1:]) == tuple(cols.values())
+                    if kind == ATTEMPT and not same:
+                        # L1-1: a reused request id with another decision; a False here would let the act diverge
+                        raise EgressRecordError("a second attempt row for one request with a different decision: "
+                                                "the stored decision would disagree with the act")
+                    if kind == FAILED and same:
+                        return False        # L1-5: the same mark again is a replay, not a glue bug
                     self._count_duplicate(launch_id, kind)
                     return False
                 if kind in (OUTCOME, ENDED):
@@ -280,23 +346,33 @@ class EgressRecords:
 
     # --- writes (the composer runs them for lifecycle's WRITE_* effects, in order) -----------------------------
     def write_attempt(self, launch_id: str, request_id: str | None, verdict: Verdict, attempt: Attempt) -> bool:
-        """The `egress_attempt` row (WRITE_ATTEMPT, `Step.verdict`). Committed when this returns True; False: a
-        refused duplicate (counted)."""
+        """The `egress_attempt` row (WRITE_ATTEMPT, `Step.verdict`). Committed when this returns True; False: an
+        identical replay of the stored attempt, refused and counted. An attempt for the same request with any
+        decision field different raises `EgressRecordError`, so the effect fails and the act cannot diverge from the
+        record."""
         values = _check_attempt(request_id, verdict, attempt)
         return self._insert(launch_id, request_id, ATTEMPT, **dict(zip(
             ("verdict", "deciding_step", "host", "method", "path", "names", "setup_record_id", "attach",
              "open_network"), values)))
 
-    def write_outcome(self, launch_id: str, obs: wire.ObsResponse) -> bool:
-        """The `egress_outcome` row (WRITE_OUTCOME) from the glue's `resp` line: its status and `declared_length`,
-        `ended = unknown`. The raw `content_type` and `content_length` are not stored (R15-21-3)."""
+    def write_outcome(self, launch_id: str, obs: wire.ObsResponse, content_type_class: str) -> bool:
+        """The `egress_outcome` row (WRITE_OUTCOME) from the glue's `resp` line: its status, `declared_length`,
+        `ended = unknown`, and `content_type_class`, R15-21-3's enum as the decider classified the response (S3b's
+        "content_type_class" / "AdvertisementSet.observe" give it). The raw `content_type` and `content_length` are
+        not stored. The enum must agree with the observation on presence: "absent" exactly when it has no
+        Content-Type."""
         if type(obs) is not wire.ObsResponse:
             raise EgressRecordError("an outcome row is written from a wire.ObsResponse")
         rid = _check_request_id(obs.request_id)
         if type(obs.status) is not int or not 100 <= obs.status <= 599:
             raise EgressRecordError("an outcome's status is 100..599")
+        if type(content_type_class) is not str or content_type_class not in CONTENT_TYPE_CLASSES:
+            raise EgressRecordError(f"an outcome's content_type_class is one of {CONTENT_TYPE_CLASSES} (R15-21-3)")
+        if (content_type_class == CT_ABSENT) != (obs.content_type is None):
+            raise EgressRecordError("content_type_class is 'absent' exactly when the response has no Content-Type")
         return self._insert(launch_id, rid, OUTCOME, status=obs.status,
-                            declared_length=wire.declared_length(obs.content_length), ended=ENDED_UNKNOWN)
+                            declared_length=wire.declared_length(obs.content_length), ended=ENDED_UNKNOWN,
+                            content_type_class=content_type_class)
 
     def write_ended(self, launch_id: str, request_id: str) -> bool:
         """The `egress_ended_before_outcome` row (WRITE_ENDED): no cause, no other field (R15-29-1)."""
@@ -304,7 +380,8 @@ class EgressRecords:
 
     def write_failed(self, launch_id: str, request_id: str, effect: Effect) -> bool:
         """The `egress_failed` row: the durable FAILED mark for a request whose NON-database `effect` raised. It
-        needs no attempt row (a card's end runs before the attempt write). False: a second mark (counted)."""
+        needs no attempt row (a card's end runs before the attempt write). False: a second mark, counted when it
+        names a different effect, a silent replay when it names the same one."""
         if type(effect) is not Effect or effect in _WRITE_EFFECTS:
             raise EgressRecordError("the FAILED mark names a non-database effect; a failed row write writes nothing "
                                     "more")
@@ -332,13 +409,19 @@ class EgressRecords:
 
     def settled(self, launch_id: str, request_id: str) -> Settled | None:
         """What one request's stored rows read as, through `lifecycle.settle` (None: the request has no row). The
-        FAILED mark is passed as `failed=`; this module keeps no reading set of its own."""
+        FAILED mark's effect is passed as `failed_effect=`, and a stored end row beats it; the mark stays on its row
+        (`rows`) for the card. This module keeps no reading set of its own.
+
+        It reads one request by its id, so it never sees the `audit-missing` deny, whose `request_id` is NULL: that
+        row is visible only through `rows(launch_id)`."""
         got = self.rows(launch_id, request_id)
         if not got:
             return None
         attempt = next((r for r in got if r.kind == ATTEMPT), None)
+        mark = next((r for r in got if r.kind == FAILED), None)
         return settle(None if attempt is None else attempt.verdict, any(r.kind == OUTCOME for r in got),
-                      any(r.kind == ENDED for r in got), failed=any(r.kind == FAILED for r in got))
+                      any(r.kind == ENDED for r in got),
+                      failed_effect=None if mark is None or mark.failed_effect is None else Effect(mark.failed_effect))
 
     def duplicate_rows(self, launch_id: str) -> int:
         """R15-28-5: the refused duplicate rows of `launch_id` this object counted (K1 surfaces it, R15-29-3)."""

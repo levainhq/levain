@@ -31,7 +31,7 @@ def main() -> None:
                 sys.stdout.write(f"ALLOW-SENT {request_id}\n" if request_id == cut else "")
                 sys.stdout.flush()
             elif eff is Effect.WRITE_OUTCOME:
-                records.write_outcome(launch_id, obs)
+                records.write_outcome(launch_id, obs, rec.CT_ABSENT)   # its resp line carries no Content-Type
         return perform
 
     first = RequestLifecycle()

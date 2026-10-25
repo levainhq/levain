@@ -303,9 +303,11 @@ def test_r15_26_3_the_second_report_is_absorbed_not_stray(first):
 
 
 class _SeamLock:
-    """The transition-lock seam (L3 r1 F3): it wraps the machine's real lock and says, per thread, when that thread
-    has reached the acquire. A thread that signalled and has not finished is blocked IN the acquire, because the real
-    lock is held by the first transition until the test lets it go. No sleep decides anything."""
+    """The transition-lock seam (L3 r1 F3; S5a-1 L3 r2 F3): it wraps the machine's real lock and says, per thread,
+    when that thread found the lock CONTENDED. "reached" is set only after a non-blocking acquire failed, so a thread
+    that signalled is about to block in the acquire on a lock another transition holds; a thread that got the lock
+    at once never signals. With the lock removed (nothing contended), no thread signals and the race tests fail.
+    No sleep decides anything."""
 
     def __init__(self, real):
         self.real = real
@@ -315,8 +317,9 @@ class _SeamLock:
         return self.reached.setdefault(name, threading.Event())
 
     def __enter__(self):
-        self.reached_by(threading.current_thread().name).set()
-        self.real.acquire()
+        if not self.real.acquire(blocking=False):
+            self.reached_by(threading.current_thread().name).set()
+            self.real.acquire()
         return self
 
     def __exit__(self, *exc):
@@ -442,7 +445,8 @@ _EFFECT_POSITIONS = [
 def test_f1_a_raise_at_each_effect_position_fails_the_request(st, ev, i):
     """F1 / F5: the effect at position `i` raises. The exception propagates, the effects after it are skipped (F2: a
     RELEASE still runs), the request is FAILED rather than the successor, every later event is absorbed with no
-    effect, and the rows that exist read FAILED."""
+    effect, and the rows that exist, read with the failed effect, follow the L2-7 precedence: an end row that landed
+    reads as itself, an allow whose frame raised reads AMBIGUOUS, anything else FAILED."""
     m, pre = _run(_PATHS[st])
     want = lc.step(st, ev)
     bad = want.effects[i]
@@ -460,7 +464,10 @@ def test_f1_a_raise_at_each_effect_position_fails_the_request(st, ev, i):
     assert m.failure == Failure(want, bad, done)
     rows = _all_effects(pre) + list(done)
     verdict = next((s.verdict for s in pre if s.verdict), None) or (want.verdict if F.WRITE_ATTEMPT in done else None)
-    assert lc.settle(verdict, F.WRITE_OUTCOME in rows, F.WRITE_ENDED in rows, failed=True) is Settled.FAILED
+    outcome, ended = F.WRITE_OUTCOME in rows, F.WRITE_ENDED in rows
+    reads = (Settled.COMPLETED if outcome else Settled.ENDED if ended
+             else Settled.AMBIGUOUS if verdict is V.ALLOW and bad is F.SEND_ALLOW else Settled.FAILED)
+    assert lc.settle(verdict, outcome, ended, failed_effect=bad) is reads
 
 
 def test_f1_the_reviewers_two_cases():
@@ -473,7 +480,7 @@ def test_f1_the_reviewers_two_cases():
     m.fire(E.ENDED, perform=q)
     m.fire(E.RESPONSE, perform=q)
     assert q.ran == [] and m.state is S.FAILED
-    assert lc.settle(None, False, False, failed=True) is Settled.FAILED
+    assert lc.settle(None, False, False, failed_effect=F.WRITE_ATTEMPT) is Settled.FAILED
 
     m = lc.RequestLifecycle()
     m.fire(E.ALLOW, perform=_Perform())
@@ -482,7 +489,7 @@ def test_f1_the_reviewers_two_cases():
     q = _Perform()
     m.fire(E.ENDED, perform=q)
     assert q.ran == [] and m.state is S.FAILED
-    assert lc.settle(V.ALLOW, False, False, failed=True) is Settled.FAILED
+    assert lc.settle(V.ALLOW, False, False, failed_effect=F.WRITE_OUTCOME) is Settled.FAILED
     assert lc.settle(V.ALLOW, False, False) is Settled.AMBIGUOUS     # what it read before F1 (no failed mark)
 
 
@@ -564,28 +571,50 @@ def test_settle_refuses_a_non_member_verdict():
         lc.settle("allow", False, False)            # type: ignore[arg-type]
 
 
+# settle(verdict, outcome, ended, failed_effect=) -> what the rows read as (the head's S5a-2 L2-7 ruling): the
+# INCONSISTENT checks first, then a stored end row beats the mark, then SEND_ALLOW on an allow is AMBIGUOUS, then
+# any other failed effect is FAILED.
 SETTLE_FAILED = {
-    (None, False, False): Settled.FAILED,        # the attempt write itself failed
-    (None, True, False): Settled.INCONSISTENT,   # rows without their attempt: no failure leaves them
-    (None, False, True): Settled.INCONSISTENT,
-    (V.DENY, False, False): Settled.FAILED,      # the deny frame failed after its attempt row
-    (V.DENY, False, True): Settled.INCONSISTENT,
-    (V.ALLOW, False, False): Settled.FAILED,     # never AMBIGUOUS
-    (V.ALLOW, True, False): Settled.FAILED,      # never a clean outcome
-    (V.ALLOW, False, True): Settled.FAILED,
-    (V.ALLOW, True, True): Settled.INCONSISTENT,
-    (V.UNDECIDED, False, False): Settled.FAILED,
-    (V.UNDECIDED, False, True): Settled.FAILED,
-    (V.UNDECIDED, True, False): Settled.INCONSISTENT,
+    (None, False, False, F.CARD_ENDED): Settled.FAILED,           # the card's end raised before any row
+    (None, False, False, F.WRITE_ATTEMPT): Settled.FAILED,        # the attempt write itself failed
+    (None, True, False, F.SEND_ALLOW): Settled.INCONSISTENT,      # rows without their attempt: no failure leaves them
+    (None, False, True, F.RELEASE): Settled.INCONSISTENT,
+    (V.DENY, False, False, F.SEND_DENY): Settled.FAILED,          # the deny frame failed after its attempt row
+    (V.DENY, False, True, F.SEND_DENY): Settled.INCONSISTENT,
+    (V.ALLOW, True, False, F.SEND_ALLOW): Settled.COMPLETED,      # the outcome proves the frame left
+    (V.ALLOW, True, False, F.RELEASE): Settled.COMPLETED,
+    (V.ALLOW, False, True, F.SEND_ALLOW): Settled.ENDED,          # the ended row proves the request reached srt
+    (V.ALLOW, False, True, F.RELEASE): Settled.ENDED,
+    (V.ALLOW, False, False, F.SEND_ALLOW): Settled.AMBIGUOUS,     # unknown whether the frame left
+    (V.ALLOW, False, False, F.WRITE_OUTCOME): Settled.FAILED,     # any other failed effect, no end row
+    (V.ALLOW, False, False, F.CARD_ENDED): Settled.FAILED,
+    (V.ALLOW, True, True, F.SEND_ALLOW): Settled.INCONSISTENT,
+    (V.UNDECIDED, False, False, F.CARD_ENDED): Settled.FAILED,
+    (V.UNDECIDED, False, False, F.RELEASE): Settled.FAILED,
+    (V.UNDECIDED, False, True, F.RELEASE): Settled.ENDED,         # the release raised after attempt + ended landed
+    (V.UNDECIDED, False, True, F.CARD_ENDED): Settled.ENDED,
+    (V.UNDECIDED, True, False, F.RELEASE): Settled.INCONSISTENT,
 }
 
 
-def test_settle_reads_failed():
-    for key, want in SETTLE_FAILED.items():
-        assert lc.settle(*key, failed=True) is want, key
-    for key, want in SETTLE.items():                 # failed=False is the table above, unchanged
-        assert lc.settle(*key, failed=False) is want, key
+@pytest.mark.parametrize("key", list(SETTLE_FAILED), ids=lambda k: f"{k[0]}-o{int(k[1])}-e{int(k[2])}-{k[3]}")
+def test_settle_with_a_failed_effect(key):
+    *rows, effect = key
+    assert lc.settle(*rows, failed_effect=effect) is SETTLE_FAILED[key]
+
+
+def test_settle_without_a_failed_effect_is_the_clean_table():
+    for key, want in SETTLE.items():                 # failed_effect=None is the table above, unchanged
+        assert lc.settle(*key, failed_effect=None) is want, key
     assert lc.settle(None, False, False) is Settled.INCONSISTENT   # no attempt row and no failure: never written
+
+
+def test_settle_refuses_a_failed_effect_that_is_not_an_effect():
+    for bad in (True, "send-allow", 1):
+        with pytest.raises(ValueError):
+            lc.settle(V.ALLOW, False, False, failed_effect=bad)   # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        lc.settle(V.ALLOW, False, False, failed=True)            # type: ignore[call-arg]  # the old keyword is gone
 
 
 def test_every_machine_end_settles_consistently():
