@@ -734,7 +734,8 @@ class Broker:
         if qdir is None:
             return wire.answer(rid, gate="limits-failed", reason=LIMITS_DIR_FAILED)
         verdict = consent_limits.count_call(qdir, agent, who.session, event, tool_name=tool_name,
-                                            tool_input=digest, limits=full, count_crossed=False)
+                                            tool_input=digest, limits=full, count_crossed=False,
+                                            now=self._clock().timestamp())
         if verdict.state in _GATE_OVER:
             return wire.answer(rid, gate="over-limit", kind=verdict.kind)
         if verdict.state == "fail_deny":

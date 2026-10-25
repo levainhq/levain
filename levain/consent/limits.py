@@ -118,6 +118,11 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS extensions ("
     " request_id TEXT PRIMARY KEY, agent TEXT NOT NULL, root TEXT NOT NULL, kind TEXT NOT NULL, scale INTEGER NOT NULL,"
     " at REAL NOT NULL)",
+    # the over-limit latch of a caller that counts no crossing (count_call's count_crossed=False): the first crossing of
+    # (root, kind) and the count it crossed at
+    "CREATE TABLE IF NOT EXISTS latches ("
+    " agent TEXT NOT NULL, root TEXT NOT NULL, kind TEXT NOT NULL, count REAL NOT NULL, at REAL NOT NULL,"
+    " PRIMARY KEY (agent, root, kind))",
 )
 
 
@@ -296,8 +301,12 @@ def count_call(queue_dir: Path | str, agent: str, session: str, event: Mapping[s
                limits: Mapping[str, float] | None = None, count_crossed: bool = True) -> Verdict:
     """Count one ``PreToolUse`` call of ``session`` (Claude Code's subagent key included) and say whether it may go on.
     Never raises: a failure is ``not_counting`` (proceed) or, past :data:`FAIL_DENY_AFTER`, ``fail_deny``.
-    ``count_crossed=False``: a call answered ``crossed`` is not counted (nothing written), for a caller that denies
-    it with no halt (the queue broker's GATE), so a limit the operator raises later is not found already spent."""
+    ``count_crossed=False``: a call answered ``crossed`` is not counted, for a caller that denies it with no halt (the
+    queue broker's GATE), so a limit the operator raises later is not found already spent. What it writes instead is a
+    LATCH, the first crossing's kind and count: every later call of the root, whatever it is and however long after,
+    is answered ``crossed`` at that count and counts nothing, until the limit in force no longer crosses at it (the
+    operator raised it); then the latch is dropped and the call is counted as any other. Without it a ``repeat`` would
+    free the session at the next different call and ``active_hours`` after a gap of :data:`ACTIVE_GAP`."""
     qdir = Path(queue_dir)
     root = session_root(session)
     fail = _fail_path(qdir, agent, root)
@@ -439,6 +448,11 @@ def _count(qdir: Path, agent: str, root: str, event: Mapping[str, Any], tool_nam
         if halt is not None:   # a halted root: deny, count nothing (the counts resume where they stopped on Extend)
             return Verdict("halted", kind=halt["kind"], halt=halt,
                            counts=_counts(calls, active_s, fresh, cache_read, window, win), limits=lim)
+        if not count_crossed:
+            held = _latched(conn, agent, root, lim)
+            if held is not None:
+                return Verdict("crossed", kind=held[0], count=held[1], limit=lim[held[0]],
+                               counts=_counts(calls, active_s, fresh, cache_read, window, win), limits=lim, mark=mark)
         if tid is not None and tid in recent:
             counted = False
         else:
@@ -466,8 +480,10 @@ def _count(qdir: Path, agent: str, root: str, event: Mapping[str, Any], tool_nam
             cache_read = _num0(spend.get("gone_cache_read")) + sum(_num0(s.get("cache_read")) for s in by.values())
             stored = transcript
         counts = _counts(calls, active_s, fresh, cache_read, window, win, digest if counted else None)
-        crossed = next((kind for kind in KINDS
-                        if counts[kind] > lim[kind] or (kind == "repeat" and counts[kind] >= lim[kind])), None)
+        crossed = next((kind for kind in KINDS if _over(kind, counts[kind], lim[kind])), None)
+        if crossed is not None and not count_crossed:
+            conn.execute("INSERT OR REPLACE INTO latches (agent, root, kind, count, at) VALUES (?, ?, ?, ?, ?)",
+                         (agent, root, crossed, counts[crossed], now))
         if crossed is None or count_crossed:
             conn.execute("UPDATE sessions SET calls = ?, active_s = ?, first_at = ?, last_at = ?, fresh = ?, "
                          "cache_read = ?, window = ?, recent_ids = ?, spend = ?, transcript = ? "
@@ -478,6 +494,24 @@ def _count(qdir: Path, agent: str, root: str, event: Mapping[str, Any], tool_nam
         return Verdict("crossed", kind=crossed, count=counts[crossed], limit=lim[crossed], counts=counts, limits=lim,
                        mark=mark)
     return Verdict("ok", counts=counts, limits=lim)
+
+
+def _over(kind: str, count: float, limit: float) -> bool:
+    """A count past its limit (``repeat``: at it)."""
+    return count > limit or (kind == "repeat" and count >= limit)
+
+
+def _latched(conn: sqlite3.Connection, agent: str, root: str, lim: Mapping[str, float]) -> tuple[str, float] | None:
+    """Inside the counting transaction: the root's first latch (in :data:`KINDS` order) that still crosses the limit
+    in force, as (kind, count); every latch that no longer crosses (or names no kind in force) is deleted."""
+    held = []
+    for kind, count in conn.execute("SELECT kind, count FROM latches WHERE agent = ? AND root = ?",
+                                    (agent, root)).fetchall():
+        if kind in KINDS and kind in lim and isinstance(count, (int, float)) and _over(kind, count, lim[kind]):
+            held.append((KINDS.index(kind), kind, float(count)))
+        else:
+            conn.execute("DELETE FROM latches WHERE agent = ? AND root = ? AND kind = ?", (agent, root, kind))
+    return min(held)[1:] if held else None
 
 
 def _num0(v: Any) -> int:
