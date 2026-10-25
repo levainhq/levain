@@ -90,6 +90,7 @@ __all__ = [
     "Binding",
     "binding_invocation",
     "seal_binding_id",
+    "binding_family",
     "derived_binding_id",
     "BindingStore",
     "ReplaceResult",
@@ -538,6 +539,24 @@ def seal_binding_id(
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     h = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
     return f"bind-{created_at}-{h}"
+
+
+def binding_family(binding: Binding) -> str:
+    """The family of ``binding``: ``fam-`` and the first 32 hex of a sha256 over its sealed core without its
+    posture and its creation time (DESIGN_REV2 C6: ``created_by``, trigger, goal, tightness, ``one_shot``,
+    guard), so the same grant re-ratified at another rung stays in its family. A graduation policy's
+    ``families`` list is compared with it. Honest-config only: a writer of the registry can mint any family."""
+    body: dict[str, Any] = {
+        "created_by": binding.created_by,
+        "trigger": binding.trigger.to_dict(),
+        "goal": [g.to_dict() for g in binding.goal],
+        "tightness": binding.tightness.to_dict(),
+        "one_shot": bool(binding.one_shot),
+    }
+    if binding.guard:   # omitted when empty, as the seal omits it
+        body["guard"] = [g.to_dict() for g in binding.guard]
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return "fam-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
 @dataclass(frozen=True)
