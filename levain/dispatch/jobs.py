@@ -1494,9 +1494,10 @@ class JobStore:
                                  "VALUES (?, ?, ?, ?, ?, ?)",
                                  (job.id, record.run, canonical(record.to_mapping()), adopt.artifact_digest(record),
                                   report.digest, stamp))
-                except sqlite3.IntegrityError:
+                except sqlite3.IntegrityError as exc:
                     _refuse_repeat(conn, current, run.run, run.ticket, refused, report_digest)
-                    raise
+                    # not a repeat of this run: a named refusal, never a raw sqlite3 error
+                    raise DispatchError(f"the run record was refused by the store: {str(exc)[:200]}") from None
                 failure = report.first_failure
                 if failure is not None:
                     self._apply(conn, job.id, "failed", "verifier_fail", stamp,

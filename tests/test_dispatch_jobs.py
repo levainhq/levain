@@ -1460,3 +1460,19 @@ def test_the_event_cursor_never_moves_backward_within_a_journal(store):
     store.drop_event_cursor()
     store.set_event_cursor("j-2", 1)
     assert store.event_cursor() == ("j-2", 1)
+
+
+def test_a_run_record_insert_refused_for_another_reason_is_a_dispatch_error(store, repo):
+    """RULINGS_OBS 16 (complement LOW C): an IntegrityError on the run record's insert that is not a repeat of the
+    run surfaces as a named DispatchError, never a raw sqlite3 error, and writes nothing."""
+    job, _ = at_state(store, repo, "verifying")
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        conn.execute("CREATE TRIGGER test_refuse BEFORE INSERT ON run_records BEGIN "
+                     "SELECT RAISE(ABORT, 'refused by the test'); END")
+    finally:
+        conn.close()
+    with pytest.raises(DispatchError) as exc:
+        verify(store, repo, job, 0)
+    assert not isinstance(exc.value, TransitionRefused) and "refused by the test" in str(exc.value)
+    assert store.get(job.id).state == "verifying" and store.run_records(job.id) == []
