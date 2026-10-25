@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<title>Levain · pair this device</title>
+<link rel="stylesheet" href="/dashboard.css" />
+</head>
+<body class="pair-body">
+  <main class="pair-card" aria-live="polite">
+    <div class="pair-brand"><span class="pair-dot"></span>Levain</div>
+    <h1 id="pair-title">Pairing this device</h1>
+    <p id="pair-msg">Claiming your one-time code…</p>
+    <p id="pair-next" hidden><a id="pair-home" href="/">Open the cockpit</a></p>
+  </main>
+  <!-- The claim lives in its own served file: the page's CSP is script-src 'self', no inline script. -->
+  <script src="/pair.js"></script>
+</body>
+</html>

@@ -520,6 +520,11 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/sky.js": ("sky.js", "text/javascript; charset=utf-8"),
     # The change stream's client: one fetch-read stream per page, through the page's own read transport.
     "/cockpit_stream.js": ("cockpit_stream.js", "text/javascript; charset=utf-8"),
+    # Per-device pairing's browser half (RP-4: the static-shell exception serves these token-free; the claim script is an
+    # external file for the CSP): the new device's page, its script, and the cockpit's Devices panel.
+    "/pair": ("pair.html", "text/html; charset=utf-8"),
+    "/pair.js": ("pair.js", "text/javascript; charset=utf-8"),
+    "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
 }
 
 
