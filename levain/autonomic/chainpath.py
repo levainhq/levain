@@ -2,8 +2,9 @@
 
 4a fires a length-1 grant end-to-end (``firepath.FireDispatcher``). 4b is the genuinely-new
 structure: a binding whose ``goal`` is an ordered chain of ``SubGoal``s walks its sequence with **the
-GATE TRAVELLING WITH THE CHAIN** — on-loop links fire immediately, the chain PAUSES at the first
-confirm-class link, and link N-1's output threads into link N. This module is (a) the per-link LOOP,
+GATE TRAVELLING WITH THE CHAIN** — on-loop links fire immediately (while a signed graduation policy
+covers their action: the gate's clamp, 2. below), the chain PAUSES at the first confirm-class link,
+and link N-1's output threads into link N. This module is (a) the per-link LOOP,
 (b) the per-link GOVERNANCE derivation, (c) the inter-link DATA-FLOW, and (d) the pause/resume
 PERSISTENCE. The gate (``EfferentGate``) stays a single-action engine — this orchestrates it
 link-by-link; no gate change.
@@ -25,7 +26,10 @@ The seams (committed in ``projects/vagus/slice4_scope.md`` § "4b — the chain 
   1. **Per-link risk** — the gate's ``binding_risk(binding, link_index)`` derives link i's risk from
      its SEALED tools alone (``aggregate_risk((goal[i],), manifest)``). Core-overlaid; fail-closed.
   2. **Per-link posture + the seam-#2 fail-UP (the TERMINAL-link ratified floor)** — INTERMEDIATE links
-     fire at their natural ``policy(risk_i, trust_i)`` (no floor — §A's early-links-fire); the LAST link
+     fire at their natural ``policy(risk_i, trust_i)`` (no ratified floor — §A's early-links-fire), and below
+     CONFIRM only while a live graduation policy covers the action the link runs, else at CONFIRM (the gate's
+     clamp, consulted for every link because every link's authority is the binding's: 14b DESIGN_REV3_1 D4;
+     ``tests/test_autonomic_chainpath.py`` X1); the LAST link
      carries ``ratified_posture = binding.posture`` (the sealed whole-chain rung), so the gate fires it
      at ``max(policy, binding.posture)``. Since ``binding.posture >= every per-link posture`` (the §2.3
      set-risk max — proven EXACT), the chain can never COMPLETE below the ratified rung. This HONORS a
@@ -663,7 +667,8 @@ class ChainExecutor:
         single link IS the terminal link, already floored at ``binding.posture``). On a resume
         continuation the terminal link is the last index, so the floor applies there too. INTERMEDIATE
         links carry ``ratified_posture=None`` — they run at their natural per-link posture (§A: early
-        on-loop links fire). The middle-link drift residual remains (per-link sealed postures = 4c)."""
+        on-loop links fire, each only while a graduation policy covers its action; the gate's clamp). The
+        middle-link drift residual remains (per-link sealed postures = 4c)."""
         if gate is None:
             gate = self._handle.current()   # this link's admission: one gate, read once, passed down
         base = self._request_builder(binding, ctx, i)

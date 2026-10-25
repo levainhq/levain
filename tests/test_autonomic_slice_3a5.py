@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 
 import pytest
 
+from tests.test_autonomic_binding import always_covered, reversible_floor
 from tests.test_autonomic_rawstore import dump, registry_of, write_raw
 
 from levain.autonomic import (
@@ -502,7 +503,7 @@ def test_supersede_onto_an_existing_new_id_aborts(tmp_path):
     store.add(b_active)
     before = dump(store)
     b_paused = a_binding(guard=(guard(),), posture=Posture.CONFIRM_ELEVATED)   # same id, default PAUSED
-    result = store.replace_atomic(a, b_paused)
+    result = store.replace_atomic(a, b_paused, coverage=always_covered, risk_floor_of=reversible_floor)
     assert not result and result.reason == "target_exists"
     assert dump(store) == before
     assert {x.binding_id for x in store.list_active()} == {a.binding_id, b_active.binding_id}
@@ -581,8 +582,8 @@ def test_replace_back_to_a_revoked_core_aborts_and_keeps_the_live_grant(tmp_path
     a = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
     store.add(a)
-    assert store.replace_atomic(a, b)
-    result = store.replace_atomic(b, a)
+    assert store.replace_atomic(a, b, coverage=always_covered, risk_floor_of=reversible_floor)
+    result = store.replace_atomic(b, a, coverage=always_covered, risk_floor_of=reversible_floor)
     assert not result and result.reason == "target_exists"
     assert [x.binding_id for x in store.list_active()] == [b.binding_id]
 
@@ -911,7 +912,7 @@ def test_replace_atomic_validates_the_proposal_before_any_early_return(tmp_path)
     tampered = replace(bad, posture=Posture.ON_LOOP)      # same id, different core: seal-broken
     never_stored = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM)
     with pytest.raises(ValueError, match="seal-broken"):
-        store.replace_atomic(never_stored, tampered)
+        store.replace_atomic(never_stored, tampered, coverage=always_covered, risk_floor_of=reversible_floor)
     assert not store.path.exists()
 
 
@@ -992,7 +993,7 @@ def test_replace_atomic_cannot_revive_a_malformed_revoked_target(tmp_path):
     _malformed_revoked(store, new)
     before = dump(store)
     with pytest.raises(ValueError, match="proves no identity"):   # S1h-4: the registry is corrupt
-        store.replace_atomic(old, new)
+        store.replace_atomic(old, new, coverage=always_covered, risk_floor_of=reversible_floor)
     assert dump(store) == before
     assert store.list_active() == []                              # and inert, whole
 
@@ -1012,7 +1013,7 @@ def test_a_record_that_would_not_read_back_is_never_written(tmp_path):
     new = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED,
                     graduation=bad_grad)
     with pytest.raises(ValueError, match="would not read back"):
-        store.replace_atomic(old, new)
+        store.replace_atomic(old, new, coverage=always_covered, risk_floor_of=reversible_floor)
     assert dump(store) == before
     assert [x.binding_id for x in store.list_active()] == [old.binding_id]
 

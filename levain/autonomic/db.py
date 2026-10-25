@@ -19,9 +19,21 @@ Durability: :mod:`levain.autonomic.durable_sqlite` (every commit on disk before 
 
 The store carries a format marker, read inside every transaction; a database with another marker, or
 tables and no marker, is refused rather than read or taken over, and a store that disappears under a
-running object is refused rather than silently started empty. The directory is created ``0700``; an
-existing one keeps its mode. A registry kept in the earlier JSON file format (this package's or the vagus package's) enters only
-through :meth:`levain.autonomic.binding.BindingStore.migrate_json`, a one-way import.
+running object is refused rather than silently started empty. The format is ``levain-autonomic/2``: a
+binding's effect runs below CONFIRM only under a signed graduation policy (the gate's clamp). The first open by
+this binary migrates a ``levain-autonomic/1`` store in place (:func:`migrate_to_v2`, in the opening
+``BEGIN IMMEDIATE``).
+
+**Upgrade order: stop every process of an older levain that has the store open before this binary opens it.** A
+``/1`` binary that checks the marker inside every transaction (``_check_format``, after 0.11.24) refuses the store at
+its next read or write once it is migrated. Levain 0.11.24 and earlier check it only when an object first opens the
+store, so such a process left running would keep reading and writing the ``/2`` store unclamped; no command of
+those releases opens it (nothing outside ``levain.autonomic`` builds a store object), which is why the migration
+takes no lock against them.
+
+The directory is created ``0700``; an existing one keeps its mode. A registry kept in the earlier JSON file format
+(this package's or the vagus package's) enters only through
+:meth:`levain.autonomic.binding.BindingStore.migrate_json`, a one-way import.
 
 Stdlib only.
 """
@@ -43,7 +55,7 @@ STORE_FORMAT_V1 = "levain-autonomic/1"
 # the format of a store whose bindings fire below CONFIRM only under a signed graduation policy: an older binary
 # that opens it refuses it at its own format check rather than fire below CONFIRM unclamped
 STORE_FORMAT_V2 = "levain-autonomic/2"
-STORE_FORMAT = STORE_FORMAT_V1
+STORE_FORMAT = STORE_FORMAT_V2
 DB_NAME = "autonomic.db"
 
 # The graduation audit table: one row per step the engine took under a policy's authority. An audit record: it
@@ -199,8 +211,9 @@ class AutonomicDB:
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
             if row is None:
                 conn.execute("INSERT INTO meta (key, value) VALUES ('format', ?)", (STORE_FORMAT,))
-            elif row[0] != STORE_FORMAT:
-                raise StoreFormatError(f"store format {row[0]!r} is not {STORE_FORMAT!r}")
+            # a new store gets its audit table here; a /1 store is migrated (marker and table, in this
+            # transaction); any other marker raises and the transaction rolls back, leaving the store as it was
+            migrate_to_v2(conn)
             conn.execute("COMMIT")
         except BaseException:
             _rollback(conn)

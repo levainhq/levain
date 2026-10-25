@@ -49,10 +49,15 @@ from levain.autonomic import (
     run_id_for,
 )
 from tests.autonomic_confirm_keys import confirm_signers, signed_yes
+from tests.autonomic_test_only_coverage import TestOnlyCoverage, policy
 from tests.test_autonomic_rawstore import rewrite_holds
 
-# TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal
-pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
+# TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal. They
+# test the chain's walk (pause, resume, data flow, fences, bookkeeping), so every effect a link runs is covered
+# by a graduation policy (the test-only fixture: a gate built without a coverage source covers every action
+# the manifest declares). The clamp itself is tested where a test passes its own ``coverage=``
+# (X1 below: an uncovered on-loop link of a CONFIRM chain is held).
+pytestmark = pytest.mark.usefixtures("test_only_confined_executor", "test_only_every_effect_covered")
 
 
 FIXED = _dt.datetime(2026, 6, 30, 12, 0, 0, tzinfo=_dt.timezone.utc)
@@ -136,8 +141,9 @@ def _registry(tmp_path) -> BindingStore:
     return _rig(tmp_path)[1]
 
 
-def _gate(tmp_path, *, executor=None, transport=None, auto_fire=None, manifest=None, binding_risk=None):
-    return EfferentGate(confirm_signers=confirm_signers(),
+def _gate(tmp_path, *, executor=None, transport=None, auto_fire=None, manifest=None, binding_risk=None,
+          coverage=None):
+    return EfferentGate(confirm_signers=confirm_signers(), coverage=coverage,
         manifest=manifest if manifest is not None else _RESOLVE_MANIFEST,
         store=GateReceiptStore(tmp_path / "r.jsonl"),
         executor=executor or RecordingExecutor(),
@@ -174,9 +180,9 @@ def _request_builder(binding, ctx: ChainContext, i):
 
 
 def _executor(tmp_path, *, transport=None, auto_fire=None, executor=None, binding_store=None,
-              risk_resolver=_risk_resolver, trust_resolver=_trust_resolver, manifest=None):
+              risk_resolver=_risk_resolver, trust_resolver=_trust_resolver, manifest=None, coverage=None):
     gate = _gate(tmp_path, executor=executor, transport=transport, auto_fire=auto_fire, manifest=manifest,
-                 binding_risk=risk_resolver)
+                 binding_risk=risk_resolver, coverage=coverage)
     return ChainExecutor(
         gate=gate, request_builder=_request_builder,
         trust_resolver=trust_resolver, clock=lambda: FIXED, binding_store=binding_store,
@@ -229,6 +235,43 @@ def test_chain_fires_link0_pauses_at_link1_confirm(tmp_path):
     saved = ChainState.from_dict(gate.journal.find_pending(out.pending_id)["chain"])
     assert saved.chain_id == out.chain_id and saved.paused_at_link == 1
     assert saved.completed_links()[0].downstream_id == "out::link0"
+
+
+# X1 (14b DESIGN_REV2 X1, DESIGN_REV3_1 D4): a CONFIRM chain runs its ON_LOOP link 0 before the confirmation only
+# while a signed graduation policy covers link 0's action at the manifest's risk. Both forms, each with its own
+# coverage source (the fixture's covers-everything source is not used: a source passed in wins).
+_LATER = FIXED + _dt.timedelta(days=10)
+
+
+def test_x1_an_uncovered_on_loop_link0_of_a_confirm_chain_is_held_and_nothing_runs(tmp_path):
+    ex = RecordingExecutor()
+    tr = FakeTransport()
+    chain, gate = _executor(tmp_path, transport=tr, executor=ex, coverage=TestOnlyCoverage())
+    out = _run(tmp_path, chain, _two_link_binding())
+    assert ex.calls == []                                   # link 0 did not run before a confirmation
+    assert out.paused and out.paused_at == 0
+    assert out.links[0].outcome.posture is Posture.CONFIRM and not out.links[0].outcome.fired
+    assert [p.action_name for p in tr.proposals] == ["link0"]
+
+
+def test_x1_a_covered_on_loop_link0_of_a_confirm_chain_runs_and_link1_pauses(tmp_path):
+    ex = RecordingExecutor()
+    tr = FakeTransport()
+    cover = TestOnlyCoverage([policy("gp-link0", {"link0": LOW_INTERNAL}, expires_at=_LATER)])
+    chain, gate = _executor(tmp_path, transport=tr, executor=ex, coverage=cover)
+    out = _run(tmp_path, chain, _two_link_binding())
+    assert [c[0] for c in ex.calls] == ["link0"]
+    assert out.paused and out.paused_at == 1
+    assert out.links[0].outcome.posture is Posture.ON_LOOP and out.links[0].outcome.fired
+    assert [p.action_name for p in tr.proposals] == ["link1"]
+
+
+def test_x1_a_policy_covering_link0_at_another_risk_covers_nothing(tmp_path):
+    ex = RecordingExecutor()
+    cover = TestOnlyCoverage([policy("gp-link0", {"link0": HIGH_EXTERNAL}, expires_at=_LATER)])
+    chain, _g = _executor(tmp_path, transport=FakeTransport(), executor=ex, coverage=cover)
+    out = _run(tmp_path, chain, _two_link_binding())
+    assert ex.calls == [] and out.paused and out.paused_at == 0
 
 
 def test_inter_link_data_flow_threads_forward(tmp_path):

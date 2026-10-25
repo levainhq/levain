@@ -51,8 +51,12 @@ HIGH_EXTERNAL = ActionRisk(cls=RiskClass.HIGH, reversible=False, external=True, 
 # --- test doubles -------------------------------------------------------------------
 
 
-# TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal
-pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
+# TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal. They test
+# the fire path (risk threading, the ratified floor, kills, the monitor, the dispatcher), so the action they fire,
+# ``deliver``, is declared in the gate's manifest and covered by a graduation policy (the test-only fixture covers
+# every declared action when a gate is built without a coverage source). The clamp's own cases pass their own
+# ``coverage=`` (Block 5).
+pytestmark = pytest.mark.usefixtures("test_only_confined_executor", "test_only_every_effect_covered")
 
 
 @dataclass
@@ -81,9 +85,12 @@ def _store(tmp_path) -> BindingStore:
     return rig(tmp_path / "store")[1]
 
 
-def _gate(tmp_path, *, executor=None, observer=None, auto_fire=None, binding_risk=None):
+def _gate(tmp_path, *, executor=None, observer=None, auto_fire=None, binding_risk=None, coverage=None):
     return EfferentGate(
-        manifest=ActionManifest({}),                  # binding fires thread risk → manifest unused
+        # the action every builder here emits, at the binding's link risk: below CONFIRM a binding's effect runs
+        # only as an action the manifest declares, at the risk a policy signs (14b DESIGN_REV3 §4)
+        manifest=ActionManifest({"deliver": LOW_INTERNAL}),
+        coverage=coverage,
         store=GateReceiptStore(tmp_path / "r.jsonl"),
         executor=executor or RecordingExecutor(),
         clock=lambda: FIXED,
@@ -99,19 +106,20 @@ def _binding_authority(binding_id="bind-x"):
     return AuthorityScope(grantor="binding", grant="binding:time@on_loop", binding_id=binding_id, hops=0)
 
 
-def _bound(gate):
+def _bound(gate, sealed=None):
     """``(authority, run)`` for a gate-level binding fire: a real binding and an admitted run of it in the
-    gate's journal (every binding fire is a journaled run)."""
-    binding_id, run = admit_binding_run(gate.journal)
+    gate's journal (every binding fire is a journaled run), sealed at ``sealed`` (default ON_LOOP)."""
+    binding_id, run = admit_binding_run(gate.journal, sealed)
     return _binding_authority(binding_id), run
 
 
 def _fire_request(gate, *, risk=LOW_INTERNAL, ratified=None, kill_predicates=(), trigger_event=None,
                   signal=SignalAuth.STRONG, predicted_trajectory=None, action="deliver",
-                  confidence=1.0):
+                  confidence=1.0, sealed=None):
     """An autonomous binding fire request on an admitted run: intent-free, human-absent
-    (STRONG+INTENT_FREE → ON_LOOP)."""
-    authority, run = _bound(gate)
+    (STRONG+INTENT_FREE → ON_LOOP). ``sealed``: the rung the admitted binding is sealed at (a ratified
+    posture must be its binding's)."""
+    authority, run = _bound(gate, sealed)
     return ActionRequest(
         action_name=action, payload="do it", context_id="ctx-1", query_text="q", query_date="2026-06-30",
         trust=TrustContext(signal_auth=signal, intent_provenance=IntentProvenance.INTENT_FREE,
@@ -128,13 +136,24 @@ def _fire_request(gate, *, risk=LOW_INTERNAL, ratified=None, kill_predicates=(),
 # =====================================================================================
 
 def test_binding_fire_resolves_against_threaded_risk_not_manifest(tmp_path):
-    """Seam #1: the gate resolves against ``request.risk`` (the sealed-tool risk), NOT the (empty)
-    manifest — an action the manifest never declared still fires because the binding supplied its risk."""
+    """Seam #1: the gate resolves against ``request.risk`` (the sealed-tool risk); a declared action fires at
+    the rung that risk gives."""
+    ex = RecordingExecutor()
+    g = _gate(tmp_path, executor=ex)
+    out = g.gate(_fire_request(g, risk=LOW_INTERNAL))
+    assert out.fired and out.posture is Posture.ON_LOOP
+    assert ex.calls == [("deliver", "do it", "ctx-1")]
+
+
+def test_an_action_the_manifest_never_declared_is_held_at_confirm_even_with_the_binding_risk(tmp_path):
+    """14b X-H1: below CONFIRM coverage reads the action the executor will run at the manifest's risk, so an
+    undeclared action is covered by nothing and waits at CONFIRM, though the binding supplied a low risk (it
+    used to fire here at ON_LOOP)."""
     ex = RecordingExecutor()
     g = _gate(tmp_path, executor=ex)
     out = g.gate(_fire_request(g, risk=LOW_INTERNAL, action="never_declared"))
-    assert out.fired and out.posture is Posture.ON_LOOP
-    assert ex.calls == [("never_declared", "do it", "ctx-1")]
+    assert not out.fired and out.posture is Posture.CONFIRM and out.deferred
+    assert ex.calls == []
 
 
 def test_binding_fire_records_by_binding(tmp_path):
@@ -171,7 +190,7 @@ def test_ratified_posture_floors_up_a_lowered_risk(tmp_path):
     g = _gate(tmp_path, auto_fire=None)
     # risk re-resolves to ON_LOOP (fires immediately), but the binding was ratified at CONFIRM →
     # max(ON_LOOP, CONFIRM) = CONFIRM → needs the confirm transport (none wired) → DEFER, never fire.
-    out = g.gate(_fire_request(g, risk=LOW_INTERNAL, ratified=Posture.CONFIRM))
+    out = g.gate(_fire_request(g, risk=LOW_INTERNAL, ratified=Posture.CONFIRM, sealed=Posture.CONFIRM))
     assert not out.fired and out.deferred and out.posture is Posture.CONFIRM
 
 
@@ -596,3 +615,38 @@ def test_low_confidence_without_kill_still_refused(tmp_path):
     req = _fire_request(g, confidence=0.1)
     out = g.gate(req)
     assert out.refused and not out.killed and out.reason.startswith("screen:")
+
+
+# =====================================================================================
+# Block 5 — the graduation clamp on the dispatcher's path (14b DESIGN_REV3 §10 S3b RUN 1-3)
+# =====================================================================================
+_LATER = FIXED + _dt.timedelta(days=10)
+
+
+def _clamped_dispatch(tmp_path, cover):
+    from tests.autonomic_test_only_coverage import TestOnlyCoverage, policy
+    ex = RecordingExecutor()
+    st, b = _active_binding(tmp_path, pattern={"op": "==", "field": "tick", "value": "1"})
+    src = TestOnlyCoverage([policy("gp-1", cover, expires_at=_LATER)] if cover else [])
+    fd = FireDispatcher(store=st, gate=_gate(tmp_path, executor=ex, coverage=src),
+                        predicate_match=_match_field_eq, request_builder=_builder(), clock=lambda: FIXED)
+    return fd.dispatch({"type": "time", "id": "e", "fields": {"tick": "1"}}), ex
+
+
+def test_an_on_loop_binding_with_no_policy_is_held_at_confirm(tmp_path):
+    out, ex = _clamped_dispatch(tmp_path, None)
+    assert len(out) == 1 and not out[0].outcome.fired and out[0].outcome.posture is Posture.CONFIRM
+    assert ex.calls == []
+
+
+def test_an_on_loop_binding_whose_action_a_policy_covers_fires(tmp_path):
+    out, ex = _clamped_dispatch(tmp_path, {"deliver": LOW_INTERNAL})
+    assert out[0].outcome.fired and out[0].outcome.posture is Posture.ON_LOOP
+    assert ex.calls == [("deliver", "fire", "e")]
+
+
+def test_a_policy_covering_the_bindings_tool_but_not_the_action_it_runs_holds_it(tmp_path):
+    """The binding's tool is ``doc.append``; the builder emits ``deliver``: what runs is what is covered."""
+    out, ex = _clamped_dispatch(tmp_path, {"doc.append": LOW_INTERNAL})
+    assert not out[0].outcome.fired and out[0].outcome.posture is Posture.CONFIRM
+    assert ex.calls == []

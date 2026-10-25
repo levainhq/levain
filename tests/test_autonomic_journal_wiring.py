@@ -34,6 +34,7 @@ from levain.autonomic import (
 from tests.autonomic_confirm_keys import SIGNER, confirm_signers, sign, signed_yes
 from tests.autonomic_test_only_confinement import assume_confined_for_this_test
 from levain.autonomic.journal import EffectStatus
+from tests.test_autonomic_binding import reversible_floor
 from tests.test_autonomic_rawstore import registry_of, write_raw
 
 FIXED = _dt.datetime(2026, 10, 7, 12, 0, 0, tzinfo=_dt.timezone.utc)
@@ -42,7 +43,8 @@ HIGH = ActionRisk(cls=RiskClass.HIGH, reversible=False, external=True, financial
 TIGHT = TightnessVector(goal_spec=0.9, tool_min=0.9, pattern_precision=0.9, output_bound=0.9)
 
 # TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal
-pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
+# TEST ONLY: every declared effect is covered, as before the graduation clamp (14b S3a)
+pytestmark = pytest.mark.usefixtures("test_only_confined_executor", "test_only_every_effect_covered")
 
 
 
@@ -194,6 +196,8 @@ def _child(work: Path, body: str, crash_after: str) -> int:
         from test_autonomic_journal_wiring import World
         import levain.autonomic.gate as _g
         _g._executor_is_confined = lambda executor: True   # TEST ONLY (tests/autonomic_test_only_confinement.py)
+        from tests.autonomic_test_only_coverage import cover_every_effect_in_this_child_process
+        cover_every_effect_in_this_child_process()   # TEST ONLY (14b S3a)
         import os, levain.autonomic.confirm as _c
         _c._SIGNERS_FILE_OWNERS = frozenset({{0, os.getuid()}})   # TEST ONLY (tests/conftest.py)
         w = World(Path({str(work)!r}))
@@ -335,7 +339,9 @@ def test_every_verb_that_stops_or_tightens_a_grant_fences_it(tmp_path, verb):
     elif verb == "replace":
         assert w.store.replace_atomic(w.store.get(b.binding_id), Binding.create(
             created_by="operator", created_at="2026-10-07T10:00:00", trigger=b.trigger, goal=b.goal,
-            tightness=b.tightness, posture=Posture.ABOVE_LOOP, guard=b.guard, status=BindingStatus.ACTIVE))
+            tightness=b.tightness, posture=Posture.COOLING_OFF, guard=b.guard, status=BindingStatus.ACTIVE),
+            coverage=lambda binding, rung: True,   # a rung below CONFIRM: a policy covers it (14b)
+            risk_floor_of=reversible_floor)
     else:
         w.store.remove(b.binding_id)
     assert w.journal.generation(b.binding_id) == before + 1          # mirrored into the journal
@@ -1149,6 +1155,8 @@ def test_many_processes_delivering_one_event_produce_one_effect(tmp_path):
         from test_autonomic_journal_wiring import World
         import levain.autonomic.gate as _g
         _g._executor_is_confined = lambda executor: True   # TEST ONLY (tests/autonomic_test_only_confinement.py)
+        from tests.autonomic_test_only_coverage import cover_every_effect_in_this_child_process
+        cover_every_effect_in_this_child_process()   # TEST ONLY (14b S3a)
         import os, levain.autonomic.confirm as _c
         _c._SIGNERS_FILE_OWNERS = frozenset({{0, os.getuid()}})   # TEST ONLY (tests/conftest.py)
         World(Path({str(tmp_path)!r})).dispatch('race')
@@ -1176,7 +1184,7 @@ def test_the_store_is_one_private_directory_with_durable_settings(tmp_path):
         assert conn.execute("PRAGMA fullfsync").fetchone()[0] == 1
         names = {p.name for p in store_dir.iterdir()}
         assert {"autonomic.db", "autonomic.db-wal", "autonomic.db-shm"} <= names
-    assert w.journal.db.meta("format") == "levain-autonomic/1"
+    assert w.journal.db.meta("format") == "levain-autonomic/2"
     assert sqlite3.connect(store_dir / "autonomic.db").execute(
         "SELECT COUNT(*) FROM holds").fetchone()[0] == 1
 

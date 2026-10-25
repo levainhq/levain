@@ -113,6 +113,10 @@ def make_gate(tmp_path, *, executor=None, transport=None, pending=None, window=3
     return gate, ex, tr, pend, store
 
 
+# TEST ONLY: every declared effect is covered, as before the graduation clamp (14b S3a)
+pytestmark = pytest.mark.usefixtures("test_only_every_effect_covered")
+
+
 # =================================================================================================
 # the posture knobs (the L2-M2 fix)
 # =================================================================================================

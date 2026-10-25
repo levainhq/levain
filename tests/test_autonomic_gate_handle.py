@@ -32,7 +32,8 @@ from tests.autonomic_confirm_keys import signed_yes
 from tests.test_autonomic_journal_wiring import (FIXED, HIGH, LOW, TIGHT, World, _chain_builder, _single_builder,
                                                   _trust)
 
-pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
+# TEST ONLY: every declared effect is covered, as before the graduation clamp (14b S3a)
+pytestmark = pytest.mark.usefixtures("test_only_confined_executor", "test_only_every_effect_covered")
 
 AUTO = ActionRisk(RiskClass.LOW, reversible=True, external=False, financial=False)
 CONFIRM = ActionRisk(RiskClass.MEDIUM, reversible=False, external=True, financial=False)

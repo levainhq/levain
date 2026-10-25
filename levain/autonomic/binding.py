@@ -90,6 +90,7 @@ __all__ = [
     "Binding",
     "binding_invocation",
     "seal_binding_id",
+    "binding_family",
     "derived_binding_id",
     "BindingStore",
     "ReplaceResult",
@@ -540,6 +541,24 @@ def seal_binding_id(
     return f"bind-{created_at}-{h}"
 
 
+def binding_family(binding: Binding) -> str:
+    """The family of ``binding``: ``fam-`` and the first 32 hex of a sha256 over its sealed core without its
+    posture and its creation time (DESIGN_REV2 C6: ``created_by``, trigger, goal, tightness, ``one_shot``,
+    guard), so the same grant re-ratified at another rung stays in its family. A graduation policy's
+    ``families`` list is compared with it. Honest-config only: a writer of the registry can mint any family."""
+    body: dict[str, Any] = {
+        "created_by": binding.created_by,
+        "trigger": binding.trigger.to_dict(),
+        "goal": [g.to_dict() for g in binding.goal],
+        "tightness": binding.tightness.to_dict(),
+        "one_shot": bool(binding.one_shot),
+    }
+    if binding.guard:   # omitted when empty, as the seal omits it
+        body["guard"] = [g.to_dict() for g in binding.guard]
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return "fam-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
 @dataclass(frozen=True)
 class Binding:
     """A compiled, ratified, standing (or one-shot) authority grant. The ``binding_id`` is the content
@@ -774,7 +793,8 @@ def binding_invocation(binding: Binding, *, hops: int = 0) -> AuthorityScope:
 class ReplaceResult:
     """The outcome of :meth:`BindingStore.replace_atomic`: truthy iff the replacement was written.
     ``reason`` is ``"replaced"`` or the check that refused it (``target_exists``, ``old_absent``,
-    ``old_unloadable``, ``old_not_fireable``, ``old_changed``, ``precondition_failed``)."""
+    ``old_unloadable``, ``old_not_fireable``, ``old_changed``, ``precondition_failed``,
+    ``below_risk_floor``, ``replace_not_covered``)."""
 
     ok: bool
     reason: str
@@ -1182,7 +1202,9 @@ class BindingStore:
             return True
 
     def replace_atomic(self, expected_old: Binding, new_binding: Binding,
-                       *, precondition: Callable[[Binding], bool] | None = None) -> "ReplaceResult":
+                       *, coverage: Callable[[Binding, Posture], bool] | None,
+                       risk_floor_of: Callable[[Binding], Posture] | None,
+                       precondition: Callable[[Binding], bool] | None = None) -> "ReplaceResult":
         """RE-RATIFICATION as one atomic, ALL-OR-NOTHING step: persist ``new_binding`` (a fresh sealed
         grant — a posture promotion / re-author / tightening produces a DIFFERENT core ⇒ a different
         id) AND set the old grant to ``REVOKED``, under ONE lock. The non-atomic alternative (``add``
@@ -1207,6 +1229,25 @@ class BindingStore:
         the lock (``precondition_failed``). ``new_binding``'s id must not exist yet (``target_exists``:
         superseding onto an existing record would mean choosing between two sets of bookkeeping).
         ``expected_old`` and ``new_binding`` with one id is not a re-ratification and raises.
+
+        Two checks on the new grant's rung (14b DESIGN_REV2 §5, HEAD R1 Q6). Both callables are required
+        keyword arguments, so leaving one out is a ``TypeError`` at the call, never a skipped check. They
+        refuse an honest caller's mistake; what stops a binding firing below CONFIRM uncovered is the gate's
+        clamp at every fire, which these do not replace:
+
+          - ``below_risk_floor``: ``risk_floor_of`` (the risk floor of the new grant's sealed tools, injected:
+            the store knows no risk) is ``None``, raises, answers something that is not a :class:`Posture`,
+            or is stricter than the new posture.
+          - ``replace_not_covered``: the new posture is below CONFIRM (any re-author, tighter and same-rung
+            included: the core differs in every replace) and ``coverage(new_binding, new posture)`` (whether
+            a live graduation policy covers every effect the new grant runs at that rung) is not ``True``:
+            ``None``, false, or raising. At or above CONFIRM coverage is not asked.
+
+        Both run under the store's write lock, after every check above passes, so a refusal those checks
+        give is the reason reported and neither callable is asked then. They may read; they must not write
+        this store. Coverage is asked inside the transaction that commits, but whatever it reads is not held
+        by this store's lock, so a policy revoked between that read and the commit is not seen here (the
+        gate's clamp at the next fire is).
 
         Returns a :class:`ReplaceResult`, truthy iff the old grant was revoked and the new one written;
         its ``reason`` names which check stopped it. Nothing is written on any failure. When a journal
@@ -1238,11 +1279,42 @@ class BindingStore:
                 return self._replace_refused(old_binding_id, "old_changed")
             if precondition is not None and not precondition(current):
                 return self._replace_refused(old_binding_id, "precondition_failed")
+            rung_refusal = self._rung_refusal(new_binding, coverage, risk_floor_of)
+            if rung_refusal is not None:
+                return self._replace_refused(old_binding_id, rung_refusal)
             self._fence(old_rec, conn)
             old_rec["status"] = BindingStatus.REVOKED.value   # supersede the old grant
             records.append(record)
             self._write_raw(records, conn)
             return ReplaceResult(True, "replaced")
+
+    @staticmethod
+    def _rung_refusal(new: Binding, coverage: Callable[[Binding, Posture], bool] | None,
+                      risk_floor_of: Callable[[Binding], Posture] | None) -> str | None:
+        """``below_risk_floor``, ``replace_not_covered`` or ``None``: :meth:`replace_atomic`'s two rung checks."""
+        if risk_floor_of is None:
+            _log.warning("binding store: no risk floor given for %r", new.binding_id)
+            return "below_risk_floor"
+        try:
+            floor = risk_floor_of(new)
+        except Exception as e:  # noqa: BLE001 — a grant whose risk cannot be read has no floor to meet
+            _log.warning("binding store: risk floor of %r unreadable (%s): %s", new.binding_id,
+                         type(e).__name__, e)
+            return "below_risk_floor"
+        if not isinstance(floor, Posture) or new.posture < floor:
+            return "below_risk_floor"
+        if new.posture < Posture.CONFIRM:
+            if coverage is None:
+                return "replace_not_covered"
+            try:
+                covered = coverage(new, new.posture)
+            except Exception as e:  # noqa: BLE001 — coverage that cannot be read covers nothing
+                _log.warning("binding store: coverage of %r unreadable (%s): %s", new.binding_id,
+                             type(e).__name__, e)
+                return "replace_not_covered"
+            if covered is not True:
+                return "replace_not_covered"
+        return None
 
     @staticmethod
     def _replace_refused(old_binding_id: str, reason: str) -> "ReplaceResult":

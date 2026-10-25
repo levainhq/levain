@@ -21,9 +21,15 @@ import levain.autonomic.confirm as confirm_mod
 import levain.autonomic.gate as gate_mod
 from levain.autonomic import Posture
 from levain.autonomic.policy import risk_floor
+import pytest
+
 from tests.autonomic_confirm_keys import SIGNER, confirm_signers, sign, signed_yes
 from tests.test_autonomic_journal_wiring import HIGH, World
 from tests.test_autonomic_l3_fixes import _before_admit, _hold_of
+
+
+# TEST ONLY: every declared effect is covered, as before the graduation clamp (14b S3a)
+pytestmark = pytest.mark.usefixtures("test_only_every_effect_covered")
 
 
 def test_an_on_loop_decision_on_a_confirm_hold_does_not_run(tmp_path, test_only_confined_executor):

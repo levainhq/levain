@@ -38,6 +38,7 @@ from levain.autonomic import (
     one_rung_looser,
     propose_graduation,
 )
+from tests.test_autonomic_binding import reversible_floor
 
 # TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal
 pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
@@ -236,7 +237,8 @@ def test_replace_atomic_promotion_revokes_old_persists_new(tmp_path):
     p = _propose(src)
     promoted = p.build_promoted(status=BindingStatus.ACTIVE, created_at="2026-06-30T18:00:00")
     assert BindingStore.is_fireable(promoted)                  # the pre-persist defense-in-depth assert
-    assert store.replace_atomic(p.source, promoted)
+    assert store.replace_atomic(p.source, promoted, coverage=lambda b, rung: True,  # a policy covers it (14b)
+                                risk_floor_of=reversible_floor)
     # old REVOKED, new ACTIVE + fireable + fresh evidence.
     assert store.get(src.binding_id).status is BindingStatus.REVOKED
     new = store.get(promoted.binding_id)
@@ -256,20 +258,41 @@ class _Exec:
         return ExecutionResult(ok=self.ok, detail="d", downstream_id="o", error=None)
 
 
-def _gate(tmp_path):
+def _gate(tmp_path, *, manifest=None):
     from tests.test_autonomic_rawstore import rig
-    return EfferentGate(manifest=ActionManifest({}), store=GateReceiptStore(tmp_path / "r.jsonl"),
+    return EfferentGate(manifest=manifest or ActionManifest({}), store=GateReceiptStore(tmp_path / "r.jsonl"),
                         executor=_Exec(), clock=lambda: FIXED, journal=rig(tmp_path / "store")[0],
                         # the binding's risk as the journal reads it again at admission (the fence): the
                         # risk the one firing test's request carries
                         binding_risk=lambda b, i: LOW_INTERNAL)
 
 
-def _req(gate, *, risk, ratified):
+def _admit_sealed_at(journal, posture):
+    """A real binding sealed at ``posture`` and an admitted run of it: ``(binding_id, RunRef)``. A terminal
+    link's ``ratified_posture`` must be its sealed binding's posture (``ratified_posture_mismatch``)."""
+    from levain.autonomic import RunRef
+    store = BindingStore(journal.db.directory, journal=journal)
+    b = Binding.create(created_by="test", created_at=f"2026-10-07T00:00:0{int(posture)}",
+                       trigger=TriggerSpec(type="email", pattern={"op": "exists", "field": "from"}),
+                       goal=(SubGoal(goal="g", tools=("t",), output="o"),),
+                       tightness=TightnessVector(goal_spec=0.9, tool_min=0.9, pattern_precision=0.9,
+                                                 output_bound=0.9),
+                       posture=posture, guard=(_kill_guard(),) if posture > Posture.ON_LOOP else (),
+                       status=BindingStatus.ACTIVE)
+    store.add(b)
+    assert store.admit(b.binding_id, "run-sealed") is not None
+    return b.binding_id, RunRef("run-sealed", "link-0")
+
+
+_DECLARED = ActionManifest({"deliver": LOW_INTERNAL})
+
+
+def _req(gate, *, risk, ratified, sealed=None):
     # AUTHENTICATED + INTENT_FREE → earned_posture = COOLING_OFF (ON_LOOP base + intent-free +1).
-    # A binding fire is a journaled run: a real binding and an admitted run of it in the gate's journal.
+    # A binding fire is a journaled run: a real binding and an admitted run of it in the gate's journal
+    # (``sealed``: the binding is sealed at that posture; else at ON_LOOP).
     from tests.test_autonomic_rawstore import admit_binding_run
-    binding_id, run = admit_binding_run(gate.journal)
+    binding_id, run = admit_binding_run(gate.journal) if sealed is None else _admit_sealed_at(gate.journal, sealed)
     return ActionRequest(
         action_name="deliver", payload="x", context_id="c", query_text="q", query_date="2026-06-30",
         trust=TrustContext(signal_auth=SignalAuth.AUTHENTICATED, intent_provenance=IntentProvenance.INTENT_FREE,
@@ -279,19 +302,28 @@ def _req(gate, *, risk, ratified):
     )
 
 
-def test_graduated_binding_fires_looser_not_refloored(tmp_path):
+def test_graduated_binding_fires_looser_not_refloored(tmp_path, test_only_every_effect_covered):
     # the CRUX: ratified=ON_LOOP (graduated) below earned=COOLING_OFF. Old max(policy,ratified) would
     # re-floor to COOLING_OFF (propose/defer); 4c max(risk_floor=ON_LOOP, ratified=ON_LOOP) FIRES on_loop.
-    g = _gate(tmp_path)
+    # Its action is declared and covered by a graduation policy (14b: below CONFIRM only a covered effect runs).
+    g = _gate(tmp_path, manifest=_DECLARED)
     o = g.gate(_req(g, risk=LOW_INTERNAL, ratified=Posture.ON_LOOP))
     assert o.fired is True and o.posture is Posture.ON_LOOP
 
 
-def test_non_graduated_binding_behavior_identical(tmp_path):
+def test_a_graduated_binding_no_policy_covers_waits_at_confirm(tmp_path):
+    # the same ON_LOOP rung with nothing covering the action: the clamp holds it at CONFIRM (14b X1/D4)
+    g = _gate(tmp_path, manifest=_DECLARED)
+    o = g.gate(_req(g, risk=LOW_INTERNAL, ratified=Posture.ON_LOOP))
+    assert o.fired is False and o.posture is Posture.CONFIRM
+
+
+def test_non_graduated_binding_behavior_identical(tmp_path, test_only_every_effect_covered):
     # ratified == earned (COOLING_OFF) — max(risk_floor=ON_LOOP, COOLING_OFF) == COOLING_OFF (the old
-    # max(policy, ratified) too). NOT fired; confirm-class (no transport → DEFER) at COOLING_OFF.
-    g = _gate(tmp_path)
-    o = g.gate(_req(g, risk=LOW_INTERNAL, ratified=Posture.COOLING_OFF))
+    # max(policy, ratified) too). NOT fired; confirm-class (no transport → DEFER) at COOLING_OFF. The binding
+    # is sealed at COOLING_OFF (a ratified posture other than the sealed one is refused) and its action covered.
+    g = _gate(tmp_path, manifest=_DECLARED)
+    o = g.gate(_req(g, risk=LOW_INTERNAL, ratified=Posture.COOLING_OFF, sealed=Posture.COOLING_OFF))
     assert o.fired is False and o.posture is Posture.COOLING_OFF
 
 
@@ -307,7 +339,7 @@ def test_requested_upgrade_still_honored(tmp_path):
     # a requested-UPGRADE binding (ratified=CONFIRM, above earned=COOLING_OFF) still pauses at CONFIRM —
     # max(risk_floor=ON_LOOP, CONFIRM) == CONFIRM (ratified dominates; behavior-identical to the old form).
     g = _gate(tmp_path)
-    o = g.gate(_req(g, risk=LOW_INTERNAL, ratified=Posture.CONFIRM))
+    o = g.gate(_req(g, risk=LOW_INTERNAL, ratified=Posture.CONFIRM, sealed=Posture.CONFIRM))
     assert o.fired is False and o.posture is Posture.CONFIRM
 
 
@@ -355,11 +387,13 @@ def test_replace_atomic_precondition_aborts_on_change(tmp_path):
     p = _propose(src)
     promoted = p.build_promoted(status=BindingStatus.ACTIVE, created_at="2026-06-30T18:00:00")
     # a precondition that always fails → abort, write NOTHING, old untouched.
-    assert not store.replace_atomic(p.source, promoted, precondition=lambda cur: False)
+    assert not store.replace_atomic(p.source, promoted, precondition=lambda cur: False,
+                                    coverage=lambda b, rung: True, risk_floor_of=reversible_floor)
     assert store.get(src.binding_id).status is BindingStatus.ACTIVE   # NOT revoked
     assert store.get(promoted.binding_id) is None                     # NOT persisted
     # a precondition that passes → applies.
-    assert store.replace_atomic(p.source, promoted, precondition=lambda cur: True)
+    assert store.replace_atomic(p.source, promoted, precondition=lambda cur: True,
+                                coverage=lambda b, rung: True, risk_floor_of=reversible_floor)
     assert store.get(src.binding_id).status is BindingStatus.REVOKED
     assert store.get(promoted.binding_id).status is BindingStatus.ACTIVE
 
@@ -373,6 +407,6 @@ def test_replace_atomic_precondition_catches_concurrent_revoke(tmp_path):
     p = _propose(src)
     promoted = p.build_promoted(status=BindingStatus.ACTIVE, created_at="2026-06-30T18:00:00")
     store.set_status(src.binding_id, BindingStatus.REVOKED)   # concurrent revoke
-    result = store.replace_atomic(p.source, promoted)
+    result = store.replace_atomic(p.source, promoted, coverage=lambda b, rung: True, risk_floor_of=reversible_floor)
     assert not result and result.reason == "old_not_fireable"
     assert store.get(promoted.binding_id) is None             # the revoked grant was NOT resurrected looser

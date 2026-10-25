@@ -1,9 +1,15 @@
-"""The ``/1 -> /2`` store migration (14b DESIGN_REV3 §8, §10 S2): the function and the ``graduation_steps`` audit
-table, built behind the format constant. ``STORE_FORMAT`` stays ``/1`` until S3b flips it and wires the migration
-into ``_ensure_schema``, so no release carries ``/2`` before the whole clamp exists (the one-release-unit rule)."""
+"""The ``/1 -> /2`` store migration (14b DESIGN_REV3 §8, §10 S2 and S3b): the function, the ``graduation_steps``
+audit table, and the flip: ``STORE_FORMAT`` is ``/2`` and the first open by this binary migrates a ``/1`` store.
+
+A ``/1`` store is made by the ``/1`` binary itself: ``tests/fixtures/autonomic_db_v1_4c280672.py`` is
+``levain/autonomic/db.py`` as it stood at 4c280672, the last commit before the flip (format ``/1``, the marker
+checked inside every transaction, the migration built but not wired), loaded as its own module. Its objects are
+"an older levain" with the store open."""
 from __future__ import annotations
 
+import importlib.util
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -32,22 +38,74 @@ def fmt(path) -> str:
         conn.close()
 
 
-def v1_store(tmp_path) -> AutonomicDB:
-    db = AutonomicDB(tmp_path / "store")
+_OLDER = Path(__file__).resolve().parent / "fixtures" / "autonomic_db_v1_4c280672.py"
+_spec = importlib.util.spec_from_file_location("autonomic_db_v1_4c280672", _OLDER)
+older = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(older)
+
+
+def v1_store(tmp_path):
+    """A ``/1`` store holding one binding row, made by the ``/1`` binary, and that binary's open object on it."""
+    db = older.AutonomicDB(tmp_path / "store")
     with db.write() as conn:
         conn.execute("INSERT INTO bindings (binding_id, record, seq) VALUES ('b1', '{}', 1)")
     return db
 
 
-def test_the_format_is_not_flipped_here():
-    assert STORE_FORMAT == STORE_FORMAT_V1 == "levain-autonomic/1"
-    assert STORE_FORMAT_V2 == "levain-autonomic/2"
+def test_the_format_is_flipped():
+    assert STORE_FORMAT == STORE_FORMAT_V2 == "levain-autonomic/2"
+    assert STORE_FORMAT_V1 == older.STORE_FORMAT == "levain-autonomic/1"
 
 
-def test_a_new_store_has_no_graduation_steps_table_until_migrated(tmp_path):
+def test_an_older_binarys_new_store_is_v1_with_no_graduation_steps_table(tmp_path):
     db = v1_store(tmp_path)
     assert "graduation_steps" not in tables(db.path)
     assert fmt(db.path) == STORE_FORMAT_V1
+
+
+def test_this_binarys_new_store_is_v2_with_its_audit_table(tmp_path):
+    db = AutonomicDB(tmp_path / "store")
+    assert db.meta("format") == STORE_FORMAT_V2
+    assert "graduation_steps" in tables(db.path)
+
+
+def test_the_first_open_migrates_a_v1_store_once_and_keeps_what_it_held(tmp_path, monkeypatch):
+    v1 = v1_store(tmp_path)
+    store_id = v1.meta("store_id")
+    calls = []
+    real = dbmod.migrate_to_v2
+    monkeypatch.setattr(dbmod, "migrate_to_v2", lambda conn: calls.append(real(conn)) or calls[-1])
+    db = AutonomicDB(tmp_path / "store")
+    assert db.meta("format") == STORE_FORMAT_V2 and calls == [True]
+    assert db.meta("store_id") == store_id                     # the same store: its identity is kept
+    with db.read() as conn:
+        assert conn.execute("SELECT binding_id FROM bindings").fetchall() == [("b1",)]
+        assert [r[1] for r in conn.execute("PRAGMA table_info(graduation_steps)")] == STEP_COLUMNS
+    AutonomicDB(tmp_path / "store").meta("format")              # another object: nothing left to migrate
+    assert calls == [True, False]
+
+
+def test_a_live_older_object_refuses_the_store_once_this_binary_has_opened_it(tmp_path):
+    # S2 ruling, carried to S3b: an older levain still serving must not keep firing on the /2 store
+    v1 = v1_store(tmp_path)
+    assert v1.meta("format") == STORE_FORMAT_V1                 # the older object is ready at /1
+    AutonomicDB(tmp_path / "store").meta("format")              # this binary opens it: migrated
+    with pytest.raises(older.StoreFormatError, match="levain-autonomic/2"):
+        with v1.write() as conn:
+            conn.execute("INSERT INTO bindings (binding_id, record, seq) VALUES ('b2', '{}', 2)")
+    with pytest.raises(older.StoreFormatError, match="levain-autonomic/2"):
+        v1.meta("store_id")
+    with pytest.raises(older.StoreFormatError, match="levain-autonomic/2"):
+        older.AutonomicDB(tmp_path / "store").meta("format")   # and an older binary opening it afresh
+
+
+def test_a_store_of_another_format_is_refused_at_open_and_left_as_it_was(tmp_path):
+    v1 = v1_store(tmp_path)
+    with v1.write() as conn:
+        conn.execute("UPDATE meta SET value = 'other/9' WHERE key = 'format'")
+    with pytest.raises(StoreFormatError, match="other/9"):
+        AutonomicDB(tmp_path / "store").meta("format")
+    assert fmt(v1.path) == "other/9" and "graduation_steps" not in tables(v1.path)
 
 
 def test_the_migration_marks_the_store_v2_and_adds_the_audit_table(tmp_path):
@@ -190,13 +248,13 @@ def test_a_ready_object_refuses_the_store_once_another_connection_migrates_it(tm
     db = v1_store(tmp_path)
     assert db.meta("format") == STORE_FORMAT_V1          # ready at /1
     in_immediate(db.path, migrate_to_v2)                 # another connection (another process) migrates
-    with pytest.raises(StoreFormatError, match="levain-autonomic/2"):
+    with pytest.raises(older.StoreFormatError, match="levain-autonomic/2"):
         with db.read() as conn:
             conn.execute("SELECT 1").fetchone()
-    with pytest.raises(StoreFormatError, match="levain-autonomic/2"):
+    with pytest.raises(older.StoreFormatError, match="levain-autonomic/2"):
         with db.write() as conn:
             conn.execute("INSERT INTO bindings (binding_id, record, seq) VALUES ('b2', '{}', 2)")
-    with pytest.raises(StoreFormatError):
+    with pytest.raises(older.StoreFormatError):
         db.meta("store_id")
     # the refused write wrote nothing
     conn = sqlite3.connect(db.path)
@@ -214,7 +272,7 @@ def test_a_read_reads_the_state_its_format_check_read(tmp_path):
         assert conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()[0] == STORE_FORMAT_V1
         assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'graduation_steps'").fetchone() is None
     assert fmt(db.path) == STORE_FORMAT_V2
-    with pytest.raises(StoreFormatError):
+    with pytest.raises(older.StoreFormatError):
         db.meta("format")
 
 
@@ -222,14 +280,14 @@ def test_a_ready_object_refuses_after_its_own_migration_commits(tmp_path):
     db = v1_store(tmp_path)
     with db.write() as conn:
         migrate_to_v2(conn)
-    with pytest.raises(StoreFormatError, match="levain-autonomic/2"):
+    with pytest.raises(older.StoreFormatError, match="levain-autonomic/2"):
         db.meta("format")
 
 
 def test_a_ready_object_refuses_a_store_whose_marker_was_removed(tmp_path):
     db = v1_store(tmp_path)
     in_immediate(db.path, lambda c: c.execute("DELETE FROM meta WHERE key = 'format'"))
-    with pytest.raises(StoreFormatError):
+    with pytest.raises(older.StoreFormatError):
         db.meta("store_id")
 
 
@@ -281,18 +339,13 @@ def test_a_migration_rolled_back_by_its_caller_leaves_v1(tmp_path):
     assert fmt(db.path) == STORE_FORMAT_V1 and "graduation_steps" not in tables(db.path)
 
 
-def test_this_binary_refuses_a_v2_store_until_the_flip(tmp_path):
-    # the one-release-unit rule, seen from this side: a /2 store under a /1 constant is refused, never read
-    db = v1_store(tmp_path)
-    with db.write() as conn:
-        migrate_to_v2(conn)
-    with pytest.raises(StoreFormatError, match="levain-autonomic/2"):
+def test_a_migration_that_fails_at_open_leaves_the_store_v1(tmp_path, monkeypatch):
+    v1 = v1_store(tmp_path)
+
+    def broken(conn):
+        conn.execute("UPDATE meta SET value = ? WHERE key = 'format'", (STORE_FORMAT_V2,))
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(dbmod, "migrate_to_v2", broken)
+    with pytest.raises(sqlite3.OperationalError):
         AutonomicDB(tmp_path / "store").meta("format")
-
-
-def test_ensure_schema_does_not_call_the_migration(tmp_path, monkeypatch):
-    # S3b wires it; S2 only builds it
-    called = []
-    monkeypatch.setattr(dbmod, "migrate_to_v2", lambda conn: called.append(conn))
-    AutonomicDB(tmp_path / "store").meta("format")
-    assert called == []
+    assert fmt(v1.path) == STORE_FORMAT_V1 and v1.meta("format") == STORE_FORMAT_V1
