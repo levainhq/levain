@@ -182,7 +182,7 @@ where = ["."]
 include = ["levain*"]
 
 [tool.setuptools.package-data]
-levain = ["templates/**/*", "webpush/static/*"]
+levain = ["templates/**/*", "webpush/static/*", "chat_egress/denied_table.json"]
 
 # Never ship compiled bytecode in the wheel: the `templates/**/*` glob above would
 # otherwise pull in any `__pycache__/*.pyc` left in the working tree (cross-version
