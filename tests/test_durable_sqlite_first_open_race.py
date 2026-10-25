@@ -271,3 +271,75 @@ def test_a_store_opened_while_another_holds_it_waits_and_keeps_the_busy_wait(tmp
     finally:
         release.join()
         holder.close()
+
+
+# The race the first fix did not reach: SQLite may answer busy with no wait on the statements after the WAL switch too
+# (the last other connection closing deletes the WAL under a connection that has not read yet). No process here stages
+# that on demand, so the retry is driven through a connection that answers as told.
+
+class _Stmt:
+    """A connection whose ``execute`` answers each statement from a script: a list of answers per statement text."""
+
+    def __init__(self, **scripts):
+        self.scripts = {k: list(v) for k, v in scripts.items()}
+        self.log = []
+        self.closed = False
+
+    def execute(self, sql):
+        self.log.append(sql)
+        script = self.scripts.get(sql)
+        a = script.pop(0) if script else None
+        if isinstance(a, BaseException):
+            raise a
+        return _Row(1)
+
+    def close(self):
+        self.closed = True
+
+
+def test_begin_immediate_answered_busy_with_no_wait_is_retried():
+    from levain.autonomic import durable_sqlite as D
+    busy = _err("database is locked", 5)
+    conn = _Stmt(**{"BEGIN IMMEDIATE": [busy, busy]})
+    with D.write_transaction(lambda: conn):
+        pass
+    assert conn.log == ["BEGIN IMMEDIATE"] * 3 + ["COMMIT"] and conn.closed
+
+
+def test_begin_immediate_failing_for_another_reason_raises_at_once_and_closes():
+    import pytest
+
+    from levain.autonomic import durable_sqlite as D
+    conn = _Stmt(**{"BEGIN IMMEDIATE": [_err("disk I/O error", 10)]})
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+        with D.write_transaction(lambda: conn):
+            raise AssertionError("the block must not run")
+    assert conn.log == ["BEGIN IMMEDIATE"] and conn.closed
+
+
+def test_open_durable_reads_once_after_the_pragmas_and_retries_that_read(monkeypatch):
+    from levain.autonomic import durable_sqlite as D
+    conn = _Stmt(**{"PRAGMA journal_mode = WAL": ["wal"], "SELECT count(*) FROM sqlite_master": [_err("database is locked", 5)]})
+    real = conn.execute
+
+    def execute(sql):
+        if sql == "PRAGMA journal_mode = WAL":
+            conn.log.append(sql)
+            return _Row("wal")
+        return real(sql)
+    conn.execute = execute
+    monkeypatch.setattr(D.sqlite3, "connect", lambda *a, **k: conn)
+    assert D.open_durable("x.db") is conn
+    assert conn.log.count("SELECT count(*) FROM sqlite_master") == 2 and not conn.closed
+
+
+def test_a_begin_that_stays_busy_past_the_bound_raises(monkeypatch):
+    import pytest
+
+    from levain.autonomic import durable_sqlite as D
+    monkeypatch.setattr(D, "BUSY_WAIT_S", 0.2)
+    conn = _Stmt(**{"BEGIN IMMEDIATE": [_err("database is locked", 5)] * 10000})
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        with D.write_transaction(lambda: conn):
+            pass
+    assert conn.closed
