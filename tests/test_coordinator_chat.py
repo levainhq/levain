@@ -932,3 +932,16 @@ def test_turn_view_takes_no_write_lock_while_the_lease_reads_live(cs, world, qdi
     assert cs.turn_view(world["launch"], ME).state == "free"
     hist = cs.turn_history(world["launch"])
     assert len(hist) == n + 1 and hist[-1][1:3] == ("lapse", e) and hist[-1][6] == "past until"
+
+
+def test_levain_chat_holds_show_and_key_in_one_command(cs, world, qdir, capsys):
+    # the merge of main's `levain chat key` with CH-D1a's `levain chat show`: argparse refused a second `chat`
+    # ("conflicting subparser: chat") and every `levain` invocation failed before reaching its verb
+    from levain.cli import main
+
+    msg(cs, world)
+    assert main(["chat", "show", world["thread"], "--queue-dir", str(qdir), "--json"]) == 0
+    assert [r["kind"] for r in json.loads(capsys.readouterr().out)["timeline"]] == ["message"]
+    with pytest.raises(SystemExit) as exc:
+        main(["chat", "key", "list", "--help"])
+    assert exc.value.code == 0

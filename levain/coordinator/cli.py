@@ -1024,6 +1024,19 @@ def run_chat(args: argparse.Namespace, out: Any = None) -> int:
     return 0
 
 
+def _chat_subparsers(subparsers: argparse._SubParsersAction) -> argparse._SubParsersAction:
+    """The ``chat`` command's verb table. ``levain chat key`` (the chat launch's held keys) may have registered
+    ``chat`` already; its verbs and ``show`` share the one command rather than argparse refusing a second ``chat``."""
+    existing = subparsers.choices.get("chat")
+    if existing is None:
+        ch = subparsers.add_parser("chat", help="A thread's chat record and the chat launch's network.")
+        return ch.add_subparsers(dest="chat_cmd", required=True)
+    for action in existing._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action
+    raise RuntimeError("the chat command was registered without a verb table")
+
+
 def run_drop_list(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
@@ -1446,8 +1459,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     for p in (tl, ts, tst, tm, td, ta, tf):
         p.set_defaults(func=run_thread)
 
-    ch = subparsers.add_parser("chat", help="A thread's chat record, read only (CH-D1).")
-    ch_sub = ch.add_subparsers(dest="chat_cmd", required=True)
+    ch_sub = _chat_subparsers(subparsers)
     chs = ch_sub.add_parser(
         "show", help="One thread's chat timeline in the store's order: messages, what the worker's thread showed "
                      "(quoted, never your words), replies and envelope rows. Writes no row.")
