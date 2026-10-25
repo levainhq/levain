@@ -407,7 +407,10 @@ def test_stream_over_a_control_server_socket(erig, tmp_path):
         assert live["state"] == R.RENDERING and live["seq"] == kept[-1]["seq"] + 1
         c.sendall(b"x")                                                 # nothing is a verb on a stream
         c.settimeout(5)
-        assert c.recv(1) == b""
+        try:                                     # closed: EOF, or a reset where the server's close found our byte unread (Linux)
+            assert c.recv(1) == b""
+        except ConnectionResetError:
+            pass
         c.close()
     finally:
         server.stop()
