@@ -97,10 +97,15 @@
   // MUST equal pair.js shortId: the first 8 characters of the device id; the Paired screen's previous-key line names the row by it
   function shortId(id) { return String(id).slice(0, 8); }
 
+  // A label inside a sentence, bidi-isolated (FSI ... PDI) so right-to-left text cannot reorder the words around it
+  function named(d) { return "\u2068" + (d.label || d.id) + "\u2069"; }
+
   function row(d) {
     const r = el("div", "dev-row" + (d.revoked_at ? " dev-revoked" : ""));
     const main = el("div", "dev-main");
-    main.appendChild(el("div", "dev-name", d.label || d.id));
+    const name = el("div", "dev-name", d.label || d.id);
+    name.dir = "auto";                                              // the label alone: its own direction
+    main.appendChild(name);
     const meta = el("div", "dev-meta", "paired " + when(d.created) + " · last seen " + when(d.last_seen) + (d.paired_by ? " · by " + d.paired_by : "") + " · ");
     meta.appendChild(el("span", "dev-id", shortId(d.id)));          // no-wrap: the id never breaks at its hyphen on a phone
     main.appendChild(meta);
@@ -110,7 +115,7 @@
     } else {
       const b = el("button", "dev-btn", "Revoke");
       b.type = "button";
-      b.setAttribute("aria-label", "Revoke " + (d.label || d.id));
+      b.setAttribute("aria-label", "Revoke " + named(d));
       b.addEventListener("click", () => revoke(d, b));
       r.appendChild(b);
     }
@@ -205,8 +210,8 @@
     try {
       const res = await api("POST", "/cockpit/pair/revoke", { id: d.id });
       const n = (res.data.revoked || []).length;
-      if (res.status !== 200) msg = "Could not revoke " + (d.label || d.id) + " (" + (res.data.message || res.status) + ").";
-      else { revoked = true; msg = n > 1 ? "Revoked " + (d.label || d.id) + " and " + (n - 1) + " device(s) it had paired." : "Revoked " + (d.label || d.id) + "."; }
+      if (res.status !== 200) msg = "Could not revoke " + named(d) + " (" + (res.data.message || res.status) + ").";
+      else { revoked = true; msg = n > 1 ? "Revoked " + named(d) + " and " + (n - 1) + " device(s) it had paired." : "Revoked " + named(d) + "."; }
     } catch (_) { msg = "Could not reach the cockpit."; }
     // G2: a failed revoke keeps a live button; a successful one leaves the row to the re-render (no second click on a revoked key)
     if (!revoked && btn.isConnected) btn.disabled = false;

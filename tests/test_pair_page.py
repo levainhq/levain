@@ -247,3 +247,12 @@ def test_the_pair_script_words_the_retry_403_and_keeps_a_failed_mark_write_from_
     assert re.search(r'try \{ window\.localStorage\.setItem\(PAIRED_MARK_KEY, "1"\); \} catch', js)
     key_try = js.index("window.localStorage.setItem(WRITE_TOKEN_KEY, data.token);")
     assert js.index("return;", key_try) < js.index("PAIRED_MARK_KEY, \"1\"")      # the key's catch ends in its own return
+
+
+def test_a_devices_label_inside_a_panel_sentence_is_bidi_isolated() -> None:
+    # The M2 class in the Devices panel (fix r6 observation): a label interpolated into a revoke note or an aria-label goes through
+    # named() (FSI ... PDI); the row title holds the label alone and takes its own direction.
+    dp = load_web_asset("devices_panel.js")
+    assert 'function named(d) { return "\\u2068" + (d.label || d.id) + "\\u2069"; }' in dp
+    assert dp.count('" + (d.label || d.id) + "') == 1      # named() itself; no label concatenated raw into a sentence
+    assert 'name.dir = "auto"' in dp
