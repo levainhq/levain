@@ -44,6 +44,10 @@ log = logging.getLogger("levain.dispatch.follow")
 _REPORT_FIELDS = ("verifier_report_digest", "verifier_report_refused")
 
 
+class _Cancelled(Exception):
+    """close() landed while a step handled an event: the step ends ``CANCELLED`` with the cursor before the event."""
+
+
 class FollowStopped(DispatchError):
     """The follower stopped at an event it could not finish; ``name`` says why, the cursor is left before it."""
 
@@ -133,6 +137,8 @@ class EventFollower:
             self._active = stream
         try:
             return self._read(stream, jid, after)
+        except _Cancelled:
+            return Stepped(CC.CANCELLED)
         finally:
             with self._lock:
                 if self._active is stream:
@@ -213,20 +219,34 @@ class EventFollower:
         self._hit("acked", ev.seq)
 
     def _ack(self, seq: int, args: Mapping[str, object]) -> None:
+        # the ACK client is read and installed under _lock against _closed, so close() always finds the client to
+        # close and none is made after it; a call close() cuts short ends the step CANCELLED, not FollowStopped
+        with self._lock:
+            if self._closed:
+                raise _Cancelled
+            client = self._ack_client
         try:
-            if self._ack_client is None:
-                self._ack_client = self._connect()
-            self._ack_client.call("ARTIFACT-ACK", **args)
+            if client is None:
+                client = self._connect()
+                with self._lock:
+                    if self._closed:
+                        client.close()
+                        raise _Cancelled
+                    self._ack_client = client
+            client.call("ARTIFACT-ACK", **args)
         except Refused as e:
+            if self._closed:
+                raise _Cancelled from None
             if e.name == "control-down":
-                self._drop_ack()
+                self._drop_ack(client)
             raise FollowStopped(e.name, f"ARTIFACT-ACK of event {seq}") from None
 
-    def _drop_ack(self) -> None:
-        """Close the ACK connection alone, so the next ACK connects again; the follower stays open (close() is the
-        caller's permanent shutdown, never a transient control-down's)."""
+    def _drop_ack(self, client: CC.ControlClient | None) -> None:
+        """Close the ACK connection ``client`` alone, so the next ACK connects again; the follower stays open (close()
+        is the caller's permanent shutdown, never a transient control-down's)."""
         with self._lock:
-            client, self._ack_client = self._ack_client, None
+            if self._ack_client is client:
+                self._ack_client = None
         if client is not None:
             client.close()
 

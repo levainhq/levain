@@ -412,3 +412,55 @@ def test_a_close_landing_while_the_stream_opens_closes_what_was_opened(store):  
     assert f.step().outcome == CC.CANCELLED
     t.join(5.0)
     assert not t.is_alive() and held.closed >= 1
+
+
+def _verifier_event_seq(rig) -> int:
+    [done] = [e for e in rig.kept("state") if e.get("session") == SESSION_V and "verifier_report_digest" in e]
+    return done["seq"]
+
+
+def test_a_close_while_an_event_is_handled_connects_no_ack_and_ends_cancelled(store, repo, served):  # noqa: F811
+    """RULINGS_OBS 16 (complement LOW B): close() from another thread while the step handles a verifier event (here
+    inside resolve, before the ACK): no ACK connection is made after close, nothing is acked, the step ends CANCELLED
+    and the cursor stays before the event, so the write converges on the next follower's re-delivery."""
+    d = setup_verifier(store, repo, served)
+    connects: list = []
+    f = None
+
+    def resolve(ev):
+        f.close()
+        return d.resolve(ev)
+
+    def connect():
+        connects.append(True)
+        return CC.ControlClient(served.path)
+
+    f = F.EventFollower(store, lambda after, jid: CC.follow_events(served.path, after, jid, read_deadline=0.5),
+                        connect, resolve)
+    assert f.step().outcome == CC.CANCELLED
+    assert connects == [] and not acked(served) and f._ack_client is None
+    assert [r.run for r in store.run_records(d.job.id)] == [0]
+    cur = store.event_cursor()
+    assert cur is None or cur[1] < _verifier_event_seq(served)
+
+
+def test_a_close_landing_during_the_ack_call_ends_the_step_cancelled(store, repo, served):  # noqa: F811
+    """RULINGS_OBS 16: close() closes the ACK connection while its call is in flight; the call then fails
+    control-down, and the step ends CANCELLED (the caller's close), never FollowStopped, the cursor before the event."""
+    d = setup_verifier(store, repo, served)
+    f = None
+
+    class ClosedUnder:
+        def call(self, *_a, **_k):
+            f.close()
+            raise Refused("control-down", "closed")
+
+        def close(self) -> None:
+            pass
+
+    f = F.EventFollower(store, lambda after, jid: CC.follow_events(served.path, after, jid, read_deadline=0.5),
+                        ClosedUnder, d.resolve)
+    assert f.step().outcome == CC.CANCELLED
+    assert not acked(served)
+    cur = store.event_cursor()
+    assert cur is None or cur[1] < _verifier_event_seq(served)
