@@ -224,9 +224,6 @@ def test_curl_signed_url_read_is_silent_and_pagination_names_are_not_credentials
     assert steps == {"silent"}, steps
 
 
-@pytest.mark.xfail(strict=True, reason="R15-12-B2 / R15-12-B10: K1 counts the signed-URL exemptions, but a lifted read's "
-                   "names are not stored (attempt.names holds the marked names only; classify's `tags` are not "
-                   "persisted), so the report cannot count them from the rows. Observation for S3a/S5a, not fixed in S9.")
 @pytest.mark.skipif(shutil.which("curl") is None, reason="curl is not installed on this machine")
 def test_k1_can_count_a_signed_url_exemption_from_the_rows(make_origin, make_launch_, tmp_path) -> None:
     origin = make_origin()
@@ -235,4 +232,4 @@ def test_k1_can_count_a_signed_url_exemption_from_the_rows(make_origin, make_lau
     assert L.stop() == 0
     from levain.chat_egress import report
     r = report.build_from_files(L.records.rows(L.launch_id), L.events)
-    assert r.signed_url_names.get("x-amz-signature") == 1
+    assert r.signed_url_names == {"x-amz-signature": 1, "x-amz-credential": 1}, r.signed_url_names
