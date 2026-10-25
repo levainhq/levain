@@ -48,7 +48,7 @@ from levain.chat_egress.parse import _canonical_path, canonical_host
 __all__ = ["ATTACH_VALUES", "AuthorityLiveness", "CredentialStore", "CredentialUnreadable", "KeyDecision",
            "KeychainStore", "LaunchCredentials", "LaunchRefused", "LivenessUnreadable", "Placement", "RouteSet", "RouteSnapshot",
            "build_route_set", "credential_placements", "decide_key", "lookup", "upload_pack_prefix",
-           "workspace_remote_urls", "workspace_repos"]
+           "workspace_remote_urls"]
 
 NOT_EVALUATED, LIVENESS_UNREADABLE, REVOKED, NONE, ATTACHED = (
     "not-evaluated", "liveness-unreadable", "revoked", "none", "attached")
@@ -185,7 +185,7 @@ def build_route_set(authority: Any, *, entity: str, now: datetime) -> RouteSet:
 
 def workspace_remote_urls(workspace: Path | str) -> tuple[str, ...]:
     """The workspace repo's own `remote.<name>.url` values (its local config only), or () when it is no repo. Read
-    by SETUP only (:func:`workspace_repos`), never by a launch (K-8): the sandbox can write this file."""
+    by SETUP only (`key_setup`), never by a launch (K-8): the sandbox can write this file."""
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_NOSYSTEM": "1",
            "GIT_CONFIG_GLOBAL": os.devnull, "HOME": os.devnull, "LC_ALL": "C"}
     try:
@@ -200,13 +200,6 @@ def workspace_remote_urls(workspace: Path | str) -> tuple[str, ...]:
         if b"\n" in entry:
             urls.append(entry.split(b"\n", 1)[1].decode("utf-8", "replace"))
     return tuple(urls)
-
-
-def workspace_repos(workspace: Path | str, host: str) -> tuple[str, ...]:
-    """The declared-repo paths the workspace's https remotes on canonical `host` (port 443) give, sorted and unique:
-    what `levain chat key setup` reads ONCE, shows and signs into the record (K-8). No launch calls this."""
-    return tuple(sorted({r for r in (_remote_repo(u, host) for u in workspace_remote_urls(workspace))
-                         if r is not None}))
 
 
 def credential_placements(snapshot_set: RouteSet) -> list[dict]:

@@ -637,8 +637,8 @@ def test_build_route_set_refuses_two_live_records_of_the_entity_for_one_host_onl
         _launch(ck, entity="other")
 
 
-def test_the_launch_reads_the_records_signed_repos_and_workspace_repos_reads_the_remotes(tmp_path):
-    """K-8: `workspace_repos` (SETUP's read) gives the https remotes on the host; the launch reads the record only."""
+def test_the_launch_reads_the_records_signed_repos_never_the_workspace_remotes(tmp_path):
+    """K-8: the launch reads the record's signed repos only; remotes added to the workspace later change nothing."""
     import subprocess
 
     ck = Cockpit(tmp_path)
@@ -649,7 +649,6 @@ def test_the_launch_reads_the_records_signed_repos_and_workspace_repos_reads_the
                "https://example.com:8443/o/port.git", "git@example.com:o/ssh.git", "https://other.example/o/x.git"]
     for i, url in enumerate(remotes):
         subprocess.run(["git", "-C", str(ws), "remote", "add", f"r{i}", url], check=True, timeout=30)
-    assert keys.workspace_repos(ws, "example.com") == ("/o/r.git", "/o/s")
     _create(ck, "ek-000000000001", repos=("/added.git", "/o/r.git", "/o/s"))
     subprocess.run(["git", "-C", str(ws), "remote", "add", "late", "https://example.com/o/late.git"], check=True,
                    timeout=30)

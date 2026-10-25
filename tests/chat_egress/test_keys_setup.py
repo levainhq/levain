@@ -21,11 +21,6 @@ from .keys_rig import KEY, SOURCE, Cockpit, artifact_hits, record
 
 ACCOUNT = "levain-chat-test-account"
 
-# F5: a setup record now carries the keychain item's `account`; the record kind gains that field on lane A's branch.
-# Every test that SIGNS a setup record (setup_key reaching prepare) needs that schema and skips until the merge.
-NEEDS_LANE_A = pytest.mark.skipif("account" not in auth._EGRESS_KEY_FIELDS,
-                                  reason="needs seat/1024-20-chd2-s6-fixa schema")
-
 
 class FakeKeychain:
     """The keychain-item check a test hands setup: how many items match (service, account), and every ask kept.
@@ -65,7 +60,6 @@ def _live(ck):
 
 # --- the record kind ---------------------------------------------------------------------------------------------
 
-@NEEDS_LANE_A
 def test_a_setup_record_is_a_laptop_signed_create_and_replays_as_its_kind(ck):
     rec, warning = _setup(ck, host="Example.COM.")
     assert warning is None
@@ -95,7 +89,6 @@ def test_a_record_lives_at_most_30_days_so_an_older_levain_holds_it_inert(ck):
 
 # --- R15-21-4 / R15-21-6: one live record per (entity, canonical host) -----------------------------------------
 
-@NEEDS_LANE_A
 def test_r15_21_4_a_second_live_record_for_one_host_is_refused_at_setup(ck):
     first, _ = _setup(ck)
     with pytest.raises(key_setup.SetupRefused, match="already has a live setup record"):
@@ -103,7 +96,6 @@ def test_r15_21_4_a_second_live_record_for_one_host_is_refused_at_setup(ck):
     assert _live(ck) == [first["id"]]
 
 
-@NEEDS_LANE_A
 def test_r15_21_6_example_com_dot_while_Example_com_is_live_is_refused_at_setup(ck):
     first, _ = _setup(ck, host="Example.com")
     with pytest.raises(key_setup.SetupRefused, match="already has a live setup record"):
@@ -118,7 +110,6 @@ def test_r15_21_4_the_log_itself_refuses_a_second_live_record_at_append(ck):
         ck.link({"op": "create_grant", "grant": record("ek-00000000000b", "example.com", repos=("/b.git",))})
 
 
-@NEEDS_LANE_A
 def test_another_entity_or_host_is_its_own_record(ck):
     a, _ = _setup(ck)
     b, _ = _setup(ck, entity="other")
@@ -126,7 +117,6 @@ def test_another_entity_or_host_is_its_own_record(ck):
     assert _live(ck) == sorted([a["id"], b["id"], c["id"]])
 
 
-@NEEDS_LANE_A
 def test_r15_21_4_a_supersession_leaves_exactly_one_live_record_after_its_one_write(ck):
     old, _ = _setup(ck)
     seq_before = ck.state().seq
@@ -156,7 +146,6 @@ def test_r15_21_4_codex_case_cannot_be_made_live_and_a_store_holding_both_refuse
     assert "h.example" in str(exc.value)
 
 
-@NEEDS_LANE_A
 def test_an_expired_record_is_not_live_and_does_not_block_a_new_one(ck):
     ck.link({"op": "create_grant", "grant": record("ek-0000000000ee", "example.com", days=1)})
     later = datetime.now(timezone.utc) + timedelta(days=2)              # the old record has expired by then
@@ -168,7 +157,6 @@ def test_an_expired_record_is_not_live_and_does_not_block_a_new_one(ck):
 
 # --- revoke beside it --------------------------------------------------------------------------------------------
 
-@NEEDS_LANE_A
 def test_revoke_removes_the_record(ck):
     rec, _ = _setup(ck)
     seq, warning = key_setup.revoke_key(ck.root, rec["id"], **ck.kw())
@@ -189,7 +177,6 @@ def test_revoke_refuses_a_consent_grant_id(ck, tmp_path):
 
 # --- the CLI ------------------------------------------------------------------------------------------------------
 
-@NEEDS_LANE_A
 def test_cli_setup_list_revoke(ck, capsys, tmp_path, one_item):
     base = ["--data-root", str(ck.root)]
     assert main(["chat", "key", "setup", "--entity", "ent", "--host", "Example.COM.", "--source", SOURCE,
@@ -238,7 +225,6 @@ def _git(*args):
     subprocess.run(["git", *args], check=True, capture_output=True, timeout=30)
 
 
-@NEEDS_LANE_A
 def test_k8_a_git_config_rewritten_after_setup_adds_no_declared_repo(ck, tmp_path):
     """Setup (Phill present) reads the workspace's remotes ONCE and signs them into the record. The sandbox can write
     the workspace's `.git/config`; a rewrite after setup (origin moved to B, a second remote C) declares nothing: the
@@ -273,7 +259,6 @@ def _setup_records(ck):
     return sorted(g["id"] for g in ck.state().policy.grants.values() if auth.egress_key_record(g))
 
 
-@NEEDS_LANE_A
 def test_f6_confirm_is_asked_before_the_append_and_what_is_signed_is_what_was_shown(ck, tmp_path, monkeypatch):
     ws = _ws(tmp_path, ("origin", "https://example.com/o/a.git"))
     reads = []
@@ -295,7 +280,6 @@ def test_f6_confirm_is_asked_before_the_append_and_what_is_signed_is_what_was_sh
     assert len(reads) == 1
 
 
-@NEEDS_LANE_A
 def test_f6_no_appends_nothing(ck):
     seq_before = ck.state().seq
     with pytest.raises(key_setup.SetupDeclined, match="nothing was signed"):
@@ -317,7 +301,6 @@ def test_f6_the_preview_names_every_remote_on_the_host_it_left_out(tmp_path):
     assert "8443" in why["https://example.com:8443/o/q.git"] and "no repo path" in why["https://example.com/"]
 
 
-@NEEDS_LANE_A
 def test_f6_cli_no_on_a_terminal_appends_nothing_and_the_prompt_follows_the_listing(ck, capsys, monkeypatch,
                                                                                     tmp_path, one_item):
     ws = _ws(tmp_path, ("origin", "https://example.com/o/a.git"), ("ssh", "git@example.com:o/s.git"))
@@ -340,7 +323,6 @@ def test_f6_cli_no_on_a_terminal_appends_nothing_and_the_prompt_follows_the_list
     assert ck.state().seq == seq_before and _setup_records(ck) == []
 
 
-@NEEDS_LANE_A
 def test_f6_cli_yes_on_a_terminal_signs(ck, capsys, monkeypatch, one_item):
     monkeypatch.setattr("sys.stdin", type("Tty", (), {"isatty": staticmethod(lambda: True)})())
     monkeypatch.setattr("builtins.input", lambda prompt: "y")
@@ -350,7 +332,6 @@ def test_f6_cli_yes_on_a_terminal_signs(ck, capsys, monkeypatch, one_item):
     assert len(_setup_records(ck)) == 1
 
 
-@NEEDS_LANE_A
 def test_f6_cli_not_a_terminal_without_yes_signs_nothing(ck, capsys, one_item):
     seq_before = ck.state().seq
     assert main(["chat", "key", "setup", "--entity", "ent", "--host", "example.com", "--source", SOURCE,
@@ -360,7 +341,6 @@ def test_f6_cli_not_a_terminal_without_yes_signs_nothing(ck, capsys, one_item):
     assert ck.state().seq == seq_before
 
 
-@NEEDS_LANE_A
 def test_f6_cli_has_no_workspace_default_and_says_so(ck, capsys, monkeypatch, tmp_path, one_item):
     """Run from inside a repo whose origin is on the host: without --workspace nothing of it is read or declared."""
     ws = _ws(tmp_path, ("origin", "https://example.com/o/a.git"))
@@ -388,7 +368,6 @@ def test_f6_a_remote_cannot_draw_a_line_of_its_own_in_the_preview(capsys):
 
 # --- F5: the keychain item is service AND account, and exactly one item --------------------------------------------
 
-@NEEDS_LANE_A
 def test_f5_the_record_carries_the_account_beside_the_service(ck):
     kc = FakeKeychain(1)
     rec, _ = _setup(ck, keychain=kc)
@@ -438,7 +417,6 @@ def test_f5_the_keychain_check_reads_attributes_only_and_counts_per_keychain(tmp
 
 # --- F7: a replace built on a snapshot the log has moved past is refused ------------------------------------------
 
-@NEEDS_LANE_A
 def test_f7_a_replace_does_not_undo_a_link_appended_after_its_snapshot(ck, monkeypatch):
     """Reproduced on 151ddfe4: the replace's full-policy loosen, built from the captured snapshot, chained onto the
     newer head and dropped the grant created in between."""
@@ -465,7 +443,6 @@ def test_f9_an_expiry_not_after_now_is_refused(ck, delta):
         _setup(ck, expires=now + delta, clock=lambda: now)
 
 
-@NEEDS_LANE_A
 def test_f9_a_replace_with_a_past_expiry_does_not_drop_the_live_record(ck):
     """Reproduced on 151ddfe4: the log refuses a past expiry on create_grant, but a replace's loosen took it and the
     live record was superseded by a dead one."""
