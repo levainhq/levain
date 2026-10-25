@@ -39,7 +39,7 @@ from levain.slot import store_verbs as SV
 from levain.slot.grammar import SESSION_RE
 from levain.slot.ids import SlotId
 from levain.slot.layout import RESERVE_BYTES, RUN, Row, base_run_rows, slot_run_rows
-from levain.slot.root_intent import fsync_dir, pending_sessions
+from levain.slot.root_intent import fsync_dir, pending_sessions, read_root_intent
 
 #: CONTRACT §11 V11: the pass worker's tick, and the revoker's when no front kill is pending.
 V11_S = 60.0
@@ -621,13 +621,21 @@ class Reaper:
         exists (the operator restored it: his, never auto-trashed again). The record is read as a HINT (§7.1); a forged
         ``artifact_acked`` can only move a dispatch session to TRASH early, from where it is restorable until purge. A
         busy session (``session-busy``) or any other refusal is skipped for the next pass; a retained object with no
-        readable ``retained_at`` is never trashed by age (``no-retained-at``)."""
+        readable ``retained_at`` is never trashed by age (``no-retained-at``).
+
+        A TRASH dispatch session whose ``discard`` journal is still on disk (the discard stopped between its CAS and
+        the journal's delete) has that journal finished (L3 r1 fix 8: ``reconciled``)."""
         allocs = self._allocs(ctx)
         days: Optional[int] = None
         now = R.epoch_of(R.timestamp(self.seams.clock()))
         for s, rec in self._records(ctx).items():
             a = allocs.get(s)
-            if rec.state != R.RETAINED or a is None or a.ticket is None:
+            if a is None or a.ticket is None:
+                continue
+            if rec.state == R.TRASH:
+                self._finish_discard(ctx, a, rep)
+                continue
+            if rec.state != R.RETAINED:
                 continue
             with self.item(rep, f"retain:{s}"):
                 facts = SV.facts_from_alloc(a, self.seams.L)
@@ -650,6 +658,18 @@ class Reaper:
                     rep["skipped"].append(f"retain:{s}:{e.name}")            # type: ignore[union-attr]
                     continue
                 rep["trashed"].append(s)                                      # type: ignore[union-attr]
+
+    def _finish_discard(self, ctx: H.Ctx, a: R.Alloc, rep: Dict[str, object]) -> None:
+        facts = SV.facts_from_alloc(a, self.seams.L)
+        if not os.path.lexists(facts.intent):
+            return
+        with self.item(rep, f"retain:{a.session}:finish"):
+            ri = read_root_intent(facts.intent, owner_ok=self.seams.trusted)
+            if ri is None or ri.intent != "discard":
+                return                                   # another verb's journal: its own caller finishes it
+            SV.reconcile_store(facts, SV.StoreSeams(cas=SV.control_cas(ctx, a.session), owner_ok=self.seams.trusted,
+                                                    now=lambda: R.timestamp(self.seams.clock())))
+            rep["reconciled"].append(a.session)                              # type: ignore[union-attr]
 
     # -- step 4: BRAKE below V5 (§7.7 4) -------------------------------------------------------------------------------
 

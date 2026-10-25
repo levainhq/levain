@@ -171,3 +171,19 @@ def test_a_restore_between_the_decision_and_the_discard_is_never_trashed(rw, mon
     assert fired["done"]
     assert rep["trashed"] == [] and rep["skipped"] == [f"retain:{S}:restored"]
     assert rw.where(S) == (R.RETAINED, ["retained"]) and (rw.L / "retained" / S / "restored_at").exists()
+
+
+def test_a_discard_stopped_between_its_cas_and_its_journal_delete_is_finished(rw):
+    """RULINGS_OBS / L3 r1 fix 8: the record is TRASH (the CAS landed) and the discard's journal is still at `commit`
+    (the stop came before its delete). The pass finishes that journal: the delete runs, nothing moves back."""
+    from levain.slot import root_intent as RI
+
+    rw.record(artifact_acked=True)
+    assert rw.step()["trashed"] == [S]
+    journal = rw.L / "alloc" / f"{S}.intent.json"
+    RI.write_root_intent(journal, RI.RootIntent("discard", "commit", "2026-10-01T00:00:00Z"))
+    calls = len(rw.control.calls)
+    rep = rw.step()
+    assert not journal.exists() and rep["reconciled"] == [S] and rep["skipped"] == []
+    assert rw.where(S) == (R.TRASH, ["trash"]) and len(rw.control.calls) == calls   # the CAS was already done
+    assert rw.step()["reconciled"] == []
