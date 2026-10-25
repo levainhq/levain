@@ -117,7 +117,8 @@ _PICKED = ("(() => { const c = document.querySelector('.req.sign.linked'); if (!
            "return { top: t ? t.textContent : null, topAbove: !!t && !!(t.compareDocumentPosition("
            "c.querySelector('pre.display')) & 4), picked: p ? { button: p.querySelector('button').textContent, "
            "line: p.querySelector('.line').textContent, words: p.querySelector('.why').textContent } : null, "
-           "miss: m ? m.textContent : null, options: c.querySelectorAll('.actions .option').length, "
+           "miss: m ? m.textContent : null, missTop: !!m && m.previousElementSibling === c.querySelector('.req-head'), "
+           "options: c.querySelectorAll('.actions .option').length, "
            "shownAbove: !!p && !!(c.querySelector('pre.display').compareDocumentPosition(p) & 4), "
            "first: document.getElementById('requests').firstChild === c }; })()")
 
@@ -265,6 +266,7 @@ def test_a_pick_the_card_does_not_offer_draws_nothing_and_says_so(tmp_path: Path
         shown = {"z": "z", "%2A": "*", "%3Cb%3E": "<b>", "a": "a"}[pick]
         assert s["picked"] is None and s["miss"] == f"the option in the link ({shown}) is not on this card: pick one below", s
     assert seen[0]["options"] == 3 and seen[3]["options"] == 0      # two options and the write-in
+    assert all(s["missTop"] for s in seen), seen                    # under the card's head, on the first screen
     assert not [p for p in got["posts"] if "/challenge " in p]
 
 
@@ -368,6 +370,8 @@ def test_a_pick_made_on_an_earlier_version_of_the_item_draws_no_shortcut(tmp_pat
     assert seen[1]["picked"] is None and seen[1]["miss"] == \
         "the link does not say which version of this item you tapped: read it and pick below", seen
     assert seen[0]["options"] == 2 and seen[1]["options"] == 2
+    # head ruling on r1: the line is the card's first block under its head, so the first screen says the tap was not carried
+    assert seen[0]["missTop"] and seen[1]["missTop"], seen
 
 
 @needs_browser

@@ -517,7 +517,8 @@
       // appends under it (the listing's, then the challenge's own), drawn under the message so the item is read before
       // the tap, and one line at the card's top saying so. The tap is the gesture: Face ID is never started on load.
       // Every option below still signs on its own tap. The pick holds only on the version he tapped it on: a link
-      // without one, or a request changed since, draws no button, only a line
+      // without one, a request changed since, or a key the card does not offer draws no button, only a line in that
+      // same top slot, so the first screen always says whether his tap was carried
       const isLinked = !!focus && r.id === focus;
       const sameV = !!pickV && typeof r.sha256 === "string" && r.sha256.slice(0, 16) === pickV;
       const po = isLinked && pick && sameV && /^[a-z0-9]{1,8}$/.test(pick) ? options.find((o) => o.key === pick) : null;
@@ -541,9 +542,9 @@
         block.append(pb, pl, el("div", "why", "you picked (" + po.key + ") on your phone; any other option below still signs instead"), echo);
         card.appendChild(block);
       } else if (isLinked && pick) {
-        card.appendChild(el("div", "where pick-miss", !pickV ? "the link does not say which version of this item you tapped: read it and pick below"
+        card.insertBefore(el("div", "where pick-miss", !pickV ? "the link does not say which version of this item you tapped: read it and pick below"
           : !sameV ? "this item changed since your tap: read it and pick again"
-          : "the option in the link (" + pick.slice(0, 24) + ") is not on this card: pick one below"));
+          : "the option in the link (" + pick.slice(0, 24) + ") is not on this card: pick one below"), head.nextSibling);
       }
       if (!options.length) {
         const b = el("button", "allow", "sign with Face ID");
