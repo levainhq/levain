@@ -8,6 +8,9 @@
      `ACCEPTED_NODE_MAJORS` (R15-17-4: the probe suite has passed on 26 only), else refused naming the version;
   4. srt: the package at `srt_dist` must say version `SRT_VERSION` (R15-10-R2 (4); the install-time vendor check of
      its import names is not this module's);
+  4a. the mode read once (`launch_mode`): a value outside `classify.MODES` is refused. The session header and the
+     egress digest are derived from that read, never from a second input (the digest fixes the mode at launch; a
+     `LiveSetting` is still read live per request by the decider: Q-R15-9);
   5. the listener pair: the HTTP(S) listener (handed to the glue as an fd) and the SOCKS refuser (`socks`), both on
      127.0.0.1; the decider and observation socket pairs, the CA pipe and the lifeline pipe;
   6. the glue spawned with `env={}` (R15-10-A10, R15-12-B6) and only those fds; the CA (key + cert PEM, held by the
@@ -43,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from levain.chat_egress import advert, keys, renew, strip
+from levain.chat_egress import advert, classify, keys, renew, strip
 from levain.chat_egress import decider as dm
 from levain.chat_egress import records as rec
 from levain.chat_egress.resolver import Resolver, system_lookup
@@ -123,6 +126,15 @@ def srt_version(srt_dist: Path) -> str | None:
         return None
 
 
+def launch_mode(mode: Any) -> str:
+    """The launch's mode, read once from the decider's own setting (`Fixed` / `LiveSetting`): the one home of
+    `open network` for the header and the digest. A value outside `classify.MODES` is refused."""
+    got = mode.get()
+    if got not in classify.MODES:
+        raise EgressRefused(f"not a chat network mode: {got!r} (one of {', '.join(classify.MODES)})")
+    return got
+
+
 def session_header(*, open_network: bool, node_version: str) -> tuple[str, ...]:
     """The launch's session header lines (item 8, R15-18-Q4, R15-10-A1)."""
     lines = (OPEN_NETWORK_LINE,) if open_network else ()
@@ -173,7 +185,7 @@ class StopResult:
 
 
 def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, events: Path, ca_pem: bytes, routes: Any,
-                 liveness: Any, credentials: Any, cards: Any, mode: Any, open_network: bool,
+                 liveness: Any, credentials: Any, cards: Any, mode: Any,
                  limits: dm.Limits = dm.Limits(), seams: TestSeams | None = None, authority: Any = None,
                  on_renew_due: Callable[[str, list[renew.RenewDue]], None] | None = None,
                  now: datetime | None = None) -> EgressLaunch:
@@ -184,6 +196,7 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, event
     if srt_version(srt_dist) != SRT_VERSION:
         raise EgressRefused(f"chat network needs @anthropic-ai/sandbox-runtime {SRT_VERSION}; {srt_dist} is "
                             f"{srt_version(srt_dist)!r}")
+    open_network = launch_mode(mode) == classify.OPEN_NETWORK
     events = Path(events)
     records = rec.EgressRecords(store)
     lsock = socket.socket()

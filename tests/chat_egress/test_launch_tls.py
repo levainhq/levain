@@ -124,7 +124,7 @@ def _start(tmp: Path, port: int, monkeypatch, *, node: str, extra: tuple[str, ..
                         srt_dist=envmod.srt_package_dir() / "dist" / "sandbox", events=tmp / "events.jsonl",
                         ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([]), liveness=Live(),
                         credentials=keys.LaunchCredentials(NoStore()), cards=Desk(), mode=dm.Fixed(classify.GATED),
-                        open_network=False, limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0), seams=seams)
+                        limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0), seams=seams)
     return e, cert_pem
 
 

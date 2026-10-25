@@ -176,7 +176,7 @@ class Origin:
 
 
 def _start(tmp: Path, origin: Origin, monkeypatch, *, open_network: bool = False, launch_id: str | None = None,
-           store: EnvelopeStore | None = None, node: str | None = None):
+           store: EnvelopeStore | None = None, node: str | None = None, mode=None, cards=None):
     monkeypatch.setenv(lm.TEST_SEAMS_ENV, "1")
     store = store or EnvelopeStore(tmp / "dispatch")
     lid = launch_id or real_launch(store)
@@ -188,9 +188,9 @@ def _start(tmp: Path, origin: Origin, monkeypatch, *, open_network: bool = False
     return lm.start_egress(store=store, launch_id=lid, node=node or envmod.node_bin(),
                            srt_dist=envmod.srt_package_dir() / "dist" / "sandbox", events=tmp / "events.jsonl",
                            ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([]), liveness=Live(),
-                           credentials=keys.LaunchCredentials(NoStore()), cards=Desk(),
-                           mode=dm.Fixed(classify.OPEN_NETWORK if open_network else classify.GATED),
-                           open_network=open_network, limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),
+                           credentials=keys.LaunchCredentials(NoStore()), cards=cards or Desk(),
+                           mode=mode or dm.Fixed(classify.OPEN_NETWORK if open_network else classify.GATED),
+                           limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),
                            seams=seams)
 
 
@@ -293,7 +293,7 @@ def test_production_launch_refuses_seams_before_spawning(tmp_path, origin, monke
                         srt_dist=envmod.srt_package_dir() / "dist" / "sandbox", events=tmp_path / "ev.jsonl",
                         ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([]), liveness=Live(),
                         credentials=keys.LaunchCredentials(NoStore()), cards=Desk(), mode=dm.Fixed(classify.GATED),
-                        open_network=False, seams=lm.TestSeams(glue_args=("--carve", "127.0.0.1:1")))
+                        seams=lm.TestSeams(glue_args=("--carve", "127.0.0.1:1")))
     assert not (tmp_path / "ev.jsonl").exists()
 
 
@@ -307,6 +307,36 @@ def test_open_network_launch_carries_the_opt_out_header_and_its_digest(tmp_path,
     finally:
         out = lm.stop_egress(e)
     assert out.glue_exit == 0 and out.final_flush["total"] == 0
+
+
+@pytest.mark.chat_egress_srt
+def test_the_header_and_digest_follow_the_mode_one_home(tmp_path, origin, monkeypatch) -> None:
+    """RULINGS_R1 item 1: the mode is the one home of open network; the header and digest are read from it."""
+    for name, mode in (("fixed", dm.Fixed(classify.OPEN_NETWORK)),
+                       ("live", dm.LiveSetting(lambda: classify.OPEN_NETWORK))):
+        (tmp_path / name).mkdir()
+        e = _start(tmp_path / name, origin, monkeypatch, mode=mode)
+        try:
+            assert e.header[0] == lm.OPEN_NETWORK_LINE and e.header[-1] == "write_prompting: off", (name, e.header)
+            assert e.egress_digest == lm.egress_digest(open_network=True), name
+        finally:
+            lm.stop_egress(e)
+    (tmp_path / "gated").mkdir()
+    e = _start(tmp_path / "gated", origin, monkeypatch, mode=dm.Fixed(classify.GATED))
+    try:
+        assert lm.OPEN_NETWORK_LINE not in e.header and e.egress_digest == lm.egress_digest(open_network=False)
+    finally:
+        lm.stop_egress(e)
+
+
+@pytest.mark.chat_egress_srt
+def test_a_mode_outside_the_known_modes_is_refused_before_anything_spawns(tmp_path, origin, monkeypatch) -> None:
+    before = {p.pid for p in _node_children()}
+    (tmp_path / "x").mkdir()
+    with pytest.raises(lm.EgressRefused) as ei:
+        _start(tmp_path / "x", origin, monkeypatch, mode=dm.Fixed("open"))
+    assert "'open'" in str(ei.value)
+    assert {p.pid for p in _node_children()} == before and not (tmp_path / "x" / "events.jsonl").exists()
 
 
 def _node_children():

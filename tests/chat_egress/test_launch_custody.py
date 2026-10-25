@@ -118,7 +118,7 @@ def test_twenty_leaves_minted_leave_no_private_key_on_disk_or_open(tmp_path, mon
                         srt_dist=envmod.srt_package_dir() / "dist" / "sandbox", events=state / "events.jsonl",
                         ca_pem=a.glue_pem(), routes=keys.RouteSet.of([]), liveness=Live(),
                         credentials=keys.LaunchCredentials(NoStore()), cards=Desk(), mode=dm.Fixed(classify.GATED),
-                        open_network=False, limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),
+                        limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),
                         seams=lm.TestSeams(glue_args=("--resolve-map", ";".join(f"{h}=127.0.0.1" for h in HOSTS)),
                                            lookup=Lookup()))
     bundle = None
