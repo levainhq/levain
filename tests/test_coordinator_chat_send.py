@@ -536,7 +536,9 @@ def test_the_window_ends_at_the_next_attempt(cs, world):
     svc.ingest(world["launch"], s.read("00000001"))
     assert svc.candidates(r2.message_id) == ["user_item:v00000002"]
     assert states(cs, r2.message_id)[-1] == "ambiguous"
-    assert states(cs, r1.message_id)[-1] == "not_delivered"               # the echo lies past r2's anchor
+    assert svc.candidates(r1.message_id) == []                             # the echo lies past r2's anchor
+    # and it carries r1's words too, so it is no evidence r1 was passed over (L3 r1 F2): r1 stays yours to mark
+    assert states(cs, r1.message_id)[-1] == "ambiguous"
 
 
 def test_an_item_resolved_to_another_send_is_no_candidate(cs, world):
@@ -551,8 +553,12 @@ def test_an_item_resolved_to_another_send_is_no_candidate(cs, world):
 
 def test_reconciliation_reads_no_gseq():
     # §7.1: no Levain gseq is vendor evidence; the window and the match compare positions through pos_lt only
-    for fn in (ChatService._window, ChatService._reconcile, ChatService._prove):
+    for fn in (chat._window, chat._absent, chat._next_anchor, chat._inside, chat._untaken, ChatService._reconcile,
+               ChatService._prove, ChatService.candidates):
         assert "gseq" not in inspect.getsource(fn)
+    # the one read that names it orders the service's own attempts among themselves, never against a vendor position
+    assert inspect.getsource(chat._launch_read).count("gseq") == 1 and "ORDER BY o.gseq" in inspect.getsource(
+        chat._launch_read)
 
 
 # --- the read: events + cursor in one transaction; backfill ---------------------------------------------------------
@@ -589,19 +595,21 @@ class _ExceptionNotDelivered(ChatService):
         try:
             session.send(command)
         except Exception:  # noqa: BLE001
-            return "not_delivered", "broken", None, None
-        return "accepted", "ok", "t", "i"
+            return "not_delivered", "broken", None, None, None
+        return "accepted", "ok", "t", "i", None
 
 
 class _DigestAccepts(ChatService):
-    def _reconcile(self, conn, now, launch_id, session):
-        for (mid,) in conn.execute("SELECT message_id FROM chat_messages").fetchall():
-            if chat.outbox_state(conn, mid) == "ambiguous" and self._window(conn, launch_id, mid, session)[1]:
-                chat.outbox_step(conn, now, mid, "accepted", cause="digest")
+    def _reconcile(self, launch_id, session, correlated):
+        read = self._chat._read(lambda conn: chat._launch_read(conn, launch_id))
+        with self._chat._write() as (conn, now):
+            for att in read.attempts:
+                if att.state == "ambiguous" and chat._window(read, att, session.pos_lt):
+                    chat.outbox_step(conn, now, att.message_id, "accepted", cause="digest")
 
 
 class _NoFenceAtAttempt(ChatService):
-    def _attempt_and_call(self, m, session, owner):
+    def _attempt_and_call(self, m, session, caps, owner):
         with self._chat._write() as (conn, now):
             chat.outbox_step(conn, now, m.message_id, "attempted", cause="attempt", op_id="op-broken",
                              vendor_anchor=chat._anchor(conn, m.launch_id))

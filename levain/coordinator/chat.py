@@ -20,7 +20,8 @@ first (§2.3; that is ``vendor_pos``, in the driver's own order).
 CH-D1b (rev 6 §2.7, §4.2, §6, §7.1-§7.4) adds ``chat_launch_checks`` and its latched fold (:func:`liveness`), and
 :class:`ChatService`, which walks the send path (preflight + ``pending``, the one attempt, the driver call, its outcome),
 the crash rule on restart, the vendor read (events and cursor in one transaction) and the ambiguous reconciliation
-over :class:`~levain.coordinator.driver.DriverSession` s that decide nothing.
+over :class:`~levain.coordinator.driver.DriverSession` s that decide nothing, plus ``chat_anomalies``: a proof that
+arrived after its send's record was terminal, kept beside the record it contradicts.
 
 NOT HERE: CH-D1c's ``chat_approvals`` and ``chat_approval_events`` (the view's seam for them is named in
 :data:`CHAT_SCHEMA`, "SEAM CH-D1c"), and CH-D1b's later slices: ``chat_echoes`` and the outside-epoch trigger (§5.4,
@@ -36,6 +37,7 @@ import json
 import re
 import secrets
 import sqlite3
+import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -98,6 +100,8 @@ _EDGE_SQL = " OR ".join(
        # only an ambiguous send is resolved by you (§7.4); every other step is the service's
        f"(NEW.by = 'operator' AND {_LATEST_OUTBOX} IS NOT 'ambiguous')"])
 
+# what a chat_anomalies row records: a proof (the vendor echoing a send's op_id) after the send's record was terminal
+ANOMALY_KINDS = ("proof_after_terminal",)
 CHECK_KINDS = ("probing", "live", "not_live", "reenabled")
 # where a check row came from (§2.7; "tripwire:<name>" too, on not_live rows only)
 CHECK_SOURCES = ("activation", "turn_start", "send", "result", "operator")
@@ -181,6 +185,17 @@ CHAT_SCHEMA: tuple[str, ...] = (
     "WHEN NEW.seq != COALESCE((SELECT MAX(seq) FROM chat_cursors WHERE launch_id = NEW.launch_id), 0) + 1 "
     "OR EXISTS (SELECT 1 FROM chat_cursors WHERE rowid = NEW.rowid OR gseq = NEW.gseq) "
     "BEGIN SELECT RAISE(ABORT, 'a cursor is the next seq of its launch'); END",
+    # CH-D1b: vendor evidence that contradicts a send's terminal record. The record is never rewritten; the
+    # contradiction is kept beside it
+    "CREATE TABLE IF NOT EXISTS chat_anomalies (launch_id TEXT NOT NULL REFERENCES launches(launch_id), "
+    "seq INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, message_id TEXT REFERENCES chat_messages(message_id), "
+    f"vendor_event_key TEXT NOT NULL, kind TEXT NOT NULL CHECK ({_in('kind', ANOMALY_KINDS)}), "
+    "detail TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (launch_id, seq))",
+    *_append_only("chat_anomalies", "a chat anomaly"),
+    "CREATE TRIGGER IF NOT EXISTS chat_anomalies_next BEFORE INSERT ON chat_anomalies "
+    "WHEN NEW.seq != COALESCE((SELECT MAX(seq) FROM chat_anomalies WHERE launch_id = NEW.launch_id), 0) + 1 "
+    "OR EXISTS (SELECT 1 FROM chat_anomalies WHERE rowid = NEW.rowid OR gseq = NEW.gseq) "
+    "BEGIN SELECT RAISE(ABORT, 'an anomaly is the next seq of its launch'); END",
     # §2.7 (CH-D1b): the liveness state machine's inputs. The service writes probing / live / not_live from its own
     # verdict over raw evidence; only you write reenabled, and only over a latch whose latest probe read live (§4.2)
     "CREATE TABLE IF NOT EXISTS chat_launch_checks (launch_id TEXT NOT NULL REFERENCES launches(launch_id), "
@@ -755,11 +770,47 @@ class SendReceipt:
     created: bool             # False: a resend of a stored outbox_id; nothing was sent again
 
 
+@dataclass(frozen=True)
+class Anomaly:
+    """Vendor evidence that contradicts a send's terminal record (a ``chat_anomalies`` row). The record stands as
+    written; this is kept beside it."""
+    launch_id: str
+    seq: int
+    message_id: str | None
+    vendor_event_key: str
+    kind: str
+    detail: str
+    at: str
+
+
+def record_anomaly(conn: sqlite3.Connection, now: str, *, launch_id: str, message_id: str | None, key: str,
+                   kind: str, detail: str) -> int:
+    """One ``chat_anomalies`` row in the caller's transaction; its seq."""
+    _worker_launch(conn, launch_id)
+    if kind not in ANOMALY_KINDS:
+        raise CoordError(f"an anomaly is one of {', '.join(ANOMALY_KINDS)}")
+    _line("a vendor event key", key)
+    seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_anomalies WHERE launch_id = ?",
+                       (launch_id,)).fetchone()[0]
+    conn.execute("INSERT INTO chat_anomalies (launch_id, seq, gseq, message_id, vendor_event_key, kind, detail, at) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (launch_id, seq, next_gseq(conn, now), message_id, key, kind, _cause_text(detail), now))
+    return seq
+
+
 def _cause_text(text: object) -> str:
     """A cause row's text: one line of at most :data:`_CAUSE_MAX` characters, never refused for its shape."""
     flat = " ".join(str(text).split()) or "no reason given"
     flat = "".join(c if c.isprintable() else "?" for c in flat)
     return flat[:_CAUSE_MAX]
+
+
+def _said(exc: BaseException) -> str:
+    """An exception's text, or a stand-in when its ``__str__`` itself raises."""
+    try:
+        return str(exc)
+    except Exception:  # noqa: BLE001 - a driver's exception is untrusted down to its text
+        return "(its message could not be read)"
 
 
 def _latest_row(conn: sqlite3.Connection, message_id: str) -> tuple[str, str] | None:
@@ -774,33 +825,240 @@ def _launch_state(conn: sqlite3.Connection, launch_id: str) -> tuple[str | None,
     return (None, None, None) if row is None else row
 
 
+def _anchor(conn: sqlite3.Connection, launch_id: str) -> str | None:
+    """The launch's latest persisted ``complete_through``: every vendor event up to it is recorded, so a window that
+    starts here misses nothing the vendor showed after the send. :meth:`ChatService.ingest` never persists one that
+    moves back, so the latest is also the furthest."""
+    row = conn.execute("SELECT complete_through FROM chat_cursors WHERE launch_id = ? AND complete_through IS NOT "
+                       "NULL ORDER BY seq DESC LIMIT 1", (launch_id,)).fetchone()
+    return None if row is None else row[0]
+
+
 def _attempt(conn: sqlite3.Connection, message_id: str) -> tuple[str, str] | None:
     """``(op_id, vendor_anchor)`` of the message's one attempt, or None."""
     return conn.execute("SELECT op_id, vendor_anchor FROM chat_outbox_events WHERE message_id = ? AND "
                         "state = 'attempted'", (message_id,)).fetchone()
 
 
-def _anchor(conn: sqlite3.Connection, launch_id: str) -> str | None:
-    """The launch's latest persisted ``complete_through``: every vendor event up to it is recorded, so a window that
-    starts here misses nothing the vendor showed after the send."""
+def _first_through(conn: sqlite3.Connection, launch_id: str) -> str | None:
+    """The launch's first persisted ``complete_through``: an event at or before it is backfill."""
     row = conn.execute("SELECT complete_through FROM chat_cursors WHERE launch_id = ? AND complete_through IS NOT "
-                       "NULL ORDER BY seq DESC LIMIT 1", (launch_id,)).fetchone()
+                       "NULL ORDER BY seq LIMIT 1", (launch_id,)).fetchone()
     return None if row is None else row[0]
+
+
+def _fingerprint(conn: sqlite3.Connection, launch_id: str) -> tuple[int, int, int]:
+    """The launch's latest cursor seq, its attempt count and its event count. Each only grows, so an equal
+    fingerprint means no cursor, attempt or vendor event of the launch was written in between."""
+    return tuple(conn.execute(
+        "SELECT (SELECT COALESCE(MAX(seq), 0) FROM chat_cursors WHERE launch_id = ?), (SELECT COUNT(*) FROM "
+        "chat_outbox_events o JOIN chat_messages m ON m.message_id = o.message_id WHERE m.launch_id = ? AND "
+        "o.state = 'attempted'), (SELECT COUNT(*) FROM chat_events WHERE launch_id = ?)",
+        (launch_id, launch_id, launch_id)).fetchone())
+
+
+@dataclass(frozen=True)
+class _Attempt:
+    message_id: str
+    op_id: str
+    anchor: str
+    norm: str                 # the message's body_norm_sha256
+    state: str                # the message's latest outbox state
+    item: str | None          # the vendor item its accepted row names, if any
+
+
+@dataclass(frozen=True)
+class _Item:
+    key: str                  # a recorded, non-backfill user_item's vendor event key
+    pos: str
+    norm: str
+
+    @property
+    def vendor_id(self) -> str:
+        return self.key[len("user_item:"):]
+
+
+@dataclass(frozen=True)
+class _LaunchRead:
+    """What the reconciliation of one launch reads, in one read transaction; everything it then decides is computed
+    from this outside any transaction, because the comparisons are the driver's ``pos_lt``."""
+    attempts: tuple[_Attempt, ...]    # in the order the attempts committed (the service's own order, not vendor's)
+    items: tuple[_Item, ...]
+    through: str | None               # the complete frontier (:func:`_anchor`)
+    gaps: tuple[str | None, ...]      # the complete_through of every cursor row that reported a gap
+    fingerprint: tuple[int, int, int]
+
+
+def _launch_read(conn: sqlite3.Connection, launch_id: str) -> _LaunchRead:
+    _worker_launch(conn, launch_id)
+    attempts = tuple(_Attempt(*r) for r in conn.execute(
+        "SELECT o.message_id, o.op_id, o.vendor_anchor, m.body_norm_sha256, (SELECT l.state FROM chat_outbox_events l "
+        "WHERE l.message_id = o.message_id ORDER BY l.seq DESC LIMIT 1), (SELECT l.vendor_item_id FROM "
+        "chat_outbox_events l WHERE l.message_id = o.message_id AND l.state = 'accepted') FROM chat_outbox_events o "
+        "JOIN chat_messages m ON m.message_id = o.message_id WHERE m.launch_id = ? AND o.state = 'attempted' "
+        "ORDER BY o.gseq", (launch_id,)))
+    items = tuple(_Item(*r) for r in conn.execute(
+        "SELECT vendor_event_key, vendor_pos, body_norm_sha256 FROM chat_events WHERE launch_id = ? AND "
+        "kind = 'user_item' AND backfill = 0", (launch_id,)))
+    gaps = tuple(r[0] for r in conn.execute("SELECT complete_through FROM chat_cursors WHERE launch_id = ? AND "
+                                            "gap = 1", (launch_id,)))
+    return _LaunchRead(attempts, items, _anchor(conn, launch_id), gaps, _fingerprint(conn, launch_id))
+
+
+def _next_anchor(read: _LaunchRead, att: _Attempt, lt: Callable[[str, str], bool]) -> str | None:
+    """§7.2's window end: the earliest anchor of another attempt strictly after ``att``'s. An EQUAL anchor ends
+    nothing: two sends attempted at one frontier cannot be told apart by position, so they share one window."""
+    end = None
+    for a in read.attempts:
+        if a.message_id != att.message_id and lt(att.anchor, a.anchor) and (end is None or lt(a.anchor, end)):
+            end = a.anchor
+    return end
+
+
+def _inside(pos: str, anchor: str, end: str | None, lt: Callable[[str, str], bool]) -> bool:
+    """``anchor < pos <= end`` (no end: ``anchor < pos``)."""
+    return lt(anchor, pos) and (end is None or not lt(end, pos))
+
+
+def _untaken(read: _LaunchRead, att: _Attempt) -> list[_Item]:
+    """The user items no OTHER message's accepted row names."""
+    taken = {a.item for a in read.attempts if a.message_id != att.message_id and a.item is not None}
+    return [i for i in read.items if i.vendor_id not in taken]
+
+
+def _window(read: _LaunchRead, att: _Attempt, lt: Callable[[str, str], bool]) -> list[_Item]:
+    """§7.2: the user items after ``att``'s anchor, up to and including the next attempt's anchor (an item there was
+    read before that attempt), not backfill and not resolved to another message."""
+    end = _next_anchor(read, att, lt)
+    return [i for i in _untaken(read, att) if _inside(i.pos, att.anchor, end, lt)]
+
+
+def _absent(read: _LaunchRead, lt: Callable[[str, str], bool], correlated: bool) -> list[str]:
+    """§7.3 step 3: the ambiguous sends a complete read shows were NOT delivered. Never with a declared correlation
+    field (the proof is awaited instead, step 1); never across a gap reported at or after the anchor; never while any
+    item after the anchor carries the send's digest (step 2). Then only an unmatched user item inside the send's
+    window AND inside the complete frontier counts, and only one no other send of ours could have caused (no other
+    send anchored before it carries its digest). A turn start, or agent output, never counts."""
+    if correlated or read.through is None:
+        return []
+    out = []
+    for att in read.attempts:
+        if att.state != "ambiguous" or not lt(att.anchor, read.through):
+            continue
+        if any(g is None or not lt(g, att.anchor) for g in read.gaps):
+            continue
+        after = [i for i in _untaken(read, att) if lt(att.anchor, i.pos)]
+        if any(i.norm == att.norm for i in after):
+            continue
+        nxt = _next_anchor(read, att, lt)
+        end = read.through if nxt is None or lt(read.through, nxt) else nxt
+        others = [a for a in read.attempts if a.message_id != att.message_id]
+        if any(_inside(i.pos, att.anchor, end, lt) and not any(o.norm == i.norm and lt(o.anchor, i.pos)
+                                                               for o in others) for i in after):
+            out.append(att.message_id)
+    return out
+
+
+@dataclass(frozen=True)
+class _Seen:
+    """One vendor event of a batch, every field read once, before any transaction (a driver's object is untrusted
+    down to its attributes)."""
+    key: str
+    kind: str
+    pos: str
+    turn_id: str | None
+    call_id: str | None
+    body: str
+    norm: str
+    correlation: object
+    vendor_id: str
+
+
+def _outcome(got: object) -> tuple[str, str, str | None, str | None]:
+    """A driver's send result mapped to ``(state, cause, vendor turn, vendor item)``. ``accepted`` needs an
+    id-bearing acknowledgement; anything unreadable is ambiguous. Every field is read here, once."""
+    if not isinstance(got, SendResult):
+        return "ambiguous", "the driver returned no send result", None, None
+    outcome, turn, item, detail = got.outcome, got.vendor_turn_id, got.vendor_item_id, got.detail
+    if type(outcome) is not str or outcome not in ("accepted", "ambiguous", "not_delivered"):
+        return "ambiguous", "the driver returned no send result", None, None
+    for value in (turn, item):
+        if value is not None and (type(value) is not str or _readable(value) is None):
+            return "ambiguous", "the vendor's acknowledgement carried an unreadable id", None, None
+    detail = detail if type(detail) is str else ""
+    if outcome == "accepted":
+        if turn is None and item is None:
+            return "ambiguous", "accepted with no vendor id", None, None
+        return "accepted", _cause_text(detail or "accepted"), turn, item
+    return outcome, _cause_text(detail or outcome), turn, item
+
+
+def _readable(value: str) -> str | None:
+    try:
+        return _line("a vendor id", value)
+    except CoordError:
+        return None
 
 
 class ChatService:
     """Walks the send path over a :class:`ChatStore` and the :class:`~levain.coordinator.driver.DriverSession` s
     attached to it, one per worker launch. Every verdict is the service's, from rows and raw vendor evidence; a
     session decides nothing. ``fault(point)`` is the crash-matrix seam, called at each of
-    :data:`SEND_FAULT_POINTS`."""
+    :data:`SEND_FAULT_POINTS`.
+
+    Each launch has one mutex, the service's: a send holds it from its preflight to its outcome (so two sends never
+    meet inside one session), a read holds it from its first read of the store to its last write, and attaching or
+    detaching a session takes it. No driver method runs inside a write transaction: the session is called first and
+    its answers are carried into short transactions that hold only store work."""
 
     def __init__(self, store: ChatStore, *, fault: Callable[[str], None] | None = None) -> None:
         self._chat = store
         self._sessions: dict[str, Any] = {}
+        self._locks: dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()                 # held only to read or change the two dicts
         self._fault_hook = fault
 
+    def _launch_lock(self, launch_id: str) -> threading.Lock:
+        with self._guard:
+            return self._locks.setdefault(launch_id, threading.Lock())
+
+    def _session(self, launch_id: str) -> Any:
+        with self._guard:
+            return self._sessions.get(launch_id)
+
     def attach(self, launch_id: str, session: Any) -> None:
-        self._sessions[launch_id] = session
+        """The launch's one session. Refused while another is attached: :meth:`detach` it first. The refusal does
+        not wait for a send in flight (a session in use is an attached one)."""
+        with self._guard:
+            self._refuse_second(launch_id)
+        with self._launch_lock(launch_id), self._guard:
+            self._refuse_second(launch_id)
+            self._sessions[launch_id] = session
+
+    def _refuse_second(self, launch_id: str) -> None:
+        if launch_id in self._sessions:
+            raise CoordError(f"launch {str(launch_id)[:40]} already has a driver session; detach it first")
+
+    def detach(self, launch_id: str) -> None:
+        """Forget the launch's session and close it, once any send or read of the launch in flight has finished."""
+        with self._launch_lock(launch_id):
+            with self._guard:
+                session = self._sessions.pop(launch_id, None)
+            if session is not None:
+                session.close()
+
+    def close(self) -> None:
+        """Detach every session. Each is closed even when an earlier close raised; the first error is raised last."""
+        with self._guard:
+            launches = list(self._sessions)
+        first: Exception | None = None
+        for launch_id in launches:
+            try:
+                self.detach(launch_id)
+            except Exception as exc:  # noqa: BLE001 - every session is closed before any error propagates
+                first = first or exc
+        if first is not None:
+            raise first
 
     def _fault(self, point: str) -> None:
         if self._fault_hook is not None:
@@ -813,38 +1071,48 @@ class ChatService:
         """One message to a running worker, sent at most once. ``author_surface:client_id`` is the AUTHENTICATED
         owner (the caller derives it from the client's session, never from a request body); an operator's send is
         fenced under ``expected_epoch``. A resend of a stored ``outbox_id`` sends nothing again."""
-        session = self._sessions.get(launch_id)
+        if not isinstance(launch_id, str) or _LAUNCH_ID.fullmatch(launch_id) is None:
+            raise CoordError(f"no worker launch {str(launch_id)[:40]!r}")
         owner = f"{author_surface}:{client_id}"
-        with self._chat._write() as (conn, now):
-            role, _state, _h = _launch_state(conn, launch_id)
-            if role != "worker":
-                raise CoordError(f"no worker launch {str(launch_id)[:40]!r}")
-            thread_id = conn.execute("SELECT j.value FROM launches l, json_each(l.threads) j WHERE l.launch_id = ? "
-                                     "LIMIT 1", (launch_id,)).fetchone()[0]
-            normalized = session.normalize(body) if session is not None else body
-            m, created = record_message(
-                conn, now, thread_id=thread_id, recipient="worker", author_kind=author_kind,
-                author_surface=author_surface, client_id=client_id, outbox_id=outbox_id, body=body,
-                normalized=normalized, launch_id=launch_id, mode=mode, expected_turn_id=expected_turn_id,
-                owner_epoch=expected_epoch if author_kind == "operator" else None, attachments=attachments)
-            if not created:
-                latest = _latest_row(conn, m.message_id)
-                return SendReceipt(m.message_id, outbox_id, latest[0] if latest else "pending",
-                                   latest[1] if latest else "", False)
-            why = self._preflight(conn, now, m, session, owner)
-            outbox_step(conn, now, m.message_id, "refused" if why else "pending", cause=why or "preflight passed")
-        if why:
-            return SendReceipt(m.message_id, outbox_id, "refused", why, True)
-        self._fault("pending_committed")
-        return self._attempt_and_call(m, session, owner)
+        with self._launch_lock(launch_id):
+            session = self._session(launch_id)
+            caps = normalized = None
+            if session is not None:
+                caps = session.capabilities()
+                normalized = session.normalize(body) if isinstance(body, str) else body
+            with self._chat._write() as (conn, now):
+                role, _state, _h = _launch_state(conn, launch_id)
+                if role != "worker":
+                    raise CoordError(f"no worker launch {launch_id!r}")
+                row = conn.execute("SELECT j.value FROM launches l, json_each(l.threads) j WHERE l.launch_id = ? "
+                                   "LIMIT 1", (launch_id,)).fetchone()
+                if row is None:
+                    raise CoordError(f"worker launch {launch_id} holds no thread; nothing was written")
+                m, created = record_message(
+                    conn, now, thread_id=row[0], recipient="worker", author_kind=author_kind,
+                    author_surface=author_surface, client_id=client_id, outbox_id=outbox_id, body=body,
+                    normalized=body if normalized is None else normalized, launch_id=launch_id, mode=mode,
+                    expected_turn_id=expected_turn_id,
+                    owner_epoch=expected_epoch if author_kind == "operator" else None, attachments=attachments)
+                if not created:
+                    latest = _latest_row(conn, m.message_id)
+                    return SendReceipt(m.message_id, outbox_id, latest[0] if latest else "pending",
+                                       latest[1] if latest else "", False)
+                why = self._preflight(conn, now, m, caps, owner)
+                outbox_step(conn, now, m.message_id, "refused" if why else "pending", cause=why or "preflight passed")
+            if why:
+                return SendReceipt(m.message_id, outbox_id, "refused", why, True)
+            self._fault("pending_committed")
+            return self._attempt_and_call(m, session, caps, owner)
 
-    def _preflight(self, conn: sqlite3.Connection, now: str, m: ChatMessage, session: Any, owner: str) -> str | None:
+    def _preflight(self, conn: sqlite3.Connection, now: str, m: ChatMessage, caps: Any, owner: str) -> str | None:
         """B1 launch state, B2 the §4.2 fold, B3 the fence (yours only; the coordinator queues unfenced, B11), B9 a
-        steer names the vendor's open turn. The first no, as a cause; None when all pass."""
+        steer names the vendor's open turn. The first no, as a cause; None when all pass. ``caps`` is the attached
+        session's capabilities, read before the transaction (None: no session)."""
         _role, state, _h = _launch_state(conn, m.launch_id)
         if state != "active":
             return _cause_text(f"launch {m.launch_id} is {state}; only a running worker takes a message")
-        if session is None:
+        if caps is None:
             return "no driver session is attached to this launch"
         fold = liveness(conn, m.launch_id)
         if not fold.enabled:
@@ -854,7 +1122,6 @@ class ChatService:
                 chat_lease.turn_fence(conn, now, m.launch_id, m.owner_epoch, owner)
             except TurnRefused as exc:
                 return _cause_text(exc)
-        caps = session.capabilities()
         if m.mode == "steer":
             if not caps.steer:
                 return "this vendor takes no steer; queue the message instead"
@@ -872,14 +1139,14 @@ class ChatService:
                                             "AND kind IN ('turn_started', 'turn_ended')", (launch_id, turn_id))}
         return kinds == {"turn_started"}
 
-    def _attempt_and_call(self, m: ChatMessage, session: Any, owner: str) -> SendReceipt:
+    def _attempt_and_call(self, m: ChatMessage, session: Any, caps: Any, owner: str) -> SendReceipt:
         op_id = "op-" + secrets.token_hex(16)
         with self._chat._write() as (conn, now):
             latest = outbox_state(conn, m.message_id)
             if latest != "pending":
                 row = _latest_row(conn, m.message_id)
                 return SendReceipt(m.message_id, m.outbox_id, row[0], row[1], True)
-            why = self._preflight(conn, now, m, session, owner)
+            why = self._preflight(conn, now, m, caps, owner)
             anchor = None if why else _anchor(conn, m.launch_id)
             if why is None and anchor is None:
                 why = "no vendor position yet"
@@ -889,39 +1156,40 @@ class ChatService:
             outbox_step(conn, now, m.message_id, "attempted", cause="attempt", op_id=op_id, vendor_anchor=anchor)
         # only the transaction whose attempted row committed reaches this call (the partial unique index)
         self._fault("attempt_committed")
-        state, cause, turn, item = self._call(session, _command(m, op_id))
-        self._fault("call_returned")
+        state, cause, turn, item, signal = self._call(session, _command(m, op_id))
+        if signal is None:
+            self._fault("call_returned")
         with self._chat._write() as (conn, now):
             if outbox_state(conn, m.message_id) == "attempted":
                 outbox_step(conn, now, m.message_id, state, cause=cause, vendor_turn_id=turn, vendor_item_id=item)
             row = _latest_row(conn, m.message_id)
+        if signal is not None:
+            raise signal
         self._fault("outcome_committed")
         return SendReceipt(m.message_id, m.outbox_id, row[0], row[1], True)
 
     @staticmethod
-    def _call(session: Any, command: Any) -> tuple[str, str, str | None, str | None]:
-        """The one driver call, mapped to ``(state, cause, vendor turn, vendor item)``. ``accepted`` needs an
-        id-bearing acknowledgement; ``NotSent`` (proof no byte left) is not delivered; anything else is ambiguous."""
+    def _call(session: Any, command: Any) -> tuple[str, str, str | None, str | None, BaseException | None]:
+        """The one driver call, mapped to ``(state, cause, vendor turn, vendor item, signal)``. ``NotSent`` (proof
+        no byte left) is not delivered; any other exception, and any result that cannot be read, is ambiguous. A
+        ``BaseException`` that is not an ``Exception`` (an interrupt, an exit, a cancellation) comes back as
+        ``signal``: the caller records the outcome first, then raises it."""
         try:
             got = session.send(command)
         except NotSent as exc:
-            return "not_delivered", _cause_text(f"not sent: {exc}"), None, None
+            return "not_delivered", _cause_text(f"not sent: {_said(exc)}"), None, None, None
         except Exception as exc:  # noqa: BLE001 - any driver exception is an unknown outcome, never a lost send
-            return "ambiguous", _cause_text(f"the driver raised {type(exc).__name__}: {exc}"), None, None
-        if not isinstance(got, SendResult) or got.outcome not in ("accepted", "ambiguous", "not_delivered"):
-            return "ambiguous", "the driver returned no send result", None, None
-        ids = []
-        for value in (got.vendor_turn_id, got.vendor_item_id):
-            try:
-                ids.append(None if value is None else _line("a vendor id", value))
-            except CoordError:
-                return "ambiguous", "the vendor's acknowledgement carried an unreadable id", None, None
-        turn, item = ids
-        if got.outcome == "accepted":
-            if turn is None and item is None:
-                return "ambiguous", "accepted with no vendor id", None, None
-            return "accepted", _cause_text(got.detail or "accepted"), turn, item
-        return got.outcome, _cause_text(got.detail or got.outcome), turn, item
+            return "ambiguous", _cause_text(f"the driver raised {type(exc).__name__}: {_said(exc)}"), None, None, None
+        except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised by the caller
+            return "ambiguous", _cause_text(f"the driver call was interrupted ({type(exc).__name__})"), None, None, exc
+        try:
+            return (*_outcome(got), None)
+        except Exception as exc:  # noqa: BLE001 - a result object that raises when read is an unknown outcome
+            return "ambiguous", _cause_text(f"the driver's result could not be read ({type(exc).__name__})"), None, \
+                None, None
+        except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised by the caller
+            return "ambiguous", _cause_text(f"reading the driver's result was interrupted ({type(exc).__name__})"), \
+                None, None, exc
 
     # --- the crash rule (§6 step 4) ------------------------------------------------------------------------------
     def recover(self) -> dict[str, int]:
@@ -946,90 +1214,105 @@ class ChatService:
     def ingest(self, launch_id: str, batch: Any) -> int:
         """Record one :class:`~levain.coordinator.driver.ReadBatch` of a launch and its cursor in ONE transaction
         (§2.4), resolving any send the batch proves, then re-check every ambiguous send of the launch (§7.3). An
-        event at or before the launch's first ``complete_through`` is backfill. The count of new events."""
-        session = self._sessions[launch_id]
-        caps = session.capabilities()
-        new = 0
-        with self._chat._write() as (conn, now):
-            first = conn.execute("SELECT complete_through FROM chat_cursors WHERE launch_id = ? AND complete_through "
-                                 "IS NOT NULL ORDER BY seq LIMIT 1", (launch_id,)).fetchone()
-            first = None if first is None else first[0]
+        event at or before the launch's first ``complete_through`` is backfill. A ``complete_through`` before the
+        one already persisted is not persisted: the frontier never moves back. The count of new events."""
+        with self._launch_lock(launch_id):
+            session = self._session(launch_id)
+            if session is None:
+                raise CoordError(f"no driver session is attached to launch {str(launch_id)[:40]}; nothing was read")
+            correlated = bool(session.capabilities().correlation_field)
+            seen = []
             for e in batch.events:
-                backfill = first is None or not session.pos_lt(first, e.pos)
-                _ev, created = record_event(conn, now, launch_id=launch_id, key=e.key, pos=e.pos, kind=e.kind,
-                                            body=e.body, normalized=session.normalize(e.body), turn_id=e.turn_id,
-                                            call_id=e.call_id, backfill=backfill)
-                new += created
-                if created and e.kind == "user_item" and not backfill and caps.correlation_field \
-                        and isinstance(e.correlation, str):
-                    self._prove(conn, now, launch_id, e)
-            record_cursor(conn, now, launch_id=launch_id, vendor_cursor=batch.next_cursor,
-                          complete_through=batch.complete_through, gap=batch.gap)
-            self._reconcile(conn, now, launch_id, session)
+                body = e.body
+                seen.append(_Seen(e.key, e.kind, e.pos, e.turn_id, e.call_id, body,
+                                  session.normalize(body) if isinstance(body, str) else body, e.correlation,
+                                  e.vendor_id))
+            through, cursor, gap = batch.complete_through, batch.next_cursor, bool(batch.gap)
+            def frontier(conn: sqlite3.Connection) -> tuple[str | None, str | None, tuple[int, int, int]]:
+                _worker_launch(conn, launch_id)
+                return _first_through(conn, launch_id), _anchor(conn, launch_id), _fingerprint(conn, launch_id)
+
+            first, prev, mark = self._chat._read(frontier)
+            backfill = [first is None or not session.pos_lt(first, e.pos) for e in seen]
+            if through is not None and prev is not None and session.pos_lt(through, prev):
+                through = prev
+            new = 0
+            with self._chat._write() as (conn, now):
+                if _fingerprint(conn, launch_id) != mark:
+                    raise CoordError(f"launch {launch_id}'s chat record changed while its batch was read; nothing "
+                                     "was written")
+                for e, old in zip(seen, backfill):
+                    _ev, created = record_event(conn, now, launch_id=launch_id, key=e.key, pos=e.pos, kind=e.kind,
+                                                body=e.body, normalized=e.norm, turn_id=e.turn_id,
+                                                call_id=e.call_id, backfill=old)
+                    new += created
+                    if created and e.kind == "user_item" and not old and correlated \
+                            and isinstance(e.correlation, str):
+                        self._prove(conn, now, launch_id, e)
+                record_cursor(conn, now, launch_id=launch_id, vendor_cursor=cursor, complete_through=through,
+                              gap=gap)
+            self._reconcile(launch_id, session, correlated)
         return new
 
     @staticmethod
-    def _prove(conn: sqlite3.Connection, now: str, launch_id: str, e: Any) -> None:
-        """§7.3 step 1: a user item carrying a send's op_id in the declared correlation field is that send's."""
+    def _prove(conn: sqlite3.Connection, now: str, launch_id: str, e: _Seen) -> None:
+        """§7.3 step 1: a user item carrying a send's op_id in the declared correlation field is that send's. A proof
+        against a record already terminal (not delivered, or accepted naming another item) is kept as an anomaly;
+        the record is never rewritten."""
         row = conn.execute("SELECT o.message_id FROM chat_outbox_events o JOIN chat_messages m ON m.message_id = "
                            "o.message_id WHERE m.launch_id = ? AND o.state = 'attempted' AND o.op_id = ?",
                            (launch_id, e.correlation)).fetchone()
-        if row is not None and outbox_state(conn, row[0]) in ("attempted", "ambiguous"):
+        if row is None:
+            return
+        state = outbox_state(conn, row[0])
+        if state in ("attempted", "ambiguous"):
             outbox_step(conn, now, row[0], "accepted", cause="the vendor echoed our op_id",
                         vendor_turn_id=e.turn_id, vendor_item_id=e.vendor_id)
+            return
+        named = conn.execute("SELECT vendor_item_id FROM chat_outbox_events WHERE message_id = ? AND state = "
+                             "'accepted'", (row[0],)).fetchone()
+        if state == "accepted" and named is not None and named[0] in (None, e.vendor_id):
+            return
+        record_anomaly(conn, now, launch_id=launch_id, message_id=row[0], key=e.key, kind="proof_after_terminal",
+                       detail=f"the vendor echoed this send's op_id on item {e.vendor_id} after it was recorded "
+                              f"{state}")
 
-    def _window(self, conn: sqlite3.Connection, launch_id: str, message_id: str, session: Any) -> tuple[str, list]:
-        """§7.2: the send's anchor and the user items after it, before the next attempted message's anchor, not
-        backfill and not resolved to another message. Positions compare only through the session's ``pos_lt``."""
-        _op, anchor = _attempt(conn, message_id)
-        later = [a for (a,) in conn.execute(
-            "SELECT o.vendor_anchor FROM chat_outbox_events o JOIN chat_messages m ON m.message_id = o.message_id "
-            "WHERE m.launch_id = ? AND o.state = 'attempted' AND o.message_id != ?", (launch_id, message_id))
-            if session.pos_lt(anchor, a)]
-        nxt = None
-        for a in later:
-            if nxt is None or session.pos_lt(a, nxt):
-                nxt = a
-        taken = {i for (i,) in conn.execute(
-            "SELECT o.vendor_item_id FROM chat_outbox_events o JOIN chat_messages m ON m.message_id = o.message_id "
-            "WHERE m.launch_id = ? AND o.state = 'accepted' AND o.vendor_item_id IS NOT NULL AND o.message_id != ?",
-            (launch_id, message_id))}
-        items = [r for r in conn.execute(
-            "SELECT vendor_event_key, vendor_pos, body_norm_sha256 FROM chat_events WHERE launch_id = ? AND "
-            "kind = 'user_item' AND backfill = 0", (launch_id,))
-            if session.pos_lt(anchor, r[1]) and (nxt is None or session.pos_lt(r[1], nxt))
-            and r[0][len("user_item:"):] not in taken]
-        return anchor, items
-
-    def _reconcile(self, conn: sqlite3.Connection, now: str, launch_id: str, session: Any) -> None:
-        """§7.3 steps 2-4 for each ambiguous send of the launch. A digest candidate leaves it ambiguous (shown as
-        "probably this one"; your mark resolves it). With no candidate, a complete read past the anchor that shows the
-        vendor took a LATER input (a later turn start or user item) is not delivered. Otherwise it stays ambiguous."""
-        through = _anchor(conn, launch_id)
-        for (message_id, norm) in conn.execute(
-                "SELECT m.message_id, m.body_norm_sha256 FROM chat_messages m WHERE m.launch_id = ? AND (SELECT "
-                "state FROM chat_outbox_events o WHERE o.message_id = m.message_id ORDER BY seq DESC LIMIT 1) = "
-                "'ambiguous'", (launch_id,)).fetchall():
-            anchor, items = self._window(conn, launch_id, message_id, session)
-            if any(r[2] == norm for r in items) or through is None or not session.pos_lt(anchor, through):
-                continue
-            taken_later = any(session.pos_lt(anchor, pos) for (pos,) in conn.execute(
-                "SELECT vendor_pos FROM chat_events WHERE launch_id = ? AND backfill = 0 AND kind IN "
-                "('turn_started', 'user_item')", (launch_id,)))
-            if taken_later:
-                outbox_step(conn, now, message_id, "not_delivered",
-                            cause="complete read past anchor shows no such item")
+    def _reconcile(self, launch_id: str, session: Any, correlated: bool) -> None:
+        """§7.3 steps 2-4 for each ambiguous send of the launch (:func:`_absent` holds the rule). Read, decide outside
+        any transaction, then step only a send still ambiguous (your mark may have resolved it since the read). The
+        caller holds the launch's mutex."""
+        read = self._chat._read(lambda conn: _launch_read(conn, launch_id))
+        gone = _absent(read, session.pos_lt, correlated)
+        if not gone:
+            return
+        with self._chat._write() as (conn, now):
+            if _fingerprint(conn, launch_id) != read.fingerprint:
+                raise CoordError(f"launch {launch_id}'s chat record changed while it was reconciled; nothing was "
+                                 "written")
+            for message_id in gone:
+                if outbox_state(conn, message_id) == "ambiguous":
+                    outbox_step(conn, now, message_id, "not_delivered",
+                                cause="a complete read past its anchor shows another input and not this one")
 
     def candidates(self, message_id: str) -> list[str]:
         """§7.3 step 2's "probably this one": the vendor event keys in an ambiguous send's window whose normalized
-        digest equals the send's. Shown beside it; never authorship, never delivery (B12)."""
-        def read(conn: sqlite3.Connection) -> list[str]:
-            m = _message(conn, "message_id", message_id)
-            if m is None or outbox_state(conn, message_id) != "ambiguous":
-                return []
-            _anchor_, items = self._window(conn, m.launch_id, message_id, self._sessions[m.launch_id])
-            return [r[0] for r in items if r[2] == m.body_norm_sha256]
-        return self._chat._read(read)
+        digest equals the send's. Shown beside it; never authorship, never delivery (B12). Empty with no session
+        attached (no ``pos_lt`` to place them with)."""
+        m = self._chat.message(message_id)
+        session = None if m is None or m.launch_id is None else self._session(m.launch_id)
+        if session is None:
+            return []
+        read = self._chat._read(lambda conn: _launch_read(conn, m.launch_id))
+        att = next((a for a in read.attempts if a.message_id == m.message_id), None)
+        if att is None or att.state != "ambiguous":
+            return []
+        return [i.key for i in _window(read, att, session.pos_lt) if i.norm == att.norm]
+
+    def anomalies(self, launch_id: str) -> list[Anomaly]:
+        """The launch's ``chat_anomalies`` rows, in order."""
+        return self._chat._read(lambda conn: [Anomaly(*r) for r in conn.execute(
+            "SELECT launch_id, seq, message_id, vendor_event_key, kind, detail, at FROM chat_anomalies WHERE "
+            "launch_id = ? ORDER BY seq", (launch_id,))])
 
     def mark(self, message_id: str, delivered: bool, owner: str) -> str:
         """§7.4: you resolve an ambiguous send, delivered or not. ``owner`` is the authenticated client."""
