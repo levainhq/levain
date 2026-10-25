@@ -27,6 +27,16 @@ MIN_SQLITE = (3, 35, 0)
 #: How long a connection waits for a lock another one holds: the busy handler, and the WAL switch's own retry.
 BUSY_WAIT_S = 30.0
 _SQLITE_BUSY = 5
+#: SQLite's own text for SQLITE_BUSY; SQLITE_LOCKED says "database table is locked" and is not retried.
+_BUSY_TEXT = "database is locked"
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    """SQLITE_BUSY by error code where Python gives one (3.11+, an extended busy code included), else by SQLite's text."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return code & 0xFF == _SQLITE_BUSY
+    return str(exc) == _BUSY_TEXT
 
 
 def _library_version() -> tuple[int, ...]:
@@ -43,25 +53,29 @@ def rollback(conn: sqlite3.Connection) -> None:
 
 
 def _set_wal(conn: sqlite3.Connection) -> None:
-    """``PRAGMA journal_mode = WAL``, retried while SQLite answers busy, for at most :data:`BUSY_WAIT_S`.
+    """``PRAGMA journal_mode = WAL``, retried while SQLite answers busy, for about :data:`BUSY_WAIT_S`.
 
     Two processes making one new store, each switching it, saw this PRAGMA answer ``SQLITE_BUSY`` (``database is
     locked``) with no wait, the busy handler not called (the queue broker's first two GATEs, lane-limitsrace). Any
-    other error, and busy past the bound, propagates.
+    other error, and busy past the bound, propagates. SQLite can also answer a mode other than ``wal`` without
+    raising (``:memory:``, a VFS without WAL); that raises too, so a store never runs un-journaled in silence.
 
     The busy handler is off while it tries, so every try answers at once and the pauses here are the only wait:
-    their sum is the bound, kept without a clock (``time`` is not on the package's import allowlist,
+    their sum is the bound (a sum of pauses, not wall time), kept without a clock (``time`` is not on the package's import allowlist,
     ``tests/test_autonomic_leaf.py``). The caller sets the busy handler after."""
     conn.execute("PRAGMA busy_timeout = 0")
     waited, pause = 0.0, 0.001
     while True:
         try:
-            conn.execute("PRAGMA journal_mode = WAL")
-            return
+            row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
         except sqlite3.OperationalError as exc:
-            busy = getattr(exc, "sqlite_errorcode", 0) & 0xFF == _SQLITE_BUSY   # an extended busy code included
-            if not busy or waited + pause > BUSY_WAIT_S:
+            if not _is_busy(exc) or waited + pause > BUSY_WAIT_S:
                 raise
+        else:
+            mode = row[0] if row else None
+            if not (isinstance(mode, str) and mode.lower() == "wal"):
+                raise sqlite3.OperationalError(f"WAL journaling was not applied: SQLite answered {mode!r}")
+            return
         threading.Event().wait(pause)
         waited += pause
         pause = min(pause * 2, 0.05)

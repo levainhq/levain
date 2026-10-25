@@ -6,19 +6,23 @@ the busy handler waiting (lane-limitsrace RETURN.md). Once the file is in WAL it
 from __future__ import annotations
 
 import json
+import queue
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 from pathlib import Path
 
 from levain.consent import limits as L
 
 TRIALS = 30
+DEADLINE_S = 60.0
 
-# One process per session, alive for every trial: it reads a fresh store directory per line and answers the verdict
-# as the queue broker's GATE asks for it, so the two calls of a trial start together (both are blocked on the read).
+# One process per session, alive for every trial. A trial is two lines on stdin: ``arm <dir>`` (the worker answers
+# ``armed``) and then ``go``. The parent sends ``go`` to both only after both answered ``armed``, so the two calls
+# start together, and the verdict is what the queue broker's GATE asks for.
 WORKER = textwrap.dedent("""
     import json, sys
     from pathlib import Path
@@ -28,10 +32,59 @@ WORKER = textwrap.dedent("""
     session = sys.argv[1]
     print("ready", flush=True)
     for line in sys.stdin:
-        v = CL.count_call(Path(line.strip()), "claude_code", session, {}, tool_name="Read",
+        cmd, _, arg = line.strip().partition(" ")
+        assert cmd == "arm", line
+        print("armed", flush=True)
+        assert sys.stdin.readline().strip() == "go"
+        v = CL.count_call(Path(arg), "claude_code", session, {}, tool_name="Read",
                           tool_input="sha256:" + "0" * 64, limits=full, count_crossed=False, one_agent=True)
         print(json.dumps([v.state, v.reason or ""]), flush=True)
 """)
+
+
+class _Worker:
+    """A worker process whose stdout is read on a thread, so every read has a deadline."""
+
+    def __init__(self, session: str):
+        self.session = session
+        self.proc = subprocess.Popen([sys.executable, "-c", WORKER, session], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, text=True)
+        self.lines: queue.Queue = queue.Queue()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        for line in self.proc.stdout:
+            self.lines.put(line.strip())
+        self.lines.put(None)
+
+    def read(self) -> str:
+        try:
+            line = self.lines.get(timeout=DEADLINE_S)
+        except queue.Empty:
+            raise AssertionError(f"worker {self.session} gave no answer in {DEADLINE_S}s") from None
+        assert line is not None, f"worker {self.session} exited (code {self.proc.poll()})"
+        return line
+
+    def send(self, text: str) -> None:
+        self.proc.stdin.write(text + "\n")
+        self.proc.stdin.flush()
+
+    def reap(self, ok: bool) -> None:
+        """Close its stdin and wait; on a failed run kill it instead. Exit code is asserted only on success."""
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        if not ok:
+            self.proc.kill()
+        try:
+            self.proc.wait(timeout=DEADLINE_S)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+            raise AssertionError(f"worker {self.session} did not exit") from None
+        if ok:
+            assert self.proc.returncode == 0, f"worker {self.session} exited {self.proc.returncode}"
 
 
 def _counted(qdir: Path) -> dict[str, int]:
@@ -42,37 +95,58 @@ def _counted(qdir: Path) -> dict[str, int]:
         conn.close()
 
 
-def test_two_first_calls_on_a_store_not_yet_created_are_both_counted(tmp_path):
+def run_first_open_race(base: Path, trials: int = TRIALS) -> tuple[list, list]:
+    """Two real processes, ``trials`` times, each making the first call on a store directory that does not hold
+    ``limits.db`` yet. Returns (calls not answered ok, trials whose two ok calls were not both counted)."""
     sessions = ("sess-x", "sess-y")
-    procs = [subprocess.Popen([sys.executable, "-c", WORKER, s], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              text=True) for s in sessions]
+    workers = [_Worker(s) for s in sessions]
+    ok = False
     try:
-        assert [p.stdout.readline().strip() for p in procs] == ["ready", "ready"]
-        failed = []
-        for i in range(TRIALS):
-            qdir = Path(tempfile.mkdtemp(dir=tmp_path)) / "limits"
+        assert [w.read() for w in workers] == ["ready", "ready"]
+        failed, miscounted = [], []
+        for i in range(trials):
+            qdir = Path(tempfile.mkdtemp(dir=base)) / "limits"
             qdir.mkdir(mode=0o700)
-            for p in procs:
-                p.stdin.write(f"{qdir}\n")
-            for p in procs:
-                p.stdin.flush()
-            got = [json.loads(p.stdout.readline()) for p in procs]
-            failed += [(i, s, state, reason) for s, (state, reason) in zip(sessions, got) if state != "ok"]
-            if not failed:
-                assert _counted(qdir) == {L.session_root(s): 1 for s in sessions}
-        assert failed == []
+            for w in workers:
+                w.send(f"arm {qdir}")
+            assert [w.read() for w in workers] == ["armed", "armed"]
+            for w in workers:
+                w.send("go")
+            got = [json.loads(w.read()) for w in workers]
+            bad = [(i, w.session, state, reason) for w, (state, reason) in zip(workers, got) if state != "ok"]
+            failed += bad
+            if not bad:
+                counted = _counted(qdir)
+                if counted != {L.session_root(s): 1 for s in sessions}:
+                    miscounted.append((i, counted))
+        ok = True
+        return failed, miscounted
     finally:
-        for p in procs:
-            p.stdin.close()
-        assert [p.wait(timeout=60) for p in procs] == [0, 0]
+        for w in workers:
+            w.reap(ok)
+
+
+def test_two_first_calls_on_a_store_not_yet_created_are_both_counted(tmp_path):
+    failed, miscounted = run_first_open_race(tmp_path)
+    assert failed == []
+    assert miscounted == []
 
 
 # The busy the race met was answered with no wait, which one process cannot stage on demand, so the retry's own
 # rules are driven through a connection that answers as told.
 
+class _Row:
+    def __init__(self, value):
+        self.value = value
+
+    def fetchone(self):
+        return None if self.value is None else (self.value,)
+
+
 class _Answers:
     def __init__(self, *answers):
         self.answers = list(answers)
+        self.last = None
         self.asked = 0
         self.statements = []
 
@@ -86,7 +160,7 @@ class _Answers:
         self.last = a
         if isinstance(a, BaseException):
             raise a
-        return a
+        return _Row(a)
 
 
 def _err(text, code):
@@ -101,6 +175,42 @@ def test_the_wal_switch_retries_busy_until_it_is_answered():
     D._set_wal(conn)
     assert conn.asked == 3                         # a plain and an extended busy code are both retried
     assert conn.statements[0] == "PRAGMA busy_timeout = 0"   # every try answers at once; the pauses are the wait
+
+
+def test_a_bare_locked_error_with_no_errorcode_attribute_is_retried():
+    # Python before 3.11 has no ``sqlite_errorcode``; the message is then the only signal of SQLITE_BUSY.
+    from levain.autonomic import durable_sqlite as D
+    conn = _Answers(sqlite3.OperationalError("database is locked"), "wal")
+    D._set_wal(conn)
+    assert conn.asked == 2
+
+
+def test_a_table_locked_error_with_no_errorcode_attribute_is_not_retried():
+    import pytest
+
+    from levain.autonomic import durable_sqlite as D
+    conn = _Answers(sqlite3.OperationalError("database table is locked"))   # SQLITE_LOCKED, not SQLITE_BUSY
+    with pytest.raises(sqlite3.OperationalError, match="table is locked"):
+        D._set_wal(conn)
+    assert conn.asked == 1
+
+
+def test_a_journal_mode_other_than_wal_raises():
+    import pytest
+
+    from levain.autonomic import durable_sqlite as D
+    for answer in ("delete", "memory", None):
+        with pytest.raises(sqlite3.OperationalError, match="WAL"):
+            D._set_wal(_Answers(answer))
+    D._set_wal(_Answers("WAL"))                    # the answer's case does not matter
+
+
+def test_open_durable_on_memory_raises_and_closes():
+    import pytest
+
+    from levain.autonomic import durable_sqlite as D
+    with pytest.raises(sqlite3.OperationalError, match="WAL"):
+        D.open_durable(":memory:")
 
 
 def test_the_wal_switch_raises_any_other_error_at_once():
