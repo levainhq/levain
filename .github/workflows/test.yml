@@ -272,3 +272,77 @@ jobs:
 
       - name: Set up, check and undo isolation
         run: bash tests/ci/isolation_e2e.sh
+
+  chat-egress-srt:
+    # The CH-D2 bump gate: the srt-marked chat-egress tests RUN against the srt that `levain chat setup` installs
+    # (`npm ci --ignore-scripts` of the shipped lockfile), on both OSes the product runs on: srt's macOS (seatbelt)
+    # and Linux (bubblewrap) paths are different code. The `test` job skips these tests (no node, no srt there).
+    # The job fails if any test of the marker skips, whatever the reason: a gate that skips is not a gate.
+    # Deselected, and not part of this gate: chat_egress_network (conftest skips it whenever CI is set) and
+    # chat_egress_slow (the minutes-long git dumps, skipped in CI unless CHD2_SLOW=1).
+    name: chat egress srt (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "26"
+
+      - name: Install srt's OS dependencies (Linux)
+        # bubblewrap, socat and ripgrep are the Linux list in srt's README
+        # (https://github.com/anthropic-experimental/sandbox-runtime, "Dependencies for srt"); the same page says
+        # Ubuntu 24.04+ must lift kernel.apparmor_restrict_unprivileged_userns, which strips capabilities from a
+        # user namespace. Lifted on the throwaway runner VM, the remedy the linux-live and browser jobs apply.
+        if: runner.os == 'Linux'
+        run: |
+          sudo timeout 300 apt-get -o Acquire::Retries=3 update -q || true
+          sudo timeout 300 apt-get -o Acquire::Retries=3 install -y -q bubblewrap socat ripgrep
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --version
+          command -v socat
+          socat -V >/dev/null
+          rg --version
+
+      - name: Install srt's OS dependencies (macOS)
+        # macOS sandboxes with the OS's built-in tool; the same README lists ripgrep for the deny-path scan.
+        if: runner.os == 'macOS'
+        run: |
+          brew install ripgrep
+          rg --version
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,openhands]" hatchling
+
+      - name: Install srt the way users do
+        # `levain chat setup` is the entry users run: the Node floor check, then `npm ci --ignore-scripts` of the
+        # shipped lock into $LEVAIN_HOME/chat-node, the vendor check and the stamp.
+        run: |
+          echo "LEVAIN_HOME=$RUNNER_TEMP/levain-home" >> "$GITHUB_ENV"
+          LEVAIN_HOME="$RUNNER_TEMP/levain-home" levain chat setup
+          echo "CHD2_SRT_DIST=$RUNNER_TEMP/levain-home/chat-node/node_modules/@anthropic-ai/sandbox-runtime" >> "$GITHUB_ENV"
+
+      - name: Run the srt-marked tests
+        run: |
+          node --version
+          pytest -q -rs -m "chat_egress_srt and not chat_egress_network and not chat_egress_slow" \
+            --junitxml="$RUNNER_TEMP/chat-egress-srt.xml" tests/chat_egress
+
+      - name: Assert the marker ran with zero skips
+        # always(): a skip does not fail pytest, so this is the step that fails it; on a pytest failure it still
+        # prints the counts. A missing junit file (pytest never wrote one) fails here too.
+        if: always()
+        run: python tests/ci/junit_no_skips.py "$RUNNER_TEMP/chat-egress-srt.xml"
