@@ -2965,7 +2965,8 @@ TOPOLOGY_NODE_STATES = ("waiting", "errored", "stalled", "running", "idle")
 TOPOLOGY_TASK_KINDS = ("dispatch", "spore", "consent", "question", "unattached")
 TOPOLOGY_TASK_STATES = ("waiting", "stuck", "running", "open", "done", "failed")
 TOPOLOGY_TASK_HEATS = ("hot", "warm", "cold", "parked")
-TOPOLOGY_COST_SOURCES = ("dispatch", "ledger")
+# "transcript": the tokens a task's workers spent, read from their session transcripts. Tokens only: a transcript carries no price.
+TOPOLOGY_COST_SOURCES = ("dispatch", "ledger", "transcript")
 TOPOLOGY_LABEL_MAX = 48
 TOPOLOGY_NEEDS_MAX = 120      # the decision mark's strings (needs_first, needs_first_card, needs_first_what): the page's own cap (topology_view.js NEED_CAP)
 
@@ -3128,6 +3129,8 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             raise _bad(spec, f"{w}.cost.source", f"must be one of {list(TOPOLOGY_COST_SOURCES)} or null")
         if cost["source"] is None and (cost["usd"] is not None or cost["tokens"] is not None):
             raise _bad(spec, f"{w}.cost.source", "must name where a cost came from (a cost is never an estimate)")
+        if cost["source"] == "transcript" and (cost["usd"] is not None or cost["tokens"] is None):
+            raise _bad(spec, f"{w}.cost.source", "a transcript source carries tokens and no usd (a transcript has no price)")
         workers = strings(f"{w}.workers", t.get("workers"))
         for j, x in enumerate(workers):
             if x not in node_ids:

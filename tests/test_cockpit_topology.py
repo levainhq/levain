@@ -153,6 +153,8 @@ MALFORMED = [
     ("tasks.0.cost", None, "value.tasks[0].cost"),
     ("tasks.0.cost.source", "estimate", "value.tasks[0].cost.source"),
     ("tasks.1.cost", {"usd": 1.0, "tokens": None, "source": None}, "never an estimate"),
+    ("tasks.1.cost", {"usd": 1.0, "tokens": 5, "source": "transcript"}, "no price"),
+    ("tasks.1.cost", {"usd": None, "tokens": None, "source": "transcript"}, "carries tokens"),
     ("tasks.0.workers.0", "ghost", "must name a node id"),
     ("lost_if_closed", _DEL, "value.lost_if_closed is required"),
     ("lost_if_closed.0.node", "ghost", "must name a node id"),
@@ -973,3 +975,11 @@ def test_a_session_stem_not_of_the_registry_shape_never_becomes_an_id(tmp_path, 
     assert [n["id"] for n in v["nodes"]] == [_stem("claude_code", "s")]
     assert "sessions: a record of an unknown name, not drawn" in v["errors"]
     assert [r["node"] for r in v["lost_if_closed"]] == [_stem("claude_code", "s")]
+
+
+def test_a_transcript_cost_is_accepted_as_tokens_without_a_price():
+    v = copy.deepcopy(_good())
+    v["tasks"][1]["cost"] = {"usd": None, "tokens": 705544, "source": "transcript"}
+    p = _panel(v)
+    assert p["status"] == "ok", p
+    assert p["value"]["tasks"][1]["cost"] == {"usd": None, "tokens": 705544, "source": "transcript"}

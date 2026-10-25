@@ -300,10 +300,15 @@ ALLOC_POLICY_KEYS = frozenset({"routes", "egress_routes", "model", "queue_grant"
 ALLOC_POLICY_REQUIRED = frozenset({"routes", "egress_routes", "queue_grant", "hooks", "incarnation"})
 _FRONT_KEYS = frozenset({"uid", "pending", "pid", "start"})
 
-#: §3.3 ATTACH's ``ticket_facts`` answer, written into alloc by ``prepare`` (§5.1).
+#: §3.3 ATTACH's ``ticket_facts`` answer, written into alloc by ``prepare`` (§5.1). 3c-7 fix r1 (codex HIGH 1): ONE
+#: shape, the facts CONTROL keeps on its ticket record (``levain.slot.tickets.check_facts``, the record ``MINT``'s
+#: claims check reads), answered whole, so a verifier ticket's top-level ``verifier_generation`` / ``verifier_id``
+#: are alloc keys; ``verifier`` is the resolved entry CONTROL adds beside them once it resolves one (§3.5 VERIFIER
+#: IDENTITY).
 TICKET_FACT_KEYS = frozenset({"job_id", "run_index", "contract_digest", "kind", "route", "routemap_generation",
                               "route_policy_digest", "model_requested", "egress_routes", "reserved_microdollars",
-                              "verifier", "verifier_steps", "driver_input_digest", "input_bundle_digest"})
+                              "verifier_generation", "verifier_id", "verifier", "verifier_steps",
+                              "driver_input_digest", "input_bundle_digest"})
 TICKET_FACT_REQUIRED = frozenset({"job_id", "run_index", "contract_digest", "kind", "egress_routes",
                                   "reserved_microdollars"})
 TICKET_VERIFIER_KEYS = frozenset({"verifier_generation", "verifier_id", "verifier_artifact_digest",
@@ -324,7 +329,7 @@ def _ticket_facts(value: object) -> dict[str, object]:
             _enum(v, where, _TICKET_KINDS)
         elif k.endswith("_digest"):
             _match(v, where, _DIGEST_RE)
-        elif k in ("run_index", "reserved_microdollars", "routemap_generation"):
+        elif k in ("run_index", "reserved_microdollars", "routemap_generation", "verifier_generation"):
             _uint(v, where)
         elif k == "egress_routes":
             _str_list(v, where, _ROUTE_ID_RE, MAX_ROUTES)

@@ -288,3 +288,13 @@ def test_a_long_group_shows_its_first_four_and_one_button_for_the_rest(tmp_path,
     # the real card repaints through cockpit_view.js; the button asks it to, so here the click is checked on the drawn state only
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}, {"eval": "(" + TV + ".querySelector('.tv-more') || {}).textContent"}])
     assert json.loads(out[-2]) == 4 and out[-1] == "show 2 more", out
+
+
+@needs_browser
+def test_a_transcript_cost_reads_as_tokens_from_transcripts_never_a_price(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    v = _value()
+    next(t for t in v["tasks"] if t["id"] == "t-stuck")["cost"] = {"usd": None, "tokens": 705544, "source": "transcript"}
+    probe = ("JSON.stringify(Object.fromEntries([...%s.querySelectorAll('.tv-task')].map(t => [t.dataset.task, (t.querySelector('.tv-cost') || {textContent: null}).textContent])))") % TV
+    out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}])
+    assert json.loads(out[-1])["t-stuck"] == "706K tokens from transcripts", out[-1]

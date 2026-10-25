@@ -989,6 +989,54 @@ def run_drop_show(args: argparse.Namespace, out: Any = None) -> int:
     return 0
 
 
+def _chat_line(r: Any) -> str:
+    """One timeline row for a terminal. Every body is quoted (:func:`_shown`); a vendor row says ``vendor`` and that it
+    is quoted data, so nothing a worker's thread showed can read as a line of yours."""
+    at = r.at if r.gseq is None else f"#{r.gseq} {r.at}"
+    if r.kind == "message":
+        status = f" [{r.status or 'no outbox row'}]"
+        return f"  {at}  {r.source} said{status}: {_shown(r.body)}"
+    if r.source == "vendor":
+        return f"  {at}  vendor {r.kind.removeprefix('vendor_')} (quoted data): {_shown(r.body)}"
+    body = "" if r.body is None else f": {_shown(r.body)}"
+    return f"  {at}  {r.kind} ({r.source}) {r.ref_id}{body}"
+
+
+def run_chat(args: argparse.Namespace, out: Any = None) -> int:
+    from levain.coordinator.chat import ChatStore
+
+    out = out or sys.stdout
+    try:
+        before, merged = ChatStore(_store(args)).timeline(args.thread_id)
+    except _REFUSED as exc:
+        print(f"levain chat {args.chat_cmd}: {exc}", file=sys.stderr)
+        return 1
+    def rows(rs: list[Any]) -> list[dict[str, Any]]:
+        return [{"gseq": r.gseq, "kind": r.kind, "source": r.source, "ref_id": r.ref_id, "launch_id": r.launch_id,
+                 "status": r.status, "body": r.body, "at": r.at} for r in rs]
+
+    text = [f"thread {args.thread_id}"]
+    if before:
+        text += ["  before the chat record:", *(_chat_line(r) for r in before)]
+    text += [_chat_line(r) for r in merged] or ["  no chat record yet"]
+    _emit(out, args.json, {"thread_id": args.thread_id, "before": rows(before), "timeline": rows(merged)},
+          "\n".join(text))
+    return 0
+
+
+def _chat_subparsers(subparsers: argparse._SubParsersAction) -> argparse._SubParsersAction:
+    """The ``chat`` command's verb table. ``levain chat key`` (the chat launch's held keys) may have registered
+    ``chat`` already; its verbs and ``show`` share the one command rather than argparse refusing a second ``chat``."""
+    existing = subparsers.choices.get("chat")
+    if existing is None:
+        ch = subparsers.add_parser("chat", help="A thread's chat record and the chat launch's network.")
+        return ch.add_subparsers(dest="chat_cmd", required=True)
+    for action in existing._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action
+    raise RuntimeError("the chat command was registered without a verb table")
+
+
 def run_drop_list(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
@@ -1410,6 +1458,14 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     common(tf)
     for p in (tl, ts, tst, tm, td, ta, tf):
         p.set_defaults(func=run_thread)
+
+    ch_sub = _chat_subparsers(subparsers)
+    chs = ch_sub.add_parser(
+        "show", help="One thread's chat timeline in the store's order: messages, what the worker's thread showed "
+                     "(quoted, never your words), replies and envelope rows. Writes no row.")
+    chs.add_argument("thread_id")
+    common(chs)
+    chs.set_defaults(func=run_chat)
 
     c = subparsers.add_parser(
         "coord", help="The coordinator lease: who holds the coordinator role, and the sessions launched for it.",

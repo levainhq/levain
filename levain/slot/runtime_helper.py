@@ -9,8 +9,8 @@ non-zero exit, raised before the next act: nothing after the refusing check acts
 Verbs built here: ``prepare``, ``render``, ``resume``, ``status``, ``adopt-open``, ``adopt-verify``, ``discard`` and
 ``restore`` (session 5's);
 ``start`` and ``teardown`` dispatch to :mod:`levain.slot.start`. Every other verb (derive: ``VERBS`` less
-``VERB_HANDLERS``) answers ``verb-unbuilt:<verb>``. A ticketed (dispatch) ``prepare`` answers ``verb-unbuilt:ticket``
-(session 2f's).
+``VERB_HANDLERS``) answers ``verb-unbuilt:<verb>``. A ticketed (``_levain_dispatch``) ``prepare`` takes its slot by
+§3.5 Pool's point-of-use rules and writes ``ATTACH``'s ``ticket_facts`` into alloc before it returns (S1 3c-7).
 
 Every root filesystem act goes through a dirfd: the store root is opened once with ``O_DIRECTORY|O_NOFOLLOW`` and
 every path below it is reached one component at a time with ``O_NOFOLLOW`` (§5 preamble), so no argv token, stdin
@@ -18,7 +18,8 @@ field or planted link names a path. Every OS act a unit test cannot do as a non-
 :class:`Seams` with a real default (owners are recorded, not applied, in the tests).
 
 The slot state file ``L/slots/{e,v}<n>/state`` (``levain-slot-state/1``, §3.5 Pool) has ONE definition,
-:mod:`levain.slot.records`; ``prepare`` (lease) and ``teardown`` (SCRUBBED) read and write it through it.
+:mod:`levain.slot.records`; ``prepare`` (lease) and ``teardown`` (SCRUBBED) read and write it through it, and
+:func:`slot_snapshot` reads every one for the reaper's ``SLOT-SYNC``.
 """
 from __future__ import annotations
 
@@ -972,6 +973,26 @@ def pick_slot(views: Sequence[SlotView], *, slot_class: str, kind: str, vendor: 
     return reusable[0].slot
 
 
+def slot_snapshot(store: Store) -> List[Dict[str, object]]:
+    """``SLOT-SYNC``'s payload (§3.5 Pool): every configured slot's state file as its ``levain-slot-state/1`` object,
+    egress then none, by index. The caller holds the pool lock (§3.5: every writer of a state file does), so the set
+    is one consistent read. A slot with no state file, or one that does not parse, is left out: absent from the snapshot is
+    NOT REUSABLE to CONTROL, the safe side."""
+    out: List[Dict[str, object]] = []
+    conf = configured_slots(store)
+    for cls in ("egress", "none"):
+        for i in sorted(conf[cls]):
+            slot = SlotId(cls, i)
+            try:
+                raw = store.read(("slots", slot.tag), "state")
+                if raw is None:
+                    continue
+                out.append(canon.parse(R.slot_state_bytes(parse_slot_state_of(raw, slot))))
+            except Refused:
+                continue
+    return out
+
+
 # --- flock (pool lock before slot lock, §3.5 LOCK ORDER) -------------------------------------------------------------
 
 def _open_lock(dirfd: int, name: str, where: str) -> int:
@@ -1261,9 +1282,18 @@ def make_staging(ctx: Ctx, session: str) -> Path:
 
 
 def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, object]:
+    """§5.1 prepare. TICKETED (S1 3c-7, §3.5): ``_levain_dispatch``'s lease carries a ticket (``bind_stdin`` holds
+    caller and ticket together), the slot is taken by :func:`pick_slot`'s ticketed rules under the pool lock (no
+    ``<slot>`` argument, never a credential or baseline slot, ``operator-slot-reserved`` for the operator's last
+    one), alloc and the ``ATTACH`` claims name the ticket, and ``ATTACH``'s ``ticket_facts`` are written into alloc,
+    durably, before ``prepare`` returns. A failure after ``ATTACH`` answered (the facts write included) leaves CONTROL's
+    record ALLOCATED with the ticket bound and an alloc carrying the ticket without its facts: render refuses that
+    ``ticket-facts-missing`` before it acts (:func:`levain.slot.render.check_ticket`), so nothing renders, and the
+    session ends with its lease."""
     seams = ctx.seams
-    if ctx.caller == DISPATCH or blob.ticket is not None:
-        raise Refused("verb-unbuilt:ticket", "ticketed prepare is session 2f's")
+    ticketed = blob.ticket is not None
+    if ticketed != (ctx.caller == DISPATCH):
+        raise Refused("ticket-required" if ctx.caller == DISPATCH else "ticket-not-allowed", "prepare")
     seams.at("floor")
     if seams.free_bytes(ctx.store.fd) < V5_FLOOR_BYTES:        # §5.1: refuses below V5
         raise Refused("below-floor", "free space under V5")
@@ -1276,7 +1306,7 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
     else:
         raise Refused("internal", "no fresh session id")
     leased = lease_slot(ctx.store, slot_class=req.slot_class, kind=req.kind, vendor=req.vendor, auth=req.auth,
-                        named=req.slot, ticketed=False, session=session)
+                        named=req.slot, ticketed=ticketed, session=session)
     created = attach_sent = False
     try:
         slot = leased.slot
@@ -1298,7 +1328,7 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
             created_at=R.timestamp(seams.clock()), boot_id=seams.boot_id(),
             child_uid=ids[second] if slot.slot_class == "none" else None,
             netns=slot.netns if linux else None, cgroup=R.cgroup_path(slot, session) if linux else None,
-            var_folders=folders)
+            var_folders=folders, ticket=blob.ticket)
         seams.at("alloc")
         try:
             create_alloc(ctx, alloc)
@@ -1309,6 +1339,8 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
         claims = {"operator_uid": alloc.operator_uid, "supervisor_uid": alloc.supervisor_uid,
                   "slot": R.slot_obj(slot), "class": slot.slot_class, "kind": alloc.kind, "vendor": alloc.vendor,
                   "auth": alloc.auth, "lease_seq": alloc.lease_seq, "slot_rev": alloc.slot_rev}
+        if ticketed:
+            claims["ticket"] = blob.ticket
         seams.at("attach")
         attach_sent = True
         try:
@@ -1320,6 +1352,13 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
             raise
         if ans.get("generation") != 0:
             raise Refused("attach-answer-malformed", repr(ans.get("generation"))[:32])
+        if ticketed:
+            # §3.5 "Ticket facts reach render": CONTROL's ticket record, never dispatch's word, into alloc before the
+            # answer; a refusal here leaves the session at CONTROL and an alloc without the facts
+            if "ticket_facts" not in ans:
+                raise Refused("attach-answer-malformed", "no ticket_facts for a ticketed ATTACH")
+            seams.at("ticket-facts")
+            write_alloc(ctx, R.parse_alloc(R.alloc_bytes(replace(alloc, ticket_facts=ans["ticket_facts"]))))
     except BaseException:
         if not attach_sent:
             _undo_prepare(ctx, leased, session if created else None)
@@ -1692,6 +1731,8 @@ def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]
         a = read_alloc(ctx, req.session)
         if a.policy is not None:
             raise Refused("not-allocated", req.session)
+        # §3.5's second gate, before step (1)'s CAS: a refusal here leaves the session ALLOCATED and acts on nothing
+        RD.check_ticket(blob, a.kind, a.slot.slot_class, a.ticket, a.ticket_facts)
         run = RenderRun(ctx, a, blob)
         try:
             for name, step in RENDER_STEPS:
