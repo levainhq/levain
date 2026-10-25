@@ -50,6 +50,9 @@ from levain.autonomic.confirm import (
     DEFAULT_SSH_KEYGEN, UNAVAILABLE, VERIFIED, challenge as confirm_challenge_bytes, verify_signature,
     verify_signature_status,
 )
+from levain.autonomic.coverage import (
+    COVER_MOVED, COVER_NONE, CoverageSource, CoverageView, Effect, Uncovered, operative,
+)
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
 from levain.autonomic.journal import (
@@ -67,7 +70,7 @@ from levain.autonomic.store import GateReceiptStore
 from levain.autonomic.transport import ConfirmDecision, ConfirmProposal, ConfirmTransport
 from levain.autonomic.trust import IntentProvenance, SignalAuth, TrustContext
 
-__all__ = ["GateOutcome", "EfferentGate"]
+__all__ = ["GateOutcome", "EfferentGate", "binding_family"]
 
 _log = logging.getLogger("levain.autonomic.gate")
 
@@ -106,7 +109,7 @@ _STATE_COLLABORATORS: dict[str, str] = {
 }
 
 # The constructor arguments a policy swap replaces: everything else is state (above).
-_POLICY_ARGUMENTS = frozenset({"manifest", "binding_risk"})
+_POLICY_ARGUMENTS = frozenset({"manifest", "binding_risk", "coverage"})
 
 
 # why a binding's risk could not be re-derived when the registry itself could not be read (a lock, a
@@ -132,14 +135,39 @@ def _risk_dict(risk: ActionRisk | None) -> dict[str, Any] | None:
             "financial": risk.financial}
 
 
-def _risk_fence(manifest_risk: ActionRisk | None, binding_risk: ActionRisk | None) -> str:
+def _risk_fence(manifest_risk: ActionRisk | None, binding_risk: ActionRisk | None,
+                cover: str | None = None) -> str:
     """The risk FENCE of an effect: a digest of the risk inputs its rung is decided from, the manifest's
     entry for the action (``None`` if it declares none) and the binding's risk for the link (``None`` for an
     action classified by the manifest alone). The journal admits the effect only if the same inputs, read
-    again at admission, digest to the same fence, so a change made to them in any way is caught."""
-    text = json.dumps({"manifest": _risk_dict(manifest_risk), "binding": _risk_dict(binding_risk)},
-                      sort_keys=True, separators=(",", ":"))
+    again at admission, digest to the same fence, so a change made to them in any way is caught.
+
+    ``cover`` is the graduation clamp's cover value (:meth:`EfferentGate._clamp`), given only when the clamp
+    was consulted. Without it the digested text has no ``cover`` key, so the fence of an effect decided at or
+    above CONFIRM is the same bytes it was before the clamp existed."""
+    body: dict[str, Any] = {"manifest": _risk_dict(manifest_risk), "binding": _risk_dict(binding_risk)}
+    if cover is not None:
+        body["cover"] = cover
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"))
     return "fence-" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def binding_family(binding: Binding) -> str:
+    """The family of ``binding``: ``fam-`` and the first 32 hex of a sha256 over its sealed core without its
+    posture and its creation time (DESIGN_REV2 C6: ``created_by``, trigger, goal, tightness, ``one_shot``,
+    guard), so the same grant re-ratified at another rung stays in its family. A graduation policy's
+    ``families`` list is compared with it. Honest-config only: a writer of the registry can mint any family."""
+    body: dict[str, Any] = {
+        "created_by": binding.created_by,
+        "trigger": binding.trigger.to_dict(),
+        "goal": [g.to_dict() for g in binding.goal],
+        "tightness": binding.tightness.to_dict(),
+        "one_shot": bool(binding.one_shot),
+    }
+    if binding.guard:   # omitted when empty, as the seal omits it
+        body["guard"] = [g.to_dict() for g in binding.guard]
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return "fam-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
 @dataclass(frozen=True)
@@ -298,7 +326,11 @@ class EfferentGate:
         binding_risk: Callable[[Binding, int], ActionRisk] | None = None,
         confirm_signers: str | Path | None = None,
         ssh_keygen: str | Path | None = None,
+        coverage: CoverageSource | None = None,
     ) -> None:
+        # Where the graduation clamp reads which signed policies cover an effect (14b DESIGN_REV3 §5.3).
+        # None ⇒ nothing is covered: every effect the clamp is consulted for runs at CONFIRM or above.
+        self._coverage = coverage
         # The manifest is frozen for this gate's lifetime (desk ruling (a), 2026-10-09): a change to it,
         # a tightening included, is a NEW gate on a new manifest (``with_policy``), published in process
         # through :class:`~levain.autonomic.handle.GateHandle`.
@@ -348,13 +380,15 @@ class EfferentGate:
         self._confirm_window_s = confirm_window_s
 
     def with_policy(self, manifest: ActionManifest,
-                    binding_risk: Callable[[Binding, int], ActionRisk]) -> "EfferentGate":
-        """A NEW gate on ``manifest`` and ``binding_risk`` that shares every stateful collaborator of this
-        one by reference (``_STATE_COLLABORATORS``): a swap changes policy, never state. This gate is
-        unchanged. Signers are state here, never an argument: an authenticator change must not ride a
-        policy swap."""
+                    binding_risk: Callable[[Binding, int], ActionRisk],
+                    coverage: CoverageSource | None = None) -> "EfferentGate":
+        """A NEW gate on ``manifest``, ``binding_risk`` and ``coverage`` that shares every stateful
+        collaborator of this one by reference (``_STATE_COLLABORATORS``): a swap changes policy, never state.
+        This gate is unchanged. Signers are state here, never an argument: an authenticator change must not
+        ride a policy swap. ``coverage`` is policy: omitted, the new gate covers nothing
+        (:meth:`GateHandle.swap <levain.autonomic.handle.GateHandle.swap>` passes this gate's)."""
         state = {arg: getattr(self, attr) for arg, attr in _STATE_COLLABORATORS.items()}
-        return type(self)(manifest=manifest, binding_risk=binding_risk, **state)
+        return type(self)(manifest=manifest, binding_risk=binding_risk, coverage=coverage, **state)
 
     def get_pending(self, pending_id: str) -> PendingAction | None:
         """The UNDECIDED pending action by id (no claim), or ``None``: a journaled run's undecided hold
@@ -487,6 +521,11 @@ class EfferentGate:
     @property
     def binding_risk(self) -> Callable[[Binding, int], ActionRisk] | None:
         return self._binding_risk
+
+    @property
+    def coverage(self) -> CoverageSource | None:
+        """Where this gate's graduation clamp reads signed policies, or ``None`` (nothing is covered)."""
+        return self._coverage
 
     @property
     def journal(self) -> RunJournal | None:
@@ -623,6 +662,23 @@ class EfferentGate:
             except UnknownAction:
                 pass
 
+        # 2b. the graduation clamp (14b DESIGN_REV3 §4, DESIGN_REV3_1 D4 (a)): a binding's link, terminal or
+        # intermediate, whose rung is below CONFIRM runs there only while a live anchored policy signs its
+        # action at the manifest's risk for it; uncovered, it runs at CONFIRM. A terminal link's rung must be
+        # the sealed binding's (``ratified_posture_mismatch``); below CONFIRM a forged rung buys nothing the
+        # clamp does not allow anyway.
+        cover: str | None = None
+        if posture < Posture.CONFIRM and self._clamps(request.authority):
+            binding = self._binding_or_none(request.authority.binding_id, request.continuation, None)
+            if (binding is not None and request.ratified_posture is not None
+                    and binding.posture is not request.ratified_posture):
+                _log.warning("efferent gate REFUSE: %r carries ratified_posture %s, its sealed binding %s",
+                             request.action_name, request.ratified_posture.name, binding.posture.name)
+                return self._deny(request, created_at, Posture.REFUSE_ESCALATE, "ratified_posture_mismatch",
+                                  cancel=False)
+            posture, cover = self._clamp(posture, self._effect(request.action_name, manifest_risk,
+                                                               request.risk, binding))
+
         # 3. the KNOWN-danger kill (Slice 4 — the first runtime consumer of the 3a.5 kill substrate,
         # closing codex's 3a.5 L3 finding #1) — evaluated BEFORE the §1.5 screen (complement L3): a
         # kill-worthy trigger must ALWAYS produce a KILL receipt, never be MASKED by a confidence/
@@ -667,7 +723,7 @@ class EfferentGate:
             fence = None
             if request.run is not None:
                 # the fence: the very risk inputs this rung was just decided from
-                fence = self._forward_fence(request, manifest_risk, risk)
+                fence = self._forward_fence(request, manifest_risk, risk, cover)
             return self._fire(
                 request=request, created_at=created_at, posture=posture,
                 verdict="auto", by=by, actor_first_estimate=request.actor_first_estimate,
@@ -892,7 +948,7 @@ class EfferentGate:
         # meet that rung (its signature and unattended checks below leave the decision open), and
         # silence takes that rung's default (``silence_decision``). The fence is the digest of the same
         # inputs, from the same read: the effect is admitted only if they digest the same at admission.
-        effective, why, fence = self._resolve_posture(pending, posture, hold)
+        effective, why, fence, clamped = self._resolve_rung(pending, posture, hold)
         if effective is None:
             # the store the risk is re-derived from cannot be read now: as BARRED, a repair clears it, so
             # nothing is recorded (an approval that stands, stands)
@@ -1018,7 +1074,8 @@ class EfferentGate:
                     return reject(posture, f"journal:{d.reason}")
             expect = d.decision   # the effect runs under the decision written here, or not at all
         armed = _Fence(fence, lambda conn: self._fence_now(conn, pending.action_name, binding_id,
-                                                           hold["effect_id"], chain, with_binding=True),
+                                                           hold["effect_id"], chain, with_binding=True,
+                                                           clamped=clamped),
                        expect=expect)
         fired = self._fire(
             request=request, created_at=created_at, posture=posture,
@@ -1110,6 +1167,16 @@ class EfferentGate:
                     posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
                     reason="confirm:not_signed_by_an_enrolled_key", receipt_id=None, execution=None,
                 )
+        # An unattended approval is screened the same way while the coverage it needs cannot be read (R9 A1):
+        # a failed refresh leaves the pending open for the next sweep instead of spending it on a deny. The
+        # check that counts runs AFTER the claim, on the record claimed (``_manual_cover_refusal``).
+        if decision.approved and decision.by != "human":
+            looked_up = self._pending_store.get(pending_id)
+            if looked_up is not None and self._manual_cover_unavailable():
+                return GateOutcome(
+                    posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
+                    reason="cover:unavailable", receipt_id=None, execution=None,
+                )
         pending = self._pending_store.claim(pending_id)
         if pending is None:
             # already claimed/resolved/swept, or never existed — nothing to fire; surface, don't crash.
@@ -1184,6 +1251,21 @@ class EfferentGate:
                 verdict="denied", by=decision.by, reason=guard,
                 actor_first_estimate=decision.first_estimate,
             )
+        if decision.by != "human":
+            # DESIGN_REV3_1 D1: an unattended manual effect runs below CONFIRM only under a live anchored
+            # policy covering it now, read here, after the claim and immediately before the fire. A conjunct
+            # beside ``_unattended_approval_allowed``, never inside it (that also serves the journal's check).
+            refusal = self._manual_cover_refusal(pending, posture)
+            if refusal is not None:
+                _log.warning("efferent gate resolve: unattended %r on %s not covered (%s) — denied",
+                             pending.action_name, pending_id, refusal)
+                return self._deny_fields(
+                    created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
+                    context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
+                    producers=pending.producers, authority=authority, posture=posture,
+                    verdict="denied", by=decision.by, reason=refusal,
+                    actor_first_estimate=decision.first_estimate, terminal_state="timed_out",
+                )
         verdict = "approved" if decision.by == "human" else "auto"  # human reply vs timeout auto-fire
         # ``by`` names the decider: a human reply = "human"; a silence-timeout auto-fire of a manual
         # cooling-off action = "on-loop". (A binding's pending never reaches here: it is a journaled hold.)
@@ -1218,21 +1300,35 @@ class EfferentGate:
         be re-derived (fail closed to the highest rung, never the lowest), and the risk FENCE of the
         inputs it was derived from (one read: the fence and the rung cannot disagree). A run's pending
         without a sealed floor is one of those. ``(None, why, None)`` when the registry the risk is
-        re-derived from cannot be read now: no rung, and no decision, until it can."""
+        re-derived from cannot be read now: no rung, and no decision, until it can.
+
+        Below CONFIRM that rung goes through the graduation clamp (DESIGN_REV3_1 D4 (b)) for the effect the
+        hold would run, ``pending.action_name`` at the manifest's risk for it: uncovered, it is CONFIRM, with
+        why ``cover:none``, and the fence carries the cover value."""
+        rung, why, fence, _ = self._resolve_rung(pending, posture, hold)
+        return rung, why, fence
+
+    def _resolve_rung(self, pending: PendingAction, posture: Posture, hold: dict[str, Any]
+                      ) -> tuple[Posture | None, str | None, str | None, bool]:
+        """:meth:`_resolve_posture`, and whether the clamp was consulted (the fence carries a cover value)."""
         if pending.risk_floor is None:
-            return Posture.REFUSE_ESCALATE, "revalidate:unsealed_risk_floor", None
+            return Posture.REFUSE_ESCALATE, "revalidate:unsealed_risk_floor", None, False
         try:
             floor = Posture[pending.risk_floor]
         except KeyError:
-            return Posture.REFUSE_ESCALATE, "revalidate:corrupt_risk_floor", None
+            return Posture.REFUSE_ESCALATE, "revalidate:corrupt_risk_floor", None, False
         manifest_risk = self._manifest_risk(pending.action_name)
         if manifest_risk is not None:
             floor = max(floor, risk_floor(manifest_risk))
         binding_id = pending.authority.get("binding_id")
-        now, why = self._binding_risk_now(binding_id, hold["effect_id"], hold.get("chain"))
+        binding, now, why = self._binding_risk_now(binding_id, hold["effect_id"], hold.get("chain"))
         if now is None:
-            return (None if why == _REGISTRY_UNREADABLE else Posture.REFUSE_ESCALATE), why, None
-        return max(posture, floor, risk_floor(now)), None, _risk_fence(manifest_risk, now)
+            return (None if why == _REGISTRY_UNREADABLE else Posture.REFUSE_ESCALATE), why, None, False
+        rung = max(posture, floor, risk_floor(now))
+        if rung >= Posture.CONFIRM:
+            return rung, None, _risk_fence(manifest_risk, now), False
+        rung, cover = self._clamp(rung, self._effect(pending.action_name, manifest_risk, now, binding))
+        return rung, ("cover:none" if cover == COVER_NONE else None), _risk_fence(manifest_risk, now, cover), True
 
     def _manifest_risk(self, action_name: str) -> ActionRisk | None:
         """The manifest's entry for ``action_name``, or ``None`` when it declares none."""
@@ -1272,49 +1368,153 @@ class EfferentGate:
         return binding, ""
 
     def _binding_risk_now(self, binding_id: Any, effect_id: Any, chain: Any,
-                          conn: sqlite3.Connection | None = None) -> tuple[ActionRisk | None, str]:
-        """The risk of the link ``effect_id`` as the binding's risk resolver derives it NOW, from the sealed
-        binding (:meth:`_read_binding`). ``(None, why)`` when it cannot be derived (no resolver, the binding
-        is absent or does not seal, the resolver raises): the caller fails closed; ``why`` is
-        :data:`_REGISTRY_UNREADABLE` when the registry could not be read, which a repair clears."""
+                          conn: sqlite3.Connection | None = None
+                          ) -> tuple[Binding | None, ActionRisk | None, str]:
+        """The sealed binding (:meth:`_read_binding`) and the risk of the link ``effect_id`` as the binding's
+        risk resolver derives it NOW from it. ``(binding or None, None, why)`` when the risk cannot be derived
+        (no resolver, the binding is absent or does not seal, the resolver raises): the caller fails closed;
+        ``why`` is :data:`_REGISTRY_UNREADABLE` when the registry could not be read, which a repair clears."""
         if self._binding_risk is None:
-            return None, "revalidate:binding_risk_unavailable:no_resolver"
+            return None, None, "revalidate:binding_risk_unavailable:no_resolver"
+        binding: Binding | None = None
         try:
             link = int(str(effect_id).removeprefix("link-"))
             binding, why = self._read_binding(binding_id, chain, conn)
             if binding is None:
-                return None, why
-            return self._binding_risk(binding, link), ""
+                return None, None, why
+            return binding, self._binding_risk(binding, link), ""
         except Exception as e:  # noqa: BLE001 — an unknown tool, a malformed record: fail closed
             _log.warning("efferent gate: cannot re-derive the risk of %s (%s): %s", binding_id,
                          type(e).__name__, e)
-            return None, f"revalidate:binding_risk_unavailable:{type(e).__name__}"
+            return binding, None, f"revalidate:binding_risk_unavailable:{type(e).__name__}"
 
     def _fence_now(self, conn: sqlite3.Connection, action_name: str, binding_id: Any, effect_id: Any,
-                   chain: Any, *, with_binding: bool) -> str:
+                   chain: Any, *, with_binding: bool, clamped: bool = False) -> str:
         """The risk fence read again at an effect's admission, in its transaction (the journal calls it):
-        the manifest's entry for the action now and, ``with_binding``, the binding's risk for the link now.
-        Raises when the inputs cannot be read, which the journal reports as UNCLASSIFIED (held)."""
+        the manifest's entry for the action now and, ``with_binding``, the binding's risk for the link now;
+        then, ``clamped`` (the clamp was consulted for the rung), the cover value the coverage source's
+        ``peek`` gives the effect now. The peek holds the last authority read (DESIGN_REV3_1 D3): after it,
+        only the digest is computed. Raises when the inputs cannot be read, which the journal reports as
+        UNCLASSIFIED (held)."""
+        manifest_now = self._manifest_risk(action_name)
         binding_now: ActionRisk | None = None
+        binding: Binding | None = None
         if with_binding:
-            binding_now, why = self._binding_risk_now(binding_id, effect_id, chain, conn)
+            binding, binding_now, why = self._binding_risk_now(binding_id, effect_id, chain, conn)
             if binding_now is None:
                 raise LookupError(why or "binding risk unavailable")
-        return _risk_fence(self._manifest_risk(action_name), binding_now)
+        cover: str | None = None
+        if clamped:
+            if not with_binding:
+                binding = self._binding_or_none(binding_id, chain, conn)
+            cover = self._cover_peek(self._effect(action_name, manifest_now, binding_now, binding))
+        return _risk_fence(manifest_now, binding_now, cover)
+
+    # --- the graduation clamp (14b DESIGN_REV3 §4-§5, DESIGN_REV3_1 D1, D3, D4) ----------------------------
+    @staticmethod
+    def _clamps(authority: AuthorityScope) -> bool:
+        """Whether a forward request is a binding's effect, for which the clamp is consulted below CONFIRM
+        (DESIGN_REV3_1 D4 (a)): never keyed on ``ratified_posture`` or ``request.risk``."""
+        return authority.grantor == "binding" and bool(authority.binding_id)
+
+    def _binding_or_none(self, binding_id: Any, chain: Any, conn: sqlite3.Connection | None) -> Binding | None:
+        """The sealed binding the clamp reads the trigger and family from, or ``None`` when none reads."""
+        try:
+            binding, _ = self._read_binding(binding_id, chain, conn)
+        except Exception as e:  # noqa: BLE001 — honest-config only: an unreadable binding names no trigger
+            _log.warning("efferent gate: binding %s unreadable for the clamp (%s): %s", binding_id,
+                         type(e).__name__, e)
+            return None
+        return binding
+
+    @staticmethod
+    def _effect(action_name: str, action_risk: ActionRisk | None, tools_risk: ActionRisk | None,
+                binding: Binding | None) -> Effect:
+        """The effect the clamp judges: the action that runs, the manifest's risk for it (``None``: not
+        declared, so covered by nothing), the binding's tools risk, and the trigger type and family read from
+        the binding (honest-config; ``None`` when there is no binding to read)."""
+        return Effect(action_name=action_name, action_risk=action_risk, tools_risk=tools_risk,
+                      trigger_type=binding.trigger.type if binding is not None else None,
+                      family=binding_family(binding) if binding is not None else None)
+
+    def _coverage_view(self) -> CoverageView | None:
+        """``refresh()`` of the coverage source, outside any store transaction: the coverage a decision is
+        made under. ``None`` (nothing covered) when no source is wired or it raised (its contract is never
+        to raise: a failed refresh is an :class:`~levain.autonomic.coverage.Uncovered`)."""
+        if self._coverage is None:
+            return None
+        try:
+            return self._coverage.refresh()
+        except Exception as e:  # noqa: BLE001 — a source that cannot answer covers nothing
+            _log.error("efferent gate: coverage refresh RAISED (%s): %s — uncovered", type(e).__name__, e)
+            return None
+
+    def _cover_peek(self, effect: Effect) -> str:
+        """The cover value ``peek`` gives ``effect`` now: :data:`~levain.autonomic.coverage.COVER_NONE`
+        with no source wired (as the decision gave), :data:`~levain.autonomic.coverage.COVER_MOVED` when the
+        source raised or answered no value (it equals no decided fence, so the effect is decided again)."""
+        if self._coverage is None:
+            return COVER_NONE
+        try:
+            value = self._coverage.peek(effect, self._clock())
+        except Exception as e:  # noqa: BLE001 — forces a re-decide
+            _log.warning("efferent gate: coverage peek RAISED (%s): %s", type(e).__name__, e)
+            return COVER_MOVED
+        return value if isinstance(value, str) and value else COVER_MOVED
+
+    def _clamp(self, candidate: Posture, effect: Effect) -> tuple[Posture, str]:
+        """The rung ``effect`` runs at from a ``candidate`` below CONFIRM, and its cover value, under a fresh
+        ``refresh()``: covered, the stricter of the candidate and the strictest covering policy's lowest rung;
+        uncovered (no source, a failed refresh, no live anchored policy signing this action at this risk),
+        CONFIRM. The floor of the action's and the tools' risk can only raise it. The decision's time is read
+        before its coverage, so a policy that lapses after the refresh is caught at admission, not here."""
+        try:
+            now = self._clock()
+        except Exception as e:  # noqa: BLE001 — no clock, no proof a policy is live
+            _log.error("efferent gate: clock FAILED in the clamp (%s): %s — uncovered", type(e).__name__, e)
+            return max(candidate, Posture.CONFIRM), COVER_NONE
+        view = self._coverage_view()
+        rung, value = operative(candidate, effect, view, now)
+        return rung, (value if value is not None else COVER_NONE)
+
+    def _manual_cover_unavailable(self) -> bool:
+        """R9 A1, the screen before a manual pending is claimed for an unattended approval: whether the
+        coverage cannot be read now (a source is wired and its refresh failed). Such a pending is left
+        open, unclaimed, for the next sweep. Coverage that reads and covers nothing is not this: that pending
+        is claimed and denied (``cover:none``)."""
+        if self._coverage is None:
+            return False
+        view = self._coverage_view()
+        return view is None or isinstance(view, Uncovered)
+
+    def _manual_cover_refusal(self, pending: PendingAction, posture: Posture) -> str | None:
+        """DESIGN_REV3_1 D1, on a claimed manual pending an unattended approval would fire: ``None`` only
+        when a live anchored policy covers ``Effect(action, its manifest risk, None, None, None)`` at a rung
+        no stricter than ``posture``, and the peek that follows the refresh gives the same cover value.
+        Trigger and family are ``None``, so only a policy that lists neither covers a manual effect."""
+        effect = self._effect(pending.action_name, self._manifest_risk(pending.action_name), None, None)
+        rung, value = self._clamp(posture, effect)
+        if value == COVER_NONE or rung > posture:
+            return "cover:none"
+        if self._cover_peek(effect) != value:
+            return "cover:moved"
+        return None
 
     def _forward_fence(self, request: ActionRequest, manifest_risk: ActionRisk | None,
-                       risk: ActionRisk) -> _Fence:
+                       risk: ActionRisk, cover: str | None) -> _Fence:
         """The fence of a journaled request fired on the forward path: the inputs its rung was decided
         from (the binding's risk the request carries, or for an action the manifest classifies alone, the
-        manifest's entry), and how to read them again at admission."""
+        manifest's entry, and the clamp's cover value when it was consulted), and how to read them again at
+        admission."""
         assert request.run is not None
         with_binding = request.risk is not None
-        value = _risk_fence(manifest_risk, risk if with_binding else None)
+        value = _risk_fence(manifest_risk, risk if with_binding else None, cover)
         chain = request.continuation
         binding_id = request.authority.binding_id
         effect_id = request.run.effect_id
+        clamped = cover is not None
         return _Fence(value, lambda conn: self._fence_now(conn, request.action_name, binding_id, effect_id,
-                                                          chain, with_binding=with_binding))
+                                                          chain, with_binding=with_binding, clamped=clamped))
 
     def _unattended_approval_allowed(self, pending: PendingAction, posture: Posture) -> bool:
         """An approval no human gave (``by != "human"``) is the silence default of a cooling-off rung,
@@ -1443,6 +1643,8 @@ class EfferentGate:
         outcome = self.resolve(pending.pending_id, decision)  # resolve CLAIMS + re-verifies the seal
         if outcome.refused and outcome.reason in ("unknown_pending", "journal:already_decided"):
             return None   # snapshot-vs-claim race (another resolver won) — a non-decision
+        if outcome.refused and outcome.reason == "cover:unavailable":
+            return None   # the coverage could not be read: left open, unclaimed, for the next sweep (R9 A1)
         return outcome
 
     def _sweep_holds(self, now: _dt.datetime, gate_for: Callable[[], "EfferentGate"]) -> list[GateOutcome]:
