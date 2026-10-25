@@ -41,6 +41,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   Doctor only reads what your account can read; it leases and runs nothing.
 
 ### Changed
+- **Claude Code 2.1.310 is a tested version for the consent hook.** Its hook canary passed (the hook fired on the
+  sentinel write and the write was denied), so installing the hook for 2.1.310 no longer needs the untested-version
+  override.
 - **The seed memory files no longer count layers.** `memory.md` and `partnership.md` now say the agent's memory is never a log
   plus a memory file: a governed, versioned state machine (an append-only episode log, consolidated by one writer into
   continuity, an immune system that decides what may graduate, and a pattern tier recalled on cue).
@@ -68,12 +71,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   session and sends them to the controller, which keeps them in an append-only file, checked and de-duplicated, with a
   record that fails its check set aside and reported back to keys. A full outbox makes keys refuse further ticketed calls.
   No `levain` command runs either service yet.
-- **The chat launch's network decider is built; no chat launch uses it.** For each request it decides to let it through
-  silently, hold it for a card, or refuse it. It refuses any destination that resolves to an internal address, carries a
-  held key only to a declared repo on its host, removes credential headers from every request, and records a request's
-  path with its query values left out. Each request's attempt and outcome are kept in the dispatch store, and a Node glue
-  file connects the decider to the sandbox runtime. `levain chat key` above is the one part you can run, and it only
-  writes signed setup records; `levain serve --chat` does not call the decider.
+- **The parts of the chat launch's network filter exist; the filter itself does not run yet.** Built: the request
+  parser, the per-request verdict (let it through, hold it for a card, or refuse it), the rule that carries a held key
+  only to a declared repo on its host, the removal of credential headers, a request path recorded with its query values
+  left out, the per-request attempt and outcome records, and the Node glue for the sandbox runtime. Not built: the
+  process that answers the sandbox runtime's questions with those verdicts, the card, and the chat launch that would
+  start them. `levain chat key` above is the one part you can run, and it only writes signed setup records.
 
 ## [0.11.23] — 2026-10-24
 
