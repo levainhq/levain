@@ -7,6 +7,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **Dispatch runs take their slot from a pool CONTROL keeps in step with the machine's real slots.** A run ticket is
+  refused (`no-free-slot`) when no free slot is left for it, one egress slot always stays yours, and `POOL` reports how
+  many are free. A finished dispatch run gives its ticket back on its own once its slot is cleaned, even when the slot
+  was reused before Levain looked.
+- **A dispatch run's settings are checked against its run ticket before anything starts.** A run asking for other
+  routes, another model, other verifier steps or another driver than its ticket names is refused, and so is a run whose
+  ticket details never reached the machine.
+
+## [0.11.24] — 2026-10-25
+
+### Added
 - **A provider can report a task's spend as tokens from transcripts.** The topology contract accepts `cost.source: "transcript"`
   (tokens only, never a price) and the Work lens draws it as "N tokens from transcripts". Levain's own tasks still report no cost:
   none of them names the session that works it.
@@ -22,8 +33,28 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   pairing link and revokes a device alone. A new device opens the offering device's `/pair#code=...` link (it also opens
   from another site as a top-level navigation) and trades the code for its own key; "Pair it again" asks before it
   replaces a key this browser already holds. No QR code is drawn: the link is the offer.
+- **`levain chat key setup`, `revoke` and `list` manage the keys Levain would hold for a chat launch.** A setup record
+  names one entity, one host (a DNS name; no wildcard, IP literal or port) and the macOS keychain item (`--source` is its
+  service, `--account` its account) whose value requests to that host on port 443 would carry, as a bearer token or, with
+  `--basic-user`, as HTTP Basic. The value never passes through the command. Setup refuses unless exactly one keychain item
+  matches, shows the record and asks `y/N` before signing it with an enrolled laptop-presence key (`--signing-key`; with no
+  terminal it signs only with `--yes`), and needs `--expires` (a duration or a UTC time, at most 30 days). On a git fetch
+  the key rides only a repo the record declares: each `--repo` plus, with `--workspace`, that repo's https remotes on the
+  host, read once at setup and shown to you with any remote it left out. One live record per entity and host; `--replace`
+  supersedes it. `revoke` takes the record id that `list` prints and accepts any enrolled key. Nothing yet reads these
+  records: no chat launch attaches a key (see Groundwork).
+- **`levain doctor` shows the agent-session isolation install.** An `agent sessions` row reads `not installed` (neutral)
+  when the isolation store (`/private/var/levain` on macOS, `/var/levain` on Linux) is absent, and fails on a symbolic link
+  where the store, its `slots` or its `policy` directory should be, or on a missing `slots` directory. An `agent slots` row
+  counts the usable slots against the pool configuration ("N usable of M required", naming a short class, slots that are not
+  usable, retired slots it did not count and entries it ignored), and fails when the pool configuration is missing or
+  unreadable. An `agent store free space` row fails under 8 GiB, where new sessions are refused and running ones braked.
+  Doctor only reads what your account can read; it leases and runs nothing.
 
 ### Changed
+- **Claude Code 2.1.310 is a tested version for the consent hook.** Its hook canary passed (the hook fired on the
+  sentinel write and the write was denied), so installing the hook for 2.1.310 no longer needs the untested-version
+  override.
 - **The seed memory files no longer count layers.** `memory.md` and `partnership.md` now say the agent's memory is never a log
   plus a memory file: a governed, versioned state machine (an append-only episode log, consolidated by one writer into
   continuity, an immune system that decides what may graduate, and a pattern tier recalled on cue).
@@ -38,6 +69,25 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **A broker that is not running answers a paired device with 503, never a refusal that drops its token.** While the
   broker is starting, owned by another process or disabled, a request carrying a paired token gets `503
   broker_unavailable` with `Retry-After: 2`.
+
+### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- **Per-run tickets exist in the isolation controller.** The controller can mint a ticket for a dispatch run, cancel one
+  that is not yet bound to a session, and report an attempt's state. Minting the same attempt again with the same request
+  returns the same ticket; with a different request it is refused. Every ticket is kept in one append-only journal that the
+  controller rebuilds its counts from at start, and a journal it cannot read whole stops it from starting. A failed write
+  stops ticket requests until the controller restarts. A ceiling file can cap the money reserved per run, the open tickets
+  and the runs per day. A session token resolves with the facts of the ticket it is bound to. No `levain` command runs the
+  controller yet.
+- **Ticketed calls leave a lineage record.** The keys service writes one record for each upstream exchange of a ticketed
+  session and sends them to the controller, which keeps them in an append-only file, checked and de-duplicated, with a
+  record that fails its check set aside and reported back to keys. A full outbox makes keys refuse further ticketed calls.
+  No `levain` command runs either service yet.
+- **The parts of the chat launch's network filter exist; the filter itself does not run yet.** Built: the request
+  parser, the per-request verdict (let it through, hold it for a card, or refuse it), the rule that carries a held key
+  only to a declared repo on its host, the removal of credential headers, a request path recorded with its query values
+  left out, the per-request attempt and outcome records, and the Node glue for the sandbox runtime. Not built: the
+  process that answers the sandbox runtime's questions with those verdicts, the card, and the chat launch that would
+  start them. `levain chat key` above is the one part you can run, and it only writes signed setup records.
 
 ## [0.11.23] — 2026-10-24
 

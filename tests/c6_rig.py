@@ -32,7 +32,7 @@ from levain.slot import routemaps as RM
 from tests import b2_keys_rig as B2
 from tests import c3_rig as R3
 from tests.test_routemaps import DISPATCH_UID, Signer, Store, item, route, submit
-from tests.test_tickets import d_attach_claims, d_mint_claims, mint_args, ticket_of, write_ceiling
+from tests.test_tickets import d_attach_claims, d_mint_claims, mint_args, sync_free, ticket_of, write_ceiling
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = str(ROOT / "tests" / "c6_keys_driver.py")
@@ -166,6 +166,7 @@ class World:
         self.ctl = R3.ControlThread(str(self.d), routes_dir=self.st.routes, dispatch_uid=DISPATCH_UID,
                                     lineage_dir=self.lineage).start()
         control = self.ctl.control
+        sync_free(control)                       # S1 3c-7: CONTROL's pool mirror starts empty and admits no mint
         real = control._op_lineage_append
 
         def spy(conn, args):

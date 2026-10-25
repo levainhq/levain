@@ -30,8 +30,10 @@ its start pass and the RELOADs to keys, each under the one activation lock; S1 3
 ``-CANCEL`` / ``-STATUS`` over the ticket journal (:mod:`levain.slot.tickets`), and the binding of a ticket: its
 ``LEASE-OPEN {ticket}``, the ``ATTACH`` of a ticket-bound lease (``ticket_facts``), ``MINT``'s claims against the
 ticket and ``TOKEN-RESOLVE``'s ``run``, read from the ticket record and never from root's claims; S1 3c-6b keys'
-``LINEAGE-APPEND {envelope}`` into the lineage sink (:mod:`levain.slot.lineage`). Root's ``SLOT-SYNC`` and the other dispatch verbs (§3.3, §3.5, §3.6) are later 3c sessions': until then
-every other peer, and every other verb of a known one, is refused ``verb-not-allowed-for-peer`` (see
+``LINEAGE-APPEND {envelope}`` into the lineage sink (:mod:`levain.slot.lineage`); S1 3c-7 root's ``SLOT-SYNC`` into
+the pool MIRROR (:class:`PoolMirror`, §3.5 Pool), the release of a bound ticket a sync shows over, ``RUN-TICKET-MINT``'s
+``no-free-slot:<class>`` and dispatch's ``POOL``. The other dispatch verbs (§3.3, §3.5, §3.6) are later 3c sessions':
+until then every other peer, and every other verb of a known one, is refused ``verb-not-allowed-for-peer`` (see
 :data:`PEER_VERBS`). Every act on keys and the reaper wake are seams: :class:`KeysAdmin` supplies the keys ones when
 CONTROL is given one.
 """
@@ -63,6 +65,7 @@ from levain.slot import records as R
 from levain.slot import lineage as LN
 from levain.slot import routemaps
 from levain.slot import tickets as T
+from levain.slot.grammar import INDEX_SPACE
 from levain.slot.layout import STORE, session_repo
 from levain.slot.runtime_grammar import HANDLE_BYTES, _handle, _keys
 
@@ -72,16 +75,17 @@ _LEN = struct.Struct(">I")
 
 ROOT_UID = 0
 
-#: §3.3's verbs per peer, as built so far (3c-6b adds keys' ``LINEAGE-APPEND``). Later 3c sessions add root's ``SLOT-SYNC`` and
-#: the rest of the ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
+#: §3.3's verbs per peer, as built so far (3c-6b adds keys' ``LINEAGE-APPEND``, 3c-7 root's ``SLOT-SYNC`` and dispatch's
+#: ``POOL``). Later 3c sessions add the rest of the ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
 #: :meth:`Control.peer_kind` is given its uid, else ``foreign``). keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` / ``LINEAGE-APPEND`` are answered only on the connection that
 #: holds the current ``KEYS-ATTACH`` (else ``not-attached``).
 PEER_VERBS: Mapping[str, frozenset[str]] = {
     "operator": frozenset({"LEASE-OPEN", "STATUS"}),
-    "root": frozenset({"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"}),
+    "root": frozenset({"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET", "SLOT-SYNC"}),
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS", "LINEAGE-APPEND"}),
-    "dispatch": frozenset({"LEASE-OPEN", "ROUTE-SUBMIT", "RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS"}),
+    "dispatch": frozenset({"LEASE-OPEN", "ROUTE-SUBMIT", "RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS",
+                           "POOL"}),
     "foreign": frozenset(),
 }
 
@@ -96,6 +100,8 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "SECRETS": (frozenset({"session"}),) * 2,
     "REVOKE": (frozenset({"session"}),) * 2,
     "REVOKED-SET": (frozenset(), frozenset()),
+    "SLOT-SYNC": (frozenset({"slots"}),) * 2,
+    "POOL": (frozenset(), frozenset()),
     "QUEUE-RESOLVE": (frozenset({"slot", "cap_digest"}),) * 2,
     "TOKEN-RESOLVE": (frozenset({"token_digest"}),) * 2,
     "KEYS-ATTACH": (frozenset({"generation", "item_sha256"}),) * 2,
@@ -133,6 +139,9 @@ QUEUE_RUN_KEYS = frozenset({"run_id", "job_id", "run_index", "contract_digest", 
 #: ``TOKEN-RESOLVE``'s ``run`` (§3.3) beside ``run_id``: the bound ticket's own facts, never root's claims.
 RESOLVE_RUN_FACTS = ("job_id", "run_index", "contract_digest", "route", "routemap_generation", "route_policy_digest",
                      "model_requested", "reserved_microdollars")
+
+#: The most entries one ``SLOT-SYNC`` carries: every configured slot of both classes.
+SLOT_SYNC_MAX = 2 * INDEX_SPACE
 
 #: DECISION: the backoff of the lease-EOF revoke's lock retry (§3.1 step 3 fixes only "with backoff
 #: until it is taken, never dropped").
@@ -449,6 +458,90 @@ def digest_of(handle: str) -> str:
     return "sha256:" + hashlib.sha256(handle.encode("utf-8")).hexdigest()
 
 
+@dataclass
+class _Mirrored:
+    """One mirror entry: root's last reported state for a (class, index), and whether the last sync listed it."""
+
+    rev: int
+    lease_seq: int
+    state: str
+    session: str | None
+    eligible: bool
+    present: bool = True
+
+
+class PoolMirror:
+    """CONTROL's §3.5 pool MIRROR, never a source: ROOT owns slot truth in ``L/slots/{e,v}<n>/state`` and the reaper
+    sends every state file it read under the pool lock as one ``SLOT-SYNC``. Memory only: a CONTROL restart starts it
+    empty, so no slot is free until the first sync, which fails closed.
+
+    MERGE (§3.5): an entry replaces the mirror's for its (class, index) only when its ``rev`` is GREATER (``rev`` is +1
+    on every write of the file, never reset), so a snapshot read before a ``prepare`` and delivered after its ``ATTACH``
+    changes nothing. An index the sync does not list is NOT REUSABLE (``present`` cleared, its ``rev`` kept, so a stale
+    sync can never bring back an older state); the same ``rev`` listed again restores it. ``ATTACH`` sets the entry to
+    ``leased`` to its session at the claims' ``slot_rev`` at once (:meth:`mark_leased`), so bind-to-sync lag never
+    over-admits. Known edge: a slot whose state file is re-created with a lower ``rev`` stays not reusable until a
+    CONTROL restart (under-counted, never over-admitted)."""
+
+    def __init__(self) -> None:
+        self._mu = threading.Lock()
+        self._e: dict[tuple[str, int], _Mirrored] = {}
+
+    def merge(self, states: "list[R.SlotState]") -> None:
+        listed = {(st.slot.slot_class, st.slot.index) for st in states}
+        with self._mu:
+            for st in states:
+                key = (st.slot.slot_class, st.slot.index)
+                cur = self._e.get(key)
+                if cur is None or st.rev > cur.rev or (st.rev == cur.rev and not cur.present):
+                    self._e[key] = _Mirrored(st.rev, st.lease_seq, st.state, st.session, st.dispatch_eligible)
+            for key, cur in self._e.items():
+                if key not in listed:
+                    cur.present = False
+
+    def mark_leased(self, cls: str, index: int, session: str, lease_seq: int,
+                    rev: int) -> "tuple[_Mirrored | None, _Mirrored | None]":
+        """The entry shows ``leased`` to ``session`` at ``rev`` when ``rev`` is greater than the mirror's. Returns
+        (the entry it replaced, the mark), the mark ``None`` when nothing changed: :meth:`unmark`'s arguments."""
+        with self._mu:
+            cur = self._e.get((cls, index))
+            if cur is None or rev > cur.rev:
+                mark = _Mirrored(rev, lease_seq, "leased", session, cur.eligible if cur is not None else False)
+                self._e[(cls, index)] = mark
+                return cur, mark
+            return cur, None
+
+    def unmark(self, cls: str, index: int, prior: "_Mirrored | None", mark: "_Mirrored | None") -> None:
+        """Undo :meth:`mark_leased` (fix r1, complement 3: an ATTACH that refused after its mark): the entry goes back
+        to ``prior`` only while it is still that mark, so a sync merged in between stands."""
+        with self._mu:
+            if mark is None or self._e.get((cls, index)) is not mark:
+                return
+            if prior is None:
+                del self._e[(cls, index)]
+            else:   # a sync that left the slot out meanwhile flagged the mark absent: that flag stands
+                self._e[(cls, index)] = replace(prior, present=prior.present and mark.present)
+
+    def free(self, cls: str) -> int:
+        """The slots of ``cls`` a ticket could take: listed by the last sync, ``reusable`` AND ``dispatch_eligible``."""
+        with self._mu:
+            return sum(1 for (c, _i), e in self._e.items()
+                       if c == cls and e.present and e.state == "reusable" and e.eligible)
+
+    def past_session(self, cls: str, index: int, session: str) -> bool:
+        """``REVOKED-SET``'s ``slot_reusable``: the mirror lists the slot and it is no longer leased to ``session``
+        (§3.3: a RETAINED record stays in the set while the mirror shows its slot still leased to it; no entry keeps it
+        there too, which is the safe side)."""
+        with self._mu:
+            e = self._e.get((cls, index))
+            return e is not None and e.present and not (e.state == "leased" and e.session == session)
+
+    def entry(self, cls: str, index: int) -> "_Mirrored | None":
+        with self._mu:
+            e = self._e.get((cls, index))
+            return None if e is None else replace(e)
+
+
 def _default_is_brokered(claims: Mapping[str, object]) -> bool:
     # DECISION: §3.2 mints a token "only if the registered claims carry a `brokered` route"; a route's type
     # lives in the route maps (§4.3), which CONTROL loads in session 3c. Until then the session's
@@ -747,9 +840,9 @@ class Control:
     ``keys_front_arm(session, reg_token)`` (default: refused ``keys-unavailable``; keys' ``registration-stale``
     arrives as an :class:`AdminRefused`) · ``keys_uid`` (the ``_levain_keys`` peer, whose verb is
     ``TOKEN-RESOLVE``; ``None``: no peer is keys) ·
-    ``slot_reusable(class, index, session) -> bool`` (the §3.5 mirror; default ``False``, which keeps a
-    RETAINED session in ``REVOKED-SET``: the revoker's kill is uid + start checked, so over-inclusion is
-    safe and under-inclusion is not) · ``is_brokered(claims) -> bool`` · ``clock() -> epoch seconds`` (persisted
+    ``slot_reusable(class, index, session) -> bool`` (default: the §3.5 mirror, :meth:`PoolMirror.past_session`, which
+    keeps a RETAINED session in ``REVOKED-SET`` while it has no entry: the revoker's kill is uid + start checked,
+    so over-inclusion is safe and under-inclusion is not) · ``is_brokered(claims) -> bool`` · ``clock() -> epoch seconds`` (persisted
     timestamps only) · ``monotonic() -> seconds`` (every deadline and interval: a wall-clock step never moves one) ·
     ``sleep(seconds)`` (the EOF retry's backoff) · ``qbroker_uid`` (the ``_levain_qbroker`` peer; ``None``: no
     peer is the broker) · ``run_facts(session) -> {run_id, job_id, run_index, contract_digest, model_requested} |
@@ -774,7 +867,7 @@ class Control:
                  wake_reaper: Callable[[], object] = _nothing,
                  keys_front_register: Callable[..., object] = _keys_unavailable,
                  keys_front_arm: Callable[[str], object] = _keys_unavailable,
-                 slot_reusable: Callable[[str, int, str], bool] = lambda c, i, s: False,
+                 slot_reusable: Callable[[str, int, str], bool] | None = None,
                  is_brokered: Callable[[Mapping[str, object]], bool] = _default_is_brokered,
                  clock: Callable[[], float] = time.time,
                  monotonic: Callable[[], float] = time.monotonic,
@@ -812,7 +905,9 @@ class Control:
         self._wake_reaper = wake_reaper
         self._keys_front_register = keys_front_register
         self._keys_front_arm = keys_front_arm
-        self._slot_reusable = slot_reusable
+        #: S1 3c-7: the §3.5 pool mirror root's SLOT-SYNC feeds (memory only)
+        self.pool = PoolMirror()
+        self._slot_reusable = slot_reusable if slot_reusable is not None else self.pool.past_session
         self._is_brokered = is_brokered
         self._clock = clock
         self._monotonic = monotonic
@@ -876,14 +971,15 @@ class Control:
 
     # -- start pass (§1 CONTROL row, §1.3) ---------------------------------------------------------------
 
-    def start(self) -> None:
+    def start(self, *, wake: bool = True) -> None:
         """CONTROL's start pass: load every record, then treat every record whose lease was live as a
         lease EOF (no lease survives a CONTROL restart): ``lease_live:false``, then live state ->
         REVOKED, then the keys drop + reaper wake. Work is retained by END, which the reaper runs.
 
         Every record already at or past REVOKED gets its ``DROP-SESSION`` again (idempotent, §4.9): a
         CONTROL that died between the REVOKED write and the drop, or whose drop never got an ack, owes it
-        still. Then one reaper wake. The split keys off the STATE alone: a record past live that still says
+        still. Then a reaper wake, whatever the records were (the pool mirror is empty until root's sync). The
+        split keys off the STATE alone: a record past live that still says
         ``lease_live:true`` (CONTROL died between a CAS into REVOKED and its after-acts) has the flag cleared,
         then its drop and the wake like every other record past live.
 
@@ -896,7 +992,10 @@ class Control:
         :class:`ControlServer`, unlinks the first one's socket. A start that fails after taking it (a route recovery,
         the record load, a journal refused `journal-inconsistent`, the revoke pass) releases it before the failure
         is raised (3c-5 fix 3, L3 r2): a CONTROL that did not start holds nothing, so a replacement in the same process
-        is never refused ``control-running``."""
+        is never refused ``control-running``.
+
+        ``wake=False`` leaves the final reaper wake to the caller, which makes it once its listener is up
+        (:meth:`ControlServer.start`: the woken reaper dials CONTROL's socket)."""
         if self.tickets is not None:
             try:
                 self.tickets.acquire()
@@ -904,7 +1003,7 @@ class Control:
                 self.seam_errors.append(("start", "", e))
                 raise
         try:
-            self._start_pass()
+            self._start_pass(wake)
         except BaseException:
             if self.tickets is not None:
                 self.tickets.close()
@@ -912,7 +1011,7 @@ class Control:
                 self.lineage.close()
             raise
 
-    def _start_pass(self) -> None:
+    def _start_pass(self, wake: bool = True) -> None:
         """:meth:`start` after the journal lock: the route maps' start pass, the records, the ticket journal, the
         revoke pass."""
         if self.routes is not None:
@@ -926,7 +1025,6 @@ class Control:
             # S1 3c-6b: the sink read whole (membership, seq), its torn tail cut, before any LINEAGE-APPEND is served;
             # a corrupt sink refuses the start ``lineage-corrupt``
             self.lineage.start()
-        past = False
         for rec in sorted(self.store.all(), key=lambda r: r.session):
             if rec.state in R.LIVE_STATES:
                 self._revoke_after_eof(rec.session)
@@ -934,8 +1032,9 @@ class Control:
             if rec.lease_live:
                 self._revoke_after_eof(rec.session)      # past live: clears the flag only
             self._drop(rec.session)
-            past = True
-        if past:
+        # always (3c-7 fix r1, obs 2): the pool mirror starts empty and admits no mint until root's next SLOT-SYNC,
+        # which the woken reaper's pass sends
+        if wake:
             self._wake()
 
     def stop(self) -> None:
@@ -1354,36 +1453,50 @@ class Control:
             lease.used = True
         facts: dict[str, object] | None = None
         landed: R.NotDurable | None = None
+        where = claims["slot"]
+        slot = (str(where["class"]), int(where["index"]), int(claims["lease_seq"]))   # type: ignore[index]
         try:
             if lease.ticket is not None:
                 held = self._ticket_store().holdable(lease.ticket)
                 if (claims["kind"], claims["class"]) != T.RENDERS_AS[str(held.facts["kind"])]:
                     raise Refused("claims-mismatch")
-            with self.store.lock(session):
-                if self.store.get(session) is not None:
-                    raise Refused("session-exists")
-                if lease.ticket is not None:
-                    # journaled before the record exists: a crash between the two leaves the ticket bound and no
-                    # session, which runs nothing; CONTROL's next start unbinds it (head ruling H8)
-                    facts = dict(self._ticket_store().bind(lease.ticket, session).facts)
-                try:
-                    rec = R.SessionState(session=session, generation=0, state=R.ALLOCATED, claims=claims,
-                                         lease_live=True, event_kind="state",
-                                         updated_at=R.timestamp(self._clock()))
-                    self.store.put(rec)
-                except R.NotDurable as e:
-                    # the record was renamed into place: it exists and the bind stands, so the ATTACH is SETTLED
-                    # below as one that landed (fix 2, codex 4 + complement 1), then its failure is answered
-                    landed = e
-                except BaseException:
-                    # 3c-5 fix 1 (L2 4a): no record was written, so the binding is undone and journaled; if that
-                    # append fails the store is poisoned and the restart's H8 pass unbinds it instead
-                    if facts is not None:
-                        try:
-                            self._ticket_store().unbind(str(lease.ticket), session)
-                        except Refused:
-                            pass
-                    raise
+            # §3.5 BINDING: the mirror shows the slot leased to this session at once, BEFORE the ticket leaves the
+            # unbound count, so the free count never rises between the two (prepare wrote this lease already)
+            prior, mark = self.pool.mark_leased(slot[0], slot[1], session, slot[2],
+                                                int(claims["slot_rev"]))                 # type: ignore[arg-type]
+            try:
+                with self.store.lock(session):
+                    if self.store.get(session) is not None:
+                        raise Refused("session-exists")
+                    if lease.ticket is not None:
+                        # journaled before the record exists: a crash between the two leaves the ticket bound and no
+                        # session, which runs nothing; CONTROL's next start unbinds it (head ruling H8)
+                        facts = dict(self._ticket_store().bind(lease.ticket, session, slot).facts)
+                    try:
+                        rec = R.SessionState(session=session, generation=0, state=R.ALLOCATED, claims=claims,
+                                             lease_live=True, event_kind="state",
+                                             updated_at=R.timestamp(self._clock()))
+                        self.store.put(rec)
+                    except R.NotDurable as e:
+                        # the record was renamed into place: it exists and the bind stands, so the ATTACH is SETTLED
+                        # below as one that landed (fix 2, codex 4 + complement 1), then its failure is answered
+                        landed = e
+                    except BaseException:
+                        # 3c-5 fix 1 (L2 4a): no record was written, so the binding is undone and journaled; if
+                        # that append fails the store is poisoned and the restart's H8 pass unbinds it instead
+                        if facts is not None:
+                            try:
+                                self._ticket_store().unbind(str(lease.ticket), session)
+                            except Refused:
+                                pass
+                        raise
+            except Refused as e:
+                # fix r1 (complement 3): a refusal by name tells prepare CONTROL created nothing, and prepare puts
+                # its lease back, so the mark goes too; `record-unsettled` (and any non-refusal, answered
+                # `internal-error`) is ambiguous to prepare, which keeps the slot leased, so the mark stays
+                if e.name != "record-unsettled":
+                    self.pool.unmark(slot[0], slot[1], prior, mark)
+                raise
         except BaseException:
             with self._mu:
                 lease.used = False
@@ -1730,6 +1843,38 @@ class Control:
                     out.append(r.session)
         return {"sessions": sorted(out)}
 
+    def _op_slot_sync(self, conn: Conn, args: dict) -> dict[str, object]:
+        """§3.3 / §3.5 ``SLOT-SYNC {slots}`` -> ``{}``: every state file the reaper read under the pool lock, each a
+        whole ``levain-slot-state/1`` object (``slot-state-malformed`` on any defect, ``bad-value`` for a slot listed
+        twice or more than :data:`SLOT_SYNC_MAX` entries; a refused sync changes nothing). MERGED into the mirror
+        (:meth:`PoolMirror.merge`), then every bound ticket the sync shows over is RELEASED and journaled
+        (:meth:`levain.slot.tickets.TicketStore.release_ended`). The merge stands when the release cannot be journaled
+        (``journal-unavailable`` answered): the next sync releases them."""
+        raw = args["slots"]
+        if type(raw) is not list or len(raw) > SLOT_SYNC_MAX:
+            raise Refused("bad-value", "slots")
+        states: list[R.SlotState] = []
+        seen: set[tuple[str, int]] = set()
+        for obj in raw:
+            if type(obj) is not dict:
+                raise Refused("slot-state-malformed", "an entry is not an object")
+            try:
+                data = canon.canonical_bytes(obj)
+            except (ContractError, TypeError, ValueError, RecursionError):
+                # fix r1 (complement 2): an in-process entry JSON cannot write (a wire frame is canonical already)
+                raise Refused("slot-state-malformed", "an entry is not a JSON value") from None
+            st = R.parse_slot_state(data)
+            key = (st.slot.slot_class, st.slot.index)
+            if key in seen:
+                raise Refused("bad-value", f"slots lists {st.slot.tag} twice")
+            seen.add(key)
+            states.append(st)
+        self.pool.merge(states)
+        if self.tickets is not None:
+            self.tickets.release_ended({(st.slot.slot_class, st.slot.index): (st.lease_seq, st.state)
+                                        for st in states})
+        return {}
+
     # -- the queue broker's verb ------------------------------------------------------------------------------
 
     def _op_queue_resolve(self, conn: Conn, args: dict) -> dict[str, object]:
@@ -1968,7 +2113,7 @@ class Control:
             if again is not None:
                 return {"ticket": again.ticket, "run_id": again.run_id}
             self._check_route_facts(facts)
-            t = store.mint(attempt, facts, new_handle)
+            t = store.mint(attempt, facts, new_handle, slots_free=self.pool.free)
             return {"ticket": t.ticket, "run_id": t.run_id}
 
     def _await_keys_serving_head(self) -> None:
@@ -2022,6 +2167,11 @@ class Control:
         """``RUN-TICKET-CANCEL {ticket}`` -> ``{}``: an UNBOUND ticket only (``ticket-bound`` once a lease bound it)."""
         self._ticket_store().cancel(_handle(args["ticket"], "ticket"))
         return {}
+
+    def _op_pool(self, conn: Conn, args: dict) -> dict[str, object]:
+        """§3.3 ``POOL`` -> ``{egress_free, none_free}``: the count ``RUN-TICKET-MINT`` refuses ``no-free-slot`` at
+        (§3.5 Pool: the mirror's reusable eligible slots - the open unbound tickets - 1 for egress)."""
+        return self._ticket_store().pool_free(self.pool.free)
 
     def _op_run_ticket_status(self, conn: Conn, args: dict) -> dict[str, object]:
         """``RUN-TICKET-STATUS {attempt_id}`` -> ``{ticket, state, session?}`` from the journal's attempt index
@@ -2231,8 +2381,9 @@ class ControlServer:
         self._stop = threading.Event()
 
     def start(self) -> None:
-        """The start pass first (no request is served before every live record is revoked), then bind."""
-        self.control.start()
+        """The start pass first (no request is served before every live record is revoked), then bind, then the
+        reaper wake: the woken reaper dials this socket, so it is listening and accepting before the wake."""
+        self.control.start(wake=False)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             self.path.unlink()
@@ -2246,6 +2397,7 @@ class ControlServer:
         t = threading.Thread(target=self._accept_loop, daemon=True, name="control-accept")
         t.start()
         self._threads.append(t)
+        self.control._wake()
 
     def _accept_loop(self) -> None:
         assert self._listener is not None
@@ -2422,6 +2574,7 @@ def serve(config: ServeConfig) -> int:
 
 
 __all__ = ["AdminRefused", "CONTROL_FORMAT", "Conn", "Control", "ControlServer", "FRAME_MAX", "FRAME_READ_S",
+           "PoolMirror", "SLOT_SYNC_MAX",
            "FRONT_REG_DIR", "FrameMalformed", "FrameTooLarge", "Handles", "KEYS_ANSWER_S", "KEYS_RECONNECT_FIRST_S",
            "KEYS_RECONNECT_MAX_S", "KeysAdmin", "Lease", "MAX_CONNECTIONS", "PEER_VERBS", "RETIRED_LEASES_MAX",
            "REVOKED_TOKENS_MAX", "SESSIONS_DIGESTS_MAX", "SPEND_OVERRUNS_MAX", "ServeConfig", "StateStore",

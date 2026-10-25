@@ -48,7 +48,7 @@ AGENT_LABELS = {"claude_code": "Claude Code", "codex": "Codex"}
 # The one credential variable each agent may need beyond levain's allowlist (an operator on an API key).
 AGENT_KEY_VARS = {"claude_code": "ANTHROPIC_API_KEY", "codex": "OPENAI_API_KEY"}
 # The agent versions the consent adapters were run against (`claude --version`, `codex --version`).
-TESTED_VERSIONS: dict[str, tuple[str, ...]] = {"claude_code": ("2.1.300", "2.1.301", "2.1.306", "2.1.308"), "codex": ("0.162.1",)}
+TESTED_VERSIONS: dict[str, tuple[str, ...]] = {"claude_code": ("2.1.300", "2.1.301", "2.1.306", "2.1.308", "2.1.310"), "codex": ("0.162.1",)}
 # What a caller passes to an adapter's install() to install for an untested version (no levain command installs a
 # consent hook, so there is no CLI flag for it).
 ALLOW_PARAMETER = "allow_untested_agent_version=True"
