@@ -2360,11 +2360,15 @@ class Keys:
         relayed), an unsent one `released` (`settled: "no"`, the call's facts null, H6-21); `refused` is the refusal
         that ended the exchange, if one did. None for an interactive hold or an `end` that is a no-op. NEVER raises
         (it is evaluated in `except BaseException` before the raise goes on): a failure builds the row from the base
-        alone, as the ledger would."""
-        st = hold.state
-        if hold.base is None or st not in (ledger.PENDING, ledger.RESERVED, ledger.SENT):
+        alone, as the ledger would, and a failure of that (or of the hold's own reads, r1 F8) is None."""
+        try:
+            st = hold.state
+            if hold.base is None or st not in (ledger.PENDING, ledger.RESERVED, ledger.SENT):
+                return None
+            now = _stamp(time.time())
+        except Exception as e:
+            _note(logging.WARNING, "levain gw-keys: a hold's end could not be read (%s)", type(e).__name__)
             return None
-        now = _stamp(time.time())
         try:
             if st is ledger.SENT:
                 rec = conn.rec or {}
@@ -2376,7 +2380,10 @@ class Keys:
                 row = lineage_row(hold.base, settled="no", ended_at=now, md=None, refused=refused)
         except Exception as e:
             _note(logging.WARNING, "levain gw-keys: a lineage row was built from its base (%s)", type(e).__name__)
-            row = dict(hold.base, settled="uncertain" if st is ledger.SENT else "no", ended_at=now)
+            try:
+                row = dict(hold.base, settled="uncertain" if st is ledger.SENT else "no", ended_at=now)
+            except Exception:
+                return None
         return {"lineage": row}
 
     async def _open_upstream(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy,

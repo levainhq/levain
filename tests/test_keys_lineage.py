@@ -694,6 +694,25 @@ def test_quarantine_and_a_refused_envelope_are_counted_in_keys_status(monkeypatc
     assert len(ack["refs"]) == 2 and [q["field"] for q in ack["quarantined"]] == ["tokens_in"]
 
 
+def test_end_meta_never_raises_even_on_its_holds_own_reads():
+    # r1 F8: `_end_meta` is evaluated in `except BaseException` before a raise goes on, so its contract is NEVER
+    # raises; the reads of `hold.state` and `hold.base` are inside it too. A hold whose reads raise gets None; one
+    # whose row cannot be built gets the base-only row
+    class Unreadable:
+        @property
+        def state(self):
+            raise RuntimeError("a test's unreadable state")
+
+        base = {"x": 1}
+
+    class NoRow:
+        state = L.RESERVED
+        base = ["not", "a", "dict"]
+
+    assert K.Keys._end_meta(None, K.Conn.__new__(K.Conn), Unreadable()) is None
+    assert K.Keys._end_meta(None, K.Conn.__new__(K.Conn), NoRow()) is None
+
+
 def test_a_malformed_ack_triple_is_not_an_ack_and_never_raises():
     # r1 F3 (a): `triple_of` takes only the on-disk triple shape (32-hex `ledger` and `epoch`, int `ref` >= 1); any
     # other answer is None, never a raise (an unhashable `ledger` once raised TypeError and killed the sender)
