@@ -33,6 +33,7 @@ class RecordingOrigin:
     def __init__(self, reflect=None, content_type=None) -> None:
         self.reqs: list[Seen] = []
         self.conns = 0
+        self.open_conns = 0
         self.reflect = reflect
         self.content_type = content_type
         self._lock = threading.Lock()
@@ -53,6 +54,7 @@ class RecordingOrigin:
                 return
             with self._lock:
                 self.conns += 1
+                self.open_conns += 1
             threading.Thread(target=self._serve, args=(c,), daemon=True).start()
 
     def _serve(self, c: socket.socket) -> None:
@@ -107,6 +109,8 @@ class RecordingOrigin:
             return
         finally:
             c.close()
+            with self._lock:
+                self.open_conns -= 1
 
     def close(self) -> None:
         self._stop = True
