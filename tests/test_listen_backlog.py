@@ -38,12 +38,13 @@ def test_a_burst_of_concurrent_asset_reads_is_all_served(tmp_path: Path) -> None
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     url = f"http://127.0.0.1:{srv.server_address[1]}/cockpit_view.js"
-    gate = threading.Barrier(BURST)
+    gate = threading.Barrier(BURST, timeout=30)   # a thread that cannot start breaks the barrier, never hangs CI
+    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # a CI proxy must not carry 127.0.0.1
 
     def one(_: int) -> str:
         gate.wait()   # every connection opens at the same moment, like a page's script tags
         try:
-            with urllib.request.urlopen(url, timeout=30) as r:
+            with direct.open(url, timeout=30) as r:
                 r.read()
                 return str(r.status)
         except Exception as exc:  # noqa: BLE001 - the tally is the assertion
