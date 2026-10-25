@@ -224,6 +224,73 @@ LAZY_SITES = {
     'levain/slot/wall.py::_read_cmd::from levain.launch import child_env': 'root',
     'levain/slot/wall.py::macos_egress_ready::from levain.slot.pf import ANCHOR, IFCONFIG, PFCTL': 'root',
     'levain/slot/wall.py::stage_main::from levain.slot.keyring_join import join_session_keyring, real_keyctl': 'root',
+    # --- what the queue broker (``levain.slot.services.qbroker``) brings into the closure ---
+    # operator: ``git grep -n '\.principal\b' -- levain`` finds it read in ``levain/cli.py``, ``levain/phone_app.py`` and ``levain/cockpit/{broker,engine,keys,labels,sign_client}.py`` only (engine's in a ``Cockpit`` panel)
+    'levain/authority.py::AuthorityKey.principal::from levain.cockpit.keys import principal_of': 'operator',
+    # operator: the authority replay (``_step`` <- ``_replay_entry`` <- ``snapshot``, run by ``consent.queue.AuthoritySource`` and ``cockpit.authority.RequestAuthority.capture``); the queue broker builds its ``AuthoritySnapshot`` from published signers (``qbroker.grants.contract_authority``) and runs neither (``git grep -n -e 'snapshot(' -e 'authority_source' -e 'RequestAuthority(' -- levain/qbroker`` finds none)
+    'levain/authority.py::_enrolled_key::from levain.cockpit.keys import KeyError_, fingerprint_of, normalise_public_key': 'operator',
+    'levain/authority.py::_step::from levain.consent.passkey import authority_signature_problem': 'operator',
+    # operator: <- ``reset_lock`` <- ``reset_anchor`` <- ``levain/cockpit/keys.py`` (the operator's anchor reset; ``git grep -n 'reset_anchor(' -- levain``)
+    'levain/authority.py::_no_live_cockpit::from levain.cockpit.broker import LOCK_NAME': 'operator',
+    # root: the target is a closure member already (an import-time import of another member), so this row adds nothing to the closure; not traced further
+    'levain/authority.py::_parse_stamp::from levain.cockpit.consent import parse_stamp': 'root',
+    'levain/authority.py::_ranks::from levain.cockpit.firejournal import _CLASS_RANK': 'root',
+    'levain/authority.py::_stamp::from levain.cockpit.consent import utc_stamp': 'root',
+    'levain/autonomic/journal.py::RunJournal._barrier::from levain.autonomic.binding import registry_bars': 'root',
+    'levain/cockpit/authority.py::RequestAuthority.capture::from levain import authority as auth': 'root',
+    'levain/cockpit/authority.py::RequestAuthority.capture::from levain.cockpit.firejournal import UNINITIALISED, _meta, conn_init_hint': 'root',
+    'levain/cockpit/authority.py::RequestAuthority.fence::from levain.cockpit.firejournal import authority_fence': 'root',
+    'levain/cockpit/authority.py::RequestAuthority.policy::from levain.authority import genesis_policy': 'root',
+    'levain/cockpit/authority.py::RequestAuthority.revision::from levain.cockpit.firejournal import authority_fence': 'root',
+    'levain/consent/queue.py::AuthoritySource.head::from levain.authority import log_head': 'root',
+    'levain/dispatch/contract.py::git_env::from levain.launch import child_env': 'root',
+    'levain/dispatch/published.py::sync::from levain.qbroker.grants import PUBLISHED_MAX   # here: grants imports this module': 'root',
+    'levain/dispatch/published.py::sync::from levain.qbroker.store import replace_file': 'root',
+    # operator: <- ``StandingPolicy.apply`` (``git grep -n 'policy.apply(' -- levain`` finds ``levain/cockpit/broker.py`` and ``verbs.py`` only) and ``classify`` / ``_validate_policy`` / ``_apply_policy_op`` (the replay, ``_step``)
+    'levain/authority.py::_tiers::from levain.cockpit.verbs import TIERS': 'operator',
+    # operator: <- ``_validate_egress_key`` (``_validate_grant`` <- ``_validate_policy`` / ``_apply_policy_op``, the replay: the authority replay (``_step`` <- ``_replay_entry`` <- ``snapshot``, run by ``consent.queue.AuthoritySource`` and ``cockpit.authority.RequestAuthority.capture``); the queue broker builds its ``AuthoritySnapshot`` from published signers (``qbroker.grants.contract_authority``) and runs neither (``git grep -n -e 'snapshot(' -e 'authority_source' -e 'RequestAuthority(' -- levain/qbroker`` finds none)) and ``levain/chat_egress/advert.py``
+    'levain/authority.py::egress_key_host_problem::from levain.chat_egress.parse import canonical_host': 'operator',
+    # operator: <- ``_validate_egress_key`` (the replay's grant validation, as ``egress_key_host_problem``) and ``levain/chat_egress/advert.py``
+    'levain/authority.py::egress_key_repo_problem::from levain.chat_egress.advert import KEYLESS_ESCAPES': 'operator',
+    'levain/authority.py::egress_key_repo_problem::from levain.chat_egress.parse import canonical_path': 'operator',
+    # operator: a ``Cockpit`` method; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py`` (``git grep -n 'Cockpit(' -- levain``), not in the closure; engine is here only as ``levain/cockpit/__init__.py``'s import
+    'levain/cockpit/engine.py::Cockpit._note_decision_one::from levain.consent.notes import NoteStoreError': 'operator',
+    # operator: a ``Cockpit`` method; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``, not in the closure
+    'levain/cockpit/engine.py::Cockpit._question_decision_one::from levain.consent.questions import QuestionStoreError': 'operator',
+    # operator: <- ``Cockpit._compose_decisions`` / ``Cockpit._consent_decision_one`` only; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``
+    'levain/cockpit/engine.py::_consent_rows_in::from levain.consent.listing import egress_state_of': 'operator',
+    'levain/cockpit/engine.py::_egress_lookup_of::from levain.consent.listing import egress_reading': 'operator',
+    # operator: <- ``Cockpit._compose_decisions`` only; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``
+    'levain/cockpit/engine.py::_note_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
+    'levain/cockpit/engine.py::_question_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
+    # operator: <- ``CockpitDB._ensure_schema_txn`` <- ``_ensure_schema``; ``CockpitDB(`` is constructed in ``levain/cli.py``, ``cockpit/{broker,keys,sign_client}.py`` and ``phone_app.py`` only (``git grep -n 'CockpitDB(' -- levain``)
+    'levain/cockpit/firejournal.py::_take_store_lock::from levain.cockpit.broker import LOCK_NAME': 'operator',
+    # operator: a ``FACETS`` validator, run by ``validate_facets``, whose one caller is ``levain/cockpit/engine.py`` (the ``Cockpit``)
+    'levain/cockpit/registry.py::_is_sign_facet::from levain.sign_request_id import request_id_ok': 'operator',
+    # the queue broker (``levain.slot.services.qbroker``, ROOT_PYTHON as ``_levain_qbroker``): its GATE runs ``consent.limits.count_call`` -> ``_count``
+    'levain/consent/limits.py::_count::from levain.cockpit.session_context import spend_step': 'root',
+    # operator: the hook's limits path: ``consent.limits.check`` (called by the agent hooks ``consent/adapters/{claude_code,codex}.py`` only) -> ``_hold`` -> ``_resolve`` -> ``_filed_for`` / ``verified_allow``, ``release_if_extended``, and ``consent/limits_cli.py``; the queue broker runs ``count_call`` only
+    'levain/consent/limits.py::_filed_for::from levain.consent.listing import filed_input': 'operator',
+    'levain/consent/limits.py::_resolve::from levain.cockpit.consent import parse_stamp': 'operator',
+    'levain/consent/limits.py::_resolve::from levain.consent.queue import Decision, Ruling': 'operator',
+    'levain/consent/limits.py::verified_allow::from levain.consent.queue import Decision, Ruling': 'operator',
+    # operator: no caller in ``levain/`` (``git grep -n _verified_deny -- levain`` finds only its def)
+    'levain/consent/limits.py::_verified_deny::from levain.consent.queue import Decision': 'operator',
+    # operator: callers are the agent hooks (``levain/consent/adapters/claude_code.py``, ``codex.py``) and ``levain/consent/limits_cli.py``, none in the closure
+    'levain/consent/limits.py::ruling_text::from levain.consent.listing import filed_input': 'operator',
+    # operator: ``ConsentQueue.file``'s callers (``git grep -n '\.file(' -- levain``) are the agent hooks, the gates, ``chat_egress.cards`` and ``consent.limits._hold`` / ``file_extend`` (the hook's limits path: ``consent.limits.check`` (called by the agent hooks ``consent/adapters/{claude_code,codex}.py`` only) -> ``_hold`` -> ``_resolve`` -> ``_filed_for`` / ``verified_allow``, ``release_if_extended``, and ``consent/limits_cli.py``; the queue broker runs ``count_call`` only); the queue broker files on its own ``qbroker.store.QueueStore``
+    'levain/consent/queue.py::ConsentQueue.file::from levain.chat_egress.cards import CardError, filed_display': 'operator',
+    # the queue broker (``levain.slot.services.qbroker``, ROOT_PYTHON as ``_levain_qbroker``): ``qbroker.seam`` runs ``consent.queue.answer_refusal`` -> ``signer_refusal`` -> ``_signature_refusal``
+    'levain/consent/queue.py::_signature_refusal::from levain.consent.passkey import answer_signature_problem': 'root',
+    # operator: ``receipt_log.verify``'s one caller is ``levain/cli.py``'s ``_cmd_consent_receipts_verify`` (``levain consent receipts verify``); the broker reads ``head`` / ``head_refusal`` only
+    'levain/consent/receipt_log.py::verify::from levain.authority import AuthorityError, VerifierUnavailable, anchor_path': 'operator',
+    'levain/consent/receipt_log.py::verify::from levain.consent.answering import answer_root': 'operator',
+    'levain/consent/receipt_log.py::verify::from levain.consent.queue import (_FIELDS, AnswerRefused, ConsentQueue, QueueStoreError, StoreNotCurrent,': 'operator',
+    'levain/consent/receipt_log.py::verify::from levain.consent.record import UNCHAINED_FORMATS': 'operator',
+    # the queue broker (``levain.slot.services.qbroker``, ROOT_PYTHON as ``_levain_qbroker``): ``qbroker.grants`` checks a contract's signature with ``dispatch.sign.refusal`` -> ``_passkey_problem``
+    'levain/dispatch/sign.py::_passkey_problem::from levain.consent.passkey import answer_signature_problem': 'root',
+    # the queue broker (``levain.slot.services.qbroker``, ROOT_PYTHON as ``_levain_qbroker``): its own package
+    'levain/qbroker/grants.py::grant_row::from levain.qbroker.store import GRANT_ROW_FORMAT': 'root',
 }
 _NEEDLES = ("run_module(", "module_argv(", "import_module(", "__import__(")
 
@@ -440,11 +507,12 @@ def lazy_sites(mods) -> dict:
     return found
 
 
-def closure() -> list:
-    """The modules the entries import at import time, plus the targets of every ``"root"`` row of ``LAZY_SITES``
-    (and what those import at import time), to a fixed point: a lazy import a root process can run is as much root
-    code as a top-level one. A site not in the table adds nothing here; the test fails it."""
-    roots = set(_entry_modules())
+def closure(entries=None) -> list:
+    """The modules the entries (``entries``, else every root of :func:`_entry_modules`) import at import time, plus
+    the targets of every ``"root"`` row of ``LAZY_SITES`` (and what those import at import time), to a fixed point: a
+    lazy import a root process can run is as much root code as a top-level one. A site not in the table adds nothing
+    here; the test fails it."""
+    roots = set(_entry_modules() if entries is None else entries)
     while True:
         mods = _eager(roots)
         grown = {n for key, names in lazy_sites(mods).items() if LAZY_SITES.get(key) == "root" for n in names} - roots
