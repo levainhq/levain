@@ -1204,7 +1204,8 @@ class BindingStore:
     def replace_atomic(self, expected_old: Binding, new_binding: Binding,
                        *, coverage: Callable[[Binding, Posture], bool] | None,
                        risk_floor_of: Callable[[Binding], Posture] | None,
-                       precondition: Callable[[Binding], bool] | None = None) -> "ReplaceResult":
+                       precondition: Callable[[Binding], bool] | None = None,
+                       record: Callable[[sqlite3.Connection], None] | None = None) -> "ReplaceResult":
         """RE-RATIFICATION as one atomic, ALL-OR-NOTHING step: persist ``new_binding`` (a fresh sealed
         grant — a posture promotion / re-author / tightening produces a DIFFERENT core ⇒ a different
         id) AND set the old grant to ``REVOKED``, under ONE lock. The non-atomic alternative (``add``
@@ -1249,6 +1250,11 @@ class BindingStore:
         by this store's lock, so a policy revoked between that read and the commit is not seen here (the
         gate's clamp at the next fire is).
 
+        ``record`` (14b S4, RULINGS_S1 item 1) is the one callable that writes: given the open write connection, it
+        runs inside this transaction after the replace is written and before the commit, so what it writes (the
+        graduation audit row) commits with the replace or not at all. If it raises, the transaction rolls back,
+        nothing is written, and the exception propagates to the caller. It is not run when a check refuses.
+
         Returns a :class:`ReplaceResult`, truthy iff the old grant was revoked and the new one written;
         its ``reason`` names which check stopped it. Nothing is written on any failure. When a journal
         is wired, the old grant is fenced before the write."""
@@ -1261,7 +1267,7 @@ class BindingStore:
                 f"replace_atomic: old and new binding_id are identical ({old_binding_id!r}) — "
                 "re-ratification requires a different core (a no-op promotion is not a re-ratification)"
             )
-        record = self._persistable(new_binding)
+        new_record = self._persistable(new_binding)
         with self._locked() as conn:
             records = self._read_raw(for_mutation=True, conn=conn)
             ids = {r["binding_id"] for r in records}
@@ -1284,8 +1290,10 @@ class BindingStore:
                 return self._replace_refused(old_binding_id, rung_refusal)
             self._fence(old_rec, conn)
             old_rec["status"] = BindingStatus.REVOKED.value   # supersede the old grant
-            records.append(record)
+            records.append(new_record)
             self._write_raw(records, conn)
+            if record is not None:
+                record(conn)   # a raise leaves the block and the write transaction rolls back
             return ReplaceResult(True, "replaced")
 
     @staticmethod

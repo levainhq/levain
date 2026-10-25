@@ -627,6 +627,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_consent_away_parser(cs_sub)
     _add_consent_rule_parser(cs_sub)
     _add_consent_receipts_parser(cs_sub)
+    _add_binding_parser(subparsers, _ck_common)
     _add_chat_parser(subparsers, _ck_common)
     _add_push_parser(subparsers)
     _add_publish_parser(subparsers)
@@ -3345,6 +3346,361 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
         state = "expired" if expires_at <= stamp else f"until {expires_at}"
         print(f"{gid!r}  kind {kind}  {state}  (seq {seq}): a grant kind this levain does not know, held inert: it "
               "answers nothing here (upgrade levain to use it; `levain consent grant revoke` removes it)")
+    return 0
+
+
+# --- levain binding policy ... / levain binding graduate (14b S4: DESIGN_REV2 §5, DESIGN_REV3 §3, §6) ----------
+
+# C-2 / LOW-1: what a graduation policy hands to anything that can write the levain home, printed before signing
+_POLICY_WARNING = ("an agent that can write the levain home can make Levain run these actions unsigned, with any "
+                   "arguments, at this rung, from any trigger, until this expires")
+# C-3: the walk the honest engine takes before it uses the policy; nothing enforces it against a writer
+_ADVISORY = "advisory"
+_POLICY_LOWEST = ("ON_LOOP", "COOLING_OFF")
+
+
+def _add_binding_parser(subparsers: argparse._SubParsersAction, common: object) -> None:
+    """``levain binding policy create|renew|revoke|list`` and ``levain binding graduate``; ``common`` adds the cockpit
+    commands' ``--path`` / ``--data-root``."""
+    b_p = subparsers.add_parser(
+        "binding", help="Graduation policies: what may run below CONFIRM without asking, signed in the authority log.",
+        description=(
+            "A standing binding fires below CONFIRM (cooling-off or on-loop) only while a graduation policy covers "
+            "each action it runs: a link in the cockpit's signed authority log, naming the actions at the risk "
+            "Levain's manifest gives them, the lowest rung, and an expiry at most 30 days out. It covers only if the "
+            "key that signed it, and the key that last renewed it, are listed in root's allowed-signers file for "
+            "levain-authority and not revoked in the log. Without one, the binding waits at CONFIRM."),
+    )
+    b_sub = b_p.add_subparsers(dest="binding_cmd", required=True)
+    pol = b_sub.add_parser("policy", help="Create, renew, revoke and list graduation policies.")
+    pol_sub = pol.add_subparsers(dest="policy_cmd", required=True)
+
+    create = pol_sub.add_parser(
+        "create", help="Sign a graduation policy (a laptop-presence key).",
+        description=(f"Append a signed create_grant link of a graduation policy. Before signing it prints: "
+                     f"{_POLICY_WARNING}. Its terms are fixed once signed: to change one, revoke it and create "
+                     "another. Each action's risk must be the one Levain's manifest gives it, or the policy covers "
+                     "nothing; the log takes only reversible, internal, non-financial actions of class LOW or "
+                     "below."))
+    create.add_argument("--action", dest="actions", action="append", required=True, metavar="NAME[=CLASS]",
+                        help="A manifest action name and its risk class (TRIVIAL or LOW; default LOW); repeatable.")
+    create.add_argument("--lowest", required=True, choices=_POLICY_LOWEST,
+                        help="The lowest rung a covered action may run at.")
+    create.add_argument("--days", type=int, default=30, help="Days until it expires, 1 to 30 (default 30).")
+    create.add_argument("--family", dest="families", action="append", default=None, metavar="FAMILY",
+                        help="Only bindings of this family (fam-<32 hex>); repeatable. Advisory: a writer of the "
+                             "binding registry can mint any family.")
+    create.add_argument("--trigger", dest="triggers", action="append", default=None, metavar="TYPE",
+                        help="Only bindings with this trigger type; repeatable. Advisory, as --family.")
+    create.add_argument("--min-clean", dest="min_clean", type=int, default=20,
+                        help="Clean fires the engine waits for before it graduates under this policy (advisory; "
+                             "default 20).")
+    create.add_argument("--store-dir", dest="store_dir", type=Path, default=None,
+                        help="The autonomic store the policy is for (default: $LEVAIN_HOME/autonomic); its id is "
+                             "signed into the policy, and it covers in no other store.")
+    create.add_argument("--id", dest="grant_id", default=None, help="The policy's id (default: gp-<random>).")
+    create.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                        help="An enrolled laptop-presence key, listed in root's allowed-signers file.")
+    common(create)
+    create.set_defaults(func=_cmd_binding_policy_create)
+
+    renew = pol_sub.add_parser(
+        "renew", help="Move a live graduation policy's expiry (its terms stay).",
+        description="Append a signed renew link: the policy's expiry becomes --days from now. A lapsed policy is not "
+                    "renewed: create another. The renewing key must be listed in root's allowed-signers file too, or "
+                    "the policy covers nothing after the renew.")
+    renew.add_argument("grant_id", help="The policy's id, as `levain binding policy list` shows it.")
+    renew.add_argument("--days", type=int, default=30, help="Days from now, 1 to 30 (default 30).")
+    renew.add_argument("--signing-key", dest="signing_key", type=Path, required=True)
+    common(renew)
+    renew.set_defaults(func=_cmd_binding_policy_renew)
+
+    revoke = pol_sub.add_parser(
+        "revoke", help="Revoke a graduation policy (any enrolled key).",
+        description="Append a signed revoke_grant link. An effect admitted before the revoke runs; every later one "
+                    "waits at CONFIRM.")
+    revoke.add_argument("grant_id")
+    revoke.add_argument("--signing-key", dest="signing_key", type=Path, required=True)
+    common(revoke)
+    revoke.set_defaults(func=_cmd_binding_policy_revoke)
+
+    lst = pol_sub.add_parser("list", help="List the graduation policies the authority log holds.")
+    lst.add_argument("--allowed-signers", dest="allowed_signers", type=Path, default=None,
+                     help="Root's allowed-signers file: with it, each policy says whether it is anchored.")
+    common(lst)
+    lst.set_defaults(func=_cmd_binding_policy_list)
+
+    grad = b_sub.add_parser(
+        "graduate", help="Take every graduation step a policy covers now; print the rest as cards.",
+        description="For each binding with enough clean fires, promote it one rung if a live anchored policy covers "
+                    "every action it runs there, recording the step; otherwise print the one `levain binding policy "
+                    "create` line that would cover it. Needs the binding driver that builds this install's "
+                    "requests.")
+    grad.add_argument("--preview", action="store_true", help="Write nothing; say what would graduate.")
+    common(grad)
+    grad.set_defaults(func=_cmd_binding_graduate)
+
+
+def _policy_actions(specs: list[str]) -> dict[str, dict[str, object]]:
+    """``--action NAME[=CLASS]`` as the policy's actions: each a reversible, internal, non-financial risk of CLASS."""
+    from levain.autonomic.risk import RiskClass
+
+    out: dict[str, dict[str, object]] = {}
+    for spec in specs:
+        name, sep, cls = spec.partition("=")
+        if not name:
+            raise ValueError(f"--action {spec!r} names no action")
+        try:
+            level = RiskClass[cls.strip().upper()] if sep else RiskClass.LOW
+        except KeyError:
+            raise ValueError(f"--action {spec!r}: {cls!r} is not a risk class (TRIVIAL, LOW)") from None
+        if name in out:
+            raise ValueError(f"--action {name!r} is given twice")
+        out[name] = {"cls": int(level), "reversible": True, "external": False, "financial": False}
+    return out
+
+
+def _policy_days(days: int) -> object:
+    from datetime import timedelta
+
+    from levain.authority import GRADUATION_GRANT_MAX
+
+    life = timedelta(days=days)
+    if not timedelta(0) < life <= GRADUATION_GRANT_MAX:
+        raise ValueError(f"--days {days} is not between 1 and {GRADUATION_GRANT_MAX.days}")
+    return life
+
+
+def _autonomic_store_id(store_dir: Path | None) -> str:
+    """The id in the autonomic store's ``meta`` row, read read-only: no store is created or migrated here."""
+    import sqlite3
+    from urllib.parse import quote
+
+    from levain.autonomic.db import DB_NAME, default_store_dir
+
+    db = (store_dir.expanduser() if store_dir is not None else default_store_dir()) / DB_NAME
+    if not db.is_file():
+        raise ValueError(f"no autonomic store at {db}: a policy is signed for one store, by its id")
+    try:
+        conn = sqlite3.connect(f"file:{quote(str(db))}?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise ValueError(f"cannot read the autonomic store at {db}: {exc}") from None
+    if row is None or not isinstance(row[0], str):
+        raise ValueError(f"the autonomic store at {db} has no id")
+    return row[0]
+
+
+def _signed_append(args: argparse.Namespace, op: dict, now: datetime, *, policy_id: str | None = None) -> object:
+    """One signed link, judged by the log's own rules: the cockpit key commands' own append, in three steps.
+
+    The link is prepared at ``now`` (a renew's signed_at is its link's time) on the head the replay just read, and
+    with ``policy_id`` only when that replay holds a graduation policy under it (RULINGS_R1 item 3); the signature is
+    made outside any transaction; the append takes it only on that same head (else ``StaleHead``), at the clock read
+    after the signature, so a policy that lapsed while it was signed is refused (RULINGS_R1 item 1)."""
+    from levain.authority import (AuthorityError, StaleHead, VerifierUnavailable, anchor_path, append,
+                                  graduation_grant, prepare)
+    from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
+    from levain.cockpit.keys import KeyError_, _capture, _journal, _signing_authority, ssh_signer
+
+    signer_fp, sign = ssh_signer(args.signing_key)
+    db = _journal(_cockpit_root(args))
+    state = _signing_authority(_capture(db, now, DEFAULT_SSH_KEYGEN))    # refused before anything is signed
+    if policy_id is not None and not graduation_grant(state.policy.grants.get(policy_id)):
+        raise ValueError(f"no graduation policy {policy_id!r}")
+    signed = False
+    try:
+        with db.autocommit() as conn:
+            link = prepare(conn, op, signer_fp=signer_fp, now=now, ssh_keygen=DEFAULT_SSH_KEYGEN)
+        if (link.seq - 1, link.prev_hash) != (state.seq, state.head_hash):
+            raise StaleHead("the authority log moved while this was prepared: look at it again")
+        signature = sign(link.message)
+        signed = True
+        with db.autocommit() as conn:
+            return append(conn, link, signature, now=_utc_now(), anchor=anchor_path(db.data_root),
+                          ssh_keygen=DEFAULT_SSH_KEYGEN)
+    except VerifierUnavailable:
+        raise
+    except StaleHead as exc:
+        raise KeyError_(f"{exc} (the authority log moved: nothing was appended)") from None
+    except AuthorityError as exc:
+        if signed and op.get("op") == "renew" and "a lapsed grant is never renewed" in str(exc):
+            raise KeyError_(f"{op['grant_id']} lapsed while you signed; create it again") from None
+        raise KeyError_(str(exc)) from None
+
+
+def _cmd_binding_policy_create(args: argparse.Namespace) -> int:
+    import secrets
+
+    from levain.cockpit.consent import utc_stamp
+
+    try:
+        actions = _policy_actions(args.actions)
+        life = _policy_days(args.days)
+        store_id = _autonomic_store_id(args.store_dir)
+        if args.min_clean < 1:
+            raise ValueError("--min-clean is at least 1")
+        now = _utc_now()
+        gid = args.grant_id if args.grant_id is not None else "gp-" + secrets.token_hex(6)
+        grant = {"id": gid, "kind": "graduation", "actions": actions, "lowest_posture": args.lowest,
+                 "expires_at": utc_stamp(now + life), "triggers": sorted(set(args.triggers)) if args.triggers else None,
+                 "families": sorted(set(args.families)) if args.families else None, "store_id": store_id,
+                 "min_clean_fires": args.min_clean}
+        print(f"lets {', '.join(sorted(actions))} run at {args.lowest} without asking, until {grant['expires_at']}.")
+        print(f"warning: {_POLICY_WARNING}.")
+        if args.families or args.triggers:
+            print(f"--family and --trigger are {_ADVISORY}: a writer of the binding registry chooses both.")
+        print(f"min clean fires {args.min_clean} ({_ADVISORY}: the engine's walk, not a limit on a writer).")
+        new = _signed_append(args, {"op": "create_grant", "grant": grant}, now)
+    except (ValueError, *_cockpit_refusals()) as exc:
+        print(f"policy refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"signed: {gid} at seq {new.seq} for {store_id}, until {grant['expires_at']}")
+    print("it covers nothing until its signer is in root's allowed-signers file (levain-authority).")
+    if new.anchor_warning:
+        print(f"warning: {new.anchor_warning}", file=sys.stderr)
+    return 0
+
+
+def _cmd_binding_policy_renew(args: argparse.Namespace) -> int:
+    from levain.cockpit.consent import utc_stamp
+
+    try:
+        life = _policy_days(args.days)
+        now = _utc_now()
+        op = {"op": "renew", "grant_id": args.grant_id, "expires_at": utc_stamp(now + life),
+              "signed_at": utc_stamp(now)}
+        new = _signed_append(args, op, now, policy_id=args.grant_id)
+    except (ValueError, *_cockpit_refusals()) as exc:
+        print(f"renew refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"renewed: {args.grant_id} at seq {new.seq}, until {op['expires_at']}")
+    if new.anchor_warning:
+        print(f"warning: {new.anchor_warning}", file=sys.stderr)
+    return 0
+
+
+def _cmd_binding_policy_revoke(args: argparse.Namespace) -> int:
+    try:
+        new = _signed_append(args, {"op": "revoke_grant", "grant_id": args.grant_id}, _utc_now(),
+                             policy_id=args.grant_id)
+    except (ValueError, *_cockpit_refusals()) as exc:
+        print(f"revoke refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"revoked: {args.grant_id} at seq {new.seq}")
+    if new.anchor_warning:
+        print(f"warning: {new.anchor_warning}", file=sys.stderr)
+    return 0
+
+
+def _graduation_state(args: argparse.Namespace) -> object:
+    """The verified, anchored replay of the cockpit's authority log."""
+    from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
+    from levain.cockpit.keys import _capture, _journal, _signing_authority
+
+    return _signing_authority(_capture(_journal(_cockpit_root(args)), _utc_now(), DEFAULT_SSH_KEYGEN))
+
+
+def _root_authority_keys(path: Path) -> frozenset[str] | str:
+    """The levain-authority keys root's file lists, or why it lists none (``trust_anchor_problem``, as the gate's
+    coverage source judges it)."""
+    from levain.autonomic import confirm as _confirm
+    from levain.autonomic.coverage import authority_keys, parse_root_signers
+    from levain.trust_anchor import trust_anchor_problem
+
+    try:
+        problem, found = trust_anchor_problem(path, what="allowed-signers file", owners=_confirm._SIGNERS_FILE_OWNERS)
+        if problem is not None:
+            return str(problem)
+        if found is None:
+            return f"the allowed-signers file {path} could not be found"
+        return authority_keys(parse_root_signers(Path(found).read_bytes()))
+    except (OSError, ValueError) as exc:
+        return str(exc) or type(exc).__name__
+
+
+def _cmd_binding_policy_list(args: argparse.Namespace) -> int:
+    from levain.authority import _thaw, graduation_grant, graduation_links
+    from levain.autonomic.coverage import _key_of
+    from levain.cockpit.consent import utc_stamp
+
+    try:
+        state = _graduation_state(args)
+        root = _root_authority_keys(args.allowed_signers) if args.allowed_signers is not None else None
+    except _cockpit_refusals() as exc:
+        print(f"policies: {exc}", file=sys.stderr)
+        return 1
+    stamp = utc_stamp(_utc_now())
+    shown = 0
+    for gid, grant in sorted(state.policy.grants.items()):
+        if not graduation_grant(grant):
+            continue
+        shown += 1
+        g = _thaw(grant)
+        lapse = "lapsed" if g["expires_at"] <= stamp else f"until {g['expires_at']}"
+        print(f"{gid}  {','.join(sorted(g['actions']))}  lowest {g['lowest_posture']}  {lapse}  store {g['store_id']}  "
+              f"min clean {g.get('min_clean_fires')} ({_ADVISORY})")
+        links = graduation_links(state, gid)
+        if links is None:
+            print("  covers nothing: its signing links cannot be named")
+            continue
+        for what, fp in zip(("signed by", "last renewed by"), links):
+            key = state.keys.get(fp)
+            if key is None:
+                note = " (not in the log: covers nothing)"
+            else:
+                note = "" if key.active else " (REVOKED in the log: covers nothing)"
+            if isinstance(root, frozenset):
+                listed = key is not None and _key_of(key.public_key) in root
+                note += "" if listed else " (not in root's allowed-signers file: covers nothing)"
+            print(f"  {what} {fp}{note}")
+        if isinstance(root, str):
+            print(f"  anchoring unknown: {root}")
+    if not shown:
+        print("no graduation policies")
+    return 0
+
+
+def _graduation_engine(args: argparse.Namespace) -> object | None:
+    """The binding driver's graduation engine: a callable ``(apply) -> list[GraduationStep]`` over this install's
+    store, gate manifest, request builder and coverage source. None: no driver is wired into this levain (14b S6)."""
+    return None
+
+
+def _cmd_binding_graduate(args: argparse.Namespace) -> int:
+    engine = _graduation_engine(args)
+    if engine is None:
+        print("nothing graduates: no binding driver is wired into this levain, so no binding fires and none "
+              "has evidence", file=sys.stderr)
+        return 1
+    from levain.cockpit.graduation_cards import card_of
+
+    try:
+        steps = engine(not args.preview)
+    except Exception as exc:  # noqa: BLE001 - an engine that cannot run is one line, never a traceback
+        print(f"graduation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    for step in steps:
+        p = step.proposal
+        head = f"{p.old_binding_id} {p.from_posture.name} -> {p.to_posture.name} ({p.clean_count}/{p.fire_count} clean)"
+        if step.outcome in ("graduated", "preview"):
+            verb = "graduated" if step.outcome == "graduated" else "would graduate"
+            print(f"{verb}: {head}" + (f" as {step.new_id}" if step.new_id else ""))
+        else:
+            card = card_of(step)
+            print(f"{step.outcome}: {head}: {card['why']}")
+            if card["command"]:
+                print(f"  {card['command']}")
+    if not steps:
+        print("no binding has the evidence to graduate")
+    # RULINGS_R2 item 1: a step that raised was not taken; every other step is as printed above
+    failed = sum(1 for step in steps if step.outcome.startswith("error:"))
+    if failed:
+        print(f"graduation partial: {failed} of {len(steps)} steps failed (the others are as printed)", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -1241,6 +1241,19 @@ class _Handler(GuardedHandler):
                 status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
             finally:
                 self.server.request_gate.release()
+            if request_id == PROPOSALS_ID and status == 200:
+                # 14b S4: the graduation cards and steps beside the proposals, read-only, built after the gate is
+                # released (RULINGS_R1 item 7: a slow authority log never holds it). The store and the engine are the
+                # binding driver's to wire (S6); with neither the payload is the proposals alone, as before
+                grad_store = getattr(self.server, "autonomic_store_dir", None)
+                grad_engine = getattr(self.server, "graduation_engine", None)
+                if grad_store is not None or grad_engine is not None:
+                    from levain.cockpit.graduation_cards import graduation_view
+
+                    try:
+                        payload["graduations"] = graduation_view(grad_store, grad_engine)
+                    except Exception:  # noqa: BLE001 - steps that cannot be read are not shown; the proposals stand
+                        payload["graduations"] = {"steps": [], "cards": []}
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
