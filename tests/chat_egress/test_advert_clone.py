@@ -105,7 +105,7 @@ def replay(seen, route=ROUTE, mode=GATED) -> list[Step]:
         for i, o in enumerate(obs):
             if i not in used and (o["scheme"], o["host"], o["port"], o["path"]) == (p.scheme, p.host, p.port, p.path):
                 used.add(i)
-                enum = adverts.observe(p, o["status"], o.get("ct"))
+                enum = adverts.observe(p, o["status"], o.get("ct"), verdict=v)
                 break
         steps.append(Step(p, v.kind, v.why, disp, advert.key_allowed(p, route), enum))
     return steps

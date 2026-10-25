@@ -71,8 +71,13 @@ def post(prefix="/o/r.git", headers=None, drop=(), **kw):
     return parse.parse(frame("POST", path=prefix + "/git-upload-pack", headers=h, **kw))
 
 
+def seen(adverts, p, status, ct):
+    """The decider's drain: observe a response with its request's own verdict (unkeyed, gated)."""
+    return adverts.observe(p, status, ct, verdict=decide(p, None, GATED))
+
+
 def advertised(adverts, prefix="/o/r.git", status=200, ct=ADV_CT, **kw):
-    return adverts.observe(discovery(prefix, **kw), status, ct)
+    return seen(adverts, discovery(prefix, **kw), status, ct)
 
 
 def verdict(p, adverts, *, keyed=False, mode=GATED, body_cut=False, rt=None):
@@ -377,10 +382,11 @@ def test_r15_21_5_the_service_value_is_read_through_r1s_folded_parse(adverts, qu
 
 def test_r15_21_5_the_discovery_must_be_a_get_of_info_refs(adverts):
     for method in ("HEAD", "POST", "OPTIONS"):
-        adverts.observe(parse.parse(frame(method, path="/o/r.git/info/refs", query="service=git-upload-pack")), 200,
-                        ADV_CT)
+        p = parse.parse(frame(method, path="/o/r.git/info/refs", query="service=git-upload-pack"))
+        assert not advert.is_advertisement(p, 200, ADV_CT), method   # the predicate itself, not only the verdict gate
+        seen(adverts, p, 200, ADV_CT)
     for path in ("/o/r.git/info/refs/", "/o/r.git/info/refsx", "/o/r.git/INFO/refs", "/o/r.git/info/refs;p"):
-        adverts.observe(parse.parse(frame("GET", path=path, query="service=git-upload-pack")), 200, ADV_CT)
+        seen(adverts, parse.parse(frame("GET", path=path, query="service=git-upload-pack")), 200, ADV_CT)
     assert len(adverts) == 0
     assert verdict(post(), adverts) == CARD
 
@@ -403,7 +409,7 @@ def test_r15_23_1_both_prefixes_compare_after_r2_normalisation(adverts):
 
 
 def test_r15_23_1_a_walled_discovery_path_records_nothing(adverts):
-    adverts.observe(parse.parse(frame("GET", path="/o/../r.git/info/refs", query="service=git-upload-pack")), 200,
+    seen(adverts, parse.parse(frame("GET", path="/o/../r.git/info/refs", query="service=git-upload-pack")), 200,
                     ADV_CT)
     assert len(adverts) == 0
 
@@ -470,3 +476,86 @@ def test_the_set_bound_holds_under_concurrent_observers():
 def test_the_set_capacity_is_not_a_launch_knob():
     with pytest.raises(ValueError):
         AdvertisementSet(capacity=0)
+
+
+# --- L3 r1 fixes (1024+20 S3_r1_findings.md) -----------------------------------------------------------------------
+
+def _get(path, query=None):
+    return parse.parse(frame("GET", path=path, query=query))
+
+
+def _post_at(path):
+    return parse.parse(frame("POST", path=path, headers=GIT_HEADERS))
+
+
+@pytest.mark.parametrize("path", [
+    "/o/undeclared.git/info/refs/", "/o/undeclared.git/info/refs;x", "/o/undeclared.git/INFO/REFS",
+    "/o/undeclared.git/info;y/Refs/", "/o/undeclared.git/Git-Upload-Pack", "/o/undeclared.git/git-upload-pack;x",
+    "/o/undeclared.git/git-upload-pack/"])
+def test_f1_near_miss_git_exchange_paths_on_a_keyed_route_are_keyless(path):
+    """F1: a server that normalises the slash, the case or a `;param` serves these as git exchanges; the key never
+    rides to an undeclared repo on one (fail closed: friction on a non-git path, never a reach)."""
+    rt = route(declared=("/o/declared.git",))
+    assert not advert.key_allowed(_get(path), rt), path
+    assert not advert.key_allowed(_post_at(path), rt), path
+
+
+def test_f1_a_declared_repo_keeps_the_key_through_the_same_spellings():
+    rt = route(declared=("/o/declared.git",))
+    assert advert.key_allowed(_get("/o/declared.git/INFO/refs/", "service=git-upload-pack"), rt)
+    assert advert.key_allowed(_post_at("/o/declared.git/Git-Upload-Pack;x"), rt)
+    assert not advert.key_allowed(_get("/o/declared.git;x/info/refs", "service=git-upload-pack"), rt), \
+        "the repo prefix is compared exactly as spelled: a `;param` inside it is another repo (keyless)"
+    assert advert.key_allowed(_get("/o/undeclared.git/README"), rt), "a non-git path keeps the snapshot's rule"
+
+
+def test_f1_any_service_query_is_a_git_exchange_and_info_refs_needs_exactly_one_upload_pack():
+    """The twin of S6's bypass (`?service=git-upload-pack&service=x`): `service` present at all makes a git exchange;
+    on an info/refs path anything but exactly one `git-upload-pack` is keyless, declared repo or not."""
+    rt = route(declared=("/o/declared.git", "/private.git"))
+    assert not advert.key_allowed(_get("/private.git/info/refs", "service=git-upload-pack&service=x"), rt)
+    assert not advert.key_allowed(_get("/o/declared.git/info/refs", "service=git-upload-pack&service=git-upload-pack"),
+                                  rt)
+    assert not advert.key_allowed(_get("/o/declared.git/info/refs", "service=x"), rt)
+    assert not advert.key_allowed(_get("/o/declared.git/info/refs"), rt), "no service on info/refs: keyless"
+    assert not advert.key_allowed(_get("/o/declared.git/info/refs", "Service"), rt)
+    assert advert.key_allowed(_get("/o/declared.git/info/refs", "service=git-upload-pack"), rt)
+    assert not advert.key_allowed(_get("/api/v4/projects", "service=git-upload-pack"), rt), \
+        "a service query with no repo path names no declared repo: keyless"
+
+
+@pytest.mark.parametrize("tail", ["/HEAD", "/objects/ab/cdef0123", "/objects/info/http-alternates", "/info/packs",
+                                  "/info/alternates", "/Objects;x/pack/p.pack", "/head/"])
+def test_f1_dumb_protocol_paths_under_a_git_segment_are_git_exchanges(tail):
+    rt = route(declared=("/o/declared.git",))
+    assert not advert.key_allowed(_get("/o/undeclared.git" + tail), rt), tail
+    assert advert.key_allowed(_get("/o/declared.git" + tail), rt), tail
+    assert advert.key_allowed(_get("/o/undeclared" + tail), rt), "no *.git segment: not a dumb-protocol shape"
+
+
+def test_f2_an_accept_range_with_q_zero_or_a_malformed_q_is_not_read_shaped(adverts):
+    advertised(adverts)
+    for accept in (RES_CT + ";q=0", RES_CT + "; q=0.000", RES_CT + ";Q=0", RES_CT + ";q=abc", RES_CT + ";q=1.5",
+                   RES_CT + ";q=", RES_CT + ";q =1", RES_CT + ";q=0.0001", RES_CT + ";q=1;q=0",
+                   RES_CT + ", " + RES_CT + ";q=0", RES_CT + ';x="a,b";q=0'):
+        assert verdict(post(headers={"accept": accept}), adverts) == CARD, accept
+    for accept in (RES_CT + ";q=0.001", RES_CT + " ; Q=1.000", "text/html;q=0, " + RES_CT, RES_CT + ";x=1"):
+        assert verdict(post(headers={"accept": accept}), adverts) == SILENT, accept
+
+
+def test_f3_a_marked_discovery_get_never_feeds_the_set(adverts):
+    """F3 (B11): a discovery GET the query marked (a card, allowed by the user) answers 200 with the advertisement;
+    it is not recorded, so a later upload-pack POST to that prefix is still a card."""
+    p = discovery(query="service=git-upload-pack&token=x")
+    v = decide(p, None, GATED)
+    assert (v.kind, v.why) == ("card", "credential_in_query")
+    assert adverts.observe(p, 200, ADV_CT, verdict=v) == advert.CT_ADVERTISEMENT
+    assert len(adverts) == 0 and verdict(post(), adverts) == CARD
+    with pytest.raises(TypeError):
+        adverts.observe(discovery(), 200, ADV_CT)   # the verdict is required: no caller can forget it
+
+
+def test_f5_a_capacity_above_the_cap_is_refused():
+    with pytest.raises(ValueError):
+        AdvertisementSet(capacity=advert.ADVERTISEMENT_SET_CAP + 1)
+    assert len(AdvertisementSet(capacity=advert.ADVERTISEMENT_SET_CAP)) == 0

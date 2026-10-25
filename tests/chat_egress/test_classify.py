@@ -482,3 +482,11 @@ def test_r15_18_q2_keyed_plain_post_zero_key_bytes_upstream():
 def test_r15_18_l2_k1_report_counts_presigned_cards():
     """R15-18-L2 / R15-13-Q3: K1's report counts the presigned cards, the Azure exemptions and sig matches."""
     raise NotImplementedError("K1's report is S9's")
+
+
+def test_f4_an_override_is_shown_as_its_rfc_9110_token():
+    """F4: `M-SEARCH` is one method token (tchar includes `-`); a non-token or an over-long value names none."""
+    assert run(frame(headers={"x-http-method-override": "M-SEARCH"}), GATED, False).method == "M-SEARCH"
+    assert run(frame(headers={"x-http-method-override": "x.y_z~1"}), GATED, False).method == "X.Y_Z~1"
+    for bad in ("DE LETE", "A" * 21, "POſT", "GET,PUT", ""):
+        assert run(frame(headers={"x-http-method-override": bad}), GATED, False).method == classify.AMBIGUOUS_METHOD, bad

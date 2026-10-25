@@ -21,9 +21,11 @@ The set (`AdvertisementSet`): per launch, at most 256 entries, oldest-first evic
 a tuple that passed the predicate refreshes it to newest; a reply that fails the predicate neither refreshes nor
 removes (R15-24-3, R15-26-1). Only the enum `content_type_class` is ever stored about a response (R15-21-3).
 
-Keys (R15-17-1): `key_allowed` narrows a keyed route's attach on a GIT EXCHANGE (a path ending `/info/refs` or
-`/git-upload-pack`, any method or query) to the route's declared repo set; it ANDs into classify's `reattached`
-and S6's liveness. A non-git request keeps the snapshot's rule.
+Keys (R15-17-1): `key_allowed` is the ONE home of "is this a git exchange that needs a declared repo?" (S6's
+`decide_key` calls it; its own `upload_pack_prefix` is deleted at the integration merge). On a keyed route it narrows
+the attach on a GIT EXCHANGE (`git_exchange`: an endpoint or discovery path, a dumb-protocol path under a `*.git`
+segment, or any `service` query; matched case-folded, `;...` stripped per segment, one trailing `/` stripped) to the
+route's declared repo set; it ANDs into classify's `reattached`. A non-git request keeps the snapshot's rule.
 
 Order (B11) is classify's: walls, R-7, R-5's query mark, then this predicate (never asked about a marked request).
 The decider binds the launch state: `functools.partial(read_shaped, adverts=<the set>, body_cut=<spool result>)`.
@@ -31,12 +33,14 @@ The decider binds the launch state: `functools.partial(read_shaped, adverts=<the
 
 from __future__ import annotations
 
+import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from levain.chat_egress import parse
+from levain.chat_egress.classify import Verdict
 from levain.chat_egress.parse import ParsedRequest, fold_name
 
 if TYPE_CHECKING:  # the type only: S6 owns the definition (the plan fixes its shape)
@@ -137,16 +141,22 @@ class AdvertisementSet:
     """One launch's advertisements: bounded, oldest-first by last insertion, refreshed on a passing re-insert."""
 
     def __init__(self, capacity: int = ADVERTISEMENT_SET_CAP) -> None:
-        if type(capacity) is not int or capacity < 1:
-            raise ValueError("capacity must be a positive int")
+        if type(capacity) is not int or not 1 <= capacity <= ADVERTISEMENT_SET_CAP:
+            raise ValueError(f"capacity must be an int in 1..{ADVERTISEMENT_SET_CAP} (the hard bound)")
         self._cap = capacity
         self._entries: OrderedDict[AdvertKey, None] = OrderedDict()
         self._lock = threading.Lock()
 
-    def observe(self, parsed: ParsedRequest, status: int, content_type: str | None) -> str:
-        """One allowed response, drained by the decider: record it when it is an advertisement; return the enum the
-        record stores (never the raw Content-Type)."""
-        if is_advertisement(parsed, status, content_type):
+    def observe(self, parsed: ParsedRequest, status: int, content_type: str | None, *, verdict: Verdict) -> str:
+        """One allowed response, drained by the decider: record it when it is an advertisement AND its request was
+        classified silent and unmarked (`verdict` is classify's for this request; B11: a request the query marked,
+        or any request that went through a card, never feeds the set). Return the enum the record stores (never the
+        raw Content-Type), recorded or not."""
+        if not isinstance(verdict, Verdict):
+            raise TypeError("observe needs the request's classify.Verdict")
+        clean = (verdict.kind == "silent" and not verdict.query_names
+                 and "credential_in_query" not in verdict.why_all)
+        if clean and is_advertisement(parsed, status, content_type):
             key = discovery_key(parsed)
             with self._lock:
                 self._entries[key] = None
@@ -164,12 +174,43 @@ class AdvertisementSet:
             return len(self._entries)
 
 
+#: RFC 9110 §12.4.2's qvalue.
+_QVALUE = re.compile(r"0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?")
+
+
+def _range_weight(params: str) -> str | None:
+    """The `q` of one Accept range's parameters (the text after its media type): "" when it carries none, None when
+    it is malformed (a second `q`, an empty or non-qvalue value, whitespace inside `q=`). `q` is case-insensitive."""
+    q = ""
+    seen = False
+    while params:
+        param, _, params = params.partition(";")
+        name, eq, val = param.strip(_OWS).partition("=")
+        if _ascii_lower(name.strip(_OWS)) != "q":
+            continue
+        if seen or not eq or name != name.strip(_OWS) or not _QVALUE.fullmatch(val):
+            return None
+        seen, q = True, val
+    return q if seen else ""
+
+
 def _accepts_result(parsed: ParsedRequest) -> bool:
+    """An `Accept` range names the result type with a weight above 0. Fail closed: any result-type range with q=0 or
+    a malformed q refuses the shape, and a value holding a quoted string (a `,` or `;` inside one would cut the
+    ranges wrong) never counts."""
+    found = False
     for value in parsed.header("accept"):
+        if '"' in value:
+            continue
         for rng in value.split(","):
-            if media_type(rng) == RESULT_TYPE:
-                return True
-    return False
+            mt, _, params = rng.partition(";")
+            if _ascii_lower(mt.strip(_OWS)) != RESULT_TYPE:
+                continue
+            q = _range_weight(params)
+            if q is None or (q and float(q) == 0):
+                return False
+            found = True
+    return found
 
 
 def _shape_ok(parsed: ParsedRequest) -> bool:
@@ -214,16 +255,51 @@ def read_shaped(parsed: ParsedRequest, route: "RouteSnapshot | None", *, adverts
     return upload_pack_disposition(parsed, adverts=adverts, body_cut=body_cut) == "read_shaped"
 
 
-def git_exchange_prefix(parsed: ParsedRequest) -> str | None:
-    """The repo prefix of a git smart-HTTP exchange (canonical path ending `/info/refs` or `/git-upload-pack`, any
-    method, any query), else None. Wider than the read shape on purpose: the key's narrowing fails closed."""
+_SERVICE_ENDPOINTS = frozenset({"git-upload-pack", "git-receive-pack"})
+_DUMB_INFO = (["info", "packs"], ["info", "alternates"])
+
+
+def _fold_segment(seg: str) -> str:
+    return _ascii_lower(seg.partition(";")[0])
+
+
+def git_exchange(parsed: ParsedRequest) -> tuple[bool, str | None]:
+    """(is a git exchange, the repo prefix the declared set may name). Wider than the read shape on purpose: the
+    key's narrowing fails closed (an over-match keeps the key off a non-git path: friction, never a reach).
+
+    Over R-2's canonical path, each segment case-folded (ASCII) and stripped of `;...`, one trailing `/` stripped:
+      (1) it ends `/info/refs`, `/git-upload-pack` or `/git-receive-pack`;
+      (2) a dumb-protocol shape under a `*.git` segment: `/HEAD`, `/objects/...`, `/info/packs`, `/info/alternates`;
+      (3) the query carries `service` at all (missing value, duplicated, any value).
+    The prefix is the path up to the git suffix (up to and including the `*.git` segment for (2)), as spelled in the
+    canonical path. None (no declared repo can match, keyless) when: an `info/refs` path does not carry exactly one
+    `service` and it `git-upload-pack`; or only (3) holds (no repo path)."""
     path = parsed.canonical_path
     if path is None:
-        return None
-    for suffix in (DISCOVERY_SUFFIX, UPLOAD_PACK_SUFFIX):
-        if path.endswith(suffix):
-            return path[: -len(suffix)]
-    return None
+        return True, None
+    service = [q.value for q in parsed.params if q.folded == _SERVICE_KEY]
+    raw = path.split("/")
+    if len(raw) > 2 and raw[-1] == "":
+        raw = raw[:-1]
+    folded = [_fold_segment(seg) for seg in raw]
+    n = len(folded)
+    prefix_raw: list[str] | None = None
+    discovery = False
+    if n >= 2 and folded[-1] in _SERVICE_ENDPOINTS:
+        prefix_raw = raw[:-1]
+    elif n >= 3 and folded[-2:] == ["info", "refs"]:
+        prefix_raw, discovery = raw[:-2], True
+    else:
+        for i in range(n - 2, 0, -1):
+            rest = folded[i + 1:]
+            if folded[i].endswith(".git") and (rest == ["head"] or rest[0] == "objects" or rest in _DUMB_INFO):
+                prefix_raw = raw[:i + 1]
+                break
+    if prefix_raw is None:
+        return bool(service), None
+    if discovery and service != [SERVICE]:
+        return True, None
+    return True, "/".join(prefix_raw)
 
 
 def _canonical_repo(entry: str) -> str | None:
@@ -238,15 +314,18 @@ def _canonical_repo(entry: str) -> str | None:
 
 
 def key_allowed(parsed: ParsedRequest, route: "RouteSnapshot | None") -> bool:
-    """R15-17-1: on a keyed route, a git exchange carries the held key only for a repo in the route's declared set
-    (matched by prefix exactly as git spells it, in R-2's canonical form). Any other request: True (the snapshot's
-    rule, S6's liveness and classify's `reattached` decide). The discovery GET of an undeclared repo is keyless too."""
+    """R15-17-1, the ONE home (S6's `decide_key` calls this): on a keyed route, a git exchange (`git_exchange`)
+    carries the held key only for a repo in the route's declared set (matched by prefix exactly as spelled, in R-2's
+    canonical form). A walled path: False. Any other request: True (the snapshot's rule, S6's liveness and
+    classify's `reattached` decide). The discovery GET of an undeclared repo is keyless too."""
     if route is None:
         return True
-    prefix = git_exchange_prefix(parsed)
-    if prefix is None:
-        if parsed.canonical_path is None:
-            return False
+    if parsed.canonical_path is None:
+        return False
+    exchange, prefix = git_exchange(parsed)
+    if not exchange:
         return True
+    if prefix is None:
+        return False
     declared = {c for c in (_canonical_repo(e) for e in route.declared_repos) if c is not None}
     return prefix in declared

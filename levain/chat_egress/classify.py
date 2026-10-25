@@ -55,7 +55,10 @@ _EXEMPTION_METHODS = frozenset({"GET", "HEAD"})
 #: The card's `method` when the overrides do not name ONE method token (two different values, or a value that is
 #: not an HTTP method token). The card never guesses which one the origin honours.
 AMBIGUOUS_METHOD = "<ambiguous override>"
-_METHOD_TOKEN = re.compile(r"[A-Za-z]{1,20}")
+#: RFC 9110 §5.6.2's token (tchar, ASCII only), checked on the value AS SENT (before any case folding), with a
+#: display-length cut of 20: a longer value names no method the card will show.
+_METHOD_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,20}")
+_ASCII_UPPER = {c: c - 32 for c in range(ord("a"), ord("z") + 1)}
 
 _METHOD_KEY = fold_name("_method")
 
@@ -164,11 +167,14 @@ def _azure_sas_read_shape(p: ParsedRequest) -> bool:
 def _effective_method(p: ParsedRequest, overrides: list[str]) -> str:
     if not overrides:
         return p.method
-    values = {v.strip().upper() for v in overrides}
+    stripped = [v.strip(" \t") for v in overrides]
+    if not all(_METHOD_TOKEN.fullmatch(v) for v in stripped):
+        return AMBIGUOUS_METHOD
+    values = {v.translate(_ASCII_UPPER) for v in stripped}   # ASCII only: str.upper() maps U+017F to `S`
     if len(values) != 1:
         return AMBIGUOUS_METHOD
     (v,) = values
-    return v if _METHOD_TOKEN.fullmatch(v) else AMBIGUOUS_METHOD
+    return v
 
 
 def decide(parsed: ParsedRequest, route: "RouteSnapshot | None", mode: str, *,
