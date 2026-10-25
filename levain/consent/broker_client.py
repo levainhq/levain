@@ -273,14 +273,15 @@ GATE_GO, GATE_HALTED, GATE_OVER, GATE_FAILED = "go", "halted", "over-limit", "li
 SLOT_HALT_TEXT = ("levain: this session is halted on request {r}: an irreversible call's hold ended with no answer. "
                   "No further tool calls are allowed. Write a short summary of what is done and end your turn.")
 # an over-limit GATE: Q13's budget words, with what the operator can do for a slot (the local
-# ``levain limits extend`` is not a slot's: the broker reads its limits from its own settings, and has no Extend hold)
+# ``levain limits extend`` is not a slot's: the broker reads its limits from root's L/policy/limits, and has no Extend)
 SLOT_OVER_TEXT = ("levain: STOPPED by a budget the operator set: this session reached {limit}. This is not "
                   "a fault and not a denial of the work. Do not try to continue it another way; the session goes on "
-                  "only when the operator raises that limit in the queue broker's limits settings, or starts a new "
-                  "session.")
-# a limits-failed GATE: the gate itself failed, not a budget; the operator repairs or moves the limits database
+                  "only when the operator raises that limit in the slot limits settings (levain limits set --slots), "
+                  "or starts a new session.")
+# a limits-failed GATE: the gate itself failed, not a budget; the reason names which part (the settings or the counter)
 SLOT_LIMITS_FAILED_TEXT = ("levain: the limits gate could not run, so the action was NOT taken: {why}. This is a fault "
-                           "of the limits store, not a budget. The operator repairs or moves aside the broker's limits "
+                           "of the limits gate, not a budget. The operator fixes what that names: the slot limits "
+                           "settings (L/policy/limits, rewritten with levain limits set --slots) or the broker's limits "
                            "database (requests/limits/limits.db under the queue); do not retry this call and do not "
                            "achieve it another way.")
 

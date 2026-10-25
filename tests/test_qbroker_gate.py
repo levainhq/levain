@@ -168,11 +168,15 @@ def test_a_decided_receipt_after_the_expiry_releases_the_halt(L, broker, keys, c
     assert gate(broker)["gate"] == "go"
 
 
+# the slot kinds a test leaves out, set past anything it reaches (a settings answer must name all three)
+ROOMY = {"calls": 10**6, "active_hours": 10**6, "repeat": 10}
+
+
 def limited(L, resolver, clock, value, seen=None):
     def limits(agent, session):
         if seen is not None:
             seen.append((agent, session))
-        return value
+        return value if value is None else ROOMY | value
     return make_broker(L, resolver, clock, limits=limits)
 
 
@@ -182,9 +186,11 @@ def test_no_limits_configured_is_go_and_counts_nothing(L, broker):
     assert not (L / "queue" / "requests" / qbroker.LIMITS_DIR).exists()
 
 
-def test_a_callable_answering_none_is_go(L, resolver, clock):
+def test_a_callable_answering_none_is_limits_failed(L, resolver, clock):
+    # slot limits R1 F1: None is no longer "no limits"; only Broker(limits=None) is (a test's broker)
     b = limited(L, resolver, clock, None)
-    assert [gate(b)["gate"] for _ in range(3)] == ["go"] * 3
+    got = [gate(b) for _ in range(3)]
+    assert [g["gate"] for g in got] == ["limits-failed"] * 3 and got[0]["reason"] == qbroker.LIMITS_SETTINGS_FAILED
 
 
 def test_a_session_over_its_limit_is_over_limit(L, resolver, clock):
@@ -202,7 +208,7 @@ def test_a_session_over_its_limit_is_over_limit(L, resolver, clock):
 def test_calls_denied_over_limit_are_not_counted_so_a_raised_limit_is_not_spent(L, resolver, clock):
     # F6 (s2b2_fix1_run/RUN_before.txt: calls=2, 3 denied, raised to 3, the next call still denied)
     lim = {"calls": 2}
-    b = make_broker(L, resolver, clock, limits=lambda a, s: dict(lim))
+    b = make_broker(L, resolver, clock, limits=lambda a, s: ROOMY | lim)
     assert [gate(b)["gate"] for _ in range(5)] == ["go", "go"] + ["over-limit"] * 3
     lim["calls"] = 3
     assert [gate(b)["gate"] for _ in range(2)] == ["go", "over-limit"]   # the third fits, the fourth crosses

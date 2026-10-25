@@ -667,7 +667,7 @@ def limited_slot(L, monkeypatch, tmp_path):
     resolver = FakeResolver()
     resolver.add(1, CAP, SESSION)
     broker = Broker(QueueStore(L / "queue"), resolver, SignersSource(L / "policy", L / "routes" / "trust.pub"),
-                    limits=lambda agent, session: {"calls": 2})
+                    limits=lambda agent, session: {"calls": 2, "active_hours": 100, "repeat": 10})
     lst = SlotListener(broker, 1, run_dir / "q.sock", os.getuid(), expected_gid=bound_gid(run_dir))
     lst.start()
     for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "CLAUDE_PROJECT_DIR"):

@@ -47,11 +47,17 @@ session is the resolve's, never the frame's.
   the operator side has a late-ruling path: nothing writes that receipt yet (:meth:`Receipts.decided` refuses an
   expired request), so a slot halt is released only by a new session.
 - Over-limit: Q13's counter (:func:`levain.consent.limits.count_call`, the counter :func:`levain.consent.limits.check`
-  runs first) fed this call, with ``count_crossed=False`` (a call answered over-limit is not counted, so a limit the
-  operator raises later is not found spent by the calls it denied), kept in ``requests/limits/limits.db`` (:meth:`Broker._limits_dir`), keyed by the
+  runs first) fed this call at the broker's clock, with ``count_crossed=False`` (a call answered over-limit is not
+  counted, so a limit the operator raises later is not found spent by the calls it denied; the crossing LATCHES
+  instead, so every later call of the session is over-limit until the limit in force is above the latched count),
+  kept in ``requests/limits/limits.db`` (:meth:`Broker._limits_dir`), keyed by the
   resolved session and the agent the frame names (its own hook's: it selects a count, never a lower one); the
-  limits in force are ``limits(agent, session)``, the Broker's settings callable (default: none configured, every
-  call GO, nothing counted). A ``crossed`` or ``halted`` verdict answers over-limit, ``fail_deny`` answers
+  limits in force are ``limits(agent, session)``, the Broker's settings callable (production:
+  :class:`levain.qbroker.limits.PolicyLimits`, read from ``L/policy/limits``; ``None``, a test's broker, every call
+  GO, nothing counted). The callable raising :class:`~levain.qbroker.limits.LimitsUnavailable` answers
+  ``limits-failed`` with its reason, and so does an answer that is not every kind of
+  :data:`levain.consent.limits.SLOT_KINDS` as a positive number (:func:`slot_limits`: a kind left out is never
+  unlimited). A ``crossed`` or ``halted`` verdict answers over-limit, ``fail_deny`` answers
   ``limits-failed`` with the counter's reason (the store failed, not a budget: the operator repairs or moves the
   limits database); ``ok`` and ``not_counting`` (the counter's own bounded fail-open) answer GO. A counter directory that cannot be established
   as the broker's own 0700 one answers ``limits-failed`` on every limited call (the counter could not even persist
@@ -98,6 +104,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import posixpath
 import re
@@ -118,6 +125,7 @@ from levain.consent.away import MAX_HOLD
 from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.record import ExternalGateRequest
 from levain.qbroker import grants, wire
+from levain.qbroker.limits import LimitsUnavailable
 from levain.qbroker.receipts import Receipts
 from levain.qbroker.seam import answer_refusal, grant_allow_refusal, request_of
 from levain.qbroker.signers import SignersSnapshot, SignersSource
@@ -180,14 +188,33 @@ _GATE_OVER = frozenset({"crossed", "halted"})
 _SETTLED = frozenset({"allowed", "denied"})
 _GATE_KEYS = frozenset({"v", "op", "id", "cap", "agent", "tool_name", "input_digest", "tool_use_id"})
 _GATE_REQUIRED = _GATE_KEYS - {"tool_use_id"}
-# the limits in force for (agent, resolved session), or None when none are configured (every call GO)
-LimitsSource = Callable[[str, str], "Mapping[str, float] | None"]
+# the limits in force for (agent, resolved session): every one of consent_limits.SLOT_KINDS, or LimitsUnavailable
+# raised (levain.qbroker.limits.PolicyLimits is the one in production)
+LimitsSource = Callable[[str, str], "Mapping[str, float]"]
 # the counter's directory under requests/ (limits.db and its failure files)
 LIMITS_DIR = "limits"
 # the longest tool_use_id a GATE frame may carry (the counter keys a repeat by it; levain.consent.limits takes the same)
 TOOL_USE_ID_MAX = 256
 # GATE's limits-failed reason when that directory cannot be used (Broker._limits_dir)
 LIMITS_DIR_FAILED = "the limits directory requests/limits could not be used as the broker's own 0700 directory"
+# GATE's limits-failed reason when the settings callable answers anything but every slot kind (slot_limits)
+LIMITS_SETTINGS_FAILED = "the broker's limits settings did not name calls, active_hours and repeat"
+
+
+def slot_limits(in_force: Any) -> dict[str, float] | None:
+    """What the counter runs with from the settings callable's answer: each of
+    :data:`levain.consent.limits.SLOT_KINDS` a positive real number (the token kinds unlimited: a slot counts none), or
+    ``None`` when the answer is not that (``None`` itself, a kind missing, a value that is not a number): a kind
+    left out is never read as unlimited (slot limits R1 F1)."""
+    if not isinstance(in_force, Mapping):
+        return None
+    full = {k: float("inf") for k in consent_limits.KINDS}
+    for kind in consent_limits.SLOT_KINDS:
+        v = in_force.get(kind)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (v > 0 and math.isfinite(v)):
+            return None
+        full[kind] = float(v)
+    return full
 
 
 @dataclass(frozen=True)
@@ -279,7 +306,8 @@ class Broker:
                  contracts_owner: int | None = None, limits: LimitsSource | None = None) -> None:
         """``contracts``: the directory dispatch publishes signed contracts in (``L/contracts/``, CONTRACT §26 S1-b),
         whose files must be owned by ``contracts_owner`` (dispatch's uid); without both, no grant ever applies.
-        ``limits``: the GATE verb's settings callable (module docstring); ``None``, no limits configured."""
+        ``limits``: the GATE verb's settings callable (module docstring); ``None``, no limits configured (a test's
+        broker: production passes :class:`levain.qbroker.limits.PolicyLimits`, :func:`levain.qbroker.__main__.build_broker`)."""
         self._store = store
         self._limits = limits
         self._limits_dir_logged = False
@@ -724,11 +752,13 @@ class Broker:
             return wire.answer(rid, gate="halted", request_id=halting)
         if self._limits is None:
             return wire.answer(rid, gate="go")
-        in_force = self._limits(agent, who.session)
-        if in_force is None:
-            return wire.answer(rid, gate="go")
-        # every kind the callable leaves out is unlimited (count_call reads all of KINDS)
-        full = {k: float(in_force.get(k, float("inf"))) for k in consent_limits.KINDS}
+        try:
+            in_force = self._limits(agent, who.session)
+        except LimitsUnavailable as exc:
+            return wire.answer(rid, gate="limits-failed", reason=str(exc.reason)[:512])
+        full = slot_limits(in_force)
+        if full is None:
+            return wire.answer(rid, gate="limits-failed", reason=LIMITS_SETTINGS_FAILED)
         event = {"tool_use_id": tid} if isinstance(tid, str) else {}
         qdir = self._limits_dir()
         if qdir is None:

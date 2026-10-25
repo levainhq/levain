@@ -4,7 +4,8 @@ Serves ``R/qb/slot<n>/q.sock`` for every ``--slot``, each accepting only the uid
 when the socket is in group ``_levain_s<n>``; resolves caps through ``R/control/control.sock``; reads rows under
 ``L/queue/`` and the answer-signer snapshot under ``L/policy/`` (verified by ``L/routes/trust.pub``), and the signed
 contracts dispatch publishes under ``L/contracts/`` (CONTRACT §26 S1-b; files owned by ``_levain_dispatch``: with no
-such user, no contract grant applies and every call goes to the queue). Runs until SIGTERM or SIGINT.
+such user, no contract grant applies and every call goes to the queue), and the slot limits under ``L/policy/limits``
+(:class:`levain.qbroker.limits.PolicyLimits`, owned by root). Runs until SIGTERM or SIGINT.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from pathlib import Path
 
 from levain.qbroker.broker import Broker
 from levain.qbroker.control import ControlResolver
+from levain.qbroker.limits import PolicyLimits
 from levain.qbroker.server import SlotListener, socket_path
 from levain.qbroker.signers import SignersSource
 from levain.qbroker.store import QueueStore
@@ -30,22 +32,33 @@ DISPATCH_USER = "_levain_dispatch"
 _DEFAULT_RUN = "/private/var/run/levain" if sys.platform == "darwin" else "/run/levain"
 
 
-def main(argv: list[str] | None = None) -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="python -I -m levain.qbroker")
     ap.add_argument("--store", default=_DEFAULT_STORE, help="L, the store root")
     ap.add_argument("--run", default=_DEFAULT_RUN, help="R, the run directory")
     ap.add_argument("--slot", type=int, action="append", required=True, help="a configured slot (repeatable)")
-    args = ap.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    return ap.parse_args(argv)
+
+
+def build_broker(args: argparse.Namespace, *, limits_owner: int = 0) -> Broker:
+    """The broker :func:`main` serves (``limits_owner``: the uid ``L/policy`` and its limits file must belong to)."""
     store_root, run_dir = Path(args.store), Path(args.run)
     try:
         dispatch_uid: int | None = pwd.getpwnam(DISPATCH_USER).pw_uid
     except KeyError:
         logging.getLogger("levain.qbroker").warning("no %s user: no contract grant applies", DISPATCH_USER)
         dispatch_uid = None
-    broker = Broker(QueueStore(store_root / "queue"), ControlResolver(run_dir / "control" / "control.sock"),
-                    SignersSource(store_root / "policy", store_root / "routes" / "trust.pub"),
-                    contracts=store_root / CONTRACTS_DIR, contracts_owner=dispatch_uid)
+    return Broker(QueueStore(store_root / "queue"), ControlResolver(run_dir / "control" / "control.sock"),
+                  SignersSource(store_root / "policy", store_root / "routes" / "trust.pub"),
+                  contracts=store_root / CONTRACTS_DIR, contracts_owner=dispatch_uid,
+                  limits=PolicyLimits(store_root / "policy", owner=limits_owner))
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    run_dir = Path(args.run)
+    broker = build_broker(args)
     listeners = []
     for slot in sorted(set(args.slot)):
         listener = SlotListener(broker, slot, socket_path(run_dir, slot), pwd.getpwnam(f"_levain_s{slot}").pw_uid,
