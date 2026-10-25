@@ -20,8 +20,9 @@ Durability: :mod:`levain.autonomic.durable_sqlite` (every commit on disk before 
 The store carries a format marker, read inside every transaction; a database with another marker, or
 tables and no marker, is refused rather than read or taken over, and a store that disappears under a
 running object is refused rather than silently started empty. The format is ``levain-autonomic/2``: a
-binding's effect runs below CONFIRM only under a signed graduation policy (the gate's clamp). The first open by this binary
-migrates a ``levain-autonomic/1`` store in place (:func:`migrate_to_v2`, in the opening ``BEGIN IMMEDIATE``).
+binding's effect runs below CONFIRM only under a signed graduation policy (the gate's clamp). The first open by
+this binary migrates a ``levain-autonomic/1`` store in place (:func:`migrate_to_v2`, in the opening
+``BEGIN IMMEDIATE``).
 
 **Upgrade order: stop every process of an older levain that has the store open before this binary opens it.** A
 ``/1`` binary that checks the marker inside every transaction (``_check_format``, after 0.11.24) refuses the store at
