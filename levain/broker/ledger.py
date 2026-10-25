@@ -222,16 +222,29 @@ def _meta_ok(meta: Any) -> bool:
 
 #: the lineage `settled` word for each outcome (H6-5: a released exchange is a row with "no")
 _SETTLED_WORD = {"released": "no", "settled": "yes", "uncertain": "uncertain"}
-#: the longest `at` the ledger writes (`_now()`'s shape), for the size check of a payload built later
+#: the longest `at` the ledger writes (`_now()`'s shape), for the size check of a payload built later (the payload
+#: carries it cut to its second, `_second`)
 _AT_SAMPLE = "0000-00-00T00:00:00.000000Z"
 
 
+def _second(at: str) -> str:
+    """A ledger stamp (`_now()`'s shape) cut to its second: `YYYY-MM-DDTHH:MM:SSZ`, the one form a lineage payload
+    carries (H6-31, 3c-6d: CONTROL's sink takes only that form, and the ledger is the one place that computes it)."""
+    return at[:19] + "Z"
+
+
 def lineage_payload(base: dict, outcome: str, at: str) -> dict:
-    """The payload of a ledger-written resolution of a ticketed hold: its `lineage_base` plus the outcome (the seam
-    3c-6c fills: keys' base already holds every field the ledger cannot know)."""
+    """The payload of a ledger-written resolution of a ticketed hold: its `lineage_base` plus the outcome (keys' base
+    already holds every field the ledger cannot know). `at` is the resolution line's own `_now()` stamp; the payload's
+    `ended_at` is that moment cut to its second (H6-31). A RELEASED outcome is a hold the ledger ended before any
+    upstream call (only PENDING / RESERVED holds release), so its row says no call was made: `model_answered` and
+    `provider_answered` null and `status` 0 (H6-32, H6-21). An `uncertain` one (a SENT hold, or replay's restart,
+    which cannot know) keeps the base's "unknown"."""
     p = json.loads(json.dumps(base))
     p["settled"] = _SETTLED_WORD[outcome]
-    p["ended_at"] = at
+    p["ended_at"] = _second(at)
+    if outcome == RELEASED:
+        p.update(model_answered=None, provider_answered=None, status=0)
     return p
 
 

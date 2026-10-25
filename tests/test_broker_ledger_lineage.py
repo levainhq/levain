@@ -203,7 +203,7 @@ def test_restart_line_carries_a_payload_built_from_lineage_base(tmp_path):
     led = L.Ledger.open(path)
     rs = [o for o in file_lines(path) if o["kind"] == "uncertain"]
     assert [(o["ref"], o["reason"]) for o in rs] == [(2, "restart"), (3, "restart")]
-    want = dict(BASE, settled="uncertain", ended_at=rs[0]["at"])
+    want = dict(BASE, settled="uncertain", ended_at=rs[0]["at"][:19] + "Z")    # H6-31: cut to its second
     assert rs[0]["meta"] == {"lineage": want} and rs[1]["meta"] == {}
     assert led.unacked() == [((LID, E1, 2), want)]
     assert led.epoch != E1
@@ -260,7 +260,8 @@ def test_a_caller_payload_is_kept_and_an_owner_end_is_built(tmp_path):
     ls = {o["kind"]: o for o in file_lines(path) if o["kind"] in ("settled", "uncertain")}
     assert ls["settled"]["meta"] == {"usage": {"in": 5}, "lineage": mine}
     assert ls["uncertain"]["reason"] == "owner-ended"
-    assert ls["uncertain"]["meta"] == {"lineage": dict(BASE, settled="uncertain", ended_at=ls["uncertain"]["at"])}
+    assert ls["uncertain"]["meta"] == {"lineage": dict(BASE, settled="uncertain",
+                                                          ended_at=ls["uncertain"]["at"][:19] + "Z")}
     assert [p for _, p in out] == [mine, ls["uncertain"]["meta"]["lineage"]]
 
 

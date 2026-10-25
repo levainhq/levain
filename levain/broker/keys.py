@@ -280,20 +280,6 @@ def _stamp(t: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(t)))
 
 
-#: the ledger's own `at` (`ledger._now()`, microseconds) as a payload the LEDGER built carries it in `ended_at`
-_FRACTIONAL = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})\.[0-9]{1,6}Z\Z")
-
-
-def _wire_stamp(v: object) -> object:
-    """A stamp as the record carries it to CONTROL: a fractional one (a ledger-built row's `ended_at`) cut to its
-    second, anything else unchanged (KNOWN SEAM: the ledger writes microseconds, CONTROL's sink takes seconds)."""
-    if type(v) is str:
-        m = _FRACTIONAL.match(v)
-        if m is not None:
-            return m.group(1) + "Z"
-    return v
-
-
 def lineage_base(run: dict, at: str, hold: int, unproven: bool) -> dict:
     """A ticketed exchange's `lineage_base` (its `reserved` line's `meta`): a WHOLE `/3` record but `source` (the
     triple, added at send) and the outcome. Every field is present (H6-15); the outcome fields hold what a row the
@@ -345,14 +331,11 @@ def refused_row(run: dict, *, reason: str, count: int, at: str, ended_at: str) -
 
 
 def wire_record(triple: Tuple[str, str, int], payload: object) -> dict:
-    """One envelope element (H6-14): the payload the outbox holds, with its `source` triple, its stamps in CONTROL's
-    shape (`_wire_stamp`). A payload that is not an object goes as its triple alone, which CONTROL quarantines (the
-    outbox still drains)."""
+    """One envelope element (H6-14): the payload the outbox holds, as it is on disk, with its `source` triple (every
+    stamp is already in CONTROL's second form: keys' `_stamp`, and the ledger's own rows, `ledger._second`, H6-31).
+    A payload that is not an object goes as its triple alone, which CONTROL quarantines (the outbox still drains)."""
     rec = dict(payload) if isinstance(payload, dict) else {}
     rec["source"] = {"ledger": triple[0], "epoch": triple[1], "ref": triple[2]}
-    for k in ("at", "ended_at"):
-        if k in rec:
-            rec[k] = _wire_stamp(rec[k])
     return rec
 
 

@@ -188,10 +188,10 @@ def test_every_row_shape_carries_every_field_and_the_bounds_are_the_sinks():
     assert K.LINEAGE_ENVELOPE_RECORDS == LN.ENVELOPE_MAX == 64
     assert K.LINEAGE_ENVELOPE_BYTES == getattr(LN, "ENVELOPE_BYTES_MAX", 48 * 1024) == 48 * 1024
     assert K.LINEAGE_OUTBOX_MAX == 4096 and K.REFUSED_ROW_S == 60.0
-    # the ledger writes microseconds into a row it builds itself (`ended_at`); the record goes in CONTROL's shape
-    rec = K.wire_record(("a" * 32, "b" * 32, 9), dict(base, ended_at="2026-10-24T12:00:00.123456Z"))
-    assert rec["ended_at"] == "2026-10-24T12:00:00Z" and rec["source"] == {"ledger": "a" * 32, "epoch": "b" * 32,
-                                                                          "ref": 9}
+    # H6-31: the record goes as the outbox holds it plus its `source` (no stamp is re-cut on the wire: the ledger
+    # writes its own rows' stamps in CONTROL's form, `test_a_ledger_built_row_is_acked_not_quarantined`)
+    rec = K.wire_record(("a" * 32, "b" * 32, 9), base)
+    assert rec == dict(base, source={"ledger": "a" * 32, "epoch": "b" * 32, "ref": 9})
     assert LN.check_record(rec) is None
 
 
@@ -681,3 +681,75 @@ def test_new_lines_are_sent_as_they_become_durable():
         return [n for _, _, n, _ in spy.ops("LINEAGE-APPEND")]
 
     assert delivery(fn) == [1, 2]
+
+
+# ---- H6-31 / H6-32 (3c-6d): the rows the LEDGER builds, at the source ----------------------------------------------
+
+_SECOND = __import__("re").compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+
+
+def _ledger_built(tmp_path, *, sent: bool, end: str) -> tuple:
+    """One ticketed hold (keys' real `lineage_base`) that the LEDGER resolves itself: its owner task ends
+    (`end="owner"`) or the ledger closes (`end="closed"`), SENT or not. Returns (its resolution line, its outbox
+    entry)."""
+    from tests.ledger_support import Owner
+    path = os.path.join(str(tmp_path), "ledger.jsonl")
+    base = K.lineage_base(RUN, "2026-10-24T12:00:00Z", 100, False)
+
+    async def go():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        o = await Owner(led, meta={"lineage_base": base}).start()
+        await o.hold.durable()
+        if sent:
+            o.hold.send_gate()
+            o.hold.mark_sent()
+        if end == "owner":
+            await o.finish()
+            await until(lambda: o.hold.state is L.RESOLVED, 10, "resolved")
+            out = led.unacked()
+            await led.aclose(5)
+        else:
+            await led.aclose(5)
+            led2 = L.Ledger.open(path)
+            out = led2.unacked()
+            await led2.aclose(0)
+            await o.finish()
+        return out
+
+    out = asyncio.run(go())
+    (res,) = [o for o in file_lines(path) if o["kind"] in ("released", "uncertain")]
+    assert len(out) == 1, out
+    return res, out[0]
+
+
+@pytest.mark.parametrize("end", ["owner", "closed"])
+def test_a_ledger_built_row_is_acked_not_quarantined(tmp_path, end):
+    # H6-31: a row the ledger builds itself (a SENT ticketed hold whose owner ended, or the ledger closed under it)
+    # carries its stamps in CONTROL's second-precision form AS THE LEDGER WROTE IT: the record CONTROL receives is
+    # the outbox payload plus its `source`, with nothing in keys re-cutting it, and CONTROL's own record check
+    # (the sink's quarantine decision) accepts it
+    res, (triple, payload) = _ledger_built(tmp_path, sent=True, end=end)
+    assert res["kind"] == "uncertain" and res["reason"] == ("owner-ended" if end == "owner" else "closed")
+    raw = dict(payload, source={"ledger": triple[0], "epoch": triple[1], "ref": triple[2]})
+    assert LN.check_record(raw) is None, LN.check_record(raw)       # base 3e8aa639: quarantined "ended_at"
+    assert _SECOND.fullmatch(payload["ended_at"]) and _SECOND.fullmatch(payload["at"]), payload
+    assert payload["ended_at"] == res["at"][:19] + "Z"               # the line's own moment, cut to its second
+    assert K.wire_record(triple, payload) == raw                     # keys sends the payload as the ledger wrote it
+
+
+@pytest.mark.parametrize("end", ["owner", "closed"])
+def test_an_unsent_holds_ledger_built_row_says_no_call(tmp_path, end):
+    # H6-32 (H6-21): a ticketed hold the ledger resolves before any upstream call (owner-ended / closed while
+    # RESERVED: `released`, settled "no") made no call, so its row's answered fields are null, not "unknown"; status 0
+    res, (_t, payload) = _ledger_built(tmp_path, sent=False, end=end)
+    assert res["kind"] == "released"
+    assert payload["settled"] == "no" and payload["status"] == 0
+    assert payload["model_answered"] is None and payload["provider_answered"] is None
+    assert payload["cost_reported"] is None and payload["tokens_in"] is None
+    assert set(payload) == set(LN.RECORD_CHECKS) - {"source"}
+    assert _wire_ok(payload) in ((None,) if _h621_landed() else ("model_answered",))
+    # a SENT hold's ledger-built row keeps "unknown": the call happened, the response did not say
+    (tmp_path / "s").mkdir()
+    _res2, (_t2, sent_payload) = _ledger_built(tmp_path / "s", sent=True, end=end)
+    assert sent_payload["model_answered"] == "unknown" and sent_payload["provider_answered"] == "unknown"
