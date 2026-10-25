@@ -11,8 +11,9 @@ THE OBSERVATION CHANNEL (glue -> decider, the second fd; one JSON object per lin
   {"t":"resp","request_id":<id>,"status":<100..599>,"content_type":<str|null>,"content_length":<str|null>}
       written inside the allow's `onResponse(status, headers)`, before srt relays the response head (so it is in the
       channel before the client can send its next request). `content_type` / `content_length` are srt's normalised
-      header values, raw: the decider evaluates the advertisement predicate on the first and parses the second with
-      `declared_length`, and persists NEITHER raw (R15-21-3).
+      header values, raw, each cut by the glue to CONTENT_FIELD_LIMIT (a longer one is a WireError): the decider
+      evaluates the advertisement predicate on the first and parses the second with `declared_length`, and persists
+      NEITHER raw (R15-21-3).
   {"t":"ended","request_id":<id>}
       written when the request's abort signal fires (a) while the decision is pending, or (b) after the wrapper
       returned allow and before `onResponse`; never after a deny, a glue wall or an outcome. It names no cause (one
@@ -56,6 +57,9 @@ HOST_MAP_LIMIT = 64
 HOST_LIMIT = 253
 DROPPED_NAME_LIMIT = 64
 DROPPED_NAMES_SHOWN = 8
+#: S4 F5: the glue cuts a resp line's `content_type` / `content_length` to this many UTF-16 units (glue.mjs's
+#: CONTENT_FIELD_LIMIT, the same number); the reader refuses a longer one, so a glue that stops cutting is a WireError.
+CONTENT_FIELD_LIMIT = 256
 
 #: The glue's wall reasons. port: CONNECT to anything but 443, plain HTTP to anything but 80 (C-2, R15-12-B1);
 #: non_dns_host: a CONNECT / absolute-form authority srt cannot canonicalise (C-2); scheme: an absolute-form target
@@ -153,12 +157,12 @@ def _keys(obj: dict, want: set[str]) -> None:
         raise WireError(f"fields {sorted(obj)} != {sorted(want)}")
 
 
-def _opt_str(v: object) -> bool:
-    return v is None or isinstance(v, str)
-
-
 def _int(v: object, lo: int, hi: int) -> bool:
     return type(v) is int and lo <= v <= hi
+
+
+def _content_field(v: object) -> bool:
+    return v is None or isinstance(v, str) and len(v) <= CONTENT_FIELD_LIMIT
 
 
 def parse_obs_line(line: bytes) -> ObsResponse | ObsEnded:
@@ -168,8 +172,8 @@ def parse_obs_line(line: bytes) -> ObsResponse | ObsEnded:
     if t == "resp":
         _keys(obj, {"t", "request_id", "status", "content_type", "content_length"})
         if not is_request_id(obj["request_id"]) or not _int(obj["status"], 100, 599) \
-                or not _opt_str(obj["content_type"]) or not _opt_str(obj["content_length"]):
-            raise WireError("resp field types")
+                or not _content_field(obj["content_type"]) or not _content_field(obj["content_length"]):
+            raise WireError("resp field types or bounds")
         return ObsResponse(obj["request_id"], obj["status"], obj["content_type"], obj["content_length"])
     if t == "ended":
         _keys(obj, {"t", "request_id"})

@@ -244,3 +244,30 @@ def test_l2_lone_surrogate_is_a_wire_error(bad):
 def test_codex_r1_low7_an_integer_past_the_digit_limit_is_a_wire_error():
     with pytest.raises(WireError):
         wire.parse_obs_line(b'{"t": "x", "n": ' + b"9" * 5000 + b"}\n")
+
+
+# --- S4 F5, the wire half: the resp fields' bound is the glue's -------------------------------------------------
+
+def test_content_field_limit_is_the_glues():
+    """The glue cuts `content_type` / `content_length` to its CONTENT_FIELD_LIMIT; the reader's bound is that same
+    number, read from glue.mjs's source so the two cannot drift apart."""
+    import re
+    from pathlib import Path
+    glue = (Path(wire.__file__).parent / "node" / "glue.mjs").read_text(encoding="utf-8")
+    found = re.findall(r"^export const CONTENT_FIELD_LIMIT = (\d+);", glue, flags=re.M)
+    assert found == [str(wire.CONTENT_FIELD_LIMIT)]
+
+
+@pytest.mark.parametrize("field", ["content_type", "content_length"])
+def test_obs_resp_fields_are_bounded_by_the_glues_limit(field):
+    at = {"t": "resp", "request_id": RID, "status": 200, "content_type": None, "content_length": None}
+    at[field] = "x" * wire.CONTENT_FIELD_LIMIT
+    assert getattr(wire.parse_obs_line(json.dumps(at).encode() + b"\n"), field) == "x" * wire.CONTENT_FIELD_LIMIT
+    # an astral character is one code point here and two UTF-16 units in the glue's slice: the glue's cut
+    # output always fits the reader's bound
+    at[field] = "\U0001F600" * wire.CONTENT_FIELD_LIMIT
+    assert getattr(wire.parse_obs_line(json.dumps(at).encode() + b"\n"), field) == at[field]
+    for over in ("x" * (wire.CONTENT_FIELD_LIMIT + 1), "x" * 100_000):
+        at[field] = over
+        with pytest.raises(WireError):
+            wire.parse_obs_line(json.dumps(at).encode() + b"\n")
