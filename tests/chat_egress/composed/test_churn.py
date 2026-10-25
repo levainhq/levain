@@ -44,6 +44,7 @@ def _churn(port: int, origin_port: int, stop: threading.Event, counts: list[int]
         try:
             s = socket.create_connection(("127.0.0.1", port), timeout=2)
         except OSError:
+            time.sleep(0.02)        # a refused connect must not spin the loop either
             continue
         try:
             if kind == 1:
@@ -52,6 +53,7 @@ def _churn(port: int, origin_port: int, stop: threading.Event, counts: list[int]
                 s.sendall(head[:rng.randrange(1, len(head))])
             elif kind == 3:
                 s.sendall(head)
+                counts[1] += 1      # a whole head was sent: one request the decider may decide
         except OSError:
             pass
         finally:
@@ -67,20 +69,22 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
     assert L.request("GET", "/warm")[0] == 200
     fds0, rss0 = _fds(pid), _rss_kb(pid)
     stop = threading.Event()
-    counts = [0]
+    counts = [0, 0]                 # connections made, whole heads sent
     ths = [threading.Thread(target=_churn, args=(L.port, origin.port, stop, counts, i), daemon=True) for i in range(4)]
-    for t in ths:
-        t.start()
     ok = []
-    t_end = time.monotonic() + CHURN_S
-    while time.monotonic() < t_end:
-        st, body, took = L.request("GET", "/during", timeout=15)
-        ok.append((st, took))
-        time.sleep(0.3)
-    stop.set()
-    for t in ths:
-        t.join(10)
-    time.sleep(2.0)
+    try:
+        for t in ths:
+            t.start()
+        t_end = time.monotonic() + CHURN_S
+        while time.monotonic() < t_end:
+            st, body, took = L.request("GET", "/during", timeout=15)
+            ok.append((st, took))
+            time.sleep(0.3)
+    finally:
+        stop.set()
+        for t in ths:
+            t.join(10)
+    assert not any(t.is_alive() for t in ths)
     st_after = L.request("GET", "/after")[0]
     fds1, rss1 = _fds(pid), _rss_kb(pid)
     print(f"C3 churn: {counts[0]} connections in {CHURN_S}s; valid requests {len(ok)} all {sorted({s for s, _ in ok})}, "
@@ -89,10 +93,22 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
     assert ok and all(s == 200 for s, _ in ok) and st_after == 200
     assert fds1 - fds0 <= FD_GROWTH, (fds0, fds1)
     assert rss1 - rss0 <= RSS_GROWTH_KB, (rss0, rss1)
-    # the open connections at the origin come back: no upstream socket outlives its client (C2's observable)
-    end = time.monotonic() + 10
-    while origin.open_conns > 0 and time.monotonic() < end:
-        time.sleep(0.1)
+    # every submitted request reaches a terminal row, then the origin holds no connection over a quiet interval
+    # (no upstream socket outlives its client: C2's observable)
+    quiet_since, last_rows = None, -1
+    end = time.monotonic() + 20
+    while time.monotonic() < end:
+        n = len(L.records.rows(L.launch_id))
+        if origin.open_conns == 0 and n == last_rows:
+            quiet_since = quiet_since or time.monotonic()
+            if time.monotonic() - quiet_since >= 1.5:
+                break
+        else:
+            quiet_since = None
+        last_rows = n
+        time.sleep(0.2)
+    else:
+        raise AssertionError(f"never quiet: open_conns {origin.open_conns}, rows {last_rows}")
     assert origin.open_conns == 0, origin.open_conns
     assert L.stop() == 0
     assert L.stderr.stat().st_size <= STDERR_BYTES
@@ -101,7 +117,10 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
     assert sum(1 for x in lines if '"t":"wall"' in x) <= 100
     assert sum(1 for x in lines if '"t":"summary"' in x) <= 3
     rows = L.records.rows(L.launch_id)
-    assert len(rows) <= 4 * counts[0]            # a row per decided request, not per connection
+    valid = counts[1] + len(ok) + 2              # whole heads churned, the /during requests, /warm and /after
+    attempts = [r for r in rows if r.kind == "egress_attempt"]
+    print("C3 rows by kind:", {k: sum(1 for r in rows if r.kind == k) for k in {r.kind for r in rows}}, "valid", valid)
+    assert len(attempts) <= valid, (len(attempts), valid)   # an attempt row per decided request, not per connection
 
 
 def test_a_client_that_leaves_at_every_point_leaves_no_upstream_socket(make_origin, make_launch_) -> None:
