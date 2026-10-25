@@ -68,7 +68,7 @@
   }
 
   // `again`: this is a second spend of the same code after a failure that may have reached the server (G3).
-  // `repaired`: this browser held a key before (Pair it again); the "Paired" screen then says the old key is still listed.
+  // `repaired`: the label of the paired device this browser held before (Pair it again), or null; the "Paired" screen then says which row.
   async function attempt(code, again, repaired) {
     say("Pairing this device", "Claiming your one-time code…", false);
     let res;
@@ -113,19 +113,51 @@
     data = null;
     if (repaired) {
       // stay on the page so the line is read; the cockpit is one click away
-      say("Paired", "This device is paired. " + OLD_KEY_LISTED, true);
+      say("Paired", "This device is paired. This browser's previous key is still listed in Devices as " + repaired + ". Revoke it there.", true);
       return;
     }
     say("Paired", "This device is paired. Opening the cockpit…", true);
     location.replace("/");
   }
 
-  // "Pair it again" only claims. The key this browser held is NOT revoked from here (L3 r3 H1): a client cannot do that safely
-  // (revoking first strands the browser when the claim fails; revoking after can cascade onto the device that issued the code).
-  // The old row stays listed in Devices; the Paired screen says so on every path, Try again included.
-  const OLD_KEY_LISTED = "This browser's previous key is still listed in Devices. Revoke it there.";
+  // "Pair it again" only claims; the key this browser held is NOT revoked from here (L3 r3 H1: a client cannot do that safely).
+  // It READS first (GET only, never a revoke): when the held key is a paired-<id> credential, the device's label is looked up so
+  // the Paired screen can say which Devices row is this browser's previous key. Any other key (an owner surface token), a
+  // failed or slow read, or a missing row gives NO line: the page never guesses a label.
+  const PAIRED_PREFIX = "paired-";               // MUST equal the server's PAIRED_PREFIX (web_server.py): the credential name's namespace
+  const TOKEN_HEADER = "X-Levain-Write-Token";   // MUST equal devices_panel.js H
+  const LOOKUP_MS = 8000;
 
-  function pairAgain(code) { attempt(code, false, true); }
+  async function previousKeyLabel(token) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), LOOKUP_MS);
+    try {
+      const get = (path) => fetch(path, { method: "GET", headers: { [TOKEN_HEADER]: token }, cache: "no-store", referrerPolicy: "no-referrer", signal: ctl.signal });
+      const man = await get("/cockpit/manifest.json");
+      if (man.status !== 200) return null;
+      const m = await man.json();
+      const name = m && m.credential && m.credential.name;
+      if (typeof name !== "string" || !name.startsWith(PAIRED_PREFIX)) return null;
+      const id = name.slice(PAIRED_PREFIX.length);
+      const lst = await get("/cockpit/pair/devices.json");
+      if (lst.status !== 200) return null;
+      const l = await lst.json();
+      const row = l && Array.isArray(l.devices) ? l.devices.find((d) => d && d.id === id) : null;
+      if (!row || typeof row.label !== "string" || !row.label.trim()) return null;
+      return row.label;
+    } catch (_) {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function pairAgain(code) {
+    say("Pairing this device", "Claiming your one-time code…", false);
+    actEl.hidden = true;
+    const label = await previousKeyLabel(storedToken());
+    attempt(code, false, label);
+  }
 
   function run() {
     const code = takeCode();

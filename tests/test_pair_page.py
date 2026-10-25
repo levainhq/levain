@@ -123,16 +123,61 @@ def test_only_the_devices_list_read_has_a_timeout_never_the_offer_or_revoke_post
     assert len(re.findall(r'api\("POST"', js)) == 2
 
 
-def test_pair_it_again_only_claims_and_never_revokes_the_old_key() -> None:
+def _fetch_calls(js: str) -> "list[str]":
+    """Each `fetch(` call's text up to its closing `);` (the script's few fetches are plain object-literal calls)."""
+    return [js[m.start(): js.index(");", m.start()) + 2] for m in re.finditer(r"fetch\(", js)]
+
+
+def test_pair_it_again_never_makes_a_revoke_request_and_its_only_write_is_the_claim() -> None:
     # L3 r3 H1: the self-revoke is gone (revoke-first strands the browser on a failed claim; revoke-after can cascade onto the
-    # device that issued the code). The Paired screen says the old key is still listed, on every path including Try again.
+    # device that issued the code). R4: it MAY read, never write: every request but the claim is a GET.
     js = load_web_asset("pair.js")
-    assert "retireOldKey" not in js and "/cockpit/pair/revoke" not in js and "/cockpit/manifest.json" not in js
-    assert "pair/revoke" not in js and "method: \"POST\"" in js and js.count("fetch(") == 1       # the one fetch is the claim
-    assert "This browser's previous key is still listed in Devices. Revoke it there." in js
-    assert "function pairAgain(code) { attempt(code, false, true); }" in js
-    # Try again keeps the re-pair flag, so the line survives a failed first claim
+    assert "retireOldKey" not in js and "pair/revoke" not in js and "revoke(" not in js
+    calls = _fetch_calls(js)
+    posts = [c for c in calls if '"POST"' in c]
+    assert len(posts) == 1 and "/cockpit/pair/claim" in posts[0], calls
+    assert all("GET" in c or c in posts for c in calls) and not re.search(r'method: "(PUT|DELETE|PATCH)"', js)
+    assert "function pairAgain(code)" in js
+    # Try again keeps the re-pair label, so the line survives a failed first claim
     assert js.count("() => attempt(code, true, repaired)") == 1 and js.count(", repaired);") == 2
+
+
+def test_pair_it_again_reads_the_held_keys_device_label_before_claiming_and_shows_it_as_text() -> None:
+    js = load_web_asset("pair.js")
+    # the read happens before the claim, with the held key, a GET of the manifest then the devices list
+    pair_again = js[js.index("async function pairAgain"): js.index("function run()")]
+    assert "previousKeyLabel(" in pair_again and pair_again.index("previousKeyLabel(") < pair_again.index("attempt(")
+    assert "/cockpit/manifest.json" in js and "/cockpit/pair/devices.json" in js and "X-Levain-Write-Token" in js
+    # only a paired-<id> credential is looked up; an owner surface token yields no label
+    assert 'startsWith(PAIRED_PREFIX)' in js and 'PAIRED_PREFIX = "paired-"' in js
+    # the label reaches the screen through textContent (say), never innerHTML
+    assert "innerHTML" not in js and "insertAdjacentHTML" not in js
+    assert "still listed in Devices as " in js and "Revoke it there." in js
+    # no label, no line: the screen with no previous label goes straight to the cockpit
+    assert re.search(r"if \(repaired\) \{", js) and "Opening the cockpit" in js
+
+
+def test_the_label_the_page_reads_is_what_the_server_exposes_for_a_paired_key_and_not_for_an_owner_token(src) -> None:
+    with _serve(src) as (port, _h):
+        st, off, _ = _call(port, "POST", "/cockpit/pair/offer", {"label": "Run iPad"}, token=T)
+        st, cl, _ = _call(port, "POST", "/cockpit/pair/claim", {"code": off["code"]})
+        tok, dev = cl["token"], cl["device_id"]
+        st, man, _ = _call(port, "GET", "/cockpit/manifest.json", token=tok)
+        assert st == 200 and man["credential"]["name"] == "paired-" + dev
+        st, lst, _ = _call(port, "GET", "/cockpit/pair/devices.json", token=tok)
+        assert st == 200 and [d["label"] for d in lst["devices"] if d["id"] == dev] == ["Run iPad"]
+        st, man, _ = _call(port, "GET", "/cockpit/manifest.json", token=T)
+        assert st == 200 and not man["credential"]["name"].startswith("paired-")
+
+
+def test_no_previous_key_line_unless_the_read_found_a_paired_label() -> None:
+    js = load_web_asset("pair.js")
+    body = js[js.index("async function previousKeyLabel"): js.index("async function pairAgain")]
+    # a non-200, a throw, a non-paired name, a missing row or an empty label each end in null
+    assert body.count("return null") >= 5 and body.count("status !== 200") == 2 and "catch" in body
+    assert "setTimeout" in body or "AbortController" in body            # a hung read never holds the claim
+    # the plain "still listed" line without a label is gone: only the labelled one remains
+    assert "previous key is still listed in Devices. Revoke it there." not in js
 
 
 def test_the_pair_script_words_the_retry_403_and_keeps_a_failed_mark_write_from_reading_as_a_lost_key() -> None:
