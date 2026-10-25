@@ -3,6 +3,7 @@ is walked (every allowed edge taken, every other (state, cause) pair refused), l
 clock, and the append-only triggers are hit with raw SQL."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sqlite3
@@ -1476,3 +1477,29 @@ def test_a_run_record_insert_refused_for_another_reason_is_a_dispatch_error(stor
         verify(store, repo, job, 0)
     assert not isinstance(exc.value, TransitionRefused) and "refused by the test" in str(exc.value)
     assert store.get(job.id).state == "verifying" and store.run_records(job.id) == []
+
+
+def test_a_report_digest_binds_exactly_one_ticket(store, repo):
+    """RULINGS_OBS 15 (codex 2/3, verify r1): a run record's envelope digest covers the ticket. The digest is over the
+    envelope file's bytes, the envelope holds the ticket, and check_envelope refuses an envelope whose ticket is not
+    the run's: so a record under digest D was written for the one ticket D's bytes name, and an event of another
+    ticket naming D carries a byte copy of that envelope, which its own check refuses (envelope-ticket). A repeat
+    matched on (job, run, digest) therefore holds the ticket too, with no ticket column on the run record."""
+    from levain.dispatch.jobs import AlreadyRecorded
+    from levain.dispatch.verifier_report import ReportRefused, check_envelope
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    other = dataclasses.replace(r, ticket="t-another")
+    raw, digest = tvr.envelope(r, tvr.body(("pass", "pass")))
+    assert tvr.envelope(other, tvr.body(("pass", "pass")))[1] != digest          # another ticket, another digest
+    with pytest.raises(ReportRefused) as exc:
+        check_envelope(raw, expected=other, event_digest=digest)
+    assert exc.value.name == "envelope-ticket"
+    verify(store, repo, job, 0, raw=raw, ev=tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest))
+    # the other ticket's event naming D: the store holds D's report, the one report D can be
+    with pytest.raises(AlreadyRecorded):
+        store.record_verification(other, envelope=raw, event=tvr.event(other, at=VERIFIED_AT,
+                                                                        verifier_report_digest=digest),
+                                  repo=str(repo[0]), tree=base_tree(repo), model=model(0))
