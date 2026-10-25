@@ -74,6 +74,8 @@ from levain.dispatch import routemap_rules
 from levain.dispatch.contract import ResolvedTemplate
 from levain.dispatch.policy import PolicyError, ProviderPolicy, match, path_text_problem
 from levain.dispatch.verifier_report import _steps_problem, artifact_digest
+from levain.slot.routemaps import DRIVER_INPUT_MAX as MAX_DRIVER_INPUT_BYTES
+from levain.slot.routemaps import VERIFIER_ITEM_MAX_BYTES, VERIFIER_SIG_MAX
 
 __all__ = [
     "ADOPTION_RULE_KEYS", "CRITERION_BOUNDS", "CRITERION_INT_MAX", "CRITERION_KEYS", "EXECUTION_BEARING_DIRS",
@@ -82,7 +84,8 @@ __all__ = [
     "VERIFIER_FORMAT", "VERIFIER_KEYS", "AdoptionRule", "active_adoption_rules", "adoption_rules_at",
     "active_policy", "active_verifier_entries", "body_refusal", "driver_template_digest", "driver_template_path",
     "execution_bearing", "legacy_rule_problem", "legacy_verifiers_problem", "parse_criteria", "r0_write_refusal",
-    "resolver", "template_content_hash", "template_from_mapping", "verifier_artifact_digest", "verifier_ticket",
+    "resolver", "template_content_hash", "template_from_mapping", "verifier_artifact_digest", "verifier_item_refusal",
+    "verifier_ticket",
 ]
 
 KINDS = ("adoption_rules", "provider_policy", "routemap", "templates", "verifier")
@@ -96,8 +99,6 @@ VERIFIER_KEYS = frozenset({"verifier_id", "verifier_artifact_digest", "declared_
                            "driver_template_digest", "steps", "steps_digest", "driver_input", "driver_input_digest"})
 # the canonical bytes of an entry's steps; the step count and each step's bounds are S1's runtime grammar's
 MAX_STEPS_BYTES = 32 * 1024
-# mirrors the contract's V25 (the driver_input cap), written here because S1 has no such constant
-MAX_DRIVER_INPUT_BYTES = 256 * 1024
 ADOPTION_RULE_KEYS = frozenset({"repo", "template_id", "template_hash", "verifier_kind", "criteria"})
 # F11 §5: the closed vocabulary of a rule's criteria; each criterion is an object with exactly one of these keys
 CRITERION_KEYS = ("onto", "max_changed_lines", "max_bytes", "max_files", "paths", "no_new_files", "max_age_hours")
@@ -642,6 +643,19 @@ def verifier_ticket(items: Mapping[str, Any], *, verifier_id: str) -> dict[str, 
     entry = parse(canonical_bytes(entry))         # a copy: the stored item's body is never handed out
     return {"verifier_generation": item.generation, "verifier_id": entry["verifier_id"],
             "verifier_steps": entry["steps"], "driver_input_digest": entry["driver_input_digest"], "entry": entry}
+
+
+def verifier_item_refusal(item: bytes, signature: Any) -> str | None:
+    """Why a verifier item and its signature cannot reach CONTROL in one ``CONFIG-SUBMIT`` frame, else ``None``: S1's
+    own bounds (:data:`levain.slot.routemaps.VERIFIER_ITEM_MAX_BYTES`, ``VERIFIER_SIG_MAX``), so dispatch never accepts
+    a verifier configuration CONTROL cannot be handed."""
+    if len(item) > VERIFIER_ITEM_MAX_BYTES:
+        return (f"the verifier item is {len(item)} bytes, over the {VERIFIER_ITEM_MAX_BYTES} one CONFIG-SUBMIT frame "
+                "to CONTROL carries")
+    if not isinstance(signature, str) or not signature.isascii() \
+            or len(canonical_bytes(signature)) > VERIFIER_SIG_MAX:
+        return f"a verifier item's signature is ASCII and at most {VERIFIER_SIG_MAX} bytes as JSON"
+    return None
 
 
 def body_refusal(kind: str, body: Any, active: Mapping[str, Any]) -> str | None:

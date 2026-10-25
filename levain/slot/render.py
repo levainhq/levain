@@ -30,12 +30,15 @@ rides ``Refused.detail``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping
 
+import levain
 from levain.contracts import ContractError
 from levain.contracts import canon
 from levain.firing.hands import HostOS
@@ -311,7 +314,9 @@ def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | Non
     the first): the blob against the ticket facts alloc carries (root's snapshot of CONTROL's record), refused by name
     before render acts. A session with no ticket has nothing to check here.
 
-    - ``ticket-facts-missing``: a ticket without its facts (an interrupted ``prepare``), or a verifier ticket whose
+    - ``ticket-facts-missing``: a ticket without its facts (an interrupted ``prepare``); facts lacking a field the
+      ticket's kind requires (an executor's or planner's ``route`` and ``model_requested``, a verifier's
+      ``verifier_steps``: 3c-8, so no gate below compares a field against an absent one); or a verifier ticket whose
       facts hold no resolved ``verifier`` entry (no driver is authorised without one);
     - ``ticket-kind-mismatch``: the alloc's kind and class are not what the ticket's kind renders as;
     - ``ticket-routes-mismatch``: the blob's routes are not exactly the ticket's ``route`` + ``egress_routes``;
@@ -324,6 +329,10 @@ def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | Non
         raise Refused("ticket-facts-missing", "alloc names a ticket without its facts")
     if RENDERS_AS.get(str(ticket_facts.get("kind"))) != (kind, slot_class):
         raise Refused("ticket-kind-mismatch", f"{ticket_facts.get('kind')!s:.16} is not {kind} {slot_class}")
+    required = ("verifier_steps",) if ticket_facts["kind"] == "verifier" else ("route", "model_requested")
+    for k in required:
+        if k not in ticket_facts:
+            raise Refused("ticket-facts-missing", f"a {ticket_facts['kind']} ticket's facts without {k}")
     want = sorted([*([ticket_facts["route"]] if "route" in ticket_facts else []),
                    *ticket_facts["egress_routes"]])                                   # type: ignore[misc]
     if sorted(blob.routes) != want:
@@ -340,6 +349,52 @@ def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | Non
         raise Refused("ticket-steps-mismatch", "the blob's verifier_steps are not the ticket's")
     if blob.driver != resolved.get("driver_template"):
         raise Refused("ticket-driver-mismatch", "the blob's driver is not the ticket's driver_template")
+
+
+#: CONTRACT §3.5: a driver template's name (a verifier entry's ``driver_template``) and the most of one root reads
+_DRIVER_TEMPLATE_RE = re.compile(r"[a-z0-9_]{1,48}")
+DRIVER_TEMPLATE_MAX = 1024 * 1024
+
+
+def read_driver_template(name: str) -> bytes | None:
+    """The bytes of driver template ``name`` in the import tree root runs (CONTRACT §3.5: ``<import
+    tree>/levain/verifier_drivers/<name>.py``, the tree this interpreter imports ``levain`` from), the directory and
+    the file each opened ``O_NOFOLLOW``, the file regular and at most :data:`DRIVER_TEMPLATE_MAX`; None for a name
+    outside the grammar (or ``_``-prefixed) and for no such regular file."""
+    if type(name) is not str or not _DRIVER_TEMPLATE_RE.fullmatch(name) or name.startswith("_"):
+        return None
+    tree = os.path.join(os.path.dirname(os.path.abspath(levain.__file__)), "verifier_drivers")
+    try:
+        dfd = os.open(tree, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        fd = os.open(name + ".py", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError:
+        return None
+    finally:
+        os.close(dfd)
+    try:
+        if (os.fstat(fd).st_mode & 0o170000) != 0o100000:
+            return None
+        out = b""
+        while len(out) <= DRIVER_TEMPLATE_MAX:
+            part = os.read(fd, DRIVER_TEMPLATE_MAX + 1 - len(out))
+            if not part:
+                return out
+            out += part
+        return None
+    finally:
+        os.close(fd)
+
+
+def check_driver_template(resolved: Mapping[str, object], read=read_driver_template) -> None:
+    """CONTRACT §3.5: render refuses ``driver-template-digest-mismatch`` unless the installed template the resolved
+    verifier entry names hashes (SHA-256 of its bytes) to the entry's ``driver_template_digest``: a levain upgrade that
+    changed a template stops every run of an entry signed for the old one until the operator re-signs it."""
+    data = read(str(resolved.get("driver_template")))
+    if data is None or "sha256:" + hashlib.sha256(data).hexdigest() != resolved.get("driver_template_digest"):
+        raise Refused("driver-template-digest-mismatch", f"{str(resolved.get('driver_template'))[:48]}")
 
 
 # --- env (§3.4) ---------------------------------------------------------------------------------------------
@@ -904,7 +959,8 @@ __all__ = [
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
     "TOKEN_ENV", "ABSENT_ENV", "check_env_absent",
     "env_text", "render_cc_settings", "render_cc_onboarding", "codex_config", "codex_toml", "gitconfig_text",
-    "assert_no_syscall", "profile_lines", "render_profile", "render_importer_profile", "render_verifier_profile",
+    "assert_no_syscall", "check_driver_template", "profile_lines", "read_driver_template", "render_profile",
+    "render_importer_profile", "render_verifier_profile",
     "render", "render_from_stdin", "expected_effective_cc",
     "expected_effective_codex", "readback_refusals", "refuse_readback", "repo_loosening_refusals",
     "refuse_repo_loosening", "discovery_refusals", "refuse_discovery", "repo_discovery_names", "parse_driver_input",

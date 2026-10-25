@@ -32,6 +32,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **The authority log accepts a signed graduation policy and the graduation opt-in (`levain-authority/2`).** A policy
   expires only by renewal, and `levain consent grant revoke` and the phone's revoke remove a policy or the opt-in;
   before, both refused one with "no consent grant", though the authority log accepts the revoke.
+- **The gateway control plane accepts signed verifier configuration (`CONFIG-SUBMIT`).** A verifier run's ticket is
+  checked against the active verifier configuration when it is minted and again when its session starts, so a verifier
+  whose entry was withdrawn or replaced no longer runs, and a session refuses to render when the installed driver
+  template is not the one its signed entry names (`driver-template-digest-mismatch`). A verifier item must fit one
+  message to the control plane, and `levain dispatch config` refuses a larger one up front. A session whose render
+  fails part-way, including when the reply to its first state change was lost, is revoked over a fresh connection
+  instead of staying half-rendered with its slot held.
 - **The coverage check for signed graduation policies exists.** It decides whether a policy you signed covers an
   autonomic action (same action and risk, a trigger and family it names, unexpired, signed by keys root lists, for this
   store only); anything not covered runs at confirm. The autonomic store gains its `/2` format and the migration to it,

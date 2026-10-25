@@ -18,6 +18,11 @@ Two holders, one checker (:func:`check_item`, the one place an item is judged):
   and at start, writing its head durably BEFORE it serves a new generation or acks. A RELOAD keys refuses leaves every
   dispatch route refused until a valid one (TUF's rule: never replace a trusted version with a lower one).
 
+Verifier items (S1 3c-8, CONTRACT §3.5 VERIFIER IDENTITY): the same envelope, namespace, trust root and identity rule
+(:func:`_check_envelope`, shared), kind `verifier`, body `levain-verifier-config/1` (:func:`check_verifier_item`),
+reaching CONTROL by `CONFIG-SUBMIT` and kept by :class:`ControlVerifiers` under `L/routes/verifiers/` against its own
+head. keys never loads one.
+
 Pins (R4 §2 "Pins"): a ticketed session is served its ticket's generation P for its life iff (1) P is in keys' `served`
 list and keys verified it itself, (2) the route id is in the HEAD generation (re-checked on every `Q`), (3) SHA-256 of
 P's entry `policy` == the ticket's digest. No grace, no follow, no revocation flag.
@@ -39,9 +44,10 @@ from levain.broker.policy import (BodyPolicyError, DispatchRoute, PolicyError, R
                                   parse_base_map, parse_routemap)
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
-from levain.dispatch.routemap_rules import envelope_problem
-from levain.slot import Refused
+from levain.dispatch.routemap_rules import ENTRIES_MAX, envelope_problem
+from levain.slot import FRAME_MAX, Refused
 from levain.slot.records import write_durably
+from levain.slot.runtime_grammar import _verifier_steps
 
 CONFIG_FORMAT = "levain-dispatch-config/1"
 CONFIG_NAMESPACE = "levain-dispatch-config"
@@ -229,6 +235,41 @@ def base_route_policy_types(routes_dir: Path) -> Dict[str, str]:
 
 # --- the one checker -----------------------------------------------------------------------------------------------
 
+def _check_envelope(raw: bytes, sig: object, trust: Trust, kind: str, prefix: str,
+                    verify: Optional[Verify]) -> dict:
+    """The identity rule's half every item kind shares (S1 3c-8: route maps and verifier items are one envelope, one
+    namespace, one trust root, CONTRACT §3.5 VERIFIER IDENTITY), in this order: the size bounds; the signature against
+    `trust` in `CONFIG_NAMESPACE` (`<prefix>-verifier` when the verifier cannot run, `<prefix>-signature` when it says
+    no); the item's canonical form and keys; `format` and `kind`; `store_id` == trust's (`<prefix>-store`); the
+    generation; the envelope's `prev` and `issued_at`. Returns the parsed item."""
+    if not isinstance(raw, bytes) or len(raw) > ITEM_MAX_BYTES:
+        raise Refused(f"{prefix}-invalid:item", f"an item is at most {ITEM_MAX_BYTES} bytes")
+    if not isinstance(sig, str) or not sig or len(sig) > SIGNATURE_MAX:
+        raise Refused(f"{prefix}-signature", "no signature")
+    try:
+        good = (verify or verify_link_sig)(raw, sig, public_key=trust.public_key, fingerprint=trust.fingerprint,
+                                           namespace=CONFIG_NAMESPACE)
+    except VerifierUnavailable as e:
+        raise Refused(f"{prefix}-verifier", str(e)) from None
+    if good is not True:
+        raise Refused(f"{prefix}-signature", "the signature does not verify against trust.pub")
+    obj = _canon_obj(raw, "the item", f"{prefix}-invalid:item")
+    if set(obj) != ITEM_KEYS:
+        raise Refused(f"{prefix}-invalid:item", f"an item is exactly {sorted(ITEM_KEYS)}")
+    if obj["format"] != CONFIG_FORMAT:
+        raise Refused(f"{prefix}-invalid:format", f"an item is {CONFIG_FORMAT}")
+    if obj["kind"] != kind:
+        raise Refused(f"{prefix}-invalid:kind", f"the item's kind is not {kind}")
+    if obj["store_id"] != trust.store_id:
+        raise Refused(f"{prefix}-store", "the item was signed for another store")
+    if not _gen(obj["generation"]):
+        raise Refused(f"{prefix}-invalid:generation", "generation is an integer from 1")
+    problem = envelope_problem(obj["generation"], obj["prev"], obj["issued_at"])
+    if problem is not None:
+        raise Refused(f"{prefix}-invalid:envelope", problem)
+    return obj
+
+
 def check_item(raw: bytes, sig: object, trust: Trust, base_ids: frozenset, *,
                verify: Optional[Verify] = None) -> Checked:
     """Every check an item must pass at CONTROL and again at keys (r3 §2.3 accept steps 1, 2 and 4, as R4 §2 strikes
@@ -241,31 +282,7 @@ def check_item(raw: bytes, sig: object, trust: Trust, base_ids: frozenset, *,
     cap, no session cap, no id twice); each route's `body_policy` (`route-invalid:body_policy`, head ruling H2); no route
     id that is a base id. The generation order is the caller's, against
     its own head."""
-    if not isinstance(raw, bytes) or len(raw) > ITEM_MAX_BYTES:
-        raise Refused("routemap-invalid:item", f"an item is at most {ITEM_MAX_BYTES} bytes")
-    if not isinstance(sig, str) or not sig or len(sig) > SIGNATURE_MAX:
-        raise Refused("routemap-signature", "no signature")
-    try:
-        good = (verify or verify_link_sig)(raw, sig, public_key=trust.public_key, fingerprint=trust.fingerprint,
-                                           namespace=CONFIG_NAMESPACE)
-    except VerifierUnavailable as e:
-        raise Refused("routemap-verifier", str(e)) from None
-    if good is not True:
-        raise Refused("routemap-signature", "the signature does not verify against trust.pub")
-    obj = _canon_obj(raw, "the item", "routemap-invalid:item")
-    if set(obj) != ITEM_KEYS:
-        raise Refused("routemap-invalid:item", f"an item is exactly {sorted(ITEM_KEYS)}")
-    if obj["format"] != CONFIG_FORMAT:
-        raise Refused("routemap-invalid:format", f"an item is {CONFIG_FORMAT}")
-    if obj["kind"] != KIND:
-        raise Refused("routemap-invalid:kind", f"the item's kind is not {KIND}")
-    if obj["store_id"] != trust.store_id:
-        raise Refused("routemap-store", "the item was signed for another store")
-    if not _gen(obj["generation"]):
-        raise Refused("routemap-invalid:generation", "generation is an integer from 1")
-    problem = envelope_problem(obj["generation"], obj["prev"], obj["issued_at"])
-    if problem is not None:
-        raise Refused("routemap-invalid:envelope", problem)
+    obj = _check_envelope(raw, sig, trust, KIND, "routemap", verify)
     try:
         routes = parse_routemap(obj["body"])
     except BodyPolicyError as e:
@@ -526,6 +543,283 @@ class ControlRoutes:
             return checked.generation
 
 
+# --- CONTROL's verifier generations (S1 3c-8; CONTRACT §3.5 VERIFIER IDENTITY, §3.3 CONFIG-SUBMIT) ---------------
+
+#: a verifier item's envelope kind and body format (dispatch's `levain.dispatch.registry` names; a test pins them equal)
+VERIFIER_KIND = "verifier"
+VERIFIER_FORMAT = "levain-verifier-config/1"
+VERIFIERS_DIR = "verifiers"
+#: a body entry's keys, exactly: the contract's seven fields plus the `steps` and `driver_input` two of its digests are
+#: over (dispatch's `registry.VERIFIER_KEYS`, a test pins the two equal)
+VERIFIER_ENTRY_KEYS = frozenset({"verifier_id", "verifier_artifact_digest", "declared_kind", "driver_template",
+                                 "driver_template_digest", "steps", "steps_digest", "driver_input",
+                                 "driver_input_digest"})
+#: the entry fields a ticket's RESOLVED object carries beside `verifier_generation` (CONTRACT §3.3 ATTACH's
+#: `ticket_facts.verifier`; `records.TICKET_VERIFIER_KEYS` is this set plus `verifier_generation`, a test pins it)
+RESOLVED_ENTRY_KEYS = ("verifier_id", "verifier_artifact_digest", "declared_kind", "driver_template",
+                       "driver_template_digest", "steps_digest", "driver_input_digest")
+DECLARED_KINDS = ("black-box", "in-process")
+#: CONTRACT §3.5 SIZES (`verifier_steps` at most 32 KiB canonical), as dispatch bounds them
+VERIFIER_STEPS_MAX = 32 * 1024
+#: CONFIG-SUBMIT carries the item and its signature in ONE CONTROL frame (`FRAME_MAX`), never chunked, so a verifier
+#: item is bounded by what that frame leaves. The signature's share is its canonical JSON string (quotes and escapes
+#: counted), at most `VERIFIER_SIG_MAX` bytes: above an SSHSIG of the largest key ssh-keygen makes (RSA 16384)
+#: [judged by lane-3c8-fix, 10-25, against `ssh-keygen -Y sign` by ed25519, ecdsa-521, rsa-4096/8192/16384 keys];
+#: the request's own keys are counted at their widest (`id` at JSON_INT_MAX).
+VERIFIER_SIG_MAX = 8 * 1024
+CONFIG_SUBMIT_ENVELOPE = len(canon.canonical_bytes(
+    {"id": JSON_INT_MAX, "item": {}, "op": "CONFIG-SUBMIT", "sig": "", "v": 1})) - len(b"{}") - len(b'""')
+VERIFIER_ITEM_MAX_BYTES = FRAME_MAX - CONFIG_SUBMIT_ENVELOPE - VERIFIER_SIG_MAX
+#: an entry's `driver_input` (canonical) is bounded by the item that carries it: no larger one fits a CONFIG-SUBMIT.
+#: Below V25's driver input cap, which bounds what a run reads.
+DRIVER_INPUT_MAX = VERIFIER_ITEM_MAX_BYTES
+_VERIFIER_ID = re.compile(r"[a-z0-9-]{1,48}\Z")
+_DRIVER_TEMPLATE = re.compile(r"[a-z0-9_]{1,48}\Z")
+
+
+def sha256_canonical(value: object) -> str:
+    """`sha256:` + the hex SHA-256 of `value`'s canonical bytes (an entry's `steps_digest` / `driver_input_digest`)."""
+    return "sha256:" + hashlib.sha256(canon.canonical_bytes(value)).hexdigest()
+
+
+@dataclass(frozen=True)
+class CheckedVerifiers:
+    """A verifier item that passed every check: its identity and its entries by id (each the whole signed entry)."""
+    generation: int
+    item_sha256: str
+    store_id: str
+    entries: Mapping[str, Mapping[str, object]]
+
+    def resolved(self, verifier_id: str) -> Optional[Dict[str, object]]:
+        """The RESOLVED object a ticket for `verifier_id` carries (CONTRACT §3.5: CONTROL resolves it, the ticket names
+        only the generation and the id), or None when this generation has no such id."""
+        e = self.entries.get(verifier_id)
+        if e is None:
+            return None
+        return {"verifier_generation": self.generation, **{k: e[k] for k in RESOLVED_ENTRY_KEYS}}
+
+
+def _verifier_entry_problem(e: object) -> Optional[Tuple[str, str]]:
+    """`(field, why)` for an entry CONTROL refuses `config-invalid:<field>`, else None. CONTROL checks every field's
+    shape, the steps by the runtime grammar alloc parses them with, and the two digests over bytes the entry carries;
+    `verifier_artifact_digest` and `driver_template_digest` are shape-checked only (render hashes the installed
+    template, `driver-template-digest-mismatch`; the artifact formula is dispatch's)."""
+    if not isinstance(e, dict) or set(e) != VERIFIER_ENTRY_KEYS:
+        return "entry", f"an entry is exactly {sorted(VERIFIER_ENTRY_KEYS)}"
+    if not isinstance(e["verifier_id"], str) or not _VERIFIER_ID.match(e["verifier_id"]):
+        return "verifier_id", "outside ^[a-z0-9-]{1,48}$"
+    if not isinstance(e["driver_template"], str) or not _DRIVER_TEMPLATE.match(e["driver_template"]) \
+            or e["driver_template"].startswith("_"):
+        return "driver_template", "outside ^[a-z0-9_]{1,48}$ (and never _-prefixed)"
+    if e["declared_kind"] not in DECLARED_KINDS:
+        return "declared_kind", f"one of {DECLARED_KINDS}"
+    for k in ("verifier_artifact_digest", "driver_template_digest", "steps_digest", "driver_input_digest"):
+        if not isinstance(e[k], str) or not _POLICY_DIGEST.match(e[k]):
+            return k, "sha256:<64 hex>"
+    try:
+        _verifier_steps(e["steps"])
+        steps = canon.canonical_bytes(e["steps"])
+    except (Refused, ContractError, TypeError, ValueError, RecursionError):
+        return "steps", "not verifier steps"
+    if len(steps) > VERIFIER_STEPS_MAX:
+        return "steps", f"over {VERIFIER_STEPS_MAX} bytes canonical"
+    if e["steps_digest"] != sha256_canonical(e["steps"]):
+        return "steps_digest", "not the digest of the entry's steps"
+    if not isinstance(e["driver_input"], dict):
+        return "driver_input", "an object"
+    try:
+        size = len(canon.canonical_bytes(e["driver_input"]))
+    except (ContractError, TypeError, ValueError, RecursionError):
+        return "driver_input", "no canonical form"
+    if size > DRIVER_INPUT_MAX:
+        return "driver_input", f"over {DRIVER_INPUT_MAX} bytes canonical"
+    if e["driver_input_digest"] != sha256_canonical(e["driver_input"]):
+        return "driver_input_digest", "not the digest of the entry's driver_input"
+    return None
+
+
+def check_verifier_item(raw: bytes, sig: object, trust: Trust, *, verify: Optional[Verify] = None) -> CheckedVerifiers:
+    """A `verifier` item (CONFIG-SUBMIT), judged by the identity rule's shared envelope (:func:`_check_envelope`, the
+    refusals named `config-*`) and then its body: exactly `{format, verifiers}`, `format` `levain-verifier-config/1`,
+    at most `routemap_rules.ENTRIES_MAX` entries, each one checked whole, no id twice (`config-invalid:<field>`).
+    First, the bounds one CONFIG-SUBMIT frame holds: the item at most `VERIFIER_ITEM_MAX_BYTES`
+    (`config-invalid:item`), the signature ASCII (`config-invalid:item`) and at most `VERIFIER_SIG_MAX` bytes as the
+    frame carries it (`config-signature`)."""
+    if isinstance(raw, bytes) and len(raw) > VERIFIER_ITEM_MAX_BYTES:
+        raise Refused("config-invalid:item", f"a verifier item is at most {VERIFIER_ITEM_MAX_BYTES} bytes")
+    if isinstance(sig, str):
+        try:
+            sig.encode("ascii")
+        except UnicodeEncodeError:
+            raise Refused("config-invalid:item", "the signature is not ASCII") from None
+        if len(canon.canonical_bytes(sig)) > VERIFIER_SIG_MAX:
+            raise Refused("config-signature", f"a verifier item's signature is at most {VERIFIER_SIG_MAX} bytes")
+    obj = _check_envelope(raw, sig, trust, VERIFIER_KIND, "config", verify)
+    body = obj["body"]
+    if not isinstance(body, dict) or set(body) != {"format", "verifiers"} or body["format"] != VERIFIER_FORMAT:
+        raise Refused("config-invalid:body", f'a verifier body is exactly {{"format": {VERIFIER_FORMAT}, "verifiers"}}')
+    entries = body["verifiers"]
+    if not isinstance(entries, list) or len(entries) > ENTRIES_MAX:
+        raise Refused("config-invalid:verifiers", f"a list of at most {ENTRIES_MAX} entries")
+    by_id: Dict[str, Mapping[str, object]] = {}
+    for e in entries:
+        problem = _verifier_entry_problem(e)
+        if problem is not None:
+            raise Refused(f"config-invalid:{problem[0]}", problem[1])
+        if e["verifier_id"] in by_id:
+            raise Refused("config-invalid:verifier_id", f"{e['verifier_id']} is listed twice")
+        by_id[e["verifier_id"]] = e
+    return CheckedVerifiers(obj["generation"], item_digest(raw), obj["store_id"], by_id)
+
+
+class ControlVerifiers:
+    """CONTROL's verifier generations under `L/routes/verifiers/` (CONTRACT §2.1: `_levain_control` 0700): `<gen>.json`
+    + `<gen>.sig`, CONTROL's own `head` (`{generation, item_sha256, store_id}`) and `current`, written in the route map's
+    order (files, then `head`, then `current`) and judged by the same identity rule against that head, never against
+    "the active file". keys loads no verifier item, so there is no RELOAD. `lock` is the verifier activation lock:
+    CONFIG-SUBMIT, the start pass, a verifier mint's check-and-journal and a verifier ATTACH's check-and-bind each hold
+    it, so no activation lands between a check and what it admits."""
+
+    def __init__(self, routes_dir: Path, *, verify: Optional[Verify] = None,
+                 fsync: Callable[[int], None] = os.fsync, fault: Callable[[str], None] = _nothing) -> None:
+        self.routes_dir = Path(routes_dir)
+        self.dir = self.routes_dir / VERIFIERS_DIR
+        self._verify = verify
+        self._fsync = fsync
+        self.fault = fault
+        self.lock = threading.Lock()
+        self._active: Optional[CheckedVerifiers] = None
+        #: the doctor row's name while the head does not verify (`verifier-head-unverifiable`), else None, and why
+        self.problem: Optional[str] = None
+        self.problem_detail = ""
+
+    def active(self) -> Optional[CheckedVerifiers]:
+        return self._active
+
+    def _read_head(self) -> Optional[dict]:
+        try:
+            data = _read(self.dir / HEAD, SMALL_FILE_MAX)
+        except OSError:
+            raise Refused("verifier-head-unverifiable", "the head is unreadable") from None
+        if data is None:
+            return None
+        try:
+            return _head_obj(data, keys=False)
+        except Refused as e:
+            raise Refused("verifier-head-unverifiable", e.detail) from None
+
+    def _write(self, path: Path, data: bytes) -> None:
+        write_durably(path, data, mode=0o600, fsync=self._fsync)
+
+    def _load(self, gen: int, sha: str, trust: Trust) -> CheckedVerifiers:
+        jp, sp = _gen_paths(self.dir, gen)
+        try:
+            raw, sig = _read(jp, ITEM_MAX_BYTES), _read(sp, SIGNATURE_MAX)
+        except OSError:
+            raw = sig = None
+        if raw is None or sig is None or item_digest(raw) != sha:
+            raise Refused("config-invalid:item_sha256", f"generation {gen}'s files are missing or not the ones recorded")
+        try:
+            sig_text = sig.decode("ascii")
+        except UnicodeDecodeError:
+            raise Refused("config-signature", "the signature file is not ASCII") from None
+        c = check_verifier_item(raw, sig_text, trust, verify=self._verify)
+        if c.generation != gen:
+            raise Refused("config-invalid:generation", f"{gen}.json holds generation {c.generation}")
+        return c
+
+    def start_pass(self) -> None:
+        """The route map's start pass, for verifiers: (1) the head's files verified exactly as CONFIG-SUBMIT verifies
+        an item (one that does not verify: no verifier generation is active, every verifier mint and ATTACH refused,
+        a doctor row, nothing rewritten); (2) `current` rewritten when it is not the head's generation; (3) the
+        generation files newer than the head, and temp files, deleted (a crash before the head's rename)."""
+        with self.lock:
+            self._active = None
+            try:
+                head = self._read_head()
+                if head is not None:
+                    trust = read_trust(self.routes_dir)
+                    if head["store_id"] != trust.store_id:
+                        raise Refused("verifier-head-unverifiable", "the head names another store")
+                    checked = self._load(head["generation"], head["item_sha256"], trust)
+            except Refused as e:
+                self.problem = "verifier-head-unverifiable"
+                self.problem_detail = f"{e.name}: {e.detail}"
+                return
+            top = 0 if head is None else head["generation"]
+            if head is not None and _read_current(self.dir) != top:
+                self._write(self.dir / CURRENT, str(top).encode("ascii"))
+            self._delete(lambda g: g > top, temps=True)
+            self._active = None if head is None else checked
+            self.problem = None
+
+    def _delete(self, doomed: Callable[[int], bool], *, temps: bool = False) -> List[int]:
+        try:
+            names = os.listdir(self.dir)
+        except FileNotFoundError:
+            return []
+        gone: set = set()
+        for n in names:
+            m = _GEN_FILE.match(n)
+            if (m and doomed(int(m.group(1)))) or (temps and n.endswith(".tmp")):
+                try:
+                    os.unlink(self.dir / n)
+                except FileNotFoundError:
+                    continue
+                if m:
+                    gone.add(int(m.group(1)))
+        if gone or temps:
+            dfd = os.open(self.dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                self._fsync(dfd)
+            finally:
+                os.close(dfd)
+        return sorted(gone)
+
+    def submit(self, item: object, sig: object, keep: Callable[[], "frozenset[int]"] = frozenset) -> int:
+        """`CONFIG-SUBMIT {item, sig}` -> the generation, under the verifier activation lock: accepted when its
+        generation is above CONTROL's verifier head (gaps allowed: one generation counter serves every kind of the
+        store), or equal with the same digest (the convergent repair: the same writes run again); any other equal or
+        lower generation is `config-generation`. Then `<gen>.json` + `.sig`, `head`, `current` (each settled), the
+        generation published as active, and the files of every generation below it that `keep()` (the verifier
+        generations an OPEN ticket names) does not name deleted (CONTRACT §3.5: pruned by the route rule)."""
+        if not isinstance(item, dict):
+            raise Refused("config-invalid:item", "item is the config item as one JSON object")
+        try:
+            raw = canon.canonical_bytes(item)
+        except (ContractError, TypeError, ValueError, RecursionError):
+            raise Refused("config-invalid:item", "item has no canonical form") from None
+        with self.lock:
+            head = self._read_head()
+            trust = read_trust(self.routes_dir)
+            checked = check_verifier_item(raw, sig, trust, verify=self._verify)
+            if head is not None:
+                if head["store_id"] != trust.store_id:
+                    raise Refused("config-store", "CONTROL's verifier head names another store")
+                if checked.generation < head["generation"] or (
+                        checked.generation == head["generation"] and checked.item_sha256 != head["item_sha256"]):
+                    raise Refused("config-generation",
+                                  f"generation {checked.generation} against the head's {head['generation']}")
+            os.makedirs(self.dir, mode=0o700, exist_ok=True)
+            jp, sp = _gen_paths(self.dir, checked.generation)
+            assert isinstance(sig, str)
+            self._write(jp, raw)
+            self._write(sp, sig.encode("ascii"))
+            self.fault("before_head")
+            self._write(self.dir / HEAD, canon.canonical_bytes(
+                {"generation": checked.generation, "item_sha256": checked.item_sha256, "store_id": checked.store_id}))
+            self._active = checked              # the head is the authority: active from its write on
+            self.problem = None
+            self.fault("after_head")
+            try:
+                self._write(self.dir / CURRENT, str(checked.generation).encode("ascii"))
+            except OSError:
+                pass                            # best effort: the start pass rewrites `current` from the head
+            kept = keep()
+            self._delete(lambda g: g < checked.generation and g not in kept)
+            return checked.generation
+
+
 # --- keys' half --------------------------------------------------------------------------------------------------
 
 class KeysRoutes:
@@ -699,7 +993,9 @@ class KeysRoutes:
         return p.routes[route].policy
 
 
-__all__ = ["CONFIG_FORMAT", "CONFIG_NAMESPACE", "CURRENT", "Checked", "ControlRoutes", "DISPATCH_DIR", "FAULT_POINTS",
+__all__ = ["CONFIG_FORMAT", "CONFIG_NAMESPACE", "CURRENT", "Checked", "CheckedVerifiers", "ControlRoutes",
+           "ControlVerifiers", "DISPATCH_DIR", "FAULT_POINTS", "RESOLVED_ENTRY_KEYS", "VERIFIERS_DIR",
+           "VERIFIER_ENTRY_KEYS", "VERIFIER_FORMAT", "VERIFIER_KIND", "check_verifier_item", "sha256_canonical",
            "HEAD", "ITEM_KEYS", "ITEM_MAX_BYTES", "KEYS_HEAD", "KEYS_HEAD_FORMAT", "KIND", "KeysRoutes", "Pin",
            "SIGNATURE_MAX", "TRUST_FORMAT", "TRUST_JSON", "TRUST_PUB", "Trust", "base_route_ids",
            "base_route_policy_types",

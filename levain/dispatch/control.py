@@ -413,7 +413,8 @@ class ControlStore:
     def _judge(self, conn: sqlite3.Connection, parsed: ConfigItem, signature: Any) -> None:
         """Every check :meth:`accept` makes, in the caller's transaction, writing nothing: the signature against the
         pinned trust root under a fresh authority replay, this store's id, the next generation, the chain link and
-        the body for its kind against the active configuration."""
+        the body for its kind against the active configuration, then a verifier item against the one CONFIG-SUBMIT
+        frame it reaches S1 CONTROL in (:func:`levain.dispatch.registry.verifier_item_refusal`)."""
         meta = _meta(conn)
         snapshot = self._snapshot()
         problem = _signer_problem(snapshot, meta["trust_root"], parsed.text.encode("utf-8"), signature,
@@ -432,6 +433,8 @@ class ControlStore:
             raise ConfigRefused(f"generation {parsed.generation} does not chain to the head (its prev is not "
                                 f"item {top}'s digest)")
         problem = registry.body_refusal(parsed.kind, parsed.body, active)
+        if problem is None and parsed.kind == "verifier":
+            problem = registry.verifier_item_refusal(parsed.text.encode("utf-8"), signature)
         if problem is not None:
             raise ConfigRefused(f"{parsed.kind}: {problem}")
 

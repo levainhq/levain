@@ -32,7 +32,9 @@ its start pass and the RELOADs to keys, each under the one activation lock; S1 3
 ticket and ``TOKEN-RESOLVE``'s ``run``, read from the ticket record and never from root's claims; S1 3c-6b keys'
 ``LINEAGE-APPEND {envelope}`` into the lineage sink (:mod:`levain.slot.lineage`); S1 3c-7 root's ``SLOT-SYNC`` into
 the pool MIRROR (:class:`PoolMirror`, §3.5 Pool), the release of a bound ticket a sync shows over, ``RUN-TICKET-MINT``'s
-``no-free-slot:<class>`` and dispatch's ``POOL``. The other dispatch verbs (§3.3, §3.5, §3.6) are later 3c sessions':
+``no-free-slot:<class>`` and dispatch's ``POOL``; S1 3c-8 dispatch's ``CONFIG-SUBMIT`` (the verifier generations,
+:class:`levain.slot.routemaps.ControlVerifiers`), the verifier ticket resolved at mint and re-checked at ``ATTACH``.
+The other dispatch verbs (§3.3, §3.5, §3.6) are later 3c sessions':
 until then every other peer, and every other verb of a known one, is refused ``verb-not-allowed-for-peer`` (see
 :data:`PEER_VERBS`). Every act on keys and the reaper wake are seams: :class:`KeysAdmin` supplies the keys ones when
 CONTROL is given one.
@@ -60,7 +62,7 @@ import fcntl
 
 from levain.broker.stub import peer_uid as kernel_peer_uid
 from levain.contracts import ContractError, canon
-from levain.slot import Refused
+from levain.slot import FRAME_MAX, Refused
 from levain.slot import records as R
 from levain.slot import lineage as LN
 from levain.slot import routemaps
@@ -70,13 +72,12 @@ from levain.slot.layout import STORE, session_repo
 from levain.slot.runtime_grammar import HANDLE_BYTES, _handle, _keys
 
 CONTROL_FORMAT = "levain-control/1"
-FRAME_MAX = 64 * 1024                      # §3.3: the frame cap
 _LEN = struct.Struct(">I")
 
 ROOT_UID = 0
 
 #: §3.3's verbs per peer, as built so far (3c-6b adds keys' ``LINEAGE-APPEND``, 3c-7 root's ``SLOT-SYNC`` and dispatch's
-#: ``POOL``). Later 3c sessions add the rest of the ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
+#: ``POOL``, 3c-8 dispatch's ``CONFIG-SUBMIT``). Later 3c sessions add the rest of the ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
 #: :meth:`Control.peer_kind` is given its uid, else ``foreign``). keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` / ``LINEAGE-APPEND`` are answered only on the connection that
 #: holds the current ``KEYS-ATTACH`` (else ``not-attached``).
 PEER_VERBS: Mapping[str, frozenset[str]] = {
@@ -85,7 +86,7 @@ PEER_VERBS: Mapping[str, frozenset[str]] = {
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS", "LINEAGE-APPEND"}),
     "dispatch": frozenset({"LEASE-OPEN", "ROUTE-SUBMIT", "RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS",
-                           "POOL"}),
+                           "POOL", "CONFIG-SUBMIT"}),
     "foreign": frozenset(),
 }
 
@@ -110,6 +111,7 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "SESSIONS": (frozenset({"digests"}),) * 2,
     "LINEAGE-APPEND": (frozenset({"envelope"}),) * 2,     # S1 3c-6b (H6-2): CONTRACT §3.3 keys row
     "ROUTE-SUBMIT": (frozenset({"map", "sig"}),) * 2,
+    "CONFIG-SUBMIT": (frozenset({"item", "sig"}),) * 2,      # S1 3c-8: kind `verifier` (§3.5 VERIFIER IDENTITY)
     # the per-kind required fields are the §3.5 table's (tickets.check_facts), refused by field name
     "RUN-TICKET-MINT": (frozenset({"attempt_id"}) | T.MINT_FIELDS, frozenset({"attempt_id"})),
     "RUN-TICKET-CANCEL": (frozenset({"ticket"}),) * 2,
@@ -562,6 +564,11 @@ def _run_facts_ok(facts: object) -> bool:
             and (model is None or type(model) is str))
 
 
+def _entry_only(resolved: Mapping[str, object]) -> dict[str, object]:
+    """A resolved verifier object without its ``verifier_generation``: the signed entry's own fields."""
+    return {k: v for k, v in resolved.items() if k != "verifier_generation"}
+
+
 def _keys_unavailable(*_a: object) -> None:
     # The keys admin wire (§4.9) is session 3c's. Fail closed until it is wired.
     raise Refused("keys-unavailable", "the keys admin wire is not wired")
@@ -855,7 +862,10 @@ class Control:
     (the ``_levain_dispatch`` peer; ``None``: no peer is dispatch) · ``tickets`` (a :class:`levain.slot.tickets.TicketStore`:
     the run-ticket journal, compacted by :meth:`start`; ``None``: every ticket verb refused ``journal-unavailable``) ·
     ``lineage`` (a :class:`levain.slot.lineage.LineageSink`: ``L/lineage/lineage.jsonl``, opened by :meth:`start`;
-    ``None``: ``LINEAGE-APPEND`` refused ``lineage-unavailable``)."""
+    ``None``: ``LINEAGE-APPEND`` refused ``lineage-unavailable``) · ``verifiers`` (a
+    :class:`levain.slot.routemaps.ControlVerifiers`: ``CONFIG-SUBMIT``'s verifier generations, their start pass, and
+    the verifier activation lock a verifier mint and a verifier ATTACH hold; ``None``: ``CONFIG-SUBMIT`` refused
+    ``config-verifier``, every verifier mint ``verifier-unknown``)."""
 
     def __init__(self, store: StateStore, operator_uid: int, *,
                  qbroker_uid: int | None = None,
@@ -876,7 +886,8 @@ class Control:
                  routes: routemaps.ControlRoutes | None = None,
                  dispatch_uid: int | None = None,
                  tickets: T.TicketStore | None = None,
-                 lineage: LN.LineageSink | None = None) -> None:
+                 lineage: LN.LineageSink | None = None,
+                 verifiers: routemaps.ControlVerifiers | None = None) -> None:
         if type(operator_uid) is not int or operator_uid <= ROOT_UID:
             raise Refused("bad-config", f"operator uid {operator_uid!r}")
         if qbroker_uid is not None and (type(qbroker_uid) is not int or qbroker_uid <= ROOT_UID
@@ -949,6 +960,9 @@ class Control:
         self._serves_cv = threading.Condition(self._mu)
         self.tickets = tickets
         self.lineage = lineage
+        #: S1 3c-8: the verifier generations (CONFIG-SUBMIT); None refuses CONFIG-SUBMIT `config-verifier` and every
+        #: verifier mint `verifier-unknown`
+        self.verifiers = verifiers
         #: (session, ref) -> the SPEND-OVERRUN record, oldest first (R4 §1.4, §4: the card's data; never a revoke).
         self._overruns: collections.OrderedDict[tuple[str, tuple], dict[str, object]] = collections.OrderedDict()
         #: the sessions keys reported FRONT-LOST for, oldest first, bounded (doctor / tests).
@@ -1016,6 +1030,8 @@ class Control:
         revoke pass."""
         if self.routes is not None:
             self.routes.start_pass()
+        if self.verifiers is not None:
+            self.verifiers.start_pass()
         loaded = self.store.load()
         if self.tickets is not None:
             # the compaction runs before any append is admitted (CONTRACT §3.5); the records are loaded first so a
@@ -1452,6 +1468,7 @@ class Control:
                 raise Refused("claims-mismatch")
             lease.used = True
         facts: dict[str, object] | None = None
+        held: T.Ticket | None = None
         landed: R.NotDurable | None = None
         where = claims["slot"]
         slot = (str(where["class"]), int(where["index"]), int(claims["lease_seq"]))   # type: ignore[index]
@@ -1465,13 +1482,13 @@ class Control:
             prior, mark = self.pool.mark_leased(slot[0], slot[1], session, slot[2],
                                                 int(claims["slot_rev"]))                 # type: ignore[arg-type]
             try:
-                with self.store.lock(session):
+                with self._verifier_attach(held if lease.ticket is not None else None), self.store.lock(session):
                     if self.store.get(session) is not None:
                         raise Refused("session-exists")
                     if lease.ticket is not None:
                         # journaled before the record exists: a crash between the two leaves the ticket bound and no
                         # session, which runs nothing; CONTROL's next start unbinds it (head ruling H8)
-                        facts = dict(self._ticket_store().bind(lease.ticket, session, slot).facts)
+                        facts = self._ticket_store().bind(lease.ticket, session, slot).answer_facts()
                     try:
                         rec = R.SessionState(session=session, generation=0, state=R.ALLOCATED, claims=claims,
                                              lease_live=True, event_kind="state",
@@ -1516,6 +1533,31 @@ class Control:
         if facts is not None:
             return {"generation": 0, "ticket_facts": facts}   # §3.3: the ticket's facts, for render's check
         return {"generation": 0}
+
+    @contextmanager
+    def _verifier_attach(self, held: T.Ticket | None) -> Iterator[None]:
+        """S1 3c-8, CONTRACT §3.5 VERIFIER IDENTITY at ``ATTACH``: a verifier ticket binds only while the ACTIVE
+        verifier generation still holds its ``verifier_id`` (``verifier-unknown``: withdrawn) with an entry equal,
+        canonical bytes, to the one resolved at mint (``verifier-superseded``: replaced; a verifier has no network to
+        keep pinned, so a replaced entry stops pre-minted tickets too). The generation number is not compared: a
+        later generation that re-signs the same entry changes nothing the run relies on [judged by lane-3c8, 10-25,
+        against §3.5's "the active entry under that id is not byte-equal (canonical) to the ticket's"]. Held, the
+        verifier activation lock spans the check and the bind, so no CONFIG-SUBMIT lands between them; any other
+        ticket (or none) takes nothing."""
+        if held is None or held.facts.get("kind") != "verifier":
+            yield
+            return
+        if self.verifiers is None:
+            raise Refused("verifier-unknown", "CONTROL holds no verifier generations")
+        with self.verifiers.lock:
+            active = self.verifiers.active()
+            now = None if active is None else active.resolved(str(held.facts["verifier_id"]))
+            if now is None:
+                raise Refused("verifier-unknown", "the verifier id is absent from the active generation")
+            if held.resolved is None or canon.canonical_bytes(_entry_only(now)) != canon.canonical_bytes(
+                    _entry_only(held.resolved)):
+                raise Refused("verifier-superseded", "the active entry under the verifier id is not the ticket's")
+            yield
 
     def _op_cas(self, conn: Conn, args: dict) -> dict[str, object]:
         return {"generation": self.cas(args["session"], args["generation"], args["from"], args["to"],
@@ -2082,10 +2124,10 @@ class Control:
         """``RUN-TICKET-MINT`` -> ``{ticket, run_id}`` (``run_id`` CONTROL's own, head ruling H1). In this order: the
         attempt id's grammar and the §3.5 table's shapes (:func:`levain.slot.tickets.check_facts`); a REPLAY of a journaled attempt answers by the idempotent rule
         before anything else is read, so a route or config change between a crash and the replay does not alter it;
-        a ``verifier`` ticket is ``verifier-unknown`` while no verifier generation is active (CONTROL activates none
-        here: ``CONFIG-SUBMIT`` is not among its verbs);
-        then the wait for keys to serve CONTROL's head on the current attachment, and, under the activation lock,
-        the route facts checked against the ACTIVE generation (:meth:`_check_route_facts`) and the mint journaled
+        a ``verifier`` ticket is resolved against the ACTIVE verifier generation under the verifier activation lock and
+        journaled with its resolved entry (:meth:`_mint_verifier`; no route map and no keys wait concern it);
+        then, for an executor or planner ticket, the wait for keys to serve CONTROL's head on the current attachment,
+        and, under the activation lock, the route facts checked against the ACTIVE generation (:meth:`_check_route_facts`) and the mint journaled
         with the ceiling (:meth:`levain.slot.tickets.TicketStore.mint`). Holding the activation lock means no
         activation moves the head between the check and the journal line."""
         store = self._ticket_store()
@@ -2095,7 +2137,7 @@ class Control:
         if again is not None:
             return {"ticket": again.ticket, "run_id": again.run_id}
         if facts["kind"] == "verifier":
-            raise Refused("verifier-unknown", "no verifier generation is active")
+            return self._mint_verifier(store, attempt, facts)
         try:
             self._await_keys_serving_head()
         except Refused:
@@ -2115,6 +2157,44 @@ class Control:
             self._check_route_facts(facts)
             t = store.mint(attempt, facts, new_handle, slots_free=self.pool.free)
             return {"ticket": t.ticket, "run_id": t.run_id}
+
+    def _mint_verifier(self, store: T.TicketStore, attempt: str, facts: Mapping[str, object]) -> dict[str, object]:
+        """S1 3c-8, the §3.5 table's VALUE half for a verifier ticket, under the verifier activation lock (a replay of
+        the attempt first, as for routes): ``verifier_generation`` == the ACTIVE verifier generation (a superseded one
+        is ``ticket-field:verifier_generation``: a hijacked dispatch cannot pick an older signed driver the operator
+        replaced); ``verifier_id`` in it (``verifier-unknown``); that entry's ``steps_digest`` the digest of the
+        ticket's ``verifier_steps`` and its ``driver_input_digest`` the ticket's (``ticket-field:<name>``). The
+        RESOLVED entry is CONTROL's own projection of the active entry, never a field of the request, and it is
+        journaled with the mint line."""
+        if self.verifiers is None:
+            raise Refused("verifier-unknown", "CONTROL holds no verifier generations")
+        with self.verifiers.lock:
+            again = store.replay(attempt, facts)
+            if again is not None:
+                return {"ticket": again.ticket, "run_id": again.run_id}
+            active = self.verifiers.active()
+            if active is None:
+                raise Refused("verifier-unknown", "no verifier generation is active")
+            if facts["verifier_generation"] != active.generation:
+                raise Refused("ticket-field:verifier_generation", f"the active generation is {active.generation}")
+            resolved = active.resolved(str(facts["verifier_id"]))
+            if resolved is None:
+                raise Refused("verifier-unknown", "the verifier id is not in the active generation")
+            if resolved["steps_digest"] != routemaps.sha256_canonical(facts["verifier_steps"]):
+                raise Refused("ticket-field:verifier_steps", "not the active entry's steps")
+            if resolved["driver_input_digest"] != facts["driver_input_digest"]:
+                raise Refused("ticket-field:driver_input_digest", "not the active entry's driver input")
+            t = store.mint(attempt, facts, new_handle, slots_free=self.pool.free, resolved=resolved)
+            return {"ticket": t.ticket, "run_id": t.run_id}
+
+    def _op_config_submit(self, conn: Conn, args: dict) -> dict[str, object]:
+        """``CONFIG-SUBMIT {item, sig}`` -> ``{generation}`` (S1 3c-8; CONTRACT §3.3, §3.5 VERIFIER IDENTITY): a
+        ``verifier`` item activated by :meth:`levain.slot.routemaps.ControlVerifiers.submit`, the generations an OPEN
+        ticket names kept when older ones are pruned."""
+        if self.verifiers is None:
+            raise Refused("config-verifier", "CONTROL holds no verifier store")
+        keep = self.tickets.referenced_verifier_generations if self.tickets is not None else frozenset
+        return {"generation": self.verifiers.submit(args["item"], args["sig"], keep)}
 
     def _await_keys_serving_head(self) -> None:
         """Waits, at most :data:`MINT_KEYS_WAIT_S`, until what keys stated or acked on the CURRENT attachment is
@@ -2542,9 +2622,11 @@ def serve(config: ServeConfig) -> int:
         ceiling = config.ceiling_path or Path(config.routes_dir).parent / "policy" / "dispatch_ceiling"
         tickets = T.TicketStore(Path(config.store_dir) / T.JOURNAL, Path(ceiling), ceiling_uid=config.ceiling_uid)
     lineage = LN.LineageSink(Path(config.lineage_dir) / LN.SINK) if config.lineage_dir is not None else None
+    # S1 3c-8: the verifier generations live beside the route maps (`L/routes/verifiers/`)
+    verifiers = routemaps.ControlVerifiers(Path(config.routes_dir)) if config.routes_dir is not None else None
     control = Control(store, config.operator_uid, qbroker_uid=config.qbroker_uid, keys_uid=config.keys_uid,
                       keys_admin=admin, host=config.host, routes=routes, dispatch_uid=config.dispatch_uid,
-                      tickets=tickets, lineage=lineage)
+                      tickets=tickets, lineage=lineage, verifiers=verifiers)
     if config.peer_uid is not None:
         server = ControlServer(control, Path(config.socket_path), peer_uid=config.peer_uid)
     else:

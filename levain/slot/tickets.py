@@ -6,8 +6,9 @@ line, fsynced per append), and rebuilds everything it counts from that journal a
 day's mints, and the attempt index `RUN-TICKET-STATUS` answers from.
 
 Lines (`op`): `mint` (the ticket, its `attempt_id`, the `run_id` CONTROL minted with it, the request digest, the facts,
-the mint time and UTC day), `bind` (an unbound ticket bound to the session an `ATTACH` created, and, from 3c-7, to the
-slot lease that session holds: `slot` `{class, index}` + `lease_seq`, CONTRACT §3.5 BINDING), `unbind` (that
+the mint time and UTC day; a verifier ticket's also its `verifier`, the entry CONTROL resolved at mint, S1 3c-8,
+checked against the line's facts at the rebuild by :func:`check_resolved`), `bind` (an unbound ticket bound to the
+session an `ATTACH` created, and, from 3c-7, to the slot lease that session holds: `slot` `{class, index}` + `lease_seq`, CONTRACT §3.5 BINDING), `unbind` (that
 `ATTACH`'s session record was never written, so the ticket is unbound again: L2 4a, 3c-5 fix 1), `release` (S1 3c-7: a
 `SLOT-SYNC` showed the bound lease over, §3.5 RELEASE), `cancel`, `expire` (an unbound ticket past V16), `tombstone`
 (`{attempt_id, ticket, request_digest, state, session?}`, written only by the
@@ -100,6 +101,7 @@ _ROUTE = re.compile(r"[a-z0-9-]{1,48}")
 #: DECISION: a job id and a model name take the text form CONTROL already uses for names it records.
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}")
 _DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_TEMPLATE = re.compile(r"[a-z0-9_]{1,48}")
 #: CONTRACT §3.5 Pool: the slot states that end a lease at the same `lease_seq` (RELEASE).
 LEASE_OVER = frozenset({"reusable", "retired"})
 #: the slot classes and the highest index a `bind` line's slot may carry (the §1.1 index space).
@@ -126,8 +128,12 @@ _VERIFIER_FIELDS = ("verifier_generation", "verifier_id", "verifier_steps", "inp
 #: §3.3 RUN-TICKET-MINT's fields beside `attempt_id`.
 MINT_FIELDS = frozenset({"job_id", "run_index", "contract_digest", "kind", "model_requested", "egress_routes",
                          "reserved_microdollars", *_ROUTE_FIELDS, *_VERIFIER_FIELDS})
-#: a journal `mint` line's keys, exactly (fix 2: the rebuild refuses any other set)
+#: a journal `mint` line's keys, exactly (fix 2: the rebuild refuses any other set); a verifier ticket's line adds
+#: `verifier`, the entry CONTROL resolved at mint (3c-8, CONTRACT §3.5 VERIFIER IDENTITY), and no other line has it
 MINT_LINE_KEYS = frozenset({"op", "ticket", "attempt_id", "run_id", "request_digest", "facts", "minted_ms", "day"})
+#: the RESOLVED object's keys (`records.TICKET_VERIFIER_KEYS`; a test pins the two equal)
+RESOLVED_KEYS = frozenset({"verifier_generation", "verifier_id", "verifier_artifact_digest", "declared_kind",
+                           "driver_template", "driver_template_digest", "steps_digest", "driver_input_digest"})
 
 
 def _field(name: str, detail: str = "") -> Refused:
@@ -210,6 +216,38 @@ def check_facts(args: Mapping[str, object]) -> Dict[str, object]:
     return facts
 
 
+def check_resolved(facts: Mapping[str, object], resolved: object) -> Dict[str, object]:
+    """A verifier ticket's RESOLVED entry (3c-8) against the ticket's own facts: exactly :data:`RESOLVED_KEYS`, each of
+    its shape, its `verifier_generation` and `verifier_id` the ticket's, its `steps_digest` the digest of the ticket's
+    `verifier_steps` and its `driver_input_digest` the ticket's (CONTRACT §3.5 table: the entry's digests equal to
+    the ticket's). Else `ticket-field:verifier`. Returns a copy."""
+    if facts.get("kind") != "verifier" or not isinstance(resolved, dict) or set(resolved) != RESOLVED_KEYS:
+        raise _field("verifier", "not a resolved verifier entry")
+    try:
+        steps_digest = "sha256:" + hashlib.sha256(canon.canonical_bytes(facts["verifier_steps"])).hexdigest()
+    except (KeyError, ContractError, TypeError, ValueError, RecursionError):
+        raise _field("verifier", "the ticket's verifier_steps") from None
+    for k in ("verifier_artifact_digest", "driver_template_digest", "steps_digest", "driver_input_digest"):
+        if type(resolved[k]) is not str or not _DIGEST.fullmatch(resolved[k]):
+            raise _field("verifier", k)
+    if type(resolved["driver_template"]) is not str or not _TEMPLATE.fullmatch(resolved["driver_template"]) \
+            or resolved["driver_template"].startswith("_") \
+            or resolved["declared_kind"] not in ("black-box", "in-process"):
+        raise _field("verifier", "driver_template or declared_kind")
+    if type(resolved["verifier_generation"]) is not int:     # `True == 1`: a bool never stands in for a generation
+        raise _field("verifier", "verifier_generation")
+    try:
+        mine = (facts["verifier_generation"], facts["verifier_id"], facts["driver_input_digest"])
+    except (KeyError, TypeError):
+        raise _field("verifier", "the ticket's verifier fields") from None
+    if (resolved["verifier_generation"] != mine[0]
+            or resolved["verifier_id"] != mine[1]
+            or resolved["steps_digest"] != steps_digest
+            or resolved["driver_input_digest"] != mine[2]):
+        raise _field("verifier", "the resolved entry is not the ticket's")
+    return dict(resolved)
+
+
 def request_digest(facts: Mapping[str, object]) -> str:
     """The digest a replay is compared on: every mint field but `attempt_id`, as canonical JSON."""
     return "sha256:" + hashlib.sha256(canon.canonical_bytes(dict(facts))).hexdigest()
@@ -268,6 +306,16 @@ class Ticket:
     run_id: str = ""
     #: the slot lease a BOUND ticket is bound to: (class, index, lease_seq) (3c-7), or None (a 3c-5 `bind` line)
     slot: Optional[Tuple[str, int, int]] = None
+    #: a verifier ticket's entry, resolved by CONTROL at mint (3c-8); None for every other kind
+    resolved: Optional[Dict[str, object]] = None
+
+    def answer_facts(self) -> Dict[str, object]:
+        """What ATTACH answers as `ticket_facts` (CONTRACT §3.3): the facts, and a verifier ticket's resolved entry as
+        `verifier` beside them."""
+        out = dict(self.facts)
+        if self.resolved is not None:
+            out["verifier"] = dict(self.resolved)
+        return out
 
 
 def check_slot(value: object) -> Tuple[str, int, int]:
@@ -447,15 +495,20 @@ class TicketStore:
                     # fix 2 (codex 2): the line whole, its facts re-checked and its digest recomputed, so a line whose
                     # facts were altered under the old digest is never served (the mint's checks would be bypassed)
                     facts = obj["facts"]
-                    if set(obj) != MINT_LINE_KEYS or not isinstance(facts, dict) or not set(facts) <= MINT_FIELDS:
+                    if not isinstance(facts, dict) or not set(facts) <= MINT_FIELDS:
+                        raise _inconsistent("a mint line's fields are not exactly a mint's")
+                    # 3c-8: a verifier ticket's line carries its resolved entry, and only a verifier ticket's
+                    want = MINT_LINE_KEYS | ({"verifier"} if facts.get("kind") == "verifier" else set())
+                    if set(obj) != want:
                         raise _inconsistent("a mint line's fields are not exactly a mint's")
                     if check_facts(facts) != facts:
                         raise _inconsistent("a mint line's facts are not what check_facts reads")
                     if obj["request_digest"] != request_digest(facts):
                         raise _inconsistent("a mint line's request digest is not its facts' digest")
+                    resolved = check_resolved(facts, obj["verifier"]) if "verifier" in obj else None
                     t = Ticket(obj["ticket"], check_attempt_id(obj["attempt_id"]), obj["request_digest"],
                                dict(obj["facts"]), _uint(obj["minted_ms"], "minted_ms"), obj["day"],
-                               run_id=obj["run_id"])
+                               run_id=obj["run_id"], resolved=resolved)
                     if type(t.ticket) is not str or not _DIGEST.fullmatch(t.request_digest) \
                             or not _DAY.fullmatch(t.day) or type(t.run_id) is not str \
                             or not RUN_ID_RE.fullmatch(t.run_id):
@@ -564,8 +617,12 @@ class TicketStore:
 
     @staticmethod
     def _mint_line(t: Ticket) -> Dict[str, object]:
-        return {"op": "mint", "ticket": t.ticket, "attempt_id": t.attempt_id, "run_id": t.run_id,
-                "request_digest": t.request_digest, "facts": t.facts, "minted_ms": t.minted_ms, "day": t.day}
+        line: Dict[str, object] = {"op": "mint", "ticket": t.ticket, "attempt_id": t.attempt_id, "run_id": t.run_id,
+                                   "request_digest": t.request_digest, "facts": t.facts, "minted_ms": t.minted_ms,
+                                   "day": t.day}
+        if t.resolved is not None:
+            line["verifier"] = t.resolved
+        return line
 
     @staticmethod
     def _bind_line(t: Ticket) -> Dict[str, object]:
@@ -650,15 +707,21 @@ class TicketStore:
         return t
 
     def mint(self, attempt_id: str, facts: Mapping[str, object], new_ticket: Callable[[], str], *,
-             slots_free: Optional[Callable[[str], int]] = None) -> Ticket:
+             slots_free: Optional[Callable[[str], int]] = None,
+             resolved: Optional[Mapping[str, object]] = None) -> Ticket:
         """A NEW attempt's mint, journaled before it answers: the ceiling read and checked against the rebuilt counts
         (the open tickets, the UTC day's mints), all under the store's lock, so two mints never both take the last
         place. An attempt the index already names answers by :meth:`replay`'s rule BEFORE the ceiling is read (fix 2,
         codex 3: a same-attempt retry that raced the first mint gets the first ticket, whatever the ceiling now says),
         and again under the lock after it. ``slots_free(class)``: the free slots CONTROL's mirror counts for a class
         (3c-7); given, the mint is refused ``no-free-slot:<class>`` after the ceiling checks when :meth:`_free` is not
-        above 0 (CONTROL always passes it; None is this store's own tests')."""
+        above 0 (CONTROL always passes it; None is this store's own tests'). ``resolved``: a verifier ticket's entry as
+        CONTROL resolved it (3c-8), required for a verifier ticket and refused for any other (``ticket-field:verifier``,
+        :func:`check_resolved`), journaled on the mint line; a replay answers the first mint's ticket and entry."""
         digest = request_digest(facts)
+        if (facts.get("kind") == "verifier") != (resolved is not None):
+            raise _field("verifier", "a verifier ticket, and only one, carries its resolved entry")
+        kept = check_resolved(facts, dict(resolved)) if resolved is not None else None
         with self.lock:
             self._live()                          # a poisoned store answers that before the ceiling is read
             again = self._replay(attempt_id, digest)
@@ -687,7 +750,8 @@ class TicketStore:
             run_id = new_run_id()
             while run_id in runs:
                 run_id = new_run_id()
-            t = Ticket(new_ticket(), attempt_id, digest, dict(facts), int(now * 1000), day, run_id=run_id)
+            t = Ticket(new_ticket(), attempt_id, digest, dict(facts), int(now * 1000), day, run_id=run_id,
+                       resolved=kept)
             self._append(self._mint_line(t))
             self._by_attempt[attempt_id] = self._by_ticket[t.ticket] = t
             return t
@@ -799,6 +863,13 @@ class TicketStore:
             return frozenset(int(t.facts["routemap_generation"]) for t in self._by_ticket.values()   # type: ignore
                              if "routemap_generation" in t.facts and (self._state(t) in OPEN or t.session in sessions))
 
+    def referenced_verifier_generations(self) -> "frozenset[int]":
+        """The verifier generations an OPEN ticket names (3c-8, CONTRACT §3.5: a verifier generation is pruned by the
+        route rule), OPEN being the derived state as for :meth:`referenced_generations`."""
+        with self.lock:
+            return frozenset(int(t.facts["verifier_generation"]) for t in self._by_ticket.values()   # type: ignore
+                             if "verifier_generation" in t.facts and self._state(t) in OPEN)
+
     def cancel(self, ticket: str) -> None:
         """An UNBOUND ticket only (`ticket-bound` once a lease bound it; `ticket-unknown` for one never minted;
         DECISION: a ticket already closed answers `attempt-closed`)."""
@@ -851,5 +922,5 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 __all__ = ["BOUND", "CANCELLED", "CEILING_FORMAT", "Ceiling", "EXPIRED", "JOURNAL", "KINDS", "LEASE_OVER", "MINT_FIELDS",
-           "RELEASED", "RENDERS_AS", "RUN_ID_RE", "TICKET_UNUSED_S", "check_slot",
+           "RELEASED", "RENDERS_AS", "RESOLVED_KEYS", "RUN_ID_RE", "TICKET_UNUSED_S", "check_resolved", "check_slot",
            "Ticket", "TicketStore", "UNBOUND", "check_attempt_id", "check_facts", "read_ceiling", "request_digest"]

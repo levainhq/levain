@@ -13,6 +13,9 @@ from __future__ import annotations
 #: whose sudo is elsewhere fails closed.
 SUDO = "/usr/bin/sudo"
 
+#: CONTRACT §3.3: a ``levain-control/1`` frame's cap, the canonical JSON bytes after the 4-byte length
+FRAME_MAX = 64 * 1024
+
 
 class Refused(Exception):
     """A refusal BY NAME (CONTRACT §5): ``name`` is the stable, machine-readable reason; ``detail`` is
@@ -38,4 +41,4 @@ def write_all(fd: int, data: bytes) -> None:
         view = view[n:]
 
 
-__all__ = ["Refused", "write_all"]
+__all__ = ["FRAME_MAX", "Refused", "write_all"]

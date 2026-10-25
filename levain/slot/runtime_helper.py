@@ -555,6 +555,8 @@ class Seams:
     grant_search: Callable[[str, int, Path, str, int], None] = grant_broker_search
     wake_reaper: Optional[Callable[[], None]] = None
     hook_templates: Mapping[str, RD.HookTemplate] = field(default_factory=dict)
+    #: a driver template's bytes by name (3c-8, render's ``driver-template-digest-mismatch``)
+    driver_template: Callable[[str], Optional[bytes]] = RD.read_driver_template
     front_module: str = FRONT_MODULE
     front_args: Callable[[str, SlotId], Sequence[str]] = stub_front_args
     lock_wait_s: float = LOCK_WAIT_S
@@ -1413,6 +1415,10 @@ class RenderRun:
     front_pid: Optional[int] = None
     front_start: Optional[int] = None
     go_w: int = -1
+    #: step (1)'s CAS may have moved the record: set as the CAS is sent, cleared only by a refusal in
+    #: :data:`CAS_UNMOVED`. A lost reply leaves ``generation`` 0 with the record RENDERING, so it is this, not the
+    #: generation, that decides the REVOKE.
+    cas_may_have_landed: bool = False
 
     @property
     def egress(self) -> bool:
@@ -1444,11 +1450,22 @@ def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
         hook_templates={k: v for k, v in seams.hook_templates.items() if k in blob.hooks})
 
 
+#: the CAS refusals CONTROL answers only after reading the record under its lock and writing nothing
+#: (``Control.cas``: the record's generation, then its state): the one proof that step (1) moved nothing.
+CAS_UNMOVED = frozenset({"stale-generation", "from-mismatch"})
+
+
 def render_step1_cas_rendering(run: RenderRun) -> None:
     """(1) CAS ALLOCATED -> RENDERING. An ALLOCATED record is always generation 0 (ATTACH creates it there and
     any later write moves it out of ALLOCATED or ends its lease). Refused = stop: nothing started."""
-    ans = run.ctx.call("CAS", session=run.alloc.session, generation=0, **{"from": R.ALLOCATED, "to": R.RENDERING},
-                       fields={})
+    run.cas_may_have_landed = True
+    try:
+        ans = run.ctx.call("CAS", session=run.alloc.session, generation=0,
+                           **{"from": R.ALLOCATED, "to": R.RENDERING}, fields={})
+    except Refused as e:
+        if e.name in CAS_UNMOVED:
+            run.cas_may_have_landed = False
+        raise
     run.generation = int(ans["generation"])
 
 
@@ -1457,7 +1474,7 @@ def render_step2_policy(run: RenderRun) -> None:
     ``front:{uid, pending:true}`` (egress), fsync. DECISION: ``incarnation`` = the slot's ``lease_seq``, unique per
     lease of the slot (the contract types it nowhere; records.py reads it as a uint)."""
     ctx, a, blob = run.ctx, run.alloc, run.blob
-    facts = render_facts(ctx, a, blob)
+    facts = run.facts if run.facts is not None else render_facts(ctx, a, blob)
     RD.check_facts(blob, facts)
     run.facts = facts
     if run.egress:
@@ -1733,15 +1750,49 @@ def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]
             raise Refused("not-allocated", req.session)
         # §3.5's second gate, before step (1)'s CAS: a refusal here leaves the session ALLOCATED and acts on nothing
         RD.check_ticket(blob, a.kind, a.slot.slot_class, a.ticket, a.ticket_facts)
+        if a.ticket is not None and a.ticket_facts is not None and a.ticket_facts.get("kind") == "verifier":
+            RD.check_driver_template(a.ticket_facts["verifier"], ctx.seams.driver_template)   # type: ignore[arg-type]
         run = RenderRun(ctx, a, blob)
+        # 3c-8 (1025-10 obs 2): step (2)'s checks read alloc, the blob and root's own files (the base map, the hook
+        # templates), none of which the CAS changes, so they run before it too; a refusal among them leaves the
+        # session ALLOCATED, as the ticket gate does
+        run.facts = render_facts(ctx, a, blob)
+        RD.check_facts(blob, run.facts)
         try:
             for name, step in RENDER_STEPS:
                 ctx.seams.at(name)
                 step(run)
         except BaseException:
-            kill_front(run)
+            try:
+                kill_front(run)
+            finally:                    # a front cleanup that raises does not skip the REVOKE
+                if run.cas_may_have_landed:
+                    revoke_failed_render(run)
             raise
     return {}
+
+
+def revoke_failed_render(run: RenderRun) -> None:
+    """3c-8 (1025-10 obs 2): a render refused once step (1)'s CAS may have landed left the session RENDERING (or past
+    it), which no later render can take up (step (1) CASes from ALLOCATED only), so root asks CONTROL to ``REVOKE``
+    it: REVOKED is a state the reaper's END clears, as it would after the lease's EOF. The REVOKE goes on a NEW
+    connection: a lost reply closes the cached client (``ControlClient._down``), and a call on it is refused
+    ``control-down`` without reaching CONTROL. Best effort: a REVOKE that fails leaves the session to that EOF, and
+    the render's own refusal is what the caller is answered."""
+    seams = run.ctx.seams
+    try:
+        client = seams.client_factory(seams.R / "control" / "control.sock")
+    except Exception:   # noqa: BLE001 - the render's refusal is the answer; the lease EOF still revokes
+        return
+    try:
+        client.call("REVOKE", session=run.alloc.session)   # type: ignore[attr-defined]
+    except Exception:   # noqa: BLE001 - as above
+        pass
+    finally:
+        try:
+            client.close()                                  # type: ignore[attr-defined]
+        except Exception:   # noqa: BLE001 - closing never changes the verb's answer
+            pass
 
 
 # --- resume, status ---------------------------------------------------------------------------------------------------
@@ -3069,7 +3120,7 @@ def _read_stdin() -> bytes:
     return bytes(data)
 
 
-__all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
+__all__ = ["BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
            "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "LinkedNotDurable", "PREPARE_RESULT_FORMAT",
            "RENDER_STEPS", "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS",
            "CHECK_S", "capture_target", "configured_slots", "drain", "reap_within", "wait_child_within", "ENTRY_ENV", "entry_env",

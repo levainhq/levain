@@ -197,6 +197,24 @@ def test_the_generation_spans_every_kind(store, log, keys):
     assert store.generation() == 2
 
 
+def test_a_verifier_item_no_control_frame_carries_is_refused(store, log, keys):
+    """S1 3c-8 r1 (codex MED): a verifier item is handed to CONTROL in one CONFIG-SUBMIT frame, so accept refuses one
+    over that bound, though each entry's driver_input is within its own."""
+    from levain.slot.routemaps import DRIVER_INPUT_MAX, VERIFIER_ITEM_MAX_BYTES
+
+    half = VERIFIER_ITEM_MAX_BYTES // 2
+    big = [ventry(f"pytest-{i}", "black-box", driver_input={"steps": [{"exit": 0, "stdout_equals": "x" * half}]})
+           for i in range(2)]
+    assert all(len(canonical_bytes(e["driver_input"])) <= DRIVER_INPUT_MAX for e in big)
+    for e in big:
+        e["driver_input_digest"] = "sha256:" + hashlib.sha256(canonical_bytes(e["driver_input"])).hexdigest()
+        e["verifier_artifact_digest"] = verifier_artifact_digest(e)
+    with pytest.raises(ctl.ConfigRefused, match="CONFIG-SUBMIT"):
+        accept(store, log, keys, "verifier", 1, vbody(*big))
+    assert store.generation() == 0
+    accept(store, log, keys, "verifier", 1, vbody(big[0]))
+
+
 def test_a_generation_gap_is_refused(store, log, keys):
     accept(store, log, keys, "verifier", 1, VERIFIERS)
     with pytest.raises(ctl.ConfigRefused, match="the next is 2"):
