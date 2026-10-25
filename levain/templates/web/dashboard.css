@@ -2503,6 +2503,12 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 @media (prefers-reduced-motion: no-preference) { .tv-task.waiting, .tv-rec { animation: tv-breathe 3.2s ease-in-out 3; } .tv-pulse { animation: tv-ring 2.6s ease-in-out 4; } .tv-needring:not(.calm) { animation: tv-needflash 1.4s ease-in-out 8; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
 @keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
 @keyframes tv-needflash { 50% { opacity: .2; } }
+/* the open decision mark breathes while it is drawn: slow, small, no blink. Infinite on purpose (it must last as long as the question is open); only the badge and the leader line, never the ring */
+@media (prefers-reduced-motion: no-preference) { .tv-needpulse { animation: tv-needpulse 4s ease-in-out infinite; } .tv-bz-lead.tv-needpulse { animation-name: tv-needlead; } }
+.tv-needbadge { transform-box: fill-box; transform-origin: center; }
+@keyframes tv-needpulse { 50% { opacity: .68; transform: scale(1.07); } }
+@keyframes tv-needlead { 50% { opacity: .35; } }   /* the leader line only fades: scaling a line would walk its ends off the pill */
+.tv-replaying .tv-needpulse { animation: none; }
 @keyframes tv-ring { 50% { transform: scale(0.82); opacity: .3; } }
 .tv-replaying .tv-task.waiting, .tv-replaying .tv-rec, .tv-replaying .tv-pulse, .tv-replaying .tv-needring, .tv-replaying .tv-hubmark *, .tv-replaying .tv-bezel.sweep .tv-bz-tick { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
 @container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }

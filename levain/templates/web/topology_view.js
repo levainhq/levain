@@ -208,11 +208,17 @@
       return best;
     } catch (_) { return pad; }
   }
-  function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale, deco, calm) {
+  // The open mark breathes (Phill 10-25) for as long as it is drawn: the badge (and the desk's leader line) carry .tv-needpulse and the mark is drawn only while
+  // needs_open > 0, so answering the item removes the class with the mark. A repaint rebuilds the nodes; a negative delay off one shared clock keeps the breath in phase
+  // across repaints instead of restarting it. PULSE_MS is the keyframe period in dashboard.css (tv-needpulse).
+  const PULSE_MS = 4000;
+  const pulsePhase = () => "-" + Math.round(((typeof performance !== "undefined" && performance.now ? performance.now() : Date.now()) % PULSE_MS)) + "ms";
+  function needMark(nd,cx, cy, rr, ang, opts, label, owner, scale, deco, calm) {
     const g = sv("g", { "data-needs": String(nd.n) }, "tv-need");
     if (deco) g.appendChild(deco.art); else g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring" + (calm ? " calm" : "")));
     const { bx, by, txt, w, side } = needGeom(nd, cx, cy, rr, ang, scale, deco);
-    const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge");
+    const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge tv-needpulse");
+    b.style.animationDelay = pulsePhase();
     const tip = nd.what || (nd.n + " decision" + (nd.n === 1 ? "" : "s") + " waiting on you");
     const openable = !!nd.card && !!opts && typeof opts.openCard === "function";
     b.appendChild(sv("rect", { x: num(bx - w / 2), y: num(by - 10), width: w, height: 20, rx: deco ? deco.rx : 10 }, "tv-needpill"));
@@ -255,7 +261,9 @@
     }
     art.appendChild(sv("path", { d: "M -3 -43.4 L 3 -43.4 L 0 -38.8 Z" }, "tv-bz-lub"));
     const s = pol(39.6, 135);
-    art.appendChild(sv("path", { d: "M " + s + " L 42 42 L 52 42" }, "tv-bz-lead"));
+    const lead = sv("path", { d: "M " + s + " L 42 42 L 52 42" }, "tv-bz-lead tv-needpulse");
+    lead.style.animationDelay = pulsePhase();
+    art.appendChild(lead);
     return { art, bx: HUB_BADGE.bx, by: HUB_BADGE.by, rx: 4 };
   }
 
