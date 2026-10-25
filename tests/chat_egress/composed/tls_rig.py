@@ -174,7 +174,11 @@ class TlsLaunch:
             raise ConnectRefused(head[:200])
         ctx = ssl.create_default_context(cadata=self.ca_pem.decode())
         ctx.check_hostname = False                       # the name checked is the leaf's, by CA; SNI is the test's variable
-        t = ctx.wrap_socket(s, server_hostname=sni) if sni else self._no_sni(ctx, s, time.monotonic() + timeout)
+        try:
+            t = ctx.wrap_socket(s, server_hostname=sni) if sni else self._no_sni(ctx, s, time.monotonic() + timeout)
+        except BaseException:
+            s.close()                                    # a failed handshake leaves no half-open tunnel behind
+            raise
         return t, head
 
     @staticmethod
@@ -226,6 +230,7 @@ class TlsLaunch:
         try:
             r = self.stop()
             assert r.glue_exit == 0 and r.decider_clean and r.socks_clean and not r.failures, r
+            assert r.final_flush is not None and r.final_flush.get("final") is True, r   # test_launch.py's teardown bar
         finally:
             self.origin.close()
 

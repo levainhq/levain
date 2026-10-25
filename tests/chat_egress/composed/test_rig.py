@@ -154,3 +154,53 @@ def test_a_bio_socket_read_is_bounded_by_its_deadline_not_the_sockets_timeout() 
         c.close()
         peer.close()
     assert time.monotonic() - t0 < 0.7, time.monotonic() - t0
+
+
+def test_tls_launch_close_refuses_a_clean_exit_with_no_final_flush(tmp_path) -> None:
+    """glue_exit 0 with no final summary is the case test_launch.py's teardown rejects."""
+    from levain.chat_egress import launch as lm
+    from .tls_rig import TlsLaunch
+    L = object.__new__(TlsLaunch)
+    closed: list[int] = []
+    L.stopped = lm.StopResult(glue_exit=0, decider_clean=True, socks_clean=True, final_flush=None, order=())
+    L.origin = type("O", (), {"close": lambda self: closed.append(1)})()
+    with pytest.raises(AssertionError):
+        L.close()
+    assert closed == [1]
+
+
+def test_tunnel_closes_its_socket_when_the_no_sni_handshake_fails(tmp_path) -> None:
+    """A CONNECT answered 200 whose tunnel then closes: the handshake raises, and the client socket must not leak."""
+    import ssl
+    from .tls_rig import TlsLaunch, make_pki
+    ca, _, _ = make_pki(tmp_path / "pki", ["x.test"])
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    L = object.__new__(TlsLaunch)
+    L.http_port, L.origin_port, L.ca_pem = srv.getsockname()[1], 1, ca.read_bytes()
+    made: list[socket.socket] = []
+    real = socket.create_connection
+
+    def spy(*a, **k):
+        s = real(*a, **k)
+        made.append(s)
+        return s
+
+    def peer() -> None:
+        c, _ = srv.accept()
+        c.recv(4096)
+        c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        c.close()                                            # EOF where a ServerHello should be
+
+    th = threading.Thread(target=peer, daemon=True)
+    th.start()
+    socket.create_connection = spy
+    try:
+        with pytest.raises((ssl.SSLError, ConnectionError, TimeoutError)):
+            L.tunnel("x.test", None, timeout=5.0)
+    finally:
+        socket.create_connection = real
+        th.join(5)
+        srv.close()
+    assert len(made) == 1 and made[0].fileno() == -1
