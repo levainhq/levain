@@ -931,8 +931,8 @@ def test_budget_stopped_is_reread_right_before_the_admit():
 
 
 def test_unmetered_is_gone():
-    # T16: the unmetered seam and its names are gone from levain/ and tests/; no keys or CONTROL unit is installed
-    # before 3c-9 (levain/slot/services/ holds neither)
+    # T16: the unmetered seam and its names are gone from levain/ and tests/; from 3c-9 levain/slot/services/ holds
+    # both the keys and the CONTROL program, so setup installs both units, and keys starts metered (no flag skips it)
     names = ["--" + "unmetered", "Unmetered" + "Budget", "Refusing" + "Budget"]
     hits = []
     for top in ("levain", "tests"):
@@ -942,4 +942,4 @@ def test_unmetered_is_gone():
                 hits += [(str(p.relative_to(ROOT)), n) for n in names if n in text]
     assert hits == []
     services = {p.name for p in (ROOT / "levain" / "slot" / "services").iterdir()}
-    assert "control.py" not in services and "keys.py" not in services
+    assert "control.py" in services and "keys.py" in services

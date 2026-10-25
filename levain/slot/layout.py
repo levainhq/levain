@@ -137,7 +137,10 @@ def base_run_rows(host: HostOS) -> list[Row]:
         _root(host, R / "planner", 0o755),
         # §2.2 (c7.2): every uid traverses, none lists; each socket's own mode, group and peer check gate it.
         Row(R / "keys", "_levain_keys", "_levain_keys", 0o711),
-        Row(R / "control", "_levain_control", "levain-control", 0o750),
+        # Setgid (3c-9 B, ruling 1 of 1025-23/3c9a): CONTROL binds control.sock here, and on Linux a new socket takes
+        # its creator's primary group (_levain_control) otherwise, which no peer reaching it through levain-control
+        # (the operator, keys, qbroker, dispatch) is in. macOS gives a new entry its directory's group either way.
+        Row(R / "control", "_levain_control", "levain-control", 0o2750),
         Row(R / "reaper", "root", "levain-wake", 0o750),
     ]
 

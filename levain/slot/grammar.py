@@ -18,13 +18,17 @@ from levain.firing.hands import OPERATOR_RE
 from levain.slot import Refused
 
 VERBS = ("setup", "repair", "undo", "replenish", "set-retention", "set-dispatch-retain",
-         "set-ceiling", "set-signers", "purge", "force-retire", "set-credential", "remove-credential", "set-limits")
+         "set-ceiling", "set-signers", "purge", "force-retire", "set-credential", "remove-credential", "set-limits",
+         "routes-base", "routes-trust")
 
 #: Verbs that run with a live lease (CONTRACT §5.2); every other verb refuses ``live-lease``. The credential verbs
 #: too: keys reads a credential on demand, so a rotation takes effect on the next exchange (design 1.8 Bootstrap).
 #: ``set-limits`` too: a slot session held over a limit goes on when the operator raises that limit, which happens
 #: while its lease is live (slot limits DESIGN §3).
-LEASE_EXEMPT = frozenset({"purge", "force-retire", "set-credential", "remove-credential", "set-limits"})
+#: ``routes-base`` / ``routes-trust`` too (3c-9): keys re-reads ``base.json`` at every ``Q`` and CONTROL reads the trust
+#: pair at each route submission, so neither write waits for the operator's sessions to end.
+LEASE_EXEMPT = frozenset({"purge", "force-retire", "set-credential", "remove-credential", "set-limits", "routes-base",
+                          "routes-trust"})
 
 #: A credential's name: the pattern of :data:`levain.broker.creds.NAME_RE`, written here because the broker module
 #: needs the optional h11 and this module is imported where it may be absent; a test pins the two equal.
@@ -212,7 +216,7 @@ def parse_install_argv(argv: Sequence[str]) -> InstallCommand:
             raise Refused("extra-argv", repr(rest[0]))
         _exact(verb, rest, 2)
         return InstallCommand(verb, source=_root_syntax(rest[1]))
-    _exact(verb, rest, 0)   # repair, undo, replenish; set-ceiling, set-signers, set-limits: stdin only
+    _exact(verb, rest, 0)   # repair, undo, replenish, routes-base; set-ceiling, set-signers, set-limits, routes-trust: stdin only
     return InstallCommand(verb)
 
 

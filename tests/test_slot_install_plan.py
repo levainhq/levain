@@ -266,7 +266,8 @@ def test_install_verbs_refuse_with_live_lease(verb):
             "remove-credential": ["remove-credential", "anthropic"]}.get(verb, [verb])
     cmd = parse_install_argv(argv)
     facts = _set_up("linux", live_leases=1) if verb != "setup" else _facts("linux", live_leases=1)
-    assert LEASE_EXEMPT == {"purge", "force-retire", "set-credential", "remove-credential", "set-limits"}
+    assert LEASE_EXEMPT == {"purge", "force-retire", "set-credential", "remove-credential", "set-limits",
+                            "routes-base", "routes-trust"}
     if verb in LEASE_EXEMPT:
         preflight(cmd, facts)                 # the lease-exempt verbs pass
     else:
@@ -371,7 +372,7 @@ def test_store_layout(host):
         if "/" in rel:
             assert order.index(str(L / rel.rsplit("/", 1)[0])) < order.index(str(L / rel)), rel
     assert rows[L / "reserve"] == ("root", root_grp, 0o600, "file")
-    assert rows[RUN[host] / "control"] == ("_levain_control", "levain-control", 0o750, "dir")
+    assert rows[RUN[host] / "control"] == ("_levain_control", "levain-control", 0o2750, "dir")
     assert L == (Path("/private/var/levain") if host == "darwin" else Path("/var/levain"))
     # L/routes/base.json: §4.3's base map, no routes, canonical, root 0644, never over an existing map
     base = [s for s in plan.steps if s.write and s.write[0] == L / "routes" / "base.json"]

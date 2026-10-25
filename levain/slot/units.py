@@ -38,6 +38,8 @@ SYSTEMD_DIR = Path("/etc/systemd/system")
 #: The first line of every systemd unit :func:`systemd_unit_text` writes (every version since S1: ``git log -S`` on it
 #: in this file). :func:`unit_state` reads a unit file as Levain's only when its first line is this.
 SYSTEMD_HEADER = "# Written by the Levain install helper; removed by its undo verb."
+#: sysexits.h EX_CONFIG: a service program's exit for an install that lacks what it needs; systemd does not restart it.
+EX_CONFIG = 78
 
 
 @dataclass(frozen=True)
@@ -156,7 +158,10 @@ def systemd_unit_text(svc: Service) -> str:
         "[Service]", "Type=simple", f"User={svc.user}", f"Group={_group('linux', svc)}",
         f"ExecStart={' '.join(argv('linux', svc))}",
         # A service that keeps failing backs off step by step instead of restarting at a fixed short interval.
-        "Restart=always", "RestartSec=1", "RestartSteps=5", "RestartMaxDelaySec=30", "",
+        "Restart=always", "RestartSec=1", "RestartSteps=5", "RestartMaxDelaySec=30",
+        # EX_CONFIG: the install lacks what the program needs (keys with no _levain_gw<n> account); a restart cannot
+        # fix it, so the unit stays down until setup or repair changes the install.
+        f"RestartPreventExitStatus={EX_CONFIG}", "",
         "[Install]", "WantedBy=multi-user.target", "",
     ]
     return "\n".join(lines)
@@ -263,6 +268,11 @@ def _stop_unit_if_changed(systemctl: str, name: str, path: Path, text: str, run:
     return True, ""
 
 
+def _enable_now_step(systemctl: str, name: str) -> Step:
+    """The ONE home of the Linux start step's wording and argv (setup, repair, replenish)."""
+    return Step(f"enable and start {name}", (systemctl, "enable", "--now", name))
+
+
 def install_steps(host: HostOS, services: Iterable[Service], *, run: Callable[..., object] | None = None,
                   read: Callable[[Path], bytes | None] = _read_or_none) -> list[Step]:
     """Write each of ``services``' units, then start each in :func:`start_order` (``run``/``read``:
@@ -296,11 +306,31 @@ def install_steps(host: HostOS, services: Iterable[Service], *, run: Callable[..
         steps.append(Step(f"write the systemd unit {name} ({s.title}, as {s.user})", write=(path, text, 0o644)))
     steps.append(Step("tell systemd about the units", (systemctl, "daemon-reload")))
     for name in start_order(host, chosen):
-        steps.append(Step(f"enable and start {name}", (systemctl, "enable", "--now", name)))
+        steps.append(_enable_now_step(systemctl, name))
     return steps
 
 
-__all__ = ["SERVICES", "Service", "argv", "built_services", "by_name", "install_steps", "launchd_label",
+def keys_start_steps(host: HostOS, *, restart: bool = False) -> list[Step]:
+    """Linux: the steps that start the keys service, built from the same step :func:`install_steps` ends with. ``restart``: a stop first, the order repair uses, for a keys that already runs and read its gateway
+    accounts once at startup. macOS: none, its keys job re-checks its accounts itself and never exits for a missing one."""
+    if host != "linux":
+        return []
+    keys = by_name("keys")
+    name = systemd_name(keys)
+    start = _enable_now_step(_abs("systemctl"), name)
+    if not restart:
+        return [start]
+
+    def stop() -> tuple[bool, str]:
+        from levain.slot.removal import Live, ReadFailed
+        try:
+            return stop_unit_act(host, keys.name, Live(), disable=False)
+        except ReadFailed as e:
+            return False, str(e)
+    return [Step(f"stop {name}", call=stop), start]
+
+
+__all__ = ["SERVICES", "Service", "argv", "built_services", "by_name", "install_steps", "keys_start_steps", "launchd_label",
            "launchd_plist_text", "program_relpath", "program_source", "services_for", "start_order",
            "systemd_name", "systemd_unit_text"]
 

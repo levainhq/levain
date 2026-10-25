@@ -331,7 +331,7 @@ def test_replenish_marks_its_new_slots_after_confinement_just_before_the_journal
     al = allocate(host, egress=(SlotId("egress", 0),), verifier=(SlotId("none", 0),), used=(), retired=())
     plan = plan_replenish(parse_install_argv(["replenish"]), _set_up(host), slots=2, verifier_slots=1,
                           live={"egress": (0,), "none": (0,)}, accounts=dict(al.ids))
-    whys = [s.why for s in plan.steps]
+    whys = [s.why for s in plan.steps if "levain-keys" not in s.why]   # the keys step follows the refill (3c9-fix4)
     marks = _index(whys, "mark ")
     assert [whys[i].split()[1] for i in marks] == ["e1"]       # the new slot only; e0 / v0 keep theirs
     assert marks == [len(whys) - 2] and whys[-1].startswith("remove the intent journal")

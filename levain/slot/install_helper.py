@@ -37,7 +37,7 @@ from typing import Callable, ClassVar, ContextManager, Iterable, Iterator, Mappi
 from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HandsSetupError, HostOS, Step, _abs, _kill_all, host_os, run_plan
 from levain.launch import child_env
-from levain.slot import Refused, bwrap, netns, pf, root_tree, units
+from levain.slot import Refused, bwrap, netns, pf, root_tree, units, write_all
 from levain.slot import removal as RM
 from levain.slot import generation as gen_mod
 from levain.slot import proc as PR
@@ -56,6 +56,7 @@ from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS
                              SlotClass, SlotId, allocate, check_capacity, choose_indices, in_own_range,
                              is_levain_account, loopback_alias, read_retired_ids, retired_ids_text, spent_indices)
 from levain.slot import limits_doc as LD
+from levain.slot import vendor_routes as VR
 from levain.slot.runtime_grammar import VERBS as RUNTIME_VERBS
 from levain.slot.runtime_grammar import ok_line, refusal_line
 from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, base_store_rows, operator_record_path,
@@ -224,7 +225,8 @@ def check_tools(facts: HostFacts, steps: Sequence[Step], *, verb: str, python: b
 
 
 #: The verbs :func:`main` applies; every other verb of the §5.2 grammar answers ``verb-unbuilt:<verb>``.
-BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential", "repair", "set-limits")
+BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential", "repair", "set-limits",
+               "routes-base", "routes-trust")
 
 
 def helper_pending() -> tuple[str, ...]:
@@ -678,6 +680,7 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         *reserve_steps(host),
         *single_filesystem_steps(host, alloc.slots),
         *base_routes_steps(host),
+        *base_routes_merge_steps(host),
         *roots_steps(host, roots),
         *pool_config_steps(host, cmd.slots, cmd.verifier_slots),
         *restart,
@@ -960,6 +963,10 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
 # --- replenish -------------------------------------------------------------------------------------
 
 
+def _keys_start_steps(host: HostOS, *, restart: bool) -> list[Step]:
+    return units.keys_start_steps(host, restart=restart)
+
+
 def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, verifier_slots: int | None,
                    live: Mapping[SlotClass, Iterable[int]],
                    accounts: Mapping[str, int] | None = None,
@@ -1040,6 +1047,9 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
         # Only now may prepare take them: a new slot is reusable once its confinement is loaded (§3.5 Pool).
         *slot_state_steps(host, alloc.slots),
         *_extend_shape_steps(host, facts.install_shape, made, alloc.slots),
+        # After the pool refill, so a keys failure never stops it. A new gateway account is a restart: keys reads its
+        # gateway uids once at startup. With none, a start (a keys unit left failed by exit 78 comes up).
+        *_keys_start_steps(host, restart=any(a.name.startswith("_levain_gw") for a in made)),
         intent_remove_step(host),   # LAST, after the confinement steps
     ]
     check_tools(facts, steps, verb="replenish")
@@ -1710,6 +1720,7 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
                       *removals("R7")])             # R1b: members, then groups (gid retired first), then accounts
     steps += F("R8", [*removals("R8"),              # R1b: the confinement kinds' removals first, then the re-render
                       *row_steps(host, rows), *reserve_steps(host), *base_routes_steps(host),     # R8
+                      *base_routes_merge_steps(host),
                       *single_filesystem_steps(host, slots), *confinement])
     if rf.current != target:
         steps += F("R9", [root_tree.flip_step(host, target,                                       # R9
@@ -2538,6 +2549,244 @@ def policy_limits_undo_steps(host: HostOS, live: RM.Live) -> list[Step]:
                            lambda: live.act((rm, "-f", RM.at(live, path))), tools=(rm,))]
 
 
+# --- routes-base and routes-trust (3c design §2.3, Q15 r3; 3c-9) -------------------------------------------------
+
+#: Q15 r3: the stdin of ``routes-trust``, exactly these keys, canonical bytes.
+ROUTES_TRUST_REQUEST = "levain-routes-trust-request/1"
+ROUTES_TRUST_REQUEST_KEYS = frozenset({"format", "store_id", "fingerprint", "public_key"})
+ROUTES_TRUST_REQUEST_MAX = 16 * 1024
+#: the key types a configuration trust root may be: the laptop custody table's (``levain.authority``'s
+#: ``_LAPTOP_KEY_TYPES``; a test holds the two equal). Written here so root imports no authority code.
+TRUST_KEY_TYPES = frozenset({"ssh-ed25519", "ecdsa-sha2-nistp256", "sk-ssh-ed25519@openssh.com",
+                             "sk-ecdsa-sha2-nistp256@openssh.com"})
+SSH_KEYGEN = "/usr/bin/ssh-keygen"
+_KEY_LINE_RE = re.compile(r"([a-z0-9@.-]{1,64}) ([A-Za-z0-9+/]{1,8192}={0,2})")
+_STORE_ID_RE = re.compile(r"[0-9a-f]{32}")
+_FINGERPRINT_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
+_KEYGEN_LINE_RE = re.compile(r"[0-9]+ (SHA256:[A-Za-z0-9+/]{43}) ")
+
+
+def _routes_dir(rs: RH.Seams, host: HostOS) -> Path:
+    """``L/routes`` under the store the seams name (STORE on a host, a test's scratch L otherwise)."""
+    return rs.L / "routes"
+
+
+def merge_base_routes(routes: Path, *, fsync: Callable[[int], None] | None = None,
+                      warn: Callable[[str], None] | None = None) -> tuple[list, bool]:
+    """``routes-base``'s act: ``routes/base.json`` read (absent = the empty map), the shipped vendor routes merged in
+    by route id (:func:`levain.slot.vendor_routes.merge`, checked by keys' own parser), written durably root 0644 when
+    the bytes, the owner or the mode differ. Returns ``(the vendor route ids, written)``; a map that cannot be merged
+    is ``Refused`` by the merge's code and left as it is, and a failure before the rename is the ``OSError``. Told to
+    ``warn`` (default: stderr): each field of a shipped route's entry the merge reverted
+    (:func:`levain.slot.vendor_routes.reverted_fields`), and a rename whose directory fsync failed (the map is in
+    force, ``written`` is True)."""
+    warn = warn or (lambda line: sys.stderr.write(f"levain install-helper: warning: {line}\n"))
+    path = Path(routes) / "base.json"
+    raw = R.read_record(path, max_bytes=1 << 20)
+    try:
+        doc = None if raw is None else canon.parse(raw)
+    except canon.ContractError:
+        raise Refused("base-map-malformed", f"{path} is not canonical JSON; it is left as it is") from None
+    try:
+        out, ids = VR.merge(doc)
+    except VR.MergeRefused as e:
+        raise Refused(e.code, f"{path}: {e.detail}; it is left as it is") from None
+    data = canon.canonical_bytes(out)
+    if raw == data:
+        st = os.lstat(path)
+        if st.st_uid == os.geteuid() and stat.S_IMODE(st.st_mode) == 0o644:
+            return ids, False
+    try:
+        R.write_durably(path, data, mode=0o644, fsync=fsync or gen_mod._full_fsync)
+    except R.NotDurable as e:
+        warn(f"{path} written but not durable ({e.strerror}): it is in force now and may not survive a crash; run "
+             "`sudo install-helper routes-base` again")
+    for rid, fields in sorted(VR.reverted_fields(doc).items()):
+        warn(f"route {rid} in {path} replaced by the shipped entry; it had changed {', '.join(fields)}, now the "
+             "shipped values")
+    return ids, True
+
+
+def base_routes_merge_steps(host: HostOS, *, store: Path | None = None) -> list[Step]:
+    """setup's and repair's ``routes-base``: after :func:`levain.slot.layout.base_routes_steps` (the empty map when
+    absent), so an upgraded store holding the empty map ends with the vendor routes. Best-effort: a map that cannot be
+    merged is the operator's own and is named, never rewritten, and never stops the install."""
+    routes = (Path(store) if store is not None else STORE[host]) / "routes"
+
+    def act() -> tuple[bool, str]:
+        warnings: list[str] = []
+        try:
+            ids, written = merge_base_routes(routes, warn=warnings.append)
+        except Refused as e:
+            return False, f"{e.name}: {e.detail} (`sudo install-helper routes-base` merges it once it parses)"
+        except OSError as e:
+            return False, (f"base-map-write-failed: {e.strerror or e}; the earlier map stands (`sudo install-helper "
+                           "routes-base` merges it once it can be written)")
+        line = f"{'merged' if written else 'already holds'} the vendor routes {', '.join(ids)}"
+        return True, "; ".join([line, *(f"warning: {w}" for w in warnings)])
+
+    return [Step(f"merge the vendor brokered routes into {routes / 'base.json'} (by route id)", call=act,
+                 allow_fail=True)]
+
+
+def run_routes_base(caller_uid: int, host: HostOS, *, lock: Callable[[], ContextManager[object]],
+                    store_seams: RH.Seams | None = None, err: TextIO | None = None,
+                    fsync: Callable[[int], None] | None = None) -> dict[str, object]:
+    """``routes-base``: the vendor routes merged into ``L/routes/base.json`` (:func:`merge_base_routes`), the operator
+    checked before the install lock and again under it. A failure before the rename refuses
+    ``base-map-write-failed`` with the old map in force; a failed directory fsync after it answers ok (the merged ids
+    named) and warns on ``err``, as does each reverted field of a shipped route."""
+    rs = store_seams or RH.Seams(host=host)
+    _check_operator("routes-base", caller_uid, rs)
+
+    def warn(line: str) -> None:
+        (err or sys.stderr).write(f"levain install-helper: warning: {line}\n")
+    with lock():
+        _check_operator("routes-base", caller_uid, rs)
+        try:
+            ids, written = merge_base_routes(_routes_dir(rs, host), fsync=fsync, warn=warn)
+        except OSError as e:
+            raise Refused("base-map-write-failed", f"{e.strerror or e}; the earlier map stands") from None
+    return {"verb": "routes-base", "routes": ids, "written": written}
+
+
+def read_trust_request(read: Callable[[int], bytes]) -> dict:
+    """``routes-trust``'s stdin (Q15 r3): one canonical ``levain-routes-trust-request/1`` object, exactly its four
+    keys, ``store_id`` 32 lowercase hex, ``fingerprint`` ``SHA256:<43>``, ``public_key`` ONE ``<type> <base64>`` line
+    of a :data:`TRUST_KEY_TYPES` type (no options, no comment). Refused ``routes-trust-request:<field>``. ``read`` is
+    called until it returns no bytes or one past the cap has been read (a pipe may hand the request over in pieces)."""
+    parts: list[bytes] = []
+    got = 0
+    while got <= ROUTES_TRUST_REQUEST_MAX:
+        chunk = read(ROUTES_TRUST_REQUEST_MAX + 1 - got)
+        if not chunk:
+            break
+        parts.append(chunk)
+        got += len(chunk)
+    raw = b"".join(parts)
+    if len(raw) > ROUTES_TRUST_REQUEST_MAX:
+        raise Refused("routes-trust-request:size", f"over {ROUTES_TRUST_REQUEST_MAX} bytes")
+    try:
+        obj = canon.parse(raw)
+        if canon.canonical_bytes(obj) != raw:
+            raise canon.ContractError("not canonical")
+    except canon.ContractError:
+        raise Refused("routes-trust-request:json", "not canonical JSON") from None
+    if type(obj) is not dict or set(obj) != ROUTES_TRUST_REQUEST_KEYS or obj["format"] != ROUTES_TRUST_REQUEST:
+        raise Refused("routes-trust-request:keys", f"exactly {sorted(ROUTES_TRUST_REQUEST_KEYS)}, format "
+                                                   f"{ROUTES_TRUST_REQUEST}")
+    if type(obj["store_id"]) is not str or not _STORE_ID_RE.fullmatch(obj["store_id"]):
+        raise Refused("routes-trust-request:store-id", "32 lowercase hex")
+    if type(obj["fingerprint"]) is not str or not _FINGERPRINT_RE.fullmatch(obj["fingerprint"]):
+        raise Refused("routes-trust-request:fingerprint", "SHA256:<43 base64>")
+    m = _KEY_LINE_RE.fullmatch(obj["public_key"]) if type(obj["public_key"]) is str else None
+    if m is None or m.group(1) not in TRUST_KEY_TYPES:
+        raise Refused("routes-trust-request:public-key", f"one '<type> <base64>' line of {sorted(TRUST_KEY_TYPES)}")
+    return obj
+
+
+def key_fingerprint(public_key: str, *, ssh_keygen: str = SSH_KEYGEN, timeout: float = 10.0) -> str:
+    """The ``SHA256:...`` fingerprint ``ssh-keygen -l -E sha256`` prints for ``public_key``, the key handed to it on a
+    pipe (``/dev/fd/N``, written whole by :func:`levain.slot.write_all` before ssh-keygen runs: the longest key line
+    ``_KEY_LINE_RE`` admits, 8,260 bytes with its newline, is under the 65,536-byte pipe buffer of both hosts
+    [measured on macOS 10-25 by lane-3c9-fix; Linux's default]). ``routes-trust-verifier`` when ssh-keygen cannot run
+    or does not name a fingerprint."""
+    r, w = os.pipe()
+    try:
+        try:
+            write_all(w, (public_key + "\n").encode("ascii"))
+        finally:
+            os.close(w)
+        p = subprocess.run([ssh_keygen, "-l", "-E", "sha256", "-f", f"/dev/fd/{r}"], capture_output=True, text=True,
+                           timeout=timeout, check=False, pass_fds=(r,), cwd="/", env=child_env())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Refused("routes-trust-verifier", f"ssh-keygen could not run ({type(e).__name__})") from None
+    finally:
+        os.close(r)
+    m = _KEYGEN_LINE_RE.match(p.stdout)
+    if p.returncode != 0 or m is None:
+        raise Refused("routes-trust-verifier", f"ssh-keygen read no key: {(p.stderr or p.stdout).strip()[:120]}")
+    return m.group(1)
+
+
+def _trust_on_disk(routes: Path) -> dict | None:
+    """``trust.json`` as root wrote it, or None when absent; one that does not parse is ``routes-trust-exists`` (only
+    ``--replace``, Q16, may set aside what is there)."""
+    raw = R.read_record(routes / "trust.json", max_bytes=64 * 1024)
+    if raw is None:
+        return None
+    try:
+        obj = canon.parse(raw)
+    except canon.ContractError:
+        obj = None
+    if type(obj) is not dict or set(obj) != {"format", "store_id", "fingerprint"}:
+        raise Refused("routes-trust-exists", f"{routes / 'trust.json'} is there and does not parse")
+    return obj
+
+
+def _trust_file_holds(path: Path, data: bytes) -> bool:
+    """``path`` holds ``data``, owned by the helper's euid at 0644: what root writes there, readable by CONTROL
+    (``merge_base_routes``' test; the group is not read, at 0644 it grants what every account has)."""
+    if R.read_record(path, max_bytes=64 * 1024) != data:
+        return False
+    st = os.lstat(path)
+    return st.st_uid == os.geteuid() and stat.S_IMODE(st.st_mode) == 0o644
+
+
+def run_routes_trust(caller_uid: int, host: HostOS, *, read: Callable[[int], bytes],
+                     lock: Callable[[], ContextManager[object]], store_seams: RH.Seams | None = None,
+                     err: TextIO | None = None, fsync: Callable[[int], None] | None = None,
+                     fingerprint: Callable[[str], str] = key_fingerprint) -> dict[str, object]:
+    """``routes-trust`` (Q15 r3): pin the dispatch trust root in ``L/routes``. Before the install lock: the operator
+    check, the request (:func:`read_trust_request`) and ``ssh-keygen -l`` of its key naming exactly its fingerprint
+    (``routes-trust-fingerprint`` otherwise). Root reads no authority log: the request comes from the operator's own
+    ``levain dispatch config init``, which ran the may-sign-configuration test against it, and the password proves the
+    operator. UNDER the lock: the operator check again; an existing ``trust.json`` naming another store or key is
+    ``routes-trust-exists`` (rotation is Q16's); then ``trust.pub`` and LAST ``trust.json``
+    (:func:`levain.slot.records.write_durably`, root 0644), so a reader finding both finds a matched pair. A file is
+    left only when its bytes, owner and mode are already root's (:func:`_trust_file_holds`); any other is written
+    again. A failure before ``trust.json``'s rename refuses ``routes-trust-write-failed`` (``trust.pub`` renamed but
+    not durable included: ``trust.json`` is then not written); ``trust.json`` renamed but not durable answers ok and
+    warns. Before the answer both files are read back and must hold the pair (``routes-trust-write-failed``)."""
+    import hashlib
+
+    rs = store_seams or RH.Seams(host=host)
+    _check_operator("routes-trust", caller_uid, rs)
+    req = read_trust_request(read)
+    if fingerprint(req["public_key"]) != req["fingerprint"]:
+        raise Refused("routes-trust-fingerprint", "the key does not have the request's fingerprint")
+    trust = {"format": "levain-routes-trust/1", "store_id": req["store_id"], "fingerprint": req["fingerprint"]}
+    routes = _routes_dir(rs, host)
+    with lock():
+        _check_operator("routes-trust", caller_uid, rs)
+        have = _trust_on_disk(routes)
+        if have is not None and have != trust:
+            raise Refused("routes-trust-exists", f"pinned to store {str(have.get('store_id'))[:32]} and key "
+                                                 f"{str(have.get('fingerprint'))[:51]}; rotation is --replace's")
+        pub = (req["public_key"] + "\n").encode("ascii")
+        pair = (("trust.pub", pub), ("trust.json", canon.canonical_bytes(trust)))
+        for name, data in pair:
+            if _trust_file_holds(routes / name, data):
+                continue
+            try:
+                R.write_durably(routes / name, data, mode=0o644, fsync=fsync or gen_mod._full_fsync)
+            except R.NotDurable as e:
+                if name == "trust.pub":
+                    raise Refused("routes-trust-write-failed", f"trust.pub is in place but not durable "
+                                                               f"({e.strerror}); trust.json was not written") from None
+                (err or sys.stderr).write(f"levain install-helper: warning: trust.json written but not durable "
+                                          f"({e.strerror}): it is in force now and may not survive a crash; run it "
+                                          "again\n")
+            except OSError as e:
+                raise Refused("routes-trust-write-failed", f"{name}: {e.strerror or e}") from None
+        for name, data in pair:
+            if not _trust_file_holds(routes / name, data):
+                raise Refused("routes-trust-write-failed", f"{name} does not hold the requested pair when read back "
+                                                           "(bytes, root's owner, 0644)")
+    return {"verb": "routes-trust", "store_id": req["store_id"], "fingerprint": req["fingerprint"],
+            "digest": "sha256:" + hashlib.sha256(pub).hexdigest()}
+
+
 # --- repair's handover: the probe (R3a), the exec (R4), phase B (R4a on) (row 33 §2.2) ---------------------------
 
 #: R3a's bounds [r3: X2-M5]: the probe child's wall clock and the most it may print.
@@ -3024,6 +3273,9 @@ class Seams:
     credential: Callable[..., dict] = run_credential
     #: set-limits (R1 F5): its own branch in :func:`run`, never the install plan's generic path.
     limits: Callable[..., dict] = run_set_limits
+    #: routes-base / routes-trust (3c-9): their own branches in :func:`run`, as set-limits'.
+    routes_base: Callable[..., dict] = run_routes_base
+    routes_trust: Callable[..., dict] = run_routes_trust
     #: repair --source's phase A: its steps (with ``apply``), the probe and the exec into phase B (:func:`repair_handover`).
     handover: Callable[..., None] = repair_handover
     #: [F7] The staged-tree launcher's fault, ``(step id, point)``: set by a test harness, never by :func:`main`'s
@@ -3071,6 +3323,12 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
         # As the credential verbs: no host plan, no pool hold, no live-lease count (a held slot session waits on this
         # very raise); the operator check and the document's check come before the lock, which run_set_limits takes.
         return seams.limits(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err)
+    if cmd.verb == "routes-base":
+        # As set-limits: one root file, no host plan, no pool hold (keys re-reads base.json at every Q).
+        return seams.routes_base(caller_uid, host, lock=lambda: seams.lock(host), err=err)
+    if cmd.verb == "routes-trust":
+        # As set-limits: the request and its fingerprint are checked before the lock, the write under it.
+        return seams.routes_trust(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err)
     with seams.lock(host) as lock_fd:
         gathered = seams.gather(cmd, host, caller_uid)
         try:

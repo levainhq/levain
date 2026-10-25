@@ -981,21 +981,93 @@ def _config_fault_not_done(cmd: str, directory: Path) -> str:
             return "nothing was pinned (no control store was created)"
         return ("whether the store was pinned is not known (it exists, and the fault came after it was opened): read "
                 "it with `levain dispatch config show`")
+    if cmd == "trust":
+        return "whether root pinned the route trust is not known: run `levain dispatch config trust` again"
     return f"nothing was {'signed' if cmd == 'sign' else 'accepted'}; the store was not given an item"
 
 
+def _sudo_routes_trust(data: bytes) -> tuple[int, str, str]:
+    """``sudo <install helper> routes-trust`` with ``data`` on stdin (Q15 r3). sudo reads the password from the
+    terminal, not from the stdin this pipe holds, and gets a fixed PATH and nothing of the operator's environment.
+    127 when the helper is not installed (no slots on this host); sudo that cannot be run answers as root's refusal
+    would, ``sudo-failed``. No timeout: sudo may be waiting on the operator's password."""
+    from levain.slot import SUDO, layout
+
+    helper = str(layout.install_helper_path("darwin" if sys.platform == "darwin" else "linux"))
+    if not os.path.isfile(helper):
+        return 127, "", f"the install helper {helper} is not installed: slots are not set up on this host"
+    try:
+        p = subprocess.run([SUDO, helper, "routes-trust"], input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           check=False, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"})
+    except OSError as e:
+        return 1, '{"ok":false,"refused":"sudo-failed"}\n', f"could not run {SUDO} {helper}: {e.strerror or e}"
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+#: how ``config init`` / ``config trust`` reach root's ``routes-trust`` (a test replaces it)
+ROUTES_TRUST_HELPER: Callable[[bytes], tuple[int, str, str]] = _sudo_routes_trust
+ROUTES_TRUST_REQUEST = "levain-routes-trust-request/1"
+
+
+def _pin_route_trust(store: dctl.ControlStore, *, refuse: bool = True) -> dict[str, Any]:
+    """Q15 r3: hand root the store's three values (``store_id``, the pinned trust root's fingerprint and its public
+    key from the authority log, after the same may-sign-configuration test ``ControlStore.init`` applies) through
+    the install helper's ``routes-trust``, which writes ``L/routes/trust.pub`` and ``trust.json``. Returns
+    ``{"pinned": bool, "refused": <root's refusal name or None>, "why": <text>}``; a key the log no longer allows
+    is a :class:`dctl.ConfigRefused`, or with ``refuse`` False the refusal ``preflight`` (nothing sent to root)."""
+    from levain.contracts.canon import canonical_bytes
+
+    fp, sid = store.trust_root(), store.store_id()
+    snapshot = store._snapshot()
+    problem = dctl._root_problem(snapshot, fp)
+    if problem is not None:
+        if not refuse:
+            return {"pinned": False, "refused": "preflight", "why": problem}
+        raise dctl.ConfigRefused(f"{problem}; the route trust was not pinned")
+    data = canonical_bytes({"format": ROUTES_TRUST_REQUEST, "store_id": sid, "fingerprint": fp,
+                            "public_key": snapshot.key(fp).public_key})
+    rc, stdout, stderr = ROUTES_TRUST_HELPER(data)
+    try:
+        answer = json.loads(stdout.strip().splitlines()[-1]) if stdout.strip() else None
+    except ValueError:
+        answer = None
+    if isinstance(answer, dict) and answer.get("ok") is True:
+        return {"pinned": True, "refused": None, "why": ""}
+    if isinstance(answer, dict) and isinstance(answer.get("refused"), str):
+        return {"pinned": False, "refused": answer["refused"], "why": stderr.strip()[-300:]}
+    return {"pinned": False, "refused": None if rc != 127 else "not-set-up",
+            "why": (stderr.strip() or f"the install helper exited {rc}")[-300:]}
+
+
+def _trust_line(pin: dict[str, Any]) -> str:
+    if pin["pinned"]:
+        return "The route trust is pinned in L/routes (trust.pub, trust.json)."
+    if pin["refused"] == "not-set-up":
+        return ("The route trust is NOT pinned: slots are not set up on this host; after setup, run "
+                "`levain dispatch config trust`.")
+    return (f"The route trust is NOT pinned ({pin['refused'] or 'the helper did not answer'}: {_safe(pin['why'])}); "
+            "dispatch routes are refused until it is. Run `levain dispatch config trust`.")
+
+
 def _change_config(args: argparse.Namespace, cmd: str, d: Path, out: Any, emit: Callable[[Any, str], None]) -> int:
-    """``config init|sign|accept``; a fault after an item reached the store is a :class:`_NotDone` already."""
+    """``config init|trust|sign|accept``; a fault after an item reached the store is a :class:`_NotDone` already."""
     if cmd == "init":
         authority = _authority_source(d, args.data_root)
         dctl.ControlStore.init(d, args.trust_root, authority=authority)
         store = dctl.ControlStore(d, authority=authority)
         sid = store.store_id()
-        emit({"store": str(store.path), "store_id": sid, "trust_root": store.trust_root()},
+        pin = _pin_route_trust(store, refuse=False)    # the store exists now: a refusal is reported beside it
+        emit({"store": str(store.path), "store_id": sid, "trust_root": store.trust_root(), "route_trust": pin},
              f"levain dispatch config: the control store {store.path} (store id {sid}) is pinned to "
-             f"{store.trust_root()}. Sign its first item with `levain dispatch config sign <kind> <body.json> "
-             "--signing-key <that key>` (the verifier item before templates).")
-        return EXIT_OK
+             f"{store.trust_root()}. {_trust_line(pin)} Sign its first item with `levain dispatch config sign "
+             "<kind> <body.json> --signing-key <that key>` (the verifier item before templates).")
+        return EXIT_OK if pin["pinned"] or pin["refused"] == "not-set-up" else EXIT_REFUSED
+    if cmd == "trust":
+        store = _control(args, d)
+        pin = _pin_route_trust(store)
+        emit({"store": str(store.path), "store_id": store.store_id(), "trust_root": store.trust_root(),
+              "route_trust": pin}, f"levain dispatch config: {_trust_line(pin)}")
+        return EXIT_OK if pin["pinned"] else EXIT_REFUSED
     view_out = sys.stderr if args.json else out
     if cmd == "sign":
         body = _read_body(args.body)
@@ -1329,6 +1401,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     data_root(ci)
     cs = csub.add_parser("show", help="The active configuration: store, generation, head and each kind.")
     data_root(cs)
+    ct = csub.add_parser("trust", help="Pin this store's trust root for the route maps again (root's L/routes trust "
+                                       "files), as init does: after slots are set up, or when doctor names them missing.")
+    data_root(ct)
     cg = csub.add_parser("sign", help="Sign a body as the next item of its kind and accept it, after reading it.")
     cg.add_argument("kind", choices=dctl.KINDS)
     cg.add_argument("body", help="The item's body as a JSON file, or - for stdin.")
@@ -1338,5 +1413,5 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ca.add_argument("signature", help="Its SSHSIG signature, as a file.")
     data_root(ca)
     yes(ca)
-    for p in (f, sh, ls, sg, cn, rc, au, ld, ci, cs, cg, ca):
+    for p in (f, sh, ls, sg, cn, rc, au, ld, ci, cs, ct, cg, ca):
         common(p)

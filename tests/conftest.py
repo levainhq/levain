@@ -287,6 +287,19 @@ def _test_team_keys_may_be_file_keys():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_routes_trust_helper():
+    """TEST ONLY: ``levain dispatch config init`` / ``config trust`` hand the route trust to root through
+    ``sudo <install helper> routes-trust`` (``levain.dispatch.cli.ROUTES_TRUST_HELPER``), which on a host with the
+    helper installed would ask for the operator's password. Every test gets a stub answering as a host with no
+    helper; a test of the pin sets its own helper, and the test of the default reads the source."""
+    import levain.dispatch.cli as dcli
+    with pytest.MonkeyPatch.context() as own:   # its own, so a test's ``monkeypatch.undo()`` keeps it
+        own.setattr(dcli, "ROUTES_TRUST_HELPER",
+                    lambda data: (127, "", "the install helper is not installed (the test suite's stub)"))
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_entity_process_latch():
     """`$LEVAIN_ENTITY_PROCESS` is a one-way latch by design (spore-438): opening an entity sets it
     and nothing in levain clears it, because nothing should. A test process opens many entities, so

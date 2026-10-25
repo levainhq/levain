@@ -178,6 +178,7 @@ Restart=always
 RestartSec=1
 RestartSteps=5
 RestartMaxDelaySec=30
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=multi-user.target
@@ -317,7 +318,7 @@ def test_service_exits_without_run_dir(host):
     """§22: a non-root service exits non-zero when its R/ dir is absent or not root-made with the §2.2
     owner, group and mode; KeepAlive / Restart brings it back once the reaper made it."""
     R = str(RUN[host])
-    good = {R: _st(0o755), f"{R}/control": _st(0o750, 3799, 3788)}
+    good = {R: _st(0o755), f"{R}/control": _st(0o2750, 3799, 3788)}
 
     def lstat_from(table):
         def lstat(p):
