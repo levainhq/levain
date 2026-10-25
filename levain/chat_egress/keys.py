@@ -382,8 +382,9 @@ def decide_key(route: RouteSnapshot | None, parsed: Any, *, liveness: Liveness,
     of the route's record AND incarnation: no answer -> `liveness-unreadable`, not live (or another incarnation) ->
     `revoked`; then off (https, 443), a route that never attaches, or a request `advert.key_allowed` keeps keyless
     (a git exchange for an undeclared repo, a walled path, a path holding a `KEYLESS_ESCAPES` escape; R15-17-1) ->
-    `none`; else the value is read and `attached`. `credentials` is the launch's :class:`LaunchCredentials` (one keychain read per record incarnation); anything else, a bare
-    :class:`CredentialStore` included, is a TypeError at the call, before any read."""
+    `none`; else the value is read and `attached`. `credentials` is the launch's :class:`LaunchCredentials` (one
+    keychain read per record incarnation); anything else, a bare :class:`CredentialStore` included, is a TypeError
+    at the call, before any read."""
     if not isinstance(credentials, LaunchCredentials):
         raise TypeError(f"decide_key takes the launch's LaunchCredentials, not {type(credentials).__name__}")
     if parsed.request_id is None:
