@@ -17,6 +17,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `--print`), and `levain cockpit pair --revoke-all` ends every paired device. The pairing page, the devices panel
   and the QR code are not in this release; until they are, a code is claimed by a client calling the route.
 
+### Changed
+- **Levain now requires anneal-memory 1.0.2.** anneal 1.0.2 forms no association links and ignores the affect
+  input; the seed's wrap steps no longer say `prepare_wrap` returns association context, so a fresh install
+  reads its 1.0.2 migration proposal as already reconciled instead of pending.
+
 ### Fixed
 - **The phone server no longer writes its token into its log.** With `--link-file`, the token goes only into that
   0600 file, and the line naming the file is printed only after the file holds the link. Without `--link-file` the
