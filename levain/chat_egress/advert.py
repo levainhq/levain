@@ -22,7 +22,7 @@ a tuple that passed the predicate refreshes it to newest; a reply that fails the
 removes (R15-24-3, R15-26-1). Only the enum `content_type_class` is ever stored about a response (R15-21-3).
 
 Keys (R15-17-1): `key_allowed` is the ONE home of "is this a git exchange that needs a declared repo?" (S6's
-`decide_key` calls it; its own `upload_pack_prefix` is deleted at the integration merge). On a keyed route it narrows
+`keys.decide_key` calls it, and holds no rule of its own). On a keyed route it narrows
 the attach on a GIT EXCHANGE (`git_exchange`: an endpoint or discovery path, a dumb-protocol path under a `*.git`
 segment, or any `service` query; matched case-folded, `;...` stripped per segment, one trailing `/` stripped) to the
 route's declared repo set; it ANDs into classify's `reattached`. A non-git request keeps the snapshot's rule.

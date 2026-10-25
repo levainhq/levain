@@ -204,12 +204,23 @@ def test_r15_21_6_a_redirect_to_an_undeclared_repo_on_a_keyed_host_goes_keyless(
     assert redirected.keyed and redirected.attach == "none" and redirected.credential is None
 
 
-def test_upload_pack_prefix():
-    assert keys.upload_pack_prefix(parse(frame(path=INFO_REFS, query=SVC))) == "/o/r.git"
-    assert keys.upload_pack_prefix(parse(frame(method="POST", path="/o/r.git/git-upload-pack"))) == "/o/r.git"
-    assert keys.upload_pack_prefix(parse(frame(path=INFO_REFS, query="service=git-receive-pack"))) is None
-    assert keys.upload_pack_prefix(parse(frame(path=INFO_REFS))) is None
-    assert keys.upload_pack_prefix(parse(frame(path="/api/x"))) is None
+def test_decide_key_narrows_a_git_exchange_by_advert_key_allowed():
+    """The declared-repo narrowing is `advert.key_allowed`'s (its one home, R15-17-1): every git exchange it reads,
+    not only the two upload-pack shapes, goes keyless for an undeclared repo; a declared one still attaches."""
+    r = _route(repos=("/o/r.git",))
+    for f in (frame(path="/o/other.git/HEAD"),
+              frame(path="/o/other.git/objects/ab/cdef"),
+              frame(path="/o/other.git/info/packs"),
+              frame(path="/o/other.git/info/refs/", query=SVC),
+              frame(path="/o/other.git/INFO/REFS", query=SVC),
+              frame(method="POST", path="/o/other.git/git-upload-pack;x"),
+              frame(path=INFO_REFS, query=SVC + "&" + SVC),
+              frame(path="/api/x", query="service=anything")):
+        d = _decide(r, f)
+        assert d.keyed and (d.attach, d.credential) == ("none", None), f
+    for f in (frame(path=INFO_REFS, query=SVC), frame(method="POST", path="/o/r.git/git-upload-pack"),
+              frame(path="/o/r.git/HEAD"), frame(path="/api/x")):
+        assert _decide(r, f).attach == "attached", f
 
 
 # --- R15-26-2 / R15-28-3: the attach enum and its precedence ------------------------------------------------------
