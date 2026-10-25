@@ -93,6 +93,20 @@ def test_the_queue_broker_imports_neither_the_agent_hooks_nor_the_dispatch_cli()
                        "levain.dispatch.cli"}
 
 
+def test_every_excluded_test_file_exists_is_selected_without_the_table_and_holds_its_evidence():
+    """An entry of NOT_ROOT_TESTS cannot rot: its file exists, the import rule alone would still select it (so the
+    entry still excludes something), and both evidence strings of its reason are where it says."""
+    mods = rc.closure()
+    unfiltered = set(rc._test_files(mods, excluded={}))
+    filtered = set(rc._test_files(mods))
+    assert unfiltered - filtered == set(rc.NOT_ROOT_TESTS)
+    root = Path(__file__).resolve().parents[1]
+    for name, (reason, marker, (other, needle)) in rc.NOT_ROOT_TESTS.items():
+        assert reason and (root / name).is_file(), name
+        assert marker in (root / name).read_text(encoding="utf-8"), (name, marker)
+        assert needle in (root / other).read_text(encoding="utf-8"), (name, other, needle)
+
+
 def test_a_test_with_an_unparseable_helper_is_not_selected(tmp_path, monkeypatch, capsys):
     (tmp_path / "tests").mkdir()
     (tmp_path / "levain" / "slot").mkdir(parents=True)

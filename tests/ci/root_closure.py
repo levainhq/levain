@@ -567,12 +567,39 @@ def _test_deps(path: Path, seen: set):
     return out
 
 
-def _test_files(mods: list) -> list:
+_CONFTEST_EXECUTOR = ("tests/conftest.py", "import test_only_confined_executor")
+_CONFTEST_SIGNERS = ("tests/conftest.py", "def _test_uid_may_own_the_test_signers_file(")
+#: Test files the import rule selects (they import only closure modules) whose 3.9 red says nothing about root, each
+#: -> (reason, a string the test file holds, (a file, a string it holds)): both strings are the reason's evidence and a
+#: test checks them, and that every entry still exists and is still selected without this table, so none can rot. The
+#: job runs with ``--noconftest``, so a file that needs a conftest fixture cannot pass there.
+NOT_ROOT_TESTS = {
+    "tests/test_autonomic_gate_handle.py": ("needs conftest's test_only_confined_executor fixture",
+                                            "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_journal_wiring.py": ("needs conftest's test_only_confined_executor fixture",
+                                               "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_l3_fixes.py": ("its enrolled test key verifies only under conftest's autouse signers-owner "
+                                         "fixture", "confirm_signers", _CONFTEST_SIGNERS),
+    "tests/test_autonomic_l3_r2_fixes.py": ("its enrolled test key verifies only under conftest's autouse "
+                                            "signers-owner fixture", "confirm_signers", _CONFTEST_SIGNERS),
+    "tests/test_autonomic_transport.py": ("its enrolled test key verifies only under conftest's autouse signers-owner "
+                                          "fixture", "confirm_signers", _CONFTEST_SIGNERS),
+    "tests/test_cockpit_k2b_journal.py": ("the test itself calls sqlite3.Connection.setconfig, 3.12+",
+                                          ".setconfig(", ("tests/test_cockpit_k2b_journal.py", ".setconfig(")),
+    "tests/test_consent_queue.py": ("its fixture signs through authority.sign_and_append, whose replay reaches "
+                                    "levain.writes, which imports anneal_memory (not installed for 3.9)",
+                                    "sign_and_append", ("levain/writes.py", "from anneal_memory import")),
+}
+
+
+def _test_files(mods: list, excluded=None) -> list:
     """The test files that import a closure module and import NOTHING of ``levain`` outside the closure (a ``levain``
     package import aside), counting what the ``tests.*`` helpers they import (recursively) import too: the files
     wholly about root-run code. A file that also reaches operator-side code (the CLI, the cockpit, ``tomllib`` users),
     directly or through a helper, is 3.11+ by design and its 3.9 red says nothing about root, so it is left to the
-    3.12/3.13 matrix. A file (or helper) this interpreter cannot parse is skipped for the same reason."""
+    3.12/3.13 matrix. A file (or helper) this interpreter cannot parse is skipped for the same reason, and so is every
+    file of ``excluded`` (default :data:`NOT_ROOT_TESTS`)."""
+    excluded = NOT_ROOT_TESTS if excluded is None else excluded
     inside = set(mods)
     leaf = [m for m in mods if _path(m).name != "__init__.py"]  # a package import says nothing: every test has one
     out = []
@@ -580,7 +607,7 @@ def _test_files(mods: list) -> list:
         names = _test_deps(f, set())
         if names is None:
             print("skipped (3.10+ syntax): " + f.relative_to(ROOT).as_posix(), file=sys.stderr)
-        elif names & set(leaf) and names <= inside:
+        elif names & set(leaf) and names <= inside and f.relative_to(ROOT).as_posix() not in excluded:
             out.append(f.relative_to(ROOT).as_posix())
     return out
 
