@@ -6,6 +6,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+- **Levain now requires anneal-memory 1.0.2.** anneal 1.0.2 forms no association links and ignores the affect
+  input; the seed's wrap steps no longer say `prepare_wrap` returns association context, so a fresh install
+  reads its 1.0.2 migration proposal as already reconciled instead of pending.
+
 ## [0.11.23] — 2026-10-24
 
 ### Added

@@ -84,8 +84,10 @@ def test_doctor_compat_ahead_is_advisory_not_fail(tmp_path, monkeypatch):
     # anneal NEWER than known-good (within the pin) = pip allowed it, install
     # works, update won't downgrade -> advisory-green, never a doctor FAIL.
     _store(tmp_path)
+    major, minor, patch = manifest.version_tuple(manifest.KNOWN_GOOD_ANNEAL)[:3]
+    ahead = f"{major}.{minor}.{patch + 1}"         # derived: a literal goes stale at every floor move
     monkeypatch.setattr(manifest, "discover_installed_set",
-                        lambda *a, **k: _inst(anneal="1.0.1"))
+                        lambda *a, **k: _inst(anneal=ahead))
     monkeypatch.setattr(manifest, "read_lock",
                         lambda _i: CompatSet("0.3.4", manifest.KNOWN_GOOD_ANNEAL, "partnership"))
     results = doctor._check_compat_set(tmp_path)
@@ -383,7 +385,10 @@ _COVERAGE_SENTINELS = {
 #   (`test_base_eager_surface_stays_within_budget`: +120 B for the sentence fails it), so the
 #   sentence is not duplicated into memory.md. Reviewed no-edit (1015+9); if the budget moves,
 #   the entry's suggested_edit can land in memory.md and move to _COVERAGE_SENTINELS.
-_NO_EDIT_REQUIRED = {"AM-PRESERVE-BARE-PATH", "AM-WRAP-GENERATED", "KL-19-OPERATOR-CONSOLIDATES"}
+# - AM-FORMATION-OFF (1.0.2) is a REMOVAL entry (no text to add): its end-state is checked by the
+#   retired-claims loop at the end of test_seed_templates_carry_the_reconciled_guidance ("association
+#   context" joined it with this entry), so it carries no positive sentinel.
+_NO_EDIT_REQUIRED = {"AM-PRESERVE-BARE-PATH", "AM-WRAP-GENERATED", "KL-19-OPERATOR-CONSOLIDATES", "AM-FORMATION-OFF"}
 
 
 def test_seed_templates_carry_the_reconciled_guidance():
@@ -451,7 +456,9 @@ def test_seed_templates_carry_the_reconciled_guidance():
     for retired in ("associative recall goes dark", "that is what forms the Hebbian link",
                     "Co-citing 2+ episodes in one graduation", "allow_unlinked",
                     # anneal 1.0.2 forms no links and ignores affect: the seed teaches two layers and the immune system
-                    "hebbian", "limbic", "affective_state", "four layers", "episode associations"):
+                    "hebbian", "limbic", "affective_state", "four layers", "episode associations",
+                    # anneal 1.0.2 AM-FORMATION-OFF: prepare_wrap returns no association context
+                    "association context", "affect tag", "affect-tag"):
         for name, text in seed_files.items():
             assert retired.lower() not in text.lower(), (
                 f"{name} still teaches the retired claim {retired!r}")
