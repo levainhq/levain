@@ -338,7 +338,8 @@ def test_every_verb_that_stops_or_tightens_a_grant_fences_it(tmp_path, verb):
     elif verb == "replace":
         assert w.store.replace_atomic(w.store.get(b.binding_id), Binding.create(
             created_by="operator", created_at="2026-10-07T10:00:00", trigger=b.trigger, goal=b.goal,
-            tightness=b.tightness, posture=Posture.ABOVE_LOOP, guard=b.guard, status=BindingStatus.ACTIVE))
+            tightness=b.tightness, posture=Posture.ABOVE_LOOP, guard=b.guard, status=BindingStatus.ACTIVE),
+            coverage=lambda binding, rung: True)   # a looser rung below CONFIRM: a policy covers it (14b)
     else:
         w.store.remove(b.binding_id)
     assert w.journal.generation(b.binding_id) == before + 1          # mirrored into the journal
@@ -1181,7 +1182,7 @@ def test_the_store_is_one_private_directory_with_durable_settings(tmp_path):
         assert conn.execute("PRAGMA fullfsync").fetchone()[0] == 1
         names = {p.name for p in store_dir.iterdir()}
         assert {"autonomic.db", "autonomic.db-wal", "autonomic.db-shm"} <= names
-    assert w.journal.db.meta("format") == "levain-autonomic/1"
+    assert w.journal.db.meta("format") == "levain-autonomic/2"
     assert sqlite3.connect(store_dir / "autonomic.db").execute(
         "SELECT COUNT(*) FROM holds").fetchone()[0] == 1
 
