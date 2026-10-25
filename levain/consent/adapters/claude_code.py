@@ -213,28 +213,50 @@ def _absolute_root(root: Any) -> str | None:
         return None
 
 
-def protected_paths(queue_dir: Path, settings: AdapterSettings) -> tuple[Path, ...]:
+def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path | None = None,
+                    cwd: str | None = None) -> tuple[Path, ...]:
     """What the adapter itself trusts, so a file tool writing any of it is agent config (codex Q2 r1 #1): the
     queue directory (the adapter settings and the queue database live in it); the whole levain home, the
-    directory the confinement floor denies (:func:`levain.firing.confinement.levain_home_base`, one derivation
-    for both), so a write to the autonomic binding store or any other operator state there is a tagged request
-    (14b Q5); and, when a cockpit data root is configured, its authority database (and sqlite's sidecars) and the
-    authority anchor. A levain home that is the user's home or holds it is named by its state directories
-    instead (:data:`levain.firing.confinement.LEVAIN_HOME_STATE_DIRS`, the floor's fallback list), or every file
-    in the home would be agent config. Bash is still never parsed: a shell write there is not tagged here."""
-    from levain.firing.confinement import LEVAIN_HOME_STATE_DIRS, levain_home_base   # lazy: the floor's module
-
-    out = [Path(os.path.abspath(queue_dir))]
-    user_home = Path.home()
-    base = levain_home_base(user_home)
-    holds_home = any(Path(h).is_relative_to(b) for h in (os.path.normpath(user_home), os.path.realpath(user_home))
-                     for b in (os.path.normpath(base), os.path.realpath(base)))
-    out += [base / name for name in LEVAIN_HOME_STATE_DIRS] if holds_home else [base]
+    directory the confinement floor denies (:func:`levain.firing.confinement.levain_home_spellings`, one
+    derivation for both), so a write to the autonomic binding store or any other operator state there is a tagged
+    request (14b Q5); and, when a cockpit data root is configured, its authority database (and sqlite's sidecars)
+    and the authority anchor. ``home`` is the one :func:`targets_agent_config` expands ``~`` under (default the
+    user's); ``cwd``, when absolute, stands in for the workspace. A levain home the floor's own predicate finds too
+    wide to deny whole (:func:`levain.firing.confinement.too_wide_to_deny`: a filesystem root, a path of two parts
+    or fewer, a shared temp directory, or one holding the home or the cwd) is named by its state directories instead
+    (:data:`levain.firing.confinement.LEVAIN_HOME_STATE_DIRS`, the floor's fallback list), or every file under it
+    would be agent config. Never raises on the levain home: one that cannot be resolved is ``<home>/.levain``
+    (fail closed for the store, never an outage of every tool). Bash is still never parsed: a shell write there
+    is not tagged here."""
+    out = [Path(os.path.abspath(queue_dir)), *_levain_home_protected(home, cwd)]
     if settings.cockpit_data_root:
         root = Path(settings.cockpit_data_root)
         db = root / "cockpit.db"
         out += [db, *(Path(f"{db}{s}") for s in ("-wal", "-shm", "-journal")), anchor_path(root).parent]
     return tuple(out)
+
+
+def _levain_home_protected(home: Path | None, cwd: str | None) -> list[Path]:
+    """:func:`protected_paths`' share of the levain home."""
+    from levain.firing.confinement import LEVAIN_HOME_STATE_DIRS, levain_home_spellings, too_wide_to_deny  # lazy
+
+    try:
+        user_home = Path(home) if home is not None else Path.home()
+        base, spellings = levain_home_spellings(user_home)
+        within = (Path(cwd),) if isinstance(cwd, str) and os.path.isabs(cwd) else ()
+        if any(too_wide_to_deny(d, user_home, *within) for d in spellings):
+            return [base / name for name in LEVAIN_HOME_STATE_DIRS]
+        return [base]
+    except Exception:  # noqa: BLE001 - any failure: the default home, never a raise
+        pass
+    try:
+        user_home = Path(home) if home is not None else Path.home()
+    except Exception:  # noqa: BLE001 - no $HOME: the password database's
+        try:
+            user_home = operator_home()
+        except Exception:  # noqa: BLE001 - no home at all: nothing there to protect
+            return []
+    return [Path(os.path.abspath(user_home / ".levain"))]
 
 
 # --- ruling 3b item 1: agent config and hooks ----------------------------------------------------------------
@@ -802,11 +824,11 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     the event's ``permission_mode`` as ``posture`` (``None`` when absent: no grant matches) and the tool input the
     request was filed for, and never for a request filed at :data:`AGENT_CONFIG_TIER`: a direct caller cannot
     bypass ruling 3b item 1. What
-    the adapter trusts (:func:`protected_paths`) is taken from ``queue.directory`` and ``settings`` here, never
-    from the caller, so no call can leave it out; a queue without a directory raises before anything is filed."""
+    the adapter trusts (:func:`protected_paths`) is taken from ``queue.directory``, ``settings``, ``home`` and the
+    event's cwd here, never as a list from the caller, so no call can leave it out; a queue without a directory
+    raises before anything is filed."""
     if getattr(queue, "directory", None) is None:
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
-    protected = protected_paths(Path(queue.directory), settings)
     deadline = clock() + max(0.0, float(max_hold)) - CLEANUP_RESERVE
     if not isinstance(event, Mapping) or event.get("hook_event_name") != EVENT:
         return None
@@ -825,6 +847,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     posture = mode if isinstance(mode, str) and mode else None
     if policy is None and nothing_can_decide(settings):
         return None
+    protected = protected_paths(Path(queue.directory), settings, home=home, cwd=cwd)
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected)
     if agent_config and unconfined(cwd, home=home):
         return None  # an unconfined session (Q10 D2): its dialog answers, as the gate left the call to its mode (L1-7)
@@ -1388,7 +1411,8 @@ def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSett
                        notify=lambda text: notify(settings, text, cwd=queue.directory), resume=resume_meta_of(event))
     if got.go:
         if got.extended and gate_class(tool_name, tool_input, cwd, home=home,
-                                       protected=protected_paths(Path(queue.directory), settings)) is not None:
+                                       protected=protected_paths(Path(queue.directory), settings, home=home,
+                                                                 cwd=cwd)) is not None:
             return _pre("deny", limits.retry_text(got.extended))
         return None
     stop = {"continue": False, "stopReason": "levain: stopped by a budget the operator set; it goes on when he "
@@ -1467,7 +1491,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         return gate_output(decision)
 
     tier = gate_class(tool_name, tool_input, cwd, home=home,
-                      protected=protected_paths(Path(queue.directory), settings))
+                      protected=protected_paths(Path(queue.directory), settings, home=home, cwd=cwd))
     if tier is None:
         return None
     what = _what(tool_name, tool_input)
@@ -1556,7 +1580,7 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
         tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
         if not isinstance(tool_name, str) or not isinstance(cwd, str) or not cwd:
             return None
-        tier = gate_class(tool_name, tool_input, cwd, protected=protected_paths(queue_dir, settings))
+        tier = gate_class(tool_name, tool_input, cwd, protected=protected_paths(queue_dir, settings, cwd=cwd))
         what = _what(tool_name, tool_input)
     except Exception:
         tier, what = "irreversible", "this call"

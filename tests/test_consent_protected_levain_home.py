@@ -114,3 +114,107 @@ def test_the_real_gate_denies_a_write_to_the_binding_store_when_nothing_can_deci
     out = io.StringIO()
     cc.main([], stdin=io.StringIO(json.dumps(ev)), stdout=out)
     assert out.getvalue() == ""
+
+
+# --- L3 r1 (1025+10 A_RULINGS_L3R1): one fallback predicate for the floor and the adapter; never raise; the
+# injected home ---
+
+def _case(kind, lhome, tmp_path):
+    """(``$LEVAIN_HOME``, the event cwd) for each home the floor cannot deny whole."""
+    if kind == "workspace":
+        ws = tmp_path / "ws"
+        (ws / "proj").mkdir(parents=True)
+        return str(ws), str(ws / "proj")
+    return {"root": "/", "tmp": "/tmp", "var_tmp": "/var/tmp", "two_parts": "/lane14b-two-parts",
+            "home": str(lhome)}[kind], "/work/proj"
+
+
+@pytest.mark.parametrize("kind", ["root", "tmp", "var_tmp", "two_parts", "home", "workspace"])
+def test_a_levain_home_the_floor_cannot_deny_whole_falls_back_in_the_adapter_too(lhome, tmp_path, monkeypatch,
+                                                                                  kind):
+    """The floor's fallback (``_hides_the_entity``: a filesystem root, two path parts or fewer, a shared temp dir, or
+    a directory holding the home or the workspace) is the adapter's: the state directories are agent config, an
+    unrelated file under the same directory is not."""
+    lh, cwd = _case(kind, lhome, tmp_path)
+    monkeypatch.setenv("LEVAIN_HOME", lh)
+    base = Path(os.path.abspath(lh))
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), cwd=cwd)
+    assert base not in got
+    assert {base / name for name in LEVAIN_HOME_STATE_DIRS} <= set(got)
+    unrelated = str(Path(cwd) / "src" / "app.py") if kind == "workspace" else str(base / "lane14b-unrelated.txt")
+    assert not cc.targets_agent_config("Write", {"file_path": unrelated, "content": "x"}, cwd, home=lhome,
+                                       protected=got)
+    assert cc.targets_agent_config("Write", {"file_path": str(base / "autonomic" / "autonomic.db"), "content": "x"},
+                                   cwd, home=lhome, protected=got)
+
+
+def test_the_floor_and_the_adapter_share_one_fallback_predicate(lhome, tmp_path, monkeypatch):
+    """One function decides for both: forced true, the floor's ``_hides_the_entity`` and the adapter both fall back
+    for an ordinary levain home."""
+    from levain.firing import confinement as cf
+
+    ordinary = tmp_path / "state" / "lv"
+    monkeypatch.setenv("LEVAIN_HOME", str(ordinary))
+    assert ordinary in cc.protected_paths(tmp_path / "q", cc.AdapterSettings())
+    monkeypatch.setattr(cf, "too_wide_to_deny", lambda d, home, *within: True)
+    assert cf._hides_the_entity(ordinary, lhome, tmp_path / "e", tmp_path / "e" / "workspace")
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings())
+    assert ordinary not in got and ordinary / "autonomic" in got
+
+
+def test_protected_paths_does_not_raise_on_an_unresolvable_levain_home(lhome, tmp_path, monkeypatch):
+    """It fails closed for the store, never an outage of every tool: the default levain home plus the queue dir."""
+    monkeypatch.setenv("LEVAIN_HOME", "~lane14b_no_such_user/lv")
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings())
+    assert Path(os.path.abspath(tmp_path / "q")) in got
+    assert lhome / ".levain" in got
+
+
+def test_protected_paths_does_not_raise_when_the_home_cannot_be_found(lhome, tmp_path, monkeypatch):
+    def no_home(cls):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "home", classmethod(no_home))
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings())
+    assert Path(os.path.abspath(tmp_path / "q")) in got
+    assert cc.operator_home() / ".levain" in got
+
+
+def test_an_unresolvable_levain_home_denies_no_read_and_still_gates_the_store(lhome, tmp_path, monkeypatch):
+    """The hook entry over an explicit queue: before the fix the gate raised, ``gate_failed`` raised again on the
+    same derivation and denied every call, a Read too."""
+    qdir = tmp_path / "q"
+    monkeypatch.setenv("LEVAIN_HOME", "~lane14b_no_such_user/lv")
+    ev = {"session_id": "s-1", "transcript_path": "/x.jsonl", "cwd": str(lhome), "permission_mode": "bypassPermissions",
+          "hook_event_name": cc.GATE_EVENT, "tool_name": "Read", "tool_input": {"file_path": str(lhome / "a.txt")},
+          "tool_use_id": "toolu_1"}
+    out = io.StringIO()
+    assert cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(ev)), stdout=out) == 0
+    assert out.getvalue() == ""
+    ev["tool_name"], ev["tool_input"] = "Write", {"file_path": str(lhome / ".levain" / "autonomic" / "autonomic.db"),
+                                                  "content": "x"}
+    out = io.StringIO()
+    cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(ev)), stdout=out)
+    assert json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_protected_paths_takes_the_injected_home(lhome, tmp_path):
+    alt = tmp_path / "alt"
+    (alt / ".levain").mkdir(parents=True)
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), home=alt)
+    assert alt / ".levain" in got
+    assert lhome / ".levain" not in got
+
+
+def test_the_gate_protects_the_levain_home_of_the_home_it_was_given(lhome, tmp_path):
+    """``gate(home=...)``: the store under the injected home is agent config, as ``targets_agent_config`` already
+    expands ``~`` under that home."""
+    alt = tmp_path / "alt"
+    (alt / ".levain").mkdir(parents=True)
+    qdir = tmp_path / "q"
+    settings = cc.AdapterSettings()
+    ev = {"session_id": "s-1", "transcript_path": "/x.jsonl", "cwd": str(alt), "permission_mode": "bypassPermissions",
+          "hook_event_name": cc.GATE_EVENT, "tool_name": "Write",
+          "tool_input": {"file_path": "~/.levain/autonomic/autonomic.db", "content": "x"}, "tool_use_id": "toolu_1"}
+    out = cc.gate(ev, cc._queue_for(qdir, settings), settings, home=alt)
+    assert out is not None and out["hookSpecificOutput"]["permissionDecision"] == "deny"
