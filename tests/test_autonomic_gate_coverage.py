@@ -18,7 +18,7 @@ import pytest
 
 import levain.autonomic.gate as gate_module
 from levain.autonomic import (
-    ActionManifest, ActionRequest, ActionRisk, Binding, BindingStatus, BindingStore, ChainExecutor,
+    ActionManifest, ActionRisk, Binding, BindingStatus, BindingStore, ChainExecutor,
     ConfirmDecision, EfferentGate, FireDispatcher, GateReceiptStore, Guard, PendingActionStore, Posture,
     RiskClass, RunJournal, RunRef, SubGoal, TriggerSpec, hold_id_for, manual_invocation,
 )
@@ -154,10 +154,11 @@ def test_a_covered_cooling_off_hold_fires_on_silence(tmp_path):
 
 
 def test_a_lowered_pending_posture_resolves_at_confirm(tmp_path):
-    # the sealed binding is CONFIRM; a writer re-seals its run's pending at COOLING_OFF. Uncovered, the
-    # clamp puts it back at CONFIRM, whose silence default is a drop.
+    # the sealed binding is CONFIRM; a writer re-seals the pending of its run's first link (not the terminal one,
+    # whose sealed rung the resolve re-derives itself) at COOLING_OFF. Uncovered, the clamp puts it back at
+    # CONFIRM, whose silence default is a drop.
     w = CWorld(tmp_path, auto_fire=frozenset({"link0"}))
-    b = w.mint(Posture.CONFIRM)
+    b = w.mint(Posture.CONFIRM, chain=True)
     w.plant_hold(b, "link0")
     [out] = w.sweep()
     assert not out.fired and out.reason == "denied:cover:none" and w.outbox() == []
@@ -315,10 +316,11 @@ def test_a_transient_refresh_failure_leaves_the_manual_pending_open(tmp_path):
     src = _covering("link0")
     w, p = _manual(tmp_path, src)
     src.fail_refresh = True
-    assert w.sweep() == []                                   # not a decision: nothing claimed
+    within = FIXED + _dt.timedelta(minutes=90)               # expired, and less than a window past it
+    assert w.sweep(within) == []                             # not a decision: nothing claimed
     assert w.pending.get(p.pending_id) is not None and w.outbox() == []
     src.fail_refresh = False
-    [out] = w.sweep()
+    [out] = w.sweep(within)
     assert out.fired and w.outbox() == ["link0"]
 
 

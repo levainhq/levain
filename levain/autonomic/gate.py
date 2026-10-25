@@ -152,6 +152,18 @@ def _risk_fence(manifest_risk: ActionRisk | None, binding_risk: ActionRisk | Non
     return "fence-" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+_FAMILY_UNREADABLE = "clamp:binding_family_unreadable"
+
+
+class _FamilyUnreadable(Exception):
+    """:func:`binding_family` raised on a binding the clamp reads: that binding's effect is refused by name."""
+
+
+def _is_terminal(binding: Binding, effect_id: Any) -> bool:
+    """Whether ``effect_id`` names the last link of ``binding``'s goal chain, the one its sealed rung binds."""
+    return effect_id == f"link-{len(binding.goal) - 1}"
+
+
 @dataclass(frozen=True)
 class _Fence:
     """The fence an effect's rung was decided under (``value``) and how to read it again at admission, in
@@ -646,20 +658,21 @@ class EfferentGate:
 
         # 2b. the graduation clamp (14b DESIGN_REV3 §4, DESIGN_REV3_1 D4 (a)): a binding's link, terminal or
         # intermediate, whose rung is below CONFIRM runs there only while a live anchored policy signs its
-        # action at the manifest's risk for it; uncovered, it runs at CONFIRM. A terminal link's rung must be
-        # the sealed binding's (``ratified_posture_mismatch``); below CONFIRM a forged rung buys nothing the
-        # clamp does not allow anyway.
+        # action at the manifest's risk for it; uncovered, it runs at CONFIRM. A ``ratified_posture`` must be
+        # the sealed binding's rung, carried by its terminal link, at every rung (checked after the kill, 3b).
+        binding: Binding | None = None
+        sealed_refusal: str | None = None
+        if request.ratified_posture is not None:
+            binding, sealed_refusal = self._ratified_refusal(request)
         cover: str | None = None
         if posture < Posture.CONFIRM and self._clamps(request.authority):
-            binding = self._binding_or_none(request.authority.binding_id, request.continuation, None)
-            if (binding is not None and request.ratified_posture is not None
-                    and binding.posture is not request.ratified_posture):
-                _log.warning("efferent gate REFUSE: %r carries ratified_posture %s, its sealed binding %s",
-                             request.action_name, request.ratified_posture.name, binding.posture.name)
-                return self._deny(request, created_at, Posture.REFUSE_ESCALATE, "ratified_posture_mismatch",
-                                  cancel=False)
-            posture, cover = self._clamp(posture, self._effect(request.action_name, manifest_risk,
-                                                               request.risk, binding))
+            if binding is None and sealed_refusal is None:
+                binding = self._binding_or_none(request.authority.binding_id, request.continuation, None)
+            try:
+                effect = self._effect(request.action_name, manifest_risk, request.risk, binding)
+            except _FamilyUnreadable:
+                return self._deny(request, created_at, Posture.REFUSE_ESCALATE, _FAMILY_UNREADABLE, cancel=False)
+            posture, cover = self._clamp(posture, effect)
 
         # 3. the KNOWN-danger kill (Slice 4 — the first runtime consumer of the 3a.5 kill substrate,
         # closing codex's 3a.5 L3 finding #1) — evaluated BEFORE the §1.5 screen (complement L3): a
@@ -676,6 +689,14 @@ class EfferentGate:
             _log.warning("efferent gate KILL: known-danger kill on %r — %s", request.action_name, kill_reason)
             return self._kill(request, created_at, posture, kill_by, request.actor_first_estimate,
                               reason=kill_reason)
+
+        # 3b. a ``ratified_posture`` other than the sealed binding's, on a link other than its terminal one, or
+        # whose binding cannot be read: refused at every rung, after the kill so a kill-worthy trigger still
+        # gets its KILL receipt. Not a run's end: the request, not the run, is what is wrong.
+        if sealed_refusal is not None:
+            _log.warning("efferent gate REFUSE: %r carries ratified_posture %s (%s)", request.action_name,
+                         request.ratified_posture.name if request.ratified_posture else None, sealed_refusal)
+            return self._deny(request, created_at, Posture.REFUSE_ESCALATE, sealed_refusal, cancel=False)
 
         # 4. the §1.5 refuse stack (confidence + groundedness + injection) — require confidence iff
         # autonomous. Scan the FULL trigger surface (the action payload AND the proposal/query text that
@@ -843,11 +864,17 @@ class EfferentGate:
         signature by an enrolled key over :meth:`confirm_challenge`; without one it is refused and the
         decision stays open. ``decision.first_estimate`` is the operator's forced pre-truth read → the
         receipt's ``actor_first_estimate``."""
+        return self._resolve_pending(pending_id, decision, chain_owned=chain_owned)
+
+    def _resolve_pending(self, pending_id: str, decision: ConfirmDecision, *, chain_owned: bool = False,
+                         at: _dt.datetime | None = None) -> GateOutcome:
+        """:meth:`resolve`; ``at`` is the sweep's time, which a manual pending is adjudicated at instead of a
+        clock read (RULINGS_R2 1)."""
         try:
             hold = self._journal.find_pending(pending_id) if self._journal is not None else None
             if hold is not None:
                 return self._resolve_hold(hold, decision, chain_owned=chain_owned)
-            return self._resolve_manual(pending_id, decision)
+            return self._resolve_manual(pending_id, decision, at)
         except Exception as e:  # noqa: BLE001 — resolve, like gate, never raises into the caller
             _log.error("efferent gate resolve UNEXPECTED error (%s): %s — failing closed",
                        type(e).__name__, e)
@@ -1122,9 +1149,11 @@ class EfferentGate:
         except (KeyError, TypeError, ValueError, AttributeError):
             return None
 
-    def _resolve_manual(self, pending_id: str, decision: ConfirmDecision) -> GateOutcome:
+    def _resolve_manual(self, pending_id: str, decision: ConfirmDecision,
+                        at: _dt.datetime | None = None) -> GateOutcome:
         """A manual (non-journaled) pending: claimed from the pending store FIRST (the claim is the
-        at-most-once gate), then fired or dropped."""
+        at-most-once gate), then fired or dropped. It is adjudicated at ONE time, ``at`` (the sweep's) or
+        else one clock read, taken before the claim (RULINGS_R2 1)."""
         if self._pending_store is None:
             return GateOutcome(
                 posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
@@ -1149,16 +1178,37 @@ class EfferentGate:
                     posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
                     reason="confirm:not_signed_by_an_enrolled_key", receipt_id=None, execution=None,
                 )
-        # An unattended approval is screened the same way while the coverage it needs cannot be read (R9 A1):
-        # a failed refresh leaves the pending open for the next sweep instead of spending it on a deny. The
-        # check that counts runs AFTER the claim, on the record claimed (``_manual_cover_refusal``).
+        # The one adjudication time (RULINGS_R2 1), read before the claim: nothing after the claim reads the clock,
+        # so a clock that fails cannot spend the pending.
+        now: _dt.datetime | None = at
+        if now is None:
+            try:
+                now = self._clock()
+            except Exception as e:  # noqa: BLE001 — no time: nothing can be decided now
+                _log.error("efferent gate resolve: clock FAILED (%s): %s — %s left open",
+                           type(e).__name__, e, pending_id)
+        # An unattended approval of a pending that exists (RULINGS_R2 2) reads its coverage ONCE, here, before the
+        # claim (RULINGS_R1 2): that one view is what the check after the claim judges (``_manual_cover_refusal``,
+        # which only peeks to re-check it). With no time, or while the coverage cannot be read (R9 A1), the pending
+        # is left open for the next sweep instead of spent on a deny, until it is a whole window past its expiry:
+        # then it is claimed and denied, so it never fires late (RULINGS_R0, ``cover:unreadable``).
+        view: CoverageView | None = None
+        unreadable = False
         if decision.approved and decision.by != "human":
             looked_up = self._pending_store.get(pending_id)
-            if looked_up is not None and self._manual_cover_unavailable():
-                return GateOutcome(
-                    posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
-                    reason="cover:unavailable", receipt_id=None, execution=None,
-                )
+            if looked_up is not None:
+                if now is not None:
+                    view, unreadable = self._manual_cover_read()
+                if now is None or (unreadable and not self._past_cover_grace(looked_up, now)):
+                    return GateOutcome(
+                        posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
+                        reason="cover:unavailable", receipt_id=None, execution=None,
+                    )
+        if now is None:
+            return GateOutcome(
+                posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
+                reason="clock:unavailable", receipt_id=None, execution=None,
+            )
         pending = self._pending_store.claim(pending_id)
         if pending is None:
             # already claimed/resolved/swept, or never existed — nothing to fire; surface, don't crash.
@@ -1167,7 +1217,7 @@ class EfferentGate:
                 posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
                 reason="unknown_pending", receipt_id=None, execution=None,
             )
-        created_at = self._clock().isoformat()  # the receipt records WHEN the decision was made
+        created_at = now.isoformat()  # the receipt records WHEN the decision was made
 
         # INTEGRITY: the claimed record must still match its content-fingerprint id (L3 codex H1/H2 +
         # complement MED-1). A mismatch ⇒ a field was altered after propose (tampered/corrupt/drifted) ⇒
@@ -1223,7 +1273,8 @@ class EfferentGate:
         # RISEN above the posture the human saw, and that the payload still passes the §1.5 screen (a
         # tampered/injection payload fires NOTHING). A guard failure denies (records a denied receipt).
         guard = self._guard_resolve_fire(pending, posture, decision)
-        if guard is None and decision.by != "human" and not self._unattended_approval_allowed(pending, posture):
+        if (guard is None and decision.by != "human"
+                and not self._unattended_approval_allowed(pending, posture, now)):
             guard = "unattended_approval_not_allowed"
         if guard is not None:
             return self._deny_fields(
@@ -1235,9 +1286,10 @@ class EfferentGate:
             )
         if decision.by != "human":
             # DESIGN_REV3_1 D1: an unattended manual effect runs below CONFIRM only under a live anchored
-            # policy covering it now, read here, after the claim and immediately before the fire. A conjunct
-            # beside ``_unattended_approval_allowed``, never inside it (that also serves the journal's check).
-            refusal = self._manual_cover_refusal(pending, posture)
+            # policy covering it now: the view read before the claim, judged at the adjudication time and re-checked
+            # by a peek, after the claim and immediately before the fire. A conjunct beside
+            # ``_unattended_approval_allowed``, never inside it (that also serves the journal's check).
+            refusal = "cover:unreadable" if unreadable else self._manual_cover_refusal(pending, posture, view, now)
             if refusal is not None:
                 _log.warning("efferent gate resolve: unattended %r on %s not covered (%s) — denied",
                              pending.action_name, pending_id, refusal)
@@ -1278,8 +1330,9 @@ class EfferentGate:
                          hold: dict[str, Any]) -> tuple[Posture | None, str | None, str | None]:
         """The rung a run's pending (a binding's) must be approved at now: ``max(posture, the sealed
         floor, the manifest's current floor for the action if it declares one, the floor of the
-        binding's tools now)``, with why when that rung is REFUSE_ESCALATE because something could not
-        be re-derived (fail closed to the highest rung, never the lowest), and the risk FENCE of the
+        binding's tools now, and for the binding's terminal link its sealed posture)``, with why when that
+        rung is REFUSE_ESCALATE because something could not be re-derived (fail closed to the highest rung,
+        never the lowest) or the sealed posture raised it, and the risk FENCE of the
         inputs it was derived from (one read: the fence and the rung cannot disagree). A run's pending
         without a sealed floor is one of those. ``(None, why, None)`` when the registry the risk is
         re-derived from cannot be read now: no rung, and no decision, until it can.
@@ -1306,10 +1359,22 @@ class EfferentGate:
         binding, now, why = self._binding_risk_now(binding_id, hold["effect_id"], hold.get("chain"))
         if now is None:
             return (None if why == _REGISTRY_UNREADABLE else Posture.REFUSE_ESCALATE), why, None, False
+        if binding is None:
+            # a risk with no binding it was derived from: fail closed by name (RULINGS_R2 3; never an ``assert``,
+            # which ``python -O`` removes)
+            return Posture.REFUSE_ESCALATE, "revalidate:binding_risk_unavailable:binding", None, False
         rung = max(posture, floor, risk_floor(now))
+        sealed_why: str | None = None
+        if _is_terminal(binding, hold["effect_id"]) and binding.posture > rung:
+            # the terminal link's ratified rung is the sealed binding's, whatever the pending says (RULINGS_R1 1)
+            rung, sealed_why = binding.posture, "revalidate:sealed_posture"
         if rung >= Posture.CONFIRM:
-            return rung, None, _risk_fence(manifest_risk, now), False
-        rung, cover = self._clamp(rung, self._effect(pending.action_name, manifest_risk, now, binding))
+            return rung, sealed_why, _risk_fence(manifest_risk, now), False
+        try:
+            effect = self._effect(pending.action_name, manifest_risk, now, binding)
+        except _FamilyUnreadable:
+            return Posture.REFUSE_ESCALATE, _FAMILY_UNREADABLE, None, False
+        rung, cover = self._clamp(rung, effect)
         return rung, ("cover:none" if cover == COVER_NONE else None), _risk_fence(manifest_risk, now, cover), True
 
     def _manifest_risk(self, action_name: str) -> ActionRisk | None:
@@ -1415,9 +1480,34 @@ class EfferentGate:
         """The effect the clamp judges: the action that runs, the manifest's risk for it (``None``: not
         declared, so covered by nothing), the binding's tools risk, and the trigger type and family read from
         the binding (honest-config; ``None`` when there is no binding to read)."""
+        family: str | None = None
+        if binding is not None:
+            try:
+                family = binding_family(binding)
+            except Exception as e:  # noqa: BLE001 — that binding's effect is refused by name (RULINGS_R1 3)
+                _log.error("efferent gate: no family for binding %s (%s): %s", binding.binding_id,
+                           type(e).__name__, e)
+                raise _FamilyUnreadable(binding.binding_id) from e
         return Effect(action_name=action_name, action_risk=action_risk, tools_risk=tools_risk,
-                      trigger_type=binding.trigger.type if binding is not None else None,
-                      family=binding_family(binding) if binding is not None else None)
+                      trigger_type=binding.trigger.type if binding is not None else None, family=family)
+
+    def _ratified_refusal(self, request: ActionRequest) -> tuple[Binding | None, str | None]:
+        """A request's ``ratified_posture`` checked against the sealed binding it names, read from the registry or
+        the chain continuation (RULINGS_R1 1): ``(binding, None)`` when it is that binding's rung and the request
+        is its terminal link, else why it is refused: ``ratified_posture_unverifiable`` (no sealed binding
+        reads) or ``ratified_posture_mismatch``."""
+        try:
+            binding, _ = self._read_binding(request.authority.binding_id, request.continuation, None)
+        except Exception as e:  # noqa: BLE001 — a rung no sealed binding confirms buys nothing
+            _log.warning("efferent gate: binding %s unreadable for its ratified rung (%s): %s",
+                         request.authority.binding_id, type(e).__name__, e)
+            binding = None
+        if binding is None:
+            return None, "ratified_posture_unverifiable"
+        effect_id = request.run.effect_id if request.run is not None else None
+        if binding.posture is not request.ratified_posture or not _is_terminal(binding, effect_id):
+            return binding, "ratified_posture_mismatch"
+        return binding, None
 
     def _coverage_view(self) -> CoverageView | None:
         """``refresh()`` of the coverage source, outside any store transaction: the coverage a decision is
@@ -1431,14 +1521,15 @@ class EfferentGate:
             _log.error("efferent gate: coverage refresh RAISED (%s): %s — uncovered", type(e).__name__, e)
             return None
 
-    def _cover_peek(self, effect: Effect) -> str:
-        """The cover value ``peek`` gives ``effect`` now: :data:`~levain.autonomic.coverage.COVER_NONE`
-        with no source wired (as the decision gave), :data:`~levain.autonomic.coverage.COVER_MOVED` when the
-        source raised or answered no value (it equals no decided fence, so the effect is decided again)."""
+    def _cover_peek(self, effect: Effect, now: _dt.datetime | None = None) -> str:
+        """The cover value ``peek`` gives ``effect`` at ``now`` (a clock read when not given):
+        :data:`~levain.autonomic.coverage.COVER_NONE` with no source wired (as the decision gave),
+        :data:`~levain.autonomic.coverage.COVER_MOVED` when the source or the clock raised or the source answered
+        no value (it equals no decided fence, so the effect is decided again)."""
         if self._coverage is None:
             return COVER_NONE
         try:
-            value = self._coverage.peek(effect, self._clock())
+            value = self._coverage.peek(effect, now if now is not None else self._clock())
         except Exception as e:  # noqa: BLE001 — forces a re-decide
             _log.warning("efferent gate: coverage peek RAISED (%s): %s", type(e).__name__, e)
             return COVER_MOVED
@@ -1459,26 +1550,47 @@ class EfferentGate:
         rung, value = operative(candidate, effect, view, now)
         return rung, (value if value is not None else COVER_NONE)
 
-    def _manual_cover_unavailable(self) -> bool:
-        """R9 A1, the screen before a manual pending is claimed for an unattended approval: whether the
-        coverage cannot be read now (a source is wired and its refresh failed). Such a pending is left
-        open, unclaimed, for the next sweep. Coverage that reads and covers nothing is not this: that pending
-        is claimed and denied (``cover:none``)."""
+    def _manual_cover_read(self) -> tuple[CoverageView | None, bool]:
+        """The one coverage read of an unattended manual resolve, before its claim (R9 A1, RULINGS_R1 2): the
+        view (``None`` with no source wired, which covers nothing) and whether the coverage cannot be read (a
+        source is wired and its refresh failed). Coverage that reads and covers nothing (no source wired
+        included) is readable: that pending is claimed and denied (``cover:none``)."""
         if self._coverage is None:
-            return False
+            return None, False
         view = self._coverage_view()
-        return view is None or isinstance(view, Uncovered)
+        return view, view is None or isinstance(view, Uncovered)
 
-    def _manual_cover_refusal(self, pending: PendingAction, posture: Posture) -> str | None:
-        """DESIGN_REV3_1 D1, on a claimed manual pending an unattended approval would fire: ``None`` only
-        when a live anchored policy covers ``Effect(action, its manifest risk, None, None, None)`` at a rung
-        no stricter than ``posture``, and the peek that follows the refresh gives the same cover value.
+    @staticmethod
+    def _past_cover_grace(pending: PendingAction, now: _dt.datetime) -> bool:
+        """RULINGS_R0's bound on leaving a manual pending open while its coverage cannot be read: true once
+        ``now`` is a whole window (``expires_at - created_at``) past ``expires_at``, and when those cannot be
+        read (the deny is the closed side)."""
+        try:
+            created = _dt.datetime.fromisoformat(pending.created_at)
+            expires = _dt.datetime.fromisoformat(pending.expires_at or "")
+            bound = expires + max(expires - created, _dt.timedelta(0))
+            if (bound.tzinfo is None) != (now.tzinfo is None):
+                if bound.tzinfo is None:
+                    bound = bound.replace(tzinfo=now.tzinfo)
+                else:
+                    now = now.replace(tzinfo=bound.tzinfo)
+            return now >= bound
+        except (ValueError, TypeError):
+            return True
+
+    def _manual_cover_refusal(self, pending: PendingAction, posture: Posture,
+                              view: CoverageView | None, now: _dt.datetime) -> str | None:
+        """DESIGN_REV3_1 D1, on a claimed manual pending an unattended approval would fire, judged on ``view``,
+        the one read before the claim (never a second refresh that could disagree with it), at ``now``, the
+        resolve's one adjudication time: ``None`` only when a live anchored policy in it covers
+        ``Effect(action, its manifest risk, None, None, None)`` at ``now`` at a rung no stricter than ``posture``,
+        and a peek at ``now`` gives the same cover value (the authority it was read from has not moved since).
         Trigger and family are ``None``, so only a policy that lists neither covers a manual effect."""
         effect = self._effect(pending.action_name, self._manifest_risk(pending.action_name), None, None)
-        rung, value = self._clamp(posture, effect)
-        if value == COVER_NONE or rung > posture:
+        rung, value = operative(posture, effect, view, now)
+        if value is None or value == COVER_NONE or rung > posture:
             return "cover:none"
-        if self._cover_peek(effect) != value:
+        if self._cover_peek(effect, now) != value:
             return "cover:moved"
         return None
 
@@ -1498,15 +1610,18 @@ class EfferentGate:
         return _Fence(value, lambda conn: self._fence_now(conn, request.action_name, binding_id, effect_id,
                                                           chain, with_binding=with_binding, clamped=clamped))
 
-    def _unattended_approval_allowed(self, pending: PendingAction, posture: Posture) -> bool:
+    def _unattended_approval_allowed(self, pending: PendingAction, posture: Posture,
+                                     now: _dt.datetime | None = None) -> bool:
         """An approval no human gave (``by != "human"``) is the silence default of a cooling-off rung,
         and nothing else: the posture must fail open, the action must be in the code-side auto-fire
-        allowlist, and the pending must have expired. Checked in ``resolve`` itself, so a caller other
-        than the sweep cannot approve a confirm-class pending on nobody's behalf."""
-        try:
-            now = self._clock()
-        except Exception:  # noqa: BLE001 — no clock, no proof of expiry
-            return False
+        allowlist, and the pending must have expired at ``now`` (a clock read when not given). Checked in
+        ``resolve`` itself, so a caller other than the sweep cannot approve a confirm-class pending on nobody's
+        behalf."""
+        if now is None:
+            try:
+                now = self._clock()
+            except Exception:  # noqa: BLE001 — no clock, no proof of expiry
+                return False
         return (posture.fail_open and pending.action_name in self._auto_fire_actions
                 and self._expired(pending, now))
 
@@ -1622,7 +1737,7 @@ class EfferentGate:
             decision = ConfirmDecision(approved=True, by="on-loop", reason="cooling_off_window_elapsed")
         else:
             decision = ConfirmDecision(approved=False, by="on-loop", reason="confirm_window_elapsed")
-        outcome = self.resolve(pending.pending_id, decision)  # resolve CLAIMS + re-verifies the seal
+        outcome = self._resolve_pending(pending.pending_id, decision, at=now)  # resolve CLAIMS + re-verifies the seal
         if outcome.refused and outcome.reason in ("unknown_pending", "journal:already_decided"):
             return None   # snapshot-vs-claim race (another resolver won) — a non-decision
         if outcome.refused and outcome.reason == "cover:unavailable":
