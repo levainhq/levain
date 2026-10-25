@@ -218,3 +218,65 @@ def test_the_gate_protects_the_levain_home_of_the_home_it_was_given(lhome, tmp_p
           "tool_input": {"file_path": "~/.levain/autonomic/autonomic.db", "content": "x"}, "tool_use_id": "toolu_1"}
     out = cc.gate(ev, cc._queue_for(qdir, settings), settings, home=alt)
     assert out is not None and out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# --- head rulings after L3 r1: the Codex adapter and the landing pass their home; an unresolvable queue directory
+# still gates the levain home ---
+
+def _patch(path):
+    return {"command": f"*** Begin Patch\n*** Add File: {path}\n+x\n*** End Patch\n"}
+
+
+def test_the_codex_gate_protects_the_levain_home_of_the_home_it_was_given(lhome, tmp_path):
+    from levain.consent.adapters import codex as cx
+
+    alt = tmp_path / "alt"
+    (alt / ".levain").mkdir(parents=True)
+    settings = cx.AdapterSettings()
+    ev = {"hook_event_name": "PreToolUse", "session_id": "S1", "turn_id": "t1", "transcript_path": None,
+          "cwd": str(alt), "model": "m", "permission_mode": "bypassPermissions", "tool_name": "apply_patch",
+          "tool_input": _patch(alt / ".levain" / "autonomic" / "autonomic.db"), "tool_use_id": "call-S1"}
+    out = cx.gate(ev, cx._queue_for(tmp_path / "q", settings), settings, home=alt, codex_dir=alt / ".codex")
+    assert out is not None and out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_the_landing_protects_the_levain_home_of_the_home_it_was_given(lhome, tmp_path):
+    from levain.consent.landing import landing_tier
+
+    alt = tmp_path / "alt"
+    (alt / ".levain").mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = str(alt / ".levain" / "autonomic" / "autonomic.db")
+    assert landing_tier(str(repo), [store], queue_dir=tmp_path / "q", home=alt, codex_dir=alt / ".codex") == "T3"
+    assert landing_tier(str(repo), [str(repo / "src" / "app.py")], queue_dir=tmp_path / "q", home=alt,
+                        codex_dir=alt / ".codex") == "T2"
+
+
+def _installed_hook(adapter, tool, inp, cwd):
+    """The hook as installed (no ``--queue-dir``): the default queue directory is derived from $LEVAIN_HOME."""
+    ev = {"hook_event_name": "PreToolUse", "session_id": "S1", "turn_id": "t1", "transcript_path": "/x.jsonl",
+          "cwd": str(cwd), "model": "m", "permission_mode": "bypassPermissions", "tool_name": tool, "tool_input": inp,
+          "tool_use_id": "call-S1"}
+    out = io.StringIO()
+    assert adapter.main([], stdin=io.StringIO(json.dumps(ev)), stdout=out) == 0
+    return json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"] if out.getvalue() else None
+
+
+def test_an_unresolvable_queue_dir_still_denies_a_write_to_the_levain_home_claude_code(lhome, monkeypatch):
+    """Before: ``default_queue_dir()`` raised in ``main`` before the gate, so every call had no decision and a
+    bypassPermissions session wrote the binding store."""
+    monkeypatch.setenv("LEVAIN_HOME", "~lane14b_no_such_user/lv")
+    store = str(lhome / ".levain" / "autonomic" / "autonomic.db")
+    assert _installed_hook(cc, "Write", {"file_path": store, "content": "x"}, lhome) == "deny"
+    assert _installed_hook(cc, "Read", {"file_path": str(lhome / "a.txt")}, lhome) is None
+    assert _installed_hook(cc, "Write", {"file_path": str(lhome / "work" / "a.txt"), "content": "x"}, lhome) is None
+
+
+def test_an_unresolvable_queue_dir_still_denies_a_write_to_the_levain_home_codex(lhome, monkeypatch):
+    from levain.consent.adapters import codex as cx
+
+    monkeypatch.setenv("LEVAIN_HOME", "~lane14b_no_such_user/lv")
+    assert _installed_hook(cx, "apply_patch", _patch(lhome / ".levain" / "autonomic" / "autonomic.db"), lhome) == "deny"
+    assert _installed_hook(cx, "apply_patch", _patch(lhome / "work" / "a.txt"), lhome) is None
+    assert _installed_hook(cx, "exec_command", {"cmd": "ls"}, lhome) is None

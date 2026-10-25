@@ -228,7 +228,7 @@ def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path | 
     would be agent config. Never raises on the levain home: one that cannot be resolved is ``<home>/.levain``
     (fail closed for the store, never an outage of every tool). Bash is still never parsed: a shell write there
     is not tagged here."""
-    out = [Path(os.path.abspath(queue_dir)), *_levain_home_protected(home, cwd)]
+    out = [Path(os.path.abspath(queue_dir)), *levain_home_protected(home, cwd)]
     if settings.cockpit_data_root:
         root = Path(settings.cockpit_data_root)
         db = root / "cockpit.db"
@@ -236,8 +236,9 @@ def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path | 
     return tuple(out)
 
 
-def _levain_home_protected(home: Path | None, cwd: str | None) -> list[Path]:
-    """:func:`protected_paths`' share of the levain home."""
+def levain_home_protected(home: Path | None, cwd: str | None) -> list[Path]:
+    """:func:`protected_paths`' share of the levain home; never raises. Also what :func:`queue_unresolved` (and
+    Codex's) classify with when no queue directory could be resolved."""
     from levain.firing.confinement import LEVAIN_HOME_STATE_DIRS, levain_home_spellings, too_wide_to_deny  # lazy
 
     try:
@@ -1593,6 +1594,22 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
     return could_not_run(tier, what)
 
 
+def queue_unresolved(event: Any) -> dict[str, Any] | None:
+    """:func:`main`'s answer for a PreToolUse when no queue directory could be resolved (:func:`default_queue_dir`
+    raised: a ``$LEVAIN_HOME`` that cannot be expanded, or no home): with no queue and no settings, only the
+    levain home is classified (:func:`levain_home_protected`, which never raises): a call that targets it or other
+    agent config is denied with the hard stop, and every other call has no decision, so a read is not an outage."""
+    try:
+        tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
+        if not isinstance(tool_name, str) or not isinstance(cwd, str) or not os.path.isabs(cwd):
+            return None
+        tier = gate_class(tool_name, tool_input, cwd, protected=tuple(levain_home_protected(None, cwd)))
+        what = _what(tool_name, tool_input)
+    except Exception:
+        tier, what = "irreversible", "this call"
+    return None if tier is None else could_not_run(tier, what)
+
+
 def could_not_run(tier: str | None, what: str) -> dict[str, Any]:
     """:func:`gate_failed`'s deny (the hard stop for the irreversible tier); the slot gate's too (:func:`slot_gate`)."""
     return _pre("deny", f"levain: the gate could not run, so the action was NOT taken: {what}. Do not retry it "
@@ -1807,14 +1824,17 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
                 and time.monotonic() - started <= GATE_FILL_WITHIN:
             _ledger_fill(event, queue_dir)
     except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow
-        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT and queue_dir is not None:
-            try:
-                out = gate_failed(event, queue_dir, settings)
-                if out is not None:
-                    stdout.write(json.dumps(out) + "\n")
-                    stdout.flush()
-            except BaseException:
-                pass
+        try:
+            if queue_dir is None and event is None:
+                event = json.loads(stdin.read())   # not read yet: the failure came first
+            out = None
+            if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
+                out = gate_failed(event, queue_dir, settings) if queue_dir is not None else queue_unresolved(event)
+            if out is not None:
+                stdout.write(json.dumps(out) + "\n")
+                stdout.flush()
+        except BaseException:
+            pass
         try:
             print(f"levain consent hook: no decision ({type(exc).__name__}: {exc})"[:500], file=sys.stderr)
         except Exception:

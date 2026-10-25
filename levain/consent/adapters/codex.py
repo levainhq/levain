@@ -84,7 +84,7 @@ from levain.consent.adapters.claude_code import (  # noqa: F401
     CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MIN_FILE_HOLD, AdapterSettings,
     _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, away_hold,
     effective_away, hold_for_answer, hook_command, read_settings_file, still_away_from, with_away_mark,
-    hook_timeout, nothing_can_decide,
+    hook_timeout, levain_home_protected, nothing_can_decide,
     protected_paths,
 )
 from levain.consent.adapters.claude_code import (  # noqa: F401 - GATE_TIMEOUT is the installer's
@@ -258,7 +258,6 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     through :func:`levain.consent.policy.guarded_policy`, never for a request filed at ``AGENT_CONFIG_TIER``."""
     if getattr(queue, "directory", None) is None:
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
-    protected = protected_paths(Path(queue.directory), settings)
     deadline = clock() + max(0.0, float(max_hold)) - CLEANUP_RESERVE
     if not isinstance(event, Mapping) or event.get("hook_event_name") != EVENT:
         return None
@@ -273,6 +272,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     posture = posture if isinstance(posture, str) and posture else None
     if policy is None and nothing_can_decide(settings):
         return None
+    protected = protected_paths(Path(queue.directory), settings, home=home, cwd=cwd)
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
                                         protected=protected)
     if agent_config and unconfined(cwd, home=home, codex_home=codex_dir):
@@ -561,7 +561,8 @@ def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSett
                        notify=lambda text: notify(settings, text, cwd=queue.directory), resume=resume_meta_of(event))
     if got.go:
         if got.extended and gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
-                                       protected=protected_paths(Path(queue.directory), settings)) is not None:
+                                       protected=protected_paths(Path(queue.directory), settings, home=home,
+                                                                 cwd=cwd)) is not None:
             return _deny(limits.retry_text(got.extended))
         return None
     return _deny(got.text)
@@ -621,7 +622,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     tier: str | None = "irreversible"           # until classified: a failure before that denies with the latch's tier
     what = "this call"
     try:
-        protected = protected_paths(qdir, settings)
+        protected = protected_paths(qdir, settings, home=home, cwd=cwd)
         git_cache: dict[Any, Any] = {}   # one git budget for the gate call (L3 r3 G1), its description included
         what = _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected,
                           git_cache=git_cache)
@@ -713,7 +714,7 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
         if any(not isinstance(v, str) or not v for v in (tool_name, cwd, session)) or not os.path.isabs(cwd):
             tier, what = "irreversible", "this call"
         else:
-            protected = protected_paths(queue_dir, settings)
+            protected = protected_paths(queue_dir, settings, cwd=cwd)
             git_cache: dict[Any, Any] = {}   # one git budget for the call
             tier = gate_class(tool_name, tool_input, cwd, protected=protected, git_cache=git_cache)
             what = _call_what(tool_name, tool_input, cwd, protected=protected, git_cache=git_cache)
@@ -721,6 +722,27 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
         tier, what = "irreversible", "this call"
     if tier is None and not os.path.lexists(queue_dir / QUEUE_DB_NAME):
         return None
+    return could_not_run(what)
+
+
+def queue_unresolved(event: Any) -> dict[str, Any] | None:
+    """:func:`main`'s answer for a PreToolUse when no queue directory could be resolved (:func:`default_queue_dir`
+    raised: a ``$LEVAIN_HOME`` that cannot be expanded, or no home): with no queue there is no halt to read and no
+    settings, so only the levain home is classified (:func:`levain.consent.adapters.claude_code.levain_home_protected`, which
+    never raises): a call that targets it or other agent config is denied, a malformed event too (as :func:`gate`
+    denies one), and every other call has no decision, so a read is not an outage."""
+    try:
+        tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
+        session = event.get("session_id")
+        if any(not isinstance(v, str) or not v for v in (tool_name, cwd, session)) or not os.path.isabs(cwd):
+            return could_not_run("this call")
+        protected = tuple(levain_home_protected(None, cwd))
+        git_cache: dict[Any, Any] = {}
+        if gate_class(tool_name, tool_input, cwd, protected=protected, git_cache=git_cache) is None:
+            return None
+        what = _call_what(tool_name, tool_input, cwd, protected=protected, git_cache=git_cache)
+    except Exception:
+        what = "this call"
     return could_not_run(what)
 
 
@@ -909,14 +931,17 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()
     except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow
-        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT and queue_dir is not None:
-            try:
-                out = gate_failed(event, queue_dir, settings)
-                if out is not None:
-                    stdout.write(json.dumps(out) + "\n")
-                    stdout.flush()
-            except BaseException:
-                pass
+        try:
+            if queue_dir is None and event is None:
+                event = json.loads(stdin.read())   # not read yet: the failure came first
+            out = None
+            if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
+                out = gate_failed(event, queue_dir, settings) if queue_dir is not None else queue_unresolved(event)
+            if out is not None:
+                stdout.write(json.dumps(out) + "\n")
+                stdout.flush()
+        except BaseException:
+            pass
         try:
             print(f"levain consent hook: no decision ({type(exc).__name__}: {exc})"[:500], file=sys.stderr)
         except Exception:
