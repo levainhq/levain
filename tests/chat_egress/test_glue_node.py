@@ -58,7 +58,7 @@ def test_glue_srt_suite(tmp_path: Path) -> None:
     p = _run_node_test(NODE_DIR / "glue_srt.test.mjs", env, 600)
     print(_summary(p.stdout))
     assert p.returncode == 0, _summary(p.stdout) + p.stdout[-4000:] + p.stderr[-2000:]
-    assert "ℹ fail 0" in p.stdout and "ℹ skipped 0" in p.stdout
+    assert "ℹ fail 0" in p.stdout and "ℹ skipped 0" in p.stdout and "ℹ todo 0" in p.stdout
 
 
 def _emit(tmp_path: Path) -> dict:

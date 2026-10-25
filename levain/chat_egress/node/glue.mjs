@@ -15,6 +15,12 @@
 //   - the per-request machine (P-2): pending -> allowed -> closed, or pending|allowed -> ended. The observation line
 //     `resp` is written in onResponse (before srt relays the head); `ended` when the abort fires while pending or
 //     allowed (R15-29-1, R15-30-4/-5); never after a deny, a wall or an outcome; at most one of the two per request.
+//   - the observation channel: an error, an unexpected close or a queue past OBS_QUEUE_LIMIT is fatal (fail closed);
+//     resp's content_type / content_length cut to CONTENT_FIELD_LIMIT.
+//   - the end of a launch: the lifeline's EOF is the only clean end. It stops accepting, closes every accepted socket
+//     so srt's aborts write their `ended` lines, waits for every open request to settle and the obs channel to drain,
+//     THEN writes the final flush and exits 0, all inside DRAIN_MS. Anything else (a lifeline error, a drain past the
+//     bound, a failed event-file write, a failed obs channel) exits non-zero and writes no final flush.
 //   - the event file (wire.py's GlueReq / GlueWall / GlueSummary, byte-compatible with wire.parse_glue_event) and the
 //     flood bound (R15-27-1, R15-28-1/-2, R15-29-2, R15-30-1/-2/-6, P-9): 100 detailed walls per launch in total,
 //     reserved synchronously; past them one summary per tumbling wall-clock minute that summarised a wall; running
@@ -29,7 +35,7 @@
 // non-root bind of 80/443), --carve (srt's allowedDomains literal-address carve-outs, for a 127.0.0.1 origin),
 // --resolve-map name=addr[,addr];..., --upstream-ca <pem>, --fifth-arg off and --terminate-ports (R15-14-3's
 // per-layer reds).
-import { appendFileSync, readFileSync, createReadStream } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 import { randomUUID as cryptoRandomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
@@ -42,6 +48,9 @@ export const DROPPED_NAMES_SHOWN = 8;
 export const AUDIT_HEADER = 'x-levain-audit';
 export const LEVAIN_HEADER_PREFIX = 'x-levain-';
 export const UNPARSED = '<unparsed>';
+export const CONTENT_FIELD_LIMIT = 256;      // resp content_type / content_length (wire has no bound of its own)
+export const OBS_QUEUE_LIMIT = 1 << 20;      // bytes queued in the glue for the obs peer; past it, fatal
+export const DRAIN_MS = 2000;                // the clean end's whole budget
 
 /** srt 0.0.81's foldHeaderName (request-filter.js), = wire.fold_name. */
 export const foldHeaderName = name => name.toLowerCase().replace(/[_.]/g, '-');
@@ -112,7 +121,15 @@ export function createFlood({ writeLine, now = () => Date.now(), schedule = defa
     armed = true;
     schedule(Math.max(1, (minuteOf(ms) + 60) * 1000 - ms), () => { armed = false; tick(); });
   }
-  function tick() { if (!finished) rollover(now()); }
+  // The timer runs on the monotonic clock and may fire before now() crosses the minute, or late, after a wall at the
+  // boundary already rolled the old minute and opened a new summarised one (whose arm() was a no-op): either way a
+  // summarised minute still open re-arms.
+  function tick() {
+    if (finished) return;
+    const ms = now();
+    rollover(ms);
+    if (minute !== null && minuteSummarised) arm(ms);
+  }
   function wall({ request_id = null, method = null, host, reason }) {
     if (finished) return;
     const ms = now();
@@ -174,10 +191,15 @@ const queryNameCount = target => {
   const q = typeof target === 'string' ? target.indexOf('?') : -1;
   return q < 0 ? 0 : target.slice(q + 1).split('&').filter(p => p !== '').length;
 };
-const headerValue = v => (typeof v === 'string' ? v : Array.isArray(v) ? v.join(', ') : null);
+const headerValue = v => (typeof v === 'string' ? v : Array.isArray(v) ? v.join(', ') : null)?.slice(0, CONTENT_FIELD_LIMIT) ?? null;
 
-export function wrapFilterRequest(inner, { writeEvent, writeObs, flood, randomUUID = cryptoRandomUUID }) {
-  return async (request, info) => {
+/**
+ * `open()` is the number of requests the decider was asked about that are still pending or allowed (no resp, no ended,
+ * no deny); `onSettled(open)` runs at every settle. The clean end waits for 0.
+ */
+export function wrapFilterRequest(inner, { writeEvent, writeObs, flood, randomUUID = cryptoRandomUUID, onSettled = () => {} }) {
+  let open = 0;
+  const fn = async (request, info) => {
     const id = randomUUID();                                                   // (1)
     let u;
     try { u = new URL(request.url); } catch { u = null; }
@@ -208,10 +230,12 @@ export function wrapFilterRequest(inner, { writeEvent, writeObs, flood, randomUU
       dropped_names: dropped.slice(0, DROPPED_NAMES_SHOWN).map(n => escapeText(n, DROPPED_NAME_LIMIT)),
     }));
     let state = 'pending';                                                     // (6) the per-request machine
+    open += 1;
+    const settle = next => { state = next; open -= 1; onSettled(open); };
     const ended = () => {
       if (state !== 'pending' && state !== 'allowed') return;
-      state = 'ended';
       writeObs(jsonLine({ t: 'ended', request_id: id }));
+      settle('ended');
     };
     if (request.signal?.aborted) ended();
     else request.signal?.addEventListener('abort', ended, { once: true });
@@ -219,11 +243,11 @@ export function wrapFilterRequest(inner, { writeEvent, writeObs, flood, randomUU
     try {
       d = await inner(request, { ...info, rawHeaders: kept });                 // (4)
     } catch (err) {
-      if (state === 'pending') state = 'closed';
+      if (state === 'pending') settle('closed');
       throw err;
     }
     if (d?.action !== 'allow') {
-      if (state === 'pending') state = 'closed';
+      if (state === 'pending') settle('closed');
       return d;
     }
     if (state === 'pending') state = 'allowed';
@@ -238,13 +262,36 @@ export function wrapFilterRequest(inner, { writeEvent, writeObs, flood, randomUU
       removeHeaders: removals,
       onResponse: (status, headers) => {
         if (state !== 'allowed') return;
-        state = 'closed';
         writeObs(jsonLine({
           t: 'resp', request_id: id, status,
           content_type: headerValue(headers?.['content-type']), content_length: headerValue(headers?.['content-length']),
         }));
+        settle('closed');
       },
     };
+  };
+  fn.open = () => open;
+  return fn;
+}
+
+// --- the observation channel ------------------------------------------------------------------------------------------
+/**
+ * The obs peer (the decider's outcome reader) is the record the consent layer pairs outcomes from: losing it while
+ * requests keep being allowed is the failure. So an error, a close we did not ask for, a write to a dead stream or a
+ * queue past `limit` bytes is `onFatal(why)` (the glue exits non-zero, no final flush). `end(cb)` is the clean end's
+ * drain: cb runs once the bytes are handed to the kernel.
+ */
+export function createObsChannel({ stream, limit = OBS_QUEUE_LIMIT, onFatal }) {
+  let ending = false;
+  stream.on('error', e => onFatal(`obs channel error ${e?.code ?? e}`));
+  stream.on('close', () => { if (!ending) onFatal('obs channel closed'); });
+  return {
+    write(line) {
+      if (stream.destroyed || stream.writableEnded) return onFatal('obs channel write after close');
+      stream.write(line);
+      if (stream.writableLength > limit) onFatal(`obs channel queue ${stream.writableLength} > ${limit} bytes`);
+    },
+    end(cb) { ending = true; stream.end(cb); },
   };
 }
 
@@ -284,11 +331,15 @@ async function main(argv) {
     resolve,
   });
 
-  const writeEvent = line => appendFileSync(EVENTS, line);
+  // Every path that would leave the audit record wrong ends here: non-zero, no final flush (R15-30-3's crash marker).
+  const fatal = (code, why) => { console.error(`glue: fatal: ${why}`); process.exit(code); };
+  const writeEvent = line => {
+    try { appendFileSync(EVENTS, line); } catch (err) { fatal(4, `event file write failed: ${err?.code ?? err}`); }
+  };
   const flood = createFlood({ writeLine: writeEvent });
   const sock = new NetSocket({ fd: Number(need('--decider-fd')), readable: true, writable: true });
-  const obs = new NetSocket({ fd: Number(need('--obs-fd')), readable: false, writable: true });
-  obs.on('error', () => {});
+  const obs = createObsChannel({ stream: new NetSocket({ fd: Number(need('--obs-fd')), readable: false, writable: true }),
+    onFatal: why => fatal(7, why) });
   const decider = createDecider({ input: sock, output: sock, timeoutMs: 130_000,
     onDead: why => { console.error(`glue: decider dead: ${why}`); process.exit(3); } });
   const pem = readFileSync(Number(need('--ca-fd')), 'utf8');
@@ -301,8 +352,9 @@ async function main(argv) {
 
   const filter = createFilter({ tlsPorts: TLS_PORTS, httpPorts: HTTP_PORTS, canonicalizeHost, flood,
     fifthArg: opt('--fifth-arg', 'on') !== 'off' });
+  let idle = null;
   const filterRequest = wrapFilterRequest((r, i) => decider.filterRequest(r, i),
-    { writeEvent, writeObs: line => obs.write(line), flood });
+    { writeEvent, writeObs: line => obs.write(line), flood, onSettled: n => { if (n === 0 && idle) idle(); } });
   const server = createHttpProxyServer({
     filter, mitmCA, shouldTerminateTLS: (_h, port) => TERMINATE.includes(port), refuseOpaqueTunnels: true,
     requireHostMatch: true, denyHeader: 'X-Deny-Reason', requestTargetAsSpelled: false,
@@ -310,23 +362,34 @@ async function main(argv) {
     filterRequest, lookupFor: port => guard.lookupFor(port),
     ...(up ? { tlsTerminateUpstreamCA: readFileSync(up, 'utf8') } : {}),
   });
+  const accepted = new Set();
   const listener = createNetServer(s => {
+    accepted.add(s); s.once('close', () => accepted.delete(s));
     markHandedInConnection(s); writeHeadsAsLatin1(s); server.emit('connection', s); keepFlushedHeaderBatches(s);
   }).listen({ fd: Number(need('--listen-fd')) }, () => console.error(`glue: serving node=${process.version}`));
 
-  // A clean end is the lifeline's EOF (S8 closes its end): stop accepting, write the final flush (P-9), drain the
-  // observation channel, exit 0. A crash writes no flush, which is how K1 tells the two apart (R15-30-3).
+  // The clean end (the lifeline's EOF; S8 closes its end) and its order are in the header. The bound timer is NOT
+  // unref'd: the process never runs out of handles into a silent exit 0 without the final flush.
   let ending = false;
-  const cleanEnd = () => {
+  const cleanEnd = async () => {
     if (ending) return;
     ending = true;
+    setTimeout(() => fatal(5, `the clean end did not drain in ${DRAIN_MS} ms (open requests ${filterRequest.open()})`),
+      DRAIN_MS);
     listener.close();
+    await Promise.all([...accepted].map(s => new Promise(r => { s.once('close', r); s.destroy(); })));
+    await new Promise(r => setImmediate(r));                                     // srt's abort handlers run on close
+    if (filterRequest.open() > 0) await new Promise(r => { idle = r; });
+    await new Promise(r => obs.end(r));
     flood.final();
-    obs.end(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2000).unref();
+    process.exit(0);
   };
-  const life = createReadStream(null, { fd: Number(need('--lifeline-fd')) });
-  life.on('end', cleanEnd); life.on('error', cleanEnd); life.resume();
+  // A pipe read as a socket (libuv, non-blocking). Not fs.createReadStream: that parks a threadpool worker in a
+  // blocking read(2), and process.exit joins the threadpool, so every non-zero exit before the EOF would hang.
+  const life = new NetSocket({ fd: Number(need('--lifeline-fd')), readable: true, writable: false });
+  life.on('end', cleanEnd);
+  life.on('error', err => fatal(6, `lifeline error: ${err?.code ?? err}`));
+  life.resume();
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

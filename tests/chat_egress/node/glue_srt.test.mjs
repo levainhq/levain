@@ -49,18 +49,18 @@ function origin() {
 }
 
 // --- one launch -----------------------------------------------------------------------------------------------------------
-async function launch(name, script, extra = []) {
+async function launch(name, script, extra = [], { events = 'events.jsonl' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), `chd2s4-${name}-`));
   writeFileSync(join(dir, 'script.json'), JSON.stringify(script));
   const args = [join(HERE, 'fake_decider.py'), dir, join(dir, 'script.json'), '--', '--srt-dist', SRT,
-    '--events', join(dir, 'events.jsonl'), '--denied-table', TABLE, ...extra];
+    '--events', join(dir, events), '--denied-table', TABLE, ...extra];
   const p = spawn(PY, args, { stdio: ['pipe', 'pipe', 'inherit'], env: { ...process.env, CHD2_NODE: process.execPath } });
   let out = '';
   p.stdout.on('data', d => { out += d; });
   for (let i = 0; i < 400 && !/READY \d+/.test(out); i++) await sleep(25);
   const m = /READY (\d+) pid (\d+)/.exec(out);
   assert.ok(m, `driver never ready: ${out}`);
-  for (let i = 0; i < 400 && !readFileSync(join(dir, 'proxy.stderr'), 'utf8').includes('serving'); i++) await sleep(25);
+  for (let i = 0; i < 400 && !readFileSync(join(dir, 'proxy.stderr'), 'utf8').includes('glue: '); i++) await sleep(25);
   const L = { dir, port: Number(m[1]), nodePid: Number(m[2]), proc: p,
     events: () => lines(join(dir, 'events.jsonl')),
     frames: () => lines(join(dir, 'frames.jsonl')).filter(f => f.way === 'in' && f.msg.t === 'req').map(f => f.msg),
@@ -77,6 +77,13 @@ async function launch(name, script, extra = []) {
   return L;
 }
 const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+// Whether the glue still accepts on its port. The driver closed its copy of the listen fd, so a refusal means the glue
+// is gone (a pid probe cannot say: an exited glue is a zombie until the driver reaps it at stop()).
+const serving = port => new Promise(res => {
+  const s = netConnect(port, '127.0.0.1');
+  s.on('connect', () => { s.destroy(); res(true); }); s.on('error', () => res(false));
+});
+const untilGone = async port => { for (let i = 0; i < 200 && await serving(port); i++) await sleep(10); return !(await serving(port)); };
 
 // --- a raw HTTP/1.1 client: one socket, requests in sequence --------------------------------------------------------
 function conn(port) {
@@ -328,30 +335,87 @@ test('P-3 C11: after the clients close, no relay/pump holds an upstream socket o
   } finally { assert.equal(await L.stop(), 0); }
 });
 
-// P-3 C7 FAILED against srt 0.0.81 (run 10-24, S4): a HIGH returned to the head with this output, not patched. Kept as a
-// `todo` so it runs and prints its measurement on every run without failing the suite until the head rules.
-test('P-3 C7: 4 AAAA (hanging) then 4 A answers -> both families dialled within the cap', { skip: SKIP, todo: 'P-3 HIGH: C7 fails against srt 0.0.81, returned to the head' }, async () => {
-  const V4 = await rawListener('127.0.0.1');
-  const P = V4.port;
-  const sc = script({ hang6_port: P });
-  const args = ['--tls-ports', '443', '--http-ports', `80,${P}`, '--carve', `127.0.0.1:${P},[::1]:${P},::1:${P}`,
-    '--resolve-map', `dual.rb.test=::1,::1,::1,::1,127.0.0.1,127.0.0.1,127.0.0.1,127.0.0.1;six.rb.test=::1`];
-  const L = await launch('c7', sc, args);
+// P-3 C7 (HEAD_RULINGS_S4 C7 FINAL; 1024-20 C7_DIAG.md): the old fixture's "hanging" [::1] listener CONNECTED on this
+// host (macOS completes loopback handshakes past a listen(0) backlog), so it measured a never-answered request, not
+// a hang. The hung family here is a real blackhole, TEST-NET-1 192.0.2.1 (nothing can accept on it), answered FIRST;
+// the working family (a [::1] listener) second. The control proves the blackhole: a direct connect never reaches
+// `connect` (and is not refused) within 2 s, and a v4-only name through the glue gets no answer and no v6 dial.
+test('P-3 C7: 4 A answers that blackhole, then 4 AAAA answers -> the working family dialled within 2 s', { skip: SKIP }, async () => {
+  const BH = '192.0.2.1';
+  const V6 = await rawListener('::1');
+  const P = V6.port;
+  const args = ['--tls-ports', '443', '--http-ports', `80,${P}`, '--carve', `${BH}:${P},[::1]:${P},::1:${P}`,
+    '--resolve-map', `dual.rb.test=${[BH, BH, BH, BH, '::1', '::1', '::1', '::1'].join(',')};hole.rb.test=${BH}`];
+  const L = await launch('c7', script(), args);
   try {
-    // control: is a ::1 answer dialled at all (carved), i.e. does the v6-only name hang rather than refuse at once?
-    const t6 = Date.now();
-    const c6 = conn(L.port);
-    const r6 = await Promise.race([c6.send(get(`http://six.rb.test:${P}/six`, `six.rb.test:${P}`)), sleep(3000).then(() => ({ status: 'pending' }))]);
-    const six = { status: r6.status, ms: Date.now() - t6 };
-    c6.destroy();
+    const probe = await new Promise(res => {
+      const s = netConnect({ host: BH, port: P, autoSelectFamily: false });
+      const to = setTimeout(() => { s.destroy(); res('hung'); }, 2000);
+      s.on('connect', () => { clearTimeout(to); s.destroy(); res('connected'); });
+      s.on('error', e => { clearTimeout(to); res(`error ${e.code}`); });
+    });
+    assert.equal(probe, 'hung', `${BH}:${P} is not a blackhole on this host (${probe}), so C7 is not exercised`);
+    const c0 = conn(L.port);
+    const r0 = await Promise.race([c0.send(get(`http://hole.rb.test:${P}/hole`, `hole.rb.test:${P}`)), sleep(2500).then(() => ({ status: 'pending' }))]);
+    c0.destroy();
+    assert.deepEqual([r0.status, V6.conns], ['pending', 0], 'the v4-only name through the glue: no answer, no v6 dial');
     const t = Date.now();
     const c = conn(L.port);
     c.s.write(get(`http://dual.rb.test:${P}/dual`, `dual.rb.test:${P}`));
-    for (let i = 0; i < 3500 && V4.conns === 0; i++) await sleep(10);
+    for (let i = 0; i < 300 && V6.conns === 0; i++) await sleep(10);
     const ms = Date.now() - t;
     c.destroy();
-    console.log(`# C7 measured: v6-only control ${JSON.stringify(six)}; dual: v4 dialled=${V4.conns > 0} after ${ms} ms`);
-    assert.equal(six.status, 'pending', `the ::1 answer was not dialled (carve), so C7 is not exercised: ${JSON.stringify(six)}`);
-    assert.ok(V4.conns > 0 && ms < 2000, `the A answers were not dialled within 2 s (${ms} ms)`);
-  } finally { await L.stop(); V4.close(); }
+    console.log(`# C7 measured: blackhole probe ${probe}; v4-only ${r0.status}; dual: v6 dialled=${V6.conns > 0} after ${ms} ms`);
+    assert.ok(V6.conns > 0 && ms < 2000, `the AAAA answers were not dialled within 2 s (${ms} ms)`);
+  } finally { await L.stop(); V6.close(); }
+});
+
+// --- L3 r1 fix round (1024-20 S4_r1_findings.md): the audit record never carries a false clean marker -------------------
+test('F2: lifeline EOF with a request pending at the decider -> its `ended` line, THEN the final flush, exit 0', { skip: SKIP }, async () => {
+  const L = await launch('f2eof', script(), baseArgs());
+  const c = conn(L.port);
+  c.s.write(get(`http://pub.rb.test:${O.port}/hold/3`, `pub.rb.test:${O.port}`));
+  for (let i = 0; i < 200 && L.frames().length === 0; i++) await sleep(10);
+  assert.equal(L.frames().length, 1, 'the request reached the decider');
+  const t = Date.now();
+  assert.equal(await L.stop(), 0);
+  assert.ok(Date.now() - t < 2500, 'the clean end did not wait for the decider');
+  const id = L.events().find(e => e.t === 'req').request_id;
+  assert.deepEqual(L.obs().map(o => [o.t, o.request_id]), [['ended', id]], 'the pending outcome was lost');
+  const fin = L.events().at(-1);
+  assert.deepEqual([fin.t, fin.final], ['summary', true]);
+});
+
+test('F2: a lifeline read ERROR is not a clean end: non-zero, no final flush', { skip: SKIP }, async () => {
+  const L = await launch('f2err', script({ lifeline_dir: true }), baseArgs());
+  assert.ok(await untilGone(L.port), 'the glue kept serving on an unreadable lifeline');
+  const code = await L.stop();
+  assert.notEqual(code, 0, L.stderr());
+  assert.equal(L.events().filter(e => e.t === 'summary').length, 0, 'a lifeline error wrote the clean marker');
+});
+
+test('F1: the observation peer closed while the decider link is open -> the glue fails closed: non-zero, no final flush', { skip: SKIP }, async () => {
+  const L = await launch('f1', script({ obs_close: true }), baseArgs());
+  const c = conn(L.port);
+  await c.send(get(`http://pub.rb.test:${O.port}/f1-1`, `pub.rb.test:${O.port}`));
+  const gone = await untilGone(L.port);
+  const r2 = await Promise.race([conn(L.port).send(get(`http://pub.rb.test:${O.port}/f1-2`, `pub.rb.test:${O.port}`)), sleep(1500).then(() => ({ status: 'pending' }))]);
+  c.destroy();
+  const code = await L.stop();
+  assert.equal(gone, true, 'the glue kept serving with its outcome channel gone');
+  assert.notEqual(r2.status, 200, 'a request was allowed after the outcome channel failed');
+  assert.notEqual(code, 0);
+  assert.equal(L.events().filter(e => e.t === 'summary').length, 0, 'a failed outcome channel wrote the clean marker');
+});
+
+test('F4: an events-file write that fails is fatal on purpose: the glue exits non-zero at the wall, no silent divergence', { skip: SKIP }, async () => {
+  const L = await launch('f4', script(), baseArgs(), { events: 'no-such-dir/events.jsonl' });
+  const c = conn(L.port);
+  const r = await c.send(`CONNECT pub.rb.test:${OFF.port} HTTP/1.1\r\nHost: pub.rb.test:${OFF.port}\r\n\r\n`, true);
+  c.destroy();
+  const gone = await untilGone(L.port);
+  const code = await L.stop();
+  assert.notEqual(r.status, 200);
+  assert.equal(gone, true, 'the glue kept running with a wall missing from its event file');
+  assert.equal(code, 4, L.stderr());
 });

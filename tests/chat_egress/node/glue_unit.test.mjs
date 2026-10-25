@@ -369,3 +369,59 @@ test('a minute whose walls were all detailed emits no summary of its own', () =>
   r.set(m0 + 61_000); r.flood.tick();
   assert.equal(r.events().filter(e => e.t === 'summary').length, 0);
 });
+
+// --- L3 r1 fix round (1024-20 S4_r1_findings.md) --------------------------------------------------------------------
+test('F3: a minute timer that fires 1 ms early re-arms; a wall at the boundary still leaves the new minute a timer', () => {
+  const m0 = 1_700_000_040_000 - (1_700_000_040_000 % 60000);
+  const sums = r => r.events().filter(e => e.t === 'summary').map(s => [s.minute, s.minute_count]);
+  // A: setTimeout runs on the monotonic clock and can fire before Date.now() crosses the minute
+  const a = floodRig(m0 + 1000);
+  for (let i = 0; i < 101; i++) wall(a.flood, 'a.example');
+  assert.equal(a.timers.length, 1);
+  a.set(m0 + 59_999); a.timers.shift()[1]();
+  assert.deepEqual(sums(a), [], 'nothing to write before the minute ends');
+  assert.equal(a.timers.length, 1, 'the early fire re-armed the summarised minute');
+  a.set(m0 + 60_000); a.timers.shift()[1]();
+  assert.deepEqual(sums(a), [[m0 / 1000, 101]]);
+  // B: a summarised wall at the boundary rolls minute 0 over while minute 0's timer is still pending
+  const b = floodRig(m0 + 1000);
+  for (let i = 0; i < 101; i++) wall(b.flood, 'a.example');
+  b.set(m0 + 60_000); wall(b.flood, 'b.example');
+  assert.deepEqual(sums(b), [[m0 / 1000, 101]]);
+  b.set(m0 + 60_005); b.timers.shift()[1]();          // minute 0's timer, late, finds minute 1 open
+  assert.equal(b.timers.length, 1, 'minute 1 (summarised) has a timer');
+  b.set(m0 + 120_000); b.timers.shift()[1]();
+  assert.deepEqual(sums(b), [[m0 / 1000, 101], [m0 / 1000 + 60, 1]]);
+});
+
+test('F5: an upstream content-type / content-length is cut to 256 in the resp line', async () => {
+  const { fr, obs } = rig(() => ({ action: 'allow' }));
+  const { request, info } = fakeRequest();
+  const d = await fr(request, info);
+  d.onResponse(200, { 'content-type': 't/' + 'x'.repeat(10_000), 'content-length': '9'.repeat(5_000) });
+  const [o] = parse(obs.lines);
+  assert.deepEqual([o.content_type.length, o.content_length.length], [256, 256]);
+  assert.equal(o.content_type, ('t/' + 'x'.repeat(10_000)).slice(0, 256));
+});
+
+test('F1: the obs channel: an error, an unexpected close or a queue past its bound is fatal; a close after end() is not', async () => {
+  const G = await import('../../../levain/chat_egress/node/glue.mjs');
+  assert.equal(typeof G.createObsChannel, 'function', 'no obs channel: an obs error/close is swallowed (codex MED 2)');
+  const { EventEmitter } = await import('node:events');
+  const fake = () => Object.assign(new EventEmitter(), {
+    writableLength: 0, destroyed: false, writableEnded: false,
+    write(l) { this.writableLength += l.length; return true; }, end(cb) { this.writableEnded = true; cb(); },
+  });
+  const run = (act, limit = 100) => {
+    const s = fake(); const why = [];
+    const ch = G.createObsChannel({ stream: s, limit, onFatal: w => why.push(w) });
+    act(s, ch);
+    return why;
+  };
+  assert.deepEqual(run((s, ch) => { ch.write('x'.repeat(100)); }), [], 'at the bound is fine');
+  assert.equal(run((s, ch) => { ch.write('x'.repeat(101)); }).length, 1, 'past the bound');
+  assert.equal(run(s => s.emit('error', Object.assign(new Error('EPIPE'), { code: 'EPIPE' }))).length, 1);
+  assert.equal(run(s => s.emit('close')).length, 1);
+  assert.equal(run((s, ch) => { s.destroyed = true; ch.write('x'); }).length, 1, 'a write to a destroyed stream');
+  assert.deepEqual(run((s, ch) => { ch.end(() => {}); s.emit('close'); }), [], 'our own end');
+});
