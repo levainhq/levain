@@ -455,8 +455,8 @@ def test_seed_templates_carry_the_reconciled_guidance():
     # not say co-citing keeps recall alive or that recall goes dark without it.
     for retired in ("associative recall goes dark", "that is what forms the Hebbian link",
                     "Co-citing 2+ episodes in one graduation", "allow_unlinked",
-                    # anneal 1.0.2 forms no links and ignores affect: the seed teaches two layers and the immune system
-                    "hebbian", "limbic", "affective_state", "four layers", "episode associations",
+                    # anneal 1.0.2 forms no links and ignores affect: the seed names no layer count (anneal is a governed state machine, not a log plus a file)
+                    "hebbian", "limbic", "affective_state", "four layers", "two layers", "episode associations",
                     # anneal 1.0.2 AM-FORMATION-OFF: prepare_wrap returns no association context
                     "association context", "affect tag", "affect-tag"):
         for name, text in seed_files.items():
