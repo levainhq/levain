@@ -12,7 +12,9 @@
      127.0.0.1; the decider and observation socket pairs, the CA pipe and the lifeline pipe;
   6. the glue spawned with `env={}` (R15-10-A10, R15-12-B6) and only those fds; the CA (key + cert PEM, held by the
      caller in memory) written into its pipe and the pipe closed, so the key never touches the file system here;
-  7. the decider service (`decider.Decider`) on Levain's ends, then the glue's `serving` line awaited.
+  7. the decider service (`decider.Decider`) on Levain's ends, then the glue's `serving` line awaited;
+  8. 19a: given the authority replay the routes were built from, the keyed records expiring within
+     `renew.RENEW_DUE` go to `on_renew_due` once (a failing callback is logged, the launch stands).
 A failure after the spawn kills the glue, closes the decider and the SOCKS listener, and refuses the launch.
 
 `stop_egress`, in order: the lifeline's write end CLOSED FIRST (the glue's only clean end: it drains, writes the
@@ -30,16 +32,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from levain.chat_egress import advert, strip
+from levain.chat_egress import advert, renew, strip
 from levain.chat_egress import decider as dm
 from levain.chat_egress import records as rec
 from levain.chat_egress.resolver import Resolver, system_lookup
@@ -60,6 +64,8 @@ GLUE_SEAMS = frozenset({"--tls-ports", "--http-ports", "--carve", "--resolve-map
 NODE_VERSION_TIMEOUT_S = 10.0
 SERVING_TIMEOUT_S = 10.0
 GLUE_EXIT_TIMEOUT_S = 10.0
+
+log = logging.getLogger(__name__)
 
 _NODE_VERSION = re.compile(r"v([0-9]{1,4})\.[0-9]{1,6}\.[0-9]{1,6}")
 
@@ -154,6 +160,7 @@ class EgressLaunch:
     events: Path
     stderr: Path
     life_w: int | None = field(default=None, repr=False)
+    renew_due: tuple[renew.RenewDue, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -167,7 +174,9 @@ class StopResult:
 
 def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, events: Path, ca_pem: bytes, routes: Any,
                  liveness: Any, credentials: Any, cards: Any, mode: Any, open_network: bool,
-                 limits: dm.Limits = dm.Limits(), seams: TestSeams | None = None) -> EgressLaunch:
+                 limits: dm.Limits = dm.Limits(), seams: TestSeams | None = None, authority: Any = None,
+                 on_renew_due: Callable[[str, list[renew.RenewDue]], None] | None = None,
+                 now: datetime | None = None) -> EgressLaunch:
     refuse_seams(seams)
     if store.launch(launch_id) is None:
         raise EgressRefused(f"no launches row for {launch_id!r}: the egress rows of a launch reference it")
@@ -225,11 +234,19 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, event
     except BaseException:
         _abort(proc, decider, socks_srv, life_w)
         raise
+    # 19a: each keyed record's expiry read from the authority replay the routes came from (its one home); a ping that
+    # fails is logged and never ends the launch
+    due = renew.renew_due(authority, routes, now=now or datetime.now(timezone.utc)) if authority is not None else []
+    if due and on_renew_due is not None:
+        try:
+            on_renew_due(launch_id, due)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("renew-due ping for %s failed: %s", launch_id, type(exc).__name__)
     return EgressLaunch(launch_id=launch_id, store=store, records=records, proc=proc, decider=decider,
                         socks=socks_srv, http_port=http_port, socks_port=socks_srv.port, node_version=node_version,
                         header=session_header(open_network=open_network, node_version=node_version),
                         egress_digest=egress_digest(open_network=open_network), events=events, stderr=stderr,
-                        life_w=life_w)
+                        life_w=life_w, renew_due=tuple(due))
 
 
 def _abort(proc: subprocess.Popen | None, decider: dm.Decider | None, socks_srv: SocksRefuser, life_w: int) -> None:
