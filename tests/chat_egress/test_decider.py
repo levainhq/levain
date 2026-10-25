@@ -57,8 +57,9 @@ def test_two_held_cards_do_not_stall_a_get(rig) -> None:
     assert action(r.srt.wait(g)) == "allow"
     assert time.monotonic() - t0 < 2.0
     assert r.srt.got(c1) == [] and r.srt.got(c2) == []          # still held
-    r.desk.answer["card-1"] = "allowed"
-    r.desk.answer["card-2"] = "denied"
+    # the two decision threads file in either order: answer each card by the path it carries, never by its number
+    for n, card in enumerate(r.desk.filed, 1):
+        r.desk.answer[f"card-{n}"] = {"/a": "allowed", "/b": "denied"}[card["path"]]
     assert action(r.srt.wait(c1)) == "allow"
     v2 = r.srt.wait(c2)
     assert action(v2) == "deny" and v2[-1]["status"] == 403
