@@ -123,7 +123,7 @@ __all__ = [
     "CAUSES", "DB_NAME", "EDGES", "FORMAT", "STATES", "TERMINAL", "UNSIGNED_LEASE", "CapabilityRefused",
     "ENVELOPE_EVIDENCE_KEYS", "EnvelopeEnd", "EnvelopeRefused", "Job", "envelope_evidence",
     "JobStore", "JobStoreError", "AlreadyRecorded", "RecordConflict", "SignatureRefused", "Transition",
-    "TransitionRefused", "default_dispatch_dir",
+    "TransitionRefused", "default_dispatch_dir", "report_of",
 ]
 
 log = logging.getLogger("levain.dispatch.jobs")
@@ -560,6 +560,15 @@ def _terminal_event(event: Any, run: VerifierRun) -> tuple[str | None, str | Non
         raise DispatchError(f"the session event's state is not {' or '.join(_SESSION_TERMINAL)}")
     if not isinstance(event.get("at"), str):
         raise DispatchError("the session event carries no at stamp")
+    return report_of(event)
+
+
+def report_of(event: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """``(refusal name, None)`` or ``(None, envelope digest)`` from a verifier's terminal event's report fields, and a
+    ``ticket`` that is a string: anything else is a :class:`DispatchError`. The one shape check of those fields, read
+    by :func:`_terminal_event` and by the SESSION-EVENTS follower before it resolves or writes anything."""
+    if not isinstance(event.get("ticket"), str):
+        raise DispatchError("the session event's ticket is not a string")
     has_digest, has_refused = "verifier_report_digest" in event, "verifier_report_refused" in event
     if has_digest == has_refused:
         raise DispatchError("the session event carries exactly one of verifier_report_digest and "

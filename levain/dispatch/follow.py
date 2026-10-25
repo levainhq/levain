@@ -33,7 +33,8 @@ from typing import Any, Callable, Mapping
 
 from levain.cockpit.consent import utc_stamp
 from levain.dispatch import DispatchError
-from levain.dispatch.jobs import _SESSION_TERMINAL, AlreadyRecorded, JobStore, RecordConflict, TransitionRefused
+from levain.dispatch.jobs import (_SESSION_TERMINAL, AlreadyRecorded, JobStore, RecordConflict, TransitionRefused,
+                                  report_of)
 from levain.dispatch.verifier_report import VerifierRun
 from levain.slot import Refused
 from levain.slot import control_client as CC
@@ -135,6 +136,10 @@ class EventFollower:
 
     def _verifier_done(self, ev: CC.Event) -> None:
         body = ev.body
+        try:
+            report_of(body)
+        except DispatchError as e:
+            raise FollowStopped("event-shape", f"event {ev.seq}: {e}") from None
         call = self.resolve(body)
         if call is None:
             raise FollowStopped("ticket-unresolved", f"event {ev.seq}: no verifier run dispatch minted holds this "

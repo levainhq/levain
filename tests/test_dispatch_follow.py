@@ -275,3 +275,18 @@ def test_a_job_failed_elsewhere_is_passed_unacked_and_the_cursor_moves(store, re
     assert not acked(served)
     assert store.event_cursor() == (served.events.journal_id, served.kept()[-1]["seq"])
     f.close()
+
+
+@pytest.mark.parametrize("bad", [{"ticket": 7}, {"verifier_report_digest": "sha256:nothex"},
+                                 {"verifier_report_refused": ""},
+                                 {"verifier_report_refused": "x", "verifier_report_digest": "sha256:" + "0" * 64}])
+def test_a_misshapen_verifier_event_stops_before_resolve_and_writes_nothing(store, repo, served, bad):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    f = d.follower()
+    body = {"seq": 9, "kind": "state", "session": SESSION_V, "ticket": "t", "state": "RETAINED",
+            "at": "2026-10-25T00:00:00Z", "verifier_report_digest": "sha256:" + "0" * 64, **bad}
+    with pytest.raises(F.FollowStopped) as exc:
+        f._handle(CC.Event(9, "state", body))
+    assert exc.value.name == "event-shape" and d.resolved == []
+    assert store.run_records(d.job.id) == [] and store.get(d.job.id).state == "verifying"
+    f.close()
