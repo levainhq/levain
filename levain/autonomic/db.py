@@ -19,8 +19,8 @@ Durability: :mod:`levain.autonomic.durable_sqlite` (every commit on disk before 
 
 The store carries a format marker, read inside every transaction; a database with another marker, or
 tables and no marker, is refused rather than read or taken over, and a store that disappears under a
-running object is refused rather than silently started empty. The format is ``levain-autonomic/2``: a binding's
-effect runs below CONFIRM only under a signed graduation policy (the gate's clamp). The first open by this binary
+running object is refused rather than silently started empty. The format is ``levain-autonomic/2``: a
+binding's effect runs below CONFIRM only under a signed graduation policy (the gate's clamp). The first open by this binary
 migrates a ``levain-autonomic/1`` store in place (:func:`migrate_to_v2`, in the opening ``BEGIN IMMEDIATE``).
 
 **Upgrade order: stop every process of an older levain that has the store open before this binary opens it.** A
@@ -28,9 +28,11 @@ migrates a ``levain-autonomic/1`` store in place (:func:`migrate_to_v2`, in the 
 its next read or write once it is migrated. Levain 0.11.24 and earlier check it only when an object first opens the
 store, so such a process left running would keep reading and writing the ``/2`` store unclamped; no command of
 those releases opens it (nothing outside ``levain.autonomic`` builds a store object), which is why the migration
-takes no lock against them. The directory is created ``0700``; an
-existing one keeps its mode. A registry kept in the earlier JSON file format (this package's or the vagus package's) enters only
-through :meth:`levain.autonomic.binding.BindingStore.migrate_json`, a one-way import.
+takes no lock against them.
+
+The directory is created ``0700``; an existing one keeps its mode. A registry kept in the earlier JSON file format
+(this package's or the vagus package's) enters only through
+:meth:`levain.autonomic.binding.BindingStore.migrate_json`, a one-way import.
 
 Stdlib only.
 """
