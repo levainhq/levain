@@ -62,14 +62,15 @@
 
   // A network error or a 5xx after the one RT-4 retry leaves the code UNSPENT (L3 r1 F4): offer to try it again rather
   // than send him back for a new one. A 403 is final (used, expired or wrong).
-  function tryAgain(code, title, msg, repaired) {
+  function tryAgain(code, title, msg, oldTok) {
     say(title, msg, false);
-    actions([["Try again", true, () => attempt(code, true, repaired)]]);
+    actions([["Try again", true, () => attempt(code, true, oldTok)]]);
   }
 
   // `again`: this is a second spend of the same code after a failure that may have reached the server (G3).
-  // `repaired`: the label of the paired device this browser held before (Pair it again), or null; the "Paired" screen then says which row.
-  async function attempt(code, again, repaired) {
+  // `oldTok`: the key this browser held before Pair it again (snapshotted before anything else), or undefined; after the claim has
+  // SUCCEEDED the Paired screen looks that key up (read-only) to say which Devices row it is.
+  async function attempt(code, again, oldTok) {
     say("Pairing this device", "Claiming your one-time code…", false);
     let res;
     try {
@@ -82,7 +83,7 @@
         res = await claim(code);
       }
     } catch (_) {
-      tryAgain(code, "Could not reach the cockpit", "Check that this device is on the same network as the cockpit, then try again. The code is not used yet.", repaired);
+      tryAgain(code, "Could not reach the cockpit", "Check that this device is on the same network as the cockpit, then try again. The code is not used yet.", oldTok);
       return;
     }
     if (res.status === 403) {
@@ -93,7 +94,7 @@
       return;
     }
     if (res.status >= 500) {
-      tryAgain(code, "The cockpit is busy", "It is still starting or another process holds it. Try again in a moment.", repaired);
+      tryAgain(code, "The cockpit is busy", "It is still starting or another process holds it. Try again in a moment.", oldTok);
       return;
     }
     let data = null;
@@ -111,9 +112,13 @@
     // G4: the mark is a nicety (it only picks the unpaired card over a prompt later); a failed write of it never says the key was lost
     try { window.localStorage.setItem(PAIRED_MARK_KEY, "1"); } catch (_) { /* the key is kept; the mark is not */ }
     data = null;
-    if (repaired) {
-      // stay on the page so the line is read; the cockpit is one click away
-      say("Paired", "This device is paired. This browser's previous key is still listed in Devices as " + repaired + ". Revoke it there.", true);
+    if (oldTok) {
+      // stay on the page so the line is read; the cockpit is one click away. The claim is done: nothing below can fail it.
+      say("Paired", "This device is paired. Checking the key this browser held before…", true);
+      const prev = await previousKey(oldTok);
+      if (prev.kind === "owner" || prev.kind === "revoked") { say("Paired", "This device is paired. Opening the cockpit…", true); location.replace("/"); return; }
+      if (prev.kind === "live") { sayLive(prev); return; }
+      say("Paired", "This device is paired. " + PREVIOUS_MAYBE, true);
       return;
     }
     say("Paired", "This device is paired. Opening the cockpit…", true);
@@ -121,42 +126,70 @@
   }
 
   // "Pair it again" only claims; the key this browser held is NOT revoked from here (L3 r3 H1: a client cannot do that safely).
-  // It READS first (GET only, never a revoke): when the held key is a paired-<id> credential, the device's label is looked up so
-  // the Paired screen can say which Devices row is this browser's previous key. Any other key (an owner surface token), a
-  // failed or slow read, or a missing row gives NO line: the page never guesses a label.
+  // The claim goes FIRST (L3 r5 K2: no read ever sits before the POST, so a short-lived code cannot expire behind a slow list).
+  // AFTER it succeeded, the held key (snapshotted before the claim; a claim does not revoke it) is looked up with GETs only, so the
+  // Paired screen can say which Devices row it is. The result is tri-state (K1): "owner" (a surface token, positively not a paired
+  // row) and "revoked" (the row is revoked) say nothing; "live" names the label and the short id; anything else (a failed, slow or
+  // malformed read, a missing row) is "unknown" and gets the generic line, because the old key may still be listed.
   const PAIRED_PREFIX = "paired-";               // MUST equal the server's PAIRED_PREFIX (web_server.py): the credential name's namespace
   const TOKEN_HEADER = "X-Levain-Write-Token";   // MUST equal devices_panel.js H
   const LOOKUP_MS = 8000;
+  const LABEL_MAX = 60;
+  const PREVIOUS_MAYBE = "This browser's previous key may still be listed in Devices. Revoke it there.";
+  // MUST equal devices_panel.js shortId: the first 8 characters of the device id ("d-" + 6 hex); the line and every Devices row show the same
+  function shortId(id) { return String(id).slice(0, 8); }
+  // quote-safe and bounded: bidi/control characters out, 60 characters and an ellipsis at most
+  function boundLabel(label) {
+    const chars = Array.from(String(label).replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "").trim());
+    return chars.length > LABEL_MAX ? chars.slice(0, LABEL_MAX).join("") + "\u2026" : chars.join("");
+  }
 
-  async function previousKeyLabel(token) {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), LOOKUP_MS);
+  // The previous-key line for a live row. The label is untrusted text (the server allows RTL scripts), so it sits inside the quotes in a
+  // <bdi> (its own direction, isolated from the sentence), built with textContent only; the short id is a no-wrap span.
+  function sayLive(prev) {
+    say("Paired", "", true);
+    const bdi = document.createElement("bdi");
+    bdi.textContent = prev.label;
+    const id = document.createElement("span");
+    id.className = "dev-id";
+    id.textContent = prev.short;
+    msgEl.append("This device is paired. This browser's previous key is still listed in Devices as \u201c", bdi, "\u201d (", id, "). Revoke it there.");
+  }
+
+  async function previousKey(token) {
+    const unknown = { kind: "unknown" };
+    let timer = null;
     try {
+      const ctl = new AbortController();         // inside the try (K4): a browser without it falls to "unknown", never a stuck page
+      timer = setTimeout(() => ctl.abort(), LOOKUP_MS);
       const get = (path) => fetch(path, { method: "GET", headers: { [TOKEN_HEADER]: token }, cache: "no-store", referrerPolicy: "no-referrer", signal: ctl.signal });
       const man = await get("/cockpit/manifest.json");
-      if (man.status !== 200) return null;
+      if (man.status === 401 || man.status === 403) return { kind: "revoked" };   // M1: a refused key is dead: no line
+      if (man.status !== 200) return unknown;
       const m = await man.json();
+      // M1 (measured): a revoked or unknown key is NOT refused by the manifest: it answers 200 with credential.class "none" and no name
+      if (m && m.credential && m.credential.class === "none") return { kind: "revoked" };
       const name = m && m.credential && m.credential.name;
-      if (typeof name !== "string" || !name.startsWith(PAIRED_PREFIX)) return null;
+      if (typeof name !== "string") return unknown;
+      if (!name.startsWith(PAIRED_PREFIX)) return { kind: "owner" };
       const id = name.slice(PAIRED_PREFIX.length);
       const lst = await get("/cockpit/pair/devices.json");
-      if (lst.status !== 200) return null;
+      if (lst.status !== 200) return unknown;
       const l = await lst.json();
-      const row = l && Array.isArray(l.devices) ? l.devices.find((d) => d && d.id === id) : null;
-      if (!row || typeof row.label !== "string" || !row.label.trim()) return null;
-      return row.label;
+      const row = l && Array.isArray(l.devices) ? l.devices.find((d) => d && String(d.id) === id) : null;
+      if (!row) return unknown;
+      if (row.revoked_at) return { kind: "revoked" };
+      const label = typeof row.label === "string" ? boundLabel(row.label) : "";
+      return { kind: "live", label: label || "paired device", short: shortId(id) };
     } catch (_) {
-      return null;
+      return unknown;
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
     }
   }
 
-  async function pairAgain(code) {
-    say("Pairing this device", "Claiming your one-time code…", false);
-    actEl.hidden = true;
-    const label = await previousKeyLabel(storedToken());
-    attempt(code, false, label);
+  function pairAgain(code) {
+    attempt(code, false, storedToken());           // the held key is snapshotted here, before the claim can replace it
   }
 
   function run() {

@@ -2595,6 +2595,7 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .dev-row:last-child { border-bottom: 0; }
 .dev-main { flex: 1 1 auto; min-width: 0; }
 .dev-name { font: var(--fw-semibold) var(--fs-body)/1.3 var(--sans); color: var(--text); overflow-wrap: anywhere; }
+.dev-id { white-space: nowrap; }
 .dev-meta { margin-top: var(--sp-1); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); overflow-wrap: anywhere; }
 .dev-revoked .dev-name { color: var(--label); text-decoration: line-through; text-decoration-color: var(--faint); }
 .dev-pill { flex: none; }
