@@ -2857,11 +2857,12 @@ class Keys:
         def bound(room: int) -> int:
             return estimate   # above the room, the ledger refuses it `budget-exhausted`
 
+        if run is not None and self.ledger.outbox_committed >= self.lineage_outbox_max:
+            # r1 F1: `_check_q`'s outbox check read again before the admit (the body read sits between them; no
+            # `await` from here to the admit)
+            raise norm.Refused("keys-unavailable", "the lineage outbox is full")
         if reg.session in self.budget_stopped:
             raise norm.Refused("budget-overrun", "the session is stopped")
-        if run is not None and self.ledger.outbox_committed >= self.lineage_outbox_max:
-            # r1 F1: `_check_q`'s outbox check read again right before the admit (the body read sits between them)
-            raise norm.Refused("keys-unavailable", "the lineage outbox is full")
         try:
             return self.ledger.admit(scope, cap, bound, price_ref=price_ref, meta=meta)
         except ledger.Refused as e:
