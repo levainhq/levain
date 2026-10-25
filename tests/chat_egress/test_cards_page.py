@@ -3,7 +3,8 @@ and drawn by the cockpit page in headless Chrome at phone width, with hostile fi
 
 Rows: R15-10-A16 (the fields render as structured rows; markup is text; no raw bidi or control character reaches the
 page; the removed names and the key line are drawn before the long path), C9 / R15-12-B7 (a card whose client left
-reads ENDED). What the card looks like to him on his phone, signed with Face ID, is S10's (residue, not here).
+reads ENDED). Every state served from real egress rows is test_cards_states_page.py. What the card looks like to him
+on his phone, signed with Face ID, is S10's (residue, not here).
 
 `LEVAIN_S7_SHOTS=<dir>` keeps the phone-width screenshots there (the default is the test's tmp dir).
 """
@@ -52,15 +53,6 @@ def test_a_hostile_egress_card_draws_as_text_rows_with_the_removed_names_before_
     q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": "ls"}, cwd="/w",
            hold=timedelta(minutes=5), event_id="keep")    # a plain card beside it, drawn as before
     assert q.withdraw(gone.id, note="egress: the client closed")   # C0's CARD_ENDED, as S5b's composer does it
-    # a body that carries `egress_state` (card_state over the egress rows) is drawn as that: no server sends one yet, so
-    # the page's fetch is rewritten to add it for this card only (AMBIGUOUS, R15-10-A8)
-    amb = file_card(q, _hostile("2d8b7a5f-5e3f-4a0a-9c5a-4f9d3b2e1c33"), agent_session_id="s", cwd="/w")
-    assert q.withdraw(amb.id, note="egress: the client closed")
-    stub = ("(() => { const real = window.fetch.bind(window); const id = " + json.dumps(amb.id) + ";"
-            " window.fetch = async (u, o) => { const r = await real(u, o);"
-            " if (!String(u).includes('/cockpit/consent/' + encodeURIComponent(id))) return r;"
-            " const b = await r.clone().json(); b.egress_state = 'ambiguous';"
-            " return new Response(JSON.stringify(b), {status: r.status, headers: r.headers}); }; return 1; })()")
     shots = Path(os.environ.get("LEVAIN_S7_SHOTS") or tmp_path)
     shots.mkdir(parents=True, exist_ok=True)
     read = ("(() => { const c = " + CARD + "; const dl = c.querySelector('.egress-kv');"
@@ -95,19 +87,14 @@ def test_a_hostile_egress_card_draws_as_text_rows_with_the_removed_names_before_
             {"eval": f"(() => {{ {CARD}.scrollIntoView({{block: 'start'}}); return 1; }})()"},
             {"eval": read},
             {"shot": str(shots / "s7_card_phone.png")},
-            {"eval": stub},
             {"eval": OPEN_DECISIONS},
-            {"until": f"{row_of(gone.id)} && {row_of(amb.id)} && {row_of(amb.id)}.querySelector('.consent-details')"},
+            {"until": f"{row_of(gone.id)} && {row_of(gone.id)}.querySelector('.consent-details')"},
             {"eval": open_row(gone.id)},
-            {"eval": open_row(amb.id)},
-            {"until": f"{row_of(amb.id)}.querySelector('.egress-state') && {tagged}.querySelector('.egress-state')"},
-            {"eval": drawn(amb.id)},
+            {"until": f"{tagged}.querySelector('.egress-state')"},
             {"eval": drawn(gone.id)},
             {"eval": f"new Promise((res) => {{ {tagged}.scrollIntoView({{block: 'start'}}); setTimeout(() => res(1), 600); }})"},
             {"shot": str(shots / "s7_ended_phone.png")},
         ])["values"]
-    assert out[-4] == ["AMBIGUOUS", "AMBIGUOUSyou allowed it, then Levain stopped before the result: it may or may not"
-                       " have been sent"], out[-4]
     got = json.loads(out[2])
     assert got["dts"] == ["method", "scheme", "host", "port", "Levain adds your key for", "removed", "why it asks",
                           "held", "body bytes", "body", "header names", "query names", "path", "whole path length",
@@ -121,4 +108,5 @@ def test_a_hostile_egress_card_draws_as_text_rows_with_the_removed_names_before_
     assert "SECRETQUERYVALUE" not in got["card_text"] and "TOPSECRETTOKEN" not in got["card_text"], got
     assert got["state"].startswith("PENDING"), got
     assert got["plain_pre"] == 1, got                                   # the Bash card still draws as it did
-    assert out[-3] == ["ENDED", "ENDEDthe request's client left; nothing was sent after it left"], out[-3]
+    assert out[-3] == ["ENDED", "ENDEDended before a result: the request's client left, or its launch or Levain closed;"
+                       " nothing was sent after that"], out[-3]

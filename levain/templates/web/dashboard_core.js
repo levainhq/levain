@@ -4139,6 +4139,8 @@
       },
       () => ({ error: "the request could not be read (network)" }));
   }
+  // An egress card's body is the exception: what it became (egress_state) moves on while its queue row keeps one
+  // state (allowed, then in flight, then completed), so a body is kept only once its egress_state is final.
   function consentBody(c, row) {
     const key = c.id + "|" + c.state;
     if (consentBodies.has(key)) return consentBodies.get(key);
@@ -4146,7 +4148,7 @@
     const headers = t && typeof t.headers === "function" ? t.headers() : {};
     if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: CONSENT_NO_TOKEN });
     const got = consentQueued(() => consentFetch(c, headers, 1), undefined, row)
-      .then((b) => { if (b.error && consentBodies.get(key) === got) consentBodies.delete(key); return b; });
+      .then((b) => { if ((b.error || egressUnsettled(b)) && consentBodies.get(key) === got) consentBodies.delete(key); return b; });
     consentBodies.set(key, got);
     return got;
   }
@@ -4197,20 +4199,31 @@
     query_keys: "query names", path: "path", path_chars: "whole path length", path_sha256: "whole path", launch: "launch",
     request: "request" };
   // the words for chat_egress.cards.CardState. A body carrying `egress_state` (card_state over the request's egress
-  // rows) is drawn as that; a body without one is drawn from the queue's state alone
+  // rows, which the server reads) is drawn as that; a body without one is drawn from the queue's state alone
   const EGRESS_WORDS = {
     pending: "waiting on your answer; nothing is sent unless you allow it",
     allowed: "you allowed it; no send is recorded yet",
+    in_flight: "you allowed it; Levain is forwarding it and has no result yet",
     completed: "you allowed it and it was sent",
     denied: "you denied it; nothing was sent",
     expired: "the hold ran out with no answer; nothing was sent",
-    ended: "the request's client left; nothing was sent after it left",
-    ambiguous: "you allowed it, then Levain stopped before the result: it may or may not have been sent",
+    denied_or_expired: "denied or expired; nothing was sent",
+    ended: "ended before a result: the request's client left, or its launch or Levain closed; nothing was sent after that",
+    ambiguous: "you allowed it, then Levain or its launch stopped before the result: it may or may not have been sent",
     failed: "Levain failed partway: its record of this request is incomplete",
     inconsistent: "the queue and the egress record disagree" };
+  // the states a card stays in: a body showing one of these is kept (consentBody); the rest are read again
+  const EGRESS_FINAL = new Set(["completed", "denied", "expired", "denied_or_expired", "ended", "ambiguous", "failed"]);
   // with no egress rows read, the queue's state alone (cards.card_state(queue_state, None), pinned by its test)
   const EGRESS_FROM_QUEUE = { pending: "pending", allowed: "allowed", denied: "denied", expired: "expired", withdrawn: "ended" };
-  const EGRESS_HIDDEN = /[\u0000-\u001f\u007f-\u009f؜​-‏‪-‮⁠-⁩﻿]/;
+  // levain.unshowable's own definition (its categories, Default_Ignorable_Code_Point, a space other than U+0020 and
+  // the characters that draw nothing), in the browser's Unicode, parity-tested against it; its context rules (a mark
+  // with no base, a selector) stay the server's, which marks every one before the card is filed
+  const EGRESS_HIDDEN = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Co}\p{Cn}\p{Default_Ignorable_Code_Point}\u2800\u{16FE4}\u{1D159}]|(?! )\p{Zs}/u;
+  const egressLabel = (s) => s.replace(/_/g, " ").toUpperCase();
+  function egressUnsettled(b) {
+    return !!b && b.tool === EGRESS_TOOL && !EGRESS_FINAL.has(typeof b.egress_state === "string" ? b.egress_state : "");
+  }
   function egressParts(b) {
     const sv = (x) => (typeof x === "string" ? x : "");
     const t = sv(b.display);
@@ -4229,8 +4242,9 @@
       : (Object.prototype.hasOwnProperty.call(EGRESS_FROM_QUEUE, sv(b.state)) ? EGRESS_FROM_QUEUE[sv(b.state)] : "inconsistent");
     const state = el("div", "consent-facts egress-state");
     state.dataset.egressState = s;
-    state.append(el("b", null, s.toUpperCase()), el("span", "ext-meta", EGRESS_WORDS[s]));
-    return { rows: dl, state: state, label: s.toUpperCase() };   // the audit slot is one nowrap line: the label; the words are the state line
+    state.append(el("b", null, egressLabel(s)), el("span", "ext-meta", EGRESS_WORDS[s]));
+    if (sv(b.egress_note)) state.append(el("span", "ext-meta egress-note", sv(b.egress_note)));
+    return { rows: dl, state: state, label: egressLabel(s) };   // the audit slot is one nowrap line: the label; the words are the state line
   }
   function drawConsentBody(row, slot, b, pending) {
     const sv = (x) => (typeof x === "string" ? x : "");
@@ -4282,7 +4296,13 @@
       left.dataset.consentExpires = c.expiresAt;
       head.appendChild(left);
       if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
-    } else head.appendChild(el("span", "consent-audit", c.state));
+    } else {
+      // an egress card's header says what the card says it became (its body, once read, says it from the rows)
+      const word = c.tool === EGRESS_TOOL
+        ? egressLabel(Object.prototype.hasOwnProperty.call(EGRESS_FROM_QUEUE, c.state) ? EGRESS_FROM_QUEUE[c.state] : "inconsistent")
+        : c.state;
+      head.appendChild(el("span", "consent-audit", word));
+    }
     if (c.age) head.appendChild(el("span", "ext-meta", "filed " + c.age));
     if (!pending && c.decidedAge) {
       const when = c.state === "expired" ? "expired " : undecided ? "undecided " : "decided ";
