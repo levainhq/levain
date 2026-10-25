@@ -25,7 +25,8 @@ Keys (R15-17-1): `key_allowed` is the ONE home of "is this a git exchange that n
 `keys.decide_key` calls it, and holds no rule of its own). On a keyed route it narrows
 the attach on a GIT EXCHANGE (`git_exchange`: an endpoint or discovery path, a dumb-protocol path under a `*.git`
 segment, or any `service` query; matched case-folded, `;...` stripped per segment, one trailing `/` stripped) to the
-route's declared repo set; it ANDs into classify's `reattached`. A non-git request keeps the snapshot's rule.
+route's declared repo set, and an encoded separator (`%2F`, `%5C`) in a keyed route's path is keyless outright;
+it ANDs into classify's `reattached`. Any other non-git request keeps the snapshot's rule.
 
 Order (B11) is classify's: walls, R-7, R-5's query mark, then this predicate (never asked about a marked request).
 The decider binds the launch state: `functools.partial(read_shaped, adverts=<the set>, body_cut=<spool result>)`.
@@ -313,14 +314,23 @@ def _canonical_repo(entry: str) -> str | None:
     return None if problem else canon
 
 
+#: An encoded path separator: R-2's canonical form upper-cases every escape it keeps, so these two spellings cover
+#: every case (`%5C` already walls `path`; it is named here too so this rule does not lean on the wall).
+_ENCODED_SEPARATORS = ("%2F", "%5C")
+
+
 def key_allowed(parsed: ParsedRequest, route: "RouteSnapshot | None") -> bool:
     """R15-17-1, the ONE home (S6's `decide_key` calls this): on a keyed route, a git exchange (`git_exchange`)
     carries the held key only for a repo in the route's declared set (matched by prefix exactly as spelled, in R-2's
-    canonical form). A walled path: False. Any other request: True (the snapshot's rule, S6's liveness and
-    classify's `reattached` decide). The discovery GET of an undeclared repo is keyless too."""
+    canonical form). A walled path: False. A path holding an encoded separator (`%2F`, `%5C`, any case): False, git
+    exchange or not, declared repo or not (a server that decodes before routing would see a git path this rule never
+    read). Any other request: True (the snapshot's rule, S6's liveness and classify's `reattached` decide). The
+    discovery GET of an undeclared repo is keyless too."""
     if route is None:
         return True
     if parsed.canonical_path is None:
+        return False
+    if any(sep in parsed.canonical_path for sep in _ENCODED_SEPARATORS):
         return False
     exchange, prefix = git_exchange(parsed)
     if not exchange:

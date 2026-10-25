@@ -533,6 +533,20 @@ def test_f1_dumb_protocol_paths_under_a_git_segment_are_git_exchanges(tail):
     assert advert.key_allowed(_get("/o/undeclared" + tail), rt), "no *.git segment: not a dumb-protocol shape"
 
 
+@pytest.mark.parametrize("path", [
+    "/o/undeclared.git%2Fgit-upload-pack", "/o/undeclared.git%2finfo%2frefs", "/o%2Fundeclared.git/HEAD",
+    "/o/declared.git%2FHEAD", "/o/declared.git/objects%2fab/cdef", "/api%2Fv4/projects", "/api/x%2f",
+    "/o/declared.git%5Cgit-upload-pack", "/api%5cv4"])
+def test_an_encoded_separator_on_a_keyed_route_is_keyless(path):
+    """HEAD_RULINGS_S3B "Encoded separator": a `%2F` or `%5C` (any case) anywhere in a keyed route's path carries no
+    key, git exchange or not, declared repo or not (a server that decodes before routing sees a path the git rule
+    never read; fail closed). An unkeyed host has no key to narrow."""
+    rt = route(declared=("/o/declared.git",))
+    assert not advert.key_allowed(_get(path), rt), path
+    assert not advert.key_allowed(_post_at(path), rt), path
+    assert advert.key_allowed(_get(path), None), path
+
+
 def test_f2_an_accept_range_with_q_zero_or_a_malformed_q_is_not_read_shaped(adverts):
     advertised(adverts)
     for accept in (RES_CT + ";q=0", RES_CT + "; q=0.000", RES_CT + ";Q=0", RES_CT + ";q=abc", RES_CT + ";q=1.5",
