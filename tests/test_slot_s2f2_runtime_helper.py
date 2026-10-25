@@ -269,13 +269,7 @@ def test_unbuilt_verbs_answer_by_name(world):
     assert world.main(["confirm-identity", s, "yes"])[1]["refused"] == "verb-unbuilt:confirm-identity"
 
 
-def test_ticketed_prepare_unbuilt(world):
-    ticket = C.new_handle()
-    stdin = canon.canonical_bytes({"lease_nonce": C.new_handle(), "ticket": ticket})
-    code, line = world.main(["prepare", "egress", "dispatch", "claude", "brokered"], stdin, uid=DISPATCH_UID)
-    assert line["refused"] == "verb-unbuilt:ticket"
-    assert world.calls == [] and "floor" not in world.steps
-    assert world.slot_state(SlotId("egress", 0)).state == "reusable"
+# The ticketed prepare (S1 3c-7) is tests/test_pool.py's.
 
 
 # --- prepare ------------------------------------------------------------------------------------------------------
