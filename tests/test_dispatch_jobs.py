@@ -1380,17 +1380,51 @@ def test_a_repeat_names_itself_and_another_report_for_the_run_is_a_conflict(stor
         verify(store, repo, job, 0, ev=tvr.event(r, at=VERIFIED_AT, verifier_report_refused="verifier-failed:exit"))
 
 
-def test_a_refusal_repeat_names_itself_and_a_job_failed_otherwise_is_a_plain_refusal(store, repo):
+def test_a_refusal_repeat_is_a_repeat_only_on_its_ticket_and_outcome(store, repo):
+    """RULINGS_OBS 10: the refusal that failed a job is stored with its run's ticket and the event's outcome, and only
+    that ticket's same outcome is AlreadyRecorded. Another run's refusal of the same name, after the job failed, is a
+    plain refusal (its follower passes it without an ACK); the same ticket with another outcome is a conflict."""
+    from levain.dispatch.jobs import AlreadyRecorded, RecordConflict
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r0, r1 = tvr.vrun(job.id, 0), tvr.vrun(job.id, 1)
+    verify(store, repo, job, 0, ev=tvr.event(r0, at=VERIFIED_AT, verifier_report_refused="verifier-failed:exit"))
+    with pytest.raises(AlreadyRecorded):
+        verify(store, repo, job, 0, ev=tvr.event(r0, at=VERIFIED_AT, verifier_report_refused="verifier-failed:exit"))
+    with pytest.raises(TransitionRefused) as exc:
+        verify(store, repo, job, 1, ev=tvr.event(r1, at=VERIFIED_AT, verifier_report_refused="verifier-failed:exit"))
+    assert type(exc.value) is TransitionRefused
+    with pytest.raises(RecordConflict):
+        verify(store, repo, job, 0, ev=tvr.event(r0, at=VERIFIED_AT, verifier_report_refused="verifier-failed:other"))
+
+
+def test_a_report_the_writer_refused_repeats_as_already_recorded(store, repo):
+    """A digest event whose envelope the writer refused failed the job under the envelope's refusal name: its repeat
+    is matched on the ticket and the event's digest, not on that name."""
     from levain.dispatch.jobs import AlreadyRecorded
     from tests import test_dispatch_verifier_report as tvr
 
-    other, _ = at_state(store, repo, "verifying")
-    o = tvr.vrun(other.id, 0)
-    verify(store, repo, other, 0, ev=tvr.event(o, at=VERIFIED_AT, verifier_report_refused="verifier-failed:exit"))
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    raw, digest = tvr.envelope(r, tvr.body(("pass", "pass")))
+    bad = "sha256:" + "0" * 64                                         # the event names a digest the envelope is not
+    out = verify(store, repo, job, 0, raw=raw, ev=tvr.event(r, at=VERIFIED_AT, verifier_report_digest=bad))
+    assert out.state == "failed" and out.history[-1].cause == "verifier_refused"
     with pytest.raises(AlreadyRecorded):
-        verify(store, repo, other, 0, ev=tvr.event(o, at=VERIFIED_AT, verifier_report_refused="verifier-failed:exit"))
+        verify(store, repo, job, 0, raw=raw, ev=tvr.event(r, at=VERIFIED_AT, verifier_report_digest=bad))
+
+
+def test_a_refusal_failure_with_no_stored_ticket_is_a_plain_refusal(store, repo):
+    """A job failed verifier_refused by a writer that stored no ticket (a store written before the ticket was kept):
+    a matching name is not enough, so the repeat is a plain refusal and gets no ACK."""
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    store._transition(job.id, "failed", "verifier_refused", evidence="verifier-failed:exit")
     with pytest.raises(TransitionRefused) as exc:
-        verify(store, repo, other, 0, ev=tvr.event(o, at=VERIFIED_AT, verifier_report_refused="verifier-failed:other"))
+        verify(store, repo, job, 0, ev=tvr.event(r, at=VERIFIED_AT, verifier_report_refused="verifier-failed:exit"))
     assert type(exc.value) is TransitionRefused
 
 
