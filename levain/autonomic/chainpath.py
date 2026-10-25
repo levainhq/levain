@@ -3,7 +3,8 @@
 4a fires a length-1 grant end-to-end (``firepath.FireDispatcher``). 4b is the genuinely-new
 structure: a binding whose ``goal`` is an ordered chain of ``SubGoal``s walks its sequence with **the
 GATE TRAVELLING WITH THE CHAIN** — on-loop links fire immediately (while a signed graduation policy
-covers their action: the gate's clamp, 2. below), the chain PAUSES at the first confirm-class link, and link N-1's output threads into link N. This module is (a) the per-link LOOP,
+covers their action: the gate's clamp, 2. below), the chain PAUSES at the first confirm-class link,
+and link N-1's output threads into link N. This module is (a) the per-link LOOP,
 (b) the per-link GOVERNANCE derivation, (c) the inter-link DATA-FLOW, and (d) the pause/resume
 PERSISTENCE. The gate (``EfferentGate``) stays a single-action engine — this orchestrates it
 link-by-link; no gate change.
@@ -666,7 +667,8 @@ class ChainExecutor:
         single link IS the terminal link, already floored at ``binding.posture``). On a resume
         continuation the terminal link is the last index, so the floor applies there too. INTERMEDIATE
         links carry ``ratified_posture=None`` — they run at their natural per-link posture (§A: early
-        on-loop links fire, each only while a graduation policy covers its action; the gate's clamp). The middle-link drift residual remains (per-link sealed postures = 4c)."""
+        on-loop links fire, each only while a graduation policy covers its action; the gate's clamp). The
+        middle-link drift residual remains (per-link sealed postures = 4c)."""
         if gate is None:
             gate = self._handle.current()   # this link's admission: one gate, read once, passed down
         base = self._request_builder(binding, ctx, i)
