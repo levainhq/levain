@@ -65,6 +65,13 @@ def test_crash_after_a_summary_shows_that_summarys_total_marked_crashed() -> Non
     assert "crashed" in r.walls.text and "180" in r.walls.text and "unknown" not in r.walls.text
 
 
+def test_a_malformed_card_row_still_counts_its_names() -> None:
+    rows = [_row(1, "card:credential_in_query", names='["x-amz-signature","sig","<1-4:a:backstop>"]')]
+    r = report.build(rows, [_summary(0, final=True, by_reason={}, hosts={}, count=0)])
+    assert r.cards == {"malformed_card_step": 1}
+    assert r.signed_url_names == {"x-amz-signature": 1} and r.azure_sas_names == 1 and r.backstop_names == 1
+
+
 def test_a_line_the_wire_reader_refuses_is_counted_not_skipped() -> None:
     r = report.build([], [_summary(2, final=True), b'{"t":"wall","host":"x"}\n', b"not json\n"])
     assert r.unreadable_event_lines == 2

@@ -179,14 +179,14 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
         elif step.startswith(_CARD_PREFIX):
             _, _, rest = step.partition(":")
             why, _, answer = rest.rpartition(":")
-            if not why or not answer:
+            if not why or not answer:         # the row's names are still counted below
                 cards[_MALFORMED_CARD] += 1
-                continue
-            cards[f"{why}:{answer}"] += 1
-            if why == "credential_in_query":
-                cred_cards += 1
-            elif why == _UPLOAD_PACK_CAP_CARD:
-                cap_cards += 1
+            else:
+                cards[f"{why}:{answer}"] += 1
+                if why == "credential_in_query":
+                    cred_cards += 1
+                elif why == _UPLOAD_PACK_CAP_CARD:
+                    cap_cards += 1
         for n in _names(r):
             if n in signed:
                 sig_names[n] += 1
