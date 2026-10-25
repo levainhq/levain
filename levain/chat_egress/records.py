@@ -18,8 +18,8 @@ for, and the table refuses every other shape written through this module or by a
   * an outcome joins an ALLOW attempt; an ended row joins an ALLOW or UNDECIDED one (never a deny); `ended` is
     `unknown`, always, in 1.0 (R15-17-9); the row has no transferred-byte field and no raw response-header value
     (R15-12-B5, R15-21-3): `write_outcome` stores the observation's status, its `declared_length` and the decider's
-    `content_type_class` enum (one of "git-upload-pack-advertisement", "other", "absent"), never the raw
-    Content-Type or Content-Length.
+    `content_type_class` enum (one of `CONTENT_TYPE_CLASSES`, the classifier's `advert.CT_*` values), never the
+    raw Content-Type or Content-Length.
   * append-only, with the repo's `_frozen` / `_kept` / `_no_replace` triggers, and `gseq` from the dispatch store's one
     sequence.
   * the attempt row is committed (`BEGIN IMMEDIATE`, `synchronous = FULL`) before `write_attempt` returns, and the
@@ -62,6 +62,7 @@ from typing import Any
 
 from levain.autonomic.durable_sqlite import read_transaction, write_transaction
 from levain.chat_egress import wire
+from levain.chat_egress.advert import CT_ABSENT, CT_ADVERTISEMENT, CT_OTHER
 from levain.chat_egress.lifecycle import Effect, Failure, Settled, Verdict, settle
 from levain.contracts.canon import canonical
 from levain.coordinator.store import _append_only, _in, next_gseq
@@ -86,10 +87,8 @@ _MARKED_EFFECTS = tuple(e for e in Effect if e not in _WRITE_EFFECTS)
 #: the one value `ended` takes in 1.0 (R15-17-9): the adopted surface has no body-end signal
 ENDED_UNKNOWN = "unknown"
 #: R15-21-3: the only thing stored about a response's Content-Type, as the decider classifies it (S3b's
-#: "content_type_class"). The raw value never reaches this module's rows.
-CT_ADVERTISEMENT = "git-upload-pack-advertisement"
-CT_OTHER = "other"
-CT_ABSENT = "absent"
+#: "content_type_class"; the CT_* strings are defined once, in advert, and re-exported here). The raw value never
+#: reaches this module's rows.
 CONTENT_TYPE_CLASSES = (CT_ADVERTISEMENT, CT_OTHER, CT_ABSENT)
 
 

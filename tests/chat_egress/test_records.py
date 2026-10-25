@@ -503,3 +503,12 @@ def test_a_failed_schema_commit_is_the_error_raised_not_the_rollback_after_it(st
 
     with pytest.raises(sqlite3.OperationalError, match="planted COMMIT failure"):
         rec.EgressRecords(Opener())._connect()
+
+
+def test_the_content_type_classes_are_the_classifiers_one_definition():
+    """Item 13: records stores exactly the enum S3b's classifier produces; the strings are defined once (advert)."""
+    from levain.chat_egress import advert
+    assert rec.CONTENT_TYPE_CLASSES == (advert.CT_ADVERTISEMENT, advert.CT_OTHER, advert.CT_ABSENT)
+    assert (rec.CT_ADVERTISEMENT, rec.CT_OTHER, rec.CT_ABSENT) == rec.CONTENT_TYPE_CLASSES
+    for ct in (None, advert.ADVERTISEMENT_TYPE, advert.ADVERTISEMENT_TYPE + "; charset=utf-8", "text/plain", ""):
+        assert advert.content_type_class(ct) in rec.CONTENT_TYPE_CLASSES, ct

@@ -58,7 +58,8 @@ UPLOAD_PACK_SUFFIX = "/git-upload-pack"
 DISCOVERY_SUFFIX = "/info/refs"
 SERVICE = "git-upload-pack"
 
-#: R15-21-3: the only thing ever stored about a response's Content-Type.
+#: R15-21-3: the only thing ever stored about a response's Content-Type. The one definition: records stores these
+#: (its CONTENT_TYPE_CLASSES is built from them).
 CT_ADVERTISEMENT = "git-upload-pack-advertisement"
 CT_OTHER = "other"
 CT_ABSENT = "absent"
