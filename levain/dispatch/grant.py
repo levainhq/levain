@@ -8,7 +8,7 @@ the operator's signature over the contract, which the caller has verified; no an
 
 The paths come from a TOTAL parse (:func:`grant_paths`): Claude Code's ``Write``/``Edit`` name one absolute
 ``file_path`` (:func:`levain.consent.policy.targets`); a Codex ``apply_patch`` names its header paths
-(:func:`levain.consent.adapters.codex.patch_targets`, which reads the lines as Codex's own parser does: that rule
+(:func:`levain.consent.adapters.rules.patch_targets`, which reads the lines as Codex's own parser does: that rule
 has one copy), each joined to the worktree root, ``Move to`` giving both. Anything not read whole is ``None``, never a
 partial list: what it touches cannot be told.
 
@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from levain.cockpit.consent import ConsentError, value_sha256
-from levain.consent.adapters.codex import PATCH_TOOL, patch_targets
+from levain.consent.adapters.rules import PATCH_TOOL, patch_targets
 from levain.consent.policy import AGENT_FILE_TOOLS, targets
 from levain.contracts.canon import canonical_bytes
 from levain.dispatch.contract import GRANTABLE, NEW, PathEntry, ResolvedContract

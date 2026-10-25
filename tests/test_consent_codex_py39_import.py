@@ -1,5 +1,6 @@
-"""``codex.py`` must import under root's Python 3.9 (the queue broker reaches ``patch_targets`` / ``PATCH_TOOL``
-through ``levain.dispatch.grant``). ``tomllib`` is 3.11+, so no reference to it may sit outside a function."""
+"""``codex.py`` stays importable under Python 3.9. The queue broker (root's Python 3.9) once reached
+``patch_targets`` / ``PATCH_TOOL`` through it; it now reads them from ``levain.consent.adapters.rules``, which the
+root-py39 closure job checks. ``tomllib`` is 3.11+, so no reference to it may sit outside a function."""
 from __future__ import annotations
 
 import ast

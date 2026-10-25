@@ -67,12 +67,44 @@ def test_roots_include_the_dynamically_run_modules():
     assert {"levain.slot.forwarder", "levain.slot.wall", "levain.broker.stub"} <= roots
 
 
+QBROKER = "levain.slot.services.qbroker"
+
+
 def test_root_verifies_a_route_map_without_the_authority_store_or_the_autonomic_package():
     """S1 3c-4: CONTROL and keys verify a route map's signature with ``levain.authority_sig``; the authority store
-    (its replay reaches the cockpit) and ``levain.autonomic`` stay out of what root imports."""
-    mods = set(rc.closure())
+    (its replay reaches the cockpit) and ``levain.autonomic`` stay out of what root imports. The queue broker's
+    service runs as ``_levain_qbroker``, never root, and verifies signed grants and counts limits with both, so it is
+    the one root left out here; every other root (the helpers, the reaper, the wall's, CONTROL's and keys' services
+    once they exist) is held to it."""
+    roots = rc._entry_modules()
+    assert QBROKER in roots  # the exclusion names a real root, so it cannot silently exclude nothing
+    mods = set(rc.closure([m for m in roots if m != QBROKER]))
     assert {"levain.slot.routemaps", "levain.authority_sig", "levain.trust_anchor"} <= mods
     assert "levain.authority" not in mods and not {m for m in mods if m.startswith("levain.autonomic")}
+
+
+def test_the_queue_broker_imports_neither_the_agent_hooks_nor_the_dispatch_cli():
+    """The queue broker's closure holds what its paths run, not the agent hooks or the operator's dispatch CLI: the
+    rules it shares with the hooks live in the leaf ``levain.consent.adapters.rules``, the contract bound in
+    ``levain.dispatch.contract``."""
+    mods = set(rc.closure([QBROKER]))
+    assert {"levain.consent.adapters.rules", "levain.dispatch.contract", "levain.authority"} <= mods
+    assert not mods & {"levain.consent.adapters.claude_code", "levain.consent.adapters.codex", "levain.consent.away",
+                       "levain.dispatch.cli"}
+
+
+def test_every_excluded_test_file_exists_is_selected_without_the_table_and_holds_its_evidence():
+    """An entry of NOT_ROOT_TESTS cannot rot: its file exists, the import rule alone would still select it (so the
+    entry still excludes something), and both evidence strings of its reason are where it says."""
+    mods = rc.closure()
+    unfiltered = set(rc._test_files(mods, excluded={}))
+    filtered = set(rc._test_files(mods))
+    assert unfiltered - filtered == set(rc.NOT_ROOT_TESTS)
+    root = Path(__file__).resolve().parents[1]
+    for name, (reason, marker, (other, needle)) in rc.NOT_ROOT_TESTS.items():
+        assert reason and (root / name).is_file(), name
+        assert marker in (root / name).read_text(encoding="utf-8"), (name, marker)
+        assert needle in (root / other).read_text(encoding="utf-8"), (name, other, needle)
 
 
 def test_a_test_with_an_unparseable_helper_is_not_selected(tmp_path, monkeypatch, capsys):

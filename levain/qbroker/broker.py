@@ -126,7 +126,7 @@ from typing import Any, Protocol
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _TIER_NEEDS
 from levain.consent import limits as consent_limits
-from levain.consent.away import MAX_HOLD
+from levain.consent.adapters.rules import MAX_HOLD
 from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.record import ExternalGateRequest
 from levain.qbroker import grants, wire

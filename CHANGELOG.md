@@ -6,6 +6,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- **Two sessions making their first call at the same moment no longer have one call refused with `database is
+  locked`.** On a store not yet created (the queue broker's `limits.db` on a fresh install, or any other Levain store),
+  opening it now waits for the other opener, up to the same 30 seconds as any other lock, including on the macOS
+  system Python 3.9.
+
+### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- **The queue broker's service program exists for an isolated install.** It serves every slot's queue socket, so slot
+  sessions' tool-call limits are enforced, and picks up slots added later without a restart. No `levain` command
+  installs or starts it yet.
+
 ## [0.11.25] — 2026-10-25
 
 ### Added

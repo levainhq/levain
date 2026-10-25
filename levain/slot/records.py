@@ -763,6 +763,8 @@ def _parse_front_reg(data: bytes, front_uid: int) -> FrontReg:
 
 SLOT_STATE_FORMAT = "levain-slot-state/1"
 SLOT_STATES = ("leased", "scrubbed", "reusable", "retired")
+#: the slot states that take a slot out of service: the one home :func:`in_service` reads.
+OUT_OF_SERVICE = frozenset({"retired"})
 #: §3.5 ``{class, index, rev, lease_seq, state, session?, dispatch_eligible, changed_at}``. DECISION: with a
 #: ``format`` key, as every other record here carries one though its section's field list omits it.
 SLOT_STATE_KEYS = frozenset({"format", "class", "index", "rev", "lease_seq", "state", "session",
@@ -781,6 +783,13 @@ class SlotState:
     dispatch_eligible: bool
     changed_at: str
     session: str | None = None
+
+
+def in_service(state: SlotState | None) -> bool:
+    """Is a slot with this state record in service? DECISION: a slot with no state record (``None``) is (one an
+    install made before state files). The one home for the predicate: ``install_helper.slots_in_service`` and the
+    queue broker service's ``scan`` both call it."""
+    return state is None or state.state not in OUT_OF_SERVICE
 
 
 def slot_state_bytes(s: SlotState) -> bytes:
@@ -896,11 +905,11 @@ __all__ = [
     "AllocBase", "AllocPolicy", "base_obj",
     "BRAKED", "CAS_FIELDS", "CREDENTIAL_PARKED", "DEAD", "EDGES", "END_FROM_STATES", "END_INTO_STATES",
     "EVENT_KINDS", "EXCLUSIVE_PAIRS", "FIELD_CHECKS", "FRONT_REG_KEYS", "FROZEN", "Front", "FrontReg", "HELD",
-    "LIVE_STATES", "MINT_CLAIM_KEYS", "NotDurable", "OBSERVED_ID_RE", "PERSISTED_CLAIM_KEYS", "PURGED", "REG_TOKEN",
+    "LIVE_STATES", "MINT_CLAIM_KEYS", "NotDurable", "OBSERVED_ID_RE", "OUT_OF_SERVICE", "PERSISTED_CLAIM_KEYS", "PURGED", "REG_TOKEN",
     "RENDERED", "RENDERING", "RETAINED", "REVOKED",
     "REVOKED_SET_STATES", "SLOT_STATES", "SLOT_STATE_FORMAT", "STATES", "STATE_FORMAT", "SessionState", "SlotState",
     "TOUCHED_NAMES", "TRASH", "alloc_bytes", "alloc_record",
     "cgroup_path", "check_alloc", "check_exclusive", "check_session", "check_state", "check_timestamp",
-    "epoch_of", "front_reg_bytes", "has_mint_claims", "parse_alloc", "parse_attach_claims", "parse_claims",
+    "epoch_of", "front_reg_bytes", "has_mint_claims", "in_service", "parse_alloc", "parse_attach_claims", "parse_claims",
     "parse_front_reg", "parse_mint_claims", "parse_slot_state", "parse_state", "read_record", "slot_obj", "slot_state_bytes", "state_bytes", "state_record", "timestamp", "write_durably",
 ]
