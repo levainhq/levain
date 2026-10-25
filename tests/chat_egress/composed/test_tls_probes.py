@@ -80,6 +80,13 @@ def test_a_socks_refusal_records_a_wall(make_tls_launch) -> None:
         s.recv(64)
     finally:
         s.close()
+    deadline = time.monotonic() + 5.0                    # the wall appears in the report, bounded; not a stop-order wait
+    while True:
+        r = report.build_from_files(L.e.records.rows(L.e.launch_id), L.e.events)
+        if "at least 1" in r.walls.text or time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    assert "at least 1" in r.walls.text, r.walls.text          # the wall is in the report before any stop
     L.stop()
     r = report.build_from_files(L.e.records.rows(L.e.launch_id), L.e.events)
     print("RUN C-1 SOCKS wall in the report:", r.text())
