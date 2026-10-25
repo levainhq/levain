@@ -1000,11 +1000,25 @@ def _readable(value: str) -> str | None:
         return None
 
 
+def _caps_snapshot(caps: Any) -> tuple[bool, bool]:
+    """``(steer, queue)`` as plain bools: the driver's object is read here, outside every transaction."""
+    return bool(caps.steer), bool(caps.queue)
+
+
+def _plain_norm(value: Any) -> str:
+    """A driver's normalized text as an exact ``str`` (a subclass's own methods are driver code, which must not run
+    in a transaction); anything that is not a string is refused."""
+    if not isinstance(value, str):
+        raise CoordError("a driver's normalized form is a string")
+    return str.__str__(value)
+
+
 class ChatService:
     """Walks the send path over a :class:`ChatStore` and the :class:`~levain.coordinator.driver.DriverSession` s
     attached to it, one per worker launch. Every verdict is the service's, from rows and raw vendor evidence; a
     session decides nothing. ``fault(point)`` is the crash-matrix seam, called at each of
-    :data:`SEND_FAULT_POINTS`.
+    :data:`SEND_FAULT_POINTS` with a launch's mutex held: a hook must not call back into the service for that launch
+    (test-only; the mutex is not re-entrant).
 
     Each launch has one mutex, the service's: a send holds it from its preflight to its outcome (so two sends never
     meet inside one session), a read holds it from its first read of the store to its last write, and attaching or
@@ -1041,6 +1055,8 @@ class ChatService:
 
     def detach(self, launch_id: str) -> None:
         """Forget the launch's session and close it, once any send or read of the launch in flight has finished."""
+        if self._session(launch_id) is None:
+            return
         with self._launch_lock(launch_id):
             with self._guard:
                 session = self._sessions.pop(launch_id, None)
@@ -1074,16 +1090,19 @@ class ChatService:
         if not isinstance(launch_id, str) or _LAUNCH_ID.fullmatch(launch_id) is None:
             raise CoordError(f"no worker launch {str(launch_id)[:40]!r}")
         owner = f"{author_surface}:{client_id}"
+        # a launch that does not exist gets no lock: the registry holds attached and real launches only
+        self._chat._read(lambda conn: self._need_worker(conn, launch_id))
         with self._launch_lock(launch_id):
             session = self._session(launch_id)
             caps = normalized = None
-            if session is not None:
-                caps = session.capabilities()
-                normalized = session.normalize(body) if isinstance(body, str) else body
+            # a resend of a stored outbox_id answers from the store alone: no driver method runs for it
+            stored = self._chat._read(lambda conn: _message(conn, "outbox_id", outbox_id)) \
+                if isinstance(outbox_id, str) else None
+            if session is not None and stored is None:
+                caps = _caps_snapshot(session.capabilities())
+                normalized = _plain_norm(session.normalize(body)) if isinstance(body, str) else body
             with self._chat._write() as (conn, now):
-                role, _state, _h = _launch_state(conn, launch_id)
-                if role != "worker":
-                    raise CoordError(f"no worker launch {launch_id!r}")
+                self._need_worker(conn, launch_id)
                 row = conn.execute("SELECT j.value FROM launches l, json_each(l.threads) j WHERE l.launch_id = ? "
                                    "LIMIT 1", (launch_id,)).fetchone()
                 if row is None:
@@ -1105,10 +1124,17 @@ class ChatService:
             self._fault("pending_committed")
             return self._attempt_and_call(m, session, caps, owner)
 
+    @staticmethod
+    def _need_worker(conn: sqlite3.Connection, launch_id: str) -> None:
+        role, _state, _h = _launch_state(conn, launch_id)
+        if role != "worker":
+            raise CoordError(f"no worker launch {launch_id!r}")
+
     def _preflight(self, conn: sqlite3.Connection, now: str, m: ChatMessage, caps: Any, owner: str) -> str | None:
         """B1 launch state, B2 the §4.2 fold, B3 the fence (yours only; the coordinator queues unfenced, B11), B9 a
-        steer names the vendor's open turn. The first no, as a cause; None when all pass. ``caps`` is the attached
-        session's capabilities, read before the transaction (None: no session)."""
+        steer names the vendor's open turn. The first no, as a cause; None when all pass. ``caps`` is
+        ``(steer, queue)`` as plain bools, copied from the attached session's capabilities before the transaction
+        (None: no session)."""
         _role, state, _h = _launch_state(conn, m.launch_id)
         if state != "active":
             return _cause_text(f"launch {m.launch_id} is {state}; only a running worker takes a message")
@@ -1123,12 +1149,12 @@ class ChatService:
             except TurnRefused as exc:
                 return _cause_text(exc)
         if m.mode == "steer":
-            if not caps.steer:
+            if not caps[0]:
                 return "this vendor takes no steer; queue the message instead"
             if not self._turn_open(conn, m.launch_id, m.expected_turn_id):
                 return _cause_text(f"turn {m.expected_turn_id} is not running; a steer lands only in the turn it "
                                    "names")
-        elif not caps.queue:
+        elif not caps[1]:
             return "this vendor takes no queued message"
         return None
 
@@ -1216,17 +1242,20 @@ class ChatService:
         (§2.4), resolving any send the batch proves, then re-check every ambiguous send of the launch (§7.3). An
         event at or before the launch's first ``complete_through`` is backfill. A ``complete_through`` before the
         one already persisted is not persisted: the frontier never moves back. The count of new events."""
+        refusal = f"no driver session is attached to launch {str(launch_id)[:40]}; nothing was read"
+        if self._session(launch_id) is None:
+            raise CoordError(refusal)
         with self._launch_lock(launch_id):
             session = self._session(launch_id)
             if session is None:
-                raise CoordError(f"no driver session is attached to launch {str(launch_id)[:40]}; nothing was read")
+                raise CoordError(refusal)
             correlated = bool(session.capabilities().correlation_field)
             seen = []
             for e in batch.events:
                 body = e.body
                 seen.append(_Seen(e.key, e.kind, e.pos, e.turn_id, e.call_id, body,
-                                  session.normalize(body) if isinstance(body, str) else body, e.correlation,
-                                  e.vendor_id))
+                                  _plain_norm(session.normalize(body)) if isinstance(body, str) else body,
+                                  e.correlation, e.vendor_id))
             through, cursor, gap = batch.complete_through, batch.next_cursor, bool(batch.gap)
             def frontier(conn: sqlite3.Connection) -> tuple[str | None, str | None, tuple[int, int, int]]:
                 _worker_launch(conn, launch_id)
@@ -1235,7 +1264,7 @@ class ChatService:
             first, prev, mark = self._chat._read(frontier)
             backfill = [first is None or not session.pos_lt(first, e.pos) for e in seen]
             if through is not None and prev is not None and session.pos_lt(through, prev):
-                through = prev
+                through, gap = prev, False      # an older batch: the persisted frontier already covers its gap
             new = 0
             with self._chat._write() as (conn, now):
                 if _fingerprint(conn, launch_id) != mark:
@@ -1299,14 +1328,17 @@ class ChatService:
         digest equals the send's. Shown beside it; never authorship, never delivery (B12). Empty with no session
         attached (no ``pos_lt`` to place them with)."""
         m = self._chat.message(message_id)
-        session = None if m is None or m.launch_id is None else self._session(m.launch_id)
-        if session is None:
+        if m is None or m.launch_id is None or self._session(m.launch_id) is None:
             return []
-        read = self._chat._read(lambda conn: _launch_read(conn, m.launch_id))
-        att = next((a for a in read.attempts if a.message_id == m.message_id), None)
-        if att is None or att.state != "ambiguous":
-            return []
-        return [i.key for i in _window(read, att, session.pos_lt) if i.norm == att.norm]
+        with self._launch_lock(m.launch_id):         # a detach or a send waits for the comparisons, and the reverse
+            session = self._session(m.launch_id)
+            if session is None:
+                return []
+            read = self._chat._read(lambda conn: _launch_read(conn, m.launch_id))
+            att = next((a for a in read.attempts if a.message_id == m.message_id), None)
+            if att is None or att.state != "ambiguous":
+                return []
+            return [i.key for i in _window(read, att, session.pos_lt) if i.norm == att.norm]
 
     def anomalies(self, launch_id: str) -> list[Anomaly]:
         """The launch's ``chat_anomalies`` rows, in order."""

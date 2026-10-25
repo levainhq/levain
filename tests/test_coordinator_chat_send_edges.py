@@ -417,3 +417,149 @@ def test_fingerprint_change_under_ingest_writes_nothing(cs, world, qdir):
     c = sqlite3.connect(qdir / "dispatch.db")
     assert c.execute("SELECT COUNT(*) FROM chat_events").fetchone()[0] == 0
     c.close()
+
+
+# --- L3 round 2: bounds and reorders on the round-1 fix -------------------------------------------------------------
+class _Touchy:
+    """A capabilities object that is not a plain tuple: reading a field is driver code, and it says where it ran."""
+    correlation_field = None
+    interrupt_by_turn = idempotency_key = catch_up = replays_pending_requests = False
+    vendor_version = "touchy"
+
+    def __init__(self, inside, seen):
+        self._inside, self._seen = inside, seen
+
+    @property
+    def steer(self):
+        if self._inside():
+            self._seen.append("steer")
+        return True
+
+    @property
+    def queue(self):
+        if self._inside():
+            self._seen.append("queue")
+        return True
+
+
+def _watch_writes(cs):
+    depth = threading.local()
+    real = cs._write
+
+    @contextmanager
+    def watched_write():
+        depth.n = getattr(depth, "n", 0) + 1
+        try:
+            with real() as got:
+                yield got
+        finally:
+            depth.n -= 1
+
+    cs._write = watched_write
+    return lambda: getattr(depth, "n", 0) > 0
+
+
+def test_a_capabilities_getter_never_runs_inside_a_write_transaction(cs, world):
+    inside = _watch_writes(cs)
+    seen = []
+
+    class S(ScriptedSession):
+        def capabilities(self):
+            return _Touchy(inside, seen)
+
+    svc = ready(cs, world, S(sends=("accept",)))
+    assert send(svc, cs, world).state == "accepted"
+    assert seen == []
+
+
+class _Sneaky(str):
+    """A normalized form whose own methods are driver code; ``encode`` is what the store hashes it with."""
+    where = None
+
+    def encode(self, *a, **kw):
+        if _Sneaky.where is not None and _Sneaky.where():
+            _Sneaky.seen.append("encode")
+        return str.encode(self, *a, **kw)
+
+    seen: list = []
+
+
+def test_a_normalized_form_is_a_plain_string_before_any_transaction(cs, world):
+    _Sneaky.where, _Sneaky.seen = _watch_writes(cs), []
+    try:
+        svc = ready(cs, world, ScriptedSession(sends=("accept",), normalize=lambda t: _Sneaky(t)))
+        assert send(svc, cs, world).state == "accepted"
+        svc.ingest(world["launch"], batch(event("user_item", "u1", "00000009", body="typed"), through="00000009"))
+        assert _Sneaky.seen == []
+    finally:
+        _Sneaky.where = None
+
+
+def test_a_resend_of_a_stored_outbox_id_calls_no_driver_method(cs, world):
+    class Gone(ScriptedSession):
+        broken = False
+
+        def capabilities(self):
+            if self.broken:
+                raise RuntimeError("the session went away")
+            return super().capabilities()
+
+        def normalize(self, text):
+            if self.broken:
+                raise RuntimeError("the session went away")
+            return super().normalize(text)
+
+    s = Gone(sends=("accept",))
+    svc = ready(cs, world, s)
+    first = send(svc, cs, world)
+    s.broken = True
+    again = send(svc, cs, world)                                            # the same outbox_id, the same words
+    assert again.state == "accepted" and again.message_id == first.message_id and again.created is False
+
+
+def test_candidates_waits_for_a_send_in_flight_on_its_launch(cs, world):
+    s = Blocking(sends=("ambiguous", "accept"))
+    svc = ready(cs, world, s)
+    s.release.set()
+    r1 = coord_send(svc, cs, world, "one", "ob-0000000a")
+    s.release.clear()
+    a = threading.Thread(target=lambda: coord_send(svc, cs, world, "two", "ob-0000000b"))
+    a.start()
+    assert s.entered[1].wait(WAIT)
+    got = {}
+    c = threading.Thread(target=lambda: got.setdefault("c", svc.candidates(r1.message_id)))
+    c.start()
+    c.join(STILL)
+    assert c.is_alive()                                                     # pos_lt would run beside a send, a detach
+    s.release.set()
+    a.join(WAIT)
+    c.join(WAIT)
+    assert got["c"] == []
+
+
+def test_an_older_batch_with_a_gap_is_not_a_gap_at_the_frontier(cs, world):
+    s = ScriptedSession(sends=("lose",))
+    svc = ready(cs, world, s)
+    s.show("agent_text", body="x")
+    older = s.read("00000000")
+    s.show("agent_text", body="y")
+    svc.ingest(world["launch"], s.read("00000000"))                         # the frontier: 00000002
+    svc.ingest(world["launch"], ReadBatch(older.events, older.next_cursor, older.complete_through, True))
+    assert anchor_of(cs, world["launch"]) == "00000002"
+    r = send(svc, cs, world)                                                # anchored at the frontier
+    other = event("user_item", "other", "00000003", body="something else")
+    svc.ingest(world["launch"], batch(other, through="00000003"))
+    assert states(cs, r.message_id)[-1] == "not_delivered"                  # the stale gap was subsumed by the frontier
+
+
+def test_no_lock_is_allocated_for_a_launch_that_does_not_exist(cs, world):
+    svc = ready(cs, world, ScriptedSession())
+    held = set(svc._locks)
+    ghost = "ln-" + "f" * 32
+    with pytest.raises(CoordError):
+        svc.send(ghost, author_surface="coordinator", client_id="coord-1", outbox_id="ob-00000009", body="hi",
+                 author_kind="coordinator")
+    with pytest.raises(CoordError):
+        svc.ingest(ghost, ReadBatch((), None, None, False))
+    svc.detach(ghost)
+    assert set(svc._locks) == held
