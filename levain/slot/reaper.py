@@ -213,6 +213,22 @@ def dispatch_retain_days(store: H.Store, log: Callable[[str], None]) -> int:
     return max(int(text), DISPATCH_RETAIN_DAYS_FLOOR)
 
 
+def _retention_discard(facts: SV.StoreFacts, seams: SV.StoreSeams) -> None:
+    """:func:`levain.slot.store_verbs.discard` for step 3c, with ``restored_at`` checked again while the session lock
+    is held, after a journal the session holds is finished and before the discard's own journal is begun (L3 r1 fix 2,
+    codex 2): a restore that landed after the pass read ``restored_at`` absent refuses ``restored``, never a trash."""
+    with SV.session_lock(facts, seams):
+        if SV._finish_journal(facts, seams, "discard"):
+            return
+        if os.path.lexists(facts.retained / "restored_at"):
+            raise Refused("restored", facts.session)
+        if os.path.lexists(facts.trash):
+            raise Refused("not-retained:trash", facts.session)
+        if not SV.retained_whole(facts, seams):
+            raise Refused("not-retained:absent", facts.session)
+        SV._start(facts, seams, SV.discard_plan(facts, seams))
+
+
 def _new_report(boot_id: str, seq: int, started: float) -> Dict[str, object]:
     return {"boot_id": boot_id, "pass_seq": seq, "started_at": R.timestamp(started), "control": "up",
             "swept": [], "revoked": [], "reconciled": [], "ended": [], "scrubbed": [], "reverted": [], "braked": [],
@@ -629,7 +645,7 @@ class Reaper:
                     if now - R.epoch_of(stamp) < days * DAY_S:
                         continue
                 try:
-                    SV.discard(facts, seams)
+                    _retention_discard(facts, seams)
                 except Refused as e:
                     rep["skipped"].append(f"retain:{s}:{e.name}")            # type: ignore[union-attr]
                     continue

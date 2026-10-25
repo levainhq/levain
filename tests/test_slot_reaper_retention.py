@@ -147,3 +147,27 @@ def test_run_pass_runs_the_retention_step():
     src = inspect.getsource(RP.Reaper.run_pass)
     assert '("3c", self.dispatch_retention)' in src and '"3c", "5"' not in src
     assert canon  # noqa: B018 - imported for parity with the world module
+
+
+def test_a_restore_between_the_decision_and_the_discard_is_never_trashed(rw, monkeypatch):
+    """L3 r1 fix 2 (codex 2): the operator's discard + restore landing after the pass read `restored_at` absent and
+    before its discard takes the session lock. The retention discard re-checks `restored_at` under that lock, so the
+    restored session stays RETAINED (and keeps its `restored_at`)."""
+    from levain.slot import store_verbs as SV
+
+    real = SV.session_lock
+    fired = {"done": False}
+
+    def interleaved(facts, seams):
+        if not fired["done"]:
+            fired["done"] = True
+            assert rw.main("discard")[0] == RH.EXIT_OK
+            assert rw.main("restore")[0] == RH.EXIT_OK
+        return real(facts, seams)
+
+    rw.record(artifact_acked=True)
+    monkeypatch.setattr(SV, "session_lock", interleaved)
+    rep = rw.step()
+    assert fired["done"]
+    assert rep["trashed"] == [] and rep["skipped"] == [f"retain:{S}:restored"]
+    assert rw.where(S) == (R.RETAINED, ["retained"]) and (rw.L / "retained" / S / "restored_at").exists()
