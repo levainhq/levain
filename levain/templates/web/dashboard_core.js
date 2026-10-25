@@ -3653,7 +3653,10 @@
   const composePick = Object.create(null);
   const composeGen = Object.create(null);     // per compose key: bumped by every send, so a slow departed-seat recovery can tell a later send overtook it
 
-  function buildActionBox(action, spec) {
+  // `stay` (optional) is a box addressed to ONE reader that outlives its own send (the agent page's message box, which no board reload
+  // rebuilds): {pickKey, gone}. Its recipient field holds that one id; no chip or picker is drawn, so it can never fall back to everyone;
+  // its kept pick is its own key; a landed send empties its text and says so; the departed-reader refusal calls `gone` (it holds the box).
+  function buildActionBox(action, spec, stay) {
     const box = el("div", "tray-dump");
     // The at-most-once key for an idempotent verb is stable per SEND CONTENT: a retry of identical
     // content (a network-fail re-click, or a tailnet/proxy/browser replay of the same body) reuses
@@ -3714,7 +3717,7 @@
         });
         group.appendChild(pick);
         group.appendChild(el("span", "ck-to-hint", "none selected = everyone"));
-        box.insertBefore(group, box.firstChild);
+        if (!stay) box.insertBefore(group, box.firstChild);
         const pressedNow = () => chips.filter((c) => c.getAttribute("aria-pressed") === "true").map((c) => c.dataset.value);
         function setTo(values, remember) {
           const want = new Set(values);
@@ -3725,7 +3728,7 @@
           chipAddr();
         }
         // a rebuild of this box (every refetch of the panel) keeps what the person chose, as far as it is still in the enum
-        const pickKey = String(action.panel || action.verb);
+        const pickKey = stay && stay.pickKey ? String(stay.pickKey) : String(action.panel || action.verb);
         const kept = composePick[pickKey];
         const inEnum = new Set(chips.map((c) => c.dataset.value));
         const keptNow = Array.isArray(kept) ? kept.filter((v) => inEnum.has(v)) : null;
@@ -3783,9 +3786,6 @@
     if (chipCtl) {
       chipCtl.set(chipCtl.initial, false);
       box.dataset.composeKey = chipCtl.pickKey;
-      box.ckBusy = () => go.disabled;                 // mid-send or at the confirm: the recipient is frozen
-      box.ckPick = (values) => { if (go.disabled) return false; chipCtl.set(values); return true; };   // the agents graph's tap on a seat (messageTo, below)
-      box.ckPrefix = typeof chipCtl.f.transient_prefix === "string" ? chipCtl.f.transient_prefix : "";   // messageTo's name -> chip id
     }
     const msg = el("span", "edit-msg", "");
     row.append(go, msg);
@@ -3819,9 +3819,22 @@
       const text = res ? [res.error, res.message].map((x) => String(x || "")).join(" ") : "";
       const gm = chipCtl ? chipCtl.f.gone_match : null;
       if (chipCtl && typeof gm === "string" && gm && typeof chipCtl.f.transient_prefix === "string" && chipCtl.f.transient_prefix
-          && text.toLowerCase().includes(gm.toLowerCase())) { seatGone(); return true; }
+          && text.toLowerCase().includes(gm.toLowerCase())) {
+        if (stay) { if (typeof stay.gone === "function") stay.gone(msg); return true; }
+        seatGone(); return true;
+      }
       setDisabled(false);
       return false;
+    };
+    // a send landed on a box that stays: its typed text goes, its reader stays, and the next identical text is a new send
+    const landed = () => {
+      lastSend = null;
+      for (const c of controls) {
+        if (c.f.chips || c.f.kind === "multiselect") continue;
+        for (const n of c.nodes) { n.value = ""; if (n.tagName === "TEXTAREA") growToText(n); }
+      }
+      setDisabled(false);
+      msg.className = "edit-msg"; msg.textContent = "sent";
     };
     async function seatGone() {
       const notice = "that reader is gone, choose again";
@@ -3914,13 +3927,14 @@
     };
     go.addEventListener("click", () => {
       const c = collect();
+      if (stay && chipCtl && chipCtl.read().length !== 1) { msg.className = "edit-msg err"; msg.textContent = "no reader to send to; nothing was sent"; return; }
       if (c.error) { msg.className = "edit-msg err"; msg.textContent = c.error; return; }
       const sendKey = keyForSend(c.params);  // stable across a retry of THIS content (above)
       if (!spec.confirm_required) {
         setDisabled(true); msg.className = "edit-msg busy"; msg.textContent = "…";
         const restore = takePick();
         if (spec.job) { startJob(c.params, sendKey, restore).then((held) => { if (!held) setDisabled(false); }); return; }
-        fire(c.params, false, sendKey).then((res) => { if (!(res && res.ok)) failed(res, restore); });
+        fire(c.params, false, sendKey).then((res) => { if (!(res && res.ok)) failed(res, restore); else if (stay) landed(); });
         return;
       }
       // confirm step (the fat-finger gate): swap the send button for a confirm/cancel pair AND
@@ -3959,7 +3973,7 @@
           return;
         }
         const res = await fire(c.params, true, sendKey);
-        if (res && res.ok) return;  // re-rendered → this box is gone, replaced fresh
+        if (res && res.ok) { if (stay) { close(); landed(); } return; }  // re-rendered → this box is gone, replaced fresh (a box that stays is not)
         close(true); failed(res, restore);
       });
     });
@@ -5125,6 +5139,34 @@
     modalEpisodeQuery = "";
     buildModal(null);
   }
+  // The reader id a compose panel of the current view gives the seat called `name`, or null: a panel whose own action carries a recipient
+  // field with a declared `transient_prefix`, whose enum (the one the view holds NOW) has prefix + name. Read from the view, never from a
+  // chip on the compose card, so a card that is folded, on another tab, mid-send or drawn without that chip does not decide it.
+  function seatRecipient(name) {
+    if (!currentView || !commitAction || typeof name !== "string" || !name) return null;
+    const ex = currentView.extra_panels || {}, verbs = currentView.action_verbs || {};
+    for (const entry of (Array.isArray(currentView.layout) ? currentView.layout : [])) {
+      const data = entry && ex[entry.id], act = data && data.action;
+      if (!act || !act.verb || !verbs[act.verb] || !Array.isArray(act.fields)) continue;
+      const f = act.fields.find((x) => x && x.chips && typeof x.transient_prefix === "string" && x.transient_prefix);
+      if (!f) continue;
+      const id = f.transient_prefix + name;
+      if ((Array.isArray(f.options) ? f.options : []).some((o) => (typeof o === "string" ? o : o && o.value) === id)) return { act, spec: verbs[act.verb], field: f, id };
+    }
+    return null;
+  }
+  // A seat's message box on its agent page: the compose panel's own verb, built by the same box builder the compose card uses (so the
+  // confirm, the passkey signature of a signed verb and the failure words are the card's), its reader fixed to this seat.
+  function seatMessageBox(name) {
+    const wrap = el("div", "agent-msg");
+    wrap.appendChild(el("div", "needs-sec-label", "Message " + name));
+    const r = seatRecipient(name);
+    if (!r) { wrap.appendChild(el("div", "agent-msg-none ext-meta", "can't message this seat right now")); return wrap; }
+    const fields = r.act.fields.map((f) => (f === r.field ? Object.assign({}, f, { options: [r.id], default: [r.id] }) : f));
+    const gone = (msg) => { msg.className = "edit-msg err"; msg.textContent = "this seat is gone; nothing was sent"; };
+    wrap.appendChild(buildActionBox(Object.assign({}, r.act, { fields: fields }), r.spec, { pickKey: "seat-page:" + r.id, gone: gone }));
+    return wrap;
+  }
   // The agent page: one node of the Agents graph opened as a modal. The fact rows come from the caller (the graph's one row builder);
   // the transcript is read at open through the session reader and drawn by the session drawer.
   function openAgentPage(page, opener) {
@@ -5137,6 +5179,7 @@
       const dl = el("dl", "consent-kv");
       for (const [k, v] of (Array.isArray(page.rows) ? page.rows : [])) { dl.appendChild(el("dt", null, k)); dl.appendChild(el("dd", null, String(v))); }
       c.appendChild(dl);
+      if (typeof page.seat === "string" && page.seat) c.appendChild(seatMessageBox(page.seat));
       if (!stem) { c.appendChild(el("div", "ext-meta", "this view keeps no transcript for this agent")); return c; }
       const wrap = el("div", "sess-tx-wrap");
       const slot = el("div", "sess-tx ext-meta");
@@ -6396,47 +6439,7 @@
     }
   }
 
-  // The agents graph's tap on a seat: press exactly that seat's chip on the compose card, bring the card into view and focus its message
-  // box. The graph passes the seat's NAME; its chip id is the card's declared `transient_prefix` + that name (a card that declares no
-  // prefix addresses no seat by name). A seat is messageable IFF that id is among the chips the card holds NOW (the enum changes with the
-  // roster): a false answer means "not a seat you can message", and the caller keeps its own click.
-  function messageTo(name) {
-    if (typeof name !== "string" || !name) return false;
-    const chip = Array.from(document.querySelectorAll('[data-ck-compose="recipient"]')).find((c) => {
-      const b = c.closest(".tray-dump");
-      return b && typeof b.ckPrefix === "string" && b.ckPrefix && c.dataset.value === b.ckPrefix + name
-        && !c.closest("#levain-modal") && !c.disabled;
-    });
-    const chipId = chip ? chip.dataset.value : "";
-    const box = chip ? chip.closest(".tray-dump") : null;
-    if (!chip || !box || typeof box.ckPick !== "function" || (typeof box.ckBusy === "function" && box.ckBusy())) return false;
-    const panel = chip.closest("[data-ck-panel]");
-    const K = layoutKit();
-    if (panel) {
-      if (K && typeof K.revealTab === "function") K.revealTab(panel);   // the card is on another tab: show the tab that has it
-      if (panel.classList.contains("ck-collapsed")) {                  // folded: its own fold button opens it
-        const fold = panel.querySelector(".phead .ck-lay-fold");
-        if (fold && !fold.disabled) fold.click();
-      }
-    }
-    box.ckPick([chipId]);
-    // a tab change redraws the board, which rebuilds this box (it keeps the pick): land again on the box that is there a frame later
-    // only the card that was pressed (its compose key), never another card that happens to offer the same chip id
-    const key = box.dataset.composeKey;
-    const land = () => {
-      const b = Array.from(document.querySelectorAll(".tray-dump")).find((x) => x.dataset.composeKey === key && !x.closest("#levain-modal")
-        && Array.from(x.querySelectorAll('[data-ck-compose="recipient"]')).some((c) => c.dataset.value === chipId));
-      const ta = b ? b.querySelector(".tray-dump-ta") : null;
-      if (!ta || document.activeElement === ta) return;
-      if (typeof b.scrollIntoView === "function") b.scrollIntoView({ block: "center" });
-      if (typeof ta.focus === "function") ta.focus({ preventScroll: true });
-    };
-    land();
-    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(() => window.requestAnimationFrame(land));
-    return true;
-  }
-
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, messageTo, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

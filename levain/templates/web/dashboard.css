@@ -719,6 +719,10 @@
     margin: 0 0 var(--sp-3); padding: var(--sp-3); border-radius: var(--r-sm);
     background: var(--base); border: 1px solid var(--line-hot);
   }
+  /* a seat's message box on its agent page (the graph's tap on a seat): under the status rows, before the transcript */
+  .agent-msg { display: flex; flex-direction: column; gap: var(--sp-2); margin: var(--sp-4) 0; }
+  .agent-msg .tray-dump { margin: 0; }
+  .agent-msg-none { padding: var(--sp-2) 0; }
   /* Async-job (consult) in-box result: a status line + the scrollable result text. CSP-safe
      (a served class, never an inline style); textContent-only on the render side. */
   .job-result-wrap { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-2); }

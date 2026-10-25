@@ -1,7 +1,7 @@
 """The decision mark on the agents graph (Phill 10-23: "when the desk is waiting for a decision the agent graph should indicate that somehow"):
 the hub and a seat node that carry `needs_open` > 0 are drawn with a red ring and a "!" badge holding the count; 0, absent, negative and
-non-integer draw nothing; a tap on the badge opens `needs_first_card`'s card and nothing else (no card id: a label, not a button); a tap elsewhere on the node keeps its page / its
-message box. Real page in headless Chrome, a literal topology value painted the way the seat-message tests do."""
+non-integer draw nothing; a tap on the badge opens `needs_first_card`'s card and nothing else (no card id: a label, not a button); a tap elsewhere on the node opens its page (a
+seat's holds its message box). Real page in headless Chrome, a literal topology value painted the way the seat-message tests do."""
 from __future__ import annotations
 
 import json
@@ -9,6 +9,9 @@ import json
 from tests.test_cockpit_f12b_topology_view import NARROW, TV, _paint, _value
 from tests.test_cockpit_flip_parity import needs_browser
 from tests.test_cockpit_seatmsg import CHIPS, PRESSED, PRIME, _run, _tap
+
+# a tap on a seat's node opens its page holding a message box addressed to it (Phill 10-25, "61a")
+SEAT_PAGE = "(document.querySelector('#levain-modal .agent-msg .ck-addr') || {}).textContent == 'to seat:ledgerline'"
 from tests.test_cockpit_k7_build import DESKTOP
 
 WHAT = "ship 0.11.21 or hold for the CI sharding?"
@@ -74,7 +77,7 @@ def test_a_badge_with_needs_first_but_no_card_id_is_display_only_and_a_tap_messa
         BADGE % "node:n3", BADGE % "node:n3", HIT % "node:n3", BADGE % "node:n3")
     out = _run(tmp_path, src, [*PRIME, {"eval": _paint(v, "agents")}, {"eval": probe},
                                {"eval": "%s.dispatchEvent(new MouseEvent('click', {bubbles: true})); 1" % (BADGE % "node:n3")},
-                               {"until": "document.activeElement.classList.contains('tray-dump-ta') && JSON.stringify(%s) == '[\"seat:ledgerline\"]'" % PRESSED},
+                               {"until": SEAT_PAGE},
                                {"eval": "window.__opened === undefined || window.__opened === null"}])
     assert json.loads(out[-4]) == [None, None, None, True], out        # no role, no tabindex, no hit rect; still inside its node
     assert out[-1] is True, out
@@ -126,9 +129,9 @@ def test_a_tap_on_the_node_centre_messages_the_seat_and_the_pill_itself_opens_th
             "const own = !!(e && e.closest('.tv-needbadge')); if (e) e.dispatchEvent(new MouseEvent('click', {bubbles: true})); return JSON.stringify([own, window.__opened]); })()") % (BADGE % "node:n3")
     for size in (DESKTOP, NARROW):
         out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_needy(), "agents")}, {"until": HIT % "node:n3" + ".getBoundingClientRect().width >= 43.5"}, {"eval": centre},
-                                   {"until": "document.activeElement.classList.contains('tray-dump-ta') && JSON.stringify(%s) == '[\"seat:ledgerline\"]'" % PRESSED},
+                                   {"until": SEAT_PAGE}, {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
                                    {"eval": "window.__opened = null; 1"}, {"eval": pill}], first=size)
-        assert json.loads(out[-4])[:4] == [True, True, False, True], out       # the node's centre and the hub's centre hit the node and the hub, never a pad; the card stayed shut
+        assert json.loads(out[-5])[:4] == [True, True, False, True], out       # the node's centre and the hub's centre hit the node and the hub, never a pad; the card stayed shut
         assert json.loads(out[-1]) == [True, "np:np-bbbb2222"], out        # the pill is on top and opens the card
 
 
@@ -151,7 +154,7 @@ def test_a_tap_on_the_marked_node_itself_still_messages_the_seat(tmp_path, monke
     from tests.test_cockpit_k7_build import _sessions_fixture
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_needy(), "agents")}, {"eval": _tap("n3")},
-                               {"until": "document.activeElement.classList.contains('tray-dump-ta') && JSON.stringify(%s) == '[\"seat:ledgerline\"]'" % PRESSED},
+                               {"until": SEAT_PAGE},
                                {"eval": "window.__opened === undefined || window.__opened === null"}])
     assert out[-1] is True, out
 
