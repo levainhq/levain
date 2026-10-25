@@ -2,7 +2,7 @@
 
 The governor that makes a sovereign entity *governed* rather than YOLO, stated as one invariant:
 
-    **Every EFFERENT action fans in to the human. AFFERENT runs ungated. NOTHING graduates.**
+    **Every EFFERENT action fans in to the human. AFFERENT runs ungated. Nothing graduates without a signed grant.**
 
 Perception is free; action on the world is not. That is the whole of K3. There are deliberately
 no stakes escalators, no per-domain curve, no capability recalibration and no graduation-to-
