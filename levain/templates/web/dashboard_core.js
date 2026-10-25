@@ -4187,10 +4187,56 @@
     }
     return parts;
   }
+  // A chat launch's egress card (tool levain_egress, levain/chat_egress/cards.py). The server seals its fields in a
+  // fixed order, the short ones that decide the answer first and the path last, every agent-controlled character
+  // already shown as a marker: it is drawn as rows in that order (never one sentence, never a scrolled <pre> a long
+  // path can push the removed names out of), and with what the request became. Text only, as every store string.
+  const EGRESS_TOOL = "levain_egress";
+  const EGRESS_LABEL = { method: "method", scheme: "scheme", host: "host", port: "port", reattached: "Levain adds your key for",
+    stripped: "removed", why: "why it asks", hold: "held", body_len: "body bytes", body_sha256: "body", header_names: "header names",
+    query_names: "query names", path: "path", path_chars: "whole path length", path_sha256: "whole path", launch: "launch",
+    request: "request" };
+  // the words for chat_egress.cards.CardState. A body carrying `egress_state` (card_state over the request's egress
+  // rows) is drawn as that; a body without one is drawn from the queue's state alone
+  const EGRESS_WORDS = {
+    pending: "waiting on your answer; nothing is sent unless you allow it",
+    allowed: "you allowed it; no send is recorded yet",
+    completed: "you allowed it and it was sent",
+    denied: "you denied it; nothing was sent",
+    expired: "the hold ran out with no answer; nothing was sent",
+    ended: "the request's client left; nothing was sent after it left",
+    ambiguous: "you allowed it, then Levain stopped before the result: it may or may not have been sent",
+    failed: "Levain failed partway: its record of this request is incomplete",
+    inconsistent: "the queue and the egress record disagree" };
+  // with no egress rows read, the queue's state alone (cards.card_state(queue_state, None), pinned by its test)
+  const EGRESS_FROM_QUEUE = { pending: "pending", allowed: "allowed", denied: "denied", expired: "expired", withdrawn: "ended" };
+  const EGRESS_HIDDEN = /[\u0000-\u001f\u007f-\u009f؜​-‏‪-‮⁠-⁩﻿]/;
+  function egressParts(b) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const t = sv(b.display);
+    if (sv(b.tool) !== EGRESS_TOOL || !t.startsWith(EGRESS_TOOL + " ")) return null;
+    let o;
+    try { o = JSON.parse(t.slice(EGRESS_TOOL.length + 1)); } catch (e) { return null; }
+    if (!o || typeof o !== "object" || Array.isArray(o)) return null;
+    const dl = el("dl", "consent-kv egress-kv");
+    for (const [k, v] of Object.entries(o)) {
+      const shown = v === null ? "none" : Array.isArray(v) ? (v.length ? v.map(String).join(", ") : "none") : String(v);
+      if (EGRESS_HIDDEN.test(shown)) return null;  // the server marks these; a raw one means this is not a card it built
+      dl.appendChild(el("dt", null, Object.prototype.hasOwnProperty.call(EGRESS_LABEL, k) ? EGRESS_LABEL[k] : k));
+      dl.appendChild(el("dd", null, shown));
+    }
+    const s = Object.prototype.hasOwnProperty.call(EGRESS_WORDS, sv(b.egress_state)) ? sv(b.egress_state)
+      : (Object.prototype.hasOwnProperty.call(EGRESS_FROM_QUEUE, sv(b.state)) ? EGRESS_FROM_QUEUE[sv(b.state)] : "inconsistent");
+    const state = el("div", "consent-facts egress-state");
+    state.dataset.egressState = s;
+    state.append(el("b", null, s.toUpperCase()), el("span", "ext-meta", EGRESS_WORDS[s]));
+    return { rows: dl, state: state, label: s.toUpperCase() };   // the audit slot is one nowrap line: the label; the words are the state line
+  }
   function drawConsentBody(row, slot, b, pending) {
     const sv = (x) => (typeof x === "string" ? x : "");
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
-    const parts = [el("pre", "consent-display", sv(b.display))];
+    const egress = egressParts(b);
+    const parts = egress ? [egress.state, egress.rows] : [el("pre", "consent-display", sv(b.display))];
     const facts = el("div", "consent-facts");
     facts.appendChild(el("span", "ext-meta", "cwd " + sv(b.cwd)));
     facts.appendChild(el("span", "ext-meta", "targets " + sv(b.targets)));
@@ -4199,9 +4245,9 @@
     if (hintBox) parts.push(hintBox);
     parts.push(...consentDigestLines(b));
     if (sv(b.note)) parts.push(el("div", "consent-note ext-meta", sv(b.note)));
-    if (!pending && sv(b.audit)) {
+    if (!pending && (egress || sv(b.audit))) {
       const audit = row.querySelector(".consent-audit");
-      if (audit) audit.textContent = sv(b.audit);
+      if (audit) audit.textContent = egress ? egress.label : sv(b.audit);
     }
     if (pending) {
       for (const [label, cmd] of [["allow", sv(b.answer_allow)], ["deny", sv(b.answer_deny)]]) {
@@ -5120,7 +5166,9 @@
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
     const full = card.classList.contains("is-full");
     const label = (t) => el("div", "needs-sec-label", t);
-    const parts = full ? [label("Request"), consentRequest(sv(b.display), card._needsItem && card._needsItem.c.tool)] : [el("pre", "consent-display", sv(b.display))];
+    const egress = egressParts(b);
+    const parts = egress ? (full ? [label("Request"), egress.state, egress.rows] : [egress.state, egress.rows])
+      : full ? [label("Request"), consentRequest(sv(b.display), card._needsItem && card._needsItem.c.tool)] : [el("pre", "consent-display", sv(b.display))];
     if (full) parts.push(label("Where"));
     const facts = el("div", "consent-facts");
     // the server's home shortens a path under it to ~/..., the full path stays as the title (never the browser's home)
