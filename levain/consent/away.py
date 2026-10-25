@@ -36,11 +36,8 @@ from typing import Any
 
 from levain.authority import anchor_path
 from levain.consent.adapters import claude_code, codex
-from levain.consent.adapters.claude_code import (
-    CLEANUP_RESERVE,
-    DEFAULT_MAX_HOLD,
-    _refuse_symlink,
-)
+from levain.consent.adapters.claude_code import _refuse_symlink
+from levain.consent.adapters.rules import MAX_HOLD
 from levain.consent.auto_away import DEFAULT_HOLDS
 from levain.consent.queue import (
     AnswerRefused,
@@ -55,8 +52,6 @@ __all__ = ["AGENTS", "DEFAULT_HOLDS", "MAX_HOLD", "check_queue_dir", "read", "se
 
 # agent -> its settings file name in the queue directory
 AGENTS = {"claude_code": claude_code.SETTINGS_NAME, "codex": codex.SETTINGS_NAME}
-# the longest wait the hook makes: installed with DEFAULT_MAX_HOLD, it stops waiting CLEANUP_RESERVE before that
-MAX_HOLD = DEFAULT_MAX_HOLD - CLEANUP_RESERVE
 # a settings file is a few keys; anything larger is not one levain wrote
 _MAX_BYTES = 64 * 1024
 

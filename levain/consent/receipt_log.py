@@ -76,7 +76,9 @@ def leaf(row: Sequence[Any]) -> bytes:
     if type(seq) is not int:
         raise LogUnreadable(f"a receipt's seq is not an integer: {seq!r}")
     fields: dict[str, Any] = {"seq": seq}
-    for name, value in zip(_TEXT_COLUMNS, texts, strict=True):
+    if len(texts) != len(_TEXT_COLUMNS):   # zip's strict=True is 3.10+; the queue broker runs this under ROOT_PYTHON
+        raise ValueError(f"a receipt row has {len(texts) + 1} columns, not {len(_TEXT_COLUMNS) + 1}")
+    for name, value in zip(_TEXT_COLUMNS, texts):
         if type(value) is not str:
             raise LogUnreadable(f"receipt {seq}: its {name} is not text")
         fields[name] = value

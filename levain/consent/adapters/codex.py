@@ -94,6 +94,9 @@ from levain.consent.adapters.claude_code import (  # noqa: F401 - GATE_TIMEOUT i
 from levain.consent.adapters.claude_code import DEFAULT_GATE_HOLD, SLOT_HOW, queue_socket_planted
 from levain.consent.broker_client import in_slot
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
+from levain.consent.adapters.rules import (  # noqa: F401 - the rules' one home; re-exported under these names
+    _PATCH_HEADERS, _PATCH_MARKERS, CODEX_DIR_NAME, PATCH_TOOL, _in_codex_config, patch_targets,
+)
 from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.queue import DB_NAME as QUEUE_DB_NAME
 from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir
@@ -103,12 +106,6 @@ AGENT = "codex"
 EVENT = "PermissionRequest"
 SETTINGS_NAME = "codex.json"
 HOOK_SCRIPT_NAME = "levain_consent.py"
-PATCH_TOOL = "apply_patch"
-# The file headers of Codex's patch format; their paths are the files a patch touches. Indentation is allowed, in
-# case Codex's parser trims it: any other line starting ``***`` that is not a patch marker makes the patch unreadable.
-_PATCH_HEADERS = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
-_PATCH_MARKERS = frozenset({"*** Begin Patch", "*** End Patch", "*** End of File"})
-CODEX_DIR_NAME = ".codex"
 CODEX_CONFIG_NAMES = ("hooks.json", "config.toml")
 # The hooks.json key Codex files a PermissionRequest hook's trust under (``<source>:<event>:<group>:<handler>``).
 TRUST_EVENT_KEY = "permission_request"
@@ -129,33 +126,6 @@ def codex_home(environ: Mapping[str, str] | None = None) -> Path:
 
 # --- ruling 3b item 1: agent config and hooks ----------------------------------------------------------------
 
-def patch_targets(patch: Any) -> list[str] | None:
-    """The file paths a Codex ``apply_patch`` names in its headers (``*** Add File:``, ``Update File:``,
-    ``Delete File:``, ``Move to:``), or ``None`` when ``patch`` is not a string, names no file, has a line starting
-    ``***`` (indented or not) that is neither a header nor a patch marker, or has a line holding ``***`` and any
-    whitespace character but a space: what it names cannot be told. Lines are read as Codex reads them, split on
-    ``\n`` alone with one trailing ``\r`` dropped, so only a line holding ``***`` can be a header to either. On such a
-    line every other whitespace character is one the two parsers trim, split or resolve differently (Codex drops a tab
-    inside a path, so ``.<tab>./x`` is ``../x`` to it), so the patch names nothing. A header is read by its literal
-    prefix, never a regular expression, so a long line costs linear time (a hook that stalls fails open on Codex)."""
-    if not isinstance(patch, str):
-        return None
-    found: list[str] = []
-    for raw in patch.split("\n"):
-        line = raw[:-1] if raw.endswith("\r") else raw
-        if "***" not in line:
-            continue
-        if any(c.isspace() and c != " " for c in line):
-            return None
-        text = line.strip(" ")
-        head = next((h for h in _PATCH_HEADERS if text.startswith(h)), None)
-        if head is not None and text[len(head):]:
-            found.append(text[len(head):])      # the line's ends are trimmed, never the path's own leading space
-        elif text.startswith("***") and text not in _PATCH_MARKERS:
-            return None
-    return found or None
-
-
 def policy_targets(tool_name: str, tool_input: Any) -> list[Any] | None:
     """The paths a Codex request names, for the consent policy's grant criteria: any tool's path fields
     (:func:`levain.consent.policy.grant_targets`), plus an ``apply_patch``'s headers (:func:`patch_targets` of
@@ -169,20 +139,6 @@ def policy_targets(tool_name: str, tool_input: Any) -> list[Any] | None:
 
 
 consent_policy.register_targets(AGENT, policy_targets)
-
-
-def _in_codex_config(path: str, cwd: str, home: Path, codex_dir: Path) -> bool:
-    raw = Path(str(home) + path[1:]) if path == "~" or path.startswith("~/") else Path(path)
-    if not raw.is_absolute():
-        raw = Path(cwd) / raw
-    roots = {os.path.normpath(codex_dir).lower(), os.path.realpath(codex_dir).lower()}
-    for p in (os.path.normpath(raw), os.path.realpath(raw)):
-        low = p.lower()
-        if CODEX_DIR_NAME in Path(low).parts[:-1]:
-            return True  # anything under any .codex/ directory (the workspace's or ~/.codex)
-        if any(low == r or low.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
-            return True  # anything under CODEX_HOME, whatever its name
-    return False
 
 
 def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,

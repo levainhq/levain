@@ -41,6 +41,8 @@ from typing import Any
 
 from levain.authority import AuthorityKey, AuthoritySnapshot, StandingPolicy, VerifierUnavailable
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
+from levain.consent.adapters.rules import CLAUDE_CODE_AGENT as CLAUDE_AGENT
+from levain.consent.adapters.rules import CODEX_DIR_NAME, _in_codex_config, _is_config_path
 from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.record import ExternalGateRequest
 from levain.contracts import ContractError
@@ -48,8 +50,7 @@ from levain.contracts.canon import canonical_bytes, parse
 from levain.dispatch import DispatchError
 from levain.dispatch import published
 from levain.dispatch import sign as dsign
-from levain.dispatch.cli import _CONTRACT_MAX
-from levain.dispatch.contract import ResolvedContract, parse_contract
+from levain.dispatch.contract import CONTRACT_MAX, ResolvedContract, parse_contract
 from levain.dispatch.grant import DIGEST_PREFIX, Allow, Queue, input_bound_digest, paths_decision
 from levain.qbroker.signers import SignersSnapshot
 
@@ -61,7 +62,7 @@ CONTRACT_NAMESPACE = dsign.DISPATCH_SIGN_NAMESPACE
 # signature (a passkey's included) and the job fields. Dispatch measures each record's final bytes against this same
 # constant and does not publish one over it (levain.dispatch.published.sync), so escaping cannot make a record it
 # wrote unreadable here
-PUBLISHED_MAX = _CONTRACT_MAX + 64 * 1024
+PUBLISHED_MAX = CONTRACT_MAX + 64 * 1024
 GRANT_KEYS = frozenset({"paths", "input"})
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _CODEX = "codex"
@@ -118,10 +119,6 @@ def agent_config_path(paths: Any, cwd: str, agent: str) -> str | None:
     Path-only on purpose: the broker runs no git (git's ``core.hooksPath`` answer is the hook's, and a hooks path the
     hook gates never reaches this as an ungated call). A path that cannot be read, or a check that raises, counts as
     agent config (fail closed: gated)."""
-    from levain.consent.adapters.claude_code import AGENT as CLAUDE_AGENT
-    from levain.consent.adapters.claude_code import _is_config_path
-    from levain.consent.adapters.codex import CODEX_DIR_NAME, _in_codex_config
-
     if not isinstance(paths, (list, tuple)) or not paths or not isinstance(cwd, str):
         return "<no paths>"
     codex_rule = agent != CLAUDE_AGENT

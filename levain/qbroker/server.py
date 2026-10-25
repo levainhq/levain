@@ -5,7 +5,8 @@ socket 0660; the peer's uid must be slot n's. After ``bind`` the PATH is chmodde
 refuses to serve (unlinking it) unless the socket's group is the slot's. A connection whose peer uid (Linux
 ``SO_PEERCRED``, macOS ``LOCAL_PEERCRED``) is not slot n's is closed unread and unanswered. Connections are bounded
 per listener (:data:`MAX_CONNECTIONS`): one past the bound is closed at once, never queued behind a lock. Each
-frame must arrive whole within :data:`IDLE_TIMEOUT` of the listener starting to read it. Stdlib only.
+frame must arrive whole within :data:`IDLE_TIMEOUT` of the listener starting to read it. :meth:`SlotListener.stop`
+closes the connections already accepted too, and no frame read after it began is handed to the broker. Stdlib only.
 """
 from __future__ import annotations
 
@@ -53,6 +54,9 @@ class SlotListener:
         self._idle = idle_timeout
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        self._conns: set[socket.socket] = set()       # accepted and not yet closed; stop() closes them
+        self._conns_lock = threading.Lock()
+        self._stopped = False
         self.refused_peers = 0
 
     def start(self) -> None:
@@ -81,8 +85,15 @@ class SlotListener:
                 self._unlink()
             raise
         self._sock = sock
-        self._thread = threading.Thread(target=self._accept_loop, name=f"qbroker-slot{self.slot}", daemon=True)
-        self._thread.start()
+        thread = threading.Thread(target=self._accept_loop, name=f"qbroker-slot{self.slot}", daemon=True)
+        try:
+            thread.start()
+        except BaseException:
+            self._sock = None
+            sock.close()
+            self._unlink()
+            raise
+        self._thread = thread
 
     def _unlink(self) -> None:
         try:
@@ -92,6 +103,14 @@ class SlotListener:
             pass
 
     def stop(self) -> None:
+        with self._conns_lock:
+            self._stopped = True
+            conns, self._conns = list(self._conns), set()
+        for conn in conns:          # wakes its _serve thread, whose own close follows
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         sock, self._sock = self._sock, None
         if sock is not None:
             try:
@@ -119,10 +138,17 @@ class SlotListener:
             if not self._slots.acquire(blocking=False):
                 conn.close()
                 continue
+            with self._conns_lock:
+                if self._stopped:
+                    self._slots.release()
+                    conn.close()
+                    return
+                self._conns.add(conn)
             try:
                 threading.Thread(target=self._serve, args=(conn,), name=f"qbroker-slot{self.slot}-conn",
                                  daemon=True).start()
             except BaseException:
+                self._forget(conn)
                 self._slots.release()
                 conn.close()
 
@@ -145,10 +171,17 @@ class SlotListener:
                     return
                 if message is None:
                     return
+                if self._stopped:
+                    return
                 conn.settimeout(self._idle)
                 wire.write_frame(conn, self.broker.handle(self.slot, message))
         except OSError:
             return
         finally:
+            self._forget(conn)
             conn.close()
             self._slots.release()
+
+    def _forget(self, conn: socket.socket) -> None:
+        with self._conns_lock:
+            self._conns.discard(conn)
