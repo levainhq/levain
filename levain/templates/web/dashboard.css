@@ -2506,7 +2506,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 /* the open decision mark breathes: slow, small, no blink; only the badge and the leader line, never the ring. FINITE (8 cycles), like the rest of this block, played once per new open decision (the script arms the class only for it). Measured 10-25 in headless Chrome, 30 s per run, 3 runs per case,
    with one open badge and with nine, against the same page with only this animation switched off: the whole browser process tree used about 5 to 6 points of one core more (the main thread about 2 points more),
    above the 2% bar for keeping it infinite. */
-@media (prefers-reduced-motion: no-preference) { .tv-needbadge { transform-box: fill-box; transform-origin: center; } .tv-needpulse { animation: tv-needpulse 4s ease-in-out 8; } .tv-bz-lead.tv-needpulse { animation-name: tv-needlead; } .tv-needpulse.tv-needpulse-inf { animation-iteration-count: infinite; } }   /* -inf: the dev-only ?needpulse=continuous look */
+@media (prefers-reduced-motion: no-preference) { .tv-needbadge { transform-box: fill-box; transform-origin: center; } .tv-needpulse { animation: tv-needpulse 4s ease-in-out 8; } .tv-bz-lead.tv-needpulse { animation-name: tv-needlead; } }
 @keyframes tv-needpulse { 50% { opacity: .68; transform: scale(1.07); } }
 @keyframes tv-needlead { 50% { opacity: .35; } }   /* the leader line only fades: scaling a line would walk its ends off the pill */
 .tv-replaying .tv-needpulse { animation: none; }

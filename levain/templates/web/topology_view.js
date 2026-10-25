@@ -216,10 +216,7 @@
   const nowMs = () => (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
   const pulseAt = new Map();                                                // owner -> {n, card, t}: committed by the lens once it is the visible build, like needSeen
   let pulseCtx = null;                                                      // the draw in progress (drawGraph is synchronous): its tentative records
-  // Dev only, for a look at the alternative: ?needpulse=continuous on the page's own URL breathes for as long as the mark is open (phase off one shared clock). Not a setting.
-  const pulseContinuous = () => { try { return /(?:^|[?&])needpulse=continuous(?:&|$)/.test(root.location.search); } catch (_) { return false; } };
   function pulseOf(owner, nd) {
-    if (pulseContinuous()) return { on: true, inf: true, delay: "-" + Math.floor(nowMs() % PULSE_MS) + "ms" };
     const t = nowMs();
     let rec = pulseCtx && pulseCtx.pulse.get(owner);
     if (!rec) {
@@ -229,14 +226,14 @@
       if (pulseCtx) pulseCtx.pulse.set(owner, rec);
     }
     const played = Math.floor(t - rec.t);
-    return played < PULSE_MS * PULSE_CYCLES ? { on: true, inf: false, delay: "-" + played + "ms" } : { on: false, inf: false, delay: "" };
+    return played < PULSE_MS * PULSE_CYCLES ? { on: true, delay: "-" + played + "ms" } : { on: false, delay: "" };
   }
   function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale, deco, calm) {
     const g = sv("g", { "data-needs": String(nd.n) }, "tv-need");
     if (deco) g.appendChild(deco.art); else g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring" + (calm ? " calm" : "")));
     const { bx, by, txt, w, side } = needGeom(nd, cx, cy, rr, ang, scale, deco);
     const pu = pulseOf(owner, nd);
-    const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge" + (pu.on ? " tv-needpulse" : "") + (pu.inf ? " tv-needpulse-inf" : ""));
+    const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge" + (pu.on ? " tv-needpulse" : ""));
     if (pu.on) b.style.animationDelay = pu.delay;
     const tip = nd.what || (nd.n + " decision" + (nd.n === 1 ? "" : "s") + " waiting on you");
     const openable = !!nd.card && !!opts && typeof opts.openCard === "function";
@@ -281,7 +278,7 @@
     art.appendChild(sv("path", { d: "M -3 -43.4 L 3 -43.4 L 0 -38.8 Z" }, "tv-bz-lub"));
     const s = pol(39.6, 135);
     const pu = pulseOf("hub", nd);
-    const lead = sv("path", { d: "M " + s + " L 42 42 L 52 42" }, "tv-bz-lead" + (pu.on ? " tv-needpulse" : "") + (pu.inf ? " tv-needpulse-inf" : ""));
+    const lead = sv("path", { d: "M " + s + " L 42 42 L 52 42" }, "tv-bz-lead" + (pu.on ? " tv-needpulse" : ""));
     if (pu.on) lead.style.animationDelay = pu.delay;
     art.appendChild(lead);
     return { art, bx: HUB_BADGE.bx, by: HUB_BADGE.by, rx: 4 };

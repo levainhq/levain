@@ -123,11 +123,3 @@ def test_a_new_decision_breathes_again_an_answered_one_that_returns_too_and_an_a
         spent, (None, _drawn(_needy())), ("fell", {"eval": COUNT}),                                        # the count falls back: an answer, not a new decision
         (None, _drawn(_value())), (None, _drawn(_needy())), ("back", {"eval": COUNT})])                    # everything answered, then a decision returns
     assert (got["still"], got["risen"], got["fell"], got["back"]) == (0, 2, 0, 3), got
-
-
-@needs_browser
-def test_the_dev_flag_breathes_for_as_long_as_the_mark_is_open(tmp_path, monkeypatch):
-    flag = "(() => { history.replaceState(null, '', location.pathname + '?needpulse=continuous'); return 1; })()"
-    count = "JSON.stringify([...%s.querySelectorAll('.tv-needbadge')].map(e => getComputedStyle(e).animationIterationCount))" % TV
-    got = _probe(tmp_path, monkeypatch, [(None, {"eval": CLOCK}), (None, {"eval": flag}), (None, {"eval": SKEW % 40_000}), (None, _drawn(_needy())), ("it", {"eval": count})])
-    assert json.loads(got["it"]) == ["infinite", "infinite"], got                                      # armed at 40 s, with no new decision, and unending
