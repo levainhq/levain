@@ -28,7 +28,8 @@ disk, whole or torn, while memory never took it): the appender is closed and eve
 ``events-unavailable`` until CONTROL restarts; the restart reads a whole line as written and cuts a torn one. Readers
 of what memory holds (a stream, :meth:`last_generation`) keep working.
 
-**Prune** (:meth:`EventJournal.prune`, at CONTROL's start and every :data:`PRUNE_EVERY` appends): the ``state`` /
+**Prune** (:meth:`EventJournal.prune`, at CONTROL's start and every :data:`PRUNE_EVERY` appends, where a failure is
+handed to :attr:`EventJournal.on_error` and the append that ran it still returns its ``seq``): the ``state`` /
 ``artifact`` events of every session whose newest ``state`` event names ``PURGED``, and the ``pool`` events older than
 :data:`POOL_KEEP_S`. The newest event is always kept, so ``seq`` carries on across a restart. The kept lines are
 written to ``events.jsonl.new``, fsynced, renamed over the journal, the directory fsynced, and the appender reopened on
@@ -170,6 +171,8 @@ class EventJournal:
         #: session -> the newest generation a state / artifact event names
         self._last_gen: Dict[str, int] = {}
         self._since_prune = 0
+        #: called with a failure the journal records and does not raise (an append's trailing prune)
+        self.on_error: Callable[[BaseException], None] = lambda _e: None
 
     # -- the start -----------------------------------------------------------------------------------------------------
 
@@ -298,8 +301,19 @@ class EventJournal:
             self._since_prune += 1
             self.cond.notify_all()
             if self._since_prune >= PRUNE_EVERY:
-                self._prune_locked()
+                try:
+                    self._prune_locked()
+                except OSError as e:
+                    # L3 r1 fix 1: the event is fsynced and kept, so its append stands; the prune's failure goes to
+                    # ``on_error`` and the prune runs again PRUNE_EVERY appends later
+                    self._note(e)
             return k.seq
+
+    def _note(self, e: BaseException) -> None:
+        try:
+            self.on_error(e)
+        except Exception:   # noqa: BLE001 - a broken recorder never fails an append that landed
+            pass
 
     def _live(self) -> None:
         if self._poisoned:

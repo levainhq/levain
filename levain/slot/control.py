@@ -988,6 +988,8 @@ class Control:
         self.verifiers = verifiers
         #: S1 3c-8: §3.6's event journal; session -> the generation whose event is owed (see the class docstring)
         self.events = events
+        if events is not None:
+            events.on_error = lambda e: self.seam_errors.append(("event-prune", "", e))
         self._owed: dict[str, int] = {}
         #: the (egress_free, none_free) of the last pool event, and the lock that orders a sync's count and append
         self._pool_last: tuple[int, int] | None = None
