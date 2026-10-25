@@ -30,6 +30,8 @@ from levain.autonomic import (
     PendingActionStore, Posture, RiskClass, RunJournal, RunRef, binding_invocation,
 )
 from levain.autonomic.journal import EffectStatus
+import pytest
+
 from tests.autonomic_confirm_keys import SIGNER, confirm_signers, sign, signed_yes
 from tests.autonomic_test_only_confinement import assume_confined_for_this_test
 from tests.test_autonomic_journal_wiring import (
@@ -65,6 +67,10 @@ def _hold_of(w: World, pending_id: str) -> dict:
 
 
 # --- 1. the signed hold, re-verified at admission ----------------------------------------------------
+
+# TEST ONLY: every declared effect is covered, as before the graduation clamp (14b S3a)
+pytestmark = pytest.mark.usefixtures("test_only_every_effect_covered")
+
 
 def test_an_unsigned_approval_left_by_an_earlier_version_reopens_instead_of_running(tmp_path, test_only_confined_executor):
     # codex 1: on e3917e1 a human CONFIRM wrote decided=1 with no signature. Its effect had not run; the

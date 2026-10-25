@@ -12,6 +12,7 @@ import pytest
 
 # TEST ONLY: the per-test seam that lets a binding's effect run on a test executor (see the module).
 from tests.autonomic_test_only_confinement import test_only_confined_executor  # noqa: F401
+from tests.autonomic_test_only_coverage import test_only_every_effect_covered  # noqa: F401
 
 
 LIVE_SEATBELT_ENV = "LEVAIN_LIVE_SEATBELT"

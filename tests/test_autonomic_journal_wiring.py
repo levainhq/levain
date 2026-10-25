@@ -42,7 +42,8 @@ HIGH = ActionRisk(cls=RiskClass.HIGH, reversible=False, external=True, financial
 TIGHT = TightnessVector(goal_spec=0.9, tool_min=0.9, pattern_precision=0.9, output_bound=0.9)
 
 # TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal
-pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
+# TEST ONLY: every declared effect is covered, as before the graduation clamp (14b S3a)
+pytestmark = pytest.mark.usefixtures("test_only_confined_executor", "test_only_every_effect_covered")
 
 
 
@@ -194,6 +195,8 @@ def _child(work: Path, body: str, crash_after: str) -> int:
         from test_autonomic_journal_wiring import World
         import levain.autonomic.gate as _g
         _g._executor_is_confined = lambda executor: True   # TEST ONLY (tests/autonomic_test_only_confinement.py)
+        from tests.autonomic_test_only_coverage import cover_every_effect_in_this_child_process
+        cover_every_effect_in_this_child_process()   # TEST ONLY (14b S3a)
         import os, levain.autonomic.confirm as _c
         _c._SIGNERS_FILE_OWNERS = frozenset({{0, os.getuid()}})   # TEST ONLY (tests/conftest.py)
         w = World(Path({str(work)!r}))
@@ -1149,6 +1152,8 @@ def test_many_processes_delivering_one_event_produce_one_effect(tmp_path):
         from test_autonomic_journal_wiring import World
         import levain.autonomic.gate as _g
         _g._executor_is_confined = lambda executor: True   # TEST ONLY (tests/autonomic_test_only_confinement.py)
+        from tests.autonomic_test_only_coverage import cover_every_effect_in_this_child_process
+        cover_every_effect_in_this_child_process()   # TEST ONLY (14b S3a)
         import os, levain.autonomic.confirm as _c
         _c._SIGNERS_FILE_OWNERS = frozenset({{0, os.getuid()}})   # TEST ONLY (tests/conftest.py)
         World(Path({str(tmp_path)!r})).dispatch('race')
