@@ -23,6 +23,7 @@ class Seen:
     headers: list[tuple[str, str]]       # in wire order, duplicates kept, name case as sent
     body: bytes
     raw_head: bytes
+    raw_body: bytes = b""           # the body as it was framed on the wire (chunk sizes and trailers included)
 
 
 class RecordingOrigin:
@@ -76,28 +77,34 @@ class RecordingOrigin:
                     hdrs.append((k, v.strip()))
                 low = {k.lower(): v for k, v in hdrs}
                 body = b""
+                raw = bytearray()
                 if low.get("transfer-encoding", "").lower() == "chunked":
                     while True:
                         while b"\r\n" not in buf:
                             buf += c.recv(65536)
                         size_line, _, buf = buf.partition(b"\r\n")
+                        raw += size_line + b"\r\n"
                         n = int(size_line.split(b";")[0], 16)
                         if n == 0:
                             # the trailer section: header lines, ended by an empty line
                             while not (buf.startswith(b"\r\n") or b"\r\n\r\n" in buf):
                                 buf += c.recv(65536)
-                            buf = buf[2:] if buf.startswith(b"\r\n") else buf.split(b"\r\n\r\n", 1)[1]
+                            cut = 2 if buf.startswith(b"\r\n") else buf.index(b"\r\n\r\n") + 4
+                            raw += buf[:cut]
+                            buf = buf[cut:]
                             break
                         while len(buf) < n + 2:
                             buf += c.recv(65536)
                         body += buf[:n]
+                        raw += buf[:n + 2]
                         buf = buf[n + 2:]
                 elif "content-length" in low:
                     n = int(low["content-length"])
                     while len(buf) < n:
                         buf += c.recv(65536)
                     body, buf = buf[:n], buf[n:]
-                seen = Seen(method, target, hdrs, body, head)
+                    raw += body
+                seen = Seen(method, target, hdrs, body, head, bytes(raw))
                 with self._lock:
                     self.reqs.append(seen)
                 extra = self.reflect(seen) if self.reflect else []
