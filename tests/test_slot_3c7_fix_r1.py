@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import tempfile
 from pathlib import Path
@@ -300,6 +301,7 @@ def test_control_client_answers_a_transport_break_as_control_down():
         assert e.value.name == "control-down"
     finally:
         srv.close()
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_reaper_step7_os_error_is_named_and_the_pass_ends(tmp_path):
@@ -368,3 +370,4 @@ def test_server_start_wakes_the_reaper_only_after_the_socket_listens():
         assert reached == [True]
     finally:
         server.stop()
+        shutil.rmtree(d, ignore_errors=True)
