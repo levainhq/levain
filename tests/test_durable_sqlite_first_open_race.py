@@ -67,16 +67,19 @@ def test_two_first_calls_on_a_store_not_yet_created_are_both_counted(tmp_path):
         assert [p.wait(timeout=60) for p in procs] == [0, 0]
 
 
-# The busy the race met was answered with no wait. A second connection holding a new file's exclusive lock does not
-# stage it (the busy handler waits that one out: such a test passed on 0c24b6f5 unfixed), so the retry's own rules
-# are driven through a connection that answers as told.
+# The busy the race met was answered with no wait, which one process cannot stage on demand, so the retry's own
+# rules are driven through a connection that answers as told.
 
 class _Answers:
     def __init__(self, *answers):
         self.answers = list(answers)
         self.asked = 0
+        self.statements = []
 
     def execute(self, sql):
+        self.statements.append(sql)
+        if sql.startswith("PRAGMA busy_timeout"):
+            return None
         assert sql == "PRAGMA journal_mode = WAL"
         self.asked += 1
         a = self.answers.pop(0) if self.answers else self.last
@@ -92,19 +95,18 @@ def _err(text, code):
     return e
 
 
-def test_the_wal_switch_retries_busy_until_it_is_answered(monkeypatch):
+def test_the_wal_switch_retries_busy_until_it_is_answered():
     from levain.autonomic import durable_sqlite as D
-    monkeypatch.setattr(D.time, "sleep", lambda s: None)
     conn = _Answers(_err("database is locked", 5), _err("database is locked", 5 | (2 << 8)), "wal")
     D._set_wal(conn)
     assert conn.asked == 3                         # a plain and an extended busy code are both retried
+    assert conn.statements[0] == "PRAGMA busy_timeout = 0"   # every try answers at once; the pauses are the wait
 
 
-def test_the_wal_switch_raises_any_other_error_at_once(monkeypatch):
+def test_the_wal_switch_raises_any_other_error_at_once():
     import pytest
 
     from levain.autonomic import durable_sqlite as D
-    monkeypatch.setattr(D.time, "sleep", lambda s: None)
     conn = _Answers(_err("disk I/O error", 10))
     with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
         D._set_wal(conn)
@@ -112,11 +114,42 @@ def test_the_wal_switch_raises_any_other_error_at_once(monkeypatch):
 
 
 def test_the_wal_switch_still_busy_at_the_bound_raises_busy(monkeypatch):
+    import time
+
     import pytest
 
     from levain.autonomic import durable_sqlite as D
     monkeypatch.setattr(D, "BUSY_WAIT_S", 0.2)
     conn = _Answers(_err("database is locked", 5))          # busy every time
+    t0 = time.monotonic()
     with pytest.raises(sqlite3.OperationalError, match="locked"):
         D._set_wal(conn)
     assert conn.asked > 1
+    assert time.monotonic() - t0 < 2
+
+
+def _held_new_file(path: Path) -> sqlite3.Connection:
+    """A new database file (not yet WAL) another connection holds the exclusive lock on."""
+    holder = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    holder.execute("CREATE TABLE t (x)")
+    holder.execute("BEGIN EXCLUSIVE")
+    return holder
+
+
+def test_a_store_opened_while_another_holds_it_waits_and_keeps_the_busy_wait(tmp_path):
+    import threading
+
+    from levain.autonomic import durable_sqlite as D
+    holder = _held_new_file(tmp_path / "s.db")
+    release = threading.Timer(0.2, lambda: holder.execute("COMMIT"))
+    release.start()
+    try:
+        conn = D.open_durable(tmp_path / "s.db")
+        try:
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+        finally:
+            conn.close()
+    finally:
+        release.join()
+        holder.close()

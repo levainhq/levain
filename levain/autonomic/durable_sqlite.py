@@ -15,7 +15,7 @@ Stdlib only.
 from __future__ import annotations
 
 import sqlite3
-import time
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,18 +47,23 @@ def _set_wal(conn: sqlite3.Connection) -> None:
 
     Two processes making one new store, each switching it, saw this PRAGMA answer ``SQLITE_BUSY`` (``database is
     locked``) with no wait, the busy handler not called (the queue broker's first two GATEs, lane-limitsrace). Any
-    other error, and busy past the bound, propagates."""
-    deadline = time.monotonic() + BUSY_WAIT_S
-    pause = 0.001
+    other error, and busy past the bound, propagates.
+
+    The busy handler is off while it tries, so every try answers at once and the pauses here are the only wait:
+    their sum is the bound, kept without a clock (``time`` is not on the package's import allowlist,
+    ``tests/test_autonomic_leaf.py``). The caller sets the busy handler after."""
+    conn.execute("PRAGMA busy_timeout = 0")
+    waited, pause = 0.0, 0.001
     while True:
         try:
             conn.execute("PRAGMA journal_mode = WAL")
             return
         except sqlite3.OperationalError as exc:
             busy = getattr(exc, "sqlite_errorcode", 0) & 0xFF == _SQLITE_BUSY   # an extended busy code included
-            if not busy or time.monotonic() + pause > deadline:
+            if not busy or waited + pause > BUSY_WAIT_S:
                 raise
-        time.sleep(pause)
+        threading.Event().wait(pause)
+        waited += pause
         pause = min(pause * 2, 0.05)
 
 
@@ -72,8 +77,8 @@ def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None,
                            f"{'.'.join(map(str, min_sqlite))}, which {needs} needs")
     conn = sqlite3.connect(path, timeout=BUSY_WAIT_S, isolation_level=None)
     try:
-        conn.execute(f"PRAGMA busy_timeout = {int(BUSY_WAIT_S * 1000)}")
         _set_wal(conn)                                  # sidecars -wal/-shm stay beside the database
+        conn.execute(f"PRAGMA busy_timeout = {int(BUSY_WAIT_S * 1000)}")
         conn.execute("PRAGMA synchronous = FULL")
         conn.execute("PRAGMA fullfsync = ON")
         conn.execute("PRAGMA checkpoint_fullfsync = ON")
