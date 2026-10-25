@@ -306,7 +306,7 @@ def test_a_failing_gettempdir_still_protects_the_resolved_custom_levain_home(lho
     custom = _custom_home(tmp_path, monkeypatch)
     _no_tempdir(monkeypatch)
     got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings())
-    assert Path(os.path.realpath(custom)) in got
+    assert Path(os.path.abspath(custom)) in got
     assert lhome / ".levain" not in got
 
 
@@ -319,7 +319,7 @@ def test_a_failing_predicate_returns_the_resolved_base_never_the_default_home(lh
 
     monkeypatch.setattr(confinement, "too_wide_to_deny", boom)
     got = cc.levain_home_protected(None, None)
-    assert got == [Path(os.path.realpath(custom))]
+    assert got == [Path(os.path.abspath(custom))]
 
 
 def test_too_wide_to_deny_keeps_the_fixed_temp_checks_when_gettempdir_fails(tmp_path, monkeypatch):
@@ -348,3 +348,87 @@ def test_a_failing_settings_load_with_a_queue_dir_still_denies_a_store_write(lho
         out = io.StringIO()
         assert adapter.main(["--queue-dir", str(tmp_path / "q")], stdin=io.StringIO(json.dumps(ev)), stdout=out) == 0
         assert json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"] == "deny", adapter.__name__
+
+
+# --- 1025+16 deepseek whole-slice pass (14bA RULINGS_DEEPSEEK_WHOLE): a failing settings load is no outage; a
+# levain home on a symlink is protected at every spelling a target can name it by ---
+
+def _event(tool, inp, cwd):
+    return {"hook_event_name": "PreToolUse", "session_id": "S1", "turn_id": "t1", "transcript_path": "/x.jsonl",
+            "cwd": str(cwd), "model": "m", "permission_mode": "bypassPermissions", "tool_name": tool,
+            "tool_input": inp, "tool_use_id": "call-S1"}
+
+
+def _decision(adapter, argv, ev):
+    out = io.StringIO()
+    assert adapter.main(argv, stdin=io.StringIO(json.dumps(ev)), stdout=out) == 0
+    return json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"] if out.getvalue() else None
+
+
+def test_a_failing_settings_load_with_a_queue_dir_is_no_outage_for_an_ordinary_call(lhome, tmp_path, monkeypatch):
+    """deepseek MED 1: ``load_settings`` raising with ``--queue-dir`` set reaches ``gate_failed`` with the default
+    settings, so the ordinary call gets no decision while the store write beside it is still denied."""
+    from levain.consent.adapters import codex as cx
+
+    def boom(*a, **k):
+        raise OSError("settings unreadable")
+
+    argv = ["--queue-dir", str(tmp_path / "q")]
+    store = lhome / ".levain" / "autonomic" / "autonomic.db"
+    for adapter, ordinary, gated in (
+            (cc, [("Read", {"file_path": str(lhome / "a.txt")}),
+                  ("Write", {"file_path": str(lhome / "work" / "a.txt"), "content": "x"})],
+             ("Write", {"file_path": str(store), "content": "x"})),
+            (cx, [("exec_command", {"cmd": "cat a.txt"}), ("apply_patch", _patch(lhome / "work" / "a.txt"))],
+             ("apply_patch", _patch(store)))):
+        monkeypatch.setattr(adapter, "load_settings", boom)
+        for tool, inp in ordinary:
+            assert _decision(adapter, argv, _event(tool, inp, lhome)) is None, (adapter.__name__, tool)
+        assert _decision(adapter, argv, _event(*gated, lhome)) == "deny", adapter.__name__
+
+
+def _linked_home(tmp_path, monkeypatch, at):
+    """A levain home reached through a symlink: ``$LEVAIN_HOME`` names the link (``at="link"``) or the real
+    directory (``at="real"``); returns (link, real)."""
+    real = tmp_path / "mnt" / "state" / "levain"
+    (real / "autonomic").mkdir(parents=True)
+    link = tmp_path / "opt" / "levain"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("LEVAIN_HOME", str(link if at == "link" else real))
+    return link, real
+
+
+@pytest.mark.parametrize("at", ["link", "real"])
+@pytest.mark.parametrize("via", ["link", "real", "real_parent"])
+def test_a_levain_home_on_a_symlink_is_agent_config_at_every_spelling(lhome, tmp_path, monkeypatch, at, via):
+    """deepseek MED 2: the floor denies the home at each of its spellings (``_spellings``); the adapter names one
+    base and :func:`cc.targets_agent_config` checks both the protected roots and each target as written and as
+    resolved, so a file tool naming the store through any spelling is tagged, in both adapters and the landing."""
+    from levain.consent.adapters import codex as cx
+    from levain.consent.landing import landing_tier
+
+    link, real = _linked_home(tmp_path, monkeypatch, at)
+    base = {"link": link, "real": real, "real_parent": Path(os.path.realpath(link.parent)) / link.name}[via]
+    store = base / "autonomic" / "autonomic.db"
+    qdir = tmp_path / "q"
+    got = cc.protected_paths(qdir, cc.AdapterSettings(), cwd=str(lhome))
+    assert cc.targets_agent_config("Edit", {"file_path": str(store), "old_string": "a", "new_string": "b"},
+                                   str(lhome), home=lhome, protected=got)
+    assert cx.targets_agent_config("apply_patch", _patch(store), str(lhome), home=lhome,
+                                   codex_dir=lhome / ".codex", protected=got)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert landing_tier(str(repo), [str(store)], queue_dir=qdir, home=lhome, codex_dir=lhome / ".codex") == "T3"
+    assert not cc.targets_agent_config("Write", {"file_path": str(tmp_path / "mnt" / "state" / "other.txt"),
+                                                 "content": "x"}, str(lhome), home=lhome, protected=got)
+
+
+def test_a_levain_home_on_a_symlink_denies_the_resolved_store_write_through_the_hook(lhome, tmp_path, monkeypatch):
+    """The installed hook end to end: ``$LEVAIN_HOME`` on the link, an Edit naming the resolved store is denied."""
+    from levain.consent.adapters import codex as cx
+
+    link, real = _linked_home(tmp_path, monkeypatch, "link")
+    store = real / "autonomic" / "autonomic.db"
+    assert _installed_hook(cc, "Edit", {"file_path": str(store), "old_string": "a", "new_string": "b"}, lhome) == "deny"
+    assert _installed_hook(cx, "apply_patch", _patch(store), lhome) == "deny"

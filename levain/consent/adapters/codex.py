@@ -909,7 +909,8 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
     stdout = stdout if stdout is not None else sys.stdout
     event: Any = None
     queue_dir: Path | None = None
-    settings = AdapterSettings()
+    settings = AdapterSettings()   # set before the try: a raising load_settings leaves it, so gate_failed still
+    # classifies the call (a store write denied, an ordinary call no decision), never with None
     if in_slot():
         return _slot_main(stdin, stdout)
     try:
