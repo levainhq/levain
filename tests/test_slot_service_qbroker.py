@@ -294,6 +294,39 @@ def test_the_served_set_is_install_helpers_slots_in_service(layout):
     assert SQ.scan(s)[0] == want == [0, 2, 3]
 
 
+@pytest.mark.parametrize("added", [(), ("decommissioned",)], ids=["the-states-today", "a-new-terminal-state"])
+def test_scan_and_slots_in_service_decide_through_one_predicate_for_every_state(layout, monkeypatch, added):
+    """deepseek MED (RULINGS_R2): one home for "in service". Every slot state value records knows gets a slot, plus one
+    with no record; the served set must be ``slots_in_service``'s and must be what the predicate says. ``added``: a
+    terminal state records does not have today, added the way a new one would be (the state enum and the predicate's
+    out-of-service set), which the old ``!= "retired"`` check in scan served."""
+    from levain.slot import install_helper as IH
+    from levain.slot import records as RR
+    from levain.slot.ids import SlotId
+    out = getattr(RR, "OUT_OF_SERVICE", frozenset({"retired"}))
+    if added:
+        monkeypatch.setattr(RR, "SLOT_STATES", RR.SLOT_STATES + added)
+        out = out | frozenset(added)
+        monkeypatch.setattr(RR, "OUT_OF_SERVICE", out, raising=False)
+    states = (None,) + RR.SLOT_STATES
+    L, R = layout
+    for n, state in enumerate(states):
+        add_slot(L, R, n)
+        if state is not None:
+            (L / "slots" / f"e{n}" / "state").write_bytes(RR.slot_state_bytes(RR.SlotState(
+                SlotId("egress", n), rev=0, lease_seq=0, state=state, dispatch_eligible=True, changed_at=TS,
+                session="s-00000000000000ff" if state == "leased" else None)))
+    s = seams(L, R)
+    store = H.Store(s)
+    try:
+        want = list(IH.slots_in_service(store)["egress"])
+    finally:
+        store.close()
+    expected = [n for n, state in enumerate(states) if state is None or state not in out]
+    assert SQ.scan(s) == (expected, {})
+    assert want == expected
+
+
 def test_a_slot_whose_state_cannot_be_read_is_never_started_and_stopped_after_two_scans(layout):
     L, R = layout
     add_slot(L, R, 0)

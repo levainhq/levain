@@ -28,6 +28,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from levain.qbroker import __main__ as QM
 from levain.qbroker.server import SlotListener, socket_path
 from levain.slot import Refused
+from levain.slot import records as R
 from levain.slot import runtime_helper as H
 from levain.slot.ids import SlotId
 
@@ -55,13 +56,14 @@ def _log(msg: str) -> None:
         pass
 
 
-def _retired(store: H.Store, n: int) -> bool:
-    """Slot n's state record says ``retired``; no record is in service. Reads ``state`` only, never ``keep/`` (root's
-    0700, which this account cannot open): :func:`levain.slot.runtime_helper.read_view`'s reading of that one file."""
+def _in_service(store: H.Store, n: int) -> bool:
+    """Slot n's state record, decided by :func:`levain.slot.records.in_service` (the predicate
+    :func:`levain.slot.install_helper.slots_in_service` calls). Reads ``state`` only, never ``keep/`` (root's 0700,
+    which this account cannot open): :func:`levain.slot.runtime_helper.read_view`'s reading of that one file."""
     slot = SlotId("egress", n)
     with store.dir("slots", slot.tag) as sfd:
         raw = H.read_at(sfd, "state", f"slots/{slot.tag}/state")
-    return raw is not None and H.parse_slot_state_of(raw, slot).state == "retired"
+    return R.in_service(H.parse_slot_state_of(raw, slot) if raw is not None else None)
 
 
 def scan(seams: H.Seams) -> Tuple[List[int], Dict[int, str]]:
@@ -74,7 +76,7 @@ def scan(seams: H.Seams) -> Tuple[List[int], Dict[int, str]]:
         unreadable: Dict[int, str] = {}
         for n in sorted(H.configured_slots(store)["egress"]):
             try:
-                if not _retired(store, n):
+                if _in_service(store, n):
                     serve.append(n)
             except Exception as e:   # noqa: BLE001 - one slot's record never decides another's
                 unreadable[n] = f"{type(e).__name__}: {e}"

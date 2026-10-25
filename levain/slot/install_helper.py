@@ -1926,14 +1926,14 @@ def _lease_list(leased: Sequence[str]) -> str:
 
 
 def slots_in_service(store: RH.Store) -> dict[str, tuple[int, ...]]:
-    """The configured slots (the runtime helper's own reading of ``L/slots/``) whose state file is not
-    ``retired``. DECISION: a slot with no state file is in service (one an install made before state files)."""
+    """The configured slots (the runtime helper's own reading of ``L/slots/``) whose state record
+    :func:`levain.slot.records.in_service` keeps (no state file: in service)."""
     out: dict[str, tuple[int, ...]] = {}
     for cls, indices in RH.configured_slots(store).items():
         keep = []
         for i in sorted(indices):
             view = RH.read_view(store, SlotId(cls, i))   # type: ignore[arg-type]
-            if view.state is None or view.state.state != "retired":
+            if R.in_service(view.state):
                 keep.append(i)
         out[cls] = tuple(keep)
     return out
