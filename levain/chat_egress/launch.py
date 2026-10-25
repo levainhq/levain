@@ -18,13 +18,15 @@
   7. the decider service (`decider.Decider`) on Levain's ends, then the glue's `serving` line awaited;
   8. 19a: given the authority replay the routes were built from, the keyed records expiring within
      `renew.RENEW_DUE` go to `on_renew_due` once (a failing callback is logged, the launch stands).
-A failure after the spawn kills the glue, closes the decider and the SOCKS listener, and refuses the launch.
+A failure at or after step 5's first allocation releases everything allocated so far (the glue killed and reaped
+first, then the decider, then every descriptor and the SOCKS listener), each close attempted whatever an earlier one
+raised; an OSError up to the CA write is refused as EgressRefused, a later failure propagates as itself.
 
 `stop_egress`, in order: the lifeline's write end CLOSED FIRST (the glue's only clean end: it drains, writes the
 final flush, exits 0), the glue awaited, THEN the decider closed (it drains the observation channel the glue just
-closed), THEN the SOCKS listener. The final flush is read back from the event file (P-9: written at every clean end,
-total 0 when no wall fired); a glue that exits non-zero, or not inside its bound, leaves none, and `StopResult` says
-so.
+closed), THEN the SOCKS listener. Every step is attempted whatever an earlier one raised; a step that raised is named
+in `StopResult.failures`. The final flush is read back from the event file (P-9: written at every clean end, total 0
+when no wall fired); a glue that exits non-zero, or not inside its bound, leaves none, and `StopResult` says so.
 
 The session header (item 8, R15-18-Q4): R15-5's words when the launch is `open network`, the Node version, and the
 three claims, `transport_confined` reading `unmeasured` until arm (15o)'s record exists. `egress_containment` is the
@@ -33,6 +35,7 @@ egress part of the format-3 containment JSON (item 7); the whole `containment_di
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -182,6 +185,7 @@ class StopResult:
     socks_clean: bool
     final_flush: dict | None                # the clean end's summary line, or None when there is none
     order: tuple[str, ...]
+    failures: tuple[str, ...] = ()          # "<step>: <exception type>" for each teardown step that raised
 
 
 def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, events: Path, ca_pem: bytes, routes: Any,
@@ -198,46 +202,64 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, event
                             f"{srt_version(srt_dist)!r}")
     open_network = launch_mode(mode) == classify.OPEN_NETWORK
     events = Path(events)
-    records = rec.EgressRecords(store)
-    lsock = socket.socket()
-    lsock.bind(("127.0.0.1", 0))
-    lsock.listen(64)
-    http_port = lsock.getsockname()[1]
-    ours, theirs = socket.socketpair()
-    obs_ours, obs_theirs = socket.socketpair()
-    ca_r, ca_w = os.pipe()
-    life_r, life_w = os.pipe()
-    child = (lsock.fileno(), theirs.fileno(), obs_theirs.fileno(), ca_r, life_r)
-    for fd in child:
-        os.set_inheritable(fd, True)
+    if not events.name:
+        raise EgressRefused(f"the events path names no file: {str(events)!r}")
     stderr = events.with_name(events.name + ".glue-stderr")
-    argv = [node, str(GLUE), "--srt-dist", str(srt_dist), "--listen-fd", str(lsock.fileno()),
-            "--decider-fd", str(theirs.fileno()), "--obs-fd", str(obs_theirs.fileno()), "--ca-fd", str(ca_r),
-            "--lifeline-fd", str(life_r), "--events", str(events), "--denied-table", str(DENIED_TABLE),
-            "--credential-placements", json.dumps(keys.credential_placements(routes), separators=(",", ":")),
-            *(seams.glue_args if seams else ())]
-    socks_srv = SocksRefuser()
-    proc: subprocess.Popen | None = None
-    decider: dm.Decider | None = None
-    try:
-        with stderr.open("w") as err:
-            proc = subprocess.Popen(argv, pass_fds=child, env={}, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=err)
-        os.write(ca_w, ca_pem)
-    except OSError as exc:
-        _abort(proc, None, socks_srv, life_w)
-        raise EgressRefused(f"the egress glue did not start: {type(exc).__name__}") from None
-    finally:
-        for fd in (ca_w, ca_r, life_r):
-            os.close(fd)
-        theirs.close()
-        obs_theirs.close()
-        lsock.close()
-    try:
+    records = rec.EgressRecords(store)
+    placements = json.dumps(keys.credential_placements(routes), separators=(",", ":"))
+    failures: list[str] = []
+    deciders: list[dm.Decider] = []
+    # `owned` holds Levain's ends from the first allocation: unwound on any failure (the glue killed first, then the
+    # decider, then the rest, newest first), handed to the EgressLaunch by pop_all() only once the glue serves
+    with contextlib.ExitStack() as owned:
+        def own(what: str, step: Callable[[], Any]) -> None:
+            owned.callback(_guarded, failures, what, step)
+        try:
+            socks_srv = SocksRefuser()
+            own("socks", socks_srv.close)
+            # `spawn` holds the glue's ends and the CA pipe: closed in this process once the glue is spawned and the CA
+            # written (the glue holds its own copies), or on a refusal
+            with contextlib.ExitStack() as spawn:
+                def theirs_(what: str, step: Callable[[], Any]) -> None:
+                    spawn.callback(_guarded, failures, what, step)
+                lsock = socket.socket()
+                theirs_("listener", lsock.close)
+                lsock.bind(("127.0.0.1", 0))
+                lsock.listen(64)
+                http_port = lsock.getsockname()[1]
+                ours, theirs = socket.socketpair()
+                own("decider socket", ours.close)
+                theirs_("glue decider socket", theirs.close)
+                obs_ours, obs_theirs = socket.socketpair()
+                own("observation socket", obs_ours.close)
+                theirs_("glue observation socket", obs_theirs.close)
+                ca_r, ca_w = os.pipe()
+                theirs_("CA pipe", lambda: os.close(ca_r))
+                theirs_("CA pipe write end", lambda: os.close(ca_w))
+                life_r, life_w = os.pipe()
+                theirs_("glue lifeline end", lambda: os.close(life_r))
+                own("lifeline", lambda: os.close(life_w))
+                own("decider", lambda: [d.close(timeout_s=GLUE_EXIT_TIMEOUT_S) for d in deciders])
+                child = (lsock.fileno(), theirs.fileno(), obs_theirs.fileno(), ca_r, life_r)
+                for fd in child:
+                    os.set_inheritable(fd, True)
+                argv = [node, str(GLUE), "--srt-dist", str(srt_dist), "--listen-fd", str(lsock.fileno()),
+                        "--decider-fd", str(theirs.fileno()), "--obs-fd", str(obs_theirs.fileno()),
+                        "--ca-fd", str(ca_r), "--lifeline-fd", str(life_r), "--events", str(events),
+                        "--denied-table", str(DENIED_TABLE), "--credential-placements", placements,
+                        *(seams.glue_args if seams else ())]
+                with stderr.open("w") as err:
+                    proc = subprocess.Popen(argv, pass_fds=child, env={}, stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=err)
+                own("glue", lambda: _end_glue(proc))
+                os.write(ca_w, ca_pem)
+        except OSError as exc:
+            raise EgressRefused(f"the egress glue did not start: {type(exc).__name__}") from None
         decider = dm.Decider(ours, obs_ours, launch_id=launch_id, records=records, routes=routes, mode=mode,
                              liveness=liveness, credentials=credentials, cards=cards,
                              resolver=Resolver(seams.lookup if seams and seams.lookup else system_lookup),
                              limits=limits, link_fault=seams.link_fault if seams else None)
+        deciders.append(decider)
         decider.start()
         socks_srv.start()
         deadline = time.monotonic() + SERVING_TIMEOUT_S
@@ -245,12 +267,10 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, event
             if proc.poll() is not None or time.monotonic() > deadline:
                 raise EgressRefused(f"the egress glue did not serve (exit {proc.poll()})")
             time.sleep(0.025)
-    except BaseException:
-        _abort(proc, decider, socks_srv, life_w)
-        raise
-    # 19a: each keyed record's expiry read from the authority replay the routes came from (its one home); a ping that
-    # fails is logged and never ends the launch
-    due = renew.renew_due(authority, routes, now=now or datetime.now(timezone.utc)) if authority is not None else []
+        # 19a: each keyed record's expiry read from the authority replay the routes came from (its one home)
+        due = renew.renew_due(authority, routes, now=now or datetime.now(timezone.utc)) if authority is not None else []
+        owned.pop_all()
+    # a renew ping that fails is logged and never ends the launch
     if due and on_renew_due is not None:
         try:
             on_renew_due(launch_id, due)
@@ -263,17 +283,20 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, event
                         life_w=life_w, renew_due=tuple(due))
 
 
-def _abort(proc: subprocess.Popen | None, decider: dm.Decider | None, socks_srv: SocksRefuser, life_w: int) -> None:
-    if proc is not None and proc.poll() is None:
-        proc.kill()
-        proc.wait(GLUE_EXIT_TIMEOUT_S)
+def _guarded(failures: list[str], what: str, step: Callable[[], Any]) -> None:
+    """One teardown step: a failure is recorded under `what` and logged, never raised, so every later step still
+    runs and the exception that ended the launch is the one that propagates."""
     try:
-        os.close(life_w)
-    except OSError:
-        pass
-    if decider is not None:
-        decider.close(timeout_s=GLUE_EXIT_TIMEOUT_S)
-    socks_srv.close()
+        step()
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"{what}: {type(exc).__name__}")       # the type only: a TimeoutExpired's text is the argv
+        log.warning("egress teardown: %s failed: %s", what, type(exc).__name__)
+
+
+def _end_glue(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(GLUE_EXIT_TIMEOUT_S)
 
 
 def final_flush(events: Path) -> dict | None:
@@ -292,21 +315,35 @@ def final_flush(events: Path) -> dict | None:
 
 
 def stop_egress(e: EgressLaunch) -> StopResult:
-    order = []
-    if e.life_w is not None:
-        os.close(e.life_w)
-        e.life_w = None
-    order.append("lifeline")
-    try:
-        code: int | None = e.proc.wait(GLUE_EXIT_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        e.proc.kill()
-        e.proc.wait(GLUE_EXIT_TIMEOUT_S)
-        code = None
-    order.append("glue")
-    clean = e.decider.close()
-    order.append("decider")
-    socks_clean = e.socks.close()
-    order.append("socks")
-    return StopResult(glue_exit=code, decider_clean=clean, socks_clean=socks_clean,
-                      final_flush=final_flush(e.events) if code == 0 else None, order=tuple(order))
+    order: list[str] = []
+    failures: list[str] = []
+    code: int | None = None
+    decider_clean = socks_clean = False
+
+    def lifeline() -> None:
+        fd, e.life_w = e.life_w, None
+        if fd is not None:
+            os.close(fd)
+
+    def glue() -> None:
+        nonlocal code
+        try:
+            code = e.proc.wait(GLUE_EXIT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            e.proc.kill()
+            e.proc.wait(GLUE_EXIT_TIMEOUT_S)
+
+    def decider() -> None:
+        nonlocal decider_clean
+        decider_clean = e.decider.close()
+
+    def socks_() -> None:
+        nonlocal socks_clean
+        socks_clean = e.socks.close()
+
+    for what, step in (("lifeline", lifeline), ("glue", glue), ("decider", decider), ("socks", socks_)):
+        _guarded(failures, what, step)
+        order.append(what)
+    return StopResult(glue_exit=code, decider_clean=decider_clean, socks_clean=socks_clean,
+                      final_flush=final_flush(e.events) if code == 0 else None, order=tuple(order),
+                      failures=tuple(failures))

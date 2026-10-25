@@ -176,7 +176,7 @@ class Origin:
 
 
 def _start(tmp: Path, origin: Origin, monkeypatch, *, open_network: bool = False, launch_id: str | None = None,
-           store: EnvelopeStore | None = None, node: str | None = None, mode=None, cards=None):
+           store: EnvelopeStore | None = None, node: str | None = None, mode=None, cards=None, events=None):
     monkeypatch.setenv(lm.TEST_SEAMS_ENV, "1")
     store = store or EnvelopeStore(tmp / "dispatch")
     lid = launch_id or real_launch(store)
@@ -186,7 +186,8 @@ def _start(tmp: Path, origin: Origin, monkeypatch, *, open_network: bool = False
                          lookup=Lookup())
     key_pem, cert_pem = spike.make_ca()
     return lm.start_egress(store=store, launch_id=lid, node=node or envmod.node_bin(),
-                           srt_dist=envmod.srt_package_dir() / "dist" / "sandbox", events=tmp / "events.jsonl",
+                           srt_dist=envmod.srt_package_dir() / "dist" / "sandbox",
+                           events=events or tmp / "events.jsonl",
                            ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([]), liveness=Live(),
                            credentials=keys.LaunchCredentials(NoStore()), cards=cards or Desk(),
                            mode=mode or dm.Fixed(classify.OPEN_NETWORK if open_network else classify.GATED),
