@@ -37,6 +37,9 @@ def test_the_pair_script_and_the_panel_use_the_dashboards_own_storage_key() -> N
     for name in ("pair.js", "devices_panel.js"):
         mine = re.search(r'WRITE_TOKEN_KEY = "([^"]+)"', load_web_asset(name))
         assert mine and mine.group(1) == boot.group(1), name
+    # L3 r1 F6: the "paired by a link" mark pair.js sets is the one dashboard_boot.js reads to show the unpaired card
+    marks = [re.search(r'PAIRED_MARK_KEY = "([^"]+)"', load_web_asset(n)) for n in ("pair.js", "dashboard_boot.js")]
+    assert all(marks) and marks[0].group(1) == marks[1].group(1)
     # the claim sends the code and nothing else (RP-6: the label is the offer's; the server answers 400 to a label)
     assert re.search(r"JSON\.stringify\(\{ code: code \}\)", load_web_asset("pair.js"))
 
@@ -44,6 +47,7 @@ def test_the_pair_script_and_the_panel_use_the_dashboards_own_storage_key() -> N
 def test_the_device_row_carries_the_fields_the_panel_reads(src) -> None:
     with _serve(src) as (port, _h):
         st, off, _ = _call(port, "POST", "/cockpit/pair/offer", {"label": "Run iPad"}, token=T)
+        assert st == 200 and "code" in off, (st, off)
         st, cl, _ = _call(port, "POST", "/cockpit/pair/claim", {"code": off["code"]})
         assert st == 200
         st, out, _ = _call(port, "GET", "/cockpit/pair/devices.json", token=T)
@@ -53,3 +57,30 @@ def test_the_device_row_carries_the_fields_the_panel_reads(src) -> None:
             assert field in row and re.search(r"\bd\.%s\b" % field, js), field
         assert row["label"] == "Run iPad" and row["revoked_at"] is None
         assert off["pair_path"] == "/pair#code=" + off["code"]     # the panel prefixes location.origin to this
+
+
+NAV = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
+
+
+def test_a_pair_link_opened_from_another_site_loads_and_nothing_else_widens(src) -> None:
+    # L3 r1 F1: a link clicked in webmail is a cross-site top-level navigation; the page must load (it carries no data).
+    with _serve(src) as (port, _h):
+        for extra in (None, PROXY):
+            st, _o, hdrs = _call(port, "GET", "/pair", headers={**NAV, **(extra or {})})
+            assert st == 200 and hdrs["content-type"].startswith("text/html"), (extra, st)
+            assert hdrs["x-frame-options"] == "DENY"
+        # a cross-site fetch / subresource load of the same page stays refused
+        for mode, dest in (("cors", "empty"), ("no-cors", "empty"), ("no-cors", "iframe"), ("navigate", "iframe")):
+            st, _o, _h2 = _call(port, "GET", "/pair", headers={**NAV, "Sec-Fetch-Mode": mode, "Sec-Fetch-Dest": dest})
+            assert st == 403, (mode, dest, st)
+        # no other route is widened by a navigation's headers: the cockpit page, the claim script, a data read, HEAD /pair
+        for method, path in (("GET", "/"), ("GET", "/pair.js"), ("GET", "/cockpit/manifest.json"),
+                             ("GET", "/pair/"), ("GET", "/pair?x=1"), ("HEAD", "/pair")):
+            st, _o, _h2 = _call(port, method, path, headers=NAV)
+            assert st == 403, (method, path, st)
+        # the Host check still holds for the carve-out
+        st, _o, _h2 = _call(port, "GET", "/pair", headers={**NAV, "Host": "evil.example"})
+        assert st == 403
+        # the claim POST is unchanged: cross-site refused
+        st, _o, _h2 = _call(port, "POST", "/cockpit/pair/claim", {"code": "x"}, headers={**NAV, "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"})
+        assert st == 403

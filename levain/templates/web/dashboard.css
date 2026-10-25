@@ -2625,3 +2625,7 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .pair-card h1 { margin: 0 0 var(--sp-3); font: var(--fw-bold) var(--fs-title)/1.2 var(--round); color: var(--text); }
 .pair-card p { margin: 0 0 var(--sp-4); color: var(--label); font: var(--fw-regular) var(--fs-body)/1.5 var(--sans); }
 .pair-card a { color: var(--text); }
+.pair-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin: 0 0 var(--sp-4); }
+.pair-actions[hidden] { display: none; }
+.pair-veil { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: var(--sp-6); box-sizing: border-box; background: var(--bg); }
+.pair-actions .dev-btn { min-height: var(--hit-min, 44px); }

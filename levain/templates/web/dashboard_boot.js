@@ -47,6 +47,9 @@
   // for daily-driver convenience on the operator's personal device; the native keychain is the
   // real fix at Lane 1.
   const WRITE_TOKEN_KEY = "levain_write_token";
+  // Set by pair.js when this browser was paired by a link: its key is a DEVICE key, so when it is refused the way back is
+  // pairing again from a paired device, never typing the owner's token (P2 L3 r1 F6). MUST equal pair.js PAIRED_MARK_KEY.
+  const PAIRED_MARK_KEY = "levain_paired_device";
   // The page's own cap on concurrent panel reads (see the batch in the board read below).
   const PANEL_READ_CONCURRENCY = 4;
   let writeTokenRequired = false;
@@ -62,7 +65,10 @@
       const rest = params.toString();
       history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
       // a token is printable ASCII without spaces (it travels in a request header)
-      if (/^[\x21-\x7e]+$/.test(tok)) window.localStorage.setItem(WRITE_TOKEN_KEY, tok);
+      if (/^[\x21-\x7e]+$/.test(tok)) {
+        window.localStorage.setItem(WRITE_TOKEN_KEY, tok);
+        window.localStorage.removeItem(PAIRED_MARK_KEY);   // the owner's own link: this browser holds the owner's key now
+      }
       else console.warn("levain: the write token in the link is not a header-safe string; not stored");
     } catch (_) { /* no history or storage: the prompt still works */ }
   })();
@@ -75,7 +81,41 @@
   // desktop-browser STOPGAP entry point (a native app shell injects the same header from
   // the keychain). One token gates BOTH the reads (spore-220) and the writes (spore-129).
   let tokenDeclined = false;   // this page load: the operator declined the prompt; passive refreshes stay quiet
+  function pairedDevice() {
+    try { return window.localStorage.getItem(PAIRED_MARK_KEY) === "1"; } catch (_) { return false; }
+  }
+  // A paired device whose key is refused (revoked): a plain card over the page in place of the prompt.
+  function showUnpaired() {
+    if (document.getElementById("ck-unpaired")) return;
+    const veil = document.createElement("div");
+    veil.id = "ck-unpaired";
+    veil.className = "pair-veil";
+    veil.setAttribute("role", "alertdialog");
+    veil.setAttribute("aria-labelledby", "ck-unpaired-t");
+    const card = document.createElement("div");
+    card.className = "pair-card";
+    const brand = document.createElement("div");
+    brand.className = "pair-brand";
+    const dot = document.createElement("span");
+    dot.className = "pair-dot";
+    brand.append(dot, "Levain");
+    const h = document.createElement("h1");
+    h.id = "ck-unpaired-t";
+    h.textContent = "This device was unpaired";
+    const p = document.createElement("p");
+    p.textContent = "Pair it again from a paired device: open the cockpit there, then Devices, Pair a device, and open the link here.";
+    card.append(brand, h, p);
+    veil.appendChild(card);
+    document.body.appendChild(veil);
+  }
   function promptForToken() {
+    if (pairedDevice()) {
+      // never the owner-token prompt on a paired device: drop the dead key so a new pair link claims without asking
+      tokenDeclined = true;
+      dropToken();
+      showUnpaired();
+      return "";
+    }
     const tok = (window.prompt("Write token (printed when this server started: on its startup line, or in the daemon's log):") || "").trim();
     if (tok) tokenDeclined = false;
     if (tok) { try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); } catch (_) { /* ignore */ } }

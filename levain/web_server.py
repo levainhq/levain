@@ -989,6 +989,18 @@ class _Handler(GuardedHandler):
     _credential_cache: Any = _UNSET
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
 
+    def _cross_site_pair_navigation(self) -> bool:
+        """P2 L3 r1 F1: a pair link opened from webmail or another site is a top-level ``GET /pair`` navigation and
+        arrives ``Sec-Fetch-Site: cross-site``, which the shared read preamble refuses. That page is a static shell
+        with no data (its code rides the fragment, its claim is a same-origin POST), so ``_route`` lets exactly this
+        request past the cross-site refusal, Host check kept. Exact raw path, GET only, a document navigation only: a
+        cross-site fetch, subresource or frame of it, HEAD, ``/pair?..`` and every other path stay refused; framing is
+        refused anyway (X-Frame-Options DENY)."""
+        return (self.command == "GET" and self.path == "/pair"
+                and self.headers.get("Sec-Fetch-Site") == "cross-site"
+                and self.headers.get("Sec-Fetch-Mode") == "navigate"
+                and self.headers.get("Sec-Fetch-Dest") == "document")
+
     def handle_one_request(self) -> None:
         """One request on this (possibly kept-alive) connection. PAIR RS-1: the credential cache is reset here, at the
         top of EVERY request, so a revoke is seen by the next request on the same connection. RT-1: the one catch of
@@ -1771,8 +1783,13 @@ class _Handler(GuardedHandler):
 
     def _route(self, *, head: bool) -> None:
         # Host allowlist (DNS rebinding), then the cross-site refusal: a cross-origin page
-        # cannot even TRIGGER the per-request store read.
-        if self._refuse_read(head=head):
+        # cannot even TRIGGER the per-request store read. The one exception is the pair page opened as a cross-site
+        # top-level navigation (F1): it skips only the cross-site refusal, never the Host allowlist.
+        if self._cross_site_pair_navigation():
+            if not self._host_ok():
+                self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
+                return
+        elif self._refuse_read(head=head):
             return
 
         # Strip any query string; route on the bare path against the allowlist.

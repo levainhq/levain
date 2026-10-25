@@ -10,6 +10,9 @@
   const WRITE_TOKEN_KEY = "levain_write_token";
   const H = "X-Levain-Write-Token";
   let section = null, list = null, offerBox = null, note = null, labelIn = null;
+  // L3 r1 F2: only the NEWEST refresh paints (an older response that lands late is dropped), and a pulse never starts a
+  // second read while one is in flight. F7: a 404 (no pairing on this server) is stable for the server's life: stop asking.
+  let gen = 0, inFlight = false, gone = false;
 
   function token() { try { return window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { return ""; } }
   function el(tag, cls, text) {
@@ -37,11 +40,6 @@
     if (s < 5400) return Math.round(s / 60) + " min ago";
     if (s < 129600) return Math.round(s / 3600) + " h ago";
     return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  }
-  function deviceName() {
-    const ua = navigator.userAgent || "";
-    const os = /iPad/.test(ua) ? "iPad" : /iPhone/.test(ua) ? "iPhone" : /Android/.test(ua) ? "Android" : /Mac/.test(ua) ? "Mac" : /Windows/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : "device";
-    return os;
   }
 
   function build() {
@@ -104,15 +102,25 @@
     return r;
   }
 
-  async function refresh() {
+  async function refresh(pulse) {
+    if (gone) return;
+    if (pulse && inFlight) return;            // a stalled read: the pulse waits for it, requests never pile up
+    const my = ++gen;
     if (!token()) { section.hidden = true; return; }
     let res;
-    try { res = await api("GET", "/cockpit/pair/devices.json"); } catch (_) { return; }
+    inFlight = true;
+    try { res = await api("GET", "/cockpit/pair/devices.json"); }
+    catch (_) { if (my === gen && !section.hidden) say("Couldn't refresh the device list."); return; }
+    finally { if (my === gen) inFlight = false; }
+    if (my !== gen) return;                   // a newer refresh started: its answer is the one that paints
     if (res.status !== 200 || !Array.isArray(res.data.devices)) {
       // 404: a read-only or ledger-less server (no pairing); 403: no usable credential. Either way nothing to show.
       if (res.status === 404 || res.status === 403) section.hidden = true;
+      else say("Couldn't refresh the device list.");
+      if (res.status === 404) gone = true;
       return;
     }
+    if (note.textContent === "Couldn't refresh the device list.") say("");
     section.hidden = false;
     list.replaceChildren();
     const devs = res.data.devices.slice().sort((a, b) => (a.revoked_at ? 1 : 0) - (b.revoked_at ? 1 : 0) || String(b.created).localeCompare(String(a.created)));
@@ -164,12 +172,17 @@
 
   async function revoke(d, btn) {
     btn.disabled = true; say("");
+    let msg = "";
     try {
       const res = await api("POST", "/cockpit/pair/revoke", { id: d.id });
-      if (res.status !== 200) say("Could not revoke " + (d.label || d.id) + " (" + (res.data.message || res.status) + ").");
-      else if ((res.data.revoked || []).length > 1) say("Revoked " + (d.label || d.id) + " and " + (res.data.revoked.length - 1) + " device(s) it had paired.");
-    } catch (_) { say("Could not reach the cockpit."); }
-    refresh();
+      const n = (res.data.revoked || []).length;
+      if (res.status !== 200) msg = "Could not revoke " + (d.label || d.id) + " (" + (res.data.message || res.status) + ").";
+      else if (n > 1) msg = "Revoked " + (d.label || d.id) + " and " + (n - 1) + " device(s) it had paired.";
+      else msg = "Revoked " + (d.label || d.id) + ".";
+    } catch (_) { msg = "Could not reach the cockpit."; }
+    finally { if (btn.isConnected) btn.disabled = false; }   // F3: a failed revoke whose refresh also fails keeps a live button
+    await refresh();
+    say(msg);                                  // after the refresh, so its own note does not wipe the revoke's answer
   }
 
   function start() {
@@ -177,7 +190,7 @@
     refresh();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
     setTimeout(refresh, 2500);
-    setInterval(() => { if (!document.hidden) refresh(); }, 30000);
+    const pulse = setInterval(() => { if (gone) clearInterval(pulse); else if (!document.hidden) refresh(true); }, 30000);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
 })();
