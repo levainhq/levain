@@ -898,9 +898,10 @@ class Decider:
             rec.Attach.NOT_EVALUATED if r.rid is None else rec.Attach.NONE)
         marked = tuple(q for q in p.params if r.verdict is not None and q.folded in r.verdict.query_names)
         names = list(r.strip.stripped if r.strip is not None else ()) + list(shape.query_name_shapes(marked))
-        if r.verdict is not None and r.verdict.exemption is not None:
+        if r.verdict is not None and r.verdict.exemption in ("signed_url", "azure_sas"):
             # an exemption lifted the mark, so no name was marked: keep the lifted NAMES (never a value) so K1 can count
-            # them. One rule for the signed-URL set, Azure SAS's `sig`, and both together.
+            # them. One rule for the signed-URL set, Azure SAS's `sig`, and both together (classify labels the combined read
+            # `azure_sas`); any other label lifted no name this code knows.
             azure = r.verdict.exemption == "azure_sas"
             names += [q.folded for q in p.params
                       if q.folded in classify._SIGNED_URL_READ_EXEMPT or (azure and q.folded == "sig")]

@@ -834,3 +834,41 @@ def test_a_cut_pack_body_labels_its_row_by_the_card_it_filed(rig, query, extra, 
     r.desk.answer["card-1"] = "denied"
     assert _until(lambda: [x for x in r.rows(rid) if x.kind == "egress_attempt"])
     assert [x.deciding_step for x in r.rows(rid) if x.kind == "egress_attempt"] == [f"card:{why}:denied"]
+
+
+# --- S9 r3b item 3: only the exemptions classify produces lift names into the row ----------------------------------
+
+def test_classify_labels_each_lifted_read_by_one_of_two_exemptions(rig) -> None:
+    """The decider's lifted-names branch is gated on exactly these labels; a combined read is `azure_sas`."""
+    seen = {}
+    real = classify.decide
+
+    def spy(*a, **k):
+        v = real(*a, **k)
+        seen[a[0].canonical_host] = v.exemption
+        return v
+
+    r = rig()
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(classify, "decide", spy)
+        for host, query in (("acct.blob.core.windows.net", _AZ), ("acct.blob.core.windows.net", _AZ + "&X-Amz-Signature=SV9"),
+                            ("ok.test", "X-Amz-Signature=SV9")):
+            g, _ = r.srt.req("GET", host=host, path="/c/b", query=query)
+            assert action(r.srt.wait(g)) == "allow"
+    assert seen == {"acct.blob.core.windows.net": "azure_sas", "ok.test": "signed_url"}
+
+
+def test_an_exemption_label_classify_does_not_produce_lifts_no_names(rig) -> None:
+    import dataclasses
+    real = classify.decide
+
+    def future_label(*a, **k):
+        return dataclasses.replace(real(*a, **k), exemption="ip_allowlist")
+
+    r = rig()
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(classify, "decide", future_label)
+        g, rid = r.srt.req("GET", host="ok.test", path="/c/b", query="X-Amz-Signature=SV9")
+        assert action(r.srt.wait(g)) == "allow"
+    row = [x for x in r.rows(rid) if x.kind == "egress_attempt"][0]
+    assert "x-amz-signature" not in json.loads(row.names)
