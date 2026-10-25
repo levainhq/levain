@@ -42,3 +42,9 @@ def test_a_decider_close_that_returns_false_fails_the_teardown(make_origin, make
         m.setattr(L.d, "close", lambda *a, **k: (real(*a, **k), False)[1])
         with pytest.raises(AssertionError, match="decider"):
             _shutdown(L)
+
+
+def test_a_decider_close_returns_the_bool_true_on_a_clean_launch_and_again_when_called_twice(make_origin, make_launch_) -> None:
+    L = make_launch_(make_origin())
+    assert L.stop() == 0
+    assert L.d.close(timeout_s=10) is True and L.d.close(timeout_s=10) is True
