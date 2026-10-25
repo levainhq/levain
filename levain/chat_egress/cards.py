@@ -7,8 +7,10 @@ goes through three rules before it is filed:
   * every unshowable character (control, bidi, format, invisible: `levain.unshowable`, the one home) is shown as a
     visible `⟨U+XXXX⟩` marker, never dropped (a dropped character would make the card read as a request the origin
     is not sent) and never left for the page to decode (a JSON `\\u0007` turns back into a raw control in the page).
-    The marker's own brackets, `⟨` and `⟩`, are marked too when the agent sends them, so every `⟨` on a card opens a
-    marker Levain wrote and a literal `⟨U+202E⟩` in a path never reads as a real override;
+    The marker's own brackets, `⟨` and `⟩`, and the cut note's `…` are marked too when the agent sends them, so every
+    `⟨` on a card opens a marker Levain wrote and every `…` belongs to a cut Levain made: a literal `⟨U+202E⟩` never
+    reads as a real override, nor a literal `…(+5 chars)…` as a real cut. A name spelled like the list's own
+    `(+N more)` entry has its `(` marked, for the same reason;
   * each field is bounded by its length as the display's JSON spells it (a `"` or a `\\` costs two), and a cut says
     so (`…(+N chars)…`, `(+N more)`); a path keeps its head and its tail and adds `path_chars` and `path_sha256` (the
     whole path as sent), so the middle a cut hides is still bound;
@@ -81,7 +83,15 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _MARK = "⟨U+{:04X}⟩"
 #: a marker `_marked` writes (`_MARK`'s `{:04X}` of a code point: four to six upper-case hex digits)
 _MARKER = re.compile(r"⟨U\+[0-9A-F]{4,6}⟩")
-_BRACKETS = re.compile("([⟨⟩])")
+#: the characters only Levain's own annotations may hold raw: a marker's brackets and a cut note's ellipsis
+_BRACKETS = re.compile("([⟨⟩…])")
+_CUT_NOTE = re.compile(r"…\(\+[0-9]+ chars\)…")
+#: How far under its bound a cut text's `_cost` can fall. `_bounded` reserves the note's longest spelling (the whole
+#: text's length as the count); the count it writes is the part left out, at most one digit shorter. Each cut end can
+#: fall short of its budget by a marker's length less one (moved off a marker it would split; `⟨U+10FFFF⟩` is 10) plus
+#: one (a character costing two that does not fit): 10 at the head, 10 more at a path's tail, 1 for the digit.
+#: Measured too: `test_every_card_card_input_makes_passes_the_check`.
+_CUT_SLACK = 21
 #: a launch id is Levain's own, so the card carries it whole (printable ASCII, no space, `"` or `\`): it is the egress
 #: rows' join key, which a marked or cut id would miss
 _LAUNCH = re.compile(r"[!#-\[\]-~]{1,%d}" % LAUNCH_MAX)
@@ -122,8 +132,8 @@ class CardState(StrEnum):
 
 
 def _marked(text: str) -> str:
-    """`text` with every unshowable character, and every `⟨` / `⟩` it holds, as a `⟨U+XXXX⟩` marker."""
-    return "".join(_MARK.format(ord(part)) if part in "⟨⟩" else unshowable.mark(part, _MARK, allow="", selectors=False)
+    """`text` with every unshowable character, and every `⟨` / `⟩` / `…` it holds, as a `⟨U+XXXX⟩` marker."""
+    return "".join(_MARK.format(ord(part)) if part in "⟨⟩…" else unshowable.mark(part, _MARK, allow="", selectors=False)
                    for part in _BRACKETS.split(text) if part)
 
 
@@ -173,7 +183,9 @@ def _names(names: Sequence[str]) -> list[str]:
         if n not in known:
             known.add(n)
             seen.append(n)
-    shown = [_bounded(n, NAME_MAX)[0] for n in seen[:NAMES_SHOWN]]
+    # a name spelled like the `(+N more)` entry has its `(` marked: only the entry this function adds reads as one
+    shown = [_MARK.format(ord("(")) + _bounded(n[1:], NAME_MAX - len(_MARK.format(ord("("))))[0]
+             if _MORE.fullmatch(n) else _bounded(n, NAME_MAX)[0] for n in seen[:NAMES_SHOWN]]
     if len(seen) > NAMES_SHOWN:
         shown.append(f"(+{len(seen) - NAMES_SHOWN} more)")
     return shown
@@ -233,11 +245,13 @@ _LIMIT = {"method": METHOD_MAX, "host": HOST_MAX, "reattached": HOST_MAX, "why":
 
 
 def _shown_text(k: str, s: str) -> None:
-    """One string of a card: no unshowable character, and every `⟨` / `⟩` part of a marker `_marked` writes."""
+    """One string of a card: no unshowable character, every `⟨` / `⟩` part of a marker `_marked` writes, and every
+    `…` part of a cut note `_bounded` writes."""
     if unshowable.first_hidden(s, selectors=False) is not None:
         raise CardError(f"card field {k} holds an unshowable character: mark it with card_input")
-    if _BRACKETS.search(_MARKER.sub("", s)):
-        raise CardError(f"card field {k} holds a bracket that opens or closes no marker: mark it with card_input")
+    if _BRACKETS.search(_CUT_NOTE.sub("", _MARKER.sub("", s))):
+        raise CardError(f"card field {k} holds a bracket or an ellipsis that is no marker or cut note of Levain's: "
+                        "mark it with card_input")
 
 
 def _check(tool_input: Any) -> dict[str, Any]:
@@ -261,12 +275,18 @@ def _check(tool_input: Any) -> dict[str, Any]:
     cut_note = False                # whether the path says it was cut
     for k, limit in _LIMIT.items():
         v = c[k]
-        cut_note = cut_note or (k == "path" and "…(+" in v)
+        for s in (v[:NAMES_SHOWN] if isinstance(v, list) else [] if v is None else [v]):
+            notes = len(_CUT_NOTE.findall(s))
+            # `_bounded` writes one note, only when the text overran, and keeps all but at most `_CUT_SLACK` of the
+            # bound: a note on a short text is not Levain's
+            if notes > 1 or notes and _cost(s) < limit - _CUT_SLACK:
+                raise bad(k, "a cut note Levain did not write")
+            cut_note = cut_note or (k == "path" and notes == 1)
         if isinstance(v, list):
             if len(v) > NAMES_SHOWN + 1 or (len(v) == NAMES_SHOWN + 1 and not _MORE.fullmatch(v[-1])):
                 raise bad(k, f"at most {NAMES_SHOWN} names, then one (+N more)")
-            if any(_cost(n) > limit for n in v[:NAMES_SHOWN]):
-                raise bad(k, f"a name over {limit}")
+            if any(_cost(n) > limit or _MORE.fullmatch(n) for n in v[:NAMES_SHOWN]):
+                raise bad(k, f"a name over {limit}, or one spelled as the (+N more) entry")
         elif v is not None and (_cost(v) > limit or (not v and k != "path")):
             raise bad(k, f"empty, or over {limit}")
     if c["scheme"] not in _SCHEMES:
@@ -278,8 +298,8 @@ def _check(tool_input: Any) -> dict[str, Any]:
     if c["body_sha256"] is None and c["body_len"] or c["body_sha256"] is not None and \
             not _DIGEST.fullmatch(c["body_sha256"]):
         raise bad("body_sha256", "sha256:<64 lower-case hex>, or none with body_len 0")
-    if "path_sha256" in c and not (_DIGEST.fullmatch(c["path_sha256"]) and cut_note):
-        raise bad("path_sha256", "sha256:<64 lower-case hex>, beside a path that says it was cut")
+    if ("path_sha256" in c) != cut_note or "path_sha256" in c and not _DIGEST.fullmatch(c["path_sha256"]):
+        raise bad("path_sha256", "sha256:<64 lower-case hex>, exactly beside a path that says it was cut")
     if not _LAUNCH.fullmatch(c["launch"]):
         raise bad("launch", "a launch id the card carries whole")
     if not wire.is_request_id(c["request"]):

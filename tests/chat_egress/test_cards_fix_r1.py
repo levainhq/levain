@@ -355,3 +355,53 @@ def test_the_page_hidden_test_agrees_with_unshowable_on_every_code_point():
         if (unshowable.first_hidden(chr(cp), selectors=False) is not None) != (cp in hit):
             wrong.append(f"U+{cp:04X} {cat}")
     assert not wrong, wrong[:40]
+
+
+# --- the head's ruling on obs 4: the agent's own cut note, the same class as complement MED 1 ---------------------------
+
+def test_a_literal_cut_note_in_agent_text_never_reads_as_a_real_cut():
+    """RED at 9f6ddd69: a path holding a literal `…(+5 chars)…` was shown as itself, the same text as Levain's cut."""
+    p = dataclasses.replace(parse.parse(frame(method="POST", path="/p")), path="/x…(+5 chars)…y")
+    v = dataclasses.replace(classify.decide(p, None, classify.GATED), card_header_names=("a…b",), why="override:…")
+    c = card_input(p, v, [], body_len=0, body_sha256=None, launch_id=LAUNCH)
+    assert c["path"] == "/x⟨U+2026⟩(+5 chars)⟨U+2026⟩y" and "path_chars" not in c, c["path"]
+    assert c["header_names"] == ["a⟨U+2026⟩b"] and c["why"] == "override:⟨U+2026⟩"
+    long = card_input(dataclasses.replace(p, path="/" + "…" * 400), v, [], body_len=0, body_sha256=None,
+                      launch_id=LAUNCH)
+    assert re.sub(r"…\(\+[0-9]+ chars\)…", "", long["path"]).count("…") == 0, long["path"]   # one note, Levain's
+    card_display(c)
+
+
+def test_a_literal_more_entry_in_agent_names_never_reads_as_a_real_one():
+    """The list form of the same class: a name spelled `(+5 more)` among two names read as one name and five more."""
+    p = parse.parse(frame(method="POST", path="/p"))
+    v = dataclasses.replace(classify.decide(p, None, classify.GATED), card_header_names=("a", "(+5 more)"))
+    c = card_input(p, v, [], body_len=0, body_sha256=None, launch_id=LAUNCH)
+    assert c["header_names"] == ["a", "⟨U+0028⟩+5 more)"], c["header_names"]
+
+
+@pytest.mark.parametrize("change", [dict(path="/x…(+5 chars)…y"), dict(why="a…"), dict(header_names=["a", "(+5 more)"])])
+def test_the_queue_refuses_an_unmarked_cut_note_or_more_entry(tmp_path, change):
+    c = {**_card(), **change}
+    q = _queue(tmp_path / "q")
+    with pytest.raises(ConsentError, match="must be a card"):
+        q.file(agent="claude_code", agent_session_id="s", tool_name="levain_egress", tool_input=c, cwd="/w",
+               hold=timedelta(seconds=EGRESS_CARD_HOLD_S), tier="T2", event_id="chat:egress:" + c["request"])
+
+
+def test_every_card_card_input_makes_passes_the_check():
+    """The cut-note rule refuses a note on a short text; it must never refuse a card `card_input` made. Every field
+    at every length around its bound, from pieces that cost one, two (`"`) and ten (`⟨U+10FFFF⟩` from U+10FFFF)."""
+    import random
+    rnd = random.Random(7)
+    pieces = ["a", '"', "\\", "\U0010ffff", "‮", "…", "⟨", "x" * 3]
+    base = parse.parse(frame(method="POST", path="/p", query="a=1"))
+    for n in range(1, 400, 3):
+        for _ in range(3):
+            text = "".join(rnd.choice(pieces) for _ in range(n))
+            p = dataclasses.replace(base, path="/" + text, canonical_host="h" + text,
+                                    params=(dataclasses.replace(base.params[0], raw_key="k" + text),))
+            v = dataclasses.replace(classify.decide(base, None, classify.GATED), method="M" + text,
+                                    why="w" + text, reattached="r" + text, card_header_names=("n" + text,))
+            c = card_input(p, v, ["s" + text], body_len=0, body_sha256=None, launch_id=LAUNCH)
+            cards._check(c)                                                     # raises on a refusal
