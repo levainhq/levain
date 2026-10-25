@@ -8,7 +8,8 @@ rebuilds the challenge from the message being verified, requires clientDataJSON 
 from the key's application, then checks the ECDSA signature over all of it (flags and counter included). It checks
 neither the user-presence flag nor what the origin is: levain's own presence rule
 (:func:`levain.authority.presence_missing`) refuses a signature without presence, and :func:`to_sshsig` refuses one
-whose origin is not exactly the key's own ``https://<host>`` or that lacks user verification. So:
+whose origin is not exactly the key's own ``https://<host>`` (or exactly the pinned page it is given) or that lacks
+user verification. So:
 
   - :func:`challenge` is the challenge the page asks the passkey to sign: the whole SSHSIG signed-data blob for the
     answer's message (``"SSHSIG" || string(namespace) || string("") || string("sha512") || string(SHA-512(message))``,
@@ -42,7 +43,7 @@ from levain.consent.record import ANSWER_NAMESPACE
 
 __all__ = ["KEY_TYPE", "SIG_TYPE", "PasskeyError", "answer_signature_problem", "authority_signature_problem",
            "b64url_decode", "challenge", "is_host_name", "key_application",
-           "public_key_line", "to_sshsig"]
+           "page_origin_problem", "public_key_line", "to_sshsig"]
 
 KEY_TYPE = "sk-ecdsa-sha2-nistp256@openssh.com"
 SIG_TYPE = "webauthn-sk-ecdsa-sha2-nistp256@openssh.com"
@@ -171,15 +172,43 @@ def _ecdsa_signature(der: bytes) -> bytes:
     return _mpint(r) + _mpint(s)
 
 
+def page_origin_problem(application: str, page_origin: object) -> str | None:
+    """Why ``page_origin`` cannot pin a passkey page for a key made on ``application``, or None. A pin is the page's
+    origin as a browser writes it: ``https://<application>`` or ``https://<application>:<port>`` (a port 1-65535 in
+    its plain form, never the default 443, which a browser leaves out), no userinfo, path, query or fragment; on
+    ``localhost`` also ``http://``. Anything else could never equal a browser's origin, or would equal another page's,
+    so it is refused where it is set up (:class:`levain.consent.sign.Signer`'s caller) and again at every verify."""
+    if not is_host_name(application):
+        return f"a page_origin pins a page for a host name's key, and {str(application)[:80]!r} is not one"
+    if not isinstance(page_origin, str):
+        return f"page_origin {str(page_origin)[:80]!r} is not a text origin"
+    schemes = ("https", "http") if application == "localhost" else ("https",)
+    scheme, sep, rest = page_origin.partition("://")
+    name, colon, port = rest.partition(":")
+    port_ok = not colon or (port.isascii() and port.isdigit() and len(port) <= 5 and not port.startswith("0")
+                            and 0 < int(port) < 65536
+                            and not (scheme == "https" and port == "443") and not (scheme == "http" and port == "80"))
+    if not (sep and scheme in schemes and name == application and port_ok):
+        return (f"page_origin {page_origin[:80]!r} is not {' or '.join(s + '://' for s in schemes)}{application} with "
+                "at most a port (no userinfo, path, query or fragment, and no default port)")
+    return None
+
+
 def _client_origin(client_data_json: bytes, application: str, page_origin: "str | None" = None) -> str:
     """The origin a passkey's clientDataJSON names, once it is a ``webauthn.get`` (not cross-origin) from a page whose
-    origin is exactly ``https://<application>``, no port; else :class:`PasskeyError`. Only ``localhost``, which no
-    phone reaches and browsers treat as secure, also takes http and a port (a page on this machine's own browser):
-    given ``page_origin`` (the phone port's own bound ``http://localhost:<port>``) it must be exactly that, since any
-    other program on this machine can serve a page on localhost under another port; without one (a re-verification
-    that does not know which port answered) any port passes. The port is pinned because a stock verify never checks
-    the origin: another page served on the same host name under another port could otherwise ask the passkey for a
-    signature levain accepts. The one rule, used at conversion and at every delivery."""
+    origin is exactly ``https://<application>``, no port; else :class:`PasskeyError`. Given ``page_origin`` (the
+    page that asked for the signature, as :func:`page_origin_problem` admits it), the origin must be exactly that
+    instead: the phone port's own bound ``http://localhost:<port>`` on ``localhost``, since any other program on this
+    machine can serve a page on localhost under another port, or the https name and port a reverse proxy serves the
+    cockpit on (``https://<name>:8443``). A malformed ``page_origin`` is a :class:`PasskeyError`, never compared.
+    Only ``localhost``, which no phone reaches and browsers treat as secure, takes http and a port without one (a
+    re-verification that does not know which port answered): any port passes. The port is pinned because a stock
+    verify never checks the origin: another page served on the same host name under another port could otherwise ask
+    the passkey for a signature levain accepts. The one rule, used at conversion and at every delivery."""
+    if page_origin is not None:
+        problem = page_origin_problem(application, page_origin)
+        if problem is not None:
+            raise PasskeyError(problem)
     try:
         client = json.loads(client_data_json.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
@@ -193,7 +222,7 @@ def _client_origin(client_data_json: bytes, application: str, page_origin: "str 
         parts = urllib.parse.urlsplit(origin) if isinstance(origin, str) else None
     except ValueError:  # an unparseable origin (an unclosed IPv6 bracket) is a refusal, never a crash at delivery
         parts = None
-    if application == "localhost" and page_origin is not None:
+    if page_origin is not None:
         ok = origin == page_origin
     elif application == "localhost":
         try:
@@ -206,7 +235,7 @@ def _client_origin(client_data_json: bytes, application: str, page_origin: "str 
     else:
         ok = origin == f"https://{application}"
     if not ok:
-        if application == "localhost" and page_origin is not None:
+        if page_origin is not None:
             raise PasskeyError(f"the passkey signed on a page that is not {page_origin} (exactly: scheme, name and "
                                "port)")
         raise PasskeyError(f"the passkey signed on a page that is not https://{application} (exactly: no port)")
@@ -218,10 +247,11 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
     queue on every verification of a passkey key's answer (on answer and at each delivery), beside ssh-keygen:
     the signature must be a WebAuthn assertion (never a plain sk signature), carry user verification (Face ID,
     Touch ID or the device passcode, as the authenticator reports it), and come from a page whose origin is exactly
-    the key's own ``https://<host>`` (:func:`_client_origin`, which ``page_origin`` pins on ``localhost``). Among
+    the key's own ``https://<host>`` (:func:`_client_origin`; exactly ``page_origin`` when one is given). Among
     levain's own verifiers, the consent queue accepts a passkey's signature only in its answer, ruling and away-leave
     namespaces (it runs this check for all three), the authority replay accepts it on a ``revoke_grant`` link only
-    (and runs :func:`authority_signature_problem`, this check with https required, at every replay), and the
+    (and runs :func:`authority_signature_problem`, this check with https required and, on that link, the key's own
+    name on any port, at every replay), and the
     cockpit broker accepts one only over a phone pending in ``levain-cockpit-phone``, T2 at most, running this
     check before ssh-keygen (K8). The phone port's sign requests (:mod:`levain.consent.sign`) also run this
     check, for a caller outside levain, in namespaces levain never verifies; so does dispatch
@@ -230,6 +260,26 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
     refusals therefore name a signature, never an answer."""
     try:
         _key_blob, application = _key_parts(public_key)
+    except (ValueError, struct.error, UnicodeError, binascii.Error, PasskeyError):
+        return "the passkey signature cannot be read"
+    read = _read_webauthn(signature)
+    if isinstance(read, str):
+        return read
+    flags, origin, client_data_json = read
+    if not flags & _FLAG_UV:
+        return "the passkey did not verify the user (Face ID, Touch ID or the device PIN)"
+    try:
+        if _client_origin(client_data_json, application, page_origin) != origin:
+            return "the signature's origin disagrees with its client data"
+    except PasskeyError as exc:
+        return str(exc)
+    return None
+
+
+def _read_webauthn(signature: str) -> "tuple[int, str, bytes] | str":
+    """``(flags, origin, clientDataJSON)`` of an armored SSHSIG carrying a WebAuthn signature, or why it is not one.
+    Reads only; it checks nothing a verifier decides on."""
+    try:
         text = signature.strip()
         head, tail = "-----BEGIN SSH SIGNATURE-----", "-----END SSH SIGNATURE-----"
         if not (text.startswith(head) and text.endswith(tail)):
@@ -267,23 +317,20 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
         string()                       # extensions
         if at[0] != len(blob):
             return "the WebAuthn signature has trailing bytes"
-    except (ValueError, struct.error, UnicodeError, binascii.Error, PasskeyError):
+    except (ValueError, struct.error, UnicodeError, binascii.Error):
         return "the passkey signature cannot be read"
-    if not flags & _FLAG_UV:
-        return "the passkey did not verify the user (Face ID, Touch ID or the device PIN)"
-    try:
-        if _client_origin(client_data_json, application, page_origin) != origin:
-            return "the signature's origin disagrees with its client data"
-    except PasskeyError as exc:
-        return str(exc)
-    return None
+    return flags, origin, client_data_json
 
 
-def authority_signature_problem(signature: str, public_key: str) -> str | None:
+def authority_signature_problem(signature: str, public_key: str, *, revoke: bool = False) -> str | None:
     """Why ``signature`` is not a passkey signature the authority log takes, or None: :func:`answer_signature_problem`
     with no ``localhost`` key at all. A link in the log is re-verified at every replay with no page to pin, and a
     localhost origin then takes any port, so any program on this machine could have served the page that asked for
-    it. A key made on an https name is held to exactly ``https://<that name>``, the name its public key carries."""
+    it. A key made on an https name is held to ``https://<that name>``, the name its public key carries: exactly, or,
+    on a ``revoke`` link (``revoke_grant``, which only narrows what an agent may do), that same name on any port
+    (``https://<that name>:<port>``, as :func:`page_origin_problem` admits a pin: Phill 10-24 "2a", so a cockpit
+    served behind a proxy on a port can sign a revoke). The port is read from the signature's own origin and held
+    there exactly, so the client data must name it too; another name, another scheme or any other link is refused."""
     try:
         _key_blob, application = _key_parts(public_key)
     except (ValueError, struct.error, UnicodeError, binascii.Error, PasskeyError):
@@ -291,7 +338,13 @@ def authority_signature_problem(signature: str, public_key: str) -> str | None:
     if application == "localhost":
         return ("a passkey made on localhost signs no authority link (its page is http on this machine, which any "
                 "program here can serve); sign it with a passkey made on the phone page's https name")
-    return answer_signature_problem(signature, public_key)
+    page_origin = None
+    if revoke:
+        read = _read_webauthn(signature)
+        if (not isinstance(read, str) and read[1] != f"https://{application}"
+                and page_origin_problem(application, read[1]) is None):
+            page_origin = read[1]
+    return answer_signature_problem(signature, public_key, page_origin)
 
 
 def to_sshsig(public_key: str, authenticator_data: bytes, client_data_json: bytes, der_signature: bytes,

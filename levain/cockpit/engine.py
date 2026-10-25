@@ -134,7 +134,7 @@ KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "
                                     "reason", "unapplied", "cancelled_by",
                                     "agent", "tool", "consent_state", "consent_tier", "decided_at",
                                     "question_n", "question_state", "question_options", "note_n", "note_state",
-                                    "note_open_total"})
+                                    "note_open_total", "sign"})
 QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
 QUESTION_DONE_HOURS = 24                # an answered question stays listed this long, as a decided request does
 NOTE_VERB = "note_dismiss"              # the cockpit verb a note row offers (verbs.py registers it)
@@ -420,6 +420,9 @@ class _Decisions:
     spec: "ProviderSpec | None" = None
 
 
+_DEC_FIELDS = ("source", "rows", "consent", "questions", "notes", "spec")     # every _Decisions field, for attach_server
+
+
 def _composed(ctx: "ReadContext") -> Result:
     return Fault("the decisions panel is composed by the kernel; it has no read of its own")
 
@@ -508,8 +511,18 @@ def _question_row_in(q: Any) -> RowIn:
                               "question_options": len(q.options)}
     if answered:
         facets["decided_at"] = q.answer.answered_at
+    _sign_facet(facets, q)
     return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{agent} · question #{q.n}", facets=facets,
                  stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open"})
+
+
+def _sign_facet(facets: dict[str, Any], item: Any) -> None:
+    """DESIGN_SIGN D5: ``sign: {"request": <id>}`` on a question or note row whose item names a levain sign request
+    (``sign_request``; an item without the attribute names none). The id only: the page reads the request itself from
+    ``/cockpit/sign.json`` behind the token."""
+    request = getattr(item, "sign_request", None)
+    if request is not None:
+        facets["sign"] = {"request": request}
 
 
 def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
@@ -541,6 +554,7 @@ def _note_row_in(n: Any, open_total: int | None = None) -> RowIn:
         facets["decided_at"] = n.dismissed.dismissed_at
     elif open_total is not None:
         facets["note_open_total"] = open_total
+    _sign_facet(facets, n)
     return RowIn(id=f"{NOTE_ROW_PREFIX}{n.n}", title=f"note from {agent} #{n.n}", facets=facets,
                  stored={"n": n.n, "dismissed_at": n.dismissed.dismissed_at if dismissed else "open"})
 
@@ -604,9 +618,60 @@ class Cockpit:
         registry first (a verb it holds, panel-bound, not a job, fields inside its allowlist), and a
         refused one refuses the attach: the registry is known from here on."""
         with self._lock:
-            for spec in self._specs.values():
-                _check_compose_verbs(spec, view)
-            self._verb_view = view
+            self._attach_verbs_locked(view)
+
+    def _attach_verbs_locked(self, view: Any) -> None:
+        self._check_verbs(view)
+        self._verb_view = view
+
+    def check_verbs(self, view: Any) -> None:
+        """The check :meth:`attach_verbs` runs, attaching nothing: a server runs it before it commits to the
+        cockpit (``make_server``), so a refused compose leaves the cockpit and everything else as they were."""
+        with self._lock:
+            self._check_verbs(view)
+
+    def _check_verbs(self, view: Any) -> None:
+        for spec in self._specs.values():
+            _check_compose_verbs(spec, view)
+
+    def attach_server(self, view: Any, consent: Callable[[datetime], Any], *,
+                      capture: Callable[[datetime], RequestAuthority] | None = None,
+                      edits: Callable[[int], Any] | None = None, decision_rows: Callable[[datetime], Any] | None = None,
+                      questions: Any = None, notes: Any = None) -> None:
+        """Every attach a server makes (``make_server``), as ONE transaction under the cockpit's lock: the verb view
+        (:meth:`attach_verbs`), the broker's capture, edits reader and decisions rows when given, the consent reader,
+        then the question and note stores when given. One that raises puts back exactly what this call found, then
+        raises. Nothing else registers while the lock is held, so a panel another thread registers before this call or
+        after it is kept: the undo removes only this server's attaches."""
+        with self._lock:
+            before = (self._verb_view, self._capture, self._edits_reader,
+                      tuple(getattr(self._dec, f) for f in _DEC_FIELDS), self._specs, self._state,
+                      dict(self._rowsets), set(self._hero_yields))
+            try:
+                self._attach_verbs_locked(view)
+                if capture is not None:
+                    self._capture = capture
+                if edits is not None:
+                    self._edits_reader = edits
+                if decision_rows is not None:
+                    self._attach_decision_rows_locked(decision_rows)
+                self._attach_consent_rows_locked(consent)
+                if questions is not None:
+                    self._attach_question_rows_locked(questions)
+                if notes is not None:
+                    self._attach_note_rows_locked(notes)
+            except BaseException:
+                # the registry is copy-on-write, so the dicts taken are the ones a reader held then; the row-set
+                # owners and hero yields, changed in place, are put back in place
+                self._verb_view, self._capture, self._edits_reader, dec, self._specs, self._state, rowsets, heroes = (
+                    before)
+                for f, v in zip(_DEC_FIELDS, dec):
+                    setattr(self._dec, f, v)
+                self._rowsets.clear()
+                self._rowsets.update(rowsets)
+                self._hero_yields.clear()
+                self._hero_yields.update(heroes)
+                raise
 
     def attach_labeller(self, fn: Callable[[], LabelSnapshot]) -> None:
         """Attach a labels-only source: ``fn()`` is ONE journal read, taken once per request (design
@@ -661,36 +726,48 @@ class Cockpit:
         while the broker is not ACTIVE, or raises. With no downstream ``decisions`` registered the
         kernel registers its own panel; a downstream that registered one keeps exactly its panel."""
         with self._lock:
-            self._dec.rows = fn
-            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
-                self._install_decisions_locked()
+            self._attach_decision_rows_locked(fn)
+
+    def _attach_decision_rows_locked(self, fn: Callable[[datetime], Any]) -> None:
+        self._dec.rows = fn
+        if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+            self._install_decisions_locked()
 
     def attach_consent_rows(self, fn: Callable[[datetime], Any]) -> None:
         """The consent queue's reader (``fn(now)`` returns a ``ConsentListing``, or raises): agents' requests
         waiting on the operator (Q6a). Read-only, and independent of the broker: a read fault is a note on the
         panel, never a dark one."""
         with self._lock:
-            self._dec.consent = fn
-            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
-                self._install_decisions_locked()
+            self._attach_consent_rows_locked(fn)
+
+    def _attach_consent_rows_locked(self, fn: Callable[[datetime], Any]) -> None:
+        self._dec.consent = fn
+        if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+            self._install_decisions_locked()
 
     def attach_question_rows(self, store: Any) -> None:
         """The question band's store (``levain.consent.questions.QuestionStore``): agents' questions waiting on the
         operator (Q-2b), read at the source, as the consent queue is. Its rows carry no question text, and the
         panel offers ``question_answer`` on an open one. A read fault is a note, never a dark panel."""
         with self._lock:
-            self._dec.questions = store
-            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
-                self._install_decisions_locked()
+            self._attach_question_rows_locked(store)
+
+    def _attach_question_rows_locked(self, store: Any) -> None:
+        self._dec.questions = store
+        if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+            self._install_decisions_locked()
 
     def attach_note_rows(self, store: Any) -> None:
         """The note store (``levain.consent.notes.NoteStore``): what agents told the operator, read at the source. Its
         rows carry no words, and the panel offers ``note_dismiss`` on an open one. A read fault is a note on the
         panel, never a dark one."""
         with self._lock:
-            self._dec.notes = store
-            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
-                self._install_decisions_locked()
+            self._attach_note_rows_locked(store)
+
+    def _attach_note_rows_locked(self, store: Any) -> None:
+        self._dec.notes = store
+        if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+            self._install_decisions_locked()
 
     @property
     def note_store(self) -> Any:
@@ -2840,8 +2917,34 @@ def _v_form(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
                 if t in seen_ids:
                     raise _bad(spec, f"{w}.enum[{j}]", f"{t!r} is repeated (after trimming)")
                 seen_ids.add(t)
-        elif "enum" in f:
-            raise _bad(spec, f"{w}.enum", "belongs to a recipient field only")
+            # the provider, not the page, says which ids are pressed at the start and which can leave its roster
+            # (and the words its refusal uses when one has): Levain assigns no meaning to any of them
+            if "default" in f:
+                dflt = f["default"]
+                if not (isinstance(dflt, list) and all(_is_str(x) for x in dflt)):
+                    raise _bad(spec, f"{w}.default", "must be a list of ids from the enum")
+                # the page presses a default id only when it equals an enum id exactly (it compares the raw strings), so
+                # the check is exact too: a padded spelling would register here and press nothing there
+                picked: set[str] = set()
+                for j, x in enumerate(dflt):
+                    if x not in en:
+                        raise _bad(spec, f"{w}.default[{j}]", f"{x!r} is not an enum id (exactly as spelled there)")
+                    if x in picked:
+                        raise _bad(spec, f"{w}.default[{j}]", f"{x!r} is repeated")
+                    picked.add(x)
+            for key in ("transient_prefix", "gone_match"):
+                if key in f and not (_is_str(f[key]) and f[key].strip()):
+                    raise _bad(spec, f"{w}.{key}", "must be a string with something other than whitespace in it")
+            if "transient_prefix" in f and f["transient_prefix"] != f["transient_prefix"].strip():
+                # the page compares the prefix raw against the enum ids: a padded one would match none of them
+                raise _bad(spec, f"{w}.transient_prefix", "carries leading or trailing whitespace")
+            if "gone_match" in f and "transient_prefix" not in f:
+                # the recovery clears only ids under the prefix, so a match with no prefix could never act
+                raise _bad(spec, f"{w}.gone_match", "needs a transient_prefix beside it")
+        else:
+            for key in ("enum", "default", "transient_prefix", "gone_match"):
+                if key in f:
+                    raise _bad(spec, f"{w}.{key}", "belongs to a recipient field only")
     if v.get("verb") is not None and not _is_str(v["verb"]):
         raise _bad(spec, "value.verb", "must be a string")
     return v
@@ -2862,8 +2965,10 @@ TOPOLOGY_NODE_STATES = ("waiting", "errored", "stalled", "running", "idle")
 TOPOLOGY_TASK_KINDS = ("dispatch", "spore", "consent", "question", "unattached")
 TOPOLOGY_TASK_STATES = ("waiting", "stuck", "running", "open", "done", "failed")
 TOPOLOGY_TASK_HEATS = ("hot", "warm", "cold", "parked")
-TOPOLOGY_COST_SOURCES = ("dispatch", "ledger")
+# "transcript": the tokens a task's workers spent, read from their session transcripts. Tokens only: a transcript carries no price.
+TOPOLOGY_COST_SOURCES = ("dispatch", "ledger", "transcript")
 TOPOLOGY_LABEL_MAX = 48
+TOPOLOGY_NEEDS_MAX = 120      # the decision mark's strings (needs_first, needs_first_card, needs_first_what): the page's own cap (topology_view.js NEED_CAP)
 
 
 def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
@@ -2916,6 +3021,20 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         raise _bad(spec, "value.hub", "must be an object {id, label}")
     text("value.hub.id", hub.get("id"), blank=False)
     text("value.hub.label", hub.get("label"), label=True)
+
+    def needs(where: str, o: dict[str, Any]) -> None:
+        """The decision mark's optional keys (all may be absent or null): a count, the first need's id and card id and first sentence, each a
+        display-safe string; the card id also stays within the page's cap (``TOPOLOGY_NEEDS_MAX``, code points)."""
+        count(f"{where}.needs_open", o.get("needs_open"))
+        for k in ("needs_first", "needs_first_card", "needs_first_what"):
+            x = o.get(k)
+            text(f"{where}.{k}", x, null=True)
+            # only the card id has a hard cap (the page never cuts or rewrites it); the two text strings are clipped by the page, so an
+            # over-long one must never fail the whole topology value
+            if k == "needs_first_card" and x is not None and len(x) > TOPOLOGY_NEEDS_MAX:
+                raise _bad(spec, f"{where}.{k}", f"is longer than {TOPOLOGY_NEEDS_MAX} characters")
+
+    needs("value.hub", hub)
     groups = _need_list(spec, v, "groups")
     group_ids = unique("value.groups", groups)
     for i, g in enumerate(groups):
@@ -2934,6 +3053,7 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         if n.get("state") not in TOPOLOGY_NODE_STATES:
             raise _bad(spec, f"{w}.state", f"must be one of {list(TOPOLOGY_NODE_STATES)}, got {n.get('state')!r}")
         count(f"{w}.tokens", n.get("tokens"))
+        needs(w, n)
         for k in ("started", "last_event"):
             if not _is_iso(n.get(k)):
                 raise _bad(spec, f"{w}.{k}", "must be an ISO-8601 timestamp")
@@ -3009,6 +3129,8 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             raise _bad(spec, f"{w}.cost.source", f"must be one of {list(TOPOLOGY_COST_SOURCES)} or null")
         if cost["source"] is None and (cost["usd"] is not None or cost["tokens"] is not None):
             raise _bad(spec, f"{w}.cost.source", "must name where a cost came from (a cost is never an estimate)")
+        if cost["source"] == "transcript" and (cost["usd"] is not None or cost["tokens"] is None):
+            raise _bad(spec, f"{w}.cost.source", "a transcript source carries tokens and no usd (a transcript has no price)")
         workers = strings(f"{w}.workers", t.get("workers"))
         for j, x in enumerate(workers):
             if x not in node_ids:

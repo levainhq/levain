@@ -10,6 +10,10 @@ modules and calls, and review beat each a new way (a parent-relative import, an 
 ``import_module``, ``pydoc.locate``), so the list now names what is allowed instead of what is not.
 Adding a stdlib module to the package means adding it here, on purpose, in review.
 
+One module outside the package is allowed, by name (``ALLOWED_OUTSIDE``): ``levain.trust_anchor``, the
+trust-anchor rule ``confirm`` uses, which root's route-map check runs without importing this package.
+It is held to more than the package is: it may import ``ALLOWED_STDLIB`` roots and nothing of ``levain``.
+
 Also flagged: the builtin loader names (``__import__``, ``__builtins__``, ``exec``, ``eval``, a bare
 ``compile``) and any attribute chain off the name ``levain`` other than ``levain.autonomic`` (an
 ``import levain.autonomic.x`` binds ``levain``, through which ``levain.kernel`` is reachable).
@@ -40,11 +44,12 @@ ALLOWED_STDLIB = frozenset({
     "threading", "types",
     "typing", "unicodedata",
 })
+ALLOWED_OUTSIDE = frozenset({"levain.trust_anchor"})
 _LOADER_NAMES = frozenset({"__import__", "__builtins__", "exec", "eval", "compile"})
 
 
 def _allowed(name: str) -> bool:
-    if name == "levain.autonomic" or name.startswith("levain.autonomic."):
+    if name == "levain.autonomic" or name.startswith("levain.autonomic.") or name in ALLOWED_OUTSIDE:
         return True
     return name.split(".")[0] in ALLOWED_STDLIB
 
@@ -105,9 +110,19 @@ def test_importing_the_package_loads_nothing_outside_it():
     loaded = json.loads(out.stdout)
     assert sum(n.startswith("levain.autonomic.") for n in loaded) > 1
     stray = [n for n in loaded
-             if not (n == "levain.autonomic" or n.startswith("levain.autonomic.")
+             if not (n == "levain.autonomic" or n.startswith("levain.autonomic.") or n in ALLOWED_OUTSIDE
                      or n.split(".")[0] in sys.stdlib_module_names)]
     assert stray == []
+
+
+def test_each_allowed_outside_module_imports_only_the_stdlib_allowlist():
+    for name in sorted(ALLOWED_OUTSIDE):
+        tree = ast.parse((ROOT / (name.replace(".", "/") + ".py")).read_text(encoding="utf-8"))
+        bad = [n for n in ast.walk(tree)
+               if isinstance(n, ast.ImportFrom) and (n.level or (n.module or "").split(".")[0] not in ALLOWED_STDLIB)
+               or isinstance(n, ast.Import) and any(a.name.split(".")[0] not in ALLOWED_STDLIB for a in n.names)
+               or isinstance(n, ast.Name) and n.id in _LOADER_NAMES]
+        assert bad == [], (name, [ast.dump(n) for n in bad])
 
 
 def test_the_static_check_flags_each_way_out(tmp_path):

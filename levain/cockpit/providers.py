@@ -32,6 +32,7 @@ from levain.dashboard import (
     SubstrateSource,
     SubstrateView,
     OpenSpore,
+    graph_caption,
     _episode_row,
     _read_levain_config,
     _one_clause,
@@ -744,20 +745,33 @@ def _health(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         if h is None:
             return Fault("health: no health read")
         metrics: list[dict[str, Any]] = [
-            {"label": "write path", "value": "live" if h.write_path_live else "dark",
-             "unit": None, "status": "ok" if h.write_path_live else "bad", "read": None},
+            # live (ok) | no wraps yet (neutral: a fresh store is not a fault) ; an unreadable store never gets here
+            # (it is the Fault above), and cockpit_view.js accepts "unreadable" (bad) for a kernel that sends it
+            {"label": "write path", "value": "live" if h.write_path_live else "no wraps yet",
+             "unit": None, "status": "ok" if h.write_path_live else "unknown", "read": None},
         ]
-        # the widget draws the dot first, then the first four whole-number metrics in order (mock-e: links, wraps,
-        # graduated, demoted), so those lead; the rest follow for the full panel
+        # the widget draws the dot first, then the first four whole-number metrics in order (wraps, graduated,
+        # demoted, episodes), so those lead; the rest follow for the full panel. The link figures are the graph
+        # panel's historical caption now, never health.
         for label, value in (
-            ("links", h.total_links), ("wraps", h.total_wraps),
+            ("wraps", h.total_wraps),
             ("graduated", h.graduations_validated_total), ("demoted", h.graduations_demoted_total),
-            ("avg strength", h.avg_strength), ("max strength", h.max_strength),
-            ("density", h.density), ("local density", h.local_density),
             ("episodes", h.total_episodes), ("episodes since wrap", h.episodes_since_wrap),
             ("tombstones", h.tombstones),
         ):
             metrics.append({"label": label, "value": value, "unit": None, "status": "unknown", "read": None})
+        for label, value, status in (
+            ("last save (hours ago)", h.save_age_hours, "unknown"),  # unrounded: the renderers round once
+            ("projection", ("unknown" if h.projection_note else None) if h.projection_converged is None else (
+                "converged" if h.projection_converged else
+                ("file missing" if h.projection_note == "continuity file missing" else "diverged")),
+             "unknown" if h.projection_converged is None else ("ok" if h.projection_converged else "bad")),
+            ("projection note", h.projection_note, "unknown"),
+            ("audit write failures", h.audit_backlog,
+             "unknown" if h.audit_backlog is None else ("ok" if not h.audit_backlog else "bad")),
+        ):
+            if value is not None:
+                metrics.append({"label": label, "value": value, "unit": None, "status": status, "read": None})
         alerts = [{"message": "a wrap is in progress; this snapshot may be inconsistent", "severity": "warn"}] \
             if h.wrap_in_progress else []
         return Read(value={"metrics": metrics, "alerts": alerts})
@@ -773,9 +787,13 @@ def _graph(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         g = view.graph
         if g is None:
             return Fault("graph: no graph read")
-        text = [{"label": "association graph",
-                 "text": f"{len(g.nodes)} nodes, {len(g.edges)} links" + (" (truncated)" if g.truncated else ""),
-                 "at": None, "source": None}]
+        text = [{"label": "association graph", "text": graph_caption(g), "at": None, "source": None}]
+        h = view.health
+        if h is not None and h.total_links:
+            text.append({"label": "historical links",
+                         "text": f"{h.total_links} (avg strength {h.avg_strength:.2f}, max {h.max_strength:.2f}, "
+                                 f"density {h.density:.3f})",
+                         "at": None, "source": None})
         return Read(value={"visual": "cognition-graph", "data": g.to_dict(), "text": text})
     return read
 

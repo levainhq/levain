@@ -86,6 +86,8 @@ class Note:
     cwd: str
     filed_at: str
     dismissed: Dismissal | None
+    # as Question.sign_request: a sign request filed for this note, by id, drawn as the row's `sign` facet
+    sign_request: str | None = None
 
 
 def _append_only(table: str, message: str, key: str) -> tuple[str, ...]:

@@ -4750,8 +4750,10 @@ def _refresh_adapter_files(
                                  + f", so the agent is missing it until you merge the staged {key}.")
             if key == "seed/memory.md" and here_text is not None and _OLD_WRAP_SENTINEL in here_text:
                 lines.append("  seed/memory.md: the wrap procedure now lives in memory_workflow.md, so "
-                             "your copy's block from '**Pair with staleness:**' up to '## Hebbian "
-                             "associations' can be removed when you merge; until then it loads twice.")
+                             "your copy's block from '**Pair with staleness:**' up to the heading that follows it "
+                             "('## Hebbian associations' in an older copy, '## Pattern recall follows the "
+                             "evidence' in a current one) can be removed when you merge; until then it "
+                             "loads twice.")
             continue
         out.refreshed.append(str(target) if key.startswith("codex-home/") else key)
         if not apply:

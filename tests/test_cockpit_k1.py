@@ -1062,20 +1062,56 @@ class TestSession2Gaps:
         assert ent["store_label"] == src.anneal.episodic_db.name or ent["store_label"].startswith("~/")
         assert ent["store_label"].endswith(src.anneal.episodic_db.name)
 
-    def test_health_carries_max_strength_and_local_density(self, env) -> None:
+    def test_health_carries_no_link_figures(self, env) -> None:
+        """The link figures describe the historical graph (anneal stopped forming links), never health."""
         _r, _s, ck = env
         labels = [m["label"] for m in ck.panel("health")["value"]["metrics"]]
-        assert "max strength" in labels and "local density" in labels
+        assert not {"links", "avg strength", "max strength", "density", "local density"} & set(labels)
+        assert "write path" in labels
 
-    def test_health_leads_with_the_mock_e_four(self, env) -> None:
-        """The widget draws the write-path dot, then the first four whole-number metrics in order: links, wraps,
-        graduated, demoted (mock-e); the rest follow for the full panel."""
+    def test_health_leads_with_the_four_whole_numbers(self, env) -> None:
+        """The widget draws the write-path dot, then the first four whole-number metrics in order: wraps,
+        graduated, demoted, episodes; the rest follow for the full panel."""
         _r, _s, ck = env
         ms = ck.panel("health")["value"]["metrics"]
         assert ms[0]["label"] == "write path"
         whole = [m["label"] for m in ms if isinstance(m["value"], int) and not isinstance(m["value"], bool)]
-        assert whole[:4] == ["links", "wraps", "graduated", "demoted"]
-        assert {"avg strength", "episodes", "tombstones"} <= {m["label"] for m in ms}
+        assert whole[:4] == ["wraps", "graduated", "demoted", "episodes"]
+        assert {"episodes", "tombstones"} <= {m["label"] for m in ms}
+
+    def test_the_oracle_metrics_flag_only_a_real_fault(self, env, monkeypatch) -> None:
+        """Over a store WITH a wrap: a converged projection is ok, a diverged one is bad."""
+        import hashlib
+        from anneal_memory import Store
+
+        root, src, ck = env
+        db, md = src.anneal.episodic_db, src.anneal.continuity_md
+        md.write_text("## State\nfoc\n", encoding="utf-8")
+        with Store(db) as store:
+            e = store.record("episode A", "decision")
+            store.wrap_started(token="w1", episode_ids=[e.id])
+            store.wrap_completed(1, 20, wrap_token="w1", episode_ids=[e.id], pair_id="p1",
+                                 content_hash=hashlib.sha256(md.read_bytes()).hexdigest())
+
+        def metrics() -> dict:
+            return {m["label"]: m for m in ck.panel("health")["value"]["metrics"]}
+
+        ms = metrics()
+        assert (ms["projection"]["value"], ms["projection"]["status"]) == ("converged", "ok")
+        assert ms["audit write failures"]["status"] == "ok"
+        md.write_text("## State\nfoO\n", encoding="utf-8")
+        ms = metrics()
+        assert (ms["projection"]["value"], ms["projection"]["status"]) == ("diverged", "bad")
+
+    def test_the_write_path_is_live_or_no_wraps_yet_and_never_bad(self, env) -> None:
+        _r, _s, ck = env
+        wp = ck.panel("health")["value"]["metrics"][0]
+        assert (wp["value"], wp["status"]) in (("live", "ok"), ("no wraps yet", "unknown"))
+
+    def test_the_graph_panel_caption_comes_from_the_graph_not_a_link_count(self, env) -> None:
+        _r, _s, ck = env
+        text = {t["label"]: t["text"] for t in ck.panel("graph")["value"]["text"]}
+        assert text["association graph"] == "not formed" or "nodes" in text["association graph"]
 
     def test_crystal_tags_are_a_real_list(self, env) -> None:
         root, _s, ck = env

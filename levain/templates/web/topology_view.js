@@ -146,6 +146,7 @@
     if (!isObj(c)) return "cost not tracked";
     const usd = fmtUsd(c.usd), tok = fmtTokens(c.tokens);
     if (usd === null && tok === null) return "cost not tracked";
+    if (c.source === "transcript" && usd === null && tok !== null) return tok + " tokens from transcripts";   // spend read off the workers' transcripts: tokens, never a price
     const src = typeof c.source === "string" && c.source ? " " + c.source : "";
     return [usd, tok === null ? null : tok + " tok"].filter(Boolean).join(" · ") + src;
   }
@@ -161,6 +162,101 @@
     node.addEventListener("click", (ev) => { if (!(ev.target.closest && ev.target.closest("a,button:not(.tv-open)"))) go(); });
     node.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(); } });
     return true;
+  }
+
+  // The decision mark (Phill 10-23): the desk (the hub) or a seat node that carries needs_open > 0 is drawn with a red ring and a "!" badge holding
+  // the count. The keys are optional: absent, zero, non-integer or negative draws nothing and is never an error. needs_first_card (the card id the
+  // cockpit resolves, never derived from needs_first) makes the badge a button that opens that card; without it the badge is display-only.
+  // needs_first_what and needs_first are clipped at 120 code points (never refused) for the title and a data attribute; the card id is never cut: one that is not a
+  // non-empty string or is longer than 120 is refused (display-only), never rewritten.
+  const NEED_CAP = 120;
+  // what each marked owner ("hub", "node:<id>") last showed on a live lens: a mark plays its motion when it arrives or its count changes (a seat's: rises)
+  const needSeen = new Map();
+  // a seat with no id of its own (not a non-empty string) has no owner key to be remembered by: it gets no mark
+  const nodeNeed = (n) => (isObj(n) && typeof n.id === "string" && n.id ? needsOf(n) : null);
+  const needsSeenNow = (v) => { const m = new Map(); const h = needsOf(v.hub); if (h) m.set("hub", h.n); for (const n of arr(v.nodes)) { const k = nodeNeed(n); if (k) m.set("node:" + n.id, k.n); } return m; };
+  const capStr = (x) => (typeof x === "string" ? Array.from(x).slice(0, NEED_CAP).join("") : "");
+  function needsOf(o) {
+    if (!isObj(o) || !Number.isInteger(o.needs_open) || o.needs_open <= 0) return null;
+    return { n: o.needs_open, first: capStr(o.needs_first), card: typeof o.needs_first_card === "string" && Array.from(o.needs_first_card).length <= NEED_CAP ? o.needs_first_card : "", what: capStr(o.needs_first_what) };
+  }
+  // ring radius rr around (cx, cy), the badge on the ring at angle ang (radians); owner is the typed key "hub" or "node:<id>". Returns {inner, outer, under}:
+  // inner goes inside the node (or hub) group; outer, set only when the badge is a button, is a sibling group at the same coordinates (no interactive
+  // role nested in the node's role=button) drawn ABOVE every node, holding the pill; under is the transparent 44 CSS px tap pad (at the graph's scale),
+  // drawn BENEATH every node so a tap on a node's own shape reaches the node (message the seat) and only the margin around the pill reaches the card.
+  // deco, set only for the desk: {art, bx, by, rx}: the desk's own drawing (a group already placed at the hub) in place of the plain ring, and the badge's
+  // centre as an offset from the hub, with its corner radius. A seat's mark passes none and is the red ring it always was.
+  // the badge's geometry, one function for the drawing and for the conflict chips' placement: centre, pill width, the tap pad's side (44 CSS px at the graph's scale)
+  function needGeom(nd, cx, cy, rr, ang, scale, spot) {
+    const bx = spot ? cx + spot.bx : cx + Math.cos(ang) * rr, by = spot ? cy + spot.by : cy + Math.sin(ang) * rr, txt = "!" + (nd.n > 9 ? "9+" : String(nd.n));
+    return { bx, by, txt, w: txt.length > 2 ? 30 : 24, side: Math.max(44, Math.ceil(44 / (scale > 0 ? Math.min(1, scale) : 1))) };
+  }
+  // a tap in the overlap of pads goes to the badge whose centre is nearest the tap (in the graph's own coordinates); a tap with no usable point goes to the pad it hit
+  function nearestPad(pad, ev) {
+    try {
+      const svg = pad.ownerSVGElement, ctm = svg && svg.getScreenCTM && svg.getScreenCTM();
+      if (!ctm || typeof svg.createSVGPoint !== "function") return pad;
+      const pt = svg.createSVGPoint(); pt.x = ev.clientX; pt.y = ev.clientY;
+      const q = pt.matrixTransform(ctm.inverse());
+      let best = pad, bd = Infinity;
+      for (const o of Array.from(pad.parentNode.children)) {
+        const x = parseFloat(o.getAttribute("x")), y = parseFloat(o.getAttribute("y")), s = parseFloat(o.getAttribute("width"));
+        if (!(q.x >= x && q.x <= x + s && q.y >= y && q.y <= y + s) || typeof o.needGo !== "function") continue;
+        const d = Math.hypot(q.x - (x + s / 2), q.y - (y + s / 2));
+        if (d < bd) { bd = d; best = o; }
+      }
+      return best;
+    } catch (_) { return pad; }
+  }
+  function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale, deco, calm) {
+    const g = sv("g", { "data-needs": String(nd.n) }, "tv-need");
+    if (deco) g.appendChild(deco.art); else g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring" + (calm ? " calm" : "")));
+    const { bx, by, txt, w, side } = needGeom(nd, cx, cy, rr, ang, scale, deco);
+    const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge");
+    const tip = nd.what || (nd.n + " decision" + (nd.n === 1 ? "" : "s") + " waiting on you");
+    const openable = !!nd.card && !!opts && typeof opts.openCard === "function";
+    b.appendChild(sv("rect", { x: num(bx - w / 2), y: num(by - 10), width: w, height: 20, rx: deco ? deco.rx : 10 }, "tv-needpill"));
+    b.appendChild(sv("text", { x: num(bx), y: num(by + 5), "text-anchor": "middle" }, "tv-needtxt", txt));
+    b.appendChild(sv("title", null, null, tip));
+    if (openable) {
+      const go = (ev) => { ev.stopPropagation(); opts.openCard(nd.card); };
+      const who = typeof label === "string" && label ? label : "a seat";
+      b.classList.add("tv-needopen");
+      b.setAttribute("role", "button");
+      b.setAttribute("tabindex", "0");
+      b.setAttribute("aria-label", who + ": " + tip + ": open its card");
+      b.addEventListener("click", go);
+      b.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); if (!ev.repeat) go(ev); } });
+      const out = sv("g", null, "tv-needout");
+      out.appendChild(b);
+      const pad = sv("rect", { x: num(bx - side / 2), y: num(by - side / 2), width: side, height: side, "data-needhitfor": owner, "aria-hidden": "true" }, "tv-needhit");
+      pad.needGo = go;
+      pad.addEventListener("click", (ev) => nearestPad(pad, ev).needGo(ev));
+      return { inner: g, outer: out, under: pad };
+    }
+    g.appendChild(b);
+    return { inner: g, outer: null, under: null };
+  }
+
+
+  // The desk's mark, direction M1 (bezel + callout): 60 engraved ticks (a major every 5) in the alert colour on a thin track hugging the core, a lubber notch at 12
+  // o'clock, the "!N" readout on a short leader line (C's aviation callout) to the lower right, clear of every label. On arrival the ticks light in sequence once (CSS: 60 ticks 20 ms apart, each .2 s), then hold; the label
+  // rides HUB_LIFT px higher while the desk is marked. Every part is inert to the pointer: the desk's own tap is untouched.
+  const HUB_LIFT = 9, HUB_CALLOUT_X = 82, HUB_CALLOUT_Y = 54, HUB_BADGE = { bx: 64, by: 42 };           // the callout pill's far edge from the hub's centre
+  const pol = (r, deg) => [num(r * Math.sin(deg * Math.PI / 180)), num(-r * Math.cos(deg * Math.PI / 180))];     // clockwise from 12 o'clock, relative to the centre
+  function hubDeco(nd, cx, cy, sweep) {
+    const art = sv("g", { transform: "translate(" + num(cx) + " " + num(cy) + ")" }, "tv-hubmark tv-bezel" + (sweep ? " sweep" : ""));
+    art.appendChild(sv("circle", { cx: 0, cy: 0, r: 38.5 }, "tv-bz-track"));
+    for (let i = 0; i < 60; i++) {
+      const maj = i % 5 === 0, a = pol(maj ? 31.6 : 33.4, i * 6), b = pol(37.2, i * 6);
+      const t = sv("line", { x1: a[0], y1: a[1], x2: b[0], y2: b[1] }, "tv-bz-tick" + (maj ? " maj" : ""));
+      t.style.setProperty("--i", String(i));
+      art.appendChild(t);
+    }
+    art.appendChild(sv("path", { d: "M -3 -43.4 L 3 -43.4 L 0 -38.8 Z" }, "tv-bz-lub"));
+    const s = pol(39.6, 135);
+    art.appendChild(sv("path", { d: "M " + s + " L 42 42 L 52 42" }, "tv-bz-lead"));
+    return { art, bx: HUB_BADGE.bx, by: HUB_BADGE.by, rx: 4 };
   }
 
   function dot(state) { const d = el("i", "tv-dot " + state); d.setAttribute("aria-hidden", "true"); return d; }
@@ -607,16 +703,18 @@
         y += Math.ceil(mine.length / ranks) * pitch + 26;
       }
     }
-    const short = settleGroups(gpos, hub, hubHalf, H);
+    const short = settleGroups(gpos, hub, hubHalf, H, !!needsOf(v.hub));
     return { LW, H, hub, gpos, pos, short, gkey: (n) => (gids.has(n.group) ? n.group : "") };
   }
   // A seat's node sits at the middle of its lanes, but its block (the node, then its two label lines) is 72 tall and must not lie on another
   // seat's block, on the hub's label or on the hub: where the middle is taken it slides along its own column to the nearest free row. The
   // biggest seats keep their middle (they have the most lanes tied to it); the smaller ones give way.
   const GROUP_BLOCK_H = 72, BLOCK_GAP = 6;
-  function settleGroups(gpos, hub, hubHalf, H) {
+  function settleGroups(gpos, hub, hubHalf, H, marked) {
     const blockOf = (gp, y) => ({ x: gp.x - gp.hw, y: y - gp.r, w: 2 * gp.hw, h: GROUP_BLOCK_H });
-    const hubBlock = { x: hub.x - hubHalf, y: hub.y - hub.r - 44, w: 2 * hubHalf, h: 44 + 2 * hub.r + 16 };
+    // a marked desk's label rides HUB_LIFT higher and its callout reaches right and below the hub: the block holds what is drawn
+    const up = marked ? HUB_LIFT : 0, right = marked ? Math.max(hubHalf, HUB_CALLOUT_X) : hubHalf, down = marked ? Math.max(hub.r + 16, HUB_CALLOUT_Y) : hub.r + 16;
+    const hubBlock = { x: hub.x - hubHalf, y: hub.y - hub.r - 44 - up, w: hubHalf + right, h: 44 + up + hub.r + down };
     const clear = (b, others) => others.every((o) => !(b.x < o.x + o.w + BLOCK_GAP && o.x < b.x + b.w + BLOCK_GAP && b.y < o.y + o.h + BLOCK_GAP && o.y < b.y + b.h + BLOCK_GAP));
     const placed = [hubBlock];
     const lo = 24, hi = Math.max(lo, H - GROUP_BLOCK_H - 8);
@@ -666,11 +764,15 @@
   // The boxes the graph draws text and nodes in, in graph coordinates: one place computes them, the drawing and the conflict chip's placement
   // both read them (two pieces of code never restate a label's size). `hub` and each group's label, each node's face, each node's ring.
   const box = (x, y, w, h) => ({ x, y, w, h });
-  function graphBoxes(v, L, measure) {
+  const nodeSpot = (P) => ({ ang: P.side === 1 ? Math.PI * 0.75 : Math.PI * 0.25 });
+  const nodeR = (n) => (n.state === "waiting" ? 11 : 9);
+  function graphBoxes(v, L, measure, scale) {
     const nodes = arr(v.nodes), running = nodes.filter((n) => n.state === "running").length, h = L.hub;
     const hsub = nodes.length + (nodes.length === 1 ? " session" : " sessions") + " \u00b7 " + running + " running";
     const hw = Math.max(measure(hsub, "l2"), 70);
-    const out = { hubText: hsub, hub: box(h.x - hw / 2 - 7, h.y - h.r - 42, hw + 14, 40), hubBody: box(h.x - h.r - 8, h.y - h.r - 8, 2 * (h.r + 8), 2 * (h.r + 8)), groups: new Map(), faces: new Map(), rings: [] };
+    const marked = !!needsOf(v.hub), lift = marked ? HUB_LIFT : 0;
+    const out = { hubText: hsub, hub: box(h.x - hw / 2 - 7, h.y - h.r - 42 - lift, hw + 14, 40), hubMark: marked ? [box(h.x - 44, h.y - 44, 88, 88), box(h.x + 42, h.y + 30, HUB_CALLOUT_X - 38, HUB_CALLOUT_Y - 30)] : [], hubBody: box(h.x - h.r - 8, h.y - h.r - 8, 2 * (h.r + 8), 2 * (h.r + 8)), pills: [], groups: new Map(), faces: new Map(), rings: [] };
+    if (marked) { const hn = needsOf(v.hub), g = needGeom(hn, h.x, h.y, h.r + 14, Math.PI / 4, scale, HUB_BADGE); out.pills.push(box(g.bx - g.w / 2, g.by - 10, g.w, 20)); out.hubMark.push(box(g.bx - g.side / 2, g.by - g.side / 2, g.side, g.side)); }
     for (const [k, gp] of L.gpos) {
       const mem = nodes.filter((n) => L.gkey(n) === k), run = mem.filter((n) => n.state === "running").length;
       const sub = mem.length + (mem.length === 1 ? " agent" : " agents") + " \u00b7 " + run + " running";
@@ -682,6 +784,8 @@
       const tx = P.x + dir * (wait ? 26 : 17), bw = P.tw + 8, bh = f.tag ? 64 : 46, bx = dir === 1 ? tx - 5 : tx - P.tw - 3;
       out.faces.set(n.id, box(bx, P.y - (f.tag ? 30 : 13), bw, bh));
       out.rings.push(box(P.x - 17, P.y - 17, 34, 34));
+      const nn = nodeNeed(n);
+      if (nn) { const g = needGeom(nn, P.x, P.y, nodeR(n) + 8, nodeSpot(P).ang, scale); out.pills.push(box(g.bx - g.w / 2, g.by - 10, g.w, 20)); out.rings.push(box(g.bx - g.side / 2, g.by - g.side / 2, g.side, g.side)); }
     }
     return out;
   }
@@ -697,10 +801,10 @@
     while (tail.length > 4 && measure("…" + tail, "chip") > 150) tail = tail.slice(1);
     return "…" + tail;
   }
-  function conflictArcs(v, L, measure, boxes) {
+  function conflictArcs(v, L, measure, boxes, scale) {
     const out = [], byId = new Map(arr(v.nodes).map((n) => [n.id, n]));
-    const bx = boxes || graphBoxes(v, L, measure);
-    const obstacles = [bx.hub, bx.hubBody, ...Array.from(bx.groups.values()).map((g) => g.rect), ...Array.from(bx.faces.values()), ...bx.rings];
+    const bx = boxes || graphBoxes(v, L, measure, scale);
+    const obstacles = [bx.hub, bx.hubBody, ...(bx.hubMark || []), ...Array.from(bx.groups.values()).map((g) => g.rect), ...Array.from(bx.faces.values()), ...bx.rings, ...bx.pills];
     for (const c of arr(v.conflicts)) {
       if (!isObj(c) || typeof c.path !== "string") continue;
       const ids = arr(c.nodes).filter((id) => L.pos.has(id) && byId.has(id));
@@ -719,7 +823,7 @@
           search: for (const off of CHIP_OFF) {
             for (const t of CHIP_AT) {
               const q = at(t), p = { x: q.x + (-dy / ln) * off, y: q.y + (dx / ln) * off }, r = box(p.x - w / 2, p.y - 10, w, 20);
-              const cost = obstacles.reduce((s, o) => s + overlap(r, o, 3), 0);
+              const cost = obstacles.reduce((s, o) => s + overlap(r, o, 3), 0) + 40 * bx.pills.reduce((s, o) => s + overlap(r, o, 3), 0);     // a pill outweighs any label: a chip never sits on a badge while a free place exists
               if (best === null || cost < best.cost) best = { cost, p };
               if (cost === 0) break search;
             }
@@ -871,10 +975,13 @@
   }
 
   // ---- the SVG ----
-  function drawGraph(v, L, edges, measure, opts) {
+  function drawGraph(v, L, edges, measure, opts, scale, fresh) {
+    fresh = fresh || { prev: new Map(), still: true };
+    const shown = new Map();                                                // what this draw puts on screen, committed by the lens once it is the visible build
+    fresh.shown = shown;
     const svg = sv("svg", { viewBox: "0 0 " + L.LW + " " + L.H, role: "group", "aria-label": "Agents graph", preserveAspectRatio: "xMidYMid meet" }, "tv-graph");
     const nodes = arr(v.nodes), byId = new Map(nodes.map((n) => [n.id, n]));
-    const lost = lostMap(v), bxs = graphBoxes(v, L, measure);
+    const lost = lostMap(v), bxs = graphBoxes(v, L, measure, scale);
     svg.appendChild(drawGlow(v, L));
     for (const k of RING_H) svg.appendChild(sv("ellipse", { cx: num(L.hub.x), cy: num(L.hub.y), rx: num(L.LW * k * 1.15), ry: num(L.H * k * 1.05) }, "tv-gring"));
     const eg = sv("g", null, "tv-edges");
@@ -886,7 +993,7 @@
     svg.appendChild(eg);
     // file conflicts: the arc runs under the plates, but its chip (the file's name) is drawn after the nodes, so a plate never hides it
     const chips = [];
-    for (const a of conflictArcs(v, L, measure, bxs)) {
+    for (const a of conflictArcs(v, L, measure, bxs, scale)) {
       svg.appendChild(sv("path", { d: "M" + num(a.A.x) + " " + num(a.A.y) + " Q" + num(a.cx) + " " + num(a.cy) + " " + num(a.B.x) + " " + num(a.B.y), "data-conflict": a.path }, "tv-confline"));
       if (a.chip) {
         const g = sv("g", { "data-conflict": a.path, "data-nodes": a.ids.join(",") }, "tv-gconf");
@@ -900,15 +1007,23 @@
     // the hub: the install, "N sessions · M running"
     const running = nodes.filter((n) => n.state === "running").length, h = L.hub;
     const hubLabel = isObj(v.hub) && typeof v.hub.label === "string" ? v.hub.label : "";
+    const under = sv("g", null, "tv-needunder"), outers = [];            // the badges' tap pads, beneath the hub and every node; their pills, above them all
+    svg.appendChild(under);
     const hg = sv("g", { "data-hub": isObj(v.hub) && typeof v.hub.id === "string" ? v.hub.id : "" }, "tv-ghub");
     hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: h.r + 8 }, "tv-hubhalo"));
     hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: h.r }, "tv-hubbody"));
     hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: 9 }, "tv-hubcore" + (running ? " run" : "")));
     const hsub = bxs.hubText, hr = bxs.hub;
+    const hubNeed = needsOf(v.hub), lift = hubNeed ? HUB_LIFT : 0;          // a marked desk's label rides a few px higher so the mark never touches it
     hg.appendChild(sv("rect", { x: num(hr.x), y: num(hr.y), width: num(hr.w), height: hr.h, rx: 7 }, "tv-lblbg"));
-    hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 26), "text-anchor": "middle" }, "tv-hubname", hubLabel));
-    hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 10), "text-anchor": "middle" }, "tv-hubsub", hsub));
+    hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 26 - lift), "text-anchor": "middle" }, "tv-hubname", hubLabel));
+    hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 10 - lift), "text-anchor": "middle" }, "tv-hubsub", hsub));
+    const hubMark = hubNeed ? needMark(hubNeed, h.x, h.y, h.r + 14, Math.PI / 4, opts, hubLabel || "the desk", "hub", scale, hubDeco(hubNeed, h.x, h.y, !fresh.still && fresh.prev.get("hub") !== hubNeed.n), false) : null;
+    if (hubNeed) shown.set("hub", hubNeed.n);
+    if (hubMark) hg.appendChild(hubMark.inner);
     svg.appendChild(hg);
+    if (hubMark && hubMark.under) under.appendChild(hubMark.under);
+    if (hubMark && hubMark.outer) outers.push(hubMark.outer);
     // the groups: "N agents · M running"
     for (const [k, gp] of L.gpos) {
       const mem = nodes.filter((n) => L.gkey(n) === k);
@@ -958,18 +1073,26 @@
       // every node is a keyboard stop: Enter or Space opens its page as a click does (agentsLens binds the keys)
       g.setAttribute("role", "button");
       g.setAttribute("tabindex", "0");
-      g.setAttribute("aria-label", n.label + ", " + (NODE_WORDS[n.state] || n.state) + ": open its page");
+      g.setAttribute("aria-label", (typeof n.label === "string" && n.label ? n.label : n.id || "a seat") + ", " + (NODE_WORDS[n.state] || n.state) + ": open its page");
       if (wait && typeof n.card === "string" && n.card && opts && typeof opts.openCard === "function") {
         g.classList.add("tv-open");
-        g.setAttribute("aria-label", n.label + ", waiting on you: open its card");
+        g.setAttribute("aria-label", (typeof n.label === "string" && n.label ? n.label : n.id || "a seat") + ", waiting on you: open its card");
         g.dataset.card = n.card;
         const go = () => opts.openCard(n.card);
         g.addEventListener("click", go);
         g.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(); } });
       }
+      const need = nodeNeed(n);
+      const owner = "node:" + n.id, prevN = fresh.prev.get(owner);
+      const mark = need ? needMark(need, P.x, P.y, r + 8, dir === 1 ? Math.PI * 0.75 : Math.PI * 0.25, opts, n.label, owner, scale, undefined, fresh.still || !(prevN === undefined || need.n > prevN)) : null;
+      if (need) shown.set(owner, need.n);
+      if (mark) g.appendChild(mark.inner);
       svg.appendChild(g);
+      if (mark && mark.under) under.appendChild(mark.under);
+      if (mark && mark.outer) outers.push(mark.outer);
     }
     for (const g of chips) svg.appendChild(g);
+    for (const o of outers) svg.appendChild(o);                              // the badges last: where a chip still overlaps one, the badge wins the tap
     return { svg, tickers };
   }
 
@@ -1092,10 +1215,13 @@
   }
 
   let pinned = null;                                                      // the fallback pin (no agent page in the page): {id, x, y, dx, dy} in stage px
-  let kbFocus = null;                                                     // the node id the keyboard focus sits on, kept across a redraw
+  let kbFocus = null;                                                     // the control the keyboard focus sits on ("n:<node id>", or "b:hub" / "b:node:<node id>" for a need badge (the owner is typed, so a node whose id is "hub" is not the desk)), kept across a redraw
   function agentsLens(v, opts) {
     release();
     const wrap = el("div", "tv-agents");
+    // what the desk's mark last showed: undefined = it just arrived, a number = the count it had (a rebuild at the same data replays nothing)
+    const still = !!(opts && opts.still);
+    const fresh = { prev: new Map(needSeen), still, shown: null };
     const stage = el("div", "tv-stage");
     const hint = el("span", "tv-hint", "Click a node for its page. Hover for the face.");
     stage.appendChild(hint);
@@ -1107,6 +1233,25 @@
     tip.setAttribute("aria-hidden", "true");
     wrap.appendChild(stage);
     let LW = 0, svgNode = null, scale = 1, built = false;
+    // keyboard focus follows its control across every rebuild of the graph (the card's own redraw, and a resize that redraws it after): the key is
+    // "n:<node id>", or "b:hub" / "b:node:<node id>" for a need badge (the owner is typed, so a node whose id is "hub" is not the desk); pending holds the key until a rebuilt element takes the focus
+    let pending = kbFocus && (kbFocus.startsWith("b:") || arr(v.nodes).some((n) => n.id === kbFocus.slice(2))) ? kbFocus : null;
+    const focusKey = (t) => { const bd = t && t.closest ? t.closest("[data-needbadge][tabindex]") : null, g = t && t.closest ? t.closest("[data-node]") : null;
+                              return bd ? "b:" + bd.getAttribute("data-needfor") : g ? "n:" + g.dataset.node : null; };
+    const restoreFocus = () => {
+      if (!pending || typeof root.requestAnimationFrame !== "function") return;
+      root.requestAnimationFrame(() => {
+        const d = root.document;
+        if (!pending || !stage.isConnected) return;
+        if (d.activeElement && d.activeElement !== d.body) { pending = null; return; }
+        const isBadge = pending.startsWith("b:"), key = pending.slice(2);
+        const g = svgNode && (isBadge ? Array.from(svgNode.querySelectorAll("[data-needbadge][tabindex]")).find((x) => x.getAttribute("data-needfor") === key)
+                                      : Array.from(svgNode.querySelectorAll("[data-node]")).find((x) => x.dataset.node === key));
+        if (g && g.focus) g.focus({ preventScroll: true });
+        else if (kbFocus === pending) kbFocus = null;          // its control is gone from this build: forget it, so a later rebuild that brings it back does not take the focus
+        pending = null;
+      });
+    };
     let reanchorPin = null;                                               // set once the card helpers exist: re-seats a pinned card on its node after every layout
     const mctx = document.createElement("canvas").getContext ? document.createElement("canvas").getContext("2d") : null;
     const build = (W) => {
@@ -1125,9 +1270,16 @@
       const edges = graphEdges(v, L);
       hint.textContent = phone ? "Swipe sideways to pan. Tap a node for its page." : "Click a node for its page. Hover for the face.";
       if (streamStop) { streamStop(); streamStop = null; }
+      if (svgNode && root.document.activeElement && svgNode.contains(root.document.activeElement)) pending = focusKey(root.document.activeElement) || pending;
       if (svgNode) svgNode.remove();
-      const g = drawGraph(v, L, edges, measure, opts);
+      const g = drawGraph(v, L, edges, measure, opts, scale, fresh);
       svgNode = g.svg;
+      // only a build the person can see (attached, with a width) has played its motion: it REPLACES the seen snapshot with what it showed, so a mark that
+      // vanished is forgotten and one that returns arrives anew; a hidden or pre-attach build commits nothing, and the lens still plays when first shown
+      if (fresh.shown && stage.isConnected && stage.getBoundingClientRect().width > 0) {
+        fresh.prev = new Map(fresh.shown);
+        if (!still) { needSeen.clear(); for (const [k, n] of fresh.shown) needSeen.set(k, n); }
+      }
       if (phone) svgNode.style.width = Math.round(LW * scale) + "px";
       stage.insertBefore(svgNode, canvas);
       // the canvas keeps the graph's own proportions: CSS size follows the SVG, the backing store follows the device
@@ -1148,6 +1300,7 @@
       stage.dataset.nodes = String(arr(v.nodes).length);
       built = true;
       if (reanchorPin) reanchorPin();
+      restoreFocus();
     };
     build(920);                                                           // a width to draw at before the card has one; the observer redraws at the real one
     let seen = 0;
@@ -1215,6 +1368,15 @@
     const openPage = (g, n, x, y) => {
       if (!n) { toggle(null); return; }
       if (g.classList.contains("tv-open")) return;
+      // a seat the compose card can address (its chip is among the card's chips now) takes the tap into the message box; the graph passes
+      // the full roster name, which is its GROUP's label (the node's own label is only the tail), and the card maps it to its chip id by the
+      // prefix its provider declared. Anything else keeps its page.
+      // Only the seat's own node does: its lanes sit in the seat's group with that node as parent, and a label shared by two groups
+      // names no one seat. Each of those keeps its agent page.
+      const D = root.LevainDashboard, grp = arr(v.groups).find((q) => q && q.id === n.group);
+      const own = n.parent == null || n.parent === "";
+      const unique = grp && typeof grp.label === "string" && arr(v.groups).filter((q) => q && typeof q.label === "string" && q.label.trim() === grp.label.trim()).length === 1;
+      if (own && unique && D && typeof D.messageTo === "function" && D.messageTo(grp.label.trim())) { hideTip(); return; }
       const A = root.LevainAgentPage;
       if (A && typeof A.open === "function") { hideTip(); A.open({ id: n.id, label: n.label, rows: tipRows(n, v.as_of), session: typeof n.session === "string" ? n.session : "" }, g); }
       else toggle(n, x, y);
@@ -1242,19 +1404,10 @@
       openPage(g, n, rc.left + rc.width / 2 - box.left + stage.scrollLeft, rc.top + rc.height / 2 - box.top);
     });
     // a redraw replaces the focused node: keyboard focus follows the id to its new element (focus that leaves while the node is still there clears it)
-    stage.addEventListener("focusin", (ev) => { const g = nodeOf(ev.target); if (g) kbFocus = g.dataset.node; });
-    stage.addEventListener("focusout", (ev) => { const t = ev.target; root.setTimeout(() => { if (t.isConnected) kbFocus = null; }, 0); });
+    stage.addEventListener("focusin", (ev) => { const k = focusKey(ev.target); if (k) kbFocus = k; });
+    stage.addEventListener("focusout", (ev) => { const t = ev.target; root.setTimeout(() => { if (t.isConnected && !focusKey(root.document.activeElement)) kbFocus = null; }, 0); });
     stage.appendChild(tip);
     if (pinned && byId.has(pinned.id)) { showTip(byId.get(pinned.id), pinned.x, pinned.y); root.requestAnimationFrame ? root.requestAnimationFrame(() => reanchorPin && reanchorPin()) : null; } else pinned = null;
-    if (kbFocus && byId.has(kbFocus) && typeof root.requestAnimationFrame === "function") {
-      const want = kbFocus;
-      root.requestAnimationFrame(() => {
-        const d = root.document;
-        if (!stage.isConnected || (d.activeElement && d.activeElement !== d.body)) return;
-        const g = svgNode && Array.from(svgNode.querySelectorAll("[data-node]")).find((x) => x.dataset.node === want);
-        if (g && g.focus) g.focus({ preventScroll: true });
-      });
-    }
     return wrap;
   }
 

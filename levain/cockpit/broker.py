@@ -93,6 +93,7 @@ from levain.cockpit.firejournal import (
     CockpitFormatError,
     DB_NAME,
     DecisionRows,
+    DeviceRevoked,
     EditsPage,
     IdempotencyConflict,
     PendingCapExceeded,
@@ -285,6 +286,11 @@ class Broker:
         self._thread: threading.Thread | None = None
         self._healer: threading.Thread | None = None
         self._stop = threading.Event()
+        self._starter: threading.Thread | None = None   # start_async's one thread (PAIR RU-4), cleared when it ends
+        # G4: the one start-in-progress signal, set under _mu before ANY start begins (synchronous or async) and
+        # cleared in a finally; wait_settled waits on it, so a starter that died leaves it False and ends the wait
+        self._starting = False
+        self.starter_error: BaseException | None = None   # the last exception a starter thread's start raised (F2(b))
 
     @staticmethod
     def check_downstream(downstream: Mapping[str, Any]) -> dict[str, DownstreamEffect]:
@@ -391,6 +397,68 @@ class Broker:
         db = self._active_db()
         return None if db is None else db.edits(limit)
 
+    def active_db(self) -> CockpitDB | None:
+        """This broker's journal while ACTIVE, else None (the pairing routes' and the paired credential's one way in)."""
+        return self._active_db()
+
+    def start_async(self) -> None:
+        """Run :meth:`start` once on a single starter thread (PAIR RU-4): the caller never runs the start sequence
+        itself, so a paired request on a fresh serve waits on broker state (:meth:`wait_settled`) instead of on
+        recovery. A broker already started, or whose starter already runs, does nothing.
+
+        G5: if the thread cannot be started (``Thread.start()`` raises), ``_starter`` and ``_starting`` are cleared,
+        the exception is kept in ``starter_error`` and re-raised, so the caller answers its controlled 503 and a
+        later call retries."""
+        with self._mu:
+            if self._started or self._starter is not None:
+                return
+            self._starting = True
+            starter = threading.Thread(target=self._run_starter, name="cockpit-broker-start", daemon=True)
+            self._starter = starter
+            try:
+                starter.start()
+            except BaseException as exc:
+                self._starter = None
+                self._starting = False
+                self.starter_error = exc
+                raise
+
+    def _run_starter(self) -> None:
+        """The starter thread's body (F2(b)): an exception out of :meth:`start` is logged and kept in
+        ``starter_error``, and a start that raised before anything moved (still STANDBY, no healer) is marked not
+        started; ``_starter`` is cleared in a ``finally`` either way, so a later :meth:`start_async` retries."""
+        try:
+            self.start()
+        except Exception as exc:  # noqa: BLE001 - a starter that dies silently would leave every paired request waiting
+            _log.exception("cockpit broker start failed")
+            with self._mu:
+                self.starter_error = exc
+                if self._state is Lifecycle.STANDBY and self._healer is None:
+                    self._started = False
+        finally:
+            with self._mu:
+                self._starter = None
+
+    def wait_settled(self, timeout: float, *, poll: float = 0.02) -> Lifecycle:
+        """The broker's state once it is ACTIVE, INSTALL_DISABLED or CLOSED, or after ``timeout`` seconds, whichever
+        comes first; but it waits only while the state is ACTIVATING or a start is in progress (G4: ``_starting``,
+        synchronous or async, read under ``_mu`` with the state): a finished start that left STANDBY (another process
+        holds the ledger) or DRAINING answers at once, and so does a starter that died."""
+        import time
+
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._mu:
+                state, starting = self._state, self._starting
+            if state in (Lifecycle.ACTIVE, Lifecycle.INSTALL_DISABLED, Lifecycle.CLOSED):
+                return state
+            if state is not Lifecycle.ACTIVATING and not starting:
+                return state
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return state
+            time.sleep(min(poll, left))
+
     def start(self) -> Lifecycle:
         """Run the start sequence once now; on a held lock stay STANDBY and heal in the background:
         retried every ``lock_poll`` for ``lock_wait`` seconds, then every ``lock_retry`` (§4.2)."""
@@ -398,16 +466,21 @@ class Broker:
             if self._started:
                 return self._state
             self._started = True
-        decision = decide_install(self.declared, self.data_root, marker_directory=self._marker_directory)
-        if decision.install_class is None:
-            return self._disable(decision.reason or "install check")
-        self.install_class = decision.install_class
-        if self._attempt():
+            self._starting = True       # G4: set under _mu before the start sequence begins
+        try:
+            decision = decide_install(self.declared, self.data_root, marker_directory=self._marker_directory)
+            if decision.install_class is None:
+                return self._disable(decision.reason or "install check")
+            self.install_class = decision.install_class
+            if self._attempt():
+                return self.state
+            if self.state is Lifecycle.STANDBY:
+                self._healer = threading.Thread(target=self._heal, name="cockpit-broker-heal", daemon=True)
+                self._healer.start()
             return self.state
-        if self.state is Lifecycle.STANDBY:
-            self._healer = threading.Thread(target=self._heal, name="cockpit-broker-heal", daemon=True)
-            self._healer.start()
-        return self.state
+        finally:
+            with self._mu:
+                self._starting = False
 
     def _disable(self, reason: str) -> Lifecycle:
         with self._mu:
@@ -988,6 +1061,9 @@ class Broker:
                 for o in exc.occupying]}) from exc
         except IdempotencyConflict as exc:
             raise BrokerError("idempotency_conflict", 409, str(exc)) from exc
+        except DeviceRevoked as exc:
+            # PAIR RS-4: revoked after this request authenticated; refused in issue()'s own transaction
+            raise BrokerError("credential_required", 403, str(exc)) from exc
         self._kp("issued")
         if intent == "reported" and res.outcome.state == "WAITING":
             # a reported pending is decided by the request that issued it, or by its replay

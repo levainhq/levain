@@ -2,11 +2,14 @@
 said "+7 more" cut off by the tile's bottom, and "why isn't this like the Decisions Waiting widget and clickable to load a modal that
 DOES show all data?").
 
-The default install's Health widget is a status-dots tile with twelve metrics, so it hides most of them: it is a button, the focus view
-lists every metric behind a filter box, and nothing in any tile is drawn outside the tile at the page's desktop width."""
+The default install's Health widget is a status-dots tile that draws four of its metrics, so it hides the rest: it is a button, the focus view
+lists every metric, and nothing in any tile is drawn outside the tile at the page's desktop width."""
 
 from __future__ import annotations
 
+import json
+import re
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -35,10 +38,20 @@ def test_a_tile_that_holds_items_back_is_a_button_and_one_that_holds_none_is_not
     assert all(r is None for r in out[2]), out
 
 
+def _filter_min() -> int:
+    js = (Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "cockpit_view.js").read_text(encoding="utf-8")
+    return int(re.search(r"const FILTER_MIN = (\d+);", js).group(1))
+
+
 @needs_browser
-def test_the_focus_view_lists_every_metric_behind_a_filter_box(tmp_path: Path) -> None:
+def test_the_focus_view_lists_every_metric(tmp_path: Path) -> None:
+    """The tile draws four of the health metrics; the focus view draws every one the server returns for the store,
+    and carries the filter box exactly when that count reaches the box's floor (FILTER_MIN in cockpit_view.js)."""
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        req = urllib.request.Request(f"{url}/cockpit/panel/health.json?profile=full", headers={"X-Levain-Write-Token": "T"})
+        with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310 - loopback
+            served = len(json.loads(r.read())["value"]["metrics"])
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             DESKTOP,
             {"until": f"{HEALTH} && {HEALTH}.querySelector('.xnote')"},
@@ -46,19 +59,13 @@ def test_the_focus_view_lists_every_metric_behind_a_filter_box(tmp_path: Path) -
             {"eval": f"(async () => {{ const t = {HEALTH}; const b = document.createElement('button'); b.textContent = 'inner'; t.querySelector('.k').appendChild(b); b.click(); "
                      "const underButton = !!document.getElementById('levain-modal'); b.remove(); return underButton; })()"},
             {"eval": f"(() => {{ {HEALTH}.dispatchEvent(new KeyboardEvent('keydown', {{key: 'Enter', bubbles: true}})); const m = document.getElementById('levain-modal'); "
-                     "return [m.querySelectorAll('.op').length, !!m.querySelector('.xfilter-input'), m.querySelector('.xfilter-count').textContent]; })()"},
-            {"eval": "(async () => { const i = document.querySelector('#levain-modal .xfilter-input'); i.value = 'strength'; i.dispatchEvent(new Event('input', {bubbles: true})); "
-                     "await new Promise(r => setTimeout(r, 300)); return [document.querySelectorAll('#levain-modal .op').length, document.querySelector('#levain-modal .xfilter-count').textContent]; })()"},
-            # the cockpit refreshing while he types rebuilds the open view: the query he typed is still there
-            {"eval": "(async () => { document.dispatchEvent(new Event('visibilitychange')); window.dispatchEvent(new Event('focus')); await new Promise(r => setTimeout(r, 600)); "
-                     "const i = document.querySelector('#levain-modal .xfilter-input'); return [i && i.value, document.querySelectorAll('#levain-modal .op').length]; })()"},
+                     "return [m.querySelectorAll('.op').length, !!m.querySelector('.xfilter-input')]; })()"},
             {"eval": f"(async () => {{ {ESC}; await new Promise(r => setTimeout(r, 200)); return !document.getElementById('levain-modal'); }})()"},
         ])["values"]
     assert out[1] is False, out                               # the click landed on a button inside the tile
-    assert out[2] == [12, True, "12 metrics"], out            # the tile drew four of them: the view draws all twelve
-    assert out[3] == [2, "2 of 12"], out                      # avg strength, max strength
-    assert out[4] == ["strength", 2], out
-    assert out[5] is True, out
+    assert served > 4, served                                 # the tile draws four of them; the view must draw more
+    assert out[2] == [served, served >= _filter_min()], out   # the view draws every served metric; the box follows the floor
+    assert out[3] is True, out
 
 
 @needs_browser

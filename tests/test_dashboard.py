@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import time
+import os
 import pytest
 
 from levain.dashboard import (
@@ -133,7 +135,8 @@ class TestBuildView:
         v = build_substrate_view(AnnealPaths.from_db(db))
         assert v.errors == {}
         assert v.health is not None
-        assert v.health.write_path_live is False
+        assert v.health.write_path_live is False  # nothing committed yet: not live, and not a fault
+        assert v.health.status == "no-wraps"
         assert v.health.total_episodes == 0
         assert v.crystal_index == []
         assert v.open_spores == []
@@ -498,7 +501,7 @@ class TestCLISurface:
         assert rc == 0
         assert json.loads(capsys.readouterr().out)["health"]["total_episodes"] == 1
 
-    def test_render_text_handles_dark_write_path(self, tmp_path: Path) -> None:
+    def test_render_text_handles_a_store_with_no_wraps(self, tmp_path: Path) -> None:
         from anneal_memory import Store
 
         from levain.dashboard import AnnealPaths, build_substrate_view, render_text
@@ -508,7 +511,8 @@ class TestCLISurface:
             pass
         v = build_substrate_view(AnnealPaths.from_db(db))
         text = render_text(v)
-        assert "DARK" in text  # an existing empty store has no associations
+        assert "no wraps yet" in text  # a fresh store is not a failure
+        assert "DARK" not in text and "links" not in text
 
     def test_render_text_with_content(self, tmp_path: Path) -> None:
         from anneal_memory import Store
@@ -520,13 +524,15 @@ class TestCLISurface:
         with Store(db) as store:
             a = store.record("episode A", "decision")
             b = store.record("episode B", "observation")
-            store.record_associations({(a.id, b.id)})
+            store.wrap_started(token="w1", episode_ids=[a.id, b.id])
+            store.wrap_completed(2, 20, wrap_token="w1", episode_ids=[a.id, b.id])
         SporeStore(tmp_path / "memory.spores.json").add(
             type="task", text="loop", tier="hot"
         )
         (tmp_path / "memory.continuity.md").write_text("## State\nfoc\n", encoding="utf-8")
         text = render_text(build_substrate_view(AnnealPaths.from_db(db)))
-        assert "LIVE" in text  # has associations
+        assert "LIVE" in text and "last wrap" in text  # a committed wrap reads live
+        assert "Hebbian" not in text and "0 links" not in text
         assert "Open loops" in text
         assert "State" in text
 
@@ -908,6 +914,64 @@ class TestL3Fixes:
         assert g.truncated is True
 
 
+class TestFormationCaption:
+    """anneal >= 1.0.2 forms no new links; the graph says so, and an old anneal says nothing."""
+
+    @staticmethod
+    def _stub(formation):
+        from types import SimpleNamespace
+
+        ep = SimpleNamespace(id="e1", type=SimpleNamespace(value="observation"), content="x")
+        kw = {} if formation is None else {"association_formation": lambda: formation}
+        return SimpleNamespace(
+            recall=lambda limit: SimpleNamespace(episodes=[ep], total_matching=1),
+            get_associations=lambda chunk, min_strength, limit: [],
+            **kw,
+        )
+
+    def test_a_disabled_store_carries_the_wrap_it_stopped_at(self) -> None:
+        from levain.dashboard import _build_graph
+
+        g = _build_graph(
+            self._stub({"mode": "disabled", "off_at_wrap": 7, "off_by_version": "1.0.2"}),
+            min_strength=0.0, max_nodes=300, max_edges=2000,
+        )
+        assert g.formation_off_at_wrap == 7
+        assert g.to_dict()["formation_off_at_wrap"] == 7
+
+    def test_an_enabled_store_or_an_old_anneal_claims_nothing(self) -> None:
+        from levain.dashboard import _build_graph
+
+        for formation in (None, {"mode": "enabled", "off_at_wrap": None, "off_by_version": None}, "odd",
+                          {"mode": "disabled", "off_at_wrap": "7"}):
+            g = _build_graph(self._stub(formation), min_strength=0.0, max_nodes=300, max_edges=2000)
+            assert g.formation_off_at_wrap is None, formation
+
+    def test_the_caption_reads_not_formed_for_an_empty_graph_and_never_errors(self) -> None:
+        from levain.dashboard import AssociationGraph, GraphEdge, GraphNode, graph_caption
+
+        assert graph_caption(AssociationGraph([], [])) == "not formed"
+        assert graph_caption(AssociationGraph([], [], formation_off_at_wrap=3)) == "not formed · no new links since wrap 3"
+        full = AssociationGraph([GraphNode("a", "episode", "A"), GraphNode("b", "episode", "B")],
+                                [GraphEdge("a", "b", 0.9, 3, None, 0.0)], truncated=True, formation_off_at_wrap=3)
+        assert graph_caption(full) == "2 nodes, 1 edges (capped for display) · no new links since wrap 3"
+
+    def test_render_text_prints_the_caption(self) -> None:
+        from levain.dashboard import AnnealPaths, AssociationGraph, SubstrateView, render_text
+
+        v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")), scope="solo")
+        v.graph = AssociationGraph([], [], formation_off_at_wrap=9)
+        assert "Association graph: not formed · no new links since wrap 9" in render_text(v)
+
+    def test_a_wrap_row_prints_links_only_when_the_row_has_them(self) -> None:
+        from levain.dashboard import AnnealPaths, SubstrateView, WrapRow, render_text
+
+        v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")), scope="solo")
+        v.wraps = [WrapRow("2026-10-23T01:00:00", 5, 900, 1, 0, 0, 0, 0), WrapRow("2026-10-01T01:00:00", 5, 900, 1, 0, 4, 1, 0)]
+        lines = [x for x in render_text(v).splitlines() if x.startswith("  - 2026-")]
+        assert "links" not in lines[0] and "+4 links" in lines[1]
+
+
 class TestEntityNameExtraction:
     def test_h1_suffix_forms(self) -> None:
         from levain.dashboard import _h1_name_suffix
@@ -1163,3 +1227,203 @@ class TestBrandWhiteLabel:
             store.record("x", "decision")
         view = SubstrateSource.local(tmp_path).build()
         assert view.brand_wordmark is None and view.brand_model is None
+
+
+class TestHealthStatusFollowsTheOldKey:
+    """A caller that built Health the old way (write_path_live, no status) gets the status it implies."""
+
+    @staticmethod
+    def _health(**kw):
+        from levain.dashboard import Health
+
+        base = dict(total_links=0, avg_strength=0.0, max_strength=0.0, density=0.0, local_density=0.0, links_formed_total=0,
+                    links_strengthened_total=0, links_decayed_total=0, graduations_validated_total=0, graduations_demoted_total=0,
+                    total_episodes=0, episodes_since_wrap=0, episodes_by_type={}, tombstones=0, continuity_chars=None,
+                    total_wraps=0, last_wrap_at=None, wrap_in_progress=False)
+        return Health(**base, **kw)
+
+    def test_the_old_shape_never_contradicts_itself(self) -> None:
+        for live, want in ((True, "live"), (False, "no-wraps")):
+            d = self._health(write_path_live=live).to_dict()
+            assert d["status"] == want and d["write_path_live"] is live, d
+
+    def test_the_new_shape_keeps_the_deprecated_key_in_step(self) -> None:
+        for status, live in (("live", True), ("no-wraps", False), ("unreadable", False)):
+            d = self._health(write_path_live=not live, status=status).to_dict()
+            assert d["status"] == status and d["write_path_live"] is live, d
+
+    def test_a_failing_formation_accessor_costs_the_caption_never_the_graph(self) -> None:
+        from types import SimpleNamespace
+
+        from levain.dashboard import _build_graph
+
+        def boom():
+            raise RuntimeError("meta table unreadable")
+
+        ep = SimpleNamespace(id="e1", type=SimpleNamespace(value="observation"), content="x")
+        stub = SimpleNamespace(
+            recall=lambda limit: SimpleNamespace(episodes=[ep], total_matching=1),
+            get_associations=lambda chunk, min_strength, limit: [],
+            association_formation=boom,
+        )
+        g = _build_graph(stub, min_strength=0.0, max_nodes=300, max_edges=2000)
+        assert g is not None and g.formation_off_at_wrap is None
+
+
+class TestHealthOracles:
+    """The substrate oracles are facts about the last committed save, never an activity counter."""
+
+    def test_recency_convergence_audit_from_the_store_facts(self, tmp_path: Path) -> None:
+        import hashlib
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+
+        from levain.dashboard import health_oracles
+
+        md = tmp_path / "memory.continuity.md"
+        md.write_text("## State\nfoc\n", encoding="utf-8")
+        h = hashlib.sha256(md.read_bytes()).hexdigest()
+        now = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
+        st = SimpleNamespace(last_wrap_at="2026-10-24T09:00:00", total_wraps=5, audit_write_failures=0)
+        row = ("2026-10-24T10:00:00", h, "tok-1")  # age and hash come from the ONE row, not from status
+        ok = health_oracles(st, row, md, now=now)
+        assert ok == {"save_age_hours": 2.0, "projection_converged": True, "projection_note": None,
+                      "audit_backlog": 0}
+        assert health_oracles(st, ("2026-10-24T10:00:00", "b" * 64, "tok-1"), md, now=now)["projection_converged"] is False
+        # a naive now compares in UTC instead of raising
+        assert health_oracles(st, row, md, now=now.replace(tzinfo=None))["save_age_hours"] == 2.0
+        # nothing to compare is None, never a guessed ok; a fresh store has no save age
+        fresh = SimpleNamespace(last_wrap_at=None, total_wraps=0, audit_write_failures=None)
+        assert health_oracles(fresh, None, md, now=now) == {
+            "save_age_hours": None, "projection_converged": None, "projection_note": None, "audit_backlog": None}
+        assert health_oracles(st, ("2026-10-24T10:00:00", None, None), md, now=now)["projection_converged"] is None
+        st.audit_write_failures = 3
+        assert health_oracles(st, row, md, now=now)["audit_backlog"] == 3
+
+    def test_convergence_is_the_content_hash_not_the_size(self, tmp_path: Path, monkeypatch) -> None:
+        import hashlib
+        from anneal_memory import Store
+
+        from levain.dashboard import AnnealPaths, build_substrate_view
+
+        db = tmp_path / "memory.db"
+        with Store(db) as store:
+            a = store.record("episode A", "decision")
+            store.wrap_started(token="w1", episode_ids=[a.id])
+            store.wrap_completed(1, 20, wrap_token="w1", episode_ids=[a.id])
+        md = tmp_path / "memory.continuity.md"
+        md.write_text("## State\nfoc\n", encoding="utf-8")
+
+        def converged() -> bool | None:
+            v = build_substrate_view(AnnealPaths.from_db(db))
+            assert v.health is not None
+            return v.health.projection_converged
+
+        assert converged() is None  # the wrap row has no hash (an old row): unknown, never converged
+        with Store(db) as store:  # a second wrap, committed WITH the hash of the text it saved
+            b = store.record("episode B", "decision")
+            store.wrap_started(token="w2", episode_ids=[b.id])
+            store.wrap_completed(1, 20, wrap_token="w2", episode_ids=[b.id], pair_id="p2",
+                                 content_hash=hashlib.sha256(md.read_bytes()).hexdigest())
+        assert converged() is True
+        md.write_text("## State\nfoO\n", encoding="utf-8")  # same length, different text
+        assert converged() is False  # no sidecar proves a rename pending: an edit, not a settle
+        md.unlink()
+        assert converged() is False  # a committed wrap and no file: diverged, "continuity file missing"
+
+    def test_a_live_view_carries_the_oracle_keys_and_never_a_link_count_as_health(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db):
+            pass
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.health is not None
+        d = v.health.to_dict()
+        assert {"save_age_hours", "projection_converged", "audit_backlog"} <= set(d) and "audit_prune_behind" not in d
+        assert d["save_age_hours"] is None and d["projection_converged"] is None  # no wrap committed yet
+
+
+class TestHealthOraclesRound2:
+    def test_a_read_only_store_reports_the_durable_audit_failures_as_a_fault(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        from levain.dashboard import health_oracle_line
+
+        db = tmp_path / "memory.db"
+        with Store(db, audit=True) as store:
+            store._audit_failures_unpersisted = 7  # close() flushes it to the durable metadata row
+        v = build_substrate_view(AnnealPaths.from_db(db))  # read-only: audit_enabled is False here
+        assert v.health is not None and v.health.audit_backlog == 7
+        assert "7 audit writes failed" in (health_oracle_line(v.health) or "")
+
+    @staticmethod
+    def _wrapped(tmp_path: Path, text: str = "## State\nfoc\n", pair: str = "0123456789ab-aaaa1111"):
+        """A real store with one committed wrap whose content_hash is sha256(text); the continuity file holds text."""
+        import hashlib
+        from anneal_memory import Store
+
+        db, md = tmp_path / "memory.db", tmp_path / "memory.continuity.md"
+        md.write_text(text, encoding="utf-8")
+        with Store(db) as store:
+            e = store.record("episode A", "decision")
+            store.wrap_started(token="w1", episode_ids=[e.id])
+            store.wrap_completed(1, 20, wrap_token="w1", episode_ids=[e.id], pair_id=pair,
+                                 content_hash=hashlib.sha256(text.encode()).hexdigest())
+        return db, md
+
+    def test_another_pairs_stale_sidecar_does_not_excuse_an_edited_file(self, tmp_path: Path) -> None:
+        db, md = self._wrapped(tmp_path)
+        (tmp_path / "memory.continuity.zzzzzzzzzzzz-deadbeef.md.tmp").write_text("old wrap", encoding="utf-8")
+        md.write_text("## State\nedited\n", encoding="utf-8")
+        h = build_substrate_view(AnnealPaths.from_db(db)).health
+        assert h is not None and h.projection_converged is False
+        assert "differs" in (h.projection_note or "")
+
+    def test_the_latest_pairs_sidecar_with_the_matching_hash_is_settling(self, tmp_path: Path) -> None:
+        db, md = self._wrapped(tmp_path)
+        (tmp_path / "memory.continuity.0123456789ab-aaaa1111.md.tmp").write_text("## State\nfoc\n", encoding="utf-8")
+        md.write_text("## State\nthe previous wrap\n", encoding="utf-8")  # the rename has not happened yet
+        h = build_substrate_view(AnnealPaths.from_db(db)).health
+        assert h is not None and h.projection_converged is None and "settling" in (h.projection_note or "")
+
+    def test_an_old_matching_sidecar_reads_incomplete_and_the_note_is_shown(self, tmp_path: Path) -> None:
+        from levain.dashboard import health_oracle_line
+
+        db, md = self._wrapped(tmp_path)
+        side = tmp_path / "memory.continuity.0123456789ab-aaaa1111.md.tmp"
+        side.write_text("## State\nfoc\n", encoding="utf-8")
+        old = time.time() - 3600
+        os.utime(side, (old, old))
+        md.write_text("## State\nthe previous wrap\n", encoding="utf-8")
+        h = build_substrate_view(AnnealPaths.from_db(db)).health
+        assert h is not None and h.projection_converged is False and "externalization incomplete" in (h.projection_note or "")
+        assert "externalization incomplete" in (health_oracle_line(h) or "")
+
+    def test_an_invalid_pair_id_is_no_settling_proof_never_a_fault(self, tmp_path: Path) -> None:
+        from levain.dashboard import health_oracles
+
+        md = tmp_path / "memory.continuity.md"
+        md.write_text("something else\n", encoding="utf-8")
+        for bad in ("../../etc/x", "a\x00b", "0123456789ab-aaaa1111"):
+            o = health_oracles(None, ("2026-01-01T00:00:00Z", "0" * 64, bad), md)
+            assert o["projection_converged"] is False and "differs" in o["projection_note"]
+
+    def test_a_file_deleted_seconds_after_a_wrap_with_no_sidecar_is_missing(self, tmp_path: Path) -> None:
+        db, md = self._wrapped(tmp_path)
+        md.unlink()
+        h = build_substrate_view(AnnealPaths.from_db(db)).health
+        assert h is not None and h.save_age_hours is not None and h.save_age_hours < 0.1  # seconds old, no window
+        assert h.projection_converged is False and h.projection_note == "continuity file missing"
+
+    def test_the_age_rounds_half_up_like_the_web_renderers(self) -> None:
+        from levain.dashboard import Health, health_oracle_line
+
+        h = Health(write_path_live=True, total_links=0, avg_strength=0, max_strength=0, density=0, local_density=0,
+                   links_formed_total=0, links_strengthened_total=0, links_decayed_total=0,
+                   graduations_validated_total=0, graduations_demoted_total=0, total_episodes=0,
+                   episodes_since_wrap=0, episodes_by_type={}, tombstones=0, continuity_chars=None, total_wraps=1,
+                   last_wrap_at=None, wrap_in_progress=False)
+        for age, want in ((2.5, "3h ago"), (3.5, "4h ago"), (0.99, "under 1h ago")):
+            h.save_age_hours = age
+            assert want in (health_oracle_line(h) or "")

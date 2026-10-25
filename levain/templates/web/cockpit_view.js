@@ -322,7 +322,8 @@
                             options: isNum(f.question_options) ? f.question_options : 0,
                             age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
                             decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
-                            offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct") };
+                            offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct"),
+                            sign: signOf(f) };
         }
         // an agent's note: who filed it, when, and whether it was dismissed; its words are fetched with the page's token
         // (dashboard_core.js noteBody). It carries no answer and no authority: `offered` is only the kernel's dismiss
@@ -333,7 +334,8 @@
                         total: isNum(f.note_open_total) ? f.note_open_total : 0,
                         age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
                         decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
-                        offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "note_dismiss" && a.gesture === "direct") };
+                        offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "note_dismiss" && a.gesture === "direct"),
+                        sign: signOf(f) };
         }
         return line;
       });
@@ -419,6 +421,9 @@
   // an action a browser can perform: refused and laptop-only gestures have nothing to post
   const isPostable = (a) => isObj(a) && typeof a.verb === "string" && a.gesture !== "refused" && a.gesture !== "laptop-only";
   const isNum = (x) => typeof x === "number" && Number.isFinite(x);
+  // a question or note row's sign facet (DESIGN_SIGN D5): the id of the sign request its answer is signed through, the
+  // id only (the page reads the request with its token); "" when the row names none
+  const signOf = (f) => (isObj(f.sign) && typeof f.sign.request === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(f.sign.request) ? f.sign.request : "");
   function need(ok, what) { if (!ok) throw new Error("malformed " + what); }
   // a line list (line and visual kinds): absent is empty; each line is an object whose text is a string
   function labelled(x, what) {
@@ -474,26 +479,42 @@
     return out;
   }
 
-  // The figures health reads: each is a finite number, except the write-path flag.
-  const HEALTH_FIGURES = ["links", "avg strength", "max strength", "density", "local density", "episodes",
-    "episodes since wrap", "tombstones", "wraps", "graduated", "demoted"];
+  // The figures health reads: each is a finite number, except the write-path status.
+  const HEALTH_FIGURES = ["episodes", "episodes since wrap", "tombstones", "wraps", "graduated", "demoted"];
+  // the write path's words, and the status each stands for (Health.status). "dark" is the older kernel's word for ZERO LINKS,
+  // never for unreadable: it stands for whatever the wrap count says (live once a wrap committed, else no wraps yet)
+  const WRITE_PATH_STATUS = { "live": "live", "no wraps yet": "no-wraps", "unreadable": "unreadable", "dark": null };
+  const WRITE_PATHS = Object.keys(WRITE_PATH_STATUS);
+  const writePathStatus = (word, wraps) => WRITE_PATH_STATUS[word] || (isNum(wraps) && wraps > 0 ? "live" : "no-wraps");
   function healthOf(metrics, wraps) {
     need(Array.isArray(metrics), "metrics");
     const m = new Map();
     for (const x of metrics) { need(isObj(x) && typeof x.label === "string", "metric"); m.set(x.label, x.value); }
     // every figure is required: the kernel always sends each one, and an absent figure would print as 0
     for (const k of HEALTH_FIGURES) need(m.has(k) && isNum(m.get(k)), "metric " + k);
-    need(m.get("write path") === "live" || m.get("write path") === "dark", "metric write path");
+    need(WRITE_PATHS.indexOf(m.get("write path")) >= 0, "metric write path");
     const n = (k) => m.get(k);
+    // the substrate oracles are optional (the kernel omits one it could not read): carried only when well-formed
+    const age = m.has("last save (hours ago)") && isNum(m.get("last save (hours ago)")) ? m.get("last save (hours ago)") : null;
+    const proj = m.get("projection");
+    const projOk = proj === "converged" ? true : (proj === "diverged" || proj === "file missing" ? false : null);
+    // a present-but-unrecognised value is surfaced, never silently null; "unknown" carries the kernel's note
+    const projKnown = proj === undefined || proj === null || ["converged", "diverged", "file missing", "unknown"].indexOf(proj) >= 0;
+    const projNote0 = m.get("projection note");
+    const projNote = proj === "file missing" ? "continuity file missing"
+      : (!projKnown ? "unknown (unrecognised value)" : (typeof projNote0 === "string" && projNote0 ? projNote0 : null));
+    const audit = m.has("audit write failures") && isNum(m.get("audit write failures")) ? m.get("audit write failures") : null;
     const last = Array.isArray(wraps) && wraps[0] ? wraps[0] : null;
     return {
-      write_path_live: m.get("write path") === "live", total_links: n("links"), avg_strength: n("avg strength"),
-      max_strength: n("max strength"), density: n("density"), local_density: n("local density"),
+      write_path_live: writePathStatus(m.get("write path"), n("wraps")) === "live", status: writePathStatus(m.get("write path"), n("wraps")),
       total_episodes: n("episodes"), episodes_since_wrap: n("episodes since wrap"),
       tombstones: n("tombstones"), total_wraps: n("wraps"),
       graduations_validated_total: n("graduated"), graduations_demoted_total: n("demoted"),
       last_wrap_at: last ? last.wrapped_at : null, continuity_chars: last ? last.continuity_chars : null,
       wrap_history_unavailable: wraps === "unavailable",
+      save_age_hours: age, projection_converged: projOk,
+      projection_note: projNote,
+      audit_backlog: audit,
     };
   }
 
@@ -533,8 +554,13 @@
   function formField(f) {
     const label = typeof f.label === "string" && f.label ? f.label : f.name;
     if (f.type === "recipient") {
+      // `default`, `transient_prefix` and `gone_match` are the provider's own declarations on its recipient field (the ids pressed at the
+      // start, the ids that can leave its roster, the words of its refusal when one has): carried through, given no meaning here
+      const str = (x) => (typeof x === "string" && x ? x : undefined);
       return { name: f.name, label: label, kind: "multiselect", chips: true, required: false,
-               options: Array.isArray(f.enum) ? f.enum.filter((x) => typeof x === "string") : [] };
+               options: Array.isArray(f.enum) ? f.enum.filter((x) => typeof x === "string") : [],
+               default: Array.isArray(f.default) ? f.default.filter((x) => typeof x === "string") : [],
+               transient_prefix: str(f.transient_prefix), gone_match: str(f.gone_match) };
     }
     const long = f.type === "text" && LONG_TEXT.has(f.name);
     return { name: f.name, label: f.type === "date" ? label + " (YYYY-MM-DD)" : label, kind: long ? "textarea" : "text", required: long, placeholder: long ? label : undefined };
@@ -757,7 +783,10 @@
         view.extra_panels[pid].pid = pid;
         // a health widget is drawn as a widget, never as the Health panel, so the page's liveness reads its own write-path metric
         const wp = (view.extra_panels[pid].metrics || []).find((x) => x.label === "write path");
-        if (region && wp && (wp.value === "live" || wp.value === "dark")) view.write_path_live = wp.value === "live";
+        if (region && wp && WRITE_PATHS.indexOf(wp.value) >= 0) {
+          const wn = (view.extra_panels[pid].metrics || []).find((x) => x.label === "wraps");
+          view.write_path_status = writePathStatus(wp.value, wn ? wn.value : null); view.write_path_live = view.write_path_status === "live";
+        }
         // a downstream's own verb on this panel becomes the compose box. The manifest names the verb's
         // fields and not their widgets, so a widget is chosen from the field's name (a known edge).
         // a form panel names its verb: the action is the one offered under that name, and no other
@@ -785,7 +814,7 @@
         if (vh && !NATIVE.has(pid)) {
           // the action names its own panel: the send posts to THIS panel's offer, never another panel's
           view.extra_panels[pid].action = { verb: own.verb, panel: pid, fields: (Array.isArray(vh.fields) ? vh.fields : []).filter((n) => typeof n === "string").map(composeField) };
-          view.action_verbs[own.verb] = { label: vh.label, confirm_required: vh.confirm === true, idempotent: vh.idempotent === true, job: false };
+          view.action_verbs[own.verb] = { label: vh.label, confirm_required: vh.confirm === true, idempotent: vh.idempotent === true, job: false, sign: vh.sign === true };
           // a form panel names its own fields: they win over the widgets guessed from the verb head's names
           const form = view.extra_panels[pid].form;
           if (form && form.verb === own.verb) view.extra_panels[pid].action.fields = form.fields.map(formField);

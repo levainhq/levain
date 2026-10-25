@@ -344,7 +344,7 @@ def _verifier_says_good(monkeypatch) -> None:
     def run(argv, **kw):
         return subprocess.CompletedProcess(argv, 0, b'Good "levain-authority" signature for authority-signer '
                                                     b"with ED25519-SK key " + FAKE_FP.encode() + b"\n", b"")
-    monkeypatch.setattr(auth.subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "run", run)
 
 
 def test_sk_signature_without_user_presence_refused_whatever_the_verifier_says(monkeypatch):
@@ -381,8 +381,8 @@ def test_signers_and_signature_reach_ssh_keygen_through_pipes_never_disk(monkeyp
     monkeypatch.setattr(auth.tempfile, "TemporaryDirectory", poisoned)
     monkeypatch.setattr(auth.tempfile, "mkstemp", poisoned)
     monkeypatch.setattr(auth.tempfile, "NamedTemporaryFile", poisoned)
-    real, argvs = auth.subprocess.run, []
-    monkeypatch.setattr(auth.subprocess, "run", lambda argv, **kw: ("verify" in argv and argvs.append(argv)) or real(argv, **kw))
+    real, argvs = subprocess.run, []
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: ("verify" in argv and argvs.append(argv)) or real(argv, **kw))
     k = keys["laptop"]
     assert auth.verify_link_sig(b"msg", k.sign(b"msg"), public_key=k.public_key, fingerprint=k.fp)
     assert not auth.verify_link_sig(b"other", k.sign(b"msg"), public_key=k.public_key, fingerprint=k.fp)
@@ -1151,7 +1151,7 @@ def test_ssh_keygen_oserror_is_verifier_unavailable_not_a_replay_error(base, mon
             raise PermissionError(13, "Permission denied", argv[0])
         return real(argv, *a, **k)
 
-    monkeypatch.setattr(auth.subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "run", run)
     with pytest.raises(AuthorityError) as exc:
         head(base)
     _unavailable(exc)

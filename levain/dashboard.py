@@ -2,7 +2,7 @@
 
 The v2 spine is *the substrate escapes the session*. Today a Levain partnership
 entity only exists INSIDE a live Claude Code / Codex session — to see your memory,
-your open loops, the health of your Hebbian graph, who the entity is and how it
+your open loops, the health of your memory store, who the entity is and how it
 thinks, you have to be mid-conversation. This module is the first move out:
 assemble the entity's WHOLE substrate — the anneal stores AND the install's
 seed/config surface — into a single ``SubstrateView`` that renders from outside
@@ -41,7 +41,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
+import sqlite3
 import sys
 import tempfile
 import time
@@ -269,9 +272,13 @@ class SubstrateSource:
 @dataclass
 class Health:
     """The "is this substrate alive and well?" panel — the dashboard's reason to
-    exist. ``write_path_live`` is the headline: a Hebbian graph with zero links
-    after real wraps is the silent-0-links death the operator can't see from
-    inside a session."""
+    exist. ``status`` is the headline: ``live`` (the store reads and at least one wrap
+    committed) or ``no-wraps`` (it reads, nothing committed yet; ``unreadable`` is a
+    view with no Health at all, named by its consumers). The age of the last wrap is a
+    fact the renderers display, never a gate. ``write_path_live`` is the DEPRECATED
+    key, ``status == "live"``, kept one release so an older reader does not KeyError.
+    ``total_links`` and the figures beside it describe the historical graph (anneal
+    stopped forming links in 1.0.2); they are never health."""
 
     write_path_live: bool
     total_links: int
@@ -292,6 +299,25 @@ class Health:
     total_wraps: int
     last_wrap_at: str | None
     wrap_in_progress: bool  # a wrap is mid-flight → this snapshot may be inconsistent
+    status: str | None = None  # "live" | "no-wraps"; None derives it from write_path_live (an older caller)
+    # The substrate oracles (anneal-cut train step 2). Facts, never an activity counter: a healthy wrap can
+    # graduate nothing and form nothing. None = could not be read / nothing to compare. Schema compatibility
+    # has no field: anneal refuses to open a newer-schema store, which lands in ``errors["store"]`` (a view with
+    # no Health at all), so a Health that exists is a store that opened.
+    save_age_hours: float | None = None  # age of the last COMMITTED save (last_wrap_at), not of any episode
+    projection_converged: bool | None = None  # sha256 of the continuity file == the last wrap's content_hash; None = unknown
+    # audit_backlog: the durable audit_write_failures count (what the trail LOST; bounded, so 0 means none RECORDED,
+    # never complete). levain opens the store read-only, where anneal never builds the audit trail, so only this
+    # durable counter is readable. None = could not be read.
+    audit_backlog: int | None = None
+    projection_note: str | None = None  # why the projection reads diverged (a missing file vs an edit); None otherwise
+
+    def __post_init__(self) -> None:
+        # one truth, two spellings: a caller that built Health the old way (write_path_live only) gets the status it
+        # implies, and the deprecated key always follows the status, so to_dict() never contradicts itself
+        if self.status is None:
+            self.status = "live" if self.write_path_live else "no-wraps"
+        self.write_path_live = self.status == "live"
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -322,20 +348,202 @@ class GraphEdge:
 
 @dataclass
 class AssociationGraph:
-    """The Hebbian co-citation graph — the visual heart of the dashboard. Nodes
-    are episodes that have at least one association above threshold; edges carry
-    strength + co-citation count + limbic (affective) tagging."""
+    """The historical co-citation graph. Nodes are episodes that have at least one
+    association above threshold; edges carry strength + co-citation count + the
+    affective tag old rows carry. anneal >= 1.0.2 forms no new links:
+    ``formation_off_at_wrap`` is the wrap after which none were (None on a store that
+    still forms them, or on an anneal that cannot say)."""
 
     nodes: list[GraphNode]
     edges: list[GraphEdge]
     truncated: bool = False  # nodes capped for render
+    formation_off_at_wrap: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "nodes": [n.to_dict() for n in self.nodes],
             "edges": [e.to_dict() for e in self.edges],
             "truncated": self.truncated,
+            "formation_off_at_wrap": self.formation_off_at_wrap,
         }
+
+
+def _last_wrap_row(db: Path) -> tuple[str | None, str | None, str | None] | None:
+    """``(wrapped_at, content_hash, pair_id)`` of the last COMMITTED wraps row (anneal >= 1.0.0), read-only, in ONE
+    read, so the save age and the expected hash can never come from two different instants. ``content_hash`` is the
+    sha256 hex of the continuity text that wrap saved; ``pair_id`` names its tmp sidecar. Either may be NULL on a
+    migrated old row. None when there is no wrap, a column is absent, or the db cannot be read: unknown."""
+    try:
+        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute("SELECT wrapped_at, content_hash, pair_id FROM wraps ORDER BY id DESC LIMIT 1").fetchone()
+        finally:
+            con.close()
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    if not row:
+        return None
+    return tuple(v if isinstance(v, str) and v else None for v in row)  # type: ignore[return-value]
+
+
+def _sha256_of(path: Path) -> tuple[str | None, bool]:
+    """``(hex, missing)``: sha256 of the file's bytes (what anneal hashed is the text it wrote). ``(None, True)``
+    when the file is absent; ``(None, False)`` when it exists but cannot be read (unknown, not missing)."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest(), False
+    except FileNotFoundError:
+        return None, True
+    except OSError:
+        return None, False
+
+
+def _sidecar_path(continuity: Path, pair_id: str) -> Path:
+    """anneal v1.0.0 ``Store._continuity_tmp_path``: ``final.with_name(f"{final.stem}.{suffix}.md.tmp")`` with the
+    wrap's ``<token12>-<uuid8>`` pair id as the suffix. Phase 1 writes it, the wraps row commits, Phase 3 renames
+    it over the file, so the row can lead the file by exactly this sidecar. Built, never globbed: another wrap's
+    leftover sidecar is not this wrap's."""
+    return continuity.with_name(f"{continuity.stem}.{pair_id}.md.tmp")
+
+
+# anneal v1.0.0 ``store.py`` ``_NEW_FORMAT_PAIR_ID_RE``: the only pair-id shape a wrap writes into a sidecar name.
+_PAIR_ID_RE = re.compile(r"[0-9a-f]{12}-[0-9a-f]{8}")
+_SETTLING_NOTE = "settling (wrap externalizing)"
+_INCOMPLETE_NOTE = ("externalization incomplete: the last wrap's file was never moved into place "
+                    "(anneal recovers it when the store is next opened for writing)")
+_SETTLE_SECONDS = 600.0  # a sidecar older than this is not an externalization in flight
+
+
+def _proven_sidecar_age(continuity: Path, pair_id: str, want: str, ref: datetime) -> float | None:
+    """Seconds since the exact sidecar for ``pair_id`` was last written, when it exists AND hashes to ``want``;
+    None when there is no such proof. An invalid pair_id (not anneal's shape) or an unreadable sidecar is "no
+    settling proof", never a fault."""
+    try:
+        if not _PAIR_ID_RE.fullmatch(pair_id):
+            return None
+        side = _sidecar_path(continuity, pair_id)
+        got, _ = _sha256_of(side)
+        if got is None or got != want:
+            return None
+        return max(0.0, ref.timestamp() - side.stat().st_mtime)
+    except (ValueError, OSError):
+        return None
+
+
+def health_oracles(
+    status: Any, row: tuple[str | None, str | None, str | None] | None, continuity: Path | None, *,
+    now: datetime | None = None,
+    reread: Callable[[], tuple[str | None, str | None, str | None] | None] | None = None,
+) -> dict[str, Any]:
+    """The substrate oracles from facts the store already states (works on anneal 1.0.0; nothing here needs
+    1.0.2). ``row`` is the latest wraps row, ``(wrapped_at, content_hash, pair_id)`` from ONE read: recency (the
+    last COMMITTED save) and the expected hash both come from it (status() supplies the audit counter, and the age
+    only when the row could not be read). Convergence is the sha256 of the continuity file against that
+    content_hash. A mismatch is "settling" (None) only when PROVEN: the exact sidecar for that row's pair_id exists
+    and hashes to the row's content_hash. Otherwise a missing file is False ("continuity file missing"), a
+    mismatch is False ("differs ... edited since?"), and anything unreadable or NULL where it is needed (hash,
+    pair_id) is None. The audit backlog is the durable audit_write_failures count, the one audit fact a read-only
+    open can see; 0 means none recorded, not that the trail is complete. Each is None when it cannot be told."""
+    ref = now if now is not None else datetime.now(timezone.utc)
+    if ref.tzinfo is None:  # a naive now compares in UTC, as build_substrate_view does
+        ref = ref.replace(tzinfo=timezone.utc)
+    converged: bool | None = None
+    note: str | None = None
+    # Race: the row and the file are two reads. Hash the file, then re-read the latest row; if a wrap committed in
+    # between, redo once with the new row; a second change reads unknown, never a false DIVERGED.
+    for attempt in (0, 1):
+        wrapped_at, want, pair_id = row if row else (None, None, None)
+        converged, note = None, None
+        if row and want and continuity is not None:
+            have, missing = _sha256_of(continuity)
+            if reread is not None:
+                row2 = reread()
+                if row2 != row:
+                    row = row2
+                    if attempt == 1:
+                        converged, note = None, "unknown (a wrap is committing)"
+                        break
+                    continue
+            if have is not None and have == want:
+                converged = True
+            elif have is None and not missing:
+                converged = None  # unreadable: unknown
+            elif not pair_id:
+                converged = None  # cannot prove settling without the pair id: unknown, never a guess
+            else:
+                side_age = _proven_sidecar_age(continuity, pair_id, want, ref)
+                if side_age is not None:
+                    if side_age > _SETTLE_SECONDS:
+                        converged, note = False, _INCOMPLETE_NOTE
+                    else:
+                        converged, note = None, _SETTLING_NOTE
+                elif missing:
+                    converged, note = False, "continuity file missing"
+                else:
+                    converged, note = False, "continuity file differs from the last wrap (edited since?)"
+        break
+    wrapped_at = row[0] if row else None
+    age: float | None = None
+    raw = wrapped_at or getattr(status, "last_wrap_at", None)
+    if raw:
+        try:
+            when = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            age = max(0.0, (ref - when).total_seconds() / 3600.0)
+        except ValueError:
+            age = None
+    failures = getattr(status, "audit_write_failures", None)
+    return {
+        "save_age_hours": age,
+        "projection_converged": converged,
+        "projection_note": note,
+        "audit_backlog": int(failures) if isinstance(failures, int) and not isinstance(failures, bool) else None,
+    }
+
+
+def health_oracle_line(h: "Health") -> str | None:
+    """The one text line the renderers print for the oracles; None when none could be read."""
+    bits: list[str] = []
+    if h.save_age_hours is not None:
+        bits.append("last save " + (f"{math.floor(h.save_age_hours + 0.5)}h ago" if h.save_age_hours >= 1 else "under 1h ago"))
+    if h.projection_converged is not None:
+        bits.append("projection converged" if h.projection_converged
+                    else "PROJECTION DIVERGED (" + (h.projection_note or "continuity file differs from the last wrap (edited since?)") + ")")
+    elif h.projection_note:
+        bits.append("projection " + h.projection_note)
+    if h.audit_backlog is not None:
+        bits.append("no audit write failures recorded" if not h.audit_backlog
+                    else f"AUDIT: {h.audit_backlog} audit writes failed")
+    return " · ".join(bits) if bits else None
+
+
+def graph_caption(g: "AssociationGraph") -> str:
+    """The one line the text renderers print for the graph: its size, or ``not formed``
+    for an empty one (a fresh store never grows a graph), then the formation note."""
+    if not g.nodes and not g.edges:
+        line = "not formed"
+    else:
+        line = f"{len(g.nodes)} nodes, {len(g.edges)} edges" + (" (capped for display)" if g.truncated else "")
+    if g.formation_off_at_wrap is not None:
+        line += f" · no new links since wrap {g.formation_off_at_wrap}"
+    return line
+
+
+def _formation_off_at_wrap(store: Any) -> int | None:
+    """``Store.association_formation()['off_at_wrap']`` when the installed anneal has the
+    accessor and says formation is off; None otherwise (anneal 1.0.1 has no accessor, so
+    nothing is claimed). Never raises: a missing accessor, an odd shape or a failing read all mean no caption."""
+    fn = getattr(store, "association_formation", None)
+    if not callable(fn):
+        return None
+    try:
+        got = fn()
+    except Exception:  # noqa: BLE001 — the caption is cosmetic; a failing accessor must not cost the graph it captions
+        return None
+    if not isinstance(got, dict) or got.get("mode") != "disabled":
+        return None
+    off = got.get("off_at_wrap")
+    return off if isinstance(off, int) and not isinstance(off, bool) else None
 
 
 @dataclass
@@ -1380,7 +1588,7 @@ _ASSOC_ID_CHUNK = 400
 def _build_graph(
     store: Any, *, min_strength: float, max_nodes: int, max_edges: int = 2000
 ) -> AssociationGraph:
-    """Assemble the Hebbian association graph from a (read-only) store.
+    """Assemble the historical association graph from a (read-only) store.
 
     Chunks the corpus id fan-in (a whole-corpus single query overflows SQLite's
     bound-variable cap), BOUNDS materialization at ``max_edges`` (a dense store
@@ -1459,7 +1667,10 @@ def _build_graph(
         for p in pairs
         if p.episode_a in connected and p.episode_b in connected
     ]
-    return AssociationGraph(nodes=nodes, edges=edges, truncated=truncated)
+    return AssociationGraph(
+        nodes=nodes, edges=edges, truncated=truncated,
+        formation_off_at_wrap=_formation_off_at_wrap(store),
+    )
 
 
 def _episode_tags(ep: Any) -> list[str]:
@@ -1694,7 +1905,8 @@ def build_substrate_view(
                 except (OSError, ValueError):
                     cont_chars = None  # ValueError covers UnicodeDecodeError
                 view.health = Health(
-                    write_path_live=bool(a and a.total_links > 0),
+                    write_path_live=status.total_wraps > 0,
+                    status="live" if status.total_wraps > 0 else "no-wraps",
                     total_links=a.total_links if a else 0,
                     avg_strength=a.avg_strength if a else 0.0,
                     max_strength=a.max_strength if a else 0.0,
@@ -1713,6 +1925,13 @@ def build_substrate_view(
                     total_wraps=status.total_wraps,
                     last_wrap_at=status.last_wrap_at,
                     wrap_in_progress=status.wrap_in_progress,
+                    **health_oracles(
+                        status,
+                        _last_wrap_row(paths.episodic_db),
+                        paths.continuity_md,
+                        now=_now,
+                        reread=lambda: _last_wrap_row(paths.episodic_db),
+                    ),
                 )
             except data_faults as exc:
                 view.errors["health"] = f"{type(exc).__name__}: {exc}"
@@ -1909,16 +2128,14 @@ def render_text(view: SubstrateView) -> str:
     h = view.health
     if h is not None:
         out.append("Health")
+        last_wrap = h.last_wrap_at.split("T")[0] if h.last_wrap_at else None
         if h.write_path_live:
-            out.append(
-                f"  Write-path:   LIVE — {h.total_links} links "
-                f"(avg {h.avg_strength:.2f}, max {h.max_strength:.2f})"
-            )
+            out.append(f"  Write-path:   LIVE — last wrap {last_wrap or 'recorded'}")
         else:
-            out.append(
-                "  Write-path:   DARK — no associations (a graduated wrap should "
-                "form links; 0 = the silent-0-links death)"
-            )
+            out.append("  Write-path:   no wraps yet")
+        oracle = health_oracle_line(h)
+        if oracle:
+            out.append(f"  Substrate:    {oracle}")
         out.append(
             f"  Graduations:  {h.graduations_validated_total} validated / "
             f"{h.graduations_demoted_total} demoted"
@@ -1943,8 +2160,7 @@ def render_text(view: SubstrateView) -> str:
 
     if view.graph is not None:
         g = view.graph
-        suffix = " (capped for display)" if g.truncated else ""
-        out.append(f"Association graph: {len(g.nodes)} nodes, {len(g.edges)} edges{suffix}")
+        out.append(f"Association graph: {graph_caption(g)}")
         out.append("")
 
     if view.crystal_index:
@@ -2000,7 +2216,8 @@ def render_text(view: SubstrateView) -> str:
             stamp = w.wrapped_at.split("T")[0] if w.wrapped_at else ""
             out.append(
                 f"  - {stamp}: {w.graduations_validated}↑/{w.graduations_demoted}↓ grad · "
-                f"+{w.associations_formed} links · {w.continuity_chars:,} chars"
+                + (f"+{w.associations_formed} links · " if w.associations_formed else "")
+                + f"{w.continuity_chars:,} chars"
             )
         out.append("")
 
@@ -2036,15 +2253,12 @@ def render_summary(view: SubstrateView) -> str:
     h = view.health
     if h is not None:
         if h.write_path_live:
-            lines.append(
-                f"Health: write-path LIVE — {h.total_links} Hebbian links "
-                f"(avg {h.avg_strength:.2f})"
-            )
+            lines.append("Health: write-path LIVE")
         else:
-            lines.append(
-                "Health: write-path DARK — 0 associations "
-                "(a graduated wrap should form links; 0 = the silent-0-links death)"
-            )
+            lines.append("Health: no wraps yet")
+        oracle = health_oracle_line(h)
+        if oracle:
+            lines.append(f"  {oracle}")
         last = h.last_wrap_at.split("T")[0] if h.last_wrap_at else "never"
         lines.append(
             f"  {h.total_episodes:,} episodes ({h.episodes_since_wrap} since wrap) · "

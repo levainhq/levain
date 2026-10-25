@@ -15,6 +15,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, Decimal
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
 
 from levain.broker import norm, policy
@@ -86,6 +87,19 @@ def guarded(fn: Callable[..., T], *args: Any, **kw: Any) -> T:
 def refuse_upgrade() -> None:
     """A websocket upgrade on a metered route (R4 §1.6): one exchange carries many responses, no one usage settles it."""
     raise norm.Refused("body-unbounded:websocket", "websocket upgrade on a metered route")
+
+
+#: re-exported for keys: a route is an OpenRouter route by its pinned upstream host (R4 §1.5).
+OPENROUTER_HOST = policy.OPENROUTER_HOST
+
+
+def write_body_policy(obj: Dict[str, Any], body_policy: Mapping[str, object]) -> None:
+    """Head ruling H2, on a dispatch route to OpenRouter: the request's `provider` object is the one the route's
+    `body_policy` maps to (`policy.provider_object`), REPLACING whatever `provider` the client sent: a client's object
+    is never merged, since a merge would let it widen routing. An empty `body_policy` leaves no `provider` key."""
+    obj.pop("provider", None)
+    if body_policy:
+        obj["provider"] = policy.provider_object(body_policy)
 
 
 def serialize(obj: Mapping[str, Any]) -> bytes:
@@ -285,6 +299,11 @@ class Codec:
         """One parsed SSE event; the usage it reports, if any, kept in `st`."""
         raise NotImplementedError
 
+    def _meta_event(self, obj: Mapping[str, Any], md: Dict[str, Any]) -> None:
+        """One parsed SSE event; the metadata it states, if any, kept in `md` (H6-6). An OpenAI-shaped chunk states
+        it at its top level (`model`; OpenRouter's `provider` and final `usage.cost`), as a non-stream body does."""
+        _note_metadata(md, obj)
+
     def _usage_stream(self, st: Mapping[str, Any], names: Mapping[str, str]) -> Optional[Usage]:
         """The usage of a whole stream from what `_usage_event` kept; None when it reported none. `names` as
         `call_names` answered."""
@@ -400,6 +419,60 @@ def price_usage(u: Usage, price: Price) -> int:
     return total
 
 
+#: what a response's metadata string must be to be recorded (S1 3c-6c, H6-6): printable ASCII, 1..128 characters,
+#: the grammar CONTROL's sink checks `model_answered` / `provider_answered` against. Anything else the response says is
+#: recorded as not said (`"unknown"`), never cut or escaped into something it did not say (DECISION).
+_ANSWERED = re.compile(r"[\x20-\x7e]{1,128}\Z")
+#: the largest reported cost recorded, in microdollars (the wire's JSON_INT_MAX, 2**53 - 1)
+_COST_MAX = (1 << 53) - 1
+
+
+@dataclass(frozen=True)
+class Metadata:
+    """What a response says about itself (S1 3c-6c, head ruling H6-6: ONE reader, here; 3c-9's settle check reuses it):
+    its top-level `model`, the provider that served it (`provider`, OpenRouter's), and the cost it reports
+    (`usage.cost`, OpenRouter's usage accounting, in USD credits) as integer microdollars. None = the response did
+    not say (the lineage row records `"unknown"` for the two strings and `null` for the cost, H6-21)."""
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    cost_reported: Optional[int] = None
+
+
+def _answered(v: Any) -> Optional[str]:
+    return v if isinstance(v, str) and _ANSWERED.match(v) else None
+
+
+def _reported_cost(v: Any) -> Optional[int]:
+    """A reported cost in USD as integer microdollars, rounded UP (the estimate's rounding; DECISION); None for
+    anything that is not a finite non-negative number (a bool included)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    if v < 0:
+        return None
+    # the decimal the JSON wrote (repr of the parsed float is its shortest round-trip spelling), never binary noise
+    micro = (Decimal(repr(v)) * 1_000_000).to_integral_value(rounding=ROUND_CEILING)
+    return int(micro) if micro <= _COST_MAX else None
+
+
+def _note_metadata(md: Dict[str, Any], obj: Any) -> None:
+    """The metadata one response object (a body, an SSE chunk, a stream's message or response object) states, kept
+    in `md` over what earlier objects stated (a later chunk names the same model; the final one carries the cost)."""
+    if not isinstance(obj, dict):
+        return
+    m, p = _answered(obj.get("model")), _answered(obj.get("provider"))
+    if m is not None:
+        md["model"] = m
+    if p is not None:
+        md["provider"] = p
+    u = obj.get("usage")
+    if isinstance(u, dict):
+        c = _reported_cost(u.get("cost"))
+        if c is not None:
+            md["cost"] = c
+
+
 class _NoUsage(Exception):
     """A usage object that is not the shape its codec documents: the exchange has no usage."""
 
@@ -433,8 +506,13 @@ class UsageReader:
     """One response's side reader. `feed` takes each body read the relay passes (b"" never; the relay's end is
     `result`), keeps at most one SSE event (`USAGE_EVENT_MAX`) or a copy of a non-stream body (`USAGE_COPY_MAX`),
     and never raises: past a cap, or on any error, it stops reading and `result` is None. It buffers only on the
-    side; the relayed bytes are the relay's own."""
-    __slots__ = ("_codec", "_stream", "_names", "_buf", "_data", "_held", "_st", "stopped")
+    side; the relayed bytes are the relay's own.
+
+    It is also the ONE response-metadata reader (S1 3c-6c, H6-6): `metadata()` is what the response said about itself
+    (`Metadata`), read from the same events and the same copied body. What it read before a cap stopped it is kept (a
+    stream's `model` from its first event stays true), so `metadata()` may be called whether or not the relay
+    completed."""
+    __slots__ = ("_codec", "_stream", "_names", "_buf", "_data", "_held", "_st", "stopped", "_md", "_body_read")
 
     def __init__(self, c: "Codec", stream: bool, names: Mapping[str, str]) -> None:
         self._codec = c
@@ -445,6 +523,8 @@ class UsageReader:
         self._held = 0                   # SSE: the bytes of those lines
         self._st: Dict[str, Any] = {}    # SSE: what the codec kept from the events so far
         self.stopped: Optional[str] = None
+        self._md: Dict[str, Any] = {}    # the metadata read so far (never cleared by a stop)
+        self._body_read = False          # non-stream: the copied body has been parsed for its metadata
 
     def feed(self, part: bytes) -> None:
         if self.stopped is not None:
@@ -509,7 +589,26 @@ class UsageReader:
         except (ValueError, RecursionError):
             return   # not a JSON event (openai-chat's `[DONE]`): it reports no usage
         if isinstance(obj, dict):
+            self._codec._meta_event(obj, self._md)
             self._codec._usage_event(obj, self._st)
+
+    def _read_body_metadata(self, obj: Any) -> None:
+        if not self._body_read:
+            self._body_read = True
+            _note_metadata(self._md, obj)
+
+    def metadata(self) -> Metadata:
+        """What the response said about itself so far (H6-6). A non-stream body is read once, whole, when this or
+        `result` first runs after the relay; a body past the copy cap, or one cut short, said nothing readable.
+        Known edge (r1 review): called on a non-stream body still being fed, the partial body does not parse and is
+        marked read, so the whole body's metadata is never read after it; every caller calls it after the relay."""
+        if not self._stream and not self._body_read and self.stopped is None and self._buf:
+            try:
+                self._read_body_metadata(json.loads(bytes(self._buf)))
+            except (ValueError, RecursionError):
+                self._body_read = True
+        md = self._md
+        return Metadata(md.get("model"), md.get("provider"), md.get("cost"))
 
     def result(self) -> Optional[Usage]:
         """The reported usage once the relay has ended, or None (no usage: cut, past a cap, none reported). An event
@@ -520,8 +619,10 @@ class UsageReader:
             if self._stream:
                 return _or_none(lambda: self._codec._usage_stream(self._st, self._names))
             obj = json.loads(bytes(self._buf))
+            self._read_body_metadata(obj)
             return _or_none(lambda: self._codec._usage_body(obj, self._names)) if isinstance(obj, dict) else None
         except (ValueError, RecursionError):
+            self._body_read = True
             return None
         finally:
             self._buf = bytearray()
@@ -558,6 +659,12 @@ class AnthropicMessages(Codec):
             st["start"] = obj["message"].get("usage")
         elif t == "message_delta":
             st["delta"] = obj.get("usage")
+
+    # Metadata: a stream names its model in `message_start.message` (a non-stream body at its top level); the Messages
+    # API names no provider and reports no cost, so those stay unknown.
+    def _meta_event(self, obj: Mapping[str, Any], md: Dict[str, Any]) -> None:
+        if obj.get("type") == "message_start":
+            _note_metadata(md, obj.get("message"))
 
     def _usage_stream(self, st: Mapping[str, Any], names: Mapping[str, str]) -> Optional[Usage]:
         start, delta = st.get("start"), st.get("delta")
@@ -704,6 +811,11 @@ class OpenAIResponses(_OpenAI):
             if named:
                 out[item_type] = max(named, key=lambda t: price.per_use.get(t, 0))
         return out
+
+    # Metadata: a stream's events carry the Response object as `response` (its `model`; OpenRouter's `provider` and
+    # its final `usage.cost`); a non-stream body IS that object.
+    def _meta_event(self, obj: Mapping[str, Any], md: Dict[str, Any]) -> None:
+        _note_metadata(md, obj.get("response"))
 
     def _usage_event(self, obj: Mapping[str, Any], st: Dict[str, Any]) -> None:
         calls = st.setdefault("calls", {})

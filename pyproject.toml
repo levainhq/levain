@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "levain"
-version = "0.11.21.dev0"
+version = "0.11.24.dev0"
 description = "A consent queue and memory harness for Claude Code and Codex: permission prompts answered by signed standing grants or signed human answers, with an audit trail, plus memory that persists across sessions."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -134,7 +134,10 @@ dependencies = [
     # `_init_store` claims it and the MCP launcher passes `serve --session-id` (levain.manifest.ANNEAL_SESSION_ID),
     # and `levain wrap` passes the same id. A launcher passing `--session-id` stops the server on 0.9.43 (no such
     # flag), so the pin and the launcher shape land in one commit. KNOWN_GOOD_ANNEAL moves with this floor.
-    "anneal-memory>=1.0.0,<2",
+    # `>=1.0.2,<2` (2026-10-24): anneal 1.0.2 forms no association links and ignores the affect input
+    # (AM-FORMATION-OFF); the seed no longer says `prepare_wrap` returns association context, and the cap
+    # TEMPLATES_RECONCILED_ANNEAL moves to 1.0.2 with it. KNOWN_GOOD_ANNEAL moves with this floor.
+    "anneal-memory>=1.0.2,<2",
     # The reply classifier (levain.firing.agent_reply.unreadable_tool_call) reads Markdown code regions with a
     # CommonMark parser rather than a hand-written one: four review rounds on a hand reader each found its next edge
     # (Phill 2026-10-05, "Let's do A"). Floor 4.0: 3.0.0 took 23 s on a reply of 5,000 reference definitions,
@@ -179,7 +182,7 @@ where = ["."]
 include = ["levain*"]
 
 [tool.setuptools.package-data]
-levain = ["templates/**/*", "webpush/static/*"]
+levain = ["templates/**/*", "webpush/static/*", "chat_egress/denied_table.json"]
 
 # Never ship compiled bytecode in the wheel: the `templates/**/*` glob above would
 # otherwise pull in any `__pycache__/*.pyc` left in the working tree (cross-version

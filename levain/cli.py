@@ -514,6 +514,27 @@ def main(argv: list[str] | None = None) -> int:
     ck_keys = ck_sub.add_parser("keys", help="List enrolled keys.")
     _ck_common(ck_keys)
     ck_keys.set_defaults(func=_cmd_cockpit_keys)
+    ck_pair = ck_sub.add_parser(
+        "pair",
+        help="Mint a one-time pairing link for a new device, from this box (or end every paired device).",
+        description=(
+            "Box-side pairing (the recovery path when no paired device or surface token is at hand): mints a "
+            "one-time code straight into the cockpit journal, minted by 'box', valid for 10 minutes, and prints the "
+            "pair link here, never to a log. Open it on the new device. --revoke-all ends every paired device "
+            "instead (each one's waiting pendings are cancelled)."),
+    )
+    _ck_common(ck_pair)
+    ck_pair.add_argument("--label", default=None,
+                         help="The new device's name in the devices panel (default: 'paired device').")
+    ck_pair.add_argument("--url", default=None,
+                         help="The cockpit's address as the device opens it (e.g. https://box.tailnet.ts.net:8443); "
+                              "without it the link is printed as a path to append to that address.")
+    ck_pair.add_argument("--revoke-all", action="store_true", dest="revoke_all",
+                         help="Revoke every paired device instead of minting a code.")
+    ck_pair.add_argument("--print", action="store_true", dest="print_link",
+                         help="Print the pair link even when stdout is not a terminal (a pipe, a file, a log): "
+                              "without it the link is refused there, since anyone who reads it can pair.")
+    ck_pair.set_defaults(func=_cmd_cockpit_pair)
     ck_pending = ck_sub.add_parser("pending", help="List the cockpit's waiting pendings (read-only, no server).")
     _ck_common(ck_pending)
     ck_pending.set_defaults(func=_cmd_cockpit_pending)
@@ -606,6 +627,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_consent_away_parser(cs_sub)
     _add_consent_rule_parser(cs_sub)
     _add_consent_receipts_parser(cs_sub)
+    _add_chat_parser(subparsers, _ck_common)
     _add_push_parser(subparsers)
     _add_publish_parser(subparsers)
     _add_limits_parser(subparsers)
@@ -849,16 +871,16 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         dest="affect_tag",
         help=(
-            "Optional emergent affective state during this consolidation (free-text, e.g. "
-            "'engaged') — tags the Hebbian associations formed this wrap. Omit for no modulation."
+            "DEPRECATED and ignored: anneal no longer tags associations with an affective state. "
+            "Still accepted so existing scripts keep working; it prints one line and does nothing."
         ),
     )
     wrap_p.add_argument(
         "--affect-intensity",
         type=float,
-        default=0.5,
+        default=None,  # None = not passed, so the deprecation line can tell an explicit 0.5 from the default
         dest="affect_intensity",
-        help="How strongly the --affect-tag state was felt, 0.0-1.0 (default 0.5). Ignored without --affect-tag.",
+        help="DEPRECATED and ignored, like --affect-tag.",
     )
     wrap_p.add_argument(
         "--max-seconds",
@@ -2142,7 +2164,11 @@ def _resolve_unattended_consolidate_bound(
 
 
 def _cmd_wrap(args: argparse.Namespace) -> int:
-    from levain.wrap import wrap_entity
+    from levain.wrap import AFFECT_DEPRECATED, wrap_entity
+
+    # once, here, whenever either deprecated flag was given: before the key check, any early return and any compose
+    if (args.affect_tag is not None and str(args.affect_tag).strip()) or args.affect_intensity is not None:
+        print(AFFECT_DEPRECATED, flush=True)
 
     if not _resolve_api_key(args):
         return 2
@@ -2159,7 +2185,7 @@ def _cmd_wrap(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         reset=args.reset,
         affect_tag=args.affect_tag,
-        affect_intensity=args.affect_intensity,
+        affect_intensity=0.5 if args.affect_intensity is None else args.affect_intensity,
         # 0 means "explicitly unbounded" — normalized at the boundary so exactly ONE representation
         # of "no bound" reaches the deadline, matching `run`'s handling of the same flag. And an
         # unattended wrap with no bound named gets the finite default rather than running unbounded
@@ -3021,6 +3047,157 @@ def _cmd_consent_deliver(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _add_chat_parser(subparsers: argparse._SubParsersAction, common: object) -> None:
+    """``levain chat key setup|revoke|list``: the chat launch's held keys (CH-D2, design §3.8.5(o) item 4)."""
+    chat = subparsers.add_parser("chat", help="The chat launch's network: the keys Levain holds for it.")
+    chat_sub = chat.add_subparsers(dest="chat_cmd", required=True)
+    key = chat_sub.add_parser(
+        "key", help="Name, replace, revoke and list the hosts whose requests carry a key Levain holds.",
+        description="A setup record names, for one entity's chat launches, ONE host whose https requests on port "
+                    "443 carry a credential Levain holds, and the keychain item it is read from at attach time: the "
+                    "value never enters the sandbox, an argv, an env, a record or a log, and this command never asks "
+                    "for it. On a git fetch the key rides only a declared repo: each --repo plus, with --workspace, "
+                    "that repo's https remotes on that host, read once at setup, shown to you with any remote on the "
+                    "host it left out, and signed into the record only when you confirm (a chat launch never reads "
+                    "the workspace's git config; adding a repo is a new setup with --replace). One live record per "
+                    "entity and host; a new record or a replacement takes effect at the next chat launch, a revoke "
+                    "from the next request.")
+    key_sub = key.add_subparsers(dest="chat_key_cmd", required=True)
+    setup = key_sub.add_parser("setup", help="Sign a setup record (a laptop-presence key).")
+    setup.add_argument("--entity", required=True, help="The entity whose chat launches the record serves.")
+    setup.add_argument("--host", required=True, help="One DNS name (no wildcard, no IP literal, no port).")
+    setup.add_argument("--source", required=True,
+                       help="The keychain item's service (a generic password's `service` attribute).")
+    setup.add_argument("--account", required=True,
+                       help="The keychain item's account attribute: with --source it names exactly one item "
+                            "(setup refuses when none or more than one matches).")
+    setup.add_argument("--basic-user", dest="basic_user", default=None,
+                       help="Place the value as HTTP Basic with this user (default: Authorization: Bearer).")
+    setup.add_argument("--repo", dest="repos", action="append", default=[], metavar="PATH",
+                       help="A repo path on that host to declare beside the workspace's remotes, as git spells it "
+                            "(/owner/repo.git); repeatable.")
+    setup.add_argument("--workspace", type=Path, default=None,
+                       help="The workspace repo whose https remotes on that host are read once, shown, and signed "
+                            "into the record as declared repos on your confirm. No default: without it only the "
+                            "--repo paths are declared and no remote is read.")
+    setup.add_argument("--yes", action="store_true",
+                       help="Sign the record shown without asking (required when stdin is not a terminal).")
+    setup.add_argument("--replace", action="store_true",
+                       help="Supersede the live record for this entity and host, in the same signed link.")
+    setup.add_argument("--expires", required=True, help="A duration (12h, 7d; at most 30d) or a UTC time.")
+    setup.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                       help="An enrolled laptop-presence key that signs the record.")
+    common(setup)
+    setup.set_defaults(func=_cmd_chat_key_setup)
+    revoke = key_sub.add_parser("revoke", help="Revoke a setup record (any enrolled key).")
+    revoke.add_argument("record_id", help="The record's id, as `levain chat key list` shows it.")
+    revoke.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                        help="An enrolled key that signs the revoke.")
+    common(revoke)
+    revoke.set_defaults(func=_cmd_chat_key_revoke)
+    lst = key_sub.add_parser("list", help="List the setup records the authority log holds.")
+    common(lst)
+    lst.set_defaults(func=_cmd_chat_key_list)
+
+
+def _confirm_setup(preview: object, yes: bool) -> bool:
+    """Show the setup record exactly as it will be signed (K-8 ceremony, F6), then ask: y/N on a terminal; with no
+    terminal only ``--yes`` signs. Every value is shown on one line with its unshowable characters marked, newline
+    and tab included: a workspace remote is sandbox-writable text and must not draw a line of its own."""
+    from levain.cockpit.display_safe import visible as _shown
+
+    def visible(text: object) -> object:
+        out = _shown(text)
+        return out.replace("\n", "⟨U+000A⟩").replace("\t", "⟨U+0009⟩") if isinstance(out, str) else out
+
+    rec = preview.record  # type: ignore[attr-defined]
+    how = "bearer" if rec["placement"]["scheme"] == "bearer" else f"basic as {visible(rec['placement']['user'])}"
+    from_ws = set(preview.from_workspace)  # type: ignore[attr-defined]
+    print(f"setup record {rec['id']} for entity {visible(rec['entity'])} on https://{visible(rec['host'])}:443")
+    print(f"  keychain item: service {visible(rec['source'])!r}, account {visible(rec['account'])!r} ({how})")
+    print(f"  until {rec['expires_at']}")
+    if preview.replaces:  # type: ignore[attr-defined]
+        print(f"  replaces: {', '.join(visible(x) for x in preview.replaces)}")  # type: ignore[attr-defined]
+    print("  declared repos (a git fetch carries the key only to these):")
+    for r in rec["repos"]:
+        print(f"    {visible(r)}  ({'workspace remote' if r in from_ws else '--repo'})")
+    if not rec["repos"]:
+        print("    (none: a git fetch carries no key)")
+    if preview.workspace is None:  # type: ignore[attr-defined]
+        print("  no --workspace: only the --repo paths above are declared; no workspace remote was read")
+    else:
+        print(f"  workspace {visible(str(preview.workspace))}: remotes read once, now")  # type: ignore[attr-defined]
+        for ex in preview.excluded:  # type: ignore[attr-defined]
+            print(f"    left out: {visible(ex.url)} ({visible(ex.why)})")
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        print("not a terminal: pass --yes to sign the record shown", file=sys.stderr)
+        return False
+    try:
+        answer = input("sign this setup record? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def _cmd_chat_key_setup(args: argparse.Namespace) -> int:
+    from levain.chat_egress.key_setup import _REFUSALS, setup_key
+    from levain.cockpit.keys import ssh_signer
+
+    placement = {"scheme": "bearer"} if args.basic_user is None else {"scheme": "basic", "user": args.basic_user}
+    try:
+        expires = _grant_expiry(args.expires)
+        signer_fp, sign = ssh_signer(args.signing_key)
+        rec, warning = setup_key(_cockpit_root(args), entity=args.entity, host=args.host, source=args.source,
+                                 account=args.account, placement=placement, repos=args.repos, expires=expires,
+                                 signer_fp=signer_fp, sign=sign, clock=_utc_now, replace=args.replace,
+                                 workspace=args.workspace, confirm=lambda p: _confirm_setup(p, args.yes))
+    except (ValueError, *_REFUSALS, *_cockpit_refusals()) as exc:
+        print(f"setup refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"set up: {rec['id']}, signed as shown; it takes effect at the next chat launch")
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _cmd_chat_key_revoke(args: argparse.Namespace) -> int:
+    from levain.chat_egress.key_setup import _REFUSALS, revoke_key
+    from levain.cockpit.keys import ssh_signer
+
+    try:
+        signer_fp, sign = ssh_signer(args.signing_key)
+        seq, warning = revoke_key(_cockpit_root(args), args.record_id, signer_fp=signer_fp, sign=sign,
+                                  clock=_utc_now)
+    except (*_REFUSALS, *_cockpit_refusals()) as exc:
+        print(f"revoke refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"revoked: {args.record_id} at seq {seq}; a running chat launch stops attaching its key from its next request")
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _cmd_chat_key_list(args: argparse.Namespace) -> int:
+    from levain.chat_egress.key_setup import _REFUSALS, list_keys
+    from levain.cockpit.display_safe import visible
+
+    try:
+        rows = list_keys(_cockpit_root(args), now=_utc_now())
+    except (*_REFUSALS, *_cockpit_refusals()) as exc:
+        print(f"list refused: {exc}", file=sys.stderr)
+        return 1
+    if not rows:
+        print("no setup records")
+    for r in rows:
+        print(f"{visible(r['id'])}  {r['state']}  entity {visible(r['entity'])}  host {visible(r['host'])}  "
+              f"source {visible(r['source'])}  account {visible(str(r.get('account', '-')))}  "
+              f"{r['placement']['scheme']}  repos "
+              f"{', '.join(visible(x) for x in r['repos']) or '-'}  until {visible(r['expires_at'])}")
+    return 0
+
+
 def _grant_expiry(text: str) -> object:
     """``--expires``: a duration (``30m``, ``12h``, ``7d``) as a timedelta, or a UTC time as an aware datetime."""
     import re
@@ -3182,6 +3359,38 @@ def _sign_refusals() -> tuple[type[BaseException], ...]:
     from levain.cockpit.sign_client import SignRefused
 
     return (SignRefused, JournalCorruptError, ConsentError, *_cockpit_refusals())
+
+
+def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
+    """``levain cockpit pair [--revoke-all]`` (PAIR RP-7, RP-8, RS-5): straight to the journal, as the box's own
+    user (its file permissions are the authority), minted by ``box``."""
+    from levain.cockpit.firejournal import CockpitDB, PairingError
+
+    try:
+        root = _cockpit_root(args)
+        if not (root / "cockpit.db").is_file():
+            print(f"pair: no cockpit journal under {root}: start `levain serve --write` once first", file=sys.stderr)
+            return 1
+        db = CockpitDB(root)
+        now = _utc_now()
+        if args.revoke_all:
+            gone = db.revoke_devices(None, by="box", now=now)
+            print(f"revoked {len(gone)} paired device(s)" + (": " + ", ".join(gone) if gone else ""))
+            return 0
+        if not args.print_link and not sys.stdout.isatty():
+            # F6: the link IS a credential for ten minutes; a pipe or a file is a log nobody meant to keep one in
+            print("pair: stdout is not a terminal, so the one-time link is not printed (anyone who reads it can "
+                  "pair a device); run it in a terminal, or pass --print to print it anyway", file=sys.stderr)
+            return 1
+        code = db.mint_offer(label=args.label, minted_by="box", now=now)
+    except (PairingError, *_cockpit_refusals()) as exc:
+        print(f"pair: {_term_safe(exc)}", file=sys.stderr)
+        return 1
+    path = f"/pair#code={code}"
+    print(f"{args.url.rstrip('/')}{path}" if args.url else path)
+    print("one use, valid 10 minutes" + ("" if args.url else "; append the path to the cockpit's address"),
+          file=sys.stderr)
+    return 0
 
 
 def _cmd_cockpit_pending(args: argparse.Namespace) -> int:

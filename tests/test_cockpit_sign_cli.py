@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import tempfile
 import threading
 import urllib.request
 from datetime import datetime, timezone
@@ -30,11 +29,11 @@ from tests.test_cockpit_k2a import _get, _install, _post, _serve
 TOKEN = "row12b-token"
 
 
-from tests.autonomic_confirm_keys import account_home
+from tests.autonomic_confirm_keys import anchor_scratch
 
 @pytest.fixture
 def home() -> Iterator[Path]:
-    d = Path(tempfile.mkdtemp(prefix=".levain-row12b-", dir=account_home()))
+    d = anchor_scratch("row12b-")
     try:
         yield d
     finally:

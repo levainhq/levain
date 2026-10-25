@@ -104,7 +104,6 @@ _DISPATCH_ROUTE = re.compile(
     r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel|authorise-challenge|authorise)")
 _COORD_ROUTE = re.compile(r"/coord/(drop|envelope-review|envelope-challenge)")
 _GRANT_PREFIX = "/grant/"
-_GRANT_ACTIONS = ("revoke-challenge", "revoke")
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
 # a cockpit write (a verb, a signature, a cancel) runs one at a time on its own gate, never a read slot: a signature's
@@ -150,18 +149,11 @@ def _sign_route(route: str) -> "tuple[str, str] | None":
 
 
 def _grant_route(route: str) -> "tuple[str, str] | None":
-    """``(grant_id, action)`` for ``/grant/<id>/<action>``, else None. A grant's id is its creator's choice, so the
-    page sends encodeURIComponent(id); the decoded id is looked up in the log, never trusted further. Its length is
-    the log's to bound, not the route's: any id a grant was made with can be revoked here."""
-    if not route.startswith(_GRANT_PREFIX):
-        return None
-    from urllib.parse import unquote
+    """``(grant_id, action)`` for ``/grant/<id>/<action>``, else None (:func:`levain.consent.grant_phone.grant_route`,
+    the cockpit's parse too)."""
+    from levain.consent.grant_phone import grant_route
 
-    quoted, sep, action = route[len(_GRANT_PREFIX):].partition("/")
-    gid = unquote(quoted)
-    if not sep or not gid or action not in _GRANT_ACTIONS:
-        return None
-    return gid, action
+    return grant_route(route, _GRANT_PREFIX)
 
 
 # the phone app's own routes (levain.phone_app), each with the one method it answers
@@ -505,6 +497,7 @@ class _PhoneServer(ThreadingHTTPServer):
         # serve a page on localhost under another port (on an https name the proxy's origin carries no port)
         self.page_origin = f"http://localhost:{self.server_address[1]}" if rp_id == "localhost" else None
         signer.page_origin = self.page_origin
+        signer.pin_page_origin(lambda _origin: None)     # this port's own page: no caller can move it afterwards
         self.signer = signer
         from levain.dispatch.phone import DispatchPhone
 
@@ -847,18 +840,11 @@ class _PhoneServer(ThreadingHTTPServer):
         return wait
 
     def _sign_root(self) -> Path:
-        """The ONE cockpit the queue's consent hooks name, whose passkeys sign a sign request or a dispatch job."""
-        from levain.consent.answering import hook_roots
-        from levain.consent.sign import SignRefused
+        """The ONE cockpit the queue's consent hooks name, whose passkeys sign a sign request or a dispatch job
+        (:func:`levain.consent.sign.sign_root`)."""
+        from levain.consent.sign import sign_root
 
-        roots = hook_roots(self.queue_dir)
-        if not roots:
-            raise SignRefused("no consent hook names a cockpit, so no passkey can sign here: this queue dir names no "
-                              "cockpit: write claude_code.json with cockpit_data_root", 503)
-        if len(roots) > 1:
-            raise SignRefused("the consent hooks name more than one cockpit, so which passkeys sign is not one "
-                              "answer: nothing is signed", 503)
-        return roots[0]
+        return sign_root(self.queue_dir)
 
     def _sign_authority(self) -> Any:
         """The authority source of :meth:`_sign_root`'s cockpit: what a dispatch signature is verified against."""
@@ -866,27 +852,20 @@ class _PhoneServer(ThreadingHTTPServer):
 
     def _sign_keys(self) -> "dict[str, Any]":
         """The active passkey keys enrolled on this name in the install's cockpit (the one the queue's consent hook
-        verifies against): what may sign a sign request. A laptop key never does."""
-        from levain.authority import AuthorityError
-        from levain.consent.answering import passkey_keys
-        from levain.consent.sign import SignRefused
+        verifies against): what may sign a sign request. A laptop key never does. The cockpit's own Signer reads the
+        same keys through the same function (:func:`levain.consent.sign.passkey_key_source`)."""
+        from levain.consent.sign import passkey_key_source
 
-        root = self._sign_root()
-        try:
-            return {k.fingerprint: k for k in passkey_keys(self._source(root)(), self.rp_id)}
-        except (AuthorityError, OSError, sqlite3.Error) as exc:
-            raise SignRefused(f"the cockpit's keys cannot be read now: {exc}", 503) from None
+        return passkey_key_source(self.queue_dir, self.rp_id, cache=self.replay_cache)()
 
     def sign_step(self, request_id: str, action: str, req: Any) -> dict[str, Any]:
         """``/sign/<id>/challenge``, ``answer`` and ``deny`` (:class:`levain.consent.sign.Signer`)."""
-        from levain.consent.sign import SignRefused
+        from levain.consent.sign import SignRefused, error_word
 
         try:
             return getattr(self.signer, action)(request_id, req)
         except SignRefused as exc:
-            word = {400: "bad_request", 404: "not_found", 409: "conflict", 503: "unavailable"}.get(exc.status,
-                                                                                                   "sign_refused")
-            raise PhoneError(exc.status, word, str(exc)) from None
+            raise PhoneError(exc.status, error_word(exc.status), str(exc)) from None
 
     def grant_step(self, grant_id: str, action: str, req: Any) -> dict[str, Any]:
         """``/grant/<id>/<action>`` (:meth:`levain.consent.grant_phone.GrantPhone.step`)."""
@@ -1219,7 +1198,8 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
     page = f"http://localhost:{bound}/" if name == "localhost" else f"https://{name}/"
     lives = (f"it is kept in {token_file} across restarts: delete that file to make a new one" if token_file is not None
              else "it dies when this stops")
-    print(f"  open on the phone (a secret; {lives}): {page}#phone_token={httpd.phone_token}", flush=True)
+    if link_file is None:
+        print(f"  open on the phone (a secret; {lives}): {page}#phone_token={httpd.phone_token}", flush=True)
     import signal
 
     def _stop(signum: int, frame: Any) -> None:
@@ -1240,6 +1220,10 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
             except OSError as exc:
                 print(f"--link-file: cannot write {link_file}: {exc.strerror or exc}", file=sys.stderr)
                 return 1
+            # stdout is a log under the LaunchAgent: the link (token included) goes only to the 0600 link file, and
+            # this line is printed only once that file holds it
+            print(f"  the phone link (a secret; {lives}) is in {link_file}: open {page}#phone_token=<its phone_token>",
+                  flush=True)
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass

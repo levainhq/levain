@@ -35,6 +35,7 @@ closed."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sqlite3
@@ -66,7 +67,7 @@ UNVERIFIED = "unverified"
 # remote-control path (§4.6). Registering one as a cockpit verb is refused.
 BROKER_HEADS: dict[str, dict[str, Any]] = {
     "harness_approve": {"label": "approve", "tier": "T2", "confirm": True, "idempotent": True,
-                        "job": False, "reversible": False, "fields": [], "effect":
+                        "job": False, "reversible": False, "fields": [], "sign": False, "effect":
                         "answers a harness's pending tool call", "gesture": "sign", "route": "broker"},
 }
 
@@ -74,7 +75,52 @@ BROKER_HEADS: dict[str, dict[str, Any]] = {
 _ENVELOPE = frozenset({"verb", "panel_id", "row_id", "row_version", "panel_version", "params",
                        "intent", "dry_run", "confirm", "idempotency_key", "tier_seen", "gesture_seen"})
 _INTENTS = ("reported", "sign")
+# The one param a signed verb (VerbSpec.sign, DESIGN_SIGN D5) takes beside its fields: the id of the sign request the
+# operator's passkey signed for these params. The kernel admits it only when the server says a compose route filed that
+# request for this verb and exactly these params (the durable binding beside the Signer's requests, which outlives a
+# restart) and it is signed, and the send's idempotency key is SIGN_KEY_PREFIX + the draft id that compose was filed under
+# (_require_sign_request, ``signed_for``); the verb's own handler or effect still verifies the signature over the params,
+# so the write token alone never sends a signed verb.
+SIGN_PARAM = "sign_request"
+SIGN_KEY_PREFIX = "sign-"
 GESTURES = ("direct", "direct-reported", "sign", "refused", "laptop-only")
+# ``signed_for(verb, request_id, params)``: the draft id (``client_txn``) a compose bound ``request_id`` to, durably, for
+# ``verb`` and exactly ``params`` (the params without SIGN_PARAM), when the Signer holds that request signed; else None.
+# It may raise ``EditError`` (503) when that binding cannot be read: a refusal would drop a signed draft that may have sent
+SignedFor = Callable[[str, str, dict[str, Any]], "str | None"]
+
+
+def _param_names(verb: "VerbSpec") -> "set[str]":
+    """The params a verb takes: its fields, and on a signed verb the sign request it names (SIGN_PARAM)."""
+    return set(verb.fields or ()) | ({SIGN_PARAM} if verb.sign else set())
+
+
+def _at_most_once(verb: "VerbSpec") -> bool:
+    """A verb whose fire is deduped by its idempotency key: one declared ``idempotent``, and every signed verb, whatever
+    its tier (a signed send is retried with its draft's key after an answer that never came, so it must apply once)."""
+    return verb.idempotent or verb.sign
+
+
+def _require_sign_request(verb: "VerbSpec", params: dict[str, Any], signed_for: "SignedFor | None",
+                          key: Any) -> None:
+    """A signed verb fails closed in the kernel: unless ``signed_for`` says its SIGN_PARAM names a request filed for this
+    verb and exactly these params and signed, and the request's idempotency ``key`` is SIGN_KEY_PREFIX + the draft id it
+    was filed under, it never reaches its handler or effect (a dry run included). So one signed request is sent under one
+    key, which the at-most-once gate dedupes: a re-post under a fresh key, or none, is refused. This check runs before
+    that gate, so it reads the durable binding, never one server's memory: the retry of a send that landed passes it
+    after a restart and reaches the gate's replay. A caller with no ``signed_for`` (no Signer to ask) sends no signed
+    verb at all. The door still verifies the signature."""
+    from levain.sign_request_id import request_id_ok
+
+    if not verb.sign:
+        return
+    rid = params.get(SIGN_PARAM)
+    rest = {k: v for k, v in params.items() if k != SIGN_PARAM}
+    txn = signed_for(verb.name, rid, rest) if request_id_ok(rid) and signed_for is not None else None
+    if txn is None or key != SIGN_KEY_PREFIX + txn:
+        raise _refuse("sign_required", 403, f"{verb.name!r} is sent only after the operator's passkey signs it: "
+                      f"{SIGN_PARAM!r} must name the sign request filed for these params and signed, and "
+                      f"'idempotency_key' must be its draft's")
 
 
 def tier_max(*tiers: Tier) -> Tier:
@@ -132,6 +178,10 @@ class VerbSpec:
     # every verb unless named here: ``dispatch`` refuses a device credential on any other (a kernel allowlist, never
     # the phone's UI)
     device_ok: bool = False
+    # DESIGN_SIGN D5: the page sends this verb only once the operator's passkey signed its params (a sign request the
+    # server's compose_signer filed), adding the one param SIGN_PARAM; the verb's own handler or effect verifies it. A
+    # signed verb is at-most-once whatever ``idempotent`` says (_at_most_once)
+    sign: bool = False
 
     # ``policy`` is the request's standing policy (``RequestAuthority.policy``, trust-tiering DESIGN
     # §3.4, §4.1): it may raise a tier, never lower one
@@ -154,8 +204,8 @@ class VerbSpec:
     def head(self, gesture: str, *, policy: "TierPolicy") -> dict[str, Any]:
         return {"label": self.label, "tier": _raised(policy, self.name, self.floor if self.tier_fn else "T2"),
                 "confirm": self.confirm_required, "idempotent": self.idempotent, "job": self.job,
-                "reversible": self.reversible, "fields": list(self.fields or ()), "effect": self.effect,
-                "gesture": gesture, "route": self.route}
+                "reversible": self.reversible, "fields": list(self.fields or ()), "sign": self.sign,
+                "effect": self.effect, "gesture": gesture, "route": self.route}
 
 
 def gesture_for(tier: Tier, credential_class: str, install_class: str) -> str:
@@ -517,6 +567,12 @@ class VerbRegistry:
             raise ValueError(f"verb {spec.name!r} is already registered")
         if getattr(spec, "route", "cockpit") != "cockpit":
             raise ValueError(f"verb {spec.name!r}: only route 'cockpit' verbs register here")
+        if type(spec.sign) is not bool:
+            raise ValueError(f"verb {spec.name!r}: sign must be True or False, got {spec.sign!r}")
+        if spec.sign and spec.job:
+            # a job's propose is posted by the page's job path, which no passkey ceremony precedes
+            raise ValueError(f"verb {spec.name!r} cannot be both sign and job: a signed verb is sent only after its "
+                             "ceremony")
         self._specs[spec.name] = spec
 
     def register_downstream(self, name: str, spec: ActionVerb | VerbSpec) -> None:
@@ -539,7 +595,7 @@ class VerbRegistry:
         self._add(VerbSpec(
             name, spec.label or name, spec.label or name, "panel", fields=spec.fields, floor="T2", tier_fn=None,
             confirm_required=spec.confirm_required, idempotent=spec.idempotent, job=spec.job,
-            reversible=False))
+            reversible=False, sign=spec.sign))
 
     def get(self, name: str) -> VerbSpec | None:
         return self._specs.get(name)
@@ -778,18 +834,20 @@ def _value_label(cockpit: "Cockpit", verb: VerbSpec, panel_id: str, authority: "
 def dispatch(
     *, registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | None", req: Any,
     credential: dict[str, Any], install_class: str, route: Literal["cockpit", "edit", "action"],
-    job_runtime: "JobRuntime | None" = None, broker: "Broker | None" = None,
+    job_runtime: "JobRuntime | None" = None, broker: "Broker | None" = None, signed_for: "SignedFor | None" = None,
 ) -> dict[str, Any]:
     # the tier at issue governs, from a FRESH snapshot taken once for this request and bound for its
     # source reads (K2b-3b §0.1, §8d row 6)
     auth = cockpit.authority()
     with bound(auth):
-        return _dispatch(registry, cockpit, scope, req, credential, install_class, route, job_runtime, broker, auth)
+        return _dispatch(registry, cockpit, scope, req, credential, install_class, route, job_runtime, broker, auth,
+                         signed_for)
 
 
 def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | None", req: Any,
               credential: dict[str, Any], install_class: str, route: Literal["cockpit", "edit", "action"],
-              job_runtime: "JobRuntime | None", broker: "Broker | None", auth: "RequestAuthority") -> dict[str, Any]:
+              job_runtime: "JobRuntime | None", broker: "Broker | None", auth: "RequestAuthority",
+              signed_for: "SignedFor | None" = None) -> dict[str, Any]:
     if credential.get("class") not in ("token", "device"):
         raise _refuse("credential_required", 403, "a write needs a credential (the write token)")
     if not isinstance(req, dict):
@@ -814,9 +872,10 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         params = req.get("params", {})
         if not isinstance(params, dict):
             raise _refuse("bad_request", 400, "'params' must be a JSON object")
-        bad = sorted(set(params) - set(verb.fields)) if verb.fields is not None else []
+        bad = sorted(set(params) - _param_names(verb)) if verb.fields is not None else []
         if bad:
             raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
+        _require_sign_request(verb, params, signed_for, req.get("idempotency_key"))
         tier = verb.tier(params, None, auth.labels.label(None), today, policy=auth.policy)    # no row, no label
         _refuse_unless_c1(verb, tier, credential, install_class)
         return _fire_downstream(registry, verb, scope, params, req, job_runtime)
@@ -839,9 +898,10 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     params = req.get("params", {})
     if not isinstance(params, dict):
         raise _refuse("bad_request", 400, "'params' must be a JSON object")
-    bad = sorted(set(params) - set(verb.fields)) if verb.fields is not None else []
+    bad = sorted(set(params) - _param_names(verb)) if verb.fields is not None else []
     if bad:
         raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
+    _require_sign_request(verb, params, signed_for, req.get("idempotency_key"))
     if "dry_run" in req and not isinstance(req["dry_run"], bool):
         raise _refuse("bad_request", 400, "'dry_run' must be true or false")
     intent = req.get("intent")
@@ -875,8 +935,9 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     gesture = gesture_for(tier, credential["class"], install_class)
     # before the key check: a fire previewed at T2 carries a key, so a T2->C1 move must answer as one
     _check_moved(req, tier, gesture)
-    # a broker pending's replay is keyed by it (K2b §2), so a T2/T3 takes one on any verb, and so does a device's C1
-    if "idempotency_key" in req and not verb.idempotent and tier == "C1" and not device:
+    # a broker pending's replay is keyed by it (K2b §2), so a T2/T3 takes one on any verb, and so does a device's C1;
+    # a C1 fire takes one when its verb is at-most-once (idempotent, or signed)
+    if "idempotency_key" in req and not _at_most_once(verb) and tier == "C1" and not device:
         raise _refuse("bad_request", 400, f"{verb.name!r} is not idempotent; it takes no idempotency_key")
     if req.get("dry_run") is True:
         return {"ok": True, "dry_run": True, "verb": verb.name, "tier": tier, "rendered_tier": floor,
@@ -952,8 +1013,11 @@ def _fire_downstream(registry: VerbRegistry, verb: VerbSpec, scope: "WriteScope"
             req.get("confirm") is True
         assert fire is not None
         av = ActionVerb(handler=lambda p: fire(scope, p, target, confirmed),
-                        confirm_required=verb.confirm_required, idempotent=verb.idempotent, job=verb.job,
+                        confirm_required=verb.confirm_required, idempotent=_at_most_once(verb), job=verb.job,
                         label=verb.label)
+    elif _at_most_once(verb) and not av.idempotent:
+        # a signed ActionVerb runs through the at-most-once gate whatever it declared (its key is its draft's identity)
+        av = dataclasses.replace(av, idempotent=True)
     body: dict[str, Any] = {"verb": verb.name, "params": params, "confirm": req.get("confirm") is True}
     if "idempotency_key" in req:
         body["idempotency_key"] = req["idempotency_key"]
@@ -1128,6 +1192,7 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
     bad = sorted(set(params) - set(verb.fields or ()))
     if bad:
         raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
+    _require_sign_request(verb, params, None, None)     # /edit asks no Signer: a signed verb never fires here
     if (verb.tier_fn is None or _is_const(verb)) and (broker is None or not broker.enabled):
         # a verb whose tier does not depend on the row: refuse a T2/T3 before reading anything
         _refuse_unless_c1(verb, verb.tier(params, None, authority.labels.label(None), today, policy=authority.policy),

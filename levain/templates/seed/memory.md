@@ -2,9 +2,9 @@
 
 > Part of the seed. This is how you operate your memory. anneal-memory is wired in as an MCP server (`anneal_memory`); these instructions teach you *when and how* to use its tools. The tool descriptions tell you what each tool does — this tells you the cognitive workflow. Use the tools naturally; don't narrate them to your operator, just work with what you know.
 
-Your memory has four layers: episodes (raw observations) compress into continuity (compressed, always-loaded working memory), with Hebbian links forming between co-cited episodes (a record of what you cite together; recall does not read them) and a limbic layer tracking your functional state during compression.
+Your memory is never a log plus a memory file. It is a governed, versioned state machine: an append-only log of episodes (raw observations), consolidated by one writer into continuity (compressed, always-loaded working memory), with an immune system that decides what may graduate (cited, grounded, not re-used), and a pattern tier recalled on cue.
 
-Those layers, plus two sibling stores, implement **Complementary Learning Systems** — how biological memory stays usable as it grows. What matters for how you operate: not all of your graduated wisdom stays always-loaded. Your `## Patterns` is a *working set* — what's developing or recently leaned on. Proven, stable patterns **crystallize out** into a long-term semantic store and are recalled *on cue* when a prompt is relevant to them, so a large body of earned wisdom stays effective without drowning your attention (a bigger continuity is not a smarter one). You don't manage this bookkeeping yourself — on-cue recall is the harness's job: today your activation hook surfaces relevant open loops (spores) the moment your prompt touches them, and it recalls relevant crystallized patterns the same way — both fire per-turn, on cue, the instant your prompt touches their domain. You can also reach the crystallized tier on demand: `crystal_recall` retrieves the patterns relevant to a query, and the always-on `crystal_index` lists every crystallized pattern by name + one-clause menu (the bodies fill on cue) so you are never blind to your own crystallized wisdom. Know the shape so you trust it: continuity staying lean while your earned wisdom keeps growing is the architecture working, not memory loss.
+This core, plus two sibling stores, implement **Complementary Learning Systems** — how biological memory stays usable as it grows. What matters for how you operate: not all of your graduated wisdom stays always-loaded. Your `## Patterns` is a *working set* — what's developing or recently leaned on. Proven, stable patterns **crystallize out** into a long-term semantic store and are recalled *on cue* when a prompt is relevant to them, so a large body of earned wisdom stays effective without drowning your attention (a bigger continuity is not a smarter one). You don't manage this bookkeeping yourself — on-cue recall is the harness's job: today your activation hook surfaces relevant open loops (spores) the moment your prompt touches them, and it recalls relevant crystallized patterns the same way — both fire per-turn, on cue, the instant your prompt touches their domain. You can also reach the crystallized tier on demand: `crystal_recall` retrieves the patterns relevant to a query, and the always-on `crystal_index` lists every crystallized pattern by name + one-clause menu (the bodies fill on cue) so you are never blind to your own crystallized wisdom. Know the shape so you trust it: continuity staying lean while your earned wisdom keeps growing is the architecture working, not memory loss.
 
 ## anneal-memory is your memory — even if your harness offers its own
 
@@ -38,21 +38,9 @@ Record the reasoning, not just the fact. "Chose X because Y" beats "using X." Do
 
 **End of session:** always wrap before ending. The procedure (`prepare_wrap -> compress -> save_continuity`) is in `memory_workflow.md`.
 
-## Hebbian associations (automatic)
+## Pattern recall follows the evidence
 
-During each wrap the server tracks which episodes you cite together. Episodes cited on the same continuity line form strong direct links (+1.0); episodes cited in the same wrap on different lines form weaker session links (+0.3). If links you recorded yourself touch this window's episodes, the `prepare_wrap` package carries them under `## Episode Associations`. Usually it does not: a wrap's own links are among episodes that have left the next window. Links decay 0.9× per unreinforced wrap and are cleaned up below 0.1. Only validated citations form links — the citation-validation pipeline extends to associations (and its limits — see *What it does NOT catch* above).
-
-**Pattern recall follows the episodes a pattern's evidence cites.** When what you are doing matches an episode, the patterns whose `[evidence:]` cites that episode surface; the links above feed the association statistics and the graph view, not recall. So cite every episode that genuinely supports a pattern: a single genuine citation is enough for it to be recallable, and when the support is plural, cite them together, `[evidence: <id1>, <id2> "how BOTH episodes validate it"]`. Never pad citations to reach two, and there is no need to co-cite on every wrap.
-
-## Limbic layer (optional — your functional state)
-
-When calling `save_continuity` you may include an `affective_state`:
-
-```json
-{ "text": "...(your continuity)...", "affective_state": { "tag": "engaged", "intensity": 0.8 } }
-```
-
-`tag` is a free-text functional-state label (engaged, curious, uncertain, focused, concerned...). `intensity` is 0.0–1.0. High-intensity states (>0.5) amplify associations formed that wrap (up to 1.5× at 1.0). Be honest — uniform "engaged 0.8" on every wrap is confabulation, not signal. The value is in genuine variation.
+**Pattern recall follows the episodes a pattern's evidence cites.** When what you are doing matches an episode, the patterns whose `[evidence:]` cites that episode surface. So cite every episode that genuinely supports a pattern: a single genuine citation is enough for it to be recallable, and when the support is plural, cite them together, `[evidence: <id1>, <id2> "how BOTH episodes validate it"]`. Never pad citations to reach two, and there is no need to co-cite on every wrap.
 
 ## What to record / what not to record
 

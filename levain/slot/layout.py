@@ -24,6 +24,7 @@ HELPER_DIR: Mapping[str, Path] = {"darwin": Path("/usr/local/libexec/levain"),
                                   "linux": Path("/usr/libexec/levain")}                            # §2.1
 ROOT_GROUP = {"darwin": "wheel", "linux": "root"}
 
+POOL_LOCK_NAME = "pool.lock"         # the one file install writes in L/slots/ (CONTRACT §2.1)
 RESERVE_BYTES = 1_342_177_280          # CONTRACT §11 V6
 _MIB = 1 << 20
 
@@ -80,7 +81,7 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         # §2.1: the per-front_uid registration counters (§4.9), CONTROL's like the session records beside them.
         Row(L / "sessions" / "front-reg", "_levain_control", "_levain_control", 0o700),
         _root(host, L / "slots", 0o755),
-        _root(host, L / "slots" / "pool.lock", 0o600, "file"),
+        _root(host, L / "slots" / POOL_LOCK_NAME, 0o600, "file"),
         _root(host, L / "retained", 0o700),
         _root(host, L / "trash", 0o700),
         _root(host, L / "staging", 0o711),
@@ -98,10 +99,15 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         # levain-queue and the broker (a member) reads it; slots are not members.
         Row(L / "contracts", "_levain_dispatch", "levain-queue", 0o2750),
         _root(host, L / "policy", 0o755),
-        Row(L / "lineage", "_levain_control", "levain-lineage", 0o750),
+        # S1 3c-6 (H6-4): CONTROL's lineage sink. Setgid, so the sink CONTROL creates takes levain-lineage: on Linux a
+        # new file takes its creator's primary group (_levain_control) otherwise, and _levain_dispatch could not read it.
+        Row(L / "lineage", "_levain_control", "levain-lineage", 0o2750),
         Row(L / "keys", "_levain_keys", "_levain_keys", 0o700),
         _root(host, L / "routes", 0o755),
-        Row(L / "routes" / "dispatch", "_levain_control", "_levain_keys", 0o750),
+        # S1 3c-4: CONTROL writes the route maps here, keys reads them. Setgid, so every file CONTROL creates takes
+        # _levain_keys: on Linux a new file takes its creator's primary group (_levain_control) otherwise, and keys
+        # could read none of them. Re-applied by every setup and repair (``row_steps``: the chown, then the mode).
+        Row(L / "routes" / "dispatch", "_levain_control", "_levain_keys", 0o2750),
         Row(L / "routes" / "verifiers", "_levain_control", "_levain_control", 0o700),
     ]
 

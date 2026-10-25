@@ -19,9 +19,11 @@ held link is taken on its first use, whatever the outcome.
 The page's token only opens the route: the authority is the passkey's signature, which the replay verifies. The one
 link a passkey may sign in the authority log is ``revoke_grant`` of a consent or inert grant (:mod:`levain.authority`);
 it only ever narrows what an agent may do. The log takes it only from a passkey made on an https name, so a phone
-port on ``localhost`` lists the grants with no signer and says why. ``keys`` and ``root`` are the server's callables
-over the ONE cockpit the queue's consent hooks name; either may raise :class:`levain.consent.sign.SignRefused`,
-answered with its status. Stdlib only.
+port on ``localhost`` lists the grants with no signer and says why. It takes one signed on that name on any port
+(:func:`levain.consent.passkey.authority_signature_problem`), so a cockpit served on ``https://<name>:8443`` signs
+here too, held to its own page by ``page_origin``. ``keys`` and ``root`` are the server's callables over the ONE
+cockpit the queue's consent hooks name; either may raise :class:`levain.consent.sign.SignRefused`, answered with its
+status. Stdlib only.
 """
 from __future__ import annotations
 
@@ -34,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__all__ = ["HOLD", "GrantPhone", "GrantRefused"]
+__all__ = ["HOLD", "GrantPhone", "GrantRefused", "grant_route"]
 
 # how long a held link waits for its signature: a Face ID ceremony takes seconds
 HOLD = 120.0
@@ -48,6 +50,22 @@ class GrantRefused(Exception):
     def __init__(self, status: int, error: str, message: str) -> None:
         super().__init__(message)
         self.status, self.error, self.message = status, error, message
+
+
+def grant_route(route: str, prefix: str) -> "tuple[str, str] | None":
+    """``(grant_id, action)`` for ``<prefix><id>/<action>``, else None: the phone port's ``/grant/`` and the cockpit's
+    ``/cockpit/grant/``. A grant's id is its creator's choice, so the page sends encodeURIComponent(id); the decoded id
+    is looked up in the log, never trusted further. Its length is the log's to bound, not the route's: any id a grant
+    was made with can be revoked here."""
+    if not route.startswith(prefix):
+        return None
+    from urllib.parse import unquote
+
+    quoted, sep, action = route[len(prefix):].partition("/")
+    gid = unquote(quoted)
+    if not sep or not gid or action not in _NEED:
+        return None
+    return gid, action
 
 
 def _b64u(data: bytes) -> str:
@@ -74,11 +92,17 @@ class GrantPhone:
     def _signers(self) -> tuple[dict[str, Any], str]:
         """The passkeys that may revoke here, by fingerprint, and a note when there are none."""
         from levain.authority import AuthorityError
+        from levain.consent.passkey import page_origin_problem
         from levain.consent.sign import SignRefused
 
         if self.rp_id == "localhost":
             return {}, ("a passkey made on localhost cannot revoke a grant (the authority log takes a passkey's revoke "
                         "only from an https page): revoke from the laptop (levain consent grant revoke)")
+        if self.page_origin is not None:
+            problem = page_origin_problem(self.rp_id, self.page_origin)
+            if problem is not None:
+                # to_sshsig refuses every assertion against such a pin, so none is asked for
+                return {}, f"{problem}: revoke from the phone page or the laptop (levain consent grant revoke)"
         try:
             keys = self._keys()
         except (SignRefused, AuthorityError, OSError, sqlite3.Error) as exc:

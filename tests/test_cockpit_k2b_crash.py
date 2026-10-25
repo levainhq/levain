@@ -18,7 +18,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -55,11 +54,11 @@ VERBS = {
 }
 
 
-from tests.autonomic_confirm_keys import account_home
+from tests.autonomic_confirm_keys import anchor_scratch
 
 @pytest.fixture
 def home() -> Iterator[Path]:
-    d = Path(tempfile.mkdtemp(prefix=".levain-k2b-crash-", dir=account_home()))
+    d = anchor_scratch("k2b-crash-")
     try:
         yield d
     finally:

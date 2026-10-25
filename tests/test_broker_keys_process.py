@@ -37,8 +37,7 @@ WAVE = 5            # keys' PENDING_PER_PEER is 8: connections opened faster tha
 
 @pytest.fixture(params=PYS, ids=lambda p: "usr-bin-python3" if p == SYS_PY else "venv")
 def py(request):
-    if not R.h11_available(request.param):
-        pytest.skip("h11 is not importable by %s (named skip, not a pass)" % request.param)
+    R.require_h11(request.param)
     return request.param
 
 

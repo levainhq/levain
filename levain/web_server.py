@@ -48,7 +48,8 @@ Sovereignty boundary (load-bearing, not incidental):
   local uid, so every write carries a per-surface write token on every bind
   (``_WRITE_TOKEN_HEADER``; a writable serve with none given mints a per-launch one). The
   ``/chat`` routes take their own per-launch token (``_CHAT_TOKEN_HEADER``; spore-1310).
-  Reads on a loopback bind stay token-free. Around the token, a write still passes the
+  Reads on a loopback bind stay token-free unless the request came through a proxy (an
+  ``extra_hosts`` Host or a proxy header: then it is off-box and every route needs the token). Around the token, a write still passes the
   Host allowlist and two CSRF layers: (1) ``Sec-Fetch-Site`` must be absent (a non-browser client like the
   operator's own curl) or ``same-origin`` (our own dashboard page) — a hostile
   cross-site page's request carries ``cross-site`` and is refused; (2) the body
@@ -77,6 +78,7 @@ Sovereignty boundary (load-bearing, not incidental):
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import hmac
 import re
 import urllib.parse
@@ -93,9 +95,10 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Iterable
 
-from levain.cockpit.broker import Broker, BrokerError
+from levain.cockpit.broker import Broker, BrokerError, Lifecycle
+from levain.cockpit.firejournal import OFFER_TTL, PAIRED_PREFIX, DeviceRevoked, PairingError
 from levain.cockpit.anneal_effects import (
     EPISODES,
     SECTIONS,
@@ -115,15 +118,20 @@ from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, Ver
                                   record_served_verbs, retier)
 
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
+from levain.consent.grant_phone import grant_route
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
-from levain.http_guards import GuardedHandler
-from levain.http_guards import host_header_allowed  # noqa: F401 — kept importable from its pre-2026-10-03 home
+from levain.http_guards import _WRITE_SEC_FETCH_ALLOWED as _SAME_ORIGIN, GuardedHandler
+from levain.http_guards import host_header_allowed  # the off-box read gate; importable here since before 2026-10-03
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
     MAX_BODY_BYTES,
     ActionVerb,
     EditError,
 )
+
+if TYPE_CHECKING:
+    from levain.consent.grant_phone import GrantPhone
+    from levain.consent.sign import Signer
 
 # The one write route of the shared cockpit (design §4.1). ``/edit`` and ``/action`` are its aliases:
 # all three end in ``levain.cockpit.verbs.dispatch``.
@@ -158,6 +166,56 @@ _WRITE_ROUTES = ("/edit", "/action", _COCKPIT_VERB_PATH)
 _PENDING_PREFIX = "/cockpit/pending/"
 _PENDING_ACTIONS = ("signature", "cancel")
 
+# Per-device pairing (PAIR, levain project_memory/1024-18/PAIR_DESIGN.md, rev 6). Route classes (RP-4): the AUTHED
+# three need a surface or paired token on EVERY bind, loopback included (a local uid must not mint a device); the
+# claim is the one credential-less POST, matched exactly after the query strip, after the Host + CSRF layer 1 check.
+_PAIR_OFFER = "/cockpit/pair/offer"
+_PAIR_REVOKE = "/cockpit/pair/revoke"
+_PAIR_LIST = "/cockpit/pair/devices.json"
+_PAIR_CLAIM = "/cockpit/pair/claim"
+_PAIR_AUTHED_POST = frozenset({_PAIR_OFFER, _PAIR_REVOKE})
+_PAIR_BODY_MAX = 1024             # every pair POST's body cap (the claim's per RP-4; offer and revoke carry less)
+_PAIR_CLAIM_SLOTS = 2             # the claim's own semaphore, not the shared request gate (RP-4)
+_PAIR_VERIFY_SLOTS = 4            # paired lookups in flight, taken before the broker start / lookup (RT-3)
+_PAIR_WAIT_S = 3.0                # how long a paired request waits on a starting broker before its 503 (RT-4, RU-4)
+_PAIR_TOKEN_LEN = (16, 128)       # a header outside this length (or the header-safe shape) is never looked up (RT-3)
+_UNSET: Any = object()            # the per-request credential cache's empty mark (RS-1)
+
+
+def _journal_holds_paired_devices(data_root: Path) -> bool:
+    """Whether the cockpit journal under ``data_root`` holds any unrevoked paired device, read through a read-only
+    connection that never creates the file (the broker is disabled, so nothing else opens it). Unreadable is True:
+    an answer the page may drop a good token on is never given on a guess."""
+    import sqlite3
+
+    from levain.cockpit.firejournal import DB_NAME
+
+    try:
+        path = (Path(data_root) / DB_NAME).resolve()
+        if not path.exists():
+            return False
+    except (OSError, ValueError):
+        return True
+    try:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=0.2)
+        try:
+            row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'paired_devices'").fetchone()
+            if row is None:
+                return False
+            return conn.execute("SELECT 1 FROM paired_devices WHERE revoked_at IS NULL LIMIT 1").fetchone() is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return True
+
+
+class _CredentialUnavailable(Exception):
+    """A token header was supplied, the surface pass missed it, and the broker that could verify it as a paired
+    device's is in a TRANSIENT state (STANDBY, ACTIVATING, DRAINING) after the bounded wait, or the paired-lookup
+    semaphore is full (PAIR RT-1, RT-3, RU-1). Never cached, never folded into a gate's False: the one catch in
+    ``_Handler.handle_one_request`` answers 503 ``broker_unavailable``. Every inner broad ``except`` on a dispatch
+    path re-raises it first (RU-5)."""
+
 
 def _pending_route(route: str) -> "tuple[str, str] | None":
     """``(pending_id, action)`` for a broker pending route, else None."""
@@ -171,6 +229,84 @@ def _pending_route(route: str) -> "tuple[str, str] | None":
 
 def _is_write_route(route: str) -> bool:
     return route in _WRITE_ROUTES or _pending_route(route) is not None
+
+
+# levain's sign-request ceremony hosted by the cockpit (DESIGN_SIGN D4): GET /cockpit/sign.json lists the requests and
+# POST /cockpit/sign/<id>/{challenge,answer,deny} runs the caller's levain.consent.sign.Signer, each behind the write
+# gate (a surface token on every bind, the Host allowlist, same-origin only, the request gate). Served only when
+# make_server was given a Signer: without one every path here is 404.
+_SIGN_LIST_PATH = "/cockpit/sign.json"
+_SIGN_PREFIX = "/cockpit/sign/"
+_SIGN_ACTIONS = ("challenge", "answer", "deny")
+# POST /cockpit/sign/compose (DESIGN_SIGN D5, the compose contract): {verb, params, client_txn} -> {request}, the caller's
+# compose_signer filing a sign request for a signed verb's params (one per draft while it is open); the page then runs the
+# ceremony on that id. Which request each draft filed is recorded durably beside the Signer's requests
+# (levain.consent.sign.bind_compose), the record the kernel's sign check reads. Served only when make_server was given a
+# compose_signer (and a signer to run the ceremony): without one it is 404.
+_SIGN_COMPOSE = "/cockpit/sign/compose"
+_COMPOSE_WAIT_S = 30.0        # how long a second compose of one draft waits for the first's compose_signer call
+# GET /cockpit/sign/<id>.json: ONE request's listing row, behind the listing's gate, so a page never reads "no longer
+# open" off a listing that stopped at its cap (Signer.row)
+_SIGN_ONE_SUFFIX = ".json"
+# PLAN M17 "9a": the grants' passkey revoke, the phone's own ceremony (levain.consent.grant_phone.GrantPhone, built by
+# make_server from the caller's Signer): GET /cockpit/grant/list.json lists each grant with the passkeys that may revoke
+# it, and POST /cockpit/grant/<id>/{revoke-challenge,revoke} runs it, behind the sign routes' gate exactly. Served only
+# beside a Signer: without one every path here is 404, and the page's revoke button copies the terminal line.
+_GRANT_LIST_PATH = "/cockpit/grant/list.json"
+_GRANT_PREFIX = "/cockpit/grant/"
+# one extra Host value (make_server extra_hosts): a DNS name or IPv4 literal and an optional trailing dot, never a port
+_EXTRA_HOST = re.compile(r"(?=[^:]{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+                         r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?")
+
+
+def _params_fingerprint(params: "dict[str, Any]") -> str:
+    """The fingerprint a compose binds a signed draft's params under, and the sign check compares: the SHA-256 of
+    their canonical JSON (sorted keys, no spaces). ``TypeError``/``ValueError`` for params JSON cannot hold."""
+    canonical = json.dumps(params, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _sign_route(route: str) -> "tuple[str, str] | None":
+    """``(request_id, action)`` for a sign route, else None. The id is passed on as it came (the Signer refuses
+    anything that is not a request id)."""
+    if not route.startswith(_SIGN_PREFIX):
+        return None
+    rid, sep, action = route[len(_SIGN_PREFIX):].partition("/")
+    if not sep or not rid or action not in _SIGN_ACTIONS:
+        return None
+    return rid, action
+
+
+def _sign_one(route: str) -> "str | None":
+    """The request id of ``GET /cockpit/sign/<id>.json``, else None (the Signer reads only a request id)."""
+    if not route.startswith(_SIGN_PREFIX) or not route.endswith(_SIGN_ONE_SUFFIX):
+        return None
+    rid = route[len(_SIGN_PREFIX):-len(_SIGN_ONE_SUFFIX)]
+    return rid if rid and "/" not in rid else None
+
+
+def _extra_hosts(hosts: object) -> frozenset[str]:
+    """``extra_hosts`` as the Host gate compares names (:func:`levain.http_guards.host_header_allowed`: lowercase, no
+    trailing dot, no port, since the gate compares host names only, for loopback too). ValueError for anything that
+    is not a bare ``name``: a port, a scheme, a path, userinfo, a wildcard, whitespace, an IPv6 literal, or a bare
+    string where a list belongs (its letters would each become a host). The port is the request's (a proxied Host
+    ``name:8443`` is admitted by name); an entry carrying one would read as a pin the gate never enforces."""
+    if hosts is None:
+        return frozenset()
+    if isinstance(hosts, (str, bytes)):
+        raise ValueError("refusing extra_hosts: pass a list of host names, not one string")
+    try:
+        items = list(hosts)        # type: ignore[call-overload]
+    except TypeError:
+        raise ValueError("refusing extra_hosts: pass a list of host names") from None
+    out = set()
+    for h in items:
+        m = _EXTRA_HOST.fullmatch(h) if isinstance(h, str) else None
+        if m is None:
+            raise ValueError(f"refusing extra_hosts entry {str(h)[:80]!r}: it must be a bare host name (no port, "
+                             "scheme, path, userinfo, wildcard or whitespace)")
+        out.add(h.rstrip(".").lower())
+    return frozenset(out)
 
 
 class _ConsentReader:
@@ -261,7 +397,8 @@ def _store_fault(what: str, exc: BaseException) -> dict[str, str]:
 # The write token header. spore-129 introduced it for an off-loopback writable bind; since K2a
 # (design §4.3) every write carries a surface token in it on EVERY bind, loopback included,
 # constant-time compared against the surface tokens ``make_server`` holds. Off-box, the same
-# token also gates the substrate-bearing reads (spore-220); loopback reads stay token-free.
+# token also gates the substrate-bearing reads (spore-220), and every route of a PROXIED request (an extra host or a
+# proxy header) whatever the source; loopback reads with no proxy header stay token-free.
 _WRITE_TOKEN_HEADER = "X-Levain-Write-Token"
 _HEADER_SAFE_TOKEN = re.compile(r"[\x21-\x7e]+")   # printable ASCII, no spaces: it travels in a header
 
@@ -280,6 +417,10 @@ _CHAT_TOKEN_HEADER = "X-Levain-Chat-Token"
 # The actual bound address is added to this set in ``make_server``. (Lowercase —
 # the Host check normalizes case before comparing, per RFC 7230 §2.7.3.)
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# A request carrying one of these came through a proxy (tailscale serve adds X-Forwarded-Host and Tailscale-User-*,
+# measured 10-23), so it is off-box whatever its Host says: a tailnet peer can send ``Host: 127.0.0.1`` through one
+_PROXY_HEADERS = frozenset({"x-forwarded-for", "x-forwarded-host", "forwarded"})
+_PROXY_HEADER_PREFIX = "tailscale-user-"
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -379,6 +520,11 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/sky.js": ("sky.js", "text/javascript; charset=utf-8"),
     # The change stream's client: one fetch-read stream per page, through the page's own read transport.
     "/cockpit_stream.js": ("cockpit_stream.js", "text/javascript; charset=utf-8"),
+    # Per-device pairing's browser half (RP-4: the static-shell exception serves these token-free; the claim script is an
+    # external file for the CSP): the new device's page, its script, and the cockpit's Devices panel.
+    "/pair": ("pair.html", "text/html; charset=utf-8"),
+    "/pair.js": ("pair.js", "text/javascript; charset=utf-8"),
+    "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -398,10 +544,12 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/job.json",
     "/edit",
     "/action",
-    "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH,
+    "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
+    _GRANT_LIST_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
-_RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX)
+_RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
+                                       _GRANT_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -601,7 +749,7 @@ def build_substrate_json(
             # never drift-prone.
             name: {"confirm_required": bool(spec.confirm_required),
                    "idempotent": bool(spec.idempotent), "job": bool(spec.job),
-                   "label": spec.label}
+                   "sign": bool(getattr(spec, "sign", False)), "label": spec.label}
             for name, spec in extra_verbs.items()
         }
     return json.dumps(payload).encode("utf-8")
@@ -675,6 +823,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # surface's token: minted on a writable server given no tokens at all, None when the caller's
     # ``surface_tokens`` name no browser surface, and None on a read-only server.
     is_loopback_bind: bool
+    # the make_server extra_hosts: a request whose Host names one came through a proxy on this machine (from
+    # loopback, so is_loopback_bind cannot see it) and is off-box for the token gate (DESIGN_SIGN D3, L3 r2)
+    proxied_hosts: frozenset[str]
     write_token: str | None
     # K2a (design §4.3, §9): one write token per surface (``browser``, ``flowconnect``), required on
     # EVERY bind for every write, since 127.0.0.1 is reachable by every local uid. Name -> token.
@@ -716,6 +867,17 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # The cockpit broker (K2b): None on a read-only source; else started with the cockpit and drained
     # by server_close. It is write-disabled unless the install class is declared (design §6).
     broker: "Broker | None" = None
+    # The caller's sign-request Signer (DESIGN_SIGN D4), its page_origin pinned to the page this cockpit is served on;
+    # None serves no sign route.
+    signer: "Signer | None" = None
+    # that pinned page_origin (the Signer refuses any other once make_server pins it), for what the page is told
+    signer_page_origin: "str | None" = None
+    # the grants' passkey revoke (PLAN M17 "9a"), built by make_server from that Signer once it is pinned; None serves no
+    # grant route
+    grant_phone: "GrantPhone | None" = None
+    # the caller's compose_signer (DESIGN_SIGN D5): (verb, params) -> the id of the sign request it filed; None serves no
+    # compose route
+    compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None
     # The change stream (levain.cockpit.stream): set per instance in __init__, before the socket binds,
     # because a failed bind runs server_close and that reads these.
     stream_gate: threading.BoundedSemaphore
@@ -728,6 +890,20 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.stream_heartbeat_s = cockpit_stream.DEFAULT_HEARTBEAT_S
         self.stream_stop = threading.Event()
         self.stream_watcher = cockpit_stream.Watcher(self._watch_manifest, epoch=secrets.token_hex(4))
+        # PAIR: the paired lookups' and the claim's own semaphores (RT-3, RP-4), and the in-process revocation epoch
+        # a revoke bumps AFTER its transaction commits, which every open stream compares before each frame (RU-3)
+        self.pair_verify_gate = threading.BoundedSemaphore(_PAIR_VERIFY_SLOTS)
+        self.pair_claim_gate = threading.BoundedSemaphore(_PAIR_CLAIM_SLOTS)
+        self.pair_epoch = 0
+        self.pair_epoch_lock = threading.Lock()
+        # (verb, client_txn) -> params fingerprint, for each draft whose compose_signer call is in flight here
+        # (_sign_compose): a second compose of the same draft waits on compose_wake for it (so two at once file one),
+        # and a compose of any other draft never waits. A concurrency primitive only, never the record: which request a
+        # draft filed is bound durably (levain.consent.sign.bind_compose) before its entry leaves. The lock is never
+        # held across compose_signer.
+        self.compose_inflight: "dict[tuple[str, str], str]" = {}
+        self.compose_lock = threading.Lock()
+        self.compose_wake = threading.Condition(self.compose_lock)
         super().__init__(*args, **kwargs)
 
     def _watch_manifest(self) -> dict[str, Any]:
@@ -746,16 +922,16 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 built = build_default_cockpit(
                     self.levain_source,
                     job_store=self.job_runtime.store if self.job_runtime is not None else None)
-                built.attach_verbs(VerbView(self.verb_registry, built, lambda: broker_install_class(self)))
-                if self.broker is not None:
-                    built.attach_authority(self.broker.capture)    # authority, labels and tiers per request
-                    built.attach_edits_reader(self.broker.edits)  # Recent edits' broker rows (§0.6)
-                    built.attach_decision_rows(self.broker.decision_rows)   # the decisions panel (§3)
-                built.attach_consent_rows(self.consent_reader)    # agents waiting on the operator (Q6a)
-                if getattr(self, "question_store", None) is not None:
-                    built.attach_question_rows(self.question_store)   # and the questions they ask him (Q-2b)
-                if getattr(self, "note_store", None) is not None:
-                    built.attach_note_rows(self.note_store)           # and what they tell him (notes)
+                # the one attach list a server makes, the same call make_server makes: authority, labels and tiers per
+                # request, Recent edits' broker rows (§0.6), the decisions panel (§3), agents waiting on the operator
+                # (Q6a), the questions they ask him (Q-2b) and what they tell him (notes)
+                broker = self.broker
+                built.attach_server(
+                    VerbView(self.verb_registry, built, lambda: broker_install_class(self)), self.consent_reader,
+                    capture=broker.capture if broker is not None else None,
+                    edits=broker.edits if broker is not None else None,
+                    decision_rows=broker.decision_rows if broker is not None else None,
+                    questions=getattr(self, "question_store", None), notes=getattr(self, "note_store", None))
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
@@ -810,31 +986,168 @@ class _Handler(GuardedHandler):
 
     server_version = "levain-serve"
     server: _LevainHTTPServer  # narrow the type for typed attribute access
+    _credential_cache: Any = _UNSET
+    _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
+
+    def _cross_site_pair_navigation(self) -> bool:
+        """P2 L3 r1 F1: a pair link opened from webmail or another site is a top-level ``GET /pair`` navigation and
+        arrives ``Sec-Fetch-Site: cross-site``, which the shared read preamble refuses. That page is a static shell
+        with no data (its code rides the fragment, its claim is a same-origin POST), so ``_route`` lets exactly this
+        request past the cross-site refusal, Host check kept. Exact raw path, GET only, a document navigation only: a
+        cross-site fetch, subresource or frame of it, HEAD, ``/pair?..`` and every other path stay refused; framing is
+        refused anyway (X-Frame-Options DENY)."""
+        return (self.command == "GET" and self.path == "/pair"
+                and self.headers.get("Sec-Fetch-Site") == "cross-site"
+                and self.headers.get("Sec-Fetch-Mode") == "navigate"
+                and self.headers.get("Sec-Fetch-Dest") == "document")
+
+    def handle_one_request(self) -> None:
+        """One request on this (possibly kept-alive) connection. PAIR RS-1: the credential cache is reset here, at the
+        top of EVERY request, so a revoke is seen by the next request on the same connection. RT-1: the one catch of
+        :class:`_CredentialUnavailable`, answered 503 ``broker_unavailable`` with ``Retry-After`` and the
+        connection closed (RU-2: like every refusal sent before a body is read). The body never says "token": the
+        dashboard's token-drop paths match that word."""
+        self._credential_cache = _UNSET
+        try:
+            super().handle_one_request()
+        except _CredentialUnavailable:
+            self.close_connection = True
+            try:
+                self._send(json.dumps({"error": "broker_unavailable",
+                                       "message": "the cockpit is starting or busy; try again shortly"}).encode("utf-8"),
+                           "application/json; charset=utf-8", status=503, head=self.command == "HEAD",
+                           headers=[("Retry-After", "2")])
+                self.wfile.flush()
+            except (OSError, ValueError):
+                pass        # the client went away first
 
     def _write_token_required(self) -> bool:
-        """True iff this surface is writable AND bound off-loopback: the off-box half of the token
-        rule, which gates the substrate-bearing READS (spore-220) and every non-write POST
-        (spore-129). Writes are gated by ``_writes_need_credential`` on every bind (K2a); the
-        frontend's ``write_token_required`` signal is the OR of the two. Loopback-bound or
-        read-only → False (a read-only mesh bind stays token-free — iPad/iPhone VIEWING is
-        unauthenticated by design)."""
-        return (
-            not self.server.is_loopback_bind
-            and self.server.levain_source.write_scope is not None
-        )
+        """True iff this request needs a surface token on EVERY route, the substrate-bearing READS included
+        (spore-220, spore-129): it is PROXIED, or it reaches a WRITABLE surface on an off-loopback bind.
 
-    def _credential(self) -> dict[str, Any]:
-        """The credential THIS request carries, verified here and never claimed (design §5.1): a
-        surface token, compared in constant time against every surface's token (no early exit, so
-        timing does not say which surface matched), or nothing. Device keys arrive with slice G."""
-        supplied = self.headers.get(_WRITE_TOKEN_HEADER, "").encode("utf-8")
+        PROXIED (L3 r2 on 0867f2c0, whatever the source's write scope): its Host names an ``extra_hosts`` entry, or
+        it carries a proxy header (``X-Forwarded-For``, ``X-Forwarded-Host``, ``Forwarded``, any
+        ``Tailscale-User-*``). A proxy on this machine delivers a tailnet peer's request from loopback, with whatever
+        Host the peer sent, so neither the bind nor the Host alone can tell it from a local one. make_server refuses
+        extra_hosts on a server with no surface token; a proxy header reaching a loopback server with no token at all
+        is refused (fail closed: a proxy nobody named gets nothing).
+
+        The spore-220 carve-out stays: a READ-ONLY source on an off-loopback bind, not proxied, serves reads
+        token-free (iPad/iPhone viewing; make_server allows that bind only for a no-install source). Writes are also
+        gated by ``_writes_need_credential`` on every bind (K2a); the frontend's ``write_token_required`` signal is
+        the OR of the two. Plain loopback with no proxy header stays token-free."""
+        if host_header_allowed(self.headers.get("Host"), self.server.proxied_hosts) or any(
+                k.lower() in _PROXY_HEADERS or k.lower().startswith(_PROXY_HEADER_PREFIX)
+                for k in self.headers.keys()):
+            return True
+        return not self.server.is_loopback_bind and self.server.levain_source.write_scope is not None
+
+    def _credential(self, *, required: "bool | None" = None) -> dict[str, Any]:
+        """The credential THIS request carries, verified here and never claimed (design §5.1), computed once per
+        request (RS-1: the cache is reset in ``handle_one_request``). First a surface token, compared in constant
+        time against every surface's token (no early exit, so timing does not say which surface matched); on a
+        miss with a header supplied, the PAIRED pass (``_paired_name``): a paired device's token, named
+        ``paired-<device id>`` (RP-1). Else nothing. Raises :class:`_CredentialUnavailable` (never cached) per RU-1.
+
+        F2(c), amending RT-1 / RU-1: where a credential is NOT required (``required`` False, or None and
+        :meth:`_credential_required` says so), "unavailable" is answered as class ``none`` instead, NOT cached, so a
+        gate later in the same request (``_off_box_token_valid`` passes ``required=True``) asks again and keeps its
+        503."""
+        cached = self._credential_cache
+        if cached is not _UNSET:
+            return cached
+        try:
+            cached = self._resolve_credential()
+        except _CredentialUnavailable:
+            if required is None:
+                required = self._credential_required()
+            if required:
+                raise
+            return {"class": "none", "device_class": None}
+        self._credential_cache = cached
+        return cached
+
+    def _credential_required(self) -> bool:
+        """Whether THIS request needs a credential at all (F2(c)): False only for a loopback-bound, unproxied
+        (``not _write_token_required()``) GET / HEAD, which reaches no write route. Every route that requires a token
+        on every bind asks through ``_off_box_token_valid`` (``required=True``) instead, so it keeps its 503."""
+        return (not self.server.is_loopback_bind or self._write_token_required()
+                or self.command not in ("GET", "HEAD"))
+
+    def _resolve_credential(self) -> dict[str, Any]:
+        raw = self.headers.get(_WRITE_TOKEN_HEADER, "")
+        supplied = raw.encode("utf-8")
         name = None
         for n, tok in sorted(self.server.surface_tokens.items()):
+            # RQ-6: make_server refuses a surface name with the paired prefix; this holds it at the point of use
+            assert not n.startswith(PAIRED_PREFIX), f"surface token name {n!r} is in the paired namespace"
             if tok and hmac.compare_digest(supplied, tok.encode("utf-8")) and name is None:
                 name = n
-        if name is None:
-            return {"class": "none", "device_class": None}
-        return {"class": "token", "name": name, "device_class": None}
+        if name is not None:
+            return {"class": "token", "name": name, "device_class": None}
+        if raw:
+            device = self._paired_device(raw)
+            if device is not None:
+                return {"class": "token", "name": PAIRED_PREFIX + device, "device_class": None}
+        return {"class": "none", "device_class": None}
+
+    def _pairing_db(self) -> Any:
+        """This server's journal for pairing, the broker started asynchronously and waited on for at most
+        ``_PAIR_WAIT_S`` (RU-4). None where paired tokens cannot exist (no broker: a read-only source with no
+        ``ledger_root``; ``INSTALL_DISABLED`` over a journal with no unrevoked paired device), RU-1. Raises
+        :class:`_CredentialUnavailable` for a transient state, and for ``INSTALL_DISABLED`` over a journal that does hold
+        one (L3 r2: such a journal can be restarted without an install class, and a definite miss would make the page
+        drop a good token)."""
+        broker = self.server.broker
+        if broker is None:
+            return None
+        try:
+            broker.start_async()
+        except Exception:  # noqa: BLE001 - G5: a starter thread that cannot start is the transient 503 (RT-1)
+            raise _CredentialUnavailable("starter") from None
+        state = broker.wait_settled(_PAIR_WAIT_S)
+        if state is Lifecycle.INSTALL_DISABLED and not _journal_holds_paired_devices(broker.data_root):
+            return None         # no paired token can be valid here: a wrong token stays the definite 403
+        db = broker.active_db() if state is Lifecycle.ACTIVE else None
+        if db is None:
+            # STANDBY (another process owns the ledger), ACTIVATING past the wait, DRAINING; CLOSED (the server is
+            # closing) is answered the same: never a definite miss, so a page never drops a good token on it
+            raise _CredentialUnavailable(state.value)
+        return db
+
+    def _paired_device(self, raw: str) -> "str | None":
+        """The id of the unrevoked paired device ``raw`` is the token of, or None for a definite miss. Bounded (RT-3):
+        a header outside the header-safe shape or ``_PAIR_TOKEN_LEN`` is never looked up, and a lookup takes one of
+        ``_PAIR_VERIFY_SLOTS`` BEFORE the broker start / the lookup (a full set is the 503 of RT-1)."""
+        srv = self.server
+        if srv.broker is None:
+            return None         # RU-1: no ledger, no paired tokens: skip the pass entirely
+        lo, hi = _PAIR_TOKEN_LEN
+        if not (lo <= len(raw) <= hi) or not _HEADER_SAFE_TOKEN.fullmatch(raw):
+            return None
+        if not srv.pair_verify_gate.acquire(blocking=False):
+            raise _CredentialUnavailable("paired lookups are full")
+        try:
+            # read BEFORE the lookup, so a revoke committing after it is one a stream of this request still sees
+            self._pair_epoch_seen = srv.pair_epoch
+            db = self._pairing_db()
+            if db is None:
+                return None
+            now = datetime.now(timezone.utc)
+            try:
+                device = db.verify_device(raw, now=now)
+            except Exception as exc:  # noqa: BLE001 - a journal fault is no definite "revoked": 503, the token kept
+                raise _CredentialUnavailable(f"{type(exc).__name__}") from exc
+        finally:
+            srv.pair_verify_gate.release()
+        # F1: the last_seen stamp runs AFTER the answer and after the verify slot is released, with no busy wait
+        # (busy_timeout 0), and nothing it does reaches the answer
+        if device is not None:
+            try:
+                db.stamp_last_seen(device, now=now)
+            except Exception:  # noqa: BLE001 - a display stamp never fails a request
+                _log.debug("paired device last_seen stamp skipped", exc_info=True)
+        return device
 
     def _transport(self) -> dict[str, bool]:
         """The manifest's ``transport``: the same two flags ``/substrate.json`` carries."""
@@ -850,7 +1163,7 @@ class _Handler(GuardedHandler):
         shared by the read gate (``_route``) and the write gate (``do_POST``) so the two can never
         diverge on the auth check (``structural_invariants_beat_discipline``); each caller gates on
         its own predicate first. An empty surface token never matches."""
-        return self._credential()["class"] == "token"
+        return self._credential(required=True)["class"] == "token"
 
     def _cockpit(self) -> "Cockpit":
         """The server's cockpit; the kernel's default over this substrate is built on first use
@@ -915,6 +1228,8 @@ class _Handler(GuardedHandler):
                     entry = find_entry(self.server.consent_reader(datetime.now(timezone.utc)), request_id)
                     if entry is not None:
                         status, payload = 200, entry_body(entry)
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
             except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
                 status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
             finally:
@@ -950,12 +1265,258 @@ class _Handler(GuardedHandler):
                         "rec": q.rec, "blocks": q.blocks, "filed_at": q.filed_at,
                         "answer": None if a is None else {"kind": a.kind, "value": a.value, "channel": a.channel,
                                                           "answered_at": a.answered_at}}
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
             except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
                 status, payload = 500, _store_fault("question", exc)
             finally:
                 self.server.request_gate.release()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
+    def _serve_sign_list(self, *, head: bool, one: "str | None" = None) -> None:
+        """``GET /cockpit/sign.json``: ``{requests, signers, origin}``, the Signer's own listing rows (sha256, options,
+        write_in, recommended) for the active passkeys that may sign, those keys' fingerprints, and the page origin the
+        ceremony is pinned to (a page served elsewhere sends the operator there). Reached only
+        through ``_route`` (Host allowlist, cross-site refusal), then the write gate's other checks before the
+        directory is read: same-origin only (``Sec-Fetch-Site`` absent or ``same-origin``), a surface token on every
+        bind, the request gate. Without a signer, 404. Keys that cannot be read list no signers and say why in
+        ``note``; the rows still list, as on the phone page.
+
+        ``GET /cockpit/sign/<id>.json`` (``one``), behind the same gate: ``{request, signers, origin}`` with that one
+        request's row (:meth:`levain.consent.sign.Signer.row`), or 404 when it is not open, whatever the listing's
+        cap."""
+        from levain.consent.sign import SignRefused
+
+        signer = self.server.signer
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if signer is None:
+            self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=404, head=head)
+            return
+        if not self._sign_read_admitted(head=head, what="the sign requests"):
+            return
+        status: int
+        try:
+            payload: dict[str, Any]
+            try:
+                signers = signer.signers()
+                note = None
+            except SignRefused as exc:
+                signers, note = [], str(exc)
+            # `origin`: the one page the ceremony signs on (make_server checked it), so a page served anywhere else says
+            # where to sign rather than offering a gesture its browser would refuse
+            origin = self.server.signer_page_origin
+            if one is None:
+                payload, status = {"requests": signer.listing(signers), "signers": signers, "origin": origin}, 200
+            else:
+                row = signer.row(one, signers)
+                payload, status = (({"request": row, "signers": signers, "origin": origin}, 200) if row is not None
+                                   else ({"error": "not_open", "message": "this sign request is not open"}, 404))
+            if note is not None and status == 200:
+                payload["note"] = note
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - a directory that cannot be read is an answer, never a dead connection
+            status, payload = 500, _store_fault("sign request", exc)
+        finally:
+            self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=hdrs, cache_control="private, no-store")
+
+    def _sign_read_admitted(self, *, head: bool, what: str) -> bool:
+        """The sign reads' gate past ``_route`` (the sign listing's and the grant listing's, one code path): same-origin
+        only (``Sec-Fetch-Site`` absent or ``same-origin``), a surface token on every bind, then the request gate,
+        which True leaves HELD for the caller to release. False: the refusal was sent."""
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if self.headers.get("Sec-Fetch-Site") not in (None, _SAME_ORIGIN):
+            self._send(json.dumps({"error": "forbidden", "message": "cross-origin read refused"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
+                       cache_control="private, no-store")
+            return False
+        if not self._off_box_token_valid():
+            self._send(json.dumps({"error": "forbidden", "message": (
+                f"{what} need this page's write token, sent as {_WRITE_TOKEN_HEADER}")}).encode("utf-8"),
+                "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
+                cache_control="private, no-store")
+            return False
+        if not self.server.request_gate.acquire(blocking=False):
+            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            return False
+        return True
+
+    def _serve_grant_list(self, *, head: bool) -> None:
+        """``GET /cockpit/grant/list.json``: :meth:`levain.consent.grant_phone.GrantPhone.listing` (each grant with
+        ``instance`` and ``signers``, the passkeys that may revoke it, and the notes) plus ``origin``, the page the
+        ceremony is pinned to, behind the sign listing's gate exactly. Without a Signer, 404."""
+        grants = self.server.grant_phone
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if grants is None:
+            self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=404, head=head)
+            return
+        if not self._sign_read_admitted(head=head, what="the grants"):
+            return
+        try:
+            payload, status = {**grants.listing(), "origin": self.server.signer_page_origin}, 200
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - listing() says its own faults; anything else is an answer too
+            status, payload = 500, _store_fault("grant", exc)
+        finally:
+            self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=hdrs, cache_control="private, no-store")
+
+    def _grant_post(self, grant_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/grant/<id>/<action>``: the GrantPhone's own reply, or its refusal as ``{error, message}``
+        with the refusal's status (the phone port's words)."""
+        from levain.consent.grant_phone import GrantRefused
+
+        grants = self.server.grant_phone
+        if grants is None:     # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        try:
+            return grants.step(grant_id, action, req), 200
+        except GrantRefused as exc:
+            return {"error": exc.error, "message": exc.message}, exc.status
+
+    def _sign_post(self, request_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/sign/<id>/<action>``: the Signer's own reply, or its refusal as ``{error, message}``
+        with the refusal's status, in the words of :func:`levain.consent.sign.error_word` (the phone port's table too)."""
+        from levain.consent.sign import SignRefused, error_word
+
+        signer = self.server.signer
+        if signer is None:     # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        # the Signer verifies against its own page_origin, which make_server pinned: nothing can move it under this call
+        try:
+            return getattr(signer, action)(request_id, req), 200
+        except SignRefused as exc:
+            return {"error": error_word(exc.status), "message": str(exc)}, exc.status
+
+    def _sign_compose(self, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/sign/compose`` ``{verb, params, client_txn}`` -> ``{request}`` (DESIGN_SIGN D5): the
+        caller's ``compose_signer`` files a sign request for a SIGNED verb's params and names it; the page runs the
+        ceremony on that id and only then posts the verb with ``sign_request``. The verb must be one this server serves
+        with ``sign`` set, and the params its fields; a ``ValueError`` from the compose_signer is a 400 carrying its
+        words (the reason the operator reads). The kernel files nothing itself and signs nothing.
+
+        ``client_txn`` is the draft's one identity (the page mints it when the signed draft is first sent and keeps it
+        with the draft): the same ``(verb, client_txn)`` names the SAME request while that request is open, so a lost
+        reply, a retry, a reload or a second send of one draft files one request. The same id with other params is
+        refused (409): an identity names one draft. Which request a draft filed is bound durably beside the Signer's
+        requests (``levain.consent.sign.bind_compose``) before the answer is sent, so this holds across a restart and
+        any number of other drafts, and the kernel's sign check (:meth:`_signed_for`) reads that binding; a request
+        filed but not bound is a 503 (the draft is sent again; the request it filed stays open until it expires). Two
+        composes of one draft at once file one: the second waits for the first's compose_signer call (up to
+        _COMPOSE_WAIT_S, then 503). Composes of different drafts never wait on each other: the compose_signer runs
+        outside the server's lock. A draft with no live binding while ``COMPOSE_LIVE_MAX`` bindings are live is
+        refused 429 ``too_many_open`` before anything is filed (``levain.consent.sign.draft_bindings``); a draft
+        already bound is answered whatever the count."""
+        from levain.consent.sign import SignRefused, bind_compose, draft_bindings, error_word, request_id_ok
+        from levain.cockpit.verbs import SIGN_PARAM
+
+        compose = self.server.compose_signer
+        if compose is None:     # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        if not isinstance(req, dict) or set(req) != {"verb", "params", "client_txn"}:
+            return {"error": "bad_request", "message": "request keys must be ['client_txn', 'params', 'verb']"}, 400
+        name, params, txn = req["verb"], req["params"], req["client_txn"]
+        if not request_id_ok(txn):
+            return {"error": "bad_request", "message": "'client_txn' must be 8 to 64 of A-Z a-z 0-9 _ -"}, 400
+        spec = self.server.verb_registry.get(name) if isinstance(name, str) else None
+        if spec is None:
+            return {"error": "unknown_verb", "message": f"no such verb: {str(name)[:80]!r}"}, 404
+        if not spec.sign:
+            return {"error": "not_signed", "message": f"{spec.name!r} is not a signed verb: it is sent as it is"}, 400
+        if not isinstance(params, dict):
+            return {"error": "bad_request", "message": "'params' must be a JSON object"}, 400
+        bad = sorted(set(params) - set(spec.fields)) if spec.fields is not None else []
+        if SIGN_PARAM in params:
+            bad = sorted(set(bad) | {SIGN_PARAM})      # what is signed is the message, never a request id
+        if bad:
+            return {"error": "field_not_allowed", "message": f"{spec.name!r} does not take {bad}"}, 400
+        try:
+            fp = _params_fingerprint(params)
+        except (TypeError, ValueError):
+            return {"error": "bad_request", "message": "'params' must be plain JSON (no NaN or Infinity)"}, 400
+        signer = self.server.signer
+        if signer is None:      # make_server refuses a compose_signer without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        inflight = self.server.compose_inflight
+        wake = self.server.compose_wake
+        key = (spec.name, txn)
+        conflict = {"error": "txn_conflict", "message": "this send's id already names other words: nothing was "
+                    "filed; send again"}, 409
+        deadline = time.monotonic() + _COMPOSE_WAIT_S
+        with wake:
+            while True:
+                held = inflight.get(key)
+                if held is None:
+                    break
+                if held != fp:
+                    return conflict
+                left = deadline - time.monotonic()      # the same draft's compose is filing: wait for its answer
+                if left <= 0:
+                    return {"error": "busy", "message": "this draft is still being filed: nothing more was filed; "
+                            "send again"}, 503
+                wake.wait(left)
+            try:
+                bound = draft_bindings(signer.queue_dir, spec.name, txn)     # 429 for a new draft past the cap
+            except SignRefused as exc:
+                message = str(exc) if exc.status == 429 else f"{exc}: nothing was filed; send again"
+                return {"error": error_word(exc.status), "message": message}, exc.status
+            if any(b["params"] != fp for b in bound):
+                return conflict
+            for b in reversed(bound):           # the newest of this draft's requests that is still open
+                row = signer.row(b["request"], [])
+                if row is not None and not row.get("refused"):
+                    return {"request": b["request"]}, 200
+            inflight[key] = fp      # this compose's in-flight entry; only its owner removes it (the finally below)
+
+        try:
+            try:
+                rid = compose(spec.name, dict(params))
+            except ValueError as exc:
+                return {"error": "bad_request", "message": str(exc) or "the message cannot be signed"}, 400
+            if not request_id_ok(rid):
+                return {"error": "internal", "message": "the compose signer named no sign request"}, 500
+            try:
+                bind_compose(signer.queue_dir, spec.name, txn, fp, rid)
+            except SignRefused as exc:
+                return {"error": error_word(exc.status), "message": f"sign request {rid} was filed but which draft "
+                        f"filed it could not be recorded ({exc}): it will not be sent; send again"}, exc.status
+            return {"request": rid}, 200
+        finally:
+            with wake:              # after the bind (or its refusal): the same draft's waiters then read the bindings
+                del inflight[key]
+                wake.notify_all()
+
+    def _signed_for(self, verb: str, request_id: str, params: "dict[str, Any]") -> "str | None":
+        """The kernel's sign check (``levain.cockpit.verbs.SignedFor``): the draft id (``client_txn``) under which a
+        compose on this Signer's queue filed ``request_id`` for ``verb`` and exactly ``params``, when the Signer holds
+        that request signed; else None. It reads the durable binding (``levain.consent.sign.compose_bindings``), so a
+        restart or any number of other drafts since never turns the retry of a send that landed into a refusal: the
+        at-most-once gate behind this check replays it. A binding file that cannot be read is an ``unavailable``
+        (503), never a refusal: a refusal drops the page's signed draft, and its re-sign would send a second time."""
+        from levain.consent.sign import SignRefused, compose_bindings, state_of
+
+        signer = self.server.signer
+        if signer is None or not isinstance(request_id, str):
+            return None
+        try:
+            fp = _params_fingerprint(params)
+        except (TypeError, ValueError):
+            return None
+        try:
+            bindings = compose_bindings(signer.queue_dir)
+        except SignRefused as exc:
+            raise EditError("unavailable", 503, f"which sign request this draft filed could not be read ({exc}): "
+                            "nothing was sent; send again") from None
+        txn = next((b["txn"] for b in bindings
+                    if b["verb"] == verb and b["request"] == request_id and b["params"] == fp), None)
+        return txn if txn is not None and state_of(signer.queue_dir, request_id) == "signed" else None
 
     def _serve_note_body(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/note/<n>.json``: one note's body (what, detail, agent, filed_at, and its dismissal if any),
@@ -981,6 +1542,8 @@ class _Handler(GuardedHandler):
                         "n": note.n, "agent": note.agent, "what": note.what, "detail": note.detail,
                         "filed_at": note.filed_at,
                         "dismissed": None if d is None else {"channel": d.channel, "dismissed_at": d.dismissed_at}}
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
             except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
                 status, payload = 500, _store_fault("note", exc)
             finally:
@@ -1022,6 +1585,8 @@ class _Handler(GuardedHandler):
                         # would make a body a browser's JSON.parse rejects. Either failure is a failed read.
                         blob = json.dumps(body, allow_nan=False).encode("utf-8")
                         status = 200
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
                 except Exception as exc:  # noqa: BLE001 - a log that cannot be read is an answer, never a dead connection
                     _log.warning("session transcript read failed: %s: %s", type(exc).__name__, exc)
                     status, payload = 500, {"error": "internal", "message": "the session's transcript could not be read"}
@@ -1037,6 +1602,8 @@ class _Handler(GuardedHandler):
                 body = read_session(root, stem, datetime.now(timezone.utc), self.server.consent_reader)
                 if body is not None:
                     status, payload = 200, body
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
             except Exception as exc:  # noqa: BLE001 - a log that cannot be read is an answer, never a dead connection
                 _log.warning("session transcript read failed: %s: %s", type(exc).__name__, exc)
                 status, payload = 500, {"error": "internal", "message": "the session's transcript could not be read"}
@@ -1088,10 +1655,93 @@ class _Handler(GuardedHandler):
         except (OSError, ValueError):
             return False
 
+    def _stream_allowed(self) -> "Callable[[bool], bool] | None":
+        """The change stream's per-pass check for a PAIRED principal (RU-3, RT-2 as amended): the revocation epoch is
+        compared on every pass (an int read); a changed one re-runs the device check, as does every pass once a
+        heartbeat interval has passed since the last full check, the data path included (G2; so a revoke made by
+        another process, ``levain cockpit pair --revoke-all``, ends the stream within one heartbeat even under a
+        steady event flow). At most the one frame already past its check when the revoke commits is written (G3).
+        Any other principal: None (a surface token is never revoked from the panel)."""
+        cred = self._credential()
+        name = cred.get("name") if cred.get("class") == "token" else None
+        if not isinstance(name, str) or not name.startswith(PAIRED_PREFIX):
+            return None
+        srv, device = self.server, name[len(PAIRED_PREFIX):]
+        seen = [self._pair_epoch_seen]
+
+        def allowed(recheck: bool) -> bool:
+            epoch = srv.pair_epoch
+            if epoch == seen[0] and not recheck:
+                return True
+            seen[0] = epoch
+            broker = srv.broker
+            db = broker.active_db() if broker is not None else None
+            try:
+                return db is not None and db.device_live(device)
+            except Exception:  # noqa: BLE001 - a check that cannot run ends the stream; the page reconnects
+                return False
+
+        return allowed
+
+    def _serve_pair_list(self, *, head: bool) -> None:
+        """``GET /cockpit/pair/devices.json``: the paired devices (never a hash), behind a token on every bind."""
+        if not self._off_box_token_valid():
+            self.close_connection = True
+            self._send(json.dumps({"error": "credential_required", "message": "missing or invalid write token"})
+                       .encode("utf-8"), "application/json; charset=utf-8", status=403, head=head)
+            return
+        payload, status = self._pair_call(lambda db: {"devices": db.list_devices()})
+        self._pair_send(payload, status, head=head)
+
+    def _pair_send(self, payload: "dict[str, Any]", status: int, *, head: bool = False,
+                   cache_control: "str | None" = None) -> None:
+        """A pair route's JSON answer; every 503 carries ``Retry-After: 2`` (F5)."""
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=[("Retry-After", "2")] if status == 503 else None, cache_control=cache_control)
+
+    def _pair_refuse(self, status: int, error: str, message: str) -> None:
+        """A pair POST refused before its body is read: closed at once, the body never read (G1: draining an
+        unauthenticated or busy request's body outside any gate let a slow-body client hold a server thread; a
+        client may see a TCP RST before the refusal, and the page's one retry covers it), ``Retry-After`` on a 503
+        (F5)."""
+        self.close_connection = True
+        self._pair_send({"error": error, "message": message}, status)
+
+    def _pair_call(self, fn: "Callable[[Any], dict[str, Any]]") -> "tuple[dict[str, Any], int]":
+        """Run ``fn(journal)`` for a pair route: 404 where pairing cannot exist (RP-3: no ledger_root, a read-only
+        source), the broker's refusal where it is disabled, 503 while it is transient (after the RU-4 wait), 500
+        ``internal`` on any other fault (F7), like every other handler."""
+        broker = self.server.broker
+        if broker is None:
+            return {"error": "not_found", "message": "pairing needs a writable cockpit"}, 404
+        try:
+            broker.start_async()
+        except Exception:  # noqa: BLE001 - G5: a starter thread that cannot start is the controlled 503
+            return {"error": "broker_unavailable", "message": "the cockpit broker could not start; try again"}, 503
+        state = broker.wait_settled(_PAIR_WAIT_S)
+        db = broker.active_db() if state is Lifecycle.ACTIVE else None
+        if db is None:
+            if state is Lifecycle.INSTALL_DISABLED:
+                return {"error": "install_disabled", "message": f"write-disabled: {broker.disabled_reason}"}, 403
+            return {"error": "broker_unavailable", "message": f"the cockpit broker is {state.value}"}, 503
+        try:
+            return fn(db), 200
+        except PairingError as exc:
+            return {"error": "bad_request", "message": str(exc)}, 400
+        except DeviceRevoked as exc:
+            return {"error": "credential_required", "message": str(exc)}, 403
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - F7: a journal fault is an answer, never a dead connection
+            _log.warning("pair route failed: %s: %s", type(exc).__name__, exc)
+            return {"error": "internal", "message": type(exc).__name__}, 500
+
     def _serve_stream(self, *, head: bool) -> None:
         """``GET /cockpit/events``: reached only through ``_route``, so the Host allowlist, the
         cross-site refusal and the off-box token gate have already answered. Past the stream cap: 503."""
         srv = self.server
+        # the credential is resolved (and may 503, RT-1) BEFORE any byte of the response is sent
+        allowed = self._stream_allowed()
         if head:
             self._send(b"", cockpit_stream.CONTENT_TYPE, head=True)
             return
@@ -1102,6 +1752,8 @@ class _Handler(GuardedHandler):
         try:
             try:
                 sub = srv.stream_watcher.subscribe(self.headers.get("Last-Event-ID"))
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
             except Exception as exc:  # noqa: BLE001 - the cockpit could not start: an answer, not a dead connection
                 self._send(json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8"),
                            "application/json; charset=utf-8", status=500)
@@ -1121,7 +1773,7 @@ class _Handler(GuardedHandler):
 
             try:
                 cockpit_stream.run(write, sub, stop=srv.stream_stop, heartbeat_s=srv.stream_heartbeat_s,
-                                   alive=self._peer_open)
+                                   alive=self._peer_open, allowed=allowed)
             except (OSError, ValueError):
                 pass        # the client went away (or the socket closed under a shutdown): this stream is over
         finally:
@@ -1131,21 +1783,38 @@ class _Handler(GuardedHandler):
 
     def _route(self, *, head: bool) -> None:
         # Host allowlist (DNS rebinding), then the cross-site refusal: a cross-origin page
-        # cannot even TRIGGER the per-request store read.
-        if self._refuse_read(head=head):
+        # cannot even TRIGGER the per-request store read. The one exception is the pair page opened as a cross-site
+        # top-level navigation (F1): it skips only the cross-site refusal, never the Host allowlist.
+        if self._cross_site_pair_navigation():
+            if not self._host_ok():
+                self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
+                return
+        elif self._refuse_read(head=head):
             return
 
         # Strip any query string; route on the bare path against the allowlist.
         path = self.path.split("?", 1)[0]
 
+        # The sign listing runs the write gate's own checks (a token on every bind), stricter than the off-box gate
+        # below, so it is routed before it; without a signer it is 404 to everyone (the route's name is public).
+        if path == _SIGN_LIST_PATH or _sign_one(path) is not None:
+            self._serve_sign_list(head=head, one=_sign_one(path))
+            return
+        if path == _GRANT_LIST_PATH:      # the grants' revoke listing rides that gate exactly (PLAN M17 "9a")
+            self._serve_grant_list(head=head)
+            return
+        if path == _PAIR_LIST:            # PAIR RP-4: an AUTHED pair route, a token on every bind
+            self._serve_pair_list(head=head)
+            return
+
         # OFF-BOX READ GATE (spore-220): the substrate-bearing reads must carry the SAME device-held
-        # token the writes do WHEN this surface is writable AND bound off-loopback — else any tailnet
-        # node reads the full store (``/substrate.json`` / ``/recall.json`` / ``/job.json`` / a
-        # downstream ``extra_json`` view) token-free over plain HTTP. Same predicate + constant-time
+        # token the writes do WHEN ``_write_token_required``: a PROXIED request (an extra host or a
+        # proxy header; writable source or not, L3 r2), or a writable surface bound off-loopback —
+        # else any tailnet node reads the full store (``/substrate.json`` / ``/recall.json`` /
+        # ``/job.json`` / a downstream ``extra_json`` view) token-free. Same predicate + constant-time
         # compare as ``do_POST`` (the two shared helpers), so a read is never served under weaker auth
-        # than a write. Two deliberate carve-outs stay token-free: (1) a read-ONLY mesh bind
-        # (``write_scope`` None → not required) — iPad/iPhone VIEWING stays open, the whole point of a
-        # read-only mesh serve; (2) the APP-SHELL static assets (the built-in html/css/js + any
+        # than a write. Two deliberate carve-outs stay token-free: (1) a read-ONLY mesh bind, not
+        # proxied (spore-220: iPad/iPhone VIEWING); (2) the APP-SHELL static assets (the built-in html/css/js + any
         # downstream ``extra_asset``) — they carry NO substrate data, and the browser must load them
         # to supply the token on the data fetches (the bootstrap). Everything else off-box requires
         # the token, so a 404-class path returns a uniform 403 to an unauthed node (no path probing).
@@ -1212,6 +1881,8 @@ class _Handler(GuardedHandler):
                     self._cockpit(), self.path, credential=self._credential(),
                     if_none_match=self.headers.get("If-None-Match"), transport=self._transport(),
                 )
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
             except Exception as exc:  # noqa: BLE001 - never 500 with a dead connection
                 status, hdrs = 500, [("Vary", COCKPIT_VARY)]
                 body = json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8")
@@ -1233,6 +1904,8 @@ class _Handler(GuardedHandler):
                     self.server.levain_source, self.server.extra_panels,
                     write_token_required=self._write_token_required() or self._writes_need_credential(),
                     extra_verbs=self.server.extra_verbs)
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
             except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
                 # build_substrate_view already degrades data/IO faults into the
                 # view; reaching here is an unexpected fault. Surface it as JSON the
@@ -1265,6 +1938,8 @@ class _Handler(GuardedHandler):
 
                 keyword = parse_qs(urlsplit(self.path).query).get("keyword", [""])[0].strip()
                 body = build_recall_json(self.server.levain_source, keyword)
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
             except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
                 body = json.dumps({
                     "keyword": "",
@@ -1310,6 +1985,8 @@ class _Handler(GuardedHandler):
                     {"error": "job_store_corrupt", "message": f"job store unreadable: {exc}"}
                 ).encode("utf-8")
                 status_code = 500
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
             except Exception as exc:  # noqa: BLE001 — any other fault → 500, fail-closed (never false unknown)
                 body = json.dumps(
                     {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
@@ -1342,6 +2019,8 @@ class _Handler(GuardedHandler):
                         f"extra_json builder for {path} must return bytes, "
                         f"got {type(body).__name__}"
                     )
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
             except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
                 # Same discipline as /substrate.json: surface the fault as JSON the
                 # registering surface can render, never a dead connection.
@@ -1385,6 +2064,8 @@ class _Handler(GuardedHandler):
             return host.job_status(ident), 200
         except ChatError as exc:
             return {"error": exc.code, "message": str(exc)}, exc.http_status
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
         except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
             return {"error": "internal", "message": type(exc).__name__}, 500
 
@@ -1407,6 +2088,8 @@ class _Handler(GuardedHandler):
             return host.close(sid), 200
         except ChatError as exc:
             return {"error": exc.code, "message": str(exc)}, exc.http_status
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
         except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
             return {"error": "internal", "message": type(exc).__name__}, 500
 
@@ -1460,18 +2143,35 @@ class _Handler(GuardedHandler):
         if self._refuse_write_origin():
             return
         # The write gate: a write route on a writable surface needs a surface token on every bind
-        # (K2a). Any other POST on an off-box writable surface needs it too (spore-129/220), with
-        # the same constant-time compare as the read gate in _route, so a write is never served
-        # under weaker auth than a read. Both predicates require write_scope (writability): a
-        # READ-ONLY surface has no write path, so it falls through to the 422 'read_only' refusal
-        # below, NOT a token-403 [codex L3].
+        # (K2a). Every POST for which _write_token_required holds needs it too (spore-129/220; a proxied
+        # one whatever the source, L3 r2), with the same constant-time compare as the read gate in _route,
+        # so a write is never served under weaker auth than a read. A READ-ONLY surface not proxied (loopback,
+        # or its token-free mesh bind) falls through to the 422 'read_only' refusal below, NOT a token-403
+        # [codex L3]; a proxied one needs the token first.
         route = self.path.split("?", 1)[0]
+        # PAIR (RP-4): the claim is the one credential-less POST, carved out by exact path BEFORE the token gates (on
+        # his proxied path every POST would otherwise need a token it cannot have yet); the live code is its
+        # credential. The authed pair POSTs need a token on every bind, loopback included.
+        if route == _PAIR_CLAIM:
+            return self._pair_claim()
+        if route in _PAIR_AUTHED_POST:
+            if not self._off_box_token_valid():
+                return self._pair_refuse(403, "credential_required", "missing or invalid write token")
+            return self._pair_authed_post(route)
         if _is_write_route(route) and self._writes_need_credential() and not self._off_box_token_valid():
             # K2a (design §4.3): every write carries a credential on every bind, loopback included;
             # refused before a byte of the body is read
             return self._reject(403, "credential_required", "missing or invalid write token")
-        if (self._write_token_required() and not _is_write_route(route)
-                and not self._off_box_token_valid()):
+        # A sign route (DESIGN_SIGN D4) needs a surface token on every bind whatever the source's write scope: its
+        # gesture is the operator's passkey, and the page that carries it must be this cockpit's own.
+        sign = _sign_route(route) if self.server.signer is not None else None
+        # the compose route (DESIGN_SIGN D5) rides exactly that gate: it files a request the operator's passkey then signs
+        compose = route == _SIGN_COMPOSE and self.server.compose_signer is not None
+        # and the grants' passkey revoke (PLAN M17 "9a"): the same ceremony class, the same gate
+        grant = grant_route(route, _GRANT_PREFIX) if self.server.grant_phone is not None else None
+        if (sign is not None or compose or grant is not None) and not self._off_box_token_valid():
+            return self._reject(403, "credential_required", "missing or invalid write token")
+        if self._write_token_required() and not self._off_box_token_valid():
             return self._reject(403, "forbidden", "missing or invalid write token")
         # CSRF layer 2: require application/json (a cross-origin page cannot send it
         # without a CORS preflight this server never answers).
@@ -1483,7 +2183,7 @@ class _Handler(GuardedHandler):
         # write_scope, and action verbs REQUIRE a write_scope (make_server enforces it), so
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
-        if not _is_write_route(route) and not is_chat:
+        if not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None:
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -1524,6 +2224,36 @@ class _Handler(GuardedHandler):
                     return
                 self._send_chat(self._chat_post(route, host, req))
                 return
+            if compose:
+                # the caller's compose_signer files the request: like the ceremony, no read-only refusal applies to it
+                try:
+                    payload, status = self._sign_compose(req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if sign is not None:
+                # the Signer's own ceremony, not the substrate's write scope: no read-only refusal applies to it
+                try:
+                    payload, status = self._sign_post(sign[0], sign[1], req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if grant is not None:
+                # the phone's grant ceremony (the passkey's signature is the authority): no read-only refusal applies
+                try:
+                    payload, status = self._grant_post(grant[0], grant[1], req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
             scope = self.server.levain_source.write_scope
             if scope is None:
                 # Distinct from writes.py's `no_install` (a writable source whose seed/
@@ -1543,15 +2273,118 @@ class _Handler(GuardedHandler):
                         registry=self.server.verb_registry, cockpit=self._cockpit(), scope=scope, req=req,
                         credential=self._credential(), install_class=self._install_class(),
                         route={"/edit": "edit", "/action": "action"}.get(route, "cockpit"),
-                        job_runtime=self.server.job_runtime, broker=self.server.broker)
+                        job_runtime=self.server.job_runtime, broker=self.server.broker,
+                        signed_for=self._signed_for)
             except EditError as exc:
                 self._send_json({**exc.extra, "error": exc.code, "message": str(exc)}, exc.http_status)
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
             except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
                 self._send_json({"error": "internal", "message": type(exc).__name__}, 500)
         finally:
             self.server.request_gate.release()
         if result is not None:
             self._send_json(result, 200)
+
+    # -- per-device pairing (PAIR RP-4..RP-7, RQ-7) ------------------------------------------------------------------
+
+    def _pair_body(self) -> "dict[str, Any] | None":
+        """A pair POST's JSON object body, read under the caller's semaphore with the 1 KiB cap; None after
+        sending the refusal. CSRF layer 2 (JSON only) and the length checks run before a byte is read."""
+        if self._refuse_non_json():
+            return None
+        clen = self._declared_length()
+        if clen is None:
+            return None
+        if self._refuse_oversize(clen, _PAIR_BODY_MAX, _PAIR_BODY_MAX):
+            return None
+        try:
+            raw = self.rfile.read(clen)
+        except OSError:
+            self.close_connection = True
+            return None
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._send_json({"error": "bad_json", "message": "body is not valid JSON"}, 400)
+            return None
+        if not isinstance(req, dict):
+            self._send_json({"error": "bad_request", "message": "request must be a JSON object"}, 400)
+            return None
+        return req
+
+    def _pair_claim(self) -> None:
+        """``POST /cockpit/pair/claim {code}``: a new device spends a live one-time code and is handed its token ONCE
+        (``Cache-Control: no-store``, RQ-7). No credential is read (a supplied header is ignored, never verified);
+        the code is the credential. Its own 2-slot semaphore (RP-4); the label is the offer's (RP-6); no lockout
+        (RP-5); nothing of the body is ever logged."""
+        if not self.server.pair_claim_gate.acquire(blocking=False):
+            return self._pair_refuse(503, "busy", "server busy")
+        try:
+            req = self._pair_body()
+            if req is None:
+                return
+            unknown = sorted(set(req) - {"code"})
+            if unknown:
+                self._send_json({"error": "bad_request", "message": f"unknown request keys {unknown}"}, 400)
+                return
+            now = datetime.now(timezone.utc)
+            payload, status = self._pair_call(lambda db: {"claimed": db.redeem_offer(req.get("code"), now=now)})
+            if status == 200:
+                claimed = payload["claimed"]
+                if claimed is None:
+                    payload, status = {"error": "pair_refused",
+                                       "message": "this pairing code is not valid: used, expired or unknown"}, 403
+                else:
+                    payload = {"device_id": claimed[0], "token": claimed[1]}
+            if status == 503:
+                self.close_connection = True     # F5: the claim's 503 closes, like its pre-body one
+            self._pair_send(payload, status, cache_control="no-store")
+        finally:
+            self.server.pair_claim_gate.release()
+
+    def _pair_authed_post(self, route: str) -> None:
+        """``POST /cockpit/pair/offer {label?}`` mints a one-time code minted by THIS credential (RQ-2); ``POST
+        /cockpit/pair/revoke {id}`` revokes a paired device and its family (RP-7; any credential, surface or paired,
+        may revoke any paired device; the surface tokens are never revocable here). The revocation epoch moves only
+        after the revoke's transaction commits (RU-3)."""
+        srv = self.server
+        if not srv.request_gate.acquire(blocking=False):
+            return self._pair_refuse(503, "busy", "server busy")
+        try:
+            req = self._pair_body()
+            if req is None:
+                return
+            cred = self._credential()
+            minted_by = str(cred["name"])
+            now = datetime.now(timezone.utc)
+            if route == _PAIR_OFFER:
+                unknown = sorted(set(req) - {"label"})
+                if unknown:
+                    self._send_json({"error": "bad_request", "message": f"unknown request keys {unknown}"}, 400)
+                    return
+
+                def mint(db: Any) -> dict[str, Any]:
+                    code = db.mint_offer(label=req.get("label"), minted_by=minted_by, now=now)
+                    return {"code": code, "pair_path": f"/pair#code={code}",
+                            "expires_in_s": int(OFFER_TTL.total_seconds())}
+
+                payload, status = self._pair_call(mint)
+            else:
+                unknown = sorted(set(req) - {"id"})
+                if unknown:
+                    self._send_json({"error": "bad_request", "message": f"unknown request keys {unknown}"}, 400)
+                    return
+                payload, status = self._pair_call(
+                    lambda db: {"revoked": db.revoke_devices([req.get("id")], by=minted_by, now=now)})
+                if status == 200:
+                    with srv.pair_epoch_lock:       # after the commit, never inside it (RU-3)
+                        srv.pair_epoch += 1
+                elif payload.get("error") == "bad_request" and "no such device" in payload.get("message", ""):
+                    status = 404
+            self._pair_send(payload, status, cache_control="no-store")
+        finally:
+            srv.request_gate.release()
 
 
 _PENDING_KEYS = {"signature": frozenset({"signature"}),
@@ -1594,6 +2427,9 @@ def make_server(
     cockpit: "Cockpit | None" = None,
     install_class: str | None = None,
     extra_effects: "Mapping[str, DownstreamEffect] | None" = None,
+    signer: "Signer | None" = None,
+    extra_hosts: "Iterable[str] | None" = None,
+    compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1635,7 +2471,9 @@ def make_server(
     - a READ-ONLY, NO-INSTALL source (``write_scope is None`` AND ``install_root is None`` —
       e.g. the embedder's self-ops cockpit over a bare anneal store) MAY bind off-loopback: the write
       route 422s and there is no seed/config to expose, so the private mesh (Tailscale's
-      WireGuard) is the access boundary;
+      WireGuard) is the access boundary and its reads stay token-free (spore-220: iPad viewing).
+      That carve-out is for the bare bind only: a PROXIED request (an ``extra_hosts`` Host or a
+      proxy header) needs the token whatever the source (L3 r2 on 0867f2c0);
     - a WRITABLE source MAY bind off-loopback ONLY with ``write_token`` (spore-129) — the
       off-box governance factor that replaces loopback-is-auth. Then POST /edit requires the
       ``X-Levain-Write-Token`` header (constant-time compared). Since K2a every write needs
@@ -1644,7 +2482,33 @@ def make_server(
       a writable source stays loopback-only;
     - an INSTALL-bearing source stays loopback-only UNCONDITIONALLY (its seed/config is
       operator-private; a token does not relax this — a different concern than spore-129).
-    Raises ``ValueError`` (before binding) on a disallowed non-loopback bind. [codex L3 MED]"""
+    Raises ``ValueError`` (before binding) on a disallowed non-loopback bind. [codex L3 MED]
+
+    ``signer`` (DESIGN_SIGN D4) is a :class:`levain.consent.sign.Signer` the cockpit page signs sign requests
+    through: ``GET /cockpit/sign.json`` and ``POST /cockpit/sign/<id>/{challenge,answer,deny}``, each behind the
+    write gate on every bind. The caller sets ``signer.page_origin`` to the page this cockpit is served on (an
+    ``https://<rp_id>[:port]``, or ``http://localhost:<port>`` on localhost), and a missing or malformed one is a
+    ``ValueError`` before binding: an assertion from any other page is refused. The kernel reads no signers file
+    and writes no trust root; the Signer's keys are the caller's.
+
+    ``extra_hosts`` names Host values the gate admits beside loopback and the bound address: the https name a
+    reverse proxy on this machine forwards (tailscale serve passes the browser's ``Host`` through, port included).
+    Each is a bare ``name`` (a port in an entry is refused); the gate compares names only, so a request Host of
+    ``name:8443`` is admitted. Anything else is a ``ValueError`` before binding, and so is any entry beside a
+    ``chat_host`` (chat is loopback-only), any loopback name or the bound name (already admitted, and naming one would
+    make every local request off-box), and extra_hosts on a server with no surface token. A request whose Host names
+    one, or that carries a proxy header, is OFF-BOX: it needs the token exactly as on an off-box bind, reads included
+    (the app shell and the static assets stay open: they carry no substrate data and no token, and the page asks for
+    the token), since the proxy delivers every tailnet request from loopback.
+
+    ``compose_signer`` (DESIGN_SIGN D5) is ``(verb, params) -> request id``: for a verb whose spec declares ``sign``,
+    the page posts ``{verb, params, client_txn}`` to ``POST /cockpit/sign/compose`` (the write gate, as the sign
+    routes), the callable files a sign request for those params and names it, the page runs the ``signer``'s
+    ceremony on it, and only after a signed result posts the verb with the params plus ``sign_request: <id>``. The
+    kernel, not the callable, keeps a draft to one request: the same ``(verb, client_txn)`` returns the request it
+    filed while that request is open, without calling the callable again. A ``ValueError`` it raises is a 400
+    carrying its words. It needs a ``signer`` (else ``ValueError``); without it the route is 404 and the page sends
+    no signed verb at all."""
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)
@@ -1687,6 +2551,7 @@ def make_server(
                 "write_token=<shared secret the device holds>, or bind loopback "
                 "(127.0.0.1 / localhost), where the server mints a per-launch write token."
             )
+
     # Validate downstream routes BEFORE binding a socket — a collision is a packaging
     # bug, caught at registration, never a silent shadow at request time.
     extra_assets = dict(extra_assets or {})
@@ -1814,6 +2679,40 @@ def make_server(
         raise ValueError(f"refusing extra_effects {stray}: each must name a verb in extra_verbs")
     Broker.check_downstream(extra_effects)
 
+    # The sign ceremony's Signer and the proxied names (DESIGN_SIGN D3, D4): refused here, pre-bind.
+    if signer is not None:
+        from levain.consent.passkey import page_origin_problem
+        from levain.consent.sign import Signer as _Signer
+
+        if not isinstance(signer, _Signer):
+            raise ValueError("refusing signer: it must be a levain.consent.sign.Signer")
+        rp_id = signer.rp_id
+
+        def problem(origin: "str | None") -> "str | None":
+            found = (page_origin_problem(rp_id, origin) if origin is not None
+                     else "its page_origin is not set (the page this cockpit is served on, which the caller pins)")
+            return None if found is None else f"refusing signer: {found}"
+
+        # checked here, pre-bind; pinned (checked again under the Signer's own lock, L3 r2 item 2) only once every
+        # other check and the bind have passed, so a refused server leaves the caller's Signer unpinned
+        found = problem(signer.page_origin)
+        if found is not None:
+            raise ValueError(found)
+    proxied_hosts = _extra_hosts(extra_hosts)
+    redundant = proxied_hosts & (_LOOPBACK_HOSTS | {str(host).rstrip(".").lower()})
+    if redundant:
+        # the gate admits loopback and the bound name already; named here, every local request would read as off-box
+        raise ValueError(f"refusing extra_hosts {sorted(redundant)}: the Host gate already admits loopback and the "
+                         "bound name; extra_hosts names only what a proxy on this machine forwards")
+    if proxied_hosts and chat_host is not None:
+        # chat is loopback-only (above); a name a proxy forwards puts this loopback server on another network
+        raise ValueError("refusing extra_hosts with --chat: a proxied name reaches this server from off the box, "
+                         "and chat drives an entity's hands with no off-box auth")
+    if compose_signer is not None and (signer is None or not callable(compose_signer)):
+        # the page signs what compose files through the Signer's ceremony: a request with no ceremony to answer it
+        # would leave every signed send waiting on nothing
+        raise ValueError("refusing compose_signer: it must be a callable (verb, params) -> request id, beside a signer")
+
     # The async-job runtime for I/O-BOUND (``job=True``) verbs. AUTO-CREATE one when a job verb is
     # registered and the caller didn't inject its own (tests inject; production auto-creates): the
     # store lives under the write_scope's ledger_root (the same governed location as the idempotency
@@ -1841,6 +2740,9 @@ def make_server(
     for name, tok in tokens.items():
         if not name or not tok:
             raise ValueError(f"refusing surface token {name!r}: name and token must be non-empty")
+        if name.startswith(PAIRED_PREFIX):
+            # PAIR RQ-6: a paired device's credential is named paired-<id>; a surface may never hold that namespace
+            raise ValueError(f"refusing surface token {name!r}: the {PAIRED_PREFIX!r} prefix names paired devices")
         if not _HEADER_SAFE_TOKEN.fullmatch(tok):
             # a token travels in a request header and the page stores what this rule admits
             raise ValueError(f"refusing surface token {name!r}: printable ASCII without spaces only")
@@ -1848,6 +2750,15 @@ def make_server(
         raise ValueError("refusing surface tokens: two surfaces share one token")
     if source.write_scope is not None and not tokens:
         tokens["browser"] = secrets.token_urlsafe(32)
+    if proxied_hosts and not tokens:
+        # a request through a proxied name is off-box and needs a surface token on every route (L3 r2)
+        raise ValueError("refusing extra_hosts: every request through a proxied name needs a surface token, reads "
+                         "included, and this server has no surface token (a read-only source given no write_token "
+                         "or surface_tokens); pass a write_token")
+    if signer is not None and not tokens:
+        # every sign route needs a surface token (DESIGN_SIGN D4), so a signer here would be a permanent 403
+        raise ValueError("refusing signer: this server has no surface token for its sign routes to require (a "
+                         "read-only source given no write_token or surface_tokens); pass a write_token")
 
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _LevainHTTPServer((host, port), _Handler)
@@ -1859,40 +2770,17 @@ def make_server(
     httpd.extra_verbs = extra_verbs
     httpd.job_runtime = job_runtime
     httpd.chat_host = chat_host
+    httpd.signer = signer
+    # the page_origin make_server pins (below); nothing is served before then
+    httpd.signer_page_origin = None
+    httpd.compose_signer = compose_signer
     # The shared cockpit (levain.cockpit). A downstream passes its own (the kernel's providers plus
     # its panels); None means the kernel's default over this substrate, built on first request.
-    # Its start() (refresher threads) is the caller's when it passes its own.
+    # Its start() (refresher threads) is the caller's when it passes its own. Nothing is attached to it
+    # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
     httpd.verb_registry = verb_registry
-    if cockpit is not None:
-        cockpit.attach_verbs(VerbView(verb_registry, cockpit, lambda: broker_install_class(httpd)))
     httpd._cockpit_lock = threading.Lock()
-    # K2b §6: `--install-class reported` is the only way to reported; no flag (and no governed
-    # marker) leaves the broker write-disabled, answering "run the installer"
-    httpd.broker = _build_broker(source, install_class, httpd, extra_effects)
-    if cockpit is not None and httpd.broker is not None:
-        cockpit.attach_authority(httpd.broker.capture)
-        cockpit.attach_edits_reader(httpd.broker.edits)
-        # a downstream that registered its own "decisions" keeps exactly that panel (K2b-3b §0.4)
-        cockpit.attach_decision_rows(httpd.broker.decision_rows)
-    # one reader over one queue directory for the decisions panel's rows and the consent body route alike
-    httpd.consent_reader = _consent_reader()
-    from levain.consent.questions import QuestionStore
-
-    # over the reader's own directory only (None is the default queue): a reader without the attribute gets no
-    # question store, never the default queue's (as the proposals route, _ConsentReader)
-    httpd.question_store = (QuestionStore(httpd.consent_reader.directory)
-                            if hasattr(httpd.consent_reader, "directory") else None)
-    from levain.consent.notes import NoteStore
-
-    httpd.note_store = (NoteStore(httpd.consent_reader.directory)
-                        if hasattr(httpd.consent_reader, "directory") else None)
-    if cockpit is not None:
-        cockpit.attach_consent_rows(httpd.consent_reader)      # agents waiting on the operator (Q6a)
-        if httpd.question_store is not None:
-            cockpit.attach_question_rows(httpd.question_store)     # and the questions they ask him (Q-2b)
-        if httpd.note_store is not None:
-            cockpit.attach_note_rows(httpd.note_store)             # and what they tell him (notes)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
@@ -1957,15 +2845,87 @@ def make_server(
             + ("" if _is_install_bearing(source) else " or pass a write_token for an off-box bind")
             + "."
         )
-    # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind),
+    if str(httpd.server_address[0]).lower() in proxied_hosts:
+        bound = str(httpd.server_address[0])
+        httpd.server_close()
+        raise ValueError(f"refusing extra_hosts {[bound]}: the Host gate already admits the bound address ({bound})")
+    # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind) + the caller's extra_hosts,
     # normalized lowercase to match the Host check; any other Host is refused.
-    httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}
+    httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()} | proxied_hosts
+    httpd.proxied_hosts = proxied_hosts
     # Bound the expensive routes (store read + writes). Cockpit GET reads wait briefly for a read-pool slot (see
     # _acquire_read_slot) and leave _RESERVED_SLOTS free; every other gated route answers 503 past the cap.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
     httpd.read_gate = threading.BoundedSemaphore(max(1, _MAX_INFLIGHT - _RESERVED_SLOTS))
     httpd.read_waiters = 0
     httpd.read_waiters_lock = threading.Lock()
+    view = VerbView(verb_registry, cockpit, lambda: broker_install_class(httpd)) if cockpit is not None else None
+    pinned = False
+    try:
+        # K2b §6: `--install-class reported` is the only way to reported; no flag (and no governed
+        # marker) leaves the broker write-disabled, answering "run the installer"
+        httpd.broker = _build_broker(source, install_class, httpd, extra_effects)
+        # one reader over one queue directory for the decisions panel's rows and the consent body route alike
+        httpd.consent_reader = _consent_reader()
+        from levain.consent.questions import QuestionStore
+
+        # over the reader's own directory only (None is the default queue): a reader without the attribute gets no
+        # question store, never the default queue's (as the proposals route, _ConsentReader)
+        httpd.question_store = (QuestionStore(httpd.consent_reader.directory)
+                                if hasattr(httpd.consent_reader, "directory") else None)
+        from levain.consent.notes import NoteStore
+
+        httpd.note_store = (NoteStore(httpd.consent_reader.directory)
+                            if hasattr(httpd.consent_reader, "directory") else None)
+        if view is not None and callable(getattr(cockpit, "check_verbs", None)):
+            cockpit.check_verbs(view)       # the attach's own refusal, run before anything is committed
+        if signer is not None:
+            # after every refusal and the bind, before the cockpit is touched: pinned under the Signer's own lock with
+            # the check above run again there (a page_origin set since is caught), after which no other page_origin
+            # can be set while this server holds the pin; refused, nothing is served and the cockpit is as it was
+            signer.pin_page_origin(problem)
+            pinned = True
+            httpd.signer_page_origin = signer.page_origin
+            from levain.consent.grant_phone import GrantPhone
+            from levain.consent.sign import sign_root
+
+            # the grants' passkey revoke over the Signer's own values: its queue (whose consent hook names the ONE
+            # cockpit whose log takes the revoke, as on the phone port), rpId, the page origin just pinned, its keys
+            sign_queue = signer.queue_dir
+            # only when the grant cards this page shows come from that same queue (/cockpit/consent/grants.json reads
+            # the consent reader's): two queues could name two cockpits whose grants share ids and instances, and a
+            # button on one card must never revoke the other's. Different queues: no grant route, the button copies.
+            from levain.consent.queue import default_queue_dir
+
+            reader = httpd.consent_reader
+            card_queue = (reader.directory if reader.directory is not None else default_queue_dir()) \
+                if hasattr(reader, "directory") else None
+            if card_queue is not None and Path(card_queue).resolve() == Path(sign_queue).resolve():
+                # the cards' queue is PINNED to the one just compared: a default queue re-resolved per request (a
+                # LEVAIN_HOME changed after start) could otherwise move the cards off the queue the revoke is bound to
+                reader.directory = Path(card_queue).resolve()
+                httpd.grant_phone = GrantPhone(sign_queue, signer.rp_id, signer.page_origin, signer.keys,
+                                               lambda: sign_root(sign_queue))
+        if cockpit is not None:
+            # one transaction: an attach that raises (a panel registered since check_verbs; a decisions panel the
+            # registry refuses) undoes this server's attaches and keeps any other registration
+            broker = httpd.broker
+            cockpit.attach_server(
+                view, httpd.consent_reader,                     # agents waiting on the operator (Q6a)
+                capture=broker.capture if broker is not None else None,
+                edits=broker.edits if broker is not None else None,
+                # a downstream that registered its own "decisions" keeps exactly that panel (K2b-3b §0.4)
+                decision_rows=broker.decision_rows if broker is not None else None,
+                questions=httpd.question_store,                 # and the questions they ask him (Q-2b)
+                notes=httpd.note_store)                         # and what they tell him (notes)
+    except BaseException:
+        # the cockpit put itself back (attach_server); this server's pin is released: it never served
+        try:
+            if pinned and signer is not None:
+                signer.release_pin()
+        finally:
+            httpd.server_close()
+        raise
     # The names this server serves, beside its cockpit.db, for `levain cockpit policy raise` to check a
     # downstream verb against (levain.cockpit.verbs.SERVED_VERBS_NAME). Written last, so a server refused
     # above records nothing. Unwritable, an earlier server's record is removed so the raise of a downstream

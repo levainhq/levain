@@ -9,11 +9,15 @@
 // A failing wait also saves timeout-step-<n>.png (+ .txt, the page text) beside the steps file and names it on stderr.
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
+//   {"motion": "reduce"|"no-preference"}    the phone's reduce-motion setting (prefers-reduced-motion); it keeps a scheme step's setting
 //   {"shot": "<abs path.png>", "full": <bool>}   saves a PNG screenshot there (the whole page when full); collected as {"shot": path}
 //   {"authenticator": {"rpId", "privateKey", "credentialId", "userHandle"}}   a virtual platform authenticator (user
 //                                            verification on) holding that one resident P-256 credential (base64
 //                                            PKCS#8 key, base64 ids), so the page's navigator.credentials.get signs
 //                                            with a key the test knows; nothing is collected
+//   {"user_verified": <bool>}               the last authenticator's answer to user verification from now on (false: the
+//                                            page's navigator.credentials.get with userVerification "required" is refused,
+//                                            a cancelled Face ID as the page sees it); nothing is collected
 // App content that loads asynchronously is not waited for: put an `until` step before the `shot`.
 // A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
@@ -25,6 +29,7 @@ import { createServer } from "node:net";
 
 const [chromePath, url, stepsPath] = process.argv.slice(2);
 const steps = JSON.parse(readFileSync(stepsPath, "utf8"));
+const media = {};   // the emulated media features set so far: each setEmulatedMedia call replaces the whole list
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
 const prof = mkdtempSync(join(tmpdir(), "levain-page-drive-"));
@@ -101,23 +106,35 @@ const shotOnTimeout = async (n) => {
     if (typeof t.value === "string") writeFileSync(p.replace(/\.png$/, ".txt"), t.value);
   } catch {}
 };
+let authenticatorId = null;   // the virtual authenticator an `authenticator` step made (a `user_verified` step changes it)
 for (const s of steps) {
   const deadline = Date.now() + (s.ms || 20000);
   if (s.authenticator !== undefined) {
     await send("WebAuthn.enable", { enableUI: false });
     const made = await send("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal",
       hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } });
-    const authenticatorId = made.result?.authenticatorId;
+    authenticatorId = made.result?.authenticatorId;
     if (!authenticatorId) throw new Error("no virtual authenticator: " + JSON.stringify(made.error || made.result));
     const a = s.authenticator;
     const added = await send("WebAuthn.addCredential", { authenticatorId, credential: { credentialId: a.credentialId,
       isResidentCredential: true, rpId: a.rpId, privateKey: a.privateKey, userHandle: a.userHandle, signCount: 0 } });
     if (added.error) throw new Error("the credential was not added: " + JSON.stringify(added.error));
+  } else if (s.user_verified !== undefined) {
+    if (!authenticatorId) throw new Error("user_verified needs an authenticator step before it");
+    const set = await send("WebAuthn.setUserVerified", { authenticatorId, isUserVerified: !!s.user_verified });
+    if (set.error) throw new Error("user verification was not set: " + JSON.stringify(set.error));
   } else if (s.emulate !== undefined) {
     await send("Emulation.setDeviceMetricsOverride", { width: s.emulate.w, height: s.emulate.h, deviceScaleFactor: s.emulate.dpr || 1, mobile: !!s.emulate.mobile });
     await sleep(600);
   } else if (s.scheme !== undefined) {
-    await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: s.scheme }] });
+    media["prefers-color-scheme"] = s.scheme;
+    await send("Emulation.setEmulatedMedia", { features: Object.entries(media).map(([name, value]) => ({ name, value })) });
+    await sleep(300);
+  } else if (s.focus !== undefined) {
+    await send("Emulation.setFocusEmulationEnabled", { enabled: !!s.focus });         // a headless page is never the focused window: without this no focusin / focusout fires
+  } else if (s.motion !== undefined) {
+    media["prefers-reduced-motion"] = s.motion;
+    await send("Emulation.setEmulatedMedia", { features: Object.entries(media).map(([name, value]) => ({ name, value })) });
     await sleep(300);
   } else if (s.shot !== undefined) {
     // a page still being attached answers "Not attached to an active page": retry until the step's deadline

@@ -22,6 +22,7 @@ import base64
 import ctypes
 import fcntl
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -30,7 +31,6 @@ import secrets
 import shlex
 import sqlite3
 import struct
-import subprocess
 import sys
 import tempfile
 import threading
@@ -42,13 +42,18 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_problem
+# the link-signature verifier lives in levain.authority_sig, so root's route-map check verifies without importing this
+# store; every name is re-exported here, and this module's own calls go through these module attributes
+from levain.authority_sig import (_WEBAUTHN_SIG_TYPE, NAMESPACE, AuthorityError, VerifierUnavailable,
+                                  _pipe_reading, _signers_line, _Wire, presence_missing, sshsig_public_key,
+                                  verify_link_sig)
+from levain.trust_anchor import DEFAULT_SSH_KEYGEN
 
 __all__ = [
     "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_MCP_FIELD_KINDS",
     "CONSENT_MCP_GRANT_KIND", "CONSENT_MCP_READ_ONLY_TOOLS",
     "CONSENT_GRANTABLE_TOOLS", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
-    "CUSTODIES", "DISPLAY_PHONE", "FIDO_ATTESTED", "FORMAT", "PASSKEY", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
+    "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "PASSKEY", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_data_root", "anchor_path",
@@ -56,7 +61,8 @@ __all__ = [
     "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
-    "custody_problem", "is_passkey_material",
+    "custody_problem", "egress_key_conflicts", "egress_key_host_problem", "egress_key_incarnation", "egress_key_live",
+    "egress_key_record", "egress_key_repo_problem", "is_passkey_material",
     "genesis_policy", "inert_grant", "conn_data_root", "conn_init_hint", "init_hint", "log_head", "prepare", "read_anchor",
     "reset_anchor", "reset_hint", "reset_lock", "reset_message", "sign_and_append",
     "presence_missing", "quarantined", "signing_laptops", "snapshot", "sshsig_public_key", "UNSTATED",
@@ -64,8 +70,6 @@ __all__ = [
 ]
 
 FORMAT = "levain-authority/1"
-# never the cockpit's or the confirm gate's namespace: a link signature verifies as nothing else
-NAMESPACE = "levain-authority"
 RESET_FORMAT = "levain-authority-reset/1"
 RESET_NAMESPACE = "levain-authority-reset"
 ANCHOR_NAME = "authority.anchor"
@@ -225,6 +229,31 @@ _CONSENT_GRANT_FIELDS = frozenset({"id", "kind", "agent", "tools", "workspace", 
 CONSENT_MCP_GRANT_KIND = "consent-mcp"
 _CONSENT_MCP_GRANT_FIELDS = _CONSENT_GRANT_FIELDS | {"mcp_fields"}
 CONSENT_AGENTS = ("claude_code", "codex")
+# A setup record (CH-D2, design §3.8.5(o) item 4, "re-attach: the setup record"): the operator names ONCE, under the
+# log's rule for a loosen (a laptop-presence key), a host whose requests from a chat launch of ``entity`` may carry a
+# credential Levain holds. It names the credential's SOURCE (a keychain item name the service reads at attach time)
+# and its ``account`` (the keychain item's account: a service alone does not pick one item, two may share it, so
+# the read passes both and a record without an account is refused), never its value, which never enters a link.
+# Fields: ``host`` (one plain-DNS name in its canonical form,
+# ``levain.chat_egress.parse.canonical_host``; no wildcard, no IP literal), ``placement`` (``{"scheme": "bearer"}`` or
+# ``{"scheme": "basic", "user": U}``, R15-9's closed set), ``repos`` (ALL the declared repo paths: the operator's
+# own plus the workspace's remotes read once at setup; a launch reads only this list, K-8, item 4) and ``expires_at`` (at most 30 days past its link, the envelope an
+# older levain holds an unknown kind to, so a log carrying one still replays there, inert). At most ONE LIVE record
+# per (entity, canonical host) (R15-21-4): a second is refused at append (:func:`_egress_key_append_check`), and
+# replacing a credential is one ``loosen`` link that removes the old record and adds the new (a supersession, a NEW
+# id): a record's id never changes meaning, so a same-id change to anything but ``expires_at`` is refused at append.
+# The launch builds its route snapshot from the live records (``levain.chat_egress.keys``), each bound to its
+# :func:`egress_key_incarnation`; "live" is :func:`egress_key_live`, defined once. ``revoke_grant`` removes one (any
+# enrolled key).
+EGRESS_KEY_KIND = "egress-key"
+_EGRESS_KEY_FIELDS = frozenset({"id", "kind", "entity", "host", "source", "account", "placement", "repos",
+                                "expires_at"})
+_EGRESS_KEY_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+# printable ASCII, no leading or trailing space, at most 255 characters
+_EGRESS_KEY_TEXT = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]{0,253}[\x21-\x7e])?")
+# a basic-auth user id: printable, no space and no ':' (RFC 7617 section 2: the user-id cannot hold a colon)
+_EGRESS_KEY_USER = re.compile(r"[\x21-\x39\x3b-\x7e]{1,255}")
+_EGRESS_KEY_REPOS_MAX = 256
 # Ruling 1: a shell command is never parsed, so a grant naming a shell tool would allow every command. Both agents
 # name their shell tool Bash in a PermissionRequest (Claude Code; Codex 0.162.1's exec_command, measured in Q0 item
 # 6, Q3 and 1017-shellnames). Codex 0.162.1 names the input it sends to a running terminal ``write_stdin`` (its
@@ -373,11 +402,6 @@ _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _FP = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 _RENEW_MAX = timedelta(days=30)
 _RENEW_SKEW = timedelta(minutes=10)
-_MAX_SIGNATURE = 16384
-
-
-class AuthorityError(Exception):
-    """A refused authority act or an unusable log; the message is operator-facing."""
 
 
 class ReplayError(AuthorityError):
@@ -386,11 +410,6 @@ class ReplayError(AuthorityError):
     def __init__(self, seq: int, why: str) -> None:
         super().__init__(f"authority log link {seq}: {why}")
         self.seq = seq
-
-
-class VerifierUnavailable(AuthorityError):
-    """The signature verifier (ssh-keygen) could not run. Never a verdict on the log: a replay raises
-    this unconverted, so a caller can tell "retry" from "the log is refused"."""
 
 
 class NotInitialised(AuthorityError):
@@ -591,6 +610,9 @@ class AuthoritySnapshot:
     anchor_warning: str | None = field(default=None, compare=False)
     # per standing grant, the seq of the link that last created or changed it (a create, a renew, a loosen)
     grant_seqs: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}), compare=False, repr=False)
+    # per standing grant, the seq of the link that brought its id into the policy (a create, or a loosen adding it):
+    # a renew or a change keeps it; a revoke and a later create of the same id gives a new one (an incarnation)
+    grant_born: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}), compare=False, repr=False)
 
     def key(self, fingerprint: str) -> AuthorityKey | None:
         return self.keys.get(fingerprint)
@@ -663,200 +685,6 @@ def _rows(conn: sqlite3.Connection) -> list[_Row]:
     cols = ", ".join(f"typeof({c}), CAST({c} AS BLOB)" for c in _TEXT_COLUMNS)
     cur = conn.execute(f"SELECT seq, {cols} FROM authority_log ORDER BY seq")
     return [_Row(r[0], *(_text_cell(k, raw) for k, raw in zip(r[1::2], r[2::2]))) for r in cur.fetchall()]
-
-
-# ---------------------------------------------------------------------------------------------------
-# signatures
-
-
-def _signers_line(principal: str, namespace: str, public_key: str) -> str:
-    # no options: in particular never ``no-touch-required``, so an sk key's user-presence flag is required
-    return f'{principal} namespaces="{namespace}" {public_key}\n'
-
-
-_SSHSIG_BEGIN = "-----BEGIN SSH SIGNATURE-----"
-_SSHSIG_END = "-----END SSH SIGNATURE-----"
-_SK_USER_PRESENT = 0x01
-_WEBAUTHN_SIG_TYPE = "webauthn-sk-ecdsa-sha2-nistp256@openssh.com"
-# a key type :func:`sshsig_public_key` will name: it is written into an allowed-signers line, so a space, a newline
-# or a quote in it would add options or a second line (``no-touch-required``) to what ssh-keygen trusts
-_KEY_TYPE_RE = re.compile(r"[A-Za-z0-9@._-]+")
-
-
-class _Wire:
-    """A cursor over SSH wire-format bytes (RFC 4251 §5); any overrun or trailing byte is ValueError."""
-
-    def __init__(self, data: bytes) -> None:
-        self._data, self._pos = data, 0
-
-    def take(self, n: int) -> bytes:
-        if self._pos + n > len(self._data):
-            raise ValueError("truncated")
-        out = self._data[self._pos:self._pos + n]
-        self._pos += n
-        return out
-
-    def u32(self) -> int:
-        return int(struct.unpack(">I", self.take(4))[0])
-
-    def string(self) -> bytes:
-        return self.take(self.u32())
-
-    def end(self) -> None:
-        if self._pos != len(self._data):
-            raise ValueError("trailing bytes")
-
-
-def _sshsig_fields(armored: str) -> tuple[bytes, bytes]:
-    """The ``publickey`` and ``signature`` strings of an armored SSHSIG v1 blob (the layout
-    :func:`_sshsig_type_and_flags` describes); namespace, reserved and hash_algorithm are skipped, for
-    ssh-keygen to judge. Raises ValueError on anything malformed."""
-    text = armored.strip()
-    if not text.startswith(_SSHSIG_BEGIN) or not text.endswith(_SSHSIG_END):
-        raise ValueError("not an armored SSH signature")
-    blob = base64.b64decode("".join(text[len(_SSHSIG_BEGIN):-len(_SSHSIG_END)].split()), validate=True)
-    outer = _Wire(blob)
-    if outer.take(6) != b"SSHSIG" or outer.u32() != 1:
-        raise ValueError("not an SSHSIG v1 blob")
-    public_key = outer.string()
-    for _ in range(3):              # namespace, reserved, hash_algorithm
-        outer.string()
-    signature = outer.string()
-    outer.end()
-    return public_key, signature
-
-
-def sshsig_public_key(armored: Any) -> tuple[str, str, str]:
-    """What an armored SSHSIG CLAIMS about its signer: the public key embedded in it as ``<type> <base64>``, that
-    key's fingerprint in the ``SHA256:...`` form ssh-keygen prints, and the signature's algorithm. Nothing here
-    verifies the signature: the key is only the one the blob names, for :func:`verify_link_sig` to verify against
-    (it is never authority on its own). Raises ValueError on anything malformed, longer than any signature
-    levain verifies, or naming a key type outside ``[A-Za-z0-9@._-]+``."""
-    if not isinstance(armored, str) or len(armored) > _MAX_SIGNATURE:
-        raise ValueError("not a signature levain reads")
-    try:
-        key_blob, sig_blob = _sshsig_fields(armored)
-        key_type = _Wire(key_blob).string().decode("ascii")
-        sig_type = _Wire(sig_blob).string().decode("ascii")
-    except UnicodeError as exc:
-        raise ValueError(f"not an SSH signature ({type(exc).__name__})") from None
-    if not key_type or not sig_type:
-        raise ValueError("the signature names no key type or no algorithm")
-    if not _KEY_TYPE_RE.fullmatch(key_type):
-        raise ValueError("the signature's key type is not one ssh-keygen names")
-    fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(key_blob).digest()).decode("ascii").rstrip("=")
-    return f"{key_type} {base64.b64encode(key_blob).decode('ascii')}", fingerprint, sig_type
-
-
-def _sshsig_type_and_flags(armored: str) -> tuple[str, int | None]:
-    """The signature algorithm inside an armored SSHSIG, and its FIDO flags byte (None for a non-sk
-    algorithm). Raises ValueError on anything malformed.
-
-    The SSHSIG blob (OpenSSH PROTOCOL.sshsig §"Blob format"): byte[6] "SSHSIG", uint32 version (1),
-    string publickey, string namespace, string reserved, string hash_algorithm, string signature.
-    For an sk-* algorithm the ``signature`` string is (OpenSSH PROTOCOL.u2f §"SSH U2F signatures"):
-    string sig-type, string inner signature, byte flags, uint32 counter; flags bit 0x01 is user
-    presence. A WebAuthn signature (``webauthn-sk-ecdsa-sha2-nistp256@openssh.com``, the same section: a
-    passkey's assertion, Q6b) carries string origin, string clientData, string extensions after the
-    counter. Every other algorithm is string sig-type, string signature."""
-    _public_key_blob, sig_blob = _sshsig_fields(armored)
-    inner = _Wire(sig_blob)
-    sig_type = inner.string().decode("ascii")
-    inner.string()
-    webauthn = sig_type == _WEBAUTHN_SIG_TYPE
-    if not (sig_type.startswith("sk-") or webauthn):
-        inner.end()
-        return sig_type, None
-    flags = inner.take(1)[0]
-    inner.u32()
-    if webauthn:
-        for _ in range(3):          # origin, clientData, extensions: ssh-keygen checks them against the message
-            inner.string()
-    inner.end()
-    return sig_type, flags
-
-
-def presence_missing(signature: str, public_key: str) -> bool:
-    """True if a FIDO (sk-*) key or signature lacks the user-presence flag, or ``signature`` cannot be
-    read for one: the one presence rule for every levain signature check (authority links here, cockpit
-    acts in the broker), so a key made ``no-touch-required`` never signs without a touch."""
-    try:
-        sig_type, flags = _sshsig_type_and_flags(signature)
-    except (ValueError, UnicodeError):
-        return True
-    key_type = public_key.split()[0] if isinstance(public_key, str) and public_key.split() else ""
-    return (key_type.startswith("sk-") or sig_type.startswith("sk-") or sig_type == _WEBAUTHN_SIG_TYPE) \
-        and (flags is None or not flags & _SK_USER_PRESENT)
-
-
-def _pipe_reading(data: bytes) -> int:
-    """The read end of a pipe that yields ``data`` and then EOF. A thread writes it, so no size can
-    block the caller; it ends with a broken pipe once the caller closes the read end."""
-    r, w = os.pipe()
-
-    def feed() -> None:
-        try:
-            with open(w, "wb") as fh:
-                fh.write(data)
-        except OSError:
-            pass
-
-    try:
-        threading.Thread(target=feed, name="levain-authority-pipe", daemon=True).start()
-    except BaseException:
-        os.close(r)
-        os.close(w)
-        raise
-    return r
-
-
-def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerprint: str,
-                    namespace: str = NAMESPACE, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-                    timeout: float = 10.0) -> bool:
-    """True only if ``signature`` is an SSHSIG over ``message`` in ``namespace`` by ``public_key``, the
-    verifier reports exactly ``fingerprint`` for the key it verified with, and, for a FIDO (sk-*) key or
-    signature, the signature carries the user-presence flag. The signers line and the signature reach
-    ssh-keygen through pipes (``/dev/fd/N``), never a file, so no same-uid process can swap either one
-    (say, for a signers line with ``no-touch-required``) between write and use; the presence flag is
-    checked here as well, so a no-touch signature is refused whatever the verifier would say.
-    Raises :class:`VerifierUnavailable` when the verifier cannot run (that is never a verdict)."""
-    if not isinstance(signature, str) or len(signature) > _MAX_SIGNATURE:
-        return False
-    try:
-        sig_bytes = (signature.strip() + "\n").encode("ascii")
-    except UnicodeError:
-        return False
-    if presence_missing(signature, public_key):
-        return False
-    problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
-    if problem is not None:
-        raise VerifierUnavailable(f"cannot verify an authority signature: {problem}")
-    principal = "authority-signer"
-    try:
-        signers = _signers_line(principal, namespace, public_key).encode("ascii")
-    except UnicodeError:
-        return False
-    fds: list[int] = []
-    try:
-        fds.append(_pipe_reading(signers))
-        fds.append(_pipe_reading(sig_bytes))
-        cp = subprocess.run([str(keygen), "-Y", "verify", "-f", f"/dev/fd/{fds[0]}", "-I", principal,
-                             "-n", namespace, "-s", f"/dev/fd/{fds[1]}"], input=message, capture_output=True,
-                            timeout=timeout, env=dict(_VERIFY_ENV), pass_fds=tuple(fds))
-    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
-        # RuntimeError: a pipe's writer thread could not start (_pipe_reading has closed that pipe)
-        raise VerifierUnavailable(f"ssh-keygen could not verify an authority signature ({type(exc).__name__})") \
-            from None
-    finally:
-        for fd in fds:
-            os.close(fd)
-    if cp.returncode != 0:
-        return False
-    good = re.compile(r'Good "' + re.escape(namespace) + r'" signature for ' + re.escape(principal)
-                      + r' with \S+ key (SHA256:[A-Za-z0-9+/]{43})')
-    out = (cp.stdout or b"").decode("utf-8", "replace") + "\n" + (cp.stderr or b"").decode("utf-8", "replace")
-    found = [m.group(1) for line in out.splitlines() if (m := good.match(line.strip()))]
-    return found == [fingerprint]
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -969,6 +797,173 @@ def _validate_inert_grant(grant: Mapping[str, Any], what: str, at: datetime | No
     if not _finite_json(grant):
         raise AuthorityError(f"{what} must be finite JSON (no NaN or Infinity)")
     return _thaw(grant)
+
+
+def egress_key_host_problem(host: Any) -> str | None:
+    """Why ``host`` cannot be a setup record's host, or None: it must be a DNS name (never an IP literal, never a
+    wildcard) already in its canonical form, so the record, the one-live rule and the route lookup compare one
+    spelling (R15-21-6)."""
+    from levain.chat_egress.parse import canonical_host
+
+    if not isinstance(host, str) or not host or not host.isascii():
+        return "is not a host in its canonical form (an ASCII DNS name)"
+    try:
+        canon = canonical_host(host)
+    except ValueError as exc:
+        return f"is not a host in its canonical form ({exc})"
+    if canon != host:
+        return f"is not in its canonical form (that is {canon!r})"
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return "must be a DNS name, not an IP literal"
+
+
+def egress_key_repo_problem(repo: Any) -> str | None:
+    """Why ``repo`` cannot be a declared repo path, or None: an origin-form path that starts with ``/``, holds more
+    than ``/``, does not end with ``/``, carries no query, is already in R-2's canonical form (the decider
+    compares a request's prefix to it as a string), and holds none of the escapes the key rule makes keyless
+    (``advert.KEYLESS_ESCAPES``: such a repo would be signed and then never attach)."""
+    from levain.chat_egress.advert import KEYLESS_ESCAPES
+    from levain.chat_egress.parse import canonical_path
+
+    if not isinstance(repo, str) or not repo.startswith("/") or repo == "/" or repo.endswith("/") or "?" in repo:
+        return "a declared repo is a path like /owner/repo.git (a leading /, no trailing /, no query)"
+    canon, why = canonical_path(repo, "GET")
+    if canon is None:
+        return f"a declared repo path walls ({why})"
+    if canon != repo:
+        return f"a declared repo path must be in its canonical form ({canon!r})"
+    held = [esc for esc in KEYLESS_ESCAPES if esc in canon]
+    if held:
+        return f"a declared repo path holding {', '.join(held)} never carries the key (such a path is keyless)"
+    return None
+
+
+def _validate_egress_key(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A setup record's shape (:data:`EGRESS_KEY_KIND`)."""
+    if set(grant) != _EGRESS_KEY_FIELDS:
+        raise AuthorityError(f"{what} (a setup record) must carry exactly {', '.join(sorted(_EGRESS_KEY_FIELDS))}")
+    if grant["kind"] != EGRESS_KEY_KIND:
+        raise AuthorityError(f"{what}.kind must be {EGRESS_KEY_KIND!r}")
+    if not isinstance(grant["id"], str) or not _EGRESS_KEY_ID.fullmatch(grant["id"]):
+        raise AuthorityError(f"{what}.id must match {_EGRESS_KEY_ID.pattern}")
+    for name in ("entity", "source", "account"):
+        if not isinstance(grant[name], str) or not _EGRESS_KEY_TEXT.fullmatch(grant[name]):
+            raise AuthorityError(f"{what}.{name} must be 1 .. 255 printable ASCII characters (the {name}'s name)")
+    problem = egress_key_host_problem(grant["host"])
+    if problem is not None:
+        raise AuthorityError(f"{what}.host {problem}")
+    placement = grant["placement"]
+    ok = isinstance(placement, Mapping) and (
+        dict(placement) == {"scheme": "bearer"}
+        or (set(placement) == {"scheme", "user"} and placement["scheme"] == "basic"
+            and isinstance(placement["user"], str) and bool(_EGRESS_KEY_USER.fullmatch(placement["user"]))))
+    if not ok:
+        raise AuthorityError(f"{what}.placement must be {{'scheme': 'bearer'}} or {{'scheme': 'basic', 'user': U}} "
+                             "(U printable, no space, no ':')")
+    repos = grant["repos"]
+    if not isinstance(repos, (list, tuple)) or len(repos) > _EGRESS_KEY_REPOS_MAX:
+        raise AuthorityError(f"{what}.repos must be a list of at most {_EGRESS_KEY_REPOS_MAX} declared repo paths")
+    for repo in repos:
+        problem = egress_key_repo_problem(repo)
+        if problem is not None:
+            raise AuthorityError(f"{what}.repos: {problem}")
+    if list(repos) != sorted(set(repos)):
+        raise AuthorityError(f"{what}.repos must be sorted and unique")
+    expires = _parse_stamp(grant["expires_at"], f"{what}.expires_at")
+    if at is not None and expires - at > _CONSENT_GRANT_MAX:
+        raise AuthorityError(f"{what} may last at most 30 days past its link's time")
+    return _thaw(grant)
+
+
+def _egress_key_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
+    """A setup record's change: ``renew`` when only its expiry moved later, anything else ``loose`` (a new host, a
+    new source, account or placement, or a repo added or dropped is a new credential route, never narrower). The
+    replay's classification only: a new link that changes a record's id in place but its expiry is refused at
+    append (:func:`_egress_key_append_check`)."""
+    rest = lambda g: _canonical({k: v for k, v in g.items() if k != "expires_at"})   # noqa: E731
+    return "renew" if rest(o) == rest(n) and n_exp > o_exp else "loose"
+
+
+def egress_key_record(grant: Any) -> bool:
+    """Whether ``grant`` is a setup record this levain knows (:data:`EGRESS_KEY_KIND`)."""
+    return isinstance(grant, Mapping) and grant.get("kind") == EGRESS_KEY_KIND \
+        and _grant_kind(grant) is _GRANT_KINDS[EGRESS_KEY_KIND]
+
+
+def egress_key_live(grant: Any, now: datetime) -> bool:
+    """THE definition of a LIVE setup record (R15-21-4, R15-22-1): a setup record the replay holds whose
+    ``expires_at`` is after ``now``. A revoked or superseded one is no longer in the policy, so it is not live."""
+    if not egress_key_record(grant):
+        return False
+    try:
+        return _parse_stamp(grant["expires_at"], "expires_at") > now
+    except AuthorityError:
+        return False
+
+
+def egress_key_conflicts(grants: Mapping[str, Any], now: datetime) -> list[tuple[str, str, tuple[str, ...]]]:
+    """``(entity, host, record ids)`` for every (entity, canonical host) holding more than one live setup record:
+    what a launch refuses, naming both (R15-21-4: no merge, no pick)."""
+    groups: dict[tuple[str, str], list[str]] = {}
+    for gid, g in grants.items():
+        if egress_key_live(g, now):
+            groups.setdefault((g["entity"], g["host"]), []).append(gid)
+    return [(e, h, tuple(sorted(ids))) for (e, h), ids in sorted(groups.items()) if len(ids) > 1]
+
+
+def _egress_key_meaning(grant: Any) -> str | None:
+    """A setup record's meaning: everything it says but its expiry, canonical (None: not a mapping)."""
+    if not isinstance(grant, Mapping):
+        return None
+    return _canonical(_thaw({k: v for k, v in grant.items() if k != "expires_at"}))
+
+
+def egress_key_incarnation(state: AuthoritySnapshot, record_id: str) -> str | None:
+    """The incarnation of setup record ``record_id`` in ``state``, or None when ``state`` holds no such record: the
+    seq of the link that brought the id into the policy, and a sha256 of its meaning (:func:`_egress_key_meaning`).
+    A launch's route carries it and every per-request liveness check compares it (``levain.chat_egress.keys``), so a
+    revoked id created again, or the same id holding another host, source, account, placement or repo list, is not
+    the record the launch read. A renew (only the expiry later) keeps it."""
+    grant = state.policy.grants.get(record_id)
+    born = state.grant_born.get(record_id)
+    if not egress_key_record(grant) or born is None:
+        return None
+    meaning = _egress_key_meaning(grant)
+    return f"{born}:{hashlib.sha256(meaning.encode()).hexdigest()}" if meaning is not None else None
+
+
+def _egress_key_append_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
+    """The one-live rule at append (R15-21-4): a create or a loosen that brings in or changes a setup record may not
+    leave two live records for that record's (entity, host). A supersession is the loosen that drops the old one in
+    the same link. And a record's id keeps its meaning: a loosen that keeps an id but changes anything of a setup
+    record there but its expiry (its host, source, account, placement, repos, entity or kind) is refused; that is a
+    supersession under a new id (a running launch's route is bound to the record it read). Judged with the
+    appender's clock (liveness reads expiry), so it is an append rule, not a replay rule: a store a foreign writer left holding two is refused at LAUNCH, naming both (``levain.chat_egress.keys``)."""
+    if rec["op"] == "create_grant":
+        grant = rec["grant"]
+        after = {**state.policy.grants, grant["id"]: grant}
+        brought = [grant]
+    elif rec["op"] == "loosen":
+        after = rec["policy"]["grants"]
+        old = state.policy.grants
+        brought = [g for gid, g in after.items()
+                   if gid not in old or _canonical(_thaw(old[gid])) != _canonical(_thaw(g))]
+        for gid, g in after.items():
+            if gid in old and (egress_key_record(old[gid]) or egress_key_record(g)) \
+                    and _egress_key_meaning(old[gid]) != _egress_key_meaning(g):
+                raise AuthorityError(f"setup record {gid[:80]!r} keeps its meaning: a change to anything but its "
+                                     "expiry is a new record under a new id (a supersession), never the same id")
+    else:
+        return
+    touched = {(g["entity"], g["host"]) for g in brought if egress_key_live(g, now)}
+    for entity, host, ids in egress_key_conflicts(after, now):
+        if (entity, host) in touched:
+            raise AuthorityError(f"one live setup record per entity and host: {entity[:80]!r} already has a live "
+                                 f"setup record for {host} ({', '.join(ids)}); replace it (a supersession) or "
+                                 "revoke it first")
 
 
 def _validate_grant(grant: Any, what: str, *, at: datetime | None = None) -> dict[str, Any]:
@@ -1184,6 +1179,7 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
                                                       lambda g: _consent_mcp_tool_check(g)),
                                        renew_checks=(lambda g, after: _consent_mcp_tool_check(g, after),),
                                        consent=True),
+    EGRESS_KEY_KIND: _GrantKind(validate=_validate_egress_key, change=_egress_key_change),
 })
 
 
@@ -1360,6 +1356,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
     keys = {} if state is None else dict(state.keys)
     policy = genesis_policy() if state is None else state.policy
     grant_seqs = {} if state is None else dict(state.grant_seqs)
+    grant_born = {} if state is None else dict(state.grant_born)
     quarantined_history = False
     try:
         if state is None:
@@ -1384,7 +1381,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             # held equal to the one the signer's key material shows (an enrolment from before the door at
             # custody_problem could hold a passkey at custody fido). The one exception is a QUARANTINED key's link
             # already in the log: WebAuthn material at another custody, so the link is re-checked below as the
-            # passkey its material shows (user verification, the exact origin). A new link it signs is refused
+            # passkey its material shows (user verification, the origin rule below). A new link it signs is refused
             why = custody_mismatch(signer.public_key, signer.custody)
             if why is not None and (new_link or not is_passkey_material(signer.public_key)):
                 raise AuthorityError(why + ("; the key is quarantined: it signs nothing new" if new_link and
@@ -1417,6 +1414,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 rank = _DELTA_RANK[delta]
                 grant_seqs = {gid: (grant_seqs.get(gid, seq) if gid in policy.grants and _canonical(
                     _thaw(policy.grants[gid])) == _canonical(_thaw(g)) else seq) for gid, g in need.grants.items()}
+                grant_born = {gid: (grant_born.get(gid, seq) if gid in policy.grants else seq) for gid in need.grants}
                 policy = need
             else:
                 rank = need
@@ -1438,18 +1436,19 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             raise ReplayError(seq, f"the signature does not verify as {signer.fingerprint}")
         if signer.custody == PASSKEY or quarantined_history:
             # the checks ssh-keygen does not make on a WebAuthn signature (user verification, an origin that is
-            # exactly the key's own https name, not cross-origin), run at every replay, and on a quarantined key's
-            # link as on any passkey's: the stored signature carries its flags and origin
+            # the key's own https name, not cross-origin), run at every replay, and on a quarantined key's
+            # link as on any passkey's: the stored signature carries its flags and origin. A revoke_grant may come
+            # from that name on any port (a cockpit behind a proxy, Phill 10-24 "2a"); every other link, exactly
             from levain.consent.passkey import authority_signature_problem
 
-            problem = authority_signature_problem(row.signature, signer.public_key)
+            problem = authority_signature_problem(row.signature, signer.public_key, revoke=op == "revoke_grant")
             if problem is not None:
                 raise ReplayError(seq, f"the passkey signature is refused: {problem}"
                                        + (f" (signed by {signer.fingerprint}, quarantined: WebAuthn material stored "
                                           f"at custody {signer.custody})" if quarantined_history else ""))
     hashes = (() if state is None else state._hashes) + (row.hash,)
     return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at,
-                             grant_seqs=MappingProxyType(grant_seqs))
+                             grant_seqs=MappingProxyType(grant_seqs), grant_born=MappingProxyType(grant_born))
 
 
 def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: dict[str, AuthorityKey],
@@ -1768,7 +1767,9 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     """The rules a replay cannot hold because they need the appender's clock (§3.3a, §6), or its home
     directory: a consent grant's workspace is never the home directory or above it (that grants every
     workspace under it), judged for every consent grant a create or a loosen brings in or changes; and every
-    other per-kind append rule (:data:`_GRANT_KINDS`), a kind this levain does not know refused."""
+    other per-kind append rule (:data:`_GRANT_KINDS`), a kind this levain does not know refused; and the setup
+    record's one-live rule (:func:`_egress_key_append_check`)."""
+    _egress_key_append_check(state, rec, now)
     if rec["op"] == "create_grant":
         _grant_append_checks([rec["grant"]])
     elif rec["op"] == "loosen":

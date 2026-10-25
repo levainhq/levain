@@ -20,6 +20,26 @@ when a `durable()` wait times out. "If the writer hangs while only resolution li
 SENT, then settled), nothing ever evaluates the stall rule. The ledger stays "healthy" and those holds sit RESOLVING at
 full amount until a new admit's `durable()` times out." Charged never drops early.
 
+Format `/3` (S1 3c-6a; R4 `1023-2/3c/R4_DESIGN.md` §3, rulings `1024-13/3c6/HEAD_RULINGS_3C6.md` H6-5, H6-10, H6-12,
+H6-17) adds the lineage outbox. A new file is written `/3`; a `/2` file is read as it stands and appended to with `/3`
+lines (its header is never rewritten), so a `/2` build refuses that file `ledger-corrupt:key` once it holds one.
+- The lineage payload is a dict at `meta["lineage"]` on a resolution line or a `refused` line (a `/2` file carries it the
+  same way, R4 §10); its schema is keys' (3c-6c), the ledger only carries it. A `reserved` line's
+  `meta["lineage_base"]` marks a ticketed hold: every resolution of it carries a payload. A keys-called settle /
+  uncertain / release / end MUST pass keys' full payload as `meta["lineage"]`, else `LedgerMisuse` (H6-28, 3c-6c: one
+  place computes a row); the ledger's OWN resolutions (`owner-ended`, `closed`, the durable wait's timeout, replay's
+  `restart`) carry `lineage_payload(base, outcome, at)`, so every resolution has its row.
+- `released` gains `meta` (a `/2` `released` line has none and is still read).
+- `refused {seq, epoch, session, run_id, route, reason, count, meta}` (H6-10: the current epoch; its triple's ref is the
+  line's own seq). `run_id` is a string or null. keys writes it at a window's close.
+- `lineage-acked {seq, refs: [{ledger, epoch, ref}..], quarantined?: [{source: <triple>, field}]}` (H6-17). Replay refuses
+  an ack naming a triple with no payload line before it (`ack-orphan`) or a quarantine outside the line's refs
+  (`ack-quarantine`); a repeated ack of an acked triple is not corrupt.
+- The outbox is every durable payload line with no durable ack. A triple is `(ledger_id, epoch, ref)`: a resolution's
+  ref and epoch are its `reserved` line's (so a restart line for an old epoch keeps the old triple, H6-12), a `refused`
+  line's are its own. `unacked()` lists them in ref order; `ack()` writes one `lineage-acked` line and moves its refs out
+  of the outbox only in its future's done-callback, after the flush.
+
 Runs on the root interpreter (3.9): no `match`, no 3.10+ API. Standard library imports only (a tripwire holds it).
 """
 from __future__ import annotations
@@ -42,8 +62,10 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
-FORMAT = "levain-reservation-ledger/2"
-FORMAT_VERSION = 2
+FORMAT = "levain-reservation-ledger/3"
+FORMAT_VERSION = 3
+#: the header formats this build reads (a `/2` file is read as it stands)
+READ_FORMATS = frozenset({"levain-reservation-ledger/2", FORMAT})
 META_MAX = 4096                  # bytes of a meta object's canonical encoding
 PRICE_REF_MAX = 256
 #: its value is `creds.LOCK_TIMEOUT_S`, keys' existing bound for a stalled durable-state operation (design 1.8 / R8),
@@ -63,14 +85,21 @@ _PRICE_REF_RE = re.compile(r"[\x20-\x7e]{1,%d}" % PRICE_REF_MAX)
 _REASON_RE = re.compile(r"[a-z0-9-]{1,32}")
 _AT_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z")
 _FORMAT_RE = re.compile(r"levain-reservation-ledger/([0-9]{1,9})")
+#: a `refused` line's session, route and run_id: printable ASCII, no space
+_ID_RE = re.compile(r"[\x21-\x7e]{1,128}")
+#: a quarantined record's field name, as CONTROL names it
+_FIELD_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
+#: each kind's allowed key sets (a `/2` `released` has no `meta`; `lineage-acked` carries `quarantined` only when any)
 _KEYS = {
-    "header": frozenset({"kind", "seq", "format", "ledger_id", "created_at"}),
-    "opened": frozenset({"kind", "seq", "epoch", "at"}),
-    "reserved": frozenset({"kind", "seq", "epoch", "scope", "cap", "amount", "price_ref", "meta", "at"}),
-    "released": frozenset({"kind", "seq", "ref", "at"}),
-    "settled": frozenset({"kind", "seq", "ref", "settled", "overrun", "meta", "at"}),
-    "uncertain": frozenset({"kind", "seq", "ref", "reason", "meta", "at"}),
+    "header": (frozenset({"kind", "seq", "format", "ledger_id", "created_at"}),),
+    "opened": (frozenset({"kind", "seq", "epoch", "at"}),),
+    "reserved": (frozenset({"kind", "seq", "epoch", "scope", "cap", "amount", "price_ref", "meta", "at"}),),
+    "released": (frozenset({"kind", "seq", "ref", "meta", "at"}), frozenset({"kind", "seq", "ref", "at"})),
+    "settled": (frozenset({"kind", "seq", "ref", "settled", "overrun", "meta", "at"}),),
+    "uncertain": (frozenset({"kind", "seq", "ref", "reason", "meta", "at"}),),
+    "refused": (frozenset({"kind", "seq", "epoch", "session", "run_id", "route", "reason", "count", "meta", "at"}),),
+    "lineage-acked": (frozenset({"kind", "seq", "refs", "at"}), frozenset({"kind", "seq", "refs", "quarantined", "at"})),
 }
 _RESOLUTIONS = ("released", "settled", "uncertain")
 
@@ -191,6 +220,62 @@ def _meta_ok(meta: Any) -> bool:
     return len(json.dumps(meta, sort_keys=True, separators=(",", ":"), ensure_ascii=True)) <= META_MAX
 
 
+#: the lineage `settled` word for each outcome (H6-5: a released exchange is a row with "no")
+_SETTLED_WORD = {"released": "no", "settled": "yes", "uncertain": "uncertain"}
+#: the longest `at` the ledger writes (`_now()`'s shape), for the size check of a payload built later (the payload
+#: carries it cut to its second, `_second`)
+_AT_SAMPLE = "0000-00-00T00:00:00.000000Z"
+
+
+def _second(at: str) -> str:
+    """A ledger stamp (`_now()`'s shape) cut to its second: `YYYY-MM-DDTHH:MM:SSZ`, the one form a lineage payload
+    carries (H6-31, 3c-6d: CONTROL's sink takes only that form, and the ledger is the one place that computes it)."""
+    return at[:19] + "Z"
+
+
+def lineage_payload(base: dict, outcome: str, at: str) -> dict:
+    """The payload of a ledger-written resolution of a ticketed hold: its `lineage_base` plus the outcome (keys' base
+    already holds every field the ledger cannot know). `at` is the resolution line's own `_now()` stamp; the payload's
+    `ended_at` is that moment cut to its second (H6-31). A RELEASED outcome is a hold the ledger ended before any
+    upstream call (only PENDING / RESERVED holds release), so its row says no call was made: `model_answered` and
+    `provider_answered` null and `status` 0 (H6-32, H6-21). An `uncertain` one (a SENT hold, or replay's restart,
+    which cannot know) keeps the base's "unknown"."""
+    p = json.loads(json.dumps(base))
+    p["settled"] = _SETTLED_WORD[outcome]
+    p["ended_at"] = _second(at)
+    if outcome == RELEASED:
+        p.update(model_answered=None, provider_answered=None, status=0)
+    return p
+
+
+def _lineage_ok(meta: dict) -> bool:
+    """`meta["lineage"]` and `meta["lineage_base"]`, when present, are objects; a base must leave room for EVERY
+    payload the ledger may build from it (a replay `restart` line that did not fit would be refused by the next
+    replay): the `uncertain` one and the `released` one, whose null fields can make it the longer (r1 F5)."""
+    if "lineage" in meta and type(meta["lineage"]) is not dict:
+        return False
+    if "lineage_base" in meta:
+        base = meta["lineage_base"]
+        if type(base) is not dict:
+            return False
+        for outcome in (UNCERTAIN, RELEASED):
+            if not _meta_ok({"lineage": lineage_payload(base, outcome, _AT_SAMPLE)}):
+                return False
+    return True
+
+
+def _triple_ok(t: Any) -> bool:
+    """An on-disk triple object `{ledger, epoch, ref}` (H6-17)."""
+    return (type(t) is dict and frozenset(t) == frozenset({"ledger", "epoch", "ref"})
+            and type(t["ledger"]) is str and bool(_HEX32_RE.fullmatch(t["ledger"]))
+            and type(t["epoch"]) is str and bool(_HEX32_RE.fullmatch(t["epoch"]))
+            and _is_int(t["ref"]) and t["ref"] >= 1)
+
+
+def _triple_obj(t: "Ref") -> dict:
+    return {"ledger": t[0], "epoch": t[1], "ref": t[2]}
+
+
 def _scope_ok(scope: Any) -> bool:
     """A tuple (in memory) or list (on disk): scope[0] a kind, every other element a non-empty str."""
     if not scope or type(scope[0]) is not str or not _KIND_RE.fullmatch(scope[0]):
@@ -273,9 +358,10 @@ _CLOSE = _Close()
 class Hold:
     """One reservation. Every method runs on the attached loop's thread; all are synchronous but `durable`. The
     resolve methods return True for the call that decided the outcome and False for any later one (a no-op)."""
-    __slots__ = ("ref", "amount", "scope", "state", "outcome", "gated", "fut", "_ledger")
+    __slots__ = ("ref", "amount", "scope", "state", "outcome", "gated", "fut", "base", "_ledger")
 
-    def __init__(self, ledger: "Ledger", ref: Ref, amount: int, scope: Scope, fut: "asyncio.Future") -> None:
+    def __init__(self, ledger: "Ledger", ref: Ref, amount: int, scope: Scope, fut: "asyncio.Future",
+                 base: Optional[dict] = None) -> None:
         self._ledger = ledger
         self.ref = ref
         self.amount = amount
@@ -284,6 +370,7 @@ class Hold:
         self.outcome: Optional[tuple] = None    # (RELEASED,) | (SETTLED, settled, overrun) | (UNCERTAIN, reason)
         self.gated = False
         self.fut = fut
+        self.base = base                        # the `reserved` line's `lineage_base`: a ticketed hold
 
     @property
     def seq(self) -> int:
@@ -301,12 +388,11 @@ class Hold:
     def mark_sent(self) -> None:
         self._ledger._hold_mark_sent(self)
 
-    def end(self) -> bool:
-        self._ledger._check_loop()
-        return self._ledger._end(self, "ended")
+    def end(self, meta: Optional[dict] = None) -> bool:
+        return self._ledger._hold_end(self, {} if meta is None else meta)
 
-    def release(self) -> bool:
-        return self._ledger._hold_release(self)
+    def release(self, meta: Optional[dict] = None) -> bool:
+        return self._ledger._hold_release(self, {} if meta is None else meta)
 
     def settle(self, cost: int, meta: Optional[dict] = None) -> bool:
         return self._ledger._hold_settle(self, cost, {} if meta is None else meta)
@@ -352,11 +438,11 @@ def _parse(raw: bytes) -> Any:
 
 
 def _type_ok(kind: str, o: dict) -> bool:
-    for k in ("seq", "cap", "amount", "ref", "settled", "overrun"):
+    for k in ("seq", "cap", "amount", "ref", "settled", "overrun", "count"):
         if k in o and not _is_int(o[k]):
             return False
     if kind == "header":
-        return (type(o["format"]) is str and o["format"] == FORMAT and type(o["ledger_id"]) is str
+        return (type(o["format"]) is str and o["format"] in READ_FORMATS and type(o["ledger_id"]) is str
                 and bool(_HEX32_RE.fullmatch(o["ledger_id"])) and type(o["created_at"]) is str
                 and bool(_AT_RE.fullmatch(o["created_at"])))
     if type(o["at"]) is not str or not _AT_RE.fullmatch(o["at"]):
@@ -368,11 +454,34 @@ def _type_ok(kind: str, o: dict) -> bool:
             return False
         if type(o["price_ref"]) is not str or not _PRICE_REF_RE.fullmatch(o["price_ref"]):
             return False
-    if kind == "uncertain" and (type(o["reason"]) is not str or not _REASON_RE.fullmatch(o["reason"])):
+    if kind in ("uncertain", "refused") and (type(o["reason"]) is not str or not _REASON_RE.fullmatch(o["reason"])):
         return False
-    if "meta" in o and not _meta_ok(o["meta"]):
+    if kind == "refused":
+        if type(o["session"]) is not str or not _ID_RE.fullmatch(o["session"]):
+            return False
+        if type(o["route"]) is not str or not _ID_RE.fullmatch(o["route"]):
+            return False
+        if o["run_id"] is not None and (type(o["run_id"]) is not str or not _ID_RE.fullmatch(o["run_id"])):
+            return False
+    if kind == "lineage-acked":
+        refs = o["refs"]
+        if type(refs) is not list or not refs or not all(_triple_ok(t) for t in refs):
+            return False
+        if "quarantined" in o:
+            q = o["quarantined"]
+            if type(q) is not list or not q:
+                return False
+            for e in q:
+                if (type(e) is not dict or frozenset(e) != frozenset({"source", "field"}) or not _triple_ok(e["source"])
+                        or type(e["field"]) is not str or not _FIELD_RE.fullmatch(e["field"])):
+                    return False
+    if "meta" in o and not (_meta_ok(o["meta"]) and _lineage_ok(o["meta"])):
         return False
     return True
+
+
+def _triple_key(t: dict) -> "Ref":
+    return (t["ledger"], t["epoch"], t["ref"])
 
 
 class _Replay:
@@ -384,9 +493,18 @@ class _Replay:
         self.last_seq = -1
         self.epochs: set = set()
         self.epoch: Optional[str] = None
-        self.reserved: Dict[int, Tuple[Scope, int]] = {}
+        # seq -> (scope, amount, epoch, lineage_base or None)
+        self.reserved: Dict[int, Tuple[Scope, int, str, Optional[dict]]] = {}
         self.resolved: set = set()
         self.acc: Dict[Scope, List[int]] = {}
+        self.known: set = set()                       # every triple a payload line named
+        self.outbox: Dict[Ref, dict] = {}             # payload lines with no ack yet
+        self.quarantined: Dict[Ref, str] = {}
+
+    def payload(self, triple: "Ref", meta: dict) -> None:
+        if "lineage" in meta:
+            self.known.add(triple)
+            self.outbox[triple] = meta["lineage"]
 
     def line(self, n: int, raw: bytes) -> None:
         p = self.path
@@ -404,7 +522,7 @@ class _Replay:
         seq = o.get("seq")
         if not _is_int(seq) or (n == 1 and seq != 0) or (n > 1 and seq <= self.last_seq):
             raise _corrupt("seq", n, p)
-        if type(kind) is not str or kind not in _KEYS or frozenset(o) != _KEYS[kind]:
+        if type(kind) is not str or kind not in _KEYS or frozenset(o) not in _KEYS[kind]:
             raise _corrupt("key", n, p)
         if not _type_ok(kind, o):
             raise _corrupt("type", n, p)
@@ -421,17 +539,38 @@ class _Replay:
                 raise _corrupt("epoch", n, p)
             if o["amount"] < 1 or o["cap"] < 0:
                 raise _corrupt("amount", n, p)
-            self.reserved[seq] = (tuple(o["scope"]), o["amount"])
+            self.reserved[seq] = (tuple(o["scope"]), o["amount"], o["epoch"], o["meta"].get("lineage_base"))
+        elif kind == "refused":
+            if o["epoch"] != self.epoch:
+                raise _corrupt("epoch", n, p)
+            if o["count"] < 1:
+                raise _corrupt("amount", n, p)
+            self.payload((self.ledger_id, o["epoch"], seq), o["meta"])
+        elif kind == "lineage-acked":
+            refs = [_triple_key(t) for t in o["refs"]]
+            for t in refs:
+                if t not in self.known:
+                    raise _corrupt("ack-orphan", n, p)
+            q = {}
+            for e in o.get("quarantined", ()):
+                src = _triple_key(e["source"])
+                if src not in refs:
+                    raise _corrupt("ack-quarantine", n, p)
+                q[src] = e["field"]
+            for t in refs:
+                self.outbox.pop(t, None)
+            self.quarantined.update(q)
         else:
             ref = o["ref"]
             if ref not in self.reserved:
                 raise _corrupt("orphan", n, p)
             if ref in self.resolved:
                 raise _corrupt("double", n, p)
-            scope, amount = self.reserved[ref]
+            scope, amount, epoch, _base = self.reserved[ref]
             if kind == "settled" and (o["settled"] < 0 or o["overrun"] < 0 or o["settled"] > amount):
                 raise _corrupt("amount", n, p)
             self.resolved.add(ref)
+            self.payload((self.ledger_id, epoch, ref), o.get("meta", {}))
             acc = self.acc.setdefault(scope, [0, 0, 0, 0, 0])
             if kind == "settled":
                 acc[_S] += o["settled"]
@@ -507,7 +646,16 @@ class Ledger:
         self._closing = False
         self._closed_fut: Optional[asyncio.Future] = None
         self._live: Dict[int, Hold] = {}
-        self._lines: Dict[int, Tuple[Hold, str]] = {}
+        self._lines: Dict[int, Tuple[Optional[Hold], str]] = {}    # a hold-less line (refused, ack) has None
+        self._line_futs: Dict[int, asyncio.Future] = {}             # a hold-less line's durable future
+        self._pending_outbox: Dict[int, Tuple[Ref, dict]] = {}      # a payload line not yet durable
+        # the outbox (loop-owned; replay fills it at open)
+        self._known: set = set()                                    # every durable payload triple
+        self._outbox: Dict[Ref, dict] = {}                          # durable payload lines with no durable ack
+        self._ack_pending: set = set()                              # triples in an ack line not yet durable
+        self._quarantined: Dict[Ref, str] = {}
+        #: called on the loop as `on_outbox(triple, payload)` when a payload line becomes durable (3c-6c's sender)
+        self.on_outbox: Optional[Callable[[Ref, dict], None]] = None
         self._inflight_since = 0.0
         self._in_bound = False
         self._bound_misused = False
@@ -620,10 +768,13 @@ class Ledger:
         batch = [_encode({"kind": "opened", "seq": seq, "epoch": epoch, "at": at})]
         for ref in rp.open_refs():
             seq += 1
-            batch.append(_encode({"kind": "uncertain", "seq": seq, "ref": ref, "reason": "restart", "meta": {},
+            scope, amount, r_epoch, base = rp.reserved[ref]
+            # a ticketed hold's restart line carries its row (built from its base; its triple keeps the OLD epoch)
+            meta = {} if base is None else {"lineage": lineage_payload(base, UNCERTAIN, at)}
+            batch.append(_encode({"kind": "uncertain", "seq": seq, "ref": ref, "reason": "restart", "meta": meta,
                                   "at": at}))
-            scope, amount = rp.reserved[ref]
             rp.acc.setdefault(scope, [0, 0, 0, 0, 0])[_UR] += amount
+            rp.payload((rp.ledger_id, r_epoch, ref), meta)
         try:
             _write_all(fd, b"".join(batch))
         except OSError as e:
@@ -632,7 +783,9 @@ class Ledger:
             _flush(fd)
         except OSError as e:
             raise _io_error("flush-opened", e, path)
-        return cls(path, fd, rp.ledger_id, epoch, seq + 1, rp.acc)
+        led = cls(path, fd, rp.ledger_id, epoch, seq + 1, rp.acc)
+        led._known, led._outbox, led._quarantined = rp.known, rp.outbox, rp.quarantined
+        return led
 
     @staticmethod
     def _replay(path: str, data: bytes) -> "_Replay":
@@ -761,11 +914,17 @@ class Ledger:
         self._next_seq += 1
         return s
 
-    def _submit(self, seq: int, data: bytes, hold: Hold, kind: str) -> None:
-        """Enqueue only. `_inflight_since` moves only when nothing was in flight."""
+    def _submit(self, seq: int, data: bytes, hold: Optional[Hold], kind: str, *,
+                fut: Optional[asyncio.Future] = None, outbox: Optional[Tuple[Ref, dict]] = None) -> None:
+        """Enqueue only. `_inflight_since` moves only when nothing was in flight. `fut` (a hold-less line's) resolves
+        when the line is durable; `outbox` enters the outbox then."""
         if not self._lines:
             self._inflight_since = time.monotonic()
         self._lines[seq] = (hold, kind)
+        if fut is not None:
+            self._line_futs[seq] = fut
+        if outbox is not None:
+            self._pending_outbox[seq] = outbox
         self._q.put((seq, data))
 
     def admit(self, scope: Scope, cap: int, bound: BoundFn, price_ref: str, meta: Optional[dict] = None) -> Hold:
@@ -782,7 +941,7 @@ class Ledger:
             raise LedgerMisuse("a malformed cap")
         if type(price_ref) is not str or not _PRICE_REF_RE.fullmatch(price_ref):
             raise LedgerMisuse("a malformed price_ref")
-        if not _meta_ok(meta):
+        if not _meta_ok(meta) or not _lineage_ok(meta):
             raise LedgerMisuse("a malformed meta")
         if not callable(bound) or inspect.iscoroutinefunction(bound) or asyncio.iscoroutinefunction(bound):
             raise LedgerMisuse("bound must be a plain function")
@@ -817,7 +976,8 @@ class Ledger:
         seq = self._take_seq()
         data = _encode({"kind": "reserved", "seq": seq, "epoch": self.epoch, "scope": list(scope), "cap": cap,
                         "amount": amount, "price_ref": price_ref, "meta": meta_c, "at": _now()})
-        hold = Hold(self, (self.ledger_id, self.epoch, seq), amount, scope, loop.create_future())
+        hold = Hold(self, (self.ledger_id, self.epoch, seq), amount, scope, loop.create_future(),
+                    meta_c.get("lineage_base"))
         hold.fut.add_done_callback(_retrieve)
         self._acc.setdefault(scope, [0, 0, 0, 0, 0])[_OUT] += amount    # visible to the next admit at once
         self._live[seq] = hold
@@ -827,32 +987,60 @@ class Ledger:
 
     def _resolve(self, hold: Hold, outcome: str, value: Any = None, meta: Optional[dict] = None) -> None:
         seq = self._take_seq()
-        line: Dict[str, Any] = {"seq": seq, "ref": hold.seq, "at": _now()}
+        at = _now()
+        meta = {} if meta is None else meta
+        if hold.base is not None and "lineage" not in meta:
+            # a ticketed hold's every resolution carries its row (H6-5, owner-ended, closed). It fits: admit checked
+            # the base alone (the ledger's own resolutions pass `{}`), `_fits` checked a caller's meta with it
+            meta = dict(meta)
+            meta["lineage"] = lineage_payload(hold.base, outcome, at)
+        line: Dict[str, Any] = {"seq": seq, "ref": hold.seq, "meta": meta, "at": at}
         if outcome == RELEASED:
             line["kind"] = "released"
             hold_outcome: tuple = (RELEASED,)
         elif outcome == SETTLED:
             settled, overrun = min(value, hold.amount), max(0, value - hold.amount)
-            line.update(kind="settled", settled=settled, overrun=overrun, meta=meta)
+            line.update(kind="settled", settled=settled, overrun=overrun)
             hold_outcome = (SETTLED, settled, overrun)
         else:
-            line.update(kind="uncertain", reason=value, meta=meta)
+            line.update(kind="uncertain", reason=value)
             hold_outcome = (UNCERTAIN, value)
         data = _encode(line)
         hold.state = RESOLVING
         hold.outcome = hold_outcome
         _set_unavailable(hold.fut, "the hold was resolved before its reservation was durable")
-        self._submit(seq, data, hold, "resolution")
+        outbox = (hold.ref, meta["lineage"]) if "lineage" in meta else None
+        self._submit(seq, data, hold, "resolution", outbox=outbox)
 
-    def _end(self, hold: Hold, reason: str) -> bool:
-        """The owner-end column: RELEASED if unsent, `uncertain {reason}` if sent, a no-op otherwise."""
+    def _end(self, hold: Hold, reason: str, meta: Optional[dict] = None) -> bool:
+        """The owner-end column: RELEASED if unsent, `uncertain {reason}` if sent, a no-op otherwise. `meta` is a
+        keys-called `end`'s (checked by `_hold_end`); the ledger's own ends (owner-ended, closed, the durable wait's
+        timeout) pass none, and a ticketed hold's row is then built from its base."""
         st = hold.state
         if st is PENDING or st is RESERVED:
-            self._resolve(hold, RELEASED)
+            self._resolve(hold, RELEASED, meta=meta)
             return True
         if st is SENT:
-            self._resolve(hold, UNCERTAIN, reason, {})
+            self._resolve(hold, UNCERTAIN, reason, {} if meta is None else meta)
             return True
+        return False
+
+    @staticmethod
+    def _keys_row(hold: Hold, meta: dict) -> None:
+        """H6-28 (3c-6, head 1024+13): ONE place computes a row. The ledger builds a payload only for its OWN
+        resolutions (restart, owner-ended, closed); a keys-called settle / uncertain / release / end of a TICKETED hold
+        (one whose `reserved` line carries `lineage_base`) must carry keys' full `/3` payload in `meta["lineage"]`."""
+        if hold.base is not None and "lineage" not in meta:
+            raise LedgerMisuse("a keys-called resolution of a ticketed hold carries meta['lineage'] (H6-28)")
+
+    def _hold_end(self, hold: Hold, meta: dict) -> bool:
+        self._check_loop()
+        st = hold.state
+        if st is PENDING or st is RESERVED or st is SENT:
+            self._keys_row(hold, meta)
+            if not self._fits(hold, UNCERTAIN if st is SENT else RELEASED, meta):
+                raise LedgerMisuse("a malformed meta")
+            return self._end(hold, "ended", json.loads(json.dumps(meta)))
         return False
 
     def _strand(self, hold: Hold) -> None:
@@ -882,15 +1070,33 @@ class Ledger:
             if ent is None:
                 continue
             hold, kind = ent
-            try:
-                self._apply_durable(hold, kind)
-            except Exception as e:
-                _note(logging.WARNING, "levain gw-keys: ledger durable step failed for seq %d (%s); hold stranded",
-                      hold.seq, type(e).__name__)
+            fut = self._line_futs.pop(s, None)
+            ob = self._pending_outbox.pop(s, None)
+            if hold is not None:
                 try:
-                    self._strand(hold)
-                except Exception:
-                    pass
+                    self._apply_durable(hold, kind)
+                except Exception as e:
+                    _note(logging.WARNING, "levain gw-keys: ledger durable step failed for seq %d (%s); hold stranded",
+                          hold.seq, type(e).__name__)
+                    try:
+                        self._strand(hold)
+                    except Exception:
+                        pass
+            if ob is not None:              # the line is in the file whatever happened to its hold: replay agrees
+                self._outbox_add(*ob)
+            if fut is not None:
+                _set_result(fut)
+
+    def _outbox_add(self, triple: Ref, payload: dict) -> None:
+        self._known.add(triple)
+        self._outbox[triple] = payload
+        fn = self.on_outbox
+        if fn is not None:
+            try:
+                fn(triple, payload)
+            except Exception as e:
+                _note(logging.WARNING, "levain gw-keys: ledger outbox listener failed for ref %d (%s)", triple[2],
+                      type(e).__name__)
 
     def _apply_durable(self, hold: Hold, kind: str) -> None:
         if hold.state is STRANDED:
@@ -932,7 +1138,20 @@ class Ledger:
                 self._strand(hold)
             except Exception:
                 pass
+        self._fail_line_futs("the ledger is unhealthy")
         self._lines.clear()
+
+    def _fail_line_futs(self, detail: str) -> None:
+        """Every hold-less line not durable: its future fails (an ack it carried is never counted) and its payload
+        stays out of the outbox (a replay finds it if its bytes reached the file)."""
+        futs = list(self._line_futs.values())
+        self._line_futs.clear()
+        self._pending_outbox.clear()
+        for f in futs:
+            try:
+                _set_unavailable(f, detail)
+            except Exception:
+                pass
 
     def _stalled(self) -> bool:
         """A line is in flight and no flush has RETURNED in the writer for DURABLE_TIMEOUT_S."""
@@ -984,15 +1203,27 @@ class Ledger:
             return
         raise LedgerMisuse("mark_sent with no passing send_gate before it")
 
-    def _hold_release(self, hold: Hold) -> bool:
+    def _hold_release(self, hold: Hold, meta: dict) -> bool:
         self._check_loop()
         st = hold.state
         if st is PENDING or st is RESERVED:
-            self._resolve(hold, RELEASED)
+            self._keys_row(hold, meta)
+            if not self._fits(hold, RELEASED, meta):
+                raise LedgerMisuse("a malformed meta")
+            self._resolve(hold, RELEASED, meta=json.loads(json.dumps(meta)))
             return True
         if st is SENT:
             raise LedgerMisuse("release on a sent hold")
         return False
+
+    @staticmethod
+    def _fits(hold: Hold, outcome: str, meta: Any) -> bool:
+        """A caller's resolution meta, with the payload `_resolve` will add to it for a ticketed hold."""
+        if not _meta_ok(meta) or "lineage_base" in meta or not _lineage_ok(meta):
+            return False
+        if hold.base is not None and "lineage" not in meta:
+            return _meta_ok(dict(meta, lineage=lineage_payload(hold.base, outcome, _AT_SAMPLE)))
+        return True
 
     def _hold_settle(self, hold: Hold, cost: int, meta: dict) -> bool:
         self._check_loop()
@@ -1000,7 +1231,8 @@ class Ledger:
         if st is SENT:
             if not _is_int(cost) or cost < 0:
                 raise LedgerMisuse("a malformed cost")
-            if not _meta_ok(meta):
+            self._keys_row(hold, meta)
+            if not self._fits(hold, SETTLED, meta):
                 raise LedgerMisuse("a malformed meta")
             self._resolve(hold, SETTLED, cost, json.loads(json.dumps(meta)))
             return True
@@ -1014,13 +1246,138 @@ class Ledger:
         if st is SENT:
             if type(reason) is not str or not _REASON_RE.fullmatch(reason) or reason in RESERVED_REASONS:
                 raise LedgerMisuse("a malformed or reserved reason")
-            if not _meta_ok(meta):
+            self._keys_row(hold, meta)
+            if not self._fits(hold, UNCERTAIN, meta):
                 raise LedgerMisuse("a malformed meta")
             self._resolve(hold, UNCERTAIN, reason, json.loads(json.dumps(meta)))
             return True
         if st is PENDING or st is RESERVED:
             raise LedgerMisuse("uncertain before SENT")
         return False
+
+    # -- the lineage outbox (3c-6a) -------------------------------------------------------------------------------
+
+    def refused(self, session: str, route: str, reason: str, count: int, meta: dict,
+                run_id: Optional[str] = None) -> Tuple[Ref, "asyncio.Future"]:
+        """Queues one `refused` line (keys writes it at a refusal window's close, H6-10) and returns its triple
+        `(ledger_id, epoch, own seq)` and a future that resolves when the line is durable (or fails
+        `LedgerUnavailable`). A `meta["lineage"]` payload enters the outbox then."""
+        self._check_loop()
+        if not self._healthy or self._closing:
+            raise LedgerUnavailable("the ledger is %s" % ("closing" if self._healthy else "unhealthy"))
+        for v in (session, route):
+            if type(v) is not str or not _ID_RE.fullmatch(v):
+                raise LedgerMisuse("a malformed session or route")
+        if run_id is not None and (type(run_id) is not str or not _ID_RE.fullmatch(run_id)):
+            raise LedgerMisuse("a malformed run_id")
+        if type(reason) is not str or not _REASON_RE.fullmatch(reason):
+            raise LedgerMisuse("a malformed reason")
+        if not _is_int(count) or count < 1:
+            raise LedgerMisuse("a malformed count")
+        if not _meta_ok(meta) or "lineage_base" in meta or not _lineage_ok(meta):
+            raise LedgerMisuse("a malformed meta")
+        meta_c = json.loads(json.dumps(meta))
+        loop = self._loop
+        assert loop is not None
+        seq = self._take_seq()
+        triple = (self.ledger_id, self.epoch, seq)
+        data = _encode({"kind": "refused", "seq": seq, "epoch": self.epoch, "session": session, "run_id": run_id,
+                        "route": route, "reason": reason, "count": count, "meta": meta_c, "at": _now()})
+        fut = loop.create_future()
+        fut.add_done_callback(_retrieve)
+        outbox = (triple, meta_c["lineage"]) if "lineage" in meta_c else None
+        self._submit(seq, data, None, "refused", fut=fut, outbox=outbox)
+        return triple, fut
+
+    def unacked(self) -> List[Tuple[Ref, dict]]:
+        """Every durable payload line with no durable ack, in ref order: `[(triple, payload)]`. A triple whose ack
+        line is queued but not durable is still listed (it is not counted yet)."""
+        self._check_read()
+        return [(t, self._outbox[t]) for t in sorted(self._outbox, key=lambda t: t[2])]
+
+    @property
+    def outbox_size(self) -> int:
+        """`len(unacked())`, in O(1): the measure `LINEAGE_OUTBOX_MAX` is checked against (H6-11)."""
+        return len(self._outbox)
+
+    @property
+    def outbox_committed(self) -> int:
+        """The outbox this ledger is committed to (r1 F1): `outbox_size`, plus every payload line queued but not yet
+        durable, plus every live ticketed hold not yet resolved (each resolves with exactly one payload). keys checks
+        its bound against this measure before anything that adds a payload, so the outbox never passes the bound."""
+        owed = sum(1 for h in self._live.values() if h.base is not None and h.outcome is None)
+        return len(self._outbox) + len(self._pending_outbox) + owed
+
+    @property
+    def quarantined(self) -> Dict[Ref, str]:
+        """Every durably acked quarantine: `{triple: field}` (H6-8's counter reads its size)."""
+        return dict(self._quarantined)
+
+    def ack(self, triples: Any, quarantined: Optional[Dict[Ref, str]] = None) -> "asyncio.Future":
+        """Queues one `lineage-acked` line for the triples CONTROL acked (`quarantined`: the ones it quarantined, by
+        field) and returns a future that resolves after the line's flush. The triples leave the outbox ONLY in the
+        done-callback of the line's own future (R4 §3: keys counts an ack only after its line is fsynced); a failed
+        flush counts nothing. A triple that is not a durable payload line is refused `LedgerMisuse` before anything
+        is queued (its line would be `ack-orphan` to the next replay). Triples already acked, or in an ack line not
+        yet durable, are dropped; with none left, no line is written and the future is already resolved.
+
+        Two consequences of that drop (r1 review, documented, no behavior change): a quarantine given for a dropped
+        triple is dropped with it, which loses nothing while CONTROL answers a triple's quarantine from its sink (the
+        in-flight line carries the same one; if that line fails, the triple stays unacked and its resend is answered
+        again); and `unacked()` still lists a triple whose ack line is in flight, so a sender that re-sends it (a new
+        attachment while the old one's ack line is not yet durable) gets an already-resolved future and sends again
+        at once, for as long as that line takes to become durable or the ledger faults."""
+        self._check_loop()
+        loop = self._loop
+        assert loop is not None
+        q = {} if quarantined is None else quarantined
+        if type(q) is not dict:
+            raise LedgerMisuse("a malformed quarantine map")
+        want: List[Ref] = []
+        for t in triples:
+            if (type(t) is not tuple or len(t) != 3 or not _is_int(t[2]) or type(t[0]) is not str
+                    or type(t[1]) is not str or t not in self._known):
+                raise LedgerMisuse("an ack of %r, which is no durable payload line" % (t,))
+            if t not in want:
+                want.append(t)
+        for t, field in q.items():
+            if t not in want or type(field) is not str or not _FIELD_RE.fullmatch(field):
+                raise LedgerMisuse("a malformed quarantine for %r" % (t,))
+        new = [t for t in want if t in self._outbox and t not in self._ack_pending]
+        outer = loop.create_future()
+        outer.add_done_callback(_retrieve)
+        if not new:
+            outer.set_result(None)
+            return outer
+        if not self._healthy or self._closing:
+            raise LedgerUnavailable("the ledger is %s" % ("closing" if self._healthy else "unhealthy"))
+        new.sort(key=lambda t: t[2])
+        line: Dict[str, Any] = {"kind": "lineage-acked", "refs": [_triple_obj(t) for t in new], "at": _now()}
+        qn = {t: q[t] for t in new if t in q}
+        if qn:
+            line["quarantined"] = [{"source": _triple_obj(t), "field": qn[t]} for t in new if t in qn]
+        seq = self._take_seq()
+        line["seq"] = seq
+        inner = loop.create_future()
+        inner.add_done_callback(functools.partial(self._ack_done, new, qn, outer))
+        self._ack_pending.update(new)
+        self._submit(seq, _encode(line), None, "lineage-acked", fut=inner)
+        return outer
+
+    def _ack_done(self, refs: List[Ref], q: Dict[Ref, str], outer: "asyncio.Future", inner: "asyncio.Future") -> None:
+        """The one place an ack is counted: the ack line's own future, resolved by `_durable` after its flush."""
+        for t in refs:
+            self._ack_pending.discard(t)
+        if inner.cancelled() or inner.exception() is not None:
+            exc = None if inner.cancelled() else inner.exception()
+            if not outer.done():
+                outer.set_exception(exc if exc is not None else LedgerUnavailable("the ack was cancelled"))
+            return
+        for t in refs:
+            self._outbox.pop(t, None)
+        self._quarantined.update(q)
+        if not outer.done():
+            outer.set_result(None)
 
     # -- close ---------------------------------------------------------------------------------------------------
 
@@ -1053,3 +1410,4 @@ class Ledger:
             await asyncio.wait_for(asyncio.shield(self._closed_fut), deadline_s)
         except asyncio.TimeoutError:
             self._stop.set()
+            self._fail_line_futs("the ledger closed before the line was durable")

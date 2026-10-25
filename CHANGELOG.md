@@ -7,6 +7,176 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **A provider can report a task's spend as tokens from transcripts.** The topology contract accepts `cost.source: "transcript"`
+  (tokens only, never a price) and the Work lens draws it as "N tokens from transcripts". Levain's own tasks still report no cost:
+  none of them names the session that works it.
+- **Per-device cockpit pairing (the server half).** A device that already holds a cockpit credential mints a one-time
+  code (`POST /cockpit/pair/offer`, 128-bit, ten minutes, single use); a new device trades it for its OWN token at
+  `POST /cockpit/pair/claim`, the one route that needs no credential. Each paired device is revocable alone
+  (`POST /cockpit/pair/revoke`), and a revoke takes the devices it paired with it, voids their open codes, cancels
+  their waiting requests and ends their open change streams. A paired token opens what the shared write token opens
+  and nothing more: every passkey-signed act still needs the passkey. Only token hashes are stored, in `cockpit.db`.
+  `levain cockpit pair` mints a code from the box itself (it refuses to print one into a pipe unless given
+  `--print`), and `levain cockpit pair --revoke-all` ends every paired device.
+- **The pairing page and the Devices panel (pairing P2).** The cockpit's Devices panel lists the paired devices, mints a
+  pairing link and revokes a device alone. A new device opens the offering device's `/pair#code=...` link (it also opens
+  from another site as a top-level navigation) and trades the code for its own key; "Pair it again" asks before it
+  replaces a key this browser already holds. No QR code is drawn: the link is the offer.
+
+### Changed
+- **The seed memory files no longer count layers.** `memory.md` and `partnership.md` now say the agent's memory is never a log
+  plus a memory file: a governed, versioned state machine (an append-only episode log, consolidated by one writer into
+  continuity, an immune system that decides what may graduate, and a pattern tier recalled on cue).
+- **Levain now requires anneal-memory 1.0.2.** anneal 1.0.2 forms no association links and ignores the affect
+  input; the seed's wrap steps no longer say `prepare_wrap` returns association context, so a fresh install
+  reads its 1.0.2 migration proposal as already reconciled instead of pending.
+
+### Fixed
+- **The phone server no longer writes its token into its log.** With `--link-file`, the token goes only into that
+  0600 file, and the line naming the file is printed only after the file holds the link. Without `--link-file` the
+  link is printed as before, for a person at a terminal.
+- **A broker that is not running answers a paired device with 503, never a refusal that drops its token.** While the
+  broker is starting, owned by another process or disabled, a request carrying a paired token gets `503
+  broker_unavailable` with `Retry-After: 2`.
+
+## [0.11.23] — 2026-10-24
+
+### Added
+- **The cockpit's grant "revoke" button signs with your passkey.** On a cockpit served with a `signer=` over the same
+  consent queue its grant cards come from, the button
+  runs the phone page's own revoke ceremony: one passkey prompt, and the grant is revoked in the authority log. The
+  server builds the link and the page checks the challenge is over that link before the prompt. The new routes,
+  `GET /cockpit/grant/list.json` and `POST /cockpit/grant/<id>/revoke-challenge` and `.../revoke`, ride the sign
+  routes' gate. Everywhere else the button still copies `levain consent grant revoke`, and the copy line stays under
+  the signing button.
+- **A grant card says why a passkey cannot revoke it.** When the page you are on cannot ask your passkey for a revoke
+  (a passkey made on `localhost`, or a page address the passkey would refuse), the grant list names the reason and
+  points to `levain consent grant revoke` instead of offering a button that fails. The phone page's Grants tab and the
+  cockpit's grant card both do this.
+- **The agents graph marks who is waiting on you.** The desk and any seat with an open decision carry a red mark and a
+  "!N" count ("9+" past nine). The desk's mark is an engraved bezel that lights once when a decision arrives, with the
+  count on a short callout beside it; a seat's mark is a red ring. A provider sets `needs_open` on the hub or a node,
+  and may add `needs_first_card` (the id of the first decision's card): then the count is a button that opens that
+  card, and tapping the node itself still opens or messages the seat. Every animation stops by itself (the bezel
+  lights once, a seat's ring flashes a few times), and none runs under reduced motion.
+
+### Changed
+- **A passkey revoke signed on a port is accepted.** The authority log now takes a passkey's `revoke_grant` signed on
+  `https://<the passkey's own name>:<any port>`, as well as on `https://<name>`. So a cockpit served on a port, such
+  as `https://<name>:8443`, signs a grant revoke with the passkey instead of copying the command. Only the passkey's
+  own name is accepted, and only on a revoke. Every other passkey signature in the log must still come from exactly
+  `https://<name>`.
+- **A compose card pre-selects only the readers its provider declares.** A provider that relied on 0.11.21's built-in
+  default reader, seat tap or departed-seat recovery must declare the keys below. Without them, the card starts with
+  nothing pressed, so a message goes to everyone. Tapping a seat on the agents graph presses that seat's chip only
+  when the card declares `transient_prefix` and the seat is among its readers; otherwise it opens the agent page, as
+  before. A departed reader's refusal is shown as the provider sent it. The departed-reader notice now reads "that
+  reader is gone, choose again".
+
+### Fixed
+- **The cockpit message card's default reader and its departed-reader recovery are declared by the provider, not built
+  into the page.** 0.11.21 pre-selected one named agent and recognised one refusal wording in the page's own script,
+  and its entry described that agent as Levain's own. A compose `recipient` field now takes three optional keys,
+  validated beside `enum` and refused on any other field type:
+  - `default`: `enum` ids pressed at the start, spelled exactly as in `enum`. Empty or absent means nothing is pressed.
+  - `transient_prefix`: the start of every id that can leave the roster between draw and send. The agents graph
+    presses the chip whose id is `transient_prefix` followed by the seat's roster name.
+  - `gone_match`: a case-insensitive substring of the refusal that says a chosen id has left. It is matched against
+    the error code and the message together, as the page receives them. A stable error code is the safest thing to
+    match.
+  The departed-reader recovery needs both `transient_prefix` and `gone_match`, so a `gone_match` without a prefix is
+  refused at registration. The graph tap needs only `transient_prefix`.
+
+### Known edges
+- A grant revoke is accepted from the passkey's name on any port, so another program on that machine serving the same
+  name on another port (a second `tailscale serve` port) could ask the passkey for a revoke. You would see the Face ID
+  prompt, and a revoke only removes a grant.
+- One revoke waits per grant on each page server: a second challenge for the same grant (another tab) replaces the
+  first, whose passkey answer is then refused, and you ask again.
+- A metered call is priced by the request's `model` alone. A fallback list (`models`) or a `route` in the body is not
+  read, and neither is the model the provider's response says ran. No route in this release reaches a vendor that
+  honours them; the vendor routes that do will refuse both and settle from the model that ran.
+
+## [0.11.22] — 2026-10-24
+
+### Added
+- **The cockpit can sign answers and messages with your passkey.** An embedder that files levain sign requests (the
+  phone page's ceremony) can now have the cockpit page run the same ceremony. `make_server` takes `signer=` (a
+  `levain.consent.sign.Signer` pinned to the page it is served on with `page_origin`), `extra_hosts=` (the bare https
+  name a reverse proxy such as `tailscale serve` forwards to it) and `compose_signer=`. With a signer the cockpit serves
+  `GET /cockpit/sign.json` and `POST /cockpit/sign/<id>/{challenge,answer,deny}`, each behind the write token, the
+  Host allowlist and same-origin rules a write has. A question or note whose caller sets `sign_request` shows that
+  request's own options as buttons; one tap asks your passkey and records a signature that `ssh-keygen -Y verify`
+  accepts, the first answer winning when the phone and the cockpit answer one request. A cancelled passkey signs
+  nothing and keeps what you typed. On any page other than the pinned one the card says where to sign and offers no
+  other answer. A verb declared with `ActionVerb(sign=True)` is sent from its compose box only after your passkey signs
+  its params: the page asks `POST /cockpit/sign/compose` (the `compose_signer` files the request; its `ValueError` is
+  shown to you), runs the ceremony, then posts the verb with `sign_request`, which the verb's own effect must verify.
+  Each draft carries one id (`client_txn`) for its whole life: the compose route names the same request for it while
+  that request is open, and the send is keyed by it, so a lost reply, a retry or a reload files one request and sends
+  once, at any tier: a signed verb is deduped by that key whatever its `idempotent` says. The kernel refuses a signed
+  verb on every route, a dry run included, before its handler runs, unless its `sign_request` names a request a
+  compose route filed for that verb and exactly those params and the Signer holds signed, and its `idempotency_key` is
+  `sign-` plus that draft's id (a signed request is sent under one key only); and `ActionVerb(sign=True, job=True)` is
+  refused. Which request each draft filed is kept in the Signer's sign directory (`sign/.compose.json`), so a restart
+  or any number of other drafts never forgets it: a send that landed and lost its reply is answered with its first
+  reply when it is sent again within the at-most-once window (24 hours), and runs once. A record goes when its request is denied, removed or expires unsigned,
+  and at the latest 48 hours after its compose; a record file grown past what a read takes is pruned by the next
+  compose once its requests have left. A `make_server` that fails part way through attaching to the caller's
+  cockpit undoes its own attaches, keeping any panel registered meanwhile, and releases its pin on the Signer. `GET /cockpit/sign/<id>.json` reads one request whatever the listing's
+  cap. Without a `compose_signer` a signed verb is not sent at all. A request through an `extra_hosts` name is treated as
+  off the box: the cockpit's reads need the token there too. `levain.consent.sign.passkey_key_source` is the passkey
+  key source the phone page uses, for an embedder building the Signer.
+- **A passkey verifier can be pinned to an https page with a port.** `levain.consent.passkey` accepts an explicit
+  `page_origin` of `https://<name>:<port>` for a name other than localhost; without one, the portless rule is
+  unchanged for every existing verifier.
+
+### Known edges
+- A signed send refused outright for a reason other than its signature (a confirm, a stale row) drops its signed draft,
+  so sending it again asks the passkey once more.
+- Each tab gives a signed draft its own id, so the same words sent from two tabs file two requests.
+- Once 1024 records are live on a queue (`COMPOSE_LIVE_MAX`), a new draft's compose is refused 429 `too_many_open`
+  ("finish or deny open requests first") and files nothing, while a draft already recorded is still answered. Composes
+  of new drafts running at once can each pass the check, so the count can pass 1024 by the composes in flight.
+- Each compose prunes the queue's records before it files, and other drafts' composes wait for it; with many live
+  records that wait grows.
+- A proxy is recognised by the `extra_hosts` names and forwarding headers; a proxy that sends neither and names
+  `127.0.0.1` reads as local.
+
+## [0.11.21] — 2026-10-24
+
+### Added
+- **`levain session adopt SESSION --repo PATH` takes a finished session's work into your repo, after showing you what it
+  is.** `levain session discard SESSION` and `levain session restore SESSION` move a retained session to trash and back.
+  The `session` command stays out of `levain --help`, and a session still needs the root helpers, which have no public
+  install path yet, so this reaches you through a build that has them. Levain checks the repo first: it must be a git
+  root (not a subdirectory, linked worktree or submodule), use the same object format as the session's, not be shallow
+  or partial, and carry the session's recorded base commit. A session that recorded no base is refused
+  `base-unrecorded`. Levain then opens the session's export in a confined child and prints a preview: the new commits
+  with author, committer and message, the changed paths from the base, config-surface files, symlinks and their
+  targets, and names that collide by case or Unicode form. Everything printed is escaped. Then it asks what to take:
+  `head`, `wip` (only the refs the export carries) or `none`. `--take head|wip|none` answers for a script; with no
+  terminal and no `--take` it refuses `bad-argument` before doing anything. The take copies objects into your repo and
+  moves the ref, never runs your repo's hooks, and never looks for a parent repo. After the preview Levain prints the
+  private copy's directory and the one command that removes it. An adopt that fails before the preview removes the
+  private copy; after it, Levain removes the bundle and index and leaves the directory for you to remove. `discard` and `restore`
+  answer `session-busy` while the session is in use, `not-retained:trash` for a session already in trash and
+  `not-trash:retained` for one not in trash; a discard or restore that stopped part-way is refused
+  `discard-incomplete:<phase>` (`restore-incomplete:<phase>` for a restore) and finishes when you run it again. This
+  replaces the 0.11.20 Groundwork line saying nothing calls the adopt stages. Tested on macOS.
+- **Message an agent from the agents graph in the cockpit.** Tapping an agent's node presses its recipient chip in the
+  message card, scrolls to the card and focuses the message box. `fanin`, the coordinating agent, is pre-selected, and
+  un-pressing every chip sends to everyone. At phone width (720 px and narrower) the chips give way to a picker with the
+  same choices. The pick survives the card's refresh and clears when a send lands; a send refused because the agent has
+  gone says the agent is gone, asks you to choose again and redraws the chips. Known edges: an agent waiting on a card keeps its
+  card-opening tap, so it is not messageable by tap; and an empty inbox card has no box to focus.
+- **A metered route's holds survive a restart of the credential-holding process.** Each hold is written to the hold
+  journal (`keys/ledger.jsonl`) and flushed to disk before the call it covers is sent. On the next start, every hold
+  with no recorded outcome is booked as uncertain at its full amount, so a restart cannot make a session's cap look
+  emptier than it is. If the journal cannot be opened, the credential-holding process refuses to start (exit 3). If the
+  journal's writer fails or stalls while running, it admits and sends nothing from then on, and every unresolved hold
+  stays charged at its full amount.
+
 - **Metered routes hold each call's estimated cost against the route's per-session cap.** On a metered base route
   (a `levain-routes-base/2` map with a price table) the credential-holding process buffers the request body, checks
   the model against the route's price table, writes the output ceiling into the body and holds the call's estimated
@@ -26,8 +196,78 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   A call that reports no usage, or whose usage could not be read, is charged its whole hold. When a call costs more
   than was held for it, it is charged in full and its session is stopped: the session's later calls are refused
   `budget-overrun` (402), while calls already running finish and are charged from their own usage. The stop lasts
-  until the session ends, or until the credential-holding process restarts (the stop is kept in its memory). A streamed openai-chat request that does not say whether it wants usage is sent asking for
-  it, so the provider adds one final chunk carrying the usage.
+  until the session ends, or until the credential-holding process restarts: the stop is kept in the process's memory,
+  not in the hold journal above, so holds persist across a restart and the stop does not. A streamed openai-chat
+  request that does not say whether it wants usage is sent asking for it, so the provider adds one final chunk
+  carrying the usage.
+
+### Changed
+- **Health, the graph panel and `levain wrap` stop treating Hebbian links as a sign of life.** Levain's anneal-memory
+  requirement is unchanged (`>=1.0.0,<2`); everything below holds with anneal-memory 1.0.1 installed except where it
+  says otherwise.
+  - Health is now `live` (the store reads and at least one wrap committed) or `no wraps yet`. The date of the last wrap is
+    shown as a fact. A fresh store no longer reads "DARK · 0 links". `write_path_live` stays in the health data for one
+    more release (true when the status is live) so an older reader does not break.
+  - The link count, strength and density figures leave the health panel. The graph panel keeps drawing the links already
+    there and says `not formed` when the graph is empty. When anneal-memory 1.0.2 or later is installed and reports that
+    it has stopped forming links, it also says `no new links since wrap N`; with 1.0.1 it says nothing extra.
+  - Wrap rows show `+N links` only for older wraps that formed some.
+  - `levain wrap` no longer prints an `associations:` line (it would read 0 on every wrap) and no longer sends an
+    affective state. It prints `wrap: #N` when the installed anneal names the wrap it committed (anneal-memory 1.0.2 or
+    later). `--affect-tag` and `--affect-intensity` still parse, do nothing, and print one line saying they are
+    deprecated.
+  - The seed memory files teach two layers (episodes and continuity) with the immune system, and drop the Hebbian and
+    limbic sections. Run `levain update` to see the proposed changes to your copy.
+  - Known edge: once anneal-memory 1.0.2 or later is in use, a process still on 1.0.1 can open a store that a newer
+    process has touched and keeps forming links on it. Keep every install that shares a store (this one, other tools, the
+    uv tool, hub venvs) on the same anneal-memory version.
+- **The wheel ships the Unicode license** (`LICENSES/Unicode-3.0.txt`) with the confusables table the adopt preview uses.
+
+### Removed
+- **The keys service no longer relays websockets.** The relay added in 0.11.20 (see its Groundwork entry) is deleted:
+  every brokered route the keys service serves is now metered, and a metered route refuses an upgrade
+  (`body-unbounded:websocket`), so nothing could reach it. The front's own websocket path is unchanged.
+
+### Fixed
+- **The cockpit no longer breaks at half-screen widths.** At 864 to 1040 px the jar and live dot sat over the tabs; the
+  weather card's foot stacked three items in one place; a strip segment shrank to 2 px; tile status rows and big-figure
+  labels ran past the tile edge; and row verbs spilled over the meta line in a 341 to 520 px column. A status line that
+  is cut now has the full text as its tooltip.
+- **Drop from the phone survives a store change and a fast laptop clock.** A refusal because the phone's clock is ahead
+  of the laptop's now retries with a fresh send time, and the refusal names the gap in minutes. A drop listing that
+  arrives late no longer overwrites the store the page already adopted. A signed drop for another store on an item bound
+  to a store is refused `other_store`. The envelope review now carries the page's store id, and the signing challenge
+  binds to the store the review kept: a store replaced or gone between the review and Sign is refused `other_store`,
+  and the challenge never creates a store.
+- **The gateway log's `bytes_up` counts only the body bytes handed upstream.**
+- **The keys service arms its shutdown triggers before it first listens**, so a SIGINT arriving the moment its socket
+  appears takes the graceful path instead of ending the process with a signal exit.
+
+### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- **The install helper's `repair --source PATH` is built.** It upgrades an existing install to a new generation, and it
+  replaces 0.11.20's "not built yet". It checks that the `--source` package is writable by the operator alone and that
+  the accounts its plan renders still exist (`account-missing`), stages and hashes a copy of the new code
+  (`source-changed` if the source moved), places it, probes it, then execs into it so the new code finishes the work
+  holding both install locks. A run that stopped after placing a generation resumes into it; if the staged copy no
+  longer hashes the same it is removed and the run refuses `source-required:<id>`. No `levain` command runs it.
+- **The keys service attaches to the isolation controller.** It holds one long-lived attachment and refuses every token
+  while it is not attached. Losing the attachment fails closed on both sides: keys drops every front, and the
+  controller revokes every egress session. A front that disappears, or never claims its registration within 10
+  seconds of being armed, gets its session revoked. Keys reconciles its cached tokens with the controller once a
+  minute, and a reconcile that goes unanswered three times in a row ends the attachment. A session stopped for
+  spending past its hold is recorded by the controller for display and is not revoked. A failed read loop or reconcile
+  ends the attachment instead of leaving it half-alive; a short-lived attachment backs off before the next try; and a
+  spend-overrun notice is resent until acknowledged, or ends the attachment. The controller's service has a single
+  entry point, `levain.slot.control.serve`. Nothing starts either process from a `levain` command yet.
+- **Dispatch route maps.** The controller accepts a signed dispatch route map (`ROUTE-SUBMIT`), verifies it against the
+  routes trust anchor, activates it as a numbered generation behind a durable head, and tells the keys service to
+  reload it. Keys keeps its own durable head, refuses an older or rolled-back generation, and refuses every dispatch
+  route until a valid reload. An equal generation and digest resubmitted converges instead of failing. A route id
+  that is both a base route and a dispatch route is refused `keys-unavailable` (`route-collision`) when used, and so is
+  any route while the dispatch ids cannot be read. A map is refused `routemap-signature`, `routemap-store`,
+  `routemap-generation`, `routemap-invalid:<part>` or `routemap-verifier`. No session carries a dispatch pin yet, so
+  every dispatch route is still refused.
+- **The keys service's `--unmetered` flag is removed.** It was an internal flag on a process you do not start.
 
 ## [0.11.20] — 2026-10-23
 

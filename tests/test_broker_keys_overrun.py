@@ -42,8 +42,7 @@ CAP = 10_000_000   # far above every charge here: no refusal below is `budget-ex
 
 @pytest.fixture(params=PYS, ids=lambda p: "usr-bin-python3" if p == "/usr/bin/python3" else "venv")
 def py(request):
-    if not R.h11_available(request.param):
-        pytest.skip("h11 is not importable by %s (named skip, not a pass)" % request.param)
+    R.require_h11(request.param)
     return request.param
 
 
@@ -331,13 +330,14 @@ class _Hold:
 
     def __init__(self, amount: int, fail: "Exception | None" = None) -> None:
         self.amount, self.fail, self.settled = amount, fail, None
+        self.base = None   # an interactive hold: no lineage row (S1 3c-6c)
 
     def settle(self, cost: int, meta: dict) -> None:
         if self.fail is not None:
             raise self.fail
         self.settled = cost
 
-    def uncertain(self, reason: str) -> None:
+    def uncertain(self, reason: str, meta: "dict | None" = None) -> None:
         raise AssertionError("not reached: the reader reports usage")
 
 
