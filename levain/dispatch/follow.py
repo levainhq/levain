@@ -13,8 +13,9 @@ Slice 1 handles:
 - a ``state`` event into a terminal session state (``jobs._SESSION_TERMINAL``) that carries a verifier report digest or
   refusal: :meth:`JobStore.record_verification` with the inputs the caller's ``resolve`` gives for it, then
   ``ARTIFACT-ACK {ticket, verifier_report_digest}`` (no digest for ``verifier_report_refused``). The ACK goes only
-  when the store holds THIS event's outcome (written now, or :class:`levain.dispatch.jobs.AlreadyRecorded`); a run
-  holding another report's record stops the follower (``record-conflict``); a job ended by another cause is passed
+  when the store holds THIS event's outcome (written now, or :class:`levain.dispatch.jobs.AlreadyRecorded`: this
+  ticket and this digest, never the digest alone); a run holding another report's or another ticket's record stops the
+  follower (``record-conflict``); a job ended by another cause is passed
   WITHOUT an ACK, retention falling back to ``dispatch_retain_days``;
 - an ``artifact`` event: passed WITHOUT an ACK. Nothing reads the exported artifact yet, and an ACK before that read
   would let the reaper trash work dispatch never took; retention falls back to ``dispatch_retain_days``;

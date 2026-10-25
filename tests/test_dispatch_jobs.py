@@ -1149,9 +1149,10 @@ def test_the_run_records_table_is_append_only(store, repo):
     verify(store, repo, job, 0)
     conn = sqlite3.connect(store.path, isolation_level=None)
     try:
-        for sql in ("UPDATE run_records SET digest = 'x'", "DELETE FROM run_records",
-                    f"INSERT OR REPLACE INTO run_records VALUES ('{job.id}', 0, 'r', 'd', 'e', 'a')",
-                    f"INSERT INTO run_records VALUES ('{job.id}', 0, 'r', 'd', 'e', 'a')"):
+        for sql in ("UPDATE run_records SET digest = 'x'", "UPDATE run_records SET ticket = 'x'",
+                    "DELETE FROM run_records",
+                    f"INSERT OR REPLACE INTO run_records VALUES ('{job.id}', 0, 'r', 'd', 'e', 'a', 't')",
+                    f"INSERT INTO run_records VALUES ('{job.id}', 0, 'r', 'd', 'e', 'a', 't')"):
             with pytest.raises(sqlite3.IntegrityError, match="written once|never replaced"):
                 conn.execute(sql)
     finally:
@@ -1479,13 +1480,12 @@ def test_a_run_record_insert_refused_for_another_reason_is_a_dispatch_error(stor
     assert store.get(job.id).state == "verifying" and store.run_records(job.id) == []
 
 
-def test_a_report_digest_binds_exactly_one_ticket(store, repo):
-    """RULINGS_OBS 15 (codex 2/3, verify r1): a run record's envelope digest covers the ticket. The digest is over the
-    envelope file's bytes, the envelope holds the ticket, and check_envelope refuses an envelope whose ticket is not
-    the run's: so a record under digest D was written for the one ticket D's bytes name, and an event of another
-    ticket naming D carries a byte copy of that envelope, which its own check refuses (envelope-ticket). A repeat
-    matched on (job, run, digest) therefore holds the ticket too, with no ticket column on the run record."""
-    from levain.dispatch.jobs import AlreadyRecorded
+def test_another_tickets_event_naming_a_stored_digest_is_a_conflict_never_a_repeat(store, repo):
+    """RULINGS_OBS 18 (codex 2/3/15 + MED, verify r3): the envelope digest binds one ticket (another ticket, another
+    digest; check_envelope refuses the copy with envelope-ticket), but a session can publish a byte copy of another
+    session's envelope under its own ticket. After ticket A's report is stored, ticket B's event naming A's digest is
+    a RecordConflict (the run record keeps A's ticket), never AlreadyRecorded, and nothing is written."""
+    from levain.dispatch.jobs import AlreadyRecorded, RecordConflict
     from levain.dispatch.verifier_report import ReportRefused, check_envelope
     from tests import test_dispatch_verifier_report as tvr
 
@@ -1498,8 +1498,72 @@ def test_a_report_digest_binds_exactly_one_ticket(store, repo):
         check_envelope(raw, expected=other, event_digest=digest)
     assert exc.value.name == "envelope-ticket"
     verify(store, repo, job, 0, raw=raw, ev=tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest))
-    # the other ticket's event naming D: the store holds D's report, the one report D can be
-    with pytest.raises(AlreadyRecorded):
-        store.record_verification(other, envelope=raw, event=tvr.event(other, at=VERIFIED_AT,
-                                                                        verifier_report_digest=digest),
-                                  repo=str(repo[0]), tree=base_tree(repo), model=model(0))
+    before = store.get(job.id)
+    # the other ticket's event naming A's digest, with the byte copy and with no envelope at all
+    for envelope in (raw, None):
+        with pytest.raises(RecordConflict) as conflict:
+            store.record_verification(other, envelope=envelope, event=tvr.event(other, at=VERIFIED_AT,
+                                                                                 verifier_report_digest=digest),
+                                      repo=str(repo[0]), tree=base_tree(repo), model=model(0))
+        assert not isinstance(conflict.value, AlreadyRecorded)
+    assert store.get(job.id).history == before.history and [x.run for x in store.run_records(job.id)] == [0]
+    # A's own re-delivery is still the idempotent repeat, the envelope gone or not (an ACK lets the reaper trash it)
+    for envelope in (raw, None):
+        with pytest.raises(AlreadyRecorded):
+            store.record_verification(r, envelope=envelope, event=tvr.event(r, at=VERIFIED_AT,
+                                                                             verifier_report_digest=digest),
+                                      repo=str(repo[0]), tree=base_tree(repo), model=model(0))
+
+
+def test_a_store_whose_run_records_keep_no_ticket_gains_the_column_on_open(store, repo):
+    """A store made before run records kept the ticket is given the column when this code opens it, and the next
+    record keeps its ticket."""
+    from levain.dispatch.jobs import DB_NAME
+
+    job, _ = at_state(store, repo, "verifying")
+    conn = sqlite3.connect(store.directory / DB_NAME)
+    try:
+        conn.execute("ALTER TABLE run_records DROP COLUMN ticket")
+        conn.commit()
+    finally:
+        conn.close()
+    reopened = JobStore(store.directory, clock=store._clock)
+    verify(reopened, repo, job, 0)
+    conn = sqlite3.connect(store.directory / DB_NAME)
+    try:
+        assert conn.execute("SELECT ticket FROM run_records").fetchall() == [(tvr_ticket(job.id, 0),)]
+    finally:
+        conn.close()
+
+
+def tvr_ticket(job_id, run):
+    from tests import test_dispatch_verifier_report as tvr
+
+    return tvr.vrun(job_id, run).ticket
+
+
+def test_a_run_record_kept_with_no_ticket_matches_no_repeat(store, repo):
+    """A run record written with no ticket (a writer from before the ticket was kept) is no event's repeat: the same
+    digest is refused as a plain TransitionRefused (the follower passes it with no ACK), never AlreadyRecorded."""
+    from levain.dispatch.jobs import DB_NAME, AlreadyRecorded, RecordConflict
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    raw, digest = tvr.envelope(r, tvr.body(("pass", "pass")))
+    ev = tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest)
+    verify(store, repo, job, 0, raw=raw, ev=ev)
+    conn = sqlite3.connect(store.directory / DB_NAME)
+    try:
+        row = conn.execute("SELECT job_id, run, record, digest, envelope_digest, at FROM run_records").fetchone()
+        conn.execute("DROP TRIGGER run_records_kept")
+        conn.execute("DELETE FROM run_records")
+        conn.execute("INSERT INTO run_records (job_id, run, record, digest, envelope_digest, at) "
+                     "VALUES (?, ?, ?, ?, ?, ?)", row)
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(TransitionRefused) as exc:
+        store.record_verification(r, envelope=raw, event=ev, repo=str(repo[0]), tree=base_tree(repo),
+                                  model=model(0))
+    assert not isinstance(exc.value, (AlreadyRecorded, RecordConflict))

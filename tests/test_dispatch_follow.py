@@ -303,6 +303,38 @@ def test_a_ticket_that_failed_the_job_with_another_outcome_stops_the_follower(st
     f.close()
 
 
+def test_a_byte_copy_of_another_tickets_stored_envelope_stops_the_follower_unacked(store, repo, served):  # noqa: F811
+    """RULINGS_OBS 18: CONTROL's verifier session (ticket B) publishes the digest of ticket A's envelope, whose report
+    the store already holds, and dispatch reads B's retained envelope as a byte copy of A's. That is no repeat of B:
+    the follower stops (record-conflict), sends no ACK (the reaper keeps B's retained work) and leaves the cursor
+    before the event."""
+    d = Dispatch(store, repo, served)
+    assert served.submit_v(vitem(1))["ok"]
+    ticket = ticket_of(served.vmint())
+    d.bind(ticket)
+    a_run = dataclasses.replace(d.run, ticket="t-a-copied")
+    d.raw, d.digest = tvr.envelope(a_run)
+    store.record_verification(a_run, envelope=d.raw, event=tvr.event(a_run, at="2026-10-25T00:00:00Z",
+                                                                      verifier_report_digest=d.digest),
+                              repo=str(repo[0]), tree=base_tree(repo), model=model(0))
+    assert served.vattach(ticket)["ok"]
+    cas(served, R.ALLOCATED, R.RENDERING, SESSION_V)
+    assert root(served, "REVOKE", session=SESSION_V)["ok"]
+    for frm, to in END_CHAIN[:-1]:
+        cas(served, frm, to, SESSION_V)
+    cas(served, R.CREDENTIAL_PARKED, R.CREDENTIAL_PARKED, SESSION_V, verifier_report_digest=d.digest)
+    cas(served, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V)
+    f = d.follower()
+    with pytest.raises(F.FollowStopped) as exc:
+        f.step()
+    assert exc.value.name == "record-conflict"
+    assert not acked(served)
+    [done] = [e for e in served.kept("state") if e.get("ticket") == ticket and "verifier_report_digest" in e]
+    cur = store.event_cursor()
+    assert cur is None or cur[1] < done["seq"]
+    f.close()
+
+
 @pytest.mark.parametrize("bad", [{"ticket": 7}, {"verifier_report_digest": "sha256:nothex"},
                                  {"verifier_report_refused": ""},
                                  {"verifier_report_refused": "x", "verifier_report_digest": "sha256:" + "0" * 64}])

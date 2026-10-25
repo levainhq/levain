@@ -235,12 +235,13 @@ class TransitionRefused(DispatchError):
 
 class AlreadyRecorded(TransitionRefused):
     """:meth:`JobStore.record_verification` refused a repeat: the store already holds THIS event's outcome for the run
-    (its report's digest as the run record's, or this ticket and outcome as the refusal that failed the job)."""
+    (this ticket and its report's digest as the run record's, or this ticket and outcome as the refusal that failed
+    the job)."""
 
 
 class RecordConflict(TransitionRefused):
-    """:meth:`JobStore.record_verification` refused an event whose run already holds a record of another report, or
-    whose ticket already failed the job with another outcome."""
+    """:meth:`JobStore.record_verification` refused an event whose run already holds a record of another report or of
+    another ticket, or whose ticket already failed the job with another outcome."""
 
 
 class SignatureRefused(DispatchError):
@@ -436,10 +437,12 @@ _SCHEMA = (
     "WHEN EXISTS (SELECT 1 FROM job_filers WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a job filer is never replaced'); END",
     # one verified (or failed) RUN's artifact record (F11 §7), written by the verifier writer alone: the record's
-    # canonical bytes, its artifact digest, and the digest of the verifier envelope it was read from; a run is
-    # recorded once
+    # canonical bytes, its artifact digest, the digest of the verifier envelope it was read from, and the verifier
+    # ticket whose event it took (what a repeat is matched on beside the digest: a session can publish a byte copy of
+    # another session's envelope under its own ticket); a run is recorded once. A row with no ticket (a writer that
+    # kept none) matches no repeat, so its follower sends no ACK
     "CREATE TABLE IF NOT EXISTS run_records (job_id TEXT NOT NULL REFERENCES jobs(id), run INTEGER NOT NULL, "
-    "record TEXT NOT NULL, digest TEXT NOT NULL, envelope_digest TEXT NOT NULL, at TEXT NOT NULL, "
+    "record TEXT NOT NULL, digest TEXT NOT NULL, envelope_digest TEXT NOT NULL, at TEXT NOT NULL, ticket TEXT, "
     "PRIMARY KEY (job_id, run))",
     *_append_only("run_records", "a run record is written once"),
     "CREATE TRIGGER IF NOT EXISTS run_records_no_replace BEFORE INSERT ON run_records "
@@ -612,16 +615,22 @@ def report_of(event: Mapping[str, Any]) -> tuple[str | None, str | None]:
 def _refuse_repeat(conn: sqlite3.Connection, job: Job, run: int, ticket: str, refused: str | None,
                    digest: str | None) -> None:
     """Refuse a verifier outcome job ``job`` cannot take for run ``run`` (ticket ``ticket``): :class:`AlreadyRecorded`
-    when the store holds this outcome (the run's record carries this report digest, or the refusal that failed the
-    job is this ticket's with this outcome), :class:`RecordConflict` when the run's record is another report's or
-    this ticket failed the job with another outcome, :class:`TransitionRefused` when the job is past verifying by any
-    other cause (another run's refusal among them). Returns when the job is verifying and the run unrecorded."""
-    row = conn.execute("SELECT envelope_digest FROM run_records WHERE job_id = ? AND run = ?", (job.id, run)).fetchone()
+    when the store holds this outcome (the run's record carries this ticket and this report digest, or the refusal
+    that failed the job is this ticket's with this outcome), :class:`RecordConflict` when the run's record is another
+    report's or another ticket's, or this ticket failed the job with another outcome, :class:`TransitionRefused` when
+    the job is past verifying by any other cause (another run's refusal among them) or the run's record of this
+    digest keeps no ticket. Returns when the job is verifying and the run unrecorded. Matched on the stored ticket,
+    never by checking the envelope again: a true repeat may come after its ACK let the reaper trash the envelope."""
+    row = conn.execute("SELECT envelope_digest, ticket FROM run_records WHERE job_id = ? AND run = ?",
+                       (job.id, run)).fetchone()
     if row is not None:
-        if refused is None and row[0] == digest:
+        if refused is None and row[0] == digest and row[1] is None:
+            raise TransitionRefused(f"run {run} of job {job.id} is already recorded, with this report and no ticket "
+                                    "kept; it matches no repeat")
+        if refused is None and row[0] == digest and row[1] == ticket:
             raise AlreadyRecorded(f"run {run} of job {job.id} is already recorded, with this report")
-        raise RecordConflict(f"run {run} of job {job.id} is already recorded, with another report; a run record is "
-                             "never replaced")
+        raise RecordConflict(f"run {run} of job {job.id} is already recorded, with another report or ticket; a run "
+                             "record is never replaced")
     held = conn.execute("SELECT run, ticket, event_refused, event_digest FROM verifier_refusals WHERE job_id = ?",
                         (job.id,)).fetchone()
     if held is not None and (held[0], held[1]) == (run, ticket):
@@ -752,6 +761,10 @@ class JobStore:
             if "jobs" in tables and "writer_format" not in {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}:
                 # a store from before /5: its rows keep no writer format (the check is on insert only)
                 conn.execute("ALTER TABLE jobs ADD COLUMN writer_format TEXT")
+            if "run_records" in tables and "ticket" not in {r[1] for r in conn.execute(
+                    "PRAGMA table_info(run_records)")}:
+                # a store whose run records keep no ticket: its rows keep none (they match no repeat)
+                conn.execute("ALTER TABLE run_records ADD COLUMN ticket TEXT")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
             if row is None:
@@ -1490,10 +1503,10 @@ class JobStore:
                              "VALUES (?, ?, ?, ?, ?, ?)", (job.id, run.run, run.ticket, refused, report_digest, stamp))
             else:
                 try:
-                    conn.execute("INSERT INTO run_records (job_id, run, record, digest, envelope_digest, at) "
-                                 "VALUES (?, ?, ?, ?, ?, ?)",
+                    conn.execute("INSERT INTO run_records (job_id, run, record, digest, envelope_digest, at, ticket) "
+                                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                                  (job.id, record.run, canonical(record.to_mapping()), adopt.artifact_digest(record),
-                                  report.digest, stamp))
+                                  report.digest, stamp, run.ticket))
                 except sqlite3.IntegrityError as exc:
                     _refuse_repeat(conn, current, run.run, run.ticket, refused, report_digest)
                     # not a repeat of this run: a named refusal, never a raw sqlite3 error
