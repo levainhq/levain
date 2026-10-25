@@ -71,7 +71,8 @@ MAX_REMOVE_BYTES = 64 << 10
 _NEVER_REMOVED = frozenset({"host", "content-length", "transfer-encoding", "connection", "upgrade", "te", "trailer",
                             "keep-alive", "proxy-connection"})
 _TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
-_CREDENTIAL = re.compile(r"[\x21-\x7e]{1,8192}")
+#: A credential VALUE srt's allow frame accepts: printable ASCII, no space, 1 to 8192 bytes.
+CREDENTIAL = re.compile(r"[\x21-\x7e]{1,8192}")
 _REQUEST_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 _MAX_ID = 2 ** 53 - 1
 _MAX_LENGTH = str(2 ** 63 - 1)
@@ -358,7 +359,7 @@ def allow_frame(srt_id: int, remove_headers: Iterable[str] = (), *, cred: str | 
     if names:
         f["removeHeaders"] = names
     if cred is not None:
-        if not isinstance(cred, str) or not cred or not _CREDENTIAL.fullmatch(credential or ""):
+        if not isinstance(cred, str) or not cred or not CREDENTIAL.fullmatch(credential or ""):
             raise WireError("credential shape")
         f["cred"], f["credential"] = cred, credential
     return f

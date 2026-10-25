@@ -824,11 +824,11 @@ def egress_key_repo_problem(repo: Any) -> str | None:
     """Why ``repo`` cannot be a declared repo path, or None: an origin-form path that starts with ``/``, holds more
     than ``/``, does not end with ``/``, carries no query, and is already in R-2's canonical form (the decider
     compares a request's prefix to it as a string)."""
-    from levain.chat_egress.parse import _canonical_path
+    from levain.chat_egress.parse import canonical_path
 
     if not isinstance(repo, str) or not repo.startswith("/") or repo == "/" or repo.endswith("/") or "?" in repo:
         return "a declared repo is a path like /owner/repo.git (a leading /, no trailing /, no query)"
-    canon, why = _canonical_path(repo, "GET")
+    canon, why = canonical_path(repo, "GET")
     if canon is None:
         return f"a declared repo path walls ({why})"
     if canon != repo:

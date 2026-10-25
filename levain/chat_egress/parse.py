@@ -19,6 +19,7 @@ Import surface (frozen for the CH-D2 sessions that build on it; a change is a he
     parse(frame) -> ParsedRequest          raises ParseError
     walls(parsed) -> str | None            the structural walls R-2 .. R-4, in order
     canonical_host(host) -> str            raises ValueError
+    canonical_path(path, method) -> (str | None, str | None)   R-2's canonical form, or None and why it walls `path`
     fold_name(name) -> str
     parse_query(raw) -> tuple[QueryParam, ...]   raises ParseError (also for a form body's `_method`, R-7)
     ParsedRequest, Header, QueryParam, Names, ParseError
@@ -302,7 +303,7 @@ def parse_query(raw: str) -> tuple[QueryParam, ...]:
     return tuple(params)
 
 
-def _canonical_path(path: str, method: str) -> tuple[str | None, str | None]:
+def canonical_path(path: str, method: str) -> tuple[str | None, str | None]:
     """(canonical form, None) or (None, why it walls `path`): R-2, "the path must not change under normalisation".
     Unreserved escapes are decoded (`%2e` is `.`, `%72` is `r`), other escapes upper-cased and kept (`%2F` stays an
     escape: an encoded slash is a resource name on real APIs). Walled: not one printable-ASCII origin-form token, a
@@ -384,7 +385,7 @@ def parse(frame: Mapping[str, object]) -> ParsedRequest:
         canon_host: str | None = canonical_host(host)
     except ValueError:
         canon_host = None
-    canon_path, problem = _canonical_path(path, method)
+    canon_path, problem = canonical_path(path, method)
     header_names = Names(h.folded for h in headers)
     return ParsedRequest(
         srt_id=srt_id, method=method, host=host, canonical_host=canon_host, port=port,

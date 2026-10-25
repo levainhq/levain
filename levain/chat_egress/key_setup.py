@@ -32,7 +32,7 @@ from levain.authority import (EGRESS_KEY_KIND, AuthorityError, _thaw, anchor_pat
 from levain.authority_sig import VerifierUnavailable
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.chat_egress.keys import _remote_repo, workspace_remote_urls
-from levain.chat_egress.parse import _canonical_path, canonical_host
+from levain.chat_egress.parse import canonical_host, canonical_path
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
 
@@ -157,7 +157,7 @@ def _why_excluded(url: str) -> str:
     path = path[:-1] if path.endswith("/") else path
     if not path or path == "/":
         return "it names no repo path"
-    canon, why = _canonical_path(path, "GET")
+    canon, why = canonical_path(path, "GET")
     if canon is None:
         return f"its path walls ({why})"
     return f"its path is not in canonical form ({canon!r})"

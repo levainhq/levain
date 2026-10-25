@@ -42,7 +42,7 @@ from types import MappingProxyType
 from typing import Any, Literal, Protocol
 
 from levain.chat_egress import advert, wire
-from levain.chat_egress.parse import _canonical_path, canonical_host
+from levain.chat_egress.parse import canonical_host, canonical_path
 
 __all__ = ["ATTACH_VALUES", "AuthorityLiveness", "CredentialStore", "CredentialUnreadable", "KeyDecision",
            "KeychainStore", "LaunchCredentials", "LaunchRefused", "LivenessUnreadable", "Placement", "RouteSet", "RouteSnapshot",
@@ -148,7 +148,7 @@ def _remote_repo(url: str, host: str) -> str | None:
     path = path[:-1] if path.endswith("/") else path
     if not path or path == "/":
         return None
-    canon, _why = _canonical_path(path, "GET")
+    canon, _why = canonical_path(path, "GET")
     return canon if canon == path else None
 
 
@@ -343,7 +343,7 @@ class LaunchCredentials:
             if k in self._values:
                 return self._values[k]
             value = self._store.read(route.credential_source, route.credential_account)
-            if isinstance(value, str) and wire._CREDENTIAL.fullmatch(value):
+            if isinstance(value, str) and wire.CREDENTIAL.fullmatch(value):
                 self._values[k] = value
             return value
 
@@ -406,6 +406,6 @@ def decide_key(route: RouteSnapshot | None, parsed: Any, *, liveness: Liveness,
         value = credentials.read(route)
     except Exception:                        # noqa: BLE001: no value is no key, whatever the store raised
         return KeyDecision(route, NONE, problem="credential-unreadable")
-    if not isinstance(value, str) or not wire._CREDENTIAL.fullmatch(value):
+    if not isinstance(value, str) or not wire.CREDENTIAL.fullmatch(value):
         return KeyDecision(route, NONE, problem="credential-unusable")
     return KeyDecision(route, ATTACHED, cred=route.record_id, credential=value)

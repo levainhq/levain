@@ -318,7 +318,7 @@ def _canonical_repo(entry: str) -> str | None:
         entry = "/" + entry
     if len(entry) > 1 and entry.endswith("/"):
         entry = entry[:-1]
-    canon, problem = parse._canonical_path(entry, "GET")
+    canon, problem = parse.canonical_path(entry, "GET")
     return None if problem else canon
 
 
