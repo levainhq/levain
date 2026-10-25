@@ -329,15 +329,21 @@ def _check_chat_network() -> list[CheckResult]:
     from levain.chat_egress.launch import EgressRefused, check_node
 
     name = "chat network"
-    prefix = srt_pin.default_prefix()
-    if not (prefix / srt_pin.STAMP).exists():
+    fix = "Run `levain chat setup` again (with Node 26 on PATH)."
+    try:
+        prefix = srt_pin.default_prefix()
+        set_up = (prefix / srt_pin.STAMP).exists()
+    except (OSError, RuntimeError) as exc:              # RuntimeError: a symlink loop under Python 3.12's resolve
+        return [CheckResult(name, False, f"the chat network install could not be read: {type(exc).__name__}: {exc}",
+                            fix)]
+    if not set_up:
         return [CheckResult(name, True, f"not set up at {prefix} (only chat needs Node 26; `levain chat setup` "
                                         "installs its pinned dependency)", neutral=True)]
     try:
         node = check_node(shutil.which("node") or "node")
         st = srt_pin.check(prefix)
     except (EgressRefused, srt_pin.SrtProblem) as exc:
-        return [CheckResult(name, False, str(exc), "Run `levain chat setup` again (with Node 26 on PATH).")]
+        return [CheckResult(name, False, str(exc), fix)]
     return [CheckResult(name, True, f"node {node}, srt {st.version} at {st.prefix}")]
 
 

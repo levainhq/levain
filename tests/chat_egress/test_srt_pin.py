@@ -176,3 +176,76 @@ def test_check_refuses_a_locked_file_swapped_for_a_symlink(tmp_path) -> None:
     f.symlink_to(evil)
     with pytest.raises(srt_pin.SrtProblem, match="hash mismatch: node_modules/node-forge"):
         srt_pin.check(prefix)
+
+
+# --- S8b r1 item 5: every decode, shape and filesystem failure is an SrtProblem -------------------------------------
+
+def _rewrite_json(path: Path, edit) -> None:
+    d = json.loads(path.read_text())
+    path.write_text(json.dumps(edit(d)))
+
+
+SHAPES = {
+    "stamp-a-list": lambda p: (p / "levain-srt.json").write_text("[]"),
+    "stamp-trees-a-list": lambda p: _rewrite_json(p / "levain-srt.json", lambda d: {**d, "trees": []}),
+    "npm-packages-a-list": lambda p: _rewrite_json(p / "node_modules/.package-lock.json",
+                                                   lambda d: {**d, "packages": []}),
+    "npm-entry-a-string": lambda p: _rewrite_json(p / "node_modules/.package-lock.json",
+                                                  lambda d: {**d, "packages": {**d["packages"],
+                                                                               "node_modules/zod": "x"}}),
+    "npm-record-not-utf8": lambda p: (p / "node_modules/.package-lock.json").write_bytes(b"\xff\xfe{"),
+    "srt-package-json-a-list": lambda p: (p / "node_modules/@anthropic-ai/sandbox-runtime/package.json")
+    .write_text("[]"),
+    "unreadable-locked-file": lambda p: (p / "node_modules/node-forge/lib/forge.js").chmod(0o000),
+    "unreadable-dir": lambda p: (p / "node_modules/zod").chmod(0o000),
+}
+
+
+@pytest.mark.chat_egress_srt
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+def test_check_turns_every_malformed_install_into_an_srt_problem(shape, tmp_path) -> None:
+    prefix = envmod.srt_prefix_copy(tmp_path / "chat-node")
+    SHAPES[shape](prefix)
+    try:
+        with pytest.raises(srt_pin.SrtProblem) as got:
+            srt_pin.check(prefix)
+    finally:
+        for p in (prefix / "node_modules/node-forge/lib/forge.js", prefix / "node_modules/zod"):
+            p.chmod(0o700)                                   # let pytest's tmp cleanup in
+    print(f"RUN S8D item 5 {shape}: {got.value}")
+
+
+def test_the_vendor_check_names_a_module_that_is_not_text(tmp_path) -> None:
+    (tmp_path / "http-proxy.js").write_bytes(b"\xff\xfe\x00")
+    assert srt_pin.vendor_check(tmp_path, {"http-proxy.js": ("createHttpProxyServer",)}) == \
+        ["http-proxy.js: (module unreadable)"]
+
+
+def test_setup_refuses_a_prefix_it_cannot_create(tmp_path) -> None:
+    (tmp_path / "chat-node").write_text("a file where the prefix goes")
+    with pytest.raises(srt_pin.SrtProblem):
+        srt_pin.setup(tmp_path / "chat-node", npm="/usr/bin/false")
+
+
+def test_doctor_reports_a_malformed_stamp_never_crashes(tmp_path, monkeypatch) -> None:
+    from levain import doctor
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path))
+    (tmp_path / "chat-node").mkdir()
+    (tmp_path / "chat-node" / "levain-srt.json").write_text("[]")
+    monkeypatch.setattr("levain.chat_egress.launch.check_node", lambda node: "v26.8.1")
+    [row] = doctor._check_chat_network()
+    print(f"RUN S8D item 5 doctor stamp []: {row}")
+    assert not row.ok and "levain chat setup" in row.detail
+
+
+def test_doctor_reports_an_unreadable_prefix_never_crashes(tmp_path, monkeypatch) -> None:
+    from levain import doctor
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path))
+    (tmp_path / "chat-node").mkdir()
+    (tmp_path / "chat-node").chmod(0o000)
+    try:
+        [row] = doctor._check_chat_network()
+    finally:
+        (tmp_path / "chat-node").chmod(0o700)
+    print(f"RUN S8D item 5 doctor unreadable prefix: {row}")
+    assert not row.ok

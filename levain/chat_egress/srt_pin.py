@@ -13,11 +13,13 @@ each module's `export` statements without running them. Then it writes a stamp: 
 
 :func:`check` is what doctor and a launch read: the stamp present, the lock it was made from still the shipped one,
 npm's own record (`node_modules/.package-lock.json`) naming the shipped integrity for every package, every tree hash
-unchanged, the version `launch.SRT_VERSION`, and the vendor check passing. Any mismatch is a refusal naming it.
+unchanged, the version `launch.SRT_VERSION`, and the vendor check passing. Any mismatch is a refusal naming it, and
+so is anything `check` or `setup` cannot read, decode or create: both raise only SrtProblem (`_READ_FAILURES`).
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -41,6 +43,22 @@ _GLUE_IMPORT = re.compile(r"const \{([^}]*)\} = await import\(SRT \+ '([A-Za-z0-
 
 class SrtProblem(Exception):
     """srt is not installed as the shipped lock pins it, or its import names moved: chat network refuses."""
+
+
+#: what a file, a decode or a shape that is not what setup wrote raises; `check` and `setup` turn each into SrtProblem
+_READ_FAILURES = (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError)
+
+
+def _as_problem(fn):
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except SrtProblem:
+            raise
+        except _READ_FAILURES as exc:
+            raise SrtProblem(f"chat network's install could not be read: {type(exc).__name__}: {exc}") from None
+    return run
 
 
 def default_prefix() -> Path:
@@ -80,8 +98,11 @@ def vendor_check(dist: Path, imports: dict[str, tuple[str, ...]] | None = None) 
     for mod, names in (imports if imports is not None else glue_imports()).items():
         try:
             src = (Path(dist) / mod).read_text()
-        except OSError:
+        except FileNotFoundError:
             missing.append(f"{mod}: (module missing)")
+            continue
+        except (OSError, ValueError):
+            missing.append(f"{mod}: (module unreadable)")
             continue
         missing += [f"{mod}: {n}" for n in names if not _exports(src, n)]
     return missing
@@ -101,6 +122,10 @@ def locked_packages() -> list[str]:
     return [k for k in json.loads((NODE_DIR / "package-lock.json").read_text())["packages"] if k]
 
 
+def _raise(exc: OSError) -> None:
+    raise exc                                  # os.walk's default skips a directory it cannot list, silently
+
+
 def tree_hashes(prefix: Path, packages: list[str]) -> dict[str, str]:
     """{package path: sha256 over its entries} for each of `packages`, plus `OUTSIDE` over every other entry under
     `<prefix>/node_modules`. An entry is its path relative to `prefix` and what it is: a file's sha256, a symlink's
@@ -109,7 +134,7 @@ def tree_hashes(prefix: Path, packages: list[str]) -> dict[str, str]:
     prefix = Path(prefix)
     owners = sorted(packages, key=len, reverse=True)
     entries: dict[str, list[bytes]] = {p: [] for p in [*packages, OUTSIDE]}
-    for top, dirs, files in os.walk(prefix / "node_modules"):
+    for top, dirs, files in os.walk(prefix / "node_modules", onerror=_raise):
         for name in dirs + files:
             path = Path(top) / name
             rel = path.relative_to(prefix).as_posix()
@@ -134,6 +159,7 @@ class SrtState:
     dist: Path
 
 
+@_as_problem
 def check(prefix: Path | None = None) -> SrtState:
     """The installed srt, verified (see the module doc); else SrtProblem naming the first mismatch."""
     from levain.chat_egress.launch import SRT_VERSION
@@ -142,17 +168,24 @@ def check(prefix: Path | None = None) -> SrtState:
     pkg = srt_package(prefix)
     try:
         stamp = json.loads((prefix / STAMP).read_text())
-    except (OSError, ValueError):
+    except FileNotFoundError:
         raise SrtProblem(f"chat network is not set up at {prefix} (run `levain chat setup`)") from None
+    except ValueError:                          # any other OSError is the boundary's "could not be read"
+        stamp = None
+    if not isinstance(stamp, dict):
+        raise SrtProblem(f"the setup stamp at {prefix / STAMP} is not one setup wrote (run `levain chat setup`)")
     shipped = json.loads((NODE_DIR / "package-lock.json").read_text())
     if stamp.get("lock_sha256") != _sha256(NODE_DIR / "package-lock.json"):
         raise SrtProblem("srt was installed from another lock than this Levain ships (run `levain chat setup`)")
     try:
         npm_record = json.loads((prefix / "node_modules" / ".package-lock.json").read_text())["packages"]
     except (OSError, ValueError, KeyError, TypeError):
-        raise SrtProblem(f"npm's install record is missing under {prefix}") from None
+        npm_record = None
+    if not isinstance(npm_record, dict):
+        raise SrtProblem(f"npm's install record is missing or malformed under {prefix}")
     for path, entry in shipped["packages"].items():
-        if path and (npm_record.get(path) or {}).get("integrity") != entry["integrity"]:
+        got = npm_record.get(path)
+        if path and (got.get("integrity") if isinstance(got, dict) else None) != entry.get("integrity"):
             raise SrtProblem(f"hash mismatch: {path} is not the integrity the shipped lock pins")
     packages = locked_packages()
     recorded = stamp.get("trees")
@@ -177,6 +210,7 @@ def check(prefix: Path | None = None) -> SrtState:
     return SrtState(prefix=prefix, version=version, dist=srt_dist(prefix))
 
 
+@_as_problem
 def setup(prefix: Path | None = None, *, npm: str | None = None, offline: bool = False,
           cache: Path | None = None) -> SrtState:
     """`levain chat setup`: `npm ci --ignore-scripts` of the shipped lock into `prefix`, the vendor check, the stamp."""
