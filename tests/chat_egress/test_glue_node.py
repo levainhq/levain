@@ -95,3 +95,14 @@ def test_js_escape_vectors_are_wires(tmp_path: Path) -> None:
     assert [tuple(v) for v in meta["vectors"]] == list(wire.ESCAPE_VECTORS)
     for raw, limit, want in wire.ESCAPE_VECTORS:
         assert wire.escape_text(raw, limit) == want
+
+
+def test_main_wires_the_lifeline_through_watch_lifeline() -> None:
+    """S4 F2 at the call site: glue_unit drives watchLifeline itself, and the srt suite's lifeline case dies at
+    construction, so neither sees main revert to `life.on('error', cleanEnd)`. Main's body must hand the lifeline
+    to watchLifeline and attach no handler of its own."""
+    src = (Path(__file__).resolve().parents[2] / "levain" / "chat_egress" / "node" / "glue.mjs").read_text(
+        encoding="utf-8")
+    main = src[src.index("async function main("):]
+    assert "watchLifeline(life, { cleanEnd, fatal });" in main
+    assert "life.on(" not in main

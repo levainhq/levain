@@ -328,7 +328,8 @@ def _canonical_repo(entry: str) -> str | None:
 #: double-encoded separator such as `%252F` is `%2F` to a server that decodes twice) and an encoded `;` (`%3B`: the
 #: git rule strips `;...` per segment only when it is literal). R-2's canonical form upper-cases every escape it
 #: keeps, so these spellings cover every case (`%5C` already walls `path`; it is named here too so this rule does not
-#: lean on the wall).
+#: lean on the wall). authority.egress_key_repo_problem reads this set when it validates a setup record, at replay
+#: too: widening it changes which already-signed records the log accepts.
 KEYLESS_ESCAPES = ("%2F", "%5C", "%25", "%3B")
 
 

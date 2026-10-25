@@ -613,4 +613,8 @@ def test_the_keyless_escape_set_is_exactly_these_four():
     the set's members are asserted directly (upper case: R-2's canonical form upper-cases every escape it keeps)."""
     assert advert.KEYLESS_ESCAPES == ("%2F", "%5C", "%25", "%3B")
     for esc in advert.KEYLESS_ESCAPES:
-        assert parse.canonical_path("/o/r.git/x" + esc.lower() + "y", "GET")[0] in (None, "/o/r.git/x" + esc + "y")
+        canon = parse.canonical_path("/o/r.git/x" + esc.lower() + "y", "GET")[0]
+        if esc == "%5C":
+            assert canon is None  # a backslash escape walls in any case
+        else:
+            assert canon == "/o/r.git/x" + esc + "y", esc
