@@ -149,9 +149,16 @@ def coverage_gaps(ranges: Iterable[str]) -> list[Net]:
 
 def load_table(path: Path = TABLE_PATH) -> tuple[str, ...]:
     """The committed table's ranges (what the launch hands srt as `deniedResolvedAddresses`), validated in shape AND
-    in coverage: DeniedTableError, refusing the launch, when it is malformed or a required network is not covered."""
+    in coverage: DeniedTableError, refusing the launch, when it cannot be read, is malformed or a required network is
+    not covered."""
     try:
-        ranges = validate_table(json.loads(path.read_text()))
+        raw = path.read_text()
+    except OSError as e:      # absent, a directory, unreadable: the launch is refused as the typed error
+        raise DeniedTableError(f"denied table {path} cannot be read: {e.strerror or type(e).__name__}") from None
+    except ValueError as e:   # a UnicodeDecodeError: not UTF-8
+        raise DeniedTableError(f"denied table {path} cannot be read: {e}") from None
+    try:
+        ranges = validate_table(json.loads(raw))
     except DeniedTableError:
         raise
     except ValueError as e:   # json.JSONDecodeError is one

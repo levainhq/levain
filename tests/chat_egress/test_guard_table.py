@@ -219,3 +219,16 @@ def test_h2_malformed_table_is_the_typed_error(tmp_path):
 
 def test_h2_the_committed_table_loads():
     assert guard.load_table() == tuple(committed()["ranges"])
+
+
+def test_a_missing_or_unreadable_table_is_the_typed_error(tmp_path):
+    """S1+S2 r2 complement LOW 1: a table file that cannot be read refuses the launch as DeniedTableError (what S8
+    catches), never a raw OSError."""
+    with pytest.raises(guard.DeniedTableError, match="cannot be read"):
+        guard.load_table(tmp_path / "absent.json")
+    with pytest.raises(guard.DeniedTableError, match="cannot be read"):
+        guard.load_table(tmp_path)                      # a directory: IsADirectoryError
+    bad = tmp_path / "latin1.json"
+    bad.write_bytes(b"\xff\xfe{")
+    with pytest.raises(guard.DeniedTableError, match="cannot be read"):
+        guard.load_table(bad)
