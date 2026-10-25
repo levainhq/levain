@@ -11,9 +11,9 @@ What it counts, and the row that asks for it:
     one it is the last summary's total, marked as from a crashed launch.
   * per-reason counters and the bounded host map from that summary (R15-28-1, R15-30-2).
   * `duplicate_rows` (R15-28-5, R15-29-3): K1 only.
-  * the decider's `credential_in_query` walls and cards (R15-17-10), the signed-URL set names that stayed MARKED on
-    an attempt (a read whose mark the exemption lifted stores no such name: the exemptions themselves are not
-    countable from the rows) and the names the backstop alone matched (the `backstop` flag of
+  * the decider's `credential_in_query` walls and cards (R15-17-10), the signed-URL set names on
+    an attempt (a read the signed-URL exemption lifted stores the exempt parameter NAMES, never a value; Azure
+    SAS's `sig` exemption stores none, so it is not countable from the rows) and the names the backstop alone matched (the `backstop` flag of
     `shape.segment_token`), the cap walls and cards (R15-19-3) and the path walls (R15-10-A17), from the attempt
     rows' `deciding_step` and `names`.
 """
