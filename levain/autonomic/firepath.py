@@ -33,6 +33,9 @@ The four design seams (resolved at the 4a build, `projects/vagus/slice4_scope.md
   2. **Fail-UP.** The dispatcher floors the gate at the binding's SEALED posture
      (``ActionRequest.ratified_posture``) — the gate fires at ``max(re-resolve, ratified)``, never
      below the rung the human ratified. The structural backstop for the adapter-sourced ``trust``.
+     Below CONFIRM the gate also requires a live signed graduation policy covering the action the request
+     names, at the gate manifest's risk for it (14b: the gate's clamp); uncovered, it waits at CONFIRM. This
+     module passes nothing for it: the gate derives the effect from the request and the sealed binding.
   3. **Trust fossil.** The adapter builds the request trust the way the compiler did (intent-free,
      human-absent); the dispatcher overlays authority/kill/trajectory/ratified/trigger/risk, leaving
      trust as the adapter's (TCB) — backstopped by seam #2.
