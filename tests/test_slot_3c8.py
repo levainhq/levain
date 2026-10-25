@@ -104,6 +104,91 @@ def test_render_refused_at_its_first_cas_revokes_nothing(dispatch):
     assert "REVOKE" not in [op for op, _ in w.calls] and w.state(s) == rec
 
 
+class _LossyClients:
+    """The real ``ControlClient``'s loss shape over the test CONTROL: a call named in ``drop`` is committed by CONTROL,
+    then its reply is lost, so the client closes itself and raises ``control-down``; every later call on that client
+    is ``control-down`` too (``ControlClient._exchange`` on a closed socket). A new client from the factory works."""
+
+    def __init__(self, world, drop: set[str]) -> None:
+        from tests.test_slot_s2f2_runtime_helper import Client
+
+        self.world, self.drop, self.made, self._base = world, set(drop), 0, Client
+
+    def __call__(self, path):
+        self.made += 1
+        clients, base = self, self._base(self.world)
+
+        class Lossy:
+            closed = False
+
+            def call(self, op, **fields):
+                if self.closed:
+                    clients.world.calls.append((op + " (closed)", fields))
+                    raise Refused("control-down", "closed")
+                ans = base.call(op, **fields)
+                if op in clients.drop:
+                    clients.drop.discard(op)
+                    self.closed = True
+                    raise Refused("control-down", f"{op}: EOF")
+                return ans
+
+            def close(self):
+                self.closed = True
+
+        return Lossy()
+
+
+def _lossy(w, drop: set[str]) -> _LossyClients:
+    import dataclasses
+
+    clients = _LossyClients(w, drop)
+    w.seams = dataclasses.replace(w.seams, client_factory=clients)
+    return clients
+
+
+@pytest.mark.parametrize("lost", ["CAS", "MINT"])
+def test_render_whose_reply_was_lost_revokes_on_a_new_connection(dispatch, lost):
+    """codex HIGH r1: CONTROL commits a render's CAS (step 1) or MINT (step 5) and the reply is lost. The cached
+    client is closed, and at step 1 the generation was never answered, so a REVOKE gated on it, or sent on the cached
+    client, never reaches CONTROL: the session stays RENDERING, ticket and slot held. The REVOKE goes through a NEW
+    connection whenever the first CAS may have landed."""
+    d, w = dispatch, dispatch.w
+    s = _prepared(d)
+    clients = _lossy(w, {lost})
+    made = clients.made
+    line = _render(d, s, _blob())
+    assert line["refused"] == "control-down", (line, w.last_err)
+    assert [op for op, _ in w.calls][-1] == "REVOKE", w.calls
+    assert clients.made == made + 2                         # the render's client, then the REVOKE's own
+    assert w.state(s).state == R.REVOKED
+
+
+def test_render_revokes_when_killing_its_front_raises(dispatch):
+    """codex HIGH r1: a front cleanup that raises cannot skip the REVOKE (it runs in a finally)."""
+    d, w = dispatch, dispatch.w
+    s = _prepared(d)
+
+    def boom(at):
+        if at == "mint":
+            raise Refused("io-error", "injected")
+
+    killed = []
+
+    def kill(pid):
+        killed.append(pid)
+        raise OSError("the kill failed")
+
+    import dataclasses
+
+    w.seams = dataclasses.replace(w.seams, kill=kill)
+    w.on_step = boom
+    line = _render(d, s, _blob())
+    w.on_step = None
+    assert not line["ok"] and killed, line
+    assert [op for op, _ in w.calls][-1] == "REVOKE"
+    assert w.state(s).state == R.REVOKED
+
+
 # ---- carried (c): CONTROL's start wake after the listener ----------------------------------------------------------
 
 def test_server_start_survives_a_wake_that_raises():

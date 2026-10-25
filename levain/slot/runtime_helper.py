@@ -1415,6 +1415,10 @@ class RenderRun:
     front_pid: Optional[int] = None
     front_start: Optional[int] = None
     go_w: int = -1
+    #: step (1)'s CAS may have moved the record: set as the CAS is sent, cleared only by a refusal in
+    #: :data:`CAS_UNMOVED`. A lost reply leaves ``generation`` 0 with the record RENDERING, so it is this, not the
+    #: generation, that decides the REVOKE.
+    cas_may_have_landed: bool = False
 
     @property
     def egress(self) -> bool:
@@ -1446,11 +1450,22 @@ def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
         hook_templates={k: v for k, v in seams.hook_templates.items() if k in blob.hooks})
 
 
+#: the CAS refusals CONTROL answers only after reading the record under its lock and writing nothing
+#: (``Control.cas``: the record's generation, then its state): the one proof that step (1) moved nothing.
+CAS_UNMOVED = frozenset({"stale-generation", "from-mismatch"})
+
+
 def render_step1_cas_rendering(run: RenderRun) -> None:
     """(1) CAS ALLOCATED -> RENDERING. An ALLOCATED record is always generation 0 (ATTACH creates it there and
     any later write moves it out of ALLOCATED or ends its lease). Refused = stop: nothing started."""
-    ans = run.ctx.call("CAS", session=run.alloc.session, generation=0, **{"from": R.ALLOCATED, "to": R.RENDERING},
-                       fields={})
+    run.cas_may_have_landed = True
+    try:
+        ans = run.ctx.call("CAS", session=run.alloc.session, generation=0,
+                           **{"from": R.ALLOCATED, "to": R.RENDERING}, fields={})
+    except Refused as e:
+        if e.name in CAS_UNMOVED:
+            run.cas_may_have_landed = False
+        raise
     run.generation = int(ans["generation"])
 
 
@@ -1748,22 +1763,36 @@ def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]
                 ctx.seams.at(name)
                 step(run)
         except BaseException:
-            kill_front(run)
-            if run.generation > 0:
-                revoke_failed_render(run)
+            try:
+                kill_front(run)
+            finally:                    # a front cleanup that raises does not skip the REVOKE
+                if run.cas_may_have_landed:
+                    revoke_failed_render(run)
             raise
     return {}
 
 
 def revoke_failed_render(run: RenderRun) -> None:
-    """3c-8 (1025-10 obs 2): a render refused after step (1)'s CAS answered left the session RENDERING (or past it),
-    which no later render can take up (step (1) CASes from ALLOCATED only), so root asks CONTROL to ``REVOKE`` it:
-    REVOKED is a state the reaper's END clears, as it would after the lease's EOF. Best effort: a REVOKE that fails
-    leaves the session to that EOF, and the render's own refusal is what the caller is answered."""
+    """3c-8 (1025-10 obs 2): a render refused once step (1)'s CAS may have landed left the session RENDERING (or past
+    it), which no later render can take up (step (1) CASes from ALLOCATED only), so root asks CONTROL to ``REVOKE``
+    it: REVOKED is a state the reaper's END clears, as it would after the lease's EOF. The REVOKE goes on a NEW
+    connection: a lost reply closes the cached client (``ControlClient._down``), and a call on it is refused
+    ``control-down`` without reaching CONTROL. Best effort: a REVOKE that fails leaves the session to that EOF, and
+    the render's own refusal is what the caller is answered."""
+    seams = run.ctx.seams
     try:
-        run.ctx.call("REVOKE", session=run.alloc.session)
+        client = seams.client_factory(seams.R / "control" / "control.sock")
     except Exception:   # noqa: BLE001 - the render's refusal is the answer; the lease EOF still revokes
+        return
+    try:
+        client.call("REVOKE", session=run.alloc.session)   # type: ignore[attr-defined]
+    except Exception:   # noqa: BLE001 - as above
         pass
+    finally:
+        try:
+            client.close()                                  # type: ignore[attr-defined]
+        except Exception:   # noqa: BLE001 - closing never changes the verb's answer
+            pass
 
 
 # --- resume, status ---------------------------------------------------------------------------------------------------
@@ -3091,7 +3120,7 @@ def _read_stdin() -> bytes:
     return bytes(data)
 
 
-__all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
+__all__ = ["BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
            "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "LinkedNotDurable", "PREPARE_RESULT_FORMAT",
            "RENDER_STEPS", "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS",
            "CHECK_S", "capture_target", "configured_slots", "drain", "reap_within", "wait_child_within", "ENTRY_ENV", "entry_env",
