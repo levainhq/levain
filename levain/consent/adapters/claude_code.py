@@ -69,28 +69,25 @@ from levain.consent.auto_away import DEFAULT_HOLDS, IDLE_THRESHOLD, WORDS, away_
 from levain.consent.queue import (
     DB_NAME, AwayMark, ConsentQueue, Decision, authority_source, default_queue_dir, gap_label,
 )
+from levain.consent.adapters.rules import (  # noqa: F401 - the rules' one home; re-exported under these names
+    CLAUDE_CODE_AGENT, CLAUDE_CONFIG_DIRS, CLEANUP_RESERVE, CONFIG_FILE_NAMES, DEFAULT_MAX_HOLD, GIT_STATE_DIRS,
+    GIT_STATE_FILES, _is_config_path, _is_git_config,
+)
 from levain.consent.broker_client import in_slot
 from levain.consent.record import ExternalGateRequest
 
-AGENT = "claude_code"
+AGENT = CLAUDE_CODE_AGENT
 EVENT = "PermissionRequest"
 SETTINGS_NAME = "claude_code.json"
 HOOK_SCRIPT_NAME = "levain_consent.py"
 # A request is filed for at least this long even when nobody is waiting on it, so the policy seam has a live
 # request to look at; it is withdrawn as soon as the hook stops waiting.
 MIN_FILE_HOLD = timedelta(seconds=5)
-# ``max_hold`` (the installed ``--max-hold``) is the hook's TOTAL internal deadline, counted from the moment
-# ``decide`` starts. Before it waits, the hook reserves this many seconds of it for what follows the wait: the
-# withdraw (one sqlite write, busy timeout 30 s) and the re-read of a decision that landed meanwhile (one
-# signature verification, 10 s, ``levain.authority`` verify timeout), plus 20 s of slack: 30 + 10 + 20 = 60. So
-# the wait is at most ``max_hold - CLEANUP_RESERVE`` (0 when that is negative) and the hook ends by
-# ``max(max_hold, CLEANUP_RESERVE)``.
-CLEANUP_RESERVE = 60.0
+# ``max_hold`` and ``CLEANUP_RESERVE`` (the reserve after the wait): :mod:`levain.consent.adapters.rules`.
 # Claude Code's ``timeout`` for the hook is :func:`hook_timeout`: ``ceil(max(max_hold, CLEANUP_RESERVE))`` plus
 # this margin (interpreter start, imports, settings read), so it always exceeds wait + CLEANUP_RESERVE and Claude
 # Code never cancels the hook while a verified answer is on its way out (a cancelled hook's output is discarded).
 TIMEOUT_MARGIN = 30
-DEFAULT_MAX_HOLD = 900.0
 # A request on one of FILE_TOOLS (or an MCP tool, by its MCP_PATH_FIELDS) whose target path is agent config or a
 # hook is tagged agent_config and filed at AGENT_CONFIG_TIER (all three from levain.consent.policy): an allow then
 # needs a key class covering T3, and no policy is ever asked (fail toward the human).
@@ -265,19 +262,10 @@ def levain_home_protected(home: Path | None, cwd: str | None) -> list[Path]:
 
 # --- ruling 3b item 1: agent config and hooks ----------------------------------------------------------------
 
-# Under a ``.claude`` directory (the workspace's or ~'s), what Claude Code loads and runs: hooks, subagents, skills,
-# slash commands, and the plugin install tree (``~/.claude/plugins``: each plugin's hooks, MCP servers, agents).
-CLAUDE_CONFIG_DIRS = frozenset({"hooks", "agents", "skills", "commands", "plugins"})
-# MCP server definitions: a ``.mcp.json`` anywhere (a workspace's). The user's ``~/.claude.json`` is matched by
-# its full path in :func:`targets_agent_config`: a ``.claude.json`` elsewhere (a test fixture) is not config.
-CONFIG_FILE_NAMES = frozenset({".mcp.json"})
+# What is agent config by its path (``CLAUDE_CONFIG_DIRS``, ``CONFIG_FILE_NAMES``, ``.git``'s ``GIT_STATE_*``,
+# :func:`_is_config_path`): :mod:`levain.consent.adapters.rules`, which the queue broker reads too.
 USER_CONFIG_NAME = ".claude.json"
 
-# Under a ``.git`` directory component, what git itself writes and never executes from: its object store, refs and
-# reflogs (directories), and its state files. Everything else there (config, config.worktree, hooks, info/, a
-# linked worktree's or a submodule's git directory) is agent config (L3 r2 G1'): tagged by path, never parsed.
-GIT_STATE_DIRS = frozenset({"objects", "refs", "logs"})
-GIT_STATE_FILES = frozenset({"head", "index", "packed-refs", "orig_head", "fetch_head", "commit_editmsg"})
 # Asking git where hooks run (L3 r3 G1): from a fixed binary, never one the session's PATH finds; within one gate
 # call's budget, at most GIT_QUERIES repositories asked and GIT_BUDGET_SECONDS spent, past which a target is tagged.
 GIT_QUERIES = 4
@@ -323,18 +311,6 @@ def _tags_path(path: Path, cwd: str, roots: tuple[str, ...], sites: tuple[str, .
     """One spelling of a target path (already normalised or resolved) is agent config or the hook's own code."""
     return (_is_config_path(path) or _under(path, roots) or str(path).lower() in user_configs
             or _redirects_the_import(path, sites) or _under_hooks_path(path, cwd, git_cache))
-
-
-def _is_git_config(rest: list[str]) -> bool:
-    """What follows a ``.git`` directory component (lower-cased) is something git reads or executes from: anything
-    but its object store, refs and reflogs (:data:`GIT_STATE_DIRS`) and its state files (:data:`GIT_STATE_FILES`)
-    directly in it. A linked worktree's or a submodule's git directory (``worktrees/<name>/``, ``modules/<name>/``)
-    is tagged whole, its objects and refs included: an over-match costs a gated call, and git writes those itself."""
-    if not rest:
-        return False
-    if len(rest) > 1 and rest[0] in GIT_STATE_DIRS:
-        return False
-    return not (len(rest) == 1 and rest[0] in GIT_STATE_FILES)
 
 
 # --- where git runs hooks from (L3 r2 G1'): asked of git, never read out of its config ------------------------------
@@ -485,31 +461,6 @@ def _under_hooks_path(path: Path, cwd: str, cache: dict[Any, Any] | None = None)
         return False
     except (OSError, ValueError):
         return True   # a path that cannot be examined is tagged, as the other checks do
-
-
-def _is_config_path(path: Path) -> bool:
-    parts = [p.lower() for p in path.parts]
-    if parts and parts[-1] in CONFIG_FILE_NAMES:
-        return True
-    if parts and parts[-1] == ".git":
-        return True  # a gitfile (a linked worktree's or a submodule's ``.git``): it names the git directory
-    for i, part in enumerate(parts[:-1]):
-        rest = parts[i + 1:]
-        if part == ".claude":
-            if rest[0] in CLAUDE_CONFIG_DIRS or (len(rest) == 1 and rest[0].startswith("settings")
-                                                  and rest[0].endswith(".json")):
-                return True
-        if part == ".codex" and len(rest) == 1 and rest[0] in ("hooks.json", "config.toml"):
-            return True
-        if part == "activation" and rest[0] == "hooks" and len(rest) > 1:
-            return True  # a levain install's hook scripts (the consent hook among them) run in every agent session
-        if part == ".git" and _is_git_config(rest):
-            return True  # git runs what these name, unsandboxed, at the operator's next git command
-        if part == ".claude-plugin":
-            return True  # a plugin's manifest directory (plugin.json can declare hooks and MCP servers inline)
-        if part == "hooks" and i > 0 and os.path.isdir(Path(*path.parts[:i]) / ".claude-plugin"):
-            return True  # a plugin outside ~/.claude/plugins (a local marketplace, --plugin-dir): its hooks/
-    return False
 
 
 def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bool:

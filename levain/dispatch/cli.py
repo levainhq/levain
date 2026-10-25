@@ -92,6 +92,7 @@ from levain.dispatch import capability as caps
 from levain.dispatch import control as dctl
 from levain.dispatch import registry as dregistry
 from levain.dispatch import sign as dsign
+from levain.dispatch.contract import CONTRACT_MAX as _CONTRACT_MAX
 from levain.dispatch.contract import NEW, GitUnavailable, ResolvedTemplate
 from levain.dispatch.jobs import (
     TERMINAL, CapabilityRefused, Job, JobStore, JobStoreError, SignatureRefused, TransitionRefused,
@@ -103,8 +104,6 @@ __all__ = ["EXIT_FAILED", "EXIT_FAULT", "EXIT_OK", "EXIT_REFUSED", "CockpitUnnam
            "planner_capability", "render", "resolvers", "run_dispatch"]
 
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED, EXIT_FAULT = 0, 1, 2, 3
-# a contract is a few kilobytes; the bound only stops a stray file from being read whole
-_CONTRACT_MAX = 1024 * 1024
 NO_REGISTRY = "no template registry is set up; every contract is R2, which is never dispatched"
 NO_LAND = "no dispatch configuration is set up, so nothing can land"
 

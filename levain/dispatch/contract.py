@@ -56,6 +56,8 @@ __all__ = [
 ]
 
 FORMAT = "levain-dispatch-contract/1"
+# a contract is a few kilobytes; the bound only stops a stray file from being read whole
+CONTRACT_MAX = 1024 * 1024
 SUBMISSION_KEYS = frozenset({"template", "goal", "read", "write", "base", "budget", "grant", "expires_at", "repo"})
 BUDGET_KEYS = frozenset({"tool_calls", "tokens", "dollars_cents"})
 GRANTABLE = frozenset({"Write", "Edit", "apply_patch"})
