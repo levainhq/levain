@@ -6,7 +6,8 @@ became of each allowed one on a second (the observation channel, `wire.parse_obs
 first and drains the second, and composes, per request, in this order (the first step that decides, decides):
   1. `parse.parse` (R-1): the one parse. A frame it refuses gets a 400 deny (no record row can carry it: no request
      id survives the refusal; it is logged and counted).
-  2. the audit value (item 2): no one well-formed `x-levain-audit` -> deny `audit-missing`.
+  2. the audit value (item 2): no one well-formed `x-levain-audit` -> deny `audit-missing`; a value already
+     spent this launch, or a new one once `max_audit_ids` are spent (503 `audit_cap`) -> denied, no row.
   3. the ONE route lookup (`keys.lookup`, R15-18-L1) and the launch's mode, read live (`LiveSetting`, C1).
   4. `parse.walls` (R-2 .. R-4), then R-5's header strip (`strip.strip`; too many credential names -> deny).
   5. C-3: `resolver.Resolver` (bounded, timed out) and `guard.address_wall`: any non-public answer walls
@@ -23,7 +24,7 @@ first and drains the second, and composes, per request, in this order (the first
   8. silent -> `keys.decide_key` (R-6) and the allow frame, BUILT (and validated by `wire`) before the ALLOW event
      fires, so every deny check has run before an allow exists; card -> at most MAX_CARDS pending per launch
      (past it 503 `card_cap`, never queued), `cards.card_input` + the desk, held EGRESS_CARD_HOLD_S, the key decided
-     at the answer; wall -> deny.
+     at the answer; wall, or any other kind -> deny.
 Every request the decider is asked about runs on its own thread (a held card never stalls another request), at most
 MAX_DECISIONS at once (past it the request is denied 503 `decider_busy` on the link thread, with its row).
 
@@ -89,6 +90,10 @@ class Limits:
     card_poll_s: float = 0.5
     stop_drain_s: float = 3.0            # close: how long the obs channel may take to reach its end
     early_ended_max: int = 4096          # `ended` lines seen before their request frame
+    # DECISION (L3 r2 FIX 2): audit values kept for the launch (bound, never evict: an evicted value could be
+    # reused). One entry is a 36-character v4 UUID str in a set: ~118 bytes measured (tracemalloc, CPython 3.12,
+    # 2**17 entries), so this cap holds ~15 MiB. Past it every new request is denied 503 `audit_cap`.
+    max_audit_ids: int = 1 << 17
 
 
 #: A body frame is at most srt's 32 MiB as base64 plus its JSON; a frame past this is a protocol violation.
@@ -396,14 +401,16 @@ class Decider:
         self._card_slots = threading.BoundedSemaphore(limits.max_cards)
         self._readers = threading.BoundedSemaphore(limits.max_body_readers)
         # `_live_lock` also covers `_closing`'s set, admission (`_threads`, `_active`) and `_spent`: close() stops
-        # admission under it, so its snapshot holds every decision thread there will be
+        # admission under it, so its snapshot holds every decision thread there will be. Admission takes
+        # `_decisions` with a non-blocking acquire under it; a blocking acquire there would hold close() off.
         self._threads: set[threading.Thread] = set()
         self._active: set[_Req] = set()          # every request with a decision thread, live or not
         self._spent: set[str] = set()            # every audit value this launch registered (one request each)
         self._closing = threading.Event()
         self._link_thread: threading.Thread | None = None
         self._obs_thread: threading.Thread | None = None
-        self.counters: dict[str, int] = {"unparsed_frames": 0, "stray_obs": 0, "stray_allow": 0, "late_bodies": 0}
+        self.counters: dict[str, int] = {"unparsed_frames": 0, "stray_obs": 0, "stray_allow": 0, "late_bodies": 0,
+                                         "audit_cap": 0}
 
     # --- service ----------------------------------------------------------------------------------------------
     def start(self) -> None:
@@ -413,9 +420,10 @@ class Decider:
         self._obs_thread.start()
 
     def close(self, timeout_s: float | None = None) -> bool:
-        """The launch end. New frames are denied; the obs channel is drained to its end (or `stop_drain_s`); THEN
-        every request still open gets CLOSE; card waits are woken; the link is cut; every thread of this service is
-        joined. True when every thread ended inside the bound."""
+        """The launch end. New frames are denied; the obs channel is drained to its end (or `stop_drain_s`); the
+        link is cut (a verdict send blocked on srt's full buffer then fails, releasing its request's transition lock);
+        THEN every request still open gets CLOSE; card waits are woken; every thread of this service is joined. True
+        when every thread ended inside the bound."""
         bound = time.monotonic() + (timeout_s if timeout_s is not None else self.limits.stop_drain_s + 5.0)
         with self._live_lock:
             self._closing.set()                  # admission stops here: no decision thread starts after it
@@ -425,12 +433,16 @@ class Decider:
             open_reqs = list(self._live.values())
             waiting = list(self._active)
             threads = list(self._threads)
+            capped = self.counters["audit_cap"]
+        self.link.kill("the launch closed")
         for r in open_reqs:
             self._fire(r, Event.CLOSE)
         for r in open_reqs + waiting:
             r.wake.set()
         self.mode.close()
-        self.link.kill("the launch closed")
+        if capped:
+            log.error("launch %s: %d requests denied audit_cap (max_audit_ids %d)", self.launch_id, capped,
+                      self.limits.max_audit_ids)
         for s in (self._obs,):
             try:
                 s.close()
@@ -511,6 +523,8 @@ class Decider:
             self._register(r, closing_ok=True)
         except _Duplicate:
             return self._owe_deny(r, 403, "decider: a second request with one audit value")
+        except _AuditCap:
+            return self._owe_deny(r, 503, "wall: audit_cap")
         if r.lc.state in PENDING:
             self._fire(r, Event.DENY)
 
@@ -650,8 +664,9 @@ class Decider:
 
     def _register(self, r: _Req, *, closing_ok: bool = False) -> None:
         """Make the request reachable by its observation lines; an `ended` that came first is applied now. An audit
-        value is spent for the whole launch (`_Duplicate` for a second request with it, live or long done). After
-        close() began, `_Closing` (close's snapshot did not see this request: its caller CLOSEs it)."""
+        value is spent for the whole launch (`_Duplicate` for a second request with it, live or long done); with
+        `max_audit_ids` spent, a new value is `_AuditCap` (no row: its value cannot be spent). After close() began,
+        `_Closing` (close's snapshot did not see this request: its caller CLOSEs it)."""
         if r.rid is None:
             return
         with self._live_lock:
@@ -659,6 +674,12 @@ class Decider:
                 raise _Closing
             if r.rid in self._spent:
                 raise _Duplicate
+            if len(self._spent) >= self.limits.max_audit_ids:
+                self.counters["audit_cap"] += 1
+                if self.counters["audit_cap"] == 1:
+                    log.error("launch %s: %d audit values spent: every new request is denied audit_cap",
+                              self.launch_id, len(self._spent))
+                raise _AuditCap
             self._spent.add(r.rid)
             self._live[r.rid] = r
             early = self._early_ended.pop(r.rid, "absent") is None
@@ -671,17 +692,26 @@ class Decider:
         p = r.parsed
         if r.rid is None:
             return self._deny(r, "audit-missing", 403, "decider: the request carries no audit value")
-        r.route = keys.lookup(self.routes, p.canonical_host)   # before _register: an early ENDED row is shaped by it
+        try:                                   # before _register: an early ENDED row is shaped by the route
+            r.route, lookup_failed = keys.lookup(self.routes, p.canonical_host), False
+        except Exception as exc:               # noqa: BLE001: denied below, once the audit value is spent
+            log.error("srt id %s: the route lookup raised %s", r.srt_id, type(exc).__name__)
+            r.route, lookup_failed = None, True
         try:
             self._register(r)
         except _Duplicate:
             self._owe_deny(r, 403, "decider: a second request with one audit value")
+            return
+        except _AuditCap:
+            self._owe_deny(r, 503, "wall: audit_cap")
             return
         except _Closing:
             self._fire(r, Event.CLOSE)
             return
         if r.lc.state not in PENDING:
             return
+        if lookup_failed:
+            return self._deny(r, "internal", 500, "decider: internal error")
         r.mode = self.mode.get()
         w = parse.walls(p) or (_CONTROL if _has_control(p) else None)
         if w is not None:
@@ -704,13 +734,8 @@ class Decider:
             if not self._spool(r):
                 return
             r.body_cut = bool(r.body_cut) or len(r.body or b"") > advert.UPLOAD_PACK_BODY_CAP
-        v = self._classify(r)
-        if v.kind == "wall":
-            return self._deny(r, f"wall:{v.why}", 403, f"wall: {v.why}")
-        if v.kind == "silent":
-            r.step_name = "silent"
-            return self._allow(r)
-        return self._card(r)
+        if not self._acted(r, self._classify(r)):
+            self._card(r)
 
     def _classify(self, r: _Req, form: tuple[parse.QueryParam, ...] | None = None) -> classify.Verdict:
         with self._obs_lock:
@@ -719,6 +744,19 @@ class Decider:
                                 read_shaped=partial(advert.read_shaped, adverts=self.adverts, body_cut=r.body_cut))
         r.verdict = v
         return v
+
+    def _acted(self, r: _Req, v: classify.Verdict) -> bool:
+        """silent -> allowed, wall -> denied, card -> False (the caller files it); any other kind -> denied."""
+        if v.kind == "card":
+            return False
+        if v.kind == "silent":
+            r.step_name = "silent"
+            self._allow(r)
+        elif v.kind == "wall":
+            self._deny(r, f"wall:{v.why}", 403, f"wall: {v.why}")
+        else:
+            self._deny(r, "wall:verdict_kind", 403, "wall: verdict_kind")
+        return True
 
     # --- the body -------------------------------------------------------------------------------------------
     def _spool(self, r: _Req) -> bool:
@@ -810,11 +848,8 @@ class Decider:
                         form = None
                     if form is not None:
                         v = self._classify(r, form)
-                        if v.kind == "wall":
-                            return self._deny(r, f"wall:{v.why}", 403, f"wall: {v.why}")
-                        if v.kind == "silent":
-                            r.step_name = "silent"
-                            return self._allow(r)
+                        if self._acted(r, v):
+                            return
             card = cards.card_input(r.parsed, v, r.strip.stripped, body_len=len(r.body or b""),
                                     body_sha256=r.body_sha, launch_id=self.launch_id)
             if self._fire(r, Event.CARD) is None or r.lc.state is not State.CARD_HELD:
@@ -949,6 +984,10 @@ class _Done(Exception):
 
 class _Duplicate(Exception):
     pass
+
+
+class _AuditCap(Exception):
+    """`max_audit_ids` audit values are spent for this launch."""
 
 
 class _Closing(Exception):

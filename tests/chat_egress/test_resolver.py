@@ -11,12 +11,14 @@ import pytest
 
 from levain.chat_egress import resolver as rs
 
+from .decider_rig import seam_release
+
 
 class Seam:
     """A lookup map; a name in `hang` blocks until `release` is set."""
 
     def __init__(self, answers: dict[str, list[str]], hang: set[str] = frozenset()) -> None:
-        self.answers, self.hang, self.release = answers, set(hang), threading.Event()
+        self.answers, self.hang, self.release = answers, set(hang), seam_release()
         self.calls: list[str] = []
 
     def __call__(self, host: str, port: int) -> list[str]:

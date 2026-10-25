@@ -62,10 +62,9 @@ def _literal(host: str) -> str | None:
 
 
 def system_lookup(host: str, port: int) -> list[str]:
-    """getaddrinfo on the absolute name (an IP literal as it is); the de-duplicated address strings, in the
-    resolver's order."""
-    name = host if _literal(host) is not None else host + "."
-    infos = socket.getaddrinfo(name, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    """getaddrinfo on the absolute name of a DNS name (`Resolver.resolve` answers an IP literal itself and never
+    calls the lookup with one); the de-duplicated address strings, in the resolver's order."""
+    infos = socket.getaddrinfo(host + ".", port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
     out: list[str] = []
     for info in infos:
         addr = info[4][0]

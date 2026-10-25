@@ -7,6 +7,7 @@ the REAL glue and srt in `test_decider_glue.py`.
 
 from __future__ import annotations
 
+import socket
 import threading
 import time
 
@@ -501,40 +502,73 @@ def test_fix2_a_need_body_cut_mid_send_cuts_the_link_and_nothing_follows(rig) ->
 
 
 class _PausedSlots:
-    """`Decider._decisions` with its acquire held at `go` (the link thread paused past the closing check)."""
+    """`Decider._decisions` with its acquire held at `go` (the link thread paused past the closing check); records
+    whether close() had begun (`_closing`) when the pause ended."""
 
-    def __init__(self, real) -> None:
-        self.real, self.reached, self.go = real, threading.Event(), threading.Event()
+    def __init__(self, real, decider) -> None:
+        self.real, self.decider, self.reached, self.go = real, decider, threading.Event(), threading.Event()
+        self.closing_at_resume: bool | None = None
 
     def acquire(self, blocking: bool = True) -> bool:
         self.reached.set()
         self.go.wait(2)
+        self.closing_at_resume = self.decider._closing.is_set()
         return self.real.acquire(blocking=blocking)
 
     def release(self) -> None:
         self.real.release()
 
 
-def test_fix3_a_request_admitted_while_close_snapshots_is_closed_and_joined(rig) -> None:
+def test_fix3_close_waits_for_an_admission_in_progress(rig) -> None:
+    """The pause ends on a timer while close() runs: close may not begin (set `_closing`, take its snapshot) while a
+    request is between the closing check and its thread's start."""
     r = rig()
-    slots = _PausedSlots(r.d._decisions)
+    slots = _PausedSlots(r.d._decisions, r.d)
     r.d._decisions = slots
+    p, rid = r.srt.req("POST", path="/late")
+    assert slots.reached.wait(5)
+    timer = threading.Timer(0.3, slots.go.set)
+    timer.start()
+    try:
+        ok = r.d.close(timeout_s=4)
+    finally:
+        timer.cancel()
+        slots.go.set()
+    assert slots.closing_at_resume is False, "close began while an admission was in progress"
+    assert ok, "a decision admitted during close outlived it"
+    assert r.records.settled(r.launch, rid) is Settled.UNDECIDED
+    assert sorted(r.desk.ended) == sorted(f"card-{i + 1}" for i in range(len(r.desk.filed)))
 
-    class Mode:                                             # close() calls mode.close after its snapshot
+
+def test_fix3_a_decision_admitted_before_the_snapshot_and_registered_after_it_is_closed(rig, monkeypatch) -> None:
+    """The snapshot window: the decision thread is admitted (in close's snapshot) but pauses before it registers until
+    close() has taken its snapshot (mode.close comes after it); it is then CLOSED, files no card, and is joined."""
+    reached, go = threading.Event(), threading.Event()
+    real = keys.lookup
+
+    def paused(routes, host):
+        if host == "late.test":
+            reached.set()
+            go.wait(3)
+        return real(routes, host)
+
+    monkeypatch.setattr(keys, "lookup", paused)
+    r = rig()
+
+    class Mode:
         def get(self) -> str:
             return "gated"
 
         def close(self) -> None:
-            slots.go.set()
-            _until(lambda: bool(r.desk.filed), 1.0)
+            go.set()
 
     r.d.mode = Mode()
-    p, rid = r.srt.req("POST", path="/late")
-    assert slots.reached.wait(5)
+    p, rid = r.srt.req("POST", host="late.test", path="/late")
+    assert reached.wait(5)
     ok = r.d.close(timeout_s=4)
+    go.set()
     assert ok, "a decision admitted during close outlived it"
-    assert r.records.settled(r.launch, rid) is Settled.UNDECIDED
-    assert sorted(r.desk.ended) == sorted(f"card-{i + 1}" for i in range(len(r.desk.filed)))
+    assert r.records.settled(r.launch, rid) is Settled.UNDECIDED and r.desk.filed == []
 
 
 @pytest.mark.parametrize("cts, method", [
@@ -655,3 +689,106 @@ def test_fix9_close_wakes_a_waiting_setting_read_and_reports_a_reader_that_lives
     assert not ok and time.monotonic() - t0 < 3.0
     assert [t.name for t in dm.service_threads()] == ["levain-egress-setting"]   # the waiting decision was woken
     hang.set()
+
+
+# --- L3 r2 (1025+16 RULINGS_R2): close cuts first, the audit-id cap, the verdict kinds, the route lookup -------------
+
+def _fill_send_buffer(sock: socket.socket) -> None:
+    """srt stopped reading long ago: the decider's send buffer is full (junk below any frame boundary srt would read;
+    it never reads again). The fd is non-blocking only while it fills (macOS ignores MSG_DONTWAIT on this socket)."""
+    sock.setblocking(False)
+    try:
+        for size in (65536, 1024, 64, 1):
+            while True:
+                try:
+                    sock.send(b"\0" * size)
+                except BlockingIOError:
+                    break
+    finally:
+        sock.setblocking(True)
+
+
+def test_r2_fix1_close_with_a_decision_blocked_in_its_verdict_send_returns_inside_its_bound(rig) -> None:
+    """Through the request path: a GET's SEND_ALLOW blocks on the full buffer inside its transition (holding the
+    request's transition lock). close() cuts the link before it fires CLOSE, so it never waits on that lock."""
+    r = rig(srt_reads=False)
+    _fill_send_buffer(r.d.link._sock)
+    g, rid = r.srt.req("GET", path="/blocked")
+
+    def blocked() -> bool:
+        q = r.d._live.get(rid)
+        return q is not None and q.lc._transition_lock.locked() and r.d.link._wlock.locked()
+
+    assert _until(blocked), "the verdict send did not block"
+    out: dict = {}
+    c = threading.Thread(target=lambda: out.setdefault("ok", r.d.close(timeout_s=2)), daemon=True)
+    try:
+        c.start()
+        c.join(4)
+        assert not c.is_alive(), "close() waited on the blocked request"
+        assert out["ok"] is True and r.d.link.dead == "the launch closed"
+        rows = r.rows(rid)
+        assert [x.kind for x in rows] == ["egress_attempt", "egress_failed"]
+        assert rows[1].failed_effect == Effect.SEND_ALLOW.value
+    finally:
+        r.srt.sock.close()                                  # unblocks the old code's send so the rig can close
+
+
+def test_r2_fix2_past_the_audit_id_cap_a_request_is_denied_and_no_id_is_reused(rig) -> None:
+    r = rig(limits=dm.Limits(card_poll_s=0.05, stop_drain_s=0.5, max_audit_ids=3))
+    rids = []
+    for i in range(3):
+        g, rid = r.srt.req("GET", path=f"/n{i}")
+        assert action(r.srt.wait(g)) == "allow"
+        rids.append(rid)
+    g, rid4 = r.srt.req("GET", path="/n3")
+    assert [(x["action"], x["status"], x["reason"]) for x in r.srt.wait(g)] == [("deny", 503, "wall: audit_cap")]
+    assert r.rows(rid4) == [] and r.d.counters["audit_cap"] == 1
+    g, _ = r.srt.req("GET", path="/again", rid=rids[0])      # an id below the cap: still a duplicate
+    assert [x["reason"] for x in r.srt.wait(g)] == ["decider: a second request with one audit value"]
+    g, rid5 = r.srt.req("GET", path="/n4")
+    assert [x["reason"] for x in r.srt.wait(g)] == ["wall: audit_cap"]
+    assert r.d.counters["audit_cap"] == 2 and len(r.d._spent) == 3
+
+
+def test_r2_d2_an_audit_id_whose_route_lookup_raised_is_spent(rig) -> None:
+    class Boom(dict):
+        def get(self, host, default=None):
+            if host == "boom.test":
+                raise RuntimeError("the route table")
+            return super().get(host, default)
+
+    class Routes:
+        routes = Boom()
+
+    r = rig(routes=Routes())
+    rid = "2c1f9a0e-7b6d-4e5f-8a9b-0c1d2e3f4a5b"
+    g, _ = r.srt.req("GET", host="boom.test", path="/a", rid=rid)
+    assert [(x["action"], x["status"]) for x in r.srt.wait(g)] == [("deny", 500)]
+    g2, _ = r.srt.req("GET", path="/b", rid=rid)
+    assert [x["reason"] for x in r.srt.wait(g2)] == ["decider: a second request with one audit value"]
+
+
+@pytest.mark.parametrize("where", ["first", "form"])
+def test_r2_d3_a_verdict_kind_outside_silent_card_wall_is_denied(rig, monkeypatch, where) -> None:
+    """Seam: classify's kinds are silent / card / wall today; any other kind fails closed, at either classification."""
+    import dataclasses
+    real = classify.decide
+
+    def seam(parsed, *a, **kw):
+        v = real(parsed, *a, **kw)
+        hit = where == "first" or kw.get("form_params") is not None
+        return dataclasses.replace(v, kind="allow") if hit else v
+
+    monkeypatch.setattr(classify, "decide", seam)
+    r = rig()
+    if where == "first":
+        p, rid = r.srt.req("POST", path="/k")
+    else:
+        p, rid = r.srt.req("POST", path="/k", headers={"content-type": ["application/x-www-form-urlencoded"],
+                                                       "content-length": ["3"]})
+        assert r.srt.wait(p)[0]["action"] == "need_body"
+        r.srt.body(p, b"a=1")
+    v = r.srt.wait(p, 2 if where == "form" else 1)
+    assert (v[-1]["action"], v[-1]["status"], v[-1]["reason"]) == ("deny", 403, "wall: verdict_kind")
+    assert r.desk.filed == [] and r.rows(rid)[0].deciding_step == "wall:verdict_kind"

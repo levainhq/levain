@@ -66,11 +66,27 @@ class NoStore:
         raise keys.CredentialUnreadable("no keychain in tests")
 
 
+#: Every hanging lookup seam's release, so the suite's teardown (conftest) frees seams a test left hung: a hung
+#: lookup holds one of the resolver's process-wide slots until it returns.
+SEAM_RELEASES: list[threading.Event] = []
+
+
+def seam_release() -> threading.Event:
+    e = threading.Event()
+    SEAM_RELEASES.append(e)
+    return e
+
+
+def release_seams() -> None:
+    while SEAM_RELEASES:
+        SEAM_RELEASES.pop().set()
+
+
 class Lookup:
     def __init__(self, answers: dict[str, list[str]] | None = None, hang: set[str] = frozenset()) -> None:
         self.answers = answers or {}
         self.hang = set(hang)
-        self.release = threading.Event()
+        self.release = seam_release()
 
     def __call__(self, host: str, port: int) -> list[str]:
         if host in self.hang:
