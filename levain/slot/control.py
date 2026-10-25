@@ -971,7 +971,7 @@ class Control:
 
     # -- start pass (§1 CONTROL row, §1.3) ---------------------------------------------------------------
 
-    def start(self) -> None:
+    def start(self, *, wake: bool = True) -> None:
         """CONTROL's start pass: load every record, then treat every record whose lease was live as a
         lease EOF (no lease survives a CONTROL restart): ``lease_live:false``, then live state ->
         REVOKED, then the keys drop + reaper wake. Work is retained by END, which the reaper runs.
@@ -992,7 +992,10 @@ class Control:
         :class:`ControlServer`, unlinks the first one's socket. A start that fails after taking it (a route recovery,
         the record load, a journal refused `journal-inconsistent`, the revoke pass) releases it before the failure
         is raised (3c-5 fix 3, L3 r2): a CONTROL that did not start holds nothing, so a replacement in the same process
-        is never refused ``control-running``."""
+        is never refused ``control-running``.
+
+        ``wake=False`` leaves the final reaper wake to the caller, which makes it once its listener is up
+        (:meth:`ControlServer.start`: the woken reaper dials CONTROL's socket)."""
         if self.tickets is not None:
             try:
                 self.tickets.acquire()
@@ -1000,7 +1003,7 @@ class Control:
                 self.seam_errors.append(("start", "", e))
                 raise
         try:
-            self._start_pass()
+            self._start_pass(wake)
         except BaseException:
             if self.tickets is not None:
                 self.tickets.close()
@@ -1008,7 +1011,7 @@ class Control:
                 self.lineage.close()
             raise
 
-    def _start_pass(self) -> None:
+    def _start_pass(self, wake: bool = True) -> None:
         """:meth:`start` after the journal lock: the route maps' start pass, the records, the ticket journal, the
         revoke pass."""
         if self.routes is not None:
@@ -1031,7 +1034,8 @@ class Control:
             self._drop(rec.session)
         # always (3c-7 fix r1, obs 2): the pool mirror starts empty and admits no mint until root's next SLOT-SYNC,
         # which the woken reaper's pass sends
-        self._wake()
+        if wake:
+            self._wake()
 
     def stop(self) -> None:
         """Stop serving WITHOUT revoking: the records stay as they are, and the next :meth:`start` revokes
@@ -2377,8 +2381,9 @@ class ControlServer:
         self._stop = threading.Event()
 
     def start(self) -> None:
-        """The start pass first (no request is served before every live record is revoked), then bind."""
-        self.control.start()
+        """The start pass first (no request is served before every live record is revoked), then bind, then the
+        reaper wake: the woken reaper dials this socket, so it is listening and accepting before the wake."""
+        self.control.start(wake=False)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             self.path.unlink()
@@ -2392,6 +2397,7 @@ class ControlServer:
         t = threading.Thread(target=self._accept_loop, daemon=True, name="control-accept")
         t.start()
         self._threads.append(t)
+        self.control._wake()
 
     def _accept_loop(self) -> None:
         assert self._listener is not None

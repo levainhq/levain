@@ -340,3 +340,31 @@ def test_pool_with_no_ticket_store_refuses(tmp_path):
         assert control.seam_errors == []
     finally:
         control.stop()
+
+
+# ---- r3: the start wake runs only after CONTROL's socket is listening --------------------------------------------
+
+def test_server_start_wakes_the_reaper_only_after_the_socket_listens():
+    """codex r2 MED: a wake that connects to CONTROL (the reaper's first pass dials it) must find the listener up."""
+    d = Path(tempfile.mkdtemp(prefix="lv3c7", dir="/tmp"))
+    (d / "sessions").mkdir(mode=0o700)
+    path = d / "c.sock"
+    reached: list = []
+
+    def wake() -> None:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            c.connect(str(path))
+            reached.append(True)
+        except OSError:
+            reached.append(False)
+        finally:
+            c.close()
+
+    control = C.Control(C.StateStore(d / "sessions"), os.getuid(), wake_reaper=wake)
+    server = C.ControlServer(control, path)
+    server.start()
+    try:
+        assert reached == [True]
+    finally:
+        server.stop()

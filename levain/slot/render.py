@@ -342,7 +342,7 @@ def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | Non
         raise Refused("ticket-driver-mismatch", "the blob's driver is not the ticket's driver_template")
 
 
-# --- env (§3.4)---------------------------------------------------------------------------------------------
+# --- env (§3.4) ---------------------------------------------------------------------------------------------
 
 def _base_env(facts: RenderFacts, home: PurePosixPath, user: str) -> dict[str, str]:
     S = facts.S
