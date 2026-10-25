@@ -606,3 +606,11 @@ def test_an_encoded_percent_or_semicolon_on_a_keyed_route_is_keyless(path):
     assert not advert.key_allowed(_get(path), rt), path
     assert not advert.key_allowed(_post_at(path), rt), path
     assert advert.key_allowed(_get(path), None), path
+
+
+def test_the_keyless_escape_set_is_exactly_these_four():
+    """Item 15 (session A L1-2): the `%5C` cases above already wall `path`, so they cannot show `%5C` is in the set;
+    the set's members are asserted directly (upper case: R-2's canonical form upper-cases every escape it keeps)."""
+    assert advert.KEYLESS_ESCAPES == ("%2F", "%5C", "%25", "%3B")
+    for esc in advert.KEYLESS_ESCAPES:
+        assert parse.canonical_path("/o/r.git/x" + esc.lower() + "y", "GET")[0] in (None, "/o/r.git/x" + esc + "y")
