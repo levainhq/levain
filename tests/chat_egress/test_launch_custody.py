@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import os
 import re
+import shutil
 import socket
 import ssl
 import stat
@@ -51,7 +52,21 @@ def private_key_files(root: Path) -> list[Path]:
 
 
 def open_regular_files(pid: int) -> list[Path]:
-    out = subprocess.run(["/usr/sbin/lsof", "-n", "-P", "-Fn", "-a", "-p", str(pid), "-d", "^txt"],
+    """The regular files ``pid`` holds open: ``/proc/<pid>/fd`` where it exists (Linux has no ``/usr/sbin/lsof``
+    on a stock runner), else ``lsof``."""
+    fds = Path("/proc") / str(pid) / "fd"
+    if fds.is_dir():
+        paths = []
+        for fd in fds.iterdir():
+            try:
+                paths.append(Path(os.readlink(fd)))
+            except OSError:
+                pass
+        return [p for p in paths if p.is_file()]
+    lsof = "/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else shutil.which("lsof")
+    if lsof is None:
+        pytest.skip("neither /proc/<pid>/fd nor lsof is here")
+    out = subprocess.run([lsof, "-n", "-P", "-Fn", "-a", "-p", str(pid), "-d", "^txt"],
                          capture_output=True, text=True, timeout=30).stdout
     paths = [Path(line[1:]) for line in out.splitlines() if line.startswith("n/")]
     return [p for p in paths if p.is_file()]
