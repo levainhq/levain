@@ -286,6 +286,15 @@ def parse_pool_config(data: bytes) -> tuple[int, int]:
     return obj["slots"], obj["verifier_slots"]
 
 
+def policy_limits_path(host: HostOS) -> Path:
+    """``L/policy/limits``: the slot sessions' limits (``levain-limits/1``), root 0644, written only by the install
+    helper's ``set-limits``, read by the queue broker, removed by ``undo``. Setup writes nothing here (no file is
+    the defaults)."""
+    from levain.qbroker.limits import POLICY_LIMITS
+
+    return STORE[host] / "policy" / POLICY_LIMITS
+
+
 def pool_config_steps(host: HostOS, slots: int, verifier_slots: int) -> list[Step]:
     """Setup's ``--slots`` / ``--verifier-slots``, the counts ``replenish`` fills back to. Written by every setup
     run: a re-run is planned at its journal's counts (§25), so it writes the same record."""
