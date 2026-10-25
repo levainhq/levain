@@ -9,6 +9,7 @@ in `test_cards_states_page.py` (ruling 5's header assertion).
 from __future__ import annotations
 
 import shutil
+from datetime import timedelta
 
 import pytest
 
@@ -55,7 +56,7 @@ def test_the_listing_serves_the_cards_state_for_egress_rows_only(tmp_path, monke
         rows[name] = (c, r)
     records.write_outcome(live, wire.ObsResponse(rows["completed"][0]["request"], 201, None, None), rec.CT_ABSENT)
     other = q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": "ls"},
-                   cwd="/w", hold=__import__("datetime").timedelta(minutes=5), event_id="e")
+                   cwd="/w", hold=timedelta(minutes=5), event_id="e")
     ck = Cockpit()
     ck.attach_consent_rows(_ConsentReader(consent))
     by_id = {r["id"]: r["facets"] for r in ck.panel("decisions", credential_class="token")["rows"]}
@@ -93,7 +94,7 @@ def _panel_facets(consent):
 @needs_ssh
 def test_another_tools_entry_is_never_parsed_for_the_word(tmp_path, monkeypatch):
     # r1 ruling 1: the tool check comes before the body is read
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timezone
     from levain.consent import listing
 
     consent, log, q = _setup(tmp_path, monkeypatch)
@@ -197,3 +198,29 @@ def test_the_page_has_a_label_for_every_card_state_and_unreadable():
     js = (Path(__file__).resolve().parents[2] / "levain/templates/web/dashboard_core.js").read_text()
     table = js[js.index("const EGRESS_WORDS = {"):js.index("};", js.index("const EGRESS_WORDS = {"))]
     assert set(re.findall(r"^\s*([a-z_]+):", table, re.M)) == {s.value for s in CardState} | {"unreadable"}
+
+
+@needs_ssh
+def test_a_write_locked_dispatch_store_reads_unreadable_fast_for_the_panel(tmp_path, monkeypatch):
+    # the store is WAL: a plain BEGIN IMMEDIATE / EXCLUSIVE never blocks a reader, so the holder takes the file whole
+    # (locking_mode=EXCLUSIVE) as a connection that has it open would
+    import sqlite3
+    import time
+
+    consent, log, q = _setup(tmp_path, monkeypatch)
+    store = CoordStore(consent)
+    (c, r), = _allowed_cards(q, log, store, 1)
+    holder = sqlite3.connect(consent / "dispatch.db", isolation_level=None)
+    holder.execute("PRAGMA locking_mode = EXCLUSIVE")
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("CREATE TABLE IF NOT EXISTS lockprobe (a)")
+    try:
+        ck = Cockpit()
+        ck.attach_consent_rows(_ConsentReader(consent))
+        t0 = time.monotonic()
+        by_id = {x["id"]: x["facets"] for x in ck.panel("decisions", credential_class="token")["rows"]}
+        elapsed = time.monotonic() - t0
+    finally:
+        holder.close()
+    assert by_id[f"consent:{r.id}"]["egress_state"] == "unreadable"
+    assert elapsed < 1.0, elapsed

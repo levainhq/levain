@@ -468,10 +468,13 @@ def _decision_rows_in(got: Any) -> list[RowIn]:
     return rows
 
 
+PANEL_EGRESS_BUSY_TIMEOUT = 0.2   # seconds: a write-locked dispatch store reads "unreadable" for the panel, never a ~2 s poll stall
+
+
 def _egress_lookup_of(reader: Any) -> Callable[[str, str], tuple[Any, bool]] | None:
     from levain.consent.listing import egress_reading
 
-    return egress_reading(reader)
+    return egress_reading(reader, busy_timeout=PANEL_EGRESS_BUSY_TIMEOUT)
 
 
 def _consent_rows_in(got: Any, egress_lookup: Callable[[str, str], tuple[Any, bool]] | None = None
@@ -1435,7 +1438,12 @@ class Cockpit:
         if fn is None:
             return Absent("no consent queue")
         got = fn(ctx.now)
-        mine = SimpleNamespace(**{part: tuple(e for e in getattr(got, part) if f"{CONSENT_ROW_PREFIX}{e.request.id}" == row_id)
+        def is_mine(e: Any) -> bool:
+            try:
+                return f"{CONSENT_ROW_PREFIX}{e.request.id}" == row_id
+            except Exception:  # noqa: BLE001 - an entry whose request cannot be read is skipped, as _consent_rows_in counts it bad
+                return False
+        mine = SimpleNamespace(**{part: tuple(e for e in getattr(got, part) if is_mine(e))
                                   for part in ("pending", "undecided", "recent")})   # only this entry is built and looked up
         for r in _consent_rows_in(mine, _egress_lookup_of(fn))[0]:
             if r.id == row_id:

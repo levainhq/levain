@@ -241,18 +241,20 @@ def egress_state_of(entry: ConsentEntry, lookup: Callable[[str, str], tuple[Any,
         return UNREADABLE
 
 
-def egress_reading(reader: object) -> Callable[[str, str], tuple[Any, bool]] | None:
+def egress_reading(reader: object, busy_timeout: float | None = None) -> Callable[[str, str], tuple[Any, bool]] | None:
     """A read-only reading of the chat egress rows (``EgressReader.reading``) over the dispatch store beside the queue
     ``reader`` lists (``dispatch.db`` lives in the consent directory), or None for a reader naming no queue: never the
     default queue's then, as the proposals route. The reading is meant for ONE listing build (or one body read): the
     first failure is kept and raised again for every later request, so a locked or corrupt store costs one failed read
-    per build, never one per card."""
+    per build, never one per card. ``busy_timeout`` (seconds) is how long a read waits on a locked store; None keeps
+    ``EgressReader``'s default."""
     from levain.chat_egress.records import EgressReader
     from levain.consent.queue import default_queue_dir
 
     if not hasattr(reader, "directory"):
         return None
-    egress = EgressReader(reader.directory if reader.directory is not None else default_queue_dir())
+    egress = EgressReader(reader.directory if reader.directory is not None else default_queue_dir(),
+                          **({} if busy_timeout is None else {"busy_timeout": busy_timeout}))
     failed: list[Exception] = []
 
     def reading(launch_id: str, request_id: str) -> tuple[Any, bool]:

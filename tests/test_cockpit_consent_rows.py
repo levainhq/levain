@@ -408,3 +408,25 @@ def test_an_undecided_row_is_drawn_waiting_not_answered(tmp_path, monkeypatch):
     cls, text = out[-1]
     assert "ext-accent" in cls and "ext-dim" not in cls, out
     assert "undecided" in text and "decided " not in text.replace("undecided ", ""), out
+
+
+def test_read_one_skips_an_entry_whose_request_cannot_be_read(tmp_path):
+    from types import SimpleNamespace
+
+    qdir, waiting, done = _filed(tmp_path)
+
+    class Unreadable:
+        state = "pending"
+
+        @property
+        def request(self):
+            raise ValueError("a request that does not parse")
+
+    def reader(now):
+        got = read_listing(qdir, now=now)
+        return SimpleNamespace(pending=(Unreadable(), *got.pending), undecided=got.undecided, recent=got.recent)
+
+    ck = _ck()
+    ck.attach_consent_rows(reader)
+    one = ck.read_one("decisions", f"consent:{waiting.id}")
+    assert isinstance(one, Read) and one.value["id"] == f"consent:{waiting.id}"
