@@ -259,7 +259,7 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
                 with stderr.open("w") as err:
                     proc = subprocess.Popen(argv, pass_fds=child, env={}, stdin=subprocess.DEVNULL,
                                             stdout=subprocess.DEVNULL, stderr=err)
-                own("glue", lambda: _end_glue(proc))
+                    own("glue", lambda: _end_glue(proc))    # inside the block: a failing close of `err` still ends it
                 pem = memoryview(ca_pem)
                 while pem:                       # a short write would hand the glue a truncated CA
                     pem = pem[os.write(ca_w, pem):]

@@ -165,3 +165,42 @@ def test_stop_whose_decider_close_raises_still_closes_socks(tmp_path, origin, mo
     assert out.glue_exit == 0 and out.socks_clean and not out.decider_clean
     assert _egress_threads() == [] and dm.service_threads() == []
     assert [f.split(":")[0] for f in out.failures] == ["decider"]
+
+
+# --- S8D r1 DS item 4: an OSError closing the glue's stderr file never leaves the glue unowned ---------------------
+
+class _StderrCloseFails:
+    """The glue's stderr file, whose close (the `with` block's exit) raises OSError after really closing."""
+
+    def __init__(self, f) -> None:
+        self._f = f
+
+    def fileno(self) -> int:
+        return self._f.fileno()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._f.close()
+        raise OSError(errno.EIO, "close failed")
+
+
+@pytest.mark.chat_egress_srt
+def test_an_oserror_closing_the_glue_stderr_still_ends_the_glue(tmp_path, origin, monkeypatch) -> None:
+    import pathlib
+    real_open = pathlib.Path.open
+
+    def opener(self, mode="r", *a, **kw):
+        f = real_open(self, mode, *a, **kw)
+        return _StderrCloseFails(f) if self.name.endswith(".glue-stderr") and mode == "w" else f
+    monkeypatch.setattr(pathlib.Path, "open", opener)
+    before = {p.pid for p in _node_children()}
+    with pytest.raises(lm.EgressRefused, match="did not start"):
+        lm.stop_egress(_start(tmp_path, origin, monkeypatch))
+    left = {p.pid for p in _node_children()} - before
+    print(f"RUN S8D DS-4: node children left after the refused launch: {sorted(left)}")
+    for pid in left:                                   # the red case: the orphaned glue, killed so the run ends clean
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+    assert left == set()
