@@ -214,8 +214,10 @@ differently per drive:
 ⚠ **UNATTENDED OPERATION IS NOW A v1 CLAIM** (K4a — ``levain daemon install-seat`` runs a governed
 seat on a schedule). This paragraph used to say the opposite, and said it correctly while the gate
 was still a spec. What remains ABSENT is not the gate but the per-domain threshold POLICY
-(``spore-417``): the stakes/context escalators, capability recalibration, and any GRADUATION to
-unattended-efferent firing. **Nothing graduates; everything efferent gates.** So v1 = **structural
+(``spore-417``): the stakes/context escalators, capability recalibration, and a graduation tier of
+the gate's own. **Nothing graduates without the operator's explicit ratification; everything efferent
+gates** (a standing grant's posture is loosened only as a re-ratification the operator applies: a new
+sealed grant replacing the old, :mod:`levain.autonomic.graduation`). So v1 = **structural
 floor + the efferent gate + you-in-the-loop wherever you are present.**
 
 Pure stdlib (``os`` / ``platform`` / ``subprocess`` / ``tempfile`` / ``pathlib`` / ``threading``) —
@@ -270,6 +272,9 @@ __all__ = [
     "CrownJewelsPolicy",
     "build_policy",
     "crown_jewel_reason",
+    "levain_home_base",
+    "levain_home_spellings",
+    "too_wide_to_deny",
     "ConfinementConfig",
     "load_confinement_config",
     "ShellResult",
@@ -2086,14 +2091,28 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
 _MAX_LISTED_STORES = 256
 
 
+def too_wide_to_deny(d: Path, home: Path, *within: Path) -> bool:
+    """Whether the subtree ``d`` is too wide to deny whole: a filesystem root, two path parts or fewer, a
+    shared temp directory, or a directory that is or holds ``home`` or any of ``within`` (by file identity,
+    :func:`_inside_by_identity`). A ``d`` INSIDE one of them is not too wide. The one predicate for the floor
+    (:func:`_hides_the_entity`, ``within`` = the entity and its workspace) and the consent adapters'
+    ``protected_paths`` (``within`` = the event's cwd when it has one)."""
+    shared = {Path("/tmp").resolve(), Path("/var/tmp").resolve()}
+    try:
+        shared.add(Path(tempfile.gettempdir()).resolve())
+    except Exception:  # noqa: BLE001 - no usable temp directory: the fixed /tmp and /var/tmp checks stand
+        pass
+    return (str(d) == d.anchor or len(d.parts) <= 2 or d in shared
+            or any(_inside_by_identity(d, p) for p in (home, *within)))
+
+
 def _hides_the_entity(d: Path, home: Path, entity_dir: Path, workspace: Path) -> bool:
     """Whether denying the subtree ``d`` would hide the entity's own home, entity or workspace, or ``d`` is
-    a filesystem root or a shared temp directory. A ``d`` INSIDE the entity or its workspace is hideable
-    (the floor already hides the entity's own confinement config that way). The one test for the levain
-    jewels: the levain home, its named state directories and the cockpit roots its consent settings name."""
-    shared = {Path("/tmp").resolve(), Path("/var/tmp").resolve(), Path(tempfile.gettempdir()).resolve()}
-    return (str(d) == d.anchor or len(d.parts) <= 2 or d in shared
-            or any(_inside_by_identity(d, p) for p in (home, entity_dir, workspace)))
+    a filesystem root or a shared temp directory (:func:`too_wide_to_deny`). A ``d`` INSIDE the entity or
+    its workspace is hideable (the floor already hides the entity's own confinement config that way). The
+    one test for the levain jewels: the levain home, its named state directories and the cockpit roots its
+    consent settings name."""
+    return too_wide_to_deny(d, home, entity_dir, workspace)
 
 
 def _unhideable(d: Path, home: Path, entity_dir: Path, workspace: Path) -> bool:
@@ -2112,6 +2131,28 @@ LEVAIN_HOME_STATE_DIRS = (AUTONOMIC_STORE_DIR, COCKPIT_KEY_DIR, "consent", GRANT
                           _ssh_agent.HOST_KEYS_DIR, "coordinator")
 
 
+def levain_home_base(home: Path) -> Path:
+    """The levain home the floor denies, ``$LEVAIN_HOME`` else ``<home>/.levain``, absolute (an empty
+    ``$LEVAIN_HOME`` is unset, a relative one is taken against the cwd now), not resolved: the floor adds
+    the other spellings. Raises :class:`ConfinementError` when it cannot be resolved (fail-closed)."""
+    return levain_home_spellings(home)[0]
+
+
+def levain_home_spellings(home: Path) -> tuple[Path, list[Path]]:
+    """:func:`levain_home_base` and its :func:`_spellings`, under one ``ConfinementError`` naming
+    ``$LEVAIN_HOME`` as written when either step fails. The consent adapters derive the directory they
+    protect from file tools from it too (``levain.consent.adapters.claude_code.protected_paths``)."""
+    raw = os.environ.get("LEVAIN_HOME")
+    try:
+        base = Path(raw).expanduser() if raw else home / ".levain"
+        base = Path(os.path.abspath(base))
+        return base, _spellings(base)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfinementError(
+            f"$LEVAIN_HOME={raw!r} cannot be resolved ({exc}) — refusing to build the floor (fail-closed)."
+        ) from exc
+
+
 def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path) -> tuple[Path, list[Path]]:
     """The floor's subtrees for the levain home, ``$LEVAIN_HOME`` else ``~/.levain``, made absolute as its
     readers make it (``levain.autonomic.db.default_store_dir``, ``levain.consent.queue.default_queue_dir``:
@@ -2125,15 +2166,7 @@ def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path) -> tuple[
     name: the shape before the whole-home deny plus the consent queue, so that layout keeps the old class
     edge (a new directory must add itself to the tuple). Refuses (fail-closed) a home that cannot be
     resolved, or a named directory that would hide the entity's own home, entity or workspace."""
-    raw = os.environ.get("LEVAIN_HOME")
-    try:
-        base = Path(raw).expanduser() if raw else home / ".levain"
-        base = Path(os.path.abspath(base))
-        whole = _spellings(base)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ConfinementError(
-            f"$LEVAIN_HOME={raw!r} cannot be resolved ({exc}) — refusing to build the floor (fail-closed)."
-        ) from exc
+    base, whole = levain_home_spellings(home)
     if not any(_hides_the_entity(d, home, entity_dir, workspace) for d in whole):
         return base, whole
     out: list[Path] = []

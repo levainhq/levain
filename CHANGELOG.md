@@ -18,6 +18,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **`levain doctor` has a `slot limits` row**: the limits each agent's slot sessions run under and where they come
   from. It fails when the file is unusable and warns when the queue broker is not running.
 
+### Fixed
+- **A Claude Code or Codex file edit inside the Levain home now asks for consent.** An edit to Levain's own state (for
+  example the autonomic binding store) is agent config, matching what the confinement floor already denies. With
+  `LEVAIN_HOME` set to a directory Levain cannot protect whole (`/tmp`, a top-level directory, or one that holds your
+  home or project), only Levain's own state directories there count; a `LEVAIN_HOME` that cannot be resolved keeps the
+  default Levain home protected instead of denying every call. Shell commands are still not parsed.
+
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - **The queue broker enforces slot limits.** A slot session's calls are counted against `L/policy/limits` (defaults
   when there is no file). A session that reaches a limit stays stopped until that limit is raised or a new session
@@ -85,6 +92,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   input; the seed's wrap steps no longer say `prepare_wrap` returns association context, so a fresh install
   reads its 1.0.2 migration proposal as already reconciled instead of pending.
 
+
 ### Fixed
 - **The phone server no longer writes its token into its log.** With `--link-file`, the token goes only into that
   0600 file, and the line naming the file is printed only after the file holds the link. Without `--link-file` the
@@ -145,6 +153,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   when the card declares `transient_prefix` and the seat is among its readers; otherwise it opens the agent page, as
   before. A departed reader's refusal is shown as the provider sent it. The departed-reader notice now reads "that
   reader is gone, choose again".
+
 
 ### Fixed
 - **The cockpit message card's default reader and its departed-reader recovery are declared by the provider, not built
@@ -300,6 +309,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **The keys service no longer relays websockets.** The relay added in 0.11.20 (see its Groundwork entry) is deleted:
   every brokered route the keys service serves is now metered, and a metered route refuses an upgrade
   (`body-unbounded:websocket`), so nothing could reach it. The front's own websocket path is unchanged.
+
 
 ### Fixed
 - **The cockpit no longer breaks at half-screen widths.** At 864 to 1040 px the jar and live dot sat over the tabs; the
@@ -471,6 +481,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
   one outcome classifier), the publish that exchanges the result tree in atomically, a root verification verb with a
   bounded `git fsck` output reader, and a tree reader. Nothing calls them from `levain adopt` yet.
 
+
 ### Fixed
 - **The isolation install helper no longer refuses on a service that is still unloading.** This happened in `undo` right
   after `setup`, and in a re-run setup that stops the services of an earlier generation. After `launchctl bootout`, the
@@ -487,6 +498,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
   `levain dispatch file --dispatch-dir`, which is the real flag.
 
 ## [0.11.16] — 2026-10-22
+
 
 ### Fixed
 - **The cockpit's theme switch keeps every key the same size on a phone.** At phone width the selected light or dark
@@ -577,6 +589,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
   - Levain's own MCP servers (anneal_memory, levain_band, levain_dispatch) are approved in that install, so a
     coordinator starting in the background no longer waits on Claude Code's "new MCP servers found" dialog, which
     nobody can answer there. A server you add yourself still asks.
+
 
 ### Fixed
 - **The phone page's top bar holds on a narrow phone.** On a narrow phone, or a wider font, the theme switch could
@@ -673,6 +686,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
 - **The dispatch job store moves to format 4** the first time this version opens it. Your jobs are kept. After that,
   Levain 0.11.13 refuses to open the store, so do not downgrade.
 
+
 ### Fixed
 - **A job's capability no longer starts with `-`.** About one in 64 capabilities that 0.11.10 to 0.11.13 handed a
   planner began with a dash, and `--capability <it>` was refused as a missing value. New ones never do. A job filed
@@ -738,6 +752,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
   - **The dispatch job store moves to format 2** the first time this version opens it. Your jobs are kept. After that,
     Levain 0.11.10 refuses to open the store, so do not downgrade.
   - `levain doctor` has a new row, "dispatch adoption rules".
+
 
 ### Fixed
 - Setting your state line, from the cockpit, the web page, the terminal view, the phone app or
@@ -903,6 +918,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
   the package, version and index for `levain publish`; the agent, session, limit and counts for an extend. They used to
   read "none named: the working directory".
 
+
 ### Fixed
 - **An OpenHands entity's turn runs once.** Saving a finished turn to memory used to run the conversation again, unchecked:
   a turn stopped by `--max-iterations` (or any run the runtime ends in its error or stuck state) started over with a fresh
@@ -1038,6 +1054,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
 
 ## [0.11.9] — 2026-10-19
 
+
 ### Fixed
 - **The confined shell starts again on a machine where Claude Code has run.** In 0.11.7 and 0.11.8 levain refused to give a session its shell when any file under `~/.claude` or `~/.codex` had a second hard link, and Claude Code's own file-history backups have them, so the shell was unavailable to almost every Claude Code user, on macOS and on Linux. The check now covers what those tools load as configuration: the files directly in `~/.claude` and `~/.codex` (and in `CLAUDE_CONFIG_DIR` / `CODEX_HOME` when they are set), the hooks, agents, commands, prompts, skills, plugins, rules, output-styles, scripts and bin directories under them, and Claude Code's project memory. A second hard link to one of those still refuses the shell, naming the file.
 - **`sudo levain setup-isolation` on Linux refuses before it changes anything when `setfacl` is missing** (install the `acl` package), in a dry run too. Before, it stopped part way and left a user behind, and `--undo` crashed the same way; `--undo` now stops and names the package. Repairing an existing setup does not need it.
@@ -1108,6 +1125,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
 - **The Decisions view offers a standing-rule proposal card.** When you have allowed the same agent, tool and working directory by hand three times in the last 14 days, it shows the one `levain consent grant create` line (7 days, `default` permission mode) that would make that a grant. The page signs nothing; the card is text and a copy button, shown only to a page holding its token. Nothing the log would refuse is proposed (a shell tool under any name, a tool levain does not know for that agent, an MCP tool off the read-only list, a tool name of a shape the log does not take, a request at the agent-config tier, a working directory that no longer exists, or that is `/`, your home directory or above it, once symlinks are followed; the card names the resolved directory); any denial of the same agent, tool and directory in the window withdraws the card, and a key whose latest decision was answered by a standing grant shows none. The evidence is counted per key in the queue database over the whole window, so no number of newer requests of other keys can hide a card or its denial; at most three cards are offered, the most hand-allowed key first, then the most recent, and the page draws every card offered. A Decisions panel whose data errored shows no card, and a reload of the dashboard reads the cards again, so a denial or a grant answered since withdraws one. Known edges: the card counts hand-allows by agent, tool and working directory, but the grant it proposes answers only requests whose targets are inside the workspace, so approvals of out-of-workspace targets can yield a card whose grant would not cover them; after the grant a card proposed expires, the card stays hidden until your next hand-allow; the per-key count does not re-check each request's seal, so a same-user tamper with the queue database could raise a card (the page signs nothing, and the grant still needs your signing key at a terminal).
 - **Known edge, the proposal card (planned fix):** every grant the card helps create is a class of action you stop seeing. The gate itself stays intact, but the choices you are offered drift toward your own yes-pattern. A periodic digest of what grants answered unseen (planned, a later 1.0 row; not shipped) is what closes it.
 
+
 ### Fixed
 - **A row you opened in the cockpit stays open when the page redraws.** A store write (a seat adding or touching a spore), the refresh button or returning to the tab redrew the board and closed every expanded row and reset each panel's scroll; now the rows you opened, and each panel's scroll, come back, in the board, the focus view and a panel's own refresh, keyword search answers included. Known edges: a row is matched by its id inside its panel, so a row that is gone stays closed; a panel whose rows arrive late (a store search) keeps what you held for 15 seconds; a focus view rebuilt twice before its search answers keeps only the second rebuild's state.
 
@@ -1124,6 +1142,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
 
 ### Added
 - **`levain consent away [show|on|off] [--agent claude_code|codex|all] [--hold SECONDS]` sets away mode without editing a file.** Away mode is what lets a signed answer reach the agent: off (what `levain init` writes), the consent hook answers only by a standing grant and otherwise leaves the agent's own dialog to ask you at once, so `levain consent answer` and the phone have nothing to answer; on, the hook holds each request no grant answers for up to the hold (more than 0 and at most 840 seconds, the longest the hook waits; default the file's hold, else 300 for Claude Code and 120 for Codex) so you can answer it. Claude Code shows its own dialog during the hold as well (an allow from the hook dismisses it); Codex shows no dialog until the hold ends, so for Codex away means away. `on` refuses when the install's cockpit has no enrolled key to sign an answer (or the settings name no cockpit, or it does not replay). Before this the only way to turn it on was editing `<levain home>/consent/claude_code.json` or `codex.json`. The verb changes only `away_mode` and `away_hold_seconds` in those files, keeps every other key, never creates one (`levain init` does, naming the install's cockpit), refuses a symlinked file or a queue directory that is not 0700 and yours, and replaces the file atomically; `show` (the default) prints each agent's mode and hold as its hook reads them, and whether an answer could verify, and writes nothing. Away mode grants nothing: every answer still verifies as a signature. Both hooks and this verb now read the settings file through one reader: a hold written as an integer too large for a number, or a file nested too deep to parse, reads as the defaults instead of stopping the hook (which then gave no decision). Known edges: two `away` runs at the same instant can each write, the last one winning; a Claude Code request you answer in the dialog stays listed on the phone until its hold ends, and an answer to it there does nothing; `on` checks that some enrolled key can sign, not that one covers T3, so with only a key that cannot sign T3 an edit of agent config waits out its hold; a hook installed with a shorter `--max-hold` than the default waits less than the hold `show` prints.
+
 
 ### Fixed
 - **A standing consent grant on an MCP tool could answer an edit of agent config or hooks when the server names its path in a field levain did not know.** Edits of agent config and hooks (Claude Code and Codex settings and hook files, `.mcp.json`, `~/.claude.json`, plugin hooks, CODEX_HOME, levain's own installed code) go to you, never to a grant; for an MCP tool levain read only the fields `file_path`, `path`, `paths`, `notebook_path`, `source` and `destination`, so a grant on, say, a write tool taking `filepath` allowed a write to `.claude/settings.json` (reproduced with a real signed grant through the Claude Code hook). Every string key and value in an MCP tool's input (an object or not), at any depth, is now checked as a path, as given and also cut at a NUL, trimmed of whitespace, percent-decoded, read as a `file:` URI (its host, query and fragment dropped), these in any combination, and with `./`, `..` and repeated slashes collapsed (as a server's own path resolving would), and a string naming a directory that holds agent config or the code the consent hook runs (a `.claude`, `.codex` or `.claude-plugin` directory, your home directory, a levain install's `activation/hooks`, levain's own package, the directory holding the cockpit's authority database, or this Python's site directories, where a `.pth` file runs at every interpreter start), or a file called `.claude.json`, also goes to you (a server can take the directory and the file name in two fields). An input with more than 4096 strings or 16384 values, nested more than 64 deep, or whose spellings total more than 256 KiB goes to you. A request whose text merely names such a file (a search for `.mcp.json`) now also goes to you.
@@ -1144,6 +1163,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
 
 ### Changed
 - The phone consent page (`levain consent phone`) now matches the cockpit's look (palette, type, card shapes, buttons; light and dark by the phone's setting); nothing it shows or signs changed. Known edges, phone page look: the waiting card's accent top line stays on a card already answered until you refresh (the page's script draws it, outside a look-only change); in light mode allow and deny differ mainly by hue, so the words "allow" and "deny" are always spelled out.
+
 
 ### Fixed
 - **Security: a confined `levain run` entity could read and rewrite the consent queue, and forge the cockpit authority it is checked against.** The confinement floor hid `<levain home>/autonomic` and `<levain home>/keys` by name; the consent queue directory (`~/.levain/consent`, or under `$LEVAIN_HOME`), added later, was not among them, and neither was the cockpit data root its settings name (`<install>/.levain/cockpit`, which holds the authority log and its anchor). An entity's shell could read every Claude Code and Codex consent request, rewrite `claude_code.json` or `codex.json`, or replace that cockpit's authority log and anchor together with its own key, after which the consent hook allowed requests by the entity's grants and answers (measured). The floor now denies the whole levain home, read and write, as one subtree, so a directory levain adds there later is covered from the start, and it denies every cockpit data root the consent settings name. Upgrade if you run entities with `levain run` on a machine whose Claude Code or Codex installs use the consent hook.
@@ -1167,6 +1187,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
 ### Added
 - **Answer an agent's consent request from your phone, with a passkey.** `levain consent phone` serves a small consent page on its own loopback port (default 7428) for an https proxy you run to put on a name your phone reaches (`--tailscale` finds this machine's tailnet name and prints the `tailscale serve` line; `--name` names any other proxy's). From the page you read each waiting request (the agent, the tool, the request as filed, where) and answer it with "allow with passkey" or "deny with passkey". The phone signs the exact answer record; the phone port turns the WebAuthn signature into an OpenSSH one and the queue verifies it with `ssh-keygen` against the cockpit's authority log, as for `levain consent answer`. The page also makes the phone's passkey and shows the laptop commands that enrol it; a passkey never enrols itself. A new custody word, `passkey`, is for a `display-phone` key only: it allows up to T2 and denies any request, so a T3 row offers deny only and a T3 allow is refused by the server. The phone port serves nothing else (not the cockpit, not the install), and its link carries its own token, which opens nothing on the cockpit.
 - Known edges, phone answers: (1) the passkey prompt shows no request text; the page shows it and the signature covers exactly that request. (2) A passkey is made for one https name; a renamed machine or tailnet needs a new one. (3) Anyone holding the phone link who reaches the name can read the waiting requests until the phone port stops. (4) The page is served by your own user account, and levain does not confine a Claude Code or Codex session, so answer only on a phone port you started. (5) When more than one passkey is enrolled on a name and this browser made none of them, the page asks which one, and the phone's own prompt may then offer another; that answer is refused at verify, never recorded. (6) An iCloud or Google passkey syncs with its account and reports no signature counter, so a cloned one cannot be detected. (7) The phone port answers every connection that reaches it before the token is checked, so a device on your tailnet can hold connections open (each times out after 30 seconds); it reads and answers nothing without the token. (8) Cancelling the phone's passkey prompt reads to the page the same as a passkey the phone no longer holds, so the page forgets which passkey this browser made; with more than one passkey enrolled, the next answer asks which one.
+
 
 ### Fixed
 - **A deleted or moved Codex install no longer blocks every Codex prompt on the machine.** Codex reads its hooks from one machine-wide `hooks.json`, and levain's commands there ran `python <install>/activation/hooks/<hook>.py`. When that install was deleted or moved, python exited 2 on the missing script, and Codex treats a hook's exit 2 as a block: every prompt in every Codex session showed "Blocked by hook" and never reached the model (measured on codex-cli 0.162.1). The commands now run `python -EP -m levain.hookrun <script>`, which exits 0 and prints nothing when the script is gone and turns any other failure of the hook into exit 1, which Codex shows as "Hook failed" and carries on. A missing interpreter (exit 127) or a venv without levain (exit 1) carries on too. The hooks now need levain itself importable from the interpreter they name, and they ignore `PYTHON*` environment variables such as `PYTHONPATH` (`-E`); `levain doctor` warns when the hooks name an interpreter other than its own (it never runs one to check), and `levain verify-hooks` runs each hook the way Codex does. Run `levain update` in the install Codex uses to rewrite its `hooks.json`; if that install is already gone, remove or replace the levain entries in `~/.codex/hooks.json` (or run `levain init --adapter codex` from the install Codex should use).
@@ -1238,6 +1259,7 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
 ### Removed
 
 - **`levain.consent.decide_by_policy`**, 0.10.4's placeholder that decided nothing. A policy answer now comes only from a standing grant, through `levain.consent.policy.guarded_policy`, which the adapters call with the request, the tool input it was filed with and the session's posture.
+
 
 ### Fixed
 - **`levain verify-hooks` checks the transcript hooks and writes nothing into your install.** `stop.py` and `post_tool_use.py` run from your installed copies in a temporary install root with a test event, the one transcript line each writes is checked and the root is removed. Its prompt check no longer sends a session id, which had made the real hook record a session nobody ran in the install (the cockpit listed it).
@@ -1312,6 +1334,7 @@ The cockpit's visual pass. No change to what a write needs, to the floor, or to 
 - **List filters and episode search share one box style**, and the Tray's filter and order select are one box.
 - **Team ledger callers go through one interface** (`levain.team.ledger_api`: `LedgerTransport`, `open_ledger`, `require_git_wire`). Commands that only work on a git-backed ledger say so through `require_git_wire`. `levain team status` and `doctor` print the same lines as before.
 
+
 ### Fixed
 
 - **The Cognition chart's settled traces no longer draw dotted** in engines that dash a non-scaling stroke.
@@ -1333,6 +1356,7 @@ A security fix. Upgrade if Levain runs bash on Linux where you use gpg, or if yo
 ### Changed
 
 - **A cockpit write fires on one click.** A write that may rise above its rendered tier still asks the server first (`dry_run`) and fires in the same click, naming the tier and gesture that dry run answered (`tier_seen`, `gesture_seen`); the server still refuses `409 tier_moved` / `gesture_moved` when either has changed. The second "Click again to fire" click is gone: a click is never the authority (the surface token in a reported install is, or the signature), and the tier and `claims cockpit token` stay in the audit record. A write whose answer was lost (or came back 5xx) keeps its envelope, and the next click sends that envelope again before any new dry run, so a write that landed returns its own answer; identical submits while one is in flight fire once.
+
 
 ### Fixed
 
@@ -1374,6 +1398,7 @@ A security fix. Upgrade if Levain runs bash on Linux where you use gpg, or if yo
 
 - **`ChainExecutor.gate`.** The executor now holds a `GateHandle`, exposed as `ChainExecutor.handle`; read the gate with `handle.current()`, once per admission. A gate kept across a policy swap goes stale, so the executor no longer hands one out.
 - **`EfferentGate.sweep_timeouts`.** The silence-default sweep is `GateHandle.sweep_timeouts`, which decides each pending on the gate current for it; a sweep held on one gate decided pendings on that gate's policy after a swap had superseded it. A bare gate sweeps with `as_handle(gate).sweep_timeouts(now)`.
+
 
 ### Fixed
 
@@ -1547,6 +1572,7 @@ The cockpit's read side: one manifest, the dashboard drawn from it, and a server
 
 Closes two of 0.7.0's known open issues (the Linux resolver deputy and concurrent codex installs) and fixes defects in the codex adapter and `ws-adopt`.
 
+
 ### Fixed
 
 - **On Linux, bash with no IP network can no longer have the host's resolver, gnupg's dirmngr, snapd or tailscaled look up or fetch a name for it.** Bash run as your own user (no `levain setup-isolation`) still saw the system D-Bus socket, and through it `systemd-resolved` resolved whatever name bash asked for, on the network; your gnupg `dirmngr` did the same for a key lookup. Wherever bash has no IP network (the default), the system D-Bus, `systemd-resolved`'s varlink, nscd, avahi and tailscaled directories are now hidden and the snapd and `dirmngr` sockets masked, as bash run as the entity's user already had them. Measured 2026-10-10 on an Ubuntu host with a packet capture on port 53: a fresh name asked through `resolvectl`, `varlinkctl`, `busctl` and dirmngr's `WKD_GET` reached the wire before this change and does not with it. (tailscaled answers such a query only where the host made your user its operator; that case is closed by the same hiding, not measured.) Every socket named `S.dirmngr` that the kernel lists as bound in levain's network namespace when bash starts is masked, wherever its `GNUPGHOME` is (also one bash later points gpg at), besides the default gnupg places; if that list (`/proc/net/unix`) cannot be read or parsed, bash without network is refused. These masks are by path, and bash runs as you, so a bash that deliberately renames one of your own directories holding a running dirmngr can reach it from its next session and have it fetch (reproduced); the resolver daemons above live in root's directories and are not affected. That closes before Levain 2.0. Cost, in that bash: no `systemctl` or `busctl` on the system bus, no `resolvectl`, `snap` or `tailscale`, no gpg network commands (gpg signing through gpg-agent still works). A daemon whose directory did not exist when the shell started is not hidden, and neither are the snapd and dirmngr sockets once their daemon recreates them during the session (snapd restarting itself, say). Other daemons that fetch for any local caller over a unix socket (an LDAP-backed sssd or nslcd, a print server, a dirmngr under another socket name or running in another network namespace, such as a container, with its socket on a path bash can see) are not hidden: bash run as the entity's own user (`levain setup-isolation`) is the mode that has none of the host's sockets in view.
@@ -1607,6 +1633,7 @@ The entity's own hands: on macOS and Linux, `levain setup-isolation` runs its ba
 - **`levain update` replaces codex's `hooks.json` only when it is exactly what levain last wrote for this install.** A copy that differs from what this version writes and is not what levain last wrote (edited by you, written by another install, or from before levain recorded what it writes) is left untouched, and this release's version is put under `.levain/pending/codex-home/hooks.json` for you to review. An unedited `hooks.json` from an install made by 0.5.0 or later matches levain's record and is refreshed as before. An install made before 0.5.0 has no such record: if its `hooks.json` differs from what this version writes, the first `levain update` after upgrading lists it as pending once and exits 1 (if it is identical, nothing changes). If it is this install's and you never edited it, copy the pending file over it (that points every codex session on the machine at this install); from then on `levain update` refreshes it again.
 - **Levain now requires anneal-memory 0.9.41 or later** (`anneal-memory>=0.9.41,<0.10`), the version this release is tested against: since 0.9.39 it no longer brings back a team entry you pruned or deleted on the next `team-import`. No schema or seed change.
 
+
 ### Fixed
 
 - **`levain init` writes files that parse, whatever the install path holds.** The install path, the interpreter path and the `anneal-memory` path were pasted raw into string literals. A path with a `\` or `"` produced a codex `config.toml` that codex could not read (which disables every MCP server it lists, not only levain's), a codex `hooks.json` and a claude-code `.mcp.json` that were invalid JSON, and with a `"` could add keys of its own; `init` still exited 0. The same paste put the `anneal-memory` path into every activation hook's Python source, so a `"` there, or an ordinary Windows path such as `C:\Users\...`, left the hooks unable to compile. Each slot is now escaped for the string it sits in (and, in a hook's command, for the shell's double quotes as well, in a form `levain doctor` and `verify-hooks` read back as the same path); a path that is not valid UTF-8 is refused by name; and `init` parses the whole codex `config.toml` it is about to write and refuses, before changing `config.toml` or `hooks.json`, if its change is what would stop the file parsing. A `config.toml` that does not parse before levain's change and still does not after it is written as before, and levain says so once the write has landed. Reproduced and closed with a real `levain init`: `codex mcp list` reads such a path exactly, and both codex hooks fire from it.
@@ -1624,6 +1651,7 @@ The entity's own hands: on macOS and Linux, `levain setup-isolation` runs its ba
 ## [0.6.9] — 2026-10-05
 
 A memory fix for the reply classifier's size bound.
+
 
 ### Fixed
 
@@ -1679,6 +1707,7 @@ A security fix for the team layer (a member could make the owner's consolidate w
 
 - **A team member could make the owner's `levain team consolidate` write outside the ledger worktree (0.6.0 to 0.6.4; upgrade to fix).** The ledger branch is written by every member, and the owner's consolidate wrote `PROJECT.md` to its path in the worktree, following a symlink. A member who pushed `PROJECT.md` as a symlink therefore had the canon written over any file the owner can write (reproduced on the 0.6.4 wheel: a file outside the worktree was overwritten). The canon carries members' ruling words, so a target such as a shell startup file could turn a ruling into a command. `PROJECT.md` and `team.toml` are now written as a new regular file renamed into place, so a link there is replaced, never followed, and `team.toml` is never read through a link. Run record: flow `projects/levain/reference/team_canon_symlink_run_1005/`.
 
+
 ### Fixed
 
 - **A teammate's ruling can no longer draw fake `[team]` lines into your session.** The `SessionStart` context printed each ruling's words, paths and owner exactly as recorded, so a line break in a member's ruling started a new line that read as the hook's own (`[team] ...`) in every teammate's agent context. Every line the hooks, `levain team status` and `PROJECT.md` assemble is now folded onto one line as a whole, whatever field or file name fed it (words, paths, owner, pack, author, the edited file's own name, warnings and git errors), so a line break in any of them stays inside its line. Found by the nightly review, reproduced, and pinned by a test that fails on 0.6.3.
@@ -1709,6 +1738,7 @@ The framed team export, the other half of anneal-memory's `team-import` contract
 0.6.1 was tagged and never published: CI on its tagged commit failed on Linux (a project's own commit hook ran during the replay), so what follows is 0.6.1's content plus the fix for that. No schema, id or exit-code change; the anneal floor stays at 0.9.36.
 
 Hardening of the team layer's sync replay, from the known-open list of 0.6.0. No schema, id or exit-code change; the anneal floor stays at 0.9.36.
+
 
 ### Fixed
 
@@ -1821,6 +1851,7 @@ Levain is now tested against, and requires, anneal-memory 0.9.31, so `levain doc
 
 `levain wrap` stops claiming things the store does not show: after a stop, a failed save, or a failure while showing the result, its messages now say only what was established (and name the command that settles the rest), `--reset` clears a wrap whose episode list anneal cannot read, and the symlink-loop warning fires on Python 3.13 as on 3.12.
 
+
 ### Fixed
 
 - **`levain wrap --reset` could not clear a wrap whose episode list anneal could not read** (new in 0.5.7). Every wrap `levain wrap` opens is token-bound, so when the snapshot is unreadable `--reset` and the unattended discard now name the store's bound token and clear the wrap by that compare-and-swap, which still leaves any wrap that replaced it alone. (A wrap another program opened with a caller-supplied token is bound too, and is cleared the same way when it passes the same lock and age check.) A wrap with no token to name is refused as before, with the commands for that entity's store.
@@ -1848,6 +1879,7 @@ Levain is now tested against, and requires, anneal-memory 0.9.31, so `levain doc
 `levain wrap` no longer cancels a wrap that is not its own: it chooses its wrap's token itself, gives it to anneal, and cancels by it on every exit. The Claude Code install no longer tells its entity that `levain wrap` recomposes its memory. Levain now requires anneal-memory 0.9.30.
 
 **Upgrade Levain together with anneal-memory.** Levain 0.5.7 needs anneal-memory 0.9.30 (`prepare_wrap(wrap_token=...)`), and the pip floor pulls it. `levain update` refreshes an install's `CLAUDE.md` and memory seed to the corrected wording (an edited copy is kept and the new one staged under `.levain/pending/`).
+
 
 ### Fixed
 
@@ -1905,6 +1937,7 @@ Found in review, not fixed in 0.5.6:
 
 Not run before release: a real model writing a new durable fact under `levain wrap`'s prompt (no free compose model was available; the prompt text, the guard and the save path are tested).
 
+
 ### Fixed
 
 - **`levain wrap` accepts a store persisted before an optional section existed.** It compared the store's sections to anneal's current list exactly, so anneal 0.9.28's optional `## Durable Facts` made every older partnership store fail the check. It now compares the required sections only; a store missing a required one is still refused.
@@ -1943,6 +1976,7 @@ Found in review, not fixed in 0.5.5:
 ### Changed
 
 - **Levain now requires anneal-memory 0.9.26 or later** (`anneal-memory>=0.9.26,<0.10`), so upgrading Levain also upgrades anneal-memory. anneal-memory 0.9.26 stopped using Hebbian links in recall: a pattern now surfaces through the episodes its evidence cites. Links still form at each wrap and can be inspected until they decay. The seed's memory guidance says so now. It no longer claims that co-citing keeps recall alive, or asks you to co-cite on every wrap. Citing every episode that genuinely supports a pattern is enough. Before this, a Levain install on anneal-memory 0.9.26 finished `levain update` with "anneal is AHEAD of this levain release's known-good" and one pending migration proposal (AM-HOP-RETIRED); a fresh install now reconciles cleanly. The README's description of the association graph is corrected to match.
+
 
 ### Fixed
 
@@ -1995,6 +2029,7 @@ Found in review, not fixed in 0.5.4:
   - **Loopback-only, nothing persisted.** A server with `--chat` refuses a non-loopback bind, because its chat routes have no off-box auth. The routes use the same Host check, cross-site refusal and JSON-only body rule as the write routes. A restart ends every conversation; resuming one after a restart is not offered.
   - At most four live sessions per server. When a session fails to start, the server keeps the error text, drops the exception and collects it, so tools built before the failure are released before the failure is reported.
 
+
 ### Fixed
 
 - **A refused action is no longer listed as work.** After an efferent action was rejected at the gate, the turn's tool activity (the REPL's summary, `--task` output, a chat job's `tool_activity`) still showed the refused command, on the same screen as the refusal.
@@ -2022,6 +2057,7 @@ Found in review, not fixed in 0.5.3:
 - **On a case-sensitive Linux filesystem, a write-protected file whose name differs only in letter case from a denied file in the same directory is hidden from the shell** (it should stay readable). This fails closed: the shell loses read access to that one file.
 - **`spawn_shell(env=...)` on Linux passes that environment to `bwrap` as well as to bash**, so a loader variable such as `LD_PRELOAD` in it runs before the sandbox exists. levain's own callers pass no environment; this affects only a program that calls the API with its own.
 - **The README does not mention that on Linux bash is refused when a crown jewel is a SQLite database** (since 0.5.1; the CHANGELOG entry for 0.5.1 explains it).
+
 
 
 ### Fixed
@@ -2061,6 +2097,7 @@ Found in review, not fixed in 0.5.3:
 - **`$LEVAIN_DRIVE_MODE` and its "one process hosts one drive mode" refusal** (`bind_drive_mode`, `current_drive_mode`, `DriveModeConflict`). Once any unattended session had opened, the process could never open an interactive one. An interactive session now opens beside an unattended one, each with its own floor.
 - **`$LEVAIN_ENTITY_DIR`, `bind_entity` and the "one process hosts one entity" refusal.** `guard_entity` checks an entity without touching process state. An isolated firing or seed built with no entity now has no store, instead of reading the variable.
 
+
 ### Fixed
 
 - **A session that failed to start after its conversation was built left that conversation open** until the process exited. It is now closed.
@@ -2083,6 +2120,7 @@ Found in review, not fixed in 0.5.3:
 - **A crown-jewel path that does not exist when the shell starts, and later becomes a SQLite database, is not refused on Linux.** The check runs at spawn. Credential files and the default store (`~/.anneal-memory/`, created as a directory) are not affected.
 - **On Linux, a jewel that is an empty (or not yet initialised) file when the shell starts is not refused**, and neither is one this user cannot read in a directory it cannot write. Either can become, or be, a database whose sidecars a later writer creates where the shell can see them.
 - **An encrypted SQLite store (SQLCipher) has no recognisable header**, so the Linux refusal does not see it. A planted sidecar would need the store's key to be replayed.
+
 
 ### Fixed
 
