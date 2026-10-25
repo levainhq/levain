@@ -15,8 +15,9 @@ The three kinds this module keeps (§3.6's tagged union; ``seq`` and ``at`` on e
 
 and the ones a stream sends but never stores: ``{kind:"hello", journal_id, oldest_seq, newest_seq}`` (CONTROL's answer
 to ``SESSION-EVENTS`` carries it), ``{kind:"gap", oldest_seq}``, sent first when the cursor is older than the oldest
-kept event and an event past the cursor was pruned, and ``{kind:"error", error}``, the last frame of a stream that
-cannot go on (``events-unavailable``: the journal was poisoned). ``oldest_seq`` / ``newest_seq`` are 0 while nothing
+kept event and an event past the cursor was pruned, ``{kind:"reset", newest_seq}``, the only frame after the hello
+of a stream whose cursor is past the newest seq (the client starts again from 0), and ``{kind:"error", error}``, the
+last frame of a stream that cannot go on (``events-unavailable``: the journal was poisoned). ``oldest_seq`` / ``newest_seq`` are 0 while nothing
 is kept.
 
 **Start** (:meth:`EventJournal.start`): the meta is read (absent: made; one that does not parse refuses
@@ -42,6 +43,7 @@ the new file; any failure before the rename leaves the journal as it was.
 Runs on the root interpreter (3.9)."""
 from __future__ import annotations
 
+import bisect
 import os
 import re
 import threading
@@ -85,8 +87,15 @@ def check_event(obj: object) -> Optional[str]:
     type and the record grammar's patterns for the fields a state record holds."""
     if type(obj) is not dict:
         return "not an object"
+    try:
+        return _check_event(obj)
+    except (TypeError, ValueError) as e:      # L3 r1 fix 9 (codex 7): a value of a type no check expects
+        return f"value ({type(e).__name__})"
+
+
+def _check_event(obj: Dict[str, object]) -> Optional[str]:
     kind = obj.get("kind")
-    if kind not in _SHAPES:
+    if type(kind) is not str or kind not in _SHAPES:
         return "kind"
     required, optional = _SHAPES[kind]
     keys = set(obj) - {"seq", "at", "kind"}
@@ -103,8 +112,7 @@ def check_event(obj: object) -> Optional[str]:
                     return k
             return None
         R.check_session(obj["session"], "session")
-        if type(obj["ticket"]) is not str or not obj["ticket"]:
-            return "ticket"
+        R._handle(obj["ticket"], "ticket")       # L3 r1 fix 9 (codex 8): the canonical handle `claims.ticket` holds
         if type(obj["generation"]) is not int or not 0 <= obj["generation"] <= JSON_INT_MAX:
             return "generation"
         if kind == "state":
@@ -171,6 +179,8 @@ class EventJournal:
         self._closed = False
         self.journal_id = ""
         self._kept: List[_Kept] = []
+        #: the kept events' seqs, in the same order (``bisect`` takes no key on 3.9)
+        self._seqs: List[int] = []
         self._next_seq = 1
         #: session -> the newest generation a state / artifact event names
         self._last_gen: Dict[str, int] = {}
@@ -270,6 +280,7 @@ class EventJournal:
     def _set_kept(self, kept: List[_Kept]) -> None:
         """Memory from ``kept`` (caller holds the lock)."""
         self._kept = kept
+        self._seqs = [k.seq for k in kept]
         if kept:
             self._next_seq = max(self._next_seq, kept[-1].seq + 1)
         self._last_gen = {}
@@ -308,6 +319,7 @@ class EventJournal:
                 raise
             k = _Kept(obj, data)
             self._kept.append(k)
+            self._seqs.append(k.seq)
             self._next_seq += 1
             if k.kind != "pool":
                 self._last_gen[str(k.session)] = max(self._last_gen.get(str(k.session), -1), int(k.generation))
@@ -405,20 +417,25 @@ class EventJournal:
 
     def open_stream(self, after_seq: int) -> Tuple[Dict[str, object], Optional[Dict[str, object]],
                                                    List[Tuple[int, bytes]], int]:
-        """``SESSION-EVENTS {after_seq}``'s opening, read at one instant: (the hello, the gap or None, the replay = every
+        """``SESSION-EVENTS {after_seq}``'s opening, read at one instant: (the hello, the lead frame or None, the replay = every
         kept event with ``seq > after_seq`` as (seq, line), the cursor the stream continues from = the replay's last
         seq, else ``after_seq``). The replay is copied under the lock the hello is read under (L3 r1 fix 4), so a
-        prune before the stream sends it cannot drop an event the hello advertised. The gap is due when an event with
-        ``seq > after_seq`` was pruned: the cursor is older than the oldest kept event and the journal's first seq (1)
-        is past it."""
+        prune before the stream sends it cannot drop an event the hello advertised. The lead frame is the gap, due when
+        an event with ``seq > after_seq`` was pruned (the cursor is older than the oldest kept event and the journal's
+        first seq (1) is past it), or ``{kind:"reset", newest_seq}`` when the cursor is past the newest seq, with no
+        replay: the stream sends it and ends."""
         with self.lock:
             self._open_or_raise()
             hello = self._hello()
             oldest = int(hello["oldest_seq"])                          # type: ignore[arg-type]
-            gap = None
+            gap: Optional[Dict[str, object]] = None
             if oldest and after_seq < oldest - 1:
                 gap = {"kind": "gap", "oldest_seq": oldest}
-            replay = [(k.seq, k.data) for k in self._kept if k.seq > after_seq]
+            if after_seq > int(hello["newest_seq"]):                   # type: ignore[arg-type]
+                # L3 r1 fix 9 (complement 5): a cursor past this journal's newest seq is another journal's, never
+                # a silent skip of seq up to it: the stream sends this frame and ends
+                return hello, {"kind": "reset", "newest_seq": hello["newest_seq"]}, [], after_seq
+            replay = [(k.seq, k.data) for k in self._kept[self._first_after(after_seq):]]
             return hello, gap, replay, replay[-1][0] if replay else after_seq
 
     def _open_or_raise(self) -> None:
@@ -437,7 +454,7 @@ class EventJournal:
             while True:
                 if self._closed:
                     return None
-                out = [(k.seq, k.data) for k in self._kept if k.seq > seq]
+                out = [(k.seq, k.data) for k in self._kept[self._first_after(seq):]]
                 if out:
                     return out
                 if self._poisoned:
@@ -446,6 +463,11 @@ class EventJournal:
                 if left <= 0:
                     return out
                 self.cond.wait(left)
+
+    def _first_after(self, seq: int) -> int:
+        """The index in the kept events (seq order) of the first with ``seq`` greater than ``seq`` (caller holds the
+        lock; L3 r1 fix 9, complement 4: a bisection, not a scan, on every stream wake)."""
+        return bisect.bisect_right(self._seqs, seq)
 
     def last_generation(self, session: str) -> int:
         """The newest generation a kept ``state`` / ``artifact`` event names for ``session``; -1 for none."""

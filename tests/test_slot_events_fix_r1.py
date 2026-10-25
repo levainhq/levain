@@ -274,3 +274,57 @@ def test_an_eof_write_over_an_owed_generation_carries_its_event(erig):
     last = erig.session_events()[-1]
     assert (last["kind"], last["state"], last["generation"]) == ("state", R.RETAINED, after.generation)
     assert erig.control.owed_events() == {}
+
+
+# ---- item 9: the LOWs ------------------------------------------------------------------------------------------------
+
+GOOD_STATE = {"seq": 1, "at": "2026-10-25T00:00:00Z", "kind": "state", "session": SESSION, "ticket": "A" * 43,
+              "generation": 0, "state": "ALLOCATED"}
+
+
+@pytest.mark.parametrize("bad", [{"kind": []}, {"kind": {}}, {"state": []}, {"session": []}, {"at": []},
+                                 {"ticket": "x"}, {"ticket": "A" * 42 + "B"}, {"ticket": 7}])
+def test_every_bad_journal_line_refuses_the_start_events_corrupt(erig, bad):
+    """codex 7 + 8: a canonical line whose kind (or any other value) is of the wrong type, or whose ticket is not the
+    canonical 43-character handle, refuses the start `events-corrupt`: never a raw exception, never served."""
+    assert EV.check_event(GOOD_STATE) is None
+    obj = {**GOOD_STATE, **bad}
+    assert EV.check_event(obj) is not None
+    erig.control.stop()
+    path = erig.sdir / EV.JOURNAL
+    path.write_bytes(canon.canonical_bytes(obj) + b"\n")
+    with pytest.raises(Refused) as e:
+        erig.restart()
+    assert e.value.name == "events-corrupt"
+
+
+def test_after_reads_from_the_first_seq_past_the_cursor(erig):
+    """complement 4: `after` finds its start by bisection over the kept seqs (holes included) and answers the same
+    events a scan would."""
+    erig.events._fsync = lambda _fd: None
+    for i in range(50):
+        erig.events.append({"kind": "pool", "egress_free": i, "none_free": i})
+    seqs = [e["seq"] for e in erig.kept()]
+    for cur in [0, seqs[0], seqs[10] - 1, seqs[10], seqs[-2], seqs[-1], seqs[-1] + 3]:
+        assert [s for s, _d in erig.events.after(cur)] == [s for s in seqs if s > cur]
+    import inspect
+    assert "bisect" in inspect.getsource(EV.EventJournal._first_after)
+
+
+def test_a_cursor_ahead_of_the_journal_gets_a_reset_frame(served):
+    """complement 5: `after_seq` above `newest_seq` on this journal (a cursor from a journal that was lost and made
+    again under the same id, or a client's bug) is never a silent skip: the stream sends `{kind:"reset", newest_seq}`
+    after the hello and closes."""
+    rig = served.rig
+    bound_session(rig)
+    newest = rig.kept()[-1]["seq"]
+    c, hello = served.open(newest + 5)
+    assert hello["ok"] and hello["newest_seq"] == newest
+    assert _frame(c) == {"kind": "reset", "newest_seq": newest}
+    c.settimeout(5)
+    assert c.recv(1) == b""
+    c.close()
+    c, hello = served.open(newest)                                     # at the newest: a live stream, no reset
+    cas(rig, R.ALLOCATED, R.RENDERING)
+    assert _frame(c)["state"] == R.RENDERING
+    c.close()

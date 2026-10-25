@@ -444,8 +444,9 @@ class Conn:
     sock: socket.socket | None = field(default=None, repr=False)
     attach_no: int | None = None
     after: list[Callable[[], object]] = field(default_factory=list, repr=False)
-    #: once ``SESSION-EVENTS`` answered: (the gap frame or None, the cursor); the server then streams (§3.6)
-    stream: "tuple[dict[str, object] | None, int] | None" = None
+    #: once ``SESSION-EVENTS`` answered: (the lead frame (gap or reset) or None, the pinned replay as (seq, line), the
+    #: cursor past it); the server then streams (§3.6, :meth:`levain.slot.events.EventJournal.open_stream`)
+    stream: "tuple[dict[str, object] | None, list[tuple[int, bytes]], int] | None" = None
 
 
 @dataclass(frozen=True)
@@ -2129,14 +2130,16 @@ class Control:
     def _op_session_events(self, conn: Conn, args: dict) -> dict[str, object]:
         """``SESSION-EVENTS {after_seq}``: answered with the stream's ``hello`` (``{kind:"hello", journal_id, oldest_seq,
         newest_seq}`` beside ``id`` / ``ok``), after which the connection is the stream (:class:`ControlServer`): the
-        ``gap`` frame when one is due, then every kept event with ``seq > after_seq``, then each new one as it is
-        appended, one canonical JSON object per frame, byte-equal to its journal line. Nothing the peer sends is read as
-        a verb again: any byte, or its EOF, ends the stream (DECISION). No journal: ``events-unavailable``."""
+        ``gap`` frame when one is due, then every kept event with ``seq > after_seq`` (read when the hello is), then each
+        new one as it is appended, one canonical JSON object per frame, byte-equal to its journal line; an ``after_seq``
+        past the newest seq gets ``{kind:"reset", newest_seq}`` alone, and a journal poisoned under the stream
+        ``{kind:"error", error}`` last. Nothing the peer sends is read as a verb again: any byte, or its EOF, ends the
+        stream (DECISION). No journal, or a poisoned one: ``events-unavailable``."""
         after = R._uint(args["after_seq"], "after_seq")
         if self.events is None:
             raise Refused("events-unavailable", "CONTROL keeps no event journal")
-        hello, gap, replay, cursor = self.events.open_stream(after)
-        conn.stream = (gap, replay, cursor)
+        hello, lead, replay, cursor = self.events.open_stream(after)
+        conn.stream = (lead, replay, cursor)
         return hello
 
     # -- the queue broker's verb ------------------------------------------------------------------------------
@@ -2802,14 +2805,16 @@ class ControlServer:
                 opening: "tuple[dict[str, object] | None, list[tuple[int, bytes]], int]") -> None:
         """The SESSION-EVENTS stream (:meth:`Control._op_session_events`) until the peer sends anything or ends, the
         journal closes (CONTROL's stop) or a send fails. The gap first, then the replay the opening pinned, then events
-        by ``seq``; a journal poisoned under the stream ends it with ``{kind:"error", error:"events-unavailable"}``
+        by ``seq`` (a reset lead frame is sent alone, then the stream ends); a journal poisoned under the stream ends it with ``{kind:"error", error:"events-unavailable"}``
         (L3 r1 fix 3)."""
-        gap, replay, cursor = opening
+        lead, replay, cursor = opening
         journal = self.control.events
         # non-blocking from here to the close: macOS blocks a unix-socket send() on a full buffer even with
         # MSG_DONTWAIT (measured 10-25), so only the fd's own O_NONBLOCK bounds :meth:`_stream_send`
         sock.setblocking(False)
-        if journal is None or (gap is not None and not self._stream_send(sock, encode_frame(gap))):
+        if journal is None or (lead is not None and not self._stream_send(sock, encode_frame(lead))):
+            return
+        if lead is not None and lead["kind"] == "reset":
             return
         for _seq, data in replay:
             if not self._stream_send(sock, _LEN.pack(len(data)) + data):
