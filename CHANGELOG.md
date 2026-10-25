@@ -17,6 +17,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   not inherit an earlier operator's limits.
 - **`levain doctor` has a `slot limits` row**: the limits each agent's slot sessions run under and where they come
   from. It fails when the file is unusable and warns when the queue broker is not running.
+- **A sign link can carry the option you already tapped on your phone.** A link with `&v=<version>&choice=<key>`
+  opens the phone page on that card with one "Sign (b) with Face ID" button and the exact line it signs, and the
+  card's first lines name your pick; Face ID waits for your tap, and every other option still signs on its own tap.
+  The pick holds only for the version of the item you tapped: if the item changed since, or the option is not on the
+  card, the page says so at the top and shows no button. A link to a request that is no longer open says where it
+  stands (already signed, denied or expired) on the first refresh, from the new `GET /sign/<id>/state`.
+- **A choice sign request's option may now be up to 1000 characters** (was 200); a title, a requester and a write-in
+  stay at 200. An older Levain refuses the longer options, so a filer sends them only to this version or later.
 
 ### Fixed
 - **`levain doctor`'s hands check runs sudo by its absolute path, like every other place Levain runs sudo.** The
