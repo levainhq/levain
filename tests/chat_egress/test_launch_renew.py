@@ -161,3 +161,23 @@ def test_a_ping_thread_that_cannot_start_still_returns_the_launch(tmp_path, orig
     finally:
         out = lm.stop_egress(e)
     assert out.glue_exit == 0 and len(_node_children()) == len(kids)
+
+
+@pytest.mark.chat_egress_srt
+def test_a_launch_cannot_be_started_without_its_authority(tmp_path, origin, monkeypatch) -> None:
+    """S8D r1 KNOWN EDGES (codex S8b-3, "authority optional, renew skipped"): `authority` is REQUIRED. Leaving it out
+    is a TypeError at the call; an explicit None is refused before anything is allocated."""
+    import inspect
+
+    real = lm.start_egress
+
+    def start(**kw):
+        return real(**{**kw, "authority": None})
+    monkeypatch.setattr(lm, "start_egress", start)
+    before, kids = _fds(), _node_children()
+    with pytest.raises(lm.EgressRefused, match="authority") as got:
+        lm.stop_egress(_start(tmp_path, origin, monkeypatch))
+    print(f"RUN chatint 4: {got.value}")
+    assert _fds() == before and len(_node_children()) == len(kids)
+    assert not (tmp_path / "events.jsonl.glue-stderr").exists()
+    assert inspect.signature(real).parameters["authority"].default is inspect.Parameter.empty

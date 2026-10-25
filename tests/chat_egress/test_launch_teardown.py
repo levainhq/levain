@@ -204,3 +204,24 @@ def test_an_oserror_closing_the_glue_stderr_still_ends_the_glue(tmp_path, origin
         os.kill(pid, 9)
         os.waitpid(pid, 0)
     assert left == set()
+
+
+@pytest.mark.chat_egress_srt
+def test_a_second_stop_after_a_glue_wait_timeout_finishes_the_stop(tmp_path, origin, monkeypatch) -> None:
+    """chatint L3 r1 item 2: a stop whose glue wait timed out is not a stop, so the launch end calls stop_egress
+    again; the second call finds the killed glue's exit and closes clean, raising nothing."""
+    kids = {p.pid for p in _node_children()}
+    e = _start(tmp_path, origin, monkeypatch)
+    _wait_times_out(monkeypatch)
+    try:
+        first = lm.stop_egress(e)
+    finally:
+        monkeypatch.undo()
+    try:
+        second = lm.stop_egress(e)
+    finally:
+        _reap(kids)
+    print(f"RUN chatfix 2 real: first stop {first}; second stop {second}")
+    assert first.glue_exit is None and [f.split(":")[0] for f in first.failures] == ["glue"]
+    assert second.glue_exit == -9 and second.failures == () and second.decider_clean and second.socks_clean
+    assert _egress_threads() == [] and dm.service_threads() == []

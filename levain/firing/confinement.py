@@ -8719,6 +8719,84 @@ def _close_live_shells() -> None:
             pass
 
 
+#: Where Linux's process table is read (a seam for the tests).
+_PROC_ROOT = "/proc"
+
+
+def _stat_pgrp_state(data: bytes) -> tuple[int, str] | None:
+    """``(pgrp, state)`` from a ``/proc/<pid>/stat`` line, or None when it does not parse. The fields
+    are read after the LAST ``)``, since a process names its own comm and may put ``) (`` in it."""
+    _, sep, rest = data.rpartition(b")")
+    fields = rest.split()
+    if not sep or len(fields) < 3:
+        return None
+    try:
+        return int(fields[2]), fields[0].decode("ascii", "replace")
+    except ValueError:
+        return None
+
+
+def _proc_hides_pids() -> bool:
+    """Whether the /proc mount may hide other users' processes: its ``hidepid`` super option set to
+    anything but ``0``/``off``. True too when ``/proc/self/mountinfo`` cannot be read or names no proc
+    mount at ``/proc`` (an unknown view is a restricted one). The last such line wins (an over-mount)."""
+    try:
+        with open(os.path.join(_PROC_ROOT, "self", "mountinfo"), encoding="utf-8",
+                  errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return True
+    hides: bool | None = None
+    for line in lines:
+        left, sep, right = line.partition(" - ")
+        fields, tail = left.split(), right.split()
+        if not sep or len(fields) < 5 or len(tail) < 3 or fields[4] != "/proc" or tail[0] != "proc":
+            continue
+        opts = dict(o.partition("=")[::2] for o in tail[2].split(","))
+        hides = opts.get("hidepid", "0") not in ("0", "off")
+    return True if hides is None else hides
+
+
+def _proc_group_live(pgid: int) -> bool | None:
+    """Linux: whether /proc shows group ``pgid`` a member that is not a zombie (state Z) or dead (X),
+    a zombie leader with a thread still running (another tid under its ``task/``) counting as live.
+    None, no evidence either way, whenever the view may be incomplete: /proc cannot be listed or hides
+    pids (:func:`_proc_hides_pids`), an entry refuses its read for any reason but having vanished, or no
+    member of the group is shown at all. Only an entry gone (ENOENT/ESRCH) after the listing is skipped."""
+    if _proc_hides_pids():
+        return None
+    try:
+        names = os.listdir(_PROC_ROOT)
+    except OSError:
+        return None
+    seen = False
+    for name in names:
+        if not name.isdigit():
+            continue
+        entry = os.path.join(_PROC_ROOT, name)
+        try:
+            with open(os.path.join(entry, "stat"), "rb") as fh:
+                got = _stat_pgrp_state(fh.read())
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            return None
+        if got is None or got[0] != pgid:
+            continue
+        if got[1] not in ("Z", "X", "x"):
+            return True
+        try:
+            tids = os.listdir(os.path.join(entry, "task"))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            return True
+        if any(t != name for t in tids):
+            return True
+        seen = True
+    return False if seen else None
+
+
 def _group_live(pgid: int) -> bool:
     """Whether process group ``pgid`` has a member that is not a zombie. The shell keeps each group's
     leader unreaped while its group lives (:class:`_Leader`), so a zombie must not count.
@@ -8756,6 +8834,52 @@ def _group_gone(pgid: int, *, timeout: float) -> bool:
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.05)
+
+
+#: The least time between the two scans :func:`group_gone_proc` needs to agree.
+_PROC_SCAN_INTERVAL = 0.05
+
+
+def group_live_proc(pgid: int) -> bool:
+    """Whether process group ``pgid`` has a member that is not a zombie, answered off macOS from /proc
+    (:func:`_proc_group_live`): live unless ``killpg`` finds no group, or /proc shows at least one of
+    its members and every one it shows a zombie. Live whenever the view may be incomplete: ``killpg``
+    refused (EPERM), or /proc gives no evidence (:func:`_proc_group_live`). On macOS, :func:`_group_live`.
+
+    Not an authority: the scan reads one entry at a time, so a member that keeps forking can slip past
+    one, and nothing that frees a group number may rest on it (that is the cgroup leaf on Linux, see
+    :meth:`SandboxedShell._group_emptied`). :func:`_group_live` keeps its always-live answer off macOS
+    for the callers that rest on it."""
+    if platform.system() == "Darwin":
+        return _group_live(pgid)
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # every member another uid's, which /proc may not show truthfully
+    return _proc_group_live(pgid) is not False
+
+
+def group_gone_proc(pgid: int, *, timeout: float) -> bool:
+    """True once two consecutive :func:`group_live_proc` answers, at least ``_PROC_SCAN_INTERVAL``
+    apart, both find no live member of group ``pgid`` (polled until ``timeout``; a first "gone" seen
+    at the deadline still gets its second scan). On macOS, :func:`_group_gone`."""
+    if platform.system() == "Darwin":
+        return _group_gone(pgid, timeout=timeout)
+    deadline = time.monotonic() + timeout
+    first_gone: float | None = None
+    while True:
+        now = time.monotonic()
+        if group_live_proc(pgid):
+            first_gone = None
+        elif first_gone is not None and now - first_gone >= _PROC_SCAN_INTERVAL:
+            return True
+        elif first_gone is None:
+            first_gone = now
+        if first_gone is None and now >= deadline:
+            return False
+        time.sleep(_PROC_SCAN_INTERVAL)
 
 
 _NOTE_EXITSTATUS = 0x04000000   # <sys/event.h>: NOTE_EXIT's data carries the wait status

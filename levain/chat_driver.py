@@ -82,14 +82,27 @@ from __future__ import annotations
 
 import abc
 import logging
+import os
+import platform
+import signal
+import subprocess
+import functools
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, Sequence, runtime_checkable
 
 __all__ = [
     "ApprovalTiming",
+    "CA_REMINT_MARGIN",
+    "CHAT_HARNESSES",
+    "CLI_GROUP_WAIT_S",
+    "CLI_TERM_WAIT_S",
+    "ChatEgressService",
+    "ChatLaunch",
+    "CliEnd",
     "DEFAULT_CLOSE_WAIT_SECONDS",
     "DriverCaps",
     "DriverContractError",
@@ -97,8 +110,10 @@ __all__ = [
     "DriverState",
     "DriverUnsupported",
     "HarnessDriver",
+    "LaunchEnd",
     "OpenHandsDriver",
     "PendingApproval",
+    "RENEW_WAIT_S",
     "TurnOptions",
     "TurnOutcome",
     "TurnSnapshot",
@@ -864,3 +879,494 @@ class OpenHandsDriver(HarnessDriver):
         if workspace is not None:
             out["workspace"] = str(workspace)
         return out
+
+
+# -- the chat launch's egress: the driver's call sites into levain.chat_egress (CH-D2) ----------------------------
+
+CLI_TERM_WAIT_S = 5.0
+"""How long :meth:`ChatLaunch.end` waits for the CLI leader to exit on SIGTERM before it SIGKILLs it, and again for
+the SIGKILLed leader to exit. [judged by lane-chatdriver, 10-25, against a CLI's own shutdown on SIGTERM]"""
+
+CLI_GROUP_WAIT_S = 5.0
+"""How long :meth:`ChatLaunch.end` then waits for the CLI's process group to hold no live member."""
+
+
+@dataclass(frozen=True)
+class CliEnd:
+    exit_code: int | None       # the leader's, once seen exited (negative: the signal); None: not seen exited
+    group_gone: bool            # no live member was left in its process group within CLI_GROUP_WAIT_S
+    reaped: bool = False        # the leader reaped by the launch, which it is only once its group is gone
+    reaped_outside: bool = False  # reaped by other code (attach_cli's contract broken): nothing more is safe to send,
+                                  # so the teardown is over without a group known gone (chatdriver r2 item 3)
+
+
+@dataclass(frozen=True)
+class LaunchEnd:
+    """What :meth:`ChatLaunch.end` came to, step by step (each step is attempted whatever an earlier one raised)."""
+    cli: CliEnd | None              # None: no CLI was attached, or its teardown raised (named in ``failures``)
+    egress: Any                     # ``chat_egress.launch.StopResult`` (the last one returned), or None when
+                                    # ``stop_egress`` raised
+    tmp_leftovers: tuple[str, ...]  # what ``tmp_clean.remove_tree`` could not remove from ``chat_tmp`` (empty: gone);
+                                    # ``(chat_tmp,)`` when it was kept, the CLI's group not confirmed gone
+    failures: tuple[str, ...] = ()  # "<step>: <exception type or reason>" for each step that failed
+    complete: bool = False          # the CLI teardown (if a CLI was attached), stop_egress and the chat_tmp step all
+                                    # done: end() returns this from now on; False: end() must be called again
+
+
+def _remove_chat_tmp(chat_tmp: Path) -> list[str]:
+    from levain.chat_egress import tmp_clean
+
+    try:
+        return tmp_clean.remove_tree(chat_tmp)
+    except Exception as exc:  # noqa: BLE001 - a leftover, named, never a crash of the launch end
+        _log.warning("chat_tmp removal failed: %s", type(exc).__name__)
+        return [f"{chat_tmp}: {type(exc).__name__}"]
+
+
+def _not_a_stop(stop: Any) -> list[str]:
+    """Why a ``StopResult`` is not a stop (chatint L3 r1 item 2): ``stop_egress`` catches each step's failure into it,
+    so its return alone proves nothing. Empty only when no step failed, the decider and the SOCKS refuser closed clean
+    and the glue was seen to exit."""
+    why = [f"egress {f}" for f in stop.failures]
+    if not stop.decider_clean:
+        why.append("egress: the decider did not close clean")
+    if not stop.socks_clean:
+        why.append("egress: the SOCKS refuser did not close clean")
+    if stop.glue_exit is None:
+        why.append("egress: the glue was not seen to exit")
+    return why
+
+
+def _leads_group(pid: int) -> bool:
+    """Whether ``pid``, a child of this process not yet reaped, leads its own process group. A zombie's ``getpgid``
+    is refused on macOS (ESRCH, measured), so a leader that already exited is known by its group instead: an unreaped
+    pid cannot be reused, so a group with its id is the one it led (``killpg(pid, 0)`` then finds the zombie, EPERM
+    on macOS, or a live member)."""
+    try:
+        return os.getpgid(pid) == pid
+    except ProcessLookupError:
+        pass
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def _send(send: Callable[[], None]) -> OSError | None:
+    """One signal; the OSError it raised, or None. ESRCH is None: there was nothing left to signal."""
+    try:
+        send()
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        return exc
+    return None
+
+
+_REAP_RAN = "_chat_reap_ran"
+"""The attribute :func:`_end_cli` sets on its leader before it calls ``reap``: the launch's own reap was attempted.
+``confinement._Leader.reaped`` is set only after its ``Popen.wait`` returns, so a reap that raised after the kernel
+reap leaves it False with ``Popen.returncode`` set; this flag tells that reap from one outside the launch (chatint L3 r1 item 3)."""
+
+
+def _release_watch(leader: Any, failures: list[str], *, reaped_outside: bool) -> None:
+    """Close the leader's watch (kqueue / pidfd) once nothing more is read from it (chatint L3 r1 item 4), so no
+    launch leaves a descriptor open. An exited leader kept unreaped: ``release_watch``. One reaped outside the launch:
+    ``reap``, which for a ``Popen`` already holding its returncode makes no wait syscall (``Popen.wait`` returns that
+    returncode); it marks the leader reaped and closes the watch under its reap lock."""
+    try:
+        if reaped_outside:
+            leader.reap(timeout=0)
+        else:
+            leader.release_watch()
+    except Exception as exc:  # noqa: BLE001 - named; a watch left open is a descriptor, never a wrong signal
+        failures.append(f"cli watch release: {type(exc).__name__}")
+
+
+def _end_cli(leader: Any, failures: list[str]) -> CliEnd:
+    """C11, on ``confinement._Leader`` (chatdriver L3 r1 FIX 1): the leader alone gets SIGTERM, then SIGKILL past
+    :data:`CLI_TERM_WAIT_S`, and its exit is read WITHOUT reaping it; its group is SIGKILLed while the zombie leader
+    still reserves the group's number (an unreaped pid is never reused, so the signal can reach no other group), then
+    polled by ``confinement.group_gone_proc`` (which counts no zombie, on Linux from /proc, and answers live whenever
+    its view may be incomplete); the leader is reaped LAST, and only once its group is gone. Every substep is
+    attempted; what failed is appended to ``failures``. A group kill refused with EPERM is not a failure when the
+    poll then finds the group gone: macOS answers EPERM for a group holding only zombies (measured), which is the
+    clean case here, the unreaped leader being one.
+
+    The leader is never signalled after a reap: this is the only reap, under :class:`ChatLaunch`'s lock; a leader it
+    already reaped is answered from what the reap saw (chatdriver r2 item 1: its number may be another process's
+    now), and a leader some other code reaped (the :meth:`ChatLaunch.attach_cli` contract broken) gets no signal
+    at all. "Reaped outside" is decided from the launch's own state, never from ``Popen.returncode`` alone: a
+    returncode that appears once this function attempted its reap is that reap's (:data:`_REAP_RAN`)."""
+    from levain.firing.confinement import _proc_hides_pids, group_gone_proc
+
+    proc, pid = leader.proc, leader.pid                 # pid == its pgid: attach_cli checked it leads its own group
+    if leader.reaped:                                   # only this function reaps it, once its group was gone
+        return CliEnd(exit_code=leader.status, group_gone=True, reaped=True)
+    if getattr(leader, _REAP_RAN, False) and proc.returncode is not None:
+        # our reap ran (it is attempted only once the group was seen gone) and raised after the kernel reap: the
+        # returncode is that reap's, never one outside (chatint L3 r1 item 3); that reap may have raised before it
+        # closed the watch, so the watch is released here (verify r2 item a)
+        _release_watch(leader, failures, reaped_outside=False)
+        return CliEnd(exit_code=leader.status if leader.status is not None else proc.returncode, group_gone=True,
+                      reaped=True)
+    if proc.returncode is not None:                     # only a refusal to signal: its number may be another's now;
+                                                        # a permanent verdict, ChatLaunch.end keeps chat_tmp for good
+        failures.append("cli: reaped outside the launch; chat_tmp kept")
+        _log.warning("chat launch end: the CLI was reaped outside the launch; its group is not signalled")
+        _release_watch(leader, failures, reaped_outside=True)
+        return CliEnd(exit_code=proc.returncode, group_gone=False, reaped_outside=True)
+
+    def exited(timeout: float) -> bool:
+        try:
+            return bool(leader.wait(timeout))
+        except OSError as exc:
+            failures.append(f"cli wait: {type(exc).__name__}")
+            return False
+
+    def note(step: str, exc: OSError | None) -> None:
+        if exc is not None:
+            failures.append(f"cli {step}: {type(exc).__name__}")
+
+    if not exited(0):
+        note("term", _send(lambda: os.kill(pid, signal.SIGTERM)))
+        if not exited(CLI_TERM_WAIT_S):
+            note("kill", _send(lambda: os.kill(pid, signal.SIGKILL)))
+            exited(CLI_TERM_WAIT_S)
+    # ALWAYS, before the gone poll, whether or not the leader exited on TERM (chatint L3 r1 item 1): the /proc scan
+    # reads one entry at a time, so a member that keeps forking can slip past it. A SIGKILLed group cannot fork, so
+    # two clean scans after this kill are sound.
+    refused = _send(lambda: os.killpg(pid, signal.SIGKILL))
+    try:
+        gone = group_gone_proc(pid, timeout=CLI_GROUP_WAIT_S)
+    except Exception as exc:  # noqa: BLE001 - named; the group is then not known gone
+        failures.append(f"cli group poll: {type(exc).__name__}")
+        gone = False
+    if not gone:
+        note("killpg", refused)
+        try:
+            hidden = platform.system() != "Darwin" and _proc_hides_pids()
+        except Exception:  # noqa: BLE001 - the cause is then unnamed; the group is still not known gone
+            hidden = False
+        if hidden:                                      # group_live_proc answers live for every group then
+            failures.append("cli group poll: /proc may hide members: chat_tmp kept")
+    reaped = False
+    if gone and leader.exited:
+        setattr(leader, _REAP_RAN, True)                # before the reap: a returncode seen from here on is this reap's
+        try:
+            reaped = bool(leader.reap(timeout=CLI_TERM_WAIT_S))
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"cli reap: {type(exc).__name__}")
+    elif leader.exited:                                 # kept unreaped for a retry: its exit is known
+        _release_watch(leader, failures, reaped_outside=False)
+    return CliEnd(exit_code=leader.status, group_gone=gone, reaped=reaped)
+
+
+@dataclass
+class ChatLaunch:
+    """One chat launch as the driver holds it: its egress (``chat_egress.launch.EgressLaunch``), its ``chat_tmp``
+    (the launch's private write root, design §3.3) and, once attached, its CLI child. :meth:`end` releases them."""
+
+    egress: Any
+    chat_tmp: Path
+    _cli: Any = field(default=None, init=False, repr=False)       # confinement._Leader over the CLI's Popen
+    _ending: bool = field(default=False, init=False, repr=False)  # end() has been called
+    _ended: LaunchEnd | None = field(default=None, init=False, repr=False)    # set only by a complete end
+    _stopped: bool = field(default=False, init=False, repr=False)             # it returned a clean stop
+    _stop: Any = field(default=None, init=False, repr=False)                  # what it returned
+    _cli_end: CliEnd | None = field(default=None, init=False, repr=False)     # the CLI teardown's, once finished
+    _cli_failures: tuple[str, ...] = field(default=(), init=False, repr=False)  # what that finishing call named
+    _tmp: tuple[str, ...] | None = field(default=None, init=False, repr=False)  # chat_tmp's leftovers, once done
+    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def attach_cli(self, proc: subprocess.Popen) -> None:
+        """Hand the launch its CLI child, so :meth:`end` ends it. It must lead its own process group
+        (``start_new_session=True``): its group is what :meth:`end` kills. Raises ValueError for one that does not or
+        is already reaped (its pid may be another process's by now), RuntimeError for a second CLI or a launch whose
+        :meth:`end` has been called.
+
+        From here the launch owns the CLI's reap (chatdriver L3 r1 FIX 2): nothing else may reap it, so its pid stays
+        its own until :meth:`end` has seen its group gone. ``proc.wait``, ``poll``, ``communicate``, ``terminate``,
+        ``kill`` and ``send_signal`` each may reap it; use :meth:`cli_exit` to watch it. Enforced as far as a Popen
+        allows: :meth:`end` finds a leader reaped elsewhere by its ``returncode`` and then signals nothing."""
+        from levain.firing.confinement import _Leader
+
+        with self._lock:
+            if self._ending:
+                raise RuntimeError("the launch has ended: nothing would reap this CLI")
+            if self._cli is not None:
+                raise RuntimeError("the launch already has its CLI")
+            if proc.returncode is not None:
+                raise ValueError("the CLI is already reaped: its pid may be another process's now")
+            if not _leads_group(proc.pid):
+                raise ValueError("the CLI must lead its own process group (start_new_session=True), unreaped")
+            self._cli = _Leader(proc)
+
+    def cli_exit(self, timeout: float = 0.0) -> int | None:
+        """The attached CLI's exit status (``Popen.returncode`` style) once its watch has seen it exit, waiting up to
+        ``timeout`` seconds, read WITHOUT reaping it; after :meth:`end` reaped it, the status the reap read. None
+        while it runs and when none is attached. On macOS, None also for a CLI that had already exited, unreaped,
+        when it was attached (:meth:`attach_cli` refuses only a reaped one): the kqueue watch is set after that exit
+        and never sees it, so its status is read only by :meth:`end`'s reap (chatdriver r2 item 5). An OSError or
+        ValueError from ``confinement._Leader.wait`` is not caught here."""
+        leader = self._cli
+        if leader is None or not leader.wait(timeout):
+            return None
+        return leader.status
+
+    def end(self) -> LaunchEnd:
+        """The launch end, in order: the CLI (:func:`_end_cli`, C11), then ``stop_egress`` (its client is gone, so
+        it drains), then ``chat_tmp`` removed by ``tmp_clean.remove_tree``, ONLY once the CLI's group is confirmed gone
+        and its leader reaped (chatdriver L3 r1 FIX 3) AND ``stop_egress`` has returned a clean stop (chatint 5a: a
+        glue still running may write into it; chatint L3 r1 item 2: :func:`_not_a_stop`), so nothing is removed under
+        a writer. Every step is attempted whatever an earlier one raised.
+
+        Retryable until complete (chatdriver r2 item 2): the end is complete only once all three parts are done, the
+        CLI teardown finished (its leader reaped, or found reaped outside the launch: a permanent verdict, chat_tmp
+        then kept for good, chatdriver r2 item 3), ``stop_egress`` returned a clean stop, and the ``chat_tmp`` step
+        ran. Each part is done once and its result kept; a later call runs only the parts not done, so a reaped leader
+        is never signalled again and ``chat_tmp`` is removed once. While the CLI teardown has not finished, or
+        ``stop_egress`` has not returned a clean stop (what was not clean is named in ``failures``), ``chat_tmp`` is
+        kept and named in ``tmp_leftovers``, and the next call retries what is not done (a leader not yet reaped keeps
+        its group's number its own). The returned end describes every part as it stands: a done part's result and the
+        failures named by the call that finished it, the others as this call found them. A complete end is returned
+        by every later call.
+
+        It blocks, up to the sum of its bounds (chatint L3 r1 item 7): :data:`CLI_TERM_WAIT_S` for the TERM, again
+        for the KILL and again for the reap; :data:`CLI_GROUP_WAIT_S` for the group poll, plus the probe running at
+        its deadline; then ``stop_egress``'s: ``launch.GLUE_EXIT_TIMEOUT_S`` for the glue, again after its kill, the
+        decider's close bound and the SOCKS refuser's; then ``chat_tmp``'s removal, which has no bound. A second
+        call also waits for the first, on the launch's lock. Never call it on an event loop: run it on a worker
+        thread (``asyncio.to_thread``)."""
+        from levain.chat_egress import launch as lm
+
+        with self._lock:
+            if self._ended is not None:
+                return self._ended
+            self._ending = True
+            cli, cli_failures = self._cli_end, list(self._cli_failures)
+            if self._cli is not None and cli is None:
+                cli_failures = []
+                try:
+                    cli = _end_cli(self._cli, cli_failures)
+                except Exception as exc:  # noqa: BLE001 - named, and the egress still ends
+                    cli_failures.append(f"cli: {type(exc).__name__}")
+                    _log.warning("chat launch end: the CLI teardown failed: %s", type(exc).__name__)
+                if cli is not None and (cli.reaped or cli.reaped_outside):
+                    self._cli_end, self._cli_failures = cli, tuple(cli_failures)
+            egress_failures: list[str] = []
+            if not self._stopped:
+                try:
+                    self._stop = lm.stop_egress(self.egress)
+                    egress_failures = _not_a_stop(self._stop)
+                except Exception as exc:  # noqa: BLE001
+                    self._stop = None
+                    egress_failures = [f"egress: {type(exc).__name__}"]
+                    _log.warning("chat launch end: stop_egress failed: %s", type(exc).__name__)
+                else:
+                    self._stopped = not egress_failures
+                    if egress_failures:
+                        _log.warning("chat launch end: the egress is not confirmed stopped: %s", egress_failures)
+            cli_done = self._cli is None or self._cli_end is not None
+            tmp_failures: list[str] = []
+            if self._tmp is None:
+                if self._cli_end is not None and self._cli_end.reaped_outside:
+                    self._tmp = (str(self.chat_tmp),)     # its group was never confirmed gone, and never can be
+                elif cli_done and self._stopped:
+                    self._tmp = tuple(_remove_chat_tmp(self.chat_tmp))
+                else:
+                    if cli_done:
+                        why = "the egress is not confirmed stopped"
+                    elif cli is None:                  # the teardown raised: no group verdict exists
+                        why = "the CLI teardown did not finish"
+                    else:
+                        why = "the CLI's process group is not confirmed gone"
+                    tmp_failures.append(f"chat_tmp: kept, {why}")
+                    _log.warning("chat launch end: chat_tmp kept, %s", why)
+            complete = cli_done and self._stopped and self._tmp is not None
+            out = LaunchEnd(cli=cli, egress=self._stop,
+                            tmp_leftovers=self._tmp if self._tmp is not None else (str(self.chat_tmp),),
+                            failures=tuple(cli_failures + egress_failures + tmp_failures), complete=complete)
+            if complete:
+                self._ended = out
+            return out
+
+
+RENEW_WAIT_S = 10.0
+"""How long a launch's renew-due callback waits for another launch's in-flight ping of the same record before it
+takes that send over. [judged by lane-cdfix, 10-25, against notify spawning a detached sender]"""
+
+CHAT_HARNESSES = ("claude-code", "codex")
+"""The harnesses a chat launch names; each has its own consent adapter settings file, which its renew ping reads
+(``consent.adapters.claude_code`` / ``consent.adapters.codex`` ``load_settings``)."""
+
+CA_REMINT_MARGIN = timedelta(days=1)
+"""A launch this close to the service CA's ``not_valid_after`` (or past it) gets a newly minted CA
+(``1025-23/chatdriver/RULINGS_OBS.md`` 1: "within 1 day of expiry")."""
+
+
+def renew_message(due: Any) -> str:
+    """The operator's renew-due ping for one ``chat_egress.renew.RenewDue``."""
+    when = due.expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return (f"levain: the chat key for {due.host} (record {due.record_id}) expires {when}; renew it with "
+            "`levain chat key setup --replace`.")
+
+
+class ChatEgressService:
+    """The chat egress of one chat-service start (CH-D2 S8's call sites): ONE CA, minted here by
+    ``chat_egress.ca.new_egress_ca`` and handed to every launch (never one per launch, never reused across starts;
+    re-minted by the first launch within :data:`CA_REMINT_MARGIN` of its expiry, see :meth:`_ca_for`),
+    the srt install every launch verifies (``start_egress`` runs ``srt_pin.check`` over ``srt_prefix`` itself), and
+    19a's renew-due ping (:meth:`renew_due`). :meth:`close` ends the start and removes its CA certs."""
+
+    def __init__(self, *, state_dir: Path, store: Any, queue_dir: Path, node: str = "node",
+                 srt_prefix: Path | None = None, now: datetime | None = None) -> None:
+        from levain.chat_egress import ca, srt_pin
+
+        self.store = store
+        self.queue_dir = Path(queue_dir)
+        self.node = node
+        self.srt_prefix = Path(srt_prefix) if srt_prefix is not None else srt_pin.default_prefix()
+        self.state_dir = Path(state_dir)
+        self.ca = ca.new_egress_ca(self.state_dir, now=now or datetime.now(timezone.utc))
+        self._certs: list[Path] = [self.ca.cert_path]                    # every cert this start minted
+        self._ca_lock = threading.Lock()
+        self._closed = False
+        self._pinged: set[tuple[str, datetime]] = set()                    # notify returned success
+        self._in_flight: dict[tuple[str, datetime], threading.Event] = {}  # a launch is sending it now
+        self._lock = threading.Lock()
+
+    def launch(self, *, launch_id: str, chat_tmp: Path, events: Path, routes: Any, liveness: Any, credentials: Any,
+               cards: Any, mode: Any, authority: Any, harness: str, limits: Any = None, seams: Any = None,
+               now: datetime | None = None) -> ChatLaunch:
+        """Start one launch's egress with this service's CA and srt install. ``chat_tmp`` is the launch's from this
+        call: removed at :meth:`ChatLaunch.end`, or here, before the refusal propagates, when the start refuses.
+        ``authority`` (the replay ``routes`` were built from) is required: ``start_egress`` reads the renew-due
+        records from it and refuses a None. ``harness`` (one of :data:`CHAT_HARNESSES`, else a ValueError) is the
+        harness that drives the chat: its renew ping reads that harness's settings (:meth:`renew_due`)."""
+        from levain.chat_egress import launch as lm
+
+        chat_tmp = Path(chat_tmp)
+        extra = {} if limits is None else {"limits": limits}
+        try:
+            if harness not in CHAT_HARNESSES:
+                raise ValueError(f"no chat harness {harness!r}: one of {', '.join(CHAT_HARNESSES)}")
+            ca_pem = self._ca_for(now or datetime.now(timezone.utc)).glue_pem()
+            egress = lm.start_egress(store=self.store, launch_id=launch_id, node=self.node,
+                                     srt_prefix=self.srt_prefix, events=events, ca_pem=ca_pem,
+                                     routes=routes, liveness=liveness, credentials=credentials, cards=cards,
+                                     mode=mode, seams=seams, authority=authority,
+                                     on_renew_due=functools.partial(self.renew_due, harness=harness),
+                                     now=now, **extra)
+        except BaseException:
+            _remove_chat_tmp(chat_tmp)
+            raise
+        return ChatLaunch(egress=egress, chat_tmp=chat_tmp)
+
+    def _ca_for(self, now: datetime) -> Any:
+        """The CA a launch at ``now`` gets: this start's, first re-minted when ``now`` is within
+        :data:`CA_REMINT_MARGIN` of its ``not_valid_after``. The earlier cert stays on disk (``prune=False``):
+        launches started on it may still be running. A naive ``now`` is a ValueError."""
+        from levain.chat_egress import ca
+
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError(f"the CA check needs an aware now, got {now!r}")
+        with self._ca_lock:
+            if self._closed:
+                raise RuntimeError("the chat egress service is closed: its CA certs are removed")
+            if now >= self.ca.not_valid_after - CA_REMINT_MARGIN:
+                self.ca = ca.new_egress_ca(self.state_dir, now=now, prune=False)
+                self._certs.append(self.ca.cert_path)
+            return self.ca
+
+    def close(self) -> tuple[str, ...]:
+        """End this start: remove every CA cert it minted (re-minted ones too) and refuse any later launch. Call
+        it once every launch has ended, since a running launch's chat env trusts its cert. Idempotent; the certs
+        that could not be removed are returned (and logged), and a later call tries them again."""
+        with self._ca_lock:
+            self._closed = True
+            left = []
+            for cert in self._certs:
+                try:
+                    cert.unlink(missing_ok=True)       # unlink removes a symlink itself, never its target
+                except OSError as exc:
+                    _log.warning("chat egress close: %s not removed: %s", cert, type(exc).__name__)
+                    left.append(cert)
+            self._certs = left
+            return tuple(str(c) for c in left)
+
+    def renew_due(self, launch_id: str, due: Sequence[Any], *, harness: str) -> None:
+        """19a's ``on_renew_due``: ping the operator about each record due, through the consent gate's own path
+        (``consent.adapters.claude_code.notify``: the notify command, the ping record, a push to a paired phone),
+        ``kind`` ``renew``, ``ref`` ``renew:<record id>``, with the settings of the ``harness`` that drives the chat
+        (``codex.json`` for ``codex``, ``claude_code.json`` for ``claude-code``; another name is a ValueError). Once
+        per record and expiry for this service: a record pinged is not pinged again by a later launch (a renewed
+        record's new expiry is a new ping). A ping with nowhere to go is not counted, so a phone paired later still
+        gets the next launch's.
+
+        A record counts as pinged only once ``notify`` returned success (chatdriver L3 r1 FIX 4). While one launch is
+        sending it, the record is in flight: a concurrent launch waits for that send (up to :data:`RENEW_WAIT_S`)
+        and rechecks, so it sends the ping itself when the first send failed, and takes the send over when it is
+        still in flight past that wait (r2 item 4: the record may then be pinged twice). After :meth:`close` it logs and returns without pinging. Nothing ``load_settings``
+        or ``notify`` raises leaves this callback: it is logged, and the record stays un-pinged for the next launch."""
+        from levain.consent.adapters import claude_code, codex
+
+        if harness not in CHAT_HARNESSES:
+            raise ValueError(f"no chat harness {harness!r}: one of {', '.join(CHAT_HARNESSES)}")
+        with self._ca_lock:
+            closed = self._closed
+        if closed:                                     # close() says every launch has ended: a late tick pings no one
+            _log.info("renew-due for launch %s after the service closed: not pinged", launch_id)
+            return
+        adapter = codex if harness == "codex" else claude_code
+
+        unloaded = object()
+        settings: Any = unloaded
+        for d in due:
+            key = (d.record_id, d.expires_at)
+            mine = self._claim_ping(key, launch_id)
+            if mine is None:
+                continue
+            sent = False
+            try:
+                if settings is unloaded:
+                    settings = adapter.load_settings(self.queue_dir)
+                sent = bool(claude_code.notify(settings, renew_message(d), cwd=self.queue_dir, kind="renew",
+                                               ref=f"renew:{d.record_id}"))
+                if not sent:
+                    _log.info("renew-due ping for %s (launch %s) had nowhere to go", d.record_id, launch_id)
+            except Exception as exc:  # noqa: BLE001 - a ping failure never reaches start_egress
+                _log.warning("renew-due ping for %s (launch %s) failed: %s", d.record_id, launch_id,
+                             type(exc).__name__)
+            finally:
+                with self._lock:
+                    if sent:
+                        self._pinged.add(key)
+                    if self._in_flight.get(key) is mine:   # a waiter may have taken a hung claim over
+                        del self._in_flight[key]
+                    mine.set()
+
+    def _claim_ping(self, key: tuple[str, datetime], launch_id: str) -> threading.Event | None:
+        """The claim (an Event, set when its send ends) when this caller is now the one sending ``key``'s ping;
+        None when it was pinged. A send in flight is waited for, up to :data:`RENEW_WAIT_S`, then rechecked; one
+        still in flight past that is taken over (chatdriver r2 item 4), so a hung ``notify`` never silences the
+        record for the service's lifetime. A newer claim than the one waited for gets its own full wait."""
+        claim = None
+        deadline = 0.0
+        while True:
+            with self._lock:
+                if key in self._pinged:
+                    return None
+                sending = self._in_flight.get(key)
+                if sending is None or (sending is claim and time.monotonic() >= deadline):
+                    if sending is not None:
+                        _log.info("renew-due ping for %s (launch %s): another launch's send is still in flight "
+                                  "after %ss; sending it here", key[0], launch_id, RENEW_WAIT_S)
+                    mine = self._in_flight[key] = threading.Event()
+                    return mine
+                if sending is not claim:
+                    claim, deadline = sending, time.monotonic() + RENEW_WAIT_S
+            sending.wait(max(0.0, deadline - time.monotonic()))

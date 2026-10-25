@@ -2,7 +2,8 @@
 
 `start_egress`, in order (the first step that refuses, refuses, and nothing after it runs):
   1. test seams are refused unless `LEVAIN_TEST_SEAMS=1` is in the SERVICE's env, and a glue argument outside the
-     glue's own test-seam list (`GLUE_SEAMS`) is refused even then;
+     glue's own test-seam list (`GLUE_SEAMS`) is refused even then; an `authority` of None is refused (the
+     parameter has no default: S8D r1 KNOWN EDGES, so no launch skips 4b);
   2. the launch id must name a row of the dispatch store's `launches` table (the egress rows reference it);
   3. Node: `<node> --version` under an empty env must read `v<major>.<minor>.<patch>` with the major in
      `ACCEPTED_NODE_MAJORS` (R15-17-4: the probe suite has passed on 26 only), else refused naming the version;
@@ -12,7 +13,7 @@
   4a. the mode read once (`launch_mode`): a value outside `classify.MODES` is refused. The session header and the
      egress digest are derived from that read, never from a second input (the digest fixes the mode at launch; a
      `LiveSetting` is still read live per request by the decider: Q-R15-9);
-  4b. 19a: given the authority replay the routes were built from, the keyed records expiring within
+  4b. 19a: from the authority replay the routes were built from, the keyed records expiring within
      `renew.RENEW_DUE` are computed (a naive `now` or an authority that does not read is refused here);
   5. the listener pair: the HTTP(S) listener (handed to the glue as an fd) and the SOCKS refuser (`socks`), both on
      127.0.0.1; the decider and observation socket pairs, the CA pipe and the lifeline pipe;
@@ -189,11 +190,13 @@ class StopResult:
 
 
 def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, events: Path, ca_pem: bytes, routes: Any,
-                 liveness: Any, credentials: Any, cards: Any, mode: Any,
-                 limits: dm.Limits = dm.Limits(), seams: TestSeams | None = None, authority: Any = None,
+                 liveness: Any, credentials: Any, cards: Any, mode: Any, authority: Any,
+                 limits: dm.Limits = dm.Limits(), seams: TestSeams | None = None,
                  on_renew_due: Callable[[str, list[renew.RenewDue]], None] | None = None,
                  now: datetime | None = None) -> EgressLaunch:
     refuse_seams(seams)
+    if authority is None:                   # S8D r1 KNOWN EDGES: no launch without the authority its routes came from
+        raise EgressRefused("no authority: a launch names the authority replay its routes were built from")
     node = shutil.which(node) or node       # the glue runs under env={}: a bare name resolves on the service's PATH
     if store.launch(launch_id) is None:
         raise EgressRefused(f"no launches row for {launch_id!r}: the egress rows of a launch reference it")
@@ -207,12 +210,10 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
     if not events.name:
         raise EgressRefused(f"the events path names no file: {str(events)!r}")
     stderr = events.with_name(events.name + ".glue-stderr")
-    due: list[renew.RenewDue] = []
-    if authority is not None:
-        try:
-            due = renew.renew_due(authority, routes, now=now or datetime.now(timezone.utc))
-        except Exception as exc:  # noqa: BLE001 - nothing is allocated yet: refused whole
-            raise EgressRefused(f"the launch's renew-due data did not read: {type(exc).__name__}: {exc}") from None
+    try:
+        due = renew.renew_due(authority, routes, now=now or datetime.now(timezone.utc))
+    except Exception as exc:  # noqa: BLE001 - nothing is allocated yet: refused whole
+        raise EgressRefused(f"the launch's renew-due data did not read: {type(exc).__name__}: {exc}") from None
     records = rec.EgressRecords(store)
     placements = json.dumps(keys.credential_placements(routes), separators=(",", ":"))
     failures: list[str] = []

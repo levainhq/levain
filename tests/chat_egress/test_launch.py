@@ -19,6 +19,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +36,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures" / "spike_glu
 import decider_spike4 as spike  # noqa: E402  (make_ca: an RSA CA srt's node-forge accepts)
 
 NODE_VERSION = "v26.8.1"
+
+#: An authority replay holding no grant: a launch whose routes are due nothing (`start_egress` requires one).
+NO_GRANTS = SimpleNamespace(policy=SimpleNamespace(grants={}))
 
 
 def real_launch(store: EnvelopeStore) -> str:
@@ -193,7 +197,7 @@ def _start(tmp: Path, origin: Origin, monkeypatch, *, open_network: bool = False
                            credentials=keys.LaunchCredentials(NoStore()), cards=cards or Desk(),
                            mode=mode or dm.Fixed(classify.OPEN_NETWORK if open_network else classify.GATED),
                            limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),
-                           seams=seams)
+                           authority=NO_GRANTS, seams=seams)
 
 
 def _get(e, port: int, path: str) -> tuple[int, bytes]:
@@ -295,7 +299,7 @@ def test_production_launch_refuses_seams_before_spawning(tmp_path, origin, monke
                         srt_prefix=envmod.srt_prefix(), events=tmp_path / "ev.jsonl",
                         ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([]), liveness=Live(),
                         credentials=keys.LaunchCredentials(NoStore()), cards=Desk(), mode=dm.Fixed(classify.GATED),
-                        seams=lm.TestSeams(glue_args=("--carve", "127.0.0.1:1")))
+                        authority=NO_GRANTS, seams=lm.TestSeams(glue_args=("--carve", "127.0.0.1:1")))
     assert not (tmp_path / "ev.jsonl").exists()
 
 

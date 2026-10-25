@@ -31,7 +31,7 @@ from levain.coordinator.envelopes import EnvelopeStore
 
 from .decider_rig import Desk, Live, Lookup, NoStore
 from .fixtures import env as envmod
-from .test_launch import real_launch
+from .test_launch import NO_GRANTS, real_launch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures" / "spike_glue"))
 import decider_spike4 as spike  # noqa: E402
@@ -124,7 +124,7 @@ def _start(tmp: Path, port: int, monkeypatch, *, node: str, extra: tuple[str, ..
                         srt_prefix=envmod.srt_prefix(), events=tmp / "events.jsonl",
                         ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([]), liveness=Live(),
                         credentials=keys.LaunchCredentials(NoStore()), cards=Desk(), mode=dm.Fixed(classify.GATED),
-                        limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0), seams=seams)
+                        authority=NO_GRANTS, limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0), seams=seams)
     return e, cert_pem
 
 

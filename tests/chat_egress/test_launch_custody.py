@@ -30,7 +30,7 @@ from levain.coordinator.envelopes import EnvelopeStore
 
 from .decider_rig import Desk, Live, Lookup, NoStore
 from .fixtures import env as envmod
-from .test_launch import real_launch
+from .test_launch import NO_GRANTS, real_launch
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
 HOSTS = [f"h{i}.s8.test" for i in range(20)]
@@ -94,6 +94,17 @@ def test_the_ca_cert_is_on_disk_and_its_key_is_not(tmp_path) -> None:
     assert cert.not_valid_after_utc - cert.not_valid_before_utc == cam.CA_VALIDITY + datetime.timedelta(minutes=5)
     b = cam.new_egress_ca(tmp_path, now=NOW, start_id="s2")      # a restart: a new CA, the old cert deleted
     assert sorted(p.name for p in (tmp_path / "egress-ca").iterdir()) == ["s2.pem"]
+    assert b.fingerprint_sha256 != a.fingerprint_sha256
+
+
+def test_the_ca_carries_its_expiry_and_a_re_mint_keeps_the_earlier_cert(tmp_path) -> None:
+    """chatdriver-2 (`1025-23/chatdriver/RULINGS_OBS.md` 1): the CA names its own not_valid_after (aware UTC, read
+    from the cert), and a re-mint inside one service start (`prune=False`) keeps the cert its earlier launches trust."""
+    a = cam.new_egress_ca(tmp_path, now=NOW, start_id="r1")
+    cert = x509.load_pem_x509_certificate(a.cert_pem)
+    assert a.not_valid_after == cert.not_valid_after_utc and a.not_valid_after.utcoffset() == datetime.timedelta(0)
+    b = cam.new_egress_ca(tmp_path, now=NOW, start_id="r2", prune=False)
+    assert sorted(p.name for p in (tmp_path / "egress-ca").iterdir()) == ["r1.pem", "r2.pem"]
     assert b.fingerprint_sha256 != a.fingerprint_sha256
 
 
@@ -178,7 +189,7 @@ def test_twenty_leaves_minted_leave_no_private_key_on_disk_or_open(tmp_path, mon
                         srt_prefix=envmod.srt_prefix(), events=state / "events.jsonl",
                         ca_pem=a.glue_pem(), routes=keys.RouteSet.of([]), liveness=Live(),
                         credentials=keys.LaunchCredentials(NoStore()), cards=Desk(), mode=dm.Fixed(classify.GATED),
-                        limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),
+                        authority=NO_GRANTS, limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),
                         seams=lm.TestSeams(glue_args=("--resolve-map", ";".join(f"{h}=127.0.0.1" for h in HOSTS)),
                                            lookup=Lookup()))
     bundle = None

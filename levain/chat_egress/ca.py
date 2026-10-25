@@ -5,7 +5,8 @@ TOUCHES DISK: it lives only in the closure behind :meth:`EgressCA.glue_pem`, who
 into the glue's CA pipe; the glue hands them to srt in memory, and srt mints every LEAF (one per host) in its process
 memory (srt 0.0.81 `mitm-leaf.js`: a cache on the CA object, no file). The CERT is written to
 `<state_dir>/egress-ca/<start id>.pem` (dir 0755, file 0644, never through a symlink) so the chat env can trust it, and
-older certs there are deleted at start.
+older certs there are deleted at start. A service up near its CA's `not_valid_after` mints a new one at a launch
+(`prune=False`: the earlier cert stays while launches started on it may run; the service removes its certs at close).
 
 The key is RSA 2048, not the design's EC P-256: srt's node-forge refuses an EC CA (the spike's measurement, kept in the
 test fixture `decider_spike4.make_ca`).
@@ -41,6 +42,7 @@ class EgressCA:
     cert_path: Path
     fingerprint_sha256: str
     start_id: str
+    not_valid_after: datetime                    # the cert's own, aware UTC
     _key_pem: Callable[[], bytes] = field(repr=False, compare=False)
 
     def glue_pem(self) -> bytes:
@@ -48,13 +50,13 @@ class EgressCA:
         return self._key_pem() + self.cert_pem
 
 
-def _write_cert(d: Path, name: str, pem: bytes) -> Path:
+def _write_cert(d: Path, name: str, pem: bytes, *, prune: bool) -> Path:
     d.mkdir(mode=0o755, parents=True, exist_ok=True)
     st = os.lstat(d)
     if not stat.S_ISDIR(st.st_mode):
         raise OSError(f"{d} is not a directory")
     os.chmod(d, 0o755)
-    for old in d.iterdir():
+    for old in (d.iterdir() if prune else ()):
         if old.name.endswith(".pem") and old.name != name:
             old.unlink(missing_ok=True)                 # unlink removes a symlink itself, never its target
     path = d / name
@@ -81,8 +83,10 @@ def _write_cert(d: Path, name: str, pem: bytes) -> Path:
     return path
 
 
-def new_egress_ca(state_dir: Path, *, now: datetime, start_id: str | None = None) -> EgressCA:
-    """A fresh CA for one chat-service start: the key in memory only, the cert on disk for the chat env's trust."""
+def new_egress_ca(state_dir: Path, *, now: datetime, start_id: str | None = None, prune: bool = True) -> EgressCA:
+    """A fresh CA for one chat-service start: the key in memory only, the cert on disk for the chat env's trust.
+    ``prune`` deletes every other cert in the directory (a start's leftovers); a re-mint inside one start passes
+    False, keeping the cert its earlier launches trust."""
     sid = start_id or secrets.token_hex(8)
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"Levain chat egress {sid}")])
@@ -97,7 +101,7 @@ def new_egress_ca(state_dir: Path, *, now: datetime, start_id: str | None = None
             .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
             .sign(key, hashes.SHA256()))
     pem = cert.public_bytes(serialization.Encoding.PEM)
-    path = _write_cert(Path(state_dir) / CA_DIR, f"{sid}.pem", pem)
+    path = _write_cert(Path(state_dir) / CA_DIR, f"{sid}.pem", pem, prune=prune)
 
     def key_pem() -> bytes:
         return key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
@@ -105,4 +109,4 @@ def new_egress_ca(state_dir: Path, *, now: datetime, start_id: str | None = None
 
     return EgressCA(cert_pem=pem, cert_path=path,
                     fingerprint_sha256=hashlib.sha256(cert.public_bytes(serialization.Encoding.DER)).hexdigest(),
-                    start_id=sid, _key_pem=key_pem)
+                    start_id=sid, not_valid_after=cert.not_valid_after_utc, _key_pem=key_pem)

@@ -21,7 +21,7 @@ from levain.coordinator.envelopes import EnvelopeStore
 
 from .decider_rig import Desk, Live, Lookup, NoStore
 from .fixtures import env as envmod
-from .test_launch import real_launch
+from .test_launch import NO_GRANTS, real_launch
 from .test_launch_tls import HOST, TlsOrigin, bad_pki, spike
 
 SECRET = "s3cret-value"
@@ -61,7 +61,7 @@ def _run(tmp_path, monkeypatch, placement: keys.Placement) -> list[str | None]:
                         srt_prefix=envmod.srt_prefix(), events=tmp_path / "events.jsonl",
                         ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([route], {"rec-1": placement}),
                         liveness=Live(), credentials=keys.LaunchCredentials(NoStore()), cards=Desk(),
-                        mode=dm.Fixed(classify.GATED),
+                        mode=dm.Fixed(classify.GATED), authority=NO_GRANTS,
                         limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),
                         seams=lm.TestSeams(glue_args=("--tls-ports", f"443,{P}", "--carve", f"127.0.0.1:{P}",
                                                       "--resolve-map", f"{HOST}=127.0.0.1", "--upstream-ca", str(ca)),
@@ -116,7 +116,7 @@ def test_a_route_without_a_placement_is_refused_with_nothing_left_open(tmp_path,
                         events=tmp_path / "events.jsonl", ca_pem=key_pem + cert_pem,
                         routes=keys.RouteSet(MappingProxyType({HOST: route}), MappingProxyType({})), liveness=Live(),
                         credentials=keys.LaunchCredentials(NoStore()), cards=Desk(), mode=dm.Fixed(classify.GATED),
-                        seams=lm.TestSeams(lookup=Lookup()))
+                        authority=NO_GRANTS, seams=lm.TestSeams(lookup=Lookup()))
     left = fds() - before
     print(f"RUN S8D item 4: refused with {type(got.value).__name__} {got.value}; fds left {sorted(left)}")
     assert not left and len(_node_children()) == len(kids)
