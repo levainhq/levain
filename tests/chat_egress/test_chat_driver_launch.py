@@ -51,6 +51,17 @@ def _members(pgid: int) -> list[str]:
     return subprocess.run(["/usr/bin/pgrep", "-g", str(pgid)], capture_output=True, text=True).stdout.split()
 
 
+def _exited_unreaped(pid: int) -> bool:
+    """The leader has exited and is not reaped: a zombie in /proc on Linux (state Z); on macOS, where pgrep lists no
+    zombie, gone from its group's members."""
+    stat = Path(f"/proc/{pid}/stat")
+    if Path("/proc/self/stat").exists():
+        try:
+            return stat.read_text().rsplit(")", 1)[1].split()[0] == "Z"
+        except (OSError, IndexError):
+            return False
+    return str(pid) not in _members(pid)
+
 def _kill_group(proc: subprocess.Popen) -> None:
     """Test cleanup: kill the CLI's group only while its leader is unreaped (its number still its own), then reap."""
     if proc.returncode is not None:
@@ -123,7 +134,9 @@ def test_a_cli_that_already_exited_leaves_its_orphans_to_the_group_kill(tmp_path
     proc = subprocess.Popen(["/bin/sh", "-c", "/bin/sh -c 'trap \"\" TERM; exec /bin/sleep 60' & exit 0"],
                             start_new_session=True)
     end = time.monotonic() + 5
-    while len(_members(proc.pid)) != 1:
+    # the leader stays unreaped (a zombie still in the group): Linux's pgrep lists it, macOS's does not, so the
+    # orphan is counted apart from the leader, and the leader's exit is waited for without reaping it
+    while [m for m in _members(proc.pid) if m != str(proc.pid)] == [] or not _exited_unreaped(proc.pid):
         assert time.monotonic() < end
         time.sleep(0.02)
     launch = cd.ChatLaunch(egress=_FakeEgress(), chat_tmp=t)
