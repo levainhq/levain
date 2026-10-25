@@ -2097,7 +2097,11 @@ def too_wide_to_deny(d: Path, home: Path, *within: Path) -> bool:
     :func:`_inside_by_identity`). A ``d`` INSIDE one of them is not too wide. The one predicate for the floor
     (:func:`_hides_the_entity`, ``within`` = the entity and its workspace) and the consent adapters'
     ``protected_paths`` (``within`` = the event's cwd when it has one)."""
-    shared = {Path("/tmp").resolve(), Path("/var/tmp").resolve(), Path(tempfile.gettempdir()).resolve()}
+    shared = {Path("/tmp").resolve(), Path("/var/tmp").resolve()}
+    try:
+        shared.add(Path(tempfile.gettempdir()).resolve())
+    except Exception:  # noqa: BLE001 - no usable temp directory: the fixed /tmp and /var/tmp checks stand
+        pass
     return (str(d) == d.anchor or len(d.parts) <= 2 or d in shared
             or any(_inside_by_identity(d, p) for p in (home, *within)))
 

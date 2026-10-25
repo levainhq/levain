@@ -244,11 +244,14 @@ def levain_home_protected(home: Path | None, cwd: str | None) -> list[Path]:
     try:
         user_home = Path(home) if home is not None else Path.home()
         base, spellings = levain_home_spellings(user_home)
-        within = (Path(cwd),) if isinstance(cwd, str) and os.path.isabs(cwd) else ()
-        if any(too_wide_to_deny(d, user_home, *within) for d in spellings):
-            return [base / name for name in LEVAIN_HOME_STATE_DIRS]
+        try:
+            within = (Path(cwd),) if isinstance(cwd, str) and os.path.isabs(cwd) else ()
+            if any(too_wide_to_deny(d, user_home, *within) for d in spellings):
+                return [base / name for name in LEVAIN_HOME_STATE_DIRS]
+        except Exception:  # noqa: BLE001 - the base resolved: protect it whole, conservative
+            pass
         return [base]
-    except Exception:  # noqa: BLE001 - any failure: the default home, never a raise
+    except Exception:  # noqa: BLE001 - any failure resolving the base: the default home, never a raise
         pass
     try:
         user_home = Path(home) if home is not None else Path.home()
@@ -1597,8 +1600,9 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
 def queue_unresolved(event: Any) -> dict[str, Any] | None:
     """:func:`main`'s answer for a PreToolUse when no queue directory could be resolved (:func:`default_queue_dir`
     raised: a ``$LEVAIN_HOME`` that cannot be expanded, or no home): with no queue and no settings, only the
-    levain home is classified (:func:`levain_home_protected`, which never raises): a call that targets it or other
-    agent config is denied with the hard stop, and every other call has no decision, so a read is not an outage."""
+    levain home is protected (:func:`levain_home_protected`, which never raises) and :func:`gate_class` classifies
+    the call: one that targets it, other agent config or an irreversible Bash call is denied with the hard stop, and
+    every other call has no decision, so a read is not an outage."""
     try:
         tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
         if not isinstance(tool_name, str) or not isinstance(cwd, str) or not os.path.isabs(cwd):
@@ -1825,7 +1829,7 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
             _ledger_fill(event, queue_dir)
     except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow
         try:
-            if queue_dir is None and event is None:
+            if event is None:
                 event = json.loads(stdin.read())   # not read yet: the failure came first
             out = None
             if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:

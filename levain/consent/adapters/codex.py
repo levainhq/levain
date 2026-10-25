@@ -932,7 +932,7 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
             stdout.flush()
     except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow
         try:
-            if queue_dir is None and event is None:
+            if event is None:
                 event = json.loads(stdin.read())   # not read yet: the failure came first
             out = None
             if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:

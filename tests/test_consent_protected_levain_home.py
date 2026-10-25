@@ -280,3 +280,71 @@ def test_an_unresolvable_queue_dir_still_denies_a_write_to_the_levain_home_codex
     assert _installed_hook(cx, "apply_patch", _patch(lhome / ".levain" / "autonomic" / "autonomic.db"), lhome) == "deny"
     assert _installed_hook(cx, "apply_patch", _patch(lhome / "work" / "a.txt"), lhome) is None
     assert _installed_hook(cx, "exec_command", {"cmd": "ls"}, lhome) is None
+
+
+# --- L3 r2: a failing temp-directory lookup or settings load never turns the store write ungated ---
+
+def _custom_home(tmp_path, monkeypatch):
+    custom = tmp_path / "opt" / "levain" / "state"
+    custom.mkdir(parents=True)
+    monkeypatch.setenv("LEVAIN_HOME", str(custom))
+    return custom
+
+
+def _no_tempdir(monkeypatch):
+    import tempfile
+
+    def boom():
+        raise FileNotFoundError("No usable temporary directory found")
+
+    monkeypatch.setattr(tempfile, "gettempdir", boom)
+
+
+def test_a_failing_gettempdir_still_protects_the_resolved_custom_levain_home(lhome, tmp_path, monkeypatch):
+    """Before: ``gettempdir()`` raised inside the predicate, the broad handler fell back to ``<home>/.levain`` and
+    a store write under a custom ``$LEVAIN_HOME`` was ungated."""
+    custom = _custom_home(tmp_path, monkeypatch)
+    _no_tempdir(monkeypatch)
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings())
+    assert Path(os.path.realpath(custom)) in got
+    assert lhome / ".levain" not in got
+
+
+def test_a_failing_predicate_returns_the_resolved_base_never_the_default_home(lhome, tmp_path, monkeypatch):
+    custom = _custom_home(tmp_path, monkeypatch)
+    from levain.firing import confinement
+
+    def boom(*a, **k):
+        raise RuntimeError("predicate")
+
+    monkeypatch.setattr(confinement, "too_wide_to_deny", boom)
+    got = cc.levain_home_protected(None, None)
+    assert got == [Path(os.path.realpath(custom))]
+
+
+def test_too_wide_to_deny_keeps_the_fixed_temp_checks_when_gettempdir_fails(tmp_path, monkeypatch):
+    from levain.firing.confinement import too_wide_to_deny
+
+    _no_tempdir(monkeypatch)
+    assert too_wide_to_deny(Path("/var/tmp").resolve(), tmp_path)
+    assert not too_wide_to_deny(tmp_path / "a" / "b" / "c", tmp_path / "other")
+
+
+def test_a_failing_settings_load_with_a_queue_dir_still_denies_a_store_write(lhome, tmp_path, monkeypatch):
+    """``load_settings`` raising after ``queue_dir`` is set: ``main`` never read the event, so its handler read
+    none and printed nothing."""
+    from levain.consent.adapters import codex as cx
+
+    def boom(*a, **k):
+        raise OSError("settings unreadable")
+
+    store = lhome / ".levain" / "autonomic" / "autonomic.db"
+    for adapter, tool, inp in ((cc, "Write", {"file_path": str(store), "content": "x"}),
+                               (cx, "apply_patch", _patch(store))):
+        monkeypatch.setattr(adapter, "load_settings", boom)
+        ev = {"hook_event_name": "PreToolUse", "session_id": "S1", "turn_id": "t1", "transcript_path": "/x.jsonl",
+              "cwd": str(lhome), "model": "m", "permission_mode": "bypassPermissions", "tool_name": tool,
+              "tool_input": inp, "tool_use_id": "call-S1"}
+        out = io.StringIO()
+        assert adapter.main(["--queue-dir", str(tmp_path / "q")], stdin=io.StringIO(json.dumps(ev)), stdout=out) == 0
+        assert json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"] == "deny", adapter.__name__
