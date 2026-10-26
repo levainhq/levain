@@ -223,6 +223,24 @@ def test_check_vendor_installed(tmp_path):
         SS.check_vendor_installed("darwin", "claude", prefix=tmp_path, root_uid=os.getuid())
 
 
+def test_the_slot_tests_vendor_prefix_passes_the_real_check_and_only_whole(tmp_path):
+    """tests/vendor_tree.py's prefix (the slot tests' ``start`` runs the real check against it) is one the check
+    accepts for every vendor on both hosts, and the check still refuses it once a vendor's copy is gone."""
+    from levain.slot import start as SS
+    from tests.vendor_tree import _VERSION, build_vendor_prefix
+
+    prefix = build_vendor_prefix(tmp_path / "levain-vendor")
+    for host in ("darwin", "linux"):
+        for name in RT.VENDORS:
+            SS.check_vendor_installed(host, name, prefix=prefix, root_uid=os.getuid())
+    os.unlink(prefix / "codex" / _VERSION / "codex-path" / "rg")
+    os.unlink(prefix / "bin" / "claude")
+    for name in RT.VENDORS:
+        with pytest.raises(Refused) as e:
+            SS.check_vendor_installed("linux", name, prefix=prefix, root_uid=os.getuid())
+        assert e.value.name == f"vendor-not-installed:{name}"
+
+
 # --- doctor's row ----------------------------------------------------------------------------------------------------
 
 def _doctor(tmp_path, states):

@@ -29,6 +29,7 @@ from levain.slot.root_tree import VENDOR_PREFIX
 from tests.execve_guard import refuse_real_execve, using
 from tests.test_slot_s2c_end import mine, thread_run_as
 from tests.test_slot_s2f2_runtime_helper import OP_UID, World, _blob, _prepared
+from tests.vendor_tree import vendor_installed, vendor_prefix  # noqa: F401 - autouse, the real vendor check
 
 E0 = SlotId("egress", 0)
 S0, GW0 = 899, 898          # World's _levain_s0 / _levain_gw0

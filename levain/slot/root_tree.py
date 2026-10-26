@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, Mapping, Optional
 
 from levain.firing.hands import HostOS, Step, _abs
-from levain.slot import Refused
+from levain.slot import Refused, write_all
 from levain.slot.layout import (HELPER_DIR, IMPORT_TREE, ROOT_GROUP, STORE, install_helper_path, runtime_helper_path,
                                 service_entry_path)
 
@@ -904,8 +904,6 @@ def _copy_one(src: int, st: os.stat_result, path: str, dest: Path, mode: int, *,
     size except one byte to see whether the file grew. :class:`_Changed` when the source's size, mtime or inode is
     not what was captured after the read; the partial is unlinked on any failure, the rename's included. ``digest``
     (a hashlib object) is fed every byte copied."""
-    from levain.slot import write_all
-
     partial = dest.parent / f".{dest.name}.partial"
     try:
         os.unlink(partial)
