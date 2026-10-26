@@ -29,6 +29,7 @@ from levain.cockpit.consent import utc_stamp
 from levain.cockpit.firejournal import CockpitDB
 
 pytest.importorskip("cryptography")
+from tests.autonomic_test_only_coverage import NO_GUARD, TEST_GUARD  # noqa: E402
 from tests.test_consent_queue import Key  # noqa: E402
 from tests.test_passkey_custody_derived import WebAuthnKey  # noqa: E402
 
@@ -40,7 +41,7 @@ GP2 = "gp-ba9876543210"
 OPT = "gpo-0123456789ab"
 STORE = "store-" + "ab" * 16
 LOW = {"cls": 1, "reversible": True, "external": False, "financial": False}
-V1, V2 = "levain-authority/1", "levain-authority/2"
+V1, V2, V3 = "levain-authority/1", "levain-authority/2", "levain-authority/3"
 OLDER = os.environ.get("LEVAIN_OLDER_CHECKOUT")
 older = pytest.mark.skipif(not OLDER, reason="set LEVAIN_OLDER_CHECKOUT to a levain checkout from before "
                                              "levain-authority/2")
@@ -145,11 +146,21 @@ class World:
 
 
 def grad(world: World, gid: str = GP, days: int = 30, **over) -> dict:
+    """A graduation policy record, signed with :data:`TEST_GUARD` (``guard=NO_GUARD``: one from before the guard)."""
     g = {"id": gid, "kind": "graduation", "actions": {"doc.append": dict(LOW)}, "lowest_posture": "ON_LOOP",
          "expires_at": utc_stamp(world.clock.now + timedelta(days=days)), "triggers": None, "families": None,
-         "store_id": STORE, "min_clean_fires": 20}
+         "store_id": STORE, "min_clean_fires": 20, "guard": [dict(e) for e in TEST_GUARD]}
     g.update(over)
+    if g["guard"] is NO_GUARD:
+        del g["guard"]
     return g
+
+
+def guard_file(tmp: Path, guard=TEST_GUARD) -> Path:
+    """``levain binding policy create --guard``'s file, holding ``guard``."""
+    path = tmp / "guard.json"
+    path.write_text(json.dumps([dict(e) for e in guard]))
+    return path
 
 
 def opt_in(world: World, *names: str, gid: str = OPT) -> dict:
@@ -190,11 +201,11 @@ def test_the_constants_are_pinned_to_the_rules_they_name():
     assert set(auth._GRADUATION_POSTURES) == {p.name for p in Posture if Posture.ABOVE_LOOP < p < Posture.CONFIRM}
 
 
-# --- §7 row 3: the laptop creates (rank 3, /1) ----------------------------------------------------------------------
+# --- §7 row 3: the laptop creates (rank 3; /3, the policy carrying its guard) ----------------------------------------
 
-def test_the_laptop_creates_a_graduation_policy_in_a_v1_link(world):
+def test_the_laptop_creates_a_graduation_policy_in_a_v3_link(world):
     snap = world.link({"op": "create_grant", "grant": grad(world)})
-    assert world.record(snap.seq)["format"] == V1
+    assert world.record(snap.seq)["format"] == V3
     assert snap.policy.grants[GP]["kind"] == "graduation" and not auth.inert_grant(snap.policy.grants[GP])
     assert auth.graduation_links(snap, GP) == (world.fp("laptop"), world.fp("laptop"))
     assert auth.graduation_incarnation(snap, GP).startswith(f"{snap.seq}:")
@@ -362,7 +373,7 @@ def test_the_opt_in_has_no_change(world):
 def test_a_passkey_the_opt_in_names_creates_one_graduation_policy(world):
     world.link({"op": "create_grant", "grant": opt_in(world, "pk")})
     snap = world.link({"op": "create_grant", "grant": grad(world)}, "pk")
-    assert world.record(snap.seq)["format"] == V2
+    assert world.record(snap.seq)["format"] == V3      # a guarded policy is /3, whoever signs it
     assert auth.graduation_links(snap, GP) == (world.fp("pk"), world.fp("pk"))
 
 
@@ -438,10 +449,14 @@ def test_every_other_passkey_act_is_refused(world):
 
 def test_a_link_in_the_wrong_format_is_refused_by_the_replay(world):
     world.link({"op": "create_grant", "grant": grad(world)})
-    # a passkey renew written /1, and a laptop create written /2
+    # a passkey renew written /1, a laptop create of a guarded policy written /2 or /1, and of one without a guard
+    # (a link from before the guard) written /2
     assert "written levain-authority/2" in world.replay_verdict(world.plant(renew(world), "pk", V1))
+    for fmt in (V1, V2):
+        assert "written levain-authority/3" in world.replay_verdict(
+            world.plant({"op": "create_grant", "grant": grad(world, GP2)}, "laptop", fmt))
     assert "written levain-authority/1" in world.replay_verdict(
-        world.plant({"op": "create_grant", "grant": grad(world, GP2)}, "laptop", V2))
+        world.plant({"op": "create_grant", "grant": grad(world, GP2, guard=NO_GUARD)}, "laptop", V2))
     assert "written levain-authority/1" in world.replay_verdict(
         world.plant({"op": "revoke_grant", "grant_id": GP}, "pk", V2))
     assert world.replay_verdict(world.plant(renew(world), "pk", V2)).startswith("ACCEPTED")
@@ -489,8 +504,10 @@ def older_replay(tmp: Path, db: Path) -> dict:
 
 @older
 def test_the_older_levain_replays_a_v1_only_log_whole_and_stops_at_the_first_v2_link(world):
-    world.link({"op": "create_grant", "grant": grad(world)})
-    world.link(renew(world), "laptop")
+    # a policy and its renew as a levain from before the guard signed them (this levain signs neither: a /3 create,
+    # and no renew of a guard-less policy), planted into the log
+    world.plant({"op": "create_grant", "grant": grad(world, guard=NO_GUARD)}, db=world.db)
+    world.plant(renew(world), db=world.db)
     world.link({"op": "create_grant", "grant": consent(world)})
     head = world.link({"op": "revoke_grant", "grant_id": GP}, "pk")
     assert older_replay(world.tmp, world.db)["seq"] == head.seq
@@ -503,7 +520,8 @@ def test_the_older_levain_replays_a_v1_only_log_whole_and_stops_at_the_first_v2_
 
 @older
 def test_the_older_levain_takes_the_planted_inert_loosen_this_replay_refuses(world):
-    snap = world.link({"op": "create_grant", "grant": grad(world)})
+    world.plant({"op": "create_grant", "grant": grad(world, guard=NO_GUARD)}, db=world.db)    # from before the guard
+    snap = world.state()
     policy = snap.policy.as_dict()
     policy["grants"][GP]["actions"] = {"doc.append": dict(LOW), "deliver": dict(LOW)}
     policy["raise_to"] = {"spore_touch": "T3"}

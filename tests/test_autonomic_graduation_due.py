@@ -25,7 +25,7 @@ _KILL = Guard(rationale="a spoofed sender", dissent_author="codex",
 
 def policy(gid, actions, *, min_clean=20, **kw) -> TermedGraduationPolicy:
     """The replayed policy with its signed ``min_clean_fires`` (the log requires the field on every policy)."""
-    return TermedGraduationPolicy.of(_policy(gid, actions, **kw), min_clean_fires=min_clean)
+    return TermedGraduationPolicy.of(_policy(gid, actions, min_clean_fires=min_clean, **kw))
 
 
 def _binding(posture=Posture.COOLING_OFF, *, links=1, clean=20, fires=20) -> Binding:
@@ -60,7 +60,8 @@ def _steps(store) -> list[tuple]:
 def test_a_covered_step_replaces_the_grant_and_its_audit_row_commits_with_it(tmp_path):
     b = _binding()
     s = _store(tmp_path, b)
-    src = TestOnlyCoverage([policy("gp-1", {"deliver": LOW}, expires_at=LATER, lowest="ON_LOOP")])
+    p1 = policy("gp-1", {"deliver": LOW}, expires_at=LATER, lowest="ON_LOOP")
+    src = TestOnlyCoverage([p1])
     [step] = _due(s, src)
     assert step.outcome == "graduated" and src.refreshes == 1
     assert s.get(b.binding_id).status is BindingStatus.REVOKED
@@ -68,7 +69,7 @@ def test_a_covered_step_replaces_the_grant_and_its_audit_row_commits_with_it(tmp
     assert new.status is BindingStatus.ACTIVE and new.posture is Posture.ON_LOOP and new.graduation.fire_count == 0
     head = src.head
     assert _steps(s) == [(b.binding_id, step.new_id, binding_family(b), "COOLING_OFF", "ON_LOOP", 20, 20, "gp-1",
-                          "inc-gp-1", f"{head[0]}:{head[1]}")]
+                          p1.incarnation, f"{head[0]}:{head[1]}")]
 
 
 def test_with_no_policy_the_step_is_uncovered_and_nothing_is_written(tmp_path):
@@ -103,12 +104,12 @@ def test_every_link_must_be_covered(tmp_path):
     one = TestOnlyCoverage([policy("gp-1", {"deliver": LOW}, expires_at=LATER)])
     [step] = _due(s, one, link_action=lambda b, i: names[i])
     assert step.outcome == "uncovered" and [l.action_name for l in step.uncovered] == ["file.note"]
-    both = TestOnlyCoverage([policy("gp-1", {"deliver": LOW}, expires_at=LATER),
-                             policy("gp-2", {"file.note": LOW}, expires_at=LATER)])
+    p1, p2 = policy("gp-1", {"deliver": LOW}, expires_at=LATER), policy("gp-2", {"file.note": LOW}, expires_at=LATER)
+    both = TestOnlyCoverage([p1, p2])
     [step] = _due(s, both, link_action=lambda b, i: names[i])
     assert step.outcome == "graduated"
     [row] = _steps(s)
-    assert row[7] == "gp-1,gp-2" and row[8] == "inc-gp-1,inc-gp-2"
+    assert row[7] == "gp-1,gp-2" and row[8] == ",".join(sorted([p1.incarnation, p2.incarnation]))
 
 
 def test_an_action_the_manifest_does_not_declare_is_uncovered(tmp_path):
@@ -206,8 +207,8 @@ def test_the_step_the_card_and_the_replace_judge_the_promoted_bindings_actions(t
     assert step.outcome == "uncovered" and [l.action_name for l in step.uncovered] == ["file.note"]
     from levain.cockpit.graduation_cards import card_of
     assert "--action file.note=LOW" in card_of(step)["command"]
-    both = TestOnlyCoverage([policy("gp-1", {"deliver": LOW}, expires_at=LATER),
-                             policy("gp-2", {"file.note": LOW}, expires_at=LATER)])
+    p1, p2 = policy("gp-1", {"deliver": LOW}, expires_at=LATER), policy("gp-2", {"file.note": LOW}, expires_at=LATER)
+    both = TestOnlyCoverage([p1, p2])
     [step] = _due(s, both, link_action=link_action)
     assert step.outcome == "graduated" and _steps(s)[0][7] == "gp-2"
 

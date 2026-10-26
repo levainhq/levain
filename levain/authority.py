@@ -10,8 +10,8 @@ A policy link is classified by RECOMPUTE: the declared op is applied to the repl
 difference is classified on its own (:func:`classify`). A declared op that disagrees with the computed
 delta is refused, and so is a link that changes nothing.
 
-A link is written :data:`FORMAT` or, when it needs a rule an older replay does not have, :data:`FORMAT_V2`; each link
-has one form (:func:`_link_format`), and the replay refuses the other.
+A link is written :data:`FORMAT` or, when it needs a rule an older replay does not have, :data:`FORMAT_V2` or
+:data:`FORMAT_V3`; each link has one form (:func:`_link_format`), and the replay refuses the others.
 
 The anchor (``anchor/authority.anchor`` in the store's data root, its directory excluded from Time Machine
 so a restore of the data root cannot roll it back with the log) is written only after a commit, so it lags
@@ -56,7 +56,8 @@ __all__ = [
     "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_MCP_FIELD_KINDS",
     "CONSENT_MCP_GRANT_KIND", "CONSENT_MCP_READ_ONLY_TOOLS",
     "CONSENT_GRANTABLE_TOOLS", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
-    "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "GRADUATION_CREATE_RANK",
+    "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "FORMAT_V3",
+    "GRADUATION_CREATE_RANK",
     "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
     "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
@@ -77,10 +78,15 @@ __all__ = [
 
 FORMAT = "levain-authority/1"
 # The format of a link that needs a rule a levain-authority/1 replay does not have (14b DESIGN_REV3 §7): a passkey's
-# renew or create_grant, and a link that brings in a graduation opt-in. Every other link is written FORMAT. This replay
-# takes both and holds each link to the one form :func:`_link_format` gives it; an older replay stops at the first
-# FORMAT_V2 link (its format check), so it never reads one as anything else.
+# renew or create_grant, and a link that brings in a graduation opt-in. A link that brings in a guarded graduation
+# policy is FORMAT_V3, and every other link is FORMAT. This replay takes all three and holds each link to the one form
+# :func:`_link_format` gives it; an older replay stops at the first FORMAT_V2 link (its format check), so it never
+# reads one as anything else.
 FORMAT_V2 = "levain-authority/2"
+# The format of a link that brings in a graduation policy carrying a ``guard`` (autogrant DESIGN I7, 1026-20 RULINGS
+# R13-12), whoever signs it. A replay that knows only /1 and /2 stops at it (its format check) rather than read a
+# policy whose guard it would not see; the guard is fixed with the policy's other terms, so no later link alters it.
+FORMAT_V3 = "levain-authority/3"
 RESET_FORMAT = "levain-authority-reset/1"
 RESET_NAMESPACE = "levain-authority-reset"
 ANCHOR_NAME = "authority.anchor"
@@ -422,9 +428,12 @@ _RENEW_SKEW = timedelta(minutes=10)
 # else is a revoke and a new id. It lasts at most GRADUATION_GRANT_MAX past its link, and a renew at most that past
 # its own. Created at the laptop (GRADUATION_CREATE_RANK), or by a passkey the live opt-in names
 # (GRADUATION_OPT_IN_RANK); renewed by any rank-2 key, a passkey included; revoked by any enrolled key.
+# Its ``guard`` (autogrant DESIGN D68, D75, D83) is optional in the record, so a log signed before it replays; this
+# levain signs no policy without a complete one (:func:`_graduation_guard_check`), and renews none.
 GRADUATION_KIND = "graduation"
 _GRADUATION_FIELDS = frozenset({"id", "kind", "actions", "lowest_posture", "expires_at", "triggers", "families",
                                 "store_id", "min_clean_fires"})
+_GRADUATION_OPTIONAL = frozenset({"guard"})
 _GRADUATION_ID = re.compile(r"gp-[0-9a-f]{12}")
 # the rungs a policy may lower an effect to: never ABOVE_LOOP (levain.autonomic.posture.Posture names)
 _GRADUATION_POSTURES = ("COOLING_OFF", "ON_LOOP")
@@ -877,9 +886,17 @@ def _graduation_names(items: Any, pattern: re.Pattern[str], where: str) -> None:
 
 def _validate_graduation(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
     """A graduation policy's shape (:data:`GRADUATION_KIND`). ``at``: the link's own time; the policy lasts at most
-    :data:`GRADUATION_GRANT_MAX` past it."""
-    if set(grant) != _GRADUATION_FIELDS:
-        raise AuthorityError(f"{what} (a graduation policy) must carry exactly {', '.join(sorted(_GRADUATION_FIELDS))}")
+    :data:`GRADUATION_GRANT_MAX` past it. A ``guard`` is held here only to be a list of objects: what its entries
+    must say is an append rule (:func:`_graduation_guard_check`), so a replay never refuses the log over a guard's
+    contents, and a replayed policy whose guard is not one the gate can evaluate covers nothing
+    (``levain.autonomic.coverage``)."""
+    if not _GRADUATION_FIELDS <= set(grant) or set(grant) - _GRADUATION_FIELDS - _GRADUATION_OPTIONAL:
+        raise AuthorityError(f"{what} (a graduation policy) must carry exactly {', '.join(sorted(_GRADUATION_FIELDS))}"
+                             f" (optionally {', '.join(sorted(_GRADUATION_OPTIONAL))})")
+    if "guard" in grant:
+        guard = grant["guard"]
+        if not isinstance(guard, (list, tuple)) or not all(isinstance(g, Mapping) for g in guard):
+            raise AuthorityError(f"{what}.guard must be a list of objects")
     if grant["kind"] != GRADUATION_KIND:
         raise AuthorityError(f"{what}.kind must be {GRADUATION_KIND!r}")
     if not isinstance(grant["id"], str) or not _GRADUATION_ID.fullmatch(grant["id"]):
@@ -1340,6 +1357,35 @@ def _graduation_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: dateti
     raise AuthorityError(_GRADUATION_FIXED)
 
 
+def _graduation_guard_problem(grant: Mapping[str, Any]) -> str | None:
+    # the gate's own rule for a signed guard, imported at use (only an append reaches it, never a replay)
+    from levain.autonomic.coverage import guard_problem
+    if "guard" not in grant:
+        return "it carries no guard (every graduation policy is signed with one: its kill and its drill)"
+    return guard_problem(_thaw(grant["guard"]))
+
+
+def _graduation_guard_check(grants: list[Any]) -> None:
+    """At append (DESIGN D83, 1026-20 RULINGS R13-11): a graduation policy a create or a loosen brings in carries a
+    complete guard, whatever rung it names (the rung an effect runs at is the binding's and the policy's together, so
+    only the fire knows whether it is confirm-class), every entry within the sign-time caps. Never at replay: a planted
+    policy without one replays and covers nothing."""
+    for grant in grants:
+        why = _graduation_guard_problem(grant)
+        if why is not None:
+            raise AuthorityError(f"graduation policy {str(grant.get('id'))[:80]!r} is refused at sign: {why}")
+
+
+def _graduation_renew_check(grants: list[Any], after: str) -> None:
+    """At append: a renew extends only a policy signed with a complete guard. One signed before the guard covers
+    nothing (``levain.autonomic.coverage.live``), and a renew cannot add one (its terms are fixed)."""
+    for grant in grants:
+        why = _graduation_guard_problem(grant)
+        if why is not None:
+            raise AuthorityError(f"graduation policy {str(grant.get('id'))[:80]!r} is not renewed: {why}; it covers "
+                                 "nothing, so revoke it and create another with a guard")
+
+
 def _graduation_phone_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime | None,
                              n_exp: datetime | None) -> str:
     """The opt-in has no change: every one is refused."""
@@ -1394,8 +1440,9 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
                                        renew_checks=(lambda g, after: _consent_mcp_tool_check(g, after),),
                                        consent=True, passkey_revocable=True),
     EGRESS_KEY_KIND: _GrantKind(validate=_validate_egress_key, change=_egress_key_change),
-    GRADUATION_KIND: _GrantKind(validate=_validate_graduation, change=_graduation_change, passkey_revocable=True,
-                                max_life=GRADUATION_GRANT_MAX, fixed=_GRADUATION_FIXED),
+    GRADUATION_KIND: _GrantKind(validate=_validate_graduation, change=_graduation_change,
+                                append_checks=(_graduation_guard_check,), renew_checks=(_graduation_renew_check,),
+                                passkey_revocable=True, max_life=GRADUATION_GRANT_MAX, fixed=_GRADUATION_FIXED),
     GRADUATION_PHONE_KIND: _GrantKind(validate=_validate_graduation_phone, change=_graduation_phone_change,
                                       passkey_revocable=True, expires=False, fixed=_GRADUATION_PHONE_FIXED),
 })
@@ -1485,8 +1532,8 @@ def _parse_record(row: _Row) -> dict[str, Any]:
         raise ReplayError(seq, "the record is nested too deeply") from None
     if not canonical:
         raise ReplayError(seq, "the record is not a canonical JSON object")
-    if rec.get("format") not in (FORMAT, FORMAT_V2):
-        raise ReplayError(seq, f"the record's format is not {FORMAT} or {FORMAT_V2}")
+    if rec.get("format") not in (FORMAT, FORMAT_V2, FORMAT_V3):
+        raise ReplayError(seq, f"the record's format is not {FORMAT}, {FORMAT_V2} or {FORMAT_V3}")
     op = rec.get("op")
     if not isinstance(op, str) or op not in _OP_FIELDS:
         raise ReplayError(seq, f"unknown op {op!r}")
@@ -1602,14 +1649,15 @@ def _graduation_step_checks(old: StandingPolicy, new: StandingPolicy, keys: Mapp
 
 def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody: str) -> str:
     """The one format a link carrying ``rec`` (its op fields), signed by a key of ``signer_custody``, is written in
-    after ``policy``: :data:`FORMAT_V2` for a passkey's renew or create_grant, and for a link that brings in a
-    graduation opt-in (by create_grant or loosen); :data:`FORMAT` for every other. :func:`prepare` writes it and the
-    replay holds every link to it. Known edge, kept: a hand-made ``/1`` loosen that changes a graduation policy's
+    after ``policy``: :data:`FORMAT_V3` for a link that brings in a graduation policy carrying a ``guard`` (by
+    create_grant or loosen, whoever signs it); else :data:`FORMAT_V2` for a passkey's renew or create_grant, and for a
+    link that brings in a graduation opt-in; :data:`FORMAT` for every other. :func:`prepare` writes it and the replay
+    holds every link to it. A guard enters the log only by a ``/3`` link and never changes after it (a graduation
+    policy's terms are fixed), so a replay that stops at ``/3`` never reads a link that carries or alters a guard.
+    Known edge, kept: a hand-made ``/1`` loosen that changes a graduation policy's
     terms is refused here and replays on a levain from before ``/2`` as an inert change; that levain never fires on a
     graduation policy (a kind it does not know is inert there), so taking the link changes nothing it enforces."""
     op = rec.get("op")
-    if signer_custody == PASSKEY and op in ("renew", "create_grant"):
-        return FORMAT_V2
     if op == "create_grant":
         brought = [rec.get("grant")]
     elif op == "loosen":
@@ -1617,6 +1665,10 @@ def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody:
         brought = [g for gid, g in grants.items() if gid not in policy.grants] if isinstance(grants, Mapping) else []
     else:
         brought = []
+    if any(isinstance(g, Mapping) and g.get("kind") == GRADUATION_KIND and "guard" in g for g in brought):
+        return FORMAT_V3
+    if signer_custody == PASSKEY and op in ("renew", "create_grant"):
+        return FORMAT_V2
     if any(isinstance(g, Mapping) and g.get("kind") == GRADUATION_PHONE_KIND for g in brought):
         return FORMAT_V2
     return FORMAT
