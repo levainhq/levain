@@ -2943,13 +2943,15 @@ def _signers_owner() -> int:
     return os.geteuid()
 
 
-def _read_signers(path: Path) -> bytes | None:
+def _read_signers(path: Path, *, owner: int | None = None) -> bytes | None:
     """Root's allowed-signers file, None when absent; read only when root wrote it and only whole. The descriptor
     read is the one checked: a regular file (``authority-signers-unreadable`` otherwise), owned by
     :func:`_signers_owner` and writable by neither group nor others, in a directory of the same
     (``authority-signers-unsafe``: a line another account could have written is never re-written as root's); at most
     :data:`AUTHORITY_SIGNERS_MAX` bytes and UTF-8 throughout (``authority-signers-unreadable``: never taken as empty,
-    and ``remove`` never misses a line it cannot read). A link there is ``bad-root``."""
+    and ``remove`` never misses a line it cannot read). A link there is ``bad-root``. ``owner`` is who the file and its
+    directory must be owned by (default :func:`_signers_owner`); a caller that is not root (``levain doctor``) names the
+    uid its own trust-anchor check has already accepted."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -2962,7 +2964,7 @@ def _read_signers(path: Path) -> bytes | None:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise Refused("authority-signers-unreadable", f"{path} is not a regular file; nothing written")
-        owner = _signers_owner()
+        owner = _signers_owner() if owner is None else owner
         if st.st_uid != owner or st.st_mode & 0o022:
             raise Refused("authority-signers-unsafe", f"{path} is owned by uid {st.st_uid} at "
                                                       f"{stat.S_IMODE(st.st_mode):04o}: not root's alone; nothing "
