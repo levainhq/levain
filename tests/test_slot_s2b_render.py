@@ -37,7 +37,9 @@ def egress(host="darwin", vendor="claude", kind="interactive", auth="brokered", 
     blob = RenderBlob(vendor=vendor, routes=tuple(routes), **blob_kw)
     facts = dict(host=host, session=S, slot=slot, kind=kind, vendor=vendor, auth=auth, slot_uid=3990,
                  slot_gid=3990, gwport=rd.gwport_for(host, slot), route_types=ROUTES, term="xterm-256color",
-                 var_folders=(VF_SLOT,) if host == "darwin" else ())
+                 var_folders=(VF_SLOT,) if host == "darwin" else (),
+                 # WF-1b: the base map gives every egress route its hosts (runtime_helper.base_routes)
+                 route_hosts={"github": ("github.com", "api.github.com")})
     facts.update(kw)
     return blob, RenderFacts(**facts)
 
@@ -311,7 +313,7 @@ def test_webfetch_hosts_only_from_egress_routes_and_checked():
         e = refused(rd.render, blob, facts)
         assert e.name == "bad-config", bad
     blob, facts = egress("darwin", route_hosts={"github": ()})
-    assert refused(rd.render, blob, facts).name == "bad-config"
+    assert refused(rd.render, blob, facts).name == "egress-route-no-hosts"     # WF-1b
 
 
 def test_webfetch_pins_read_back():
@@ -594,7 +596,8 @@ GOLD_PROFILE_DISPATCH_QUEUE_LINES = [
     '(allow network-outbound (remote unix-socket (subpath "/private/var/run/levain/qb/slot3")))',
 ]
 
-GOLD_SETTINGS_LINUX = {"permissions": {"ask": ["Bash(dangerouslyDisableSandbox:true)"],
+GOLD_SETTINGS_LINUX = {"permissions": {"allow": ["WebFetch(domain:api.github.com)", "WebFetch(domain:github.com)"],
+                                       "ask": ["Bash(dangerouslyDisableSandbox:true)"],
                                        "disableBypassPermissionsMode": "disable"},
                        "sandbox": {"bwrapPath": "/usr/libexec/levain/bwrap", "enabled": True, "excludedCommands": [],
                                    "failIfUnavailable": True},
@@ -640,15 +643,17 @@ def _digest(r) -> str:
 
 
 #: Every file (path, owner, mode, bytes) of each (OS x vendor x class) render, pinned. The full text of each was
-#: read once when these were taken; a change here is a change to what a confined session loads.
+#: read once when these were taken; a change here is a change to what a confined session loads. WF-1b re-took the four
+#: egress digests: the only change against cf2e19bb is root/settings.json's permissions.allow gaining
+#: WebFetch(domain:api.github.com) and WebFetch(domain:github.com), the helper's route_hosts for its github route.
 GOLD_DIGESTS = {
-    ("darwin", "claude", "egress"): "873cb0c57bd5157d",
+    ("darwin", "claude", "egress"): "18f9a25ffabf303f",
     ("darwin", "claude", "none"): "dd0f5dad5c38e0b8",
-    ("darwin", "codex", "egress"): "b8411e7cc570d868",
+    ("darwin", "codex", "egress"): "24cbf6f8faa1bac0",
     ("darwin", "codex", "none"): "7441ce40b3226c61",
-    ("linux", "claude", "egress"): "b463aaf9983d28cf",
+    ("linux", "claude", "egress"): "9a6f5684256bdd1c",
     ("linux", "claude", "none"): "c9796d76e53b1d57",
-    ("linux", "codex", "egress"): "b180ddc588d8ece9",
+    ("linux", "codex", "egress"): "02b07820fb916f2b",
     ("linux", "codex", "none"): "673582e9c5e81a4e",
 }
 
@@ -681,16 +686,14 @@ def test_golden_text_per_os_vendor_class():
     assert got == GOLD_DIGESTS
 
 
-def test_egress_route_without_hosts_renders_no_allow_rule():
-    """WF-1a L3 r1 ruling (route_hosts has no producer until WF-1b): an egress route the session names with no hosts
-    entry renders no allow rule, so the fetch prompts or is denied and the front still decides (fail closed)."""
+def test_egress_route_without_hosts_is_refused_not_rendered_ruleless():
+    """WF-1a L3 r1 ruling, closed by WF-1b (wf1a return ruling 2): an egress route the session names with no hosts
+    entry was rendered with no allow rule; route_hosts now has its producer (runtime_helper.base_routes), so a missing
+    entry is refused by name before any byte."""
     for host in ("darwin", "linux"):
-        blob, facts = egress(host, "claude")
-        assert "github" in blob.routes and ROUTES["github"] == "egress" and facts.route_hosts == {}
-        s = rd.render_cc_settings(blob, facts)
-        assert "allow" not in s["permissions"]
-        assert not any(k == "permissions.allow" for k in rd.expected_effective_cc(blob, facts))
-        assert "WebFetch(" not in rd.render(blob, facts).file("root/settings.json").data.decode()
+        blob, facts = egress(host, "claude", route_hosts={})
+        assert "github" in blob.routes and ROUTES["github"] == "egress"
+        assert refused(rd.render, blob, facts).name == "egress-route-no-hosts"
 
 
 class _Boom:
