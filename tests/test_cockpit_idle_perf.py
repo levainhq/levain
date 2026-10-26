@@ -271,6 +271,122 @@ def test_a_waiter_on_a_hung_build_raises_the_timeout_at_the_deadline_and_does_no
     assert not isinstance(view, Exception)
 
 
+# ---- C12: a hung build's flight is replaced once it is older than the panel read budget (one rescue per budget window) ----
+
+def _hung_builds(monkeypatch, src, deadline: float = 0.4):
+    """Build call 1 hangs on ``hangs[0]``, call 2 on ``hangs[1]``; later calls build at once. ``entered[i]`` is set as call i+1 starts."""
+    import threading
+    monkeypatch.setattr(providers, "VIEW_FLIGHT_WAIT_S", 0.1, raising=False)
+    monkeypatch.setattr(providers, "PANEL_READ_DEADLINE_S", deadline, raising=False)
+    real = type(src).build
+    entered, hangs, calls = [threading.Event(), threading.Event()], [threading.Event(), threading.Event()], []
+
+    def build(self, **kw):
+        calls.append(1)
+        n = len(calls)
+        if n <= 2:
+            entered[n - 1].set()
+            hangs[n - 1].wait(20)
+        return real(self, **kw)
+
+    monkeypatch.setattr(type(src), "build", build)
+    return entered, hangs, calls
+
+
+def test_a_read_after_a_hung_build_outlives_the_deadline_builds_and_the_late_build_does_not_overwrite_its_view(tmp_path: Path, monkeypatch) -> None:
+    """C12: a builder that hangs past the panel budget no longer blocks the source: the next read replaces its flight and builds.
+    When the hung build returns at last, its caller gets its own view, but the cache keeps the replacement's."""
+    import time
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    entered, hangs, calls = _hung_builds(monkeypatch, src)
+    hangs[1].set()                                  # only the first build hangs
+    ts, out = _readers(src, 1)
+    try:
+        assert entered[0].wait(5)
+        time.sleep(0.5)                             # the hung flight is now older than the budget
+        ts2, out2 = _readers(src, 1)
+        ts2[0].join(5)
+        assert len(out2) == 1 and not isinstance(out2[0], Exception), out2
+        assert len(calls) == 2, len(calls)
+        key = id(src)
+        assert providers._view_cache[key][3] is out2[0]
+    finally:
+        hangs[0].set()
+        ts[0].join(10)
+    assert len(out) == 1 and not isinstance(out[0], Exception) and out[0] is not out2[0], out
+    assert providers._view_cache[key][3] is out2[0], "the abandoned build overwrote the newer view"
+    from levain.cockpit.engine import ReadContext
+    assert providers._view(src, ReadContext(datetime.now(timezone.utc))) is out2[0] and len(calls) == 2
+
+
+def test_an_abandoned_build_returning_late_leaves_the_replacement_flight_and_publishes_nothing(tmp_path: Path, monkeypatch) -> None:
+    """C12: the abandoned builder returns while the replacement still builds: the replacement stays registered (a reader arriving
+    then joins it, no third build) and the cache never holds the abandoned view."""
+    import time
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    entered, hangs, calls = _hung_builds(monkeypatch, src, deadline=0.6)
+    key = id(src)
+    ts, out = _readers(src, 1)
+    ts2: list = []
+    ts3: list = []
+    try:
+        assert entered[0].wait(5)
+        time.sleep(0.7)
+        ts2, out2 = _readers(src, 1)
+        assert entered[1].wait(2), "no reader replaced the hung flight"
+        replacement = providers._view_flights.get(key)
+        assert replacement is not None
+        hangs[0].set()
+        ts[0].join(5)
+        assert not isinstance(out[0], Exception), out
+        assert providers._view_flights.get(key) is replacement, "the abandoned build removed the replacement flight"
+        hit = providers._view_cache.get(key)
+        assert hit is None or hit[3] is not out[0], "the abandoned build published its view"
+        ts3, out3 = _readers(src, 1)                # arrives while the replacement builds: it joins
+        time.sleep(0.2)
+        assert len(calls) == 2, len(calls)
+        hangs[1].set()
+        for t in ts2 + ts3:
+            t.join(5)
+    finally:
+        for h in hangs:
+            h.set()
+        for t in ts + ts2 + ts3:
+            t.join(10)
+    assert not isinstance(out2[0], Exception) and out3 == [out2[0]], (out2, out3)
+    assert providers._view_cache[key][3] is out2[0] and key not in providers._view_flights
+    assert len(calls) == 2, len(calls)
+
+
+def test_several_readers_arriving_after_a_hung_build_outlived_the_deadline_start_one_replacement(tmp_path: Path, monkeypatch) -> None:
+    """C12 bound: at most one build per budget window per source. Readers that all find the stale flight together replace it once;
+    the rest wait on the replacement and share its view (the C10 property, kept)."""
+    import time
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    entered, hangs, calls = _hung_builds(monkeypatch, src, deadline=0.6)
+    ts, out = _readers(src, 1)
+    ts2: list = []
+    try:
+        assert entered[0].wait(5)
+        time.sleep(0.7)
+        ts2, out2 = _readers(src, 5)
+        assert entered[1].wait(2), "no reader replaced the hung flight"
+        time.sleep(0.2)                             # the other four are at the replacement now
+        hangs[1].set()
+        for t in ts2:
+            t.join(5)
+    finally:
+        for h in hangs:
+            h.set()
+        for t in ts + ts2:
+            t.join(10)
+    assert len(calls) == 2, len(calls)
+    assert len(out2) == 5 and not isinstance(out2[0], Exception) and all(v is out2[0] for v in out2), out2
+
+
 def test_the_flight_wait_is_a_quarter_of_the_panel_read_budget() -> None:
     """K10b: the wait is an expression of the budget constant, so it moves with it and stays inside it."""
     from levain.cockpit.engine import PANEL_READ_DEADLINE_S

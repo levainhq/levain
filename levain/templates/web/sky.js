@@ -274,9 +274,11 @@
     var clock = o.now || function () { return Date.now(); };
     var reduce = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
     var calmOn = function () { var h = document.documentElement; return !!(h && h.classList && h.classList.contains('calm')); };   // the page's Calm control: the same as the OS asking
-    // ambientOn is the user's Ambient preference; Calm never writes it. The motion that runs is the preference AND not Calm.
-    var ambientOn = o.ambient !== false && !strip && !(reduce && reduce.matches);
-    var motionOn = function () { return ambientOn && !calmOn(); };
+    var reduceOn = function () { return !!(reduce && reduce.matches); };
+    // ambientOn is the user's Ambient preference; neither Calm nor the OS reduced-motion setting writes it. The motion that
+    // runs is the preference AND not reduced motion AND not Calm.
+    var ambientOn = o.ambient !== false && !strip;
+    var motionOn = function () { return ambientOn && !reduceOn() && !calmOn(); };
 
     var root = el('div', { class: 'sky-panel' });
     root.style.position = 'relative';
@@ -336,7 +338,7 @@
       ambientOn = !ambientOn; setToggle();
       if (!motionOn()) { meteors = []; draw(); }
     });
-    function onReduce() { if (reduce && reduce.matches && ambientOn) { ambientOn = false; setToggle(); meteors = []; draw(); } }
+    function onReduce() { if (reduceOn() && meteors.length) { meteors = []; draw(); } }
     if (reduce && reduce.addEventListener) reduce.addEventListener('change', onReduce);
     function onCalm() { if (calmOn() && meteors.length) { meteors = []; draw(); } }
     window.addEventListener('levain-calm', onCalm);

@@ -163,6 +163,10 @@ global.addEventListener = (t, f) => { (wl[t] = wl[t] || []).push(f); };
 let calm = !!I.calmAtMount;
 document.documentElement.classList = { contains: c => c === 'calm' && calm };
 const setCalm = on => { calm = on; (wl['levain-calm'] || []).forEach(f => f({})); };
+// the OS reduced-motion query, flippable mid-run; every other media query answers no
+const mq = { matches: !!I.reduceAtMount, ls: [], addEventListener(t, f) { this.ls.push(f); }, removeEventListener(t, f) { this.ls = this.ls.filter(g => g !== f); } };
+global.matchMedia = q => String(q).includes('prefers-reduced-motion') ? mq : { matches: false, addEventListener() {}, removeEventListener() {} };
+const setReduce = on => { mq.matches = on; mq.ls.forEach(f => f({ matches: on })); };
 const h = sky.mount(new El('div'), mk(I.base), Object.assign({ now: () => NOW }, I.opts || {}));
 const toggle = all.find(e => e.attrs['class'] === 'sky-toggle');
 const pressed = () => toggle.attrs['aria-pressed'];
@@ -172,6 +176,8 @@ const out = { log: [] };
 for (const s of I.steps) {
   if (s === 'calm_on') setCalm(true);
   else if (s === 'calm_off') setCalm(false);
+  else if (s === 'reduce_on') setReduce(true);
+  else if (s === 'reduce_off') setReduce(false);
   else if (s === 'click') toggle.listeners.click.forEach(f => f({}));
   else if (s === 'commit') { const before = sky.stats.pending; h.update(commit()); out.log.push(['launch', sky.stats.pending - before]); }
   out.log.push([s, pressed()]);
@@ -181,12 +187,12 @@ console.log(JSON.stringify(out));
 """
 
 
-def _sky_calm(tmp_path, steps, calm_at_mount=False):
+def _sky_calm(tmp_path, steps, calm_at_mount=False, reduce_at_mount=False):
     import subprocess
     from tests.test_cockpit_sky import NODE, _LEVAIN_FEED, _NOW, SKY
     script = tmp_path / "sky_calm.cjs"
     script.write_text(_sky_calm_script())
-    payload = {"sky": str(SKY), "base": _LEVAIN_FEED, "feeds": [_LEVAIN_FEED], "now": _NOW, "steps": steps, "calmAtMount": calm_at_mount}
+    payload = {"sky": str(SKY), "base": _LEVAIN_FEED, "feeds": [_LEVAIN_FEED], "now": _NOW, "steps": steps, "calmAtMount": calm_at_mount, "reduceAtMount": reduce_at_mount}
     out = subprocess.run([NODE, str(script)], input=json.dumps(payload), capture_output=True, text=True, check=True).stdout
     return json.loads(out.strip().splitlines()[-1])["log"]
 
@@ -215,3 +221,23 @@ def test_ambient_off_before_calm_stays_off_after_calm_and_a_page_mounted_under_c
     assert [d for k, d in log if k in ("click", "calm_on", "calm_off")] == ["false", "false", "false"] and _launched(log) == [0], log
     mounted = _sky_calm(tmp_path, ["commit", "calm_off", "commit"], calm_at_mount=True)
     assert _launched(mounted) == [0, 1] and [d for k, d in mounted if k == "calm_off"] == ["true"], mounted
+
+
+# ---- C13: the OS reduced-motion setting suppresses motion the way Calm does and never writes the Ambient preference ---------
+
+def test_os_reduced_motion_on_then_off_restores_the_ambient_preference(tmp_path):
+    log = _sky_calm(tmp_path, ["reduce_on", "commit", "reduce_off", "commit"])
+    assert [d for k, d in log if k in ("reduce_on", "reduce_off")] == ["true", "true"], log     # the preference is untouched
+    assert _launched(log) == [0, 1], log                                                           # still while the OS asks; motion back after
+
+
+def test_a_page_mounted_under_os_reduced_motion_moves_once_the_os_stops_asking(tmp_path):
+    log = _sky_calm(tmp_path, ["commit", "reduce_off", "commit"], reduce_at_mount=True)
+    assert _launched(log) == [0, 1] and [d for k, d in log if k == "reduce_off"] == ["true"], log
+
+
+def test_reduced_motion_and_calm_each_hold_the_sky_still_and_ambient_off_survives_both(tmp_path):
+    log = _sky_calm(tmp_path, ["reduce_on", "calm_on", "reduce_off", "commit", "calm_off", "commit"])
+    assert _launched(log) == [0, 1], log                       # Calm still holds after the OS lets go; motion only once both are off
+    off = _sky_calm(tmp_path, ["click", "reduce_on", "reduce_off", "commit"])
+    assert [d for k, d in off if k in ("click", "reduce_off")] == ["false", "false"] and _launched(off) == [0], off

@@ -155,12 +155,14 @@ def _signature_of(source: Any) -> tuple | None:
 
 
 class _Flight:
-    """One build in progress for a source: the readers that arrive meanwhile wait on it and share its view."""
-    __slots__ = ("done", "sig", "view", "exc")
+    """One build in progress for a source: the readers that arrive meanwhile wait on it and share its view. ``started``
+    (monotonic) lets a later reader see that the build has outlived the panel read budget and replace the flight."""
+    __slots__ = ("done", "sig", "started", "view", "exc")
 
     def __init__(self, sig: tuple) -> None:
         self.done = threading.Event()
         self.sig = sig
+        self.started = time.monotonic()
         self.view: SubstrateView | None = None
         self.exc: BaseException | None = None
 
@@ -173,8 +175,11 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
     (``_store_signature``) serves the view built before, up to ``VIEW_CACHE_MAX_AGE_S``. A miss is single-flight:
     one build per source runs and the readers that arrive meanwhile wait for it, on the same flight, until the panel
     deadline (``PANEL_READ_DEADLINE_S``), when they raise ``TimeoutError``; they never build for themselves. They share its view; a build that raises stores nothing and its waiters get the same
-    exception. A new flight starts only after the old one has finished. A write's own read (``ctx.fresh``) and a
-    view that carries an error are never cached."""
+    exception. A new flight starts when the old one has finished, or when a reader finds it older than the panel read
+    budget (a hung build): that reader replaces it and builds, and later readers join the replacement, so a source has
+    at most one new build per budget window. The abandoned build, if it ever returns, gives its own caller its view but
+    neither caches it nor removes the replacement. A write's own read (``ctx.fresh``) and a view that carries an error
+    are never cached."""
     def build() -> SubstrateView:
         key = id(source)
         deadline = time.monotonic() + PANEL_READ_DEADLINE_S      # one budget for all the waits of this read
@@ -187,7 +192,8 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
                 if hit and hit[0] is source and hit[1] == sig and time.monotonic() - hit[2] < VIEW_CACHE_MAX_AGE_S:
                     return hit[3]
                 flight = _view_flights.get(key)
-                if flight is None:
+                # a flight older than the budget is a hung build: replace it (under the lock, so one reader does)
+                if flight is None or time.monotonic() - flight.started >= PANEL_READ_DEADLINE_S:
                     flight = _view_flights[key] = _Flight(sig)
                     mine = True
                 else:
@@ -211,6 +217,8 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
                 flight.view = view          # the readers waiting on this flight share it, an errored view too
                 if not view.errors:
                     with _view_cache_lock:
+                        if _view_flights.get(key) is not flight:
+                            return view         # replaced while it hung: the replacement owns the cache entry
                         _view_cache.pop(key, None)      # re-insert at the tail, so the eviction below drops the oldest
                         _view_cache[key] = (source, sig, time.monotonic(), view)
                         while len(_view_cache) > VIEW_CACHE_SOURCES:
