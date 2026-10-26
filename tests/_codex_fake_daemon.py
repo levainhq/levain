@@ -7,7 +7,9 @@ Two transports over one handler: :class:`FakeDaemon` listens on ``<home>/app-ser
 per line over a pipe pair, as ``codex app-server`` does on stdio. Each connection is a :class:`Conn` a test can push
 notifications, server requests and raw frames down. A test scripts the daemon with ``before_reply[method]`` (runs
 after the answer is computed and before it is sent, so it can name a thread ``thread/start`` just made) and
-``after_reply[method]``, and ``on_client_reply`` (runs when the client answers a server request).
+``after_reply[method]``, and ``on_client_reply`` (runs when the client answers a server request). Clearing
+:attr:`FakeDaemon.reading` stops the daemon reading what the client sends (its buffers then fill, so a client write
+blocks); on the socket :meth:`Conn.ping` sends a ping and the pongs that come back are kept in ``pongs``.
 
 Not measured, the fake's own choices: the error a request sent before ``initialized`` gets (:data:`NOT_INITIALIZED`),
 and the wording of the stale-steer error (:meth:`FakeDaemon._answer`). No test here reaches a real Codex."""
@@ -35,8 +37,10 @@ class Conn:
     """One client connection: everything sent down it goes out whole, under one lock. :attr:`hangup` drops it from the
     daemon's side."""
 
-    def __init__(self, write: Callable[[bytes], None], hangup: Callable[[], None]) -> None:
+    def __init__(self, write: Callable[[bytes], None], hangup: Callable[[], None],
+                 write_frame: Callable[[int, bytes], None] | None = None) -> None:
         self._write = write
+        self._write_frame = write_frame
         self.hangup = hangup
         self._lock = threading.Lock()
         self.initialized = False
@@ -49,6 +53,10 @@ class Conn:
     def send(self, obj: Any) -> None:
         self.send_raw(json.dumps(obj).encode())
 
+    def ping(self, payload: bytes) -> None:
+        with self._lock:
+            self._write_frame(9, payload)
+
     def notify(self, method: str, params: dict[str, Any]) -> None:
         self.send({"method": method, "params": params})
 
@@ -56,9 +64,9 @@ class Conn:
         self.send({"id": rid, "method": method, "params": params})
 
 
-def _ws_frame(body: bytes) -> bytes:
+def _ws_frame(body: bytes, op: int = 1) -> bytes:
     n = len(body)
-    head = bytes([0x81]) + (bytes([n]) if n < 126 else bytes([126]) + struct.pack(">H", n) if n < 65536 else
+    head = bytes([0x80 | op]) + (bytes([n]) if n < 126 else bytes([126]) + struct.pack(">H", n) if n < 65536 else
                             bytes([127]) + struct.pack(">Q", n))
     return head + body
 
@@ -108,6 +116,10 @@ class FakeDaemon:
         self.client_notifications: list[tuple[str, Any]] = []
         self.client_replies: list[dict[str, Any]] = []
         self.refused_before_init: list[str] = []
+        self.pongs: list[bytes] = []
+        self.bad_frames: list[bytes] = []
+        self.reading = threading.Event()
+        self.reading.set()
         self.conns: list[Conn] = []
         self.hooks: list[dict[str, Any]] = []
         self.before_reply: dict[str, Callable[[Conn, dict, dict], None]] = {}
@@ -155,9 +167,11 @@ class FakeDaemon:
             accept = base64.b64encode(hashlib.sha1(key + _GUID).digest())
             conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nconnection: Upgrade\r\nupgrade: websocket\r\n"
                          b"sec-websocket-accept: " + accept + b"\r\n\r\n")
-            c = Conn(lambda body: conn.sendall(_ws_frame(body)), lambda: conn.shutdown(socket.SHUT_RDWR))
+            c = Conn(lambda body: conn.sendall(_ws_frame(body)), lambda: conn.shutdown(socket.SHUT_RDWR),
+                     lambda op, body: conn.sendall(_ws_frame(body, op)))
             self.conns.append(c)
             while True:
+                self.reading.wait()
                 h = self._recv(conn, 2)
                 op, n = h[0] & 0x0F, h[1] & 0x7F
                 if n == 126:
@@ -168,7 +182,15 @@ class FakeDaemon:
                 payload = bytes(b ^ mask[i % 4] for i, b in enumerate(self._recv(conn, n)))
                 if op == 8:
                     return
-                self._handle(c, json.loads(payload))
+                if op == 10:
+                    self.pongs.append(payload)
+                    continue
+                try:
+                    msg = json.loads(payload)
+                except ValueError:
+                    self.bad_frames.append(payload[:200])        # a corrupt stream: the connection is dropped
+                    return
+                self._handle(c, msg)
         except (EOFError, OSError):
             return
         finally:
@@ -191,7 +213,11 @@ class FakeDaemon:
 
         def serve() -> None:
             try:
-                for line in inp:
+                while True:
+                    self.reading.wait()
+                    line = inp.readline()
+                    if not line:
+                        break
                     self._handle(c, json.loads(line))
             except (OSError, ValueError):
                 pass

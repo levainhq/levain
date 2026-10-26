@@ -255,7 +255,7 @@ def test_the_bootstrap_buffer_is_capped_and_says_what_it_dropped(daemon):
         wire.start_thread({"cwd": "/tmp"})
         got = _collect(wire, 3)
         assert [i.params["status"]["n"] for i in got[:2]] == [0, 1]
-        assert got[2].kind == "unparseable" and "3 thread-scoped message(s) past the bootstrap cap of 2" in \
+        assert got[2].kind == "unparseable" and "3 message(s) past the bootstrap cap of 2" in \
             got[2].detail
         assert _collect(wire, 1, 0.2) == []
     finally:
@@ -574,3 +574,230 @@ def test_the_pinned_surface_matches_the_installed_codex_schema(tmp_path):
         assert set(schema.get("required", [])) <= set(row.reply), row.method
         if "decision" in row.reply:
             assert f'"enum": ["{row.reply["decision"]}"]' in json.dumps(schema), row.method
+
+
+# --- the L3 r1 bounds (W1-W9), each RED first on the r1 wire -------------------------------------------------------
+def _within(fn: Callable[[], object], seconds: float) -> tuple[bool, object]:
+    """Run ``fn`` on its own daemon thread: ``(finished, result or the exception it raised)``; a wire that hangs fails
+    the test instead of hanging it."""
+    out: list[object] = []
+
+    def run() -> None:
+        try:
+            out.append(fn())
+        except BaseException as exc:  # noqa: BLE001 - handed back to the test
+            out.append(exc)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(seconds)
+    return (not t.is_alive(), out[0] if out else None)
+
+
+def test_w1_a_second_thread_start_raises_at_once_while_one_is_outstanding_or_bound(daemon):
+    daemon.before_reply["thread/start"] = lambda c, _p, _r: time.sleep(0.5)
+    wire = _open(daemon, "ws")
+    try:
+        first: dict[str, object] = {}
+        t = threading.Thread(target=lambda: first.update(got=wire.start_thread({"cwd": "/tmp"})), daemon=True)
+        t.start()
+        time.sleep(0.15)                                    # the first thread/start is outstanding
+        t0 = time.monotonic()
+        with pytest.raises(CodexError, match="outstanding"):
+            wire.start_thread({"cwd": "/tmp"})
+        assert time.monotonic() - t0 < 0.2
+        t.join(3.0)
+        assert wire.thread_id == first["got"]["thread"]["id"]
+        with pytest.raises(CodexError, match="already bound"):
+            wire.start_thread({"cwd": "/tmp"})
+        assert [m for m, _ in daemon.calls].count("thread/start") == 1
+    finally:
+        wire.close()
+
+
+@pytest.mark.parametrize("method", ["applyPatchApproval", "execCommandApproval"])
+def test_w2_a_legacy_approval_names_its_thread_by_conversation_id(daemon, method):
+    wire = _open(daemon, "ws")
+    try:
+        tid = wire.start_thread({"cwd": "/tmp"})["thread"]["id"]
+        c = daemon.conns[-1]
+        c.request(method, fake.non_approval_requests("another-thread", "t1")[method], 1)
+        c.request(method, fake.non_approval_requests(tid, "t1")[method], 2)
+        c.request(method, {k: v for k, v in fake.non_approval_requests(tid, "t1")[method].items()
+                           if k != "conversationId"}, 3)
+        got = _collect(wire, 3)
+        assert [(i.kind, i.thread_id) for i in got] == [("foreign", "another-thread"), ("request", tid),
+                                                       ("unparseable", None)], got
+        assert "conversationId" in got[2].detail
+        with pytest.raises(CodexError, match="never answered"):
+            wire.reply(got[0], error=(-32601, "no"))
+    finally:
+        wire.close()
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_w3_a_send_the_daemon_never_reads_fails_in_the_calls_deadline_and_close_cannot_hang(daemon, transport):
+    wire = _open(daemon, transport)
+    try:
+        daemon.reading.clear()                              # the daemon stops reading: the client's buffers fill
+        t0 = time.monotonic()
+        done, got = _within(lambda: wire.call("hooks/list", {"pad": "x" * (4 << 20)}, timeout=0.5), 5.0)
+        assert done, "the call blocked in its send past its own deadline"
+        assert isinstance(got, CodexError) and time.monotonic() - t0 < 2.0, got
+        assert wire.closed, "a send that failed mid-message leaves the wire open"
+        with pytest.raises(CodexError, match="closed"):
+            wire.notify("turn/interrupt", {"threadId": "x", "turnId": "y"})
+        done, _ = _within(wire.close, 3.0)
+        assert done, "close() hung"
+        # the stalled daemon never closes its output: the reader ends because levain closed, not because the peer did
+        assert not wire._reader.is_alive()
+    finally:
+        daemon.reading.set()
+        _within(wire.close, 3.0)
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_w4_a_thread_start_timeout_releases_what_it_held_on_the_reader_thread(daemon, transport):
+    def slow(c, _params, reply):
+        c.notify("thread/started", {"thread": {"id": reply["result"]["thread"]["id"]}})
+        time.sleep(0.6)
+
+    daemon.before_reply["thread/start"] = slow
+    seen: list[tuple[str, str]] = []
+    wire = _open(daemon, transport, on_inbound=lambda i: seen.append((i.kind, threading.current_thread().name)))
+    try:
+        with pytest.raises(CodexError, match="did not answer thread/start"):
+            wire.start_thread({"cwd": "/tmp"}, timeout=0.2)
+        (held,) = _collect(wire, 1)
+        assert held.kind == "foreign"
+        end = time.monotonic() + 2
+        while not seen and time.monotonic() < end:
+            time.sleep(0.01)
+        assert seen == [("foreign", f"codex-wire-{wire.gen}")], seen
+    finally:
+        wire.close()
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_w4_the_waiter_is_released_before_the_callbacks_for_the_frames_it_unblocked(daemon, transport):
+    # codex HIGH 4: the caller holds a session mutex across start_thread and the callback takes the same mutex
+    daemon.before_reply["thread/start"] = lambda c, _p, reply: c.notify(
+        "thread/started", {"thread": {"id": reply["result"]["thread"]["id"]}})
+    mutex = threading.Lock()
+    seen: list[str] = []
+
+    def on_item(item: Inbound) -> None:
+        with mutex:
+            seen.append(item.method)
+
+    wire = _open(daemon, transport, on_inbound=on_item)
+    try:
+        def start():
+            with mutex:
+                return wire.start_thread({"cwd": "/tmp"}, timeout=1.0)
+
+        done, got = _within(start, 4.0)
+        assert done and isinstance(got, dict), got
+        end = time.monotonic() + 2
+        while not seen and time.monotonic() < end:
+            time.sleep(0.01)
+        assert seen == ["thread/started"]
+    finally:
+        _within(wire.close, 3.0)
+
+
+def test_w5_a_pong_never_lands_inside_a_text_frame(daemon):
+    # codex MED 7, complement MED 1: a ping arrives while a large request is half written
+    wire = _open(daemon, "ws")
+    try:
+        daemon.reading.clear()
+        done: list[object] = []
+        t = threading.Thread(target=lambda: done.append(wire.call("hooks/list", {"pad": "y" * (4 << 20)},
+                                                                  timeout=10.0)), daemon=True)
+        t.start()
+        time.sleep(0.3)                                     # the request is mid-send: the buffers are full
+        daemon.conns[-1].ping(b"pp")
+        time.sleep(0.3)                                     # the reader has the ping and would answer it now
+        daemon.reading.set()
+        t.join(10.0)
+        assert daemon.bad_frames == [] and done == [{"data": []}], (daemon.bad_frames, done)
+        end = time.monotonic() + 2
+        while not daemon.pongs and time.monotonic() < end:
+            time.sleep(0.01)
+        assert daemon.pongs == [b"pp"] and wire.closed is None
+    finally:
+        daemon.reading.set()
+        _within(wire.close, 3.0)
+
+
+def test_w6_a_server_request_past_the_bootstrap_cap_closes_the_wire_rather_than_drop_its_id(daemon):
+    def preamble(c, _params, reply):
+        tid = reply["result"]["thread"]["id"]
+        for n in range(3):
+            c.request("item/commandExecution/requestApproval", fake.command_approval(tid, "t1", f"i{n}"), n)
+
+    daemon.before_reply["thread/start"] = preamble
+    wire = _open(daemon, "ws", bootstrap_cap=2)
+    try:
+        with pytest.raises(CodexError, match="bootstrap cap"):
+            wire.start_thread({"cwd": "/tmp"})
+        got = _collect(wire, 4)
+        assert [i.kind for i in got][-1] == "closed" and "bootstrap cap" in (wire.closed or ""), got
+        assert all(i.kind != "request" for i in got)       # nothing here can be answered: the wire is dead
+    finally:
+        wire.close()
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+@pytest.mark.parametrize("body", [{}, {"result": {"data": []}, "error": {"code": 1, "message": "m"}}])
+def test_w7_a_response_without_exactly_one_of_result_and_error_is_a_protocol_fault(daemon, transport, body):
+    daemon.before_reply["hooks/list"] = lambda c, _p, _r: c.send({"id": c.last_id, **body})
+    wire = _open(daemon, transport)
+    try:
+        with pytest.raises(CodexError, match="result"):
+            wire.call("hooks/list", {})
+        (item,) = _collect(wire, 1)
+        assert item.kind == "unparseable" and "exactly one of result and error" in item.detail, item
+    finally:
+        wire.close()
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_w8_the_reader_dying_unexpectedly_closes_the_wire_and_fails_every_waiter(daemon, transport):
+    class Faulty(CodexWire):
+        def _thread_of(self, method, params):
+            if method == "turn/started":
+                raise RuntimeError("a bug in the sorting")
+            return super()._thread_of(method, params)
+
+    daemon.before_reply["hooks/list"] = lambda c, _p, _r: (c.notify("turn/started", {"threadId": "x", "turn": {}}),
+                                                           time.sleep(0.3))
+    wire = _open(daemon, transport, Faulty)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(CodexError, match="RuntimeError"):
+            wire.call("hooks/list", {}, timeout=3.0)
+        assert time.monotonic() - t0 < 1.5
+        assert "a bug in the sorting" in (wire.closed or "")
+        assert [i.kind for i in _collect(wire, 1)] == ["closed"]
+    finally:
+        wire.close()
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_w9_arrival_order_and_its_ordinals_hold_across_bootstrap(daemon, transport):
+    def preamble(c, _params, reply):
+        tid = reply["result"]["thread"]["id"]
+        c.notify("thread/started", {"thread": {"id": tid}})
+        c.notify("configWarning", {"summary": "w"})
+        c.notify("thread/status/changed", {"threadId": tid, "status": {"type": "idle"}})
+
+    daemon.before_reply["thread/start"] = preamble
+    wire = _open(daemon, transport)
+    try:
+        wire.start_thread({"cwd": "/tmp"})
+        got = _drain_when(wire, 3)
+        assert [i.method for i in got] == ["thread/started", "configWarning", "thread/status/changed"], got
+        assert [i.obs for i in got] == sorted(i.obs for i in got)
+    finally:
+        wire.close()
