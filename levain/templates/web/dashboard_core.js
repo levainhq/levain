@@ -4491,6 +4491,14 @@
     line.append(code, btn);
     return line;
   }
+  // flow's provider puts the whole body into `blocks`, and the body starts with the title sentence: what `blocks` adds beyond
+  // the title is the part after it (trimmed, a trailing "?" or "." on the title ignored). "" when nothing is left.
+  function blocksBeyondTitle(title, blocks) {
+    const t = String(blocks || "").trim();
+    const w = String(title || "").trim().replace(/[?.\s]+$/, "");
+    if (!w || !t.startsWith(w)) return t;
+    return t.slice(w.length).replace(/^[?.\s]+/, "");
+  }
   // `card` (the Needs-you strip's card) draws the mock's anatomy: the question as a bold title, "blocks: ...", then "REC key. words";
   // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
   function drawQuestionBody(q, slot, b, card) {
@@ -4507,7 +4515,8 @@
     const parts = [];
     if (card) {
       parts.push(el("div", "needs-q-title", sv(b.what)));
-      if (sv(b.blocks)) parts.push(el("div", "ext-meta needs-q-blocks", "blocks: " + sv(b.blocks)));
+      const more = blocksBeyondTitle(sv(b.what), sv(b.blocks));
+      if (more) parts.push(el("div", "ext-meta needs-q-blocks", "blocks: " + more));
       const recOpt = options.find((o) => o && sv(o.key) === sv(b.rec));
       if (sv(b.rec)) {
         const rl = el("div", "needs-rec");
@@ -5669,7 +5678,8 @@
         if (!b || b.error) return;
         const first = flat(b.what);
         if (first) title.textContent = first;
-        if (flat(b.blocks)) sub.textContent = "blocks: " + flat(b.blocks);
+        const more = flat(blocksBeyondTitle(b.what, b.blocks));
+        if (more) sub.textContent = "blocks: " + more;
         if (typeof b.rec === "string" && b.rec) side.appendChild(el("span", "needs-rec-tag needs-row-rec", "rec " + b.rec));
       });
     }

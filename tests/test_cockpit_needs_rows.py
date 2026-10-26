@@ -78,3 +78,32 @@ def test_the_focus_view_draws_the_long_item_whole_and_decides_there(tmp_path: Pa
     for (key, label), btn in zip(LONG_OPTS, got["opts"]):
         assert btn == f"{key} · {label}", (btn, label)       # every option in full
     assert got["rec"] and got["words"], got
+
+
+@needs_browser
+def test_blocks_that_begin_with_the_title_show_only_the_remainder(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "levain_home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    (home / "consent").mkdir(parents=True, mode=0o700)
+    store = QuestionStore(home / "consent")
+    store.file(agent="codex", agent_session_id="s1", what="Ship the fix now?", options=[("a", "Yes"), ("b", "No")], rec="a",
+               blocks="Ship the fix now? The release waits on this.", cwd="/w")
+    store.file(agent="codex", agent_session_id="s2", what="Cut the second slice?", options=[("a", "Yes"), ("b", "No")], rec="a",
+               blocks="Cut the second slice?", cwd="/w")
+    _root, src, _ids = _install(tmp_path)
+    rows = "[...document.querySelectorAll('#ck-needs .needs-row')]"
+    ready = f"{rows}.length === 2 && {rows}.every(r => /Ship|Cut/.test(r.querySelector('.needs-row-title').textContent))"
+    subs = f"JSON.stringify({rows}.map(r => [r.querySelector('.needs-row-title').textContent, r.querySelector('.needs-row-sub').textContent]))"
+    open_ship = f"{rows}.find(r => /Ship/.test(r.textContent)).click(); 1"
+    focus = ("JSON.stringify({text: document.querySelector('#levain-modal .needs-card').innerText,"
+             " blocks: [...document.querySelectorAll('#levain-modal .needs-q-blocks')].map(x => x.textContent)})")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        vals = _drive(tmp_path, f"{url}/#write_token=T", [{"emulate": SIZES[0][1]}, {"until": ready, "ms": 20000},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 600))"}, {"eval": subs}, {"eval": open_ship},
+            {"until": "document.querySelector('#levain-modal .needs-q-title')"}, {"eval": focus}])["values"]
+    got = {t: s for t, s in json.loads(vals[-4])}
+    assert got["Ship the fix now?"] == "blocks: The release waits on this.", got
+    assert got["Cut the second slice?"] == "", got            # nothing remains: the row has no second line
+    f = json.loads(vals[-1])
+    assert f["blocks"] == ["blocks: The release waits on this."], f
+    assert f["text"].count("Ship the fix now?") == 1, f       # the title is drawn once
