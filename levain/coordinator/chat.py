@@ -919,16 +919,20 @@ def canary_verdict_id(verdict: Any) -> str:
     separators=(",", ":"))``, over the canary verdict an activation accepted."""
     if not is_dataclass(verdict) or isinstance(verdict, type):
         raise CoordError("a canary verdict is a dataclass instance")
-    return hashlib.sha256(json.dumps(asdict(verdict), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    try:
+        text = json.dumps(asdict(verdict), sort_keys=True, separators=(",", ":"))
+    except Exception as exc:  # noqa: BLE001 - a canary that cannot be serialised has no id: refused
+        raise CoordError(f"a canary verdict that cannot be serialised has no id ({type(exc).__name__})") from None
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def _evidence_sha256(evidence: LivenessEvidence) -> str | None:
-    """``sha256:<hex>`` of the evidence's canonical JSON; None when its raw data is not JSON (the verdict still
-    stands, unrecorded by digest)."""
+    """``sha256:<hex>`` of the evidence's canonical JSON; None when it cannot be serialised (any exception): an
+    activation refuses such evidence and a probe counts it a failed try."""
     try:
         text = json.dumps({"source": evidence.source, "raw": evidence.raw, "read_at": evidence.read_at},
                           sort_keys=True, separators=(",", ":"), allow_nan=False)
-    except (TypeError, ValueError):
+    except Exception:  # noqa: BLE001 - TypeError, ValueError, RecursionError, a raising __getattr__ ...
         return None
     return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
 
@@ -954,6 +958,19 @@ def _boundary(conn: sqlite3.Connection, now: str, launch_id: str, source: str) -
         record_check(conn, now, launch_id, "probing", source, f"probing at the {source.replace('_', ' ')} boundary")
 
 
+def _crossing(conn: sqlite3.Connection, launch_id: str, seen: Sequence[Any], backfill: Sequence[bool],
+              claude: bool) -> str | None:
+    """The source of the first boundary of a batch that crosses one (two new boundaries, or one that is not the
+    batch's last event); None when it does not. A boundary is a new, non-backfill ``turn_started`` (any harness) or,
+    on Claude, ``turn_ended`` (R9): the events :meth:`ChatService._ingest` writes a ``probing`` row for."""
+    at = [(i, "turn_start" if e.kind == "turn_started" else "result") for i, (e, old) in enumerate(zip(seen, backfill))
+          if not old and (e.kind == "turn_started" or (claude and e.kind == "turn_ended"))
+          and _event_row(conn, launch_id, e.key) is None]
+    if len(at) > 1 or at and at[0][0] != len(seen) - 1:
+        return at[0][1]
+    return None
+
+
 def _pending_probe(conn: sqlite3.Connection, launch_id: str) -> tuple[int, str] | None:
     """``(seq, source)`` of the launch's latest check row when it is a boundary's ``probing`` the service's probe
     answers; else None."""
@@ -966,19 +983,26 @@ def _pending_probe(conn: sqlite3.Connection, launch_id: str) -> tuple[int, str] 
 def _first_send_open(conn: sqlite3.Connection, launch_id: str) -> bool:
     """H9 (Q-R6-7), the one exception to B2's "no send while probing": a Claude launch whose latest check is its
     activation's ``probing`` WITH evidence (stage 1 passed: the initialize response checked; the spawn's own probing
-    row carries none), nothing latched, and no send of the launch attempted since that row. Every allow stays
-    deferred: the launch is still not ``enabled``."""
+    row carries none), nothing latched, and no send of the launch attempted since that child's FIRST activation row
+    (one first send per spawn nonce: a replayed stage 1 opens no second one). Every allow stays deferred: the launch
+    is still not ``enabled``."""
     if _launch_state(conn, launch_id)[2] != "claude":
         return False
     rows = _check_rows(conn, launch_id)
     if not rows:
         return False
-    _seq, gseq, kind, source, evidence = rows[-1]
+    seq, _gseq, kind, source, evidence = rows[-1]
     if kind != "probing" or source != "activation" or evidence is None or liveness(conn, launch_id).latched:
         return False
+    nonce = conn.execute("SELECT spawn_nonce FROM chat_launch_checks WHERE launch_id = ? AND seq = ?",
+                         (launch_id, seq)).fetchone()[0]
+    if nonce is None:
+        return False
+    since = conn.execute("SELECT MIN(gseq) FROM chat_launch_checks WHERE launch_id = ? AND source = 'activation' AND "
+                         "spawn_nonce = ?", (launch_id, nonce)).fetchone()[0]
     return conn.execute("SELECT 1 FROM chat_outbox_events o JOIN chat_messages m ON m.message_id = o.message_id "
                         "WHERE m.launch_id = ? AND o.state = 'attempted' AND o.gseq > ? LIMIT 1",
-                        (launch_id, gseq)).fetchone() is None
+                        (launch_id, since)).fetchone() is None
 
 
 # --- the composer (§4.3, §5.4, §7.4, H9) ---------------------------------------------------------------------------
@@ -1396,6 +1420,10 @@ class ChatService:
     that has not answered within :data:`INTERRUPT_DEADLINE` is ``ambiguous`` to its caller, and detach waits at most
     that long before it closes the session under it (closing is the stop that is always available, §4.3).
 
+    A driver call that has not returned by its deadline (a read, an evidence read, an interrupt) WEDGES the session:
+    the call is left in flight and nothing else is called on that session until it is detached (a new attach starts
+    unwedged).
+
     Liveness (§4.1-§4.2): ``probe(launch_id, evidence)`` is the service's verdict function (the launcher's; CH-D2 /
     CH-D3 give the vendor ones) and returns a :class:`Verdict`. A session supplies only
     :class:`~levain.coordinator.driver.LivenessEvidence`; nothing it returns is read as a verdict. With no probe, every
@@ -1436,6 +1464,21 @@ class ChatService:
         with self._launch_lock(launch_id), self._guard:
             self._refuse_second(launch_id)
             self._sessions[launch_id] = session
+            self._wedged.discard(launch_id)           # a wedge belongs to the session that left a call unanswered
+
+    def _wedge(self, launch_id: str, session: Any) -> None:
+        """``session`` left a driver call unanswered: the launch's session is used no more until it is detached.
+        Only the session still attached is wedged (a call that went overdue after a detach marks nothing)."""
+        with self._guard:
+            if self._sessions.get(launch_id) is session:
+                self._wedged.add(launch_id)
+
+    def _refuse_wedged(self, launch_id: str, done: str) -> None:
+        """Refuse (CoordError) once the launch's session is wedged; ``done`` says what was already written."""
+        with self._guard:
+            wedged = launch_id in self._wedged
+        if wedged:
+            raise CoordError(f"launch {str(launch_id)[:40]}'s driver session stopped answering; detach it; {done}")
 
     def _refuse_second(self, launch_id: str) -> None:
         if launch_id in self._sessions:
@@ -1660,12 +1703,12 @@ class ChatService:
         restarted service resumes where the last persisted batch ended. The count of new events."""
         with self._attached(launch_id) as session:
             self._probe_pending(launch_id, session)
+            self._refuse_wedged(launch_id, "nothing was read")
             cursor = self._chat._read(lambda conn: _last_cursor(conn, launch_id))
             try:
                 batch = _bounded(lambda: session.read(cursor), READ_DEADLINE)
             except _Overdue:
-                with self._guard:
-                    self._wedged.add(launch_id)
+                self._wedge(launch_id, session)
                 raise CoordError(f"launch {launch_id}'s vendor read did not return within {READ_DEADLINE:g} s; its "
                                  "session is used no more until it is detached; nothing was recorded") from None
             return self._ingest(launch_id, session, batch)
@@ -1680,9 +1723,7 @@ class ChatService:
             session = self._session(launch_id)
             if session is None:
                 raise CoordError(refusal)
-            if launch_id in self._wedged:
-                raise CoordError(f"launch {str(launch_id)[:40]}'s driver session stopped answering; detach it; "
-                                 "nothing was read")
+            self._refuse_wedged(launch_id, "nothing was read")
             yield session
 
     def _ingest(self, launch_id: str, session: Any, batch: Any) -> int:
@@ -1690,6 +1731,7 @@ class ChatService:
         write transaction; the positions they place are immutable, and the fingerprint check refuses the write if a
         cursor, an attempt or an event of the launch was written since they were read."""
         self._probe_pending(launch_id, session)
+        self._refuse_wedged(launch_id, "nothing was recorded")
         correlated = bool(session.capabilities().correlation_field)
         seen = []
         for e in batch.events:
@@ -1713,17 +1755,24 @@ class ChatService:
             through, gap = prev, False      # an older batch: the persisted frontier already covers its gap
         new = 0
         recorded: list[str] = []
+        crossed = None
         with self._chat._write() as (conn, now):
             if _fingerprint(conn, launch_id) != read.fingerprint:
                 raise CoordError(f"launch {launch_id}'s chat record changed while its batch was read; nothing "
                                  "was written")
             claude = _launch_state(conn, launch_id)[2] == "claude"
+            crossed = _crossing(conn, launch_id, seen, backfill, claude)
+            if crossed is not None:
+                # the driver contract: a read ends at its one boundary. Fail closed: nothing of the batch is
+                # recorded, the cursor stays, and the launch latches off
+                record_check(conn, now, launch_id, "not_live", crossed, "batch crossed a boundary")
+                seen = []
             for e, old, window in zip(seen, backfill, windows):
                 ev, created = record_event(conn, now, launch_id=launch_id, key=e.key, pos=e.pos, kind=e.kind,
                                            body=e.body, normalized=e.norm, turn_id=e.turn_id, call_id=e.call_id,
                                            backfill=old)
                 new += created
-                if created:
+                if created and not old:
                     recorded.append(e.key)
                 # §4.2: probing commits with the boundary that starts a turn (Codex turn/started; any harness's
                 # turn_started) and, on Claude, with the turn_ended a result line maps to (R9). History is no boundary
@@ -1734,10 +1783,15 @@ class ChatService:
                 if correlated and isinstance(e.correlation, str) and self._prove(conn, now, launch_id, e):
                     continue
                 _echo_or_outside(conn, now, ev, window)
-            record_cursor(conn, now, launch_id=launch_id, vendor_cursor=cursor, complete_through=through, gap=gap)
-        # the boundary's probe runs before anything handles the events behind it (§4.2: a request queued behind
-        # turn_started is routed only after the verdict)
+            if crossed is None:
+                record_cursor(conn, now, launch_id=launch_id, vendor_cursor=cursor, complete_through=through,
+                              gap=gap)
+        if crossed is not None:
+            raise CoordError(f"launch {launch_id}'s vendor read crossed a boundary (a boundary event that is not its "
+                             "batch's last); nothing was recorded and the launch is off until you re-enable it")
+        # the boundary (the batch's last event) is judged before anything handles what follows it (§4.2)
         self._probe_pending(launch_id, session)
+        self._refuse_wedged(launch_id, "the batch was recorded; the launch is off")
         self._reconcile(launch_id, session, correlated)
         if recorded and self._route is not None:
             self._route(launch_id, tuple(recorded))
@@ -1787,13 +1841,15 @@ class ChatService:
     def candidates(self, message_id: str) -> list[str]:
         """§7.3 step 2's "probably this one": the vendor event keys in an ambiguous send's window whose normalized
         digest equals the send's. Shown beside it; never authorship, never delivery (B12). Empty with no session
-        attached (no ``pos_lt`` to place them with)."""
+        attached, or a wedged one (no ``pos_lt`` to place them with)."""
         m = self._chat.message(message_id)
         if m is None or m.launch_id is None or self._session(m.launch_id) is None:
             return []
         with self._launch_lock(m.launch_id):         # a detach or a send waits for the comparisons, and the reverse
             session = self._session(m.launch_id)
-            if session is None:
+            with self._guard:
+                wedged = m.launch_id in self._wedged
+            if session is None or wedged:
                 return []
             read = self._chat._read(lambda conn: _launch_read(conn, m.launch_id))
             att = next((a for a in read.attempts if a.message_id == m.message_id), None)
@@ -1814,7 +1870,8 @@ class ChatService:
         it writes nothing (the in-flight approval rows a stop cancels are CH-D1c's). It does not wait on the launch's
         mutex: a stop never queues behind a send in flight. A driver that raises, or returns anything but a
         :class:`~levain.coordinator.driver.CommandResult`, is ``ambiguous``; so is one that has not answered within
-        :data:`INTERRUPT_DEADLINE`. The session is pinned until its call returns: :meth:`detach` refuses a new
+        :data:`INTERRUPT_DEADLINE`, and that one also wedges the session (no further call reaches it, an interrupt
+        included, until it is detached). The session is pinned until its call returns: :meth:`detach` refuses a new
         interrupt meanwhile and waits for the pin, at most :data:`INTERRUPT_DEADLINE`, before it closes the session
         (an interrupt reaches only the session it pinned; one stuck past the deadline is closed under it).
         ``turn_id`` is None or one line of plain text, as a recorded vendor turn id is (:func:`record_event`)."""
@@ -1826,26 +1883,40 @@ class ChatService:
                 raise CoordError(f"no driver session is attached to launch {str(launch_id)[:40]}; nothing was sent")
             if launch_id in self._detaching:
                 raise CoordError(f"launch {str(launch_id)[:40]}'s driver session is being detached; nothing was sent")
+            if launch_id in self._wedged:
+                raise CoordError(f"launch {str(launch_id)[:40]}'s driver session stopped answering; detach it; "
+                                 "nothing was sent")
             self._pins[id(session)] = self._pins.get(id(session), 0) + 1
         command = InterruptCommand("op-" + secrets.token_hex(16), turn_id)
+        ran = threading.Event()
+
+        def unpin() -> None:
+            with self._guard:
+                self._pins[id(session)] -= 1
+                if not self._pins[id(session)]:
+                    del self._pins[id(session)]
+                self._unpinned.notify_all()
 
         def call() -> Any:
             # the pin is released when the session's call returns, not when the caller stops waiting for it
+            ran.set()
             try:
                 return session.interrupt(command)
             finally:
-                with self._guard:
-                    self._pins[id(session)] -= 1
-                    if not self._pins[id(session)]:
-                        del self._pins[id(session)]
-                    self._unpinned.notify_all()
+                unpin()
 
         try:
             got = _bounded(call, INTERRUPT_DEADLINE)
         except _Overdue:
+            self._wedge(launch_id, session)
             return CommandResult("ambiguous", f"the driver did not answer the interrupt within "
-                                              f"{INTERRUPT_DEADLINE:g} s")
-        except Exception as exc:  # noqa: BLE001 - any driver exception is an unknown outcome
+                                              f"{INTERRUPT_DEADLINE:g} s; its session is used no more until it is "
+                                              "detached")
+        except BaseException as exc:
+            if not ran.is_set():
+                unpin()                               # the call's thread never started: nothing else releases it
+            if not isinstance(exc, Exception):
+                raise
             return CommandResult("ambiguous", _cause_text(f"the driver raised {type(exc).__name__}: {_said(exc)}"))
         if not isinstance(got, CommandResult) or type(got.outcome) is not str or got.outcome not in (
                 "confirmed", "ambiguous", "rejected", "no_such_request"):
@@ -1866,6 +1937,8 @@ class ChatService:
         if evidence is not None and type(evidence) is not LivenessEvidence:
             raise CoordError("activation evidence is a LivenessEvidence")
         digest = None if evidence is None else _evidence_sha256(evidence)
+        if evidence is not None and digest is None:
+            raise CoordError("activation evidence that cannot be serialised is refused; nothing was written")
         verdict_id = None
         if canary is not None:
             if getattr(canary, "ok", None) is not True:
@@ -1879,6 +1952,11 @@ class ChatService:
                                  "the containment digest; nothing was written")
             if harness != "claude" and (spawn_nonce, verdict_id, containment_digest) != (None, None, None):
                 raise CoordError(f"a {harness} activation carries no spawn nonce, canary or containment digest; "
+                                 "nothing was written")
+            if kind == "probing" and digest is not None and spawn_nonce is not None and conn.execute(
+                    "SELECT 1 FROM chat_launch_checks WHERE launch_id = ? AND source = 'activation' AND spawn_nonce "
+                    "= ? AND evidence_sha256 IS NOT NULL LIMIT 1", (launch_id, spawn_nonce)).fetchone() is not None:
+                raise CoordError("stage 1 of this child is recorded already; a replay opens no second first send; "
                                  "nothing was written")
             return record_check(conn, now, launch_id, kind, "activation", detail, evidence_sha256=digest,
                                 spawn_nonce=spawn_nonce, canary_verdict_id=verdict_id,
@@ -1901,29 +1979,43 @@ class ChatService:
     def _probe_pending(self, launch_id: str, session: Any) -> None:
         """Answer the launch's boundary ``probing`` row, if its latest check is one (the caller holds the launch's
         mutex): up to :data:`PROBE_TRIES` tries :data:`PROBE_GAP` apart, each reading fresh evidence from the
-        session and judging it with the service's probe; a try that raises or returns anything but a
-        :class:`Verdict` fails. If every try fails, ``not_live`` ("could not check: <why>"), which latches."""
+        session and judging it with the service's probe; a try that raises, returns anything but a
+        :class:`Verdict`, or reads evidence that cannot be serialised fails. If every try fails, ``not_live``
+        ("could not check: <why>"), which latches. An evidence read that has not returned by :data:`READ_DEADLINE`
+        ends the probe at once: the session is wedged (no second call while that one is in flight) and the launch
+        latches ``not_live`` ("could not check: evidence read overdue"). A wedged session is not called: its
+        boundary's ``probing`` row stands."""
         pending = self._chat._read(lambda conn: _pending_probe(conn, launch_id))
-        if pending is None:
-            return
+        with self._guard:
+            wedged = launch_id in self._wedged
+        if pending is None or wedged:
+            return                                    # a wedged session is called no more: the probing row stands
         why = "no probe ran"
         for attempt in range(PROBE_TRIES):
             if attempt:
                 self._sleep(PROBE_GAP)
             try:
                 evidence = _bounded(session.liveness_evidence, READ_DEADLINE)
+            except _Overdue:
+                # its call is still in flight: no second one on this session, no further try
+                self._wedge(launch_id, session)
+                self._write_verdict(launch_id, pending, "not_live", "could not check: evidence read overdue", None)
+                return
+            except Exception as exc:  # noqa: BLE001 - a failed try, retried; never read as live
+                why = f"{type(exc).__name__}: {_said(exc)}"
+                continue
+            try:
                 if type(evidence) is not LivenessEvidence:
                     raise CoordError("the session returned no liveness evidence")
+                digest = _evidence_sha256(evidence)
+                if digest is None:
+                    raise CoordError("the session's evidence cannot be serialised")
                 verdict = self._verdict(launch_id, evidence)
-            except _Overdue:
-                why = f"the evidence read did not return within {READ_DEADLINE:g} s"
-                continue
             except Exception as exc:  # noqa: BLE001 - a failed try, retried; never read as live
                 why = f"{type(exc).__name__}: {_said(exc)}"
                 continue
             self._write_verdict(launch_id, pending, "live" if verdict.live else "not_live",
-                                _cause_text(verdict.detail or ("live" if verdict.live else "not live")),
-                                _evidence_sha256(evidence))
+                                _cause_text(verdict.detail or ("live" if verdict.live else "not live")), digest)
             return
         self._write_verdict(launch_id, pending, "not_live", _cause_text(f"could not check: {why}"), None)
 
