@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import ipaddress
 import json
 import os
 import re
@@ -735,6 +736,7 @@ _CAN = b"\x18"             # cancels a sequence the abandoned rest may have cut,
 REPROBE_S = 60.0           # CONTRACT V13: the macOS re-probe's period, start to start
 URGENT_DRAIN_S = 1.0       # N4: the final drain's bound when the session ends on ``firewall-open``
 _NOTES_MAX = 32            # DECISION: re-probe notes kept for the end of the relay; past this they are counted
+REPROBE_SKIPS_MAX = 5      # L1: consecutive skipped re-probes that end the session (at REPROBE_S apart, ~5 min)
 
 
 def _pty_pending(fd: int) -> int:
@@ -764,18 +766,22 @@ def reprobe_class(name: str) -> str:
 
 
 class _Reprobe:
-    """The macOS re-probe's schedule and streak (R5, O2, N1), on the caller's clock and nothing else. Start to start:
-    the first run is due ``every`` after the relay begins, each next one ``every`` after the last one STARTED, and
-    one still running when the next is due delays it to its own end (the caller starts none while one runs). The
-    streak counts consecutive runs: ``closed`` and ``skipped`` reset it, ``unknown`` adds one, and the second unknown
-    in a row, like any ``open``, is the session's end reason. A run of skipped ticks is noted once. The notes are
-    for the END of the relay (N5): nothing here writes to the operator's terminal."""
+    """The macOS re-probe's schedule and streak (R5, O2, N1, L1), on the caller's clock and nothing else. Start to
+    start: the first run is due ``every`` after the relay begins, each next one ``every`` after the last one STARTED,
+    and one still running when the next is due delays it to its own end (the caller starts none while one runs).
+    Two counts: ``unknowns`` (only ``closed`` resets it; a skipped tick leaves it as it is) and ``skips``, the
+    current run of consecutive skipped ticks (``closed`` and ``unknown`` end it). The second unknown, the
+    :data:`REPROBE_SKIPS_MAX`-th skip in a row, or any ``open`` is the session's end reason. After a run that timed
+    out (``helper-timeout``: the ended helper may still hold the session lock, since a KILL ends sudo alone),
+    ``session-busy`` counts unknown until a run answers ``closed``. A run of skipped ticks is noted once. The notes
+    are for the END of the relay (N5): nothing here writes to the operator's terminal."""
 
     def __init__(self, now: float, every: float) -> None:
         self.every = every
         self.next_due = now + every
         self.unknowns = 0
-        self.skipping = False
+        self.skips = 0
+        self.timed_out = False
         self.notes: List[str] = []
         self.dropped = 0
 
@@ -794,20 +800,61 @@ class _Reprobe:
     def finished(self, name: str, detail: str = "") -> Optional[str]:
         """The run's result: returns the session's end reason, or ``None`` to go on."""
         kind = reprobe_class(name)
+        if name == "session-busy" and self.timed_out:
+            kind = "unknown"
+        if name == "helper-timeout":
+            self.timed_out = True
         tail = f": {detail}" if detail else ""
         if kind == "open":
             self._note(f"firewall self-probe: {name}{tail}")
             return "firewall-open"
         if kind == "unknown":
             self.unknowns += 1
-            self.skipping = False
+            self.skips = 0
             self._note(f"firewall self-probe unknown ({name}), {self.unknowns} in a row{tail}")
             return "firewall-probe-unknown" if self.unknowns >= 2 else None
-        self.unknowns = 0
-        if kind == "skipped" and not self.skipping:
-            self._note(f"firewall self-probe skipped ({name}): not counted until it answers again{tail}")
-        self.skipping = kind == "skipped"
+        if kind == "closed":
+            self.unknowns = self.skips = 0
+            self.timed_out = False
+            return None
+        self.skips += 1
+        if self.skips >= REPROBE_SKIPS_MAX:
+            self._note(f"firewall self-probe skipped ({name}): {self.skips} skipped in a row{tail}")
+            return "firewall-probe-unknown"
+        if self.skips == 1:
+            self._note(f"firewall self-probe skipped ({name}): the session ends at {REPROBE_SKIPS_MAX} in a row{tail}")
         return None
+
+
+def probe_answer(out: Mapping[str, object], vendor: str) -> Mapping[str, object]:
+    """A ``probe`` ok answer checked whole (L2), for the launch and the re-probe alike: exactly ``probe`` =
+    ``closed``, ``host`` one of the vendor's probed hosts, ``address`` an IP address string, ``addresses`` an int
+    from 1 to the probe's address cap. Anything else is ``firewall-probe-malformed`` naming the field."""
+    from levain.slot.probe import MAX_PROBE_ADDRS, PROBE_HOSTS
+
+    def bad(what: str) -> Refused:
+        return Refused("firewall-probe-malformed", f"probe: {what}")
+
+    if set(out) != _PROBE_KEYS:
+        raise bad("keys: " + ",".join(sorted(str(k) for k in set(out) ^ _PROBE_KEYS))[:128])
+    if out["probe"] != "closed":
+        raise bad("probe")
+    if type(out["host"]) is not str or out["host"] not in PROBE_HOSTS.get(vendor, ()):
+        raise bad("host")
+    try:
+        if type(out["address"]) is not str:
+            raise ValueError
+        ipaddress.ip_address(out["address"])
+    except ValueError:
+        raise bad("address") from None
+    n = out["addresses"]
+    if type(n) is not int or not 1 <= n <= MAX_PROBE_ADDRS:
+        raise bad("addresses")
+    return out
+
+
+#: L2: the fields of a ``probe`` ok answer (``ok`` itself is the line's, taken off by :func:`parse_helper_line`).
+_PROBE_KEYS = frozenset({"probe", "host", "address", "addresses"})
 
 
 def _host() -> str:
@@ -883,11 +930,15 @@ class _ProbeRun:
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, lease_fds=sup._lease_fds(),
                              env=sup.s.env)
         self.out, self.err = bytearray(), bytearray()
-        self.fout, self.ferr = self.p.stdout.fileno(), self.p.stderr.fileno()     # type: ignore[union-attr]
-        self.open = [self.fout, self.ferr]
         self.over = False
-        for fd in self.open:
-            os.set_blocking(fd, False)
+        try:
+            self.fout, self.ferr = self.p.stdout.fileno(), self.p.stderr.fileno()     # type: ignore[union-attr]
+            self.open = [self.fout, self.ferr]
+            for fd in self.open:
+                os.set_blocking(fd, False)
+        except BaseException:
+            self.end()                    # L4: a setup failure after the spawn leaves no child and no pipe behind
+            raise
 
     def pump(self, ready: Collection[int]) -> None:
         for fd in list(self.open):
@@ -920,24 +971,27 @@ class _ProbeRun:
             return "helper-output-malformed"
         if not self.open and self.p.poll() is not None:
             try:
-                out = parse_helper_line(bytes(self.out), "probe")
+                probe_answer(parse_helper_line(bytes(self.out), "probe"), self.sup.req.vendor)
             except Refused as e:
                 return e.name
-            return "closed" if out.get("probe") == "closed" else "firewall-probe-malformed"
+            return "closed"
         if now >= self.deadline:
             return "helper-timeout"
         return None
 
     def end(self) -> None:
-        """Ended if still running (TERM, then KILL, reaped: :meth:`Supervisor._end_helper`), pipes closed."""
-        if self.p.poll() is None:
-            self.sup._end_helper(self.p)
-        for f in (self.p.stdout, self.p.stderr):
-            if f is not None:
-                try:
-                    f.close()
-                except OSError:
-                    pass
+        """Ended if still running (TERM, then KILL, reaped: :meth:`Supervisor._end_helper`), pipes closed whatever
+        the ending raised (L4)."""
+        try:
+            if self.p.poll() is None:
+                self.sup._end_helper(self.p)
+        finally:
+            for f in (self.p.stdout, self.p.stderr):
+                if f is not None:
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
 
 
 class Supervisor:
@@ -1098,9 +1152,9 @@ class Supervisor:
         if self.stop_signal is not None:
             raise Refused("stopped", signal.Signals(self.stop_signal).name)
 
-    def helper(self, *args: str, stdin: bytes = b"", stoppable: bool = True) -> Dict[str, object]:
-        """One verb off the pty: stdin and stdout are pipes, stderr is read and shown escaped (root's refusal detail
-        may quote a slot-made name). The pipes are driven in a bounded select loop that also watches the wake pipe:
+    def helper(self, *args: str, stdin: Optional[bytes] = b"", stoppable: bool = True) -> Dict[str, object]:
+        """One verb off the pty: stdin (``None``: ``/dev/null``) and stdout are pipes, stderr is read and shown
+        escaped (root's refusal detail may quote a slot-made name). The pipes are driven in a bounded select loop that also watches the wake pipe:
         a stop signal (``stoppable``; for teardown, which runs AFTER the first stop, only a later one) or the verb's
         :attr:`Seams.helper_deadline_s` ends the helper (TERM, then KILL, reaped) and refuses ``stopped`` /
         ``helper-timeout``. An OS failure to run or talk to it is ``helper-unrunnable``, never a traceback."""
@@ -1109,12 +1163,13 @@ class Supervisor:
         err = bytearray()
         try:
             try:
-                p = self.s.spawn(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 lease_fds=self._lease_fds(), env=self.s.env)
+                p = self.s.spawn(argv, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, lease_fds=self._lease_fds(),
+                                 env=self.s.env)
             except OSError as e:
                 raise Refused("helper-unrunnable", f"{verb}: {e.strerror or e}") from None
             try:
-                out = self._drive(p, verb, stdin, err, stoppable)
+                out = self._drive(p, verb, stdin or b"", err, stoppable)
             except OSError as e:
                 raise Refused("helper-unrunnable", f"{verb}: {e.strerror or e}") from None
             finally:
@@ -1138,12 +1193,14 @@ class Supervisor:
         close and the helper exits."""
         deadline = time.monotonic() + self.s.helper_deadline_s.get(verb, HELPER_DEADLINE_DEFAULT_S)
         stops = self._stops
-        fin, fout, ferr = p.stdin.fileno(), p.stdout.fileno(), p.stderr.fileno()   # type: ignore[union-attr]
+        fout, ferr = p.stdout.fileno(), p.stderr.fileno()                          # type: ignore[union-attr]
+        fin = p.stdin.fileno() if p.stdin is not None else -1
         for fd in (fin, fout, ferr):
-            os.set_blocking(fd, False)
+            if fd >= 0:
+                os.set_blocking(fd, False)
         view = memoryview(bytes(data))
-        if not view:
-            p.stdin.close()                                                          # type: ignore[union-attr]
+        if not view and p.stdin is not None:
+            p.stdin.close()
         out = bytearray()
         readers = [fout, ferr]
         while readers or p.poll() is None:
@@ -1327,13 +1384,12 @@ class Supervisor:
 
     def _launch_probe(self, session: str) -> None:
         """V13 at launch (R2): the session starts only on ``closed``. Every refusal (``firewall-open``, every
-        ``inconclusive``, every ``unknown``) raises through :meth:`helper`, and an ``ok`` that is not ``closed`` is
-        refused ``firewall-probe-malformed``."""
-        out = self.helper("probe", session)
-        if out.get("probe") != "closed":
-            raise Refused("firewall-probe-malformed", "probe")
-        self.say(f"firewall self-probe: closed ({out.get('host')} {out.get('address')} not reachable as the slot; "
-                 f"{out.get('addresses')} addresses)")
+        ``inconclusive``, every ``unknown``) raises through :meth:`helper`, and an ``ok`` that :func:`probe_answer`
+        does not take whole is refused ``firewall-probe-malformed``. stdin is ``/dev/null``, as the re-probe's
+        (L6)."""
+        out = probe_answer(self.helper("probe", session, stdin=None), self.req.vendor)
+        self.say(f"firewall self-probe: closed ({out['host']} {out['address']} not reachable as the slot; "
+                 f"{out['addresses']} addresses)")
 
     def _teardown(self, session: str) -> bool:
         try:

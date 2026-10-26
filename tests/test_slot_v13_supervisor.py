@@ -36,6 +36,7 @@ def test_launch_order_is_render_probe_start(tmp_path: Path, monkeypatch: pytest.
     v = r.verbs()
     assert [x["verb"] for x in v] == ["prepare", "render", "probe", "start", "teardown"]
     assert v[2]["args"] == [SESSION]
+    assert v[2]["null0"] and not v[2]["tty"]                 # L6: stdin /dev/null, as the re-probe's
     err = r.stderr()
     assert "firewall self-probe not run" not in err
     assert "firewall self-probe: closed (api.anthropic.com 192.0.2.10 not reachable as the slot; 2 addresses)" in err
@@ -61,6 +62,55 @@ def test_an_ok_that_is_not_closed_is_refused_malformed(tmp_path: Path, monkeypat
     assert r.run() == 1
     assert verbs(r) == ["prepare", "render", "probe", "teardown"]
     assert "refused firewall-probe-malformed" in r.stderr()
+
+
+GOOD = {"address": "192.0.2.10", "addresses": 2, "host": "api.anthropic.com", "probe": "closed"}
+
+
+@pytest.mark.parametrize("bad", [
+    {"probe": "closed"},                                                       # keys missing
+    {**GOOD, "extra": 1},                                                      # a key too many
+    {**GOOD, "host": []}, {**GOOD, "host": "evil.example"},                    # host not a probed host
+    {**GOOD, "host": "api.openai.com"},                                        # another vendor's host
+    {**GOOD, "address": None}, {**GOOD, "address": "192.0.2"}, {**GOOD, "address": "example.com"},
+    {**GOOD, "addresses": "many"}, {**GOOD, "addresses": 0}, {**GOOD, "addresses": True},
+    {**GOOD, "addresses": 10 ** 6}, {**GOOD, "probe": "open"}])
+def test_probe_answer_is_checked_whole(bad: dict) -> None:
+    """L2: one strict validator for the launch and the re-probe: exact keys and types."""
+    with pytest.raises(SV.Refused) as e:
+        SV.probe_answer(bad, "claude")
+    assert e.value.name == "firewall-probe-malformed"
+
+
+def test_probe_answer_accepts_the_real_answer() -> None:
+    assert SV.probe_answer(dict(GOOD), "claude") == GOOD
+    assert SV.probe_answer({**GOOD, "address": "2001:db8::1"}, "claude")["address"] == "2001:db8::1"
+    assert SV.probe_answer({**GOOD, "host": "chatgpt.com"}, "codex")["host"] == "chatgpt.com"
+
+
+@bounded(60)
+def test_a_launch_answer_closed_but_malformed_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    bad = {"address": None, "addresses": "many", "host": [], "ok": True, "probe": "closed"}
+    r = Rig(tmp_path, monkeypatch, FAKE_PROBES="raw",
+            FAKE_PROBE_LINE=json.dumps(bad, sort_keys=True, separators=(",", ":")))
+    assert r.run() == 1
+    assert verbs(r) == ["prepare", "render", "probe", "teardown"]
+    assert "refused firewall-probe-malformed" in r.stderr()
+
+
+@bounded(60)
+def test_a_reprobe_answer_closed_but_malformed_counts_unknown(tmp_path: Path,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    bad = {"address": "192.0.2.10", "addresses": 2, "host": "evil.example", "ok": True, "probe": "closed"}
+    r = mac_rig(tmp_path, monkeypatch, FAKE_START="wait", FAKE_PROBES="closed,raw",
+                FAKE_PROBE_LINE=json.dumps(bad, sort_keys=True, separators=(",", ":")))
+    assert r.run() == 1
+    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "probe", "start", "probe", "probe", "teardown"]
+    err = r.stderr()
+    assert f"firewall-probe-unknown: ending session {SESSION}" in err
+    assert "firewall self-probe unknown (firewall-probe-malformed), 2 in a row" in err
 
 
 @bounded(60)
@@ -105,20 +155,59 @@ def test_reprobe_class(name: str, kind: str) -> None:
     assert SV.reprobe_class(name) == kind
 
 
-def test_two_unknowns_in_a_row_end_and_closed_or_skipped_reset_the_streak() -> None:
+def test_two_unknowns_in_a_row_end_and_only_closed_resets_the_streak() -> None:
     rp = SV._Reprobe(0.0, 60.0)
     assert rp.finished("firewall-probe-unknown:child") is None
     assert rp.finished("closed") is None                     # 1 unknown, then closed: no end
-    assert rp.finished("helper-timeout") is None
-    assert rp.finished("session-busy") is None               # a skipped tick resets the streak too (N1)
-    assert rp.finished("firewall-probe-inconclusive:dns") is None
     assert rp.finished("firewall-probe-unknown:child") is None
-    assert rp.finished("helper-timeout") == "firewall-probe-unknown"
+    assert rp.finished("session-busy") is None               # L1: a skipped tick does NOT reset the streak
+    assert rp.finished("firewall-probe-inconclusive:dns") is None
+    assert rp.finished("firewall-probe-unknown:child") == "firewall-probe-unknown"
+
+
+@pytest.mark.parametrize("name", ["session-busy", "not-probeable:BRAKED", "firewall-probe-inconclusive:dns",
+                                  "firewall-probe-inconclusive:no-control-connect"])
+def test_skipped_ticks_in_a_row_end_the_session_at_the_bound(name: str) -> None:
+    """L1: skips that never end are bounded: the REPROBE_SKIPS_MAX-th consecutive skipped tick is the end."""
+    assert SV.REPROBE_SKIPS_MAX == 5
+    rp = SV._Reprobe(0.0, 60.0)
+    for _ in range(SV.REPROBE_SKIPS_MAX - 1):
+        assert rp.finished(name) is None
+    assert rp.finished(name) == "firewall-probe-unknown"
+    assert "5 skipped in a row" in rp.notes[-1]
+
+
+def test_a_closed_or_an_unknown_ends_a_run_of_skipped_ticks() -> None:
+    rp = SV._Reprobe(0.0, 60.0)
+    for _ in range(4):
+        assert rp.finished("session-busy") is None
+    assert rp.finished("closed") is None
+    for _ in range(4):
+        assert rp.finished("session-busy") is None
+    assert rp.finished("firewall-probe-unknown:child") is None   # one unknown: the skipped run is over
+    for _ in range(4):
+        assert rp.finished("firewall-probe-inconclusive:dns") is None
+    assert rp.finished("closed") is None
+
+
+def test_after_a_timed_out_reprobe_session_busy_is_unknown_until_a_probe_answers_closed() -> None:
+    """L1: the ended helper may still hold the session lock (a KILL ends sudo alone), so a busy lock is no longer
+    a benign skip."""
+    rp = SV._Reprobe(0.0, 60.0)
+    assert rp.finished("helper-timeout") is None
+    assert rp.finished("session-busy") == "firewall-probe-unknown"
+    rp = SV._Reprobe(0.0, 60.0)
+    assert rp.finished("helper-timeout") is None
+    assert rp.finished("closed") is None
+    assert rp.finished("session-busy") is None               # a probe completed: busy is a skip again
+    assert rp.finished("helper-timeout") is None
+    assert rp.finished("firewall-probe-inconclusive:dns") is None
+    assert rp.finished("session-busy") == "firewall-probe-unknown"
 
 
 def test_open_ends_at_once_and_skipped_is_noted_once_per_streak() -> None:
     rp = SV._Reprobe(0.0, 60.0)
-    for _ in range(5):
+    for _ in range(SV.REPROBE_SKIPS_MAX - 1):
         assert rp.finished("firewall-probe-inconclusive:dns") is None
     assert rp.finished("closed") is None
     assert rp.finished("session-busy") is None
@@ -194,8 +283,8 @@ def test_two_unknowns_in_a_row_end_the_session(tmp_path: Path, monkeypatch: pyte
 
 @bounded(60)
 def test_unknown_then_closed_and_skipped_ticks_do_not_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    seq = ("closed,firewall-probe-unknown:child,closed,firewall-probe-unknown:child,session-busy,"
-           "firewall-probe-inconclusive:dns,firewall-probe-unknown:child,closed")
+    seq = ("closed,firewall-probe-unknown:child,closed,session-busy,firewall-probe-inconclusive:dns,closed,"
+           "firewall-probe-unknown:child,closed")
     r = mac_rig(tmp_path, monkeypatch, FAKE_START="wait", FAKE_PROBES=seq)
     seen: dict = {}
     stop_after_probes(r, 9, seen)
@@ -262,6 +351,92 @@ def test_a_reprobe_past_its_deadline_counts_unknown(tmp_path: Path, monkeypatch:
     assert r.run() == 1
     assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "probe", "start", "probe", "probe", "teardown"]
     assert f"firewall-probe-unknown: ending session {SESSION}" in r.stderr()
+
+
+@bounded(60)
+@pytest.mark.parametrize("skip", ["session-busy", "firewall-probe-inconclusive:dns"])
+def test_skipped_forever_ends_the_session_within_the_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                           skip: str) -> None:
+    """L1: a helper stand-in that answers ``skip`` for ever: END after REPROBE_SKIPS_MAX re-probes, one teardown."""
+    r = mac_rig(tmp_path, monkeypatch, FAKE_START="wait", FAKE_PROBES=f"closed,{skip}")
+    assert r.run() == 1
+    assert [x["verb"] for x in r.verbs()] == (["prepare", "render", "probe", "start"]
+                                              + ["probe"] * SV.REPROBE_SKIPS_MAX + ["teardown"])
+    err = r.stderr()
+    assert f"firewall-probe-unknown: ending session {SESSION}" in err and err.count("ended RETAINED") == 1
+
+
+@bounded(60)
+def test_a_timed_out_reprobe_then_session_busy_ends(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    r = mac_rig(tmp_path, monkeypatch, FAKE_START="wait", FAKE_PROBES="closed,hang,session-busy")
+    r.seams.helper_deadline_s = {**SV.HELPER_DEADLINE_S, "probe": 0.5}
+    r.seams.kill_grace_s = 0.3
+    assert r.run() == 1
+    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "probe", "start", "probe", "probe", "teardown"]
+    err = r.stderr()
+    assert f"firewall-probe-unknown: ending session {SESSION}" in err
+    assert "firewall self-probe unknown (session-busy), 2 in a row" in err
+
+
+# --- L4: a probe run that fails after its spawn leaves nothing behind -------------------------------------------------
+
+class _BadFd:
+    def __init__(self, real) -> None:
+        self.real, self.closed = real, False
+
+    def fileno(self) -> int:
+        raise OSError(9, "Bad file descriptor")
+
+    def close(self) -> None:
+        self.closed = True
+        self.real.close()
+
+
+def _sleeper_sup(tmp_path: Path, made: list, bad_stderr: bool) -> "SV.Supervisor":
+    import subprocess
+    import sys
+
+    def spawn(argv, **kw):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if bad_stderr:
+            p.stderr = _BadFd(p.stderr)
+        made.append(p)
+        return p
+    return SV.Supervisor(SV.Request(vendor="claude", repo=tmp_path),
+                         SV.Seams(host="darwin", helper=["fake"], spawn=spawn, err=open(os.devnull, "w"),
+                                  kill_grace_s=0.5))
+
+
+@bounded(30)
+def test_probe_run_setup_failure_ends_and_reaps_the_child(tmp_path: Path) -> None:
+    made: list = []
+    sup = _sleeper_sup(tmp_path, made, bad_stderr=True)
+    with pytest.raises(OSError):
+        SV._ProbeRun(sup, SESSION, 0.0)
+    (p,) = made
+    assert p.returncode is not None                          # ended and reaped, not left running
+    assert p.stdout.closed and p.stderr.closed
+
+
+@bounded(30)
+def test_probe_run_end_closes_its_pipes_whatever_ending_raised(tmp_path: Path,
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    made: list = []
+    sup = _sleeper_sup(tmp_path, made, bad_stderr=False)
+    run = SV._ProbeRun(sup, SESSION, 0.0)
+    (p,) = made
+
+    def boom(_p) -> None:
+        raise RuntimeError("ending failed")
+    monkeypatch.setattr(sup, "_end_helper", boom)
+    try:
+        with pytest.raises(RuntimeError):
+            run.end()
+        assert p.stdout.closed and p.stderr.closed
+    finally:
+        p.kill()
+        p.wait()
 
 
 @bounded(60)

@@ -124,8 +124,8 @@ elif verb == "start":
         os.write(1, b"bye no newline ")
         line({"exit": 3, "ok": True})
 elif verb == "probe":
-    # FAKE_PROBES: one outcome per probe call, in order (the last repeats): closed, malformed, slow:<s> (then
-    # closed), hang, or a refusal name.
+    # FAKE_PROBES: one outcome per probe call, in order (the last repeats): closed, malformed, raw (the line
+    # FAKE_PROBE_LINE), slow:<s> (then closed), hang, or a refusal name.
     seq = os.environ.get("FAKE_PROBES", "closed").split(",")
     count = os.path.join(store, "probes")
     n = int(open(count).read()) if os.path.exists(count) else 0
@@ -147,6 +147,8 @@ elif verb == "probe":
         line({"address": "192.0.2.10", "addresses": 2, "host": "api.anthropic.com", "ok": True, "probe": "closed"})
     elif what == "malformed":
         line({"ok": True, "probe": "open"})
+    elif what == "raw":
+        sys.stdout.write(os.environ["FAKE_PROBE_LINE"] + "\n")
     else:
         sys.stderr.write("levain runtime-helper: refused %%s: api.anthropic.com 192.0.2.10\n" %% what)
         line({"ok": False, "refused": what})
