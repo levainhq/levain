@@ -3908,9 +3908,12 @@
       };
       setTimeout(tick, 1000);  // first poll soon, then every 2s
     };
+    // a fresh object each time: the refusal a send takes when a read-only render took its transport away
+    const READ_ONLY_REFUSAL = () => ({ ok: false, error: "read-only", message: "this page can no longer send; nothing was sent" });
     const startJob = async (params, key, restore) => {
       msg.className = "edit-msg busy"; msg.textContent = "starting…";
-      const res = await commitJob(action.verb, params, true, key);
+      // the confirm step runs after the click guard: a read-only render in between took commitJob away
+      const res = commitJob ? await commitJob(action.verb, params, true, key) : READ_ONLY_REFUSAL();
       if (!(res && res.ok)) return failed(res, restore);
       msg.className = "edit-msg"; msg.textContent = "";
       // a job start rebuilds nothing: put this live box's chips back to its start state so the shown pick is the kept one
@@ -3928,12 +3931,14 @@
     // the transport this box sends through, read at the send (a later read-only render takes it away): a job verb's start, else the action post
     const sendWay = () => (spec.job ? commitJob : commitAction);
     const fire = async (params, confirm, key) => {
-      if (!sendWay()) return { ok: false, error: "read-only", message: "this page can no longer send; nothing was sent" };
+      if (!commitAction) return READ_ONLY_REFUSAL();  // fire posts through commitAction whatever sendWay() names
       if (!spec.sign) return commitAction(action.verb, params, confirm, key, action.panel);
       const say = (t, k) => { msg.className = "edit-msg" + (k === "bad" ? " err" : k === "ok" ? "" : " busy"); msg.textContent = t; };
       const s = await signedCompose(action.verb, action.panel, params, say, row);
       if (!s.ok) return { ok: false, error: "unsigned", message: s.message };
       const signed = Object.assign({}, params, { sign_request: s.request });
+      // the ceremony awaited: a read-only render in that time took the transport away, so it is read again here
+      if (!commitAction) return READ_ONLY_REFUSAL();
       const res = await commitAction(action.verb, signed, confirm, "sign-" + s.txn, action.panel, s.txn);
       if ((res && res.ok) || (res && typeof res.status === "number" && res.status >= 400 && res.status < 500)) {
         signDraftDrop(action.verb, action.panel, params);

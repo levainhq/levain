@@ -54,6 +54,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   the row says why, and a key past its limit shows as exhausted. Asking doctor never makes keys contact OpenRouter.
   When keys or CONTROL cannot be reached, or CONTROL has not yet connected to keys, the rows still say "held by keys".
   `sudo levain doctor`, which reads the key itself, checks OpenRouter's answer exactly as keys does.
+- **Message a seat from its node.** Tapping a seat on the cockpit's agents graph opens its page: its status, what it is
+  doing, and a box to message it, sent and signed like any other cockpit message. A seat the cockpit has no way to reach
+  says so instead of showing nothing to type into, and a page that has turned read-only says nothing was sent (also
+  when it turns read-only while the passkey prompt is open). The tap no longer jumps to the message card further down
+  the page, and that card now sends to the desk, the cockpit's other readers or everyone: an untouched card asks you
+  to choose a reader instead of sending to a default.
 
 ### Fixed
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
