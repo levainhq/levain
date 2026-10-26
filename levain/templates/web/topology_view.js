@@ -1394,17 +1394,15 @@
     const openPage = (g, n, x, y) => {
       if (!n) { toggle(null); return; }
       if (g.classList.contains("tv-open")) return;
-      // a seat the compose card can address (its chip is among the card's chips now) takes the tap into the message box; the graph passes
-      // the full roster name, which is its GROUP's label (the node's own label is only the tail), and the card maps it to its chip id by the
-      // prefix its provider declared. Anything else keeps its page.
-      // Only the seat's own node does: its lanes sit in the seat's group with that node as parent, and a label shared by two groups
-      // names no one seat. Each of those keeps its agent page.
-      const D = root.LevainDashboard, grp = arr(v.groups).find((q) => q && q.id === n.group);
+      // a seat's own node names its seat to the page, which offers a message box addressed to it: the graph passes the full roster name,
+      // which is its GROUP's label (the node's own label is only the tail). Only the seat's own node does: its lanes sit in the seat's group
+      // with that node as parent, and a label shared by two groups names no one seat. Each of those opens its page with no box.
+      const grp = arr(v.groups).find((q) => q && q.id === n.group);
       const own = n.parent == null || n.parent === "";
       const unique = grp && typeof grp.label === "string" && arr(v.groups).filter((q) => q && typeof q.label === "string" && q.label.trim() === grp.label.trim()).length === 1;
-      if (own && unique && D && typeof D.messageTo === "function" && D.messageTo(grp.label.trim())) { hideTip(); return; }
+      const seat = own && unique ? grp.label.trim() : "";
       const A = root.LevainAgentPage;
-      if (A && typeof A.open === "function") { hideTip(); A.open({ id: n.id, label: n.label, rows: tipRows(n, v.as_of), session: typeof n.session === "string" ? n.session : "" }, g); }
+      if (A && typeof A.open === "function") { hideTip(); A.open({ id: n.id, label: n.label, rows: tipRows(n, v.as_of), session: typeof n.session === "string" ? n.session : "", seat: seat }, g); }
       else toggle(n, x, y);
     };
     // the card stays on its node through every layout (a live relayout moves the node, a resize moves the whole graph), not only a stage replacement
