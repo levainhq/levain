@@ -55,6 +55,7 @@ from levain.contracts import ContractError, canon
 from levain.slot import SUDO, Refused, layout
 from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import RENDER_FORMAT, parse_stdin
+from levain.slot.vendor_hosts import VENDOR_HOSTS, _hosts
 
 # --- the terminal filter (BUILD_PLAN §2e 14, §6: titles pass, OSC 52 and report sequences are stripped) ---------------
 #
@@ -612,12 +613,6 @@ def check_repo_layer(docs: Mapping[str, Any]) -> None:
 
 # --- the render blob's inputs (§5.3) ---------------------------------------------------------------------------------
 
-#: DECISION: §4.3's route policy carries no vendor, and the base map holds every vendor's brokered and passthrough
-#: routes, so a route belongs to a vendor when one of its hosts (``hosts`` + ``upstream.host``) is that vendor's.
-VENDOR_HOSTS: Mapping[str, frozenset] = {
-    "claude": frozenset({"api.anthropic.com", "console.anthropic.com", "claude.ai", "platform.claude.com"}),
-    "codex": frozenset({"api.openai.com", "auth.openai.com", "chatgpt.com"}),
-}
 _AUTH_ROUTE = {"brokered": "brokered", "passthrough": "subscription_passthrough"}
 
 
@@ -633,14 +628,6 @@ def read_base_map(path: Path, *, read: Callable[[Path], bytes] = Path.read_bytes
     if type(obj) is not dict or obj.get("format") not in layout.BASE_ROUTES_FORMATS or type(obj.get("routes")) is not list:
         raise Refused("base-map-malformed", str(path))
     return [r for r in obj["routes"] if type(r) is dict]
-
-
-def _hosts(route: Mapping[str, Any]) -> set:
-    hs = {h for h in route.get("hosts", ()) if type(h) is str} if type(route.get("hosts")) is list else set()
-    up = route.get("upstream")
-    if type(up) is dict and type(up.get("host")) is str:
-        hs.add(up["host"])
-    return hs
 
 
 def pick_routes(base: Sequence[Mapping[str, Any]], vendor: str, auth: str) -> Tuple[str, ...]:

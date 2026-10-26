@@ -12,7 +12,7 @@ published Claude Code network requirements, not invented: :data:`CLAUDE_NETWORK_
 
 One brokered route per vendor whose models carry a price row in :mod:`levain.broker.vendor_prices`: Anthropic's
 Messages API, priced for every Claude row there. The OpenRouter row (``z-ai/glm-5.2``) gets no base route: no
-interactive session picks one (``supervisor.VENDOR_HOSTS`` names no OpenRouter host), and dispatch routes come from the
+interactive session picks one (``vendor_hosts.VENDOR_HOSTS`` names no OpenRouter host), and dispatch routes come from the
 signed route map.
 A body's ``models`` fallback list or ``route`` is refused at the check, and on the openai-chat codec (the one whose
 route can fall back, ``Codec.checks_answered_model``) a response naming another model is not priced at the checked
@@ -22,7 +22,7 @@ The merge is by route id: every shipped id is replaced whole by its shipped entr
 kept as written. The operator's route wins in two places (:func:`_shipped_for`, each choice named in the merge's
 notes): a host one of the map's own ``egress`` routes already admits is left off ``egress-default``; and (1026-10 R6)
 a shipped ``subscription_passthrough`` route is not added when the map already holds the operator's own passthrough
-route for the same vendor under another id (a vendor's hosts are ``supervisor.VENDOR_HOSTS``, the supervisor's own
+route for the same vendor under another id (a vendor's hosts are ``vendor_hosts.VENDOR_HOSTS``, the supervisor's own
 pick; :func:`yielded_routes`), so a merge never adds a second passthrough route for a vendor (``route-ambiguous`` at
 every launch). Any other route of the map on a host of an ``egress`` route is a clash, refused. The result is parsed
 by :func:`levain.broker.policy.parse_base_map` (keys' own parser) and checked by :func:`connect_host_clashes` before
@@ -37,7 +37,7 @@ from typing import Dict, List, Mapping, Sequence, Tuple
 
 from levain.broker import policy as P
 from levain.broker.vendor_prices import VENDOR
-from levain.slot.supervisor import VENDOR_HOSTS, _hosts
+from levain.slot.vendor_hosts import VENDOR_HOSTS, _hosts
 
 #: the format the merge writes (``layout.BASE_ROUTES_FORMAT``; a test holds the two equal)
 BASE_FORMAT = "levain-routes-base/2"
