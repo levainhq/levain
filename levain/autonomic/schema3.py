@@ -55,6 +55,9 @@ def _tune(key: str) -> str:
 
 
 _HELD_LIMIT_SQL = _tune("held_limit")
+# I11: the reason a held count carries: a subject-specific fault, ``subject:<why>``. One rule, a GLOB: the held_born /
+# held_move triggers apply it, and count_held asks SQLite to apply the same pattern before it writes (O-a1c1-7)
+SUBJECT_REASON = "subject:?*"
 
 
 def format_n(marker: object) -> int | None:
@@ -434,9 +437,9 @@ V3_TRIGGERS = (
     _abort("held_new", "EXISTS (SELECT 1 FROM held_counts WHERE subject = NEW.subject)",
            "D69: a row is never replaced", "BEFORE INSERT ON held_counts"),
     _abort("held_born", f"NOT IFNULL(NEW.n = 1 AND NEW.mark IS {_progress('NEW.subject')} "
-           f"AND NEW.last_reason GLOB 'subject:?*' AND NOT {_closed('NEW.subject')}, 0)",
+           f"AND NEW.last_reason GLOB '{SUBJECT_REASON}' AND NOT {_closed('NEW.subject')}, 0)",
            "I11: a held count is born 1, at the live subject mark, for a subject fault", "BEFORE INSERT ON held_counts"),
-    _abort("held_move", "NOT IFNULL(NEW.subject IS OLD.subject AND NEW.last_reason GLOB 'subject:?*' "
+    _abort("held_move", f"NOT IFNULL(NEW.subject IS OLD.subject AND NEW.last_reason GLOB '{SUBJECT_REASON}' "
            f"AND NOT {_closed('NEW.subject')} AND NEW.mark IS {_progress('NEW.subject')} AND ("
            "(NEW.n = OLD.n + 1 AND NEW.mark IS OLD.mark) OR (NEW.n = 1 AND NEW.mark > OLD.mark)), 0)",
            "I11: a held count rises by one at the same mark, or restarts at 1 only on progress",
@@ -539,9 +542,9 @@ KNOWN_COLUMNS["hold_decisions"] = ("hold_id", "run_id", "pending_id", "by", "n")
 
 HELD_TRIGGERS = (
     _abort("held_born", f"NOT IFNULL(NEW.n = 1 AND NEW.mark IS {_progress('NEW.subject')} "
-           f"AND NEW.last_reason GLOB 'subject:?*' AND NOT {_closed('NEW.subject')}, 0)",
+           f"AND NEW.last_reason GLOB '{SUBJECT_REASON}' AND NOT {_closed('NEW.subject')}, 0)",
            "I11: a held count is born 1, at the live subject mark, for a subject fault", "BEFORE INSERT ON held_counts"),
-    _abort("held_move", "NOT IFNULL(NEW.subject IS OLD.subject AND NEW.last_reason GLOB 'subject:?*' "
+    _abort("held_move", f"NOT IFNULL(NEW.subject IS OLD.subject AND NEW.last_reason GLOB '{SUBJECT_REASON}' "
            f"AND NOT {_closed('NEW.subject')} AND NEW.mark IS {_progress('NEW.subject')} AND ("
            "(NEW.n = OLD.n + 1 AND NEW.mark IS OLD.mark) OR (NEW.n = 1 AND NEW.mark > OLD.mark)), 0)",
            "I11: a held count rises by one at the same mark, or restarts at 1 only on progress",
@@ -1047,6 +1050,8 @@ def count_held(conn: sqlite3.Connection, subject: str, reason: str) -> int:
     progress mark; +1 at the same mark; back to 1 when the mark moved. Returns the count (the caller closes the
     subject ``refused`` with reason ``held_limit:<reason>`` at :func:`held_limit`). ``reason`` is ``subject:<why>``."""
     _in_write(conn, "count_held")
+    if not isinstance(reason, str) or conn.execute("SELECT ? GLOB ?", (reason, SUBJECT_REASON)).fetchone()[0] != 1:
+        raise ValueError(f"count_held: reason {reason!r} is not {SUBJECT_REASON!r} (a subject-specific fault)")
     mark = conn.execute(f"SELECT {_progress(':s')}", {"s": subject}).fetchone()[0]
     row = conn.execute("SELECT n, mark FROM held_counts WHERE subject = ?", (subject,)).fetchone()
     if row is None:

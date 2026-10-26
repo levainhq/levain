@@ -297,6 +297,27 @@ def test_a_re_approval_is_progress_and_restarts_the_count(store):
     c.close()
 
 
+@pytest.mark.parametrize("reason", ["fault", "subject:", "Subject:x", "subjectx:y", "", None, 7])
+def test_count_held_and_the_triggers_share_one_reason_rule(store, reason):
+    # O-a1c1-7: count_held refuses, before any write, exactly the reasons held_born refuses
+    c = raw(store)
+    subj = "request:p:link-0"
+    tx(c, ("INSERT INTO runs (run_id, binding_id, generation, seal) VALUES ('p', 'b', 0, ?)", (RUN_SEAL,)))
+    with pytest.raises(ValueError, match="count_held: reason"):
+        tx(c, lambda conn: s.count_held(conn, subj, reason))
+    with pytest.raises(sqlite3.IntegrityError, match="I11: a held count is born 1"):
+        tx(c, ("INSERT INTO held_counts (subject, n, last_reason, mark) VALUES (?, 1, ?, 0)", (subj, reason)))
+    tx(c, lambda conn: s.count_held(conn, subj, "subject:x"))
+    with pytest.raises(ValueError, match="count_held: reason"):
+        tx(c, lambda conn: s.count_held(conn, subj, reason))
+    with pytest.raises(sqlite3.IntegrityError, match="I11: a held count rises"):
+        tx(c, ("UPDATE held_counts SET n = 2, last_reason = ? WHERE subject = ?", (reason, subj)))
+    assert c.execute("SELECT n, last_reason FROM held_counts").fetchall() == [(1, "subject:x")]
+    triggers = dict(c.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'").fetchall())
+    assert all(f"GLOB '{s.SUBJECT_REASON}'" in triggers[n] for n in ("held_born", "held_move"))
+    c.close()
+
+
 def test_a_held_limit_close_needs_its_count_at_the_bound(store):
     c = raw(store)
     subj = "request:p:link-0"
