@@ -4754,6 +4754,8 @@
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const signUnb64u = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
                                             (c) => c.charCodeAt(0));
+  // unpadded base64url with a length some bytes encode to; signUnb64u is only ever handed one from the server or storage
+  const signDecodable = (t) => typeof t === "string" && /^[A-Za-z0-9_-]+$/.test(t) && t.length % 4 !== 1;
   // a cancelled Face ID and a passkey this device no longer holds both read NotAllowedError: one sentence for both
   const signDeclined = (e, what) => "the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + what;
   const signWhy = (r) => (r.body && typeof r.body.message === "string" && r.body.message) || ("refused (HTTP " + r.status + ")");
@@ -4770,6 +4772,30 @@
   }
   function signRemember(rp, fp, rawId) {
     try { const m = signMine(rp); m[fp] = rawId; window.localStorage.setItem(signMapKey(rp), JSON.stringify(m)); } catch (e) { /* kept nowhere */ }
+  }
+  function signForget(rp, fp) {
+    try { const m = signMine(rp); delete m[fp]; window.localStorage.setItem(signMapKey(rp), JSON.stringify(m)); } catch (e) { /* kept nowhere */ }
+  }
+  // after a verified signature: the record names the credential that signed, when it does not already
+  function signKeep(rp, fp, cred) {
+    if (!cred || !cred.rawId || typeof rp !== "string" || !rp) return;
+    const id = signB64u(cred.rawId);
+    if (signMine(rp)[fp] !== id) signRemember(rp, fp, id);
+  }
+  // The passkey prompt for `fp` on rpId `rp` (the challenge's), `pk` without allowCredentials: asks for `rawId`'s passkey
+  // when that id decodes, else for none (the OS's own list), never a throw. An id this browser remembered that does not
+  // decode is forgotten; one the authenticator refuses (NotAllowedError, which a passkey since removed reads as, and a
+  // cancel too) is asked once more with no id, and stays remembered until a passkey signs (signKeep replaces it)
+  function signAsk(pk, rp, fp, rawId) {
+    const local = !!rawId && typeof rp === "string" && signMine(rp)[fp] === rawId;
+    const id = rawId && signDecodable(rawId) ? signUnb64u(rawId) : null;
+    if (rawId && !id && local) signForget(rp, fp);
+    const ask = (allow) => navigator.credentials.get({ publicKey: Object.assign({}, pk,
+      allow ? { allowCredentials: [{ type: "public-key", id: allow }] } : {}) });
+    return ask(id).catch((e) => {
+      if (!(e && e.name === "NotAllowedError" && id && local)) throw e;
+      return ask(null);
+    });
   }
   function signHeaders(post) {
     const t = window.LevainCockpitTransport;
@@ -4832,12 +4858,12 @@
     say(choice !== undefined ? "asking for the challenge for (" + choice + ")…" : "asking for the challenge…");
     return signCall(base + "challenge", body).then((c) => {
       if (!c.ok) { say(signWhy(c), "bad"); return { done: "unsigned" }; }
+      if (!c.body || !signDecodable(c.body.challenge)) { say("the cockpit sent a malformed challenge; nothing was signed", "bad"); return { done: "unsigned" }; }
       // the exact line the signature appends, from the server's bytes: what is shown is what is signed
       if (typeof c.body.line === "string") line = c.body.line;
       say("confirm with your passkey to sign…" + (line ? " " + line : ""));
-      const pk = { challenge: signUnb64u(String(c.body.challenge || "")), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
-      if (rawId) pk.allowCredentials = [{ type: "public-key", id: signUnb64u(rawId) }];
-      return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+      const pk = { challenge: signUnb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+      return signAsk(pk, c.body.rp_id, fp, rawId).then((cred) => {
         say("verifying the signature…");
         sent = true;
         // raw_id: the credential that signed, which the cockpit records as this key's once the signature verifies
@@ -4847,9 +4873,12 @@
         return signCall(base + "answer", answer).then((a) => {
           if (!a.ok && a.status >= 400 && a.status < 500) { say("not signed: " + signWhy(a), "bad"); return { done: "unsigned" }; }
           if (!a.ok) { say("not sure this was signed (" + signWhy(a) + "): check the list", "bad"); return { done: "unsure" }; }
-          if (!rawId && cred.rawId && typeof c.body.rp_id === "string") signRemember(c.body.rp_id, fp, signB64u(cred.rawId));
-          say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + a.body.signer_fp + " in " + a.body.namespace
-              + (line ? ": " + line : ""), "ok");
+          signKeep(c.body.rp_id, fp, cred);
+          // the reply's fields where it names them, else what was sent; a part neither names is left out
+          const chose = typeof a.body.choice === "string" && a.body.choice ? a.body.choice : choice;
+          const by = typeof a.body.signer_fp === "string" && a.body.signer_fp ? a.body.signer_fp : fp;
+          const ns = typeof a.body.namespace === "string" && a.body.namespace ? " in " + a.body.namespace : "";
+          say("signed" + (chose ? " (" + chose + ")" : "") + " · by " + by + ns + (line ? ": " + line : ""), "ok");
           return { done: "signed", line: line };
         });
       }, (e) => { say(signDeclined(e, "nothing was signed"), "bad"); return { done: "unsigned" }; });
@@ -4870,6 +4899,8 @@
     const signers = Array.isArray(listing.signers) ? listing.signers : [];
     const rp = (listing.origin || "").replace(/^https?:\/\//, "").replace(/:\d+$/, "");
     const local = signMine(rp);
+    // an entry that cannot be an id (empty, null, not text) names no passkey: it is dropped before it decides who signs
+    for (const k of Object.keys(local)) if (!signDecodable(local[k])) { signForget(rp, k); delete local[k]; }
     const held = listing.credentials && typeof listing.credentials === "object" ? listing.credentials : {};
     const idOf = (fp) => (Object.prototype.hasOwnProperty.call(local, fp) ? local[fp]
       : (Object.prototype.hasOwnProperty.call(held, fp) && held[fp] && typeof held[fp].credential_id === "string"
@@ -4942,6 +4973,7 @@
         signBusy++;
         lock(true);
         let done = "unsigned";
+        let rearm = true;     // false: the card stays frozen (signed, or "not sure" until a read finds the version open)
         signWho(Object.assign({}, listing, { signers: signers }), acts, say)
           .then((who) => (who ? signCeremony(r, who.fp, who.rawId, choice, words, say) : { done: "unsigned" }),
                 () => { say(SIGN_PICK_CLOSED, "bad"); return { done: "unsigned" }; })
@@ -4953,23 +4985,41 @@
           })
           .then((out) => {
             done = out.done;
-            // only a signature spends the words. "Not sure" keeps them, frozen until a read of the request by its id
-            // shows it still open (so nothing was signed); a request no longer open keeps them frozen, and a redrawn
-            // card offers them again only if it is still open
-            if (out.done === "signed") { signWriteIns.delete(id); return undefined; }
+            // only a signature spends the words. "Not sure" keeps them and every button frozen until a read of the
+            // request by its id shows the same version still open twice running; anything else leaves the card
+            // frozen and says so, and the board reads again below (a redrawn card offers the words only if still open)
+            if (out.done === "signed") { signWriteIns.delete(id); rearm = false; return undefined; }
             if (out.done === "unsigned") { if (freeze) freeze.release(); return undefined; }
-            return signOne(id).then((one) => { if (one.request && one.request.sha256 === r.sha256 && freeze) freeze.release(); });
+            rearm = false;
+            const said = (signNotes.get(id) || [""])[0];
+            const readOne = () => Promise.resolve().then(() => signOne(id)).catch((e) => ({ error: "the read failed (" + ((e && e.name) || "error") + ")" }));
+            const stillOpen = (one) => !!one.request && one.request.sha256 === r.sha256 && !one.request.refused;
+            const settled = (one) => say(said + (one.error ? "; where it stands could not be read (" + one.error + ")"
+              : one.request ? "; the request changed while it was being signed" : "; the request is no longer open")
+              + ": the board reads it again", "bad");
+            // one open read does not show nothing was signed: the answer may still be verifying. The card stays frozen,
+            // and comes back only if a second read, after the board's own delay, finds the same version still open
+            return readOne().then((first) => {
+              if (!stillOpen(first)) return settled(first);
+              say(said + "; the request reads open now; not confirmed", "bad");
+              return new Promise((res) => setTimeout(res, 1500)).then(readOne).then((second) => {
+                if (!stillOpen(second)) return settled(second);
+                rearm = true;
+                if (freeze) freeze.release();
+                return say(said + "; the request still reads open on a second read: sign it again", "bad");
+              });
+            });
           })
           .catch(() => { /* the ceremony said what happened; the lease is released below */ })
           .finally(() => {
             signBusy--;
             for (const p of acts.querySelectorAll(".sign-pick")) p.remove();
-            lock(false);
+            lock(!rearm);
             signListed = null;
             // a signed (or not-knowable) answer may have closed the request: the board reads again (a row its caller has
             // answered leaves). A definite "nothing was signed" changed nothing, so nothing is read again under the operator
             const t = window.LevainCockpitTransport;
-            if (done !== "unsigned" && t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
+            if (done !== "unsigned" && !rearm && t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
           });
       };
       const options = Array.isArray(r.options) ? r.options : [];
@@ -5894,8 +5944,7 @@
           }
           say("confirm with your passkey to revoke… " + c.body.line);
           const pk = { challenge: want, rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
-          if (who.rawId) pk.allowCredentials = [{ type: "public-key", id: signUnb64u(who.rawId) }];
-          return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+          return signAsk(pk, c.body.rp_id, who.fp, who.rawId).then((cred) => {
             if (!cred || !cred.response) { say("not revoked: the passkey gave nothing to send; nothing was revoked", "bad"); return; }
             say("verifying the signature…");
             sent = true;
@@ -5912,7 +5961,7 @@
                 return;
               }
               if (!r.ok) { grantSaid = "not revoked " + g.id + ": " + signWhy(r); say(grantSaid, "bad"); return; }
-              if (!who.rawId && cred.rawId && typeof c.body.rp_id === "string") signRemember(c.body.rp_id, who.fp, signB64u(cred.rawId));
+              signKeep(c.body.rp_id, who.fp, cred);
               revoked = true;
               grantSaid = "revoked " + ((typeof g.id_shown === "string" && g.id_shown) || g.id) + " · link seq " + r.body.seq + (r.body.warning ? " · " + r.body.warning : "");
               say(grantSaid, "ok");

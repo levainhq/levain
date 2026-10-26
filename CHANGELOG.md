@@ -22,6 +22,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **`levain daemon install-feeds` runs the review queue's feed pass on a schedule, with no model.** The pass is
   `levain coord review feeds`. Each run is bounded in whole seconds by the operating system, covering the whole command,
   and skips if another is still running; a run that finds nothing new adds no record.
+- **The cockpit's sign card no longer says nothing was signed after one read.** When an answer's reply is lost it stays
+  frozen, reads the request twice, and comes back only if it is still open both times. Cancelling a passkey prompt on
+  the card keeps the remembered passkey.
 - **`levain binding graduate` says what is missing, and still exits 1.** It names the autonomic store (with its path;
   `--store-dir` takes the same store `policy create` signs) and that no executor can yet run a binding effect; a store
   or gate it cannot read is reported as a reason, not a traceback. `levain binding policy create --help` says that
