@@ -18,6 +18,7 @@ re-runs through the install helper.
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import functools
 import json
@@ -929,6 +930,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         *slot_state_undo_steps(host, slots_of(uids), store=live.at(STORE[host])),
         *pool_config_undo_steps(host),
         *policy_limits_undo_steps(host, live),
+        *authority_signers_undo_steps(host, live),
         Step(f"create {path.parent}", (mkdir, "-p", "-m", "755", str(path.parent))),
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
         *remove(of("account/1"), "R7"),             # per account: its processes ended and proven, then the tombstone
@@ -2552,6 +2554,17 @@ def policy_limits_undo_steps(host: HostOS, live: RM.Live) -> list[Step]:
                            lambda: live.act((rm, "-f", RM.at(live, path))), tools=(rm,))]
 
 
+def authority_signers_undo_steps(host: HostOS, live: RM.Live) -> list[Step]:
+    """Undo's removal of root's allowed-signers file (:func:`levain.slot.root_tree.authority_signers_path`), so a
+    later setup for another operator does not inherit the keys root listed for this one. OURS by path and owner alone
+    (:func:`levain.slot.removal.root_file`); a link or another owner's entry there is left. The live read first."""
+    path = root_tree.authority_signers_path(host)
+    rm = "/bin/rm" if host == "darwin" else _abs("rm")
+    return [RM.remove_step(f"remove root's authority signers {path}", ("authority-signers", str(path)), live,
+                           lambda: RM.root_file(live, path),
+                           lambda: live.act((rm, "-f", RM.at(live, path))), tools=(rm,))]
+
+
 # --- routes-base and routes-trust (3c design §2.3, Q15 r3; 3c-9) -------------------------------------------------
 
 #: Q15 r3: the stdin of ``routes-trust``, exactly these keys, canonical bytes.
@@ -2822,7 +2835,7 @@ def is_passkey_material(public_key: str) -> bool:
         wire.string()                  # point
         application = wire.string()
         wire.end()
-    except (ValueError, struct.error):
+    except (ValueError, IndexError, struct.error):
         return False
     return not application.startswith(b"ssh:")
 
@@ -2860,15 +2873,129 @@ def blob_fingerprint(public_key: str) -> str | None:
     return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii").rstrip("=")
 
 
+def _quoted_split(text: str, sep: str | None) -> list[str] | None:
+    """``text`` split outside double quotes, on whitespace runs (``sep`` None) or on ``sep``; None for an
+    unterminated quote (``levain.autonomic.coverage``'s ``_fields`` / ``_options``, written here for root)."""
+    out: list[str] = []
+    cur: list[str] = []
+    quoted = False
+    for ch in text:
+        if ch == '"':
+            quoted = not quoted
+            cur.append(ch)
+        elif not quoted and (ch.isspace() if sep is None else ch == sep):
+            if cur or sep is not None:
+                out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if quoted:
+        return None
+    if cur or sep is not None:
+        out.append("".join(cur))
+    return out
+
+
+def _signer_fields(raw: bytes) -> tuple[str, str | None, str] | None:
+    """A line of root's file in the allowed-signers structure: ``(principals, options or None, "<type> <base64>")``,
+    the principals unquoted; None for a blank or ``#`` line, or one that does not parse. Only the key field is the
+    key: a word after it is the line's comment and is never read, so a key named in a comment is no line's key.
+    ``raw`` is UTF-8 (:func:`_read_signers` refuses a file that is not)."""
+    text = raw.decode("utf-8").strip()
+    if not text or text.startswith("#"):
+        return None
+    parts = _quoted_split(text, None)
+    if parts is None or len(parts) < 3:
+        return None
+    principals, rest = parts[0], parts[1:]
+    if len(principals) >= 2 and principals[0] == principals[-1] == '"':
+        principals = principals[1:-1]
+    options = None
+    if rest[0] not in KEY_TYPE_NAMES:
+        options, rest = rest[0], rest[1:]
+    if len(rest) < 2 or rest[0] not in KEY_TYPE_NAMES or not _BLOB_RE.fullmatch(rest[1]):
+        return None
+    return principals, options, f"{rest[0]} {rest[1]}"
+
+
 def _line_keys(raw: bytes) -> tuple[str, ...]:
-    """Every ``<type> <base64>`` a line of root's file names (a key type the reader knows, then a base64 word), so
-    a line with options the coverage reader refuses (one ``ssh-keygen -Y verify`` may still honour) is found too. A
-    line that is not UTF-8 names none."""
+    """The key a line of root's file names (:func:`_signer_fields`), or none. A line with options the coverage reader
+    refuses (one ``ssh-keygen -Y verify`` may still honour) names its key too."""
+    fields = _signer_fields(raw)
+    return () if fields is None else (fields[2],)
+
+
+def _line_namespaces(options: str | None) -> frozenset[str] | None:
+    """The namespaces a line's options restrict it to, when they are exactly one ``namespaces="a,b"``; None for no
+    options (every namespace) or any other option."""
+    opts = None if options is None else _quoted_split(options, ",")
+    if opts is None or len(opts) != 1:
+        return None
+    name, sep, value = opts[0].partition("=")
+    if not sep or name.lower() != "namespaces" or len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        return None
+    entries = value[1:-1].split(",")
+    return frozenset(entries) if all(entries) and '"' not in value[1:-1] else None
+
+
+def _signers_owner() -> int:
+    """Who root's file and its directory must be owned by: the helper's euid (root on a host, the test's own uid
+    under the conftest owner override)."""
+    return os.geteuid()
+
+
+def _read_signers(path: Path) -> bytes | None:
+    """Root's allowed-signers file, None when absent; read only when root wrote it and only whole. The descriptor
+    read is the one checked: a regular file (``authority-signers-unreadable`` otherwise), owned by
+    :func:`_signers_owner` and writable by neither group nor others, in a directory of the same
+    (``authority-signers-unsafe``: a line another account could have written is never re-written as root's); at most
+    :data:`AUTHORITY_SIGNERS_MAX` bytes and UTF-8 throughout (``authority-signers-unreadable``: never taken as empty,
+    and ``remove`` never misses a line it cannot read). A link there is ``bad-root``."""
     try:
-        words = raw.decode("utf-8").split()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK):
+            raise Refused("bad-root", f"{path} is a link") from None
+        raise Refused("authority-signers-unreadable", f"{path}: {e.strerror or e}; nothing written") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused("authority-signers-unreadable", f"{path} is not a regular file; nothing written")
+        owner = _signers_owner()
+        if st.st_uid != owner or st.st_mode & 0o022:
+            raise Refused("authority-signers-unsafe", f"{path} is owned by uid {st.st_uid} at "
+                                                      f"{stat.S_IMODE(st.st_mode):04o}: not root's alone; nothing "
+                                                      "written, its lines are not re-written as root's")
+        try:
+            dst = os.lstat(path.parent)
+        except OSError as e:
+            raise Refused("authority-signers-unreadable", f"{path.parent}: {e.strerror or e}") from None
+        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != owner or dst.st_mode & 0o022:
+            raise Refused("authority-signers-unsafe", f"{path.parent} is not a directory root alone may write; "
+                                                      "nothing written")
+        if st.st_size > AUTHORITY_SIGNERS_MAX:
+            raise Refused("authority-signers-unreadable", f"{path} is past {AUTHORITY_SIGNERS_MAX} bytes; nothing "
+                                                          "written")
+        raw = b""
+        try:
+            while len(raw) <= AUTHORITY_SIGNERS_MAX:
+                chunk = os.read(fd, AUTHORITY_SIGNERS_MAX + 1 - len(raw))
+                if not chunk:
+                    break
+                raw += chunk
+        except OSError as e:
+            raise Refused("authority-signers-unreadable", f"{path}: {e.strerror or e}; nothing written") from None
+    finally:
+        os.close(fd)
+    if len(raw) > AUTHORITY_SIGNERS_MAX:
+        raise Refused("authority-signers-unreadable", f"{path} is past {AUTHORITY_SIGNERS_MAX} bytes; nothing written")
+    try:
+        raw.decode("utf-8")
     except UnicodeDecodeError:
-        return ()
-    return tuple(f"{t} {b}" for t, b in zip(words, words[1:]) if t in KEY_TYPE_NAMES and _BLOB_RE.fullmatch(b))
+        raise Refused("authority-signers-unreadable", f"{path} has a line that is not UTF-8; nothing written") from None
+    return raw
 
 
 def _signer_lines(raw: bytes | None) -> list[bytes]:
@@ -2925,13 +3052,17 @@ def run_authority_signer(cmd: InstallCommand, caller_uid: int, host: HostOS, *,
     (:func:`authority_key_problem`, ``authority-signer-key``) and fingerprinted by ``ssh-keygen -l``
     (``authority-signer-verifier`` when it cannot read the key, or prints another fingerprint than
     :func:`blob_fingerprint`'s, the one ``remove`` finds lines by). UNDER the lock: the operator check again (an undo
-    between the two is seen), then one read-modify-write of the file. ``enrol`` writes one line per key: a key's
-    earlier line is replaced where it stood and any further line naming that key dropped, a key with no line is
-    appended in argv order (the laptop key's first), and every other line is kept as root wrote it. ``remove`` drops
-    every line naming the key whose fingerprint ``--key`` gives (a narrowing; the file stays, listing what is left; no
-    file stays none, and its ``digest`` is None). Nothing is written when the bytes, root's owner and 0644 already
-    hold (:func:`_write_signers`). The answer names each fingerprint, also told on ``err`` to compare with ``levain
-    cockpit keys``."""
+    between the two is seen), then one read-modify-write of the file, read only when it is root's alone, whole and
+    UTF-8 (:func:`_read_signers`). A line's key is its key field alone (:func:`_signer_fields`). ``enrol`` writes one
+    line per key: a key's earlier line is replaced where it stood and any further line naming that key dropped, a key
+    with no line is appended in argv order (the laptop key's first), and every other line is kept as root wrote it.
+    A line for one of the keys whose principal is not ``--principal``, or whose options are anything but a
+    ``namespaces=`` this enrolment names all of, refuses ``authority-signer-changed`` (remove it first); a file that
+    would pass :data:`AUTHORITY_SIGNERS_MAX` refuses ``authority-signers-too-large`` before any write. ``remove``
+    drops every line naming the key whose fingerprint ``--key`` gives (a narrowing; the file stays, listing what is
+    left; no file stays none, and its ``digest`` is None). Nothing is written when the bytes, root's owner and 0644
+    already hold (:func:`_write_signers`); ``digest`` is then the file's own. The answer names each fingerprint, also
+    told on ``err`` to compare with ``levain cockpit keys``."""
     import hashlib
 
     errw = err or sys.stderr
@@ -2942,7 +3073,7 @@ def run_authority_signer(cmd: InstallCommand, caller_uid: int, host: HostOS, *,
         target = cmd.key_fingerprint
         with lock():
             _check_operator(cmd.verb, caller_uid, rs)
-            old = R.read_record(path, max_bytes=AUTHORITY_SIGNERS_MAX)
+            old = _read_signers(path)
             lines = _signer_lines(old)
             kept = [line for line in lines if not any(blob_fingerprint(k) == target for k in _line_keys(line))]
             written = old is not None and len(kept) != len(lines) and _write_signers(path, _signers_bytes(kept),
@@ -2950,9 +3081,11 @@ def run_authority_signer(cmd: InstallCommand, caller_uid: int, host: HostOS, *,
         removed = len(lines) - len(kept)
         errw.write(f"levain install-helper: {target}: {removed} line(s) removed from {path}\n")
         return {"verb": cmd.verb, "fingerprint": target, "removed": removed, "written": bool(written),
-                "digest": None if old is None else "sha256:" + hashlib.sha256(_signers_bytes(kept)).hexdigest()}
+                "digest": None if old is None else
+                "sha256:" + hashlib.sha256(_signers_bytes(kept) if written else old).hexdigest()}
 
-    assert cmd.public_key is not None and cmd.principal is not None
+    if cmd.public_key is None or cmd.principal is None:
+        raise Refused("missing-argv", f"{cmd.verb} takes --principal and --public-key")
     wanted: list[tuple[str, tuple[str, ...], str]] = []      # (key, namespaces, fingerprint), the laptop key first
     for key, passkey in ((cmd.public_key, False), *((k, True) for k in cmd.passkeys)):
         problem = authority_key_problem(key, passkey=passkey)
@@ -2965,20 +3098,31 @@ def run_authority_signer(cmd: InstallCommand, caller_uid: int, host: HostOS, *,
         ns = (AUTHORITY_NAMESPACE, CONFIRM_NAMESPACE) if cmd.confirm and not passkey else (AUTHORITY_NAMESPACE,)
         wanted.append((key, ns, fp))
     new = {key: _signer_text(cmd.principal, ns, key) for key, ns, _ in wanted}
+    namespaces = {key: ns for key, ns, _ in wanted}
     with lock():
         _check_operator(cmd.verb, caller_uid, rs)
         out: list[bytes] = []
         placed: set[str] = set()
-        for line in _signer_lines(R.read_record(path, max_bytes=AUTHORITY_SIGNERS_MAX)):
-            hit = [k for k in _line_keys(line) if k in new]
-            if not hit:
+        for n, line in enumerate(_signer_lines(_read_signers(path)), 1):
+            fields = _signer_fields(line)
+            if fields is None or fields[2] not in new:
                 out.append(line)
-            for k in hit:
-                if k not in placed:
-                    out.append(new[k])
-                    placed.add(k)
+                continue
+            principals, options, k = fields
+            had = _line_namespaces(options)
+            if principals != cmd.principal or had is None or not had <= set(namespaces[k]):
+                raise Refused("authority-signer-changed",
+                              f"line {n} lists {blob_fingerprint(k)} for {principals[:128]} with "
+                              f"{(options or 'every namespace')[:256]}; this enrolment would not keep that: "
+                              "remove-authority-signer it first, then enrol")
+            if k not in placed:
+                out.append(new[k])
+                placed.add(k)
         out.extend(new[k] for k, _, _ in wanted if k not in placed)
         data = _signers_bytes(out)
+        if len(data) > AUTHORITY_SIGNERS_MAX:
+            raise Refused("authority-signers-too-large", f"{path} would be past {AUTHORITY_SIGNERS_MAX} bytes; the "
+                                                         "earlier file stands")
         written = _write_signers(path, data, err, fsync)
     for _, ns, fp in wanted:
         errw.write(f"levain install-helper: {fp} enrolled in {path} for {','.join(ns)}; compare it with "
@@ -3589,7 +3733,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 __all__ = ["ContinueSeams", "PROBE_OUT_CAP", "PROBE_TIMEOUT_S", "adopt_lock", "exec_phase_b", "phase_b_text",
            "plan_repair_stage", "plan_repair_resume", "check_fault", "fault_hook", "FAULT_POINTS", "FAULT_STEPS", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
            "RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "CHILD_MARGIN_S", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
-           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "read_limits", "run_set_limits", "run_authority_signer", "authority_key_problem", "blob_fingerprint", "SIGNER_VERBS", "policy_limits_state", "policy_limits_undo_steps", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
+           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "read_limits", "run_set_limits", "run_authority_signer", "authority_key_problem", "blob_fingerprint", "SIGNER_VERBS", "policy_limits_state", "policy_limits_undo_steps", "authority_signers_undo_steps", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
            "quiesce_step",

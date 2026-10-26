@@ -227,7 +227,7 @@ def test_enrol_again_writes_nothing(L, keys):
 def test_a_wrong_mode_is_written_again(L, keys):
     argv = _enrol_argv("phill", keys["a"][0])
     _act(L, argv)
-    os.chmod(_path(L), 0o664)
+    os.chmod(_path(L), 0o600)            # root's alone, another mode: written again (a writable one is refused, J1)
     assert _act(L, argv)["written"] is True and stat.S_IMODE(os.lstat(_path(L)).st_mode) == 0o644
 
 
@@ -235,7 +235,7 @@ def test_enrol_updates_a_keys_line_in_place_and_keeps_every_other_line(L, keys):
     p = _path(L)
     hand = (f"# root's own note\n"
             f'other namespaces="{confirm.NAMESPACE}" {keys["b"][0]}\n'
-            f'old namespaces="{AUTHORITY_NAMESPACE}" {keys["a"][0]}\n'
+            f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["a"][0]}\n'
             f"not a line at all\n")
     p.write_text(hand)
     os.chmod(p, 0o644)
@@ -249,8 +249,8 @@ def test_enrol_updates_a_keys_line_in_place_and_keeps_every_other_line(L, keys):
 
 def test_a_second_line_for_the_same_key_is_dropped(L, keys):
     p = _path(L)
-    p.write_text(f'x namespaces="{AUTHORITY_NAMESPACE}" {keys["a"][0]}\n'
-                 f'y,z namespaces="{confirm.NAMESPACE}",cert-authority {keys["a"][0]} trailing\n')
+    p.write_text(f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["a"][0]}\n'
+                 f'"phill" namespaces="{AUTHORITY_NAMESPACE}" {keys["a"][0]} trailing\n')
     _act(L, _enrol_argv("phill", keys["a"][0]))
     assert p.read_text() == f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["a"][0]}\n'
 
@@ -562,3 +562,228 @@ def test_the_confirm_gate_verifies_against_a_confirm_line_and_not_an_authority_o
     _act(L, _enrol_argv("phill", pub, confirm_ns=True))
     assert confirm.verify_signature(msg, signature=sig, signer="phill", allowed_signers=_path(L)) is True
     assert confirm.verify_signature(msg, signature=sig, signer="other", allowed_signers=_path(L)) is False
+
+
+# --- L3 r1 (1025+43 lane-s5af): root's own file is read only when root's, whole and UTF-8 ------------------------------
+
+def _remove(L, fp, **kw):
+    return IH.run_authority_signer(parse_install_argv([REMOVE, "--key", fp]), ME, "darwin", lock=_Lock(),
+                                   store_seams=_rs(L), **kw)
+
+
+def _put(L, text: bytes | str, mode: int = 0o644) -> Path:
+    p = _path(L)
+    p.write_bytes(text.encode() if isinstance(text, str) else text)
+    os.chmod(p, mode)
+    return p
+
+
+def _held(p: Path):
+    st = os.lstat(p)
+    return p.read_bytes(), st.st_ino, stat.S_IMODE(st.st_mode)
+
+
+@pytest.mark.parametrize("mode", [0o664, 0o666, 0o646, 0o620])
+@pytest.mark.parametrize("verb", ["enrol", "remove"])
+def test_j1_a_group_or_world_writable_file_is_refused_never_laundered(L, keys, mode, verb):
+    """codex HIGH 1: a line another account wrote into a writable file is never re-written as root's 0644."""
+    p = _put(L, f'intruder namespaces="{AUTHORITY_NAMESPACE}" {keys["b"][0]}\n'
+                f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["ec"][0]}\n', mode)
+    before = _held(p)
+    with pytest.raises(Refused) as e:
+        _act(L, _enrol_argv("phill", keys["a"][0])) if verb == "enrol" else _remove(L, keys["ec"][1])
+    assert e.value.name == "authority-signers-unsafe" and _held(p) == before
+
+
+@pytest.mark.parametrize("verb", ["enrol", "remove"])
+def test_j1_a_file_another_uid_owns_is_refused(L, keys, verb, monkeypatch):
+    p = _put(L, f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["ec"][0]}\n')
+    before = _held(p)
+    real = os.geteuid()
+    monkeypatch.setattr(IH, "_signers_owner", lambda: real + 1)
+    with pytest.raises(Refused) as e:
+        _act(L, _enrol_argv("phill", keys["a"][0])) if verb == "enrol" else _remove(L, keys["ec"][1])
+    assert e.value.name == "authority-signers-unsafe" and _held(p) == before
+
+
+@pytest.mark.parametrize("verb", ["enrol", "remove"])
+def test_j1_a_writable_parent_directory_is_refused(L, keys, verb):
+    p = _put(L, f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["ec"][0]}\n')
+    before = _held(p)
+    os.chmod(p.parent, 0o775)
+    try:
+        with pytest.raises(Refused) as e:
+            _act(L, _enrol_argv("phill", keys["a"][0])) if verb == "enrol" else _remove(L, keys["ec"][1])
+    finally:
+        os.chmod(p.parent, 0o755)
+    assert e.value.name == "authority-signers-unsafe" and _held(p) == before
+
+
+def test_j2_an_enrolment_past_the_cap_is_refused_before_any_write(L, keys):
+    """codex HIGH 2: the bound holds before the rename, the earlier file in force."""
+    line = f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["ec"][0]}\n'.encode()
+    filler = b"#" * 100 + b"\n"
+    body = line + filler * ((IH.AUTHORITY_SIGNERS_MAX - len(line) - 10) // len(filler))
+    assert len(body) <= IH.AUTHORITY_SIGNERS_MAX
+    p = _put(L, body)
+    before = _held(p)
+    with pytest.raises(Refused) as e:
+        _act(L, _enrol_argv("phill", keys["a"][0]))
+    assert e.value.name == "authority-signers-too-large" and _held(p) == before
+
+
+@pytest.mark.parametrize("verb", ["enrol", "remove"])
+def test_j3_an_oversized_file_is_unreadable_never_empty(L, keys, verb):
+    """deepseek HIGH 1: a file too big to read whole is refused, never taken as empty and overwritten."""
+    line = f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["ec"][0]}\n'.encode()
+    p = _put(L, line + b"#" * IH.AUTHORITY_SIGNERS_MAX + b"\n")
+    before = _held(p)
+    with pytest.raises(Refused) as e:
+        _act(L, _enrol_argv("phill", keys["a"][0])) if verb == "enrol" else _remove(L, keys["ec"][1])
+    assert e.value.name == "authority-signers-unreadable" and _held(p) == before
+
+
+@pytest.mark.parametrize("kind", ["fifo", "dir"])
+@pytest.mark.parametrize("verb", ["enrol", "remove"])
+def test_j3_a_non_regular_entry_is_unreadable(L, keys, verb, kind):
+    p = _path(L)
+    os.mkfifo(p, 0o644) if kind == "fifo" else os.mkdir(p, 0o755)
+    with pytest.raises(Refused) as e:
+        _act(L, _enrol_argv("phill", keys["a"][0])) if verb == "enrol" else _remove(L, keys["a"][1])
+    assert e.value.name == "authority-signers-unreadable"
+    assert (stat.S_ISFIFO if kind == "fifo" else stat.S_ISDIR)(os.lstat(p).st_mode)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a 0000 file")
+@pytest.mark.parametrize("verb", ["enrol", "remove"])
+def test_j3_a_file_that_cannot_be_opened_is_unreadable(L, keys, verb):
+    p = _put(L, f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["ec"][0]}\n', 0o000)
+    try:
+        with pytest.raises(Refused) as e:
+            _act(L, _enrol_argv("phill", keys["a"][0])) if verb == "enrol" else _remove(L, keys["ec"][1])
+    finally:
+        os.chmod(p, 0o644)
+    assert e.value.name == "authority-signers-unreadable"
+    assert p.read_text() == f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["ec"][0]}\n'
+
+
+def test_j4_a_comment_naming_a_key_is_never_matched(L, keys):
+    """codex MED 3 + complement LOW 2: full-line and trailing comments name no key, for enrol or remove."""
+    keep = (f'# old laptop: {keys["b"][0]}\n'
+            f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["a"][0]} # old {keys["b"][0]}\n')
+    p = _put(L, keep)
+    got = _remove(L, keys["b"][1])
+    assert (got["removed"], got["written"]) == (0, False) and p.read_text() == keep
+    _act(L, _enrol_argv("phill", keys["b"][0]))
+    assert p.read_text() == keep + f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["b"][0]}\n'
+    got = _remove(L, keys["a"][1])
+    assert got["removed"] == 1
+    assert p.read_text() == (f'# old laptop: {keys["b"][0]}\n'
+                             f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["b"][0]}\n')
+
+
+@pytest.mark.parametrize("verb", ["enrol", "remove"])
+def test_j5_a_line_that_is_not_utf8_refuses_both_verbs(L, keys, verb):
+    """complement MED 1: remove fails closed, never a silent no-op on a line ssh-keygen may still honour."""
+    p = _put(L, f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["ec"][0]} caf'.encode() + b"\xe9\n")
+    before = _held(p)
+    with pytest.raises(Refused) as e:
+        _act(L, _enrol_argv("phill", keys["a"][0])) if verb == "enrol" else _remove(L, keys["ec"][1])
+    assert e.value.name == "authority-signers-unreadable" and _held(p) == before
+
+
+@pytest.mark.parametrize("field", ["public_key", "principal"])
+def test_j6_an_enrol_command_without_its_key_or_principal_is_refused(L, keys, field):
+    import dataclasses
+    cmd = dataclasses.replace(parse_install_argv(_enrol_argv("phill", keys["a"][0])), **{field: None})
+    lock = _Lock()
+    with pytest.raises(Refused) as e:
+        IH.run_authority_signer(cmd, ME, "darwin", lock=lock, store_seams=_rs(L))
+    assert e.value.name == "missing-argv" and lock.calls == [] and not _path(L).exists()
+
+
+@pytest.mark.parametrize("cut", [1, 5, 40, 80])
+def test_j7_a_truncated_passkey_blob_is_not_passkey_material(keys, cut):
+    import base64
+    blob = base64.b64decode(keys["pk"][0].split()[1])
+    short = f"{IH.PASSKEY_KEY_TYPE} {base64.b64encode(blob[:-cut]).decode()}"
+    assert IH.is_passkey_material(short) is False
+    assert authority.is_passkey_material(short) is False
+
+
+def test_j8_a_remove_that_writes_nothing_names_the_files_own_digest(L, keys):
+    import hashlib
+    p = _put(L, f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["a"][0]}\n\n# note')
+    got = _remove(L, keys["b"][1])
+    assert got["written"] is False and got["digest"] == "sha256:" + hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("existing,confirm_ns", [
+    (f'old namespaces="{AUTHORITY_NAMESPACE}" {{a}}', False),                     # another principal
+    (f'phill,old namespaces="{AUTHORITY_NAMESPACE}" {{a}}', False),               # a principal list
+    (f'phill namespaces="{AUTHORITY_NAMESPACE},{confirm.NAMESPACE}" {{a}}', False),  # loses levain-confirm
+    ("phill {a}", True),                                                         # no options: every namespace
+    (f'phill namespaces="{AUTHORITY_NAMESPACE}",cert-authority {{a}}', False),   # loses an option
+])
+def test_j9_a_rewrite_that_would_lose_a_principal_or_namespace_refuses(L, keys, existing, confirm_ns):
+    """complement LOW 4: remove first, then enrol."""
+    p = _put(L, existing.format(a=keys["a"][0]) + "\n")
+    before = _held(p)
+    with pytest.raises(Refused) as e:
+        _act(L, _enrol_argv("phill", keys["a"][0], confirm_ns=confirm_ns))
+    assert e.value.name == "authority-signer-changed" and _held(p) == before
+
+
+def test_j9_gaining_confirm_and_an_identical_duplicate_are_not_changes(L, keys):
+    p = _put(L, f'phill namespaces="{AUTHORITY_NAMESPACE}" {keys["a"][0]}\n'
+                f'"phill" namespaces="{AUTHORITY_NAMESPACE}" {keys["a"][0]}\n')
+    assert _act(L, _enrol_argv("phill", keys["a"][0], confirm_ns=True))["written"] is True
+    assert p.read_text() == f'phill namespaces={BOTH} {keys["a"][0]}\n'
+    assert _act(L, _enrol_argv("phill", keys["a"][0], confirm_ns=True))["written"] is False
+
+
+def _run_undo(tmp_path, put=None):
+    from levain.slot import install_helper as IH2
+    from levain.slot.grammar import parse_install_argv as parse
+    from tests.test_undo_remove import RECORD, S0, _darwin_host, _facts, _shape
+
+    h, live, shared = _darwin_host(tmp_path)
+    target = live.at(root_tree.authority_signers_path("darwin"))
+    if put is not None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        put(target)
+    plan = IH2.plan_undo(parse(["undo"]), _facts("darwin", _shape(*RECORD)), accounts={"_levain_s0": S0},
+                         shared_groups=shared, live=live, end=lambda uid, name: (True, ""))
+    whys = [s.why for s in plan.steps]
+    out = {}
+    for s in plan.steps:
+        if s.call is not None and s.write is None:
+            ok, why = s.call()
+            assert ok, (s.why, why)
+            out[s.why] = why
+    return target, whys, out, live
+
+
+_UNDO_WHY = f"remove root's authority signers {root_tree.authority_signers_path('darwin')}"
+
+
+def test_j10_undo_removes_the_authority_signers_after_the_limits(tmp_path):
+    """Lane observation 2: a later setup for another operator does not inherit root's listed keys."""
+    from levain.slot import layout
+    target, whys, _, _ = _run_undo(tmp_path, lambda p: p.write_bytes(b"phill ssh-ed25519 AAAA\n"))
+    assert not os.path.lexists(target)
+    limits = f"remove the slot limits {layout.policy_limits_path('darwin')}"
+    assert whys.index(limits) < whys.index(_UNDO_WHY) < whys.index("remove the install record")
+
+
+def test_j10_undo_with_no_authority_signers_runs_nothing_for_it(tmp_path):
+    target, _, out, _ = _run_undo(tmp_path)
+    assert not os.path.lexists(target) and out[_UNDO_WHY] == ""
+
+
+def test_j10_undo_leaves_a_link_at_the_authority_signers_in_place(tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_bytes(b"x")
+    target, _, out, live = _run_undo(tmp_path, lambda p: os.symlink(elsewhere, p))
+    assert os.path.islink(target) and elsewhere.exists() and "left in place" in out[_UNDO_WHY]
+    assert ("authority-signers", str(root_tree.authority_signers_path("darwin"))) in live.skips
