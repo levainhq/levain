@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.26] — 2026-10-25
+
 ### Added
 - **`levain chat setup` installs chat's one Node dependency** (`@anthropic-ai/sandbox-runtime` 0.0.81, pinned by
   integrity hash) into your Levain home, never globally, and records a hash of the whole installed tree. Chat needs
