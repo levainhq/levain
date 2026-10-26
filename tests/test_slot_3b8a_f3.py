@@ -7,7 +7,10 @@ F1: ``prepare_front_log`` acts below ``L/gw/`` only when it is root's alone (``s
 from __future__ import annotations
 
 import ast
+import dataclasses
 import os
+import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -92,7 +95,8 @@ def test_repair_line_is_a_command_the_install_helper_parses():
 
 @pytest.mark.parametrize("gone", ["slot0", "gw"])
 def test_a_missing_store_log_dir_is_refused_naming_repair(tmp_path, gone):
-    """An install made before b732b63a has neither ``L/gw/`` nor ``L/gw/slot<n>/``."""
+    """An install made before b732b63a has neither ``L/gw/`` nor ``L/gw/slot<n>/``. S-6: the refusal names the dir
+    that is actually missing."""
     w = _world(tmp_path)
     os.rmdir(w.L / "gw" / "slot0")
     if gone == "gw":
@@ -103,19 +107,63 @@ def test_a_missing_store_log_dir_is_refused_naming_repair(tmp_path, gone):
     line = w.main(["render", s], _blob())[1]
     assert line == {"ok": False, "refused": "store-missing"} and w.fronts.procs == {}
     assert layout.repair_line(w.seams.host) in w.last_err and "gw/slot0" in w.last_err, w.last_err
+    missed = f"{w.L}/gw is missing" if gone == "gw" else f"{w.L}/gw/slot0: the front log dir is missing"
+    assert missed in w.last_err, w.last_err
 
 
-def _doctor_store(tmp: Path, tags: dict) -> Path:
+@pytest.mark.parametrize("gone", ["slot0", "gw"])
+def test_prepare_front_log_rewrites_a_genuine_miss_naming_the_missing_dir(tmp_path, gone):
+    """S-6 positive (deepseek MED 2, LOW 6): called directly, a missing ``L/gw/slot<n>/`` or ``L/gw/`` is the
+    rewritten ``store-missing``, naming the path that failed and the repair line."""
+    w = _world(tmp_path)
+    os.rmdir(w.L / "gw" / "slot0")
+    if gone == "gw":
+        for d in (w.L / "gw").iterdir():
+            os.rmdir(d)
+        os.rmdir(w.L / "gw")
+    store = H.Store(w.seams)
+    try:
+        with pytest.raises(H.Refused) as e:
+            H.prepare_front_log(store, H.SlotId("egress", 0), 898)
+    finally:
+        store.close()
+    assert e.value.name == "store-missing"
+    assert e.value.detail.startswith(f"{w.L}/gw is missing," if gone == "gw"
+                                     else f"{w.L}/gw/slot0: the front log dir is missing"), e.value.detail
+    assert f"`{layout.repair_line(w.seams.host)}`" in e.value.detail
+
+
+def _dirs(store: Path, *rels: str, mode: int = 0o755) -> None:
+    """Make each dir below ``store`` with ``mode`` set explicitly (never the umask's)."""
+    for rel in rels:
+        p = store / rel
+        p.mkdir()
+        os.chmod(p, mode)
+
+
+def _doctor_store(tmp: Path, tags: dict, gw: tuple = ()) -> Path:
+    """A doctor store whose root and ``gw/`` (with ``gw/slot<n>`` for each ``n`` in ``gw``) have modes set
+    explicitly: the runtime's walk holds the root and ``gw/`` to ``trusted`` (no group or other write)."""
     from tests.test_doctor_slot_isolation import _store
     live = [t for t, st in tags.items() if st != "retired"]
-    return _store(tmp, tags, pool=(sum(1 for t in live if t[0] == "e"), sum(1 for t in live if t[0] == "v")))
+    store = _store(tmp, tags, pool=(sum(1 for t in live if t[0] == "e"), sum(1 for t in live if t[0] == "v")))
+    os.chmod(store, 0o755)
+    if gw:
+        _dirs(store, "gw", *(f"gw/slot{n}" for n in gw))
+    return store
+
+
+#: what the tests' seams map the front account to: an id in §1.1's linux slot range (``ids.in_own_range``), which
+#: ``chowned_uid`` maps to this test's own uid (nothing is chowned by a non-root test)
+FRONT_UID = 898
 
 
 def _test_user_seams(**over):
     """The runtime's predicates with root and the front account both mapped to this test's own uid."""
     uid = os.getuid()
     kw = dict(host="linux", trusted=lambda st: st.st_uid == uid and not st.st_mode & 0o022,
-              account_uid=lambda name: uid)
+              account_uid=lambda name: FRONT_UID, chowned_uid=lambda u: uid,
+              chown=lambda fd, u, g, rel: None, fsync=lambda fd: None)
     kw.update(over)
     return H.Seams(**kw)
 
@@ -126,93 +174,241 @@ def _front_row(store: Path, seams=None):
     return rows.get("agent front logs"), rows
 
 
+def _named(row) -> set:
+    """The slot tags the row names, from its ``<tags>: <why>`` segments."""
+    return {t for seg in re.findall(r"(?:^|: |; )((?:[ev]\d+, )*[ev]\d+): ", row.detail) for t in seg.split(", ")}
+
+
+def _runtime(store: Path, seams, n: int = 0):
+    """What render would refuse for egress slot ``n``: its account lookup (``slot_ids``), then prepare_front_log."""
+    seams = dataclasses.replace(seams, store=store)
+    st = H.Store(seams)
+    try:
+        front = H.account_in_range(seams, H.SlotId("egress", n).accounts[1])
+        H.prepare_front_log(st, H.SlotId("egress", n), front)
+        return None
+    except H.Refused as e:
+        return e.name
+    finally:
+        st.close()
+
+
 def test_doctor_reports_a_missing_slot_log_dir_with_the_repair_line(tmp_path):
-    store = _doctor_store(tmp_path, {"e0": "reusable", "e1": "leased", "e2": "retired", "v1": "reusable"})
-    (store / "gw" / "slot0").mkdir(parents=True)
+    store = _doctor_store(tmp_path, {"e0": "reusable", "e1": "leased", "e2": "retired", "v1": "reusable"}, gw=(0,))
     row, rows = _front_row(store)
     assert row is not None and not row.ok and row.upgrade_pending
-    assert "e1" in row.detail and "e0" not in row.detail and "e2" not in row.detail   # a tombstone is not counted
+    assert _named(row) == {"e1"}                                                   # a tombstone is not counted
+    assert f"{store}/gw/slot1: the front log dir is missing" in row.detail
     assert layout.repair_line("linux") in row.hint
-    assert rows["agent slots"].ok                                                      # the slots row is kept
+    assert rows["agent slots"].ok                                                  # the slots row is kept
 
 
 def test_doctor_front_log_row_green_absent_and_linked(tmp_path):
-    store = _doctor_store(tmp_path / "a", {"e0": "reusable", "e1": "reusable"})
-    for n in (0, 1):
-        (store / "gw" / f"slot{n}").mkdir(parents=True)
+    store = _doctor_store(tmp_path / "a", {"e0": "reusable", "e1": "reusable"}, gw=(0, 1))
     row, _ = _front_row(store)
     assert row.ok and not row.warn and "2 egress slot" in row.detail
     # no egress slot (a verifier-only pool): no row at all
     assert _front_row(_doctor_store(tmp_path / "b", {"v0": "reusable"}))[0] is None
-    # L/gw is a link: the runtime refuses it, so the doctor does too, never green through it
+    # L/gw is a link: the runtime refuses it (bad-root), so the doctor does too, never green and never upgrade-pending
     store = _doctor_store(tmp_path / "c", {"e0": "reusable"})
-    (tmp_path / "realgw" / "slot0").mkdir(parents=True)
+    _dirs(tmp_path, "realgw", "realgw/slot0")
     os.symlink(tmp_path / "realgw", store / "gw")
     row, _ = _front_row(store)
-    assert not row.ok and "symbolic link" in row.detail
-    # a whole store with no gw/ (made before it existed): every egress slot named
+    assert not row.ok and not row.upgrade_pending and f"{store}/gw is not a directory (bad-root)" in row.detail
+    assert _runtime(store, _test_user_seams()) == "bad-root"
+    # a whole store with no gw/ (made before it existed): every egress slot named, L/gw named as the missing dir
     store = _doctor_store(tmp_path / "d", {"e0": "reusable", "e3": "scrubbed"})
     row, _ = _front_row(store)
-    assert not row.ok and "e0, e3" in row.detail
+    assert not row.ok and row.upgrade_pending and _named(row) == {"e0", "e3"}
+    assert f"{store}/gw is missing" in row.detail
 
 
 # --- S-5: the doctor row judges L/gw and L/gw/slot<n> by the runtime's own predicates --------------------------------
 
 def test_doctor_front_row_is_red_where_the_runtime_refuses_bad_root(tmp_path):
     for plant in ("slot-group-writable", "slot-other-writable", "gw-group-writable"):
-        store = _doctor_store(tmp_path / plant, {"e0": "reusable"})
-        (store / "gw" / "slot0").mkdir(parents=True)
+        store = _doctor_store(tmp_path / plant, {"e0": "reusable"}, gw=(0,))
         if plant.startswith("slot"):
             os.chmod(store / "gw" / "slot0", 0o770 if "group" in plant else 0o707)
         else:
             os.chmod(store / "gw", 0o775)
         row, _ = _front_row(store)
-        assert not row.ok and "bad-root" in row.detail, (plant, row)
-        assert (("e0" in row.detail) if plant.startswith("slot") else (str(store / "gw") in row.detail)), row.detail
+        assert not row.ok and not row.upgrade_pending and "bad-root" in row.detail, (plant, row)
+        assert _named(row) == {"e0"}
+        assert (("gw/slot0 is not the front account's alone" if plant.startswith("slot") else f"{store}/gw (")
+                in row.detail), row.detail
 
 
 def test_doctor_front_row_is_red_for_a_wrong_owner(tmp_path):
     """Constructible through the seams the runtime reads: the front account is another uid than the dir's owner, and
     a non-root gw owner."""
-    store = _doctor_store(tmp_path / "a", {"e0": "reusable"})
-    (store / "gw" / "slot0").mkdir(parents=True)
+    store = _doctor_store(tmp_path / "a", {"e0": "reusable"}, gw=(0,))
     row, _ = _front_row(store, _test_user_seams(chowned_uid=lambda uid: uid + 1))
-    assert not row.ok and "bad-root" in row.detail and "e0" in row.detail
-    store = _doctor_store(tmp_path / "b", {"e0": "reusable"})
-    (store / "gw" / "slot0").mkdir(parents=True)
-    row, _ = _front_row(store, _test_user_seams(trusted=lambda st: False))
-    assert not row.ok and "bad-root" in row.detail and str(store / "gw") in row.detail
+    assert not row.ok and not row.upgrade_pending and "bad-root" in row.detail and _named(row) == {"e0"}
+    store = _doctor_store(tmp_path / "b", {"e0": "reusable"}, gw=(0,))
+    root = os.stat(store)                       # trusted: the store root only, so L/gw has a non-root owner
+    seams = _test_user_seams(trusted=lambda st: (st.st_dev, st.st_ino) == (root.st_dev, root.st_ino))
+    row, _ = _front_row(store, seams)
+    assert not row.ok and not row.upgrade_pending and f"{store}/gw (bad-root)" in row.detail
+
+
+def _plant(store: Path, tmp: Path, plant: str):
+    """codex's L3 r4 scenarios (and the green control) on a store with ``gw/slot0``; the seams to judge it by."""
+    gw = store / "gw"
+    if plant == "missing-front-account":
+        def gone(name):
+            raise H.Refused("account-missing", name)
+        return _test_user_seams(account_uid=gone)
+    if plant == "regular-file-gw":
+        os.rmdir(gw / "slot0")
+        os.rmdir(gw)
+        gw.write_text("")
+    elif plant == "symlinked-slot0":
+        _dirs(tmp, "real-slot0")
+        os.rmdir(gw / "slot0")
+        os.symlink(tmp / "real-slot0", gw / "slot0")
+    elif plant == "gw-0777":
+        os.chmod(gw, 0o777)
+    elif plant == "slot0-a-file":
+        os.rmdir(gw / "slot0")
+        (gw / "slot0").write_text("")
+    return _test_user_seams()
+
+
+@pytest.mark.parametrize("plant,refused", [("missing-front-account", "account-missing"),
+                                           ("regular-file-gw", "bad-root"), ("symlinked-slot0", "bad-root"),
+                                           ("gw-0777", "bad-root"), ("slot0-a-file", "bad-root"),
+                                           ("green", None)])
+def test_doctor_row_is_what_the_runtime_refuses(tmp_path, plant, refused):
+    """S-7 (codex HIGH 1, HIGH 2, MED 3, MED 4): the row is the runtime's own verdict. A refusal the runtime makes is
+    a failing row naming the slot and the refusal, and only a genuinely absent dir is upgrade-pending."""
+    store = _doctor_store(tmp_path, {"e0": "reusable"}, gw=(0,))
+    seams = _plant(store, tmp_path, plant)
+    assert _runtime(store, seams) == refused
+    row, _ = _front_row(store, seams)
+    if refused is None:
+        assert row.ok and not row.warn, row
+        return
+    assert not row.ok and not row.warn and not row.upgrade_pending, row
+    assert f"({refused})" in row.detail and _named(row) == {"e0"}, row.detail
 
 
 def test_doctor_and_runtime_agree_on_the_same_dirs(tmp_path):
     """One derivation: whatever the doctor row calls green, prepare_front_log accepts, and the reverse."""
-    for mode, ok in ((0o755, True), (0o775, False), (0o757, False)):
-        store = _doctor_store(tmp_path / f"m{mode:o}", {"e0": "reusable"})
-        (store / "gw" / "slot0").mkdir(parents=True)
-        os.chmod(store / "gw" / "slot0", mode)
-        seams = _test_user_seams(store=store, chown=lambda fd, u, g, rel: None, fsync=lambda fd: None)
-        row, _ = _front_row(store, seams)
-        st = H.Store(seams)
-        try:
-            try:
-                H.prepare_front_log(st, H.SlotId("egress", 0), os.getuid())
-                accepted = True
-            except H.Refused as e:
-                assert e.name == "bad-root"
-                accepted = False
-        finally:
-            st.close()
-        assert row.ok == accepted == ok, (mode, row)
+    for where in ("gw/slot0", "gw"):
+        for mode, ok in ((0o755, True), (0o775, False), (0o757, False)):
+            store = _doctor_store(tmp_path / where.replace("/", "-") / f"m{mode:o}", {"e0": "reusable"}, gw=(0,))
+            os.chmod(store / where, mode)
+            seams = _test_user_seams()
+            row, _ = _front_row(store, seams)
+            assert (_runtime(store, seams) is None) == row.ok == ok, (where, mode, row)
 
 
-def test_doctor_front_row_without_a_front_account_is_a_warning_not_green(tmp_path):
-    store = _doctor_store(tmp_path, {"e0": "reusable"})
-    (store / "gw" / "slot0").mkdir(parents=True)
+def test_one_row_names_every_slots_refusal(tmp_path):
+    """deepseek LOW 4/5: e0's dir missing, e1's front account missing, e3's dir wrong: one row names all three, and
+    the gw half is still walked for the slot with no account. Not upgrade-pending: two are not an absence."""
+    store = _doctor_store(tmp_path, {"e0": "reusable", "e1": "reusable", "e3": "reusable"}, gw=(1, 3))
+    os.chmod(store / "gw" / "slot3", 0o775)
+
+    def acct(name):
+        if name == "_levain_gw1":
+            raise H.Refused("account-missing", name)
+        return FRONT_UID
+    row, _ = _front_row(store, _test_user_seams(account_uid=acct))
+    assert not row.ok and not row.upgrade_pending and _named(row) == {"e0", "e1", "e3"}, row.detail
+    for why in ("(store-missing)", "_levain_gw1 (account-missing)", "gw/slot3 is not the front account's alone"):
+        assert why in row.detail, row.detail
+    # the same gw failure, met by every slot, is said once with every slot it stops
+    os.chmod(store / "gw", 0o777)
+    row, _ = _front_row(store, _test_user_seams(account_uid=acct))
+    assert f"e0, e1, e3: {store}/gw (bad-root)" in row.detail, row.detail
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root reads a mode-0 dir")
+def test_an_unreadable_front_log_dir_is_a_warning_never_absent_or_green(tmp_path):
+    store = _doctor_store(tmp_path, {"e0": "reusable"}, gw=(0,))
+    os.chmod(store / "gw", 0)
+    try:
+        row, _ = _front_row(store)
+    finally:
+        os.chmod(store / "gw", 0o755)
+    assert row.ok and row.warn and not row.upgrade_pending and "could not be read" in row.detail, row
+    assert "e0 (permission denied" in row.detail
+
+
+def test_doctor_front_row_without_a_front_account_fails_naming_the_slot(tmp_path):
+    """codex HIGH 1: render refuses ``account-missing`` (``slot_ids``), so the row fails, never a warning or green."""
+    store = _doctor_store(tmp_path, {"e0": "reusable", "e1": "reusable"}, gw=(0, 1))
 
     def gone(name):
-        raise H.Refused("account-missing", name)
+        if name == "_levain_gw1":
+            raise H.Refused("account-missing", name)
+        return FRONT_UID
     row, _ = _front_row(store, _test_user_seams(account_uid=gone))
-    assert row.ok and row.warn and "not checked" in row.detail
+    assert not row.ok and not row.warn and not row.upgrade_pending
+    assert _named(row) == {"e1"} and "e1: _levain_gw1 (account-missing)" in row.detail
+
+
+# --- the real seams: the default construction and account_uid's raise contract -------------------------------------
+
+def test_the_doctor_builds_the_runtimes_default_seams_for_its_store(tmp_path, monkeypatch):
+    """deepseek MED 1: ``_check_slot_isolation()``'s production path (no host, no seams: ``_run_doctor``'s call) builds
+    ``H.Seams`` with the host it resolves and the store it reads. Nothing here reaches NSS: the one construction is
+    observed and given this test's accounts."""
+    store = _doctor_store(tmp_path, {"e0": "reusable"}, gw=(0,))
+    built = []
+    host = "darwin" if sys.platform == "darwin" else "linux"
+    # _levain_gw0 in §1.1's slot range on each host (the front-wiring tests' darwin id; FRONT_UID on linux)
+    base = _test_user_seams(account_uid=lambda name: {"linux": FRONT_UID, "darwin": 3998}[host])
+
+    def seams(**kw):
+        built.append(kw)
+        return dataclasses.replace(base, **kw)
+    monkeypatch.setattr(H, "Seams", seams)
+    rows = {r.name: r for r in doctor._check_slot_isolation(store=store, free_bytes=lambda p: 100 << 30)}
+    assert built == [{"host": host, "store": store}]
+    row = rows["agent front logs"]
+    assert row.ok and not row.warn, row
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="the test store is root's when root runs it")
+def test_the_real_default_seams_refuse_a_store_root_does_not_own(tmp_path):
+    """The default ``H.Seams`` unpatched: the test's store is not root's, so the runtime refuses it ``bad-root``
+    before any account is read, and the doctor row says the same (no exception, a failing row)."""
+    store = _doctor_store(tmp_path, {"e0": "reusable"}, gw=(0,))
+    with pytest.raises(H.Refused) as e:
+        H.Store(H.Seams(store=store))
+    assert e.value.name == "bad-root"
+    row = {r.name: r for r in doctor._check_slot_isolation(store=store,
+                                                           free_bytes=lambda p: 100 << 30)}["agent front logs"]
+    assert not row.ok and not row.upgrade_pending and "(bad-root)" in row.detail, row
+
+
+def test_the_real_account_uid_raises_only_refused_for_a_missing_account(monkeypatch):
+    """deepseek MED 3: the default ``Seams.account_uid`` is ``_account_uid``, which turns ``pwd``'s ``KeyError`` (the
+    one miss ``pwd.getpwnam`` reports) into ``Refused("account-missing")``."""
+    import pwd
+
+    assert H.Seams().account_uid is H._account_uid
+
+    def miss(name):
+        raise KeyError(name)
+    monkeypatch.setattr(pwd, "getpwnam", miss)
+    with pytest.raises(H.Refused) as e:
+        H.Seams().account_uid("_levain_gw0")
+    assert e.value.name == "account-missing" and e.value.detail == "_levain_gw0"
+
+
+@pytest.mark.parametrize("exc", [KeyError("_levain_gw0"), OSError(5, "Input/output error")])
+def test_an_account_lookup_that_raises_otherwise_is_could_not_be_read(tmp_path, exc):
+    """A seam that raises what is not a ``Refused`` (a directory service fault) is said as unreadable: the row warns,
+    the doctor goes on."""
+    store = _doctor_store(tmp_path, {"e0": "reusable"}, gw=(0,))
+
+    def broken(name):
+        raise exc
+    row, _ = _front_row(store, _test_user_seams(account_uid=broken))
+    assert row.ok and row.warn and "could not be read: e0 (" in row.detail, row
 
 
 # --- S-6: only the gw / gw/slot<n> miss is rewritten as the missing front log dir -------------------------------------
