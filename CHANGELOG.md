@@ -47,6 +47,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   credentials. `levain.chat_egress.report` reads one launch's rows and the glue's event file into the wall total (exact
   after a clean end, marked unknown or crashed after a crash), per-reason counts, duplicate rows, and the path,
   credential-in-query and cap counts. No `levain` command prints it yet.
+- **Dispatch can follow the control plane's session events.** It reads them from a cursor it keeps across restarts
+  (never moved backward), records a verifier's result from them and acknowledges it (`ARTIFACT-ACK`) only when dispatch
+  holds that outcome, so the reaper can clear a finished session early. It recognises a repeated verifier refusal only by
+  its ticket and outcome, stops on a run already holding another report or on a malformed or off-schema event before
+  anything is written, reports a gap in the event stream with the count of events lost, and wakes a read waiting on its
+  deadline when closed. Nothing runs it yet.
+- **Before dispatch acknowledges a finished run's exported artifact, it takes it:** it copies the bundle into its own
+  store under the bundle's digest, checks it against the digest the export names, syncs every directory, and records
+  it. When the machine (not the artifact) fails to read the export, the follower stops by name and tries again on its
+  next step; an artifact that can never be taken (missing bundle, wrong digest) is set aside after three tries, without
+  an acknowledgement, so it no longer blocks later events. Nothing runs it yet.
 
 ## [0.11.26] — 2026-10-25
 

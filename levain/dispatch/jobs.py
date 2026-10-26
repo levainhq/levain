@@ -122,7 +122,8 @@ if TYPE_CHECKING:
 __all__ = [
     "CAUSES", "DB_NAME", "EDGES", "FORMAT", "STATES", "TERMINAL", "UNSIGNED_LEASE", "CapabilityRefused",
     "ENVELOPE_EVIDENCE_KEYS", "EnvelopeEnd", "EnvelopeRefused", "Job", "envelope_evidence",
-    "JobStore", "JobStoreError", "AlreadyRecorded", "RecordConflict", "SignatureRefused", "Transition",
+    "JobStore", "JobStoreError", "AlreadyRecorded", "RecordConflict", "SignatureRefused", "TakeConflict", "TakenArtifact",
+    "Transition",
     "TransitionRefused", "default_dispatch_dir", "report_of",
 ]
 
@@ -239,6 +240,10 @@ class AlreadyRecorded(TransitionRefused):
     the job)."""
 
 
+class TakeConflict(DispatchError):
+    """A taken artifact is already recorded for this (session, ticket) with other digests."""
+
+
 class RecordConflict(TransitionRefused):
     """:meth:`JobStore.record_verification` refused an event whose run already holds a record of another report or of
     another ticket, or whose ticket already failed the job with another outcome."""
@@ -320,6 +325,19 @@ class EnvelopeEnd:
     :meth:`JobStore.stop_recorded` with cause ``envelope_ended`` (their write files stay held until then)."""
     failed: tuple[str, ...]
     to_stop: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TakenArtifact:
+    """An executor artifact dispatch holds: ``path`` is the bundle copy relative to the store directory (None for an
+    artifact that names no bundle, where ``bundle_digest`` is None too)."""
+    session: str
+    ticket: str
+    manifest_digest: str
+    bundle_digest: str | None
+    path: str | None
+    files: int
+    bytes: int
 
 
 @dataclass(frozen=True)
@@ -481,6 +499,21 @@ _SCHEMA = (
     "CREATE TRIGGER IF NOT EXISTS verifier_refusals_no_replace BEFORE INSERT ON verifier_refusals "
     "WHEN EXISTS (SELECT 1 FROM verifier_refusals WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a verifier refusal is never replaced'); END",
+    # the executor artifacts dispatch TOOK before it acknowledged them (levain.dispatch.take): per (session, ticket)
+    # the digests the export named, and the path under the store directory of the bundle copy whose bytes were
+    # checked against bundle_digest (both null for an artifact that names no bundle); once, never replaced
+    "CREATE TABLE IF NOT EXISTS artifact_takes (session TEXT NOT NULL, ticket TEXT NOT NULL, "
+    "manifest_digest TEXT NOT NULL, bundle_digest TEXT, path TEXT, files INTEGER NOT NULL, bytes INTEGER NOT NULL, "
+    "at TEXT NOT NULL, PRIMARY KEY (session, ticket), CHECK ((bundle_digest IS NULL) = (path IS NULL)))",
+    *_append_only("artifact_takes", "a taken artifact is recorded once"),
+    "CREATE TRIGGER IF NOT EXISTS artifact_takes_no_replace BEFORE INSERT ON artifact_takes "
+    "WHEN EXISTS (SELECT 1 FROM artifact_takes WHERE (session = NEW.session AND ticket = NEW.ticket) "
+    "OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a taken artifact is never replaced'); END",
+    # takes that failed for a reason that will not mend (levain.dispatch.follow bounds them): per (session, ticket) how
+    # many times and why; `parked` once the follower gave up and moved the cursor on without acknowledging
+    "CREATE TABLE IF NOT EXISTS artifact_take_failures (session TEXT NOT NULL, ticket TEXT NOT NULL, "
+    "failures INTEGER NOT NULL CHECK (failures >= 1), reason TEXT NOT NULL, parked INTEGER NOT NULL "
+    "CHECK (parked IN (0, 1)), at TEXT NOT NULL, PRIMARY KEY (session, ticket))",
     # dispatch's SESSION-EVENTS cursor (CONTRACT §3.6 "dispatch persists its cursor"): at most one row, the journal
     # the cursor belongs to and the last seq the follower finished (levain.dispatch.follow); rewritten, never appended
     "CREATE TABLE IF NOT EXISTS event_cursor (one INTEGER PRIMARY KEY CHECK (one = 1), journal_id TEXT NOT NULL, "
@@ -824,6 +857,62 @@ class JobStore:
         """Forget the cursor (its journal is gone: the follower restarts from 0)."""
         with self._write() as conn:
             conn.execute("DELETE FROM event_cursor")
+
+    # --- the executor artifacts dispatch took (levain.dispatch.take) -----------------------------------------------
+    def taken_artifact(self, session: str, ticket: str) -> TakenArtifact | None:
+        """The artifact dispatch recorded as taken for ``session`` and ``ticket``; None if it took none."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT session, ticket, manifest_digest, bundle_digest, path, files, bytes "
+                               "FROM artifact_takes WHERE session = ? AND ticket = ?", (session, ticket)).fetchone()
+        finally:
+            conn.close()
+        return None if row is None else TakenArtifact(*row)
+
+    def record_take(self, taken: TakenArtifact) -> bool:
+        """Record ``taken`` in one transaction, once per (session, ticket): True when written now, False when the same
+        record is already held (a repeat), :class:`TakeConflict` when this (session, ticket) is held with other
+        digests or another path."""
+        with self._write() as conn:
+            row = conn.execute("SELECT session, ticket, manifest_digest, bundle_digest, path, files, bytes "
+                               "FROM artifact_takes WHERE session = ? AND ticket = ?",
+                               (taken.session, taken.ticket)).fetchone()
+            if row is not None:
+                if TakenArtifact(*row) != taken:
+                    raise TakeConflict("this session's ticket is already recorded as taken with other digests")
+                return False
+            conn.execute("INSERT INTO artifact_takes (session, ticket, manifest_digest, bundle_digest, path, files, "
+                         "bytes, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                         (taken.session, taken.ticket, taken.manifest_digest, taken.bundle_digest, taken.path,
+                          taken.files, taken.bytes, self._stamp()))
+            return True
+
+    def take_failure(self, session: str, ticket: str) -> tuple[int, str, bool] | None:
+        """``(failures, reason, parked)`` for a take of ``session`` and ``ticket`` that failed for a reason that does
+        not mend; None if none did."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT failures, reason, parked FROM artifact_take_failures "
+                               "WHERE session = ? AND ticket = ?", (session, ticket)).fetchone()
+        finally:
+            conn.close()
+        return None if row is None else (row[0], row[1], bool(row[2]))
+
+    def note_take_failure(self, session: str, ticket: str, reason: str, limit: int) -> tuple[int, str, bool]:
+        """Count one more failed take of (``session``, ``ticket``) for ``reason``: the record becomes ``parked`` at
+        ``limit`` failures and stays parked (a parked record is returned as it is, uncounted). Returns the record."""
+        with self._write() as conn:
+            row = conn.execute("SELECT failures, reason, parked FROM artifact_take_failures "
+                               "WHERE session = ? AND ticket = ?", (session, ticket)).fetchone()
+            if row is not None and row[2]:
+                return row[0], row[1], True
+            n = 1 if row is None else row[0] + 1
+            parked = n >= limit
+            conn.execute("INSERT INTO artifact_take_failures (session, ticket, failures, reason, parked, at) "
+                         "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session, ticket) DO UPDATE SET "
+                         "failures = excluded.failures, reason = excluded.reason, parked = excluded.parked, "
+                         "at = excluded.at", (session, ticket, n, reason, int(parked), self._stamp()))
+            return n, reason, parked
 
     @contextmanager
     def _swept(self) -> Iterator[tuple[sqlite3.Connection, str]]:
