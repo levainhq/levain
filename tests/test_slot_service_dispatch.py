@@ -2,7 +2,9 @@
 program ``levain/slot/services/dispatch.py``: the supervisor lock (W2-d DESIGN U5), the follower as its body, and the
 exits each unit manager reads (the lock loser's EX_TEMPFAIL, a SIGTERM death, EX_SOFTWARE for a 0 with no stop signal,
 EX_CONFIG for a usage error or a store of the wrong shape). The service account resolves to this test's own uid here
-(:func:`_as_the_service_account`); the refusal of every other user is ``test_slot_service_dispatch_user.py``'s."""
+(:func:`_as_the_service_account`); the refusal of root and of every other user is
+``test_slot_service_dispatch_user.py``'s. The program refuses root before its body, so as root the tests that run the
+body skip (:func:`_body`)."""
 from __future__ import annotations
 
 import errno
@@ -40,8 +42,16 @@ def _as_the_service_account(monkeypatch):
     real = H.Seams
     monkeypatch.setattr(SD.H, "Seams", lambda: real(account_uid=lambda n: ME))
 
+
+def _body() -> None:
+    """Skip, at run time, a test that runs the program past its root refusal when pytest itself runs as root: as root
+    the program exits EX_CONFIG before its body."""
+    if os.geteuid() == 0:
+        pytest.skip("the program refuses root before its body; this test needs a non-root euid")
+
 #: sha256 of each OTHER service's render on main bcb41e68 (``launchd_plist_text``, ``systemd_unit_text``; pf has no
-#: Linux unit): the on-failure change must leave every one byte-unchanged.
+#: Linux unit): the on-failure change must leave every one byte-unchanged. Since then each Linux unit's
+#: ``RestartPreventExitStatus`` also lists EX_NOPERM 77, and that line is the only change (``_at_bcb41e68``).
 _BASE_RENDERS = {
     "control": ("83f103c1d60e52f419f385bd32937619f331debbf01ea5683df517af3c8dbc50",
                 "231c2096278f0f51ed339d15dc8b8fdfafa7989e0e2e616e267995e275909c2d"),
@@ -59,6 +69,13 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def _at_bcb41e68(unit: str) -> str:
+    """A Linux unit text with its one line since bcb41e68 put back (the line must be there to be put back)."""
+    now, then = "\nRestartPreventExitStatus=78 77\n", "\nRestartPreventExitStatus=78\n"
+    assert unit.count(now) == 1, unit
+    return unit.replace(now, then)
+
+
 def test_dispatch_unit_is_on_failure_and_every_other_render_is_unchanged():
     d = units.by_name("dispatch")
     assert d.restart == "on-failure"
@@ -70,7 +87,7 @@ def test_dispatch_unit_is_on_failure_and_every_other_render_is_unchanged():
     for name, (plist, unit) in _BASE_RENDERS.items():
         assert _sha(units.launchd_plist_text(others[name])) == plist, name
         if unit is not None:
-            assert _sha(units.systemd_unit_text(others[name])) == unit, name
+            assert _sha(_at_bcb41e68(units.systemd_unit_text(others[name]))) == unit, name
 
 
 @pytest.mark.parametrize("host", ("darwin", "linux"))
@@ -94,6 +111,7 @@ def sdir(tmp_path: Path) -> Path:
 
 def _main(sdir: Path, *, wait_s: float = 0.2, rc: int = 0, signalled: bool = True):
     """main() with a fake follower that, like the real one, takes SIGTERM on its own handler when ``signalled``."""
+    _body()
     calls: list = []
     died: list = []
 
@@ -215,6 +233,7 @@ def test_a_signal_the_follower_handled_itself_still_ends_by_sigterm(sdir, signum
             signal.signal(signum, old)
         assert got == [signum]
         return 0
+    _body()
     died: list = []
     out = SD.main(["--store-dir", str(sdir), "--socket", "/x/c.sock", "--export-dir", "/x/e"], wait_s=0.2,
                   follow=follow, die=lambda: died.append(True) or -15)
@@ -225,6 +244,7 @@ def test_service_entry_runs_the_program_on_the_layout_store(capfd, monkeypatch):
     """The unit's path: ``service_boot.main(["dispatch"])`` runs the program as ``__main__`` with its own name left in
     argv; it parses (no usage error) and reaches the store check of :func:`layout.dispatch_store_dir`, which on this
     machine is absent (no install), so the program exits EX_CONFIG naming that path."""
+    _body()
     host = "darwin" if sys.platform == "darwin" else "linux"
     if layout.dispatch_store_dir(host).exists():
         pytest.skip("an installed L/dispatch on this machine")
@@ -236,6 +256,7 @@ def test_service_entry_runs_the_program_on_the_layout_store(capfd, monkeypatch):
 
 
 def test_main_parses_the_entry_argv_with_layout_defaults(monkeypatch):
+    _body()
     seen: dict = {}
 
     def fake_take(directory, *, wait_s):
@@ -249,12 +270,13 @@ def test_main_parses_the_entry_argv_with_layout_defaults(monkeypatch):
 
 def test_refuses_root(monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    assert SD.main([]) == SD.EX_WRONG_USER
+    assert SD.main([]) == SD.EX_CONFIG
 
 
 @pytest.mark.parametrize("argv", (["--store-dir", "relative"], ["--no-such-flag"]))
 def test_a_usage_error_is_ex_config(argv, capfd):
     """S3: a unit line the program cannot parse stays down (78, RestartPreventExitStatus), never 2."""
+    _body()
     assert SD.main(argv) == SD.EX_CONFIG
     assert "error:" in capfd.readouterr().err
 
@@ -299,6 +321,7 @@ def test_the_program_as_its_own_process_holds_the_lock_and_dies_by_sigterm(sdir,
     second start in this process meets the first PROCESS's lock and exits EX_TEMPFAIL; SIGTERM, sent only once the
     follower's handler is known installed (its first stop line), reaches the program through that handler (the wakeup
     fd) and ends the process by SIGTERM."""
+    _body()
     proc = subprocess.Popen([sys.executable, "-c", _AS_ACCOUNT, "--store-dir", str(sdir),
                              "--socket", str(tmp_path / "no-control.sock"), "--export-dir", str(tmp_path / "export")],
                             env=_env(), cwd=str(ROOT), stderr=subprocess.PIPE, text=True)

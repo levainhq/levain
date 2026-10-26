@@ -173,9 +173,10 @@ def systemd_unit_text(svc: Service) -> str:
         "[Service]", "Type=simple", f"User={svc.user}", f"Group={_group('linux', svc)}",
         f"ExecStart={' '.join(argv('linux', svc))}",
         *_SYSTEMD_RESTART[svc.restart],
-        # EX_CONFIG: the install lacks what the program needs (keys with no _levain_gw<n> account); a restart cannot
-        # fix it, so the unit stays down until setup or repair changes the install.
-        f"RestartPreventExitStatus={EX_CONFIG}", "",
+        # EX_CONFIG: the install lacks what the program needs (keys with no _levain_gw<n> account). EX_NOPERM 77: the
+        # program runs as a user its row does not name. A restart fixes neither, so the unit stays down until setup or
+        # repair changes the install.
+        f"RestartPreventExitStatus={EX_CONFIG} 77", "",
         "[Install]", "WantedBy=multi-user.target", "",
     ]
     return "\n".join(lines)
