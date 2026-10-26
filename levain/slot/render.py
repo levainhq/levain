@@ -163,8 +163,9 @@ class RenderFacts:
     ``route_types``: route id -> its §4.1 type, for at least every route the blob names. ``var_folders``: macOS
     only, the ``/var/folders`` subtree of each uid the profile confines (egress: the slot; verifier: child and
     driver). ``term``: ``TERM`` from the supervisor, or none. ``route_hosts``: route id -> its CONNECT hosts, read
-    beside ``route_types`` from the same base map; render uses only the hosts of the blob's ``egress`` routes (the
-    ``WebFetch(domain:)`` allows), and a route the map gives no hosts here renders no allow rule."""
+    beside ``route_types`` from the same base map (``runtime_helper.base_routes``); render uses only the hosts of the
+    blob's ``egress`` routes (the ``WebFetch(domain:)`` allows), and an egress route of the blob with no hosts here is
+    refused (:func:`egress_hosts`)."""
 
     host: HostOS
     session: str
@@ -325,18 +326,21 @@ def check_facts(blob: RenderBlob, facts: RenderFacts) -> None:
 def egress_hosts(blob: RenderBlob, facts: RenderFacts) -> tuple[str, ...]:
     """The CONNECT hosts of an egress-class session's ``egress`` routes, sorted, each through the policy parser's one
     host grammar (``policy.hosts``), so no host that is not a lowercase A-label name reaches a permission rule. A
-    none-class session has none (it renders no egress rule). A route with no ``route_hosts`` entry adds none (fail
-    closed: the fetch prompts and the front decides); a ``route_hosts`` that is not a mapping of host lists, or an
-    entry that does not parse, is refused ``bad-config``."""
+    none-class session has none (it renders no egress rule). An egress route of the blob with no ``route_hosts``
+    entry, or an empty one, is refused ``egress-route-no-hosts`` (WF-1b: the base map gives every egress route its
+    hosts, so a missing list is a defect, never a session whose on-list fetches all prompt); a ``route_hosts`` that is
+    not a mapping of host lists, or an entry that does not parse, is refused ``bad-config``."""
     if facts.slot.slot_class != "egress":
         return ()
     if not isinstance(facts.route_hosts, Mapping):
         raise Refused("bad-config", "route_hosts")
     out: set[str] = set()
     for r in blob.routes:
-        if facts.route_types.get(r) != "egress" or r not in facts.route_hosts:
+        if facts.route_types.get(r) != "egress":
             continue
-        raw = facts.route_hosts[r]
+        raw = facts.route_hosts.get(r)
+        if raw is None or (isinstance(raw, (tuple, list)) and not raw):
+            raise Refused("egress-route-no-hosts", r)
         if not isinstance(raw, (tuple, list)):
             raise Refused("bad-config", f"route_hosts {r}")
         try:
