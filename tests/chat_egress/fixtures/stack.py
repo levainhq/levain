@@ -282,3 +282,134 @@ class GlueRun:
             self.all_pids = sorted(set(self.all_pids) | set(self.proc.group_pids()))
             self.proc.stop()
             self.proc = None
+
+
+# --- the CH-D2 glue (R15-14-1's port target) --------------------------------------------------------------------------
+REBIND = {"loop": "127.0.0.2", "1918": "10.0.0.1", "ll": "169.254.169.254", "doc": "192.0.2.10",
+          "nat64": "64:ff9b::7f00:1"}
+HELD_KEY = "HELD-KEY-CHD2"
+
+
+class ProdGlueRun:
+    """The production spawn (`launch.start_egress`: `levain/chat_egress/node/glue.mjs`, the in-process decider, Levain's
+    SOCKS refuser, the closed env) over the same rig as `GlueRun` (`origin.py` on the four port stand-ins, its PKI).
+
+    What differs from the spike run, each a seam the production launch already names (`launch.GLUE_SEAMS`):
+    srt's lookups go through `--resolve-map` (every name a probe uses; the rebinding names `rb-<cls>.rb.test` answer
+    their class, `REBIND`), and the glue logs each one to its stderr (`lookups()`); the decider's own lookup is the
+    in-process `Lookup()` (a public answer for every name). One keyed route, `api.rb.test`, holds `HELD_KEY`. The real
+    `keys.decide_key` attaches only on port 443, so the rig's 443 stand-in is presented to it as 443; `key_on_plain` set
+    True also presents the plain stand-in as (https, 443): the TEST-ONLY leaky variant B12's negative control uses.
+    There are no decider frames: what the decider decided is `attempts()` (the dispatch store's rows)."""
+
+    def __init__(self, rig: Rig, name: str, *, upstream_ca: str = "origin", hostile_extra_ca: bool = False,
+                 extra_http_ports: tuple[int, ...] = (), answer: str | None = None) -> None:
+        self.rig, self.name = rig, name
+        self.upstream_ca, self.hostile_extra_ca, self.extra_http_ports = upstream_ca, hostile_extra_ca, extra_http_ports
+        self.dir = rig.root / f"prod-{name}"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.events = Jsonl(self.dir / "events.jsonl")
+        self.frames = self.obs = self.bodies = Jsonl(self.dir / "no-such-log.jsonl")     # Rig.mark() reads all four
+        self.port = 0
+        self.all_pids: list[int] = []
+        self.e = None
+        self.key_on_plain = False
+        self.answer = answer
+        self.stopped = None
+
+    @property
+    def ca(self) -> Path:
+        return self.dir / "ca.pem"
+
+    def names(self) -> dict[str, list[str]]:
+        out = {n: ["127.0.0.1"] for n in ("api.rb.test", "s.rb.test", "a.rb.test", "b.rb.test", "b7.rb.test",
+                                          "bad.rb.test", "pin-t.rb.test", "pin2-t.rb.test")}
+        out.update({f"rb-{cls}.rb.test": [addr] for cls, addr in REBIND.items()})
+        return out
+
+    def start(self) -> "ProdGlueRun":
+        import dataclasses
+
+        import pytest
+
+        from levain.chat_egress import classify, keys
+        from levain.chat_egress import decider as dm
+        from levain.chat_egress import launch as lm
+        from levain.coordinator.envelopes import EnvelopeStore
+
+        from ..decider_rig import Desk, Live, Lookup
+        from ..test_launch import real_launch
+        sys.path.insert(0, str(envmod.GLUE_DIR))
+        import decider_spike4 as spike  # noqa: E402  (its make_ca: an RSA CA srt's node-forge accepts)
+
+        p, pki = self.rig.ports, self.rig.pki
+        assert pki is not None
+        self.mp = pytest.MonkeyPatch()
+        try:
+            real_decide = keys.decide_key
+
+            def decide(route, parsed, **kw):
+                if parsed.port == p.tls:
+                    parsed = dataclasses.replace(parsed, port=443)
+                elif self.key_on_plain and parsed.port == p.http:
+                    parsed = dataclasses.replace(parsed, port=443, scheme="https")
+                return real_decide(route, parsed, **kw)
+            self.mp.setattr(keys, "decide_key", decide)
+            self.mp.setenv(lm.TEST_SEAMS_ENV, "1")
+            if self.hostile_extra_ca:                    # the PARENT's env; the glue is spawned with env={} regardless
+                self.mp.setenv("NODE_EXTRA_CA_CERTS", str(pki / "bad-ca.pem"))
+            up = {"origin": ("--upstream-ca", str(pki / "origin-ca.pem")),
+                  "bad": ("--upstream-ca", str(pki / "bad-ca.pem")), "system": ()}[self.upstream_ca]
+            http_ports = ",".join(str(x) for x in (80, p.http, *self.extra_http_ports))
+            carve = ",".join(f"127.0.0.1:{x}" for x in (p.http, p.tls, *self.extra_http_ports))
+            rmap = ";".join(f"{n}={','.join(a)}" for n, a in self.names().items())
+            route = keys.RouteSnapshot(record_id="rec-chd2", canonical_host="api.rb.test", credential_source="svc",
+                                       declared_repos=frozenset(), attach=True, credential_account="acct",
+                                       incarnation="1:chd2")
+
+            class Store:
+                reads = 0
+
+                def read(self, source, account):
+                    Store.reads += 1
+                    return HELD_KEY
+            self.store = Store()
+            self.desk = Desk()
+            estore = EnvelopeStore(self.dir / "dispatch")
+            key_pem, cert_pem = spike.make_ca()
+            self.ca.write_bytes(cert_pem)
+            self.e = lm.start_egress(
+                store=estore, launch_id=real_launch(estore), node=envmod.node_bin(), srt_prefix=envmod.srt_prefix(),
+                events=self.events.path, ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([route]), liveness=Live(),
+                credentials=keys.LaunchCredentials(self.store), cards=self.desk, mode=dm.Fixed(classify.GATED),
+                limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),
+                seams=lm.TestSeams(glue_args=("--tls-ports", f"443,{p.tls}", "--http-ports", http_ports, "--carve", carve,
+                                              "--resolve-map", rmap, *up), lookup=Lookup()))
+        except BaseException:
+            self.mp.undo()
+            raise
+        self.port = self.e.http_port
+        self.all_pids = [self.e.proc.pid]
+        return self
+
+    # --- what the probes read ----------------------------------------------------------------------------------------
+    def lookups(self) -> list[str]:
+        """srt's lookups, in order, from the glue's own test-seam trace (one stderr line per lookup)."""
+        text = self.e.stderr.read_text(errors="replace") if self.e else ""
+        return [ln.rsplit(" ", 1)[1] for ln in text.splitlines() if ln.startswith("glue: test-seam lookup ")]
+
+    def attempts(self) -> list:
+        """Every request the decider was asked about: its `egress_attempt` rows."""
+        return [r for r in self.e.records.rows(self.e.launch_id) if r.kind == "egress_attempt"]
+
+    def walls(self) -> list[dict]:
+        return [e for e in self.events.lines() if e.get("t") == "wall"]
+
+    def stop(self):
+        from levain.chat_egress import launch as lm
+        try:
+            if self.e is not None and self.stopped is None:
+                self.stopped = lm.stop_egress(self.e)
+        finally:
+            self.mp.undo()
+        return self.stopped
