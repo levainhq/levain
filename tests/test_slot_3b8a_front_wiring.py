@@ -210,3 +210,14 @@ def test_front_dir_of_another_owner_refused(tmp_path):
     line = w.main(["render", s], _blob())[1]
     assert line == {"ok": False, "refused": "bad-root"} and w.fronts.procs == {}
     assert "gw/slot0 is not the front account" in w.last_err
+
+
+def test_dispatch_session_view_drops_the_session_cap():
+    """A dispatch or planner session's file carries no max_session_microdollars (the front's dispatch-session rule);
+    the entry is otherwise the base map's (INTERIM: the pinned generation's entry is not read here)."""
+    (anth,) = H.front_session_routes(BASE_DOC, ["anthropic"], dispatch=True)
+    assert "max_session_microdollars" not in anth and "credential" not in anth and "prices" not in anth
+    (inter,) = H.front_session_routes(BASE_DOC, ["anthropic"])
+    assert inter["max_session_microdollars"] == VR.ANTHROPIC_SESSION_CAP
+    doc = {"format": FR.POLICY_FORMAT, "kind": "dispatch", "session": "s-1", "incarnation": 1, "routes": [anth]}
+    assert set(FR.load_policy(json.dumps(doc).encode()).brokered) == {"anthropic"}

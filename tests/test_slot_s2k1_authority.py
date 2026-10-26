@@ -24,7 +24,7 @@ from levain.slot import runtime_helper as H
 from levain.slot import start as SS
 from levain.slot.ids import SlotId
 from tests.test_slot_s2a_control import Env, attach_claims, mint_claims
-from tests.test_slot_s2f2_runtime_helper import OP_UID, _blob, _prepared, world  # noqa: F401 - the fixture
+from tests.test_slot_s2f2_runtime_helper import ACCOUNTS, OP_UID, _blob, _prepared, world  # noqa: F401 - the fixture
 
 S1, S2 = "s-00000000000000a1", "s-00000000000000a2"
 
@@ -555,7 +555,8 @@ def _root_check_refusing_owner_dirs(world, s: str):
     """The trusted seam as production's ``_root_trusted`` answers on this store: every dir root made passes (the test
     uid stands for root), and the session owner's vendor dirs FAIL, as they do for real (owned by the slot)."""
     owned = {os.stat(world.L / "live" / s / rel).st_ino for rel in H.SLOT_OWNED_RENDER_DIRS}
-    world.seams.chowned_uid = lambda uid: uid                           # the REAL owner check: alloc's uid as is
+    # the REAL owner check: alloc's uid as is; R/gw/slot0 is this test's, standing for the front account (3b-8a)
+    world.seams.chowned_uid = lambda uid: ME if uid == ACCOUNTS["_levain_gw0"] else uid
     return lambda st: st.st_uid == ME and not st.st_mode & 0o022 and st.st_ino not in owned
 
 

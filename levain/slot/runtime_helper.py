@@ -497,18 +497,23 @@ def gateway_front_args(host: str, slot: SlotId, *, run: Path, slot_uid: int) -> 
             "--keys", str(run / "keys" / "front.sock"), "--go-fd", str(GO_FD))
 
 
-def front_session_routes(base: Mapping[str, object], routes: Sequence[str]) -> List[dict]:
+def front_session_routes(base: Mapping[str, object], routes: Sequence[str], *,
+                         dispatch: bool = False) -> List[dict]:
     """The session's routes as the front reads them (§4.3 "the front's view"): each id's base-map entry, in the
-    blob's order, with :data:`FRONT_DROPPED_FIELDS` removed. An id with no base-map entry (a dispatch map's route,
-    whose entry is the ticket's pinned generation, §3.3 ROUTE PINNING) is refused ``front-policy-unavailable``:
-    that file is not built here."""
+    blob's order, with :data:`FRONT_DROPPED_FIELDS` removed. An id with no base-map entry is refused
+    ``front-policy-unavailable``. ``dispatch`` (a dispatch or planner session): ``max_session_microdollars`` is
+    dropped too, as a dispatch-session file carries none (the ticket's reservation is the cap, kept by keys).
+    INTERIM [judged by s3b8a, 10-26, against CONTRACT §3.3 ROUTE PINNING]: a ticketed session's brokered entry is to
+    come from the ticket's pinned generation file, its digest re-checked (``route-policy-mismatch``); render reads
+    its route types from the base map alone, so the base entry is what is copied here until that is built."""
     by_id = {r.get("route"): r for r in base.get("routes", ()) if isinstance(r, dict)}   # type: ignore[union-attr]
+    drop = FRONT_DROPPED_FIELDS + (("max_session_microdollars",) if dispatch else ())
     out: List[dict] = []
     for rid in routes:
         entry = by_id.get(rid)
         if entry is None:
             raise Refused("front-policy-unavailable", f"route {rid} has no base-map entry")
-        out.append({k: v for k, v in entry.items() if k not in FRONT_DROPPED_FIELDS})
+        out.append({k: v for k, v in entry.items() if k not in drop})
     return out
 
 
@@ -517,13 +522,15 @@ def front_policy_bytes(store: Store, a: R.Alloc, routes: Sequence[str]) -> bytes
     routes (:func:`front_session_routes` over ``L/routes/base.json``) and the incarnation, the lease's ``lease_seq``
     (render (2)'s DECISION). The front's own parser (``levain.broker.front.load_policy``) reads them here first: a
     file it would refuse is ``front-policy-refused``."""
-    from levain.broker import front as FR        # the front's closure is root's already (FRONT_MODULE); on the call
+    # on the call: the front's import closure (asyncio, h11) stays out of every other verb's start
+    from levain.broker import front as FR
 
     data = store.read(("routes",), "base.json")
     if data is None:
         raise Refused("base-map-missing", "L/routes/base.json")
-    doc = {"format": FR.POLICY_FORMAT, "kind": a.kind, "session": a.session,
-           "routes": front_session_routes(_canon_obj(data, "base-map"), routes), "incarnation": a.lease_seq}
+    routes_view = front_session_routes(_canon_obj(data, "base-map"), routes, dispatch=a.kind in FR.DISPATCH_KINDS)
+    doc = {"format": FR.POLICY_FORMAT, "kind": a.kind, "session": a.session, "routes": routes_view,
+           "incarnation": a.lease_seq}
     out = canon.canonical_bytes(doc)
     try:
         FR.load_policy(out)
