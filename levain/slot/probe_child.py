@@ -20,13 +20,14 @@ then ``end``. A child that dies, is killed by its alarm, or writes anything else
 from __future__ import annotations
 
 import errno
+import ipaddress
 import os
 import selectors
 import signal
 import socket
 import sys
 import time
-from typing import Callable, Dict, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 #: Every vendor host the probe targets is HTTPS (§8: port 443 always).
 PORT = 443
@@ -70,6 +71,23 @@ def family(ip: str) -> int:
         except (OSError, ValueError):
             continue
     raise ValueError("not a numeric address")
+
+
+def probe_address(text: str) -> Optional[str]:
+    """N8: ``text``'s canonical spelling when it is a numeric address the probe may target, else None. Dropped:
+    loopback, link-local, unspecified and multicast (an IPv4-mapped IPv6 address is judged by its IPv4 address), and
+    any scoped address (``%<zone>``). Root filters resolver answers with it; the wall's spec check requires each probe
+    address to already be in this spelling."""
+    if "%" in text:
+        return None
+    try:
+        a = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    judged = a.ipv4_mapped if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped is not None else a
+    if judged.is_loopback or judged.is_link_local or judged.is_unspecified or judged.is_multicast:
+        return None
+    return str(a)
 
 
 def connect_all(addrs: Sequence[str], *, bound_s: float = CONNECT_S,

@@ -29,7 +29,8 @@ fresh ``/dev/shm``, tmpfs, the session dir and the socket dirs) built by bwrap i
 
 Targets: ``vendor``, ``clone`` (§5.4 step 3: by the SAME path as the vendor), ``clone-check`` (the post-clone
 check's ``git`` children, §5.4 step 3 (b), by that same path), ``step`` (a verifier step, §5.6 step 2), ``driver``
-(§5.6 step 3), ``forwarder`` (Linux egress, §9.1) and ``front`` (§5.1 render (4)). The export targets
+(§5.6 step 3), ``forwarder`` (Linux egress, §9.1), ``front`` (§5.1 render (4)) and ``probe`` (V13: the firewall
+self-probe's connector, an egress slot's, under ``<S>/root/probe.sb`` on macOS). The export targets
 ``importer`` and ``verifier`` (s5 §5b) run as their own singletons (:func:`export_principal`), ROOT-launched
 through the same stage by their own spec builder (:func:`export_launch_spec`) and walls (:class:`WallFacts`).
 
@@ -76,6 +77,13 @@ EXEC_REFUSED = b"!"
 #: The forwarder's readiness pipe: spawn_target puts it on the same fd as the exec pipe; the forwarder keeps it
 #: and writes :data:`EXEC_OK` once its socket is bound and listening (EOF or :data:`EXEC_REFUSED` = not ready).
 READY_FD = EXEC_FD
+#: V13 (DESIGN_V13_REV2 §5): the probe child's result pipe, on the same fd as the exec / ready pipe (spawn_target
+#: puts its write end there); the connector module it runs (stdlib only, head ruling N3) and the profile it runs under
+#: on macOS, ``<S>/root/probe.sb`` (render's ``render_profile(..., probe=True)``). :func:`_check_spec` binds that
+#: profile to exactly this module's argv, in both directions.
+PROBE_RESULT_FD = EXEC_FD
+PROBE_MODULE = "levain.slot.probe_child"
+PROBE_PROFILE = "probe.sb"
 #: DECISION: the front's fixed argv from root (lane F3 b): at most this many strings of at most 4 KiB, no NUL.
 _FRONT_ARGS = 16
 
@@ -83,13 +91,14 @@ SPEC_CAP = 64 * 1024
 ENV_CAP = 64 * 1024
 PROFILE_CAP = 1024 * 1024
 
-TARGETS = ("vendor", "clone", "clone-check", "step", "driver", "forwarder", "front")
+TARGETS = ("vendor", "clone", "clone-check", "step", "driver", "forwarder", "front", "probe")
 #: s5 §5b: the export wall's targets, each ROOT-launched by :func:`export_launch_spec`, never by
 #: :func:`launch_spec` (which is slot-shaped). The stage runs either spec with the same machinery.
 EXPORT_TARGETS = ("importer", "verifier")
 #: §3.1 step 4: a slot child holds 0, 1, 2 + its pty; the front 0, 1, 2 + its GO pipe (§5.1 render (4)); the
-#: forwarder 0, 1, 2 + its readiness pipe; an export target 0, 1, 2 + its result pipe (s5 §5b).
-_ONE_EXTRA_FD = frozenset({"vendor", "front", "forwarder"}) | frozenset(EXPORT_TARGETS)
+#: forwarder 0, 1, 2 + its readiness pipe; an export target 0, 1, 2 + its result pipe (s5 §5b); the V13 probe
+#: 0, 1, 2 + its result pipe.
+_ONE_EXTRA_FD = frozenset({"vendor", "front", "forwarder", "probe"}) | frozenset(EXPORT_TARGETS)
 #: Only these targets carry handles or a TERM (§3.2: start adds token + cap at the VENDOR's exec).
 _EXTRA_ENV = frozenset({"vendor", "front"})
 
@@ -186,12 +195,13 @@ def export_principal(host: str, role: str, ids: Mapping[str, int], shared: Mappi
 
 
 def target_account(slot, target: str) -> str:
-    """The account a target runs as (§1, §5.4, §5.6): an egress slot's vendor, clone and forwarder run as
+    """The account a target runs as (§1, §5.4, §5.6): an egress slot's vendor, clone, forwarder and V13 probe run as
     ``_levain_s<n>``, its front as ``_levain_gw<n>``; a verifier pair's clone and steps run as the CHILD
     ``_levain_c<n>``, its driver as ``_levain_v<n>``. Any other pairing is refused."""
     first, second = slot.accounts
     if slot.slot_class == "egress":
-        table = {"vendor": first, "clone": first, "clone-check": first, "forwarder": first, "front": second}
+        table = {"vendor": first, "clone": first, "clone-check": first, "forwarder": first, "front": second,
+                 "probe": first}
     else:
         table = {"clone": second, "clone-check": second, "step": second, "driver": first}
     if target not in table:
@@ -280,6 +290,43 @@ def _check_spec(s: Spec) -> None:
         raise Refused("fd-off-list", f"{s.target} keeps {list(s.keep_fds)!r}")
     if s.exec_fd is not None and (s.exec_fd != EXEC_FD or s.target != "vendor" or s.exec_fd in s.keep_fds):
         raise Refused("spec-malformed", f"exec_fd {s.exec_fd!r}: only the vendor's, on {EXEC_FD}, never kept")
+    if s.target == "probe":
+        _check_probe_spec(s)
+    elif s.profile is not None and PurePosixPath(s.profile).name == PROBE_PROFILE:
+        raise Refused("spec-malformed", f"{s.target} under the probe profile")
+
+
+def _check_probe_spec(s: Spec) -> None:
+    """V13 (head R3, codex MED "a probe-labelled spec can run something else"): a ``probe`` spec is EXACTLY the one
+    :func:`launch_spec` builds: the root-tree module launcher running :data:`PROBE_MODULE` with
+    ``--result-fd`` :data:`PROBE_RESULT_FD` and 1 to ``probe_child.MAX_ADDRS`` distinct addresses, each already in
+    :func:`probe_child.probe_address`'s spelling; cwd ``<S>/tmp``; no env file, extra env, resolve or exec fd; the
+    one kept fd; the slot's NPROC; on macOS (the launcher's host) ``<S>/root/probe.sb``, on Linux no profile. Run by
+    the plan half and by the stage (:func:`parse_spec`), so the stage never runs a probe-labelled spec root would
+    not have built."""
+    from levain.slot.grammar import SESSION_RE
+    from levain.slot.layout import STORE
+    from levain.slot.probe_child import MAX_ADDRS, probe_address
+
+    if s.env_file is not None or s.extra_env or s.resolve or s.exec_fd is not None \
+            or s.keep_fds != (PROBE_RESULT_FD,) or s.nproc != NPROC:
+        raise Refused("spec-malformed", "probe: env, resolve, fds or nproc")
+    cwd = PurePosixPath(s.cwd)
+    S = cwd.parent
+    host = None
+    for h in ("darwin", "linux"):
+        prefix = module_argv(h, PROBE_MODULE, "--result-fd", str(PROBE_RESULT_FD))
+        if s.argv[:len(prefix)] == prefix and S.parent == PurePosixPath(str(STORE[h])) / "live":
+            host, addrs = h, s.argv[len(prefix):]
+            break
+    if host is None or cwd.name != "tmp" or not SESSION_RE.fullmatch(S.name):
+        raise Refused("spec-malformed", "probe: argv or cwd is not the connector's")
+    if not 0 < len(addrs) <= MAX_ADDRS or len(set(addrs)) != len(addrs) \
+            or any(probe_address(a) != a for a in addrs):
+        raise Refused("spec-malformed", "probe: addresses")
+    want = str(S / "root" / PROBE_PROFILE) if host == "darwin" else None
+    if s.profile != want:
+        raise Refused("spec-malformed", f"probe: profile {s.profile!r} is not {want!r}")
 
 
 def parse_spec(data: bytes) -> Spec:
@@ -393,7 +440,7 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
                 argv: Sequence[str] = (), env_file: Optional[str] = None, profile: Optional[str] = None,
                 extra_env: Optional[Mapping[str, str]] = None, keep_fds: Iterable[int] = (),
                 front_module: Optional[str] = None, exec_fd: Optional[int] = None,
-                kind: Optional[str] = None) -> Spec:
+                kind: Optional[str] = None, probe_addrs: Sequence[str] = ()) -> Spec:
     """The stage's spec for ``target`` of ``slot``'s ``session``. Every path is derived from the session id
     (§5: no argv token or stdin field is a path); ``env_file`` / ``profile`` may only name a file in the
     rendered layer ``<S>/root/`` (lane B renders them; this module takes their paths, never their text).
@@ -410,6 +457,9 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
       is child 0700, unreadable to it by design (§5.6 step 3).
     * ``forwarder`` (Linux): Levain's TCP->unix relay, cwd ``<S>/tmp``, keeping :data:`READY_FD` (its
       readiness pipe, ``--ready-fd``); ``keep_fds`` is built here, never the caller's.
+    * ``probe`` (V13, egress): :data:`PROBE_MODULE` from the root tree with ``--result-fd`` and ``probe_addrs``, cwd
+      ``<S>/tmp``, keeping :data:`PROBE_RESULT_FD`; on macOS the profile is ALWAYS ``<S>/root/probe.sb`` (any other
+      is refused); no env file. ``argv`` and ``keep_fds`` are built here, never the caller's.
     * ``front``: drop + assert only (§8.2 last sentence): no profile, no ``RLIMIT_NPROC`` (V3 is per SLOT),
       no env file; its env is ``extra_env`` alone, cwd ``/``, one extra fd (the GO pipe). ``argv`` is the front
       module's FIXED arguments, root's (never slot-supplied), appended after the module.
@@ -428,6 +478,8 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
     root_layer = S / "root"
     argv = tuple(argv)
     resolve = False
+    if tuple(probe_addrs) and target != "probe":
+        raise Refused("spec-malformed", f"{target} takes no probe addresses")
     if target == "vendor":
         prefix = PurePosixPath(str(VENDOR_PREFIX[host]))
         if not argv or not _abs_path(argv[0]) or prefix not in PurePosixPath(argv[0]).parents:
@@ -460,6 +512,16 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
         argv = module_argv(host, "levain.slot.forwarder", "--port", str(FORWARDER_PORT), "--unix", str(sock),
                            "--ready-fd", str(READY_FD))
         cwd, keep_fds = S / "tmp", (READY_FD,)
+    elif target == "probe":
+        if argv or tuple(keep_fds) or env_file is not None:
+            raise Refused("spec-malformed", "the probe builds its own argv and fds and reads no env file")
+        if host == "darwin":
+            want = str(root_layer / PROBE_PROFILE)
+            if profile is not None and profile != want:
+                raise Refused("spec-malformed", f"the probe runs only under {want}")
+            profile = want
+        argv = module_argv(host, PROBE_MODULE, "--result-fd", str(PROBE_RESULT_FD), *probe_addrs)
+        cwd, keep_fds = S / "tmp", (PROBE_RESULT_FD,)
     else:   # front
         if len(argv) > _FRONT_ARGS or not all(
                 isinstance(a, str) and "\x00" not in a and len(a.encode("utf-8", "surrogatepass")) <= _STEP_ARG_BYTES

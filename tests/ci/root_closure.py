@@ -58,6 +58,9 @@ DYNAMIC_SITES = {
     "levain/slot/wall.py::module_argv::" '"runpy.run_module(m, run_name=\'__main__\', alter_sys=True)")': (),
     "levain/slot/wall.py::launch_spec::" 'argv = module_argv(host, "levain.slot.forwarder", "--port", str(FORWARDER_PORT), "--unix", str(sock),': ("levain.slot.forwarder",),
     "levain/slot/wall.py::launch_spec::argv = module_argv(host, front_module or \"\", *argv)": "@front",
+    # V13: the probe's connector child (stdlib only), built by launch_spec and matched by the stage's spec check
+    "levain/slot/wall.py::launch_spec::" 'argv = module_argv(host, PROBE_MODULE, "--result-fd", str(PROBE_RESULT_FD), *probe_addrs)': ("levain.slot.probe_child",),
+    "levain/slot/wall.py::_check_probe_spec::" 'prefix = module_argv(h, PROBE_MODULE, "--result-fd", str(PROBE_RESULT_FD))': ("levain.slot.probe_child",),
     "levain/slot/wall.py::stage_argv::" 'return module_argv(host, "levain.slot.wall", "--spec-fd", str(spec_fd))': ("levain.slot.wall",),
     "levain/slot/wall.py::trampoline_argv::" 'return module_argv("darwin", "levain.slot.wall", "--exec-fd", str(exec_fd), "--", *argv)': ("levain.slot.wall",),
     # in-process ``importlib`` calls, none run by a root process (empty = no module seeded); each row's reason:
@@ -205,6 +208,9 @@ LAZY_SITES = {
     'levain/slot/wall.py::parse_spec::from levain.contracts import ContractError, canon': 'root',
     'levain/slot/wall.py::_session_dir::from levain.slot.grammar import SESSION_RE': 'root',
     'levain/slot/wall.py::_session_dir::from levain.slot.layout import STORE': 'root',
+    'levain/slot/wall.py::_check_probe_spec::from levain.slot.grammar import SESSION_RE': 'root',
+    'levain/slot/wall.py::_check_probe_spec::from levain.slot.layout import STORE': 'root',
+    'levain/slot/wall.py::_check_probe_spec::from levain.slot.probe_child import MAX_ADDRS, probe_address': 'root',
     'levain/slot/wall.py::module_argv::from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON, boot_path_code': 'root',
     'levain/slot/wall.py::clone_argv::from levain.slot.render import READSET_KINDS, READSET_TEMPLATE': 'root',
     'levain/slot/wall.py::clone_argv::from levain.slot.runtime_grammar import KINDS': 'root',

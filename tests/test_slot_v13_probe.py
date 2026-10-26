@@ -244,3 +244,126 @@ def test_t8_probe_sb_rendered_beside_profile_sb_same_owner_and_mode():
     blob, facts = verifier()
     paths = {f.path for f in rd.render(blob, facts).files}
     assert "root/profile.sb" in paths and "root/probe.sb" not in paths    # no probe runs in a none-class slot
+
+
+# --- T7 the wall target (R1, R8, codex MED "a probe-labelled spec can run something else") -----------------------------
+
+ADDRS = ("192.0.2.10", "2001:db8::10")
+
+
+def _wspec(host, target="probe", **kw):
+    from tests.test_slot_s2d_wall import spec
+
+    if target == "probe":
+        kw.setdefault("probe_addrs", ADDRS)
+    return spec(host, target, **kw)
+
+
+def _mutated(sp, **fields):
+    """A spec's canonical JSON with ``fields`` replaced: what a root-side regression could hand the stage."""
+    from levain.contracts import canon
+
+    obj = canon.parse(sp.to_json())
+    obj.update(fields)
+    return canon.canonical_bytes(obj)
+
+
+@pytest.mark.parametrize("host", ["darwin", "linux"])
+def test_t7_probe_spec_shape(host):
+    from levain.slot import wall
+    from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON, boot_path_code
+    from tests.test_slot_s2d_wall import IDS, S as SDIR
+
+    sp = _wspec(host)
+    boot = (f"{boot_path_code(host)}; import runpy; m = sys.argv.pop(1); "
+            "runpy.run_module(m, run_name='__main__', alter_sys=True)")
+    assert sp.argv == (ROOT_PYTHON[host], PY_FLAGS, "-c", boot, "levain.slot.probe_child",
+                       "--result-fd", "4") + ADDRS
+    assert (sp.target, sp.uid, sp.cwd, sp.keep_fds, sp.env_file, sp.extra_env, sp.exec_fd, sp.resolve) == \
+        ("probe", IDS[host]["_levain_s0"], f"{SDIR[host]}/tmp", (4,), None, (), None, False)
+    assert sp.profile == (f"{SDIR[host]}/root/probe.sb" if host == "darwin" else None)
+    assert wall.parse_spec(sp.to_json()) == sp                 # the stage takes exactly what the plan built
+    assert wall.PROBE_RESULT_FD == wall.EXEC_FD == wall.READY_FD
+
+
+def test_t7_darwin_probe_forced_onto_probe_sb_and_launched_through_asuser():
+    from levain.slot import wall
+    from tests.test_slot_s2d_wall import S as SDIR
+
+    assert _refused(_wspec, "darwin", profile=f"{SDIR['darwin']}/root/profile.sb") == "spec-malformed"
+    assert _wspec("darwin", profile=f"{SDIR['darwin']}/root/probe.sb").profile == f"{SDIR['darwin']}/root/probe.sb"
+    sp = _wspec("darwin")
+    argv = wall.macos_launch_argv(sp)
+    assert argv[:3] == (wall.LAUNCHCTL, "asuser", str(sp.uid)) and argv[3:] == wall.stage_argv("darwin")
+
+
+def test_t7_probe_sb_never_reaches_another_target():
+    from levain.slot import wall
+    from tests.test_slot_s2d_wall import S as SDIR
+
+    probe_sb = f"{SDIR['darwin']}/root/probe.sb"
+    for target in ("vendor", "clone", "clone-check", "forwarder"):
+        if target == "forwarder":
+            continue                                         # Linux only: no profile path at all
+        kw = {"argv": wall.ls_files_argv()} if target == "clone-check" else {}
+        assert _refused(_wspec, "darwin", target, profile=probe_sb, **kw) == "spec-malformed", target
+    vendor = _wspec("darwin", "vendor")
+    assert _refused(wall.parse_spec, _mutated(vendor, profile=probe_sb)) == "spec-malformed"
+
+
+def test_t7_stage_refuses_a_probe_labelled_spec_running_anything_else():
+    from levain.slot import wall
+    from tests.test_slot_s2d_wall import S as SDIR
+
+    for host in ("darwin", "linux"):
+        sp = _wspec(host)
+        argv = list(sp.argv)
+        bad_module = argv[:4] + ["levain.slot.forwarder"] + argv[5:]
+        bad_exe = ["/bin/sh"] + argv[1:]
+        other = {"darwin": "linux", "linux": "darwin"}[host]
+        for fields in ({"argv": bad_module}, {"argv": bad_exe}, {"argv": argv + ["127.0.0.1"]},
+                       {"argv": argv[:7]}, {"argv": argv + ["192.0.2.10"]}, {"argv": argv[:7] + ["fe80::1"]},
+                       {"argv": argv[:7] + ["2001:DB8::10"]},
+                       {"argv": list(wall.module_argv(other, wall.PROBE_MODULE, "--result-fd", "4", *ADDRS))},
+                       {"keep_fds": []}, {"cwd": f"{SDIR[host]}/repo"}, {"env_file": f"{SDIR[host]}/root/env"},
+                       {"nproc": None}, {"profile": f"{SDIR[host]}/root/profile.sb"},
+                       {"profile": None if host == "darwin" else f"{SDIR[host]}/root/probe.sb"},
+                       {"profile": "/private/var/levain/live/s-fedcba9876543210/root/probe.sb"}):
+            assert _refused(wall.parse_spec, _mutated(sp, **fields)) == "spec-malformed", (host, fields)
+
+
+def test_t7_probe_refusals_at_build():
+    from levain.slot import wall
+    from levain.slot.ids import SlotId
+
+    assert _refused(_wspec, "darwin", argv=["/bin/sh"]) == "spec-malformed"
+    assert _refused(_wspec, "linux", keep_fds=(4,)) == "spec-malformed"
+    assert _refused(_wspec, "darwin", probe_addrs=()) == "spec-malformed"
+    assert _refused(_wspec, "darwin", probe_addrs=("127.0.0.1",)) == "spec-malformed"
+    assert _refused(_wspec, "darwin", probe_addrs=("api.anthropic.com",)) == "spec-malformed"
+    assert _refused(_wspec, "darwin", "vendor", probe_addrs=ADDRS) == "spec-malformed"
+    assert _refused(_wspec, "darwin", slot=SlotId("none", 0)) == "bad-token"     # a none-class slot has no probe
+
+
+def test_t7_linux_probe_argv_is_the_forwarders_path():
+    from levain.slot import wall
+    from levain.slot.bwrap import LEVAIN_BWRAP
+    from tests.test_slot_s2d_wall import E0, LINKS, SESSION
+
+    sp = _wspec("linux")
+    ll = wall.linux_launch_argv(sp, slot=E0, session=SESSION, kind="interactive",
+                                netns_names=lambda: {"levain-e0"}, host_links=LINKS)
+    fwd = wall.linux_launch_argv(_wspec("linux", "forwarder"), slot=E0, session=SESSION, kind="interactive",
+                                 netns_names=lambda: {"levain-e0"}, host_links=LINKS)
+    assert ll.argv[:4] == (wall.NSENTER, "--net=/run/netns/levain-e0", "--", str(LEVAIN_BWRAP))
+    assert ll.argv == fwd.argv and ll.cgroup == fwd.cgroup == wall.cgroup_dir(E0, SESSION)
+    assert _refused(wall.linux_launch_argv, sp, slot=E0, session=SESSION, kind="interactive",
+                    netns_names=lambda: set(), host_links=LINKS) == "netns-missing"
+
+
+def test_n8_probe_address():
+    assert PC.probe_address("192.0.2.1") == "192.0.2.1"
+    assert PC.probe_address("2001:DB8::1") == "2001:db8::1"
+    for bad in ("127.0.0.1", "0.0.0.0", "::", "::1", "169.254.1.1", "fe80::1", "fe80::1%en0", "224.0.0.1",
+                "ff02::1", "::ffff:127.0.0.1", "api.anthropic.com", "", "1.2.3"):
+        assert PC.probe_address(bad) is None, bad
