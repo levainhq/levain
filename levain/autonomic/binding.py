@@ -73,8 +73,10 @@ from pathlib import Path
 from typing import Any, Iterator, Protocol, runtime_checkable
 
 from levain.autonomic.authority import AuthorityScope
-from levain.autonomic.db import AutonomicDB
+from levain.autonomic.db import DB_NAME, STORE_FORMAT_V2, AutonomicDB, StoreFormatError, _marker
+from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.journal import RunJournal, durable_replace
+from levain.autonomic.schema3 import STORE_FORMAT_V3
 from levain.autonomic.kill import Kleene, assert_kill_pure, kill_outcome
 from levain.autonomic.monitor import assert_trajectory_pure
 from levain.autonomic.posture import Posture
@@ -893,6 +895,45 @@ def _parse_json_registry(text: str) -> tuple[list[dict[str, Any]], str | None]:
     return _identified(pairs)
 
 
+class _StoreAsItIs:
+    """R14-9: the store directory's database opened as it is: no table is created, no column added, no format step
+    run, so a store with runs in flight (the store the ``/2 -> /3`` upgrade, I15, is designed to refuse) still takes
+    a pause. The store must exist
+    and carry a format whose ``bindings`` and ``fences`` tables this module writes as it writes ``/2`` (``/2`` or
+    ``/3``); any other marker, or none, is refused in every transaction and nothing is written. The same ``read`` /
+    ``write`` contract as :class:`~levain.autonomic.db.AutonomicDB`."""
+
+    FORMATS = (STORE_FORMAT_V2, STORE_FORMAT_V3)
+
+    def __init__(self, directory: Path | str) -> None:
+        self.directory = Path(directory)
+        self.path = self.directory / DB_NAME
+
+    def _connect(self) -> sqlite3.Connection:
+        if not self.path.is_file():
+            raise StoreFormatError(f"no autonomic store at {self.path}")
+        return open_durable(self.path)
+
+    @classmethod
+    def _check_format(cls, conn: sqlite3.Connection) -> None:
+        marker = _marker(conn)
+        if marker not in cls.FORMATS:
+            raise StoreFormatError(f"store format {marker!r} is not one of {', '.join(map(repr, cls.FORMATS))}: "
+                                   "nothing is written to it")
+
+    @contextmanager
+    def write(self) -> Iterator[sqlite3.Connection]:
+        with write_transaction(self._connect) as conn:
+            self._check_format(conn)
+            yield conn
+
+    @contextmanager
+    def read(self) -> Iterator[sqlite3.Connection]:
+        with read_transaction(self._connect) as conn:
+            self._check_format(conn)
+            yield conn
+
+
 class BindingStore:
     """The delegated-authority registry — "the third kind of state" (standing governance: not memory
     that accretes, not tasks that complete). The ``bindings`` table of the store directory's SQLite
@@ -907,10 +948,11 @@ class BindingStore:
     predicate before matching — it cannot trust that a stored predicate was ever validated."""
 
     def __init__(self, path: str | Path, *, validator: PredicateValidator | None = None,
-                 journal: RunJournal | None = None) -> None:
+                 journal: RunJournal | None = None, upgrade: bool = True) -> None:
         # ``path`` is the store DIRECTORY (see :mod:`levain.autonomic.db`): the registry is the
-        # ``bindings`` table of the database in it, shared with the run journal.
-        self.db = AutonomicDB(path)
+        # ``bindings`` table of the database in it, shared with the run journal. ``upgrade=False`` opens an
+        # existing store as it is, with no schema or format step (R14-9: ``levain binding pause|resume``)
+        self.db = AutonomicDB(path) if upgrade else _StoreAsItIs(path)
         self.path = self.db.directory
         self._validator = validator
         # The run journal the fire path admits runs into: the SAME database, so a pause and its fence,
