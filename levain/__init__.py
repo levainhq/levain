@@ -1,3 +1,3 @@
 """Levain — a portable cognitive-partnership memory + methodology kit."""
 
-__version__ = "0.11.26"
+__version__ = "0.11.27.dev0"
