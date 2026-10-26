@@ -22,7 +22,7 @@ from typing import Callable, Iterable, Iterator, Mapping, Optional
 
 from levain.firing.hands import HostOS, Step, _abs
 from levain.slot import Refused
-from levain.slot.layout import (HELPER_DIR, IMPORT_TREE, ROOT_GROUP, install_helper_path, runtime_helper_path,
+from levain.slot.layout import (HELPER_DIR, IMPORT_TREE, ROOT_GROUP, STORE, install_helper_path, runtime_helper_path,
                                 service_entry_path)
 
 #: The interpreter root runs (a root-owned system path, never one found on a PATH).
@@ -50,6 +50,16 @@ HELPER_MODULES = {k: v for k, v in ENTRY_MODULES.items()
 #: link, so it resolves inside the Linux wall's read-only bind of the tree too.
 CURRENT = "current"
 STAGING = "staging.partial"
+
+
+#: Root's allowed-signers file for the authority log and the confirm gate (14b DESIGN_REV2 S5): ``L/policy/``, beside
+#: the queue broker's ``allowed_signers.json``. Written only by the install helper's ``enrol-authority-signer`` and
+#: ``remove-authority-signer``; the path DESIGN_REV3 §10 S6 hands the production gate's coverage source.
+AUTHORITY_SIGNERS = "authority_signers"
+
+
+def authority_signers_path(host: HostOS) -> Path:
+    return STORE[host] / "policy" / AUTHORITY_SIGNERS
 
 
 def current_path(host: HostOS, *, tree: Path | None = None) -> Path:

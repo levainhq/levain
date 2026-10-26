@@ -19,7 +19,7 @@ from levain.slot import Refused
 
 VERBS = ("setup", "repair", "undo", "replenish", "set-retention", "set-dispatch-retain",
          "set-ceiling", "set-signers", "purge", "force-retire", "set-credential", "remove-credential", "set-limits",
-         "routes-base", "routes-trust")
+         "routes-base", "routes-trust", "enrol-authority-signer", "remove-authority-signer")
 
 #: Verbs that run with a live lease (CONTRACT §5.2); every other verb refuses ``live-lease``. The credential verbs
 #: too: keys reads a credential on demand, so a rotation takes effect on the next exchange (design 1.8 Bootstrap).
@@ -27,14 +27,26 @@ VERBS = ("setup", "repair", "undo", "replenish", "set-retention", "set-dispatch-
 #: while its lease is live (slot limits DESIGN §3).
 #: ``routes-base`` / ``routes-trust`` too (3c-9): keys re-reads ``base.json`` at every ``Q`` and CONTROL reads the trust
 #: pair at each route submission, so neither write waits for the operator's sessions to end.
+#: The authority signer verbs too (14b S5): one root file the coverage source re-reads at every refresh.
 LEASE_EXEMPT = frozenset({"purge", "force-retire", "set-credential", "remove-credential", "set-limits", "routes-base",
-                          "routes-trust"})
+                          "routes-trust", "enrol-authority-signer", "remove-authority-signer"})
 
 #: A credential's name: the pattern of :data:`levain.broker.creds.NAME_RE`, written here because the broker module
 #: needs the optional h11 and this module is imported where it may be absent; a test pins the two equal.
 CREDENTIAL_NAME_RE = re.compile(r"[a-z0-9-]{1,48}")
 
 SESSION_RE = re.compile(r"s-[0-9a-f]{16}")
+
+#: The authority signer verbs' tokens (14b S5). A key is ONE ``<type> <base64>`` (no options, no comment), the shape
+#: ``routes-trust`` takes; a principal is the confirm gate's signer pattern (``levain.autonomic.confirm._SIGNER``, a
+#: test pins the two equal) and never a key type's name (:data:`KEY_TYPE_NAMES`, the root file reader's
+#: ``levain.autonomic.coverage.KEY_TYPES``, a test pins the two equal), which that reader would take for the key.
+PUBLIC_KEY_RE = re.compile(r"([a-z0-9@.-]{1,64}) ([A-Za-z0-9+/]{1,8192}={0,2})")
+PRINCIPAL_RE = re.compile(r"[A-Za-z0-9._@+][A-Za-z0-9._@+-]{0,127}")
+FINGERPRINT_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
+KEY_TYPE_NAMES = frozenset({"ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+                            "ssh-rsa", "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"})
+MAX_PASSKEYS = 8                             # DECISION: rev 2 sets no cap
 SLOT_CLASSES = ("egress", "none")            # CONTRACT §5.1 class enum
 
 MAX_SLOTS = 32                               # CONTRACT §1.1 N cap
@@ -76,6 +88,11 @@ class InstallCommand:
     max_seconds: int | None = None
     credential: str | None = None
     source: str | None = None             # repair --source PATH (row 33, head ruling Q1)
+    principal: str | None = None          # enrol-authority-signer (14b S5)
+    public_key: str | None = None
+    passkeys: tuple[str, ...] = ()
+    confirm: bool = False                 # the laptop key's line names levain-confirm too
+    key_fingerprint: str | None = None    # remove-authority-signer --key
 
 
 def _uint(token: str, field: str, lo: int, hi: int) -> int:
@@ -178,6 +195,55 @@ def _parse_force_retire(rest: Sequence[str]) -> InstallCommand:
                           max_inodes=found.get("--max-inodes"), max_seconds=found.get("--max-seconds"))
 
 
+def _key_token(flag: str, token: str) -> str:
+    if not PUBLIC_KEY_RE.fullmatch(token):
+        raise Refused("bad-token", f"{flag}: one '<type> <base64>' key, no options and no comment")
+    return token
+
+
+def _parse_enrol_signer(rest: Sequence[str]) -> InstallCommand:
+    """``enrol-authority-signer --principal P --public-key K [--passkey K]... [--confirm]`` (14b S5): each flag once
+    but ``--passkey`` (at most :data:`MAX_PASSKEYS`), every key distinct (by its ``<type> <base64>``)."""
+    seen: dict[str, str] = {}
+    passkeys: list[str] = []
+    confirm = False
+    i = 0
+    while i < len(rest):
+        flag = rest[i]
+        if flag == "--confirm":
+            if confirm:
+                raise Refused("duplicate-flag", flag)
+            confirm = True
+            i += 1
+            continue
+        if flag not in ("--principal", "--public-key", "--passkey"):
+            raise Refused("extra-argv", repr(flag))
+        if i + 1 >= len(rest):
+            raise Refused("missing-argv", f"{flag} needs a value")
+        value = rest[i + 1]
+        if flag == "--passkey":
+            if len(passkeys) >= MAX_PASSKEYS:
+                raise Refused("out-of-range", f"at most {MAX_PASSKEYS} --passkey")
+            passkeys.append(_key_token(flag, value))
+        elif flag in seen:
+            raise Refused("duplicate-flag", flag)
+        else:
+            seen[flag] = value
+        i += 2
+    for flag in ("--principal", "--public-key"):
+        if flag not in seen:
+            raise Refused("missing-argv", flag)
+    principal = seen["--principal"]
+    if not PRINCIPAL_RE.fullmatch(principal) or principal in KEY_TYPE_NAMES:
+        raise Refused("bad-token", f"--principal: {principal[:40]!r}")
+    public_key = _key_token("--public-key", seen["--public-key"])
+    keys = [public_key, *passkeys]
+    if len(set(keys)) != len(keys):
+        raise Refused("duplicate-key", "a key may be named once")
+    return InstallCommand("enrol-authority-signer", principal=principal, public_key=public_key,
+                          passkeys=tuple(passkeys), confirm=confirm)
+
+
 def parse_install_argv(argv: Sequence[str]) -> InstallCommand:
     """``argv`` without the program name. Returns the command or raises :class:`Refused`."""
     if isinstance(argv, (str, bytes)):
@@ -209,6 +275,15 @@ def parse_install_argv(argv: Sequence[str]) -> InstallCommand:
         if not CREDENTIAL_NAME_RE.fullmatch(rest[0]):
             raise Refused("bad-token", f"credential: {rest[0]!r}")
         return InstallCommand(verb, credential=rest[0])
+    if verb == "enrol-authority-signer":
+        return _parse_enrol_signer(rest)
+    if verb == "remove-authority-signer":
+        if rest[:1] != ["--key"]:
+            raise Refused("missing-argv" if not rest else "extra-argv", "remove-authority-signer --key <SHA256:...>")
+        _exact(verb, rest, 2)
+        if not FINGERPRINT_RE.fullmatch(rest[1]):
+            raise Refused("bad-token", f"--key: {rest[1][:60]!r} is not SHA256:<43 base64>")
+        return InstallCommand(verb, key_fingerprint=rest[1])
     if verb == "repair" and rest:
         # Row 33 (head ruling Q1, a §5.2 amendment): ``repair --source PATH``, the operator's installed levain
         # package dir, checked as ``--root`` is. The helper checks ownership, the final component and links.
