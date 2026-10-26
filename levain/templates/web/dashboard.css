@@ -1704,7 +1704,19 @@ body.ke .needs-gloss { font-size: var(--fs-meta); color: var(--meta); }
 body.ke .needs-order { font-size: var(--fs-meta); color: var(--meta); text-transform: uppercase; letter-spacing: .06em; }
 body.ke .needs-history { margin-left: auto; font: var(--fw-medium) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--label); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-3); cursor: pointer; }
 body.ke .needs-history:hover { color: var(--text); border-color: var(--label); }
-body.ke .needs-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: var(--gap); margin-top: var(--sp-4); align-items: stretch; }
+body.ke .needs-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-3); margin-top: var(--sp-4); }
+/* the strip's row: one fixed height for every item (the whole item is in its focus view), the card's ring and tokens, no controls */
+body.ke .needs-row { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); box-sizing: border-box; height: 80px; min-width: 0; width: 100%; padding: 0 var(--sp-5); overflow: hidden;
+  text-align: left; font: inherit; color: var(--text); cursor: pointer; background: var(--card); border: 1px solid var(--wait-ring); border-radius: var(--r-lg);
+  box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 22%, transparent), var(--edge-hi), 0 10px 30px -14px color-mix(in oklch, var(--accent) 35%, transparent); }
+body.ke .needs-row:hover { background: var(--card-2); }
+body.ke .needs-row:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-line); }
+body.ke .needs-row-text { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; flex: 1 1 auto; }
+body.ke .needs-row-title { font: var(--fw-bold) var(--fs-title)/1.35 var(--round); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body.ke .needs-row-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 1.4em; }
+body.ke .needs-row-side { display: flex; flex-direction: column; align-items: flex-end; gap: var(--sp-1); flex: none; max-width: 40%; }
+body.ke .needs-row-side > * { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body.ke .needs-row-rec { margin-right: 0; }
 /* the waiting ring is ONE recipe with the decisions strip: a crisp 1px ring, no second border, a soft lit edge and an accent bloom below */
 body.ke .needs-card { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; padding: var(--sp-5); background: var(--card); border: 1px solid var(--wait-ring); border-radius: var(--r-lg);
   box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 22%, transparent), var(--edge-hi), 0 10px 30px -14px color-mix(in oklch, var(--accent) 35%, transparent); }
@@ -1804,7 +1816,7 @@ body.ke .needs-chip-btn:hover { border-color: var(--accent); }
 body.ke .needs-more, body.ke .needs-soonest { white-space: nowrap; flex: none; }
 body.ke .needs-open { margin-left: 0; flex: none; }
 @keyframes needs-lit { 0% { box-shadow: 0 0 0 3px var(--accent), 0 0 18px var(--accent); } 100% { box-shadow: 0 0 0 3px var(--accent-soft); } }
-body.ke .needs-card.needs-lit { animation: needs-lit 1.6s ease-out 1; }
+body.ke .needs-row.needs-lit, body.ke .needs-card.needs-lit { animation: needs-lit 1.6s ease-out 1; }
 body.ke .needs-chip-btn.needs-lit { animation: needs-lit 1.6s ease-out 1; }
 @media (max-width: 640px) { body.ke .needs-chips { flex-basis: 100%; order: 9; } }
 body.ke .ck-widgets.frame { padding-inline: 0; margin-inline: var(--gutter-ke); }

@@ -5627,6 +5627,57 @@
     host.hidden = true;
     delete host.dataset.sig;
   }
+  // The strip's row (option A, Phill 10-26): one fixed-height summary per waiting item, a single button that opens the focus view.
+  // It carries no answer control: the options, the words box, Allow/Deny and the sign row live only in the focus view, where the
+  // item is drawn whole. Line one is the question's title (a consent's tool and first words), line two what it blocks (a consent's
+  // working directory), the right edge the agent, the clock or age, and "rec <key>" when the item carries one. Text is drawn with
+  // textContent and cut by CSS to one line each, so a long item never sets its row's height.
+  function needsRow(it) {
+    const row = el("button", "needs-row" + (it.kind === "consent" ? " needs-consent" : " needs-question"));
+    row.type = "button";
+    row.setAttribute("aria-haspopup", "dialog");
+    row._needsItem = it;
+    const id = needsIdOf(it);
+    if (id) row.dataset.needsId = id;
+    row.dataset.needsCard = it.kind;
+    const title = el("span", "needs-row-title", it.kind === "consent" ? (it.c.tool || "request") : "question #" + it.q.n);
+    const sub = el("span", "needs-row-sub ext-meta", "");
+    const text = el("span", "needs-row-text");
+    text.append(title, sub);
+    const side = el("span", "needs-row-side");
+    const who = el("span", "needs-chip consent-agent", (it.kind === "consent" ? it.c.agent : it.q.agent) || "agent");
+    side.appendChild(who);
+    const flat = (t) => String(t || "").replace(/\s+/g, " ").trim();
+    if (it.kind === "consent") {
+      row.dataset.needsExpires = String(it.c.expiresAt);
+      row.dataset.needsState = String(it.c.state);
+      const left = el("span", "ext-meta consent-left needs-left", consentLeft(it.c.expiresAt));
+      left.dataset.consentExpires = it.c.expiresAt;
+      if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
+      side.appendChild(left);
+      title.className = "needs-row-title consent-tool";
+      if (it.c.id) consentBody(it.c, row).then((b) => {
+        if (!b || b.error) return;
+        const w = needsFirstWords(b.display, it.c.tool);
+        if (w) title.textContent = (it.c.tool || "request") + " " + w;
+        const where = flat(b.cwd_short || b.cwd);
+        sub.textContent = where ? "in " + where + (b.targets ? " \u00b7 targets " + flat(b.targets) : "") : "";
+      });
+    } else {
+      if (it.q.age) side.appendChild(el("span", "ext-meta needs-left", "asked " + it.q.age));
+      questionBody(it.q, row).then((b) => {
+        if (!b || b.error) return;
+        const first = flat(b.what);
+        if (first) title.textContent = first;
+        if (flat(b.blocks)) sub.textContent = "blocks: " + flat(b.blocks);
+        if (typeof b.rec === "string" && b.rec) side.appendChild(el("span", "needs-rec-tag needs-row-rec", "rec " + b.rec));
+      });
+    }
+    row.title = "open the whole request and decide there";
+    row.append(text, side);
+    row.addEventListener("click", () => openNeedsFocus(it, row));
+    return row;
+  }
   function renderNeeds(view) {
     const host = document.getElementById("ck-needs");
     if (!host) return;
@@ -5650,32 +5701,26 @@
     hist.title = "decided requests, outcomes and standing-rule proposals";
     hist.addEventListener("click", () => openDecisionsHistory(hist));
     head.appendChild(hist);
-    // the cards are kept by their stable id: a card whose item still waits is moved, never rebuilt, so the words typed into a
-    // question and an open "details" survive a change in what else waits; only a card whose item has gone is dropped
+    // the rows are kept by their stable id: a row whose item still waits is moved, never rebuilt (words typed into an item live in
+    // its focus view, which stays open while the item waits: refreshModal)
     let grid = host.querySelector(".needs-grid");
     const kept = new Map();
     if (grid) for (const c of grid.children) if (c.dataset && c.dataset.needsId) kept.set(c.dataset.needsId, c);
-    const idOf = (it) => (it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : ""));
-    // a card kept by id still shows what its item says NOW: a consent whose expiry moved (extended) takes the new clock in place;
-    // one whose state changed is rebuilt unless words are typed into it or its details are open (then it is kept as it is)
-    const fresh = (it) => (it.kind === "consent" ? consentCard(it.c) : questionCard(it.q));
-    const keep = (card, it) => {
-      if (it.kind !== "consent") return card;
-      const st = it.c.state;
-      if (card.dataset.needsState !== undefined && card.dataset.needsState !== st) {
-        const ta = card.querySelector("textarea");
-        const open = card.querySelector("details[open]");
-        if (!(ta && ta.value) && !open) return consentCard(it.c);
-      }
+    // a row kept by id still shows what its item says NOW: a consent whose expiry moved (extended) takes the new clock in place;
+    // one whose state changed is rebuilt
+    const keep = (row, it) => {
+      if (it.kind !== "consent") return row;
+      if (row.dataset.needsState !== undefined && row.dataset.needsState !== String(it.c.state)) return needsRow(it);
       const exp = String(it.c.expiresAt);
-      if (card.dataset.needsExpires !== exp) {
-        card.dataset.needsExpires = exp;
-        const left = card.querySelector(".consent-left");
+      if (row.dataset.needsExpires !== exp) {
+        row.dataset.needsExpires = exp;
+        row._needsItem = it;
+        const left = row.querySelector(".consent-left");
         if (left) { left.dataset.consentExpires = exp; left.textContent = consentLeft(it.c.expiresAt); }
       }
-      return card;
+      return row;
     };
-    const cards = items.map((it) => { const id = idOf(it); const k = id && kept.get(id); return k ? keep(k, it) : fresh(it); });
+    const cards = items.map((it) => { const id = needsIdOf(it); const k = id && kept.get(id); return k ? keep(k, it) : needsRow(it); });
     if (!grid) grid = el("div", "needs-grid");
     for (let i = 0; i < cards.length; i++) if (grid.children[i] !== cards[i]) grid.insertBefore(cards[i], grid.children[i] || null);
     while (grid.children.length > cards.length) grid.removeChild(grid.lastChild);
@@ -5756,8 +5801,8 @@
   function needsFocus() {
     const host = document.getElementById("ck-needs");
     if (!host || host.hidden) return false;
-    const first = host.querySelector(".needs-card");
-    if (!first || !first.offsetParent) return false;   // on Build and Memory the cards are not drawn: the bar is
+    const first = host.querySelector(".needs-row");
+    if (!first || !first.offsetParent) return false;   // on Build and Memory the rows are not drawn: the bar is
     first.tabIndex = -1;
     if (typeof first.scrollIntoView === "function") first.scrollIntoView({ block: "center", behavior: "smooth" });
     first.focus({ preventScroll: true });
@@ -5771,8 +5816,8 @@
     const host = document.getElementById("ck-needs");
     if (!host || host.hidden || !id) return false;
     for (const n of host.querySelectorAll(".needs-lit")) n.classList.remove("needs-lit");
-    const cards = host.querySelector(".needs-card") && host.querySelector(".needs-card").offsetParent;
-    const sel = cards ? ".needs-card" : ".needs-chip-btn";
+    const cards = host.querySelector(".needs-row") && host.querySelector(".needs-row").offsetParent;
+    const sel = cards ? ".needs-row" : ".needs-chip-btn";
     const node = Array.prototype.find.call(host.querySelectorAll(sel), (n) => n.dataset.needsId === id);
     if (!node) return false;
     if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "center", behavior: "smooth" });
