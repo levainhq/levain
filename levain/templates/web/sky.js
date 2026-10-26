@@ -273,7 +273,12 @@
     var opts = { windowHours: o.windowHours || 14, topRows: o.topRows || 5, pinnedRows: o.pinnedRows || [], single: o.single || '', size: size, dialect: dialectOf(value) };
     var clock = o.now || function () { return Date.now(); };
     var reduce = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
-    var ambientOn = o.ambient !== false && !strip && !(reduce && reduce.matches);
+    var calmOn = function () { var h = document.documentElement; return !!(h && h.classList && h.classList.contains('calm')); };   // the page's Calm control: the same as the OS asking
+    var reduceOn = function () { return !!(reduce && reduce.matches); };
+    // ambientOn is the user's Ambient preference; neither Calm nor the OS reduced-motion setting writes it. The motion that
+    // runs is the preference AND not reduced motion AND not Calm.
+    var ambientOn = o.ambient !== false && !strip;
+    var motionOn = function () { return ambientOn && !reduceOn() && !calmOn(); };
 
     var root = el('div', { class: 'sky-panel' });
     root.style.position = 'relative';
@@ -331,10 +336,12 @@
     }
     toggle.addEventListener('click', function () {
       ambientOn = !ambientOn; setToggle();
-      if (!ambientOn) { meteors = []; draw(); }
+      if (!motionOn()) { meteors = []; draw(); }
     });
-    function onReduce() { if (reduce && reduce.matches && ambientOn) { ambientOn = false; setToggle(); meteors = []; draw(); } }
+    function onReduce() { if (reduceOn() && meteors.length) { meteors = []; draw(); } }
     if (reduce && reduce.addEventListener) reduce.addEventListener('change', onReduce);
+    function onCalm() { if (calmOn() && meteors.length) { meteors = []; draw(); } }
+    window.addEventListener('levain-calm', onCalm);
     setToggle();
 
     var xOf = function (t, now) { var span = opts.windowHours * 3600000 / nowAt; return gutter + (W - gutter - padR) * ((t - (now - opts.windowHours * 3600000)) / span); };
@@ -568,7 +575,7 @@
     }
 
     function launch(e) {
-      if (!ambientOn || !model || (!e.repo && offView(e, model.single))) return;
+      if (!motionOn() || !model || (!e.repo && offView(e, model.single))) return;
       if (e.kind !== 'commit' && !(e.kind === 'review' && !e.ok)) return;   // commits and failures streak; the rest just appear
       meteors.push({ e: e, row: model.rowOf(e), born: performance.now(), x: 0, y: 0, tx: 0, ty: 0, len: 60, a: 1, fail: e.kind === 'review' });
       schedule();
@@ -640,6 +647,7 @@
         if (raf) { cancelAnimationFrame(raf); stats.pending--; raf = 0; }
         clearInterval(timer); if (ro) ro.disconnect(); else window.removeEventListener('resize', resize);
         if (reduce && reduce.removeEventListener) reduce.removeEventListener('change', onReduce);
+        window.removeEventListener('levain-calm', onCalm);
         if (themeObs) themeObs.disconnect();
         if (scheme && scheme.removeEventListener) scheme.removeEventListener('change', repaint);
         root.remove();

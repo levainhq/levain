@@ -12,6 +12,8 @@ import hashlib
 import json
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -21,7 +23,7 @@ from levain import unshowable
 from levain.cockpit.anneal_effects import section_resource_key
 from levain.cockpit.authority import LabelKey
 from levain.cockpit.effects import SPORE_AUTHORITY_FIELDS, _stored_authority, spore_resource_key
-from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext, row_version_of
+from levain.cockpit.engine import PANEL_READ_DEADLINE_S, Cockpit, ProviderSpec, ReadContext, row_version_of
 from levain.cockpit.registry import opened_day, parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 from levain.dashboard import (
@@ -95,9 +97,184 @@ def _store_label(db: Path) -> str:
         return db.name       # no filesystem resolution, and no exception text, can reach the wire
 
 
+# A built view is served again until one of the files it reads changes, or this many seconds pass. The age bound
+# is for what a file signature cannot see: the state line's expiry, the jar's day, and files below seed/ or activation/.
+VIEW_CACHE_MAX_AGE_S = 30.0
+# the slice a reader waits on another reader's build before it looks at its own deadline; a waiter never builds, it waits on the
+# same flight until the panel read budget ends and then raises the panel timeout
+VIEW_FLIGHT_WAIT_S = PANEL_READ_DEADLINE_S / 4
+VIEW_CACHE_SOURCES = 8
+_view_cache: dict[int, tuple[Any, tuple, float, SubstrateView]] = {}
+_view_cache_lock = threading.Lock()
+
+
+def _stat_of(p: Path | None) -> tuple | None:
+    if p is None:
+        return None
+    try:
+        st = os.stat(p)
+    except OSError:
+        return None
+    # ctime and mode so a chmod (which moves neither mtime nor size) is seen too
+    return (st.st_ino, st.st_mtime_ns, st.st_size, st.st_ctime_ns, st.st_mode)
+
+
+def _store_signature(source: Any) -> tuple | None:
+    """What a build of this source reads that moves when the store does: the anneal files (the db with its WAL,
+    the continuity file, the crystals, the spores), the state-line file, and the edit-log ledger. None when the
+    source names none of them, or the signature cannot be taken: no signal, so no caching, never an exception."""
+    try:
+        return _signature_of(source)
+    except Exception:       # noqa: BLE001 — a partial source or a failing stat builds normally, uncached
+        return None
+
+
+def _signature_of(source: Any) -> tuple | None:
+    anneal = getattr(source, "anneal", None)
+    db = getattr(anneal, "episodic_db", None)
+    if db is None:
+        return None
+    ledger = getattr(getattr(source, "write_scope", None), "ledger_root", None)
+    root = getattr(source, "install_root", None)
+    ledger = ledger if ledger is not None else (Path(root) / ".levain" if root is not None else None)
+    # no -shm: it is not a write signal; the db and its -wal move on every write
+    files = [db, Path(f"{db}-wal"), anneal.continuity_md, anneal.crystal_json, anneal.spores_json,
+             getattr(source, "context_json", None), Path(ledger) / "edits.jsonl" if ledger is not None else None]
+    if root is not None:
+        # the config docs: the install dir, its seed/ and activation/ dirs (a removed or added file moves the
+        # dir) and every file directly in them (an edit in place moves only the file), and the config file
+        root = Path(root)
+        files += [root, root / ".levain" / "config.json"]
+        for d in (root / "seed", root / "activation"):
+            files.append(d)
+            try:
+                files += sorted(d.iterdir())
+            except OSError:
+                pass
+    return tuple(_stat_of(Path(f)) if f is not None else None for f in files)
+
+
+class _Flight:
+    """One build in progress for a source: the readers that arrive meanwhile wait on it and share its view. ``started``
+    (monotonic) lets a later reader see that the build has outlived the panel read budget and replace the flight;
+    ``superseded`` is set (under the lock) when it is replaced, and its waiters then look again instead of taking its result."""
+    __slots__ = ("done", "sig", "started", "superseded", "view", "exc")
+
+    def __init__(self, sig: tuple) -> None:
+        self.done = threading.Event()
+        self.sig = sig
+        self.started = time.monotonic()
+        self.superseded = False
+        self.view: SubstrateView | None = None
+        self.exc: BaseException | None = None
+
+
+_view_flights: dict[int, _Flight] = {}
+# builds started for a source and not yet returned, a flight's, an abandoned one's, an uncached read's; a source holds at most
+# VIEW_BUILDS_PER_SOURCE of them (the abandoned build and one rescue), so builds that keep hanging cost a bounded number of threads
+VIEW_BUILDS_PER_SOURCE = 2
+_view_builds: dict[int, int] = {}
+
+
 def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
-    return ctx.memo("view", lambda: source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT,
-                                                 now=ctx.now))
+    """The view for this read cycle. Within a cycle the memo shares one build; across cycles an unchanged store
+    (``_store_signature``) serves the view built before, up to ``VIEW_CACHE_MAX_AGE_S``. A miss is single-flight:
+    one build per source runs and the readers that arrive meanwhile wait for it, on the same flight, until the panel
+    deadline (``PANEL_READ_DEADLINE_S``), when they raise ``TimeoutError``; they never build for themselves. They share its view; a build that raises stores nothing and its waiters get the same
+    exception. A new flight starts when the old one has finished, or when a reader finds it older than the panel read
+    budget (a hung build): that reader replaces it and builds, and later readers join the replacement. A source holds at
+    most ``VIEW_BUILDS_PER_SOURCE`` builds that have not returned (the abandoned one and one rescue): while both are out, a
+    reader that finds the rescue stale too raises ``TimeoutError`` at once and starts nothing, and a new rescue starts only
+    once one of them returns. The abandoned build, if it ever returns or raises, gives its own caller its view or its
+    exception but neither caches it nor removes the replacement, and the readers that waited on it look again (the cache or
+    the replacement), never taking its result. The bound covers every build: a write's own read (``ctx.fresh``) and a read
+    whose store signature cannot be taken build without a flight, but take a slot of the same count and raise ``TimeoutError``
+    at once when both are out. Those two, and a view that carries an error, are never cached."""
+    def build() -> SubstrateView:
+        key = id(source)
+        deadline = time.monotonic() + PANEL_READ_DEADLINE_S      # one budget for all the waits of this read
+        while True:
+            sig = None if ctx.fresh else _store_signature(source)      # retaken on every pass: a pass is a new look
+            if sig is None:
+                # uncached (a write's read, or a signature that cannot be taken): it takes a slot of the same per-source
+                # bound, never registers or joins a flight and never caches
+                with _view_cache_lock:
+                    if _view_builds.get(key, 0) >= VIEW_BUILDS_PER_SOURCE:
+                        raise TimeoutError(f"shared read 'view' did not finish in {PANEL_READ_DEADLINE_S:g}s")
+                    _view_builds[key] = _view_builds.get(key, 0) + 1
+                try:
+                    return source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
+                finally:
+                    with _view_cache_lock:
+                        left = _view_builds.get(key, 1) - 1
+                        if left > 0:
+                            _view_builds[key] = left
+                        else:
+                            _view_builds.pop(key, None)
+            with _view_cache_lock:
+                hit = _view_cache.get(key)
+                if hit and hit[0] is source and hit[1] == sig and time.monotonic() - hit[2] < VIEW_CACHE_MAX_AGE_S:
+                    return hit[3]
+                flight = _view_flights.get(key)
+                # a flight older than the budget is a hung build: replace it (under the lock, so one reader does)
+                stale = flight is not None and time.monotonic() - flight.started >= PANEL_READ_DEADLINE_S
+                if flight is None or stale:
+                    if _view_builds.get(key, 0) >= VIEW_BUILDS_PER_SOURCE:
+                        # the bound: the builds already out have not returned, so start none (the page handles the timeout)
+                        raise TimeoutError(f"shared read 'view' did not finish in {PANEL_READ_DEADLINE_S:g}s")
+                    if stale:
+                        flight.superseded = True
+                    flight = _view_flights[key] = _Flight(sig)
+                    _view_builds[key] = _view_builds.get(key, 0) + 1
+                    mine = True
+                else:
+                    mine = False
+            if not mine:
+                # only the flight's builder builds: a waiter keeps waiting on the same flight, in VIEW_FLIGHT_WAIT_S slices,
+                # until the panel deadline, then raises the timeout the memo's own deadline raises (the page handles it).
+                # A flight replaced meanwhile is left when the slice ends (or when it exits): its result is not this reader's to take.
+                while not flight.done.wait(max(0.0, min(VIEW_FLIGHT_WAIT_S, deadline - time.monotonic()))):
+                    if flight.superseded:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"shared read 'view' did not finish in {PANEL_READ_DEADLINE_S:g}s")
+                if flight.superseded:
+                    continue            # look again: the replacement's cached view, or the replacement flight
+                if flight.sig == sig:
+                    if flight.exc is not None:
+                        raise flight.exc            # the builder's failure is every waiter's, not a chain of rebuilds
+                    if flight.view is not None:
+                        return flight.view
+                continue            # it saw another store state: look again
+            try:
+                # the signature is taken BEFORE the build: a change landing mid-build leaves a stale signature on the
+                # stored view, so the next read sees a mismatch and rebuilds
+                view = source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
+                flight.view = view          # the readers waiting on this flight share it, an errored view too
+                if not view.errors:
+                    with _view_cache_lock:
+                        if _view_flights.get(key) is not flight:
+                            return view         # replaced while it hung: the replacement owns the cache entry
+                        _view_cache.pop(key, None)      # re-insert at the tail, so the eviction below drops the oldest
+                        _view_cache[key] = (source, sig, time.monotonic(), view)
+                        while len(_view_cache) > VIEW_CACHE_SOURCES:
+                            _view_cache.pop(next(iter(_view_cache)))
+                return view
+            except BaseException as e:
+                flight.exc = e
+                raise
+            finally:
+                # every exit (a view, an exception, a BaseException) ends this build's count and pops only its own flight
+                with _view_cache_lock:
+                    if _view_flights.get(key) is flight:
+                        del _view_flights[key]
+                    left = _view_builds.get(key, 1) - 1
+                    if left > 0:
+                        _view_builds[key] = left
+                    else:
+                        _view_builds.pop(key, None)
+                flight.done.set()
+    return ctx.memo("view", build)
 
 
 def _view_fault(view: SubstrateView, *keys: str) -> Fault | None:
@@ -735,6 +912,20 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
     return read
 
 
+def _save_stamp(h: Any) -> str | None:
+    """The last committed save as a UTC ISO stamp; None when the age could not be read (no wrap, or an
+    unparseable stamp: ``save_age_hours`` is None then, and the metric is left out)."""
+    if h.save_age_hours is None or not h.last_wrap_at:
+        return None
+    try:
+        when = datetime.fromisoformat(str(h.last_wrap_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(timezone.utc).isoformat()
+
+
 def _health(source: SubstrateSource) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
         view = _view(source, ctx)
@@ -761,7 +952,9 @@ def _health(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         ):
             metrics.append({"label": label, "value": value, "unit": None, "status": "unknown", "read": None})
         for label, value, status in (
-            ("last save (hours ago)", h.save_age_hours, "unknown"),  # unrounded: the renderers round once
+            # the stamp, never an age: an age moves with the clock, so it would change the panel's etag on every
+            # watcher tick over an unchanged store. The renderers compute the age from it against their own clock.
+            ("last save at", _save_stamp(h), "unknown"),
             ("projection", ("unknown" if h.projection_note else None) if h.projection_converged is None else (
                 "converged" if h.projection_converged else
                 ("file missing" if h.projection_note == "continuity file missing" else "diverged")),

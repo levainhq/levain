@@ -71,6 +71,15 @@
     return Date.parse(iso.indexOf("T") < 0 || /(Z|[+-]\d\d:?\d\d)$/i.test(iso) ? iso : iso + "Z");
   }
 
+  // The kernel sends a save's STAMP, never its age (an age moves every second and would change the panel's etag on an
+  // idle store). The page draws the age from the stamp against the server's clock and redraws it on its own timer:
+  // AGE_TICK_MS is that timer's one interval, so a display tier can slow or stop every age on the page by changing it.
+  const AGE_TICK_MS = 30000;
+  const CALM_AGE_TICK_MS = 120000;       // the same timer under Calm: slower, never stopped, so every age stays true
+  const SAVE_STAMP = "last save at";
+  let serverOffsetMs = 0;       // the server's clock minus this browser's, as of the last snapshot
+  const serverNow = () => Date.now() + serverOffsetMs;
+
   function ageLabel(iso, now, prefix) {
     const t = parseIso(iso);
     if (isNaN(t)) return "";
@@ -79,6 +88,44 @@
       : s >= 60 ? Math.floor(s / 60) + "m" : s + "s";
     return (prefix || "") + u + " ago";
   }
+
+  const savedAge = (iso, nowMs) => ageLabel(iso, nowMs, "") || "unknown";
+  // the Health panel's save stamp as a metric a reader can read: an age that tickAges keeps current; no readable stamp reads "unknown"
+  function saveMetric(m, nowMs) {
+    const iso = typeof m.value === "string" && !isNaN(parseIso(m.value)) ? m.value : null;
+    return Object.assign({}, m, { label: "last save", value: iso ? savedAge(iso, nowMs || serverNow()) : "unknown", age_at: iso });
+  }
+  let ageTimer = 0;
+  // Calm (one page control): the page reads as if the OS asked for reduced motion. The class on <html> is the one predicate every
+  // reader (dashboard.css, topology_view.js, sky.js, the age timer) tests; the choice is kept per browser, absent storage = full.
+  const isCalm = () => typeof document !== "undefined" && !!document.documentElement && !!document.documentElement.classList && document.documentElement.classList.contains("calm");
+  // Once armed, the one timer runs for the page's life: a tick that finds no age on the page costs one empty query, and the
+  // next age drawn needs no re-arm. Detached nodes are skipped (querySelectorAll only returns attached ones, so they are never seen).
+  function tickAges() {
+    for (const n of (typeof document !== "undefined" && document.querySelectorAll ? Array.from(document.querySelectorAll("[data-age-at]")) : [])) {
+      if (!n.isConnected) continue;
+      const text = savedAge(n.dataset.ageAt, serverNow());
+      if (n.textContent !== text) n.textContent = text;
+      // only the age part of the row's tooltip moves; its reading and detail stay
+      if (n.dataset.ageTitle && n.parentNode && n.parentNode.title !== undefined)
+        n.parentNode.title = n.dataset.ageTitle + ": " + [text, n.dataset.ageRead || "", n.dataset.ageDetail || ""].filter(Boolean).join(" · ");
+    }
+  }
+  // a node that shows a save's age: tagged with its stamp, and the one timer started if it is not running
+  function ageNode(node, m, titled) {
+    if (!m.age_at) return node;
+    node.dataset.ageAt = m.age_at;
+    if (titled) {                                       // the row's tooltip carries the age too, beside the reading and detail
+      node.dataset.ageTitle = m.label;
+      node.dataset.ageRead = m.read || "";
+      node.dataset.ageDetail = typeof m.detail === "string" ? m.detail : "";
+    }
+    if (!ageTimer) ageTimer = root.setInterval(tickAges, isCalm() ? CALM_AGE_TICK_MS : AGE_TICK_MS);
+    return node;
+  }
+
+  // a span that shows the age of `iso` and ticks like every other age (the native Health panel draws its "last save" with it)
+  function ageSpan(iso) { return ageNode(el("span", "", savedAge(iso, serverNow())), { age_at: iso }); }
 
   function badgeText(b) {
     const f = Object.prototype.hasOwnProperty.call(BADGE_TEXT, b.kind) ? BADGE_TEXT[b.kind] : null;
@@ -363,9 +410,9 @@
       need(Array.isArray(ms) && ms.every((m) => isObj(m) && typeof m.label === "string"
         && (m.value == null || typeof m.value === "string" || isNum(m.value)) && (m.unit == null || typeof m.unit === "string")
         && (m.read == null || typeof m.read === "string") && (m.detail == null || typeof m.detail === "string")), "metrics");
-      out.metrics = ms;
+      out.metrics = ms.map((m) => (m.label === SAVE_STAMP ? saveMetric(m, nowMs) : m));
       out.typed = true;
-      out.lines = ms.map((m) => ({
+      out.lines = out.metrics.map((m) => ({
         meta: m.label,
         text: [m.value == null ? "" : m.value + (m.unit ? " " + m.unit : ""), m.read || "", m.detail || ""].filter(Boolean).join(" — ") || (m.status || "unknown"),   // the detail rides along: the focus filter, the jump box and a touch reader have no hover
         accent: m.status === "warn" || m.status === "bad", dim: m.status === "unknown" }));
@@ -494,7 +541,7 @@
   const WRITE_PATH_STATUS = { "live": "live", "no wraps yet": "no-wraps", "unreadable": "unreadable", "dark": null };
   const WRITE_PATHS = Object.keys(WRITE_PATH_STATUS);
   const writePathStatus = (word, wraps) => WRITE_PATH_STATUS[word] || (isNum(wraps) && wraps > 0 ? "live" : "no-wraps");
-  function healthOf(metrics, wraps) {
+  function healthOf(metrics, wraps, nowMs) {
     need(Array.isArray(metrics), "metrics");
     const m = new Map();
     for (const x of metrics) { need(isObj(x) && typeof x.label === "string", "metric"); m.set(x.label, x.value); }
@@ -503,7 +550,9 @@
     need(WRITE_PATHS.indexOf(m.get("write path")) >= 0, "metric write path");
     const n = (k) => m.get(k);
     // the substrate oracles are optional (the kernel omits one it could not read): carried only when well-formed
-    const age = m.has("last save (hours ago)") && isNum(m.get("last save (hours ago)")) ? m.get("last save (hours ago)") : null;
+    // the kernel sends the save's stamp, never its age: an age moves every second and would change the panel's etag
+    const savedMs = m.has("last save at") ? parseIso(m.get("last save at")) : NaN;
+    const age = isNaN(savedMs) ? null : Math.max(0, (nowMs - savedMs) / 3600000);
     const proj = m.get("projection");
     const projOk = proj === "converged" ? true : (proj === "diverged" || proj === "file missing" ? false : null);
     // a present-but-unrecognised value is surfaced, never silently null; "unknown" carries the kernel's note
@@ -520,7 +569,7 @@
       graduations_validated_total: n("graduated"), graduations_demoted_total: n("demoted"),
       last_wrap_at: last ? last.wrapped_at : null, continuity_chars: last ? last.continuity_chars : null,
       wrap_history_unavailable: wraps === "unavailable",
-      save_age_hours: age, projection_converged: projOk,
+      save_age_hours: age, save_at: isNaN(savedMs) ? null : m.get("last save at"), projection_converged: projOk,
       projection_note: projNote,
       audit_backlog: audit,
     };
@@ -612,6 +661,7 @@
     noteRepos(snap.panels);
     const m = snap.manifest;
     const gen = parseIso(m.generated_at);
+    serverOffsetMs = isNaN(gen) ? 0 : gen - Date.now();
     let now = isNaN(gen) ? Date.now() : gen;   // the server's clock, so a skewed browser cannot misreport ages
     const genAt = now;
     for (const p of Object.values(snap.panels || {})) {
@@ -771,7 +821,7 @@
         });
         view.layout.push(Object.assign(entry, { kind: "crystals" }));
       } else if (nat === "health" && (panel.kind === "metric" || panel.kind === "status-dots")) {
-        view.health = healthOf((panel.value || {}).metrics, wrapsData);
+        view.health = healthOf((panel.value || {}).metrics, wrapsData, now);
         view.layout.push(Object.assign(entry, { kind: "health" }));
       } else if (nat === "graph" && (panel.kind === "visual" || panel.kind === "ambient")) {
         view.graph = (panel.value || {}).data || null;
@@ -1035,7 +1085,7 @@
       row.appendChild(el("span", "op-l", m.label));
       const fig = m.value == null ? "" : m.value + (m.unit ? " " + m.unit : "");
       // a state is never colour alone: with no figure and no reading, the word stands in
-      row.appendChild(el("span", "v", [fig, m.read || ""].filter(Boolean).join(" · ") || st));
+      row.appendChild(ageNode(el("span", "v", (m.age_at ? fig : [fig, m.read || ""].filter(Boolean).join(" · ")) || st), m, true));      // an aged row's cell is the age alone: its reading rides in the tooltip
       // the row stays one line and a tile cuts its reading: the tooltip holds the whole reading, then the detail
       const whole = [[fig, m.read || ""].filter(Boolean).join(" · "), typeof m.detail === "string" ? m.detail : ""].filter(Boolean).join(" · ");
       if (whole) row.title = m.label + ": " + whole;
@@ -1274,7 +1324,7 @@
       }
       if (nf) {
         const row = el("div", "row");
-        for (const m of figsAll.slice(0, nf)) { const c = el("span"); c.append(el("b", "num", figure(m.value) + (m.unit ? " " + m.unit : "")), document.createTextNode(m.label)); row.appendChild(c); }
+        for (const m of figsAll.slice(0, nf)) { const c = el("span"); c.append(ageNode(el("b", "num", figure(m.value) + (m.unit ? " " + m.unit : "")), m), document.createTextNode(m.label)); row.appendChild(c); }
         host.appendChild(row);
       }
       s.hidden = ms.length - nd - nf;
@@ -1975,11 +2025,32 @@
     if (keep) { try { if (isTheme(t)) root.localStorage.setItem(THEME_KEY, t); else root.localStorage.removeItem(THEME_KEY); } catch (_) { /* the page still switched */ } }
     paintThemeSwitch();
   }
+  // ---- Calm: a stored choice sets html.calm before the body paints; the page's controls and the three motion readers follow it
+  const CALM_KEY = "levain_cockpit_calm";
+  function storedCalm() { try { return root.localStorage.getItem(CALM_KEY) === "1"; } catch (_) { return false; } }
+  function paintCalmSwitch() {
+    const on = isCalm();
+    for (const b of document.querySelectorAll("[data-calm-toggle]")) {
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+      b.textContent = on ? "Calm on" : "Calm off";
+      b.setAttribute("aria-label", b.textContent);     // the phone shows an icon only: its name is this
+      b.title = b.textContent;
+    }
+  }
+  function setCalm(on, keep) {
+    const html = pageRoot();
+    if (html && html.classList) { if (on) html.classList.add("calm"); else html.classList.remove("calm"); }
+    if (keep) { try { if (on) root.localStorage.setItem(CALM_KEY, "1"); else root.localStorage.removeItem(CALM_KEY); } catch (_) { /* the page still switched */ } }
+    if (ageTimer) { root.clearInterval(ageTimer); ageTimer = root.setInterval(tickAges, on ? CALM_AGE_TICK_MS : AGE_TICK_MS); }
+    if (typeof root.dispatchEvent === "function" && typeof root.Event === "function") root.dispatchEvent(new root.Event("levain-calm"));
+    paintCalmSwitch();
+  }
   // run as this file loads (it is in the <head>): the theme is set before the body paints, so a stored light theme never flashes dark
   (function earlyTheme() {
     const html = pageRoot();
     const t = queryTheme() || storedTheme();
     if (html && html.dataset && t) html.dataset.theme = t;
+    if (html && html.classList && storedCalm()) html.classList.add("calm");
   })();
   // ---- the layout (K5): the order of a zone's cards and which panels are folded, kept per browser under one key, the way the theme is.
   // {"v":1,"zones":{"<zone id>":{"order":["<card key>",...]}},"collapsed":["<card key>",...]}; a card's key is its first panel id, and a folded card folds all its panels.
@@ -2627,6 +2698,10 @@
       const b = ev.target && ev.target.closest ? ev.target.closest("[data-theme-set]") : null;
       if (b) setTheme(b.dataset.themeSet, true);
     });
+    paintCalmSwitch();
+    document.addEventListener("click", (ev) => {
+      if (ev.target && ev.target.closest && ev.target.closest("[data-calm-toggle]")) setCalm(!isCalm(), true);
+    });
     document.addEventListener("click", (ev) => {
       if (!(ev.target && ev.target.closest && ev.target.closest("[data-layout-reset]"))) return;
       const D = root.LevainDashboard;
@@ -2669,7 +2744,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

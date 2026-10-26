@@ -192,12 +192,14 @@
   }
   .indicators { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; justify-content: flex-end; }
   .stamp { font-variant-numeric: tabular-nums; color: var(--meta); font: var(--fw-regular) var(--fs-meta) var(--sans); }
-  button#refresh, button#jumpbtn {
+  button#refresh, button#jumpbtn, button#calmbtn, button#calmphone {
     background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4);
     color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer;
   }
-  button#refresh:hover, button#jumpbtn:hover { color: var(--text); border-color: var(--hair-2); }
+  button#refresh:hover, button#jumpbtn:hover, button#calmbtn:hover, button#calmphone:hover { color: var(--text); border-color: var(--hair-2); }
   button#refresh:disabled { opacity: .5; cursor: default; }
+  button#calmphone { display: none; }
+  button#calmbtn[aria-pressed="true"], button#calmphone[aria-pressed="true"] { color: var(--text); border-color: var(--hair-2); }
 
   /* the operator's state line: their own words, reflected back, with its age */
   .stateline { display: flex; align-items: baseline; gap: var(--sp-5); flex-wrap: wrap; margin: 0; padding-block: var(--sp-5) 0; }
@@ -1564,6 +1566,10 @@ body.ke .ck-card-title { font: var(--fw-bold) var(--fs-title)/1 var(--round); co
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0ms !important; animation: none !important; }
 }
+/* CALM (the page control sets html.calm): every reduced-motion rule above, plus the two that set a static look the animation would have drawn */
+html.calm *, html.calm *::before, html.calm *::after { transition-duration: 0ms !important; animation: none !important; }
+html.calm .jar .jar-bubble { display: none; }
+html.calm svg.scope .trace-core, html.calm svg.scope .trace-glow { stroke-dashoffset: 0; stroke-dasharray: none; }
 
 .tray-dump[hidden], .edit-trigger-row[hidden] { display: none; }
 body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertical; }
@@ -1604,6 +1610,10 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .masthead .livechip { font-size: 0; gap: 0; }
   body.ke .masthead #jumpbtn { font-size: 0; width: var(--hit-min); padding: 0; justify-content: center; }
   body.ke .masthead #jumpbtn::before { content: "\2315"; font-size: var(--fs-title); }
+  /* Calm leaves the first row on a phone: the band carries its own Calm button (#calmphone) at the right of the clock and date */
+  body.ke .masthead #calmbtn { display: none; }
+  body.ke .band { position: relative; }
+  body.ke .band #calmphone { display: inline-flex; align-items: center; justify-content: center; position: absolute; top: var(--gap); right: var(--gutter); min-height: var(--hit-min); }
   body.ke .masthead .themesw button { width: 36px; font-size: var(--fs-micro); }
   /* the brand takes what the first row leaves instead of claiming its own width, so a wider font cannot push the theme switch
      onto a row of its own (Linux Chrome's fonts did, in CI) */

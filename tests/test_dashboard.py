@@ -1287,15 +1287,15 @@ class TestHealthOracles:
         st = SimpleNamespace(last_wrap_at="2026-10-24T09:00:00", total_wraps=5, audit_write_failures=0)
         row = ("2026-10-24T10:00:00", h, "tok-1")  # age and hash come from the ONE row, not from status
         ok = health_oracles(st, row, md, now=now)
-        assert ok == {"save_age_hours": 2.0, "projection_converged": True, "projection_note": None,
-                      "audit_backlog": 0}
+        assert ok == {"save_age_hours": 2.0, "save_at": "2026-10-24T10:00:00", "projection_converged": True,
+                      "projection_note": None, "audit_backlog": 0}   # save_at: the stamp the age is counted from (a page ticks it)
         assert health_oracles(st, ("2026-10-24T10:00:00", "b" * 64, "tok-1"), md, now=now)["projection_converged"] is False
         # a naive now compares in UTC instead of raising
         assert health_oracles(st, row, md, now=now.replace(tzinfo=None))["save_age_hours"] == 2.0
         # nothing to compare is None, never a guessed ok; a fresh store has no save age
         fresh = SimpleNamespace(last_wrap_at=None, total_wraps=0, audit_write_failures=None)
         assert health_oracles(fresh, None, md, now=now) == {
-            "save_age_hours": None, "projection_converged": None, "projection_note": None, "audit_backlog": None}
+            "save_age_hours": None, "save_at": None, "projection_converged": None, "projection_note": None, "audit_backlog": None}
         assert health_oracles(st, ("2026-10-24T10:00:00", None, None), md, now=now)["projection_converged"] is None
         st.audit_write_failures = 3
         assert health_oracles(st, row, md, now=now)["audit_backlog"] == 3
