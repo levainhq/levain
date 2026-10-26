@@ -5023,8 +5023,38 @@
       const kept = signNotes.get(id);
       // an answer whose reply was lost and that the cockpit had not settled: the card is drawn frozen and asks about it
       // (settleHere, below) before anything is offered
-      if (!r) signPending.delete(id);
       const unsettled = !!r && signPending.has(id);
+      if (!r && signPending.has(id)) {
+        // an unsettled answer whose request left the listing is never dropped: it is asked about on this read and on
+        // every board read (signRecheck) until the cockpit says signed or refused
+        const gone = () => {
+          const p = signPending.get(id);
+          if (!p) return Promise.resolve();
+          return signAttempt(id, p.attempt).catch(() => ({ state: "" })).then((st) => {
+            if (signPending.get(id) !== p) return;
+            if (st.state === "signed") {
+              signPending.delete(id);
+              signWriteIns.delete(id);
+              return show("signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
+                          + " (its reply was lost; the cockpit confirmed it)", "ok");
+            }
+            if (st.state === "refused") {
+              signPending.delete(id);
+              return show("this sign request is no longer open, and the last answer here was not signed", "bad");
+            }
+            show("this sign request is no longer open; the last answer here is not confirmed, and is asked about again "
+                 + "on the next read", "bad");
+          });
+        };
+        const p = signPending.get(id);
+        p.recheck = gone;
+        show("this sign request is no longer open; asking the cockpit where the last answer here stands", "bad");
+        if (!p.asking) {
+          p.asking = true;
+          gone().catch(() => undefined).then(() => { p.asking = false; });
+        }
+        return;
+      }
       if (!r) {
         // answered here: its signed line stays until the row itself leaves; else it was answered, denied or expired elsewhere
         return show(kept && kept[1] === "ok" ? kept[0] : "this sign request is no longer open; the card updates on the next read", kept && kept[1]);
