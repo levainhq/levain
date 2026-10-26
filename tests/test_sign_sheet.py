@@ -142,10 +142,23 @@ def test_a_link_opened_from_another_site_reaches_the_sheet_and_nothing_else(shee
     assert _raw(sheet["url"], SHEET, headers={**nav, "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"})[0] == 403
     assert _raw(sheet["url"], SHEET, headers={**nav, "Sec-Fetch-Dest": "iframe"})[0] == 403
     assert _raw(sheet["url"], SHEET, method="HEAD", headers=nav)[0] == 403
-    assert _raw(sheet["url"], SHEET + "?x", headers=nav)[0] == 403
+    assert _raw(sheet["url"], "/sign/short", headers=nav)[0] == 403
     assert _raw(sheet["url"], "/sign.js", headers=nav)[0] == 403
     assert _raw(sheet["url"], f"/cockpit/sign/{RID}.json", headers={**nav, "X-Levain-Write-Token": TOK})[0] == 403
     assert _raw(sheet["url"], SHEET, headers={**nav, "Host": "evil.example"})[0] == 403
+
+
+def test_a_cross_site_link_with_a_query_after_the_id_reaches_the_sheet_and_a_query_on_a_near_path_does_not(sheet) -> None:
+    nav = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
+    assert _raw(sheet["url"], SHEET + "?utm=x", headers=nav)[0] == 200      # the id is read past the query
+    assert _raw(sheet["url"], SHEET + "/?utm=x", headers=nav)[0] == 403   # a longer path is not the sheet
+    assert _raw(sheet["url"], "/pair?x", headers=nav)[0] == 403            # the pair page keeps its exact path
+    assert _raw(sheet["url"], SHEET + "?x", headers={**nav, "Sec-Fetch-Dest": "iframe"})[0] == 403
+
+
+def test_the_cockpit_pages_frame_src_is_appended_to_a_policy_that_names_none() -> None:
+    assert "frame-src" not in _CSP
+    assert web_server._COCKPIT_PAGE_CSP == _CSP + "; frame-src 'self'"
 
 
 def test_a_malformed_id_is_not_a_sheet(sheet) -> None:

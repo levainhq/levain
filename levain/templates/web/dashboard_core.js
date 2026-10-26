@@ -4966,7 +4966,8 @@
       else show("");
       const acts = el("div", "sign-actions");
       const buttons = [];
-      const lock = (on) => { for (const b of buttons) b.disabled = on || !signers.length; };
+      let sheetBtn = null;    // "open the sheet": locked with the card's own controls, whether or not a key may sign
+      const lock = (on) => { for (const b of buttons) b.disabled = on || !signers.length; if (sheetBtn) sheetBtn.disabled = on; };
       let freeze = null;      // the write-in's frozen state while its ceremony runs (set below when it offers one)
       const run = (choice, words) => {
         if (signBusy) return say(SIGN_BUSY, "bad");   // the lease holds a second tap, never a button drawn disabled
@@ -5018,8 +5019,7 @@
             signListed = null;
             // a signed (or not-knowable) answer may have closed the request: the board reads again (a row its caller has
             // answered leaves). A definite "nothing was signed" changed nothing, so nothing is read again under the operator
-            const t = window.LevainCockpitTransport;
-            if (done !== "unsigned" && !rearm && t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
+            if (done !== "unsigned" && !rearm) rereadBoard();
           });
       };
       const options = Array.isArray(r.options) ? r.options : [];
@@ -5067,7 +5067,8 @@
         acts.append(box, b);
       }
       lock(false);
-      acts.appendChild(signSheetButton(r));
+      sheetBtn = signSheetButton(r, say);
+      acts.appendChild(sheetBtn);
       wrap.appendChild(acts);
       if (options.length) {
         const lines = el("div", "sign-lines ext-meta", "an option signs the request's message with its line appended:");
@@ -5083,20 +5084,34 @@
   // The sheet /sign/<id> shown as a same-origin iframe over this page: the sheet runs its own ceremony and tells this page
   // "signed", "reload" or "close" by postMessage, read only from this origin and from that frame. Its headers let only this
   // origin frame it. Signing there changes the board, so the board reads again after a signature, and after a sign whose
-  // outcome the sheet could not learn ("reload"), and after any close. While it is open everything behind it is inert.
+  // outcome the sheet could not learn ("reload"), and after a close the sheet did not answer. While it is open everything
+  // behind it is inert, and the sheet holds the same `signBusy` lease a card's ceremony does, so an inline ceremony and the
+  // sheet never challenge at once. A close (its x, Escape) is asked of the sheet first: it answers "ack" at once, then
+  // leaves only when its own rule lets it (a ceremony in flight stays, and says so).
   const SIGN_SHEET_ID = "levain-sign-sheet";
+  const SIGN_CLOSE_ACK_MS = 1000;       // a sheet that has not answered the close request by then is closed by this page
+  const SIGN_RELOAD_MS = 1500;
+  const SIGN_RELOAD_LATE_MS = 8000;     // a second read after a close forced past a sheet that never answered
   let signSheetInerted = [];      // what openSignSheet made inert (and closeSignSheet gives back): never what was already
-  function signSheetButton(r) {
+  let signSheetLease = false;     // the sheet holds a `signBusy` count
+  let signSheetAsk = null;        // the pending close request's timer
+  let signSheetWatch = null;      // the MutationObserver that makes a node added to the body while open inert
+  let signBoardTimer = null;      // the one pending board read
+  let signBoardPasses = 0;        // board reads still owed, a latched run's included
+  function signSheetButton(r, say) {
     const b = el("button", "undo-btn sign-sheet-open", "open the sheet");
     b.type = "button";
     b.title = "sign this request in the sign sheet";
-    b.addEventListener("click", () => openSignSheet(r.id, r.sha256));
+    b.addEventListener("click", () => { if (!openSignSheet(r.id, r.sha256) && signBusy && say) say(SIGN_BUSY, "bad"); });
     return b;
   }
   // `version`: the listing's sha256 the card showed (the sheet draws a pick only on it); `choice`: an option to preselect
   function openSignSheet(id, version, choice) {
     if (typeof id !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return null;
     closeSignSheet();
+    if (signBusy) return null;
+    signBusy++;
+    signSheetLease = true;
     let frag = typeof version === "string" && /^[0-9a-f]{16}/.test(version) ? "v=" + version.slice(0, 16) : "";
     if (frag && typeof choice === "string" && /^[a-z0-9]{1,8}$/.test(choice)) frag += "&choice=" + choice;
     const veil = el("div", "modal-overlay");
@@ -5110,7 +5125,7 @@
     const x = el("button", "modal-close", "×");
     x.type = "button";
     x.setAttribute("aria-label", "close the sign sheet");
-    x.addEventListener("click", closeSignSheet);
+    x.addEventListener("click", askCloseSignSheet);
     head.appendChild(x);
     const frame = document.createElement("iframe");
     frame.id = SIGN_SHEET_ID + "-frame";
@@ -5121,32 +5136,63 @@
     Object.assign(frame.style, { width: "100%", height: "min(80vh, 680px)", border: "0", display: "block", background: "transparent" });
     box.append(head, frame);
     veil.appendChild(box);
-    veil.addEventListener("keydown", (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); closeSignSheet(); } });
+    veil.addEventListener("keydown", (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); askCloseSignSheet(); } });
     document.body.appendChild(veil);
     document.body.classList.add("modal-open");
     for (const n of document.body.children) if (n !== veil && !n.inert) { n.inert = true; signSheetInerted.push(n); }
+    // a board that draws again while the sheet is open adds nodes to the body: they are made inert as they arrive
+    if (typeof MutationObserver === "function") {
+      signSheetWatch = new MutationObserver((muts) => {
+        for (const m of muts) for (const n of m.addedNodes) {
+          if (n.nodeType === 1 && n !== veil && !n.inert) { n.inert = true; signSheetInerted.push(n); }
+        }
+      });
+      signSheetWatch.observe(document.body, { childList: true });
+    }
     x.focus();
     return veil;
   }
+  // ask the sheet to close; it answers "ack", then tells "close" when it may leave. No answer within SIGN_CLOSE_ACK_MS
+  // (the frame is gone or stuck): this page closes it and latches the board read, since a signature may have been landing
+  function askCloseSignSheet() {
+    const frame = document.getElementById(SIGN_SHEET_ID + "-frame");
+    if (!frame) return;
+    if (signSheetAsk) return;
+    signSheetAsk = setTimeout(() => { signSheetAsk = null; closeSignSheet(); rereadBoard(true); }, SIGN_CLOSE_ACK_MS);
+    try { frame.contentWindow.postMessage({ levainSheetCmd: "close" }, window.location.origin); } catch (e) { /* the timer closes it */ }
+  }
   function closeSignSheet() {
+    clearTimeout(signSheetAsk);
+    signSheetAsk = null;
     const veil = document.getElementById(SIGN_SHEET_ID);
     if (!veil) return;
+    if (signSheetWatch) { signSheetWatch.disconnect(); signSheetWatch = null; }
     for (const n of signSheetInerted) n.inert = false;
     signSheetInerted = [];
     veil.remove();
     if (!document.getElementById("levain-modal")) document.body.classList.remove("modal-open");
-    rereadBoard();      // a sheet closed over a ceremony in flight leaves its outcome to the board
+    if (signSheetLease) { signSheetLease = false; signBusy--; }
   }
-  function rereadBoard() {
+  // one pending board read; `latch`: a second read follows, for a sheet closed while its signature may have been landing
+  function signBoardTick() {
+    signBoardTimer = null;
     signListed = null;
+    signBoardPasses--;
     const t = window.LevainCockpitTransport;
-    if (t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
+    if (t && typeof t.reload === "function") t.reload();
+    if (signBoardPasses > 0) signBoardTimer = setTimeout(signBoardTick, SIGN_RELOAD_LATE_MS);
+  }
+  function rereadBoard(latch) {
+    signBoardPasses = Math.max(signBoardPasses, latch ? 2 : 1);
+    clearTimeout(signBoardTimer);
+    signBoardTimer = setTimeout(signBoardTick, SIGN_RELOAD_MS);
   }
   window.addEventListener("message", (ev) => {
     const frame = document.getElementById(SIGN_SHEET_ID + "-frame");
     if (!frame || ev.source !== frame.contentWindow || ev.origin !== window.location.origin) return;
     const what = ev.data && typeof ev.data === "object" ? ev.data.levainSheet : null;
-    if (what === "close") closeSignSheet();
+    if (what === "ack") { clearTimeout(signSheetAsk); signSheetAsk = null; }
+    else if (what === "close") closeSignSheet();
     else if (what === "signed" || what === "reload") {
       // the sheet's line stays on it until it is closed; the board under it reads again
       rereadBoard();

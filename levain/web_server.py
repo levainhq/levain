@@ -267,6 +267,8 @@ if _SHEET_CSP == _CSP:     # pragma: no cover - a reworded policy must not leave
 # The cockpit page that shows the sheet over itself may frame its own origin (default-src 'none' refuses any frame);
 # it stays unframable itself.
 _COCKPIT_PAGE = "/"
+if "frame-src" in _CSP:     # pragma: no cover - the cockpit page's frame-src is appended once, never beside another
+    raise ImportError("levain.web_server: the shared CSP already names a frame-src")
 _COCKPIT_PAGE_CSP = _CSP + "; frame-src 'self'"
 
 
@@ -1044,7 +1046,7 @@ class _Handler(GuardedHandler):
         refused anyway (X-Frame-Options DENY). The sign sheet ``GET /sign/<id>`` is the same class (OS-1: a sign link
         opened from a message or a mail page; a static shell whose reads are same-origin and gated), exact raw path too;
         a cross-site frame of it is refused here, its own-origin frame is what its headers admit."""
-        return (self.command == "GET" and (self.path == "/pair" or _sheet_id(self.path) is not None)
+        return (self.command == "GET" and (self.path == "/pair" or _sheet_id(self.path.split("?", 1)[0]) is not None)
                 and self.headers.get("Sec-Fetch-Site") == "cross-site"
                 and self.headers.get("Sec-Fetch-Mode") == "navigate"
                 and self.headers.get("Sec-Fetch-Dest") == "document")

@@ -204,11 +204,11 @@ def test_the_overlay_closes_on_its_own_button_and_on_escape(tmp_path: Path, monk
             {"eval": f"{OPEN_SHEET}.click() || 1"},
             {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state", "ms": 30000},
             {"eval": "document.querySelector('#levain-sign-sheet .modal-close').click() || 1"},
-            {"eval": f"!{FRAME}"},
+            {"eval": f"new Promise((r) => setTimeout(() => r(!{FRAME}), 1500))"},       # the close is asked of the sheet first
             {"eval": "window.LevainSignSheet.open('np-card-question-01') && 1"},
             {"eval": "document.getElementById('levain-sign-sheet').dispatchEvent(new KeyboardEvent('keydown', "
                      "{key: 'Escape', bubbles: true})) && 1"},
-            {"eval": f"!{FRAME}"},
+            {"eval": f"new Promise((r) => setTimeout(() => r(!{FRAME}), 1500))"},       # the close is asked of the sheet first
             {"eval": "window.LevainSignSheet.open('../../evil') === null && !document.getElementById('levain-sign-sheet')"},
             # a message from anything but the sheet's own frame closes nothing
             {"eval": "window.LevainSignSheet.open('np-card-question-01') && 1"},
@@ -504,7 +504,7 @@ UNPAIRED_READ = "(real, u, o) => Promise.resolve({ ok: false, status: 403, json:
 
 
 @needs_browser
-def test_h9_a_close_from_the_sheet_re_reads_the_board(tmp_path: Path, monkeypatch) -> None:
+def test_h9_a_close_from_the_sheet_alone_schedules_no_board_read(tmp_path: Path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
@@ -513,7 +513,7 @@ def test_h9_a_close_from_the_sheet_re_reads_the_board(tmp_path: Path, monkeypatc
             {"until": f"!{FRAME} && 1", "ms": 5000},
             WAIT_RELOAD,
         ])
-    assert out["values"][-1] >= 1, out["values"]                     # the cockpit under it read again
+    assert out["values"][-1] == 0, out["values"]                     # a close alone read nothing again
 
 
 @needs_browser
@@ -775,3 +775,135 @@ def test_h20_one_open_read_while_the_answer_is_still_landing_keeps_the_sheet_fro
     assert v[-2] == [True, True], v                      # the second read found it closed: the controls stay frozen
     assert "no longer open" in v[-1], v
     assert rig.verifies(QRID)                            # the answer had landed after the first read
+
+
+# --- landing integration fixes (I1-I7) ------------------------------------------------------------------------------
+
+CARD_OPTION_A = "document.querySelector('#ck-needs .needs-question .sign-facet .sign-option')"
+CARD_NOTE = "document.querySelector('#ck-needs .needs-question .sign-facet .sign-note').textContent"
+PARENT_X = "document.querySelector('#levain-sign-sheet .modal-close')"
+
+
+@needs_browser
+def test_i1_a_card_ceremony_in_flight_locks_the_sheet_button_and_the_sheet_cannot_open(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(),
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            _stub(),
+            {"eval": f"window.__stub['/challenge'] = {HANG}; {CARD_OPTION_A}.click() || 1"},
+            {"until": f"{OPEN_SHEET}.disabled && 1", "ms": 10000, "may_timeout": True},
+            {"eval": f"{OPEN_SHEET}.disabled"},
+            {"eval": f"window.LevainSignSheet.open('{QRID}') === null && !document.getElementById('levain-sign-sheet')"},
+        ])
+    v = out["values"]
+    assert v[-2] is True and v[-1] is True, v
+
+
+@needs_browser
+def test_i1_an_open_sheet_holds_the_lease_so_a_card_tap_asks_for_no_challenge(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), *OPEN_FRAMED,
+            {"eval": f"{CARD_OPTION_A}.click() || 1"},
+            {"eval": CARD_NOTE},
+            {"eval": PARENT_X + ".click() || 1"},
+            {"until": f"!{FRAME} && 1", "ms": 5000},
+            {"eval": f"{CARD_OPTION_A}.click() || 1"},
+            {"until": f"/asking|confirm|challenge/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 10000, "may_timeout": True},
+        ])
+    v = out["values"]
+    assert "already being asked for" in v[-5], v                   # while the sheet is up the tap does nothing
+    assert not isinstance(v[-1], dict), v                         # and after it closed the lease is back: the tap runs
+    challenges = [p for p in out["posts"] if p.split(" ", 1)[0].endswith("/challenge")]
+    assert len(challenges) == 1, out["posts"]
+
+
+@needs_browser
+@needs_ssh
+def test_i2_the_parents_close_while_the_answer_is_held_stays_open_then_the_second_close_leaves(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), *OPEN_FRAMED,
+            _stub(f"{FRAME}.contentWindow"),
+            {"eval": f"{FRAME}.contentWindow.__stub['/answer'] = {_hold('__answer')}; {CHOICE_IN('b')}.click() || 1"},
+            {"until": "typeof window.__answer === 'function' && 1", "ms": 30000},
+            {"eval": PARENT_X + ".click() || 1"},
+            {"eval": AFTER_MS(2500)},                                    # past the parent's acknowledgement window
+            {"eval": f"[!!{FRAME}, {SIGNING_IN}]"},
+            {"eval": PARENT_X + ".click() || 1"},
+            {"until": f"!{FRAME} && 1", "ms": 5000},
+        ])
+    v = out["values"]
+    assert v[-3][0] is True and v[-3][1].startswith("Not confirmed:"), v         # the sheet applied its own rule: it stayed, and said so
+
+
+@needs_browser
+def test_i2_a_sheet_that_never_answers_is_closed_by_the_parent_and_the_board_is_read_more_than_once(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, *OPEN_FRAMED,
+            # the frame stops listening: the sheet's message handler is the thing under test
+            {"eval": f"{FRAME}.contentWindow.postMessage = () => {{}}; 1"},
+            {"eval": "window.__reloads = 0; 1"},
+            {"eval": PARENT_X + ".click() || 1"},
+            {"until": f"!{FRAME} && 1", "ms": 5000},
+            {"eval": "new Promise((r) => setTimeout(() => r(window.__reloads), 11000))"},
+        ])
+    assert out["values"][-1] >= 2, out["values"]                      # a latched read: one early reload is not all
+
+
+@needs_browser
+@needs_ssh
+def test_i3_a_cancelled_retry_keeps_the_remembered_credential(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    fp = rig.pk.key.fingerprint
+    cancel = ("(() => { navigator.credentials.get = (o) => Promise.reject(new DOMException('cancelled', 'NotAllowedError')); "
+              "return 1; })()")
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), _seed("localhost", {fp: CARD_CRED}),
+            *_open(rig), {"eval": cancel},
+            {"eval": f"{_button('b')}.click() || 1"},
+            {"until": f"/nothing was signed/.test({NOTE}) && 1", "ms": 30000},
+            {"eval": "window.localStorage.getItem('levain-passkeys:localhost')"},
+        ])
+    assert json.loads(out["values"][-1]) == {fp: CARD_CRED}, out["values"]
+    assert rig.nothing_signed(QRID)
+
+
+@needs_browser
+def test_i4_a_node_the_board_adds_to_the_body_while_the_sheet_is_open_is_inert(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, *OPEN_FRAMED,
+            {"eval": "(() => { const d = document.createElement('div'); d.id = 'redrawn'; const b = document.createElement('button'); "
+                     "d.appendChild(b); document.body.appendChild(d); return new Promise((r) => setTimeout(() => r(d.inert), 100)); })()"},
+            {"eval": PARENT_X + ".click() || 1"},
+            {"until": f"!{FRAME} && 1", "ms": 5000},
+            {"eval": "document.getElementById('redrawn').inert"},
+        ])
+    v = out["values"]
+    assert v[-4] is True, v
+    assert v[-1] is False, v                                           # given back on close
+
+
+@needs_browser
+def test_i5_the_signer_picker_is_not_a_ceremony_in_flight(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch, two_keys=True)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, *OPEN_FRAMED,
+            {"eval": f"{CHOICE_IN('b')}.click() || 1"},
+            {"until": f"{IN}.querySelector('#sheet-actions .sheet-key') && 1", "ms": 30000},
+            {"eval": CLOSE_IN_FRAME},
+            {"until": f"!{FRAME} && 1", "ms": 3000, "may_timeout": True},
+            {"eval": f"!!{FRAME}"},
+        ])
+    assert out["values"][-1] is False, out["values"]                   # nothing was posted: the close leaves at once
+    assert not [p for p in out["posts"] if p.split(" ", 1)[0].endswith("/challenge")], out["posts"]

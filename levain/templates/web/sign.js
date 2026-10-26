@@ -61,6 +61,14 @@
     if (!framed) return;
     try { window.parent.postMessage({ levainSheet: what, id: id }, location.origin); } catch (e) { /* no parent to tell */ }
   }
+  // the cockpit asks to close the overlay (its x, its Escape): this page answers "ack" at once, so the parent knows a
+  // sheet is listening, then applies its own close rule (askClose below), which tells "close" only when it may leave
+  if (framed) {
+    window.addEventListener("message", (ev) => {
+      if (ev.source !== window.parent || ev.origin !== location.origin) return;
+      if (ev.data && typeof ev.data === "object" && ev.data.levainSheetCmd === "close") { tell("ack"); askClose(); }
+    });
+  }
   (function back() {
     if (!framed) return;      // top-level: the link to the cockpit is the way back
     const p = $("sheet-back");
@@ -234,7 +242,6 @@
     const run = (choice, words, expect) => {
       if (busy) return;
       busy = true;
-      flight = true;
       active = r;
       lock(true);
       if (expect) signing(expect, "page", "Signing");
@@ -397,6 +404,7 @@
     let sent = false, line = "";
     const unsigned = (m) => { say(/nothing was signed/.test(m) ? m : m + "; nothing was signed.", "bad"); return "unsigned"; };
     say(choice !== undefined ? "Asking for the challenge for (" + choice + ")…" : "Asking for the challenge…");
+    flight = true;        // from the request for the challenge: the signer picker before it posts nothing
     return call(base + "challenge", body).then((c) => {
       if (!c.ok) return unsigned("Not signed: " + why(c));
       if (!decodable(c.body.challenge)) return unsigned("The cockpit sent a malformed challenge");
@@ -410,11 +418,10 @@
         if (id) pk.allowCredentials = [{ type: "public-key", id: id }];
         return navigator.credentials.get({ publicKey: pk });
       };
-      // a NotAllowedError for the id this browser remembered may be a passkey since removed: forget it and ask once more
-      // with no id, so the next answer is the passkey actually held (remembered below)
+      // a NotAllowedError for the id this browser remembered may be a passkey since removed, or only a cancel: ask once
+      // more with no id. The record is kept until a passkey signs with a different credential (remembered below)
       const asked = ask(allow).catch((e) => {
         if (!(e && e.name === "NotAllowedError" && allow && k.local)) throw e;
-        forget(rp, fp);
         return ask(null);
       });
       return asked.then((cred) => {
