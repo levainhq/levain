@@ -4376,7 +4376,10 @@
     }
     // OS-2: where this cockpit answers (pending) or rules (undecided) the request with a passkey, the sheet does it
     if (b.sheet === true && typeof b.id === "string" && b.id) {
-      const btn = el("button", "undo-btn consent-sheet-open", pending ? "answer with your passkey" : "rule with your passkey");
+      // no answer a passkey may sign here (none enrolled, or a ported page): the sheet says why, not "with your passkey"
+      const can = Array.isArray(b.sheet_choices) && b.sheet_choices.length > 0;
+      const btn = el("button", "undo-btn consent-sheet-open", !can ? "why no passkey answers this here"
+        : pending ? "answer with your passkey" : "rule with your passkey");
       btn.type = "button";
       btn.dataset.consentSheet = pending ? "answer" : "rule";
       btn.title = "open the sign sheet for this request";
@@ -5130,13 +5133,13 @@
     signBusy++;
     signSheetLease = true;
     try {
-      return buildSignSheet(id, version, choice);
+      return buildSignSheet(path, version, choice, what);
     } catch (e) {
       closeSignSheet();   // a build that threw gives back the lease and whatever it had made inert
       return null;
     }
   }
-  function buildSignSheet(id, version, choice) {
+  function buildSignSheet(path, version, choice, what) {
     let frag = typeof version === "string" && /^[0-9a-f]{16}/.test(version) ? "v=" + version.slice(0, 16) : "";
     if (frag && typeof choice === "string" && /^[a-z0-9]{1,8}$/.test(choice)) frag += "&choice=" + choice;
     const veil = el("div", "modal-overlay");
@@ -5547,20 +5550,22 @@
     if (full && card._needsItem && Number.isFinite(Date.parse(card._needsItem.c.expiresAt))) {
       parts.push(label("Expires"), el("div", "ext-meta needs-expires", new Date(card._needsItem.c.expiresAt).toLocaleString()));
     }
-    // Allow and Deny are one component at one weight: neither is filled, neither leads. Where this cockpit answers the
-    // request with a passkey (the body's `sheet`, OS-2), each opens the sign sheet with that answer picked, and the terminal
-    // commands stay under the card's details; elsewhere each copies the terminal command that answers.
+    // Allow and Deny are one component at one weight: neither is filled, neither leads. An answer the sheet offers here
+    // (the body's `sheet_choices`, OS-2: a passkey enrolled that may sign it) opens the sign sheet with that answer picked;
+    // any other copies the terminal command that answers (a passkey never allows a T3 request, so its Allow stays a
+    // terminal line and never opens a sheet that offers only Deny). The terminal commands stay under the card's details.
     const acts = el("div", "needs-actions");
     const cmds = [];
     const cid = card._needsItem && card._needsItem.c ? card._needsItem.c.id : "";
-    const signsHere = b.sheet === true && typeof cid === "string" && !!cid;
+    const choices = b.sheet === true && typeof cid === "string" && cid && Array.isArray(b.sheet_choices)
+      ? b.sheet_choices.filter((k) => k === "allow" || k === "deny") : [];
     for (const [label, cmd] of [["Allow", sv(b.answer_allow)], ["Deny", sv(b.answer_deny)]]) {
       if (!cmd) continue;
       const btn = el("button", "needs-btn", label);
       btn.type = "button";
       btn.dataset.label = label;
       const code = el("code", "consent-code", cmd);
-      if (signsHere) {
+      if (choices.includes(label.toLowerCase())) {
         btn.title = label.toLowerCase() + " with your passkey, in the sign sheet";
         btn.dataset.consentSheet = label.toLowerCase();
         btn.addEventListener("click", () => openConsentSheet(cid, sv(b.sheet_v), label.toLowerCase()));
@@ -5579,7 +5584,9 @@
     slot.replaceChildren(...parts);
     // the actions and the one-line footer are the card's own rows, pinned below the body so cards in a row end alike
     if (acts.childElementCount) card.appendChild(acts);
-    card.appendChild(needsDetails(more, signsHere ? "signs with your passkey here" : "signs on your phone", card));
+    const here = choices.length === 2 ? "signs with your passkey here"
+      : choices.length ? choices[0] + " signs with your passkey here" : "signs on your phone";
+    card.appendChild(needsDetails(more, here, card));
   }
   function consentCard(c, full) {
     const card = el("div", "needs-card needs-consent" + (full ? " is-full" : ""));
