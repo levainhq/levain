@@ -17,11 +17,12 @@ of the whole B3 policy (R7): no UDP or ICMP is probed.
 4. ``probe-lock``: the session END lock (``runtime_helper.session_lock``, a TRY-lock: held = ``session-busy``). Under
    it alloc is re-read (changed = ``not-probeable:alloc-changed``), the record state re-checked and the slot state
    must still name this lease (``slot-not-ours``); then ``probe-spawn``: the child through the wall's ``probe`` target
-   (:data:`levain.slot.wall.PROBE_MODULE`), its result read to EOF and the child reaped, all inside
-   :data:`PROBE_REAP_S` of the spawn (codex MED: EOF is not a reap). On every path the child's process GROUP is
-   then killed, and a child not yet reaped is killed and reaped, before the lock is released (N7). The probe never
-   kills the slot's domain: at ACTIVE that is the vendor. Released, then the reaper is woken (``start._wake``), as
-   ``start`` does.
+   (:data:`levain.slot.wall.PROBE_MODULE`), its result read to EOF, the child's exit seen WITHOUT reaping it, its
+   process GROUP killed, then the child reaped, all inside :data:`PROBE_REAP_S` of the spawn (codex MED: EOF is not
+   a reap). On a path that leaves before the exit is seen, the group is killed and then the child killed and reaped.
+   Either way the group is signalled only while its leader is unreaped, so the pid cannot have been reused (X4), and
+   before the lock is released (N7). The probe never kills the slot's domain: at ACTIVE that is the vendor.
+   Released, then the reaper is woken (``start._wake``), as ``start`` does.
 5. ``probe-control-after``: CONTROL again (codex MED: an address counts as closed only when root connected to it both
    before and after the slot could not). Not run when the slot connected to any address: that is ``firewall-open``
    at once (L3 r1 X3).
@@ -41,6 +42,7 @@ from __future__ import annotations
 
 import errno
 import os
+import select
 import selectors
 import signal
 import socket
@@ -87,14 +89,50 @@ RECORD_FORMAT = "levain-probe-result/1"
 _RECORDED = {OPEN: "open", INCONCLUSIVE: "inconclusive", UNKNOWN: "unknown"}
 
 
+def exited_unreaped(pid: int, timeout: float) -> bool:
+    """True when ``pid``, the caller's own child, has exited within ``timeout`` seconds, WITHOUT reaping it (X4: the
+    group is killed while the leader is a zombie, so neither its pid nor its group id can have been reused). macOS:
+    a kqueue ``NOTE_EXIT`` watch (on a child that is already a zombie the registration itself answers ``ESRCH``,
+    measured on this Mac 10-25); Linux: a pidfd, readable once the process has exited (kernel 5.3+). Anything that
+    cannot watch answers False, which the probe reads as unknown, never as the wall."""
+    try:
+        if hasattr(select, "kqueue"):
+            kq = select.kqueue()
+            try:
+                ev = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                   fflags=select.KQ_NOTE_EXIT)
+                got = kq.control([ev], 1, timeout)
+            finally:
+                kq.close()
+            for g in got:
+                if g.flags & select.KQ_EV_ERROR:
+                    return g.data == errno.ESRCH          # registered on our own zombie: it has exited
+                if g.fflags & select.KQ_NOTE_EXIT:
+                    return True
+            return False
+        fd = os.pidfd_open(pid)                           # type: ignore[attr-defined]  # Linux, Python 3.9+
+        try:
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            return bool(poller.poll(int(timeout * 1000)))
+        finally:
+            os.close(fd)
+    except OSError as e:
+        return e.errno == errno.ESRCH and hasattr(select, "kqueue")
+    except AttributeError:                                # no kqueue and no pidfd_open on this host
+        return False
+
+
 @dataclass
 class ProbeSeams:
     """The probe's own OS acts (None in ``runtime_helper.Seams.probe`` = these defaults). ``connect`` is CONTROL's
-    round of connects; ``killpg`` ends the child's process group."""
+    round of connects; ``killpg`` ends the child's process group; ``exited`` waits for the child's exit without
+    reaping it (:func:`exited_unreaped`)."""
 
     getaddrinfo: Callable[..., list] = socket.getaddrinfo
     connect: Callable[[Sequence[str]], Dict[str, PC.Outcome]] = PC.connect_all
     killpg: Callable[[int, int], None] = os.killpg
+    exited: Callable[[int, float], bool] = exited_unreaped
     resolve_s: float = RESOLVE_S
     reap_s: float = PROBE_REAP_S
 
@@ -286,17 +324,14 @@ def _read_result(fd: int, end: float, monotonic: Callable[[], float]) -> bytes:
             chunks.append(b)
 
 
-def _end_child(ctx: H.Ctx, ps: ProbeSeams, pid: int, *, reaped: bool) -> None:
-    """Every path out of the spawn, before the lock is released: the child's process GROUP killed (it was spawned
-    detached, so the group is the child's own: whatever it forked across ``launchctl asuser`` or the stage dies with
-    it, N7; codex MED), then, when the child itself is not reaped yet, the child SIGKILLed and its reap polled
-    (``runtime_helper.Seams.kill``). Never the slot's domain: at ACTIVE that is the vendor."""
+def _kill_group(ps: ProbeSeams, pid: int) -> None:
+    """The child's process GROUP SIGKILLed (it was spawned detached, so the group is the child's own: whatever it
+    forked across ``launchctl asuser`` or the stage dies with it, N7; codex MED). Called only while the leader is
+    unreaped, so ``pid`` still names it and its group (X4). Never the slot's domain: at ACTIVE that is the vendor."""
     try:
         ps.killpg(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
-    if not reaped:
-        ctx.seams.kill(pid)
 
 
 def _probe_fenced(ctx: H.Ctx, a: R.Alloc, ips: Sequence[str]) -> Dict[str, str]:
@@ -324,6 +359,9 @@ def _probe_fenced(ctx: H.Ctx, a: R.Alloc, ips: Sequence[str]) -> Dict[str, str]:
             os.close(res_w)
         end = seams.monotonic() + ps.reap_s
         raw = _read_result(res_r, end, seams.monotonic)
+        if not ps.exited(pid, max(0.0, end - seams.monotonic())):
+            raise Refused(f"{UNKNOWN}:unreaped", "the child did not exit after its result")
+        _kill_group(ps, pid)                 # X4: the leader exited and is not reaped yet, so pid is still its own
         try:
             status = seams.wait_within(pid, max(0.0, end - seams.monotonic()))
         except Refused:
@@ -335,8 +373,9 @@ def _probe_fenced(ctx: H.Ctx, a: R.Alloc, ips: Sequence[str]) -> Dict[str, str]:
         return parse_result(raw, ips)
     finally:
         os.close(res_r)
-        if pid is not None:
-            _end_child(ctx, ps, pid, reaped=reaped)
+        if pid is not None and not reaped:   # the leader is unreaped here: group first, then the child killed + reaped
+            _kill_group(ps, pid)
+            seams.kill(pid)
         seams.at("probe-reaped")
 
 

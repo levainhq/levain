@@ -607,7 +607,9 @@ class Probe:
         self.result = None           # None = every address blocked by timeout
         self.status = 0
         self.hold_open = False       # keep a copy of the write end: no EOF ever arrives
+        self.no_exit = False         # the result arrives, but the child never exits
         self.spawns, self.killpgs, self.kills, self.waits, self.held = [], [], [], [], []
+        self.events = []             # ("killpg" | "wait" | "kill" | "exited", pid) in call order
         self.kept = []
         self.next_pid = 72000
 
@@ -648,15 +650,21 @@ class Probe:
             self.kept.append(os.dup(exec_w))
         return pid
 
+    def exited(self, pid, timeout):
+        self.events.append(("exited", pid))
+        return not self.no_exit
+
     def wait_within(self, pid, bound):
         if pid not in {s["pid"] for s in self.spawns}:
             return self.la.wait_within(pid, bound)
         self.waits.append(pid)
+        self.events.append(("wait", pid))
         return self.status
 
     def kill(self, pid):
         if pid in {s["pid"] for s in self.spawns}:
             self.kills.append(pid)
+            self.events.append(("kill", pid))
         else:
             self.la.kill(pid)
 
@@ -679,7 +687,8 @@ def penv(tmp_path):
     s = w.seams
     s.spawn, s.wait_within, s.kill = pr.spawn, pr.wait_within, pr.kill
     s.probe = PB.ProbeSeams(getaddrinfo=pr.getaddrinfo, connect=pr.connect,
-                            killpg=lambda pid, sig: pr.killpgs.append((pid, sig)), resolve_s=2.0, reap_s=2.0)
+                            killpg=lambda pid, sig: pr.killpgs.append((pid, sig)) or pr.events.append(("killpg", pid)),
+                            exited=pr.exited, resolve_s=2.0, reap_s=2.0)
     (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(_base_v2()))
     yield w, la, table, pr
     pr.close()
@@ -729,6 +738,8 @@ def test_t6_rendered_probe_closed_in_order_spawned_under_the_lock(penv, monkeypa
     import signal
     # the group is killed on every path (nothing it forked outlives the lock); the reaped child is not re-killed
     assert pr.rounds == 2 and pr.killpgs == [(sp["pid"], signal.SIGKILL)] and pr.kills == []
+    # X4: the group is killed while its leader is still unreaped (its pid and group id cannot be reused), then reaped
+    assert pr.events == [("exited", sp["pid"]), ("killpg", sp["pid"]), ("wait", sp["pid"])]
     rec = _record(w)
     assert (rec["format"], rec["session"], rec["outcome"], rec["cause"]) == \
         ("levain-probe-result/1", s, "closed", "closed")
@@ -864,6 +875,53 @@ def test_t6_no_eof_kills_the_group_then_reaps_before_release(penv):
     assert pr.killpgs == [(pid, signal.SIGKILL)] and pr.kills == [pid] and pr.waits == []
     assert ("probe-release", [pid]) in order                     # killed and reaped BEFORE the lock was released
     assert _record(w)["outcome"] == "unknown"
+
+
+def test_t6_result_without_exit_kills_the_group_then_the_child(penv):
+    """X4: EOF arrived but the leader never exited inside the bound: unknown, the group killed while the leader is
+    unreaped, then the leader killed and reaped; never a wait that reaps first."""
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    pr.no_exit = True
+    assert w.main(["probe", s])[1]["refused"] == "firewall-probe-unknown:unreaped"
+    pid = pr.spawns[0]["pid"]
+    assert pr.events == [("exited", pid), ("killpg", pid), ("kill", pid)]
+
+
+def _fork(body):
+    pid = os.fork()
+    if pid == 0:                     # pragma: no cover - the child
+        try:
+            body()
+        finally:
+            os._exit(0)
+    return pid
+
+
+@pytest.mark.skipif(not hasattr(__import__("select"), "kqueue") and not hasattr(os, "pidfd_open"),
+                    reason="no exit watch on this host")
+def test_x4_exited_unreaped_on_real_children():
+    """The real watch on this host's own children (no network, no profile): a zombie is seen as exited and is
+    still ours to reap afterwards; a child exiting inside the bound is seen; one that outlives it is not."""
+    import time
+
+    from levain.slot.probe import exited_unreaped
+
+    pid = _fork(lambda: None)
+    time.sleep(0.2)                                     # a zombie by now
+    assert exited_unreaped(pid, 1.0) is True
+    assert os.waitpid(pid, 0)[0] == pid                 # not reaped by the watch
+    pid = _fork(lambda: time.sleep(0.2))
+    assert exited_unreaped(pid, 3.0) is True
+    assert os.waitpid(pid, 0)[0] == pid
+    pid = _fork(lambda: time.sleep(5))
+    t0 = time.monotonic()
+    try:
+        assert exited_unreaped(pid, 0.2) is False
+        assert time.monotonic() - t0 < 2
+    finally:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
 
 
 @pytest.mark.parametrize("result,status", [(b"garbage\n", 0), (None, 3), (b"x" * 5000, 0)])
