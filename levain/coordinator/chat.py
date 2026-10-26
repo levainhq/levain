@@ -21,17 +21,22 @@ CH-D1b (rev 6 §2.7, §4.2, §6, §7.1-§7.4) adds ``chat_launch_checks`` and it
 :class:`ChatService`, which walks the send path (preflight + ``pending``, the one attempt, the driver call, its outcome),
 the crash rule on restart, the vendor read (events and cursor in one transaction) and the ambiguous reconciliation
 over :class:`~levain.coordinator.driver.DriverSession` s that decide nothing, plus ``chat_anomalies``: a proof that
-arrived after its send's record was terminal, kept beside the record it contradicts.
+arrived after its send's record was terminal, kept beside the record it contradicts. Its second slice adds
+``chat_echoes`` (§2.9) and, in the transaction that records a user item, §7.6's echo search and §5.4's outside
+epoch; the timeline's echo join; the cursor read-back (:meth:`ChatService.read_next`); the unfenced
+:meth:`ChatService.interrupt` (§9, the session call only); and :func:`_ensure`, the one path that brings a store
+made by an earlier release current (head ruling Q-A, 1025+40).
 
 NOT HERE: CH-D1c's ``chat_approvals`` and ``chat_approval_events`` (the view's seam for them is named in
-:data:`CHAT_SCHEMA`, "SEAM CH-D1c"), and CH-D1b's later slices: ``chat_echoes`` and the outside-epoch trigger (§5.4,
-§7.6), the probe that writes ``live`` / ``not_live`` and Claude's boundaries and tripwires (§4.2 R9, §4.4), the pump
-thread and the composer states.
+:data:`CHAT_SCHEMA`, "SEAM CH-D1c"), and CH-D1b's later slices: the probe that writes ``live`` / ``not_live`` and
+Claude's boundaries and tripwires (§4.2 R9, §4.4), the pump thread and the composer states.
 
-[seat] numbers rev 2 marks ``[seat]``: :data:`EVENT_BODY_MAX`; :data:`ATTACHMENTS_MAX` is this lane's. Stdlib only.
+[seat] numbers rev 2 marks ``[seat]``: :data:`EVENT_BODY_MAX`, and rev 4's §7.6 :data:`ECHO_WINDOW`;
+:data:`ATTACHMENTS_MAX` is this lane's. Stdlib only.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
@@ -41,15 +46,17 @@ import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from levain import unshowable
 from levain.autonomic.durable_sqlite import read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
+from levain.cockpit.consent import parse_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import chat_lease
 from levain.coordinator.chat_lease import TURN_LEASE_SCHEMA, TurnLease, TurnRefused, TurnView
-from levain.coordinator.driver import NotSent, SendCommand, SendResult
+from levain.coordinator.driver import CommandResult, InterruptCommand, NotSent, SendCommand, SendResult
 from levain.coordinator.store import WORDS_MAX, CoordError, _append_only, _in, next_gseq, schema_present
 
 __all__ = [
@@ -79,6 +86,8 @@ EVENT_KINDS = ("turn_started", "turn_ended", "user_item", "agent_text", "tool_ca
 EVENT_BODY_MAX = 16 * 1024
 # [seat, chd1a] how many attachment digests one message names
 ATTACHMENTS_MAX = 20
+# [seat] §7.6 condition 3: a user item recorded this long after a send's attempt committed is never its echo
+ECHO_WINDOW = timedelta(seconds=60)
 
 _MESSAGE_ID = re.compile(r"cm-[0-9a-f]{32}")
 _THREAD_ID = re.compile(r"th-[0-9a-f]{32}")
@@ -218,29 +227,50 @@ CHAT_SCHEMA: tuple[str, ...] = (
     f"CREATE TRIGGER IF NOT EXISTS chat_launch_checks_reenable BEFORE INSERT ON chat_launch_checks "
     f"WHEN NEW.kind = 'reenabled' AND NOT ({_LATCHED_LIVE}) "
     "BEGIN SELECT RAISE(ABORT, 'a re-enable clears a latch whose latest probe read live'); END",
+    # §2.9 (CH-D1b): a user item that is probably our own send. NOT authorship and NOT delivery: nothing reads it to
+    # set an outbox state (B12); it answers only whether the item opened an outside epoch (§7.6). One per message
+    "CREATE TABLE IF NOT EXISTS chat_echoes (launch_id TEXT NOT NULL REFERENCES launches(launch_id), "
+    "vendor_event_key TEXT NOT NULL, message_id TEXT NOT NULL UNIQUE REFERENCES chat_messages(message_id), "
+    "gseq INTEGER NOT NULL UNIQUE, basis TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (launch_id, vendor_event_key), "
+    "FOREIGN KEY (launch_id, vendor_event_key) REFERENCES chat_events(launch_id, vendor_event_key))",
+    *_append_only("chat_echoes", "a chat echo"),
+    "CREATE TRIGGER IF NOT EXISTS chat_echoes_no_replace BEFORE INSERT ON chat_echoes WHEN EXISTS (SELECT 1 FROM "
+    "chat_echoes WHERE (launch_id = NEW.launch_id AND vendor_event_key = NEW.vendor_event_key) "
+    "OR message_id = NEW.message_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a chat echo is never replaced'); END",
     *TURN_LEASE_SCHEMA,
     # §2.8: one thread in the store-wide order, over dispatch.db rows only. A message carries its latest outbox state
-    # as a status, never as rows of its own; a vendor event joins the thread its worker launch holds; a reply joins
+    # as a status, never as rows of its own; a vendor event joins the thread its worker launch holds, and a user item
+    # with a chat_echoes row is "the vendor's copy of" the message echo_of names, never an outside line; a reply joins
     # once it has a gseq (the old ones are timeline()'s "before the chat record" block); an envelope joins by its
-    # bind and its attenuations (one naming no thread narrows every thread the envelope is bound to).
+    # bind and its attenuations (one naming no thread narrows every thread the envelope is bound to). A store holding
+    # an older text of this view is brought current by _ensure (ChatStore._connect runs it).
     # SEAM CH-D1c: chat_approvals + chat_approval_events join this view when they are built (§2.5-§2.7)
-    "CREATE VIEW IF NOT EXISTS chat_timeline (thread_id, gseq, kind, source, ref_id, launch_id, status, body, at) AS "
+    "CREATE VIEW IF NOT EXISTS chat_timeline (thread_id, gseq, kind, source, ref_id, launch_id, status, body, at, "
+    "echo_of) AS "
     "SELECT m.thread_id, m.gseq, 'message', m.author_kind, m.message_id, m.launch_id, "
     "(SELECT o.state FROM chat_outbox_events o WHERE o.message_id = m.message_id ORDER BY o.seq DESC LIMIT 1), "
-    "m.body, m.at FROM chat_messages m "
-    "UNION ALL SELECT j.value, e.gseq, 'vendor_' || e.kind, e.source, e.vendor_event_key, e.launch_id, NULL, e.body, "
-    "e.at FROM chat_events e JOIN launches l ON l.launch_id = e.launch_id, json_each(l.threads) j "
+    "m.body, m.at, NULL FROM chat_messages m "
+    "UNION ALL SELECT j.value, e.gseq, CASE WHEN x.message_id IS NULL THEN 'vendor_' || e.kind ELSE 'vendor_echo' "
+    "END, e.source, e.vendor_event_key, e.launch_id, NULL, e.body, e.at, x.message_id "
+    "FROM chat_events e JOIN launches l ON l.launch_id = e.launch_id JOIN json_each(l.threads) j "
+    "LEFT JOIN chat_echoes x ON x.launch_id = e.launch_id AND x.vendor_event_key = e.vendor_event_key "
     "UNION ALL SELECT r.thread_id, r.gseq, CASE r.kind WHEN 'drop_receipt' THEN 'reply_receipt' "
     "WHEN 'sign' THEN 'reply_sign' WHEN 'answer' THEN 'reply_answer' WHEN 'know' THEN 'reply_know' END, "
-    "'levain', r.reply_id, NULL, NULL, r.body, r.at FROM replies r "
+    "'levain', r.reply_id, NULL, NULL, r.body, r.at, NULL FROM replies r "
     "WHERE r.gseq IS NOT NULL AND r.thread_id IS NOT NULL "
-    "UNION ALL SELECT b.thread_id, b.gseq, 'envelope_bound', 'levain', b.envelope_id, NULL, NULL, NULL, b.at "
+    "UNION ALL SELECT b.thread_id, b.gseq, 'envelope_bound', 'levain', b.envelope_id, NULL, NULL, NULL, b.at, NULL "
     "FROM envelope_binds b "
-    "UNION ALL SELECT a.thread_id, a.gseq, 'attenuation_' || a.kind, a.by, a.envelope_id, NULL, NULL, a.value, a.at "
-    "FROM envelope_attenuations a WHERE a.thread_id IS NOT NULL "
-    "UNION ALL SELECT b.thread_id, a.gseq, 'attenuation_' || a.kind, a.by, a.envelope_id, NULL, NULL, a.value, a.at "
-    "FROM envelope_attenuations a JOIN envelope_binds b ON b.envelope_id = a.envelope_id WHERE a.thread_id IS NULL",
+    "UNION ALL SELECT a.thread_id, a.gseq, 'attenuation_' || a.kind, a.by, a.envelope_id, NULL, NULL, a.value, a.at, "
+    "NULL FROM envelope_attenuations a WHERE a.thread_id IS NOT NULL "
+    "UNION ALL SELECT b.thread_id, a.gseq, 'attenuation_' || a.kind, a.by, a.envelope_id, NULL, NULL, a.value, a.at, "
+    "NULL FROM envelope_attenuations a JOIN envelope_binds b ON b.envelope_id = a.envelope_id "
+    "WHERE a.thread_id IS NULL",
 )
+# (table, column, declaration): a column a released table gains, added by ChatStore._ensure when it is missing. Only
+# additive columns (nullable, or NOT NULL with a constant default; SQLite's ALTER TABLE refuses the rest). The table's
+# CREATE statement above must carry the same column, so a new store has it from the start
+CHAT_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = ()
 
 
 class MessageConflict(CoordError):
@@ -304,6 +334,7 @@ class TimelineRow:
     status: str | None    # a message's latest outbox state
     body: str | None
     at: str
+    echo_of: str | None = None    # a vendor_echo row's message: the vendor's copy of it (never authorship, §2.9)
 
 
 def body_sha256(text: str) -> str:
@@ -570,7 +601,9 @@ def record_cursor(conn: sqlite3.Connection, now: str, *, launch_id: str, vendor_
 def timeline(conn: sqlite3.Connection, thread_id: str) -> tuple[list[TimelineRow], list[TimelineRow]]:
     """``(before, merged)`` for a thread: ``merged`` is :data:`CHAT_SCHEMA`'s view in ``gseq`` order; ``before`` holds
     the thread's replies written before replies carried a gseq, ordered by ``at`` among themselves (one store, one
-    clock) and never merged into that order (§2.8: no ordering by ``at`` across the merged stream)."""
+    clock) and never merged into that order (§2.8: no ordering by ``at`` across the merged stream). A store whose
+    view is an older text (no ``echo_of`` column; a read-only reader brings nothing current) reads with ``echo_of``
+    None."""
     if not isinstance(thread_id, str) or _THREAD_ID.fullmatch(thread_id) is None or conn.execute(
             "SELECT 1 FROM threads WHERE thread_id = ?", (thread_id,)).fetchone() is None:
         raise CoordError(f"no thread {str(thread_id)[:40]!r}")
@@ -578,10 +611,78 @@ def timeline(conn: sqlite3.Connection, thread_id: str) -> tuple[list[TimelineRow
         "SELECT reply_id, CASE kind WHEN 'drop_receipt' THEN 'reply_receipt' WHEN 'sign' THEN 'reply_sign' "
         "WHEN 'answer' THEN 'reply_answer' WHEN 'know' THEN 'reply_know' END, body, at FROM replies "
         "WHERE thread_id = ? AND gseq IS NULL ORDER BY at, rowid", (thread_id,))]
+    echo = "echo_of" if "echo_of" in {r[1] for r in conn.execute("PRAGMA table_info(chat_timeline)")} else "NULL"
     merged = [TimelineRow(*r) for r in conn.execute(
-        "SELECT gseq, kind, source, ref_id, launch_id, status, body, at FROM chat_timeline WHERE thread_id = ? "
-        "ORDER BY gseq", (thread_id,))]
+        f"SELECT gseq, kind, source, ref_id, launch_id, status, body, at, {echo} FROM chat_timeline "
+        "WHERE thread_id = ? ORDER BY gseq", (thread_id,))]
     return before, merged
+
+
+_VIEW = re.compile(r"CREATE VIEW IF NOT EXISTS (\w+) ")
+
+
+@functools.lru_cache(maxsize=4)
+def _view_texts(statements: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    """``(name, sql)`` of every view ``statements`` create, as THIS SQLite stores it in ``sqlite_master`` (read back
+    from a scratch in-memory database, never a hand normalisation of the text: SQLite drops ``IF NOT EXISTS``, and a
+    view's tables need not exist to create it)."""
+    scratch = sqlite3.connect(":memory:")
+    try:
+        names = []
+        for stmt in statements:
+            m = _VIEW.match(stmt)
+            if m is not None:
+                scratch.execute(stmt)
+                names.append(m.group(1))
+        return tuple((n, scratch.execute("SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?",
+                                         (n,)).fetchone()[0]) for n in names)
+    finally:
+        scratch.close()
+
+
+def _stale(conn: sqlite3.Connection) -> tuple[list[str], list[tuple[str, str, str]]]:
+    """What a store holds that is not current: ``(views whose stored text differs from CHAT_SCHEMA's, added columns
+    a present table lacks)``. A view or table the file does not hold yet is not stale: its CREATE makes it."""
+    stored = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'view'").fetchall())
+    views = [n for n, sql in _view_texts(CHAT_SCHEMA) if n in stored and stored[n] != sql]
+    columns = []
+    for table, column, decl in CHAT_ADDED_COLUMNS:
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if have and column not in have:
+            columns.append((table, column, decl))
+    return views, columns
+
+
+def _integrity(conn: sqlite3.Connection) -> list[tuple]:
+    return conn.execute("PRAGMA integrity_check").fetchall()
+
+
+def _ensure(conn: sqlite3.Connection) -> None:
+    """The ONE ensure-schema path of the chat tables (head ruling Q-A, 1025+40): in one ``BEGIN IMMEDIATE``, every
+    missing additive column (:data:`CHAT_ADDED_COLUMNS`) by ``ALTER TABLE ... ADD COLUMN``, ``DROP VIEW`` of every view
+    whose stored text is not :data:`CHAT_SCHEMA`'s, then every statement of :data:`CHAT_SCHEMA` (``IF NOT EXISTS``:
+    new tables, triggers and the dropped views); when anything changed, ``PRAGMA integrity_check`` must answer ``ok``
+    before the COMMIT. Any raise rolls all of it back. Rows and rowids are never rewritten (no table rebuild, no
+    ``writable_schema``)."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        before = conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()
+        views, columns = _stale(conn)
+        for table, column, decl in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        for name in views:
+            conn.execute(f"DROP VIEW IF EXISTS {name}")
+        for stmt in CHAT_SCHEMA:
+            conn.execute(stmt)
+        if conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall() != before:
+            check = _integrity(conn)
+            if check != [("ok",)]:
+                raise CoordError(f"bringing the chat tables current left the store failing its integrity check "
+                                 f"({str(check[:3])[:200]}); nothing was changed")
+        conn.execute("COMMIT")
+    except BaseException:
+        _rollback(conn)
+        raise
 
 
 class ChatStore:
@@ -598,14 +699,7 @@ class ChatStore:
         conn = self._opener._connect()
         if not self._ready:
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                try:
-                    for stmt in CHAT_SCHEMA:
-                        conn.execute(stmt)
-                    conn.execute("COMMIT")
-                except BaseException:
-                    _rollback(conn)
-                    raise
+                _ensure(conn)
             except BaseException:
                 conn.close()
                 raise
@@ -614,16 +708,17 @@ class ChatStore:
 
     def _read_connect(self) -> sqlite3.Connection:
         """A connection for a read that takes no write lock: the opener's (see its ``_read_connect``) once the chat
-        tables are in the file too; a file still missing them is made by :meth:`_connect`, under the lock."""
+        tables are in the file and current too; a file missing them, or holding an older view or a table short of a
+        column, is brought current by :meth:`_connect`, under the lock."""
         if self._ready:
             return self._connect()
         conn = self._opener._read_connect()
         try:
-            present = schema_present(conn, CHAT_SCHEMA)
+            current = schema_present(conn, CHAT_SCHEMA) and _stale(conn) == ([], [])
         except BaseException:
             conn.close()
             raise
-        if present:
+        if current:
             return conn
         conn.close()
         return self._connect()
@@ -959,6 +1054,76 @@ def _absent(read: _LaunchRead, lt: Callable[[str, str], bool], correlated: bool)
     return out
 
 
+def _last_cursor(conn: sqlite3.Connection, launch_id: str) -> str | None:
+    """The launch's last persisted vendor cursor (None before the first batch that named one): where a resumed
+    ``read`` starts (§2.4)."""
+    _worker_launch(conn, launch_id)
+    row = conn.execute("SELECT vendor_cursor FROM chat_cursors WHERE launch_id = ? AND vendor_cursor IS NOT NULL "
+                       "ORDER BY seq DESC LIMIT 1", (launch_id,)).fetchone()
+    return None if row is None else row[0]
+
+
+def _sent_turn(conn: sqlite3.Connection, message_id: str, attempt_gseq: int, launch_id: str) -> str | None:
+    """§7.6 condition 2: the vendor turn a send went into. Its ``SendResult``'s turn when the vendor named one; else
+    (a vendor that gives no turn id, or no reply yet) the turn the service had RECORDED as current when the attempt
+    committed: the latest ``turn_started`` recorded before the attempt row with no ``turn_ended`` recorded before it.
+    Those gseq comparisons order the service's own observations, never what the vendor saw first (§2.3). None: no
+    turn is known, and the send is no candidate."""
+    row = conn.execute("SELECT vendor_turn_id FROM chat_outbox_events WHERE message_id = ? AND vendor_turn_id IS NOT "
+                       "NULL ORDER BY seq DESC LIMIT 1", (message_id,)).fetchone()
+    if row is not None:
+        return row[0]
+    row = conn.execute("SELECT s.vendor_turn_id FROM chat_events s WHERE s.launch_id = ? AND s.kind = 'turn_started' "
+                       "AND s.vendor_turn_id IS NOT NULL AND s.gseq < ? AND NOT EXISTS (SELECT 1 FROM chat_events f "
+                       "WHERE f.launch_id = s.launch_id AND f.kind = 'turn_ended' AND f.vendor_turn_id = "
+                       "s.vendor_turn_id AND f.gseq < ?) ORDER BY s.gseq DESC LIMIT 1",
+                       (launch_id, attempt_gseq, attempt_gseq)).fetchone()
+    return None if row is None else row[0]
+
+
+def _echo_candidate(conn: sqlite3.Connection, now: str, message_id: str, item: ChatEvent) -> bool:
+    """§7.6 conditions 1, 2, 4 and the time half of 3 for one send whose window holds ``item`` (the positional half
+    is the caller's, from the driver's ``pos_lt``): latest state attempted / accepted / ambiguous and no echo row yet;
+    the same vendor turn; the item recorded within :data:`ECHO_WINDOW` of the attempt's commit; equal normalized
+    digests."""
+    row = conn.execute("SELECT m.body_norm_sha256, o.gseq, o.at FROM chat_messages m JOIN chat_outbox_events o ON "
+                       "o.message_id = m.message_id AND o.state = 'attempted' WHERE m.message_id = ?",
+                       (message_id,)).fetchone()
+    if row is None or outbox_state(conn, message_id) not in ("attempted", "accepted", "ambiguous"):
+        return False
+    norm, attempt_gseq, attempted_at = row
+    if conn.execute("SELECT 1 FROM chat_echoes WHERE message_id = ?", (message_id,)).fetchone() is not None:
+        return False
+    if item.vendor_turn_id is None or _sent_turn(conn, message_id, attempt_gseq, item.launch_id) != item.vendor_turn_id:
+        return False
+    if parse_stamp(now) - parse_stamp(attempted_at) > ECHO_WINDOW:
+        return False
+    return item.body_norm_sha256 == norm
+
+
+def _echo_or_outside(conn: sqlite3.Connection, now: str, item: ChatEvent, window: Sequence[str]) -> None:
+    """§7.6 then §5.4 for one just-recorded, non-backfill user item the vendor did not prove ours by op_id, in the
+    transaction that recorded it. The send's own accepted ``vendor_item_id`` is ours: nothing. Exactly one candidate
+    among the sends whose window holds the item (``window``): a ``chat_echoes`` row and no outside epoch. Zero, or two
+    or more: the item opens an outside epoch on a running launch (an ended one has no turn to hold). The echo row is
+    all this writes besides the lease: it never touches an outbox state (B12)."""
+    launch_id = item.launch_id
+    if conn.execute("SELECT 1 FROM chat_outbox_events o JOIN chat_messages m ON m.message_id = o.message_id WHERE "
+                    "m.launch_id = ? AND o.state = 'accepted' AND o.vendor_item_id = ?",
+                    (launch_id, item.vendor_event_key[len("user_item:"):])).fetchone() is not None:
+        return
+    found = [m for m in window if _echo_candidate(conn, now, m, item)]
+    if len(found) == 1:
+        conn.execute("INSERT INTO chat_echoes (launch_id, vendor_event_key, message_id, gseq, basis, at) VALUES "
+                     "(?, ?, ?, ?, ?, ?)",
+                     (launch_id, item.vendor_event_key, found[0], next_gseq(conn, now),
+                      _cause_text(f"same turn {item.vendor_turn_id}; equal normalized digest; sole candidate"), now))
+        return
+    if _launch_state(conn, launch_id)[1] == "active":
+        chat_lease.outside(conn, now, launch_id, "terminal",
+                           cause=f"a user item from outside Levain ({len(found)} candidate sends)")
+
+
 @dataclass(frozen=True)
 class _Seen:
     """One vendor event of a batch, every field read once, before any transaction (a driver's object is untrusted
@@ -1242,6 +1407,20 @@ class ChatService:
         (§2.4), resolving any send the batch proves, then re-check every ambiguous send of the launch (§7.3). An
         event at or before the launch's first ``complete_through`` is backfill. A ``complete_through`` before the
         one already persisted is not persisted: the frontier never moves back. The count of new events."""
+        with self._attached(launch_id) as session:
+            return self._ingest(launch_id, session, batch)
+
+    def read_next(self, launch_id: str) -> int:
+        """The cursor read-back: ``session.read(<the launch's last persisted vendor cursor>)`` (None before the
+        first), then :meth:`ingest` of what it returned, all under the launch's mutex. A restarted service resumes
+        where the last persisted batch ended. The count of new events."""
+        with self._attached(launch_id) as session:
+            cursor = self._chat._read(lambda conn: _last_cursor(conn, launch_id))
+            return self._ingest(launch_id, session, session.read(cursor))
+
+    @contextmanager
+    def _attached(self, launch_id: str) -> Iterator[Any]:
+        """The launch's mutex held, with its attached session; refused with nothing read when there is none."""
         refusal = f"no driver session is attached to launch {str(launch_id)[:40]}; nothing was read"
         if self._session(launch_id) is None:
             raise CoordError(refusal)
@@ -1249,62 +1428,74 @@ class ChatService:
             session = self._session(launch_id)
             if session is None:
                 raise CoordError(refusal)
-            correlated = bool(session.capabilities().correlation_field)
-            seen = []
-            for e in batch.events:
-                body = e.body
-                seen.append(_Seen(e.key, e.kind, e.pos, e.turn_id, e.call_id, body,
-                                  _plain_norm(session.normalize(body)) if isinstance(body, str) else body,
-                                  e.correlation, e.vendor_id))
-            through, cursor, gap = batch.complete_through, batch.next_cursor, bool(batch.gap)
-            def frontier(conn: sqlite3.Connection) -> tuple[str | None, str | None, tuple[int, int, int]]:
-                _worker_launch(conn, launch_id)
-                return _first_through(conn, launch_id), _anchor(conn, launch_id), _fingerprint(conn, launch_id)
+            yield session
 
-            first, prev, mark = self._chat._read(frontier)
-            backfill = [first is None or not session.pos_lt(first, e.pos) for e in seen]
-            if through is not None and prev is not None and session.pos_lt(through, prev):
-                through, gap = prev, False      # an older batch: the persisted frontier already covers its gap
-            new = 0
-            with self._chat._write() as (conn, now):
-                if _fingerprint(conn, launch_id) != mark:
-                    raise CoordError(f"launch {launch_id}'s chat record changed while its batch was read; nothing "
-                                     "was written")
-                for e, old in zip(seen, backfill):
-                    _ev, created = record_event(conn, now, launch_id=launch_id, key=e.key, pos=e.pos, kind=e.kind,
-                                                body=e.body, normalized=e.norm, turn_id=e.turn_id,
-                                                call_id=e.call_id, backfill=old)
-                    new += created
-                    if created and e.kind == "user_item" and not old and correlated \
-                            and isinstance(e.correlation, str):
-                        self._prove(conn, now, launch_id, e)
-                record_cursor(conn, now, launch_id=launch_id, vendor_cursor=cursor, complete_through=through,
-                              gap=gap)
-            self._reconcile(launch_id, session, correlated)
+    def _ingest(self, launch_id: str, session: Any, batch: Any) -> int:
+        """:meth:`ingest` with the launch's mutex held. Every driver call (``normalize``, ``pos_lt``) runs before the
+        write transaction; the positions they place are immutable, and the fingerprint check refuses the write if a
+        cursor, an attempt or an event of the launch was written since they were read."""
+        correlated = bool(session.capabilities().correlation_field)
+        seen = []
+        for e in batch.events:
+            body = e.body
+            seen.append(_Seen(e.key, e.kind, e.pos, e.turn_id, e.call_id, body,
+                              _plain_norm(session.normalize(body)) if isinstance(body, str) else body,
+                              e.correlation, e.vendor_id))
+        through, cursor, gap = batch.complete_through, batch.next_cursor, bool(batch.gap)
+
+        def frontier(conn: sqlite3.Connection) -> tuple[str | None, _LaunchRead]:
+            return _first_through(conn, launch_id), _launch_read(conn, launch_id)
+
+        first, read = self._chat._read(frontier)
+        prev, lt = read.through, session.pos_lt
+        backfill = [first is None or not lt(first, e.pos) for e in seen]
+        # §7.6 condition 3's positional half: the attempts whose window holds each item (the rest is re-read below)
+        windows = [tuple(a.message_id for a in read.attempts if _inside(e.pos, a.anchor, _next_anchor(read, a, lt), lt))
+                   if e.kind == "user_item" and not old else () for e, old in zip(seen, backfill)]
+        if through is not None and prev is not None and lt(through, prev):
+            through, gap = prev, False      # an older batch: the persisted frontier already covers its gap
+        new = 0
+        with self._chat._write() as (conn, now):
+            if _fingerprint(conn, launch_id) != read.fingerprint:
+                raise CoordError(f"launch {launch_id}'s chat record changed while its batch was read; nothing "
+                                 "was written")
+            for e, old, window in zip(seen, backfill, windows):
+                ev, created = record_event(conn, now, launch_id=launch_id, key=e.key, pos=e.pos, kind=e.kind,
+                                           body=e.body, normalized=e.norm, turn_id=e.turn_id, call_id=e.call_id,
+                                           backfill=old)
+                new += created
+                if not created or e.kind != "user_item" or old:
+                    continue
+                if correlated and isinstance(e.correlation, str) and self._prove(conn, now, launch_id, e):
+                    continue
+                _echo_or_outside(conn, now, ev, window)
+            record_cursor(conn, now, launch_id=launch_id, vendor_cursor=cursor, complete_through=through, gap=gap)
+        self._reconcile(launch_id, session, correlated)
         return new
 
     @staticmethod
-    def _prove(conn: sqlite3.Connection, now: str, launch_id: str, e: _Seen) -> None:
-        """§7.3 step 1: a user item carrying a send's op_id in the declared correlation field is that send's. A proof
-        against a record already terminal (not delivered, or accepted naming another item) is kept as an anomaly;
-        the record is never rewritten."""
+    def _prove(conn: sqlite3.Connection, now: str, launch_id: str, e: _Seen) -> bool:
+        """§7.3 step 1: a user item carrying a send's op_id in the declared correlation field is that send's (True;
+        False when no send of the launch has that op_id). A proof against a record already terminal (not delivered,
+        or accepted naming another item) is kept as an anomaly; the record is never rewritten."""
         row = conn.execute("SELECT o.message_id FROM chat_outbox_events o JOIN chat_messages m ON m.message_id = "
                            "o.message_id WHERE m.launch_id = ? AND o.state = 'attempted' AND o.op_id = ?",
                            (launch_id, e.correlation)).fetchone()
         if row is None:
-            return
+            return False
         state = outbox_state(conn, row[0])
         if state in ("attempted", "ambiguous"):
             outbox_step(conn, now, row[0], "accepted", cause="the vendor echoed our op_id",
                         vendor_turn_id=e.turn_id, vendor_item_id=e.vendor_id)
-            return
+            return True
         named = conn.execute("SELECT vendor_item_id FROM chat_outbox_events WHERE message_id = ? AND state = "
                              "'accepted'", (row[0],)).fetchone()
         if state == "accepted" and named is not None and named[0] in (None, e.vendor_id):
-            return
+            return True
         record_anomaly(conn, now, launch_id=launch_id, message_id=row[0], key=e.key, kind="proof_after_terminal",
                        detail=f"the vendor echoed this send's op_id on item {e.vendor_id} after it was recorded "
                               f"{state}")
+        return True
 
     def _reconcile(self, launch_id: str, session: Any, correlated: bool) -> None:
         """§7.3 steps 2-4 for each ambiguous send of the launch (:func:`_absent` holds the rule). Read, decide outside
@@ -1345,6 +1536,25 @@ class ChatService:
         return self._chat._read(lambda conn: [Anomaly(*r) for r in conn.execute(
             "SELECT launch_id, seq, message_id, vendor_event_key, kind, detail, at FROM chat_anomalies WHERE "
             "launch_id = ? ORDER BY seq", (launch_id,))])
+
+    def interrupt(self, launch_id: str, turn_id: str | None, owner_epoch: int | None = None) -> CommandResult:
+        """§9: interrupt the launch's turn ``turn_id`` (None: whatever is running). Operator-authenticated by the
+        caller and UNFENCED: it never reads the turn lease, so ``owner_epoch`` is accepted and checked against
+        nothing. This half only calls ``session.interrupt`` with a fresh op_id and returns what the session said;
+        it writes nothing (the in-flight approval rows a stop cancels are CH-D1c's). It does not wait on the launch's
+        mutex: a stop never queues behind a send in flight. A driver that raises, or returns anything but a
+        :class:`~levain.coordinator.driver.CommandResult`, is ``ambiguous``."""
+        session = self._session(launch_id)
+        if session is None:
+            raise CoordError(f"no driver session is attached to launch {str(launch_id)[:40]}; nothing was sent")
+        try:
+            got = session.interrupt(InterruptCommand("op-" + secrets.token_hex(16), turn_id))
+        except Exception as exc:  # noqa: BLE001 - any driver exception is an unknown outcome
+            return CommandResult("ambiguous", _cause_text(f"the driver raised {type(exc).__name__}: {_said(exc)}"))
+        if not isinstance(got, CommandResult) or type(got.outcome) is not str or got.outcome not in (
+                "confirmed", "ambiguous", "rejected", "no_such_request"):
+            return CommandResult("ambiguous", "the driver returned no command result")
+        return CommandResult(got.outcome, _cause_text(got.detail if type(got.detail) is str else got.outcome))
 
     def mark(self, message_id: str, delivered: bool, owner: str) -> str:
         """§7.4: you resolve an ambiguous send, delivered or not. ``owner`` is the authenticated client."""
