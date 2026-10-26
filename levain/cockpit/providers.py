@@ -12,6 +12,8 @@ import hashlib
 import json
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -95,9 +97,62 @@ def _store_label(db: Path) -> str:
         return db.name       # no filesystem resolution, and no exception text, can reach the wire
 
 
+# A built view is served again until one of the files it reads changes, or this many seconds pass. The age bound
+# is for what a file signature cannot see: the seed/config docs, the state line's expiry, the jar's day.
+VIEW_CACHE_MAX_AGE_S = 30.0
+VIEW_CACHE_SOURCES = 8
+_view_cache: dict[int, tuple[Any, tuple, float, SubstrateView]] = {}
+_view_cache_lock = threading.Lock()
+
+
+def _stat_of(p: Path | None) -> tuple | None:
+    if p is None:
+        return None
+    try:
+        st = os.stat(p)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _store_signature(source: Any) -> tuple | None:
+    """What a build of this source reads that moves when the store does: the anneal files (the db with its WAL,
+    the continuity file, the crystals, the spores), the state-line file, and the edit-log ledger. None when the
+    source names none of them, which is no signal and so no caching."""
+    anneal = getattr(source, "anneal", None)
+    db = getattr(anneal, "episodic_db", None)
+    if db is None:
+        return None
+    ledger = getattr(getattr(source, "write_scope", None), "ledger_root", None)
+    root = getattr(source, "install_root", None)
+    ledger = ledger if ledger is not None else (Path(root) / ".levain" if root is not None else None)
+    files = [db, Path(f"{db}-wal"), Path(f"{db}-shm"), anneal.continuity_md, anneal.crystal_json, anneal.spores_json,
+             getattr(source, "context_json", None), Path(ledger) / "edits.jsonl" if ledger is not None else None]
+    return tuple(_stat_of(Path(f)) if f is not None else None for f in files)
+
+
 def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
-    return ctx.memo("view", lambda: source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT,
-                                                 now=ctx.now))
+    """The view for this read cycle. Within a cycle the memo shares one build; across cycles an unchanged store
+    (``_store_signature``) serves the view built before, up to ``VIEW_CACHE_MAX_AGE_S``. A write's own read
+    (``ctx.fresh``) and a view that carries an error are never cached."""
+    def build() -> SubstrateView:
+        sig = None if ctx.fresh else _store_signature(source)
+        key = id(source)
+        if sig is not None:
+            with _view_cache_lock:
+                hit = _view_cache.get(key)
+            if hit and hit[0] is source and hit[1] == sig and time.monotonic() - hit[2] < VIEW_CACHE_MAX_AGE_S:
+                return hit[3]
+        # the signature is taken BEFORE the build: a change landing mid-build leaves a stale signature on the
+        # stored view, so the next read sees a mismatch and rebuilds
+        view = source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
+        if sig is not None and not view.errors:
+            with _view_cache_lock:
+                _view_cache[key] = (source, sig, time.monotonic(), view)
+                while len(_view_cache) > VIEW_CACHE_SOURCES:
+                    _view_cache.pop(next(iter(_view_cache)))
+        return view
+    return ctx.memo("view", build)
 
 
 def _view_fault(view: SubstrateView, *keys: str) -> Fault | None:
@@ -735,6 +790,20 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
     return read
 
 
+def _save_stamp(h: Any) -> str | None:
+    """The last committed save as a UTC ISO stamp; None when the age could not be read (no wrap, or an
+    unparseable stamp: ``save_age_hours`` is None then, and the metric is left out)."""
+    if h.save_age_hours is None or not h.last_wrap_at:
+        return None
+    try:
+        when = datetime.fromisoformat(str(h.last_wrap_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(timezone.utc).isoformat()
+
+
 def _health(source: SubstrateSource) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
         view = _view(source, ctx)
@@ -761,7 +830,9 @@ def _health(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         ):
             metrics.append({"label": label, "value": value, "unit": None, "status": "unknown", "read": None})
         for label, value, status in (
-            ("last save (hours ago)", h.save_age_hours, "unknown"),  # unrounded: the renderers round once
+            # the stamp, never an age: an age moves with the clock, so it would change the panel's etag on every
+            # watcher tick over an unchanged store. The renderers compute the age from it against their own clock.
+            ("last save at", _save_stamp(h), "unknown"),
             ("projection", ("unknown" if h.projection_note else None) if h.projection_converged is None else (
                 "converged" if h.projection_converged else
                 ("file missing" if h.projection_note == "continuity file missing" else "diverged")),

@@ -494,7 +494,7 @@
   const WRITE_PATH_STATUS = { "live": "live", "no wraps yet": "no-wraps", "unreadable": "unreadable", "dark": null };
   const WRITE_PATHS = Object.keys(WRITE_PATH_STATUS);
   const writePathStatus = (word, wraps) => WRITE_PATH_STATUS[word] || (isNum(wraps) && wraps > 0 ? "live" : "no-wraps");
-  function healthOf(metrics, wraps) {
+  function healthOf(metrics, wraps, nowMs) {
     need(Array.isArray(metrics), "metrics");
     const m = new Map();
     for (const x of metrics) { need(isObj(x) && typeof x.label === "string", "metric"); m.set(x.label, x.value); }
@@ -503,7 +503,9 @@
     need(WRITE_PATHS.indexOf(m.get("write path")) >= 0, "metric write path");
     const n = (k) => m.get(k);
     // the substrate oracles are optional (the kernel omits one it could not read): carried only when well-formed
-    const age = m.has("last save (hours ago)") && isNum(m.get("last save (hours ago)")) ? m.get("last save (hours ago)") : null;
+    // the kernel sends the save's stamp, never its age: an age moves every second and would change the panel's etag
+    const savedMs = m.has("last save at") ? parseIso(m.get("last save at")) : NaN;
+    const age = isNaN(savedMs) ? null : Math.max(0, (nowMs - savedMs) / 3600000);
     const proj = m.get("projection");
     const projOk = proj === "converged" ? true : (proj === "diverged" || proj === "file missing" ? false : null);
     // a present-but-unrecognised value is surfaced, never silently null; "unknown" carries the kernel's note
@@ -771,7 +773,7 @@
         });
         view.layout.push(Object.assign(entry, { kind: "crystals" }));
       } else if (nat === "health" && (panel.kind === "metric" || panel.kind === "status-dots")) {
-        view.health = healthOf((panel.value || {}).metrics, wrapsData);
+        view.health = healthOf((panel.value || {}).metrics, wrapsData, now);
         view.layout.push(Object.assign(entry, { kind: "health" }));
       } else if (nat === "graph" && (panel.kind === "visual" || panel.kind === "ambient")) {
         view.graph = (panel.value || {}).data || null;
