@@ -147,7 +147,8 @@ def test_routes_base_names_the_merged_ids_on_not_durable(L, monkeypatch):
     _not_durable_on(monkeypatch, "base.json")
     err = io.StringIO()
     got = IH.run_routes_base(ME, "darwin", lock=_Lock(), store_seams=_rs(L), err=err)
-    assert got == {"verb": "routes-base", "routes": ["anthropic", "egress-default"], "written": True}
+    assert got == {"verb": "routes-base", "routes": ["anthropic", "claude-subscription", "egress-default"],
+                   "written": True}
     assert "not durable" in err.getvalue()
 
 
@@ -157,8 +158,7 @@ def test_an_operator_edit_to_the_shipped_route_is_reverted_with_a_warning(L, tmp
     _base(L, [edited])
     err = io.StringIO()
     IH.run_routes_base(ME, "darwin", lock=_Lock(), store_seams=_rs(L), err=err)
-    assert canon.parse((L / "routes" / "base.json").read_bytes())["routes"] == [VR.anthropic_route(),
-                                                                                VR.egress_default_route()]
+    assert canon.parse((L / "routes" / "base.json").read_bytes())["routes"] == VR.shipped_routes()
     assert "anthropic" in err.getvalue() and "credential, max_session_microdollars" in err.getvalue()
     _base(L, [edited])                                       # setup's / repair's step says the same in its line
     (step,) = IH.base_routes_merge_steps("darwin", store=L)
