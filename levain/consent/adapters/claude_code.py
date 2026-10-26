@@ -302,7 +302,7 @@ def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], 
         raw = Path(cwd) / raw
     git_cache = git_cache if git_cache is not None else {}
     parents = {os.path.dirname(r) for r in roots}   # a directory holding a protected file (cockpit.db) as well
-    user_roots = user_site_roots(home)
+    user_roots = user_site_roots(home, environ=environ)
     for p in (Path(os.path.normpath(raw)), Path(os.path.realpath(raw))):
         if p.name.lower() == USER_CONFIG_NAME or str(p).lower() in parents:
             return True
@@ -539,19 +539,19 @@ def import_site_dirs() -> tuple[str, ...]:
     return tuple({os.path.realpath(d).lower() for d in dirs if d})
 
 
-def user_site_roots(home: Path) -> tuple[str, ...]:
+def user_site_roots(home: Path, *, environ: Mapping[str, str]) -> tuple[str, ...]:
     """The operator's Python user-site trees :func:`in_user_site` protects, lowercased, each as written and resolved:
     the floor's own derivation (``levain.firing.confinement.python_user_site_roots``: ``~/.local/lib``, macOS's
     ``~/Library/Python``, an absolute ``$PYTHONUSERBASE``'s ``lib``), for ``home`` (where a ``~`` in a target
     expands) and for :func:`operator_home`. Whatever THIS interpreter's ``site.ENABLE_USER_SITE`` says: a venv's is
     False, and the operator's other, non-venv Pythons still run a ``.pth``, ``usercustomize.py`` or package planted
-    there. Kept apart from :func:`import_site_dirs`, which answers only what redirects this interpreter's
-    ``import levain``."""
+    there. ``environ`` names the operator (:func:`operator_home`) and any ``$PYTHONUSERBASE``. Kept apart from
+    :func:`import_site_dirs`, which answers only what redirects this interpreter's ``import levain``."""
     from levain.firing.confinement import python_user_site_roots  # lazy: keep this module light
 
     out: dict[str, None] = {}
-    for h in dict.fromkeys((Path(home), operator_home())):
-        for root, _label in python_user_site_roots(h)[0]:
+    for h in dict.fromkeys((Path(home), operator_home(environ))):
+        for root, _label in python_user_site_roots(h, environ)[0]:
             for spelled in (os.path.normpath(root), os.path.realpath(root)):
                 out[spelled.lower()] = None
     return tuple(out)
@@ -622,7 +622,7 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}
                       | {levain_package_dir().lower()})
         sites = import_site_dirs()
-        user_roots = user_site_roots(home)
+        user_roots = user_site_roots(home, environ=environ)
         git_cache = git_cache if git_cache is not None else {}   # git asked once per repository, in one budget, per call
         home = Path(home)
         # by full path: the home's ``.claude.json`` and the user's git config files (``~/.gitconfig``,

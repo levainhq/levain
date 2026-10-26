@@ -320,10 +320,10 @@ def test_a_patch_into_the_operators_user_site_is_agent_config_under_a_venv(monke
 
     home = tmp_path / "home"
     monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
-    monkeypatch.setattr(cc, "operator_home", lambda: tmp_path / "elsewhere")
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
     target = home / ".local" / "lib" / "python3.12" / "site-packages" / "x.pth"
     patch = {"command": f"*** Begin Patch\n*** Add File: {target}\n+import os\n*** End Patch\n"}
-    assert cx.targets_agent_config("apply_patch", patch, str(tmp_path), home=home, codex_dir=tmp_path / "cx")
+    assert cx.targets_agent_config("apply_patch", patch, str(tmp_path), home=home, codex_dir=tmp_path / "cx", environ=h4_env())
 
 
 def test_a_patch_into_an_absolute_pythonuserbase_site_is_agent_config(monkeypatch, tmp_path):
@@ -333,8 +333,8 @@ def test_a_patch_into_an_absolute_pythonuserbase_site_is_agent_config(monkeypatc
     base = tmp_path / "opt" / "python-user"
     monkeypatch.setenv("PYTHONUSERBASE", str(base))
     monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
-    monkeypatch.setattr(cc, "operator_home", lambda: tmp_path / "elsewhere")
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
     target = base / "lib" / "python3.12" / "site-packages" / "x.pth"
     patch = {"command": f"*** Begin Patch\n*** Add File: {target}\n+import os\n*** End Patch\n"}
     assert cx.targets_agent_config("apply_patch", patch, str(tmp_path), home=tmp_path / "home",
-                                   codex_dir=tmp_path / "cx")
+                                   codex_dir=tmp_path / "cx", environ=h4_env())

@@ -1574,13 +1574,13 @@ def test_a_write_into_the_operators_user_site_is_agent_config_under_a_venv(monke
     monkeypatch.setattr("platform.system", lambda: "Darwin")   # the framework layout is macOS's
     monkeypatch.delenv("PYTHONUSERBASE", raising=False)
     monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
-    monkeypatch.setattr(cc, "operator_home", lambda: tmp_path / "elsewhere")
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
     assert all(not s.startswith(str(home).lower()) for s in cc.import_site_dirs())
     target = home / rel
     assert cc.targets_agent_config("Write", {"file_path": str(target)}, "/work/proj", home=home, environ=h4_env())
     assert cc.targets_agent_config("Write", {"file_path": "~/" + rel}, "/work/proj", home=home, environ=h4_env())
     # the OPERATOR's home (the password database's), when the agent's HOME is set elsewhere
-    monkeypatch.setattr(cc, "operator_home", lambda: home)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: home)
     assert cc.targets_agent_config("Write", {"file_path": str(target)}, "/work/proj", home=tmp_path / "agent-home", environ=h4_env())
     # an MCP tool given the site directory itself and a file name in another field
     assert cc.targets_agent_config("mcp__fs__write", {"dir": str(target.parent), "name": "x.pth"}, "/work/proj",
@@ -1594,7 +1594,7 @@ def test_paths_beside_the_user_site_are_not_agent_config(monkeypatch, tmp_path, 
     monkeypatch.setattr("platform.system", lambda: "Darwin")
     monkeypatch.delenv("PYTHONUSERBASE", raising=False)
     monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
-    monkeypatch.setattr(cc, "operator_home", lambda: tmp_path / "elsewhere")
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
     assert not cc.targets_agent_config("Write", {"file_path": str(home / rel)}, "/work/proj", home=home, environ=h4_env())
 
 
@@ -1607,9 +1607,9 @@ def test_the_consent_check_and_the_floor_read_one_user_site_derivation(monkeypat
     home = tmp_path / "home"
     base = tmp_path / "pyuser"
     monkeypatch.setenv("PYTHONUSERBASE", str(base))
-    monkeypatch.setattr(cc, "operator_home", lambda: home)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: home)
     floor = {os.path.normpath(r).lower() for r, _ in C.python_user_site_roots(home)[0]}
-    assert set(cc.user_site_roots(home)) >= floor and os.path.normpath(base / "lib").lower() in floor
+    assert set(cc.user_site_roots(home, environ=h4_env())) >= floor and os.path.normpath(base / "lib").lower() in floor
     assert cc.targets_agent_config("Write", {"file_path": str(home / ".local/lib/node_modules/a.js")}, "/work/proj",
                                    home=home, environ=h4_env())
 
@@ -1623,7 +1623,7 @@ def test_a_write_into_an_absolute_pythonuserbase_site_is_agent_config(monkeypatc
     base = tmp_path / "opt" / "python-user"
     monkeypatch.setenv("PYTHONUSERBASE", str(base))
     monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
-    monkeypatch.setattr(cc, "operator_home", lambda: tmp_path / "elsewhere")
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
     assert cc.targets_agent_config("Write", {"file_path": str(base / rel)}, "/work/proj", home=home, environ=h4_env())
     assert cc.targets_agent_config("mcp__fs__write", {"dir": str((base / rel).parent), "name": "x.pth"},
                                    "/work/proj", home=home, environ=h4_env())

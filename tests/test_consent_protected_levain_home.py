@@ -453,4 +453,4 @@ def test_a_levain_home_holding_its_venv_is_still_denied_whole(lhome, tmp_path, m
     monkeypatch.setattr(sys, "prefix", str(lh / "venv"))
     assert not cf.too_wide_to_deny(lh, lhome)
     assert not cf._hides_the_entity(lh, lhome, tmp_path / "e", tmp_path / "e" / "workspace")
-    assert lh in cc.protected_paths(tmp_path / "q", cc.AdapterSettings())
+    assert lh in cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), environ=h4_env(), home=h4_home())
