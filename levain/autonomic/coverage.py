@@ -240,8 +240,8 @@ class GraduationPolicy:
     born_signer: str | None
     current_signer: str | None
     store_id: str
-    born: int = field(kw_only=True)
-    terms_text: str = field(kw_only=True)
+    born: int
+    terms_text: str
 
     def __post_init__(self) -> None:
         # a policy built directly, not through from_record, is held to the shape from_record builds: any other is a

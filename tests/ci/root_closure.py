@@ -242,6 +242,7 @@ LAZY_SITES = {
     # operator: <- ``reset_lock`` <- ``reset_anchor`` <- ``levain/cockpit/keys.py`` (the operator's anchor reset; ``git grep -n 'reset_anchor(' -- levain``)
     'levain/authority.py::_no_live_cockpit::from levain.cockpit.broker import LOCK_NAME': 'operator',
     # root: the target is a closure member already (an import-time import of another member), so this row adds nothing to the closure; not traced further
+    'levain/authority.py::_graduation_guard_problem::from levain.autonomic.coverage import guard_problem': 'root',
     'levain/authority.py::_parse_stamp::from levain.cockpit.consent import parse_stamp': 'root',
     'levain/authority.py::_ranks::from levain.cockpit.firejournal import _CLASS_RANK': 'root',
     'levain/authority.py::_stamp::from levain.cockpit.consent import utc_stamp': 'root',
