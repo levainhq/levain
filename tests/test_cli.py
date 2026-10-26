@@ -567,3 +567,58 @@ class TestMaxSecondsErrorNamesTheFlagYouTyped:
             "a consolidate bound is validated without naming its own flag, so the error will "
             f"say --max-seconds: {offenders}"
         )
+
+
+def test_cli_install_feeds_defaults_match_the_daemon_module():
+    """The same drift-lock for `daemon install-feeds`: its label and interval are literals."""
+    from levain import daemon
+
+    seen: dict[str, object] = {}
+
+    def capture(args):
+        seen.update(vars(args))
+        return 0
+
+    with mock.patch("levain.cli._cmd_daemon_install_feeds", side_effect=capture):
+        main(["daemon", "install-feeds"])
+    assert seen["label"] == daemon.DEFAULT_FEEDS_LABEL
+    assert seen["interval"] == daemon.DEFAULT_FEEDS_INTERVAL
+    assert seen["max_seconds"] is None
+
+
+def test_install_feeds_unit_runs_from_home_not_from_levain_home(tmp_path, monkeypatch):
+    """The unit's WorkingDirectory is the home directory; the store rides LEVAIN_HOME / --queue-dir."""
+    from levain import daemon
+
+    seen: dict[str, object] = {}
+    real = daemon.build_feeds_spec
+
+    def spy(**kw):
+        seen.update(kw)
+        return real(**kw)
+
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    with mock.patch("levain.daemon.build_feeds_spec", side_effect=spy), \
+            mock.patch("levain.cli._daemon_provider", return_value=(mock.MagicMock(), None)):
+        main(["daemon", "install-feeds", "--dry-run", "--label", "com.levainhq.test.feedscwd"])
+    assert seen["working_dir"] == Path.home() and seen["levain_home"] == tmp_path / "lh"
+
+
+def test_install_feeds_daemon_error_while_building_the_spec_is_a_usage_error(capsys):
+    from levain import daemon
+
+    with mock.patch("levain.daemon.build_feeds_spec", side_effect=daemon.DaemonError("no levain on PATH")):
+        rc = main(["daemon", "install-feeds", "--dry-run"])
+    assert rc == 2
+    assert "no levain on PATH" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["1.5", "abc"])
+def test_install_feeds_bound_is_a_whole_number_of_seconds(bad, capsys):
+    with pytest.raises(SystemExit) as e:
+        main(["daemon", "install-feeds", "--dry-run", "--max-seconds", bad])
+    assert e.value.code == 2
+
+
+def test_install_feeds_negative_bound_is_refused(capsys):
+    assert main(["daemon", "install-feeds", "--dry-run", "--max-seconds", "-3"]) == 2

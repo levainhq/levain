@@ -6,6 +6,7 @@ Synthetic words."""
 from __future__ import annotations
 
 import io
+import sys
 import json
 import sqlite3
 from argparse import Namespace
@@ -390,3 +391,213 @@ def test_the_morning_card_words_the_waiting_set_with_the_one_formatter(band, cq)
     card = morning.card(band.store)
     lines = deliver.waiting_lines(card["waiting"])
     assert lines[0] == "waiting on you: 1" and all(ln in morning.render(card) for ln in lines)
+
+
+# --- the scheduled run: one at a time, bounded -------------------------------------------------------------------------
+
+def _hold_lock(band):
+    import fcntl
+    import os
+
+    fd = os.open(band.store.directory / deliver.FEEDS_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def test_a_feeds_run_while_another_holds_the_lock_skips_and_files_nothing(band):
+    import os
+
+    fd = _hold_lock(band)
+    try:
+        assert deliver.run_exclusive(band.store) is None
+        out = io.StringIO()
+        assert run_coord(_args(band, "feeds", json=True), out) == 0
+        assert "skipped" in json.loads(out.getvalue())
+    finally:
+        os.close(fd)
+    assert set(deliver.run_exclusive(band.store)) == {"feeds", "delivery"}      # released: the next run goes
+
+
+def test_a_second_exclusive_run_after_the_first_ends_is_not_blocked_by_a_stale_lock_file(band):
+    assert deliver.run_exclusive(band.store) is not None
+    assert (band.store.directory / deliver.FEEDS_LOCK).exists()
+    assert deliver.run_exclusive(band.store) is not None
+
+
+def _record_alarm(monkeypatch):
+    """Record the alarm calls and the handler the kernel would act on, with the real alarm replaced by a recorder."""
+    import signal
+
+    calls: list[int] = []
+    monkeypatch.setattr(signal, "alarm", lambda n: calls.append(n) or 0)
+    handlers: list[object] = []
+    real = signal.signal
+    monkeypatch.setattr(signal, "signal", lambda sig, h: handlers.append((sig, h)) or real(sig, h))
+    return calls, handlers
+
+
+def test_a_bounded_feeds_run_arms_the_kernel_alarm_at_the_default_action_and_disarms_after_the_output(band, monkeypatch):
+    import signal
+
+    calls, handlers = _record_alarm(monkeypatch)
+    wrote_when_disarmed: list[str] = []
+    before = signal.getsignal(signal.SIGALRM)
+
+    class Out(io.StringIO):
+        def write(self, text):
+            wrote_when_disarmed.append(f"{text.strip()[:1]}|{calls[-1] if calls else None}")
+            return super().write(text)
+
+    assert run_coord(_args(band, "feeds", json=True, max_seconds=7), Out()) == 0
+    assert calls == [7, 0]                                         # armed with the integer, disarmed once
+    assert handlers[0] == (signal.SIGALRM, signal.SIG_DFL)         # no Python handler: the kernel ends the process
+    assert signal.getsignal(signal.SIGALRM) == before              # and the caller's disposition is put back
+    assert wrote_when_disarmed and all(w.endswith("|7") for w in wrote_when_disarmed)   # output written while armed
+
+
+def test_the_alarm_is_armed_before_the_store_is_opened_and_through_the_error_line(band, monkeypatch, capsys):
+    from levain.coordinator import cli as coord_cli
+
+    calls, _handlers = _record_alarm(monkeypatch)
+    seen: dict[str, object] = {}
+    real_store = coord_cli._store
+
+    def store_when(args):
+        seen["armed_at_open"] = list(calls)
+        return real_store(args)
+
+    monkeypatch.setattr(coord_cli, "_store", store_when)
+    assert run_coord(_args(band, "feeds", json=True, max_seconds=9), io.StringIO()) == 0
+    assert seen["armed_at_open"] == [9]
+
+    calls.clear()
+
+    def refuse(store, **kw):
+        raise deliver.CoordError("the feeds lock cannot be taken")
+
+    monkeypatch.setattr(deliver, "run_exclusive", refuse)
+    err_when: list[int | None] = []
+    real_print = print
+
+    def spy_print(*a, **kw):
+        if kw.get("file") is sys.stderr:
+            err_when.append(calls[-1] if calls else None)
+        return real_print(*a, **kw)
+
+    monkeypatch.setattr("builtins.print", spy_print)
+    assert run_coord(_args(band, "feeds", json=True, max_seconds=9), io.StringIO()) == 1
+    assert err_when == [9] and calls == [9, 0]                     # the error line was written while armed
+
+
+def test_an_in_process_caller_keeps_its_alarm_disposition_and_outstanding_alarm(band, monkeypatch):
+    import signal
+
+    calls: list[int] = []
+    monkeypatch.setattr(signal, "alarm", lambda n: calls.append(n) or (30 if len(calls) == 1 else 0))
+    mine = lambda *a: None  # noqa: E731
+    old = signal.signal(signal.SIGALRM, mine)
+    try:
+        assert run_coord(_args(band, "feeds", json=True, max_seconds=7), io.StringIO()) == 0
+        assert signal.getsignal(signal.SIGALRM) is mine
+        assert calls == [7, 0, 30]                                 # armed, cancelled, the caller's 30 s put back
+    finally:
+        signal.signal(signal.SIGALRM, old)
+
+
+def test_an_unbounded_feeds_run_arms_nothing(band, monkeypatch):
+    calls, handlers = _record_alarm(monkeypatch)
+    assert run_coord(_args(band, "feeds", json=True), io.StringIO()) == 0
+    assert calls == [] and handlers == []
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, "3"])
+def test_a_bad_bound_is_refused(band, bad):
+    assert run_coord(_args(band, "feeds", json=True, max_seconds=bad), io.StringIO()) == 1
+
+
+def test_the_skip_payload_keeps_the_runs_key_set(band):
+    import os
+
+    fd = _hold_lock(band)
+    try:
+        out = io.StringIO()
+        assert run_coord(_args(band, "feeds", json=True), out) == 0
+        got = json.loads(out.getvalue())
+    finally:
+        os.close(fd)
+    assert got["skipped"] is True and got["feeds"] == {} and got["delivery"] == {} and got["new_items"] == 0
+
+
+def test_a_lock_failure_that_is_not_contention_is_an_error_not_a_skip(band, monkeypatch):
+    import errno
+    import fcntl
+
+    def boom(fd, op):
+        raise OSError(errno.EIO, "disk")
+
+    monkeypatch.setattr(fcntl, "flock", boom)
+    out = io.StringIO()
+    with pytest.raises(deliver.CoordError, match="cannot be taken"):
+        deliver.run_exclusive(band.store)
+    assert run_coord(_args(band, "feeds", json=True), out) == 1
+
+
+def test_contention_errnos_are_the_only_skips(band, monkeypatch):
+    import errno
+    import fcntl
+
+    for code in (errno.EAGAIN, errno.EACCES):
+        monkeypatch.setattr(fcntl, "flock", lambda fd, op, c=code: (_ for _ in ()).throw(OSError(c, "held")))
+        assert deliver.run_exclusive(band.store) is None
+
+
+def test_a_lock_that_is_a_symlink_is_a_named_error(band):
+    import os
+
+    lock = band.store.directory / deliver.FEEDS_LOCK
+    target = band.store.directory / "elsewhere"
+    target.write_text("")
+    os.symlink(target, lock)
+    out = io.StringIO()
+    with pytest.raises(deliver.CoordError, match="cannot be opened"):
+        deliver.run_exclusive(band.store)
+    assert run_coord(_args(band, "feeds", json=True), out) == 1
+
+
+def test_a_store_directory_that_is_a_symlink_is_refused_before_a_lock_is_made(tmp_path):
+    import os
+
+    from levain.coordinator.store import CoordStore
+
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    os.symlink(real, link)
+    with pytest.raises(deliver.CoordError, match="cannot be opened"):
+        deliver.run_exclusive(CoordStore(link))
+    assert not (real / deliver.FEEDS_LOCK).exists()
+
+
+def test_the_lock_is_made_where_a_fresh_home_has_no_store_directory_yet(tmp_path, monkeypatch):
+    """Reproduced on a fresh LEVAIN_HOME: the first scheduled run died on a missing directory before it read anything."""
+    from levain.coordinator.store import CoordStore
+
+    ran = {"feeds": {}, "delivery": {}}
+    store = CoordStore(tmp_path / "fresh" / "consent")
+    monkeypatch.setattr(deliver, "run", lambda store, queue_dir=None: ran)
+    assert deliver.run_exclusive(store) is ran
+    assert (store.directory / deliver.FEEDS_LOCK).exists()
+
+
+def _pass_rows(band):
+    return band.c.rows("SELECT feed, seq FROM review_marks WHERE feed = 'pass' ORDER BY seq")
+
+
+def test_every_fault_free_run_on_an_existing_store_leaves_one_mark(band, cq):
+    deliver.run(band.store)                    # a quiet pass on a store with nothing waiting
+    assert len(_pass_rows(band)) == 1
+    deliver.run(band.store)                    # still nothing new: a healthy idle scheduler still reads as having run
+    assert len(_pass_rows(band)) == 2
+    _file(cq, band)
+    deliver.run(band.store)                    # delivers a SIGN pointer
+    assert len(_pass_rows(band)) == 3

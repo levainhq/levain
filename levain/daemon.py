@@ -387,6 +387,58 @@ def build_seat_spec(
     )
 
 
+# --- scheduled review feeds ---
+# A distinct label from the cockpit's and the seat's: a third unit with its own lifecycle.
+DEFAULT_FEEDS_LABEL = "com.levainhq.levain.feeds"
+# [judged by lane-c4ft, 10-26, against nothing measured]: five minutes; a run is cheap and an item waits for the next one.
+DEFAULT_FEEDS_INTERVAL = 300
+# [judged by lane-c4ft, 10-26, against nothing measured]: a run is SQLite reads and a few writes, so two minutes is far
+# above what it needs and far below the interval. It makes "restartable" true for the reason DEFAULT_SEAT_MAX_SECONDS
+# does: launchd coalesces per label, so a hung run would otherwise stop every later one.
+DEFAULT_FEEDS_MAX_SECONDS = 120
+
+
+def build_feeds_spec(
+    *,
+    working_dir: Path,
+    queue_dir: Path | None = None,
+    levain_home: Path | None = None,
+    interval: int = DEFAULT_FEEDS_INTERVAL,
+    label: str = DEFAULT_FEEDS_LABEL,
+    max_seconds: int | None = DEFAULT_FEEDS_MAX_SECONDS,
+    log_dir: Path | None = None,
+) -> DaemonSpec:
+    """The periodic spec that runs ``levain coord review feeds`` and exits: no model, no keep-alive, not at login.
+
+    ``--max-seconds`` (whole seconds) is EMITTED into the argv when set, so a reader of the unit file sees the bound. ``queue_dir`` and
+    ``levain_home`` are written down at install time because a login-launched unit carries neither the shell's
+    ``$LEVAIN_HOME`` nor its cwd: without them the unit would read the default store while the operator's is elsewhere.
+    The run itself holds a lock (:func:`levain.coordinator.deliver.run_exclusive`), so a run that outlives the interval
+    or a manual one beside it is skipped, not doubled."""
+    working_dir = working_dir.expanduser().resolve()
+    invocation = _levain_invocation()
+    argv = [*invocation, "coord", "review", "feeds"]
+    if queue_dir is not None:
+        argv += ["--queue-dir", str(queue_dir.expanduser().resolve())]
+    if max_seconds is not None:
+        argv += ["--max-seconds", str(max_seconds)]
+    env = _daemon_env(invocation)
+    if levain_home is not None:
+        env["LEVAIN_HOME"] = str(levain_home.expanduser().resolve())
+    logs = (log_dir or _default_log_dir()).expanduser().resolve()
+    return DaemonSpec(
+        label=label,
+        argv=argv,
+        working_dir=working_dir,
+        env=env,
+        stdout_log=logs / f"{label}.log",
+        stderr_log=logs / f"{label}.err",
+        run_at_login=False,
+        keep_alive=False,
+        start_interval=interval,
+    )
+
+
 # --- the provider interface ------------------------------------------------------------------
 
 class DaemonProvider(ABC):

@@ -19,6 +19,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   It reads that file the way the install helper does (size bound, whole-file UTF-8, no links), names every missing
   signer of a live graduation policy, and reports an unreadable cockpit authority log as a warning instead of an
   apparently healthy signers row. A damaged file or log never aborts it.
+- **`levain daemon install-feeds` runs the review queue's feed pass on a schedule, with no model.** The pass is
+  `levain coord review feeds`. Each run is bounded in whole seconds by the operating system, covering the whole command,
+  and skips if another is still running; a run that finds nothing new adds no record.
 - **`levain binding graduate` says what is missing, and still exits 1.** It names the autonomic store (with its path;
   `--store-dir` takes the same store `policy create` signs) and that no executor can yet run a binding effect; a store
   or gate it cannot read is reported as a reason, not a traceback. `levain binding policy create --help` says that

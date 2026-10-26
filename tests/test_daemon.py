@@ -1210,3 +1210,39 @@ def test_systemd_reinstall_during_a_turn_reads_a_shebang_cmdline(systemd, tmp_pa
     assert "PREVIOUS definition" not in systemd.install(seat)
     changed = replace(seat, argv=[*seat.argv[:-1], "a different task"])
     assert "PREVIOUS definition" in systemd.install(changed)
+
+
+# --- the scheduled review-feed runner ----------------------------------------------------------------------------------
+
+def test_feeds_spec_is_periodic_bounded_and_carries_the_store(tmp_path) -> None:
+    spec = daemon.build_feeds_spec(working_dir=tmp_path, queue_dir=tmp_path / "q", levain_home=tmp_path / "h",
+                                   log_dir=tmp_path / "l")
+    assert spec.start_interval == daemon.DEFAULT_FEEDS_INTERVAL
+    assert spec.keep_alive is False and spec.run_at_login is False
+    i = spec.argv.index("coord")
+    assert spec.argv[i:i + 3] == ["coord", "review", "feeds"]
+    assert spec.argv[spec.argv.index("--queue-dir") + 1] == str((tmp_path / "q").resolve())
+    assert spec.argv[spec.argv.index("--max-seconds") + 1] == f"{daemon.DEFAULT_FEEDS_MAX_SECONDS}"
+    assert spec.env["LEVAIN_HOME"] == str((tmp_path / "h").resolve())
+    assert "model" not in " ".join(spec.argv)
+
+
+def test_feeds_spec_bound_is_emitted_as_a_whole_number(tmp_path) -> None:
+    spec = daemon.build_feeds_spec(working_dir=tmp_path, max_seconds=90, log_dir=tmp_path / "l")
+    assert spec.argv[spec.argv.index("--max-seconds") + 1] == "90"
+
+
+def test_feeds_spec_unbounded_emits_no_bound_and_no_home_when_unset(tmp_path) -> None:
+    spec = daemon.build_feeds_spec(working_dir=tmp_path, max_seconds=None, log_dir=tmp_path / "l")
+    assert "--max-seconds" not in spec.argv and "--queue-dir" not in spec.argv
+    assert "LEVAIN_HOME" not in spec.env
+
+
+def test_feeds_spec_refuses_a_nonpositive_interval(tmp_path) -> None:
+    with pytest.raises(ValueError):
+        daemon.build_feeds_spec(working_dir=tmp_path, interval=0, log_dir=tmp_path / "l")
+
+
+def test_feeds_label_differs_from_the_cockpit_and_seat() -> None:
+    assert len({daemon.DEFAULT_LABEL, daemon.DEFAULT_SEAT_LABEL, daemon.DEFAULT_FEEDS_LABEL}) == 3
+
