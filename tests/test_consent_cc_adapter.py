@@ -1628,3 +1628,56 @@ def test_a_write_into_an_absolute_pythonuserbase_site_is_agent_config(monkeypatc
     assert cc.targets_agent_config("mcp__fs__write", {"dir": str((base / rel).parent), "name": "x.pth"},
                                    "/work/proj", home=home, environ=h4_env())
     assert not cc.targets_agent_config("Write", {"file_path": str(base / "notes.txt")}, "/work/proj", home=home, environ=h4_env())
+
+
+def test_a_large_mcp_input_derives_the_user_site_roots_once(monkeypatch, tmp_path):
+    """K1 (stack7 L3 r1, codex MED): the user-site trees are derived once per call, in `targets_agent_config`, and
+    handed to `names_config_dir` like `roots`/`sites`/`user_configs`, never once per every-string candidate."""
+    calls = []
+    real = cc.user_site_roots
+
+    def counting(home, *, environ):
+        calls.append(home)
+        return real(home, environ=environ)
+
+    monkeypatch.setattr(cc, "user_site_roots", counting)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
+    tool_input = {"names": [f"d{i}" for i in range(3000)]}
+    assert policy_mod.mcp_config_candidates(tool_input) is not None   # inside the bound: each string is a candidate
+    assert not cc.targets_agent_config("mcp__fs__write", tool_input, str(tmp_path), home=tmp_path / "home",
+                                       environ=h4_env())
+    assert len(calls) == 1
+
+
+def test_no_operator_home_fails_closed_through_the_mcp_path(monkeypatch, tmp_path):
+    """K1 (stack7 L3 r1, deepseek MED 1): a password database with no entry and no HOME (`operator_home` raises
+    KeyError) tags an MCP call, never escapes it; so does one that raises only after the first derivation (the
+    per-candidate site `names_config_dir` had, outside the outer try's KeyError)."""
+    def gone(environ):
+        raise KeyError("HOME")
+
+    monkeypatch.setattr(cc, "operator_home", gone)
+    assert cc.targets_agent_config("mcp__fs__write", {"dir": "d", "name": "n"}, str(tmp_path), home=tmp_path / "home",
+                                   environ=h4_env())
+    seen = []
+
+    def later(environ):
+        seen.append(1)
+        if len(seen) > 2:   # the outer try's two derivations (user_site_roots, global_git_configs) succeed
+            raise KeyError("HOME")
+        return tmp_path / "elsewhere"
+
+    monkeypatch.setattr(cc, "operator_home", later)
+    monkeypatch.setattr(cc, "_under_hooks_path", lambda *a, **k: False)   # git's own operator_home call kept out
+    cc.targets_agent_config("mcp__fs__write", {"dir": "d", "name": "n"}, str(tmp_path), home=tmp_path / "home",
+                            environ=h4_env())
+
+
+@pytest.mark.parametrize("bad", ("", "rel/home"))
+def test_a_non_absolute_home_gives_no_user_site_root(monkeypatch, tmp_path, bad):
+    """K2 (stack7 L3 r1, complement LOW 2): a home that is not absolute (an empty pw_dir is `.`) names no user-site
+    tree: no root relative to wherever the hook runs; the absolute home beside it still gives its own."""
+    monkeypatch.delenv("PYTHONUSERBASE", raising=False)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: Path(bad))
+    roots = cc.user_site_roots(tmp_path / "home", environ=h4_env())
+    assert roots and all(os.path.isabs(r) and r.startswith(str(tmp_path).lower()) for r in roots)

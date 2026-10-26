@@ -286,23 +286,22 @@ _DIR_PROBES = ("x", "settings.json", "hooks.json", "config.toml", USER_CONFIG_NA
 
 def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], sites: tuple[str, ...],
                      user_configs: frozenset[str], git_cache: dict[Any, Any] | None = None, *,
-                     environ: Mapping[str, str]) -> bool:
+                     user_roots: tuple[str, ...], environ: Mapping[str, str]) -> bool:
     """For an MCP tool's every-string candidates only (:func:`levain.consent.policy.mcp_config_candidates`): True
     when a server given ``target`` as a directory and a file name in another field could write agent config:
     ``target`` (``~`` expanded, joined to ``cwd``; as written and resolved) holds a file the path checks of
     :func:`targets_agent_config` tag (each of :data:`_DIR_PROBES` directly inside it, so the directory list is
     derived from those checks, never spelled twice) or directly one of ``roots`` (a protected file such as the
     authority database, :func:`protected_paths`), or its file name is ``.claude.json`` wherever it sits (a
-    server that joins a relative name to a root of its own, home among them). ``roots``, ``sites`` and
-    ``user_configs`` are the caller's, computed once. An over-match costs a gated call: the request goes to the
-    human, or, when no enrolled key can sign T3 outside ``default``, the call is refused (the
-    Q10 floor) and the agent reads why."""
+    server that joins a relative name to a root of its own, home among them). ``roots``, ``sites``,
+    ``user_configs`` and ``user_roots`` (:func:`user_site_roots`) are the caller's, computed once. An over-match
+    costs a gated call: the request goes to the human, or, when no enrolled key can sign T3 outside ``default``,
+    the call is refused (the Q10 floor) and the agent reads why."""
     raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
     if not raw.is_absolute():
         raw = Path(cwd) / raw
     git_cache = git_cache if git_cache is not None else {}
     parents = {os.path.dirname(r) for r in roots}   # a directory holding a protected file (cockpit.db) as well
-    user_roots = user_site_roots(home, environ=environ)
     for p in (Path(os.path.normpath(raw)), Path(os.path.realpath(raw))):
         if p.name.lower() == USER_CONFIG_NAME or str(p).lower() in parents:
             return True
@@ -543,14 +542,16 @@ def user_site_roots(home: Path, *, environ: Mapping[str, str]) -> tuple[str, ...
     """The operator's Python user-site trees :func:`in_user_site` protects, lowercased, each as written and resolved:
     the floor's own derivation (``levain.firing.confinement.python_user_site_roots``: ``~/.local/lib``, macOS's
     ``~/Library/Python``, an absolute ``$PYTHONUSERBASE``'s ``lib``), for ``home`` (where a ``~`` in a target
-    expands) and for :func:`operator_home`. Whatever THIS interpreter's ``site.ENABLE_USER_SITE`` says: a venv's is
-    False, and the operator's other, non-venv Pythons still run a ``.pth``, ``usercustomize.py`` or package planted
-    there. ``environ`` names the operator (:func:`operator_home`) and any ``$PYTHONUSERBASE``. Kept apart from
-    :func:`import_site_dirs`, which answers only what redirects this interpreter's ``import levain``."""
+    expands) and for :func:`operator_home`, each only when absolute. Whatever THIS interpreter's
+    ``site.ENABLE_USER_SITE`` says: a venv's is False, and the operator's other, non-venv Pythons still run a
+    ``.pth``, ``usercustomize.py`` or package planted there. ``environ`` names the operator (:func:`operator_home`)
+    and any ``$PYTHONUSERBASE``. Kept apart from :func:`import_site_dirs`, which answers only what redirects this interpreter's ``import levain``."""
     from levain.firing.confinement import python_user_site_roots  # lazy: keep this module light
 
     out: dict[str, None] = {}
     for h in dict.fromkeys((Path(home), operator_home(environ))):
+        if not h.is_absolute():   # an empty pw_dir is ``.``: no tree, never one relative to where the hook runs
+            continue
         for root, _label in python_user_site_roots(h, environ)[0]:
             for spelled in (os.path.normpath(root), os.path.realpath(root)):
                 out[spelled.lower()] = None
@@ -647,9 +648,10 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
                 or in_user_site(written, user_roots) or in_user_site(resolved, user_roots)):
             return True
     try:
-        return any(names_config_dir(target, cwd, home, roots, sites, user_configs, git_cache, environ=environ)
+        return any(names_config_dir(target, cwd, home, roots, sites, user_configs, git_cache, user_roots=user_roots,
+                                    environ=environ)
                    for target in extra)
-    except (OSError, ValueError):
+    except (OSError, ValueError, KeyError):
         return True
 
 
