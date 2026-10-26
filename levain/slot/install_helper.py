@@ -2835,8 +2835,8 @@ def _flock_held(path: Path, refusal: str, running: str, *, create_as: os.stat_re
     the lock exists whether or not the service ever ran (verify r2 R1); the service opens it as its own after. A
     file the service makes between the look and the make (``EEXIST``) is opened and locked as one found. A file this
     makes is locked before it is owned; one that cannot be owned as ``create_as`` is removed, still locked, before
-    the refusal (verify r2 R5). A made file is never removed once owned: a service that opened it and waits on its
-    lock would then lock a file no longer in the directory."""
+    the refusal (verify r2 R5). A made file is never removed once owned: a service that opened it before a removal
+    and locked it after this closed would hold its lock on a file no longer in the directory."""
     made = False
     try:
         try:
