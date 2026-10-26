@@ -32,16 +32,17 @@ ROLES = {"importer": ("_levain_export", ".work", "operator"), "verifier": ("_lev
 @pytest.mark.parametrize("role", sorted(ROLES))
 def test_export_walls_render_their_capability_list(role):
     """§5b: each export profile and view is the shared builder over the role's facts, exactly (no syscall rule, one
-    rw path, the three user-data subpaths denied, /dev/null + /dev/zero the only devices on macOS; on Linux a
-    minimal /dev, no --dev-bind, capabilities dropped but the two the stage's drop spends)."""
+    rw path, the three user-data subpaths denied, /dev/null + /dev/zero + /dev/urandom the only devices on macOS; on
+    Linux a minimal /dev, no --dev-bind, capabilities dropped but the two the stage's drop spends)."""
     account, d, _ = ROLES[role]
     profile = (rd.render_importer_profile if role == "importer" else rd.render_verifier_profile)("darwin")
+    devs = '(literal "/dev/null") (literal "/dev/zero") (literal "/dev/urandom")'
     assert profile.decode() == "\n".join([
         "(version 1)", f";; Levain export wall profile, target {role}, principal {account}.", "(allow default)",
         '(deny file-read* (subpath "/Users") (subpath "/System/Volumes/Data/Users") (subpath "/Volumes"))',
         "(deny file-write*)", "(allow file-write*", f'  (subpath "/private/var/levain/export/{d}")',
-        '  (literal "/dev/null") (literal "/dev/zero"))', '(deny file-read* file-ioctl (subpath "/dev"))',
-        '(allow file-read* file-ioctl (literal "/dev/null") (literal "/dev/zero"))', "(deny network*)",
+        f"  {devs})", '(deny file-read* file-ioctl (subpath "/dev"))',
+        f"(allow file-read* file-ioctl {devs})", "(deny network*)",
         "(deny ipc-posix*)", "(deny ipc-sysv*)", "(deny mach-lookup)", "(deny mach-register)",
         '(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))']) + "\n"
     assert SC not in profile.decode().lower()
@@ -68,6 +69,20 @@ def test_export_walls_render_their_capability_list(role):
         wall.launch_spec("linux", role, slot=None, session="s-0123456789abcdef", ids=IDS["linux"],
                          shared=SHARED["linux"])
     assert ei.value.name == "bad-token"      # the slot path never builds an export target
+
+
+@pytest.mark.parametrize("role", sorted(ROLES))
+def test_export_walls_let_the_interpreter_read_urandom(role):
+    """1026+8 wallexec, measured in r3c10-vm: the export target is ``/usr/bin/python3 -IS`` (the entry script's
+    shebang), and that interpreter reads ``/dev/urandom`` before any Levain code runs. With the profile's ``/dev``
+    read denial covering it, the importer died ``Fatal Python error: _Py_HashRandomization_Init: failed to get
+    random numbers`` (Seatbelt: ``deny(1) file-read-data /dev/urandom``) and every adopt refused
+    ``importer-failed:result-malformed: 'no result line'``. The device must be on the profile's read allow-list."""
+    profile = (rd.render_importer_profile if role == "importer" else rd.render_verifier_profile)("darwin").decode()
+    allow_read = [ln for ln in profile.splitlines() if ln.startswith("(allow file-read* file-ioctl ")]
+    assert len(allow_read) == 1 and '(literal "/dev/urandom")' in allow_read[0]
+    assert profile.splitlines().index(allow_read[0]) > profile.splitlines().index(
+        '(deny file-read* file-ioctl (subpath "/dev"))')       # the allow follows the deny, so it wins
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
