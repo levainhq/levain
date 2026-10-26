@@ -1511,8 +1511,8 @@ class ChatService:
         self._seat_item = seat_item
         self._filed: dict[str, set[str]] = {}            # launch -> the seat items' dedupe keys filed while attached
         # launch -> the control events this session was sent something for, by the event's identity (its stream
-        # position and vendor id, which carries the request id) -> "done" (its reply or interrupt was confirmed, or
-        # answered no_such_request: nothing is sent for it again), "open" (tried, not confirmed: tried again) or
+        # position and vendor id, which carries the request id) -> "done" (its reply was confirmed, or its interrupt
+        # confirmed or answered no_such_request: nothing is sent for it again), "open" (tried, not done: tried again) or
         # "stale" (open when the launch was activated again: its reply is tried again, an interrupt naming no turn
         # is not, since it would reach the new activation's turn). A committed batch's events are dropped from it
         self._handled: dict[str, dict[tuple[str, str], str]] = {}
@@ -2203,8 +2203,10 @@ class ChatService:
         return failed
 
     def _reject(self, launch_id: str, session: Any, reply: ControlReply) -> str | None:
-        """Send one named error reply; None when the session confirmed it or holds no such request (nothing waits on
-        it), else why it failed (a failed reply is tried again on a re-read)."""
+        """Send one named error reply; None when the session confirmed it, else why it failed (a failed reply is tried
+        again on a re-read). A reply answered ``no_such_request`` fails: the caller sends a control event only while
+        the record holds it not done, so the session never confirmed this event and its request is unaccounted for
+        (T1's ``unanswerable_control`` latch)."""
         with self._guard:
             wedged = launch_id in self._wedged
         if wedged:
@@ -2216,7 +2218,9 @@ class ChatService:
             return f"the reply did not return within {READ_DEADLINE:g} s"
         except Exception as exc:  # noqa: BLE001 - an unwritten reply leaves the CLI waiting: latch and stop
             return f"{type(exc).__name__}: {_said(exc)}"
-        if not isinstance(got, CommandResult) or got.outcome not in ("confirmed", "no_such_request"):
+        if isinstance(got, CommandResult) and got.outcome == "no_such_request":
+            return "the session holds no such request"
+        if not isinstance(got, CommandResult) or got.outcome != "confirmed":
             return "the session did not confirm the reply"
         return None
 

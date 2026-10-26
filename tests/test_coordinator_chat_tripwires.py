@@ -1058,17 +1058,37 @@ def test_h4_the_record_is_dropped_at_detach_and_at_attach(cs, claude, root):
     assert [c.turn_id for c in s.interrupts] == ["t-1", "t-1"]
 
 
-def test_h5_a_reply_answered_no_such_request_is_done_not_failed(cs, claude, root):
-    class Gone(Session):
-        def reject_control(self, request_id, text):
-            self.asked = getattr(self, "asked", 0) + 1
-            return CommandResult("no_such_request", "no such request")
+class Gone(Session):
+    """Answers every reply no_such_request."""
 
+    def reject_control(self, request_id, text):
+        self.asked = getattr(self, "asked", 0) + 1
+        return CommandResult("no_such_request", "no such request")
+
+
+def test_i1_a_first_reply_answered_no_such_request_latches_and_interrupts(cs, claude, root):
+    svc, s, _ = up(cs, claude, root, session=Gone())
+    s.inbound("ctl-1", "elicitation", turn_id="t-1")
+    svc.read_next(claude["launch"])
+    assert s.asked == 1 and len(s.interrupts) == 1
+    assert trips(cs, claude["launch"]) == ["tripwire:unanswerable_control"] and latched(cs, claude["launch"])
+
+
+def test_i1_a_first_reply_answered_no_such_request_in_a_crossing_batch_latches_and_interrupts(cs, claude, root):
     svc, s, _ = up(cs, claude, root, session=Gone())
     crossing = _cross_with(event("error", "control:ctl-e", "00000100", turn_id="t-1", control_subtype="elicitation"))
-    for _ in (1, 2):
+    _refused(svc, claude["launch"], crossing)
+    assert s.asked == 1 and len(s.interrupts) == 1
+    assert "tripwire:unanswerable_control" in trips(cs, claude["launch"]) and latched(cs, claude["launch"])
+
+
+def test_i1_a_confirmed_reply_is_not_sent_again_on_a_re_read(cs, claude, root):
+    svc, s, _ = up(cs, claude, root)
+    s._inbound["ctl-e"] = "elicitation"
+    crossing = _cross_with(event("error", "control:ctl-e", "00000100", turn_id="t-1", control_subtype="elicitation"))
+    for _ in (1, 2, 3):
         _refused(svc, claude["launch"], crossing)
-    assert s.asked == 1 and s.interrupts == []
+    assert _replies(s) == [("ctl-e", "levain answers no elicitation in chat")] and s.interrupts == []
     assert "tripwire:unanswerable_control" not in trips(cs, claude["launch"])
 
 
