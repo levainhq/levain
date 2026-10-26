@@ -17,6 +17,7 @@ start.
 from __future__ import annotations
 
 import os
+import stat
 import sys
 from types import SimpleNamespace
 from typing import Callable, ContextManager, Optional, Sequence, Tuple
@@ -34,6 +35,22 @@ EX_BUSY = 75
 EX_NOPERM = 77
 #: sysexits.h EX_CONFIG: not macOS (the unit exists on macOS alone: ``units.SERVICES``).
 EX_CONFIG = 78
+
+
+#: The size past which :func:`bound_log` empties the unit's log before a run writes to it
+#: [judged by pfbootf4, 10-26, against a boot run's few hundred bytes: thousands of runs fit].
+LOG_MAX_BYTES = 1 << 20
+
+
+def bound_log(fd: int = 2) -> None:
+    """Empty ``fd``'s file when it is a regular file past :data:`LOG_MAX_BYTES` (launchd opens
+    :func:`levain.slot.units.launchd_log_path` for appending and never trims it). A terminal or a pipe is left alone."""
+    try:
+        st = os.fstat(fd)
+        if stat.S_ISREG(st.st_mode) and st.st_size > LOG_MAX_BYTES:
+            os.ftruncate(fd, 0)
+    except OSError:
+        pass
 
 
 def _log(msg: str) -> None:
@@ -121,8 +138,10 @@ def main(argv: Optional[Sequence[str]] = None, *, platform: str = sys.platform,
     return 0
 
 
-__all__ = ["EX_BUSY", "EX_CONFIG", "EX_NOPERM", "RC_UNCERTAIN", "installed_egress_slots", "main"]
+__all__ = ["EX_BUSY", "EX_CONFIG", "EX_NOPERM", "LOG_MAX_BYTES", "RC_UNCERTAIN", "bound_log", "installed_egress_slots",
+           "main"]
 
 
 if __name__ == "__main__":
+    bound_log()
     sys.exit(main())

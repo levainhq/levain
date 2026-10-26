@@ -408,3 +408,109 @@ def test_a_token_write_that_fails_after_a_reboot_dropped_the_old_reference_gives
     ok, why = pf.take_enable_reference(token, run=run)
     assert calls == [("/sbin/pfctl", "-E"), ("/sbin/pfctl", "-X", "111"), ("/sbin/pfctl", "-X", "222")]
     assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN) and "222" in why and "No space left on device" in why
+
+
+# --- the VM reboot run (f4): P6 the boot lines are kept, P7 no retry loop after an uncertain run ---------------------
+
+
+def test_the_pf_unit_keeps_its_lines_in_a_root_log_launchd_does_not_throw_away():
+    """P6 (pfbootvm check 1): the plist named no StandardErrorPath, so launchd threw the boot run's stderr away and the
+    "restored pf" / "not retried" lines could not be read after a real boot."""
+    import plistlib
+
+    job = plistlib.loads(units.launchd_plist_text(units.by_name("pf")).encode())
+    assert job["StandardErrorPath"] == job["StandardOutPath"] == str(units.launchd_log_path(units.by_name("pf")))
+    assert units.launchd_log_path(units.by_name("pf")) == Path("/var/log/com.levain.pf.log")
+
+
+def test_the_log_is_cut_back_to_empty_once_it_passes_its_cap(tmp_path):
+    log = tmp_path / "pf.log"
+    log.write_bytes(b"x" * (PS.LOG_MAX_BYTES + 1))
+    fd = os.open(log, os.O_WRONLY | os.O_APPEND)
+    try:
+        PS.bound_log(fd)
+        os.write(fd, b"next\n")
+    finally:
+        os.close(fd)
+    assert log.read_bytes() == b"next\n"
+    log.write_bytes(b"y" * PS.LOG_MAX_BYTES)
+    fd = os.open(log, os.O_WRONLY | os.O_APPEND)
+    try:
+        PS.bound_log(fd)
+    finally:
+        os.close(fd)
+    assert log.stat().st_size == PS.LOG_MAX_BYTES        # at the cap, left as it is
+    r, w = os.pipe()
+    try:
+        PS.bound_log(w)                                  # not a file (a terminal, a pipe): left alone
+    finally:
+        os.close(r)
+        os.close(w)
+
+
+class _Refs:
+    """A fake pfctl holding real reference state: ``-E`` takes the next token, ``-X`` releases a held one or answers
+    ``pf: token invalid``, ``-s References`` lists what is held (the measured column layout, raw/vm r2)."""
+
+    def __init__(self, held=()):
+        self.held, self.next = list(held), 222
+
+    def __call__(self, argv, **kw):
+        if argv[1] == "-E":
+            tok, self.next = str(self.next), self.next + 111
+            self.held.append(tok)
+            return subprocess.CompletedProcess(argv, 0, "", f"pf enabled\nToken : {tok}\n")
+        if argv[1] == "-X":
+            if argv[2] not in self.held:
+                return subprocess.CompletedProcess(argv, 1, "", "pf: token invalid\n")
+            self.held.remove(argv[2])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        rows = "".join(f"946      pfctl                        {t}      0 days 00:00:21\n" for t in self.held)
+        return subprocess.CompletedProcess(argv, 0, "TOKENS:\nPID      Process Name                 TOKEN"
+                                                    "                    TIMESTAMP\n" + rows, "")
+
+
+def _blocked(tmp_path):
+    """The VM's blocker: a directory where the token's temp file goes, so every token write fails as it did there."""
+    token = tmp_path / "pf.token"
+    (tmp_path / ".pf.token.tmp").mkdir()
+    return token
+
+
+def test_two_runs_with_the_token_path_unwritable_hold_one_reference_and_neither_is_retried(tmp_path):
+    """P7 (pfbootvm FINDING): run 1 released the live 111, kept 222 unrecorded and answered uncertain; the token file
+    still named 111. Run 2 then read 111 as gone (f3), gave its 333 back and failed as retriable: launchd restarted it
+    every ~10 s for as long as the path stayed unwritable. Run 2 must give 333 back AND not be retried."""
+    token = _blocked(tmp_path)
+    token.write_text("111\n")
+    pfctl = _Refs(["111"])
+    ok, why = pf.take_enable_reference(token, run=pfctl)
+    assert not ok and why.startswith(pf.ENABLE_UNCERTAIN) and pfctl.held == ["222"]
+    ok, why = pf.take_enable_reference(token, run=pfctl)
+    assert pfctl.held == ["222"]                                     # one reference, and pf stays on
+    assert not ok and why.startswith(pf.ENABLE_UNCERTAIN), why        # so the one-shot exits 0
+    from levain.firing.hands import Step
+    assert PS._run([Step("enable", call=lambda: pf.take_enable_reference(token, run=pfctl))]) == PS.RC_UNCERTAIN
+    assert pfctl.held == ["222"]
+
+
+def test_after_a_reboot_a_kept_reference_pf_no_longer_holds_is_the_ordinary_retried_failure(tmp_path):
+    """The f3 case with a note left from before the reboot: pf holds nothing, so 222 is not holding pf on and the run
+    gives its new reference back and is retried, as f3 ruled."""
+    token = _blocked(tmp_path)
+    token.write_text("111\n")
+    pfctl = _Refs(["111"])
+    assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
+    pfctl.held = []                                                  # the reboot
+    ok, why = pf.take_enable_reference(token, run=pfctl)
+    assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN) and pfctl.held == []
+
+
+def test_a_run_whose_write_works_again_records_its_token_and_drops_the_note(tmp_path):
+    token = _blocked(tmp_path)
+    token.write_text("111\n")
+    pfctl = _Refs(["111"])
+    assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
+    (tmp_path / ".pf.token.tmp").rmdir()                             # the path is writable again
+    assert pf.take_enable_reference(token, run=pfctl) == (True, "")
+    assert token.read_text() == "333\n" and sorted(os.listdir(tmp_path)) == ["pf.token"]

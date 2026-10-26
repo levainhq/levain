@@ -185,6 +185,30 @@ def _write_token(token_path: Path, token: str) -> None:
         os.close(dfd)
 
 
+def _kept_path(token_path: Path) -> Path:
+    """Beside the token: the reference an :data:`ENABLE_UNCERTAIN` run kept and could not record (pfbootf4, P7)."""
+    return token_path.with_name(f"{token_path.name}.kept")
+
+
+def _note_kept(token_path: Path, token: str) -> None:
+    """Best effort: a note that cannot be written leaves the next run to fail as the ordinary, retried case."""
+    try:
+        _write_token(_kept_path(token_path), token)
+    except OSError:
+        pass
+
+
+def _kept_held(token_path: Path, run: Run) -> str | None:
+    """The token :func:`_note_kept` named, when ``pfctl -s References`` lists it held (a reboot drops it), else None."""
+    readable, kept, _ = _read_token(_kept_path(token_path))
+    if not readable or kept is None:
+        return None
+    r = run([PFCTL, "-s", "References"], capture_output=True, text=True, env=child_env())
+    if r.returncode != 0:
+        return None
+    return kept if any(kept in ln.split() for ln in (r.stdout or "").splitlines()) else None
+
+
 def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run, *,
                              after_release: Callable[[], None] = lambda: None) -> tuple[bool, str]:
     """Release the reference whose token :func:`take_enable_reference` stored, then remove the token
@@ -201,6 +225,7 @@ def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.
     if ok:
         after_release()
         token_path.unlink(missing_ok=True)
+        _kept_path(token_path).unlink(missing_ok=True)
     return ok, why
 
 
@@ -211,6 +236,11 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
     completes holds one recorded reference. A token write that fails with no old reference released gives the new one
     back too, so the boot one-shot's launchd retries never pile up references no token names. A recorded token pf
     answers gone (a reboot dropped it) released nothing pf held, so it counts as no old reference here.
+
+    An uncertain run notes the reference it kept beside the token (:func:`_kept_path`). A later run whose write fails
+    again gives its new reference back, and while ``pfctl -s References`` still lists the noted one (the same boot), it
+    answers :data:`ENABLE_UNCERTAIN` too: pf stays on by the noted reference, and a retry would change nothing (P7, the
+    pfbootvm restart loop). A recorded token clears the note; the noted reference stays held until a reboot.
 
     Once a LIVE old reference is released, the new one is NEVER given back: it may be all that holds pf on under running
     sessions (L3 verify r2 codex HIGH). A token write that fails then keeps it held, unrecorded, and answers
@@ -244,11 +274,18 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
     except OSError as e:
         failed = f"cannot record the pf token {new} in {token_path}: {e.strerror or e}"
         if old is not None:
+            _note_kept(token_path, new)
             return False, f"{ENABLE_UNCERTAIN}: {failed}; reference {new} kept (the old one {old} is released)"
         back, _, back_why = _release(new, run)
         if back:
+            kept = _kept_held(token_path, run)
+            if kept is not None:
+                return False, (f"{ENABLE_UNCERTAIN}: {failed}; reference {new} given back, and pf stays enabled by"
+                               f" {kept}, which an earlier run kept and no token names")
             return False, f"{failed}; reference {new} given back"
+        _note_kept(token_path, new)
         return False, f"{ENABLE_UNCERTAIN}: {failed}; and the new reference {new} could not be given back: {back_why}"
+    _kept_path(token_path).unlink(missing_ok=True)
     return True, note
 
 
