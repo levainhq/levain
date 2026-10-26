@@ -29,6 +29,7 @@ from levain.consent.passkey import challenge
 from levain.consent.queue import ConsentQueue, authority_source
 from tests.test_dispatch_phone import SoftPasskey, _b64u
 from tests.test_phone_server import _enrol
+from tests._h4 import h4_home
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -77,7 +78,7 @@ def world(tmp_path: Path):
 
     source = authority_source(root / "cockpit.db", anchor=auth.anchor_path(root))
     gp = GrantPhone(qdir, RP, None, lambda: {k.fingerprint: k for k in passkey_keys(source(), RP)}, lambda: root)
-    queue = ConsentQueue(qdir, authority=source)
+    queue = ConsentQueue(qdir, authority=source, home=h4_home())
 
     def ask(name: str):
         tool_input = {"file_path": str(ws / name), "content": "x"}

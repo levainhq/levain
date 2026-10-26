@@ -14,6 +14,7 @@ cannot read. Stdlib only.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -40,8 +41,8 @@ def landing_tier(repo: str, paths: Iterable[str], *, queue_dir: Path | None = No
         if not isinstance(path, str) or not path.startswith("/"):
             raise ValueError(f"a landing path is absolute, not {str(path)[:80]!r}")
         judged += 1
-        if claude_code.targets_agent_config("Write", {"file_path": path}, repo, home=home, protected=protected,
-                                            git_cache=git_cache):
+        if claude_code.targets_agent_config("Write", {"file_path": path}, repo, home=home, environ=os.environ,
+                                            protected=protected, git_cache=git_cache):
             return "T3"
         if codex._in_codex_config(path, repo, home, codex_dir):
             return "T3"

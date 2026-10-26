@@ -15,6 +15,7 @@ from levain.authority import ReplayCache, anchor_path
 from levain.cli import main
 from levain.cockpit.firejournal import CockpitDB
 from levain.consent.queue import ConsentQueue, authority_source
+from tests._h4 import h4_home
 
 
 def _key(d: Path, name: str) -> tuple[Path, str, str]:
@@ -49,7 +50,7 @@ def scratch(tmp_path):
         conn.close()
     qdir = tmp_path / "home" / "consent"
     qdir.mkdir(parents=True, mode=0o700)
-    queue = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
+    queue = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)), home=h4_home())
     return queue, laptop, fp, root
 
 

@@ -18,6 +18,7 @@ from levain.consent.receipt_log import head
 from levain.consent.record import ANSWER_FORMAT, ANSWER_NAMESPACE, answer_message
 from tests.test_consent_answer_cli import _file, _key
 from tests.test_consent_answer_cli import scratch  # noqa: F401 - the shared fixture
+from tests._h4 import h4_home
 
 
 def _sign(key, message: bytes) -> str:
@@ -181,7 +182,7 @@ def test_verify_refuses_a_prior_format_store_and_names_the_command_that_migrates
     # the advice is true: `levain consent pending` migrates it, and verify then reads the log
     assert main(["consent", "pending", "--queue-dir", str(queue.directory)]) == 0
     rc, out, _ = _verify_cli(ConsentQueue(queue.directory, authority=authority_source(root / "cockpit.db",
-                                                                                      anchor=_anchor(root))),
+                                                                                      anchor=_anchor(root)), home=h4_home()),
                              root, capsys)
     assert rc == 0, out
     assert "receipts: 1" in out and "UNREADABLE" not in out

@@ -27,6 +27,7 @@ from levain.consent.ledger import Ledger
 from levain.consent.queue import UNDECIDED_GRACE
 from levain.consent.record import RULING_NAMESPACE
 from tests.test_consent_queue import Clock, Key, Log, signed
+from tests._h4 import h4_home
 
 HEX64 = re.compile(r"^[a-f0-9]{64}$")
 REAL_UTCNOW = ab._utcnow
@@ -58,7 +59,7 @@ def build_scratch(tmp: Path) -> tuple[ConsentQueue, dict[str, str]]:
         "id": "g1", "kind": "consent", "agent": "claude_code", "tools": ["Edit"], "workspace": str(ws),
         "postures": ["default"], "expires_at": utc_stamp(datetime.now(timezone.utc) + timedelta(days=1))}})
     clock = Clock(datetime.now(timezone.utc))
-    queue = ConsentQueue(tmp / "consent", authority=log.source, clock=clock)
+    queue = ConsentQueue(tmp / "consent", authority=log.source, clock=clock, home=h4_home())
     ids: dict[str, str] = {}
 
     calls: dict[str, tuple[str, Any, str, str | None, str | None]] = {}     # name -> what the agent's hook reports
@@ -465,7 +466,7 @@ def test_an_empty_queue_exports_nothing(tmp_path):
     (tmp_path / "keys").mkdir()
     (tmp_path / "auth").mkdir()
     log = Log(tmp_path / "auth", {"laptop": Key(tmp_path / "keys", "laptop")})
-    queue = ConsentQueue(tmp_path / "consent", authority=log.source)
+    queue = ConsentQueue(tmp_path / "consent", authority=log.source, home=h4_home())
     queue.sweep()                                                       # opens the store, creating the schema
     exported = ab.export(queue.directory)
     assert exported.receipts == [] and exported.referenced_policies() == set()
@@ -478,7 +479,7 @@ def _late_world(tmp_path):
     (tmp_path / "auth").mkdir()
     log = Log(tmp_path / "auth", {"laptop": Key(tmp_path / "keys", "laptop")})
     clock = Clock(datetime.now(timezone.utc))
-    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     request = queue.file(agent="claude_code", agent_session_id="s-late", tool_name="Bash", tool_input={"command": "late"},
                          cwd=str(tmp_path), hold=timedelta(minutes=5), tier="T2")
     assert queue.withdraw(request.id)
@@ -638,7 +639,7 @@ def _allow_world(tmp_path, use_ids=(None,)):
     log = Log(tmp_path / "auth", {"laptop": laptop})
     log.enrol("laptop", "laptop-presence")
     clock = Clock(datetime.now(timezone.utc))
-    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     t0, requests = clock.now, []
     for use_id in use_ids:
         request = queue.file(agent="claude_code", agent_session_id="s-run", tool_name="Bash",
@@ -863,7 +864,7 @@ def _refused_world(tmp_path, rkeys):
     since = log.source().key(rkeys["thief"].fp).enrolled_seq
     log.link({"op": "revoke_key", "fingerprint": rkeys["thief"].fp, "compromised_since": since})
     clock = Clock(datetime.now(timezone.utc))
-    return ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock), clock
+    return ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home()), clock
 
 
 HOLD = timedelta(minutes=5)

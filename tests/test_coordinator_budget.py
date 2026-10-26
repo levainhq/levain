@@ -22,6 +22,7 @@ from levain.coordinator.cli import run_coord
 from levain.coordinator.store import CoordError, Part
 from tests.test_consent_queue import Clock, Log
 from tests.test_coordinator_envelope import NOW, _lease, ctx, keys, repo, snapshot  # noqa: F401 - fixtures
+from tests._h4 import h4_home
 
 
 class Night:
@@ -180,7 +181,7 @@ def away_night(night, keys, tmp_path):  # noqa: F811
         (night.store.directory / name).write_text(json.dumps({"cockpit_data_root": str(tmp_path / "auth"),
                                                               "away_mode": False, "away_hold_seconds": 0}))
     night.clock = Clock(NOW)
-    night.queue = ConsentQueue(night.store.directory, authority=lg.source, clock=night.clock)
+    night.queue = ConsentQueue(night.store.directory, authority=lg.source, clock=night.clock, home=h4_home())
     night.keys = keys
     return night
 

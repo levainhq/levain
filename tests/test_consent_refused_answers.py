@@ -34,6 +34,7 @@ from levain.consent.record import RULING_NAMESPACE, ruling_message
 from tests.test_consent_queue import NOW, Clock, FakeAgent, Key, Log, _raw, signed
 from tests.test_consent_queue import authority, clock, keys, queue  # noqa: F401 - the shared fixtures
 from tests.test_consent_queue_v4 import _v3_module, ruled, undecided
+from tests._h4 import h4_home
 
 
 def _refused(q, request_id, payload, sig):
@@ -206,7 +207,7 @@ def test_an_answer_refused_while_the_log_cannot_be_replayed_is_not_kept(tmp_path
     (tmp_path / "auth").mkdir()
     log = Log(tmp_path / "auth", keys)
     log.enrol("laptop", "laptop-presence")
-    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     request = FakeAgent(q).ask()
     payload, sig = signed(q, request, keys["stranger"])
     log.path.rename(tmp_path / "auth" / "moved.db")
@@ -406,12 +407,12 @@ def test_kept_refusals_leave_the_receipts_log_byte_for_byte_unchanged(queue, clo
 
 def test_a_current_store_made_before_the_table_gains_it_on_open(tmp_path, keys, clock, authority):
     d = tmp_path / "consent"
-    q = ConsentQueue(d, authority=authority, clock=clock)
+    q = ConsentQueue(d, authority=authority, clock=clock, home=h4_home())
     request = FakeAgent(q).ask()
     payload, sig = signed(q, request, keys["phone"])
     q.answer(request.id, payload, sig)
     _raw(q, ("DROP TABLE refused_answers", ()))                        # as a store from before this slice
-    fresh = ConsentQueue(d, authority=authority, clock=clock)
+    fresh = ConsentQueue(d, authority=authority, clock=clock, home=h4_home())
     assert fresh.decision(request.id).decision == "allow"
     other = FakeAgent(fresh).ask("b")
     p, s = signed(fresh, other, keys["stranger"])
@@ -438,7 +439,7 @@ def test_a_v3_store_migrates_and_gains_the_table(tmp_path, keys):
     from levain.authority import ReplayCache
     old = v3.ConsentQueue(d, authority=v3.authority_source(log.path, anchor=None, cache=ReplayCache()), clock=clock)
     request = FakeAgent(old).ask()
-    new = ConsentQueue(d, authority=log.source, clock=clock)
+    new = ConsentQueue(d, authority=log.source, clock=clock, home=h4_home())
     payload, sig = signed(new, request, keys["stranger"])
     assert _refused(new, request.id, payload, sig) == "the signer is not an enrolled key"
     assert [r["reason_code"] for r in new.refused_answers(request.id)] == [REFUSED_NOT_AUTHORIZED]
@@ -470,7 +471,7 @@ def test_a_key_revoked_as_compromised_is_kept_as_compromised(tmp_path, keys, clo
     log.enrol("phone", "display-phone")
     since = log.source().key(keys["phone"].fp).enrolled_seq
     log.link({"op": "revoke_key", "fingerprint": keys["phone"].fp, "compromised_since": since})
-    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     request = FakeAgent(q).ask()
     payload, sig = signed(q, request, keys["phone"])
     assert _refused(q, request.id, payload, sig) == "the signer's key is revoked"
@@ -648,7 +649,7 @@ def test_the_refusal_texts_are_those_of_f06ed8ff(queue, clock, keys, authority):
 
 def _refuse_in_a_process(qdir, cockpit_db, request_id, attempts, out):
     from levain.consent.queue import AnswerRefused as Refused, ConsentQueue as Q, authority_source as src
-    q = Q(qdir, authority=src(cockpit_db, anchor=None), clock=lambda: NOW + timedelta(minutes=1))
+    q = Q(qdir, authority=src(cockpit_db, anchor=None), clock=lambda: NOW + timedelta(minutes=1), home=h4_home())
     told = []
     for payload, sig in attempts:
         try:
@@ -666,7 +667,7 @@ def test_the_bound_and_the_dedupe_hold_across_processes(tmp_path, keys, clock, s
     log = Log(tmp_path / "auth", keys)
     log.enrol("laptop", "laptop-presence")
     d = tmp_path / "consent"
-    q = ConsentQueue(d, authority=log.source, clock=clock)
+    q = ConsentQueue(d, authority=log.source, clock=clock, home=h4_home())
     request = FakeAgent(q).ask(hold=timedelta(hours=1))
     batches = []
     for proc in range(3):
@@ -739,7 +740,7 @@ def test_unenrolled_keys_never_crowd_out_enrolled_evidence(tmp_path, keys, clock
     log.enrol("laptop", "laptop-presence")
     for i in range(len(enrolled_keys)):
         log.enrol(f"e{i}", "presence")                                # presence does not cover T2: refused
-    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     request = FakeAgent(q).ask(hold=timedelta(hours=1))
     throwaway = strangers[REFUSED_PER_REQUEST + 1:] + [keys[n] for n in ("stranger", "phone", "presence", "revoked")]
     assert len(throwaway) > REFUSED_UNENROLLED_PER_REQUEST

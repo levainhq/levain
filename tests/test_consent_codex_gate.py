@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from levain.consent import ConsentQueue, authority_source
 from levain.consent.adapters import codex as cx
 from levain.consent.ledger import Ledger
+from tests._h4 import h4_env, h4_home
 
 
 def _event(session: str, tool_name: str, tool_input: dict, cwd: str) -> dict:
@@ -30,11 +31,11 @@ def test_a_halted_session_is_latched_and_no_other_session_is(tmp_path):
     qdir.mkdir(mode=0o700)
     t0 = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
     source = authority_source(qdir, anchor=None)
-    filed = ConsentQueue(qdir, authority=source, clock=lambda: t0)
+    filed = ConsentQueue(qdir, authority=source, clock=lambda: t0, home=h4_home())
     request = filed.file(agent="codex", agent_session_id="S1", tool_name="apply_patch",
                          tool_input={"command": "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch"},
                          cwd=str(tmp_path), hold=timedelta(seconds=20), tier="T3")
-    later = ConsentQueue(qdir, authority=source, clock=lambda: t0 + timedelta(seconds=21))
+    later = ConsentQueue(qdir, authority=source, clock=lambda: t0 + timedelta(seconds=21), home=h4_home())
     assert later.mark_undecided(request.id, halt=True).gap == 1
 
     benign = {"command": "ls -a"}
@@ -135,7 +136,7 @@ def test_with_no_key_a_codex_config_patch_is_a_plain_deny_unless_default_or_unco
 
     monkeypatch.setenv(cx.UNCONFINED_ENV, "1")
     assert _run(qdir, event) == ""
-    assert ConsentQueue(qdir, authority=authority_source(qdir, anchor=None)).pending() == []
+    assert ConsentQueue(qdir, authority=authority_source(qdir, anchor=None), home=h4_home()).pending() == []
 
 
 def test_a_halted_session_stays_halted_when_started_unconfined(tmp_path, monkeypatch):
@@ -150,12 +151,12 @@ def test_a_halted_session_stays_halted_when_started_unconfined(tmp_path, monkeyp
     t0 = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
     source = authority_source(qdir, anchor=None)
     patch = {"command": "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch"}
-    request = ConsentQueue(qdir, authority=source, clock=lambda: t0).file(
+    request = ConsentQueue(qdir, authority=source, clock=lambda: t0, home=h4_home()).file(
         agent="codex", agent_session_id="S1", tool_name="apply_patch", tool_input=patch, cwd=str(tmp_path),
         hold=timedelta(seconds=20), tier="T3")
-    assert ConsentQueue(qdir, authority=source, clock=lambda: t0 + timedelta(seconds=21)).mark_undecided(
+    assert ConsentQueue(qdir, authority=source, clock=lambda: t0 + timedelta(seconds=21), home=h4_home()).mark_undecided(
         request.id, halt=True).gap == 1
-    assert cx.unconfined(str(tmp_path), codex_home=tmp_path / "codex-home")
+    assert cx.unconfined(str(tmp_path), codex_home=tmp_path / "codex-home", environ=h4_env(), home=h4_home())
     for tool, inp in (("apply_patch", patch), ("Bash", {"command": "ls"})):
         out = json.loads(_run(qdir, _event("S1", tool, inp, str(tmp_path))))
         assert out["hookSpecificOutput"]["permissionDecisionReason"] == cx.HALT_TEXT.format(n=1), tool
@@ -167,10 +168,10 @@ def test_a_halted_session_stays_halted_when_started_unconfined(tmp_path, monkeyp
     for session, mode, unconfined in (("S3", "bypassPermissions", True), ("S4", "default", False),
                                       ("S5", "plan", False)):
         def halting(*a, _s=session, _u=unconfined, **kw):
-            r = ConsentQueue(qdir, authority=source, clock=lambda: t0).file(
+            r = ConsentQueue(qdir, authority=source, clock=lambda: t0, home=h4_home()).file(
                 agent="codex", agent_session_id=_s, tool_name="apply_patch", tool_input=patch, cwd=str(tmp_path),
                 hold=timedelta(seconds=20), tier="T3")
-            ConsentQueue(qdir, authority=source, clock=lambda: t0 + timedelta(seconds=21)).mark_undecided(
+            ConsentQueue(qdir, authority=source, clock=lambda: t0 + timedelta(seconds=21), home=h4_home()).mark_undecided(
                 r.id, halt=True)
             return real(*a, **kw) if _u else None
         monkeypatch.setattr(cx, "unconfined_state", halting)
@@ -184,8 +185,8 @@ def test_every_codex_gate_call_checks_for_held_phone_pings(tmp_path, monkeypatch
 
     calls = []
     monkeypatch.setattr(cx, "flush_held_pings", lambda q: calls.append(q.directory))
-    queue = ConsentQueue(tmp_path / "q", authority=authority_source(tmp_path / "q", anchor=None))
+    queue = ConsentQueue(tmp_path / "q", authority=authority_source(tmp_path / "q", anchor=None), home=h4_home())
     event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"},
              "cwd": "/work/proj", "session_id": "s1", "turn_id": "t1", "tool_use_id": "c1"}
-    cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"), environ=h4_env())
     assert calls == [queue.directory]

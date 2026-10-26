@@ -77,7 +77,8 @@ def _proposable(agent: str, tool: str, workspace: str) -> str | None:
     if not isinstance(workspace, str) or not os.path.isabs(workspace):   # a hook's cwd is absolute; nothing else is proposed
         return None
     resolved, _ = consent_resolved_workspace(workspace)
-    return resolved if resolved is not None and consent_root_problem(resolved) is None else None
+    return resolved if resolved is not None and consent_root_problem(resolved, home=os.path.expanduser("~")) is None \
+        else None
 
 
 def _duration(life: timedelta) -> str:

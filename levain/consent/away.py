@@ -67,7 +67,7 @@ def check_queue_dir(qdir: Path) -> None:
     it. Raises ``ValueError`` (missing) or ``QueueStoreError``."""
     if not os.path.lexists(qdir):
         raise ValueError(f"no consent queue directory at {qdir}; run `levain init` with the consent hook on first")
-    ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))._check_directory()
+    ConsentQueue(qdir, home=Path.home(), authority=authority_source(qdir, anchor=None))._check_directory()
 
 
 def _stat_key(st: os.stat_result) -> tuple[int, int, int, int]:
@@ -180,7 +180,7 @@ def _leave(qdir: Path, agent: str, adapter_settings: Any, signing_key: Path | No
     from levain.cockpit.consent import ConsentError
     from levain.cockpit.keys import KeyError_, ssh_signer
 
-    queue = claude_code._queue_for(qdir, adapter_settings)
+    queue = claude_code._queue_for(qdir, adapter_settings, home=Path.home())
     marked = False
     try:
         signer_fp, sign = ssh_signer(Path(signing_key), namespace=AWAY_NAMESPACE)
@@ -255,7 +255,7 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
         raise ValueError(f"{path} would be larger than a consent settings file once written; not changed")
     try:
         if on:
-            claude_code._queue_for(qdir, adapter_settings).mark_away(agent)
+            claude_code._queue_for(qdir, adapter_settings, home=Path.home()).mark_away(agent)
             changed = "an away mark was recorded"
         else:
             changed = "the away mark was left" if _leave(qdir, agent, adapter_settings, signing_key) else ""

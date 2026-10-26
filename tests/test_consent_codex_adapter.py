@@ -14,6 +14,7 @@ import pytest
 
 from levain.authority import CONSENT_SHELL_TOOLS
 from levain.consent.adapters import codex as cx
+from tests._h4 import h4_env
 
 FAKE_CODEX = r'''#!{python}
 import json, os, sys, threading, time
@@ -150,9 +151,9 @@ def test_a_codex_mcp_write_naming_agent_config_in_any_field_is_tagged(tmp_path):
     home, codex_dir = tmp_path / "home", tmp_path / "codexhome"
     for inp in ({"filepath": ".codex/config.toml"}, {"target": {"file": str(codex_dir / "x")}},
                 {"filepath": ".claude/settings.json"}):
-        assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=home, codex_dir=codex_dir), inp
+        assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=home, codex_dir=codex_dir, environ=h4_env()), inp
     assert not cx.targets_agent_config("mcp__fs__write", {"filepath": "src/a.py"}, str(tmp_path), home=home,
-                                       codex_dir=codex_dir)
+                                       codex_dir=codex_dir, environ=h4_env())
 
 
 def test_a_codex_mcp_write_naming_a_config_directory_is_tagged(tmp_path):
@@ -160,13 +161,13 @@ def test_a_codex_mcp_write_naming_a_config_directory_is_tagged(tmp_path):
     for inp in ({"dir": "~/.claude", "name": "settings.json"}, {"dir": str(tmp_path / ".codex"), "name": "hooks.json"},
                 {"name": ".claude.json"}):
         assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=home,
-                                       codex_dir=tmp_path / "ch"), inp
+                                       codex_dir=tmp_path / "ch", environ=h4_env()), inp
 
 
 def test_a_codex_mcp_input_that_is_not_an_object_is_still_read(tmp_path):
     for inp in ([".codex/config.toml"], [{"file": ".codex/config.toml"}], "file:///x/.codex/hooks.json?a=1"):
         assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=tmp_path / "h",
-                                       codex_dir=tmp_path / "ch"), inp
+                                       codex_dir=tmp_path / "ch", environ=h4_env()), inp
 
 
 # The PermissionRequest real Codex 0.162.1 sent for input typed into a terminal it launched outside the sandbox

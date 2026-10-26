@@ -31,6 +31,7 @@ from levain.consent.record import (
     RULING_NAMESPACE, ExternalGateRequest, redact_display, ruling_message, tool_input_digest,
 )
 from tests.test_consent_queue import authority, keys, signed  # noqa: F401 - the shared fixtures
+from tests._h4 import h4_home
 
 LOCAL = "http://127.0.0.1:8080/"
 
@@ -372,7 +373,7 @@ def test_a_call_not_in_levains_shape_is_refused(home, art):
 
 @pytest.fixture
 def gate(tmp_path, authority, monkeypatch):
-    queue = ConsentQueue(tmp_path / "lhome" / "consent", authority=authority)
+    queue = ConsentQueue(tmp_path / "lhome" / "consent", authority=authority, home=h4_home())
     queue.pending()
     runner = Runner()
     monkeypatch.setattr(publish_gate, "_signable", lambda settings: True)

@@ -11,6 +11,7 @@ from levain.consent.queue import ConsentQueue, authority_source
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_k4a_needs import DESKTOP, READY, _waiting
+from tests._h4 import h4_home
 
 
 @needs_browser
@@ -23,7 +24,7 @@ def test_a_typed_question_answer_survives_a_new_consent_arriving(tmp_path: Path,
     def late() -> None:
       try:
         time.sleep(4.0)
-        q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None))
+        q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
         assert q.withdraw(q.pending()[0].id)   # one leaves as one arrives: the count the manifest holds does not move
         q.file(agent="codex", agent_session_id="s3", tool_name="Edit", tool_input={"file_path": "/w/x.py"}, cwd="/w",
                hold=timedelta(minutes=40), event_id="c")

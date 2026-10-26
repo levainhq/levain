@@ -121,6 +121,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import sqlite3
 import time
@@ -603,11 +604,27 @@ def class_covers(key_class: str, tier: str) -> bool:
     return have is not None and tier in _TIER_NEEDS and have >= _TIER_NEEDS[tier]
 
 
+def queue_dir_for(environ: Mapping[str, str]) -> Path:
+    """``<levain home>/consent`` as ``environ`` names it: ``$LEVAIN_HOME/consent`` if set (``~`` expanded under
+    ``environ["HOME"]``), else ``$HOME/.levain/consent``, made absolute (as
+    ``levain.autonomic.db.default_store_dir`` does for the autonomic store). Reads nothing of this process's own
+    environment; with no ``HOME`` in ``environ``, the password database's home, as ``os.path.expanduser`` does."""
+    home = environ.get("LEVAIN_HOME")
+    if home and home.startswith("~") and not (home == "~" or home.startswith("~/")):
+        base = Path(home).expanduser()      # ~user: the password database's, no $HOME read
+    elif home and not home.startswith("~"):
+        base = Path(home)
+    else:
+        user = environ["HOME"] if "HOME" in environ else pwd.getpwuid(os.getuid()).pw_dir
+        user = user.rstrip("/") or "/"
+        base = Path(user + home[1:]) if home else Path(user) / ".levain"
+    return (base / "consent").resolve()
+
+
 def default_queue_dir() -> Path:
-    """``<levain home>/consent``: ``$LEVAIN_HOME/consent`` if set, else ``~/.levain/consent``, made absolute
-    (as ``levain.autonomic.db.default_store_dir`` does for the autonomic store)."""
-    home = os.environ.get("LEVAIN_HOME")
-    return ((Path(home).expanduser() if home else Path.home() / ".levain") / "consent").resolve()
+    """:func:`queue_dir_for` this process's environment. Not for the core path: the hook entry points call
+    :func:`queue_dir_for` with the environment they bound."""
+    return queue_dir_for(os.environ)
 
 
 def answer_refusal(request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any, authority: Any, *,
@@ -817,7 +834,7 @@ class ConsentQueue:
     ``authority`` is the trusted source every answer and every delivered decision is verified against
     (:func:`authority_source`), called afresh each time: never a snapshot a caller captured earlier."""
 
-    def __init__(self, directory: Path | str | None = None, *, authority: AuthoritySource,
+    def __init__(self, directory: Path | str | None = None, *, authority: AuthoritySource, home: Path | str,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  ssh_keygen: Path | str | None = None) -> None:
         if type(authority) is not AuthoritySource:
@@ -826,6 +843,7 @@ class ConsentQueue:
         self.directory = Path(directory) if directory is not None else default_queue_dir()
         self.path = self.directory / DB_NAME
         self._authority = authority
+        self.home = Path(home)    # where a grant's ``~`` targets and home check are read (grant_refusal), never $HOME
         self._clock = clock
         self._ssh_keygen = ssh_keygen
         self._ready = False
@@ -2376,7 +2394,7 @@ class ConsentQueue:
         for gid in sorted(authority.policy.grants):
             link = authority.grant_link(gid)
             if link is not None and grant_refusal(authority.policy.grants[gid], request, tool_input=tool_input,
-                                                  posture=posture, now=now) is None:
+                                                  posture=posture, now=now, home=self.home) is None:
                 return gid, link[0], link[1]
         return None
 
@@ -2428,7 +2446,7 @@ class ConsentQueue:
         # name another, and a renew, tighten or loosen after the answer takes back an undelivered answer
         if grant is None or authority.grant_link(gid) != (payload["grant_seq"], payload["grant_hash"]) \
                 or grant_refusal(grant, request, tool_input=tool_input, posture=posture,
-                                          now=_now_utc(self._clock)) is not None:
+                                          now=_now_utc(self._clock), home=self.home) is not None:
             return None
         return Decision(request_id=request.id, decision="allow", signer_fp=None, decided_at=row["decided_at"],
                         request_digest=request.digest, via="grant", grant_id=gid, grant_seq=payload["grant_seq"],

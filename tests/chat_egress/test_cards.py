@@ -28,6 +28,7 @@ from levain.consent.listing import UNSHOWN, entry_body, filed_input, read_listin
 from levain.consent.queue import ConsentQueue, authority_source
 from levain.consent.record import DISPLAY_MAX, _secret_named
 from tests.chat_egress.test_classify import frame, route_for
+from tests._h4 import h4_home
 
 LAUNCH = "launch-7f3a"
 SHA = "ab" * 32
@@ -44,7 +45,7 @@ def _card(fr, *, keyed=False, mode=classify.GATED, body_len=0, body_sha256=None,
 def _queue(tmp_path: Path) -> ConsentQueue:
     d = tmp_path / "consent"
     d.mkdir(mode=0o700)
-    return ConsentQueue(d, authority=authority_source(d, anchor=None))
+    return ConsentQueue(d, authority=authority_source(d, anchor=None), home=h4_home())
 
 
 def _shown(card: dict) -> list[str]:
