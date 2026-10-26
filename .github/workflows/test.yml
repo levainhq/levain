@@ -333,6 +333,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,openhands]" hatchling
 
+      - name: Install uv
+        # tests/chat_egress/composed/test_k1_corpus.py runs a real `uv` client through the egress rig; without uv the
+        # case skips and the zero-skips step below fails the job. Pinned to an exact version.
+        run: python -m pip install uv==0.13.5
+
       - name: Install srt the way users do
         # `levain chat setup` is the entry users run: the Node floor check, then `npm ci --ignore-scripts` of the
         # shipped lock into $LEVAIN_HOME/chat-node, the vendor check and the stamp.
