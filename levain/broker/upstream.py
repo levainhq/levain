@@ -33,6 +33,7 @@ from typing import Any, Callable, List, NamedTuple, Optional, Tuple
 import h11
 
 from levain.broker.norm import Refused
+from levain.broker.policy import OPENROUTER_HOST
 
 logger = logging.getLogger("levain.broker")
 
@@ -451,8 +452,6 @@ async def limit_get(header: Tuple[bytes, bytes]) -> RefreshResponse:
     (the caller passes only the credential's header, never a host, an address or a target), resolved by
     `pick_address` (every answer checked), no body, one response of at most REFRESH_BODY_CAP, no redirect followed.
     Its one caller is keys' limit refresher, which bounds the whole call by its own deadline."""
-    from levain.broker.policy import OPENROUTER_HOST
-
     addr = await pick_address(OPENROUTER_HOST, LIMIT_PORT)
     conn = h11.Connection(our_role=h11.CLIENT)
     try:
