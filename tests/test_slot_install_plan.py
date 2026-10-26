@@ -263,11 +263,14 @@ def test_install_verbs_refuse_with_live_lease(verb):
             "set-retention": ["set-retention", "30"], "set-dispatch-retain": ["set-dispatch-retain", "3"],
             "purge": ["purge", "s-0123456789abcdef"], "force-retire": ["force-retire", "egress", "0"],
             "set-credential": ["set-credential", "anthropic"],
-            "remove-credential": ["remove-credential", "anthropic"]}.get(verb, [verb])
+            "remove-credential": ["remove-credential", "anthropic"],
+            "enrol-authority-signer": ["enrol-authority-signer", "--principal", OP, "--public-key",
+                                       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA=="],
+            "remove-authority-signer": ["remove-authority-signer", "--key", "SHA256:" + "A" * 43]}.get(verb, [verb])
     cmd = parse_install_argv(argv)
     facts = _set_up("linux", live_leases=1) if verb != "setup" else _facts("linux", live_leases=1)
     assert LEASE_EXEMPT == {"purge", "force-retire", "set-credential", "remove-credential", "set-limits",
-                            "routes-base", "routes-trust"}
+                            "routes-base", "routes-trust", "enrol-authority-signer", "remove-authority-signer"}
     if verb in LEASE_EXEMPT:
         preflight(cmd, facts)                 # the lease-exempt verbs pass
     else:

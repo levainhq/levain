@@ -13,10 +13,12 @@ re-runs through the install helper.
 
 ``purge``, ``set-credential``, ``remove-credential`` and ``set-limits`` are not plans: they act under the install lock
 (the credential verbs through a forked child that drops to keys before it opens anything below ``L/keys/``,
-:func:`run_credential`; ``set-limits`` writes ``L/policy/limits`` in root, :func:`run_set_limits`).
+:func:`run_credential`; ``set-limits`` writes ``L/policy/limits`` in root, :func:`run_set_limits`). Nor are
+``enrol-authority-signer`` / ``remove-authority-signer``: root's allowed-signers file, :func:`run_authority_signer`.
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import functools
 import json
@@ -34,6 +36,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, ClassVar, ContextManager, Iterable, Iterator, Mapping, Optional, Sequence, TextIO, Tuple
 
+from levain.authority_sig import NAMESPACE as AUTHORITY_NAMESPACE, _Wire
 from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HandsSetupError, HostOS, Step, _abs, _kill_all, host_os, run_plan
 from levain.launch import child_env
@@ -51,7 +54,8 @@ from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Gro
                                   membership_pairs, membership_steps, revive_steps,
                                   shared_group_steps, shared_groups_of, member_state, group_state, uid_retires,
                                   account_state, remove_member_steps, remove_group_steps, remove_account_steps)
-from levain.slot.grammar import LEASE_EXEMPT, SESSION_RE, VERBS, InstallCommand, check_roots, parse_install_argv
+from levain.slot.grammar import (KEY_TYPE_NAMES, LEASE_EXEMPT, PUBLIC_KEY_RE, SESSION_RE, VERBS, InstallCommand,
+                                 check_roots, parse_install_argv)
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
                              SlotClass, SlotId, allocate, check_capacity, choose_indices, in_own_range,
                              is_levain_account, loopback_alias, read_retired_ids, retired_ids_text, spent_indices)
@@ -226,7 +230,7 @@ def check_tools(facts: HostFacts, steps: Sequence[Step], *, verb: str, python: b
 
 #: The verbs :func:`main` applies; every other verb of the §5.2 grammar answers ``verb-unbuilt:<verb>``.
 BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential", "repair", "set-limits",
-               "routes-base", "routes-trust")
+               "routes-base", "routes-trust", "enrol-authority-signer", "remove-authority-signer")
 
 
 def helper_pending() -> tuple[str, ...]:
@@ -926,6 +930,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         *slot_state_undo_steps(host, slots_of(uids), store=live.at(STORE[host])),
         *pool_config_undo_steps(host),
         *policy_limits_undo_steps(host, live),
+        *authority_signers_undo_steps(host, live),
         Step(f"create {path.parent}", (mkdir, "-p", "-m", "755", str(path.parent))),
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
         *remove(of("account/1"), "R7"),             # per account: its processes ended and proven, then the tombstone
@@ -2549,6 +2554,17 @@ def policy_limits_undo_steps(host: HostOS, live: RM.Live) -> list[Step]:
                            lambda: live.act((rm, "-f", RM.at(live, path))), tools=(rm,))]
 
 
+def authority_signers_undo_steps(host: HostOS, live: RM.Live) -> list[Step]:
+    """Undo's removal of root's allowed-signers file (:func:`levain.slot.root_tree.authority_signers_path`), so a
+    later setup for another operator does not inherit the keys root listed for this one. OURS by path and owner alone
+    (:func:`levain.slot.removal.root_file`); a link or another owner's entry there is left. The live read first."""
+    path = root_tree.authority_signers_path(host)
+    rm = "/bin/rm" if host == "darwin" else _abs("rm")
+    return [RM.remove_step(f"remove root's authority signers {path}", ("authority-signers", str(path)), live,
+                           lambda: RM.root_file(live, path),
+                           lambda: live.act((rm, "-f", RM.at(live, path))), tools=(rm,))]
+
+
 # --- routes-base and routes-trust (3c design §2.3, Q15 r3; 3c-9) -------------------------------------------------
 
 #: Q15 r3: the stdin of ``routes-trust``, exactly these keys, canonical bytes.
@@ -2560,7 +2576,7 @@ ROUTES_TRUST_REQUEST_MAX = 16 * 1024
 TRUST_KEY_TYPES = frozenset({"ssh-ed25519", "ecdsa-sha2-nistp256", "sk-ssh-ed25519@openssh.com",
                              "sk-ecdsa-sha2-nistp256@openssh.com"})
 SSH_KEYGEN = "/usr/bin/ssh-keygen"
-_KEY_LINE_RE = re.compile(r"([a-z0-9@.-]{1,64}) ([A-Za-z0-9+/]{1,8192}={0,2})")
+_KEY_LINE_RE = PUBLIC_KEY_RE
 _STORE_ID_RE = re.compile(r"[0-9a-f]{32}")
 _FINGERPRINT_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 _KEYGEN_LINE_RE = re.compile(r"[0-9]+ (SHA256:[A-Za-z0-9+/]{43}) ")
@@ -2685,12 +2701,13 @@ def read_trust_request(read: Callable[[int], bytes]) -> dict:
     return obj
 
 
-def key_fingerprint(public_key: str, *, ssh_keygen: str = SSH_KEYGEN, timeout: float = 10.0) -> str:
+def key_fingerprint(public_key: str, *, ssh_keygen: str = SSH_KEYGEN, timeout: float = 10.0,
+                    refusal: str = "routes-trust-verifier") -> str:
     """The ``SHA256:...`` fingerprint ``ssh-keygen -l -E sha256`` prints for ``public_key``, the key handed to it on a
     pipe (``/dev/fd/N``, written whole by :func:`levain.slot.write_all` before ssh-keygen runs: the longest key line
     ``_KEY_LINE_RE`` admits, 8,260 bytes with its newline, is under the 65,536-byte pipe buffer of both hosts
     [measured on macOS 10-25 by lane-3c9-fix; Linux's default]). ``routes-trust-verifier`` when ssh-keygen cannot run
-    or does not name a fingerprint."""
+    or does not name a fingerprint (``refusal``: another verb's name for that)."""
     r, w = os.pipe()
     try:
         try:
@@ -2700,12 +2717,12 @@ def key_fingerprint(public_key: str, *, ssh_keygen: str = SSH_KEYGEN, timeout: f
         p = subprocess.run([ssh_keygen, "-l", "-E", "sha256", "-f", f"/dev/fd/{r}"], capture_output=True, text=True,
                            timeout=timeout, check=False, pass_fds=(r,), cwd="/", env=child_env())
     except (OSError, subprocess.TimeoutExpired) as e:
-        raise Refused("routes-trust-verifier", f"ssh-keygen could not run ({type(e).__name__})") from None
+        raise Refused(refusal, f"ssh-keygen could not run ({type(e).__name__})") from None
     finally:
         os.close(r)
     m = _KEYGEN_LINE_RE.match(p.stdout)
     if p.returncode != 0 or m is None:
-        raise Refused("routes-trust-verifier", f"ssh-keygen read no key: {(p.stderr or p.stdout).strip()[:120]}")
+        raise Refused(refusal, f"ssh-keygen read no key: {(p.stderr or p.stdout).strip()[:120]}")
     return m.group(1)
 
 
@@ -2724,10 +2741,10 @@ def _trust_on_disk(routes: Path) -> dict | None:
     return obj
 
 
-def _trust_file_holds(path: Path, data: bytes) -> bool:
+def _trust_file_holds(path: Path, data: bytes, *, max_bytes: int = 64 * 1024) -> bool:
     """``path`` holds ``data``, owned by the helper's euid at 0644: what root writes there, readable by CONTROL
     (``merge_base_routes``' test; the group is not read, at 0644 it grants what every account has)."""
-    if R.read_record(path, max_bytes=64 * 1024) != data:
+    if R.read_record(path, max_bytes=max_bytes) != data:
         return False
     st = os.lstat(path)
     return st.st_uid == os.geteuid() and stat.S_IMODE(st.st_mode) == 0o644
@@ -2785,6 +2802,332 @@ def run_routes_trust(caller_uid: int, host: HostOS, *, read: Callable[[int], byt
                                                            "(bytes, root's owner, 0644)")
     return {"verb": "routes-trust", "store_id": req["store_id"], "fingerprint": req["fingerprint"],
             "digest": "sha256:" + hashlib.sha256(pub).hexdigest()}
+
+
+# --- enrol-authority-signer / remove-authority-signer (14b DESIGN_REV2 S5, DESIGN_REV3 §7) --------------------------
+
+SIGNER_VERBS = ("enrol-authority-signer", "remove-authority-signer")
+#: The confirm gate's namespace (``levain.autonomic.confirm.NAMESPACE``; a test holds the two equal). Root imports
+#: neither ``levain.authority`` nor ``levain.autonomic`` (``tests/test_ci_root_closure.py``), so the custody rule below
+#: is written here too, held equal to ``levain.authority.custody_problem`` by the tests.
+CONFIRM_NAMESPACE = "levain-confirm"
+#: The one key type a WebAuthn passkey is (``levain.authority``'s custody table entry for ``passkey``).
+PASSKEY_KEY_TYPE = "sk-ecdsa-sha2-nistp256@openssh.com"
+#: DECISION: the most root's allowed-signers file may hold for these verbs to read it.
+AUTHORITY_SIGNERS_MAX = 256 * 1024
+_BLOB_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
+
+
+def is_passkey_material(public_key: str) -> bool:
+    """``levain.authority.is_passkey_material``, written here (root imports no authority store; a test holds the two
+    equal): a :data:`PASSKEY_KEY_TYPE` key whose application is a web rpId, where an OpenSSH FIDO key's is ``ssh:``."""
+    import base64
+    import struct
+
+    parts = public_key.split()
+    if len(parts) < 2 or parts[0] != PASSKEY_KEY_TYPE:
+        return False
+    try:
+        wire = _Wire(base64.b64decode(parts[1], validate=True))
+        if wire.string() != PASSKEY_KEY_TYPE.encode("ascii"):
+            return False
+        wire.string()                  # curve
+        wire.string()                  # point
+        application = wire.string()
+        wire.end()
+    except (ValueError, IndexError, struct.error):
+        return False
+    return not application.startswith(b"ssh:")
+
+
+def authority_key_problem(public_key: str, *, passkey: bool) -> str | None:
+    """Why ``public_key`` may not be enrolled with root, or None: the authority log's own custody rule
+    (``levain.authority.custody_problem``; the tests hold this equal to it), so root lists no key the log would refuse
+    to enrol. The laptop key (``passkey`` False): a type some stated laptop-presence custody admits
+    (:data:`TRUST_KEY_TYPES`, the custody table's union) and not a passkey's material. A ``--passkey``: a
+    :data:`PASSKEY_KEY_TYPE` key whose material is a passkey's."""
+    key_type = public_key.split()[0]
+    if passkey:
+        if not is_passkey_material(public_key):
+            return f"not a WebAuthn passkey (a {PASSKEY_KEY_TYPE} key made on a web origin)"
+        return None
+    if is_passkey_material(public_key):
+        return "the key is a WebAuthn passkey: name it with --passkey, never as the laptop key"
+    if key_type not in TRUST_KEY_TYPES:
+        return f"no laptop-presence custody takes a {key_type} key (one of {', '.join(sorted(TRUST_KEY_TYPES))})"
+    return None
+
+
+def blob_fingerprint(public_key: str) -> str | None:
+    """OpenSSH's ``SHA256:`` fingerprint of a ``<type> <base64>`` key: the unpadded base64 of the sha256 of the key
+    blob (what ``ssh-keygen -l -E sha256`` prints; :func:`run_authority_signer` refuses an enrolment where the two
+    differ). None when the base64 does not decode. Used to find a key's lines in root's file without running
+    ssh-keygen on lines root may have written by hand."""
+    import base64
+    import hashlib
+
+    try:
+        blob = base64.b64decode(public_key.split()[1], validate=True)
+    except (ValueError, IndexError):
+        return None
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii").rstrip("=")
+
+
+def _quoted_split(text: str, sep: str | None) -> list[str] | None:
+    """``text`` split outside double quotes, on whitespace runs (``sep`` None) or on ``sep`` (empty entries kept);
+    None for an unterminated quote."""
+    out: list[str] = []
+    cur: list[str] = []
+    quoted = False
+    for ch in text:
+        if ch == '"':
+            quoted = not quoted
+            cur.append(ch)
+        elif not quoted and (ch.isspace() if sep is None else ch == sep):
+            if cur or sep is not None:
+                out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if quoted:
+        return None
+    if cur or sep is not None:
+        out.append("".join(cur))
+    return out
+
+
+def _signer_fields(raw: bytes) -> tuple[str, str | None, str] | None:
+    """A line of root's file in the allowed-signers structure: ``(principals, options or None, "<type> <base64>")``,
+    the principals unquoted; None for a blank or ``#`` line, or one that does not parse. Only the key field is the
+    key: a word after it is the line's comment and is never read, so a key named in a comment is no line's key.
+    ``raw`` is UTF-8 (:func:`_read_signers` refuses a file that is not)."""
+    text = raw.decode("utf-8").strip()
+    if not text or text.startswith("#"):
+        return None
+    parts = _quoted_split(text, None)
+    if parts is None or len(parts) < 3:
+        return None
+    principals, rest = parts[0], parts[1:]
+    if len(principals) >= 2 and principals[0] == principals[-1] == '"':
+        principals = principals[1:-1]
+    options = None
+    if rest[0] not in KEY_TYPE_NAMES:
+        options, rest = rest[0], rest[1:]
+    if len(rest) < 2 or rest[0] not in KEY_TYPE_NAMES or not _BLOB_RE.fullmatch(rest[1]):
+        return None
+    return principals, options, f"{rest[0]} {rest[1]}"
+
+
+def _line_keys(raw: bytes) -> tuple[str, ...]:
+    """The key a line of root's file names (:func:`_signer_fields`), or none. A line with options the coverage reader
+    refuses (one ``ssh-keygen -Y verify`` may still honour) names its key too."""
+    fields = _signer_fields(raw)
+    return () if fields is None else (fields[2],)
+
+
+def _line_namespaces(options: str | None) -> frozenset[str] | None:
+    """The namespaces a line's options restrict it to, when they are exactly one ``namespaces="a,b"``; None for no
+    options (every namespace) or any other option."""
+    opts = None if options is None else _quoted_split(options, ",")
+    if opts is None or len(opts) != 1:
+        return None
+    name, sep, value = opts[0].partition("=")
+    if not sep or name.lower() != "namespaces" or len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        return None
+    entries = value[1:-1].split(",")
+    return frozenset(entries) if all(entries) and '"' not in value[1:-1] else None
+
+
+def _signers_owner() -> int:
+    """Who root's file and its directory must be owned by: the helper's euid (root on a host)."""
+    return os.geteuid()
+
+
+def _read_signers(path: Path) -> bytes | None:
+    """Root's allowed-signers file, None when absent; read only when root wrote it and only whole. The descriptor
+    read is the one checked: a regular file (``authority-signers-unreadable`` otherwise), owned by
+    :func:`_signers_owner` and writable by neither group nor others, in a directory of the same
+    (``authority-signers-unsafe``: a line another account could have written is never re-written as root's); at most
+    :data:`AUTHORITY_SIGNERS_MAX` bytes and UTF-8 throughout (``authority-signers-unreadable``: never taken as empty,
+    and ``remove`` never misses a line it cannot read). A link there is ``bad-root``."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK):
+            raise Refused("bad-root", f"{path} is a link") from None
+        raise Refused("authority-signers-unreadable", f"{path}: {e.strerror or e}; nothing written") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused("authority-signers-unreadable", f"{path} is not a regular file; nothing written")
+        owner = _signers_owner()
+        if st.st_uid != owner or st.st_mode & 0o022:
+            raise Refused("authority-signers-unsafe", f"{path} is owned by uid {st.st_uid} at "
+                                                      f"{stat.S_IMODE(st.st_mode):04o}: not root's alone; nothing "
+                                                      "written, its lines are not re-written as root's")
+        try:
+            dst = os.lstat(path.parent)
+        except OSError as e:
+            raise Refused("authority-signers-unreadable", f"{path.parent}: {e.strerror or e}") from None
+        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != owner or dst.st_mode & 0o022:
+            raise Refused("authority-signers-unsafe", f"{path.parent} is not a directory root alone may write; "
+                                                      "nothing written")
+        if st.st_size > AUTHORITY_SIGNERS_MAX:
+            raise Refused("authority-signers-unreadable", f"{path} is past {AUTHORITY_SIGNERS_MAX} bytes; nothing "
+                                                          "written")
+        raw = b""
+        try:
+            while len(raw) <= AUTHORITY_SIGNERS_MAX:
+                chunk = os.read(fd, AUTHORITY_SIGNERS_MAX + 1 - len(raw))
+                if not chunk:
+                    break
+                raw += chunk
+        except OSError as e:
+            raise Refused("authority-signers-unreadable", f"{path}: {e.strerror or e}; nothing written") from None
+    finally:
+        os.close(fd)
+    if len(raw) > AUTHORITY_SIGNERS_MAX:
+        raise Refused("authority-signers-unreadable", f"{path} is past {AUTHORITY_SIGNERS_MAX} bytes; nothing written")
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused("authority-signers-unreadable", f"{path} has a line that is not UTF-8; nothing written") from None
+    return raw
+
+
+def _signer_lines(raw: bytes | None) -> list[bytes]:
+    if not raw:
+        return []
+    lines = raw.split(b"\n")
+    return lines[:-1] if lines[-1] == b"" else lines
+
+
+def _signers_bytes(lines: Sequence[bytes]) -> bytes:
+    return b"".join(line + b"\n" for line in lines)
+
+
+def _signer_text(principal: str, namespaces: Sequence[str], key: str) -> bytes:
+    return f'{principal} namespaces="{",".join(namespaces)}" {key}'.encode("ascii")
+
+
+def _signers_path(rs: RH.Seams, host: HostOS) -> Path:
+    """Root's allowed-signers file under the store the seams name (STORE on a host, a test's scratch L otherwise)."""
+    return rs.L / root_tree.authority_signers_path(host).relative_to(STORE[host])
+
+
+def _write_signers(path: Path, data: bytes, err: TextIO | None, fsync: Callable[[int], None] | None) -> bool:
+    """``data`` at ``path``, root 0644, unless it already holds it (:func:`_trust_file_holds`); True when written. A
+    failure before the rename refuses ``authority-signers-write-failed`` with the earlier file in force; a rename
+    whose directory fsync failed answers (True) and warns on ``err``. Read back before the answer."""
+    if _trust_file_holds(path, data, max_bytes=AUTHORITY_SIGNERS_MAX):
+        return False
+    try:
+        R.write_durably(path, data, mode=0o644, fsync=fsync or gen_mod._full_fsync)
+    except R.NotDurable as e:
+        (err or sys.stderr).write(f"levain install-helper: warning: {path} written but not durable ({e.strerror}): "
+                                  "it is in force now and may not survive a crash; run it again\n")
+    except OSError as e:
+        raise Refused("authority-signers-write-failed", f"{path}: {e.strerror or e}; the earlier file stands") from None
+    if not _trust_file_holds(path, data, max_bytes=AUTHORITY_SIGNERS_MAX):
+        raise Refused("authority-signers-write-failed", f"{path} does not hold the new lines when read back "
+                                                        "(bytes, root's owner, 0644)")
+    return True
+
+
+def run_authority_signer(cmd: InstallCommand, caller_uid: int, host: HostOS, *,
+                         lock: Callable[[], ContextManager[object]], store_seams: RH.Seams | None = None,
+                         err: TextIO | None = None, fsync: Callable[[int], None] | None = None,
+                         fingerprint: Callable[[str], str] = functools.partial(
+                             key_fingerprint, refusal="authority-signer-verifier")) -> dict[str, object]:
+    """``enrol-authority-signer`` / ``remove-authority-signer`` (14b DESIGN_REV2 S5, DESIGN_REV3 §7): root's
+    allowed-signers file (:func:`levain.slot.root_tree.authority_signers_path`): a line per key in namespace
+    ``levain-authority`` (a graduation policy covers only when its signers are listed there), the laptop key's line
+    naming ``levain-confirm`` too with ``--confirm`` (the namespace of a person's signed approval).
+
+    Root reads no operator-uid file: every key comes from argv, typed at the operator's terminal under one ``sudo``.
+    Before the install lock: the operator check, each key held to the authority log's custody rule
+    (:func:`authority_key_problem`, ``authority-signer-key``) and fingerprinted by ``ssh-keygen -l``
+    (``authority-signer-verifier`` when it cannot read the key, or prints another fingerprint than
+    :func:`blob_fingerprint`'s, the one ``remove`` finds lines by). UNDER the lock: the operator check again (an undo
+    between the two is seen), then one read-modify-write of the file, read only when it is root's alone, whole and
+    UTF-8 (:func:`_read_signers`). A line's key is its key field alone (:func:`_signer_fields`). ``enrol`` writes one
+    line per key: a key's earlier line is replaced where it stood and any further line naming that key dropped, a key
+    with no line is appended in argv order (the laptop key's first), and every other line is kept as root wrote it.
+    A line for one of the keys whose principal is not ``--principal``, or whose options are anything but a
+    ``namespaces=`` this enrolment names all of, refuses ``authority-signer-changed`` (remove it first); a file that
+    would pass :data:`AUTHORITY_SIGNERS_MAX` refuses ``authority-signers-too-large`` before any write. ``remove``
+    drops every line naming the key whose fingerprint ``--key`` gives (a narrowing; the file stays, listing what is
+    left; no file stays none, and its ``digest`` is None). Nothing is written when the bytes, root's owner and 0644
+    already hold (:func:`_write_signers`); ``digest`` is then the file's own. The answer names each fingerprint, also
+    told on ``err`` to compare with ``levain cockpit keys``."""
+    import hashlib
+
+    errw = err or sys.stderr
+    rs = store_seams or RH.Seams(host=host)
+    _check_operator(cmd.verb, caller_uid, rs)
+    path = _signers_path(rs, host)
+    if cmd.verb == "remove-authority-signer":
+        target = cmd.key_fingerprint
+        with lock():
+            _check_operator(cmd.verb, caller_uid, rs)
+            old = _read_signers(path)
+            lines = _signer_lines(old)
+            kept = [line for line in lines if not any(blob_fingerprint(k) == target for k in _line_keys(line))]
+            written = old is not None and len(kept) != len(lines) and _write_signers(path, _signers_bytes(kept),
+                                                                                       err, fsync)
+        removed = len(lines) - len(kept)
+        errw.write(f"levain install-helper: {target}: {removed} line(s) removed from {path}\n")
+        return {"verb": cmd.verb, "fingerprint": target, "removed": removed, "written": bool(written),
+                "digest": None if old is None else
+                "sha256:" + hashlib.sha256(_signers_bytes(kept) if written else old).hexdigest()}
+
+    if cmd.public_key is None or cmd.principal is None:
+        raise Refused("missing-argv", f"{cmd.verb} takes --principal and --public-key")
+    wanted: list[tuple[str, tuple[str, ...], str]] = []      # (key, namespaces, fingerprint), the laptop key first
+    for key, passkey in ((cmd.public_key, False), *((k, True) for k in cmd.passkeys)):
+        problem = authority_key_problem(key, passkey=passkey)
+        if problem is not None:
+            raise Refused("authority-signer-key", f"{'--passkey' if passkey else '--public-key'}: {problem}")
+        fp = fingerprint(key)
+        if fp != blob_fingerprint(key):
+            raise Refused("authority-signer-verifier", f"ssh-keygen names {fp} for a key whose blob hashes to "
+                                                       f"{blob_fingerprint(key)}")
+        ns = (AUTHORITY_NAMESPACE, CONFIRM_NAMESPACE) if cmd.confirm and not passkey else (AUTHORITY_NAMESPACE,)
+        wanted.append((key, ns, fp))
+    new = {key: _signer_text(cmd.principal, ns, key) for key, ns, _ in wanted}
+    namespaces = {key: ns for key, ns, _ in wanted}
+    with lock():
+        _check_operator(cmd.verb, caller_uid, rs)
+        out: list[bytes] = []
+        placed: set[str] = set()
+        for n, line in enumerate(_signer_lines(_read_signers(path)), 1):
+            fields = _signer_fields(line)
+            if fields is None or fields[2] not in new:
+                out.append(line)
+                continue
+            principals, options, k = fields
+            had = _line_namespaces(options)
+            if principals != cmd.principal or had is None or not had <= set(namespaces[k]):
+                raise Refused("authority-signer-changed",
+                              f"line {n} lists {blob_fingerprint(k)} for {principals[:128]} with "
+                              f"{(options or 'every namespace')[:256]}; this enrolment would not keep that: "
+                              "remove-authority-signer it first, then enrol")
+            if k not in placed:
+                out.append(new[k])
+                placed.add(k)
+        out.extend(new[k] for k, _, _ in wanted if k not in placed)
+        data = _signers_bytes(out)
+        if len(data) > AUTHORITY_SIGNERS_MAX:
+            raise Refused("authority-signers-too-large", f"{path} would be past {AUTHORITY_SIGNERS_MAX} bytes; the "
+                                                         "earlier file stands")
+        written = _write_signers(path, data, err, fsync)
+    for _, ns, fp in wanted:
+        errw.write(f"levain install-helper: {fp} enrolled in {path} for {','.join(ns)}; compare it with "
+                   "`levain cockpit keys`\n")
+    return {"verb": cmd.verb, "signers": [{"fingerprint": fp, "namespaces": ",".join(ns)} for _, ns, fp in wanted],
+            "written": written, "digest": "sha256:" + hashlib.sha256(data).hexdigest()}
 
 
 # --- repair's handover: the probe (R3a), the exec (R4), phase B (R4a on) (row 33 §2.2) ---------------------------
@@ -3276,6 +3619,8 @@ class Seams:
     #: routes-base / routes-trust (3c-9): their own branches in :func:`run`, as set-limits'.
     routes_base: Callable[..., dict] = run_routes_base
     routes_trust: Callable[..., dict] = run_routes_trust
+    #: enrol-authority-signer / remove-authority-signer (14b S5): their own branch in :func:`run`, as routes-trust's.
+    authority_signer: Callable[..., dict] = run_authority_signer
     #: repair --source's phase A: its steps (with ``apply``), the probe and the exec into phase B (:func:`repair_handover`).
     handover: Callable[..., None] = repair_handover
     #: [F7] The staged-tree launcher's fault, ``(step id, point)``: set by a test harness, never by :func:`main`'s
@@ -3329,6 +3674,9 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
     if cmd.verb == "routes-trust":
         # As set-limits: the request and its fingerprint are checked before the lock, the write under it.
         return seams.routes_trust(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err)
+    if cmd.verb in SIGNER_VERBS:
+        # As routes-trust: argv's keys are checked and fingerprinted before the lock, the file written under it.
+        return seams.authority_signer(cmd, caller_uid, host, lock=lambda: seams.lock(host), err=err)
     with seams.lock(host) as lock_fd:
         gathered = seams.gather(cmd, host, caller_uid)
         try:
@@ -3384,7 +3732,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 __all__ = ["ContinueSeams", "PROBE_OUT_CAP", "PROBE_TIMEOUT_S", "adopt_lock", "exec_phase_b", "phase_b_text",
            "plan_repair_stage", "plan_repair_resume", "check_fault", "fault_hook", "FAULT_POINTS", "FAULT_STEPS", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
            "RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "CHILD_MARGIN_S", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
-           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "read_limits", "run_set_limits", "policy_limits_state", "policy_limits_undo_steps", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
+           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "read_limits", "run_set_limits", "run_authority_signer", "authority_key_problem", "blob_fingerprint", "SIGNER_VERBS", "policy_limits_state", "policy_limits_undo_steps", "authority_signers_undo_steps", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
            "quiesce_step",
