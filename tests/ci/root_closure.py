@@ -255,6 +255,30 @@ LAZY_SITES = {
     'levain/dispatch/contract.py::git_env::from levain.launch import child_env': 'root',
     'levain/dispatch/published.py::sync::from levain.qbroker.grants import PUBLISHED_MAX   # here: grants imports this module': 'root',
     'levain/dispatch/published.py::sync::from levain.qbroker.store import replace_file': 'root',
+    # root: ``record_verification`` <- ``follow.EventFollower`` (the dispatch service's ``follow_run.main``)
+    'levain/dispatch/jobs.py::JobStore.record_verification::from levain.dispatch import adopt': 'root',
+    # root: ``_stored_record`` <- ``record_verification`` / ``run_records`` <- ``follow.EventFollower`` (the dispatch service)
+    'levain/dispatch/jobs.py::_stored_record::from levain.dispatch.adopt import ArtifactRecord, artifact_digest': 'root',
+    # root: ``_verified_at`` <- ``record_verification`` <- ``follow.EventFollower`` (the dispatch service)
+    'levain/dispatch/jobs.py::_verified_at::from levain.slot import records as SR': 'root',
+    # operator: ``recommend`` <- ``dispatch/cli.py`` and ``dispatch/mcp.py``; the follower never calls it
+    'levain/dispatch/jobs.py::JobStore.recommend::from levain.dispatch import adopt': 'operator',
+    # operator: ``JobStore.__init__`` calls it only for ``directory=None``; ``follow_run.main`` passes ``a.store_dir``, and ``dispatch/cli.py`` / ``control.py`` are the other callers
+    'levain/dispatch/jobs.py::default_dispatch_dir::from levain.consent.queue import default_queue_dir': 'operator',
+    # operator: ``land`` <- ``dispatch/cli.py`` (``levain dispatch land``), the only caller; the follower never lands
+    'levain/dispatch/adopt.py::_human_refusal::from levain.consent.queue import AuthoritySource': 'operator',
+    # operator: ``land`` <- ``dispatch/cli.py`` (``levain dispatch land``), the only caller; the follower never lands
+    'levain/dispatch/adopt.py::_human_refusal::from levain.dispatch.jobs import _replay': 'operator',
+    # operator: ``authorise_refusal`` <- ``land`` (``dispatch/cli.py``) and ``JobStore.authorise``, neither run by the follower
+    'levain/dispatch/adopt.py::authorise_refusal::from levain.consent.passkey import answer_signature_problem': 'operator',
+    # operator: ``floor`` <- ``land`` <- ``dispatch/cli.py`` (``levain dispatch land``)
+    'levain/dispatch/adopt.py::floor::from levain.dispatch.control import ControlStateUnavailable': 'operator',
+    # operator: ``sweep_staged`` <- ``dispatch/cli.py`` (after a land, and the sweep verb); ``record_verification`` calls ``_delete_staged``, not this
+    'levain/dispatch/adopt.py::sweep_staged::from levain.dispatch.jobs import JobStoreError': 'operator',
+    # operator: ``driver_template_digest`` <- ``doctor.py`` / ``dispatch/cli.py``; nothing the follower runs reads a driver template
+    'levain/dispatch/registry.py::driver_template_path::from levain import verifier_drivers': 'operator',
+    # operator: ``body_refusal`` <- ``dispatch/cli.py`` and ``dispatch/control.py``; the follower reads no registry
+    'levain/dispatch/registry.py::_verifier_entry_problem::from levain.verifier_drivers import output_compare': 'operator',
     # operator: <- ``StandingPolicy.apply`` (``git grep -n 'policy.apply(' -- levain`` finds ``levain/cockpit/broker.py`` and ``verbs.py`` only) and ``classify`` / ``_validate_policy`` / ``_apply_policy_op`` (the replay, ``_step``)
     'levain/authority.py::_tiers::from levain.cockpit.verbs import TIERS': 'operator',
     # operator: <- ``_validate_egress_key`` (``_validate_grant`` <- ``_validate_policy`` / ``_apply_policy_op``, the replay: the authority replay (``_step`` <- ``_replay_entry`` <- ``snapshot``, run by ``consent.queue.AuthoritySource`` and ``cockpit.authority.RequestAuthority.capture``); the queue broker builds its ``AuthoritySnapshot`` from published signers (``qbroker.grants.contract_authority``) and runs neither (``git grep -n -e 'snapshot(' -e 'authority_source' -e 'RequestAuthority(' -- levain/qbroker`` finds none)) and ``levain/chat_egress/advert.py``
