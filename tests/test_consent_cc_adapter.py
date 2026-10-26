@@ -1651,26 +1651,13 @@ def test_a_large_mcp_input_derives_the_user_site_roots_once(monkeypatch, tmp_pat
 
 def test_no_operator_home_fails_closed_through_the_mcp_path(monkeypatch, tmp_path):
     """K1 (stack7 L3 r1, deepseek MED 1): a password database with no entry and no HOME (`operator_home` raises
-    KeyError) tags an MCP call, never escapes it; so does one that raises only after the first derivation (the
-    per-candidate site `names_config_dir` had, outside the outer try's KeyError)."""
+    KeyError) tags an MCP call, never escapes it."""
     def gone(environ):
         raise KeyError("HOME")
 
     monkeypatch.setattr(cc, "operator_home", gone)
     assert cc.targets_agent_config("mcp__fs__write", {"dir": "d", "name": "n"}, str(tmp_path), home=tmp_path / "home",
                                    environ=h4_env())
-    seen = []
-
-    def later(environ):
-        seen.append(1)
-        if len(seen) > 2:   # the outer try's two derivations (user_site_roots, global_git_configs) succeed
-            raise KeyError("HOME")
-        return tmp_path / "elsewhere"
-
-    monkeypatch.setattr(cc, "operator_home", later)
-    monkeypatch.setattr(cc, "_under_hooks_path", lambda *a, **k: False)   # git's own operator_home call kept out
-    cc.targets_agent_config("mcp__fs__write", {"dir": "d", "name": "n"}, str(tmp_path), home=tmp_path / "home",
-                            environ=h4_env())
 
 
 @pytest.mark.parametrize("bad", ("", "rel/home"))

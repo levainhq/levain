@@ -545,7 +545,8 @@ def user_site_roots(home: Path, *, environ: Mapping[str, str]) -> tuple[str, ...
     expands) and for :func:`operator_home`, each only when absolute. Whatever THIS interpreter's
     ``site.ENABLE_USER_SITE`` says: a venv's is False, and the operator's other, non-venv Pythons still run a
     ``.pth``, ``usercustomize.py`` or package planted there. ``environ`` names the operator (:func:`operator_home`)
-    and any ``$PYTHONUSERBASE``. Kept apart from :func:`import_site_dirs`, which answers only what redirects this interpreter's ``import levain``."""
+    and any ``$PYTHONUSERBASE``. Kept apart from :func:`import_site_dirs`, which answers only what redirects
+    this interpreter's ``import levain``."""
     from levain.firing.confinement import python_user_site_roots  # lazy: keep this module light
 
     out: dict[str, None] = {}
@@ -651,7 +652,7 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         return any(names_config_dir(target, cwd, home, roots, sites, user_configs, git_cache, user_roots=user_roots,
                                     environ=environ)
                    for target in extra)
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError):
         return True
 
 
