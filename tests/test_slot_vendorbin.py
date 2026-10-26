@@ -1,6 +1,7 @@
 """The vendor CLIs in the root-owned vendor prefix (1026+8 VENDOR BINARIES ruling; CONTRACT §2.1 row "vendor prefix";
-BUILD_PLAN §2e 14): setup and repair COPY each vendor CLI found on the machine to ``VENDOR_PREFIX/bin/<name>`` (a
-regular file, root's, 0755, never a link), an absent vendor is skipped with a line, ``start`` refuses
+BUILD_PLAN §2e 14): setup and repair COPY each vendor CLI found on the machine into ``VENDOR_PREFIX`` (Claude Code to
+``bin/claude``, a regular file, root's, 0755, never a link; Codex's whole package to ``codex/<version>-<digest>/``, with
+``bin/codex`` root's link into it, head ruling 1026-14 V8), an absent vendor is skipped with a line, ``start`` refuses
 ``vendor-not-installed:<name>`` before the clone, and doctor names a copy that differs from the vendor it came from."""
 from __future__ import annotations
 
@@ -297,17 +298,18 @@ def test_v1_a_codex_copy_without_its_companions_is_refused_by_start(tmp_path):
     _exe(tmp_path / "bin" / "codex", MACHO)
     with pytest.raises(Refused) as e:
         SS.check_vendor_installed("darwin", "codex", prefix=tmp_path, root_uid=os.getuid())
-    assert e.value.name == "vendor-not-installed:codex" and "codex-package.json" in str(e.value.detail)
+    assert e.value.name == "vendor-not-installed:codex" and "not the link" in str(e.value.detail)
 
 
 def test_v1_the_codex_package_is_copied_as_a_unit(env):
     root, files = _codex_pkg(env)
     ok, why = _codex_copy(env)
     assert ok and "copied" in why, why
+    active = _active_root(env.prefix)
     for rel, (data, mode) in files.items():
-        st = os.lstat(env.prefix / rel)
+        st = os.lstat(active / rel)
         assert stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == mode, rel
-        assert (env.prefix / rel).read_bytes() == data, rel
+        assert (active / rel).read_bytes() == data, rel
     assert not any(p.name.endswith(".partial") for p in env.prefix.rglob("*"))
     from levain.slot import start as SS
     SS.check_vendor_installed("darwin", "codex", prefix=env.prefix, root_uid=os.getuid())
@@ -324,7 +326,7 @@ def test_v1_a_companion_update_makes_the_unit_stale_and_repair_recopies_it(env):
     kw = dict(prefix=env.prefix, search=env.search, machine="arm64", root_uid=os.getuid())
     assert RT.vendor_state("darwin", "codex", str(env.home), **kw)[0] == "stale"
     ok, why = _codex_copy(env)
-    assert ok and "copied" in why and (env.prefix / "codex-path" / "rg").read_bytes() == MACHO + b"rg2"
+    assert ok and "copied" in why and (_active_root(env.prefix) / "codex-path" / "rg").read_bytes() == MACHO + b"rg2"
 
 
 @pytest.mark.parametrize("skip", ["codex-package.json", "bin/codex-code-mode-host", "codex-path/rg"])
@@ -363,7 +365,7 @@ def test_v1_start_refuses_a_codex_unit_with_a_bad_companion(env):
 
     _codex_pkg(env)
     _codex_copy(env)
-    os.chmod(env.prefix / "codex-path" / "rg", 0o775)
+    os.chmod(_active_root(env.prefix) / "codex-path" / "rg", 0o775)
     with pytest.raises(Refused) as e:
         SS.check_vendor_installed("darwin", "codex", prefix=env.prefix, root_uid=os.getuid())
     assert "codex-path/rg" in str(e.value.detail)
@@ -506,3 +508,178 @@ def test_v7_a_dir_fsync_failure_after_the_rename_is_a_warning(env):
 def test_low3_an_unreadable_copy_gets_the_repair_hint(tmp_path):
     [r] = _doctor(tmp_path, {"claude": ("unreadable", "cannot compare"), "codex": ("current", "")})
     assert r.warn and "repair" in r.hint and "claude" in r.hint and "leaves it" not in r.hint
+
+
+# --- f2 (1026-14 RULINGS "vendorbin verify r2 triage" V8-V13) ---------------------------------------------------------
+
+def _active_root(prefix: Path) -> Path:
+    """The package root ``bin/codex`` runs from (links resolved, the way codex finds its own package)."""
+    return Path(os.path.realpath(prefix / "bin" / "codex")).parent.parent
+
+
+def _v2(env, **kw):
+    return _codex_pkg(env, extra={"bin/codex": (MACHO + b"v2", 0o755),
+                                  "bin/codex-code-mode-host": (MACHO + b"hostv2", 0o755),
+                                  "codex-path/rg": (MACHO + b"rg-v2", 0o755),
+                                  "codex-resources/voice/manifest.json": (b'{"v": 2}', 0o644)}, **kw)
+
+
+def test_v8_an_upgrade_that_fails_part_way_leaves_the_old_package_active_and_whole(env):
+    """RED at bb334bac: companions were renamed over the active package one at a time, so a failure on a later file
+    left the old ``bin/codex`` beside new companions and start accepted the mix."""
+    _, v1 = _codex_pkg(env)
+    assert _codex_copy(env)[0]
+    _v2(env)
+    calls = []
+
+    def fsync(fd):
+        calls.append(fd)
+        if len(calls) == 3:
+            raise OSError(5, "Input/output error")
+    ok, why = _codex_copy(env, fsync=fsync)
+    assert not ok and "failed" in why, why
+    root = _active_root(env.prefix)
+    for rel, (data, _) in v1.items():
+        assert (root / rel).read_bytes() == data, rel
+    assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid()) == ""
+    ok, why = _codex_copy(env)
+    assert ok and "copied" in why, why
+    assert (_active_root(env.prefix) / "codex-path" / "rg").read_bytes() == MACHO + b"rg-v2"
+
+
+def test_v8_the_active_name_is_one_link_to_a_complete_versioned_package(env):
+    _codex_pkg(env, extra={"codex-package.json": (b'{"version": "0.162.1"}', 0o644)})
+    ok, why = _codex_copy(env)
+    assert ok, why
+    link = env.prefix / "bin" / "codex"
+    assert os.path.islink(link)
+    target = os.readlink(link)
+    assert target.startswith("../codex/0.162.1-") and target.endswith("/bin/codex"), target
+    assert _active_root(env.prefix).parent == (env.prefix / "codex").resolve()
+    first = _active_root(env.prefix).name
+    _codex_pkg(env, extra={"codex-package.json": (b'{"version": "0.163.0"}', 0o644)})
+    ok, why = _codex_copy(env)
+    assert ok and "copied" in why, why
+    assert _active_root(env.prefix).name.startswith("0.163.0-")
+    left = sorted(p.name for p in (env.prefix / "codex").iterdir())
+    assert left == [_active_root(env.prefix).name] and first not in left, left
+    assert not any(p.name.endswith(".partial") for p in env.prefix.rglob("*"))
+
+
+@pytest.mark.parametrize("target", ["/bin/sh", "../../elsewhere/bin/codex", "../codex/.staging.partial/bin/codex"])
+def test_v8_start_refuses_an_active_link_off_the_package_dir(env, target):
+    from levain.slot import start as SS
+
+    _codex_pkg(env)
+    _codex_copy(env)
+    os.unlink(env.prefix / "bin" / "codex")
+    os.symlink(target, env.prefix / "bin" / "codex")
+    with pytest.raises(Refused) as e:
+        SS.check_vendor_installed("darwin", "codex", prefix=env.prefix, root_uid=os.getuid())
+    assert e.value.name == "vendor-not-installed:codex"
+
+
+def test_v8_a_flat_codex_file_is_not_the_active_package(env):
+    from levain.slot import start as SS
+
+    _exe(env.prefix / "codex-package.json", b"{}", 0o644)
+    _exe(env.prefix / "bin" / "codex", MACHO)
+    _exe(env.prefix / "bin" / "codex-code-mode-host", MACHO)
+    _exe(env.prefix / "codex-path" / "rg", MACHO)
+    _exe(env.prefix / "codex-resources" / "x", b"x", 0o644)
+    with pytest.raises(Refused):
+        SS.check_vendor_installed("darwin", "codex", prefix=env.prefix, root_uid=os.getuid())
+
+
+def test_v9_repair_fixes_a_bad_directory_mode_when_every_file_matches(env):
+    """RED at bb334bac: every file equal returned "already matches" before any directory was checked, so a 0775
+    directory start refuses was never fixed."""
+    _codex_pkg(env)
+    _codex_copy(env)
+    os.chmod(_active_root(env.prefix) / "codex-resources" / "voice", 0o775)
+    assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid())
+    ok, why = _codex_copy(env)
+    assert ok, why
+    assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid()) == ""
+
+
+def test_v9_a_repair_that_leaves_a_problem_reports_failure(env, monkeypatch):
+    _codex_pkg(env)
+    _codex_copy(env)
+    os.chmod(_active_root(env.prefix) / "codex-resources" / "voice", 0o775)
+    monkeypatch.setattr(RT.os, "chmod", lambda *a, **k: None)
+    ok, why = _codex_copy(env)
+    assert not ok and "voice" in why, why
+
+
+def test_v10_start_refuses_a_required_executable_at_0644(env):
+    """RED at bb334bac: every non-entry file passed at 0755 or 0644, so a 0644 ``rg`` started and failed EACCES."""
+    from levain.slot import start as SS
+
+    _codex_pkg(env)
+    _codex_copy(env)
+    os.chmod(_active_root(env.prefix) / "codex-path" / "rg", 0o644)
+    with pytest.raises(Refused) as e:
+        SS.check_vendor_installed("darwin", "codex", prefix=env.prefix, root_uid=os.getuid())
+    assert "rg" in str(e.value.detail) and "644" in str(e.value.detail)
+
+
+@pytest.mark.parametrize("rel", ["codex-path/rg", "bin/codex-code-mode-host", "codex-resources/zsh/bin/zsh"])
+def test_v10_a_source_executable_that_is_not_executable_is_not_copied(env, rel):
+    _codex_pkg(env, extra={rel: (MACHO + b"x", 0o644)})
+    ok, why = _codex_copy(env)
+    assert ok and "not copied" in why and rel.split("/")[-1] in why, why
+    assert not os.path.lexists(env.prefix / "bin" / "codex")
+
+
+def test_v11_an_exception_in_a_copy_step_reaches_the_sink(tmp_path):
+    """RED at bb334bac: an exception skipped ``sink.append``, so the report step saw no failure."""
+    from types import SimpleNamespace
+
+    def boom(host, name, **kw):
+        raise RuntimeError("kaboom")
+    failed: list = []
+    steps = RT.vendor_steps("darwin", "op", failed=failed, copy=boom,
+                            lookup=lambda o: SimpleNamespace(pw_dir="/h", pw_uid=1))
+    [claude, codex] = [s for s in steps if s.why.startswith("place root's copy")]
+    ok, why = claude.call()
+    assert not ok and "kaboom" in why and failed == [why]
+
+    def nolook(o):
+        raise OSError(5, "Input/output error")
+    failed2: list = []
+    steps = RT.vendor_steps("darwin", "op", failed=failed2, lookup=nolook)
+    ok, why = [s for s in steps if s.why.startswith("place root's copy")][0].call()
+    assert not ok and failed2 == [why]
+
+
+def test_v12_a_codex_package_without_codex_resources_is_not_copied(env):
+    """RED at bb334bac: a missing tree was skipped, so a package with no resources was published whole."""
+    root, _ = _codex_pkg(env)
+    import shutil
+    shutil.rmtree(root / "codex-resources")
+    ok, why = _codex_copy(env)
+    assert ok and "not copied" in why and "codex-resources" in why, why
+    assert not os.path.lexists(env.prefix / "bin" / "codex")
+
+
+def test_v12_start_refuses_an_active_package_without_codex_resources(env):
+    import shutil
+
+    from levain.slot import start as SS
+
+    _codex_pkg(env)
+    _codex_copy(env)
+    shutil.rmtree(_active_root(env.prefix) / "codex-resources")
+    with pytest.raises(Refused) as e:
+        SS.check_vendor_installed("darwin", "codex", prefix=env.prefix, root_uid=os.getuid())
+    assert "codex-resources" in str(e.value.detail)
+
+
+def test_v13_a_probe_that_raises_anything_is_a_row_not_a_crash(tmp_path):
+    def state(n):
+        raise TypeError("bad probe")
+    from levain import doctor as D
+
+    [r] = D._check_vendor_copies(host="darwin", store=tmp_path, home=str(tmp_path), state=state)
+    assert r.warn and "UNREADABLE" in r.detail and "bad probe" in r.detail

@@ -142,7 +142,8 @@ def check_discovery(ctx: H.Ctx, a: R.Alloc) -> None:
 def check_vendor_installed(host: str, vendor: str, *, prefix: Optional[Path] = None, root_uid: int = 0) -> None:
     """Root's copy of the vendor's install unit in the vendor prefix can be run
     (:func:`levain.slot.root_tree.unit_problem`, the one predicate doctor reads too: the binary :func:`vendor_argv`
-    execs and, for Codex, every file of its package, each a regular file owned by root, never a link): else
+    execs: Claude Code's a regular file owned by root, never a link; Codex's root's link to one whole version of its
+    package, every file of it root's): else
     ``vendor-not-installed:<vendor>``, so a missing copy is named before the clone instead of as the wall's
     ``exec-failed: errno 2`` after it. ``root_uid``: tests pass their own uid."""
     from levain.slot.root_tree import unit_problem

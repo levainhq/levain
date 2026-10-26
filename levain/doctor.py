@@ -547,7 +547,7 @@ def _check_vendor_copies(*, host: str | None = None, store: Path | None = None, 
     for name in RT.VENDORS:
         try:
             st, detail = read(name)
-        except OSError as exc:
+        except Exception as exc:     # V13: a probe that crashes is a row, never doctor's crash
             st, detail = "unreadable", f"could not be read ({_slot_why(exc)})"
         if st == "current":
             parts.append(f"{name} current")
