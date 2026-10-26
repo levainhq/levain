@@ -32,7 +32,7 @@ from levain.coordinator.envelopes import EnvelopeStore
 
 from ..decider_rig import Desk, Live, Lookup
 from ..fixtures import env as envmod
-from ..test_launch import real_launch
+from ..test_launch import NO_GRANTS, real_launch
 from .rig import LeakyRelay, RecordingOrigin
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fixtures" / "spike_glue"))
@@ -152,7 +152,7 @@ class TlsLaunch:
             store=estore, launch_id=real_launch(estore), node=envmod.node_bin(), srt_prefix=envmod.srt_prefix(),
             events=tmp / "events.jsonl", ca_pem=key_pem + cert_pem,
             routes=keys.RouteSet.of([route] if secret is not None else []), liveness=liveness or Live(),
-            credentials=keys.LaunchCredentials(self.store), cards=self.desk, mode=dm.Fixed(mode),
+            credentials=keys.LaunchCredentials(self.store), cards=self.desk, mode=dm.Fixed(mode), authority=NO_GRANTS,
             limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),
             seams=lm.TestSeams(glue_args=("--tls-ports", f"443,{P}", "--carve", f"127.0.0.1:{P}",
                                           "--resolve-map", f"{KEYED}=127.0.0.1;{UNKEYED}=127.0.0.1",

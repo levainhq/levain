@@ -339,7 +339,7 @@ class ProdGlueRun:
         from levain.coordinator.envelopes import EnvelopeStore
 
         from ..decider_rig import Desk, Live, Lookup
-        from ..test_launch import real_launch
+        from ..test_launch import NO_GRANTS, real_launch
         if str(envmod.GLUE_DIR) not in sys.path:
             sys.path.insert(0, str(envmod.GLUE_DIR))
         import decider_spike4 as spike  # noqa: E402  (its make_ca: an RSA CA srt's node-forge accepts)
@@ -383,7 +383,7 @@ class ProdGlueRun:
             self.e = lm.start_egress(
                 store=estore, launch_id=real_launch(estore), node=envmod.node_bin(), srt_prefix=envmod.srt_prefix(),
                 events=self.events.path, ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([route]), liveness=Live(),
-                credentials=keys.LaunchCredentials(self.store), cards=self.desk, mode=dm.Fixed(classify.GATED),
+                credentials=keys.LaunchCredentials(self.store), cards=self.desk, mode=dm.Fixed(classify.GATED), authority=NO_GRANTS,
                 limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),
                 seams=lm.TestSeams(glue_args=("--tls-ports", f"443,{p.tls}", "--http-ports", http_ports, "--carve", carve,
                                               "--resolve-map", rmap, *up), lookup=Lookup()))

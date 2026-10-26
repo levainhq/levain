@@ -59,6 +59,7 @@ def test_close_shuts_down_a_connection_the_tls_wrap_took_over(tmp_path) -> None:
 def test_a_failed_tls_launch_constructor_closes_the_origin_it_started(tmp_path, monkeypatch) -> None:
     from levain.chat_egress import launch as lm
     from . import tls_rig
+    from ..fixtures import env as envmod
     made: list[RecordingOrigin] = []
 
     class Spy(RecordingOrigin):
@@ -70,9 +71,19 @@ def test_a_failed_tls_launch_constructor_closes_the_origin_it_started(tmp_path, 
         raise RuntimeError("start_egress failed")
     monkeypatch.setattr(tls_rig, "RecordingOrigin", Spy)
     monkeypatch.setattr(lm, "start_egress", boom)
+    monkeypatch.setattr(envmod, "srt_prefix", lambda: tmp_path)   # the constructor reads it before start_egress runs
     with pytest.raises(RuntimeError, match="start_egress failed"):
         tls_rig.TlsLaunch(tmp_path / "T", monkeypatch)
     assert len(made) == 1 and not made[0]._t.is_alive()
+
+
+def _no_name_ctx():
+    """The context `TlsLaunch.tunnel` hands `_no_sni`: no name check (a memory-BIO handshake has no server_hostname,
+    and `wrap_bio` refuses `check_hostname=True` without one)."""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    return ctx
 
 
 def test_the_no_sni_handshake_fails_on_a_peer_eof_inside_the_deadline() -> None:
@@ -90,7 +101,7 @@ def test_the_no_sni_handshake_fails_on_a_peer_eof_inside_the_deadline() -> None:
     t0 = time.monotonic()
     try:
         with pytest.raises((ssl.SSLError, ConnectionError, TimeoutError)):
-            TlsLaunch._no_sni(ssl.create_default_context(), c, time.monotonic() + 5)
+            TlsLaunch._no_sni(_no_name_ctx(), c, time.monotonic() + 5)
     finally:
         c.close()
         peer.close()
@@ -131,7 +142,7 @@ def test_the_no_sni_handshake_is_bounded_by_its_deadline_not_the_sockets_timeout
     t0 = time.monotonic()
     try:
         with pytest.raises(TimeoutError):
-            TlsLaunch._no_sni(ssl.create_default_context(), c, t0 + 0.2)
+            TlsLaunch._no_sni(_no_name_ctx(), c, t0 + 0.2)
     finally:
         c.close()
         peer.close()
