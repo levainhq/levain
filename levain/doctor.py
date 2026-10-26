@@ -1037,9 +1037,9 @@ def _served_pairs(store: Path, deadline: float, keys_status: Any) -> tuple[set, 
             if said:
                 return pairs, CheckResult(name, True, "; ".join(said), warn=True), None
             return pairs, None, None
-        return set(), CheckResult(name, True, "held by keys: the dispatch route maps are read once a session has "
-                                  "started, and keys gave none to this run, so the ceilings of their credentials "
-                                  "are not shown",
+        return set(), CheckResult(name, True, "held by keys: this account's own read of the route maps was refused "
+                                  "and keys gave none to this run, so the ceilings of their credentials are not "
+                                  "shown (keys gives them once a session has started)",
                                   "Run `sudo levain doctor` to read them as root.", neutral=True), frozenset()
     except OSError as exc:
         return set(), CheckResult(name, True, f"dispatch route maps could not be read ({_slot_why(exc)})",
@@ -1152,12 +1152,16 @@ def _limit_verdict(name: str, lim: float | None, rem: float | None, reset: objec
 def _keys_limit_row(cred: str, name: str, held: tuple, keys_status: Any) -> CheckResult:
     """The ceiling row from keys' own report (D1: keys' refresher reads each served OpenRouter key's limit and
     ``KEYS-STATUS`` carries its last read, in microdollars, with its age), for an operator whose account cannot open
-    the credential; the held words when keys did not tell it."""
+    the credential; the held words when keys gave no report, and its own words when keys answered without this credential."""
     told = keys_status()
     entry = None if told is None else next((e for e in told["limits"] if e["credential"] == cred), None)
     if entry is None:
-        more = ("; keys' answer had no room for it" if told is not None and told["limits_truncated"] else "")
-        return CheckResult(name, True, held[0] + more, held[1], warn=True)
+        if told is None:
+            return CheckResult(name, True, held[0], held[1], warn=True)
+        # keys answered: what it left out is said as what it left out, never as keys not answering
+        said = (f"the key limit was not read: keys answered and reports no limit for {cred}"
+                + ("; keys' answer had no room for it" if told["limits_truncated"] else ""))
+        return CheckResult(name, True, said, held[1], warn=True)
     failed = entry["failed"]
     if entry["age_s"] is None:
         if failed is None:

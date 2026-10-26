@@ -58,6 +58,8 @@ def test_idle_dispatch_row_says_keys_holds_it_and_the_read_comes_with_a_session(
     store = _held_store(tmp_path)
     (store / "keys" / "routemap.head").write_bytes(b"x")
     r = _idle_rows(store)["invoice ceiling (dispatch routes)"]
-    assert _no_permission_words(r.detail) == []
+    # this row's branch proves a direct read was refused AND that keys gave none: it says both, and no more
+    assert "this account's own read of the route maps was refused" in r.detail and "keys gave none" in r.detail
+    assert "not answering" not in r.detail and "no session" not in r.detail
     assert r.detail.startswith("held by keys") and "once a session has started" in r.detail
     assert r.neutral
