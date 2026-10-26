@@ -48,7 +48,7 @@ class Service:
     title: str                             # §1.3 "Service" column
     user: str                              # §1.3 "Uid" column
     after: tuple[str, ...]                 # §1.3 "Starts after" (names); () = boot
-    restart: Literal["always", "one-shot"]
+    restart: Literal["always", "on-failure", "one-shot"]
     hosts: tuple[HostOS, ...] = ("darwin", "linux")
 
 
@@ -57,7 +57,7 @@ SERVICES: tuple[Service, ...] = (
     Service("control", "CONTROL", "_levain_control", (), "always"),
     Service("keys", "gw-keys", "_levain_keys", ("control",), "always"),
     Service("qbroker", "QUEUE BROKER", "_levain_qbroker", ("control",), "always"),
-    Service("dispatch", "dispatch", "_levain_dispatch", ("control", "keys"), "always"),
+    Service("dispatch", "dispatch", "_levain_dispatch", ("control", "keys"), "on-failure"),
     Service("reaper", "reaper", "root", ("control",), "always"),
     Service("pf", "pf anchor", "root", (), "one-shot", hosts=("darwin",)),
 )
@@ -128,6 +128,8 @@ def launchd_plist_text(svc: Service) -> str:
         "RunAtLoad": True,
         # "always": restarted whenever it exits. "one-shot": restarted only while it exits non-zero, so a
         # boot load that failed once is retried until it succeeds instead of leaving its work undone.
+        # "on-failure" (§1.3 dispatch): the same mapping; a non-zero exit or a signal death is relaunched, an exit 0
+        # (the supervisor-lock loser's) is not.
         "KeepAlive": True if svc.restart == "always" else {"SuccessfulExit": False},
     }
     return plistlib.dumps(job, sort_keys=True).decode("utf-8")
@@ -144,24 +146,37 @@ def systemd_path(name: str) -> Path:
     return SYSTEMD_DIR / name
 
 
+#: Each Linux restart policy's ``[Service]`` lines. ``always``: a service that keeps failing backs off step by step
+#: instead of restarting at a fixed short interval. ``on-failure`` (§1.3 dispatch): a non-zero exit or a signal other
+#: than SIGHUP/SIGINT/SIGTERM/SIGPIPE is restarted 5 s later; an exit 0 and a SIGTERM death are not (systemd's own
+#: definition of on-failure). Under either, an EX_CONFIG exit is not (``RestartPreventExitStatus``, below). No Linux
+#: service is one-shot.
+_SYSTEMD_RESTART: dict[str, tuple[str, ...]] = {
+    "always": ("Restart=always", "RestartSec=1", "RestartSteps=5", "RestartMaxDelaySec=30"),
+    "on-failure": ("Restart=on-failure", "RestartSec=5"),
+}
+
+
 def systemd_unit_text(svc: Service) -> str:
     if "linux" not in svc.hosts:
         raise Refused("unsupported-host", f"{svc.name} is macOS only")
+    if svc.restart not in _SYSTEMD_RESTART:
+        raise Refused("unsupported-host", f"{svc.name}: no Linux form of restart {svc.restart!r}")
     deps = " ".join(systemd_name(by_name(a)) for a in svc.after)
     unit = [f"Description=Levain {svc.title} (CONTRACT §1.3)"]
     if deps:
         unit += [f"After={deps}", f"Wants={deps}"]
-    unit.append("StartLimitIntervalSec=0")   # "always" means always: no start-rate limit gives up on it
+    unit.append("StartLimitIntervalSec=0")   # no start-rate limit gives up on a service that is restarted
     lines = [
         SYSTEMD_HEADER,
         "[Unit]", *unit, "",
         "[Service]", "Type=simple", f"User={svc.user}", f"Group={_group('linux', svc)}",
         f"ExecStart={' '.join(argv('linux', svc))}",
-        # A service that keeps failing backs off step by step instead of restarting at a fixed short interval.
-        "Restart=always", "RestartSec=1", "RestartSteps=5", "RestartMaxDelaySec=30",
-        # EX_CONFIG: the install lacks what the program needs (keys with no _levain_gw<n> account); a restart cannot
-        # fix it, so the unit stays down until setup or repair changes the install.
-        f"RestartPreventExitStatus={EX_CONFIG}", "",
+        *_SYSTEMD_RESTART[svc.restart],
+        # EX_CONFIG: the install lacks what the program needs (keys with no _levain_gw<n> account). EX_NOPERM 77: the
+        # program runs as a user its row does not name. A restart fixes neither, so the unit stays down until setup or
+        # repair changes the install.
+        f"RestartPreventExitStatus={EX_CONFIG} 77", "",
         "[Install]", "WantedBy=multi-user.target", "",
     ]
     return "\n".join(lines)

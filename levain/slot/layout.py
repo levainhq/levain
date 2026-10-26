@@ -48,6 +48,12 @@ def session_repo(host: HostOS, session: str) -> Path:
     return STORE[host] / "live" / session / "repo"
 
 
+def dispatch_store_dir(host: HostOS) -> Path:
+    """``L/dispatch``: the dispatch principal's own store (job state, CONTRACT §1 dispatch row), the job store's
+    directory and the supervisor lock's (``levain.slot.services.dispatch``)."""
+    return STORE[host] / "dispatch"
+
+
 def operator_record_path(host: HostOS) -> Path:
     return STORE[host] / "policy" / "operator"   # CONTRACT header scope line
 
@@ -99,6 +105,9 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         # §26 S1-b: dispatch publishes each contract the operator signed here; setgid, so every file takes
         # levain-queue and the broker (a member) reads it; slots are not members.
         Row(L / "contracts", "_levain_dispatch", "levain-queue", 0o2750),
+        # dispatch's job state and its supervisor lock: its own, 0700, the one shape ``JobStore`` opens (owned by the
+        # opening uid, no group or other bit).
+        Row(dispatch_store_dir(host), "_levain_dispatch", "_levain_dispatch", 0o700),
         _root(host, L / "policy", 0o755),
         # S1 3c-6 (H6-4): CONTROL's lineage sink. Setgid, so the sink CONTROL creates takes levain-lineage: on Linux a
         # new file takes its creator's primary group (_levain_control) otherwise, and _levain_dispatch could not read it.
