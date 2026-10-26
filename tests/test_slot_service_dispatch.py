@@ -1,13 +1,16 @@
 """The dispatch service (CONTRACT §1.3): its unit's on-failure restart policy, its store row (``L/dispatch``), and its
 program ``levain/slot/services/dispatch.py``: the supervisor lock (W2-d DESIGN U5), the follower as its body, and the
-exits each unit manager reads (the lock loser's 0, a SIGTERM death, EX_CONFIG for a store of the wrong shape)."""
+exits each unit manager reads (the lock loser's EX_TEMPFAIL, a SIGTERM death, EX_SOFTWARE for a 0 with no stop signal,
+EX_CONFIG for a usage error or a store of the wrong shape)."""
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import os
 import plistlib
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -72,12 +75,22 @@ def sdir(tmp_path: Path) -> Path:
     return d
 
 
-def _main(sdir: Path, *, wait_s: float = 0.2, rc: int = 0):
+def _main(sdir: Path, *, wait_s: float = 0.2, rc: int = 0, signalled: bool = True):
+    """main() with a fake follower that, like the real one, takes SIGTERM on its own handler when ``signalled``."""
     calls: list = []
     died: list = []
+
+    def follow(argv) -> int:
+        calls.append(list(argv))
+        if signalled:
+            old = signal.signal(signal.SIGTERM, lambda s, f: None)
+            try:
+                os.kill(os.getpid(), signal.SIGTERM)
+            finally:
+                signal.signal(signal.SIGTERM, old)
+        return rc
     out = SD.main(["--store-dir", str(sdir), "--socket", "/x/control.sock", "--export-dir", "/x/export"],
-                  wait_s=wait_s, follow=lambda argv: calls.append(list(argv)) or rc,
-                  die=lambda: died.append(True) or -15)
+                  wait_s=wait_s, follow=follow, die=lambda: died.append(True) or -15)
     return out, calls, died
 
 
@@ -92,15 +105,15 @@ def test_holder_runs_the_follower_over_its_store_then_dies_by_sigterm(sdir):
     assert out == 75 and died == []
 
 
-def test_lock_loser_exits_zero_and_runs_nothing(sdir, capfd):
+def test_lock_loser_exits_tempfail_and_runs_nothing(sdir, capfd):
     fd = os.open(str(sdir / SD.LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)     # another open file description
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         out, calls, died = _main(sdir, wait_s=0.3)
     finally:
         os.close(fd)
-    assert (out, calls, died) == (0, [], [])
-    assert f"another dispatch supervisor holds {sdir / SD.LOCK_NAME}" in capfd.readouterr().err
+    assert (out, calls, died) == (SD.EX_TEMPFAIL, [], [])
+    assert f"another dispatch supervisor held {sdir / SD.LOCK_NAME}" in capfd.readouterr().err
     # released: the next start takes it
     out, calls, _ = _main(sdir)
     assert len(calls) == 1
@@ -134,6 +147,63 @@ def test_a_store_of_the_wrong_shape_is_ex_config(tmp_path, sdir):
     assert _main(tmp_path / "absent")[0] == SD.EX_CONFIG
 
 
+def test_a_holder_released_after_the_last_try_leaves_the_loser_relaunchable(sdir, capfd):
+    """S1 (L3 r1, codex): the holder releases between the contender's last failed ``flock`` and its deadline check. The
+    contender gives up with nobody holding the lock, so its exit must be one the unit manager relaunches (75), never
+    0."""
+    held = os.open(str(sdir / SD.LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    clock = iter([0.0])                                   # the deadline is computed at 0.0
+
+    def monotonic() -> float:
+        for t in clock:
+            return t
+        os.close(held)                                    # the old holder exits right after the failed try
+        return 31.0
+    assert SD.take_supervisor_lock(sdir, wait_s=30.0, monotonic=monotonic, sleep=lambda s: None) is None
+    probe = os.open(str(sdir / SD.LOCK_NAME), os.O_RDWR)
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)  # nobody holds it now
+    finally:
+        os.close(probe)
+    # and main maps a timed-out wait to EX_TEMPFAIL
+    fd = os.open(str(sdir / SD.LOCK_NAME), os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        out, calls, died = _main(sdir, wait_s=0.2)
+    finally:
+        os.close(fd)
+    assert (out, calls, died) == (SD.EX_TEMPFAIL, [], []) and SD.EX_TEMPFAIL == 75
+
+
+def test_a_follower_return_0_with_no_signal_is_not_a_signal_death(sdir, capfd):
+    """S2 (L3 r1, complement): an rc 0 the program saw no SIGTERM/SIGINT for is a distinct non-zero exit, logged; it
+    never dies by SIGTERM (which systemd would not restart)."""
+    out, calls, died = _main(sdir, rc=0, signalled=False)
+    assert len(calls) == 1 and died == []
+    assert out == SD.EX_SOFTWARE == 70
+    assert "returned 0 with no stop signal" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("signum", (signal.SIGTERM, signal.SIGINT))
+def test_a_signal_the_follower_handled_itself_still_ends_by_sigterm(sdir, signum):
+    """The real follower installs its own handlers over the program's and restores them after; the program still sees
+    a stop signal delivered while the follower's handler was in place."""
+    def follow(_argv) -> int:
+        got: list = []
+        old = signal.signal(signum, lambda s, f: got.append(s))
+        try:
+            os.kill(os.getpid(), signum)
+        finally:
+            signal.signal(signum, old)
+        assert got == [signum]
+        return 0
+    died: list = []
+    out = SD.main(["--store-dir", str(sdir), "--socket", "/x/c.sock", "--export-dir", "/x/e"], wait_s=0.2,
+                  follow=follow, die=lambda: died.append(True) or -15)
+    assert (out, died) == (-15, [True])
+
+
 def test_service_entry_runs_the_program_on_the_layout_store(capfd, monkeypatch):
     """The unit's path: ``service_boot.main(["dispatch"])`` runs the program as ``__main__`` with its own name left in
     argv; it parses (no usage error) and reaches the store check of :func:`layout.dispatch_store_dir`, which on this
@@ -155,14 +225,52 @@ def test_main_parses_the_entry_argv_with_layout_defaults(monkeypatch):
         seen["dir"], seen["wait"] = directory, wait_s
         return None
     monkeypatch.setattr(SD, "take_supervisor_lock", fake_take)
-    assert SD.main(["dispatch"]) == 0
+    assert SD.main(["dispatch"]) == SD.EX_TEMPFAIL
     host = "darwin" if sys.platform == "darwin" else "linux"
     assert seen == {"dir": layout.dispatch_store_dir(host), "wait": SD.LOCK_WAIT_S}
 
 
 def test_refuses_root(monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    assert SD.main([]) == SD.EX_USAGE
+    assert SD.main([]) == SD.EX_CONFIG
+
+
+@pytest.mark.parametrize("argv", (["--store-dir", "relative"], ["--no-such-flag"]))
+def test_a_usage_error_is_ex_config(argv, capfd):
+    """S3: a unit line the program cannot parse stays down (78, RestartPreventExitStatus), never 2."""
+    assert SD.main(argv) == SD.EX_CONFIG
+    assert "error:" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("bit", (stat.S_ISGID, stat.S_ISVTX))
+def test_a_store_dir_with_a_special_bit_is_ex_config(sdir, bit):
+    """S5: the store dir is exactly 0700; a setgid or sticky bit is a drifted dir."""
+    os.chmod(sdir, 0o700 | bit)
+    if not os.stat(sdir).st_mode & bit:
+        pytest.skip("this filesystem cleared the bit for a non-member")
+    out, calls, _ = _main(sdir)
+    assert (out, calls) == (SD.EX_CONFIG, [])
+
+
+def test_a_flock_error_other_than_contention_is_ex_config(sdir, monkeypatch):
+    """S4: ENOLCK (or any OSError but EWOULDBLOCK) from the lock path is a refusal, not a traceback the unit
+    restarts."""
+    def flock(fd, op):
+        raise OSError(errno.ENOLCK, "No locks available")
+    monkeypatch.setattr(SD.fcntl, "flock", flock)
+    out, calls, _ = _main(sdir)
+    assert (out, calls) == (SD.EX_CONFIG, [])
+
+
+def test_the_lockfile_is_0600_under_a_narrow_umask(sdir):
+    """S6: a umask that clears an owner bit still leaves the created lockfile 0600, so a fresh install starts."""
+    old = os.umask(0o277)
+    try:
+        out, calls, _ = _main(sdir)
+    finally:
+        os.umask(old)
+    assert len(calls) == 1 and out == -15
+    assert stat.S_IMODE((sdir / SD.LOCK_NAME).stat().st_mode) == 0o600
 
 
 def _env() -> dict:
@@ -171,8 +279,9 @@ def _env() -> dict:
 
 def test_the_program_as_its_own_process_holds_the_lock_and_dies_by_sigterm(sdir, tmp_path):
     """The real program and the real follower runner: CONTROL absent (the follower logs control-down and waits). A
-    second start in this process meets the first PROCESS's lock and exits 0; SIGTERM, sent only once the follower's
-    handler is known installed (its first stop line), ends the process by SIGTERM."""
+    second start in this process meets the first PROCESS's lock and exits EX_TEMPFAIL; SIGTERM, sent only once the
+    follower's handler is known installed (its first stop line), reaches the program through that handler (the wakeup
+    fd) and ends the process by SIGTERM."""
     proc = subprocess.Popen([sys.executable, "-m", "levain.slot.services.dispatch", "--store-dir", str(sdir),
                              "--socket", str(tmp_path / "no-control.sock"), "--export-dir", str(tmp_path / "export")],
                             env=_env(), cwd=str(ROOT), stderr=subprocess.PIPE, text=True)
@@ -191,7 +300,7 @@ def test_the_program_as_its_own_process_holds_the_lock_and_dies_by_sigterm(sdir,
         if not ready.wait(20.0):
             pytest.fail(f"the follower never logged its first stop: {lines!r}")
         out, calls, _ = _main(sdir, wait_s=0.3)
-        assert (out, calls) == (0, [])                     # a true duplicate: exit 0, nothing run
+        assert (out, calls) == (SD.EX_TEMPFAIL, [])        # a true duplicate: nothing run
         proc.send_signal(signal.SIGTERM)
         assert proc.wait(timeout=20.0) == -signal.SIGTERM
     finally:
