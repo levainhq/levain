@@ -11,7 +11,7 @@ CONTROL checks, never as a fact root acts on.
 1. ``kind``: kind ``verifier`` answers ``verb-unbuilt:verifier`` (§5.6, session 2f); interactive passthrough answers
    ``verb-unbuilt:identity-gate`` (the ``keep/`` return + the §7.6 gate are 2f's). A ``login`` session proceeds
    with no ``keep/`` return: its credential is the one the vendor's login writes.
-   ``vendor``: the session's vendor CLI is not a root-owned regular file at ``VENDOR_PREFIX/bin/<vendor>``
+   ``vendor``: root's copy of the session's vendor CLI (its install unit) in ``VENDOR_PREFIX`` is not whole
    (:func:`check_vendor_installed`; setup and repair copy it there) = ``vendor-not-installed:<vendor>``, before any
    clone.
 2. ``discovery``: a planted §5.5 name under ``CLAUDE_CONFIG_DIR``, ``CODEX_HOME`` or ``HOME`` is refused by name,
@@ -140,26 +140,17 @@ def check_discovery(ctx: H.Ctx, a: R.Alloc) -> None:
 # --- the launch path (wall) ----------------------------------------------------------------------------------------
 
 def check_vendor_installed(host: str, vendor: str, *, prefix: Optional[Path] = None, root_uid: int = 0) -> None:
-    """The binary :func:`vendor_argv` execs is a regular file (never a link) owned by root, writable by root alone and
-    executable: else ``vendor-not-installed:<vendor>``, so a missing copy is named before the clone instead of as
-    the wall's ``exec-failed: errno 2`` after it. ``root_uid``: tests pass their own uid."""
-    from levain.slot.root_tree import vendor_bin
+    """Root's copy of the vendor's install unit in the vendor prefix can be run
+    (:func:`levain.slot.root_tree.unit_problem`, the one predicate doctor reads too: the binary :func:`vendor_argv`
+    execs and, for Codex, every file of its package, each a regular file owned by root, never a link): else
+    ``vendor-not-installed:<vendor>``, so a missing copy is named before the clone instead of as the wall's
+    ``exec-failed: errno 2`` after it. ``root_uid``: tests pass their own uid."""
+    from levain.slot.root_tree import unit_problem
 
-    path = vendor_bin(host, vendor, prefix=prefix)
-    code, fix = f"vendor-not-installed:{vendor}", "the install helper's setup or repair copies it there"
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        raise Refused(code, f"{path} is not there; {fix}") from None
-    except OSError as e:
-        raise Refused(code, f"cannot examine {path} ({e.strerror or e})") from None
-    if stat.S_ISLNK(st.st_mode):
-        raise Refused(code, f"{path} is a link, not root's copy; {fix}")
-    if not stat.S_ISREG(st.st_mode):
-        raise Refused(code, f"{path} is not a regular file; {fix}")
-    if st.st_uid != root_uid or st.st_mode & 0o022 or not st.st_mode & stat.S_IXOTH:
-        raise Refused(code, f"{path} is not root's alone or not executable by the slot (uid {st.st_uid}, mode "
-                            f"{stat.S_IMODE(st.st_mode):o}); {fix}")
+    problem = unit_problem(host, vendor, prefix=prefix, root_uid=root_uid)   # type: ignore[arg-type]
+    if problem:
+        raise Refused(f"vendor-not-installed:{vendor}",
+                      f"{problem}; the install helper's setup or repair copies it there")
 
 
 #: The check :func:`start` runs at its ``vendor`` step (tests replace it: their store has no vendor prefix).

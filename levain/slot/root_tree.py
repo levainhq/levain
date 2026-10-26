@@ -576,6 +576,29 @@ NATIVE_MAGIC: Mapping[str, tuple] = {"darwin": (b"\xcf\xfa\xed\xfe", b"\xca\xfe\
 _CHUNK = 1 << 20
 
 
+@dataclass(frozen=True)
+class VendorUnit:
+    """A vendor whose native binary is one file of a package it reads from its own path: the package root (the
+    directory above the binary's ``bin``) is copied onto the vendor prefix, so ``bin/<name>`` stays where
+    :func:`vendor_bin` names it. ``manifest``: the file at the root that marks the package; ``required``: the files it
+    must hold (relative to the root); ``trees``: the directories beside ``bin`` copied whole. Only the manifest, the
+    files directly in ``bin`` and the ``trees`` are copied."""
+
+    manifest: str
+    required: tuple
+    trees: tuple
+
+
+#: Codex's package (``codex-package.json`` names ``entrypoint bin/codex``, ``resourcesDir codex-resources``,
+#: ``pathDir codex-path``; the binary's strings name ``bin/codex-code-mode-host`` and ``codex-path/rg`` as the
+#: package's own files). Claude Code is not here: its native binary links only system libraries, so its unit is the
+#: one file ``bin/claude``. Both measured on a Mac (codex 0.162.1, claude 2.1.310) by lane vbf1 1026+10.
+VENDOR_UNITS: Mapping[str, VendorUnit] = {
+    "codex": VendorUnit("codex-package.json",
+                        ("codex-package.json", "bin/codex", "bin/codex-code-mode-host", "codex-path/rg"),
+                        ("codex-path", "codex-resources"))}
+
+
 def vendor_bin(host: HostOS, name: str, *, prefix: Optional[Path] = None) -> Path:
     return (prefix if prefix is not None else VENDOR_PREFIX[host]) / "bin" / name
 
@@ -627,8 +650,7 @@ def find_vendor(host: HostOS, name: str, home: str, *, search: Optional[Iterable
     alike) has a native executable at the end of the link. Codex's npm package has a node launcher there
     (``<pkg>/bin/codex.js``); the native binary that launcher spawns is
     ``<pkg>/node_modules/@<scope>/<name>-<platform>/vendor/<triple>/bin/<name>`` (or ``<pkg>/vendor/<triple>/...``),
-    and it runs on its own (measured by lane vendorbin 1026+8: a copy in a scratch dir answered ``--version``).
-    None when no entry exists."""
+    the entry point of the package :data:`VENDOR_UNITS` describes. None when no entry exists."""
     import glob
 
     magic = NATIVE_MAGIC[host]
@@ -658,16 +680,128 @@ def find_vendor(host: HostOS, name: str, home: str, *, search: Optional[Iterable
     return None
 
 
+def _unit_sources(name: str, binary: str) -> tuple:
+    """``(root, files, why)``: the vendor's install unit as ``(relative path, source path)`` pairs, the entry point
+    ``bin/<name>`` LAST (it is published after every companion), and ``root`` the package root it was read from
+    (None for a one-file unit). ``files`` is empty and ``why`` says why when the package is not whole: its manifest
+    or a required file missing, a link (or anything but a directory) where a directory of it should be, or a file
+    named for another vendor's entry point (the package root maps onto the shared prefix)."""
+    entry = f"bin/{name}"
+    unit = VENDOR_UNITS.get(name)
+    if unit is None:
+        return None, [(entry, binary)], ""
+    bindir = os.path.dirname(binary)
+    root = os.path.dirname(bindir)
+    if os.path.basename(bindir) != "bin" or not os.path.lexists(os.path.join(root, unit.manifest)):
+        return root, [], f"{binary} has no {unit.manifest} beside its bin directory, so its package is not whole"
+    rels = [unit.manifest]
+    try:
+        rels += [f"bin/{n}" for n in sorted(os.listdir(bindir)) if not n.startswith(".")]
+        for tree in unit.trees:
+            top = os.path.join(root, tree)
+            if not os.path.lexists(top):
+                continue                    # a required file under it is named below
+            for d, dirs, files in os.walk(top, followlinks=False):
+                for n in [d] + [os.path.join(d, x) for x in dirs]:
+                    if not stat.S_ISDIR(os.lstat(n).st_mode):
+                        return root, [], f"{n} in {name}'s package is a link or not a directory"
+                rels += [os.path.relpath(os.path.join(d, x), root) for x in sorted(files)]
+                dirs.sort()
+    except OSError as e:
+        return root, [], f"cannot list {name}'s package at {root} ({e.strerror or e})"
+    clash = sorted({f"bin/{v}" for v in VENDORS if v != name} & set(rels))
+    if clash:
+        return root, [], f"{name}'s package at {root} holds {', '.join(clash)}, another vendor's entry point"
+    missing = [r for r in unit.required if r not in rels]
+    if missing:
+        return root, [], f"{name}'s package at {root} is missing {', '.join(missing)}"
+    rels = [r for r in rels if r != entry] + [entry]
+    return root, [(r, os.path.join(root, r)) for r in rels], ""
+
+
+def _file_mode(st: os.stat_result) -> int:
+    """The mode of root's copy of a source file: 0755 for one its owner may run, else 0644."""
+    return 0o755 if st.st_mode & stat.S_IXUSR else 0o644
+
+
 def _source_problem(st: os.stat_result, operator_uid: int) -> str:
-    """Why a vendor source is not copied, or "". Root copies only a file root or the operator owns, that no other
-    account can write, and that every user can already read and run, so the 0755 copy shows nothing it hid."""
+    """Why a vendor source file is not copied, or "". Root copies only a file root or the operator owns, that no
+    other account can write, and that every user can already read (and run, when it is to be 0755), so the copy shows
+    nothing it hid."""
     if st.st_uid not in (0, operator_uid):
         return f"is owned by uid {st.st_uid}, neither root nor the operator"
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         return "is writable by its group or by every user"
-    want = stat.S_IROTH | stat.S_IXOTH
+    want = stat.S_IROTH | (stat.S_IXOTH if _file_mode(st) == 0o755 else 0)
     if st.st_mode & want != want:
-        return "is not readable and runnable by every user"
+        return "is not readable and runnable by every user" if want & stat.S_IXOTH else "is not readable by every user"
+    return ""
+
+
+def _copy_problem(path: Path, modes: tuple, root_uid: int = 0) -> str:
+    """Why ``path`` is not good as root's copy of a vendor file, or "": THE predicate (head ruling V4) that start's
+    check, doctor's state and the copy's own "already matches" read. Good = a regular file (never a link), owned by
+    ``root_uid``, its mode one of ``modes``."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return f"{path} is not there"
+    except OSError as e:
+        return f"cannot examine {path} ({e.strerror or e})"
+    if stat.S_ISLNK(st.st_mode):
+        return f"{path} is a link, not root's copy"
+    if not stat.S_ISREG(st.st_mode):
+        return f"{path} is not a regular file"
+    if st.st_uid != root_uid:
+        return f"{path} is owned by uid {st.st_uid}, not root"
+    if stat.S_IMODE(st.st_mode) not in modes:
+        return f"{path} has mode {stat.S_IMODE(st.st_mode):o}, not {' or '.join(f'{m:o}' for m in modes)}"
+    return ""
+
+
+def _dir_problem(path: Path, root_uid: int = 0) -> str:
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        return f"cannot examine {path} ({e.strerror or e})"
+    if not stat.S_ISDIR(st.st_mode):
+        return f"{path} is a link or not a directory"
+    if st.st_uid != root_uid or stat.S_IMODE(st.st_mode) != 0o755:
+        return f"{path} is not root's 0755 directory (uid {st.st_uid}, mode {stat.S_IMODE(st.st_mode):o})"
+    return ""
+
+
+def unit_problem(host: HostOS, name: str, *, prefix: Optional[Path] = None, root_uid: int = 0) -> str:
+    """Why root's copy of the vendor ``name`` in the prefix cannot be run, or "". Read from the prefix alone (root's
+    tree; start never reads the operator's): the entry point is root's 0755 regular file; for a :data:`VENDOR_UNITS`
+    package, every required file is there too and every file under its ``trees`` and in its ``bin`` passes
+    :func:`_copy_problem` (0755 or 0644), in directories that are root's 0755."""
+    base = prefix if prefix is not None else VENDOR_PREFIX[host]
+    entry = vendor_bin(host, name, prefix=prefix)
+    unit = VENDOR_UNITS.get(name)
+    if unit is None:
+        return _copy_problem(entry, (0o755,), root_uid)
+    for rel in unit.required:
+        p = _copy_problem(base / rel, (0o755,) if rel == f"bin/{name}" else (0o755, 0o644), root_uid)
+        if p:
+            return p
+    for tree in (*unit.trees, "bin"):
+        top = base / tree
+        for d, dirs, files in os.walk(top, followlinks=False):
+            p = _dir_problem(Path(d), root_uid)
+            if p:
+                return p
+            for x in dirs:
+                if os.path.islink(os.path.join(d, x)):
+                    return f"{os.path.join(d, x)} is a link, not root's directory"
+            for x in files:
+                if x.startswith(".") and x.endswith(".partial"):
+                    continue                # a running copy's file before its rename
+                p = _copy_problem(Path(d) / x, (0o755, 0o644), root_uid)
+                if p:
+                    return p
+            if tree == "bin":
+                break
     return ""
 
 
@@ -696,19 +830,103 @@ def _paths_equal(a: str, b: str) -> bool:
         os.close(fa)
 
 
+class _Changed(Exception):
+    """A source file changed while it was copied (head ruling V2: ``vendor-changed-during-copy``)."""
+
+
+def _copy_one(src: int, st: os.stat_result, path: str, dest: Path, mode: int, *,
+              fchown: Callable[[int, int, int], None], fsync: Callable[[int], None]) -> int:
+    """Copy exactly ``st.st_size`` bytes of ``src`` (the fd that was fstat'd as ``st``) to ``dest`` through
+    ``.<name>.partial`` beside it, root's at ``mode``, and rename it over ``dest``. Never reads past the captured
+    size except one byte to see whether the file grew. :class:`_Changed` when the source's size, mtime or inode is
+    not what was captured after the read; the partial is unlinked on any failure, the rename's included."""
+    from levain.slot import write_all
+
+    partial = dest.parent / f".{dest.name}.partial"
+    try:
+        os.unlink(partial)
+    except FileNotFoundError:
+        pass
+    out = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o700)
+    try:
+        try:
+            off = 0
+            while off < st.st_size:
+                chunk = os.pread(src, min(_CHUNK, st.st_size - off), off)
+                if not chunk:
+                    raise _Changed(f"{path} shrank while it was copied ({st.st_size} -> {off} bytes)")
+                write_all(out, chunk)
+                off += len(chunk)
+            if os.pread(src, 1, st.st_size):
+                raise _Changed(f"{path} grew while it was copied (past {st.st_size} bytes)")
+            now = os.fstat(src)
+            if (now.st_size, now.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+                raise _Changed(f"{path} was modified while it was copied")
+            try:
+                there = os.lstat(path)
+            except OSError:
+                there = None
+            if there is None or (there.st_dev, there.st_ino) != (st.st_dev, st.st_ino):
+                raise _Changed(f"{path} was replaced while it was copied")
+            fchown(out, 0, 0)
+            os.fchmod(out, mode)
+            fsync(out)
+        finally:
+            os.close(out)
+        os.rename(partial, dest)
+    except BaseException:
+        try:
+            os.unlink(partial)
+        except OSError:
+            pass
+        raise
+    return off
+
+
+def _ensure_dirs(base: Path, rels: Iterable[str], *, chown: Callable[[str, int, int], None],
+                 root_uid: int) -> list:
+    """Every directory the unit's files sit in, below ``base``: made 0755 and root's when missing, set so when they are
+    not; OSError when one is a link or not a directory. Returns them, parents first."""
+    made: list = []
+    for rel in rels:
+        parts = Path(rel).parent.parts
+        for i in range(1, len(parts) + 1):
+            d = base.joinpath(*parts[:i])
+            if d in made:
+                continue
+            try:
+                os.mkdir(d, 0o755)
+            except FileExistsError:
+                pass
+            st = os.lstat(d)
+            if not stat.S_ISDIR(st.st_mode):
+                raise OSError(f"{d} is a link or not a directory")
+            if st.st_uid != root_uid:
+                chown(str(d), 0, 0)
+            if stat.S_IMODE(st.st_mode) != 0o755:
+                os.chmod(d, 0o755)
+            made.append(d)
+    return made
+
+
 def copy_vendor(host: HostOS, name: str, *, home: str, operator_uid: int, prefix: Optional[Path] = None,
                 search: Optional[Iterable[str]] = None, machine: Optional[str] = None,
                 fchown: Callable[[int, int, int], None] = os.fchown, fsync: Callable[[int], None] = os.fsync,
-                root_uid: int = 0) -> tuple:
-    """Copy the vendor CLI ``name`` (:func:`find_vendor`) to ``VENDOR_PREFIX/bin/<name>`` as a regular file, root's,
-    0755: written beside it as ``.<name>.partial``, flushed, then renamed over it (a running session keeps the inode
-    it exec'd). Never a link: the vendor's own tree is the operator's to write (r3c10-vm: ``/opt/homebrew/lib`` is
-    ``admin``-writable), and the slot must run what root copied. A copy already equal to the source, root's and 0755,
-    is left alone. A vendor not found, a launcher with no native binary, or a source :func:`_source_problem` refuses
-    is a SKIP with a line, never a failed step (the copy already there, if any, is kept). ``root_uid``: the owner a
-    copy left alone must have (tests pass their own uid, since their ``fchown`` only records)."""
-    from levain.slot import write_all
+                chown: Callable[[str, int, int], None] = os.chown, root_uid: int = 0) -> tuple:
+    """Copy the vendor CLI ``name`` (:func:`find_vendor`) into the vendor prefix as its whole install unit
+    (:func:`_unit_sources`: Claude Code's one binary; Codex's package): each file a regular file, root's, 0755 or
+    0644 (:func:`_file_mode`), written beside its place as ``.<file>.partial``, flushed, then renamed over it (a
+    running session keeps the inode it exec'd), the entry point ``bin/<name>`` last. Never a link: the vendor's own
+    tree is the operator's to write (r3c10-vm: ``/opt/homebrew/lib`` is ``admin``-writable), and the slot must run
+    what root copied. A file already good (:func:`_copy_problem`) and equal to its source is left alone.
 
+    A vendor not found, a package not whole, or a source file :func:`_source_problem` refuses is a SKIP with a line
+    (``(True, ...)``), and the copy already there, if any, is kept. A failed copy is ``(False, ...)``:
+    ``vendor-changed-during-copy`` when a source changed under the read (repair copies it again on its next run).
+    The directories are fsync'd once every file is renamed into place; one that fails is a warning on a successful
+    line. ``root_uid``: the owner a copy
+    left alone must have (tests pass their own uid, since their ``fchown``/``chown`` only record)."""
+    base = prefix if prefix is not None else VENDOR_PREFIX[host]
     dest = vendor_bin(host, name, prefix=prefix)
     have = os.path.lexists(dest)
     tail = (f"; the copy at {dest} is kept" if have
@@ -719,101 +937,122 @@ def copy_vendor(host: HostOS, name: str, *, home: str, operator_uid: int, prefix
         return True, f"{name}: not found in {where}; skipped{tail}"
     if found.binary is None:
         return True, f"{name}: {found.why}; skipped{tail}"
+    root, files, why = _unit_sources(name, found.binary)
+    if why:
+        return True, f"{name}: {why}; not copied{tail}"
+    srcs: list = []
     try:
-        src = _open_regular(found.binary)
-    except OSError as e:
-        return True, f"{name}: cannot open {found.binary} ({e.strerror or e}); not copied{tail}"
-    try:
-        st = os.fstat(src)
-        problem = _source_problem(st, operator_uid)
-        if problem:
-            return True, f"{name}: {found.binary} {problem}; not copied{tail}"
-        if os.pread(src, 4, 0)[:4] not in NATIVE_MAGIC[host]:    # re-read from the fd that is copied
-            return True, f"{name}: {found.binary} is not a native {host} executable; not copied{tail}"
-        if have and not os.path.islink(dest):
+        for rel, path in files:
             try:
-                dfd = _open_regular(str(dest))
-            except OSError:
-                dfd = None
-            if dfd is not None:
+                fd = _open_regular(path)
+            except OSError as e:
+                return True, f"{name}: cannot open {path} ({e.strerror or e}); not copied{tail}"
+            srcs.append((rel, path, fd))
+            st = os.fstat(fd)
+            problem = _source_problem(st, operator_uid)
+            if problem:
+                return True, f"{name}: {path} {problem}; not copied{tail}"
+            if rel == f"bin/{name}" and (_file_mode(st) != 0o755
+                                         or os.pread(fd, 4, 0)[:4] not in NATIVE_MAGIC[host]):
+                return True, f"{name}: {path} is not a native {host} executable; not copied{tail}"
+        todo = []
+        for rel, path, fd in srcs:
+            st = os.fstat(fd)
+            target, mode = base / rel, _file_mode(st)
+            if not _copy_problem(target, (mode,), root_uid):
                 try:
-                    dst = os.fstat(dfd)
-                    if (dst.st_uid == root_uid and stat.S_IMODE(dst.st_mode) == 0o755
-                            and _fds_equal(src, dfd)):
-                        return True, f"{name}: {dest} already matches {found.binary}"
+                    dfd = _open_regular(str(target))
+                except OSError:
+                    dfd = None
+                if dfd is not None:
+                    try:
+                        if _fds_equal(fd, dfd):
+                            continue
+                    finally:
+                        os.close(dfd)
+            todo.append((rel, path, fd, st, target, mode))
+        source = root if root is not None else found.binary
+        if not todo:
+            return True, f"{name}: {base if root is not None else dest} already matches {source}"
+        try:
+            dirs = _ensure_dirs(base, [t[0] for t in todo], chown=chown, root_uid=root_uid)
+            total = 0
+            for rel, path, fd, st, target, mode in todo:
+                total += _copy_one(fd, st, path, target, mode, fchown=fchown, fsync=fsync)
+        except _Changed as e:
+            return False, f"{name}: vendor-changed-during-copy: {e}; not copied (repair copies it on its next run)"
+        except OSError as e:
+            return False, f"{name}: copying {source} to {base} failed ({e.strerror or e})"
+        warnings = []
+        for d in dirs:
+            try:
+                dfd = os.open(d, os.O_RDONLY)
+                try:
+                    fsync(dfd)
                 finally:
                     os.close(dfd)
-        partial = dest.parent / f".{name}.partial"
-        try:
-            os.unlink(partial)
-        except FileNotFoundError:
-            pass
-        out = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-                      0o700)
-        try:
-            off = 0
-            while True:
-                chunk = os.pread(src, _CHUNK, off)
-                if not chunk:
-                    break
-                write_all(out, chunk)
-                off += len(chunk)
-            if off != st.st_size:
-                raise OSError(f"{found.binary} changed size while it was copied ({st.st_size} -> {off})")
-            fchown(out, 0, 0)
-            os.fchmod(out, 0o755)
-            fsync(out)
-        except BaseException:
-            os.close(out)
-            try:
-                os.unlink(partial)
-            except OSError:
-                pass
-            raise
-        os.close(out)
-        os.rename(partial, dest)
-        dfd = os.open(dest.parent, os.O_RDONLY)
-        try:
-            fsync(dfd)
-        finally:
-            os.close(dfd)
-        return True, f"{name}: copied {found.binary} to {dest} ({off} bytes, root's, 0755)"
-    except OSError as e:
-        return False, f"{name}: copying {found.binary} to {dest} failed ({e.strerror or e})"
+            except OSError as e:
+                warnings.append(f"warning: could not fsync {d} ({e.strerror or e})")
+        if root is None:
+            line = f"{name}: copied {found.binary} to {dest} ({total} bytes, root's, 0755)"
+        else:
+            line = (f"{name}: copied {len(todo)} of {len(files)} files of its package {root} to {base} ({total} "
+                    f"bytes, root's), {dest} last")
+        return True, "; ".join([line, *warnings])
     finally:
-        os.close(src)
+        for _, _, fd in srcs:
+            os.close(fd)
 
 
 def vendor_state(host: HostOS, name: str, home: str, *, prefix: Optional[Path] = None,
-                 search: Optional[Iterable[str]] = None, machine: Optional[str] = None) -> tuple:
-    """``(state, detail)`` for doctor: ``current`` (the copy's bytes equal the vendor it would be copied from),
-    ``stale`` (they differ: the vendor was updated since the last repair), ``not-copied`` (a vendor, no copy),
-    ``orphan`` (a copy, no vendor to compare it with), ``absent`` (neither), ``unreadable``."""
+                 search: Optional[Iterable[str]] = None, machine: Optional[str] = None, root_uid: int = 0) -> tuple:
+    """``(state, detail)`` for doctor: ``current`` (root's copy passes :func:`unit_problem` and every file equals the
+    vendor's it would be copied from), ``stale`` (a file differs or is missing: the vendor was updated since the last
+    repair), ``bad-copy`` (:func:`unit_problem`: start refuses it whatever its bytes), ``not-copied`` (a vendor, no
+    copy), ``orphan`` (a copy, no whole vendor to compare it with), ``absent`` (neither), ``unreadable``."""
+    base = prefix if prefix is not None else VENDOR_PREFIX[host]
     dest = vendor_bin(host, name, prefix=prefix)
     found = find_vendor(host, name, home, search=search, machine=machine)
     has = os.path.lexists(dest)
-    if found is None or found.binary is None:
-        why = f" ({found.why})" if found is not None else ""
+    why = ""
+    files: list = []
+    if found is not None and found.binary is not None:
+        _, files, why = _unit_sources(name, found.binary)
+    elif found is not None:
+        why = found.why
+    if not files:
         if has:
-            return "orphan", f"{dest} is there, but no {name} was found to compare it with{why}"
-        return "absent", f"no {name} on this machine{why}"
+            return "orphan", f"{dest} is there, but no whole {name} was found to compare it with" + (
+                f" ({why})" if why else "")
+        return "absent", f"no {name} on this machine" + (f" ({why})" if why else "")
     if not has:
-        return "not-copied", f"{found.binary} is not copied to {dest}"
+        return "not-copied", f"{found.binary} is not copied to {dest}"     # type: ignore[union-attr]
+    problem = unit_problem(host, name, prefix=prefix, root_uid=root_uid)
+    if problem:
+        return "bad-copy", problem
     try:
-        same = _paths_equal(found.binary, str(dest))
+        for rel, path in files:
+            if not os.path.lexists(base / rel):
+                return "stale", f"{base / rel} is missing (the vendor has {path})"
+            if not _paths_equal(path, str(base / rel)):
+                return "stale", f"{base / rel} differs from {path}"
     except OSError as e:
-        return "unreadable", f"cannot compare {dest} with {found.binary} ({e.strerror or e})"
-    if same:
-        return "current", f"{dest} matches {found.binary}"
-    return "stale", f"{dest} differs from {found.binary}"
+        return "unreadable", f"cannot compare root's copy in {base} with {found.binary} ({e.strerror or e})"  # type: ignore[union-attr]
+    return "current", f"{dest} matches {found.binary}" + (f" with its package ({len(files)} files)"  # type: ignore[union-attr]
+                                                          if len(files) > 1 else "")
 
 
-def vendor_steps(host: HostOS, operator: str, *, lookup: Optional[Callable[[str], object]] = None) -> list:
+def vendor_steps(host: HostOS, operator: str, *, lookup: Optional[Callable[[str], object]] = None,
+                 failed: Optional[list] = None, copy: Optional[Callable[..., tuple]] = None) -> list:
     """The vendor prefix's ``bin`` (root's, 0755, no link above it) and one copy step per :data:`VENDORS` entry
-    (:func:`copy_vendor`), searched from ``operator``'s home, read when the step runs."""
+    (:func:`copy_vendor`), searched from ``operator``'s home, read when the step runs. A copy step is ``allow_fail``
+    (head ruling V6): a failed copy never stops the plan; its line is appended to ``failed`` and
+    :func:`vendor_report_step`, planned later, fails the run with it."""
     import pwd
 
     look = lookup if lookup is not None else pwd.getpwnam
+    run_copy = copy if copy is not None else copy_vendor
+    sink = failed if failed is not None else []
     t = _tools(host)
     b = VENDOR_PREFIX[host] / "bin"
     steps = [
@@ -824,16 +1063,30 @@ def vendor_steps(host: HostOS, operator: str, *, lookup: Optional[Callable[[str]
         Step(f"set {b} to 0755", (t["chmod"], "0755", str(b))),
     ]
 
-    def copy(name: str) -> Callable[[], tuple]:
+    def step(name: str) -> Callable[[], tuple]:
         def run() -> tuple:
-            pw = look(operator)
-            return copy_vendor(host, name, home=pw.pw_dir, operator_uid=pw.pw_uid)   # type: ignore[attr-defined]
+            try:
+                pw = look(operator)
+            except KeyError:
+                ok, why = False, f"{name}: the operator {operator} has no account, so there is no home to search"
+            else:
+                ok, why = run_copy(host, name, home=pw.pw_dir, operator_uid=pw.pw_uid)   # type: ignore[attr-defined]
+            if not ok:
+                sink.append(why)
+            return ok, why
         return run
 
     for name in VENDORS:
-        steps.append(Step(f"place root's copy (0755) of the {name} CLI at {vendor_bin(host, name)} (a vendor not "
-                          "on this machine is skipped)", call=copy(name)))
+        steps.append(Step(f"place root's copy of the {name} CLI (its whole install unit) in {VENDOR_PREFIX[host]} "
+                          "(a vendor not on this machine is skipped)", call=step(name), allow_fail=True))
     return steps
+
+
+def vendor_report_step(failed: list) -> Step:
+    """The step that fails the run when a :func:`vendor_steps` copy failed earlier in it, planned after the steps a
+    vendor copy must not block: repair plans it after R11's sudoers rules and R12's units, setup after its units."""
+    return Step("report the vendor CLI copies that failed earlier in this run (none: nothing to report)",
+                call=lambda: (not failed, "; ".join(failed)))
 
 
 def check_sources(source: Path, h11_dir: Path) -> None:
@@ -919,8 +1172,9 @@ def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None, gener
 
 __all__ = ["CURRENT", "ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "STAGING", "Staged",
            "generation_boot_code", "stage_hashing_steps",
-           "NATIVE_MAGIC", "VENDORS", "VENDOR_SEARCH", "VENDOR_TRIPLES", "VendorFound", "copy_vendor", "find_vendor",
-           "vendor_bin", "vendor_state", "vendor_steps",
+           "NATIVE_MAGIC", "VENDORS", "VENDOR_SEARCH", "VENDOR_TRIPLES", "VENDOR_UNITS", "VendorFound", "VendorUnit",
+           "copy_vendor", "find_vendor", "unit_problem", "vendor_bin", "vendor_report_step", "vendor_state",
+           "vendor_steps",
            "VENDOR_PREFIX", "boot_path_code", "check_source_writers", "check_sources", "current_path", "dir_steps",
            "entry_steps", "entry_text", "flip_step", "gc_step", "h11_floor", "h11_source", "helper_entry_text",
            "read_current", "stage_steps", "tree_steps"]

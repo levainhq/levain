@@ -35,13 +35,18 @@ class Env:
         (self.prefix / "bin").mkdir(parents=True)
         self.search = ("~/.local/bin", str(self.brew))
         self.chowned: list[tuple[int, int]] = []
+        self.dirs_chowned: list[str] = []
 
     def fchown(self, fd: int, uid: int, gid: int) -> None:
         self.chowned.append((uid, gid))
 
+    def chown(self, path: str, uid: int, gid: int) -> None:
+        self.dirs_chowned.append(path)
+
     def copy(self, name: str, **kw):
         return RT.copy_vendor("darwin", name, home=str(self.home), operator_uid=os.getuid(), prefix=self.prefix,
-                              search=self.search, machine="arm64", fchown=self.fchown, root_uid=os.getuid(), **kw)
+                              search=self.search, machine="arm64", fchown=self.fchown, chown=self.chown,
+                              root_uid=os.getuid(), **kw)
 
 
 @pytest.fixture
@@ -159,18 +164,18 @@ def test_linux_wants_elf(tmp_path):
     e = Env(tmp_path)
     _exe(e.brew / "claude", MACHO)
     ok, why = RT.copy_vendor("linux", "claude", home=str(e.home), operator_uid=os.getuid(), prefix=e.prefix,
-                             search=e.search, machine="x86_64", fchown=e.fchown)
+                             search=e.search, machine="x86_64", fchown=e.fchown, chown=e.chown)
     assert ok and "skipped" in why
     _exe(e.brew / "claude", ELF)
     ok, why = RT.copy_vendor("linux", "claude", home=str(e.home), operator_uid=os.getuid(), prefix=e.prefix,
-                             search=e.search, machine="x86_64", fchown=e.fchown)
+                             search=e.search, machine="x86_64", fchown=e.fchown, chown=e.chown)
     assert ok and "copied" in why
 
 
 # --- the drift read (doctor's row reads it) ---------------------------------------------------------------------------
 
 def test_vendor_state(env):
-    kw = dict(prefix=env.prefix, search=env.search, machine="arm64")
+    kw = dict(prefix=env.prefix, search=env.search, machine="arm64", root_uid=os.getuid())
     assert RT.vendor_state("darwin", "claude", str(env.home), **kw)[0] == "absent"
     _exe(env.brew / "claude", MACHO + b"v1")
     assert RT.vendor_state("darwin", "claude", str(env.home), **kw)[0] == "not-copied"
@@ -188,8 +193,8 @@ def test_vendor_steps_name_each_copy_and_the_bin_dir():
     steps = RT.vendor_steps("darwin", "op")
     whys = [s.why for s in steps]
     assert any(str(RT.VENDOR_PREFIX["darwin"] / "bin") in w for w in whys)
-    assert any(w.startswith("place root's copy (0755) of the claude CLI") for w in whys)
-    assert any(w.startswith("place root's copy (0755) of the codex CLI") for w in whys)
+    assert any(w.startswith("place root's copy of the claude CLI") for w in whys)
+    assert any(w.startswith("place root's copy of the codex CLI") for w in whys)
 
 
 # --- start's refusal -----------------------------------------------------------------------------------------------
@@ -253,6 +258,251 @@ def test_doctor_row_reads_the_real_state(env):
     env.copy("claude")
     _exe(env.brew / "claude", MACHO + b"v2")
     state = lambda n: RT.vendor_state("darwin", n, str(env.home), prefix=env.prefix, search=env.search,
-                                      machine="arm64")
+                                      machine="arm64", root_uid=os.getuid())
     [r] = D._check_vendor_copies(host="darwin", store=env.tmp, home=str(env.home), state=state)
     assert r.warn and "claude STALE" in r.detail and "codex not on this machine" in r.detail
+
+
+# --- f1 (1026-10 RULINGS "vendorbin L3 r1 triage -> vbf1") -------------------------------------------------------------
+
+def _codex_pkg(env, *, version: bytes = b"v1", skip=(), extra=None):
+    """A Codex npm install the way 0.162.1 lays it out on a Mac (lane vbf1 measured it): the launcher, and the
+    platform package's ``vendor/<triple>/`` root holding ``codex-package.json``, ``bin/codex``,
+    ``bin/codex-code-mode-host``, ``codex-path/rg`` and ``codex-resources/``."""
+    pkg = env.tmp / "brew" / "lib" / "node_modules" / "@openai" / "codex"
+    launcher = _exe(pkg / "bin" / "codex.js", b"#!/usr/bin/env node\n")
+    root = pkg / "node_modules" / "@openai" / "codex-darwin-arm64" / "vendor" / "aarch64-apple-darwin"
+    files = {"codex-package.json": (b'{"layoutVersion": 1}', 0o644), "bin/codex": (MACHO + version, 0o755),
+             "bin/codex-code-mode-host": (MACHO + b"host" + version, 0o755), "codex-path/rg": (MACHO + b"rg", 0o755),
+             "codex-resources/voice/manifest.json": (b"{}", 0o644),
+             "codex-resources/voice/lib/libffi.8.dylib": (MACHO + b"ffi", 0o755),
+             "codex-resources/zsh/bin/zsh": (MACHO + b"zsh", 0o755), **(extra or {})}
+    for rel, (data, mode) in files.items():
+        if rel not in skip:
+            _exe(root / rel, data, mode)
+    env.brew.mkdir(parents=True, exist_ok=True)
+    if not os.path.lexists(env.brew / "codex"):
+        os.symlink(launcher, env.brew / "codex")
+    return root, {r: v for r, v in files.items() if r not in skip}
+
+
+def _codex_copy(env, **kw):
+    return env.copy("codex", **kw)
+
+
+def test_v1_a_codex_copy_without_its_companions_is_refused_by_start(tmp_path):
+    """RED at e8efdaf6: ``bin/codex`` alone passed start's check, and codex's code-mode host was never there."""
+    from levain.slot import start as SS
+
+    _exe(tmp_path / "bin" / "codex", MACHO)
+    with pytest.raises(Refused) as e:
+        SS.check_vendor_installed("darwin", "codex", prefix=tmp_path, root_uid=os.getuid())
+    assert e.value.name == "vendor-not-installed:codex" and "codex-package.json" in str(e.value.detail)
+
+
+def test_v1_the_codex_package_is_copied_as_a_unit(env):
+    root, files = _codex_pkg(env)
+    ok, why = _codex_copy(env)
+    assert ok and "copied" in why, why
+    for rel, (data, mode) in files.items():
+        st = os.lstat(env.prefix / rel)
+        assert stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == mode, rel
+        assert (env.prefix / rel).read_bytes() == data, rel
+    assert not any(p.name.endswith(".partial") for p in env.prefix.rglob("*"))
+    from levain.slot import start as SS
+    SS.check_vendor_installed("darwin", "codex", prefix=env.prefix, root_uid=os.getuid())
+    assert RT.vendor_state("darwin", "codex", str(env.home), prefix=env.prefix, search=env.search,
+                           machine="arm64", root_uid=os.getuid())[0] == "current"
+    ok, why = _codex_copy(env)
+    assert ok and "already" in why, why
+
+
+def test_v1_a_companion_update_makes_the_unit_stale_and_repair_recopies_it(env):
+    _codex_pkg(env)
+    _codex_copy(env)
+    _codex_pkg(env, extra={"codex-path/rg": (MACHO + b"rg2", 0o755)})
+    kw = dict(prefix=env.prefix, search=env.search, machine="arm64", root_uid=os.getuid())
+    assert RT.vendor_state("darwin", "codex", str(env.home), **kw)[0] == "stale"
+    ok, why = _codex_copy(env)
+    assert ok and "copied" in why and (env.prefix / "codex-path" / "rg").read_bytes() == MACHO + b"rg2"
+
+
+@pytest.mark.parametrize("skip", ["codex-package.json", "bin/codex-code-mode-host", "codex-path/rg"])
+def test_v1_a_codex_package_missing_a_required_file_is_not_copied(env, skip):
+    _codex_pkg(env, skip=(skip,))
+    ok, why = _codex_copy(env)
+    assert ok and ("skipped" in why or "not copied" in why) and skip.split("/")[-1] in why, why
+    assert not (env.prefix / "bin" / "codex").exists()
+
+
+def test_v1_a_link_inside_the_codex_package_is_not_copied(env):
+    root, _ = _codex_pkg(env)
+    os.symlink("/etc/hosts", root / "codex-resources" / "voice" / "hosts")
+    ok, why = _codex_copy(env)
+    assert ok and "not copied" in why and "hosts" in why, why
+    assert not (env.prefix / "bin" / "codex").exists()
+
+
+def test_v1_the_entry_point_is_published_last(env):
+    """A copy that fails part-way never leaves a new ``bin/codex`` beside companions that are not all there."""
+    _codex_pkg(env)
+    calls = []
+
+    def fsync(fd):
+        calls.append(fd)
+        if len(calls) == 3:
+            raise OSError(5, "Input/output error")
+    ok, why = _codex_copy(env, fsync=fsync)
+    assert not ok and "failed" in why
+    assert not (env.prefix / "bin" / "codex").exists()
+    assert not any(p.name.endswith(".partial") for p in env.prefix.rglob("*"))
+
+
+def test_v1_start_refuses_a_codex_unit_with_a_bad_companion(env):
+    from levain.slot import start as SS
+
+    _codex_pkg(env)
+    _codex_copy(env)
+    os.chmod(env.prefix / "codex-path" / "rg", 0o775)
+    with pytest.raises(Refused) as e:
+        SS.check_vendor_installed("darwin", "codex", prefix=env.prefix, root_uid=os.getuid())
+    assert "codex-path/rg" in str(e.value.detail)
+
+
+def _mutating_pread(monkeypatch, action):
+    """``os.pread`` that runs ``action`` once, right after the first full-size chunk read of the copy loop."""
+    real, done = os.pread, []
+
+    def pread(fd, n, off):
+        data = real(fd, n, off)
+        if n > 4 and not done and data:
+            done.append(1)
+            action()
+        return data
+    monkeypatch.setattr(RT.os, "pread", pread)
+
+
+def test_v2_a_same_size_change_during_the_copy_is_refused(env, monkeypatch):
+    """RED at e8efdaf6: an in-place same-size rewrite mid-copy published a hybrid of old and new bytes."""
+    src = _exe(env.brew / "claude", MACHO + b"v1")
+
+    def rewrite():
+        with open(src, "r+b") as f:
+            f.seek(len(MACHO))
+            f.write(b"v2")
+        os.utime(src, ns=(os.stat(src).st_atime_ns, os.stat(src).st_mtime_ns + 10**9))
+    _mutating_pread(monkeypatch, rewrite)
+    ok, why = env.copy("claude")
+    assert not ok and "vendor-changed-during-copy" in why, why
+    assert not (env.prefix / "bin" / "claude").exists()
+    assert not (env.prefix / "bin" / ".claude.partial").exists()
+
+
+def test_v2_a_source_that_grows_is_read_only_to_its_captured_size(env, monkeypatch):
+    src = _exe(env.brew / "claude", MACHO + b"v1")
+    size = os.path.getsize(src)
+    seen = []
+
+    def append():
+        with open(src, "ab") as f:
+            f.write(b"x" * (3 << 20))
+    _mutating_pread(monkeypatch, append)
+    inner = RT.os.pread
+
+    def spy(fd, n, off):
+        seen.append(off + n)
+        return inner(fd, n, off)
+    monkeypatch.setattr(RT.os, "pread", spy)
+    ok, why = env.copy("claude")
+    assert not ok and "vendor-changed-during-copy" in why, why
+    assert max(seen) <= size + 1        # the one byte past the captured size is the growth probe
+
+
+def test_v4_a_byte_identical_copy_with_bad_perms_is_a_distinct_doctor_state(env):
+    """RED at e8efdaf6: doctor said ``current`` for a copy start refuses."""
+    from levain import doctor as D
+
+    _exe(env.brew / "claude", MACHO + b"v1")
+    env.copy("claude")
+    os.chmod(env.prefix / "bin" / "claude", 0o775)
+    kw = dict(prefix=env.prefix, search=env.search, machine="arm64", root_uid=os.getuid())
+    st, detail = RT.vendor_state("darwin", "claude", str(env.home), **kw)
+    assert st == "bad-copy" and "775" in detail
+    [r] = D._check_vendor_copies(host="darwin", store=env.tmp, home=str(env.home),
+                                 state=lambda n: RT.vendor_state("darwin", n, str(env.home), **kw))
+    assert r.warn and "repair" in r.hint and "claude" in r.hint and "BAD COPY" in r.detail
+
+
+def test_v5_doctor_searches_from_the_operators_home_under_sudo(tmp_path, monkeypatch):
+    """RED at e8efdaf6: ``sudo levain doctor`` searched from root's home."""
+    import pwd
+
+    from levain import doctor as D
+
+    me = pwd.getpwuid(os.getuid())
+    monkeypatch.setenv("HOME", str(tmp_path / "var-root"))
+    monkeypatch.setenv("SUDO_UID", str(me.pw_uid))
+    monkeypatch.setattr(D.os, "getuid", lambda: 0)
+    homes = []
+    monkeypatch.setattr(RT, "vendor_state", lambda host, name, home, **kw: (homes.append(home), ("absent", ""))[1])
+    D._check_vendor_copies(host="darwin", store=tmp_path)
+    assert homes and set(homes) == {me.pw_dir}
+
+
+def test_v6_a_failed_vendor_copy_does_not_block_later_steps_and_still_fails_the_run():
+    from levain.firing.hands import Plan, run_plan
+
+    failed: list = []
+    from types import SimpleNamespace
+
+    steps = RT.vendor_steps("darwin", "op", failed=failed, lookup=lambda o: SimpleNamespace(pw_dir="/h", pw_uid=1),
+                            copy=lambda host, name, **kw: (False, f"{name}: copying failed (EIO)"))
+    copies = [s for s in steps if s.why.startswith("place root's copy")]
+    assert copies and all(s.allow_fail for s in copies)
+    ran = []
+    later = RT.Step("the sudoers rule", call=lambda: (ran.append(1), (True, ""))[1])
+    plan = Plan("darwin", "op", "h", 1, Path("/x"), Path("/y"),
+                steps=(*copies, later, RT.vendor_report_step(failed)))
+    out: list = []
+    assert run_plan(plan, dry_run=False, emit=out.append) == 1
+    assert ran == [1]
+    assert any("FAILED" in o and "claude" in o and "codex" in o for o in out), out
+
+
+def test_v6_repair_reports_vendor_failures_after_the_sudoers_and_units(tmp_path):
+    from tests.test_repair_plan import _pre_change, _plan
+
+    facts, rf = _pre_change(tmp_path)
+    whys = [s.why for s in _plan(facts, rf).steps]
+    report = [i for i, w in enumerate(whys) if w.startswith("report the vendor CLI copies")]
+    sudoers = [i for i, w in enumerate(whys) if "sudoers" in w]
+    copies = [i for i, w in enumerate(whys) if w.startswith("place root's copy")]
+    assert len(report) == 1 and copies and sudoers
+    assert max(copies) < min(sudoers) and report[0] > max(sudoers)
+
+
+def test_v7_a_failed_rename_unlinks_its_partial(env):
+    _exe(env.brew / "claude", MACHO + b"v1")
+    (env.prefix / "bin" / "claude").mkdir()
+    (env.prefix / "bin" / "claude" / "x").write_bytes(b"x")     # a non-empty dir: the rename over it fails
+    ok, why = env.copy("claude")
+    assert not ok and "failed" in why
+    assert not (env.prefix / "bin" / ".claude.partial").exists()
+
+
+def test_v7_a_dir_fsync_failure_after_the_rename_is_a_warning(env):
+    _exe(env.brew / "claude", MACHO + b"v1")
+    calls = []
+
+    def fsync(fd):
+        calls.append(fd)
+        if len(calls) > 1:
+            raise OSError(5, "Input/output error")
+    ok, why = env.copy("claude", fsync=fsync)
+    assert ok and "copied" in why and "warning" in why, why
+    assert (env.prefix / "bin" / "claude").read_bytes() == MACHO + b"v1"
+
+
+def test_low3_an_unreadable_copy_gets_the_repair_hint(tmp_path):
+    [r] = _doctor(tmp_path, {"claude": ("unreadable", "cannot compare"), "codex": ("current", "")})
+    assert r.warn and "repair" in r.hint and "claude" in r.hint and "leaves it" not in r.hint

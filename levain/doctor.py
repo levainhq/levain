@@ -507,13 +507,27 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
     return rows
 
 
+def _operator_home(*, env: Any = None, getuid: Any = None, getpwuid: Any = None) -> str:
+    """The home the vendor search starts from, resolved the way the install helper's repair resolves its operator:
+    under sudo, the account ``SUDO_UID`` names (never root's ``~``); else the account running doctor."""
+    import pwd
+
+    env = os.environ if env is None else env
+    uid = (getuid or os.getuid)()
+    sudo = env.get("SUDO_UID", "")
+    if uid == 0 and sudo.isdigit():
+        uid = int(sudo)
+    return (getpwuid or pwd.getpwuid)(uid).pw_dir
+
+
 def _check_vendor_copies(*, host: str | None = None, store: Path | None = None, home: str | None = None,
                          state: Any = None) -> list[CheckResult]:
-    """The ``agent vendor CLIs`` row: each vendor CLI a session runs is root's copy at ``VENDOR_PREFIX/bin/<name>``
-    (setup and repair make it, head ruling 1026+8), and the copy is compared byte for byte with the vendor it is copied
-    from (:func:`levain.slot.root_tree.vendor_state`, the same search repair runs, from the operator's home). A copy
-    that differs is a vendor updated since the last repair: sessions keep running the old one until repair re-copies
-    it. No row when there is no isolation install."""
+    """The ``agent vendor CLIs`` row: each vendor CLI a session runs is root's copy of its install unit in
+    ``VENDOR_PREFIX`` (setup and repair make it, head ruling 1026+8), checked with the predicate start's check reads
+    and compared byte for byte with the vendor it is copied from (:func:`levain.slot.root_tree.vendor_state`, the same
+    search repair runs, from the operator's home, :func:`_operator_home`). A copy that differs is a vendor updated
+    since the last repair: sessions keep running the old one until repair re-copies it. No row when there is no
+    isolation install."""
     from levain.slot import layout
     from levain.slot import root_tree as RT
 
@@ -522,9 +536,14 @@ def _check_vendor_copies(*, host: str | None = None, store: Path | None = None, 
     store = store if store is not None else layout.STORE.get(host)
     if store is None or not os.path.lexists(store):
         return []
-    home = home if home is not None else os.path.expanduser("~")
+    if home is None and state is None:
+        try:
+            home = _operator_home()
+        except (KeyError, OSError) as exc:
+            return [CheckResult("agent vendor CLIs", True, f"the operator's home could not be read ({exc})",
+                                warn=True)]
     read = state if state is not None else (lambda name: RT.vendor_state(host, name, home))
-    parts, stale, missing, problem = [], [], [], []
+    parts, fix, orphan = [], [], []
     for name in RT.VENDORS:
         try:
             st, detail = read(name)
@@ -535,20 +554,26 @@ def _check_vendor_copies(*, host: str | None = None, store: Path | None = None, 
         elif st == "absent":
             parts.append(f"{name} not on this machine")
         elif st == "stale":
-            stale.append(name)
+            fix.append(name)
             parts.append(f"{name} STALE: {detail}")
         elif st == "not-copied":
-            missing.append(name)
+            fix.append(name)
             parts.append(f"{name} NOT COPIED: {detail}; its sessions are refused vendor-not-installed:{name}")
-        else:   # orphan, unreadable
-            problem.append(name)
+        elif st == "bad-copy":
+            fix.append(name)
+            parts.append(f"{name} BAD COPY: {detail}; its sessions are refused vendor-not-installed:{name}")
+        elif st == "unreadable":
+            fix.append(name)
+            parts.append(f"{name} UNREADABLE: {detail}")
+        else:   # orphan
+            orphan.append(name)
             parts.append(f"{name}: {detail}")
     repair = f"sudo {layout.install_helper_path(host)} repair"
-    if stale or missing:
+    if fix:
         return [CheckResult("agent vendor CLIs", True, "; ".join(parts), warn=True,
-                            hint=f"Run `{repair}`: it copies {', '.join(stale + missing)} into "
-                                 f"{RT.VENDOR_PREFIX[host]}/bin, where sessions run it.")]
-    if problem:
+                            hint=f"Run `{repair}`: it copies {', '.join(fix)} into {RT.VENDOR_PREFIX[host]} again, "
+                                 "where sessions run it.")]
+    if orphan:
         return [CheckResult("agent vendor CLIs", True, "; ".join(parts), warn=True,
                             hint="A copy with no vendor to compare it with keeps running as it is; repair leaves it.")]
     return [CheckResult("agent vendor CLIs", True, "; ".join(parts))]

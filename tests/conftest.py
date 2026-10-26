@@ -19,8 +19,11 @@ from tests.autonomic_test_only_coverage import test_only_every_effect_covered  #
 def _vendor_installed(monkeypatch):
     """Every test that reaches ``start``'s ``vendor`` step runs against a store with no vendor prefix, so the step
     passes here; tests/test_slot_vendorbin.py tests the real check (and re-patches ``vendor_ready`` where it runs
-    ``start`` against it)."""
-    import levain.slot.start as _start
+    ``start`` against it). A test that blocks the module's import (``sys.modules`` entry None) never reaches it."""
+    try:
+        import levain.slot.start as _start
+    except ImportError:
+        return
     monkeypatch.setattr(_start, "vendor_ready", lambda host, vendor: None)
 
 
