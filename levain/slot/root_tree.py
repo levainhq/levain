@@ -702,7 +702,7 @@ def copy_vendor(host: HostOS, name: str, *, home: str, operator_uid: int, prefix
                 root_uid: int = 0) -> tuple:
     """Copy the vendor CLI ``name`` (:func:`find_vendor`) to ``VENDOR_PREFIX/bin/<name>`` as a regular file, root's,
     0755: written beside it as ``.<name>.partial``, flushed, then renamed over it (a running session keeps the inode
-    it exec'd). Never a link: the vendor's own tree is the operator's to write (``/opt/homebrew/lib`` is
+    it exec'd). Never a link: the vendor's own tree is the operator's to write (r3c10-vm: ``/opt/homebrew/lib`` is
     ``admin``-writable), and the slot must run what root copied. A copy already equal to the source, root's and 0755,
     is left alone. A vendor not found, a launcher with no native binary, or a source :func:`_source_problem` refuses
     is a SKIP with a line, never a failed step (the copy already there, if any, is kept). ``root_uid``: the owner a
