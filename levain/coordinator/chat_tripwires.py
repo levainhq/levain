@@ -9,9 +9,11 @@ launch off: nothing here ever reads as live (§4.4, "What O8 limits" 4).
 
 The window holds the counts §4.4 compares and the per-call joins (a call's tool name and input from its ``tool_call``;
 whether this child raised a host request for it; whether that request was cancelled). Counts reset at a boundary only
-when no call is open (the counting window rule, R9 / Q-R5-4); the joins live for the session and each is dropped at its
-call's ``tool_result``. A session the service did not watch from its start has no counts and no joins, so its next
-``tool_result`` trips (fail closed).
+when no call is open (the counting window rule, R9 / Q-R5-4); each join is dropped at its call's ``tool_result``. A
+state the window cannot account for latches, never passes: a session the service did not watch from its start has no
+counts and no joins, so its next ``tool_result`` trips; a turn boundary (a ``result`` line, a turn start) with a call
+still open trips and drops every join and count; a read that reports a gap drops the counts, and trips (dropping the
+joins too) when a call was open before or after that read. A line that reports a permission mode is read per event.
 
 The tripwires read the Event's fields (``hook``, ``cancel_of``, ``decision_source``, ``control_subtype``), never which
 :data:`~levain.coordinator.chat.EVENT_KINDS` value a driver put a hook or cancel line on. Stdlib only.
@@ -25,8 +27,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 __all__ = [
-    "CONTROL_REPLIES", "MODE_ALLOWED_SHAPE", "TRIPWIRES", "UNPARSEABLE", "ControlReply", "Trip", "TripwireContext",
-    "TripwireWindow", "launch_roots", "mode_trip", "read_exempt", "read_target_within",
+    "CONTROL_REPLIES", "MODE", "MODE_ALLOWED_SHAPE", "TRIPWIRES", "UNPARSEABLE", "ControlReply", "Trip",
+    "TripwireContext", "TripwireWindow", "launch_roots", "mode_trip", "read_exempt", "read_target_within",
+    "reported_mode_trip",
 ]
 
 TRIPWIRES = ("deficit", "unexpected_rule", "unexpected_hook", "mode_changed", "accepted_without_host",
@@ -40,10 +43,13 @@ CONTROL_REPLIES: dict[str, tuple[str, bool]] = {
     "elicitation": ("levain answers no elicitation in chat", False),
     "set_permission_mode": ("levain fixes this launch's mode", True),
 }
-# the vendor-id prefix of an inbound control_request's event (ScriptedSession's ``error:control:<request_id>``), and of
-# the event a driver gives a line it could not parse (a CH-D2 driver contract line: ``error:unparseable:<its id>``)
+# the vendor-id prefix of an inbound control_request's event (ScriptedSession's ``error:control:<request_id>``), of the
+# event a driver gives a line it could not parse (a CH-D2 driver contract line: ``error:unparseable:<its id>``), and of
+# the event a driver gives each line that reports a permissionMode (a CH-D2 driver contract line:
+# ``error:mode:<its id>``, the body the reported mode verbatim)
 CONTROL = "control:"
 UNPARSEABLE = "unparseable:"
+MODE = "mode:"
 _APPROVAL = "can_use_tool"
 
 
@@ -73,13 +79,16 @@ class ControlReply(NamedTuple):
     text: str
 
 
-# ---- §4.4 exemption 2, verbatim from rev 15 (D:5851-5869) ---------------------------------------------------------
+# ---- §4.4 exemption 2, from rev 15 (D:5851-5869); verbatim but for read_exempt resolving the roots (L3 r1 T8) -------
 MODE_ALLOWED_SHAPE = {"decision": "accept", "source": "config", "reason_type": "mode"}   # rbpp2 a11_inside, 2.1.310
 
 def read_exempt(tool_name: str, tool_input: Any, decision: Mapping[str, Any], ctx: TripwireContext) -> bool:
+    # the target is compared resolved, so the roots are too (a cwd under macOS /tmp or /var is a symlink path); a
+    # relative or unusable root is no root
+    roots = tuple(os.path.realpath(r) for r in launch_roots(ctx) if isinstance(r, str) and os.path.isabs(r))
     return (tool_name == "Read"                                   # exact
             and {k: decision.get(k) for k in MODE_ALLOWED_SHAPE} == MODE_ALLOWED_SHAPE
-            and read_target_within(tool_input, launch_roots(ctx)))
+            and read_target_within(tool_input, roots))
 
 def launch_roots(ctx) -> tuple[str, ...]: return (ctx.cwd,)       # --restricted's working directory; no --add-dir
 def read_target_within(tool_input: Any, roots: tuple[str, ...]) -> bool:
@@ -100,6 +109,17 @@ def mode_trip(permission_mode: Any) -> Trip | None:
     if permission_mode is None or permission_mode == "default":
         return None
     return Trip("mode_changed", f"the session reports permission mode {str(permission_mode)[:60]!r}, not 'default'")
+
+
+def reported_mode_trip(e: Any) -> Trip | None:
+    """``mode_changed`` from one event: a line that reports a permissionMode (``error:mode:<id>``, its body the mode)
+    other than ``default``, read per event so a mode that changes and changes back inside one read still trips. A
+    report whose mode cannot be read trips too."""
+    if e.kind != "error" or not e.vendor_id.startswith(MODE):
+        return None
+    if not isinstance(e.body, str) or not e.body:
+        return Trip("mode_changed", "a line reported a permission mode that cannot be read")
+    return mode_trip(e.body)
 
 
 class _Call(NamedTuple):
@@ -128,12 +148,38 @@ class TripwireWindow:
         w.host, w.pending, w.cancelled = set(self.host), dict(self.pending), set(self.cancelled)
         return w
 
-    def boundary(self) -> None:
-        """The counts reset only when no call is open (every ``tool_call`` seen has its ``tool_result``): a boundary
-        never splits a PreToolUse ``hook_response`` from its call's ``tool_result``."""
+    def boundary(self, turn: bool = False) -> Trip | None:
+        """The counts reset only when no call is open (every ``tool_call`` seen has its ``tool_result``): a send's
+        boundary never splits a PreToolUse ``hook_response`` from its call's ``tool_result``. A ``turn`` boundary (a
+        ``result`` line, a turn start) has no call open in a whole stream; one that does trips ``deficit``, and the
+        orphans' joins and every count are dropped, so an orphan never pins the counts."""
+        if turn and self.calls:
+            orphans = len(self.calls)
+            self._forget()
+            return Trip("deficit", f"a turn boundary with {orphans} tool call(s) that never got a tool_result")
         if not self.calls:
             self.hooks.clear()
             self.results.clear()
+        return None
+
+    def gap(self, was_open: bool) -> Trip | None:
+        """A read that reports a gap (lines the session could not read). The counts are dropped (a hook counted before
+        the gap never covers a call after it); a call open before or after the read (``was_open``, or one open now)
+        may have lost its hooks or its result, so that trips ``deficit`` and drops every join too."""
+        if was_open or self.calls:
+            self._forget()
+            return Trip("deficit", "the read reported a gap with a tool call open: its hooks or result may be lost")
+        self.hooks.clear()
+        self.results.clear()
+        return None
+
+    def _forget(self) -> None:
+        self.hooks.clear()
+        self.results.clear()
+        self.calls.clear()
+        self.host.clear()
+        self.pending.clear()
+        self.cancelled.clear()
 
     def observe(self, e: Any) -> tuple[Trip | None, ControlReply | None]:
         """The trip (if any) and the control reply (if any) one event gives."""
@@ -148,6 +194,9 @@ class TripwireWindow:
                 self.cancelled.add(call)
             return None, None
         vid = e.vendor_id
+        mode = reported_mode_trip(e)
+        if mode is not None or e.kind == "error" and vid.startswith(MODE):
+            return mode, None
         if e.kind == "error" and vid.startswith(UNPARSEABLE):
             return Trip("unanswerable_control", "the session read a line it could not parse", True, e.turn_id), None
         if e.kind == "error" and vid.startswith(CONTROL):
@@ -170,8 +219,10 @@ class TripwireWindow:
         if not request_id:
             return Trip("unanswerable_control", "a control_request with no usable request_id", True, turn_id), None
         if subtype == _APPROVAL:
-            # never answered outside the one door (reject_control refuses it); a driver that put one here is broken
-            return Trip("unexpected_control", "a can_use_tool request arrived as a non-approval control request"), None
+            # never answered outside the one door (reject_control refuses it), so the CLI would wait on it: latch, and
+            # the turn's interrupt aborts its pending requests (§8.1, O6)
+            return Trip("unexpected_control", "a can_use_tool request arrived as a non-approval control request", True,
+                        turn_id), None
         if isinstance(subtype, str) and subtype in CONTROL_REPLIES:
             text, latches = CONTROL_REPLIES[subtype]
         else:
@@ -204,6 +255,8 @@ class TripwireWindow:
         decision, source, reason = d.get("decision"), d.get("source"), d.get("reason_type")
         if cancelled and source == "hook":
             return Trip("unexpected_hook", f"a hook decided the {tool[:60]} call after its host request was cancelled")
+        if cancelled:
+            host = False                                  # a withdrawn request is no host answer: no exemption
         if decision == "reject":
             return None                                   # a deny is never refused
         if decision != "accept":

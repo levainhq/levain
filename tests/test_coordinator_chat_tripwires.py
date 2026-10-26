@@ -20,8 +20,8 @@ from levain.coordinator.chat import ChatService, Verdict, liveness
 from levain.coordinator.chat_tripwires import TripwireContext, TripwireWindow
 from levain.coordinator.driver import CommandResult, ScriptedSession, SessionMeta, event
 
-from tests.test_coordinator_chat_liveness import (Probe, _world, activate, cs, kinds, ready, rows,  # noqa: F401
-                                                  send, store)
+from tests.test_coordinator_chat_liveness import Probe, _world, cs, kinds, ready, send, store  # noqa: F401
+from tests.test_coordinator_chat_liveness_r1 import _crossing
 
 HOOK_KIND = "agent_text"
 CANCEL_KIND = "approval_resolved"
@@ -645,3 +645,267 @@ def test_observe_reads_fields_not_kinds():
     for kind in ("agent_text", "error", "approval_resolved"):
         w.observe(event(kind, f"h-{kind}", "1", hook={"event": "hook_response", "name": "PreToolUse:Bash"}))
     assert w.hooks == {"PreToolUse:Bash": 3}
+
+
+# --- L3 r1 (T1-T11): every state the window cannot account for latches ---------------------------------------------
+def test_t1_a_crash_after_the_commit_still_leaves_the_control_answered(cs, claude, root, monkeypatch):
+    svc, s, ctx = up(cs, claude, root)
+    s.inbound("ctl-1", "elicitation", turn_id="t-1")
+
+    def crash(launch_id):
+        raise KeyboardInterrupt("the process died after the batch committed")
+
+    monkeypatch.setattr(svc, "_file_latches", crash)
+    with pytest.raises(KeyboardInterrupt):
+        svc.read_next(claude["launch"])
+    svc2 = ChatService(cs, probe=Probe(), sleep=lambda _s: None, tripwires=ctx.context)
+    svc2.attach(claude["launch"], s)                  # the restarted service, the same CLI still waiting
+    svc2.read_next(claude["launch"])
+    assert _replies(s) == [("ctl-1", "levain answers no elicitation in chat")]
+
+
+def test_t1_a_crash_between_the_reply_and_the_commit_re_finds_it_and_latches(cs, claude, root):
+    crashed = []
+
+    def fault(point):
+        if point == "controls_answered" and not crashed:
+            crashed.append(point)
+            raise KeyboardInterrupt("the process died after the reply, before the commit")
+
+    svc, s, ctx = up(cs, claude, root, fault=fault)
+    s.inbound("ctl-1", "elicitation", turn_id="t-1")
+    with pytest.raises(KeyboardInterrupt):
+        svc.read_next(claude["launch"])
+    assert crashed and _replies(s) == [("ctl-1", "levain answers no elicitation in chat")]
+    svc2 = ChatService(cs, probe=Probe(), sleep=lambda _s: None, tripwires=ctx.context)
+    svc2.attach(claude["launch"], s)
+    svc2.read_next(claude["launch"])                  # the cursor never moved: the control is read again
+    assert _replies(s) == [("ctl-1", "levain answers no elicitation in chat")]    # the driver refused a second
+    assert trips(cs, claude["launch"]) == ["tripwire:unanswerable_control"] and latched(cs, claude["launch"])
+
+
+def test_t1_a_failed_transaction_does_not_answer_twice_in_one_process(cs, claude, root, monkeypatch):
+    from levain.coordinator import chat as chat_mod
+    svc, s, _ = up(cs, claude, root)
+    s.inbound("ctl-1", "elicitation", turn_id="t-1")
+    real, seen = chat_mod._fingerprint, []
+
+    def moved(conn, launch_id):                       # another writer moved the record once: the batch is refused
+        got = real(conn, launch_id)
+        seen.append(got)
+        return (-1, -1, -1) if len(seen) == 2 else got
+
+    monkeypatch.setattr(chat_mod, "_fingerprint", moved)
+    with pytest.raises(chat_mod.CoordError):
+        svc.read_next(claude["launch"])
+    svc.read_next(claude["launch"])
+    assert _replies(s) == [("ctl-1", "levain answers no elicitation in chat")]
+    assert trips(cs, claude["launch"]) == []
+
+
+class Gappy(Session):
+    """Reports its next read as a gap (lines the session could not read)."""
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.gap_next = False
+
+    def read(self, cursor):
+        got = super().read(cursor)
+        if self.gap_next:
+            self.gap_next = False
+            got = got._replace(gap=True)
+        return got
+
+
+def test_t2_a_gap_with_a_call_open_latches(cs, claude, root):
+    svc, s, _ = up(cs, claude, root, session=Gappy())
+    call(s, "toolu_A")
+    hooks(s)                                          # A's two hooks; its result is lost in the gap below
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == []
+    s.gap_next = True
+    call(s, "toolu_B")
+    host(s, "req-B", "toolu_B")
+    result(s, "toolu_B", HOST_ALLOW)                  # B ran no hook: A's would have covered it
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == ["tripwire:deficit"] and latched(cs, claude["launch"])
+
+
+def test_t2_a_gap_resets_the_counts(cs, claude, root):
+    svc, s, _ = up(cs, claude, root, session=Gappy())
+    hooks(s)                                          # surplus hooks with no call open
+    svc.read_next(claude["launch"])
+    s.gap_next = True
+    s.show("agent_text", None, body="x")
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == []
+    call(s, "toolu_1")
+    host(s, "req-1", "toolu_1")
+    result(s, "toolu_1", HOST_ALLOW)                  # no hook of its own: the pre-gap surplus does not count
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == ["tripwire:deficit"]
+
+
+def test_t3_a_transient_mode_inside_one_batch_trips(cs, claude, root):
+    svc, s, _ = up(cs, claude, root)                  # meta reads default before and after the batch
+    s.show("error", "mode:1", body="bypassPermissions")
+    s.show("error", "mode:2", body="default")
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == ["tripwire:mode_changed"] and latched(cs, claude["launch"])
+
+
+def test_t3_a_mode_report_of_default_does_not_trip(cs, claude, root):
+    svc, s, _ = up(cs, claude, root)
+    s.show("error", "mode:1", body="default")
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == []
+
+
+def test_t4_no_injected_callback_runs_inside_the_write_transaction(cs, claude, root):
+    import sqlite3
+
+    def outside() -> None:
+        conn = cs._connect()
+        try:
+            conn.execute("PRAGMA busy_timeout = 0")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                raise AssertionError(f"called inside a write transaction: {exc}") from None
+            conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+
+    class Checked(Ctx):
+        def expected(self, tool):
+            outside()
+            return super().expected(tool)
+
+        def gate(self, tool_use_id, tool_input):
+            outside()
+            return super().gate(tool_use_id, tool_input)
+
+    ctx = Checked(str(root), allowed=("toolu_1",))
+    svc, s, _ = up(cs, claude, root, ctx=ctx)
+    call(s, "toolu_1")
+    hooks(s)
+    result(s, "toolu_1", HOOK_ALLOW)
+    svc.read_next(claude["launch"])
+    assert ctx.asked and trips(cs, claude["launch"]) == []
+
+
+def test_t5_a_cancelled_host_request_does_not_exempt_a_later_accept(cs, claude, root):
+    svc, s, _ = up(cs, claude, root)
+    call(s, "toolu_1")
+    hooks(s)
+    host(s, "req-1", "toolu_1")
+    s.show(CANCEL_KIND, "cancel-1", cancel_of="req-1")
+    result(s, "toolu_1", SANDBOX_ALLOW)               # accepted after the host's request was withdrawn
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == ["tripwire:accepted_without_host"]
+
+
+def test_t5_a_cancelled_host_request_then_a_reject_does_not_trip(cs, claude, root):
+    svc, s, _ = up(cs, claude, root)
+    call(s, "toolu_1")
+    hooks(s)
+    host(s, "req-1", "toolu_1")
+    s.show(CANCEL_KIND, "cancel-1", cancel_of="req-1")
+    result(s, "toolu_1", HOST_DENY)
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == []
+
+
+def test_t6_a_result_line_with_a_call_open_latches_and_frees_the_counts(cs, claude, root):
+    svc, s, _ = up(cs, claude, root)
+    call(s, "toolu_orphan")
+    hooks(s)
+    s.show("turn_ended", "t-1", turn_id="t-1")        # a result line with toolu_orphan still open
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == ["tripwire:deficit"]
+    assert svc._windows[claude["launch"]].calls == {} and svc._windows[claude["launch"]].hooks == {}
+
+
+def test_t6_a_send_with_a_call_open_still_carries_the_counts(cs, claude, root):
+    svc, s, _ = up(cs, claude, root)
+    call(s, "toolu_1")
+    hooks(s)
+    svc.read_next(claude["launch"])
+    send(svc, cs, claude)
+    host(s, "req-1", "toolu_1")
+    result(s, "toolu_1", HOST_ALLOW)
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == []
+
+
+def test_t8_a_launch_cwd_reached_through_a_symlink_keeps_the_read_exemption(cs, claude, root, tmp_path):
+    link = tmp_path / "via-link"
+    link.symlink_to(root)
+    svc, s, _ = up(cs, claude, root, ctx=Ctx(str(link)))
+    call(s, "toolu_1", tool="Read", tool_input={"file_path": str(root / "inside.txt")})
+    hooks(s, tool="Read")
+    result(s, "toolu_1", MODE_READ, tool="Read")
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == []
+
+
+def test_t9_can_use_tool_on_the_error_channel_latches_and_interrupts(cs, claude, root):
+    svc, s, _ = up(cs, claude, root)
+    s.show("error", "control:ctl-x", turn_id="t-1", control_subtype="can_use_tool")
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == ["tripwire:unexpected_control"]
+    assert [c.turn_id for c in s.interrupts] == ["t-1"] and _replies(s) == []
+
+
+def test_t10_a_mode_trip_is_kept_when_the_batch_crosses_a_boundary(cs, claude, root):
+    from levain.coordinator.chat import CoordError
+    session = Session()
+    svc, s, _ = up(cs, claude, root, session=session)
+    session.mode = "bypassPermissions"
+    with pytest.raises(CoordError, match="crossed a boundary"):
+        svc.ingest(claude["launch"], _crossing(100))
+    assert trips(cs, claude["launch"]) == ["tripwire:mode_changed"]
+
+
+def test_t10_a_mode_report_inside_a_crossing_batch_is_kept(cs, claude, root):
+    from levain.coordinator.chat import CoordError
+    svc, s, _ = up(cs, claude, root)
+    b = _crossing(100)
+    mode = event("error", "mode:9", "00000100", body="bypassPermissions")
+    with pytest.raises(CoordError, match="crossed a boundary"):
+        svc.ingest(claude["launch"], b._replace(events=(mode,) + b.events))
+    assert trips(cs, claude["launch"]) == ["tripwire:mode_changed"]
+
+
+def test_t11_the_filed_record_is_per_launch_and_dropped_at_detach(cs, store, claude, root):
+    svc, s, _ = up(cs, claude, root, seat_item=Filer(store))
+    call(s, "toolu_1")
+    result(s, "toolu_1", SANDBOX_ALLOW)
+    svc.read_next(claude["launch"])
+    assert len(_items(cs)) == 1 and svc._filed.get(claude["launch"])
+    svc.detach(claude["launch"])
+    assert claude["launch"] not in svc._filed
+
+
+def test_t1_a_failed_reply_in_a_refused_transaction_still_latches_on_the_re_read(cs, claude, root, monkeypatch):
+    from levain.coordinator import chat as chat_mod
+
+    class Broken(Session):
+        def reject_control(self, request_id, text):
+            raise OSError("broken pipe")
+
+    svc, s, _ = up(cs, claude, root, session=Broken())
+    s.inbound("ctl-1", "elicitation", turn_id="t-1")
+    real, seen = chat_mod._fingerprint, []
+
+    def moved(conn, launch_id):
+        got = real(conn, launch_id)
+        seen.append(got)
+        return (-1, -1, -1) if len(seen) == 2 else got
+
+    monkeypatch.setattr(chat_mod, "_fingerprint", moved)
+    with pytest.raises(chat_mod.CoordError):
+        svc.read_next(claude["launch"])
+    svc.read_next(claude["launch"])                   # the reply fails again, and this time the latch commits
+    assert trips(cs, claude["launch"]) == ["tripwire:unanswerable_control"]
