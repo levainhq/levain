@@ -547,13 +547,13 @@ def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResu
 def _front_log_rows(store: Path, host: str, layout: Any, R: Any, seams: Any = None) -> list[CheckResult]:
     """The ``agent front logs`` row: for each in-service egress slot, what a session start would refuse about its
     front log dirs (``L/gw/``, ``L/gw/slot<n>/``, S1 3b-8a), asked of the runtime itself
-    (``runtime_helper.check_front_log_dirs``: render's own front-account lookup and ``prepare_front_log``'s own open
-    walk, read-only), never re-derived here. Every slot's refusal is gathered into the one row. A ``store-missing``
-    there is a dir that is genuinely absent (the walk raises it only on ``FileNotFoundError``): an install made before
-    the dir existed, upgrade-pending with the repair line. Any other refusal (``bad-root``: a link, a non-directory, a
-    wrong owner or mode; ``account-missing``) fails the row and is not upgrade-pending. What the walk cannot read is a
-    warning. No egress slot: no row. ``seams``: the runtime's, for tests (its ``store`` is set to ``store``); the
-    default reads the real accounts."""
+    (``runtime_helper.check_front_log_dirs``: render's own front-account lookup and ``prepare_front_log``'s own walk
+    up to its final open, read-only), never re-derived here. Every slot's refusal is gathered into the one row. A
+    ``store-missing`` there is a dir that is genuinely absent (the walk raises it only on ``FileNotFoundError``): an
+    install made before the dir existed, upgrade-pending with the repair line. Any other refusal (``bad-root``: a
+    link, a non-directory, a wrong owner or mode; ``account-missing``) fails the row and is not upgrade-pending. What
+    the walk cannot read is a warning. No egress slot: no row. ``seams``: the runtime's, for tests (its ``store`` is
+    set to ``store``); the default reads the real accounts."""
     import dataclasses
 
     from levain.slot import Refused
@@ -573,7 +573,7 @@ def _front_log_rows(store: Path, host: str, layout: Any, R: Any, seams: Any = No
         if exc.name == "bad-root":
             return [CheckResult(name, False, f"{store} is not root's alone; the runtime refuses it (bad-root), so no "
                                 "session can be started", f"Look at its owner and mode; `{layout.repair_line(host)}` "
-                                "re-applies setup's rows.")]
+                                "sets them back to setup's.")]
         # Store maps every open error of the root to store-missing; the caller saw the root there, so it is unreadable
         return [CheckResult(name, True, f"could not be read ({_slot_why(exc)})", warn=True)]
     absent: dict[str, list[str]] = {}       # refusal text -> tags, in the order first met
@@ -600,7 +600,9 @@ def _front_log_rows(store: Path, host: str, layout: Any, R: Any, seams: Any = No
         return [CheckResult(name, False, f"every session on the slot(s) named is refused: {detail}",
                             f"Run `{layout.repair_line(host)}` once (an install made before the front log moved to the "
                             "store has none)." if not failed else
-                            f"Look at what is named; `{layout.repair_line(host)}` re-applies setup's rows.",
+                            f"Look at what is named. `{layout.repair_line(host)}` sets each dir's owner and mode back "
+                            "to setup's; it does not replace a link or a file standing where a dir belongs, and it "
+                            "never makes a missing account (undo, then setup, does).",
                             upgrade_pending=not failed)]
     if unread:
         return [CheckResult(name, True, f"could not be read: {', '.join(unread)}", warn=True)]

@@ -627,7 +627,8 @@ def _open_front_log_dir(store: "Store", slot: SlotId, front_uid: Optional[int], 
     """The checking half of :func:`prepare_front_log`: ``L/gw/`` opened through ``store.dir(..., trusted=True)`` (a
     link, a non-directory, a wrong owner or a group/other-writable mode is ``bad-root``), then ``L/gw/slot<n>/``
     stat'd below it by :func:`_statat_dir` and held to :func:`_front_dir_ok`. The stat needs search on ``L/gw/`` only,
-    never read on ``L/gw/slot<n>/`` (setup's row, ``layout.slot_store_rows``, gives the operator no access to it).
+    never read on ``L/gw/slot<n>/`` (setup's row, ``layout.slot_store_rows``, is the front account's with group root
+    and no other access, so the operator running ``levain doctor`` cannot read it).
     Only a miss of one of those two (each raises ``store-missing`` on ``FileNotFoundError`` and on nothing else) is
     rewritten as the pre-move install, naming the dir that is missing and :func:`layout.repair_line`; a
     ``store-missing`` from elsewhere keeps its own text.
