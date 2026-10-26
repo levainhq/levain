@@ -540,7 +540,7 @@ SELECT r.run_id, r.seal FROM runs r
 # ---- rev 7.4 (rev74_schema.py): R13-6 decisions, R13-5 legacy mark, INVARIANT, R13-1 reaper, R13-9 floor ----
 V74_TABLES = (
     "CREATE TABLE IF NOT EXISTS hold_decisions (hold_id TEXT NOT NULL, run_id TEXT NOT NULL, pending_id TEXT, "
-    "by TEXT, n INTEGER NOT NULL, PRIMARY KEY (hold_id, n))",
+    "by TEXT, n INTEGER NOT NULL CHECK (n >= 1), PRIMARY KEY (hold_id, n))",
 )
 LEGACY_TABLES = ("runs", "cancels", "effects", "holds")
 V74_COLUMNS = tuple((t, "legacy", "INTEGER NOT NULL DEFAULT 0 CHECK (legacy IN (0, 1))") for t in LEGACY_TABLES)
@@ -567,8 +567,10 @@ DECISION_TRIGGERS = (
     "INSERT INTO hold_decisions (hold_id, run_id, pending_id, by, n) VALUES (NEW.hold_id, NEW.run_id, NEW.pending_id, "
     "NEW.decided_by, NEW.decisions); END",
     # A1-R2: n is the hold's decision generation, which only a deciding statement steps (holds_move); the primary key
-    # refuses a second row for it
-    _abort("hold_decisions_born", "NOT EXISTS (SELECT 1 FROM holds h WHERE h.hold_id = NEW.hold_id "
+    # refuses a second row for it. A1-R2b: the upgrade gives a decided legacy hold the column's default 0, so a legacy
+    # hold takes no row and n starts at 1 (the table's CHECK too)
+    _abort("hold_decisions_born", "NEW.n < 1 OR NOT EXISTS (SELECT 1 FROM holds h "
+           "WHERE h.hold_id = NEW.hold_id AND h.legacy = 0 "
            "AND h.run_id IS NEW.run_id AND h.pending_id IS NEW.pending_id AND h.decided IS NOT NULL "
            "AND h.decided_by IS NEW.by AND h.decisions IS NEW.n)",
            "R13-6: a decision row is the current decision of a decided hold", "BEFORE INSERT ON hold_decisions"),
@@ -843,6 +845,21 @@ def fingerprint(conn: sqlite3.Connection) -> str:
 
 
 _EXPECTED: dict[str, str] = {}
+_V2_COLUMNS: dict[str, frozenset[str]] = {}
+
+
+def v2_columns(table: str) -> frozenset[str]:
+    """The columns V's own ``/2`` opener gives ``table`` (:func:`_v2_schema`, built in memory); empty for a table it
+    does not make."""
+    if not _V2_COLUMNS:
+        m = sqlite3.connect(":memory:", isolation_level=None)
+        try:
+            _v2_schema(m)
+            for (name,) in m.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall():
+                _V2_COLUMNS[name] = frozenset(r[1] for r in m.execute(f"PRAGMA table_info({name})"))
+        finally:
+            m.close()
+    return _V2_COLUMNS.get(table, frozenset())
 
 
 def expected_fingerprint() -> str:

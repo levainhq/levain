@@ -77,7 +77,7 @@ from levain.autonomic.db import DB_NAME, STORE_FORMAT_V2, AutonomicDB, StoreForm
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.journal import RunJournal, durable_replace
 from levain.autonomic.schema3 import (STORE_FORMAT_V3, StoreNewerThanLevain, StoreSchemaMismatch, expected_fingerprint,
-                                      fingerprint, format_n, preflight)
+                                      fingerprint, format_n, preflight, v2_columns)
 from levain.autonomic.kill import Kleene, assert_kill_pure, kill_outcome
 from levain.autonomic.monitor import assert_trajectory_pure
 from levain.autonomic.posture import Posture
@@ -931,6 +931,12 @@ class _StoreAsItIs:
             if missing:
                 raise StoreFormatError(f"the {STORE_FORMAT_V2!r} store has no {' or '.join(missing)} table: nothing "
                                        "is written to it")
+            # A1-R3b: each with every column V's own /2 opener gives it
+            for t in ("bindings", "fences"):
+                lacks = sorted(v2_columns(t) - {r[1] for r in conn.execute(f"PRAGMA table_info({t})")})
+                if lacks:
+                    raise StoreFormatError(f"the {STORE_FORMAT_V2!r} store's {t} table has no {', '.join(lacks)} "
+                                           f"column{'s' if len(lacks) > 1 else ''}: nothing is written to it")
             return
         if marker == STORE_FORMAT_V3:
             if fingerprint(conn) != expected_fingerprint():

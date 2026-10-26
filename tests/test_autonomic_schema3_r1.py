@@ -133,6 +133,26 @@ def test_a_forged_decision_row_is_refused_and_does_not_restart_the_held_count(st
     c.close()
 
 
+@pytest.mark.parametrize("hold, run, n", [
+    # A1-R2b (codex r2): the upgrade gives a decided legacy hold decisions = 0, so its forged row matched it
+    ("h-old", "old", 0),
+    ("h-old", "old", 1),
+])
+def test_a_legacy_hold_takes_no_decision_row(legacy, hold, run, n):
+    with pytest.raises(sqlite3.IntegrityError, match="R13-6"):
+        tx(legacy, ("INSERT INTO hold_decisions (hold_id, run_id, pending_id, by, n) VALUES (?, ?, NULL, 'human', ?)",
+                    (hold, run, n)))
+    assert legacy.execute("SELECT COUNT(*) FROM hold_decisions").fetchone() == (0,)
+
+
+def test_a_decision_row_carries_a_positive_generation(store):
+    # A1-R2b: the table refuses n < 1 whatever a trigger says
+    c = raw(store)
+    sql = c.execute("SELECT sql FROM sqlite_master WHERE name = 'hold_decisions'").fetchone()[0]
+    assert "CHECK (n >= 1)" in sql
+    c.close()
+
+
 @pytest.mark.parametrize("stmt, why", [
     # a decision without its generation step, a generation step without a decision, a generation step backwards
     ("UPDATE holds SET decided = 1, decided_by = 'on-loop' WHERE hold_id = 'h-p'", "I3"),

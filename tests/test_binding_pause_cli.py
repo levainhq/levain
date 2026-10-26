@@ -314,6 +314,11 @@ def _sidecars(path) -> list[str]:
     (["CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
       f"INSERT INTO meta VALUES ('format', '{vdb.STORE_FORMAT_V2}')", "CREATE TABLE bindings (binding_id TEXT, "
       "record TEXT, seq INTEGER)"], "not paused: the 'levain-autonomic/2' store has no fences table"),
+    # A1-R3b (codex r2): both tables, one of them without a column V's /2 code gives it
+    (["CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+      f"INSERT INTO meta VALUES ('format', '{vdb.STORE_FORMAT_V2}')", "CREATE TABLE bindings (binding_id TEXT, "
+      "record TEXT, sequence INTEGER)", "CREATE TABLE fences (binding_id TEXT PRIMARY KEY, generation INTEGER)"],
+     "not paused: the 'levain-autonomic/2' store's bindings table has no seq column"),
 ])
 def test_a_foreign_database_is_refused_before_its_journal_mode_or_files_change(tmp_path, capsys, ddl, why):
     # A1-R3 (codex): the durable opener switches a database to WAL; a refused store must keep its rollback journal
