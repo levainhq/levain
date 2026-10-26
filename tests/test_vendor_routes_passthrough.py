@@ -56,3 +56,65 @@ def test_codex_passthrough_is_still_refused_by_name():
     with pytest.raises(Refused) as e:
         SV.pick_routes(out["routes"], "codex", "passthrough")
     assert e.value.name == "no-route:passthrough"
+
+
+#: an operator's own Claude passthrough route under another id, hand-written before one shipped (1026-10 R6)
+OPERATOR_PASS = {"route": "operator-claude-pass", "type": "subscription_passthrough", "hosts": ["api.anthropic.com"]}
+
+
+def _upgraded(*extra):
+    return {"format": VR.BASE_FORMAT, "routes": [dict(OPERATOR_PASS), *extra]}
+
+
+def test_merge_keeps_an_operators_claude_passthrough_route_and_adds_no_second_one():
+    out, ids = VR.merge(_upgraded())
+    passes = [r for r in out["routes"] if r["type"] == "subscription_passthrough"]
+    assert passes == [OPERATOR_PASS]
+    assert "claude-subscription" not in ids
+    assert "anthropic" in ids
+    P.parse_base_map(out)
+    assert SV.pick_routes(out["routes"], "claude", "passthrough") == ("operator-claude-pass",)
+    assert SV.pick_routes(out["routes"], "claude", "brokered") == ("anthropic",)
+
+
+def test_the_merge_names_the_operators_route_it_kept_in_place_of_the_shipped_one():
+    assert VR.yielded_routes(_upgraded()) == {"claude-subscription": ["operator-claude-pass"]}
+    assert VR.yielded_routes(None) == {}
+    assert VR.yielded_routes({"format": VR.BASE_FORMAT, "routes": []}) == {}
+
+
+def test_an_operators_passthrough_route_under_the_shipped_id_is_still_replaced():
+    mine = {"route": "claude-subscription", "type": "subscription_passthrough", "hosts": ["api.anthropic.com"]}
+    out, ids = VR.merge({"format": VR.BASE_FORMAT, "routes": [mine]})
+    assert "claude-subscription" in ids
+    assert VR.yielded_routes({"format": VR.BASE_FORMAT, "routes": [mine]}) == {}
+    assert SV.pick_routes(out["routes"], "claude", "passthrough") == ("claude-subscription",)
+
+
+def test_another_vendors_passthrough_route_does_not_stop_the_claude_default():
+    codex = {"route": "operator-codex-pass", "type": "subscription_passthrough", "hosts": ["chatgpt.com"]}
+    out, ids = VR.merge({"format": VR.BASE_FORMAT, "routes": [codex]})
+    assert "claude-subscription" in ids
+    assert SV.pick_routes(out["routes"], "claude", "passthrough") == ("claude-subscription",)
+    assert SV.pick_routes(out["routes"], "codex", "passthrough") == ("operator-codex-pass",)
+
+
+def test_a_merge_of_its_own_output_is_a_fixed_point_with_the_operators_route():
+    out, ids = VR.merge(_upgraded())
+    again, ids2 = VR.merge(out)
+    assert again == out and ids2 == ids
+
+
+def test_a_map_holding_both_the_shipped_and_the_operators_route_is_merged_to_the_operators_alone():
+    # the map an earlier merge wrote (the default added beside his route): the merge resolves it to his route
+    out, ids = VR.merge(_upgraded(VR.claude_passthrough_route()))
+    assert SV.pick_routes(out["routes"], "claude", "passthrough") == ("operator-claude-pass",)
+    assert "claude-subscription" not in ids
+
+
+def test_two_operator_routes_for_claude_are_named_and_left_as_written():
+    two = _upgraded({"route": "other-claude-pass", "type": "subscription_passthrough", "hosts": ["claude.ai"]})
+    assert VR.yielded_routes(two) == {"claude-subscription": ["operator-claude-pass", "other-claude-pass"]}
+    out, _ = VR.merge(two)
+    assert [r["route"] for r in out["routes"] if r["type"] == "subscription_passthrough"] == [
+        "operator-claude-pass", "other-claude-pass"]

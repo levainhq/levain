@@ -14,7 +14,10 @@ route can fall back, ``Codec.checks_answered_model``) a response naming another 
 model's row (3c-9, ``levain.broker.codec.answered_other``).
 
 The merge is by route id: every id here is replaced whole by its shipped entry, every other entry of the map is kept
-as written. The result is parsed by :func:`levain.broker.policy.parse_base_map` (keys' own parser) before root writes
+as written. One exception (1026-10 R6): a shipped ``subscription_passthrough`` route is not added when the map already
+holds the operator's own passthrough route for the same vendor under another id (a vendor's hosts are
+``supervisor.VENDOR_HOSTS``, the supervisor's own pick); the operator's route is kept and :func:`yielded_routes`
+names it, so a merge never adds a second passthrough route for a vendor (``route-ambiguous`` at every launch). The result is parsed by :func:`levain.broker.policy.parse_base_map` (keys' own parser) before root writes
 it, so root never writes a map keys would refuse.
 
 Runs on the root interpreter (3.9).
@@ -25,6 +28,7 @@ from typing import Dict, List, Tuple
 
 from levain.broker import policy as P
 from levain.broker.vendor_prices import VENDOR
+from levain.slot.supervisor import VENDOR_HOSTS, _hosts
 
 #: the format the merge writes (``layout.BASE_ROUTES_FORMAT``; a test holds the two equal)
 BASE_FORMAT = "levain-routes-base/2"
@@ -93,20 +97,44 @@ class MergeRefused(ValueError):
         self.code, self.detail = code, detail
 
 
+def yielded_routes(doc: object) -> Dict[str, List[str]]:
+    """For each shipped ``subscription_passthrough`` route :func:`merge` does not add: the ids of the operator's own
+    passthrough routes in ``doc`` (the map on disk, parsed; ``None`` = absent) for the same vendor, kept in its place.
+    A route is a vendor's when one of its hosts is in ``VENDOR_HOSTS`` for that vendor (``supervisor.pick_routes``'
+    test); an entry under a shipped id is not the operator's here, the merge replaces it."""
+    if type(doc) is not dict or type(doc.get("routes")) is not list:
+        return {}
+    shipped = vendor_routes()
+    ids = {r["route"] for r in shipped}
+    theirs = [e for e in doc["routes"] if type(e) is dict and e.get("type") == "subscription_passthrough"
+              and type(e.get("route")) is str and e["route"] not in ids]
+    out: Dict[str, List[str]] = {}
+    for r in shipped:
+        if r["type"] != "subscription_passthrough":
+            continue
+        vendors = [v for v, hs in VENDOR_HOSTS.items() if _hosts(r) & hs]
+        kept = sorted({e["route"] for e in theirs for v in vendors if _hosts(e) & VENDOR_HOSTS[v]})
+        if kept:
+            out[r["route"]] = kept
+    return out
+
+
 def merge(doc: object) -> Tuple[dict, List[str]]:
     """``(the merged map, the route ids replaced or added)``. ``doc`` is the map on disk, parsed (``None`` = absent,
     merged as the empty map). A ``/1`` map is carried to ``/2``: its egress and passthrough entries are the same
     objects in both formats; a ``/1`` brokered entry that is not a vendor id has no price table and is refused
     ``base-map-unmergeable`` (the operator's own brokered route is never rewritten by root). The result is parsed by
-    keys' parser; a refusal there is ``base-map-unmergeable`` too."""
+    keys' parser; a refusal there is ``base-map-unmergeable`` too. A shipped passthrough route that
+:func:`yielded_routes` names is neither added nor among the ids."""
     if doc is None:
         doc = {"format": BASE_FORMAT, "routes": []}
     try:
         P.parse_base_map(doc)
     except P.PolicyError as e:
         raise MergeRefused("base-map-malformed", str(e)[:200]) from None
-    shipped = vendor_routes()
-    ids = {r["route"] for r in shipped}
+    yielded = yielded_routes(doc)
+    shipped = [r for r in vendor_routes() if r["route"] not in yielded]
+    ids = {r["route"] for r in vendor_routes()}
     kept: List[dict] = []
     for entry in doc["routes"]:                       # type: ignore[index]
         if entry["route"] in ids:
@@ -119,7 +147,7 @@ def merge(doc: object) -> Tuple[dict, List[str]]:
         P.parse_base_map(out)
     except P.PolicyError as e:
         raise MergeRefused("base-map-unmergeable", str(e)[:200]) from None
-    return out, sorted(ids)
+    return out, sorted(r["route"] for r in shipped)
 
 
 def reverted_fields(doc: object) -> Dict[str, List[str]]:
@@ -141,4 +169,4 @@ def reverted_fields(doc: object) -> Dict[str, List[str]]:
 
 
 __all__ = ["ANTHROPIC_SESSION_CAP", "BASE_FORMAT", "CLAUDE_MODELS", "CLAUDE_NETWORK_DOC", "CLAUDE_PASSTHROUGH_HOSTS",
-           "MergeRefused", "anthropic_route", "claude_passthrough_route", "merge", "reverted_fields", "vendor_routes"]
+           "MergeRefused", "anthropic_route", "claude_passthrough_route", "merge", "reverted_fields", "vendor_routes", "yielded_routes"]
