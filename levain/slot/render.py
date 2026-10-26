@@ -92,8 +92,8 @@ QUEUE_SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"   # §3.2, not a secret: rendered
 CODEX_PROVIDER = "levain"
 
 ROUTE_TYPES = ("egress", "brokered", "subscription_passthrough")   # §4.1
-#: wfetch DESIGN §2.4: the proxy env a repo settings layer may not set (the names Claude Code reads, both cases); the
-#: wall still holds if one is cleared, but every fetch would fail with no cause shown, so the launch is refused.
+#: wfetch DESIGN §2.4: the proxy env names a repo settings layer may not set, upper and lower case. Clearing one
+#: cannot get past the OS wall (DESIGN §1.3), but every fetch would then fail with no cause shown.
 PROXY_ENV = frozenset(n for b in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY") for n in (b, b.lower()))
 #: wfetch RULINGS Q3: Codex's server-side search mode until Phill rules (fail closed: the front cannot see it).
 CODEX_WEB_SEARCH = "disabled"
@@ -525,10 +525,12 @@ def render_cc_settings(blob: RenderBlob, facts: RenderFacts) -> dict:
     a repo or local layer setting it true would switch Levain's gate hooks off).
 
     WebFetch (wfetch DESIGN §3 WF-1, RULINGS Q1): an egress session gets ``skipWebFetchPreflight: true`` (the
-    preflight goes to ``api.anthropic.com``, which the front never admits as a CONNECT host, and Levain's host list
-    is the gate) and one ``WebFetch(domain:<h>)`` allow per host of its ``egress`` routes, so an on-list fetch does
-    not prompt; the front, not this rule, refuses an off-list host. Every session gets
-    ``disableClaudeAiConnectors: true`` (connectors are fetched from a host on no route)."""
+    preflight goes to ``api.anthropic.com``, which the front never admits as a CONNECT host on a brokered session;
+    one behaviour for both auths, and the front's host list is the gate) and one ``WebFetch(domain:<h>)`` allow
+    per host of its ``egress`` routes, so an on-list fetch does not prompt; the front, not this rule, refuses an
+    off-list host. Every session gets
+    ``disableClaudeAiConnectors: true`` (wfetch runs/r1: connectors reach ``mcp-proxy.anthropic.com``, a host on
+    no route)."""
     check_facts(blob, facts)
     sandbox: dict[str, Any] = {"enabled": facts.host == "linux", "excludedCommands": []}
     permissions: dict[str, Any] = {"disableBypassPermissionsMode": "disable"}
@@ -885,7 +887,8 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     JSON. Refused by key: every ``sandbox`` key in host_guard's ``_LOOSENING_TRUE`` that is ``true`` and every one
     in ``_LOOSENING_NONEMPTY`` that is non-empty (the keys whose merge across layers the flag layer cannot pin),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
-    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars or a :data:`PROXY_ENV` name. A document that is not an object is refused ``repo-settings-malformed``.
+    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars or a :data:`PROXY_ENV` name. A
+    document that is not an object is refused ``repo-settings-malformed``.
     Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
 
     Operator-side: the supervisor runs this on the clone it bundles, before the bundle is made (the slot clones
@@ -910,7 +913,7 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
             for name in sorted(n for n in env if n in (QUEUE_CAP_ENV, QUEUE_SOCKET_ENV)):
                 out.append(_refused("loosening", f"env.{name}", f"{path}: the queue's env is set by levain only"))
             for name in sorted(n for n in env if n in PROXY_ENV):
-                out.append(_refused("loosening", f"env.{name}", f"{path}: {name}: the proxy env is set by levain only"))
+                out.append(_refused("loosening", f"env.{name}", f"{path}: {name} is set by levain only"))
         sb = doc.get("sandbox", {})
         if not isinstance(sb, Mapping):
             out.append(Refused("repo-settings-malformed", f"{path}: sandbox"))
