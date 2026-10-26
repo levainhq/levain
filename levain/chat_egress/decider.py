@@ -10,7 +10,8 @@ first and drains the second, and composes, per request, in this order (the first
      spent this launch, or a new one once `max_audit_ids` are spent (503 `audit_cap`) -> denied, no row.
   3. the ONE route lookup (`keys.lookup`, R15-18-L1) and the launch's mode, read live (`LiveSetting`, C1) and held as
      a ratchet from the mode the launch started with (`Capped`, Q-R15-9: a tightening applies live and stays for the
-     launch; a loosening, undoing a tightening included, never applies to it).
+     launch; a loosening, undoing a tightening included, never applies to it; a failed or timed-out read gates
+     that request only and does not move the hold).
   4. `parse.walls` (R-2 .. R-4), then R-5's header strip (`strip.strip`; too many credential names -> deny).
   5. C-3: `resolver.Resolver` (bounded, timed out) and `guard.address_wall`: any non-public answer walls
      `non_public_address` BEFORE any card (R15-10-A4); no answer denies.
@@ -237,6 +238,8 @@ class LiveSetting:
     it arrived (a revoke that landed before the request is seen by it); no answer inside `timeout_s`, an error, or
     a value outside `allowed` -> `fail_closed`. After `close()` every answer is `fail_closed` and no read starts:
     a read finishing after the close arms nothing, and a `get()` waiting on a read is woken by the close.
+    `get_ex()` answers the same value paired with whether it came from a real read (an in-`allowed` value the read
+    returned) rather than `fail_closed` standing in for one (timeout, error, out-of-`allowed` value, closed).
     `reader` is the read thread while it lives (the decider's close reports it: a read cannot be cancelled)."""
 
     def __init__(self, read: Callable[[], str], *, allowed: tuple[str, ...] = classify.MODES,
@@ -275,27 +278,31 @@ class LiveSetting:
         return self._flight
 
     def get(self) -> str:
+        return self.get_ex()[0]
+
+    def get_ex(self) -> tuple[str, bool]:
+        closed = (self._closed_value, False)
         arrived = time.monotonic()
         deadline = arrived + self._timeout
         while True:
             with self._lock:
                 if self._closed:
-                    return self._closed_value
+                    return closed
                 f = self._flight
                 if f is None or f[1].is_set():
                     f, mine = self._start(time.monotonic()), True
                 else:
                     mine = f[0] >= arrived
             if not f[1].wait(max(0.0, deadline - time.monotonic())):
-                return self._closed_value
+                return closed
             with self._lock:
                 if self._closed:
-                    return self._closed_value
+                    return closed
             if mine:
                 v = f[2].get("v")
-                return v if "e" not in f[2] and v in self._allowed else self._closed_value
+                return (v, True) if "e" not in f[2] and v in self._allowed else closed
             if time.monotonic() >= deadline:
-                return self._closed_value
+                return closed
 
 
 STRICTEST_FIRST = (classify.GATED, classify.OPEN_NETWORK)
@@ -312,8 +319,11 @@ class Capped:
     the next launch"), a ratchet: it holds the strictest mode seen for the launch's life, starting at ``launched``
     (the mode the launch started with), and each `get()` answers the stricter of the live setting's answer and that
     held mode, and holds the answer. A tightening applies live; undoing it is a loosening and never applies to this
-    launch. A value outside `STRICTEST_FIRST` on either side answers the strictest mode. `get()` is called from
-    concurrent decision threads: the hold is updated under a lock (the live read happens outside it)."""
+    launch. Only a REAL read moves the hold (`get_ex()`'s flag): an answer that stands in for a failed read (a
+    timeout, an error, a value outside the allowed modes) answers the strictest mode for that `get()` alone. A
+    setting with no `get_ex` has every read counted real. A value outside `STRICTEST_FIRST` on either side answers
+    the strictest mode. `get()` is called from concurrent decision threads: the hold is updated under a lock (the
+    live read happens outside it)."""
 
     def __init__(self, live: Any, launched: str) -> None:
         self._live = live
@@ -326,8 +336,11 @@ class Capped:
         return getattr(self._live, "reader", None)
 
     def get(self) -> str:
-        live = self._live.get()
+        get_ex = getattr(self._live, "get_ex", None)
+        live, real = get_ex() if get_ex is not None else (self._live.get(), True)
         with self._lock:
+            if not real:
+                return STRICTEST_FIRST[0]
             self._held = _stricter(live, self._held)
             return self._held
 
@@ -345,6 +358,9 @@ class Fixed:
 
     def get(self) -> str:
         return self.value
+
+    def get_ex(self) -> tuple[str, bool]:
+        return self.value, True
 
     def close(self) -> None:
         pass

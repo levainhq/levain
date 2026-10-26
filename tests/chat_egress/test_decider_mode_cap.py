@@ -153,3 +153,61 @@ def test_capped_closes_and_reports_the_live_settings_reader() -> None:
             return classify.GATED
 
     assert dm.Capped(Stub(), classify.GATED).reader is Stub.reader
+
+
+def _stalls_once(value: str):
+    """A read of the standing default that stalls (past the setting's timeout) the first time, then reads `value`."""
+    import threading
+
+    release, calls = threading.Event(), {"n": 0}
+
+    def read() -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            release.wait(10)
+        return value
+
+    return read, release
+
+
+def test_a_timed_out_read_gates_that_request_only(rig) -> None:
+    """HEAD ruling (1026+8 p2f2): a read that timed out answers gated for THAT request and does not move the held
+    mode; only a real read of the setting tightens the launch."""
+    read, release = _stalls_once(classify.OPEN_NETWORK)
+    r = rig(setting=dm.LiveSetting(read, timeout_s=0.3), launch_mode=classify.OPEN_NETWORK)
+    p, _ = r.srt.req("POST", path="/during-stall")
+    assert _until(lambda: len(r.desk.filed) == 1), "a request whose read timed out must card"
+    release.set()                                            # the stalled read finishes; the next one is real
+    p2, rid2 = r.srt.req("POST", path="/after-stall")
+    assert _action(r.srt.wait(p2)) == "allow", "a timed-out read must not gate the rest of an open launch"
+    assert len(r.desk.filed) == 1
+    assert all(row.open_network is True for row in r.rows(rid2))
+
+
+def test_capped_ratchets_only_on_a_real_read() -> None:
+    g, o = classify.GATED, classify.OPEN_NETWORK
+    read, release = _stalls_once(o)
+    c = dm.Capped(dm.LiveSetting(read, timeout_s=0.2), o)
+    assert c.get() == g                                      # timed out: gated for this get
+    release.set()
+    assert c.get() == o                                      # the held mode did not move
+    bad = {"v": "wide open"}
+    c2 = dm.Capped(dm.LiveSetting(lambda: bad["v"]), o)
+    assert c2.get() == g                                     # a value outside the allowed modes: this get only
+    bad["v"] = o
+    assert c2.get() == o
+    errs = {"raise": True}
+
+    def flaky() -> str:
+        if errs["raise"]:
+            raise OSError("read failed")
+        return o
+
+    c3 = dm.Capped(dm.LiveSetting(flaky), o)
+    assert c3.get() == g                                     # a read error: this get only
+    errs["raise"] = False
+    assert c3.get() == o
+
+
+def test_fixed_reads_are_real() -> None:
+    assert dm.Fixed(classify.GATED).get_ex() == (classify.GATED, True)
