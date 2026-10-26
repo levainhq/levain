@@ -52,16 +52,19 @@ def test_the_unit_runs_this_program_as_root_and_is_retried_only_on_failure():
 # --- boot_steps ---------------------------------------------------------------------------------------------------
 
 
-def test_boot_steps_are_setups_aliases_then_the_recorded_rules_then_the_enable_reference():
+def test_boot_steps_are_setups_aliases_then_the_enable_reference_then_the_recorded_rules_last():
+    """L3 r1 codex HIGH: the anchor load is the LAST readiness-publishing step, so a failed enable (an unreadable token
+    path fails before ``pfctl -E``) leaves the anchor empty and every egress start refused, never pf off with the rules
+    and alias in place."""
     steps = pf.boot_steps(EGRESS + VERIFY)
     aliases = pf.alias_steps(EGRESS + VERIFY)
     assert steps[:len(aliases)] == aliases
     assert [s.argv[3] for s in aliases] == [loopback_alias(s) for s in EGRESS]   # verifier pairs get none
     rest = steps[len(aliases):]
     assert [s.why for s in rest] == [
-        f"load the recorded rules {pf.ANCHOR_FILE} into the pf anchor {pf.ANCHOR}",
         f"create {pf.PF_TOKEN.parent}",
         f"take pf's enable reference, its token kept in {pf.PF_TOKEN}",
+        f"load the recorded rules {pf.ANCHOR_FILE} into the pf anchor {pf.ANCHOR}",
     ]
     # the one-shot never writes the rules file: only setup, replenish and repair do
     assert not [s for s in steps if s.write is not None]
@@ -229,3 +232,68 @@ def test_installed_egress_slots_with_no_store_is_none(monkeypatch, tmp_path):
     real = RH.Seams
     monkeypatch.setattr(RH, "Seams", lambda **kw: real(**{**kw, "store": tmp_path / "absent"}))
     assert PS.installed_egress_slots() is None
+
+
+# --- L3 r1 fixes -----------------------------------------------------------------------------------------------------
+
+
+def test_a_token_write_that_fails_gives_the_new_reference_back(tmp_path, monkeypatch):
+    """L3 r1 complement MED 1 = codex MED 2: ``-E`` took a reference and the token write raised. The new reference is
+    released before the step fails, so launchd's retries never pile up references no token names."""
+    token = tmp_path / "pf.token"
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(tuple(argv))
+        if argv[1] == "-E":
+            return subprocess.CompletedProcess(argv, 0, "", "pf enabled\nToken : 222\n")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def no_space(path, value):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(pf, "_write_token", no_space)
+    ok, why = pf.take_enable_reference(token, run=run)
+    assert not ok and "No space left on device" in why and "222" in why
+    assert calls == [("/sbin/pfctl", "-E"), ("/sbin/pfctl", "-X", "222")]
+    assert not token.exists()
+
+
+def test_a_token_write_that_fails_and_a_give_back_that_fails_says_both(tmp_path, monkeypatch):
+    def run(argv, **kw):
+        if argv[1] == "-E":
+            return subprocess.CompletedProcess(argv, 0, "", "Token : 222\n")
+        return subprocess.CompletedProcess(argv, 1, "", "pfctl: busy\n")
+
+    def no_space(path, value):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(pf, "_write_token", no_space)
+    ok, why = pf.take_enable_reference(tmp_path / "pf.token", run=run)
+    assert not ok and "No space left on device" in why and "could not be given back" in why and "busy" in why
+
+
+def test_main_with_no_egress_slot_and_no_rules_file_exits_0_with_a_line(capsys):
+    """L3 r1 deepseek MED 2: an operator file with no egress slot in service and no rules file is nothing to load, not a
+    failure launchd retries forever."""
+    rc, ran = _main(slots=lambda: (), rules_present=lambda: False)
+    assert rc == 0 and ran == []
+    assert "nothing to load" in capsys.readouterr().err
+
+
+def test_main_with_no_egress_slot_still_loads_a_rules_file_that_is_there():
+    # the file also carries the verifier pairs' rules (pf.anchor_rules), so it is loaded when it is there
+    rc, ran = _main(slots=lambda: (), rules_present=lambda: True)
+    assert rc == 0 and [s.why for s in ran[0]] == [s.why for s in pf.boot_steps(())]
+
+
+def test_the_real_run_plan_fails_on_a_step_that_answers_false():
+    """L3 r1 deepseek MED 1 / MED 3, checked against the real ``run_plan`` (``ok, why = step.call()``; ``return 1`` /
+    ``return 0``): a step answering ``(False, msg)`` fails the run, and a run of good steps returns 0, never None."""
+    from levain.firing.hands import Step
+
+    assert PS._run([Step("boom", call=lambda: (False, "boom"))]) == 1
+    assert PS._run([Step("fine", call=lambda: (True, ""))]) == 0
+    rc = PS.main([], platform="darwin", euid=lambda: 0, lock=_free, slots=lambda: EGRESS,
+                 run=lambda steps: PS._run([Step("boom", call=lambda: (False, "boom"))]))
+    assert rc == 1
+
+

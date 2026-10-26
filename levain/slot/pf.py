@@ -204,8 +204,9 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
     """``pfctl -E`` and store its token, readable by root alone (§23). The new reference is taken BEFORE
     an earlier run's is released, so pf never sits with no Levain reference between the two. If the old
     one cannot be released, the new one is given back and the old token stays recorded, so a re-run that
-    completes holds one recorded reference. A crash between ``-E`` and the token write, or a token write
-    that fails (it raises), leaves one reference with no record; pf then stays enabled, which is the
+    completes holds one recorded reference. A token write that fails gives the new reference back too, so the boot
+    one-shot's launchd retries never pile up references no token names. A crash between ``-E`` and the token write,
+    or a ``-E`` whose output names no token, leaves one reference with no record; pf then stays enabled, which is the
     fail-closed side (known edge). A token path that cannot be read is refused before ``-E``."""
     readable, old, note = _read_token(token_path)
     if not readable:
@@ -222,7 +223,13 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
         if not ok:
             back, back_why = _release(new, run)
             return False, why + ("" if back else f"; and the new reference {new} could not be given back: {back_why}")
-    _write_token(token_path, new)
+    try:
+        _write_token(token_path, new)
+    except OSError as e:
+        back, back_why = _release(new, run)
+        return False, (f"cannot record the pf token {new} in {token_path}: {e.strerror or e}; "
+                       + (f"reference {new} given back" if back
+                          else f"and the new reference {new} could not be given back: {back_why}"))
     return True, note
 
 
@@ -294,14 +301,17 @@ def load_recorded_anchor(path: Path = ANCHOR_FILE, run: Run = subprocess.run) ->
 
 
 def boot_steps(slots: Iterable[SlotId]) -> list[Step]:
-    """What a reboot undoes, redone (the ``com.levain.pf`` one-shot): each egress slot's lo0 alias
-    (:func:`alias_steps`), the anchor loaded from its recorded rules file (:func:`load_recorded_anchor`), and pf's
-    enable reference taken again (a reboot drops every reference; the token recorded before it names one pf no longer
-    knows, which :func:`take_enable_reference` releases as gone). Setup's order: the aliases before the rules."""
+    """What a reboot undoes, redone (the ``com.levain.pf`` one-shot), in this order: each egress slot's lo0 alias
+    (:func:`alias_steps`), pf's enable reference taken again (a reboot drops every reference; the token recorded before
+    it names one pf no longer knows, which :func:`take_enable_reference` releases as gone), and last the anchor loaded
+    from its recorded rules file (:func:`load_recorded_anchor`). A start's readiness check
+    (:func:`levain.slot.wall.macos_egress_ready`) reads all three; with the load last, a run that stops before it
+    leaves the anchor empty and every egress start refused, never the rules and aliases in place with pf off (L3 r1
+    codex HIGH)."""
     return [*alias_steps(slots),
+            *_enable_steps(),
             Step(f"load the recorded rules {ANCHOR_FILE} into the pf anchor {ANCHOR}",
-                 call=lambda: load_recorded_anchor()),
-            *_enable_steps()]
+                 call=lambda: load_recorded_anchor())]
 
 
 #: Read by the alias ``skip_if`` s; ``/sbin/ifconfig lo0`` prints one ``inet <addr> netmask <mask>``

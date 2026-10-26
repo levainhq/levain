@@ -2,8 +2,8 @@
 
 A reboot leaves pf disabled, the ``com.apple/levain`` anchor empty and lo0 without the slots' aliases, and every session
 start then refuses ``firewall-open`` or ``loopback-alias-down`` [measured in r3c10-vm 10-26, adoptvm RETURN]. This
-program runs :func:`levain.slot.pf.boot_steps` for the egress slots in service: each alias, the rules file setup,
-replenish or repair last wrote, loaded as it is, and pf's enable reference taken again.
+program runs :func:`levain.slot.pf.boot_steps` for the egress slots in service: each alias, pf's enable reference taken
+again, and last the rules file setup, replenish or repair last wrote, loaded as it is.
 
 It runs as root under the install lock (:func:`levain.slot.intent.install_lock`), so it never interleaves with a
 setup, replenish, repair or undo, which write the same rules file and token. The unit's ``KeepAlive`` is
@@ -66,9 +66,12 @@ def main(argv: Optional[Sequence[str]] = None, *, platform: str = sys.platform,
          euid: Callable[[], int] = os.geteuid,
          lock: Callable[[], ContextManager[int]] = _lock,
          slots: Callable[[], Optional[Tuple[SlotId, ...]]] = installed_egress_slots,
+         rules_present: Callable[[], bool] = lambda: os.path.lexists(pf.ANCHOR_FILE),
          run: Callable[[list], int] = _run) -> int:
-    """0: every step ran or was already done, or nothing is installed. :data:`EX_BUSY`: an install verb holds the lock.
-    1: a step failed (its line is on stderr). :data:`EX_NOPERM` / :data:`EX_CONFIG`: not root / not macOS."""
+    """0: every step ran or was already done, or nothing is installed, or no egress slot is in service and there is no
+    rules file to load. :data:`EX_BUSY`: an install verb holds the lock. 1: a step failed (its line is on stderr).
+    :data:`EX_NOPERM` / :data:`EX_CONFIG`: not root / not macOS. With no egress slot in service a rules file that IS
+    there is still loaded: it carries the verifier pairs' rules too (:func:`levain.slot.pf.anchor_rules`)."""
     if platform != "darwin":
         _log("the pf one-shot is macOS only")
         return EX_CONFIG
@@ -80,6 +83,9 @@ def main(argv: Optional[Sequence[str]] = None, *, platform: str = sys.platform,
             found = slots()
             if found is None:
                 _log("no finished install here: nothing to restore")
+                return 0
+            if not found and not rules_present():
+                _log(f"no egress slot in service and no {pf.ANCHOR_FILE}: nothing to load")
                 return 0
             rc = run(pf.boot_steps(found))
     except Refused as e:
