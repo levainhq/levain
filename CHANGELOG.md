@@ -6,6 +6,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **The cockpit's `!N` badge breathes when a new decision waits on you.** It pulses for about half a minute, then sits
+  still; never with reduced motion.
+
+### Fixed
+- **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
+  refilled,** so a keys failure cannot leave the pool short.
+
 ## [0.11.26] — 2026-10-25
 
 ### Added
@@ -14,8 +22,6 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   Node 26 on your PATH and refuses any other Node version by name; the rest of Levain stays Python. `levain doctor`
   shows the Node and dependency versions, fails on a changed or damaged install, and reports an unreadable one as a
   problem instead of crashing. Run `levain chat setup` again after upgrading.
-- **The cockpit's `!N` badge breathes when a new decision waits on you.** It pulses for about half a minute, then sits
-  still; never with reduced motion.
 
 ### Fixed
 - **The cockpit no longer loses a script when a browser opens many connections at once.** Levain's web servers
@@ -27,8 +33,6 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   locked`.** On a store not yet created (the queue broker's `limits.db` on a fresh install, or any other Levain store),
   opening it now waits for the other opener, up to the same 30 seconds as any other lock, including on the macOS
   system Python 3.9.
-- **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
-  refilled,** so a keys failure cannot leave the pool short.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - **The queue broker's service program exists for an isolated install.** It serves every slot's queue socket, so slot
