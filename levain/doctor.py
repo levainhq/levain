@@ -443,7 +443,8 @@ def _read_slot_dirs(slots: Path) -> tuple[dict[str, tuple[str, str]], list[str]]
 
 
 def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
-                          free_bytes: Any = None, now: float | None = None) -> list[CheckResult]:
+                          free_bytes: Any = None, now: float | None = None,
+                          seams: Any = None) -> list[CheckResult]:
     """Read-only rows over the isolation install's facts the OPERATOR can read (doctor runs as the operator): the
     pool's configured counts (``policy/pool``), the slots' state files (root-owned 0644 in 0755 dirs; the group is
     ``wheel`` on macOS) and the store volume's free space. Nothing is leased, probed or run as a slot user. A fact that
@@ -480,7 +481,7 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
             return [CheckResult("agent sessions", False, f"partially installed: no slots directory at {store}",
                                 "The isolation install is incomplete; its install helper repairs it.")]
         rows = _slot_rows(store, layout, R, Refused)
-        rows += _front_log_rows(store, host, layout, R)
+        rows += _front_log_rows(store, host, layout, R, seams)
     except OSError as exc:
         rows = [CheckResult("agent slots", True, f"could not be read ({_slot_why(exc)})", warn=True)]
     else:
@@ -543,10 +544,17 @@ def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResu
                         + note)]
 
 
-def _front_log_rows(store: Path, host: str, layout: Any, R: Any) -> list[CheckResult]:
+def _front_log_rows(store: Path, host: str, layout: Any, R: Any, seams: Any = None) -> list[CheckResult]:
     """The ``agent front logs`` row: each in-service egress slot's ``L/gw/slot<n>/`` (S1 3b-8a), which render refuses
     ``store-missing`` without. ``L/gw/`` is root's 0755, so the operator can see whether each is a real directory;
-    an install made before the dir existed has none until a repair applies setup's rows. No egress slot: no row."""
+    an install made before the dir existed has none until a repair applies setup's rows. A dir that is there but fails
+    what the runtime demands of it (``L/gw`` root's alone, ``slot<n>`` the front account's with no group or other write)
+    is reported as the runtime refuses it, by the same predicates (``runtime_helper.front_log_dirs_problem``). No egress
+    slot: no row. ``seams``: the runtime's, for tests; the default reads the real accounts."""
+    from levain.slot import Refused
+    from levain.slot import runtime_helper as H
+    from levain.slot.ids import SlotId
+
     found, _ignored = _read_slot_dirs(store / "slots")
     tags = sorted((t for t, v in found.items() if t[0] == "e" and v[0] not in R.OUT_OF_SERVICE),
                   key=lambda t: int(t[1:]))
@@ -561,21 +569,50 @@ def _front_log_rows(store: Path, host: str, layout: Any, R: Any) -> list[CheckRe
         pass
     except OSError as exc:
         return [CheckResult("agent front logs", True, f"could not be read ({_slot_why(exc)})", warn=True)]
+    seams = seams if seams is not None else H.Seams(host=host)
     missing = []
+    refused: list[str] = []
+    unchecked = False
     for t in tags:
         try:
-            if not stat.S_ISDIR(os.lstat(store / "gw" / f"slot{t[1:]}").st_mode):
+            slot_st = os.lstat(store / "gw" / f"slot{t[1:]}")
+            if not stat.S_ISDIR(slot_st.st_mode):
                 missing.append(t)
+                continue
+            gw_st = os.lstat(store / "gw")
         except FileNotFoundError:
             missing.append(t)
+            continue
         except OSError as exc:      # unreadable is said as unreadable, never as present, and keeps the slots row
             return [CheckResult("agent front logs", True, f"could not be read ({_slot_why(exc)})", warn=True)]
+        try:
+            front_uid = seams.account_uid(SlotId("egress", int(t[1:])).accounts[1])
+        except Refused:             # no front account: the slots rows and the runtime say so; this row cannot judge
+            unchecked = True
+            continue
+        bad = H.front_log_dirs_problem(seams, gw_st, slot_st, front_uid)
+        if bad == "gw":
+            return [CheckResult("agent front logs", False, f"{store / 'gw'} is not root's alone (wrong owner or group- "
+                                "or other-writable); the runtime refuses it (bad-root), so no egress session can be "
+                                "started", f"Run `{layout.repair_line(host)}` to restore its owner and mode.",
+                                upgrade_pending=True)]
+        if bad == "slot":
+            refused.append(t)
     if missing:
         return [CheckResult("agent front logs", False,
                             f"no front log directory for {', '.join(missing)}: every session on "
                             f"{'that slot' if len(missing) == 1 else 'those slots'} is refused (store-missing)",
                             f"Run `{layout.repair_line(host)}` once (an install made before the front log moved to "
                             "the store has none).", upgrade_pending=True)]
+    if refused:
+        return [CheckResult("agent front logs", False,
+                            f"the front log directory of {', '.join(refused)} is not the front account's alone "
+                            f"(wrong owner or group- or other-writable): every session on "
+                            f"{'that slot' if len(refused) == 1 else 'those slots'} is refused (bad-root)",
+                            f"Run `{layout.repair_line(host)}` to restore its owner and mode.", upgrade_pending=True)]
+    if unchecked:
+        return [CheckResult("agent front logs", True, f"{len(tags)} egress slot(s) have a front log directory; owner "
+                            "not checked (a front account is missing)", warn=True)]
     return [CheckResult("agent front logs", True, f"{len(tags)} egress slot(s), each with its front log directory")]
 
 

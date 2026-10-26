@@ -111,8 +111,16 @@ def _doctor_store(tmp: Path, tags: dict) -> Path:
     return _store(tmp, tags, pool=(sum(1 for t in live if t[0] == "e"), sum(1 for t in live if t[0] == "v")))
 
 
-def _front_row(store: Path):
-    rows = {r.name: r for r in doctor._check_slot_isolation(host="linux", store=store, free_bytes=lambda p: 100 << 30)}
+def _test_user_seams(**over):
+    """The runtime's predicates with root and the front account both mapped to this test's own uid."""
+    uid = os.getuid()
+    return H.Seams(host="linux", trusted=lambda st: st.st_uid == uid and not st.st_mode & 0o022,
+                   account_uid=lambda name: uid, **over)
+
+
+def _front_row(store: Path, seams=None):
+    rows = {r.name: r for r in doctor._check_slot_isolation(host="linux", store=store, free_bytes=lambda p: 100 << 30,
+                                                            seams=seams or _test_user_seams())}
     return rows.get("agent front logs"), rows
 
 
@@ -144,3 +152,80 @@ def test_doctor_front_log_row_green_absent_and_linked(tmp_path):
     store = _doctor_store(tmp_path / "d", {"e0": "reusable", "e3": "scrubbed"})
     row, _ = _front_row(store)
     assert not row.ok and "e0, e3" in row.detail
+
+
+# --- S-5: the doctor row judges L/gw and L/gw/slot<n> by the runtime's own predicates --------------------------------
+
+def test_doctor_front_row_is_red_where_the_runtime_refuses_bad_root(tmp_path):
+    for plant in ("slot-group-writable", "slot-other-writable", "gw-group-writable"):
+        store = _doctor_store(tmp_path / plant, {"e0": "reusable"})
+        (store / "gw" / "slot0").mkdir(parents=True)
+        if plant.startswith("slot"):
+            os.chmod(store / "gw" / "slot0", 0o770 if "group" in plant else 0o707)
+        else:
+            os.chmod(store / "gw", 0o775)
+        row, _ = _front_row(store)
+        assert not row.ok and "bad-root" in row.detail, (plant, row)
+        assert (("e0" in row.detail) if plant.startswith("slot") else (str(store / "gw") in row.detail)), row.detail
+
+
+def test_doctor_front_row_is_red_for_a_wrong_owner(tmp_path):
+    """Constructible through the seams the runtime reads: the front account is another uid than the dir's owner, and
+    a non-root gw owner."""
+    store = _doctor_store(tmp_path / "a", {"e0": "reusable"})
+    (store / "gw" / "slot0").mkdir(parents=True)
+    row, _ = _front_row(store, _test_user_seams(chowned_uid=lambda uid: uid + 1))
+    assert not row.ok and "bad-root" in row.detail and "e0" in row.detail
+    store = _doctor_store(tmp_path / "b", {"e0": "reusable"})
+    (store / "gw" / "slot0").mkdir(parents=True)
+    row, _ = _front_row(store, _test_user_seams(trusted=lambda st: False))
+    assert not row.ok and "bad-root" in row.detail and str(store / "gw") in row.detail
+
+
+def test_doctor_and_runtime_agree_on_the_same_dirs(tmp_path):
+    """One derivation: whatever the doctor row calls green, prepare_front_log accepts, and the reverse."""
+    for mode, ok in ((0o755, True), (0o775, False), (0o757, False)):
+        store = _doctor_store(tmp_path / f"m{mode:o}", {"e0": "reusable"})
+        (store / "gw" / "slot0").mkdir(parents=True)
+        os.chmod(store / "gw" / "slot0", mode)
+        seams = _test_user_seams(store=store, chown=lambda fd, u, g, rel: None, fsync=lambda fd: None)
+        row, _ = _front_row(store, seams)
+        st = H.Store(seams)
+        try:
+            try:
+                H.prepare_front_log(st, H.SlotId("egress", 0), os.getuid())
+                accepted = True
+            except H.Refused as e:
+                assert e.name == "bad-root"
+                accepted = False
+        finally:
+            st.close()
+        assert row.ok == accepted == ok, (mode, row)
+
+
+def test_doctor_front_row_without_a_front_account_is_a_warning_not_green(tmp_path):
+    store = _doctor_store(tmp_path, {"e0": "reusable"})
+    (store / "gw" / "slot0").mkdir(parents=True)
+
+    def gone(name):
+        raise H.Refused("account-missing", name)
+    row, _ = _front_row(store, _test_user_seams(account_uid=gone))
+    assert row.ok and row.warn and "not checked" in row.detail
+
+
+# --- S-6: only the gw / gw/slot<n> miss is rewritten as the missing front log dir -------------------------------------
+
+def test_a_store_missing_from_elsewhere_keeps_its_own_message(tmp_path, monkeypatch):
+    w = _world(tmp_path)
+
+    def other(*a, **k):
+        raise H.Refused("store-missing", "something-else")
+    monkeypatch.setattr(H.Store, "open_dir", other)
+    store = H.Store(w.seams)
+    try:
+        with pytest.raises(H.Refused) as e:
+            H.prepare_front_log(store, H.SlotId("egress", 0), 898)
+    finally:
+        store.close()
+    assert e.value.name == "store-missing" and e.value.detail == "something-else"
+    assert "front log dir is missing" not in str(e.value)

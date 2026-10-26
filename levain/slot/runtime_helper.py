@@ -556,6 +556,18 @@ def _front_dir_ok(st: os.stat_result, seams: "Seams", front_uid: int) -> bool:
     return st.st_uid == seams.chowned_uid(front_uid) and not st.st_mode & 0o022
 
 
+def front_log_dirs_problem(seams: "Seams", gw_st: os.stat_result, slot_st: os.stat_result,
+                           front_uid: int) -> Optional[str]:
+    """The ONE derivation of whether ``L/gw/`` and ``L/gw/slot<n>/`` pass what :func:`prepare_front_log` demands
+    (``seams.trusted`` on the first, :func:`_front_dir_ok` on the second), over stat results the caller already holds
+    (``levain doctor`` reads them by path; the runtime holds fds). The relative name of the dir that fails, or None."""
+    if not seams.trusted(gw_st):
+        return "gw"
+    if not _front_dir_ok(slot_st, seams, front_uid):
+        return "slot"
+    return None
+
+
 def write_front_policy(seams: "Seams", slot: SlotId, front_uid: int, data: bytes) -> None:
     """Root writes ``R/gw/slot<n>/session.json`` (§2.2 row; here root : the front account's primary group, 0440).
     ``R/`` and ``R/gw/`` must pass ``seams.trusted``; ``R/gw/slot<n>/`` is the front account's (its §2.2 row), so a
@@ -625,7 +637,8 @@ def prepare_front_log(store: "Store", slot: SlotId, front_uid: int) -> None:
         with store.dir("gw", trusted=True) as gfd:
             fd = _openat_dir(gfd, f"slot{slot.index}", where)
     except Refused as e:
-        if e.name != "store-missing":
+        # only the miss of L/gw or L/gw/slot<n> is the pre-move install; a store-missing from elsewhere keeps its text
+        if e.name != "store-missing" or e.detail not in (f"{store.path}/gw", where):
             raise
         raise Refused("store-missing", f"{store.path}/{where}: the front log dir is missing (an install made before "
                       f"it existed); run `{repair_line(seams.host)}` once") from None
