@@ -556,6 +556,286 @@ def dir_steps(host: HostOS) -> list[Step]:
     return steps
 
 
+# --- the vendor CLIs (head ruling 1026+8 VENDOR BINARIES; CONTRACT §2.1 row "vendor prefix"; BUILD_PLAN §2e 14) ---
+
+#: The vendor CLIs a slot session runs, each at ``VENDOR_PREFIX/bin/<name>`` (``start.vendor_argv`` execs it).
+VENDORS = ("claude", "codex")
+#: Where setup and repair look for each vendor CLI, in this order; the first entry that exists is the one used. Root
+#: never reads the operator's PATH (sudo resets it). ``~`` is the operator's home (Claude Code's native installer
+#: links ``~/.local/bin/claude``; Homebrew's npm links its ``bin``).
+VENDOR_SEARCH: Mapping[str, tuple] = {"darwin": ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"),
+                                      "linux": ("~/.local/bin", "/usr/local/bin", "/usr/bin")}
+#: The target triple an npm launcher's native binary lives under (``vendor/<triple>/bin/<name>``), by host and
+#: ``os.uname().machine``.
+VENDOR_TRIPLES: Mapping[tuple, str] = {
+    ("darwin", "arm64"): "aarch64-apple-darwin", ("darwin", "x86_64"): "x86_64-apple-darwin",
+    ("linux", "x86_64"): "x86_64-unknown-linux-musl", ("linux", "aarch64"): "aarch64-unknown-linux-musl"}
+#: A native executable's first four bytes: Mach-O 64-bit or universal on macOS, ELF on Linux. A script is never
+#: copied: its interpreter is not on the wall's PATH.
+NATIVE_MAGIC: Mapping[str, tuple] = {"darwin": (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"), "linux": (b"\x7fELF",)}
+_CHUNK = 1 << 20
+
+
+def vendor_bin(host: HostOS, name: str, *, prefix: Optional[Path] = None) -> Path:
+    return (prefix if prefix is not None else VENDOR_PREFIX[host]) / "bin" / name
+
+
+@dataclass(frozen=True)
+class VendorFound:
+    """``found``: the search entry that exists; ``binary``: the native executable it leads to (links resolved, an npm
+    launcher followed to its package's native binary), or None, and then ``why``."""
+
+    name: str
+    found: str
+    binary: Optional[str]
+    why: str = ""
+
+
+def _open_regular(path: str) -> int:
+    """``path`` opened read-only, not through a last link and without blocking (a FIFO at a search path must not
+    hang root); OSError unless it is a regular file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _head(path: str) -> bytes:
+    try:
+        fd = _open_regular(path)
+    except OSError:
+        return b""
+    try:
+        return os.pread(fd, 4, 0)
+    finally:
+        os.close(fd)
+
+
+def _expand(entry: str, home: str) -> str:
+    return home + entry[1:] if entry.startswith("~") else entry
+
+
+def find_vendor(host: HostOS, name: str, home: str, *, search: Optional[Iterable[str]] = None,
+                machine: Optional[str] = None,
+                realpath: Callable[[str], str] = os.path.realpath) -> Optional[VendorFound]:
+    """The vendor CLI ``name`` on this machine: the first ``search`` entry (default :data:`VENDOR_SEARCH`) holding
+    ``name``, resolved to the native executable to copy. Claude Code (its native installer and its npm package
+    alike) has a native executable at the end of the link. Codex's npm package has a node launcher there
+    (``<pkg>/bin/codex.js``); the native binary that launcher spawns is
+    ``<pkg>/node_modules/@<scope>/<name>-<platform>/vendor/<triple>/bin/<name>`` (or ``<pkg>/vendor/<triple>/...``),
+    and it runs on its own (measured by lane vendorbin 1026+8: a copy in a scratch dir answered ``--version``).
+    None when no entry exists."""
+    import glob
+
+    magic = NATIVE_MAGIC[host]
+    for entry in (search if search is not None else VENDOR_SEARCH[host]):
+        p = os.path.join(_expand(entry, home), name)
+        if not os.path.lexists(p):
+            continue
+        real = realpath(p)
+        head = _head(real)
+        if head[:4] in magic:
+            return VendorFound(name, p, real)
+        if not head.startswith(b"#!"):
+            return VendorFound(name, p, None, f"{p} leads to {real}, which is neither a native {host} executable "
+                                              "nor a launcher script")
+        arch = machine or os.uname().machine
+        triple = VENDOR_TRIPLES.get((host, arch))
+        if triple is not None:
+            pkg = glob.escape(os.path.dirname(os.path.dirname(real)))
+            for pattern in (os.path.join(pkg, "node_modules", "@*", "*", "vendor", triple, "bin", name),
+                            os.path.join(pkg, "vendor", triple, "bin", name)):
+                for c in sorted(glob.glob(pattern)):
+                    r = realpath(c)
+                    if _head(r)[:4] in magic:
+                        return VendorFound(name, p, r)
+        return VendorFound(name, p, None, f"{p} is a launcher script with no native {name} for {triple or arch} "
+                                          "in its package")
+    return None
+
+
+def _source_problem(st: os.stat_result, operator_uid: int) -> str:
+    """Why a vendor source is not copied, or "". Root copies only a file root or the operator owns, that no other
+    account can write, and that every user can already read and run, so the 0755 copy shows nothing it hid."""
+    if st.st_uid not in (0, operator_uid):
+        return f"is owned by uid {st.st_uid}, neither root nor the operator"
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return "is writable by its group or by every user"
+    want = stat.S_IROTH | stat.S_IXOTH
+    if st.st_mode & want != want:
+        return "is not readable and runnable by every user"
+    return ""
+
+
+def _fds_equal(a: int, b: int) -> bool:
+    if os.fstat(a).st_size != os.fstat(b).st_size:
+        return False
+    off = 0
+    while True:
+        x, y = os.pread(a, _CHUNK, off), os.pread(b, _CHUNK, off)
+        if x != y:
+            return False
+        if not x:
+            return True
+        off += len(x)
+
+
+def _paths_equal(a: str, b: str) -> bool:
+    fa = _open_regular(a)
+    try:
+        fb = _open_regular(b)
+        try:
+            return _fds_equal(fa, fb)
+        finally:
+            os.close(fb)
+    finally:
+        os.close(fa)
+
+
+def copy_vendor(host: HostOS, name: str, *, home: str, operator_uid: int, prefix: Optional[Path] = None,
+                search: Optional[Iterable[str]] = None, machine: Optional[str] = None,
+                fchown: Callable[[int, int, int], None] = os.fchown, fsync: Callable[[int], None] = os.fsync,
+                root_uid: int = 0) -> tuple:
+    """Copy the vendor CLI ``name`` (:func:`find_vendor`) to ``VENDOR_PREFIX/bin/<name>`` as a regular file, root's,
+    0755: written beside it as ``.<name>.partial``, flushed, then renamed over it (a running session keeps the inode
+    it exec'd). Never a link: the vendor's own tree is the operator's to write (``/opt/homebrew/lib`` is
+    ``admin``-writable), and the slot must run what root copied. A copy already equal to the source, root's and 0755,
+    is left alone. A vendor not found, a launcher with no native binary, or a source :func:`_source_problem` refuses
+    is a SKIP with a line, never a failed step (the copy already there, if any, is kept). ``root_uid``: the owner a
+    copy left alone must have (tests pass their own uid, since their ``fchown`` only records)."""
+    from levain.slot import write_all
+
+    dest = vendor_bin(host, name, prefix=prefix)
+    have = os.path.lexists(dest)
+    tail = (f"; the copy at {dest} is kept" if have
+            else f"; a {name} session is refused vendor-not-installed:{name}")
+    found = find_vendor(host, name, home, search=search, machine=machine)
+    if found is None:
+        where = ", ".join(search if search is not None else VENDOR_SEARCH[host])
+        return True, f"{name}: not found in {where}; skipped{tail}"
+    if found.binary is None:
+        return True, f"{name}: {found.why}; skipped{tail}"
+    try:
+        src = _open_regular(found.binary)
+    except OSError as e:
+        return True, f"{name}: cannot open {found.binary} ({e.strerror or e}); not copied{tail}"
+    try:
+        st = os.fstat(src)
+        problem = _source_problem(st, operator_uid)
+        if problem:
+            return True, f"{name}: {found.binary} {problem}; not copied{tail}"
+        if os.pread(src, 4, 0)[:4] not in NATIVE_MAGIC[host]:    # re-read from the fd that is copied
+            return True, f"{name}: {found.binary} is not a native {host} executable; not copied{tail}"
+        if have and not os.path.islink(dest):
+            try:
+                dfd = _open_regular(str(dest))
+            except OSError:
+                dfd = None
+            if dfd is not None:
+                try:
+                    dst = os.fstat(dfd)
+                    if (dst.st_uid == root_uid and stat.S_IMODE(dst.st_mode) == 0o755
+                            and _fds_equal(src, dfd)):
+                        return True, f"{name}: {dest} already matches {found.binary}"
+                finally:
+                    os.close(dfd)
+        partial = dest.parent / f".{name}.partial"
+        try:
+            os.unlink(partial)
+        except FileNotFoundError:
+            pass
+        out = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                      0o700)
+        try:
+            off = 0
+            while True:
+                chunk = os.pread(src, _CHUNK, off)
+                if not chunk:
+                    break
+                write_all(out, chunk)
+                off += len(chunk)
+            if off != st.st_size:
+                raise OSError(f"{found.binary} changed size while it was copied ({st.st_size} -> {off})")
+            fchown(out, 0, 0)
+            os.fchmod(out, 0o755)
+            fsync(out)
+        except BaseException:
+            os.close(out)
+            try:
+                os.unlink(partial)
+            except OSError:
+                pass
+            raise
+        os.close(out)
+        os.rename(partial, dest)
+        dfd = os.open(dest.parent, os.O_RDONLY)
+        try:
+            fsync(dfd)
+        finally:
+            os.close(dfd)
+        return True, f"{name}: copied {found.binary} to {dest} ({off} bytes, root's, 0755)"
+    except OSError as e:
+        return False, f"{name}: copying {found.binary} to {dest} failed ({e.strerror or e})"
+    finally:
+        os.close(src)
+
+
+def vendor_state(host: HostOS, name: str, home: str, *, prefix: Optional[Path] = None,
+                 search: Optional[Iterable[str]] = None, machine: Optional[str] = None) -> tuple:
+    """``(state, detail)`` for doctor: ``current`` (the copy's bytes equal the vendor it would be copied from),
+    ``stale`` (they differ: the vendor was updated since the last repair), ``not-copied`` (a vendor, no copy),
+    ``orphan`` (a copy, no vendor to compare it with), ``absent`` (neither), ``unreadable``."""
+    dest = vendor_bin(host, name, prefix=prefix)
+    found = find_vendor(host, name, home, search=search, machine=machine)
+    has = os.path.lexists(dest)
+    if found is None or found.binary is None:
+        why = f" ({found.why})" if found is not None else ""
+        if has:
+            return "orphan", f"{dest} is there, but no {name} was found to compare it with{why}"
+        return "absent", f"no {name} on this machine{why}"
+    if not has:
+        return "not-copied", f"{found.binary} is not copied to {dest}"
+    try:
+        same = _paths_equal(found.binary, str(dest))
+    except OSError as e:
+        return "unreadable", f"cannot compare {dest} with {found.binary} ({e.strerror or e})"
+    if same:
+        return "current", f"{dest} matches {found.binary}"
+    return "stale", f"{dest} differs from {found.binary}"
+
+
+def vendor_steps(host: HostOS, operator: str, *, lookup: Optional[Callable[[str], object]] = None) -> list:
+    """The vendor prefix's ``bin`` (root's, 0755, no link above it) and one copy step per :data:`VENDORS` entry
+    (:func:`copy_vendor`), searched from ``operator``'s home, read when the step runs."""
+    import pwd
+
+    look = lookup if lookup is not None else pwd.getpwnam
+    t = _tools(host)
+    b = VENDOR_PREFIX[host] / "bin"
+    steps = [
+        Step(f"check every directory above {b} is root's alone (links resolved), and {b} is no link",
+             call=lambda: _root_owned_ancestors(b)),
+        Step(f"create {b}", (t["mkdir"], "-p", "-m", "755", str(b))),
+        Step(f"own {b} as root", (t["chown"], f"root:{ROOT_GROUP[host]}", str(b))),
+        Step(f"set {b} to 0755", (t["chmod"], "0755", str(b))),
+    ]
+
+    def copy(name: str) -> Callable[[], tuple]:
+        def run() -> tuple:
+            pw = look(operator)
+            return copy_vendor(host, name, home=pw.pw_dir, operator_uid=pw.pw_uid)   # type: ignore[attr-defined]
+        return run
+
+    for name in VENDORS:
+        steps.append(Step(f"place root's copy (0755) of the {name} CLI at {vendor_bin(host, name)} (a vendor not "
+                          "on this machine is skipped)", call=copy(name)))
+    return steps
+
+
 def check_sources(source: Path, h11_dir: Path) -> None:
     if source.name != "levain":
         raise Refused("bad-root", f"{source} is not a levain package directory")
@@ -639,6 +919,8 @@ def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None, gener
 
 __all__ = ["CURRENT", "ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "STAGING", "Staged",
            "generation_boot_code", "stage_hashing_steps",
+           "NATIVE_MAGIC", "VENDORS", "VENDOR_SEARCH", "VENDOR_TRIPLES", "VendorFound", "copy_vendor", "find_vendor",
+           "vendor_bin", "vendor_state", "vendor_steps",
            "VENDOR_PREFIX", "boot_path_code", "check_source_writers", "check_sources", "current_path", "dir_steps",
            "entry_steps", "entry_text", "flip_step", "gc_step", "h11_floor", "h11_source", "helper_entry_text",
            "read_current", "stage_steps", "tree_steps"]

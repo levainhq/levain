@@ -13,6 +13,16 @@ from tests.test_slot_s2f3_start import E0, _started, _world
 E1 = SlotId("egress", 1)
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _vendor_installed(monkeypatch):
+    """A test store has no vendor prefix: start's vendor check passes here (test_slot_vendorbin.py tests it)."""
+    import levain.slot.start as _start
+    monkeypatch.setattr(_start, "vendor_ready", lambda host, vendor: None)
+
+
 def _clock(w):
     """The revoker's monotonic clock, set by hand: a retry is due only once its delay has passed."""
     clk = [1000.0]

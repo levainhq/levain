@@ -156,6 +156,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_dispatch_adoption_rules())
     core.extend(_check_dispatch_verifiers())
     core.extend(_check_slot_isolation())
+    core.extend(_check_vendor_copies())
     core.extend(_check_slot_limits())
     core.extend(_check_slot_keys())
     core.extend(_check_slot_services())
@@ -504,6 +505,53 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
         else:
             rows.append(CheckResult("agent store free space", True, f"{gib:.1f} GiB free"))
     return rows
+
+
+def _check_vendor_copies(*, host: str | None = None, store: Path | None = None, home: str | None = None,
+                         state: Any = None) -> list[CheckResult]:
+    """The ``agent vendor CLIs`` row: each vendor CLI a session runs is root's copy at ``VENDOR_PREFIX/bin/<name>``
+    (setup and repair make it, head ruling 1026+8), and the copy is compared byte for byte with the vendor it is copied
+    from (:func:`levain.slot.root_tree.vendor_state`, the same search repair runs, from the operator's home). A copy
+    that differs is a vendor updated since the last repair: sessions keep running the old one until repair re-copies
+    it. No row when there is no isolation install."""
+    from levain.slot import layout
+    from levain.slot import root_tree as RT
+
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    if store is None or not os.path.lexists(store):
+        return []
+    home = home if home is not None else os.path.expanduser("~")
+    read = state if state is not None else (lambda name: RT.vendor_state(host, name, home))
+    parts, stale, missing, problem = [], [], [], []
+    for name in RT.VENDORS:
+        try:
+            st, detail = read(name)
+        except OSError as exc:
+            st, detail = "unreadable", f"could not be read ({_slot_why(exc)})"
+        if st == "current":
+            parts.append(f"{name} current")
+        elif st == "absent":
+            parts.append(f"{name} not on this machine")
+        elif st == "stale":
+            stale.append(name)
+            parts.append(f"{name} STALE: {detail}")
+        elif st == "not-copied":
+            missing.append(name)
+            parts.append(f"{name} NOT COPIED: {detail}; its sessions are refused vendor-not-installed:{name}")
+        else:   # orphan, unreadable
+            problem.append(name)
+            parts.append(f"{name}: {detail}")
+    repair = f"sudo {layout.install_helper_path(host)} repair"
+    if stale or missing:
+        return [CheckResult("agent vendor CLIs", True, "; ".join(parts), warn=True,
+                            hint=f"Run `{repair}`: it copies {', '.join(stale + missing)} into "
+                                 f"{RT.VENDOR_PREFIX[host]}/bin, where sessions run it.")]
+    if problem:
+        return [CheckResult("agent vendor CLIs", True, "; ".join(parts), warn=True,
+                            hint="A copy with no vendor to compare it with keeps running as it is; repair leaves it.")]
+    return [CheckResult("agent vendor CLIs", True, "; ".join(parts))]
 
 
 def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResult]:

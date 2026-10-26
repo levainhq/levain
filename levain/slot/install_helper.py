@@ -692,6 +692,8 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         *pool_config_steps(host, cmd.slots, cmd.verifier_slots),
         *restart,
         *root_tree.tree_steps(host, package, h11_dir=h11_dir, generation=target, current=current),
+        # The vendor CLIs a session execs, COPIED into the prefix tree_steps made (head ruling 1026+8).
+        *root_tree.vendor_steps(host, cmd.operator),
         *confinement,
         # Before the first start: each service's started_after threshold (row 33 §2.5).
         Step("note each service's started_after threshold (before the first start)", call=note),
@@ -1734,7 +1736,9 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
         steps += F("R9", [root_tree.flip_step(host, target,                                       # R9
                                               fault=(lambda pt: fault("R9", pt)) if fault else None)])
     steps += F("R10", [*root_tree.entry_steps(host),                                              # R10
-                       *removals("R10")])           # R1b: entries after the flip (their sudoers rule went at R5)
+                       *removals("R10"),            # R1b: entries after the flip (their sudoers rule went at R5)
+                       # the vendor CLIs re-copied, so a vendor updated since the last repair reaches the slot
+                       *root_tree.vendor_steps(host, operator)])
     steps += F("R11", sudoers_steps(host, operator))                                              # R11
     steps += F("R12", [*removals("R12"),            # R1b: the removed units' files
                        *units.install_steps(host, services)])                                     # R12
