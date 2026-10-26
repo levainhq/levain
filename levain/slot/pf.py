@@ -29,7 +29,6 @@ from levain.firing.hands import _RETIRED_IDS as _HANDS_RETIRED_IDS, Step
 from levain.launch import child_env
 from levain.slot import Refused, write_all
 from levain.slot.ids import RETIRED_IDS_PATH, SlotId, in_own_range, loopback_alias
-from levain.slot.layout import RUN
 
 if TYPE_CHECKING:
     from levain.slot.removal import Live
@@ -37,13 +36,7 @@ if TYPE_CHECKING:
 ANCHOR = "com.apple/levain"
 ANCHOR_FILE = Path("/etc/pf.anchors/levain")
 PF_TOKEN = Path("/var/db/levain/pf.token")
-#: Where an :data:`ENABLE_UNCERTAIN` run notes the reference it kept and no token names (P7): in the §2.2 run dir,
-#: apart from the token's directory so the token's own write failures do not reach it (P9). macOS empties it at boot
-#: [measured in r3c10-vm 10-26, lane pfbootf5 raw]; the note also carries the boot it was written in (P8,
-#: :func:`_kept_held`). The run dir is the reaper's to make (§22); with it not there yet, no note is written.
-PF_KEPT = RUN["darwin"] / "pf.token.kept"
 PFCTL = "/sbin/pfctl"
-SYSCTL = "/usr/sbin/sysctl"
 #: The optimizer flag every load and check of the anchor carries (see :func:`load_steps`).
 PF_OPTIMIZE = ("-o", "none")
 
@@ -192,79 +185,13 @@ def _write_token(token_path: Path, token: str) -> None:
         os.close(dfd)
 
 
-#: ``sysctl -n kern.boottime``: ``{ sec = 1792860815, usec = 967376 } Sat Oct 24 12:53:35 2026`` (this Mac, 10-26).
-_BOOT_RE = re.compile(r"\{\s*sec\s*=\s*([0-9]+),\s*usec\s*=\s*([0-9]+)\s*\}")
-#: The note :func:`_note_kept` writes: the kept token, one space, the boot (:func:`_boot_time`).
-_KEPT_RE = re.compile(r"([0-9]{1,20}) ([0-9]+\.[0-9]{6})\n?")
-#: One row of ``pfctl -s References``, its TOKEN column captured: the field just before the ``<n> days hh:mm:ss``
-#: timestamp, so a process name with spaces in it does not shift it (layout measured in r3c10-vm, pfbootvm raw r2).
-_REF_ROW = re.compile(r"\s*[0-9]+\s.*\s([0-9]{1,20})\s+[0-9]+ days [0-9]+:[0-9]{2}:[0-9]{2}\s*")
-
-
-def _boot_time(run: Run) -> str | None:
-    """``kern.boottime`` as ``sec.usec``, or None when sysctl does not say."""
-    try:
-        r = run([SYSCTL, "-n", "kern.boottime"], capture_output=True, text=True, env=child_env())
-    except OSError:
-        return None
-    m = _BOOT_RE.search(r.stdout or "") if r.returncode == 0 else None
-    return f"{m.group(1)}.{int(m.group(2)):06d}" if m else None
-
-
-def _drop_kept(kept: Path) -> None:
-    try:
-        kept.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-def _note_kept(kept: Path, token: str, run: Run) -> None:
-    """Note ``token`` and this boot at ``kept``. Best effort: with no note (unwritable, its directory not made yet, or
-    no boot time to scope it to), the next run whose write fails is the ordinary, retried failure, each retry giving its
-    reference back."""
-    boot = _boot_time(run)
-    if boot is None:
-        return
-    try:
-        _write_token(kept, f"{token} {boot}")
-    except OSError:
-        pass
-
-
-def _kept_held(kept: Path, run: Run) -> str | None:
-    """The token :func:`_note_kept` noted, when the note is from this boot and the TOKEN column of ``pfctl -s
-    References`` lists it, else None. A note from another boot, or one that is not a note, is removed: the reference it
-    named is gone, whatever reference pf lists under that number now (P8)."""
-    try:
-        text = kept.read_text(encoding="ascii")
-    except (OSError, UnicodeDecodeError):
-        return None
-    m = _KEPT_RE.fullmatch(text)
-    if m is None:
-        _drop_kept(kept)
-        return None
-    boot = _boot_time(run)
-    if boot is None:
-        return None
-    if m.group(2) != boot:
-        _drop_kept(kept)
-        return None
-    r = run([PFCTL, "-s", "References"], capture_output=True, text=True, env=child_env())
-    if r.returncode != 0:
-        return None
-    held = {row.group(1) for row in map(_REF_ROW.fullmatch, (r.stdout or "").splitlines()) if row}
-    return m.group(1) if m.group(1) in held else None
-
-
 def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run, *,
-                             after_release: Callable[[], None] = lambda: None,
-                             kept: Path | None = None) -> tuple[bool, str]:
+                             after_release: Callable[[], None] = lambda: None) -> tuple[bool, str]:
     """Release the reference whose token :func:`take_enable_reference` stored, then remove the token
     file. No file, or a file holding no token, = nothing to release. The file goes only once pf
     confirms the reference is gone (released now, or already dropped); any other failure keeps it. A
     token path that cannot be read is a failure, and nothing is removed. ``after_release``: the crash
-    table's ``pf-enable/1:after-release`` point (row 33 R1b), between the release and the unlink. ``kept``: the
-    kept-reference note (:data:`PF_KEPT` when None), removed with the token."""
+    table's ``pf-enable/1:after-release`` point (row 33 R1b), between the release and the unlink."""
     readable, token, note = _read_token(token_path)
     if not readable:
         return False, note
@@ -274,24 +201,16 @@ def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.
     if ok:
         after_release()
         token_path.unlink(missing_ok=True)
-        _drop_kept(PF_KEPT if kept is None else kept)
     return ok, why
 
 
-def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run, *,
-                          kept: Path | None = None) -> tuple[bool, str]:
+def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run) -> tuple[bool, str]:
     """``pfctl -E`` and store its token, readable by root alone (§23). The new reference is taken BEFORE
     an earlier run's is released, so pf never sits with no Levain reference between the two. If the old
     one cannot be released, the new one is given back and the old token stays recorded, so a re-run that
     completes holds one recorded reference. A token write that fails with no old reference released gives the new one
     back too, so the boot one-shot's launchd retries never pile up references no token names. A recorded token pf
     answers gone (a reboot dropped it) released nothing pf held, so it counts as no old reference here.
-
-    An uncertain run notes the reference it kept at ``kept`` (:data:`PF_KEPT` when None), with the boot it ran in. A
-    later run in the same boot whose write fails again gives its new reference back, and while ``pfctl -s References``
-    still lists the noted one, it answers :data:`ENABLE_UNCERTAIN` too: pf stays on by the noted reference, and a retry
-    would change nothing (P7, the pfbootvm restart loop). A note from another boot is removed and counts for nothing
-    (P8). A recorded token clears the note; the noted reference stays held until a reboot.
 
     Once a LIVE old reference is released, the new one is NEVER given back: it may be all that holds pf on under running
     sessions (L3 verify r2 codex HIGH). A token write that fails then keeps it held, unrecorded, and answers
@@ -301,7 +220,6 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
     edge), and so is a crash between ``-E`` and the token write, or a ``-E`` whose output names no token (L3 r1
     codex MED 2: unparseable ``-E`` output needs a pfctl format change; it fails as an ordinary, retried step). A token
     path that cannot be read is refused before ``-E``."""
-    kept = PF_KEPT if kept is None else kept
     readable, old, note = _read_token(token_path)
     if not readable:
         return False, note
@@ -326,18 +244,11 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
     except OSError as e:
         failed = f"cannot record the pf token {new} in {token_path}: {e.strerror or e}"
         if old is not None:
-            _note_kept(kept, new, run)
             return False, f"{ENABLE_UNCERTAIN}: {failed}; reference {new} kept (the old one {old} is released)"
         back, _, back_why = _release(new, run)
         if back:
-            held = _kept_held(kept, run)
-            if held is not None:
-                return False, (f"{ENABLE_UNCERTAIN}: {failed}; reference {new} given back, and pf stays enabled by"
-                               f" {held}, which an earlier run kept and no token names")
             return False, f"{failed}; reference {new} given back"
-        _note_kept(kept, new, run)
         return False, f"{ENABLE_UNCERTAIN}: {failed}; and the new reference {new} could not be given back: {back_why}"
-    _drop_kept(kept)
     return True, note
 
 
@@ -457,9 +368,9 @@ def alias_steps(slots: Iterable[SlotId]) -> list[Step]:
             for s in sorted(set(slots)) if s.slot_class == "egress"]
 
 
-__all__ = ["ANCHOR", "ANCHOR_FILE", "GWPORT_BASE", "IFCONFIG", "PFCTL", "PF_KEPT", "PF_OPTIMIZE", "PF_TOKEN",
-           "PF_TOKEN_GONE", "alias_absent", "alias_present", "alias_steps", "anchor_rules", "anchor_text", "boot_steps",
-           "gwport", "load_recorded_anchor", "load_steps", "release_enable_reference", "take_enable_reference"]
+__all__ = ["ANCHOR", "ANCHOR_FILE", "GWPORT_BASE", "IFCONFIG", "PFCTL", "PF_OPTIMIZE", "PF_TOKEN", "PF_TOKEN_GONE", "alias_absent", "alias_present",
+           "alias_steps", "anchor_rules", "anchor_text", "boot_steps", "gwport", "load_recorded_anchor", "load_steps",
+           "release_enable_reference", "take_enable_reference"]
 
 
 # --- row 33 R1b: removal by the RECORDED identity (§1.1 table rows 6-8) --------------------------------------------
@@ -536,8 +447,7 @@ def remove_enable_steps(token: str, *, live: "Live") -> list[Step]:
     def release() -> tuple[bool, str]:
         try:
             return release_enable_reference(live.at(Path(token)), run=live.timed,
-                                            after_release=lambda: live.fault("pf-enable/1:after-release"),
-                                            kept=live.at(PF_KEPT))
+                                            after_release=lambda: live.fault("pf-enable/1:after-release"))
         except subprocess.TimeoutExpired:
             return False, f"pfctl -X timed out after {live.timeout:g}s, token kept"
 

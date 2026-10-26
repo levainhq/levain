@@ -23,13 +23,6 @@ EGRESS = (SlotId("egress", 0), SlotId("egress", 1))
 VERIFY = (SlotId("none", 0),)
 
 
-@pytest.fixture(autouse=True)
-def _kept_in_tmp(tmp_path, monkeypatch):
-    """The kept-reference note's home (``/var/run/levain``) moved under this test's tmp dir, apart from the token's."""
-    (tmp_path / "var-run" / "levain").mkdir(parents=True)              # made by the reaper's boot pass
-    monkeypatch.setattr(pf, "PF_KEPT", tmp_path / "var-run" / "levain" / "pf.token.kept", raising=False)
-
-
 # --- the reproduced failure: setup / repair installed no com.levain.pf ---------------------------------------------
 
 
@@ -333,8 +326,7 @@ def test_a_token_write_that_fails_after_the_old_reference_was_released_keeps_the
     run, calls = _pfctl({})
     monkeypatch.setattr(pf, "_write_token", _no_space)
     ok, why = pf.take_enable_reference(token, run=run)
-    assert calls == [("/sbin/pfctl", "-E"), ("/sbin/pfctl", "-X", "111"),   # 222 is never given back
-                     ("/usr/sbin/sysctl", "-n", "kern.boottime")]           # the note's boot (P8)
+    assert calls == [("/sbin/pfctl", "-E"), ("/sbin/pfctl", "-X", "111")]   # 222 is never given back
     assert not ok and why.startswith(pf.ENABLE_UNCERTAIN)
     assert "222" in why and "No space left on device" in why
 
@@ -418,7 +410,7 @@ def test_a_token_write_that_fails_after_a_reboot_dropped_the_old_reference_gives
     assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN) and "222" in why and "No space left on device" in why
 
 
-# --- the VM reboot run (f4): P6 the boot lines are kept, P7 no retry loop after an uncertain run ---------------------
+# --- the VM reboot run: P6 the boot lines are kept; the VM blocker case is the ordinary retried failure (P11) ---------
 
 
 def test_the_pf_unit_keeps_its_lines_in_a_root_log_launchd_does_not_throw_away():
@@ -458,7 +450,7 @@ def test_the_log_is_cut_back_to_empty_once_it_passes_its_cap(tmp_path):
 
 class _Refs:
     """A fake pfctl holding real reference state: ``-E`` takes the next token, ``-X`` releases a held one or answers
-    ``pf: token invalid``, ``-s References`` lists what is held (the measured column layout, raw/vm r2)."""
+    ``pf: token invalid``."""
 
     def __init__(self, held=()):
         self.held, self.next = list(held), 222
@@ -468,168 +460,31 @@ class _Refs:
             tok, self.next = str(self.next), self.next + 111
             self.held.append(tok)
             return subprocess.CompletedProcess(argv, 0, "", f"pf enabled\nToken : {tok}\n")
-        if argv[1] == "-X":
-            if argv[2] not in self.held:
-                return subprocess.CompletedProcess(argv, 1, "", "pf: token invalid\n")
-            self.held.remove(argv[2])
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        rows = "".join(f"946      pfctl                        {t}      0 days 00:00:21\n" for t in self.held)
-        return subprocess.CompletedProcess(argv, 0, "TOKENS:\nPID      Process Name                 TOKEN"
-                                                    "                    TIMESTAMP\n" + rows, "")
+        assert argv[1] == "-X", argv
+        if argv[2] not in self.held:
+            return subprocess.CompletedProcess(argv, 1, "", "pf: token invalid\n")
+        self.held.remove(argv[2])
+        return subprocess.CompletedProcess(argv, 0, "", "")
 
 
-def _blocked(tmp_path):
-    """The VM's blocker: a directory where the token's temp file goes, so every token write fails as it did there."""
+def test_with_the_token_path_unwritable_the_next_run_gives_its_reference_back_and_is_retried(tmp_path):
+    """The pfbootvm blocker (a directory where the token's temp file goes, so every token write fails). Run 1 released
+    the live 111 and kept 222 unrecorded: uncertain, exit 0 (f3's ruled behaviour). Run 2 reads the recorded 111 as
+    gone, gives its 333 back and fails: exit 1, so launchd retries it (P11: no note stops that; the retry is the right
+    behaviour while the path stays unwritable). It never exits 0 with the anchor load unrun (P5)."""
+    from levain.firing.hands import Step
+
     token = tmp_path / "pf.token"
     (tmp_path / ".pf.token.tmp").mkdir()
-    return token
-
-
-def test_two_runs_with_the_token_path_unwritable_hold_one_reference_and_neither_is_retried(tmp_path):
-    """P7 (pfbootvm FINDING): run 1 released the live 111, kept 222 unrecorded and answered uncertain; the token file
-    still named 111. Run 2 then read 111 as gone (f3), gave its 333 back and failed as retriable: launchd restarted it
-    every ~10 s for as long as the path stayed unwritable. Run 2 must give 333 back AND not be retried."""
-    token = _blocked(tmp_path)
     token.write_text("111\n")
-    pfctl = _Booted(["111"])
+    pfctl = _Refs(["111"])
     ok, why = pf.take_enable_reference(token, run=pfctl)
     assert not ok and why.startswith(pf.ENABLE_UNCERTAIN) and pfctl.held == ["222"]
-    ok, why = pf.take_enable_reference(token, run=pfctl)
-    assert pfctl.held == ["222"]                                     # one reference, and pf stays on
-    assert not ok and why.startswith(pf.ENABLE_UNCERTAIN), why        # so the one-shot exits 0
-    from levain.firing.hands import Step
-    assert PS._run([Step("enable", call=lambda: pf.take_enable_reference(token, run=pfctl))]) == PS.RC_UNCERTAIN
-    assert pfctl.held == ["222"]
-
-
-def test_after_a_reboot_a_kept_reference_pf_no_longer_holds_is_the_ordinary_retried_failure(tmp_path):
-    """The f3 case with a note left from before the reboot: pf holds nothing, so 222 is not holding pf on and the run
-    gives its new reference back and is retried, as f3 ruled."""
-    token = _blocked(tmp_path)
-    token.write_text("111\n")
-    pfctl = _Booted(["111"])
-    assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
-    pfctl.held = []                                                  # the reboot
-    ok, why = pf.take_enable_reference(token, run=pfctl)
-    assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN) and pfctl.held == []
-
-
-def test_a_run_whose_write_works_again_records_its_token_and_drops_the_note(tmp_path):
-    token = _blocked(tmp_path)
-    token.write_text("111\n")
-    pfctl = _Booted(["111"])
-    assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
-    (tmp_path / ".pf.token.tmp").rmdir()                             # the path is writable again
-    assert pf.take_enable_reference(token, run=pfctl) == (True, "")
-    assert token.read_text() == "333\n" and sorted(os.listdir(tmp_path)) == ["pf.token", "var-run"]
-    assert _noted_kept(tmp_path) == []
-
-
-# --- L3 verify r5 (f5): P8 the note is boot-scoped and only the TOKEN column counts, P9 it lives apart from the token -
-
-
-class _Booted(_Refs):
-    """:class:`_Refs` plus ``sysctl -n kern.boottime`` (the measured layout) and rows other processes hold."""
-
-    def __init__(self, held=(), boot=1792860815, others=()):
-        super().__init__(held)
-        self.boot, self.others = boot, list(others)
-
-    def __call__(self, argv, **kw):
-        if argv[0] == "/usr/sbin/sysctl":
-            return subprocess.CompletedProcess(argv, 0, f"{{ sec = {self.boot}, usec = 967376 }} Sat Oct 24 12:53:35"
-                                                        " 2026\n", "")
-        r = super().__call__(argv, **kw)
-        if argv[1:] == ["-s", "References"]:
-            r.stdout += "".join(f"{pid:<8} {name:<28} {tok:<24} 0 days 00:{pid % 60:02d}:01\n"
-                                for pid, name, tok in self.others)
-        return r
-
-
-def _noted_kept(tmp_path) -> list:
-    return [p for p in tmp_path.rglob("*.kept")]
-
-
-def test_a_noted_token_seen_only_in_another_rows_pid_is_not_held(tmp_path):
-    """P8 (r5 codex MED, deepseek MED): ``_kept_held`` matched the noted token against every field of every row, so a
-    PID (or a timestamp field) equal to it read as held, and a run that should retry exited 0 with the anchor unloaded.
-    Here someone released 222 after run 1 noted it; another process's row carries 222 as its PID."""
-    token = _blocked(tmp_path)
-    token.write_text("111\n")
-    pfctl = _Booted(["111"])
-    assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
-    pfctl.held.remove("222")
-    pfctl.others = [(222, "socketfilterfw", "9988776655")]
-    ok, why = pf.take_enable_reference(token, run=pfctl)
-    assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN), why
-
-
-def test_a_note_from_an_earlier_boot_is_ignored_and_removed(tmp_path):
-    """P8: a note carries the boot it was written in; after a reboot, even a token pf now lists under the same number
-    is not the reference that run kept, so the run gives its new one back and is retried, and the note is gone."""
-    token = _blocked(tmp_path)
-    token.write_text("111\n")
-    pfctl = _Booted(["111"])
-    assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
-    assert _noted_kept(tmp_path)
-    pfctl.boot += 3600                                              # the reboot ...
-    pfctl.held, pfctl.next = ["222"], 333                           # ... and pf lists 222 again, another reference
-    ok, why = pf.take_enable_reference(token, run=pfctl)
-    assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN), why
-    assert pfctl.held == ["222"] and _noted_kept(tmp_path) == []
-
-
-def test_a_token_dir_that_cannot_be_written_still_leaves_a_note_so_run_two_is_not_retried(tmp_path):
-    """P9 (r5 complement MED): the note shared the token's directory, so a read-only or permission-denied state dir
-    failed both writes and run 2 looped as before. The note's own home is apart from the token's."""
-    d = tmp_path / "db"
-    d.mkdir()
-    token = d / "pf.token"
-    token.write_text("111\n")
-    os.chmod(d, 0o500)
-    try:
-        pfctl = _Booted(["111"])
-        assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
-        ok, why = pf.take_enable_reference(token, run=pfctl)
-        assert not ok and why.startswith(pf.ENABLE_UNCERTAIN), why
-        assert pfctl.held == ["222"]
-    finally:
-        os.chmod(d, 0o700)
-
-
-def test_only_the_token_column_of_a_references_row_is_read():
-    measured = "946      pfctl                        8485652482348616732      0 days 00:00:21"   # pfbootvm raw r2
-    long_name = "1203     Some Helper (with spaces) x  4242                     12 days 03:04:05"
-    rows = ["TOKENS:", "PID      Process Name                 TOKEN                    TIMESTAMP", measured, long_name]
-    assert [m.group(1) for m in map(pf._REF_ROW.fullmatch, rows) if m] == ["8485652482348616732", "4242"]
-
-
-def test_a_note_that_is_not_one_is_removed_and_one_with_no_boot_time_to_check_is_left(tmp_path):
-    kept = pf.PF_KEPT
-    kept.write_text("222\n")                                        # f4's layout: no boot
-    assert pf._kept_held(kept, _Booted(["222"])) is None and not kept.exists()
-    kept.write_text("222 1792860815.967376\n")
-
-    def no_sysctl(argv, **kw):
-        return subprocess.CompletedProcess(argv, 1, "", "sysctl: unknown oid\n")
-    assert pf._kept_held(kept, no_sysctl) is None and kept.exists()  # which boot is unknown: neither used nor removed
-    assert pf._kept_held(kept, _Booted(["222"])) == "222"
-
-
-def test_with_the_run_dir_not_made_yet_no_note_is_written_and_the_dir_is_left_to_the_reaper(tmp_path):
-    """R/ (``/var/run/levain``) is the reaper's to make, root 0755 (§2.2, §22): a pf run that made it first would give
-    it another mode. With no R/ there is no note, and run 2 is the ordinary retried failure (the fallback)."""
-    (tmp_path / "var-run" / "levain").rmdir()
-    token = _blocked(tmp_path)
-    token.write_text("111\n")
-    pfctl = _Booted(["111"])
-    assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
-    assert not (tmp_path / "var-run" / "levain").exists()
-    ok, why = pf.take_enable_reference(token, run=pfctl)
-    assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN) and pfctl.held == ["222"]
-
-
-def test_the_note_lives_in_the_run_dir_the_reaper_makes(monkeypatch):
-    from levain.slot.layout import RUN
-    monkeypatch.undo()                                              # the real home, not this file's tmp one
-    assert pf.PF_KEPT.parent == RUN["darwin"] == Path("/private/var/run/levain")
+    loaded = []
+    steps = [Step("enable", call=lambda: pf.take_enable_reference(token, run=pfctl)),
+             Step("load the anchor", call=lambda: (loaded.append(1), (True, ""))[1])]
+    rc = PS.main([], platform="darwin", euid=lambda: 0, lock=_free, slots=lambda: EGRESS,
+                 run=lambda _steps: PS._run(steps))
+    assert rc == 1 and loaded == []
+    assert pfctl.held == ["222"]                                     # 333 given back: no reference piles up
+    assert token.read_text() == "111\n"
