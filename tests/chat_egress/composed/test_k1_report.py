@@ -320,7 +320,7 @@ def test_a_real_stop_whose_wall_write_failed_reaches_the_report_through_one_entr
     finally:
         theirs.close()
     assert stop.socks_wall_failures == 1 and stop.socks_count_exact
-    text = report.build_from_files([], e.events, stop=stop).text()
+    text = report.build_from_stop([], e.events, 0, stop).text()
     assert "1 SOCKS wall writes failed (refusals not counted; the glue total is an undercount)" in text
     assert "may be incomplete" not in text
     assert "SOCKS wall writes failed" not in report.build_from_files([], e.events).text()
@@ -332,5 +332,5 @@ def test_a_stop_whose_socks_close_timed_out_marks_the_report_count_incomplete(tm
     e = _stub_launch(tmp_path, SimpleNamespace(close=lambda: False, wall_failures=2))
     stop = lm.stop_egress(e)
     assert not stop.socks_count_exact
-    text = report.build_from_files([], e.events, stop=stop).text()
+    text = report.build_from_stop([], e.events, 0, stop).text()
     assert "2 SOCKS wall writes failed" in text and "SOCKS wall-write count may be incomplete" in text

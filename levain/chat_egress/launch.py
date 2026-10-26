@@ -186,7 +186,7 @@ class StopResult:
     final_flush: dict | None                # the clean end's summary line, or None when there is none
     order: tuple[str, ...]
     failures: tuple[str, ...] = ()          # "<step>: <exception type>" for each teardown step that raised
-    socks_wall_failures: int = 0            # the refuser's `wall_failures`, read after its close(); report.build_from_files(stop=...) shows it
+    socks_wall_failures: int = 0            # the refuser's `wall_failures`, read after its close(); report.build_from_stop shows it
     socks_count_exact: bool = True          # False: the refuser's close() did not end its thread, so a late write may be uncounted
 
 

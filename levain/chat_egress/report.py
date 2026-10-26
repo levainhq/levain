@@ -218,16 +218,21 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
         socks_wall_write_failures=socks_wall_failures, socks_count_exact=socks_count_exact)
 
 
-def build_from_files(rows: Sequence[EgressRow], events_path, duplicate_rows: int = 0,
-                     stop: StopResult | None = None) -> LaunchReport:
-    """`build` over the glue's event file; a missing or unreadable file reads as no lines (a crash before any). The one
-    way the SOCKS wall-write count reaches the report is `stop`, the launch's StopResult; without it the report cannot
-    show that count."""
+def _read_events(events_path) -> list[bytes]:
+    """The glue's event file as lines; a missing or unreadable file reads as no lines (a crash before any)."""
     try:
         with open(events_path, "rb") as f:
-            data = f.read().splitlines(keepends=True)
+            return f.read().splitlines(keepends=True)
     except OSError:
-        data = []
-    if stop is None:
-        return build(rows, data, duplicate_rows)
-    return build(rows, data, duplicate_rows, stop.socks_wall_failures, stop.socks_count_exact)
+        return []
+
+
+def build_from_files(rows: Sequence[EgressRow], events_path, duplicate_rows: int = 0) -> LaunchReport:
+    """`build` over the glue's event file. No stop happened here, so the report carries no SOCKS wall-write line."""
+    return build(rows, _read_events(events_path), duplicate_rows)
+
+
+def build_from_stop(rows: Sequence[EgressRow], events_path, duplicate_rows: int, stop: StopResult) -> LaunchReport:
+    """`build_from_files` for a report built after a stop. The one place the SOCKS wall-write count enters a report is the
+    launch's StopResult, so it is required here."""
+    return build(rows, _read_events(events_path), duplicate_rows, stop.socks_wall_failures, stop.socks_count_exact)
