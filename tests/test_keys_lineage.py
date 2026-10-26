@@ -374,15 +374,16 @@ def test_the_one_metadata_reader():
     # OpenRouter's chat completion: its model, the provider that served it, and its reported cost (credits, USD)
     r = body("openai-chat", {"model": "z-ai/glm-5.2", "provider": "Z.AI",
                              "usage": {"prompt_tokens": 3, "completion_tokens": 4, "cost": 0.000123}})
-    assert r.metadata() == codec.Metadata("z-ai/glm-5.2", "Z.AI", 123)
-    assert r.result() is not None and r.metadata() == codec.Metadata("z-ai/glm-5.2", "Z.AI", 123)
+    glm = codec.Metadata("z-ai/glm-5.2", "Z.AI", 123, models=("z-ai/glm-5.2",))
+    assert r.metadata() == glm
+    assert r.result() is not None and r.metadata() == glm
     # a stream: every chunk names the model, the final one carries the cost (rounded up to a microdollar)
     r = sse("openai-chat", {"model": "m-1", "provider": "P"}, {"model": "m-1", "usage": {
         "prompt_tokens": 1, "completion_tokens": 1, "cost": 1.0000001}})
-    assert r.metadata() == codec.Metadata("m-1", "P", 1000001)
+    assert r.metadata() == codec.Metadata("m-1", "P", 1000001, models=("m-1",))
     # Anthropic names its model in `message_start.message` (a body at its top level), no provider, no cost
     r = sse("anthropic-messages", {"type": "message_start", "message": {"model": "claude-x", "usage": {}}})
-    assert r.metadata() == codec.Metadata("claude-x", None, None)
+    assert r.metadata() == codec.Metadata("claude-x", None, None, models=("claude-x",))
     assert body("anthropic-messages", {"model": "claude-y", "usage": {}}).metadata().model == "claude-y"
     # Responses: the Response object, in the events as `response`
     r = sse("openai-responses", {"type": "response.created", "response": {"model": "gpt-x"}})

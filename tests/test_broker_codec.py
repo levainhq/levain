@@ -133,7 +133,47 @@ REFUSALS = [
 
 
 def test_a_models_list_of_exactly_the_model_is_admitted():
-    assert isinstance(_go("openai-chat", '{"model":"m1","models":["m1"],"messages":[]}', EO, dispatch=True), tuple)
+    # admitted as the same body without it is (L3 r1 deepseek LOW 5: a refusal is a str, so compare the answer)
+    got = _go("openai-chat", '{"model":"m1","models":["m1"],"messages":[]}', EO, dispatch=True)
+    plain = _go("openai-chat", '{"model":"m1","messages":[]}', EO, dispatch=True)
+    assert type(got) is tuple and got[1] == plain[1] == () and got[0] > plain[0], got   # its bytes are estimated too
+    assert json.loads(got[2]) == dict(json.loads(plain[2]), models=["m1"])
+
+
+def test_every_model_a_response_states_is_kept():
+    """L3 r1 Q4 (codex HIGH, complement LOW 4): a stream that names another model in one chunk and the checked one in a
+    later chunk ran another model; the checked model and its dated variants alone are not "other"."""
+    def sse(*models):
+        r = codec.CODECS["openai-chat"].usage(b"text/event-stream")
+        for m in models:
+            r.feed(b"data: " + json.dumps({"model": m}).encode() + b"\n\n")
+        return r.metadata()
+    assert codec.answered_other(sse("m2", "m1"), "m1") and codec.answered_other(sse("m1", "m2"), "m1")
+    assert not codec.answered_other(sse("m1", "m1-20251001", "m1"), "m1")
+    assert sse("m2", "m1").models == ("m2", "m1")
+    # more distinct names than the reader keeps is a model it cannot read: fail closed
+    many = sse(*[f"m1-2025100{i}" for i in range(1, 10)])
+    assert many.model_unreadable and codec.answered_other(many, "m1")
+
+
+def test_a_stated_model_that_is_not_a_string_is_unreadable():
+    """L3 r1 Q3 (codex HIGH): `"model": null` (or a number) is a model stated outside the grammar, body and stream."""
+    for bad in (None, 5, 1.5, [], {}):
+        r = codec.CODECS["openai-chat"].usage(b"application/json")
+        r.feed(json.dumps({"model": bad, "usage": {"prompt_tokens": 1, "completion_tokens": 1}}).encode())
+        assert r.metadata().model_unreadable and codec.answered_other(r.metadata(), "m1"), bad
+        r = codec.CODECS["openai-chat"].usage(b"text/event-stream")
+        r.feed(b"data: " + json.dumps({"model": bad}).encode() + b"\n\n")
+        assert r.metadata().model_unreadable, bad
+    r = codec.CODECS["openai-chat"].usage(b"application/json")
+    r.feed(json.dumps({"usage": {"prompt_tokens": 1, "completion_tokens": 1}}).encode())
+    assert not r.metadata().model_unreadable and not codec.answered_other(r.metadata(), "m1")   # absent: not said
+
+
+def test_only_the_fallback_capable_codec_checks_the_answered_model():
+    """Head ruling (settle-check SCOPE, 1026+1): until 3c-10 measures what real providers put in `model`, the settle
+    checks it only on the codec whose route can fall back to another model (OpenRouter's openai-chat)."""
+    assert {n for n, c in codec.CODECS.items() if c.checks_answered_model} == {"openai-chat"}
 
 
 @pytest.mark.parametrize("row", REFUSALS, ids=[r[0] for r in REFUSALS])

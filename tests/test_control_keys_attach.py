@@ -561,7 +561,8 @@ def test_spend_overrun_recorded_session_not_revoked(py):
     assert out["q2"].get("refused") == "budget-overrun", out
     # R4 §4, the card row's data: the operator's STATUS of the stopped session carries its overrun
     (st,) = out["status"]["records"]
-    assert st["budget_overrun"] == {"microdollars": line["overrun"], "calls": 1, "unproven": False}, st
+    assert st["budget_overrun"] == {"microdollars": line["overrun"], "calls": 1, "unproven": False,
+                                    "model_mismatch": False}, st
 
 
 # ---- idempotency and the slow ack -----------------------------------------------------------------------------------
@@ -623,7 +624,7 @@ def test_admin_verbs_idempotent(py):
     assert out["overrun"] == [{"id": 7, "ok": True}] * 2 and len(out["overrun_recs"]) == 1, out
     # the card row's data counts the repeated SPEND-OVERRUN once, and marks it unproven; S1 has none
     cards = {r["session"]: r.get("budget_overrun") for r in out["status"]}
-    assert cards == {S1: None, S2: {"microdollars": 5, "calls": 1, "unproven": True}}, cards
+    assert cards == {S1: None, S2: {"microdollars": 5, "calls": 1, "unproven": True, "model_mismatch": False}}, cards
     zero = "sha256:" + "0" * 64
     assert out["sessions"] == [{"id": 7, "ok": True, "drop": [zero]}] * 2, out
     assert out["lost"] == [{"id": 7, "ok": True}] * 2 and out["lost_again"] == {"id": 7, "ok": True}, out
@@ -831,3 +832,54 @@ def test_serve_is_the_program_entry(tmp_path):
     assert seen == {"state": R.REVOKED, "mode": 0o660}, seen
     assert ans == {"id": 1, "ok": True, "attach": 1}, ans
     assert rc == [0] and not t.is_alive()
+
+
+# ---- L3 r1 Q5 / Q6: the card's aggregate -----------------------------------------------------------------------------
+
+def _bare_attached(tmp: Path, *sessions: str) -> tuple:
+    """A CONTROL over `tmp` with each of `sessions` ATTACHed (no keys behind it) and a stand-in attachment to report
+    on (SPEND-OVERRUN is answered only on the attachment CONTROL holds)."""
+    control = C.Control(C.StateStore(tmp), OP_UID, keys_uid=R3.KEYS_UID)
+    for s in sessions:
+        attach_only(control, s)
+    att = C.Conn(R3.KEYS_UID, attach_no=1)
+    control._attach = att
+    return control, att
+
+
+def _over(control, att, session: str, seq: int, overrun: int, **extra) -> dict:
+    return control.handle(att, {"v": 1, "op": "SPEND-OVERRUN", "id": 7, "session": session, "route": "r",
+                                "model": "m1", "ref": ["a" * 32, "b" * 32, seq], "overrun": overrun,
+                                "unproven": False, **extra})
+
+
+def _cards(control) -> dict:
+    return {r["session"]: r.get("budget_overrun")
+            for r in control.handle(C.Conn(OP_UID), {"v": 1, "op": "STATUS", "id": 3})["records"]}
+
+
+def test_a_model_mismatch_stop_is_recorded_at_zero_overrun(tmp_path):
+    control, att = _bare_attached(tmp_path, S1, S2)
+    assert _over(control, att, S1, 1, 0, reason="model-mismatch") == {"id": 7, "ok": True}
+    assert _over(control, att, S2, 2, 0) == {"id": 7, "ok": False, "refused": "bad-value"}   # no reason: 0 refused
+    assert _over(control, att, S2, 3, 5, reason="other")["refused"] == "bad-value"
+    assert _over(control, att, S2, 4, 5) == {"id": 7, "ok": True}
+    assert _cards(control) == {S1: {"microdollars": 0, "calls": 1, "unproven": False, "model_mismatch": True},
+                               S2: {"microdollars": 5, "calls": 1, "unproven": False, "model_mismatch": False}}
+
+
+def test_the_card_outlives_the_diagnostic_records_bound_and_counts_a_ref_once(tmp_path, monkeypatch):
+    # codex MED: the card's sums are the session's own, not read back from the bounded diagnostic records, so a
+    # session's card survives later sessions' overruns past the bound, and a ref sent again after its diagnostic
+    # record was forgotten is not counted twice.
+    monkeypatch.setattr(C, "SPEND_OVERRUNS_MAX", 2)
+    control, att = _bare_attached(tmp_path, S1, S2)
+    assert _over(control, att, S1, 1, 7)["ok"]
+    for seq in range(2, 6):
+        assert _over(control, att, S2, seq, 1)["ok"]
+    assert len(control.spend_overruns()) == 2 and control.spend_overruns(S1) == []       # the diagnostic bound held
+    seven = {"microdollars": 7, "calls": 1, "unproven": False, "model_mismatch": False}
+    assert _cards(control)[S1] == seven                                                 # the card did not
+    assert _over(control, att, S1, 1, 7)["ok"]                                          # the same ref, again
+    assert _cards(control) == {S1: {"microdollars": 7, "calls": 1, "unproven": False, "model_mismatch": False},
+                               S2: {"microdollars": 4, "calls": 4, "unproven": False, "model_mismatch": False}}

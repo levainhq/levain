@@ -2339,12 +2339,14 @@ class Keys:
                 return   # the front aborted, or the exchange was cut short: `_serve_q`'s `end()` resolves the hold
             assert reader is not None   # a completed relay made one
             self._settle(conn.reg, meter[1], hold, reader, route=pol.route, model=meter[3], unproven=meter[4],
-                         status=rec["status"] if type(rec["status"]) is int else 0)
+                         status=rec["status"] if type(rec["status"]) is int else 0,
+                         checks_model=meter[0].checks_answered_model)
         finally:
             rec["redactions"] = scanner.count
 
     def _settle(self, reg: Registration, price: Price, hold: ledger.Hold, reader: codec.UsageReader, *,
-                route: str = "", model: str = "", unproven: bool = False, status: int = 0) -> None:
+                route: str = "", model: str = "", unproven: bool = False, status: int = 0,
+                checks_model: bool = False) -> None:
         """A completed relay's resolution (R4 §1.2, §1.4): its reported usage priced by class, settled in full (the
         ledger books what passes the hold as `overrun`); with none, `uncertain` charged its hold, the reason the
         reader's (`usage-over-cap` when a cap stopped it, else `no-usage`). A cost above the hold stops the session: it
@@ -2360,19 +2362,25 @@ class Keys:
         call's metadata and no counts, or `settled: "yes"` with its counts, its cost and, past the hold, `overrun`
         (H6-7). `status` is the upstream's (the relayed `R`).
 
-        3c-9 (R4 §5 CARRIED): a response that says another model ran than `model`, the checked one
-        (:func:`levain.broker.codec.answered_other`), is never priced at `model`'s row: it is charged its whole hold, or
-        the cost the response reports when that is more, and the session stops as for an overrun (with no usage it is
-        `uncertain` at its hold, as any call, and the session stops too). `SPEND-OVERRUN` goes only for a charge past
-        the hold (CONTROL refuses an overrun of 0)."""
+        3c-9 (R4 §5 CARRIED), on a codec that checks it (`checks_model`: the exchange's
+        :attr:`levain.broker.codec.Codec.checks_answered_model`, head ruling 1026+1): a response that says another model
+        ran than `model`, the checked one (:func:`levain.broker.codec.answered_other`), is never priced at `model`'s
+        row: it is charged its whole hold, or the cost the response reports when that is more, and the session stops as
+        for an overrun (with no usage it is `uncertain` at its hold, as any call, and the session stops too). Such a
+        stop is reported whatever its overrun, 0 included (L3 r1 Q5): `SPEND-OVERRUN` with `reason: "model-mismatch"`,
+        so CONTROL records it for the card; an overrun stop of the checked model's own usage is reported as before."""
         usage = reader.result()
         md = reader.metadata()
-        other = bool(model) and codec.answered_other(md, model)
+        other = checks_model and bool(model) and codec.answered_other(md, model)
         current = self.by_session.get(reg.session) is reg
         if usage is None:
             if other and current:
                 self.budget_stopped.add(reg.session)
-            hold.uncertain(reader.reason, self._row_meta(hold, "uncertain", reader, status))
+            try:
+                hold.uncertain(reader.reason, self._row_meta(hold, "uncertain", reader, status))
+            finally:
+                if other and current:
+                    self._report_stop(reg, hold, route, model, 0, unproven, other=True)
             return
         if other:
             cost = max(hold.amount, md.cost_reported or 0)
@@ -2380,15 +2388,24 @@ class Keys:
             cost = codec.price_usage(usage, price)
         if (other or cost > hold.amount) and current:
             self.budget_stopped.add(reg.session)
-        stopped = cost > hold.amount and current
         try:
             hold.settle(cost, dict(usage.meta(), **self._row_meta(hold, "yes", reader, status, usage, cost)))
         finally:
-            if stopped and self.attach:
-                ledger_id, epoch, seq = hold.ref
-                self._attach_send_task(self._spend_overrun({
-                    "session": reg.session, "route": route, "model": model, "ref": [ledger_id, epoch, seq],
-                    "overrun": cost - hold.amount, "unproven": unproven}))
+            if current and (other or cost > hold.amount):
+                self._report_stop(reg, hold, route, model, max(0, cost - hold.amount), unproven, other=other)
+
+    def _report_stop(self, reg: Registration, hold: ledger.Hold, route: str, model: str, overrun: int,
+                     unproven: bool, *, other: bool) -> None:
+        """`SPEND-OVERRUN` for a stop `_settle` made (R4 §1.4 step 2), on the attachment when there is one; an
+        other-model stop carries `reason: "model-mismatch"` (L3 r1 Q5)."""
+        if not self.attach:
+            return
+        ledger_id, epoch, seq = hold.ref
+        args = {"session": reg.session, "route": route, "model": model, "ref": [ledger_id, epoch, seq],
+                "overrun": overrun, "unproven": unproven}
+        if other:
+            args["reason"] = "model-mismatch"
+        self._attach_send_task(self._spend_overrun(args))
 
     @staticmethod
     def _row_meta(hold: ledger.Hold, settled: str, reader: Optional[codec.UsageReader], status: int,

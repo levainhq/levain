@@ -112,7 +112,9 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "TOKEN-RESOLVE": (frozenset({"token_digest"}),) * 2,
     "KEYS-ATTACH": (frozenset({"generation", "item_sha256"}),) * 2,
     "FRONT-LOST": (frozenset({"session"}),) * 2,
-    "SPEND-OVERRUN": (frozenset({"session", "route", "model", "ref", "overrun", "unproven"}),) * 2,
+    # L3 r1 Q5: `reason` ("model-mismatch") is optional; with it the overrun may be 0
+    "SPEND-OVERRUN": (frozenset({"session", "route", "model", "ref", "overrun", "unproven", "reason"}),
+                      frozenset({"session", "route", "model", "ref", "overrun", "unproven"})),
     "SESSIONS": (frozenset({"digests"}),) * 2,
     "LINEAGE-APPEND": (frozenset({"envelope"}),) * 2,     # S1 3c-6b (H6-2): CONTRACT §3.3 keys row
     "ROUTE-SUBMIT": (frozenset({"map", "sig"}),) * 2,
@@ -136,9 +138,17 @@ _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 _HEX32_RE = re.compile(r"[0-9a-f]{32}")
 #: a route id or a model name as SPEND-OVERRUN carries it (keys' own policy names; CONTROL records, never acts on them).
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}")
-#: DECISION: the SPEND-OVERRUN records CONTROL keeps for the card (R4 §4), oldest forgotten first. Memory only: a
-#: CONTROL restart loses them, as R4 §1.4 says (its restart is keys' attachment EOF, which refuses every token).
+#: DECISION: the SPEND-OVERRUN records CONTROL keeps as diagnostics (:meth:`Control.spend_overruns`), oldest
+#: forgotten first. Memory only: a CONTROL restart loses them, as R4 §1.4 says (its restart is keys' attachment EOF,
+#: which refuses every token). The card's sums are kept apart, per session (L3 r1 Q6: :attr:`Control._cards`).
 SPEND_OVERRUNS_MAX = 4096
+#: L3 r1 Q6, DECISION: the distinct SPEND-OVERRUN refs one session's card remembers (to count each once for the
+#: session's life); one more is refused ``out-of-range``, which ends keys' attachment (fail closed). keys stops a
+#: session at its first report, so its refs are its calls in flight then.
+SPEND_OVERRUN_REFS_MAX = 4096
+#: L3 r1 Q5: the one ``reason`` SPEND-OVERRUN may carry: keys stopped the session because a response said another
+#: model ran than the checked one (it may then be charged no more than its hold: overrun 0)
+SPEND_OVERRUN_REASONS = frozenset({"model-mismatch"})
 #: DECISION: the token digests one SESSIONS may carry; keys sends more as several (a test pins its chunk below this).
 SESSIONS_DIGESTS_MAX = 512
 
@@ -1042,8 +1052,12 @@ class Control:
         #: the (egress_free, none_free) of the last pool event, and the lock that orders a sync's count and append
         self._pool_last: tuple[int, int] | None = None
         self._pool_ev_mu = threading.Lock()
-        #: (session, ref) -> the SPEND-OVERRUN record, oldest first (R4 §1.4, §4: the card's data; never a revoke).
+        #: (session, ref) -> the SPEND-OVERRUN record, oldest first, bounded (diagnostics; never a revoke).
         self._overruns: collections.OrderedDict[tuple[str, tuple], dict[str, object]] = collections.OrderedDict()
+        #: L3 r1 Q6: session -> (its card ``{microdollars, calls, unproven, model_mismatch}``, the refs counted in it),
+        #: kept while the session has a record (pruned when a new session's first report arrives), never evicted by
+        #: the diagnostics' bound, so a ref is counted once for the session's life (R4 §4)
+        self._cards: dict[str, tuple[dict[str, object], set[tuple]]] = {}
         #: the sessions keys reported FRONT-LOST for, oldest first, bounded (doctor / tests).
         self.front_lost: collections.deque[str] = collections.deque(maxlen=SPEND_OVERRUNS_MAX)
 
@@ -1637,21 +1651,15 @@ class Control:
         so the list rides ``records``. Head ruling H8 (1024+8): a record's ``claims.ticket`` is left out (the ticket is
         a bearer handle that reaches no record a non-root reader opens, H1).
 
-        R4 §4, the card row's data: a record whose session keys stopped for an overrun (``SPEND-OVERRUN``) carries
-        ``budget_overrun`` = ``{microdollars, calls, unproven}``: the overruns' sum, how many settles overran, and
-        whether any of them was an unproven call. One fixed-size object per record whatever the count of overruns,
-        so it adds no list the answer's frame must hold; absent for a session with none. Memory only, like the
-        records it comes from (:meth:`spend_overruns`): a CONTROL restart forgets it."""
+        R4 §4, the card row's data: a record whose session keys stopped (``SPEND-OVERRUN``) carries ``budget_overrun``
+        = ``{microdollars, calls, unproven, model_mismatch}``: the overruns' sum, how many settles were reported (each
+        ref once), whether any was an unproven call, and whether any stop was for another model answering (L3 r1 Q5,
+        reported at overrun 0 too). One fixed-size object per record whatever the count of reports, so it adds no list
+        the answer's frame must hold; absent for a session with none. Kept per session for the record's life, apart
+        from the bounded diagnostic records (L3 r1 Q6). Memory only: a CONTROL restart forgets it."""
         want = R.check_session(args["session"]) if "session" in args else None
         with self._mu:
-            stopped: dict[str, dict[str, object]] = {}
-            for (s, _ref), o in self._overruns.items():
-                card = stopped.setdefault(s, {"microdollars": 0, "calls": 0, "unproven": False})
-                # held at the wire's integer bound: each overrun is in it (``_op_spend_overrun``), a sum may not be
-                card["microdollars"] = min(R.JSON_INT_MAX, int(card["microdollars"])         # type: ignore[call-overload]
-                                           + int(o["overrun"]))                              # type: ignore[call-overload]
-                card["calls"] = int(card["calls"]) + 1                               # type: ignore[call-overload]
-                card["unproven"] = bool(card["unproven"]) or bool(o["unproven"])
+            stopped = {s: dict(card) for s, (card, _refs) in self._cards.items()}
         recs = []
         for r in sorted(self.store.all(), key=lambda r: r.session):
             if r.claims.get("operator_uid") == conn.peer_uid and (want is None or r.session == want):
@@ -2630,20 +2638,47 @@ class Control:
             raise Refused("bad-value", "ref")
         R._uint(ref[2], "ref.seq")
         overrun = R._uint(args["overrun"], "overrun")
-        if overrun == 0:
+        reason = args.get("reason")
+        if reason is not None and (type(reason) is not str or reason not in SPEND_OVERRUN_REASONS):
+            raise Refused("bad-value", "reason")
+        if overrun == 0 and reason is None:
             raise Refused("bad-value", "overrun")
         unproven = args["unproven"]
         if type(unproven) is not bool:
             raise Refused("wrong-type", "unproven is a boolean")
         rec: dict[str, object] = {"session": session, "route": route, "model": model, "ref": list(ref),
                                   "overrun": overrun, "unproven": unproven}
-        key = (session, (ref[0], ref[1], ref[2]))
+        if reason is not None:
+            rec["reason"] = reason
+        ref_key = (ref[0], ref[1], ref[2])
+        key = (session, ref_key)
         with self._mu:
+            if session not in self._cards:
+                self._prune_cards_locked()
+                self._cards[session] = ({"microdollars": 0, "calls": 0, "unproven": False, "model_mismatch": False},
+                                        set())
+            card, counted = self._cards[session]
+            if ref_key not in counted:
+                if len(counted) >= SPEND_OVERRUN_REFS_MAX:
+                    raise Refused("out-of-range", f"over {SPEND_OVERRUN_REFS_MAX} overrun refs for {session}")
+                counted.add(ref_key)
+                # held at the wire's integer bound: each overrun is in it (``R._uint``), a sum may not be
+                card["microdollars"] = min(R.JSON_INT_MAX, int(card["microdollars"]) + overrun)  # type: ignore
+                card["calls"] = int(card["calls"]) + 1                                            # type: ignore
+                card["unproven"] = bool(card["unproven"]) or unproven
+                card["model_mismatch"] = bool(card["model_mismatch"]) or reason == "model-mismatch"
             if key not in self._overruns:
                 self._overruns[key] = rec
                 while len(self._overruns) > SPEND_OVERRUNS_MAX:
                     self._overruns.popitem(last=False)
         return {}
+
+    def _prune_cards_locked(self) -> None:
+        """L3 r1 Q6: the cards of sessions whose record is gone (caller holds ``_mu``): a card lives as long as its
+        session's record. Memory only (:meth:`StateStore.in_memory`: no disk read under the lock)."""
+        have = {r.session for r in self.store.in_memory() if r.state != R.PURGED}
+        for s in [s for s in self._cards if s not in have]:
+            del self._cards[s]
 
     def _op_sessions(self, conn: Conn, args: dict) -> dict[str, object]:
         """3c design r3 §2.1 (e), the reconcile: ``SESSIONS {digests}``, the token digests keys holds a cached resolve
