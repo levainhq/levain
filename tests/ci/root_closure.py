@@ -574,6 +574,7 @@ _CONFTEST_SIGNERS = ("tests/conftest.py", "def _test_uid_may_own_the_test_signer
 #: -> (reason, a string the test file holds, (a file, a string it holds)): both strings are the reason's evidence and a
 #: test checks them, and that every entry still exists and is still selected without this table, so none can rot. The
 #: job runs with ``--noconftest``, so a file that needs a conftest fixture cannot pass there.
+_B2_H11_FAIL = ("tests/b2_keys_rig.py", "h11 is not importable by %s under CI")
 NOT_ROOT_TESTS = {
     "tests/test_autonomic_gate_handle.py": ("needs conftest's test_only_confined_executor fixture",
                                             "test_only_confined_executor", _CONFTEST_EXECUTOR),
@@ -591,6 +592,10 @@ NOT_ROOT_TESTS = {
         "test_only_confined_executor", _CONFTEST_EXECUTOR),
     "tests/test_autonomic_graduation.py": ("needs conftest's test_only_confined_executor fixture",
         "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_broker_keys_process.py": ("its usr-bin-python3 param fails under CI unless /usr/bin/python3 has h11, "
+        "which only the Linux test job installs", "R.require_h11(request.param)", _B2_H11_FAIL),
+    "tests/test_control_keys_attach.py": ("its usr-bin-python3 param fails under CI unless /usr/bin/python3 has h11, "
+        "which only the Linux test job installs", "B2.require_h11(request.param)", _B2_H11_FAIL),
     "tests/test_autonomic_l3_fixes.py": ("its enrolled test key verifies only under conftest's autouse signers-owner "
                                          "fixture", "confirm_signers", _CONFTEST_SIGNERS),
     "tests/test_autonomic_l3_r2_fixes.py": ("its enrolled test key verifies only under conftest's autouse "
