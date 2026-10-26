@@ -510,3 +510,19 @@ def test_run_a_passkey_born_policy_covers_only_with_its_passkey_line(jv):
 @pytest.mark.parametrize("name", ["a", "ec", "rsa", "pk"])
 def test_the_blob_fingerprint_is_ssh_keygens(keys, name):
     assert IH.blob_fingerprint(keys[name][0]) == keys[name][1] == IH.key_fingerprint(keys[name][0])
+
+
+def test_the_confirm_gate_verifies_against_a_confirm_line_and_not_an_authority_only_one(L, tmp_path):
+    """``--confirm``'s line through the confirm gate's own verifier (``ssh-keygen -Y verify``); a passkey-style
+    authority-only line never verifies a ``levain-confirm`` signature."""
+    k = tmp_path / "k"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "c", "-f", str(k)], check=True)
+    pub = " ".join((tmp_path / "k.pub").read_text().split()[:2])
+    msg = b"levain-confirm challenge"
+    sig = subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", str(k), "-n", confirm.NAMESPACE], input=msg,
+                         capture_output=True, check=True).stdout.decode()
+    _act(L, _enrol_argv("phill", pub))
+    assert confirm.verify_signature(msg, signature=sig, signer="phill", allowed_signers=_path(L)) is False
+    _act(L, _enrol_argv("phill", pub, confirm_ns=True))
+    assert confirm.verify_signature(msg, signature=sig, signer="phill", allowed_signers=_path(L)) is True
+    assert confirm.verify_signature(msg, signature=sig, signer="other", allowed_signers=_path(L)) is False
