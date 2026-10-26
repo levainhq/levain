@@ -356,8 +356,17 @@ def test_no_effect_row_is_removed_and_the_delete_sweep_is_pinned(store):
         except sqlite3.IntegrityError:
             pass
     # bindings: V's BindingStore rewrites the registry by DELETE + INSERT; closing: close_subject_do deletes its own
-    # mark. fences, graduation_steps and env_health carry no guard
-    assert deletable == ["bindings", "closing", "env_health", "fences", "graduation_steps"]
+    # mark (O-a1c1-3: every other table refuses a delete)
+    assert deletable == ["bindings", "closing"]
+    for t, guard in (("fences", "a fence"), ("graduation_steps", "a graduation step"), ("env_health", "the health row")):
+        with pytest.raises(sqlite3.IntegrityError, match=f"O-a1c1-3: {guard} is never removed"):
+            tx(c, f"DELETE FROM {t}")
+    # a REPLACE over a fence reaches its delete (recursive_triggers is ON); the writers' upsert does not
+    with pytest.raises(sqlite3.IntegrityError, match="O-a1c1-3"):
+        tx(c, "INSERT OR REPLACE INTO fences (binding_id, generation) VALUES ('b', 2)")
+    tx(c, "INSERT INTO fences (binding_id, generation) VALUES ('b', 2) ON CONFLICT(binding_id) "
+          "DO UPDATE SET generation = MAX(generation, excluded.generation)")
+    assert s.health_probe(c, "t2")
     assert {r[0] for r in c.execute("SELECT key FROM meta")} == set(s.PROTECTED_META)
     c.close()
 

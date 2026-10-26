@@ -702,8 +702,16 @@ def check_sqlite(conn: sqlite3.Connection, minimum: tuple[int, int, int] = MIN_S
 
 
 # ---- O-74-4: no effect row is removed, an intent one included (effects_final_d leaves intent rows to this) --------
+# O-a1c1-3: no levain writer deletes a fence, a graduation step (an audit row) or the health row (fences and the
+# health row are written by upsert, ON CONFLICT DO UPDATE, which fires no delete), so none of them is removed either.
+# Left deletable: bindings (V BindingStore rewrites its registry by "DELETE FROM bindings") and closing
+# (close_subject_do deletes its own mark).
 DELETE_TRIGGERS = (
     _abort("effects_d", "1", "O-74-4: an effect row is never removed", "BEFORE DELETE ON effects"),
+    _abort("fences_d", "1", "O-a1c1-3: a fence is never removed", "BEFORE DELETE ON fences"),
+    _abort("graduation_steps_d", "1", "O-a1c1-3: a graduation step is never removed",
+           "BEFORE DELETE ON graduation_steps"),
+    _abort("env_health_d", "1", "O-a1c1-3: the health row is never removed", "BEFORE DELETE ON env_health"),
 )
 
 # ---- R13-7: the per-subject environment-fault bound ------------------------------------------------------------------
