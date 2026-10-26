@@ -8,7 +8,7 @@ non-zero exit, raised before the next act: nothing after the refusing check acts
 
 Verbs built here: ``prepare``, ``render``, ``resume``, ``status``, ``adopt-open``, ``adopt-verify``, ``discard`` and
 ``restore`` (session 5's);
-``start`` and ``teardown`` dispatch to :mod:`levain.slot.start`. Every other verb (derive: ``VERBS`` less
+``start`` and ``teardown`` dispatch to :mod:`levain.slot.start`, ``probe`` (V13) to :mod:`levain.slot.probe`. Every other verb (derive: ``VERBS`` less
 ``VERB_HANDLERS``) answers ``verb-unbuilt:<verb>``. A ticketed (``_levain_dispatch``) ``prepare`` takes its slot by
 §3.5 Pool's point-of-use rules and writes ``ATTACH``'s ``ticket_facts`` into alloc before it returns (S1 3c-7).
 
@@ -583,6 +583,8 @@ class Seams:
     #: (``AdoptRunSeams``, whose real ``launch`` for this verb is :func:`verify_launch_default`).
     verify: Optional["VerifySeams"] = None
     verify_run: Optional["AdoptRunSeams"] = None
+    #: probe's own seams (None = the real ones: ``probe.ProbeSeams``): resolver, CONTROL's connects, the group kill.
+    probe: Optional[object] = None
 
     @property
     def L(self) -> Path:
@@ -1853,6 +1855,12 @@ def _teardown(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     return SS.teardown(ctx, req, blob)
 
 
+def _probe(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    from levain.slot import probe as PB
+
+    return PB.probe(ctx, req, blob)
+
+
 # --- adopt-open steps 1-5 (S1 session 5 DESIGN §1, §2, §4.7, §4.10, §4.11) ------------------------------------------
 
 #: V7 (CONTRACT §11): the walker's caps, bytes (logical), entries, and the wall that also bounds the adopt-lock wait.
@@ -3026,7 +3034,7 @@ def restore(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
 VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, object]]] = {
     "prepare": prepare, "render": render, "resume": resume, "status": status,
     "start": _start, "teardown": _teardown, "adopt-open": adopt_open, "adopt-verify": adopt_verify,
-    "discard": discard, "restore": restore,
+    "discard": discard, "restore": restore, "probe": _probe,
 }
 
 

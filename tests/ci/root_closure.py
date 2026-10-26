@@ -171,6 +171,8 @@ LAZY_SITES = {
     'levain/slot/runtime_helper.py::read_operator_uid::from levain.slot.install_helper import parse_operator_record': 'root',
     'levain/slot/runtime_helper.py::_start::from levain.slot import start as SS': 'root',
     'levain/slot/runtime_helper.py::_teardown::from levain.slot import start as SS': 'root',
+    'levain/slot/runtime_helper.py::_probe::from levain.slot import probe as PB': 'root',
+    'levain/slot/probe.py::session_route::from levain.broker.policy import PolicyError, parse_base_map': 'root',
     'levain/slot/runtime_helper.py::adopt_walk_caps::from levain.slot import walker as WK': 'root',
     'levain/slot/runtime_helper.py::_manifest_depths::from levain.slot import walkframe as WF': 'root',
     'levain/slot/runtime_helper.py::adopt_step3_root_facts::from levain.slot import end as E': 'root',

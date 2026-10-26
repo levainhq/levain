@@ -367,3 +367,491 @@ def test_n8_probe_address():
     for bad in ("127.0.0.1", "0.0.0.0", "::", "::1", "169.254.1.1", "fe80::1", "fe80::1%en0", "224.0.0.1",
                 "ff02::1", "::ffff:127.0.0.1", "api.anthropic.com", "", "1.2.3"):
         assert PC.probe_address(bad) is None, bad
+
+
+# --- T2 refusal names (R6) -------------------------------------------------------------------------------------------
+
+NAMES = ("firewall-open", "firewall-probe-inconclusive:dns", "firewall-probe-inconclusive:no-control-connect",
+         "firewall-probe-inconclusive:too-many", "firewall-probe-unknown:child", "firewall-probe-unknown:unreaped",
+         "not-probeable:RENDERING", "not-probeable:BRAKED", "not-probeable:CREDENTIAL_PARKED".replace("_", "-"),
+         "not-probeable:unrecorded", "not-probeable:class", "not-probeable:kind", "not-probeable:route",
+         "not-probeable:alloc-changed", "slot-not-ours", "session-busy")
+
+
+def test_t2_every_name_parses_and_no_address_ever_does():
+    from levain.slot import records as R
+
+    for n in NAMES:
+        assert rg._NAME_RE.fullmatch(n) and len(n) <= 64, n
+    for state in R.STATES:     # not-probeable:<state> carries the state's own name, "_" spelled "-"
+        assert rg._NAME_RE.fullmatch(f"not-probeable:{state.replace('_', '-')}"), state
+    # the reason for the spelling: the raw CREDENTIAL_PARKED would leave stdout as `internal`
+    assert '"internal"' in rg.refusal_line(Refused("not-probeable:CREDENTIAL_PARKED"))
+    assert rg.refusal_line(Refused("firewall-open:2001:db8::1")) == '{"ok":false,"refused":"internal"}\n'
+    assert rg.refusal_line(Refused("firewall-open", "api.anthropic.com 2001:db8::1")) == \
+        '{"ok":false,"refused":"firewall-open"}\n'
+
+
+# --- T3 hosts (R4 + O3) ------------------------------------------------------------------------------------------------
+
+def test_t3_probe_hosts_ordered_tuples_within_vendor_hosts_and_shipped_upstreams():
+    from levain.slot import probe as PB
+    from levain.slot import supervisor as SV
+    from levain.slot import vendor_routes as VR
+
+    upstreams = {r["upstream"]["host"] for r in VR.vendor_routes() if "upstream" in r}
+    assert upstreams, "no shipped upstream read"
+    for vendor, hosts in PB.PROBE_HOSTS.items():
+        assert type(hosts) is tuple and len(set(hosts)) == len(hosts)
+        assert set(hosts) <= SV.VENDOR_HOSTS[vendor] | upstreams, vendor
+    assert set(PB.PROBE_HOSTS) == set(SV.VENDOR_HOSTS)
+    for r in VR.vendor_routes():          # every shipped route's upstream IS probed for each vendor it serves
+        for vendor in [v for v in SV.VENDOR_HOSTS if SV._hosts(r) & SV.VENDOR_HOSTS[v]]:
+            assert r["upstream"]["host"] in PB.PROBE_HOSTS[vendor], (r["route"], vendor)
+
+
+def _all_imports(path: Path) -> set:
+    return _imports(path)      # ast.walk reaches function bodies too: a lazy import counts
+
+
+def test_t3_probe_modules_never_import_the_supervisor_or_launch():
+    for name in ("probe.py", "probe_child.py"):
+        names = _all_imports(REPO / "levain" / "slot" / name)
+        assert not {n for n in names if n in ("levain.slot.supervisor", "levain.launch")
+                    or n.startswith("levain.launch.")}, name
+        assert "levain.slot" not in names or name != "probe_child.py"
+
+
+# --- T4 host order -----------------------------------------------------------------------------------------------------
+
+def test_t4_order_upstream_then_route_hosts_then_api_host():
+    from levain.slot.probe import probe_hosts
+
+    assert probe_hosts("claude", "api.anthropic.com", ["api.anthropic.com"]) == ("api.anthropic.com",)
+    assert probe_hosts("claude", "platform.claude.com", ["claude.ai", "evil.example", "claude.ai"]) == \
+        ("platform.claude.com", "claude.ai", "api.anthropic.com")
+    assert probe_hosts("claude", None, ["claude.ai"]) == ("claude.ai", "api.anthropic.com")
+    assert probe_hosts("codex", "proxy.example", ["chatgpt.com", "auth.openai.com"]) == \
+        ("chatgpt.com", "auth.openai.com", "api.openai.com")
+
+
+def test_t4_same_order_under_two_hash_seeds():
+    import os
+    import subprocess
+    import sys
+
+    code = ("from levain.slot.probe import probe_hosts, PROBE_HOSTS;"
+            "print([probe_hosts(v, None, list(reversed(h))) for v, h in sorted(PROBE_HOSTS.items())])")
+    outs = set()
+    for seed in ("0", "1"):
+        env = dict(os.environ, PYTHONHASHSEED=seed, PYTHONPATH=str(REPO))
+        outs.add(subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                                check=True, cwd=str(REPO)).stdout)
+    assert len(outs) == 1
+
+
+# --- T5 the verdict and the child's result -----------------------------------------------------------------------------
+
+A = [("api.anthropic.com", "192.0.2.10"), ("api.anthropic.com", "2001:db8::10")]
+
+
+def test_t5_verdict_branches():
+    from levain.slot.probe import verdict
+
+    yes = {"192.0.2.10": True, "2001:db8::10": True}
+    no = {"192.0.2.10": False, "2001:db8::10": False}
+    assert _refused(verdict, [], {}, {}, {}) == "firewall-probe-inconclusive:dns"
+    with pytest.raises(Refused) as e:
+        verdict(A, yes, {"192.0.2.10": "b", "2001:db8::10": "c"}, yes)
+    assert e.value.name == "firewall-open" and e.value.detail == "api.anthropic.com 2001:db8::10"
+    assert _refused(verdict, A, no, {"192.0.2.10": "c", "2001:db8::10": "b"}, no) == "firewall-open"
+    assert verdict(A, {"192.0.2.10": False, "2001:db8::10": True}, {"192.0.2.10": "b", "2001:db8::10": "b"}, yes) \
+        == {"probe": "closed", "address": "2001:db8::10", "host": "api.anthropic.com", "addresses": 2}
+    assert _refused(verdict, A, no, {"192.0.2.10": "b", "2001:db8::10": "b"}, no) == \
+        "firewall-probe-inconclusive:no-control-connect"
+    # codex MED: connected before, lost after, slot blocked = not evidence
+    assert _refused(verdict, A, yes, {"192.0.2.10": "b", "2001:db8::10": "b"}, no) == \
+        "firewall-probe-inconclusive:no-control-connect"
+    assert _refused(verdict, A, no, {"192.0.2.10": "b", "2001:db8::10": "b"}, yes) == \
+        "firewall-probe-inconclusive:no-control-connect"
+
+
+@pytest.mark.parametrize("raw", [b"", b"c 192.0.2.10\n", b"c 192.0.2.10\nend\n",
+                                 b"b 192.0.2.10 timeout\nb 2001:db8::10 ENOBUFS\nend\n",
+                                 b"b 192.0.2.10 timeout\nu 2001:db8::10 EINVAL\nend\n",
+                                 b"b 192.0.2.10 timeout\nb 192.0.2.10 timeout\nend\n",
+                                 b"b 192.0.2.10 timeout\nb 192.0.2.99 timeout\nend\n",
+                                 b"b 192.0.2.10 timeout\nc 2001:db8::10\nend\nmore\n",
+                                 b"b 192.0.2.10  timeout\nc 2001:db8::10\nend\n",
+                                 b"\xff\nend\n", b"!", b"c 192.0.2.10\nc 2001:db8::10\n" + b"x" * 5000 + b"\nend\n"])
+def test_t5_unreadable_child_is_unknown_never_closed_or_open(raw):
+    from levain.slot.probe import parse_result
+
+    assert _refused(parse_result, raw, ["192.0.2.10", "2001:db8::10"]) == "firewall-probe-unknown:child"
+
+
+def test_t5_readable_child():
+    from levain.slot.probe import parse_result
+
+    assert parse_result(b"b 192.0.2.10 EPERM\nc 2001:db8::10\nend\n", ["192.0.2.10", "2001:db8::10"]) == \
+        {"192.0.2.10": "b", "2001:db8::10": "c"}
+
+
+def test_n6_the_whole_hold_is_under_ends_lock_wait():
+    from levain.slot import end as E
+    from levain.slot import proc as PR
+    from levain.slot import probe as PB
+
+    assert PC.CONNECT_S < PC.PROBE_SELF_S < PB.PROBE_REAP_S
+    assert PB.PROBE_REAP_S + PR.REAP_GRACE_S < E.END_LOCK_WAIT_S
+
+
+# --- T6 the fence (R3, N6, N7, codex MED reap) on the start harness: a real store, the real CONTROL ---------------------
+
+IP4, IP6 = "192.0.2.10", "2001:db8::10"
+
+
+def _base_v2():
+    from levain.slot import vendor_routes as VR
+
+    return {"format": "levain-routes-base/2", "routes": [
+        VR.anthropic_route(), {"route": "github", "type": "egress", "hosts": ["github.com"]},
+        {"route": "claude-sub", "type": "subscription_passthrough", "hosts": ["claude.ai"]}]}
+
+
+class Probe:
+    """The probe's seams: a resolver, CONTROL's two rounds and a probe child that writes a scripted result on its
+    result pipe. ``held`` records whether the session END lock was held at the spawn (a try of it was refused)."""
+
+    def __init__(self, w, la):
+        self.w, self.la = w, la
+        self.answers = {"api.anthropic.com": [IP4, IP6]}
+        self.before = {IP4: True, IP6: True}
+        self.after = {IP4: True, IP6: True}
+        self.rounds = 0
+        self.result = None           # None = every address blocked by timeout
+        self.status = 0
+        self.hold_open = False       # keep a copy of the write end: no EOF ever arrives
+        self.spawns, self.killpgs, self.kills, self.waits, self.held = [], [], [], [], []
+        self.kept = []
+        self.next_pid = 72000
+
+    def getaddrinfo(self, host, port, type=0):
+        assert port == 443 and type == socket.SOCK_STREAM
+        if host not in self.answers:
+            raise socket.gaierror(socket.EAI_NONAME, "no")
+        return [(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                 (ip, 443, 0, 0) if ":" in ip else (ip, 443)) for ip in self.answers[host]]
+
+    def connect(self, ips):
+        self.rounds += 1
+        table = self.before if self.rounds == 1 else self.after
+        return {ip: (PC.CONNECTED, "") if table.get(ip) else (PC.BLOCKED, "timeout") for ip in ips}
+
+    def spawn(self, argv, spec_json, cgroup, exec_w, detach):
+        from levain.contracts import canon
+        from levain.slot import runtime_helper as H
+
+        spec = canon.parse(spec_json)
+        if spec["target"] != "probe":
+            return self.la.spawn(argv, spec_json, cgroup, exec_w, detach)
+        try:
+            ctx = H.Ctx(self.w.seams, H.Store(self.w.seams), 0, "operator", 0, {})
+            with H.session_lock(ctx, self.w.session):
+                self.held.append(False)
+        except Refused as e:
+            self.held.append(e.name == "session-busy")
+        pid = self.next_pid
+        self.next_pid += 1
+        self.spawns.append({"pid": pid, "argv": tuple(argv), "spec": spec, "cgroup": cgroup, "detach": detach,
+                            "exec_w": exec_w})
+        ips = spec["argv"][7:]
+        data = self.result if self.result is not None else \
+            "".join(f"b {ip} timeout\n" for ip in ips).encode() + b"end\n"
+        os.write(exec_w, data[:65536])
+        if self.hold_open:
+            self.kept.append(os.dup(exec_w))
+        return pid
+
+    def wait_within(self, pid, bound):
+        if pid not in {s["pid"] for s in self.spawns}:
+            return self.la.wait_within(pid, bound)
+        self.waits.append(pid)
+        return self.status
+
+    def kill(self, pid):
+        if pid in {s["pid"] for s in self.spawns}:
+            self.kills.append(pid)
+        else:
+            self.la.kill(pid)
+
+    def close(self):
+        for fd in self.kept:
+            os.close(fd)
+
+
+import os  # noqa: E402  (the harness section's own imports)
+
+
+@pytest.fixture
+def penv(tmp_path):
+    from levain.contracts import canon
+    from levain.slot import probe as PB
+    from tests.test_slot_s2f3_start import _world
+
+    w, la, table = _world(tmp_path)
+    pr = Probe(w, la)
+    s = w.seams
+    s.spawn, s.wait_within, s.kill = pr.spawn, pr.wait_within, pr.kill
+    s.probe = PB.ProbeSeams(getaddrinfo=pr.getaddrinfo, connect=pr.connect,
+                            killpg=lambda pid, sig: pr.killpgs.append((pid, sig)), resolve_s=2.0, reap_s=2.0)
+    (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(_base_v2()))
+    yield w, la, table, pr
+    pr.close()
+
+
+def _rendered_probe(w):
+    from levain.contracts import canon
+    from tests.test_slot_s2f3_start import _rendered
+
+    base = (w.L / "routes" / "base.json").read_bytes()
+    (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(
+        {"format": "levain-routes-base/1", "routes": [{"route": r["route"], "type": r["type"]}
+                                                      for r in _base_v2()["routes"]]}))
+    s = _rendered(w)          # render reads route types only; the probe reads the full /2 map
+    (w.L / "routes" / "base.json").write_bytes(base)
+    return s
+
+
+def _record(w, slot="e0"):
+    from levain.contracts import canon
+
+    p = w.L / "slots" / slot / "probe"
+    return canon.parse(p.read_bytes()) if p.exists() else None
+
+
+PROBE_STEPS = ["probe-read", "probe-resolve", "probe-control", "probe-lock", "probe-spawn", "probe-reaped",
+               "probe-release", "probe-control-after"]
+
+
+def test_t6_rendered_probe_closed_in_order_spawned_under_the_lock(penv, monkeypatch):
+    from levain.slot import proc as PR
+    from levain.slot import start as SS
+
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    for name in ("_kill_quiet", "_abandon", "kill_domain"):      # the probe never touches the slot's domain
+        monkeypatch.setattr(SS, name, lambda *a, **k: pytest.fail("domain kill"))
+    monkeypatch.setattr(PR, "end_domain", lambda *a, **k: pytest.fail("end_domain"))
+    w.steps.clear()
+    code, line = w.main(["probe", s])
+    assert line == {"ok": True, "probe": "closed", "address": IP4, "host": "api.anthropic.com", "addresses": 2}
+    assert [x for x in w.steps if x.startswith("probe-")] == PROBE_STEPS
+    assert pr.held == [True] and len(pr.spawns) == 1 and pr.waits == [pr.spawns[0]["pid"]]
+    sp = pr.spawns[0]
+    assert sp["detach"] is True and sp["spec"]["target"] == "probe" and sp["spec"]["argv"][7:] == [IP4, IP6]
+    assert sp["cgroup"] == w.alloc(s).cgroup and w.cgroups[-1] == w.alloc(s).cgroup
+    import signal
+    # the group is killed on every path (nothing it forked outlives the lock); the reaped child is not re-killed
+    assert pr.rounds == 2 and pr.killpgs == [(sp["pid"], signal.SIGKILL)] and pr.kills == []
+    rec = _record(w)
+    assert (rec["format"], rec["session"], rec["outcome"], rec["cause"]) == \
+        ("levain-probe-result/1", s, "closed", "closed")
+    assert (w.L / "slots" / "e0" / "probe").stat().st_mode & 0o777 == 0o644
+
+
+def test_t6_active_session_is_probeable(penv):
+    from tests.test_slot_s2f3_start import _started
+
+    w, la, table, pr = penv
+    from levain.contracts import canon
+    v1 = canon.canonical_bytes({"format": "levain-routes-base/1", "routes": [
+        {"route": r["route"], "type": r["type"]} for r in _base_v2()["routes"]]})
+    (w.L / "routes" / "base.json").write_bytes(v1)
+    s = _started(w, la, table)
+    (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(_base_v2()))
+    assert w.state(s).state == "ACTIVE"
+    assert w.main(["probe", s])[1]["probe"] == "closed"
+
+
+def test_t6_lock_held_is_session_busy_nothing_spawned(penv):
+    from levain.slot import runtime_helper as H
+
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    ctx = H.Ctx(w.seams, H.Store(w.seams), 0, "operator", 0, {})
+    with H.session_lock(ctx, s):
+        assert w.main(["probe", s])[1]["refused"] == "session-busy"
+    assert pr.spawns == [] and _record(w) is None
+
+
+def test_t6_alloc_changed_under_the_lock(penv):
+    from dataclasses import replace
+
+    from levain.slot import records as R
+
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+
+    def change(step):
+        if step == "probe-lock":
+            a = w.alloc(s)
+            (w.L / "alloc" / f"{s}.json").write_bytes(R.alloc_bytes(replace(a, slot_rev=a.slot_rev + 1)))
+    w.on_step = change
+    assert w.main(["probe", s])[1]["refused"] == "not-probeable:alloc-changed"
+    assert pr.spawns == [] and _record(w) is None
+
+
+def test_t6_slot_moved_under_the_lock(penv):
+    from tests.test_slot_s2f2_runtime_helper import _slot_state
+    from levain.slot.ids import SlotId
+
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+
+    def move(step):
+        if step == "probe-lock":
+            (w.L / "slots" / "e0" / "state").write_bytes(_slot_state(SlotId("egress", 0), "leased", rev=9, seq=9,
+                                                                      session="s-fedcba9876543210"))
+    w.on_step = move
+    assert w.main(["probe", s])[1]["refused"] == "slot-not-ours"
+    assert pr.spawns == []
+
+
+def test_t6_end_between_the_unlocked_read_and_the_spawn_never_spawns(penv):
+    """F7: END runs after the probe's unlocked read (here: while CONTROL runs); the probe then takes the lock, sees
+    what END changed, and refuses with nothing spawned into a slot END has proven empty."""
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    ended = []
+
+    def end_now(step):
+        if step == "probe-control" and not ended:
+            ended.append(w.main(["teardown", s])[1])
+    w.on_step = end_now
+    line = w.main(["probe", s])[1]
+    assert ended == [{"ok": True, "state": "RETAINED"}]
+    assert line == {"ok": False, "refused": "not-probeable:RETAINED"}
+    assert pr.spawns == []
+
+
+def test_t6_not_probeable_before_render(penv):
+    from tests.test_slot_s2f2_runtime_helper import _prepared
+
+    w, la, table, pr = penv
+    s = _prepared(w)
+    w.session = s
+    assert w.main(["probe", s])[1]["refused"] == "not-probeable:ALLOCATED"
+    assert pr.rounds == 0 and _record(w) is None
+
+
+def test_t6_firewall_open_names_host_and_address_on_stderr_only(penv):
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    pr.result = f"b {IP4} ECONNREFUSED\nc {IP6}\nend\n".encode()
+    code, line = w.main(["probe", s])
+    assert line == {"ok": False, "refused": "firewall-open"}
+    assert "api.anthropic.com 2001:db8::10" in w.last_err
+    assert _record(w)["outcome"] == "open" and len(pr.killpgs) == 1 and pr.kills == []
+
+
+def test_t6_no_eof_kills_the_group_then_reaps_before_release(penv):
+    import signal
+
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    pr.hold_open = True
+    w.seams.probe.reap_s = 0.3
+    order = []
+    w.on_step = lambda step: order.append((step, list(pr.kills)))
+    assert w.main(["probe", s])[1]["refused"] == "firewall-probe-unknown:unreaped"
+    pid = pr.spawns[0]["pid"]
+    assert pr.killpgs == [(pid, signal.SIGKILL)] and pr.kills == [pid] and pr.waits == []
+    assert ("probe-release", [pid]) in order                     # killed and reaped BEFORE the lock was released
+    assert _record(w)["outcome"] == "unknown"
+
+
+@pytest.mark.parametrize("result,status", [(b"garbage\n", 0), (None, 3), (b"x" * 5000, 0)])
+def test_t6_bad_result_is_unknown_and_leaves_no_group(penv, result, status):
+    import signal
+
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    pr.result, pr.status = result, status
+    assert w.main(["probe", s])[1]["refused"] == "firewall-probe-unknown:child"
+    pid = pr.spawns[0]["pid"]
+    assert (pid, signal.SIGKILL) in pr.killpgs
+    assert pr.waits == [pid] or pr.kills == [pid]                # reaped by its wait, or killed and reaped
+
+
+def test_t6_fork_failure_is_one_unknown(penv):
+    import errno as E
+
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+
+    def fail(argv, spec_json, cgroup, exec_w, detach):
+        raise OSError(E.EAGAIN, "fork")
+    w.seams.spawn = fail
+    assert w.main(["probe", s])[1]["refused"] == "firewall-probe-unknown:child"
+    assert pr.killpgs == [] and _record(w)["outcome"] == "unknown"
+
+
+def test_t6_dns_and_control_inconclusives_are_recorded(penv):
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    pr.answers = {}
+    assert w.main(["probe", s])[1]["refused"] == "firewall-probe-inconclusive:dns"
+    assert pr.rounds == 0 and pr.spawns == [] and _record(w)["outcome"] == "inconclusive"
+    pr.answers = {"api.anthropic.com": [IP4]}
+    pr.after = {}
+    assert w.main(["probe", s])[1]["refused"] == "firewall-probe-inconclusive:no-control-connect"
+    assert _record(w)["cause"] == "firewall-probe-inconclusive:no-control-connect"
+
+
+def test_n1_a_hung_resolver_is_dns_inside_the_bound(penv):
+    import threading
+    import time
+
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    gate = threading.Event()
+    w.seams.probe.getaddrinfo = lambda *a, **k: gate.wait(30) and []
+    w.seams.probe.resolve_s = 0.2
+    t0 = time.monotonic()
+    try:
+        assert w.main(["probe", s])[1]["refused"] == "firewall-probe-inconclusive:dns"
+    finally:
+        gate.set()
+    assert time.monotonic() - t0 < 5
+
+
+def test_n8_resolver_answers_filtered(penv):
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    pr.answers = {"api.anthropic.com": ["127.0.0.1", "0.0.0.0", "fe80::1", IP4, IP4, "224.0.0.1"]}
+    assert w.main(["probe", s])[1]["addresses"] == 1
+    assert pr.spawns[0]["spec"]["argv"][7:] == [IP4]
+    pr.answers = {"api.anthropic.com": ["127.0.0.1"]}
+    assert w.main(["probe", s])[1]["refused"] == "firewall-probe-inconclusive:dns"
+    assert "127.0.0.1" in w.last_err
+
+
+def test_too_many_addresses(penv):
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    pr.answers = {"api.anthropic.com": [f"198.51.100.{i}" for i in range(1, 66)]}
+    assert w.main(["probe", s])[1]["refused"] == "firewall-probe-inconclusive:too-many"
+    assert pr.spawns == []
+
+
+def test_route_missing_from_the_base_map(penv):
+    from levain.contracts import canon
+
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    base = _base_v2()
+    base["routes"] = [r for r in base["routes"] if r["route"] != "anthropic"]
+    (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(base))
+    assert w.main(["probe", s])[1]["refused"] == "not-probeable:route"
+    assert _record(w) is None
