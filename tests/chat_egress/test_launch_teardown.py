@@ -147,7 +147,7 @@ def test_stop_whose_glue_wait_times_out_still_closes_the_decider_and_socks(tmp_p
     print(f"RUN S8C stop + wait timeout: {out}")
     assert out.glue_exit is None and out.final_flush is None
     assert out.socks_clean and _egress_threads() == [] and dm.service_threads() == []
-    assert out.order == ("lifeline", "glue", "decider", "socks")
+    assert out.order == ("socks", "lifeline", "glue", "decider")
     assert [f.split(":")[0] for f in out.failures] == ["glue"]
 
 
@@ -165,6 +165,44 @@ def test_stop_whose_decider_close_raises_still_closes_socks(tmp_path, origin, mo
     assert out.glue_exit == 0 and out.socks_clean and not out.decider_clean
     assert _egress_threads() == [] and dm.service_threads() == []
     assert [f.split(":")[0] for f in out.failures] == ["decider"]
+
+
+def _read_exact(c, n: int, within_s: float = 5.0) -> bytes:
+    """Exactly `n` bytes (a TCP read may return fewer), bounded by one deadline; fewer at EOF."""
+    import time
+    deadline = time.monotonic() + within_s
+    buf = b""
+    while len(buf) < n:
+        left = deadline - time.monotonic()
+        assert left > 0, f"read {len(buf)} of {n} bytes inside {within_s}s"
+        c.settimeout(left)
+        chunk = c.recv(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+@pytest.mark.chat_egress_srt
+def test_a_socks_refusal_landing_during_stop_is_counted_in_the_final_flush(tmp_path, origin, monkeypatch) -> None:
+    import socket
+    import time
+    e = _start(tmp_path, origin, monkeypatch)
+    real_close = e.socks.close
+
+    def close(*a, **k):
+        c = socket.create_connection(("127.0.0.1", e.socks_port), timeout=5)
+        try:
+            c.sendall(b"\x05\x01\x00")
+            assert _read_exact(c, 2) == b"\x05\x00"    # the refusal was reported before this answer
+        finally:
+            c.close()
+        return real_close(*a, **k)
+    monkeypatch.setattr(e.socks, "close", close)
+    out = lm.stop_egress(e)
+    print(f"RUN S1 refusal during stop: {out.final_flush}")
+    assert out.glue_exit == 0 and out.final_flush is not None
+    assert out.final_flush["total"] == 1 and out.final_flush["by_reason"] == {"socks": 1}
 
 
 # --- S8D r1 DS item 4: an OSError closing the glue's stderr file never leaves the glue unowned ---------------------
@@ -225,3 +263,26 @@ def test_a_second_stop_after_a_glue_wait_timeout_finishes_the_stop(tmp_path, ori
     assert first.glue_exit is None and [f.split(":")[0] for f in first.failures] == ["glue"]
     assert second.glue_exit == -9 and second.failures == () and second.decider_clean and second.socks_clean
     assert _egress_threads() == [] and dm.service_threads() == []
+
+
+# --- socks3 r1 item 1: a launch torn down after a partial start has no SOCKS refuser ------------------------------
+
+class _Proc:
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self) -> None:
+        pass
+
+
+class _Decider:
+    def close(self, timeout_s=None) -> bool:
+        return True
+
+
+def test_stop_of_a_launch_whose_socks_refuser_never_started_does_not_raise(tmp_path) -> None:
+    from types import SimpleNamespace
+    e = SimpleNamespace(proc=_Proc(), decider=_Decider(), socks=None, life_w=None, events=tmp_path / "ev.jsonl")
+    out = lm.stop_egress(e)
+    assert out.socks_wall_failures == 0 and out.socks_count_exact
+    assert out.failures == () and out.order == ("socks", "lifeline", "glue", "decider")

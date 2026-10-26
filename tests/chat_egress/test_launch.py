@@ -232,7 +232,7 @@ def test_run_one_launch_one_allowed_get_then_stop_writes_the_final_flush(tmp_pat
     print(f"RUN S8: stop: {out}")
     print(f"RUN S8: events file raw:\n{events}")
     assert (st, body) == (200, b"ok") and origin.reqs == [("GET", "/s8")]
-    assert out.glue_exit == 0 and out.decider_clean and out.order == ("lifeline", "glue", "decider", "socks")
+    assert out.glue_exit == 0 and out.decider_clean and out.order == ("socks", "lifeline", "glue", "decider")
     last = json.loads(events.strip().splitlines()[-1])
     assert last["t"] == "summary" and last["final"] is True and last["total"] == 0
     assert out.final_flush == last

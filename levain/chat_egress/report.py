@@ -24,9 +24,13 @@ import json
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from levain.chat_egress import strip, wire
 from levain.chat_egress.records import EgressRow
+
+if TYPE_CHECKING:
+    from levain.chat_egress.launch import StopResult
 
 #: `deciding_step` values of a request the decider stopped at one of its bounds, as it records them (a row exists for
 #: each: the audit-cap deny is owed outside the machine and has none). Pinned against a live launch in test_k1_report.
@@ -74,6 +78,8 @@ class LaunchReport:
     attempts: int
     audit_missing: int
     unreadable_event_lines: int = 0
+    socks_wall_write_failures: int = 0    # SOCKS wall writes that failed: those refusals are in no glue total
+    socks_count_exact: bool = True        # False: that count was read before the SOCKS refuser had stopped
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     def lines(self) -> list[str]:
@@ -101,6 +107,10 @@ class LaunchReport:
         out.append(f"duplicate_rows: {self.duplicate_rows}")
         if self.unreadable_event_lines:
             out.append(f"unreadable glue event lines: {self.unreadable_event_lines}")
+        if self.socks_wall_write_failures:
+            out.append(f"{self.socks_wall_write_failures} SOCKS wall writes failed (refusals not counted; the glue total is an undercount)")
+        if not self.socks_count_exact:
+            out.append("SOCKS wall-write count may be incomplete (the refuser had not stopped when it was read)")
         out.extend(self.notes)
         return out
 
@@ -141,7 +151,8 @@ def _names(row: EgressRow) -> list[str]:
     return [n for n in v if isinstance(n, str)] if isinstance(v, list) else []
 
 
-def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows: int = 0) -> LaunchReport:
+def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows: int = 0,
+          socks_wall_failures: int = 0, socks_count_exact: bool = True) -> LaunchReport:
     """K1's report for one launch. A glue line `wire.parse_glue_event` refuses is counted, never skipped silently."""
     events: list[wire.GlueEvent] = []
     unreadable = 0
@@ -203,14 +214,25 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
         duplicate_rows=duplicate_rows, verdicts=dict(verdicts), decider_walls=dict(dwalls),
         credential_in_query_walls=cred_walls, credential_in_query_cards=cred_cards, cap_walls=cap, cap_cards=cap_cards, path_walls=path,
         cards=dict(cards), signed_url_names=dict(sig_names), azure_sas_names=azure, backstop_names=backstop, attempts=attempts,
-        audit_missing=missing, unreadable_event_lines=unreadable)
+        audit_missing=missing, unreadable_event_lines=unreadable,
+        socks_wall_write_failures=socks_wall_failures, socks_count_exact=socks_count_exact)
+
+
+def _read_events(events_path) -> list[bytes]:
+    """The glue's event file as lines; a missing or unreadable file reads as no lines (a crash before any)."""
+    try:
+        with open(events_path, "rb") as f:
+            return f.read().splitlines(keepends=True)
+    except OSError:
+        return []
 
 
 def build_from_files(rows: Sequence[EgressRow], events_path, duplicate_rows: int = 0) -> LaunchReport:
-    """`build` over the glue's event file; a missing or unreadable file reads as no lines (a crash before any)."""
-    try:
-        with open(events_path, "rb") as f:
-            data = f.read().splitlines(keepends=True)
-    except OSError:
-        data = []
-    return build(rows, data, duplicate_rows)
+    """`build` over the glue's event file. No stop happened here, so the report carries no SOCKS wall-write line."""
+    return build(rows, _read_events(events_path), duplicate_rows)
+
+
+def build_from_stop(rows: Sequence[EgressRow], events_path, duplicate_rows: int, stop: StopResult) -> LaunchReport:
+    """`build_from_files` for a report built after a stop. The one place the SOCKS wall-write count enters a report is the
+    launch's StopResult, so it is required here."""
+    return build(rows, _read_events(events_path), duplicate_rows, stop.socks_wall_failures, stop.socks_count_exact)

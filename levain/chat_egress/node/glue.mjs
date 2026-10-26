@@ -26,6 +26,8 @@
 //     reserved synchronously; past them one summary per tumbling wall-clock minute that summarised a wall; running
 //     totals; a 64-host map with no eviction and an overflow count; a final flush at every clean end, total 0 when no
 //     wall fired.
+//   - the SOCKS wall: one byte per refused SOCKS attempt on `--wall-fd` (written by Levain's refuser, socks.py) goes
+//     through the same `flood.wall`, reason `socks`.
 // No event, log line or exception path receives request.url, a path, a query value or a header value (R15-17-8,
 // R15-21-2).
 //
@@ -53,6 +55,7 @@ export const DROPPED_NAMES_SHOWN = 8;
 export const AUDIT_HEADER = 'x-levain-audit';
 export const LEVAIN_HEADER_PREFIX = 'x-levain-';
 export const UNPARSED = '<unparsed>';
+export const SOCKS_HOST = '<socks>';              // the wall's host: the refuser records no client byte (socks.py)
 export const CONTENT_FIELD_LIMIT = 256;      // resp content_type / content_length; wire.py's reader bound is this
 export const OBS_QUEUE_LIMIT = 1 << 20;      // bytes queued in the glue for the obs peer; past it, fatal
 export const DRAIN_MS = 2000;                // the clean end's whole budget
@@ -352,6 +355,16 @@ async function main(argv) {
     try { appendFileSync(EVENTS, line); } catch (err) { fatal(4, `event file write failed: ${err?.code ?? err}`); }
   };
   const flood = createFlood({ writeLine: writeEvent });
+  // Levain's SOCKS refuser lives in Python and refuses every attempt; it writes one byte here per refusal and the glue
+  // records the wall (C-1), so K1's one wall total counts it. No client byte ever arrives on this fd.
+  const wallFd = opt('--wall-fd');
+  let wallsDone = Promise.resolve();                 // settles at the wall channel's EOF or error: the clean end waits on it
+  if (wallFd !== undefined) {
+    const walls = new NetSocket({ fd: Number(wallFd), readable: true, writable: false });
+    wallsDone = new Promise(r => { walls.once('end', r); walls.once('error', r); });
+    walls.on('data', buf => { for (let i = 0; i < buf.length; i += 1) flood.wall({ host: SOCKS_HOST, reason: 'socks' }); });
+    walls.on('error', err => console.error(`glue: socks wall channel: ${err?.code ?? err}`));
+  }
   const sock = new NetSocket({ fd: Number(need('--decider-fd')), readable: true, writable: true });
   const obs = createObsChannel({ stream: new NetSocket({ fd: Number(need('--obs-fd')), readable: false, writable: true }),
     onFatal: why => fatal(7, why) });
@@ -402,6 +415,7 @@ async function main(argv) {
     await new Promise(r => setImmediate(r));                                     // srt's abort handlers run on close
     if (filterRequest.open() > 0) await new Promise(r => { idle = r; });
     await new Promise(r => obs.end(r));
+    await wallsDone;                                                             // every refusal Levain sent is read first
     flood.final();
     process.exit(0);
   };

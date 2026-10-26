@@ -88,3 +88,26 @@ def make_launch_(tmp_path):
             failed.append(exc)
     if failed:
         raise failed[0]
+
+
+@pytest.fixture
+def make_tls_launch(tmp_path, monkeypatch):
+    """`make(**kw)` starts a production-spawned launch over a TLS recording origin (`tls_rig.TlsLaunch`); all are
+    stopped at teardown, the origin closed, a failed stop re-raised after the rest ran."""
+    from .tls_rig import TlsLaunch
+    made: list[TlsLaunch] = []
+
+    def make(**kw) -> TlsLaunch:
+        L = TlsLaunch(tmp_path / f"T{len(made)}", monkeypatch, **kw)
+        made.append(L)
+        return L
+
+    yield make
+    failed: list[BaseException] = []
+    for L in made:
+        try:
+            L.close()
+        except BaseException as exc:           # noqa: BLE001 - re-raised below
+            failed.append(exc)
+    if failed:
+        raise failed[0]

@@ -3,7 +3,10 @@
 The design's `chat_sandbox_block(egress="proxy")` points the sandbox's SOCKS port here. A SOCKS5
 client is offered no-auth, its request read, and answered with reply `0x02` (connection not allowed by ruleset),
 then closed; a SOCKS5 client not offering no-auth is answered "no acceptable methods" (`0xff`) and closed; anything
-else (SOCKS4, garbage) is closed with nothing answered. One connection is served at a time,
+else (SOCKS4, garbage) is closed with nothing answered. Each connection that sends a byte first reports one refusal on the
+launch's wall channel (C-1: the glue records it through its one wall path); the report is made before the answer,
+inside the connection's deadline: a report that cannot be written by then is counted in `wall_failures` and logged.
+One connection is served at a time,
 and the whole exchange (draining included) has one absolute deadline, `IO_TIMEOUT_S` from the accept, so a client
 trickling bytes holds the listener no longer than that; `close()` shuts the connection being served. No connection
 is ever made and nothing the client sent is recorded or logged.
@@ -11,10 +14,13 @@ is ever made and nothing the client sent is recorded or logged.
 
 from __future__ import annotations
 
+import logging
 import socket
 import threading
 import time
+from typing import Callable
 
+_LOG = logging.getLogger(__name__)
 
 IO_TIMEOUT_S = 5.0                   # one connection's whole exchange, from its accept
 _ACCEPT_POLL_S = 0.2
@@ -22,12 +28,12 @@ _DRAIN_S = 0.5                       # after our FIN, how long the client's unre
 _REFUSED = b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00"   # VER, REP=0x02, RSV, ATYP=IPv4, 0.0.0.0:0
 
 
-def _recv(conn: socket.socket, n: int, deadline: float) -> bytes:
+def _recv(conn: socket.socket, n: int, deadline: float, peek: bool = False) -> bytes:
     left = deadline - time.monotonic()
     if left <= 0:
         raise socket.timeout("connection deadline")
     conn.settimeout(left)
-    return conn.recv(n)
+    return conn.recv(n, socket.MSG_PEEK) if peek else conn.recv(n)
 
 
 def _exact(conn: socket.socket, n: int, deadline: float) -> bytes | None:
@@ -40,7 +46,11 @@ def _exact(conn: socket.socket, n: int, deadline: float) -> bytes | None:
     return buf
 
 
-def _serve(conn: socket.socket, deadline: float) -> None:
+def _serve(conn: socket.socket, deadline: float, refused: Callable[[float], None]) -> None:
+    first = _recv(conn, 1, deadline, peek=True)
+    if not first:
+        return
+    refused(deadline)
     head = _exact(conn, 2, deadline)
     methods = None if head is None or head[0] != 5 or head[1] == 0 else _exact(conn, head[1], deadline)
     if methods is None:
@@ -77,16 +87,21 @@ def _drain(conn: socket.socket, deadline: float) -> None:
 
 class SocksRefuser:
     """One launch's SOCKS listener on 127.0.0.1. `start()` binds and serves; `close()` stops accepting and joins.
-    `served` counts the connections accepted."""
+    `served` counts the connections accepted. `refusals`, when given, is the launch's wall channel (the glue's
+    `--wall-fd`): one byte is written to it for each connection that sends a byte, before its answer; the wall end is closed once the serving thread is done with it (by `close()` when the thread has ended,
+    else by the thread on its way out)."""
 
-    def __init__(self, sock: socket.socket | None = None) -> None:
+    def __init__(self, sock: socket.socket | None = None, refusals: socket.socket | None = None) -> None:
         if sock is None:
             sock = socket.socket()
             sock.bind(("127.0.0.1", 0))
             sock.listen(16)
         self._sock = sock
+        self._refusals = refusals
         self.port: int = sock.getsockname()[1]
         self.served = 0
+        self.wall_failures = 0               # refusals whose wall report could not be written inside the deadline
+        self._wall_lock = threading.Lock()   # guards `_refusals` against a close racing the write that is using it
         self._closed = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -112,7 +127,7 @@ class SocksRefuser:
                 closing = self._closed.is_set()
             try:
                 if not closing:
-                    _serve(conn, deadline)
+                    _serve(conn, deadline, self._refused)
                     _drain(conn, deadline)
             except OSError:
                 pass
@@ -124,6 +139,28 @@ class SocksRefuser:
                 except OSError:
                     pass
                 conn.close()
+        self._close_wall()                           # the loop has ended: nothing writes to it again
+
+    def _refused(self, deadline: float) -> None:
+        with self._wall_lock:
+            wall = self._refusals
+            if wall is None:
+                return
+            try:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise socket.timeout("connection deadline")
+                wall.settimeout(left)
+                wall.sendall(b"\x01")
+            except OSError as exc:
+                self.wall_failures += 1
+                _LOG.warning("socks refusal not recorded as a wall: %s", type(exc).__name__)
+
+    def _close_wall(self) -> None:
+        with self._wall_lock:
+            wall, self._refusals = self._refusals, None
+        if wall is not None:
+            wall.close()
 
     def close(self, timeout_s: float = IO_TIMEOUT_S + 1.0) -> bool:
         """Stop accepting and shut the connection being served; True when the serving thread ended inside
@@ -140,7 +177,10 @@ class SocksRefuser:
         except OSError:
             pass
         self._sock.close()
+        ended = True
         if self._thread is not None:
             self._thread.join(timeout_s)
-            return not self._thread.is_alive()
-        return True
+            ended = not self._thread.is_alive()
+        if ended:
+            self._close_wall()
+        return ended

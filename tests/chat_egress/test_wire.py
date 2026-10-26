@@ -271,3 +271,8 @@ def test_obs_resp_fields_are_bounded_by_the_glues_limit(field):
         at[field] = over
         with pytest.raises(WireError):
             wire.parse_obs_line(json.dumps(at).encode() + b"\n")
+
+
+def test_a_socks_wall_is_a_glue_wall_reason() -> None:
+    line = wire.glue_event_line(wire.GlueWall(None, None, "<socks>", "socks"))
+    assert wire.parse_glue_event(line) == wire.GlueWall(None, None, "<socks>", "socks")

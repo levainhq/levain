@@ -112,3 +112,118 @@ def test_a_client_that_does_not_offer_no_auth_gets_no_acceptable_method(refuser)
         assert s.recv(1) == b""
     finally:
         s.close()
+
+
+# --- the wall channel (C-1, R15-12-B9): one byte per attempt, before the answer ---------------------------------------
+
+def _attempt(port: int, payload: bytes) -> bytes:
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        if payload:
+            s.sendall(payload)
+        s.shutdown(socket.SHUT_WR)
+        buf = b""
+        while chunk := s.recv(64):
+            buf += chunk
+        return buf
+    finally:
+        s.close()
+
+
+def test_each_connection_that_sends_a_byte_reports_one_refusal_and_a_silent_one_reports_none() -> None:
+    ours, theirs = socket.socketpair()
+    r = socks.SocksRefuser(refusals=ours)
+    r.start()
+    try:
+        _attempt(r.port, b"\x05\x01\x00\x05\x01\x00\x01\x7f\x00\x00\x01\x00\x50")      # SOCKS5 no-auth request
+        _attempt(r.port, b"\x05\x01\x02")                                              # no acceptable method
+        _attempt(r.port, b"\x04\x01\x00\x50\x7f\x00\x00\x01\x00")                      # SOCKS4: closed, still an attempt
+        _attempt(r.port, b"")                                                          # connect and close: none
+    finally:
+        assert r.close()
+    theirs.settimeout(2)
+    got = b""
+    while chunk := theirs.recv(16):
+        got += chunk                                   # r.close() closed `ours`, so this ends at EOF
+    theirs.close()
+    assert got == b"\x01\x01\x01"
+
+
+def test_the_refusal_is_reported_before_the_answer_reaches_the_client() -> None:
+    ours, theirs = socket.socketpair()
+    r = socks.SocksRefuser(refusals=ours)
+    r.start()
+    try:
+        s = socket.create_connection(("127.0.0.1", r.port), timeout=5)
+        s.sendall(b"\x05\x01\x00")
+        assert s.recv(2) == b"\x05\x00"
+        theirs.settimeout(2)
+        assert theirs.recv(8) == b"\x01"                 # already there once the method answer is read
+        s.close()
+    finally:
+        r.close()
+        theirs.close()
+
+
+def test_a_dead_wall_channel_does_not_end_the_refusal() -> None:
+    ours, theirs = socket.socketpair()
+    theirs.close()
+    r = socks.SocksRefuser(refusals=ours)
+    r.start()
+    try:
+        assert _attempt(r.port, b"\x05\x01\x00\x05\x01\x00\x01\x7f\x00\x00\x01\x00\x50")[:2] == b"\x05\x00"
+    finally:
+        r.close()
+
+
+def _fill(sock: socket.socket) -> None:
+    """Fill `sock`'s send buffer so the next write blocks."""
+    sock.setblocking(False)
+    try:
+        while True:
+            sock.send(b"\x00" * 65536)
+    except BlockingIOError:
+        pass
+    sock.setblocking(True)
+
+
+def test_a_wall_write_with_a_full_buffer_does_not_hold_the_connection_past_its_deadline(monkeypatch) -> None:
+    monkeypatch.setattr(socks, "IO_TIMEOUT_S", DEADLINE_S)
+    ours, theirs = socket.socketpair()
+    _fill(ours)
+    r = socks.SocksRefuser(refusals=ours)
+    r.start()
+    try:
+        t0 = time.monotonic()
+        s = socket.create_connection(("127.0.0.1", r.port), timeout=10)
+        s.sendall(b"\x05\x01\x00")
+        s.settimeout(10)
+        while s.recv(16):
+            pass                                          # to the refuser's close of this connection
+        held = time.monotonic() - t0
+        s.close()
+        assert held < DEADLINE_S + 1.0, held
+        assert r.wall_failures == 1
+    finally:
+        r.close()
+        theirs.close()
+
+
+def test_a_close_that_outlasts_an_inflight_wall_write_leaves_the_wall_end_to_the_refuser_thread(monkeypatch) -> None:
+    monkeypatch.setattr(socks, "IO_TIMEOUT_S", 1.5)
+    ours, theirs = socket.socketpair()
+    _fill(ours)
+    r = socks.SocksRefuser(refusals=ours)
+    r.start()
+    try:
+        s = socket.create_connection(("127.0.0.1", r.port), timeout=10)
+        s.sendall(b"\x05")
+        time.sleep(0.3)                                   # the refuser is inside its blocked wall write
+        assert r.close(timeout_s=0.1) is False
+        assert ours.fileno() != -1                        # not closed under the write that is still using it
+        s.close()
+        r._thread.join(5)
+        assert not r._thread.is_alive()
+        assert ours.fileno() == -1                        # the thread closed it on its way out
+    finally:
+        theirs.close()

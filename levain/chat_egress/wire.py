@@ -63,8 +63,9 @@ CONTENT_FIELD_LIMIT = 256
 
 #: The glue's wall reasons. port: CONNECT to anything but 443, plain HTTP to anything but 80 (C-2, R15-12-B1);
 #: non_dns_host: a CONNECT / absolute-form authority srt cannot canonicalise (C-2); scheme: an absolute-form target
-#: on the plain path whose scheme is not http (R15-17-5, R15-19-4).
-GLUE_WALL_REASONS = frozenset({"port", "non_dns_host", "scheme"})
+#: on the plain path whose scheme is not http (R15-17-5, R15-19-4); socks: a connection to Levain's SOCKS refuser
+#: (C-1, R15-12-B9), host always `<socks>`.
+GLUE_WALL_REASONS = frozenset({"port", "non_dns_host", "scheme", "socks"})
 
 #: srt 0.0.81's decider-protocol limits a verdict must keep (decider-client.js) or srt kills the link.
 MAX_REASON_BYTES = 1 << 10

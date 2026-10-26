@@ -166,7 +166,7 @@ class EgressLaunch:
     records: rec.EgressRecords
     proc: subprocess.Popen
     decider: dm.Decider
-    socks: SocksRefuser
+    socks: SocksRefuser | None             # None only on a launch torn down before its refuser was made
     http_port: int
     socks_port: int
     node_version: str
@@ -187,6 +187,8 @@ class StopResult:
     final_flush: dict | None                # the clean end's summary line, or None when there is none
     order: tuple[str, ...]
     failures: tuple[str, ...] = ()          # "<step>: <exception type>" for each teardown step that raised
+    socks_wall_failures: int = 0            # the refuser's `wall_failures`, read after its close(); report.build_from_stop shows it
+    socks_count_exact: bool = True          # False: the refuser's close() did not end its thread, so a late write may be uncounted
 
 
 def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, events: Path, ca_pem: bytes, routes: Any,
@@ -224,7 +226,10 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
         def own(what: str, step: Callable[[], Any]) -> None:
             owned.callback(_guarded, failures, what, step)
         try:
-            socks_srv = SocksRefuser()
+            wall_ours, wall_theirs = socket.socketpair()
+            own("socks wall channel", wall_theirs.close)
+            own("socks wall channel (Levain's end)", wall_ours.close)
+            socks_srv = SocksRefuser(refusals=wall_ours)       # owns its end: closed by its close()
             own("socks", socks_srv.close)
             # `spawn` holds the glue's ends and the CA pipe: closed in this process once the glue is spawned and the CA
             # written (the glue holds its own copies), or on a refusal
@@ -242,6 +247,7 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
                 obs_ours, obs_theirs = socket.socketpair()
                 own("observation socket", obs_ours.close)
                 theirs_("glue observation socket", obs_theirs.close)
+                theirs_("glue socks wall channel", wall_theirs.close)
                 ca_r, ca_w = os.pipe()
                 theirs_("CA pipe", lambda: os.close(ca_r))
                 theirs_("CA pipe write end", lambda: os.close(ca_w))
@@ -249,11 +255,12 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
                 theirs_("glue lifeline end", lambda: os.close(life_r))
                 own("lifeline", lambda: os.close(life_w))
                 own("decider", lambda: [d.close(timeout_s=GLUE_EXIT_TIMEOUT_S) for d in deciders])
-                child = (lsock.fileno(), theirs.fileno(), obs_theirs.fileno(), ca_r, life_r)
+                child = (lsock.fileno(), theirs.fileno(), obs_theirs.fileno(), wall_theirs.fileno(), ca_r, life_r)
                 for fd in child:
                     os.set_inheritable(fd, True)
                 argv = [node, str(GLUE), "--srt-dist", str(srt_dist), "--listen-fd", str(lsock.fileno()),
                         "--decider-fd", str(theirs.fileno()), "--obs-fd", str(obs_theirs.fileno()),
+                        "--wall-fd", str(wall_theirs.fileno()),
                         "--ca-fd", str(ca_r), "--lifeline-fd", str(life_r), "--events", str(events),
                         "--denied-table", str(DENIED_TABLE), "--credential-placements", placements,
                         *(seams.glue_args if seams else ())]
@@ -368,11 +375,14 @@ def stop_egress(e: EgressLaunch) -> StopResult:
 
     def socks_() -> None:
         nonlocal socks_clean
-        socks_clean = e.socks.close()
+        socks_clean = True if e.socks is None else e.socks.close()
 
-    for what, step in (("lifeline", lifeline), ("glue", glue), ("decider", decider), ("socks", socks_)):
+    # The SOCKS refuser stops (thread joined, wall end closed: the glue's EOF on the wall channel) before the lifeline closes,
+    # so a refusal in flight is on the wall channel ahead of that EOF and the glue's final flush counts it.
+    for what, step in (("socks", socks_), ("lifeline", lifeline), ("glue", glue), ("decider", decider)):
         _guarded(failures, what, step)
         order.append(what)
+    wall_failures = 0 if e.socks is None else e.socks.wall_failures      # after close(): the thread that counts has ended when it returned True
     return StopResult(glue_exit=code, decider_clean=decider_clean, socks_clean=socks_clean,
                       final_flush=final_flush(e.events) if code == 0 else None, order=tuple(order),
-                      failures=tuple(failures))
+                      failures=tuple(failures), socks_wall_failures=wall_failures, socks_count_exact=socks_clean)

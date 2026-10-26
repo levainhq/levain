@@ -31,8 +31,13 @@ class RecordingOrigin:
     `reflect(Seen)` returns extra response header lines (bytes, each `Name: value`); `content_type(Seen)` the
     Content-Type value (default text/plain)."""
 
-    def __init__(self, reflect=None, content_type=None) -> None:
+    def __init__(self, reflect=None, content_type=None, tls: tuple[str, str] | None = None) -> None:
         self.reqs: list[Seen] = []
+        self.tls_ctx = None
+        if tls is not None:                # (cert chain pem, key pem): every accepted connection is TLS, one handshake each
+            import ssl
+            self.tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self.tls_ctx.load_cert_chain(*tls)
         self.conns = 0
         self.open_conns = 0
         self.reflect = reflect
@@ -77,10 +82,12 @@ class RecordingOrigin:
             raise EOFError
         return d
 
-    def _serve(self, c: socket.socket) -> None:
+    def _serve(self, c: socket.socket) -> None:       # noqa: C901 - one wire reader, kept in one place
         c.settimeout(10)
         buf = b""
         try:
+            if self.tls_ctx is not None:
+                c = self.tls_ctx.wrap_socket(c, server_side=True)
             while True:
                 while b"\r\n\r\n" not in buf:
                     buf += self._recv(c)
