@@ -705,8 +705,9 @@ def check_sqlite(conn: sqlite3.Connection, minimum: tuple[int, int, int] = MIN_S
 
 
 # ---- O-74-4: no effect row is removed, an intent one included (effects_final_d leaves intent rows to this) --------
-# O-a1c1-3: no levain writer deletes a fence, a graduation step (an audit row) or the health row (fences and the
-# health row are written by upsert, ON CONFLICT DO UPDATE, which fires no delete), so none of them is removed either.
+# O-a1c1-3: no levain writer deletes a fence, a graduation step (an audit row) or the health row [judged by lane
+# a1c1b, 10-26, against git grep over levain/ for DELETE FROM, REPLACE INTO, executescript, DROP TABLE]; fences and
+# the health row are written by upsert (ON CONFLICT DO UPDATE fires no delete: the delete-sweep test runs both).
 # Left deletable: bindings (V BindingStore rewrites its registry by "DELETE FROM bindings") and closing
 # (close_subject_do deletes its own mark).
 DELETE_TRIGGERS = (
