@@ -622,6 +622,9 @@ _LIMIT_TOTAL_S = 10.0
 _LIMIT_ANSWER_CAP = 64 * 1024
 #: The clock every deadline in these rows is read on (a test's seam: patching it never reaches ``time`` itself).
 _clock = time.monotonic
+#: DECISION: the wait for CONTROL's ``KEYS-STATUS`` answer (keys' own report of what the operator cannot read), asked
+#: at most once per run and only when a row meets keys' 0700 directory.
+_KEYS_STATUS_S = 3.0
 #: Provider hosts whose spend limit is an operator setting Levain cannot read: host -> (what the limit is called).
 _PROVIDER_LIMIT_SETTINGS = {"api.anthropic.com": "workspace spend limit", "api.openai.com": "project spend limit"}
 
@@ -742,7 +745,74 @@ def _check_route_trust(store: Path) -> CheckResult:
     return CheckResult(name, True, f"pinned to {t.fingerprint} for store {t.store_id}")
 
 
-def _check_spend_ledger(store: Path) -> CheckResult:
+def _keys_status_asker(run_dir: Path, budget_s: float) -> Any:
+    """A callable answering CONTROL's ``KEYS-STATUS`` (3c-9 session D: keys' report of its ledger size and the
+    brokered routes it serves, which the operator's account cannot read), asked on its first call only and answered
+    within ``budget_s`` of that call; ``None`` for any failure (CONTROL or keys unreachable, a refusal, an answer off its shape), which a
+    row says as held by keys."""
+    memo: list = []
+
+    def ask() -> Any:
+        if not memo:
+            memo.append(_ask_keys_status(run_dir, _clock() + budget_s))
+        return memo[0]
+    return ask
+
+
+class _ByDeadline:
+    """A socket whose every blocking operation waits only what is left of ONE ``deadline`` (on :data:`_clock`), so
+    a peer answering a byte at a time cannot stretch it (a socket timeout alone restarts at each operation)."""
+
+    def __init__(self, sock: Any, deadline: float) -> None:
+        self._sock, self._deadline = sock, deadline
+
+    def _left(self) -> float:
+        left = self._deadline - _clock()
+        if left <= 0:
+            raise TimeoutError("the deadline passed")
+        self._sock.settimeout(left)
+        return left
+
+    def connect(self, path: str) -> None:
+        self._left()
+        self._sock.connect(path)
+
+    def sendall(self, data: bytes) -> None:
+        self._left()
+        self._sock.sendall(data)   # one bounded call: since 3.5 the timeout is the whole send's
+
+    def recv(self, n: int) -> bytes:
+        self._left()
+        return self._sock.recv(n)
+
+    def gettimeout(self) -> float | None:
+        return self._sock.gettimeout()
+
+    def settimeout(self, _t: float | None) -> None:
+        pass   # every operation sets its own from the deadline
+
+
+def _ask_keys_status(run_dir: Path, deadline: float) -> dict | None:
+    """One ``KEYS-STATUS`` on CONTROL's socket, framed by CONTROL's own ``encode_frame``/``read_frame`` and inside
+    ``deadline`` as a whole: connect, send and each receive wait only what is left of it."""
+    import socket
+
+    try:
+        from levain.slot import control
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as raw:
+            s = _ByDeadline(raw, deadline)
+            s.connect(str(run_dir / "control" / "control.sock"))
+            s.sendall(control.encode_frame({"v": 1, "op": "KEYS-STATUS", "id": 1}))
+            ans = control.read_frame(s)  # type: ignore[arg-type]
+        if ans is None or ans.get("ok") is not True or ans.get("id") != 1:
+            return None
+        return control._keys_status_answer({k: v for k, v in ans.items() if k not in ("id", "ok")})
+    except Exception:  # noqa: BLE001 - any failure is "not told", said as held by keys
+        return None
+
+
+def _check_spend_ledger(store: Path, keys_status: Any = lambda: None) -> CheckResult:
     name = "spend ledger"
     path = store / "keys" / "ledger.jsonl"
     try:
@@ -750,7 +820,13 @@ def _check_spend_ledger(store: Path) -> CheckResult:
     except FileNotFoundError:
         return CheckResult(name, True, "not created yet (keys opens it when it first starts)")
     except PermissionError:
-        return CheckResult(name, True, "held by keys: your account cannot read its size", neutral=True)
+        told = keys_status()
+        if told is None:
+            return CheckResult(name, True, "held by keys: your account cannot read its size", neutral=True)
+        if told["ledger_bytes"] is None:
+            return CheckResult(name, True, "keys could not tell its size (it has no ledger open, or cannot stat it)",
+                               neutral=True)
+        return CheckResult(name, True, f"{told['ledger_bytes']:,} bytes (one line per call), as keys reports it")
     except OSError as exc:
         return CheckResult(name, True, f"could not be read ({exc})", warn=True)
     if not stat.S_ISREG(st.st_mode):
@@ -785,10 +861,11 @@ def _egress_in_service(store: Path) -> int | None:
     return sum(1 for tag, v in found.items() if tag[0] == "e" and v[0] not in R.OUT_OF_SERVICE)
 
 
-def _base_pairs(store: Path) -> tuple[set, str | None]:
+def _base_pairs(store: Path, shadow: frozenset = frozenset()) -> tuple[set, str | None]:
     """``({(upstream host, credential name)}, problem)`` of the brokered routes in ``L/routes/base.json``, read by
-    keys' own reader (``routemaps.read_base_map``). ``problem`` is a sentence when the map cannot be read; an absent
-    map is no routes."""
+    keys' own reader (``routemaps.read_base_map``), leaving out each route whose id is in ``shadow`` (a dispatch id:
+    keys refuses that base route at use). ``problem`` is a sentence when the map cannot be read; an absent map is no
+    routes."""
     from levain.broker.policy import PolicyError
     from levain.contracts import ContractError
     from levain.slot import routemaps
@@ -803,7 +880,7 @@ def _base_pairs(store: Path) -> tuple[set, str | None]:
         return set(), f"base.json is refused by keys ({exc})"
     except (ContractError, ValueError, RecursionError) as exc:
         return set(), f"base.json does not parse as keys parses it ({type(exc).__name__}); keys refuses it"
-    return _brokered_pairs(p for p in routes.values()), None
+    return _brokered_pairs(p for rid, p in routes.items() if rid not in shadow), None
 
 
 def _brokered_pairs(policies: Any) -> set:
@@ -811,13 +888,24 @@ def _brokered_pairs(policies: Any) -> set:
             if p.type == "brokered" and p.upstream is not None and p.upstream.host and p.credential}
 
 
-def _dispatch_pairs(store: Path, deadline: float) -> tuple[set, CheckResult | None]:
+def _dispatch_pairs(store: Path, deadline: float, keys_status: Any = lambda: None) -> tuple[set, CheckResult | None]:
     """The brokered ``(host, credential)`` pairs of the dispatch routes keys serves, and a row when they cannot be
-    told. Read as keys starts (``KeysRoutes.load``, inside the run's ``deadline``); a load ``problem`` means keys
+    told (:func:`_served_pairs` with its third part dropped)."""
+    pairs, row, _shadow = _served_pairs(store, deadline, keys_status)
+    return pairs, row
+
+
+def _served_pairs(store: Path, deadline: float, keys_status: Any) -> tuple[set, CheckResult | None, frozenset | None]:
+    """``(pairs, row, shadow)``: the brokered ``(host, credential)`` pairs of the dispatch routes keys serves, a row
+    when they cannot be told, and which base routes keys refuses at use because their id is a dispatch id
+    (``_route_policy``'s collision rule): ``shadow`` is those ids, or ``None`` when the base map adds no pair, because
+    ``pairs`` is already keys' own WHOLE served set (its STATUS, base map included: L3 r1 K2) or because keys
+    refuses every base route (the dispatch ids are unknown). Read as keys starts (``KeysRoutes.load``, inside the run's ``deadline``); a load ``problem`` means keys
     refuses every dispatch route, so it is the warning and no pairs. Otherwise a route counts in each generation where
     keys' own pin rule (``KeysRoutes.policy``) would serve it, so a route the head generation dropped does not count.
     keys' head sits in keys' own 0700 directory, so the operator's account often cannot read it, which is said as such
-    (neutral). Any failure of the read is this row's warning, never the loss of the base map's rows."""
+    (neutral) unless keys' own report (``keys_status``, CONTROL's ``KEYS-STATUS``) gives the pairs it serves. Any
+    failure of the read is this row's warning, never the loss of the base map's rows."""
     from levain import trust_anchor
     from levain.slot import Refused
     from levain.slot import routemaps
@@ -827,29 +915,42 @@ def _dispatch_pairs(store: Path, deadline: float) -> tuple[set, CheckResult | No
     try:
         os.lstat(head)
     except FileNotFoundError:
-        return set(), None
+        return set(), None, frozenset()
     except PermissionError:
+        told = keys_status()
+        if told is not None:
+            pairs = {(h, c) for h, c in told["routes"]}
+            said = []
+            if told["routes_problem"] is not None:
+                said.append(f"keys reports: {told['routes_problem']}")
+            if told["routes_truncated"]:
+                said.append(f"keys' answer had room for {len(pairs)} routes and left {told['routes_truncated']} more "
+                            "out, so their ceilings are not shown")
+            if said:
+                return pairs, CheckResult(name, True, "; ".join(said), warn=True), None
+            return pairs, None, None
         return set(), CheckResult(name, True, "held by keys: your account cannot read the dispatch route maps, so "
                                   "the ceilings of their credentials are not shown",
-                                  "Run `sudo levain doctor` to read them as root.", neutral=True)
+                                  "Run `sudo levain doctor` to read them as root.", neutral=True), frozenset()
     except OSError as exc:
-        return set(), CheckResult(name, True, f"dispatch route maps could not be read ({_slot_why(exc)})", warn=True)
+        return set(), CheckResult(name, True, f"dispatch route maps could not be read ({_slot_why(exc)})",
+                                  warn=True), frozenset()
     problem, _keygen = trust_anchor.trust_anchor_problem(trust_anchor.DEFAULT_SSH_KEYGEN, what="ssh-keygen")
     if problem is not None:
         return set(), CheckResult(name, True, f"the dispatch route maps cannot be verified ({problem}); keys refuses "
-                                  "every dispatch route while ssh-keygen cannot run", warn=True)
+                                  "every dispatch route while ssh-keygen cannot run", warn=True), frozenset()
     kr = routemaps.KeysRoutes(str(store))
     try:
         kr_head, maps, problem = _by_deadline(kr.load, deadline, "the dispatch route map read")
     except TimeoutError:
         return set(), CheckResult(name, True, "the dispatch route maps were not read: the time allowed for the reads "
-                                  "in this run was used up", warn=True)
+                                  "in this run was used up", warn=True), frozenset()
     except Exception as exc:  # noqa: BLE001 - this row's failure, never the base map's rows
         return set(), CheckResult(name, True, f"the dispatch route maps could not be read ({type(exc).__name__}: "
-                                  f"{exc})", warn=True)
+                                  f"{exc})", warn=True), frozenset()
     if problem is not None:
         return set(), CheckResult(name, True, f"keys refuses every dispatch route ({problem}), so no dispatch "
-                                  "credential is in use", warn=True)
+                                  "credential is in use", warn=True), frozenset()
     pairs: set = set()
     try:
         kr.install(kr_head, maps, problem)
@@ -860,10 +961,11 @@ def _dispatch_pairs(store: Path, deadline: float) -> tuple[set, CheckResult | No
                 except Refused:
                     continue
                 pairs |= _brokered_pairs([served])
+        shadow = kr.route_ids()
     except Exception as exc:  # noqa: BLE001 - this row's failure, never the base map's rows
         return set(), CheckResult(name, True, f"the dispatch route maps could not be read ({type(exc).__name__}: "
-                                  f"{exc})", warn=True)
-    return pairs, None
+                                  f"{exc})", warn=True), frozenset()
+    return pairs, None, shadow
 
 
 def _usd(v: float) -> str:
@@ -966,7 +1068,7 @@ def _openrouter_limit_row(store: Path, cred: str, name: str, fetch: Any, timeout
     return CheckResult(name, True, f"key limit {_usd(lim)} total, {_usd(rem)} remaining")
 
 
-def _check_invoice_ceiling(store: Path, fetch: Any) -> list[CheckResult]:
+def _check_invoice_ceiling(store: Path, fetch: Any, keys_status: Any = lambda: None) -> list[CheckResult]:
     """The provider-side limit on each brokered credential in the routes keys serves (the base map and the dispatch
     route maps; design §2.2, the invoice ceiling): OpenRouter's is read within one total deadline; Anthropic's and
     OpenAI's are operator settings Levain cannot read, said as that; any other provider's is said to be unknown."""
@@ -974,10 +1076,10 @@ def _check_invoice_ceiling(store: Path, fetch: Any) -> list[CheckResult]:
 
     deadline = _clock() + _LIMIT_TOTAL_S
     rows: list[CheckResult] = []
-    pairs, problem = _base_pairs(store)
+    more, dispatch_row, shadow = _served_pairs(store, deadline, keys_status)
+    pairs, problem = (set(), None) if shadow is None else _base_pairs(store, shadow)
     if problem is not None:
         rows.append(CheckResult("invoice ceiling", True, problem, warn=True))
-    more, dispatch_row = _dispatch_pairs(store, deadline)
     pairs |= more
     if dispatch_row is not None:
         rows.append(dispatch_row)
@@ -1037,23 +1139,29 @@ def _guarded(name: str, build: Any) -> list[CheckResult]:
 
 
 def _check_slot_keys(*, host: str | None = None, store: Path | None = None, running: Any = None,
-                     fetch: Any = None) -> list[CheckResult]:
+                     fetch: Any = None, keys_status: Any = None) -> list[CheckResult]:
     """The 3c-9 rows over the brokered-spend install: ``route trust``, ``keys service``, ``spend ledger`` and one
     ``invoice ceiling`` row per brokered credential. Read-only and read as the OPERATOR, so a fact in keys' own
     0700 directory is said as held by keys, never as healthy or failed. No rows before the isolation install. Each
-    row is built on its own (:func:`_guarded`). ``running``/``fetch``: a test's seams."""
+    row is built on its own (:func:`_guarded`). A row that meets keys' directory asks keys through CONTROL instead
+    (``keys_status``; the default asks the installed CONTROL, and with a test's ``store`` it asks nothing).
+    ``running``/``fetch``: a test's seams."""
     from levain.slot import layout
 
     if host is None:
         host = "darwin" if sys.platform == "darwin" else "linux"
+    if keys_status is None:
+        run = layout.RUN.get(host)
+        keys_status = (_keys_status_asker(run, _KEYS_STATUS_S) if store is None and run is not None
+                       else (lambda: None))
     store = store if store is not None else layout.STORE.get(host)
     if store is None or not (store / "policy").is_dir():
         return []
     rows = _guarded("route trust", lambda: _check_route_trust(store))
     rows += _guarded("keys service", lambda: _check_keys_service(host, running or _unit_running,
                                                                  _egress_in_service(store)))
-    rows += _guarded("spend ledger", lambda: _check_spend_ledger(store))
-    rows += _guarded("invoice ceiling", lambda: _check_invoice_ceiling(store, fetch))
+    rows += _guarded("spend ledger", lambda: _check_spend_ledger(store, keys_status))
+    rows += _guarded("invoice ceiling", lambda: _check_invoice_ceiling(store, fetch, keys_status))
     return rows
 
 

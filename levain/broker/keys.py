@@ -38,6 +38,9 @@ The admin server (design 1.5 "The admin connection", "Fencing", "Order inside on
   a dispatch route map under keys' one RELOAD lock (RELOAD names no session, so the per-session order cannot order it):
   every check re-run by keys itself (`levain.slot.routemaps`), keys' own head written durably before it serves or acks;
   its file work is one transaction at a time (`KeysRoutes.txn`) and is waited out even when a preemption cancels it.
+- STATUS (3c-9 session D) takes no argument and changes nothing: the reservation ledger's size and the brokered
+  (upstream host, credential name) pairs keys serves, which CONTROL relays to the operator (`KEYS-STATUS`); names
+  only, never a credential's bytes, and no upstream connection.
 - a newer connection PREEMPTS in five steps: bump the epoch, fence every live exchange (marked detached, so its next
   upstream write is refused) and stop reading the old one; cancel its request tasks and
   await them, bounded; the fail-closed clear in two phases (`reg_high` kept); close the old connection; adopt.
@@ -175,6 +178,11 @@ RUN_KINDS = frozenset({"dispatch", "planner", "verifier"})
 PREEMPT_WAIT_S = 2.0
 #: `levain-control/1`'s frame cap, which the admin wire shares.
 ADMIN_FRAME_MAX = 64 * 1024
+#: the most bytes STATUS's answer (its canonical JSON, `id` and `ok` included) may take: half the frame cap, so CONTROL
+#: re-wraps the same fields for the operator inside its own frame of the same cap. A list that does not fit is cut
+#: from its end and the cut counted, because a frame past the cap makes CONTROL's reader close the admin connection,
+#: and that EOF revokes every session registered on it (L3 r1 K1).
+STATUS_ANSWER_MAX = ADMIN_FRAME_MAX // 2
 #: once an admin frame's first byte is in, the rest of its length and its body must arrive within this, and an
 #: answer's write must drain within it (the connection idles legitimately only BETWEEN frames).
 ADMIN_FRAME_S = 10.0
@@ -187,6 +195,7 @@ ADMIN_VERBS = {
     "FRONT-ARM": frozenset({"session", "reg_token"}),
     "DROP-SESSION": frozenset({"session"}),
     "RELOAD": frozenset({"generation", "item_sha256", "keep"}),
+    "STATUS": frozenset(),
 }
 #: RELOAD's `item_sha256`: the hex SHA-256 of the route-map item (3c design r3 §2.3, R4 §2)
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -2004,6 +2013,8 @@ class Keys:
             out = await self.front_arm(epoch, args["session"], args["reg_token"])
         elif op == "DROP-SESSION":
             out = await self.drop_session(epoch, args["session"])
+        elif op == "STATUS":
+            out = self.status()
         else:
             out = await self.reload(epoch, args["generation"], args["item_sha256"], keep=args["keep"])
         if out is None:
@@ -2582,6 +2593,48 @@ class Keys:
             raise norm.Refused("route-not-allowed", "no brokered route")
         return pol
 
+    def status(self) -> dict:
+        """`STATUS` (3c-9 session D): read-only, no upstream connection, never a credential's bytes. `ledger_bytes`:
+        the reservation ledger's size (None when keys has none or cannot stat it). `routes`: the brokered `[upstream
+        host, credential name]` pairs keys would serve now, sorted: the base map's (a base id that is also a dispatch
+        id is refused at use by `_route_policy`, so it is not one) and each dispatch generation's whose pin rule
+        (`KeysRoutes.policy`) holds. `routes_problem`: why a part of that set cannot be told (that part is then left
+        out, as keys refuses it), else None. `routes_truncated`: how many pairs past STATUS_ANSWER_MAX were left off
+        the end of `routes`."""
+        size = None
+        if self.ledger is not None:
+            try:
+                size = os.stat(self.ledger.path).st_size
+            except OSError:
+                size = None
+        pairs: Set[Tuple[str, str]] = set()
+        problems: List[str] = []
+        ids = None if self.routes is None else self.routes.route_ids()
+        if self.routes is not None and ids is None:
+            problems.append("the dispatch route ids are unknown, so keys refuses every base route and the dispatch "
+                            "routes cannot be told")
+        elif self.lib_root is not None:
+            try:
+                self._base = routemaps.read_base_map(self.lib_root, self._base, parse=parse_base_map)
+                base = self._base[1]
+            except FileNotFoundError:
+                base = {}
+            except (OSError, ValueError, ContractError, RecursionError) as e:
+                problems.append(f"the base map is unusable ({type(e).__name__}), so keys refuses every base route")
+                base = {}
+            pairs |= _brokered(p for rid, p in base.items() if rid not in (ids or ()))
+        if self.routes is not None and ids is not None:
+            for gen, m in list(self.routes.maps.items()):
+                for rid in list(m.routes):
+                    try:
+                        pol = self.routes.policy(rid, routemaps.Pin(gen, m.digests[rid]))
+                    except (RouteRefused, KeyError):
+                        continue
+                    pairs |= _brokered([pol])
+        out = {"ledger_bytes": size, "routes": sorted([h, c] for h, c in pairs),
+               "routes_problem": "; ".join(problems) or None, "routes_truncated": 0}
+        return _within_budget(out, "routes", "routes_truncated")
+
     def _dispatch_policy(self, route: str, pin: Optional["routemaps.Pin"]) -> Optional[RoutePolicy]:
         """The dispatch map's policy for `route` under the session's `pin` (R4 §2's three-part rule,
         `KeysRoutes.policy`); a refusal names the rule that failed."""
@@ -3048,6 +3101,26 @@ class Keys:
             if ftype in (b"E", b"X"):
                 return
             got += len(payload)
+
+
+def _within_budget(out: dict, key: str, count: str) -> dict:
+    """`out` with its list `out[key]` cut from the end until the whole answer, framed as the largest `id` and `ok`
+    would frame it, is within STATUS_ANSWER_MAX; `out[count]` is how many were cut."""
+    items = out[key]
+    fixed = len(canon.canonical_bytes({**out, "id": JSON_INT_MAX, "ok": True, key: [], count: len(items)}))
+    kept = 0
+    for it in items:
+        fixed += len(canon.canonical_bytes(it)) + 1   # the item and its comma
+        if fixed > STATUS_ANSWER_MAX:
+            break
+        kept += 1
+    return {**out, key: items[:kept], count: len(items) - kept}
+
+
+def _brokered(policies: object) -> Set[Tuple[str, str]]:
+    """The `(upstream host, credential name)` of each brokered policy among `policies`."""
+    return {(p.upstream.host, p.credential) for p in policies     # type: ignore[attr-defined]
+            if p.type == "brokered" and p.upstream is not None and p.upstream.host and p.credential}
 
 
 def request_head(pol: RoutePolicy, method: bytes, path: bytes, query: Optional[bytes], fwd: Sequence[Tuple[str, str]],

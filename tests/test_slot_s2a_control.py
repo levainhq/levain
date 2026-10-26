@@ -32,8 +32,8 @@ S1, S2, S3, S4 = (f"s-{i:016x}" for i in range(1, 5))
 ALL_VERBS = ("LEASE-OPEN", "STATUS", "ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET",
              "SLOT-SYNC", "TOKEN-RESOLVE", "LINEAGE-APPEND", "KEYS-ATTACH", "QUEUE-RESOLVE", "RUN-TICKET-MINT",
              "RUN-TICKET-CANCEL", "ROUTE-SUBMIT", "CONFIG-SUBMIT", "SESSION-EVENTS", "ARTIFACT-ACK", "POOL",
-             "NOT-A-VERB")
-SESSION2 = {"operator": {"LEASE-OPEN", "STATUS"},
+             "KEYS-STATUS", "NOT-A-VERB")
+SESSION2 = {"operator": {"LEASE-OPEN", "STATUS", "KEYS-STATUS"},
             # S1 3c-7 adds root's SLOT-SYNC (CONTRACT §3.3 root row, §3.5 Pool)
             "root": {"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET", "SLOT-SYNC"},
             "qbroker": {"QUEUE-RESOLVE"},

@@ -80,11 +80,12 @@ _LEN = struct.Struct(">I")
 ROOT_UID = 0
 
 #: §3.3's verbs per peer, as built so far (3c-6b adds keys' ``LINEAGE-APPEND``, 3c-7 root's ``SLOT-SYNC`` and dispatch's
-#: ``POOL``, 3c-8 dispatch's ``CONFIG-SUBMIT``, ``SESSION-EVENTS`` and ``ARTIFACT-ACK``). The ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
+#: ``POOL``, 3c-8 dispatch's ``CONFIG-SUBMIT``, ``SESSION-EVENTS`` and ``ARTIFACT-ACK``, 3c-9 session D the operator's
+#: ``KEYS-STATUS``). The ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
 #: :meth:`Control.peer_kind` is given its uid, else ``foreign``). keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` / ``LINEAGE-APPEND`` are answered only on the connection that
 #: holds the current ``KEYS-ATTACH`` (else ``not-attached``).
 PEER_VERBS: Mapping[str, frozenset[str]] = {
-    "operator": frozenset({"LEASE-OPEN", "STATUS"}),
+    "operator": frozenset({"LEASE-OPEN", "STATUS", "KEYS-STATUS"}),
     "root": frozenset({"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET", "SLOT-SYNC"}),
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS", "LINEAGE-APPEND"}),
@@ -97,6 +98,7 @@ PEER_VERBS: Mapping[str, frozenset[str]] = {
 _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "LEASE-OPEN": (frozenset({"ticket"}), frozenset()),       # a ticket from dispatch only (§3.1 step 1)
     "STATUS": (frozenset({"session"}), frozenset()),
+    "KEYS-STATUS": (frozenset(), frozenset()),               # 3c-9 session D: keys' read-only STATUS, relayed
     "ATTACH": (frozenset({"lease_nonce", "sudo_uid", "session", "claims"}),) * 2,
     "CAS": (frozenset({"session", "generation", "from", "to", "fields"}),) * 2,
     "MINT": (frozenset({"session", "generation", "claims"}),) * 2,
@@ -607,6 +609,24 @@ class _Pending:
     conn: int                                     # the connection the request went out on (KeysAdmin._conn_no)
     done: threading.Event = field(default_factory=threading.Event)
     answer: dict | None = None
+
+
+def _keys_status_answer(ans: Mapping[str, object]) -> dict[str, object]:
+    """keys' ``STATUS`` answer, exactly ``{ledger_bytes: uint | null, routes: [[host, name]..], routes_problem: str |
+    null, routes_truncated: uint}``, or ``Refused("keys-answer")``."""
+    if set(ans) != {"ledger_bytes", "routes", "routes_problem", "routes_truncated"}:
+        raise Refused("keys-answer", "fields")
+    size, routes, problem, cut = ans["ledger_bytes"], ans["routes"], ans["routes_problem"], ans["routes_truncated"]
+    if type(cut) is not int or cut < 0:
+        raise Refused("keys-answer", "routes_truncated")
+    if size is not None and (type(size) is not int or size < 0):
+        raise Refused("keys-answer", "ledger_bytes")
+    if type(routes) is not list or any(type(r) is not list or len(r) != 2 or any(type(x) is not str or not x for x in r)
+                                       for r in routes):
+        raise Refused("keys-answer", "routes")
+    if problem is not None and type(problem) is not str:
+        raise Refused("keys-answer", "routes_problem")
+    return {"ledger_bytes": size, "routes": routes, "routes_problem": problem, "routes_truncated": cut}
 
 
 class KeysAdmin:
@@ -1597,6 +1617,21 @@ class Control:
                 rec["claims"] = {k: v for k, v in rec["claims"].items() if k != "ticket"}
                 recs.append(rec)
         return {"records": recs}
+
+    def _op_keys_status(self, conn: Conn, args: dict) -> dict[str, object]:
+        """3c-9 session D: keys' ``STATUS`` on its admin wire (:class:`KeysAdmin`), for the operator, whose account
+        cannot open keys' 0700 directory: the reservation ledger's size and the brokered ``[host, credential name]``
+        pairs keys serves. Only that shape is passed on (anything else is ``keys-answer``), so no other field keys
+        might send reaches the operator; with no keys admin client, no live connection, or no answer,
+        ``keys-unavailable``. An operator's read never opens the admin connection (``connect=False``): a connect
+        is keys' preemption point and a failed one backs off every verb behind it (L3 r1 K4)."""
+        if self.keys_admin is None:
+            raise Refused("keys-unavailable")
+        try:
+            ans = self.keys_admin.call("STATUS", connect=False)
+        except AdminRefused as e:
+            raise Refused("keys-unavailable", e.name) from None
+        return _keys_status_answer(ans)
 
     # -- root verbs ----------------------------------------------------------------------------------------
 

@@ -371,7 +371,7 @@ def test_r1_1_a_row_builder_that_raises_is_its_own_failure_row(tmp_path, monkeyp
     store = _store(tmp_path)
     _trust(store)
 
-    def boom(_store):
+    def boom(_store, *_told):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(doctor, "_check_spend_ledger", boom)
