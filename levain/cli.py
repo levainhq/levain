@@ -3623,9 +3623,10 @@ def _cmd_binding_policy_create(args: argparse.Namespace) -> int:
         for i, entry in enumerate(guard):
             print(_term_safe(f"  [{i}] why it might be wrong: {entry['rationale']}"))
             print(_term_safe(f"      kill: {json.dumps(entry['kill_predicate'], sort_keys=True)}"))
-            print(_term_safe(f"      drill (an event it stops): {json.dumps(entry['kill_drill'], sort_keys=True)}"))
-        print("where several policies cover one effect, the strictest rung's policy authorizes it, and its guard "
-              "applies.")
+            print(_term_safe(f"      drill (an example event the kill must catch): "
+                             f"{json.dumps(entry['kill_drill'], sort_keys=True)}"))
+        print("where several policies cover one effect, the strictest rung's policy is the one that authorizes it; "
+              "its guard is the one that was checked when it was signed.")
         print(f"warning: {_POLICY_WARNING}.")
         if args.families or args.triggers:
             print(f"--family and --trigger are {_ADVISORY}: a writer of the binding registry chooses both.")

@@ -329,7 +329,7 @@ def test_the_signed_terms_are_parsed_once_at_construction(world, monkeypatch):
 
 def test_an_unlisted_signer_covers_nothing_and_two_covering_policies_name_the_strictest_rungs_least_value(world):
     """probe72 line 6 (a policy whose signer root does not list) and line 12 (two policies at the strictest rung: the
-    cover names the least value, and that policy is ``Cover.policy``, the one whose guard applies)."""
+    cover names the least value, and that policy is ``Cover.policy``, the one that authorizes the effect)."""
     world.link({"op": "create_grant", "grant": grad(world)})
     write_root(world, "pk")
     assert source(world).refresh().cover(APPEND, world.clock.now) == Cover(None, "none")

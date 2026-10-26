@@ -61,6 +61,32 @@ def test_create_prints_what_it_hands_over_before_signing_and_signs_the_stores_id
     assert dict(g["actions"]["link0"]) == {"cls": 1, "reversible": True, "external": False, "financial": False}
 
 
+def test_every_read_back_line_claims_only_the_check_at_signing(cw, capsys):
+    # O-g1f2-1 (1026-22 RULINGS "G1"): nothing checks a policy's guard at fire yet, so no read-back line may say the
+    # drill is an event it stops or that a guard applies; every line before the signature is pinned here
+    import json
+
+    from tests.test_authority_graduation_kind import TEST_GUARD
+    assert cw.cli("policy", "create", "--action", "link0", "--lowest", "ON_LOOP", "--days", "7", "--id",
+                  "gp-0123456789ab") == 0
+    head = capsys.readouterr().out.split("signed: gp-0123456789ab")[0].splitlines()
+    g = dict(cw.state().policy.grants["gp-0123456789ab"])
+    until = g["expires_at"]
+    expected = [f"lets link0 run at ON_LOOP without asking, until {until}.",
+                "its guard (checked now, when it is signed; levain does not check it at fire yet):"]
+    for i, entry in enumerate(TEST_GUARD):
+        expected += [f"  [{i}] why it might be wrong: {entry['rationale']}",
+                     f"      kill: {json.dumps(entry['kill_predicate'], sort_keys=True)}",
+                     f"      drill (an example event the kill must catch): "
+                     f"{json.dumps(entry['kill_drill'], sort_keys=True)}"]
+    expected += ["where several policies cover one effect, the strictest rung's policy is the one that authorizes it; "
+                 "its guard is the one that was checked when it was signed.",
+                 f"warning: {cli._POLICY_WARNING}.",
+                 f"min clean fires {g['min_clean_fires']} (advisory: the engine's walk, not a limit on a writer)."]
+    assert head == expected
+    assert not any("stops" in line or "applies" in line for line in head)
+
+
 @pytest.mark.parametrize("argv,why", [
     (("--action", "link0", "--lowest", "ON_LOOP", "--days", "31"), "--days 31"),
     (("--action", "link0", "--lowest", "ON_LOOP", "--days", "0"), "--days 0"),
