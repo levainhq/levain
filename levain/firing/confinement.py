@@ -2752,6 +2752,15 @@ def build_policy(
         for root, label in (
             (home / "bin", "operator bin"),
             (home / ".local" / "bin", "operator local bin"),
+            # The Python user site: a .pth, usercustomize.py or package there runs in every later
+            # Python of the operator's that does not disable it (-I, -s, a venv; -EP does not).
+            # CPython puts it, with PYTHONUSERBASE unset, under ~/.local/lib, or for a macOS
+            # framework build under ~/Library/Python (tests/test_user_site_floor.py asks each
+            # interpreter on the machine). The whole tree, so a Python version installed after this
+            # build is covered too; it costs the entity `pip install --user`.
+            (home / ".local" / "lib", "operator Python user site"),
+            *(((home / "Library" / "Python", "operator Python user site (macOS framework)"),)
+              if platform.system() == "Darwin" else ()),
             (home / "Library" / "LaunchAgents", "operator LaunchAgents"),
             (home / ".config" / "git", "operator git config"),
             *((t, "operator git config ($XDG_CONFIG_HOME)") for t in git_env_subtrees),
