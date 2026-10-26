@@ -23,6 +23,7 @@ from levain.slot import render as RD
 from levain.slot import tickets as T
 from tests.test_pool import F2_DISPATCH, dispatch  # noqa: F401 - fixture
 from tests.test_slot_3c7_fix_r1 import F2_FACTS, VER_FACTS, _blob, _mint, _prepared, _render
+from tests.test_slot_3c7_fix_r1 import pinning_stand_in  # noqa: F401 - fixture
 
 
 # ---- carried (b) + (c): render's facts gate never compares against an absent field --------------------------------
@@ -62,6 +63,7 @@ def test_verifier_facts_without_steps_refuse_by_name():
 
 # ---- carried (a): no render refusal leaves the session RENDERING ----------------------------------------------------
 
+@pytest.mark.usefixtures("pinning_stand_in")
 def test_render_policy_refusal_comes_before_the_cas(dispatch):
     """1025-10 obs 2: step (2)'s checks (here the hook template the blob names and the world does not hold) change
     with nothing the CAS writes, so they refuse before step (1)'s CAS: the session stays ALLOCATED."""
@@ -73,6 +75,7 @@ def test_render_policy_refusal_comes_before_the_cas(dispatch):
     assert w.calls[calls:] == [] and w.state(s).state == R.ALLOCATED
 
 
+@pytest.mark.usefixtures("pinning_stand_in")
 @pytest.mark.parametrize("step", ["policy", "files", "front", "mint"])
 def test_render_refused_after_its_cas_revokes_the_session(dispatch, step):
     """A refusal after step (1)'s CAS answered: root REVOKEs the session (a state the reaper's END clears), never
@@ -92,6 +95,7 @@ def test_render_refused_after_its_cas_revokes_the_session(dispatch, step):
     assert w.state(s).state == R.REVOKED
 
 
+@pytest.mark.usefixtures("pinning_stand_in")
 def test_render_refused_at_its_first_cas_revokes_nothing(dispatch):
     """A step (1) CAS CONTROL refused moved nothing: no REVOKE is sent and the record is what it was."""
     d, w = dispatch, dispatch.w
@@ -146,6 +150,7 @@ def _lossy(w, drop: set[str]) -> _LossyClients:
     return clients
 
 
+@pytest.mark.usefixtures("pinning_stand_in")
 @pytest.mark.parametrize("lost", ["CAS", "MINT"])
 def test_render_whose_reply_was_lost_revokes_on_a_new_connection(dispatch, lost):
     """codex HIGH r1: CONTROL commits a render's CAS (step 1) or MINT (step 5) and the reply is lost. The cached
@@ -163,6 +168,7 @@ def test_render_whose_reply_was_lost_revokes_on_a_new_connection(dispatch, lost)
     assert w.state(s).state == R.REVOKED
 
 
+@pytest.mark.usefixtures("pinning_stand_in")
 def test_render_revokes_when_killing_its_front_raises(dispatch):
     """codex HIGH r1: a front cleanup that raises cannot skip the REVOKE (it runs in a finally)."""
     d, w = dispatch, dispatch.w

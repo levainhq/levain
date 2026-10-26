@@ -2,7 +2,7 @@
 
 ``render`` writes the front's policy file ``R/gw/slot<n>/session.json`` (CONTRACT §4.3 "the front's view", §5.1 render
 (3)) from the base map: the session's routes, no credential, no price table, the lease's incarnation. The front is
-started with that file, its log ``R/gw/slot<n>/front.log``, keys' ``R/keys/front.sock`` and the GO fd. The front built
+started with that file, its log ``L/gw/slot<n>/front.log`` (3b-8a T1), keys' ``R/keys/front.sock`` and the GO fd. The front built
 from what render wrote TUNNELS a CONNECT to a host on one of the session's routes and REFUSES a host on none, and logs
 both. Unprivileged: the World of ``test_slot_s2f2_runtime_helper`` (owners recorded, the front a fake process table);
 the front itself is the real ``Front`` over a unix socket, its resolver and upstream fixtures (never the internet).
@@ -62,7 +62,7 @@ def test_render_starts_the_front_on_its_policy_log_keys_and_go_fd(tmp_path, host
     args = argv[i + 1:]
     gw = w.R / "gw" / "slot0"
     assert _arg(args, "--policy") == str(gw / "session.json")
-    assert _arg(args, "--log") == str(gw / "front.log")
+    assert _arg(args, "--log") == str(w.L / "gw" / "slot0" / "front.log")
     assert _arg(args, "--keys") == str(w.R / "keys" / "front.sock")
     assert _arg(args, "--go-fd") == str(H.GO_FD)
     if host == "darwin":

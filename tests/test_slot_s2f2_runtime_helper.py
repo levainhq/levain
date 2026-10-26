@@ -132,8 +132,10 @@ class World:
             os.chmod(L / d, mode)
         (self.R / "control").mkdir(parents=True)
         (self.R / "gw").mkdir(mode=0o755)
+        (L / "gw").mkdir(mode=0o755)
         for i in range(egress):   # §2.2 R/gw/slot<n>: the front account's (here: this test's uid, chowned_uid)
             (self.R / "gw" / f"slot{i}").mkdir(mode=0o750)
+            (L / "gw" / f"slot{i}").mkdir(mode=0o750)    # 3b-8a T1: the front's log dir, setup's row
         (L / "slots" / "pool.lock").write_bytes(b"")
         for slot in [SlotId("egress", i) for i in range(egress)] + [SlotId("none", i) for i in range(verifier)]:
             d = slot.slot_dir(L)
@@ -565,7 +567,8 @@ def test_render_order_observed(world):
     # 3b-8a: the gateway front runs with root's args (its listener, policy, log, keys' socket, the GO fd).
     gw = world.R / "gw" / "slot0"
     assert spec["argv"][-13:] == [H.FRONT_MODULE, "--unix", str(gw / "gw.sock"), "--slot-uid", "899",
-                                  "--policy", str(gw / "session.json"), "--log", str(gw / "front.log"),
+                                  "--policy", str(gw / "session.json"),
+                                  "--log", str(world.L / "gw" / "slot0" / "front.log"),          # 3b-8a T1
                                   "--keys", str(world.R / "keys" / "front.sock"), "--go-fd", str(H.GO_FD)]
     assert world.fronts.alive() == [pid]                                # left running, detached
 
