@@ -271,6 +271,71 @@ def test_effective_config_readback():
     assert rd.readback_refusals(exp, good) == ["permissions.ask"]
 
 
+# --- WF-1a: WebFetch through the front (wfetch DESIGN §3 WF-1 items 1-3) -----------------------------------------
+
+HOSTS = {"github": ("github.com", "api.github.com")}
+
+
+def test_webfetch_pins_on_every_egress_session():
+    """skipWebFetchPreflight on every egress session (RULINGS Q1 (b)), one ``WebFetch(domain:)`` allow per host of the
+    session's egress routes (never the vendor route's), and the existing permission pins untouched."""
+    for host, auth in itertools.product(("darwin", "linux"), ("brokered", "passthrough")):
+        blob, facts = egress(host, "claude", auth=auth, route_hosts=HOSTS)
+        s = rd.render_cc_settings(blob, facts)
+        assert s["skipWebFetchPreflight"] is True
+        assert s["disableClaudeAiConnectors"] is True
+        assert s["permissions"]["allow"] == ["WebFetch(domain:api.github.com)", "WebFetch(domain:github.com)"]
+        assert s["permissions"]["disableBypassPermissionsMode"] == "disable"
+        if host == "linux":
+            assert s["permissions"]["ask"] == ["Bash(dangerouslyDisableSandbox:true)"]
+        assert not any("anthropic" in a for a in s["permissions"]["allow"])
+    # no egress route in the session: the preflight is still skipped, no allow rule is rendered
+    blob, facts = egress("darwin", "codex", auth="passthrough")
+    s = rd.render_cc_settings(blob, facts)
+    assert s["skipWebFetchPreflight"] is True and "allow" not in s["permissions"]
+    # the none class has no network: none of it but the connectors pin
+    blob, facts = verifier()
+    s = rd.render_cc_settings(blob, facts)
+    assert "skipWebFetchPreflight" not in s and "allow" not in s["permissions"]
+    assert s["disableClaudeAiConnectors"] is True
+
+
+def test_webfetch_hosts_only_from_egress_routes_and_checked():
+    """A host list for a non-egress route renders nothing; a host the policy grammar refuses is refused before any
+    byte (it would otherwise be spliced into a permission rule)."""
+    blob, facts = egress("darwin", route_hosts={**HOSTS, "anthropic": ("api.anthropic.com",)})
+    assert rd.render_cc_settings(blob, facts)["permissions"]["allow"] == [
+        "WebFetch(domain:api.github.com)", "WebFetch(domain:github.com)"]
+    for bad in ("GitHub.com", "*.github.com", "github.com)", "127.0.0.1", "0x7f.0x1", "localhost", ""):
+        blob, facts = egress("darwin", route_hosts={"github": (bad,)})
+        e = refused(rd.render, blob, facts)
+        assert e.name == "bad-config", bad
+    blob, facts = egress("darwin", route_hosts={"github": ()})
+    assert refused(rd.render, blob, facts).name == "bad-config"
+
+
+def test_webfetch_pins_read_back():
+    blob, facts = egress("darwin", route_hosts=HOSTS)
+    exp = rd.expected_effective_cc(blob, facts)
+    assert exp["skipWebFetchPreflight"] is True and exp["disableClaudeAiConnectors"] is True
+    good = json.loads(rd.render(blob, facts).file("root/settings.json").data)
+    assert rd.readback_refusals(exp, good) == []
+    good["skipWebFetchPreflight"] = False
+    assert rd.readback_refusals(exp, good) == ["skipWebFetchPreflight"]
+    blob, facts = egress("darwin", "codex")
+    assert rd.expected_effective_codex(blob, facts)["web_search"] == "disabled"
+
+
+def test_codex_web_search_disabled():
+    """RULINGS Q3: until Phill rules, Codex's server-side search is off (under danger-full-access it defaults to live,
+    a vendor-side fetch the front cannot see)."""
+    for host, vendor, auth in itertools.product(("darwin", "linux"), ("claude", "codex"), ("brokered", "passthrough")):
+        blob, facts = egress(host, vendor, auth=auth)
+        assert 'web_search = "disabled"' in rd.codex_toml(blob, facts).decode().splitlines()
+    blob, facts = verifier(vendor="codex")
+    assert 'web_search = "disabled"' in rd.codex_toml(blob, facts).decode().splitlines()
+
+
 def test_codex_onboarding_and_provider():
     blob, facts = egress("darwin", "codex", model="gpt-6")
     r = rd.render(blob, facts)
@@ -456,6 +521,18 @@ def test_repo_settings_env_naming_the_queue_refused():
     assert [x.name for x in rd.repo_loosening_refusals({f: {"env": ["x"]}})] == ["repo-settings-malformed"]
 
 
+def test_repo_settings_env_naming_a_proxy_var_refused():
+    """WF-1 item 2: a repo layer clearing or redirecting the proxy vars cannot escape the wall, but every fetch would
+    then fail with no cause shown; refused at launch by name instead."""
+    f = ".claude/settings.json"
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY",
+                 "all_proxy"):
+        got = rd.repo_loosening_refusals({f: {"env": {name: ""}}})
+        assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
+        assert f in got[0].detail
+    assert rd.repo_loosening_refusals({f: {"env": {"PROXY_HOST": "x", "HTTPS_PROXYX": "y"}}}) == []
+
+
 def test_levain_repo_settings_pass():
     """The negative control. ``.claude/settings.json`` is absent from this repo, so the control is (a) a hooks-only
     settings file and (b) the Claude Code settings template Levain ships (hooks + permissions)."""
@@ -521,12 +598,13 @@ GOLD_SETTINGS_LINUX = {"permissions": {"ask": ["Bash(dangerouslyDisableSandbox:t
                                        "disableBypassPermissionsMode": "disable"},
                        "sandbox": {"bwrapPath": "/usr/libexec/levain/bwrap", "enabled": True, "excludedCommands": [],
                                    "failIfUnavailable": True},
-                       "disableAllHooks": False}
+                       "disableAllHooks": False, "disableClaudeAiConnectors": True, "skipWebFetchPreflight": True}
 
 GOLD_CODEX_DARWIN = f"""approval_policy = "never"
 cli_auth_credentials_store = "file"
 model_provider = "levain"
 sandbox_mode = "danger-full-access"
+web_search = "disabled"
 
 [model_providers.levain]
 base_url = "http://127.0.0.1:47103/r/openai/v1"
@@ -541,6 +619,7 @@ trust_level = "trusted"
 GOLD_CODEX_LINUX = f"""approval_policy = "never"
 cli_auth_credentials_store = "file"
 model_provider = "levain"
+web_search = "disabled"
 
 [model_providers.levain]
 base_url = "http://127.0.0.1:47100/r/openai/v1"
@@ -563,14 +642,14 @@ def _digest(r) -> str:
 #: Every file (path, owner, mode, bytes) of each (OS x vendor x class) render, pinned. The full text of each was
 #: read once when these were taken; a change here is a change to what a confined session loads.
 GOLD_DIGESTS = {
-    ("darwin", "claude", "egress"): "47601d17095c0001",    # V13: + root/probe.sb (the rest unchanged)
-    ("darwin", "claude", "none"): "3ef89c7358a401ec",
-    ("darwin", "codex", "egress"): "682bfd7ae3303973",     # V13: + root/probe.sb (the rest unchanged)
-    ("darwin", "codex", "none"): "309384e358924b92",
-    ("linux", "claude", "egress"): "98ce399830ec8e9e",
-    ("linux", "claude", "none"): "c5ec670282a4d84a",
-    ("linux", "codex", "egress"): "7bbc08bc23292e46",
-    ("linux", "codex", "none"): "81b2599fe7f67fb5",
+    ("darwin", "claude", "egress"): "add92e76017a907f",
+    ("darwin", "claude", "none"): "5339f14eebd60e6c",
+    ("darwin", "codex", "egress"): "c104d9ecb1c8ec31",
+    ("darwin", "codex", "none"): "0781e57368c7ff34",
+    ("linux", "claude", "egress"): "6dfa33ae720145c0",
+    ("linux", "claude", "none"): "0699994457ecf098",
+    ("linux", "codex", "egress"): "be6dac9f952b5103",
+    ("linux", "codex", "none"): "e4181d5b141f2e74",
 }
 
 
