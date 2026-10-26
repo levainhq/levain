@@ -15,9 +15,9 @@ SIGINT and returns 0. This program records each SIGTERM / SIGINT it receives (a 
 follower's own handler is installed counts too); when the follower returns 0 after one, it dies by SIGTERM with its
 default action, so each unit manager treats the stop as its own policy says (systemd's on-failure does not restart a
 SIGTERM death; launchd relaunches one unless the job was booted out). A 0 with no signal recorded exits
-:data:`EX_SOFTWARE`, which both relaunch. A run as any user but ``_levain_dispatch`` (root included) exits
-:data:`EX_WRONG_USER` before it reads argv, the queue broker service's rule. A usage error and a store dir or lockfile of
-the wrong shape exit :data:`EX_CONFIG`.
+:data:`EX_SOFTWARE`, which both relaunch. Before it reads argv, a run as root exits :data:`EX_CONFIG`, and then a run
+as any other user but ``_levain_dispatch`` exits :data:`EX_WRONG_USER` (the queue broker service's rule); the Linux unit
+restarts neither. A usage error and a store dir or lockfile of the wrong shape exit :data:`EX_CONFIG`.
 """
 from __future__ import annotations
 
@@ -46,10 +46,11 @@ _LOCK_SLICE_S = 0.05
 EX_SOFTWARE = 70
 #: sysexits.h: the supervisor lock stayed held for :data:`LOCK_WAIT_S`; both unit managers relaunch it
 EX_TEMPFAIL = 75
-#: sysexits.h EX_NOPERM: the euid is not :data:`ACCOUNT`'s uid, or that account does not exist
+#: sysexits.h EX_NOPERM: a non-root euid that is not :data:`ACCOUNT`'s uid, or that account does not exist. The Linux
+#: unit stays down on it (``RestartPreventExitStatus``); launchd relaunches any non-zero exit.
 EX_WRONG_USER = 77
-#: sysexits.h: a usage error, or a store dir / lockfile not what install made. The Linux unit stays down on it
-#: (``RestartPreventExitStatus``); launchd relaunches any non-zero exit.
+#: sysexits.h: a run as root, a usage error, or a store dir / lockfile not what install made. The Linux unit stays down
+#: on it (``RestartPreventExitStatus``); launchd relaunches any non-zero exit.
 EX_CONFIG = 78
 _STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
@@ -201,6 +202,9 @@ def _parser(host: str) -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None, *, wait_s: float = LOCK_WAIT_S,
          follow: Optional[Callable[[Sequence[str]], int]] = None, die: Callable[[], int] = _die_by_sigterm) -> int:
+    if os.geteuid() == 0:                   # first: an account resolved to uid 0 never reaches the comparison below
+        print(f"levain dispatch: refusing to run as root (it runs as {ACCOUNT})", file=sys.stderr)
+        return EX_CONFIG
     seams = H.Seams()
     try:
         me = seams.account_uid(ACCOUNT)

@@ -90,5 +90,5 @@ def test_keys_exits_ex_config_with_no_gw_account(monkeypatch, capsys):
 def test_systemd_does_not_restart_an_ex_config_exit():
     for svc in units.services_for("linux"):
         text = units.systemd_unit_text(svc)
-        # every policy (always; dispatch's on-failure, §1.3) keeps EX_CONFIG down
-        assert f"Restart={svc.restart}\n" in text and "RestartPreventExitStatus=78\n" in text, svc.name
+        # every policy (always; dispatch's on-failure, §1.3) keeps EX_CONFIG and EX_NOPERM (a wrong user) down
+        assert f"Restart={svc.restart}\n" in text and "RestartPreventExitStatus=78 77\n" in text, svc.name

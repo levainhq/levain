@@ -176,7 +176,7 @@ Group=_levain_dispatch
 ExecStart=/usr/bin/python3 -IS /usr/libexec/levain/service-entry dispatch
 Restart=on-failure
 RestartSec=5
-RestartPreventExitStatus=78
+RestartPreventExitStatus=78 77
 
 [Install]
 WantedBy=multi-user.target
