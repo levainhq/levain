@@ -606,6 +606,38 @@ def _git_config_overrides(environ=None) -> tuple[list[Path], list[Path]]:
     return list(_dedup_paths(subtrees)), list(_dedup_paths(files))
 
 
+def _python_userbase_override(home: Path, workspace: Path, environ=None) -> tuple[list[Path], str | None]:
+    """``(subtrees, note)`` for the Python user site ``$PYTHONUSERBASE`` moves, read from ``environ``
+    (default ``os.environ``: the operator's, at policy build). CPython takes the value as written: unset or
+    empty means the default layout, which the floor already holds. An ABSOLUTE value that is neither the home
+    itself nor an ancestor of the home or of the workspace is one more persistence subtree. Otherwise (a relative
+    value, the home, or such an ancestor) it is NOT added, since a write deny there would take the home or the
+    workspace with it, and ``note`` is the one line the run banner and doctor print saying the user site is
+    outside the floor."""
+    env = os.environ if environ is None else environ
+    value = env.get("PYTHONUSERBASE", "")
+    if not value:
+        return [], None
+    if not os.path.isabs(value):
+        why = "a relative path, which Python resolves against whatever directory it starts in"
+    else:
+        base = Path(os.path.normpath(value))
+        spellings = {base, Path(os.path.realpath(base))}
+        anchors = {h for a in (home, workspace) for h in (Path(os.path.normpath(a)), Path(os.path.realpath(a)))}
+        if not any(a == b or a.is_relative_to(b) for a in anchors for b in spellings):
+            return [base], None
+        why = "your home or a directory holding your home or the workspace"
+    return [], (f"\u26a0 Python user site NOT in the floor: $PYTHONUSERBASE is {value!r} ({why}), so the "
+                "entity may plant a .pth there that your later Python runs; point it at a dedicated absolute "
+                "directory, or unset it")
+
+
+def python_userbase_note(workspace: Path | str, environ=None) -> str | None:
+    """The run banner's and doctor's line when ``$PYTHONUSERBASE`` puts the user site outside the floor
+    (:func:`_python_userbase_override`), else None."""
+    return _python_userbase_override(Path.home(), Path(workspace).expanduser(), environ)[1]
+
+
 def _cred_dir_sources() -> list[Path]:
     """The credential directories that are a tool's whole home, lexical: the defaults and every
     override (:data:`_CRED_DIR_ENV`)."""
@@ -2747,6 +2779,7 @@ def build_policy(
     # On Linux an absent derived file under a directory nobody here can create makes bwrap refuse to
     # start (its mountpoint cannot be made): fail-closed, and accepted as a known edge (L3 r4).
     git_env_subtrees, git_env_files = _git_config_overrides()
+    userbase_subtrees, _ = _python_userbase_override(home, ws)
     persistence_write_subtrees = _dedup([
         p
         for root, label in (
@@ -2761,6 +2794,8 @@ def build_policy(
             (home / ".local" / "lib", "operator Python user site"),
             *(((home / "Library" / "Python", "operator Python user site (macOS framework)"),)
               if platform.system() == "Darwin" else ()),
+            # Where the operator's $PYTHONUSERBASE moves it; one the floor cannot hold is a banner line.
+            *((t, "operator Python user site ($PYTHONUSERBASE)") for t in userbase_subtrees),
             (home / "Library" / "LaunchAgents", "operator LaunchAgents"),
             (home / ".config" / "git", "operator git config"),
             *((t, "operator git config ($XDG_CONFIG_HOME)") for t in git_env_subtrees),
@@ -7180,9 +7215,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             raise ConfinementError(
                 f"the Linux floor would bind {real} read-only to keep the agents' configuration and the "
                 f"shell's startup files out of bash's reach, and that would cover {covered}, "
-                "which bash needs as it is. Refusing to grant bash hands (fail-closed). This comes from "
-                "a symlink under ~/.claude or ~/.codex (or a startup directory) resolving into that "
-                "directory: replace the symlink with the real directory or file to use bash."
+                "which bash needs as it is. Refusing to grant bash hands (fail-closed). To use bash, move "
+                f"{covered} out of {real}; or, where {real} is protected only because a symlink under "
+                "~/.claude or ~/.codex (or a startup directory) resolves into it, replace that symlink "
+                "with the real directory or file."
             )
         if os.path.lexists(real):
             if real.is_dir() and not real.is_symlink():

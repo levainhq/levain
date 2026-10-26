@@ -39,7 +39,7 @@ def home(tmp_path: Path, monkeypatch) -> Path:
 
 def _policy(tmp_path: Path) -> C.CrownJewelsPolicy:
     entity = tmp_path / "entity"
-    (entity / ".levain").mkdir(parents=True)
+    (entity / ".levain").mkdir(parents=True, exist_ok=True)
     return build_policy(entity, workspace=tmp_path / "ws", deny_standard_creds=False)
 
 
@@ -50,7 +50,7 @@ def _site_dirs(home: Path) -> list[Path]:
 
 
 def _covered(policy: C.CrownJewelsPolicy, p: Path) -> bool:
-    return any(p == t or p.is_relative_to(t) for t in policy.persistence_write_subtrees)
+    return any(p == Path(t) or p.is_relative_to(Path(t)) for t in policy.persistence_write_subtrees)
 
 
 def _interpreters() -> list[str]:
@@ -78,9 +78,12 @@ def test_every_interpreter_here_puts_its_user_site_inside_the_floor(home: Path, 
     policy = _policy(tmp_path)
     asked = 0
     for py in _interpreters():
-        out = subprocess.run([py, "-I", "-c", "import site; print(site.getusersitepackages())"],
-                             capture_output=True, text=True, env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
-                             timeout=30)
+        try:
+            out = subprocess.run([py, "-I", "-c", "import site; print(site.getusersitepackages())"],
+                                 capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                 env={"HOME": str(home), "PATH": "/usr/bin:/bin"}, timeout=30)
+        except subprocess.TimeoutExpired:
+            continue   # no answer (the Xcode stub's install prompt, say): not an interpreter to ask
         if out.returncode != 0:
             continue
         site_dir = Path(out.stdout.strip())
@@ -144,3 +147,142 @@ def test_live_an_existing_user_site_cannot_be_planted_or_renamed_into(home: Path
             assert r.exit_code != 0 and not (d / "x.pth").exists(), (d, r.output)
             r = sh.run(f"mv {d} {d}.old 2>&1", timeout=20)
             assert r.exit_code != 0 and d.is_dir(), (d, r.output)
+
+
+def _linux_plan(home: Path, monkeypatch) -> tuple[list[str], list[str]]:
+    monkeypatch.setattr(C.platform, "system", lambda: "Linux")
+    for var in ("XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL", *{v for v, _, _ in C._CRED_OVERRIDES}):
+        monkeypatch.delenv(var, raising=False)
+    ent = home / "proj" / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    ws = home / "proj" / "ws"
+    ws.mkdir()
+    return C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+
+
+def _ro_binds(argv: list[str]) -> list[str]:
+    return [argv[i + 2] for i, a in enumerate(argv) if a == "--ro-bind" and argv[i + 1] == argv[i + 2]]
+
+
+def test_the_linux_plan_protects_an_absent_local_lib(home: Path, tmp_path: Path, monkeypatch) -> None:
+    """F1 (L3 r1, deepseek HIGH, reasoned): with ~/.local present and ~/.local/lib absent, is the tree still
+    protected? Settled by building the plan: step (2p) binds the exact path read-only and the provider creates
+    it first (``create_first``), as for ~/.local/bin, so bash cannot mkdir it and plant inside."""
+    lib = home / ".local" / "lib"
+    assert not os.path.lexists(lib) and (home / ".local").is_dir()
+    argv, create_first = _linux_plan(home, monkeypatch)
+    real = os.path.realpath(lib)
+    assert real in _ro_binds(argv)
+    assert real in create_first
+    assert os.path.realpath(home / ".local" / "bin") in create_first   # the sibling it is handled like
+
+
+def test_the_linux_plan_protects_the_user_site_with_no_local_at_all(home: Path, tmp_path: Path,
+                                                                   monkeypatch) -> None:
+    """F1's variant: no ~/.local. Nothing is created on the host; instead step (0) makes $HOME's own entries
+    read-only (a tmpfs over $HOME, each existing child bound back, then remounted read-only), so bash cannot
+    create ~/.local, and with it nothing below."""
+    (home / ".local").rmdir()
+    argv, create_first = _linux_plan(home, monkeypatch)
+    home_real = os.path.realpath(home)
+    local = os.path.join(home_real, ".local")
+    pairs = list(zip(argv, argv[1:]))
+    assert ("--tmpfs", home_real) in pairs and ("--remount-ro", home_real) in pairs
+    # nothing names ~/.local (no bind back in, no placeholder made on the host)
+    assert not any(a == local or a.startswith(local + os.sep) for a in argv)
+    assert not any(p == local or p.startswith(local + os.sep) for p in create_first)
+
+
+# --- F2: $PYTHONUSERBASE, read from the operator's environment at policy build ----------------------------------
+
+def test_an_absolute_dedicated_userbase_joins_the_floor(home: Path, tmp_path: Path, monkeypatch) -> None:
+    base = tmp_path / "pyuser"
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    policy = _policy(tmp_path)
+    assert _covered(policy, base / "lib" / f"python{_XY}" / "site-packages" / "x.pth")
+    assert crown_jewel_reason(policy, base / "lib" / f"python{_XY}" / "site-packages" / "x.pth")
+    assert crown_jewel_reason(policy, base / "lib" / f"python{_XY}" / "site-packages" / "x.pth", write=False) is None
+    assert C.python_userbase_note(tmp_path / "ws") is None
+    # Asked of the interpreter itself: the site it uses under this variable is inside the floor.
+    out = subprocess.run([sys.executable, "-c", "import site; print(site.getusersitepackages())"],
+                         capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+                         env={"HOME": str(home), "PYTHONUSERBASE": str(base), "PATH": "/usr/bin:/bin"})
+    assert out.returncode == 0 and _covered(policy, Path(out.stdout.strip())), out
+
+
+def test_an_unset_or_empty_userbase_adds_nothing_and_says_nothing(home: Path, tmp_path: Path, monkeypatch) -> None:
+    baseline = set(_policy(tmp_path).persistence_write_subtrees)
+    monkeypatch.setenv("PYTHONUSERBASE", "")
+    assert set(_policy(tmp_path).persistence_write_subtrees) == baseline
+    assert C.python_userbase_note(tmp_path / "ws") is None
+
+
+@pytest.mark.parametrize("which", ["relative", "home", "ancestor of home", "ancestor of the workspace"])
+def test_a_userbase_the_floor_cannot_hold_is_named_not_added(home: Path, tmp_path: Path, monkeypatch,
+                                                            which: str) -> None:
+    ws = tmp_path / "ws"
+    entity = tmp_path / "entity"
+    if which == "ancestor of the workspace":
+        ws = tmp_path / "outside" / "ws"
+    value = {"relative": "pyuser", "home": str(home), "ancestor of home": str(tmp_path),
+             "ancestor of the workspace": str(tmp_path / "outside")}[which]
+    (entity / ".levain").mkdir(parents=True)
+    monkeypatch.delenv("PYTHONUSERBASE", raising=False)
+    baseline = set(build_policy(entity, workspace=ws, deny_standard_creds=False).persistence_write_subtrees)
+    monkeypatch.setenv("PYTHONUSERBASE", value)
+    policy = build_policy(entity, workspace=ws, deny_standard_creds=False)
+    assert set(policy.persistence_write_subtrees) == baseline
+    note = C.python_userbase_note(ws)
+    assert note is not None and "PYTHONUSERBASE" in note and repr(value) in note and "NOT in the floor" in note
+
+
+def test_the_run_banner_and_doctor_print_the_userbase_line(home: Path, tmp_path: Path, monkeypatch, capsys) -> None:
+    from levain.doctor import _check_confinement
+    from levain.run import _print_banner
+
+    class _Binding:
+        episodic_path = tmp_path / "e.db"
+        crystal_path = tmp_path / "c.json"
+
+    monkeypatch.setenv("PYTHONUSERBASE", str(home))
+    note = C.python_userbase_note(tmp_path / "ws")
+    _print_banner(tmp_path, _Binding(), model="m", with_tools=True, bash_ok=True, user_site_note=note)
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Python user site NOT in the floor: $PYTHONUSERBASE is" in out
+    monkeypatch.setattr(C, "diagnose_confinement", lambda *a, **k: C.ConfinementDiagnosis(
+        supported=True, provider="p", reason="", remedy=None))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+    assert "Python user site NOT in the floor" in _check_confinement(entity)[0].detail
+    monkeypatch.delenv("PYTHONUSERBASE")
+    assert "PYTHONUSERBASE" not in _check_confinement(entity)[0].detail
+
+
+# --- F6: the refusal names what it is when the workspace sits in a protected tree --------------------------------
+
+def test_a_workspace_inside_the_local_lib_tree_is_refused_by_what_it_is(home: Path, tmp_path: Path,
+                                                                        monkeypatch) -> None:
+    monkeypatch.setattr(C.platform, "system", lambda: "Linux")
+    for var in ("XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL", *{v for v, _, _ in C._CRED_OVERRIDES}):
+        monkeypatch.delenv(var, raising=False)
+    ent = home / "proj" / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    ws = home / ".local" / "lib" / "proj" / "ws"
+    ws.mkdir(parents=True)
+    with pytest.raises(C.ConfinementError) as err:
+        C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    msg = " ".join(str(err.value).split())
+    assert f"move {os.path.realpath(ws)} out of {os.path.realpath(home / '.local' / 'lib')}" in msg
+
+
+@live
+def test_live_a_dedicated_userbase_cannot_be_planted(home: Path, tmp_path: Path, monkeypatch) -> None:
+    base = tmp_path / "pyuser"
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    policy = _policy(tmp_path)
+    site_dir = base / "lib" / f"python{_XY}" / "site-packages"
+    with C.select_provider().spawn_shell(policy) as sh:
+        r = sh.run(f"mkdir -p {site_dir} 2>&1; echo 'import os' > {site_dir}/x.pth 2>&1", timeout=20)
+        assert r.exit_code != 0 and not (site_dir / "x.pth").exists(), r.output
+        ok = sh.run(f"mkdir -p {tmp_path}/beside && echo x > {tmp_path}/beside/f", timeout=20)   # the control
+        assert ok.exit_code == 0, ok.output
