@@ -285,6 +285,7 @@ def test_t8_probe_sb_rendered_beside_profile_sb_same_owner_and_mode():
     from tests.test_slot_s2b_render import egress, verifier
 
     blob, facts = egress()
+    assert facts.slot.slot_class == "egress"
     files = {f.path: f for f in rd.render(blob, facts).files}
     prof, probe = files["root/profile.sb"], files["root/probe.sb"]
     assert (probe.uid, probe.gid, probe.mode) == (prof.uid, prof.gid, prof.mode)
@@ -292,6 +293,7 @@ def test_t8_probe_sb_rendered_beside_profile_sb_same_owner_and_mode():
     blob, facts = egress(host="linux")
     assert not any(f.path.endswith(".sb") for f in rd.render(blob, facts).files)     # darwin only
     blob, facts = verifier()
+    assert facts.slot.slot_class == "none" and facts.host == "darwin"      # X7: the none-class case
     paths = {f.path for f in rd.render(blob, facts).files}
     assert "root/profile.sb" in paths and "root/probe.sb" not in paths    # no probe runs in a none-class slot
 

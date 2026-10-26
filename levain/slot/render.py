@@ -745,7 +745,7 @@ def render(blob: RenderBlob, facts: RenderFacts) -> Rendered:
         files.append(RenderedFile("root/driver.env", env_text(envs["driver"]), 0, rgid, fmode))
     if facts.host == "darwin":
         files.append(RenderedFile("root/profile.sb", render_profile(blob, facts), 0, rgid, fmode))
-        if not verifier:      # V13: only an egress slot is probed (wall.target_account has no none-class probe)
+        if facts.slot.slot_class == "egress":      # V13: only an egress slot is probed
             files.append(RenderedFile("root/probe.sb", render_profile(blob, facts, probe=True), 0, rgid, fmode))
     if facts.kind in READSET_KINDS:
         # §2.1: root : root 0644 whatever the class, so the slot can read it and no slot group can change it.
