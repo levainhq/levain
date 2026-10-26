@@ -6,8 +6,11 @@ writer. A crash is an exception raised at the follower's fault seam."""
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import logging
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -519,18 +522,23 @@ def test_a_re_delivered_write_meets_the_repeat_seam_never_the_written_one(store,
 
 # -- slice 2: the executor's export artifact is read, then acked ------------------------------------------------------
 
+BUNDLE = b"a git bundle, as far as the take can tell\n" * 40
+BUNDLE_DIGEST = "sha256:" + hashlib.sha256(BUNDLE).hexdigest()
 ART_DIGEST = "sha256:" + "a" * 64
 
 
-def exported(tmp_path, session, ticket, named=None, **over):
-    """Root's published file for ``session`` under a fresh export dir, as ``levain-dispatch-artifact/1``."""
-    import json
+def exported(tmp_path, session, ticket, named=None, content=BUNDLE, **over):
+    """Root's published directory for ``session`` under a fresh export dir: `dispatch-artifact.json` and, unless the
+    artifact names no bundle, the bundle file it digests."""
     from levain.dispatch import export as X
-    obj = {"format": X.FORMAT, "session": named or session, "ticket": ticket, "manifest_digest": "sha256:" + "c" * 64,
-           "bundle": "bundle", "bundle_digest": "sha256:" + "d" * 64, "files": 2, "bytes": 64}
+    obj = {"session": named or session, "ticket": ticket, "manifest_digest": "sha256:" + "c" * 64,
+           "bundle": "bundle", "bundle_digest": "sha256:" + hashlib.sha256(content).hexdigest(), "files": 2,
+           "bytes": 64}
     obj.update(over)
     (tmp_path / session).mkdir(exist_ok=True)
     (tmp_path / session / X.FILE).write_text(json.dumps(obj))
+    if obj["bundle"] is not None:
+        (tmp_path / session / obj["bundle"]).write_bytes(content)
     return tmp_path
 
 
@@ -648,4 +656,196 @@ def test_an_ack_control_refuses_stops_the_follower_by_name_with_the_cursor_unmov
         f.step()
     assert e.value.name == "artifact-not-published"
     assert "artifact_acked" not in served.control.store.get(session).fields
+    f.close()
+
+
+# -- F1: dispatch TAKES the artifact before the ack --------------------------------------------------------------------
+
+def held(store, session, ticket):  # noqa: F811
+    return store.taken_artifact(session, ticket)
+
+
+def test_the_bundle_is_taken_before_the_ack_and_outlives_the_export(store, repo, served, tmp_path):  # noqa: F811
+    """The data-loss case: the ACK lets the reaper trash the retained session and the export with it. After the ack
+    and the trash, dispatch still holds the verified bundle."""
+    d = Dispatch(store, repo, served)
+    session, ticket, seq = published(served)
+    export = exported(tmp_path, session, ticket)
+    f = artifact_follower(d, export)
+    assert f.step().outcome == CC.DEADLINE
+    assert served.control.store.get(session).fields.get("artifact_acked") is True
+    shutil.rmtree(export / session)                              # the reaper's trash
+    t = held(store, session, ticket)
+    assert t is not None and t.bundle_digest == BUNDLE_DIGEST
+    data = (store.directory / t.path).read_bytes()
+    assert data == BUNDLE and "sha256:" + hashlib.sha256(data).hexdigest() == t.bundle_digest
+    assert (t.files, t.bytes) == (2, 64) and t.manifest_digest == "sha256:" + "c" * 64
+    f.close()
+
+
+def test_the_take_comes_before_the_ack(store, repo, served, tmp_path):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, ticket, _ = published(served)
+    order = []
+    d.faults.clear()
+    f = artifact_follower(d, exported(tmp_path, session, ticket))
+    f._fault = lambda where, seq: order.append((where, held(store, session, ticket) is not None,
+                                                served.control.store.get(session).fields.get("artifact_acked")))
+    f.step()
+    assert ("taken", True, None) in order and order.index(("taken", True, None)) < order.index(("acked", True, True))
+    f.close()
+
+
+def test_a_crash_between_the_take_and_the_ack_re_delivers_and_converges(store, repo, served, tmp_path):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, ticket, seq = published(served)
+    export = exported(tmp_path, session, ticket)
+    d.faults["taken"] = True
+    f = artifact_follower(d, export)
+    with pytest.raises(Crash):
+        f.step()
+    assert "artifact_acked" not in served.control.store.get(session).fields
+    first = held(store, session, ticket)
+    ino = os.stat(store.directory / first.path).st_ino
+    f.close()
+    d.faults.clear()
+    f2 = artifact_follower(d, export)
+    f2.step()
+    assert served.control.store.get(session).fields.get("artifact_acked") is True
+    assert held(store, session, ticket) == first
+    assert os.stat(store.directory / first.path).st_ino == ino          # the repeat took nothing again
+    assert store.event_cursor()[1] == seq
+    f2.close()
+
+
+def test_a_bundle_whose_bytes_are_not_its_digest_stops_the_follower_and_holds_nothing(store, repo, served, tmp_path):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, ticket, _ = published(served)
+    export = exported(tmp_path, session, ticket)
+    (export / session / "bundle").write_bytes(BUNDLE + b"x")
+    f = artifact_follower(d, export)
+    with pytest.raises(F.FollowStopped) as e:
+        f.step()
+    assert e.value.name == "take-digest-mismatch"
+    assert "artifact_acked" not in served.control.store.get(session).fields
+    assert held(store, session, ticket) is None
+    cur = store.event_cursor()
+    assert cur is None or cur[1] < served.kept()[-1]["seq"]
+    taken = store.directory / "taken"
+    assert not taken.exists() or not [p for p in taken.rglob("*") if p.is_file()]
+    f.close()
+
+
+def test_a_bundle_the_artifact_names_but_the_export_lacks_stops_the_follower(store, repo, served, tmp_path):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, ticket, _ = published(served)
+    export = exported(tmp_path, session, ticket)
+    (export / session / "bundle").unlink()
+    f = artifact_follower(d, export)
+    with pytest.raises(F.FollowStopped) as e:
+        f.step()
+    assert e.value.name == "take-bundle-absent"
+    assert "artifact_acked" not in served.control.store.get(session).fields
+    f.close()
+
+
+def test_a_copy_that_fails_stops_the_follower_unacked_and_leaves_no_partial(store, repo, served, tmp_path, monkeypatch):  # noqa: F811
+    from levain.dispatch import take as K
+    d = Dispatch(store, repo, served)
+    session, ticket, seq = published(served)
+    export = exported(tmp_path, session, ticket)
+
+    def full(fd):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(K.os, "fsync", full)
+    f = artifact_follower(d, export)
+    with pytest.raises(F.FollowStopped) as e:
+        f.step()
+    assert e.value.name == "take-failed"
+    assert "artifact_acked" not in served.control.store.get(session).fields
+    assert held(store, session, ticket) is None
+    assert not [p for p in (store.directory / "taken").rglob("*") if p.is_file()]
+    cur = store.event_cursor()
+    assert cur is None or cur[1] < seq
+    f.close()
+    monkeypatch.undo()
+    f2 = artifact_follower(d, export)                                  # the disk freed: the same event converges
+    f2.step()
+    assert served.control.store.get(session).fields.get("artifact_acked") is True
+    assert held(store, session, ticket) is not None
+    f2.close()
+
+
+def test_a_second_artifact_of_the_same_ticket_with_other_digests_stops_the_follower(store, repo, served, tmp_path):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, ticket, seq = published(served)
+    export = exported(tmp_path, session, ticket)
+    f = artifact_follower(d, export)
+    f.step()
+    f.close()
+    first = held(store, session, ticket)
+    exported(tmp_path, session, ticket, content=b"another bundle")
+    store.drop_event_cursor()
+    f2 = artifact_follower(d, export)
+    with pytest.raises(F.FollowStopped) as e:
+        f2.step()
+    assert e.value.name == "take-conflict"
+    assert held(store, session, ticket) == first
+    f2.close()
+
+
+def test_a_taken_bundle_whose_file_is_gone_is_taken_again_from_a_live_export(store, repo, served, tmp_path):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, ticket, _ = published(served)
+    export = exported(tmp_path, session, ticket)
+    f = artifact_follower(d, export)
+    f.step()
+    f.close()
+    t = held(store, session, ticket)
+    (store.directory / t.path).unlink()
+    store.drop_event_cursor()
+    f2 = artifact_follower(d, export)
+    f2.step()
+    assert (store.directory / t.path).read_bytes() == BUNDLE
+    f2.close()
+
+
+def test_a_taken_bundle_whose_file_and_export_are_gone_is_passed_unacked(store, repo, served, tmp_path):  # noqa: F811
+    """The row alone is not the artifact, and an absent export is passed like any other (CONTROL was acked once)."""
+    d = Dispatch(store, repo, served)
+    session, ticket, _ = published(served)
+    export = exported(tmp_path, session, ticket)
+    f = artifact_follower(d, export)
+    f.step()
+    f.close()
+    t = held(store, session, ticket)
+    (store.directory / t.path).unlink()
+    shutil.rmtree(export / session)
+    store.drop_event_cursor()
+    f2 = artifact_follower(d, export)
+    f2.step()
+    assert held(store, session, ticket) == t
+    f2.close()
+
+
+def test_an_artifact_with_no_bundle_is_taken_as_a_record_with_no_file(store, repo, served, tmp_path):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, ticket, _ = published(served)
+    f = artifact_follower(d, exported(tmp_path, session, ticket, bundle=None, bundle_digest=None))
+    f.step()
+    t = held(store, session, ticket)
+    assert t is not None and t.path is None and t.bundle_digest is None
+    assert served.control.store.get(session).fields.get("artifact_acked") is True
+    f.close()
+
+
+def test_the_taken_bundle_is_private_to_dispatch(store, repo, served, tmp_path):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, ticket, _ = published(served)
+    f = artifact_follower(d, exported(tmp_path, session, ticket))
+    f.step()
+    t = held(store, session, ticket)
+    p = store.directory / t.path
+    assert p.stat().st_mode & 0o777 == 0o600
+    assert (store.directory / "taken").stat().st_mode & 0o077 == 0 and p.parent.stat().st_mode & 0o077 == 0
     f.close()

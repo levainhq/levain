@@ -19,11 +19,16 @@ Handled:
   WITHOUT an ACK, retention falling back to ``dispatch_retain_days``;
 - an ``artifact`` event carrying ``artifact_digest``, when the follower has an ``export_dir``:
   :func:`levain.dispatch.export.read_artifact` reads root's ``dispatch-artifact.json`` for the event's session, the
-  file must name that session and the event's ticket, and only then ``ARTIFACT-ACK {ticket, artifact_digest}`` goes
-  (CONTROL checks the digest against its own record). An export that is absent, partial, malformed or names another
-  session or ticket, an ``artifact_failed`` event, and a follower with no ``export_dir`` are all passed WITHOUT an ACK:
-  an ACK lets the reaper trash work dispatch never took, and the stream must move on (a replay from 0 meets exports
-  already trashed), so retention falls back to ``dispatch_retain_days``;
+  file must name that session and the event's ticket, then :func:`levain.dispatch.take.take_artifact` copies the bundle
+  into dispatch's own store and records it (idempotent by session and ticket), and only then
+  ``ARTIFACT-ACK {ticket, artifact_digest}`` goes (CONTROL checks the digest against its own record; the event's
+  digest is what is acked, and what it covers is open in the contract). A take that fails (the bundle absent, its
+  bytes not the digest the artifact names, the disk, another take recorded for the ticket) sends no ACK and stops the
+  follower by name with the cursor before the event, as a refused ACK does. An export that is absent, partial,
+  malformed or names another session or ticket, an ``artifact_failed`` event, and a follower with no ``export_dir``
+  are passed WITHOUT an ACK and the cursor moves: an ACK lets the reaper trash work dispatch never took, and the stream
+  must not stall on an export a replay from 0 meets already trashed, so retention falls back to
+  ``dispatch_retain_days``;
 - every other event (other states, ``pool``, a kind this module does not know): passed.
 
 A hello naming another journal than the cursor's, or a ``reset``, drops the cursor: the next :meth:`step` replays from
@@ -44,6 +49,7 @@ from levain.dispatch import DispatchError
 from levain.dispatch.export import ArtifactUnreadable, read_artifact
 from levain.dispatch.jobs import (_SESSION_TERMINAL, AlreadyRecorded, JobStore, RecordConflict, TransitionRefused,
                                   report_of)
+from levain.dispatch.take import TakeFailed, take_artifact
 from levain.dispatch.verifier_report import VerifierRun
 from levain.slot import Refused
 from levain.slot import control_client as CC
@@ -94,7 +100,7 @@ class EventFollower:
     ``connect()`` a ControlClient for the ACK; ``resolve`` maps a verifier's terminal event to its inputs.
     ``export_dir`` is root's ``export/dispatch`` directory (None: artifact events are passed unacked). ``fault``
     is the crash seam: called after (1) with ``("written", seq)``, or ``("repeat", seq)`` when the store already held
-    the event's outcome, and with ``("acked", seq)`` after (2)."""
+    the event's outcome (``("taken", seq)`` after an artifact's take), and with ``("acked", seq)`` after (2)."""
 
     def __init__(self, jobs: JobStore, stream: Callable[[int, str | None], CC.EventStream],
                  connect: Callable[[], CC.ControlClient], resolve: Resolve, *,
@@ -216,6 +222,11 @@ class EventFollower:
             log.warning("artifact event %d (session %s) passed unacked: the file names another ticket", ev.seq,
                         body.get("session"))
             return
+        try:
+            take_artifact(self.jobs, self._export_dir, art)
+        except TakeFailed as e:
+            raise FollowStopped(e.name, f"event {ev.seq}: {e}") from None
+        self._hit("taken", ev.seq)
         self._ack(ev.seq, {"ticket": body["ticket"], "artifact_digest": digest})
         self._hit("acked", ev.seq)
 

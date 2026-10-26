@@ -2,8 +2,8 @@
 
 Root builds the file in the same publish transaction as the bundle (CONTRACT §10.2); dispatch reads it as a member of the
 export group, never writes it. :func:`read_artifact` returns an :class:`ExportedArtifact` only for a file that is exactly
-the ``levain-dispatch-artifact/1`` shape: anything else (absent, not a regular file, too large, unparseable, a key
-missing or extra, a field of the wrong type) raises :class:`ArtifactUnreadable` by name, so a caller never acts on a
+the ``levain-dispatch-artifact/1`` shape (a ``format`` key is optional; present, it is that value): anything else
+(absent, not a regular file, too large, unparseable, a key missing or extra, a field of the wrong type) raises :class:`ArtifactUnreadable` by name, so a caller never acts on a
 partial record.
 
 The file is NOT an :class:`levain.dispatch.adopt.ArtifactRecord`: that record is a verified RUN (staged commit, tree,
@@ -25,7 +25,8 @@ FORMAT = "levain-dispatch-artifact/1"
 FILE = "dispatch-artifact.json"
 #: the file holds seven short fields; a larger one is not root's
 MAX_BYTES = 16 * 1024
-_KEYS = frozenset({"format", "session", "ticket", "manifest_digest", "bundle", "bundle_digest", "files", "bytes"})
+#: the fields CONTRACT §3.5 names; a `format` key, which the contract does not define, is allowed beside them
+_KEYS = frozenset({"session", "ticket", "manifest_digest", "bundle", "bundle_digest", "files", "bytes"})
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}", re.ASCII)
 
 
@@ -94,9 +95,9 @@ def _read(export_dir: str, session: str) -> bytes:
 
 
 def _shape(obj: object, session: str) -> ExportedArtifact:
-    if not isinstance(obj, dict) or set(obj) != _KEYS:
+    if not isinstance(obj, dict) or set(obj) - {"format"} != _KEYS:
         raise ArtifactUnreadable("shape", "not exactly the levain-dispatch-artifact/1 keys")
-    if obj["format"] != FORMAT:
+    if "format" in obj and obj["format"] != FORMAT:
         raise ArtifactUnreadable("format", "not levain-dispatch-artifact/1")
     if obj["session"] != session:
         raise ArtifactUnreadable("session-mismatch", "the file names another session than its directory")

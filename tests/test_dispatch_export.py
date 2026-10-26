@@ -85,6 +85,15 @@ def test_a_missing_key_is_never_an_artifact(tmp_path, drop):
     refused(tmp_path, "shape")
 
 
+def test_a_file_with_no_format_key_reads(tmp_path):
+    """The contract does not define a `format` key in the file: a reader that refused every file without one would be
+    a silent dead path against the real writer. A `format` that IS present must be the known value."""
+    obj = good()
+    del obj["format"]
+    a = X.read_artifact(put(tmp_path, obj), SESSION)
+    assert a.ticket == "tkt-1"
+
+
 def test_an_extra_key_is_never_an_artifact(tmp_path):
     put(tmp_path, good(extra=1))
     refused(tmp_path, "shape")

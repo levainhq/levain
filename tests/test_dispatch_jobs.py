@@ -13,6 +13,7 @@ import pytest
 
 from levain.cockpit.consent import utc_stamp
 from levain.dispatch import ContractRefused, DispatchError
+from levain.dispatch import jobs as djobs
 from levain.dispatch import sign as dsign
 from levain.dispatch.jobs import (
     CAUSES, EDGES, FORMAT, STATES, TERMINAL, UNSIGNED_LEASE, CapabilityRefused, JobStore, JobStoreError,
@@ -1462,6 +1463,27 @@ def test_the_event_cursor_never_moves_backward_within_a_journal(store):
     store.drop_event_cursor()
     store.set_event_cursor("j-2", 1)
     assert store.event_cursor() == ("j-2", 1)
+
+
+def test_a_taken_artifact_is_recorded_once_a_repeat_is_a_no_op_and_other_digests_conflict(store):
+    t = djobs.TakenArtifact("s-" + "1" * 16, "tkt", "sha256:" + "a" * 64, "sha256:" + "b" * 64, "taken/x/bundle", 2, 9)
+    assert store.taken_artifact(t.session, t.ticket) is None
+    assert store.record_take(t) is True and store.record_take(t) is False
+    assert store.taken_artifact(t.session, t.ticket) == t
+    with pytest.raises(djobs.TakeConflict):
+        store.record_take(djobs.TakenArtifact(t.session, t.ticket, t.manifest_digest, "sha256:" + "c" * 64, t.path,
+                                              2, 9))
+    other = djobs.TakenArtifact(t.session, "tkt-2", t.manifest_digest, None, None, 0, 0)
+    assert store.record_take(other) is True
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        for sql in ("UPDATE artifact_takes SET files = 1", "DELETE FROM artifact_takes"):
+            with pytest.raises(sqlite3.DatabaseError):
+                conn.execute(sql)
+        with pytest.raises(sqlite3.DatabaseError):          # a path with no digest (or the reverse) is no record
+            conn.execute("INSERT INTO artifact_takes VALUES ('s','t','m',NULL,'p',0,0,'now')")
+    finally:
+        conn.close()
 
 
 def test_a_run_record_insert_refused_for_another_reason_is_a_dispatch_error(store, repo):
