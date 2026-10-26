@@ -670,9 +670,9 @@ def _ensure(conn: sqlite3.Connection) -> None:
     """The ONE ensure-schema path of the chat tables (head ruling Q-A, 1025+40): in one ``BEGIN IMMEDIATE``, every
     missing additive column (:data:`CHAT_ADDED_COLUMNS`) by ``ALTER TABLE ... ADD COLUMN``, ``DROP`` of every view,
     trigger and index whose stored text is not :data:`CHAT_SCHEMA`'s (:func:`_stale`), then every statement of
-    :data:`CHAT_SCHEMA` (``IF NOT EXISTS``: new tables and objects, and the dropped ones); when anything changed, ``PRAGMA integrity_check`` must answer ``ok``
-    before the COMMIT. Any raise rolls all of it back. Rows and rowids are never rewritten (no table rebuild, no
-    ``writable_schema``)."""
+    :data:`CHAT_SCHEMA` (``IF NOT EXISTS``: new tables and objects, and the dropped ones); when anything changed,
+    ``PRAGMA integrity_check`` must answer ``ok`` before the COMMIT. Any raise rolls all of it back. Rows and rowids
+    are never rewritten (no table rebuild, no ``writable_schema``)."""
     conn.execute("BEGIN IMMEDIATE")
     try:
         before = conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()

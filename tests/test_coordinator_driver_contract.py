@@ -144,7 +144,7 @@ def test_driver_still_imports_nothing_from_consent():
     assert not any(m.startswith("levain") for m in mods)
 
 
-# --- L3 r1 K5: a reply is forgotten only after its write; K8: an inbound id keeps its first subtype ----------------------
+# --- L3 r1 K5: a reply is forgotten only after its write; K8: an inbound id keeps its first subtype --------------------
 class Unreadable(Mapping):
     def __getitem__(self, key):
         raise RuntimeError("unreadable reply")
