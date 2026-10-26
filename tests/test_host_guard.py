@@ -983,6 +983,21 @@ def test_managed_allow_read_of_the_wrong_type_refuses(ent, bad):
     assert hg.check_managed_settings([("m.json", {"sandbox": {"filesystem": {"allowRead": []}}})], roots) == []
 
 
+_MANAGED_LIST_KEYS = sorted({k for k, t in hg._SANDBOX_TYPES.items() if t is list}
+                            | {("filesystem", "denyRead"), ("filesystem", "allowRead")})
+
+
+@pytest.mark.parametrize("bad", [[1], ["x", None]], ids=repr)
+@pytest.mark.parametrize("keys", _MANAGED_LIST_KEYS, ids=".".join)
+def test_managed_list_key_holding_a_non_string_refuses(ent, keys, bad):
+    """RULINGS 1026-10 Q5 (2): one fact, one strictness. render's repo check requires a list key's items to be strings;
+    the managed exact-type check does too (a `denyRead: [1]` passed every check before)."""
+    roots = hg.cc_writable_roots(ent)
+    probs = hg.check_managed_settings([("m.json", {"sandbox": _nested(keys, bad)})], roots)
+    name = type(next(i for i in bad if type(i) is not str)).__name__
+    assert f"m.json: sandbox.{'.'.join(keys)} must be a list of strings, holds {name}" in probs
+
+
 def test_the_pinned_block_closes_mach_lookup_apple_events_and_nested_namespaces():
     block = hg.cc_sandbox_block("/x")
     assert block["network"]["allowMachLookup"] == []

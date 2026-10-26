@@ -1540,8 +1540,14 @@ def check_managed_settings(docs: Sequence[tuple[str, Any]], roots: Sequence[Path
         for keys, typ in {**_SANDBOX_TYPES, ("filesystem", "denyRead"): list,
                           ("filesystem", "allowRead"): list}.items():
             v = _get(sb, keys)
-            if v is not _MISSING and type(v) is not typ:
+            if v is _MISSING:
+                continue
+            if type(v) is not typ:
                 problems.append(f"{path}: sandbox.{'.'.join(keys)} must be {typ.__name__}, got {type(v).__name__}")
+            elif typ is list and (odd := next((i for i in v if type(i) is not str), _MISSING)) is not _MISSING:
+                # RULINGS 1026-10 Q5 (2): items too, as render's repo check (`repo_loosening_refusals`) requires.
+                problems.append(f"{path}: sandbox.{'.'.join(keys)} must be a list of strings, "
+                                f"holds {type(odd).__name__}")
         for keys in _LOOSENING_TRUE:
             if _get(sb, keys) is True:
                 problems.append(f"{path}: sandbox.{'.'.join(keys)} is true")

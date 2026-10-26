@@ -241,8 +241,11 @@ class LiveSetting:
     `get_ex()` answers the same value paired with whether it came from a real read (an in-`allowed` value the read
     returned) rather than `fail_closed` standing in for one (timeout, error, out-of-`allowed` value, closed).
     `reader` is the read thread while it lives (the decider's close reports it: a read cannot be cancelled).
-    `watch(fn)`: `fn` gets every real read's value on the read thread before any `get()` waiting on that read is
-    woken; reads run one at a time, so `fn` sees them in the order they started (`Capped` ratchets there)."""
+    `watch(fn)`: `fn` gets every ACCEPTED real read's value on the read thread before any `get()` waiting on that
+    read is woken; reads run one at a time, so `fn` sees them in the order they started (`Capped` ratchets there).
+    A read is accepted when it finishes before the deadline of a `get()` it answers, and exactly the `get()`s whose
+    deadline it beat answer it as real; a read that finishes after every such deadline reached no request and is
+    passed to no watcher (L3 verify r2, codex: a late gated answer must not gate the rest of the launch)."""
 
     def __init__(self, read: Callable[[], str], *, allowed: tuple[str, ...] = classify.MODES,
                  fail_closed: str = classify.GATED, timeout_s: float = 2.0) -> None:
@@ -267,8 +270,9 @@ class LiveSetting:
             if self._flight is not None:
                 self._flight[1].set()        # wakes every waiting get(); each then reads `_closed`
 
-    def _start(self, now: float) -> tuple[float, threading.Event, dict]:
-        done, box = threading.Event(), {}
+    def _start(self, now: float, until: float) -> tuple[float, threading.Event, dict]:
+        # box["until"]: the latest deadline among the get()s this read answers (raised as they join, under _lock).
+        done, box = threading.Event(), {"until": until}
 
         def work() -> None:
             try:
@@ -276,13 +280,17 @@ class LiveSetting:
             except BaseException as exc:     # noqa: BLE001
                 box["e"] = exc
             finally:
-                try:
-                    v = box.get("v")
-                    if not self._closed and "e" not in box and v in self._allowed:
-                        for fn in list(self._watchers):
-                            fn(v)
-                finally:
-                    done.set()
+                # Accept, watch and wake under _lock: a get() decides its own timeout under it too, so a read is
+                # accepted only while some get() can still answer it.
+                with self._lock:
+                    try:
+                        v, at = box.get("v"), time.monotonic()
+                        if (not self._closed and "e" not in box and v in self._allowed and at < box["until"]):
+                            box["at"] = at
+                            for fn in list(self._watchers):
+                                fn(v)
+                    finally:
+                        done.set()
 
         self._flight = (now, done, box)
         self._thread = threading.Thread(target=work, name="levain-egress-setting", daemon=True)
@@ -302,18 +310,19 @@ class LiveSetting:
                     return closed
                 f = self._flight
                 if f is None or f[1].is_set():
-                    f, mine = self._start(time.monotonic()), True
+                    f, mine = self._start(time.monotonic(), deadline), True
                 else:
                     mine = f[0] >= arrived
-            if not f[1].wait(max(0.0, deadline - time.monotonic())):
-                return closed
+                    if mine:
+                        f[2]["until"] = max(f[2]["until"], deadline)
+            waited = f[1].wait(max(0.0, deadline - time.monotonic()))
             with self._lock:
                 if self._closed:
                     return closed
-            if mine:
-                v = f[2].get("v")
-                return (v, True) if "e" not in f[2] and v in self._allowed else closed
-            if time.monotonic() >= deadline:
+                if mine:
+                    at = f[2].get("at")
+                    return (f[2]["v"], True) if at is not None and at < deadline else closed
+            if not waited or time.monotonic() >= deadline:
                 return closed
 
 
@@ -335,9 +344,10 @@ class Capped:
     timeout, an error, a value outside the allowed modes) answers the strictest mode for that `get()` alone. A
     setting with no `get_ex` has every read counted real. A value outside `STRICTEST_FIRST` on either side answers
     the strictest mode. `get()` is called from concurrent decision threads: the hold is updated under a lock (the
-    live read happens outside it). A setting with `watch` (`LiveSetting`) also moves the hold as each real read
-    finishes, before that read answers anyone and before the next read can start, so no `get()` answers looser
-    than a read that started before its own (L3 r1, codex 1: a later read reaching the lock first)."""
+    live read happens outside it). A setting with `watch` (`LiveSetting`) also moves the hold as each accepted real
+    read finishes, before that read answers anyone and before the next read can start, so no `get()` answers looser
+    than a read that started before its own (L3 r1, codex 1: a later read reaching the lock first). A read that
+    finished after every request waiting on it timed out answered no one and moves nothing (L3 verify r2)."""
 
     def __init__(self, live: Any, launched: str) -> None:
         self._live = live

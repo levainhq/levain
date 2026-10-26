@@ -260,3 +260,54 @@ def test_capped_ratchets_only_on_a_real_read() -> None:
 
 def test_fixed_reads_are_real() -> None:
     assert dm.Fixed(classify.GATED).get_ex() == (classify.GATED, True)
+
+
+def _stalls_once_reading(standing: dict):
+    """A read that captures the standing default when it starts and, the first time, stalls past the timeout before
+    answering that captured value."""
+    import threading
+
+    release, calls = threading.Event(), {"n": 0}
+
+    def read() -> str:
+        v = standing["mode"]
+        calls["n"] += 1
+        if calls["n"] == 1:
+            release.wait(10)
+        return v
+
+    return read, release
+
+
+def test_a_timed_out_gated_read_finishing_late_does_not_tighten_the_launch() -> None:
+    """P1 verify r2 (codex, introduced by Q1's watcher; RULINGS 1026-10 Q6): an open launch's read returns gated but
+    only after it timed out for its request; the setting reopened meanwhile. The late answer reached no request, so
+    it must not move the hold: the next fresh read answers open."""
+    g, o = classify.GATED, classify.OPEN_NETWORK
+    standing = {"mode": g}
+    read, release = _stalls_once_reading(standing)
+    s = dm.LiveSetting(read, timeout_s=0.2)
+    c = dm.Capped(s, o)
+    assert c.get() == g                                      # timed out: gated for this get alone
+    standing["mode"] = o                                     # the setting reopens
+    release.set()                                            # the stalled read completes with its captured gated
+    assert _until(lambda: s.reader is None)
+    assert c.get() == o
+
+
+def test_a_timed_out_gated_read_finishing_late_leaves_the_launch_open(rig) -> None:
+    """The same, through a running decider: the request whose read timed out cards; the stalled read then answers
+    gated after the reopen; the next request is allowed."""
+    standing = {"mode": classify.GATED}
+    read, release = _stalls_once_reading(standing)
+    s = dm.LiveSetting(read, timeout_s=0.3)
+    r = rig(setting=s, launch_mode=classify.OPEN_NETWORK)
+    p, _ = r.srt.req("POST", path="/during-stall")
+    assert _until(lambda: len(r.desk.filed) == 1), "a request whose read timed out must card"
+    standing["mode"] = classify.OPEN_NETWORK
+    release.set()
+    assert _until(lambda: s.reader is None)
+    p2, rid2 = r.srt.req("POST", path="/after-stall")
+    assert _action(r.srt.wait(p2)) == "allow", "a late answer no request accepted must not gate the launch"
+    assert len(r.desk.filed) == 1
+    assert all(row.open_network is True for row in r.rows(rid2))
