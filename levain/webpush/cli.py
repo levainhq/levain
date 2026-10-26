@@ -38,12 +38,54 @@ def register(subparsers) -> None:
     pr = common(sub.add_parser("pair", help="Print a short pairing code to type into the installed phone app."))
     pr.add_argument("--label", default=None, help="What to call the phone in `levain ping devices` (default: phone).")
     pr.set_defaults(func=_pair)
+    from levain.webpush import presence
+
+    for word, text in (("quiet", "Hold phone pushes for a while (default 60 min), except urgent ones; one summary and the held "
+                                 "pings follow when it ends."),
+                       ("sleep", "Hold every phone push, urgent too, until your next keyboard or mouse input at this "
+                                 "Mac (read from the Mac's input idle time); one summary and the held pings follow."),
+                       ("loud", "Push every ping for a while (default 60 min), over everything else; `loud off` ends it."),
+                       ("away", "Push at once until you next type here (optional override)."),
+                       ("remote", "Push for a while (default 60 min) whatever the desk shows (optional override)."),
+                       ("back", "Clear away, remote, quiet or sleep; a standing loud is left (`loud off`).")):
+        w = common(sub.add_parser(word, help=text))
+        if word in presence.TIMED:
+            w.add_argument("duration", nargs="?", default=None,
+                           help="30, 30m or 2h" + (", or `off`" if word == "loud" else "") + " (default 60 min, most 24 h).")
+        w.set_defaults(func=_word, word=word)
+    common(sub.add_parser("status", help="Whether a ping is pushed now, and why.")).set_defaults(func=_status)
 
 
 def _qdir(args: argparse.Namespace) -> Path:
     from levain.consent.queue import default_queue_dir
 
     return args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
+
+
+def _word(args: argparse.Namespace) -> int:
+    from levain.webpush import presence
+
+    qdir = _qdir(args)
+    try:
+        presence.set_word(qdir, args.word, duration=getattr(args, "duration", None))
+    except presence.PresenceError as e:
+        print(f"levain ping {args.word}: {e}")
+        return 2
+    try:   # a word can make held pings due (loud, away, remote, back, a quiet ended): start their push now
+        from levain.webpush import held
+
+        held.flush_if_due(qdir, throttle=False)
+    except Exception:  # noqa: BLE001 - the word is written; the next gate call or the server tick flushes
+        pass
+    print(presence.describe(qdir))
+    return 0
+
+
+def _status(args: argparse.Namespace) -> int:
+    from levain.webpush import presence
+
+    print(presence.describe(_qdir(args)))
+    return 0
 
 
 def _keygen(args: argparse.Namespace) -> int:

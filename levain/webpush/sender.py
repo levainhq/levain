@@ -129,14 +129,25 @@ def _post(req: urllib.request.Request) -> int:
 
 
 def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
-         command: bool | None = None, push: bool = True) -> list[tuple[int, int]]:
+         command: bool | None = None, push: bool = True, hold: str | None = None) -> list[tuple[int, int]]:
     """Record the ping (``command``: whether the notify command started for it, None when none is set), push it to each live subscription concurrently; returns (subscription id, HTTP status)
     pairs (status 0: no answer; :data:`UNKNOWN`: none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription, and so does a refusal that names the key (:class:`_Dead`). Every
-    store write happens in this thread; the workers only talk to the push services."""
+    store write happens in this thread; the workers only talk to the push services. ``push=False`` pushes nothing; with
+    ``hold`` (the reason, see :meth:`PushStore.add_ping`) the recorded ping also waits in the held queue for
+    :func:`levain.webpush.held.flush`."""
     qdir = Path(queue_dir)
     store = PushStore(qdir)
-    subs = store.live_subscriptions() if push else []   # push=False: record only, the caller saw no live phone
-    ping_id = store.add_ping(kind, ref, title, body, command)
+    # the ping row and its held row are one transaction: a ping is never recorded as held-for-later and then lost
+    ping_id = store.add_ping(kind, ref, title, body, command, hold=(url, hold) if hold and not push else None)
+    if not push:   # the caller saw no live phone, or the presence rule held the push
+        return []
+    return deliver(qdir, store, ping_id, kind=kind, ref=ref, title=title, body=body, url=url)
+
+
+def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str | None, title: str, body: str,
+            url: str) -> list[tuple[int, int]]:
+    """Push the already recorded ping ``ping_id`` to each live subscription and record each answer."""
+    subs = store.live_subscriptions()
     data = build_payload(title, body, ref or kind, url, ping_id)
     topic = topic_for(ref)
     reqs = [(sub, _prepare(qdir, sub, data, topic)) for sub in subs]
@@ -170,7 +181,7 @@ def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body:
 
 
 def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
-          command: bool | None = None, push: bool = True) -> bool:
+          command: bool | None = None, push: bool = True, hold: str | None = None) -> bool:
     """Start :func:`send` detached, never waited on. ``push=False`` records the ping and pushes it to no phone: how a
     ping that only the notify command carried gets its row, decided by the caller's own read of the phones. The text goes to the child on its
     STDIN as JSON, so a body that begins with ``-`` is not an option and the consent text never sits in the process
@@ -178,7 +189,7 @@ def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body
     from levain.launch import child_env
 
     fields = {"title": title[:300], "body": body[:4000], "ref": None if ref is None else ref[:200], "url": url[:500],
-              "command": command, "push": push}
+              "command": command, "push": push, "hold": hold}
     data = json.dumps(fields).encode("utf-8", "replace")
     while len(data) > _SPAWN_STDIN_MAX and fields["body"]:
         fields["body"] = fields["body"][: len(fields["body"]) // 2]

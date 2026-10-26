@@ -84,6 +84,7 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from levain.http_guards import LISTEN_BACKLOG, GuardedHandler
+from levain.webpush.held import tick as held_tick
 
 __all__ = ["DEFAULT_PHONE_PORT", "PHONE_TOKEN_HEADER", "PhoneError", "make_phone_server", "run_phone_server",
            "tailscale_name"]
@@ -1246,7 +1247,12 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
             # this line is printed only once that file holds it
             print(f"  the phone link (a secret; {lives}) is in {link_file}: open {page}#phone_token=<its phone_token>",
                   flush=True)
-        httpd.serve_forever()
+        ticking = threading.Event()
+        threading.Thread(target=held_tick, args=(queue_dir, ticking), daemon=True).start()
+        try:
+            httpd.serve_forever()
+        finally:
+            ticking.set()
     except KeyboardInterrupt:
         pass
     finally:

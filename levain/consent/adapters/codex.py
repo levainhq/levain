@@ -88,8 +88,8 @@ from levain.consent.adapters.claude_code import (  # noqa: F401
 )
 from levain.consent.adapters.claude_code import (  # noqa: F401 - GATE_TIMEOUT is the installer's
     ATTENDED_POSTURES, FLOOR_TEXT, GATE_HOLD_CEILING, GATE_POLL, GATE_SLEEP_CAP, GATE_TIMEOUT, HOOK_FLAGS, HOOKRUN,
-    RULING_TEXT, UNCONFINED_ENV, U_IRR, U_REV, _pre, _what, floor_text, notify, send_repings, unconfined,
-    unconfined_state,
+    RULING_TEXT, UNCONFINED_ENV, U_IRR, U_REV, _pre, _what, floor_text, flush_held_pings, notify, send_repings,
+    unconfined, unconfined_state,
 )
 from levain.consent.adapters.claude_code import DEFAULT_GATE_HOLD, SLOT_HOW, queue_socket_planted
 from levain.consent.broker_client import in_slot
@@ -458,6 +458,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
     if not isinstance(event, Mapping) or event.get("hook_event_name") != GATE_EVENT:
         return None
+    flush_held_pings(queue)   # first, so no return below (a halted session, limits, malformed) skips it
     tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
     session = event.get("session_id")
     has_session = isinstance(session, str) and bool(session)

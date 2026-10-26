@@ -43,7 +43,7 @@ def test_a_phone_with_pings_on_gets_the_gate_ping_with_its_ref(tmp_path, monkeyp
                               cwd=tmp_path, ref="request:r1") is True
     assert calls == [{"kind": "consent", "ref": "request:r1", "title": "levain",
                       "body": "claude waits on you: Bash (request r1).", "url": "/?view=needs", "command": None,
-                      "push": True}]
+                      "push": True, "hold": None}]
 
 
 def test_a_ruling_ping_reaches_the_phone_without_a_notify_command(tmp_path, monkeypatch):
@@ -75,7 +75,7 @@ def test_a_notify_command_only_install_still_gets_the_ping_recorded(tmp_path, mo
                               cwd=tmp_path, ref="request:r2") is True
     assert calls == [{"kind": "consent", "ref": "request:r2", "title": "levain",
                       "body": "claude waits on you: Bash (request r2).", "url": "/?view=needs", "command": True,
-                      "push": False}]
+                      "push": False, "hold": None}]
 
 
 def test_a_notify_command_that_cannot_start_is_recorded_as_not_started_and_the_ping_is_not_sent(tmp_path, monkeypatch):

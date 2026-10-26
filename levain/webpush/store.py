@@ -4,13 +4,17 @@ The directory is 0700 and the file 0600; a symlinked directory or file is refuse
 ``O_NOFOLLOW`` so a link planted between the check and the open is not followed. Under a sandboxed agent the
 queue directory is outside its write reach, which is where the VAPID private key belongs.
 
-``pings``, ``deliveries`` and ``opens`` are records: a trigger refuses to change or delete a row.
+``pings``, ``deliveries`` and ``opens`` are records: a trigger refuses to change or delete a row. ``held`` is not: it is
+the queue of pings the presence rule held back from the phone (:mod:`levain.webpush.held`). A flush claims a held ping
+with a lease (``claimed_at``) and marks it released only after a push to the phone succeeded; a claim older than
+:data:`HELD_LEASE_SECS` is taken again, so a flush that dies loses nothing and a duplicate is bounded by the lease.
 """
 from __future__ import annotations
 
 import os
 import sqlite3
 import stat
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -25,6 +29,7 @@ STORE_FORMAT = "levain-push-store/1"
 MAX_SUBSCRIPTIONS_PER_DEVICE = 5
 MAX_SUBSCRIPTIONS = 20
 STAMP = "%Y-%m-%dT%H:%M:%SZ"   # the one stamp format of this store, whole seconds, UTC
+HELD_LEASE_SECS = 300          # a held ping claimed for a push is another flush's to take again after this long
 
 
 class PushStoreError(RuntimeError):
@@ -73,6 +78,8 @@ _SCHEMA: tuple[str, ...] = (
     "status INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS opens (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
     "REFERENCES pings(id), device_id TEXT, at TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS held (ping_id INTEGER PRIMARY KEY REFERENCES pings(id), url TEXT NOT NULL, "
+    "reason TEXT NOT NULL, held_at TEXT NOT NULL, released_at TEXT, claimed_at TEXT)",
     *_records("pings"), *_records("deliveries"), *_records("opens"),
 )
 
@@ -142,6 +149,8 @@ class PushStore:
             # NULL none was set (and every ping recorded before the column existed)
             if "command" not in {r[1] for r in conn.execute("PRAGMA table_info(pings)")}:
                 conn.execute("ALTER TABLE pings ADD COLUMN command INTEGER")
+            if "claimed_at" not in {r[1] for r in conn.execute("PRAGMA table_info(held)")}:
+                conn.execute("ALTER TABLE held ADD COLUMN claimed_at TEXT")
             # a subscription with no device is one no revoke can stop: none is stored any more, and any left is retired
             conn.execute("UPDATE subscriptions SET retired_at = ? WHERE device_id IS NULL AND retired_at IS NULL",
                          (now_stamp(),))
@@ -209,12 +218,49 @@ class PushStore:
                 "WHERE s.retired_at IS NULL AND (d.id IS NULL OR d.revoked_at IS NULL) ORDER BY s.id")]
 
     # --- the record ----------------------------------------------------------------------------------
-    def add_ping(self, kind: str, ref: str | None, title: str, body: str, command: bool | None = None) -> int:
-        """Record one ping; ``command`` is whether the notify command started (None: none was set)."""
+    def add_ping(self, kind: str, ref: str | None, title: str, body: str, command: bool | None = None, *,
+                 hold: tuple[str, str] | None = None) -> int:
+        """Record one ping; ``command`` is whether the notify command started (None: none was set). ``hold`` is
+        ``(url, reason)``: the ping is also queued for the phone in the same transaction, ``reason`` being the word that
+        muted it (``quiet``, ``sleep``) or ``active`` (the desk was in use)."""
         with self.write() as c:
-            return int(c.execute("INSERT INTO pings (at, kind, ref, title, body, command) VALUES (?,?,?,?,?,?)",
-                                 (now_stamp(), kind, ref, title, body,
-                                  None if command is None else int(bool(command)))).lastrowid)
+            ping_id = int(c.execute("INSERT INTO pings (at, kind, ref, title, body, command) VALUES (?,?,?,?,?,?)",
+                                    (now_stamp(), kind, ref, title, body,
+                                     None if command is None else int(bool(command)))).lastrowid)
+            if hold is not None:
+                c.execute("INSERT INTO held (ping_id, url, reason, held_at) VALUES (?,?,?,?)",
+                          (ping_id, hold[0], hold[1], now_stamp()))
+            return ping_id
+
+    # --- the held queue ------------------------------------------------------------------------------
+    @staticmethod
+    def _cutoff(now: float | None) -> str:
+        at = time.time() if now is None else now
+        return time.strftime(STAMP, time.gmtime(at - HELD_LEASE_SECS))
+
+    def held_items(self, *, now: float | None = None) -> list[dict[str, Any]]:
+        """The pings a flush may take now, oldest first, each with what it says: held, and not under a live claim."""
+        with self.read() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT h.ping_id, h.url, h.reason, h.held_at, p.kind, p.ref, p.title, p.body FROM held h "
+                "JOIN pings p ON p.id = h.ping_id WHERE h.released_at IS NULL "
+                "AND (h.claimed_at IS NULL OR h.claimed_at <= ?) ORDER BY h.ping_id", (self._cutoff(now),))]
+
+    def claim_held(self, ping_ids: list[int], *, now: float | None = None) -> list[int]:
+        """Lease these held pings to the caller and return the ids it got: a ping under a live claim, or already
+        released, is not given again, so racing flushes take disjoint sets."""
+        with self.write() as c:
+            at = time.strftime(STAMP, time.gmtime(time.time() if now is None else now))
+            cutoff = self._cutoff(now)
+            return [i for i in ping_ids if c.execute(
+                "UPDATE held SET claimed_at = ? WHERE ping_id = ? AND released_at IS NULL "
+                "AND (claimed_at IS NULL OR claimed_at <= ?)", (at, i, cutoff)).rowcount == 1]
+
+    def release_held(self, ping_id: int) -> None:
+        """Mark a claimed ping released: its push to the phone succeeded."""
+        with self.write() as c:
+            c.execute("UPDATE held SET released_at = ? WHERE ping_id = ? AND released_at IS NULL",
+                      (now_stamp(), ping_id))
 
     def add_delivery(self, ping_id: int, subscription_id: int, status: int, *, retire: bool = False) -> None:
         with self.write() as c:
