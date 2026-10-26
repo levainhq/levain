@@ -219,8 +219,8 @@ def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path | 
     request (14b Q5); and, when a cockpit data root is configured, its authority database (and sqlite's sidecars)
     and the authority anchor. ``home`` is the one :func:`targets_agent_config` expands ``~`` under (default the
     user's); ``cwd``, when absolute, stands in for the workspace. A levain home the floor's own predicate finds too
-    wide to deny whole (:func:`levain.firing.confinement.too_wide_to_deny`: a filesystem root, a path of two parts
-    or fewer, a shared temp directory, or one holding the home or the cwd) is named by its state directories instead
+    wide to deny whole (:func:`levain.firing.confinement.too_wide_to_deny` holds the rules; the event's cwd is passed
+    as its ``within``) is named by its state directories instead
     (:data:`levain.firing.confinement.LEVAIN_HOME_STATE_DIRS`, the floor's fallback list), or every file under it
     would be agent config. Never raises on the levain home: one that cannot be resolved is ``<home>/.levain``
     (fail closed for the store, never an outage of every tool). Bash is still never parsed: a shell write there
