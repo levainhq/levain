@@ -37,8 +37,8 @@ if TYPE_CHECKING:
 ANCHOR = "com.apple/levain"
 ANCHOR_FILE = Path("/etc/pf.anchors/levain")
 PF_TOKEN = Path("/var/db/levain/pf.token")
-#: Where an :data:`ENABLE_UNCERTAIN` run notes the reference it kept and no token names (P7): in the §2.2 run dir, apart
-#: from the token's directory so the token's own write failures do not reach it (P9). macOS empties it at boot
+#: Where an :data:`ENABLE_UNCERTAIN` run notes the reference it kept and no token names (P7): in the §2.2 run dir,
+#: apart from the token's directory so the token's own write failures do not reach it (P9). macOS empties it at boot
 #: [measured in r3c10-vm 10-26, lane pfbootf5 raw]; the note also carries the boot it was written in (P8,
 #: :func:`_kept_held`). The run dir is the reaper's to make (§22); with it not there yet, no note is written.
 PF_KEPT = RUN["darwin"] / "pf.token.kept"
