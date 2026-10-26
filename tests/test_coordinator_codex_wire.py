@@ -144,6 +144,7 @@ def test_notifications_and_server_requests_are_queued_in_arrival_order(daemon, t
 @pytest.mark.parametrize("broken", [CoercesIds, ZeroIsNoId])
 def test_request_ids_keep_their_json_type_and_zero_is_an_id(daemon, transport, broken):
     def check(cls):
+        daemon.client_replies.clear()
         wire = _open(daemon, transport, cls, timeout=1.0)
         try:
             tid = wire.start_thread({"cwd": "/tmp"})["thread"]["id"]
@@ -799,5 +800,86 @@ def test_w9_arrival_order_and_its_ordinals_hold_across_bootstrap(daemon, transpo
         got = _drain_when(wire, 3)
         assert [i.method for i in got] == ["thread/started", "configWarning", "thread/status/changed"], got
         assert [i.obs for i in got] == sorted(i.obs for i in got)
+    finally:
+        wire.close()
+
+
+# --- L3 r2 fixes (F1-F5) ----------------------------------------------------------------------------------------
+class _Unserialisable:
+    pass
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_f1_a_thread_start_that_cannot_be_serialised_leaves_no_bootstrap_behind(daemon, transport):
+    wire = _open(daemon, transport)
+    try:
+        with pytest.raises(TypeError):
+            wire.start_thread({"cwd": "/tmp", "bad": _Unserialisable()})
+        assert wire._boot is None and wire._waiters == {}
+        assert wire.start_thread({"cwd": "/tmp"})["thread"]["id"] == wire.thread_id
+    finally:
+        wire.close()
+
+
+@pytest.mark.parametrize("fin,op,payload,declared", [(True, 9, b"x" * 200, None), (False, 9, b"x", None),
+                                                     (True, 8, b"", 1 << 40)])
+def test_f2_a_control_frame_over_125_bytes_or_fragmented_is_a_protocol_fault(daemon, fin, op, payload, declared):
+    wire = _open(daemon, "ws")
+    try:
+        daemon.conns[-1].frame(op, payload, fin=fin, declared=declared)
+        end = time.monotonic() + 2.0
+        while wire.closed is None and time.monotonic() < end:
+            time.sleep(0.01)
+        assert wire.closed is not None and "control frame" in wire.closed, wire.closed
+    finally:
+        _within(wire.close, 3.0)
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_f3_a_reply_that_cannot_be_serialised_can_be_retried(daemon, transport):
+    wire = _open(daemon, transport)
+    try:
+        tid = wire.start_thread({"cwd": "/tmp"})["thread"]["id"]
+        daemon.conns[-1].request("item/commandExecution/requestApproval", fake.command_approval(tid, "t1", "a"), 5)
+        (item,) = _collect(wire, 1)
+        with pytest.raises(TypeError):
+            wire.reply(item, result={"decision": _Unserialisable()})
+        wire.reply(item, result={"decision": "decline"})
+        end = time.monotonic() + 2
+        while not daemon.client_replies and time.monotonic() < end:
+            time.sleep(0.01)
+        assert [r["id"] for r in daemon.client_replies] == [5]
+    finally:
+        wire.close()
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_f4_an_unparseable_request_with_a_usable_id_is_answered_by_the_wire(daemon, transport):
+    wire = _open(daemon, transport)
+    try:
+        wire.start_thread({"cwd": "/tmp"})
+        daemon.conns[-1].request("item/commandExecution/requestApproval", {"turnId": "t1"}, 0)
+        (item,) = _collect(wire, 1)
+        assert item.kind == "unparseable" and item.id == 0 and item.answered, item
+        end = time.monotonic() + 2
+        while not daemon.client_replies and time.monotonic() < end:
+            time.sleep(0.01)
+        (r,) = daemon.client_replies
+        assert r["id"] == 0 and r["error"]["code"] == -32600
+        with pytest.raises(CodexError):
+            wire.reply(item, error=(-32600, "again"))
+    finally:
+        wire.close()
+
+
+def test_f5_a_line_that_starts_with_a_brace_but_is_not_json_is_unparseable_not_a_log_line(daemon):
+    wire = _open(daemon, "line")
+    try:
+        c = daemon.conns[-1]
+        c.send_raw(b"plain log text")
+        c.send_raw(b'  {"half": ')
+        (item,) = _collect(wire, 1)
+        assert item.kind == "unparseable" and "JSON" in item.detail, item
+        assert wire.log_lines == 1
     finally:
         wire.close()

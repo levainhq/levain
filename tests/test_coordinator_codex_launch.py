@@ -17,6 +17,7 @@ from levain.coordinator import launch as cl
 from levain.coordinator.store import CoordStore
 from tests._codex_fake_daemon import FakeDaemon
 
+
 @pytest.fixture
 def home(monkeypatch):
     # a short path: a unix socket path is capped near 104 bytes on macOS, which pytest's tmp_path can pass

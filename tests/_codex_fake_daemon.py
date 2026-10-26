@@ -38,7 +38,7 @@ class Conn:
     daemon's side."""
 
     def __init__(self, write: Callable[[bytes], None], hangup: Callable[[], None],
-                 write_frame: Callable[[int, bytes], None] | None = None) -> None:
+                 write_frame: Callable[..., None] | None = None) -> None:
         self._write = write
         self._write_frame = write_frame
         self.hangup = hangup
@@ -54,8 +54,12 @@ class Conn:
         self.send_raw(json.dumps(obj).encode())
 
     def ping(self, payload: bytes) -> None:
+        self.frame(9, payload)
+
+    def frame(self, op: int, payload: bytes, *, fin: bool = True, declared: int | None = None) -> None:
+        """One raw WebSocket frame; ``declared`` overrides the length the header states (the payload is then short)."""
         with self._lock:
-            self._write_frame(9, payload)
+            self._write_frame(op, payload, fin, declared)
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
         self.send({"method": method, "params": params})
@@ -64,9 +68,9 @@ class Conn:
         self.send({"id": rid, "method": method, "params": params})
 
 
-def _ws_frame(body: bytes, op: int = 1) -> bytes:
-    n = len(body)
-    head = bytes([0x80 | op]) + (bytes([n]) if n < 126 else bytes([126]) + struct.pack(">H", n) if n < 65536 else
+def _ws_frame(body: bytes, op: int = 1, fin: bool = True, declared: int | None = None) -> bytes:
+    n = len(body) if declared is None else declared
+    head = bytes([(0x80 if fin else 0) | op]) + (bytes([n]) if n < 126 else bytes([126]) + struct.pack(">H", n) if n < 65536 else
                             bytes([127]) + struct.pack(">Q", n))
     return head + body
 
@@ -161,14 +165,20 @@ class FakeDaemon:
         try:
             head = b""
             while b"\r\n\r\n" not in head:
-                head += conn.recv(1)
+                got = conn.recv(1)
+                if not got:
+                    raise EOFError
+                head += got
+                if len(head) > 8192:
+                    return
             key = next(ln.split(b":", 1)[1].strip() for ln in head.split(b"\r\n")
                        if ln.lower().startswith(b"sec-websocket-key:"))
             accept = base64.b64encode(hashlib.sha1(key + _GUID).digest())
             conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nconnection: Upgrade\r\nupgrade: websocket\r\n"
                          b"sec-websocket-accept: " + accept + b"\r\n\r\n")
             c = Conn(lambda body: conn.sendall(_ws_frame(body)), lambda: conn.shutdown(socket.SHUT_RDWR),
-                     lambda op, body: conn.sendall(_ws_frame(body, op)))
+                     lambda op, body, fin=True, declared=None: conn.sendall(
+                         _ws_frame(body, op, fin, declared)))
             self.conns.append(c)
             while True:
                 self.reading.wait()

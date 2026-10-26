@@ -298,6 +298,9 @@ class WsFraming(_Framing):
                 n = struct.unpack(">H", self._need(2))[0]
             elif n == 127:
                 n = struct.unpack(">Q", self._need(8))[0]
+            if op & 8 and (n > 125 or not fin):
+                raise CodexError("the daemon sent a control frame that is fragmented or over 125 bytes (RFC 6455 "
+                                 "section 5.5)")
             if h[1] & 0x80 or (not skip_oversize and len(msg) + n > _MAX_MESSAGE):
                 raise CodexError("the daemon sent a frame this client does not take (masked, or too large)")
             if op in (0, 1, 2) and (dropped or len(msg) + n > _MAX_MESSAGE):
@@ -585,6 +588,7 @@ class Inbound:
     thread_id: str | None = None
     raw_sha256: str = ""
     detail: str = ""
+    answered: bool = False          # an ``unparseable`` request the wire itself answered with -32600
 
     @property
     def token(self) -> str:
@@ -767,14 +771,16 @@ class CodexWire:
                 raise CodexError(f"{item.method}: the request is from a dead connection ({item.gen})")
             if self._closed is not None:
                 raise CodexError(f"{item.method}: the connection is closed ({self._closed})")
-            if self._pending.pop(item.token, None) is None:
-                raise CodexError(f"{item.method}: request {item.token} was already answered")
         body: dict[str, Any] = {"id": item.id}
         if error is None:
             body["result"] = result
         else:
             body["error"] = {"code": error[0], "message": error[1]}
-        self._send(body, time.monotonic() + _CALL_TIMEOUT)
+        data = json.dumps(body).encode()                    # a body that cannot be serialised leaves the item pending
+        with self._lock:
+            if self._pending.pop(item.token, None) is None:
+                raise CodexError(f"{item.method}: request {item.token} was already answered")
+        self._send_data(data, time.monotonic() + _CALL_TIMEOUT)
 
     def close(self) -> None:
         """Close the connection; calls still waiting raise :class:`CodexError`. Bounded: the framing's shutdown waits
@@ -803,7 +809,9 @@ class CodexWire:
             self._framing.shutdown()
 
     def _send(self, body: dict[str, Any], deadline: float) -> None:
-        data = json.dumps(body).encode()
+        self._send_data(json.dumps(body).encode(), deadline)
+
+    def _send_data(self, data: bytes, deadline: float) -> None:
         with self._lock:
             if self._closed is not None:
                 raise CodexError(f"the connection is closed ({self._closed})")
@@ -820,6 +828,7 @@ class CodexWire:
                              "answer")
         self._check_ready(method)
         deadline = time.monotonic() + timeout
+        params_json = json.dumps(params)                    # before anything is reserved: a TypeError leaves no state
         with self._lock:
             if self._closed is not None:
                 raise CodexError(f"{method}: the connection is closed ({self._closed})")
@@ -835,7 +844,8 @@ class CodexWire:
             if boot:
                 self._boot = _Boot(key)
         try:
-            self._send({"id": rid, "method": method, "params": params}, deadline)
+            self._send_data(f'{{"id": {rid}, "method": {json.dumps(method)}, "params": {params_json}}}'.encode(),
+                            deadline)
         except CodexError:
             self._abandon(key, boot)
             raise
@@ -911,7 +921,7 @@ class CodexWire:
             self._push(self._item("unparseable", raw_sha256=sha, detail="a message nested too deeply to parse"))
             return
         except (UnicodeDecodeError, ValueError):
-            if self._framing.kind == "line":
+            if self._framing.kind == "line" and not raw.lstrip()[:1] == b"{":
                 with self._lock:
                     self.log_lines += 1
                     self._log_sha.update(hashlib.sha256(raw).digest())
@@ -942,8 +952,16 @@ class CodexWire:
         params = msg.get("params")
         tid, why = self._thread_of(method, params)
         if why:
+            answered = False
+            if has_id:
+                try:
+                    self._send({"id": rid, "error": {"code": -32600, "message": f"invalid request: {why}"}},
+                               time.monotonic() + _CALL_TIMEOUT)
+                    answered = True
+                except CodexError:
+                    pass                    # the send failed and closed the wire; the item still says unanswered
             self._push(self._item("unparseable", method=method, id=self._wire_id(rid) if has_id else NO_ID,
-                                  raw_sha256=sha, detail=why))
+                                  raw_sha256=sha, detail=why, answered=answered))
             return
         rid = self._wire_id(rid) if has_id else NO_ID
         fields = {"method": method, "id": rid, "params": params, "thread_id": tid, "raw_sha256": sha}
