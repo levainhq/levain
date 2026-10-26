@@ -18,6 +18,7 @@ from levain.autonomic.coverage import (
 )
 from levain.autonomic.posture import Posture
 from levain.autonomic.risk import ActionRisk, RiskClass
+from tests.autonomic_test_only_coverage import TEST_GUARD, terms_incarnation
 
 NOW = datetime(2026, 10, 25, 12, 0, 0, tzinfo=timezone.utc)
 LOW = ActionRisk(RiskClass.LOW, reversible=True, external=False, financial=False)
@@ -40,13 +41,15 @@ def record(**over) -> dict:
     rec = {"id": "gp-0123456789ab", "kind": "graduation",
            "actions": {"doc.append": risk_dict(LOW)},
            "lowest_posture": "ON_LOOP", "expires_at": stamp(NOW + timedelta(days=10)),
-           "triggers": None, "families": None, "store_id": STORE, "min_clean_fires": 20}
+           "triggers": None, "families": None, "store_id": STORE, "min_clean_fires": 20,
+           "guard": [dict(g) for g in TEST_GUARD]}
     rec.update(over)
     return rec
 
 
-def policy(born=K1, current=K1, incarnation="3:abc", **over) -> GraduationPolicy:
-    return GraduationPolicy.from_record(record(**over), incarnation=incarnation, born_signer=born,
+def policy(born=K1, current=K1, seq=3, **over) -> GraduationPolicy:
+    rec = record(**over)
+    return GraduationPolicy.from_record(rec, incarnation=terms_incarnation(rec, seq), born=seq, born_signer=born,
                                         current_signer=current)
 
 
@@ -226,7 +229,7 @@ def test_a_record_missing_a_binding_term_is_refused():
         rec = record()
         del rec[name]
         with pytest.raises(ValueError):
-            GraduationPolicy.from_record(rec, incarnation="1:x", born_signer=K1, current_signer=K1)
+            GraduationPolicy.from_record(rec, incarnation="1:x", born=1, born_signer=K1, current_signer=K1)
 
 
 def test_an_unknown_key_that_is_not_a_string_is_a_value_error():
@@ -235,7 +238,7 @@ def test_an_unknown_key_that_is_not_a_string_is_a_value_error():
     rec[1] = "x"
     rec["unknown_term"] = 2
     with pytest.raises(ValueError, match="carries no"):
-        GraduationPolicy.from_record(rec, incarnation="1:x", born_signer=K1, current_signer=K1)
+        GraduationPolicy.from_record(rec, incarnation="1:x", born=1, born_signer=K1, current_signer=K1)
 
 
 # deepseek HIGH 2: a policy built directly, not through from_record, is held to the same shape
@@ -278,7 +281,8 @@ def test_a_directly_built_above_loop_policy_never_reaches_a_snapshot():
         GraduationPolicy(grant_id="gp-1", incarnation="1:a",
                          actions=(("doc.append", cov._canonical(risk_dict(LOW))),),
                          lowest_posture=Posture.ABOVE_LOOP, expires_at=NOW + timedelta(days=1), triggers=None,
-                         families=None, born_signer=K1, current_signer=K1, store_id=STORE)
+                         families=None, born_signer=K1, current_signer=K1, store_id=STORE, born=1,
+                         terms_text="{}")
 
 
 def test_a_directly_built_policy_of_the_records_shape_is_the_records_policy():
@@ -286,7 +290,8 @@ def test_a_directly_built_policy_of_the_records_shape_is_the_records_policy():
     assert dataclasses.replace(p) == p
     q = GraduationPolicy(grant_id=p.grant_id, incarnation=p.incarnation, actions=p.actions,
                          lowest_posture=p.lowest_posture, expires_at=p.expires_at, triggers=p.triggers,
-                         families=p.families, born_signer=None, current_signer=None, store_id=p.store_id)
+                         families=p.families, born_signer=None, current_signer=None, store_id=p.store_id,
+                         born=p.born, terms_text=p.terms_text)
     assert q.cover_value == p.cover_value
 
 
@@ -299,7 +304,8 @@ def test_the_stamp_form_is_the_cockpits():
 
 def test_the_policy_is_frozen_and_does_not_alias_the_record():
     rec = record()
-    p = GraduationPolicy.from_record(rec, incarnation="1:x", born_signer=K1, current_signer=K1)
+    p = GraduationPolicy.from_record(rec, incarnation=terms_incarnation(rec, 1), born=1, born_signer=K1,
+                                     current_signer=K1)
     rec["actions"]["doc.append"]["cls"] = 0
     rec["actions"]["deliver"] = risk_dict(LOW)
     assert covered(p, effect()) and not covered(p, effect(action="deliver"))
@@ -383,22 +389,23 @@ def test_a_covered_effect_runs_at_the_stricter_of_the_candidate_and_the_signed_r
     p = policy(lowest_posture="COOLING_OFF")
     rung, value = operative(Posture.ON_LOOP, effect(), snapshot(p), NOW)
     assert rung == Posture.COOLING_OFF
-    assert value == f"3:abc@{p.expires_at.strftime('%Y-%m-%dT%H:%M:%S.%fZ')}"
+    assert value == f"{p.incarnation}@{p.expires_at.strftime('%Y-%m-%dT%H:%M:%S.%fZ')}"
+    assert p.incarnation.startswith("3:")
     assert operative(Posture.COOLING_OFF, effect(), snapshot(policy()), NOW)[0] == Posture.COOLING_OFF
     assert operative(Posture.ABOVE_LOOP, effect(), snapshot(policy()), NOW)[0] == Posture.ON_LOOP
 
 
 def test_the_strictest_covering_policy_wins_and_its_value_is_the_cover():
-    loose = policy(incarnation="1:a", lowest_posture="ON_LOOP")
-    strict = policy(incarnation="2:b", lowest_posture="COOLING_OFF")
+    loose = policy(seq=1, lowest_posture="ON_LOOP")
+    strict = policy(seq=2, lowest_posture="COOLING_OFF")
     rung, value = operative(Posture.ON_LOOP, effect(), snapshot(loose, strict), NOW)
-    assert rung == Posture.COOLING_OFF and value.startswith("2:b@")
+    assert rung == Posture.COOLING_OFF and value == strict.cover_value and value.startswith("2:")
     assert operative(Posture.ON_LOOP, effect(), snapshot(strict, loose), NOW) == (rung, value)
 
 
 def test_ties_pick_one_value_whatever_the_order():
-    a = policy(incarnation="1:a")
-    b = policy(incarnation="2:b")
+    a = policy(seq=1)
+    b = policy(seq=2)
     assert operative(Posture.ON_LOOP, effect(), snapshot(a, b), NOW) == \
         operative(Posture.ON_LOOP, effect(), snapshot(b, a), NOW)
 

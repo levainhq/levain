@@ -9,7 +9,12 @@ envelope in the authority log that signs ``actions`` (each at its whole risk dic
   gives it (``None`` when the manifest does not know it), the sealed tools risk, and the honest-config trigger and
   family.
 - :func:`covered` (the policy signs this action at this risk, and its trigger and family lists admit it),
-  :func:`anchored` (both signers root-listed), :func:`live` (anchored, unexpired, inside the cap at ``now``).
+  :func:`anchored` (both signers root-listed), :func:`live` (anchored, unexpired, inside the cap at ``now``, and
+  signed with a guard).
+- :func:`guard_problem`: what a policy's signed ``guard`` must be (every entry a rationale, a kill predicate this
+  package can evaluate and a drill that trips it, each inside the sign-time caps). The authority log refuses to sign
+  a policy it finds a problem in; a replayed policy whose guard has one is refused by :meth:`GraduationPolicy.
+  from_record` (it covers nothing), and a policy signed with no guard covers nothing (:func:`live`).
 - :func:`operative`: the rung a candidate below ``CONFIRM`` runs at, and the fence's cover value.
 - :class:`CoverageSnapshot`: what a source caches. Its ``token`` is a property over its own ``head``, the digest
   of the root-file bytes it holds and its ``store_id``, and its signers are parsed from those same bytes, so no
@@ -36,15 +41,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, runtime_checkable
 
+from levain.autonomic.kill import Kleene, kill_outcome, kill_purity_error
 from levain.autonomic.policy import risk_floor
 from levain.autonomic.posture import Posture
 from levain.autonomic.risk import ActionRisk, RiskClass
 
 __all__ = [
-    "AUTHORITY_NAMESPACE", "COVER_MOVED", "COVER_NONE", "GRADUATION_GRANT_MAX", "KEY_TYPES",
-    "Cover", "CoverageSnapshot", "CoverageSource", "CoverageView", "Effect", "GraduationPolicy", "RootSigner",
-    "Uncovered", "anchored", "authority_keys", "covered", "live", "operative", "parse_root_signers",
-    "peek_snapshot", "risk_dict", "signers_digest", "stricter_risk",
+    "AUTHORITY_NAMESPACE", "COVER_MOVED", "COVER_NONE", "GRADUATION_GRANT_MAX", "GUARD_DRILL_MAX_BYTES",
+    "GUARD_ENTRY_FIELDS", "GUARD_KILL_MAX_BYTES", "GUARD_KILL_MAX_DEPTH", "GUARD_MAX_ENTRIES",
+    "GUARD_RATIONALE_MAX", "KEY_TYPES",
+    "Cover", "CoverageSnapshot", "CoverageSource", "CoverageView", "Effect", "EffectiveCover", "GraduationPolicy",
+    "RootSigner", "Uncovered", "anchored", "authority_keys", "covered", "guard_problem", "live", "operative",
+    "parse_root_signers", "peek_cover_snapshot", "peek_snapshot", "risk_dict", "signers_digest", "stricter_risk",
 ]
 
 # The fence cover value of an effect no live anchored policy covers. A covered value always holds an "@".
@@ -67,9 +75,20 @@ KEY_TYPES = frozenset({"ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp38
 # The rungs a policy may sign as its lowest. ABOVE_LOOP is never one (DESIGN_REV3 §3).
 _LOWEST = {"COOLING_OFF": Posture.COOLING_OFF, "ON_LOOP": Posture.ON_LOOP}
 
-# The record's fields (DESIGN_REV3 §3): those a policy must carry, and those it may.
+# The record's fields (DESIGN_REV3 §3): those a policy must carry, and those it may. ``guard`` is optional in the
+# record so a log signed before it replays; a policy without one covers nothing (:func:`live`).
 _REQUIRED = frozenset({"id", "kind", "actions", "lowest_posture", "expires_at", "store_id"})
-_OPTIONAL = frozenset({"triggers", "families", "min_clean_fires"})
+_OPTIONAL = frozenset({"triggers", "families", "min_clean_fires", "guard"})
+
+# A signed guard entry (autogrant DESIGN D68 (1), D75): the dissent, the kill and the drill, all three, on every entry.
+GUARD_ENTRY_FIELDS = frozenset({"rationale", "kill_predicate", "kill_drill"})
+# The sign-time caps on a guard (1026-20 RULINGS R13-11): the gate evaluates every kill at every fire, so what a
+# policy may carry is bounded where it is signed.
+GUARD_MAX_ENTRIES = 8
+GUARD_RATIONALE_MAX = 2000          # characters
+GUARD_KILL_MAX_BYTES = 4096         # of the kill predicate's canonical UTF-8 text
+GUARD_KILL_MAX_DEPTH = 8            # nodes from the root to the deepest leaf, the root counted
+GUARD_DRILL_MAX_BYTES = 4096        # of the drill's canonical UTF-8 text
 
 # The one timestamp form of the authority log (``levain.cockpit.consent.utc_stamp``).
 _STAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
@@ -99,6 +118,68 @@ def _str_keys(obj: Any) -> bool:
     if isinstance(obj, (list, tuple)):
         return all(_str_keys(v) for v in obj)
     return True
+
+
+def _kill_depth(node: Any) -> int:
+    # nodes from ``node`` to its deepest leaf, ``node`` counted; called only on a predicate kill_purity_error passed,
+    # whose nesting it already bounds
+    op = node.get("op")
+    if op in ("and", "or"):
+        return 1 + max(_kill_depth(c) for c in node["clauses"])
+    if op == "not":
+        return 1 + _kill_depth(node["clause"])
+    return 1
+
+
+def guard_problem(guard: Any) -> str | None:
+    """Why ``guard`` cannot be a graduation policy's signed guard, or ``None``. A guard is a non-empty list of at most
+    :data:`GUARD_MAX_ENTRIES` entries, and EVERY entry is complete (DESIGN D83): exactly :data:`GUARD_ENTRY_FIELDS`, a
+    non-blank ``rationale`` of at most :data:`GUARD_RATIONALE_MAX` characters, a ``kill_predicate`` this package's
+    kill substrate evaluates (``kill_purity_error``) within :data:`GUARD_KILL_MAX_BYTES` and
+    :data:`GUARD_KILL_MAX_DEPTH`, and a ``kill_drill`` (a concrete event, an object within
+    :data:`GUARD_DRILL_MAX_BYTES`) that the kill does not confidently let through (the compiler's drill gate). Never
+    raises."""
+    if not isinstance(guard, (list, tuple)) or not guard:
+        return "the guard is a non-empty list of entries"
+    if len(guard) > GUARD_MAX_ENTRIES:
+        return f"the guard holds {len(guard)} entries, more than {GUARD_MAX_ENTRIES}"
+    for i, entry in enumerate(guard):
+        what = f"guard[{i}]"
+        if not isinstance(entry, Mapping):
+            return f"{what} is not an object"
+        if set(entry) != GUARD_ENTRY_FIELDS:
+            return f"{what} must carry exactly {', '.join(sorted(GUARD_ENTRY_FIELDS))}"
+        try:
+            if not _str_keys(entry):
+                raise ValueError
+            # one JSON form of the entry: what the kill substrate reads is plain dicts and lists, never a caller's
+            # mapping type
+            kill_text = _canonical(entry["kill_predicate"])
+            drill_text = _canonical(entry["kill_drill"])
+        except (TypeError, ValueError, RecursionError):
+            return f"{what} is not JSON with string keys"
+        rationale = entry["rationale"]
+        if not isinstance(rationale, str) or not rationale.strip():
+            return f"{what}.rationale must be non-blank text (why this might be wrong)"
+        if len(rationale) > GUARD_RATIONALE_MAX:
+            return f"{what}.rationale is longer than {GUARD_RATIONALE_MAX} characters"
+        if len(kill_text.encode("utf-8")) > GUARD_KILL_MAX_BYTES:
+            return f"{what}.kill_predicate is longer than {GUARD_KILL_MAX_BYTES} bytes"
+        kill = json.loads(kill_text)
+        why = kill_purity_error(kill)
+        if why is not None:
+            return f"{what}.kill_predicate is not a kill the gate can evaluate: {why}"
+        depth = _kill_depth(kill)
+        if depth > GUARD_KILL_MAX_DEPTH:
+            return f"{what}.kill_predicate nests {depth} deep, more than {GUARD_KILL_MAX_DEPTH}"
+        if len(drill_text.encode("utf-8")) > GUARD_DRILL_MAX_BYTES:
+            return f"{what}.kill_drill is longer than {GUARD_DRILL_MAX_BYTES} bytes"
+        drill = json.loads(drill_text)
+        if not isinstance(drill, dict):
+            return f"{what}.kill_drill must be an object (a concrete event)"
+        if kill_outcome(kill, drill) is Kleene.FALSE:
+            return f"{what}.kill_drill does not trip its kill: a drill is an event the kill stops"
+    return None
 
 
 def stricter_risk(a: ActionRisk | None, b: ActionRisk | None) -> ActionRisk | None:
@@ -142,7 +223,12 @@ class GraduationPolicy:
     ``born_signer`` and ``current_signer`` are the public keys (``<type> <base64>``) of the signers of the link that
     brought this incarnation in and of the link that last renewed it. ``incarnation`` is the authority log's value
     for it; with the expiry, it is the fence's cover value. ``store_id`` is the store the policy was signed for; it
-    covers in no other. Build it with :meth:`from_record`."""
+    covers in no other. Build it with :meth:`from_record`.
+
+    ``born`` is the seq of the link that brought this incarnation in, and ``terms_text`` the canonical text of the
+    signed record minus its expiry: the bytes the incarnation hashes. Construction refuses an incarnation that is not
+    ``<born>:<sha256 of terms_text>`` and terms that disagree with any field, so a policy can carry no action, rung,
+    store or :attr:`guard` other than the terms its incarnation names."""
 
     grant_id: str
     incarnation: str
@@ -154,6 +240,8 @@ class GraduationPolicy:
     born_signer: str | None
     current_signer: str | None
     store_id: str
+    born: int = field(kw_only=True)
+    terms_text: str = field(kw_only=True)
 
     def __post_init__(self) -> None:
         # a policy built directly, not through from_record, is held to the shape from_record builds: any other is a
@@ -177,12 +265,62 @@ class GraduationPolicy:
                 raise ValueError(f"{what} is None or a public key string")
         if not isinstance(self.store_id, str) or not self.store_id:
             raise ValueError(f"store_id {str(self.store_id)[:40]!r} is not a store's id")
+        self._check_terms()
+
+    def _check_terms(self) -> None:
+        # the terms are the bytes the incarnation names, and they say what every field says
+        if type(self.born) is not int or self.born < 1:
+            raise ValueError("born is the seq of the link that brought the policy in")
+        if not isinstance(self.terms_text, str):
+            raise ValueError("terms_text is the canonical text of the signed terms")
+        digest = hashlib.sha256(self.terms_text.encode("utf-8")).hexdigest()
+        if self.incarnation != f"{self.born}:{digest}":
+            raise ValueError("the terms are not the ones the policy's incarnation names")
+        try:
+            terms = json.loads(self.terms_text)
+            ok = isinstance(terms, dict) and _canonical(terms) == self.terms_text
+        except (TypeError, ValueError, RecursionError):
+            ok = False
+        if not ok:
+            raise ValueError("terms_text is not the canonical text of a JSON object")
+        if "expires_at" in terms:
+            raise ValueError("the terms are the record minus its expiry")
+        try:
+            actions = terms.get("actions")
+            agree = (terms.get("kind") == "graduation" and terms.get("id") == self.grant_id
+                     and terms.get("lowest_posture") == self.lowest_posture.name
+                     and terms.get("store_id") == self.store_id
+                     and isinstance(actions, dict)
+                     and tuple(sorted((n, _canonical(r)) for n, r in actions.items())) == self.actions
+                     and _names(terms.get("triggers"), "triggers") == self.triggers
+                     and _names(terms.get("families"), "families") == self.families)
+        except (TypeError, ValueError, RecursionError):
+            agree = False
+        if not agree:
+            raise ValueError("the policy's fields are not its signed terms")
+        if "guard" in terms:
+            why = guard_problem(terms["guard"])
+            if why is not None:
+                raise ValueError(f"the policy's signed guard covers nothing: {why}")
+
+    @property
+    def guarded(self) -> bool:
+        """Whether the policy was signed with a guard (construction holds it to :func:`guard_problem`)."""
+        return "guard" in json.loads(self.terms_text)
+
+    @property
+    def guard(self) -> tuple[dict[str, Any], ...]:
+        """The guard the policy was signed with, read from :attr:`terms_text` (``()`` when it carries none): a fresh
+        copy on every read, so no caller can change what another reads."""
+        return tuple(json.loads(self.terms_text).get("guard") or ())
 
     @classmethod
-    def from_record(cls, record: Mapping[str, Any], *, incarnation: str, born_signer: str | None,
+    def from_record(cls, record: Mapping[str, Any], *, incarnation: str, born: int, born_signer: str | None,
                     current_signer: str | None) -> "GraduationPolicy":
-        """The policy a §3 record describes, or ``ValueError`` for a record that is not one. Nothing of ``record``
-        is kept by reference."""
+        """The policy a §3 record describes, or ``ValueError`` for a record that is not one, including a record
+        whose ``guard`` :func:`guard_problem` refuses (it then covers nothing). ``born`` is the seq of the link that
+        brought it in; its terms text is the record minus ``expires_at``, canonical. Nothing of ``record`` is kept by
+        reference."""
         if not isinstance(record, Mapping):
             raise ValueError("a graduation policy is a mapping")
         names = set(record)
@@ -224,11 +362,16 @@ class GraduationPolicy:
         store_id = record["store_id"]
         if not isinstance(store_id, str) or not store_id:
             raise ValueError(f"store_id {str(store_id)[:40]!r} is not a store's id")
+        try:
+            terms_text = _canonical({k: v for k, v in record.items() if k != "expires_at"})
+        except (TypeError, ValueError, RecursionError):
+            raise ValueError("a graduation policy's terms are not JSON") from None
         return cls(grant_id=gid, incarnation=incarnation, actions=tuple(sorted(signed)),
                    lowest_posture=_LOWEST[lowest], expires_at=expires_at,
                    triggers=_names(record.get("triggers"), "triggers"),
                    families=_names(record.get("families"), "families"),
-                   born_signer=born_signer, current_signer=current_signer, store_id=store_id)
+                   born_signer=born_signer, current_signer=current_signer, store_id=store_id,
+                   born=born, terms_text=terms_text)
 
     def signed_risk(self, action_name: str) -> str | None:
         """The canonical text of the risk dict this policy signs ``action_name`` at, or ``None``."""
@@ -310,20 +453,27 @@ def anchored(policy: GraduationPolicy, root_keys: frozenset[str]) -> bool:
 
 def live(policy: GraduationPolicy, now: datetime, root_keys: frozenset[str]) -> bool:
     """Whether ``policy`` counts at ``now``: unexpired (``now < expires_at``), no further ahead than
-    :data:`GRADUATION_GRANT_MAX`, and :func:`anchored`. That it is in the replayed policy is its source's to
-    guarantee: a source hands over only those."""
+    :data:`GRADUATION_GRANT_MAX`, :func:`anchored`, and signed with a guard (:attr:`GraduationPolicy.guarded`). That
+    it is in the replayed policy is its source's to guarantee: a source hands over only those.
+
+    A policy signed with no guard (a log from before the guard) counts for nothing (1026-20 RULINGS R13-4: an ON_LOOP
+    policy lowers an ON_LOOP binding from CONFIRM to ON_LOOP, so it is a confirm-class grant and needs the guard
+    np-6bd5f97e (a) requires); it covers again only once it is revoked and signed anew with one."""
     now = _aware(now)
-    return now < policy.expires_at <= now + GRADUATION_GRANT_MAX and anchored(policy, root_keys)
+    return (now < policy.expires_at <= now + GRADUATION_GRANT_MAX and anchored(policy, root_keys)
+            and policy.guarded)
 
 
 @dataclass(frozen=True)
 class Cover:
     """What a view says of one effect: the strictest ``lowest_posture`` of the live anchored policies covering it
     (``None``: none does) and the fence's cover value (that policy's :attr:`GraduationPolicy.cover_value`, or
-    :data:`COVER_NONE`)."""
+    :data:`COVER_NONE`). ``policy`` is the policy whose cover value it is: the one whose signed guard authorizes the
+    effect. It takes no part in equality: within one view a cover value names one policy."""
 
     posture: Posture | None
     value: str
+    policy: GraduationPolicy | None = field(default=None, compare=False)
 
 
 _UNCOVERED = Cover(None, COVER_NONE)
@@ -352,7 +502,7 @@ class CoverageView(Protocol):
 
 @runtime_checkable
 class CoverageSource(Protocol):
-    """Where the gate gets coverage (DESIGN_REV3 §5.3, DESIGN_REV3_1 D2-D3). Neither method raises: any failure is
+    """Where the gate gets coverage (DESIGN_REV3 §5.3, DESIGN_REV3_1 D2-D3). No method raises: any failure is
     uncovered.
 
     :meth:`refresh` runs outside any store transaction: it reads the root file's bytes once, replays the authority
@@ -362,11 +512,19 @@ class CoverageSource(Protocol):
 
     :meth:`peek` reads the root file's digest and then the authority head (the last authority read), and returns
     :func:`peek_snapshot` of the cached view at the token of those two and the store's own id: the cover value, or
-    :data:`COVER_MOVED`."""
+    :data:`COVER_MOVED`.
+
+    :meth:`peek_cover` is the same read, answering :func:`peek_cover_snapshot`: the value with the rung and the
+    policy that set it, all three from ONE answer of ONE cached view (no second read of the cache, no refresh), so
+    the policy a fire takes its guard from is the one whose cover value the fence compares. Where several live
+    policies cover an effect, the strictest rung wins, and at that rung the least cover value: that one policy
+    authorizes the effect, and its guard is the one that applies."""
 
     def refresh(self) -> CoverageView: ...
 
     def peek(self, effect: Effect, now: datetime) -> str: ...
+
+    def peek_cover(self, effect: Effect, now: datetime) -> "EffectiveCover": ...
 
 
 def signers_digest(root_bytes: bytes) -> str:
@@ -420,7 +578,8 @@ class CoverageSnapshot:
             return _UNCOVERED
         strictest = max(p.lowest_posture for p in hits)
         # ties at the strictest rung: one value whatever the policies' order, so a re-read gives the same fence
-        return Cover(strictest, min(p.cover_value for p in hits if p.lowest_posture == strictest))
+        chosen = min((p for p in hits if p.lowest_posture == strictest), key=lambda p: p.cover_value)
+        return Cover(strictest, chosen.cover_value, chosen)
 
 
 @dataclass(frozen=True)
@@ -472,21 +631,51 @@ def operative(candidate: Posture, effect: Effect, view: CoverageView | None,
     return max(rung, floor), cover.value
 
 
-def peek_snapshot(view: CoverageView | None, token: tuple[tuple[int, str], str, str], effect: Effect,
-                  now: datetime) -> str:
-    """The pure half of a peek: the cover value ``view`` gives ``effect`` at ``now`` when ``token`` (the head and
-    digest just read, and the current store's id) is the view's own, else :data:`COVER_MOVED`. A view that raises or
-    answers anything but a :class:`Cover` keeping the module's invariants is :data:`COVER_MOVED` too: it equals no
-    decided fence, so the effect is decided again."""
+@dataclass(frozen=True)
+class EffectiveCover:
+    """What one peek gives the fire check (:meth:`CoverageSource.peek_cover`): the cover ``value`` (a policy's cover
+    value, :data:`COVER_NONE` or :data:`COVER_MOVED`), the rung it sets (``None`` unless covered) and the ``policy``
+    whose cover value it is. ``policy`` is ``None`` when the value is not a covered one, and also when the view did
+    not name a policy that gives exactly this value at this rung: what to do with a covered value no policy
+    authorizes is the fire check's."""
+
+    value: str
+    posture: Posture | None
+    policy: GraduationPolicy | None
+
+
+_MOVED = EffectiveCover(COVER_MOVED, None, None)
+
+
+def peek_cover_snapshot(view: CoverageView | None, token: tuple[tuple[int, str], str, str], effect: Effect,
+                        now: datetime) -> EffectiveCover:
+    """The pure half of :meth:`CoverageSource.peek_cover`: from ONE ``view.cover`` answer, the value, the rung and the
+    policy ``view`` gives ``effect`` at ``now`` when ``token`` (the head and digest just read, and the current
+    store's id) is the view's own, else :data:`COVER_MOVED`. A view that raises or answers anything but a
+    :class:`Cover` keeping the module's invariants is :data:`COVER_MOVED` too: it equals no decided fence, so the
+    effect is decided again."""
     if view is None:
-        return COVER_MOVED
+        return _MOVED
     try:
         if view.token != token:
-            return COVER_MOVED
+            return _MOVED
         cover = view.cover(effect, now)
     except Exception:  # noqa: BLE001 - a view that cannot answer forces a re-decide
-        return COVER_MOVED
-    return cover.value if _is_cover(cover) else COVER_MOVED
+        return _MOVED
+    if not _is_cover(cover):
+        return _MOVED
+    policy = getattr(cover, "policy", None)
+    if not (cover.posture is not None and isinstance(policy, GraduationPolicy)
+            and policy.cover_value == cover.value and policy.lowest_posture == cover.posture):
+        policy = None
+    return EffectiveCover(cover.value, cover.posture, policy)
+
+
+def peek_snapshot(view: CoverageView | None, token: tuple[tuple[int, str], str, str], effect: Effect,
+                  now: datetime) -> str:
+    """The pure half of a peek: the value :func:`peek_cover_snapshot` reads (one implementation, so the value a peek
+    gives and the value a fire's policy was read with cannot differ)."""
+    return peek_cover_snapshot(view, token, effect, now).value
 
 
 @dataclass(frozen=True)

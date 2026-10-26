@@ -13,7 +13,7 @@ from levain.autonomic.db import AutonomicDB
 from levain.cockpit.firejournal import CockpitDB
 
 pytest.importorskip("cryptography")
-from tests.test_authority_graduation_kind import World, consent, renew  # noqa: E402
+from tests.test_authority_graduation_kind import World, consent, guard_file, renew  # noqa: E402
 from tests.test_graduation_policy import write_root  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
@@ -37,6 +37,8 @@ class CliWorld(World):
             common += ["--signing-key", str(self.tmp / "keys" / key)]
         if argv[:2] == ("policy", "create"):
             common += ["--store-dir", str(self.store)]
+            if "--guard" not in argv:
+                common += ["--guard", str(guard_file(self.tmp))]
         return cli.main(["binding", *argv, *common])
 
 
@@ -73,8 +75,8 @@ def test_create_refuses_what_the_log_or_the_verb_would_not_take(cw, capsys, argv
 def test_create_without_an_autonomic_store_is_refused(cw, capsys, tmp_path):
     seq = cw.state().seq
     assert cli.main(["binding", "policy", "create", "--action", "link0", "--lowest", "ON_LOOP", "--store-dir",
-                     str(tmp_path / "none"), "--data-root", str(cw.root), "--signing-key",
-                     str(cw.tmp / "keys" / "laptop")]) == 1
+                     str(tmp_path / "none"), "--guard", str(guard_file(cw.tmp)), "--data-root", str(cw.root),
+                     "--signing-key", str(cw.tmp / "keys" / "laptop")]) == 1
     assert "no autonomic store" in capsys.readouterr().err and cw.state().seq == seq
 
 
@@ -257,6 +259,7 @@ def test_create_over_a_file_that_is_not_an_autonomic_store_is_refused_by_name(cw
         (d / "autonomic.db").write_bytes(content)
     seq = cw.state().seq
     assert cli.main(["binding", "policy", "create", "--action", "link0", "--lowest", "ON_LOOP", "--store-dir", str(d),
+                     "--guard", str(guard_file(cw.tmp)),
                      "--data-root", str(cw.root), "--signing-key", str(cw.tmp / "keys" / "laptop")]) == 1
     assert f"cannot read the autonomic store at {d / 'autonomic.db'}" in capsys.readouterr().err
     assert cw.state().seq == seq
