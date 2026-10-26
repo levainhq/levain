@@ -271,9 +271,66 @@ def test_a_malformed_card_step_counts_under_its_own_key() -> None:
     assert r.cards == {"malformed_card_step": 2, "body:denied": 1}, r.cards
 
 
-def test_socks_refusals_whose_wall_write_failed_show_as_a_counted_line() -> None:
+def test_socks_wall_writes_that_failed_show_as_a_counted_line() -> None:
     final = _summary(0, final=True, by_reason={}, hosts={}, count=0)
     r = report.build([], [final], socks_wall_failures=3)
-    assert r.socks_uncounted == 3
-    assert "3 SOCKS refusals not counted" in r.text()
-    assert "SOCKS refusals not counted" not in report.build([], [final]).text()
+    assert r.socks_wall_write_failures == 3
+    assert "3 SOCKS wall writes failed (refusals not counted; the glue total is an undercount)" in r.text()
+    assert "SOCKS wall writes failed" not in report.build([], [final]).text()
+
+
+def test_a_socks_count_read_before_the_refuser_stopped_says_it_may_be_incomplete() -> None:
+    r = report.build([], [], socks_wall_failures=0, socks_count_exact=False)
+    assert "SOCKS wall-write count may be incomplete" in r.text()
+    assert "may be incomplete" not in report.build([], []).text()
+
+
+def _stub_launch(tmp_path, socks_):
+    """An EgressLaunch stand-in: the real `stop_egress` runs over it; only the glue process and the decider are stood in."""
+    from types import SimpleNamespace
+    return SimpleNamespace(proc=SimpleNamespace(wait=lambda timeout=None: 0, kill=lambda: None),
+                           decider=SimpleNamespace(close=lambda timeout_s=None: True), socks=socks_, life_w=None,
+                           events=tmp_path / "ev.jsonl")
+
+
+def test_a_real_stop_whose_wall_write_failed_reaches_the_report_through_one_entry_point(tmp_path, monkeypatch) -> None:
+    from levain.chat_egress import launch as lm
+    from levain.chat_egress import socks
+    monkeypatch.setattr(socks, "IO_TIMEOUT_S", 0.5)
+    ours, theirs = socket.socketpair()
+    ours.setblocking(False)
+    try:
+        while True:
+            ours.send(b"x" * 65536)
+    except BlockingIOError:
+        pass
+    ours.setblocking(True)
+    refuser = socks.SocksRefuser(refusals=ours)          # its wall channel is full: a refusal's wall write fails
+    refuser.start()
+    e = _stub_launch(tmp_path, refuser)
+    e.events.write_bytes(_summary(0, final=True, by_reason={}, hosts={}, count=0))
+    try:
+        c = socket.create_connection(("127.0.0.1", refuser.port), timeout=10)
+        c.sendall(b"\x05\x01\x00")
+        c.settimeout(10)
+        while c.recv(16):
+            pass
+        c.close()
+        stop = lm.stop_egress(e)
+    finally:
+        theirs.close()
+    assert stop.socks_wall_failures == 1 and stop.socks_count_exact
+    text = report.build_from_files([], e.events, stop=stop).text()
+    assert "1 SOCKS wall writes failed (refusals not counted; the glue total is an undercount)" in text
+    assert "may be incomplete" not in text
+    assert "SOCKS wall writes failed" not in report.build_from_files([], e.events).text()
+
+
+def test_a_stop_whose_socks_close_timed_out_marks_the_report_count_incomplete(tmp_path) -> None:
+    from types import SimpleNamespace
+    from levain.chat_egress import launch as lm
+    e = _stub_launch(tmp_path, SimpleNamespace(close=lambda: False, wall_failures=2))
+    stop = lm.stop_egress(e)
+    assert not stop.socks_count_exact
+    text = report.build_from_files([], e.events, stop=stop).text()
+    assert "2 SOCKS wall writes failed" in text and "SOCKS wall-write count may be incomplete" in text

@@ -242,3 +242,26 @@ def test_an_oserror_closing_the_glue_stderr_still_ends_the_glue(tmp_path, origin
         os.kill(pid, 9)
         os.waitpid(pid, 0)
     assert left == set()
+
+
+# --- socks3 r1 item 1: a launch torn down after a partial start has no SOCKS refuser ------------------------------
+
+class _Proc:
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self) -> None:
+        pass
+
+
+class _Decider:
+    def close(self, timeout_s=None) -> bool:
+        return True
+
+
+def test_stop_of_a_launch_whose_socks_refuser_never_started_does_not_raise(tmp_path) -> None:
+    from types import SimpleNamespace
+    e = SimpleNamespace(proc=_Proc(), decider=_Decider(), socks=None, life_w=None, events=tmp_path / "ev.jsonl")
+    out = lm.stop_egress(e)
+    assert out.socks_wall_failures == 0 and out.socks_count_exact
+    assert out.failures == () and out.order == ("socks", "lifeline", "glue", "decider")

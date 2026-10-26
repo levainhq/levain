@@ -165,7 +165,7 @@ class EgressLaunch:
     records: rec.EgressRecords
     proc: subprocess.Popen
     decider: dm.Decider
-    socks: SocksRefuser
+    socks: SocksRefuser | None             # None only on a launch torn down before its refuser was made
     http_port: int
     socks_port: int
     node_version: str
@@ -186,7 +186,8 @@ class StopResult:
     final_flush: dict | None                # the clean end's summary line, or None when there is none
     order: tuple[str, ...]
     failures: tuple[str, ...] = ()          # "<step>: <exception type>" for each teardown step that raised
-    socks_wall_failures: int = 0            # the refuser's `wall_failures`: pass to report.build so the undercount shows
+    socks_wall_failures: int = 0            # the refuser's `wall_failures`, read after its close(); report.build_from_files(stop=...) shows it
+    socks_count_exact: bool = True          # False: the refuser's close() did not end its thread, so a late write may be uncounted
 
 
 def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, events: Path, ca_pem: bytes, routes: Any,
@@ -373,13 +374,14 @@ def stop_egress(e: EgressLaunch) -> StopResult:
 
     def socks_() -> None:
         nonlocal socks_clean
-        socks_clean = e.socks.close()
+        socks_clean = True if e.socks is None else e.socks.close()
 
     # The SOCKS refuser stops (thread joined, wall end closed: the glue's EOF on the wall channel) before the lifeline closes,
     # so a refusal in flight is on the wall channel ahead of that EOF and the glue's final flush counts it.
     for what, step in (("socks", socks_), ("lifeline", lifeline), ("glue", glue), ("decider", decider)):
         _guarded(failures, what, step)
         order.append(what)
+    wall_failures = 0 if e.socks is None else e.socks.wall_failures      # after close(): the thread that counts has ended when it returned True
     return StopResult(glue_exit=code, decider_clean=decider_clean, socks_clean=socks_clean,
                       final_flush=final_flush(e.events) if code == 0 else None, order=tuple(order),
-                      failures=tuple(failures), socks_wall_failures=e.socks.wall_failures)
+                      failures=tuple(failures), socks_wall_failures=wall_failures, socks_count_exact=socks_clean)
