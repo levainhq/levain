@@ -269,3 +269,11 @@ def test_walls_after_the_last_summary_of_a_crashed_launch_read_as_at_least() -> 
 def test_a_malformed_card_step_counts_under_its_own_key() -> None:
     r = report.build([_row(1, "card:"), _row(2, "card:nocolon"), _row(3, "card:body:denied")], [])
     assert r.cards == {"malformed_card_step": 2, "body:denied": 1}, r.cards
+
+
+def test_socks_refusals_whose_wall_write_failed_show_as_a_counted_line() -> None:
+    final = _summary(0, final=True, by_reason={}, hosts={}, count=0)
+    r = report.build([], [final], socks_wall_failures=3)
+    assert r.socks_uncounted == 3
+    assert "3 SOCKS refusals not counted" in r.text()
+    assert "SOCKS refusals not counted" not in report.build([], [final]).text()

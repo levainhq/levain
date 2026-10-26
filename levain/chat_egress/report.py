@@ -74,6 +74,7 @@ class LaunchReport:
     attempts: int
     audit_missing: int
     unreadable_event_lines: int = 0
+    socks_uncounted: int = 0          # SOCKS refusals whose wall write failed: in no glue total
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     def lines(self) -> list[str]:
@@ -101,6 +102,8 @@ class LaunchReport:
         out.append(f"duplicate_rows: {self.duplicate_rows}")
         if self.unreadable_event_lines:
             out.append(f"unreadable glue event lines: {self.unreadable_event_lines}")
+        if self.socks_uncounted:
+            out.append(f"{self.socks_uncounted} SOCKS refusals not counted (their wall write failed; the glue total is an undercount)")
         out.extend(self.notes)
         return out
 
@@ -141,7 +144,8 @@ def _names(row: EgressRow) -> list[str]:
     return [n for n in v if isinstance(n, str)] if isinstance(v, list) else []
 
 
-def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows: int = 0) -> LaunchReport:
+def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows: int = 0,
+          socks_wall_failures: int = 0) -> LaunchReport:
     """K1's report for one launch. A glue line `wire.parse_glue_event` refuses is counted, never skipped silently."""
     events: list[wire.GlueEvent] = []
     unreadable = 0
@@ -203,14 +207,16 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
         duplicate_rows=duplicate_rows, verdicts=dict(verdicts), decider_walls=dict(dwalls),
         credential_in_query_walls=cred_walls, credential_in_query_cards=cred_cards, cap_walls=cap, cap_cards=cap_cards, path_walls=path,
         cards=dict(cards), signed_url_names=dict(sig_names), azure_sas_names=azure, backstop_names=backstop, attempts=attempts,
-        audit_missing=missing, unreadable_event_lines=unreadable)
+        audit_missing=missing, unreadable_event_lines=unreadable,
+        socks_uncounted=socks_wall_failures)
 
 
-def build_from_files(rows: Sequence[EgressRow], events_path, duplicate_rows: int = 0) -> LaunchReport:
+def build_from_files(rows: Sequence[EgressRow], events_path, duplicate_rows: int = 0,
+                     socks_wall_failures: int = 0) -> LaunchReport:
     """`build` over the glue's event file; a missing or unreadable file reads as no lines (a crash before any)."""
     try:
         with open(events_path, "rb") as f:
             data = f.read().splitlines(keepends=True)
     except OSError:
         data = []
-    return build(rows, data, duplicate_rows)
+    return build(rows, data, duplicate_rows, socks_wall_failures)

@@ -167,6 +167,22 @@ def test_stop_whose_decider_close_raises_still_closes_socks(tmp_path, origin, mo
     assert [f.split(":")[0] for f in out.failures] == ["decider"]
 
 
+def _read_exact(c, n: int, within_s: float = 5.0) -> bytes:
+    """Exactly `n` bytes (a TCP read may return fewer), bounded by one deadline; fewer at EOF."""
+    import time
+    deadline = time.monotonic() + within_s
+    buf = b""
+    while len(buf) < n:
+        left = deadline - time.monotonic()
+        assert left > 0, f"read {len(buf)} of {n} bytes inside {within_s}s"
+        c.settimeout(left)
+        chunk = c.recv(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
 @pytest.mark.chat_egress_srt
 def test_a_socks_refusal_landing_during_stop_is_counted_in_the_final_flush(tmp_path, origin, monkeypatch) -> None:
     import socket
@@ -178,7 +194,7 @@ def test_a_socks_refusal_landing_during_stop_is_counted_in_the_final_flush(tmp_p
         c = socket.create_connection(("127.0.0.1", e.socks_port), timeout=5)
         try:
             c.sendall(b"\x05\x01\x00")
-            assert c.recv(2) == b"\x05\x00"              # the refusal was reported before this answer
+            assert _read_exact(c, 2) == b"\x05\x00"    # the refusal was reported before this answer
         finally:
             c.close()
         return real_close(*a, **k)

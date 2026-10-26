@@ -186,6 +186,7 @@ class StopResult:
     final_flush: dict | None                # the clean end's summary line, or None when there is none
     order: tuple[str, ...]
     failures: tuple[str, ...] = ()          # "<step>: <exception type>" for each teardown step that raised
+    socks_wall_failures: int = 0            # the refuser's `wall_failures`: pass to report.build so the undercount shows
 
 
 def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, events: Path, ca_pem: bytes, routes: Any,
@@ -381,4 +382,4 @@ def stop_egress(e: EgressLaunch) -> StopResult:
         order.append(what)
     return StopResult(glue_exit=code, decider_clean=decider_clean, socks_clean=socks_clean,
                       final_flush=final_flush(e.events) if code == 0 else None, order=tuple(order),
-                      failures=tuple(failures))
+                      failures=tuple(failures), socks_wall_failures=e.socks.wall_failures)
