@@ -1121,7 +1121,8 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
     a queue directory, the ping is also written to the notification record (``kind`` and ``ref``, ``request:<id>``
     or ``question:<n>``, name it there) by a detached child, with whether the notify command started, and that
     same child pushes it to each paired phone when one with pings on was live at that moment and
-    :func:`levain.webpush.presence.should_push` says so (a ping it holds is recorded, not pushed). With no ``cwd`` there
+    :func:`levain.webpush.presence.should_push` says so (a ping it holds is recorded and queued for the phone,
+    :mod:`levain.webpush.held`, not pushed). With no ``cwd`` there
     is no queue directory, so nothing is recorded and no push is sent.
     True when the notify command or a push started; False when neither is configured or neither could start (a
     command that did not start is still written to the record, as not started). A failed ping never fails the
@@ -1133,11 +1134,14 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
             from levain.webpush import live, presence, sender
 
             paired = live(cwd)
-            phone = paired and presence.should_push(cwd, kind).push   # a held ping is recorded, not pushed
+            said = presence.should_push(cwd, kind) if paired else None
+            phone = said is not None and said.push
+            # a ping the rule holds waits in the held queue under the word that muted it, else as "active"
+            hold = None if said is None or said.push else (said.by or "active")
             if paired or settings.notify_argv:
                 body = message[len("levain: "):] if message.startswith("levain: ") else message
                 recorded = sender.spawn(cwd, kind=kind, ref=ref, title="levain", body=body, url="/?view=needs",
-                                        command=started if settings.notify_argv else None, push=phone)
+                                        command=started if settings.notify_argv else None, push=phone, hold=hold)
                 pushed = recorded and phone
         except Exception:  # noqa: BLE001 - a failed ping never fails the gate
             pushed = False
@@ -1167,6 +1171,17 @@ def _notify_argv(settings: AdapterSettings, message: str, *, cwd: Path | str | N
     except Exception:
         return False
     return True
+
+
+def flush_held_pings(queue: ConsentQueue) -> bool:
+    """Start the push of any held phone ping the presence rule now lets through (:func:`levain.webpush.held.flush_if_due`).
+    Called with every gate call, so held pings are delivered without a daemon. Never raises."""
+    try:
+        from levain.webpush import held
+
+        return held.flush_if_due(queue.directory)
+    except Exception:  # noqa: BLE001 - a held ping waits for the next call
+        return False
 
 
 def send_repings(queue: ConsentQueue, settings: AdapterSettings) -> int:
@@ -1328,6 +1343,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         return limited
     try:
         send_repings(queue, settings)
+        flush_held_pings(queue)
     except Exception:
         pass  # a re-ping is a ping: it never fails the gate
     if still_away is None:

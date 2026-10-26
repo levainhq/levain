@@ -39,20 +39,32 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("send")
     s.add_argument("--queue-dir", required=True, type=Path)
     s.add_argument("--kind", required=True)
+    f_ = sub.add_parser("flush")
+    f_.add_argument("--queue-dir", required=True, type=Path)
     a = p.parse_args(argv)
+    if a.cmd == "flush":   # push what the presence rule now lets through of the pings it held
+        from levain.webpush import held
+
+        held.flush(a.queue_dir)
+        return 0
     # the text arrives as JSON on stdin (see sender.spawn): never argv, so it is not an option and not in `ps`
     try:
         f = json.loads(sys.stdin.buffer.read(65536).decode("utf-8"))
         title, body, ref, url = f["title"], f["body"], f.get("ref"), f.get("url") or "/"
-        command, push = f.get("command"), f.get("push", True)
+        command, push, hold = f.get("command"), f.get("push", True), f.get("hold")
         if (not all(isinstance(x, str) for x in (title, body, url)) or not (ref is None or isinstance(ref, str))
-                or not (command is None or isinstance(command, bool)) or not isinstance(push, bool)):
+                or not (command is None or isinstance(command, bool)) or not isinstance(push, bool)
+                or hold not in (None, "quiet", "sleep", "active")):
             raise ValueError("fields")
     except (ValueError, KeyError, TypeError, AttributeError):
-        print("levain.webpush send: expected a JSON object {title, body, ref, url, command, push} on stdin", file=sys.stderr)
+        print("levain.webpush send: expected a JSON object {title, body, ref, url, command, push, hold} on stdin", file=sys.stderr)
         return 2
     try:
-        sender.send(a.queue_dir, kind=a.kind, ref=ref, title=title, body=body, url=url, command=command, push=push)
+        sender.send(a.queue_dir, kind=a.kind, ref=ref, title=title, body=body, url=url, command=command, push=push, hold=hold)
+        if push:   # a ping that reached the phone is also a moment when pings held earlier may be due
+            from levain.webpush import held
+
+            held.flush(a.queue_dir)
     except Exception as exc:  # noqa: BLE001 - the child's stderr is /dev/null: the failure is said in a bounded log
         _log_error(a.queue_dir, exc)
         return 1

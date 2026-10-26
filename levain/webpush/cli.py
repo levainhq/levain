@@ -40,8 +40,10 @@ def register(subparsers) -> None:
     pr.set_defaults(func=_pair)
     from levain.webpush import presence
 
-    for word, text in (("quiet", "Hold phone pushes for a while (default 60 min), urgent ones too."),
-                       ("sleep", "Hold phone pushes until your next input at this Mac."),
+    for word, text in (("quiet", "Hold phone pushes for a while (default 60 min), except urgent ones; one summary and the held "
+                                 "pings follow when it ends."),
+                       ("sleep", "Hold every phone push, urgent too, until your next keyboard or mouse input at this "
+                                 "Mac (read from the Mac's input idle time); one summary and the held pings follow."),
                        ("loud", "Push every ping for a while (default 60 min), over everything else; `loud off` ends it."),
                        ("away", "Push at once until you next type here (optional override)."),
                        ("remote", "Push for a while (default 60 min) whatever the desk shows (optional override)."),

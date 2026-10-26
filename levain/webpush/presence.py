@@ -218,10 +218,14 @@ def _write(queue_dir: Path | str, rec: dict | None) -> None:
 
 def describe(queue_dir: Path | str, *, now: float | None = None,
              idle: Callable[[], float | None] | None = None) -> str:
-    """One line for ``levain ping status``: the word on file and what the rule does now with an ordinary ping."""
+    """One line for ``levain ping status``: the word on file, what the rule does now with an ordinary ping, and how many
+    pings are held for the phone."""
     ts = time.time() if now is None else now
     word = read_word(queue_dir)
     d = should_push(queue_dir, "ping", now=ts, idle=idle)
     on_file = "no word" if word is None else (word["word"] if "until" not in word else
                                               f"{word['word']} until {time.strftime('%H:%M', time.localtime(word['until']))}")
-    return f"{d.state.upper()}: {d.why} (word: {on_file})"
+    from levain.webpush import held
+
+    n = held.count(queue_dir)
+    return f"{d.state.upper()}: {d.why} (word: {on_file}; {n} held for the phone)"

@@ -1501,3 +1501,12 @@ def test_a_malformed_pretooluse_event_naming_a_gated_call_is_denied(queue, monke
     ungated = {**good, "session_id": None, "tool_name": "Bash", "tool_input": {"command": "ls"}}
     assert cc.gate(ungated, queue, settings, home=Path("/home/u")) is None
     assert queue.pending() == []
+
+
+def test_every_gate_call_checks_for_held_phone_pings(queue, monkeypatch):
+    """Held phone pings (levain.webpush.held) are delivered without a daemon: the gate calls the check each time."""
+    calls = []
+    monkeypatch.setattr(cc, "flush_held_pings", lambda q: calls.append(q.directory))
+    monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
+    cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    assert calls == [queue.directory]

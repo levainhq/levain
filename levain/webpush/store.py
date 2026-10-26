@@ -4,7 +4,8 @@ The directory is 0700 and the file 0600; a symlinked directory or file is refuse
 ``O_NOFOLLOW`` so a link planted between the check and the open is not followed. Under a sandboxed agent the
 queue directory is outside its write reach, which is where the VAPID private key belongs.
 
-``pings``, ``deliveries`` and ``opens`` are records: a trigger refuses to change or delete a row.
+``pings``, ``deliveries`` and ``opens`` are records: a trigger refuses to change or delete a row. ``held`` is not: it is
+the queue of pings the presence rule held back from the phone (:mod:`levain.webpush.held`), each released once.
 """
 from __future__ import annotations
 
@@ -73,6 +74,8 @@ _SCHEMA: tuple[str, ...] = (
     "status INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS opens (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
     "REFERENCES pings(id), device_id TEXT, at TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS held (ping_id INTEGER PRIMARY KEY REFERENCES pings(id), url TEXT NOT NULL, "
+    "reason TEXT NOT NULL, held_at TEXT NOT NULL, released_at TEXT)",
     *_records("pings"), *_records("deliveries"), *_records("opens"),
 )
 
@@ -215,6 +218,29 @@ class PushStore:
             return int(c.execute("INSERT INTO pings (at, kind, ref, title, body, command) VALUES (?,?,?,?,?,?)",
                                  (now_stamp(), kind, ref, title, body,
                                   None if command is None else int(bool(command)))).lastrowid)
+
+    # --- the held queue ------------------------------------------------------------------------------
+    def hold(self, ping_id: int, url: str, reason: str) -> None:
+        """Queue ping ``ping_id`` (already recorded) for the phone: ``reason`` is the word that muted it (``quiet``,
+        ``sleep``) or ``active`` (the desk was in use)."""
+        with self.write() as c:
+            c.execute("INSERT OR IGNORE INTO held (ping_id, url, reason, held_at) VALUES (?,?,?,?)",
+                      (ping_id, url, reason, now_stamp()))
+
+    def held_items(self) -> list[dict[str, Any]]:
+        """The pings still held, oldest first, each with what it says."""
+        with self.read() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT h.ping_id, h.url, h.reason, h.held_at, p.kind, p.ref, p.title, p.body FROM held h "
+                "JOIN pings p ON p.id = h.ping_id WHERE h.released_at IS NULL ORDER BY h.ping_id")]
+
+    def claim_held(self, ping_ids: list[int]) -> list[int]:
+        """Mark these held pings released and return the ids this call released: a ping is claimed by exactly one
+        caller, so it is pushed at most once however many flushes race."""
+        with self.write() as c:
+            at = now_stamp()
+            return [i for i in ping_ids if c.execute(
+                "UPDATE held SET released_at = ? WHERE ping_id = ? AND released_at IS NULL", (at, i)).rowcount == 1]
 
     def add_delivery(self, ping_id: int, subscription_id: int, status: int, *, retire: bool = False) -> None:
         with self.write() as c:

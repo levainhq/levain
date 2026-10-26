@@ -176,3 +176,16 @@ def test_a_halted_session_stays_halted_when_started_unconfined(tmp_path, monkeyp
         monkeypatch.setattr(cx, "unconfined_state", halting)
         out = json.loads(_run(qdir, {**_event(session, "apply_patch", patch, str(tmp_path)), "permission_mode": mode}))
         assert out["hookSpecificOutput"]["permissionDecisionReason"] == cx.HALT_TEXT.format(n=1), session
+
+
+def test_every_codex_gate_call_checks_for_held_phone_pings(tmp_path, monkeypatch):
+    """Held phone pings (levain.webpush.held) are delivered without a daemon: this gate calls the check each time too."""
+    from pathlib import Path
+
+    calls = []
+    monkeypatch.setattr(cx, "flush_held_pings", lambda q: calls.append(q.directory))
+    queue = ConsentQueue(tmp_path / "q", authority=authority_source(tmp_path / "q", anchor=None))
+    event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"},
+             "cwd": "/work/proj", "session_id": "s1", "turn_id": "t1", "tool_use_id": "c1"}
+    cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    assert calls == [queue.directory]

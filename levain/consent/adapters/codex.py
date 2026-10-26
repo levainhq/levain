@@ -88,8 +88,8 @@ from levain.consent.adapters.claude_code import (  # noqa: F401
 )
 from levain.consent.adapters.claude_code import (  # noqa: F401 - GATE_TIMEOUT is the installer's
     ATTENDED_POSTURES, FLOOR_TEXT, GATE_HOLD_CEILING, GATE_POLL, GATE_SLEEP_CAP, GATE_TIMEOUT, HOOK_FLAGS, HOOKRUN,
-    RULING_TEXT, UNCONFINED_ENV, U_IRR, U_REV, _pre, _what, floor_text, notify, send_repings, unconfined,
-    unconfined_state,
+    RULING_TEXT, UNCONFINED_ENV, U_IRR, U_REV, _pre, _what, floor_text, flush_held_pings, notify, send_repings,
+    unconfined, unconfined_state,
 )
 from levain.consent.adapters.claude_code import DEFAULT_GATE_HOLD, SLOT_HOW, queue_socket_planted
 from levain.consent.broker_client import in_slot
@@ -481,6 +481,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         return _with_rulings(limited, queue, session)   # a late End on the limit reaches a halted Codex session
     try:
         send_repings(queue, settings)
+        flush_held_pings(queue)
     except Exception:
         pass  # a re-ping is a ping: it never fails the gate
     if still_away is None:
