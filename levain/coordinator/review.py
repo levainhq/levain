@@ -415,7 +415,7 @@ def file_clear_request(store: CoordStore, item_id: str, *, queue_dir: Path, reus
 
 
 def clear_signed(store: CoordStore, item_id: str, *, queue_dir: Path, request_id: object,
-                 keys: Callable[[], Mapping[str, Any]]) -> Item:
+                 keys: Callable[[], Mapping[str, Any]], still: Callable[[], None] | None = None) -> Item:
     """Clear ``item_id`` on the operator's passkey signature (R3, R4): the sign request ``request_id`` in
     ``queue_dir``'s sign directory must be levain's own in :data:`levain.contracts.namespaces.REVIEW_CLEAR_NAMESPACE`,
     signed (not open, not denied) and unexpired; its signature must verify (:func:`levain.authority.verify_link_sig`)
@@ -423,8 +423,10 @@ def clear_signed(store: CoordStore, item_id: str, *, queue_dir: Path, request_id
     whose class covers :data:`SIGN_TIER`. The verify runs before the write; inside the write transaction the message
     is recomputed from the item as it is now (:func:`clear_message`) and compared byte for byte, so a signature over an
     older version (the item cleared or reopened since) clears nothing. The event is mode :data:`SIGNED` with the
-    request's id. Refusals are :class:`SignedClearRefused`; a missing item is :class:`CoordNotFound` and a missing
-    store :class:`StoreAbsent` (none is made), as on every other review transition."""
+    request's id. ``still()`` runs inside the write transaction before anything is read or written there (the
+    phone's check that the device is still paired); it refuses by raising. Refusals are :class:`SignedClearRefused`;
+    a missing item is :class:`CoordNotFound` and a missing store :class:`StoreAbsent` (none is made), as on every
+    other review transition."""
     import hashlib
 
     from levain.authority import VerifierUnavailable, verify_link_sig
@@ -480,6 +482,8 @@ def clear_signed(store: CoordStore, item_id: str, *, queue_dir: Path, request_id
     if not verified:
         raise refuse(f"the signature of sign request {rid} does not verify")
     with store._write("operator", create=False) as (conn, now):
+        if still is not None:
+            still()
         row = conn.execute(f"SELECT {_COLS} FROM review_items WHERE item_id = ?", (str(item_id),)).fetchone()
         if row is None:
             raise CoordNotFound(f"no review item {str(item_id)[:40]}")

@@ -560,8 +560,8 @@ class _PhoneServer(ThreadingHTTPServer):
 
     def device_live(self, device_id: str) -> bool:
         """Whether ``device_id`` is still a paired, unrevoked device: asked again at a review write, inside the
-        coordinator store's write transaction (a revoke that landed after the request's token was checked refuses the
-        write). A store that cannot be read raises :class:`levain.writes.EditError` (503)."""
+        coordinator store's write transaction, and immediately before a sign request is filed (a revoke that landed
+        after the request's token was checked refuses the write). A store that cannot be read raises :class:`levain.writes.EditError` (503)."""
         from levain.webpush import devices
         from levain.writes import EditError
 
@@ -962,7 +962,9 @@ class _PhoneServer(ThreadingHTTPServer):
         time is left, is answered again instead of a second filed) and answers its listing row and the passkeys that may
         sign it; ``clear`` with ``{"sign_request": ...}`` clears it on that signature, verified at the store's door
         against the passkeys this port signs with (:func:`levain.coordinator.review.clear_signed`, mode ``signed``).
-        Before either, the verb ``review_clear_signed`` is tiered under the signed standing policy of the cockpit those
+        The device is asked again (:meth:`device_live`) immediately before the request is filed and inside the
+        clear's write, so a device revoked since its token was checked files and clears nothing (403
+        ``device_revoked``). Before either, the verb ``review_clear_signed`` is tiered under the signed standing policy of the cockpit those
         passkeys are enrolled in, and refused as the cockpit's kernel refuses it when a policy raised it above C1
         (:func:`levain.cockpit.verbs.refuse_raised_review`); a request is filed only while a passkey is enrolled to sign
         it, and a missing, closed or plain item is its own 404 / 409 before that. A directory holding no coordinator
@@ -1011,6 +1013,12 @@ class _PhoneServer(ThreadingHTTPServer):
         except EditError as exc:
             raise PhoneError(exc.http_status, exc.code, str(exc)) from None
         store = CoordStore(self.coord.dispatch_dir)
+
+        def still() -> None:
+            # the plain path's rule: a device revoked since its token was checked writes nothing
+            if not self.device_live(device):
+                raise review.SignedClearRefused(403, "device_revoked", "this device is no longer paired, so it "
+                                                "files and clears nothing")
         try:
             if filing:
                 signers = [k.fingerprint for k in passkey_keys(snap, self.rp_id)]
@@ -1025,12 +1033,15 @@ class _PhoneServer(ThreadingHTTPServer):
                     raise PhoneError(422, "no_passkey", f"no passkey is enrolled for {self.rp_id} to sign the clear of "
                                                         f"item {item_id}: enrol one first; nothing was filed")
                 # levain's own request over the item as it is now; the page signs it on /sign/<id>/ and then clears
+                still()
                 rid = review.file_clear_request(store, item_id, queue_dir=self.queue_dir, reuse=True)
                 return {"request": self.signer.row(rid, signers), "signers": signers}
             item = review.clear_signed(store, item_id, queue_dir=self.queue_dir, request_id=req["sign_request"],
-                                       keys=self._sign_keys)
+                                       keys=self._sign_keys, still=still)
         except review.SignedClearRefused as exc:
             raise PhoneError(exc.status, exc.error, str(exc)) from None
+        except EditError as exc:                       # the paired-device store cannot be read now (device_live)
+            raise PhoneError(exc.http_status, exc.code, str(exc)) from None
         except (review.CoordNotFound, StoreAbsent, FileNotFoundError) as exc:
             raise PhoneError(404, "not_found", str(exc) or "there is no coordinator review queue here") from None
         except SignRefused as exc:

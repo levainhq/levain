@@ -100,3 +100,66 @@ def test_the_phone_poll_between_challenge_and_answer_does_not_cost_the_signed_cl
         httpd.server_close()
         thread.join(timeout=5)
     assert _events(store, mine.item_id) == [("cleared", "signed", "operator", row["id"])]
+
+
+# --- P2 -----------------------------------------------------------------------------------------------------------
+
+def _revoke_devices(qdir: Path) -> None:
+    from datetime import datetime, timezone
+
+    from levain.webpush import devices
+    from levain.webpush.store import PushStore
+
+    conn = PushStore(qdir).connection()
+    try:
+        for d in devices.list_devices(conn):
+            devices.revoke(conn, d["id"], datetime.now(timezone.utc))
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
+def test_a_device_revoked_while_its_signed_clear_verifies_clears_nothing(world, monkeypatch) -> None:  # noqa: F811
+    import levain.authority as authority
+    from tests.test_coordinator_phone import _post, device_token
+    from tests.test_phone_dispatch import _serve
+
+    store = CoordStore(world["qdir"])
+    mine = _mine(store)
+    dev = device_token(world["qdir"])
+    with _serve(world["qdir"], world["qdir"]) as (base, httpd):
+        got = _post(base, f"/coord/review/{mine.item_id}/sign-request", {}, dev)[1]
+        _phone_sign(base, httpd.server_address[1], world, got["request"], dev)
+        verify = authority.verify_link_sig
+
+        def revoked_mid_verify(*a, **kw):        # the device's token passed; it is revoked while the door verifies
+            _revoke_devices(world["qdir"])
+            return verify(*a, **kw)
+
+        monkeypatch.setattr(authority, "verify_link_sig", revoked_mid_verify)
+        st, out = _post(base, f"/coord/review/{mine.item_id}/clear", {"sign_request": got["request"]["id"]}, dev)
+    assert (st, out.get("error")) == (403, "device_revoked"), out
+    assert _events(store, mine.item_id) == []
+    assert review.get_item(store, mine.item_id).state == "open"
+
+
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
+def test_a_device_revoked_while_its_sign_request_is_checked_files_nothing(world, monkeypatch) -> None:  # noqa: F811
+    import levain.cockpit.verbs as verbs
+    from tests.test_coordinator_phone import _post, device_token
+    from tests.test_phone_dispatch import _serve
+
+    store = CoordStore(world["qdir"])
+    mine = _mine(store)
+    dev = device_token(world["qdir"])
+    refuse = verbs.refuse_raised_review
+
+    def revoked_mid_check(*a, **kw):             # the device's token passed; it is revoked while the policy is read
+        _revoke_devices(world["qdir"])
+        return refuse(*a, **kw)
+
+    monkeypatch.setattr(verbs, "refuse_raised_review", revoked_mid_check)
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        st, out = _post(base, f"/coord/review/{mine.item_id}/sign-request", {}, dev)
+    assert (st, out.get("error")) == (403, "device_revoked"), out
+    assert list((world["qdir"] / "sign").glob("lv-*")) == []
