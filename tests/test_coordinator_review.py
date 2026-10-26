@@ -20,6 +20,7 @@ from levain.coordinator.store import CoordError, CoordStore, Part
 from tests.test_consent_queue import authority, keys  # noqa: F401  (module fixtures)
 from tests.test_coordinator_envelope import ctx, keys as env_keys, repo, snapshot, structured_thread  # noqa: F401
 from tests.test_coordinator_envelope import HOUR, NOW as ENV_NOW
+from tests._h4 import h4_home
 
 T0 = datetime(2026, 10, 22, 20, 0, tzinfo=timezone.utc)
 
@@ -166,7 +167,7 @@ def test_a_know_is_a_reply_and_an_open_item_in_one_write(store):
 # --- SIGN / ANSWER records and "waiting on you" ---------------------------------------------------------------
 @pytest.fixture
 def cq(qdir, authority, clock):  # noqa: F811
-    return ConsentQueue(qdir, authority=authority, clock=clock)
+    return ConsentQueue(qdir, authority=authority, clock=clock, home=h4_home())
 
 
 def _request(cq, command="touch /tmp/x"):

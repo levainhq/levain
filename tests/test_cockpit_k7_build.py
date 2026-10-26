@@ -17,6 +17,7 @@ from levain.consent.queue import ConsentQueue, authority_source
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_sessions import CWD_CC, CWD_CX, SID_CC, SID_CX, SID_Q, _fixture, _put, _stamp
+from tests._h4 import h4_home
 
 DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
 BUILD = "#write_token=T&build"
@@ -119,7 +120,7 @@ def test_two_pending_requests_on_one_session_carry_the_count_and_the_newest_name
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     from datetime import timedelta as td
     home = tmp_path / "levain_home"
-    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None))
+    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
     q.file(agent="claude_code", agent_session_id=SID_CC, tool_name="Edit", tool_input={"file_path": "/x/y"}, cwd=CWD_CC,
            hold=td(minutes=5), event_id="e2")
     v = _views(src)["claude_code:active"]
@@ -129,7 +130,7 @@ def test_two_pending_requests_on_one_session_carry_the_count_and_the_newest_name
 def test_a_waiting_tool_name_is_filtered_and_capped(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     home = tmp_path / "levain_home"
-    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None))
+    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
     q.file(agent="codex", agent_session_id=SID_CX, tool_name="x" * 500 + "\x1b[31m", tool_input={}, cwd=CWD_CX,
            hold=timedelta(minutes=5), event_id="e3")
     w = _views(src)["codex:active"]["waiting"]
@@ -285,7 +286,7 @@ def test_a_session_at_the_warn_line_is_marked_over_for_both_agents_and_the_label
 def test_a_quiet_session_with_a_pending_request_shows_waiting_and_two_pending_say_so(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     home = tmp_path / "levain_home"
-    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None))
+    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
     q.file(agent="claude_code", agent_session_id=SID_Q, tool_name="Edit", tool_input={}, cwd=CWD_CC, hold=timedelta(minutes=5), event_id="eq1")
     q.file(agent="claude_code", agent_session_id=SID_CC, tool_name="Write", tool_input={}, cwd=CWD_CC, hold=timedelta(minutes=5), event_id="e9")
     probe = "JSON.stringify(" + ROWS + ".map(r => [r.classList.contains('live'), r.classList.contains('waiting'), r.querySelector('.k7-tool').textContent]))"

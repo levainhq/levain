@@ -30,10 +30,12 @@ columns (by :data:`CHAT_ADDED_COLUMNS`, their rule a trigger), the activation wr
 the verdict writer over an injected probe with retry-then-latch, ``probing`` at every §4.2 boundary (R9's Claude
 send and result line included) and H9's first-send exception, the pump step's order (a pending probe before the next
 line; the route seam after the verdict), the bounded vendor read and interrupt, and :func:`composer_state`.
+CH-D1b-4 wires Claude's tripwires (§4.4; the rules are :mod:`levain.coordinator.chat_tripwires`) and the named replies
+to inbound control requests (§8.1) into the pump, and files §4.3's ``seat`` review item when a ``not_live`` latches.
 
 NOT HERE: CH-D1c's ``chat_approvals`` and ``chat_approval_events`` (the view's seam for them is named in
-:data:`CHAT_SCHEMA`, "SEAM CH-D1c"); Claude's tripwires (§4.4, CH-D1b-4); the vendor probes themselves (CH-D2 /
-CH-D3); a pump thread (the launcher's loop over :meth:`ChatService.read_next`).
+:data:`CHAT_SCHEMA`, "SEAM CH-D1c"); the vendor probes themselves (CH-D2 / CH-D3); a pump thread (the launcher's loop
+over :meth:`ChatService.read_next`).
 
 [seat] numbers rev 2 marks ``[seat]``: :data:`EVENT_BODY_MAX`, and rev 4's §7.6 :data:`ECHO_WINDOW`; §4.2's
 :data:`PROBE_TRIES` and :data:`PROBE_GAP`; :data:`ATTACHMENTS_MAX`, :data:`READ_DEADLINE` and
@@ -63,8 +65,10 @@ from levain.cockpit.consent import parse_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import chat_lease
 from levain.coordinator.chat_lease import TURN_LEASE_SCHEMA, TurnLease, TurnRefused, TurnView
+from levain.coordinator.chat_tripwires import (ControlReply, Trip, TripwireContext, TripwireWindow, control_line,
+                                               mode_trip, reported_mode_trip)
 from levain.coordinator.driver import (CommandResult, InterruptCommand, LivenessEvidence, NotSent, SendCommand,
-                                       SendResult)
+                                       SendResult, SessionMeta)
 from levain.coordinator.store import WORDS_MAX, CoordError, _append_only, _in, next_gseq, schema_present
 
 __all__ = [
@@ -894,6 +898,34 @@ def record_check(conn: sqlite3.Connection, now: str, launch_id: str, kind: str, 
     return seq
 
 
+def _owed_items(conn: sqlite3.Connection, launch_id: str) -> list[tuple[str, dict[str, Any]]]:
+    """§4.3: ``(dedupe key, body)`` of each ``seat`` review item the launch's latches owe: a ``not_live`` that
+    latched the launch (no other ``not_live`` since the last ``reenabled`` before it) when a ``live`` came before it,
+    and a tripwire's with no prior live too (§4.4: it names the source of what it caught). One item per latch cycle
+    either way: a ``not_live`` after another in the same cycle files none."""
+    rows = conn.execute(
+        "SELECT c.seq, c.source, c.detail FROM chat_launch_checks c WHERE c.launch_id = ? AND c.kind = 'not_live' "
+        "AND NOT EXISTS (SELECT 1 FROM chat_launch_checks p WHERE p.launch_id = c.launch_id AND p.kind = 'not_live' "
+        "AND p.seq < c.seq AND p.seq > COALESCE((SELECT MAX(r.seq) FROM chat_launch_checks r WHERE r.launch_id = "
+        "c.launch_id AND r.kind = 'reenabled' AND r.seq < c.seq), 0)) AND (c.source GLOB 'tripwire:?*' OR EXISTS "
+        "(SELECT 1 FROM chat_launch_checks l WHERE l.launch_id = c.launch_id AND l.kind = 'live' AND l.seq < c.seq)) "
+        "ORDER BY c.seq", (launch_id,)).fetchall()
+    return [(f"chat-not-live:{launch_id}:{seq}", {"what": "chat turned off for a worker until you re-enable it",
+                                                  "launch": launch_id, "check": seq, "source": source,
+                                                  "detail": detail}) for seq, source, detail in rows]
+
+
+def _trip(conn: sqlite3.Connection, now: str, launch_id: str, trip: Trip) -> None:
+    """A tripwire's ``not_live`` (source ``tripwire:<name>``), in the caller's transaction; once per tripwire while
+    the launch stays latched (a second catch of the same kind adds nothing your re-enable would not clear)."""
+    source = "tripwire:" + trip.name
+    since = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM chat_launch_checks WHERE launch_id = ? AND kind = "
+                         "'reenabled'", (launch_id,)).fetchone()[0]
+    if conn.execute("SELECT 1 FROM chat_launch_checks WHERE launch_id = ? AND kind = 'not_live' AND source = ? AND "
+                    "seq > ? LIMIT 1", (launch_id, source, since)).fetchone() is None:
+        record_check(conn, now, launch_id, "not_live", source, _cause_text(trip.detail))
+
+
 # §4.2 [seat]: a probe that cannot run is retried in place this many times, this far apart (seconds), then latches
 PROBE_TRIES = 3
 PROBE_GAP = 2.0
@@ -958,14 +990,13 @@ def _boundary(conn: sqlite3.Connection, now: str, launch_id: str, source: str) -
         record_check(conn, now, launch_id, "probing", source, f"probing at the {source.replace('_', ' ')} boundary")
 
 
-def _crossing(conn: sqlite3.Connection, launch_id: str, seen: Sequence[Any], backfill: Sequence[bool],
-              claude: bool) -> str | None:
+def _crossing(stored: set[str], seen: Sequence[Any], backfill: Sequence[bool], claude: bool) -> str | None:
     """The source of the first boundary of a batch that crosses one (two new boundaries, or one that is not the
-    batch's last event); None when it does not. A boundary is a new, non-backfill ``turn_started`` (any harness) or,
-    on Claude, ``turn_ended`` (R9): the events :meth:`ChatService._ingest` writes a ``probing`` row for."""
+    batch's last event); None when it does not. A boundary is a new (its key not in ``stored``, the launch's recorded
+    keys among the batch's), non-backfill ``turn_started`` (any harness) or, on Claude, ``turn_ended`` (R9): the
+    events :meth:`ChatService._ingest` writes a ``probing`` row for."""
     at = [(i, "turn_start" if e.kind == "turn_started" else "result") for i, (e, old) in enumerate(zip(seen, backfill))
-          if not old and (e.kind == "turn_started" or (claude and e.kind == "turn_ended"))
-          and _event_row(conn, launch_id, e.key) is None]
+          if not old and (e.kind == "turn_started" or (claude and e.kind == "turn_ended")) and e.key not in stored]
     if len(at) > 1 or at and at[0][0] != len(seen) - 1:
         return at[0][1]
     return None
@@ -1322,6 +1353,20 @@ def _echo_or_outside(conn: sqlite3.Connection, now: str, item: ChatEvent, window
                            cause=f"a user item from outside Levain ({len(found)} candidate sends)")
 
 
+class _Handled(NamedTuple):
+    """One control event in the handled-control record: its state and whether it was interrupted."""
+    state: str
+    interrupted: bool = False
+
+
+class _Control(NamedTuple):
+    """One control line of a batch: its identity (the event's position and vendor id), the trip that asks for the
+    turn's interrupt, and the named reply."""
+    ident: tuple[str, str]
+    stop: Trip | None
+    reply: ControlReply | None
+
+
 @dataclass(frozen=True)
 class _Seen:
     """One vendor event of a batch, every field read once, before any transaction (a driver's object is untrusted
@@ -1429,12 +1474,32 @@ class ChatService:
     :class:`~levain.coordinator.driver.LivenessEvidence`; nothing it returns is read as a verdict. With no probe, every
     probe fails and latches. ``route(launch_id, keys)`` is the seam a later slice routes vendor requests through: the
     keys of the events one read recorded, called after that read's verdict with the launch's mutex held (it must not
-    call back into the service for that launch: the mutex is not re-entrant). ``sleep`` is the retry wait."""
+    call back into the service for that launch: the mutex is not re-entrant). ``sleep`` is the retry wait.
+
+    Tripwires (§4.4, Claude launches only): ``tripwires(launch_id)`` gives the launch's
+    :class:`~levain.coordinator.chat_tripwires.TripwireContext` (the launcher's); None, an exception or anything else
+    leaves the launch with none, and its first ``tool_result`` trips. Each attached session gets a fresh
+    :class:`~levain.coordinator.chat_tripwires.TripwireWindow`; every pump step feeds it the events it will record new,
+    BEFORE the transaction that records them (no context callback and no path resolve runs inside a write
+    transaction), and that transaction writes each trip as ``not_live`` (source ``tripwire:<name>``) at its event.
+    Each inbound non-approval control request gets its named error reply (§8.1), and a trip that asks for it sends the
+    turn's interrupt, also before that transaction: a process that dies before the commit leaves the cursor where it
+    was, so the next service reads the request again and answers it; one that dies after a reply and before the commit
+    answers it again, and a second reply the session does not confirm latches ``tripwire:unanswerable_control``.
+
+    §4.3's review item: ``seat_item(dedupe_key, body)`` is the launcher's filer of a ``seat`` review item, which must
+    file at most once per dedupe key (this module never imports the review queue). After any write that can latch a
+    launch, the service files each item its latches owe (:func:`_owed_items`) that this process has not filed yet.
+    The filer runs after the latch commits, never inside it, so a filer that fails costs nothing but the item, and the
+    next sweep files it again. It may run with the launch's mutex held (a pump step), so like ``route`` it must not
+    call back into the service for that launch."""
 
     def __init__(self, store: ChatStore, *, fault: Callable[[str], None] | None = None,
                  probe: Callable[[str, LivenessEvidence], Verdict] | None = None,
                  route: Callable[[str, tuple[str, ...]], None] | None = None,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 tripwires: Callable[[str], TripwireContext | None] | None = None,
+                 seat_item: Callable[[str, dict[str, Any]], Any] | None = None) -> None:
         self._chat = store
         self._sessions: dict[str, Any] = {}
         self._locks: dict[str, threading.Lock] = {}
@@ -1447,6 +1512,18 @@ class ChatService:
         self._probe = probe
         self._route = route
         self._sleep = sleep
+        self._tripwires = tripwires
+        self._windows: dict[str, TripwireWindow] = {}   # launch -> its attached session's tripwire window
+        self._seat_item = seat_item
+        self._filed: dict[str, set[str]] = {}            # launch -> the seat items' dedupe keys filed while attached
+        # launch -> the control events this session was sent something for, by the event's identity (its stream
+        # position and vendor id, which carries the request id) -> two facts. Its state: "done" (its reply was
+        # confirmed, or its interrupt confirmed or answered no_such_request: nothing is sent for it again), "open"
+        # (tried, not done: tried again) or "stale" (open when the launch was activated or re-enabled: its reply is
+        # tried again, an interrupt naming no turn is not, since it would reach a turn started after that). And
+        # whether it was interrupted (an interrupt sent for it was confirmed or answered no_such_request): that
+        # interrupt is never sent again, only its reply is retried. A committed batch's events are dropped from it
+        self._handled: dict[str, dict[tuple[str, str], _Handled]] = {}
 
     def _launch_lock(self, launch_id: str) -> threading.Lock:
         with self._guard:
@@ -1465,6 +1542,8 @@ class ChatService:
             self._refuse_second(launch_id)
             self._sessions[launch_id] = session
             self._wedged.discard(launch_id)           # a wedge belongs to the session that left a call unanswered
+            self._windows.pop(launch_id, None)        # so does a tripwire window: a new child is watched from zero
+            self._handled.pop(launch_id, None)
 
     def _wedge(self, launch_id: str, session: Any) -> None:
         """``session`` left a driver call unanswered: the launch's session is used no more until it is detached.
@@ -1497,6 +1576,10 @@ class ChatService:
                     self._unpinned.wait_for(lambda: not self._pins.get(id(held)), timeout=INTERRUPT_DEADLINE)
                     session = self._sessions.pop(launch_id, None)
                     self._wedged.discard(launch_id)
+                    self._windows.pop(launch_id, None)
+                    self._handled.pop(launch_id, None)
+                    # the filer files once per key (its contract): a later attach asks it again
+                    self._filed.pop(launch_id, None)
                 finally:
                     self._detaching.discard(launch_id)
             if session is not None:
@@ -1626,8 +1709,16 @@ class ChatService:
             # under activation's probing (H9) writes none (stage 2 gives that launch its verdict)
             first = _first_send_open(conn, m.launch_id)
             outbox_step(conn, now, m.message_id, "attempted", cause="attempt", op_id=op_id, vendor_anchor=anchor)
-            if not first and _launch_state(conn, m.launch_id)[2] == "claude":
+            claude = _launch_state(conn, m.launch_id)[2] == "claude"
+            if not first and claude:
                 _boundary(conn, now, m.launch_id, "send")
+        if claude:
+            # R9: a send is a boundary for the tripwire counts too, once its attempt committed (the launch's mutex,
+            # held here, is the one the pump updates the window under); they reset only with no call open
+            with self._guard:
+                window = self._windows.get(m.launch_id)
+            if window is not None:
+                window.boundary()
         # only the transaction whose attempted row committed reaches this call (the partial unique index)
         self._fault("attempt_committed")
         state, cause, turn, item, signal = self._call(session, _command(m, op_id))
@@ -1733,18 +1824,21 @@ class ChatService:
         self._probe_pending(launch_id, session)
         self._refuse_wedged(launch_id, "nothing was recorded")
         correlated = bool(session.capabilities().correlation_field)
+        raws = tuple(batch.events)
         seen = []
-        for e in batch.events:
+        for e in raws:
             body = e.body
             seen.append(_Seen(e.key, e.kind, e.pos, e.turn_id, e.call_id, body,
                               _plain_norm(session.normalize(body)) if isinstance(body, str) else body,
                               e.correlation, e.vendor_id))
         through, cursor, gap = batch.complete_through, batch.next_cursor, bool(batch.gap)
 
-        def frontier(conn: sqlite3.Connection) -> tuple[str | None, _LaunchRead]:
-            return _first_through(conn, launch_id), _launch_read(conn, launch_id)
+        def frontier(conn: sqlite3.Connection) -> tuple[str | None, _LaunchRead, bool, set[str]]:
+            return _first_through(conn, launch_id), _launch_read(conn, launch_id), \
+                _launch_state(conn, launch_id)[2] == "claude", \
+                {e.key for e in seen if _event_row(conn, launch_id, e.key) is not None}
 
-        first, read = self._chat._read(frontier)
+        first, read, claude, stored = self._chat._read(frontier)
         prev, lt = read.through, session.pos_lt
         baseline = first if first is not None else through
         backfill = [baseline is not None and not lt(baseline, e.pos) for e in seen]
@@ -1753,27 +1847,47 @@ class ChatService:
                    if e.kind == "user_item" and not old else () for e, old in zip(seen, backfill)]
         if through is not None and prev is not None and lt(through, prev):
             through, gap = prev, False      # an older batch: the persisted frontier already covers its gap
+        # what the write below records new: a key not stored and not earlier in the batch (the fingerprint check
+        # refuses the write if any event of the launch was written since this read, and each row is checked again)
+        fresh, keys = [], set()
+        for e in seen:
+            fresh.append(e.key not in stored and e.key not in keys)
+            keys.add(e.key)
+        crossed = _crossing(stored, seen, backfill, claude)
+        window, early, at, controls = self._watch(launch_id, session, claude, raws, seen, backfill, fresh, crossed,
+                                                  gap)
+        if controls:
+            # answer-then-commit: every reply and the interrupt are written before the batch and its cursor commit
+            failed = self._answer_controls(launch_id, session, controls)
+            if failed:
+                early.append(Trip("unanswerable_control", "a control reply could not be written: " + "; ".join(failed)))
+            self._fault("controls_answered")
         new = 0
         recorded: list[str] = []
-        crossed = None
         with self._chat._write() as (conn, now):
             if _fingerprint(conn, launch_id) != read.fingerprint:
                 raise CoordError(f"launch {launch_id}'s chat record changed while its batch was read; nothing "
                                  "was written")
-            claude = _launch_state(conn, launch_id)[2] == "claude"
-            crossed = _crossing(conn, launch_id, seen, backfill, claude)
             if crossed is not None:
                 # the driver contract: a read ends at its one boundary. Fail closed: nothing of the batch is
                 # recorded, the cursor stays, and the launch latches off
                 record_check(conn, now, launch_id, "not_live", crossed, "batch crossed a boundary")
                 seen = []
-            for e, old, window in zip(seen, backfill, windows):
+            for trip in early:                        # the batch's own trips, before any of its rows
+                _trip(conn, now, launch_id, trip)
+            for i, (e, old, window_keys) in enumerate(zip(seen, backfill, windows)):
                 ev, created = record_event(conn, now, launch_id=launch_id, key=e.key, pos=e.pos, kind=e.kind,
                                            body=e.body, normalized=e.norm, turn_id=e.turn_id, call_id=e.call_id,
                                            backfill=old)
+                if created != fresh[i]:
+                    raise CoordError(f"launch {launch_id}'s chat record changed while its batch was read; nothing "
+                                     "was written")
                 new += created
                 if created and not old:
                     recorded.append(e.key)
+                # each trip is written at its event, so a boundary after it still gets its own probing and verdict
+                for trip in at[i]:
+                    _trip(conn, now, launch_id, trip)
                 # §4.2: probing commits with the boundary that starts a turn (Codex turn/started; any harness's
                 # turn_started) and, on Claude, with the turn_ended a result line maps to (R9). History is no boundary
                 if created and not old and (e.kind == "turn_started" or (claude and e.kind == "turn_ended")):
@@ -1782,10 +1896,18 @@ class ChatService:
                     continue
                 if correlated and isinstance(e.correlation, str) and self._prove(conn, now, launch_id, e):
                     continue
-                _echo_or_outside(conn, now, ev, window)
+                _echo_or_outside(conn, now, ev, window_keys)
             if crossed is None:
                 record_cursor(conn, now, launch_id=launch_id, vendor_cursor=cursor, complete_through=through,
                               gap=gap)
+        # the window and the reply record first: nothing after the commit can lose them
+        with self._guard:
+            if window is not None and crossed is None and self._sessions.get(launch_id) is session:
+                self._windows[launch_id] = window
+            if crossed is None:                       # a crossing batch stays unrecorded: its re-read sends nothing new
+                for ident, _stop, _reply in controls:
+                    self._handled.get(launch_id, {}).pop(ident, None)
+        self._file_latches(launch_id)
         if crossed is not None:
             raise CoordError(f"launch {launch_id}'s vendor read crossed a boundary (a boundary event that is not its "
                              "batch's last); nothing was recorded and the launch is off until you re-enable it")
@@ -1944,6 +2066,17 @@ class ChatService:
             if getattr(canary, "ok", None) is not True:
                 raise CoordError("an activation accepts only a canary verdict that passed")
             verdict_id = canary_verdict_id(canary)
+        # a launch that does not exist gets no lock: the registry holds attached and real launches only
+        self._chat._read(lambda conn: _worker_launch(conn, launch_id))
+        with self._launch_lock(launch_id):
+            seq = self._activation_row(launch_id, kind, detail, digest, spawn_nonce, verdict_id, containment_digest)
+            self._stale_handled(launch_id)
+        self._file_latches(launch_id)
+        return seq
+
+    def _activation_row(self, launch_id: str, kind: str, detail: str, digest: str | None, spawn_nonce: str | None,
+                        verdict_id: str | None, containment_digest: str | None) -> int:
+        """:meth:`activate`'s row, in its own transaction (the caller holds the launch's mutex). The seq."""
         with self._chat._write() as (conn, now):
             harness = _launch_state(conn, launch_id)[2]
             if harness == "claude" and (spawn_nonce is None or kind == "live" and (
@@ -1962,19 +2095,165 @@ class ChatService:
                                 spawn_nonce=spawn_nonce, canary_verdict_id=verdict_id,
                                 containment_digest=containment_digest)
 
+    def _stale_handled(self, launch_id: str) -> None:
+        """After an activation or a re-enable, in the same hold of the launch's mutex as its commit (so no read
+        holds an entry across it): every control event still open in the handled record turns stale, so an
+        interrupt it asked for and that names no turn never reaches a turn started after it."""
+        with self._guard:
+            record = self._handled.get(launch_id, {})
+            record.update([(ident, h._replace(state="stale")) for ident, h in record.items() if h.state == "open"])
+
     def reenable(self, launch_id: str, owner: str) -> int:
         """Your re-enable (§4.2): clears a latch only while the latest check read live again. ``owner`` is the
         authenticated client. The service never writes this row itself."""
         owner = chat_lease.check_owner(owner)
-        with self._chat._write() as (conn, now):
-            return record_check(conn, now, launch_id, "reenabled", "operator", f"re-enabled by {owner}",
-                                by="operator")
+        self._chat._read(lambda conn: _worker_launch(conn, launch_id))
+        with self._launch_lock(launch_id):
+            with self._chat._write() as (conn, now):
+                seq = record_check(conn, now, launch_id, "reenabled", "operator", f"re-enabled by {owner}",
+                                   by="operator")
+            self._stale_handled(launch_id)
+        return seq
 
     def composer(self, launch_id: str, owner: str) -> Composer:
         """:func:`composer_state` for ``owner``, read without the write lock."""
         attached = self._session(launch_id) is not None and launch_id not in self._wedged
         return self._chat._read(lambda conn: composer_state(conn, self._chat._opener._stamp(), launch_id, owner,
                                                             attached=attached))
+
+    def _watch(self, launch_id: str, session: Any, claude: bool, raws: Sequence[Any], seen: Sequence[Any],
+               backfill: Sequence[bool], fresh: Sequence[bool], crossed: str | None,
+               gap: bool) -> tuple[TripwireWindow | None, list[Trip], list[list[Trip]], list[_Control]]:
+        """§4.4 on Claude, before the write transaction: ``(window copy, the batch's own trips, each event's trips,
+        the control lines to answer or interrupt)``. The copy observes each event the write records new and that is
+        not history; the mode is read from the session (a meta that cannot be read trips). A batch that crosses a
+        boundary is not recorded, so nothing of it feeds the window, but a mode one of its lines reports is still kept
+        and each of its control lines is still answered or interrupted. An effective gap drops the counts and, with a call open, trips."""
+        at: list[list[Trip]] = [[] for _ in seen]
+        if not claude:
+            return None, [], at, []
+        window, early, controls = self._window(launch_id), [], []
+        mode = self._mode(launch_id, session)
+        early += [mode] if mode is not None else []
+        new = [(i, raw, e) for i, (raw, e, old, f) in enumerate(zip(raws, seen, backfill, fresh)) if f and not old]
+
+        def control(e: _Seen, trip: Trip | None, reply: ControlReply | None) -> None:
+            stop = trip if trip is not None and trip.interrupt else None
+            if stop is not None or reply is not None:
+                controls.append(_Control((str(e.pos), str(e.vendor_id)), stop, reply))
+
+        if crossed is not None:
+            for _i, raw, e in new:
+                reported = reported_mode_trip(raw)
+                trip, reply = control_line(raw) or (None, None)
+                early += [t for t in (reported, trip) if t is not None]
+                control(e, trip, reply)
+            return window, early, at, controls
+        was_open = bool(window.calls)
+        for i, raw, e in new:
+            trip, reply = window.observe(raw)
+            at[i] += [trip] if trip is not None else []
+            control(e, trip, reply)
+            if e.kind in ("turn_started", "turn_ended"):
+                trip = window.boundary(turn=True)
+                at[i] += [trip] if trip is not None else []
+        if gap:
+            trip = window.gap(was_open)
+            early += [trip] if trip is not None else []
+        return window, early, at, controls
+
+    def _window(self, launch_id: str) -> TripwireWindow:
+        """A copy of the launch's tripwire window, or a fresh one (with the launcher's context) for a session not
+        yet watched."""
+        with self._guard:
+            held = self._windows.get(launch_id)
+        if held is not None:
+            return held.copy()
+        ctx = None
+        if self._tripwires is not None:
+            try:
+                ctx = self._tripwires(launch_id)
+            except Exception:  # noqa: BLE001 - no context: the launch's first tool_result trips
+                ctx = None
+        return TripwireWindow(ctx if isinstance(ctx, TripwireContext) else None)
+
+    def _mode(self, launch_id: str, session: Any) -> Trip | None:
+        """``mode_changed`` from the session's meta (its init, or a later line that reported a change), bounded by
+        :data:`READ_DEADLINE`; a meta that cannot be read trips it too (an overdue one also wedges the session)."""
+        try:
+            meta = _bounded(session.meta, READ_DEADLINE)
+        except _Overdue:
+            self._wedge(launch_id, session)
+            return Trip("mode_changed", "could not read the session's permission mode: the read is overdue")
+        except Exception as exc:  # noqa: BLE001 - an unread mode is never read as default
+            return Trip("mode_changed", f"could not read the session's permission mode: {type(exc).__name__}")
+        if type(meta) is not SessionMeta:
+            return Trip("mode_changed", "could not read the session's permission mode: the session returned no meta")
+        return mode_trip(meta.permission_mode)
+
+    def _answer_controls(self, launch_id: str, session: Any, controls: Sequence[_Control]) -> list[str]:
+        """Before the batch commits (the caller holds the launch's mutex; no transaction is open): each inbound
+        non-approval control request gets its named error reply through ``reject_control`` (§8.1), bounded by
+        :data:`READ_DEADLINE`. Then, when a trip asked for it or a reply failed, ONE interrupt of the turn (§8.1, O6:
+        the CLI's pending requests abort); an interrupt that is refused or ambiguous leaves the latch as the record.
+        The handled-control record (``_handled``) decides what is sent: nothing for a control event already done, no
+        second interrupt for one already interrupted, and no interrupt naming no turn for one left over from before the
+        launch's last activation or re-enable. What failed, for the
+        caller to latch ``tripwire:unanswerable_control`` in the batch's transaction."""
+        with self._guard:
+            record = self._handled.setdefault(launch_id, {})
+            held = {c.ident: record.setdefault(c.ident, _Handled("open")) for c in controls}
+        failed, stops, unanswered = [], [], []
+        for c in controls:
+            state, interrupted = held[c.ident]
+            if state == "done":
+                continue
+            if c.stop is not None and not interrupted and (c.stop.turn_id is not None or state == "open"):
+                stops.append(c)
+            if c.reply is None:
+                continue
+            why = self._reject(launch_id, session, c.reply)
+            if why is None:
+                with self._guard:
+                    record[c.ident] = _Handled("done", interrupted)
+                continue
+            failed.append(f"{c.reply.request_id[:40]}: {why}")
+            if state == "open" and not interrupted:
+                unanswered.append(c)
+        if stops or unanswered:
+            turn = next((c.stop.turn_id for c in stops if c.stop.turn_id is not None), None)
+            try:
+                got = self.interrupt(launch_id, turn)
+            except CoordError:
+                got = None                            # detached or wedged: the latch stands, and close is the stop
+            if got is not None and got.outcome in ("confirmed", "no_such_request"):
+                with self._guard:
+                    # a stop carries no reply, so an interrupted stop is done; an unanswered reply is retried
+                    record.update((c.ident, _Handled("done", True)) for c in stops)
+                    record.update((c.ident, record[c.ident]._replace(interrupted=True)) for c in unanswered)
+        return failed
+
+    def _reject(self, launch_id: str, session: Any, reply: ControlReply) -> str | None:
+        """Send one named error reply; None when the session confirmed it, else why it failed (a failed reply is tried
+        again on a re-read). A reply answered ``no_such_request`` fails: the caller sends a control event only while
+        the record holds it not done, so the session never confirmed this event and its request is unaccounted for
+        (T1's ``unanswerable_control`` latch)."""
+        with self._guard:
+            wedged = launch_id in self._wedged
+        if wedged:
+            return "the session stopped answering"
+        try:
+            got = _bounded(functools.partial(session.reject_control, reply.request_id, reply.text), READ_DEADLINE)
+        except _Overdue:
+            self._wedge(launch_id, session)
+            return f"the reply did not return within {READ_DEADLINE:g} s"
+        except Exception as exc:  # noqa: BLE001 - an unwritten reply leaves the CLI waiting: latch and stop
+            return f"{type(exc).__name__}: {_said(exc)}"
+        if isinstance(got, CommandResult) and got.outcome == "no_such_request":
+            return "the session holds no such request"
+        if not isinstance(got, CommandResult) or got.outcome != "confirmed":
+            return "the session did not confirm the reply"
+        return None
 
     def _probe_pending(self, launch_id: str, session: Any) -> None:
         """Answer the launch's boundary ``probing`` row, if its latest check is one (the caller holds the launch's
@@ -2037,6 +2316,30 @@ class ChatService:
             if _pending_probe(conn, launch_id) != pending:
                 return
             record_check(conn, now, launch_id, kind, pending[1], detail, evidence_sha256=evidence)
+        self._file_latches(launch_id)
+
+    def _file_latches(self, launch_id: str) -> None:
+        """§4.3: file each ``seat`` item the launch's latches owe and this process has not filed while the launch's
+        session is attached. A filer that raises, or a read that does, files nothing now; the next sweep asks again.
+        Never raises an Exception."""
+        if self._seat_item is None:
+            return
+        try:
+            owed = self._chat._read(lambda conn: _owed_items(conn, launch_id))
+        except Exception:  # noqa: BLE001 - after a latch committed: a failed read costs the item, never the latch
+            return
+        for key, body in owed:
+            with self._guard:
+                if key in self._filed.get(launch_id, ()):
+                    continue
+            try:
+                self._seat_item(key, body)
+            except Exception:  # noqa: BLE001 - the latch is the record; the item is its pointer, filed next sweep
+                continue
+            with self._guard:
+                # cached only while attached (detach drops it): a launch with no session asks the filer each time
+                if launch_id in self._sessions:
+                    self._filed.setdefault(launch_id, set()).add(key)
 
     def mark(self, message_id: str, delivered: bool, owner: str) -> str:
         """§7.4: you resolve an ambiguous send, delivered or not. ``owner`` is the authenticated client."""

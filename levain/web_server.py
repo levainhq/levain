@@ -309,6 +309,191 @@ def _sign_one(route: str) -> "str | None":
     return rid if rid and "/" not in rid else None
 
 
+# ONESURFACE OS-2, the consent family: a consent request answered with a passkey on the cockpit (a pending one), or ruled
+# (an undecided one), through the phone port's OWN step code (ConsentSheet below), over the Signer's queue, rpId and pinned
+# page. GET /cockpit/consent/<id>/sheet.json is the sign sheet's read of one request, POST
+# /cockpit/consent/<id>/{challenge,answer,rule-challenge,rule} its ceremony, both behind the sign routes' gate exactly, and
+# GET /sign/consent/<id> the sheet's page. Served only beside the grant routes (make_server's same-queue condition): the
+# card a button sits on and the request it answers come from one queue. Else every path here is 404.
+_CONSENT_SIGN_ACTIONS = ("challenge", "answer", "rule-challenge", "rule")
+_CONSENT_SHEET_READ = "/sheet.json"
+_CONSENT_SHEET_PREFIX = "/sign/consent/"
+
+
+def _consent_sign_route(route: str) -> "tuple[str, str] | None":
+    """``(request_id, action)`` for ``POST /cockpit/consent/<id>/<action>``, else None."""
+    if not route.startswith(_CONSENT_BODY_PREFIX):
+        return None
+    seg, sep, action = route[len(_CONSENT_BODY_PREFIX):].partition("/")
+    rid = urllib.parse.unquote(seg)     # the page encodes the id (a ":" in it), as the consent body route reads it
+    if not sep or _CONSENT_ID.fullmatch(rid) is None or action not in _CONSENT_SIGN_ACTIONS:
+        return None
+    return rid, action
+
+
+def _consent_sheet_read(path: str) -> "str | None":
+    """The request id of ``GET /cockpit/consent/<id>/sheet.json``, else None."""
+    if not path.startswith(_CONSENT_BODY_PREFIX) or not path.endswith(_CONSENT_SHEET_READ):
+        return None
+    rid = urllib.parse.unquote(path[len(_CONSENT_BODY_PREFIX):-len(_CONSENT_SHEET_READ)])
+    return rid if _CONSENT_ID.fullmatch(rid) is not None else None
+
+
+def _consent_sheet_id(path: str) -> "str | None":
+    """The request id of ``GET /sign/consent/<id>`` (the sheet's page), else None."""
+    rid = urllib.parse.unquote(path[len(_CONSENT_SHEET_PREFIX):]) if path.startswith(_CONSENT_SHEET_PREFIX) else ""
+    return rid if _CONSENT_ID.fullmatch(rid) is not None else None
+
+
+class ConsentRefused(Exception):
+    """A consent step's refusal: an HTTP status, an error word and the words the page shows (the phone port's)."""
+
+    def __init__(self, status: int, error: str, message: str) -> None:
+        super().__init__(message)
+        self.status, self.error, self.message = status, error, message
+
+
+class ConsentSheet:
+    """The consent family on the cockpit (OS-2): the phone port's answer and ruling steps
+    (:meth:`levain.phone_server._PhoneServer.answer_step`, ``rule_step``, ``_source``, ``_deliver_later``), called on
+    this object, so the checks a cockpit answer passes are the phone's own code, not a copy: the request's state, a cut
+    display, an active passkey enrolled on ``rp_id`` in the cockpit the request's hook names, the key's class against
+    the tier for an allow, the assertion turned into an SSHSIG against ``page_origin``, and the queue's own verification
+    (ssh-keygen and the passkey checks it runs at every delivery). ``signer`` supplies only display facts (a credential
+    id per key, :meth:`levain.consent.sign.Signer.key_facts`), never who may sign.
+
+    The queue re-verifies a passkey's answer against ``https://<rp_id>`` with no port (``localhost``: any port), never
+    the page's origin, so a cockpit pinned elsewhere (``https://<name>:8443``) would have every answer refused after
+    the ceremony. There it lists no signer and refuses each step before any ceremony, saying where it can be answered."""
+
+    def __init__(self, queue_dir: Path, rp_id: str, page_origin: "str | None", signer: "Signer") -> None:
+        from levain.authority import ReplayCache
+
+        self.queue_dir, self.rp_id, self.page_origin, self.signer = Path(queue_dir), rp_id, page_origin, signer
+        self.replay_cache = ReplayCache()      # one per sheet, as the phone port keeps one per server
+
+    # the phone port's steps read these on their `self` -------------------------------------------------------------
+
+    def _source(self, root: Path) -> Any:
+        from levain.phone_server import _PhoneServer
+
+        return _PhoneServer._source(self, root)    # type: ignore[arg-type]
+
+    def rule_step(self, request_id: str, action: str, req: Any, *, deliver: bool = True) -> "dict[str, Any]":
+        from levain.phone_server import _PhoneServer
+
+        return _PhoneServer.rule_step(self, request_id, action, req, deliver=deliver)    # type: ignore[arg-type]
+
+    def _deliver_later(self, queue: Any, request_id: str, agent: str) -> Any:
+        from levain.phone_server import _PhoneServer
+
+        return _PhoneServer._deliver_later(self, queue, request_id, agent)    # type: ignore[arg-type]
+
+    # ----------------------------------------------------------------------------------------------------------------
+
+    def elsewhere(self) -> "str | None":
+        """Why no consent answer made on this cockpit's page can verify, or None."""
+        if self.rp_id == "localhost" or self.page_origin == f"https://{self.rp_id}":
+            return None
+        return (f"a consent answer verifies only when signed on https://{self.rp_id} (no port), and this cockpit is "
+                f"served on {self.page_origin}: answer it on that page or from the terminal")
+
+    def step(self, request_id: str, action: str, req: Any) -> "dict[str, Any]":
+        """``POST /cockpit/consent/<id>/<action>``: the phone port's :meth:`answer_step` reply; a challenge's also
+        carries ``line``, the exact text signed (the record's JCS bytes). A ruling is answered as soon as the queue has
+        recorded it, with ``delivery`` ``pending``: its delivery runs on its own thread and is never waited on here;
+        where it landed is the queue's own record. :class:`ConsentRefused` with the phone port's status, word and words."""
+        from levain.phone_server import _AWAIT, PhoneError, _PhoneServer
+
+        problem = self.elsewhere()
+        if problem is not None:
+            raise ConsentRefused(422, "answer_refused", problem + "; nothing was signed")
+        try:
+            out = _PhoneServer.answer_step(self, request_id, action, req)    # type: ignore[arg-type]
+        except PhoneError as exc:
+            raise ConsentRefused(exc.status, exc.error, exc.message) from None
+        if out.pop(_AWAIT, None) is not None:       # the delivery thread is started; the ruling stands either way
+            out["delivery"] = {"route": "pending", "reason": "its delivery to the session is running"}
+        if action in ("challenge", "rule-challenge"):
+            from levain.consent.record import answer_message, ruling_message
+
+            encode = answer_message if action == "challenge" else ruling_message
+            out["line"] = encode(out["payload"]).decode("utf-8")
+        return out
+
+    @staticmethod
+    def version(row: "dict[str, Any]", digest: str) -> str:
+        """The version a sheet row and a card's link name one request by: over the request's digest and every field
+        the row shows as the thing decided (its state, title, requester, message, hold and each option offered whole:
+        its key, its shown text and the exact line it signs), so a request whose shown words, offered answers or signed
+        lines changed reads as changed."""
+        shown = [row["id"], digest, row["state"], row["title"], row["requester"], row["message"], row["expires_at"],
+                 [[o["key"], o["text"], o["line"]] for o in row["options"]], row.get("refused"), row.get("note")]
+        return hashlib.sha256(json.dumps(shown, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def row(self, request_id: str) -> "dict[str, Any] | None":
+        """The sheet's row for one request that is open to a passkey here (pending: an answer; undecided: a ruling),
+        else None. ``signers``: the active passkeys enrolled on ``rp_id`` in the cockpit the request's hook names; an
+        allow is offered only when one of them may allow the request's tier (``class_covers``, the phone's own check),
+        and only over a display shown whole (a deny is still ruled over a cut one, as on the phone). ``sha256``: the
+        version the sheet signs on (:meth:`version`), so a request that moved from pending to undecided reads as
+        changed. A pending request whose hold has ended is not open here (the queue applies no answer to it)."""
+        import sqlite3
+
+        from levain.authority import AuthorityError, VerifierUnavailable
+        from levain.cockpit.consent import utc_stamp
+        from levain.cockpit.hintview import visible
+        from levain.consent.answering import answer_root, passkey_keys
+        from levain.consent.listing import UNSHOWN, filed_input
+        from levain.consent.queue import AnswerRefused, ConsentQueue, authority_source, class_covers
+
+        got = ConsentQueue(self.queue_dir, home=Path.home(),
+                           authority=authority_source(self.queue_dir, anchor=None)).get(request_id)
+        if got is None or got[1] not in ("pending", "undecided"):
+            return None
+        request, state = got
+        # the queue's own rule: no answer applies once the hold has ended; inside UNDECIDED_GRACE the request still
+        # reads pending (for the hook's undecided mark), but it is not open to an answer, so not to this sheet
+        if state == "pending" and request.expires_at <= utc_stamp(datetime.now(timezone.utc)):
+            return None
+        mode = "answer" if state == "pending" else "rule"
+        cut = filed_input(request) is UNSHOWN
+        row: dict[str, Any] = {
+            "id": request.id, "kind": "consent", "mode": mode, "state": state,
+            "title": f"{visible(request.tool_name)} · {request.tier}", "requester": visible(request.agent),
+            "message": visible(request.display), "expires_at": request.expires_at if state == "pending" else None,
+            "options": [], "signers": [], "recommended": None}
+        problem = self.elsewhere()
+        try:
+            keys = [] if problem is not None else passkey_keys(self._source(answer_root(self.queue_dir, request))(),
+                                                               self.rp_id)
+        except (AnswerRefused, AuthorityError, VerifierUnavailable, OSError, sqlite3.Error) as exc:
+            keys, problem = [], str(exc)
+        if problem is None and not keys:
+            problem = f"no passkey is enrolled for {self.rp_id} in the cockpit this request's hook names"
+        if problem is not None:
+            row["note"] = problem
+            return self._versioned(row, request)
+        verb = "answer" if mode == "answer" else "rule"
+        if cut and mode == "answer":
+            row["refused"] = ("its input is too long to show here, so it is not signed from this page; the agent's own "
+                              "dialog stands")
+            return self._versioned(row, request)
+        allow = [k.fingerprint for k in keys if class_covers(k.key_class, request.tier)]
+        if allow and not cut:
+            row["options"].append({"key": "allow", "text": "Allow", "line": f"{verb} allow: request {request.id}"})
+        elif not cut:
+            row["note"] = (f"a passkey cannot allow a {request.tier} request: allow it from the laptop "
+                           f"(levain consent {verb} {request.id} allow --signing-key <laptop key>)")
+        row["options"].append({"key": "deny", "text": "Deny", "line": f"{verb} deny: request {request.id}"})
+        row["signers"] = [k.fingerprint for k in keys]
+        return self._versioned(row, request)
+
+    def _versioned(self, row: "dict[str, Any]", request: Any) -> "dict[str, Any]":
+        row["sha256"] = self.version(row, request.digest)
+        return row
+
+
 def _extra_hosts(hosts: object) -> frozenset[str]:
     """``extra_hosts`` as the Host gate compares names (:func:`levain.http_guards.host_header_allowed`: lowercase, no
     trailing dot, no port, since the gate compares host names only, for loopback too). ValueError for anything that
@@ -902,6 +1087,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # the grants' passkey revoke (PLAN M17 "9a"), built by make_server from that Signer once it is pinned; None serves no
     # grant route
     grant_phone: "GrantPhone | None" = None
+    # the consent family's answer and ruling (OS-2), built by make_server beside grant_phone, under its condition; None
+    # serves no consent signing route
+    consent_sheet: "ConsentSheet | None" = None
     # the caller's compose_signer (DESIGN_SIGN D5): (verb, params) -> the id of the sign request it filed; None serves no
     # compose route
     compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None
@@ -1045,8 +1233,11 @@ class _Handler(GuardedHandler):
         cross-site fetch, subresource or frame of it, HEAD, ``/pair?..`` and every other path stay refused; framing is
         refused anyway (X-Frame-Options DENY). The sign sheet ``GET /sign/<id>`` is the same class (OS-1: a sign link
         opened from a message or a mail page; a static shell whose reads are same-origin and gated), exact raw path too;
-        a cross-site frame of it is refused here, its own-origin frame is what its headers admit."""
-        return (self.command == "GET" and (self.path == "/pair" or _sheet_id(self.path.split("?", 1)[0]) is not None)
+        a cross-site frame of it is refused here, its own-origin frame is what its headers admit. The consent sheet
+        ``GET /sign/consent/<id>`` (OS-2) is the same shell over a consent request, admitted alike."""
+        page = self.path.split("?", 1)[0]
+        return (self.command == "GET"
+                and (self.path == "/pair" or _sheet_id(page) is not None or _consent_sheet_id(page) is not None)
                 and self.headers.get("Sec-Fetch-Site") == "cross-site"
                 and self.headers.get("Sec-Fetch-Mode") == "navigate"
                 and self.headers.get("Sec-Fetch-Dest") == "document")
@@ -1285,6 +1476,22 @@ class _Handler(GuardedHandler):
                     entry = find_entry(self.server.consent_reader(datetime.now(timezone.utc)), request_id)
                     if entry is not None:
                         status, payload = 200, entry_body(entry, settled_lookup=self._egress_lookup())
+                        # OS-2: the sheet's own row: `sheet` when it is open to the sheet here (it shows the
+                        # reason when no passkey may sign it), `sheet_choices` the answers the sheet offers (the
+                        # card routes only those to it), `sheet_v` the version the card's link carries
+                        row = None
+                        if self.server.consent_sheet is not None and entry.state in ("pending", "undecided"):
+                            try:
+                                row = self.server.consent_sheet.row(request_id)
+                            except _CredentialUnavailable:
+                                raise
+                            except Exception:  # noqa: BLE001 - the card keeps its terminal lines
+                                row = None
+                        payload["sheet"] = row is not None
+                        payload["sheet_choices"] = ([o["key"] for o in row["options"]]
+                                                    if row is not None and row["signers"] else [])
+                        if row is not None:
+                            payload["sheet_v"] = row["sha256"]
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                 raise
             except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
@@ -1401,10 +1608,11 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
-    def _serve_sheet(self, *, head: bool) -> None:
+    def _serve_sheet(self, *, head: bool, consent: bool = False) -> None:
         """``GET /sign/<id>`` (OS-1): the sign sheet's page, the same bytes for every id (the id is read from the path
-        by ``/sign.js``), framable only by this origin. Without a signer, 404."""
-        if self.server.signer is None:
+        by ``/sign.js``), framable only by this origin. Without a signer, 404. ``GET /sign/consent/<id>`` (``consent``,
+        OS-2) serves the same bytes beside a consent sheet, else 404."""
+        if (self.server.consent_sheet if consent else self.server.signer) is None:
             self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
             return
         self._send_framing((_SHEET_CSP, "SAMEORIGIN"), self.server.levain_assets[_SHEET_PAGE], "text/html; charset=utf-8",
@@ -1465,6 +1673,52 @@ class _Handler(GuardedHandler):
         try:
             return grants.step(grant_id, action, req), 200
         except GrantRefused as exc:
+            return {"error": exc.error, "message": exc.message}, exc.status
+
+    def _serve_consent_sheet(self, request_id: str, *, head: bool) -> None:
+        """``GET /cockpit/consent/<id>/sheet.json`` (OS-2): ``{request, signers, credentials, origin, rp_id}`` with the
+        request's sheet row (:meth:`ConsentSheet.row`), or 404 ``not_open`` once it is no longer open to a passkey here,
+        behind the sign listing's gate exactly. Without a consent sheet, 404 ``not_found``."""
+        sheet = self.server.consent_sheet
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if sheet is None:
+            self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=404, head=head, cache_control="private, no-store")
+            return
+        if not self._sign_read_admitted(head=head, what="the consent requests"):
+            return
+        try:
+            payload: dict[str, Any]
+            row = sheet.row(request_id)
+            if row is None:
+                payload, status = {"error": "not_open", "message": "this consent request is not open"}, 404
+            else:
+                try:
+                    credentials = sheet.signer.key_facts(row["signers"])
+                except Exception:  # noqa: BLE001 - display facts only: the browser's own list stands in for them
+                    credentials = {}
+                payload, status = {"request": row, "signers": row["signers"], "credentials": credentials,
+                                   "origin": self.server.signer_page_origin, "rp_id": sheet.rp_id}, 200
+                if row.get("note"):
+                    payload["note"] = row["note"]
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
+            status, payload = 500, _store_fault("consent request", exc)
+        finally:
+            self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=hdrs, cache_control="private, no-store")
+
+    def _consent_post(self, request_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/consent/<id>/<action>`` (OS-2): the consent sheet's reply and status, or its refusal as
+        ``{error, message}`` with the phone port's status."""
+        sheet = self.server.consent_sheet
+        if sheet is None:      # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        try:
+            return sheet.step(request_id, action, req), 200
+        except ConsentRefused as exc:
             return {"error": exc.error, "message": exc.message}, exc.status
 
     def _sign_post(self, request_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
@@ -1904,6 +2158,13 @@ class _Handler(GuardedHandler):
         if _sheet_id(path) is not None:
             self._serve_sheet(head=head)
             return
+        if _consent_sheet_id(path) is not None:     # the same sheet over a consent request (OS-2)
+            self._serve_sheet(head=head, consent=True)
+            return
+        consent_read = _consent_sheet_read(path)
+        if consent_read is not None:                # its read rides the sign listing's gate exactly
+            self._serve_consent_sheet(consent_read, head=head)
+            return
         # The sign listing runs the write gate's own checks (a token on every bind), stricter than the off-box gate
         # below, so it is routed before it; without a signer it is 404 to everyone (the route's name is public).
         if path == _SIGN_LIST_PATH or _sign_one(path) is not None:
@@ -2284,7 +2545,9 @@ class _Handler(GuardedHandler):
         compose = route == _SIGN_COMPOSE and (self.server.signer is not None or self.server.compose_signer is not None)
         # and the grants' passkey revoke (PLAN M17 "9a"): the same ceremony class, the same gate
         grant = grant_route(route, _GRANT_PREFIX) if self.server.grant_phone is not None else None
-        if (sign is not None or compose or grant is not None) and not self._off_box_token_valid():
+        # and the consent family's answer and ruling (OS-2): the same ceremony class, the same gate
+        consent = _consent_sign_route(route) if self.server.consent_sheet is not None else None
+        if (sign is not None or compose or grant is not None or consent is not None) and not self._off_box_token_valid():
             return self._reject(403, "credential_required", "missing or invalid write token")
         if self._write_token_required() and not self._off_box_token_valid():
             return self._reject(403, "forbidden", "missing or invalid write token")
@@ -2298,7 +2561,8 @@ class _Handler(GuardedHandler):
         # write_scope, and action verbs REQUIRE a write_scope (make_server enforces it), so
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
-        if not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None:
+        if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
+                and consent is None):
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -2311,7 +2575,11 @@ class _Handler(GuardedHandler):
 
         # Acquire the rate-gate BEFORE any body read/drain so the read+write phase is
         # concurrency-bounded — a stalled body can't pile up unbounded threads. [L3 MED]
-        if not self.server.request_gate.acquire(blocking=False):
+        # a consent answer or ruling carries a signature the person just made with a passkey: it waits a moment for a
+        # slot rather than throw that ceremony away, as on the phone port; everything else answers busy at once
+        waits = consent is not None and consent[1] in ("answer", "rule")
+        if not (self.server.request_gate.acquire(timeout=5) if waits
+                else self.server.request_gate.acquire(blocking=False)):
             return self._reject(503, "busy", "server busy")
         result: dict[str, object] | None = None
         try:
@@ -2363,6 +2631,17 @@ class _Handler(GuardedHandler):
                 # the phone's grant ceremony (the passkey's signature is the authority): no read-only refusal applies
                 try:
                     payload, status = self._grant_post(grant[0], grant[1], req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if consent is not None:
+                # the phone's consent ceremony (the passkey's signature, verified by the queue, is the authority): no
+                # read-only refusal applies to it
+                try:
+                    payload, status = self._consent_post(consent[0], consent[1], req)
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -3022,6 +3301,9 @@ def make_server(
                 reader.directory = Path(card_queue).resolve()
                 httpd.grant_phone = GrantPhone(sign_queue, signer.rp_id, signer.page_origin, signer.keys,
                                                lambda: sign_root(sign_queue))
+                # the consent family's answer and ruling (OS-2), on the same condition and for the same reason: the
+                # consent card a button sits on is read from this queue, the one the answer is verified in
+                httpd.consent_sheet = ConsentSheet(sign_queue, signer.rp_id, signer.page_origin, signer)
         if cockpit is not None:
             # one transaction: an attach that raises (a panel registered since check_verbs; a decisions panel the
             # registry refuses) undoes this server's attaches and keeps any other registration

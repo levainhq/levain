@@ -134,7 +134,8 @@ class Launch:
         self.d = dm.Decider(ours, obs_ours, launch_id=self.launch_id, records=self.records,
                             routes=keys.RouteSet.of([]), mode=dm.Fixed(mode), liveness=Live(),
                             credentials=keys.LaunchCredentials(NoStore()), cards=self.desk,
-                            resolver=Resolver(lookup, max_lookups=4, timeout_s=resolver_timeout), limits=limits)
+                            resolver=Resolver(lookup, max_lookups=4, timeout_s=resolver_timeout), limits=limits,
+                            launch_mode=mode)
         self.d.start()
         for _ in range(400):
             if "glue: serving" in self.stderr.read_text():

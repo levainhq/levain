@@ -16,6 +16,7 @@ from levain.cli import main as levain_main
 from levain.consent import stamps
 from levain.consent.ledger import STORE_FORMAT, Ledger, LedgerStoreError, parse_when, reconcile
 from levain.consent.record import tool_input_digest
+from tests._h4 import h4_home
 
 FIX = Path(__file__).parent / "fixtures" / "ledger"
 NOW = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
@@ -743,7 +744,7 @@ def test_a_locked_ledger_changes_neither_the_gate_answer_nor_its_time(queue, key
              "tool_name": "Edit", "tool_input": edit}
 
     def answer(qdir: Path) -> tuple[str, float]:
-        monkeypatch.setattr(cc, "_queue_for", lambda d, s: ConsentQueue(qdir, authority=authority, clock=clock))
+        monkeypatch.setattr(cc, "_queue_for", lambda d, s, **kw: ConsentQueue(qdir, authority=authority, clock=clock, home=h4_home()))
         out, t0 = io.StringIO(), time.monotonic()
         assert cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(event)), stdout=out) == 0
         return out.getvalue(), time.monotonic() - t0

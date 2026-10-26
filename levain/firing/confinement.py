@@ -232,6 +232,7 @@ from __future__ import annotations
 import atexit
 import codecs
 import errno
+import functools
 import inspect
 import json
 import logging
@@ -246,12 +247,14 @@ import socket
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
 import unicodedata
 import urllib.parse
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, NoReturn
@@ -276,6 +279,7 @@ __all__ = [
     "levain_home_base",
     "levain_home_spellings",
     "too_wide_to_deny",
+    "SYSTEM_RUNTIME_ROOTS",
     "ConfinementConfig",
     "load_confinement_config",
     "ShellResult",
@@ -604,6 +608,46 @@ def _git_config_overrides(environ=None) -> tuple[list[Path], list[Path]]:
         files.append(Path(git_global))
     files += [f for f in _git_config_read_files(env) if os.path.normpath(f) != "/dev/null"]
     return list(_dedup_paths(subtrees)), list(_dedup_paths(files))
+
+
+def python_user_site_roots(home: Path, environ=None) -> tuple[list[tuple[Path, str]], str | None]:
+    """``(roots, note)``: the operator's Python user-site trees for ``home`` as ``(path, label)``, and the line the
+    run banner and doctor print when ``$PYTHONUSERBASE`` puts the user site where no tree can hold it. The ONE
+    derivation of those trees: :func:`build_policy`'s persistence floor and the consent adapters' file-tool check
+    both read it. A ``.pth``, ``usercustomize.py`` or package there runs in every later Python of the operator's
+    that does not disable the user site (-I, -s, a venv; -EP does not). site.py puts the site below
+    ``<base>/lib`` (``lib/pythonX.Y/site-packages``; a macOS framework build's ``lib/python/site-packages``), the
+    base being ``~/.local``, a framework build's ``~/Library/Python/X.Y``, or ``$PYTHONUSERBASE`` as written. So:
+    ``~/.local/lib``; on macOS ``~/Library/Python`` whole, so a Python version installed later is covered too;
+    and for an ABSOLUTE ``$PYTHONUSERBASE`` its ``lib`` only, as written and resolved (:func:`build_policy`
+    refuses one :func:`too_wide_to_deny` names at either spelling). Read from ``environ`` (default
+    ``os.environ``: the operator's, at policy build); an empty value means the default layout. A RELATIVE value, ``~/...`` included (site.py does not
+    expand ``~``), resolves against whatever directory each Python starts in, so no tree holds it: the note."""
+    env = os.environ if environ is None else environ
+    roots = [(home / ".local" / "lib", "operator Python user site"),
+             *(((home / "Library" / "Python", "operator Python user site (macOS framework)"),)
+               if platform.system() == "Darwin" else ())]
+    value = env.get("PYTHONUSERBASE", "")
+    if not value:
+        return roots, None
+    if os.path.isabs(value):
+        # Both spellings (verify r3 #19): through a symlinked base the site lives at the real ``lib``, and the
+        # too-wide refusal compares paths, so it must see that one too (a base linked to / has the site /lib).
+        lib = Path(os.path.normpath(value)) / "lib"
+        return [*roots, *((p, _USERBASE_LABEL) for p in _dedup_paths([lib, Path(os.path.realpath(lib))]))], None
+    return roots, (f"\u26a0 Python user site NOT in the floor: $PYTHONUSERBASE is the relative path {value!r}, "
+                   "which Python resolves against whatever directory it starts in (it does not expand ~), so the "
+                   "entity may plant a .pth there that your later Python runs; point it at a dedicated absolute "
+                   "directory, or unset it")
+
+
+_USERBASE_LABEL = "operator Python user site ($PYTHONUSERBASE)"
+
+
+def python_userbase_note(home: Path | str, environ=None) -> str | None:
+    """The run banner's and doctor's line when ``$PYTHONUSERBASE`` puts the user site outside the floor
+    (:func:`python_user_site_roots`), else None."""
+    return python_user_site_roots(Path(home), environ)[1]
 
 
 def _cred_dir_sources() -> list[Path]:
@@ -2092,6 +2136,52 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
 _MAX_LISTED_STORES = 256
 
 
+# The system directories a runtime loads from. Denying one whole (a $PYTHONUSERBASE linked to /usr names
+# /usr/lib; on a usrmerge Linux /lib IS /usr/lib) would break the agent's own tools with no clear refusal, so
+# the $PYTHONUSERBASE site refuses one (:func:`_holds_a_system_runtime`). tests/test_user_site_floor.py
+# enumerates it.
+SYSTEM_RUNTIME_ROOTS: tuple[Path, ...] = tuple(Path(p) for p in (
+    "/lib", "/lib64", "/usr", "/usr/lib", "/usr/lib64", "/usr/local", "/usr/local/lib", "/bin", "/sbin",
+    "/usr/bin", "/usr/sbin", "/System", "/Library", "/opt/homebrew", "/opt/homebrew/lib",
+))
+
+
+@functools.lru_cache(maxsize=1)
+def _system_runtime_roots() -> tuple[Path, ...]:
+    """:data:`SYSTEM_RUNTIME_ROOTS` plus this interpreter's own load paths: ``sysconfig``'s stdlib, platstdlib,
+    purelib and platlib, its ``LIBDIR``, ``sys.prefix``, ``sys.base_prefix``, the directory of ``sys.executable``
+    and the real directory of ``/bin/sh``. A value that is None, empty or relative is skipped (never the cwd);
+    each that exists, resolved. Computed once per process."""
+    exe = sys.executable
+    raw: list[object] = [*SYSTEM_RUNTIME_ROOTS, sys.prefix, sys.base_prefix,
+                         os.path.dirname(exe) if isinstance(exe, str) else None,
+                         os.path.dirname(os.path.realpath("/bin/sh"))]
+    try:
+        paths = sysconfig.get_paths()
+        raw += [paths.get(k) for k in ("stdlib", "platstdlib", "purelib", "platlib")]
+        raw.append(sysconfig.get_config_var("LIBDIR"))
+    except Exception:  # noqa: BLE001 - no sysconfig answer: the roster and the prefixes stand
+        pass
+    out: list[Path] = []
+    for v in raw:
+        try:
+            if not v or not os.path.isabs(v) or not os.path.exists(v):
+                continue
+            r = Path(v).resolve()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        if r not in out:
+            out.append(r)
+    return tuple(out)
+
+
+def _holds_a_system_runtime(d: Path) -> bool:
+    """Whether the subtree ``d`` is or holds a system runtime root (:func:`_system_runtime_roots`), by file
+    identity (:func:`_inside_by_identity`). Only the ``$PYTHONUSERBASE`` site asks it: a levain home or a store
+    that holds its own venv stays deniable whole (:func:`too_wide_to_deny` does not apply it)."""
+    return any(_inside_by_identity(d, p) for p in _system_runtime_roots())
+
+
 def too_wide_to_deny(d: Path, home: Path, *within: Path) -> bool:
     """Whether the subtree ``d`` is too wide to deny whole: a filesystem root, two path parts or fewer, a
     shared temp directory, or a directory that is or holds ``home`` or any of ``within`` (by file identity,
@@ -2132,18 +2222,19 @@ LEVAIN_HOME_STATE_DIRS = (AUTONOMIC_STORE_DIR, COCKPIT_KEY_DIR, "consent", GRANT
                           _ssh_agent.HOST_KEYS_DIR, "coordinator", "chat-node")
 
 
-def levain_home_base(home: Path) -> Path:
-    """The levain home the floor denies, ``$LEVAIN_HOME`` else ``<home>/.levain``, absolute (an empty
-    ``$LEVAIN_HOME`` is unset, a relative one is taken against the cwd now), not resolved: the floor adds
+def levain_home_base(home: Path, *, environ: Mapping[str, str]) -> Path:
+    """The levain home the floor denies, ``LEVAIN_HOME`` in ``environ`` else ``<home>/.levain``, absolute (an
+    empty ``LEVAIN_HOME`` is unset, a relative one is taken against the cwd now), not resolved: the floor adds
     the other spellings. Raises :class:`ConfinementError` when it cannot be resolved (fail-closed)."""
-    return levain_home_spellings(home)[0]
+    return levain_home_spellings(home, environ=environ)[0]
 
 
-def levain_home_spellings(home: Path) -> tuple[Path, list[Path]]:
+def levain_home_spellings(home: Path, *, environ: Mapping[str, str]) -> tuple[Path, list[Path]]:
     """:func:`levain_home_base` and its :func:`_spellings`, under one ``ConfinementError`` naming
-    ``$LEVAIN_HOME`` as written when either step fails. The consent adapters derive the directory they
-    protect from file tools from it too (``levain.consent.adapters.claude_code.protected_paths``)."""
-    raw = os.environ.get("LEVAIN_HOME")
+    ``$LEVAIN_HOME`` as written when either step fails. ``environ`` is required and is the only environment
+    read. The consent adapters derive the directory they protect from file tools from it too
+    (``levain.consent.adapters.claude_code.protected_paths``)."""
+    raw = environ.get("LEVAIN_HOME")
     try:
         base = Path(raw).expanduser() if raw else home / ".levain"
         base = Path(os.path.abspath(base))
@@ -2154,7 +2245,8 @@ def levain_home_spellings(home: Path) -> tuple[Path, list[Path]]:
         ) from exc
 
 
-def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path) -> tuple[Path, list[Path]]:
+def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path, *,
+                        environ: Mapping[str, str]) -> tuple[Path, list[Path]]:
     """The floor's subtrees for the levain home, ``$LEVAIN_HOME`` else ``~/.levain``, made absolute as its
     readers make it (``levain.autonomic.db.default_store_dir``, ``levain.consent.queue.default_queue_dir``:
     an empty ``$LEVAIN_HOME`` is unset, a relative one is taken against the cwd now). Returns the home and
@@ -2167,7 +2259,7 @@ def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path) -> tuple[
     name: the shape before the whole-home deny plus the consent queue, so that layout keeps the old class
     edge (a new directory must add itself to the tuple). Refuses (fail-closed) a home that cannot be
     resolved, or a named directory that would hide the entity's own home, entity or workspace."""
-    base, whole = levain_home_spellings(home)
+    base, whole = levain_home_spellings(home, environ=environ)
     if not any(_hides_the_entity(d, home, entity_dir, workspace) for d in whole):
         return base, whole
     out: list[Path] = []
@@ -2446,7 +2538,7 @@ def build_policy(
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
     # The whole levain home, one subtree, so an operator-state directory under it is covered without
     # naming itself; the by-name fallback for a home that overlaps the entity is in the helper.
-    levain_base, levain_home_jewels = _levain_home_jewels(home, ed, ws)
+    levain_base, levain_home_jewels = _levain_home_jewels(home, ed, ws, environ=os.environ)
     subtrees.extend(levain_home_jewels)
     # The cockpit authority the consent settings in that home name: its log and anchor sit outside it.
     authority_jewels = _consent_authority_jewels(levain_base, home, ed, ws)
@@ -2747,11 +2839,30 @@ def build_policy(
     # On Linux an absent derived file under a directory nobody here can create makes bwrap refuse to
     # start (its mountpoint cannot be made): fail-closed, and accepted as a known edge (L3 r4).
     git_env_subtrees, git_env_files = _git_config_overrides()
+    user_site_roots, _ = python_user_site_roots(home)
+    for root, label in user_site_roots:
+        if label == _USERBASE_LABEL and (too_wide_to_deny(root, home, ws, ed, *tool_dirs, *gnupg_homes,
+                                                           *_runtime_roots())
+                                         or _holds_a_system_runtime(root)):
+            try:
+                real = root.resolve()
+            except (OSError, RuntimeError, ValueError):
+                real = root
+            where = str(root) if real == root else f"{root} (really {real})"
+            raise ConfinementError(
+                f"$PYTHONUSERBASE puts your Python user site below {where}, and denying writes there would "
+                "take a filesystem root, a system directory, a shared temp directory, your home, the workspace, "
+                "the entity or a tool's directory with it — refusing to build the floor (fail-closed). Point "
+                "PYTHONUSERBASE at a dedicated absolute directory, or unset it."
+            )
     persistence_write_subtrees = _dedup([
         p
         for root, label in (
             (home / "bin", "operator bin"),
             (home / ".local" / "bin", "operator local bin"),
+            # The Python user site (python_user_site_roots; tests/test_user_site_floor.py asks each
+            # interpreter on the machine where it puts it). It costs the entity `pip install --user`.
+            *user_site_roots,
             (home / "Library" / "LaunchAgents", "operator LaunchAgents"),
             (home / ".config" / "git", "operator git config"),
             *((t, "operator git config ($XDG_CONFIG_HOME)") for t in git_env_subtrees),
@@ -7171,15 +7282,26 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             raise ConfinementError(
                 f"the Linux floor would bind {real} read-only to keep the agents' configuration and the "
                 f"shell's startup files out of bash's reach, and that would cover {covered}, "
-                "which bash needs as it is. Refusing to grant bash hands (fail-closed). This comes from "
-                "a symlink under ~/.claude or ~/.codex (or a startup directory) resolving into that "
-                "directory: replace the symlink with the real directory or file to use bash."
+                "which bash needs as it is. Refusing to grant bash hands (fail-closed). To use bash, move "
+                f"{covered} out of {real}; or, where {real} is protected only because a symlink under "
+                "~/.claude or ~/.codex (or a startup directory) resolves into it, replace that symlink "
+                "with the real directory or file."
             )
         if os.path.lexists(real):
             if real.is_dir() and not real.is_symlink():
                 argv += ["--ro-bind", str(real), str(real)]
                 persist_ro.append(real)
-            continue   # a file where a tree would be holds nothing below it
+                continue
+            anc = real.parent
+            if anc in ro_store_dirs or _in_tool_view(anc) or _in_persist_ro(anc) or not _bash_may_write(anc):
+                continue   # bash cannot replace it either: nothing can come to live below it
+            # bash could unlink it, make the directory and plant below it (verify r2, codex HIGH)
+            raise ConfinementError(
+                f"{real} is not a directory, and the Linux floor protects it as one (a directory that "
+                "programs you run later load files from): bash could replace it with a directory and plant "
+                "files there. Refusing to grant bash hands (fail-closed). To use bash, remove it or move it "
+                "out of the way."
+            )
         anc = _nearest_existing(real)
         if (anc == ws_real or anc.is_relative_to(ws_real)) and not os.access(anc, os.W_OK):
             # A hands workspace (owned by the hands user; this process has read access only): bash

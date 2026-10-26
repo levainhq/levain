@@ -859,7 +859,7 @@ class _PhoneServer(ThreadingHTTPServer):
         if q.link is None or q.link.kind != "push":
             return False
         if request is None:
-            got = ConsentQueue(self.queue_dir, authority=authority_source(self.queue_dir, anchor=None)
+            got = ConsentQueue(self.queue_dir, home=Path.home(), authority=authority_source(self.queue_dir, anchor=None)
                                ).get(q.link.request_id)
             request = None if got is None else got[0]
         return (request is not None and request.tool_name == PUSH_TOOL and request.tier == PUSH_TIER
@@ -1082,7 +1082,8 @@ class _PhoneServer(ThreadingHTTPServer):
         if not isinstance(req, dict) or set(req) != need:
             raise PhoneError(400, "bad_request", f"request keys must be {sorted(need)}")
         try:
-            got = ConsentQueue(self.queue_dir, authority=authority_source(self.queue_dir, anchor=None)).get(request_id)
+            got = ConsentQueue(self.queue_dir, home=Path.home(),
+                               authority=authority_source(self.queue_dir, anchor=None)).get(request_id)
             if got is None:
                 raise PhoneError(404, "not_found", "no such consent request")
             request, state = got
@@ -1101,7 +1102,8 @@ class _PhoneServer(ThreadingHTTPServer):
                 if decision == "allow" and not class_covers(keys[fp].key_class, request.tier):
                     raise PhoneError(422, "answer_refused", f"a {keys[fp].key_class} passkey cannot allow a "
                                                             f"{request.tier} request: allow it from the laptop")
-                payload = ConsentQueue(self.queue_dir, authority=source).answer_payload(request_id, decision, fp)
+                payload = ConsentQueue(self.queue_dir, home=Path.home(),
+                                       authority=source).answer_payload(request_id, decision, fp)
                 return {"payload": payload, "rp_id": self.rp_id, "challenge": _b64u(challenge(answer_message(payload)))}
             payload = req["payload"]
             fp = payload.get("signer_fp") if isinstance(payload, dict) else None
@@ -1112,7 +1114,8 @@ class _PhoneServer(ThreadingHTTPServer):
             signature = to_sshsig(key.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
                                   b64url_decode(req["client_data_json"], "client_data_json"),
                                   b64url_decode(req["signature"], "signature"), page_origin=self.page_origin)
-            decided = ConsentQueue(self.queue_dir, authority=source).answer(request_id, payload, signature)
+            decided = ConsentQueue(self.queue_dir, home=Path.home(),
+                                   authority=source).answer(request_id, payload, signature)
         except (AnswerRefused, PasskeyError, ConsentError) as exc:
             raise PhoneError(422, "answer_refused", str(exc)) from None
         except (AuthorityError, VerifierUnavailable, QueueStoreError, OSError, sqlite3.Error) as exc:
@@ -1137,7 +1140,8 @@ class _PhoneServer(ThreadingHTTPServer):
         if not isinstance(req, dict) or set(req) != need:
             raise PhoneError(400, "bad_request", f"request keys must be {sorted(need)}")
         try:
-            got = ConsentQueue(self.queue_dir, authority=authority_source(self.queue_dir, anchor=None)).get(request_id)
+            got = ConsentQueue(self.queue_dir, home=Path.home(),
+                               authority=authority_source(self.queue_dir, anchor=None)).get(request_id)
             if got is None:
                 raise PhoneError(404, "not_found", "no such consent request")
             request, state = got
@@ -1150,7 +1154,7 @@ class _PhoneServer(ThreadingHTTPServer):
                 refuse_cut_display(request, "from a phone")   # a deny is signed even over a cut display
             source = self._source(answer_root(self.queue_dir, request))
             keys = {k.fingerprint: k for k in passkey_keys(source(), self.rp_id)}
-            queue = ConsentQueue(self.queue_dir, authority=source)
+            queue = ConsentQueue(self.queue_dir, home=Path.home(), authority=source)
             if action == "rule-challenge":
                 decision, fp = req["decision"], req["signer_fp"]
                 if decision not in DECISIONS:

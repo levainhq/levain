@@ -186,6 +186,7 @@ _HELD_SEAMS = {
     ("levain/slot/install_helper.py", "gather_facts", "run"): "subprocess.run",
     ("levain/slot/pf.py", "release_enable_reference", "run"): "subprocess.run",
     ("levain/slot/pf.py", "take_enable_reference", "run"): "subprocess.run",
+    ("levain/slot/pf.py", "load_recorded_anchor", "run"): "subprocess.run",
     ("levain/slot/stage.py", "make_bundle", "run"): "subprocess.run",
     ("levain/slot/supervisor.py", "repo_toplevel", "run"): "subprocess.run",
     ("levain/slot/supervisor.py", "operator_clone", "run"): "subprocess.run",

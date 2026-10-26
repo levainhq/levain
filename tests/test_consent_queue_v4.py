@@ -30,6 +30,7 @@ from levain.consent.record import (RULING_FORMAT, RULING_FORMAT_UNCHAINED, RULIN
                                    ruling_payload)
 from tests.test_consent_queue import NOW, Clock, FakeAgent, Log, _raw, signed
 from tests.test_consent_queue import authority, clock, keys, queue  # noqa: F401 - the shared fixtures
+from tests._h4 import h4_home
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "consent_queue_v3_d430b804.py"
 CWD = "/work/proj"
@@ -98,7 +99,7 @@ def test_gap_numbers_count_per_agent_and_session(queue):
 def test_gap_numbers_are_unique_under_two_connections(tmp_path, authority):
     """Two queue objects (two connections, as two hook processes) mark one session's requests at once."""
     d = tmp_path / "consent"
-    q1, q2 = ConsentQueue(d, authority=authority), ConsentQueue(d, authority=authority)
+    q1, q2 = ConsentQueue(d, authority=authority, home=h4_home()), ConsentQueue(d, authority=authority, home=h4_home())
     requests = [ask(q1, f"c{i}", hold=timedelta(hours=1)) for i in range(24)]
     got: list[int] = []
     lock = threading.Lock()
@@ -344,7 +345,7 @@ def test_unknown_and_revoked_signers_cannot_rule(queue, keys):
 
 def test_a_signer_revoked_after_ruling_delivers_nothing(tmp_path, keys, clock):
     log = _own_log(tmp_path, keys)
-    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     request, _ = undecided(q)
     payload, sig = ruled(q, request.id, keys["phone"])
     assert q.answer_late(request.id, payload, sig).ruling == "allow"
@@ -603,7 +604,7 @@ def test_a_v3_store_built_by_the_v3_code_migrates_in_place_row_for_row(tmp_path,
     before, meta_before = _dump(d / "queue.db")
     assert meta_before["format"] == PRIOR_FORMAT and len(before["receipts"]) == 5
 
-    new = ConsentQueue(d, authority=log.source, clock=clock)
+    new = ConsentQueue(d, authority=log.source, clock=clock, home=h4_home())
     assert new.get(open_.id)[1] == "pending"                # the first open migrates
     after, meta_after = _dump(d / "queue.db")
     assert after == before                                  # every row, with its rowid / seq, unchanged
@@ -642,18 +643,18 @@ def test_a_failed_migration_leaves_the_v3_store_as_it_was(tmp_path, keys, monkey
     import levain.consent.queue as qmod
     monkeypatch.setattr(qmod, "_SCHEMA", qmod._SCHEMA + ("CREATE TABLE broken (",))
     with pytest.raises(sqlite3.Error):
-        ConsentQueue(d, authority=log.source).pending()
+        ConsentQueue(d, authority=log.source, home=h4_home()).pending()
     assert _dump(d / "queue.db") == before
     monkeypatch.undo()
-    assert ConsentQueue(d, authority=log.source, clock=Clock(NOW)).decision(r.id).decision == "allow"
+    assert ConsentQueue(d, authority=log.source, clock=Clock(NOW), home=h4_home()).decision(r.id).decision == "allow"
 
 
 def test_another_format_is_still_refused(tmp_path, authority):
-    q = ConsentQueue(tmp_path / "consent", authority=authority)
+    q = ConsentQueue(tmp_path / "consent", authority=authority, home=h4_home())
     q.pending()
     _raw(q, ("UPDATE meta SET value = 'levain-consent-queue/2' WHERE key = 'format'", ()))
     with pytest.raises(QueueStoreError, match="queue/2"):
-        ConsentQueue(tmp_path / "consent", authority=authority).pending()
+        ConsentQueue(tmp_path / "consent", authority=authority, home=h4_home()).pending()
 
 
 def test_the_listing_reads_a_v3_store_and_shows_an_undecided_request(tmp_path, keys):
@@ -663,7 +664,7 @@ def test_the_listing_reads_a_v3_store_and_shows_an_undecided_request(tmp_path, k
     old = v3.ConsentQueue(d, authority=v3.authority_source(log.path, anchor=None), clock=Clock(NOW))
     r = FakeAgent(old).ask()
     assert [e.request.id for e in read_listing(d, now=NOW).pending] == [r.id]
-    new = ConsentQueue(d, authority=log.source, clock=Clock(NOW))
+    new = ConsentQueue(d, authority=log.source, clock=Clock(NOW), home=h4_home())
     new.mark_undecided(r.id)
     listing = read_listing(d, now=NOW)
     assert listing.pending == () and listing.recent == ()
@@ -876,7 +877,7 @@ def test_a_retry_with_halt_halts_an_already_undecided_request(queue):
 
 def test_mark_undecided_says_why_an_answer_no_longer_verifies(tmp_path, keys, clock):
     log = _own_log(tmp_path, keys)
-    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     request = ask(q)
     payload, sig = signed(q, request, keys["phone"])
     q.answer(request.id, payload, sig)
@@ -943,7 +944,7 @@ def test_claim_rulings_for_delivers_each_ruling_once(queue, keys, clock):
 
 def test_a_ruling_that_no_longer_verifies_is_not_claimed(tmp_path, keys, clock):
     log = _own_log(tmp_path, keys)
-    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     request, _ = undecided(q)
     _rule(q, request, keys["phone"])
     log.revoke("phone")
@@ -987,7 +988,7 @@ def test_resume_meta_is_written_with_the_request_and_read_back(queue):
 
 def test_two_sweepers_never_both_claim_a_reping(tmp_path, authority, clock):
     d = tmp_path / "consent"
-    qs = [ConsentQueue(d, authority=authority, clock=clock) for _ in range(4)]
+    qs = [ConsentQueue(d, authority=authority, clock=clock, home=h4_home()) for _ in range(4)]
     for i in range(12):
         qs[0].snooze(ask(qs[0], f"r{i}", hold=timedelta(hours=2)).id, minutes=1)
     clock.now = NOW + timedelta(minutes=2)
@@ -1033,7 +1034,7 @@ def test_the_take_checks_cheaply_before_the_replay_and_the_lock(queue, keys, mon
 
 def _take_in_a_process(qdir, cockpit_db, out):
     from levain.consent.queue import ConsentQueue as Q, authority_source as src
-    q = Q(qdir, authority=src(cockpit_db, anchor=None), clock=lambda: NOW + timedelta(minutes=1))
+    q = Q(qdir, authority=src(cockpit_db, anchor=None), clock=lambda: NOW + timedelta(minutes=1), home=h4_home())
     got = q.take_ruled_allow(*TAKE, cwd=CWD)
     out.put(None if got is None else got.request_id)
 
@@ -1042,7 +1043,7 @@ def test_a_ruled_allow_is_taken_once_across_processes(tmp_path, keys, clock):
     import multiprocessing
     log = _own_log(tmp_path, keys)
     d = tmp_path / "consent"
-    q = ConsentQueue(d, authority=log.source, clock=clock)
+    q = ConsentQueue(d, authority=log.source, clock=clock, home=h4_home())
     request, _ = undecided(q)
     _rule(q, request, keys["phone"])
     ctx = multiprocessing.get_context("spawn")
@@ -1087,7 +1088,7 @@ def test_the_cockpit_groups_an_undecided_request_under_needs_input(tmp_path, key
     from levain.cockpit import Cockpit
     log = _own_log(tmp_path, keys)
     d = tmp_path / "consent"
-    q = ConsentQueue(d, authority=log.source, clock=Clock(NOW))
+    q = ConsentQueue(d, authority=log.source, clock=Clock(NOW), home=h4_home())
     waiting, _ = undecided(q)
     ck = Cockpit(clock=lambda: NOW + timedelta(days=2))
     ck.attach_consent_rows(lambda now: read_listing(d, now=now))
@@ -1104,7 +1105,7 @@ def test_the_sessions_tile_counts_an_undecided_request_as_waiting(tmp_path, monk
     root, src = _fixture(tmp_path, monkeypatch)
     from levain.consent.queue import authority_source
     home = tmp_path / "levain_home" / "consent"
-    q = ConsentQueue(home, authority=authority_source(home, anchor=None))
+    q = ConsentQueue(home, authority=authority_source(home, anchor=None), home=h4_home())
     (filed,) = q.pending()
     assert q.mark_undecided(filed.id).state == "undecided"
     ck = build_default_cockpit(src)

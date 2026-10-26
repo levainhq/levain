@@ -9,6 +9,7 @@ from levain.slot import start as SS
 from levain.slot.ids import SlotId
 from tests.test_slot_r2_reaper import _lease_to, _reaper
 from tests.test_slot_s2f3_start import E0, _started, _world
+from tests.vendor_tree import vendor_installed, vendor_prefix  # noqa: F401 - autouse, the real vendor check
 
 E1 = SlotId("egress", 1)
 

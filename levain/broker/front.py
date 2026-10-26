@@ -359,6 +359,11 @@ def connect_target(policy: FrontPolicy, target: bytes) -> tuple[ConnectRoute, in
 #: the most of a refused CONNECT's host the log line carries: a DNS name's length.
 REFUSED_HOST_CAP = 253
 
+#: WF-1b (wf1a return ruling 3): an off-list refusal's line names how the operator adds a host. The agent's own error
+#: text names no host (measured by lane-wfetch on Claude Code 2.1.310: "Error: proxy refused the connection", wfetch
+#: DESIGN §1.4), so this line is where the remedy can be read.
+OFF_LIST_REMEDY = "sudo install-helper routes-egress"
+
 
 def refused_host_fields(target: object) -> dict:
     """The requested host of a refused CONNECT, for its log line (wfetch DESIGN §2.3): ``{"host": h}`` only when the
@@ -1333,9 +1338,11 @@ class Front:
 
     async def _refuse(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, r: Refused,
                       target: Optional[bytes] = None) -> None:
-        """Answer ``r`` and log it; a refused CONNECT's line also names its host (:func:`refused_host_fields`)."""
+        """Answer ``r`` and log it; a refused CONNECT's line also names its host (:func:`refused_host_fields`), and an
+        off-list one the remedy (:data:`OFF_LIST_REMEDY`)."""
         self._log({"event": "refused", "refused": r.name, "detail": r.detail,
-                   **(refused_host_fields(target) if target is not None else {})})
+                   **(refused_host_fields(target) if target is not None else {}),
+                   **({"remedy": OFF_LIST_REMEDY} if (r.name, r.detail) == ("host-not-allowed", "off-list") else {})})
         body = r.name.encode() + b"\n"
         writer.write(b"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
                      b"X-Levain-Refused: %s\r\nConnection: close\r\n\r\n%s"

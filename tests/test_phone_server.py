@@ -30,6 +30,7 @@ from levain.consent.passkey import challenge, public_key_line
 from levain.consent.queue import ConsentQueue, authority_source
 from levain.consent.record import answer_message
 from levain.phone_server import PHONE_TOKEN_HEADER, make_phone_server
+from tests._h4 import h4_home
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -73,7 +74,7 @@ def world(tmp_path: Path):
     qdir.mkdir(mode=0o700)
     (qdir / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(root), "away_mode": False,
                                                        "away_hold_seconds": 0}))
-    queue = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
+    queue = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)), home=h4_home())
     seq = iter(range(1, 100))
 
     def file(tier: str = "T2") -> str:

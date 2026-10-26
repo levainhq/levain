@@ -61,7 +61,7 @@ _BASE_RENDERS = {
                 "f57330c86d79cf0968eadc1c8722f7fbcf749d8ca0b040875137b948c1d1f103"),
     "reaper": ("0e43ef1cd8e4169f92da574c9ed5a7636fabe2875e47c0e8b15ae9d32474f074",
                "bba7ea59e0cfd3ec98488124db756571e22c2cd14f05e05613866750e453292b"),
-    "pf": ("02d446fbdf4eed0270e5092d57ef3af5142edb11e4d18c6ec39b7b30051d5777", None),
+    "pf": ("bf226f0434c4c2598d98d34c84a254c1ed9d137812e9d78fb5002a30d4ee82d7", None),  # pfboot: the boot log paths (logs=True)
 }
 
 

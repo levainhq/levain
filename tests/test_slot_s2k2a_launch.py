@@ -42,6 +42,7 @@ from tests.execve_guard import refuse_real_execve
 from tests.test_slot_s2d_forwarder import sockdir  # noqa: F401,F811 - the short /tmp socket dir fixture
 from tests.test_slot_s2f2_runtime_helper import OP_UID
 from tests.test_slot_s2f3_start import (DARWIN_IDS, E0, S0, Execd, StageFake, _rendered, _S, _world)
+from tests.vendor_tree import vendor_installed, vendor_prefix  # noqa: F401 - autouse, the real vendor check
 
 ROOT = str(Path(wall.__file__).resolve().parents[2])
 SESSION = "s-00000000000000aa"

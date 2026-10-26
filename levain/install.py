@@ -2608,7 +2608,7 @@ def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], N
     ours = os.path.realpath(consent_cockpit_root(install))
     try:
         # the queue's own directory rule (0700, owned by this uid, not a symlink), never re-spelled here
-        ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))._check_directory()
+        ConsentQueue(qdir, home=Path.home(), authority=authority_source(qdir, anchor=None))._check_directory()
         _refuse_symlink(path)
         if not os.path.lexists(path):
             body = json.dumps({"cockpit_data_root": ours, "away_mode": False, "away_word": "auto",

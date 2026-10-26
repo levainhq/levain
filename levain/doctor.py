@@ -156,6 +156,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_dispatch_adoption_rules())
     core.extend(_check_dispatch_verifiers())
     core.extend(_check_slot_isolation())
+    core.extend(_check_vendor_copies())
     core.extend(_check_slot_limits())
     core.extend(_check_slot_keys())
     core.extend(_check_slot_services())
@@ -506,6 +507,78 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
         else:
             rows.append(CheckResult("agent store free space", True, f"{gib:.1f} GiB free"))
     return rows
+
+
+def _operator_home(*, env: Any = None, getuid: Any = None, getpwuid: Any = None) -> str:
+    """The home the vendor search starts from, resolved the way the install helper's repair resolves its operator:
+    under sudo, the account ``SUDO_UID`` names (never root's ``~``); else the account running doctor."""
+    import pwd
+
+    env = os.environ if env is None else env
+    uid = (getuid or os.getuid)()
+    sudo = env.get("SUDO_UID", "")
+    if uid == 0 and sudo.isdigit():
+        uid = int(sudo)
+    return (getpwuid or pwd.getpwuid)(uid).pw_dir
+
+
+def _check_vendor_copies(*, host: str | None = None, store: Path | None = None, home: str | None = None,
+                         state: Any = None) -> list[CheckResult]:
+    """The ``agent vendor CLIs`` row: each vendor CLI a session runs is root's copy of its install unit in
+    ``VENDOR_PREFIX`` (setup and repair make it, head ruling 1026+8), checked with the predicate start's check reads
+    and compared byte for byte with the vendor it is copied from (:func:`levain.slot.root_tree.vendor_state`, the same
+    search repair runs, from the operator's home, :func:`_operator_home`). A copy that differs is a vendor updated
+    since the last repair: sessions keep running the old one until repair re-copies it. No row when there is no
+    isolation install."""
+    from levain.slot import layout
+    from levain.slot import root_tree as RT
+
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    if store is None or not os.path.lexists(store):
+        return []
+    if home is None and state is None:
+        try:
+            home = _operator_home()
+        except (KeyError, OSError) as exc:
+            return [CheckResult("agent vendor CLIs", True, f"the operator's home could not be read ({exc})",
+                                warn=True)]
+    read = state if state is not None else (lambda name: RT.vendor_state(host, name, home))
+    parts, fix, orphan = [], [], []
+    for name in RT.VENDORS:
+        try:
+            st, detail = read(name)
+        except Exception as exc:     # V13: a probe that crashes is a row, never doctor's crash
+            st, detail = "unreadable", f"could not be read ({_slot_why(exc)})"
+        if st == "current":
+            parts.append(f"{name} current")
+        elif st == "absent":
+            parts.append(f"{name} not on this machine")
+        elif st == "stale":
+            fix.append(name)
+            parts.append(f"{name} STALE: {detail}")
+        elif st == "not-copied":
+            fix.append(name)
+            parts.append(f"{name} NOT COPIED: {detail}; its sessions are refused vendor-not-installed:{name}")
+        elif st == "bad-copy":
+            fix.append(name)
+            parts.append(f"{name} BAD COPY: {detail}; its sessions are refused vendor-not-installed:{name}")
+        elif st == "unreadable":
+            fix.append(name)
+            parts.append(f"{name} UNREADABLE: {detail}")
+        else:   # orphan
+            orphan.append(name)
+            parts.append(f"{name}: {detail}")
+    repair = f"sudo {layout.install_helper_path(host)} repair"
+    if fix:
+        return [CheckResult("agent vendor CLIs", True, "; ".join(parts), warn=True,
+                            hint=f"Run `{repair}`: it copies {', '.join(fix)} into {RT.VENDOR_PREFIX[host]} again, "
+                                 "where sessions run it.")]
+    if orphan:
+        return [CheckResult("agent vendor CLIs", True, "; ".join(parts), warn=True,
+                            hint="A copy with no vendor to compare it with keeps running as it is; repair leaves it.")]
+    return [CheckResult("agent vendor CLIs", True, "; ".join(parts))]
 
 
 def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResult]:
@@ -2418,18 +2491,26 @@ def _check_confinement(install: Path) -> list[CheckResult]:
         # The host can sandbox bash, but the entity's localhost deny can still drop it or take its
         # network. `levain run` asks the SAME resolver with the same config, so the two agree.
         bash_ok, refusal, offline = resolve_localhost_deny(cfg.allow_localhost_outbound)
+        # The line `levain run` prints when $PYTHONUSERBASE puts the user site outside the floor.
+        try:
+            from levain.firing.confinement import python_userbase_note
+
+            note = python_userbase_note(Path.home())   # build_policy's home
+        except Exception:  # noqa: BLE001 — never let a diagnosis break the whole doctor run
+            note = None
+        tail = f"\n      {note}" if note else ""
         if not bash_ok:
             return [CheckResult("confinement floor", True,
                                 f"{d.provider} available, but `levain run` gets file_editor only: "
-                                f"{refusal}")]
+                                f"{refusal}{tail}")]
         if offline:
             return [CheckResult("confinement floor", True,
                                 f"{d.provider} — `levain run` gets file_editor + bash, and bash has "
                                 f"no IP network: connections back to this host are blocked by "
                                 f"removing it; {OFFLINE_RESIDUAL}. \"allow_localhost_outbound\": "
-                                f"true restores the network, with the spore-755 exposure")]
+                                f"true restores the network, with the spore-755 exposure{tail}")]
         return [CheckResult("confinement floor", True,
-                            f"{d.provider} — `levain run` gets file_editor + bash")]
+                            f"{d.provider} — `levain run` gets file_editor + bash{tail}")]
     detail = f"{d.reason} — `levain run` gets file_editor only (this is a supported configuration)"
     if d.remedy:
         detail += f"\n      → to enable the bash hand: {d.remedy}"
@@ -3310,7 +3391,7 @@ def _hooks_off_files(install: Path, adapter: str, *, home: Path | None = None,
     if adapter == "claude-code":
         from levain.consent.adapters.claude_code import _settings_files
 
-        files = [p for kind, p in _settings_files(str(install), home, None) if kind == "json"]
+        files = [p for kind, p in _settings_files(str(install), home, None, environ=os.environ) if kind == "json"]
         for f in dict.fromkeys(files):
             try:
                 data = json.loads(f.read_text())

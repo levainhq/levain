@@ -11,6 +11,7 @@ import pytest
 from levain.consent.listing import (TOO_LONG, UNSHOWN, audit_line, consent_targets, entry_body, filed_input, find_entry,
                                     read_listing)
 from levain.consent.queue import ConsentQueue, QueueStoreError, authority_source
+from tests._h4 import h4_home
 
 T0 = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -18,7 +19,7 @@ T0 = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
 def _queue(tmp_path: Path, clock) -> ConsentQueue:
     qdir = tmp_path / "consent"
     qdir.mkdir(mode=0o700)
-    return ConsentQueue(qdir, authority=authority_source(qdir, anchor=None), clock=clock)
+    return ConsentQueue(qdir, authority=authority_source(qdir, anchor=None), clock=clock, home=h4_home())
 
 
 def _file(queue: ConsentQueue, event: str, hold_min: int = 5):

@@ -14,6 +14,7 @@ import pytest
 
 from levain.authority import CONSENT_SHELL_TOOLS
 from levain.consent.adapters import codex as cx
+from tests._h4 import h4_env
 
 FAKE_CODEX = r'''#!{python}
 import json, os, sys, threading, time
@@ -150,9 +151,9 @@ def test_a_codex_mcp_write_naming_agent_config_in_any_field_is_tagged(tmp_path):
     home, codex_dir = tmp_path / "home", tmp_path / "codexhome"
     for inp in ({"filepath": ".codex/config.toml"}, {"target": {"file": str(codex_dir / "x")}},
                 {"filepath": ".claude/settings.json"}):
-        assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=home, codex_dir=codex_dir), inp
+        assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=home, codex_dir=codex_dir, environ=h4_env()), inp
     assert not cx.targets_agent_config("mcp__fs__write", {"filepath": "src/a.py"}, str(tmp_path), home=home,
-                                       codex_dir=codex_dir)
+                                       codex_dir=codex_dir, environ=h4_env())
 
 
 def test_a_codex_mcp_write_naming_a_config_directory_is_tagged(tmp_path):
@@ -160,13 +161,13 @@ def test_a_codex_mcp_write_naming_a_config_directory_is_tagged(tmp_path):
     for inp in ({"dir": "~/.claude", "name": "settings.json"}, {"dir": str(tmp_path / ".codex"), "name": "hooks.json"},
                 {"name": ".claude.json"}):
         assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=home,
-                                       codex_dir=tmp_path / "ch"), inp
+                                       codex_dir=tmp_path / "ch", environ=h4_env()), inp
 
 
 def test_a_codex_mcp_input_that_is_not_an_object_is_still_read(tmp_path):
     for inp in ([".codex/config.toml"], [{"file": ".codex/config.toml"}], "file:///x/.codex/hooks.json?a=1"):
         assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=tmp_path / "h",
-                                       codex_dir=tmp_path / "ch"), inp
+                                       codex_dir=tmp_path / "ch", environ=h4_env()), inp
 
 
 # The PermissionRequest real Codex 0.162.1 sent for input typed into a terminal it launched outside the sandbox
@@ -311,3 +312,29 @@ def test_every_shell_name_the_hook_templates_know_is_a_shell_tool_to_consent():
                 found += 1
                 assert {n.lower() for n in names} <= CONSENT_SHELL_TOOLS, path
     assert found >= 2      # both PostToolUse templates (Claude Code's and Codex's)
+
+
+def test_a_patch_into_the_operators_user_site_is_agent_config_under_a_venv(monkeypatch, tmp_path):
+    """F7, through Codex's own entry: its patch headers go through the Claude Code check."""
+    from levain.consent.adapters import claude_code as cc
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
+    target = home / ".local" / "lib" / "python3.12" / "site-packages" / "x.pth"
+    patch = {"command": f"*** Begin Patch\n*** Add File: {target}\n+import os\n*** End Patch\n"}
+    assert cx.targets_agent_config("apply_patch", patch, str(tmp_path), home=home, codex_dir=tmp_path / "cx", environ=h4_env())
+
+
+def test_a_patch_into_an_absolute_pythonuserbase_site_is_agent_config(monkeypatch, tmp_path):
+    """U1, through Codex's own entry: <PYTHONUSERBASE>/lib/.../site-packages/x.pth is agent config."""
+    from levain.consent.adapters import claude_code as cc
+
+    base = tmp_path / "opt" / "python-user"
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
+    target = base / "lib" / "python3.12" / "site-packages" / "x.pth"
+    patch = {"command": f"*** Begin Patch\n*** Add File: {target}\n+import os\n*** End Patch\n"}
+    assert cx.targets_agent_config("apply_patch", patch, str(tmp_path), home=tmp_path / "home",
+                                   codex_dir=tmp_path / "cx", environ=h4_env())

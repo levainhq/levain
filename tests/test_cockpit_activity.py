@@ -26,6 +26,7 @@ from levain.consent.queue import ConsentQueue, authority_source
 from levain.consent.questions import QuestionStore
 from levain.firing import ws_git
 from tests.test_cockpit_k2a import _install
+from tests._h4 import h4_home
 
 KINDS = {"commit", "session", "decision", "memory", "question"}
 CRED = {"class": "token", "name": "browser", "device_class": None}
@@ -65,7 +66,7 @@ def _fixture(tmp_path: Path, monkeypatch):
     home = tmp_path / "levain_home"
     monkeypatch.setenv("LEVAIN_HOME", str(home))
     (home / "consent").mkdir(parents=True, mode=0o700)
-    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None))
+    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
     q.file(agent="claude_code", agent_session_id="s1", tool_name="Bash", tool_input={"command": "rm -rf ‮ x"},
            cwd="/w/levain-work", hold=timedelta(minutes=5), event_id="e1")
     qs = QuestionStore(home / "consent")

@@ -194,6 +194,7 @@ LAZY_SITES = {
     'levain/slot/runtime_helper.py::discard::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/runtime_helper.py::restore::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/service_boot.py::main::from levain.slot.units import services_for': 'root',
+    'levain/slot/start.py::check_vendor_installed::from levain.slot.root_tree import unit_problem': 'root',
     'levain/slot/start.py::vendor_argv::from levain.slot.layout import STORE': 'root',
     'levain/slot/start.py::vendor_argv::from levain.slot.root_tree import VENDOR_PREFIX': 'root',
     'levain/slot/store_verbs.py::retained_whole::from levain.slot import end as E': 'root',

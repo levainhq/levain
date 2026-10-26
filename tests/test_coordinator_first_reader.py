@@ -20,6 +20,7 @@ from levain.coordinator import review
 from levain.coordinator.store import CoordError, Part
 from tests.test_consent_queue import Log
 from tests.test_coordinator_envelope import _lease, ctx, keys, repo, snapshot  # noqa: F401 - fixtures
+from tests._h4 import h4_home
 
 SEAT = "sess-worker-1"
 COORD = "sess-coord"
@@ -86,7 +87,7 @@ def test_the_coordinator_can_never_answer_a_question_whose_option_is_a_consent_r
     (tmp_path / "auth").mkdir()
     lg = Log(tmp_path / "auth", keys)
     lg.enrol("laptop", "laptop-presence")
-    cq = ConsentQueue(band.store.directory, authority=lg.source)
+    cq = ConsentQueue(band.store.directory, authority=lg.source, home=h4_home())
     req = cq.file(agent="claude_code", agent_session_id=SEAT, tool_name="Bash",
                   tool_input={"command": "git push origin main"}, cwd=band.c.path, hold=timedelta(hours=3))
     before = cq.get(req.id)

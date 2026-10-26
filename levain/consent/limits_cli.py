@@ -466,7 +466,8 @@ def _make_queue(qdir: Path, settings: Any) -> ConsentQueue:
     from levain.authority import anchor_path
 
     root = Path(settings.cockpit_data_root)
-    return ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
+    return ConsentQueue(qdir, home=Path.home(),
+                        authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
 
 
 def _find_halt(qdir: Path, agent: str | None, session: str) -> tuple[str, dict[str, Any]]:

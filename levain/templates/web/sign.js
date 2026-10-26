@@ -18,6 +18,11 @@
 // been signed: a refusal, or anything before the answer was posted) or "unsure" (the answer was posted and its reply did not
 // come back). Only "unsigned" re-arms the controls; "unsure" keeps them frozen and reads the request again, and they come
 // back only when that read finds the same version still open. A write-in is frozen as typed (trimmed) from its click on.
+//
+// A consent request (OS-2) is the same sheet at /sign/consent/<id>: its read is GET /cockpit/consent/<id>/sheet.json (the
+// same row shape, its options allow and deny), and its ceremony the phone port's own: POST .../challenge and .../answer for
+// a pending request, .../rule-challenge and .../rule for an undecided one (the row's `mode`), with the phone's exact bodies
+// ({decision, signer_fp}, then the challenge's `payload` beside the assertion).
 (function () {
   "use strict";
 
@@ -34,8 +39,17 @@
   const framed = window.parent !== window;           // only this origin may frame the sheet (its frame-ancestors)
 
   // ---- the link ----
-  const pathId = /^\/sign\/([A-Za-z0-9_-]{8,64})$/.exec(location.pathname);
-  const id = pathId ? pathId[1] : "";
+  const consentPath = /^\/sign\/consent\/([^/]{1,480})$/.exec(location.pathname);
+  const pathId = consentPath ? null : /^\/sign\/([A-Za-z0-9_-]{8,64})$/.exec(location.pathname);
+  let id = pathId ? pathId[1] : "";
+  if (consentPath) {
+    try { id = decodeURIComponent(consentPath[1]); } catch (e) { id = ""; }
+    if (!/^[A-Za-z0-9._:-]{1,160}$/.test(id)) id = "";       // the server's consent id shape
+  }
+  const consent = !!consentPath;
+  const noun = consent ? "consent request" : "sign request";
+  const Noun = consent ? "Consent request" : "Sign request";
+  const routeOf = (rid) => (consent ? "/cockpit/consent/" : "/cockpit/sign/") + encodeURIComponent(rid);
   const pm = /(?:^#|&)choice=([^&]*)(?:&|$)/.exec(location.hash);
   const vm = /(?:^#|&)v=([0-9a-f]{16})(?:&|$)/.exec(location.hash);
   let pick = "";
@@ -133,12 +147,12 @@
   const call = (route, body) => within(route, { method: "POST", headers: headers(true), body: JSON.stringify(body) });
   // the request as the cockpit holds it now: {request, rp_id, ...}, {closed}, {unpaired} or {error}
   function readRequest() {
-    return within("/cockpit/sign/" + encodeURIComponent(id) + ".json", { headers: headers(false) }).then((g) => {
+    return within(routeOf(id) + (consent ? "/sheet.json" : ".json"), { headers: headers(false) }).then((g) => {
       if (g.status === 403) return { unpaired: true };
       if (g.status === 404) return g.body.error === "not_open" ? { closed: true } : { error: "This cockpit hosts no signing." };
-      if (g.status === 0) return { error: "The sign request could not be read: " + g.body.message + "." };
-      if (!g.ok) return { error: "The sign request could not be read (HTTP " + g.status + ")." };
-      return g.body.request && typeof g.body.request === "object" ? g.body : { error: "The sign request could not be read." };
+      if (g.status === 0) return { error: "The " + noun + " could not be read: " + g.body.message + "." };
+      if (!g.ok) return { error: "The " + noun + " could not be read (HTTP " + g.status + ")." };
+      return g.body.request && typeof g.body.request === "object" ? g.body : { error: "The " + noun + " could not be read." };
     });
   }
 
@@ -156,36 +170,48 @@
   }
 
   // ---- read the request, then draw it ----
-  if (!id) { head("Not a sign request", "This link names no sign request."); return; }
+  if (!id) { head("Not a " + noun, "This link names no " + noun + "."); return; }
+  if (consent) { document.title = "Levain · consent"; $("sheet-title").textContent = Noun; $("sheet-msg").textContent = "Reading the consent request…"; }
   if (!storedToken()) { unpaired(false); return; }
   readRequest().then(draw);
 
   function draw(got) {
     if (got.unpaired) return unpaired(true);
-    if (got.closed) { $("sheet").dataset.state = "closed"; return head("Nothing to sign", "This sign request is no longer open: it was signed, denied or it expired."); }
-    if (got.error) { $("sheet").dataset.state = "error"; return head("Sign request", got.error); }
+    if (got.closed) {
+      $("sheet").dataset.state = "closed";
+      return head("Nothing to sign", consent ? "This consent request is no longer open: it was answered, ruled or it expired."
+        : "This sign request is no longer open: it was signed, denied or it expired.");
+    }
+    if (got.error) { $("sheet").dataset.state = "error"; return head(Noun, got.error); }
     const r = got.request;
     const origin = typeof got.origin === "string" ? got.origin : "";
     if (!usable || origin !== window.location.origin) {
       $("sheet").dataset.state = "elsewhere";
-      head(r.title || "Sign request", "This page cannot use your passkey: sign on " + (origin || "the cockpit's https page") + ".");
+      head(r.title || Noun, "This page cannot use your passkey: sign on " + (origin || "the cockpit's https page") + ".");
       if (origin) {
-        const a = el("a", "", origin + "/sign/" + id);
-        a.href = origin + "/sign/" + encodeURIComponent(id);
+        const path = (consent ? "/sign/consent/" : "/sign/") + encodeURIComponent(id);
+        const a = el("a", "", origin + path);
+        a.href = origin + path;
         $("sheet-body").appendChild(el("p", "")).appendChild(a);
       }
       return;
     }
-    head(r.title || "Sign request", r.requester ? "From " + r.requester : "");
+    head(r.title || Noun, r.requester ? "From " + r.requester : "");
     const body = $("sheet-body");
     if (r.refused) { $("sheet").dataset.state = "refused"; return body.appendChild(el("p", "", "Not signable: " + r.refused)); }
     body.appendChild(el("pre", "sheet-message", typeof r.message === "string" ? r.message : ""));
     if (r.expires_at) body.appendChild(el("p", "ext-meta", "Open until " + r.expires_at));
+    // what the server says about this request beside its options (a consent allow only the laptop key signs)
+    if (typeof r.note === "string" && r.note && signersOf(r).length) {
+      const n = el("p", "ext-meta", r.note);
+      n.id = "sheet-request-note";
+      body.appendChild(n);
+    }
 
     // the rpId the passkey record is kept under, written and read: the read's own (the Signer's), which a page on another
     // name of the same site does not share with its hostname; a cockpit that names none is read as this page's name
     const rp = typeof got.rp_id === "string" && got.rp_id ? got.rp_id : window.location.hostname;
-    const signers = Array.isArray(r.signers) ? r.signers.filter((fp) => typeof fp === "string") : [];
+    const signers = signersOf(r);
     const held = got.credentials && typeof got.credentials === "object" ? got.credentials : {};
     if (!signers.length) return escalate(rp, got.note);
 
@@ -198,6 +224,8 @@
     $("sheet").dataset.state = "open";
     offer(r, rp, signers, held);
   }
+
+  function signersOf(r) { return Array.isArray(r.signers) ? r.signers.filter((fp) => typeof fp === "string") : []; }
 
   // §4A.3 rule 4: no key that may sign this request, so no ceremony is started; what it needs, and where it is signed
   function escalate(rp, note) {
@@ -396,16 +424,19 @@
   // one ceremony with key `k` ({fp, rawId, local}): "signed", "unsigned" (definitely nothing signed) or "unsure" (the
   // answer was posted and may have landed). `rp` keys this browser's passkey record (draw's).
   function ceremony(r, rp, k, choice, words) {
-    const base = "/cockpit/sign/" + encodeURIComponent(r.id) + "/";
+    const base = routeOf(r.id) + "/";
     const fp = k.fp;
-    const body = { signer_fp: fp, request_sha256: r.sha256 };
-    if (choice !== undefined) body.choice = choice;
-    if (words !== undefined) body.write_in = words;
+    // a consent request takes the phone port's own bodies, exactly their keys: {decision, signer_fp}, then the payload the
+    // challenge returned beside the assertion; an undecided one is ruled (its own pair of routes), never answered
+    const steps = !consent ? ["challenge", "answer"] : r.mode === "rule" ? ["rule-challenge", "rule"] : ["challenge", "answer"];
+    const body = consent ? { decision: choice, signer_fp: fp } : { signer_fp: fp, request_sha256: r.sha256 };
+    if (!consent && choice !== undefined) body.choice = choice;
+    if (!consent && words !== undefined) body.write_in = words;
     let sent = false, line = "";
     const unsigned = (m) => { say(/nothing was signed/.test(m) ? m : m + "; nothing was signed.", "bad"); return "unsigned"; };
     say(choice !== undefined ? "Asking for the challenge for (" + choice + ")…" : "Asking for the challenge…");
     flight = true;        // from the request for the challenge: the signer picker before it posts nothing
-    return call(base + "challenge", body).then((c) => {
+    return call(base + steps[0], body).then((c) => {
       if (!c.ok) return unsigned("Not signed: " + why(c));
       if (!decodable(c.body.challenge)) return unsigned("The cockpit sent a malformed challenge");
       if (typeof c.body.line === "string") { line = c.body.line; signing(line, "server", "Signing"); }
@@ -428,15 +459,19 @@
         say("Verifying the signature…");
         const answer = { authenticator_data: b64u(cred.response.authenticatorData),
           client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
-        if (cred.rawId) answer.raw_id = b64u(cred.rawId);
+        if (consent) answer.payload = c.body.payload;
+        else if (cred.rawId) answer.raw_id = b64u(cred.rawId);
         sent = true;          // from here on a failure may follow an answer that landed
-        return call(base + "answer", answer).then((a) => {
+        return call(base + steps[1], answer).then((a) => {
           if (!a.ok && a.status >= 400 && a.status < 500) return unsigned("Not signed: " + why(a));
           if (!a.ok) { say("Not sure this was signed (" + why(a) + ").", "bad"); return "unsure"; }
           if (cred.rawId && mine(rp)[fp] !== b64u(cred.rawId)) remember(rp, fp, b64u(cred.rawId));
           const by = typeof a.body.signer_fp === "string" && a.body.signer_fp ? a.body.signer_fp : fp;
           const ns = typeof a.body.namespace === "string" && a.body.namespace ? " in " + a.body.namespace : "";
-          say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + by + ns + (line ? ": " + line : ""), "ok");
+          // a consent answer's reply names its decision; a ruling's also says where its delivery stands
+          const what = a.body.choice || (consent && typeof a.body.decision === "string" ? a.body.decision : "");
+          const went = consent && a.body.delivery && typeof a.body.delivery.reason === "string" ? " · " + a.body.delivery.reason : "";
+          say("signed" + (what ? " (" + what + ")" : "") + " · by " + by + ns + (line ? ": " + line : "") + went, "ok");
           if (line) signing(line, "server", "Signed"); else relabel("Signed");
           $("sheet").dataset.state = "signed";
           return "signed";

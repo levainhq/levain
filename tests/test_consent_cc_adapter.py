@@ -25,6 +25,7 @@ from levain.consent import ConsentQueue, Decision, answer_message, authority_sou
 from levain.consent import policy as policy_mod
 from levain.consent.adapters import claude_code as cc
 from levain.consent.record import ANSWER_NAMESPACE, ExternalGateRequest
+from tests._h4 import h4_env, h4_home
 
 SESSION = "ceedbaa9-2e6d-433f-b374-0ad96dd5f62d"
 
@@ -92,7 +93,7 @@ AWAY = cc.AdapterSettings(away_mode=True, away_hold_seconds=20)
 
 
 def run_main(monkeypatch, queue, stdin_text, settings=AWAY, policy=None):
-    monkeypatch.setattr(cc, "_queue_for", lambda d, s: queue)
+    monkeypatch.setattr(cc, "_queue_for", lambda d, s, **kw: queue)
     monkeypatch.setattr(cc, "load_settings", lambda d: settings)
     monkeypatch.setattr(cc, "nothing_can_decide", lambda s: False)  # these tests drive the policy seam itself
     if policy is not None:
@@ -190,7 +191,7 @@ def test_default_mode_answers_at_once(monkeypatch):
 def test_the_wait_never_exceeds_the_installed_hold():
     q = FakeQueue(None)
     cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=5000), max_hold=60 + cc.CLEANUP_RESERVE,
-              clock=lambda: 0.0)
+              clock=lambda: 0.0, environ=h4_env(), home=h4_home())
     assert q.waited == [60.0] and q.filed[0]["hold"] == timedelta(seconds=60)
 
 
@@ -242,7 +243,7 @@ HOME = Path("/Users/someone")
     ("Write", "~/.codex/config.toml"), ("Edit", "src/../.claude/settings.json"), ("Write", ".CLAUDE/Settings.json"),
 ])
 def test_agent_config_targets_are_tagged(tool, path):
-    assert cc.targets_agent_config(tool, {"file_path": path}, "/work/proj", home=HOME)
+    assert cc.targets_agent_config(tool, {"file_path": path}, "/work/proj", home=HOME, environ=h4_env())
 
 
 @pytest.mark.parametrize("tool,inp", [
@@ -251,18 +252,18 @@ def test_agent_config_targets_are_tagged(tool, path):
     ("Bash", {"command": "echo {} > .claude/settings.json"}),  # Bash is never parsed (ruling 1)
 ])
 def test_other_targets_are_not_tagged(tool, inp):
-    assert not cc.targets_agent_config(tool, inp, "/work/proj", home=HOME)
+    assert not cc.targets_agent_config(tool, inp, "/work/proj", home=HOME, environ=h4_env())
 
 
 def test_a_symlink_into_agent_config_is_tagged(tmp_path):
     (tmp_path / ".claude").mkdir()
     (tmp_path / ".claude" / "settings.json").write_text("{}")
     (tmp_path / "innocent.json").symlink_to(tmp_path / ".claude" / "settings.json")
-    assert cc.targets_agent_config("Write", {"file_path": "innocent.json"}, str(tmp_path))
+    assert cc.targets_agent_config("Write", {"file_path": "innocent.json"}, str(tmp_path), environ=h4_env(), home=h4_home())
 
 
 def test_an_unreadable_file_target_is_tagged():
-    assert cc.targets_agent_config("Edit", {"path": "x"}, "/w") and cc.targets_agent_config("Write", "x", "/w")
+    assert cc.targets_agent_config("Edit", {"path": "x"}, "/w", environ=h4_env(), home=h4_home()) and cc.targets_agent_config("Write", "x", "/w", environ=h4_env(), home=h4_home())
 
 
 def test_agent_config_never_reaches_the_policy_seam(monkeypatch):
@@ -341,7 +342,7 @@ def test_real_core_signed_allow_through_main(tmp_path):
     qdir.mkdir(parents=True, mode=0o700)
     (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"away_mode": True, "away_hold_seconds": 20,
                                                      "cockpit_data_root": str(root)}))
-    observer = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=None))
+    observer = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=None), home=h4_home())
 
     def answer():
         for _ in range(100):
@@ -406,7 +407,7 @@ def test_real_core_without_authority_is_no_decision(tmp_path):
     out = io.StringIO()
     rc = cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(event())), stdout=out)
     assert (rc, out.getvalue()) == (0, "")
-    q = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
+    q = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None), home=h4_home())
     assert q.pending() == []  # filed, then withdrawn: the native dialog stands
     assert q._fresh_authority() is None  # the no-root source never replays
 
@@ -418,10 +419,10 @@ def test_real_core_without_authority_is_no_decision(tmp_path):
 def test_the_adapters_own_trust_root_is_agent_config(tmp_path, rel):
     """P1 (codex 1): the adapter settings, the queue db, the authority db and its anchor are T3, policy-ineligible."""
     settings = cc.AdapterSettings(cockpit_data_root=str(tmp_path / "cockpit"))
-    protected = cc.protected_paths(tmp_path / "consent", settings)
-    assert cc.targets_agent_config("Write", {"file_path": str(tmp_path / rel)}, "/work/proj", protected=protected)
+    protected = cc.protected_paths(tmp_path / "consent", settings, environ=h4_env(), home=h4_home())
+    assert cc.targets_agent_config("Write", {"file_path": str(tmp_path / rel)}, "/work/proj", protected=protected, environ=h4_env(), home=h4_home())
     assert not cc.targets_agent_config("Write", {"file_path": str(tmp_path / "other.json")}, "/work/proj",
-                                       protected=protected)
+                                       protected=protected, environ=h4_env(), home=h4_home())
 
 
 def test_main_files_a_write_to_the_adapter_settings_at_t3_without_policy(monkeypatch, tmp_path):
@@ -429,7 +430,7 @@ def test_main_files_a_write_to_the_adapter_settings_at_t3_without_policy(monkeyp
     q = FakeQueue(None)
     q.directory = tmp_path / "consent"  # _queue_for builds the queue over main's --queue-dir
     target = str(tmp_path / "consent" / cc.SETTINGS_NAME)
-    monkeypatch.setattr(cc, "_queue_for", lambda d, s: q)
+    monkeypatch.setattr(cc, "_queue_for", lambda d, s, **kw: q)
     monkeypatch.setattr(policy_mod, "decide", lambda r, *a, **kw: calls.append(r))
     monkeypatch.setattr(cc, "nothing_can_decide", lambda s: False)
     cc.main(["--queue-dir", str(tmp_path / "consent")],
@@ -444,12 +445,16 @@ def test_a_relative_cockpit_root_is_no_authority(tmp_path, root):
     assert cc.load_settings(tmp_path).cockpit_data_root is None
 
 
-def test_a_home_relative_cockpit_root_is_expanded_and_canonical(tmp_path, monkeypatch):
+def test_a_home_relative_cockpit_root_is_no_authority_and_an_absolute_one_canonical(tmp_path, monkeypatch):
+    """CH-D1c-A (H4): a ``~`` root is no longer expanded (no home is read there), so it is no authority, the safe
+    direction; an absolute root through a symlink is canonicalized as before."""
     real = tmp_path / "real"
     real.mkdir()
     (tmp_path / "link").symlink_to(real)
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / cc.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": "~/link"}))
+    assert cc.load_settings(tmp_path).cockpit_data_root is None
+    (tmp_path / cc.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(tmp_path / "link")}))
     assert cc.load_settings(tmp_path).cockpit_data_root == os.path.realpath(real)
 
 
@@ -514,7 +519,7 @@ def test_an_exception_after_filing_withdraws(where):
     def policy(request, queue=None, **kw):
         raise RuntimeError("policy boom")
     with pytest.raises(RuntimeError):
-        cc.decide(event(), q, AWAY, policy=policy if where == "policy" else (lambda r, *a, **kw: None))
+        cc.decide(event(), q, AWAY, policy=policy if where == "policy" else (lambda r, *a, **kw: None), environ=h4_env(), home=h4_home())
     assert q.withdrawn == [q.requests[0].id]
 
 
@@ -532,7 +537,7 @@ def test_a_withdraw_that_raises_is_retried_by_the_cleanup():
         return True
     q.withdraw = withdraw
     with pytest.raises(RuntimeError):
-        cc.decide(event(), q, AWAY, policy=lambda r, *a, **kw: None)
+        cc.decide(event(), q, AWAY, policy=lambda r, *a, **kw: None, environ=h4_env(), home=h4_home())
     assert len(calls) == 2 and q.withdrawn == [q.requests[0].id]
 
 
@@ -558,7 +563,7 @@ def test_max_hold_is_a_total_deadline_and_the_cc_timeout_exceeds_it():
     is above wait + reserve, so it never cancels a hook that is delivering a verified answer."""
     for max_hold in (0, 30, 60, 90, 900, 1800.5):
         q = FakeQueue(None)
-        cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=10**6), max_hold=max_hold)
+        cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=10**6), max_hold=max_hold, environ=h4_env(), home=h4_home())
         wait = q.waited[0] if q.waited else 0.0
         assert wait <= max(0.0, max_hold - cc.CLEANUP_RESERVE) + 1e-6
         assert wait + cc.CLEANUP_RESERVE < cc.hook_timeout(max_hold)
@@ -573,7 +578,7 @@ def test_the_deadline_counts_time_already_spent():
         t[0] += 50
         return None
     cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=10**6), max_hold=200,
-              policy=slow_policy, clock=lambda: t[0])
+              policy=slow_policy, clock=lambda: t[0], environ=h4_env(), home=h4_home())
     assert q.waited == [200 - cc.CLEANUP_RESERVE - 50]
 
 
@@ -581,7 +586,7 @@ def test_a_failing_stdout_is_still_exit_0(monkeypatch):
     class Broken(io.StringIO):
         def write(self, s):
             raise BrokenPipeError
-    monkeypatch.setattr(cc, "_queue_for", lambda d, s: FakeQueue("allow"))
+    monkeypatch.setattr(cc, "_queue_for", lambda d, s, **kw: FakeQueue("allow"))
     monkeypatch.setattr(cc, "load_settings", lambda d: AWAY)
     assert cc.main(["--queue-dir", "/nonexistent"], stdin=io.StringIO(json.dumps(event())), stdout=Broken()) == 0
 
@@ -601,7 +606,7 @@ def test_config_execution_surfaces_are_tagged(path):
     """complement-2: what Claude Code loads and runs (MCP servers, subagents, skills, commands, plugin hooks, the
     adapter's own hook script) is agent config, in the workspace and in ~."""
     for tool in ("Edit", "Write"):
-        assert cc.targets_agent_config(tool, {"file_path": path}, "/work/proj", home=HOME), (tool, path)
+        assert cc.targets_agent_config(tool, {"file_path": path}, "/work/proj", home=HOME, environ=h4_env()), (tool, path)
 
 
 def test_a_plugin_dirs_hooks_are_tagged_only_beside_a_plugin_manifest(tmp_path):
@@ -611,9 +616,9 @@ def test_a_plugin_dirs_hooks_are_tagged_only_beside_a_plugin_manifest(tmp_path):
     (plug / ".claude-plugin").mkdir(parents=True)
     (other / "hooks").mkdir(parents=True)
     for rel in ("plug/hooks/hooks.json", "plug/hooks/guard.sh", "plug/.claude-plugin/plugin.json"):
-        assert cc.targets_agent_config("Write", {"file_path": rel}, str(tmp_path)), rel
+        assert cc.targets_agent_config("Write", {"file_path": rel}, str(tmp_path), environ=h4_env(), home=h4_home()), rel
     for rel in ("other/hooks/hooks.json", "plug/src/hooks.json", "plug/README.md"):
-        assert not cc.targets_agent_config("Write", {"file_path": rel}, str(tmp_path)), rel
+        assert not cc.targets_agent_config("Write", {"file_path": rel}, str(tmp_path), environ=h4_env(), home=h4_home()), rel
 
 
 @pytest.mark.parametrize("inp,tagged", [
@@ -626,7 +631,7 @@ def test_a_plugin_dirs_hooks_are_tagged_only_beside_a_plugin_manifest(tmp_path):
 def test_an_mcp_tool_is_tagged_by_any_string_that_names_agent_config(inp, tagged):
     """MCP tools that write files: a server can name its path in any field, so every string key and value is read
     as a path (no parsing: a string is a path or it is not); over-matching sends the request to the human."""
-    assert cc.targets_agent_config("mcp__fs__write_file", inp, "/work/proj", home=HOME) is tagged
+    assert cc.targets_agent_config("mcp__fs__write_file", inp, "/work/proj", home=HOME, environ=h4_env()) is tagged
 
 
 def test_a_policy_that_would_allow_an_mcp_json_edit_is_never_consulted(monkeypatch):
@@ -675,7 +680,7 @@ def test_entries_that_redirect_import_levain_are_agent_config(monkeypatch, tmp_p
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     monkeypatch.setattr(cc, "import_site_dirs", lambda: (os.path.realpath(site_dir).lower(),))
-    assert cc.targets_agent_config("Write", {"file_path": str(site_dir / rel)}, "/work/proj", home=HOME) is tagged
+    assert cc.targets_agent_config("Write", {"file_path": str(site_dir / rel)}, "/work/proj", home=HOME, environ=h4_env()) is tagged
 
 
 def test_decide_always_goes_through_the_guard(monkeypatch):
@@ -687,7 +692,7 @@ def test_decide_always_goes_through_the_guard(monkeypatch):
     monkeypatch.setattr(cc, "nothing_can_decide", lambda s: False)
     for kw in ({}, {"policy": lambda r, *a, **k: None}):
         q = FakeQueue(None)
-        cc.decide(event(), q, cc.AdapterSettings(), **kw)
+        cc.decide(event(), q, cc.AdapterSettings(), environ=h4_env(), home=h4_home(), **kw)
         assert seen[-1] == q.requests[0].id
     assert len(seen) == 2
 
@@ -700,7 +705,7 @@ def test_a_request_filed_at_the_config_tier_never_reaches_a_direct_callers_polic
             return super().file(**{**kw, "tier": cc.AGENT_CONFIG_TIER})
     calls = []
     q = RaisedQueue("allow")
-    out = cc.decide(event(), q, AWAY, policy=lambda r, *a, **kw: calls.append(r))
+    out = cc.decide(event(), q, AWAY, policy=lambda r, *a, **kw: calls.append(r), environ=h4_env(), home=h4_home())
     assert calls == [] and out["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
     with pytest.raises(cc.PolicyNotEligible):
         cc.guarded_policy(q.requests[0], q, policy=lambda r, *a, **kw: None)
@@ -723,7 +728,7 @@ def test_a_direct_decide_caller_cannot_skip_the_adapters_own_protection(tmp_path
     q.directory = tmp_path / "consent"
     settings = cc.AdapterSettings(away_mode=True, away_hold_seconds=20, cockpit_data_root=str(tmp_path / "cockpit"))
     cc.decide(event("Write", {"file_path": str(tmp_path / rel), "content": "{}"}), q, settings,
-              policy=lambda r, *a, **kw: calls.append(r))
+              policy=lambda r, *a, **kw: calls.append(r), environ=h4_env(), home=h4_home())
     assert q.filed[0]["tier"] == cc.AGENT_CONFIG_TIER and calls == []
 
 
@@ -732,7 +737,7 @@ def test_decide_without_a_queue_directory_fails_closed():
     class NoDir(FakeQueue):
         directory = None
     with pytest.raises(Exception):
-        cc.decide(event(), NoDir("allow"), AWAY)
+        cc.decide(event(), NoDir("allow"), AWAY, environ=h4_env(), home=h4_home())
 
 
 def test_dot_claude_json_is_config_only_as_the_users_own(tmp_path):
@@ -745,10 +750,10 @@ def test_dot_claude_json_is_config_only_as_the_users_own(tmp_path):
     (ws / "tests" / "fixtures").mkdir(parents=True)
     (ws / "link.json").symlink_to(home / ".claude.json")
     for path in ("~/.claude.json", str(home / ".claude.json"), "link.json"):
-        assert cc.targets_agent_config("Write", {"file_path": path}, str(ws), home=home), path
+        assert cc.targets_agent_config("Write", {"file_path": path}, str(ws), home=home, environ=h4_env()), path
     for path in ("tests/fixtures/.claude.json", ".claude.json", str(home / "sub" / ".claude.json")):
-        assert not cc.targets_agent_config("Write", {"file_path": path}, str(ws), home=home), path
-    assert cc.targets_agent_config("Write", {"file_path": "sub/.mcp.json"}, str(ws), home=home)
+        assert not cc.targets_agent_config("Write", {"file_path": path}, str(ws), home=home, environ=h4_env()), path
+    assert cc.targets_agent_config("Write", {"file_path": "sub/.mcp.json"}, str(ws), home=home, environ=h4_env())
 
 
 def test_install_refuses_an_untested_claude_version_unless_allowed(tmp_path, monkeypatch):
@@ -981,9 +986,10 @@ def test_the_directory_holding_the_authority_database_is_tagged(tmp_path):
     """L3 r1 codex MED: a protected FILE (cockpit.db) is a root, so its directory with the name in another field
     was not tagged."""
     root = tmp_path / "trust"
-    protected = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(cockpit_data_root=str(root)))
+    protected = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(cockpit_data_root=str(root)), environ=h4_env(),
+                                   home=h4_home())
     for inp in ({"directory": str(root), "filename": "cockpit.db"}, {"path": str(root / "cockpit.db")}):
-        assert cc.targets_agent_config("mcp__fs__w", inp, str(tmp_path), home=tmp_path / "h", protected=protected)
+        assert cc.targets_agent_config("mcp__fs__w", inp, str(tmp_path), home=tmp_path / "h", protected=protected, environ=h4_env())
 
 
 @pytest.mark.parametrize("config_file", [
@@ -995,9 +1001,9 @@ def test_the_directory_holding_each_config_file_is_tagged(config_file):
     """L1 on 1ae0546 (the class of the finding it closes): the probes are a list too, so tie them to the file
     checks: wherever a file is tagged, a server given its directory and its name in two fields is tagged."""
     cwd, home = "/work/proj", Path("/home/u")
-    assert cc.targets_agent_config("Write", {"file_path": f"{cwd}/{config_file}"}, cwd, home=home)
+    assert cc.targets_agent_config("Write", {"file_path": f"{cwd}/{config_file}"}, cwd, home=home, environ=h4_env())
     parent, name = os.path.split(config_file)
-    assert cc.targets_agent_config("mcp__fs__w", {"directory": f"{cwd}/{parent}", "n": "zz-" + name}, cwd, home=home)
+    assert cc.targets_agent_config("mcp__fs__w", {"directory": f"{cwd}/{parent}", "n": "zz-" + name}, cwd, home=home, environ=h4_env())
 
 
 @pytest.mark.parametrize("where", ["activation-hooks", "activation-hooks-relative", "site-dir"])
@@ -1014,20 +1020,20 @@ def test_a_directory_field_holding_the_hook_or_a_site_dir_is_tagged(tmp_path, wh
     inp = {"activation-hooks": {"directory": str(proj / "activation" / "hooks"), "filename": "consent_claude_code.py"},
            "activation-hooks-relative": {"directory": "activation/hooks", "filename": "consent_claude_code.py"},
            "site-dir": {"directory": sysconfig.get_path("purelib"), "filename": "zz.pth"}}[where]
-    assert cc.targets_agent_config("mcp__fs__write_file", inp, str(proj), home=tmp_path / "h")
+    assert cc.targets_agent_config("mcp__fs__write_file", inp, str(proj), home=tmp_path / "h", environ=h4_env())
     assert cx.targets_agent_config("mcp__fs__write_file", inp, str(proj), home=tmp_path / "h",
-                                   codex_dir=tmp_path / "h" / ".codex")
+                                   codex_dir=tmp_path / "h" / ".codex", environ=h4_env())
     assert not cc.targets_agent_config("mcp__fs__write_file", {"directory": str(proj / "src"), "filename": "a.py"},
-                                       str(proj), home=tmp_path / "h")
+                                       str(proj), home=tmp_path / "h", environ=h4_env())
 
 
 def test_an_mcp_input_past_the_bound_is_tagged():
-    assert cc.targets_agent_config("mcp__fs__w", {"lines": ["a"] * 5000}, "/work/proj", home=HOME)
+    assert cc.targets_agent_config("mcp__fs__w", {"lines": ["a"] * 5000}, "/work/proj", home=HOME, environ=h4_env())
     deep: object = "x"
     for _ in range(70):
         deep = [deep]
-    assert cc.targets_agent_config("mcp__fs__w", {"v": deep}, "/work/proj", home=HOME)
-    assert not cc.targets_agent_config("mcp__fs__w", {"lines": ["a"] * 4000}, "/work/proj", home=HOME)
+    assert cc.targets_agent_config("mcp__fs__w", {"v": deep}, "/work/proj", home=HOME, environ=h4_env())
+    assert not cc.targets_agent_config("mcp__fs__w", {"lines": ["a"] * 4000}, "/work/proj", home=HOME, environ=h4_env())
 
 
 @pytest.mark.parametrize("inp", [
@@ -1041,23 +1047,23 @@ def test_an_mcp_input_past_the_bound_is_tagged():
 ])
 def test_an_mcp_path_built_or_spelled_another_way_is_tagged(inp):
     """L2 probes on 450913a, each untagged there: what a server opens is not always one string as written."""
-    assert cc.targets_agent_config("mcp__x__write_file", inp, "/work/proj", home=Path("/home/u")), inp
+    assert cc.targets_agent_config("mcp__x__write_file", inp, "/work/proj", home=Path("/home/u"), environ=h4_env()), inp
 
 
 def test_ordinary_mcp_inputs_stay_untagged():
     for inp in ({"dir": "/work/proj/src", "name": "a.py", "content": "~ home"}, {"url": "https://example.com/a"},
                 {"query": "claude settings", "limit": 5}, {"content": "./" * 3000}):
-        assert not cc.targets_agent_config("mcp__x__w", inp, "/work/proj", home=Path("/home/u")), inp
+        assert not cc.targets_agent_config("mcp__x__w", inp, "/work/proj", home=Path("/home/u"), environ=h4_env()), inp
 
 
 def test_the_scan_has_a_bound_and_tags_past_it():
     """L1 on 450913a: 4000 strings of ~4 KiB cost 33-49 s of lstat. Past the total the request goes to the human."""
     t0 = time.monotonic()
-    assert cc.targets_agent_config("mcp__x__w", {"v": ["a/" * 2040] * 4000}, "/work/proj", home=Path("/home/u"))
+    assert cc.targets_agent_config("mcp__x__w", {"v": ["a/" * 2040] * 4000}, "/work/proj", home=Path("/home/u"), environ=h4_env())
     assert time.monotonic() - t0 < 5
     # 4095 values + the key "v" = 4096 strings, the most read; one more is past the bound
-    assert not cc.targets_agent_config("mcp__x__w", {"v": ["ab"] * 4095}, "/work/proj", home=Path("/home/u"))
-    assert cc.targets_agent_config("mcp__x__w", {"v": ["ab"] * 4096}, "/work/proj", home=Path("/home/u"))
+    assert not cc.targets_agent_config("mcp__x__w", {"v": ["ab"] * 4095}, "/work/proj", home=Path("/home/u"), environ=h4_env())
+    assert cc.targets_agent_config("mcp__x__w", {"v": ["ab"] * 4096}, "/work/proj", home=Path("/home/u"), environ=h4_env())
 
 
 @pytest.mark.parametrize("inp", [
@@ -1067,14 +1073,14 @@ def test_the_scan_has_a_bound_and_tags_past_it():
     ["~/.claude/settings.json"], "~/.claude/hooks/h.sh",  # an input that is not an object (L3 r1 glm)
 ])
 def test_l3_r1_spellings_are_tagged(inp):
-    assert cc.targets_agent_config("mcp__x__write", inp, "/work/proj", home=Path("/home/u")), inp
+    assert cc.targets_agent_config("mcp__x__write", inp, "/work/proj", home=Path("/home/u"), environ=h4_env()), inp
 
 
 def test_the_budget_stops_the_walk_early():
     """L3 r1 codex MED: 4095 percent-encoded file: strings of ~3.5 KiB built ~53 MiB before the total was checked."""
     t0 = time.monotonic()
-    assert cc.targets_agent_config("mcp__x__w", {"v": ["file:///" + "%61" * 1200] * 4095}, "/w", home=Path("/h"))
-    assert cc.targets_agent_config("mcp__x__w", {"v": [0] * 20000}, "/w", home=Path("/h"))
+    assert cc.targets_agent_config("mcp__x__w", {"v": ["file:///" + "%61" * 1200] * 4095}, "/w", home=Path("/h"), environ=h4_env())
+    assert cc.targets_agent_config("mcp__x__w", {"v": [0] * 20000}, "/w", home=Path("/h"), environ=h4_env())
     assert time.monotonic() - t0 < 2
 
 
@@ -1084,13 +1090,13 @@ def test_the_budget_stops_the_walk_early():
     "a/%2E%2E/" * 9000 + ".claude/settings.json",
 ])
 def test_a_long_string_is_collapsed_then_decoded(value):
-    assert cc.targets_agent_config("mcp__x__write", {"filepath": value}, "/work/proj", home=Path("/home/u"))
+    assert cc.targets_agent_config("mcp__x__write", {"filepath": value}, "/work/proj", home=Path("/home/u"), environ=h4_env())
 
 
 def test_long_content_is_not_tagged():
     body = "def f(x):\n    return x / 2  # 50% of it\n" * 3000
     assert not cc.targets_agent_config("mcp__x__write", {"path": "src/a.py", "content": body}, "/work/proj",
-                                       home=Path("/home/u"))
+                                       home=Path("/home/u"), environ=h4_env())
 
 
 # --- the PreToolUse gate (Q14 B2) ----------------------------------------------------------------------------
@@ -1143,9 +1149,9 @@ def test_the_dialog_after_a_gate_allow_takes_that_allow_once(queue, keys, monkey
     queue.answer(gated.id, *signed(queue, gated, keys["laptop"]))
     dialog = {"hook_event_name": "PermissionRequest", "tool_name": "Edit", "tool_input": tool_input,
               "cwd": "/work/proj", "session_id": "sess-1", "permission_mode": "acceptEdits"}
-    first = cc.decide(dialog, queue, cc.AdapterSettings(), home=Path("/home/u"))
+    first = cc.decide(dialog, queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     assert first == {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}
-    assert cc.decide(dialog, queue, cc.AdapterSettings(), home=Path("/home/u")) is None
+    assert cc.decide(dialog, queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env()) is None
     assert [r.id for r in queue.pending()] == []
 
 
@@ -1167,7 +1173,7 @@ def test_a_default_mode_gate_hold_ends_when_the_operator_comes_back(queue, monke
     back = threading.Timer(0.3, lambda: settings_file.write_text(json.dumps({"away_word": "off"})))
     back.start()
     t0 = time.monotonic()
-    out = cc.gate(event, queue, settings, home=Path("/home/u"))
+    out = cc.gate(event, queue, settings, home=Path("/home/u"), environ=h4_env())
     assert out is None
     assert time.monotonic() - t0 < 2.5
     assert queue.pending() == []
@@ -1192,7 +1198,7 @@ def test_with_no_key_a_hook_write_is_a_plain_deny_in_every_mode_where_no_dialog_
     settings = cc.AdapterSettings()  # no cockpit: no key can sign T3
     assert cc.nothing_can_decide(settings, tier=cc.AGENT_CONFIG_TIER)
     for mode in ("bypassPermissions", "auto", "dontAsk", "acceptEdits", None, "x"):
-        out = cc.gate(_hook_write(mode), queue, settings, home=Path("/home/u"))
+        out = cc.gate(_hook_write(mode), queue, settings, home=Path("/home/u"), environ=h4_env())
         what = "Write of /work/proj/.claude/hooks/x.sh"
         assert "continue" not in out and "stopReason" not in out, mode
         spec = out["hookSpecificOutput"]
@@ -1201,10 +1207,10 @@ def test_with_no_key_a_hook_write_is_a_plain_deny_in_every_mode_where_no_dialog_
     assert queue.pending() == []
     codex_cfg = {**_hook_write("acceptEdits"),
                  "tool_input": {"file_path": "/work/proj/.codex/config.toml", "content": "x"}}  # run 4 C5
-    out = cc.gate(codex_cfg, queue, settings, home=Path("/home/u"))
+    out = cc.gate(codex_cfg, queue, settings, home=Path("/home/u"), environ=h4_env())
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and queue.pending() == []
     for mode in ("default", "plan"):
-        assert cc.gate(_hook_write(mode), queue, settings, home=Path("/home/u")) is None, mode
+        assert cc.gate(_hook_write(mode), queue, settings, home=Path("/home/u"), environ=h4_env()) is None, mode
     rows = Ledger(Path(queue.directory)).window(cc.AGENT, "sess-1", datetime.now(timezone.utc) - timedelta(days=1))
     assert {(r.phase, r.outcome, (r.stamp_detail or {}).get("decision")) for r in rows} == {
         ("denied_by_gate", "refused", "floor")}
@@ -1217,10 +1223,10 @@ def test_an_unconfined_session_passes_a_hook_write_and_spends_no_ruled_allow(que
     taken = []
     monkeypatch.setattr(queue, "take_ruled_allow", lambda *a, **kw: taken.append(a))
     monkeypatch.setenv(cc.UNCONFINED_ENV, "1")
-    assert cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u")) is None
+    assert cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env()) is None
     assert taken == [] and queue.pending() == []
     monkeypatch.setenv(cc.UNCONFINED_ENV, "true")
-    out = cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    out = cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and len(taken) == 1
 
 
@@ -1241,8 +1247,8 @@ def test_a_settings_file_that_sets_unconfined_does_not_open_the_session(tmp_path
           "tool_input": {"file_path": target, "content": "x"}}
     settings = cc.AdapterSettings()
     monkeypatch.setenv(cc.UNCONFINED_ENV, "1")
-    assert cc.unconfined_state(str(ws / "sub"), home=home) == "on"
-    assert cc.gate(ev, queue, settings, home=home) is None
+    assert cc.unconfined_state(str(ws / "sub"), home=home, environ=h4_env()) == "on"
+    assert cc.gate(ev, queue, settings, home=home, environ=h4_env()) is None
     ignored = cc.FLOOR_TEXT.format(x=f"Write of {target}") + cc.UNCONFINED_IGNORED_TEXT
     for path, body in ((ws / ".claude" / "settings.json", json.dumps({"hooks": {}, "env": {cc.UNCONFINED_ENV: "1"}})),
                        (ws / ".claude" / "settings.local.json", json.dumps({"env": {cc.UNCONFINED_ENV: "0"}})),
@@ -1259,14 +1265,14 @@ def test_a_settings_file_that_sets_unconfined_does_not_open_the_session(tmp_path
                        (tmp_path / "etc" / "config.toml", f'x = "{cc.UNCONFINED_ENV}"\n')):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
-        assert cc.unconfined_state(str(ws / "sub"), home=home) == "ignored", path
-        out = cc.gate(ev, queue, settings, home=home)
+        assert cc.unconfined_state(str(ws / "sub"), home=home, environ=h4_env()) == "ignored", path
+        out = cc.gate(ev, queue, settings, home=home, environ=h4_env())
         assert "continue" not in out and out["hookSpecificOutput"]["permissionDecisionReason"] == ignored, path
         path.unlink()
     (ws / ".claude" / "settings.json").write_text(json.dumps({"env": {"OTHER": "1"}}))
-    assert cc.gate(ev, queue, settings, home=home) is None  # an env block that does not set it leaves his word
+    assert cc.gate(ev, queue, settings, home=home, environ=h4_env()) is None  # an env block that does not set it leaves his word
     monkeypatch.delenv(cc.UNCONFINED_ENV)
-    assert cc.unconfined_state(str(ws / "sub"), home=home) is None
+    assert cc.unconfined_state(str(ws / "sub"), home=home, environ=h4_env()) is None
     assert queue.pending() == []
 
 
@@ -1283,12 +1289,12 @@ def test_with_a_key_that_can_sign_t3_the_floor_is_skipped_and_a_git_hook_write_i
     for p in (".git/hooks/pre-commit", ".git/config", ".GIT/Config", "sub/.git/hooks/d/x", ".git/config.worktree",
               ".git/worktrees/wt/config.worktree", ".git/worktrees/wt/hooks/post-checkout", "wt/.git",
               ".git/worktrees/config", ".git/description"):
-        assert cc.targets_agent_config("Write", {"file_path": p, "content": "x"}, "/work/proj", home=home), p
+        assert cc.targets_agent_config("Write", {"file_path": p, "content": "x"}, "/work/proj", home=home, environ=h4_env()), p
         patch = {"command": f"*** Begin Patch\n*** Add File: {p}\n+x\n*** End Patch"}
-        assert cx.targets_agent_config("apply_patch", patch, "/work/proj", home=home, codex_dir=codex_dir), p
+        assert cx.targets_agent_config("apply_patch", patch, "/work/proj", home=home, codex_dir=codex_dir, environ=h4_env()), p
     for p in (".git/HEAD", ".git/refs/heads/main", ".git/objects/ab/cd", ".git/logs/HEAD", ".git/index",
               ".git/packed-refs", ".git/FETCH_HEAD", ".gitignore", ".gitattributes", "src/config"):
-        assert not cc.targets_agent_config("Write", {"file_path": p, "content": "x"}, "/work/proj", home=home), p
+        assert not cc.targets_agent_config("Write", {"file_path": p, "content": "x"}, "/work/proj", home=home, environ=h4_env()), p
 
     key = Key(tmp_path, "laptop")
     root = tmp_path / "cockpit"
@@ -1305,7 +1311,7 @@ def test_with_a_key_that_can_sign_t3_the_floor_is_skipped_and_a_git_hook_write_i
     assert not cc.nothing_can_decide(settings, tier=cc.AGENT_CONFIG_TIER)
     qdir = tmp_path / "consent"
     qdir.mkdir(mode=0o700)
-    q = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=None))
+    q = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=None), home=h4_home())
     filed = []
 
     def at_the_ping(*a, **kw):
@@ -1314,11 +1320,11 @@ def test_with_a_key_that_can_sign_t3_the_floor_is_skipped_and_a_git_hook_write_i
     monkeypatch.setattr(cc, "notify", at_the_ping)
     ev = {**_hook_write("bypassPermissions"),
           "tool_input": {"file_path": "/work/proj/.git/hooks/pre-commit", "content": "#!/bin/sh\n"}}
-    out = cc.gate(ev, q, settings, home=home)
+    out = cc.gate(ev, q, settings, home=home, environ=h4_env())
     assert [(r.tool_name, r.tier) for r in filed] == [("Write", cc.AGENT_CONFIG_TIER)]
     assert out["hookSpecificOutput"]["permissionDecisionReason"].startswith("levain: the gate failed (RuntimeError)")
     assert cc.gate({**ev, "tool_input": {"file_path": "/work/proj/.git/HEAD", "content": "x"}}, q, settings,
-                   home=home) is None
+                   home=home, environ=h4_env()) is None
 
     monkeypatch.setenv(cc.UNCONFINED_ENV, "1")
     calls = []
@@ -1326,7 +1332,7 @@ def test_with_a_key_that_can_sign_t3_the_floor_is_skipped_and_a_git_hook_write_i
     dialog = {"hook_event_name": "PermissionRequest", "tool_name": "Write", "cwd": "/work/proj",
               "session_id": "sess-1", "permission_mode": "acceptEdits",
               "tool_input": {"file_path": "/work/proj/.claude/settings.json", "content": "{}"}}
-    assert cc.decide(dialog, q, settings, home=home) is None and calls == []
+    assert cc.decide(dialog, q, settings, home=home, environ=h4_env()) is None and calls == []
 
 
 # --- L3 r1 G1 / r2 G1': git's config and hooks, by path, and where git itself says hooks run ----------------------
@@ -1465,9 +1471,9 @@ def test_git_executable_config_includes_submodules_the_effective_hooks_path_and_
     monkeypatch.setattr(cc.pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir=str(tmp_path / "home")))
     cwd, home, target, expected = _git_case(name, tmp_path, monkeypatch)
     try:
-        got = cc.targets_agent_config("Write", {"file_path": target, "content": "x"}, str(cwd), home=home)
+        got = cc.targets_agent_config("Write", {"file_path": target, "content": "x"}, str(cwd), home=home, environ=h4_env())
         patch = {"command": f"*** Begin Patch\n*** Add File: {target}\n+x\n*** End Patch"}
-        got_cx = cx.targets_agent_config("apply_patch", patch, str(cwd), home=home, codex_dir=home / ".codex")
+        got_cx = cx.targets_agent_config("apply_patch", patch, str(cwd), home=home, codex_dir=home / ".codex", environ=h4_env())
     finally:
         cfg = tmp_path / "ws" / ".git" / "config"
         cfg.exists() and cfg.chmod(0o600)
@@ -1494,12 +1500,12 @@ def test_a_malformed_pretooluse_event_naming_a_gated_call_is_denied(queue, monke
                          ({**good, "cwd": "."}, "cwd"), ({**good, "cwd": " "}, "cwd"),
                          ({**good, "cwd": "ws", "tool_input": {"file_path": ".husky/pre-commit", "content": "x"}},
                           "cwd")):
-        out = cc.gate(bad, queue, settings, home=Path("/home/u"))
+        out = cc.gate(bad, queue, settings, home=Path("/home/u"), environ=h4_env())
         assert out["hookSpecificOutput"]["permissionDecision"] == "deny", missing
         assert out["continue"] is False and f"no valid {missing}" in out["hookSpecificOutput"][
             "permissionDecisionReason"], missing
     ungated = {**good, "session_id": None, "tool_name": "Bash", "tool_input": {"command": "ls"}}
-    assert cc.gate(ungated, queue, settings, home=Path("/home/u")) is None
+    assert cc.gate(ungated, queue, settings, home=Path("/home/u"), environ=h4_env()) is None
     assert queue.pending() == []
 
 
@@ -1508,5 +1514,157 @@ def test_every_gate_call_checks_for_held_phone_pings(queue, monkeypatch):
     calls = []
     monkeypatch.setattr(cc, "flush_held_pings", lambda q: calls.append(q.directory))
     monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
-    cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     assert calls == [queue.directory]
+
+
+@pytest.mark.parametrize("why", ["symlink loop", "source raises"])
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm", "-journal"])
+def test_a_queue_that_will_not_open_still_tags_the_configured_cockpit_store(tmp_path, monkeypatch, suffix, why):
+    """L3 r1 (complement MED 1, CH-D1c-A): ``main`` loads the settings before the queue is built, so when building
+    it raises, :func:`gate_failed` still protects the configured cockpit's authority store and its sqlite sidecars:
+    a bypass-mode Write there is denied with the hard stop, never left to the session's mode. Reproduced with the
+    real hook on Python 3.12: a ``cockpit.db`` that is a symlink loop made ``Path.resolve`` in the authority source
+    raise, and the Write got no decision. Python 3.13's ``resolve`` returns a loop unresolved, so the other case
+    makes the source raise directly."""
+    import sys
+
+    if why == "symlink loop" and sys.version_info >= (3, 13):
+        pytest.skip("Path.resolve raises on a symlink loop only before Python 3.13")
+    monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    if why == "symlink loop":
+        os.symlink(root / "cockpit.db", root / "cockpit.db")
+    else:
+        def raising(*a, **kw):
+            raise RuntimeError("the authority source could not be built")
+        monkeypatch.setattr(cc, "authority_source", raising)
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(root)}))
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with pytest.raises(RuntimeError):   # the window this test is about: building the queue raised
+        cc.permission_context(qdir, environ=h4_env(), home=h4_home())
+    target = f"{root / 'cockpit.db'}{suffix}"
+    write = {"hook_event_name": "PreToolUse", "tool_name": "Write", "cwd": str(ws), "session_id": "sess-1",
+             "permission_mode": "bypassPermissions", "tool_use_id": "toolu_1",
+             "tool_input": {"file_path": target, "content": "x"}}
+    out = io.StringIO()
+    assert cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(write)), stdout=out) == 0
+    got = json.loads(out.getvalue())
+    assert got["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert got["continue"] is False and target in got["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+_USER_SITE_PLANTS = (".local/lib/python3.12/site-packages/x.pth",
+                     ".local/lib/python3.99/site-packages/evil/__init__.py",
+                     "Library/Python/3.12/lib/python/site-packages/usercustomize.py",
+                     "Library/Python/3.14/bin/tool")
+
+
+@pytest.mark.parametrize("rel", _USER_SITE_PLANTS)
+def test_a_write_into_the_operators_user_site_is_agent_config_under_a_venv(monkeypatch, tmp_path, rel):
+    """F7: on a venv install the hook's interpreter has ENABLE_USER_SITE False, so `import_site_dirs` leaves the user
+    site out; the operator's other, non-venv Pythons still load it. The user-site TREES are agent config whatever
+    this interpreter's flag says, and `import_site_dirs` keeps its meaning (what redirects THIS interpreter's
+    `import levain`)."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("platform.system", lambda: "Darwin")   # the framework layout is macOS's
+    monkeypatch.delenv("PYTHONUSERBASE", raising=False)
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
+    assert all(not s.startswith(str(home).lower()) for s in cc.import_site_dirs())
+    target = home / rel
+    assert cc.targets_agent_config("Write", {"file_path": str(target)}, "/work/proj", home=home, environ=h4_env())
+    assert cc.targets_agent_config("Write", {"file_path": "~/" + rel}, "/work/proj", home=home, environ=h4_env())
+    # the OPERATOR's home (the password database's), when the agent's HOME is set elsewhere
+    monkeypatch.setattr(cc, "operator_home", lambda environ: home)
+    assert cc.targets_agent_config("Write", {"file_path": str(target)}, "/work/proj", home=tmp_path / "agent-home", environ=h4_env())
+    # an MCP tool given the site directory itself and a file name in another field
+    assert cc.targets_agent_config("mcp__fs__write", {"dir": str(target.parent), "name": "x.pth"}, "/work/proj",
+                                   home=home, environ=h4_env())
+
+
+@pytest.mark.parametrize("rel", (".local/libpython3/x.pth", ".local/share/x.pth", ".local/lib.d/x.pth",
+                                 "Library/Pythonx/x.pth", "proj/.local/lib/python3.12/x.pth"))
+def test_paths_beside_the_user_site_are_not_agent_config(monkeypatch, tmp_path, rel):
+    home = tmp_path / "home"
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.delenv("PYTHONUSERBASE", raising=False)
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
+    assert not cc.targets_agent_config("Write", {"file_path": str(home / rel)}, "/work/proj", home=home, environ=h4_env())
+
+
+def test_the_consent_check_and_the_floor_read_one_user_site_derivation(monkeypatch, tmp_path):
+    """U1 (verify r2, codex HIGH + complement MED): the trees the hook tags are the floor's, from the one function
+    (`python_user_site_roots`), so a tree the floor denies is never one a standing grant answers. Anything under
+    ~/.local/lib is the floor's (a node_modules there included), so it is the hook's too."""
+    from levain.firing import confinement as C
+
+    home = tmp_path / "home"
+    base = tmp_path / "pyuser"
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    monkeypatch.setattr(cc, "operator_home", lambda environ: home)
+    floor = {os.path.normpath(r).lower() for r, _ in C.python_user_site_roots(home)[0]}
+    assert set(cc.user_site_roots(home, environ=h4_env())) >= floor and os.path.normpath(base / "lib").lower() in floor
+    assert cc.targets_agent_config("Write", {"file_path": str(home / ".local/lib/node_modules/a.js")}, "/work/proj",
+                                   home=home, environ=h4_env())
+
+
+@pytest.mark.parametrize("rel", ("lib/python3.12/site-packages/x.pth", "lib/python/site-packages/usercustomize.py",
+                                 "lib/python3.99/site-packages/evil/__init__.py"))
+def test_a_write_into_an_absolute_pythonuserbase_site_is_agent_config(monkeypatch, tmp_path, rel):
+    """U1: with an absolute $PYTHONUSERBASE the user site is below <base>/lib; a file-tool write there is agent config
+    (so no standing grant answers it), under a venv too. <base> itself beside lib stays ordinary."""
+    home = tmp_path / "home"
+    base = tmp_path / "opt" / "python-user"
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
+    assert cc.targets_agent_config("Write", {"file_path": str(base / rel)}, "/work/proj", home=home, environ=h4_env())
+    assert cc.targets_agent_config("mcp__fs__write", {"dir": str((base / rel).parent), "name": "x.pth"},
+                                   "/work/proj", home=home, environ=h4_env())
+    assert not cc.targets_agent_config("Write", {"file_path": str(base / "notes.txt")}, "/work/proj", home=home, environ=h4_env())
+
+
+def test_a_large_mcp_input_derives_the_user_site_roots_once(monkeypatch, tmp_path):
+    """K1 (stack7 L3 r1, codex MED): the user-site trees are derived once per call, in `targets_agent_config`, and
+    handed to `names_config_dir` like `roots`/`sites`/`user_configs`, never once per every-string candidate."""
+    calls = []
+    real = cc.user_site_roots
+
+    def counting(home, *, environ):
+        calls.append(home)
+        return real(home, environ=environ)
+
+    monkeypatch.setattr(cc, "user_site_roots", counting)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
+    tool_input = {"names": [f"d{i}" for i in range(3000)]}
+    assert policy_mod.mcp_config_candidates(tool_input) is not None   # inside the bound: each string is a candidate
+    assert not cc.targets_agent_config("mcp__fs__write", tool_input, str(tmp_path), home=tmp_path / "home",
+                                       environ=h4_env())
+    assert len(calls) == 1
+
+
+def test_no_operator_home_fails_closed_through_the_mcp_path(monkeypatch, tmp_path):
+    """K1 (stack7 L3 r1, deepseek MED 1): a password database with no entry and no HOME (`operator_home` raises
+    KeyError) tags an MCP call, never escapes it."""
+    def gone(environ):
+        raise KeyError("HOME")
+
+    monkeypatch.setattr(cc, "operator_home", gone)
+    assert cc.targets_agent_config("mcp__fs__write", {"dir": "d", "name": "n"}, str(tmp_path), home=tmp_path / "home",
+                                   environ=h4_env())
+
+
+@pytest.mark.parametrize("bad", ("", "rel/home"))
+def test_a_non_absolute_home_gives_no_user_site_root(monkeypatch, tmp_path, bad):
+    """K2 (stack7 L3 r1, complement LOW 2): a home that is not absolute (an empty pw_dir is `.`) names no user-site
+    tree: no root relative to wherever the hook runs; the absolute home beside it still gives its own."""
+    monkeypatch.delenv("PYTHONUSERBASE", raising=False)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: Path(bad))
+    roots = cc.user_site_roots(tmp_path / "home", environ=h4_env())
+    assert roots and all(os.path.isabs(r) and r.startswith(str(tmp_path).lower()) for r in roots)

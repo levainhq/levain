@@ -13,6 +13,7 @@ from levain.cockpit import Cockpit, ProviderSpec, Read, RowIn
 from levain.cockpit.results import Absent
 from levain.consent.listing import read_listing
 from levain.consent.queue import ConsentQueue, authority_source
+from tests._h4 import h4_home
 
 T0 = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -20,7 +21,7 @@ T0 = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
 def _filed(tmp_path: Path):
     qdir = tmp_path / "consent"
     qdir.mkdir(mode=0o700)
-    q = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None), clock=lambda: T0)
+    q = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None), clock=lambda: T0, home=h4_home())
     waiting = q.file(agent="claude_code", agent_session_id="s", tool_name="Bash",
                      tool_input={"command": "ls /w"}, cwd="/w", hold=timedelta(minutes=5), event_id="a")
     done = q.file(agent="codex", agent_session_id="s2", tool_name="Write",
@@ -173,7 +174,7 @@ def _home_queue(tmp_path, monkeypatch) -> ConsentQueue:
     home = tmp_path / "levain_home"
     monkeypatch.setenv("LEVAIN_HOME", str(home))
     (home / "consent").mkdir(parents=True, mode=0o700)
-    return ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None))
+    return ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
 
 
 def test_the_token_free_panel_and_manifest_carry_no_request_body_on_loopback(tmp_path, monkeypatch):
@@ -215,7 +216,7 @@ def test_the_page_draws_a_consent_request_as_text_with_a_countdown_and_copy_butt
     monkeypatch.setenv("LEVAIN_HOME", str(home))
     (home / "consent").mkdir(parents=True, mode=0o700)
     qdir = home / "consent"
-    q = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
+    q = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None), home=h4_home())
     r = q.file(agent="claude_code", agent_session_id="s", tool_name="Bash",
                tool_input={"command": "echo '<img src=x onerror=window.__pwned=1>'"}, cwd="/w",
                hold=timedelta(minutes=5), event_id="p1")

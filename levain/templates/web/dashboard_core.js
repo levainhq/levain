@@ -4374,6 +4374,18 @@
         parts.push(line);
       }
     }
+    // OS-2: where this cockpit answers (pending) or rules (undecided) the request with a passkey, the sheet does it
+    if (b.sheet === true && typeof b.id === "string" && b.id) {
+      // no answer a passkey may sign here (none enrolled, or a ported page): the sheet says why, not "with your passkey"
+      const can = Array.isArray(b.sheet_choices) && b.sheet_choices.length > 0;
+      const btn = el("button", "undo-btn consent-sheet-open", !can ? "why no passkey answers this here"
+        : pending ? "answer with your passkey" : "rule with your passkey");
+      btn.type = "button";
+      btn.dataset.consentSheet = pending ? "answer" : "rule";
+      btn.title = "open the sign sheet for this request";
+      btn.addEventListener("click", () => openConsentSheet(b.id, sv(b.sheet_v)));
+      parts.push(btn);
+    }
     slot.replaceChildren(...parts);
   }
   function consentRow(o) {
@@ -5108,28 +5120,36 @@
   // `version`: the listing's sha256 the card showed (the sheet draws a pick only on it); `choice`: an option to preselect
   function openSignSheet(id, version, choice) {
     if (typeof id !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return null;
+    return openSheet("/sign/" + encodeURIComponent(id), version, choice, "sign request");
+  }
+  // OS-2: the same sheet over a consent request (/sign/consent/<id>), answered or ruled there with a passkey
+  function openConsentSheet(id, version, choice) {
+    if (typeof id !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(id)) return null;
+    return openSheet("/sign/consent/" + encodeURIComponent(id), version, choice, "consent request");
+  }
+  function openSheet(path, version, choice, what) {
     closeSignSheet();
     if (signBusy) return null;
     signBusy++;
     signSheetLease = true;
     try {
-      return buildSignSheet(id, version, choice);
+      return buildSignSheet(path, version, choice, what);
     } catch (e) {
       closeSignSheet();   // a build that threw gives back the lease and whatever it had made inert
       return null;
     }
   }
-  function buildSignSheet(id, version, choice) {
+  function buildSignSheet(path, version, choice, what) {
     let frag = typeof version === "string" && /^[0-9a-f]{16}/.test(version) ? "v=" + version.slice(0, 16) : "";
     if (frag && typeof choice === "string" && /^[a-z0-9]{1,8}$/.test(choice)) frag += "&choice=" + choice;
     const veil = el("div", "modal-overlay");
     veil.id = SIGN_SHEET_ID;
     veil.setAttribute("role", "dialog");
     veil.setAttribute("aria-modal", "true");
-    veil.setAttribute("aria-label", "sign request");
+    veil.setAttribute("aria-label", what);
     const box = el("div", "modal");
     const head = el("div", "modal-head");
-    head.appendChild(el("h2", "", "Sign request"));
+    head.appendChild(el("h2", "", what.charAt(0).toUpperCase() + what.slice(1)));
     const x = el("button", "modal-close", "×");
     x.type = "button";
     x.setAttribute("aria-label", "close the sign sheet");
@@ -5137,10 +5157,10 @@
     head.appendChild(x);
     const frame = document.createElement("iframe");
     frame.id = SIGN_SHEET_ID + "-frame";
-    frame.title = "sign request";
+    frame.title = what;
     frame.setAttribute("allow", "publickey-credentials-get");
     frame.referrerPolicy = "no-referrer";
-    frame.src = "/sign/" + encodeURIComponent(id) + (frag ? "#" + frag : "");
+    frame.src = path + (frag ? "#" + frag : "");
     Object.assign(frame.style, { width: "100%", height: "min(80vh, 680px)", border: "0", display: "block", background: "transparent" });
     box.append(head, frame);
     veil.appendChild(box);
@@ -5211,7 +5231,7 @@
       rereadBoard();
     }
   });
-  window.LevainSignSheet = { open: openSignSheet, close: closeSignSheet };
+  window.LevainSignSheet = { open: openSignSheet, openConsent: openConsentSheet, close: closeSignSheet };
 
   // A signed verb's send (ActionVerb.sign): the server's compose_signer files a sign request for exactly these params, the
   // passkey signs it, and only then does the caller post the verb with `sign_request`. Resolves {ok: true, request, txn} or
@@ -5530,18 +5550,29 @@
     if (full && card._needsItem && Number.isFinite(Date.parse(card._needsItem.c.expiresAt))) {
       parts.push(label("Expires"), el("div", "ext-meta needs-expires", new Date(card._needsItem.c.expiresAt).toLocaleString()));
     }
-    // Allow and Deny are one component at one weight: neither is filled, neither leads. This page signs nothing, so each
-    // copies the terminal command that answers; the phone is where the answer is signed.
+    // Allow and Deny are one component at one weight: neither is filled, neither leads. An answer the sheet offers here
+    // (the body's `sheet_choices`, OS-2: a passkey enrolled that may sign it) opens the sign sheet with that answer picked;
+    // any other copies the terminal command that answers (a passkey never allows a T3 request, so its Allow stays a
+    // terminal line and never opens a sheet that offers only Deny). The terminal commands stay under the card's details.
     const acts = el("div", "needs-actions");
     const cmds = [];
+    const cid = card._needsItem && card._needsItem.c ? card._needsItem.c.id : "";
+    const choices = b.sheet === true && typeof cid === "string" && cid && Array.isArray(b.sheet_choices)
+      ? b.sheet_choices.filter((k) => k === "allow" || k === "deny") : [];
     for (const [label, cmd] of [["Allow", sv(b.answer_allow)], ["Deny", sv(b.answer_deny)]]) {
       if (!cmd) continue;
       const btn = el("button", "needs-btn", label);
       btn.type = "button";
       btn.dataset.label = label;
-      btn.title = "copy the " + label.toLowerCase() + " command for a terminal; this page signs nothing, sign on your phone with Face ID";
       const code = el("code", "consent-code", cmd);
-      btn.addEventListener("click", () => copyText(cmd, code, btn));
+      if (choices.includes(label.toLowerCase())) {
+        btn.title = label.toLowerCase() + " with your passkey, in the sign sheet";
+        btn.dataset.consentSheet = label.toLowerCase();
+        btn.addEventListener("click", () => openConsentSheet(cid, sv(b.sheet_v), label.toLowerCase()));
+      } else {
+        btn.title = "copy the " + label.toLowerCase() + " command for a terminal; this page signs nothing, sign on your phone with Face ID";
+        btn.addEventListener("click", () => copyText(cmd, code, btn));
+      }
       acts.appendChild(btn);
       const line = el("div", "consent-cmd");
       line.appendChild(code);
@@ -5553,7 +5584,9 @@
     slot.replaceChildren(...parts);
     // the actions and the one-line footer are the card's own rows, pinned below the body so cards in a row end alike
     if (acts.childElementCount) card.appendChild(acts);
-    card.appendChild(needsDetails(more, "signs on your phone", card));
+    const here = choices.length === 2 ? "signs with your passkey here"
+      : choices.length ? choices[0] + " signs with your passkey here" : "signs on your phone";
+    card.appendChild(needsDetails(more, here, card));
   }
   function consentCard(c, full) {
     const card = el("div", "needs-card needs-consent" + (full ? " is-full" : ""));

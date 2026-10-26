@@ -23,6 +23,7 @@ from levain.web_server import _ConsentReader
 from tests.chat_egress.test_cards_states_page import _card, _launch
 from tests.chat_egress.test_records import GET
 from tests.test_consent_queue import Key, Log, signed
+from tests._h4 import h4_home
 
 needs_ssh = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="ssh-keygen signs the answers")
 
@@ -37,7 +38,7 @@ def _setup(tmp_path, monkeypatch):
     (tmp_path / "auth").mkdir()
     log = Log(tmp_path / "auth", {"laptop": Key(keydir, "laptop")})
     log.enrol("laptop", "laptop-presence")
-    return consent, log, ConsentQueue(consent, authority=log.source)
+    return consent, log, ConsentQueue(consent, authority=log.source, home=h4_home())
 
 
 @needs_ssh

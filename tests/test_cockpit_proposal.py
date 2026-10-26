@@ -18,6 +18,7 @@ from levain.cockpit.proposals import MIN_HAND_ALLOWS, PROPOSAL_CAP, PROPOSED_LIF
 from levain.consent.listing import KeyEvidence, read_evidence, read_listing
 from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.queue import ConsentQueue, authority_source
+from tests._h4 import h4_home
 
 # The page under test reads its proposal window against the browser's real clock, so the seed is anchored to the
 # current hour: a fixed date ages out of that window (it did, nine days after 2026-10-17).
@@ -36,7 +37,7 @@ class Seed:
         self.dir = base / "consent"
         self.dir.mkdir(mode=0o700, parents=True)
         self.clock = [NOW - timedelta(days=5)]
-        self.q = ConsentQueue(self.dir, authority=authority_source(self.dir, anchor=None), clock=lambda: self.clock[0])
+        self.q = ConsentQueue(self.dir, authority=authority_source(self.dir, anchor=None), clock=lambda: self.clock[0], home=h4_home())
         self.n = 0
         self.root = base / "work"
         self.ws = self.w("proj")

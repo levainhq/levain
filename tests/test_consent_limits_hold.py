@@ -9,12 +9,13 @@ from levain.consent import limits as L
 from levain.consent.queue import AnswerRefused, ConsentQueue
 from levain.consent.record import RULING_NAMESPACE, ruling_message
 from tests.test_consent_queue import authority, keys, signed  # noqa: F401 - the shared fixtures
+from tests._h4 import h4_env, h4_home
 
 LIM = dict(L.DEFAULTS, calls=2)
 
 
 def _q(tmp_path, authority):
-    return ConsentQueue(tmp_path / "home" / "consent", authority=authority)
+    return ConsentQueue(tmp_path / "home" / "consent", authority=authority, home=h4_home())
 
 
 def _check(q, i, *, session="s1", hold=2.0, pings=None, limits=LIM, monkeypatch=None):
@@ -200,7 +201,7 @@ def test_a_late_ruling_on_a_limit_reads_as_extend_or_end(tmp_path, keys, authori
     _answer_when_filed(q, keys["phone"], "allow", late=True).join()
     text = claude_code.ruling_context(q, "s1")
     assert "EXTENDED this session's tool calls limit to 4 (gap #1)" in text and "Do «" not in text
-    q2 = ConsentQueue(tmp_path / "h2" / "consent", authority=authority)
+    q2 = ConsentQueue(tmp_path / "h2" / "consent", authority=authority, home=h4_home())
     for i in (1, 2):
         L.check("codex", {"tool_use_id": f"c{i}"}, q2, "s9", "shell", {"c": i}, hold=0.4, notify=lambda _t: None,
                 cwd="/w")
@@ -242,10 +243,10 @@ def test_a_stale_end_is_not_told_after_an_extend_and_codex_hears_a_live_end(tmp_
     q.answer(eid, p2, s2)
     assert _check(q, 4).go
     assert not (claude_code.ruling_context(q, "s1") or "")   # the End on gap #1 was superseded: not told
-    q2 = ConsentQueue(tmp_path / "h2" / "consent", authority=authority)
+    q2 = ConsentQueue(tmp_path / "h2" / "consent", authority=authority, home=h4_home())
     run = lambda i: codex.gate({"hook_event_name": "PreToolUse", "session_id": "s9", "tool_use_id": f"c{i}",  # noqa: E731
                                 "tool_name": "Read", "tool_input": {"file_path": f"/w/{i}"}, "cwd": "/w"}, q2,
-                               codex.AdapterSettings(gate_hold_seconds=0.4))
+                               codex.AdapterSettings(gate_hold_seconds=0.4), environ=h4_env(), home=h4_home())
     run(1), run(2), run(3)
     rid2 = q2.undecided_for("codex")[0].request.id
     payload = q2.ruling_payload(rid2, "deny", keys["phone"].fp)

@@ -124,6 +124,21 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   If anything fails part way, the old pin and store are put back. A replace interrupted part way leaves a marker; until
   a `--replace` is run again, the control and keys services refuse to start, and that run first finishes the
   interrupted replace or puts the old store back. On an install where keys never ran, the replace also holds keys off.
+- **The cockpit answers an agent's consent request with your passkey.** On the Needs-you card, Allow and Deny open the
+  sign sheet with that answer picked, and an undecided request can be ruled from the decisions panel. The checks are the
+  phone page's own. An answer a passkey cannot give here (allowing a T3 request) stays a terminal command, and a cockpit
+  served on a port says where the request can be answered instead of asking for a passkey. A ruling is confirmed as soon
+  as it is recorded; its delivery to the session continues on its own.
+- **The consent sheet treats a request as changed when the words an option shows, or the exact line it signs, change.**
+- **Slot sessions can fetch from a shipped list of hosts without a prompt.** Setup and repair add a shipped
+  `egress-default` route to your route map (`github.com`, `api.github.com`, `pypi.org`, `files.pythonhosted.org`); every
+  other host is still refused at the gateway, and the refusal now names how to allow it.
+- **The install helper's `routes-egress` verb sets your own extra egress hosts** (JSON on stdin; an empty list removes
+  them). They apply to sessions started afterwards. If your route map already has your own egress route for one of the
+  shipped hosts (for example `pypi.org`), your route keeps it and the shipped list leaves it off; setup, repair and
+  `routes-base` say so. A map where two of your routes name the same host, a route that lists the same host twice, or a
+  subscription route that names a shipped host is refused when the map is merged, with the route names and the fix (edit
+  `routes/base.json`), instead of every session failing at its gateway; `routes-egress` refuses to write over such a map.
 
 ### Changed
 - **A coordinator store made by an earlier version is updated the first time a `levain` command that writes to it
@@ -142,7 +157,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   when it was charged no more than its hold.
 
 - **A Claude Code session's settings skip WebFetch's hostname preflight, and claude.ai connectors are off in every
-  session.** The egress hosts are not pre-allowed: an on-list WebFetch still asks first, and the gateway still decides.
+  session.** A session on an egress route is allowed WebFetch to that route's hosts without a prompt; the gateway still
+  refuses every other host.
 - **Codex sessions start with web search disabled on the command line,** so a repository's own Codex config cannot turn
   it back on.
 - **A repo settings file that sets a proxy variable** (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `ALL_PROXY`, any case)
@@ -159,6 +175,49 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **A session's `budget_overrun` in CONTROL's `STATUS` goes away when the session is purged.**
 - **On an OpenRouter route, a response from another model that reports a cost above the call's hold but no token
   counts is charged that cost** (it was charged only the hold).
+- **The levain home a consent hook protects comes from the environment the hook read when it started,** the same as
+  everything else on its decision path. When the hook cannot open its queue, a write to the configured cockpit's
+  authority store is still refused.
+- **Chat: a read that crosses a turn boundary still answers or interrupts the control requests it carries,** so a
+  pending request no longer leaves the CLI waiting while the read is refused. Read again, it does not re-send an
+  interrupt or reply it already delivered; a later request that reuses an answered request id is answered.
+- **Chat: a control request whose reply keeps failing is answered on every read, but the turn is interrupted for it
+  only once.** An activation or re-enable waits for a read in progress, so that read's interrupt never reaches a turn
+  started after it. A control reply the session does not hold still latches the launch off.
+- **Chat: a Read whose path (or a launch directory) contains a NUL byte latches the launch off instead of erroring.**
+- **`levain session adopt` works on a real macOS install again.** The confined importer died at startup, before it read
+  anything, because its sandbox denied the system random device Python needs to start, so every adopt refused
+  `importer-failed:result-malformed: 'no result line'`. The importer and verifier sandboxes now allow reading
+  `/dev/urandom`.
+- **`levain session adopt` no longer refuses `bad-root` on `/var/levain/export/operator`.** The export directories are now
+  owned by root (group `levain-export` / `levain-dispatch-export`, mode 0750), as the store layout specifies. **Run the
+  install helper's `repair --source <levain package>` once after upgrading** so an existing install's directories are
+  re-owned.
+- **Setup and repair on macOS now remove extended ACLs from Levain's store directories.** A directory that an older
+  install gave to another account could keep an ACL grant (for example, to add files) after repair made it root's, and
+  Levain's trust check would not see it.
+- **macOS: after a reboot, Levain now restores pf on its own.** The `com.levain.pf` boot job turns pf on, loads Levain's
+  firewall rules and puts back the loopback addresses the egress slots use. Before, `setup` and `repair` reported the job
+  as pending and installed nothing, so every session refused to start until pf was set up again by hand. The job keeps
+  its output in `/var/log/com.levain.pf.log`. If it cannot save its pf token it gives back the reference it took and
+  launchd retries it until the token can be saved, so pf references no longer pile up; while the token's path stays
+  unwritable, the job retries on launchd's throttle.
+- **macOS: a session no longer starts while pf itself is disabled,** even when Levain's rules are loaded. The start is
+  refused with `pf-disabled`.
+- **A chat launch's network mode can only get stricter while it runs.** Turning the standing "open network" default on
+  takes effect from the next chat launch; turning it off still applies at once to launches already running. A read of
+  that setting that fails, is slow or answers too late gates only the request it was read for.
+- **`pip` can install packages in chat again.** Recent `pip` versions check certificates through the macOS system
+  verifier, which the chat sandbox cannot use, so every download failed. The chat environment now sets
+  `PIP_USE_DEPRECATED=legacy-certs`, which makes `pip` use Levain's chat certificate. A `pip` older than that option (such
+  as the 21.x that ships with Xcode's Python) refuses the setting; run it as `env -u PIP_USE_DEPRECATED pip ...`.
+- **More sandbox settings that weaken Claude Code's sandbox are refused.** A repository's `.claude/settings.json` or
+  managed settings that add Mach services (`sandbox.network.allowMachLookup`), allow Apple Events or nested user
+  namespaces, re-allow reads (`sandbox.filesystem.allowRead`) or turn filesystem isolation off
+  (`sandbox.filesystem.disabled`) are now refused by name, as `enableWeakerNetworkIsolation` already was. Allowing
+  `com.apple.trustd.agent` let a sandboxed command make macOS fetch a web address of its choosing, outside Levain's proxy.
+  Such a key holding the wrong type (for example `false` or `""` where a list belongs), or a list holding anything but
+  strings, is refused by key name instead of launching.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - **The graduation engine behind `levain binding graduate`.** Once the binding driver is wired, it takes the steps a
@@ -201,6 +260,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Chat checks that a worker's hooks are still live at every turn** and refuses messages while a check runs; a check
   that cannot run is retried, then turns chat off for that worker until you re-enable it. A stuck worker connection no
   longer freezes chat: a read or an interrupt that does not answer gives up after a bounded wait.
+- **Chat turns a Claude worker off, until you re-enable it, when its stream shows a permission check Levain did not
+  make:** a hook that did not run, an allow rule or a mode Levain did not set (even for a moment), a call accepted with no
+  request to you (except Levain's own gate and reads inside the worker's folder), a control message Levain cannot answer,
+  or lines the worker's stream lost while a tool call was open. When chat turns a worker off after it was live, a review
+  item says which check did it. A control message Levain refuses is answered before chat records it, so a restart never
+  leaves the worker waiting.
+- **The Codex chat connection fails closed under load.** A request whose timeout passes before it is sent is not sent
+  late, and a peer that accepts data slowly cannot stretch a send past its timeout; a send that could not start in time
+  fails only that call. An oversized message, or a WebSocket frame that breaks RFC 6455 section 5 (reserved bits or
+  opcodes, broken fragmentation), closes the connection at once instead of stalling it. Closing it always releases its
+  file descriptors, even while a session callback is stuck.
 - **Dispatch has a runner for its event follower** (`python -m levain.dispatch.follow_run`, with `--store-dir` defaulting to the dispatch store directory): it follows
   CONTROL's event stream, retries a CONTROL that is down with a growing wait, waits five minutes between retries of a
   stop no retry can fix, and stops cleanly on SIGTERM. No installed service runs it yet.

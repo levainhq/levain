@@ -16,6 +16,7 @@ from levain.cli import main as cli
 from levain.consent.dialog import observe
 from levain.consent.listing import audit_line, read_listing
 from levain.consent.queue import ConsentQueue, authority_source
+from tests._h4 import h4_home
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "levain" / "templates"
 
@@ -24,7 +25,7 @@ def _queue(tmp_path: Path) -> ConsentQueue:
     q = tmp_path / "consent"
     q.mkdir(mode=0o700)
     os.chmod(q, 0o700)
-    return ConsentQueue(q, authority=authority_source(q, anchor=None))
+    return ConsentQueue(q, authority=authority_source(q, anchor=None), home=h4_home())
 
 
 def _left(queue, agent, session, tool_name, tool_input, *, hold=60.0, withdraw=True):

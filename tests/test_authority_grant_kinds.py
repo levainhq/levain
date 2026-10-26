@@ -21,6 +21,7 @@ from levain.cockpit.consent import utc_stamp
 from levain.cockpit.firejournal import CockpitDB
 from levain.consent import policy
 from levain.consent.queue import ConsentQueue, authority_source
+from tests._h4 import h4_home
 
 READ = "mcp__fsw__read_text_file"
 PUSH = "pg-0123456789ab"
@@ -48,7 +49,7 @@ class Scratch:
         qdir = tmp_path / "home" / "consent"
         qdir.mkdir(parents=True, mode=0o700)
         self.queue = ConsentQueue(qdir, authority=authority_source(self.root / "cockpit.db",
-                                                                    anchor=anchor_path(self.root)))
+                                                                    anchor=anchor_path(self.root)), home=h4_home())
 
     def sign(self, m: bytes) -> str:
         return subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", str(self.key), "-n", auth.NAMESPACE],
@@ -106,7 +107,7 @@ def test_a_log_holding_an_unknown_kind_replays_and_that_grant_answers_nothing(lo
     request = log.queue.file(agent="claude_code", agent_session_id="s", tool_name=READ,
                              tool_input={"path": str(log.ws / "a")}, cwd=str(log.ws), hold=timedelta(minutes=5))
     assert policy.grant_refusal(push, request, tool_input={"path": str(log.ws / "a")}, posture="default",
-                                now=datetime.now(timezone.utc)) == "not a consent grant"
+                                now=datetime.now(timezone.utc), home=h4_home()) == "not a consent grant"
 
 
 def test_every_other_grant_still_answers(log):

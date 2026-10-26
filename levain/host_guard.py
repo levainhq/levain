@@ -214,9 +214,12 @@ _SANDBOX_TYPES: dict[tuple[str, ...], type] = {
     ("excludedCommands",): list,
     ("enableWeakerNestedSandbox",): bool,
     ("enableWeakerNetworkIsolation",): bool,
+    ("allowAppleEvents",): bool,
+    ("allowNestedUserNamespaces",): bool,
     ("network", "allowLocalBinding"): bool,
     ("network", "allowUnixSockets"): list,
     ("network", "allowAllUnixSockets"): bool,
+    ("network", "allowMachLookup"): list,
     ("network", "strictAllowlist"): bool,
     ("network", "deniedDomains"): list,
     ("filesystem", "disabled"): bool,
@@ -234,11 +237,13 @@ def cc_sandbox_block(entity: str | os.PathLike[str]) -> dict[str, Any]:
         "excludedCommands": [],
         "enableWeakerNestedSandbox": False,
         "enableWeakerNetworkIsolation": False,
+        "allowAppleEvents": False,
+        "allowNestedUserNamespaces": False,
         # strictAllowlist with an empty allowlist: the sandbox's own HTTP proxy denies every host
         # instead of prompting, so `curl http://127.0.0.1:<cockpit>` through $HTTP_PROXY is refused
         # (L2 r1 #3); the loopback names are denied as well in case an allow is merged in.
         "network": {"allowLocalBinding": False, "allowUnixSockets": [], "allowAllUnixSockets": False,
-                    "strictAllowlist": True,
+                    "allowMachLookup": [], "strictAllowlist": True,
                     "deniedDomains": ["localhost", "*.localhost", "127.0.0.1", "::1"]},
         # One list for one fact: every protected name is write-denied to sandboxed Bash, the same
         # set the file-tool policy refuses (L1 r1 #4: two lists had drifted to two of five).
@@ -1451,11 +1456,16 @@ def _db_arg(args: Sequence[Any], expected: str | os.PathLike[str], what: str) ->
     return [], i + 1
 
 
+# The keys of Claude Code's sandbox settings that relax the profile. network.allowMachLookup naming
+# com.apple.trustd.agent opens what enableWeakerNetworkIsolation opens; a run (levain-memory 1026-8/p1)
+# made trustd fetch a URL a sandboxed command chose, outside the proxy.
 _LOOSENING_TRUE = (("allowUnsandboxedCommands",), ("enableWeakerNestedSandbox",),
-                   ("enableWeakerNetworkIsolation",), ("network", "allowAllUnixSockets"),
-                   ("network", "allowLocalBinding"))
-_LOOSENING_NONEMPTY = (("excludedCommands",), ("filesystem", "allowWrite"),
-                       ("network", "allowUnixSockets"), ("network", "allowedDomains"))
+                   ("enableWeakerNetworkIsolation",), ("allowAppleEvents",), ("allowNestedUserNamespaces",),
+                   ("network", "allowAllUnixSockets"), ("network", "allowLocalBinding"),
+                   ("filesystem", "disabled"))
+_LOOSENING_NONEMPTY = (("excludedCommands",), ("filesystem", "allowWrite"), ("filesystem", "allowRead"),
+                       ("network", "allowUnixSockets"), ("network", "allowedDomains"),
+                       ("network", "allowMachLookup"))
 
 
 def _get(d: Any, keys: Sequence[str]) -> Any:
@@ -1527,15 +1537,20 @@ def check_managed_settings(docs: Sequence[tuple[str, Any]], roots: Sequence[Path
             node = sb.get(sub, {})
             for k in sorted((set(node) - allowed) if isinstance(node, Mapping) else {"<not an object>"}):
                 problems.append(f"{path}: sandbox.{sub}.{k} is not a key hosting can vet")
-        for keys, typ in {**_SANDBOX_TYPES, ("filesystem", "denyRead"): list}.items():
+        for keys, typ in {**_SANDBOX_TYPES, ("filesystem", "denyRead"): list,
+                          ("filesystem", "allowRead"): list}.items():
             v = _get(sb, keys)
-            if v is not _MISSING and type(v) is not typ:
+            if v is _MISSING:
+                continue
+            if type(v) is not typ:
                 problems.append(f"{path}: sandbox.{'.'.join(keys)} must be {typ.__name__}, got {type(v).__name__}")
+            elif typ is list and (odd := next((i for i in v if type(i) is not str), _MISSING)) is not _MISSING:
+                # RULINGS 1026-10 Q5 (2): items too, as render's repo check (`repo_loosening_refusals`) requires.
+                problems.append(f"{path}: sandbox.{'.'.join(keys)} must be a list of strings, "
+                                f"holds {type(odd).__name__}")
         for keys in _LOOSENING_TRUE:
             if _get(sb, keys) is True:
                 problems.append(f"{path}: sandbox.{'.'.join(keys)} is true")
-        if _get(sb, ("filesystem", "disabled")) is True:
-            problems.append(f"{path}: sandbox.filesystem.disabled is true")
         if _get(sb, ("network", "strictAllowlist")) is False:
             problems.append(f"{path}: sandbox.network.strictAllowlist is false")
         for keys in (("enabled",), ("failIfUnavailable",)):
@@ -1852,10 +1867,10 @@ _MANAGED_SANDBOX_KEYS = frozenset({k[0] for k in _SANDBOX_TYPES} | {"network", "
 
 
 _MANAGED_NETWORK_KEYS = frozenset({"allowLocalBinding", "allowUnixSockets", "allowAllUnixSockets",
-                                   "strictAllowlist", "deniedDomains"})
+                                   "allowMachLookup", "strictAllowlist", "deniedDomains"})
 
 
-_MANAGED_FILESYSTEM_KEYS = frozenset({"denyWrite", "denyRead", "disabled"})
+_MANAGED_FILESYSTEM_KEYS = frozenset({"denyWrite", "denyRead", "allowRead", "disabled"})
 
 
 _SCRIPT_EXT = re.compile(r"\.(py|sh|bash|zsh|js|mjs|ts|rb|pl)$")

@@ -15,6 +15,7 @@ from levain.consent.adapters import claude_code as cc
 from levain.consent.adapters import codex as cx
 from levain.consent.questions import QuestionStore
 from tests.test_consent_queue import authority, clock, keys, queue  # noqa: F401 - the shared queue fixtures
+from tests._h4 import h4_env
 
 SESSION = "ceedbaa9-2e6d-433f-b374-0ad96dd5f62d"
 OPTS = [("a", "merge now"), ("b", "wait for the run")]
@@ -156,13 +157,13 @@ def test_claude_code_gate_carries_the_answer_on_an_ungated_call(queue):
     store = QuestionStore(queue.directory)
     q = _file(store)
     store.answer(q.id, option="a", channel="phone")
-    out = cc.gate(_pre(agent_id="sub1"), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    out = cc.gate(_pre(agent_id="sub1"), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     assert out is None                                          # a subagent's call: nothing delivered
-    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     ctx = out["hookSpecificOutput"]["additionalContext"]
     assert "question #1" in ctx and ctx.endswith(band.ANSWER_TAIL)
     assert "permissionDecision" not in out["hookSpecificOutput"]   # information only: no decision
-    assert cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u")) is None
+    assert cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env()) is None
 
 
 def test_codex_gate_carries_the_answer(queue):
@@ -171,7 +172,7 @@ def test_codex_gate_carries_the_answer(queue):
     store.answer(q.id, text="go ahead", channel="cli")
     event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"},
              "cwd": "/work/proj", "session_id": SESSION, "turn_id": "t1", "tool_use_id": "c1"}
-    out = cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    out = cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"), environ=h4_env())
     ctx = out["hookSpecificOutput"]["additionalContext"]
     assert '"go ahead"' in ctx and ctx.endswith(band.ANSWER_TAIL)
     assert "permissionDecision" not in out["hookSpecificOutput"]
@@ -182,7 +183,7 @@ def test_a_broken_question_store_never_changes_the_gate(queue, monkeypatch):
         raise RuntimeError("store gone")
 
     monkeypatch.setattr(band, "question_context", boom)
-    assert cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u")) is None
+    assert cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env()) is None
 
 
 def test_question_context_reads_an_empty_or_unset_store_as_none(tmp_path):
@@ -248,7 +249,7 @@ def test_rulings_and_answers_ride_together_and_a_decision_is_kept(queue, monkeyp
     deny = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": "no"}}
     monkeypatch.setattr(cc, "_gate_call", lambda *a, **k: json.loads(json.dumps(deny)))
-    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     spec = out["hookSpecificOutput"]
     assert spec["permissionDecision"] == "deny" and spec["permissionDecisionReason"] == "no"
     lines = spec["additionalContext"].splitlines()
@@ -261,12 +262,12 @@ def test_a_broken_question_store_keeps_the_rulings(queue, monkeypatch):
 
     monkeypatch.setattr(band, "question_context", boom)
     monkeypatch.setattr(cc, "ruling_context", lambda q, s: "RULING LINE")
-    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     assert out["hookSpecificOutput"]["additionalContext"] == "RULING LINE"
     monkeypatch.setattr(cx, "ruling_context", lambda q, s: "RULING LINE")
     event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"},
              "cwd": "/work/proj", "session_id": SESSION, "turn_id": "t1", "tool_use_id": "c1"}
-    out = cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    out = cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"), environ=h4_env())
     assert out["hookSpecificOutput"]["additionalContext"] == "RULING LINE"
 
 
@@ -278,7 +279,7 @@ def test_codex_appends_answers_after_its_own_allow_line(queue, monkeypatch):
     monkeypatch.setattr(cx, "_gate_call", lambda *a, **k: json.loads(json.dumps(allow)))
     event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"},
              "cwd": "/work/proj", "session_id": SESSION, "turn_id": "t1", "tool_use_id": "c1"}
-    out = cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    out = cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"), environ=h4_env())
     lines = out["hookSpecificOutput"]["additionalContext"].splitlines()
     assert lines[0] == "levain: this call is allowed by a grant." and "question #1" in lines[1]
 
@@ -366,8 +367,8 @@ def test_l3r1_a_hard_stop_leaves_the_answer_for_the_next_call(queue, monkeypatch
     stop = {"continue": False, "stopReason": "halt",
             "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny"}}
     monkeypatch.setattr(cc, "_gate_call", lambda *a, **k: json.loads(json.dumps(stop)))
-    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     assert "additionalContext" not in out["hookSpecificOutput"]
     monkeypatch.undo()
-    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     assert "question #1" in out["hookSpecificOutput"]["additionalContext"]

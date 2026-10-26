@@ -24,6 +24,7 @@ from tests.chat_egress.test_classify import frame, route_for
 from tests.test_cockpit_consent_rows import OPEN_DECISIONS
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
+from tests._h4 import h4_home
 
 NARROW = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
 LONG_PATH = "/repos/o/r/git/refs/" + "a" * 400 + "/tail-end"
@@ -47,7 +48,7 @@ def test_a_hostile_egress_card_draws_as_text_rows_with_the_removed_names_before_
     home = tmp_path / "levain_home"
     monkeypatch.setenv("LEVAIN_HOME", str(home))
     (home / "consent").mkdir(parents=True, mode=0o700)
-    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None))
+    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
     file_card(q, _hostile("0b6f5f3e-3c1d-4c8e-9a3e-2d7b1f0c9a11"), agent_session_id="s", cwd="/w")
     gone = file_card(q, _hostile("1c7a6f4e-4d2e-4f9f-8b4f-3e8c2a1d0b22"), agent_session_id="s", cwd="/w")
     q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": "ls"}, cwd="/w",

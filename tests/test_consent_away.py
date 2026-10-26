@@ -18,6 +18,7 @@ from levain.cockpit.firejournal import CockpitDB
 from levain.consent import away
 from levain.consent.adapters import claude_code as cc
 from levain.consent.adapters import codex as cx
+from tests._h4 import h4_home
 
 
 def _cockpit(tmp_path: Path, enrol: bool = True) -> Path:
@@ -353,7 +354,7 @@ def test_a_store_from_before_away_marks_has_no_mark(qdir, capsys):
     """Fix r3 (complement + codex MED), reproduced on 23a1458e: a current-format store made before the away
     tables (neither one there) made `show` say the store is unreadable. It has no mark, and the queue adds them."""
     assert main(["consent", "away", "auto", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
-    cc._queue_for(qdir, away.settings(qdir, "claude_code")).queue_id   # the store, in its current format
+    cc._queue_for(qdir, away.settings(qdir, "claude_code"), home=h4_home()).queue_id   # the store, in its current format
     _drop(qdir / "queue.db", "away_marks", "away_leaves")
     capsys.readouterr()
     assert main(["consent", "away", "show", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
@@ -368,7 +369,7 @@ def test_the_hook_never_recreates_a_lost_away_table(qdir):
     assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
     _drop(qdir / "queue.db", "away_marks")
     started = cc.settings_from(json.loads((qdir / cc.SETTINGS_NAME).read_text()))
-    got = cc.with_away_mark(started, qdir, "claude_code", queue=cc._queue_for(qdir, started))
+    got = cc.with_away_mark(started, qdir, "claude_code", queue=cc._queue_for(qdir, started, home=h4_home()))
     assert got.away_marked and "consent store unreadable at" in got.away_unreadable
     conn = sqlite3.connect(qdir / "queue.db")
     assert "away_marks" not in {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}

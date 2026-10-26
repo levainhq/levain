@@ -29,6 +29,7 @@ from levain.slot.root_tree import VENDOR_PREFIX
 from tests.execve_guard import refuse_real_execve, using
 from tests.test_slot_s2c_end import mine, thread_run_as
 from tests.test_slot_s2f2_runtime_helper import OP_UID, World, _blob, _prepared
+from tests.vendor_tree import vendor_installed, vendor_prefix  # noqa: F401 - autouse, the real vendor check
 
 E0 = SlotId("egress", 0)
 S0, GW0 = 899, 898          # World's _levain_s0 / _levain_gw0
@@ -227,7 +228,23 @@ def test_active_recorded_after_exec(env):
     assert la.states_at_spawn[-1] == R.RENDERED                   # not ACTIVE before the exec
     assert la.states_at_wait[-1] == R.ACTIVE                      # ACTIVE while the vendor runs
     assert w.state(s).state == R.ACTIVE
-    assert w.steps[-9:] == ["kind", "discovery", "repo", "clone", "forwarder", "secrets", "exec", "active", "wait"]
+    assert w.steps[-10:] == ["kind", "vendor", "discovery", "repo", "clone", "forwarder", "secrets", "exec", "active",
+                             "wait"]
+
+
+def test_vendor_not_installed_refused_before_the_clone(env, monkeypatch, tmp_path):
+    """1026+8 VENDOR BINARIES: no root copy at VENDOR_PREFIX/bin/<vendor> = ``vendor-not-installed:<vendor>`` at the
+    ``vendor`` step, before the repo step and the clone (it used to surface as the wall's exec-failed errno 2)."""
+    w, la, _ = env
+    s = _rendered(w)
+    empty = tmp_path / "no-vendor-prefix"
+    (empty / "bin").mkdir(parents=True)
+    monkeypatch.setattr(SS, "vendor_ready", lambda host, vendor: SS.check_vendor_installed(host, vendor, prefix=empty))
+    line = w.main(["start", s])[1]
+    assert line["refused"] == "vendor-not-installed:claude", line
+    assert w.steps[-2:] == ["kind", "vendor"]
+    assert la.of("clone") == [] and la.of("vendor") == []
+    assert w.state(s).state == R.RENDERED
 
 
 def test_failed_exec_records_no_active(env):

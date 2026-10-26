@@ -19,6 +19,7 @@ from levain.authority import anchor_path
 from levain.consent.queue import ConsentQueue, authority_source
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_phone_server import _TOK, _serving, world  # noqa: F401  (world is a fixture)
+from tests._h4 import h4_home
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")  # as test_phone_server
 
@@ -26,7 +27,7 @@ LONG = "x" * 40 + "/very/long/path/with/no/spaces/" * 6 + "\nline two of the req
 
 
 def _file_long(world) -> str:
-    q = ConsentQueue(world["qdir"], authority=authority_source(world["root"] / "cockpit.db", anchor=anchor_path(world["root"])))
+    q = ConsentQueue(world["qdir"], authority=authority_source(world["root"] / "cockpit.db", anchor=anchor_path(world["root"])), home=h4_home())
     return q.file(agent="claude_code", agent_session_id="s", tool_name="Write",
                   tool_input={"file_path": "/w/" + "d/" * 30 + "f.txt", "content": LONG}, cwd="/w",
                   hold=timedelta(minutes=5), tier="T2", event_id="look-T2-1").id

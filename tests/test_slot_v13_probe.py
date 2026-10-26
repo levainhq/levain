@@ -699,6 +699,12 @@ def penv(tmp_path):
     pr.close()
 
 
+def _v1_entry(r):
+    """A /2 entry cut to what render reads: its id, its type and, for an egress route, its hosts (WF-1b: an egress
+    route with no hosts is refused ``base-map-malformed``)."""
+    return {"route": r["route"], "type": r["type"], **({"hosts": r["hosts"]} if r["type"] == "egress" else {})}
+
+
 def _rendered_probe(w):
     from tests.test_slot_s2f3_start import _rendered
 

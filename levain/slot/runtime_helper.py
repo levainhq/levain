@@ -53,7 +53,7 @@ from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
 from levain.slot.ids import SlotId, in_own_range
-from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE, repair_line
+from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE, admits_root, repair_line, store_dir_row
 from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
                                          bind_stdin, ok_line, parse_runtime_argv, parse_stdin, refusal_line)
 
@@ -100,9 +100,8 @@ def _host() -> str:
     return "darwin" if sys.platform == "darwin" else "linux"
 
 
-def _root_trusted(st: os.stat_result) -> bool:
-    """A store directory root may act below: root-owned, not group- or other-writable."""
-    return st.st_uid == 0 and not st.st_mode & 0o022
+#: What a store directory root acts below must be: the layout's root shape (:func:`layout.admits_root`).
+_root_trusted = admits_root
 
 
 def _fchown(fd: int, uid: int, gid: int, rel: str) -> None:
@@ -1017,8 +1016,10 @@ class Store:
             self.fd = -1
 
     def open_dir(self, *parts: str, trusted: bool = True) -> int:
-        """An fd on ``L/<parts…>``. ``trusted``: the LAST component must pass ``seams.trusted`` (every
-        intermediate always must)."""
+        """An fd on ``L/<parts…>``. ``trusted``: the LAST component must be trusted (every intermediate always
+        must): its layout row (:func:`layout.store_dir_row`) is root's, or it has none, and the open dir passes
+        ``seams.trusted``. A dir whose row another account owns is never trusted, whatever is on disk: that account
+        could write where root acts."""
         cur = os.dup(self.fd)
         where = str(self.path)
         try:
@@ -1029,8 +1030,12 @@ class Store:
                 nxt = _openat_dir(cur, p, where)
                 os.close(cur)
                 cur = nxt
-                if (trusted or i < len(parts) - 1) and not self.seams.trusted(os.fstat(cur)):
-                    raise Refused("bad-root", where)
+                if trusted or i < len(parts) - 1:
+                    row = store_dir_row(self.seams.host, parts[:i + 1])
+                    if row is not None and row.owner != "root":
+                        raise Refused("bad-root", f"{where}: its layout row is {row.owner}'s, not root's")
+                    if not self.seams.trusted(os.fstat(cur)):
+                        raise Refused("bad-root", where)
             return cur
         except BaseException:
             os.close(cur)
@@ -1126,9 +1131,13 @@ def configured_slots(store: Store) -> Dict[str, frozenset]:
     return {k: frozenset(v) for k, v in out.items()}
 
 
-def base_route_types(store: Store) -> Dict[str, str]:
-    """``L/routes/base.json`` (§4.3 S1 base map): route id -> its §4.1 type. Interactive and login sessions name
-    base-map ids only (§5.3), so this map is the whole set a render may name."""
+def base_routes(store: Store) -> Tuple[Dict[str, str], Dict[str, Tuple[str, ...]]]:
+    """``L/routes/base.json`` (§4.3 S1 base map), read once: ``(route id -> its §4.1 type, route id -> its hosts)``.
+    Interactive and login sessions name base-map ids only (§5.3), so this map is the whole set a render may name. The
+    hosts are each route's ``hosts`` list as written (render checks each through the policy's host grammar); an
+    ``egress`` route whose ``hosts`` is not a non-empty list of strings is ``base-map-malformed`` (WF-1b: an egress
+    route with no hosts is a refusal, never a session that renders no allow rule). A route of another type without a
+    ``hosts`` list is given none."""
     data = store.read(("routes",), "base.json")
     if data is None:
         raise Refused("base-map-missing", "L/routes/base.json")
@@ -1136,13 +1145,25 @@ def base_route_types(store: Store) -> Dict[str, str]:
     routes = obj.get("routes")
     if obj.get("format") not in BASE_ROUTES_FORMATS or type(routes) is not list:
         raise Refused("base-map-malformed", "format or routes")
-    out: Dict[str, str] = {}
+    types: Dict[str, str] = {}
+    hosts: Dict[str, Tuple[str, ...]] = {}
     for r in routes:
         if type(r) is not dict or type(r.get("route")) is not str or r.get("type") not in RD.ROUTE_TYPES \
-                or r["route"] in out:
+                or r["route"] in types:
             raise Refused("base-map-malformed", "a route")
-        out[r["route"]] = r["type"]
-    return out
+        types[r["route"]] = r["type"]
+        hs = r.get("hosts")
+        ok = type(hs) is list and bool(hs) and all(type(h) is str for h in hs)
+        if r["type"] == "egress" and not ok:
+            raise Refused("base-map-malformed", f"egress route {r['route'][:64]!r} has no hosts")
+        if ok:
+            hosts[r["route"]] = tuple(hs)
+    return types, hosts
+
+
+def base_route_types(store: Store) -> Dict[str, str]:
+    """:func:`base_routes`' types alone (``start``'s secret names need no hosts)."""
+    return base_routes(store)[0]
 
 
 # --- the slot state file (§3.5 Pool) ---------------------------------------------------------------------------------
@@ -1703,9 +1724,10 @@ class RenderRun:
 
 
 def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
-    """The alloc facts ``render.render`` needs (§7.1: root acts on alloc only), plus the base map's route types,
-    the slot's /var/folders (macOS), ``TERM`` from the supervisor's env when it is a plain terminal name, and the
-    hook templates the blob names (a missing one is refused by name in ``render.check_facts``)."""
+    """The alloc facts ``render.render`` needs (§7.1: root acts on alloc only), plus the base map's route types and
+    hosts (one read, :func:`base_routes`), the slot's /var/folders (macOS), ``TERM`` from the supervisor's env when it
+    is a plain terminal name, and the hook templates the blob names (a missing one is refused by name in
+    ``render.check_facts``)."""
     seams = ctx.seams
     slot = alloc.slot
     egress = slot.slot_class == "egress"
@@ -1719,10 +1741,11 @@ def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
     term = ctx.env.get("TERM")
     if term is not None and not RD._TERM_RE.fullmatch(term):
         term = None
+    route_types, route_hosts = base_routes(ctx.store)
     return RD.RenderFacts(
         host=seams.host, session=alloc.session, slot=slot, kind=alloc.kind, vendor=alloc.vendor, auth=alloc.auth,
         slot_uid=owner, slot_gid=owner, gwport=RD.gwport_for(seams.host, slot) if egress else None,
-        route_types=base_route_types(ctx.store), term=term, var_folders=folders,
+        route_types=route_types, route_hosts=route_hosts, term=term, var_folders=folders,
         driver_uid=None if egress else alloc.slot_uid, driver_gid=None if egress else alloc.slot_gid,
         hook_templates={k: v for k, v in seams.hook_templates.items() if k in blob.hooks})
 
@@ -3418,7 +3441,7 @@ __all__ = ["BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ctx", "DirRo
            "FRONT_DROPPED_FIELDS", "FRONT_LOG_MODE", "FRONT_LOG_NAME", "FRONT_MODULE", "FRONT_POLICY_NAME", "GO_BYTE", "GO_FD", "GO_FD_ENV",
            "Leased", "LinkedNotDurable", "PREPARE_RESULT_FORMAT",
            "RENDER_STEPS", "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS",
-           "CHECK_S", "capture_target", "configured_slots", "drain", "reap_within", "wait_child_within", "ENTRY_ENV", "entry_env",
+           "CHECK_S", "base_routes", "capture_target", "configured_slots", "drain", "reap_within", "wait_child_within", "ENTRY_ENV", "entry_env",
            "create_alloc", "create_at", "kill_front", "lease_slot", "main", "make_cgroup", "open_slot_owned_dir",
            "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
            "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",

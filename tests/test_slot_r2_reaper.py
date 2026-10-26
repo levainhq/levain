@@ -9,6 +9,7 @@ import os
 from levain.slot import records as R
 from levain.slot import runtime_helper as H
 from tests.test_slot_s2f3_start import E0, _started, _world
+from tests.vendor_tree import vendor_installed, vendor_prefix  # noqa: F401 - autouse, the real vendor check
 
 
 def _reaper(w):

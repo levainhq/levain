@@ -68,6 +68,7 @@ from levain.consent.policy import targets as _targets
 from levain.consent.auto_away import DEFAULT_HOLDS, IDLE_THRESHOLD, WORDS, away_state, hold_seconds
 from levain.consent.queue import (
     DB_NAME, AwayMark, ConsentQueue, Decision, authority_source, default_queue_dir, gap_label,
+    queue_dir_for,
 )
 from levain.consent.adapters.rules import (  # noqa: F401 - the rules' one home; re-exported under these names
     CLAUDE_CODE_AGENT, CLAUDE_CONFIG_DIRS, CLEANUP_RESERVE, CONFIG_FILE_NAMES, DEFAULT_MAX_HOLD, GIT_STATE_DIRS,
@@ -196,36 +197,39 @@ def _seconds(value: Any, default: float, *, positive: bool = False) -> float:
 
 
 def _absolute_root(root: Any) -> str | None:
-    """``root`` canonicalized (``~`` expanded, symlinks resolved) when it is ABSOLUTE after ``~`` expansion; else
-    ``None`` (no authority). A relative path is never resolved: the hook runs in the project's directory, and a
-    repository must not be able to supply the authority it is judged by."""
+    """``root`` canonicalized (symlinks resolved) when it is ABSOLUTE as written; else ``None`` (no authority). A
+    ``~`` is never expanded (H4: this reads no home; ``levain init`` writes the real path), so a ``~/...`` root is
+    ``None``, the safe direction: no signed answer verifies. A relative path is never resolved: the hook runs in the
+    project's directory, and a repository must not be able to supply the authority it is judged by."""
     if not isinstance(root, str) or not root or "\x00" in root:
         return None
     try:
-        expanded = Path(root).expanduser()
-        if not expanded.is_absolute():
+        written = Path(root)
+        if not written.is_absolute():
             return None
-        return os.path.realpath(expanded)
+        return os.path.realpath(written)
     except (OSError, ValueError, RuntimeError):
         return None
 
 
-def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path | None = None,
+def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path, environ: Mapping[str, str],
                     cwd: str | None = None) -> tuple[Path, ...]:
     """What the adapter itself trusts, so a file tool writing any of it is agent config (codex Q2 r1 #1): the
     queue directory (the adapter settings and the queue database live in it); the whole levain home, the
     directory the confinement floor denies (:func:`levain.firing.confinement.levain_home_spellings`, one
     derivation for both), so a write to the autonomic binding store or any other operator state there is a tagged
     request (14b Q5); and, when a cockpit data root is configured, its authority database (and sqlite's sidecars)
-    and the authority anchor. ``home`` is the one :func:`targets_agent_config` expands ``~`` under (default the
-    user's); ``cwd``, when absolute, stands in for the workspace. A levain home the floor's own predicate finds too
-    wide to deny whole (:func:`levain.firing.confinement.too_wide_to_deny`: a filesystem root, a path of two parts
-    or fewer, a shared temp directory, or one holding the home or the cwd) is named by its state directories instead
+    and the authority anchor. ``home`` is the one :func:`targets_agent_config` expands ``~`` under and ``environ``
+    the one whose ``LEVAIN_HOME`` names the levain home (both required: the hook binds them once at its top);
+    ``cwd``, when absolute, stands in for the workspace. A levain home the floor's own predicate finds too
+    wide to deny whole (:func:`levain.firing.confinement.too_wide_to_deny` holds the rules: a filesystem root, a path
+    of two parts or fewer, a shared temp directory, or one holding the home or the cwd; the event's cwd is passed as
+    its ``within``) is named by its state directories instead
     (:data:`levain.firing.confinement.LEVAIN_HOME_STATE_DIRS`, the floor's fallback list), or every file under it
     would be agent config. Never raises on the levain home: one that cannot be resolved is ``<home>/.levain``
     (fail closed for the store, never an outage of every tool). Bash is still never parsed: a shell write there
     is not tagged here."""
-    out = [Path(os.path.abspath(queue_dir)), *levain_home_protected(home, cwd)]
+    out = [Path(os.path.abspath(queue_dir)), *levain_home_protected(home, cwd, environ=environ)]
     if settings.cockpit_data_root:
         root = Path(settings.cockpit_data_root)
         db = root / "cockpit.db"
@@ -233,14 +237,14 @@ def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path | 
     return tuple(out)
 
 
-def levain_home_protected(home: Path | None, cwd: str | None) -> list[Path]:
-    """:func:`protected_paths`' share of the levain home; never raises. Also what :func:`queue_unresolved` (and
-    Codex's) classify with when no queue directory could be resolved."""
+def levain_home_protected(home: Path | None, cwd: str | None, *, environ: Mapping[str, str]) -> list[Path]:
+    """:func:`protected_paths`' share of the levain home, named by ``LEVAIN_HOME`` in ``environ``; never raises.
+    Also what :func:`queue_unresolved` (and Codex's) classify with when no queue directory could be resolved."""
     from levain.firing.confinement import LEVAIN_HOME_STATE_DIRS, levain_home_spellings, too_wide_to_deny  # lazy
 
     try:
         user_home = Path(home) if home is not None else Path.home()
-        base, spellings = levain_home_spellings(user_home)
+        base, spellings = levain_home_spellings(user_home, environ=environ)
         try:
             within = (Path(cwd),) if isinstance(cwd, str) and os.path.isabs(cwd) else ()
             if any(too_wide_to_deny(d, user_home, *within) for d in spellings):
@@ -254,7 +258,7 @@ def levain_home_protected(home: Path | None, cwd: str | None) -> list[Path]:
         user_home = Path(home) if home is not None else Path.home()
     except Exception:  # noqa: BLE001 - no $HOME: the password database's
         try:
-            user_home = operator_home()
+            user_home = operator_home(os.environ)
         except Exception:  # noqa: BLE001 - no home at all: nothing there to protect
             return []
     return [Path(os.path.abspath(user_home / ".levain"))]
@@ -281,17 +285,18 @@ _DIR_PROBES = ("x", "settings.json", "hooks.json", "config.toml", USER_CONFIG_NA
 
 
 def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], sites: tuple[str, ...],
-                     user_configs: frozenset[str], git_cache: dict[Any, Any] | None = None) -> bool:
+                     user_configs: frozenset[str], git_cache: dict[Any, Any] | None = None, *,
+                     user_roots: tuple[str, ...], environ: Mapping[str, str]) -> bool:
     """For an MCP tool's every-string candidates only (:func:`levain.consent.policy.mcp_config_candidates`): True
     when a server given ``target`` as a directory and a file name in another field could write agent config:
     ``target`` (``~`` expanded, joined to ``cwd``; as written and resolved) holds a file the path checks of
     :func:`targets_agent_config` tag (each of :data:`_DIR_PROBES` directly inside it, so the directory list is
     derived from those checks, never spelled twice) or directly one of ``roots`` (a protected file such as the
     authority database, :func:`protected_paths`), or its file name is ``.claude.json`` wherever it sits (a
-    server that joins a relative name to a root of its own, home among them). ``roots``, ``sites`` and
-    ``user_configs`` are the caller's, computed once. An over-match costs a gated call: the request goes to the
-    human, or, when no enrolled key can sign T3 outside ``default``, the call is refused (the
-    Q10 floor) and the agent reads why."""
+    server that joins a relative name to a root of its own, home among them). ``roots``, ``sites``,
+    ``user_configs`` and ``user_roots`` (:func:`user_site_roots`) are the caller's, computed once. An over-match
+    costs a gated call: the request goes to the human, or, when no enrolled key can sign T3 outside ``default``,
+    the call is refused (the Q10 floor) and the agent reads why."""
     raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
     if not raw.is_absolute():
         raw = Path(cwd) / raw
@@ -301,38 +306,40 @@ def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], 
         if p.name.lower() == USER_CONFIG_NAME or str(p).lower() in parents:
             return True
         for probe in _DIR_PROBES:
-            if _tags_path(p / probe, cwd, roots, sites, user_configs, git_cache):
+            if (_tags_path(p / probe, cwd, roots, sites, user_configs, git_cache, environ=environ)
+                    or in_user_site(p / probe, user_roots)):
                 return True
     return False
 
 
 def _tags_path(path: Path, cwd: str, roots: tuple[str, ...], sites: tuple[str, ...], user_configs: frozenset[str],
-               git_cache: dict[Any, Any] | None = None) -> bool:
+               git_cache: dict[Any, Any] | None = None, *, environ: Mapping[str, str]) -> bool:
     """One spelling of a target path (already normalised or resolved) is agent config or the hook's own code."""
     return (_is_config_path(path) or _under(path, roots) or str(path).lower() in user_configs
-            or _redirects_the_import(path, sites) or _under_hooks_path(path, cwd, git_cache))
+            or _redirects_the_import(path, sites) or _under_hooks_path(path, cwd, git_cache, environ=environ))
 
 
 # --- where git runs hooks from (L3 r2 G1'): asked of git, never read out of its config ------------------------------
 
-def operator_home() -> Path:
+def operator_home(environ: Mapping[str, str]) -> Path:
     """The operator's home directory from the password database, not ``$HOME`` (which the agent's environment
-    sets): the home the operator's own shell and git read the user's git config from."""
+    sets): the home the operator's own shell and git read the user's git config from. Only when the database has
+    no entry, ``environ["HOME"]``; a ``KeyError`` when that is unset too (no guess)."""
     try:
         return Path(pwd.getpwuid(os.getuid()).pw_dir)
     except (KeyError, OSError):
-        return Path(os.path.expanduser("~"))
+        return Path(environ["HOME"])
 
 
-def global_git_configs(home: Path) -> tuple[Path, ...]:
+def global_git_configs(home: Path, *, environ: Mapping[str, str]) -> tuple[Path, ...]:
     """The user-level git config files, tagged by full path: ``~/.gitconfig`` and ``~/.config/git/config`` for
     ``home`` (where a ``~`` in a target expands) and for :func:`operator_home`, ALWAYS, whatever
     ``$XDG_CONFIG_HOME`` says (an agent-set value must not move the protected file), plus
-    ``$XDG_CONFIG_HOME/git/config`` when that variable is set to an absolute path."""
+    ``$XDG_CONFIG_HOME/git/config`` when that variable is set to an absolute path in ``environ``."""
     out: list[Path] = []
-    for h in dict.fromkeys((Path(home), operator_home())):
+    for h in dict.fromkeys((Path(home), operator_home(environ))):
         out += [h / ".gitconfig", h / ".config" / "git" / "config"]
-    xdg = os.environ.get("XDG_CONFIG_HOME")
+    xdg = environ.get("XDG_CONFIG_HOME")
     if xdg and os.path.isabs(xdg):
         out.append(Path(xdg) / "git" / "config")
     return tuple(out)
@@ -341,13 +348,13 @@ def global_git_configs(home: Path) -> tuple[Path, ...]:
 GIT_TAGGED = "tagged"                # a repository answer that tags every target asked of it (fail closed)
 
 
-def _git_envs() -> list[dict[str, str]]:
+def _git_envs(environ: Mapping[str, str]) -> list[dict[str, str]]:
     """The environments git is asked in: ``PATH`` = ``os.defpath``, ``HOME`` from :func:`operator_home`,
-    ``LANG``/``LC_ALL`` = ``C``, nothing else (no ``GIT_*``, no ``XDG_*``); and, when this process's
+    ``LANG``/``LC_ALL`` = ``C``, nothing else (no ``GIT_*``, no ``XDG_*``); and, when ``environ``'s
     ``XDG_CONFIG_HOME`` is absolute, the same with it set (L3 r3 G1: the operator's own git reads its global config
     there). Both answers count."""
-    base = {"PATH": os.defpath, "HOME": str(operator_home()), "LANG": "C", "LC_ALL": "C"}
-    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = {"PATH": os.defpath, "HOME": str(operator_home(environ)), "LANG": "C", "LC_ALL": "C"}
+    xdg = environ.get("XDG_CONFIG_HOME")
     return [base, {**base, "XDG_CONFIG_HOME": xdg}] if xdg and os.path.isabs(xdg) else [base]
 
 
@@ -357,7 +364,7 @@ def _git_budget(cache: dict[Any, Any]) -> dict[str, Any]:
     return cache.setdefault("git", {"scopes": {}, "asked": {}, "queries": 0, "deadline": None})
 
 
-def _ask_git(directory: str, state: dict[str, Any]) -> frozenset[Path] | str:
+def _ask_git(directory: str, state: dict[str, Any], *, environ: Mapping[str, str]) -> frozenset[Path] | str:
     """``git -C <directory> rev-parse --path-format=absolute --show-toplevel --git-path hooks``, one spawn per
     environment (:func:`_git_envs`): git's own answer to where the repository holding ``directory`` runs hooks from
     (``core.hooksPath`` from every config file git reads, includes, linked worktrees and submodules applied), the
@@ -380,7 +387,7 @@ def _ask_git(directory: str, state: dict[str, Any]) -> frozenset[Path] | str:
         state["deadline"] = time.monotonic() + GIT_BUDGET_SECONDS
     hooks: set[Path] = set()
     top: str | None = None
-    for env in _git_envs():
+    for env in _git_envs(environ):
         left = state["deadline"] - time.monotonic()
         if left <= 0:
             return GIT_TAGGED
@@ -412,7 +419,7 @@ def _ask_git(directory: str, state: dict[str, Any]) -> frozenset[Path] | str:
     return answer
 
 
-def _git_answer(directory: Path, cache: dict[Any, Any]) -> frozenset[Path] | str:
+def _git_answer(directory: Path, cache: dict[Any, Any], *, environ: Mapping[str, str]) -> frozenset[Path] | str:
     """The hooks directories of the repository holding ``directory`` (real, existing): an answer already in
     ``cache`` for a repository top-level (or a no-repository ancestor) reached from ``directory`` without passing a
     directory that could start another repository (one holding a ``.git`` or a ``HEAD``, or a mount point), else
@@ -429,7 +436,7 @@ def _git_answer(directory: Path, cache: dict[Any, Any]) -> frozenset[Path] | str
         if os.path.lexists(d / ".git") or os.path.lexists(d / "HEAD") or os.path.ismount(d) or d.parent == d:
             break
         d = d.parent
-    state["asked"][key] = got = _ask_git(key, state)
+    state["asked"][key] = got = _ask_git(key, state, environ=environ)
     return got
 
 
@@ -441,7 +448,8 @@ def _nearest_dir(start: Path) -> Path:
     return d
 
 
-def _under_hooks_path(path: Path, cwd: str, cache: dict[Any, Any] | None = None) -> bool:
+def _under_hooks_path(path: Path, cwd: str, cache: dict[Any, Any] | None = None, *,
+                      environ: Mapping[str, str]) -> bool:
     """``path`` lies under a directory git runs hooks from (husky's ``.husky/``, a ``.githooks/``, an absolute
     ``core.hooksPath`` outside the worktree) for the repository of the event's ``cwd`` (its nearest existing
     directory) or of the target's nearest existing ancestor directory, as git answers (:func:`_git_answer`), the
@@ -452,15 +460,15 @@ def _under_hooks_path(path: Path, cwd: str, cache: dict[Any, Any] | None = None)
         dirs = [_nearest_dir(Path(cwd))] if cwd and os.path.isabs(cwd) else []
         dirs.append(_nearest_dir(path.parent))
         for d in dirs:
-            got = _git_answer(Path(os.path.realpath(d)), cache)
+            got = _git_answer(Path(os.path.realpath(d)), cache, environ=environ)
             if isinstance(got, str):   # GIT_TAGGED
                 return True
             hooks = tuple({s for h in got for s in (os.path.normpath(h).lower(), os.path.realpath(h).lower())})
             if _under(path, hooks):
                 return True
         return False
-    except (OSError, ValueError):
-        return True   # a path that cannot be examined is tagged, as the other checks do
+    except (OSError, ValueError, KeyError):
+        return True   # a path that cannot be examined (or no operator home to ask git as) is tagged
 
 
 def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bool:
@@ -530,6 +538,34 @@ def import_site_dirs() -> tuple[str, ...]:
     return tuple({os.path.realpath(d).lower() for d in dirs if d})
 
 
+def user_site_roots(home: Path, *, environ: Mapping[str, str]) -> tuple[str, ...]:
+    """The operator's Python user-site trees :func:`in_user_site` protects, lowercased, each as written and resolved:
+    the floor's own derivation (``levain.firing.confinement.python_user_site_roots``: ``~/.local/lib``, macOS's
+    ``~/Library/Python``, an absolute ``$PYTHONUSERBASE``'s ``lib``), for ``home`` (where a ``~`` in a target
+    expands) and for :func:`operator_home`, each only when absolute. Whatever THIS interpreter's
+    ``site.ENABLE_USER_SITE`` says: a venv's is False, and the operator's other, non-venv Pythons still run a
+    ``.pth``, ``usercustomize.py`` or package planted there. ``environ`` names the operator (:func:`operator_home`)
+    and any ``$PYTHONUSERBASE``. Kept apart from :func:`import_site_dirs`, which answers only what redirects
+    this interpreter's ``import levain``."""
+    from levain.firing.confinement import python_user_site_roots  # lazy: keep this module light
+
+    out: dict[str, None] = {}
+    for h in dict.fromkeys((Path(home), operator_home(environ))):
+        if not h.is_absolute():   # an empty pw_dir is ``.``: no tree, never one relative to where the hook runs
+            continue
+        for root, _label in python_user_site_roots(h, environ)[0]:
+            for spelled in (os.path.normpath(root), os.path.realpath(root)):
+                out[spelled.lower()] = None
+    return tuple(out)
+
+
+def in_user_site(path: Path, roots: tuple[str, ...]) -> bool:
+    """``path`` (one spelling, normalised or resolved, as :func:`_tags_path` takes it) is one of ``roots``
+    (:func:`user_site_roots`) or lies under one."""
+    p = str(path).lower()
+    return any(p == r or p.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
 def _redirects_the_import(path: Path, sites: tuple[str, ...]) -> bool:
     """A site-directory entry that decides what ``import levain`` loads: a ``levain`` package or module, a
     ``levain-*.dist-info``, an ``__editable__`` levain finder, or any ``.pth`` / ``sitecustomize.py`` /
@@ -549,7 +585,7 @@ def _redirects_the_import(path: Path, sites: tuple[str, ...]) -> bool:
     return False
 
 
-def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
+def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path, environ: Mapping[str, str],
                          protected: Iterable[Path] = (), git_cache: dict[Any, Any] | None = None) -> bool:
     """True when a file tool (Edit/Write/MultiEdit/NotebookEdit) or an MCP tool targets an agent's config or hooks,
     in the workspace or the home directory: a ``.claude/settings*.json``; anything under a ``.claude/`` ``hooks``,
@@ -562,7 +598,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     repository of ``cwd`` or of the target (:func:`_under_hooks_path`: ``core.hooksPath`` wherever it points), and
     the user's git config files (:func:`global_git_configs`), never ``.gitignore`` or ``.gitattributes``; anything under a ``.claude-plugin/`` directory, or
     under ``hooks/`` beside one (a plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
-    it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); or any of
+    it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); anything in an
+    operator's Python user site, whatever this interpreter's own flag (:func:`in_user_site`); or any of
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
     tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and every
     other string in its input (:func:`levain.consent.policy.mcp_config_candidates`: a server can name its path in a
@@ -583,18 +620,18 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             return True
         extra = got
         targets = [*targets, *extra]
-    home = home if home is not None else Path.home()
     try:
         roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}
                       | {levain_package_dir().lower()})
         sites = import_site_dirs()
+        user_roots = user_site_roots(home, environ=environ)
         git_cache = git_cache if git_cache is not None else {}   # git asked once per repository, in one budget, per call
         home = Path(home)
         # by full path: the home's ``.claude.json`` and the user's git config files (``~/.gitconfig``,
         # ``~/.config/git/config``, the XDG one), which every repository reads executables from (L3 r1 G1c, r2 G1')
-        user_configs = frozenset({s for f in (home / USER_CONFIG_NAME, *global_git_configs(home))
+        user_configs = frozenset({s for f in (home / USER_CONFIG_NAME, *global_git_configs(home, environ=environ))
                                   for s in (os.path.normpath(f).lower(), os.path.realpath(f).lower())})
-    except (OSError, ValueError, ImportError, TypeError):
+    except (OSError, ValueError, ImportError, TypeError, KeyError):
         return True
     for target in targets:
         if not isinstance(target, str) or not target:
@@ -607,11 +644,14 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             resolved = Path(os.path.realpath(raw))
         except (OSError, ValueError):
             return True
-        if (_tags_path(written, cwd, roots, sites, user_configs, git_cache)
-                or _tags_path(resolved, cwd, roots, sites, user_configs, git_cache)):
+        if (_tags_path(written, cwd, roots, sites, user_configs, git_cache, environ=environ)
+                or _tags_path(resolved, cwd, roots, sites, user_configs, git_cache, environ=environ)
+                or in_user_site(written, user_roots) or in_user_site(resolved, user_roots)):
             return True
     try:
-        return any(names_config_dir(target, cwd, home, roots, sites, user_configs, git_cache) for target in extra)
+        return any(names_config_dir(target, cwd, home, roots, sites, user_configs, git_cache, user_roots=user_roots,
+                                    environ=environ)
+                   for target in extra)
     except (OSError, ValueError):
         return True
 
@@ -690,7 +730,9 @@ def away_mark_of(queue_dir: Path, settings: AdapterSettings, agent: str, *, queu
         return None
     if isinstance(queue, ConsentQueue):
         return queue.away_mark(agent)
-    return _queue_for(Path(queue_dir), settings).away_mark(agent, as_is=True)
+    # a queue opened here reads only the mark (never a grant), so the home it holds decides nothing: the caller's
+    # process home, as before (not the core path: the hooks and the chat core pass their own ``queue``)
+    return _queue_for(Path(queue_dir), settings, home=Path.home()).away_mark(agent, as_is=True)
 
 
 def with_away_mark(settings: AdapterSettings, queue_dir: Path, agent: str, *, queue: Any = None) -> AdapterSettings:
@@ -764,9 +806,9 @@ def hold_for_answer(queue: ConsentQueue, request: ExternalGateRequest, wait: flo
             return None, why
 
 
-def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_hold: float = DEFAULT_MAX_HOLD,
-           policy: Policy | None = None,
-           home: Path | None = None, clock: Callable[[], float] = time.monotonic,
+def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, environ: Mapping[str, str], home: Path,
+           claude_pid: int | None = None, max_hold: float = DEFAULT_MAX_HOLD,
+           policy: Policy | None = None, clock: Callable[[], float] = time.monotonic,
            idle: Callable[[], float | None] | None = None,
            still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The hook's output for one event, or ``None`` for no decision. Raises on anything unexpected (after
@@ -802,9 +844,9 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     posture = mode if isinstance(mode, str) and mode else None
     if policy is None and nothing_can_decide(settings):
         return None
-    protected = protected_paths(Path(queue.directory), settings, home=home, cwd=cwd)
-    agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected)
-    if agent_config and unconfined(cwd, home=home):
+    protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
+    agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected)
+    if agent_config and unconfined(cwd, home=home, environ=environ):
         return None  # an unconfined session (Q10 D2): its dialog answers, as the gate left the call to its mode (L1-7)
     if agent_config:
         # the gate already asked the operator about this call and delivered an allow, and Claude Code shows its
@@ -818,7 +860,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER,
                          event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
-                         resume=resume_meta_of(event), model=event.get("model"))
+                         resume=resume_meta_of(event, environ=environ, claude_pid=claude_pid),
+                         model=event.get("model"))
     settled = False
     try:
         got: Decision | None = None
@@ -939,23 +982,23 @@ SYSTEM_SETTINGS_FILES: tuple[tuple[str, Path], ...] = (
 )
 
 
-def _settings_files(cwd: str | None, home: Path | None, codex_home: Path | None) -> list[tuple[str, Path]]:
+def _settings_files(cwd: str | None, home: Path, codex_home: Path | None, *,
+                    environ: Mapping[str, str]) -> list[tuple[str, Path]]:
     """Every settings file an agent session started in ``cwd`` can load an environment from, as (``json`` | ``toml``,
     path): Claude Code's user settings (``$CLAUDE_CONFIG_DIR`` or ``~/.claude``), Codex's ``config.toml`` (its home),
     the machine-wide :data:`SYSTEM_SETTINGS_FILES`, and in ``cwd``, ``$CLAUDE_PROJECT_DIR`` and each of their ancestors up to ``/`` (as written and resolved: Claude
     Code reads a project's settings at its repository root) ``.claude/settings.json``, ``.claude/settings.local.json``
-    and ``.codex/config.toml``."""
-    home = home if home is not None else Path.home()
+    and ``.codex/config.toml``. Every variable is read from ``environ``."""
     out: list[tuple[str, Path]] = []
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = environ.get("CLAUDE_CONFIG_DIR")
     for d in ([Path(config_dir)] if config_dir else []) + [home / ".claude"]:
         out.append(("json", d / "settings.json"))
-    env_codex = os.environ.get("CODEX_HOME")
+    env_codex = environ.get("CODEX_HOME")
     for d in ([codex_home] if codex_home is not None else []) + ([Path(env_codex)] if env_codex else []) \
             + [home / ".codex"]:
         out.append(("toml", d / "config.toml"))
     out += list(SYSTEM_SETTINGS_FILES)
-    for start in (cwd, os.environ.get("CLAUDE_PROJECT_DIR")):
+    for start in (cwd, environ.get("CLAUDE_PROJECT_DIR")):
         if not isinstance(start, str) or not start:
             continue
         for p in {Path(os.path.abspath(start)), Path(os.path.realpath(start))}:
@@ -1004,24 +1047,26 @@ def _sets_unconfined(kind: str, path: Path, name: str = UNCONFINED_ENV) -> bool:
         return True
 
 
-def unconfined_state(cwd: str | None, *, home: Path | None = None, codex_home: Path | None = None) -> str | None:
+def unconfined_state(cwd: str | None, *, home: Path, environ: Mapping[str, str],
+                     codex_home: Path | None = None) -> str | None:
     """``"on"`` when the operator started this session unconfined: :data:`UNCONFINED_ENV` is exactly ``"1"`` in the
     hook's environment and no settings file the session can load sets it (:func:`_settings_files`; the hook cannot
     tell a variable a settings file's ``env`` put there from one the operator's shell did, so a cloned repository's
     ``.claude/settings.json`` could otherwise turn the gate off, L2-1). ``"ignored"`` when it is ``"1"`` but such a
     file sets it, or cannot be ruled out (:func:`_sets_unconfined`). ``None`` when it is not ``"1"``."""
-    if os.environ.get(UNCONFINED_ENV) != "1":
+    if environ.get(UNCONFINED_ENV) != "1":
         return None
-    files = _settings_files(cwd, home, codex_home)
+    files = _settings_files(cwd, home, codex_home, environ=environ)
     return "ignored" if any(_sets_unconfined(kind, path) for kind, path in files) else "on"
 
 
-def unconfined(cwd: str | None, *, home: Path | None = None, codex_home: Path | None = None) -> bool:
+def unconfined(cwd: str | None, *, home: Path, environ: Mapping[str, str], codex_home: Path | None = None) -> bool:
     """Whether the operator started this session unconfined (:func:`unconfined_state` is ``"on"``)."""
-    return unconfined_state(cwd, home=home, codex_home=codex_home) == "on"
+    return unconfined_state(cwd, home=home, environ=environ, codex_home=codex_home) == "on"
 
 
-def queue_socket_planted(cwd: str | None, *, home: Path | None = None, codex_home: Path | None = None) -> bool:
+def queue_socket_planted(cwd: str | None, *, home: Path, environ: Mapping[str, str],
+                         codex_home: Path | None = None) -> bool:
     """True when a settings file this session can load (:func:`_settings_files`) mentions the slot's broker socket
     variable (:data:`levain.consent.broker_client.SOCKET_ENV`), or that cannot be ruled out (:func:`_sets_unconfined`'s
     rules). A slot's launcher sets it in the agent's environment, never in a settings file, and a hook cannot tell a
@@ -1030,7 +1075,8 @@ def queue_socket_planted(cwd: str | None, *, home: Path | None = None, codex_hom
     then (:func:`slot_gate`)."""
     from levain.consent.broker_client import SOCKET_ENV
 
-    return any(_sets_unconfined(kind, path, SOCKET_ENV) for kind, path in _settings_files(cwd, home, codex_home))
+    return any(_sets_unconfined(kind, path, SOCKET_ENV)
+               for kind, path in _settings_files(cwd, home, codex_home, environ=environ))
 
 
 def floor_text(what: str, state: str | None) -> str:
@@ -1064,12 +1110,12 @@ def gate_timeout(hold: float) -> int:
 GATE_TIMEOUT = gate_timeout(GATE_HOLD_CEILING)
 
 
-def gate_class(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
+def gate_class(tool_name: str, tool_input: Any, cwd: str, *, home: Path, environ: Mapping[str, str],
                protected: Iterable[Path] = ()) -> str | None:
     """The gate's tier for a call: ``irreversible`` (T3, agent config and hooks, which is Q10's floor and Q14's
     irreversible tier at once, R-h), ``reversible``, or ``None`` (not gated). Bash is never parsed (ruling 1, R-g).
     THE SEAM for B6: the push executor's tool joins here as ``irreversible``."""
-    if targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected):
+    if targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected):
         return "irreversible"
     return None
 
@@ -1266,7 +1312,8 @@ def ruling_line(queue: ConsentQueue, ruling: Any, *, quote: bool = False) -> str
     return text.format(n=ruling.gap, x=f"«{what}»" if quote else what)
 
 
-def resume_meta_of(event: Mapping[str, Any]) -> dict[str, Any] | None:
+def resume_meta_of(event: Mapping[str, Any], *, environ: Mapping[str, str],
+                   claude_pid: int | None) -> dict[str, Any] | None:
     """What a later resume of this hook's session needs (:meth:`ConsentQueue.file`'s ``resume``), or ``None`` when its
     session id is not a UUID (it would be an argument of the resume, :func:`levain.consent.delivery.session_ok`).
     From the hook's payload, the environment Claude Code gives its hooks and the OS: ``-p`` when the entrypoint is an
@@ -1275,20 +1322,23 @@ def resume_meta_of(event: Mapping[str, Any]) -> dict[str, Any] | None:
     (``CLAUDE_PROJECT_DIR``, where its transcript is found), its config directory, its process (``CLAUDE_PID``) and
     that process's start time and the option names of its command line as ``ps`` reports them
     (:func:`levain.consent.delivery.process_identity`: the start time tells it from a later process that reused the
-    pid; the option names say what a resume would drop; values and the prompt are never recorded)."""
+    pid; the option names say what a resume would drop; values and the prompt are never recorded). The variables
+    are read from ``environ``; ``claude_pid``, when not ``None``, is the process instead of ``CLAUDE_PID``."""
     from levain.consent.delivery import option_names, process_identity, session_ok
 
     if not session_ok(event.get("session_id")):
         return None
-    entry = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
-    project = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    entry = environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    project = environ.get("CLAUDE_PROJECT_DIR", "")
     cwd = project if os.path.isabs(project) else event.get("cwd")
     mode = event.get("permission_mode")
-    config = os.environ.get("CLAUDE_CONFIG_DIR", "")
-    try:
-        pid: int | None = int(os.environ.get("CLAUDE_PID", ""))
-    except ValueError:
-        pid = None
+    config = environ.get("CLAUDE_CONFIG_DIR", "")
+    pid: int | None = claude_pid
+    if pid is None:
+        try:
+            pid = int(environ.get("CLAUDE_PID", ""))
+        except ValueError:
+            pid = None
     pid = pid if pid is not None and pid > 0 else None
     seen = process_identity(pid) if pid is not None else None
     return {"invocation": "-p" if entry.startswith("sdk") else "interactive",
@@ -1308,7 +1358,7 @@ def _session_of(event: Mapping[str, Any]) -> str | None:
     return f"{session}#agent:{agent_id}" if isinstance(agent_id, str) and agent_id else session
 
 
-def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Path | None = None,
+def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Path, environ: Mapping[str, str],
          sleep: Callable[[float], None] = time.sleep,
          still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The gate's output for one ``PreToolUse`` event, or ``None`` (the call goes on as the session's mode says).
@@ -1339,7 +1389,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         return _malformed(event, queue, settings, home=home)
     if tool_input is None:
         tool_input = {}
-    limited = _limits(event, queue, settings, session, tool_name, tool_input, cwd, home=home)
+    limited = _limits(event, queue, settings, session, tool_name, tool_input, cwd, home=home, environ=environ)
     if limited is not None:
         return limited
     try:
@@ -1348,7 +1398,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         pass  # a re-ping is a ping: it never fails the gate
     if still_away is None:
         still_away = still_away_from(Path(queue.directory) / SETTINGS_NAME, settings, queue=queue)
-    out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, sleep=sleep,
+    out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, environ=environ,
+                     sleep=sleep,
                      still_away=still_away)
     try:
         context = ruling_context(queue, session)
@@ -1372,7 +1423,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
 
 
 def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, session: str, tool_name: str,
-            tool_input: Any, cwd: str, *, home: Path | None) -> dict[str, Any] | None:
+            tool_input: Any, cwd: str, *, home: Path, environ: Mapping[str, str]) -> dict[str, Any] | None:
     """Q13 at the top of the gate (:func:`levain.consent.limits.check`): every call is counted, gated or not, before
     any of the gate's own exits; ``None`` lets the call on to the gate. A halt or an End ends the turn
     (``continue: false``). A GATED call held at a limit and extended is denied with a retry line, so the gate's own
@@ -1381,11 +1432,12 @@ def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSett
 
     hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)
     got = limits.check(AGENT, event, queue, session, tool_name, tool_input, hold=hold, cwd=cwd,
-                       notify=lambda text: notify(settings, text, cwd=queue.directory), resume=resume_meta_of(event))
+                       notify=lambda text: notify(settings, text, cwd=queue.directory),
+                       resume=resume_meta_of(event, environ=environ, claude_pid=None))
     if got.go:
-        if got.extended and gate_class(tool_name, tool_input, cwd, home=home,
+        if got.extended and gate_class(tool_name, tool_input, cwd, home=home, environ=environ,
                                        protected=protected_paths(Path(queue.directory), settings, home=home,
-                                                                 cwd=cwd)) is not None:
+                                                                 environ=environ, cwd=cwd)) is not None:
             return _pre("deny", limits.retry_text(got.extended))
         return None
     stop = {"continue": False, "stopReason": "levain: stopped by a budget the operator set; it goes on when he "
@@ -1449,7 +1501,7 @@ def _ledger_fill(event: Any, queue_dir: Path | None) -> None:
 
 
 def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, tool_name: str,
-               tool_input: Any, cwd: str, session: str, *, home: Path | None,
+               tool_input: Any, cwd: str, session: str, *, home: Path, environ: Mapping[str, str],
                sleep: Callable[[float], None],
                still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     from datetime import datetime, timezone
@@ -1463,8 +1515,8 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         note(decision=decision)
         return gate_output(decision)
 
-    tier = gate_class(tool_name, tool_input, cwd, home=home,
-                      protected=protected_paths(Path(queue.directory), settings, home=home, cwd=cwd))
+    tier = gate_class(tool_name, tool_input, cwd, home=home, environ=environ,
+                      protected=protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd))
     if tier is None:
         return None
     what = _what(tool_name, tool_input)
@@ -1474,7 +1526,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     posture = mode if isinstance(mode, str) and mode else None
     if posture == "plan":
         return None  # plan runs nothing: no decision, and a ruled allow is not spent on a call that will not run
-    loose = unconfined_state(cwd, home=home)
+    loose = unconfined_state(cwd, home=home, environ=environ)
     if loose == "on":
         return None  # the operator started this session unconfined (Q10 D2): the mode decides, no ruled allow spent
     try:
@@ -1496,7 +1548,8 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
         request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
                              cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id,
-                             resume=resume_meta_of(event), model=event.get("model"))
+                             resume=resume_meta_of(event, environ=environ, claude_pid=None),
+                             model=event.get("model"))
     except Exception as exc:
         note(refused="failed")
         return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
@@ -1546,14 +1599,16 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
                     "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))
 
 
-def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[str, Any] | None:
+def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings, *, home: Path | None,
+                environ: Mapping[str, str]) -> dict[str, Any] | None:
     """:func:`main`'s answer when the gate itself raised before it could classify the call (the queue would not
     open): a deny with the hard stop when the call is gated, or when that cannot be told; ``None`` otherwise."""
     try:
         tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
         if not isinstance(tool_name, str) or not isinstance(cwd, str) or not cwd:
             return None
-        tier = gate_class(tool_name, tool_input, cwd, protected=protected_paths(queue_dir, settings, cwd=cwd))
+        tier = gate_class(tool_name, tool_input, cwd, home=home, environ=environ,
+                          protected=protected_paths(queue_dir, settings, home=home, environ=environ, cwd=cwd))
         what = _what(tool_name, tool_input)
     except Exception:
         tier, what = "irreversible", "this call"
@@ -1566,7 +1621,7 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
     return could_not_run(tier, what)
 
 
-def queue_unresolved(event: Any) -> dict[str, Any] | None:
+def queue_unresolved(event: Any, *, home: Path | None, environ: Mapping[str, str]) -> dict[str, Any] | None:
     """:func:`main`'s answer for a PreToolUse when no queue directory could be resolved (:func:`default_queue_dir`
     raised: a ``$LEVAIN_HOME`` that cannot be expanded, or no home): with no queue and no settings, only the
     levain home is protected (:func:`levain_home_protected`, which never raises) and :func:`gate_class` classifies
@@ -1576,7 +1631,8 @@ def queue_unresolved(event: Any) -> dict[str, Any] | None:
         tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
         if not isinstance(tool_name, str) or not isinstance(cwd, str) or not os.path.isabs(cwd):
             return None
-        tier = gate_class(tool_name, tool_input, cwd, protected=tuple(levain_home_protected(None, cwd)))
+        tier = gate_class(tool_name, tool_input, cwd, home=home, environ=environ,
+                          protected=tuple(levain_home_protected(home, cwd, environ=environ)))
         what = _what(tool_name, tool_input)
     except Exception:
         tier, what = "irreversible", "this call"
@@ -1612,7 +1668,8 @@ SLOT_STOP_REASON = "levain: stopped by the consent broker (a halt or a limit the
 SLOT_HOW = "a levain decision the queue broker verified against an operator's signature"
 
 
-def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold: float = DEFAULT_GATE_HOLD,
+def slot_gate(event: Any, *, home: Path, environ: Mapping[str, str], client: Any = None,
+              hold: float = DEFAULT_GATE_HOLD,
               expected_uid: int | None = None, sleep: Callable[[float], None] = time.sleep,
               monotonic: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
     """The slot's gate output for one ``PreToolUse`` event, or ``None`` (the call goes on as the mode says). A
@@ -1642,9 +1699,10 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
         tool_input = {}
     # GATE first, before the call is classified (F10 S2b-2): the session's halt and its limits, every call
     try:
-        if queue_socket_planted(cwd, home=home):
+        if queue_socket_planted(cwd, home=home, environ=environ):
             return could_not_run("irreversible", "this call")
-        client = client if client is not None else broker_client.BrokerClient.from_env(expected_uid=expected_uid)
+        client = client if client is not None else broker_client.BrokerClient.from_env(environ,
+                                                                                      expected_uid=expected_uid)
         tool_use_id = event.get("tool_use_id")
         stopped = broker_client.gate_check(
             client, agent=AGENT, tool_name=tool_name, tool_input=tool_input,
@@ -1655,17 +1713,19 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
         # a halt or a limit ends the turn, as on the local path (_limits; the irreversible tier's _stop)
         return _pre("deny", stopped, **{"continue": False, "stopReason": SLOT_STOP_REASON})
     try:
-        tier = gate_class(tool_name, tool_input, cwd, home=home)
+        tier = gate_class(tool_name, tool_input, cwd, home=home, environ=environ)
         if tier is None:
-            return _slot_ungated(event, session, tool_name, tool_input, cwd, home=home, client=client, hold=hold,
+            return _slot_ungated(event, session, tool_name, tool_input, cwd, home=home, environ=environ,
+                                 client=client, hold=hold,
                                  expected_uid=expected_uid, sleep=sleep, monotonic=monotonic)
         what = _what(tool_name, tool_input)
     except Exception:  # noqa: BLE001 - a call that cannot be classified is denied as the irreversible tier
         return could_not_run("irreversible", "this call")
     try:
-        if queue_socket_planted(cwd, home=home):
+        if queue_socket_planted(cwd, home=home, environ=environ):
             return could_not_run(tier, what)
-        client = client if client is not None else broker_client.BrokerClient.from_env(expected_uid=expected_uid)
+        client = client if client is not None else broker_client.BrokerClient.from_env(environ,
+                                                                                      expected_uid=expected_uid)
         tool_use_id = event.get("tool_use_id")
         request = broker_client.gate_request(
             agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
@@ -1681,7 +1741,7 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
 
 
 def _slot_ungated(event: Mapping[str, Any], session: str, tool_name: str, tool_input: Any, cwd: str, *,
-                  home: Path | None, client: Any, hold: float, expected_uid: int | None,
+                  home: Path, environ: Mapping[str, str], client: Any, hold: float, expected_uid: int | None,
                   sleep: Callable[[float], None], monotonic: Callable[[], float]) -> dict[str, Any] | None:
     """:func:`slot_gate` for a call :func:`gate_class` does not gate (W2-c3, head ruling 1020+49): a file write
     (:data:`FILE_TOOLS`) goes to the broker (:func:`levain.consent.broker_client.file_ungated`), with its grant member
@@ -1706,7 +1766,7 @@ def _slot_ungated(event: Mapping[str, Any], session: str, tool_name: str, tool_i
         member = broker_client.grant_member(AGENT, tool_name, tool_input, cwd)
         if member is None and tool_name not in FILE_TOOLS:
             return None
-        if queue_socket_planted(cwd, home=home):
+        if queue_socket_planted(cwd, home=home, environ=environ):
             return could_not_run("reversible", what())
         tool_use_id = event.get("tool_use_id")
         got = broker_client.file_ungated(
@@ -1723,7 +1783,8 @@ def _slot_ungated(event: Mapping[str, Any], session: str, tool_name: str, tool_i
     return decision_output(decision, SLOT_HOW)
 
 
-def _slot_main(stdin: IO[str], stdout: IO[str], *, expected_uid: int | None = None) -> int:
+def _slot_main(stdin: IO[str], stdout: IO[str], *, home: Path | None, environ: Mapping[str, str],
+               expected_uid: int | None = None) -> int:
     """:func:`main` in a slot session: no ConsentQueue, no settings file, no ledger. Always exits 0. A stdin that
     is not a JSON object (truncated, garbled, an array) is :func:`could_not_run`'s deny: the event cannot be told
     from a PreToolUse, and a PermissionRequest ignores a PreToolUse's deny. ``expected_uid``: :func:`slot_gate`'s."""
@@ -1732,7 +1793,8 @@ def _slot_main(stdin: IO[str], stdout: IO[str], *, expected_uid: int | None = No
         event = json.loads(stdin.read())
         if not isinstance(event, Mapping):
             raise ValueError("the hook event is not a JSON object")
-        out = slot_gate(event, expected_uid=expected_uid) if event.get("hook_event_name") == GATE_EVENT \
+        out = slot_gate(event, home=home, environ=environ,
+                        expected_uid=expected_uid) if event.get("hook_event_name") == GATE_EVENT \
             else None   # a PermissionRequest in a slot: no decision
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
@@ -1751,7 +1813,7 @@ def _slot_main(stdin: IO[str], stdout: IO[str], *, expected_uid: int | None = No
     return 0
 
 
-def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
+def _queue_for(queue_dir: Path, settings: AdapterSettings, *, home: Path) -> ConsentQueue:
     if settings.cockpit_data_root:
         root = Path(settings.cockpit_data_root)
         source = authority_source(root / "cockpit.db", anchor=anchor_path(root))
@@ -1759,7 +1821,43 @@ def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
         # No cockpit data root: a source over the queue DIRECTORY, which sqlite cannot open as a database, so
         # every replay fails and no answer can verify (never a file path a writer could plant a log at).
         source = authority_source(queue_dir, anchor=None)
-    return ConsentQueue(queue_dir, authority=source)
+    return ConsentQueue(queue_dir, authority=source, home=home)
+
+
+@dataclass
+class PermissionContext:
+    """What one hook call (or one chat core request) decides with, from :func:`permission_context`: the queue, the
+    settings as the hook acts on them (:func:`with_away_mark`) and the away recheck a hold re-reads
+    (:func:`still_away_from`). A context manager; :meth:`close` releases nothing today (the queue and the authority
+    source open a connection per operation) and is where a future held handle is closed."""
+    queue: ConsentQueue
+    settings: AdapterSettings
+    recheck: Callable[[], tuple[bool, str, str]]
+    environ: Mapping[str, str]
+    home: Path
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> "PermissionContext":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
+def permission_context(queue_dir: Path, *, environ: Mapping[str, str], home: Path,
+                       settings: AdapterSettings | None = None) -> PermissionContext:
+    """The setup :func:`main` runs before it reads the event, for ``queue_dir``: the settings file (or ``settings``,
+    when the caller already loaded it), one queue over it holding ``home`` (the away mark, the hold and every recheck
+    read it), the settings with the away mark applied, and the recheck over that queue. ``environ`` is carried for
+    the caller's core call; nothing here reads it."""
+    settings = settings if settings is not None else load_settings(queue_dir)
+    queue = _queue_for(queue_dir, settings, home=home)
+    settings = with_away_mark(settings, queue_dir, AGENT, queue=queue)
+    return PermissionContext(queue=queue, settings=settings,
+                             recheck=still_away_from(queue_dir / SETTINGS_NAME, settings, queue=queue),
+                             environ=environ, home=home)
 
 
 def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO[str] | None = None) -> int:
@@ -1774,23 +1872,30 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
     settings = AdapterSettings()   # set before the try: a raising load_settings leaves it, so gate_failed still
     # classifies the call (a store write denied, an ordinary call no decision), never with None
     started = time.monotonic()
-    if in_slot():
-        return _slot_main(stdin, stdout)
+    # H4: the one read of the process environment and home; everything below is handed them
+    environ: Mapping[str, str] = os.environ
+    home = _bound_home()
+    if in_slot(environ):
+        return _slot_main(stdin, stdout, home=home, environ=environ)
     try:
         parser = argparse.ArgumentParser(prog="levain-consent-claude-code")
         parser.add_argument("--queue-dir", default=None)
         parser.add_argument("--max-hold", type=float, default=DEFAULT_MAX_HOLD)
         args = parser.parse_args(argv)
-        queue_dir = Path(args.queue_dir) if args.queue_dir else default_queue_dir()
+        queue_dir = Path(args.queue_dir) if args.queue_dir else queue_dir_for(environ)
+        if home is None:
+            raise RuntimeError("could not determine the home directory")
+        # loaded here, not only inside permission_context: when building the queue raises, gate_failed still
+        # protects the cockpit root these settings name (L3 r1, complement MED 1)
         settings = load_settings(queue_dir)
-        queue = _queue_for(queue_dir, settings)   # one queue: the away mark, the hold and every recheck read it
-        settings = with_away_mark(settings, queue_dir, AGENT, queue=queue)
-        event = json.loads(stdin.read())
-        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
-            out = gate(event, queue, settings)
-        else:
-            out = decide(event, queue, settings, max_hold=args.max_hold,
-                         still_away=still_away_from(queue_dir / SETTINGS_NAME, settings, queue=queue))
+        with permission_context(queue_dir, environ=environ, home=home, settings=settings) as pc:
+            queue, settings = pc.queue, pc.settings
+            event = json.loads(stdin.read())
+            if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
+                out = gate(event, queue, settings, home=home, environ=environ)
+            else:
+                out = decide(event, queue, settings, environ=environ, home=home, max_hold=args.max_hold,
+                             still_away=pc.recheck)
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()
@@ -1803,7 +1908,8 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
                 event = json.loads(stdin.read())   # not read yet: the failure came first
             out = None
             if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
-                out = gate_failed(event, queue_dir, settings) if queue_dir is not None else queue_unresolved(event)
+                out = gate_failed(event, queue_dir, settings, home=home, environ=environ) \
+                    if queue_dir is not None else queue_unresolved(event, home=home, environ=environ)
             if out is not None:
                 stdout.write(json.dumps(out) + "\n")
                 stdout.flush()
@@ -1815,6 +1921,15 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
             pass
         return 0
     return 0
+
+
+def _bound_home() -> Path | None:
+    """``Path.home()`` for a hook entry point's one binding, or ``None`` when there is none (no ``$HOME`` and no
+    password-database entry): the entry point then classifies a PreToolUse with no queue, as before."""
+    try:
+        return Path.home()
+    except RuntimeError:
+        return None
 
 
 # --- install (one workspace's project settings) ------------------------------------------------------------

@@ -64,6 +64,7 @@ from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS
                              is_levain_account, loopback_alias, read_retired_ids, retired_ids_text, spent_indices)
 from levain.slot import limits_doc as LD
 from levain.slot import vendor_routes as VR
+from levain.broker import policy as broker_policy
 from levain.slot.runtime_grammar import VERBS as RUNTIME_VERBS
 from levain.slot.runtime_grammar import ok_line, refusal_line
 from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, base_store_rows, operator_record_path,
@@ -233,7 +234,7 @@ def check_tools(facts: HostFacts, steps: Sequence[Step], *, verb: str, python: b
 
 #: The verbs :func:`main` applies; every other verb of the §5.2 grammar answers ``verb-unbuilt:<verb>``.
 BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential", "repair", "set-limits",
-               "routes-base", "routes-trust", "enrol-authority-signer", "remove-authority-signer")
+               "routes-base", "routes-trust", "routes-egress", "enrol-authority-signer", "remove-authority-signer")
 
 
 def helper_pending() -> tuple[str, ...]:
@@ -674,6 +675,7 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         new = gen_mod.InstallShape(target, versions[0], versions[1], txn, dict(noted), _shape_of(desired))
         return gen_mod.write_record_durably(shape_path, gen_mod.shape_text(new))
 
+    vendor_failed: list[str] = []
     steps: list[Step] = [
         # FIRST (§25): the exact allocation, before anything is made, so an interrupted run re-plans it.
         intent_write_step(host, intent),
@@ -692,6 +694,9 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         *pool_config_steps(host, cmd.slots, cmd.verifier_slots),
         *restart,
         *root_tree.tree_steps(host, package, h11_dir=h11_dir, generation=target, current=current),
+        # The vendor CLIs a session execs, COPIED into the prefix tree_steps made (head ruling 1026+8). A failed copy
+        # does not stop setup here: the report step after the units prints it as skipped (ruling V23).
+        *root_tree.vendor_steps(host, cmd.operator, failed=vendor_failed),
         *confinement,
         # Before the first start: each service's started_after threshold (row 33 §2.5).
         Step("note each service's started_after threshold (before the first start)", call=note),
@@ -701,6 +706,9 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         # Each slot's §3.5 Pool state once everything the slot needs is in place, before the rule that lets
         # prepare run (prepare picks only from these).
         *slot_state_steps(host, alloc.slots),
+        # Setup's report is allow_fail (ruling V23): a copy that fails on every run is printed as skipped and never
+        # keeps the sudoers rules, the install record or the operator record from being written.
+        root_tree.vendor_report_step(vendor_failed, allow_fail=True),
         *sudoers_steps(host, cmd.operator),
         # Row 33 §2.5: the install record before the operator record; setup's completion is still the latter.
         Step(f"write the install record {shape_path} (completed_txn {txn})", call=record),
@@ -1712,6 +1720,7 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     if finished is not None:
         steps.append(Step(f"remove the finished repair journal {INTENT_PATH[host]} (its txn is install-shape's "
                           "completed_txn)", (root_tree._tools(host)["rm"], "-f", str(INTENT_PATH[host]))))
+    vendor_failed: list[str] = []
     F = functools.partial(_faulted, fault)
     if continuing is None:                          # phase B starts at R4b: phase A journalled R1-R3
         steps += F("R1", [intent_write_step(host, first)])                                        # R1
@@ -1734,10 +1743,16 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
         steps += F("R9", [root_tree.flip_step(host, target,                                       # R9
                                               fault=(lambda pt: fault("R9", pt)) if fault else None)])
     steps += F("R10", [*root_tree.entry_steps(host),                                              # R10
-                       *removals("R10")])           # R1b: entries after the flip (their sudoers rule went at R5)
+                       *removals("R10"),            # R1b: entries after the flip (their sudoers rule went at R5)
+                       # the vendor CLIs re-copied, so a vendor updated since the last repair reaches the slot;
+                       # a failed copy does not stop R11/R12: the report step after them fails the run (ruling V6)
+                       *root_tree.vendor_steps(host, operator, failed=vendor_failed),
+                       # the versions the copies kept, removed only with no session live (ruling V18)
+                       *vendor_prune_steps(host, failed=vendor_failed)])
     steps += F("R11", sudoers_steps(host, operator))                                              # R11
     steps += F("R12", [*removals("R12"),            # R1b: the removed units' files
-                       *units.install_steps(host, services)])                                     # R12
+                       *units.install_steps(host, services),                                     # R12
+                       root_tree.vendor_report_step(vendor_failed)])
     if rf.legacy or gen_change:
         steps += F("R13", [root_tree.gc_step(host, keep)])                                        # R13
     steps += F("R14", [Step(f"write the install record {shape_path} (completed_txn {run_txn}, last host act)",
@@ -1921,6 +1936,41 @@ def live_lease_sessions(sessions: Path) -> tuple[str, ...]:
         except (Refused, OSError):
             live.append(name[:-len(".json")])
     return tuple(live)
+
+
+def vendor_prune_live(store: Path) -> tuple[str, ...]:
+    """The live-session evidence :func:`levain.slot.root_tree.prune_vendor` reads (head ruling V18): this run's
+    :meth:`Quiesce.live` when it holds ``L/slots/pool.lock`` (the same count preflight's ``live-lease`` refusal took,
+    under the hold that keeps a ``prepare`` from leasing beneath the prune). With no ``pool.lock`` no ``prepare`` can
+    lease, so the session records' ``lease_live`` (:func:`live_lease_sessions`) are the evidence. A ``pool.lock``
+    this process does not hold counts as live: nothing keeps a lease from starting beneath the prune."""
+    L = Path(store)
+    q = _QUIESCING.get(_store_key(L))
+    if q is not None and q.held:
+        return q.live()
+    if os.path.lexists(L / "slots" / "pool.lock"):
+        return (f"{L / 'slots' / 'pool.lock'} not held by this run",)
+    return live_lease_sessions(L / "sessions")
+
+
+def vendor_prune_steps(host: HostOS, *, store: Path | None = None, failed: list | None = None) -> list[Step]:
+    """One step per versioned vendor package: :func:`levain.slot.root_tree.prune_vendor` with
+    :func:`vendor_prune_live`, read when the step runs. ``allow_fail``: a prune never stops the plan. ``failed`` is
+    the sink :func:`levain.slot.root_tree.vendor_steps` appends a failed or indeterminate copy's line to (each line
+    starts ``<name>:``): a unit with a line there is not pruned, because the previous version may still be the one a
+    crash restores (head ruling V25)."""
+    L = Path(store) if store is not None else STORE[host]
+    sink = failed if failed is not None else []
+
+    def prune(name: str) -> Callable[[], tuple[bool, str]]:
+        def run() -> tuple[bool, str]:
+            if any(str(line).startswith(f"{name}:") for line in sink):
+                return True, (f"{name}: every version kept (this run's copy of {name} did not finish durably, so "
+                              "the previous version may be the one a crash restores)")
+            return root_tree.prune_vendor(host, name, live=lambda: vendor_prune_live(L))
+        return run
+    return [Step(f"remove the old versions of root's {name} copy in {root_tree.VENDOR_PREFIX[host]} (only with no "
+                 "session live)", call=prune(name), allow_fail=True) for name in root_tree.VENDOR_UNITS]
 
 
 def count_live_leases(sessions: Path) -> int:
@@ -2592,38 +2642,59 @@ def _routes_dir(rs: RH.Seams, host: HostOS) -> Path:
 
 def merge_base_routes(routes: Path, *, fsync: Callable[[int], None] | None = None,
                       warn: Callable[[str], None] | None = None) -> tuple[list, bool]:
-    """``routes-base``'s act: ``routes/base.json`` read (absent = the empty map), the shipped vendor routes merged in
-    by route id (:func:`levain.slot.vendor_routes.merge`, checked by keys' own parser), written durably root 0644 when
-    the bytes, the owner or the mode differ. Returns ``(the vendor route ids, written)``; a map that cannot be merged
+    """``routes-base``'s act: ``routes/base.json`` read (absent = the empty map), the shipped routes (the vendor
+    routes and ``egress-default``) merged in by route id (:func:`levain.slot.vendor_routes.merge`, checked by keys'
+    own parser), written durably root 0644 when
+    the bytes, the owner or the mode differ. Returns ``(the shipped route ids the map holds, written)``; a map that cannot be merged
     is ``Refused`` by the merge's code and left as it is, and a failure before the rename is the ``OSError``. Told to
-    ``warn`` (default: stderr): each field of a shipped route's entry the merge reverted
+    ``warn`` (default: stderr): each host left off ``egress-default`` because a route of the operator's admits it (on
+    every run, written or not), each field of a shipped route's entry the merge reverted
     (:func:`levain.slot.vendor_routes.reverted_fields`), and a rename whose directory fsync failed (the map is in
     force, ``written`` is True)."""
     warn = warn or (lambda line: sys.stderr.write(f"levain install-helper: warning: {line}\n"))
     path = Path(routes) / "base.json"
-    raw = R.read_record(path, max_bytes=1 << 20)
+    raw, doc = _read_base_map(path)
     try:
-        doc = None if raw is None else canon.parse(raw)
-    except canon.ContractError:
-        raise Refused("base-map-malformed", f"{path} is not canonical JSON; it is left as it is") from None
-    try:
-        out, ids = VR.merge(doc)
+        out, ids, notes = VR.merge(doc)
     except VR.MergeRefused as e:
         raise Refused(e.code, f"{path}: {e.detail}; it is left as it is") from None
-    data = canon.canonical_bytes(out)
+    written = _write_base_map(path, raw, out, verb="routes-base", fsync=fsync, warn=warn)
+    for note in notes:
+        warn(f"{note} ({path})")
+    if not written:
+        return ids, False
+    for rid, fields in sorted(VR.reverted_fields(doc, out).items()):
+        warn(f"route {rid} in {path} replaced by the shipped entry; it had changed {', '.join(fields)}, now the "
+             "shipped values")
+    return ids, True
+
+
+def _read_base_map(path: Path) -> tuple[bytes | None, object]:
+    """``(the bytes on disk or None when absent, their parse)``; bytes that are not canonical JSON are
+    ``base-map-malformed`` and left as they are."""
+    raw = R.read_record(path, max_bytes=1 << 20)
+    try:
+        return raw, (None if raw is None else canon.parse(raw))
+    except canon.ContractError:
+        raise Refused("base-map-malformed", f"{path} is not canonical JSON; it is left as it is") from None
+
+
+def _write_base_map(path: Path, raw: bytes | None, doc: dict, *, verb: str,
+                    fsync: Callable[[int], None] | None, warn: Callable[[str], None]) -> bool:
+    """``doc`` written to ``path`` durably, root 0644, unless ``raw`` (the bytes read) already holds it with root's
+    owner and that mode: then False. A failure before the rename is the ``OSError`` (the earlier map stands); a
+    failed directory fsync after it is told to ``warn`` (the map is in force) and answers True."""
+    data = canon.canonical_bytes(doc)
     if raw == data:
         st = os.lstat(path)
         if st.st_uid == os.geteuid() and stat.S_IMODE(st.st_mode) == 0o644:
-            return ids, False
+            return False
     try:
         R.write_durably(path, data, mode=0o644, fsync=fsync or gen_mod._full_fsync)
     except R.NotDurable as e:
         warn(f"{path} written but not durable ({e.strerror}): it is in force now and may not survive a crash; run "
-             "`sudo install-helper routes-base` again")
-    for rid, fields in sorted(VR.reverted_fields(doc).items()):
-        warn(f"route {rid} in {path} replaced by the shipped entry; it had changed {', '.join(fields)}, now the "
-             "shipped values")
-    return ids, True
+             f"`sudo install-helper {verb}` again")
+    return True
 
 
 def base_routes_merge_steps(host: HostOS, *, store: Path | None = None) -> list[Step]:
@@ -2641,10 +2712,11 @@ def base_routes_merge_steps(host: HostOS, *, store: Path | None = None) -> list[
         except OSError as e:
             return False, (f"base-map-write-failed: {e.strerror or e}; the earlier map stands (`sudo install-helper "
                            "routes-base` merges it once it can be written)")
-        line = f"{'merged' if written else 'already holds'} the vendor routes {', '.join(ids)}"
+        line = f"{'merged' if written else 'already holds'} the shipped routes {', '.join(ids)}"
         return True, "; ".join([line, *(f"warning: {w}" for w in warnings)])
 
-    return [Step(f"merge the vendor brokered routes into {routes / 'base.json'} (by route id)", call=act,
+    return [Step(f"merge the shipped routes (vendor, egress-default) into {routes / 'base.json'} (by route id)",
+                 call=act,
                  allow_fail=True)]
 
 
@@ -2667,6 +2739,90 @@ def run_routes_base(caller_uid: int, host: HostOS, *, lock: Callable[[], Context
         except OSError as e:
             raise Refused("base-map-write-failed", f"{e.strerror or e}; the earlier map stands") from None
     return {"verb": "routes-base", "routes": ids, "written": written}
+
+
+#: WF-1b: the stdin of ``routes-egress``, exactly ``{format, hosts}``, canonical bytes.
+ROUTES_EGRESS_REQUEST = "levain-routes-egress-request/1"
+ROUTES_EGRESS_REQUEST_MAX = 16 * 1024
+#: [judged by lane wf1b, 10-26, against F3's four shipped hosts and the request cap (64 names of the longest legal
+#: length do not fit 16 KiB, so the cap binds first for long names): an operator list is a handful of hosts]
+ROUTES_EGRESS_MAX_HOSTS = 64
+
+
+def _read_capped(read: Callable[[int], bytes], cap: int) -> bytes:
+    """``read`` called until it returns no bytes or one past ``cap`` has been read (a pipe may hand stdin over in
+    pieces)."""
+    parts: list[bytes] = []
+    got = 0
+    while got <= cap:
+        chunk = read(cap + 1 - got)
+        if not chunk:
+            break
+        parts.append(chunk)
+        got += len(chunk)
+    return b"".join(parts)
+
+
+def read_egress_request(read: Callable[[int], bytes]) -> list[str]:
+    """``routes-egress``'s stdin: one canonical ``levain-routes-egress-request/1`` object, exactly ``format`` and
+    ``hosts``; ``hosts`` a list of at most :data:`ROUTES_EGRESS_MAX_HOSTS` distinct names, each passing the policy's one
+    host grammar (:func:`levain.broker.policy.is_host_name`: a lowercase A-label name, no address literal, no
+    wildcard). Returned sorted. Refused ``routes-egress-request:<size|json|keys|hosts>``."""
+    raw = _read_capped(read, ROUTES_EGRESS_REQUEST_MAX)
+    if len(raw) > ROUTES_EGRESS_REQUEST_MAX:
+        raise Refused("routes-egress-request:size", f"over {ROUTES_EGRESS_REQUEST_MAX} bytes")
+    try:
+        obj = canon.parse(raw)
+        if canon.canonical_bytes(obj) != raw:
+            raise canon.ContractError("not canonical")
+    except canon.ContractError:
+        raise Refused("routes-egress-request:json", "not canonical JSON") from None
+    if type(obj) is not dict or set(obj) != {"format", "hosts"} or obj["format"] != ROUTES_EGRESS_REQUEST:
+        raise Refused("routes-egress-request:keys", f"exactly format ({ROUTES_EGRESS_REQUEST}) and hosts")
+    hosts = obj["hosts"]
+    if type(hosts) is not list or len(hosts) > ROUTES_EGRESS_MAX_HOSTS:
+        raise Refused("routes-egress-request:hosts", f"a list of at most {ROUTES_EGRESS_MAX_HOSTS} host names")
+    for h in hosts:
+        if not broker_policy.is_host_name(h):
+            raise Refused("routes-egress-request:hosts", f"{str(h)[:80]!r} is not a lowercase A-label host name")
+    if len(set(hosts)) != len(hosts):
+        raise Refused("routes-egress-request:hosts", "a host is named twice")
+    return sorted(hosts)
+
+
+def run_routes_egress(caller_uid: int, host: HostOS, *, read: Callable[[int], bytes],
+                      lock: Callable[[], ContextManager[object]], store_seams: RH.Seams | None = None,
+                      err: TextIO | None = None, fsync: Callable[[int], None] | None = None) -> dict[str, object]:
+    """``routes-egress`` (WF-1b): the operator's egress allow-list, the ``egress-operator`` route of
+    ``L/routes/base.json``, set to the request's hosts (replaced whole; an empty list removes the route). Order, as
+    ``routes-trust``'s: the operator checked, stdin read and checked in root (:func:`read_egress_request`), both before
+    the install lock; under it the operator checked again, the map read, the route set
+    (:func:`levain.slot.vendor_routes.set_operator_hosts`: keys' parser, and no egress host on another route), and the
+    map written durably root 0644 unless it already holds it. Refused by name with the map left as it is:
+    ``routes-egress-request:*``, ``routes-egress-host-on-route``, ``base-map-missing``, ``base-map-malformed``;
+    ``base-map-write-failed`` for a failure before the rename (the earlier map stands); a failed directory fsync after
+    it answers ok and warns on ``err``. The list reaches the sessions rendered after it [judged by lane wf1b, 10-26,
+    against ``runtime_helper.render_facts`` reading ``base.json`` at render and ``front.load_policy`` parsing the
+    session file render writes]."""
+    rs = store_seams or RH.Seams(host=host)
+    _check_operator("routes-egress", caller_uid, rs)
+    hosts = read_egress_request(read)
+
+    def warn(line: str) -> None:
+        (err or sys.stderr).write(f"levain install-helper: warning: {line}\n")
+    with lock():
+        _check_operator("routes-egress", caller_uid, rs)
+        path = _routes_dir(rs, host) / "base.json"
+        raw, doc = _read_base_map(path)
+        try:
+            out = VR.set_operator_hosts(doc, hosts)
+        except VR.MergeRefused as e:
+            raise Refused(e.code, f"{path}: {e.detail}" + ("" if doc is None else "; it is left as it is")) from None
+        try:
+            written = _write_base_map(path, raw, out, verb="routes-egress", fsync=fsync, warn=warn)
+        except OSError as e:
+            raise Refused("base-map-write-failed", f"{e.strerror or e}; the earlier map stands") from None
+    return {"verb": "routes-egress", "hosts": hosts, "written": written}
 
 
 def read_trust_request(read: Callable[[int], bytes]) -> dict:
@@ -4136,6 +4292,8 @@ class Seams:
     #: routes-base / routes-trust (3c-9): their own branches in :func:`run`, as set-limits'.
     routes_base: Callable[..., dict] = run_routes_base
     routes_trust: Callable[..., dict] = run_routes_trust
+    #: routes-egress (WF-1b): its own branch in :func:`run`, as routes-trust's.
+    routes_egress: Callable[..., dict] = run_routes_egress
     #: enrol-authority-signer / remove-authority-signer (14b S5): their own branch in :func:`run`, as routes-trust's.
     authority_signer: Callable[..., dict] = run_authority_signer
     #: repair --source's phase A: its steps (with ``apply``), the probe and the exec into phase B (:func:`repair_handover`).
@@ -4193,6 +4351,9 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
         # --replace (Q16) is passed only when given, so a seam written for the plain verb still takes it.
         return seams.routes_trust(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err,
                                   **({"replace": True} if cmd.replace else {}))
+    if cmd.verb == "routes-egress":
+        # As routes-trust: the request is checked before the lock, the map written under it.
+        return seams.routes_egress(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err)
     if cmd.verb in SIGNER_VERBS:
         # As routes-trust: argv's keys are checked and fingerprinted before the lock, the file written under it.
         return seams.authority_signer(cmd, caller_uid, host, lock=lambda: seams.lock(host), err=err)

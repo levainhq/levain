@@ -353,6 +353,20 @@ def test_a_launch_within_a_day_of_the_ca_expiry_re_mints_it_and_keeps_the_old_ce
     assert first.cert_path.exists() and second.cert_path.exists()
 
 
+def test_each_launch_renders_the_trust_env_of_the_ca_its_egress_got(tmp_path, monkeypatch):
+    """chd2fix P1: the env a launch renders names the cert of the CA handed to ITS start (a re-mint between two
+    launches gives the second the new cert), with pip on legacy-certs (truststore cannot verify in the sandbox)."""
+    monkeypatch.setattr(lm, "start_egress", lambda **kw: SimpleNamespace(launch_id=kw["launch_id"]))
+    svc = cd.ChatEgressService(state_dir=tmp_path / "state", store=_store(), queue_dir=tmp_path / "q", now=NOW)
+    first = svc.ca
+    a = svc.launch(**_launch_kw(tmp_path, "L1"), now=NOW)
+    b = svc.launch(**_launch_kw(tmp_path, "L2"), now=first.not_valid_after)       # re-minted for this one
+    assert a.trust_env == first.trust_env() and a.trust_env["PIP_CERT"] == str(first.cert_path)
+    assert b.trust_env == svc.ca.trust_env() and b.trust_env["SSL_CERT_FILE"] == str(svc.ca.cert_path)
+    assert svc.ca is not first
+    assert a.trust_env["PIP_USE_DEPRECATED"] == b.trust_env["PIP_USE_DEPRECATED"] == "legacy-certs"
+
+
 def test_close_removes_every_ca_cert_the_start_minted_and_refuses_later_launches(tmp_path, monkeypatch):
     """chatdriver RULINGS_R1 CARRIED (complement 6 + deepseek 4): per-start CA certs accumulated; close() removes
     this start's, the re-minted ones too, and a launch after it is refused with its chat_tmp removed."""

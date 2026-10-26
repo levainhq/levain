@@ -20,6 +20,7 @@ from levain.consent.record import (
     RULING_NAMESPACE, ExternalGateRequest, redact_display, ruling_message, tool_input_digest,
 )
 from tests.test_consent_queue import authority, keys  # noqa: F401 - the shared fixtures
+from tests._h4 import h4_home
 
 
 def _git(*argv, cwd=None):
@@ -42,7 +43,7 @@ def test_a_ruling_on_a_row_whose_display_names_another_push_never_pushes(tmp_pat
     shown = {"repo": str(repo), "remote": url, "branch": "claude/x", "commit": _git("rev-parse", "claude/x", cwd=repo)}
     evil = {**shown, "branch": "main", "commit": _git("rev-parse", "main", cwd=repo)}
 
-    queue = ConsentQueue(base / "home" / "consent", authority=authority)
+    queue = ConsentQueue(base / "home" / "consent", authority=authority, home=h4_home())
     queue.pending()                                     # the store exists before the raw writer opens it
     now = datetime.now(timezone.utc)
     forged = ExternalGateRequest.create(

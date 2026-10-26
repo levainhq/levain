@@ -18,6 +18,7 @@ from levain.consent import limits as L
 from levain.consent import limits_cli as C
 from levain.consent.queue import AnswerRefused, ConsentQueue
 from tests.test_consent_queue import authority, keys, signed  # noqa: F401 - the shared fixtures
+from tests._h4 import h4_home
 
 
 def _run(argv: list[str], qdir: Path) -> tuple[int, str]:
@@ -167,7 +168,7 @@ LIM = dict(L.DEFAULTS, calls=2)
 
 
 def _q(tmp_path, authority):
-    return ConsentQueue(tmp_path / "home" / "consent", authority=authority)
+    return ConsentQueue(tmp_path / "home" / "consent", authority=authority, home=h4_home())
 
 
 def _halt_by_end(q, key, cwd):

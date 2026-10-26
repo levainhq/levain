@@ -13,6 +13,7 @@ from levain.consent.listing import read_listing
 from levain.consent.queue import ConsentQueue, authority_source
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
+from tests._h4 import h4_home
 
 SID_CC, SID_CX, SID_Q = "zq-session-id-cc-8812", "zq-session-id-cx-8813", "zq-session-id-q-8814"
 CWD_CC, CWD_CX = "/zq/full/path/cc-marker/levain-work", "/zq/full/path/cx-marker/codex-work"
@@ -38,7 +39,7 @@ def _fixture(tmp_path: Path, monkeypatch):
     home = tmp_path / "levain_home"
     monkeypatch.setenv("LEVAIN_HOME", str(home))
     (home / "consent").mkdir(parents=True, mode=0o700)
-    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None))
+    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
     q.file(agent="claude_code", agent_session_id=SID_CC, tool_name="Bash", tool_input={"command": "ls"}, cwd=CWD_CC,
            hold=timedelta(minutes=5), event_id="e1")
     root, src, _ids = _install(tmp_path)

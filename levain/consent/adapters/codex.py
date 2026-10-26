@@ -91,7 +91,7 @@ from levain.consent.adapters.claude_code import (  # noqa: F401 - GATE_TIMEOUT i
     RULING_TEXT, UNCONFINED_ENV, U_IRR, U_REV, _pre, _what, floor_text, flush_held_pings, notify, send_repings,
     unconfined, unconfined_state,
 )
-from levain.consent.adapters.claude_code import DEFAULT_GATE_HOLD, SLOT_HOW, queue_socket_planted
+from levain.consent.adapters.claude_code import DEFAULT_GATE_HOLD, SLOT_HOW, _bound_home, queue_socket_planted
 from levain.consent.broker_client import in_slot
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
 from levain.consent.adapters.rules import (  # noqa: F401 - the rules' one home; re-exported under these names
@@ -99,7 +99,7 @@ from levain.consent.adapters.rules import (  # noqa: F401 - the rules' one home;
 )
 from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.queue import DB_NAME as QUEUE_DB_NAME
-from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir
+from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir, queue_dir_for
 from levain.consent.record import ExternalGateRequest
 
 AGENT = "codex"
@@ -124,6 +124,12 @@ def codex_home(environ: Mapping[str, str] | None = None) -> Path:
     return Path(env.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
 
 
+def _codex_dir_or(codex_dir: Path | None, environ: Mapping[str, str], home: Path) -> Path:
+    """``codex_dir``, else :func:`codex_home` as ``environ`` and ``home`` name it (``$CODEX_HOME``, else
+    ``home/.codex``): the hook paths' default, read from what the entry point bound, never this process."""
+    return codex_dir if codex_dir is not None else Path(environ.get("CODEX_HOME") or Path(home) / ".codex")
+
+
 # --- ruling 3b item 1: agent config and hooks ----------------------------------------------------------------
 
 def policy_targets(tool_name: str, tool_input: Any) -> list[Any] | None:
@@ -141,8 +147,8 @@ def policy_targets(tool_name: str, tool_input: Any) -> list[Any] | None:
 consent_policy.register_targets(AGENT, policy_targets)
 
 
-def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
-                         codex_dir: Path | None = None, protected: tuple[Path, ...] = (),
+def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path, codex_dir: Path,
+                         environ: Mapping[str, str], protected: tuple[Path, ...] = (),
                          git_cache: dict[Any, Any] | None = None) -> bool:
     """True when a Codex ``apply_patch`` or an MCP tool targets an agent's config or hooks: every path the Claude
     Code adapter tags (:func:`levain.consent.adapters.claude_code.targets_agent_config`: Claude Code's config,
@@ -153,8 +159,6 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     other tool are never tagged: a command is not parsed (ruling 1). ``git_cache`` is one gate call's: one git
     budget (:func:`levain.consent.adapters.claude_code._git_answer`) for all its headers, past which a header is
     tagged."""
-    home = home if home is not None else Path.home()
-    codex_dir = codex_dir if codex_dir is not None else codex_home()
     if tool_name == PATCH_TOOL:
         command = tool_input.get("command") if isinstance(tool_input, Mapping) else None
         targets: list[Any] | None = patch_targets(command)
@@ -163,7 +167,7 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     elif tool_name.startswith("mcp__"):
         # the Claude Code check reads the whole MCP input once (named fields, every-string candidates, config
         # directories); what is left per path is CODEX_HOME and any .codex/
-        if _claude_targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected,
+        if _claude_targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected,
                                         git_cache=git_cache):
             return True
         targets = consent_policy.mcp_config_candidates(tool_input) or []
@@ -174,18 +178,19 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     else:
         return False
     git_cache = git_cache if git_cache is not None else {}   # one budget for the whole patch (and the gate call)
-    return any(_header_is_config(target, cwd, home, codex_dir, protected, git_cache) for target in targets)
+    return any(_header_is_config(target, cwd, home, codex_dir, protected, git_cache, environ=environ)
+               for target in targets)
 
 
 def _header_is_config(target: Any, cwd: str, home: Path, codex_dir: Path, protected: tuple[Path, ...],
-                      git_cache: dict[Any, Any] | None = None) -> bool:
+                      git_cache: dict[Any, Any] | None = None, *, environ: Mapping[str, str]) -> bool:
     """Whether one patch header names agent config or hooks (an empty or unreadable one is taken to). Where git runs
     hooks from is asked of git (the Claude Code check), shared across one call's headers through ``git_cache``."""
     if not isinstance(target, str) or not target:
         return True
     try:
-        return (_claude_targets_agent_config("Write", {"file_path": target}, cwd, home=home, protected=protected,
-                                             git_cache=git_cache)
+        return (_claude_targets_agent_config("Write", {"file_path": target}, cwd, home=home, environ=environ,
+                                             protected=protected, git_cache=git_cache)
                 or _in_codex_config(target, cwd, home, codex_dir))
     except (OSError, ValueError):
         return True
@@ -203,8 +208,9 @@ def hook_output(decision: Decision) -> dict[str, Any]:
 
 
 def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_hold: float = DEFAULT_MAX_HOLD,
-           policy: consent_policy.Policy | None = None, home: Path | None = None, codex_dir: Path | None = None,
-           clock: Callable[[], float] = time.monotonic, idle: Callable[[], float | None] | None = None,
+           policy: consent_policy.Policy | None = None, environ: Mapping[str, str], home: Path,
+           codex_dir: Path | None = None, clock: Callable[[], float] = time.monotonic,
+           idle: Callable[[], float | None] | None = None,
            still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The hook's output for one event, or ``None`` for no decision. Raises on anything unexpected (after
     withdrawing the request it filed); the caller (:func:`main`) turns that into no decision. ``max_hold`` is a
@@ -227,10 +233,11 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     posture = posture if isinstance(posture, str) and posture else None
     if policy is None and nothing_can_decide(settings):
         return None
-    protected = protected_paths(Path(queue.directory), settings, home=home, cwd=cwd)
-    agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
+    protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
+    agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home,
+                                        codex_dir=_codex_dir_or(codex_dir, environ, home), environ=environ,
                                         protected=protected)
-    if agent_config and unconfined(cwd, home=home, codex_home=codex_dir):
+    if agent_config and unconfined(cwd, home=home, environ=environ, codex_home=codex_dir):
         return None  # an unconfined session (Q10 D2): Codex's approval answers, as the gate left it to the mode
     hold = min(away_hold(settings, AGENT, idle), max(0.0, deadline - clock()))
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
@@ -298,7 +305,7 @@ HALT_TEXT = ("levain: this session is halted on gap #{n}. No further tool calls 
              "what is done and end your turn.")
 
 
-def _call_what(tool_name: str, tool_input: Any, cwd: str | None = None, *, home: Path | None = None,
+def _call_what(tool_name: str, tool_input: Any, cwd: str | None = None, *, home: Path, environ: Mapping[str, str],
                codex_dir: Path | None = None, protected: tuple[Path, ...] = (),
                git_cache: dict[Any, Any] | None = None) -> str:
     """The action in a few words: for a readable patch, ``apply_patch of <paths>`` naming the agent-config paths
@@ -309,10 +316,10 @@ def _call_what(tool_name: str, tool_input: Any, cwd: str | None = None, *, home:
         if paths:
             tagged = []
             if cwd:
-                home = home if home is not None else Path.home()
-                codex_dir = codex_dir if codex_dir is not None else codex_home()
+                codex_dir = _codex_dir_or(codex_dir, environ, home)
                 git_cache = git_cache if git_cache is not None else {}
-                tagged = [p for p in paths if _header_is_config(p, cwd, home, codex_dir, protected, git_cache)]
+                tagged = [p for p in paths
+                          if _header_is_config(p, cwd, home, codex_dir, protected, git_cache, environ=environ)]
             if tagged and len(tagged) < len(paths):
                 rest = len(paths) - len(tagged)
                 text = f"{PATCH_TOOL} of {', '.join(tagged)} (+{rest} other file{'s' if rest != 1 else ''})"
@@ -322,14 +329,14 @@ def _call_what(tool_name: str, tool_input: Any, cwd: str | None = None, *, home:
     return _what(tool_name, tool_input)
 
 
-def gate_class(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
+def gate_class(tool_name: str, tool_input: Any, cwd: str, *, home: Path, environ: Mapping[str, str],
                codex_dir: Path | None = None, protected: tuple[Path, ...] = (),
                git_cache: dict[Any, Any] | None = None) -> str | None:
     """The gate's tier for a Codex call: ``irreversible`` for agent config and hooks (:func:`targets_agent_config`,
     Q10's floor and Q14's irreversible tier at once), else ``None`` (not gated). A shell command is never parsed.
     THE SEAM for B6: the push executor's tool joins here as ``irreversible``."""
-    if targets_agent_config(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected,
-                            git_cache=git_cache):
+    if targets_agent_config(tool_name, tool_input, cwd, home=home, codex_dir=_codex_dir_or(codex_dir, environ, home),
+                            environ=environ, protected=protected, git_cache=git_cache):
         return "irreversible"
     return None
 
@@ -404,11 +411,12 @@ def _ledger_note(queue_dir: Path, event: Mapping[str, Any], session: str, tool_n
         pass
 
 
-def resume_meta_of(event: Mapping[str, Any]) -> dict[str, Any]:
+def resume_meta_of(event: Mapping[str, Any], *, environ: Mapping[str, str]) -> dict[str, Any]:
     """What a later resume of this Codex session needs (:meth:`ConsentQueue.file`'s ``resume``): the hook's parent
     process when it is ``codex`` itself (Codex runs the hook command as its own child, measured on 0.162.1), with
     ``-p`` when that process is a ``codex exec`` and ``interactive`` otherwise; the event's cwd; and the CODEX_HOME
-    the session runs under (``None``: the default); and that process's option names, which a resume refuses on
+    the session runs under (``environ``'s; ``None``: the default); and that process's option names, which a resume
+    refuses on
     (:func:`levain.consent.delivery.codex_unrestored`). Only the fields this
     queue's resume record accepts are kept."""
     from levain.consent import queue as queue_module
@@ -428,14 +436,14 @@ def resume_meta_of(event: Mapping[str, Any]) -> dict[str, Any]:
         if args[1:2] == ["exec"]:
             invocation = "-p"
         flags = option_names(" ".join(args))
-    cwd, chome = event.get("cwd"), os.environ.get("CODEX_HOME", "")
+    cwd, chome = event.get("cwd"), environ.get("CODEX_HOME", "")
     record = {"invocation": invocation, "codex_pid": pid, "cwd": cwd if isinstance(cwd, str) and cwd else None,
               "config_dir": chome if os.path.isabs(chome) else None, "codex_flags": flags}
     keys = getattr(queue_module, "_RESUME_KEYS", frozenset(record))
     return {k: v for k, v in record.items() if k in keys}
 
 
-def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Path | None = None,
+def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Path, environ: Mapping[str, str],
          codex_dir: Path | None = None, sleep: Callable[[float], None] = time.sleep,
          still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The gate's output for one Codex ``PreToolUse`` event, or ``None`` (the call goes on). The halt is read
@@ -477,7 +485,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         return _missing_output(missing)
     if tool_input is None:
         tool_input = {}
-    limited = _limits(event, queue, settings, session, tool_name, tool_input, cwd, home=home, codex_dir=codex_dir)
+    limited = _limits(event, queue, settings, session, tool_name, tool_input, cwd, home=home, environ=environ,
+                      codex_dir=codex_dir)
     if limited is not None:
         return _with_rulings(limited, queue, session)   # a late End on the limit reaches a halted Codex session
     try:
@@ -486,8 +495,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         pass  # a re-ping is a ping: it never fails the gate
     if still_away is None:
         still_away = still_away_from(Path(queue.directory) / SETTINGS_NAME, settings, queue=queue)
-    out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, codex_dir=codex_dir,
-                     sleep=sleep, still_away=still_away)
+    out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, environ=environ,
+                     codex_dir=codex_dir, sleep=sleep, still_away=still_away)
     return _with_rulings(out, queue, session)
 
 
@@ -505,7 +514,8 @@ def _missing_output(missing: list[str]) -> dict[str, Any]:
 
 
 def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, session: str, tool_name: str,
-            tool_input: Any, cwd: str, *, home: Path | None, codex_dir: Path | None) -> dict[str, Any] | None:
+            tool_input: Any, cwd: str, *, home: Path, environ: Mapping[str, str],
+            codex_dir: Path | None) -> dict[str, Any] | None:
     """Q13 after the queue halt is read (:func:`levain.consent.limits.check`); ``None`` lets the call on to the gate.
     No hook output stops a Codex turn (``continue: false`` would void the deny), so a limit halt is the limits store's
     own: every later call of the session is denied until an Extend lifts it. A GATED call held and then extended is
@@ -514,11 +524,12 @@ def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSett
 
     hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)
     got = limits.check(AGENT, event, queue, session, tool_name, tool_input, hold=hold, cwd=cwd,
-                       notify=lambda text: notify(settings, text, cwd=queue.directory), resume=resume_meta_of(event))
+                       notify=lambda text: notify(settings, text, cwd=queue.directory),
+                       resume=resume_meta_of(event, environ=environ))
     if got.go:
-        if got.extended and gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
+        if got.extended and gate_class(tool_name, tool_input, cwd, home=home, environ=environ, codex_dir=codex_dir,
                                        protected=protected_paths(Path(queue.directory), settings, home=home,
-                                                                 cwd=cwd)) is not None:
+                                                                 environ=environ, cwd=cwd)) is not None:
             return _deny(limits.retry_text(got.extended))
         return None
     return _deny(got.text)
@@ -545,8 +556,8 @@ def _with_rulings(out: dict[str, Any] | None, queue: ConsentQueue, session: str)
 
 
 def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, tool_name: str,
-               tool_input: Any, cwd: str, session: str, *, home: Path | None, codex_dir: Path | None,
-               sleep: Callable[[float], None],
+               tool_input: Any, cwd: str, session: str, *, home: Path, environ: Mapping[str, str],
+               codex_dir: Path | None, sleep: Callable[[float], None],
                still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     from datetime import datetime, timezone
 
@@ -578,11 +589,13 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     tier: str | None = "irreversible"           # until classified: a failure before that denies with the latch's tier
     what = "this call"
     try:
-        protected = protected_paths(qdir, settings, home=home, cwd=cwd)
+        protected = protected_paths(qdir, settings, home=home, environ=environ, cwd=cwd)
         git_cache: dict[Any, Any] = {}   # one git budget for the gate call (L3 r3 G1), its description included
-        what = _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected,
+        what = _call_what(tool_name, tool_input, cwd, home=home, environ=environ, codex_dir=codex_dir,
+                          protected=protected,
                           git_cache=git_cache)
-        tier = gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected,
+        tier = gate_class(tool_name, tool_input, cwd, home=home, environ=environ, codex_dir=codex_dir,
+                          protected=protected,
                           git_cache=git_cache)
         if tier is None:
             return None
@@ -590,7 +603,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         event_id = tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
         mode = event.get("permission_mode")
         posture = mode if isinstance(mode, str) and mode else None
-        loose = unconfined_state(cwd, home=home, codex_home=codex_dir)
+        loose = unconfined_state(cwd, home=home, environ=environ, codex_home=codex_dir)
         if loose == "on":
             # the operator started this session unconfined (Q10 D2): the mode decides, no ruled allow is spent. A
             # halt was read before this call reached here (:func:`gate`): the env var never releases one. A
@@ -613,7 +626,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
         request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
                              cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id,
-                             resume=resume_meta_of(event), model=event.get("model"))
+                             resume=resume_meta_of(event, environ=environ), model=event.get("model"))
     except Exception as exc:
         note(refused="failed")
         return _deny(f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
@@ -658,7 +671,8 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
                      "Do not retry it and do not achieve it another way.")
 
 
-def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[str, Any] | None:
+def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings, *, home: Path | None,
+                environ: Mapping[str, str]) -> dict[str, Any] | None:
     """:func:`main`'s answer when the gate raised before it could answer (the queue would not open): a deny when
     the event lacks a valid ``session_id``, ``tool_name`` or absolute ``cwd`` (as :func:`gate` denies it), when the call is
     gated or cannot be classified, AND for every call while the queue store exists, since a halt on this session
@@ -670,10 +684,12 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
         if any(not isinstance(v, str) or not v for v in (tool_name, cwd, session)) or not os.path.isabs(cwd):
             tier, what = "irreversible", "this call"
         else:
-            protected = protected_paths(queue_dir, settings, cwd=cwd)
+            protected = protected_paths(queue_dir, settings, home=home, environ=environ, cwd=cwd)
             git_cache: dict[Any, Any] = {}   # one git budget for the call
-            tier = gate_class(tool_name, tool_input, cwd, protected=protected, git_cache=git_cache)
-            what = _call_what(tool_name, tool_input, cwd, protected=protected, git_cache=git_cache)
+            tier = gate_class(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected,
+                              git_cache=git_cache)
+            what = _call_what(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected,
+                              git_cache=git_cache)
     except Exception:
         tier, what = "irreversible", "this call"
     if tier is None and not os.path.lexists(queue_dir / QUEUE_DB_NAME):
@@ -681,7 +697,7 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
     return could_not_run(what)
 
 
-def queue_unresolved(event: Any) -> dict[str, Any] | None:
+def queue_unresolved(event: Any, *, home: Path | None, environ: Mapping[str, str]) -> dict[str, Any] | None:
     """:func:`main`'s answer for a PreToolUse when no queue directory could be resolved (:func:`default_queue_dir`
     raised: a ``$LEVAIN_HOME`` that cannot be expanded, or no home): with no queue there is no halt to read and no
     settings, so only the levain home is classified (:func:`levain.consent.adapters.claude_code.levain_home_protected`, which
@@ -692,11 +708,13 @@ def queue_unresolved(event: Any) -> dict[str, Any] | None:
         session = event.get("session_id")
         if any(not isinstance(v, str) or not v for v in (tool_name, cwd, session)) or not os.path.isabs(cwd):
             return could_not_run("this call")
-        protected = tuple(levain_home_protected(None, cwd))
+        protected = tuple(levain_home_protected(home, cwd, environ=environ))
         git_cache: dict[Any, Any] = {}
-        if gate_class(tool_name, tool_input, cwd, protected=protected, git_cache=git_cache) is None:
+        if gate_class(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected,
+                      git_cache=git_cache) is None:
             return None
-        what = _call_what(tool_name, tool_input, cwd, protected=protected, git_cache=git_cache)
+        what = _call_what(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected,
+                          git_cache=git_cache)
     except Exception:
         what = "this call"
     return could_not_run(what)
@@ -716,7 +734,8 @@ def could_not_run(what: str) -> dict[str, Any]:
 # yet), is denied; GO lets the rest of this gate run (never an allow); the broker down, refusing or out of shape
 # denies.
 
-def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = None, client: Any = None,
+def slot_gate(event: Any, *, home: Path, environ: Mapping[str, str], codex_dir: Path | None = None,
+              client: Any = None,
               hold: float = DEFAULT_GATE_HOLD, expected_uid: int | None = None,
               sleep: Callable[[float], None] = time.sleep,
               monotonic: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
@@ -744,9 +763,10 @@ def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = 
         tool_input = {}
     # GATE first, before the call is classified (F10 S2b-2): the session's halt and its limits, every call
     try:
-        if queue_socket_planted(cwd, home=home, codex_home=codex_dir):
+        if queue_socket_planted(cwd, home=home, environ=environ, codex_home=codex_dir):
             return could_not_run("this call")
-        client = client if client is not None else broker_client.BrokerClient.from_env(expected_uid=expected_uid)
+        client = client if client is not None else broker_client.BrokerClient.from_env(environ,
+                                                                                      expected_uid=expected_uid)
         tool_use_id = event.get("tool_use_id")
         stopped = broker_client.gate_check(
             client, agent=AGENT, tool_name=tool_name, tool_input=tool_input,
@@ -757,18 +777,22 @@ def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = 
         return _deny(stopped)
     try:
         git_cache: dict[Any, Any] = {}   # one git budget for the call, its description included
-        tier = gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
+        tier = gate_class(tool_name, tool_input, cwd, home=home, environ=environ, codex_dir=codex_dir,
+                          git_cache=git_cache)
         if tier is None:
-            return _slot_ungated(event, session, tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
+            return _slot_ungated(event, session, tool_name, tool_input, cwd, home=home, environ=environ,
+                                 codex_dir=codex_dir,
                                  git_cache=git_cache, client=client, hold=hold, expected_uid=expected_uid,
                                  sleep=sleep, monotonic=monotonic)
-        what = _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
+        what = _call_what(tool_name, tool_input, cwd, home=home, environ=environ, codex_dir=codex_dir,
+                          git_cache=git_cache)
     except Exception:  # noqa: BLE001 - a call that cannot be classified is denied
         return could_not_run("this call")
     try:
-        if queue_socket_planted(cwd, home=home, codex_home=codex_dir):
+        if queue_socket_planted(cwd, home=home, environ=environ, codex_home=codex_dir):
             return could_not_run(what)
-        client = client if client is not None else broker_client.BrokerClient.from_env(expected_uid=expected_uid)
+        client = client if client is not None else broker_client.BrokerClient.from_env(environ,
+                                                                                      expected_uid=expected_uid)
         tool_use_id = event.get("tool_use_id")
         request = broker_client.gate_request(
             agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
@@ -784,7 +808,8 @@ def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = 
 
 
 def _slot_ungated(event: Mapping[str, Any], session: str, tool_name: str, tool_input: Any, cwd: str, *,
-                  home: Path | None, codex_dir: Path | None, git_cache: dict[Any, Any], client: Any, hold: float,
+                  home: Path, environ: Mapping[str, str], codex_dir: Path | None, git_cache: dict[Any, Any],
+                  client: Any, hold: float,
                   expected_uid: int | None, sleep: Callable[[float], None],
                   monotonic: Callable[[], float]) -> dict[str, Any] | None:
     """Claude Code's :func:`levain.consent.adapters.claude_code._slot_ungated`, in Codex's words: a file write
@@ -794,7 +819,8 @@ def _slot_ungated(event: Mapping[str, Any], session: str, tool_name: str, tool_i
 
     def what() -> str:
         try:
-            return _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
+            return _call_what(tool_name, tool_input, cwd, home=home, environ=environ, codex_dir=codex_dir,
+                              git_cache=git_cache)
         except Exception:  # noqa: BLE001 - a call that cannot be described is still denied
             return "this call"
 
@@ -802,7 +828,7 @@ def _slot_ungated(event: Mapping[str, Any], session: str, tool_name: str, tool_i
         member = broker_client.grant_member(AGENT, tool_name, tool_input, cwd)
         if member is None and tool_name != PATCH_TOOL:
             return None
-        if queue_socket_planted(cwd, home=home, codex_home=codex_dir):
+        if queue_socket_planted(cwd, home=home, environ=environ, codex_home=codex_dir):
             return could_not_run(what())
         tool_use_id = event.get("tool_use_id")
         got = broker_client.file_ungated(
@@ -819,7 +845,8 @@ def _slot_ungated(event: Mapping[str, Any], session: str, tool_name: str, tool_i
     return decision_output(decision, SLOT_HOW)
 
 
-def _slot_main(stdin: IO[str], stdout: IO[str], *, expected_uid: int | None = None) -> int:
+def _slot_main(stdin: IO[str], stdout: IO[str], *, home: Path | None, environ: Mapping[str, str],
+               expected_uid: int | None = None) -> int:
     """:func:`main` in a slot session: no ConsentQueue, no settings file, no ledger. Always exits 0. A stdin that
     is not a JSON object is :func:`could_not_run`'s deny (Claude Code's :func:`_slot_main` says why)."""
     event: Any = None
@@ -827,7 +854,8 @@ def _slot_main(stdin: IO[str], stdout: IO[str], *, expected_uid: int | None = No
         event = json.loads(stdin.read())
         if not isinstance(event, Mapping):
             raise ValueError("the hook event is not a JSON object")
-        out = slot_gate(event, expected_uid=expected_uid) if event.get("hook_event_name") == GATE_EVENT \
+        out = slot_gate(event, home=home, environ=environ,
+                        expected_uid=expected_uid) if event.get("hook_event_name") == GATE_EVENT \
             else None   # a PermissionRequest in a slot: no decision
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
@@ -846,13 +874,13 @@ def _slot_main(stdin: IO[str], stdout: IO[str], *, expected_uid: int | None = No
     return 0
 
 
-def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
+def _queue_for(queue_dir: Path, settings: AdapterSettings, *, home: Path) -> ConsentQueue:
     if settings.cockpit_data_root:
         root = Path(settings.cockpit_data_root)
         source = authority_source(root / "cockpit.db", anchor=anchor_path(root))
     else:
         source = authority_source(queue_dir, anchor=None)  # no authority: nothing can verify
-    return ConsentQueue(queue_dir, authority=source)
+    return ConsentQueue(queue_dir, authority=source, home=home)
 
 
 def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO[str] | None = None) -> int:
@@ -867,22 +895,27 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
     queue_dir: Path | None = None
     settings = AdapterSettings()   # set before the try: a raising load_settings leaves it, so gate_failed still
     # classifies the call (a store write denied, an ordinary call no decision), never with None
-    if in_slot():
-        return _slot_main(stdin, stdout)
+    # H4: the one read of the process environment and home; everything below is handed them
+    environ: Mapping[str, str] = os.environ
+    home = _bound_home()
+    if in_slot(environ):
+        return _slot_main(stdin, stdout, home=home, environ=environ)
     try:
         parser = argparse.ArgumentParser(prog="levain-consent-codex")
         parser.add_argument("--queue-dir", default=None)
         parser.add_argument("--max-hold", type=float, default=DEFAULT_MAX_HOLD)
         args = parser.parse_args(argv)
-        queue_dir = Path(args.queue_dir) if args.queue_dir else default_queue_dir()
+        queue_dir = Path(args.queue_dir) if args.queue_dir else queue_dir_for(environ)
+        if home is None:
+            raise RuntimeError("could not determine the home directory")
         settings = load_settings(queue_dir)
-        queue = _queue_for(queue_dir, settings)   # one queue: the away mark, the hold and every recheck read it
+        queue = _queue_for(queue_dir, settings, home=home)   # one queue: the away mark, the hold and every recheck
         settings = with_away_mark(settings, queue_dir, AGENT, queue=queue)
         event = json.loads(stdin.read())
         if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
-            out = gate(event, queue, settings)
+            out = gate(event, queue, settings, home=home, environ=environ)
         else:
-            out = decide(event, queue, settings, max_hold=args.max_hold,
+            out = decide(event, queue, settings, environ=environ, home=home, max_hold=args.max_hold,
                          still_away=still_away_from(queue_dir / SETTINGS_NAME, settings, queue=queue))
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
@@ -893,7 +926,8 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
                 event = json.loads(stdin.read())   # not read yet: the failure came first
             out = None
             if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
-                out = gate_failed(event, queue_dir, settings) if queue_dir is not None else queue_unresolved(event)
+                out = gate_failed(event, queue_dir, settings, home=home, environ=environ) \
+                    if queue_dir is not None else queue_unresolved(event, home=home, environ=environ)
             if out is not None:
                 stdout.write(json.dumps(out) + "\n")
                 stdout.flush()

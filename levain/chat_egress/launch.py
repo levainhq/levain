@@ -12,7 +12,8 @@
      that check returns;
   4a. the mode read once (`launch_mode`): a value outside `classify.MODES` is refused. The session header and the
      egress digest are derived from that read, never from a second input (the digest fixes the mode at launch; a
-     `LiveSetting` is still read live per request by the decider: Q-R15-9);
+     `LiveSetting` is still read live per request by the decider, ratcheted from that read: a tightening applies
+     live and stays, a loosening never applies to this launch: Q-R15-9);
   4b. 19a: from the authority replay the routes were built from, the keyed records expiring within
      `renew.RENEW_DUE` are computed (a naive `now` or an authority that does not read is refused here);
   5. the listener pair: the HTTP(S) listener (handed to the glue as an fd) and the SOCKS refuser (`socks`), both on
@@ -207,7 +208,8 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
         srt_dist = srt_pin.check(srt_prefix).dist
     except srt_pin.SrtProblem as exc:
         raise EgressRefused(f"chat network refused: {exc}") from None
-    open_network = launch_mode(mode) == classify.OPEN_NETWORK
+    launched = launch_mode(mode)
+    open_network = launched == classify.OPEN_NETWORK
     events = Path(events)
     if not events.name:
         raise EgressRefused(f"the events path names no file: {str(events)!r}")
@@ -276,7 +278,7 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
         decider = dm.Decider(ours, obs_ours, launch_id=launch_id, records=records, routes=routes, mode=mode,
                              liveness=liveness, credentials=credentials, cards=cards,
                              resolver=Resolver(seams.lookup if seams and seams.lookup else system_lookup),
-                             limits=limits, link_fault=seams.link_fault if seams else None)
+                             limits=limits, link_fault=seams.link_fault if seams else None, launch_mode=launched)
         deciders.append(decider)
         decider.start()
         socks_srv.start()

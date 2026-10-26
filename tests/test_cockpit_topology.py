@@ -28,6 +28,7 @@ from levain.consent.queue import ConsentQueue, authority_source
 from levain.consent.questions import QuestionStore
 from tests.test_cockpit_activity import _git, _repo, _session, _stamp
 from tests.test_cockpit_k2a import _install
+from tests._h4 import h4_home
 
 NOW_ISO = "2026-10-19T15:00:00+00:00"
 
@@ -213,7 +214,7 @@ def _queue(tmp_path: Path, monkeypatch) -> tuple[Path, ConsentQueue, QuestionSto
     monkeypatch.setenv("LEVAIN_HOME", str(home))
     cdir = home / "consent"
     cdir.mkdir(parents=True, mode=0o700)
-    q = ConsentQueue(cdir, authority=authority_source(cdir, anchor=None))
+    q = ConsentQueue(cdir, authority=authority_source(cdir, anchor=None), home=h4_home())
     return cdir, q, QuestionStore(cdir)
 
 

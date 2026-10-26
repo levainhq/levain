@@ -14,6 +14,7 @@ cannot read. Stdlib only.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -32,16 +33,18 @@ def landing_tier(repo: str, paths: Iterable[str], *, queue_dir: Path | None = No
     qdir = Path(queue_dir) if queue_dir is not None else default_queue_dir()
     home = Path(home) if home is not None else Path.home()
     codex_dir = Path(codex_dir) if codex_dir is not None else codex.codex_home()
-    protected = tuple({*claude_code.protected_paths(qdir, claude_code.load_settings(qdir), home=home, cwd=repo),
-                       *claude_code.protected_paths(qdir, codex.load_settings(qdir), home=home, cwd=repo)})
+    protected = tuple({*claude_code.protected_paths(qdir, claude_code.load_settings(qdir), home=home,
+                                                    environ=os.environ, cwd=repo),
+                       *claude_code.protected_paths(qdir, codex.load_settings(qdir), home=home,
+                                                    environ=os.environ, cwd=repo)})
     git_cache: dict[Any, Any] = {}       # one git budget for the whole change set, as one gate call has
     judged = 0
     for path in paths:
         if not isinstance(path, str) or not path.startswith("/"):
             raise ValueError(f"a landing path is absolute, not {str(path)[:80]!r}")
         judged += 1
-        if claude_code.targets_agent_config("Write", {"file_path": path}, repo, home=home, protected=protected,
-                                            git_cache=git_cache):
+        if claude_code.targets_agent_config("Write", {"file_path": path}, repo, home=home, environ=os.environ,
+                                            protected=protected, git_cache=git_cache):
             return "T3"
         if codex._in_codex_config(path, repo, home, codex_dir):
             return "T3"

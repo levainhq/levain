@@ -20,6 +20,7 @@ from levain.install import refresh_adapter
 from tests.test_repin_on_install import make_install  # noqa: F401  (fixture)
 
 from tests.test_subfolder_hooks import cc_local_layout  # noqa: E402,F401  (fixture)
+from tests._h4 import h4_env, h4_home
 
 # levain's hooks live in settings.local.json in these tests: a git-root workspace's layout (test_subfolder_hooks)
 pytestmark = pytest.mark.usefixtures("cc_local_layout")
@@ -456,10 +457,10 @@ def test_a_moved_claude_install_s_consent_command_falls_through(make_install, tm
 def test_a_write_to_an_install_s_hook_scripts_is_agent_config(tmp_path, name):
     target = tmp_path / "inst" / "activation" / "hooks" / name
     assert claude_code.targets_agent_config("Write", {"file_path": str(target), "content": "x"}, str(tmp_path / "inst"),
-                                            home=tmp_path / "home")
+                                            home=tmp_path / "home", environ=h4_env())
     patch = f"*** Begin Patch\n*** Add File: {target}\n+x\n*** End Patch\n"
     assert codex.targets_agent_config("apply_patch", {"command": patch}, str(tmp_path / "inst"),
-                                      home=tmp_path / "home", codex_dir=tmp_path / "codex-home")
+                                      home=tmp_path / "home", codex_dir=tmp_path / "codex-home", environ=h4_env())
 
 
 @pytest.mark.parametrize("mod", [claude_code, codex])
@@ -468,7 +469,7 @@ def test_away_off_with_no_cockpit_files_nothing(tmp_path, mod):
 
     qdir = tmp_path / "q"
     qdir.mkdir(mode=0o700)
-    queue = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
+    queue = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None), home=h4_home())
     cockpit = tmp_path / "cockpit"
     settings = mod.AdapterSettings(away_mode=False, away_hold_seconds=0, cockpit_data_root=str(cockpit))
     event = {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "ls"},
@@ -483,11 +484,11 @@ def test_away_off_with_no_cockpit_files_nothing(tmp_path, mod):
                 return 0
             return c.execute("SELECT count(*) FROM requests").fetchone()[0]
 
-    assert mod.decide(event, queue, settings, home=tmp_path / "home") is None
+    assert mod.decide(event, queue, settings, home=tmp_path / "home", environ=h4_env()) is None
     assert rows() == 0
     # control: away mode on files the request (and, with nothing to answer it, withdraws it)
     away = mod.AdapterSettings(away_mode=True, away_hold_seconds=0, cockpit_data_root=None)
-    assert mod.decide(event, queue, away, home=tmp_path / "home") is None
+    assert mod.decide(event, queue, away, home=tmp_path / "home", environ=h4_env()) is None
     assert rows() == 1
     cockpit.mkdir()
     (cockpit / "cockpit.db").write_bytes(b"")

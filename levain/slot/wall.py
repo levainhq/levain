@@ -594,7 +594,10 @@ VERIFY_WRITABLE = (".verify",)
 #: s5 §5b (HEAD_r10 Q-r7-5): the one protected object, the users' data, under every spelling macOS gives it.
 EXPORT_READ_DENIED = ("/Users", "/System/Volumes/Data/Users", "/Volumes")
 #: s5 §5b: an export target's devices on macOS, NOT the slot's set (no tty, no ptmx, no dtracehelper).
-EXPORT_DEVICES = ("/dev/null", "/dev/zero")
+#: ``/dev/urandom``: the target's interpreter (``/usr/bin/python3``) reads it at startup for hash randomization and
+#: exits ``Fatal Python error`` without it (measured in a slot-runtime VM, 1026+8 wallexec). The profile allows each
+#: device for write as well as read; the node is ``crw-rw-rw-`` on macOS, so any account can write it outside a wall.
+EXPORT_DEVICES = ("/dev/null", "/dev/zero", "/dev/urandom")
 #: s5 §5b: the start of the Mach allow-list; the list git and the importer need is measured on the VM (5g).
 EXPORT_MACH_ALLOW = ("com.apple.system.opendirectoryd.libinfo",)
 #: s5 §5b: ``--cap-drop ALL`` with only the two capabilities the stage spends on its drop added back. The stage
@@ -615,7 +618,7 @@ _EXPORT_SCOPE = {"importer": "export.scope", "verifier": "verify.scope"}
 def export_wall_facts(host: str, role: str) -> WallFacts:
     """The importer's or the verifier's wall (s5 §5b capability list): the one writable path ``L/export/.work``
     (``.verify``), the cwd there, fd 4 kept (the bounded result pipe). macOS: ``(allow default)`` reads less the
-    three user-data subpaths, ``/dev/null`` and ``/dev/zero`` the only devices, all network and IPC denied, Mach
+    three user-data subpaths, :data:`EXPORT_DEVICES` the only devices, all network and IPC denied, Mach
     denied but for the allow-list. Linux: fresh net, IPC, PID and UTS namespaces, a new session, capabilities
     dropped (:data:`EXPORT_CAPS`), ro ``/usr`` ``/etc`` (+ the import tree and helper dir where ``/usr`` does not
     hold them), bwrap's minimal ``/dev``, nothing of the operator's and no socket dir."""
@@ -1086,12 +1089,23 @@ def _read_cmd(argv: Sequence[str], run) -> str:
     return r.stdout
 
 
+def check_pf_enabled(info_text: str) -> None:
+    """pf itself is on: a line of ``pfctl -s info`` that starts ``Status: Enabled`` (measured after a reboot in
+    r3c10-vm 10-26: ``Status: Enabled for 0 days 00:00:10           Debug: Urgent``). A loaded anchor enforces nothing
+    while pf is disabled, so anything else is refused (L3 r1 codex HIGH, lane pfboot)."""
+    if not any(line.split()[:2] == ["Status:", "Enabled"] for line in info_text.splitlines()):
+        first = next((line.strip() for line in info_text.splitlines() if line.strip()), "")
+        raise Refused("pf-disabled", f"pfctl -s info does not report Status: Enabled ({first[:80]!r})")
+
+
 def macos_egress_ready(slot, ids: Mapping[str, int], *,
                        run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> None:
-    """:func:`check_egress_ready` on the live reads: ``pfctl -a com.apple/levain -sr`` (§23's sub-anchor,
-    the one doctor reads) and ``ifconfig lo0``. Root only; the reads are the ``run`` seam."""
+    """:func:`check_pf_enabled` on ``pfctl -s info``, then :func:`check_egress_ready` on the live reads:
+    ``pfctl -a com.apple/levain -sr`` (§23's sub-anchor, the one doctor reads) and ``ifconfig lo0``. Root only; the
+    reads are the ``run`` seam."""
     from levain.slot.pf import ANCHOR, IFCONFIG, PFCTL
 
+    check_pf_enabled(_read_cmd((PFCTL, "-s", "info"), run))
     check_egress_ready(slot, ids, pf_text=_read_cmd((PFCTL, "-a", ANCHOR, "-sr"), run),
                        ifconfig_text=_read_cmd((IFCONFIG, "lo0"), run))
 
@@ -1661,7 +1675,8 @@ __all__ = ["EXEC_FD", "EXEC_OK", "EXEC_REFUSED", "EXPORT_ACCOUNT", "EXPORT_CAPS"
            "EXPORT_GROUPS", "EXPORT_MACH_ALLOW", "EXPORT_NPROC", "EXPORT_READ_DENIED", "EXPORT_TARGETS",
            "EXPORT_WRITABLE", "FORWARDER_PORT", "HASH_OBJECT_PREFIX", "RESULT_FD", "VERIFY_WRITABLE", "WallFacts",
            "LinuxLaunch", "NPROC", "OsCalls", "Principal", "READY_FD", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
-           "Spec", "TARGETS", "cgroup_dir", "check_egress_ready", "check_profile_text", "clone_argv",
+           "Spec", "TARGETS", "cgroup_dir", "check_egress_ready", "check_pf_enabled", "check_profile_text",
+           "clone_argv",
            "drop_and_assert", "exec_launch", "expected_slot_rules", "export_launch_spec", "export_linux_launch_argv",
            "export_principal", "export_wall_facts", "hash_object_argv", "importer_view_args", "launch_spec",
            "linux_launch_argv", "linux_view_args", "ls_files_argv", "macos_egress_ready", "macos_launch_argv",

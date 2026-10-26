@@ -584,7 +584,7 @@ def test_dispatch_dir_setgid_keys_group(st):
         assert (row.owner, row.group, row.mode) == ("_levain_control", "_levain_keys", 0o2750), row
         steps = [s.argv for s in layout.row_steps(host, [row]) if s.argv]
         chown = [a for a in steps if a[0].endswith("chown")]
-        chmod = [a for a in steps if a[0].endswith("chmod")]
+        chmod = [a for a in steps if a[0].endswith("chmod") and a[1] != "-N"]    # -N: the macOS ACL clear
         assert chown == [(chown[0][0], "_levain_control:_levain_keys", str(row.path))], steps
         assert chmod == [(chmod[0][0], "2750", str(row.path))], steps
         assert steps.index(chown[0]) < steps.index(chmod[0])   # the mode (setgid) set after the chown

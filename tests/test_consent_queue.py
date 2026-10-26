@@ -29,6 +29,7 @@ from levain.consent import (
 )
 from levain.consent.receipt_log import head as receipts_head
 from levain.consent.record import ExternalGateRequest, redact_display, tool_input_digest
+from tests._h4 import h4_home
 
 NOW = datetime(2026, 10, 13, 20, 0, tzinfo=timezone.utc)
 
@@ -109,7 +110,7 @@ def clock():
 
 @pytest.fixture
 def queue(tmp_path, clock, authority):
-    return ConsentQueue(tmp_path / "levain-home" / "consent", authority=authority, clock=clock)
+    return ConsentQueue(tmp_path / "levain-home" / "consent", authority=authority, clock=clock, home=h4_home())
 
 
 class FakeAgent:
@@ -139,7 +140,7 @@ def signed(queue, request, key, decision="allow", **override):
 # --- the fake external agent, end to end -------------------------------------------------------------------
 
 def test_signed_allow_resolves_a_waiting_agent(tmp_path, keys, authority):
-    q = ConsentQueue(tmp_path / "consent", authority=authority)  # the real clock: the agent really waits
+    q = ConsentQueue(tmp_path / "consent", authority=authority, home=h4_home())  # the real clock: the agent really waits
     request = FakeAgent(q).ask()
     got = {}
     waiter = threading.Thread(target=lambda: got.setdefault("d", q.await_decision(request.id, 20)))
@@ -158,7 +159,7 @@ def test_signed_allow_resolves_a_waiting_agent(tmp_path, keys, authority):
 
 
 def test_silence_expires_and_is_no_decision(tmp_path, authority):
-    q = ConsentQueue(tmp_path / "consent", authority=authority)
+    q = ConsentQueue(tmp_path / "consent", authority=authority, home=h4_home())
     request = FakeAgent(q, "codex").ask(hold=timedelta(milliseconds=300))
     t0 = time.monotonic()
     assert q.await_decision(request.id, 10, poll=0.05) is None
@@ -371,7 +372,7 @@ def test_a_key_revoked_after_it_answered_delivers_nothing(tmp_path, keys, clock)
     log = Log(tmp_path / "auth", keys)
     log.enrol("laptop", "laptop-presence")
     log.enrol("phone", "display-phone")
-    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     request = FakeAgent(queue).ask()
     payload, sig = signed(queue, request, keys["phone"])
     assert queue.answer(request.id, payload, sig).decision == "allow"
@@ -389,7 +390,7 @@ def test_an_answer_is_checked_against_a_fresh_replay(tmp_path, keys, clock):
     log = Log(tmp_path / "auth", keys)
     log.enrol("laptop", "laptop-presence")
     log.enrol("phone", "display-phone")
-    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     request = FakeAgent(queue).ask()
     payload, sig = signed(queue, request, keys["phone"])
     log.revoke("phone")
@@ -404,7 +405,7 @@ def test_an_unavailable_authority_is_no_decision(tmp_path, keys, clock):
     log = Log(tmp_path / "auth", keys)
     log.enrol("laptop", "laptop-presence")
     log.enrol("phone", "display-phone")
-    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     a, b = FakeAgent(queue).ask("a"), FakeAgent(queue).ask("b")
     payload, sig = signed(queue, a, keys["phone"])
     queue.answer(a.id, payload, sig)
@@ -540,7 +541,7 @@ def test_authority_must_be_the_replaying_source(tmp_path, authority):
 
     for bad in (snap, lambda: snap, Stale(tmp_path / "x.db", anchor=None)):
         with pytest.raises(ConsentError, match="AuthoritySource"):
-            ConsentQueue(tmp_path / "consent", authority=bad)
+            ConsentQueue(tmp_path / "consent", authority=bad, home=h4_home())
 
 
 def test_no_authority_is_no_decision(tmp_path, keys, clock):
@@ -548,7 +549,7 @@ def test_no_authority_is_no_decision(tmp_path, keys, clock):
     authority: the source raises with RequestAuthority.capture's reason and no answer is authority."""
     from levain.consent.queue import AuthoritySource
     log = Log(tmp_path, keys)
-    request_queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    request_queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
     request = FakeAgent(request_queue).ask()
     payload = request_queue.answer_payload(request.id, "allow", keys["laptop"].fp)
     sig = keys["laptop"].sign(answer_message(payload))
@@ -664,7 +665,7 @@ def test_store_is_owner_only_and_refuses_a_shared_directory(tmp_path, queue):
     shared.mkdir(mode=0o755)
     os.chmod(shared, 0o755)
     with pytest.raises(QueueStoreError, match="0700"):
-        FakeAgent(ConsentQueue(shared, authority=queue._authority)).ask()
+        FakeAgent(ConsentQueue(shared, authority=queue._authority, home=h4_home())).ask()
 
 
 def test_default_dir_is_levain_home_consent(monkeypatch, tmp_path):
@@ -777,7 +778,7 @@ def _granted_queue(tmp_path, keys, tools=("Edit", "Write")):
     log.link({"op": "create_grant", "grant": {
         "id": "g1", "kind": "consent", "agent": "claude_code", "tools": sorted(tools), "workspace": str(ws),
         "postures": ["default"], "expires_at": utc_stamp(datetime.now(timezone.utc) + timedelta(days=1))}})
-    q = ConsentQueue(tmp_path / "consent", authority=log.source)
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, home=h4_home())
 
     def ask(tool_input, *, tool="Edit", cwd=str(ws), posture="default"):
         r = q.file(agent="claude_code", agent_session_id="s1", tool_name=tool, tool_input=tool_input, cwd=cwd,
@@ -889,7 +890,7 @@ def test_a_grant_answers_nothing_once_its_workspace_is_home(tmp_path, keys, monk
     r, d = ask(inside, tool="Read")
     assert d is not None
     for home in (ws, ws / "sub"):
-        monkeypatch.setenv("HOME", str(home))
+        q.home = home   # H4: the queue holds the home its hook bound (was $HOME, read at each decision)
         assert q.decision(r.id, tool_input=inside, posture="default") is None, home
         assert ask(inside, tool="Read")[1] is None, home
 

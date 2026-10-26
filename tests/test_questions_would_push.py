@@ -14,6 +14,7 @@ from levain.consent.questions import QuestionStore
 from levain.consent.record import RULING_NAMESPACE, ruling_message
 from levain.phone_server import PhoneError, make_phone_server
 from tests.test_consent_queue import authority, keys  # noqa: F401 - the shared fixtures
+from tests._h4 import h4_home
 
 S = "sess-q3"
 
@@ -33,7 +34,7 @@ def world(tmp_path, authority, monkeypatch):  # noqa: F811 - the shared fixture
     qdir = base / "home" / "consent"
     qdir.mkdir(parents=True, mode=0o700)
     (base / "home").chmod(0o700)
-    queue = ConsentQueue(qdir, authority=authority)
+    queue = ConsentQueue(qdir, authority=authority, home=h4_home())
     monkeypatch.setattr(push_gate, "_signable", lambda settings: True)
     monkeypatch.setattr(push_gate, "_queue", lambda d, settings: queue)
     monkeypatch.chdir(repo)
