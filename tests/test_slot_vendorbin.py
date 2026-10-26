@@ -561,8 +561,8 @@ def test_v8_the_active_name_is_one_link_to_a_complete_versioned_package(env):
     ok, why = _codex_copy(env)
     assert ok and "copied" in why, why
     assert _active_root(env.prefix).name.startswith("0.163.0-")
-    left = sorted(p.name for p in (env.prefix / "codex").iterdir())
-    assert left == [_active_root(env.prefix).name] and first not in left, left
+    left = sorted(p.name for p in (env.prefix / "codex").iterdir() if p.name != ".lock")
+    assert left == sorted([first, _active_root(env.prefix).name]), left
     assert not any(p.name.endswith(".partial") for p in env.prefix.rglob("*"))
 
 
@@ -683,3 +683,107 @@ def test_v13_a_probe_that_raises_anything_is_a_row_not_a_crash(tmp_path):
 
     [r] = D._check_vendor_copies(host="darwin", store=tmp_path, home=str(tmp_path), state=state)
     assert r.warn and "UNREADABLE" in r.detail and "bad probe" in r.detail
+
+
+# --- f3 (1026-14 RULINGS "vendorbin f2" V14-V15) ----------------------------------------------------------------------
+
+def _versions(prefix: Path) -> list:
+    return sorted(p.name for p in (prefix / "codex").iterdir() if not p.name.startswith("."))
+
+
+def test_v14_an_upgrade_keeps_the_version_it_replaced(env):
+    """RED at d8ab0b43: every other version was removed right after the switch, so a session started on v1 (codex
+    resolves its PHYSICAL version dir at start) met ENOENT on its next spawn of ``codex-path/rg``."""
+    _codex_pkg(env)
+    assert _codex_copy(env)[0]
+    running = os.path.realpath(_active_root(env.prefix) / "codex-path" / "rg")
+    v1 = _active_root(env.prefix).name
+    _v2(env)
+    ok, why = _codex_copy(env)
+    assert ok and "copied" in why, why
+    v2 = _active_root(env.prefix).name
+    assert v2 != v1 and os.path.isfile(running), running
+    assert _versions(env.prefix) == sorted([v1, v2])
+    _codex_pkg(env, extra={"bin/codex": (MACHO + b"v3", 0o755)})
+    ok, why = _codex_copy(env)
+    assert ok and "copied" in why, why
+    v3 = _active_root(env.prefix).name
+    assert _versions(env.prefix) == sorted([v2, v3]) and not os.path.exists(running), _versions(env.prefix)
+    assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid()) == ""
+
+
+def test_v14_a_failed_upgrade_keeps_both_versions_it_found(env):
+    _codex_pkg(env)
+    _codex_copy(env)
+    _v2(env)
+    _codex_copy(env)
+    before = _versions(env.prefix)
+    _codex_pkg(env, extra={"bin/codex": (MACHO + b"v3", 0o755)})
+
+    def fsync(fd):
+        raise OSError(5, "Input/output error")
+    ok, why = _codex_copy(env, fsync=fsync)
+    assert not ok and "unchanged" in why, why
+    assert _versions(env.prefix) == before
+
+
+def test_v15_two_concurrent_copies_take_turns(env):
+    """RED at d8ab0b43: both runs used ``codex/.staging.partial``, so the second removed the first's half-built tree
+    and the first failed."""
+    import threading
+    import time
+
+    _codex_pkg(env)
+    _codex_copy(env)
+    _v2(env)
+    second_started = threading.Event()
+    seen: dict = {}
+    results: dict = {}
+
+    def slow_fsync(fd):
+        if "waited" not in seen:
+            seen["waited"] = True
+            t2.start()
+            second_started.wait(5)
+            time.sleep(0.4)
+            seen["second_done_early"] = not t2.is_alive()
+        os.fsync(fd)
+
+    def first():
+        results[1] = _codex_copy(env, fsync=slow_fsync)
+
+    def second():
+        second_started.set()
+        results[2] = _codex_copy(env)
+    t1, t2 = threading.Thread(target=first), threading.Thread(target=second)
+    t1.start()
+    t1.join(30)
+    t2.join(30)
+    assert not t1.is_alive() and not t2.is_alive()
+    assert results[1][0] and results[2][0], results
+    assert seen["second_done_early"] is False
+    assert "already" in results[2][1], results[2]
+    assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid()) == ""
+    assert (_active_root(env.prefix) / "codex-path" / "rg").read_bytes() == MACHO + b"rg-v2"
+    assert not [p for p in (env.prefix / "codex").iterdir() if p.name.startswith(".staging")]
+
+
+def test_v15_a_stale_staging_dir_from_a_crashed_run_is_removed(env):
+    _codex_pkg(env)
+    _codex_copy(env)
+    stale = env.prefix / "codex" / ".staging.12345.dead.partial"
+    _exe(stale / "bin" / "codex", MACHO + b"half")
+    _v2(env)
+    ok, why = _codex_copy(env)
+    assert ok and "copied" in why, why
+    assert not os.path.lexists(stale)
+    assert not [p for p in (env.prefix / "codex").iterdir() if p.name.startswith(".staging")]
+
+
+def test_v15_a_link_at_the_lock_is_refused(env):
+    _codex_pkg(env)
+    (env.prefix / "codex").mkdir()
+    os.symlink(env.tmp / "elsewhere", env.prefix / "codex" / ".lock")
+    ok, why = _codex_copy(env)
+    assert not ok and ".lock" in why, why
+    assert not os.path.lexists(env.tmp / "elsewhere")
