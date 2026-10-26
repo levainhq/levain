@@ -41,10 +41,17 @@ def test_urgent_pushes_while_home_and_active():
     assert decide(NOW, None, ACTIVE, urgent=True).push is True
 
 
-def test_quiet_holds_even_urgent():
+def test_quiet_holds_an_ordinary_ping_but_urgent_pushes_through():
     q = _w("quiet", until=NOW + 600)
     assert decide(NOW, q, INACTIVE).push is False
-    assert decide(NOW, q, ACTIVE, urgent=True).push is False
+    assert decide(NOW, q, ACTIVE).state == "muted"
+    d = decide(NOW, q, ACTIVE, urgent=True)
+    assert (d.push, d.state) == (True, "pushing")
+
+
+def test_sleep_holds_urgent_too():
+    d = decide(NOW, _w("sleep"), INACTIVE, urgent=True)   # no input since the word, said 100 s ago
+    assert (d.push, d.state, d.by) == (False, "muted", "sleep")
 
 
 def test_loud_overrides_quiet_and_sleep_and_an_active_desk():
@@ -83,8 +90,9 @@ def test_expired_quiet_stops_holding_and_expired_loud_stops_overriding():
     assert decide(NOW + 700, _w("quiet", until=NOW + 600), INACTIVE).push is True
 
 
-def test_no_state_precedence_urgent_not_muted_beats_active_desk_and_quiet_beats_away():
-    assert decide(NOW, _w("quiet", until=NOW + 600), ACTIVE, urgent=True).push is False
+def test_no_state_precedence_urgent_beats_quiet_and_an_active_desk_and_quiet_beats_away():
+    assert decide(NOW, _w("quiet", until=NOW + 600), ACTIVE, urgent=True).push is True
+    assert decide(NOW, _w("quiet", until=NOW + 600), ACTIVE).push is False
     assert decide(NOW, _w("away", ts=NOW - 100), ACTIVE).push is True
 
 
@@ -205,10 +213,20 @@ def test_wiring_quiet_holds_consent_and_loud_pushes_again(tmp_path, monkeypatch)
     _phone(tmp_path)
     calls = _spy(monkeypatch, INACTIVE)
     set_word(tmp_path, "quiet", duration="30")
-    assert _notify(tmp_path, "consent") is False
+    assert _notify(tmp_path, "ruling") is False
     set_word(tmp_path, "loud", duration="30")
-    assert _notify(tmp_path, "consent") is True
+    assert _notify(tmp_path, "ruling") is True
     assert [c["push"] for c in calls] == [False, True]
+
+
+def test_wiring_quiet_still_pushes_a_consent_and_sleep_holds_it(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    calls = _spy(monkeypatch, ACTIVE)
+    set_word(tmp_path, "quiet", duration="30")
+    assert _notify(tmp_path, "consent") is True
+    set_word(tmp_path, "sleep")
+    assert _notify(tmp_path, "consent") is False
+    assert [c["push"] for c in calls] == [True, False]
 
 
 # --- the CLI words ----------------------------------------------------------------------------------------------------

@@ -3,13 +3,15 @@
     push = not muted AND (urgent OR not_home OR desk inactive >= ACTIVE_WINDOW_SECS)        ... unless loud
 
 (Phill 10-25: *"++ yes that's the shape 100%"*.) A ping that is not pushed is still written to the notification record
-(:func:`levain.webpush.sender.send` with ``push=False``); only the push to the phone is held.
+(:func:`levain.webpush.sender.send` with ``push=False``); only the push to the phone is held, and a held ping waits in
+the push store (:mod:`levain.webpush.held`) until the rule next says push.
 
 Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newest replaces the one before):
 
 - ``quiet [duration]`` and ``sleep`` are the only holding words. ``quiet`` mutes for its duration (default
-  :data:`DEFAULT_SECS`, at most :data:`MAX_SECS`), urgent pings included. ``sleep`` mutes until the operator's next
-  input at this machine after saying it.
+  :data:`DEFAULT_SECS`, at most :data:`MAX_SECS`); an urgent ping still pushes through it. ``sleep`` mutes until the
+  operator's next input at this machine after saying it (input is read from the macOS HID idle time: he has typed since
+  when ``now - idle`` is later than the word), urgent pings included.
 - ``loud [duration|off]`` turns pings on for its duration, over every other parameter, a mute included; only its timer,
   ``quiet`` or ``loud off`` ends it, never ``back``.
 - ``away`` pushes at once until input at this machine more than :data:`AWAY_GRACE_SECS` after it (a line typed just
@@ -48,8 +50,10 @@ MAX_SECS = 24 * 3600
 MIN_SECS = 60
 WORDS = ("away", "back", "sleep", "quiet", "loud", "remote")
 TIMED = ("quiet", "loud", "remote")
-# a held request blocks an agent until the operator answers; every other kind of ping waits for the rule
-URGENT_KINDS = frozenset({"consent"})
+# urgent = a ping about a request that holds an agent until the operator answers: the hook's wait (``consent``, the
+# default kind: the permission hook, the publish gate, the limits), the push gate's wait (``push``) and the asking-again
+# of a request still pending (``reping``). Every other kind (``question``, ``ruling``, ``summary``) waits for the rule.
+URGENT_KINDS = frozenset({"consent", "push", "reping"})
 FILE_NAME = "presence.json"
 _MAX_BYTES = 4096
 _DURATION = re.compile(r"^(\d{1,4})\s*(m|min|mins|minutes?|h|hr|hrs|hours?)?$", re.I)
@@ -64,6 +68,7 @@ class Decision:
     push: bool
     state: str   # "muted", "pushing" or "holding"
     why: str
+    by: str = ""   # the word that muted it ("quiet" or "sleep"), when state is "muted"
 
 
 def parse_duration(text: str | None) -> float:
@@ -131,11 +136,11 @@ def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = 
         return Decision(True, "pushing", "loud: pings on until its timer ends, over every other parameter")
     seen = None if idle is None else now - max(0.0, idle)   # when he last did something here
     if word and word["word"] == "sleep" and not (seen is not None and seen > word["ts"]):
-        return Decision(False, "muted", "sleep: nothing is pushed until his next input here")
-    if _active(word, "quiet", now):
-        return Decision(False, "muted", "quiet: nothing is pushed until it ends, urgent pings included")
+        return Decision(False, "muted", "sleep: nothing is pushed until his next input here, urgent pings included", "sleep")
     if urgent:
         return Decision(True, "pushing", "urgent")
+    if _active(word, "quiet", now):
+        return Decision(False, "muted", "quiet: nothing but an urgent ping is pushed until it ends", "quiet")
     if word and word["word"] == "away" and not (seen is not None and seen > word["ts"] + AWAY_GRACE_SECS):
         return Decision(True, "pushing", "away: his word")
     if _active(word, "remote", now):
