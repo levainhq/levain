@@ -179,8 +179,9 @@ def test_an_undecided_request_is_ruled_in_the_sheet(tmp_path: Path, monkeypatch)
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
         ])
     v = out["values"]
-    assert str(v[3]).startswith("signed (deny)") and "next step" in v[3], v
-    assert rig.state(rid) == "denied" and delivered == [rid]
+    # answered once recorded (L3 r1 C1): the line says its delivery is running, never waits for it
+    assert str(v[3]).startswith("signed (deny)") and "delivery to the session is running" in v[3], v
+    assert rig.state(rid) == "denied"
     posts = [p.split(" ", 1)[0] for p in out["posts"]]
     assert posts == [f"/cockpit/consent/{rig.enc(rid)}/rule-challenge", f"/cockpit/consent/{rig.enc(rid)}/rule"], posts
 
@@ -197,4 +198,30 @@ def test_a_t3_request_offers_only_deny_and_says_where_it_is_allowed(tmp_path: Pa
         ])
     v = out["values"]
     assert v[2] == "deny" and "laptop" in v[3], v
+    assert rig.state() == "pending"
+
+
+@needs_browser
+@needs_ssh
+def test_a_t3_cards_allow_never_opens_a_sheet_that_offers_only_deny(tmp_path: Path, monkeypatch) -> None:
+    """L3 r1 C3: a passkey cannot allow a T3 request, so the card's Allow keeps the terminal line (copied, as before the
+    sheet) and only Deny opens the sheet: Allow must never open a sheet whose only option is Deny."""
+    rig = _ConsentRig(tmp_path, monkeypatch, tier="T3")
+    card = "document.querySelector('#ck-needs .needs-consent')"
+    btn = card + ".querySelector('.needs-btn[data-label=\"{}\"]')"
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(),
+            {"until": f"{btn.format('Deny')} && {btn.format('Allow')} && 1", "ms": 30000},
+            {"eval": f"{btn.format('Allow')}.dataset.consentSheet || ''"},
+            {"eval": f"{btn.format('Deny')}.dataset.consentSheet || ''"},
+            {"eval": f"{btn.format('Allow')}.click() || 1"},
+            {"until": f"{FRAME} && {FRAME}.getAttribute('src')", "ms": 6000, "may_timeout": True},
+            {"eval": f"{btn.format('Deny')}.click() || 1"},
+            {"until": f"{FRAME} && {FRAME}.getAttribute('src')", "ms": 30000, "may_timeout": True},
+        ])
+    v = out["values"]
+    assert (v[1], v[2]) == ("", "deny"), v          # Allow is the terminal line; Deny is the sheet's
+    assert isinstance(v[4], dict) and "timeout" in v[4], v      # Allow opened no sheet
+    assert str(v[6]).endswith("&choice=deny"), v
     assert rig.state() == "pending"
