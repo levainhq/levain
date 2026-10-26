@@ -65,8 +65,8 @@ from levain.cockpit.consent import parse_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import chat_lease
 from levain.coordinator.chat_lease import TURN_LEASE_SCHEMA, TurnLease, TurnRefused, TurnView
-from levain.coordinator.chat_tripwires import (Trip, TripwireContext, TripwireWindow, control_line, mode_trip,
-                                               reported_mode_trip)
+from levain.coordinator.chat_tripwires import (ControlReply, Trip, TripwireContext, TripwireWindow, control_line,
+                                               mode_trip, reported_mode_trip)
 from levain.coordinator.driver import (CommandResult, InterruptCommand, LivenessEvidence, NotSent, SendCommand,
                                        SendResult, SessionMeta)
 from levain.coordinator.store import WORDS_MAX, CoordError, _append_only, _in, next_gseq, schema_present
@@ -1353,6 +1353,14 @@ def _echo_or_outside(conn: sqlite3.Connection, now: str, item: ChatEvent, window
                            cause=f"a user item from outside Levain ({len(found)} candidate sends)")
 
 
+class _Control(NamedTuple):
+    """One control line of a batch: its identity (the event's position and vendor id), the trip that asks for the
+    turn's interrupt, and the named reply."""
+    ident: tuple[str, str]
+    stop: Trip | None
+    reply: ControlReply | None
+
+
 @dataclass(frozen=True)
 class _Seen:
     """One vendor event of a batch, every field read once, before any transaction (a driver's object is untrusted
@@ -1502,9 +1510,12 @@ class ChatService:
         self._windows: dict[str, TripwireWindow] = {}   # launch -> its attached session's tripwire window
         self._seat_item = seat_item
         self._filed: dict[str, set[str]] = {}            # launch -> the seat items' dedupe keys filed while attached
-        # launch -> request ids this process's control reply was confirmed for, whose batch has not committed yet (a
-        # refused write re-reads them; they are not answered twice)
-        self._replied: dict[str, set[str]] = {}
+        # launch -> the control events this session was sent something for, by the event's identity (its stream
+        # position and vendor id, which carries the request id) -> "done" (its reply or interrupt was confirmed, or
+        # answered no_such_request: nothing is sent for it again), "open" (tried, not confirmed: tried again) or
+        # "stale" (open when the launch was activated again: its reply is tried again, an interrupt naming no turn
+        # is not, since it would reach the new activation's turn). A committed batch's events are dropped from it
+        self._handled: dict[str, dict[tuple[str, str], str]] = {}
 
     def _launch_lock(self, launch_id: str) -> threading.Lock:
         with self._guard:
@@ -1524,7 +1535,7 @@ class ChatService:
             self._sessions[launch_id] = session
             self._wedged.discard(launch_id)           # a wedge belongs to the session that left a call unanswered
             self._windows.pop(launch_id, None)        # so does a tripwire window: a new child is watched from zero
-            self._replied.pop(launch_id, None)
+            self._handled.pop(launch_id, None)
 
     def _wedge(self, launch_id: str, session: Any) -> None:
         """``session`` left a driver call unanswered: the launch's session is used no more until it is detached.
@@ -1558,7 +1569,7 @@ class ChatService:
                     session = self._sessions.pop(launch_id, None)
                     self._wedged.discard(launch_id)
                     self._windows.pop(launch_id, None)
-                    self._replied.pop(launch_id, None)
+                    self._handled.pop(launch_id, None)
                     # the filer files once per key (its contract): a later attach asks it again
                     self._filed.pop(launch_id, None)
                 finally:
@@ -1835,11 +1846,11 @@ class ChatService:
             fresh.append(e.key not in stored and e.key not in keys)
             keys.add(e.key)
         crossed = _crossing(stored, seen, backfill, claude)
-        window, early, at, replies = self._watch(launch_id, session, claude, raws, seen, backfill, fresh, crossed, gap)
-        stops = [t for t in early + [t for ts in at for t in ts] if t.interrupt]
-        if replies or stops:
+        window, early, at, controls = self._watch(launch_id, session, claude, raws, seen, backfill, fresh, crossed,
+                                                  gap)
+        if controls:
             # answer-then-commit: every reply and the interrupt are written before the batch and its cursor commit
-            failed = self._answer_controls(launch_id, session, replies, stops)
+            failed = self._answer_controls(launch_id, session, controls)
             if failed:
                 early.append(Trip("unanswerable_control", "a control reply could not be written: " + "; ".join(failed)))
             self._fault("controls_answered")
@@ -1885,8 +1896,9 @@ class ChatService:
         with self._guard:
             if window is not None and crossed is None and self._sessions.get(launch_id) is session:
                 self._windows[launch_id] = window
-            if crossed is None:                       # a crossing batch stays unrecorded: its re-read is no new reply
-                self._replied.get(launch_id, set()).difference_update(r.request_id for r in replies)
+            if crossed is None:                       # a crossing batch stays unrecorded: its re-read sends nothing new
+                for ident, _stop, _reply in controls:
+                    self._handled.get(launch_id, {}).pop(ident, None)
         self._file_latches(launch_id)
         if crossed is not None:
             raise CoordError(f"launch {launch_id}'s vendor read crossed a boundary (a boundary event that is not its "
@@ -2063,6 +2075,9 @@ class ChatService:
             seq = record_check(conn, now, launch_id, kind, "activation", detail, evidence_sha256=digest,
                                spawn_nonce=spawn_nonce, canary_verdict_id=verdict_id,
                                containment_digest=containment_digest)
+        with self._guard:                             # a new activation: what was tried before it is stale
+            record = self._handled.get(launch_id, {})
+            record.update([(ident, "stale") for ident, state in record.items() if state == "open"])
         self._file_latches(launch_id)
         return seq
 
@@ -2082,38 +2097,44 @@ class ChatService:
 
     def _watch(self, launch_id: str, session: Any, claude: bool, raws: Sequence[Any], seen: Sequence[Any],
                backfill: Sequence[bool], fresh: Sequence[bool], crossed: str | None,
-               gap: bool) -> tuple[TripwireWindow | None, list[Trip], list[list[Trip]], list[Any]]:
+               gap: bool) -> tuple[TripwireWindow | None, list[Trip], list[list[Trip]], list[_Control]]:
         """§4.4 on Claude, before the write transaction: ``(window copy, the batch's own trips, each event's trips,
-        control replies)``. The copy observes each event the write records new and that is not history; the mode is
-        read from the session (a meta that cannot be read trips). A batch that crosses a boundary is not recorded, so
-        nothing of it feeds the window, but a mode one of its lines reports is still kept and each of its control lines
-        is still answered or interrupted. An effective gap drops the counts and, with a call open, trips."""
+        the control lines to answer or interrupt)``. The copy observes each event the write records new and that is
+        not history; the mode is read from the session (a meta that cannot be read trips). A batch that crosses a
+        boundary is not recorded, so nothing of it feeds the window, but a mode one of its lines reports is still kept
+        and each of its control lines is still answered or interrupted. An effective gap drops the counts and, with a call open, trips."""
         at: list[list[Trip]] = [[] for _ in seen]
         if not claude:
             return None, [], at, []
-        window, early, replies = self._window(launch_id), [], []
+        window, early, controls = self._window(launch_id), [], []
         mode = self._mode(launch_id, session)
         early += [mode] if mode is not None else []
         new = [(i, raw, e) for i, (raw, e, old, f) in enumerate(zip(raws, seen, backfill, fresh)) if f and not old]
+
+        def control(e: _Seen, trip: Trip | None, reply: ControlReply | None) -> None:
+            stop = trip if trip is not None and trip.interrupt else None
+            if stop is not None or reply is not None:
+                controls.append(_Control((str(e.pos), str(e.vendor_id)), stop, reply))
+
         if crossed is not None:
-            for _i, raw, _e in new:
+            for _i, raw, e in new:
                 reported = reported_mode_trip(raw)
                 trip, reply = control_line(raw) or (None, None)
                 early += [t for t in (reported, trip) if t is not None]
-                replies += [reply] if reply is not None else []
-            return window, early, at, replies
+                control(e, trip, reply)
+            return window, early, at, controls
         was_open = bool(window.calls)
         for i, raw, e in new:
             trip, reply = window.observe(raw)
             at[i] += [trip] if trip is not None else []
-            replies += [reply] if reply is not None else []
+            control(e, trip, reply)
             if e.kind in ("turn_started", "turn_ended"):
                 trip = window.boundary(turn=True)
                 at[i] += [trip] if trip is not None else []
         if gap:
             trip = window.gap(was_open)
             early += [trip] if trip is not None else []
-        return window, early, at, replies
+        return window, early, at, controls
 
     def _window(self, launch_id: str) -> TripwireWindow:
         """A copy of the launch's tripwire window, or a fresh one (with the launcher's context) for a session not
@@ -2144,46 +2165,60 @@ class ChatService:
             return Trip("mode_changed", "could not read the session's permission mode: the session returned no meta")
         return mode_trip(meta.permission_mode)
 
-    def _answer_controls(self, launch_id: str, session: Any, replies: Sequence[Any],
-                         stops: Sequence[Trip]) -> list[str]:
+    def _answer_controls(self, launch_id: str, session: Any, controls: Sequence[_Control]) -> list[str]:
         """Before the batch commits (the caller holds the launch's mutex; no transaction is open): each inbound
         non-approval control request gets its named error reply through ``reject_control`` (§8.1), bounded by
-        :data:`READ_DEADLINE`, unless this process had one confirmed whose batch has not committed. Then, when a trip
-        asked for it or a reply failed, ONE interrupt of the turn (§8.1, O6: the CLI's pending requests abort); an
-        interrupt that is refused or ambiguous leaves the latch as the record. What failed, for the caller to latch
-        ``tripwire:unanswerable_control`` in the batch's transaction."""
-        failed = []
-        for reply in replies:
-            with self._guard:
-                wedged = launch_id in self._wedged
-                done = reply.request_id in self._replied.get(launch_id, ())
-            if done:
+        :data:`READ_DEADLINE`. Then, when a trip asked for it or a reply failed, ONE interrupt of the turn (§8.1, O6:
+        the CLI's pending requests abort); an interrupt that is refused or ambiguous leaves the latch as the record.
+        The handled-control record (``_handled``) decides what is sent: nothing for a control event already done, and
+        no interrupt naming no turn for one left over from before the launch's last activation. What failed, for the
+        caller to latch ``tripwire:unanswerable_control`` in the batch's transaction."""
+        with self._guard:
+            record = self._handled.setdefault(launch_id, {})
+            state = {c.ident: record.setdefault(c.ident, "open") for c in controls}
+        failed, stops, unanswered = [], [], False
+        for c in controls:
+            if state[c.ident] == "done":
                 continue
-            if wedged:
-                failed.append(f"{reply.request_id[:40]}: the session stopped answering")
+            if c.stop is not None and (c.stop.turn_id is not None or state[c.ident] == "open"):
+                stops.append(c)
+            if c.reply is None:
                 continue
+            why = self._reject(launch_id, session, c.reply)
+            if why is None:
+                with self._guard:
+                    record[c.ident] = "done"
+                continue
+            failed.append(f"{c.reply.request_id[:40]}: {why}")
+            unanswered = unanswered or state[c.ident] == "open"
+        if stops or unanswered:
+            turn = next((c.stop.turn_id for c in stops if c.stop.turn_id is not None), None)
             try:
-                got = _bounded(functools.partial(session.reject_control, reply.request_id, reply.text), READ_DEADLINE)
-            except _Overdue:
-                self._wedge(launch_id, session)
-                failed.append(f"{reply.request_id[:40]}: the reply did not return within {READ_DEADLINE:g} s")
-                continue
-            except Exception as exc:  # noqa: BLE001 - an unwritten reply leaves the CLI waiting: latch and stop
-                failed.append(f"{reply.request_id[:40]}: {type(exc).__name__}: {_said(exc)}")
-                continue
-            if not isinstance(got, CommandResult) or got.outcome != "confirmed":
-                failed.append(f"{reply.request_id[:40]}: the session did not confirm the reply")
-                continue
-            with self._guard:
-                # only a confirmed reply is skipped on a re-read: one that failed is tried again, and fails again
-                self._replied.setdefault(launch_id, set()).add(reply.request_id)
-        if stops or failed:
-            turn = next((t.turn_id for t in stops if t.turn_id is not None), None)
-            try:
-                self.interrupt(launch_id, turn)
+                got = self.interrupt(launch_id, turn)
             except CoordError:
-                pass                                  # detached or wedged: the latch stands, and close is the stop
+                got = None                            # detached or wedged: the latch stands, and close is the stop
+            if got is not None and got.outcome in ("confirmed", "no_such_request"):
+                with self._guard:
+                    record.update((c.ident, "done") for c in stops)
         return failed
+
+    def _reject(self, launch_id: str, session: Any, reply: ControlReply) -> str | None:
+        """Send one named error reply; None when the session confirmed it or holds no such request (nothing waits on
+        it), else why it failed (a failed reply is tried again on a re-read)."""
+        with self._guard:
+            wedged = launch_id in self._wedged
+        if wedged:
+            return "the session stopped answering"
+        try:
+            got = _bounded(functools.partial(session.reject_control, reply.request_id, reply.text), READ_DEADLINE)
+        except _Overdue:
+            self._wedge(launch_id, session)
+            return f"the reply did not return within {READ_DEADLINE:g} s"
+        except Exception as exc:  # noqa: BLE001 - an unwritten reply leaves the CLI waiting: latch and stop
+            return f"{type(exc).__name__}: {_said(exc)}"
+        if not isinstance(got, CommandResult) or got.outcome not in ("confirmed", "no_such_request"):
+            return "the session did not confirm the reply"
+        return None
 
     def _probe_pending(self, launch_id: str, session: Any) -> None:
         """Answer the launch's boundary ``probing`` row, if its latest check is one (the caller holds the launch's
