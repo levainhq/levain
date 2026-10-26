@@ -4921,6 +4921,7 @@
         acts.append(box, b);
       }
       lock(false);
+      acts.appendChild(signSheetButton(r));
       wrap.appendChild(acts);
       if (options.length) {
         const lines = el("div", "sign-lines ext-meta", "an option signs the request's message with its line appended:");
@@ -4931,6 +4932,72 @@
     });
     return wrap;
   }
+
+  // ---- The sign sheet over the cockpit (ONESURFACE OS-1, Q2 RULED OVERLAY) ----
+  // The sheet /sign/<id> shown as a same-origin iframe over this page: the sheet runs its own ceremony and tells this page
+  // "signed" or "close" by postMessage, read only from this origin and from that frame. Its headers let only this origin
+  // frame it. Signing there changes the board, so the board reads again after a signature.
+  const SIGN_SHEET_ID = "levain-sign-sheet";
+  function signSheetButton(r) {
+    const b = el("button", "undo-btn sign-sheet-open", "open the sheet");
+    b.type = "button";
+    b.title = "sign this request in the sign sheet";
+    b.addEventListener("click", () => openSignSheet(r.id, r.sha256));
+    return b;
+  }
+  // `version`: the listing's sha256 the card showed (the sheet draws a pick only on it); `choice`: an option to preselect
+  function openSignSheet(id, version, choice) {
+    if (typeof id !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return null;
+    closeSignSheet();
+    let frag = typeof version === "string" && /^[0-9a-f]{16}/.test(version) ? "v=" + version.slice(0, 16) : "";
+    if (frag && typeof choice === "string" && /^[a-z0-9]{1,8}$/.test(choice)) frag += "&choice=" + choice;
+    const veil = el("div", "modal-overlay");
+    veil.id = SIGN_SHEET_ID;
+    veil.setAttribute("role", "dialog");
+    veil.setAttribute("aria-modal", "true");
+    veil.setAttribute("aria-label", "sign request");
+    const box = el("div", "modal");
+    const head = el("div", "modal-head");
+    head.appendChild(el("h2", "", "Sign request"));
+    const x = el("button", "modal-close", "×");
+    x.type = "button";
+    x.setAttribute("aria-label", "close the sign sheet");
+    x.addEventListener("click", closeSignSheet);
+    head.appendChild(x);
+    const frame = document.createElement("iframe");
+    frame.id = SIGN_SHEET_ID + "-frame";
+    frame.title = "sign request";
+    frame.setAttribute("allow", "publickey-credentials-get");
+    frame.referrerPolicy = "no-referrer";
+    frame.src = "/sign/" + encodeURIComponent(id) + (frag ? "#" + frag : "");
+    Object.assign(frame.style, { width: "100%", height: "min(80vh, 680px)", border: "0", display: "block", background: "transparent" });
+    box.append(head, frame);
+    veil.appendChild(box);
+    veil.addEventListener("keydown", (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); closeSignSheet(); } });
+    document.body.appendChild(veil);
+    document.body.classList.add("modal-open");
+    x.focus();
+    return veil;
+  }
+  function closeSignSheet() {
+    const veil = document.getElementById(SIGN_SHEET_ID);
+    if (!veil) return;
+    veil.remove();
+    if (!document.getElementById("levain-modal")) document.body.classList.remove("modal-open");
+  }
+  window.addEventListener("message", (ev) => {
+    const frame = document.getElementById(SIGN_SHEET_ID + "-frame");
+    if (!frame || ev.source !== frame.contentWindow || ev.origin !== window.location.origin) return;
+    const what = ev.data && typeof ev.data === "object" ? ev.data.levainSheet : null;
+    if (what === "close") closeSignSheet();
+    else if (what === "signed") {
+      // the signed line stays on the sheet until it is closed; the board under it reads again
+      signListed = null;
+      const t = window.LevainCockpitTransport;
+      if (t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
+    }
+  });
+  window.LevainSignSheet = { open: openSignSheet, close: closeSignSheet };
 
   // A signed verb's send (ActionVerb.sign): the server's compose_signer files a sign request for exactly these params, the
   // passkey signs it, and only then does the caller post the verb with `sign_request`. Resolves {ok: true, request, txn} or
