@@ -195,6 +195,17 @@ def test_every_row_shape_carries_every_field_and_the_bounds_are_the_sinks():
     assert LN.check_record(rec) is None
 
 
+def test_a_settle_with_a_reported_cost_and_no_counts_carries_the_cost():
+    # verify r2 R2: another model's reported cost past the hold is settled with no usage; its row says the cost and the
+    # overrun, the token counts null, and CONTROL's record check takes it
+    base = K.lineage_base(RUN, "2026-10-24T12:00:00Z", 100, False)
+    row = K.lineage_row(base, settled="yes", ended_at="2026-10-24T12:00:01Z",
+                        md=codec.Metadata("m2", None, 10_000, models=("m2",)), usage=None, cost=10_000, overrun=9_900,
+                        status=200)
+    assert (row["cost_microdollars"], row["overrun"], row["tokens_in"], row["tokens_out"]) == (10_000, 9_900, None, None)
+    assert _wire_ok(row) is None
+
+
 def test_settled_row_is_whole_from_lineage_base_and_the_response(monkeypatch):
     # R4 §3 "the record is on disk before it is sent": the `reserved` line carries `lineage_base`, and the settle
     # carries keys' whole row (H6-28): the run's facts renamed per H6-3, the response's own metadata (H6-6), the

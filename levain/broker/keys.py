@@ -329,7 +329,8 @@ def lineage_row(base: dict, *, settled: str, ended_at: str, md: "Optional[codec.
     happened, None when no upstream call was made (H6-21: `model_answered` / `provider_answered` / `cost_reported`
     are then null; with a call, an unsaid string is `"unknown"` and an unsaid cost null). `usage` and `cost` are the
     settle's: `tokens_in` counts every input class (plain, cache write, cache read), `cost_microdollars` the whole
-    priced cost, and `overrun` (H6-7: a `"yes"` row) the part past the hold, null when none."""
+    priced cost, and `overrun` (H6-7: a `"yes"` row) the part past the hold, null when none. A settle with a cost and
+    no usage (another model's reported cost past the hold, verify r2 R2) has the cost and null token counts."""
     row = dict(base)
     call = md is not None
     row.update(ended_at=ended_at, settled=settled, status=status, refused=refused,
@@ -337,9 +338,10 @@ def lineage_row(base: dict, *, settled: str, ended_at: str, md: "Optional[codec.
                provider_answered=((md.provider or "unknown") if md is not None else None),
                cost_reported=(md.cost_reported if md is not None else None),
                tokens_in=None, tokens_out=None, cost_microdollars=None, overrun=None, count=None)
-    if call and usage is not None and cost is not None:
-        row.update(tokens_in=usage.in_ + usage.cache_write + usage.cache_read, tokens_out=usage.out,
-                   cost_microdollars=cost, overrun=overrun if overrun > 0 else None)
+    if call and cost is not None:
+        row.update(cost_microdollars=cost, overrun=overrun if overrun > 0 else None)
+        if usage is not None:
+            row.update(tokens_in=usage.in_ + usage.cache_write + usage.cache_read, tokens_out=usage.out)
     return row
 
 
@@ -2366,14 +2368,15 @@ class Keys:
         :attr:`levain.broker.codec.Codec.checks_answered_model`, head ruling 1026+1): a response that says another model
         ran than `model`, the checked one (:func:`levain.broker.codec.answered_other`), is never priced at `model`'s
         row: it is charged its whole hold, or the cost the response reports when that is more, and the session stops as
-        for an overrun (with no usage it is `uncertain` at its hold, as any call, and the session stops too). Such a
+        for an overrun. With no usage it is `uncertain` at its hold, as any call, unless the cost it reports is past the
+        hold: then that cost is settled (no counts; verify r2 R2), since `uncertain` charges only the hold. Such a
         stop is reported whatever its overrun, 0 included (L3 r1 Q5): `SPEND-OVERRUN` with `reason: "model-mismatch"`,
         so CONTROL records it for the card; an overrun stop of the checked model's own usage is reported as before."""
         usage = reader.result()
         md = reader.metadata()
         other = checks_model and bool(model) and codec.answered_other(md, model)
         current = self.by_session.get(reg.session) is reg
-        if usage is None:
+        if usage is None and not (other and (md.cost_reported or 0) > hold.amount):
             if other and current:
                 self.budget_stopped.add(reg.session)
             try:
@@ -2385,11 +2388,13 @@ class Keys:
         if other:
             cost = max(hold.amount, md.cost_reported or 0)
         else:
+            assert usage is not None
             cost = codec.price_usage(usage, price)
         if (other or cost > hold.amount) and current:
             self.budget_stopped.add(reg.session)
         try:
-            hold.settle(cost, dict(usage.meta(), **self._row_meta(hold, "yes", reader, status, usage, cost)))
+            hold.settle(cost, dict(usage.meta() if usage is not None else {},
+                                   **self._row_meta(hold, "yes", reader, status, usage, cost)))
         finally:
             if current and (other or cost > hold.amount):
                 self._report_stop(reg, hold, route, model, max(0, cost - hold.amount), unproven, other=other)
