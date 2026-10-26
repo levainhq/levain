@@ -959,3 +959,148 @@ def test_r3_a_never_attached_launch_keeps_no_filed_record(cs, store, claude):
     assert len(_items(cs)) == 1                       # the item is filed
     svc.detach(claude["launch"])
     assert claude["launch"] not in svc._filed
+
+
+# --- L3 verify r3 (1026-3 d1b4h): one handled-control record, keyed by the control event's identity -----------------
+class Shaky(Session):
+    """Answers each interrupt with the next scripted outcome (the last one repeats)."""
+
+    def __init__(self, *outcomes: str, **kw) -> None:
+        super().__init__(**kw)
+        self.outcomes = list(outcomes)
+
+    def interrupt(self, command):
+        self.interrupts.append(command)
+        outcome = self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
+        return CommandResult(outcome, outcome)
+
+
+def _cross_with(ctl):
+    b = _crossing(100)
+    return b._replace(events=(ctl,) + b.events)
+
+
+def _refused(svc, launch, batch):
+    from levain.coordinator.chat import CoordError
+    with pytest.raises(CoordError, match="crossed a boundary"):
+        svc.ingest(launch, batch)
+
+
+def test_h1_a_refused_crossing_batch_re_read_interrupts_its_can_use_tool_once(cs, claude, root):
+    svc, s, _ = up(cs, claude, root)
+    crossing = _cross_with(event("error", "control:ctl-x", "00000100", turn_id="t-1", control_subtype="can_use_tool"))
+    for _ in (1, 2, 3):
+        _refused(svc, claude["launch"], crossing)
+    assert [c.turn_id for c in s.interrupts] == ["t-1"]
+    assert "tripwire:unexpected_control" in trips(cs, claude["launch"])
+
+
+@pytest.mark.parametrize("outcome", ["ambiguous", "rejected"])
+def test_h1_an_interrupt_that_was_not_confirmed_is_sent_again(cs, claude, root, outcome):
+    svc, s, _ = up(cs, claude, root, session=Shaky(outcome, "confirmed"))
+    crossing = _cross_with(event("error", "control:ctl-x", "00000100", turn_id="t-1", control_subtype="can_use_tool"))
+    for _ in (1, 2, 3):
+        _refused(svc, claude["launch"], crossing)
+    assert [c.turn_id for c in s.interrupts] == ["t-1", "t-1"]
+
+
+def test_h1_an_interrupt_answered_no_such_request_is_not_sent_again(cs, claude, root):
+    svc, s, _ = up(cs, claude, root, session=Shaky("no_such_request"))
+    crossing = _cross_with(event("error", "control:ctl-x", "00000100", turn_id="t-1", control_subtype="can_use_tool"))
+    for _ in (1, 2):
+        _refused(svc, claude["launch"], crossing)
+    assert len(s.interrupts) == 1
+
+
+def test_h2_a_new_control_event_reusing_a_crossing_batchs_request_id_is_answered(cs, claude, root):
+    from tests.test_coordinator_chat_liveness import activate
+    svc, s, _ = up(cs, claude, root)
+    s._inbound["ctl-e"] = "elicitation"
+    _refused(svc, claude["launch"], _cross_with(event("error", "control:ctl-e", "00000100", turn_id="t-1",
+                                                      control_subtype="elicitation")))
+    activate(svc, claude)                             # the launch is activated again, its session still attached
+    s.inbound("ctl-e", "elicitation", turn_id="t-2")  # a distinct later request that reuses the id
+    svc.read_next(claude["launch"])
+    assert _replies(s) == [("ctl-e", "levain answers no elicitation in chat")] * 2
+
+
+@pytest.mark.parametrize("first", ["confirmed", "ambiguous"])
+def test_h3_a_stale_crossing_batch_never_interrupts_the_reactivated_launchs_turn(cs, claude, root, first):
+    from tests.test_coordinator_chat_liveness import activate
+    svc, s, _ = up(cs, claude, root, session=Shaky(first, "confirmed"))
+    crossing = _cross_with(event("error", "control:ctl-x", "00000100", turn_id=None, control_subtype="can_use_tool"))
+    _refused(svc, claude["launch"], crossing)
+    assert [c.turn_id for c in s.interrupts] == [None]
+    activate(svc, claude)                             # a new activation: a turn of it may be running now
+    _refused(svc, claude["launch"], crossing)         # the stale batch read again
+    assert [c.turn_id for c in s.interrupts] == [None]
+    assert latched(cs, claude["launch"])
+
+
+def test_h3_a_stale_control_naming_its_own_turn_is_still_interrupted(cs, claude, root):
+    from tests.test_coordinator_chat_liveness import activate
+    svc, s, _ = up(cs, claude, root, session=Shaky("ambiguous", "confirmed"))
+    crossing = _cross_with(event("error", "control:ctl-x", "00000100", turn_id="t-1", control_subtype="can_use_tool"))
+    _refused(svc, claude["launch"], crossing)
+    activate(svc, claude)
+    _refused(svc, claude["launch"], crossing)
+    assert [c.turn_id for c in s.interrupts] == ["t-1", "t-1"]
+
+
+def test_h4_the_record_is_dropped_at_detach_and_at_attach(cs, claude, root):
+    svc, s, _ = up(cs, claude, root)
+    crossing = _cross_with(event("error", "control:ctl-x", "00000100", turn_id="t-1", control_subtype="can_use_tool"))
+    _refused(svc, claude["launch"], crossing)
+    svc.detach(claude["launch"])
+    assert claude["launch"] not in svc._handled
+    svc.attach(claude["launch"], s)
+    _refused(svc, claude["launch"], crossing)         # a new session's record starts empty: it is interrupted
+    assert [c.turn_id for c in s.interrupts] == ["t-1", "t-1"]
+
+
+def test_h5_a_reply_answered_no_such_request_is_done_not_failed(cs, claude, root):
+    class Gone(Session):
+        def reject_control(self, request_id, text):
+            self.asked = getattr(self, "asked", 0) + 1
+            return CommandResult("no_such_request", "no such request")
+
+    svc, s, _ = up(cs, claude, root, session=Gone())
+    crossing = _cross_with(event("error", "control:ctl-e", "00000100", turn_id="t-1", control_subtype="elicitation"))
+    for _ in (1, 2):
+        _refused(svc, claude["launch"], crossing)
+    assert s.asked == 1 and s.interrupts == []
+    assert "tripwire:unanswerable_control" not in trips(cs, claude["launch"])
+
+
+def test_h5_a_failed_reply_in_a_crossing_batch_is_tried_again(cs, claude, root):
+    class Flaky(Session):
+        def reject_control(self, request_id, text):
+            self.asked = getattr(self, "asked", 0) + 1
+            if self.asked == 1:
+                raise OSError("broken pipe")
+            return super().reject_control(request_id, text)
+
+    svc, s, _ = up(cs, claude, root, session=Flaky())
+    s._inbound["ctl-e"] = "elicitation"
+    crossing = _cross_with(event("error", "control:ctl-e", "00000100", turn_id="t-1", control_subtype="elicitation"))
+    for _ in (1, 2, 3):
+        _refused(svc, claude["launch"], crossing)
+    assert s.asked == 2 and _replies(s) == [("ctl-e", "levain answers no elicitation in chat")]
+    assert len(s.interrupts) == 1                     # the failed try's interrupt; the confirmed retry sends none
+    assert "tripwire:unanswerable_control" in trips(cs, claude["launch"])
+
+
+def test_h5_a_stale_failed_reply_is_tried_again_but_interrupts_no_new_turn(cs, claude, root):
+    from tests.test_coordinator_chat_liveness import activate
+
+    class Broken(Session):
+        def reject_control(self, request_id, text):
+            raise OSError("broken pipe")
+
+    svc, s, _ = up(cs, claude, root, session=Broken())
+    crossing = _cross_with(event("error", "control:ctl-e", "00000100", turn_id="t-1", control_subtype="elicitation"))
+    _refused(svc, claude["launch"], crossing)
+    assert [c.turn_id for c in s.interrupts] == [None]
+    activate(svc, claude)
+    _refused(svc, claude["launch"], crossing)
+    assert [c.turn_id for c in s.interrupts] == [None]
