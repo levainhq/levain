@@ -26,6 +26,7 @@ filesystem, its own loopback listener.
 """
 import hashlib
 import os
+import shlex
 import socket
 import stat
 import subprocess
@@ -153,7 +154,7 @@ def nested_hook(nonce, home):
         hook = os.path.join(root, ".git", "hooks", "post-checkout")
         os.makedirs(os.path.dirname(hook), exist_ok=True)
         with open(hook, "w") as fh:
-            fh.write(f"#!/bin/sh\ntouch '{marker}'\n")
+            fh.write(f"#!/bin/sh\ntouch {shlex.quote(marker)}\n")
         os.chmod(hook, os.stat(hook).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     except (OSError, subprocess.SubprocessError) as exc:
         return say(nonce, "nested_hook", "ERROR", errname(exc))

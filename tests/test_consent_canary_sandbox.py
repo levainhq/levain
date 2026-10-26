@@ -10,6 +10,8 @@ import errno
 import hashlib
 import os
 import re
+import select
+import signal
 import socket
 import subprocess
 import sys
@@ -40,12 +42,13 @@ class World:
     """A fake vendor plus a fake host. Every knob is what the HOST would observe, independent of the printed lines."""
 
     def __init__(self, tmp_path: Path, *, statuses=None, raw=None, error="", transcript_session=True,
-                 control="good", tree=(), hit_cockpit=False, home_probe=False, hook_marker=False, retained_error="",
+                 control="good", tree=(), gitlinks=(), tree_error="", hit_cockpit=False, home_probe=False, hook_marker=False, retained_error="",
                  discard_note=""):
         self.home = tmp_path / "home"
         self.home.mkdir(exist_ok=True)
         self.statuses, self.raw, self.error = statuses, raw, error
         self.transcript_session, self.control, self.tree = transcript_session, control, tuple(tree)
+        self.gitlinks, self.tree_error = tuple(gitlinks), tree_error
         self.hit_cockpit, self.home_probe, self.hook_marker = hit_cockpit, home_probe, hook_marker
         self.retained_error, self.discard_note = retained_error, discard_note
         self.nonce = ""
@@ -74,7 +77,7 @@ class World:
         sha = hashlib.sha256((repo / canary.PROBE_FILE).read_bytes()).hexdigest()
         text = {"good": f"{nonce} {sha}\n", "absent": None, "wrongsha": f"{nonce} {'0' * 64}\n",
                 "oldnonce": f"deadbeefdead {sha}\n"}[self.control]
-        return canary.RetainedReading(text, self.tree)
+        return canary.RetainedReading(text, self.tree, tree_gitlinks=self.gitlinks, tree_error=self.tree_error)
 
     def discard(self, session):
         self.discarded.append(session)
@@ -577,3 +580,134 @@ def test_a_launcher_refusal_leads_the_fail_detail(tmp_path):
 def test_a_session_that_ran_does_not_get_the_did_not_start_line(tmp_path):
     result = World(tmp_path, control="absent").run(tmp_path)
     assert result.status == "FAIL" and "session did not start" not in result.detail
+
+
+# --- verify r3 (G1-G5) --------------------------------------------------------------------------------------------
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgsign=false",
+                    "-c", "protocol.file.allow=always", "-C", str(repo), *args], check=True, capture_output=True,
+                   stdin=subprocess.DEVNULL)
+
+
+def test_g1_an_unreadable_tree_listing_is_a_fail_not_an_empty_path_list(tmp_path):
+    result = World(tmp_path, tree_error="could not read the retained tree: boom").run(tmp_path)
+    assert result.status == "FAIL" and "could not read the retained tree" in result.detail
+
+
+def test_g1_a_failed_ls_tree_reads_as_a_tree_error_and_a_good_one_does_not(tmp_path, monkeypatch):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "a.txt").write_text("x")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "m")
+    real_run = subprocess.run
+    mode = {"ls_fails": True}
+
+    def fake_run(argv, *a, **kw):
+        if argv[:3] == [sys.executable, "-m", "levain"]:
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "ls-tree" in argv and mode["ls_fails"]:
+            return types.SimpleNamespace(returncode=128, stdout="", stderr="fatal: bad ref")
+        return real_run(argv, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    _git(repo, "update-ref", "refs/heads/levain/s-1-wip", "HEAD")
+    _git(repo, "update-ref", "refs/heads/levain/s-1-wip", "HEAD")
+    failed = canary.read_retained_via_adopt(repo, "s-1", "n")
+    assert "could not read the retained tree" in failed.tree_error
+    mode["ls_fails"] = False
+    ok = canary.read_retained_via_adopt(repo, "s-1", "n")
+    assert ok.tree_error == "" and ok.tree_paths == ("a.txt",) and ok.tree_gitlinks == ()
+
+
+def test_g5_a_gitlink_in_the_imported_tree_is_an_escape(tmp_path):
+    result = World(tmp_path, tree=["levain_probe_nested"], gitlinks=["levain_probe_nested"]).run(tmp_path)
+    assert result.status == "FAIL" and "a gitlink crossed into the imported tree: levain_probe_nested" in result.detail
+
+
+def test_g5_ls_tree_with_modes_names_a_gitlink_and_keeps_odd_paths_whole(tmp_path, monkeypatch):
+    out = ("100644 blob " + "a" * 40 + "\tsub dir/file with space.txt\0"
+           "160000 commit " + "b" * 40 + "\tlevain_probe_nested\0")
+    assert canary._parse_ls_tree(out) == (("sub dir/file with space.txt", "levain_probe_nested"),
+                                          ("levain_probe_nested",))
+
+
+def test_g2_a_transcript_archive_that_cannot_be_written_still_cleans_up_and_discards(tmp_path):
+    w = World(tmp_path, home_probe=True, hook_marker=True)
+    inner = w.runner
+
+    def runner(agent, repo, prompt, done, timeout):
+        (repo / "canary_sandbox_output.txt").mkdir()   # the archive write will fail on this
+        return inner(agent, repo, prompt, done, timeout)
+
+    result = canary.run_sandbox_canary("claude_code", workspace=tmp_path / "ws", runner=runner, host=w.seams())
+    assert result.status == "FAIL" and "transcript archive was not written" in result.detail
+    assert w.discarded == [SESSION]
+    assert not (w.home / f"levain-canary-probe-{w.nonce}").exists()
+    assert not (w.home / f"levain-canary-hook-{w.nonce}").exists()
+
+
+def test_g2_an_interrupted_runner_still_cleans_up_the_host(tmp_path):
+    w = World(tmp_path, home_probe=True)
+
+    def runner(agent, repo, prompt, done, timeout):
+        w.nonce, _, _, _ = _args(prompt)
+        (w.home / f"levain-canary-probe-{w.nonce}").write_text("")
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        canary.run_sandbox_canary("claude_code", workspace=tmp_path / "ws", runner=runner, host=w.seams())
+    assert not (w.home / f"levain-canary-probe-{w.nonce}").exists()
+
+
+def test_g3_teardown_keeps_reading_after_the_process_has_exited(tmp_path, monkeypatch):
+    """The loop's logic, platform-free (a macOS pty drops what is unread once the slave closes, so the real child
+    cannot show it): the process reads as exited the moment SIGTERM is sent, and the pty still holds a final line."""
+    _fake_child(monkeypatch)
+    state = {"term": False, "served": False}
+    real_signal, real_select, real_read = canary._signal_group, select.select, os.read
+    real_popen = subprocess.Popen
+
+    class Exited:
+        def __init__(self, proc):
+            self._proc = proc
+
+        def poll(self):
+            return 0 if state["term"] else self._proc.poll()
+
+        def __getattr__(self, name):
+            return getattr(self._proc, name)
+
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kw: Exited(real_popen(argv, **kw)))
+
+    def signal_group(proc, sig):
+        if sig == signal.SIGTERM:
+            state["term"] = True
+        real_signal(proc._proc if isinstance(proc, Exited) else proc, sig)
+
+    def fake_select(r, w, x, timeout=None):
+        return (r, [], []) if state["term"] and not state["served"] else real_select(r, w, x, timeout)
+
+    def fake_read(fd, n):
+        if state["term"] and not state["served"]:
+            state["served"] = True
+            return b"FINAL-TEARDOWN-LINE\n"
+        return real_read(fd, n)
+
+    monkeypatch.setattr(canary, "_signal_group", signal_group)
+    monkeypatch.setattr(select, "select", fake_select)
+    monkeypatch.setattr(os, "read", fake_read)
+    out = canary.session_runner("claude_code", tmp_path, "p", lambda t: True, 60.0)
+    assert "FINAL-TEARDOWN-LINE" in out.text
+
+
+def test_g4_a_home_path_with_a_quote_still_yields_a_hook_that_touches_the_marker(tmp_path):
+    mod = _load_probe(tmp_path)
+    home = tmp_path / "ho'me"
+    home.mkdir()
+    mod.nested_hook("abc123", str(home))
+    hook = Path(mod.HERE) / "levain_probe_nested" / ".git" / "hooks" / "post-checkout"
+    out = subprocess.run([str(hook)], capture_output=True, text=True)
+    assert out.returncode == 0 and (home / "levain-canary-hook-abc123").exists()
