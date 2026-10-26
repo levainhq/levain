@@ -615,9 +615,9 @@ def python_user_site_roots(home: Path, environ=None) -> tuple[list[tuple[Path, s
     ``<base>/lib`` (``lib/pythonX.Y/site-packages``; a macOS framework build's ``lib/python/site-packages``), the
     base being ``~/.local``, a framework build's ``~/Library/Python/X.Y``, or ``$PYTHONUSERBASE`` as written. So:
     ``~/.local/lib``; on macOS ``~/Library/Python`` whole, so a Python version installed later is covered too;
-    and for an ABSOLUTE ``$PYTHONUSERBASE`` its ``lib`` only (:func:`build_policy` refuses one
-    :func:`too_wide_to_deny` names). Read from ``environ`` (default ``os.environ``: the operator's, at policy
-    build); an empty value means the default layout. A RELATIVE value, ``~/...`` included (site.py does not
+    and for an ABSOLUTE ``$PYTHONUSERBASE`` its ``lib`` only, as written and resolved (:func:`build_policy`
+    refuses one :func:`too_wide_to_deny` names at either spelling). Read from ``environ`` (default
+    ``os.environ``: the operator's, at policy build); an empty value means the default layout. A RELATIVE value, ``~/...`` included (site.py does not
     expand ``~``), resolves against whatever directory each Python starts in, so no tree holds it: the note."""
     env = os.environ if environ is None else environ
     roots = [(home / ".local" / "lib", "operator Python user site"),
@@ -627,7 +627,10 @@ def python_user_site_roots(home: Path, environ=None) -> tuple[list[tuple[Path, s
     if not value:
         return roots, None
     if os.path.isabs(value):
-        return [*roots, (Path(os.path.normpath(value)) / "lib", _USERBASE_LABEL)], None
+        # Both spellings (verify r3 #19): through a symlinked base the site lives at the real ``lib``, and the
+        # too-wide refusal compares paths, so it must see that one too (a base linked to / has the site /lib).
+        lib = Path(os.path.normpath(value)) / "lib"
+        return [*roots, *((p, _USERBASE_LABEL) for p in _dedup_paths([lib, Path(os.path.realpath(lib))]))], None
     return roots, (f"\u26a0 Python user site NOT in the floor: $PYTHONUSERBASE is the relative path {value!r}, "
                    "which Python resolves against whatever directory it starts in (it does not expand ~), so the "
                    "entity may plant a .pth there that your later Python runs; point it at a dedicated absolute "
@@ -7236,10 +7239,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
                 continue   # bash cannot replace it either: nothing can come to live below it
             # bash could unlink it, make the directory and plant below it (verify r2, codex HIGH)
             raise ConfinementError(
-                f"{real} is not a directory, and the Linux floor protects it as one (it is where your "
-                "Python user site, the agents' configuration or a shell's startup files live): bash could "
-                "replace it with a directory and plant files your later sessions run. Refusing to grant "
-                "bash hands (fail-closed). To use bash, remove it or move it out of the way."
+                f"{real} is not a directory, and the Linux floor protects it as one (a directory that "
+                "programs you run later load files from): bash could replace it with a directory and plant "
+                "files there. Refusing to grant bash hands (fail-closed). To use bash, remove it or move it "
+                "out of the way."
             )
         anc = _nearest_existing(real)
         if (anc == ws_real or anc.is_relative_to(ws_real)) and not os.access(anc, os.W_OK):

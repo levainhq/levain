@@ -343,3 +343,73 @@ def test_the_linux_plan_refuses_a_file_where_the_local_lib_tree_would_be(home: P
         _linux_plan(home, monkeypatch)
     msg = " ".join(str(err.value).split())
     assert os.path.realpath(lib) in msg and "not a directory" in msg and "remove it or move it" in msg
+
+
+# --- verify r3 #19: a $PYTHONUSERBASE that is a symlink ----------------------------------------------------------
+
+def _symlinked_base(tmp_path: Path) -> tuple[Path, Path]:
+    """``(link, real)``: the base as the operator wrote it, a symlink to a directory in another temp tree."""
+    real = Path(os.path.realpath(tmp_path)) / "elsewhere" / "pybase"
+    real.mkdir(parents=True)
+    link = tmp_path / "pybase-link"
+    link.symlink_to(real)
+    return link, real
+
+
+def test_a_symlinked_userbase_names_its_real_lib_too(home: Path, tmp_path: Path, monkeypatch) -> None:
+    """#19 (verify r3, deepseek MED): with the base a symlink, the derivation returns ``<base>/lib`` as written AND
+    the real ``lib`` it resolves to, so every reader (the floor, its too-wide test, the consent hook) sees both."""
+    link, real = _symlinked_base(tmp_path)
+    monkeypatch.setenv("PYTHONUSERBASE", str(link))
+    roots, note = C.python_user_site_roots(home)
+    paths = [p for p, _ in roots]
+    assert link / "lib" in paths and real / "lib" in paths and note is None
+    policy = _policy(tmp_path)
+    for b in (link, real):
+        assert _covered(policy, b / "lib" / f"python{_XY}" / "site-packages" / "x.pth")
+        assert crown_jewel_reason(policy, b / "lib" / "python" / "site-packages" / "usercustomize.py")
+
+
+def test_a_symlinked_userbase_whose_real_lib_is_too_wide_refuses_the_floor(home: Path, tmp_path: Path,
+                                                                          monkeypatch) -> None:
+    """#19's other reader: the too-wide refusal. A base linked to ``/`` has the real site ``/lib`` (a filesystem
+    root's), which the lexical ``<link>/lib`` alone does not show."""
+    link = tmp_path / "rootlink"
+    link.symlink_to("/")
+    monkeypatch.setenv("PYTHONUSERBASE", str(link))
+    with pytest.raises(C.ConfinementError) as err:
+        _policy(tmp_path)
+    msg = " ".join(str(err.value).split())
+    assert "$PYTHONUSERBASE" in msg and "/lib" in msg and "fail-closed" in msg
+
+
+@live
+def test_live_a_symlinked_userbase_cannot_be_planted_through_its_real_path(home: Path, tmp_path: Path,
+                                                                          monkeypatch) -> None:
+    link, real = _symlinked_base(tmp_path)
+    monkeypatch.setenv("PYTHONUSERBASE", str(link))
+    policy = _policy(tmp_path)
+    q = shlex.quote
+    with C.select_provider().spawn_shell(policy) as sh:
+        for b in (link, real):
+            site_dir = b / "lib" / f"python{_XY}" / "site-packages"
+            r = sh.run(f"mkdir -p {q(str(site_dir))} 2>&1; echo 'import os' > {q(str(site_dir / 'x.pth'))} 2>&1",
+                       timeout=20)
+            assert r.exit_code != 0 and not (site_dir / "x.pth").exists(), (b, r.output)
+        ok = sh.run(f"mkdir -p {q(str(real / 'share'))} && echo x > {q(str(real / 'share' / 'f'))}", timeout=20)
+        assert ok.exit_code == 0, ok.output   # the control: the base beside its lib stays writable
+
+
+# --- verify r3: the step-(2p) non-directory refusal names no tree it is not --------------------------------------
+
+def test_a_file_where_the_local_bin_tree_would_be_is_refused_without_naming_the_user_site(home: Path, tmp_path: Path,
+                                                                                         monkeypatch) -> None:
+    """deepseek LOW (verify r3): the U2 refusal covers every step-(2p) tree; its message must not tell the operator
+    that ``~/.local/bin`` is where the Python user site lives."""
+    binf = home / ".local" / "bin"
+    binf.write_text("not a directory\n")
+    with pytest.raises(C.ConfinementError) as err:
+        _linux_plan(home, monkeypatch)
+    msg = " ".join(str(err.value).split())
+    assert os.path.realpath(binf) in msg and "not a directory" in msg and "remove it or move it" in msg
+    assert "Python user site" not in msg
