@@ -156,6 +156,17 @@ def test_echo_outside_window_opens_epoch(cs, world, clock):
     assert echoes(cs, world["launch"]) == [] and len(outside_epochs(cs, world["launch"])) == 1
 
 
+def test_echo_with_the_clock_stepped_back_opens_epoch(cs, world, clock):
+    # the attempt is stamped later than the ingest's now: a negative elapsed time is outside the window
+    s = ScriptedSession(sends=("accept_silent",))
+    svc = ready(cs, world, s)
+    send(svc, cs, world)
+    clock.advance(seconds=-5)
+    s.show("user_item", body="go", turn_id="t-1")
+    svc.read_next(world["launch"])
+    assert echoes(cs, world["launch"]) == [] and len(outside_epochs(cs, world["launch"])) == 1
+
+
 def test_echo_at_the_window_edge_is_an_echo(cs, world, clock):
     s = ScriptedSession(sends=("accept_silent",))
     svc = ready(cs, world, s)

@@ -1111,7 +1111,7 @@ def _echo_candidate(conn: sqlite3.Connection, now: str, message_id: str, item: C
         elapsed = parse_stamp(now) - parse_stamp(attempted_at)
     except ValueError:                  # parse_stamp's ConsentError is a ValueError
         return False
-    if elapsed > ECHO_WINDOW:
+    if elapsed < timedelta(0) or elapsed > ECHO_WINDOW:      # a clock stepped back is outside the window
         return False
     return item.body_norm_sha256 == norm
 
