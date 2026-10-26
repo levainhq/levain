@@ -13,11 +13,17 @@
 // The passkey asked for is one of those, by its credential id when this browser or the cockpit knows it (allowCredentials),
 // so the browser never asks for a biometric a refusal would follow. With no key that may sign, no ceremony starts: the sheet
 // says what the request needs and where it can be signed.
+//
+// Every read and post has a deadline over its headers and its body. A ceremony ends "signed", "unsigned" (nothing can have
+// been signed: a refusal, or anything before the answer was posted) or "unsure" (the answer was posted and its reply did not
+// come back). Only "unsigned" re-arms the controls; "unsure" keeps them frozen and reads the request again, and they come
+// back only when that read finds the same version still open. A write-in is frozen as typed (trimmed) from its click on.
 (function () {
   "use strict";
 
   const WRITE_TOKEN_KEY = "levain_write_token";     // dashboard_boot.js's key: the cockpit's own token in this browser
   const PAIRED_MARK_KEY = "levain_paired_device";   // pair.js's mark: this browser holds a paired device's key
+  const FETCH_TIMEOUT_MS = 15000;                    // one read or post, its headers and its body
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, text) => {
     const n = document.createElement(tag);
@@ -63,6 +69,8 @@
     b.id = "sheet-close";
     b.addEventListener("click", () => tell("close"));
     p.replaceChildren(b);
+    // a key pressed in this frame is this document's event, never the cockpit's: Escape closes the overlay from here
+    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") tell("close"); });
   })();
 
   function storedToken() {
@@ -82,6 +90,8 @@
 
   const b64u = (buf) => btoa(String.fromCharCode.apply(null, new Uint8Array(buf)))
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  // unpadded base64url with a length some bytes encode to; unb64u is only ever handed one
+  const decodable = (t) => typeof t === "string" && /^[A-Za-z0-9_-]+$/.test(t) && t.length % 4 !== 1;
   const unb64u = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
                                         (c) => c.charCodeAt(0));
   const why = (r) => (r.body && typeof r.body.message === "string" && r.body.message) || ("refused (HTTP " + r.status + ")");
@@ -93,12 +103,32 @@
     if (post) h["Content-Type"] = "application/json";
     return h;
   }
-  // {ok, status, body}; status 0 when the cockpit could not be reached
-  function call(route, body) {
-    return fetch(route, { method: "POST", cache: "no-store", headers: headers(true), body: JSON.stringify(body) })
+  // one read or post: {ok, status, body}, status 0 when no whole reply came (unreachable, or past the deadline). The abort
+  // stays armed until the body is read, so a reply that stalls before its headers or mid-body is cancelled; the race ends
+  // the wait a second after it for a browser without AbortController, or a body that does not honour the signal.
+  function within(route, opts) {
+    const ac = typeof AbortController === "function" ? new AbortController() : null;
+    let late = false;
+    const timer = setTimeout(() => { late = true; if (ac) ac.abort(); }, FETCH_TIMEOUT_MS);
+    const none = () => ({ ok: false, status: 0,
+                          body: { message: late ? "the cockpit did not answer in time" : "the cockpit could not be reached" } });
+    const got = fetch(route, Object.assign({ cache: "no-store" }, opts, ac ? { signal: ac.signal } : {}))
       .then((res) => res.json().then((j) => ({ ok: res.ok, status: res.status, body: j && typeof j === "object" ? j : {} }),
-                                     () => ({ ok: false, status: res.status, body: {} })),
-            () => ({ ok: false, status: 0, body: { message: "the cockpit could not be reached" } }));
+                                     () => (late ? none() : { ok: false, status: res.status, body: {} })),
+            none);
+    const deadline = new Promise((r) => setTimeout(() => { late = true; r(none()); }, FETCH_TIMEOUT_MS + 1000));
+    return Promise.race([got, deadline]).finally(() => clearTimeout(timer));
+  }
+  const call = (route, body) => within(route, { method: "POST", headers: headers(true), body: JSON.stringify(body) });
+  // the request as the cockpit holds it now: {request, rp_id, ...}, {closed}, {unpaired} or {error}
+  function readRequest() {
+    return within("/cockpit/sign/" + encodeURIComponent(id) + ".json", { headers: headers(false) }).then((g) => {
+      if (g.status === 403) return { unpaired: true };
+      if (g.status === 404) return g.body.error === "not_open" ? { closed: true } : { error: "This cockpit hosts no signing." };
+      if (g.status === 0) return { error: "The sign request could not be read: " + g.body.message + "." };
+      if (!g.ok) return { error: "The sign request could not be read (HTTP " + g.status + ")." };
+      return g.body.request && typeof g.body.request === "object" ? g.body : { error: "The sign request could not be read." };
+    });
   }
 
   // which passkey THIS browser used, per rpId: the cockpit page's record (dashboard_core.js), fingerprint -> credential id
@@ -110,18 +140,14 @@
   function remember(rp, fp, rawId) {
     try { const m = mine(rp); m[fp] = rawId; window.localStorage.setItem(mapKey(rp), JSON.stringify(m)); } catch (e) { /* kept nowhere */ }
   }
+  function forget(rp, fp) {
+    try { const m = mine(rp); delete m[fp]; window.localStorage.setItem(mapKey(rp), JSON.stringify(m)); } catch (e) { /* kept nowhere */ }
+  }
 
   // ---- read the request, then draw it ----
   if (!id) { head("Not a sign request", "This link names no sign request."); return; }
   if (!storedToken()) { unpaired(false); return; }
-  fetch("/cockpit/sign/" + encodeURIComponent(id) + ".json", { cache: "no-store", headers: headers(false) }).then((res) => {
-    if (res.status === 403) return { unpaired: true };
-    if (res.status === 404) return res.json().then((b) => (b && b.error === "not_open" ? { closed: true } : { error: "This cockpit hosts no signing." }),
-                                                   () => ({ error: "This cockpit hosts no signing." }));
-    if (!res.ok) return { error: "The sign request could not be read (HTTP " + res.status + ")." };
-    return res.json().then((b) => (b && typeof b === "object" && b.request && typeof b.request === "object" ? b : { error: "The sign request could not be read." }),
-                           () => ({ error: "The sign request could not be read." }));
-  }, () => ({ error: "The cockpit could not be reached." })).then(draw);
+  readRequest().then(draw);
 
   function draw(got) {
     if (got.unpaired) return unpaired(true);
@@ -145,7 +171,9 @@
     body.appendChild(el("pre", "sheet-message", typeof r.message === "string" ? r.message : ""));
     if (r.expires_at) body.appendChild(el("p", "ext-meta", "Open until " + r.expires_at));
 
-    const rp = window.location.hostname;
+    // the rpId the passkey record is kept under, written and read: the read's own (the Signer's), which a page on another
+    // name of the same site does not share with its hostname; a cockpit that names none is read as this page's name
+    const rp = typeof got.rp_id === "string" && got.rp_id ? got.rp_id : window.location.hostname;
     const signers = Array.isArray(r.signers) ? r.signers.filter((fp) => typeof fp === "string") : [];
     const held = got.credentials && typeof got.credentials === "object" ? got.credentials : {};
     if (!signers.length) return escalate(rp, got.note);
@@ -171,21 +199,36 @@
     $("sheet-body").appendChild(card);
   }
 
+  // what is being signed, beside the controls: the page's expectation at the tap ("page"), then the line the challenge
+  // carries ("server"), which after a signature is the line signed
+  function signing(text, source, done) {
+    let n = $("sheet-signing");
+    if (!n) {
+      n = el("p", "sheet-signing");
+      n.id = "sheet-signing";
+      $("sheet-actions").before(n);
+    }
+    n.textContent = (done ? "Signed: " : "Signing: ") + text;
+    n.dataset.source = source;
+  }
+
   let busy = false;
   function offer(r, rp, signers, held) {
     const acts = $("sheet-actions");
     acts.hidden = false;
-    const buttons = [];
-    const lock = (on) => { for (const b of buttons) b.disabled = on; };
-    const run = (choice, words) => {
+    const controls = [];          // every button and the write-in: frozen together for the whole ceremony
+    const lock = (on) => { for (const b of controls) b.disabled = on; };
+    const run = (choice, words, expect) => {
       if (busy) return;
       busy = true;
       lock(true);
-      whom(rp, signers, held, acts).then((k) => (k ? ceremony(r, k.fp, k.rawId, choice, words) : "unsigned"))
+      if (expect) signing(expect, "page", false);
+      whom(rp, signers, held, acts).then((k) => (k ? ceremony(r, rp, k, choice, words) : "unsigned"))
         .catch(() => "unsigned")
         .then((done) => {
+          if (done === "signed") { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
+          if (done === "unsure") return settle(r, () => { busy = false; lock(false); });
           busy = false;
-          if (done === "signed") { acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
           lock(false);
         });
     };
@@ -193,9 +236,10 @@
       const b = el("button", "dev-btn" + (cls ? " " + cls : ""), text);
       b.type = "button";
       b.addEventListener("click", onClick);
-      buttons.push(b);
+      controls.push(b);
       return b;
     };
+    const lineOf = (o) => (o && typeof o.line === "string" ? o.line : "");
     const options = Array.isArray(r.options) ? r.options : [];
     // his pick from the link: one tap that signs that option, only on the version he tapped it on (phone.js's rule)
     const sameV = !!pickV && typeof r.sha256 === "string" && r.sha256.slice(0, 16) === pickV;
@@ -204,7 +248,7 @@
       const top = el("p", "sheet-pick", "Your pick: (" + po.key + "). Read the item; Sign (" + po.key + ") is below it.");
       top.id = "sheet-pick";
       $("sheet-body").insertBefore(top, $("sheet-body").firstChild);
-      const pb = button("Sign (" + po.key + ")", "dev-primary", () => run(String(po.key), undefined));
+      const pb = button("Sign (" + po.key + ")", "dev-primary", () => run(String(po.key), undefined, lineOf(po)));
       pb.id = "sheet-picked";
       acts.appendChild(pb);
     } else if (pick) {
@@ -217,7 +261,7 @@
     if (!options.length) acts.appendChild(button("Sign with your passkey", po ? "" : "dev-primary", () => run(undefined, undefined)));
     for (const o of options) {
       if (!o || typeof o.key !== "string") continue;
-      const b = button("(" + o.key + ") " + String(o.text), o.key === r.recommended ? "sheet-rec" : "", () => run(o.key, undefined));
+      const b = button("(" + o.key + ") " + String(o.text), o.key === r.recommended ? "sheet-rec" : "", () => run(o.key, undefined, lineOf(o)));
       b.title = "signs: " + String(o.line);
       b.dataset.choice = o.key;
       acts.appendChild(b);
@@ -229,10 +273,14 @@
       box.id = "sheet-write-in";
       box.maxLength = Number(wi.max) || 200;
       box.placeholder = "or write your own answer";
+      controls.push(box);
       acts.append(box, button("(" + String(wi.key) + ") Sign my words", "", () => {
+        if (busy) return;
+        // the words signed are the box's at this click, trimmed, and the box shows exactly them until the ceremony ends
         const w = box.value.trim();
         if (!w) return say("Type your answer first.", "bad");
-        run(String(wi.key), w);
+        box.value = w;
+        run(String(wi.key), w, (typeof wi.line === "string" ? wi.line : "(" + String(wi.key) + "): ") + w);
       }));
     }
     if (options.length) {
@@ -242,15 +290,35 @@
     }
   }
 
+  // "unsure": the answer was posted and no reply said what landed. Read the request again; only the same version still open
+  // gives the controls back (`release`), anything else leaves them frozen, says so, and tells the cockpit to read again
+  function settle(r, release) {
+    say($("sheet-note").textContent + " Checking where it stands…", "bad");
+    return readRequest().then((got) => {
+      if (got.request && got.request.sha256 === r.sha256 && !got.request.refused) {
+        say("Not signed: the cockpit says this request is still open, unsigned, on the version shown; you can sign it again.", "bad");
+        return release();
+      }
+      $("sheet").dataset.state = "closed";
+      say(got.closed ? "This request is no longer open (it may have been signed from here): the cockpit shows what landed."
+          : got.request ? "This request changed while it was being signed: reload it and read it again."
+          : "Where this request stands could not be read (" + String(got.error || "no reply") + "): reload before signing again.",
+          "bad");
+      tell("reload");
+    });
+  }
+
   // which eligible key signs: the one this browser used before, else the only one, else his pick from a list.
-  // Resolves {fp, rawId} or null (dismissed); rawId is this browser's record, else the cockpit's, else null (the OS's list)
+  // Resolves {fp, rawId, local} or null (dismissed); rawId is this browser's record (local: true), else the cockpit's,
+  // else null (the OS's list)
   function whom(rp, signers, held, acts) {
     const local = mine(rp);
-    const idOf = (fp) => (Object.prototype.hasOwnProperty.call(local, fp) ? local[fp]
-      : held[fp] && typeof held[fp].credential_id === "string" ? held[fp].credential_id : null);
-    const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
-    if (known.length === 1) return Promise.resolve({ fp: known[0], rawId: local[known[0]] });
-    if (!known.length && signers.length === 1) return Promise.resolve({ fp: signers[0], rawId: idOf(signers[0]) });
+    const has = (fp) => Object.prototype.hasOwnProperty.call(local, fp);
+    const idOf = (fp) => (has(fp) ? { fp: fp, rawId: local[fp], local: true }
+      : { fp: fp, rawId: held[fp] && typeof held[fp].credential_id === "string" ? held[fp].credential_id : null, local: false });
+    const known = signers.filter(has);
+    if (known.length === 1) return Promise.resolve(idOf(known[0]));
+    if (!known.length && signers.length === 1) return Promise.resolve(idOf(signers[0]));
     say("More than one passkey may sign this; pick the one this device holds:");
     return new Promise((resolve) => {
       const picks = [];
@@ -259,7 +327,7 @@
         const p = el("button", "dev-btn sheet-key", fp.slice(0, 18) + "…");
         p.type = "button";
         p.title = fp;
-        p.addEventListener("click", () => end({ fp: fp, rawId: idOf(fp) }));
+        p.addEventListener("click", () => end(idOf(fp)));
         picks.push(p);
       }
       const no = el("button", "dev-btn sheet-key", "Dismiss");
@@ -270,41 +338,59 @@
     });
   }
 
-  // one ceremony: "signed", "unsigned" (definitely nothing signed) or "unsure" (the answer may have landed)
-  function ceremony(r, fp, rawId, choice, words) {
+  // one ceremony with key `k` ({fp, rawId, local}): "signed", "unsigned" (definitely nothing signed) or "unsure" (the
+  // answer was posted and may have landed). `rp` keys this browser's passkey record (draw's).
+  function ceremony(r, rp, k, choice, words) {
     const base = "/cockpit/sign/" + encodeURIComponent(r.id) + "/";
+    const fp = k.fp;
     const body = { signer_fp: fp, request_sha256: r.sha256 };
     if (choice !== undefined) body.choice = choice;
     if (words !== undefined) body.write_in = words;
     let sent = false, line = "";
+    const unsigned = (m) => { say(/nothing was signed/.test(m) ? m : m + "; nothing was signed.", "bad"); return "unsigned"; };
     say(choice !== undefined ? "Asking for the challenge for (" + choice + ")…" : "Asking for the challenge…");
     return call(base + "challenge", body).then((c) => {
-      if (!c.ok) { say(why(c), "bad"); return "unsigned"; }
-      if (typeof c.body.line === "string") line = c.body.line;
+      if (!c.ok) return unsigned("Not signed: " + why(c));
+      if (!decodable(c.body.challenge)) return unsigned("The cockpit sent a malformed challenge");
+      if (typeof c.body.line === "string") { line = c.body.line; signing(line, "server", false); }
       say("Confirm with your passkey to sign…" + (line ? " " + line : ""));
-      const pk = { challenge: unb64u(String(c.body.challenge || "")), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
-      if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
-      return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+      // the passkey asked for by its id when one decodes; an id that does not is dropped (the OS's own list), never a throw
+      const allow = k.rawId && decodable(k.rawId) ? unb64u(k.rawId) : null;
+      if (k.rawId && !allow && k.local) forget(rp, fp);
+      const ask = (id) => {
+        const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+        if (id) pk.allowCredentials = [{ type: "public-key", id: id }];
+        return navigator.credentials.get({ publicKey: pk });
+      };
+      // a NotAllowedError for the id this browser remembered may be a passkey since removed: forget it and ask once more
+      // with no id, so the next answer is the passkey actually held (remembered below)
+      const asked = ask(allow).catch((e) => {
+        if (!(e && e.name === "NotAllowedError" && allow && k.local)) throw e;
+        forget(rp, fp);
+        return ask(null);
+      });
+      return asked.then((cred) => {
         say("Verifying the signature…");
-        sent = true;
         const answer = { authenticator_data: b64u(cred.response.authenticatorData),
           client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
         if (cred.rawId) answer.raw_id = b64u(cred.rawId);
+        sent = true;          // from here on a failure may follow an answer that landed
         return call(base + "answer", answer).then((a) => {
-          if (!a.ok && a.status >= 400 && a.status < 500) { say("Not signed: " + why(a), "bad"); return "unsigned"; }
-          if (!a.ok) { say("Not sure this was signed (" + why(a) + "): check the cockpit.", "bad"); return "unsure"; }
-          if (!rawId && cred.rawId && typeof c.body.rp_id === "string") remember(c.body.rp_id, fp, b64u(cred.rawId));
-          say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + a.body.signer_fp + " in " + a.body.namespace
-              + (line ? ": " + line : ""), "ok");
+          if (!a.ok && a.status >= 400 && a.status < 500) return unsigned("Not signed: " + why(a));
+          if (!a.ok) { say("Not sure this was signed (" + why(a) + ").", "bad"); return "unsure"; }
+          if (cred.rawId && mine(rp)[fp] !== b64u(cred.rawId)) remember(rp, fp, b64u(cred.rawId));
+          const by = typeof a.body.signer_fp === "string" && a.body.signer_fp ? a.body.signer_fp : fp;
+          const ns = typeof a.body.namespace === "string" && a.body.namespace ? " in " + a.body.namespace : "";
+          say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + by + ns + (line ? ": " + line : ""), "ok");
+          if (line) signing(line, "server", true);
           $("sheet").dataset.state = "signed";
           return "signed";
         });
-      }, (e) => { say("The passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed.", "bad"); return "unsigned"; });
+      }, (e) => unsigned("The passkey did not sign (" + ((e && e.name) || "cancelled") + ")"));
     }).catch((e) => {
       const name = (e && e.name) || "error";
-      if (sent) { say("Not sure this was signed (the page failed: " + name + "): check the cockpit.", "bad"); return "unsure"; }
-      say("The page failed (" + name + "); nothing was signed.", "bad");
-      return "unsigned";
+      if (sent) { say("Not sure this was signed (the page failed: " + name + ").", "bad"); return "unsure"; }
+      return unsigned("The page failed (" + name + ")");
     });
   }
 })();

@@ -218,3 +218,272 @@ def test_the_overlay_closes_on_its_own_button_and_on_escape(tmp_path: Path, monk
     v = out["values"]
     assert v[4] is True and v[7] is True and v[8] is True and v[10] is True, v
     assert rig.nothing_signed(QRID)
+
+
+# --- L3 r1 (H1-H8): what the sheet does when the text, the network or the passkey record misbehave -------------------
+
+WRITE_IN_BOX = "document.getElementById('sheet-write-in')"
+WRITE_IN_BTN = "[...document.querySelectorAll('#sheet-actions button')].find((b) => /Sign my words/.test(b.textContent))"
+SIGNING = "(document.getElementById('sheet-signing') || {}).textContent"
+ENABLED = f"!{_button('a')}.disabled && !{_button('b')}.disabled"
+
+
+def _stub(win: str = "window") -> dict:
+    """A fetch wrapper in ``win`` (the sheet's window): a path ending in a key of ``<win>.__stub`` is answered by that
+    function ``(real, url, opts)``; every other call goes to the real fetch. ``<win>.__reads`` counts the request
+    reads (GET ...json) made from now on."""
+    return {"eval": f"(() => {{ const w = {win}; const real = w.fetch.bind(w); w.__reads = 0; w.__stub = {{}}; "
+                    "w.fetch = (u, o) => { const url = String(u); if (/\\.json$/.test(url)) w.__reads++; "
+                    "for (const k of Object.keys(w.__stub)) if (url.endsWith(k)) return w.__stub[k](real, u, o || {}); "
+                    "return real(u, o); }; return 1; })()"}
+
+
+# a reply that never comes: settles only by the AbortSignal the caller passed (none: never)
+HANG = ("(real, u, o) => new Promise((res, rej) => { if (o.signal) o.signal.addEventListener('abort', "
+        "() => rej(new DOMException('aborted', 'AbortError'))); })")
+# headers that arrive and a body that never does (same rule)
+BODY_HANG = ("(real, u, o) => Promise.resolve({ ok: true, status: 200, json: () => new Promise((res, rej) => { "
+             "if (o.signal) o.signal.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError'))); }) })")
+# the answer reaches the cockpit, which records the signature, and its reply is lost on the way back
+LOST_AFTER_SEND = "(real, u, o) => real(u, o).then(() => { throw new TypeError('the reply was lost'); })"
+# the answer never left the page
+LOST_BEFORE_SEND = "(real, u, o) => Promise.reject(new TypeError('the network went away'))"
+
+
+def _signed_message(rig: _Rig) -> str:
+    return json.loads((rig.qdir / "sign" / f"{QRID}.signed.json").read_text())["signed_message"]
+
+
+@needs_browser
+@needs_ssh
+def test_h1_a_write_in_is_frozen_and_normalised_at_the_click_and_the_text_signed_is_shown(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig),
+            {"eval": f"{WRITE_IN_BOX}.value = '  approve $10  '; 1"},
+            # the click and what the page shows in the same turn, before any reply could come back
+            {"eval": f"(() => {{ {WRITE_IN_BTN}.click(); return [{WRITE_IN_BOX}.disabled, {WRITE_IN_BOX}.value, "
+                     f"{SIGNING} || '']; }})()"},
+            {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
+            {"eval": SIGNING},
+            {"eval": "document.getElementById('sheet-signing').dataset.source"},
+        ])
+    v = out["values"]
+    disabled, value, shown = v[3]
+    assert disabled is True and value == "approve $10", v           # frozen at the click, the text normalised in place
+    assert shown.endswith("approve $10"), v                          # what is being signed, shown as it is signed
+    assert v[5].endswith("(*): approve $10") and v[6] == "server", v   # after the signature: the server's own line
+    assert _signed_message(rig).endswith("(*): approve $10")
+    assert rig.verifies(QRID)
+
+
+@needs_browser
+@needs_ssh
+def test_h2_unsure_after_the_answer_landed_re_reads_and_shows_it_closed_never_re_arms(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(),
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"eval": "(() => { window.__reloads = 0; const t = window.LevainCockpitTransport; const r = t.reload.bind(t); "
+                     "t.reload = () => { window.__reloads++; return r(); }; return 1; })()"},
+            {"eval": f"{OPEN_SHEET}.click() || 1"},
+            {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state === 'open'", "ms": 30000},
+            _stub(f"{FRAME}.contentWindow"),
+            {"eval": f"{FRAME}.contentWindow.__stub['/answer'] = {LOST_AFTER_SEND}; 1"},
+            {"eval": f"{IN}.getElementById('sheet-write-in').value = 'approve $10'; "
+                     f"[...{IN}.querySelectorAll('#sheet-actions button')].find((b) => /Sign my words/.test(b.textContent)).click() || 1"},
+            {"until": f"{IN}.getElementById('sheet').dataset.state === 'closed' && 1", "ms": 30000, "may_timeout": True},
+            {"eval": f"{FRAME}.contentWindow.__reads"},
+            {"eval": f"[...{IN}.querySelectorAll('#sheet-actions button, #sheet-actions input')].filter((b) => !b.disabled).length"},
+            {"eval": f"{IN}.getElementById('sheet-note').textContent"},
+            {"eval": "new Promise((r) => setTimeout(() => r(window.__reloads), 2000))"},
+        ])
+    v = out["values"]
+    assert not isinstance(v[7], dict), v                            # the sheet reached "closed"
+    assert v[8] >= 1, v                                              # by reading the request again
+    assert v[9] == 0, v                                              # nothing re-armed
+    assert "no longer open" in v[10], v
+    assert v[11] >= 1, v                                             # the cockpit under it was told to read again
+    assert rig.verifies(QRID)                                        # the answer had landed
+
+
+@needs_browser
+def test_h2_unsure_with_the_identical_version_still_open_unlocks_after_the_re_read(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig), _stub(),
+            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; {_button('a')}.click() || 1"},
+            {"until": f"window.__reads >= 1 && {ENABLED} && {WRITE_IN_BOX} && !{WRITE_IN_BOX}.disabled && 1", "ms": 30000},
+            {"eval": STATE},
+            {"eval": NOTE},
+        ])
+    v = out["values"]
+    assert v[5] == "open", v
+    assert "still open" in v[6], v
+    assert rig.nothing_signed(QRID)
+
+
+@needs_browser
+def test_h3_a_challenge_that_never_answers_ends_unsigned_at_the_deadline(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig), _stub(), {"eval": SPY},
+            {"eval": f"window.__stub['/challenge'] = {HANG}; {_button('a')}.click() || 1"},
+            {"until": f"/did not answer in time/.test({NOTE}) && {ENABLED} && {NOTE}", "ms": 25000, "may_timeout": True},
+            {"eval": "window.__gets"},
+            {"eval": "window.__reads"},
+        ])
+    v = out["values"]
+    assert isinstance(v[5], str) and "nothing was signed" in v[5], v   # unsigned: before the answer, so the options re-arm
+    assert v[6] == 0 and v[7] == 0, v                                  # no passkey asked, no re-read needed
+    assert rig.nothing_signed(QRID)
+
+
+@needs_browser
+def test_h3_an_answer_whose_body_never_arrives_is_unsure_and_re_reads(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig), _stub(),
+            {"eval": f"window.__stub['/answer'] = {BODY_HANG}; {_button('a')}.click() || 1"},
+            {"until": f"window.__reads >= 1 && {ENABLED} && {NOTE}", "ms": 25000, "may_timeout": True},
+            {"eval": NOTE},
+        ])
+    v = out["values"]
+    assert isinstance(v[4], str), v                                   # the deadline fired and the re-read ran
+    assert "still open" in v[5], v                                    # the answer never reached the cockpit here
+    assert rig.nothing_signed(QRID)
+
+
+@needs_browser
+def test_h4_a_malformed_challenge_is_named_and_no_passkey_is_asked(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    bad = ("(real, u, o) => Promise.resolve(new Response(JSON.stringify({challenge: window.__bad, rp_id: 'localhost'}), "
+           "{status: 200, headers: {'Content-Type': 'application/json'}}))")
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig), _stub(), {"eval": SPY},
+            {"eval": f"window.__bad = 'not base64url!'; window.__stub['/challenge'] = {bad}; {_button('a')}.click() || 1"},
+            {"until": f"{ENABLED} && /challenge/.test({NOTE}) && {NOTE}", "ms": 10000, "may_timeout": True},
+            {"eval": f"window.__bad = ''; {_button('a')}.click() || 1"},
+            {"until": f"{ENABLED} && /challenge/.test({NOTE}) && {NOTE}", "ms": 10000, "may_timeout": True},
+            {"eval": "window.__gets"},
+        ])
+    v = out["values"]
+    for said in (v[5], v[7]):
+        assert isinstance(said, str) and "malformed challenge" in said and "nothing was signed" in said, v
+    assert v[8] == 0, v
+    assert rig.nothing_signed(QRID)
+
+
+@needs_browser
+def test_h5_escape_inside_the_frame_closes_the_overlay_and_the_cockpit_behind_is_inert(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    behind = ("[...document.body.children].filter((n) => n.id !== 'levain-sign-sheet' && n.tagName !== 'SCRIPT')")
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP,
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"eval": f"{OPEN_SHEET}.click() || 1"},
+            {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state === 'open'", "ms": 30000},
+            {"eval": f"{behind}.length > 0 && {behind}.every((n) => n.inert)"},
+            {"eval": "document.getElementById('levain-sign-sheet').inert === false"},
+            # focus inside the sheet, then Escape there: the key event never reaches the cockpit's document
+            {"eval": f"(() => {{ const b = {IN}.querySelector('#sheet-actions button'); b.focus(); "
+                     f"b.dispatchEvent(new ({FRAME}.contentWindow.KeyboardEvent)('keydown', {{key: 'Escape', bubbles: true}})); "
+                     f"return {IN}.activeElement === b; }})()"},
+            {"until": f"!{FRAME} && 1", "ms": 3000, "may_timeout": True},
+            {"eval": f"{behind}.some((n) => n.inert)"},
+        ])
+    v = out["values"]
+    assert v[3] is True and v[4] is True, v                          # open: everything behind it inert, the sheet not
+    assert v[5] is True, v
+    assert v[6] == 1, v                                              # Escape in the frame closed the overlay
+    assert v[7] is False, v                                          # and the cockpit is live again
+
+
+# every navigator.credentials.get from now on, by the credential id it asked for (null: none, the OS's own list)
+ASKED = ("(() => { window.__asked = []; const real = navigator.credentials.get.bind(navigator.credentials); "
+         "const b64u = (b) => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\\+/g, '-').replace(/\\//g, '_')"
+         ".replace(/=+$/, ''); navigator.credentials.get = (o) => { const a = o.publicKey.allowCredentials; "
+         "window.__asked.push(a && a.length ? b64u(a[0].id) : null); return real(o); }; return 1; })()")
+CARD_CRED = "bGV2YWluLWNhcmQtY3JlZA"        # b64u(b"levain-card-cred"): the credential the virtual authenticator holds
+
+
+def _seed(rp: str, record: dict) -> dict:
+    return {"eval": f"window.localStorage.setItem('levain-passkeys:{rp}', {json.dumps(json.dumps(record))}); 1"}
+
+
+@needs_browser
+def test_h6_the_sheet_reads_its_passkey_record_under_the_reads_rp_id(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    fp = rig.pk.key.fingerprint
+    with rig.serving():
+        # the Signer names an rpId other than this page's hostname (after the server checked its pin: the passkey
+        # cannot sign there, and nothing here needs it to; the id the page asks for is the measurement)
+        rig.signer.rp_id = "rp.example"
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), _seed("rp.example", {fp: "cnAtZXhhbXBsZQ"}), _seed("localhost", {fp: "aG9zdG5hbWU"}),
+            *_open(rig), {"eval": ASKED},
+            {"eval": f"{_button('a')}.click() || 1"},
+            {"until": "window.__asked.length >= 1 && window.__asked", "ms": 10000},
+        ])
+    assert out["values"][-1][0] == "cnAtZXhhbXBsZQ", out["values"]
+    assert rig.nothing_signed(QRID)
+
+
+@needs_browser
+@needs_ssh
+def test_h7_a_credential_id_that_does_not_decode_is_dropped_and_the_sheet_still_signs(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), _seed("localhost", {rig.pk.key.fingerprint: "%%% not base64url"}),
+            *_open(rig), {"eval": ASKED},
+            {"eval": f"{_button('b')}.click() || 1"},
+            {"until": f"/^signed|failed|did not/.test({NOTE}) && {NOTE}", "ms": 30000},
+            {"eval": "window.__asked"},
+        ])
+    v = out["values"]
+    assert str(v[-2]).startswith("signed (b)"), v
+    assert v[-1] == [None], v
+    assert rig.verifies(QRID)
+
+
+@needs_browser
+@needs_ssh
+def test_h7_a_stale_remembered_credential_retries_once_without_it_and_is_replaced(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    fp = rig.pk.key.fingerprint
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), _seed("localhost", {fp: "c3RhbGUtY3JlZA"}),     # b64u(b"stale-cred")
+            *_open(rig), {"eval": ASKED},
+            {"eval": f"{_button('b')}.click() || 1"},
+            {"until": f"/^signed|nothing was signed/.test({NOTE}) && {NOTE}", "ms": 90000},
+            {"eval": "window.__asked"},
+            {"eval": "window.localStorage.getItem('levain-passkeys:localhost')"},
+        ])
+    v = out["values"]
+    assert str(v[-3]).startswith("signed (b)"), v
+    assert v[-2] == ["c3RhbGUtY3JlZA", None], v
+    assert json.loads(v[-1]) == {fp: CARD_CRED}, v
+    assert rig.verifies(QRID)
+
+
+@needs_browser
+def test_h8_the_signed_line_never_prints_undefined(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    bare = ("(real, u, o) => Promise.resolve(new Response('{}', {status: 200, headers: {'Content-Type': 'application/json'}}))")
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig), _stub(),
+            {"eval": f"window.__stub['/answer'] = {bare}; {_button('b')}.click() || 1"},
+            {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
+        ])
+    said = out["values"][-1]
+    assert "undefined" not in said and rig.pk.key.fingerprint in said, said

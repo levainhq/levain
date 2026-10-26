@@ -4935,9 +4935,11 @@
 
   // ---- The sign sheet over the cockpit (ONESURFACE OS-1, Q2 RULED OVERLAY) ----
   // The sheet /sign/<id> shown as a same-origin iframe over this page: the sheet runs its own ceremony and tells this page
-  // "signed" or "close" by postMessage, read only from this origin and from that frame. Its headers let only this origin
-  // frame it. Signing there changes the board, so the board reads again after a signature.
+  // "signed", "reload" or "close" by postMessage, read only from this origin and from that frame. Its headers let only this
+  // origin frame it. Signing there changes the board, so the board reads again after a signature, and after a sign whose
+  // outcome the sheet could not learn ("reload"). While it is open everything behind it is inert.
   const SIGN_SHEET_ID = "levain-sign-sheet";
+  let signSheetInerted = [];      // what openSignSheet made inert (and closeSignSheet gives back): never what was already
   function signSheetButton(r) {
     const b = el("button", "undo-btn sign-sheet-open", "open the sheet");
     b.type = "button";
@@ -4976,12 +4978,15 @@
     veil.addEventListener("keydown", (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); closeSignSheet(); } });
     document.body.appendChild(veil);
     document.body.classList.add("modal-open");
+    for (const n of document.body.children) if (n !== veil && !n.inert) { n.inert = true; signSheetInerted.push(n); }
     x.focus();
     return veil;
   }
   function closeSignSheet() {
     const veil = document.getElementById(SIGN_SHEET_ID);
     if (!veil) return;
+    for (const n of signSheetInerted) n.inert = false;
+    signSheetInerted = [];
     veil.remove();
     if (!document.getElementById("levain-modal")) document.body.classList.remove("modal-open");
   }
@@ -4990,8 +4995,8 @@
     if (!frame || ev.source !== frame.contentWindow || ev.origin !== window.location.origin) return;
     const what = ev.data && typeof ev.data === "object" ? ev.data.levainSheet : null;
     if (what === "close") closeSignSheet();
-    else if (what === "signed") {
-      // the signed line stays on the sheet until it is closed; the board under it reads again
+    else if (what === "signed" || what === "reload") {
+      // the sheet's line stays on it until it is closed; the board under it reads again
       signListed = null;
       const t = window.LevainCockpitTransport;
       if (t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
