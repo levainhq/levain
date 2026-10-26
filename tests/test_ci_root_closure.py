@@ -68,17 +68,19 @@ def test_roots_include_the_dynamically_run_modules():
 
 
 QBROKER = "levain.slot.services.qbroker"
+DISPATCH = "levain.slot.services.dispatch"
 
 
 def test_root_verifies_a_route_map_without_the_authority_store_or_the_autonomic_package():
     """S1 3c-4: CONTROL and keys verify a route map's signature with ``levain.authority_sig``; the authority store
     (its replay reaches the cockpit) and ``levain.autonomic`` stay out of what root imports. The queue broker's
     service runs as ``_levain_qbroker``, never root, and verifies signed grants and counts limits with both, so it is
-    the one root left out here; every other root (the helpers, the reaper, the wall's, CONTROL's and keys' services
+    a root left out here, and the dispatch service is the other (it runs as ``_levain_dispatch`` and any other euid,
+    root included, exits at once, and its job store replays the authority); every other root (the helpers, the reaper, the wall's, CONTROL's and keys' services
     once they exist) is held to it."""
     roots = rc._entry_modules()
-    assert QBROKER in roots  # the exclusion names a real root, so it cannot silently exclude nothing
-    mods = set(rc.closure([m for m in roots if m != QBROKER]))
+    assert QBROKER in roots and DISPATCH in roots  # each exclusion names a real root, so it cannot silently exclude nothing
+    mods = set(rc.closure([m for m in roots if m not in (QBROKER, DISPATCH)]))
     assert {"levain.slot.routemaps", "levain.authority_sig", "levain.trust_anchor"} <= mods
     assert "levain.authority" not in mods and not {m for m in mods if m.startswith("levain.autonomic")}
 
