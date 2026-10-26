@@ -856,7 +856,7 @@ def _keys_status_asker(run_dir: Path, budget_s: float) -> Any:
     """A callable answering CONTROL's ``KEYS-STATUS`` (3c-9 session D: keys' report of its ledger size and the
     brokered routes it serves, which the operator's account cannot read), asked on its first call only and answered
     within ``budget_s`` of that call; ``None`` for any failure (CONTROL or keys unreachable, a refusal, an answer off its shape), which a
-    row says as held by keys."""
+    row says as keys having given none to this run."""
     memo: list = []
 
     def ask() -> Any:
@@ -929,7 +929,8 @@ def _check_spend_ledger(store: Path, keys_status: Any = lambda: None) -> CheckRe
     except PermissionError:
         told = keys_status()
         if told is None:
-            return CheckResult(name, True, "held by keys: your account cannot read its size", neutral=True)
+            return CheckResult(name, True, "held by keys: its size is read once a session has started, and keys gave "
+                               "none to this run (with no session yet, or with keys not answering)", neutral=True)
         if told["ledger_bytes"] is None:
             return CheckResult(name, True, "keys could not tell its size (it has no ledger open, or cannot stat it)",
                                neutral=True)
@@ -1036,8 +1037,9 @@ def _served_pairs(store: Path, deadline: float, keys_status: Any) -> tuple[set, 
             if said:
                 return pairs, CheckResult(name, True, "; ".join(said), warn=True), None
             return pairs, None, None
-        return set(), CheckResult(name, True, "held by keys: your account cannot read the dispatch route maps, so "
-                                  "the ceilings of their credentials are not shown",
+        return set(), CheckResult(name, True, "held by keys: the dispatch route maps are read once a session has "
+                                  "started, and keys gave none to this run, so the ceilings of their credentials "
+                                  "are not shown",
                                   "Run `sudo levain doctor` to read them as root.", neutral=True), frozenset()
     except OSError as exc:
         return set(), CheckResult(name, True, f"dispatch route maps could not be read ({_slot_why(exc)})",
@@ -1179,7 +1181,8 @@ def _openrouter_limit_row(store: Path, cred: str, name: str, fetch: Any, timeout
     limit resets over) and ``include_byok_in_limit`` (boolean)."""
     from levain.broker import creds, policy
 
-    held = (f"the key limit was not read: {cred} is held by keys and your account cannot open it",
+    held = (f"the key limit was not read: keys holds {cred}; its limit is read once a session has started, and keys "
+            "gave none to this run (with no session yet, or with keys not answering: see the keys service row)",
             "Set a per-key credit limit at openrouter.ai/settings/keys; Levain's authorized cap does not bound "
             "the provider's invoice by itself.")
     try:
