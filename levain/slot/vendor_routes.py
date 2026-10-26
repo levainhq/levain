@@ -75,9 +75,9 @@ CLAUDE_PASSTHROUGH_HOSTS = ("api.anthropic.com", "claude.ai", "platform.claude.c
 
 
 def claude_passthrough_route() -> dict:
-    """The slot's own Claude login, tunnelled end to end (the front logs host and bytes, never a request line); never
-    a dispatch route (CONTRACT §4.1). It shares ``api.anthropic.com`` with :func:`anthropic_route`; a session carries
-    one or the other by its auth (render refuses ``auth-routes-mismatch`` otherwise)."""
+    """The slot's own Claude login, tunnelled end to end; never a dispatch route (CONTRACT §4.1). It shares
+    ``api.anthropic.com`` with :func:`anthropic_route`; a session carries one or the other by its auth (render refuses
+    ``auth-routes-mismatch`` otherwise)."""
     return {"route": "claude-subscription", "type": "subscription_passthrough", "hosts": list(CLAUDE_PASSTHROUGH_HOSTS)}
 
 
