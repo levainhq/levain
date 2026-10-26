@@ -26,6 +26,7 @@ VERIFY = (SlotId("none", 0),)
 @pytest.fixture(autouse=True)
 def _kept_in_tmp(tmp_path, monkeypatch):
     """The kept-reference note's home (``/var/run/levain``) moved under this test's tmp dir, apart from the token's."""
+    (tmp_path / "var-run" / "levain").mkdir(parents=True)              # made by the reaper's boot pass
     monkeypatch.setattr(pf, "PF_KEPT", tmp_path / "var-run" / "levain" / "pf.token.kept", raising=False)
 
 
@@ -605,7 +606,6 @@ def test_only_the_token_column_of_a_references_row_is_read():
 
 def test_a_note_that_is_not_one_is_removed_and_one_with_no_boot_time_to_check_is_left(tmp_path):
     kept = pf.PF_KEPT
-    kept.parent.mkdir(parents=True)
     kept.write_text("222\n")                                        # f4's layout: no boot
     assert pf._kept_held(kept, _Booted(["222"])) is None and not kept.exists()
     kept.write_text("222 1792860815.967376\n")
@@ -614,3 +614,22 @@ def test_a_note_that_is_not_one_is_removed_and_one_with_no_boot_time_to_check_is
         return subprocess.CompletedProcess(argv, 1, "", "sysctl: unknown oid\n")
     assert pf._kept_held(kept, no_sysctl) is None and kept.exists()  # which boot is unknown: neither used nor removed
     assert pf._kept_held(kept, _Booted(["222"])) == "222"
+
+
+def test_with_the_run_dir_not_made_yet_no_note_is_written_and_the_dir_is_left_to_the_reaper(tmp_path):
+    """R/ (``/var/run/levain``) is the reaper's to make, root 0755 (§2.2, §22): a pf run that made it first would give
+    it another mode. With no R/ there is no note, and run 2 is the ordinary retried failure (the fallback)."""
+    (tmp_path / "var-run" / "levain").rmdir()
+    token = _blocked(tmp_path)
+    token.write_text("111\n")
+    pfctl = _Booted(["111"])
+    assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
+    assert not (tmp_path / "var-run" / "levain").exists()
+    ok, why = pf.take_enable_reference(token, run=pfctl)
+    assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN) and pfctl.held == ["222"]
+
+
+def test_the_note_lives_in_the_run_dir_the_reaper_makes(monkeypatch):
+    from levain.slot.layout import RUN
+    monkeypatch.undo()                                              # the real home, not this file's tmp one
+    assert pf.PF_KEPT.parent == RUN["darwin"] == Path("/private/var/run/levain")

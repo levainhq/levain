@@ -29,6 +29,7 @@ from levain.firing.hands import _RETIRED_IDS as _HANDS_RETIRED_IDS, Step
 from levain.launch import child_env
 from levain.slot import Refused, write_all
 from levain.slot.ids import RETIRED_IDS_PATH, SlotId, in_own_range, loopback_alias
+from levain.slot.layout import RUN
 
 if TYPE_CHECKING:
     from levain.slot.removal import Live
@@ -36,10 +37,11 @@ if TYPE_CHECKING:
 ANCHOR = "com.apple/levain"
 ANCHOR_FILE = Path("/etc/pf.anchors/levain")
 PF_TOKEN = Path("/var/db/levain/pf.token")
-#: Where an :data:`ENABLE_UNCERTAIN` run notes the reference it kept and no token names (P7), apart from the token's
-#: directory so the token's own write failures do not reach it (P9). macOS empties ``/var/run`` at boot [measured in
-#: r3c10-vm 10-26, lane pfbootf5 raw]; the note also carries the boot it was written in (P8, :func:`_kept_held`).
-PF_KEPT = Path("/var/run/levain/pf.token.kept")
+#: Where an :data:`ENABLE_UNCERTAIN` run notes the reference it kept and no token names (P7): in the §2.2 run dir, apart
+#: from the token's directory so the token's own write failures do not reach it (P9). macOS empties it at boot
+#: [measured in r3c10-vm 10-26, lane pfbootf5 raw]; the note also carries the boot it was written in (P8,
+#: :func:`_kept_held`). The run dir is the reaper's to make (§22); with it not there yet, no note is written.
+PF_KEPT = RUN["darwin"] / "pf.token.kept"
 PFCTL = "/sbin/pfctl"
 SYSCTL = "/usr/sbin/sysctl"
 #: The optimizer flag every load and check of the anchor carries (see :func:`load_steps`).
@@ -217,13 +219,13 @@ def _drop_kept(kept: Path) -> None:
 
 
 def _note_kept(kept: Path, token: str, run: Run) -> None:
-    """Note ``token`` and this boot at ``kept``. Best effort: with no note (unwritable, or no boot time to scope it to),
-    the next run whose write fails is the ordinary, retried failure, each retry giving its reference back."""
+    """Note ``token`` and this boot at ``kept``. Best effort: with no note (unwritable, its directory not made yet, or
+    no boot time to scope it to), the next run whose write fails is the ordinary, retried failure, each retry giving its
+    reference back."""
     boot = _boot_time(run)
     if boot is None:
         return
     try:
-        kept.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         _write_token(kept, f"{token} {boot}")
     except OSError:
         pass
