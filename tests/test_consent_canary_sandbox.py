@@ -561,3 +561,19 @@ def test_f2_the_pass_detail_and_the_help_state_the_known_edge(tmp_path):
     with redirect_stdout(out), pytest.raises(SystemExit):
         main(["consent", "canary", "--help"])
     assert "does not prove anything against a model trying to deceive" in " ".join(out.getvalue().split())
+
+
+REFUSAL = "levain: refused base-map-unreadable: /private/var/levain/routes/base.json: No such file or directory"
+
+
+def test_a_launcher_refusal_leads_the_fail_detail(tmp_path):
+    world = World(tmp_path, raw=lambda nonce: REFUSAL + "\n", transcript_session=False, control="absent")
+    result = world.run(tmp_path)
+    assert result.status == "FAIL"
+    assert result.detail.startswith(f"session did not start: {REFUSAL}; ")
+    assert "missing home_write" in result.detail
+
+
+def test_a_session_that_ran_does_not_get_the_did_not_start_line(tmp_path):
+    result = World(tmp_path, control="absent").run(tmp_path)
+    assert result.status == "FAIL" and "session did not start" not in result.detail

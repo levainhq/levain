@@ -782,6 +782,9 @@ def sandbox_verdict(agent: str, version: str | None, ws: Path, output: RunOutput
     if output.error:
         failed.append(output.error)
     if failed:
+        if not seen and not host.session:   # no probe line and no kept session: the launch never produced a turn
+            first = next((ln.strip() for ln in output.text.splitlines() if ln.strip()), "(no output)")
+            failed.insert(0, f"session did not start: {first[:200]}")
         return CanaryResult(agent, version, "FAIL", "; ".join(failed), str(ws))
     detail = ("the host's evidence agrees: control file read back, real home untouched, listener quiet, planted hook "
               "never ran; stopped: " + ", ".join(ESCAPE_PROBES) + ". A PASS shows the wall stopped the probes the "
