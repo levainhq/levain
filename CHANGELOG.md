@@ -19,8 +19,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   It reads that file the way the install helper does (size bound, whole-file UTF-8, no links), names every missing
   signer of a live graduation policy, and reports an unreadable cockpit authority log as a warning instead of an
   apparently healthy signers row. A damaged file or log never aborts it.
-- **`levain binding graduate` exists, and in this release says that nothing graduates and exits 1:** the binding
-  driver it needs is not wired yet.
+- **`levain binding graduate` says what is missing, and still exits 1.** It names the autonomic store (with its path;
+  `--store-dir` takes the same store `policy create` signs) and that no executor can yet run a binding effect; a store
+  or gate it cannot read is reported as a reason, not a traceback. `levain binding policy create --help` says that
+  cooling-off behaves like confirm until an action is allowed to fire on its own.
 - **The cockpit and the phone show the coordinator's review queue and morning card, read-only.** The cockpit shows them
   on the Morning and Board tabs: what needs a look, newest first, how long ago, and which items only you clear. The phone
   page has a Review tab with the morning card, the open items (what each is, what it says, how old it is) and the ones

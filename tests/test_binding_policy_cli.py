@@ -111,9 +111,74 @@ def test_list_says_which_signer_root_does_not_list_and_which_the_log_revoked(cw,
     assert f"last renewed by {cw.fp('pk')} (REVOKED in the log: covers nothing)" in capsys.readouterr().out
 
 
-def test_graduate_without_a_binding_driver_says_nothing_graduates(capsys):
-    assert cli.main(["binding", "graduate"]) == 1
-    assert "no binding driver" in capsys.readouterr().err
+def test_graduate_with_no_store_names_the_path_policy_create_would_use(capsys, tmp_path):
+    from levain.autonomic.db import DB_NAME
+
+    store = tmp_path / "nostore"
+    assert cli.main(["binding", "graduate", "--store-dir", str(store)]) == 1
+    err = capsys.readouterr().err
+    assert "nothing graduates" in err
+    assert f"no autonomic store at {store / DB_NAME}" in err
+    assert "executor_not_confined" in err
+
+
+def test_graduate_with_a_store_present_drops_the_store_blocker_and_keeps_the_executor_one(capsys, tmp_path):
+    AutonomicDB(tmp_path / "here").meta("store_id")
+    assert cli.main(["binding", "graduate", "--store-dir", str(tmp_path / "here")]) == 1
+    err = capsys.readouterr().err
+    assert "no autonomic store" not in err
+    assert "executor_not_confined" in err
+
+
+def test_graduate_checks_the_store_dir_it_is_given_not_the_default(capsys, tmp_path):
+    from levain.autonomic.db import DB_NAME, default_store_dir
+
+    AutonomicDB(default_store_dir()).meta("store_id")          # the default store exists (under the test's $LEVAIN_HOME)
+    elsewhere = tmp_path / "elsewhere"
+    assert cli.main(["binding", "graduate", "--store-dir", str(elsewhere)]) == 1
+    assert f"no autonomic store at {elsewhere / DB_NAME}" in capsys.readouterr().err
+
+
+def test_graduate_store_read_failure_is_a_blocker_line_not_a_traceback(capsys, monkeypatch, tmp_path):
+    from levain.autonomic.db import DB_NAME
+
+    def boom(store_dir):
+        raise RuntimeError("symlink loop")
+
+    monkeypatch.setattr(cli, "_autonomic_store_id", boom)
+    assert cli.main(["binding", "graduate", "--store-dir", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert f"could not read the autonomic store at {tmp_path / DB_NAME}: symlink loop" in err
+    assert "nothing graduates" in err and "executor_not_confined" in err
+
+
+def test_graduate_gate_failure_is_a_blocker_line_not_a_traceback(capsys, monkeypatch, tmp_path):
+    from levain.autonomic.gate import EfferentGate
+
+    def boom(self):
+        raise AttributeError("_journal")
+
+    monkeypatch.setattr(EfferentGate, "binding_effect_refusal", boom)
+    assert cli.main(["binding", "graduate", "--store-dir", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "could not determine whether an executor may run a binding effect: _journal" in err
+    assert "no autonomic store" in err
+
+
+def test_graduate_reads_the_executor_reason_from_the_gate_not_a_restatement(capsys, monkeypatch, tmp_path):
+    from levain.autonomic.gate import EfferentGate
+
+    monkeypatch.setattr(EfferentGate, "binding_effect_refusal", lambda self: "some_other_reason")
+    assert cli.main(["binding", "graduate", "--store-dir", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "some_other_reason" in err and "executor_not_confined" not in err
+
+
+def test_policy_create_help_says_cooling_off_is_denied_on_silence_while_nothing_auto_fires(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["binding", "policy", "create", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "COOLING_OFF" in text and "denied on silence" in text and "like CONFIRM" in text
 
 
 def test_a_renew_whose_policy_lapses_while_it_is_signed_is_refused(cw, capsys, monkeypatch):
@@ -243,7 +308,7 @@ def test_list_says_a_signer_absent_from_the_log_apart_from_a_revoked_one(cw, cap
 def test_graduate_takes_the_cockpit_flags(capsys, tmp_path):
     # RULINGS_R1 item 11 (deepseek 6): the engine S6 wires reads the same --data-root / --path as the policy verbs
     assert cli.main(["binding", "graduate", "--data-root", str(tmp_path), "--preview"]) == 1
-    assert "no binding driver" in capsys.readouterr().err
+    assert "nothing graduates" in capsys.readouterr().err
 
 
 def test_graduate_with_an_error_step_prints_what_committed_and_exits_1(capsys, monkeypatch, tmp_path):

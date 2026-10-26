@@ -13,6 +13,7 @@ import math
 import os
 import stat
 import sys
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -3393,11 +3394,13 @@ def _add_binding_parser(subparsers: argparse._SubParsersAction, common: object) 
                      f"{_POLICY_WARNING}. Its terms are fixed once signed: to change one, revoke it and create "
                      "another. Each action's risk must be the one Levain's manifest gives it, or the policy covers "
                      "nothing; the log takes only reversible, internal, non-financial actions of class LOW or "
-                     "below."))
+                     "below. While no action is allowlisted to auto-fire, a COOLING_OFF policy behaves like "
+                     "CONFIRM: the binding is proposed with a cancel window and is denied on silence."))
     create.add_argument("--action", dest="actions", action="append", required=True, metavar="NAME[=CLASS]",
                         help="A manifest action name and its risk class (TRIVIAL or LOW; default LOW); repeatable.")
     create.add_argument("--lowest", required=True, choices=_POLICY_LOWEST,
-                        help="The lowest rung a covered action may run at.")
+                        help="The lowest rung a covered action may run at. While no action is allowlisted to "
+                             "auto-fire, COOLING_OFF behaves like CONFIRM (denied on silence).")
     create.add_argument("--days", type=int, default=30, help="Days until it expires, 1 to 30 (default 30).")
     create.add_argument("--family", dest="families", action="append", default=None, metavar="FAMILY",
                         help="Only bindings of this family (fam-<32 hex>); repeatable. Advisory: a writer of the "
@@ -3446,9 +3449,11 @@ def _add_binding_parser(subparsers: argparse._SubParsersAction, common: object) 
         "graduate", help="Take every graduation step a policy covers now; print the rest as cards.",
         description="For each binding with enough clean fires, promote it one rung if a live anchored policy covers "
                     "every action it runs there, recording the step; otherwise print the one `levain binding policy "
-                    "create` line that would cover it. Needs the binding driver that builds this install's "
-                    "requests.")
+                    "create` line that would cover it. It exits 1 and names what is missing now: the "
+                    "autonomic store, and an executor confined enough to run a binding effect.")
     grad.add_argument("--preview", action="store_true", help="Write nothing; say what would graduate.")
+    grad.add_argument("--store-dir", dest="store_dir", type=Path, default=None,
+                      help="The autonomic store to check (default: $LEVAIN_HOME/autonomic), as `policy create` takes it.")
     common(grad)
     grad.set_defaults(func=_cmd_binding_graduate)
 
@@ -3682,11 +3687,41 @@ def _graduation_engine(args: argparse.Namespace) -> object | None:
     return None
 
 
+def _graduation_blockers(store_dir: Path | None = None) -> list[str]:
+    """What stops a graduation run now, each read at run time: the autonomic store at the path ``policy create`` would
+    sign for given the same ``--store-dir``, and the reason the efferent gate refuses a binding effect. A failure of
+    either read is itself a blocker line, never a traceback."""
+    from levain.autonomic.db import DB_NAME, default_store_dir
+    from levain.autonomic.gate import EfferentGate
+
+    blockers: list[str] = []
+    try:
+        _autonomic_store_id(store_dir)
+    except ValueError as exc:
+        blockers.append(str(exc))
+    except Exception as exc:  # noqa: BLE001 - a store that cannot be read is a blocker, not a crash
+        try:
+            where = (store_dir.expanduser() if store_dir is not None else default_store_dir()) / DB_NAME
+        except Exception:  # noqa: BLE001
+            where = Path(DB_NAME)
+        blockers.append(f"could not read the autonomic store at {where}: {exc}")
+    try:
+        # the refusal is a method of the gate; no gate is built here, and the reason does not depend on one
+        refusal = EfferentGate.binding_effect_refusal(types.SimpleNamespace(_executor=None))  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001
+        blockers.append(f"could not determine whether an executor may run a binding effect: {exc}")
+    else:
+        if refusal is not None:
+            blockers.append(f"no executor can run a binding effect ({refusal}), so no binding fires")
+    return blockers
+
+
 def _cmd_binding_graduate(args: argparse.Namespace) -> int:
     engine = _graduation_engine(args)
     if engine is None:
-        print("nothing graduates: no binding driver is wired into this levain, so no binding fires and none "
-              "has evidence", file=sys.stderr)
+        blockers = _graduation_blockers(args.store_dir)
+        print("nothing graduates: no binding driver is wired into this levain" + "".join(f"\n  - {b}" for b in blockers),
+              file=sys.stderr)
         return 1
     from levain.cockpit.graduation_cards import card_of
 
