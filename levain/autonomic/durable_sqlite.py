@@ -14,6 +14,7 @@ Stdlib only.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator
@@ -81,6 +82,37 @@ def _set_wal(conn: sqlite3.Connection) -> None:
         pause = min(pause * 2, 0.05)
 
 
+def _until_not_busy(conn: sqlite3.Connection, step: Callable[[], object]) -> object:
+    """``step()``, retried while it raises SQLITE_BUSY, for one wall-clock bound covering the tries and the
+    pauses between them: the connection's own ``busy_timeout``, read before the retry, never more. For a statement SQLite may answer busy without calling the busy handler: the
+    sqlite.org WAL page says a connection that opens and queries while the last other one is closing "might get an
+    SQLITE_BUSY error" (wal.html, "Sometimes Queries Return SQLITE_BUSY In WAL Mode"), and the busy-handler page
+    says the handler is not guaranteed to be invoked (c3ref/busy_handler.html). ``step`` must leave no transaction
+    open when it fails.
+
+    The connection's busy handler is off while it tries (every try answers at once, so the clock bounds the call and
+    a held lock is polled by the pauses), and put back after. A connection whose ``busy_timeout`` is already 0 was
+    set fail-fast on purpose: it gets one try, no retry. The clock is ``os.times().elapsed`` (``time`` is not on the
+    package's import allowlist, ``tests/test_autonomic_leaf.py``)."""
+    restore = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    if not restore:
+        return step()
+    conn.execute("PRAGMA busy_timeout = 0")
+    try:
+        deadline = os.times().elapsed + restore / 1000
+        pause = 0.001
+        while True:
+            try:
+                return step()
+            except sqlite3.OperationalError as exc:
+                if not _is_busy(exc) or os.times().elapsed + pause > deadline:
+                    raise
+            threading.Event().wait(pause)
+            pause = min(pause * 2, 0.05)
+    finally:
+        conn.execute(f"PRAGMA busy_timeout = {int(restore)}")
+
+
 def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None,
                  needs: str = "this store") -> sqlite3.Connection:
     """A connection to ``path`` with the durability PRAGMAs applied, in autocommit mode so the caller
@@ -93,6 +125,11 @@ def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None,
     try:
         _set_wal(conn)                                  # sidecars -wal/-shm stay beside the database
         conn.execute(f"PRAGMA busy_timeout = {int(BUSY_WAIT_S * 1000)}")
+        # A first read, retried, so the statements after it meet a connection that has already read the database.
+        # [judged by lane-limitsrace, 10-25, against wal.html: the last connection to close takes an exclusive lock
+        # to delete the WAL and shared memory; not reproduced here, so whether this read is what stops that cleanup
+        # under this connection is unmeasured.]
+        _until_not_busy(conn, lambda: conn.execute("SELECT count(*) FROM sqlite_master").fetchone())
         conn.execute("PRAGMA synchronous = FULL")
         conn.execute("PRAGMA fullfsync = ON")
         conn.execute("PRAGMA checkpoint_fullfsync = ON")
@@ -108,7 +145,7 @@ def write_transaction(connect: Callable[[], sqlite3.Connection]) -> Iterator[sql
     exits, rolled back if it raises, the connection closed either way."""
     conn = connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        _until_not_busy(conn, lambda: conn.execute("BEGIN IMMEDIATE"))
         try:
             yield conn
         except BaseException:
@@ -125,7 +162,7 @@ def read_transaction(connect: Callable[[], sqlite3.Connection]) -> Iterator[sqli
     block raised (so the block's error is the one that propagates)."""
     conn = connect()
     try:
-        conn.execute("BEGIN")
+        _until_not_busy(conn, lambda: conn.execute("BEGIN"))
         try:
             yield conn
         except BaseException:
