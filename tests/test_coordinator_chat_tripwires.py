@@ -950,3 +950,12 @@ def test_r2_a_launch_root_with_an_embedded_nul_is_no_root(cs, claude, root):
     svc.read_next(claude["launch"])
     assert trips(cs, claude["launch"]) == ["tripwire:accepted_without_host"]
 
+
+def test_r3_a_never_attached_launch_keeps_no_filed_record(cs, store, claude):
+    from tests.test_coordinator_chat_liveness import NONCE, activate, service
+    svc = service(cs, seat_item=Filer(store))
+    activate(svc, claude)                             # live, then the launcher's failed check: never attached
+    svc.activate(claude["launch"], "not_live", "the canary failed", spawn_nonce=NONCE)
+    assert len(_items(cs)) == 1                       # the item is filed
+    svc.detach(claude["launch"])
+    assert claude["launch"] not in svc._filed
