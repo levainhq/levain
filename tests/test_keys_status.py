@@ -793,3 +793,24 @@ def test_keys_limit_read_a_kernel_connect_timeout_is_unreachable_and_keys_deadli
         assert asyncio.run(run()) == ("unreachable", "timeout")
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_keys_limit_read_a_timeout_raised_inside_the_call_is_unreachable_not_keys_deadline(monkeypatch):
+    """The 3.9 port of the bound (`wait_for`, not `asyncio.timeout`): an `asyncio.TimeoutError` the call itself raises
+    (an inner `wait_for` running out) is `unreachable`, the same as the kernel's; only `key_limit_s` is `timeout`."""
+    from levain.broker import upstream as U
+    d = _limit_lib(["or-i"])
+
+    async def get(header):
+        raise asyncio.TimeoutError()
+    monkeypatch.setattr(U, "limit_get", get)
+
+    async def run():
+        k = K.Keys(lib_root=d, routes=PairRoutes([(OR, "or-i")]))
+        k._in_loop()
+        k.key_limit_s = 5.0
+        return await k._read_limit("or-i")
+    try:
+        assert asyncio.run(run()) == "unreachable"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

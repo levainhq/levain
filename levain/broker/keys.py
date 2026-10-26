@@ -2720,16 +2720,31 @@ class Keys:
             unexpired(self.cred_lifecycle, cred)
         except norm.Refused:
             return "expired"
+        # the root interpreter's floor is 3.9, which has no `asyncio.timeout`: the call runs as a task that a timer
+        # cancels at `key_limit_s`. `expired` tells that cancel from any other, and a timeout the call itself raises
+        # (the kernel's, an inner `wait_for`'s) stays what it was, a failure of the connection
+        expired = False
+        task = asyncio.ensure_future(upstream.limit_get(cred.header_pair()))
+
+        def expire() -> None:
+            nonlocal expired
+            expired = True
+            task.cancel()
+        timer = asyncio.get_running_loop().call_later(self.key_limit_s, expire)
         try:
-            async with asyncio.timeout(self.key_limit_s) as deadline:
-                resp = await upstream.limit_get(cred.header_pair())
+            resp = await task
+        except asyncio.CancelledError:
+            if expired:
+                return "timeout"
+            raise
         except norm.Refused as r:
             return "address-refused" if r.name == "address-refused" else "bad-credential"
         except upstream.BadResponse:
             return "bad-body"
         except (OSError, EOFError):   # a refused, reset or kernel-timed-out connect, a TLS failure, a lost connection
-            # TimeoutError is an OSError, so keys' own deadline lands here too: only that is `timeout`
-            return "timeout" if deadline.expired() else "unreachable"
+            return "unreachable"
+        finally:
+            timer.cancel()
         return _limit_values(resp)
 
     def _dispatch_policy(self, route: str, pin: Optional["routemaps.Pin"]) -> Optional[RoutePolicy]:
