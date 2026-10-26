@@ -1556,6 +1556,11 @@ class BindingStore:
                             f"for binding {binding_id!r} (revive a revoked/expired grant by minting a "
                             "new binding)"
                         )
+                    if status.is_active and self._load(rec) is None:
+                        # O-a1c1d-3: unsealed bookkeeping that does not load (a hand-corrupted counter) is never
+                        # made live; stopping it (a pause, a revoke) still works
+                        raise ValueError(f"binding {binding_id!r} does not load (malformed record): not made "
+                                         f"{status.value}")
                     if not status.is_active:
                         self._fence(rec, conn)   # stops admitted runs, in this transaction
                     rec["status"] = status.value

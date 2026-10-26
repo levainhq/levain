@@ -117,3 +117,31 @@ def test_an_interrupted_effect_is_recorded_unknown_and_raised(j, exc):
         j.effect("r1", "link-0", digest="d", **FENCE, fn=fn)
     assert _effects(j) == [("link-0", "unknown")] and j.poisoned() == [("r1", "link-0")]
     assert not j._lease_held("r1", "link-0")
+
+
+# ---- O-a1c1d-3: a record whose bookkeeping does not load is never made live -------------------------------------------
+def test_a_hand_corrupted_record_is_refused_by_every_way_back_to_active(tmp_path, capsys):
+    import json
+    import sqlite3
+
+    import levain.cli as cli
+    from levain.autonomic import BindingStatus, BindingStore, Posture
+    from levain.autonomic import db as vdb
+    from tests.test_binding_pause_cli import _binding
+
+    d = tmp_path / "store"
+    st = BindingStore(d)
+    b = _binding(Posture.ON_LOOP)
+    st.add(b)
+    c = sqlite3.connect(d / vdb.DB_NAME, isolation_level=None)
+    rec = json.loads(c.execute("SELECT record FROM bindings").fetchone()[0])
+    rec["graduation"]["fire_count"] = "x"
+    c.execute("UPDATE bindings SET record = ? WHERE binding_id = ?", (json.dumps(rec, sort_keys=True), b.binding_id))
+    status = lambda: json.loads(c.execute("SELECT record FROM bindings").fetchone()[0])["status"]  # noqa: E731
+    assert cli.main(["binding", "resume", b.binding_id, "--store-dir", str(d)]) == 1   # ratify: _load refuses it
+    assert "malformed" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="does not load"):
+        st.set_status(b.binding_id, BindingStatus.ACTIVE)
+    assert status() == "paused"
+    assert st.set_status(b.binding_id, BindingStatus.PAUSED) and st.pause(b.binding_id) == 2   # stopping still works
+    c.close()
