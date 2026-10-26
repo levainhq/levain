@@ -257,6 +257,8 @@ class LiveSetting:
         self._watchers: list[Callable[[str], None]] = []
 
     def watch(self, fn: Callable[[str], None]) -> None:
+        """Register before the first read. `fn` runs on the read thread while this setting's lock is held, so it must
+        not call back into this setting (`get`, `get_ex`, `close`): the lock is not reentrant and that call deadlocks."""
         self._watchers.append(fn)
 
     @property
