@@ -671,6 +671,9 @@ def test_h15_a_close_after_the_re_read_settled_leaves_at_once(tmp_path: Path, mo
 @needs_ssh
 def test_h16_a_signed_ceremony_with_no_server_line_still_reads_signed(tmp_path: Path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
+    # the line is stripped from the CHALLENGE's reply: the sheet's signed line is the challenge's own `line` (the answer's
+    # reply carries none it reads), so stripping it from /answer leaves the line in place and passes without the fix
+    # [measured by lane-os2, 1026+1: stubbed at /answer this passed against a sign.js with H16 reverted; at /challenge it fails there]
     no_line = ("(real, u, o) => real(u, o).then((r) => r.json().then((j) => { delete j.line; return new Response("
                "JSON.stringify(j), {status: r.status, headers: {'Content-Type': 'application/json'}}); }))")
     with rig.serving():
