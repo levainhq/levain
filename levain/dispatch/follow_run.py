@@ -13,11 +13,11 @@ any other exception (a broken job store, say) closes the follower and reaches th
 with it. A step that ends with an outcome this module does not know waits :data:`LASTING_S`. The signal handlers
 :func:`main` installs only record the request; the main thread calls :meth:`FollowRunner.stop` after it.
 
-``python -I -m levain.dispatch.follow_run --store-dir <dir>``: the follower of CONTROL at ``R/control/control.sock``,
-taking artifacts from ``L/export/dispatch`` into the job store at ``--store-dir``, until SIGTERM or SIGINT. It never
-runs as root: CONTROL answers ``SESSION-EVENTS`` and ``ARTIFACT-ACK`` to the ``_levain_dispatch`` peer only, so it
-runs as that uid. One runner per store: it holds ``<store-dir>/follow.lock`` while it runs and exits
-:data:`EX_INSTANCE_HELD` when another holds it.
+``python -I -m levain.dispatch.follow_run``: the follower of CONTROL at ``R/control/control.sock``, taking artifacts
+from ``L/export/dispatch`` into the job store at ``--store-dir`` (default ``L/dispatch``, the dispatch store row),
+until SIGTERM or SIGINT. It never runs as root: CONTROL answers ``SESSION-EVENTS`` and ``ARTIFACT-ACK`` to the
+``_levain_dispatch`` peer only, so it runs as that uid. One runner per store: it holds ``<store-dir>/follow.lock``
+while it runs and exits :data:`EX_INSTANCE_HELD` when another holds it.
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ from levain.dispatch.follow import PERMANENT_TAKES, EventFollower, FollowStopped
 from levain.dispatch.jobs import JobStore
 from levain.slot import Refused
 from levain.slot import control_client as CC
-from levain.slot.layout import RUN, STORE
+from levain.slot.layout import RUN, STORE, dispatch_store_dir
 
 log = logging.getLogger("levain.dispatch.follow_run")
 
@@ -158,7 +158,8 @@ def _parser(host: str) -> argparse.ArgumentParser:
     L, R = STORE[host], RUN[host]
     ap = argparse.ArgumentParser(prog="python -I -m levain.dispatch.follow_run",
                                  description="dispatch's SESSION-EVENTS follower; runs as _levain_dispatch.")
-    ap.add_argument("--store-dir", required=True, help="the dispatch job store's directory (dispatch.db)")
+    ap.add_argument("--store-dir", default=str(dispatch_store_dir(host)),
+                    help="the dispatch job store's directory (dispatch.db)")
     ap.add_argument("--socket", default=str(R / "control" / "control.sock"), help="the socket CONTROL serves")
     ap.add_argument("--export-dir", default=str(L / "export" / "dispatch"), help="root's export/dispatch directory")
     return ap

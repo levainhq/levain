@@ -42,6 +42,7 @@ from typing import Any, Iterable, Mapping
 import levain
 from levain.contracts import ContractError
 from levain.contracts import canon
+from levain.broker import policy as broker_policy
 from levain.firing.hands import HostOS
 from levain.slot import Refused
 from levain.slot.bwrap import LEVAIN_BWRAP
@@ -91,6 +92,14 @@ QUEUE_SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"   # §3.2, not a secret: rendered
 CODEX_PROVIDER = "levain"
 
 ROUTE_TYPES = ("egress", "brokered", "subscription_passthrough")   # §4.1
+#: wfetch DESIGN §2.4: the proxy env names a repo settings layer may not set, upper and lower case. Clearing one
+#: cannot get past the OS wall (DESIGN §1.3), but every fetch would then fail with no cause shown.
+PROXY_ENV = frozenset(n for b in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY") for n in (b, b.lower()))
+#: wfetch RULINGS Q3: Codex's server-side search mode until Phill rules (fail closed: the front cannot see it).
+CODEX_WEB_SEARCH = "disabled"
+#: The Codex launch's ``-c`` overrides (``start.vendor_argv``), the layer above every config file, so ``web_search``
+#: holds even if the repo's own ``.codex/config.toml`` were loaded (``codex_config`` files the repo untrusted).
+CODEX_LAUNCH_ARGS = ("-c", f'web_search="{CODEX_WEB_SEARCH}"')
 _TERM_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}", re.ASCII)
 #: DECISION: the slot's ``/var/folders/<xx>/<id>`` subtree (the parent of its ``DARWIN_USER_DIR``, as R-M2 measured
 #: it), its real ``/private`` path, in the alphabet ``confstr`` produces. Never a path a profile string must escape.
@@ -153,7 +162,9 @@ class RenderFacts:
     ``<S>/config``). ``driver_uid`` / ``driver_gid``: verifier only, ``_levain_v<n>``. ``gwport``: egress only.
     ``route_types``: route id -> its §4.1 type, for at least every route the blob names. ``var_folders``: macOS
     only, the ``/var/folders`` subtree of each uid the profile confines (egress: the slot; verifier: child and
-    driver). ``term``: ``TERM`` from the supervisor, or none."""
+    driver). ``term``: ``TERM`` from the supervisor, or none. ``route_hosts``: route id -> its CONNECT hosts, read
+    beside ``route_types`` from the same base map; render uses only the hosts of the blob's ``egress`` routes (the
+    ``WebFetch(domain:)`` allows), and a route the map gives no hosts here renders no allow rule."""
 
     host: HostOS
     session: str
@@ -165,6 +176,7 @@ class RenderFacts:
     slot_gid: int
     gwport: int | None = None
     route_types: Mapping[str, str] = field(default_factory=dict)
+    route_hosts: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     term: str | None = None
     var_folders: tuple[str, ...] = ()
     driver_uid: int | None = None
@@ -306,7 +318,32 @@ def check_facts(blob: RenderBlob, facts: RenderFacts) -> None:
     if names and facts.vendor == "codex":
         raise Refused("hooks-not-wired:codex", ",".join(sorted(names)))
     _brokered_route(blob, facts)
+    egress_hosts(blob, facts)
     own_loopback(blob, facts)
+
+
+def egress_hosts(blob: RenderBlob, facts: RenderFacts) -> tuple[str, ...]:
+    """The CONNECT hosts of an egress-class session's ``egress`` routes, sorted, each through the policy parser's one
+    host grammar (``policy.hosts``), so no host that is not a lowercase A-label name reaches a permission rule. A
+    none-class session has none (it renders no egress rule). A route with no ``route_hosts`` entry adds none (fail
+    closed: the fetch prompts and the front decides); a ``route_hosts`` that is not a mapping of host lists, or an
+    entry that does not parse, is refused ``bad-config``."""
+    if facts.slot.slot_class != "egress":
+        return ()
+    if not isinstance(facts.route_hosts, Mapping):
+        raise Refused("bad-config", "route_hosts")
+    out: set[str] = set()
+    for r in blob.routes:
+        if facts.route_types.get(r) != "egress" or r not in facts.route_hosts:
+            continue
+        raw = facts.route_hosts[r]
+        if not isinstance(raw, (tuple, list)):
+            raise Refused("bad-config", f"route_hosts {r}")
+        try:
+            out.update(broker_policy.hosts(r, list(raw)))
+        except Exception:
+            raise Refused("bad-config", f"route_hosts {r}") from None
+    return tuple(sorted(out))
 
 
 def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | None,
@@ -497,14 +534,28 @@ def render_cc_settings(blob: RenderBlob, facts: RenderFacts) -> dict:
     """The ``--settings`` layer. Pinned whatever the blob says (§5.3): macOS ``sandbox.enabled:false``; Linux
     ``true`` + ``failIfUnavailable:true`` + ``bwrapPath`` (Levain's copy) + the ask rule; both
     ``disableBypassPermissionsMode:"disable"``, ``excludedCommands: []`` and ``disableAllHooks: false`` (L2 M6:
-    a repo or local layer setting it true would switch Levain's gate hooks off)."""
+    a repo or local layer setting it true would switch Levain's gate hooks off).
+
+    WebFetch (wfetch DESIGN §3 WF-1, RULINGS Q1): an egress session gets ``skipWebFetchPreflight: true`` (the
+    preflight goes to ``api.anthropic.com``, which the front never admits as a CONNECT host on a brokered session;
+    one behaviour for both auths, and the front's host list is the gate) and one ``WebFetch(domain:<h>)`` allow
+    per host of its ``egress`` routes, so an on-list fetch does not prompt; the front, not this rule, refuses an
+    off-list host. Every session gets
+    ``disableClaudeAiConnectors: true`` (wfetch runs/r1: connectors reach ``mcp-proxy.anthropic.com``, a host on
+    no route)."""
     check_facts(blob, facts)
     sandbox: dict[str, Any] = {"enabled": facts.host == "linux", "excludedCommands": []}
     permissions: dict[str, Any] = {"disableBypassPermissionsMode": "disable"}
     if facts.host == "linux":
         sandbox.update({"failIfUnavailable": True, "bwrapPath": str(LEVAIN_BWRAP)})
         permissions["ask"] = [LINUX_ASK_RULE]
-    out: dict[str, Any] = {"sandbox": sandbox, "permissions": permissions, "disableAllHooks": False}
+    out: dict[str, Any] = {"sandbox": sandbox, "permissions": permissions, "disableAllHooks": False,
+                           "disableClaudeAiConnectors": True}
+    if facts.slot.slot_class == "egress":
+        out["skipWebFetchPreflight"] = True
+        allow = [f"WebFetch(domain:{h})" for h in egress_hosts(blob, facts)]
+        if allow:
+            permissions["allow"] = allow
     if blob.model is not None:
         out["model"] = blob.model
     if blob.hooks:
@@ -554,10 +605,17 @@ def codex_config(blob: RenderBlob, facts: RenderFacts) -> dict[str, Any]:
     (R-M2 ran it with its sandbox bypassed), so as with CC the OS wall is the sandbox. Linux leaves Codex's
     sandbox_mode at its default (no run measured it inside the view). DECISION: ``cli_auth_credentials_store =
     "file"``, so a passthrough login lands in ``auth.json`` (the file ``keep/`` parks, §2.1), never a keychain.
-    DECISION: ``[projects."<S>/repo"] trust_level = "trusted"``, the trust pre-seed (no run measured Codex's TUI
-    trust dialog). Brokered: the provider block runs/macos-RB 1e measured (env-only base URL did not work)."""
+    ``[projects."<S>/repo"] trust_level = "untrusted"``: Codex then leaves out the repo's own ``.codex/`` layer
+    (its words: "To load project-local config, hooks, and exec policies, update its trust setting"). Filed
+    ``trusted``, the repo's ``.codex/config.toml`` ranked above this file and its ``sandbox_mode``,
+    ``approval_policy`` and ``web_search`` were the effective ones (1026-2/wf1ag, Codex 0.162.1 ``config/read``).
+    With no entry at all, a thread's sandbox under this file's Linux shape was ``readOnly``; ``untrusted`` gave
+    ``workspaceWrite``, as ``trusted`` did. Whether the TUI asks a trust question for an ``untrusted`` entry: no run
+    measured it.
+    Brokered: the provider block runs/macos-RB 1e measured (env-only base URL did not work)."""
     check_facts(blob, facts)
-    top: dict[str, Any] = {"approval_policy": "never", "cli_auth_credentials_store": "file"}
+    top: dict[str, Any] = {"approval_policy": "never", "cli_auth_credentials_store": "file",
+                           "web_search": CODEX_WEB_SEARCH}
     if facts.host == "darwin":
         top["sandbox_mode"] = "danger-full-access"
     if blob.model is not None:
@@ -569,7 +627,7 @@ def codex_config(blob: RenderBlob, facts: RenderFacts) -> dict[str, Any]:
         tables[f"model_providers.{CODEX_PROVIDER}"] = {
             "name": CODEX_PROVIDER, "base_url": f"http://127.0.0.1:{facts.gwport}/r/{brokered}/v1",
             "env_key": TOKEN_ENV["codex"], "wire_api": "responses"}
-    tables[f"projects.{_toml_str(str(facts.S / 'repo'))}"] = {"trust_level": "trusted"}
+    tables[f"projects.{_toml_str(str(facts.S / 'repo'))}"] = {"trust_level": "untrusted"}
     return {"top": top, "tables": tables}
 
 
@@ -785,16 +843,23 @@ class Contains:
 def expected_effective_cc(blob: RenderBlob, facts: RenderFacts) -> dict[str, Any]:
     """Every pin of :func:`render_cc_settings`, as dotted key -> the value the effective config must hold."""
     exp: dict[str, Any] = {"sandbox.enabled": facts.host == "linux", "sandbox.excludedCommands": [],
-                           "permissions.disableBypassPermissionsMode": "disable", "disableAllHooks": False}
+                           "permissions.disableBypassPermissionsMode": "disable", "disableAllHooks": False,
+                           "disableClaudeAiConnectors": True}
     if facts.host == "linux":
         exp.update({"sandbox.failIfUnavailable": True, "sandbox.bwrapPath": str(LEVAIN_BWRAP),
                     "permissions.ask": Contains((LINUX_ASK_RULE,))})
+    if facts.slot.slot_class == "egress":
+        exp["skipWebFetchPreflight"] = True
+        allow = tuple(f"WebFetch(domain:{h})" for h in egress_hosts(blob, facts))
+        if allow:
+            exp["permissions.allow"] = Contains(allow)
     return exp
 
 
 def expected_effective_codex(blob: RenderBlob, facts: RenderFacts) -> dict[str, Any]:
     cfg = codex_config(blob, facts)["top"]
-    return {k: cfg[k] for k in ("approval_policy", "cli_auth_credentials_store", "sandbox_mode") if k in cfg}
+    return {k: cfg[k] for k in ("approval_policy", "cli_auth_credentials_store", "sandbox_mode", "web_search")
+            if k in cfg}
 
 
 def _lookup(observed: Any, key: str) -> Any:
@@ -840,7 +905,8 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     JSON. Refused by key: every ``sandbox`` key in host_guard's ``_LOOSENING_TRUE`` that is ``true`` and every one
     in ``_LOOSENING_NONEMPTY`` that is non-empty (the keys whose merge across layers the flag layer cannot pin),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
-    its meaning to CC is unmeasured). A document that is not an object is refused ``repo-settings-malformed``.
+    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars or a :data:`PROXY_ENV` name. A
+    document that is not an object is refused ``repo-settings-malformed``.
     Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
 
     Operator-side: the supervisor runs this on the clone it bundles, before the bundle is made (the slot clones
@@ -864,6 +930,8 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
             # gated call when a settings layer names one, so the session is refused here, by name, instead.
             for name in sorted(n for n in env if n in (QUEUE_CAP_ENV, QUEUE_SOCKET_ENV)):
                 out.append(_refused("loosening", f"env.{name}", f"{path}: the queue's env is set by levain only"))
+            for name in sorted(n for n in env if n in PROXY_ENV):
+                out.append(_refused("loosening", f"env.{name}", f"{path}: {name} is set by levain only"))
         sb = doc.get("sandbox", {})
         if not isinstance(sb, Mapping):
             out.append(Refused("repo-settings-malformed", f"{path}: sandbox"))
@@ -965,7 +1033,7 @@ __all__ = [
     "VENDOR_PREFIX", "READSET_ATTRIBUTES", "READSET_ATTRIBUTES_PATH", "READSET_KINDS", "READSET_TEMPLATE",
     "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
-    "TOKEN_ENV", "ABSENT_ENV", "check_env_absent",
+    "TOKEN_ENV", "ABSENT_ENV", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",
     "env_text", "render_cc_settings", "render_cc_onboarding", "codex_config", "codex_toml", "gitconfig_text",
     "assert_no_syscall", "check_driver_template", "profile_lines", "read_driver_template", "render_profile",
     "render_importer_profile", "render_verifier_profile",
