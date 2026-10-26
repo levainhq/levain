@@ -190,7 +190,7 @@ class SrtEnd:
 class Rig:
     def __init__(self, tmp: Path, *, mode: str = "gated", limits: dm.Limits | None = None,
                  lookup: Lookup | None = None, routes: keys.RouteSet | None = None, start_obs: bool = True,
-                 link_fault=None, resolver_timeout: float = 1.0, srt_reads: bool = True) -> None:
+                 link_fault=None, resolver_timeout: float = 1.0, srt_reads: bool = True, setting=None, launch_mode: str | None = None) -> None:
         self.store = CoordStore(Path(tmp) / "dispatch")
         self.records = rec.EgressRecords(self.store)
         self.launch = make_launch(self.store)
@@ -198,11 +198,15 @@ class Rig:
         oa, ob = socket.socketpair()
         self.desk = Desk()
         self.lookup = lookup or Lookup()
+        setting = setting or dm.Fixed(mode)
+        if launch_mode is None:              # the rig stands in for start_egress: one read, before the decider
+            launch_mode = setting.get()
         self.d = dm.Decider(a, oa, launch_id=self.launch, records=self.records,
-                            routes=routes or keys.RouteSet.of([]), mode=dm.Fixed(mode), liveness=Live(),
+                            routes=routes or keys.RouteSet.of([]), mode=setting, liveness=Live(),
                             credentials=keys.LaunchCredentials(NoStore()), cards=self.desk,
                             resolver=Resolver(self.lookup, max_lookups=4, timeout_s=resolver_timeout),
-                            limits=limits or dm.Limits(card_poll_s=0.05, stop_drain_s=0.5), link_fault=link_fault)
+                            limits=limits or dm.Limits(card_poll_s=0.05, stop_drain_s=0.5), link_fault=link_fault,
+                            launch_mode=launch_mode)
         if not start_obs:
             self.d._obs_loop = lambda: None          # no reader thread: only the decisions drain
         self.srt = SrtEnd(b)

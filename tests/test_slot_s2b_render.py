@@ -512,6 +512,38 @@ def test_loosening_repo_layer_refused_by_key():
     assert [x.name for x in rd.repo_loosening_refusals({"a": {"sandbox": 1}})] == ["repo-settings-malformed"]
 
 
+@pytest.mark.parametrize("bad", [False, "", 0, None, {}, [1], ["x", None]], ids=repr)
+def test_loosening_list_key_of_the_wrong_type_refused_by_key(bad):
+    """RULINGS 1026-10 Q5: the repo layer is repo-author controlled, and a falsy non-list passed the not-empty check;
+    Claude Code expects a list of strings, and a schema type error can drop the sandbox block silently (host_guard's
+    managed check refuses the same way, L3 r1 codex 2)."""
+    f = ".claude/settings.json"
+    for keys in _LOOSENING_NONEMPTY:
+        got = rd.repo_loosening_refusals({f: {"sandbox": _nest(keys, bad)}})
+        assert [e.name for e in got] == ["loosening:" + rd.wire_name("sandbox." + ".".join(keys))], keys
+        assert "must be a list of strings" in got[0].detail
+        assert rd.repo_loosening_refusals({f: {"sandbox": _nest(keys, [])}}) == []
+
+
+@pytest.mark.parametrize("bad", [0, 1, "", "true", None, [], {}], ids=repr)
+def test_loosening_bool_key_of_the_wrong_type_refused_by_key(bad):
+    """RULINGS 1026-10 Q5, the bool half: only a JSON boolean is vetted; ``"forbid"`` for a boolean key made CC drop
+    the block silently (host_guard's _SANDBOX_TYPES note)."""
+    f = ".claude/settings.json"
+    for keys in _LOOSENING_TRUE:
+        got = rd.repo_loosening_refusals({f: {"sandbox": _nest(keys, bad)}})
+        assert [e.name for e in got] == ["loosening:" + rd.wire_name("sandbox." + ".".join(keys))], keys
+        assert "must be bool" in got[0].detail
+
+
+def test_loosening_sandbox_subtable_that_is_not_an_object_is_malformed():
+    for sub in ("network", "filesystem"):
+        for bad in (1, "", None, [], False):
+            got = rd.repo_loosening_refusals({"a": {"sandbox": {sub: bad}}})
+            assert [(x.name, x.detail) for x in got] == [("repo-settings-malformed", f"a: sandbox.{sub}")]
+        assert rd.repo_loosening_refusals({"a": {"sandbox": {sub: {}}}}) == []
+
+
 def test_repo_settings_env_naming_the_queue_refused():
     """From the run (levain-memory 1019-s1design/runs/s3-queue-env/RUN.txt): a committed settings ``env`` naming the
     queue's socket or cap launched, and the consent hook then denies every gated call; now refused by name."""

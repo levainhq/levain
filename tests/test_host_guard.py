@@ -924,3 +924,85 @@ def test_cc_sandbox_state_precedence(tmp_path):
     assert hg.cc_sandbox_state(ent, home, managed=[("/m", {"sandbox": {"enabled": True}})])[0] is True
     (ent / ".claude" / "settings.local.json").write_text(json.dumps({"sandbox": {"enabled": "yes"}}))
     assert hg.cc_sandbox_state(ent, home, managed=[])[0] is False  # a string is not True
+
+
+
+# ---------------------------------------------------------------------------- srt keys that relax the profile
+# Each key below is in Claude Code 2.1.310's sandbox settings schema (the `sandbox` object it passes to the sandbox
+# runtime). network.allowMachLookup ["com.apple.trustd.agent"] was RUN (levain-memory 1026-8/p1/RETURN.md, Q3/Q5): it
+# opens the same trustd.agent hole as enableWeakerNetworkIsolation, through which a sandboxed `security verify-cert`
+# made trustd fetch a URL the command chose, with no proxy row.
+_RELAXING = (
+    (("network", "allowMachLookup"), ["com.apple.trustd.agent"], []),
+    (("allowAppleEvents",), True, False),
+    (("allowNestedUserNamespaces",), True, False),
+    (("filesystem", "allowRead"), ["/"], []),
+    (("filesystem", "disabled"), True, False),
+)
+
+
+def _nested(keys, value):
+    d = value
+    for k in reversed(keys):
+        d = {k: d}
+    return d
+
+
+@pytest.mark.parametrize("keys,loose,tight", _RELAXING, ids=[".".join(k) for k, _, _ in _RELAXING])
+def test_a_repo_settings_layer_that_relaxes_the_profile_is_refused_by_key(keys, loose, tight):
+    from levain.slot import render as rd
+    f = ".claude/settings.json"
+    got = rd.repo_loosening_refusals({f: {"sandbox": _nested(keys, loose)}})
+    assert [e.name for e in got] == ["loosening:" + rd.wire_name("sandbox." + ".".join(keys))]
+    assert rd.repo_loosening_refusals({f: {"sandbox": _nested(keys, tight)}}) == []
+
+
+@pytest.mark.parametrize("keys,loose,tight", _RELAXING, ids=[".".join(k) for k, _, _ in _RELAXING])
+def test_managed_settings_that_relax_the_profile_refuse_by_key(ent, keys, loose, tight):
+    roots = hg.cc_writable_roots(ent)
+    probs = hg.check_managed_settings([("m.json", {"sandbox": _nested(keys, loose)})], roots)
+    want = "is true" if loose is True else "is not empty"
+    assert probs == [f"m.json: sandbox.{'.'.join(keys)} {want}"]
+
+
+def test_managed_mach_lookup_that_adds_nothing_is_accepted(ent):
+    roots = hg.cc_writable_roots(ent)
+    assert hg.check_managed_settings([("m.json", {"sandbox": {"network": {"allowMachLookup": []}}})], roots) == []
+    probs = hg.check_managed_settings([("m.json", {"sandbox": {"network": {"allowMachLookup": "x"}}})], roots)
+    assert "m.json: sandbox.network.allowMachLookup must be list, got str" in probs
+
+
+@pytest.mark.parametrize("bad", [False, "", 0, None, {}], ids=repr)
+def test_managed_allow_read_of_the_wrong_type_refuses(ent, bad):
+    """L3 r1 (codex 2): a falsy non-list allowRead passed the not-empty check and nothing else; Claude Code expects a
+    list, and a schema type error can drop the sandbox block silently, so the wrong type refuses like every pinned
+    key."""
+    roots = hg.cc_writable_roots(ent)
+    probs = hg.check_managed_settings([("m.json", {"sandbox": {"filesystem": {"allowRead": bad}}})], roots)
+    assert f"m.json: sandbox.filesystem.allowRead must be list, got {type(bad).__name__}" in probs
+    assert hg.check_managed_settings([("m.json", {"sandbox": {"filesystem": {"allowRead": []}}})], roots) == []
+
+
+_MANAGED_LIST_KEYS = sorted({k for k, t in hg._SANDBOX_TYPES.items() if t is list}
+                            | {("filesystem", "denyRead"), ("filesystem", "allowRead")})
+
+
+@pytest.mark.parametrize("bad", [[1], ["x", None]], ids=repr)
+@pytest.mark.parametrize("keys", _MANAGED_LIST_KEYS, ids=".".join)
+def test_managed_list_key_holding_a_non_string_refuses(ent, keys, bad):
+    """RULINGS 1026-10 Q5 (2): one fact, one strictness. render's repo check requires a list key's items to be strings;
+    the managed exact-type check does too (a `denyRead: [1]` passed every check before)."""
+    roots = hg.cc_writable_roots(ent)
+    probs = hg.check_managed_settings([("m.json", {"sandbox": _nested(keys, bad)})], roots)
+    name = type(next(i for i in bad if type(i) is not str)).__name__
+    assert f"m.json: sandbox.{'.'.join(keys)} must be a list of strings, holds {name}" in probs
+
+
+def test_the_pinned_block_closes_mach_lookup_apple_events_and_nested_namespaces():
+    block = hg.cc_sandbox_block("/x")
+    assert block["network"]["allowMachLookup"] == []
+    assert block["allowAppleEvents"] is False
+    assert block["allowNestedUserNamespaces"] is False
+    assert hg.check_sandbox_types(block) == []
+    del block["network"]["allowMachLookup"]
+    assert "sandbox.network.allowMachLookup is missing" in hg.check_sandbox_types(block)

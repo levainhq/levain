@@ -336,6 +336,31 @@ def test_the_header_and_digest_follow_the_mode_one_home(tmp_path, origin, monkey
 
 
 @pytest.mark.chat_egress_srt
+def test_the_decider_is_capped_at_the_mode_the_header_and_digest_were_read_from(tmp_path, origin, monkeypatch) -> None:
+    """Q-R15-9 (chd2fix): the decider's cap is start_egress's one read, so a loosening after it never applies and a
+    tightening does."""
+    standing = {"mode": classify.GATED}
+    e = _start(tmp_path, origin, monkeypatch, mode=dm.LiveSetting(lambda: standing["mode"]))
+    try:
+        assert lm.OPEN_NETWORK_LINE not in e.header and e.decider.mode.launched == classify.GATED
+        standing["mode"] = classify.OPEN_NETWORK
+        assert e.decider.mode.get() == classify.GATED
+    finally:
+        lm.stop_egress(e)
+    standing["mode"] = classify.OPEN_NETWORK
+    (tmp_path / "open").mkdir()
+    e = _start(tmp_path / "open", origin, monkeypatch, mode=dm.LiveSetting(lambda: standing["mode"]))
+    try:
+        assert e.header[0] == lm.OPEN_NETWORK_LINE and e.decider.mode.launched == classify.OPEN_NETWORK
+        standing["mode"] = classify.GATED
+        assert e.decider.mode.get() == classify.GATED
+        standing["mode"] = classify.OPEN_NETWORK             # the revoke undone: a loosening, next launch only
+        assert e.decider.mode.get() == classify.GATED
+    finally:
+        lm.stop_egress(e)
+
+
+@pytest.mark.chat_egress_srt
 def test_a_mode_outside_the_known_modes_is_refused_before_anything_spawns(tmp_path, origin, monkeypatch) -> None:
     before = {p.pid for p in _node_children()}
     (tmp_path / "x").mkdir()

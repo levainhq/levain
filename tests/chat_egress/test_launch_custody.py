@@ -97,6 +97,19 @@ def test_the_ca_cert_is_on_disk_and_its_key_is_not(tmp_path) -> None:
     assert b.fingerprint_sha256 != a.fingerprint_sha256
 
 
+def test_the_trust_env_names_the_cert_and_puts_pip_on_legacy_certs(tmp_path) -> None:
+    """chd2fix P1: a truststore pip fails TLS inside the chat sandbox (S10 15f, pip 26.1.1); the env
+    carries PIP_USE_DEPRECATED=legacy-certs beside PIP_CERT. No name points at anything but this start's cert."""
+    a = cam.new_egress_ca(tmp_path, now=NOW, start_id="t1")
+    env = a.trust_env()
+    assert env == cam.trust_env(a.cert_path)
+    assert env["PIP_USE_DEPRECATED"] == "legacy-certs" and env["PIP_CERT"] == str(a.cert_path)
+    assert {n for n, v in env.items() if v == str(a.cert_path)} == set(cam.TRUST_FILE_ENV)
+    assert {"SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "PIP_CERT", "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS"} <= set(env)
+    assert env["NPM_CONFIG_AUDIT"] == env["NPM_CONFIG_FUND"] == "false"
+    assert set(env) == set(cam.TRUST_FILE_ENV) | set(cam.TRUST_SET_ENV)
+
+
 def test_the_ca_carries_its_expiry_and_a_re_mint_keeps_the_earlier_cert(tmp_path) -> None:
     """chatdriver-2 (`1025-23/chatdriver/RULINGS_OBS.md` 1): the CA names its own not_valid_after (aware UTC, read
     from the cert), and a re-mint inside one service start (`prune=False`) keeps the cert its earlier launches trust."""
