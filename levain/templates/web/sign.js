@@ -364,7 +364,10 @@
       return Promise.resolve();
     }
     say($("sheet-note").textContent + " Asking the cockpit where this answer stands…", "bad");
-    return call(routeOf(r.id) + "/attempt", { attempt: a.attempt }).then((st) => {
+    // a read that fails outright is a read that said nothing: frozen, "Not confirmed", Check again; never re-armed
+    return Promise.resolve().then(() => call(routeOf(r.id) + "/attempt", { attempt: a.attempt }))
+      .catch((e) => ({ ok: false, status: 0, body: { message: "the read failed (" + ((e && e.name) || "error") + ")" } }))
+      .then((st) => {
       const state = st.ok && st.body && typeof st.body.state === "string" ? st.body.state : "";
       if (state === "signed") {
         unsureAttempt = null;
