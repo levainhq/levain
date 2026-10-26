@@ -4492,12 +4492,17 @@
     return line;
   }
   // flow's provider puts the whole body into `blocks`, and the body starts with the title sentence: what `blocks` adds beyond
-  // the title is the part after it (trimmed, a trailing "?" or "." on the title ignored). "" when nothing is left.
+  // the title is the part after it (trimmed, a trailing "?" or "." on the title ignored). The provider also prefixes the title with
+  // the asking repo ("flow: ..."), which the body does not carry, so the title is tried with that one-word prefix dropped too.
+  // "" when nothing is left.
   function blocksBeyondTitle(title, blocks) {
     const t = String(blocks || "").trim();
-    const w = String(title || "").trim().replace(/[?.\s]+$/, "");
-    if (!w || !t.startsWith(w)) return t;
-    return t.slice(w.length).replace(/^[?.\s]+/, "");
+    const full = String(title || "").trim();
+    for (const cand of [full, full.replace(/^[^\s:]{1,40}:\s+/, "")]) {
+      const w = cand.replace(/[?.\s]+$/, "");
+      if (w && t.startsWith(w)) return t.slice(w.length).replace(/^[?.\s]+/, "");
+    }
+    return t;
   }
   // `card` (the Needs-you strip's card) draws the mock's anatomy: the question as a bold title, "blocks: ...", then "REC key. words";
   // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
@@ -5408,45 +5413,28 @@
     const first = items.find((it) => it.kind === "consent");
     return parts.join(" · ") + (first && Number.isFinite(Date.parse(first.c.expiresAt)) ? " · soonest " + consentLeft(first.c.expiresAt) : "");
   }
-  function needsHead(card, kindChip, agent, tail) {
+  // the focus view's dialog title already names the tool or question number and the agent: the card's head holds only the clock or age
+  function needsHead(card, tail) {
     const head = el("div", "consent-head needs-head");
-    // the focus view's dialog title already names the tool or question number and the agent: its card head keeps only the rest
-    if (!card.classList.contains("is-full")) {
-      head.appendChild(kindChip);
-      head.appendChild(el("span", "needs-chip consent-agent", agent || "agent"));
-    }
     if (tail) head.appendChild(tail);
     card.appendChild(head);
   }
   const needsIdOf = (it) => (it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : ""));
-  // The strip's card carries one "Open" row: it opens the focus view, where the SAME card is drawn unclamped (`is-full`) and the CLI
-  // route (the digests, the note and the commands) sits under "Answer from a terminal". There is no second renderer: the full card is
-  // the strip card built again with `full` set.
-  function needsDetails(parts, note, card) {
-    if (card && card.classList.contains("is-full")) {
-      const t = el("div", "needs-terminal");
-      t.appendChild(el("div", "needs-sec-label", "Answer from a terminal"));
-      if (note) t.appendChild(el("span", "needs-phone ext-meta", note));
-      t.append(...parts);
-      return t;
-    }
-    const d = el("div", "needs-details needs-open-row");
-    const btn = el("button", "needs-open", "Open");
-    btn.type = "button";
-    btn.title = "open the whole request";
-    btn.setAttribute("aria-haspopup", "dialog");
-    btn.addEventListener("click", () => { if (card && card._needsItem) openNeedsFocus(card._needsItem, btn); });
-    d.appendChild(btn);
-    if (note) d.appendChild(el("span", "needs-phone ext-meta", note));
-    return d;
+  // The CLI route (the digests, the note and the commands) sits at the card's foot under "Answer from a terminal".
+  function needsDetails(parts, note) {
+    const t = el("div", "needs-terminal");
+    t.appendChild(el("div", "needs-sec-label", "Answer from a terminal"));
+    if (note) t.appendChild(el("span", "needs-phone ext-meta", note));
+    t.append(...parts);
+    return t;
   }
-  // The focus view of one waiting item: the card built again, unclamped. Closes when the item is answered (refreshModal).
+  // The focus view of one waiting item: its card, drawn whole. Closes when the item is answered (refreshModal).
   function openNeedsFocus(it, opener) {
     const id = needsIdOf(it);
     modalCustom = {
       id,
       title: it.kind === "consent" ? (it.c.tool || "request") + " · " + (it.c.agent || "agent") : "Question #" + it.q.n + " · " + (it.q.agent || "agent"),
-      build: () => (it.kind === "consent" ? consentCard(it.c, true) : questionCard(it.q, true)),
+      build: () => (it.kind === "consent" ? consentCard(it.c) : questionCard(it.q)),
     };
     modalGlance = false;
     modalKey = "needs:" + id;
@@ -5553,12 +5541,11 @@
   function drawConsentCard(card, slot, b) {
     const sv = (x) => (typeof x === "string" ? x : "");
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
-    const full = card.classList.contains("is-full");
     const label = (t) => el("div", "needs-sec-label", t);
     const egress = egressParts(b);
-    const parts = egress ? (full ? [label("Request"), egress.state, egress.rows] : [egress.state, egress.rows])
-      : full ? [label("Request"), consentRequest(sv(b.display), card._needsItem && card._needsItem.c.tool)] : [el("pre", "consent-display", sv(b.display))];
-    if (full) parts.push(label("Where"));
+    const parts = egress ? [label("Request"), egress.state, egress.rows]
+      : [label("Request"), consentRequest(sv(b.display), card._needsItem && card._needsItem.c.tool)];
+    parts.push(label("Where"));
     const facts = el("div", "consent-facts");
     // the server's home shortens a path under it to ~/..., the full path stays as the title (never the browser's home)
     const where = el("span", "ext-meta", "in " + (sv(b.cwd_short) || sv(b.cwd)) + " \u00b7 targets " + sv(b.targets));
@@ -5566,8 +5553,8 @@
     facts.appendChild(where);
     parts.push(facts);
     const hintBox = consentHintBox(b);
-    if (hintBox) { if (full) parts.push(label("Hint")); parts.push(hintBox); }
-    if (full && card._needsItem && Number.isFinite(Date.parse(card._needsItem.c.expiresAt))) {
+    if (hintBox) { parts.push(label("Hint"), hintBox); }
+    if (card._needsItem && Number.isFinite(Date.parse(card._needsItem.c.expiresAt))) {
       parts.push(label("Expires"), el("div", "ext-meta needs-expires", new Date(card._needsItem.c.expiresAt).toLocaleString()));
     }
     // Allow and Deny are one component at one weight: neither is filled, neither leads. An answer the sheet offers here
@@ -5606,39 +5593,37 @@
     if (acts.childElementCount) card.appendChild(acts);
     const here = choices.length === 2 ? "signs with your passkey here"
       : choices.length ? choices[0] + " signs with your passkey here" : "signs on your phone";
-    card.appendChild(needsDetails(more, here, card));
+    card.appendChild(needsDetails(more, here));
   }
-  function consentCard(c, full) {
-    const card = el("div", "needs-card needs-consent" + (full ? " is-full" : ""));
+  function consentCard(c) {
+    const card = el("div", "needs-card needs-consent is-full");
     card.dataset.needsCard = "consent";
     card._needsItem = { kind: "consent", c };
-    if (c.id && !full) card.dataset.needsId = "consent:" + c.id;
     card.dataset.needsExpires = String(c.expiresAt);
     card.dataset.needsState = String(c.state);
-    needsHead(card, el("b", "consent-tool", c.tool), c.agent, (() => {
+    needsHead(card, (() => {
       const left = el("span", "consent-left needs-left", consentLeft(c.expiresAt));
       left.dataset.consentExpires = c.expiresAt;
       if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
       return left;
     })());
-    if (c.tier) card.firstChild.insertBefore(el("span", "needs-chip", c.tier), card.firstChild.children[full ? 0 : 1]);
+    if (c.tier) card.firstChild.insertBefore(el("span", "needs-chip", c.tier), card.firstChild.firstChild);
     const slot = el("div", "needs-body ext-meta", "reading the request…");
     card.appendChild(slot);
     if (c.id) consentBody(c, card).then((b) => drawConsentCard(card, slot, b));
     else slot.textContent = "this request has no id";
     return card;
   }
-  function questionCard(q, full) {
-    const card = el("div", "needs-card needs-question" + (full ? " is-full" : ""));
+  function questionCard(q) {
+    const card = el("div", "needs-card needs-question is-full");
     card.dataset.needsCard = "question";
     card._needsItem = { kind: "question", q };
-    if (q.id && !full) card.dataset.needsId = String(q.id);
-    needsHead(card, el("span", "needs-chip", "question"), q.agent, q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null);
+    needsHead(card, q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null);
     const slot = el("div", "needs-body ext-meta", "reading the question…");
     card.appendChild(slot);
     questionBody(q, card).then((b) => {
       drawQuestionBody(q, slot, b, card);
-      if (!b.error) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], "", card));
+      if (!b.error) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], ""));
     });
     return card;
   }

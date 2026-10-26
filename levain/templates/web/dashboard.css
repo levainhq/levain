@@ -1725,12 +1725,6 @@ body.ke .needs-head { align-items: center; }
 body.ke .needs-chip { font: var(--fw-medium) var(--fs-micro)/1.4 var(--mono); color: var(--label); border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: 0 var(--sp-2); }
 body.ke .needs-body { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; flex: 1 1 auto; }
 body.ke .needs-body .consent-display { margin-top: 0; }
-/* fixed slots, so the actions sit on one baseline across a row whatever the request says; the focus view (is-full) shows it whole */
-body.ke .needs-card:not(.is-full) .needs-q-title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; }
-body.ke .needs-card:not(.is-full) .consent-display { max-height: calc(7.5em + var(--sp-3) * 2); overflow-y: auto; -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent);
-  mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent); animation: edge-fade linear both; animation-timeline: scroll(self); }
-@supports (animation-timeline: scroll()) { body.ke .needs-card:not(.is-full) .consent-display { scrollbar-width: none; } body.ke .needs-card:not(.is-full) .consent-display::-webkit-scrollbar { display: none; } }
-body.ke .needs-card:not(.is-full) .consent-facts > .ext-meta:not(.needs-keep), body.ke .needs-card:not(.is-full) .consent-hint .consent-dgtext { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
 body.ke .needs-card.is-full { max-width: 720px; width: 100%; }
 body.ke .needs-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); margin-top: auto; }
 body.ke .needs-btn, body.ke .needs-card .question-option { min-height: 38px; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--text); background: none; border: 1px solid var(--label); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-4); cursor: pointer; text-align: center; margin: 0; }
@@ -1781,14 +1775,6 @@ body.ke .needs-rec-tag { font: var(--fw-bold) var(--fs-micro)/1 var(--mono); let
 body.ke .needs-card .question-words { max-width: none; }
 body.ke .needs-card .question-send { align-self: flex-start; }
 body.ke .needs-phone { font-size: var(--fs-meta); }
-body.ke .needs-details > summary { display: flex; align-items: baseline; gap: var(--sp-3); cursor: pointer; font-size: var(--fs-meta); color: var(--label); }
-body.ke .needs-details-toggle { font-weight: var(--fw-semibold); text-decoration: underline; text-underline-offset: 2px; }
-body.ke .needs-details[open] > summary { margin-bottom: var(--sp-2); }
-body.ke .needs-details .consent-cmd { margin-top: var(--sp-2); }
-/* the strip card's one "Open" row, and the focus view it opens (the same card, unclamped) */
-body.ke .needs-open-row { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
-body.ke .needs-open-row .needs-open { min-height: 32px; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--label); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-4); cursor: pointer; margin: 0; }
-body.ke .needs-open-row .needs-open:hover, body.ke .needs-open-row .needs-open:focus-visible { color: var(--text); border-color: var(--label); }
 body.ke .needs-card.is-full { gap: var(--sp-4); border: 0; box-shadow: none; padding: var(--sp-6) var(--sp-6) var(--sp-6); background: none; max-width: none; }
 body.ke .needs-card.is-full .needs-head { justify-content: space-between; }
 body.ke .needs-card.is-full .needs-head > .needs-left:only-child { margin-left: 0; }
