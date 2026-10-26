@@ -1510,3 +1510,39 @@ def test_every_gate_call_checks_for_held_phone_pings(queue, monkeypatch):
     monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
     cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u"))
     assert calls == [queue.directory]
+
+
+_USER_SITE_PLANTS = (".local/lib/python3.12/site-packages/x.pth",
+                     ".local/lib/python3.99/site-packages/evil/__init__.py",
+                     "Library/Python/3.12/lib/python/site-packages/usercustomize.py",
+                     "Library/Python/3.14/bin/tool")
+
+
+@pytest.mark.parametrize("rel", _USER_SITE_PLANTS)
+def test_a_write_into_the_operators_user_site_is_agent_config_under_a_venv(monkeypatch, tmp_path, rel):
+    """F7: on a venv install the hook's interpreter has ENABLE_USER_SITE False, so `import_site_dirs` leaves the user
+    site out; the operator's other, non-venv Pythons still load it. The user-site TREES are agent config whatever
+    this interpreter's flag says, and `import_site_dirs` keeps its meaning (what redirects THIS interpreter's
+    `import levain`)."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda: tmp_path / "elsewhere")
+    assert all(not s.startswith(str(home).lower()) for s in cc.import_site_dirs())
+    target = home / rel
+    assert cc.targets_agent_config("Write", {"file_path": str(target)}, "/work/proj", home=home)
+    assert cc.targets_agent_config("Write", {"file_path": "~/" + rel}, "/work/proj", home=home)
+    # the OPERATOR's home (the password database's), when the agent's HOME is set elsewhere
+    monkeypatch.setattr(cc, "operator_home", lambda: home)
+    assert cc.targets_agent_config("Write", {"file_path": str(target)}, "/work/proj", home=tmp_path / "agent-home")
+    # an MCP tool given the site directory itself and a file name in another field
+    assert cc.targets_agent_config("mcp__fs__write", {"dir": str(target.parent), "name": "x.pth"}, "/work/proj",
+                                   home=home)
+
+
+@pytest.mark.parametrize("rel", (".local/lib/node_modules/a.js", ".local/libpython3/x.pth", ".local/share/x.pth",
+                                 "Library/Pythonx/x.pth", "proj/.local/lib/python3.12/x.pth"))
+def test_paths_beside_the_user_site_are_not_agent_config(monkeypatch, tmp_path, rel):
+    home = tmp_path / "home"
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda: tmp_path / "elsewhere")
+    assert not cc.targets_agent_config("Write", {"file_path": str(home / rel)}, "/work/proj", home=home)
