@@ -296,3 +296,84 @@ def test_nothing_that_decides_authority_reads_the_facts_store() -> None:
     out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True,
                          env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])})
     assert out.stdout.strip() == "False", out.stderr
+
+
+# --- the phone page's key-line --------------------------------------------------------------------------------------
+
+def test_the_key_line_puts_a_checked_creation_on_the_enrol_command_and_records_nothing(tmp_path: Path, capsys,
+                                                                                    monkeypatch) -> None:
+    import shlex
+
+    from levain import cli
+    from levain.cockpit import install
+    from levain.phone_server import PhoneError, make_phone_server
+
+    monkeypatch.setattr(install, "marker_dir", lambda: tmp_path / "m")
+    root, laptop = _cockpit(tmp_path)
+    q = tmp_path / "q"
+    q.mkdir()
+    (q / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(root)}))
+    pk = Passkey()
+    srv = make_phone_server(q, RP, port=0)
+    try:
+        plain = srv.key_line({"spki": _b64u(pk.spki)})
+        assert all("--attested" not in c for c in plain["commands"])
+        with pytest.raises(PhoneError) as bad:
+            srv.key_line({"spki": _b64u(pk.spki), "authenticator_data": _b64u(Passkey().creation)})
+        assert bad.value.status == 422 and "not the key being enrolled" in str(bad.value)
+        with pytest.raises(PhoneError) as extra:
+            srv.key_line({"spki": _b64u(pk.spki), "raw_id": _b64u(pk.cred)})
+        assert extra.value.status == 400
+        got = srv.key_line({"spki": _b64u(pk.spki), "authenticator_data": _b64u(pk.creation) + "=="})
+    finally:
+        srv.server_close()
+    assert keyfacts.read(root) == {}                                     # the page's call records nothing
+    enrol = [c for c in got["commands"] if c.startswith("levain cockpit enroll")]
+    assert enrol, got
+    argv = shlex.split(enrol[0])
+    assert argv[argv.index("--attested") + 1] == _b64u(pk.creation)
+    (tmp_path / got["file"]).write_text(got["public_key"] + "\n")
+    argv[argv.index(got["file"])] = str(tmp_path / got["file"])
+    argv[argv.index("YOUR_LAPTOP_PRESENCE_KEY")] = str(laptop.path)
+    assert cli.main(argv[1:]) == 0, capsys.readouterr().err
+    assert keyfacts.read(root)[got["fingerprint"]].credential_id == _b64u(pk.cred)
+
+
+# --- the cockpit's sign listing ---------------------------------------------------------------------------------------
+
+def test_a_fresh_browser_gets_the_credential_id_from_the_cockpit_after_one_signature(tmp_path: Path) -> None:
+    """Over http: the listing names no credential before any signature; an answer carrying ``raw_id`` that verifies
+    records it; the next listing (what a fresh browser reads) carries it for that signer."""
+    from levain.authority import AuthorityKey
+    from levain.cockpit.keys import fingerprint_of
+    from levain.consent.sign import Signer
+    from tests.test_cockpit_sign_routes import _call, _serving
+
+    rp = "box.example"
+    origin = f"https://{rp}:8443"
+    pk = Passkey(rp=rp)
+    key = AuthorityKey(fingerprint=fingerprint_of(pk.line), public_key=pk.line, key_class="display-phone",
+                       enrolled_seq=2)
+    facts = tmp_path / "facts"
+    facts.mkdir()
+    q = tmp_path / "q"
+    q.mkdir()
+    signer = Signer(q, (NS,), rp, lambda: {key.fingerprint: key}, facts_root=lambda: facts)
+    signer.page_origin = origin
+    _file(q, "http-0001")
+    with _serving(tmp_path / "inst", signer=signer, extra_hosts=[rp]) as (url, _httpd):
+        status, body = _call(url, "/cockpit/sign.json")
+        assert status == 200 and body["credentials"] == {}
+        sha = next(r["sha256"] for r in body["requests"] if r["id"] == "http-0001")
+        status, c = _call(url, "/cockpit/sign/http-0001/challenge", {"signer_fp": key.fingerprint, "request_sha256": sha})
+        assert status == 200, c
+        status, a = _call(url, "/cockpit/sign/http-0001/answer",
+                          {**pk.assertion(c["challenge"], origin), "raw_id": _b64u(pk.cred)})
+        assert status == 200, a
+        status, body = _call(url, "/cockpit/sign.json")
+        assert body["credentials"] == {key.fingerprint: {
+            "credential_id": _b64u(pk.cred),
+            "provider": "provider not recorded (only an enrolment that sends its creation names it)"}}
+        _file(q, "http-0002")
+        status, one = _call(url, "/cockpit/sign/http-0002.json")
+        assert status == 200 and one["credentials"][key.fingerprint]["credential_id"] == _b64u(pk.cred)

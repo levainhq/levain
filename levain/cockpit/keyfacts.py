@@ -21,14 +21,13 @@ provider: it never widens what a key may sign.
 from __future__ import annotations
 
 import base64
-import binascii
 import hashlib
 import sqlite3
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["DB_NAME", "PROVIDERS", "Attested", "KeyFacts", "KeyFactsError", "attested", "attested_b64", "learn", "provider_name",
+__all__ = ["DB_NAME", "PROVIDERS", "Attested", "KeyFacts", "KeyFactsError", "attested", "learn", "provider_name",
            "provider_text", "raw_id_bytes", "read", "record_enrolment"]
 
 DB_NAME = "key_facts.db"
@@ -36,11 +35,11 @@ _ZERO = "00000000-0000-0000-0000-000000000000"
 _AT = 0x40                          # authenticatorData flag: attested credential data present
 _HEAD = 32 + 1 + 4                  # rpIdHash || flags || signCount
 _CRED_MAX = 1023                    # WebAuthn's longest credential id
-_CRED_MIN = 16                      # WebAuthn's shortest: at least 16 bytes of entropy
+_CRED_MIN = 16                      # WebAuthn asks an authenticator for an id of at least 16 bytes
 _FIELD_MAX = 16 * 1024              # a real creation's authenticatorData is a few hundred bytes
 
 # AAGUID -> provider, from github.com/passkeydeveloper/passkey-authenticator-aaguids (aaguid.json, read 2026-10-25).
-# Display only. An all-zero AAGUID names nothing: a browser may send zeros (Safari does for its own passkeys).
+# Display only. An all-zero AAGUID names nothing: a browser or provider may send zeros.
 PROVIDERS: dict[str, str] = {
     "fbfc3007-154e-4ecc-8c0b-6e020557d7bd": "Apple Passwords (iCloud Keychain)",
     "dd4ec289-e01d-41c9-bb89-70fa845d4bf2": "iCloud Keychain (Managed)",
@@ -142,17 +141,6 @@ def attested(authenticator_data: bytes, public_key: str) -> Attested:
     if b"\x21\x58\x20" + x not in cose or b"\x22\x58\x20" + y not in cose:
         raise KeyFactsError("the attested credential's public key is not the key being enrolled")
     return Attested(credential_id=d[start:start + size], aaguid=_aaguid_text(aaguid))
-
-
-def attested_b64(text: object, public_key: str) -> Attested:
-    """:func:`attested` on base64url text (a page's or a command line's)."""
-    from levain.consent.passkey import PasskeyError, b64url_decode
-
-    try:
-        raw = b64url_decode(text, "authenticator_data")
-    except (PasskeyError, binascii.Error) as exc:
-        raise KeyFactsError(str(exc)) from None
-    return attested(raw, public_key)
 
 
 def provider_name(aaguid: str | None) -> str | None:

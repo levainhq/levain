@@ -4744,9 +4744,11 @@
       return navigator.credentials.get({ publicKey: pk }).then((cred) => {
         say("verifying the signature…");
         sent = true;
-        return signCall(base + "answer", {
-          authenticator_data: signB64u(cred.response.authenticatorData), client_data_json: signB64u(cred.response.clientDataJSON),
-          signature: signB64u(cred.response.signature) }).then((a) => {
+        // raw_id: the credential that signed, which the cockpit records as this key's once the signature verifies
+        const answer = { authenticator_data: signB64u(cred.response.authenticatorData),
+          client_data_json: signB64u(cred.response.clientDataJSON), signature: signB64u(cred.response.signature) };
+        if (cred.rawId) answer.raw_id = signB64u(cred.rawId);
+        return signCall(base + "answer", answer).then((a) => {
           if (!a.ok && a.status >= 400 && a.status < 500) { say("not signed: " + signWhy(a), "bad"); return { done: "unsigned" }; }
           if (!a.ok) { say("not sure this was signed (" + signWhy(a) + "): check the list", "bad"); return { done: "unsure" }; }
           if (!rawId && cred.rawId && typeof c.body.rp_id === "string") signRemember(c.body.rp_id, fp, signB64u(cred.rawId));
@@ -4763,16 +4765,22 @@
     });
   }
   // Which passkey signs: the one this browser used before, else the only one enrolled; with several and no record, the
-  // person picks (buttons put into `host`, the phone's pick list). Resolves {fp, rawId}, or null when the pick was dismissed
+  // person picks (buttons put into `host`, the phone's pick list). The credential id is this browser's own record, else
+  // the one the listing's `credentials` names (display facts the cockpit holds, so a fresh browser asks for that passkey
+  // at once), else none (the OS's own list). Resolves {fp, rawId}, or null when the pick was dismissed
   // by its dismiss button; rejects (an AbortError) when a redraw took `host` off the page with the pick still open, so the
   // caller's `signBusy` is released on every path. The pick holds `signBusy` like a ceremony.
   function signWho(listing, host, say) {
     const signers = Array.isArray(listing.signers) ? listing.signers : [];
     const rp = (listing.origin || "").replace(/^https?:\/\//, "").replace(/:\d+$/, "");
     const local = signMine(rp);
+    const held = listing.credentials && typeof listing.credentials === "object" ? listing.credentials : {};
+    const idOf = (fp) => (Object.prototype.hasOwnProperty.call(local, fp) ? local[fp]
+      : (Object.prototype.hasOwnProperty.call(held, fp) && held[fp] && typeof held[fp].credential_id === "string"
+        ? held[fp].credential_id : null));
     const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
     if (known.length === 1) return Promise.resolve({ fp: known[0], rawId: local[known[0]] });
-    if (!known.length && signers.length === 1) return Promise.resolve({ fp: signers[0], rawId: null });
+    if (!known.length && signers.length === 1) return Promise.resolve({ fp: signers[0], rawId: idOf(signers[0]) });
     const choices = known.length ? known : signers;
     say("more than one passkey is enrolled for this name; pick the one this device holds:");
     return new Promise((resolve, reject) => {
@@ -4790,7 +4798,7 @@
         const p = el("button", "undo-btn sign-pick", fp.slice(0, 18) + "…");
         p.type = "button";
         p.title = fp;
-        p.addEventListener("click", () => { end(); resolve({ fp: fp, rawId: known.length ? local[fp] : null }); });
+        p.addEventListener("click", () => { end(); resolve({ fp: fp, rawId: idOf(fp) }); });
         picks.push(p);
         host.appendChild(p);
       }

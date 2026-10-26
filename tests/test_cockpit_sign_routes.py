@@ -118,7 +118,8 @@ def test_without_a_signer_every_sign_route_is_404(tmp_path: Path) -> None:
 def test_the_listing_is_the_signers_own_rows_and_its_enrolled_keys(cockpit) -> None:
     status, body = _call(cockpit["url"], "/cockpit/sign.json")
     assert status == 200
-    assert set(body) == {"requests", "signers", "origin"} and body["origin"] == PINNED
+    assert set(body) == {"requests", "signers", "credentials", "origin"} and body["origin"] == PINNED
+    assert body["credentials"] == {}      # no key facts held (levain.cockpit.keyfacts): the browser asks its own list
     assert body["signers"] == [cockpit["pk"].key.fingerprint]
     assert body["requests"] == cockpit["signer"].listing([cockpit["pk"].key.fingerprint])
     [row] = body["requests"]

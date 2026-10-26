@@ -1059,24 +1059,36 @@ class _PhoneServer(ThreadingHTTPServer):
         return wait
 
     def key_line(self, req: Any) -> dict[str, Any]:
-        """``POST /passkey/key-line`` ({spki}: the new credential's ``getPublicKey()``, base64url) -> its OpenSSH
-        public key on this server's name, its fingerprint, and the laptop commands that enrol it. Nothing is
-        enrolled here."""
+        """``POST /passkey/key-line`` ({spki}: the new credential's ``getPublicKey()``, base64url; optionally
+        ``authenticator_data``, its creation's ``getAuthenticatorData()``) -> its OpenSSH public key on this server's
+        name, its fingerprint, and the laptop commands that enrol it. Nothing is enrolled or recorded here: a creation
+        that attests this key rides the enrol command as ``--attested``, which the laptop's signed enrolment checks
+        again and records (:mod:`levain.cockpit.keyfacts`); one that does not is refused (422)."""
+        from levain.cockpit import keyfacts
         from levain.cockpit.keys import fingerprint_of
         from levain.consent.answering import hook_roots
         from levain.consent.passkey import PasskeyError, b64url_decode, public_key_line
 
-        if not isinstance(req, dict) or set(req) != {"spki"}:
-            raise PhoneError(400, "bad_request", "request keys must be ['spki']")
+        if not isinstance(req, dict) or not {"spki"} <= set(req) <= {"spki", "authenticator_data"}:
+            raise PhoneError(400, "bad_request", "request keys must be ['spki'], and optionally 'authenticator_data'")
         try:
             line = public_key_line(b64url_decode(req["spki"], "spki"), self.rp_id)
         except PasskeyError as exc:
             raise PhoneError(422, "bad_passkey", str(exc)) from None
+        attested = ""
+        if "authenticator_data" in req:
+            try:
+                raw = b64url_decode(req["authenticator_data"], "authenticator_data")
+                keyfacts.attested(raw, line)
+            except (PasskeyError, keyfacts.KeyFactsError) as exc:
+                raise PhoneError(422, "bad_passkey", str(exc)) from None
+            # re-encoded from the bytes checked, so the command carries nothing but base64url
+            attested = " --attested " + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
         # one file per passkey: two devices enrolled on one name must not overwrite each other's file
         name = f"passkey-{self.rp_id.split('.')[0]}-{hashlib.sha256(line.encode('ascii')).hexdigest()[:8]}.pub"
         roots = hook_roots(self.queue_dir)
         enrol = [f"levain cockpit enroll {name} --class display-phone --custody passkey --data-root {shlex.quote(str(r))} "
-                 "--signing-key YOUR_LAPTOP_PRESENCE_KEY" for r in roots]
+                 f"--signing-key YOUR_LAPTOP_PRESENCE_KEY{attested}" for r in roots]
         return {"public_key": line, "fingerprint": fingerprint_of(line), "file": name,
                 "commands": [f"printf '%s\\n' '{line}' > {name}", *enrol],
                 "note": None if roots else ("no consent hook names a cockpit yet (run `levain init` with the consent "
