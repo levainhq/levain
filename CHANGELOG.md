@@ -14,6 +14,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   them, the lowest rung, and an expiry at most 30 days out. A policy covers only while its signing keys are listed in
   root's allowed-signers file and are not revoked; `create` prints what it hands over before anything is signed, and
   the command it prints names its store and cockpit by absolute path, so it signs the same store from any directory.
+- **`levain doctor` says when nothing can graduate.** It reports root's authority-signers file when it is missing,
+  untrusted or lists no key, and prints the one `sudo` line that enrols them (with every reason the helper may refuse).
+  It reads that file the way the install helper does (size bound, whole-file UTF-8, no links), names every missing
+  signer of a live graduation policy, and reports an unreadable cockpit authority log as a warning instead of an
+  apparently healthy signers row. A damaged file or log never aborts it.
 - **`levain binding graduate` exists, and in this release says that nothing graduates and exits 1:** the binding
   driver it needs is not wired yet.
 - **The cockpit and the phone show the coordinator's review queue and morning card, read-only.** The cockpit shows them
