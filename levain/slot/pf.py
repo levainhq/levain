@@ -274,8 +274,8 @@ def _is_rules_file(st: os.stat_result, head: bytes) -> str:
 def load_recorded_anchor(path: Path = ANCHOR_FILE, run: Run = subprocess.run) -> tuple[bool, str]:
     """Load the rules file setup, replenish or repair last wrote, as it is, into :data:`ANCHOR` (the boot one-shot).
     It is never rewritten here. A file that is not Levain's (:func:`_is_rules_file`) is refused and nothing is loaded.
-    The file's parent, ``/etc/pf.anchors``, is root's, so no other user can swap the file between the check and
-    ``pfctl``'s own open."""
+    The file's parent, ``/etc/pf.anchors``, is root's (root:wheel 0755, measured on the build Mac 10-26), so no
+    other user can swap the file between the check and ``pfctl``'s own open."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError as e:

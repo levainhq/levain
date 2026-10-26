@@ -68,7 +68,7 @@ def test_boot_steps_are_setups_aliases_then_the_recorded_rules_then_the_enable_r
 
 
 def test_setups_load_and_enable_steps_are_unchanged():
-    ids, uid = {}, 3987            # the darwin slot range, counted down (test_slot_s2fx4_macos's _ids)
+    ids, uid = {}, 3987            # the darwin slot range, counted down
     for s in EGRESS:
         for name in s.accounts:
             ids[name], uid = uid, uid - 1
