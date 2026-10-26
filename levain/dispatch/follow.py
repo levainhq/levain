@@ -70,6 +70,7 @@ _REPORT_FIELDS = ("verifier_report_digest", "verifier_report_refused")
 TAKE_FAILURE_LIMIT = 3
 #: the takes whose cause is the export or the record, which stays until one of them changes
 _PERMANENT_TAKES = frozenset({"take-bundle-absent", "take-digest-mismatch", "take-conflict"})
+PERMANENT_TAKES = _PERMANENT_TAKES
 
 
 class _Cancelled(Exception):
