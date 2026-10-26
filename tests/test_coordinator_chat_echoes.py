@@ -770,6 +770,41 @@ def test_reader_of_a_read_only_released_store_reads_it_and_changes_nothing(qdir,
     assert c.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall() == schema
 
 
+# --- L3 r1 K10: the fingerprint covers attempts: one committed between the batch read and its write refuses the write -
+class AttemptsMidRead(ScriptedSession):
+    """A vendor whose ``pos_lt`` (called between the ingest's read and its write) lets another writer commit an
+    attempt of the launch first, once."""
+
+    def __init__(self, cs, world, **kw) -> None:
+        super().__init__(**kw)
+        self.cs, self.world, self.armed = cs, world, False
+
+    def pos_lt(self, a, b):
+        if self.armed:
+            self.armed = False
+            with self.cs._write() as (conn, now):
+                m, _ = chat.record_message(conn, now, thread_id=self.world["thread"], recipient="worker",
+                                           author_kind="coordinator", author_surface="coordinator", client_id="coord",
+                                           outbox_id="ob-midread1", body="go", normalized="go",
+                                           launch_id=self.world["launch"])
+                chat.outbox_step(conn, now, m.message_id, "pending", cause="preflight passed")
+                chat.outbox_step(conn, now, m.message_id, "attempted", cause="attempt", op_id="op-midread",
+                                 vendor_anchor="00000000")
+        return super().pos_lt(a, b)
+
+
+def test_an_attempt_committed_between_the_read_and_the_write_refuses_the_batch(cs, world):
+    s = AttemptsMidRead(cs, world)
+    svc = ready(cs, world, s)
+    s.show("user_item", body="go", turn_id="t-1")
+    s.armed = True
+    with pytest.raises(CoordError, match="changed while its batch was read"):
+        svc.read_next(world["launch"])
+    assert _backfill(cs, world["launch"]) == {}                        # nothing of the batch was written
+    assert outside_epochs(cs, world["launch"]) == [] and echoes(cs, world["launch"]) == []
+    assert svc.read_next(world["launch"]) == 1                         # read again over the new attempt
+
+
 # --- the released shape (v0.11.25's CHAT_SCHEMA, frozen) -------------------------------------------------------------
 RELEASED_CHAT_SCHEMA_V0_11_25 = (
     'CREATE TABLE IF NOT EXISTS chat_messages (message_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE,'
