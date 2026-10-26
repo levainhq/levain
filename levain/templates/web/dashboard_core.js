@@ -5112,6 +5112,14 @@
     if (signBusy) return null;
     signBusy++;
     signSheetLease = true;
+    try {
+      return buildSignSheet(id, version, choice);
+    } catch (e) {
+      closeSignSheet();   // a build that threw gives back the lease and whatever it had made inert
+      return null;
+    }
+  }
+  function buildSignSheet(id, version, choice) {
     let frag = typeof version === "string" && /^[0-9a-f]{16}/.test(version) ? "v=" + version.slice(0, 16) : "";
     if (frag && typeof choice === "string" && /^[a-z0-9]{1,8}$/.test(choice)) frag += "&choice=" + choice;
     const veil = el("div", "modal-overlay");
@@ -5144,7 +5152,7 @@
     if (typeof MutationObserver === "function") {
       signSheetWatch = new MutationObserver((muts) => {
         for (const m of muts) for (const n of m.addedNodes) {
-          if (n.nodeType === 1 && n !== veil && !n.inert) { n.inert = true; signSheetInerted.push(n); }
+          if (n.nodeType === 1 && n !== veil && n.id !== "levain-modal" && !n.inert) { n.inert = true; signSheetInerted.push(n); }
         }
       });
       signSheetWatch.observe(document.body, { childList: true });
@@ -5156,7 +5164,13 @@
   // (the frame is gone or stuck): this page closes it and latches the board read, since a signature may have been landing
   function askCloseSignSheet() {
     const frame = document.getElementById(SIGN_SHEET_ID + "-frame");
-    if (!frame) return;
+    if (!frame) {
+      // no frame to ask: leave now, and read the board again if a sheet was up, since a signature may have been landing
+      const was = !!document.getElementById(SIGN_SHEET_ID);
+      closeSignSheet();
+      if (was) rereadBoard(true);
+      return;
+    }
     if (signSheetAsk) return;
     signSheetAsk = setTimeout(() => { signSheetAsk = null; closeSignSheet(); rereadBoard(true); }, SIGN_CLOSE_ACK_MS);
     try { frame.contentWindow.postMessage({ levainSheetCmd: "close" }, window.location.origin); } catch (e) { /* the timer closes it */ }
@@ -5165,11 +5179,10 @@
     clearTimeout(signSheetAsk);
     signSheetAsk = null;
     const veil = document.getElementById(SIGN_SHEET_ID);
-    if (!veil) return;
     if (signSheetWatch) { signSheetWatch.disconnect(); signSheetWatch = null; }
     for (const n of signSheetInerted) n.inert = false;
     signSheetInerted = [];
-    veil.remove();
+    if (veil) veil.remove();
     if (!document.getElementById("levain-modal")) document.body.classList.remove("modal-open");
     if (signSheetLease) { signSheetLease = false; signBusy--; }
   }

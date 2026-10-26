@@ -907,3 +907,69 @@ def test_i5_the_signer_picker_is_not_a_ceremony_in_flight(tmp_path: Path, monkey
         ])
     assert out["values"][-1] is False, out["values"]                   # nothing was posted: the close leaves at once
     assert not [p for p in out["posts"] if p.split(" ", 1)[0].endswith("/challenge")], out["posts"]
+
+
+# --- the lease and the inert set are given back on every close path (L3 r2 of the landing) ---------------------------
+
+SHEET_OPENS = "(() => { const v = window.LevainSignSheet.open('%s'); const ok = !!v; window.LevainSignSheet.close(); return ok; })()" % QRID
+
+
+@needs_browser
+def test_j1_a_veil_removed_from_under_the_sheet_still_gives_back_the_lease_and_the_inert_set(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, *OPEN_FRAMED,
+            {"eval": "document.getElementById('levain-sign-sheet').remove() || 1"},
+            {"eval": "window.LevainSignSheet.close() || 1"},
+            {"eval": "[...document.body.children].filter((n) => n.inert).length"},
+            {"eval": SHEET_OPENS},
+        ])
+    v = out["values"]
+    assert v[-2] == 0, v                                               # nothing the sheet made inert stays inert
+    assert v[-1] is True, v                                            # the lease is back: the sheet opens again
+
+
+@needs_browser
+def test_j2_a_build_that_throws_leaves_no_lease_and_no_inert_node(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"eval": "(() => { const real = document.body.appendChild.bind(document.body); let once = true; "
+                     "document.body.appendChild = (n) => { if (once && n.id === 'levain-sign-sheet') { once = false; throw new Error('boom'); } return real(n); }; "
+                     "try { window.LevainSignSheet.open('%s'); return 'no throw'; } catch (e) { return 'threw'; } })()" % QRID},
+            {"eval": "[...document.body.children].filter((n) => n.inert).length"},
+            {"eval": SHEET_OPENS},
+        ])
+    v = out["values"]
+    assert v[-2] == 0, v
+    assert v[-1] is True, v
+
+
+@needs_browser
+def test_j3_the_x_closes_an_overlay_whose_frame_is_gone(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, *OPEN_FRAMED,
+            {"eval": FRAME + ".remove() || 1"},
+            {"eval": PARENT_X + ".click() || 1"},
+            {"eval": "!!document.getElementById('levain-sign-sheet')"},
+            {"eval": SHEET_OPENS},
+        ])
+    v = out["values"]
+    assert v[-2] is False, v                                           # it left at once, with no frame to ask
+    assert v[-1] is True, v
+
+
+@needs_browser
+def test_j4_the_apps_own_modal_opened_while_the_sheet_is_up_is_not_made_inert(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, *OPEN_FRAMED,
+            {"eval": "(() => { const d = document.createElement('div'); d.id = 'levain-modal'; document.body.appendChild(d); "
+                     "return new Promise((r) => setTimeout(() => r(d.inert), 100)); })()"},
+        ])
+    assert out["values"][-1] is False, out["values"]
