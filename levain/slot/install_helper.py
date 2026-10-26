@@ -2874,8 +2874,8 @@ def blob_fingerprint(public_key: str) -> str | None:
 
 
 def _quoted_split(text: str, sep: str | None) -> list[str] | None:
-    """``text`` split outside double quotes, on whitespace runs (``sep`` None) or on ``sep``; None for an
-    unterminated quote (``levain.autonomic.coverage``'s ``_fields`` / ``_options``, written here for root)."""
+    """``text`` split outside double quotes, on whitespace runs (``sep`` None) or on ``sep`` (empty entries kept);
+    None for an unterminated quote."""
     out: list[str] = []
     cur: list[str] = []
     quoted = False
@@ -2939,8 +2939,7 @@ def _line_namespaces(options: str | None) -> frozenset[str] | None:
 
 
 def _signers_owner() -> int:
-    """Who root's file and its directory must be owned by: the helper's euid (root on a host, the test's own uid
-    under the conftest owner override)."""
+    """Who root's file and its directory must be owned by: the helper's euid (root on a host)."""
     return os.geteuid()
 
 
