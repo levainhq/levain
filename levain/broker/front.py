@@ -348,31 +348,23 @@ REFUSED_HOST_CAP = 253
 
 
 def refused_host_fields(target: object) -> dict:
-    """The requested host of a refused CONNECT, for its log line (wfetch DESIGN §2.3): ``{"host": h}`` when the
-    target's host part is at most :data:`REFUSED_HOST_CAP` bytes and, lowercased as :func:`connect_target` matches
-    it, passes the policy's host grammar (:func:`levain.broker.policy.is_host_name`), or is an address literal
-    spelled exactly as ``ipaddress`` prints it (no scope id); else ``{"host_invalid": True, "host_len": n}``, and
-    ``{"host_invalid": True}`` for a target that is not bytes. The host is slot-supplied, so nothing else of it is
-    logged."""
+    """The requested host of a refused CONNECT, for its log line (wfetch DESIGN §2.3): ``{"host": h}`` only when the
+    target is an unbracketed ``host[:port]`` whose host part is at most :data:`REFUSED_HOST_CAP` bytes and, lowercased
+    as :func:`connect_target` matches it, passes the policy's host grammar (:func:`levain.broker.policy.is_host_name`);
+    else ``{"host_invalid": True, "host_len": n}`` (an address literal and a bracketed authority included, which the
+    CONNECT grammar refuses), and ``{"host_invalid": True}`` for a target that is not bytes. The host is slot-supplied,
+    so nothing else of it is logged."""
     if type(target) is not bytes:
         return {"host_invalid": True}
     m = re.match(rb"\[([^\]]*)\](?::[0-9]*)?\Z", target)
     raw = m.group(1) if m else (target.rpartition(b":")[0] if b":" in target else target)
-    if len(raw) <= REFUSED_HOST_CAP:
+    if not m and len(raw) <= REFUSED_HOST_CAP:
         try:
-            text = raw.decode("ascii")
+            low = raw.decode("ascii").lower()
         except UnicodeDecodeError:
-            text = None
-        if text is not None:
-            low = text.lower()
-            if is_host_name(low):
-                return {"host": low}
-            try:
-                addr = str(ipaddress.ip_address(text))
-            except ValueError:
-                addr = None
-            if addr == text and "%" not in text:
-                return {"host": addr}
+            low = None
+        if low is not None and is_host_name(low):
+            return {"host": low}
     return {"host_invalid": True, "host_len": len(raw)}
 
 
