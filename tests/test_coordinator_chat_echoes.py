@@ -705,6 +705,71 @@ def test_interrupt_refuses_a_turn_id_that_is_not_one(cs, world, turn_id):
     assert s.got == []
 
 
+# --- L3 r1 K6: every view, trigger and index CHAT_SCHEMA creates is compared by its stored text -----------------------
+def _stmt(prefix):
+    return next(s for s in chat.CHAT_SCHEMA if s.startswith(prefix))
+
+
+def _older_trigger_and_index(c):
+    # an older release's text of a trigger and an index, under the names CHAT_SCHEMA uses
+    c.execute("BEGIN IMMEDIATE")
+    c.execute("DROP TRIGGER chat_cursors_next")
+    c.execute("CREATE TRIGGER chat_cursors_next BEFORE INSERT ON chat_cursors WHEN 0 BEGIN SELECT RAISE(ABORT, 'old'); "
+              "END")
+    c.execute("DROP INDEX chat_outbox_one_attempt")
+    c.execute("CREATE INDEX chat_outbox_one_attempt ON chat_outbox_events (message_id)")
+    c.execute("COMMIT")
+
+
+def _current_trigger_and_index(c):
+    stored = dict(c.execute("SELECT name, sql FROM sqlite_master WHERE name IN ('chat_cursors_next', "
+                            "'chat_outbox_one_attempt')").fetchall())
+    assert stored["chat_cursors_next"] == _stmt("CREATE TRIGGER IF NOT EXISTS chat_cursors_next ").replace(
+        "IF NOT EXISTS ", "", 1)
+    assert stored["chat_outbox_one_attempt"] == _stmt("CREATE UNIQUE INDEX IF NOT EXISTS chat_outbox_one_attempt "
+                                                      ).replace("IF NOT EXISTS ", "", 1)
+    unique = {r[1]: r[2] for r in c.execute("PRAGMA index_list(chat_outbox_events)")}
+    assert unique["chat_outbox_one_attempt"] == 1
+
+
+def test_released_store_with_an_older_trigger_and_index_is_brought_current(qdir, store, world):
+    c, _m = _released_store(qdir, store, world)
+    _older_trigger_and_index(c)
+    rows = _rows(c)
+    ChatStore(store)._connect().close()
+    _current_trigger_and_index(c)
+    assert _rows(c) == rows and c.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    with pytest.raises(sqlite3.IntegrityError, match="next seq"):     # the current trigger holds again
+        c.execute("INSERT INTO chat_cursors (launch_id, seq, gseq, vendor_cursor, complete_through, gap, at) VALUES "
+                  "(?, 9, 999999, NULL, NULL, 0, 'x')", (world["launch"],))
+
+
+def test_reader_of_an_older_trigger_brings_it_current(qdir, store, world):
+    ChatStore(store)._connect().close()
+    c = raw(qdir)
+    _older_trigger_and_index(c)
+    ChatStore(store).timeline(world["thread"])                         # a read: the older trigger is not current
+    _current_trigger_and_index(c)
+
+
+# --- L3 r1 K7: a reader of a file it cannot write never runs the ensure path ------------------------------------------
+def test_reader_of_a_read_only_released_store_reads_it_and_changes_nothing(qdir, store, world, clock):
+    c, m = _released_store(qdir, store, world)
+    schema = c.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()
+    c.close()
+    db = qdir / "dispatch.db"
+    db.chmod(0o444)
+    try:
+        cs = ChatStore(EnvelopeStore(qdir, clock=clock))
+        _before, merged = cs.timeline(world["thread"])
+        assert [(r.kind, r.echo_of) for r in merged] == [("message", None), ("vendor_agent_text", None)]
+        assert cs.message(m.message_id).body == "go"
+    finally:
+        db.chmod(0o600)
+    c = raw(qdir)
+    assert c.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall() == schema
+
+
 # --- the released shape (v0.11.25's CHAT_SCHEMA, frozen) -------------------------------------------------------------
 RELEASED_CHAT_SCHEMA_V0_11_25 = (
     'CREATE TABLE IF NOT EXISTS chat_messages (message_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE,'

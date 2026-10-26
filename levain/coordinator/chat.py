@@ -39,6 +39,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -267,7 +268,7 @@ CHAT_SCHEMA: tuple[str, ...] = (
     "NULL FROM envelope_attenuations a JOIN envelope_binds b ON b.envelope_id = a.envelope_id "
     "WHERE a.thread_id IS NULL",
 )
-# (table, column, declaration): a column a released table gains, added by ChatStore._ensure when it is missing. Only
+# (table, column, declaration): a column a released table gains, added by _ensure when it is missing. Only
 # additive columns (nullable, or NOT NULL with a constant default; SQLite's ALTER TABLE refuses the rest). The table's
 # CREATE statement above must carry the same column, so a new store has it from the start
 CHAT_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = ()
@@ -618,39 +619,47 @@ def timeline(conn: sqlite3.Connection, thread_id: str) -> tuple[list[TimelineRow
     return before, merged
 
 
-_VIEW = re.compile(r"CREATE VIEW IF NOT EXISTS (\w+) ")
+# the sqlite_master types _ensure drops and recreates when their stored text is not CHAT_SCHEMA's (a table is never
+# rebuilt: it gains only CHAT_ADDED_COLUMNS)
+_REPLACEABLE = ("view", "trigger", "index")
 
 
 @functools.lru_cache(maxsize=4)
-def _view_texts(statements: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
-    """``(name, sql)`` of every view ``statements`` create, as THIS SQLite stores it in ``sqlite_master`` (read back
-    from a scratch in-memory database, never a hand normalisation of the text: SQLite drops ``IF NOT EXISTS``, and a
-    view's tables need not exist to create it)."""
+def _object_texts(statements: tuple[str, ...]) -> tuple[tuple[str, str, str], ...]:
+    """``(type, name, sql)`` of every view, trigger and index ``statements`` create, as THIS SQLite stores it in
+    ``sqlite_master``: read back from a scratch in-memory database that ran every statement (a trigger or an index needs
+    its table there), never a hand normalisation of the text (SQLite drops ``IF NOT EXISTS``; a view's or a trigger
+    body's other tables need not exist to create it). An automatic index has no text and is not listed."""
     scratch = sqlite3.connect(":memory:")
     try:
-        names = []
         for stmt in statements:
-            m = _VIEW.match(stmt)
-            if m is not None:
-                scratch.execute(stmt)
-                names.append(m.group(1))
-        return tuple((n, scratch.execute("SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?",
-                                         (n,)).fetchone()[0]) for n in names)
+            scratch.execute(stmt)
+        return tuple(scratch.execute(
+            f"SELECT type, name, sql FROM sqlite_master WHERE type IN ({', '.join(repr(t) for t in _REPLACEABLE)}) "
+            "AND sql IS NOT NULL ORDER BY type, name").fetchall())
     finally:
         scratch.close()
 
 
-def _stale(conn: sqlite3.Connection) -> tuple[list[str], list[tuple[str, str, str]]]:
-    """What a store holds that is not current: ``(views whose stored text differs from CHAT_SCHEMA's, added columns
-    a present table lacks)``. A view or table the file does not hold yet is not stale: its CREATE makes it."""
-    stored = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'view'").fetchall())
-    views = [n for n, sql in _view_texts(CHAT_SCHEMA) if n in stored and stored[n] != sql]
+def _stale(conn: sqlite3.Connection) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
+    """What a store holds that is not current: ``([(type, name)] of every view, trigger and index whose stored text
+    differs from CHAT_SCHEMA's, added columns a present table lacks)``. An object or table the file does not hold yet
+    is not stale: its CREATE makes it."""
+    stored = {(t, n): sql for t, n, sql in conn.execute("SELECT type, name, sql FROM sqlite_master")}
+    objects = [(t, n) for t, n, sql in _object_texts(CHAT_SCHEMA) if (t, n) in stored and stored[(t, n)] != sql]
     columns = []
     for table, column, decl in CHAT_ADDED_COLUMNS:
         have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if have and column not in have:
             columns.append((table, column, decl))
-    return views, columns
+    return objects, columns
+
+
+def _unwritable(conn: sqlite3.Connection) -> bool:
+    """Whether this process cannot write the file behind ``conn``'s main database (``os.access``: its mode, or a
+    read-only mount)."""
+    path = next((f for _seq, name, f in conn.execute("PRAGMA database_list") if name == "main"), "")
+    return bool(path) and not os.access(path, os.W_OK)
 
 
 def _integrity(conn: sqlite3.Connection) -> list[tuple]:
@@ -659,19 +668,19 @@ def _integrity(conn: sqlite3.Connection) -> list[tuple]:
 
 def _ensure(conn: sqlite3.Connection) -> None:
     """The ONE ensure-schema path of the chat tables (head ruling Q-A, 1025+40): in one ``BEGIN IMMEDIATE``, every
-    missing additive column (:data:`CHAT_ADDED_COLUMNS`) by ``ALTER TABLE ... ADD COLUMN``, ``DROP VIEW`` of every view
-    whose stored text is not :data:`CHAT_SCHEMA`'s, then every statement of :data:`CHAT_SCHEMA` (``IF NOT EXISTS``:
-    new tables, triggers and the dropped views); when anything changed, ``PRAGMA integrity_check`` must answer ``ok``
+    missing additive column (:data:`CHAT_ADDED_COLUMNS`) by ``ALTER TABLE ... ADD COLUMN``, ``DROP`` of every view,
+    trigger and index whose stored text is not :data:`CHAT_SCHEMA`'s (:func:`_stale`), then every statement of
+    :data:`CHAT_SCHEMA` (``IF NOT EXISTS``: new tables and objects, and the dropped ones); when anything changed, ``PRAGMA integrity_check`` must answer ``ok``
     before the COMMIT. Any raise rolls all of it back. Rows and rowids are never rewritten (no table rebuild, no
     ``writable_schema``)."""
     conn.execute("BEGIN IMMEDIATE")
     try:
         before = conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()
-        views, columns = _stale(conn)
+        objects, columns = _stale(conn)
         for table, column, decl in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-        for name in views:
-            conn.execute(f"DROP VIEW IF EXISTS {name}")
+        for kind, name in objects:
+            conn.execute(f"DROP {kind.upper()} IF EXISTS {name}")
         for stmt in CHAT_SCHEMA:
             conn.execute(stmt)
         if conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall() != before:
@@ -708,13 +717,15 @@ class ChatStore:
 
     def _read_connect(self) -> sqlite3.Connection:
         """A connection for a read that takes no write lock: the opener's (see its ``_read_connect``) once the chat
-        tables are in the file and current too; a file missing them, or holding an older view or a table short of a
-        column, is brought current by :meth:`_connect`, under the lock."""
+        tables are in the file and current too; a file missing them, or holding an older view, trigger or index or a
+        table short of a column, is brought current by :meth:`_connect`, under the lock. A file this process cannot
+        write (a read-only file or mount) is read as it is and never brought current: its reads see the shape it holds
+        (:func:`timeline` reads an older view without ``echo_of``), and a table it lacks fails that read."""
         if self._ready:
             return self._connect()
         conn = self._opener._read_connect()
         try:
-            current = schema_present(conn, CHAT_SCHEMA) and _stale(conn) == ([], [])
+            current = (schema_present(conn, CHAT_SCHEMA) and _stale(conn) == ([], [])) or _unwritable(conn)
         except BaseException:
             conn.close()
             raise
