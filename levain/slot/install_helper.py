@@ -1747,7 +1747,7 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
                        # a failed copy does not stop R11/R12: the report step after them fails the run (ruling V6)
                        *root_tree.vendor_steps(host, operator, failed=vendor_failed),
                        # the versions the copies kept, removed only with no session live (ruling V18)
-                       *vendor_prune_steps(host)])
+                       *vendor_prune_steps(host, failed=vendor_failed)])
     steps += F("R11", sudoers_steps(host, operator))                                              # R11
     steps += F("R12", [*removals("R12"),            # R1b: the removed units' files
                        *units.install_steps(host, services),                                     # R12
@@ -1952,13 +1952,22 @@ def vendor_prune_live(store: Path) -> tuple[str, ...]:
     return live_lease_sessions(L / "sessions")
 
 
-def vendor_prune_steps(host: HostOS, *, store: Path | None = None) -> list[Step]:
+def vendor_prune_steps(host: HostOS, *, store: Path | None = None, failed: list | None = None) -> list[Step]:
     """One step per versioned vendor package: :func:`levain.slot.root_tree.prune_vendor` with
-    :func:`vendor_prune_live`, read when the step runs. ``allow_fail``: a prune never stops the plan."""
+    :func:`vendor_prune_live`, read when the step runs. ``allow_fail``: a prune never stops the plan. ``failed`` is
+    the sink :func:`levain.slot.root_tree.vendor_steps` appends a failed or indeterminate copy's line to (each line
+    starts ``<name>:``): a unit with a line there is not pruned, because the previous version may still be the one a
+    crash restores (head ruling V25)."""
     L = Path(store) if store is not None else STORE[host]
+    sink = failed if failed is not None else []
 
     def prune(name: str) -> Callable[[], tuple[bool, str]]:
-        return lambda: root_tree.prune_vendor(host, name, live=lambda: vendor_prune_live(L))
+        def run() -> tuple[bool, str]:
+            if any(str(line).startswith(f"{name}:") for line in sink):
+                return True, (f"{name}: every version kept (this run's copy of {name} did not finish durably, so "
+                              "the previous version may be the one a crash restores)")
+            return root_tree.prune_vendor(host, name, live=lambda: vendor_prune_live(L))
+        return run
     return [Step(f"remove the old versions of root's {name} copy in {root_tree.VENDOR_PREFIX[host]} (only with no "
                  "session live)", call=prune(name), allow_fail=True) for name in root_tree.VENDOR_UNITS]
 

@@ -1191,19 +1191,19 @@ def _publish_package(host: HostOS, name: str, unit: VendorUnit, root: str, srcs:
             pass                       # V21: a structure set-in-place cannot mend is rebuilt below
         else:
             problem = unit_problem(host, name, prefix=base, root_uid=root_uid)
-            if problem:
-                return False, f"{name}: {problem}; repair could not fix it"
-            try:
-                _fsync_strict([pdir, bindir], fsync)
-            except OSError as e:
-                return False, _indeterminate(name, link, active, e)
-            return True, f"{name}: {active} already matches {root}"
-    manifest = next((os.pread(fd, 1 << 16, 0) for rel, _, fd, _ in srcs if rel == unit.manifest), b"")
-    version = _version_name(manifest)
+            if not problem:
+                try:
+                    _fsync_strict([pdir, bindir], fsync)
+                except OSError as e:
+                    return False, _indeterminate(name, link, active, e)
+                return True, f"{name}: {active} already matches {root}"
+            # V28: set-in-place returned and the structure is still not whole: rebuilt below, as for an OSError
     staging = pdir / f"{_STAGING}{os.getpid()}.{secrets.token_hex(4)}.partial"
     final: Optional[Path] = None
     total = 0
     try:
+        manifest = next((os.pread(fd, 1 << 16, 0) for rel, _, fd, _ in srcs if rel == unit.manifest), b"")   # V26
+        version = _version_name(manifest)
         _ensure_dirs(base, [f"{name}/x"], chown=chown, root_uid=root_uid)
         for entry in sorted(os.listdir(pdir)):
             if (entry.startswith(f"{version}-") and (active is None or entry != active.name)

@@ -604,12 +604,13 @@ def test_v9_repair_fixes_a_bad_directory_mode_when_every_file_matches(env):
 
 
 def test_v9_a_repair_that_leaves_a_problem_reports_failure(env, monkeypatch):
+    """With no chmod at all neither set-in-place nor the V28 rebuild can make the tree whole: a failure, active kept."""
     _codex_pkg(env)
     _codex_copy(env)
     os.chmod(_active_root(env.prefix) / "codex-resources" / "voice", 0o775)
     monkeypatch.setattr(RT.os, "chmod", lambda *a, **k: None)
     ok, why = _codex_copy(env)
-    assert not ok and "voice" in why, why
+    assert not ok and "not whole" in why and "unchanged" in why, why
 
 
 def test_v10_start_refuses_a_required_executable_at_0644(env):
@@ -1048,3 +1049,82 @@ def test_v23_repair_with_the_same_failure_still_fails_the_run(monkeypatch, tmp_p
     out: list = []
     assert run_plan(plan, dry_run=False, emit=out.append) == 1
     assert any("FAILED" in o and "codex" in o for o in out), out
+
+
+def test_v26_an_oserror_reading_the_manifest_is_a_failed_copy_not_a_raise(env, monkeypatch):
+    """RED at a9ffc283: the manifest ``os.pread`` sat above the ``try``, so an EIO there escaped ``copy_vendor``."""
+    _codex_pkg(env)
+    _codex_copy(env)
+    v1 = _active_root(env.prefix).name
+    _v2(env)
+    real = os.pread
+
+    def pread(fd, n, off):
+        if n == 1 << 16:
+            raise OSError(5, "Input/output error")
+        return real(fd, n, off)
+    monkeypatch.setattr(os, "pread", pread)
+    ok, why = _codex_copy(env)
+    assert not ok and "unchanged" in why, why
+    assert _active_root(env.prefix).name == v1
+
+
+def test_v28_a_matching_active_version_fix_tree_leaves_unfixed_is_rebuilt(env, monkeypatch):
+    """RED at a9ffc283: ``_fix_tree`` returned without raising, ``unit_problem`` stayed non-empty, and the ``same``
+    branch failed with "repair could not fix it" on every repair after."""
+    _codex_pkg(env)
+    _codex_copy(env)
+    v1 = _active_root(env.prefix).name
+    os.chmod(_active_root(env.prefix) / "codex-path" / "rg", 0o600)
+    assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid())
+    monkeypatch.setattr(RT, "_fix_tree", lambda *a, **k: None)
+    ok, why = _codex_copy(env)
+    assert ok and "copied" in why, why
+    assert _active_root(env.prefix).name != v1
+    assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid()) == ""
+
+
+def _prune_run(env, monkeypatch, fsync):
+    """The repair plan's R10 copy step then its prune step for codex, sharing one ``failed`` sink, on ``env``."""
+    from levain.slot import install_helper as IH
+
+    failed: list = []
+    monkeypatch.setitem(RT.VENDOR_PREFIX, "darwin", env.prefix)
+    real = RT.prune_vendor
+    monkeypatch.setattr(RT, "prune_vendor", lambda host, name, **kw: real(
+        host, name, prefix=env.prefix, fchown=env.fchown, chown=env.chown, root_uid=os.getuid(), **kw))
+    monkeypatch.setattr(IH, "vendor_prune_live", lambda L: ())
+    copy = RT.vendor_steps("darwin", "op", failed=failed, lookup=lambda n: type("P", (), {
+        "pw_dir": str(env.home), "pw_uid": os.getuid()})(),
+        copy=lambda host, name, **kw: env.copy(name, fsync=fsync) if name == "codex" else (True, "skip"))
+    prune = IH.vendor_prune_steps("darwin", store=env.tmp, failed=failed)
+    codex_copy = next(s for s in copy if "codex" in s.why and s.call is not None)
+    codex_prune = next(s for s in prune if "codex" in s.why)
+    return codex_copy, codex_prune
+
+
+def test_v25_a_prune_after_an_indeterminate_publish_keeps_the_previous_version(env, monkeypatch):
+    """RED at a9ffc283: the prune ran after a copy whose ``bin`` fsync failed and removed the previous version."""
+    _codex_pkg(env)
+    _codex_copy(env)
+    before = _versions(env.prefix)
+    _v2(env)
+    copy, prune = _prune_run(env, monkeypatch, _fails_on(env.prefix / "bin"))
+    ok, why = copy.call()
+    assert not ok and "indeterminate" in why, why
+    assert len(_versions(env.prefix)) == 2
+    ok, why = prune.call()
+    assert ok and "kept" in why and "codex" in why, why
+    assert len(_versions(env.prefix)) == 2 and before[0] in _versions(env.prefix)
+
+
+def test_v25_a_prune_after_a_durable_copy_removes_the_old_versions_as_before(env, monkeypatch):
+    _codex_pkg(env)
+    _codex_copy(env)
+    _v2(env)
+    copy, prune = _prune_run(env, monkeypatch, os.fsync)
+    ok, why = copy.call()
+    assert ok, why
+    ok, why = prune.call()
+    assert ok and "removed" in why, why
+    assert _versions(env.prefix) == [_active_root(env.prefix).name]
