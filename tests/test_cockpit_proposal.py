@@ -20,7 +20,9 @@ from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.queue import ConsentQueue, authority_source
 from tests._h4 import h4_home
 
-NOW = datetime(2026, 10, 17, 12, 0, 0, tzinfo=timezone.utc)
+# The page under test reads its proposal window against the browser's real clock, so the seed is anchored to the
+# current hour: a fixed date ages out of that window (it did, nine days after 2026-10-17).
+NOW = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
 
 def _stamp(when: datetime) -> str:
