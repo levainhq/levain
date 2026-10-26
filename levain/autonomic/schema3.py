@@ -33,6 +33,7 @@ from pathlib import Path
 
 from levain.autonomic import db as vdb
 from levain.autonomic.db import StoreFormatError
+from levain.autonomic.journal import UNSIGNED_DECIDER
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 
@@ -177,14 +178,18 @@ def _progress(subj: str) -> str:
     # R13-6: the subject's DB-visible progress, NEVER decreasing: effects and holds are never removed once past intent
     # (effects_final_d, holds_final_d; and an effect row of any state is never removed: effects_d) and
     # hold_decisions is append-only. request:<run>:<eid> -> its run's effects + holds + decisions ever taken;
-    # pending:<pid> -> its manual pending's state rank, or the number of decisions its hold ever took
+    # pending:<pid> -> its manual pending's state rank, or the number of decisions its hold ever took.
+    # R14-1: a decision counts only when someone took it: the silence default's (UNSIGNED_DECIDER) is not progress,
+    # or a coverage answer that flaps between the sweep's read and the admission's (approve, then reopen, every
+    # sweep) restarts the held count every cycle and the subject never reaches HELD_LIMIT
     r = _run_of_request(subj)
+    taken = f"by IS NOT '{UNSIGNED_DECIDER}'"
     return (f"(CASE WHEN {subj} GLOB 'request:?*' THEN "
             f"(SELECT COUNT(*) FROM effects WHERE run_id = {r}) + (SELECT COUNT(*) FROM holds WHERE run_id = {r}) "
-            f"+ (SELECT COUNT(*) FROM hold_decisions WHERE run_id = {r}) "
+            f"+ (SELECT COUNT(*) FROM hold_decisions WHERE run_id = {r} AND {taken}) "
             f"WHEN {subj} GLOB 'pending:?*' THEN IFNULL((SELECT CASE state WHEN 'open' THEN 0 WHEN 'firing' THEN 1 "
             f"ELSE 2 END FROM manual_pendings WHERE 'pending:' || pending_id = {subj}), "
-            f"(SELECT COUNT(*) FROM hold_decisions WHERE 'pending:' || pending_id = {subj})) "
+            f"(SELECT COUNT(*) FROM hold_decisions WHERE 'pending:' || pending_id = {subj} AND {taken})) "
             "END)")
 
 

@@ -12,11 +12,15 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from levain.autonomic import Posture
 from levain.autonomic import db as vdb
 from levain.autonomic import schema3 as s
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.db import AutonomicDB, StoreFormatError
 from levain.autonomic.receipt import build_gate_face
+from tests.autonomic_test_only_confinement import test_only_confined_executor  # noqa: F401  (the root-run closure has no conftest)
+from tests.autonomic_test_only_coverage import TestOnlyCoverage
+from tests.test_autonomic_gate_coverage import LATER, CWorld, _covering
 
 
 def canon(o) -> str:
@@ -565,3 +569,75 @@ def test_a_hold_birth_dry_runs_its_request_close(store):
     with store.read() as c:
         assert c.execute("SELECT COUNT(*) FROM requests").fetchone() == (0,)
         assert s.invariant(c) == []
+
+
+# ---- R14-1: an unattended approve/reopen loop is not progress ---------------------------------------------------------
+class _ScheduledCoverage(TestOnlyCoverage):
+    """Refresh i covers the effect iff ``answer(i)`` (a grant or revoke moves the head when the answer changes)."""
+
+    __test__ = False
+
+    def __init__(self, answer) -> None:
+        self._policies_all = list(_covering("link0", lowest="COOLING_OFF")._policies.values())
+        super().__init__(self._policies_all)
+        self._covered, self._answer, self.reads = True, answer, 0
+
+    def refresh(self):
+        want = bool(self._answer(self.reads))
+        if want != self._covered:
+            for p in self._policies_all:
+                self.grant(p) if want else self.revoke(p.grant_id)
+            self._covered = want
+        self.reads += 1
+        return super().refresh()
+
+
+# the dispatch reads covered, then every sweep reads T T F F T (silence approves, admission finds the rung risen and
+# reopens); found by running every period-1..6 pattern after a covered dispatch through V's sweep (lane a1c1b RETURN)
+_FLAP = "TTFFT"
+SWEEPS = 24
+
+
+@pytest.mark.usefixtures("test_only_confined_executor")
+def test_an_unattended_approve_reopen_loop_does_not_restart_the_held_count(tmp_path, store):
+    cov = _ScheduledCoverage(lambda i: i == 0 or _FLAP[(i - 1) % len(_FLAP)] == "T")
+    w = CWorld(tmp_path / "v", coverage=cov, auto_fire=frozenset({"link0"}))
+    w.mint(Posture.COOLING_OFF)
+    w.dispatch("m1")
+    v = sqlite3.connect(tmp_path / "v" / "store" / vdb.DB_NAME, isolation_level=None)
+    v.execute("CREATE TABLE rig_log (k TEXT, by TEXT)")
+    v.execute("CREATE TRIGGER rig_dec AFTER UPDATE OF decided ON holds WHEN OLD.decided IS NULL AND NEW.decided IS "
+              "NOT NULL BEGIN INSERT INTO rig_log VALUES ('decide:' || NEW.decided, NEW.decided_by); END")
+    v.execute("CREATE TRIGGER rig_reopen AFTER UPDATE OF decided ON holds WHEN OLD.decided IS 1 AND NEW.decided IS "
+              "NULL BEGIN INSERT INTO rig_log VALUES ('reopen', OLD.decided_by); END")
+    per_sweep = []
+    for i in range(SWEEPS):
+        w.sweep(LATER + timedelta(minutes=i))
+        per_sweep.append(v.execute("SELECT COUNT(*) FROM rig_log WHERE k = 'decide:1'").fetchone()[0])
+    log = v.execute("SELECT k, by FROM rig_log ORDER BY rowid").fetchall()
+    v.close()
+    # V loops: one unattended approval and one reopen every sweep, nothing fired, nothing closed
+    assert per_sweep == list(range(1, SWEEPS + 1))
+    assert log == [("decide:1", "on-loop"), ("reopen", "on-loop")] * SWEEPS and w.outbox() == []
+    # the same decisions on a /3 store, one subject fault held after each reopen (the hold open again: a pending
+    # subject is closed while its hold is decided, _closed)
+    c = raw(store)
+    tx(c, ("INSERT INTO runs (run_id, binding_id, generation, seal) VALUES ('p', 'b', 0, ?)", (RUN_SEAL,)),
+       ("INSERT INTO holds (hold_id, run_id, effect_id, binding_id, digest, pending_id, seq) "
+        "VALUES ('h-p', 'p', 'link-0', 'b', 'd', 'pp', 1)",))
+    counts = {"request:p:link-0": [], "pending:pp": []}
+    for k, by in log:
+        if k == "decide:1":
+            tx(c, ("UPDATE holds SET decided = 1, decided_by = ? WHERE hold_id = 'h-p'", (by,)))
+        else:
+            tx(c, (REOPEN, ("h-p",)),
+               *(lambda conn, subj=subj: counts[subj].append(s.count_held(conn, subj, "subject:fault"))
+                 for subj in counts))
+    assert c.execute("SELECT COUNT(*) FROM hold_decisions").fetchone() == (SWEEPS,)
+    for subj, ns in counts.items():
+        assert ns == list(range(1, SWEEPS + 1)), subj   # never restarted: the loop is not progress
+    tx(c, lambda conn: s.close_subject(conn, subject="request:p:link-0",
+                                       record=rec("r-q", "request:p:link-0", "refused"),
+                                       reason="held_limit:subject:fault"))
+    assert s.invariant(c) == []
+    c.close()
