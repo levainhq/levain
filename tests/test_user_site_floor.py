@@ -402,14 +402,23 @@ def test_a_userbase_linked_to_usr_refuses_the_floor(home: Path, tmp_path: Path, 
     assert "$PYTHONUSERBASE" in msg and _names_real(msg, Path('/usr/lib')) and "fail-closed" in msg
 
 
-def test_every_existing_system_runtime_root_is_too_wide_to_deny(tmp_path: Path) -> None:
-    """The roster, enumerated: each member that exists here, resolved, and the interpreter's own roots."""
+def test_every_existing_system_runtime_root_is_refused_at_the_userbase_site() -> None:
+    """The roster, enumerated, and the interpreter's own load paths: each that exists here, resolved, is held by
+    the ``$PYTHONUSERBASE`` site's predicate, and NOT by the shared :func:`too_wide_to_deny` (U4: a levain home
+    holding its venv stays deniable whole)."""
+    import sysconfig
+    paths = sysconfig.get_paths()
+    own = [sys.prefix, sys.base_prefix, os.path.dirname(sys.executable), sysconfig.get_config_var("LIBDIR"),
+           *(paths[k] for k in ("stdlib", "platstdlib", "purelib", "platlib"))]
     checked = []
-    for p in (*C.SYSTEM_RUNTIME_ROOTS, Path(sys.base_prefix), Path(sys.executable).parent, Path("/bin/sh").parent):
+    for p in (*C.SYSTEM_RUNTIME_ROOTS, *(Path(v) for v in own if v)):
         if p.exists():
-            assert C.too_wide_to_deny(p.resolve(), tmp_path / "h"), p
+            assert C._holds_a_system_runtime(p.resolve()), p
             checked.append(p)
     assert Path("/usr") in checked   # the roster is not vacuous on any system the tests run on
+    stdlib = Path(paths["stdlib"]).resolve()
+    assert C._holds_a_system_runtime(stdlib.parent)   # <prefix>/lib holds the stdlib (codex MED, U4)
+    assert not C.too_wide_to_deny(stdlib, Path("/nonexistent-home"))
 
 
 def test_an_ordinary_userbase_lib_is_not_too_wide(home: Path, tmp_path: Path) -> None:
@@ -417,7 +426,9 @@ def test_an_ordinary_userbase_lib_is_not_too_wide(home: Path, tmp_path: Path) ->
     lib = tmp_path / "pyuser" / "lib"
     lib.mkdir(parents=True)
     assert not C.too_wide_to_deny(lib.resolve(), home, tmp_path / "ws", tmp_path / "entity")
+    assert not C._holds_a_system_runtime(lib.resolve())
     assert not C.too_wide_to_deny((home / ".local" / "lib").resolve(), home / "other")
+    assert not C._holds_a_system_runtime((home / ".local" / "lib").resolve())
 
 
 @live
@@ -450,3 +461,45 @@ def test_a_file_where_the_local_bin_tree_would_be_is_refused_without_naming_the_
     msg = " ".join(str(err.value).split())
     assert os.path.realpath(binf) in msg and "not a directory" in msg and "remove it or move it" in msg
     assert "Python user site" not in msg
+
+
+@pytest.fixture
+def fresh_runtime_roots():
+    """The runtime roots are computed once per process: clear the cache around a test that changes ``sys``."""
+    clear = getattr(getattr(C, "_system_runtime_roots", None), "cache_clear", lambda: None)
+    clear()
+    yield
+    clear()
+
+
+@pytest.mark.parametrize("how", ["the base prefix", "a link to it"])
+def test_a_userbase_at_the_interpreters_base_prefix_refuses_the_floor(home: Path, tmp_path: Path, monkeypatch,
+                                                                      fresh_runtime_roots, how: str) -> None:
+    """U4 (codex MED): ``<sys.base_prefix>/lib`` holds the interpreter's stdlib; denying it whole breaks every
+    Python tool, so it refuses by name, the real path named when the base is a link."""
+    real = Path(sys.base_prefix).resolve()
+    base = real
+    if how == "a link to it":
+        base = tmp_path / "prefixlink"
+        base.symlink_to(real)
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    with pytest.raises(C.ConfinementError) as err:
+        _policy(tmp_path)
+    msg = " ".join(str(err.value).split())
+    assert "$PYTHONUSERBASE" in msg and _names_real(msg, real / "lib") and "fail-closed" in msg
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_no_sys_executable_is_skipped_never_a_crash_or_the_cwd(home: Path, tmp_path: Path, monkeypatch,
+                                                               fresh_runtime_roots, value) -> None:
+    """U4 (codex MED + complement LOW): ``sys.executable`` may be None or empty. Neither raises, and an empty one
+    never makes the cwd a runtime root (``Path("").parent`` is ``.``)."""
+    base = tmp_path / "pyuser"
+    cwd = base / "lib" / "here"
+    cwd.mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(sys, "executable", value)
+    assert not C.too_wide_to_deny(cwd.parent, home)
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    policy = _policy(tmp_path)
+    assert _covered(policy, base / "lib" / f"python{_XY}" / "site-packages" / "x.pth")
