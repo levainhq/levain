@@ -138,14 +138,15 @@ def check_discovery(ctx: H.Ctx, a: R.Alloc) -> None:
 
 def vendor_argv(host: str, vendor: str, session: str) -> Tuple[str, ...]:
     """The vendor's exec: its binary under the root-owned vendor prefix (§2.1). Claude Code reads the rendered
-    ``--settings`` layer (render's ``<S>/root/settings.json``); Codex reads ``CODEX_HOME/config.toml``."""
+    ``--settings`` layer (render's ``<S>/root/settings.json``); Codex reads ``CODEX_HOME/config.toml`` and takes
+    render's :data:`~levain.slot.render.CODEX_LAUNCH_ARGS` on its command line."""
     from levain.slot.layout import STORE
     from levain.slot.root_tree import VENDOR_PREFIX
 
     binary = f"{VENDOR_PREFIX[host]}/bin/{vendor}"
     if vendor == "claude":
         return (binary, "--settings", f"{STORE[host]}/live/{session}/root/settings.json")
-    return (binary,)
+    return (binary, *RD.CODEX_LAUNCH_ARGS)
 
 
 def launch(ctx: H.Ctx, a: R.Alloc, spec: wall.Spec) -> Tuple[Tuple[str, ...], Optional[str]]:

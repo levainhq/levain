@@ -97,6 +97,9 @@ ROUTE_TYPES = ("egress", "brokered", "subscription_passthrough")   # §4.1
 PROXY_ENV = frozenset(n for b in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY") for n in (b, b.lower()))
 #: wfetch RULINGS Q3: Codex's server-side search mode until Phill rules (fail closed: the front cannot see it).
 CODEX_WEB_SEARCH = "disabled"
+#: The Codex launch's ``-c`` overrides (``start.vendor_argv``), the layer above every config file: a repo the session
+#: trusts can set ``web_search`` in its own ``.codex/config.toml``, which Codex ranks above ``CODEX_HOME``'s file.
+CODEX_LAUNCH_ARGS = ("-c", f'web_search="{CODEX_WEB_SEARCH}"')
 _TERM_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}", re.ASCII)
 #: DECISION: the slot's ``/var/folders/<xx>/<id>`` subtree (the parent of its ``DARWIN_USER_DIR``, as R-M2 measured
 #: it), its real ``/private`` path, in the alphabet ``confstr`` produces. Never a path a profile string must escape.
@@ -320,16 +323,25 @@ def check_facts(blob: RenderBlob, facts: RenderFacts) -> None:
 
 
 def egress_hosts(blob: RenderBlob, facts: RenderFacts) -> tuple[str, ...]:
-    """The CONNECT hosts of the blob's ``egress`` routes, sorted, each through the policy parser's one host grammar
-    (``policy.hosts``), so no host that is not a lowercase A-label name reaches a permission rule. A route with no
-    ``route_hosts`` entry adds none; an entry that does not parse is refused ``bad-config``."""
+    """The CONNECT hosts of an egress-class session's ``egress`` routes, sorted, each through the policy parser's one
+    host grammar (``policy.hosts``), so no host that is not a lowercase A-label name reaches a permission rule. A
+    none-class session has none (it renders no egress rule). A route with no ``route_hosts`` entry adds none (fail
+    closed: the fetch prompts and the front decides); a ``route_hosts`` that is not a mapping of host lists, or an
+    entry that does not parse, is refused ``bad-config``."""
+    if facts.slot.slot_class != "egress":
+        return ()
+    if not isinstance(facts.route_hosts, Mapping):
+        raise Refused("bad-config", "route_hosts")
     out: set[str] = set()
     for r in blob.routes:
         if facts.route_types.get(r) != "egress" or r not in facts.route_hosts:
             continue
+        raw = facts.route_hosts[r]
+        if not isinstance(raw, (tuple, list)):
+            raise Refused("bad-config", f"route_hosts {r}")
         try:
-            out.update(broker_policy.hosts(r, list(facts.route_hosts[r])))
-        except (broker_policy.PolicyError, TypeError):
+            out.update(broker_policy.hosts(r, list(raw)))
+        except Exception:
             raise Refused("bad-config", f"route_hosts {r}") from None
     return tuple(sorted(out))
 
@@ -1015,7 +1027,7 @@ __all__ = [
     "VENDOR_PREFIX", "READSET_ATTRIBUTES", "READSET_ATTRIBUTES_PATH", "READSET_KINDS", "READSET_TEMPLATE",
     "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
-    "TOKEN_ENV", "ABSENT_ENV", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "egress_hosts",
+    "TOKEN_ENV", "ABSENT_ENV", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",
     "env_text", "render_cc_settings", "render_cc_onboarding", "codex_config", "codex_toml", "gitconfig_text",
     "assert_no_syscall", "check_driver_template", "profile_lines", "read_driver_template", "render_profile",
     "render_importer_profile", "render_verifier_profile",
