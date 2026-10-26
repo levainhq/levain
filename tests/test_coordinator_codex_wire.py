@@ -6,6 +6,7 @@ No daemon is started, no model is called and no sandbox runs; the one test that 
 regenerates its JSON schema, offline, under a scratch CODEX_HOME."""
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import shutil
@@ -298,34 +299,45 @@ def test_a_required_thread_id_missing_and_a_request_without_a_usable_id_are_unpa
 
 
 # --- frames that are not messages -------------------------------------------------------------------------------
-def test_ws_non_json_and_oversize_frames_are_unparseable_and_the_reader_goes_on(daemon):
+def test_ws_non_json_frames_are_unparseable_and_the_reader_goes_on(daemon):
     wire = _open(daemon, "ws")
     try:
         tid = wire.start_thread({"cwd": "/tmp"})["thread"]["id"]
         c = daemon.conns[-1]
         c.send_raw(b"\x1b[2mnot json\x1b[0m")
         c.send_raw(b"[1, 2]")
-        c.send_raw(b"x" * (cw._MAX_MESSAGE + 1))
         c.notify("turn/started", {"threadId": tid, "turn": {"id": "t1"}})
-        got = _collect(wire, 4, 10.0)
-        assert [i.kind for i in got] == ["unparseable", "unparseable", "unparseable", "notification"], got
-        assert "not JSON" in got[0].detail and "not a JSON object" in got[1].detail
-        assert f"over {cw._MAX_MESSAGE}" in got[2].detail and wire.closed is None
+        got = _collect(wire, 3, 10.0)
+        assert [i.kind for i in got] == ["unparseable", "unparseable", "notification"], got
+        assert "not JSON" in got[0].detail and "not a JSON object" in got[1].detail and wire.closed is None
     finally:
         wire.close()
 
 
-def test_line_non_json_lines_are_counted_logs_and_an_oversize_line_is_unparseable(daemon):
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_g2_an_oversize_message_closes_the_wire_as_a_protocol_fault(daemon, transport):
+    # codex OPEN 5: it has no recoverable id or kind, so it is no longer an id-less item the reader goes past
+    wire = _open(daemon, transport)
+    try:
+        wire.start_thread({"cwd": "/tmp"})
+        daemon.conns[-1].send_raw(b"x" * (cw._MAX_MESSAGE + 1))
+        got = _collect(wire, 2, 10.0)
+        assert [i.kind for i in got] == ["closed"], got
+        assert f"over {cw._MAX_MESSAGE}" in got[0].detail and wire.closed, (got, wire.closed)
+    finally:
+        wire.close()
+
+
+def test_line_non_json_lines_are_counted_logs_never_items(daemon):
     wire = _open(daemon, "line")
     try:
         tid = wire.start_thread({"cwd": "/tmp"})["thread"]["id"]
         c = daemon.conns[-1]
         c.send_raw(b"\x1b[2m2026-10-26 INFO codex_app_server: started\x1b[0m")
         c.send_raw(b"")
-        c.send_raw(b"x" * (cw._MAX_MESSAGE + 1))
         c.notify("turn/started", {"threadId": tid, "turn": {"id": "t1"}})
-        got = _collect(wire, 2, 10.0)
-        assert [i.kind for i in got] == ["unparseable", "notification"], got
+        got = _collect(wire, 1, 10.0)
+        assert [i.kind for i in got] == ["notification"], got
         assert wire.log_lines == 2 and len(wire.log_digest) == 64
     finally:
         wire.close()
@@ -883,3 +895,85 @@ def test_f5_a_line_that_starts_with_a_brace_but_is_not_json_is_unparseable_not_a
         assert wire.log_lines == 1
     finally:
         wire.close()
+
+
+def _stalled_writer(wire: CodexWire, daemon: FakeDaemon) -> threading.Thread:
+    """A big call mid-send with the daemon not reading: it holds the write lock for its 30 s deadline."""
+    daemon.reading.clear()
+    wire.notify("turn/interrupt", {"threadId": "x", "turnId": "y"})   # the daemon is parked in a read: this frame frees it
+    time.sleep(0.3)                                                 # to its next stop at the gate, so the big one blocks
+    t = threading.Thread(target=lambda: _within(lambda: wire.call("hooks/list", {"pad": "z" * (4 << 20)},
+                                                                  timeout=30.0), 40.0), daemon=True)
+    t.start()
+    end = time.monotonic() + 15.0
+    while not wire._framing._wlock.locked() and time.monotonic() < end:     # the frame is built, the write has begun
+        time.sleep(0.01)
+    assert wire._framing._wlock.locked()
+    return t
+
+
+def _wait_closed(wire: CodexWire, seconds: float) -> bool:
+    end = time.monotonic() + seconds
+    while wire.closed is None and time.monotonic() < end:
+        time.sleep(0.02)
+    return wire.closed is not None
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_g1_the_readers_auto_answer_has_a_short_deadline_and_a_failed_one_fails_the_wire(daemon, transport):
+    # deepseek MED: the -32600 reply ran on the reader thread under the 60 s call deadline
+    wire = _open(daemon, transport)
+    try:
+        wire.start_thread({"cwd": "/tmp"})
+        _stalled_writer(wire, daemon)
+        daemon.conns[-1].request("item/commandExecution/requestApproval", {"turnId": "t1"}, 0)
+        assert _wait_closed(wire, 5.0), "the reader waited out the call deadline"
+    finally:
+        daemon.reading.set()
+        _within(wire.close, 3.0)
+
+
+def test_g1_a_pong_that_cannot_be_sent_fails_the_wire_in_the_readers_deadline(daemon):
+    # codex / complement LOW: the pong ran on the reader thread under the 60 s call deadline
+    wire = _open(daemon, "ws")
+    try:
+        _stalled_writer(wire, daemon)
+        daemon.conns[-1].ping(b"pp")
+        assert _wait_closed(wire, 5.0), "the reader waited out the call deadline"
+    finally:
+        daemon.reading.set()
+        _within(wire.close, 3.0)
+
+
+def test_g3_a_wake_cannot_write_to_a_descriptor_closed_under_it(daemon, monkeypatch):
+    # complement LOW: wake() read _wake_w, _close_wake closed it, and the write landed on a reused descriptor
+    framing = cw.WsFraming(cx.control_socket(daemon.home))
+    framing.arm(lambda: None)
+    reused: list[tuple[int, int]] = []
+    real_write = cw.os.write
+    fired = []
+
+    def racing_write(fd, data):
+        if not fired and data == b"w":
+            fired.append(1)
+            t = threading.Thread(target=framing._close_wake, daemon=True)
+            t.start()
+            t.join(0.5)                                     # unlocked: the close has run; locked: it waits for us
+            reused.append(cw.os.pipe())                     # the freed numbers are reused here when it ran
+        return real_write(fd, data)
+
+    monkeypatch.setattr(cw.os, "write", racing_write)
+    try:
+        framing.wake()
+        time.sleep(0.2)                                     # a locked close finishes after the wake returns
+        r, w = reused[0]
+        os_set = cw.os.set_blocking
+        os_set(r, False)
+        with pytest.raises(BlockingIOError):
+            cw.os.read(r, 8)                                # nothing may land in the reused pipe
+        framing.wake()                                      # a wake after close is a no-op
+    finally:
+        for fd in reused[0] if reused else ():
+            with contextlib.suppress(OSError):
+                cw.os.close(fd)
+        framing.close()

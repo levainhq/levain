@@ -28,7 +28,8 @@ process Levain spawns (:class:`LineFraming`). :class:`CodexWire` is the one clie
   arrival ordinal (at most :data:`BOOTSTRAP_FRAME_CAP`, and only until that call's deadline): the returned id is bound
   and the held items are released in arrival order, another thread's as ``foreign``. Past the cap a notification is
   dropped and counted; a server request closes the connection rather than lose its id;
-- a frame over :data:`_MAX_MESSAGE` and, on the socket, a frame that is not a JSON object are ``unparseable`` items and
+- a message over :data:`_MAX_MESSAGE` has no recoverable id or kind, so it closes the connection as a protocol fault
+  (as the bootstrap cap does); on the socket a frame that is not a JSON object is an ``unparseable`` item and
   the reader goes on; on a pipe a line that is not JSON is a log line (``codex app-server`` writes ANSI log lines to
   its stdout, measured over stdio in runs72), counted in :attr:`CodexWire.log_lines` and a running digest, never an item;
 - :meth:`CodexWire.open` sends ``initialize`` (``experimentalApi: false`` and :data:`OPT_OUT_NOTIFICATIONS`), then the
@@ -68,7 +69,8 @@ _MAX_MESSAGE = 16 * 1024 * 1024 + 4096     # the daemon's own header names 16777
 _GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 BOOTSTRAP_FRAME_CAP = 256
 _LATE_IDS_CAP = 1024
-_CLOSE_TIMEOUT = 1.0        # shutdown's wait for the write lock, then for its close frame
+_READER_SEND_TIMEOUT = 2.0  # every send the reader thread makes (a pong, the -32600 answer); a failed one ends the wire
+_CLOSE_TIMEOUT = 1.0       # shutdown's wait for the write lock, then for its close frame
 _WRITE_SLICE = 0.05         # a blocked write re-checks for shutdown this often
 
 
@@ -109,6 +111,7 @@ class _Framing:
         self._broken = False
         self._wake_r: int | None = None
         self._wake_w: int | None = None
+        self._wake_lock = threading.Lock()      # wake() and _close_wake() never interleave: no write to a reused fd
         self._on_wake: Callable[[], None] = lambda: None
 
     def arm(self, on_wake: Callable[[], None]) -> None:
@@ -119,9 +122,10 @@ class _Framing:
 
     def wake(self) -> None:
         """Make the reader run ``on_wake`` (on its own thread) as soon as it is waiting for data."""
-        if self._wake_w is not None:
-            with contextlib.suppress(OSError):         # a full pipe is a wake already pending
-                os.write(self._wake_w, b"w")
+        with self._wake_lock:
+            if self._wake_w is not None:
+                with contextlib.suppress(OSError):     # a full pipe is a wake already pending
+                    os.write(self._wake_w, b"w")
 
     def _wait_readable(self, fd: int) -> None:
         """Block until ``fd`` has data (or its peer closed), running ``on_wake`` for each wake on the way."""
@@ -172,11 +176,12 @@ class _Framing:
             self._wlock.release()
 
     def _close_wake(self) -> None:
-        for fd in (self._wake_r, self._wake_w):
-            if fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
-        self._wake_r = self._wake_w = None
+        with self._wake_lock:
+            for fd in (self._wake_r, self._wake_w):
+                if fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+            self._wake_r = self._wake_w = None
 
 
 class WsFraming(_Framing):
@@ -312,7 +317,7 @@ class WsFraming(_Framing):
                 continue
             payload = self._need(n)
             if op == 9:
-                self._send(10, payload, time.monotonic() + _CALL_TIMEOUT)
+                self._send(10, payload, time.monotonic() + _READER_SEND_TIMEOUT)
             elif op == 8:
                 raise CodexError("the daemon closed the connection")
             elif op in (0, 1, 2):
@@ -885,9 +890,7 @@ class CodexWire:
                 try:
                     raw = self._framing.recv_message(skip_oversize=True)
                 except _Oversize as exc:
-                    self._push(self._item("unparseable",
-                                          detail=f"a message of {exc.size} bytes, over {_MAX_MESSAGE}"))
-                    continue
+                    raise _ReaderFault(f"a message of {exc.size} bytes, over {_MAX_MESSAGE}") from None
                 self._dispatch(raw)
         except (CodexError, _ReaderFault, OSError, ValueError) as exc:
             reason = str(exc) or type(exc).__name__
@@ -956,7 +959,7 @@ class CodexWire:
             if has_id:
                 try:
                     self._send({"id": rid, "error": {"code": -32600, "message": f"invalid request: {why}"}},
-                               time.monotonic() + _CALL_TIMEOUT)
+                               time.monotonic() + _READER_SEND_TIMEOUT)
                     answered = True
                 except CodexError:
                     pass                    # the send failed and closed the wire; the item still says unanswered
