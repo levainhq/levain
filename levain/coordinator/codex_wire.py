@@ -13,8 +13,11 @@ process Levain spawns (:class:`LineFraming`). :class:`CodexWire` is the one clie
   thread, after the call a frame unblocked is released. If the reader ends for ANY reason (an unexpected exception
   included) the connection is dead: every waiting call fails and a ``closed`` item is queued;
 - **bounded writes**: every byte written (a message, a pong, the close frame) goes out under the framing's ONE write
-  lock and within the sender's deadline (a call's own timeout covers its send); a send that cannot complete in it fails
-  and closes the connection, since part of a message may be out. :meth:`CodexWire.close` is bounded the same way;
+  lock and within the sender's deadline (a call's own timeout covers its send), checked before the first byte and
+  after every partial write. A send whose deadline passes before its first byte fails alone (the stream is intact; the
+  reader's own ``-32600`` answer still closes the connection); one cut off part-way fails and closes the connection,
+  since a partial message cannot be resumed. :meth:`CodexWire.close` is bounded the same way, and closes the
+  connection's descriptors even under a stuck ``on_inbound``;
 - **typed ids**: an id is kept as the exact JSON value (``0`` and ``"0"`` are different requests) and "has an id" is a
   key-presence test, never truthiness. A reply echoes the id as it came;
 - **``gen``**: every connection mints a fresh random hex string, stamped on every item it queues. It is an opaque
@@ -29,7 +32,8 @@ process Levain spawns (:class:`LineFraming`). :class:`CodexWire` is the one clie
   and the held items are released in arrival order, another thread's as ``foreign``. Past the cap a notification is
   dropped and counted; a server request closes the connection rather than lose its id;
 - a message over :data:`_MAX_MESSAGE` has no recoverable id or kind, so it closes the connection as a protocol fault
-  (as the bootstrap cap does); on the socket a frame that is not a JSON object is an ``unparseable`` item and
+  (as the bootstrap cap does) as soon as its size is known, never read through; so does a WebSocket frame that breaks
+  RFC 6455 section 5 (:meth:`WsFraming.recv_message`); on the socket a frame that is not a JSON object is an ``unparseable`` item and
   the reader goes on; on a pipe a line that is not JSON is a log line (``codex app-server`` writes ANSI log lines to
   its stdout, measured over stdio in runs72), counted in :attr:`CodexWire.log_lines` and a running digest, never an item;
 - :meth:`CodexWire.open` sends ``initialize`` (``experimentalApi: false`` and :data:`OPT_OUT_NOTIFICATIONS`), then the
@@ -83,18 +87,29 @@ class CodexError(Exception):
 
 
 class _NotStarted(CodexError):
-    """A send's write lock was not acquired by its deadline: not one byte of it went out, the stream is intact."""
+    """A send that ended before one byte of it went out (its deadline passed before or while it waited for the write
+    lock or for the peer to take a first byte): the stream is intact."""
 
 
-class _Oversize(Exception):
-    """A message over :data:`_MAX_MESSAGE`, already read past: the stream is still in step."""
+class _Oversize(CodexError):
+    """A message over :data:`_MAX_MESSAGE`, raised as soon as its size is known: its bytes are NOT read past, so the
+    stream is out of step and the connection must close."""
 
     def __init__(self, size: int) -> None:
-        super().__init__(size)
+        super().__init__(f"a message of at least {size} bytes, over {_MAX_MESSAGE}")
         self.size = size
 
 
 # --- framings ----------------------------------------------------------------------------------------------------
+def _masked(payload: bytes, mask: bytes) -> bytes:
+    """``payload`` XORed with the 4-byte ``mask`` repeated (RFC 6455 section 5.3), as one big-integer XOR."""
+    n = len(payload)
+    if not n:
+        return b""
+    key = (mask * (n // 4 + 1))[:n]
+    return (int.from_bytes(payload, "big") ^ int.from_bytes(key, "big")).to_bytes(n, "big")
+
+
 def _poll(fds: list[tuple[int, int]], timeout: float | None) -> set[int]:
     """The fds of ``fds`` (``(fd, events)``) that are ready within ``timeout`` seconds (None: no limit)."""
     p = select.poll()
@@ -105,12 +120,18 @@ def _poll(fds: list[tuple[int, int]], timeout: float | None) -> set[int]:
 
 class _Framing:
     """What both framings share once :meth:`arm`-ed by a :class:`CodexWire`: every byte written goes out under ONE
-    write lock (:attr:`_wlock`) and within the writer's deadline; the reader waits on the data and on a wake pipe, so
-    :meth:`wake` runs the wire's ``on_wake`` on the reader thread and :meth:`shutdown` ends a reader whose peer never
-    closes. Unarmed (C3c's single-shot client) a framing blocks as a plain socket or file does."""
+    write lock (:attr:`_wlock`) and within the writer's deadline; every read-side descriptor operation (the wait, the
+    wake drain, the read) runs under ONE read lock (:attr:`_rlock`). The reader waits on the data and on a wake pipe,
+    so :meth:`wake` runs the wire's ``on_wake`` on the reader thread and :meth:`shutdown` ends a reader whose peer
+    never closes. Each side's descriptors are closed only by a thread holding that side's lock: :meth:`_side_close`
+    closes them at once when the lock frees in time, else the holder closes them on its way out, so a descriptor is
+    never closed under a thread that is using it and a late operation finds it gone instead of a reused number. A
+    reader stuck in a callback holds neither lock, so it cannot keep the connection's descriptors open. Unarmed
+    (C3c's single-shot client) a framing blocks as a plain socket or file does."""
 
     def __init__(self) -> None:
         self._wlock = threading.Lock()
+        self._rlock = threading.Lock()
         self._closing = False
         self._broken = False
         self._wake_r: int | None = None
@@ -118,9 +139,14 @@ class _Framing:
         self._wake_lock = threading.Lock()      # wake() and _close_wake() never interleave: no write to a reused fd
         self._shut = False                      # guarded by _wake_lock: shutdown() runs its body once
         self._on_wake: Callable[[], None] = lambda: None
+        # a side's close: asked for (pending), then done by a holder of that side's lock (r: _rlock, w: _wlock)
+        self._pending = {"r": False, "w": False}
+        self._done = {"r": False, "w": False}
+        self._armed = False
 
     def arm(self, on_wake: Callable[[], None]) -> None:
         self._wake_r, self._wake_w = os.pipe()
+        self._armed = True
         os.set_blocking(self._wake_r, False)
         os.set_blocking(self._wake_w, False)
         self._on_wake = on_wake
@@ -132,53 +158,96 @@ class _Framing:
                 with contextlib.suppress(OSError):     # a full pipe is a wake already pending
                     os.write(self._wake_w, b"w")
 
-    def _wait_readable(self, fd: int) -> None:
-        """Block until ``fd`` has data (or its peer closed), running ``on_wake`` for each wake on the way."""
+    def _armed_read(self, fd: Callable[[], int], read: Callable[[], bytes]) -> bytes:
+        """Wait for data on ``fd()`` (or its peer's close) and ``read()`` it, under the read lock, running ``on_wake``
+        (outside the lock) for each wake on the way. Once levain closes, it raises before touching a descriptor."""
         while True:
-            if self._closing:
-                raise CodexError("the connection was closed by levain")
-            ready = _poll([(fd, select.POLLIN), (self._wake_r, select.POLLIN)], None)
-            if self._wake_r in ready:
-                with contextlib.suppress(OSError):
-                    while os.read(self._wake_r, 512):
-                        pass
-                if self._closing:
-                    raise CodexError("the connection was closed by levain")
-                self._on_wake()
-            if fd in ready:
-                return
+            with self._rlock:
+                try:
+                    if self._closing or self._done["r"]:
+                        raise CodexError("the connection was closed by levain")
+                    ready = _poll([(fd(), select.POLLIN), (self._wake_r, select.POLLIN)], None)
+                    woke = self._wake_r in ready
+                    if woke:
+                        with contextlib.suppress(OSError):
+                            while os.read(self._wake_r, 512):
+                                pass
+                    elif ready:
+                        try:
+                            return read()
+                        except BlockingIOError:
+                            continue
+                finally:
+                    self._settle_locked("r")
+            if woke:
+                self._on_wake()                 # may run long (a session callback): it holds no lock
 
     def _locked_write(self, data: bytes, deadline: float | None, write: Callable[[memoryview], int], fd: int, *,
                       closing_ok: bool = False) -> None:
-        """Write all of ``data`` under the write lock by the deadline (monotonic seconds; None: no limit), or raise
-        :class:`CodexError` and mark the stream broken (a part of a message may be out)."""
+        """Write all of ``data`` under the write lock by the deadline (monotonic seconds; None: no limit). The deadline
+        is checked once the lock is held and after every write: one that passes before the first byte goes out raises
+        :class:`_NotStarted` (nothing sent, the stream intact); one that passes part-way raises :class:`CodexError`
+        and marks the stream broken (a partial message cannot be resumed)."""
         left = None if deadline is None else deadline - time.monotonic()
         if not self._wlock.acquire(timeout=-1 if left is None else max(0.0, left)):
             raise _NotStarted("a send could not start within its deadline (another send holds the connection)")
         try:
             if self._broken:
                 raise CodexError("an earlier send failed part-way; the connection's output is unusable")
+            if self._done["w"]:
+                raise CodexError("the connection was closed by levain")
             view = memoryview(data)
+            sent = 0
             try:
                 while view:
                     if self._closing and not closing_ok:
                         raise CodexError("the connection was closed by levain")
+                    left = None if deadline is None else deadline - time.monotonic()
+                    if left is not None and left <= 0:
+                        if not sent:
+                            raise _NotStarted("a send's deadline passed before its first byte went out")
+                        raise CodexError(f"a send did not complete within its deadline ({sent} of {len(data)} "
+                                         "bytes out; the peer is reading too slowly)")
                     try:
                         n = write(view)
                     except BlockingIOError:
                         n = 0
                     if n:
                         view = view[n:]
+                        sent += n
                         continue
-                    left = None if deadline is None else deadline - time.monotonic()
-                    if left is not None and left <= 0:
-                        raise CodexError("a send did not complete within its deadline (the peer is not reading)")
                     _poll([(fd, select.POLLOUT)], _WRITE_SLICE if left is None else min(left, _WRITE_SLICE))
+            except _NotStarted:
+                raise
             except BaseException:
                 self._broken = True
                 raise
         finally:
-            self._wlock.release()
+            try:
+                self._settle_locked("w")
+            finally:
+                self._wlock.release()
+
+    def _side_close(self, side: str, timeout: float) -> None:
+        """Close one side's descriptors (``"r"`` or ``"w"``): now, if that side's lock frees within ``timeout``; else
+        the thread holding it closes them as it lets go."""
+        lock = self._rlock if side == "r" else self._wlock
+        self._pending[side] = True
+        if lock.acquire(timeout=timeout):
+            try:
+                self._settle_locked(side)
+            finally:
+                lock.release()
+
+    def _settle_locked(self, side: str) -> None:
+        """With ``side``'s lock held: close its descriptors if a close was asked for and has not run."""
+        if self._pending[side] and not self._done[side]:
+            self._done[side] = True
+            with contextlib.suppress(OSError, ValueError):
+                self._close_side(side)
+
+    def _close_side(self, side: str) -> None:
+        raise NotImplementedError
 
     def _first_shutdown(self) -> bool:
         with self._wake_lock:
@@ -202,6 +271,7 @@ class WsFraming(_Framing):
 
     def __init__(self, path: Path, timeout: float = _CONNECT_TIMEOUT) -> None:
         super().__init__()
+        self._ws: socket.socket | None = None
         self._s = socket.socket(socket.AF_UNIX)
         try:
             self._s.settimeout(timeout)
@@ -229,30 +299,51 @@ class WsFraming(_Framing):
             raise
 
     def arm(self, on_wake: Callable[[], None]) -> None:
-        """The wire's mode: the socket goes non-blocking; reads wait in :meth:`_wait_readable`, writes are bounded."""
-        super().arm(on_wake)
+        """The wire's mode: the socket goes non-blocking; reads go through :meth:`_armed_read` on the socket, writes
+        (bounded) through a duplicate of it, so each side's descriptor has one owner (the read lock, the write lock)."""
         self._s.setblocking(False)
+        self._ws = self._s.dup()
+        self._ws.setblocking(False)
+        super().arm(on_wake)
 
     def close(self) -> None:
         self.shutdown()
-        self._s.close()
-        self._close_wake()
+        if not self._armed:
+            if self._ws is not None:                # an arm that failed part-way
+                self._ws.close()
+            self._s.close()
+            return
+        self._side_close("w", _CLOSE_TIMEOUT)
+        self._side_close("r", _CLOSE_TIMEOUT)
 
     def shutdown(self) -> None:
         """Unblock a reader waiting in :meth:`recv_message` (it then sees the connection closed) and any blocked writer;
-        bounded: a close frame goes out only if the write lock frees within :data:`_CLOSE_TIMEOUT`. Once only."""
+        bounded: a close frame goes out only if the write lock frees within :data:`_CLOSE_TIMEOUT`, and the write side
+        (the socket shut both ways, then closed) is closed by whoever holds that lock. Once only."""
         if not self._first_shutdown():
             return
-        if self._wake_r is None:
+        if not self._armed:
             with contextlib.suppress(OSError, CodexError):
                 self._send(8, b"")
+            with contextlib.suppress(OSError):
+                self._s.shutdown(socket.SHUT_RDWR)
+            return
+        self._closing = True
+        self.wake()
+        with contextlib.suppress(OSError, CodexError):
+            self._send(8, b"", time.monotonic() + _CLOSE_TIMEOUT, closing_ok=True)
+        self._side_close("w", _CLOSE_TIMEOUT)
+
+    def _close_side(self, side: str) -> None:
+        if side == "w":
+            with contextlib.suppress(OSError):
+                self._ws.shutdown(socket.SHUT_RDWR)     # the shared socket: the reader sees end of input
+            self._ws.close()
         else:
-            self._closing = True
-            self.wake()
-            with contextlib.suppress(OSError, CodexError):
-                self._send(8, b"", time.monotonic() + _CLOSE_TIMEOUT, closing_ok=True)
-        with contextlib.suppress(OSError):
-            self._s.shutdown(socket.SHUT_RDWR)
+            try:
+                self._s.close()
+            finally:
+                self._close_wake()
 
     def settimeout(self, timeout: float | None) -> None:
         self._s.settimeout(timeout)
@@ -266,22 +357,17 @@ class WsFraming(_Framing):
                                      bytes([0x80 | 126]) + struct.pack(">H", n) if n < 65536 else
                                      bytes([0x80 | 127]) + struct.pack(">Q", n))
         mask = os.urandom(4)
-        frame = head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        if self._wake_r is None:
+        frame = head + mask + _masked(payload, mask)
+        if not self._armed:
             with self._wlock:
                 self._s.sendall(frame)
             return
-        self._locked_write(frame, deadline, self._s.send, self._s.fileno(), closing_ok=closing_ok)
+        self._locked_write(frame, deadline, self._ws.send, self._ws.fileno(), closing_ok=closing_ok)
 
     def _recv_some(self) -> bytes:
-        if self._wake_r is None:
+        if not self._armed:
             return self._s.recv(65536)
-        while True:
-            self._wait_readable(self._s.fileno())
-            try:
-                return self._s.recv(65536)
-            except BlockingIOError:
-                continue
+        return self._armed_read(self._s.fileno, lambda: self._s.recv(65536))
 
     def _need(self, n: int) -> bytes:
         while len(self._buf) < n:
@@ -292,41 +378,45 @@ class WsFraming(_Framing):
         out, self._buf = self._buf[:n], self._buf[n:]
         return out
 
-    def _skip(self, n: int) -> None:
-        while n > 0:
-            if not self._buf:
-                self._buf = self._recv_some()
-                if not self._buf:
-                    raise CodexError("the daemon closed the connection")
-            take = min(n, len(self._buf))
-            self._buf = self._buf[take:]
-            n -= take
-
-    def recv_message(self, *, skip_oversize: bool = False) -> bytes:
-        """One whole data message (fragments joined; pings answered). A masked frame raises :class:`CodexError`. A
-        message over :data:`_MAX_MESSAGE` raises :class:`CodexError` at once, or, with ``skip_oversize``, is read past
-        to its last fragment and raises :class:`_Oversize` (the stream stays usable)."""
-        msg = b""
-        dropped = 0
+    def recv_message(self) -> bytes:
+        """One whole data message (fragments joined; pings answered, pongs ignored). A frame that breaks RFC 6455
+        section 5 raises :class:`CodexError` (the connection must close): nonzero RSV bits, an opcode outside
+        0/1/2/8/9/10 or a 64-bit length with its top bit set (5.2), a masked frame (5.1), a continuation with no
+        message open or a new data message inside a fragmented one (5.4), a control frame fragmented or over 125 bytes
+        (5.5). A message over :data:`_MAX_MESSAGE` raises :class:`_Oversize` as soon as a frame header declares it,
+        before any of that frame's payload is read."""
+        msg = bytearray()
+        open_ = False                       # a fragmented message has begun and not ended
         while True:
             h = self._need(2)
-            fin, op, n = h[0] & 0x80, h[0] & 0x0F, h[1] & 0x7F
+            fin, rsv, op, masked, n = h[0] & 0x80, h[0] & 0x70, h[0] & 0x0F, h[1] & 0x80, h[1] & 0x7F
+            if rsv:
+                raise CodexError("the daemon sent a frame with nonzero RSV bits and no extension agreed (RFC 6455 "
+                                 "section 5.2)")
+            if op not in (0, 1, 2, 8, 9, 10):
+                raise CodexError(f"the daemon sent a frame with the reserved opcode {op:#x} (RFC 6455 section 5.2)")
+            if masked:
+                raise CodexError("the daemon sent a masked frame (RFC 6455 section 5.1)")
             if n == 126:
                 n = struct.unpack(">H", self._need(2))[0]
             elif n == 127:
                 n = struct.unpack(">Q", self._need(8))[0]
-            if op & 8 and (n > 125 or not fin):
-                raise CodexError("the daemon sent a control frame that is fragmented or over 125 bytes (RFC 6455 "
-                                 "section 5.5)")
-            if h[1] & 0x80 or (not skip_oversize and len(msg) + n > _MAX_MESSAGE):
-                raise CodexError("the daemon sent a frame this client does not take (masked, or too large)")
-            if op in (0, 1, 2) and (dropped or len(msg) + n > _MAX_MESSAGE):
-                self._skip(n)
-                dropped += len(msg) + n
-                msg = b""
-                if fin:
-                    raise _Oversize(dropped)
-                continue
+                if n >> 63:
+                    raise CodexError("the daemon sent a 64-bit frame length with its top bit set (RFC 6455 "
+                                     "section 5.2)")
+            if op & 8:
+                if n > 125 or not fin:
+                    raise CodexError("the daemon sent a control frame that is fragmented or over 125 bytes (RFC 6455 "
+                                     "section 5.5)")
+            else:
+                if op == 0 and not open_:
+                    raise CodexError("the daemon sent a continuation frame with no message open (RFC 6455 "
+                                     "section 5.4)")
+                if op != 0 and open_:
+                    raise CodexError("the daemon began a new data message inside a fragmented one (RFC 6455 "
+                                     "section 5.4)")
+                if len(msg) + n > _MAX_MESSAGE:
+                    raise _Oversize(len(msg) + n)
             payload = self._need(n)
             if op == 9:
                 try:
@@ -335,10 +425,11 @@ class WsFraming(_Framing):
                     pass                    # a writer holds the lock: nothing went out, a later ping gets its own try
             elif op == 8:
                 raise CodexError("the daemon closed the connection")
-            elif op in (0, 1, 2):
+            elif op != 10:
                 msg += payload
+                open_ = not fin
                 if fin:
-                    return msg
+                    return bytes(msg)
 
 
 class LineFraming(_Framing):
@@ -356,50 +447,44 @@ class LineFraming(_Framing):
         self._scan = 0
 
     def arm(self, on_wake: Callable[[], None]) -> None:
-        """The wire's mode: the write end goes non-blocking (writes are bounded); reads wait in
-        :meth:`_wait_readable`."""
-        super().arm(on_wake)
+        """The wire's mode: the write end goes non-blocking (writes are bounded); reads go through
+        :meth:`_armed_read`."""
         self._w.flush()
         os.set_blocking(self._w.fileno(), False)
+        super().arm(on_wake)
 
     def send_text(self, data: bytes, deadline: float | None = None) -> None:
-        if self._wake_r is None:
+        if not self._armed:
             with self._wlock:
                 self._w.write(data + b"\n")
                 self._w.flush()
             return
-        fd = self._w.fileno()
+        fd = self._w.fileno()       # read before the lock: _locked_write refuses a closed side under the lock
         self._locked_write(data + b"\n", deadline, lambda view: os.write(fd, view), fd)
 
     def _read_some(self) -> bytes:
-        fd = self._r.fileno()
-        if self._wake_r is not None:
-            self._wait_readable(fd)
-        return os.read(fd, 65536)
+        if not self._armed:
+            return os.read(self._r.fileno(), 65536)
+        return self._armed_read(self._r.fileno, lambda: os.read(self._r.fileno(), 65536))
 
-    def recv_message(self, *, skip_oversize: bool = True) -> bytes:
-        """One line without its line ending. A line over :data:`_MAX_MESSAGE` bytes is read past to its end and raises
-        :class:`_Oversize` (with ``skip_oversize``) or :class:`CodexError`."""
-        dropped = 0
+    def recv_message(self) -> bytes:
+        """One line without its line ending. A line over :data:`_MAX_MESSAGE` bytes raises :class:`_Oversize` as soon
+        as that many bytes have arrived without a line end; the rest of it is never read."""
         while True:
             i = self._rbuf.find(b"\n", self._scan)
             if i >= 0:
+                if i > _MAX_MESSAGE:
+                    raise _Oversize(i)
                 line = bytes(self._rbuf[:i])
                 del self._rbuf[:i + 1]
                 self._scan = 0
-                if dropped or len(line) > _MAX_MESSAGE:
-                    if not skip_oversize:
-                        raise CodexError("the app-server sent a line this client does not take (too large)")
-                    raise _Oversize(dropped + len(line))
                 return line.rstrip(b"\r")
+            if len(self._rbuf) > _MAX_MESSAGE:
+                raise _Oversize(len(self._rbuf))
             self._scan = len(self._rbuf)
-            if self._scan > _MAX_MESSAGE:
-                dropped += self._scan
-                self._rbuf.clear()
-                self._scan = 0
             chunk = self._read_some()
             if not chunk:
-                if self._rbuf and not dropped:
+                if self._rbuf:
                     line = bytes(self._rbuf)
                     self._rbuf.clear()
                     self._scan = 0
@@ -408,24 +493,34 @@ class LineFraming(_Framing):
             self._rbuf += chunk
 
     def shutdown(self) -> None:
-        """End Levain's write end (the peer sees end of input) and the reader; bounded like :meth:`WsFraming.shutdown`."""
+        """End Levain's write end (the peer sees end of input) and the reader; bounded like :meth:`WsFraming.shutdown`:
+        the write end is closed by whoever holds the write lock, never under a writer."""
         if not self._first_shutdown():
+            return
+        if not self._armed:
+            with contextlib.suppress(OSError, ValueError):
+                self._w.close()
             return
         self._closing = True
         self.wake()
-        held = self._wlock.acquire(timeout=_CLOSE_TIMEOUT)
-        try:
-            with contextlib.suppress(OSError, ValueError):
-                self._w.close()
-        finally:
-            if held:
-                self._wlock.release()
+        self._side_close("w", _CLOSE_TIMEOUT)
 
     def close(self) -> None:
         self.shutdown()
-        with contextlib.suppress(OSError, ValueError):
-            self._r.close()
-        self._close_wake()
+        if not self._armed:
+            with contextlib.suppress(OSError, ValueError):
+                self._r.close()
+            return
+        self._side_close("r", _CLOSE_TIMEOUT)
+
+    def _close_side(self, side: str) -> None:
+        if side == "w":
+            self._w.close()
+        else:
+            try:
+                self._r.close()
+            finally:
+                self._close_wake()
 
 
 # --- the pinned surface and the server-request registry ------------------------------------------------------------
@@ -671,6 +766,7 @@ class CodexWire:
         self._boot: _Boot | None = None
         self._initialized = False
         self._closed: str | None = None
+        self._closed_queued = False
         self._reader = threading.Thread(target=self._run, name=f"codex-wire-{self.gen}", daemon=True)
 
     # -- construction --
@@ -684,9 +780,9 @@ class CodexWire:
         if client_version is None:
             from levain import __version__ as client_version
         wire = cls(framing, on_inbound=on_inbound, bootstrap_cap=bootstrap_cap)
-        framing.arm(wire._after_deferred)   # bounded writes; the reader waits on data and on wire wakes
-        wire._reader.start()
         try:
+            framing.arm(wire._after_deferred)   # bounded writes; the reader waits on data and on wire wakes
+            wire._reader.start()
             deadline = time.monotonic() + timeout
             init = wire._call("initialize", {
                 "clientInfo": {"name": "levain-chat", "title": "Levain chat", "version": client_version},
@@ -737,10 +833,11 @@ class CodexWire:
 
     # -- reading --
     def get(self, timeout: float | None = None) -> Inbound | None:
-        """The next queued item, waiting up to ``timeout`` seconds (None: until one arrives); None on timeout."""
+        """The next queued item, waiting up to ``timeout`` seconds (None: until one arrives); None on timeout, and at
+        once when the queue is empty after the ``closed`` item was queued (nothing more can arrive)."""
         with self._cond:
             if not self._queue:
-                self._cond.wait_for(lambda: bool(self._queue), timeout)
+                self._cond.wait_for(lambda: bool(self._queue) or self._closed_queued, timeout)
             return self._queue.popleft() if self._queue else None
 
     def drain(self) -> list[Inbound]:
@@ -754,8 +851,8 @@ class CodexWire:
     def call(self, method: str, params: dict[str, Any], *, timeout: float = _CALL_TIMEOUT,
              on_server_request: str = "queue") -> Any:
         """Send one request and return its ``result``; an error response raises :class:`CodexError` (``.error`` holds
-        it). The deadline covers the send too: a send that cannot complete in it fails the call and closes the
-        connection. Server traffic in between is queued as always; with ``on_server_request="refuse"`` a server
+        it). The deadline covers the send too: a send not begun in it fails the call alone (nothing went out); one
+        cut off part-way fails the call and closes the connection. Server traffic in between is queued as always; with ``on_server_request="refuse"`` a server
         request arriving while this call is outstanding (the wire's thread, or no thread) also makes the call raise
         :class:`CodexError` naming that method (the request stays queued, unanswered; the late response is
         dropped). Called from the reader thread, it raises at once."""
@@ -781,7 +878,8 @@ class CodexWire:
     def reply(self, item: Inbound, *, result: Any = NO_ID, error: tuple[int, str] | None = None) -> None:
         """Answer server request ``item`` once, with ``result`` or ``error`` ``(code, message)``, echoing its id as it
         came. Refused (:class:`CodexError`): an item that is not a request (a foreign thread's included), one from
-        another ``gen``, one already answered, or a closed connection. A send that fails closes the connection."""
+        another ``gen``, one already answered, or a closed connection. A send that fails part-way closes the
+        connection; one not begun by its deadline leaves the request unanswered, to be answered again."""
         if (result is NO_ID) == (error is None):
             raise ValueError("reply takes exactly one of result= or error=")
         with self._lock:
@@ -804,17 +902,24 @@ class CodexWire:
         with self._lock:
             if self._pending.pop(item.token, None) is None:
                 raise CodexError(f"{item.method}: request {item.token} was already answered")
-        self._send_data(data, time.monotonic() + _CALL_TIMEOUT)
+        try:
+            self._send_data(data, time.monotonic() + _CALL_TIMEOUT)
+        except CodexError:
+            with self._lock:
+                if self._closed is None:            # not one byte went out: the request is still unanswered
+                    self._pending[item.token] = item
+            raise
 
     def close(self) -> None:
         """Close the connection; calls still waiting raise :class:`CodexError`. Bounded: the framing's shutdown waits
-        at most :data:`_CLOSE_TIMEOUT` for a writer, and the reader is given 2s to end."""
+        at most :data:`_CLOSE_TIMEOUT` for a writer, and the reader is given 2s to end. The framing is closed even when
+        the reader has not ended (an ``on_inbound`` that never returns): a stuck callback holds no descriptor, and a
+        writer still holding the write lock closes the write side as it lets go."""
         self._fail("closed by levain")
         if self._reader.is_alive() and self._reader is not threading.current_thread():
             self._reader.join(2.0)
-        if not self._reader.is_alive():
-            with contextlib.suppress(OSError, ValueError):
-                self._framing.close()
+        with contextlib.suppress(OSError, ValueError, CodexError):
+            self._framing.close()
 
     # -- internals: sending --
     def _check_ready(self, method: str) -> None:
@@ -832,15 +937,23 @@ class CodexWire:
         with contextlib.suppress(OSError, ValueError, CodexError):
             self._framing.shutdown()
 
-    def _send(self, body: dict[str, Any], deadline: float) -> None:
-        self._send_data(json.dumps(body).encode(), deadline)
+    def _send(self, body: dict[str, Any], deadline: float, *, fail_unsent: bool = False) -> None:
+        self._send_data(json.dumps(body).encode(), deadline, fail_unsent=fail_unsent)
 
-    def _send_data(self, data: bytes, deadline: float) -> None:
+    def _send_data(self, data: bytes, deadline: float, *, fail_unsent: bool = False) -> None:
+        """Send one message. A send that ended before its first byte (:class:`_NotStarted`) fails only this send (the
+        stream is intact) unless ``fail_unsent``; any other failure closes the connection."""
         with self._lock:
             if self._closed is not None:
                 raise CodexError(f"the connection is closed ({self._closed})")
         try:
             self._framing.send_text(data, deadline)
+        except _NotStarted as exc:
+            if not fail_unsent:
+                raise CodexError(f"not sent: {exc}") from None
+            why = f"a send failed ({type(exc).__name__}: {exc})"
+            self._fail(why)
+            raise CodexError(f"the Codex connection failed: {why}") from None
         except (CodexError, OSError, ValueError) as exc:
             why = f"a send failed ({type(exc).__name__}: {exc})"
             self._fail(why)
@@ -907,9 +1020,9 @@ class CodexWire:
         try:
             while True:
                 try:
-                    raw = self._framing.recv_message(skip_oversize=True)
+                    raw = self._framing.recv_message()
                 except _Oversize as exc:
-                    raise _ReaderFault(f"a message of {exc.size} bytes, over {_MAX_MESSAGE}") from None
+                    raise _ReaderFault(f"a message of at least {exc.size} bytes, over {_MAX_MESSAGE}") from None
                 self._dispatch(raw)
         except (CodexError, _ReaderFault, OSError, ValueError) as exc:
             reason = str(exc) or type(exc).__name__
@@ -929,6 +1042,8 @@ class CodexWire:
                 fresh += self._end_boot_locked(None)
             self._fail_waiters_locked(f"the connection ended ({self._closed})")
             fresh.append(self._enqueue_new_locked("closed", detail=self._closed))
+            self._closed_queued = True
+            self._cond.notify_all()
         with contextlib.suppress(OSError, ValueError, CodexError):
             self._framing.shutdown()
         self._after(fresh)
@@ -978,7 +1093,7 @@ class CodexWire:
             if has_id:
                 try:
                     self._send({"id": rid, "error": {"code": -32600, "message": f"invalid request: {why}"}},
-                               time.monotonic() + _READER_SEND_TIMEOUT)
+                               time.monotonic() + _READER_SEND_TIMEOUT, fail_unsent=True)
                     answered = True
                 except CodexError:
                     pass                    # the send failed and closed the wire; the item still says unanswered
@@ -1070,6 +1185,8 @@ class CodexWire:
             return (tid, "") if isinstance(tid, str) else (None, "thread/started without a thread id")
         name = _THREAD_FIELD.get(method, "threadId")
         tid = params.get(name, NO_ID) if isinstance(params, dict) else NO_ID
+        if tid is None and method not in _THREAD_REQUIRED:
+            tid = NO_ID                     # an explicit null where the schema does not require the field: absent
         if tid is NO_ID:
             return (None, f"{method} without the {name} its schema requires") if method in _THREAD_REQUIRED \
                 else (None, "")

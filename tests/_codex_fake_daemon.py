@@ -10,18 +10,22 @@ after the answer is computed and before it is sent, so it can name a thread ``th
 ``after_reply[method]``, and ``on_client_reply`` (runs when the client answers a server request). Clearing
 :attr:`FakeDaemon.reading` stops the daemon reading what the client sends (its buffers then fill, so a client write
 blocks); on the socket :meth:`Conn.ping` sends a ping and the pongs that come back are kept in ``pongs``.
+:meth:`Conn.send_bytes` writes bytes with no framing at all (a hostile peer's malformed or stalled traffic), and
+:class:`TricklePeer` is a peer that takes a write a few bytes at a time without ever blocking.
 
 Not measured, the fake's own choices: the error a request sent before ``initialized`` gets (:data:`NOT_INITIALIZED`),
 and the wording of the stale-steer error (:meth:`FakeDaemon._answer`). No test here reaches a real Codex."""
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
 import socket
 import struct
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -38,9 +42,11 @@ class Conn:
     daemon's side."""
 
     def __init__(self, write: Callable[[bytes], None], hangup: Callable[[], None],
-                 write_frame: Callable[..., None] | None = None) -> None:
+                 write_frame: Callable[..., None] | None = None,
+                 write_bytes: Callable[[bytes], None] | None = None) -> None:
         self._write = write
         self._write_frame = write_frame
+        self._write_bytes = write_bytes
         self.hangup = hangup
         self._lock = threading.Lock()
         self.initialized = False
@@ -52,6 +58,11 @@ class Conn:
 
     def send(self, obj: Any) -> None:
         self.send_raw(json.dumps(obj).encode())
+
+    def send_bytes(self, data: bytes) -> None:
+        """``data`` exactly as given: no WebSocket frame, no line end."""
+        with self._lock:
+            self._write_bytes(data)
 
     def ping(self, payload: bytes) -> None:
         self.frame(9, payload)
@@ -107,6 +118,34 @@ def settings_updated(tid: str, approval_policy: str = "on-request") -> dict[str,
                                                 "collaborationMode": "default", "cwd": "/tmp", "model": "m",
                                                 "modelProvider": "openai",
                                                 "sandboxPolicy": {"type": "workspaceWrite"}}}
+
+
+class TricklePeer:
+    """A peer that is always ready to take more and takes it slowly: each :meth:`write` waits ``delay`` seconds and
+    accepts at most ``chunk`` bytes (into a socket pair whose far end a thread drains), so no write ever blocks or
+    makes zero progress. It is passed as a framing's ``write`` callable: a kernel socket blocks once its buffer
+    fills, so the shape is built at the write seam, where the framing meets it."""
+
+    def __init__(self, chunk: int = 256, delay: float = 0.001) -> None:
+        self.chunk, self.delay = chunk, delay
+        self.near, self._far = socket.socketpair(socket.AF_UNIX)
+        self.taken = 0
+        threading.Thread(target=self._drain, daemon=True).start()
+
+    def _drain(self) -> None:
+        with contextlib.suppress(OSError):
+            while self._far.recv(65536):
+                pass
+
+    def write(self, view: memoryview) -> int:
+        time.sleep(self.delay)
+        n = self.near.send(view[:self.chunk])
+        self.taken += n
+        return n
+
+    def close(self) -> None:
+        self.near.close()
+        self._far.close()
 
 
 class FakeDaemon:
@@ -180,7 +219,7 @@ class FakeDaemon:
                          b"sec-websocket-accept: " + accept + b"\r\n\r\n")
             c = Conn(lambda body: conn.sendall(_ws_frame(body)), lambda: conn.shutdown(socket.SHUT_RDWR),
                      lambda op, body, fin=True, declared=None: conn.sendall(
-                         _ws_frame(body, op, fin, declared)))
+                         _ws_frame(body, op, fin, declared)), conn.sendall)
             self.conns.append(c)
             while True:
                 if not self.reading.is_set():
@@ -222,7 +261,11 @@ class FakeDaemon:
             out.write(body + b"\n")
             out.flush()
 
-        c = Conn(write, out.close)
+        def write_bytes(data: bytes) -> None:
+            out.write(data)
+            out.flush()
+
+        c = Conn(write, out.close, write_bytes=write_bytes)
         self.conns.append(c)
 
         def serve() -> None:

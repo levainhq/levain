@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -320,7 +321,10 @@ def test_g2_an_oversize_message_closes_the_wire_as_a_protocol_fault(daemon, tran
     wire = _open(daemon, transport)
     try:
         wire.start_thread({"cwd": "/tmp"})
-        daemon.conns[-1].send_raw(b"x" * (cw._MAX_MESSAGE + 1))
+        c = daemon.conns[-1]
+        # on its own thread: the wire closes without reading the message through, so the rest never drains
+        threading.Thread(target=_quietly, args=(lambda: c.send_raw(b"x" * (cw._MAX_MESSAGE + 1)),),
+                         daemon=True).start()
         got = _collect(wire, 1, 10.0)
         assert [i.kind for i in got] == ["closed"], got
         assert f"over {cw._MAX_MESSAGE}" in got[0].detail and wire.closed, (got, wire.closed)
@@ -1017,3 +1021,241 @@ def test_g3_a_wake_cannot_write_to_a_descriptor_closed_under_it(daemon, monkeypa
             with contextlib.suppress(OSError):
                 cw.os.close(fd)
         framing.close()
+
+
+# --- the C9 round (W1-W8): the wire's peer runs inside the untrusted slot, so each bound holds against a hostile peer ---
+def _quietly(fn: Callable[[], object]) -> None:
+    with contextlib.suppress(OSError, ValueError):
+        fn()
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_c9_w1_a_call_whose_deadline_passed_before_its_first_byte_sends_nothing_and_fails_alone(daemon, transport):
+    wire = _open(daemon, transport)
+    try:
+        with pytest.raises(CodexError, match="not sent"):
+            wire.call("hooks/list", {}, timeout=0)
+        time.sleep(0.3)                                     # what was sent has reached the daemon by now
+        assert "hooks/list" not in [m for m, _ in daemon.calls], "a timed-out request went out anyway"
+        assert wire.closed is None
+        assert wire.call("hooks/list", {}, timeout=3.0) == {"data": []}
+    finally:
+        wire.close()
+
+
+def test_c9_w1_a_peer_that_takes_every_write_slowly_cannot_stretch_a_send_past_its_deadline():
+    # codex HIGH 1: a peer that always takes a few bytes made every write succeed, and the deadline was read only when
+    # a write made no progress (codex measured a 30 ms deadline completing after 243 ms)
+    peer = fake.TricklePeer(chunk=256, delay=0.001)
+    framing = cw._Framing()
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(CodexError) as got:
+            framing._locked_write(b"x" * (64 << 10), time.monotonic() + 0.03, peer.write, peer.near.fileno())
+        took = time.monotonic() - t0
+        assert not isinstance(got.value, cw._NotStarted), "part of the message went out"
+        assert took < 0.15, f"a 30 ms send ran {took:.3f} s"
+        assert 0 < peer.taken < 64 << 10 and framing._broken
+    finally:
+        peer.close()
+
+
+def _w2_ws_declared(c: fake.Conn) -> None:
+    c.frame(1, b"", declared=1 << 40)                      # a 1 TiB frame declared, then nothing more
+
+
+def _w2_ws_fragments(c: fake.Conn) -> None:
+    c.frame(1, b"{", fin=False)
+    c.frame(0, b"", declared=cw._MAX_MESSAGE)              # the running total crosses the cap, then nothing more
+
+
+def _w2_line(c: fake.Conn) -> None:
+    threading.Thread(target=_quietly, args=(lambda: c.send_bytes(b"x" * (cw._MAX_MESSAGE + 4096)),),
+                     daemon=True).start()                   # no line end, then nothing more
+
+
+@pytest.mark.parametrize("transport,stall", [("ws", _w2_ws_declared), ("ws", _w2_ws_fragments), ("line", _w2_line)])
+def test_c9_w2_an_oversize_message_closes_the_wire_without_waiting_for_its_end(daemon, transport, stall):
+    wire = _open(daemon, transport)
+    try:
+        wire.start_thread({"cwd": "/tmp"})
+        stall(daemon.conns[-1])
+        got = _collect(wire, 1, 5.0)
+        assert [i.kind for i in got] == ["closed"], (got, wire.closed)
+        assert f"over {cw._MAX_MESSAGE}" in got[0].detail, got
+    finally:
+        _within(wire.close, 5.0)
+
+
+_W3_CASES: dict[str, Callable[[fake.Conn, bytes], None]] = {
+    "rsv1 set": lambda c, body: c.frame(0x40 | 1, body),  # the op argument carries the RSV1 bit into byte 0
+    "reserved data opcode": lambda c, body: c.frame(3, body),
+    "reserved data opcode declaring 1 TiB": lambda c, body: c.frame(3, b"", declared=1 << 40),
+    "reserved control opcode": lambda c, body: c.frame(0xB, b"x"),
+    "orphan continuation": lambda c, body: c.frame(0, body),
+    "new message inside a fragmented one": lambda c, body: (c.frame(1, body[:5], fin=False), c.frame(1, body)),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_W3_CASES))
+def test_c9_w3_a_frame_that_breaks_rfc_6455_section_5_closes_the_wire(daemon, case):
+    wire = _open(daemon, "ws")
+    try:
+        tid = wire.start_thread({"cwd": "/tmp"})["thread"]["id"]
+        c = daemon.conns[-1]
+        body = json.dumps({"method": "turn/started", "params": {"threadId": tid, "turn": {"id": "t1"}}}).encode()
+        _W3_CASES[case](c, body)
+        _quietly(lambda: c.notify("turn/started", {"threadId": tid, "turn": {"id": "t2"}}))
+        got = _collect(wire, 1, 5.0)
+        assert [i.kind for i in got] == ["closed"], (got, wire.closed)
+        assert "RFC 6455 section 5" in got[0].detail, got
+    finally:
+        _within(wire.close, 5.0)
+
+
+def _fds() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+def _fds_settle_to(base: int, seconds: float) -> bool:
+    end = time.monotonic() + seconds
+    while _fds() > base and time.monotonic() < end:
+        time.sleep(0.02)
+    return _fds() <= base
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_c9_w4_an_on_inbound_that_never_returns_cannot_keep_the_descriptors_open(daemon, transport):
+    stuck, release = threading.Event(), threading.Event()
+
+    def on_item(item: Inbound) -> None:
+        if item.kind == "notification":
+            stuck.set()
+            release.wait(30.0)
+
+    base = _fds()
+    wire = _open(daemon, transport, on_inbound=on_item)
+    try:
+        tid = wire.start_thread({"cwd": "/tmp"})["thread"]["id"]
+        daemon.conns[-1].notify("turn/started", {"threadId": tid, "turn": {"id": "t1"}})
+        assert stuck.wait(5.0)
+        done, _ = _within(wire.close, 8.0)
+        assert done, "close() hung"
+        assert wire._reader.is_alive(), "the callback was meant to be stuck still"
+        assert _fds_settle_to(base, 3.0), f"{_fds() - base} descriptor(s) still open under a stuck callback"
+    finally:
+        release.set()
+        wire._reader.join(5.0)
+    assert not wire._reader.is_alive() and wire.callback_errors == 0
+
+
+def test_c9_w5_a_writer_holding_the_lock_closes_the_line_write_end_itself_never_under_it(daemon, monkeypatch):
+    wire = _open(daemon, "line")
+    framing = wire._framing
+    wfd = framing._w.fileno()
+    inside, go = threading.Event(), threading.Event()
+    real_write = cw.os.write
+
+    def held_write(fd, data):
+        if fd == wfd and not inside.is_set():
+            inside.set()
+            go.wait(10.0)                                   # a writer descheduled while holding the write lock
+        return real_write(fd, data)
+
+    monkeypatch.setattr(cw.os, "write", held_write)
+    writer = threading.Thread(target=_within, args=(lambda: wire.notify("turn/interrupt", {"threadId": "x",
+                                                                                           "turnId": "y"}), 15.0),
+                              daemon=True)
+    writer.start()
+    try:
+        assert inside.wait(5.0)
+        done, _ = _within(framing.shutdown, 5.0)            # waits _CLOSE_TIMEOUT for the lock, which never frees
+        assert done
+        assert not framing._w.closed, "the write end was closed under a writer holding the write lock"
+        go.set()
+        writer.join(10.0)
+        end = time.monotonic() + 3.0
+        while not framing._w.closed and time.monotonic() < end:
+            time.sleep(0.01)
+        assert framing._w.closed, "the writer did not close the write end as it let go"
+    finally:
+        go.set()
+        _within(wire.close, 5.0)
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_c9_w6_a_send_that_never_got_the_lock_fails_its_call_and_the_wire_stays_up(daemon, transport):
+    # complement MED 1: _NotStarted closed a healthy wire under a slow, legitimate large send
+    wire = _open(daemon, transport)
+    try:
+        t = _stalled_writer(wire, daemon)
+        with pytest.raises(CodexError, match="not sent"):
+            wire.call("hooks/list", {}, timeout=0.5)
+        assert wire.closed is None, wire.closed
+        daemon.reading.set()
+        t.join(15.0)
+        assert not t.is_alive() and wire.closed is None
+        assert wire.call("hooks/list", {}, timeout=3.0) == {"data": []}
+    finally:
+        daemon.reading.set()
+        _within(wire.close, 3.0)
+
+
+def test_c9_w7_the_mask_is_the_rfc_xor_and_a_16_mb_payload_masks_quickly():
+    mask = b"\x01\x80\xfe\x37"
+    for n in (0, 1, 3, 4, 5, 1000):
+        payload = os.urandom(n)
+        assert cw._masked(payload, mask) == bytes(b ^ mask[i % 4] for i, b in enumerate(payload)), n
+    big = b"z" * (16 << 20)
+    t0 = time.monotonic()
+    cw._masked(big, mask)
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_c9_w8_a_failed_arm_or_reader_start_closes_the_framing(daemon, monkeypatch):
+    framing = cw.WsFraming(cx.control_socket(daemon.home))
+
+    def no_arm(on_wake):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(framing, "arm", no_arm)
+    with pytest.raises(OSError):
+        CodexWire.open(framing, timeout=3.0)
+    assert framing._s.fileno() == -1, "the socket was left open"
+
+    class NoThread(CodexWire):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+
+            def no_start():
+                raise RuntimeError("can't start new thread")
+
+            self._reader.start = no_start
+
+    framing = cw.WsFraming(cx.control_socket(daemon.home))
+    with pytest.raises(RuntimeError):
+        NoThread.open(framing, timeout=3.0)
+    assert framing._s.fileno() == -1, "the socket was left open"
+
+
+def test_c9_w8_get_after_the_closed_item_returns_none_at_once(daemon):
+    wire = _open(daemon, "ws")
+    wire.close()
+    got = _collect(wire, 5, 3.0)
+    assert got and got[-1].kind == "closed", got
+    done, after = _within(lambda: wire.get(None), 2.0)
+    assert done and after is None, "get(None) blocked after the closed item"
+
+
+def test_c9_w8_a_null_thread_id_is_absent_only_where_the_schema_does_not_require_it(daemon):
+    wire = _open(daemon, "ws")
+    try:
+        wire.start_thread({"cwd": "/tmp"})
+        c = daemon.conns[-1]
+        c.request("account/chatgptAuthTokens/refresh", {"reason": "unauthorized", "threadId": None}, 5)
+        c.notify("turn/started", {"threadId": None, "turn": {"id": "t1"}})
+        got = _collect(wire, 2)
+        assert [(i.kind, i.thread_id) for i in got] == [("request", None), ("unparseable", None)], got
+        assert not got[0].answered and "not a string" in got[1].detail
+    finally:
+        wire.close()
