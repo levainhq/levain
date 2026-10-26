@@ -47,13 +47,6 @@ ROOT = str(Path(wall.__file__).resolve().parents[2])
 SESSION = "s-00000000000000aa"
 
 
-@pytest.fixture(autouse=True)
-def _vendor_installed(monkeypatch):
-    """A test store has no vendor prefix: start's vendor check passes here (test_slot_vendorbin.py tests it)."""
-    import levain.slot.start as _start
-    monkeypatch.setattr(_start, "vendor_ready", lambda host, vendor: None)
-
-
 @pytest.fixture
 def env(tmp_path):
     return _world(tmp_path)

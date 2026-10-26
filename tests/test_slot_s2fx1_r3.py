@@ -34,13 +34,6 @@ from tests.test_slot_s2k2a_launch import _no_active, scripted
 
 # --- g1-N1: create_at's temp is the writer's own ---------------------------------------------------------------------
 
-@pytest.fixture(autouse=True)
-def _vendor_installed(monkeypatch):
-    """A test store has no vendor prefix: start's vendor check passes here (test_slot_vendorbin.py tests it)."""
-    import levain.slot.start as _start
-    monkeypatch.setattr(_start, "vendor_ready", lambda host, vendor: None)
-
-
 def test_two_writers_of_one_name_never_touch_each_others_temp(tmp_path):
     """codex HIGH: both writers used ``name.new``; the second unlinked the first's live temp. Here writer B runs
     whole while writer A sits between its write and its link: B's record lands intact, A then meets an EXISTING

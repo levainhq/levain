@@ -34,13 +34,6 @@ E0 = SlotId("egress", 0)
 S0, GW0 = 899, 898          # World's _levain_s0 / _levain_gw0
 
 
-@pytest.fixture(autouse=True)
-def _vendor_installed(monkeypatch):
-    """A test store has no vendor prefix: start's vendor check passes here (test_slot_vendorbin.py tests it)."""
-    import levain.slot.start as _start
-    monkeypatch.setattr(_start, "vendor_ready", lambda host, vendor: None)
-
-
 class Clock:
     def __init__(self) -> None:
         self.t = 1000.0

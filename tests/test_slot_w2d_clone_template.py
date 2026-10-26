@@ -33,13 +33,6 @@ GENV = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL"
 FILES = {".gitattributes": b"* ident\n*.txt eol=crlf\n", "id.txt": b"$Id$\nline1\nline2\n", "plain": b"plain\n"}
 
 
-@pytest.fixture(autouse=True)
-def _vendor_installed(monkeypatch):
-    """A test store has no vendor prefix: start's vendor check passes here (test_slot_vendorbin.py tests it)."""
-    import levain.slot.start as _start
-    monkeypatch.setattr(_start, "vendor_ready", lambda host, vendor: None)
-
-
 def _git(*args, cwd, inp=None):
     r = subprocess.run(["/usr/bin/git", *args], cwd=cwd, env={**GENV, "HOME": str(cwd)}, input=inp,
                        capture_output=True, timeout=60)

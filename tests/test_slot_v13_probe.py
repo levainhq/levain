@@ -24,13 +24,6 @@ S = "s-0123456789abcdef"
 SLOTS = {"egress": 3, "none": 1}
 
 
-@pytest.fixture(autouse=True)
-def _vendor_installed(monkeypatch):
-    """A test store has no vendor prefix: start's vendor check passes here (test_slot_vendorbin.py tests it)."""
-    import levain.slot.start as _start
-    monkeypatch.setattr(_start, "vendor_ready", lambda host, vendor: None)
-
-
 def _refused(fn, *a, **kw) -> str:
     with pytest.raises(Refused) as e:
         fn(*a, **kw)
