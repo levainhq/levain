@@ -2267,7 +2267,9 @@ class ChatService:
             except Exception:  # noqa: BLE001 - the latch is the record; the item is its pointer, filed next sweep
                 continue
             with self._guard:
-                self._filed.setdefault(launch_id, set()).add(key)
+                # cached only while attached (detach drops it): a launch with no session asks the filer each time
+                if launch_id in self._sessions:
+                    self._filed.setdefault(launch_id, set()).add(key)
 
     def mark(self, message_id: str, delivered: bool, owner: str) -> str:
         """§7.4: you resolve an ambiguous send, delivered or not. ``owner`` is the authenticated client."""
