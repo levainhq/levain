@@ -36,7 +36,7 @@ from levain.slot.grammar import INDEX_SPACE, SESSION_RE, SLOT_CLASSES
 # --- §5.1 verbs and enums -------------------------------------------------------------------------
 
 VERBS = ("prepare", "render", "start", "resume", "teardown", "confirm-identity",
-         "adopt-open", "adopt-verify", "discard", "restore", "status")
+         "adopt-open", "adopt-verify", "discard", "restore", "status", "probe")
 
 KINDS = ("interactive", "login", "dispatch", "planner", "verifier")   # §5.1 prepare
 VENDORS = ("claude", "codex")                                          # §5.1 prepare, §5.3 vendor
@@ -47,8 +47,10 @@ BUNDLE_DIGEST_FLAG = "--bundle-digest"
 _BUNDLE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}", re.ASCII)
 
 #: §5.1 Lease column: these verbs run on a live lease (prepare's is the stdin nonce); the rest are
-#: lease-free (adopt-open, adopt-verify, discard, restore are caller-bound; status is read-only).
-LEASE_VERBS = frozenset({"prepare", "render", "start", "resume", "teardown", "confirm-identity"})
+#: lease-free (adopt-open, adopt-verify, discard, restore are caller-bound; status is read-only). ``probe`` (V13, the
+#: firewall self-probe) is a lease verb by this column only: ``needs_lease`` is metadata, and the handler takes its own
+#: fence (:mod:`levain.slot.probe`).
+LEASE_VERBS = frozenset({"prepare", "render", "start", "resume", "teardown", "confirm-identity", "probe"})
 
 #: §5.1 verbs that read a stdin blob; every other verb takes none ("—").
 STDIN_VERBS = frozenset({"prepare", "render"})
@@ -56,10 +58,12 @@ STDIN_VERBS = frozenset({"prepare", "render"})
 OPERATOR, DISPATCH = "operator", "dispatch"
 CALLERS = (OPERATOR, DISPATCH)
 
-#: §5.1 the ``_levain_dispatch`` rule: every verb except these four. ``adopt-verify`` is NOT excepted (c7.10 fix1
+#: §5.1 the ``_levain_dispatch`` rule: every verb except these. ``adopt-verify`` is NOT excepted (c7.10 fix1
 #: F2, head 1022+20 Q1): dispatch's consumer verifies a dispatch-class session's artifact; the verb layer splits the
 #: caller check by class (``runtime_helper.verify_caller``).
-DISPATCH_FORBIDDEN = frozenset({"adopt-open", "discard", "restore", "confirm-identity"})
+#: DECISION (V13 rev 2 §1): ``probe`` is forbidden to dispatch until a dispatch session launches (2f), so
+#: ``sudoers.DISPATCH_VERBS`` stays as installed and no sudoers re-install is needed for the new verb.
+DISPATCH_FORBIDDEN = frozenset({"adopt-open", "discard", "restore", "confirm-identity", "probe"})
 
 #: DECISION (narrowest reading of §3.1 + §3.5): the operator's leases carry no ticket, so the operator
 #: prepares only the operator kinds; ``_levain_dispatch`` prepares only the ticketed kinds (ticket kinds
@@ -275,7 +279,7 @@ def parse_runtime_argv(argv: Sequence[str], *, configured_slots: SlotConfig, cal
         if not _BUNDLE_DIGEST_RE.fullmatch(rest[2]):
             raise Refused("bad-token", f"bundle digest: {rest[2][:80]!r}")
         return RuntimeRequest(verb, caller, session=session, bundle_digest=rest[2])
-    # render, start, resume, teardown, adopt-open, discard, restore: exactly <session>.
+    # render, start, resume, teardown, adopt-open, discard, restore, probe: exactly <session>.
     # DECISION: §5.1's "`discard` / `restore <session>`" row reads as both taking <session>.
     _arity(verb, rest, 1, 1)
     return RuntimeRequest(verb, caller, session=_session(rest[0]))
