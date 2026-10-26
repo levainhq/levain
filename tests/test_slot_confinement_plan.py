@@ -174,10 +174,8 @@ Type=simple
 User=_levain_dispatch
 Group=_levain_dispatch
 ExecStart=/usr/bin/python3 -IS /usr/libexec/levain/service-entry dispatch
-Restart=always
-RestartSec=1
-RestartSteps=5
-RestartMaxDelaySec=30
+Restart=on-failure
+RestartSec=5
 RestartPreventExitStatus=78
 
 [Install]
@@ -189,7 +187,8 @@ TABLE_1_3 = {
     "control": ("_levain_control", (), "always", "com.levain.control", "levain-control.service"),
     "keys": ("_levain_keys", ("control",), "always", "com.levain.keys", "levain-keys.service"),
     "qbroker": ("_levain_qbroker", ("control",), "always", "com.levain.qbroker", "levain-qbroker.service"),
-    "dispatch": ("_levain_dispatch", ("control", "keys"), "always", "com.levain.dispatch", "levain-dispatch.service"),
+    "dispatch": ("_levain_dispatch", ("control", "keys"), "on-failure", "com.levain.dispatch",
+                 "levain-dispatch.service"),
     "reaper": ("root", ("control",), "always", "com.levain.reaper", "levain-reaper.service"),
     "pf": ("root", (), "one-shot", "com.levain.pf", None),
 }
@@ -214,10 +213,14 @@ def test_service_units_golden():
             continue
         text = units.systemd_unit_text(s)
         assert units.systemd_name(s) == unit
-        assert f"User={uid}\n" in text and "Restart=always\n" in text
+        assert f"User={uid}\n" in text and f"Restart={restart}\n" in text
         assert f"ExecStart=/usr/bin/python3 -IS /usr/libexec/levain/service-entry {name}\n" in text
-        # §23 item 8: a failing service backs off instead of looping at 1 Hz
-        assert "RestartSteps=5\n" in text and "RestartMaxDelaySec=30\n" in text
+        if restart == "always":
+            # §23 item 8: a failing service backs off instead of looping at 1 Hz
+            assert "RestartSteps=5\n" in text and "RestartMaxDelaySec=30\n" in text
+        else:
+            # §1.3's dispatch cell: on-failure, RestartSec=5
+            assert "RestartSec=5\n" in text and "RestartSteps=" not in text
         deps = " ".join(TABLE_1_3[a][4] for a in after)
         assert (f"After={deps}\n" in text) if after else ("After=" not in text)
 
