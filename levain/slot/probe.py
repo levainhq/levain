@@ -81,6 +81,7 @@ NOT_PROBEABLE = "not-probeable"
 
 RECORD_NAME = "probe"
 RECORD_FORMAT = "levain-probe-result/1"
+RECORD_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"      # the record's ``at``, UTC (doctor parses it with this)
 #: the refusals that are a verdict about the wall (recorded), by name or by base name
 _RECORDED = {OPEN: "open", INCONCLUSIVE: "inconclusive", UNKNOWN: "unknown"}
 
@@ -344,7 +345,7 @@ def _run(ctx: H.Ctx, a: R.Alloc) -> Dict[str, object]:
 
 def _record(ctx: H.Ctx, a: R.Alloc, outcome: str, cause: str) -> None:
     """N10: the slot's last-probe record, root 0644, replaced whole. A failed write is noted, never the answer."""
-    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ctx.seams.clock()))
+    stamp = time.strftime(RECORD_AT_FORMAT, time.gmtime(ctx.seams.clock()))
     data = canon.canonical_bytes({"format": RECORD_FORMAT, "at": stamp, "session": a.session,
                                   "outcome": outcome, "cause": cause})
     try:
@@ -369,5 +370,6 @@ def probe(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     return answer
 
 
-__all__ = ["MAX_PROBE_ADDRS", "PROBE_HOSTS", "PROBE_REAP_S", "ProbeSeams", "RECORD_FORMAT", "RESOLVE_S",
+__all__ = ["MAX_PROBE_ADDRS", "PROBE_HOSTS", "PROBE_REAP_S", "ProbeSeams", "RECORD_AT_FORMAT", "RECORD_FORMAT",
+           "RESOLVE_S",
            "parse_result", "probe", "probe_hosts", "resolve", "session_route", "verdict"]

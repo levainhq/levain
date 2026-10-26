@@ -478,9 +478,14 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
             return [CheckResult("agent sessions", False, f"partially installed: no slots directory at {store}",
                                 "The isolation install is incomplete; its install helper repairs it.")]
         rows = _slot_rows(store, layout, R, Refused)
-        rows += _probe_rows(store, R, Refused, time.time() if now is None else now)
     except OSError as exc:
         rows = [CheckResult("agent slots", True, f"could not be read ({_slot_why(exc)})", warn=True)]
+    else:
+        try:
+            rows += _probe_rows(store, R, Refused, time.time() if now is None else now)
+        except OSError as exc:
+            rows.append(CheckResult("agent firewall probe", True, f"could not be read ({_slot_why(exc)})",
+                                    warn=True))
 
     try:
         free = (free_bytes if free_bytes is not None
@@ -558,10 +563,15 @@ def _age_text(s: float) -> str:
 
 
 def _probe_one(path: Path, now: float, R: Any, Refused: Any) -> tuple[int, str]:
-    """(level, words) for one slot's record: level 0 ok, 1 not probed yet, 2 warn, 3 bad."""
+    """(level, words) for one slot's record: level 0 ok, 1 not probed yet, 2 warn, 3 bad. The stamp is parsed with
+    the writer's own format (``levain.slot.probe.RECORD_AT_FORMAT``) and must spell back to itself; an ``open``
+    record is a failure whatever its stamp says (a stamp anomaly is appended); the record's text is marked before
+    it is shown."""
     import calendar
 
+    from levain import unshowable
     from levain.contracts import ContractError, canon
+    from levain.slot import probe as P
 
     try:
         raw = R.read_record(path, max_bytes=_SLOT_RECORD_CAP)
@@ -574,15 +584,21 @@ def _probe_one(path: Path, now: float, R: Any, Refused: Any) -> tuple[int, str]:
         if type(rec) is not dict or set(rec) != _PROBE_KEYS or rec["format"] != _PROBE_RECORD_FORMAT \
                 or rec["outcome"] not in _PROBE_OUTCOMES or not all(type(rec[k]) is str for k in _PROBE_KEYS):
             raise ValueError("shape")
-        at = calendar.timegm(time.strptime(rec["at"], "%Y-%m-%dT%H:%M:%SZ"))
+        parsed = time.strptime(rec["at"], P.RECORD_AT_FORMAT)
+        if time.strftime(P.RECORD_AT_FORMAT, parsed) != rec["at"]:
+            raise ValueError("at")
+        at = calendar.timegm(parsed)
     except (ContractError, ValueError, OverflowError):
         return 2, "record unreadable (not a levain-probe-result/1 record)"
-    age, sess, outcome, cause = now - at, rec["session"][:64], rec["outcome"], rec["cause"][:96]
-    if age < -_PROBE_SKEW_S:
+    age, outcome = now - at, rec["outcome"]
+    sess, cause = unshowable.mark(rec["session"][:64], allow=""), unshowable.mark(rec["cause"][:96], allow="")
+    future = age < -_PROBE_SKEW_S
+    if outcome == "open":
+        when = f"stamped in the future ({rec['at']})" if future else f"{_age_text(age)} ago"
+        return 3, f"OPEN at its last probe, {when}: the slot reached a vendor address (session {sess})"
+    if future:
         return 2, f"stamped in the future ({rec['at']}; session {sess})"
     when = f"{_age_text(age)} ago"
-    if outcome == "open":
-        return 3, f"OPEN at its last probe {when}: the slot reached a vendor address (session {sess})"
     if outcome != "closed":
         return 2, f"{outcome} ({cause}) {when} (session {sess})"
     if age > _PROBE_STALE_S:
@@ -596,7 +612,7 @@ def _probe_rows(store: Path, R: Any, Refused: Any, now: float) -> list[CheckResu
     macOS, its re-probes) found. OPEN is a failure; unknown, inconclusive, unreadable and stale results warn; a slot
     never probed is said so and never read as healthy. No egress slot in service: no row."""
     found, _ignored = _read_slot_dirs(store / "slots")
-    tags = [t for t, v in sorted(found.items()) if t[0] == "e" and v[0] not in R.OUT_OF_SERVICE]
+    tags = [t for t, v in sorted(found.items()) if t.startswith("e") and v[0] not in R.OUT_OF_SERVICE]
     if not tags:
         return []
     per = [(t, *_probe_one(store / "slots" / t / _PROBE_RECORD_NAME, now, R, Refused)) for t in tags]
