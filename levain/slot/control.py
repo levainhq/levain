@@ -613,10 +613,12 @@ class _Pending:
 
 def _keys_status_answer(ans: Mapping[str, object]) -> dict[str, object]:
     """keys' ``STATUS`` answer, exactly ``{ledger_bytes: uint | null, routes: [[host, name]..], routes_problem: str |
-    null}``, or ``Refused("keys-answer")``."""
-    if set(ans) != {"ledger_bytes", "routes", "routes_problem"}:
+    null, routes_truncated: uint}``, or ``Refused("keys-answer")``."""
+    if set(ans) != {"ledger_bytes", "routes", "routes_problem", "routes_truncated"}:
         raise Refused("keys-answer", "fields")
-    size, routes, problem = ans["ledger_bytes"], ans["routes"], ans["routes_problem"]
+    size, routes, problem, cut = ans["ledger_bytes"], ans["routes"], ans["routes_problem"], ans["routes_truncated"]
+    if type(cut) is not int or cut < 0:
+        raise Refused("keys-answer", "routes_truncated")
     if size is not None and (type(size) is not int or size < 0):
         raise Refused("keys-answer", "ledger_bytes")
     if type(routes) is not list or any(type(r) is not list or len(r) != 2 or any(type(x) is not str or not x for x in r)
@@ -624,7 +626,7 @@ def _keys_status_answer(ans: Mapping[str, object]) -> dict[str, object]:
         raise Refused("keys-answer", "routes")
     if problem is not None and type(problem) is not str:
         raise Refused("keys-answer", "routes_problem")
-    return {"ledger_bytes": size, "routes": routes, "routes_problem": problem}
+    return {"ledger_bytes": size, "routes": routes, "routes_problem": problem, "routes_truncated": cut}
 
 
 class KeysAdmin:
@@ -1620,11 +1622,13 @@ class Control:
         """3c-9 session D: keys' ``STATUS`` on its admin wire (:class:`KeysAdmin`), for the operator, whose account
         cannot open keys' 0700 directory: the reservation ledger's size and the brokered ``[host, credential name]``
         pairs keys serves. Only that shape is passed on (anything else is ``keys-answer``), so no other field keys
-        might send reaches the operator; with no keys admin client, or no answer, ``keys-unavailable``."""
+        might send reaches the operator; with no keys admin client, no live connection, or no answer,
+        ``keys-unavailable``. An operator's read never opens the admin connection (``connect=False``): a connect
+        is keys' preemption point and a failed one backs off every verb behind it (L3 r1 K4)."""
         if self.keys_admin is None:
             raise Refused("keys-unavailable")
         try:
-            ans = self.keys_admin.call("STATUS")
+            ans = self.keys_admin.call("STATUS", connect=False)
         except AdminRefused as e:
             raise Refused("keys-unavailable", e.name) from None
         return _keys_status_answer(ans)

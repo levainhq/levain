@@ -178,6 +178,11 @@ RUN_KINDS = frozenset({"dispatch", "planner", "verifier"})
 PREEMPT_WAIT_S = 2.0
 #: `levain-control/1`'s frame cap, which the admin wire shares.
 ADMIN_FRAME_MAX = 64 * 1024
+#: the most bytes STATUS's answer (its canonical JSON, `id` and `ok` included) may take: half the frame cap, so CONTROL
+#: re-wraps the same fields for the operator inside its own frame of the same cap. A list that does not fit is cut
+#: from its end and the cut counted, because a frame past the cap makes CONTROL's reader close the admin connection,
+#: and that EOF revokes every session registered on it (L3 r1 K1).
+STATUS_ANSWER_MAX = ADMIN_FRAME_MAX // 2
 #: once an admin frame's first byte is in, the rest of its length and its body must arrive within this, and an
 #: answer's write must drain within it (the connection idles legitimately only BETWEEN frames).
 ADMIN_FRAME_S = 10.0
@@ -2594,7 +2599,8 @@ class Keys:
         host, credential name]` pairs keys would serve now, sorted: the base map's (a base id that is also a dispatch
         id is refused at use by `_route_policy`, so it is not one) and each dispatch generation's whose pin rule
         (`KeysRoutes.policy`) holds. `routes_problem`: why a part of that set cannot be told (that part is then left
-        out, as keys refuses it), else None."""
+        out, as keys refuses it), else None. `routes_truncated`: how many pairs past STATUS_ANSWER_MAX were left off
+        the end of `routes`."""
         size = None
         if self.ledger is not None:
             try:
@@ -2625,8 +2631,9 @@ class Keys:
                     except (RouteRefused, KeyError):
                         continue
                     pairs |= _brokered([pol])
-        return {"ledger_bytes": size, "routes": sorted([h, c] for h, c in pairs),
-                "routes_problem": "; ".join(problems) or None}
+        out = {"ledger_bytes": size, "routes": sorted([h, c] for h, c in pairs),
+               "routes_problem": "; ".join(problems) or None, "routes_truncated": 0}
+        return _within_budget(out, "routes", "routes_truncated")
 
     def _dispatch_policy(self, route: str, pin: Optional["routemaps.Pin"]) -> Optional[RoutePolicy]:
         """The dispatch map's policy for `route` under the session's `pin` (R4 §2's three-part rule,
@@ -3094,6 +3101,20 @@ class Keys:
             if ftype in (b"E", b"X"):
                 return
             got += len(payload)
+
+
+def _within_budget(out: dict, key: str, count: str) -> dict:
+    """`out` with its list `out[key]` cut from the end until the whole answer, framed as the largest `id` and `ok`
+    would frame it, is within STATUS_ANSWER_MAX; `out[count]` is how many were cut."""
+    items = out[key]
+    fixed = len(canon.canonical_bytes({**out, "id": JSON_INT_MAX, "ok": True, key: [], count: len(items)}))
+    kept = 0
+    for it in items:
+        fixed += len(canon.canonical_bytes(it)) + 1   # the item and its comma
+        if fixed > STATUS_ANSWER_MAX:
+            break
+        kept += 1
+    return {**out, key: items[:kept], count: len(items) - kept}
 
 
 def _brokered(policies: object) -> Set[Tuple[str, str]]:

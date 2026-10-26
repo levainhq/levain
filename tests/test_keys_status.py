@@ -71,7 +71,8 @@ def test_keys_status_answers_the_ledger_size_and_the_routes_it_serves():
     finally:
         shutil.rmtree(d, ignore_errors=True)
     assert ans == {"id": 7, "ok": True, "ledger_bytes": size,
-                   "routes": [["api.example.com", "c1"], ["openrouter.ai", "or1"]], "routes_problem": None}
+                   "routes": [["api.example.com", "c1"], ["openrouter.ai", "or1"]], "routes_problem": None,
+                   "routes_truncated": 0}
     assert _ADM._SECRET.encode() not in K.encode_admin(ans)        # names only, never a credential's bytes
 
 
@@ -156,14 +157,14 @@ def _ask(ctl, uid, **args) -> dict:
     return ctl.handle(C.Conn(uid), {"v": 1, "op": "KEYS-STATUS", "id": 9, **args})
 
 
-GOOD = {"ledger_bytes": 120, "routes": [["openrouter.ai", "or1"]], "routes_problem": None}
+GOOD = {"ledger_bytes": 120, "routes": [["openrouter.ai", "or1"]], "routes_problem": None, "routes_truncated": 0}
 
 
 def test_control_relays_keys_status_to_the_operator_only(tmp_path):
     admin = _Admin(GOOD)
     ctl = _control(tmp_path, admin)
     assert _ask(ctl, OPERATOR) == {"id": 9, "ok": True, **GOOD}
-    assert admin.calls == [("STATUS", {})]
+    assert admin.calls == [("STATUS", {"connect": False})]
     for uid in (QBROKER, 777, 0):               # every other peer, root included, as for every operator verb
         assert _ask(ctl, uid)["refused"] == "verb-not-allowed-for-peer"
     assert _ask(ctl, OPERATOR, key_limits=True)["refused"] == "unknown-key"
@@ -202,12 +203,13 @@ def test_doctor_spend_ledger_row_shows_keys_report_or_stays_held(tmp_path):
     try:
         shown = D._check_spend_ledger(store, keys_status=lambda: dict(GOOD))
         held = D._check_spend_ledger(store, keys_status=lambda: None)
+        keys_said_none = D._check_spend_ledger(store, keys_status=lambda: {**GOOD, "ledger_bytes": None})
     finally:
         (store / "keys").chmod(0o700)
     assert shown.ok and not shown.warn and "120 bytes" in shown.detail and "as keys reports" in shown.detail
     assert held.neutral and held.detail.startswith("held by keys")
-    keys_said_none = D._check_spend_ledger(store, keys_status=lambda: {**GOOD, "ledger_bytes": None})
     assert "120" not in keys_said_none.detail                       # never a number keys did not give
+    assert keys_said_none.neutral and "keys could not tell" in keys_said_none.detail   # not "held": keys answered
 
 
 @needs_non_root
@@ -233,32 +235,17 @@ def test_doctor_asks_control_once_and_any_failure_is_none(tmp_path, monkeypatch)
 
     calls = []
 
-    class _Client:
-        def __init__(self, path, *, timeout):
-            calls.append((str(path), timeout))
+    def fake(run_dir, deadline):
+        calls.append((run_dir, deadline - D._clock()))
+        return dict(GOOD)
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return None
-
-        def call(self, op, **f):
-            assert op == "KEYS-STATUS" and not f
-            return dict(GOOD)
-
-    monkeypatch.setattr("levain.slot.control_client.ControlClient", _Client)
+    monkeypatch.setattr(D, "_ask_keys_status", fake)
     ask = D._keys_status_asker(tmp_path / "run", 5)
     assert ask() == GOOD and ask() == GOOD and len(calls) == 1
-    assert calls[0][0] == str(tmp_path / "run" / "control" / "control.sock") and 0 < calls[0][1] <= 5
-
-    class _Down(_Client):
-        def __init__(self, path, *, timeout):
-            raise Refused("control-down", str(path))
-
-    monkeypatch.setattr("levain.slot.control_client.ControlClient", _Down)
-    assert D._keys_status_asker(tmp_path / "run", 5)() is None
-    assert D._keys_status_asker(tmp_path / "run", 0)() is None      # no time to ask: not asked
+    assert calls[0][0] == tmp_path / "run" and 0 < calls[0][1] <= 5
+    monkeypatch.undo()
+    assert D._keys_status_asker(tmp_path / "run", 5)() is None      # no CONTROL socket there
+    assert D._ask_keys_status(tmp_path / "run", D._clock()) is None  # no time left: nothing is asked
 
 
 # --- the whole path ------------------------------------------------------------------------------------------------
@@ -297,6 +284,7 @@ def test_doctor_reads_keys_status_through_a_real_control_and_a_real_keys():
     server = C.ControlServer(control, d / "run" / "control" / "control.sock")
     server.start()
     try:
+        admin.call("STATUS")   # CONTROL's wire to keys is up (on an install the attach RELOAD or a MINT opens it)
         told = D._ask_keys_status(d / "run", D._clock() + 5)
         size = os.stat(d / "keys" / "ledger.jsonl").st_size
 
@@ -312,5 +300,147 @@ def test_doctor_reads_keys_status_through_a_real_control_and_a_real_keys():
         t.join(10)
         shutil.rmtree(d, ignore_errors=True)
     assert told == {"ledger_bytes": size, "routes": [["api.example.com", "c1"], ["openrouter.ai", "or1"]],
-                    "routes_problem": None}
+                    "routes_problem": None, "routes_truncated": 0}
     assert gone is None
+
+
+# --- L3 r1 fixes (K1-K4) -------------------------------------------------------------------------------------------
+
+class _ManyRoutes(_Routes):
+    """codex's K1 construction: 256 dispatch routes, each a 251-character host and a 48-character credential name."""
+
+    def __init__(self, n: int = 256) -> None:
+        self._ids = frozenset(f"d{i}" for i in range(n))
+        self._pol = {f"d{i}": SimpleNamespace(type="brokered", credential=f"{i:03d}".ljust(48, "c"),
+                                              upstream=SimpleNamespace(host=f"{i:03d}".ljust(251, "h")))
+                     for i in range(n)}
+        self.maps = {1: SimpleNamespace(routes=dict(self._pol), digests={r: "a" for r in self._pol})}
+
+    def policy(self, route, pin):
+        return self._pol[route]
+
+
+def test_keys_status_answer_stays_inside_its_budget_and_says_what_it_left_out():
+    # K1: unbounded, this answer is past the admin wire's frame cap, and CONTROL's reader closing the shared admin
+    # connection on it revokes every session
+    many = _ManyRoutes()
+    whole = [[p.upstream.host, p.credential] for p in many._pol.values()]
+    assert len(K.canon.canonical_bytes(whole)) > K.ADMIN_FRAME_MAX
+    d = _lib()
+    try:
+        ans, _size = asyncio.run(_status_of(d, routes=many))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert K.STATUS_ANSWER_MAX < K.ADMIN_FRAME_MAX
+    assert len(K.encode_admin(ans)) - 4 <= K.STATUS_ANSWER_MAX
+    shown = len(ans["routes"])
+    assert 0 < shown < 257 and ans["routes_truncated"] == 257 - shown      # 256 dispatch pairs + the base map's c1
+    assert ans["routes"] == sorted(ans["routes"])                          # the kept ones are the sorted list's head
+    relayed = C._keys_status_answer({k: v for k, v in ans.items() if k not in ("id", "ok")})
+    assert len(C.encode_frame({**relayed, "v": 1, "id": 2 ** 53 - 1, "ok": True})) <= C.FRAME_MAX
+
+
+@needs_non_root
+def test_doctor_says_when_keys_left_routes_out(tmp_path):
+    from levain import doctor as D
+
+    store = _held_store(tmp_path)
+    try:
+        pairs, row = D._dispatch_pairs(store, D._clock() + 5,
+                                       keys_status=lambda: {**GOOD, "routes_truncated": 3})
+    finally:
+        (store / "keys").chmod(0o700)
+    assert pairs == {("openrouter.ai", "or1")} and row.warn and "3 more" in row.detail
+
+
+@needs_non_root
+def test_doctor_takes_keys_route_set_whole_when_it_cannot_read_keys_head(tmp_path):
+    # K2: base.json's `r` names c1, but `r` is also a dispatch id, so keys refuses it and its STATUS leaves c1 out: the
+    # operator's own read of base.json must not add it back
+    from levain import doctor as D
+
+    store = tmp_path / "L"
+    _ADM._frame_lib(str(store))
+    (store / "keys" / "ledger.jsonl").write_bytes(b"")
+    (store / "keys").chmod(0)
+    try:
+        rows = D._check_invoice_ceiling(store, None, keys_status=lambda: dict(GOOD))
+    finally:
+        (store / "keys").chmod(0o700)
+    names = [r.name for r in rows]
+    assert not any("c1" in n for n in names), names
+    assert "invoice ceiling (or1)" in names
+
+
+def test_doctor_keys_status_ask_has_one_total_deadline(tmp_path):
+    # K3: a CONTROL that answers one byte at a time, each inside a per-operation timeout, must not hold the ask past
+    # its one deadline
+    import pathlib
+    import threading
+    import time as _t
+    from levain import doctor as D
+
+    run = tempfile.mkdtemp(prefix="kd", dir="/tmp")
+    os.makedirs(os.path.join(run, "control"))
+    path = os.path.join(run, "control", "control.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+    stop = threading.Event()
+
+    def serve() -> None:
+        c, _ = srv.accept()
+        with c:
+            C.read_frame(c)
+            frame = C.encode_frame({**GOOD, "id": 1, "ok": True})
+            for i in range(len(frame)):
+                if stop.wait(0.2):
+                    return
+                try:
+                    c.sendall(frame[i:i + 1])
+                except OSError:
+                    return
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        t0 = _t.monotonic()
+        told = D._ask_keys_status(pathlib.Path(run), D._clock() + 1.0)
+        took = _t.monotonic() - t0
+    finally:
+        stop.set()
+        t.join(5)
+        srv.close()
+        shutil.rmtree(run, ignore_errors=True)
+    assert told is None and took < 1.5
+
+
+def test_control_keys_status_never_opens_the_admin_connection(tmp_path):
+    # K4 (complement MED 1): an operator read must not open (or back off) CONTROL's authority wire to keys
+    admin = C.KeysAdmin(tmp_path / "no-keys.sock", answer_s=0.5, window_s=1.0)
+    ctl = _control(tmp_path, admin)
+    assert _ask(ctl, OPERATOR)["refused"] == "keys-unavailable"
+    assert not admin.connected() and admin._retry_at == 0.0          # no connect was tried, so no backoff was set
+
+
+def test_doctor_slot_keys_rows_for_an_unknown_host_are_none():
+    from levain import doctor as D
+
+    assert D._check_slot_keys(host="plan9") == []
+
+
+def test_doctor_root_read_leaves_out_a_base_route_a_dispatch_id_shadows(tmp_path, monkeypatch):
+    # K2's class on the path that reads keys' head itself: base `anthropic` is also a dispatch id, so keys refuses it
+    from tests import test_doctor_3c9_rows as T
+    from levain.slot import vendor_routes as VR
+
+    store = T._store(tmp_path)
+    T._base(store, [VR.anthropic_route()])
+    T._cred(store, "orkey", "openrouter.ai")
+    (store / "keys").mkdir(exist_ok=True)
+    (store / "keys" / "routemap.head").write_text("x")
+    checked = T._checked(1, {"anthropic": T._FakeRoute("openrouter.ai", "orkey")})
+    monkeypatch.setattr(routemaps.KeysRoutes, "load", lambda self: (T._head(1), {1: checked}, None))
+    rows = T._rows(store, fetch=T._ok_fetch())
+    assert "invoice ceiling (orkey)" in rows
+    assert not any("anthropic" in n for n in rows), sorted(rows)
