@@ -567,3 +567,20 @@ class TestMaxSecondsErrorNamesTheFlagYouTyped:
             "a consolidate bound is validated without naming its own flag, so the error will "
             f"say --max-seconds: {offenders}"
         )
+
+
+def test_cli_install_feeds_defaults_match_the_daemon_module():
+    """The same drift-lock for `daemon install-feeds`: its label and interval are literals."""
+    from levain import daemon
+
+    seen: dict[str, object] = {}
+
+    def capture(args):
+        seen.update(vars(args))
+        return 0
+
+    with mock.patch("levain.cli._cmd_daemon_install_feeds", side_effect=capture):
+        main(["daemon", "install-feeds"])
+    assert seen["label"] == daemon.DEFAULT_FEEDS_LABEL
+    assert seen["interval"] == daemon.DEFAULT_FEEDS_INTERVAL
+    assert seen["max_seconds"] is None

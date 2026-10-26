@@ -1196,6 +1196,29 @@ def main(argv: list[str] | None = None) -> int:
                         help="Show what would be installed + the true live state; change nothing.")
     d_seat.set_defaults(func=_cmd_daemon_install_seat)
 
+    d_feeds = daemon_sub.add_parser(
+        "install-feeds",
+        help="Install the review-feed runner on a schedule (no model; manage it with its label).",
+        description=(
+            "Run `levain coord review feeds` on a cadence: the mechanical feeds and the delivery pass that file the "
+            "review queue's items. A periodic unit, not kept alive, not started at install. Each run takes a lock, so "
+            "a run that outlives the interval, or a manual one, is skipped rather than doubled; each run is "
+            "wall-clock bounded. Manage it with the same label: `daemon status|restart|uninstall --label <label>`."
+        ),
+    )
+    d_feeds.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
+                         help="The consent queue's directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
+    d_feeds.add_argument("--interval", type=int, default=300,
+                         help="Seconds between runs (default: 300).")
+    d_feeds.add_argument("--max-seconds", type=float, default=None, dest="max_seconds",
+                         help="Wall-clock bound per run (default: 120; 0 disables it, and a hung run then stops "
+                              "every later one).")
+    d_feeds.add_argument("--label", default="com.levainhq.levain.feeds",
+                         help="Service label (default: com.levainhq.levain.feeds).")
+    d_feeds.add_argument("--dry-run", action="store_true", dest="dry_run",
+                         help="Show what would be installed + the true live state; change nothing.")
+    d_feeds.set_defaults(func=_cmd_daemon_install_feeds)
+
     d_uninstall = daemon_sub.add_parser(
         "uninstall", help="Stop + remove the autostart (no-op if absent).",
     )
@@ -4236,6 +4259,55 @@ def _print_bound_cadence_notes(
             "--max-seconds unless something\n"
             "    else bounds this process."
         )
+
+
+def _cmd_daemon_install_feeds(args: argparse.Namespace) -> int:
+    from levain import daemon
+
+    provider, err = _daemon_provider()
+    if provider is None:
+        return err
+    if args.max_seconds is not None and (not math.isfinite(args.max_seconds) or args.max_seconds < 0):
+        print(f"levain daemon install-feeds: --max-seconds must be a finite number >= 0, got {args.max_seconds!r}. "
+              f"Use 0 to disable the bound, or omit the flag for the default ({daemon.DEFAULT_FEEDS_MAX_SECONDS:g}s).",
+              file=sys.stderr)
+        return 2
+    max_secs = (daemon.DEFAULT_FEEDS_MAX_SECONDS if args.max_seconds is None
+                else (None if args.max_seconds == 0 else args.max_seconds))
+    home = os.environ.get("LEVAIN_HOME")
+    try:
+        spec = daemon.build_feeds_spec(
+            working_dir=Path(home) if home else Path.home(),
+            queue_dir=args.queue_dir, levain_home=Path(home) if home else None,
+            interval=args.interval, label=args.label, max_seconds=max_secs,
+        )
+    except ValueError as exc:
+        print(f"levain daemon install-feeds: {exc}", file=sys.stderr)
+        return 2
+    if max_secs is not None and max_secs >= args.interval:
+        print(f"  ⓘ the run bound ({max_secs:g}s) is >= the cadence ({args.interval}s): launchd coalesces per label, "
+              f"so a long run skips intervals.")
+    if max_secs is None:
+        print("  ⚠ NO WALL-CLOCK BOUND: a run that hangs never exits, and launchd coalesces per label, so no later run "
+              "starts behind a unit still reporting installed + loaded.")
+    if args.dry_run:
+        plan = provider.would_install(spec)
+        print(f"install-feeds dry-run for {plan.label} (NOTHING is changed):")
+        print(f"  cadence: every {spec.start_interval}s, bound {'none' if max_secs is None else f'{max_secs:g}s'}")
+        print(f"  argv:    {' '.join(spec.argv)}")
+        print(f"  unit:    {plan.unit_path}")
+        print(f"  live:    {plan.current.load_state} — {plan.current.detail}")
+        print(f"  action:  {plan.action}")
+        return 0
+    try:
+        result = provider.install(spec)
+    except daemon.DaemonError as exc:
+        print(f"levain daemon install-feeds failed: {exc}", file=sys.stderr)
+        return 1
+    print(result)
+    print(f"  log: {spec.stdout_log}\n  errors: {spec.stderr_log}")
+    print(f"  manage: levain daemon status|restart|uninstall --label {args.label}")
+    return 0
 
 
 def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:

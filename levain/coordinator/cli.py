@@ -22,6 +22,7 @@ import secrets
 import sqlite3
 import subprocess
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -1340,7 +1341,31 @@ def _coord_review(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> i
         _emit(out, args.json, {"item_id": item.item_id, "state": item.state, "mode": args.mode},
               f"{item.item_id} {'cleared' if cmd == 'clear' else 'reopened'} ({args.mode})")
         return 0
-    ran = deliver.run(store)
+    if cmd == "feeds":
+        limit = getattr(args, "max_seconds", None) or 0
+        if limit < 0 or limit != limit or limit == float("inf"):
+            raise CoordError("--max-seconds is a finite number of seconds, 0 for none")
+        timer = None
+        if limit:
+            # a run stuck past its bound exits: launchd coalesces per label, so a hung scheduled run would otherwise
+            # stop every later one. Each write is its own transaction, so a cut run leaves nothing half-filed.
+            def _stop() -> None:
+                print(f"levain coord review feeds: stopped after {limit:g}s", file=sys.stderr, flush=True)
+                os._exit(3)
+            timer = threading.Timer(limit, _stop)
+            timer.daemon = True
+            timer.start()
+        try:
+            ran = deliver.run_exclusive(store)
+        finally:
+            if timer is not None:
+                timer.cancel()
+        if ran is None:
+            _emit(out, args.json, {"skipped": "another feeds run holds the lock"},
+                  "feeds: skipped, another run is in progress")
+            return 0
+    else:
+        ran = deliver.run(store)
     delivery = ran["delivery"]
     faults = deliver.faults(ran)
     if cmd == "feeds":
@@ -1624,7 +1649,11 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         p.add_argument("--mode", default="manual", choices=review_modes(),
                        help="manual (you, the default), fresh (a fresh session you asked), coordinator (needs --token).")
         token(p)
-    rvf = rv_sub.add_parser("feeds", help="Run the feeds and the delivery pass once and say what they reached.")
+    rvf = rv_sub.add_parser("feeds", help="Run the feeds and the delivery pass once and say what they reached.",
+                            description="Takes a lock: while another feeds run holds it this one skips (exit 0). "
+                                        "levain daemon install-feeds runs this on a schedule.")
+    rvf.add_argument("--max-seconds", dest="max_seconds", type=float, default=None,
+                     help="Stop (exit 3) if the run is still going after this many seconds (default: no bound).")
     for p in (rvl, rvc, rvo, rvf):
         common(p)
         p.set_defaults(func=run_coord)

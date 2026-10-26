@@ -390,3 +390,75 @@ def test_the_morning_card_words_the_waiting_set_with_the_one_formatter(band, cq)
     card = morning.card(band.store)
     lines = deliver.waiting_lines(card["waiting"])
     assert lines[0] == "waiting on you: 1" and all(ln in morning.render(card) for ln in lines)
+
+
+# --- the scheduled run: one at a time, bounded -------------------------------------------------------------------------
+
+def _hold_lock(band):
+    import fcntl
+    import os
+
+    fd = os.open(band.store.directory / deliver.FEEDS_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def test_a_feeds_run_while_another_holds_the_lock_skips_and_files_nothing(band):
+    import os
+
+    fd = _hold_lock(band)
+    try:
+        assert deliver.run_exclusive(band.store) is None
+        out = io.StringIO()
+        assert run_coord(_args(band, "feeds", json=True), out) == 0
+        assert "skipped" in json.loads(out.getvalue())
+    finally:
+        os.close(fd)
+    assert set(deliver.run_exclusive(band.store)) == {"feeds", "delivery"}      # released: the next run goes
+
+
+def test_a_second_exclusive_run_after_the_first_ends_is_not_blocked_by_a_stale_lock_file(band):
+    assert deliver.run_exclusive(band.store) is not None
+    assert (band.store.directory / deliver.FEEDS_LOCK).exists()
+    assert deliver.run_exclusive(band.store) is not None
+
+
+def test_a_feeds_run_past_its_bound_exits_3(band, monkeypatch):
+    import time
+
+    from levain.coordinator import cli
+
+    exits: list[int] = []
+    monkeypatch.setattr(cli.os, "_exit", exits.append)
+    monkeypatch.setattr(deliver, "run_exclusive", lambda store: time.sleep(0.6) or {"feeds": {}, "delivery": {
+        "signs": [], "answers": [], "created": 0, "errors": []}})
+    assert run_coord(_args(band, "feeds", json=True, max_seconds=0.1), io.StringIO()) == 0
+    assert exits == [3]
+
+
+def test_a_feeds_run_inside_its_bound_does_not_exit(band, monkeypatch):
+    from levain.coordinator import cli
+
+    exits: list[int] = []
+    monkeypatch.setattr(cli.os, "_exit", exits.append)
+    assert run_coord(_args(band, "feeds", json=True, max_seconds=30), io.StringIO()) == 0
+    assert exits == []
+
+
+def test_a_bad_bound_is_refused(band):
+    assert run_coord(_args(band, "feeds", json=True, max_seconds=-1), io.StringIO()) == 1
+
+
+def test_the_lock_is_made_where_a_fresh_home_has_no_store_directory_yet(tmp_path):
+    """Reproduced on a fresh LEVAIN_HOME: the first scheduled run died on a missing directory before it read anything."""
+    from types import SimpleNamespace
+
+    ran = {"feeds": {}, "delivery": {}}
+    stand_in = SimpleNamespace(directory=tmp_path / "fresh" / "consent")
+    orig = deliver.run
+    deliver.run = lambda store, queue_dir=None: ran
+    try:
+        assert deliver.run_exclusive(stand_in) is ran
+    finally:
+        deliver.run = orig
+    assert (stand_in.directory / deliver.FEEDS_LOCK).exists()

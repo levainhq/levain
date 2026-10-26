@@ -20,11 +20,13 @@ held ping's own release files the ANSWER when the coordinator escalates or leave
 
 **The runner** (:func:`run`) is one call: every mechanical feed, then the delivery pass. HEAD RULING (1025+25): no
 daemon for 1.0, so it runs on read: ``levain coord review`` runs it, and a panel's read path calls the same function.
+``levain daemon install-feeds`` also runs it on a schedule, through :func:`run_exclusive`.
 
 NOTHING HERE IS AUTHORITY: a record says something waits, never what he decides.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -37,7 +39,7 @@ from levain.coordinator import review
 from levain.coordinator.first_reader import _HARNESS_OF
 from levain.coordinator.store import CoordStore
 
-__all__ = ["Delivery", "deliver", "faults", "pass_line", "run", "waiting_lines"]
+__all__ = ["Delivery", "FEEDS_LOCK", "deliver", "faults", "pass_line", "run", "run_exclusive", "waiting_lines"]
 
 _TEXT = 500
 
@@ -158,6 +160,30 @@ def run(store: CoordStore, *, queue_dir: Path | str | None = None) -> dict[str, 
     if existed and not faults(ran):      # a pass that read nothing, or not all, is not "the last time it looked"
         review.record_pass(store)
     return ran
+
+
+FEEDS_LOCK = "feeds.lock"
+
+
+def run_exclusive(store: CoordStore, *, queue_dir: Path | str | None = None) -> dict[str, Any] | None:
+    """:func:`run` under a non-blocking exclusive lock on ``<store directory>/feeds.lock``, so a scheduled run and a
+    manual one (or two schedules) never overlap. ``None`` when another run holds it: the caller skips, it does not wait.
+    The lock is the kernel's (``flock``) and dies with the process, so a killed run leaves nothing to clear. A host
+    without ``fcntl`` runs unlocked: its feeds are idempotent by key, so an overlap files nothing twice."""
+    try:
+        import fcntl
+    except ImportError:
+        return run(store, queue_dir=queue_dir)
+    Path(store.directory).mkdir(parents=True, exist_ok=True, mode=0o700)       # a fresh home has no store yet
+    fd = os.open(Path(store.directory) / FEEDS_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return None
+        return run(store, queue_dir=queue_dir)
+    finally:
+        os.close(fd)
 
 
 def faults(ran: dict[str, Any]) -> list[str]:
