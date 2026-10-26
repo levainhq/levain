@@ -138,6 +138,8 @@ elif verb == "probe":
         os.remove(os.path.join(store, "probing"))
         what = "closed"
     if what == "hang":
+        with open(os.path.join(store, "pid-probe"), "w") as f:
+            f.write(str(os.getpid()))
         open(os.path.join(store, "probing"), "w").close()
         while True:
             time.sleep(0.05)
