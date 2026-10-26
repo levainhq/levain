@@ -3651,7 +3651,11 @@
   // the seat's own page, never drawn as a chip on the card) and the words of the refusal that says one has left (`gone_match`) are
   // declared by the provider on its recipient field.
   const SEVERAL_VALUE = "*several";
+  const CHOOSE_VALUE = "*choose";
   const composePick = Object.create(null);
+  // which cards' kept pick is an "everyone" the person chose themselves: set only by their own pick (a chip, the picker), never
+  // read off an empty kept pick, and kept and taken with that pick
+  const composeEveryone = Object.create(null);
 
   // `stay` (optional) is a box addressed to ONE reader that outlives its own send (the agent page's message box, which no board reload
   // rebuilds): {pickKey, gone}. Its recipient field holds that one id; no chip or picker is drawn, so it can never fall back to everyone;
@@ -3697,7 +3701,7 @@
           chip.setAttribute("aria-pressed", "false");
           chip.setAttribute("data-ck-compose", "recipient");
           chip.addEventListener("click", () => {
-            setTo(chips.filter((c) => (c === chip) !== (c.getAttribute("aria-pressed") === "true")).map((c) => c.dataset.value));
+            userPick(chips.filter((c) => (c === chip) !== (c.getAttribute("aria-pressed") === "true")).map((c) => c.dataset.value));
           });
           group.appendChild(chip);
           chips.push(chip);
@@ -3705,7 +3709,10 @@
         const pick = el("select", "rc-pick");
         pick.setAttribute("aria-label", f.label ? String(f.label) : "To");
         pick.setAttribute("data-ck-compose", "recipient-pick");
-        // the picker's options are told apart by IDENTITY, never by value: a roster may legally hold an id equal to the synthetic one's value
+        // the picker's options are told apart by IDENTITY, never by value: a roster may legally hold an id equal to the synthetic one's value.
+        // While the card still needs a choice it shows "choose a reader", so picking "everyone" moves the picker and is a change like any other.
+        const choose = Object.assign(el("option", null, "choose a reader"), { value: CHOOSE_VALUE, hidden: true, disabled: true });
+        pick.appendChild(choose);
         const everyone = Object.assign(el("option", null, "everyone"), { value: "" });
         pick.appendChild(everyone);
         const optOf = new Map();
@@ -3715,19 +3722,28 @@
         const optAt = (o) => Array.prototype.indexOf.call(pick.options, o);
         pick.addEventListener("change", () => {
           const o = pick.options[pick.selectedIndex];
-          setTo(!o || o === everyone || o === several ? [] : [o.value]);
+          if (!o || o === choose) return;
+          userPick(o === everyone || o === several ? [] : [o.value]);
         });
         group.appendChild(pick);
         group.appendChild(el("span", "ck-to-hint", "none selected = everyone"));
         if (!stay) box.insertBefore(group, box.firstChild);
         const pressedNow = () => chips.filter((c) => c.getAttribute("aria-pressed") === "true").map((c) => c.dataset.value);
+        // `remember` keeps the pick across a rebuild; only the person's own pick (userPick) passes true
         function setTo(values, remember) {
           const want = new Set(values);
           for (const c of chips) c.setAttribute("aria-pressed", want.has(c.dataset.value) ? "true" : "false");
           const now = pressedNow();
-          pick.selectedIndex = optAt(now.length === 1 ? optOf.get(now[0]) : (now.length ? several : everyone));
-          if (remember !== false) { composePick[pickKey] = now; ctl.needsChoice = false; if (ctl.onPick) ctl.onPick(); }
+          pick.selectedIndex = optAt(now.length === 1 ? optOf.get(now[0]) : (now.length ? several : (ctl.needsChoice ? choose : everyone)));
+          if (remember === true) composePick[pickKey] = now;
           chipAddr();
+        }
+        // the person's pick (a chip click or a picker change, the only callers): the one place the card's need for a choice is answered
+        function userPick(values) {
+          ctl.needsChoice = false;
+          setTo(values, true);
+          if (composePick[pickKey].length) delete composeEveryone[pickKey]; else composeEveryone[pickKey] = true;
+          if (ctl.onPick) ctl.onPick();
         }
         // a rebuild of this box (every refetch of the panel) keeps what the person chose, as far as it is still in the enum
         const pickKey = stay && stay.pickKey ? String(stay.pickKey) : String(action.panel || action.verb);
@@ -3738,11 +3754,10 @@
         const start = keptNow && (keptNow.length || !kept.length) ? keptNow : dflt;
         // a declared default that names a seat (which the card does not draw) cannot start pressed: an empty pick is "everyone", so
         // a send from that untouched state is refused rather than widened. A pick the person makes themselves (a chip, the picker,
-        // "everyone" included, or one kept from before this rebuild) is a send like any other: `needsChoice` goes at their first pick.
+        // "everyone" included, or their "everyone" kept from before this rebuild) is a send like any other: `needsChoice` goes at their pick.
         const seatDefault = !!seatPrefix && Array.isArray(f.default) && f.default.some((v) => typeof v === "string" && v.startsWith(seatPrefix));
-        const keptEveryone = Array.isArray(kept) && kept.length === 0;
         const ctl = { f: f, nodes: chips.concat([pick]), read: pressedNow, set: setTo, chips: chips, pickKey: pickKey, initial: start,
-                      default: dflt, needsChoice: seatDefault && !start.length && !keptEveryone, onPick: null };
+                      default: dflt, needsChoice: seatDefault && !start.length && composeEveryone[pickKey] !== true, onPick: null };
         controls.push(ctl);
         continue;
       }
@@ -3819,9 +3834,14 @@
     // fresh box must start from the provider's declared default, not from the pick it just used. The returned restore puts it back if the send fails.
     const takePick = () => {
       if (!chipCtl) return null;
-      const had = chipCtl.pickKey in composePick, snap = composePick[chipCtl.pickKey];
-      delete composePick[chipCtl.pickKey];
-      return () => { if (had && !(chipCtl.pickKey in composePick)) composePick[chipCtl.pickKey] = snap; };
+      const k = chipCtl.pickKey;
+      const had = k in composePick, snap = composePick[k], chose = composeEveryone[k];
+      delete composePick[k]; delete composeEveryone[k];
+      return () => {
+        if (!had || k in composePick) return;
+        composePick[k] = snap;
+        if (chose === true) composeEveryone[k] = true;
+      };
     };
     // Returns true when the box is HELD disabled after the departed-seat refusal (the caller must not re-enable it).
     const failed = (res, restore) => {
@@ -3905,8 +3925,10 @@
     // the post, never the request it names: a lost answer retried, or retried after a reload, replays the first send. A
     // definite refusal (a 4xx) forgets the draft's request, so the next send files and signs again; an answer that never
     // came keeps it. Any other verb posts as it always has.
+    // the transport this box sends through, read at the send (a later read-only render takes it away): a job verb's start, else the action post
+    const sendWay = () => (spec.job ? commitJob : commitAction);
     const fire = async (params, confirm, key) => {
-      if (!commitAction) return { ok: false, error: "read-only", message: "this page can no longer send; nothing was sent" };
+      if (!sendWay()) return { ok: false, error: "read-only", message: "this page can no longer send; nothing was sent" };
       if (!spec.sign) return commitAction(action.verb, params, confirm, key, action.panel);
       const say = (t, k) => { msg.className = "edit-msg" + (k === "bad" ? " err" : k === "ok" ? "" : " busy"); msg.textContent = t; };
       const s = await signedCompose(action.verb, action.panel, params, say, row);
@@ -3919,7 +3941,7 @@
       return res;
     };
     go.addEventListener("click", () => {
-      if (!commitAction) { setDisabled(true); msg.className = "edit-msg err"; msg.textContent = "this page can no longer send; nothing was sent"; return; }
+      if (!sendWay()) { setDisabled(true); msg.className = "edit-msg err"; msg.textContent = "this page can no longer send; nothing was sent"; return; }
       const c = collect();
       if (chipCtl && chipCtl.needsChoice && !chipCtl.read().length) { msg.className = "edit-msg err"; msg.textContent = NO_SEAT_REFUSED; return; }
       if (stay && (!chipCtl || chipCtl.read().length !== 1)) { msg.className = "edit-msg err"; msg.textContent = "no reader to send to; nothing was sent"; return; }

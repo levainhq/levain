@@ -233,17 +233,55 @@ PICK = "document.querySelector('[data-ck-compose=recipient-pick]')"
 
 @needs_browser
 def test_an_everyone_the_person_chose_on_a_seat_default_card_is_sent(tmp_path, monkeypatch):
-    # R1 (codex MED, fix r1 verify): only the untouched seat default is refused; a reader pressed and let go, or "everyone" picked, is a choice
+    # R1 (codex MED, fix r1 verify): only the untouched seat default is refused; a reader pressed and let go is a choice (the picker: below)
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     by_chip = CHIPS + ".find(c => c.dataset.value === 'cli').click(); " + CHIPS + ".find(c => c.dataset.value === 'cli').click(); 1"
-    by_pick = "const p = %s; p.selectedIndex = 0; p.dispatchEvent(new Event('change')); 1" % PICK
-    for choose in (by_chip, by_pick):
+    with _serve_inbox(src, ENUM, None, SEAT_DEFAULT) as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/{BUILD}#write_token=T", [DESKTOP, {"until": "document.querySelector('[data-ck-compose=recipient]')"},
+                                                                {"eval": by_chip}, {"eval": "window.__old = %s; 1" % CARD_BOX}, {"eval": CARD_SEND},
+                                                                {"until": "%s !== window.__old" % CARD_BOX}])
+    real = [p for p in _verb_posts(out) if not p.get("dry_run")]
+    assert len(real) == 1 and not real[0]["params"].get("for"), (_verb_posts(out), out["values"])
+
+
+@needs_browser
+def test_everyone_picked_on_the_phone_picker_of_a_seat_default_card_is_a_choice_and_is_sent(tmp_path, monkeypatch):
+    # V1 (codex R1 OPEN, fix r2 verify): on the phone's picker an untouched seat-default card must not already show "everyone", or
+    # picking "everyone" moves nothing, fires no change, and the send stays refused. The picker is driven as a person drives it: focused,
+    # then a typed letter moves its selection (a trusted key press; nothing here sets the value or dispatches the change).
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    shown = ("(() => { const p = %s; return JSON.stringify([p.options[p.selectedIndex].textContent, getComputedStyle(p).display, "
+             "document.activeElement === p]); })()") % PICK
+    with _serve_inbox(src, ENUM, None, SEAT_DEFAULT) as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/{BUILD}#write_token=T", [NARROW, {"until": "document.querySelector('[data-ck-compose=recipient]')"},
+                                                                {"focus": True}, {"eval": shown}, {"eval": PICK + ".focus(); 1"}, {"key": "e"},
+                                                                {"eval": shown}, {"eval": "window.__old = %s; 1" % CARD_BOX}, {"eval": CARD_SEND},
+                                                                {"until": "%s !== window.__old" % CARD_BOX, "ms": 8000, "may_timeout": True}])
+    before, after = json.loads(out["values"][1]), json.loads(out["values"][3])
+    real = [p for p in _verb_posts(out) if not p.get("dry_run")]
+    assert len(real) == 1 and not real[0]["params"].get("for"), (_verb_posts(out), out["values"])
+    assert before[0] == "choose a reader" and before[1] != "none", out["values"]
+    assert after == ["everyone", before[1], True], out["values"]
+
+
+@needs_browser
+def test_a_rebuild_keeps_the_persons_own_everyone_and_keeps_asking_an_untouched_card(tmp_path, monkeypatch):
+    # V2 (deepseek MED 2+3, fix r2 verify): "the person chose everyone" is its own record, made only by their pick, so it survives a rebuild
+    # of the box (a refetch), and a rebuild of a card nobody touched still asks for a reader.
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    by_chip = CHIPS + ".find(c => c.dataset.value === 'cli').click(); " + CHIPS + ".find(c => c.dataset.value === 'cli').click(); 1"
+    rebuild = "window.__old = %s; document.dispatchEvent(new Event('visibilitychange')); 1" % CARD_BOX
+    shown = "JSON.stringify([%s, (p => p.options[p.selectedIndex].textContent)(%s)])" % (CARD_MSG, PICK)
+    for touch, want_msg, want_pick, sends in ((by_chip, "", "everyone", 1), ("1", "choose a reader", "choose a reader", 0)):
         with _serve_inbox(src, ENUM, None, SEAT_DEFAULT) as (url, _httpd):
             out = _drive(tmp_path, f"{url}/{BUILD}#write_token=T", [DESKTOP, {"until": "document.querySelector('[data-ck-compose=recipient]')"},
-                                                                    {"eval": choose}, {"eval": "window.__old = %s; 1" % CARD_BOX}, {"eval": CARD_SEND},
-                                                                    {"until": "%s !== window.__old" % CARD_BOX}])
+                                                                    {"eval": touch}, {"eval": rebuild}, {"until": "%s !== window.__old" % CARD_BOX},
+                                                                    {"eval": shown}, {"eval": "window.__old = %s; 1" % CARD_BOX}, {"eval": CARD_SEND},
+                                                                    {"until": "%s !== window.__old" % CARD_BOX, "ms": 5000, "may_timeout": True}])
+        msg, pick = json.loads(out["values"][4])
+        assert (want_msg in msg if want_msg else msg == "") and pick == want_pick, (touch, out["values"])
         real = [p for p in _verb_posts(out) if not p.get("dry_run")]
-        assert len(real) == 1 and not real[0]["params"].get("for"), (choose, _verb_posts(out), out["values"])
+        assert len(real) == sends and all(not p["params"].get("for") for p in real), (touch, _verb_posts(out), out["values"])
 
 
 @needs_browser

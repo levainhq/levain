@@ -18,6 +18,7 @@
 //   {"user_verified": <bool>}               the last authenticator's answer to user verification from now on (false: the
 //                                            page's navigator.credentials.get with userVerification "required" is refused,
 //                                            a cancelled Face ID as the page sees it); nothing is collected
+//   {"key": "<key>"}                        one trusted key press (down, then up) to the focused element; nothing is collected
 // App content that loads asynchronously is not waited for: put an `until` step before the `shot`.
 // A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
@@ -130,6 +131,12 @@ for (const s of steps) {
     media["prefers-color-scheme"] = s.scheme;
     await send("Emulation.setEmulatedMedia", { features: Object.entries(media).map(([name, value]) => ({ name, value })) });
     await sleep(300);
+  } else if (s.key !== undefined) {
+    // a key a person presses, to whatever holds focus: a trusted event, so a focused <select> answers it as it answers a keyboard
+    // (a typed letter selects an option starting with it; `change` fires only when that moves the selection)
+    await send("Input.dispatchKeyEvent", { type: "keyDown", key: s.key, ...(s.key.length === 1 ? { text: s.key } : {}) });
+    await send("Input.dispatchKeyEvent", { type: "keyUp", key: s.key });
+    await sleep(200);
   } else if (s.focus !== undefined) {
     await send("Emulation.setFocusEmulationEnabled", { enabled: !!s.focus });         // a headless page is never the focused window: without this no focusin / focusout fires
   } else if (s.motion !== undefined) {
