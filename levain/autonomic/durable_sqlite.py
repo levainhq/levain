@@ -83,8 +83,8 @@ def _set_wal(conn: sqlite3.Connection) -> None:
 
 
 def _until_not_busy(conn: sqlite3.Connection, step: Callable[[], object]) -> object:
-    """``step()``, retried while it raises SQLITE_BUSY, for one wall-clock bound of :data:`BUSY_WAIT_S` covering the
-    tries and the pauses between them. For a statement SQLite may answer busy without calling the busy handler: the
+    """``step()``, retried while it raises SQLITE_BUSY, for one wall-clock bound covering the tries and the
+    pauses between them: the connection's own ``busy_timeout``, read before the retry, never more. For a statement SQLite may answer busy without calling the busy handler: the
     sqlite.org WAL page says a connection that opens and queries while the last other one is closing "might get an
     SQLITE_BUSY error" (wal.html, "Sometimes Queries Return SQLITE_BUSY In WAL Mode"), and the busy-handler page
     says the handler is not guaranteed to be invoked (c3ref/busy_handler.html). ``step`` must leave no transaction
@@ -99,7 +99,7 @@ def _until_not_busy(conn: sqlite3.Connection, step: Callable[[], object]) -> obj
         return step()
     conn.execute("PRAGMA busy_timeout = 0")
     try:
-        deadline = os.times().elapsed + BUSY_WAIT_S
+        deadline = os.times().elapsed + restore / 1000
         pause = 0.001
         while True:
             try:

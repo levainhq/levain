@@ -286,8 +286,8 @@ class _Stmt:
         self.closed = False
 
     def execute(self, sql):
-        if sql.startswith("PRAGMA busy_timeout"):        # the retry's own handler switch: a wait set, not a statement under test
-            return _Row(1)
+        if sql.startswith("PRAGMA busy_timeout"):        # the retry's own handler switch: a wait of 30 s read back, not a statement under test
+            return _Row(30000)
         self.log.append(sql)
         script = self.scripts.get(sql)
         a = script.pop(0) if script else None

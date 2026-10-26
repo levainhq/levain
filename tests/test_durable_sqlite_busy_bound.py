@@ -74,3 +74,28 @@ def test_the_busy_wait_is_restored_after_a_retried_begin(tmp_path, monkeypatch):
     _store(path)
     with D.write_transaction(lambda: D.open_durable(path)) as conn:
         assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == int(WAIT_S * 1000)
+
+
+def test_a_shorter_connection_busy_timeout_bounds_the_retry(tmp_path, monkeypatch):
+    """CI on 435bbbf6: the deadline was BUSY_WAIT_S for every connection, so a caller whose connection set a shorter
+    ``busy_timeout`` (the consent store's) waited the longer bound. The connection's own value is the most it waits."""
+    monkeypatch.setattr(D, "BUSY_WAIT_S", 6.0)
+    path = tmp_path / "s.db"
+    _store(path)
+
+    def short():
+        conn = D.open_durable(path)
+        conn.execute("PRAGMA busy_timeout = 1000")
+        return conn
+
+    holder = _holder(path)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            with D.write_transaction(short):
+                raise AssertionError("the lock is held: the block must not run")
+        took = time.monotonic() - t0
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert 0.5 <= took < 1.0 + MARGIN_S, took
