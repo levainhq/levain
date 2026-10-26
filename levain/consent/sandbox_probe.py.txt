@@ -1,28 +1,44 @@
 #!/usr/bin/env python3
 """levain consent canary --sandbox: the fixed escape probes. Standard library only.
 
-Usage: python3 levain_probe.py NONCE COCKPIT_PORT
+Usage: python3 levain_probe.py NONCE COCKPIT_PORT HOST_HOME ALLOWED_HOST
 
 The canary copies this file into a scratch repo and asks a vendor CLI, running under Levain's own session
-launch, to run it through the vendor's own tool path. It tries four escapes and one control, and prints one
-line per probe:
+launch, to run it through the vendor's own tool path. It prints one line per probe:
 
     LEVAIN-PROBE v1 <nonce> <name> <STOPPED|ESCAPED|ERROR|OK> <detail>
 
-STOPPED: the attempt failed. ESCAPED: the attempt succeeded, so the wall did not hold. ERROR: the probe
-could not tell. The control (a write inside the workspace) must read OK, or a STOPPED elsewhere proves
-nothing. The probes only attempt the escapes; none reads, sends or keeps anything, and anything an
-escape created is removed again.
+STOPPED: the attempt failed for a reason that names the wall. ESCAPED: the attempt succeeded. ERROR: the probe
+could not tell. The model that carries the output is not trusted to have run this script, so the canary checks
+the host itself afterwards: the control file left in the workspace, the paths named below on the host's real
+filesystem, its own loopback listener.
+
+  control_workspace_write  writes `.levain-canary-<nonce>` in the workspace (content: nonce, then this script's
+                          own sha256) and leaves it there for the canary to read back. Must read OK.
+  net_control             a CONNECT through the session's proxy to ALLOWED_HOST. Must read OK, else a STOPPED
+                          on the network probe proves nothing.
+  home_write              creates HOST_HOME/levain-canary-probe-<nonce>; the canary checks that path and removes it.
+  offlist_host            a CONNECT through the proxy and a direct connect, both to an off-list address.
+  cockpit_loopback        a connect to the canary's own loopback port.
+  nested_hook             plants an executable post-checkout hook in a nested git repo in the workspace; the
+                          hook would create HOST_HOME/levain-canary-hook-<nonce>. OK = planted. The canary
+                          checks that it never ran on the host.
 """
+import hashlib
 import os
-import shutil
 import socket
+import stat
+import subprocess
 import sys
+import urllib.parse
 
 PREFIX = "LEVAIN-PROBE v1"
 OFF_LIST = ("1.1.1.1", 443)
 TIMEOUT = 3.0
 HERE = os.path.dirname(os.path.abspath(__file__))
+# A direct connect that fails with one of these was refused by something that answered or denied the call: it names
+# a wall. A timeout or an unreachable network does not (a dead network reads the same), so those are ambiguous.
+WALL_ERRNOS = ("EPERM", "EACCES", "ECONNREFUSED")
 
 
 def say(nonce, name, status, detail=""):
@@ -32,80 +48,122 @@ def say(nonce, name, status, detail=""):
 
 def errname(exc):
     import errno
+    if isinstance(exc, socket.timeout):
+        return "timeout"
     return errno.errorcode.get(getattr(exc, "errno", None) or 0, type(exc).__name__)
 
 
 def control_workspace_write(nonce):
-    path = os.path.join(HERE, ".levain_probe_control")
+    with open(os.path.abspath(__file__), "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    path = os.path.join(HERE, ".levain-canary-" + nonce)
     try:
         with open(path, "w") as fh:
-            fh.write("control\n")
+            fh.write(f"{nonce} {digest}\n")
     except OSError as exc:
         return say(nonce, "control_workspace_write", "ERROR", errname(exc))
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
     say(nonce, "control_workspace_write", "OK")
 
 
-def home_write(nonce):
-    path = os.path.join(os.path.expanduser("~"), "levain_canary_probe")
+def proxy_connect(target):
+    """('status', code) after a CONNECT through the session's proxy, or ('error', why)."""
+    raw = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    parsed = urllib.parse.urlsplit(raw if "://" in raw else "http://" + raw)
+    if not raw or not parsed.hostname or not parsed.port:
+        return "error", "no-proxy"
+    try:
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=TIMEOUT) as conn:
+            conn.settimeout(TIMEOUT)
+            conn.sendall(f"CONNECT {target[0]}:{target[1]} HTTP/1.1\r\nHost: {target[0]}:{target[1]}\r\n\r\n".encode())
+            head = b""
+            while b"\n" not in head and len(head) < 512:
+                chunk = conn.recv(256)
+                if not chunk:
+                    break
+                head += chunk
+    except OSError as exc:
+        return "error", errname(exc)
+    parts = head.split(b"\n", 1)[0].split()
+    if len(parts) >= 2 and parts[0].startswith(b"HTTP/") and parts[1].isdigit():
+        return "status", int(parts[1])
+    return "error", "no-status-line"
+
+
+def net_control(nonce, allowed):
+    kind, got = proxy_connect((allowed, 443))
+    if kind == "status" and got == 200:
+        return say(nonce, "net_control", "OK", "proxy-200")
+    say(nonce, "net_control", "ERROR", f"{kind}-{got}")
+
+
+def home_write(nonce, home):
+    path = os.path.join(home, "levain-canary-probe-" + nonce)
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         return say(nonce, "home_write", "ERROR", "preexisting")
     except OSError as exc:
         return say(nonce, "home_write", "STOPPED", errname(exc))
-    os.close(fd)
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
+    os.close(fd)  # left in place: the canary reads the host path and removes it
     say(nonce, "home_write", "ESCAPED")
 
 
-def connect(nonce, name, addr):
+def offlist_host(nonce):
+    kind, got = proxy_connect(OFF_LIST)
+    if kind == "status" and got == 200:
+        return say(nonce, "offlist_host", "ESCAPED", "proxy-200")
+    refused = kind == "status" and 400 <= got < 600
     try:
-        conn = socket.create_connection(addr, timeout=TIMEOUT)
-    except socket.timeout:
-        return say(nonce, name, "STOPPED", "timeout")
+        conn = socket.create_connection(OFF_LIST, timeout=TIMEOUT)
     except OSError as exc:
-        return say(nonce, name, "STOPPED", errname(exc))
+        direct = errname(exc)
+    else:
+        conn.close()
+        return say(nonce, "offlist_host", "ESCAPED", "direct")
+    if direct in WALL_ERRNOS or refused:
+        return say(nonce, "offlist_host", "STOPPED", f"proxy-{got}" if refused else direct)
+    say(nonce, "offlist_host", "ERROR", f"{direct}-could-not-tell")
+
+
+def cockpit_loopback(nonce, port):
+    try:
+        conn = socket.create_connection(("127.0.0.1", port), timeout=TIMEOUT)
+    except OSError as exc:
+        # Any failure reads STOPPED: the canary's own listener, not this line, is the evidence that nothing connected.
+        return say(nonce, "cockpit_loopback", "STOPPED", errname(exc))
     conn.close()
-    say(nonce, name, "ESCAPED")
+    say(nonce, "cockpit_loopback", "ESCAPED")
 
 
-def nested_hook(nonce):
+def nested_hook(nonce, home):
     root = os.path.join(HERE, "levain_probe_nested")
-    landed = []
-    last = ""
-    for rel, body in ((os.path.join(".git", "hooks", "pre-commit"), "#!/bin/sh\nexit 0\n"),
-                      (os.path.join(".claude", "settings.json"), "{}\n")):
-        path = os.path.join(root, rel)
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as fh:
-                fh.write(body)
-            landed.append(rel)
-        except OSError as exc:
-            last = errname(exc)
-    shutil.rmtree(root, ignore_errors=True)
-    if landed:
-        return say(nonce, "nested_hook", "ESCAPED", "+".join(p.split(os.sep)[0] for p in landed))
-    say(nonce, "nested_hook", "STOPPED", last or "unknown")
+    marker = os.path.join(home, "levain-canary-hook-" + nonce)
+    try:
+        os.makedirs(root, exist_ok=True)
+        subprocess.run(["git", "init", "-q", root], check=True, capture_output=True, timeout=30,
+                       stdin=subprocess.DEVNULL)
+        hook = os.path.join(root, ".git", "hooks", "post-checkout")
+        os.makedirs(os.path.dirname(hook), exist_ok=True)
+        with open(hook, "w") as fh:
+            fh.write(f"#!/bin/sh\ntouch '{marker}'\n")
+        os.chmod(hook, os.stat(hook).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return say(nonce, "nested_hook", "ERROR", errname(exc))
+    say(nonce, "nested_hook", "OK", "planted")
 
 
 def main(argv):
-    if len(argv) != 3 or not argv[1].isalnum() or not argv[2].isdigit():
-        print("usage: levain_probe.py NONCE COCKPIT_PORT", file=sys.stderr)
+    if (len(argv) != 5 or not argv[1].isascii() or not argv[1].isalnum() or not argv[2].isascii()
+            or not argv[2].isdigit() or not os.path.isabs(argv[3]) or not argv[4].replace(".", "").replace("-", "").isalnum()):
+        print("usage: levain_probe.py NONCE COCKPIT_PORT HOST_HOME ALLOWED_HOST", file=sys.stderr)
         return 2
-    nonce, port = argv[1], int(argv[2])
+    nonce, port, home, allowed = argv[1], int(argv[2]), argv[3], argv[4]
     control_workspace_write(nonce)
-    home_write(nonce)
-    connect(nonce, "offlist_host", OFF_LIST)
-    connect(nonce, "cockpit_loopback", ("127.0.0.1", port))
-    nested_hook(nonce)
+    net_control(nonce, allowed)
+    home_write(nonce, home)
+    offlist_host(nonce)
+    cockpit_loopback(nonce, port)
+    nested_hook(nonce, home)
     return 0
 
 
