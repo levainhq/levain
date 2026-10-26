@@ -781,14 +781,20 @@ class Signer:
     (:func:`levain.web_server.make_server` refuses a missing or malformed one). A server that takes the Signer pins
     it (:meth:`pin_page_origin`): while any server holds a pin a different ``page_origin`` is refused, so the origin
     every verification reads is the one the server checked, and nothing can move it under a ceremony in flight. Only a
-    server that failed before it served releases its pin (:meth:`release_pin`)."""
+    server that failed before it served releases its pin (:meth:`release_pin`).
 
-    def __init__(self, queue_dir: Path, namespaces: "tuple[str, ...]", rp_id: str, keys: Any) -> None:
+    ``facts_root`` returns the cockpit data root whose key facts (:mod:`levain.cockpit.keyfacts`) an answer's
+    ``raw_id`` is recorded into and a listing's credential ids are read from (default: :func:`sign_root`'s). Those
+    facts are display only: nothing here reads them to decide what a key may sign."""
+
+    def __init__(self, queue_dir: Path, namespaces: "tuple[str, ...]", rp_id: str, keys: Any, *,
+                 facts_root: "Callable[[], Path] | None" = None) -> None:
         for ns in namespaces:
             problem = namespace_problem(ns)
             if problem is not None:
                 raise ValueError(f"--sign-namespace: {problem}")
         self.queue_dir, self.namespaces, self.rp_id, self._keys = Path(queue_dir), tuple(namespaces), rp_id, keys
+        self._facts_root = facts_root if facts_root is not None else (lambda: sign_root(self.queue_dir))
         self._page_origin: str | None = None
         self._pins = 0          # the servers holding it pinned (pin_page_origin, release_pin): pinned while any does
         self._lock = threading.Lock()
@@ -861,6 +867,35 @@ class Signer:
         """The fingerprints of the active passkeys that may sign here (what a listing names as its signers), or
         :class:`SignRefused` saying why there are none to ask."""
         return list(self._keys())
+
+    def key_facts(self, signers: "list[str]") -> dict[str, dict[str, Any]]:
+        """``{fingerprint: {credential_id, provider}}`` for those of ``signers`` the cockpit's key facts name, so a page
+        can ask the browser for exactly that passkey (``allowCredentials``). Display only; empty when the facts cannot
+        be read."""
+        from levain.cockpit import keyfacts
+
+        try:
+            held = keyfacts.read(self._facts_root())
+        except (keyfacts.KeyFactsError, SignRefused, OSError):
+            return {}
+        return {fp: {"credential_id": held[fp].credential_id, "provider": keyfacts.provider_text(held[fp])}
+                for fp in signers if fp in held and held[fp].credential_id}
+
+    def _learn(self, fingerprint: str, raw_id: Any) -> None:
+        """Record ``raw_id``, reported with an assertion that verified under ``fingerprint``'s key, as that key's
+        credential id. Display only, so anything that keeps it from being recorded is dropped: it never costs the
+        signature already recorded."""
+        import sqlite3
+
+        from levain.cockpit import keyfacts
+        from levain.cockpit.consent import utc_stamp
+
+        if raw_id is None:
+            return
+        try:
+            keyfacts.learn(self._facts_root(), fingerprint, keyfacts.raw_id_bytes(raw_id), now=utc_stamp(_now()))
+        except (keyfacts.KeyFactsError, SignRefused, OSError, sqlite3.Error):
+            return
 
     def listing(self, signers: "list[str]") -> list[dict[str, Any]]:
         """The rows of :meth:`page`."""
@@ -1010,14 +1045,15 @@ class Signer:
         """``{authenticator_data, client_data_json, signature}`` (base64url) -> the signature verified and recorded:
         the ``.sig`` (over an orphan one), then ``.signed.json`` last, never over one already there. The key read
         and the verify run outside the lock; the request is read again under it just before anything is written,
-        and one that changed, expired or was answered meanwhile is refused (409)."""
+        and one that changed, expired or was answered meanwhile is refused (409). An optional ``raw_id`` (the
+        assertion's credential id) is recorded as the signing key's after both files are written (:meth:`_learn`)."""
         from levain.authority import VerifierUnavailable, verify_link_sig
         from levain.cockpit.consent import utc_stamp
         from levain.consent.passkey import PasskeyError, answer_signature_problem, b64url_decode, to_sshsig
 
         need = {"authenticator_data", "client_data_json", "signature"}
-        if not isinstance(req, dict) or set(req) != need:
-            raise SignRefused(f"request keys must be {sorted(need)}", 400)
+        if not isinstance(req, dict) or not need <= set(req) <= need | {"raw_id"}:
+            raise SignRefused(f"request keys must be {sorted(need)}, and optionally 'raw_id'", 400)
         with self._lock:
             bound = self._challenged.get(request_id)
         if bound is None:
@@ -1071,6 +1107,7 @@ class Signer:
             _publish(_write_new, d / f"{request_id}.signed.json", json.dumps(record) + "\n",
                      f"sign request {request_id} is already signed")
             del self._challenged[request_id]
+        self._learn(key.fingerprint, req.get("raw_id"))
         done = {"id": request_id, "signer_fp": key.fingerprint, "namespace": request.namespace, "signed_at": signed_at}
         return done if bound[2] is None else {**done, "choice": bound[2]}
 

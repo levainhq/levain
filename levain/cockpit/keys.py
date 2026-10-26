@@ -203,18 +203,30 @@ def _append(db: CockpitDB, op: Mapping[str, Any], *, signer_fp: str, sign: Signe
 
 def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, signer_fp: str, sign: Signer,
            clock: Callable[[], datetime], custody: str = UNSTATED, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-           marker_directory: Path | None = None) -> tuple[KeyRow, bool, str | None]:
+           marker_directory: Path | None = None, attested: bytes | None = None) -> tuple[KeyRow, bool, str | None]:
     """Enrol one key, declaring its ``custody``, by a link ``signer_fp`` signs (a laptop-presence key).
     The custody table (``levain.authority.custody_problem``, the replay's own rule) is checked before
     anything is signed; a laptop-presence key must state a real custody. Returns ``(row, created,
     warning)``: ``created`` is False when this exact key is already enrolled, unrevoked, with this class
-    and custody (nothing is signed); ``warning`` says the link committed but its anchor did not advance."""
+    and custody (nothing is signed); ``warning`` says the link committed but its anchor did not advance.
+
+    ``attested`` is a passkey creation's authenticatorData: checked against the key before anything is signed
+    (:func:`levain.cockpit.keyfacts.attested`), and its credential id and AAGUID recorded beside the key only when
+    this call signed the enrol link. They are display facts outside the log, never authority."""
+    from levain.cockpit import keyfacts
+
     if key_class not in _CLASS_RANK:
         raise KeyError_(f"unknown key class {key_class!r}; one of {', '.join(KEY_CLASSES)}")
     public_key = normalise_public_key(public_key_text)
     problem = _authority.custody_problem(key_class, custody, public_key.split()[0], public_key=public_key)
     if problem is not None:
         raise KeyError_(problem)
+    facts = None
+    if attested is not None:
+        try:
+            facts = keyfacts.attested(attested, public_key)
+        except keyfacts.KeyFactsError as exc:
+            raise KeyError_(f"--attested: {exc}") from None
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, _now(clock), ssh_keygen))
@@ -232,7 +244,13 @@ def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, signe
                        "custody": custody}, signer_fp=signer_fp, sign=sign, clock=clock, ssh_keygen=ssh_keygen)
     key = new.key(fp)
     assert key is not None
-    return _row(key), True, new.anchor_warning
+    warning = new.anchor_warning
+    if facts is not None:
+        try:
+            keyfacts.record_enrolment(Path(data_root), fp, facts, now=_now(clock).isoformat())
+        except (OSError, sqlite3.Error) as exc:   # the key is enrolled; only the display facts are missing
+            warning = "; ".join(filter(None, (warning, f"its credential id and provider were not recorded: {exc}")))
+    return _row(key), True, warning
 
 
 def revoke(data_root: Path | str, ref: str, *, signer_fp: str, sign: Signer, clock: Callable[[], datetime],

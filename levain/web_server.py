@@ -1296,15 +1296,18 @@ class _Handler(GuardedHandler):
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
     def _serve_sign_list(self, *, head: bool, one: "str | None" = None) -> None:
-        """``GET /cockpit/sign.json``: ``{requests, signers, origin}``, the Signer's own listing rows (sha256, options,
-        write_in, recommended) for the active passkeys that may sign, those keys' fingerprints, and the page origin the
-        ceremony is pinned to (a page served elsewhere sends the operator there). Reached only
+        """``GET /cockpit/sign.json``: ``{requests, signers, credentials, origin}``, the Signer's own listing rows
+        (sha256, options, write_in, recommended) for the active passkeys that may sign, those keys' fingerprints, the
+        credential id and provider the cockpit holds for each of them (:meth:`levain.consent.sign.Signer.key_facts`:
+        display facts a page builds ``allowCredentials`` from, never a widening of who signs), and the page origin
+        the ceremony is pinned to (a page served elsewhere sends the operator there). Reached only
         through ``_route`` (Host allowlist, cross-site refusal), then the write gate's other checks before the
         directory is read: same-origin only (``Sec-Fetch-Site`` absent or ``same-origin``), a surface token on every
         bind, the request gate. Without a signer, 404. Keys that cannot be read list no signers and say why in
         ``note``; the rows still list, as on the phone page.
 
-        ``GET /cockpit/sign/<id>.json`` (``one``), behind the same gate: ``{request, signers, origin}`` with that one
+        ``GET /cockpit/sign/<id>.json`` (``one``), behind the same gate: ``{request, signers, credentials, origin}``
+        with that one
         request's row (:meth:`levain.consent.sign.Signer.row`), or 404 when it is not open, whatever the listing's
         cap."""
         from levain.consent.sign import SignRefused
@@ -1328,11 +1331,14 @@ class _Handler(GuardedHandler):
             # `origin`: the one page the ceremony signs on (make_server checked it), so a page served anywhere else says
             # where to sign rather than offering a gesture its browser would refuse
             origin = self.server.signer_page_origin
+            credentials = signer.key_facts(signers)
             if one is None:
-                payload, status = {"requests": signer.listing(signers), "signers": signers, "origin": origin}, 200
+                payload, status = {"requests": signer.listing(signers), "signers": signers, "credentials": credentials,
+                                   "origin": origin}, 200
             else:
                 row = signer.row(one, signers)
-                payload, status = (({"request": row, "signers": signers, "origin": origin}, 200) if row is not None
+                payload, status = (({"request": row, "signers": signers, "credentials": credentials, "origin": origin},
+                                    200) if row is not None
                                    else ({"error": "not_open", "message": "this sign request is not open"}, 404))
             if note is not None and status == 200:
                 payload["note"] = note
