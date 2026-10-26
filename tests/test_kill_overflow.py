@@ -64,3 +64,16 @@ def test_an_in_list_or_equality_threshold_past_float_range_evaluates_without_rai
     assert kill_purity_error({"op": "in", "field": "n", "value": [HUGE]}) is None
     assert kill_outcome({"op": "in", "field": "n", "value": [HUGE]}, {"fields": {"n": 1}}) is Kleene.FALSE
     assert kill_outcome({"op": "in", "field": "n", "value": [HUGE]}, {"fields": {"n": HUGE}}) is Kleene.TRUE
+
+
+@pytest.mark.parametrize("helper", ["_kleene_eval", "_eval_leaf", "_resolve_field", "_as_number"])
+def test_an_internal_raise_in_the_evaluator_is_unknown_so_the_kill_trips(monkeypatch, helper):
+    # kill_outcome's run-time contract (O-g1f2-2): an anomaly no branch anticipated degrades to UNKNOWN, never a raise
+    import levain.autonomic.kill as kill
+
+    def boom(*_a, **_k):
+        raise RuntimeError("unanticipated")
+    monkeypatch.setattr(kill, helper, boom)
+    kp = {"op": ">", "field": "n", "value": 5}
+    assert kill.kill_outcome(kp, {"fields": {"n": 9}}) is Kleene.UNKNOWN
+    assert kill.kill_trips(kp, {"fields": {"n": 9}}) is True
