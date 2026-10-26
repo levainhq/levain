@@ -1542,6 +1542,10 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
             if status[1] is _AS_ROOT:
                 return CheckResult(name, True, "not asked: run as root, CONTROL does not serve this account its "
                                    "sessions", "Run `levain doctor` as the operator to see them.", neutral=True)
+            if fresh is not None:
+                return CheckResult(name, True, f"unknown: CONTROL did not answer ({status[1]}); the reaper's last pass "
+                                   f"(pass {fresh['pass_seq']}, {_age_text(_beat_age(fresh, now))} ago) saw no held "
+                                   "session", warn=True)
             seen = {"closed": "closed to this account", "absent": "not written yet", "bad": "unreadable"}.get(beat[0])
             why = (f"CONTROL did not answer ({status[1]}) and the reaper's pass record is {seen}" if seen
                    else f"CONTROL did not answer ({status[1]}) and the reaper's pass record is out of date")

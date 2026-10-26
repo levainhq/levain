@@ -480,3 +480,19 @@ def test_a_silent_peer_is_bounded_by_the_deadline(tmp_path: Path):
         srv.close()
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_control_down_a_fresh_pass_with_nothing_held_is_not_called_out_of_date(tmp_path: Path):
+    _beat(tmp_path / "run", age=30, control="down")
+    row = _rows(tmp_path, status=lambda: (False, "no answer in time"))["agent held sessions"]
+    assert row.ok and row.warn
+    assert "out of date" not in row.detail and "would not show here" not in row.detail
+    assert "pass 7" in row.detail and "30 s ago" in row.detail and "no held session" in row.detail
+    assert "CONTROL did not answer (no answer in time)" in row.detail
+
+
+def test_control_down_a_stale_pass_is_still_out_of_date(tmp_path: Path):
+    _beat(tmp_path / "run", age=5000, control="down")
+    row = _rows(tmp_path, status=lambda: (False, "no answer in time"))["agent held sessions"]
+    assert row.ok and row.warn
+    assert "the reaper's pass record is out of date" in row.detail and "would not show here" in row.detail
