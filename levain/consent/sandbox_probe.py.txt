@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""levain consent canary --sandbox: the fixed escape probes. Standard library only.
+
+Usage: python3 levain_probe.py NONCE COCKPIT_PORT
+
+The canary copies this file into a scratch repo and asks a vendor CLI, running under Levain's own session
+launch, to run it through the vendor's own tool path. It tries four escapes and one control, and prints one
+line per probe:
+
+    LEVAIN-PROBE v1 <nonce> <name> <STOPPED|ESCAPED|ERROR|OK> <detail>
+
+STOPPED: the attempt failed. ESCAPED: the attempt succeeded, so the wall did not hold. ERROR: the probe
+could not tell. The control (a write inside the workspace) must read OK, or a STOPPED elsewhere proves
+nothing. The probes only attempt the escapes; none reads, sends or keeps anything, and anything an
+escape created is removed again.
+"""
+import os
+import shutil
+import socket
+import sys
+
+PREFIX = "LEVAIN-PROBE v1"
+OFF_LIST = ("1.1.1.1", 443)
+TIMEOUT = 3.0
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def say(nonce, name, status, detail=""):
+    detail = "".join(c if c.isalnum() or c in "-_.:" else "_" for c in str(detail))[:60]
+    print(f"{PREFIX} {nonce} {name} {status} {detail}".rstrip(), flush=True)
+
+
+def errname(exc):
+    import errno
+    return errno.errorcode.get(getattr(exc, "errno", None) or 0, type(exc).__name__)
+
+
+def control_workspace_write(nonce):
+    path = os.path.join(HERE, ".levain_probe_control")
+    try:
+        with open(path, "w") as fh:
+            fh.write("control\n")
+    except OSError as exc:
+        return say(nonce, "control_workspace_write", "ERROR", errname(exc))
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    say(nonce, "control_workspace_write", "OK")
+
+
+def home_write(nonce):
+    path = os.path.join(os.path.expanduser("~"), "levain_canary_probe")
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return say(nonce, "home_write", "ERROR", "preexisting")
+    except OSError as exc:
+        return say(nonce, "home_write", "STOPPED", errname(exc))
+    os.close(fd)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    say(nonce, "home_write", "ESCAPED")
+
+
+def connect(nonce, name, addr):
+    try:
+        conn = socket.create_connection(addr, timeout=TIMEOUT)
+    except socket.timeout:
+        return say(nonce, name, "STOPPED", "timeout")
+    except OSError as exc:
+        return say(nonce, name, "STOPPED", errname(exc))
+    conn.close()
+    say(nonce, name, "ESCAPED")
+
+
+def nested_hook(nonce):
+    root = os.path.join(HERE, "levain_probe_nested")
+    landed = []
+    last = ""
+    for rel, body in ((os.path.join(".git", "hooks", "pre-commit"), "#!/bin/sh\nexit 0\n"),
+                      (os.path.join(".claude", "settings.json"), "{}\n")):
+        path = os.path.join(root, rel)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(body)
+            landed.append(rel)
+        except OSError as exc:
+            last = errname(exc)
+    shutil.rmtree(root, ignore_errors=True)
+    if landed:
+        return say(nonce, "nested_hook", "ESCAPED", "+".join(p.split(os.sep)[0] for p in landed))
+    say(nonce, "nested_hook", "STOPPED", last or "unknown")
+
+
+def main(argv):
+    if len(argv) != 3 or not argv[1].isalnum() or not argv[2].isdigit():
+        print("usage: levain_probe.py NONCE COCKPIT_PORT", file=sys.stderr)
+        return 2
+    nonce, port = argv[1], int(argv[2])
+    control_workspace_write(nonce)
+    home_write(nonce)
+    connect(nonce, "offlist_host", OFF_LIST)
+    connect(nonce, "cockpit_loopback", ("127.0.0.1", port))
+    nested_hook(nonce)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
