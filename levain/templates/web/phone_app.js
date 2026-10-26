@@ -17,6 +17,9 @@
   function keepToken(t) { memToken = t; store.set("sessionStorage", TOKEN_KEY, t); }
   function keepDevice(t) { memDevice = t; if (!store.set("localStorage", DEVICE_KEY, t)) forgets = true; }
   const deviceToken = () => memDevice || store.get("localStorage", DEVICE_KEY) || "";
+  // Safari is named only to an iPhone or iPad user: elsewhere there is no Safari to name
+  const ua = navigator.userAgent || "";
+  const isIos = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && (navigator.maxTouchPoints || 0) > 1);
   // one unpaired state, said in the same words by every part of the page (Needs-you's status line included); the
   // Pairing code box is on screen whenever it shows
   const UNPAIRED = "This phone was unpaired on the laptop: type a new pairing code in the box above to pair it again.";
@@ -24,7 +27,7 @@
   function sayUnpaired() { const st = document.getElementById("status"); if (st && st.textContent !== UNPAIRED) st.textContent = UNPAIRED; }
   // a page holding no credential the laptop takes: the server's own words for that name a header, so the page says
   // what to do instead, in every place it would show them
-  const NOT_PAIRED = "This app is not paired yet: type the pairing code from the laptop or from Safari.";
+  const NOT_PAIRED = "This app is not paired yet: type the pairing code from the laptop" + (isIos ? " or from Safari." : ".");
   let needsPair = false;
   function sayNotPaired() { const st = document.getElementById("status"); if (st && st.textContent !== NOT_PAIRED) st.textContent = NOT_PAIRED; }
   function forgetDevice(dev) {
@@ -155,7 +158,7 @@
   // ---- tabs -----------------------------------------------------------------------------------------------------
   let view = askedView || store.get("sessionStorage", "levain-view") || "needs";
   if (askedView) { try { history.replaceState(null, "", location.pathname + location.hash); } catch (e) { /* the address stays */ } }
-  if (!["needs", "board", "notes", "grants", "drop"].includes(view)) view = "needs";
+  if (!["needs", "board", "notes", "grants", "drop", "review"].includes(view)) view = "needs";
   function show(v) {
     const was = view;
     view = v; store.set("sessionStorage", "levain-view", v);
@@ -165,7 +168,13 @@
     $("view-needs").hidden = v !== "needs"; $("board").hidden = v !== "board"; $("notes").hidden = v !== "notes";
     if ($("grants")) $("grants").hidden = v !== "grants";   // drawn by phone.js from the same consent.json read
     if ($("drop")) $("drop").hidden = v !== "drop";         // the drop sheet and its outbox: phone.js too
-    for (const b of document.querySelectorAll("#tabs button")) b.setAttribute("aria-selected", b.dataset.view === v ? "true" : "false");
+    if ($("review")) $("review").hidden = v !== "review";   // the review queue and the morning card: phone.js too
+    for (const b of document.querySelectorAll("#tabs button")) {
+      const on = b.dataset.view === v;
+      b.setAttribute("aria-selected", on ? "true" : "false");
+      // the strip scrolls sideways once the tabs outgrow the screen: the one chosen is brought into view
+      if (on && b.scrollIntoView) { try { b.scrollIntoView({ inline: "nearest", block: "nearest" }); } catch (e) { /* stays where it is */ } }
+    }
     refreshView();
   }
   for (const b of document.querySelectorAll("#tabs button")) b.addEventListener("click", () => show(b.dataset.view));
@@ -199,7 +208,7 @@
                                          onclick: () => startEdit(line && line.text || "", act) }) : null;
     box.append(h("div", { class: "sl-row" }, textEl, edit));
     if (slNote) box.append(h("p", { class: "note " + slNoteKind, role: "status", text: slNote }));
-    if (forgets) box.append(h("p", { class: "note bad", text: "This browser will not remember the pairing: it works until the page is closed. To pair for good, get a new pairing code (in Safari: Install on this phone; on the laptop: levain ping pair) and try again in a browser that keeps site data." }));
+    if (forgets) box.append(h("p", { class: "note bad", text: "This browser will not remember the pairing: it works until the page is closed. To pair for good, get a new pairing code (" + (isIos ? "in Safari: Install on this phone; " : "") + "on the laptop: levain ping pair) and try again in a browser that keeps site data." }));
   }
   function startEdit(text, act) {
     slEditing = true; slNote = "";
@@ -358,8 +367,6 @@
   }
 
   // ---- notifications: the pings card -------------------------------------------------------------------------------
-  const ua = navigator.userAgent || "";
-  const isIos = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && (navigator.maxTouchPoints || 0) > 1);
   const standalone = navigator.standalone === true || (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
   const pushOk = swOk && "PushManager" in window && "Notification" in window;
   let pingNote = "", pingNoteKind = "", subState = null, installCode = null, installNote = "";
@@ -567,8 +574,8 @@
   // The installed app opened with no credential: the operator types the short code the laptop (`levain ping pair`) or
   // Safari's Install on this phone showed. The redeem carries no token header, since the page holds none to send.
   let pairNote = "", pairBusy = false;
-  const PAIR_FAILED = "This install link was already used or has expired. Get a new pairing code (in Safari: Install " +
-                      "on this phone; on the laptop: levain ping pair) and type it here.";
+  const PAIR_FAILED = "This install link was already used or has expired. Get a new pairing code (" +
+                      (isIos ? "in Safari: Install on this phone; " : "") + "on the laptop: levain ping pair) and type it here.";
   function needPairing() {
     if (needsPair) return;
     needsPair = true; sayNotPaired(); renderPairing();
@@ -596,7 +603,7 @@
         pairNote = "This browser will not keep the pairing, and the code is spent. Get a new code and try again in a " +
                    "browser that keeps site data.";
       } else if (r.status === 403) {
-        pairNote = "That code did not match, or it expired (only the newest code works). Get a new one: run levain ping pair on the laptop, or in Safari tap Install on this phone.";
+        pairNote = "That code did not match, or it expired (only the newest code works). Get a new one: run levain ping pair on the laptop" + (isIos ? ", or in Safari tap Install on this phone." : ".");
       } else if (r.status === 429) {
         const secs = Number(r.body.retry_after) > 0 ? Number(r.body.retry_after) : 60;
         pairNote = "Too many wrong codes. Try again in " + Math.max(1, Math.ceil(secs / 60)) + " min, then get a new code.";

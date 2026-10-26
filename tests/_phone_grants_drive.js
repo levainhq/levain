@@ -59,6 +59,8 @@ class Node {
   querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
 }
 
+const IPHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148";
+const ANDROID = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36";
 const IDS = ["status", "requests", "enrol", "enrol-note", "enrol-btn", "enrol-out", "refresh", "grants", "grants-status",
              "grants-list"];
 
@@ -73,7 +75,9 @@ function page(fetchImpl, opts) {
     querySelectorAll: (sel) => body.querySelectorAll(sel),
     addEventListener(ev, fn) { (this.listeners[ev] = this.listeners[ev] || []).push(fn); },
   };
-  const navigator = { credentials: { get: (o) => { log.webauthn.push(o.publicKey); return opts.webauthn(o.publicKey); } } };
+  // an iPhone unless a scenario says otherwise: the page names Face ID there and "your screen lock" elsewhere
+  const navigator = { userAgent: opts.userAgent === undefined ? IPHONE : opts.userAgent,
+                      credentials: { get: (o) => { log.webauthn.push(o.publicKey); return opts.webauthn(o.publicKey); } } };
   const window = { isSecureContext: true, PublicKeyCredential: function () {}, localStorage: memStore(),
                    sessionStorage: memStore(), addEventListener() {} };
   window.window = window;
@@ -142,6 +146,21 @@ const notesOf = (c) => c ? c.querySelectorAll("div.note").map((n) => n.textConte
 async function scripted() {
   const out = {};
   const base = { rpId: "phone.example", mine: { [FP]: RAW } };
+
+  // the platform's prompt is named by platform: Android's is the screen lock or a fingerprint, never Face ID
+  {
+    const names = {};
+    for (const [label, userAgent] of [["ios", IPHONE], ["android", ANDROID], ["none", undefined]]) {
+      const ans = { challenge: (route, b) => ok(200, REPLY(DEMOTE.id, { signer_fp: b.signer_fp })), revoke: () => ok(200, {}) };
+      const p = page(scriptedFetch(listing([DEMOTE]), ans), Object.assign({ webauthn: fakeCred, userAgent: label === "none" ? "" : userAgent }, base));
+      await tick();
+      p.button(p.card(DEMOTE.id), /revoke with passkey/i).click();
+      await tick();
+      const c = p.card(DEMOTE.id);
+      names[label] = { buttons: c.querySelectorAll("button").map((b) => b.textContent), text: c.textContent };
+    }
+    out.platform = names;
+  }
 
   // the list: the grant with a refused call comes first, and inside it the refused call leads
   {

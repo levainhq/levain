@@ -38,13 +38,18 @@ bound to the sealed tools — the core never imports the embedder's manifest). T
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
 
-from levain.autonomic.binding import Binding, BindingStatus, BindingStore
+from levain.autonomic.binding import Binding, BindingStatus, BindingStore, binding_family
+from levain.autonomic.coverage import (COVER_NONE, Cover, CoverageSource, CoverageView, Effect, GraduationPolicy,
+                                       _is_cover, authority_keys, covered, live)
 from levain.autonomic.policy import risk_floor
 from levain.autonomic.posture import Posture
-from levain.autonomic.risk import ActionRisk
+from levain.autonomic.risk import ActionManifest, ActionRisk, UnknownAction
 
 __all__ = [
     "DEEP_OUTBOUND_MIN_HOPS",
@@ -55,6 +60,10 @@ __all__ = [
     "one_rung_looser",
     "is_depth_bounded",
     "propose_graduation",
+    "LinkActionResolver",
+    "LinkCover",
+    "GraduationStep",
+    "graduate_due",
 ]
 
 _log = logging.getLogger("levain.autonomic.graduation")
@@ -237,3 +246,276 @@ def propose_graduation(
     # current > floor >= ABOVE_LOOP, so one_rung_looser is never None here; assert for the type-narrower.
     assert looser is not None and looser.value >= floor.value
     return GraduationProposal(source=binding, to_posture=looser)
+
+
+# 14b S4 (DESIGN_REV2 §5, DESIGN_REV3 §6): the engine step that takes a proposal under a signed graduation policy.
+#   LinkActionResolver: (binding, link_index) -> the action name link i's request builder emits: the honest engine's
+#   record of what it builds, never the fire path's input. The gate judges the action that runs, so this must be the
+#   same name the builder puts on the request.
+LinkActionResolver = Callable[[Binding, int], str]
+
+_STEP_STAMP = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+# RULINGS_R2 item 4: the replace refusals that mean the store moved after the walk read the binding (a revoke, a pause,
+# a fire, or another graduate run that already superseded it, under its id or this run's): the step is ``stale``.
+# replace_atomic's own compares (is_fireable, then equality with the grant as read) are the one check; the race
+# tests in test_autonomic_graduation_due.py pin them, so no caller-side restatement
+_STALE = frozenset({"target_exists", "old_absent", "old_not_fireable", "old_changed"})
+
+
+@dataclass(frozen=True)
+class LinkCover:
+    """One link of a proposed step: the action it runs, the manifest's risk for it (``None``: the manifest does not
+    declare it, so nothing covers it), what the view said of it, and the live policies of that view that cover it
+    (empty when the view names none: a view that is not a snapshot, or one whose policies disagree with its answer).
+    """
+
+    link_index: int
+    action_name: str
+    action_risk: ActionRisk | None
+    cover: Cover
+    policies: tuple[GraduationPolicy, ...] = ()
+
+    def covers(self, rung: Posture) -> bool:
+        """A live anchored policy signs this action at this risk and lets it run at ``rung``: the view's answer keeps
+        the gate's own invariant (``coverage._is_cover``, RULINGS_R1 item 6) and names a rung no stricter."""
+        return _is_cover(self.cover) and self.cover.posture is not None and self.cover.posture <= rung
+
+
+@dataclass(frozen=True)
+class GraduationStep:
+    """What :func:`graduate_due` did with one proposal.
+
+    ``outcome`` is ``graduated`` (the promoted grant replaced the old one and its audit row committed with it),
+    ``preview`` (covered, ``apply=False``: nothing was written), ``uncovered`` (some link's action no live anchored
+    policy signs at its manifest risk down to ``to_posture``: the card), ``unresolved`` (a link's action could not be
+    named: nothing covers what cannot be named), ``unattributed`` (covered, but a policy covering a link cannot be
+    named, or names no ``min_clean_fires``: nothing is written), ``error:<type>`` (refreshing the coverage, building
+    the promoted grant, the audit row or the replace raised: this binding's step is not taken; the others are), or the
+    :class:`~levain.autonomic.binding.ReplaceResult` reason that refused the replace."""
+
+    outcome: str
+    proposal: GraduationProposal
+    family: str
+    links: tuple[LinkCover, ...]
+    new_id: str | None = None
+    authority_head: tuple[int, str] | None = None
+    # where the engine ran: the binding store's directory and, when the coverage source names it, the cockpit data
+    # root whose authority log it reads (the card's line signs a policy for that store, in that log)
+    store_dir: str | None = None
+    cockpit_root: str | None = None
+
+    @property
+    def uncovered(self) -> tuple[LinkCover, ...]:
+        return tuple(link for link in self.links if not link.covers(self.proposal.to_posture))
+
+
+def _absolute(path: object) -> str:
+    # RULINGS_R2 item 3: a path the card's line carries names the same directory from any working directory
+    return str(Path(str(path)).expanduser().resolve())
+
+
+def _cockpit_root_of(coverage: CoverageSource | None) -> str | None:
+    root = getattr(coverage, "cockpit_root", None)
+    return None if root is None else _absolute(root)
+
+
+def _family_or_blank(binding: Binding) -> str:
+    try:
+        return binding_family(binding)
+    except Exception:  # noqa: BLE001 - an error step names the family when it can, never raises for it
+        return ""
+
+
+def _step_stamp(now: datetime) -> str:
+    return now.astimezone(timezone.utc).strftime(_STEP_STAMP)
+
+
+def _covering(view: CoverageView, effect: Effect, now: datetime, cover: Cover) -> tuple[GraduationPolicy, ...]:
+    """The live policies of ``view`` that cover ``effect`` at ``now`` (coverage's own ``covered`` and ``live``, over the
+    snapshot's policies, root file and store id), or ``()`` when ``view`` does not carry them or they do not give the
+    answer ``view`` gave (its strictest rung and one of their cover values)."""
+    policies, signers, store = (getattr(view, a, None) for a in ("policies", "signers", "store_id"))
+    if cover.posture is None or not isinstance(policies, tuple) or signers is None:
+        return ()
+    try:
+        keys = authority_keys(signers)
+        hits = tuple(p for p in policies if isinstance(p, GraduationPolicy) and p.store_id == store
+                     and covered(p, effect) and live(p, now, keys))
+        # RULINGS_R2 item 5: a hit whose rung or cover value cannot be read is a policy that cannot be read
+        if not hits or max(p.lowest_posture for p in hits) != cover.posture or \
+                cover.value not in {p.cover_value for p in hits}:
+            return ()
+    except Exception:  # noqa: BLE001 - policies that cannot be read name nothing
+        return ()
+    return hits
+
+
+def _walk(links: tuple[LinkCover, ...]) -> int | None:
+    """The clean fires the covering policies ask for: the strictest (largest) ``min_clean_fires`` of every policy
+    covering any link, at least 1; ``None`` when a link names no covering policy or one names no walk."""
+    walks: list[int] = []
+    for link in links:
+        if not link.policies:
+            return None
+        for p in link.policies:
+            n = getattr(p, "min_clean_fires", None)
+            if type(n) is not int or n < 0:
+                return None
+            walks.append(n)
+    return max([1, *walks])
+
+
+def _link_covers(binding: Binding, view: CoverageView | None, now: datetime, *, manifest: ActionManifest,
+                 link_action: LinkActionResolver, link_risk_resolver: LinkRiskResolver,
+                 family: str) -> tuple[LinkCover, ...]:
+    """Every link's effect as the gate builds it (``Effect(action, manifest risk, tools risk, trigger, family)``) and
+    what ``view`` says of it. Raises when a link's action or tools risk cannot be read."""
+    out: list[LinkCover] = []
+    for i in range(len(binding.goal)):
+        action = link_action(binding, i)
+        if not isinstance(action, str) or not action:
+            raise ValueError(f"link {i} of {binding.binding_id} names no action")
+        try:
+            action_risk: ActionRisk | None = manifest.risk_of(action)
+        except UnknownAction:
+            action_risk = None
+        effect = Effect(action, action_risk, link_risk_resolver(binding, i), binding.trigger.type, family)
+        cover = Cover(None, COVER_NONE) if view is None or action_risk is None else view.cover(effect, now)
+        if not _is_cover(cover):
+            cover = Cover(None, COVER_NONE)     # what the gate does with the same answer: it covers nothing
+        out.append(LinkCover(i, action, action_risk, cover,
+                             _covering(view, effect, now, cover) if view is not None else ()))
+    return tuple(out)
+
+
+def _audit_row(step: GraduationStep, at: str, new_id: str, view: CoverageView) -> tuple:
+    """The ``graduation_steps`` row of a covered step. ``policy_id`` and ``incarnation`` name every policy that
+    covered one of its links (comma-joined when there are several). A link that names no covering policy raises
+    ``ValueError``: the row is never written with a policy it cannot name (RULINGS_R1 item 11)."""
+    if not step.links or not all(link.policies for link in step.links):
+        raise ValueError(f"no covering policy can be named for {step.proposal.old_binding_id}")
+    covering = {p for link in step.links for p in link.policies}
+    ids = sorted({p.grant_id for p in covering})
+    incarnations = sorted({p.incarnation for p in covering})
+    head = view.token[0]
+    p = step.proposal
+    return (at, p.old_binding_id, new_id, step.family, p.from_posture.name, p.to_posture.name, p.clean_count,
+            p.fire_count, ",".join(ids), ",".join(incarnations), f"{head[0]}:{head[1]}")
+
+
+def graduate_due(
+    store: BindingStore,
+    coverage: CoverageSource | None,
+    *,
+    clock: Callable[[], datetime],
+    manifest: ActionManifest,
+    link_action: LinkActionResolver,
+    risk_resolver: RiskResolver,
+    link_risk_resolver: LinkRiskResolver,
+    min_clean_fires: int = DEFAULT_MIN_CLEAN_FIRES,
+    apply: bool = True,
+) -> list[GraduationStep]:
+    """The engine step (DESIGN_REV2 §5, DESIGN_REV3 §6): for each fireable binding :func:`propose_graduation`
+    proposes, refresh ``coverage`` (outside any store transaction), mint the promoted grant ACTIVE, then judge each of
+    its links' effects against that one view. Covered at the target rung on every link: ``replace_atomic`` it, its
+    ``coverage`` callable reading only that view, its risk floor from ``risk_resolver``, and its ``record`` writing the
+    ``graduation_steps`` audit row in the replace's own transaction. Otherwise the step is returned uncovered (the
+    card), and nothing is written.
+
+    The evidence a covered step needs is the policies' own (RULINGS_R1 item 2): the strictest ``min_clean_fires`` of
+    the policies covering its links; a step under it is not returned. ``min_clean_fires`` here is only the walk
+    before a step no named policy's walk governs (``uncovered``, ``unresolved``, ``unattributed``) is returned as a
+    card.
+
+    ``manifest`` is the gate's (the risk a policy must sign is the manifest's for the action that runs);
+    ``link_action`` names the action each link's request builder emits; ``link_risk_resolver`` is the gate's
+    ``binding_risk`` (the tools risk of link i). ``coverage`` ``None`` covers nothing. ``apply=False`` writes nothing:
+    a covered step is returned as ``preview``. What stops an uncovered binding firing below CONFIRM is the gate's clamp
+    at every fire, not this step."""
+    out: list[GraduationStep] = []
+    where = {"store_dir": _absolute(store.path), "cockpit_root": _cockpit_root_of(coverage)}
+    for binding in store.list_active():
+        # every clean binding is a candidate: which walk it must have taken is known only once its covers are read.
+        # A resolver that raises on this binding leaves it unproposed (logged), never the run: the steps already taken
+        # stay as returned (no step is built here, because a step needs the proposal that could not be made)
+        try:
+            proposal = propose_graduation(binding, risk_resolver=risk_resolver, link_risk_resolver=link_risk_resolver,
+                                          min_clean_fires=1)
+        except Exception as e:  # noqa: BLE001 - one binding's failure never hides the steps already taken
+            _log.warning("graduation: binding %s: no proposal could be made (%s): %s", binding.binding_id,
+                         type(e).__name__, e)
+            continue
+        if proposal is None:
+            continue
+        # RULINGS_R2 item 1: a refresh or a promoted grant that raises (a locked authority log) is this binding's own
+        # error step, as a failed replace is below: the bindings already stepped stay as returned, the rest still step
+        try:
+            view = coverage.refresh() if coverage is not None else None
+            now = clock()
+            at = _step_stamp(now)
+            # RULINGS_R1 item 4: the step, its card and the replace's own coverage check all judge the PROMOTED
+            # grant's links (the grant that will fire), never the old one's
+            promoted = proposal.build_promoted(status=BindingStatus.ACTIVE, created_at=at)
+            family = binding_family(promoted)
+        except Exception as e:  # noqa: BLE001 - one binding's failure never hides the steps already taken
+            _log.warning("graduation: binding %s: the step could not be judged (%s): %s", binding.binding_id,
+                         type(e).__name__, e)
+            out.append(GraduationStep(f"error:{type(e).__name__}", proposal, _family_or_blank(binding), (), **where))
+            continue
+        try:
+            links = _link_covers(promoted, view, now, manifest=manifest, link_action=link_action,
+                                 link_risk_resolver=link_risk_resolver, family=family)
+        except Exception as e:  # noqa: BLE001 - an effect that cannot be named is covered by nothing
+            _log.warning("graduation: binding %s: a link's effect cannot be read (%s): %s", binding.binding_id,
+                         type(e).__name__, e)
+            if proposal.clean_count >= min_clean_fires:
+                out.append(GraduationStep("unresolved", proposal, family, (), **where))
+            continue
+        head = view.token[0] if view is not None else None
+        step = GraduationStep("uncovered", proposal, family, links, authority_head=head, **where)
+        if view is None or step.uncovered:
+            if proposal.clean_count >= min_clean_fires:
+                out.append(step)
+            continue
+        walk = _walk(links)
+        if walk is None:
+            # RULINGS_R2 item 2: a walk no policy names is the engine's, as for an uncovered binding's card
+            if proposal.clean_count >= min_clean_fires:
+                out.append(replace(step, outcome="unattributed"))
+            continue
+        if proposal.clean_count < walk:
+            continue
+        if not apply:
+            out.append(replace(step, outcome="preview"))
+            continue
+
+        def covered_new(new: Binding, rung: Posture, view: CoverageView = view, now: datetime = now) -> bool:
+            # reads only the view refreshed above (S3b RULINGS_R2 observation 1); writes nothing
+            new_links = _link_covers(new, view, now, manifest=manifest, link_action=link_action,
+                                     link_risk_resolver=link_risk_resolver, family=binding_family(new))
+            return bool(new_links) and all(link.covers(rung) for link in new_links)
+
+        # RULINGS_R1 item 8: the row is built before anything is written, and a failure of this binding's step is its
+        # own error step: the bindings already stepped stay as returned, the rest still step
+        try:
+            row = _audit_row(step, at, promoted.binding_id, view)
+
+            def record(conn: sqlite3.Connection, row: tuple = row) -> None:
+                conn.execute("INSERT INTO graduation_steps (at, old_id, new_id, family, from_posture, to_posture, "
+                             "clean_count, fire_count, policy_id, incarnation, authority_head) "
+                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", row)
+
+            result = store.replace_atomic(binding, promoted, coverage=covered_new,
+                                          risk_floor_of=lambda b: risk_floor(risk_resolver(b)), record=record)
+        except Exception as e:  # noqa: BLE001 - one binding's failure never hides the steps already taken
+            _log.warning("graduation: binding %s: the step failed (%s): %s", binding.binding_id, type(e).__name__, e)
+            out.append(replace(step, outcome=f"error:{type(e).__name__}"))
+            continue
+        if not result and result.reason in _STALE:
+            _log.warning("graduation: binding %s changed after it was read (%s); nothing written", binding.binding_id,
+                         result.reason)
+        outcome = "graduated" if result else "stale" if result.reason in _STALE else result.reason
+        out.append(replace(step, outcome=outcome, new_id=promoted.binding_id if result else None))
+    return out
+

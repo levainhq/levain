@@ -67,6 +67,14 @@ verifies.
 The listing (:meth:`CoordPhone.listing`) never creates the store; a drop does, exactly as ``levain drop`` does. Stdlib
 only.
 
+- **The review queue and the morning card** (C4-c, C6-c; READ-ONLY on the phone): ``GET /coord.json``
+  (:meth:`CoordPhone.coord_listing`, not ``/consent.json``, so the page's poll pays for it only while the Review tab is
+  shown) carries ``coord_review`` (the queue's open count and its bounded pages, from :func:`levain.coordinator.review.queue_page`) and
+  ``coord_morning`` (the card, :func:`levain.coordinator.morning.card` and its own
+  :func:`~levain.coordinator.morning.render` lines), each with a ``*_note`` when the store could not be read. The queue
+  is read once per response and both come from that read. "Waiting on you" is the card's own derived count, never
+  computed here. Nothing on this port clears or reopens an item (tests/test_coordinator_phone_review.py pins that).
+
 Known edges: a browser without Web Locks (``navigator.locks``) edits the outbox unlocked, so two tabs of it can each
 overwrite the other's change; the page says "one tab at a time" there. iOS Safari ships Web Locks from 15.4
 [judged by coordphone-fix2, 2026-10-23, against the head's ruling 4].
@@ -82,10 +90,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-__all__ = ["DROPS_SHOWN", "REVIEWS_KEPT", "REVIEW_TTL", "CoordPhone", "CoordRefused"]
+__all__ = ["DROPS_SHOWN", "REVIEWS_KEPT", "REVIEW_CLEARED_SHOWN", "REVIEW_OPEN_SHOWN", "REVIEW_TTL", "CoordPhone",
+           "CoordRefused"]
 
 # phone drops a listing shows, newest first
 DROPS_SHOWN = 10
+# review items a listing shows: the open ones (oldest first, as the queue lists them) and the newest cleared ones
+REVIEW_OPEN_SHOWN = 50
+REVIEW_CLEARED_SHOWN = 10
 # repos the sheet suggests for an envelope's "where" (the store's own threads and drop sources)
 _REPOS_SHOWN = 20
 _DROP_KEYS = frozenset({"words", "outbox_id", "sent_at", "store_id"})
@@ -233,6 +245,76 @@ class CoordPhone:
             out["coord_store_id"], out["coord_store_read"] = None, False
             out["coord_note"] = f"the coordinator store cannot be read: {type(exc).__name__}: {str(exc)[:200]}"
         return out
+
+    def coord_listing(self) -> dict[str, Any]:
+        """``GET /coord.json``: the review queue (``coord_review``) and the morning card (``coord_morning``), each with a
+        ``*_note`` when it cannot be read, so a queue or card that fails is never an empty panel. The page asks for it
+        only while the Review tab is shown. The queue is read ONCE and both views are made from that read."""
+        from levain.autonomic.durable_sqlite import read_transaction
+        from levain.coordinator import review
+        from levain.coordinator.store import StoreAbsent
+
+        out: dict[str, Any] = {"coord_review": None, "coord_review_note": None,
+                               "coord_morning": None, "coord_morning_note": None}
+        try:
+            store = self._store(create=False)
+            if store is None:
+                return out
+            # the count and the two bounded pages: the queue keeps every item it ever held, and a view reads only what it
+            # shows. The card is made inside the same read transaction, so the response is one snapshot of the store
+            with read_transaction(store.open_readonly) as conn:
+                page = review.queue_page(conn, open_limit=REVIEW_OPEN_SHOWN, cleared_limit=REVIEW_CLEARED_SHOWN)
+                # each is its own note: a card that cannot be read leaves the queue shown
+                for key, make in (("coord_review", lambda: self.review_view(store, page)),
+                                  ("coord_morning", lambda: self.morning_view(store, page, conn))):
+                    try:
+                        out[key] = make()
+                    except Exception as exc:  # noqa: BLE001 - shown as the panel's note, never the page's failure
+                        out[key + "_note"] = f"cannot be read: {type(exc).__name__}: {str(exc)[:200]}"
+        except StoreAbsent:          # the file holds no current coordinator tables yet: nothing to show, nothing made
+            return {**out, "coord_review": None, "coord_morning": None}
+        except Exception as exc:  # noqa: BLE001 - shown as both panels' note, never the page's failure
+            note = f"cannot be read: {type(exc).__name__}: {str(exc)[:200]}"
+            return {"coord_review": None, "coord_review_note": note, "coord_morning": None, "coord_morning_note": note}
+        return out
+
+    def review_view(self, store: Any, page: Any) -> dict[str, Any]:
+        """The review queue as the phone shows it, from ``page`` (one :func:`levain.coordinator.review.queue_page`
+        read): ``{"open": [...], "open_total", "cleared": [...], "now"}``, an item
+        ``{item_id, feed, label, authority_relevant, text, at, state, cleared_at}`` with its text display-safe."""
+        from levain.cockpit.display_safe import visible
+        from levain.cockpit.consent import utc_stamp
+        from levain.coordinator import review
+
+        def row(i: Any) -> dict[str, Any]:
+            return {"item_id": i.item_id, "feed": i.feed, "label": review.FEED_LABELS.get(i.feed, i.feed),
+                    "authority_relevant": i.authority_relevant,
+                    "text": visible(str(i.body.get("text", ""))[:300]), "at": i.at, "state": i.state,
+                    "cleared_at": i.last[3] if i.state == "cleared" and i.last is not None else None}
+
+        return {"open": [row(i) for i in page.open], "open_total": page.open_total,
+                "cleared": [row(i) for i in page.cleared], "now": utc_stamp(self._clock())}
+
+    def morning_view(self, store: Any, page: Any, conn: Any = None) -> dict[str, Any]:
+        """The coordinator's morning card as the phone shows it: its own counts and its own ``render`` lines,
+        display-safe. The card is made from ``page`` (the one queue read the queue view is made from), so the card's
+        count and the queue's open total cannot disagree."""
+        from levain.coordinator import morning
+        from levain.cockpit.display_safe import visible
+
+        c = morning.card(store, items=page.open, review_total=page.open_total, conn=conn)
+        w = c["waiting"]
+        # a section the card could not read is None, never the empty list it fell back to (card() records it in errors)
+        unread = {e.split(":", 1)[0] for e in c["errors"]}
+        return {"at": c["at"], "lines": visible(morning.render(c)).split("\n"),
+                "away": [a for a, s in c["away"].items() if s.get("away")],
+                "away_unknown": [a for a, s in c["away"].items() if s.get("away") is None],
+                "undecided": None if "undecided" in unread else len(c["undecided"]),
+                "budgets_crossed": sum(1 for b in c["budgets"] if b["refusal"] and not b["unreadable"]),
+                "budgets_unreadable": sum(1 for b in c["budgets"] if b["unreadable"]),
+                "budgets": len(c["budgets"]),
+                "waiting": sum(len(v) for v in w["threads"].values()) + len(w["loose"]),
+                "waiting_unreadable": len(w["unresolved"]), "review_open": c["review_total"], "errors": c["errors"]}
 
     # --- the routes --------------------------------------------------------------------------------------------------
     def step(self, action: str, req: Any, *, device: str | None) -> dict[str, Any]:

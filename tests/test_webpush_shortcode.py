@@ -349,9 +349,9 @@ def test_a_locked_route_opens_only_for_a_run_token_mint(tmp_path: Path):
 
 def test_the_page_offers_the_typed_code_in_the_installed_app():
     js = _JS.read_text(encoding="utf-8")
-    for words in ("This app is not paired yet: type the pairing code from the laptop or from Safari.",
+    for words in ('This app is not paired yet: type the pairing code from the laptop" + (isIos ? " or from Safari." : ".")',
                   "That code did not match, or it expired (only the newest code works). Get a new one: run levain ping "
-                  "pair on the laptop, or in Safari tap Install on this phone.",
+                  'pair on the laptop" + (isIos ? ", or in Safari tap Install on this phone." : ".")',
                   "Too many wrong codes. Try again in ", " min, then get a new code.",
                   "Type this code in the box the app shows.", "New code", "Pairing code"):
         assert words in js, words
@@ -363,6 +363,17 @@ def test_the_page_offers_the_typed_code_in_the_installed_app():
     redeem = js[js.index("function redeemShort"):js.index("function submitPair")]
     assert "X-Levain-Phone-Token" not in redeem and "location.reload()" in js
     assert "innerHTML" not in js
+
+
+def test_safari_is_named_only_on_ios():
+    """The strings that name Safari are built from ``isIos``, which is computed before the first of them is made
+    (a ``const`` read earlier is a ReferenceError that blanks the page)."""
+    js = _JS.read_text(encoding="utf-8")
+    assert js.index("const isIos") < js.index("const NOT_PAIRED"), "isIos must be defined before NOT_PAIRED uses it"
+    assert js.count("const isIos") == 1
+    for line in js.splitlines():
+        if "Safari" in line and "Try Chrome on Android" not in line and not line.lstrip().startswith("//"):
+            assert "isIos" in line, line
 
 
 def test_the_page_copy_never_sends_the_operator_back_to_a_browser_link():

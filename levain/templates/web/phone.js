@@ -40,6 +40,11 @@
     else if (/(?:^#|&)choice=/.test(location.hash)) history.replaceState(null, "", location.pathname);
   });
 
+  // what the platform's passkey prompt is called to the person: Face ID on an iPhone or iPad (the same test phone_app.js
+  // uses), the neutral "your screen lock" elsewhere (Android's sheet is the screen lock or a fingerprint)
+  const ua = navigator.userAgent || "";
+  const isIos = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && (navigator.maxTouchPoints || 0) > 1);
+  const unlock = isIos ? "Face ID" : "your screen lock";
   const usable = window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
     && !!(navigator.credentials && navigator.credentials.get);
   let rpId = location.hostname;
@@ -158,6 +163,74 @@
     if (!usable) $("status").textContent += " · this browser cannot use a passkey here (needs https)";
     drawGrants(data);
     drawDrops(data, seq);
+  }
+
+  // C4-c / C6-c: the coordinator's review queue and its morning card, READ-ONLY here. /coord.json carries both
+  // (`coord_review`, `coord_morning`, levain.coordinator.phone); "waiting on you" and every count is the server's, never
+  // recomputed. Clear and reopen are not offered here. It is its own read, not /consent.json's: asked for only while the
+  // Review tab is shown, and never again while a previous ask is still out, so the 10 s tick cannot stack requests
+  let coordAsking = false;
+  function loadCoord() {
+    if (!token || coordAsking || !$("review") || $("review").hidden) return;
+    coordAsking = true;
+    call("GET", "/coord.json").then((r) => {
+      if ($("review").hidden) return;      // the tab was left while this was out: nothing to draw; showing it again asks again
+      const bad = r.ok ? "" : why(r);
+      drawReview(r.ok ? r.body : { coord_review_note: bad, coord_morning_note: bad });
+    }).catch(() => { /* the panel keeps what it showed; while the tab is shown the 10 s tick asks again */ }).finally(() => { coordAsking = false; });
+  }
+  const ago = (iso, now) => {
+    const t = typeof iso === "string" ? Date.parse(iso.replace(/(\.\d{3})\d+/, "$1")) : NaN;
+    const n = typeof now === "string" ? Date.parse(now.replace(/(\.\d{3})\d+/, "$1")) : Date.now();
+    if (isNaN(t) || isNaN(n)) return "";
+    const s = Math.max(0, Math.round((n - t) / 1000));
+    return s < 90 ? "just now" : s < 5400 ? Math.round(s / 60) + " min ago" : s < 129600 ? Math.round(s / 3600) + " h ago" : Math.round(s / 86400) + " d ago";
+  };
+  function reviewCard(i, now) {
+    const card = el("article", "req review-item" + (i.state === "cleared" ? " cleared" : ""));
+    const head = el("div", "req-head");
+    head.append(el("span", "tool", typeof i.label === "string" && i.label ? i.label : i.feed), el("span", "meta", ago(i.at, now)));
+    if (i.authority_relevant) head.appendChild(el("span", "tier", "yours to clear"));
+    card.append(head, el("div", "note-what", typeof i.text === "string" ? i.text : ""));
+    if (i.state === "cleared") card.appendChild(el("div", "where", "cleared " + ago(i.cleared_at, now)));
+    return card;
+  }
+  function drawReview(data) {
+    if (!$("review-list")) return;
+    const rv = data.coord_review && typeof data.coord_review === "object" ? data.coord_review : null;
+    const rn = typeof data.coord_review_note === "string" && data.coord_review_note ? data.coord_review_note : "";
+    const open = rv && Array.isArray(rv.open) ? rv.open : [];
+    const cleared = rv && Array.isArray(rv.cleared) ? rv.cleared : [];
+    const total = rv && Number.isInteger(rv.open_total) ? rv.open_total : open.length;
+    // a queue that could not be read is never "nothing to review"
+    $("review-meta").textContent = rn ? "can't read the review queue: " + rn : !rv ? "no coordinator store yet"
+      : total ? total + " open" + (total > open.length ? " (" + open.length + " shown)" : "") : "nothing to review";
+    $("review-list").replaceChildren(...open.map((i) => reviewCard(i, rv.now)));
+    $("review-cleared-meta").textContent = rn ? "can't read" : cleared.length ? "newest first" : "none";
+    $("review-cleared").replaceChildren(...cleared.map((i) => reviewCard(i, rv.now)));
+    const mc = data.coord_morning && typeof data.coord_morning === "object" ? data.coord_morning : null;
+    const mn = typeof data.coord_morning_note === "string" && data.coord_morning_note ? data.coord_morning_note : "";
+    $("morning-meta").textContent = mn ? "can't read the morning card: " + mn : !mc ? "no coordinator store yet" : "as of " + readable(mc.at);
+    if (!mc) { $("morning").replaceChildren(); return; }
+    const facts = [];
+    const away = Array.isArray(mc.away) ? mc.away : [], unk = Array.isArray(mc.away_unknown) ? mc.away_unknown : [];
+    // known-away and unknown are independent: one agent unreadable never hides that another is away
+    if (away.length || unk.length) {
+      if (away.length) facts.push("away ON for " + away.join(", "));
+      if (unk.length) facts.push("away UNKNOWN for " + unk.join(", "));
+    } else facts.push("away off");
+    facts.push(mc.waiting + " waiting on you" + (mc.waiting_unreadable ? " (" + mc.waiting_unreadable + " unreadable)" : ""));
+    // a section the card could not read is null: said so, never "0 undecided"
+    facts.push(Number.isInteger(mc.undecided) ? mc.undecided + " undecided" : "undecided: could not read");
+    facts.push(mc.budgets + (mc.budgets === 1 ? " thread budget" : " thread budgets") + (mc.budgets_crossed ? ", " + mc.budgets_crossed + " crossed" : "")
+               + (mc.budgets_unreadable ? ", " + mc.budgets_unreadable + " could not be read (new steps stop)" : ""));
+    facts.push(mc.review_open + " in the review queue");
+    const card = el("article", "req morning-card");
+    // the counts lead; the card's own lines (what `levain coord morning` prints) are one tap down, so the queue is not read twice
+    const more = el("details", "morning-more");
+    more.append(el("summary", null, "the whole card"), el("pre", "display morning-lines", Array.isArray(mc.lines) ? mc.lines.slice(1).join("\n") : ""));
+    card.append(el("div", "note-what", facts.join(" \u00b7 ")), more);
+    $("morning").replaceChildren(card);
   }
 
   // a question: text only (never HTML) for everything the agent wrote. No passkey: the answer is unsigned and
@@ -354,9 +427,10 @@
   // so does leaving its view (phone_app.js's tabs): a picker or a revoke still being asked for, left on a hidden tab,
   // would hold every list still where nobody can see it. A ceremony past its Face ID prompt is not dismissed
   // and so does any open K8 review (signPending): the view change dismisses every one (dismissReviews, below)
-  window.levainViewChanged = () => {
+  window.levainViewChanged = (v) => {
     const picked = !!(closePick && closePick());
     if (dismissReviews() || picked) setTimeout(load, 0);
+    if (v === "review") setTimeout(loadCoord, 0);     // the tab's first look does not wait for the next tick
   };
 
   function start(r, decision, signers, say, actions, ruling, go, what) {
@@ -526,7 +600,7 @@
         card.insertBefore(el("div", "pick-top", "Your pick: (" + po.key + "). Read the item; Sign (" + po.key + ") is below it."),
                           head.nextSibling);
         const block = el("div", "picked");
-        const pb = el("button", "allow", "Sign (" + po.key + ") with Face ID");
+        const pb = el("button", "allow", "Sign (" + po.key + ") with " + unlock);
         pb.type = "button";
         pb.disabled = !usable || !signers.length;
         const pl = el("div", "line", po.line);
@@ -547,7 +621,7 @@
           : "the option in the link (" + pick.slice(0, 24) + ") is not on this card: pick one below"), head.nextSibling);
       }
       if (!options.length) {
-        const b = el("button", "allow", "sign with Face ID");
+        const b = el("button", "allow", "sign with " + unlock);
         b.type = "button";
         b.disabled = !usable || !signers.length;
         b.addEventListener("click", go(undefined));
@@ -980,7 +1054,7 @@
         return release();
       }
       if (typeof c.body.prev_hash !== "string") {
-        say("not revoked: the server did not say which log head the link chains to, so the page cannot check what Face ID would sign; nothing was signed", "bad");
+        say("not revoked: the server did not say which log head the link chains to, so the page cannot check what " + unlock + " would sign; nothing was signed", "bad");
         return release();
       }
       return linkChallenge(c.body.prev_hash, c.body.line).then((want) => {
@@ -995,17 +1069,17 @@
 
     function sheet(c, want) {
       const box = el("div", "sheet");
-      box.append(el("div", "where", "Face ID signs exactly this authority link (it removes grant " + (g.id_shown || g.id) + "):"),
+      box.append(el("div", "where", (isIos ? "Face ID" : "Your screen lock") + " signs exactly this authority link (it removes grant " + (g.id_shown || g.id) + "):"),
                  el("pre", "display line", c.body.line));
       const row = el("div", "actions");
-      const go = el("button", "deny", "revoke with Face ID");
+      const go = el("button", "deny", "revoke with " + unlock);
       go.type = "button";
       const no = el("button", "quiet", "cancel");
       no.type = "button";
       row.append(go, no);
       box.appendChild(row);
       actions.after(box);
-      say("check the link, then revoke with Face ID");
+      say("check the link, then revoke with " + unlock);
       const dismiss = () => { if (released) return false; box.remove(); say(""); release(); return true; };
       closePick = closer = dismiss;
       no.addEventListener("click", dismiss);
@@ -1125,6 +1199,7 @@
       if (held()) return;
       if (r.ok) draw(r.body, seq); else { $("status").textContent = why(r); grantsUnread(why(r)); }
     });
+    loadCoord();
   }
 
   // K8: a cockpit write signed by this phone's passkey. issue(fp) files the write as a pending under that passkey (the

@@ -63,6 +63,15 @@ def test_the_grants_tab_shows_refused_first_and_signs_only_the_link_it_showed():
     assert r["revoke"] and not r["disabled"], r
     assert "2 standing grants" in r["status"] and "1 with a refused call" in r["status"], r
 
+    # the platform's prompt is named by platform: Face ID on an iPhone, "your screen lock" on Android and wherever the
+    # page cannot tell (a missing or empty user agent), and never both
+    pf = got["platform"]
+    assert "revoke with Face ID" in pf["ios"]["buttons"] and "Face ID signs exactly this authority link" in pf["ios"]["text"], pf
+    for other in ("android", "none"):
+        assert "revoke with your screen lock" in pf[other]["buttons"], pf[other]
+        assert "Your screen lock signs exactly this authority link" in pf[other]["text"], pf[other]
+        assert "Face ID" not in pf[other]["text"] and not any("Face ID" in b for b in pf[other]["buttons"]), pf[other]
+
     c = got["ceremony"]
     # the challenge names the grant's instance as listed, with the passkey this browser made
     assert c["posts"][0] == ["/grant/cg-bbbbbbbbbbbb/revoke-challenge",

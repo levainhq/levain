@@ -7,6 +7,7 @@ the REAL glue and srt in `test_decider_glue.py`.
 
 from __future__ import annotations
 
+import json
 import socket
 import threading
 import time
@@ -793,3 +794,82 @@ def test_r2_d3_a_verdict_kind_outside_silent_card_wall_is_denied(rig, monkeypatc
     v = r.srt.wait(p, 2 if where == "form" else 1)
     assert (v[-1]["action"], v[-1]["status"], v[-1]["reason"]) == ("deny", 403, "wall: verdict_kind")
     assert r.desk.filed == [] and r.rows(rid)[0].deciding_step == "wall:verdict_kind"
+
+
+# --- S9 r2 item A: a lifted read stores the NAMES the exemption lifted (never a value) ---------------------------
+
+_AZ = "sig=AZV1&sv=2022-11-02&se=2030-01-01&sp=r"
+
+
+@pytest.mark.parametrize("host,query,expect", [
+    ("acct.blob.core.windows.net", _AZ, ["sig"]),
+    ("acct.blob.core.windows.net", _AZ + "&X-Amz-Signature=SV9", ["sig", "x-amz-signature"]),
+    ("ok.test", "X-Amz-Signature=SV9&X-Amz-Credential=SV8", ["x-amz-signature", "x-amz-credential"]),
+])
+def test_a_lifted_read_stores_the_lifted_names_and_no_value(rig, host, query, expect) -> None:
+    r = rig()
+    g, rid = r.srt.req("GET", host=host, path="/c/b", query=query)
+    assert action(r.srt.wait(g)) == "allow"
+    row = [x for x in r.rows(rid) if x.kind == "egress_attempt"][0]
+    stored = json.loads(row.names)
+    assert [n for n in stored if n in ("sig", "x-amz-signature", "x-amz-credential")] == expect
+    assert "SV9" not in row.names and "AZV1" not in row.names and "SV8" not in row.names
+
+
+# --- S9 r2 item B: the over-cap reason labels the over-cap card only ----------------------------------------------
+
+@pytest.mark.parametrize("query,extra,why", [
+    (None, {}, "upload_pack_over_cap"),
+    ("token=QV1", {}, "credential_in_query"),
+    ("_method=DELETE", {}, "_method"),
+    (None, {"x-http-method-override": ["DELETE"]}, "override:x-http-method-override"),
+])
+def test_a_cut_pack_body_labels_its_row_by_the_card_it_filed(rig, query, extra, why) -> None:
+    r = rig()
+    _advertise(r)
+    p, rid = r.srt.req("POST", path="/r.git/git-upload-pack", query=query,
+                       headers=UP_CT | {"transfer-encoding": ["chunked"]} | extra)
+    assert r.srt.wait(p)[0]["action"] == "need_body"
+    r.srt.body(p, b"x" * (advert.UPLOAD_PACK_BODY_CAP + 1))
+    assert _until(lambda: r.desk.filed)
+    r.desk.answer["card-1"] = "denied"
+    assert _until(lambda: [x for x in r.rows(rid) if x.kind == "egress_attempt"])
+    assert [x.deciding_step for x in r.rows(rid) if x.kind == "egress_attempt"] == [f"card:{why}:denied"]
+
+
+# --- S9 r3b item 3: only the exemptions classify produces lift names into the row ----------------------------------
+
+def test_classify_labels_each_lifted_read_by_one_of_two_exemptions(rig) -> None:
+    """The decider's lifted-names branch is gated on exactly these labels; a combined read is `azure_sas`."""
+    seen = {}
+    real = classify.decide
+
+    def spy(*a, **k):
+        v = real(*a, **k)
+        seen[a[0].canonical_host] = v.exemption
+        return v
+
+    r = rig()
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(classify, "decide", spy)
+        for host, query in (("acct.blob.core.windows.net", _AZ), ("acct.blob.core.windows.net", _AZ + "&X-Amz-Signature=SV9"),
+                            ("ok.test", "X-Amz-Signature=SV9")):
+            g, _ = r.srt.req("GET", host=host, path="/c/b", query=query)
+            assert action(r.srt.wait(g)) == "allow"
+    assert seen == {"acct.blob.core.windows.net": "azure_sas", "ok.test": "signed_url"}
+
+
+def test_an_exemption_label_classify_does_not_produce_lifts_no_names(rig) -> None:
+    import dataclasses
+    real = classify.decide
+
+    def future_label(*a, **k):
+        return dataclasses.replace(real(*a, **k), exemption="ip_allowlist")
+
+    r = rig()
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(classify, "decide", future_label)
+        g, rid = r.srt.req("GET", host="ok.test", path="/c/b", query="X-Amz-Signature=SV9")
+        assert action(r.srt.wait(g)) == "allow"
+    row = [x for x in r.rows(rid) if x.kind == "egress_attempt"][0]
+    assert "x-amz-signature" not in json.loads(row.names)

@@ -147,3 +147,10 @@ textarea.words { width: 100%; box-sizing: border-box; margin-top: var(--sp-4); f
 .req.sign .pick-miss { margin-top: var(--sp-3); color: var(--warn); }
 /* the first screen of the linked card says the tap carried his pick, and that its button is below the item */
 .req.sign .pick-top { margin-top: var(--sp-3); font-weight: 600; color: var(--contrast); }
+
+/* the review tab: items wait for a look and authorise nothing, so no warm rule; a cleared one is quieter still */
+.req.review-item { border-top: 1px dashed var(--hair); background: none; }
+.req.review-item.cleared { opacity: .7; }
+.req.review-item .note-what, .req.morning-card .note-what { font-weight: 600; overflow-wrap: anywhere; margin-top: var(--sp-3); }
+.req.morning-card { border-top: 1px dashed var(--hair); background: none; }
+.req.morning-card .morning-lines { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }

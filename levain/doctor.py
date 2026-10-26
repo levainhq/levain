@@ -33,6 +33,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -155,6 +156,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_dispatch_verifiers())
     core.extend(_check_slot_isolation())
     core.extend(_check_slot_limits())
+    core.extend(_check_slot_keys())
     for r in core:
         _emit(r)
     print(spend_cap_note())
@@ -505,8 +507,8 @@ def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResu
         return [CheckResult("agent slots", False, f"the pool configuration cannot be read ({_slot_why(exc)})",
                             f"Look at {store / 'policy' / 'pool'}.")]
     found, ignored = _read_slot_dirs(store / "slots")
-    live = {t: v for t, v in found.items() if v[0] != "retired"}
-    tombs = sorted(t for t, v in found.items() if v[0] == "retired")
+    live = {t: v for t, v in found.items() if v[0] not in R.OUT_OF_SERVICE}
+    tombs = sorted(t for t, v in found.items() if v[0] in R.OUT_OF_SERVICE)
     usable = {t for t, v in live.items() if v[0] in _SLOT_USABLE}
     bad = [f"{t} ({v[1] or v[0]})" for t, v in live.items() if t not in usable]
     note = ((f"; {len(tombs)} retired, not counted" if tombs else "")
@@ -607,6 +609,452 @@ def _check_slot_limits(*, host: str | None = None, store: Path | None = None, ow
                                 "Start the Levain queue broker unit (levain-qbroker on Linux, com.levain.qbroker on macOS).",
                                 warn=True)]
     return [CheckResult(name, True, detail)]
+
+
+# --- 3c-9: the brokered-spend rows (route trust, keys, the spend ledger, the invoice ceiling) --------------------
+
+#: OpenRouter's key-status endpoint: ``limit`` and ``limit_remaining`` for the key that asks (US dollars).
+OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
+#: The most one limit read may take in total (name lookup through the last body byte): doctor never hangs on a provider.
+_LIMIT_FETCH_TIMEOUT_S = 5.0
+#: The most wall clock all the provider reads of one doctor run may use together.
+_LIMIT_TOTAL_S = 10.0
+_LIMIT_ANSWER_CAP = 64 * 1024
+#: The clock every deadline in these rows is read on (a test's seam: patching it never reaches ``time`` itself).
+_clock = time.monotonic
+#: Provider hosts whose spend limit is an operator setting Levain cannot read: host -> (what the limit is called).
+_PROVIDER_LIMIT_SETTINGS = {"api.anthropic.com": "workspace spend limit", "api.openai.com": "project spend limit"}
+
+
+def _unit_running(host: str, name: str) -> bool | None:
+    """Whether the named slot service's unit runs, as the operator can see it (``systemctl is-active`` on Linux,
+    ``launchctl print``'s ``state = running`` on macOS); ``None`` when it cannot be told. A unit the host does not know
+    (``is-active`` exit 4, ``launchctl`` exit 113) is not running."""
+    import subprocess
+
+    from levain.launch import child_env
+    from levain.slot import units
+
+    svc = units.by_name(name)
+    argv = (["systemctl", "is-active", "--quiet", units.systemd_name(svc)] if host == "linux"
+            else ["/bin/launchctl", "print", f"system/{units.launchd_label(svc)}"])
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=10, env=child_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if host == "linux":
+        return r.returncode == 0 if r.returncode in (0, 3, 4) else None
+    if r.returncode != 0:
+        return False if r.returncode == 113 else None
+    return any(line.strip() == "state = running" for line in r.stdout.splitlines())
+
+
+def _by_deadline(build: Any, deadline: float, what: str) -> Any:
+    """``build()``'s value, run on a daemon thread joined to ``deadline`` (on :data:`_clock`): its exception is raised
+    here, and ``TimeoutError`` when it is not over by then (the thread is left to finish on its own)."""
+    import threading
+
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["ok"] = build()
+        except BaseException as exc:  # noqa: BLE001 - handed to the caller's thread
+            box["err"] = exc
+
+    t = threading.Thread(target=run, name="levain-doctor-deadline", daemon=True)
+    t.start()
+    t.join(max(0.0, deadline - _clock()))
+    if "ok" in box:
+        return box["ok"]
+    if "err" in box:
+        raise box["err"]
+    raise TimeoutError(f"{what} passed its deadline")
+
+
+def _fetch_key_limit(url: str, headers: dict, timeout: float) -> tuple[int, bytes]:
+    """One GET of ``url`` with ``headers`` that is over within ``timeout`` seconds in TOTAL (name lookup, connect,
+    headers and the body, which is read in chunks): ``(status, at most _LIMIT_ANSWER_CAP bytes)``. A redirect is never
+    followed (the credential goes to the host it is bound to and nowhere else). Raises on any transport failure,
+    ``TimeoutError`` past the deadline."""
+    deadline = _clock() + timeout
+    return _by_deadline(lambda: _fetch_once(url, headers, deadline), deadline, "the key-limit read")
+
+
+def _fetch_once(url: str, headers: dict, deadline: float) -> tuple[int, bytes]:
+    import urllib.error
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a: Any, **k: Any) -> None:
+            return None
+
+    def body(resp: Any) -> bytes:
+        out = b""
+        while len(out) < _LIMIT_ANSWER_CAP:
+            if _clock() > deadline:
+                raise TimeoutError("the key-limit answer passed its deadline")
+            part = resp.read(min(4096, _LIMIT_ANSWER_CAP - len(out)))
+            if not part:
+                break
+            out += part
+        return out
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, headers=dict(headers), method="GET")
+    try:
+        with opener.open(req, timeout=max(0.1, deadline - _clock())) as resp:
+            return resp.status, body(resp)
+    except urllib.error.HTTPError as exc:
+        with exc:
+            return exc.code, body(exc)
+
+
+def _check_route_trust(store: Path) -> CheckResult:
+    from levain import authority_sig
+    from levain.slot import Refused
+    from levain.slot import routemaps
+
+    name = "route trust"
+    routes = store / "routes"
+    present = [os.path.lexists(routes / f) for f in (routemaps.TRUST_PUB, routemaps.TRUST_JSON)]
+    if not any(present):
+        return CheckResult(name, True, "not pinned: dispatch route maps cannot be verified, so dispatch routes "
+                           "are refused", "Run `levain dispatch config init` (or `levain dispatch config trust` "
+                           "if the store exists) to pin it.", warn=True)
+    try:
+        t = routemaps.read_trust(routes)
+    except Refused as exc:
+        return CheckResult(name, False, f"{_slot_why(exc)}; every dispatch route is refused",
+                           "Run `levain dispatch config trust` to write the pair again.")
+    try:
+        actual = authority_sig.public_key_fingerprint(t.public_key)
+    except authority_sig.VerifierUnavailable as exc:
+        return CheckResult(name, True, f"trust.pub was not checked: {exc}; keys cannot verify a dispatch route map "
+                           "without ssh-keygen, so every dispatch route is refused", warn=True)
+    if actual is None:
+        return CheckResult(name, False, "trust.pub is not a public key; every dispatch route is refused",
+                           "Run `levain dispatch config trust` to write the pair again.")
+    if actual != t.fingerprint:
+        return CheckResult(name, False, f"trust.pub's fingerprint is {actual} but trust.json pins {t.fingerprint}; "
+                           "every dispatch signature is refused",
+                           "Run `levain dispatch config trust` to write the pair again.")
+    return CheckResult(name, True, f"pinned to {t.fingerprint} for store {t.store_id}")
+
+
+def _check_spend_ledger(store: Path) -> CheckResult:
+    name = "spend ledger"
+    path = store / "keys" / "ledger.jsonl"
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return CheckResult(name, True, "not created yet (keys opens it when it first starts)")
+    except PermissionError:
+        return CheckResult(name, True, "held by keys: your account cannot read its size", neutral=True)
+    except OSError as exc:
+        return CheckResult(name, True, f"could not be read ({exc})", warn=True)
+    if not stat.S_ISREG(st.st_mode):
+        return CheckResult(name, True, "is not a regular file; keys will not append to it", warn=True)
+    return CheckResult(name, True, f"{st.st_size:,} bytes (one line per call)")
+
+
+def _check_keys_service(host: str, running: Any, egress: int | None) -> CheckResult:
+    name = "keys service"
+    if egress == 0:
+        return CheckResult(name, True, "no egress slot, so keys waits for one (idle on macOS, stopped on Linux "
+                                       "after exit status 78); this is not a failure", neutral=True)
+    up = running(host, "keys")
+    if up is True:
+        return CheckResult(name, True, "running")
+    if up is False and egress is None:
+        return CheckResult(name, True, "not running, and the egress slots could not be read to tell whether "
+                           "it should be", warn=True)
+    if up is False:
+        return CheckResult(name, False, "not running: no model call can be brokered",
+                           "Run `sudo levain setup-isolation` (a repair run starts it).")
+    return CheckResult(name, True, "could not be checked", warn=True)
+
+
+def _egress_in_service(store: Path) -> int | None:
+    """Egress slots not out of service, or ``None`` when the slots cannot be read."""
+    try:
+        found, _ignored = _read_slot_dirs(store / "slots")
+    except OSError:
+        return None
+    from levain.slot import records as R
+    return sum(1 for tag, v in found.items() if tag[0] == "e" and v[0] not in R.OUT_OF_SERVICE)
+
+
+def _base_pairs(store: Path) -> tuple[set, str | None]:
+    """``({(upstream host, credential name)}, problem)`` of the brokered routes in ``L/routes/base.json``, read by
+    keys' own reader (``routemaps.read_base_map``). ``problem`` is a sentence when the map cannot be read; an absent
+    map is no routes."""
+    from levain.broker.policy import PolicyError
+    from levain.contracts import ContractError
+    from levain.slot import routemaps
+
+    try:
+        _key, routes = routemaps.read_base_map(str(store))
+    except FileNotFoundError:
+        return set(), None
+    except OSError as exc:
+        return set(), f"base.json could not be read ({_slot_why(exc)}); keys refuses it"
+    except PolicyError as exc:
+        return set(), f"base.json is refused by keys ({exc})"
+    except (ContractError, ValueError, RecursionError) as exc:
+        return set(), f"base.json does not parse as keys parses it ({type(exc).__name__}); keys refuses it"
+    return _brokered_pairs(p for p in routes.values()), None
+
+
+def _brokered_pairs(policies: Any) -> set:
+    return {(p.upstream.host, p.credential) for p in policies
+            if p.type == "brokered" and p.upstream is not None and p.upstream.host and p.credential}
+
+
+def _dispatch_pairs(store: Path, deadline: float) -> tuple[set, CheckResult | None]:
+    """The brokered ``(host, credential)`` pairs of the dispatch routes keys serves, and a row when they cannot be
+    told. Read as keys starts (``KeysRoutes.load``, inside the run's ``deadline``); a load ``problem`` means keys
+    refuses every dispatch route, so it is the warning and no pairs. Otherwise a route counts in each generation where
+    keys' own pin rule (``KeysRoutes.policy``) would serve it, so a route the head generation dropped does not count.
+    keys' head sits in keys' own 0700 directory, so the operator's account often cannot read it, which is said as such
+    (neutral). Any failure of the read is this row's warning, never the loss of the base map's rows."""
+    from levain import trust_anchor
+    from levain.slot import Refused
+    from levain.slot import routemaps
+
+    name = "invoice ceiling (dispatch routes)"
+    head = store / "keys" / "routemap.head"
+    try:
+        os.lstat(head)
+    except FileNotFoundError:
+        return set(), None
+    except PermissionError:
+        return set(), CheckResult(name, True, "held by keys: your account cannot read the dispatch route maps, so "
+                                  "the ceilings of their credentials are not shown",
+                                  "Run `sudo levain doctor` to read them as root.", neutral=True)
+    except OSError as exc:
+        return set(), CheckResult(name, True, f"dispatch route maps could not be read ({_slot_why(exc)})", warn=True)
+    problem, _keygen = trust_anchor.trust_anchor_problem(trust_anchor.DEFAULT_SSH_KEYGEN, what="ssh-keygen")
+    if problem is not None:
+        return set(), CheckResult(name, True, f"the dispatch route maps cannot be verified ({problem}); keys refuses "
+                                  "every dispatch route while ssh-keygen cannot run", warn=True)
+    kr = routemaps.KeysRoutes(str(store))
+    try:
+        kr_head, maps, problem = _by_deadline(kr.load, deadline, "the dispatch route map read")
+    except TimeoutError:
+        return set(), CheckResult(name, True, "the dispatch route maps were not read: the time allowed for the reads "
+                                  "in this run was used up", warn=True)
+    except Exception as exc:  # noqa: BLE001 - this row's failure, never the base map's rows
+        return set(), CheckResult(name, True, f"the dispatch route maps could not be read ({type(exc).__name__}: "
+                                  f"{exc})", warn=True)
+    if problem is not None:
+        return set(), CheckResult(name, True, f"keys refuses every dispatch route ({problem}), so no dispatch "
+                                  "credential is in use", warn=True)
+    pairs: set = set()
+    try:
+        kr.install(kr_head, maps, problem)
+        for gen, m in maps.items():
+            for rid in m.routes:
+                try:
+                    served = kr.policy(rid, routemaps.Pin(gen, m.digests[rid]))
+                except Refused:
+                    continue
+                pairs |= _brokered_pairs([served])
+    except Exception as exc:  # noqa: BLE001 - this row's failure, never the base map's rows
+        return set(), CheckResult(name, True, f"the dispatch route maps could not be read ({type(exc).__name__}: "
+                                  f"{exc})", warn=True)
+    return pairs, None
+
+
+def _usd(v: float) -> str:
+    return f"${v:,.2f}"
+
+
+def _number(v: object) -> float | None:
+    """``v`` as a finite float when it is a JSON number (a bool is not), else ``None``; a number past float range
+    is not usable."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        f = float(v)
+    except OverflowError:
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
+_RESET_PERIOD = {"daily": "day", "weekly": "week", "monthly": "month"}
+
+
+def _openrouter_limit_row(store: Path, cred: str, name: str, fetch: Any, timeout: float) -> CheckResult:
+    """The ceiling row for one OpenRouter credential: its key status read with that credential, or why not. Never
+    hangs and every outcome is its own row text. GET /api/v1/key answers ``data`` with (OpenRouter's API reference,
+    "Get current API key") ``limit`` (USD, nullable), ``limit_remaining`` (nullable), ``limit_reset`` (nullable
+    string: the period the limit resets over) and ``include_byok_in_limit`` (boolean)."""
+    from levain.broker import creds, policy
+
+    held = (f"the key limit was not read: {cred} is held by keys and your account cannot open it",
+            "Set a per-key credit limit at openrouter.ai/settings/keys; Levain's authorized cap does not bound "
+            "the provider's invoice by itself.")
+    try:
+        dir_fd = os.open(store / "keys" / "cred", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except PermissionError:
+        return CheckResult(name, True, held[0], held[1], warn=True)
+    except FileNotFoundError:
+        return CheckResult(name, True, f"no credential file for {cred} (the credential directory does not exist); "
+                           "keys refuses calls on this route until it is set; the key limit was not read", warn=True)
+    except OSError as exc:
+        return CheckResult(name, True, f"the credential directory could not be read ({_slot_why(exc)})", warn=True)
+    try:
+        raw = creds.read_file(dir_fd, cred)
+    except PermissionError:
+        return CheckResult(name, True, held[0], held[1], warn=True)
+    except creds.Unparseable as exc:
+        return CheckResult(name, True, f"the credential file for {cred} is not usable ({exc}); the key limit was "
+                           "not read", warn=True)
+    except OSError as exc:
+        return CheckResult(name, True, f"the credential file for {cred} could not be read ({_slot_why(exc)}); "
+                           "the key limit was not read", warn=True)
+    finally:
+        os.close(dir_fd)
+    if raw is None:
+        return CheckResult(name, True, f"no credential file for {cred}; keys refuses calls on this route until it "
+                           "is set; the key limit was not read", warn=True)
+    try:
+        c = creds.parse(raw, cred)
+    except creds.Unparseable as exc:
+        return CheckResult(name, True, f"the credential file does not parse ({exc}); the limit was not read",
+                           warn=True)
+    if policy.OPENROUTER_HOST not in c.hosts:
+        return CheckResult(name, True, f"{cred} is not bound to {policy.OPENROUTER_HOST}, so it is not sent there; "
+                           "the key limit was not read", warn=True)
+    hname, hvalue = c.header_pair()
+    try:
+        status, body = (fetch or _fetch_key_limit)(OPENROUTER_KEY_URL, {hname.decode(): hvalue.decode("latin-1")},
+                                                   timeout)
+    except Exception as exc:  # noqa: BLE001 - any transport failure is a row, never a doctor failure
+        return CheckResult(name, True, f"OpenRouter was unreachable ({type(exc).__name__}); the key limit was not read",
+                           warn=True)
+    if status != 200:
+        return CheckResult(name, True, f"OpenRouter answered {status}; the key limit was not read", warn=True)
+    hint_set = ("Set a per-key credit limit with no reset period, counting BYOK usage, at "
+                "openrouter.ai/settings/keys.")
+    try:
+        data = json.loads(body.decode("utf-8"))["data"]
+        limit, left = data["limit"], data["limit_remaining"]
+        reset, byok = data.get("limit_reset"), data.get("include_byok_in_limit")
+    except Exception:  # noqa: BLE001 - an answer of another shape is said as such
+        return CheckResult(name, True, "OpenRouter answered with something that was not a key status; "
+                                       "the key limit was not read", warn=True)
+    if limit is None:
+        return CheckResult(name, True, "no credit limit is set on this key: nothing at the provider bounds the "
+                                       "invoice", hint_set, warn=True)
+    lim, rem = _number(limit), _number(left)
+    if lim is None or rem is None:
+        return CheckResult(name, True, "OpenRouter's key status had no usable numbers; the key limit was not read",
+                           warn=True)
+    problems = []
+    if rem <= 0:
+        problems.append("the key is exhausted: OpenRouter will refuse its calls")
+    if reset is not None:
+        period = _RESET_PERIOD.get(reset, reset) if isinstance(reset, str) else "period"
+        problems.append(f"cap {_usd(lim)} per {period}, not a total: spend can pass it across periods")
+    if byok is False:
+        problems.append("BYOK usage is not counted against this limit")
+    if problems:
+        return CheckResult(name, True, f"key limit {_usd(lim)}, {_usd(rem)} remaining; " + "; ".join(problems),
+                           hint_set, warn=True)
+    return CheckResult(name, True, f"key limit {_usd(lim)} total, {_usd(rem)} remaining")
+
+
+def _check_invoice_ceiling(store: Path, fetch: Any) -> list[CheckResult]:
+    """The provider-side limit on each brokered credential in the routes keys serves (the base map and the dispatch
+    route maps; design §2.2, the invoice ceiling): OpenRouter's is read within one total deadline; Anthropic's and
+    OpenAI's are operator settings Levain cannot read, said as that; any other provider's is said to be unknown."""
+    from levain.broker import policy
+
+    deadline = _clock() + _LIMIT_TOTAL_S
+    rows: list[CheckResult] = []
+    pairs, problem = _base_pairs(store)
+    if problem is not None:
+        rows.append(CheckResult("invoice ceiling", True, problem, warn=True))
+    more, dispatch_row = _dispatch_pairs(store, deadline)
+    pairs |= more
+    if dispatch_row is not None:
+        rows.append(dispatch_row)
+    uses: dict = {}
+    for host, cred in pairs:
+        uses[cred] = uses.get(cred, 0) + 1
+    if pairs and not _cred_dir_exists(store):
+        rows.append(CheckResult("invoice ceiling (credentials)", True, "no credential is set for any route (the "
+                                "credential directory does not exist), so keys refuses every brokered call; no key "
+                                "limit was read", warn=True))
+        pairs = {(h, c) for h, c in pairs if h != policy.OPENROUTER_HOST}
+    for host, cred in sorted(pairs):
+        name = f"invoice ceiling ({cred})" if uses[cred] == 1 else f"invoice ceiling ({cred} at {host})"
+        rows.extend(_guarded(name, lambda host=host, cred=cred, name=name: _ceiling_row(
+            store, host, cred, name, fetch, deadline)))
+    return rows
+
+
+def _cred_dir_exists(store: Path) -> bool:
+    """False only when keys' credential directory is known to be absent (an unreadable parent is not absence)."""
+    try:
+        os.lstat(store / "keys" / "cred")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _ceiling_row(store: Path, host: str, cred: str, name: str, fetch: Any, deadline: float) -> CheckResult:
+    from levain.broker import policy
+
+    if host == policy.OPENROUTER_HOST:
+        left = deadline - _clock()
+        if left <= 0:
+            return CheckResult(name, True, "the key limit was not read: the time allowed for the provider reads "
+                               "in this run was used up", warn=True)
+        return _openrouter_limit_row(store, cred, name, fetch, min(_LIMIT_FETCH_TIMEOUT_S, left))
+    if host in _PROVIDER_LIMIT_SETTINGS:
+        return CheckResult(name, True, f"not readable; set a {_PROVIDER_LIMIT_SETTINGS[host]} in the provider "
+                           "console, since Levain's authorized cap does not bound the provider's invoice",
+                           neutral=True)
+    return CheckResult(name, True, f"the provider-side ceiling for {host} is unknown: Levain cannot read it, and its "
+                       "invoice is not bounded by Levain's authorized cap", "Set a spend limit in that provider's "
+                       "console.", warn=True)
+
+
+def _guarded(name: str, build: Any) -> list[CheckResult]:
+    """``build()``'s row(s); a builder that raises is its OWN failure row, so one defect never discards the rows built
+    beside it nor turns into a pass."""
+    try:
+        out = build()
+    except Exception as exc:  # noqa: BLE001 - this is the isolation
+        return [CheckResult(name, False, f"could not be built ({type(exc).__name__}: {exc})",
+                            "This is a defect in `levain doctor`; report it.")]
+    return out if isinstance(out, list) else [out]
+
+
+def _check_slot_keys(*, host: str | None = None, store: Path | None = None, running: Any = None,
+                     fetch: Any = None) -> list[CheckResult]:
+    """The 3c-9 rows over the brokered-spend install: ``route trust``, ``keys service``, ``spend ledger`` and one
+    ``invoice ceiling`` row per brokered credential. Read-only and read as the OPERATOR, so a fact in keys' own
+    0700 directory is said as held by keys, never as healthy or failed. No rows before the isolation install. Each
+    row is built on its own (:func:`_guarded`). ``running``/``fetch``: a test's seams."""
+    from levain.slot import layout
+
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    if store is None or not (store / "policy").is_dir():
+        return []
+    rows = _guarded("route trust", lambda: _check_route_trust(store))
+    rows += _guarded("keys service", lambda: _check_keys_service(host, running or _unit_running,
+                                                                 _egress_in_service(store)))
+    rows += _guarded("spend ledger", lambda: _check_spend_ledger(store))
+    rows += _guarded("invoice ceiling", lambda: _check_invoice_ceiling(store, fetch))
+    return rows
 
 
 def _check_host_awake() -> list[CheckResult]:

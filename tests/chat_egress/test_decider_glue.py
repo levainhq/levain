@@ -171,8 +171,14 @@ class Launch:
         finally:
             s.close()
 
+    def close_life(self) -> None:
+        """Close the lifeline write end once; the number is then -1, so no later close touches a reused descriptor."""
+        if self.life_w >= 0:
+            fd, self.life_w = self.life_w, -1
+            os.close(fd)
+
     def stop(self) -> int:
-        os.close(self.life_w)
+        self.close_life()
         try:
             code = self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:

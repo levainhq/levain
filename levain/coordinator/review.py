@@ -27,6 +27,7 @@ import hashlib
 import json
 import secrets
 import sqlite3
+from contextvars import ContextVar
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -38,11 +39,16 @@ from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator.store import ACTORS, CoordError, CoordStore, _append_only, _in
 
-__all__ = ["FEEDS", "MODES", "NEAR_STOP", "NO_SPLIT_AFTER", "REVIEW_SCHEMA", "Item", "clear_item", "collect_feeds",
+__all__ = ["FEEDS", "FEED_LABELS", "MODES", "NEAR_STOP", "NO_SPLIT_AFTER", "REVIEW_SCHEMA", "Item", "clear_item", "collect_feeds",
            "feed_dead_seats", "feed_digest", "feed_end", "feed_envelopes", "feed_no_split", "file_item", "file_know",
-           "get_item", "list_items", "push_answer", "push_sign", "reopen_item", "waiting_on_you"]
+           "QueuePage", "get_item", "last_pass", "list_items", "push_answer", "push_sign", "queue_page", "record_pass", "reopen_item", "waiting_on_you"]
 
 FEEDS = ("receipt", "seat", "envelope", "end", "digest", "know", "doubt", "contradiction")
+# a seat's words for each feed: the ONE table every surface draws from (the cockpit panel, the phone route); the
+# stored name stays the item's ``feed``
+FEED_LABELS = {"receipt": "Drop not split", "seat": "Seat died", "envelope": "Envelope near its stop",
+               "end": "Session ended at a limit", "digest": "Unseen digest", "know": "Know", "doubt": "Doubt",
+               "contradiction": "Contradiction"}
 MODES = ("manual", "fresh", "coordinator")
 # C0 §3.3 [seat: N = 10]: a drop with no split receipt after this long is a review item
 NO_SPLIT_AFTER = timedelta(minutes=10)
@@ -134,6 +140,10 @@ def _item(conn: sqlite3.Connection, row: tuple[Any, ...]) -> Item:
 _COLS = "item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at"
 
 
+# the ids this thread's current :func:`collect_feeds` run inserted (None outside one): what "created" means to a counter
+_CREATED: ContextVar[list[str] | None] = ContextVar("review_created", default=None)
+
+
 def _insert(conn: sqlite3.Connection, now: str, feed: str, body: Mapping[str, Any], *, dedupe_key: str,
             thread_id: str | None = None, authority_relevant: bool = False, by: str = "service") -> tuple[Item, bool]:
     """The one insert, inside a write transaction the caller holds: the stored item and ``False`` when the key is
@@ -160,14 +170,25 @@ def _insert(conn: sqlite3.Connection, now: str, feed: str, body: Mapping[str, An
     return _item(conn, row), True
 
 
+def _note_created(item_id: str) -> None:
+    """Record an inserted id for the running :func:`collect_feeds`; called only once the write that inserted it has
+    committed, so a failed COMMIT never reports a new item."""
+    made = _CREATED.get()
+    if made is not None:
+        made.append(item_id)
+
+
 def file_item(store: CoordStore, feed: str, body: Mapping[str, Any], *, dedupe_key: str,
               thread_id: str | None = None, authority_relevant: bool = False, by: str = "service",
               token: object = None) -> tuple[Item, bool]:
     """File one review item, once per ``dedupe_key``: a second call with the same key returns the stored item and
     ``False``, and writes nothing (so a feed run again, or a cleared item's condition still holding, files nothing)."""
     with store._write(by, token) as (conn, now):
-        return _insert(conn, now, feed, body, dedupe_key=dedupe_key, thread_id=thread_id,
-                       authority_relevant=authority_relevant, by=by)
+        item, new = _insert(conn, now, feed, body, dedupe_key=dedupe_key, thread_id=thread_id,
+                            authority_relevant=authority_relevant, by=by)
+    if new:
+        _note_created(item.item_id)
+    return item, new
 
 
 def _file_checked(store: CoordStore, feed: str, body: Mapping[str, Any], *, dedupe_key: str, thread_id: str | None = None,
@@ -177,8 +198,11 @@ def _file_checked(store: CoordStore, feed: str, body: Mapping[str, Any], *, dedu
     with store._write() as (conn, now):
         if not still(conn, now):
             return None
-        return _insert(conn, now, feed, body, dedupe_key=dedupe_key, thread_id=thread_id,
-                       authority_relevant=authority_relevant)[0]
+        item, new = _insert(conn, now, feed, body, dedupe_key=dedupe_key, thread_id=thread_id,
+                            authority_relevant=authority_relevant)
+    if new:
+        _note_created(item.item_id)
+    return item
 
 
 def get_item(store: CoordStore, item_id: str) -> Item:
@@ -190,13 +214,52 @@ def get_item(store: CoordStore, item_id: str) -> Item:
 
 
 def list_items(store: CoordStore, *, include_cleared: bool = False, feed: str | None = None,
-               thread_id: str | None = None) -> list[Item]:
-    """The queue, oldest first. Open items only unless ``include_cleared``."""
-    with read_transaction(store._connect) as conn:
-        rows = conn.execute(f"SELECT {_COLS} FROM review_items ORDER BY rowid").fetchall()
-        items = [_item(conn, r) for r in rows]
+               thread_id: str | None = None, conn: sqlite3.Connection | None = None) -> list[Item]:
+    """The queue, oldest first. Open items only unless ``include_cleared``. ``conn`` is the read transaction a caller
+    already holds (the read is then one of its snapshot's); without it the read opens its own."""
+    def read(c: sqlite3.Connection) -> list[Item]:
+        return [_item(c, r) for r in c.execute(f"SELECT {_COLS} FROM review_items ORDER BY rowid").fetchall()]
+
+    if conn is not None:
+        items = read(conn)
+    else:
+        with read_transaction(store.open_readonly) as own:
+            items = read(own)
     return [i for i in items if (include_cleared or i.state == "open") and (feed is None or i.feed == feed)
             and (thread_id is None or i.thread_id == thread_id)]
+
+
+# an item with its latest event, in one statement: the item is open unless that event cleared it (as :func:`_item` reads it)
+_LATEST = ("FROM review_items i LEFT JOIN review_events e ON e.item_id = i.item_id AND e.seq = "
+           "(SELECT MAX(seq) FROM review_events WHERE item_id = i.item_id)")
+_LATEST_COLS = "i.item_id, i.thread_id, i.feed, i.dedupe_key, i.body, i.authority_relevant, i.by, i.at, e.op, e.mode, e.by, e.at"
+
+
+@dataclass(frozen=True)
+class QueuePage:
+    """A bounded look at the queue: how many items are open, the oldest ``open_limit`` of them (oldest first), and the
+    most recently cleared ``cleared_limit``, newest clear first."""
+    open_total: int
+    open: list[Item]
+    cleared: list[Item]
+
+
+def _joined(row: tuple[Any, ...]) -> Item:
+    last = None if row[8] is None else (row[8], row[9], row[10], row[11])
+    return Item(row[0], row[1], row[2], json.loads(row[4]), bool(row[5]), row[6], row[7],
+                "cleared" if row[8] == "cleared" else "open", last)
+
+
+def queue_page(conn: sqlite3.Connection, *, open_limit: int, cleared_limit: int) -> QueuePage:
+    """The queue's open count and the bounded open and cleared pages, read in three statements on ``conn`` whatever the
+    queue's history (a long-lived store keeps every item it ever held). Cleared items order by the clearing event's
+    rowid, the order they were cleared in."""
+    total = conn.execute(f"SELECT COUNT(*) {_LATEST} WHERE e.op IS NULL OR e.op != 'cleared'").fetchone()[0]
+    opened = conn.execute(f"SELECT {_LATEST_COLS} {_LATEST} WHERE e.op IS NULL OR e.op != 'cleared' "
+                          "ORDER BY i.rowid LIMIT ?", (int(open_limit),)).fetchall()
+    cleared = conn.execute(f"SELECT {_LATEST_COLS} {_LATEST} WHERE e.op = 'cleared' ORDER BY e.rowid DESC LIMIT ?",
+                           (int(cleared_limit),)).fetchall()
+    return QueuePage(total, [_joined(r) for r in opened], [_joined(r) for r in cleared])
 
 
 def _review(store: CoordStore, item_id: str, op: str, mode: str, token: object) -> Item:
@@ -231,8 +294,25 @@ def reopen_item(store: CoordStore, item_id: str, *, mode: str = "manual", token:
 
 
 # --- the push records (C0 §3.3) ----------------------------------------------------------------------------------
+def first_reader_holds(conn: sqlite3.Connection, question_id: str) -> bool:
+    """The question is the coordinator's to read first: its filing ping is held and not released, with no first read
+    yet, or the coordinator answered it as a KNOW. The one reading of that state; the delivery pass and the ANSWER write
+    both ask it."""
+    if conn.execute("SELECT 1 FROM first_reads WHERE question_id = ? AND outcome = 'know'", (question_id,)).fetchone():
+        return True
+    return conn.execute(
+        "SELECT 1 FROM held_pings h WHERE h.question_id = ? AND NOT EXISTS (SELECT 1 FROM held_ping_releases r WHERE "
+        "r.question_id = h.question_id) AND NOT EXISTS (SELECT 1 FROM first_reads f WHERE f.question_id = h.question_id)",
+        (question_id,)).fetchone() is not None
+
+
+class _Held(Exception):
+    """Raised inside the ANSWER write when the first reader holds the question: nothing is written."""
+
+
 def _push(store: CoordStore, kind: str, thread_id: str | None, ref_id: str, text: str, extra: Mapping[str, Any],
-          by: str, token: object, still_open: Callable[[str], bool | None] | None) -> tuple[str, bool]:
+          by: str, token: object, still_open: Callable[[str], bool | None] | None,
+          unless_held: bool = False) -> tuple[str, bool]:
     if kind not in _PUSH_KINDS:
         raise CoordError("a push record is a sign or an answer")
     if by not in ACTORS:
@@ -263,6 +343,8 @@ def _push(store: CoordStore, kind: str, thread_id: str | None, ref_id: str, text
                             (kind, _REF_STORE[kind], ref)).fetchone()
         if same is not None:
             return same[0], False
+        if unless_held and first_reader_holds(conn, ref):
+            raise _Held()
         if land:
             for old_ref in _land_refs(conn, thread_id, onto):
                 if closed.get(old_ref, None) is not False:      # open, unreadable, or filed since the read
@@ -292,6 +374,17 @@ def push_answer(store: CoordStore, thread_id: str | None, question_id: str, text
                 token: object = None) -> tuple[str, bool]:
     """Record an ANSWER: a pointer to the question ``question_id`` in ``questions.db``. It authorises nothing."""
     return _push(store, "answer", thread_id, question_id, text, {}, by, token, None)
+
+
+def push_answer_unless_held(store: CoordStore, thread_id: str | None, question_id: str, text: str, *,
+                            by: str = "service", token: object = None) -> tuple[str, bool] | None:
+    """:func:`push_answer` for the delivery pass: the first-reader check is made INSIDE the write transaction that
+    inserts the record, and ``hold_ping`` (``first_reader``) declines a hold once the record exists. Whichever writes
+    first decides; the loser is a no-op. None when the first reader holds the question (nothing written)."""
+    try:
+        return _push(store, "answer", thread_id, question_id, text, {}, by, token, None, unless_held=True)
+    except _Held:
+        return None
 
 
 def file_know(store: CoordStore, thread_id: str | None, text: str, *, by: str = "coordinator",
@@ -363,18 +456,25 @@ def question_open(queue_dir: Path | str) -> Callable[[str], bool | None]:
 
 
 def waiting_on_you(store: CoordStore, *, sign_open: Callable[[str], bool | None],
-                   answer_open: Callable[[str], bool | None]) -> dict[str, Any]:
+                   answer_open: Callable[[str], bool | None], conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """What waits on you, derived from the open SIGN and ANSWER records: ``{"threads": {thread_id: [records]},
     "loose": [records with no thread], "unresolved": [records whose state could not be read]}``. A record is
-    ``{"kind", "ref_id", "reply_id", "text"}``. A thread with no open record is absent."""
+    ``{"kind", "ref_id", "reply_id", "text"}``. A thread with no open record is absent. ``conn`` is the read
+    transaction a caller already holds."""
     from levain.coordinator import budget
 
-    with read_transaction(store._connect) as conn:
-        rows = conn.execute("SELECT reply_id, thread_id, kind, ref_id, body, ref_store FROM replies WHERE kind IN "
-                            "('sign', 'answer') ORDER BY rowid").fetchall()
+    def read(c: sqlite3.Connection) -> tuple[list[Any], dict[str, Any]]:
+        got = c.execute("SELECT reply_id, thread_id, kind, ref_id, body, ref_store FROM replies WHERE kind IN "
+                        "('sign', 'answer') ORDER BY rowid").fetchall()
         # a SIGN to extend a thread's budget (C6) points into this store, not queue.db: read here, in this transaction
-        now = store._stamp()
-        extend = {r[3]: budget.sign_open(conn, r[3], now) for r in rows if r[5] == budget.SIGN_REF}
+        at = store._stamp()
+        return got, {r[3]: budget.sign_open(c, r[3], at) for r in got if r[5] == budget.SIGN_REF}
+
+    if conn is not None:
+        rows, extend = read(conn)
+    else:
+        with read_transaction(store.open_readonly) as own:
+            rows, extend = read(own)
     out: dict[str, Any] = {"threads": {}, "loose": [], "unresolved": []}
     for reply_id, thread_id, kind, ref_id, body, ref_store in rows:
         if ref_store == budget.SIGN_REF:
@@ -455,6 +555,25 @@ def feed_no_split(store: CoordStore, *, after: timedelta = NO_SPLIT_AFTER, error
 def _mark(conn: sqlite3.Connection, feed: str) -> int:
     row = conn.execute("SELECT value FROM review_marks WHERE feed = ? ORDER BY seq DESC LIMIT 1", (feed,)).fetchone()
     return 0 if row is None else row[0]
+
+
+# the feed name under which each run of the feed runner leaves a mark (value = its own seq, which only moves forward):
+# "has the delivery pass ever run here" is a display's question, and this is its only answer
+PASS_FEED = "pass"
+
+
+def record_pass(store: CoordStore) -> None:
+    """Leave one mark that the feed runner (:func:`levain.coordinator.deliver.run`) ran, at its time. Known edge: one
+    ``review_marks`` row per run, append-only."""
+    with store._write() as (conn, now):
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM review_marks WHERE feed = ?", (PASS_FEED,)).fetchone()[0]
+        conn.execute("INSERT INTO review_marks (feed, seq, value, at) VALUES (?, ?, ?, ?)", (PASS_FEED, seq, seq, now))
+
+
+def last_pass(conn: sqlite3.Connection) -> str | None:
+    """When the feed runner last ran against this store, or None when it never has."""
+    row = conn.execute("SELECT at FROM review_marks WHERE feed = ? ORDER BY seq DESC LIMIT 1", (PASS_FEED,)).fetchone()
+    return None if row is None else row[0]
 
 
 _TERMINAL = "('failed', 'expired', 'ended')"
@@ -668,6 +787,8 @@ def collect_feeds(store: CoordStore, *, queue_dir: Path | str | None = None) -> 
     """Run every mechanical feed once. ``{feed: [item ids]}``, and a feed that raised is ``{feed: "error: ..."}``: one
     failing feed never hides the others, and is never read as an empty one. A row a feed could not file is recorded
     under ``"errors": {feed: [lines]}`` (present only when there are some) and the feed's other rows are filed.
+    ``"created"`` lists the ids THIS run inserted (a feed also returns an item that already existed), so a count of new
+    items is never inferred from the table's size, which other writers move.
     ``queue_dir`` defaults to the store's own directory (the consent directory), where ``limits.db`` and ``ledger.db``
     sit."""
     qdir = Path(queue_dir) if queue_dir is not None else store.directory
@@ -682,13 +803,19 @@ def collect_feeds(store: CoordStore, *, queue_dir: Path | str | None = None) -> 
         "end": lambda: feed_end(store, qdir, errors=sink("end")),
         "digest": lambda: feed_digest(store, qdir)}
     out: dict[str, Any] = {}
-    for name, run in runs.items():
-        try:
-            got = run()
-        except Exception as exc:  # noqa: BLE001 - reported under the feed's name, never swallowed
-            out[name] = f"error: {type(exc).__name__}: {exc}"[:300]
-            continue
-        out[name] = [] if got is None else [i.item_id for i in (got if isinstance(got, list) else [got])]
+    created: list[str] = []
+    mark = _CREATED.set(created)
+    try:
+        for name, run in runs.items():
+            try:
+                got = run()
+            except Exception as exc:  # noqa: BLE001 - reported under the feed's name, never swallowed
+                out[name] = f"error: {type(exc).__name__}: {exc}"[:300]
+                continue
+            out[name] = [] if got is None else [i.item_id for i in (got if isinstance(got, list) else [got])]
+    finally:
+        _CREATED.reset(mark)
+    out["created"] = created
     bad = {n: e for n, e in row_errors.items() if e}
     if bad:
         out["errors"] = bad

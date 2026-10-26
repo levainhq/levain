@@ -629,6 +629,17 @@ def _key_act_callers(tree: ast.AST) -> bool:
     return bool(_uses_in(tree, acts, "levain.cockpit.keys"))
 
 
+# The call sites allowed to build a snapshot, by name. Each entry carries its reason; the scan is never loosened.
+SNAPSHOT_BUILDERS = {
+    (LEVAIN / "cockpit" / "authority.py", "capture"),
+    # DESIGN_REV3 §5.3's coverage replay: opened mode=ro, anchored by read_anchor before its read transaction, and it
+    # appends nothing; its decision is re-checked at use (graduation's precondition on the binding record). Routing
+    # it through RequestAuthority.capture would pull the cockpit request path into the autonomic engine for no
+    # freshness gain (both snapshot at one instant).
+    (LEVAIN / "graduation_policy.py", "_replay"),
+}
+
+
 def test_no_snapshot_is_built_outside_capture_and_append():
     """DESIGN §3.4: ``RequestAuthority.capture`` is the only snapshot builder (``levain.authority.append``
     replays inside itself), so no reader can fall back to a second head."""
@@ -637,7 +648,7 @@ def test_no_snapshot_is_built_outside_capture_and_append():
         if path == LEVAIN / "authority.py":
             continue
         for name, fn, line in _uses(path, ("snapshot", "_replay", "_replay_entry")):
-            if (path, fn) != (LEVAIN / "cockpit" / "authority.py", "capture"):
+            if (path, fn) not in SNAPSHOT_BUILDERS:
                 offenders.append(f"{path.relative_to(LEVAIN.parent)}:{line} {name}() in {fn}")
     assert offenders == []
 
@@ -648,6 +659,71 @@ def test_the_fence_sees_a_planted_snapshot_call(tmp_path):
     probe.write_text("from levain import authority as a\nfrom levain.authority import snapshot as s\n"
                      "def reader(conn):\n    return a.snapshot(conn), s(conn)\n")
     assert sorted(_uses(probe, ("snapshot",))) == [("snapshot", "reader", 4), ("snapshot", "reader", 4)]
+
+
+def _function(tree: ast.AST, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    """The one function (or method) named ``name`` in ``tree``."""
+    found = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name]
+    assert len(found) == 1, (name, len(found))
+    return found[0]
+
+
+def _within(node: ast.AST, scope: ast.AST) -> bool:
+    return any(n is node for n in ast.walk(scope))
+
+
+# the statements graduation_policy._replay may execute itself: transaction control, never a write
+REPLAY_STATEMENTS = ("BEGIN", "COMMIT", "ROLLBACK")
+
+
+def _check_the_coverage_replay(path: Path) -> None:
+    """SNAPSHOT_BUILDERS' ``graduation_policy._replay`` entry, held to its reason: the module's only
+    ``sqlite3.connect`` is in ``_connect`` and opens a ``file:...?mode=ro`` URI with ``uri=True``; ``_replay``
+    opens its connection through ``_connect`` and nothing else; every statement it executes itself is a literal
+    in :data:`REPLAY_STATEMENTS`."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    connect_fn = _function(tree, "_connect")
+    connects = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _dotted(n.func) == "sqlite3.connect"]
+    assert connects and all(_within(c, connect_fn) for c in connects), "a sqlite3.connect outside _connect"
+    for call in connects:
+        url = call.args[0] if call.args else None
+        parts = url.values if isinstance(url, ast.JoinedStr) else [url]
+        literal = "".join(v.value for v in parts if isinstance(v, ast.Constant) and isinstance(v.value, str))
+        assert literal.startswith("file:") and literal.endswith("?mode=ro") and literal.count("mode=") == 1, literal
+        assert isinstance(parts[-1], ast.Constant), "the URI's mode is not its literal tail"
+        assert any(k.arg == "uri" and isinstance(k.value, ast.Constant) and k.value.value is True
+                   for k in call.keywords), "the URI is not opened as a URI"
+    replay = _function(tree, "_replay")
+    openers = [_dotted(n.func) for n in ast.walk(replay) if isinstance(n, ast.Call)
+               and (_dotted(n.func) or "").split(".")[-1] in ("_connect", "connect", "CockpitDB", "_journal",
+                                                                "autocommit", "write")]
+    assert openers == ["_connect"], openers
+    for n in ast.walk(replay):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                and n.func.attr in ("execute", "executemany", "executescript"):
+            arg = n.args[0] if n.args else None
+            assert n.func.attr == "execute" and isinstance(arg, ast.Constant) and arg.value in REPLAY_STATEMENTS, \
+                f"_replay executes {ast.unparse(n)}"
+
+
+def test_the_coverage_replay_opens_read_only_and_writes_nothing():
+    _check_the_coverage_replay(LEVAIN / "graduation_policy.py")
+
+
+@pytest.mark.parametrize("old, new, why", [
+    ("?mode=ro", "?mode=rw", "mode=rw"),
+    ('conn.execute("COMMIT")', 'conn.execute("DELETE FROM authority_log")', "_replay executes"),
+    ("conn = _connect(self._root / DB_NAME, _REFRESH_BUSY_TIMEOUT)\n",
+     "conn = sqlite3.connect(self._root / DB_NAME)\n", "outside _connect"),
+])
+def test_the_coverage_replay_check_sees_a_planted_write_path(tmp_path, old, new, why):
+    # the check is not vacuous: a read-write open, a write statement, or a second connect fails it
+    src = (LEVAIN / "graduation_policy.py").read_text(encoding="utf-8")
+    assert src.count(old) == 1, old
+    planted = tmp_path / "graduation_policy.py"
+    planted.write_text(src.replace(old, new), encoding="utf-8")
+    with pytest.raises(AssertionError, match=why):
+        _check_the_coverage_replay(planted)
 
 
 def _key_setup_callers(tree: ast.AST) -> bool:
@@ -661,6 +737,49 @@ def _key_setup_callers(tree: ast.AST) -> bool:
     return bool(_uses_in(tree, acts, "levain.chat_egress.key_setup"))
 
 
+# The appenders allowlisted for their per-act shape, with the append calls each makes (_check_per_act_append).
+PER_ACT_APPENDERS = {
+    ("cockpit/keys.py", "_append"): ("sign_and_append",),
+    ("cli.py", "_signed_append"): ("append", "prepare"),
+}
+
+
+def _check_per_act_append(fn: ast.FunctionDef | ast.AsyncFunctionDef, names: tuple[str, ...]) -> None:
+    """``fn`` appends per act: every call of ``names`` in it passes, as its first argument, the connection an
+    enclosing ``with <db>.autocommit() as <conn>:`` opened, where ``<db>`` is a parameter of ``fn`` or a local
+    ``fn`` assigns only from ``_journal(...)``/``CockpitDB(...)``; and ``fn`` declares no global or nonlocal."""
+    assert not [n for n in ast.walk(fn) if isinstance(n, (ast.Global, ast.Nonlocal))], f"{fn.name}: global state"
+    params = {a.arg for a in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)}
+    built: dict[str, list[ast.AST]] = {}
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    built.setdefault(t.id, []).append(n.value)
+    parents = {c: p for p in ast.walk(fn) for c in ast.iter_child_nodes(p)}
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+             and ((isinstance(n.func, ast.Name) and n.func.id in names)
+                  or (isinstance(n.func, ast.Attribute) and n.func.attr in names))]
+    assert calls, f"{fn.name}: no {names} call"
+    for call in calls:
+        first = call.args[0] if call.args else None
+        node, holder = call, None
+        while node in parents and holder is None:
+            node = parents[node]
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    ctx, var = item.context_expr, item.optional_vars
+                    if isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Attribute) \
+                            and ctx.func.attr == "autocommit" and isinstance(ctx.func.value, ast.Name) \
+                            and isinstance(var, ast.Name) and isinstance(first, ast.Name) and first.id == var.id:
+                        holder = ctx.func.value.id
+        assert holder is not None, f"{fn.name}:{call.lineno} {ast.unparse(call.func)} outside its own autocommit()"
+        sources = built.get(holder, [])
+        assert holder in params and not sources or holder not in params and sources and all(
+            isinstance(v, ast.Call) and (_dotted(v.func) or "").split(".")[-1] in ("_journal", "CockpitDB")
+            for v in sources), f"{fn.name}: {holder} is not a journal this act opened or was handed"
+
+
 def _check_the_appenders(root: Path) -> None:
     """The S3a-2 MUST (a) guard over the package at ``root`` (the installed one, or a planted copy)."""
     appenders = []
@@ -669,11 +788,17 @@ def _check_the_appenders(root: Path) -> None:
             continue
         for name, fn, _line in _uses(path, ("append", "sign_and_append", "prepare")):
             appenders.append((str(path.relative_to(root)), fn, name))
+    # cli._signed_append (append + prepare): the `levain binding policy create|renew|revoke` verbs, a short-lived CLI
+    # act that opens its journal per act, the same shape as keys._append; PER_ACT_APPENDERS holds both to it below.
     assert sorted(appenders) == [("chat_egress/key_setup.py", "setup_key", "append"),
                                  ("chat_egress/key_setup.py", "setup_key", "prepare"),
+                                 ("cli.py", "_signed_append", "append"),
+                                 ("cli.py", "_signed_append", "prepare"),
                                  ("cockpit/keys.py", "_append", "sign_and_append"),
                                  ("consent/grants.py", "append_revoke", "append"),
                                  ("consent/grants.py", "prepare_revoke", "prepare")]
+    for (rel, name), calls in PER_ACT_APPENDERS.items():
+        _check_per_act_append(_function(ast.parse((root / rel).read_text(encoding="utf-8")), name), calls)
     callers = [str(path.relative_to(root)) for path in sorted(root.rglob("*.py"))
                if _key_act_callers(ast.parse(path.read_text(encoding="utf-8")))]
     assert callers == ["cli.py"]
@@ -740,6 +865,23 @@ def test_the_appender_guard_sees_a_planted_second_caller_of_setup_key(tmp_path):
         with pytest.raises(AssertionError, match=f"planted_{i}"):
             _check_the_appenders(root)
         planted.unlink()
+
+
+@pytest.mark.parametrize("rel, old, new, why", [
+    ("cli.py", "            return append(conn, link,", "            return append(HELD, link,", "_signed_append:.* outside"),
+    ("cli.py", "    db = _journal(_cockpit_root(args))\n", "    db = _JOURNAL\n", "_signed_append: db is not a journal"),
+    ("cockpit/keys.py", "        with db.autocommit() as conn:\n            return sign_and_append(",
+     "        with _HELD as conn:\n            return sign_and_append(", "_append:.* outside"),
+])
+def test_the_appender_guard_sees_an_append_off_its_per_act_connection(tmp_path, rel, old, new, why):
+    # the per-act shape is not vacuous: another connection, a held journal, or a with that is not autocommit fails it
+    root = tmp_path / "levain"
+    shutil.copytree(LEVAIN, root, ignore=shutil.ignore_patterns("__pycache__"))
+    src = (root / rel).read_text(encoding="utf-8")
+    assert src.count(old) == 1, old
+    (root / rel).write_text(src.replace(old, new), encoding="utf-8")
+    with pytest.raises(AssertionError, match=why):
+        _check_the_appenders(root)
 
 
 def test_the_fences_see_a_nested_module_call_and_a_module_import_of_keys():

@@ -164,3 +164,41 @@ def test_the_rung_checks_run_under_the_store_write_lock(tmp_path):
                             coverage=lambda b, rung: _probe() or True,
                             risk_floor_of=lambda b: _probe() or Posture.ABOVE_LOOP)
     assert held == [True, True]
+
+
+def test_record_runs_in_the_replace_transaction_after_the_write_and_commits_with_it(tmp_path):
+    # RULINGS_S1 item 1: the audit row's home is replace_atomic's own transaction
+    s, old = _stored(tmp_path, Posture.COOLING_OFF)
+    new = _grant(Posture.ON_LOOP, created_at="2026-06-27T13:00:00")
+    seen = []
+
+    def record(conn):
+        assert conn.in_transaction
+        rows = {r[0] for r in conn.execute("SELECT binding_id FROM bindings")}
+        seen.append(new.binding_id in rows)
+        conn.execute("INSERT INTO meta (key, value) VALUES ('audit-probe', 'x')")
+
+    assert s.replace_atomic(old, new, coverage=_covered, risk_floor_of=_no_floor, record=record)
+    assert seen == [True] and s.db.meta("audit-probe") == "x"
+
+
+def test_a_record_that_raises_rolls_the_replace_back(tmp_path):
+    s, old = _stored(tmp_path, Posture.COOLING_OFF)
+    new = _grant(Posture.ON_LOOP, created_at="2026-06-27T13:00:00")
+
+    def record(conn):
+        conn.execute("INSERT INTO meta (key, value) VALUES ('audit-probe', 'x')")
+        raise RuntimeError("audit write failed")
+
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        s.replace_atomic(old, new, coverage=_covered, risk_floor_of=_no_floor, record=record)
+    assert not _written(s, old, new) and s.db.meta("audit-probe") is None
+
+
+def test_record_is_not_run_when_a_check_refuses(tmp_path):
+    s, old = _stored(tmp_path, Posture.COOLING_OFF)
+    new = _grant(Posture.ON_LOOP, created_at="2026-06-27T13:00:00")
+    ran = []
+    result = s.replace_atomic(old, new, coverage=lambda b, rung: False, risk_floor_of=_no_floor,
+                              record=lambda conn: ran.append(1))
+    assert not result and ran == []

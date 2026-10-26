@@ -1236,3 +1236,29 @@ def test_a_consent_grant_never_names_the_shell_and_a_sibling_workspace_is_a_loos
     assert to(workspace="/w/p/sub") == auth.TIGHTEN
     assert to(expires=NOW + timedelta(days=9)) == auth.RENEW
     assert to(tools=("Edit", "Write")) == auth.LOOSEN
+
+
+# --- public_key_fingerprint (3c-9 C fix r2 item 1): ssh-keygen's reading of one key line -------------------------
+
+def test_public_key_fingerprint_is_ssh_keygens_reading(keys):
+    from levain import authority_sig
+    k = keys["laptop"]
+    assert authority_sig.public_key_fingerprint(k.public_key) == k.fp
+    assert authority_sig.public_key_fingerprint(k.public_key + " a comment\n") == k.fp
+    assert auth.verify_link_sig(b"m", k.sign(b"m"), public_key=k.public_key,
+                                fingerprint=authority_sig.public_key_fingerprint(k.public_key))
+
+
+def test_public_key_fingerprint_refuses_what_ssh_keygen_cannot_read(keys):
+    from levain import authority_sig
+    k = keys["laptop"]
+    kt, b64 = k.public_key.split()
+    cut = f"{kt} {base64.b64encode(base64.b64decode(b64)[:-3]).decode()}"
+    for bad in (cut, "", "not a key", "ssh-ed25519 AAAA", f"{k.public_key}\n{k.public_key}", 7, None):
+        assert authority_sig.public_key_fingerprint(bad) is None, bad
+
+
+def test_public_key_fingerprint_without_its_verifier_raises(tmp_path, keys):
+    from levain import authority_sig
+    with pytest.raises(authority_sig.VerifierUnavailable):
+        authority_sig.public_key_fingerprint(keys["laptop"].public_key, ssh_keygen=tmp_path / "no-ssh-keygen")

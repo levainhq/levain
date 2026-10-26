@@ -9,10 +9,44 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Added
 - **The cockpit's `!N` badge breathes when a new decision waits on you.** It pulses for about half a minute, then sits
   still; never with reduced motion.
+- **`levain binding policy create|renew|revoke|list` signs the graduation policies** that let a standing binding run
+  below confirm (cooling-off or on-loop) without asking: the actions it may run at the risk Levain's manifest gives
+  them, the lowest rung, and an expiry at most 30 days out. A policy covers only while its signing keys are listed in
+  root's allowed-signers file and are not revoked; `create` prints what it hands over before anything is signed, and
+  the command it prints names its store and cockpit by absolute path, so it signs the same store from any directory.
+- **`levain binding graduate` exists, and in this release says that nothing graduates and exits 1:** the binding
+  driver it needs is not wired yet.
+- **The cockpit and the phone show the coordinator's review queue and morning card, read-only.** The cockpit shows them
+  on the Morning and Board tabs: what needs a look, newest first, how long ago, and which items only you clear. The phone
+  page has a Review tab with the morning card, the open items (what each is, what it says, how old it is) and the ones
+  you cleared; it reads one page at a time. Neither appears until the coordinator has been used. Opening them never
+  creates or changes the coordinator's store. They say when the review check last ran, or that it has not run yet or
+  could not read the queue, and never "Nothing is waiting on you" in those cases; a section the morning card could not
+  read says so instead of showing zero. A command too long for a cockpit row is cut with a visible "shortened" mark.
+  On a phone other than an iPhone the page says "your screen lock" where it said Face ID.
+- **`levain doctor` reports the brokered-spend install.** New rows: whether the dispatch route trust is pinned (and to
+  which key; `trust.pub` is checked with `ssh-keygen` the way Levain verifies a route map, so a damaged key file fails),
+  whether the keys service runs (an install with no egress slot says so instead of failing), the spend ledger's size,
+  and, for each brokered credential, the provider-side limit that bounds your invoice, counting only the dispatch routes
+  the keys service actually serves. OpenRouter's key limit and what remains of it are read when your account can open
+  the credential, with when it resets and whether it leaves BYOK usage out or is used up; Anthropic's and OpenAI's are
+  named as settings to make in the provider console. All provider reads together take at most ten seconds and never
+  fail the check. It says so when `ssh-keygen` cannot run or no credential is set at all.
 
 ### Fixed
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
   refilled,** so a keys failure cannot leave the pool short.
+
+### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- **The graduation engine behind `levain binding graduate`.** Once the binding driver is wired, it takes the steps a
+  policy covers, records each, and prints the one `levain binding policy create` line for a step none covers; the steps
+  already taken stay printed when a later one fails, and a binding that changed during the run (revoked, paused,
+  fired, or graduated by another run) is reported as `stale` with nothing written for it.
+- **Chat egress has a composed test suite and a report.** The suite runs the real glue and decider over the sandbox
+  runtime with real clients (curl, git, requests, pip, npm, uv) and sweeps every artifact of a run for leaked
+  credentials. `levain.chat_egress.report` reads one launch's rows and the glue's event file into the wall total (exact
+  after a clean end, marked unknown or crashed after a crash), per-reason counts, duplicate rows, and the path,
+  credential-in-query and cap counts. No `levain` command prints it yet.
 
 ## [0.11.26] — 2026-10-25
 
