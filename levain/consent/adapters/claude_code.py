@@ -221,10 +221,10 @@ def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path, e
     request (14b Q5); and, when a cockpit data root is configured, its authority database (and sqlite's sidecars)
     and the authority anchor. ``home`` is the one :func:`targets_agent_config` expands ``~`` under and ``environ``
     the one whose ``LEVAIN_HOME`` names the levain home (both required: the hook binds them once at its top);
-    ``cwd``, when absolute, stands in for the workspace. A levain home the floor's
-    own predicate finds too
-    wide to deny whole (:func:`levain.firing.confinement.too_wide_to_deny`: a filesystem root, a path of two parts
-    or fewer, a shared temp directory, or one holding the home or the cwd) is named by its state directories instead
+    ``cwd``, when absolute, stands in for the workspace. A levain home the floor's own predicate finds too
+    wide to deny whole (:func:`levain.firing.confinement.too_wide_to_deny` holds the rules: a filesystem root, a path
+    of two parts or fewer, a shared temp directory, or one holding the home or the cwd; the event's cwd is passed as
+    its ``within``) is named by its state directories instead
     (:data:`levain.firing.confinement.LEVAIN_HOME_STATE_DIRS`, the floor's fallback list), or every file under it
     would be agent config. Never raises on the levain home: one that cannot be resolved is ``<home>/.levain``
     (fail closed for the store, never an outage of every tool). Bash is still never parsed: a shell write there
@@ -302,11 +302,13 @@ def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], 
         raw = Path(cwd) / raw
     git_cache = git_cache if git_cache is not None else {}
     parents = {os.path.dirname(r) for r in roots}   # a directory holding a protected file (cockpit.db) as well
+    user_roots = user_site_roots(home)
     for p in (Path(os.path.normpath(raw)), Path(os.path.realpath(raw))):
         if p.name.lower() == USER_CONFIG_NAME or str(p).lower() in parents:
             return True
         for probe in _DIR_PROBES:
-            if _tags_path(p / probe, cwd, roots, sites, user_configs, git_cache, environ=environ):
+            if (_tags_path(p / probe, cwd, roots, sites, user_configs, git_cache, environ=environ)
+                    or in_user_site(p / probe, user_roots)):
                 return True
     return False
 
@@ -537,6 +539,31 @@ def import_site_dirs() -> tuple[str, ...]:
     return tuple({os.path.realpath(d).lower() for d in dirs if d})
 
 
+def user_site_roots(home: Path) -> tuple[str, ...]:
+    """The operator's Python user-site trees :func:`in_user_site` protects, lowercased, each as written and resolved:
+    the floor's own derivation (``levain.firing.confinement.python_user_site_roots``: ``~/.local/lib``, macOS's
+    ``~/Library/Python``, an absolute ``$PYTHONUSERBASE``'s ``lib``), for ``home`` (where a ``~`` in a target
+    expands) and for :func:`operator_home`. Whatever THIS interpreter's ``site.ENABLE_USER_SITE`` says: a venv's is
+    False, and the operator's other, non-venv Pythons still run a ``.pth``, ``usercustomize.py`` or package planted
+    there. Kept apart from :func:`import_site_dirs`, which answers only what redirects this interpreter's
+    ``import levain``."""
+    from levain.firing.confinement import python_user_site_roots  # lazy: keep this module light
+
+    out: dict[str, None] = {}
+    for h in dict.fromkeys((Path(home), operator_home())):
+        for root, _label in python_user_site_roots(h)[0]:
+            for spelled in (os.path.normpath(root), os.path.realpath(root)):
+                out[spelled.lower()] = None
+    return tuple(out)
+
+
+def in_user_site(path: Path, roots: tuple[str, ...]) -> bool:
+    """``path`` (one spelling, normalised or resolved, as :func:`_tags_path` takes it) is one of ``roots``
+    (:func:`user_site_roots`) or lies under one."""
+    p = str(path).lower()
+    return any(p == r or p.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
 def _redirects_the_import(path: Path, sites: tuple[str, ...]) -> bool:
     """A site-directory entry that decides what ``import levain`` loads: a ``levain`` package or module, a
     ``levain-*.dist-info``, an ``__editable__`` levain finder, or any ``.pth`` / ``sitecustomize.py`` /
@@ -569,7 +596,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     repository of ``cwd`` or of the target (:func:`_under_hooks_path`: ``core.hooksPath`` wherever it points), and
     the user's git config files (:func:`global_git_configs`), never ``.gitignore`` or ``.gitattributes``; anything under a ``.claude-plugin/`` directory, or
     under ``hooks/`` beside one (a plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
-    it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); or any of
+    it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); anything in an
+    operator's Python user site, whatever this interpreter's own flag (:func:`in_user_site`); or any of
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
     tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and every
     other string in its input (:func:`levain.consent.policy.mcp_config_candidates`: a server can name its path in a
@@ -594,6 +622,7 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}
                       | {levain_package_dir().lower()})
         sites = import_site_dirs()
+        user_roots = user_site_roots(home)
         git_cache = git_cache if git_cache is not None else {}   # git asked once per repository, in one budget, per call
         home = Path(home)
         # by full path: the home's ``.claude.json`` and the user's git config files (``~/.gitconfig``,
@@ -614,7 +643,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         except (OSError, ValueError):
             return True
         if (_tags_path(written, cwd, roots, sites, user_configs, git_cache, environ=environ)
-                or _tags_path(resolved, cwd, roots, sites, user_configs, git_cache, environ=environ)):
+                or _tags_path(resolved, cwd, roots, sites, user_configs, git_cache, environ=environ)
+                or in_user_site(written, user_roots) or in_user_site(resolved, user_roots)):
             return True
     try:
         return any(names_config_dir(target, cwd, home, roots, sites, user_configs, git_cache, environ=environ)

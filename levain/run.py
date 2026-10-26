@@ -766,6 +766,7 @@ def _print_banner(
     hands_user: str | None = None,
     workspace: Path | None = None,
     socket_lines: list[str] | None = None,
+    user_site_note: str | None = None,
 ) -> None:
     """The session header — and the HONESTY FLOOR: show the operator exactly which stores this
     entity reads/writes, what hands it has, AND what the crown-jewels floor keeps off-limits, so
@@ -877,6 +878,12 @@ def _print_banner(
             print(textwrap.fill(line, width=88, initial_indent="  sockets:   " if i == 0 else "             ",
                                 subsequent_indent="               ", break_on_hyphens=False,
                                 break_long_words=False))
+        # The one persistence path the floor cannot hold where the operator put it ($PYTHONUSERBASE), from
+        # `python_userbase_note`, the same reader the floor is built with.
+        if user_site_note:
+            print(textwrap.fill(user_site_note, width=88, initial_indent="             ",
+                                subsequent_indent="               ", break_on_hyphens=False,
+                                break_long_words=False))
         print("             its OWN memory store (continuity/crystal/episodic) is WRITE-protected —")
         print("             only `levain wrap` composes it; the hands may READ but not rewrite it")
         # The GATE line sits with the floor because it answers the same question the floor does —
@@ -946,6 +953,14 @@ def _banner_for(
                                              grants=getattr(session, "grants", None))
         except Exception as exc:  # noqa: BLE001 — the spawn refuses bash on the same error, and says so
             socket_lines = [f"unix sockets: not determinable ({exc})"]
+    user_site_note = None
+    if session.with_tools:
+        try:
+            from levain.firing.confinement import python_userbase_note
+
+            user_site_note = python_userbase_note(Path.home())   # build_policy's home
+        except Exception:  # noqa: BLE001 — a note that cannot be computed must never break the banner
+            user_site_note = None
     _print_banner(
         session.entity_dir, session.binding,
         model=session.model_label, with_tools=session.with_tools, bash_ok=session.bash_ok,
@@ -957,6 +972,7 @@ def _banner_for(
         workspace=(getattr(session, "workspace", None)
                    if getattr(session, "hands_user", None) else None),
         socket_lines=socket_lines,
+        user_site_note=user_site_note,
     )
 
 

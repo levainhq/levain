@@ -2344,18 +2344,26 @@ def _check_confinement(install: Path) -> list[CheckResult]:
         # The host can sandbox bash, but the entity's localhost deny can still drop it or take its
         # network. `levain run` asks the SAME resolver with the same config, so the two agree.
         bash_ok, refusal, offline = resolve_localhost_deny(cfg.allow_localhost_outbound)
+        # The line `levain run` prints when $PYTHONUSERBASE puts the user site outside the floor.
+        try:
+            from levain.firing.confinement import python_userbase_note
+
+            note = python_userbase_note(Path.home())   # build_policy's home
+        except Exception:  # noqa: BLE001 — never let a diagnosis break the whole doctor run
+            note = None
+        tail = f"\n      {note}" if note else ""
         if not bash_ok:
             return [CheckResult("confinement floor", True,
                                 f"{d.provider} available, but `levain run` gets file_editor only: "
-                                f"{refusal}")]
+                                f"{refusal}{tail}")]
         if offline:
             return [CheckResult("confinement floor", True,
                                 f"{d.provider} — `levain run` gets file_editor + bash, and bash has "
                                 f"no IP network: connections back to this host are blocked by "
                                 f"removing it; {OFFLINE_RESIDUAL}. \"allow_localhost_outbound\": "
-                                f"true restores the network, with the spore-755 exposure")]
+                                f"true restores the network, with the spore-755 exposure{tail}")]
         return [CheckResult("confinement floor", True,
-                            f"{d.provider} — `levain run` gets file_editor + bash")]
+                            f"{d.provider} — `levain run` gets file_editor + bash{tail}")]
     detail = f"{d.reason} — `levain run` gets file_editor only (this is a supported configuration)"
     if d.remedy:
         detail += f"\n      → to enable the bash hand: {d.remedy}"

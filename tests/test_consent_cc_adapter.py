@@ -1556,3 +1556,75 @@ def test_a_queue_that_will_not_open_still_tags_the_configured_cockpit_store(tmp_
     got = json.loads(out.getvalue())
     assert got["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert got["continue"] is False and target in got["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+_USER_SITE_PLANTS = (".local/lib/python3.12/site-packages/x.pth",
+                     ".local/lib/python3.99/site-packages/evil/__init__.py",
+                     "Library/Python/3.12/lib/python/site-packages/usercustomize.py",
+                     "Library/Python/3.14/bin/tool")
+
+
+@pytest.mark.parametrize("rel", _USER_SITE_PLANTS)
+def test_a_write_into_the_operators_user_site_is_agent_config_under_a_venv(monkeypatch, tmp_path, rel):
+    """F7: on a venv install the hook's interpreter has ENABLE_USER_SITE False, so `import_site_dirs` leaves the user
+    site out; the operator's other, non-venv Pythons still load it. The user-site TREES are agent config whatever
+    this interpreter's flag says, and `import_site_dirs` keeps its meaning (what redirects THIS interpreter's
+    `import levain`)."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("platform.system", lambda: "Darwin")   # the framework layout is macOS's
+    monkeypatch.delenv("PYTHONUSERBASE", raising=False)
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda: tmp_path / "elsewhere")
+    assert all(not s.startswith(str(home).lower()) for s in cc.import_site_dirs())
+    target = home / rel
+    assert cc.targets_agent_config("Write", {"file_path": str(target)}, "/work/proj", home=home, environ=h4_env())
+    assert cc.targets_agent_config("Write", {"file_path": "~/" + rel}, "/work/proj", home=home, environ=h4_env())
+    # the OPERATOR's home (the password database's), when the agent's HOME is set elsewhere
+    monkeypatch.setattr(cc, "operator_home", lambda: home)
+    assert cc.targets_agent_config("Write", {"file_path": str(target)}, "/work/proj", home=tmp_path / "agent-home", environ=h4_env())
+    # an MCP tool given the site directory itself and a file name in another field
+    assert cc.targets_agent_config("mcp__fs__write", {"dir": str(target.parent), "name": "x.pth"}, "/work/proj",
+                                   home=home, environ=h4_env())
+
+
+@pytest.mark.parametrize("rel", (".local/libpython3/x.pth", ".local/share/x.pth", ".local/lib.d/x.pth",
+                                 "Library/Pythonx/x.pth", "proj/.local/lib/python3.12/x.pth"))
+def test_paths_beside_the_user_site_are_not_agent_config(monkeypatch, tmp_path, rel):
+    home = tmp_path / "home"
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.delenv("PYTHONUSERBASE", raising=False)
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda: tmp_path / "elsewhere")
+    assert not cc.targets_agent_config("Write", {"file_path": str(home / rel)}, "/work/proj", home=home, environ=h4_env())
+
+
+def test_the_consent_check_and_the_floor_read_one_user_site_derivation(monkeypatch, tmp_path):
+    """U1 (verify r2, codex HIGH + complement MED): the trees the hook tags are the floor's, from the one function
+    (`python_user_site_roots`), so a tree the floor denies is never one a standing grant answers. Anything under
+    ~/.local/lib is the floor's (a node_modules there included), so it is the hook's too."""
+    from levain.firing import confinement as C
+
+    home = tmp_path / "home"
+    base = tmp_path / "pyuser"
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    monkeypatch.setattr(cc, "operator_home", lambda: home)
+    floor = {os.path.normpath(r).lower() for r, _ in C.python_user_site_roots(home)[0]}
+    assert set(cc.user_site_roots(home)) >= floor and os.path.normpath(base / "lib").lower() in floor
+    assert cc.targets_agent_config("Write", {"file_path": str(home / ".local/lib/node_modules/a.js")}, "/work/proj",
+                                   home=home, environ=h4_env())
+
+
+@pytest.mark.parametrize("rel", ("lib/python3.12/site-packages/x.pth", "lib/python/site-packages/usercustomize.py",
+                                 "lib/python3.99/site-packages/evil/__init__.py"))
+def test_a_write_into_an_absolute_pythonuserbase_site_is_agent_config(monkeypatch, tmp_path, rel):
+    """U1: with an absolute $PYTHONUSERBASE the user site is below <base>/lib; a file-tool write there is agent config
+    (so no standing grant answers it), under a venv too. <base> itself beside lib stays ordinary."""
+    home = tmp_path / "home"
+    base = tmp_path / "opt" / "python-user"
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda: tmp_path / "elsewhere")
+    assert cc.targets_agent_config("Write", {"file_path": str(base / rel)}, "/work/proj", home=home, environ=h4_env())
+    assert cc.targets_agent_config("mcp__fs__write", {"dir": str((base / rel).parent), "name": "x.pth"},
+                                   "/work/proj", home=home, environ=h4_env())
+    assert not cc.targets_agent_config("Write", {"file_path": str(base / "notes.txt")}, "/work/proj", home=home, environ=h4_env())
