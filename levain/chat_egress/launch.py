@@ -12,7 +12,8 @@
      that check returns;
   4a. the mode read once (`launch_mode`): a value outside `classify.MODES` is refused. The session header and the
      egress digest are derived from that read, never from a second input (the digest fixes the mode at launch; a
-     `LiveSetting` is still read live per request by the decider, capped at that read: Q-R15-9);
+     `LiveSetting` is still read live per request by the decider, ratcheted from that read: a tightening applies
+     live and stays, a loosening never applies to this launch: Q-R15-9);
   4b. 19a: from the authority replay the routes were built from, the keyed records expiring within
      `renew.RENEW_DUE` are computed (a naive `now` or an authority that does not read is refused here);
   5. the listener pair: the HTTP(S) listener (handed to the glue as an fd) and the SOCKS refuser (`socks`), both on

@@ -354,6 +354,8 @@ def test_the_decider_is_capped_at_the_mode_the_header_and_digest_were_read_from(
         assert e.header[0] == lm.OPEN_NETWORK_LINE and e.decider.mode.launched == classify.OPEN_NETWORK
         standing["mode"] = classify.GATED
         assert e.decider.mode.get() == classify.GATED
+        standing["mode"] = classify.OPEN_NETWORK             # the revoke undone: a loosening, next launch only
+        assert e.decider.mode.get() == classify.GATED
     finally:
         lm.stop_egress(e)
 
