@@ -21,7 +21,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   apparently healthy signers row. A damaged file or log never aborts it.
 - **`levain daemon install-feeds` runs the review queue's feed pass on a schedule, with no model.** The pass is
   `levain coord review feeds`. Each run is bounded in whole seconds by the operating system, covering the whole command,
-  and skips if another is still running; a run that finds nothing new adds no record.
+  and skips if another is still running; every clean run records its pass, so the cockpit shows when it last looked.
 - **The cockpit's sign card no longer says nothing was signed after one read.** When an answer's reply is lost it stays
   frozen, reads the request twice, and comes back only if it is still open both times. Cancelling a passkey prompt on
   the card keeps the remembered passkey.
