@@ -3399,10 +3399,12 @@ _POLICY_LOWEST = ("ON_LOOP", "COOLING_OFF")
 
 
 def _add_binding_parser(subparsers: argparse._SubParsersAction, common: object) -> None:
-    """``levain binding policy create|renew|revoke|list`` and ``levain binding graduate``; ``common`` adds the cockpit
-    commands' ``--path`` / ``--data-root``."""
+    """``levain binding policy create|renew|revoke|list``, ``levain binding graduate`` and ``levain binding
+    pause|resume|abandon``; ``common`` adds the cockpit commands' ``--path`` / ``--data-root`` (pause, resume and
+    abandon read no cockpit, so they take only ``--store-dir``)."""
     b_p = subparsers.add_parser(
-        "binding", help="Graduation policies: what may run below CONFIRM without asking, signed in the authority log.",
+        "binding", help="Graduation policies (what may run below CONFIRM without asking, signed in the authority log); "
+                        "pause, resume or abandon a binding.",
         description=(
             "A standing binding fires below CONFIRM (cooling-off or on-loop) only while a graduation policy covers "
             "each action it runs: a link in the cockpit's signed authority log, naming the actions at the risk "
@@ -3487,6 +3489,27 @@ def _add_binding_parser(subparsers: argparse._SubParsersAction, common: object) 
                       help="The autonomic store to check (default: $LEVAIN_HOME/autonomic), as `policy create` takes it.")
     common(grad)
     grad.set_defaults(func=_cmd_binding_graduate)
+
+    as_is = "The store is opened as it is: nothing in it is upgraded, so this works on a store with runs in flight."
+    for verb, status_help, description in (
+        ("pause", "Pause a binding: it stops firing, and runs it already started stop before their next action.",
+         "Set the binding PAUSED in the autonomic store. Runs it already started stop before their next action. "
+         + as_is),
+        ("resume", "Resume a paused binding: it fires on its next event.",
+         "Set a PAUSED binding ACTIVE in the autonomic store, if it can fire (a confirm-class binding needs a kill "
+         "in its sealed guard). Runs admitted before the pause stay stopped. A revoked or expired binding is not "
+         "resumed: create a new one. " + as_is),
+        ("abandon", "Stop the runs a revoked or expired binding already started (a one-shot is revoked when its "
+                    "run is admitted); it does not fire again.",
+         "Runs the binding already started stop before their next action; its status is not changed. For a "
+         "binding that cannot be paused because it is revoked or expired; an active or paused binding is paused "
+         "instead. " + as_is),
+    ):
+        one = b_sub.add_parser(verb, help=status_help, description=description)
+        one.add_argument("binding_id", help="The binding's id.")
+        one.add_argument("--store-dir", dest="store_dir", type=Path, default=None,
+                         help="The autonomic store (default: $LEVAIN_HOME/autonomic).")
+        one.set_defaults(func=_cmd_binding_status, binding_status=verb)
 
 
 def _policy_actions(specs: list[str]) -> dict[str, dict[str, object]]:
@@ -3774,6 +3797,40 @@ def _graduation_blockers(store_dir: Path | None = None) -> list[str]:
         if refusal is not None:
             blockers.append(f"no executor can run a binding effect ({refusal}), so no binding fires")
     return blockers
+
+
+def _cmd_binding_status(args: argparse.Namespace) -> int:
+    """``levain binding pause|resume|abandon <id>`` (R14-9, O-75-6, R15-1) on the store opened as it is: pause is
+    :meth:`BindingStore.pause`, resume :meth:`BindingStore.ratify`, abandon :meth:`BindingStore.abandon`. One line out:
+    exit 0 on stdout, exit 1 ``not <done>: <why>`` on stderr."""
+    import sqlite3
+
+    from levain.autonomic.binding import BindingStore
+    from levain.autonomic.db import StoreFormatError, default_store_dir
+
+    verb, bid = args.binding_status, args.binding_id
+    done = {"pause": "paused", "resume": "resumed", "abandon": "abandoned"}[verb]
+    store_dir = args.store_dir.expanduser() if args.store_dir is not None else default_store_dir()
+    try:
+        store = BindingStore(store_dir, upgrade=False)
+        if verb == "resume":
+            found = store.ratify(bid)
+        else:
+            found = (store.pause if verb == "pause" else store.abandon)(bid)
+    except (ValueError, StoreFormatError, sqlite3.Error, OSError) as exc:
+        print(f"not {done}: {exc}", file=sys.stderr)
+        return 1
+    if found is None:
+        print(f"not {done}: no binding {bid}", file=sys.stderr)
+        return 1
+    if verb == "pause":
+        print(f"paused {bid}: its admitted runs are fenced (fence {found}); `levain binding resume {bid}` makes it "
+              "fire again")
+    elif verb == "resume":
+        print(f"resumed {bid}: it fires on its next event (runs admitted before the pause stay fenced)")
+    else:
+        print(f"abandoned {bid}: its admitted runs are fenced (fence {found}); it does not fire again")
+    return 0
 
 
 def _cmd_binding_graduate(args: argparse.Namespace) -> int:
