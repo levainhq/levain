@@ -796,8 +796,9 @@ def test_keys_limit_read_a_kernel_connect_timeout_is_unreachable_and_keys_deadli
 
 
 def test_keys_limit_read_a_timeout_raised_inside_the_call_is_unreachable_not_keys_deadline(monkeypatch):
-    """The 3.9 port of the bound (`wait_for`, not `asyncio.timeout`): an `asyncio.TimeoutError` the call itself raises
-    (an inner `wait_for` running out) is `unreachable`, the same as the kernel's; only `key_limit_s` is `timeout`."""
+    """The bound is a timer plus a task cancel: an `asyncio.TimeoutError` the call itself raises (an inner `wait_for`
+    running out) is `unreachable`, the same as the kernel's; only `key_limit_s` is `timeout`. On the 3.9 root interpreter
+    that exception is no OSError (3.11+ aliases it to the builtin one), so only a 3.9 run tells this test from a missing arm."""
     from levain.broker import upstream as U
     d = _limit_lib(["or-i"])
 

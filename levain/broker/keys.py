@@ -2741,7 +2741,7 @@ class Keys:
             return "address-refused" if r.name == "address-refused" else "bad-credential"
         except upstream.BadResponse:
             return "bad-body"
-        except (OSError, EOFError):   # a refused, reset or kernel-timed-out connect, a TLS failure, a lost connection
+        except (OSError, EOFError, asyncio.TimeoutError):   # a refused, reset or kernel-timed-out connect, a TLS failure, a lost connection; on 3.9 asyncio.TimeoutError is no OSError
             return "unreachable"
         finally:
             timer.cancel()
