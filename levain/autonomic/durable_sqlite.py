@@ -63,22 +63,28 @@ def _set_wal(conn: sqlite3.Connection) -> None:
 
     The busy handler is off while it tries, so every try answers at once and the pauses here are the only wait:
     their sum is the bound (a sum of pauses, not wall time), kept without a clock (``time`` is not on the package's import allowlist,
-    ``tests/test_autonomic_leaf.py``). The caller sets the busy handler after."""
+    ``tests/test_autonomic_leaf.py``). The caller sets the busy handler after.
+
+    Each pause is its step (doubling from 1 ms to 50 ms) scaled by a random factor in [0.5, 1.5). Two openers of one
+    new file each block the other's switch, and with one fixed schedule they woke together and collided again, round
+    after round (lane-race39 measured six rounds in one trial; on CI both calls of one trial were refused). The random
+    factor parts them, so one switches and the other then finds the file in WAL."""
     conn.execute("PRAGMA busy_timeout = 0")
     waited, pause = 0.0, 0.001
     while True:
         try:
             row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
         except sqlite3.OperationalError as exc:
-            if not _is_busy(exc) or waited + pause > BUSY_WAIT_S:
+            if not _is_busy(exc) or waited + 1.5 * pause > BUSY_WAIT_S:
                 raise
         else:
             mode = row[0] if row else None
             if not (isinstance(mode, str) and mode.lower() == "wal"):
                 raise sqlite3.OperationalError(f"WAL journaling was not applied: SQLite answered {mode!r}")
             return
-        threading.Event().wait(pause)
-        waited += pause
+        jittered = pause * (0.5 + int.from_bytes(os.urandom(2), "big") / 65536)
+        threading.Event().wait(jittered)
+        waited += jittered
         pause = min(pause * 2, 0.05)
 
 

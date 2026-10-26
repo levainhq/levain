@@ -104,6 +104,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Fixed
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
   refilled,** so a keys failure cannot leave the pool short.
+- **Two sessions making their first call at the same moment on a fresh install could both be refused with
+  `database is locked`.** Opening a new store now spaces its retries at random, so the two openers no longer keep
+  colliding.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - **The graduation engine behind `levain binding graduate`.** Once the binding driver is wired, it takes the steps a
