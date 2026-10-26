@@ -146,7 +146,11 @@ def load_policy(data: bytes) -> FrontPolicy:
     brokered_hosts: set[str] = set()
     brokered: dict[str, RoutePolicy] = {}
     for raw in doc["routes"]:
-        pol = parse_route(raw, source="dispatch-session" if doc["kind"] in DISPATCH_KINDS else "session")
+        # an entry is a priced map's (no per-call cap) or a `/1` map's (a per-call cap); the front enforces neither
+        # cap (keys does), so each entry is read as the format it came from.
+        per_call = isinstance(raw, dict) and "max_call_microdollars" in raw
+        pol = parse_route(raw, source="dispatch-session" if doc["kind"] in DISPATCH_KINDS else "session",
+                          per_call=per_call)
         route, typ = pol.route, pol.type
         if route in seen:
             raise PolicyError(f"route {route} twice")
@@ -1401,7 +1405,8 @@ async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[
     return 0
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def build_parser():
+    """The front's argv grammar (root's ``runtime_helper.gateway_front_args`` builds the one it is started with)."""
     import argparse
 
     ap = argparse.ArgumentParser(prog="python -m levain.broker.front")
@@ -1419,6 +1424,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--keys", required=True,
                     help="keys' R/keys/front.sock: the STATUS connection is opened after GO and the listener bound "
                          "only after keys' A; brokered exchanges go there")
+    return ap
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    ap = build_parser()
     a = ap.parse_args(argv)
     # every argument is checked before the GO fd is read: a bad one exits at once instead of after render's byte
     if a.unix is not None and a.slot_uid is None:
