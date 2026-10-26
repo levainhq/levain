@@ -547,7 +547,8 @@ def test_spend_overrun_recorded_session_not_revoked(py):
             settled = [o for o in B2.ledger_lines(w.keys.ledger_path) if o["kind"] == "settled"]
             return {"q1": q1, "recs": w.control.spend_overruns(S1), "settled": settled, "state": s1.state(),
                     "handles": w.control.handles(S1) is not None, "no_k": await no_k(f1), "q2": await f1.q(),
-                    "drops_owed": w.control.drops_owed()}
+                    "drops_owed": w.control.drops_owed(),
+                    "status": w.control.handle(C.Conn(R3.OP_UID), {"v": 1, "op": "STATUS", "id": 3, "session": S1})}
 
     out = run(go())
     assert out["q1"].get("status") == 200, out
@@ -558,6 +559,9 @@ def test_spend_overrun_recorded_session_not_revoked(py):
     assert rec["ref"][2] == line["ref"], (rec, line)
     assert out["state"] == R.RENDERED and out["handles"] and out["no_k"], out
     assert out["q2"].get("refused") == "budget-overrun", out
+    # R4 §4, the card row's data: the operator's STATUS of the stopped session carries its overrun
+    (st,) = out["status"]["records"]
+    assert st["budget_overrun"] == {"microdollars": line["overrun"], "calls": 1, "unproven": False}, st
 
 
 # ---- idempotency and the slow ack -----------------------------------------------------------------------------------
@@ -596,6 +600,7 @@ def test_admin_verbs_idempotent(py):
             over = dict(session=S2, route="r", model="m1", ref=["a" * 32, "b" * 32, 9], overrun=5, unproven=True)
             out["overrun"] = [ask("SPEND-OVERRUN", **over) for _ in range(2)]
             out["overrun_recs"] = w.control.spend_overruns(S2)
+            out["status"] = w.control.handle(C.Conn(R3.OP_UID), {"v": 1, "op": "STATUS", "id": 3})["records"]
             digest = C.digest_of(s2.token)
             out["sessions"] = [ask("SESSIONS", digests=[digest, "sha256:" + "0" * 64]) for _ in range(2)]
             out["lost"] = [ask("FRONT-LOST", session=S2) for _ in range(2)]
@@ -616,6 +621,9 @@ def test_admin_verbs_idempotent(py):
     assert out["no_k"] and out["q"].get("status") == 200, out
     assert out["drop"] == [{"dropped": True}, {"dropped": False}], out
     assert out["overrun"] == [{"id": 7, "ok": True}] * 2 and len(out["overrun_recs"]) == 1, out
+    # the card row's data counts the repeated SPEND-OVERRUN once, and marks it unproven; S1 has none
+    cards = {r["session"]: r.get("budget_overrun") for r in out["status"]}
+    assert cards == {S1: None, S2: {"microdollars": 5, "calls": 1, "unproven": True}}, cards
     zero = "sha256:" + "0" * 64
     assert out["sessions"] == [{"id": 7, "ok": True, "drop": [zero]}] * 2, out
     assert out["lost"] == [{"id": 7, "ok": True}] * 2 and out["lost_again"] == {"id": 7, "ok": True}, out

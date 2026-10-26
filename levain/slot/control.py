@@ -1630,13 +1630,30 @@ class Control:
     def _op_status(self, conn: Conn, args: dict) -> dict[str, object]:
         """§3.3: the records whose ``claims.operator_uid`` is the peer. DECISION: the answer is an object,
         so the list rides ``records``. Head ruling H8 (1024+8): a record's ``claims.ticket`` is left out (the ticket is
-        a bearer handle that reaches no record a non-root reader opens, H1)."""
+        a bearer handle that reaches no record a non-root reader opens, H1).
+
+        R4 §4, the card row's data: a record whose session keys stopped for an overrun (``SPEND-OVERRUN``) carries
+        ``budget_overrun`` = ``{microdollars, calls, unproven}``: the overruns' sum, how many settles overran, and
+        whether any of them was an unproven call. One fixed-size object per record whatever the count of overruns,
+        so it adds no list the answer's frame must hold; absent for a session with none. Memory only, like the
+        records it comes from (:meth:`spend_overruns`): a CONTROL restart forgets it."""
         want = R.check_session(args["session"]) if "session" in args else None
+        with self._mu:
+            stopped: dict[str, dict[str, object]] = {}
+            for (s, _ref), o in self._overruns.items():
+                card = stopped.setdefault(s, {"microdollars": 0, "calls": 0, "unproven": False})
+                # held at the wire's integer bound: each overrun is in it (``_op_spend_overrun``), a sum may not be
+                card["microdollars"] = min(R.JSON_INT_MAX, int(card["microdollars"])         # type: ignore[call-overload]
+                                           + int(o["overrun"]))                              # type: ignore[call-overload]
+                card["calls"] = int(card["calls"]) + 1                               # type: ignore[call-overload]
+                card["unproven"] = bool(card["unproven"]) or bool(o["unproven"])
         recs = []
         for r in sorted(self.store.all(), key=lambda r: r.session):
             if r.claims.get("operator_uid") == conn.peer_uid and (want is None or r.session == want):
                 rec = R.state_record(r)
                 rec["claims"] = {k: v for k, v in rec["claims"].items() if k != "ticket"}
+                if r.session in stopped:
+                    rec["budget_overrun"] = stopped[r.session]
                 recs.append(rec)
         return {"records": recs}
 
