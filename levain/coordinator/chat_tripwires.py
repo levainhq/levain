@@ -79,13 +79,16 @@ class ControlReply(NamedTuple):
     text: str
 
 
-# ---- §4.4 exemption 2, from rev 15 (D:5851-5869); verbatim but for read_exempt resolving the roots (L3 r1 T8) -------
+# ---- §4.4 exemption 2, from rev 15 (D:5851-5869); verbatim but for resolving the roots (L3 r1 T8) and ValueError --
 MODE_ALLOWED_SHAPE = {"decision": "accept", "source": "config", "reason_type": "mode"}   # rbpp2 a11_inside, 2.1.310
 
 def read_exempt(tool_name: str, tool_input: Any, decision: Mapping[str, Any], ctx: TripwireContext) -> bool:
     # the target is compared resolved, so the roots are too (a cwd under macOS /tmp or /var is a symlink path); a
-    # relative or unusable root is no root
-    roots = tuple(os.path.realpath(r) for r in launch_roots(ctx) if isinstance(r, str) and os.path.isabs(r))
+    # relative or unusable root is no root, and one that cannot be resolved (an embedded NUL) is no exemption
+    try:
+        roots = tuple(os.path.realpath(r) for r in launch_roots(ctx) if isinstance(r, str) and os.path.isabs(r))
+    except (OSError, RuntimeError, ValueError):
+        return False
     return (tool_name == "Read"                                   # exact
             and {k: decision.get(k) for k in MODE_ALLOWED_SHAPE} == MODE_ALLOWED_SHAPE
             and read_target_within(tool_input, roots))
@@ -97,8 +100,8 @@ def read_target_within(tool_input: Any, roots: tuple[str, ...]) -> bool:
         return False                                               # missing, malformed or relative: latch
     try:
         real = str(Path(fp).resolve(strict=True))                  # a missing target raises: latch
-    except (OSError, RuntimeError):
-        return False                                               # a symlink loop too
+    except (OSError, RuntimeError, ValueError):
+        return False                                               # a symlink loop or an embedded NUL too
     return any(real == r or real.startswith(r.rstrip(os.sep) + os.sep) for r in roots)   # symlink escape: latch
 # ---- end verbatim --------------------------------------------------------------------------------------------------
 

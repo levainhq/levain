@@ -937,3 +937,16 @@ def test_r1_a_crossing_batch_still_answers_its_elicitation_once(cs, claude, root
     assert _replies(s) == [("ctl-e", "levain answers no elicitation in chat")]
     assert s.interrupts == []
 
+
+def test_r2_a_read_path_with_an_embedded_nul_trips_and_does_not_raise(cs, claude, root):
+    assert _read(cs, claude, root, str(root / "inside.txt") + "\x00x") == ["tripwire:accepted_without_host"]
+
+
+def test_r2_a_launch_root_with_an_embedded_nul_is_no_root(cs, claude, root):
+    svc, s, _ = up(cs, claude, root, ctx=Ctx(str(root) + "\x00x"))
+    call(s, "toolu_1", tool="Read", tool_input={"file_path": str(root / "inside.txt")})
+    hooks(s, tool="Read")
+    result(s, "toolu_1", MODE_READ, tool="Read")
+    svc.read_next(claude["launch"])
+    assert trips(cs, claude["launch"]) == ["tripwire:accepted_without_host"]
+
