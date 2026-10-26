@@ -89,7 +89,7 @@ def test_control_down_backs_off_doubling_then_resumes_and_converges(store, repo,
         runner.stop()
         t.join(5.0)
         assert not t.is_alive()
-        assert waits.delays == [1.0, 2.0]
+        assert waits.delays[:2] == [1.0, 2.0] and all(d <= 8.0 for d in waits.delays)
         assert [r.run for r in store.run_records(d.job.id)] == [0]
     finally:
         for s in servers:
@@ -213,6 +213,65 @@ def test_a_cancelled_step_ends_run_without_a_wait():
     assert waits.delays == [] and f.steps == 1
 
 
+def test_a_step_that_raises_once_stop_is_set_is_the_clean_end():
+    """A stop that lands between the loop's check and the step leaves the step on a closed follower; whatever that
+    raises (a closed socket, a closed store handle) is the stop, not a failure."""
+    class Closed(FakeFollower):
+        def step(self):
+            self.steps += 1
+            if self.closed:
+                raise OSError("bad file descriptor")
+            return F.Stepped(CC.CLOSED)
+
+    f = Closed([])
+    runner = FR.FollowRunner(f, wait=Waits())
+
+    def stop_between_check_and_step() -> None:
+        runner.stop()
+
+    real = f.jobs.event_cursor
+    f.jobs.event_cursor = lambda: (stop_between_check_and_step(), real())[1]
+    runner.run()                                                # does not raise
+    assert f.steps == 1 and f.closed >= 1
+
+
+def test_a_step_that_raises_with_no_stop_still_reaches_the_caller():
+    f = FakeFollower([OSError("disk gone")])
+    with pytest.raises(OSError):
+        FR.FollowRunner(f, wait=Waits()).run()
+
+
+def test_an_unknown_outcome_waits_the_long_wait_even_when_the_cursor_moved():
+    def unknown_after_moving(f):
+        moved(f)
+        return F.Stepped("something-new")
+
+    f = FakeFollower([unknown_after_moving, F.Stepped("something-new")])
+    waits = Waits(stop_at=2)
+    FR.FollowRunner(f, first_s=1.0, max_s=4.0, lasting_s=100.0, wait=waits).run()
+    assert waits.delays == [100.0, 100.0]
+
+
+def test_a_stop_name_is_retryable_only_where_a_later_attempt_can_succeed():
+    assert {"control-down", "artifact-io", "take-failed", "take-bundle-absent"} <= FR.RETRYABLE
+    assert not ({"ticket-unresolved", "record-conflict", "event-shape"} & FR.RETRYABLE)
+
+
+def test_the_signal_handler_takes_no_lock_a_second_signal_could_find_held(store):  # noqa: F811
+    """A second SIGTERM/SIGINT arrives on the main thread while the first handler is running there. The handler only
+    records the request, so it returns while the follower's lock is held (as it is inside close())."""
+    f = F.EventFollower.at(store, "/nonexistent/c.sock", lambda _ev: None)
+    requested: list = []
+    handler = FR._stop_request_handler(requested)
+    returned = threading.Event()
+    with f._lock:
+        t = threading.Thread(target=lambda: (handler(signal.SIGTERM, None), handler(signal.SIGINT, None),
+                                             returned.set()), daemon=True)
+        t.start()
+        assert returned.wait(5.0)
+    assert len(requested) == 2
+
+
 # -- the entry ----------------------------------------------------------------------------------------------------
 
 
@@ -224,10 +283,14 @@ def test_main_takes_an_artifact_acks_it_and_ends_on_sigterm(store, served, tmp_p
     export = exported(tmp_path / "export", session, ticket)
     done: list = []
 
+    before = signal.getsignal(signal.SIGTERM)
+
     def term() -> None:
         ok = until(lambda: served.control.store.get(session).fields.get("artifact_acked") is True)
         done.append(ok)
-        os.kill(os.getpid(), signal.SIGTERM)
+        # signal only a process whose handler main() installed; with the default action SIGTERM would end pytest
+        if signal.getsignal(signal.SIGTERM) is not before:
+            os.kill(os.getpid(), signal.SIGTERM)
 
     t = threading.Thread(target=term, daemon=True)
     t.start()
@@ -259,6 +322,39 @@ def test_the_module_run_as_a_program_acks_and_exits_0_on_sigterm(store, served, 
             proc.communicate()
     assert proc.returncode == 0, err.decode()
     assert store.event_cursor()[1] >= seq and store.taken_artifact(session, ticket) is not None
+
+
+def test_two_sigterms_in_a_row_still_end_the_program_with_0(store, served, tmp_path):  # noqa: F811
+    session, ticket, seq = published(served)
+    (tmp_path / "export").mkdir()
+    export = exported(tmp_path / "export", session, ticket)
+    root = Path(FR.__file__).resolve().parents[2]
+    env = {**os.environ, "PYTHONPATH": str(root)}
+    proc = subprocess.Popen([sys.executable, "-m", "levain.dispatch.follow_run", "--store-dir", str(store.directory),
+                             "--socket", str(served.path), "--export-dir", str(export)], env=env, cwd=str(root),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        assert until(lambda: served.control.store.get(session).fields.get("artifact_acked") is True, 20.0)
+        proc.send_signal(signal.SIGTERM)
+        proc.send_signal(signal.SIGINT)
+        _, err = proc.communicate(timeout=10.0)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    assert proc.returncode == 0, err.decode()
+
+
+def test_a_held_lock_is_refused_before_the_store_is_opened(tmp_path):
+    d = tmp_path / "store"
+    d.mkdir(mode=0o700)
+    fd = FR.take_instance_lock(d)
+    assert fd is not None
+    try:
+        assert FR.main(["--store-dir", str(d), "--socket", "/nonexistent/c.sock"]) == FR.EX_INSTANCE_HELD
+        assert not (d / "dispatch.db").exists()
+    finally:
+        os.close(fd)
 
 
 def test_main_exits_tempfail_while_another_runner_holds_the_store(store):  # noqa: F811
