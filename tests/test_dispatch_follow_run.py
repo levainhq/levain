@@ -436,3 +436,10 @@ def test_main_refuses_a_relative_path(tmp_path):
     with pytest.raises(SystemExit) as e:
         FR.main(["--store-dir", "relative/store"])
     assert e.value.code == 2
+
+
+@pytest.mark.parametrize("host", ("darwin", "linux"))
+def test_store_dir_defaults_to_the_dispatch_store_row(host):
+    """O2: with no --store-dir the runner opens L/dispatch, the store row the dispatch service holds its lock in."""
+    from levain.slot import layout
+    assert FR._parser(host).parse_args([]).store_dir == str(layout.dispatch_store_dir(host))
