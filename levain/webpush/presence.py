@@ -19,7 +19,8 @@ Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newe
   ``remote``); ``back`` keeps it.
 - ``away`` pushes at once until input at this machine more than :data:`AWAY_GRACE_SECS` after it (a line typed just
   after saying it is the parting instruction). ``remote [duration]`` pushes for its duration. ``back`` clears
-  ``away``, ``remote``, ``quiet`` and ``sleep``, and leaves the measurement to decide. All optional overrides.
+  ``away``, ``remote``, ``quiet`` and ``sleep``; a standing ``loud`` stays until its timer, ``quiet`` or ``loud off``,
+  and the measurement decides only when no ``loud`` stands. All optional overrides.
 
 Desk activity is the macOS HID idle time (:func:`levain.consent.auto_away.input_idle_seconds`): measured, never
 predicted. With no such source, or no readable word, nothing is muted and the desk reads inactive: a ping he did not

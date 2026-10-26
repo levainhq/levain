@@ -482,13 +482,31 @@ def test_a_silent_peer_is_bounded_by_the_deadline(tmp_path: Path):
         shutil.rmtree(d, ignore_errors=True)
 
 
-def test_control_down_a_fresh_pass_with_nothing_held_is_not_called_out_of_date(tmp_path: Path):
-    _beat(tmp_path / "run", age=30, control="down")
+def test_control_silent_a_fresh_pass_that_looked_and_saw_nothing_says_so(tmp_path: Path):
+    # control "up" and no step3 failure: the reaper ran end_and_scrub, so its empty `held` is a sighting
+    _beat(tmp_path / "run", age=30, control="up")
     row = _rows(tmp_path, status=lambda: (False, "no answer in time"))["agent held sessions"]
     assert row.ok and row.warn
     assert "out of date" not in row.detail and "would not show here" not in row.detail
-    assert "pass 7" in row.detail and "30 s ago" in row.detail and "no held session" in row.detail
+    assert "pass 7" in row.detail and "30 s ago" in row.detail and "saw no held session" in row.detail
     assert "CONTROL did not answer (no answer in time)" in row.detail
+
+
+def test_control_silent_a_fresh_pass_that_ran_with_control_down_never_looked(tmp_path: Path):
+    _beat(tmp_path / "run", age=30, control="down")
+    row = _rows(tmp_path, status=lambda: (False, "no answer in time"))["agent held sessions"]
+    assert row.ok and row.warn
+    assert "would not show here" in row.detail and "did not look for held sessions" in row.detail
+    assert "out of date" not in row.detail and "saw no held" not in row.detail
+    assert "pass 7" in row.detail and "30 s ago" in row.detail and "CONTROL down" in row.detail
+
+
+def test_control_silent_a_fresh_pass_whose_step3_failed_never_looked(tmp_path: Path):
+    _beat(tmp_path / "run", age=30, control="up", skipped=["step3:OSError"])
+    row = _rows(tmp_path, status=lambda: (False, "no answer in time"))["agent held sessions"]
+    assert row.ok and row.warn
+    assert "would not show here" in row.detail and "step3:OSError" in row.detail
+    assert "out of date" not in row.detail and "saw no held" not in row.detail
 
 
 def test_control_down_a_stale_pass_is_still_out_of_date(tmp_path: Path):

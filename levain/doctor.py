@@ -1543,9 +1543,15 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
                 return CheckResult(name, True, "not asked: run as root, CONTROL does not serve this account its "
                                    "sessions", "Run `levain doctor` as the operator to see them.", neutral=True)
             if fresh is not None:
-                return CheckResult(name, True, f"unknown: CONTROL did not answer ({status[1]}); the reaper's last pass "
-                                   f"(pass {fresh['pass_seq']}, {_age_text(_beat_age(fresh, now))} ago) saw no held "
-                                   "session", warn=True)
+                # the reaper runs end_and_scrub (step 3, the only filler of `held`) only when CONTROL is up
+                step3 = [s for s in fresh["skipped"] if s.startswith("step3:")]
+                lead = (f"unknown: CONTROL did not answer ({status[1]}); the reaper's last pass "
+                        f"(pass {fresh['pass_seq']}, {_age_text(_beat_age(fresh, now))} ago) ")
+                if fresh["control"] == "up" and not step3:
+                    return CheckResult(name, True, lead + "saw no held session", warn=True)
+                ran = "ran with CONTROL down" if fresh["control"] != "up" else f"failed {step3[0]}"
+                return CheckResult(name, True, lead + f"{ran} and did not look for held sessions, so a session stuck "
+                                   "mid-end would not show here", warn=True)
             seen = {"closed": "closed to this account", "absent": "not written yet", "bad": "unreadable"}.get(beat[0])
             why = (f"CONTROL did not answer ({status[1]}) and the reaper's pass record is {seen}" if seen
                    else f"CONTROL did not answer ({status[1]}) and the reaper's pass record is out of date")

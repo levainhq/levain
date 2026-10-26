@@ -258,14 +258,18 @@ def test_cli_words_write_the_word_and_status_says_why(tmp_path, capsys, monkeypa
     assert _cli(tmp_path, "status") == 0
 
 
-@pytest.mark.parametrize("word,on_file", [("sleep", "sleep"), ("away", "away"), ("remote", "remote"),
-                                          ("quiet", "quiet"), ("back", "loud")])
-def test_what_a_standing_loud_leaves_on_file_after_each_word(tmp_path, word, on_file):
+@pytest.mark.parametrize("word,on_file,pushes", [("sleep", "sleep", False), ("away", "away", True),
+                                                 ("remote", "remote", True), ("quiet", "quiet", False),
+                                                 ("back", "loud", True)])
+def test_what_a_standing_loud_leaves_on_file_after_each_word(tmp_path, word, on_file, pushes):
     """Pins the contract the module docstring states (it passes against the code as written; it is a pin, not a
-    reproduction): a 2 h loud is replaced on file by any word but ``back``, which keeps it."""
+    reproduction): a 2 h loud is replaced on file by any word but ``back``, which keeps it. The on-file word is the
+    only place a loud lives, so the push decision (:func:`presence.should_push`, the one the sender uses) is asserted
+    too: a ``sleep`` or ``quiet`` that replaced it mutes the next ping, and a kept loud pushes it."""
     set_word(tmp_path, "loud", duration="2h", now=NOW)
     set_word(tmp_path, word, duration="5m" if word in ("quiet", "remote") else None, now=NOW + 10)
     assert presence.read_word(tmp_path)["word"] == on_file
+    assert presence.should_push(tmp_path, "ping", now=NOW + 15, idle=lambda: INACTIVE).push is pushes
 
 
 def test_loud_off_ends_a_standing_loud(tmp_path):
