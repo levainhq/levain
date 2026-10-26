@@ -29,6 +29,9 @@ from levain.coordinator.driver import (DriverSession, LivenessEvidence, Scripted
 from levain.coordinator.envelopes import EnvelopeStore
 from levain.coordinator.store import CoordError, Part
 
+# CH-D1b-3: a service's verdict comes from its probe; these worlds are Claude launches, whose every send is a boundary
+# (R9), so their services carry a probe that reads live and a retry wait that does not sleep
+LIVE = {"probe": lambda _launch, _evidence: chat.Verdict(True, "scripted probe: live"), "sleep": lambda _s: None}
 T0 = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
 ME = "cockpit:tab-a"
 PHONE = "phone:iphone-1"
@@ -100,7 +103,7 @@ def check(cs, launch, kind, source="activation", **kw):
 def ready(cs, world, session, *, svc_cls=ChatService, **kw):
     """A launch the service may send to: a live check, the vendor's origin read, an attached session."""
     check(cs, world["launch"], "live")
-    svc = svc_cls(cs, **kw)
+    svc = svc_cls(cs, **{**LIVE, **kw})
     svc.attach(world["launch"], session)
     svc.ingest(world["launch"], session.read(None))
     return svc
@@ -285,7 +288,7 @@ def test_send_refused_on_an_ended_launch(cs, world, store):
 
 def test_send_refused_with_no_session(cs, world):
     check(cs, world["launch"], "live")
-    svc = ChatService(cs)
+    svc = ChatService(cs, **LIVE)
     r = send(svc, cs, world)
     assert r.state == "refused" and "no driver session" in r.cause
 
@@ -327,7 +330,7 @@ def test_steer_refused_when_vendor_takes_none(cs, world):
 def test_no_vendor_position_cancels_before_any_call(cs, world):
     s = ScriptedSession()
     check(cs, world["launch"], "live")
-    svc = ChatService(cs)
+    svc = ChatService(cs, **LIVE)
     svc.attach(world["launch"], s)                                         # never read: no cursor persisted
     r = send(svc, cs, world)
     assert (r.state, r.cause) == ("cancelled", "no vendor position yet") and s.written == []
@@ -412,7 +415,7 @@ def test_send_crash_matrix_in_process(cs, world, store, point, after, written):
     e = cs.turn_claim(world["launch"], ME)
     with pytest.raises(Died):
         send(svc, cs, world, epoch=e)
-    restarted = ChatService(ChatStore(store))
+    restarted = ChatService(ChatStore(store), **LIVE)
     restarted.recover()
     with cs._write() as (conn, _now):
         m = conn.execute("SELECT message_id FROM chat_messages").fetchone()[0]
@@ -434,7 +437,7 @@ def _child(qdir: str, launch_id: str, epoch: str, point: str, log: str) -> None:
         if p == point:
             os.kill(os.getpid(), signal.SIGKILL)
 
-    svc = ChatService(cs, fault=die)
+    svc = ChatService(cs, fault=die, **LIVE)
     svc.attach(launch_id, s)
     svc.ingest(launch_id, s.read(None))
     svc.send(launch_id, author_surface="cockpit", client_id="tab-a", outbox_id="ob-00000001", body="go",
@@ -460,7 +463,7 @@ def test_send_crash_matrix_kill9(tmp_path, point, after, written):
     assert p.returncode == -signal.SIGKILL, (p.returncode, p.stderr[-2000:])
     lines = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
     assert len(lines) == written
-    svc = ChatService(ChatStore(EnvelopeStore(q)))
+    svc = ChatService(ChatStore(EnvelopeStore(q)), **LIVE)
     svc.recover()
     with cs._write() as (conn, _now):
         m = conn.execute("SELECT message_id FROM chat_messages").fetchone()[0]
@@ -566,7 +569,7 @@ def test_first_read_is_backfill_and_proves_nothing(cs, world):
     s = ScriptedSession(correlation_field="uuid")
     s.show("user_item", body="old", correlation="op-x")
     check(cs, world["launch"], "live")
-    svc = ChatService(cs)
+    svc = ChatService(cs, **LIVE)
     svc.attach(world["launch"], s)
     assert svc.ingest(world["launch"], s.read(None)) == 1
     with cs._write() as (conn, _now):

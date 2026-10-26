@@ -16,7 +16,7 @@ from levain.coordinator import chat
 from levain.coordinator.chat import ChatService
 from levain.coordinator.driver import ReadBatch, ScriptedSession, SendResult, event
 from levain.coordinator.store import CoordError
-from tests.test_coordinator_chat_send import (ME, check, clock, cs, qdir, ready, send, states, store,  # noqa: F401
+from tests.test_coordinator_chat_send import (LIVE, ME, check, clock, cs, qdir, ready, send, states, store,  # noqa: F401
                                               world)
 
 WAIT = 5.0          # seconds a test waits for a thread it expects to move
@@ -86,7 +86,7 @@ def test_absence_is_never_inferred_across_an_unresolved_gap(cs, world):
 def test_a_gap_before_the_anchor_does_not_block_absence(cs, world):
     s = ScriptedSession(sends=("lose",))
     check(cs, world["launch"], "live")
-    svc = ChatService(cs)
+    svc = ChatService(cs, **LIVE)
     svc.attach(world["launch"], s)
     svc.ingest(world["launch"], batch(through="00000000"))
     svc.ingest(world["launch"], batch(through="00000002", gap=True))
@@ -357,7 +357,7 @@ def test_ingest_without_a_session_is_refused_and_candidates_are_empty(cs, world,
     s = ScriptedSession(sends=("ambiguous",))
     svc = ready(cs, world, s)
     r = send(svc, cs, world)
-    fresh = ChatService(cs)                                                # a restarted service, nothing attached
+    fresh = ChatService(cs, **LIVE)                                                # a restarted service, nothing attached
     with pytest.raises(CoordError, match="no driver session"):
         fresh.ingest(world["launch"], s.read("00000000"))
     assert fresh.candidates(r.message_id) == []
@@ -373,7 +373,7 @@ def test_a_worker_launch_with_no_thread_is_refused(cs, world, qdir):
               "placement, at) SELECT ?, (SELECT MAX(gseq) FROM gseq), session_key || '-bare', harness, role, '[]', "
               "model, cwd, token, placement, at FROM launches WHERE launch_id = ?", (bare, world["launch"]))
     c.close()
-    svc = ChatService(cs)
+    svc = ChatService(cs, **LIVE)
     with pytest.raises(CoordError, match="no thread"):
         svc.send(bare, author_surface="coordinator", client_id="coord-1", outbox_id="ob-00000009",
                  body="go", author_kind="coordinator")
