@@ -37,7 +37,9 @@ def egress(host="darwin", vendor="claude", kind="interactive", auth="brokered", 
     blob = RenderBlob(vendor=vendor, routes=tuple(routes), **blob_kw)
     facts = dict(host=host, session=S, slot=slot, kind=kind, vendor=vendor, auth=auth, slot_uid=3990,
                  slot_gid=3990, gwport=rd.gwport_for(host, slot), route_types=ROUTES, term="xterm-256color",
-                 var_folders=(VF_SLOT,) if host == "darwin" else ())
+                 var_folders=(VF_SLOT,) if host == "darwin" else (),
+                 # WF-1b: the base map gives every egress route its hosts (runtime_helper.base_routes)
+                 route_hosts={"github": ("github.com", "api.github.com")})
     facts.update(kw)
     return blob, RenderFacts(**facts)
 
@@ -271,6 +273,71 @@ def test_effective_config_readback():
     assert rd.readback_refusals(exp, good) == ["permissions.ask"]
 
 
+# --- WF-1a: WebFetch through the front (wfetch DESIGN §3 WF-1 items 1-3) -----------------------------------------
+
+HOSTS = {"github": ("github.com", "api.github.com")}
+
+
+def test_webfetch_pins_on_every_egress_session():
+    """skipWebFetchPreflight on every egress session (RULINGS Q1 (b)), one ``WebFetch(domain:)`` allow per host of the
+    session's egress routes (never the vendor route's), and the existing permission pins untouched."""
+    for host, auth in itertools.product(("darwin", "linux"), ("brokered", "passthrough")):
+        blob, facts = egress(host, "claude", auth=auth, route_hosts=HOSTS)
+        s = rd.render_cc_settings(blob, facts)
+        assert s["skipWebFetchPreflight"] is True
+        assert s["disableClaudeAiConnectors"] is True
+        assert s["permissions"]["allow"] == ["WebFetch(domain:api.github.com)", "WebFetch(domain:github.com)"]
+        assert s["permissions"]["disableBypassPermissionsMode"] == "disable"
+        if host == "linux":
+            assert s["permissions"]["ask"] == ["Bash(dangerouslyDisableSandbox:true)"]
+        assert not any("anthropic" in a for a in s["permissions"]["allow"])
+    # no egress route in the session: the preflight is still skipped, no allow rule is rendered
+    blob, facts = egress("darwin", "codex", auth="passthrough")
+    s = rd.render_cc_settings(blob, facts)
+    assert s["skipWebFetchPreflight"] is True and "allow" not in s["permissions"]
+    # the none class has no network: none of it but the connectors pin
+    blob, facts = verifier()
+    s = rd.render_cc_settings(blob, facts)
+    assert "skipWebFetchPreflight" not in s and "allow" not in s["permissions"]
+    assert s["disableClaudeAiConnectors"] is True
+
+
+def test_webfetch_hosts_only_from_egress_routes_and_checked():
+    """A host list for a non-egress route renders nothing; a host the policy grammar refuses is refused before any
+    byte (it would otherwise be spliced into a permission rule)."""
+    blob, facts = egress("darwin", route_hosts={**HOSTS, "anthropic": ("api.anthropic.com",)})
+    assert rd.render_cc_settings(blob, facts)["permissions"]["allow"] == [
+        "WebFetch(domain:api.github.com)", "WebFetch(domain:github.com)"]
+    for bad in ("GitHub.com", "*.github.com", "github.com)", "127.0.0.1", "0x7f.0x1", "localhost", ""):
+        blob, facts = egress("darwin", route_hosts={"github": (bad,)})
+        e = refused(rd.render, blob, facts)
+        assert e.name == "bad-config", bad
+    blob, facts = egress("darwin", route_hosts={"github": ()})
+    assert refused(rd.render, blob, facts).name == "egress-route-no-hosts"     # WF-1b
+
+
+def test_webfetch_pins_read_back():
+    blob, facts = egress("darwin", route_hosts=HOSTS)
+    exp = rd.expected_effective_cc(blob, facts)
+    assert exp["skipWebFetchPreflight"] is True and exp["disableClaudeAiConnectors"] is True
+    good = json.loads(rd.render(blob, facts).file("root/settings.json").data)
+    assert rd.readback_refusals(exp, good) == []
+    good["skipWebFetchPreflight"] = False
+    assert rd.readback_refusals(exp, good) == ["skipWebFetchPreflight"]
+    blob, facts = egress("darwin", "codex")
+    assert rd.expected_effective_codex(blob, facts)["web_search"] == "disabled"
+
+
+def test_codex_web_search_disabled():
+    """RULINGS Q3: until Phill rules, Codex's server-side search is off (under danger-full-access it defaults to live,
+    a vendor-side fetch the front cannot see)."""
+    for host, vendor, auth in itertools.product(("darwin", "linux"), ("claude", "codex"), ("brokered", "passthrough")):
+        blob, facts = egress(host, vendor, auth=auth)
+        assert 'web_search = "disabled"' in rd.codex_toml(blob, facts).decode().splitlines()
+    blob, facts = verifier(vendor="codex")
+    assert 'web_search = "disabled"' in rd.codex_toml(blob, facts).decode().splitlines()
+
+
 def test_codex_onboarding_and_provider():
     blob, facts = egress("darwin", "codex", model="gpt-6")
     r = rd.render(blob, facts)
@@ -456,6 +523,18 @@ def test_repo_settings_env_naming_the_queue_refused():
     assert [x.name for x in rd.repo_loosening_refusals({f: {"env": ["x"]}})] == ["repo-settings-malformed"]
 
 
+def test_repo_settings_env_naming_a_proxy_var_refused():
+    """WF-1 item 2: a repo layer clearing or redirecting the proxy vars cannot escape the wall, but every fetch would
+    then fail with no cause shown; refused at launch by name instead."""
+    f = ".claude/settings.json"
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY",
+                 "all_proxy"):
+        got = rd.repo_loosening_refusals({f: {"env": {name: ""}}})
+        assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
+        assert f in got[0].detail
+    assert rd.repo_loosening_refusals({f: {"env": {"PROXY_HOST": "x", "HTTPS_PROXYX": "y"}}}) == []
+
+
 def test_levain_repo_settings_pass():
     """The negative control. ``.claude/settings.json`` is absent from this repo, so the control is (a) a hooks-only
     settings file and (b) the Claude Code settings template Levain ships (hooks + permissions)."""
@@ -517,16 +596,18 @@ GOLD_PROFILE_DISPATCH_QUEUE_LINES = [
     '(allow network-outbound (remote unix-socket (subpath "/private/var/run/levain/qb/slot3")))',
 ]
 
-GOLD_SETTINGS_LINUX = {"permissions": {"ask": ["Bash(dangerouslyDisableSandbox:true)"],
+GOLD_SETTINGS_LINUX = {"permissions": {"allow": ["WebFetch(domain:api.github.com)", "WebFetch(domain:github.com)"],
+                                       "ask": ["Bash(dangerouslyDisableSandbox:true)"],
                                        "disableBypassPermissionsMode": "disable"},
                        "sandbox": {"bwrapPath": "/usr/libexec/levain/bwrap", "enabled": True, "excludedCommands": [],
                                    "failIfUnavailable": True},
-                       "disableAllHooks": False}
+                       "disableAllHooks": False, "disableClaudeAiConnectors": True, "skipWebFetchPreflight": True}
 
 GOLD_CODEX_DARWIN = f"""approval_policy = "never"
 cli_auth_credentials_store = "file"
 model_provider = "levain"
 sandbox_mode = "danger-full-access"
+web_search = "disabled"
 
 [model_providers.levain]
 base_url = "http://127.0.0.1:47103/r/openai/v1"
@@ -535,12 +616,13 @@ name = "levain"
 wire_api = "responses"
 
 [projects."/private/var/levain/live/{S}/repo"]
-trust_level = "trusted"
+trust_level = "untrusted"
 """
 
 GOLD_CODEX_LINUX = f"""approval_policy = "never"
 cli_auth_credentials_store = "file"
 model_provider = "levain"
+web_search = "disabled"
 
 [model_providers.levain]
 base_url = "http://127.0.0.1:47100/r/openai/v1"
@@ -549,7 +631,7 @@ name = "levain"
 wire_api = "responses"
 
 [projects."/var/levain/live/{S}/repo"]
-trust_level = "trusted"
+trust_level = "untrusted"
 """
 
 
@@ -561,16 +643,18 @@ def _digest(r) -> str:
 
 
 #: Every file (path, owner, mode, bytes) of each (OS x vendor x class) render, pinned. The full text of each was
-#: read once when these were taken; a change here is a change to what a confined session loads.
+#: read once when these were taken; a change here is a change to what a confined session loads. WF-1b re-took the four
+#: egress digests: the only change against cf2e19bb is root/settings.json's permissions.allow gaining
+#: WebFetch(domain:api.github.com) and WebFetch(domain:github.com), the helper's route_hosts for its github route.
 GOLD_DIGESTS = {
-    ("darwin", "claude", "egress"): "47601d17095c0001",    # V13: + root/probe.sb (the rest unchanged)
-    ("darwin", "claude", "none"): "3ef89c7358a401ec",
-    ("darwin", "codex", "egress"): "682bfd7ae3303973",     # V13: + root/probe.sb (the rest unchanged)
-    ("darwin", "codex", "none"): "309384e358924b92",
-    ("linux", "claude", "egress"): "98ce399830ec8e9e",
-    ("linux", "claude", "none"): "c5ec670282a4d84a",
-    ("linux", "codex", "egress"): "7bbc08bc23292e46",
-    ("linux", "codex", "none"): "81b2599fe7f67fb5",
+    ("darwin", "claude", "egress"): "18f9a25ffabf303f",
+    ("darwin", "claude", "none"): "dd0f5dad5c38e0b8",
+    ("darwin", "codex", "egress"): "24cbf6f8faa1bac0",
+    ("darwin", "codex", "none"): "7441ce40b3226c61",
+    ("linux", "claude", "egress"): "9a6f5684256bdd1c",
+    ("linux", "claude", "none"): "c9796d76e53b1d57",
+    ("linux", "codex", "egress"): "02b07820fb916f2b",
+    ("linux", "codex", "none"): "673582e9c5e81a4e",
 }
 
 
@@ -600,3 +684,71 @@ def test_golden_text_per_os_vendor_class():
         got[(host, vendor, "egress")] = _digest(rd.render(*egress(host, vendor)))
         got[(host, vendor, "none")] = _digest(rd.render(*verifier(host, vendor)))
     assert got == GOLD_DIGESTS
+
+
+def test_egress_route_without_hosts_is_refused_not_rendered_ruleless():
+    """WF-1a L3 r1 ruling, closed by WF-1b (wf1a return ruling 2): an egress route the session names with no hosts
+    entry was rendered with no allow rule; route_hosts now has its producer (runtime_helper.base_routes), so a missing
+    entry is refused by name before any byte."""
+    for host in ("darwin", "linux"):
+        blob, facts = egress(host, "claude", route_hosts={})
+        assert "github" in blob.routes and ROUTES["github"] == "egress"
+        assert refused(rd.render, blob, facts).name == "egress-route-no-hosts"
+
+
+class _Boom:
+    def __iter__(self):
+        raise RuntimeError("not a host list")
+
+
+def test_egress_hosts_malformed_facts_refused_by_name():
+    """WF-1a L3 r1 W2: a route_hosts fact of the wrong shape is refused ``bad-config``, never a raw traceback."""
+    for bad in (None, ["github"], {"github": _Boom()}, {"github": ("github.com", None)}, {"github": "github.com"},
+                {"github": {"github.com": 1}}, {"github": ("github.com", b"api.github.com")}):
+        blob, facts = egress("darwin", route_hosts=bad)
+        e = refused(rd.render, blob, facts)
+        assert e.name == "bad-config", bad
+
+
+def test_egress_hosts_scoped_to_the_egress_class():
+    """WF-1a L3 r1 W4: only an egress-class session reads route_hosts; the none class renders none of it."""
+    blob, facts = verifier(route_hosts={"github": ("NOT A HOST",)})
+    assert rd.egress_hosts(blob, facts) == ()
+    rd.render(blob, facts)
+
+
+def test_codex_files_the_session_repo_untrusted():
+    """wf1af return rulings (THE CLASS), from the run (1026-2/wf1ag/RETURN.md, Codex 0.162.1 app-server
+    ``config/read``): a ``trusted`` repo's ``.codex/config.toml`` outranked every key this file sets; ``untrusted``
+    keeps that layer out. Every session that renders a Codex config files its repo, and only its repo, so."""
+    for host, vendor, auth in itertools.product(("darwin", "linux"), ("claude", "codex"), ("brokered", "passthrough")):
+        blob, facts = egress(host, vendor, auth=auth)
+        tables = rd.codex_config(blob, facts)["tables"]
+        projects = {k: v for k, v in tables.items() if k.startswith("projects.")}
+        assert projects == {f"projects.{rd._toml_str(str(facts.S / 'repo'))}": {"trust_level": "untrusted"}}
+        assert 'trust_level = "trusted"' not in rd.codex_toml(blob, facts).decode()
+    blob, facts = verifier(vendor="codex")
+    assert 'trust_level = "untrusted"' in rd.codex_toml(blob, facts).decode().splitlines()
+
+
+def test_codex_launch_pins_web_search_above_a_trusted_repo():
+    """WF-1a L3 r1 W1, from the run (1026-2/wf1af/RETURN.md, Codex 0.162.1 app-server ``config/read``): a trusted
+    repo's ``.codex/config.toml`` ``web_search = "live"`` wins over CODEX_HOME's ``disabled``; a ``-c`` override
+    is the ``sessionFlags`` layer above it, kept now that the repo is filed untrusted. The launch args parse as
+    Codex parses ``-c`` (a TOML value)."""
+    import tomllib
+
+    args = rd.CODEX_LAUNCH_ARGS
+    assert len(args) % 2 == 0 and all(f == "-c" for f in args[::2])
+    pinned = {}
+    for kv in args[1::2]:
+        k, _, v = kv.partition("=")
+        pinned[k] = tomllib.loads(f"x = {v}")["x"]
+    assert pinned == {"web_search": rd.CODEX_WEB_SEARCH} and rd.CODEX_WEB_SEARCH == "disabled"
+
+
+def test_repo_settings_proxy_env_of_the_wrong_shape_is_malformed():
+    """WF-1a L3 r1 LOW-2: an ``env`` that is not an object is refused as malformed before any name is matched."""
+    for env in (["HTTPS_PROXY"], "HTTPS_PROXY=x", None, 1):
+        got = rd.repo_loosening_refusals({".claude/settings.json": {"env": env}})
+        assert [x.name for x in got] == ["repo-settings-malformed"], env

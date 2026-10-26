@@ -699,15 +699,20 @@ def penv(tmp_path):
     pr.close()
 
 
+def _v1_entry(r):
+    """A /2 entry cut to what render reads: its id, its type and, for an egress route, its hosts (WF-1b: an egress
+    route with no hosts is refused ``base-map-malformed``)."""
+    return {"route": r["route"], "type": r["type"], **({"hosts": r["hosts"]} if r["type"] == "egress" else {})}
+
+
 def _rendered_probe(w):
     from levain.contracts import canon
     from tests.test_slot_s2f3_start import _rendered
 
     base = (w.L / "routes" / "base.json").read_bytes()
     (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(
-        {"format": "levain-routes-base/1", "routes": [{"route": r["route"], "type": r["type"]}
-                                                      for r in _base_v2()["routes"]]}))
-    s = _rendered(w)          # render reads route types only; the probe reads the full /2 map
+        {"format": "levain-routes-base/1", "routes": [_v1_entry(r) for r in _base_v2()["routes"]]}))
+    s = _rendered(w)          # render reads route types and egress hosts only; the probe reads the full /2 map
     (w.L / "routes" / "base.json").write_bytes(base)
     return s
 
@@ -806,7 +811,7 @@ def test_t6_active_session_is_probeable(penv):
     w, la, table, pr = penv
     from levain.contracts import canon
     v1 = canon.canonical_bytes({"format": "levain-routes-base/1", "routes": [
-        {"route": r["route"], "type": r["type"]} for r in _base_v2()["routes"]]})
+        _v1_entry(r) for r in _base_v2()["routes"]]})
     (w.L / "routes" / "base.json").write_bytes(v1)
     s = _started(w, la, table)
     (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(_base_v2()))

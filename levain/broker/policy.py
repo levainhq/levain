@@ -102,18 +102,26 @@ def _is_inet_aton_spelling(h: str) -> bool:
     return True
 
 
-def hosts(route: str, raw: object) -> list[str]:
+def is_host_name(h: object) -> bool:
     """The one host grammar, for CONNECT hosts and a brokered route's `upstream.host` alike: a lowercase IDNA A-label
     name of two or more labels, with no trailing dot and no port. A host that is an address in disguise is refused
     too: a last label of digits only, and any spelling `socket.inet_aton` accepts as IPv4 (hex, octal, short forms
     such as 0x7f.0x1), because the system resolver would turn it into that address without a lookup."""
+    return (isinstance(h, str) and _HOSTNAME.match(h) is not None and not h.rsplit(".", 1)[1].isdigit()
+            and not _is_inet_aton_spelling(h))
+
+
+def hosts(route: str, raw: object) -> list[str]:
+    """A route's ``hosts`` list: non-empty, every entry passing :func:`is_host_name`, none named twice (the front
+    refuses a CONNECT host admitted twice, so a map holding one would fail every session that carries the route)."""
     if not isinstance(raw, list) or not raw:
         raise PolicyError(f"route {route}: hosts must be a non-empty list")
     out = []
     for h in raw:
-        if (not isinstance(h, str) or not _HOSTNAME.match(h) or h.rsplit(".", 1)[1].isdigit()
-                or _is_inet_aton_spelling(h)):
+        if not is_host_name(h):
             raise PolicyError(f"route {route}: host {h!r} is not a lowercase A-label host name")
+        if h in out:
+            raise PolicyError(f"route {route}: host {h} named twice")
         out.append(h)
     return out
 

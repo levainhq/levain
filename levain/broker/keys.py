@@ -104,6 +104,7 @@ from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.slot import Refused as RouteRefused
 from levain.slot import routemaps
+from levain.slot.grammar import replace_intent_problem
 
 T = TypeVar("T")
 
@@ -328,7 +329,8 @@ def lineage_row(base: dict, *, settled: str, ended_at: str, md: "Optional[codec.
     happened, None when no upstream call was made (H6-21: `model_answered` / `provider_answered` / `cost_reported`
     are then null; with a call, an unsaid string is `"unknown"` and an unsaid cost null). `usage` and `cost` are the
     settle's: `tokens_in` counts every input class (plain, cache write, cache read), `cost_microdollars` the whole
-    priced cost, and `overrun` (H6-7: a `"yes"` row) the part past the hold, null when none."""
+    priced cost, and `overrun` (H6-7: a `"yes"` row) the part past the hold, null when none. A settle with a cost and
+    no usage (another model's reported cost past the hold, verify r2 R2) has the cost and null token counts."""
     row = dict(base)
     call = md is not None
     row.update(ended_at=ended_at, settled=settled, status=status, refused=refused,
@@ -336,9 +338,10 @@ def lineage_row(base: dict, *, settled: str, ended_at: str, md: "Optional[codec.
                provider_answered=((md.provider or "unknown") if md is not None else None),
                cost_reported=(md.cost_reported if md is not None else None),
                tokens_in=None, tokens_out=None, cost_microdollars=None, overrun=None, count=None)
-    if call and usage is not None and cost is not None:
-        row.update(tokens_in=usage.in_ + usage.cache_write + usage.cache_read, tokens_out=usage.out,
-                   cost_microdollars=cost, overrun=overrun if overrun > 0 else None)
+    if call and cost is not None:
+        row.update(cost_microdollars=cost, overrun=overrun if overrun > 0 else None)
+        if usage is not None:
+            row.update(tokens_in=usage.in_ + usage.cache_write + usage.cache_read, tokens_out=usage.out)
     return row
 
 
@@ -2338,12 +2341,14 @@ class Keys:
                 return   # the front aborted, or the exchange was cut short: `_serve_q`'s `end()` resolves the hold
             assert reader is not None   # a completed relay made one
             self._settle(conn.reg, meter[1], hold, reader, route=pol.route, model=meter[3], unproven=meter[4],
-                         status=rec["status"] if type(rec["status"]) is int else 0)
+                         status=rec["status"] if type(rec["status"]) is int else 0,
+                         checks_model=meter[0].checks_answered_model)
         finally:
             rec["redactions"] = scanner.count
 
     def _settle(self, reg: Registration, price: Price, hold: ledger.Hold, reader: codec.UsageReader, *,
-                route: str = "", model: str = "", unproven: bool = False, status: int = 0) -> None:
+                route: str = "", model: str = "", unproven: bool = False, status: int = 0,
+                checks_model: bool = False) -> None:
         """A completed relay's resolution (R4 §1.2, §1.4): its reported usage priced by class, settled in full (the
         ledger books what passes the hold as `overrun`); with none, `uncertain` charged its hold, the reason the
         reader's (`usage-over-cap` when a cap stopped it, else `no-usage`). A cost above the hold stops the session: it
@@ -2357,23 +2362,55 @@ class Keys:
 
         A ticketed exchange's resolution carries keys' whole `/3` row (H6-28; `lineage_row`): `uncertain` with the
         call's metadata and no counts, or `settled: "yes"` with its counts, its cost and, past the hold, `overrun`
-        (H6-7). `status` is the upstream's (the relayed `R`)."""
+        (H6-7). `status` is the upstream's (the relayed `R`).
+
+        3c-9 (R4 §5 CARRIED), on a codec that checks it (`checks_model`: the exchange's
+        :attr:`levain.broker.codec.Codec.checks_answered_model`, head ruling 1026+1): a response that says another model
+        ran than `model`, the checked one (:func:`levain.broker.codec.answered_other`), is never priced at `model`'s
+        row: it is charged its whole hold, or the cost the response reports when that is more, and the session stops as
+        for an overrun. With no usage it is `uncertain` at its hold, as any call, unless the cost it reports is past the
+        hold: then that cost is settled (no counts; verify r2 R2), since `uncertain` charges only the hold. Such a
+        stop is reported whatever its overrun, 0 included (L3 r1 Q5): `SPEND-OVERRUN` with `reason: "model-mismatch"`,
+        so CONTROL records it for the card; an overrun stop of the checked model's own usage is reported as before."""
         usage = reader.result()
-        if usage is None:
-            hold.uncertain(reader.reason, self._row_meta(hold, "uncertain", reader, status))
+        md = reader.metadata()
+        other = checks_model and bool(model) and codec.answered_other(md, model)
+        current = self.by_session.get(reg.session) is reg
+        if usage is None and not (other and (md.cost_reported or 0) > hold.amount):
+            if other and current:
+                self.budget_stopped.add(reg.session)
+            try:
+                hold.uncertain(reader.reason, self._row_meta(hold, "uncertain", reader, status))
+            finally:
+                if other and current:
+                    self._report_stop(reg, hold, route, model, 0, unproven, other=True)
             return
-        cost = codec.price_usage(usage, price)
-        stopped = cost > hold.amount and self.by_session.get(reg.session) is reg
-        if stopped:
+        if other:
+            cost = max(hold.amount, md.cost_reported or 0)
+        else:
+            assert usage is not None
+            cost = codec.price_usage(usage, price)
+        if (other or cost > hold.amount) and current:
             self.budget_stopped.add(reg.session)
         try:
-            hold.settle(cost, dict(usage.meta(), **self._row_meta(hold, "yes", reader, status, usage, cost)))
+            hold.settle(cost, dict(usage.meta() if usage is not None else {},
+                                   **self._row_meta(hold, "yes", reader, status, usage, cost)))
         finally:
-            if stopped and self.attach:
-                ledger_id, epoch, seq = hold.ref
-                self._attach_send_task(self._spend_overrun({
-                    "session": reg.session, "route": route, "model": model, "ref": [ledger_id, epoch, seq],
-                    "overrun": cost - hold.amount, "unproven": unproven}))
+            if current and (other or cost > hold.amount):
+                self._report_stop(reg, hold, route, model, max(0, cost - hold.amount), unproven, other=other)
+
+    def _report_stop(self, reg: Registration, hold: ledger.Hold, route: str, model: str, overrun: int,
+                     unproven: bool, *, other: bool) -> None:
+        """`SPEND-OVERRUN` for a stop `_settle` made (R4 §1.4 step 2), on the attachment when there is one; an
+        other-model stop carries `reason: "model-mismatch"` (L3 r1 Q5)."""
+        if not self.attach:
+            return
+        ledger_id, epoch, seq = hold.ref
+        args = {"session": reg.session, "route": route, "model": model, "ref": [ledger_id, epoch, seq],
+                "overrun": overrun, "unproven": unproven}
+        if other:
+            args["reason"] = "model-mismatch"
+        self._attach_send_task(self._spend_overrun(args))
 
     @staticmethod
     def _row_meta(hold: ledger.Hold, settled: str, reader: Optional[codec.UsageReader], status: int,
@@ -3504,6 +3541,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 gid = g
             else:
                 admin_gid = g
+    # L3 r1 Q1: a routes-trust --replace that did not finish (its intent marker in L/routes) refuses the start before
+    # the ledger or a route map is read: keys' head may be half moved
+    problem = replace_intent_problem(os.path.join(a.lib_root, "routes"))
+    if problem is not None:
+        print(f"levain gw-keys: refused: routes-trust-replace-unfinished: {problem}", file=sys.stderr)
+        return 3
     raise_nofile()
     # the ONE credential writer (design 1.8): its executor made here at start, its thread at the first commit; it is
     # the credential layer shutdown's latch and step (3) call. Closed after the loop, whatever ended it.

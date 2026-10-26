@@ -60,7 +60,7 @@ from levain.broker.gwwire import FrameReader, FrontSide, HoldingReader, WireErro
 from levain.broker.norm import REASON, STATUS, Refused  # noqa: F401 - STATUS and Refused are re-exported
 from levain.broker import norm
 from levain.broker.policy import (CONNECT_TYPES, ROUTE_TYPES, PolicyError, RoutePolicy,  # noqa: F401 - re-exported
-                                  parse_route)
+                                  is_host_name, parse_route)
 from levain.broker.stub import GWPORT_BASE, SLOTS, clear_stale_socket, peer_uid
 
 POLICY_FORMAT = "levain-front-session/1"
@@ -341,6 +341,36 @@ def connect_target(policy: FrontPolicy, target: bytes) -> tuple[ConnectRoute, in
     if route is None:
         raise Refused("host-not-allowed", "off-list")
     return route, port
+
+
+#: the most of a refused CONNECT's host the log line carries: a DNS name's length.
+REFUSED_HOST_CAP = 253
+
+#: WF-1b (wf1a return ruling 3): an off-list refusal's line names how the operator adds a host. The agent's own error
+#: text names no host (measured by lane-wfetch on Claude Code 2.1.310: "Error: proxy refused the connection", wfetch
+#: DESIGN §1.4), so this line is where the remedy can be read.
+OFF_LIST_REMEDY = "sudo install-helper routes-egress"
+
+
+def refused_host_fields(target: object) -> dict:
+    """The requested host of a refused CONNECT, for its log line (wfetch DESIGN §2.3): ``{"host": h}`` only when the
+    target is an unbracketed ``host[:port]`` whose host part is at most :data:`REFUSED_HOST_CAP` bytes and, lowercased
+    as :func:`connect_target` matches it, passes the policy's host grammar (:func:`levain.broker.policy.is_host_name`);
+    else ``{"host_invalid": True, "host_len": n}`` (an address literal and a bracketed authority included, which the
+    CONNECT grammar refuses), and ``{"host_invalid": True}`` for a target that is not bytes. The host is slot-supplied,
+    so nothing else of it is logged."""
+    if type(target) is not bytes:
+        return {"host_invalid": True}
+    m = re.match(rb"\[([^\]]*)\](?::[0-9]*)?\Z", target)
+    raw = m.group(1) if m else (target.rpartition(b":")[0] if b":" in target else target)
+    if not m and len(raw) <= REFUSED_HOST_CAP:
+        try:
+            low = raw.decode("ascii").lower()
+        except UnicodeDecodeError:
+            low = None
+        if low is not None and is_host_name(low):
+            return {"host": low}
+    return {"host_invalid": True, "host_len": len(raw)}
 
 
 # --- the TLS ClientHello (domain fronting) ----------------------------------------------------------------------
@@ -1119,6 +1149,7 @@ class Front:
             return
         except (asyncio.IncompleteReadError, asyncio.TimeoutError):
             return
+        target: Optional[bytes] = None
         try:
             conn, req = parse_head_conn(head)
             if req.method != b"CONNECT":
@@ -1130,10 +1161,11 @@ class Front:
                     raise Refused("route-not-allowed")
                 await BrokeredExchange(self, pol, conn, req, path, query, reader, writer).run()
                 return
-            route, port = connect_target(self.policy, req.target)
+            target = req.target
+            route, port = connect_target(self.policy, target)
             ureader, uwriter, addr = await self._open_upstream(route, port)
         except Refused as r:
-            await self._refuse(reader, writer, r)
+            await self._refuse(reader, writer, r, target)
             return
         # The upstream is open before the 200 so an unreachable one is still answered 502 / 504. The ClientHello
         # comes after the 200, so a refused hello leaves that connection opened with no byte sent on it.
@@ -1254,8 +1286,13 @@ class Front:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _refuse(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, r: Refused) -> None:
-        self._log({"event": "refused", "refused": r.name, "detail": r.detail})
+    async def _refuse(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, r: Refused,
+                      target: Optional[bytes] = None) -> None:
+        """Answer ``r`` and log it; a refused CONNECT's line also names its host (:func:`refused_host_fields`), and an
+        off-list one the remedy (:data:`OFF_LIST_REMEDY`)."""
+        self._log({"event": "refused", "refused": r.name, "detail": r.detail,
+                   **(refused_host_fields(target) if target is not None else {}),
+                   **({"remedy": OFF_LIST_REMEDY} if (r.name, r.detail) == ("host-not-allowed", "off-list") else {})})
         body = r.name.encode() + b"\n"
         writer.write(b"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
                      b"X-Levain-Refused: %s\r\nConnection: close\r\n\r\n%s"

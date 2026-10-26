@@ -8,6 +8,7 @@ keys refuses uid 0, so the process tests skip as root."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import shutil
@@ -547,7 +548,8 @@ def test_spend_overrun_recorded_session_not_revoked(py):
             settled = [o for o in B2.ledger_lines(w.keys.ledger_path) if o["kind"] == "settled"]
             return {"q1": q1, "recs": w.control.spend_overruns(S1), "settled": settled, "state": s1.state(),
                     "handles": w.control.handles(S1) is not None, "no_k": await no_k(f1), "q2": await f1.q(),
-                    "drops_owed": w.control.drops_owed()}
+                    "drops_owed": w.control.drops_owed(),
+                    "status": w.control.handle(C.Conn(R3.OP_UID), {"v": 1, "op": "STATUS", "id": 3, "session": S1})}
 
     out = run(go())
     assert out["q1"].get("status") == 200, out
@@ -558,6 +560,10 @@ def test_spend_overrun_recorded_session_not_revoked(py):
     assert rec["ref"][2] == line["ref"], (rec, line)
     assert out["state"] == R.RENDERED and out["handles"] and out["no_k"], out
     assert out["q2"].get("refused") == "budget-overrun", out
+    # R4 §4, the card row's data: the operator's STATUS of the stopped session carries its overrun
+    (st,) = out["status"]["records"]
+    assert st["budget_overrun"] == {"microdollars": line["overrun"], "calls": 1, "unproven": False,
+                                    "model_mismatch": False}, st
 
 
 # ---- idempotency and the slow ack -----------------------------------------------------------------------------------
@@ -596,6 +602,7 @@ def test_admin_verbs_idempotent(py):
             over = dict(session=S2, route="r", model="m1", ref=["a" * 32, "b" * 32, 9], overrun=5, unproven=True)
             out["overrun"] = [ask("SPEND-OVERRUN", **over) for _ in range(2)]
             out["overrun_recs"] = w.control.spend_overruns(S2)
+            out["status"] = w.control.handle(C.Conn(R3.OP_UID), {"v": 1, "op": "STATUS", "id": 3})["records"]
             digest = C.digest_of(s2.token)
             out["sessions"] = [ask("SESSIONS", digests=[digest, "sha256:" + "0" * 64]) for _ in range(2)]
             out["lost"] = [ask("FRONT-LOST", session=S2) for _ in range(2)]
@@ -616,6 +623,9 @@ def test_admin_verbs_idempotent(py):
     assert out["no_k"] and out["q"].get("status") == 200, out
     assert out["drop"] == [{"dropped": True}, {"dropped": False}], out
     assert out["overrun"] == [{"id": 7, "ok": True}] * 2 and len(out["overrun_recs"]) == 1, out
+    # the card row's data counts the repeated SPEND-OVERRUN once, and marks it unproven; S1 has none
+    cards = {r["session"]: r.get("budget_overrun") for r in out["status"]}
+    assert cards == {S1: None, S2: {"microdollars": 5, "calls": 1, "unproven": True, "model_mismatch": False}}, cards
     zero = "sha256:" + "0" * 64
     assert out["sessions"] == [{"id": 7, "ok": True, "drop": [zero]}] * 2, out
     assert out["lost"] == [{"id": 7, "ok": True}] * 2 and out["lost_again"] == {"id": 7, "ok": True}, out
@@ -823,3 +833,81 @@ def test_serve_is_the_program_entry(tmp_path):
     assert seen == {"state": R.REVOKED, "mode": 0o660}, seen
     assert ans == {"id": 1, "ok": True, "attach": 1}, ans
     assert rc == [0] and not t.is_alive()
+
+
+# ---- L3 r1 Q5 / Q6: the card's aggregate -----------------------------------------------------------------------------
+
+def _bare_attached(tmp: Path, *sessions: str) -> tuple:
+    """A CONTROL over `tmp` with each of `sessions` ATTACHed (no keys behind it) and a stand-in attachment to report
+    on (SPEND-OVERRUN is answered only on the attachment CONTROL holds)."""
+    control = C.Control(C.StateStore(tmp), OP_UID, keys_uid=R3.KEYS_UID)
+    for s in sessions:
+        attach_only(control, s)
+    att = C.Conn(R3.KEYS_UID, attach_no=1)
+    control._attach = att
+    return control, att
+
+
+def _over(control, att, session: str, seq: int, overrun: int, **extra) -> dict:
+    return control.handle(att, {"v": 1, "op": "SPEND-OVERRUN", "id": 7, "session": session, "route": "r",
+                                "model": "m1", "ref": ["a" * 32, "b" * 32, seq], "overrun": overrun,
+                                "unproven": False, **extra})
+
+
+def _cards(control) -> dict:
+    return {r["session"]: r.get("budget_overrun")
+            for r in control.handle(C.Conn(OP_UID), {"v": 1, "op": "STATUS", "id": 3})["records"]}
+
+
+def test_a_model_mismatch_stop_is_recorded_at_zero_overrun(tmp_path):
+    control, att = _bare_attached(tmp_path, S1, S2)
+    assert _over(control, att, S1, 1, 0, reason="model-mismatch") == {"id": 7, "ok": True}
+    assert _over(control, att, S2, 2, 0) == {"id": 7, "ok": False, "refused": "bad-value"}   # no reason: 0 refused
+    assert _over(control, att, S2, 3, 5, reason="other")["refused"] == "bad-value"
+    assert _over(control, att, S2, 4, 5) == {"id": 7, "ok": True}
+    assert _cards(control) == {S1: {"microdollars": 0, "calls": 1, "unproven": False, "model_mismatch": True},
+                               S2: {"microdollars": 5, "calls": 1, "unproven": False, "model_mismatch": False}}
+
+
+def test_the_card_outlives_the_diagnostic_records_bound_and_counts_a_ref_once(tmp_path, monkeypatch):
+    # codex MED: the card's sums are the session's own, not read back from the bounded diagnostic records, so a
+    # session's card survives later sessions' overruns past the bound, and a ref sent again after its diagnostic
+    # record was forgotten is not counted twice.
+    monkeypatch.setattr(C, "SPEND_OVERRUNS_MAX", 2)
+    control, att = _bare_attached(tmp_path, S1, S2)
+    assert _over(control, att, S1, 1, 7)["ok"]
+    for seq in range(2, 6):
+        assert _over(control, att, S2, seq, 1)["ok"]
+    assert len(control.spend_overruns()) == 2 and control.spend_overruns(S1) == []       # the diagnostic bound held
+    seven = {"microdollars": 7, "calls": 1, "unproven": False, "model_mismatch": False}
+    assert _cards(control)[S1] == seven                                                 # the card did not
+    assert _over(control, att, S1, 1, 7)["ok"]                                          # the same ref, again
+    assert _cards(control) == {S1: {"microdollars": 7, "calls": 1, "unproven": False, "model_mismatch": False},
+                               S2: {"microdollars": 4, "calls": 4, "unproven": False, "model_mismatch": False}}
+
+
+def _purge(control, session: str) -> None:
+    with control.store.lock(session):
+        control._write(control.store.get(session), state=R.PURGED, event_kind="state")
+
+
+def test_a_purged_session_loses_its_card_at_once(tmp_path):
+    # verify r2 R3 (codex MED): the card and its ref set go when the record goes PURGED, not when an unrelated
+    # session's first report happens to prune; STATUS never shows a PURGED record's card.
+    control, att = _bare_attached(tmp_path, S1, S2)
+    assert _over(control, att, S1, 1, 7)["ok"] and _over(control, att, S2, 2, 3)["ok"]
+    _purge(control, S1)
+    assert S1 not in control._cards and S2 in control._cards
+    assert _cards(control).get(S1) is None
+    assert _over(control, att, S1, 3, 9)["ok"]                    # a late report: recorded, no card made again
+    assert S1 not in control._cards and len(control.spend_overruns(S1)) == 2
+
+
+def test_a_record_gone_on_a_reload_loses_its_card(tmp_path):
+    # verify r2 R3: the reload of an unsettled record (StateStore._settle -> on_settle) finding it gone or PURGED
+    control, att = _bare_attached(tmp_path, S1, S2)
+    assert _over(control, att, S1, 1, 7)["ok"] and _over(control, att, S2, 2, 3)["ok"]
+    old1, old2 = control.store.get(S1), control.store.get(S2)
+    control._on_settle(old1, None)
+    control._on_settle(old2, dataclasses.replace(old2, state=R.PURGED))
+    assert control._cards == {}

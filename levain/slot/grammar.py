@@ -19,7 +19,7 @@ from levain.slot import Refused
 
 VERBS = ("setup", "repair", "undo", "replenish", "set-retention", "set-dispatch-retain",
          "set-ceiling", "set-signers", "purge", "force-retire", "set-credential", "remove-credential", "set-limits",
-         "routes-base", "routes-trust", "enrol-authority-signer", "remove-authority-signer")
+         "routes-base", "routes-trust", "routes-egress", "enrol-authority-signer", "remove-authority-signer")
 
 #: Verbs that run with a live lease (CONTRACT §5.2); every other verb refuses ``live-lease``. The credential verbs
 #: too: keys reads a credential on demand, so a rotation takes effect on the next exchange (design 1.8 Bootstrap).
@@ -27,9 +27,30 @@ VERBS = ("setup", "repair", "undo", "replenish", "set-retention", "set-dispatch-
 #: while its lease is live (slot limits DESIGN §3).
 #: ``routes-base`` / ``routes-trust`` too (3c-9): keys re-reads ``base.json`` at every ``Q`` and CONTROL reads the trust
 #: pair at each route submission, so neither write waits for the operator's sessions to end.
+#: ``routes-egress`` too (WF-1b): one root file, as ``routes-base``.
 #: The authority signer verbs too (14b S5): one root file the coverage source re-reads at every refresh.
 LEASE_EXEMPT = frozenset({"purge", "force-retire", "set-credential", "remove-credential", "set-limits", "routes-base",
-                          "routes-trust", "enrol-authority-signer", "remove-authority-signer"})
+                          "routes-trust", "routes-egress", "enrol-authority-signer", "remove-authority-signer"})
+
+#: Q16, L3 r1 Q1: the intent marker ``routes-trust --replace`` writes in ``L/routes`` before its first move and removes
+#: after the new pair is read back. While it is there a replace is half done: CONTROL's start and keys' start refuse
+#: ``routes-trust-replace-unfinished`` (:func:`replace_intent_problem`), and the next ``--replace`` finishes or undoes it
+#: before anything else. Here because CONTROL, keys and the install helper all import this module.
+ROUTES_REPLACE_INTENT = ".replace-intent"
+
+
+def replace_intent_problem(routes_dir: "os.PathLike[str] | str") -> str | None:
+    """None when no half-done ``routes-trust --replace`` is marked in ``routes_dir``; else why a service must not
+    start. A marker that cannot be checked (any error but its absence) is a problem too: a start never assumes it away."""
+    path = os.path.join(routes_dir, ROUTES_REPLACE_INTENT)
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"{path} cannot be checked ({e.strerror or e})"
+    return f"{path} marks a routes-trust --replace that did not finish: run levain dispatch config trust --replace"
+
 
 #: A credential's name: the pattern of :data:`levain.broker.creds.NAME_RE`, written here because the broker module
 #: needs the optional h11 and this module is imported where it may be absent; a test pins the two equal.
@@ -93,6 +114,7 @@ class InstallCommand:
     passkeys: tuple[str, ...] = ()
     confirm: bool = False                 # the laptop key's line names levain-confirm too
     key_fingerprint: str | None = None    # remove-authority-signer --key
+    replace: bool = False                 # routes-trust --replace (3c design r3 Q16; R4 §5 3c-9)
 
 
 def _uint(token: str, field: str, lo: int, hi: int) -> int:
@@ -284,6 +306,12 @@ def parse_install_argv(argv: Sequence[str]) -> InstallCommand:
         if not FINGERPRINT_RE.fullmatch(rest[1]):
             raise Refused("bad-token", f"--key: {rest[1][:60]!r} is not SHA256:<43 base64>")
         return InstallCommand(verb, key_fingerprint=rest[1])
+    if verb == "routes-trust" and rest:
+        # Q16: the one flag, rotating the pin to another store or key; the request still comes on stdin.
+        if rest[0] != "--replace":
+            raise Refused("extra-argv", repr(rest[0]))
+        _exact(verb, rest, 1)
+        return InstallCommand(verb, replace=True)
     if verb == "repair" and rest:
         # Row 33 (head ruling Q1, a §5.2 amendment): ``repair --source PATH``, the operator's installed levain
         # package dir, checked as ``--root`` is. The helper checks ownership, the final component and links.
@@ -291,7 +319,8 @@ def parse_install_argv(argv: Sequence[str]) -> InstallCommand:
             raise Refused("extra-argv", repr(rest[0]))
         _exact(verb, rest, 2)
         return InstallCommand(verb, source=_root_syntax(rest[1]))
-    _exact(verb, rest, 0)   # repair, undo, replenish, routes-base; set-ceiling, set-signers, set-limits, routes-trust: stdin only
+    _exact(verb, rest, 0)   # repair, undo, replenish, routes-base; set-ceiling, set-signers, set-limits, routes-trust,
+    #                         routes-egress: stdin only
     return InstallCommand(verb)
 
 

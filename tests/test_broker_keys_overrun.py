@@ -79,12 +79,12 @@ class PerConnUpstream(FakeUpstream):
 
 
 class World:
-    def __init__(self, py: str, responses: List[bytes]) -> None:
-        self.py, self.responses = py, responses
+    def __init__(self, py: str, responses: List[bytes], codec: str = "anthropic-messages") -> None:
+        self.py, self.responses, self.codec = py, responses, codec
 
     async def __aenter__(self) -> "World":
         self.d = R.short_dir()
-        R.lib(self.d, CAP)
+        R.lib(self.d, CAP, codec=self.codec)
         self.control = FakeControl(os.path.join(self.d, "control.sock"))
         await self.control.start()
         self.up = PerConnUpstream(self.responses)
@@ -348,6 +348,10 @@ class _Reader:
         from levain.broker import codec
         return codec.Usage(in_=OVER["input_tokens"], out=OVER["output_tokens"], cache_write=0, cache_read=0)
 
+    def metadata(self):
+        from levain.broker import codec
+        return codec.Metadata()       # the real reader's: the response named no model (3c-9's settle reads it)
+
 
 def test_an_in_flight_settle_stops_only_the_registration_it_started_on(monkeypatch):
     # L3 r2 complement LOW 2: an exchange admitted under a registration that has since left (DROP-SESSION, or a
@@ -397,3 +401,218 @@ def test_a_settle_that_raises_still_stops_the_session(monkeypatch):
             return {"stopped": set(s.k.budget_stopped)}
 
     assert _run(go)["stopped"] == {"s0"}
+
+
+# --- 3c-9, the 1-GLM-route bound's settle half (R4 §5 CARRIED) ----------------------------------------------------------
+
+def _answered(model, usage: dict) -> bytes:
+    """An openai-chat (OpenRouter) JSON 200 naming the model that answered (OpenRouter prices at the model that ran);
+    `usage` in the rig's anthropic names, turned into openai-chat's."""
+    u = {"prompt_tokens": usage["input_tokens"], "completion_tokens": usage["output_tokens"],
+         **({"cost": usage["cost"]} if "cost" in usage else {})}
+    body = json.dumps({"object": "chat.completion", "model": model, "usage": u}).encode()
+    return (b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\nconnection: close\r\n\r\n"
+            % len(body) + body)
+
+
+def _anthropic_answered(model, usage: dict) -> bytes:
+    body = json.dumps({"type": "message", "model": model, "usage": usage}).encode()
+    return (b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\nconnection: close\r\n\r\n"
+            % len(body) + body)
+
+
+#: the rig body's hold on the openai-chat route (its own estimate of the same body at `m1`'s entry)
+def _chat_hold() -> int:
+    from levain.broker import codec
+    from levain.broker.policy import parse_price
+    from tests.test_broker_keys_upstream import PRICE
+    return codec.CODECS["openai-chat"].estimate(json.loads(BODY), parse_price("m1", PRICE))
+
+
+@pytest.mark.parametrize("answered,stops", [("m2", True), ("m1-20251001", False), ("m1-2025-10-01", False),
+                                             ("m1", False), ("m1x", True), ("m1-2025", True), (123, True),
+                                             (None, True)])
+def test_a_response_from_another_model_charges_the_hold_and_stops_the_session(py, answered, stops):
+    # The checked model is `m1`, on the openai-chat route (the codec whose route can fall back, head ruling 1026+1). A
+    # response whose top-level `model` is neither it nor a dated variant of it is never priced at `m1`'s row: its hold
+    # is charged whole and the session stops. False if the settle is `m1`'s price of the usage (UNDER_COST, below the
+    # hold), or the next `Q` is served.
+    hold = _chat_hold()
+
+    async def go() -> dict:
+        async with World(py, [_answered(answered, UNDER), _answered("m1", UNDER)], codec="openai-chat") as w:
+            for g in w.up.gates:
+                g.set()
+            first = await w.front.q(attempts=5)
+            await until(lambda: len(_resolutions(w.keys.ledger_path)) == 1)
+            second = await w.front.q(attempts=5)
+            return {"first": first, "second": second, "res": _resolutions(w.keys.ledger_path)[0], "rc": w.keys.stop()}
+
+    out = asyncio.run(asyncio.wait_for(go(), 120))
+    assert out["first"].get("status") == 200, out["first"]
+    res = out["res"]
+    if stops:
+        assert (res["kind"], res["settled"], res["overrun"]) == ("settled", hold, 0), res
+        assert out["second"].get("refused") == "budget-overrun", out["second"]
+    else:
+        assert (res["kind"], res["settled"], res["overrun"]) == ("settled", UNDER_COST, 0), res
+        assert out["second"].get("status") == 200, out["second"]
+    assert out["rc"] == 0
+
+
+def test_another_model_reporting_more_than_the_hold_is_charged_what_it_reports(py):
+    # OpenRouter's usage accounting (`usage.cost`, USD) is what the provider charged for the model that ran: when it
+    # is past the hold, the charge is it (the overrun booked and sent), never the checked model's price.
+    hold = _chat_hold()
+
+    async def go() -> dict:
+        async with World(py, [_answered("m2", dict(UNDER, cost=0.01))], codec="openai-chat") as w:
+            w.up.gates[0].set()
+            first = await w.front.q(attempts=5)
+            await until(lambda: len(_resolutions(w.keys.ledger_path)) == 1)
+            return {"first": first, "res": _resolutions(w.keys.ledger_path)[0], "second": await w.front.q(attempts=5),
+                    "rc": w.keys.stop()}
+
+    out = asyncio.run(asyncio.wait_for(go(), 120))
+    res = out["res"]
+    assert (res["kind"], res["settled"], res["overrun"]) == ("settled", hold, 10_000 - hold), res
+    assert out["second"].get("refused") == "budget-overrun" and out["rc"] == 0, out
+
+
+@pytest.mark.parametrize("answered", ["m2", None, 123])
+def test_the_anthropic_route_settles_at_the_usage_whatever_model_it_names(py, answered):
+    # Head ruling (settle-check SCOPE, 1026+1): an Anthropic undated alias would otherwise stop every interactive
+    # session after its first call; until 3c-10 measures real responses, only the fallback-capable codec is checked.
+    async def go() -> dict:
+        async with World(py, [_anthropic_answered(answered, UNDER), R.usage_response(UNDER)]) as w:
+            for g in w.up.gates:
+                g.set()
+            first = await w.front.q(attempts=5)
+            await until(lambda: len(_resolutions(w.keys.ledger_path)) == 1)
+            return {"first": first, "second": await w.front.q(attempts=5),
+                    "res": _resolutions(w.keys.ledger_path)[0], "rc": w.keys.stop()}
+
+    out = asyncio.run(asyncio.wait_for(go(), 120))
+    res = out["res"]
+    assert (res["kind"], res["settled"], res["overrun"]) == ("settled", UNDER_COST, 0), res
+    assert out["second"].get("status") == 200 and out["rc"] == 0, out
+
+
+class _OtherReader(_Reader):
+    """A reader whose response named `m2` (the checked model is `m1`); `usage` None = it reported none."""
+
+    def __init__(self, usage=True) -> None:
+        self.usage = usage
+
+    def result(self):
+        return super().result() if self.usage else None
+
+    def metadata(self):
+        from levain.broker import codec
+        return codec.Metadata("m2", models=("m2",))
+
+
+class _UncertainHold(_Hold):
+    def __init__(self, amount: int) -> None:
+        super().__init__(amount)
+        self.ref, self.uncertain_reason = ("a" * 32, "b" * 32, 4), None
+
+    def uncertain(self, reason: str, meta: "dict | None" = None) -> None:
+        self.uncertain_reason = reason
+
+
+@pytest.mark.parametrize("usage", [True, False])
+def test_an_other_model_stop_is_reported_to_control_at_zero_overrun(monkeypatch, usage):
+    # L3 r1 Q5 (complement MED 2, deepseek LOW 8): an other-model stop charged no more than its hold still reaches
+    # CONTROL, as SPEND-OVERRUN with `reason: "model-mismatch"` and its overrun (0 here), so the card shows it and it
+    # outlives a keys restart; with no usage it is `uncertain` at its hold and reported the same way.
+    from levain.broker.policy import parse_price
+    from tests.test_broker_keys_upstream import PRICE
+    price = parse_price("m1", PRICE)
+    sent = []
+
+    async def go(d: str) -> dict:
+        async with _Sessions(d, 1) as s:
+            async def capture(args):
+                sent.append(args)
+            monkeypatch.setattr(s.k, "_spend_overrun", capture)
+            monkeypatch.setattr(s.k, "attach", True)
+            h = _UncertainHold(10 * OVER_COST)          # far above the usage's price: no overrun
+            s.k._settle(s.k.by_session["s0"], price, h, _OtherReader(usage), route="r", model="m1",
+                        checks_model=True)
+            await asyncio.sleep(0)
+            return {"stopped": set(s.k.budget_stopped), "settled": h.settled, "uncertain": h.uncertain_reason}
+
+    out = _run(go)
+    assert out["stopped"] == {"s0"}
+    assert (out["settled"], out["uncertain"]) == ((10 * OVER_COST, None) if usage else (None, "no-usage"))
+    assert sent == [{"session": "s0", "route": "r", "model": "m1", "ref": ["a" * 32, "b" * 32, 4], "overrun": 0,
+                     "unproven": False, "reason": "model-mismatch"}], sent
+
+
+def _cost_only(model, cost: float) -> bytes:
+    """An openai-chat JSON 200 naming `model` whose usage holds a cost and no token counts (so the codec reads no
+    usage, and the metadata reader still reads the cost)."""
+    body = json.dumps({"object": "chat.completion", "model": model, "usage": {"cost": cost}}).encode()
+    return (b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\nconnection: close\r\n\r\n"
+            % len(body) + body)
+
+
+def test_another_model_with_no_counts_reporting_more_than_the_hold_is_charged_what_it_reports(py):
+    # verify r2 R2 (codex HIGH): with no usable counts the reader's usage is None; the cost the response reports is
+    # still what the provider charged, so past the hold it is booked (settled at the hold, the rest overrun), never
+    # an `uncertain` at the hold alone.
+    hold = _chat_hold()
+
+    async def go() -> dict:
+        async with World(py, [_cost_only("m2", 0.01)], codec="openai-chat") as w:
+            w.up.gates[0].set()
+            first = await w.front.q(attempts=5)
+            await until(lambda: len(_resolutions(w.keys.ledger_path)) == 1)
+            return {"first": first, "res": _resolutions(w.keys.ledger_path)[0], "second": await w.front.q(attempts=5),
+                    "rc": w.keys.stop()}
+
+    out = asyncio.run(asyncio.wait_for(go(), 120))
+    res = out["res"]
+    assert 10_000 > hold
+    assert (res["kind"], res.get("settled"), res.get("overrun")) == ("settled", hold, 10_000 - hold), res
+    assert out["second"].get("refused") == "budget-overrun" and out["rc"] == 0, out
+
+
+class _CostOnlyReader(_OtherReader):
+    def __init__(self, cost: "int | None") -> None:
+        super().__init__(usage=False)
+        self.cost = cost
+
+    def metadata(self):
+        from levain.broker import codec
+        return codec.Metadata("m2", cost_reported=self.cost, models=("m2",))
+
+
+@pytest.mark.parametrize("cost", [None, 5, 10 * OVER_COST, 10 * OVER_COST + 7])
+def test_an_other_model_with_no_usage_books_the_more_of_its_hold_and_its_reported_cost(monkeypatch, cost):
+    # verify r2 R2: max(hold, cost reported) on the no-usage path too; the overrun sent is the part past the hold.
+    from levain.broker.policy import parse_price
+    from tests.test_broker_keys_upstream import PRICE
+    price = parse_price("m1", PRICE)
+    sent = []
+    amount = 10 * OVER_COST
+
+    async def go(d: str) -> dict:
+        async with _Sessions(d, 1) as s:
+            async def capture(args):
+                sent.append(args)
+            monkeypatch.setattr(s.k, "_spend_overrun", capture)
+            monkeypatch.setattr(s.k, "attach", True)
+            h = _UncertainHold(amount)
+            s.k._settle(s.k.by_session["s0"], price, h, _CostOnlyReader(cost), route="r", model="m1",
+                        checks_model=True)
+            await asyncio.sleep(0)
+            return {"stopped": set(s.k.budget_stopped), "settled": h.settled, "uncertain": h.uncertain_reason}
+
+    out = _run(go)
+    assert out["stopped"] == {"s0"}
+    over = cost is not None and cost > amount
+    assert (out["settled"], out["uncertain"]) == ((cost, None) if over else (None, "no-usage"))
+    assert [a["overrun"] for a in sent] == [cost - amount if over else 0], sent
+    assert sent[0]["reason"] == "model-mismatch"

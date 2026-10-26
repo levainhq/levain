@@ -148,6 +148,11 @@ class Codec:
     ceiling_fields: Tuple[str, ...] = ()
     #: whether a request may lack a ceiling (written in at `default_output`); Anthropic requires `max_tokens`.
     writes_ceiling = False
+    #: head ruling (1026+1, settle-check SCOPE): whether keys' settle checks the model a response says ran
+    #: (:func:`answered_other`). Only a codec whose route can fall back to another model (OpenRouter's openai-chat),
+    #: until 3c-10 measures what real providers put in `model`: an undated alias answered on the primary path would
+    #: otherwise stop every session after its first call.
+    checks_answered_model = False
 
     # -- parse ---------------------------------------------------------------------------------------------------
 
@@ -169,13 +174,18 @@ class Codec:
     def check(self, obj: Mapping[str, Any], prices: Optional[Mapping[str, Price]], *, dispatch: bool,
               model_requested: Optional[str] = None) -> Checked:
         """The model has a price entry (else `model-not-allowed`); a ticketed run's `model` is its ticket's
-        `model_requested` (else `model-not-allowed`); then the unboundable shapes: a dispatch route refuses them
+        `model_requested` (else `model-not-allowed`); no `route`, and no `models` but exactly `[model]` (else
+        `model-not-allowed`); then the unboundable shapes: a dispatch route refuses them
         `body-unbounded:<what>` (403), an interactive one returns them as `unproven`."""
         model = obj.get("model")
         if not isinstance(model, str) or not prices or model not in prices:
             raise norm.Refused("model-not-allowed", "no price entry for the model")
         if model_requested is not None and model != model_requested:
             raise norm.Refused("model-not-allowed", "not the ticket's model")
+        # 3c-9 (R4 §5 CARRIED): a provider's fallback list or router choice may run another model than `model`, and
+        # OpenRouter prices the request at the model that ran; the hold and the settle price `model` only
+        if "route" in obj or ("models" in obj and obj["models"] != [model]):
+            raise norm.Refused("model-not-allowed", "a fallback list or route may run another model")
         price = prices[model]
         found = self._unbounded(obj, price)
         if found and dispatch:
@@ -432,10 +442,37 @@ class Metadata:
     """What a response says about itself (S1 3c-6c, head ruling H6-6: ONE reader, here; 3c-9's settle check reuses it):
     its top-level `model`, the provider that served it (`provider`, OpenRouter's), and the cost it reports
     (`usage.cost`, OpenRouter's usage accounting, in USD credits) as integer microdollars. None = the response did
-    not say (the lineage row records `"unknown"` for the two strings and `null` for the cost, H6-21)."""
+    not say (the lineage row records `"unknown"` for the two strings and `null` for the cost, H6-21).
+    `model_unreadable`: the response did state a top-level `model` key whose value is outside the recorded grammar
+    (null and every non-string included, L3 r1 Q3), or stated more distinct models than :data:`MODELS_KEPT` (3c-9:
+    the settle cannot rule such a response the checked model, so it fails closed on it; the lineage row still records
+    `"unknown"`). `models`: every distinct readable model the response stated, in the order first stated (L3 r1 Q4:
+    a stream may name one model in one chunk and another in a later one; `model` is the last, the lineage row's)."""
     model: Optional[str] = None
     provider: Optional[str] = None
     cost_reported: Optional[int] = None
+    model_unreadable: bool = False
+    models: Tuple[str, ...] = ()
+
+
+#: L3 r1 Q4, DECISION: the most distinct models one response's metadata keeps; one more is `model_unreadable`
+MODELS_KEPT = 8
+
+
+#: 3c-9: a dated variant of a checked model, as a provider names the snapshot that ran (`<model>-20251001` or
+#: `<model>-2025-10-01`); the settle prices such an answer at the checked model's row
+_DATED = re.compile(r"-(?:[0-9]{8}|[0-9]{4}-[0-9]{2}-[0-9]{2})\Z")
+
+
+def answered_other(md: Metadata, model: str) -> bool:
+    """3c-9 (R4 §5 CARRIED): the response says another model ran than `model`, the checked one: ANY model it stated
+    (L3 r1 Q4: every one is kept, `md.models`) is neither `model` nor a dated variant of it, or it stated one outside
+    the recorded grammar. A response that names no model is not another model (the codec's own usage is then the only
+    evidence, as for every call). Only a codec with :attr:`Codec.checks_answered_model` asks (head ruling 1026+1)."""
+    if md.model_unreadable:
+        return True
+    return any(m != model and not (m.startswith(model) and _DATED.fullmatch(m[len(model):]) is not None)
+               for m in (md.models or ((md.model,) if md.model is not None else ())))
 
 
 def _answered(v: Any) -> Optional[str]:
@@ -464,6 +501,16 @@ def _note_metadata(md: Dict[str, Any], obj: Any) -> None:
     m, p = _answered(obj.get("model")), _answered(obj.get("provider"))
     if m is not None:
         md["model"] = m
+        seen = md.setdefault("models", [])
+        if m not in seen:
+            if len(seen) < MODELS_KEPT:
+                seen.append(m)
+            else:
+                md["model_unreadable"] = True
+    elif "model" in obj:
+        # stated, but not readably (null and every non-string included, L3 r1 Q3); sticky: a later readable chunk
+        # does not clear it
+        md["model_unreadable"] = True
     if p is not None:
         md["provider"] = p
     u = obj.get("usage")
@@ -608,7 +655,8 @@ class UsageReader:
             except (ValueError, RecursionError):
                 self._body_read = True
         md = self._md
-        return Metadata(md.get("model"), md.get("provider"), md.get("cost"))
+        return Metadata(md.get("model"), md.get("provider"), md.get("cost"), bool(md.get("model_unreadable")),
+                        tuple(md.get("models", ())))
 
     def result(self) -> Optional[Usage]:
         """The reported usage once the relay has ended, or None (no usage: cut, past a cap, none reported). An event
@@ -705,6 +753,7 @@ class _OpenAI(Codec):
 
 class OpenAIChat(_OpenAI):
     name = "openai-chat"
+    checks_answered_model = True
     # `messages[].content[]`. A `tool` message's content is text parts only (openai-python
     # `ChatCompletionToolMessageParam`), so a tool output holds no image position.
     image_paths = ((("messages", EACH, "content", EACH), ("image_url",)),)

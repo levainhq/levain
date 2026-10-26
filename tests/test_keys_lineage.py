@@ -195,6 +195,17 @@ def test_every_row_shape_carries_every_field_and_the_bounds_are_the_sinks():
     assert LN.check_record(rec) is None
 
 
+def test_a_settle_with_a_reported_cost_and_no_counts_carries_the_cost():
+    # verify r2 R2: another model's reported cost past the hold is settled with no usage; its row says the cost and the
+    # overrun, the token counts null, and CONTROL's record check takes it
+    base = K.lineage_base(RUN, "2026-10-24T12:00:00Z", 100, False)
+    row = K.lineage_row(base, settled="yes", ended_at="2026-10-24T12:00:01Z",
+                        md=codec.Metadata("m2", None, 10_000, models=("m2",)), usage=None, cost=10_000, overrun=9_900,
+                        status=200)
+    assert (row["cost_microdollars"], row["overrun"], row["tokens_in"], row["tokens_out"]) == (10_000, 9_900, None, None)
+    assert _wire_ok(row) is None
+
+
 def test_settled_row_is_whole_from_lineage_base_and_the_response(monkeypatch):
     # R4 §3 "the record is on disk before it is sent": the `reserved` line carries `lineage_base`, and the settle
     # carries keys' whole row (H6-28): the run's facts renamed per H6-3, the response's own metadata (H6-6), the
@@ -203,7 +214,8 @@ def test_settled_row_is_whole_from_lineage_base_and_the_response(monkeypatch):
 
     async def go(d):
         async with KeysWorld(d, monkeypatch) as w:
-            frames = await w.q(TICKETED, response=(http_json({"type": "message", "model": "glm-5.2-0901",
+            # a dated variant of the checked model (3c-9: any other model would be charged its hold, not priced)
+            frames = await w.q(TICKETED, response=(http_json({"type": "message", "model": MODEL + "-20260901",
                                                               "usage": usage}), b""))
             return frames, w.lines()
 
@@ -214,7 +226,7 @@ def test_settled_row_is_whole_from_lineage_base_and_the_response(monkeypatch):
     assert set(base) == set(LN.RECORD_CHECKS)
     row = st["meta"]["lineage"]
     cost = codec.price_usage(codec.Usage(3, 4, 0, 2), codec_price())
-    want = dict(base, settled="yes", ended_at=row["ended_at"], model_answered="glm-5.2-0901",
+    want = dict(base, settled="yes", ended_at=row["ended_at"], model_answered=MODEL + "-20260901",
                 provider_answered="unknown", cost_reported=None, tokens_in=5, tokens_out=4, cost_microdollars=cost,
                 overrun=None, status=200)
     assert row == want
@@ -233,7 +245,7 @@ def test_overrun_row_is_settled_yes_with_its_overrun(monkeypatch):
     # H6-7: an overrun row is `settled: "yes"` plus `overrun` (the settled amount is known; the overrun its own fact)
     async def go(d):
         async with KeysWorld(d, monkeypatch) as w:
-            frames = await w.q(TICKETED, response=(http_json({"model": "glm-5.2", "usage": {
+            frames = await w.q(TICKETED, response=(http_json({"model": MODEL, "usage": {
                 "input_tokens": 0, "output_tokens": 100000}}), b""))
             return frames, w.lines()
 
@@ -373,15 +385,16 @@ def test_the_one_metadata_reader():
     # OpenRouter's chat completion: its model, the provider that served it, and its reported cost (credits, USD)
     r = body("openai-chat", {"model": "z-ai/glm-5.2", "provider": "Z.AI",
                              "usage": {"prompt_tokens": 3, "completion_tokens": 4, "cost": 0.000123}})
-    assert r.metadata() == codec.Metadata("z-ai/glm-5.2", "Z.AI", 123)
-    assert r.result() is not None and r.metadata() == codec.Metadata("z-ai/glm-5.2", "Z.AI", 123)
+    glm = codec.Metadata("z-ai/glm-5.2", "Z.AI", 123, models=("z-ai/glm-5.2",))
+    assert r.metadata() == glm
+    assert r.result() is not None and r.metadata() == glm
     # a stream: every chunk names the model, the final one carries the cost (rounded up to a microdollar)
     r = sse("openai-chat", {"model": "m-1", "provider": "P"}, {"model": "m-1", "usage": {
         "prompt_tokens": 1, "completion_tokens": 1, "cost": 1.0000001}})
-    assert r.metadata() == codec.Metadata("m-1", "P", 1000001)
+    assert r.metadata() == codec.Metadata("m-1", "P", 1000001, models=("m-1",))
     # Anthropic names its model in `message_start.message` (a body at its top level), no provider, no cost
     r = sse("anthropic-messages", {"type": "message_start", "message": {"model": "claude-x", "usage": {}}})
-    assert r.metadata() == codec.Metadata("claude-x", None, None)
+    assert r.metadata() == codec.Metadata("claude-x", None, None, models=("claude-x",))
     assert body("anthropic-messages", {"model": "claude-y", "usage": {}}).metadata().model == "claude-y"
     # Responses: the Response object, in the events as `response`
     r = sse("openai-responses", {"type": "response.created", "response": {"model": "gpt-x"}})
@@ -389,7 +402,9 @@ def test_the_one_metadata_reader():
     # what is not printable ASCII 1..128, or not a finite non-negative number, was not said
     for bad in ({"model": "é"}, {"model": "x" * 129}, {"model": 5}, {"model": ""},
                 {"usage": {"cost": True}}, {"usage": {"cost": -1}}, {"usage": {"cost": "0.1"}}):
-        assert body("openai-chat", bad).metadata() == codec.Metadata(), bad
+        # 3c-9: a model stated outside the grammar is recorded as not said, and marked, so the settle fails closed
+        want = codec.Metadata(model_unreadable="model" in bad)
+        assert body("openai-chat", bad).metadata() == want, bad
     # a body past the copy cap, or cut short, said nothing readable; a stopped stream keeps what it read before
     cut = codec.CODECS["openai-chat"].usage(b"application/json")
     cut.feed(b'{"model": "m-1", "usag')

@@ -41,16 +41,17 @@ class _Lock:
 @pytest.fixture
 def helper(L, monkeypatch):
     """Root's side: the install helper's own ``main`` with ``routes-trust`` over ``L``; records each request."""
-    sent = []
+    sent, argvs = [], []
 
-    def call(data: bytes):
+    def call(data: bytes, *, replace: bool = False):
         sent.append(data)
+        argvs.append(["routes-trust", *(["--replace"] if replace else [])])
         out, err = io.StringIO(), io.StringIO()
         run_trust = functools.partial(IH.run_routes_trust, store_seams=RH.Seams(host="darwin", store=L,
                                                                                 trusted=lambda st: True))
         seams = IH.Seams(euid=lambda: 0, host=lambda: "darwin", lock=_Lock(), stdin=io.BytesIO(data).read,
                          routes_trust=run_trust)
-        rc = IH.main(["routes-trust"], env={"SUDO_UID": str(ME)}, seams=seams, out=out, err=err)
+        rc = IH.main(argvs[-1], env={"SUDO_UID": str(ME)}, seams=seams, out=out, err=err)
         return rc, out.getvalue(), err.getvalue()
     monkeypatch.setattr(dcli, "ROUTES_TRUST_HELPER", call)
     return sent
@@ -94,6 +95,23 @@ def test_root_refusing_is_exit_2_naming_the_remedy(capsys, ddir, root, keys, L, 
     assert "NOT pinned (routes-trust-exists" in out and "levain dispatch config trust" in out
 
 
+def test_config_trust_replace_rotates_a_pin_naming_another_store(capsys, ddir, root, keys, L, helper):
+    """Q16 through the CLI: the plain verb names `--replace` as the remedy, and `config trust --replace` sends root's
+    `routes-trust --replace`, which sets the old pin aside and pins this store."""
+    old = '{"fingerprint":"SHA256:' + "A" * 43 + '","format":"levain-routes-trust/1","store_id":"' + "f" * 32 + '"}'
+    (L / "routes" / "trust.json").write_text(old)
+    (L / "sessions").mkdir(mode=0o700)
+    code, out, _ = _init(capsys, ddir, root, keys)
+    assert code == 2 and "levain dispatch config trust --replace" in out
+    code, out, _ = run(capsys, "config", "trust", "--replace", "--dispatch-dir", str(ddir), "--data-root", root)
+    assert code == 0, out
+    assert "replacing the pin to store " + "f" * 32 in out
+    t = routemaps.read_trust(L / "routes")
+    assert t.fingerprint == keys["laptop"].fp and t.store_id != "f" * 32
+    aside = [p for p in (L / "routes").iterdir() if p.name.startswith(".replaced-")]
+    assert len(aside) == 1 and (aside[0] / "trust.json").read_text() == old
+
+
 def test_no_install_helper_leaves_init_ok_and_says_so(capsys, ddir, root, keys, monkeypatch):
     monkeypatch.setattr(dcli, "ROUTES_TRUST_HELPER", lambda data: (127, "", "the install helper x is not installed"))
     code, out, _ = _init(capsys, ddir, root, keys)
@@ -111,7 +129,7 @@ def test_config_trust_with_no_store_points_at_init(capsys, ddir, root, helper):
 def test_the_default_helper_is_sudo_routes_trust():
     # the conftest stub stands in for it in every test, so the default is read from the source
     import inspect
-    assert "\nROUTES_TRUST_HELPER: Callable[[bytes], tuple[int, str, str]] = _sudo_routes_trust\n" in inspect.getsource(
+    assert "\nROUTES_TRUST_HELPER: Callable[..., tuple[int, str, str]] = _sudo_routes_trust\n" in inspect.getsource(
         dcli)
     assert dcli.ROUTES_TRUST_HELPER is not dcli._sudo_routes_trust and dcli.ROUTES_TRUST_HELPER(b"{}")[0] == 127
     assert dcli.ROUTES_TRUST_REQUEST == IH.ROUTES_TRUST_REQUEST
@@ -147,3 +165,31 @@ def test_sudo_that_cannot_run_is_a_named_refusal_not_a_traceback(capsys, ddir, r
     code, out, _ = _init(capsys, ddir, root, keys)
     assert code == 2
     assert "NOT pinned (sudo-failed" in out and "slots are not set up" not in out
+
+
+def test_the_trust_line_names_a_replace_that_did_not_finish_and_its_recovery():
+    """L3 r1 Q1/Q2: a plain `config trust` over a half-done replace says to stop both services and replace; a replace
+    that first finished or undid one says which; a rotation says to start both services again."""
+    line = dcli._trust_line({"pinned": False, "refused": "routes-trust-replace-unfinished", "why": "marker"})
+    assert "Stop both and run `levain dispatch config trust --replace`" in line
+    pin = {"pinned": True, "refused": None, "why": "", "replaced": {"store_id": "f" * 32}, "aside": "/L/a",
+           "recovered": "rolled-back"}
+    line = dcli._trust_line(pin)
+    assert line.startswith("A replace that did not finish was undone first.")
+    assert "Start the control and keys services again" in line
+    assert dcli._trust_line(dict(pin, replaced=None, recovered="completed")).startswith(
+        "A replace that did not finish was finished first. The route trust is pinned")
+
+
+def test_the_trust_line_names_the_aside_a_recovery_left_and_both_services_to_stop():
+    """verify r2 R4 / R5: a recovered replace's aside is named; `routes-trust-exists` says to stop control AND keys
+    (the replace refuses `keys-running` otherwise)."""
+    pin = {"pinned": True, "refused": None, "why": "", "replaced": None, "aside": None, "recovered": "completed",
+           "recovered_aside": "/L/routes/.replaced-1"}
+    assert dcli._trust_line(pin).startswith("A replace that did not finish was finished first; the store it set aside "
+                                            "is in /L/routes/.replaced-1. The route trust is pinned")
+    line = dcli._trust_line(dict(pin, recovered="rolled-back"))
+    assert line.startswith("A replace that did not finish was undone first; /L/routes/.replaced-1 held more than it "
+                           "moved and is kept. The route trust is pinned")
+    line = dcli._trust_line({"pinned": False, "refused": "routes-trust-exists", "why": "w"})
+    assert "stop the control and keys services and run" in line

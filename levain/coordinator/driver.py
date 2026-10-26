@@ -132,6 +132,11 @@ class Event(NamedTuple):
 
 
 class ReadBatch(NamedTuple):
+    """One :meth:`DriverSession.read`. Apart from the launch's history (the events at or before its first
+    ``complete_through``, which the service records as backfill), a read returns AT MOST ONE liveness boundary event
+    (``turn_started``, or ``turn_ended``), and it is the batch's LAST event: the service judges each boundary before it
+    handles anything after it, and refuses a batch whose boundaries break this (``turn_ended`` is one on Claude
+    only)."""
     events: tuple[Event, ...]
     next_cursor: str | None
     complete_through: str | None      # the vendor position up to which the session asserts it read everything
@@ -394,10 +399,14 @@ class ScriptedSession:
         return CommandResult("confirmed", "interrupted")
 
     def read(self, cursor: str | None) -> ReadBatch:
-        """Every shown event after ``cursor`` (an ordinal position; None = from the start)."""
+        """Every shown event after ``cursor`` (an ordinal position; None = from the start, all of it), ending at the
+        first boundary event when ``cursor`` is given (the :class:`ReadBatch` contract)."""
         after = int(cursor) if cursor else 0
         with self._lock:
             got = tuple(e for e in self._shown if int(e.pos) > after)
+            if cursor is not None:
+                end = next((i for i, e in enumerate(got) if e.kind in ("turn_started", "turn_ended")), None)
+                got = got if end is None else got[:end + 1]
             through = max([after, *(int(e.pos) for e in got)])
             self._read_through = max(self._read_through, through)
             return ReadBatch(got, f"{through:08d}", f"{through:08d}", False)

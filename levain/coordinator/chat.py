@@ -25,14 +25,19 @@ arrived after its send's record was terminal, kept beside the record it contradi
 ``chat_echoes`` (§2.9) and, in the transaction that records a user item, §7.6's echo search and §5.4's outside
 epoch; the timeline's echo join; the cursor read-back (:meth:`ChatService.read_next`); the unfenced
 :meth:`ChatService.interrupt` (§9, the session call only); and :func:`_ensure`, the one path that brings a store
-made by an earlier release current (head ruling Q-A, 1025+40).
+made by an earlier release current (head ruling Q-A, 1025+40). Its third slice adds liveness: rev 7's two activation
+columns (by :data:`CHAT_ADDED_COLUMNS`, their rule a trigger), the activation writer (:meth:`ChatService.activate`),
+the verdict writer over an injected probe with retry-then-latch, ``probing`` at every §4.2 boundary (R9's Claude
+send and result line included) and H9's first-send exception, the pump step's order (a pending probe before the next
+line; the route seam after the verdict), the bounded vendor read and interrupt, and :func:`composer_state`.
 
 NOT HERE: CH-D1c's ``chat_approvals`` and ``chat_approval_events`` (the view's seam for them is named in
-:data:`CHAT_SCHEMA`, "SEAM CH-D1c"), and CH-D1b's later slices: the probe that writes ``live`` / ``not_live`` and
-Claude's boundaries and tripwires (§4.2 R9, §4.4), the pump thread and the composer states.
+:data:`CHAT_SCHEMA`, "SEAM CH-D1c"); Claude's tripwires (§4.4, CH-D1b-4); the vendor probes themselves (CH-D2 /
+CH-D3); a pump thread (the launcher's loop over :meth:`ChatService.read_next`).
 
-[seat] numbers rev 2 marks ``[seat]``: :data:`EVENT_BODY_MAX`, and rev 4's §7.6 :data:`ECHO_WINDOW`;
-:data:`ATTACHMENTS_MAX` is this lane's. Stdlib only.
+[seat] numbers rev 2 marks ``[seat]``: :data:`EVENT_BODY_MAX`, and rev 4's §7.6 :data:`ECHO_WINDOW`; §4.2's
+:data:`PROBE_TRIES` and :data:`PROBE_GAP`; :data:`ATTACHMENTS_MAX`, :data:`READ_DEADLINE` and
+:data:`INTERRUPT_DEADLINE` are lanes'. Stdlib only.
 """
 from __future__ import annotations
 
@@ -44,11 +49,12 @@ import re
 import secrets
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 from levain import unshowable
 from levain.autonomic.durable_sqlite import read_transaction, write_transaction
@@ -57,15 +63,18 @@ from levain.cockpit.consent import parse_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import chat_lease
 from levain.coordinator.chat_lease import TURN_LEASE_SCHEMA, TurnLease, TurnRefused, TurnView
-from levain.coordinator.driver import CommandResult, InterruptCommand, NotSent, SendCommand, SendResult
+from levain.coordinator.driver import (CommandResult, InterruptCommand, LivenessEvidence, NotSent, SendCommand,
+                                       SendResult)
 from levain.coordinator.store import WORDS_MAX, CoordError, _append_only, _in, next_gseq, schema_present
 
 __all__ = [
-    "ATTACHMENTS_MAX", "AUTHOR_KINDS", "AUTHOR_SURFACES", "CHAT_SCHEMA", "EVENT_BODY_MAX", "EVENT_KINDS", "MODES",
-    "OUTBOX_STATES", "RECIPIENTS", "CHECK_KINDS", "CHECK_SOURCES", "SEND_FAULT_POINTS", "ChatEvent", "ChatMessage",
-    "ChatService", "ChatStore", "EventConflict", "Liveness", "MessageConflict", "OutboxRefused", "SendReceipt",
-    "TimelineRow", "TurnLease", "TurnRefused", "TurnView", "body_sha256", "liveness", "outbox_state", "outbox_step",
-    "record_check", "record_cursor", "record_event", "record_message", "timeline",
+    "ATTACHMENTS_MAX", "AUTHOR_KINDS", "AUTHOR_SURFACES", "CHAT_SCHEMA", "COMPOSER_STATES", "EVENT_BODY_MAX",
+    "EVENT_KINDS", "INTERRUPT_DEADLINE", "MODES", "OUTBOX_STATES", "PROBE_GAP", "PROBE_TRIES", "READ_DEADLINE",
+    "RECIPIENTS", "CHECK_KINDS", "CHECK_SOURCES", "SEND_FAULT_POINTS", "ChatEvent", "ChatMessage", "ChatService",
+    "ChatStore", "Composer", "EventConflict", "Liveness", "MessageConflict", "OutboxRefused", "SendReceipt",
+    "TimelineRow", "TurnLease", "TurnRefused", "TurnView", "Verdict", "body_sha256", "canary_verdict_id",
+    "composer_state", "liveness", "outbox_state", "outbox_step", "record_check", "record_cursor", "record_event",
+    "record_message", "timeline",
 ]
 
 RECIPIENTS = ("coordinator", "worker", "thread")
@@ -215,7 +224,7 @@ CHAT_SCHEMA: tuple[str, ...] = (
     "evidence_sha256 TEXT CHECK (evidence_sha256 IS NULL OR (length(evidence_sha256) = 71 AND "
     "substr(evidence_sha256, 1, 7) = 'sha256:' AND substr(evidence_sha256, 8) NOT GLOB '*[^0-9a-f]*')), "
     "spawn_nonce TEXT, detail TEXT NOT NULL, by TEXT NOT NULL CHECK (by IN ('service', 'operator')), "
-    "at TEXT NOT NULL, PRIMARY KEY (launch_id, seq), "
+    "at TEXT NOT NULL, canary_verdict_id TEXT, containment_digest TEXT, PRIMARY KEY (launch_id, seq), "
     "CHECK ((kind = 'reenabled') = (by = 'operator')), CHECK ((kind = 'reenabled') = (source = 'operator')), "
     # rev 6 §2.7: a nonce only on an activation row, 32 lowercase hex
     "CHECK (spawn_nonce IS NULL OR (source = 'activation' AND length(spawn_nonce) = 32 "
@@ -228,6 +237,17 @@ CHAT_SCHEMA: tuple[str, ...] = (
     f"CREATE TRIGGER IF NOT EXISTS chat_launch_checks_reenable BEFORE INSERT ON chat_launch_checks "
     f"WHEN NEW.kind = 'reenabled' AND NOT ({_LATCHED_LIVE}) "
     "BEGIN SELECT RAISE(ABORT, 'a re-enable clears a latch whose latest probe read live'); END",
+    # rev 7 §2.7 (R7-1): the canary verdict id and the containment digest ride together, 64 lowercase hex each, on a
+    # live activation row that names its child, and nowhere else. A trigger, not a CHECK: a released table gains the
+    # columns by ALTER (CHAT_ADDED_COLUMNS), which cannot add a CHECK
+    "CREATE TRIGGER IF NOT EXISTS chat_launch_checks_canary BEFORE INSERT ON chat_launch_checks "
+    "WHEN (NEW.canary_verdict_id IS NULL) != (NEW.containment_digest IS NULL) OR (NEW.canary_verdict_id IS NOT NULL "
+    "AND NOT (NEW.source = 'activation' AND NEW.kind = 'live' AND NEW.spawn_nonce IS NOT NULL "
+    "AND typeof(NEW.canary_verdict_id) = 'text' AND length(NEW.canary_verdict_id) = 64 "
+    "AND NEW.canary_verdict_id NOT GLOB '*[^0-9a-f]*' AND typeof(NEW.containment_digest) = 'text' "
+    "AND length(NEW.containment_digest) = 64 AND NEW.containment_digest NOT GLOB '*[^0-9a-f]*')) "
+    "BEGIN SELECT RAISE(ABORT, 'a canary verdict id and a containment digest ride together, 64 lowercase hex each, "
+    "on a live activation row that names its child'); END",
     # §2.9 (CH-D1b): a user item that is probably our own send. NOT authorship and NOT delivery: nothing reads it to
     # set an outbox state (B12); it answers only whether the item opened an outside epoch (§7.6). One per message
     "CREATE TABLE IF NOT EXISTS chat_echoes (launch_id TEXT NOT NULL REFERENCES launches(launch_id), "
@@ -271,7 +291,10 @@ CHAT_SCHEMA: tuple[str, ...] = (
 # (table, column, declaration): a column a released table gains, added by _ensure when it is missing. Only
 # additive columns (nullable, or NOT NULL with a constant default; SQLite's ALTER TABLE refuses the rest). The table's
 # CREATE statement above must carry the same column, so a new store has it from the start
-CHAT_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = ()
+CHAT_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("chat_launch_checks", "canary_verdict_id", "TEXT"),        # rev 7 §2.7 (CH-D1b-3); its rule is a trigger
+    ("chat_launch_checks", "containment_digest", "TEXT"),
+)
 
 
 class MessageConflict(CoordError):
@@ -833,10 +856,18 @@ def liveness(conn: sqlite3.Connection, launch_id: str) -> Liveness:
 
 
 def record_check(conn: sqlite3.Connection, now: str, launch_id: str, kind: str, source: str, detail: str, *,
-                 by: str = "service", evidence_sha256: str | None = None, spawn_nonce: str | None = None) -> int:
+                 by: str = "service", evidence_sha256: str | None = None, spawn_nonce: str | None = None,
+                 canary_verdict_id: str | None = None, containment_digest: str | None = None) -> int:
     """One ``chat_launch_checks`` row in the caller's transaction; its seq. The table's CHECKs and triggers hold the
     same rules for any writer: reenabled is yours and needs a latch whose latest probe read live; a nonce rides only an
-    activation row."""
+    activation row; a canary verdict id and a containment digest ride together, only on a live activation row that
+    carries a nonce."""
+    if (canary_verdict_id is None) != (containment_digest is None) or canary_verdict_id is not None and (
+            source != "activation" or kind != "live" or spawn_nonce is None
+            or any(not isinstance(v, str) or re.fullmatch(r"[0-9a-f]{64}", v) is None
+                   for v in (canary_verdict_id, containment_digest))):
+        raise CoordError("a canary verdict id and a containment digest ride together, 64 lowercase hex each, on a live "
+                         "activation row that names its child")
     _worker_launch(conn, launch_id)
     if kind not in CHECK_KINDS:
         raise CoordError(f"a launch check is one of {', '.join(CHECK_KINDS)}")
@@ -857,9 +888,161 @@ def record_check(conn: sqlite3.Connection, now: str, launch_id: str, kind: str, 
     seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_launch_checks WHERE launch_id = ?",
                        (launch_id,)).fetchone()[0]
     conn.execute("INSERT INTO chat_launch_checks (launch_id, seq, gseq, kind, source, evidence_sha256, spawn_nonce, "
-                 "detail, by, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                 (launch_id, seq, next_gseq(conn, now), kind, source, evidence_sha256, spawn_nonce, detail, by, now))
+                 "detail, by, at, canary_verdict_id, containment_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (launch_id, seq, next_gseq(conn, now), kind, source, evidence_sha256, spawn_nonce, detail, by, now,
+                  canary_verdict_id, containment_digest))
     return seq
+
+
+# §4.2 [seat]: a probe that cannot run is retried in place this many times, this far apart (seconds), then latches
+PROBE_TRIES = 3
+PROBE_GAP = 2.0
+# [lane d1b3, unmeasured against a real vendor]: how long (seconds) the service waits on a driver's read, evidence read
+# or interrupt before it stops waiting (the D1b-2 known edges: a read under the launch mutex, an interrupt pinning
+# detach)
+READ_DEADLINE = 10.0
+INTERRUPT_DEADLINE = 10.0
+# the check sources whose probing row the service's own probe answers. An activation's probing is answered only by the
+# activation writer (:meth:`ChatService.activate`: Claude's stage 2, H9)
+_TURN_SOURCES = ("turn_start", "send", "result")
+
+
+class Verdict(NamedTuple):
+    """What the service's probe concludes from one :class:`~levain.coordinator.driver.LivenessEvidence`. Made by the
+    probe the service was given, never by a session; read back by exact type (:meth:`ChatService._verdict`)."""
+    live: bool
+    detail: str
+
+
+def canary_verdict_id(verdict: Any) -> str:
+    """Rev 7 §2.7 (R7-1): ``sha256`` (hex) of ``json.dumps(dataclasses.asdict(verdict), sort_keys=True,
+    separators=(",", ":"))``, over the canary verdict an activation accepted."""
+    if not is_dataclass(verdict) or isinstance(verdict, type):
+        raise CoordError("a canary verdict is a dataclass instance")
+    try:
+        text = json.dumps(asdict(verdict), sort_keys=True, separators=(",", ":"))
+    except Exception as exc:  # noqa: BLE001 - a canary that cannot be serialised has no id: refused
+        raise CoordError(f"a canary verdict that cannot be serialised has no id ({type(exc).__name__})") from None
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _evidence_sha256(evidence: LivenessEvidence) -> str | None:
+    """``sha256:<hex>`` of the evidence's canonical JSON; None when it cannot be serialised (any exception): an
+    activation refuses such evidence and a probe counts it a failed try."""
+    try:
+        text = json.dumps({"source": evidence.source, "raw": evidence.raw, "read_at": evidence.read_at},
+                          sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except Exception:  # noqa: BLE001 - TypeError, ValueError, RecursionError, a raising __getattr__ ...
+        return None
+    return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+
+
+def _check_rows(conn: sqlite3.Connection, launch_id: str) -> list[tuple]:
+    """``(seq, gseq, kind, source, evidence_sha256)`` of the launch's probing / live / not_live rows, in order."""
+    return conn.execute("SELECT seq, gseq, kind, source, evidence_sha256 FROM chat_launch_checks WHERE launch_id = ? "
+                        "AND kind IN ('probing', 'live', 'not_live') ORDER BY seq", (launch_id,)).fetchall()
+
+
+def _activated(conn: sqlite3.Connection, launch_id: str) -> bool:
+    """The launch's latest activation row is live: its child passed activation (Claude: stage 2), so the service's own
+    probe judges its boundaries from here on. Before that only the activation writer gives a verdict."""
+    row = conn.execute("SELECT kind FROM chat_launch_checks WHERE launch_id = ? AND source = 'activation' ORDER BY "
+                       "seq DESC LIMIT 1", (launch_id,)).fetchone()
+    return row is not None and row[0] == "live"
+
+
+def _boundary(conn: sqlite3.Connection, now: str, launch_id: str, source: str) -> None:
+    """§4.2: ``probing`` at a boundary, in the caller's transaction (the one that records the boundary). A launch whose
+    activation has not passed is probing already, and its boundaries write nothing."""
+    if _activated(conn, launch_id):
+        record_check(conn, now, launch_id, "probing", source, f"probing at the {source.replace('_', ' ')} boundary")
+
+
+def _crossing(conn: sqlite3.Connection, launch_id: str, seen: Sequence[Any], backfill: Sequence[bool],
+              claude: bool) -> str | None:
+    """The source of the first boundary of a batch that crosses one (two new boundaries, or one that is not the
+    batch's last event); None when it does not. A boundary is a new, non-backfill ``turn_started`` (any harness) or,
+    on Claude, ``turn_ended`` (R9): the events :meth:`ChatService._ingest` writes a ``probing`` row for."""
+    at = [(i, "turn_start" if e.kind == "turn_started" else "result") for i, (e, old) in enumerate(zip(seen, backfill))
+          if not old and (e.kind == "turn_started" or (claude and e.kind == "turn_ended"))
+          and _event_row(conn, launch_id, e.key) is None]
+    if len(at) > 1 or at and at[0][0] != len(seen) - 1:
+        return at[0][1]
+    return None
+
+
+def _pending_probe(conn: sqlite3.Connection, launch_id: str) -> tuple[int, str] | None:
+    """``(seq, source)`` of the launch's latest check row when it is a boundary's ``probing`` the service's probe
+    answers; else None."""
+    rows = _check_rows(conn, launch_id)
+    if not rows or rows[-1][2] != "probing" or rows[-1][3] not in _TURN_SOURCES or not _activated(conn, launch_id):
+        return None
+    return rows[-1][0], rows[-1][3]
+
+
+def _first_send_open(conn: sqlite3.Connection, launch_id: str) -> bool:
+    """H9 (Q-R6-7), the one exception to B2's "no send while probing": a Claude launch whose latest check is its
+    activation's ``probing`` WITH evidence (stage 1 passed: the initialize response checked; the spawn's own probing
+    row carries none), nothing latched, and no send of the launch attempted since that child's FIRST activation row
+    (one first send per spawn nonce: a replayed stage 1 opens no second one). Every allow stays deferred: the launch
+    is still not ``enabled``."""
+    if _launch_state(conn, launch_id)[2] != "claude":
+        return False
+    rows = _check_rows(conn, launch_id)
+    if not rows:
+        return False
+    seq, _gseq, kind, source, evidence = rows[-1]
+    if kind != "probing" or source != "activation" or evidence is None or liveness(conn, launch_id).latched:
+        return False
+    nonce = conn.execute("SELECT spawn_nonce FROM chat_launch_checks WHERE launch_id = ? AND seq = ?",
+                         (launch_id, seq)).fetchone()[0]
+    if nonce is None:
+        return False
+    since = conn.execute("SELECT MIN(gseq) FROM chat_launch_checks WHERE launch_id = ? AND source = 'activation' AND "
+                         "spawn_nonce = ?", (launch_id, nonce)).fetchone()[0]
+    return conn.execute("SELECT 1 FROM chat_outbox_events o JOIN chat_messages m ON m.message_id = o.message_id "
+                        "WHERE m.launch_id = ? AND o.state = 'attempted' AND o.gseq > ? LIMIT 1",
+                        (launch_id, since)).fetchone() is None
+
+
+# --- the composer (§4.3, §5.4, §7.4, H9) ---------------------------------------------------------------------------
+# what a composer for one owner shows, in the order composer_state tests them: the launch is not running; no driver
+# session is attached; not live (latched, or the latest check read not live: read-only, §4.3); a check is running
+# (the composer shows "checking", §4.2 R9); another holder has the turn (read-only, naming it, §5.4); you may write
+COMPOSER_STATES = ("ended", "no_session", "not_live", "checking", "taken", "writable")
+
+
+@dataclass(frozen=True)
+class Composer:
+    state: str                        # one of COMPOSER_STATES
+    why: str | None                   # None when writable
+    holder: str | None                # taken: who holds the turn
+    reenable: bool                    # not_live with a latch whose latest check read live: your re-enable is offered
+    unresolved: tuple[str, ...]       # the launch's ambiguous sends (§7.4: open / mark delivered / not delivered)
+
+
+def composer_state(conn: sqlite3.Connection, now: str, launch_id: str, owner: str, *, attached: bool) -> Composer:
+    """What ``owner``'s composer for a launch shows, derived from rows alone (it writes nothing; ``attached`` is
+    whether the service holds a driver session for the launch). A send it shows as writable may still be refused by
+    the send's own preflight; this is the display, B2 is :func:`liveness`."""
+    owner = chat_lease.check_owner(owner)
+    unresolved = tuple(r[0] for r in conn.execute(
+        "SELECT m.message_id FROM chat_messages m WHERE m.launch_id = ? AND (SELECT o.state FROM chat_outbox_events o "
+        "WHERE o.message_id = m.message_id ORDER BY o.seq DESC LIMIT 1) = 'ambiguous' ORDER BY m.gseq", (launch_id,)))
+    _role, state, _harness = _launch_state(conn, launch_id)
+    if state != "active":
+        return Composer("ended", f"the launch is {state}", None, False, unresolved)
+    if not attached:
+        return Composer("no_session", "no driver session is attached to this launch", None, False, unresolved)
+    fold = liveness(conn, launch_id)
+    if fold.latched or fold.latest == "not_live":
+        return Composer("not_live", fold.why_not, None, fold.latched and fold.latest == "live", unresolved)
+    if not fold.enabled and not _first_send_open(conn, launch_id):
+        return Composer("checking", fold.why_not, None, False, unresolved)
+    view = chat_lease.view(conn, now, launch_id, owner)
+    if view.state == "taken":
+        return Composer("taken", f"the turn is held ({view.holder})", view.holder, False, unresolved)
+    return Composer("writable", None, None, False, unresolved)
 
 
 # --- the send path (§6) and ambiguous reconciliation (§7.1-§7.4) (CH-D1b) -----------------------------------------
@@ -1193,6 +1376,32 @@ def _plain_norm(value: Any) -> str:
     return str.__str__(value)
 
 
+class _Overdue(Exception):
+    """A bounded driver call that had not returned by its deadline (it may still be running)."""
+
+
+def _bounded(fn: Callable[[], Any], seconds: float) -> Any:
+    """``fn()`` on its own daemon thread, waited on for at most ``seconds``: its value, or its exception re-raised
+    here, or :class:`_Overdue` when it has not returned (the thread is left to finish; nothing waits on it again)."""
+    box: dict[str, Any] = {}
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - carried to the waiting caller
+            box["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="levain-chat-driver-call", daemon=True).start()
+    if not done.wait(seconds):
+        raise _Overdue()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 class ChatService:
     """Walks the send path over a :class:`ChatStore` and the :class:`~levain.coordinator.driver.DriverSession` s
     attached to it, one per worker launch. Every verdict is the service's, from rows and raw vendor evidence; a
@@ -1207,17 +1416,37 @@ class ChatService:
 
     :meth:`interrupt` takes no launch mutex; it PINS the session it calls instead (``_pins``), and :meth:`detach`
     refuses new pins (``_detaching``) and waits for the pinned interrupts to return before it closes the session, so
-    an interrupt never reaches a session that was closed or replaced under it."""
+    an interrupt never reaches a session that was closed or replaced under it. Both waits are bounded: an interrupt
+    that has not answered within :data:`INTERRUPT_DEADLINE` is ``ambiguous`` to its caller, and detach waits at most
+    that long before it closes the session under it (closing is the stop that is always available, §4.3).
 
-    def __init__(self, store: ChatStore, *, fault: Callable[[str], None] | None = None) -> None:
+    A driver call that has not returned by its deadline (a read, an evidence read, an interrupt) WEDGES the session:
+    the call is left in flight and nothing else is called on that session until it is detached (a new attach starts
+    unwedged).
+
+    Liveness (§4.1-§4.2): ``probe(launch_id, evidence)`` is the service's verdict function (the launcher's; CH-D2 /
+    CH-D3 give the vendor ones) and returns a :class:`Verdict`. A session supplies only
+    :class:`~levain.coordinator.driver.LivenessEvidence`; nothing it returns is read as a verdict. With no probe, every
+    probe fails and latches. ``route(launch_id, keys)`` is the seam a later slice routes vendor requests through: the
+    keys of the events one read recorded, called after that read's verdict with the launch's mutex held (it must not
+    call back into the service for that launch: the mutex is not re-entrant). ``sleep`` is the retry wait."""
+
+    def __init__(self, store: ChatStore, *, fault: Callable[[str], None] | None = None,
+                 probe: Callable[[str, LivenessEvidence], Verdict] | None = None,
+                 route: Callable[[str, tuple[str, ...]], None] | None = None,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
         self._chat = store
         self._sessions: dict[str, Any] = {}
         self._locks: dict[str, threading.Lock] = {}
-        self._pins: dict[str, int] = {}               # launch -> interrupts in flight on its attached session
+        self._pins: dict[int, int] = {}               # id(session) -> interrupts in flight on it
         self._detaching: set[str] = set()             # launches whose session takes no new pin
-        self._guard = threading.Lock()                 # held only to read or change the dicts and the set
+        self._wedged: set[str] = set()                # launches whose session left a read unanswered: used no more
+        self._guard = threading.Lock()                 # held only to read or change the dicts and the sets
         self._unpinned = threading.Condition(self._guard)
         self._fault_hook = fault
+        self._probe = probe
+        self._route = route
+        self._sleep = sleep
 
     def _launch_lock(self, launch_id: str) -> threading.Lock:
         with self._guard:
@@ -1235,6 +1464,21 @@ class ChatService:
         with self._launch_lock(launch_id), self._guard:
             self._refuse_second(launch_id)
             self._sessions[launch_id] = session
+            self._wedged.discard(launch_id)           # a wedge belongs to the session that left a call unanswered
+
+    def _wedge(self, launch_id: str, session: Any) -> None:
+        """``session`` left a driver call unanswered: the launch's session is used no more until it is detached.
+        Only the session still attached is wedged (a call that went overdue after a detach marks nothing)."""
+        with self._guard:
+            if self._sessions.get(launch_id) is session:
+                self._wedged.add(launch_id)
+
+    def _refuse_wedged(self, launch_id: str, done: str) -> None:
+        """Refuse (CoordError) once the launch's session is wedged; ``done`` says what was already written."""
+        with self._guard:
+            wedged = launch_id in self._wedged
+        if wedged:
+            raise CoordError(f"launch {str(launch_id)[:40]}'s driver session stopped answering; detach it; {done}")
 
     def _refuse_second(self, launch_id: str) -> None:
         if launch_id in self._sessions:
@@ -1249,8 +1493,10 @@ class ChatService:
             with self._guard:
                 self._detaching.add(launch_id)
                 try:
-                    self._unpinned.wait_for(lambda: not self._pins.get(launch_id))
+                    held = self._sessions.get(launch_id)
+                    self._unpinned.wait_for(lambda: not self._pins.get(id(held)), timeout=INTERRUPT_DEADLINE)
                     session = self._sessions.pop(launch_id, None)
+                    self._wedged.discard(launch_id)
                 finally:
                     self._detaching.discard(launch_id)
             if session is not None:
@@ -1291,6 +1537,8 @@ class ChatService:
             # a resend of a stored outbox_id answers from the store alone: no driver method runs for it
             stored = self._chat._read(lambda conn: _message(conn, "outbox_id", outbox_id)) \
                 if isinstance(outbox_id, str) else None
+            if launch_id in self._wedged:
+                session = None
             if session is not None and stored is None:
                 caps = _caps_snapshot(session.capabilities())
                 normalized = _plain_norm(session.normalize(body)) if isinstance(body, str) else body
@@ -1311,6 +1559,8 @@ class ChatService:
                     return SendReceipt(m.message_id, outbox_id, latest[0] if latest else "pending",
                                        latest[1] if latest else "", False)
                 why = self._preflight(conn, now, m, caps, owner)
+                if why and launch_id in self._wedged:
+                    why = "the launch's driver session stopped answering; it is detached and replaced before any send"
                 outbox_step(conn, now, m.message_id, "refused" if why else "pending", cause=why or "preflight passed")
             if why:
                 return SendReceipt(m.message_id, outbox_id, "refused", why, True)
@@ -1334,7 +1584,7 @@ class ChatService:
         if caps is None:
             return "no driver session is attached to this launch"
         fold = liveness(conn, m.launch_id)
-        if not fold.enabled:
+        if not fold.enabled and not _first_send_open(conn, m.launch_id):
             return _cause_text(f"the gate is not live: {fold.why_not}")
         if m.author_kind == "operator":
             try:
@@ -1372,7 +1622,12 @@ class ChatService:
             if why:
                 outbox_step(conn, now, m.message_id, "cancelled", cause=why)
                 return SendReceipt(m.message_id, m.outbox_id, "cancelled", why, True)
+            # R9: on Claude each send is a boundary, its probing in this transaction, before the bytes; the first send
+            # under activation's probing (H9) writes none (stage 2 gives that launch its verdict)
+            first = _first_send_open(conn, m.launch_id)
             outbox_step(conn, now, m.message_id, "attempted", cause="attempt", op_id=op_id, vendor_anchor=anchor)
+            if not first and _launch_state(conn, m.launch_id)[2] == "claude":
+                _boundary(conn, now, m.launch_id, "send")
         # only the transaction whose attempted row committed reaches this call (the partial unique index)
         self._fault("attempt_committed")
         state, cause, turn, item, signal = self._call(session, _command(m, op_id))
@@ -1385,6 +1640,7 @@ class ChatService:
         if signal is not None:
             raise signal
         self._fault("outcome_committed")
+        self._probe_pending(m.launch_id, session)
         return SendReceipt(m.message_id, m.outbox_id, row[0], row[1], True)
 
     @staticmethod
@@ -1440,12 +1696,22 @@ class ChatService:
             return self._ingest(launch_id, session, batch)
 
     def read_next(self, launch_id: str) -> int:
-        """The cursor read-back: ``session.read(<the launch's last persisted vendor cursor>)`` (None before the
-        first), then :meth:`ingest` of what it returned, all under the launch's mutex. A restarted service resumes
-        where the last persisted batch ended. The count of new events."""
+        """One pump step, the cursor read-back: a pending boundary probe first (§4.2: before the vendor's next line
+        is handled), then ``session.read(<the launch's last persisted vendor cursor>)`` (None before the first),
+        bounded by :data:`READ_DEADLINE`, then :meth:`ingest` of what it returned, all under the launch's mutex. A read
+        that has not returned by the deadline records nothing and leaves the session unused until it is detached. A
+        restarted service resumes where the last persisted batch ended. The count of new events."""
         with self._attached(launch_id) as session:
+            self._probe_pending(launch_id, session)
+            self._refuse_wedged(launch_id, "nothing was read")
             cursor = self._chat._read(lambda conn: _last_cursor(conn, launch_id))
-            return self._ingest(launch_id, session, session.read(cursor))
+            try:
+                batch = _bounded(lambda: session.read(cursor), READ_DEADLINE)
+            except _Overdue:
+                self._wedge(launch_id, session)
+                raise CoordError(f"launch {launch_id}'s vendor read did not return within {READ_DEADLINE:g} s; its "
+                                 "session is used no more until it is detached; nothing was recorded") from None
+            return self._ingest(launch_id, session, batch)
 
     @contextmanager
     def _attached(self, launch_id: str) -> Iterator[Any]:
@@ -1457,12 +1723,15 @@ class ChatService:
             session = self._session(launch_id)
             if session is None:
                 raise CoordError(refusal)
+            self._refuse_wedged(launch_id, "nothing was read")
             yield session
 
     def _ingest(self, launch_id: str, session: Any, batch: Any) -> int:
         """:meth:`ingest` with the launch's mutex held. Every driver call (``normalize``, ``pos_lt``) runs before the
         write transaction; the positions they place are immutable, and the fingerprint check refuses the write if a
         cursor, an attempt or an event of the launch was written since they were read."""
+        self._probe_pending(launch_id, session)
+        self._refuse_wedged(launch_id, "nothing was recorded")
         correlated = bool(session.capabilities().correlation_field)
         seen = []
         for e in batch.events:
@@ -1485,22 +1754,47 @@ class ChatService:
         if through is not None and prev is not None and lt(through, prev):
             through, gap = prev, False      # an older batch: the persisted frontier already covers its gap
         new = 0
+        recorded: list[str] = []
+        crossed = None
         with self._chat._write() as (conn, now):
             if _fingerprint(conn, launch_id) != read.fingerprint:
                 raise CoordError(f"launch {launch_id}'s chat record changed while its batch was read; nothing "
                                  "was written")
+            claude = _launch_state(conn, launch_id)[2] == "claude"
+            crossed = _crossing(conn, launch_id, seen, backfill, claude)
+            if crossed is not None:
+                # the driver contract: a read ends at its one boundary. Fail closed: nothing of the batch is
+                # recorded, the cursor stays, and the launch latches off
+                record_check(conn, now, launch_id, "not_live", crossed, "batch crossed a boundary")
+                seen = []
             for e, old, window in zip(seen, backfill, windows):
                 ev, created = record_event(conn, now, launch_id=launch_id, key=e.key, pos=e.pos, kind=e.kind,
                                            body=e.body, normalized=e.norm, turn_id=e.turn_id, call_id=e.call_id,
                                            backfill=old)
                 new += created
+                if created and not old:
+                    recorded.append(e.key)
+                # §4.2: probing commits with the boundary that starts a turn (Codex turn/started; any harness's
+                # turn_started) and, on Claude, with the turn_ended a result line maps to (R9). History is no boundary
+                if created and not old and (e.kind == "turn_started" or (claude and e.kind == "turn_ended")):
+                    _boundary(conn, now, launch_id, "turn_start" if e.kind == "turn_started" else "result")
                 if not created or e.kind != "user_item" or old:
                     continue
                 if correlated and isinstance(e.correlation, str) and self._prove(conn, now, launch_id, e):
                     continue
                 _echo_or_outside(conn, now, ev, window)
-            record_cursor(conn, now, launch_id=launch_id, vendor_cursor=cursor, complete_through=through, gap=gap)
+            if crossed is None:
+                record_cursor(conn, now, launch_id=launch_id, vendor_cursor=cursor, complete_through=through,
+                              gap=gap)
+        if crossed is not None:
+            raise CoordError(f"launch {launch_id}'s vendor read crossed a boundary (a boundary event that is not its "
+                             "batch's last); nothing was recorded and the launch is off until you re-enable it")
+        # the boundary (the batch's last event) is judged before anything handles what follows it (§4.2)
+        self._probe_pending(launch_id, session)
+        self._refuse_wedged(launch_id, "the batch was recorded; the launch is off")
         self._reconcile(launch_id, session, correlated)
+        if recorded and self._route is not None:
+            self._route(launch_id, tuple(recorded))
         return new
 
     @staticmethod
@@ -1547,13 +1841,15 @@ class ChatService:
     def candidates(self, message_id: str) -> list[str]:
         """§7.3 step 2's "probably this one": the vendor event keys in an ambiguous send's window whose normalized
         digest equals the send's. Shown beside it; never authorship, never delivery (B12). Empty with no session
-        attached (no ``pos_lt`` to place them with)."""
+        attached, or a wedged one (no ``pos_lt`` to place them with)."""
         m = self._chat.message(message_id)
         if m is None or m.launch_id is None or self._session(m.launch_id) is None:
             return []
         with self._launch_lock(m.launch_id):         # a detach or a send waits for the comparisons, and the reverse
             session = self._session(m.launch_id)
-            if session is None:
+            with self._guard:
+                wedged = m.launch_id in self._wedged
+            if session is None or wedged:
                 return []
             read = self._chat._read(lambda conn: _launch_read(conn, m.launch_id))
             att = next((a for a in read.attempts if a.message_id == m.message_id), None)
@@ -1573,8 +1869,11 @@ class ChatService:
         nothing. This half only calls ``session.interrupt`` with a fresh op_id and returns what the session said;
         it writes nothing (the in-flight approval rows a stop cancels are CH-D1c's). It does not wait on the launch's
         mutex: a stop never queues behind a send in flight. A driver that raises, or returns anything but a
-        :class:`~levain.coordinator.driver.CommandResult`, is ``ambiguous``. The session is pinned for the call:
-        :meth:`detach` neither closes nor replaces it until the call returns, and refuses a new interrupt meanwhile.
+        :class:`~levain.coordinator.driver.CommandResult`, is ``ambiguous``; so is one that has not answered within
+        :data:`INTERRUPT_DEADLINE`, and that one also wedges the session (no further call reaches it, an interrupt
+        included, until it is detached). The session is pinned until its call returns: :meth:`detach` refuses a new
+        interrupt meanwhile and waits for the pin, at most :data:`INTERRUPT_DEADLINE`, before it closes the session
+        (an interrupt reaches only the session it pinned; one stuck past the deadline is closed under it).
         ``turn_id`` is None or one line of plain text, as a recorded vendor turn id is (:func:`record_event`)."""
         if turn_id is not None:
             _line("an interrupt's turn id", turn_id)
@@ -1584,21 +1883,160 @@ class ChatService:
                 raise CoordError(f"no driver session is attached to launch {str(launch_id)[:40]}; nothing was sent")
             if launch_id in self._detaching:
                 raise CoordError(f"launch {str(launch_id)[:40]}'s driver session is being detached; nothing was sent")
-            self._pins[launch_id] = self._pins.get(launch_id, 0) + 1
-        try:
-            got = session.interrupt(InterruptCommand("op-" + secrets.token_hex(16), turn_id))
-        except Exception as exc:  # noqa: BLE001 - any driver exception is an unknown outcome
-            return CommandResult("ambiguous", _cause_text(f"the driver raised {type(exc).__name__}: {_said(exc)}"))
-        finally:
+            if launch_id in self._wedged:
+                raise CoordError(f"launch {str(launch_id)[:40]}'s driver session stopped answering; detach it; "
+                                 "nothing was sent")
+            self._pins[id(session)] = self._pins.get(id(session), 0) + 1
+        command = InterruptCommand("op-" + secrets.token_hex(16), turn_id)
+        ran = threading.Event()
+
+        def unpin() -> None:
             with self._guard:
-                self._pins[launch_id] -= 1
-                if not self._pins[launch_id]:
-                    del self._pins[launch_id]
+                self._pins[id(session)] -= 1
+                if not self._pins[id(session)]:
+                    del self._pins[id(session)]
                 self._unpinned.notify_all()
+
+        def call() -> Any:
+            # the pin is released when the session's call returns, not when the caller stops waiting for it
+            ran.set()
+            try:
+                return session.interrupt(command)
+            finally:
+                unpin()
+
+        try:
+            got = _bounded(call, INTERRUPT_DEADLINE)
+        except _Overdue:
+            self._wedge(launch_id, session)
+            return CommandResult("ambiguous", f"the driver did not answer the interrupt within "
+                                              f"{INTERRUPT_DEADLINE:g} s; its session is used no more until it is "
+                                              "detached")
+        except BaseException as exc:
+            if not ran.is_set():
+                unpin()                               # the call's thread never started: nothing else releases it
+            if not isinstance(exc, Exception):
+                raise
+            return CommandResult("ambiguous", _cause_text(f"the driver raised {type(exc).__name__}: {_said(exc)}"))
         if not isinstance(got, CommandResult) or type(got.outcome) is not str or got.outcome not in (
                 "confirmed", "ambiguous", "rejected", "no_such_request"):
             return CommandResult("ambiguous", "the driver returned no command result")
         return CommandResult(got.outcome, _cause_text(got.detail if type(got.detail) is str else got.outcome))
+
+    # --- liveness: the activation writer, the probe, your re-enable, the composer (§4.1-§4.3, H9) -------------
+    def activate(self, launch_id: str, kind: str, detail: str, *, evidence: LivenessEvidence | None = None,
+                 spawn_nonce: str | None = None, canary: Any = None, containment_digest: str | None = None) -> int:
+        """An activation row (source ``activation``) from a verdict the LAUNCHER computed (§3.3; CH-D2 / CH-D3 hold
+        the vendor checks): ``probing`` at spawn, ``probing`` with ``evidence`` once Claude's stage 1 passed (the
+        initialize response checked; it opens the first send, H9), and ``live`` / ``not_live``. A Claude row always
+        names its child (``spawn_nonce``) and a Claude ``live`` carries the accepted canary verdict (its id is
+        computed here, :func:`canary_verdict_id`) and the spawn's containment digest; a Codex row carries none of
+        the three. The seq."""
+        if kind not in ("probing", "live", "not_live"):
+            raise CoordError("an activation row is probing, live or not_live")
+        if evidence is not None and type(evidence) is not LivenessEvidence:
+            raise CoordError("activation evidence is a LivenessEvidence")
+        digest = None if evidence is None else _evidence_sha256(evidence)
+        if evidence is not None and digest is None:
+            raise CoordError("activation evidence that cannot be serialised is refused; nothing was written")
+        verdict_id = None
+        if canary is not None:
+            if getattr(canary, "ok", None) is not True:
+                raise CoordError("an activation accepts only a canary verdict that passed")
+            verdict_id = canary_verdict_id(canary)
+        with self._chat._write() as (conn, now):
+            harness = _launch_state(conn, launch_id)[2]
+            if harness == "claude" and (spawn_nonce is None or kind == "live" and (
+                    verdict_id is None or containment_digest is None)):
+                raise CoordError("a Claude activation names its child, and its live carries the canary verdict and "
+                                 "the containment digest; nothing was written")
+            if harness != "claude" and (spawn_nonce, verdict_id, containment_digest) != (None, None, None):
+                raise CoordError(f"a {harness} activation carries no spawn nonce, canary or containment digest; "
+                                 "nothing was written")
+            if kind == "probing" and digest is not None and spawn_nonce is not None and conn.execute(
+                    "SELECT 1 FROM chat_launch_checks WHERE launch_id = ? AND source = 'activation' AND spawn_nonce "
+                    "= ? AND evidence_sha256 IS NOT NULL LIMIT 1", (launch_id, spawn_nonce)).fetchone() is not None:
+                raise CoordError("stage 1 of this child is recorded already; a replay opens no second first send; "
+                                 "nothing was written")
+            return record_check(conn, now, launch_id, kind, "activation", detail, evidence_sha256=digest,
+                                spawn_nonce=spawn_nonce, canary_verdict_id=verdict_id,
+                                containment_digest=containment_digest)
+
+    def reenable(self, launch_id: str, owner: str) -> int:
+        """Your re-enable (§4.2): clears a latch only while the latest check read live again. ``owner`` is the
+        authenticated client. The service never writes this row itself."""
+        owner = chat_lease.check_owner(owner)
+        with self._chat._write() as (conn, now):
+            return record_check(conn, now, launch_id, "reenabled", "operator", f"re-enabled by {owner}",
+                                by="operator")
+
+    def composer(self, launch_id: str, owner: str) -> Composer:
+        """:func:`composer_state` for ``owner``, read without the write lock."""
+        attached = self._session(launch_id) is not None and launch_id not in self._wedged
+        return self._chat._read(lambda conn: composer_state(conn, self._chat._opener._stamp(), launch_id, owner,
+                                                            attached=attached))
+
+    def _probe_pending(self, launch_id: str, session: Any) -> None:
+        """Answer the launch's boundary ``probing`` row, if its latest check is one (the caller holds the launch's
+        mutex): up to :data:`PROBE_TRIES` tries :data:`PROBE_GAP` apart, each reading fresh evidence from the
+        session and judging it with the service's probe; a try that raises, returns anything but a
+        :class:`Verdict`, or reads evidence that cannot be serialised fails. If every try fails, ``not_live``
+        ("could not check: <why>"), which latches. An evidence read that has not returned by :data:`READ_DEADLINE`
+        ends the probe at once: the session is wedged (no second call while that one is in flight) and the launch
+        latches ``not_live`` ("could not check: evidence read overdue"). A wedged session is not called: its
+        boundary's ``probing`` row stands."""
+        pending = self._chat._read(lambda conn: _pending_probe(conn, launch_id))
+        with self._guard:
+            wedged = launch_id in self._wedged
+        if pending is None or wedged:
+            return                                    # a wedged session is called no more: the probing row stands
+        why = "no probe ran"
+        for attempt in range(PROBE_TRIES):
+            if attempt:
+                self._sleep(PROBE_GAP)
+            try:
+                evidence = _bounded(session.liveness_evidence, READ_DEADLINE)
+            except _Overdue:
+                # its call is still in flight: no second one on this session, no further try
+                self._wedge(launch_id, session)
+                self._write_verdict(launch_id, pending, "not_live", "could not check: evidence read overdue", None)
+                return
+            except Exception as exc:  # noqa: BLE001 - a failed try, retried; never read as live
+                why = f"{type(exc).__name__}: {_said(exc)}"
+                continue
+            try:
+                if type(evidence) is not LivenessEvidence:
+                    raise CoordError("the session returned no liveness evidence")
+                digest = _evidence_sha256(evidence)
+                if digest is None:
+                    raise CoordError("the session's evidence cannot be serialised")
+                verdict = self._verdict(launch_id, evidence)
+            except Exception as exc:  # noqa: BLE001 - a failed try, retried; never read as live
+                why = f"{type(exc).__name__}: {_said(exc)}"
+                continue
+            self._write_verdict(launch_id, pending, "live" if verdict.live else "not_live",
+                                _cause_text(verdict.detail or ("live" if verdict.live else "not live")), digest)
+            return
+        self._write_verdict(launch_id, pending, "not_live", _cause_text(f"could not check: {why}"), None)
+
+    def _verdict(self, launch_id: str, evidence: LivenessEvidence) -> Verdict:
+        """The probe's verdict on ``evidence``, read back by exact type: a :class:`Verdict` whose ``live`` is a bool
+        and ``detail`` a str, or the try fails."""
+        if self._probe is None:
+            raise CoordError("no probe is configured for this service")
+        got = self._probe(launch_id, evidence)
+        if type(got) is not Verdict or type(got.live) is not bool or type(got.detail) is not str:
+            raise CoordError("the probe returned no verdict")
+        return got
+
+    def _write_verdict(self, launch_id: str, pending: tuple[int, str], kind: str, detail: str,
+                       evidence: str | None) -> None:
+        """The verdict row for the boundary ``pending`` names (its source), written only while that boundary's
+        probing is still the launch's latest check."""
+        with self._chat._write() as (conn, now):
+            if _pending_probe(conn, launch_id) != pending:
+                return
+            record_check(conn, now, launch_id, kind, pending[1], detail, evidence_sha256=evidence)
 
     def mark(self, message_id: str, delivered: bool, owner: str) -> str:
         """§7.4: you resolve an ambiguous send, delivered or not. ``owner`` is the authenticated client."""
