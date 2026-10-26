@@ -80,6 +80,10 @@ def test_root_verifies_a_route_map_without_the_authority_store_or_the_autonomic_
     once they exist) is held to it."""
     roots = rc._entry_modules()
     assert QBROKER in roots and DISPATCH in roots  # each exclusion names a real root, so it cannot silently exclude nothing
+    # the reason each exclusion stands: its unit runs under its own service account, never root (fails if one moves to root)
+    from levain.slot.units import SERVICES
+    users = {s.name: s.user for s in SERVICES}
+    assert users["qbroker"] == "_levain_qbroker" and users["dispatch"] == "_levain_dispatch"
     mods = set(rc.closure([m for m in roots if m not in (QBROKER, DISPATCH)]))
     assert {"levain.slot.routemaps", "levain.authority_sig", "levain.trust_anchor"} <= mods
     assert "levain.authority" not in mods and not {m for m in mods if m.startswith("levain.autonomic")}
