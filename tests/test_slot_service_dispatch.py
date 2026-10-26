@@ -1,7 +1,8 @@
 """The dispatch service (CONTRACT §1.3): its unit's on-failure restart policy, its store row (``L/dispatch``), and its
 program ``levain/slot/services/dispatch.py``: the supervisor lock (W2-d DESIGN U5), the follower as its body, and the
 exits each unit manager reads (the lock loser's EX_TEMPFAIL, a SIGTERM death, EX_SOFTWARE for a 0 with no stop signal,
-EX_CONFIG for a usage error or a store of the wrong shape)."""
+EX_CONFIG for a usage error or a store of the wrong shape). The service account resolves to this test's own uid here
+(:func:`_as_the_service_account`); the refusal of every other user is ``test_slot_service_dispatch_user.py``'s."""
 from __future__ import annotations
 
 import errno
@@ -19,9 +20,25 @@ from pathlib import Path
 import pytest
 
 from levain.slot import layout, service_boot, units
+from levain.slot import runtime_helper as H
 from levain.slot.services import dispatch as SD
 
 ROOT = Path(__file__).resolve().parents[1]
+ME = os.geteuid()
+
+#: the program as its own process, with ``_levain_dispatch`` resolved to this uid (the subprocess twin of the
+#: autouse fixture below); argv after ``-c`` reaches the program as its own argv.
+_AS_ACCOUNT = ("import os, runpy\n"
+               "from levain.slot import runtime_helper as H\n"
+               "real, me = H.Seams, os.geteuid()\n"
+               "H.Seams = lambda: real(account_uid=lambda n: me)\n"
+               "runpy.run_module('levain.slot.services.dispatch', run_name='__main__', alter_sys=True)\n")
+
+
+@pytest.fixture(autouse=True)
+def _as_the_service_account(monkeypatch):
+    real = H.Seams
+    monkeypatch.setattr(SD.H, "Seams", lambda: real(account_uid=lambda n: ME))
 
 #: sha256 of each OTHER service's render on main bcb41e68 (``launchd_plist_text``, ``systemd_unit_text``; pf has no
 #: Linux unit): the on-failure change must leave every one byte-unchanged.
@@ -232,7 +249,7 @@ def test_main_parses_the_entry_argv_with_layout_defaults(monkeypatch):
 
 def test_refuses_root(monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    assert SD.main([]) == SD.EX_CONFIG
+    assert SD.main([]) == SD.EX_WRONG_USER
 
 
 @pytest.mark.parametrize("argv", (["--store-dir", "relative"], ["--no-such-flag"]))
@@ -282,7 +299,7 @@ def test_the_program_as_its_own_process_holds_the_lock_and_dies_by_sigterm(sdir,
     second start in this process meets the first PROCESS's lock and exits EX_TEMPFAIL; SIGTERM, sent only once the
     follower's handler is known installed (its first stop line), reaches the program through that handler (the wakeup
     fd) and ends the process by SIGTERM."""
-    proc = subprocess.Popen([sys.executable, "-m", "levain.slot.services.dispatch", "--store-dir", str(sdir),
+    proc = subprocess.Popen([sys.executable, "-c", _AS_ACCOUNT, "--store-dir", str(sdir),
                              "--socket", str(tmp_path / "no-control.sock"), "--export-dir", str(tmp_path / "export")],
                             env=_env(), cwd=str(ROOT), stderr=subprocess.PIPE, text=True)
     lines: list = []

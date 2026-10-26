@@ -15,8 +15,9 @@ SIGINT and returns 0. This program records each SIGTERM / SIGINT it receives (a 
 follower's own handler is installed counts too); when the follower returns 0 after one, it dies by SIGTERM with its
 default action, so each unit manager treats the stop as its own policy says (systemd's on-failure does not restart a
 SIGTERM death; launchd relaunches one unless the job was booted out). A 0 with no signal recorded exits
-:data:`EX_SOFTWARE`, which both relaunch. A usage error, a run as root, and a store dir or lockfile of the wrong shape
-exit :data:`EX_CONFIG`.
+:data:`EX_SOFTWARE`, which both relaunch. A run as any user but ``_levain_dispatch`` (root included) exits
+:data:`EX_WRONG_USER` before it reads argv, the queue broker service's rule. A usage error and a store dir or lockfile of
+the wrong shape exit :data:`EX_CONFIG`.
 """
 from __future__ import annotations
 
@@ -31,9 +32,12 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from levain.dispatch import follow_run as FR
+from levain.slot import Refused
+from levain.slot import runtime_helper as H
 from levain.slot.layout import RUN, STORE, dispatch_store_dir
 
 NAME = "dispatch"
+ACCOUNT = "_levain_dispatch"
 LOCK_NAME = "supervisor.lock"
 #: [judged by 1021+25 head, 10-21] how long a start waits for a held supervisor lock before it exits EX_TEMPFAIL
 LOCK_WAIT_S = 30.0
@@ -42,7 +46,9 @@ _LOCK_SLICE_S = 0.05
 EX_SOFTWARE = 70
 #: sysexits.h: the supervisor lock stayed held for :data:`LOCK_WAIT_S`; both unit managers relaunch it
 EX_TEMPFAIL = 75
-#: sysexits.h: a usage error, root, or a store dir / lockfile not what install made. The Linux unit stays down on it
+#: sysexits.h EX_NOPERM: the euid is not :data:`ACCOUNT`'s uid, or that account does not exist
+EX_WRONG_USER = 77
+#: sysexits.h: a usage error, or a store dir / lockfile not what install made. The Linux unit stays down on it
 #: (``RestartPreventExitStatus``); launchd relaunches any non-zero exit.
 EX_CONFIG = 78
 _STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
@@ -195,9 +201,14 @@ def _parser(host: str) -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None, *, wait_s: float = LOCK_WAIT_S,
          follow: Optional[Callable[[Sequence[str]], int]] = None, die: Callable[[], int] = _die_by_sigterm) -> int:
-    if os.geteuid() == 0:
-        print("levain dispatch: refusing to run as root (it runs as _levain_dispatch)", file=sys.stderr)
-        return EX_CONFIG
+    seams = H.Seams()
+    try:
+        me = seams.account_uid(ACCOUNT)
+    except Refused:
+        me = None
+    if me is None or os.geteuid() != me:
+        print(f"levain dispatch: must run as {ACCOUNT} (the service unit runs it)", file=sys.stderr)
+        return EX_WRONG_USER
     args = list(sys.argv[1:] if argv is None else argv)
     if args[:1] == [NAME]:                  # ``service-entry dispatch`` leaves the program's own name
         args = args[1:]
@@ -235,8 +246,8 @@ def main(argv: Optional[Sequence[str]] = None, *, wait_s: float = LOCK_WAIT_S,
     return EX_SOFTWARE
 
 
-__all__ = ["EX_CONFIG", "EX_SOFTWARE", "EX_TEMPFAIL", "LOCK_NAME", "LOCK_WAIT_S", "LockRefused", "main",
-           "take_supervisor_lock"]
+__all__ = ["ACCOUNT", "EX_CONFIG", "EX_SOFTWARE", "EX_TEMPFAIL", "EX_WRONG_USER", "LOCK_NAME", "LOCK_WAIT_S",
+           "LockRefused", "main", "take_supervisor_lock"]
 
 
 if __name__ == "__main__":
