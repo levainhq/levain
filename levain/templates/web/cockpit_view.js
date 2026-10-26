@@ -99,19 +99,17 @@
   // Calm (one page control): the page reads as if the OS asked for reduced motion. The class on <html> is the one predicate every
   // reader (dashboard.css, topology_view.js, sky.js, the age timer) tests; the choice is kept per browser, absent storage = full.
   const isCalm = () => typeof document !== "undefined" && !!document.documentElement && !!document.documentElement.classList && document.documentElement.classList.contains("calm");
+  // Once armed, the one timer runs for the page's life: a tick that finds no age on the page costs one empty query, and the
+  // next age drawn needs no re-arm. Detached nodes are skipped (querySelectorAll only returns attached ones, so they are never seen).
   function tickAges() {
-    let any = 0;
     for (const n of (typeof document !== "undefined" && document.querySelectorAll ? Array.from(document.querySelectorAll("[data-age-at]")) : [])) {
-      any++;      // a node not yet attached still keeps the timer: it is drawn, only not on the page yet
       if (!n.isConnected) continue;
-      const t = savedAge(n.dataset.ageAt, serverNow());
-      const text = [t, n.dataset.ageRead || ""].filter(Boolean).join(" · ");
+      const text = savedAge(n.dataset.ageAt, serverNow());
       if (n.textContent !== text) n.textContent = text;
       // only the age part of the row's tooltip moves; its reading and detail stay
       if (n.dataset.ageTitle && n.parentNode && n.parentNode.title !== undefined)
-        n.parentNode.title = n.dataset.ageTitle + ": " + [text, n.dataset.ageDetail || ""].filter(Boolean).join(" · ");
+        n.parentNode.title = n.dataset.ageTitle + ": " + [text, n.dataset.ageRead || "", n.dataset.ageDetail || ""].filter(Boolean).join(" · ");
     }
-    if (!any && ageTimer) { root.clearInterval(ageTimer); ageTimer = 0; }
   }
   // a node that shows a save's age: tagged with its stamp, and the one timer started if it is not running
   function ageNode(node, m, titled) {
@@ -125,6 +123,9 @@
     if (!ageTimer) ageTimer = root.setInterval(tickAges, isCalm() ? CALM_AGE_TICK_MS : AGE_TICK_MS);
     return node;
   }
+
+  // a span that shows the age of `iso` and ticks like every other age (the native Health panel draws its "last save" with it)
+  function ageSpan(iso) { return ageNode(el("span", "", savedAge(iso, serverNow())), { age_at: iso }); }
 
   function badgeText(b) {
     const f = Object.prototype.hasOwnProperty.call(BADGE_TEXT, b.kind) ? BADGE_TEXT[b.kind] : null;
@@ -568,7 +569,7 @@
       graduations_validated_total: n("graduated"), graduations_demoted_total: n("demoted"),
       last_wrap_at: last ? last.wrapped_at : null, continuity_chars: last ? last.continuity_chars : null,
       wrap_history_unavailable: wraps === "unavailable",
-      save_age_hours: age, projection_converged: projOk,
+      save_age_hours: age, save_at: isNaN(savedMs) ? null : m.get("last save at"), projection_converged: projOk,
       projection_note: projNote,
       audit_backlog: audit,
     };
@@ -1084,7 +1085,7 @@
       row.appendChild(el("span", "op-l", m.label));
       const fig = m.value == null ? "" : m.value + (m.unit ? " " + m.unit : "");
       // a state is never colour alone: with no figure and no reading, the word stands in
-      row.appendChild(ageNode(el("span", "v", [fig, m.read || ""].filter(Boolean).join(" · ") || st), m, true));
+      row.appendChild(ageNode(el("span", "v", (m.age_at ? fig : [fig, m.read || ""].filter(Boolean).join(" · ")) || st), m, true));      // an aged row's cell is the age alone: its reading rides in the tooltip
       // the row stays one line and a tile cuts its reading: the tooltip holds the whole reading, then the detail
       const whole = [[fig, m.read || ""].filter(Boolean).join(" · "), typeof m.detail === "string" ? m.detail : ""].filter(Boolean).join(" · ");
       if (whole) row.title = m.label + ": " + whole;
@@ -2741,7 +2742,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

@@ -23,7 +23,7 @@ from levain import unshowable
 from levain.cockpit.anneal_effects import section_resource_key
 from levain.cockpit.authority import LabelKey
 from levain.cockpit.effects import SPORE_AUTHORITY_FIELDS, _stored_authority, spore_resource_key
-from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext, row_version_of
+from levain.cockpit.engine import PANEL_READ_DEADLINE_S, Cockpit, ProviderSpec, ReadContext, row_version_of
 from levain.cockpit.registry import opened_day, parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 from levain.dashboard import (
@@ -100,8 +100,9 @@ def _store_label(db: Path) -> str:
 # A built view is served again until one of the files it reads changes, or this many seconds pass. The age bound
 # is for what a file signature cannot see: the state line's expiry, the jar's day, and files below seed/ or activation/.
 VIEW_CACHE_MAX_AGE_S = 30.0
-# how long a reader waits on another reader's build before it builds for itself (a build that hangs must not hang its waiters)
-VIEW_FLIGHT_WAIT_S = 10.0
+# how long a reader waits on another reader's build before it builds for itself (a build that hangs must not hang its waiters):
+# a quarter of a panel's read budget, so the wait and the build that follows it both fit inside that budget
+VIEW_FLIGHT_WAIT_S = PANEL_READ_DEADLINE_S / 4
 VIEW_CACHE_SOURCES = 8
 _view_cache: dict[int, tuple[Any, tuple, float, SubstrateView]] = {}
 _view_cache_lock = threading.Lock()
@@ -171,7 +172,7 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
     """The view for this read cycle. Within a cycle the memo shares one build; across cycles an unchanged store
     (``_store_signature``) serves the view built before, up to ``VIEW_CACHE_MAX_AGE_S``. A miss is single-flight:
     one build per source runs and the readers that arrive meanwhile wait for it (up to ``VIEW_FLIGHT_WAIT_S``, then
-    they build for themselves) and share its view; a build that raises stores nothing and its waiters get the same
+    they build for themselves, and cache that view only if the store signature is still the one they looked at) and share its view; a build that raises stores nothing and its waiters get the same
     exception. A write's own read (``ctx.fresh``) and a
     view that carries an error are never cached."""
     def build() -> SubstrateView:
@@ -192,7 +193,18 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
                     mine = False
             if not mine:
                 if not flight.done.wait(VIEW_FLIGHT_WAIT_S):
-                    return source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
+                    # the builder is slow or hung: build for itself, and keep the view only if the store is still the one
+                    # this reader looked at (otherwise every waiter would leave an uncached build behind)
+                    view = source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
+                    if not view.errors and _store_signature(source) == sig:
+                        with _view_cache_lock:
+                            hit = _view_cache.get(key)
+                            if not (hit and hit[0] is source and hit[1] == sig):
+                                _view_cache.pop(key, None)
+                                _view_cache[key] = (source, sig, time.monotonic(), view)
+                                while len(_view_cache) > VIEW_CACHE_SOURCES:
+                                    _view_cache.pop(next(iter(_view_cache)))
+                    return view
                 if flight.sig == sig:
                     if flight.exc is not None:
                         raise flight.exc            # the builder's failure is every waiter's, not a chain of rebuilds

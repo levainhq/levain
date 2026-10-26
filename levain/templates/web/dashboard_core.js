@@ -1612,11 +1612,26 @@
     // the substrate oracles (facts, never an activity counter); absent on a manifest source or an older levain
     {
       const bits = [];
-      if (h.save_age_hours != null) bits.push("last save " + (h.save_age_hours >= 1 ? Math.round(h.save_age_hours) + "h ago" : "under 1h ago"));
+      const K = typeof window !== "undefined" ? window.LevainCockpitKinds : null;
+      // the save's stamp (carried by the page's own model) draws through the shared age node so it ticks; an older model gets the text
+      const stamped = !!(h.save_at && K && K.ageSpan);
+      if (h.save_age_hours != null) bits.push(stamped ? null : "last save " + (h.save_age_hours >= 1 ? Math.round(h.save_age_hours) + "h ago" : "under 1h ago"));
       if (h.projection_converged != null) bits.push(h.projection_converged ? "projection converged" : "PROJECTION DIVERGED (" + (h.projection_note || "continuity file differs from the last wrap (edited since?)") + ")");
       else if (h.projection_note) bits.push("projection " + h.projection_note);
       if (h.audit_backlog != null) bits.push(!h.audit_backlog ? "no audit write failures recorded" : "AUDIT: " + h.audit_backlog + " audit writes failed");
-      if (bits.length) kv(p, "substrate", bits.join(" · "));
+      if (bits.length && !stamped) kv(p, "substrate", bits.join(" · "));
+      else if (bits.length) {
+        const row = el("div", "kv");
+        row.appendChild(el("span", "k", "substrate"));
+        const v = el("span", "v");
+        bits.forEach((b, i) => {
+          if (i) v.appendChild(document.createTextNode(" · "));
+          if (b === null) { v.appendChild(document.createTextNode("last save ")); v.appendChild(K.ageSpan(h.save_at)); }
+          else v.appendChild(document.createTextNode(b));
+        });
+        row.appendChild(v);
+        p.appendChild(row);
+      }
     }
     // a manifest source may not carry every figure: show only what was sent, never a made-up 0.00
     kv(p, "graduations", `${fmt(h.graduations_validated_total)} validated / ${fmt(h.graduations_demoted_total)} demoted`);

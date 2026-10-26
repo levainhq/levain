@@ -237,6 +237,50 @@ def test_a_waiter_on_a_hung_build_builds_for_itself_after_the_wait(tmp_path: Pat
     assert out2 and not isinstance(out2[0], Exception) and waited < 5, (out2, waited)
 
 
+def test_the_flight_wait_is_a_quarter_of_the_panel_read_budget() -> None:
+    """K10b: the wait is an expression of the budget constant, so it moves with it and stays inside it."""
+    from levain.cockpit.engine import PANEL_READ_DEADLINE_S
+    assert providers.VIEW_FLIGHT_WAIT_S <= PANEL_READ_DEADLINE_S / 4
+
+
+def test_a_waiter_that_timed_out_caches_its_build_only_if_the_signature_still_matches(tmp_path: Path, monkeypatch) -> None:
+    """K10b: a timed-out waiter's view is stored when the store is still the one it looked at, and is not stored when the
+    store moved while it built."""
+    import threading
+    import time
+    from levain.cockpit.engine import ReadContext
+    for moved in (False, True):
+        root, src = _install(tmp_path / ("m" if moved else "s"))
+        _wrap(src)
+        monkeypatch.setattr(providers, "VIEW_FLIGHT_WAIT_S", 0.3, raising=False)
+        real = type(src).build
+        hang, entered, calls = threading.Event(), threading.Event(), []
+
+        def build(self, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                hang.wait(20)
+            elif moved:
+                SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="moved mid-build", tier="hot", salience=2)
+            return real(self, **kw)
+
+        monkeypatch.setattr(type(src), "build", build)
+        providers._view_cache.clear()
+        ts, _o = _readers(src, 1)
+        entered.wait(5)
+        view = providers._view(src, ReadContext(datetime.now(timezone.utc)))
+        stored = providers._view_cache.get(id(src))
+        hang.set()
+        ts[0].join(10)
+        monkeypatch.undo()
+        assert not isinstance(view, Exception)
+        if moved:
+            assert stored is None or stored[3] is not view, "a view built across a store change must not be cached"
+        else:
+            assert stored is not None and stored[3] is view, "an unchanged store's late build is cached"
+
+
 def test_the_signature_is_retaken_when_a_reader_looks_again(tmp_path: Path, monkeypatch) -> None:
     """K9d: a reader whose flight saw another store state loops, and the loop takes a fresh signature."""
     import time
