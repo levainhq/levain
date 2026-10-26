@@ -320,3 +320,29 @@ def test_a_card_box_that_outlived_a_read_only_render_says_so_on_click_and_on_ent
         text, errs = json.loads(out["values"][-1])
         assert text and "nothing was sent" in text.lower(), (act, out["values"])
         assert not [e for e in errs if "ResizeObserver" not in e] and [p for p in _verb_posts(out) if not p.get("dry_run")] == [], (act, out["values"])
+
+
+@needs_browser
+def test_a_job_verb_confirmed_after_the_page_turned_read_only_says_nothing_was_sent_and_posts_nothing(tmp_path, monkeypatch):
+    # W1 (deepseek MED 1, fix r3 verify): the confirm step of a job verb sends through commitJob, which a read-only render takes away. No
+    # shipped verb is both a job and a seat/compose card, so the page's view is turned into that stand-in: the compose verb declared job + confirm.
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    spy = ("window.__orig = window.LevainDashboard.render; window.LevainDashboard.render = (v, o) => { window.__v = v; window.__o = o; return window.__orig(v, o); }; "
+           "window.__errs = []; window.addEventListener('error', e => window.__errs.push(String(e.message))); "
+           "window.addEventListener('unhandledrejection', e => window.__errs.push(String(e.reason))); 1")
+    keep = ("(() => { for (const k of Object.keys(window.__v.action_verbs || {})) { const s = window.__v.action_verbs[k]; "
+            "if (s) { s.job = true; s.confirm_required = true; } } "
+            "window.__jobs = 0; window.__orig(window.__v, Object.assign({}, window.__o, {commitJob: async () => { window.__jobs += 1; return {ok: true, job_id: 'j1'}; }})); window.__b = %s; window.__b.querySelector('.tray-dump-ta').value = 'hi'; "
+            "document.body.appendChild(window.__b); window.__b.querySelector('.tray-dump-btn').click(); "
+            "return window.__b.querySelector('.verb-confirm') ? 'confirming' : 'no-confirm'; })()") % CARD_BOX
+    readonly = "window.__orig(window.__v, {}); 1"
+    yes = "window.__b.querySelector('.verb-confirm').click(); 1"
+    said = "JSON.stringify([(window.__b.querySelector('.edit-msg') || {}).textContent, window.__errs, window.__jobs])"
+    out = _out(tmp_path, src, [{"eval": spy}, {"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"}, {"until": "window.__v"},
+                               {"eval": keep}, {"eval": readonly}, {"until": "1", "ms": 500}, {"eval": yes}, {"until": "1", "ms": 500}, {"eval": said}],
+               first=DESKTOP)
+    assert out["values"][-6] == "confirming", out["values"]
+    text, errs, jobs = json.loads(out["values"][-1])
+    assert text and "nothing was sent" in text.lower(), out["values"]
+    assert jobs == 0, out["values"]
+    assert not [e for e in errs if "ResizeObserver" not in e] and [p for p in _verb_posts(out) if not p.get("dry_run")] == [], out["values"]

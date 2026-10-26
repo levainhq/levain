@@ -3910,7 +3910,8 @@
     };
     const startJob = async (params, key, restore) => {
       msg.className = "edit-msg busy"; msg.textContent = "starting…";
-      const res = await commitJob(action.verb, params, true, key);
+      // the confirm step runs after the click guard: a read-only render in between took commitJob away
+      const res = commitJob ? await commitJob(action.verb, params, true, key) : READ_ONLY_REFUSAL;
       if (!(res && res.ok)) return failed(res, restore);
       msg.className = "edit-msg"; msg.textContent = "";
       // a job start rebuilds nothing: put this live box's chips back to its start state so the shown pick is the kept one
@@ -3926,9 +3927,10 @@
     // definite refusal (a 4xx) forgets the draft's request, so the next send files and signs again; an answer that never
     // came keeps it. Any other verb posts as it always has.
     // the transport this box sends through, read at the send (a later read-only render takes it away): a job verb's start, else the action post
+    const READ_ONLY_REFUSAL = { ok: false, error: "read-only", message: "this page can no longer send; nothing was sent" };
     const sendWay = () => (spec.job ? commitJob : commitAction);
     const fire = async (params, confirm, key) => {
-      if (!sendWay()) return { ok: false, error: "read-only", message: "this page can no longer send; nothing was sent" };
+      if (!commitAction) return READ_ONLY_REFUSAL;  // fire posts through commitAction whatever sendWay() names
       if (!spec.sign) return commitAction(action.verb, params, confirm, key, action.panel);
       const say = (t, k) => { msg.className = "edit-msg" + (k === "bad" ? " err" : k === "ok" ? "" : " busy"); msg.textContent = t; };
       const s = await signedCompose(action.verb, action.panel, params, say, row);
