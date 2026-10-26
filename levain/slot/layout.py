@@ -93,8 +93,10 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         _root(host, L / "trash", 0o700),
         _root(host, L / "staging", 0o711),
         _root(host, L / "export", 0o755),
-        Row(L / "export" / "operator", "_levain_export", "levain-export", 0o2750),
-        Row(L / "export" / "dispatch", "_levain_export", "levain-dispatch-export", 0o2750),
+        # CONTRACT §2.1: root : the class group, 0750. Root acts in these dirs (seal-in's stale delete and probe, the
+        # publish transaction), so they are root's alone; the importer writes only below wall.EXPORT_WRITABLE.
+        Row(L / "export" / "operator", "root", "levain-export", 0o750),
+        Row(L / "export" / "dispatch", "root", "levain-dispatch-export", 0o750),
         # §2.1 gives no row for L/queue/ itself; root 0755 so the members of its two children reach them.
         _root(host, L / "queue", 0o755),
         # Both setgid: on Linux a new file takes its creator's primary group, so without it a row (the broker's
@@ -120,6 +122,29 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         Row(L / "routes" / "dispatch", "_levain_control", "_levain_keys", 0o2750),
         Row(L / "routes" / "verifiers", "_levain_control", "_levain_control", 0o700),
     ]
+
+
+#: Stands in for the operator's account name in :func:`store_dir_row`'s lookup: the one row it owns is not root's,
+#: which is all the trust check reads.
+_ANY_OPERATOR = "<operator>"
+
+
+def admits_root(st: os.stat_result) -> bool:
+    """The trust root's store handle demands of a directory it acts below (a root row, or a per-session / per-slot dir
+    the verb that makes it gives to root): root-owned, not group- or other-writable. Every root directory row's mode
+    has no group or other write bit (tests/test_slot_layout_trust.py), so this IS each root row's own shape."""
+    return st.st_uid == 0 and not st.st_mode & 0o022
+
+
+def store_dir_row(host: HostOS, parts: Iterable[str]) -> "Row | None":
+    """The :func:`base_store_rows` directory row of ``L/<parts>``, or None for a dir no base row makes (a session's or
+    a slot's: every :func:`slot_store_rows` row is root's)."""
+    want = tuple(parts)
+    L = STORE[host]
+    for r in base_store_rows(host, _ANY_OPERATOR):
+        if r.kind == "dir" and r.path.relative_to(L).parts == want:
+            return r
+    return None
 
 
 def policy_rows(host: HostOS) -> list[Row]:
