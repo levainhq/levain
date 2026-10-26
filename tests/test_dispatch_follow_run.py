@@ -318,6 +318,7 @@ def test_main_takes_an_artifact_acks_it_and_ends_on_sigterm(store, served, tmp_p
     rc = FR.main(["--store-dir", str(store.directory), "--socket", str(served.path), "--export-dir", str(export)])
     t.join(5.0)
     assert rc == 0 and done == [True]
+    assert signal.SIGTERM in handlers  # main() installed its handler: the fallback stop alone must not pass this test
     assert store.event_cursor()[1] >= seq
     assert store.taken_artifact(session, ticket) is not None
 
