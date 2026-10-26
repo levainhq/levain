@@ -25,7 +25,7 @@ _KILL = Guard(rationale="a spoofed sender", dissent_author="codex",
 
 def policy(gid, actions, *, min_clean=20, **kw) -> TermedGraduationPolicy:
     """The replayed policy with its signed ``min_clean_fires`` (the log requires the field on every policy)."""
-    return TermedGraduationPolicy.of(_policy(gid, actions, **kw), min_clean_fires=min_clean)
+    return TermedGraduationPolicy.of(_policy(gid, actions, min_clean_fires=min_clean, **kw))
 
 
 def _binding(posture=Posture.COOLING_OFF, *, links=1, clean=20, fires=20) -> Binding:

@@ -70,9 +70,10 @@ def terms_incarnation(record: Mapping, born: int) -> str:
 def policy(gid: str, actions: Mapping[str, ActionRisk], *, expires_at: _dt.datetime,
            lowest: str = "ON_LOOP", signer: str = LAPTOP, renewer: str | None = None, store_id: str = STORE,
            triggers: list[str] | None = None, families: list[str] | None = None, born: int = 1,
-           guard=TEST_GUARD) -> GraduationPolicy:
+           guard=TEST_GUARD, min_clean_fires: int | None = None) -> GraduationPolicy:
     """The replayed policy a ``create_grant`` of this §3 record by ``signer`` at seq ``born`` gives (``renewer``: the
-    key of the renew that last moved its expiry), signed with ``guard``."""
+    key of the renew that last moved its expiry), signed with ``guard`` (and ``min_clean_fires`` when given: the term
+    ``levain.graduation_policy.TermedGraduationPolicy`` reads)."""
     record: dict = {"id": gid, "kind": "graduation", "lowest_posture": lowest, "store_id": store_id,
                     "expires_at": expires_at.astimezone(_dt.timezone.utc).strftime(_STAMP),
                     "actions": {name: risk_dict(risk) for name, risk in actions.items()}}
@@ -82,6 +83,8 @@ def policy(gid: str, actions: Mapping[str, ActionRisk], *, expires_at: _dt.datet
         record["families"] = families
     if guard is not NO_GUARD:
         record["guard"] = [dict(g) for g in guard]
+    if min_clean_fires is not None:
+        record["min_clean_fires"] = min_clean_fires
     return GraduationPolicy.from_record(record, incarnation=terms_incarnation(record, born), born=born,
                                         born_signer=signer, current_signer=renewer or signer)
 

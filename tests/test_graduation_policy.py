@@ -260,9 +260,43 @@ def test_min_clean_fires_has_one_source_the_signed_terms(world):
     create(world, min_clean_fires=100)
     [p] = gp.graduation_policies(world.state())
     assert gp.TermedGraduationPolicy.of(p).min_clean_fires == 100
-    assert gp.TermedGraduationPolicy.of(p, min_clean_fires=100).min_clean_fires == 100
-    with pytest.raises(ValueError, match="not its signed term"):
+    with pytest.raises(TypeError):
         gp.TermedGraduationPolicy.of(p, min_clean_fires=5)
+
+
+def test_terms_that_carry_no_min_clean_fires_are_refused_whatever_a_caller_passes():
+    """O-g1f1-3 (1026-22 RULINGS "G1"): the signed terms are the one source; there is no passed-value fallback for
+    terms that carry none (the authority log requires the term, so only a policy built outside it can lack one)."""
+    from tests.autonomic_test_only_coverage import policy as built
+    bare = built(GP, {"doc.append": LOW}, expires_at=T0 + timedelta(days=7))
+    with pytest.raises(ValueError, match="no signed min_clean_fires"):
+        gp.TermedGraduationPolicy.of(bare)
+    with pytest.raises(TypeError):
+        gp.TermedGraduationPolicy.of(bare, min_clean_fires=20)
+    signed = built(GP, {"doc.append": LOW}, expires_at=T0 + timedelta(days=7), min_clean_fires=20)
+    assert gp.TermedGraduationPolicy.of(signed).min_clean_fires == 20
+
+
+def test_an_ordinary_grant_without_a_birth_does_not_warn(world, caplog):
+    """deepseek r2 LOW (1026-22 RULINGS "G1"): the unborn warning is for graduation grants only; an ordinary grant the
+    replay holds without a ``grant_born`` entry is not a graduation policy and says nothing."""
+    import dataclasses
+    import logging
+    from levain.cockpit.consent import utc_stamp
+    create(world)
+    # planted, as test_authority_graduation_kind does: this levain replays a grant of another kind, never creates one
+    db = world.plant({"op": "create_grant", "grant": {"id": "push-0123456789ab", "kind": "push",
+                                                      "expires_at": utc_stamp(world.clock.now + timedelta(days=1))}},
+                     db=world.db)
+    state = world.state(db)
+    assert "push-0123456789ab" in state.policy.grants
+    unborn = dataclasses.replace(state, grant_born={})
+    gp._UNBORN_WARNED.discard(GP)
+    gp._UNBORN_WARNED.discard("push-0123456789ab")
+    with caplog.at_level(logging.WARNING, logger="levain.graduation_policy"):
+        assert gp.graduation_policies(unborn) == ()
+    said = [r.getMessage() for r in caplog.records]
+    assert len(said) == 1 and GP in said[0], said
 
 
 def test_a_graduation_grant_the_replay_has_no_birth_for_warns_once(world, caplog):

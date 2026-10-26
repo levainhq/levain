@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -76,27 +76,25 @@ class TermedGraduationPolicy(GraduationPolicy):
     before it graduates a binding under this policy (``levain.autonomic.graduation.graduate_due``). Advisory against
     a writer of the levain home; the gate never reads it.
 
-    The term has one source, the signed terms (1026-21 RULINGS G1-5): construction reads it from them, and refuses a
-    ``min_clean_fires`` passed beside terms that say another. Only terms that carry none (a policy built outside an
-    authority log, which requires the term on every graduation policy) take the passed value."""
+    The term has one source, the signed terms (1026-21 RULINGS G1-5, 1026-22 RULINGS G1): construction reads it from
+    them and takes no value from a caller; terms that carry none are refused (the authority log requires the term on
+    every graduation policy, so only a policy built outside it can lack one)."""
 
-    min_clean_fires: int | None = None
+    min_clean_fires: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if "min_clean_fires" in self._terms:
-            signed = self._terms["min_clean_fires"]
-            if self.min_clean_fires is not None and self.min_clean_fires != signed:
-                raise ValueError(f"min_clean_fires {self.min_clean_fires!r} is not its signed term {signed!r}")
-            object.__setattr__(self, "min_clean_fires", signed)
-        if type(self.min_clean_fires) is not int or self.min_clean_fires < 0:
+        if "min_clean_fires" not in self._terms:
+            raise ValueError("the policy's terms carry no signed min_clean_fires")
+        signed = self._terms["min_clean_fires"]
+        if type(signed) is not int or signed < 0:
             raise ValueError("min_clean_fires is a non-negative integer")
+        object.__setattr__(self, "min_clean_fires", signed)
 
     @classmethod
-    def of(cls, policy: GraduationPolicy, *, min_clean_fires: int | None = None) -> "TermedGraduationPolicy":
-        """``policy`` with its signed ``min_clean_fires``; ``min_clean_fires`` only for terms that carry none."""
-        return cls(**{f.name: getattr(policy, f.name) for f in fields(GraduationPolicy) if f.init},
-                   min_clean_fires=min_clean_fires)
+    def of(cls, policy: GraduationPolicy) -> "TermedGraduationPolicy":
+        """``policy`` with its signed ``min_clean_fires``, read from its terms."""
+        return cls(**{f.name: getattr(policy, f.name) for f in fields(GraduationPolicy) if f.init})
 
 
 def graduation_policies(state: _auth.AuthoritySnapshot) -> tuple[GraduationPolicy, ...]:
