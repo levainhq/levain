@@ -151,13 +151,14 @@ def _read_token(token_path: Path) -> tuple[bool, str | None, str]:
     return True, None, f"{token_path} held no pf token; removed it (nothing to release)"
 
 
-def _release(token: str, run: Run) -> tuple[bool, str]:
+def _release(token: str, run: Run) -> tuple[bool, bool, str]:
+    """(released or gone, gone: pf no longer held it, so releasing it took nothing pf held, a note)."""
     r = run([PFCTL, "-X", token], capture_output=True, text=True, env=child_env())
     if r.returncode == 0:
-        return True, ""
+        return True, False, ""
     if _token_gone(r):
-        return True, f"pf no longer held token {token} ({(r.stderr or '').strip()})"
-    return False, f"pfctl -X {token} failed, token kept: {(r.stderr or r.stdout or '').strip()}"
+        return True, True, f"pf no longer held token {token} ({(r.stderr or '').strip()})"
+    return False, False, f"pfctl -X {token} failed, token kept: {(r.stderr or r.stdout or '').strip()}"
 
 
 def _write_token(token_path: Path, token: str) -> None:
@@ -196,7 +197,7 @@ def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.
         return False, note
     if token is None:
         return True, note
-    ok, why = _release(token, run)
+    ok, _, why = _release(token, run)
     if ok:
         after_release()
         token_path.unlink(missing_ok=True)
@@ -208,9 +209,10 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
     an earlier run's is released, so pf never sits with no Levain reference between the two. If the old
     one cannot be released, the new one is given back and the old token stays recorded, so a re-run that
     completes holds one recorded reference. A token write that fails with no old reference released gives the new one
-    back too, so the boot one-shot's launchd retries never pile up references no token names.
+    back too, so the boot one-shot's launchd retries never pile up references no token names. A recorded token pf
+    answers gone (a reboot dropped it) released nothing pf held, so it counts as no old reference here.
 
-    Once the old reference is released, the new one is NEVER given back: it may be all that holds pf on under running
+    Once a LIVE old reference is released, the new one is NEVER given back: it may be all that holds pf on under running
     sessions (L3 verify r2 codex HIGH). A token write that fails then keeps it held, unrecorded, and answers
     :data:`ENABLE_UNCERTAIN`, as does a give-back that fails (the reference stays, named by no token). That answer is
     not retried (:func:`levain.slot.services.pf.main` exits 0 on it), since each retry would take one more reference no
@@ -229,19 +231,21 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
         return False, "pfctl -E printed no token"
     new = m.group(1)
     if old is not None:
-        ok, why = _release(old, run)
+        ok, gone, why = _release(old, run)
         if not ok:
-            back, back_why = _release(new, run)
+            back, _, back_why = _release(new, run)
             if back:
                 return False, why
             return False, f"{ENABLE_UNCERTAIN}: {why}; and the new reference {new} could not be given back: {back_why}"
+        if gone:
+            old = None      # it held nothing (a reboot dropped it): no live reference was released (L3 verify r3 P5)
     try:
         _write_token(token_path, new)
     except OSError as e:
         failed = f"cannot record the pf token {new} in {token_path}: {e.strerror or e}"
         if old is not None:
             return False, f"{ENABLE_UNCERTAIN}: {failed}; reference {new} kept (the old one {old} is released)"
-        back, back_why = _release(new, run)
+        back, _, back_why = _release(new, run)
         if back:
             return False, f"{failed}; reference {new} given back"
         return False, f"{ENABLE_UNCERTAIN}: {failed}; and the new reference {new} could not be given back: {back_why}"

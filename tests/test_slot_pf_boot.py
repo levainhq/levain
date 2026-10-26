@@ -380,3 +380,31 @@ def test_the_one_shot_exits_0_on_an_uncertain_enable_so_launchd_does_not_retry(c
     # an ordinary failed step is still retried
     assert PS.main([], platform="darwin", euid=lambda: 0, lock=_free, slots=lambda: EGRESS,
                    run=lambda _: PS._run([Step("boom", call=lambda: (False, "boom"))])) == 1
+
+
+# --- L3 verify r3 fixes (f3) -----------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("gone", pf.PF_TOKEN_GONE)
+def test_a_token_write_that_fails_after_a_reboot_dropped_the_old_reference_gives_the_new_one_back(tmp_path, monkeypatch,
+                                                                                                   gone):
+    """L3 verify r3 complement MED / codex MED (P5): after a reboot the recorded 111 names a reference pf no longer
+    holds, so ``-X 111`` answers it gone and released nothing that held pf on. A token write that fails then is the
+    no-old case: 222 is given back and the failure is the ordinary, retried one, not :data:`pf.ENABLE_UNCERTAIN` (which
+    exits 0 and leaves the anchor unloaded until the next boot)."""
+    token = tmp_path / "pf.token"
+    token.write_text("111\n")
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(tuple(argv))
+        if argv[1] == "-E":
+            return subprocess.CompletedProcess(argv, 0, "", "pf enabled\nToken : 222\n")
+        if argv[2] == "111":
+            return subprocess.CompletedProcess(argv, 1, "", f"{gone}\n")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(pf, "_write_token", _no_space)
+    ok, why = pf.take_enable_reference(token, run=run)
+    assert calls == [("/sbin/pfctl", "-E"), ("/sbin/pfctl", "-X", "111"), ("/sbin/pfctl", "-X", "222")]
+    assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN) and "222" in why and "No space left on device" in why
