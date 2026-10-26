@@ -724,8 +724,8 @@ def test_the_session_end_sweep_kills_every_process_of_the_hands_user_and_verifie
     from levain.firing import confinement
 
     calls: list[list[str]] = []
-    monkeypatch.setattr(confinement.subprocess, "run",
-                        lambda argv, **kw: calls.append(list(argv)) or sp.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr("levain.hands_live.run_bounded",
+                        lambda argv, **kw: calls.append(list(argv)) or sp.CompletedProcess(argv, 0, b"", b""))
     live = iter([True, False])
     monkeypatch.setattr("levain.hands_live.entity_session_live", lambda uid, **kw: next(live))
     assert confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017) is None
@@ -748,10 +748,10 @@ def test_the_sweep_never_waits_longer_than_its_timeout_on_a_stalled_step(monkeyp
     def stalled(argv, **kw):
         timeouts.append(kw["timeout"])
         if argv[0].endswith("pgrep"):
-            return sp.CompletedProcess(argv, 0, "4242\n", "")
+            return sp.CompletedProcess(argv, 0, b"4242\n", b"")
         raise sp.TimeoutExpired(argv, kw["timeout"])
 
-    monkeypatch.setattr(confinement.subprocess, "run", stalled)
+    monkeypatch.setattr("levain.hands_live.run_bounded", stalled)
     import time
 
     monkeypatch.setattr("levain.hands_live.entity_session_live", lambda uid, **kw: True)
@@ -773,16 +773,16 @@ def test_the_sweeps_liveness_check_is_bounded_by_the_sweeps_timeout(monkeypatch)
 
     def run(argv, **kw):
         if argv[0] == confinement.SUDO:
-            return sp.CompletedProcess(argv, 0, "", "")
+            return sp.CompletedProcess(argv, 0, b"", b"")
         checks.append(kw)
-        if "timeout" not in kw:
-            return sp.CompletedProcess(argv, 0, "4242\n", "")   # would have hung; the test cannot
+        if kw.get("timeout") is None:
+            return sp.CompletedProcess(argv, 0, b"4242\n", b"")   # would have hung; the test cannot
         raise sp.TimeoutExpired(argv, kw["timeout"])
 
-    monkeypatch.setattr(confinement.subprocess, "run", run)
+    monkeypatch.setattr("levain.hands_live.run_bounded", run)
     said = confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017, timeout=0.2)
-    assert checks and all(0 <= kw.get("timeout", 99) <= 0.2 for kw in checks)
-    assert all(kw.get("stdin") is sp.DEVNULL for kw in checks)
+    assert checks and all(0 <= (99 if kw.get("timeout") is None else kw["timeout"]) <= 0.2 for kw in checks)
+    assert all(kw.get("stdin") is None for kw in checks)   # no input: run_bounded starts it on /dev/null
     assert said is not None and "cannot tell" in said
 
 
@@ -807,10 +807,10 @@ def test_the_sweep_takes_the_known_uid_and_says_when_it_ran_out_of_time(monkeypa
         time.sleep(kw["timeout"])
         raise sp.TimeoutExpired(argv, kw["timeout"])
 
-    monkeypatch.setattr(confinement.subprocess, "run", stalled)
+    monkeypatch.setattr("levain.hands_live.run_bounded", stalled)
     said = confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017, timeout=0.2)
     assert said is not None and "ran out" in said and checked == []
-    monkeypatch.setattr(confinement.subprocess, "run", lambda argv, **kw: sp.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr("levain.hands_live.run_bounded", lambda argv, **kw: sp.CompletedProcess(argv, 0, b"", b""))
     assert confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017) is None and checked == [4_000_017]
 
 
@@ -845,7 +845,7 @@ def test_the_sweep_refuses_levains_own_account_and_root(monkeypatch):
     from levain.firing import confinement
 
     ran: list[list[str]] = []
-    monkeypatch.setattr(confinement.subprocess, "run", lambda argv, **kw: ran.append(argv) or sp.CompletedProcess(argv, 1, "", ""))
+    monkeypatch.setattr("levain.hands_live.run_bounded", lambda argv, **kw: ran.append(argv) or sp.CompletedProcess(argv, 1, b"", b""))
     for user, uid in ((getpass.getuser(), os.getuid()), ("root", 0)):
         said = confinement.sweep_hands_user(user, uid=uid)
         assert said is not None and "refusing" in said
@@ -860,7 +860,7 @@ def test_the_sweep_leaves_macos_per_user_agents_and_counts_only_the_entitys(monk
 
     from levain.firing import confinement, ws_git
 
-    monkeypatch.setattr(confinement.subprocess, "run", lambda argv, **kw: sp.CompletedProcess(argv, 0, "4242\n", ""))
+    monkeypatch.setattr("levain.hands_live.run_bounded", lambda argv, **kw: sp.CompletedProcess(argv, 0, b"4242\n", b""))
     checked: list[int] = []
     monkeypatch.setattr("levain.hands_live.entity_session_live", lambda uid, **kw: checked.append(uid) or False)
     assert confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017) is None and checked == [4_000_017]

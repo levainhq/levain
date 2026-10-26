@@ -55,6 +55,9 @@ from levain.hands_live import (
     HandsLiveError,
     entity_session_live,
     hands_user_name,
+    kill_quietly,
+    reap_quietly,
+    run_bounded,
     sweep_hands_user,
     take_exclusive,
 )
@@ -152,24 +155,11 @@ def _call(argv: List[str], *, env: Dict[str, str], timeout: float, retry_timeout
     """One program run with a bounded wait; ``retry_timeout`` runs it once more on a timeout. Raises
     ``subprocess.TimeoutExpired`` or ``OSError``.
 
-    Not ``subprocess.run``: on a timeout it kills the child and then waits for it without a bound, and a probe's
-    child is sudo, which runs as root, so the kill from the operator uid can be refused; the wait would then last
-    as long as the hands-user process under sudo. Here the kill is best effort and every wait after it is bounded
-    (:func:`_reap`); a child left running is the caller's to stop (the plan sweeps the hands user)."""
-    tries = 2 if retry_timeout else 1
-    for n in range(tries):
-        proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/", env=env)
-        try:
-            out, err = proc.communicate(input=stdin, timeout=timeout)
-        except BaseException as e:
-            _kill(proc)
-            _reap(proc)
-            if isinstance(e, subprocess.TimeoutExpired) and n < tries - 1:
-                continue
-            raise
-        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
-    raise AssertionError("unreachable")   # pragma: no cover
+    :func:`levain.hands_live.run_bounded`, with this module's ``Popen`` and :data:`_REAP_TIMEOUT`: a probe's child
+    is sudo, whose kill from the operator uid can be refused, so no wait after the kill is unbounded; a child left
+    running is the caller's to stop (the plan sweeps the hands user)."""
+    return run_bounded(argv, env=env, timeout=timeout, retry_timeout=retry_timeout, stdin=stdin,
+                       reap_timeout=_REAP_TIMEOUT, popen=subprocess.Popen)
 
 
 def acl_problem(paths: List[str], *, host: str) -> Optional[str]:
@@ -863,28 +853,12 @@ def _wait(proc: "subprocess.Popen[bytes]", body: Optional[bytes]) -> str:
     return "exit_0" if code == 0 else f"exit_{code}:{_EXIT_NAMES.get(code, 'other')}"
 
 
-def _kill(proc: "subprocess.Popen[bytes]") -> None:
-    """SIGKILL, best effort and nothing else: a refused kill (``PermissionError`` on a root parent) is not waited
-    on here, so no later step depends on it."""
-    try:
-        proc.kill()
-    except Exception:
-        pass
+_kill = kill_quietly
 
 
 def _reap(proc: "subprocess.Popen[bytes]") -> None:
-    """Wait at most :data:`_REAP_TIMEOUT` for the child to exit, then close its pipes. Never raises an
-    ``Exception``; a child still running then is left to the ``Popen`` object's own cleanup."""
-    try:
-        proc.wait(timeout=_REAP_TIMEOUT)
-    except Exception:
-        pass
-    for f in (proc.stdin, proc.stdout, proc.stderr):
-        if f is not None:
-            try:
-                f.close()
-            except Exception:
-                pass
+    """:func:`levain.hands_live.reap_quietly` with :data:`_REAP_TIMEOUT`."""
+    reap_quietly(proc, _REAP_TIMEOUT)
 
 
 _RD = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)

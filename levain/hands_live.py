@@ -9,7 +9,8 @@ liveness check), :func:`sweep_hands_user` (the session-end stop), the per-entity
 Held like :mod:`levain.trust_anchor`: stdlib only and nothing of ``levain``, so ``levain.autonomic`` may import it
 (the leaf test's ``ALLOWED_OUTSIDE``), and 3.9-valid, since root's ``/usr/bin/python3`` imports it through
 ``levain.firing.hands``. Every failure to tell is a :class:`HandsLiveError`; :mod:`levain.firing.ws_git` re-raises it
-as its own ``WsGitError`` with the same text.
+as its own ``WsGitError`` with the same text. Every child here is run by :func:`run_bounded`, which the automation
+executor shares.
 """
 from __future__ import annotations
 
@@ -55,6 +56,9 @@ LIVENESS_TIMEOUT = 10.0
 #: while a session is open. Busy is a refusal on both sides, never a wait without end.
 HANDS_LOCK = "hands.lock"
 
+#: After a child here is killed (or its kill refused), the wait for it to exit: at most this long.
+_REAP_TIMEOUT = 0.5
+
 
 def hands_user_name(entity_dir: Union[Path, str]) -> str:
     """The hands user's name for this entity: a slug of the directory name plus a hash of the
@@ -71,6 +75,58 @@ class HandsLiveError(RuntimeError):
     """Whether the hands user is running cannot be told; the caller refuses."""
 
 
+def kill_quietly(proc: "subprocess.Popen[bytes]") -> None:
+    """SIGKILL, best effort and nothing else: a refused kill (``PermissionError``, which a child running as root
+    under sudo can raise) is not waited on here, so no later step depends on it."""
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def reap_quietly(proc: "subprocess.Popen[bytes]", timeout: float) -> None:
+    """Wait at most ``timeout`` for the child to exit, then close its pipes. Never raises an ``Exception``; a
+    child still running then is left to the ``Popen`` object's own cleanup."""
+    try:
+        proc.wait(timeout=max(0.0, timeout))
+    except Exception:
+        pass
+    for f in (proc.stdin, proc.stdout, proc.stderr):
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+def run_bounded(argv: List[str], *, env: Dict[str, str], timeout: Optional[float], retry_timeout: bool = False,
+                stdin: Optional[bytes] = None, reap_timeout: float = _REAP_TIMEOUT,
+                popen: Optional[type] = None) -> "subprocess.CompletedProcess[bytes]":
+    """One program run from ``/`` with a bounded wait, its output as bytes; ``retry_timeout`` runs it once more on
+    a timeout. Raises ``subprocess.TimeoutExpired``, ``OSError``, or whatever interrupted the wait.
+
+    Not ``subprocess.run``: on a timeout (or an interrupt) it kills the child and then waits for it without a bound,
+    and when the child runs as root (sudo) the kill from the operator uid can be refused, so that wait lasts as long
+    as the child does (``tests/test_hands_live.py``'s unkillable-child tests). Here the kill is best effort and the wait after it is at most
+    ``reap_timeout``; a child left running is the caller's to stop. ``popen`` is the ``Popen`` to start it with
+    (default: ``subprocess.Popen``, looked up at call time)."""
+    start = popen if popen is not None else subprocess.Popen
+    tries = 2 if retry_timeout else 1
+    for n in range(tries):
+        proc = start(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/", env=env)
+        try:
+            out, err = proc.communicate(input=stdin, timeout=timeout)
+        except BaseException as e:
+            kill_quietly(proc)
+            reap_quietly(proc, reap_timeout)
+            if isinstance(e, subprocess.TimeoutExpired) and n < tries - 1:
+                continue
+            raise
+        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+    raise AssertionError("unreachable")   # pragma: no cover
+
+
 def _secure(name: str) -> str:
     """A program for root to run, resolved on :data:`SECURE_PATH` (the bare name if not found, so a
     plan built on a host without the tool still renders; running it then fails)."""
@@ -79,7 +135,7 @@ def _secure(name: str) -> str:
 
 def _child_env() -> Dict[str, str]:
     """The environment of every child here: :data:`SECURE_PATH`, plus the operator's ``LANG`` and ``LC_*``
-    so ``ps`` output decodes as it would under the operator's locale. pgrep, ps and kill need nothing else."""
+    so ``ps`` prints as it would under the operator's locale. pgrep, ps and kill need nothing else."""
     env = {"PATH": SECURE_PATH}
     env.update((k, v) for k, v in os.environ.items() if k == "LANG" or k.startswith("LC_"))
     return env
@@ -121,19 +177,23 @@ def entity_session_live(hands_uid: int, *, timeout: Optional[float] = None) -> b
     deadline = None if timeout is None else time.monotonic() + timeout
 
     def run(argv: List[str]) -> "subprocess.CompletedProcess[str]":
+        # Any failure here, an output that does not decode included, cannot tell: the whole check fails closed
+        # as a HandsLiveError, never as another type. stdout is decoded as UTF-8, strictly; stderr only feeds a
+        # refusal's text.
         left = None if deadline is None else deadline - time.monotonic()
         try:
             if left is not None and left <= 0:
                 raise subprocess.TimeoutExpired(argv, 0)
-            return subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                                  cwd="/", env=_child_env(), timeout=left)
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            r = run_bounded(argv, env=_child_env(), timeout=left)
+            return subprocess.CompletedProcess(argv, r.returncode, r.stdout.decode("utf-8"),
+                                               r.stderr.decode("utf-8", "replace"))
+        except Exception as exc:
             raise HandsLiveError(f"cannot tell whether the entity is running ({argv[0]}: {exc}); refusing") from None
 
     if platform.system() == "Linux":
         try:
             mounts = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
-        except OSError as exc:
+        except Exception as exc:
             raise HandsLiveError(f"cannot tell whether the entity is running ({exc}); refusing") from None
         if proc_hides_processes(mounts):
             raise HandsLiveError("cannot tell whether the entity is running (/proc hides other users' "
@@ -209,12 +269,12 @@ def sweep_hands_user(user: str, *, uid: Optional[int], timeout: float = 5.0) -> 
     said: Optional[str] = None
     while True:
         # Every step, the check's pgrep and ps included, is bounded by what is left of `timeout`, with
-        # no floor, so a stalled one cannot stretch the sweep (S2d codex MED, r3, r4).
+        # no floor, so a stalled one cannot stretch the sweep (S2d codex MED, r3, r4). A child killed at the
+        # deadline adds its bounded reap (_REAP_TIMEOUT, run_bounded), and then the sweep returns.
         left = deadline - time.monotonic()
         if left > 0:
             try:
-                subprocess.run([SUDO, "-n", "-u", user, "/bin/kill", "-9", "--", "-1"], capture_output=True,
-                               stdin=subprocess.DEVNULL, cwd="/", env=_child_env(), timeout=left)
+                run_bounded([SUDO, "-n", "-u", user, "/bin/kill", "-9", "--", "-1"], env=_child_env(), timeout=left)
             except (OSError, subprocess.TimeoutExpired):
                 pass
         left = deadline - time.monotonic()

@@ -23,7 +23,7 @@ def _hands(tmp: Path) -> ws_git.Hands:
 def test_a_stub_of_the_moved_check_bites_both_ws_git_and_the_sweep(monkeypatch, tmp_path):
     # r4.4's seam test: one stub on hands_live reaches _refuse_while_live (through ws_git's wrapper) and the sweep
     seen: list[str] = []
-    monkeypatch.setattr(confinement.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr(hands_live, "run_bounded", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, b"", b""))
     monkeypatch.setattr(hands_live, "entity_session_live", lambda uid, **kw: seen.append("live") or True)
     with pytest.raises(ws_git.WsGitError, match="has processes running"):
         ws_git._refuse_while_live(_hands(tmp_path), "ws-git")
@@ -68,8 +68,8 @@ def test_the_children_get_the_secure_path_and_only_the_locale(monkeypatch):
 
     def run(argv, **kw):
         envs.append(kw["env"])
-        return subprocess.CompletedProcess(argv, 1, "", "")
-    monkeypatch.setattr(hands_live.subprocess, "run", run)
+        return subprocess.CompletedProcess(argv, 1, b"", b"")
+    monkeypatch.setattr(hands_live, "run_bounded", run)
     assert hands_live.entity_session_live(4_000_017) is False
     locale = {k: v for k, v in os.environ.items() if k == "LANG" or k.startswith("LC_")}
     assert envs == [{"PATH": hands_live.SECURE_PATH, **locale}]
@@ -113,3 +113,97 @@ def test_the_module_compiles_and_imports_under_roots_interpreter(tmp_path):
     assert out.returncode == 0, out.stderr
     print(f"  /usr/bin/python3 {out.stdout.strip()}: compiled and imported")
     py_compile.compile(str(copy), doraise=True)
+
+
+# --- B1-10: every failure to read the process table is a HandsLiveError; B1-11: no unbounded wait after a kill ----
+
+def _rewire(monkeypatch, table: dict, *, kill_refused: bool = False) -> list:
+    """Every child started from here runs ``table[basename(argv[0])]`` instead (``/usr/bin/true`` for any other, so
+    no real sudo, pgrep or ps runs). Patched on the ``subprocess`` module, so ``subprocess.run`` and a direct
+    ``Popen`` both reach it. With ``kill_refused``, ``kill()`` raises ``PermissionError``."""
+    real = subprocess.Popen
+    spawned: list = []
+
+    class P(real):
+        def __init__(self, argv, *a, **kw):
+            super().__init__(table.get(os.path.basename(argv[0]), ["/usr/bin/true"]), *a, **kw)
+            spawned.append(self)
+
+        if kill_refused:
+            def kill(self):
+                raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(subprocess, "Popen", P)
+    return spawned
+
+
+def _reap_all(spawned: list) -> None:
+    for p in spawned:
+        if p.poll() is None:
+            p.send_signal(9)     # send_signal, not the patched kill()
+        p.wait()
+
+
+@pytest.mark.parametrize("which", ["pgrep", "ps"])
+def test_a_process_table_that_does_not_decode_cannot_tell(monkeypatch, which):
+    monkeypatch.setattr(hands_live.platform, "system", lambda: "Darwin")
+    table = {"pgrep": ["/usr/bin/printf", "101\\n"], "ps": ["/usr/bin/printf", "  101     1 /usr/sbin/cfprefsd\\n"]}
+    table[which] = ["/usr/bin/printf", "10\\377\\n"]
+    spawned = _rewire(monkeypatch, table)
+    try:
+        with pytest.raises(hands_live.HandsLiveError, match="cannot tell"):
+            hands_live.entity_session_live(4_000_017, timeout=5.0)
+    finally:
+        _reap_all(spawned)
+
+
+def test_a_mountinfo_that_does_not_decode_cannot_tell(monkeypatch):
+    monkeypatch.setattr(hands_live.platform, "system", lambda: "Linux")
+
+    class Unreadable:
+        def __init__(self, *a):
+            pass
+
+        def read_text(self, **kw):
+            return b"\xff".decode("utf-8")
+    monkeypatch.setattr(hands_live, "Path", Unreadable)
+    with pytest.raises(hands_live.HandsLiveError, match="cannot tell"):
+        hands_live.entity_session_live(4_000_017)
+
+
+def test_the_sweep_reports_a_table_that_does_not_decode_and_never_raises_it(monkeypatch):
+    monkeypatch.setattr(hands_live.platform, "system", lambda: "Darwin")
+    spawned = _rewire(monkeypatch, {"pgrep": ["/usr/bin/printf", "10\\377\\n"]})
+    try:
+        said = hands_live.sweep_hands_user("_levain_x_000000", uid=4_000_017, timeout=0.5)
+    finally:
+        _reap_all(spawned)
+    assert said is not None and "cannot tell" in said
+
+
+def test_a_check_whose_child_cannot_be_killed_still_ends_within_its_bound(monkeypatch):
+    # subprocess.run kills the child on a timeout and then waits for it WITHOUT a bound (RED on e5a09a46: 4.0 s for
+    # a 4 s child); a child running as root under sudo can refuse the operator's kill
+    monkeypatch.setattr(hands_live, "_REAP_TIMEOUT", 0.2, raising=False)
+    spawned = _rewire(monkeypatch, {"pgrep": ["/bin/sleep", "4"]}, kill_refused=True)
+    import time
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(hands_live.HandsLiveError, match="cannot tell"):
+            hands_live.entity_session_live(4_000_017, timeout=0.3)
+        took = time.monotonic() - t0
+    finally:
+        _reap_all(spawned)
+    assert took < 2.0, took
+
+
+def test_a_sweep_whose_children_cannot_be_killed_still_ends_within_its_bound(monkeypatch):
+    monkeypatch.setattr(hands_live, "_REAP_TIMEOUT", 0.2, raising=False)
+    spawned = _rewire(monkeypatch, {"sudo": ["/bin/sleep", "4"], "pgrep": ["/bin/sleep", "4"]}, kill_refused=True)
+    import time
+    t0 = time.monotonic()
+    try:
+        said = hands_live.sweep_hands_user("_levain_x_000000", uid=4_000_017, timeout=0.5)
+        took = time.monotonic() - t0
+    finally:
+        _reap_all(spawned)
+    assert said is not None and took < 2.5, (took, said)
