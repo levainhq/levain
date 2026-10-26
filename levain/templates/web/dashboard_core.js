@@ -4774,17 +4774,29 @@
   const signNotes = new Map();     // request id -> [text, kind, sha256]: what the last ceremony said, kept across redraws
   const signWriteIns = new Map();  // request id -> {sha256, words}: a write-in being typed, kept for the version it was typed on
   let signBusy = 0;                // a ceremony (or a passkey pick) in progress: a second tap anywhere does nothing
-  // request id -> {attempt, recheck}: an answer whose reply was lost and that the cockpit has not yet settled. Its card is
-  // frozen, and every board read asks the cockpit about the attempt again (signRecheck, from renderNeeds: the strip keeps a
-  // card whose item did not change, so a read alone would never reach it). `recheck` is the frozen card's own ask, set by
-  // signFacet; a card drawn afresh asks before it offers anything
+  // request id -> {attempt, views, asking}: an answer whose reply was lost and that the cockpit has not yet settled. Every
+  // board read asks the cockpit about the attempt again (signRecheck, from renderNeeds: the strip keeps a card whose item
+  // did not change, so a read alone would never reach it), one ask at a time. `views` are the facets showing it (the frozen
+  // card's, and one drawn afresh after its request left the listing): each is told every answer and drops itself once its
+  // facet is off the page, so a facet drawn later never takes the ask away from one still shown
   const signPending = new Map();
+  function signAskPending(id) {
+    const p = signPending.get(id);
+    if (!p || p.asking) return;
+    p.asking = true;
+    Promise.resolve()
+      .then(() => signAttempt(id, p.attempt))
+      .catch(() => ({ state: "" }))
+      .then((st) => {
+        if (signPending.get(id) !== p) return;
+        if (st.state === "signed" || st.state === "refused") signPending.delete(id);
+        for (const view of [...p.views]) { try { view(st); } catch (e) { p.views.delete(view); } }
+      })
+      .catch(() => undefined)
+      .then(() => { p.asking = false; });
+  }
   function signRecheck() {
-    for (const p of signPending.values()) {
-      if (!p.recheck || p.asking) continue;
-      p.asking = true;
-      Promise.resolve().then(p.recheck).catch(() => undefined).then(() => { p.asking = false; });
-    }
+    for (const [id, p] of signPending) if (p.views.size) signAskPending(id);
   }
   let signListed = null;           // {at, got}: the last listing, shared by every card of one render
   // which enrolled passkey THIS browser used: fingerprint -> credential id, so the OS prompt asks for that one. Browser
@@ -4951,7 +4963,7 @@
           say("not signed: " + why + (/nothing was signed/.test(why) ? "" : "; nothing was signed") + ": sign it again", "bad");
           return { done: "unsigned" };
         }
-        signPending.set(id, { attempt: attempt, recheck: null, asking: false });
+        signPending.set(id, { attempt: attempt, views: new Set(), asking: false });
         say(said + (st.state === "pending" ? "; the cockpit is still verifying it: not confirmed"
           : "; where it stands could not be read (" + (st.why || st.state || "no reply") + "): not confirmed")
           + "; the board reads it again", "bad");
@@ -5025,34 +5037,25 @@
       // (settleHere, below) before anything is offered
       const unsettled = !!r && signPending.has(id);
       if (!r && signPending.has(id)) {
-        // an unsettled answer whose request left the listing is never dropped: it is asked about on this read and on
-        // every board read (signRecheck) until the cockpit says signed or refused
-        const gone = () => {
-          const p = signPending.get(id);
-          if (!p) return Promise.resolve();
-          return signAttempt(id, p.attempt).catch(() => ({ state: "" })).then((st) => {
-            if (signPending.get(id) !== p) return;
-            if (st.state === "signed") {
-              signPending.delete(id);
-              signWriteIns.delete(id);
-              return show("signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
-                          + " (its reply was lost; the cockpit confirmed it)", "ok");
-            }
-            if (st.state === "refused") {
-              signPending.delete(id);
-              return show("this sign request is no longer open, and the last answer here was not signed", "bad");
-            }
-            show("this sign request is no longer open; the last answer here is not confirmed, and is asked about again "
-                 + "on the next read", "bad");
-          });
-        };
+        // an unsettled answer whose request left the listing is never dropped: this facet is told every ask about it (on
+        // this read and on every board read, signRecheck) until the cockpit says signed or refused
         const p = signPending.get(id);
-        p.recheck = gone;
+        const gone = (st) => {
+          if (!wrap.isConnected) { p.views.delete(gone); return; }
+          if (st.state === "signed") {
+            signWriteIns.delete(id);
+            return show("signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
+                        + " (its reply was lost; the cockpit confirmed it)", "ok");
+          }
+          if (st.state === "refused") {
+            return show("this sign request is no longer open, and the last answer here was not signed", "bad");
+          }
+          show("this sign request is no longer open; the last answer here is not confirmed, and is asked about again "
+               + "on the next read", "bad");
+        };
+        p.views.add(gone);
         show("this sign request is no longer open; asking the cockpit where the last answer here stands", "bad");
-        if (!p.asking) {
-          p.asking = true;
-          gone().catch(() => undefined).then(() => { p.asking = false; });
-        }
+        signAskPending(id);
         return;
       }
       if (!r) {
@@ -5072,35 +5075,40 @@
       let sheetBtn = null;    // "open the sheet": locked with the card's own controls, whether or not a key may sign
       const lock = (on) => { for (const b of buttons) b.disabled = on || !signers.length; if (sheetBtn) sheetBtn.disabled = on; };
       let freeze = null;      // the write-in's frozen state while its ceremony runs (set below when it offers one)
-      // the frozen card's ask about its unsettled answer (signPending): "signed" says so and the board reads again;
+      // the frozen card's view of its unsettled answer (signPending): "signed" says so and the board reads again;
       // "refused" gives the card back; anything else keeps it frozen until the next board read asks again (signRecheck)
-      const settleHere = () => {
+      let settleView = null;
+      const settleHere = (ask) => {     // ask: false only right after the ceremony's own ask (the next board read asks)
         const p = signPending.get(id);
-        if (!p) return Promise.resolve();
-        return signAttempt(id, p.attempt).catch(() => ({ state: "" })).then((st) => {
-          if (signPending.get(id) !== p) return;
-          if (!wrap.isConnected) { if (p.recheck === settleHere) p.recheck = null; return; }   // a newer card asks now
-          if (st.state === "signed") {
-            signPending.delete(id);
-            signWriteIns.delete(id);
-            say("signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
-                + " (its reply was lost; the cockpit confirmed it)", "ok");
-            rereadBoard();
-            return;
-          }
-          if (st.state === "refused") {
-            signPending.delete(id);
-            const why = typeof st.reason === "string" && st.reason ? st.reason.replace(/[.\s]+$/, "") : "refused";
-            say("not signed: " + why + (/nothing was signed/.test(why) ? "" : "; nothing was signed") + ": sign it again", "bad");
-            lock(false);
-            if (freeze) freeze.release();
-            for (const x of acts.querySelectorAll("input")) x.readOnly = x.disabled = false;
-            return;
-          }
-          say((st.state === "pending" ? "the cockpit is still verifying the last answer"
-            : "where the last answer stands could not be read" + (st.why ? " (" + st.why + ")" : ""))
-            + ": not confirmed; the card asks again on the next board read", "bad");
-        });
+        if (!p) return;
+        if (!settleView) {
+          settleView = (st) => {
+            if (!wrap.isConnected) { p.views.delete(settleView); return; }   // a newer card shows it now
+            settleShow(st);
+          };
+        }
+        p.views.add(settleView);
+        if (ask !== false) signAskPending(id);
+      };
+      const settleShow = (st) => {
+        if (st.state === "signed") {
+          signWriteIns.delete(id);
+          say("signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
+              + " (its reply was lost; the cockpit confirmed it)", "ok");
+          rereadBoard();
+          return;
+        }
+        if (st.state === "refused") {
+          const why = typeof st.reason === "string" && st.reason ? st.reason.replace(/[.\s]+$/, "") : "refused";
+          say("not signed: " + why + (/nothing was signed/.test(why) ? "" : "; nothing was signed") + ": sign it again", "bad");
+          lock(false);
+          if (freeze) freeze.release();
+          for (const x of acts.querySelectorAll("input")) x.readOnly = x.disabled = false;
+          return;
+        }
+        say((st.state === "pending" ? "the cockpit is still verifying the last answer"
+          : "where the last answer stands could not be read" + (st.why ? " (" + st.why + ")" : ""))
+          + ": not confirmed; the card asks again on the next board read", "bad");
       };
       const run = (choice, words) => {
         if (signBusy) return say(SIGN_BUSY, "bad");   // the lease holds a second tap, never a button drawn disabled
@@ -5130,8 +5138,7 @@
             if (out.done === "signed") { signWriteIns.delete(id); rearm = false; return undefined; }
             if (out.done === "unsigned") { if (freeze) freeze.release(); return undefined; }
             rearm = false;
-            const p = signPending.get(id);
-            if (p) p.recheck = settleHere;
+            settleHere(false);
             return undefined;
           })
           .catch(() => { /* the ceremony said what happened; the lease is released below */ })
@@ -5196,7 +5203,6 @@
       if (unsettled) {          // the last answer may still sign: nothing here is offered until the cockpit settles it
         lock(true);
         for (const x of acts.querySelectorAll("input")) x.readOnly = x.disabled = true;
-        signPending.get(id).recheck = settleHere;
         settleHere();
       }
       if (options.length) {
