@@ -4124,51 +4124,9 @@ def _hands_signal(hands: HandsIdentity, pgid: int, sig: int) -> bool:
     return r.returncode == 0
 
 
-def sweep_hands_user(user: str, *, uid: int | None, timeout: float = 5.0) -> str | None:
-    """Stop every process of the hands user ``user`` (SIGKILL to all it may signal, sent as it), and
-    verify none of the entity's is left. For a session's start and end: a command can leave its
-    process group (``setsid``), so killing the groups levain started does not reach everything the
-    entity left running. Safe only while one session owns the user
-    (:func:`levain.firing.ws_git.hold_hands_session`). None when none is left, else what is.
-
-    The check is :func:`levain.firing.ws_git.entity_session_live`, the one ws-git uses: on macOS
-    launchd starts (and restarts) per-user system agents for a uid that ran Apple code, and those
-    are not the entity's (S2 L3 r3, codex HIGH). Root and levain's own account are refused. ``uid`` is
-    the hands user's id as setup recorded it: no name lookup runs here, since one can block in NSS
-    with no bound (S2 L3 r5, codex MED); None (not known) is refused."""
-    from levain.firing.ws_git import WsGitError, entity_session_live
-    from levain.launch import child_env
-
-    deadline = time.monotonic() + timeout
-    if uid is None:
-        return f"the id of {user} is not known, so its processes cannot be checked"
-    if uid in (0, os.getuid()):
-        return f"refusing to stop every process of {user} (uid {uid}): it is root or levain's own account"
-    said: str | None = None
-    while True:
-        # Every step, the check's pgrep and ps included, is bounded by what is left of `timeout`, with
-        # no floor, so a stalled one cannot stretch the sweep (S2d codex MED, r3, r4).
-        left = deadline - time.monotonic()
-        if left > 0:
-            try:
-                subprocess.run([SUDO, "-n", "-u", user, "/bin/kill", "-9", "--", "-1"], capture_output=True,
-                               stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=left)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        left = deadline - time.monotonic()
-        if left <= 0:   # what the last check found, or that none could run (S2 L3 r5)
-            return said or (f"the stop of {user}'s processes ran out of its {timeout:g} s before it "
-                            "could check that none is left")
-        try:
-            if not entity_session_live(uid, timeout=left):
-                return None
-            said = f"processes of {user} are still running"
-        except WsGitError as exc:
-            said = str(exc)
-        left = deadline - time.monotonic()
-        if left <= 0:
-            return said
-        time.sleep(min(0.2, left))
+# The session-end stop of every hands-user process, moved to levain.hands_live. session.py looks this name up here at
+# call time, so a patch of ``confinement.sweep_hands_user`` keeps reaching it.
+from levain.hands_live import sweep_hands_user  # noqa: E402,F401
 
 
 # Names never carried from one command to the next, whatever the entity set them to: each makes a
