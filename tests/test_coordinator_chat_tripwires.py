@@ -909,3 +909,31 @@ def test_t1_a_failed_reply_in_a_refused_transaction_still_latches_on_the_re_read
         svc.read_next(claude["launch"])
     svc.read_next(claude["launch"])                   # the reply fails again, and this time the latch commits
     assert trips(cs, claude["launch"]) == ["tripwire:unanswerable_control"]
+
+
+# --- L3 verify r2 (1026-3 d1b4g): R1 a crossing batch's controls, R2 a NUL Read path, R3 _filed with no session -------
+def test_r1_a_crossing_batch_still_interrupts_its_can_use_tool_on_the_error_channel(cs, claude, root):
+    from levain.coordinator.chat import CoordError
+    svc, s, _ = up(cs, claude, root)
+    b = _crossing(100)
+    ctl = event("error", "control:ctl-x", "00000100", turn_id="t-1", control_subtype="can_use_tool")
+    with pytest.raises(CoordError, match="crossed a boundary"):
+        svc.ingest(claude["launch"], b._replace(events=(ctl,) + b.events))
+    assert [c.turn_id for c in s.interrupts] == ["t-1"]
+    assert "tripwire:unexpected_control" in trips(cs, claude["launch"])
+    assert latched(cs, claude["launch"])
+
+
+def test_r1_a_crossing_batch_still_answers_its_elicitation_once(cs, claude, root):
+    from levain.coordinator.chat import CoordError
+    svc, s, _ = up(cs, claude, root)
+    s._inbound["ctl-e"] = "elicitation"               # the vendor's pending request, its line in the batch below
+    b = _crossing(100)
+    ctl = event("error", "control:ctl-e", "00000100", turn_id="t-1", control_subtype="elicitation")
+    crossing = b._replace(events=(ctl,) + b.events)
+    for _ in (1, 2):                                  # the refused batch is read again: no second reply
+        with pytest.raises(CoordError, match="crossed a boundary"):
+            svc.ingest(claude["launch"], crossing)
+    assert _replies(s) == [("ctl-e", "levain answers no elicitation in chat")]
+    assert s.interrupts == []
+
