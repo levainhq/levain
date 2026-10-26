@@ -41,7 +41,7 @@ _FIELD_MAX = 16 * 1024              # a real creation's authenticatorData is a f
 # AAGUID -> provider, from github.com/passkeydeveloper/passkey-authenticator-aaguids (aaguid.json, read 2026-10-25).
 # Display only. An all-zero AAGUID names nothing: a browser or provider may send zeros.
 PROVIDERS: dict[str, str] = {
-    "fbfc3007-154e-4ecc-8c0b-6e020557d7bd": "Apple Passwords (iCloud Keychain)",
+    "fbfc3007-154e-4ecc-8c0b-6e020557d7bd": "iCloud Keychain (Apple Passwords)",
     "dd4ec289-e01d-41c9-bb89-70fa845d4bf2": "iCloud Keychain (Managed)",
     "ea9b8d66-4d01-1d21-3ce4-b6b48cb575d4": "Google Password Manager",
     "adce0002-35bc-c60a-648b-0b25f1f05503": "Chrome on Mac",
@@ -144,17 +144,21 @@ def attested(authenticator_data: bytes, public_key: str) -> Attested:
 
 
 def provider_name(aaguid: str | None) -> str | None:
-    """The provider an AAGUID names, None when it names none (absent, or all zeros)."""
+    """The provider :data:`PROVIDERS` lists for an AAGUID, else None: absent, all zeros, or unlisted. Never a guess."""
     if aaguid is None or aaguid == _ZERO:
         return None
-    return PROVIDERS.get(aaguid, f"an unlisted provider (AAGUID {aaguid})")
+    return PROVIDERS.get(aaguid)
 
 
 def provider_text(facts: KeyFacts | None) -> str:
     """The provider line for a key view: always a sentence, never a blank that reads as fine."""
     if facts is None or facts.source != "enrol":
         return "provider not recorded (only an enrolment that sends its creation names it)"
-    return provider_name(facts.aaguid) or "provider not named (the browser sent no AAGUID)"
+    if facts.aaguid is None:
+        return "provider not named (no AAGUID recorded)"
+    if facts.aaguid == _ZERO:
+        return "provider not named (the passkey's AAGUID is all zeros)"
+    return provider_name(facts.aaguid) or f"unknown provider (AAGUID {facts.aaguid})"
 
 
 def _connect(root: Path) -> sqlite3.Connection:

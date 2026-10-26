@@ -80,8 +80,21 @@ def test_a_creation_names_its_credential_id_and_provider() -> None:
     assert got.credential_id == pk.cred and got.aaguid == GPM
     assert keyfacts.provider_name(got.aaguid) == "Google Password Manager"
     assert keyfacts.provider_name("00000000-0000-0000-0000-000000000000") is None
-    assert "unlisted" in keyfacts.provider_name("12345678-1234-1234-1234-123456789abc")
+    assert keyfacts.provider_name("12345678-1234-1234-1234-123456789abc") is None      # never a guess
 
+
+@pytest.mark.parametrize("aaguid, shown", [
+    ("fbfc3007-154e-4ecc-8c0b-6e020557d7bd", "iCloud Keychain (Apple Passwords)"),   # his, named "Passwords" on the Mac
+    ("dd4ec289-e01d-41c9-bb89-70fa845d4bf2", "iCloud Keychain (Managed)"),
+    ("00000000-0000-0000-0000-000000000000", "provider not named (the passkey's AAGUID is all zeros)"),
+    ("12345678-1234-1234-1234-123456789abc", "unknown provider (AAGUID 12345678-1234-1234-1234-123456789abc)"),
+    (None, "provider not named (no AAGUID recorded)"),
+])
+def test_the_provider_line_names_only_what_the_aaguid_names(aaguid, shown) -> None:
+    """Head fact 10-25: his passkey is one synced credential in iCloud Keychain (his Mac named it "Passwords"). The
+    view names a listed AAGUID's provider, says so plainly for an all-zero one, and never guesses at an unlisted one."""
+    facts = keyfacts.KeyFacts("SHA256:k", "aWQ", aaguid, "enrol", "t")
+    assert keyfacts.provider_text(facts) == shown
 
 def test_a_creation_that_does_not_attest_this_key_is_refused() -> None:
     pk, other = Passkey(), Passkey()
