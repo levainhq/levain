@@ -221,6 +221,8 @@ RECHECK = "recheck"
 # check (made outside the write transaction) and the admission; after that the effect is held.
 _ADMIT_TRIES = 3
 _RETRY = object()
+# How many write transactions the not-started transition tries before it fails closed (autogrant r6.2 (a)).
+_NOT_STARTED_TRIES = 3
 
 
 def decision_key(hold: dict[str, Any]) -> tuple:
@@ -667,12 +669,18 @@ class RunJournal:
 
     def _run_effect(self, run_id: str, effect_id: str, fn: Callable[[], Any], lease: int) -> EffectOutcome:
         """Run ``fn`` outside any transaction (the lease marks it in flight), then commit its result,
-        or ``unknown`` if it raised. The lease is released last."""
+        or ``unknown`` if it raised. ``fn`` raising :class:`EffectNotStarted` says nothing began: the intent row
+        is removed and the effect is HELD ``not_started:<why>`` (its hold's decision untouched), so the next
+        delivery runs it. The lease is released last."""
         try:
             try:
                 result = fn()
                 encoded = json.dumps(result)
+            except EffectNotStarted as e:
+                # B1-1: before the unknown branch below, which would poison an effect that never began
+                return self._not_started(run_id, effect_id, e)
             except BaseException:
+                # B1-3: anything else (KeyboardInterrupt and SystemExit included) may have begun the effect
                 with self._write() as conn:
                     conn.execute("UPDATE effects SET state = 'unknown' WHERE run_id = ? AND effect_id = ?",
                                  (run_id, effect_id))
@@ -683,6 +691,29 @@ class RunJournal:
         finally:
             self._drop_lease(run_id, effect_id, lease)
         return EffectOutcome(EffectStatus.DONE, result)
+
+    def _not_started(self, run_id: str, effect_id: str, exc: EffectNotStarted) -> EffectOutcome:
+        """The not-started transition (autogrant r5.1, bounded by r6.2): remove the ``intent`` row in one write
+        transaction, retried on a store that does not take the write (:class:`JournalCorruptError`) up to
+        :data:`_NOT_STARTED_TRIES` times, never on a :class:`JournalConflictError`. After the last failure the
+        error is raised and the row stays ``intent``: once the lease drops it reads POISONED (fail closed). The
+        caller still holds the lease throughout, so a concurrent admission reads IN_FLIGHT, never POISONED."""
+        hold_id = hold_id_for(run_id, effect_id)
+        for attempt in range(1, _NOT_STARTED_TRIES + 1):
+            try:
+                with self._write() as conn:
+                    conn.execute("DELETE FROM effects WHERE run_id = ? AND effect_id = ? AND state = 'intent'",
+                                 (run_id, effect_id))
+                    held = self._hold_row(conn, hold_id) is not None
+                return EffectOutcome(EffectStatus.HELD, hold_id=hold_id if held else None, why=f"not_started:{exc}")
+            except JournalConflictError:
+                raise
+            except JournalCorruptError as e:
+                if attempt == _NOT_STARTED_TRIES:
+                    raise
+                _log.warning("run journal: not-started %s/%s not recorded (attempt %d): %s", run_id, effect_id,
+                             attempt, e)
+        raise AssertionError("unreachable")   # the loop returns or raises
 
     def note_receipt(self, run_id: str, effect_id: str, receipt_id: str) -> None:
         """Record that the receipt for this effect was persisted, so a replay does not write another."""
