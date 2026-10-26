@@ -803,6 +803,12 @@ def write_tunables(conn: sqlite3.Connection) -> None:
             conn.execute("UPDATE meta SET value = ? WHERE key = ?", (str(value), key))
 
 
+def tunables_differ(conn: sqlite3.Connection) -> bool:
+    """Some tunable row is missing or holds another value than the code's (:func:`write_tunables` would write)."""
+    have = dict(conn.execute(f"SELECT key, value FROM meta WHERE key IN {_TUNE_KEYS}").fetchall())
+    return any(have.get(key) != str(value) for key, value in TUNABLES.items())
+
+
 def _v2_schema(conn: sqlite3.Connection) -> None:
     # V's own /2 tables, as V's opener makes them (levain.autonomic.db)
     for stmt in vdb._SCHEMA:
@@ -898,11 +904,24 @@ class AutonomicStore3:
             raise
         return conn
 
+    @classmethod
+    def _open(cls, conn: sqlite3.Connection) -> None:
+        # O-a1c1-4: the open of a /3 store whose tunables equal the code's is a read transaction (deferred BEGIN): it
+        # takes no write lock. Only a store to create or a tunable to write takes BEGIN IMMEDIATE, and every check
+        # then runs again under that lock (another opener may have moved the store between the two).
+        if cls._open_in(conn, write=False):
+            cls._open_in(conn, write=True)
+
     @staticmethod
-    def _open(conn: sqlite3.Connection) -> None:
-        conn.execute("BEGIN IMMEDIATE")
+    def _open_in(conn: sqlite3.Connection, *, write: bool) -> bool:
+        """The open's checks in one transaction; True when a read (``write=False``) found a write to do, after
+        rolling its read back."""
+        conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
         try:
             if conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
+                if not write:
+                    _rollback(conn)
+                    return True
                 _v2_schema(conn)
                 conn.execute("INSERT INTO meta (key, value) VALUES ('store_id', ?)", ("store-" + _random_hex(),))
                 conn.execute("INSERT INTO meta (key, value) VALUES ('format', ?)", (STORE_FORMAT_V3,))
@@ -927,10 +946,15 @@ class AutonomicStore3:
                 if fingerprint(conn) != expected_fingerprint():
                     raise StoreSchemaMismatch(f"store-schema-mismatch: the store's DDL is not this levain's "
                                               f"({STORE_FORMAT_V3}); it is not rewritten")
-                write_tunables(conn)
+                if tunables_differ(conn):
+                    if not write:
+                        _rollback(conn)
+                        return True
+                    write_tunables(conn)
             if fingerprint(conn) != expected_fingerprint():
                 raise StoreSchemaMismatch("store-schema-mismatch: the new store's DDL is not this levain's")
             conn.execute("COMMIT")
+            return False
         except BaseException:
             _rollback(conn)
             raise

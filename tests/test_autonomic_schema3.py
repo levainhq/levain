@@ -14,6 +14,7 @@ import pytest
 
 from levain.autonomic import Posture
 from levain.autonomic import db as vdb
+from levain.autonomic import durable_sqlite
 from levain.autonomic import schema3 as s
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.db import AutonomicDB, StoreFormatError
@@ -179,6 +180,28 @@ def test_a_tunable_is_data_not_ddl(tmp_path, store, monkeypatch):
        lambda conn: s.count_held(conn, subj, "subject:f"), lambda conn: s.count_held(conn, subj, "subject:f"))
     tx(c, lambda conn: s.close_subject(conn, subject=subj, record=rec("r-q", subj, "refused"),
                                        reason="held_limit:subject:f"))
+    c.close()
+
+
+def test_an_equal_format_open_takes_no_write_lock(store, monkeypatch):
+    # O-a1c1-4: another connection holds the write lock for the whole open
+    monkeypatch.setattr(durable_sqlite, "BUSY_WAIT_S", 0.2)   # a refused write lock surfaces in 0.2 s, not 30
+    holder = raw(store)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        before = snapshot(store.path)
+        assert s.AutonomicStore3(store.directory).meta("format") == s.STORE_FORMAT_V3
+        # a differing tunable is a write: it waits for that lock (and here, never getting it, is refused busy)
+        monkeypatch.setitem(s.TUNABLES, "held_limit", 2)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            s.AutonomicStore3(store.directory).meta("format")
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert snapshot(store.path) == before
+    assert s.AutonomicStore3(store.directory).meta("held_limit") == "2"
+    c = raw(store)
+    assert not s.tunables_differ(c)
     c.close()
 
 
