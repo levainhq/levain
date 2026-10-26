@@ -635,3 +635,111 @@ def test_h14_no_deadline_timer_is_left_pending_after_a_fetch_settles(tmp_path: P
             {"eval": "[...window.__live.values()].filter((ms) => ms >= 15000).length"},
         ])
     assert out["values"][-1] == 0, out["values"]
+
+
+# --- L3 verify r3 (H15-H19) --------------------------------------------------------------------------------------------
+
+FRAME_STILL_UP = "new Promise((r) => setTimeout(() => r(!!document.getElementById('levain-sign-sheet-frame')), 1500))"
+# a reply that waits for the test to let it through: `window.<name>()` (on the cockpit's window, where the stub runs) sends the real request on
+def _hold(name: str) -> str:
+    return "(real, u, o) => new Promise((res) => { window." + name + " = () => res(real(u, o)); })"
+
+# a request that fails when the test says so
+HOLD_THEN_FAIL = "(real, u, o) => new Promise((res, rej) => { window.__fail = () => rej(new TypeError('the network went away')); })"
+CHOICE_IN = lambda c: f"{IN}.querySelector('#sheet-actions [data-choice=\"{c}\"]')"  # noqa: E731
+NOTE_IN = f"{IN}.getElementById('sheet-note').textContent"
+SIGNING_IN = f"({IN}.getElementById('sheet-signing') || {{}}).textContent"
+
+
+@needs_browser
+@needs_ssh
+def test_h15_a_close_after_the_re_read_settled_leaves_at_once(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), *OPEN_FRAMED,
+            _stub(f"{FRAME}.contentWindow"),
+            {"eval": f"{FRAME}.contentWindow.__stub['/answer'] = {LOST_AFTER_SEND}; {CHOICE_IN('b')}.click() || 1"},
+            {"until": f"{IN}.getElementById('sheet').dataset.state === 'closed' && 1", "ms": 30000},
+            {"eval": CLOSE_IN_FRAME},
+            {"eval": FRAME_STILL_UP},
+        ])
+    assert out["values"][-1] is False, out["values"]                  # the ceremony had ended: the close left
+
+
+@needs_browser
+@needs_ssh
+def test_h16_a_signed_ceremony_with_no_server_line_still_reads_signed(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    no_line = ("(real, u, o) => real(u, o).then((r) => r.json().then((j) => { delete j.line; return new Response("
+               "JSON.stringify(j), {status: r.status, headers: {'Content-Type': 'application/json'}}); }))")
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig), _stub(),
+            {"eval": f"window.__stub['/challenge'] = {no_line}; {_button('b')}.click() || 1"},
+            {"until": f"/^signed/.test({NOTE}) && 1", "ms": 30000},
+            {"eval": SIGNING},
+        ])
+    assert out["values"][-1].startswith("Signed:"), out["values"]    # never "Signing:" once signed
+
+
+@needs_browser
+@needs_ssh
+def test_h17_the_close_read_back_never_overwrites_a_signed_outcome(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), *OPEN_FRAMED,
+            _stub(f"{FRAME}.contentWindow"),
+            {"eval": f"{FRAME}.contentWindow.__stub['/answer'] = {_hold('__answer')}; "
+                     f"{FRAME}.contentWindow.__stub['.json'] = {_hold('__read')}; {CHOICE_IN('b')}.click() || 1"},
+            {"until": f"typeof window.__answer === 'function' && 1", "ms": 30000},
+            {"eval": CLOSE_IN_FRAME},                                  # the read-back is now held
+            {"until": f"typeof window.__read === 'function' && 1", "ms": 30000},
+            {"eval": f"window.__answer() || 1"},
+            {"until": f"/^signed/.test({NOTE_IN}) && 1", "ms": 30000},
+            {"eval": f"window.__read() || 1"},          # now the read-back comes back
+            {"eval": f"new Promise((r) => setTimeout(() => r({NOTE_IN}), 1500))"},
+        ])
+    assert out["values"][-1].startswith("signed"), out["values"]
+
+
+@needs_browser
+@needs_ssh
+def test_h18_the_close_read_back_names_a_changed_request(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    changed = ("(real, u, o) => real(u, o).then((r) => r.json().then((j) => { j.request.sha256 = 'f'.repeat(64); "
+               "return new Response(JSON.stringify(j), {status: r.status, headers: {'Content-Type': 'application/json'}}); }))")
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), *OPEN_FRAMED,
+            _stub(f"{FRAME}.contentWindow"),
+            {"eval": f"{FRAME}.contentWindow.__stub['/challenge'] = {HANG}; {CHOICE_IN('b')}.click() || 1"},
+            {"eval": f"{FRAME}.contentWindow.__stub['.json'] = {changed}; 1"},
+            {"eval": CLOSE_IN_FRAME},
+            {"until": f"{FRAME}.contentWindow.__reads >= 1 && /changed|still open/.test({NOTE_IN}) && {NOTE_IN}", "ms": 30000},
+        ])
+    assert "changed" in out["values"][-1], out["values"]
+
+
+@needs_browser
+@needs_ssh
+def test_h19_a_close_asked_in_one_ceremony_does_not_leave_the_next_one(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), *OPEN_FRAMED,
+            _stub(f"{FRAME}.contentWindow"),
+            {"eval": f"{FRAME}.contentWindow.__stub['/challenge'] = {HOLD_THEN_FAIL}; {CHOICE_IN('b')}.click() || 1"},
+            {"eval": CLOSE_IN_FRAME},
+            {"until": f"/still open/.test({NOTE_IN}) && 1", "ms": 30000},
+            {"eval": f"window.__fail() || 1"},          # the first ceremony ends, unsigned
+            {"until": f"!{CHOICE_IN('b')}.disabled && 1", "ms": 30000},
+            {"eval": f"{FRAME}.contentWindow.__stub['/challenge'] = {HANG}; {CHOICE_IN('b')}.click() || 1"},
+            {"until": f"/^Signing:/.test({SIGNING_IN}) && 1", "ms": 30000},
+            {"eval": CLOSE_IN_FRAME},                                  # a first close of the second ceremony
+            {"eval": FRAME_STILL_UP},
+            {"eval": SIGNING_IN},
+        ])
+    v = out["values"]
+    assert v[-2] is True and v[-1].startswith("Not confirmed:"), v

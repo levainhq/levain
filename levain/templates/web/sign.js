@@ -222,7 +222,10 @@
     if (n && typeof n.dataset.text === "string") n.textContent = label + ": " + n.dataset.text;
   }
 
-  let busy = false;
+  // `busy`: the controls are locked (a ceremony runs, or an unsure one is not yet settled). `flight`: a ceremony is in
+  // flight, which ends on every outcome; `active` is the request it signs
+  let busy = false, flight = false, active = null;
+  function ended() { flight = false; closeAsked = false; }
   function offer(r, rp, signers, held) {
     const acts = $("sheet-actions");
     acts.hidden = false;
@@ -231,14 +234,20 @@
     const run = (choice, words, expect) => {
       if (busy) return;
       busy = true;
+      flight = true;
+      active = r;
       lock(true);
       if (expect) signing(expect, "page", "Signing");
       whom(rp, signers, held, acts).then((k) => (k ? ceremony(r, rp, k, choice, words) : "unsigned"))
         .catch(() => "unsigned")
         .then((done) => {
-          if (done === "signed") { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
-          if (done === "unsure") { relabel("Not confirmed"); return settle(r, () => { relabel("Not signed"); busy = false; lock(false); }); }
+          if (done === "signed") { busy = false; ended(); acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
+          if (done === "unsure") {
+            relabel("Not confirmed");
+            return settle(r, () => { relabel("Not signed"); busy = false; lock(false); }).then(ended);
+          }
           relabel("Not signed");
+          ended();
           busy = false;
           lock(false);
         });
@@ -328,14 +337,17 @@
   // close leaves
   let closeAsked = false;
   function askClose() {
-    if (!busy || closeAsked) return tell("close");
+    if (!flight || closeAsked) return tell("close");
     closeAsked = true;
     relabel("Not confirmed");
     say("Signing is still in progress, so it is not confirmed. Checking where the request stands… (close again to leave).", "bad");
     return readRequest().then((got) => {
-      say(got.request && got.request.sha256 && !got.request.refused
-          ? "The request is still open and unsigned as of this check; the signature in progress may yet land (close again to leave)."
-          : standing(got), "bad");
+      // a ceremony that ended while this read was out has said its own outcome: this read does not replace it
+      if (flight && $("sheet").dataset.state !== "signed") {
+        say(stillOpen(active, got)
+            ? "The request is still open and unsigned as of this check; the signature in progress may yet land (close again to leave)."
+            : standing(got), "bad");
+      }
       tell("reload");
     });
   }
@@ -414,7 +426,7 @@
           const by = typeof a.body.signer_fp === "string" && a.body.signer_fp ? a.body.signer_fp : fp;
           const ns = typeof a.body.namespace === "string" && a.body.namespace ? " in " + a.body.namespace : "";
           say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + by + ns + (line ? ": " + line : ""), "ok");
-          if (line) signing(line, "server", "Signed");
+          if (line) signing(line, "server", "Signed"); else relabel("Signed");
           $("sheet").dataset.state = "signed";
           return "signed";
         });
