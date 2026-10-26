@@ -135,6 +135,40 @@ def test_t11_connect_outcomes():
     assert [s.fam for s in made].count(socket.AF_INET6) == 1
 
 
+def test_t11_writable_past_the_deadline_is_connected_not_timeout():
+    """L3 r1 X1 (codex HIGH): the handshake finished while the child was descheduled past the bound, so the loop
+    never selects; a final non-blocking sweep must still read the socket as connected, never as ``b … timeout``."""
+    script = {"192.0.2.1": (errno.EINPROGRESS, 0), "192.0.2.2": (errno.EINPROGRESS, errno.ECONNREFUSED),
+              "192.0.2.3": (errno.EINPROGRESS, None)}
+    clock = T()
+    sel = FakeSel()
+    sel.clock = clock
+    timeouts = []
+    real = sel.select
+
+    def select(timeout):
+        timeouts.append(timeout)
+        return real(timeout)
+    sel.select = select
+    made = []
+
+    def make(fam, typ):
+        s = FakeSock(fam, typ, script)
+        made.append(s)
+        return s
+
+    reads = []
+
+    def monotonic():
+        reads.append(clock.t)
+        if len(reads) == 2:                        # after the deadline was fixed, before the first select:
+            clock.t += PC.CONNECT_S + 60          # descheduled past it
+        return clock()
+    out = PC.connect_all(list(script), make_socket=make, monotonic=monotonic, selector=lambda: sel)
+    assert out == {"192.0.2.1": ("c", ""), "192.0.2.2": ("b", "ECONNREFUSED"), "192.0.2.3": ("b", "timeout")}
+    assert timeouts == [0]                         # the one sweep, non-blocking
+
+
 def test_t11_blocked_errnos_are_n2s_six():
     assert PC.BLOCKED_ERRNOS == {errno.ECONNREFUSED, errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH,
                                  errno.EACCES, errno.EPERM}

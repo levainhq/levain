@@ -95,8 +95,8 @@ def connect_all(addrs: Sequence[str], *, bound_s: float = CONNECT_S,
                 monotonic: Callable[[], float] = time.monotonic,
                 selector: Callable[[], selectors.BaseSelector] = selectors.DefaultSelector) -> Dict[str, Outcome]:
     """One outcome per address of ``addrs``: every socket made first, then every connect started, then one select
-    loop inside ``bound_s``; an address still pending at the bound is ``(BLOCKED, TIMEOUT)``. Every socket is closed
-    before this returns."""
+    loop inside ``bound_s``, then one non-blocking select of whatever is still pending; an address still pending after
+    that is ``(BLOCKED, TIMEOUT)``. Every socket is closed before this returns."""
     out: Dict[str, Outcome] = {}
     socks: Dict[str, socket.socket] = {}
     try:
@@ -134,6 +134,18 @@ def connect_all(addrs: Sequence[str], *, bound_s: float = CONNECT_S,
                 out[ip] = classify(code)
         if pending:
             sel = selector()
+
+            def settle(ready: list) -> None:
+                for key, _ in ready:
+                    ip = key.data
+                    s = pending.pop(ip)
+                    sel.unregister(s)
+                    try:
+                        code = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    except OSError as e:
+                        out[ip] = (UNKNOWN, errno_name(e.errno or 0))
+                        continue
+                    out[ip] = (CONNECTED, "") if code == 0 else classify(code)
             try:
                 for ip, s in pending.items():
                     sel.register(s, selectors.EVENT_WRITE, ip)
@@ -142,16 +154,11 @@ def connect_all(addrs: Sequence[str], *, bound_s: float = CONNECT_S,
                     left = end - monotonic()
                     if left <= 0:
                         break
-                    for key, _ in sel.select(left):
-                        ip = key.data
-                        s = pending.pop(ip)
-                        sel.unregister(s)
-                        try:
-                            code = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-                        except OSError as e:
-                            out[ip] = (UNKNOWN, errno_name(e.errno or 0))
-                            continue
-                        out[ip] = (CONNECTED, "") if code == 0 else classify(code)
+                    settle(sel.select(left))
+                if pending:
+                    # The bound passed with sockets pending; a handshake that finished while this process was not
+                    # running (descheduled past ``end``) is read here, so it is never reported as a timeout.
+                    settle(sel.select(0))
             finally:
                 sel.close()
             for ip in pending:
