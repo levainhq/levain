@@ -75,6 +75,7 @@
   // idle store). The page draws the age from the stamp against the server's clock and redraws it on its own timer:
   // AGE_TICK_MS is that timer's one interval, so a display tier can slow or stop every age on the page by changing it.
   const AGE_TICK_MS = 30000;
+  const CALM_AGE_TICK_MS = 120000;       // the same timer under Calm: slower, never stopped, so every age stays true
   const SAVE_STAMP = "last save at";
   let serverOffsetMs = 0;       // the server's clock minus this browser's, as of the last snapshot
   const serverNow = () => Date.now() + serverOffsetMs;
@@ -95,6 +96,9 @@
     return Object.assign({}, m, { label: "last save", value: iso ? savedAge(iso, nowMs || serverNow()) : "unknown", age_at: iso });
   }
   let ageTimer = 0;
+  // Calm (one page control): the page reads as if the OS asked for reduced motion. The class on <html> is the one predicate every
+  // reader (dashboard.css, topology_view.js, sky.js, the age timer) tests; the choice is kept per browser, absent storage = full.
+  const isCalm = () => typeof document !== "undefined" && !!document.documentElement && !!document.documentElement.classList && document.documentElement.classList.contains("calm");
   function tickAges() {
     let any = 0;
     for (const n of (typeof document !== "undefined" && document.querySelectorAll ? Array.from(document.querySelectorAll("[data-age-at]")) : [])) {
@@ -118,7 +122,7 @@
       node.dataset.ageRead = m.read || "";
       node.dataset.ageDetail = typeof m.detail === "string" ? m.detail : "";
     }
-    if (!ageTimer) ageTimer = root.setInterval(tickAges, AGE_TICK_MS);
+    if (!ageTimer) ageTimer = root.setInterval(tickAges, isCalm() ? CALM_AGE_TICK_MS : AGE_TICK_MS);
     return node;
   }
 
@@ -2020,11 +2024,30 @@
     if (keep) { try { if (isTheme(t)) root.localStorage.setItem(THEME_KEY, t); else root.localStorage.removeItem(THEME_KEY); } catch (_) { /* the page still switched */ } }
     paintThemeSwitch();
   }
+  // ---- Calm: a stored choice sets html.calm before the body paints; the page's controls and the three motion readers follow it
+  const CALM_KEY = "levain_cockpit_calm";
+  function storedCalm() { try { return root.localStorage.getItem(CALM_KEY) === "1"; } catch (_) { return false; } }
+  function paintCalmSwitch() {
+    const on = isCalm();
+    for (const b of document.querySelectorAll("[data-calm-toggle]")) {
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+      b.textContent = on ? "Calm on" : "Calm off";
+    }
+  }
+  function setCalm(on, keep) {
+    const html = pageRoot();
+    if (html && html.classList) { if (on) html.classList.add("calm"); else html.classList.remove("calm"); }
+    if (keep) { try { if (on) root.localStorage.setItem(CALM_KEY, "1"); else root.localStorage.removeItem(CALM_KEY); } catch (_) { /* the page still switched */ } }
+    if (ageTimer) { root.clearInterval(ageTimer); ageTimer = root.setInterval(tickAges, on ? CALM_AGE_TICK_MS : AGE_TICK_MS); }
+    if (typeof root.dispatchEvent === "function" && typeof root.Event === "function") root.dispatchEvent(new root.Event("levain-calm"));
+    paintCalmSwitch();
+  }
   // run as this file loads (it is in the <head>): the theme is set before the body paints, so a stored light theme never flashes dark
   (function earlyTheme() {
     const html = pageRoot();
     const t = queryTheme() || storedTheme();
     if (html && html.dataset && t) html.dataset.theme = t;
+    if (html && html.classList && storedCalm()) html.classList.add("calm");
   })();
   // ---- the layout (K5): the order of a zone's cards and which panels are folded, kept per browser under one key, the way the theme is.
   // {"v":1,"zones":{"<zone id>":{"order":["<card key>",...]}},"collapsed":["<card key>",...]}; a card's key is its first panel id, and a folded card folds all its panels.
@@ -2672,6 +2695,10 @@
       const b = ev.target && ev.target.closest ? ev.target.closest("[data-theme-set]") : null;
       if (b) setTheme(b.dataset.themeSet, true);
     });
+    paintCalmSwitch();
+    document.addEventListener("click", (ev) => {
+      if (ev.target && ev.target.closest && ev.target.closest("[data-calm-toggle]")) setCalm(!isCalm(), true);
+    });
     document.addEventListener("click", (ev) => {
       if (!(ev.target && ev.target.closest && ev.target.closest("[data-layout-reset]"))) return;
       const D = root.LevainDashboard;
@@ -2714,7 +2741,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, AGE_TICK_MS, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

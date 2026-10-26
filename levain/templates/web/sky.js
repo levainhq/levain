@@ -273,7 +273,8 @@
     var opts = { windowHours: o.windowHours || 14, topRows: o.topRows || 5, pinnedRows: o.pinnedRows || [], single: o.single || '', size: size, dialect: dialectOf(value) };
     var clock = o.now || function () { return Date.now(); };
     var reduce = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
-    var ambientOn = o.ambient !== false && !strip && !(reduce && reduce.matches);
+    var calmOn = function () { var h = document.documentElement; return !!(h && h.classList && h.classList.contains('calm')); };   // the page's Calm control: the same as the OS asking
+    var ambientOn = o.ambient !== false && !strip && !(reduce && reduce.matches) && !calmOn();
 
     var root = el('div', { class: 'sky-panel' });
     root.style.position = 'relative';
@@ -335,6 +336,8 @@
     });
     function onReduce() { if (reduce && reduce.matches && ambientOn) { ambientOn = false; setToggle(); meteors = []; draw(); } }
     if (reduce && reduce.addEventListener) reduce.addEventListener('change', onReduce);
+    function onCalm() { if (calmOn() && ambientOn) { ambientOn = false; setToggle(); meteors = []; draw(); } }
+    window.addEventListener('levain-calm', onCalm);
     setToggle();
 
     var xOf = function (t, now) { var span = opts.windowHours * 3600000 / nowAt; return gutter + (W - gutter - padR) * ((t - (now - opts.windowHours * 3600000)) / span); };
@@ -640,6 +643,7 @@
         if (raf) { cancelAnimationFrame(raf); stats.pending--; raf = 0; }
         clearInterval(timer); if (ro) ro.disconnect(); else window.removeEventListener('resize', resize);
         if (reduce && reduce.removeEventListener) reduce.removeEventListener('change', onReduce);
+        window.removeEventListener('levain-calm', onCalm);
         if (themeObs) themeObs.disconnect();
         if (scheme && scheme.removeEventListener) scheme.removeEventListener('change', repaint);
         root.remove();
