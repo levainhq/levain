@@ -18,6 +18,7 @@ from levain.consent.adapters import claude_code as cc
 from levain.consent.adapters import codex as cx
 from levain.consent.queue import ConsentQueue, authority_source
 from levain.consent.record import ExternalGateRequest
+from levain.firing import confinement
 
 H = Path("/Users/someone")
 ENV: dict[str, str] = {"HOME": str(H)}
@@ -67,6 +68,10 @@ ROWS = [
     ("cc.decide", lambda t: cc.decide(EVENT, _queue(t), cc.AdapterSettings(), home=H), "environ"),
     ("cc.gate", lambda t: cc.gate(EVENT, _queue(t), cc.AdapterSettings(), home=H), "environ"),
     ("cc.permission_context", lambda t: cc.permission_context(t, home=H), "environ"),
+    ("cc.protected_paths", lambda t: cc.protected_paths(t, cc.AdapterSettings(), home=H), "environ"),
+    ("cc.levain_home_protected", lambda t: cc.levain_home_protected(H, None), "environ"),
+    ("confinement.levain_home_spellings", lambda t: confinement.levain_home_spellings(H), "environ"),
+    ("confinement.levain_home_base", lambda t: confinement.levain_home_base(H), "environ"),
     ("cx.decide", lambda t: cx.decide(EVENT, _queue(t), cx.AdapterSettings(), environ=ENV), "home"),
 ]
 
@@ -158,9 +163,6 @@ def _core_call(qdir, repo, environ, home, monkeypatch=None, recording=None):
         return out, pc.queue
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="levain.firing.confinement.levain_home_spellings still reads "
-                   "os.environ['LEVAIN_HOME'] on the core path (protected_paths -> levain_home_protected); "
-                   "confinement.py is outside CH-D1c-A's files (lane-d1ca RETURN, observation 1)")
 def test_core_reads_no_process_environment(tmp_path, monkeypatch):
     """The core path (``permission_context`` + ``decide``) for a Write of a plain file inside a scratch git
     repository (not a config path, so the classifier asks git where hooks run) reads nothing of the process
@@ -184,24 +186,16 @@ def test_core_reads_no_process_environment(tmp_path, monkeypatch):
     assert recording.seen == [], recording.seen
 
 
-def test_core_reads_no_process_environment_but_the_levain_home_spelling(tmp_path, monkeypatch):
-    """The xfail above, with :func:`levain.firing.confinement.levain_home_spellings` replaced by one that reads no
-    environment: then nothing is read, so that function is the one reader left on the path (its ``LEVAIN_HOME``
-    read, the only access the run above records)."""
-    from levain.firing import confinement
-
-    monkeypatch.setattr(confinement, "levain_home_spellings", lambda home: (home / ".levain", [home / ".levain"]))
-    cc.import_site_dirs()
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
-    qdir = tmp_path / "q"
-    qdir.mkdir(mode=0o700)
-    environ = {"HOME": str(tmp_path / "h"), "LEVAIN_UNCONFINED": "1", "CLAUDE_PID": "1",
-               "XDG_CONFIG_HOME": str(tmp_path / "xdg")}
-    recording = _Recording()
-    out, _ = _core_call(qdir, repo, environ, tmp_path / "h", monkeypatch, recording)
-    assert recording.seen == [] and out is None
+def test_the_levain_home_protected_is_named_by_the_environ_passed(tmp_path, monkeypatch):
+    """``protected_paths`` (and the floor's own derivation under it) takes ``LEVAIN_HOME`` from the mapping it is
+    handed: the process's ``$LEVAIN_HOME`` names some other directory and is neither read nor protected."""
+    bound, ambient = tmp_path / "bound", tmp_path / "ambient"
+    monkeypatch.setenv("LEVAIN_HOME", str(ambient))
+    environ = {"HOME": str(tmp_path / "h"), "LEVAIN_HOME": str(bound)}
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), home=tmp_path / "h", environ=environ)
+    assert bound in got and ambient not in got
+    assert confinement.levain_home_base(tmp_path / "h", environ=environ) == bound
+    assert confinement.levain_home_base(tmp_path / "h", environ={}) == tmp_path / "h" / ".levain"
 
 
 def test_core_resume_record_comes_from_the_environ_passed(tmp_path):
