@@ -706,15 +706,9 @@ def _v1_entry(r):
 
 
 def _rendered_probe(w):
-    from levain.contracts import canon
     from tests.test_slot_s2f3_start import _rendered
 
-    base = (w.L / "routes" / "base.json").read_bytes()
-    (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(
-        {"format": "levain-routes-base/1", "routes": [_v1_entry(r) for r in _base_v2()["routes"]]}))
-    s = _rendered(w)          # render reads route types and egress hosts only; the probe reads the full /2 map
-    (w.L / "routes" / "base.json").write_bytes(base)
-    return s
+    return _rendered(w)       # on the full /2 map: render copies the session's entries into the front's file (3b-8a)
 
 
 def _record(w, slot="e0"):
@@ -809,12 +803,7 @@ def test_t6_active_session_is_probeable(penv):
     from tests.test_slot_s2f3_start import _started
 
     w, la, table, pr = penv
-    from levain.contracts import canon
-    v1 = canon.canonical_bytes({"format": "levain-routes-base/1", "routes": [
-        _v1_entry(r) for r in _base_v2()["routes"]]})
-    (w.L / "routes" / "base.json").write_bytes(v1)
-    s = _started(w, la, table)
-    (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(_base_v2()))
+    s = _started(w, la, table)                  # on penv's full /2 map (render copies its entries, 3b-8a)
     assert w.state(s).state == "ACTIVE"
     assert w.main(["probe", s])[1]["probe"] == "closed"
 

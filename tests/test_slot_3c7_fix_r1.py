@@ -132,6 +132,16 @@ def _render(d, s: str, blob: bytes) -> dict:
     return d.w.main(["render", s], blob, uid=F2_DISPATCH)[1]
 
 
+@pytest.fixture
+def pinning_stand_in(monkeypatch):
+    """3b-8a T5 refuses every ticketed egress render ``route-policy-unavailable`` until S2 builds route pinning
+    (CONTRACT §3.3). A test of what a ticketed render does PAST that refusal (its first CAS, a post-CAS REVOKE) lifts
+    it here, so the machinery S2 re-opens stays held; the refusal itself is held by ``test_slot_3b8a_f1``."""
+    from levain.slot import runtime_helper as H
+
+    monkeypatch.setattr(H, "refuse_ticketed_front", lambda a: None)
+
+
 def test_prepare_failing_after_attach_leaves_render_refused(dispatch):
     """A prepare whose alloc write of the facts fails after ATTACH bound the ticket: CONTROL holds the session
     (ALLOCATED, ticket bound), alloc carries the ticket without the facts, and render refuses `ticket-facts-missing`
@@ -172,6 +182,7 @@ def test_render_refuses_a_blob_off_its_ticket(dispatch, change, name):
     assert w.calls[calls:] == [] and w.state(s).state == R.ALLOCATED and w.alloc(s).policy is None
 
 
+@pytest.mark.usefixtures("pinning_stand_in")
 def test_render_on_its_ticket_passes_the_gate(dispatch):
     """The blob the ticket names passes the second gate: render goes on to its first CAS."""
     d, w = dispatch, dispatch.w

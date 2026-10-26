@@ -168,6 +168,8 @@ LAZY_SITES = {
     'levain/slot/root_tree.py::tree_steps::from levain.slot.generation import generation_id': 'root',
     'levain/slot/runtime_helper.py::_default_client::from levain.slot.control_client import ControlClient': 'root',
     'levain/slot/runtime_helper.py::_front_interlock::from levain.slot import start as SS': 'root',
+    # root: render builds the front's policy file and reads it with the front's own parser (3b-8a)
+    'levain/slot/runtime_helper.py::front_policy_bytes::from levain.broker import front as FR': 'root',
     'levain/slot/runtime_helper.py::read_operator_uid::from levain.slot.install_helper import parse_operator_record': 'root',
     'levain/slot/runtime_helper.py::_start::from levain.slot import start as SS': 'root',
     'levain/slot/runtime_helper.py::_teardown::from levain.slot import start as SS': 'root',

@@ -43,9 +43,15 @@ BOOT = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
 BUNDLE_OID = b"0123456789abcdef0123456789abcdef01234567"
 BUNDLE = (b"# v2 git bundle\n" + BUNDLE_OID + b" HEAD\n" + BUNDLE_OID + b" refs/heads/main\n\n"
           + b"bundle-bytes " * 64)
+#: a base map the front's parser takes (render copies the session's entries into R/gw/slot<n>/session.json, 3b-8a)
 BASE = {"format": "levain-routes-base/1", "routes": [
-    {"route": "anthropic", "type": "brokered"}, {"route": "github", "type": "egress", "hosts": ["github.com"]},
-    {"route": "claude-sub", "type": "subscription_passthrough"}]}
+    {"route": "anthropic", "type": "brokered", "hosts": ["api.anthropic.com"],
+     "upstream": {"scheme": "https", "host": "api.anthropic.com", "base_path": ""}, "credential": "anthropic",
+     "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}], "headers": {}, "body_cap": 1048576,
+                  "body_codec": "anthropic-messages"},
+     "max_call_microdollars": 2000000, "max_session_microdollars": 50000000},
+    {"route": "github", "type": "egress", "hosts": ["github.com"]},
+    {"route": "claude-sub", "type": "subscription_passthrough", "hosts": ["claude.ai"]}]}
 
 
 def _blob(**kw) -> bytes:
@@ -125,6 +131,11 @@ class World:
             (L / d).mkdir(parents=True, exist_ok=True)
             os.chmod(L / d, mode)
         (self.R / "control").mkdir(parents=True)
+        (self.R / "gw").mkdir(mode=0o755)
+        (L / "gw").mkdir(mode=0o755)
+        for i in range(egress):   # §2.2 R/gw/slot<n>: the front account's (here: this test's uid, chowned_uid)
+            (self.R / "gw" / f"slot{i}").mkdir(mode=0o750)
+            (L / "gw" / f"slot{i}").mkdir(mode=0o750)    # 3b-8a T1: the front's log dir, setup's row
         (L / "slots" / "pool.lock").write_bytes(b"")
         for slot in [SlotId("egress", i) for i in range(egress)] + [SlotId("none", i) for i in range(verifier)]:
             d = slot.slot_dir(L)
@@ -553,16 +564,19 @@ def test_render_order_observed(world):
     spec = world.fronts.procs[pid]["spec"]
     assert (spec["target"], spec["uid"], spec["keep_fds"], spec["extra_env"], spec["profile"]) == \
         ("front", 898, [H.GO_FD], {H.GO_FD_ENV: str(H.GO_FD)}, None)
-    # Lane F3 b: the stub runs with root's FIXED args (its argparse needs --unix/--port + --log).
-    assert spec["argv"][-7:] == [H.FRONT_MODULE, "--unix", "/run/levain/gw/slot0/gw.sock", "--slot", "0",
-                                 "--log", "/dev/null"]
+    # 3b-8a: the gateway front runs with root's args (its listener, policy, log, keys' socket, the GO fd).
+    gw = world.R / "gw" / "slot0"
+    assert spec["argv"][-13:] == [H.FRONT_MODULE, "--unix", str(gw / "gw.sock"), "--slot-uid", "899",
+                                  "--policy", str(gw / "session.json"),
+                                  "--log", str(world.L / "gw" / "slot0" / "front.log"),          # 3b-8a T1
+                                  "--keys", str(world.R / "keys" / "front.sock"), "--go-fd", str(H.GO_FD)]
     assert world.fronts.alive() == [pid]                                # left running, detached
 
 
 def test_render_front_program_is_a_parameter(world):
     s = _prepared(world)
     world.seams.front_module = "levain.gateway.front"
-    world.seams.front_args = lambda host, slot: ("--config-fd", "5")
+    world.seams.front_args = lambda host, slot, **kw: ("--config-fd", "5")
     assert world.main(["render", s], _blob())[1]["ok"]
     (p,) = world.fronts.procs.values()
     assert p["spec"]["argv"][-3:] == ["levain.gateway.front", "--config-fd", "5"]

@@ -64,7 +64,7 @@ def test_a_module_name_differing_only_in_case_is_not_a_module(tmp_path, monkeypa
 
 def test_roots_include_the_dynamically_run_modules():
     roots = set(rc._entry_modules())
-    assert {"levain.slot.forwarder", "levain.slot.wall", "levain.broker.stub"} <= roots
+    assert {"levain.slot.forwarder", "levain.slot.wall", "levain.broker.front"} <= roots
 
 
 QBROKER = "levain.slot.services.qbroker"

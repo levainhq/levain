@@ -444,7 +444,8 @@ def _read_slot_dirs(slots: Path) -> tuple[dict[str, tuple[str, str]], list[str]]
 
 
 def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
-                          free_bytes: Any = None, now: float | None = None) -> list[CheckResult]:
+                          free_bytes: Any = None, now: float | None = None,
+                          seams: Any = None) -> list[CheckResult]:
     """Read-only rows over the isolation install's facts the OPERATOR can read (doctor runs as the operator): the
     pool's configured counts (``policy/pool``), the slots' state files (root-owned 0644 in 0755 dirs; the group is
     ``wheel`` on macOS) and the store volume's free space. Nothing is leased, probed or run as a slot user. A fact that
@@ -481,6 +482,7 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
             return [CheckResult("agent sessions", False, f"partially installed: no slots directory at {store}",
                                 "The isolation install is incomplete; its install helper repairs it.")]
         rows = _slot_rows(store, layout, R, Refused)
+        rows += _front_log_rows(store, host, layout, R, seams)
     except OSError as exc:
         rows = [CheckResult("agent slots", True, f"could not be read ({_slot_why(exc)})", warn=True)]
     else:
@@ -613,6 +615,78 @@ def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResu
                             "The pool is below its configured counts; its install helper replenishes it.")]
     return [CheckResult("agent slots", True, detail + (f"; not usable (extra): {', '.join(bad)}" if bad else "")
                         + note)]
+
+
+def _front_log_rows(store: Path, host: str, layout: Any, R: Any, seams: Any = None) -> list[CheckResult]:
+    """The ``agent front logs`` row: for each in-service egress slot, what a session start would refuse about its
+    front log dirs (``L/gw/``, ``L/gw/slot<n>/``, S1 3b-8a), asked of the runtime itself
+    (``runtime_helper.check_front_log_dirs``: render's own front-account lookup and ``prepare_front_log``'s own walk
+    up to its final open, read-only), never re-derived here. Every slot is gathered into the one row, each named
+    under its own clause only. A ``store-missing`` there is a dir that is genuinely absent (the walk raises it only on
+    ``FileNotFoundError``): an install made before the dir existed, said with the repair line. Any other refusal
+    (``bad-root``: a link, a non-directory, a wrong owner or mode; ``account-missing``, ``account-out-of-range``) is
+    said refused. What the walk cannot read is said not judged, never refused. The row's verdict is the worst real
+    one: any refusal fails it, absences alone make it upgrade-pending, unread alone warns. No egress slot: no row.
+    ``seams``: the runtime's, for tests (its ``store`` is set to ``store``); the default reads the real accounts."""
+    import dataclasses
+
+    from levain.slot import Refused
+    from levain.slot import runtime_helper as H
+    from levain.slot.ids import SlotId
+
+    found, _ignored = _read_slot_dirs(store / "slots")
+    tags = sorted((t for t, v in found.items() if t[0] == "e" and v[0] not in R.OUT_OF_SERVICE),
+                  key=lambda t: int(t[1:]))
+    if not tags:
+        return []
+    name = "agent front logs"
+    seams = H.Seams(host=host, store=store) if seams is None else dataclasses.replace(seams, store=store)
+    try:
+        st = H.Store(seams)
+    except Refused as exc:
+        if exc.name == "bad-root":
+            return [CheckResult(name, False, f"{store} is not root's alone; the runtime refuses it (bad-root), so no "
+                                "session can be started", f"Look at its owner and mode; `{layout.repair_line(host)}` "
+                                "sets them back to setup's.")]
+        # Store maps every open error of the root to store-missing; the caller saw the root there, so it is unreadable
+        return [CheckResult(name, True, f"could not be read ({_slot_why(exc)})", warn=True)]
+    absent: dict[str, list[str]] = {}       # refusal text -> tags, in the order first met
+    failed: dict[str, list[str]] = {}
+    unread: list[str] = []
+    try:
+        for t in tags:
+            try:
+                refusals = H.check_front_log_dirs(st, SlotId("egress", int(t[1:])))
+            except (OSError, LookupError) as exc:   # unreadable is said as unreadable, never as present or absent
+                unread.append(f"{t} ({_slot_why(exc)})")
+                continue
+            for r in refusals:
+                (absent if r.name == "store-missing" else failed).setdefault(f"{r.detail} ({r.name})", []).append(t)
+    finally:
+        st.close()
+
+    def said(header: str, groups: dict[str, list[str]]) -> list[str]:
+        return [header + "; ".join(f"{', '.join(ts)}: {why}" for why, ts in groups.items())] if groups else []
+
+    # each slot under its own verdict only: a slot never judged is never said refused (codex L3 r5)
+    clauses = (said("refused, so no session on them starts: ", failed)
+               + said("refused until the missing dir is made: ", absent)
+               + (["could not be checked, so not judged: " + ", ".join(unread)] if unread else []))
+    detail = ". ".join(clauses)
+    unjudged = (" What could not be checked is not judged; run the doctor again once it can read them."
+                if unread else "")
+    if failed:
+        return [CheckResult(name, False, detail,
+                            f"Look at what is named. `{layout.repair_line(host)}` sets each dir's owner and mode back "
+                            "to setup's; it does not replace a link or a file standing where a dir belongs, and it "
+                            "never makes a missing account (undo, then setup, does)." + unjudged)]
+    if absent:
+        return [CheckResult(name, False, detail,
+                            f"Run `{layout.repair_line(host)}` once (an install made before the front log moved to the "
+                            "store has none)." + unjudged, upgrade_pending=True)]
+    if unread:
+        return [CheckResult(name, True, detail, unjudged.strip(), warn=True)]
+    return [CheckResult(name, True, f"{len(tags)} egress slot(s), each with its front log directory")]
 
 
 #: V13 (O4, N10): the record root writes after each firewall probe, beside the slot's state (levain.slot.probe's

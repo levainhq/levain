@@ -40,6 +40,12 @@ def install_helper_path(host: HostOS) -> Path:
     return HELPER_DIR[host] / "install-helper"
 
 
+def repair_line(host: HostOS) -> str:
+    """The one command that re-applies setup's rows to an existing install (a bare ``repair``): the remedy a refusal
+    or a doctor row names for a row an older install lacks."""
+    return f"sudo {install_helper_path(host)} repair"
+
+
 def service_entry_path(host: HostOS) -> Path:
     """The one bootstrap entry every service unit runs (CONTRACT §23), beside the helpers' entries."""
     return HELPER_DIR[host] / "service-entry"
@@ -117,6 +123,8 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         # new file takes its creator's primary group (_levain_control) otherwise, and _levain_dispatch could not read it.
         Row(L / "lineage", "_levain_control", "levain-lineage", 0o2750),
         Row(L / "keys", "_levain_keys", "_levain_keys", 0o700),
+        # S1 3b-8a T1: the fronts' tunnel logs, one dir per egress slot below it (``slot_store_rows``).
+        _root(host, L / "gw", 0o755),
         _root(host, L / "routes", 0o755),
         # S1 3c-4: CONTROL writes the route maps here, keys reads them. Setgid, so every file CONTROL creates takes
         # _levain_keys: on Linux a new file takes its creator's primary group (_levain_control) otherwise, and keys
@@ -160,10 +168,15 @@ def policy_rows(host: HostOS) -> list[Row]:
 
 
 def slot_store_rows(host: HostOS, slot: SlotId) -> list[Row]:
-    """``L/slots/{e,v}<n>/``, its lock, and (egress class) its ``keep/`` dir (CONTRACT §2.1)."""
+    """``L/slots/{e,v}<n>/``, its lock, and (egress class) its ``keep/`` dir (CONTRACT §2.1) and its front's log dir
+    ``L/gw/slot<n>/`` (S1 3b-8a T1): the front account's, so it can rotate its log there, group root and setgid, so a
+    log the front makes takes root's group on Linux too (macOS gives a new file its dir's group either way), never the
+    slot's; no other access, so the slot can neither list nor read it."""
     rows = [_root(host, slot.slot_dir(STORE[host]), 0o755), _root(host, slot.lock_path(STORE[host]), 0o600, "file")]
     if slot.slot_class == "egress":
         rows.append(_root(host, slot.slot_dir(STORE[host]) / "keep", 0o700))
+        rows.append(Row(STORE[host] / "gw" / f"slot{slot.index}", f"_levain_gw{slot.index}", ROOT_GROUP[host],
+                        0o2750))
     return rows
 
 

@@ -53,7 +53,7 @@ from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
 from levain.slot.ids import SlotId, in_own_range
-from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE, admits_root, store_dir_row
+from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE, admits_root, repair_line, store_dir_row
 from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
                                          bind_stdin, ok_line, parse_runtime_argv, parse_stdin, refusal_line)
 
@@ -75,8 +75,14 @@ GO_FD = 4
 #: DECISION: the front learns its GO fd from this env var (the front's env is ``extra_env`` alone, wall §8.2).
 GO_FD_ENV = "LEVAIN_GO_FD"
 GO_BYTE = b"G"         # DECISION: §5.1 (5b) "writes the go byte" names no value
-#: §5.1 render (4): the front program is a parameter; session 2's is the stub, session 3a's the gateway front.
-FRONT_MODULE = "levain.broker.stub"
+#: §5.1 render (4): the front program is a parameter: the gateway front (3b-8a); ``levain.broker.stub`` with
+#: :func:`stub_front_args` is session 2's.
+FRONT_MODULE = "levain.broker.front"
+#: §2.2 ``R/gw/slot<n>/``: the front's policy file (§4.3 "the front's view", render (3)) and its tunnel log.
+FRONT_POLICY_NAME = "session.json"
+FRONT_LOG_NAME = "front.log"
+#: §4.3: render's copy of a base-map entry drops these (the front holds no key and meters nothing).
+FRONT_DROPPED_FIELDS = ("credential", "prices")
 
 #: §2.1 ``keep/``: the vendor credential file a slot parks (END's ``CREDENTIAL_FILES``, by vendor).
 CREDENTIAL_NAME: Mapping[str, str] = {"claude": ".credentials.json", "codex": "auth.json"}
@@ -464,14 +470,276 @@ def make_cgroup(path: str, *, mkdir: Callable[[str, int], None] = os.mkdir,
             raise Refused("cgroup-untrusted", f"{cur}: uid {st.st_uid} mode {stat.S_IMODE(st.st_mode):o}")
 
 
-def stub_front_args(host: str, slot: SlotId) -> Tuple[str, ...]:
+def stub_front_args(host: str, slot: SlotId, **_: object) -> Tuple[str, ...]:
     """The FIXED argv root gives the session-2 front, ``levain.broker.stub`` (§5.1 render (4), lane F3 b): the
     Linux unix shape on ``R/gw/slot<n>/gw.sock`` (§2.2), the macOS TCP shape on ``gwport_n``. Nothing in it is
-    slot- or session-supplied. DECISION: its log is ``/dev/null`` (the stub has nothing a session needs kept)."""
+    slot- or session-supplied. DECISION: its log is ``/dev/null`` (the stub has nothing a session needs kept).
+    Takes and ignores :func:`gateway_front_args`'s keywords, so either can be ``Seams.front_args``."""
     if host == "darwin":
         return ("--port", str(RD.gwport_for(host, slot)), "--log", "/dev/null")
     sock = RUN[host] / "gw" / f"slot{slot.index}" / "gw.sock"
     return ("--unix", str(sock), "--slot", str(slot.index), "--log", "/dev/null")
+
+
+def gateway_front_args(host: str, slot: SlotId, *, run: Path, store: Path, slot_uid: int) -> Tuple[str, ...]:
+    """The argv root gives ``levain.broker.front`` (§5.1 render (4)): the listener (Linux: ``R/gw/slot<n>/gw.sock``
+    serving only ``slot_uid``, the alloc's slot account; macOS: ``127.0.0.1:gwport_n``), the policy file render (3)
+    wrote in ``R/gw/slot<n>/``, the tunnel log in ``L/gw/slot<n>/`` (3b-8a T1: an audit trail, so on the store, which
+    a reboot keeps), keys' ``R/keys/front.sock`` (the STATUS connection, §4.2) and the GO pipe's fd. Every path is
+    root's run dir or store; nothing is slot- or session-supplied."""
+    gw = run / "gw" / f"slot{slot.index}"
+    shape: Tuple[str, ...]
+    if host == "darwin":
+        shape = ("--port", str(RD.gwport_for(host, slot)))
+    else:
+        shape = ("--unix", str(gw / "gw.sock"), "--slot-uid", str(slot_uid))
+    return (*shape, "--policy", str(gw / FRONT_POLICY_NAME),
+            "--log", str(store / "gw" / f"slot{slot.index}" / FRONT_LOG_NAME),
+            "--keys", str(run / "keys" / "front.sock"), "--go-fd", str(GO_FD))
+
+
+def front_session_routes(base: Mapping[str, object], routes: Sequence[str], *,
+                         dispatch: bool = False) -> List[dict]:
+    """The session's routes as the front reads them (§4.3 "the front's view"): each id's base-map entry, in the
+    blob's order, with :data:`FRONT_DROPPED_FIELDS` removed. An id with no base-map entry is refused
+    ``front-policy-unavailable``. ``dispatch`` (a dispatch or planner session): ``max_session_microdollars`` is
+    dropped too, as a dispatch-session file carries none (the ticket's reservation is the cap, kept by keys).
+    Render never brings a ticketed session here: :func:`refuse_ticketed_front` refuses it ``route-policy-unavailable`` first
+    (3b-8a T5), since its brokered entry is to come from the ticket's pinned generation file, its digest re-checked
+    (CONTRACT §3.3 ROUTE PINNING, S2), never from the base map."""
+    by_id = {r.get("route"): r for r in base.get("routes", ()) if isinstance(r, dict)}   # type: ignore[union-attr]
+    drop = FRONT_DROPPED_FIELDS + (("max_session_microdollars",) if dispatch else ())
+    out: List[dict] = []
+    for rid in routes:
+        entry = by_id.get(rid)
+        if entry is None:
+            raise Refused("front-policy-unavailable", f"route {rid} has no base-map entry")
+        out.append({k: v for k, v in entry.items() if k not in drop})
+    return out
+
+
+def front_policy_bytes(store: Store, a: R.Alloc, routes: Sequence[str]) -> bytes:
+    """``R/gw/slot<n>/session.json``'s bytes for alloc ``a`` and the blob's ``routes``: format, kind, session, the
+    routes (:func:`front_session_routes` over ``L/routes/base.json``) and the incarnation, the lease's ``lease_seq``
+    (render (2)'s DECISION). The front's own parser (``levain.broker.front.load_policy``) reads them here first: a
+    file it would refuse is ``front-policy-refused``. An alloc carrying a ticket is ``route-policy-unavailable``
+    (3b-8a T5): the base map is read for a session with no ticket only (render refuses it earlier too)."""
+    refuse_ticketed_front(a)
+    # on the call: the front's import closure (asyncio, h11) stays out of every other verb's start
+    from levain.broker import front as FR
+
+    data = store.read(("routes",), "base.json")
+    if data is None:
+        raise Refused("base-map-missing", "L/routes/base.json")
+    routes_view = front_session_routes(_canon_obj(data, "base-map"), routes, dispatch=a.kind in FR.DISPATCH_KINDS)
+    doc = {"format": FR.POLICY_FORMAT, "kind": a.kind, "session": a.session, "routes": routes_view,
+           "incarnation": a.lease_seq}
+    out = canon.canonical_bytes(doc)
+    try:
+        FR.load_policy(out)
+    except FR.PolicyError as e:
+        raise Refused("front-policy-refused", str(e)[:200]) from None
+    return out
+
+
+def refuse_ticketed_front(a: R.Alloc) -> None:
+    """3b-8a T5, until S2 builds CONTRACT §3.3 ROUTE PINNING: a ticketed egress session (dispatch or planner) has no
+    front policy root can build, so it is refused by name. The base map's entry is never a ticket's, even under the
+    same id."""
+    if a.ticket is not None and a.slot.slot_class == "egress":
+        raise Refused("route-policy-unavailable", "a ticketed session's front policy needs route pinning (S2)")
+
+
+def _front_dir_ok(st: os.stat_result, seams: "Seams", front_uid: int) -> bool:
+    """A front-owned dir (``R/gw/slot<n>/``, ``L/gw/slot<n>/``): the front account's, no group or other write."""
+    return st.st_uid == seams.chowned_uid(front_uid) and not st.st_mode & 0o022
+
+
+def write_front_policy(seams: "Seams", slot: SlotId, front_uid: int, data: bytes) -> None:
+    """Root writes ``R/gw/slot<n>/session.json`` (§2.2 row; here root : the front account's primary group, 0440).
+    ``R/`` and ``R/gw/`` must pass ``seams.trusted``; ``R/gw/slot<n>/`` is the front account's (its §2.2 row), so a
+    name left there is unlinked and the file made fresh, ``O_EXCL|O_NOFOLLOW`` at that dirfd: a planted link is never
+    followed. The file is fsynced, then its dir."""
+    where = f"gw/slot{slot.index}"
+    fds: List[int] = []
+    try:
+        fd = os.open(str(seams.R), _O_DIR)
+        fds.append(fd)
+        if not seams.trusted(os.fstat(fd)):
+            raise Refused("bad-root", f"{seams.R} is not root's alone")
+        fd = _openat_dir(fd, "gw", "gw")
+        fds.append(fd)
+        if not seams.trusted(os.fstat(fd)):
+            raise Refused("bad-root", f"{seams.R}/gw is not root's alone")
+        fd = _openat_dir(fd, f"slot{slot.index}", where)
+        fds.append(fd)
+        if not _front_dir_ok(os.fstat(fd), seams, front_uid):
+            raise Refused("bad-root", f"{where} is not the front account's alone")
+        # what is left there is the front account's (a dir, a link, a file); an object root cannot unlink, or one
+        # put back between the unlink and the exclusive open, is a refusal by name
+        try:
+            os.unlink(FRONT_POLICY_NAME, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise Refused("bad-root", f"{where}/{FRONT_POLICY_NAME}: {e.strerror}") from None
+        try:
+            f = os.open(FRONT_POLICY_NAME, _O_NEW, 0o440, dir_fd=fd)
+        except (FileExistsError, IsADirectoryError):
+            raise Refused("bad-root", f"{where}/{FRONT_POLICY_NAME} reappeared") from None
+        except OSError as e:
+            if e.errno != errno.ELOOP:
+                raise
+            raise Refused("bad-root", f"{where}/{FRONT_POLICY_NAME} reappeared") from None
+        try:
+            seams.chown(f, 0, seams.user_gid(front_uid), f"{where}/{FRONT_POLICY_NAME}")
+            os.fchmod(f, 0o440)
+            write_all(f, data)
+            seams.fsync(f)
+        finally:
+            os.close(f)
+        seams.fsync(fd)
+    finally:
+        for d in reversed(fds):
+            os.close(d)
+
+
+#: 3b-8a T1: the tunnel log's mode, front account : root (never the slot's group, so the slot cannot read it).
+FRONT_LOG_MODE = 0o640
+
+
+def _statat_dir(parent: int, name: str, where: str) -> os.stat_result:
+    """``name`` below ``parent`` stat'd without following a link and without opening it, so a caller who may search
+    ``parent`` but not read ``name`` gets a verdict: absent (``FileNotFoundError``, and nothing else) is
+    ``store-missing``; a link or any other non-directory is ``bad-root``, as :func:`_openat_dir` refuses them."""
+    try:
+        st = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        raise Refused("store-missing", where) from None
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refused("bad-root", f"{where} is not a directory")
+    return st
+
+
+def _open_front_log_dir(store: "Store", slot: SlotId, front_uid: Optional[int], *,
+                        open_slot: bool = True) -> Optional[int]:
+    """The checking half of :func:`prepare_front_log`: ``L/gw/`` opened through ``store.dir(..., trusted=True)`` (a
+    link, a non-directory, a wrong owner or a group/other-writable mode is ``bad-root``), then ``L/gw/slot<n>/``
+    stat'd below it by :func:`_statat_dir` and held to :func:`_front_dir_ok`. The stat needs search on ``L/gw/`` only,
+    never read on ``L/gw/slot<n>/`` (setup's row, ``layout.slot_store_rows``, is the front account's with group root
+    and no other access, so the operator running ``levain doctor`` cannot read it).
+    Only a miss of one of those two (each raises ``store-missing`` on ``FileNotFoundError`` and on nothing else) is
+    rewritten as the pre-move install, naming the dir that is missing and :func:`layout.repair_line`; a
+    ``store-missing`` from elsewhere keeps its own text.
+
+    With ``open_slot`` (root's caller), ``L/gw/slot<n>/`` is then opened ``O_NOFOLLOW|O_DIRECTORY`` through the same
+    ``L/gw/`` fd and refused ``bad-root`` unless the fd is the dir that was judged (its ``st_dev``, ``st_ino``) and
+    its own fstat still passes :func:`_front_dir_ok`: a dir moved, swapped, removed or re-moded between the stat and
+    the open is never used. The fd is returned for the caller to close.
+    None without ``open_slot``, or with ``front_uid`` None (no front account to judge the slot dir by: only ``L/gw/``
+    is walked). Any other ``OSError`` of the walk is raised as it is."""
+    seams = store.seams
+    name = f"slot{slot.index}"
+    where = f"gw/{name}"
+    gw = f"{store.path}/gw"
+    try:
+        with store.dir("gw", trusted=True) as gfd:
+            if front_uid is None:
+                return None
+            st = _statat_dir(gfd, name, where)
+            if not _front_dir_ok(st, seams, front_uid):
+                raise Refused("bad-root", f"{where} is not the front account's alone")
+            if not open_slot:
+                return None
+            try:
+                fd = _openat_dir(gfd, name, where)
+            except Refused as e:
+                if e.name != "store-missing":
+                    raise
+                raise Refused("bad-root", f"{where} changed while it was checked") from None
+            try:
+                got = os.fstat(fd)
+                if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
+                    raise Refused("bad-root", f"{where} changed while it was checked")
+                # the front account owns it and may chmod the same inode between the stat and the open
+                if not _front_dir_ok(got, seams, front_uid):
+                    raise Refused("bad-root", f"{where} is not the front account's alone")
+            except BaseException:
+                os.close(fd)
+                raise
+            return fd
+    except Refused as e:
+        if e.name != "store-missing" or e.detail not in (gw, where):
+            raise
+        what = (f"{gw} is missing, so the front log dir {store.path}/{where} is too" if e.detail == gw
+                else f"{store.path}/{where}: the front log dir is missing")
+        raise Refused("store-missing", f"{what} (an install made before it existed); run "
+                      f"`{repair_line(seams.host)}` once") from None
+
+
+def check_front_log_dirs(store: "Store", slot: SlotId, front_uid: Optional[int] = None) -> List[Refused]:
+    """What a session start on egress ``slot`` would refuse about its front log dirs, without making, chowning or
+    writing anything: each of the slot's accounts looked up as render's :func:`slot_ids` does (when ``front_uid`` is
+    not given), then :func:`prepare_front_log`'s own walk (:func:`_open_front_log_dir`) up to its final open, which
+    only root's caller makes (``levain doctor`` runs as the operator, who may search ``L/gw/`` but not read
+    ``L/gw/slot<n>/``). The refusals in the order the runtime meets them, empty when the start would pass them; every
+    refused account is listed (render stops at the first), then the walk (with no front account, its ``L/gw/`` half,
+    which needs no account). Raises the walk's other ``OSError`` (an unreadable dir) and whatever
+    ``seams.account_uid`` raises that is not a ``Refused``."""
+    found: List[Refused] = []
+    if front_uid is None:
+        ids: Dict[str, int] = {}
+        for name in slot.accounts:
+            try:
+                ids[name] = account_in_range(store.seams, name)
+            except Refused as e:
+                found.append(e)
+        front_uid = ids.get(slot.accounts[1])
+    try:
+        _open_front_log_dir(store, slot, front_uid, open_slot=False)
+    except Refused as e:
+        found.append(e)
+    return found
+
+
+def prepare_front_log(store: "Store", slot: SlotId, front_uid: int) -> None:
+    """3b-8a T1: ``L/gw/slot<n>/front.log``, root-prepared before the front starts. ``L/gw/`` must pass
+    ``seams.trusted`` (``store.dir(..., trusted=True)`` refuses it ``bad-root``); ``L/gw/slot<n>/`` is the front
+    account's (setup's row, ``layout.slot_store_rows``), no group or other write. Either dir missing (an install made
+    before the log moved to the store) is ``store-missing`` naming :func:`layout.repair_line`. Those checks are
+    :func:`_open_front_log_dir`, the walk :func:`check_front_log_dirs` runs read-only for ``levain doctor``; only here
+    is ``L/gw/slot<n>/`` then opened, and only if it is still the dir the walk judged. The log
+    is made ``O_EXCL|O_NOFOLLOW`` when absent; one already there (the slot's earlier sessions: an audit trail, never
+    truncated) must be a regular file with one link, owned by the front account or root. Either way it is then chowned
+    front account : root and set to :data:`FRONT_LOG_MODE`, so a log a front made under a loose umask is put right. A
+    link, a dir, a second hard link: ``bad-root``, nothing chowned through it."""
+    seams = store.seams
+    rel = f"gw/slot{slot.index}/{FRONT_LOG_NAME}"
+    fd = _open_front_log_dir(store, slot, front_uid)
+    try:
+        try:
+            f = os.open(FRONT_LOG_NAME, _O_NEW, FRONT_LOG_MODE, dir_fd=fd)
+        except FileExistsError:
+            try:
+                f = os.open(FRONT_LOG_NAME, _O_READ, dir_fd=fd)
+            except OSError as e:
+                raise Refused("bad-root", f"{rel}: {e.strerror}") from None
+            st = os.fstat(f)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 \
+                    or st.st_uid not in (seams.chowned_uid(front_uid), 0):
+                os.close(f)
+                raise Refused("bad-root", f"{rel} is not the front's log file")
+        except OSError as e:
+            raise Refused("bad-root", f"{rel}: {e.strerror}") from None
+        try:
+            seams.chown(f, front_uid, 0, rel)
+            os.fchmod(f, FRONT_LOG_MODE)
+            seams.fsync(f)
+        finally:
+            os.close(f)
+        seams.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def wake_reaper(run: Path) -> None:
@@ -557,7 +825,9 @@ class Seams:
     #: a driver template's bytes by name (3c-8, render's ``driver-template-digest-mismatch``)
     driver_template: Callable[[str], Optional[bytes]] = RD.read_driver_template
     front_module: str = FRONT_MODULE
-    front_args: Callable[[str, SlotId], Sequence[str]] = stub_front_args
+    #: ``(host, slot, *, run, store, slot_uid) -> argv`` (:func:`gateway_front_args`; :func:`stub_front_args` takes
+    #: the same)
+    front_args: Callable[..., Sequence[str]] = gateway_front_args
     lock_wait_s: float = LOCK_WAIT_S
     at: Callable[[str], None] = lambda step: None
     # start / teardown (levain.slot.start):
@@ -1181,13 +1451,15 @@ class Ctx:
 
 def slot_ids(ctx: Ctx, slot: SlotId) -> Dict[str, int]:
     """The two accounts of ``slot`` (egress: slot + front; none: driver + child), each in its §1.1 range."""
-    out = {}
-    for name in slot.accounts:
-        uid = ctx.seams.account_uid(name)
-        if not in_own_range(ctx.seams.host, name, uid):
-            raise Refused("account-out-of-range", f"{name} {uid!r}")
-        out[name] = uid
-    return out
+    return {name: account_in_range(ctx.seams, name) for name in slot.accounts}
+
+
+def account_in_range(seams: "Seams", name: str) -> int:
+    """One slot account's uid (``seams.account_uid``), refused ``account-out-of-range`` outside its §1.1 range."""
+    uid = seams.account_uid(name)
+    if not in_own_range(seams.host, name, uid):
+        raise Refused("account-out-of-range", f"{name} {uid!r}")
+    return uid
 
 
 def read_alloc(ctx: Ctx, session: str) -> R.Alloc:
@@ -1436,6 +1708,8 @@ class RenderRun:
     generation: int = 0
     facts: Optional[RD.RenderFacts] = None
     front_uid: Optional[int] = None
+    #: egress: ``R/gw/slot<n>/session.json``'s bytes (:func:`front_policy_bytes`), built before step (1), written in (3)
+    front_policy: Optional[bytes] = None
     front_pid: Optional[int] = None
     front_start: Optional[int] = None
     go_w: int = -1
@@ -1610,6 +1884,12 @@ def render_step3_files(run: RenderRun) -> None:
             seams.fsync(pfd)
         finally:
             os.close(pfd)
+    if run.egress:                      # §5.1 render (3): the front's session.json, before step (4) starts it
+        assert run.front_uid is not None
+        if run.front_policy is None:
+            run.front_policy = front_policy_bytes(ctx.store, a, run.blob.routes)
+        write_front_policy(seams, a.slot, run.front_uid, run.front_policy)
+        prepare_front_log(ctx.store, a.slot, run.front_uid)
     # DECISION: only the names this render staged are removed (the verifier's driver_input.json is session 2f's to
     # stage, so it is never removed here unstaged); the dir itself is END's ("staging deleted").
     with ctx.store.dir("staging", a.session, trusted=False) as staging:
@@ -1633,7 +1913,9 @@ def front_launch(run: RenderRun) -> Tuple[Tuple[str, ...], bytes]:
     gw = a.slot.accounts[1]
     spec = wall.launch_spec(seams.host, "front", slot=a.slot, session=a.session, ids={gw: run.front_uid},
                             shared={"levain-gwfronts": seams.group_gid("levain-gwfronts")},
-                            argv=tuple(seams.front_args(seams.host, a.slot)), extra_env={GO_FD_ENV: str(GO_FD)},
+                            argv=tuple(seams.front_args(seams.host, a.slot, run=seams.R, store=seams.L,
+                                                        slot_uid=a.slot_uid)),
+                            extra_env={GO_FD_ENV: str(GO_FD)},
                             keep_fds=(GO_FD,), front_module=seams.front_module)
     if seams.host == "darwin":
         argv = wall.macos_launch_argv(spec)
@@ -1776,6 +2058,7 @@ def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]
             raise Refused("not-allocated", req.session)
         # §3.5's second gate, before step (1)'s CAS: a refusal here leaves the session ALLOCATED and acts on nothing
         RD.check_ticket(blob, a.kind, a.slot.slot_class, a.ticket, a.ticket_facts)
+        refuse_ticketed_front(a)        # 3b-8a T5: before the base map's route types are read, so one name for all
         if a.ticket is not None and a.ticket_facts is not None and a.ticket_facts.get("kind") == "verifier":
             RD.check_driver_template(a.ticket_facts["verifier"], ctx.seams.driver_template)   # type: ignore[arg-type]
         run = RenderRun(ctx, a, blob)
@@ -1784,6 +2067,8 @@ def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]
         # session ALLOCATED, as the ticket gate does
         run.facts = render_facts(ctx, a, blob)
         RD.check_facts(blob, run.facts)
+        if run.egress:                  # the front's policy file, refused here (if at all) like step (2)'s checks
+            run.front_policy = front_policy_bytes(ctx.store, a, blob.routes)
         try:
             for name, step in RENDER_STEPS:
                 ctx.seams.at(name)
@@ -3153,14 +3438,17 @@ def _read_stdin() -> bytes:
 
 
 __all__ = ["BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
-           "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "LinkedNotDurable", "PREPARE_RESULT_FORMAT",
+           "FRONT_DROPPED_FIELDS", "FRONT_LOG_MODE", "FRONT_LOG_NAME", "FRONT_MODULE", "FRONT_POLICY_NAME", "GO_BYTE", "GO_FD", "GO_FD_ENV",
+           "Leased", "LinkedNotDurable", "PREPARE_RESULT_FORMAT",
            "RENDER_STEPS", "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS",
            "CHECK_S", "base_routes", "capture_target", "configured_slots", "drain", "reap_within", "wait_child_within", "ENTRY_ENV", "entry_env",
            "create_alloc", "create_at", "kill_front", "lease_slot", "main", "make_cgroup", "open_slot_owned_dir",
            "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
            "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",
            "session_lock_name", "session_owner_uid", "slot_owned_dir_ok", "spawn_front", "spawn_target", "status",
-           "stub_front_args", "wait_child"]
+           "front_policy_bytes", "front_session_routes", "gateway_front_args", "prepare_front_log",
+           "account_in_range", "check_front_log_dirs",
+           "refuse_ticketed_front", "stub_front_args", "wait_child", "write_front_policy"]
 
 
 if __name__ == "__main__":   # pragma: no cover - the root entry (root_tree.ENTRY_MODULES)
