@@ -96,6 +96,8 @@ def _snapshot(L: Path) -> dict:
         for p in sorted((L / top).rglob("*")):
             if p.is_file():
                 out[str(p.relative_to(L))] = p.read_bytes()
+    if out.get("keys/ledger.jsonl") == b"":
+        del out["keys/ledger.jsonl"]       # the keys lock a replace makes when keys never ran (verify r2 R1): kept
     return out
 
 
@@ -444,6 +446,86 @@ def test_keys_cannot_start_while_the_replace_holds_its_ledger(old, monkeypatch):
     assert seen == ["ledger-locked"]
 
 
+def test_keys_cannot_start_mid_replace_on_an_install_whose_keys_never_ran(old, monkeypatch):
+    """verify r2 R1 (codex HIGH): with no ledger there was no lock, so a keys starting mid-replace made and locked the
+    ledger and served against a half-moved head. The replace now makes the ledger (empty, 0600, owned as ``L/keys``)
+    and holds it; keys' own open then refuses ``ledger-locked``, and opens it whole after."""
+    from levain.broker import ledger
+    path = old.L / "keys" / "ledger.jsonl"
+    assert not path.exists()
+    seen = []
+    real = IH._set_aside
+
+    def spy(*a, **kw):
+        try:
+            os.close(ledger.Ledger.open(str(path))._fd)
+            seen.append("opened")
+        except ledger.LedgerOpenError as e:
+            seen.append(e.name)
+        return real(*a, **kw)
+    monkeypatch.setattr(IH, "_set_aside", spy)
+    _replace(old, _req(old.new, OTHER_STORE))
+    assert seen == ["ledger-locked"]
+    st = os.lstat(path)
+    keys_dir = os.lstat(old.L / "keys")
+    assert stat.S_IMODE(st.st_mode) == 0o600 and (st.st_uid, st.st_gid) == (keys_dir.st_uid, keys_dir.st_gid)
+    led = ledger.Ledger.open(str(path))                # the empty file is a ledger keys opens (its header written)
+    os.close(led._fd)
+
+
+def test_a_ledger_keys_makes_between_the_look_and_the_make_is_its_lock(old, monkeypatch):
+    """verify r2 R1: keys creating the ledger in the gap between the replace's open and its O_EXCL create is held
+    by keys, so the replace refuses ``keys-running`` (never ``routes-trust-in-use`` on the EEXIST)."""
+    path = str(old.L / "keys" / "ledger.jsonl")
+    real_open = IH.os.open
+    held = []
+
+    def racing(p, flags, *a, **kw):
+        if str(p) == path and flags & os.O_EXCL and not held:
+            fd = real_open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.append(fd)
+        return real_open(p, flags, *a, **kw)
+    monkeypatch.setattr(IH.os, "open", racing)
+    try:
+        _refused(old, "keys-running")
+    finally:
+        for fd in held:
+            os.close(fd)
+    assert held
+
+
+def test_no_keys_dir_is_no_keys_lock(old):
+    """verify r2 R1: with no ``L/keys`` keys cannot open its ledger (its start makes no directory before the ledger,
+    ``test_keys_refuses_to_start_with_no_keys_dir``), so the replace takes no lock there and makes nothing."""
+    shutil.rmtree(old.L / "keys")
+    got = _replace(old, _req(old.new, OTHER_STORE))
+    assert got["store_id"] == OTHER_STORE and not (old.L / "keys").exists()
+
+
+def test_keys_refuses_to_start_with_no_keys_dir(old, capsys):
+    from levain.broker import keys as K
+    shutil.rmtree(old.L / "keys")
+    rc = K.main(["--runtime-root", str(old.L / "run"), "--lib-root", str(old.L), "--control", str(old.L / "c.sock"),
+                 "--test-single-uid"])
+    assert rc == 3 and "ledger" in capsys.readouterr().err
+    assert not (old.L / "keys").exists()
+
+
+def test_a_lock_file_the_replace_makes_and_cannot_own_is_removed(tmp_path):
+    """verify r2 R5 (deepseek LOW): a lock file made and then not owned as its directory says (here: chown to root,
+    which this uid may not do) is removed before the refusal, never left for the service to trip on."""
+    if ME == 0:
+        pytest.skip("root may chown")
+    path = tmp_path / "ledger.jsonl"
+    rootish = os.stat_result((stat.S_IFDIR | 0o700, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+    with pytest.raises(Refused) as e:
+        with IH._flock_held(path, "keys-running", "stop keys", create_as=rootish):
+            raise AssertionError("not reached")
+    assert e.value.name == "routes-trust-in-use" and "removed" in e.value.detail
+    assert not path.exists()
+
+
 # --- L3 r1 Q7 / Q8 / Q9 -------------------------------------------------------------------------------------------------
 
 def test_no_sessions_dir_is_no_references(old):
@@ -489,4 +571,5 @@ def test_keys_refuses_to_start_on_a_killed_replace(old, capsys):
     rc = K.main(["--runtime-root", str(old.L / "run"), "--lib-root", str(old.L), "--control", str(old.L / "c.sock"),
                  "--test-single-uid"])
     assert rc == 3 and "routes-trust-replace-unfinished" in capsys.readouterr().err
-    assert not (old.L / "keys" / "ledger.jsonl").exists()          # refused before the ledger is opened
+    # refused before the ledger is opened: the empty lock the killed replace made (verify r2 R1) has no header
+    assert (old.L / "keys" / "ledger.jsonl").read_bytes() == b""

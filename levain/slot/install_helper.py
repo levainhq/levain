@@ -2828,26 +2828,25 @@ def _why(e: BaseException) -> str:
 
 
 @contextmanager
-def _flock_held(path: Path, refusal: str, running: str, *, create_as: Optional[os.stat_result]) -> Iterator[None]:
+def _flock_held(path: Path, refusal: str, running: str, *, create_as: os.stat_result) -> Iterator[None]:
     """An exclusive ``flock`` on a service's single-instance lock file, taken non-blocking and held through the block:
     held elsewhere is ``refusal`` (``running`` says what to do), and a service starting while root holds it refuses its
-    own start. A lock file that is not there is made 0600 owned as ``create_as`` says (CONTROL's), or, with no
-    ``create_as``, not made: the service never ran, and the block runs unlocked."""
+    own start. A lock file that is not there is made 0600, owned as ``create_as`` says (the directory it is in), so
+    the lock exists whether or not the service ever ran (verify r2 R1); the service opens it as its own after. A
+    file the service makes between the look and the make (``EEXIST``) is opened and locked as one found. A file this
+    makes is locked before it is owned; one that cannot be owned as ``create_as`` is removed, still locked, before
+    the refusal (verify r2 R5). A made file is never removed once owned: a service that opened it and waits on its
+    lock would then lock a file no longer in the directory."""
+    made = False
     try:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except FileNotFoundError:
-            if create_as is None:
-                yield
-                return
-            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             try:
-                have = os.fstat(fd)
-                if (have.st_uid, have.st_gid) != (create_as.st_uid, create_as.st_gid):
-                    os.fchown(fd, create_as.st_uid, create_as.st_gid)
-            except OSError:
-                os.close(fd)
-                raise
+                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+                made = True
+            except FileExistsError:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError as e:
         raise Refused("routes-trust-in-use", f"the lock {path}: {e.strerror or e}") from None
     try:
@@ -2857,6 +2856,18 @@ def _flock_held(path: Path, refusal: str, running: str, *, create_as: Optional[o
             raise Refused(refusal, running) from None
         except OSError as e:
             raise Refused("routes-trust-in-use", f"the lock {path}: {e.strerror or e}") from None
+        if made:
+            try:
+                have = os.fstat(fd)
+                if (have.st_uid, have.st_gid) != (create_as.st_uid, create_as.st_gid):
+                    os.fchown(fd, create_as.st_uid, create_as.st_gid)
+            except OSError as e:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                raise Refused("routes-trust-in-use", f"the lock {path} cannot be owned as its directory is "
+                                                     f"({e.strerror or e}); it is removed") from None
         yield
     finally:
         os.close(fd)                          # closing the only descriptor releases the flock
@@ -2868,12 +2879,14 @@ def _services_held(L: Path) -> Iterator[None]:
     (:meth:`levain.slot.tickets.TicketStore.acquire`'s ``flock`` on ``L/sessions/tickets.jsonl.lock``;
     ``control-running``), then keys' ledger lock (:meth:`levain.broker.ledger.Ledger.open`'s ``flock`` on
     ``L/keys/ledger.jsonl``; ``keys-running``), so neither mints, reloads or commits a head against the old store
-    between the reference check and the last write. A missing CONTROL lock file is made as CONTROL would make it,
-    owned as ``L/sessions`` is. A missing ``L/sessions`` (L3 r1 Q7) is made root 0700 and no lock file is made in it:
-    no CONTROL can hold or take a lock in a directory only root can enter, and setup's chown of the directory would
-    not reach a root-owned 0600 lock file left in it [judged by lane-r3c9f, 10-26, against ``row_steps``' per-row
-    chown; not run]. A missing ledger: keys never ran, so no RELOAD of an old CONTROL is in flight in it (a RELOAD comes
-    from CONTROL's attach, and CONTROL is held) [judged by lane-r3c9f, 10-26, against codex's L3 r1 HIGH; not run]."""
+    between the reference check and the last write. A missing lock file is made as its service would make it, owned
+    as its directory is (:func:`_flock_held`): the ledger made so is an empty file, which ``Ledger.open`` takes as a
+    ledger with no lines and writes its header to. A missing ``L/sessions`` (L3 r1 Q7) is made root 0700 and no lock
+    file is made in it: no CONTROL can hold or take a lock in a directory only root can enter, and setup's chown of
+    the directory would not reach a root-owned 0600 lock file left in it [judged by lane-r3c9f, 10-26, against
+    ``row_steps``' per-row chown; not run]. A missing ``L/keys`` takes no keys lock: keys' start opens its ledger
+    before it makes any directory, and the open fails there
+    (``tests/test_slot_routes_trust_replace.py::test_keys_refuses_to_start_with_no_keys_dir``)."""
     sessions = L / "sessions"
     made = False
     try:
@@ -2882,18 +2895,27 @@ def _services_held(L: Path) -> Iterator[None]:
         try:
             os.mkdir(sessions, 0o700)
             os.chmod(sessions, 0o700)
+            st = os.lstat(sessions)
         except OSError as e:
             raise Refused("routes-trust-in-use", f"{sessions} is not there and cannot be made ({e.strerror or e})"
                           ) from None
         made = True
-        st = os.lstat(sessions)
     except OSError as e:
         raise Refused("routes-trust-in-use", f"{sessions}: {e.strerror or e}") from None
+    keys_dir = L / "keys"
+    try:
+        kst: Optional[os.stat_result] = os.lstat(keys_dir)
+    except FileNotFoundError:
+        kst = None
+    except OSError as e:
+        raise Refused("routes-trust-in-use", f"{keys_dir}: {e.strerror or e}") from None
     control = (contextlib.nullcontext() if made else
                _flock_held(sessions / (T.JOURNAL + ".lock"), "control-running", "CONTROL holds its ticket journal: "
                            "stop the control service, then run the replace again", create_as=st))
-    with control, _flock_held(L / "keys" / "ledger.jsonl", "keys-running", "keys holds its ledger: stop the keys "
-                              "service, then run the replace again", create_as=None):
+    keys = (contextlib.nullcontext() if kst is None else
+            _flock_held(keys_dir / "ledger.jsonl", "keys-running", "keys holds its ledger: stop the keys service, "
+                        "then run the replace again", create_as=kst))
+    with control, keys:
         yield
 
 
