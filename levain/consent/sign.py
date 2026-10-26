@@ -774,6 +774,33 @@ def _read_attempt(path: Path) -> "dict[str, Any] | None":
     return data
 
 
+def _prune_settled(path: Path, cutoff: float) -> bool:
+    """Drop the record at ``path`` (and its mark) when, under the record's ``flock`` (the lock an answer and a settle
+    hold), it is still settled and last written before ``cutoff``. A record whose lock is held, or that is pending,
+    newer, unreadable or not a regular file, is kept. True when it was dropped."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_mtime >= cutoff:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        if (_read_attempt(path) or {}).get("state") not in ("signed", "refused") or os.stat(path).st_ino != st.st_ino:
+            return False
+        path.unlink(missing_ok=True)
+        path.with_suffix(".sig256").unlink(missing_ok=True)
+        return True
+    finally:
+        os.close(fd)
+
+
 def _attempt_room(queue_dir: Path) -> None:
     """Make the attempts directory, drop settled records older than :data:`ATTEMPT_KEEP_S` (a pending one is never
     dropped), and refuse (429) when :data:`ATTEMPTS_MAX` records are left."""
@@ -791,9 +818,7 @@ def _attempt_room(queue_dir: Path) -> None:
                 old = os.lstat(path).st_mtime < cutoff
             except FileNotFoundError:
                 continue
-            if old and (_read_attempt(path) or {}).get("state") in ("signed", "refused"):
-                path.unlink(missing_ok=True)
-                path.with_suffix(".sig256").unlink(missing_ok=True)
+            if old and _prune_settled(path, cutoff):
                 continue
             kept += 1
     except OSError as exc:
