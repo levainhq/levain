@@ -1055,11 +1055,11 @@ def _absent(read: _LaunchRead, lt: Callable[[str, str], bool], correlated: bool)
 
 
 def _last_cursor(conn: sqlite3.Connection, launch_id: str) -> str | None:
-    """The launch's last persisted vendor cursor (None before the first batch that named one): where a resumed
-    ``read`` starts (§2.4)."""
+    """The vendor cursor of the launch's newest persisted batch, a None one included (None before the first): where a
+    resumed ``read`` starts (§2.4). An older cursor is never carried past a batch that returned none."""
     _worker_launch(conn, launch_id)
-    row = conn.execute("SELECT vendor_cursor FROM chat_cursors WHERE launch_id = ? AND vendor_cursor IS NOT NULL "
-                       "ORDER BY seq DESC LIMIT 1", (launch_id,)).fetchone()
+    row = conn.execute("SELECT vendor_cursor FROM chat_cursors WHERE launch_id = ? ORDER BY seq DESC LIMIT 1",
+                       (launch_id,)).fetchone()
     return None if row is None else row[0]
 
 
@@ -1085,7 +1085,7 @@ def _echo_candidate(conn: sqlite3.Connection, now: str, message_id: str, item: C
     """§7.6 conditions 1, 2, 4 and the time half of 3 for one send whose window holds ``item`` (the positional half
     is the caller's, from the driver's ``pos_lt``): latest state attempted / accepted / ambiguous and no echo row yet;
     the same vendor turn; the item recorded within :data:`ECHO_WINDOW` of the attempt's commit; equal normalized
-    digests."""
+    digests. An attempt whose stamp cannot be read is no candidate (never an exception out of the ingest)."""
     row = conn.execute("SELECT m.body_norm_sha256, o.gseq, o.at FROM chat_messages m JOIN chat_outbox_events o ON "
                        "o.message_id = m.message_id AND o.state = 'attempted' WHERE m.message_id = ?",
                        (message_id,)).fetchone()
@@ -1096,7 +1096,11 @@ def _echo_candidate(conn: sqlite3.Connection, now: str, message_id: str, item: C
         return False
     if item.vendor_turn_id is None or _sent_turn(conn, message_id, attempt_gseq, item.launch_id) != item.vendor_turn_id:
         return False
-    if parse_stamp(now) - parse_stamp(attempted_at) > ECHO_WINDOW:
+    try:
+        elapsed = parse_stamp(now) - parse_stamp(attempted_at)
+    except ValueError:                  # parse_stamp's ConsentError is a ValueError
+        return False
+    if elapsed > ECHO_WINDOW:
         return False
     return item.body_norm_sha256 == norm
 
@@ -1405,7 +1409,8 @@ class ChatService:
     def ingest(self, launch_id: str, batch: Any) -> int:
         """Record one :class:`~levain.coordinator.driver.ReadBatch` of a launch and its cursor in ONE transaction
         (§2.4), resolving any send the batch proves, then re-check every ambiguous send of the launch (§7.3). An
-        event at or before the launch's first ``complete_through`` is backfill. A ``complete_through`` before the
+        event at or before the launch's first persisted ``complete_through`` is backfill; before any is persisted, one
+        at or before this batch's own ``complete_through``; with neither, no event is. A ``complete_through`` before the
         one already persisted is not persisted: the frontier never moves back. The count of new events."""
         with self._attached(launch_id) as session:
             return self._ingest(launch_id, session, batch)
@@ -1448,7 +1453,8 @@ class ChatService:
 
         first, read = self._chat._read(frontier)
         prev, lt = read.through, session.pos_lt
-        backfill = [first is None or not lt(first, e.pos) for e in seen]
+        baseline = first if first is not None else through
+        backfill = [baseline is not None and not lt(baseline, e.pos) for e in seen]
         # §7.6 condition 3's positional half: the attempts whose window holds each item (the rest is re-read below)
         windows = [tuple(a.message_id for a in read.attempts if _inside(e.pos, a.anchor, _next_anchor(read, a, lt), lt))
                    if e.kind == "user_item" and not old else () for e, old in zip(seen, backfill)]

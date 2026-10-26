@@ -17,9 +17,9 @@ import pytest
 import levain
 from levain.coordinator import chat
 from levain.coordinator.chat import ChatService, ChatStore, record_check
-from levain.coordinator.driver import CommandResult, InterruptCommand, ScriptedSession
+from levain.coordinator.driver import CommandResult, InterruptCommand, ReadBatch, ScriptedSession, event
 from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import CoordError, Part
+from levain.coordinator.store import CoordError, Part, next_gseq
 
 T0 = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
 ME = "cockpit:tab-a"
@@ -575,6 +575,75 @@ def test_interrupt_driver_failure_is_ambiguous(cs, world):
 def test_interrupt_without_a_session_is_refused(cs, world):
     with pytest.raises(CoordError, match="no driver session"):
         ChatService(cs).interrupt(world["launch"], "t-1")
+
+
+# --- L3 r1 K1: a first batch's backfill is classified against its own frontier ---------------------------------------
+def _attached(cs, world, session):
+    with cs._write() as (conn, now):
+        record_check(conn, now, world["launch"], "live", "activation", "test")
+    svc = ChatService(cs)
+    svc.attach(world["launch"], session)
+    return svc
+
+
+def _backfill(cs, launch):
+    with cs._write() as (conn, _now):
+        return dict(conn.execute("SELECT vendor_event_key, backfill FROM chat_events WHERE launch_id = ?", (launch,)))
+
+
+def test_first_batch_classifies_backfill_against_its_own_frontier(cs, world):
+    # no frontier persisted yet: only what the batch's own complete_through covers is backfill
+    svc = _attached(cs, world, ScriptedSession())
+    batch = ReadBatch((event("user_item", "u1", "00000001", body="before Levain", turn_id="t-0"),
+                       event("user_item", "u2", "00000200", body="typed in the terminal", turn_id="t-0")),
+                      "00000200", "00000001", False)
+    assert svc.ingest(world["launch"], batch) == 2
+    assert _backfill(cs, world["launch"]) == {"user_item:u1": 1, "user_item:u2": 0}
+    assert len(outside_epochs(cs, world["launch"])) == 1
+    assert cs.turn_view(world["launch"], ME).state == "taken"
+
+
+def test_first_batch_with_no_frontier_has_no_backfill(cs, world):
+    svc = _attached(cs, world, ScriptedSession())
+    batch = ReadBatch((event("user_item", "u1", "00000001", body="typed in the terminal", turn_id="t-0"),),
+                      None, None, False)
+    svc.ingest(world["launch"], batch)
+    assert _backfill(cs, world["launch"]) == {"user_item:u1": 0}
+    assert len(outside_epochs(cs, world["launch"])) == 1
+
+
+# --- L3 r1 K3: an attempt whose stamp cannot be read is not an echo, never a wedged ingest ----------------------------
+def test_unreadable_attempt_stamp_is_no_echo_and_ingest_goes_on(cs, world):
+    s = ScriptedSession()
+    svc = ready(cs, world, s)
+    with cs._write() as (conn, now):
+        m, _ = chat.record_message(conn, now, thread_id=world["thread"], recipient="worker", author_kind="operator",
+                                   author_surface="cockpit", client_id="tab-a", outbox_id="ob-badstamp", body="go",
+                                   normalized="go", launch_id=world["launch"])
+        chat.outbox_step(conn, now, m.message_id, "pending", cause="preflight passed")
+        # a row another writer stamped in a shape parse_stamp refuses (the triggers hold the edge, not the stamp)
+        conn.execute("INSERT INTO chat_outbox_events (message_id, seq, gseq, state, op_id, vendor_anchor, cause, by, "
+                     "at) VALUES (?, 2, ?, 'attempted', 'op-badstamp', '00000000', 'attempt', 'service', "
+                     "'yesterday')", (m.message_id, next_gseq(conn, now)))
+        chat.outbox_step(conn, now, m.message_id, "accepted", cause="accepted", vendor_turn_id="t-1",
+                         vendor_item_id="i-9")
+    s.show("user_item", body="go", turn_id="t-1")
+    assert svc.read_next(world["launch"]) == 1
+    assert echoes(cs, world["launch"]) == [] and len(outside_epochs(cs, world["launch"])) == 1
+    s.show("agent_text", body="still reading")
+    assert svc.read_next(world["launch"]) == 1
+
+
+# --- L3 r1 K4: the read-back starts at the NEWEST persisted cursor, a NULL one included -------------------------------
+def test_read_next_after_a_null_cursor_does_not_resurrect_an_older_one(cs, world):
+    s = Recording()
+    svc = ready(cs, world, s)
+    assert s.cursors == [None]
+    svc.read_next(world["launch"])
+    assert s.cursors[-1] == "00000000"
+    svc.ingest(world["launch"], ReadBatch((), None, None, False))     # the vendor's stream reset: no cursor
+    svc.read_next(world["launch"])
+    assert s.cursors[-1] is None
 
 
 # --- the released shape (v0.11.25's CHAT_SCHEMA, frozen) -------------------------------------------------------------
