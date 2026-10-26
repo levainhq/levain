@@ -448,6 +448,10 @@ def main(argv: list[str] | None = None) -> int:
     ck_enroll.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
                            help="The enrolled laptop-presence key that signs this enrolment (its private "
                                 "key file, or the .pub of a key an agent holds).")
+    ck_enroll.add_argument("--attested", dest="attested", default=None, metavar="AUTHENTICATOR_DATA",
+                           help="A passkey's creation authenticatorData (base64url), as the phone page's enrol "
+                                "command gives it. It must attest this very key; its credential id and provider "
+                                "are recorded beside the key for display, and grant no authority.")
     _ck_common(ck_enroll)
     ck_enroll.set_defaults(func=_cmd_cockpit_enroll)
     ck_revoke = ck_sub.add_parser("revoke", help="Revoke an enrolled key.")
@@ -2244,9 +2248,17 @@ def _cmd_cockpit_enroll(args: argparse.Namespace) -> int:
             raise KeyError_(f"{args.key} is larger than a public key file ({_KEY_FILE_MAX} bytes)")
         # checked before anything is signed: the custody table, the sidecar, the encrypted file, the CTK identity
         custody = declared_custody(args.key, args.custody, args.key_class, raw.decode("utf-8"))
+        attested = None
+        if args.attested is not None:
+            from levain.consent.passkey import PasskeyError, b64url_decode
+            try:
+                attested = b64url_decode(args.attested, "--attested authenticator_data")
+            except PasskeyError as exc:
+                raise KeyError_(str(exc)) from None
         signer_fp, sign = ssh_signer(args.signing_key)
         row, created, warning = enroll(_cockpit_root(args), raw.decode("utf-8"), args.key_class,
-                                       custody=custody, signer_fp=signer_fp, sign=sign, clock=_utc_now)
+                                       custody=custody, signer_fp=signer_fp, sign=sign, clock=_utc_now,
+                                       attested=attested)
     except _cockpit_refusals() as exc:
         print(f"enroll refused: {exc}", file=sys.stderr)
         return 1
@@ -3363,6 +3375,12 @@ def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
     except _cockpit_refusals() as exc:
         print(f"keys: {exc}", file=sys.stderr)
         return 1
+    from levain.cockpit import keyfacts
+
+    try:
+        facts = keyfacts.read(_cockpit_root(args))
+    except keyfacts.KeyFactsError as exc:     # display facts only: the keys still list, and say why these do not
+        facts, note = {}, "; ".join(filter(None, (note, str(exc))))
     if note:
         print(note)
     if not rows:
@@ -3371,9 +3389,15 @@ def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
         state = f"revoked at seq {r.revoked_seq}" if r.revoked_seq is not None else "active"
         if r.compromised_since is not None:
             state += f", compromised since seq {r.compromised_since}"
+        held = facts.get(r.fingerprint)
+        # a passkey's provider and credential id (levain.cockpit.keyfacts): display only, never what the key may sign
+        passkey = "" if r.custody != "passkey" else (
+            f", {keyfacts.provider_text(held)}, "
+            + ("credential id recorded" if held is not None and held.credential_id else "no credential id recorded"))
         print(f"{r.fingerprint}  {r.key_class:<16} custody {r.custody:<14} {state:<44} enrolled at seq {r.enrolled_seq}"
               + (f" ({r.enrolled_at})" if r.enrolled_at else "")
               + (f", first enrolled {r.legacy_enrolled_at}" if r.legacy_enrolled_at else "")
+              + passkey
               + (f"; {notes[r.fingerprint]}" if r.fingerprint in notes else ""))
     return 0
 
