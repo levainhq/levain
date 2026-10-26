@@ -14,9 +14,11 @@ route can fall back, ``Codec.checks_answered_model``) a response naming another 
 model's row (3c-9, ``levain.broker.codec.answered_other``).
 
 The merge is by route id: every shipped id is replaced whole by its shipped entry, every other entry of the map is
-kept as written. The result is parsed by :func:`levain.broker.policy.parse_base_map` (keys' own parser) and checked by
-:func:`connect_host_clashes` before root writes it, so root never writes a map keys would refuse or a map whose egress
-hosts the front would refuse in every session.
+kept as written. The operator's route wins over ``egress-default``: a host one of the map's own CONNECT routes already
+admits is left off ``egress-default`` and named (:func:`_shipped_for`). The result is parsed by
+:func:`levain.broker.policy.parse_base_map` (keys' own parser) and checked by :func:`connect_host_clashes` before root
+writes it, so root never writes a map keys would refuse or a map whose egress hosts the front would refuse in every
+session.
 
 Runs on the root interpreter (3.9).
 """
@@ -85,9 +87,9 @@ def shipped_routes() -> List[dict]:
     return [*vendor_routes(), egress_default_route()]
 
 
-def connect_host_clashes(parsed: Mapping[str, P.RoutePolicy]) -> List[str]:
+def connect_host_clashes(parsed: Mapping[str, P.RoutePolicy]) -> List[Tuple[str, str, str]]:
     """Each host of an ``egress`` route that another route of the map also names (its ``hosts`` or, brokered, its
-    upstream host), as ``"<host> (<egress route>, <other route>)"``, sorted. Every egress route goes to every
+    upstream host), as ``(host, the egress route, the other route)``, sorted. Every egress route goes to every
     interactive session, and the front refuses a policy that admits a host by two CONNECT routes or as a CONNECT host
     and a brokered host (``levain.broker.front.load_policy``), so a map with one would have every session refused at
     its front."""
@@ -98,13 +100,30 @@ def connect_host_clashes(parsed: Mapping[str, P.RoutePolicy]) -> List[str]:
             hs.add(pol.upstream.host)
         for h in hs:
             names.setdefault(h, []).append(rid)
-    out = []
+    out = set()
     for rid, pol in parsed.items():
         if pol.type != "egress":
             continue
         for h in pol.hosts:
-            out.extend(f"{h} ({rid}, {other})" for other in names[h] if other != rid)
-    return sorted(set(out))
+            out.update((h, rid, other) for other in names[h] if other != rid)
+    return sorted(out)
+
+
+def clash_message(clashes: Sequence[Tuple[str, str, str]], base: str = "base.json") -> str:
+    """One refusal line for ``clashes`` (:func:`connect_host_clashes`): each host with the two routes that admit it
+    (each pair once), and the remedy: edit the route of the pair the merge does not ship (a shipped one is replaced
+    whole by every merge) in ``base``. ``routes-egress`` sets only the ``egress-operator`` route, so it is named only
+    where that route is one of the pair."""
+    shipped = {r["route"] for r in shipped_routes()}
+    pairs = sorted({(h, *sorted((a, b))) for h, a, b in clashes})
+    parts = []
+    for h, a, b in pairs:
+        yours = [r for r in (a, b) if r not in shipped] or [a, b]
+        fix = f"edit route {' or '.join(yours)} in {base}"
+        if EGRESS_OPERATOR in (a, b):
+            fix += " (`install-helper routes-egress` sets egress-operator)"
+        parts.append(f"host {h} is on routes {a} and {b}: {fix}")
+    return "; ".join(parts)[:400]
 
 
 class MergeRefused(ValueError):
@@ -115,20 +134,46 @@ class MergeRefused(ValueError):
         self.code, self.detail = code, detail
 
 
-def merge(doc: object) -> Tuple[dict, List[str]]:
-    """``(the merged map, the route ids replaced or added)``. ``doc`` is the map on disk, parsed (``None`` = absent,
-    merged as the empty map). A ``/1`` map is carried to ``/2``: its egress and passthrough entries are the same
-    objects in both formats; a ``/1`` brokered entry that is not a vendor id has no price table and is refused
-    ``base-map-unmergeable`` (the operator's own brokered route is never rewritten by root). The result is parsed by
-    keys' parser; a refusal there is ``base-map-unmergeable`` too."""
+def _shipped_for(kept: Sequence[object]) -> Tuple[List[dict], List[str]]:
+    """``(the shipped routes for a map keeping ``kept``, one note per omitted host)``. The user's route wins: a host
+    that a kept CONNECT route (``egress`` or ``subscription_passthrough``) already admits is left off
+    ``egress-default`` (the host stays reachable through that route, in the sessions that carry it: every interactive
+    session for an ``egress`` route, ``supervisor.pick_routes``), and an ``egress-default`` with no host left is
+    not shipped. ``kept`` entries are parsed by the caller; a malformed one is skipped here."""
+    owner: Dict[str, str] = {}
+    for entry in kept:
+        if type(entry) is dict and entry.get("type") in P.CONNECT_TYPES and type(entry.get("hosts")) is list:
+            for h in entry["hosts"]:
+                if type(h) is str:
+                    owner.setdefault(h, entry["route"])
+    out: List[dict] = []
+    notes: List[str] = []
+    for r in shipped_routes():
+        if r["route"] == EGRESS_DEFAULT:
+            keep = [h for h in r["hosts"] if h not in owner]
+            notes.extend(f"host {h} stays on your route {owner[h]}, so {EGRESS_DEFAULT} leaves it off"
+                         for h in r["hosts"] if h in owner)
+            if not keep:
+                continue
+            r = {**r, "hosts": keep}
+        out.append(r)
+    return out, notes
+
+
+def merge(doc: object) -> Tuple[dict, List[str], List[str]]:
+    """``(the merged map, the shipped route ids it holds, notes)``. ``doc`` is the map on disk, parsed (``None`` =
+    absent, merged as the empty map). A ``/1`` map is carried to ``/2``: its egress and passthrough entries are the
+    same objects in both formats; a ``/1`` brokered entry that is not a vendor id has no price table and is refused
+    ``base-map-unmergeable`` (the operator's own brokered route is never rewritten by root). A host the map's own
+    CONNECT route admits is left off ``egress-default``, one note each (:func:`_shipped_for`). The result is parsed by
+    keys' parser and checked by :func:`connect_host_clashes`; a refusal there is ``base-map-unmergeable`` too."""
     if doc is None:
         doc = {"format": BASE_FORMAT, "routes": []}
     try:
         P.parse_base_map(doc)
     except P.PolicyError as e:
         raise MergeRefused("base-map-malformed", str(e)[:200]) from None
-    shipped = shipped_routes()
-    ids = {r["route"] for r in shipped}
+    ids = {r["route"] for r in shipped_routes()}
     kept: List[dict] = []
     for entry in doc["routes"]:                       # type: ignore[index]
         if entry["route"] in ids:
@@ -136,6 +181,7 @@ def merge(doc: object) -> Tuple[dict, List[str]]:
         if doc["format"] != BASE_FORMAT and entry.get("type") == "brokered":   # type: ignore[index]
             raise MergeRefused("base-map-unmergeable", f"route {entry['route']}: a /1 brokered route has no prices")
         kept.append(entry)
+    shipped, notes = _shipped_for(kept)
     out = {"format": BASE_FORMAT, "routes": kept + shipped}
     try:
         parsed = P.parse_base_map(out)
@@ -143,9 +189,8 @@ def merge(doc: object) -> Tuple[dict, List[str]]:
         raise MergeRefused("base-map-unmergeable", str(e)[:200]) from None
     clashes = connect_host_clashes(parsed)
     if clashes:
-        raise MergeRefused("base-map-unmergeable", f"an egress host is on another route: {'; '.join(clashes)[:200]} "
-                                                   "(`install-helper routes-egress` sets the operator's list)")
-    return out, sorted(ids)
+        raise MergeRefused("base-map-unmergeable", clash_message(clashes))
+    return out, sorted(r["route"] for r in shipped), notes
 
 
 def set_operator_hosts(doc: object, hosts: Sequence[str]) -> dict:
@@ -153,7 +198,9 @@ def set_operator_hosts(doc: object, hosts: Sequence[str]) -> dict:
     (sorted), replaced in place when present, appended when not; an empty ``hosts`` removes it. Every other entry and
     the map's format are kept as written. Refused (:class:`MergeRefused`): ``base-map-missing`` (no map: setup writes
     one), ``base-map-malformed`` (the map does not parse; it is left as it is), ``routes-egress-request:hosts`` (a
-    host the policy grammar refuses), ``routes-egress-host-on-route`` (:func:`connect_host_clashes`)."""
+    host the policy grammar refuses), ``routes-egress-host-on-route`` (a requested host another route admits,
+    :func:`connect_host_clashes`), ``base-map-unmergeable`` (the map's other routes already clash, named as the merge
+    names it: this verb never writes a map with a clash)."""
     if doc is None:
         raise MergeRefused("base-map-missing", "no base map: `install-helper setup` (or routes-base) writes one")
     try:
@@ -183,20 +230,30 @@ def set_operator_hosts(doc: object, hosts: Sequence[str]) -> dict:
         parsed = P.parse_base_map(out)
     except P.PolicyError as e:
         raise MergeRefused("routes-egress-request:hosts", str(e)[:200]) from None
-    clashes = [c for c in connect_host_clashes(parsed) if f"({EGRESS_OPERATOR}," in c]
+    clashes = connect_host_clashes(parsed)
+    other = [c for c in clashes if EGRESS_OPERATOR not in c[1:]]
+    if other:
+        raise MergeRefused("base-map-unmergeable", clash_message(other))
     if clashes:
-        raise MergeRefused("routes-egress-host-on-route", "; ".join(clashes)[:200])
+        raise MergeRefused("routes-egress-host-on-route",
+                           "; ".join(sorted({f"{h} (on route {b if a == EGRESS_OPERATOR else a})"
+                                             for h, a, b in clashes}))[:200])
     return out
 
 
-
-def reverted_fields(doc: object) -> Dict[str, List[str]]:
+def reverted_fields(doc: object, merged: object = None) -> Dict[str, List[str]]:
     """For each entry of ``doc`` (the map on disk, parsed; ``None`` = absent) whose id is a shipped route and which
-    :func:`merge` replaces: the top-level fields where it differs from the shipped entry, by route id. An operator's
-    change to one of them (a lowered ``max_session_microdollars``) is undone by the merge; this names it."""
+    :func:`merge` replaces: the top-level fields where it differs from the entry the merge wrote (``merged``, the
+    merged map; ``None``: the shipped entries as :func:`shipped_routes` gives them), by route id. An operator's change
+    to one of them (a lowered ``max_session_microdollars``) is undone by the merge; this names it. An entry the merge
+    dropped (an ``egress-default`` left with no host) is not named here; the merge's notes name its hosts."""
     if type(doc) is not dict or type(doc.get("routes")) is not list:
         return {}
-    shipped = {r["route"]: r for r in shipped_routes()}
+    ids = {r["route"] for r in shipped_routes()}
+    if merged is None:
+        shipped = {r["route"]: r for r in shipped_routes()}
+    else:
+        shipped = {r["route"]: r for r in merged["routes"] if r["route"] in ids}  # type: ignore[index]
     out: Dict[str, List[str]] = {}
     for entry in doc["routes"]:
         if type(entry) is not dict or entry.get("route") not in shipped:
@@ -209,5 +266,5 @@ def reverted_fields(doc: object) -> Dict[str, List[str]]:
 
 
 __all__ = ["ANTHROPIC_SESSION_CAP", "BASE_FORMAT", "CLAUDE_MODELS", "EGRESS_DEFAULT", "EGRESS_DEFAULT_HOSTS",
-           "EGRESS_OPERATOR", "MergeRefused", "anthropic_route", "connect_host_clashes", "egress_default_route",
-           "merge", "reverted_fields", "set_operator_hosts", "shipped_routes", "vendor_routes"]
+           "EGRESS_OPERATOR", "MergeRefused", "anthropic_route", "clash_message", "connect_host_clashes",
+           "egress_default_route", "merge", "reverted_fields", "set_operator_hosts", "shipped_routes", "vendor_routes"]

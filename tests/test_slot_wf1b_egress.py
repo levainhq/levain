@@ -107,8 +107,10 @@ def test_pick_routes_takes_both_egress_routes(L):
 def test_merge_refuses_a_map_whose_egress_host_sits_on_another_route():
     """The front refuses a session policy whose CONNECT host is on two routes or on a brokered route
     (``front.load_policy``), and every egress route goes to every interactive session (``pick_routes``): a map like
-    that would refuse every session at its front, so root never writes one."""
-    for clash in ("github.com", "api.anthropic.com"):
+    that would refuse every session at its front, so root never writes one. (A host of egress-default that the
+    operator's own CONNECT route admits is no clash: the merge leaves it off egress-default,
+    tests/test_slot_wf1b_f1_clash.py.)"""
+    for clash in ("api.anthropic.com",):
         doc = {"format": VR.BASE_FORMAT, "routes": [{"route": "mine", "type": "egress", "hosts": [clash]}]}
         with pytest.raises(VR.MergeRefused) as e:
             VR.merge(doc)
@@ -336,8 +338,8 @@ def test_the_front_refuses_what_connect_host_clashes_names():
             F.load_policy(pol([VR.egress_default_route(), brokered, clash]))
         parsed = P.parse_base_map({"format": VR.BASE_FORMAT,
                                    "routes": [VR.egress_default_route(), VR.anthropic_route(), clash]})
-        want = {"github.com": ["github.com (egress-default, mine)", "github.com (mine, egress-default)"],
-                "api.anthropic.com": ["api.anthropic.com (mine, anthropic)"]}[clash["hosts"][0]]
+        want = {"github.com": [("github.com", "egress-default", "mine"), ("github.com", "mine", "egress-default")],
+                "api.anthropic.com": [("api.anthropic.com", "mine", "anthropic")]}[clash["hosts"][0]]
         assert VR.connect_host_clashes(parsed) == want
 
 

@@ -2596,22 +2596,25 @@ def merge_base_routes(routes: Path, *, fsync: Callable[[int], None] | None = Non
     """``routes-base``'s act: ``routes/base.json`` read (absent = the empty map), the shipped routes (the vendor
     routes and ``egress-default``) merged in by route id (:func:`levain.slot.vendor_routes.merge`, checked by keys'
     own parser), written durably root 0644 when
-    the bytes, the owner or the mode differ. Returns ``(the vendor route ids, written)``; a map that cannot be merged
+    the bytes, the owner or the mode differ. Returns ``(the shipped route ids the map holds, written)``; a map that cannot be merged
     is ``Refused`` by the merge's code and left as it is, and a failure before the rename is the ``OSError``. Told to
-    ``warn`` (default: stderr): each field of a shipped route's entry the merge reverted
+    ``warn`` (default: stderr): each host left off ``egress-default`` because a route of the operator's admits it (on
+    every run, written or not), each field of a shipped route's entry the merge reverted
     (:func:`levain.slot.vendor_routes.reverted_fields`), and a rename whose directory fsync failed (the map is in
     force, ``written`` is True)."""
     warn = warn or (lambda line: sys.stderr.write(f"levain install-helper: warning: {line}\n"))
     path = Path(routes) / "base.json"
     raw, doc = _read_base_map(path)
     try:
-        out, ids = VR.merge(doc)
+        out, ids, notes = VR.merge(doc)
     except VR.MergeRefused as e:
         raise Refused(e.code, f"{path}: {e.detail}; it is left as it is") from None
     written = _write_base_map(path, raw, out, verb="routes-base", fsync=fsync, warn=warn)
+    for note in notes:
+        warn(f"{note} ({path})")
     if not written:
         return ids, False
-    for rid, fields in sorted(VR.reverted_fields(doc).items()):
+    for rid, fields in sorted(VR.reverted_fields(doc, out).items()):
         warn(f"route {rid} in {path} replaced by the shipped entry; it had changed {', '.join(fields)}, now the "
              "shipped values")
     return ids, True
