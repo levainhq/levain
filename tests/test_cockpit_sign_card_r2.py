@@ -253,7 +253,7 @@ THROWS = ("(() => {{ const real = window.fetch; let armed = true; window.fetch =
 
 @needs_browser
 @needs_ssh
-def test_a_ceremony_that_throws_is_not_sure_and_releases_the_write_in(tmp_path, monkeypatch) -> None:
+def test_a_ceremony_that_throws_before_it_posts_signs_nothing_and_releases_the_write_in(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving() as (_url, _httpd):
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
@@ -263,11 +263,11 @@ def test_a_ceremony_that_throws_is_not_sure_and_releases_the_write_in(tmp_path, 
             {"eval": f"(() => {{ const i = {WRITE_IN}; i.value = 'only after the backup'; "
                      "i.dispatchEvent(new Event('input')); return 1; })()"},
             {"eval": f"{WORDS_BTN}.click() || 1"},
-            {"until": f"/not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "may_timeout": True},
+            {"until": f"/nothing was signed/.test({FACET_NOTE}) && {FACET_NOTE}", "may_timeout": True},
             {"until": f"!{WRITE_IN}.disabled && {WRITE_IN}.value", "may_timeout": True},
             {"eval": OPEN % QRID},
         ])
     v = out["values"]
-    assert "not sure" in str(v[4]), v
-    assert v[5] == "only after the backup", v           # released: the request still reads open, nothing was signed
+    assert "the page failed (TypeError); nothing was signed" in str(v[4]), v   # the throw came before any answer was posted
+    assert v[5] == "only after the backup", v           # released
     assert v[6] is True and rig.nothing_signed(QRID)

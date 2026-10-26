@@ -62,46 +62,42 @@ def _card(rig: _Rig, *steps: dict) -> list:
 
 @needs_browser
 @needs_ssh
-def test_h2_an_answer_that_landed_with_its_reply_lost_keeps_the_card_frozen_and_says_it_closed(tmp_path, monkeypatch) -> None:
+def test_h2_an_answer_that_landed_with_its_reply_lost_is_confirmed_signed_by_its_attempt(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": LOSE_REPLY.format(tail=json.dumps("/answer"))},
             {"eval": f"{OPTION_B}.click() || 1"},
-            {"until": f"/not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
+            {"until": f"/the cockpit confirmed it/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": AFTER.format(ms=2000)},
             {"eval": BUTTONS},
             {"eval": "window.__reloads"},
-            {"eval": FACET_NOTE},
         ])
     v = out["values"]
-    assert str(v[5]).startswith("not sure this was signed"), v[5]
-    assert v[7] == [True, True, True], v[7]               # frozen: the request it may have signed is closed
+    assert str(v[5]).startswith("signed (b) · by " + rig.pk.key.fingerprint), v[5]
+    assert v[7] == [True, True, True], v[7]               # frozen: the request it signed is closed
     assert v[8] >= 1, v[8]                                # and the board is told to read again
-    assert v[9].startswith("not sure this was signed") and "no longer open" in v[9], v[9]
     assert rig.verifies(QRID)                             # the answer did land
 
 
 @needs_browser
 @needs_ssh
-def test_h2_an_answer_that_never_left_reads_open_and_only_then_the_card_comes_back(tmp_path, monkeypatch) -> None:
+def test_h2_an_answer_that_never_left_is_refused_by_its_attempt_and_only_then_the_card_comes_back(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
             {"eval": f"{OPTION_B}.click() || 1"},
-            {"until": f"/not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
-            {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 8000},
+            {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 30000},
             {"eval": OPEN % QRID},
             {"eval": f"{OPTION_B}.click() || 1"},
             {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
         ])
     v = out["values"]
-    assert str(v[5]).startswith("not sure this was signed"), v[5]
-    assert "still reads open" in v[6] and "second read" in v[6], v[6]   # said once the second read came back
-    assert v[7] is True                                   # it was open: nothing had been signed
+    assert "never reached the cockpit" in v[5] and "sign it again" in v[5], v[5]   # the cockpit's word, not a read
+    assert v[6] is True                                   # it was open: nothing had been signed
     assert rig.verifies(QRID)                             # and the card signed it on the next tap
 
 
