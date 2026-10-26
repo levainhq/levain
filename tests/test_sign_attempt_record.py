@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from levain.consent import sign as signmod
-from levain.consent.sign import Signer, SignRefused, attempts_dir
+from levain.consent.sign import SignRefused, attempts_dir
 from tests.test_sign_attempt import AID, RID, _challenged, _record
 from tests.test_sign_choice import _file, passkey  # noqa: F401 -- the fixture
 
