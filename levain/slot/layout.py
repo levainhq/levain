@@ -38,6 +38,12 @@ def install_helper_path(host: HostOS) -> Path:
     return HELPER_DIR[host] / "install-helper"
 
 
+def repair_line(host: HostOS) -> str:
+    """The one command that re-applies setup's rows to an existing install (a bare ``repair``): the remedy a refusal
+    or a doctor row names for a row an older install lacks."""
+    return f"sudo {install_helper_path(host)} repair"
+
+
 def service_entry_path(host: HostOS) -> Path:
     """The one bootstrap entry every service unit runs (CONTRACT §23), beside the helpers' entries."""
     return HELPER_DIR[host] / "service-entry"

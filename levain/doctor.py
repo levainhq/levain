@@ -480,6 +480,7 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
             return [CheckResult("agent sessions", False, f"partially installed: no slots directory at {store}",
                                 "The isolation install is incomplete; its install helper repairs it.")]
         rows = _slot_rows(store, layout, R, Refused)
+        rows += _front_log_rows(store, host, layout, R)
     except OSError as exc:
         rows = [CheckResult("agent slots", True, f"could not be read ({_slot_why(exc)})", warn=True)]
     else:
@@ -540,6 +541,42 @@ def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResu
                             "The pool is below its configured counts; its install helper replenishes it.")]
     return [CheckResult("agent slots", True, detail + (f"; not usable (extra): {', '.join(bad)}" if bad else "")
                         + note)]
+
+
+def _front_log_rows(store: Path, host: str, layout: Any, R: Any) -> list[CheckResult]:
+    """The ``agent front logs`` row: each in-service egress slot's ``L/gw/slot<n>/`` (S1 3b-8a), which render refuses
+    ``store-missing`` without. ``L/gw/`` is root's 0755, so the operator can see whether each is a real directory;
+    an install made before the dir existed has none until a repair applies setup's rows. No egress slot: no row."""
+    found, _ignored = _read_slot_dirs(store / "slots")
+    tags = sorted((t for t, v in found.items() if t[0] == "e" and v[0] not in R.OUT_OF_SERVICE),
+                  key=lambda t: int(t[1:]))
+    if not tags:
+        return []
+    try:
+        if stat.S_ISLNK(os.lstat(store / "gw").st_mode):   # the runtime opens it O_NOFOLLOW: a link is not it
+            return [CheckResult("agent front logs", False, f"{store / 'gw'} is a symbolic link; the runtime refuses "
+                                "it, so no egress session can be started",
+                                "Replace it with the real directory (the install helper creates it).")]
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        return [CheckResult("agent front logs", True, f"could not be read ({_slot_why(exc)})", warn=True)]
+    missing = []
+    for t in tags:
+        try:
+            if not stat.S_ISDIR(os.lstat(store / "gw" / f"slot{t[1:]}").st_mode):
+                missing.append(t)
+        except FileNotFoundError:
+            missing.append(t)
+        except OSError as exc:      # unreadable is said as unreadable, never as present, and keeps the slots row
+            return [CheckResult("agent front logs", True, f"could not be read ({_slot_why(exc)})", warn=True)]
+    if missing:
+        return [CheckResult("agent front logs", False,
+                            f"no front log directory for {', '.join(missing)}: every session on "
+                            f"{'that slot' if len(missing) == 1 else 'those slots'} is refused (store-missing)",
+                            f"Run `{layout.repair_line(host)}` once (an install made before the front log moved to "
+                            "the store has none).", upgrade_pending=True)]
+    return [CheckResult("agent front logs", True, f"{len(tags)} egress slot(s), each with its front log directory")]
 
 
 #: V13 (O4, N10): the record root writes after each firewall probe, beside the slot's state (levain.slot.probe's

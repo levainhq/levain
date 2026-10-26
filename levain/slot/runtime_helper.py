@@ -53,7 +53,7 @@ from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
 from levain.slot.ids import SlotId, in_own_range
-from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE
+from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE, repair_line
 from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
                                          bind_stdin, ok_line, parse_runtime_argv, parse_stdin, refusal_line)
 
@@ -611,16 +611,24 @@ FRONT_LOG_MODE = 0o640
 
 def prepare_front_log(store: "Store", slot: SlotId, front_uid: int) -> None:
     """3b-8a T1: ``L/gw/slot<n>/front.log``, root-prepared before the front starts. ``L/gw/`` must pass
-    ``seams.trusted``; ``L/gw/slot<n>/`` is the front account's (setup's row, ``layout.slot_store_rows``), no group or
-    other write. The log is made ``O_EXCL|O_NOFOLLOW`` when absent; one already there (the slot's earlier sessions:
-    an audit trail, never truncated) must be a regular file with one link, owned by the front account or root. Either
-    way it is then chowned front account : root and set to :data:`FRONT_LOG_MODE`, so a log a front made under a
-    loose umask is put right. A link, a dir, a second hard link: ``bad-root``, nothing chowned through it."""
+    ``seams.trusted`` (``store.dir(..., trusted=True)`` refuses it ``bad-root``); ``L/gw/slot<n>/`` is the front
+    account's (setup's row, ``layout.slot_store_rows``), no group or other write. Either dir missing (an install made
+    before the log moved to the store) is ``store-missing`` naming :func:`layout.repair_line`. The log is made
+    ``O_EXCL|O_NOFOLLOW`` when absent; one already there (the slot's earlier sessions: an audit trail, never
+    truncated) must be a regular file with one link, owned by the front account or root. Either way it is then chowned
+    front account : root and set to :data:`FRONT_LOG_MODE`, so a log a front made under a loose umask is put right. A
+    link, a dir, a second hard link: ``bad-root``, nothing chowned through it."""
     seams = store.seams
     where = f"gw/slot{slot.index}"
     rel = f"{where}/{FRONT_LOG_NAME}"
-    with store.dir("gw") as gfd:
-        fd = _openat_dir(gfd, f"slot{slot.index}", where)
+    try:
+        with store.dir("gw", trusted=True) as gfd:
+            fd = _openat_dir(gfd, f"slot{slot.index}", where)
+    except Refused as e:
+        if e.name != "store-missing":
+            raise
+        raise Refused("store-missing", f"{store.path}/{where}: the front log dir is missing (an install made before "
+                      f"it existed); run `{repair_line(seams.host)}` once") from None
     try:
         if not _front_dir_ok(os.fstat(fd), seams, front_uid):
             raise Refused("bad-root", f"{where} is not the front account's alone")
