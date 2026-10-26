@@ -365,8 +365,8 @@ def test_an_old_release_that_fails_with_a_give_back_that_works_stays_retriable(t
 
 
 def test_the_one_shot_exits_0_on_an_uncertain_enable_so_launchd_does_not_retry(capsys):
-    """KeepAlive ``SuccessfulExit: false`` restarts every non-zero exit, so 0 is the one exit launchd leaves; the line on
-    stderr names the state, and the steps after the enable (the anchor load) do not run."""
+    """KeepAlive ``SuccessfulExit: false`` restarts every non-zero exit, so 0 is the one exit launchd leaves; the line
+    on stderr names the state, and the steps after the enable (the anchor load) do not run."""
     from levain.firing.hands import Step
 
     later = []
