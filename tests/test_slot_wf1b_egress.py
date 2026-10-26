@@ -339,3 +339,29 @@ def test_the_front_refuses_what_connect_host_clashes_names():
         want = {"github.com": ["github.com (egress-default, mine)", "github.com (mine, egress-default)"],
                 "api.anthropic.com": ["api.anthropic.com (mine, anthropic)"]}[clash["hosts"][0]]
         assert VR.connect_host_clashes(parsed) == want
+
+
+def test_the_render_verb_writes_the_allow_rule_from_the_base_map(tmp_path):
+    """The production path: the runtime helper's ``render`` reads the base map (``render_facts``), and the session's
+    ``root/settings.json`` holds one ``WebFetch(domain:)`` allow per host of its egress route. A map whose egress route
+    has no hosts is refused at render, by name."""
+    from tests.test_slot_s2f2_runtime_helper import BASE
+    from tests.test_slot_s2f3_start import _S, _blob, _prepared, _world
+
+    w, la, table = _world(tmp_path)
+    s = _prepared(w)
+    w.session = s
+    code, line = w.main(["render", s], _blob())
+    assert line["ok"], line
+    settings = json.loads((_S(w, s) / "root" / "settings.json").read_bytes())
+    assert settings["permissions"]["allow"] == ["WebFetch(domain:github.com)"]
+    assert [r for r in BASE["routes"] if r["route"] == "github"] == [
+        {"route": "github", "type": "egress", "hosts": ["github.com"]}]
+
+    w2, _, _ = _world(tmp_path / "two")
+    (w2.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(
+        {"format": BASE["format"], "routes": [{k: v for k, v in r.items() if k != "hosts"} for r in BASE["routes"]]}))
+    s2 = _prepared(w2)
+    w2.session = s2
+    code, line = w2.main(["render", s2], _blob())
+    assert line["refused"] == "base-map-malformed", line
