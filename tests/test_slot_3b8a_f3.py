@@ -114,8 +114,10 @@ def _doctor_store(tmp: Path, tags: dict) -> Path:
 def _test_user_seams(**over):
     """The runtime's predicates with root and the front account both mapped to this test's own uid."""
     uid = os.getuid()
-    return H.Seams(host="linux", trusted=lambda st: st.st_uid == uid and not st.st_mode & 0o022,
-                   account_uid=lambda name: uid, **over)
+    kw = dict(host="linux", trusted=lambda st: st.st_uid == uid and not st.st_mode & 0o022,
+              account_uid=lambda name: uid)
+    kw.update(over)
+    return H.Seams(**kw)
 
 
 def _front_row(store: Path, seams=None):
