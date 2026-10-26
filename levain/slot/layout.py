@@ -2,12 +2,14 @@
 ``install``, §2.2 dirs), as data rows plus the Steps that create them.
 
 A cell that names only an owner means owner : that owner's own primary group (root : the host's
-gid-0 group). A directory is made, then chowned, then chmodded, so the mode (setgid included) is
-set last and no chown can clear it.
+gid-0 group). A directory is made, then chowned, then (macOS) its extended ACL cleared, then chmodded,
+so the mode (setgid included) is set last and no chown can clear it.
 """
 from __future__ import annotations
 
+import functools
 import os
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Literal, Mapping
@@ -139,12 +141,16 @@ def admits_root(st: os.stat_result) -> bool:
 def store_dir_row(host: HostOS, parts: Iterable[str]) -> "Row | None":
     """The :func:`base_store_rows` directory row of ``L/<parts>``, or None for a dir no base row makes (a session's or
     a slot's: every :func:`slot_store_rows` row is root's)."""
-    want = tuple(parts)
+    return _store_dir_rows(host).get(tuple(parts))
+
+
+@functools.lru_cache(maxsize=None)
+def _store_dir_rows(host: HostOS) -> Mapping[tuple, Row]:
+    """:func:`base_store_rows`' directory rows by their parts below ``L``, built once per host (the helper looks one
+    up for every component of every trusted open)."""
     L = STORE[host]
-    for r in base_store_rows(host, _ANY_OPERATOR):
-        if r.kind == "dir" and r.path.relative_to(L).parts == want:
-            return r
-    return None
+    return types.MappingProxyType({r.path.relative_to(L).parts: r for r in base_store_rows(host, _ANY_OPERATOR)
+                                   if r.kind == "dir"})
 
 
 def policy_rows(host: HostOS) -> list[Row]:
@@ -218,10 +224,14 @@ def row_steps(host: HostOS, rows: Iterable[Row]) -> list[Step]:
         else:
             # Created only when absent: a lock file is never replaced under a process holding it.
             steps.append(Step(f"create {p}", write=(r.path, "", r.mode), skip_if=(t["test"], "-e", p)))
-        steps += [
-            Step(f"own {p} as {r.owner}:{r.group}", (t["chown"], f"{r.owner}:{r.group}", p)),
-            Step(f"set {p} to {r.mode:04o}", (t["chmod"], f"{r.mode:04o}", p)),
-        ]
+        steps.append(Step(f"own {p} as {r.owner}:{r.group}", (t["chown"], f"{r.owner}:{r.group}", p)))
+        if host == "darwin":
+            # A numeric chmod leaves an extended ACL in place, and the trust check reads only owner and mode bits, so
+            # a grant an earlier owner set (add_file, delete_child) would outlive this row. Cleared after the chown:
+            # until then the old owner can still add an entry, as an owner always can. Linux: no install code reads
+            # or writes POSIX ACLs, so a Linux row has no such step.
+            steps.append(Step(f"no extended ACL on {p}", (t["chmod"], "-N", p)))
+        steps.append(Step(f"set {p} to {r.mode:04o}", (t["chmod"], f"{r.mode:04o}", p)))
     return steps
 
 

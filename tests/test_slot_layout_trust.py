@@ -211,3 +211,111 @@ def test_the_root_predicate_is_every_root_rows_own_shape(host):
     for parts, r in rows.items():
         st = os.stat_result((stat.S_IFDIR | r.mode, 1, 1, 2, _uid(r.owner), _gid(r.group), 0, 0, 0, 0))
         assert LY.admits_root(st) is (r.owner == "root"), parts
+
+
+# --- the runtime seam: every trusted open the helper makes while it runs a verb --------------------------------------
+# The source scan above reads call sites with a regex, so a call written another way (a nested paren, a starred or
+# computed first part, a single-quoted literal) drops out of it. This seam records what Store.open_dir is ASKED at
+# runtime, while real verbs run through runtime_helper.main, and checks each one against the layout row it names.
+
+def _load(name: str):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(f"layout_trust_{name}", Path(__file__).with_name(f"{name}.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class OpenLog:
+    """Every ``Store.open_dir`` call, recorded before the real one runs, as ``(host, parts, trusted)``."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.opens: list = []
+        real, log = RH.Store.open_dir, self.opens
+
+        def open_dir(store, *parts, trusted=True):
+            log.append((store.seams.host, tuple(parts), trusted))
+            return real(store, *parts, trusted=trusted)
+        monkeypatch.setattr(RH.Store, "open_dir", open_dir)
+
+    def checked(self) -> set:
+        """Every ``(host, prefix)`` the open checks trusted: each prefix of a trusted open, every prefix but the last
+        of an untrusted one (``Store.open_dir``)."""
+        out = set()
+        for host, parts, trusted in self.opens:
+            for n in range(1, len(parts) + (1 if trusted else 0)):
+                out.add((host, parts[:n]))
+        return out
+
+    def off_row(self) -> dict:
+        """Each checked dir that has a layout row the row itself fails: not root's, or a shape ``admits_root``
+        refuses. A dir with no base row (a session's, a slot's) is the verb's to make root's and is not judged here."""
+        bad = {}
+        for host, parts in self.checked():
+            row = LY.store_dir_row(host, parts)
+            if row is None:
+                continue
+            st = os.stat_result((stat.S_IFDIR | row.mode, 1, 1, 2, _uid(row.owner), _gid(row.group), 0, 0, 0, 0))
+            if row.owner != "root" or not LY.admits_root(st):
+                bad["/".join(parts)] = (row.owner, oct(row.mode))
+        return bad
+
+
+@pytest.fixture
+def open_log(monkeypatch):
+    return OpenLog(monkeypatch)
+
+
+def test_discard_and_restore_open_trusted_only_dirs_their_rows_give_root(open_log, tmp_path):
+    rv = _load("test_slot_rootverbs_discard_restore")
+    world = rv.World(tmp_path)
+    assert world.main("discard")[0] == RH.EXIT_OK
+    assert world.main("restore")[0] == RH.EXIT_OK
+    rows = {p for _h, p in open_log.checked() if LY.store_dir_row("darwin", p) is not None}
+    # the seam saw the verbs' own Store opens; the retained -> trash move itself goes by path in store_verbs, not
+    # through Store (an observation for the head, 1026+8 adoptf1)
+    assert {("alloc",), ("policy",)} <= rows, sorted(rows)
+    assert not open_log.off_row(), open_log.off_row()
+
+
+def test_adopt_open_and_verify_open_trusted_only_dirs_their_rows_give_root(open_log, tmp_path):
+    """The verbs that broke: adopt-open's ``export/operator`` open refused ``bad-root`` on r3c10-vm (1026+8 A1)."""
+    av = _load("test_slot_s5d1b_adopt_verify")
+    if sys.platform != "darwin" or av.fx.GIT is None or not os.path.exists(av.ER.HDIUTIL):
+        pytest.skip("the seam run needs macOS hdiutil and a git")
+    vrig = av.VRig(tmp_path)                        # runs adopt-open, asserting it exits 0
+    try:
+        rc, _out, err = vrig.verify()
+        assert rc == 0, err
+    finally:
+        vrig.rig.cleanup()
+    rows = {p for _h, p in open_log.checked() if LY.store_dir_row("darwin", p) is not None}
+    assert {("export",), ("export", "operator"), ("alloc",), ("retained",)} <= rows, sorted(rows)
+    assert not open_log.off_row(), open_log.off_row()
+
+
+def test_the_seam_goes_red_on_a_row_another_account_owns(open_log, tmp_path, monkeypatch):
+    """The seam is not vacuous: with the row 041f062d had (``export/operator`` ``_levain_export`` 2750), a recorded
+    trusted open of it is named."""
+    host = "darwin"
+    real = LY._store_dir_rows(host)
+    old = LY.Row(LY.STORE[host] / "export" / "operator", "_levain_export", "levain-export", 0o2750)
+    patched = {**real, ("export", "operator"): old}
+    monkeypatch.setattr(LY, "store_dir_row", lambda h, parts: patched.get(tuple(parts)) if h == host
+                        else real.get(tuple(parts)))
+    open_log.opens.append((host, ("export", "operator", "s-x"), False))
+    assert open_log.off_row() == {"export/operator": ("_levain_export", "0o2750")}
+
+
+def test_the_row_lookup_builds_the_layout_once_per_host(monkeypatch):
+    LY._store_dir_rows.cache_clear()
+    calls = []
+    real = LY.base_store_rows
+    monkeypatch.setattr(LY, "base_store_rows", lambda h, op: calls.append(h) or real(h, op))
+    try:
+        for _ in range(3):
+            assert LY.store_dir_row("darwin", ("export", "operator")).owner == "root"
+            assert LY.store_dir_row("darwin", ("live", "s-x")) is None
+        assert calls == ["darwin"]
+    finally:
+        LY._store_dir_rows.cache_clear()

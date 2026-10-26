@@ -365,7 +365,8 @@ def test_store_layout(host):
         assert rows[L / rel if rel else L] == want, rel
         p = str(L / rel if rel else L)
         mk = [i for i, s in enumerate(plan.steps) if s.argv and s.argv[-1] == p and s.argv[0].endswith("mkdir")]
-        chmod = [i for i, s in enumerate(plan.steps) if s.argv and s.argv[-1] == p and s.argv[0].endswith("chmod")]
+        chmod = [i for i, s in enumerate(plan.steps) if s.argv and s.argv[-1] == p and s.argv[0].endswith("chmod")
+                 and s.argv[1] != "-N"]                     # -N: the macOS ACL clear (tests/test_slot_layout_acl.py)
         assert mk and chmod and mk[0] < chmod[0] and plan.steps[chmod[0]].argv[1] == f"{mode:04o}", rel
     # a verifier slot has no keep/ (§2.1: L/slots/e<n>/keep only)
     assert L / "slots/v0/keep" not in rows
