@@ -6,6 +6,7 @@ stand-ins, verified by ssh-keygen through the replay). Root's allowed-signers fi
 test-only owner override (``tests/conftest.py``)."""
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
 import sqlite3
@@ -21,6 +22,7 @@ from levain.graduation_policy import AuthorityCoverage
 
 pytest.importorskip("cryptography")
 from tests.test_authority_graduation_kind import GP, GP2, STORE, T0, World, grad, opt_in, renew  # noqa: E402
+from tests.autonomic_confirm_keys import anchor_scratch  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -37,9 +39,22 @@ def key(world: World, name: str) -> str:
     return world.state().keys[world.fp(name)].public_key
 
 
+_ROOT_DIRS: dict[Path, Path] = {}
+
+
+def root_dir(tmp: Path) -> Path:
+    """The directory of root's allowed-signers file for the test whose temp dir is ``tmp``: a private dir under the
+    account home (``tests/autonomic_confirm_keys.anchor_scratch``), never under ``tmp``, whose ancestors on Linux
+    include the world-writable ``/tmp`` that ``trust_anchor_problem`` refuses. Removed at exit."""
+    d = _ROOT_DIRS.get(tmp)
+    if d is None:
+        d = _ROOT_DIRS[tmp] = anchor_scratch("grad-root-")
+        atexit.register(shutil.rmtree, d, True)
+    return d
+
+
 def write_root(world: World, *names: str, namespaces: str = "levain-authority") -> Path:
-    d = world.tmp / "root"
-    d.mkdir(exist_ok=True)
+    d = root_dir(world.tmp)
     path = d / "allowed_signers"
     tmp = d / ".allowed_signers.new"
     tmp.write_text("".join(f'{n} namespaces="{namespaces}" {key(world, n)}\n' for n in names))
@@ -49,7 +64,7 @@ def write_root(world: World, *names: str, namespaces: str = "levain-authority") 
 
 
 def source(world: World, **kw) -> AuthorityCoverage:
-    return AuthorityCoverage(world.root, allowed_signers=world.tmp / "root" / "allowed_signers", store_id=STORE, **kw)
+    return AuthorityCoverage(world.root, allowed_signers=root_dir(world.tmp) / "allowed_signers", store_id=STORE, **kw)
 
 
 def create(world: World, signer: str = "laptop", **over):
@@ -103,7 +118,7 @@ def test_an_action_at_another_risk_another_action_or_another_store_is_not_covere
     assert covers(src, world, Effect("doc.append", ActionRisk(RiskClass(0), reversible=True, external=False,
                                                               financial=False), None, None, None)) == COVER_NONE
     assert covers(src, world, Effect("mail.send", LOW, None, None, None)) == COVER_NONE
-    other = AuthorityCoverage(world.root, allowed_signers=world.tmp / "root" / "allowed_signers",
+    other = AuthorityCoverage(world.root, allowed_signers=root_dir(world.tmp) / "allowed_signers",
                               store_id="store-" + "cd" * 16)
     assert covers(other, world) == COVER_NONE
 
@@ -286,8 +301,7 @@ def test_fix1_a_covered_peek_whose_anchor_cannot_be_read_is_moved(world):
 
 def test_fix2_an_empty_or_missing_log_covers_nothing_and_the_peek_answers_none_not_moved(tmp_path):
     from levain.cockpit.firejournal import CockpitDB
-    signers = tmp_path / "root" / "allowed_signers"
-    signers.parent.mkdir()
+    signers = root_dir(tmp_path) / "allowed_signers"
     signers.write_text('laptop namespaces="levain-authority" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA\n')
     os.chmod(signers, 0o644)
     root = tmp_path / "cockpit"
