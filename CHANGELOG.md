@@ -124,6 +124,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   If anything fails part way, the old pin and store are put back. A replace interrupted part way leaves a marker; until
   a `--replace` is run again, the control and keys services refuse to start, and that run first finishes the
   interrupted replace or puts the old store back. On an install where keys never ran, the replace also holds keys off.
+- **The cockpit answers an agent's consent request with your passkey.** On the Needs-you card, Allow and Deny open the
+  sign sheet with that answer picked, and an undecided request can be ruled from the decisions panel. The checks are the
+  phone page's own. An answer a passkey cannot give here (allowing a T3 request) stays a terminal command, and a cockpit
+  served on a port says where the request can be answered instead of asking for a passkey. A ruling is confirmed as soon
+  as it is recorded; its delivery to the session continues on its own.
+- **The consent sheet treats a request as changed when the words an option shows, or the exact line it signs, change.**
 
 ### Changed
 - **A coordinator store made by an earlier version is updated the first time a `levain` command that writes to it
@@ -159,6 +165,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **A session's `budget_overrun` in CONTROL's `STATUS` goes away when the session is purged.**
 - **On an OpenRouter route, a response from another model that reports a cost above the call's hold but no token
   counts is charged that cost** (it was charged only the hold).
+- **The levain home a consent hook protects comes from the environment the hook read when it started,** the same as
+  everything else on its decision path. When the hook cannot open its queue, a write to the configured cockpit's
+  authority store is still refused.
+- **Chat: a read that crosses a turn boundary still answers or interrupts the control requests it carries,** so a
+  pending request no longer leaves the CLI waiting while the read is refused. Read again, it does not re-send an
+  interrupt or reply it already delivered; a later request that reuses an answered request id is answered.
+- **Chat: a control request whose reply keeps failing is answered on every read, but the turn is interrupted for it
+  only once.** An activation or re-enable waits for a read in progress, so that read's interrupt never reaches a turn
+  started after it. A control reply the session does not hold still latches the launch off.
+- **Chat: a Read whose path (or a launch directory) contains a NUL byte latches the launch off instead of erroring.**
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - **The graduation engine behind `levain binding graduate`.** Once the binding driver is wired, it takes the steps a
