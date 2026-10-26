@@ -350,7 +350,25 @@ def test_codex_config_passes_only_as_rendered(env):
     cfg.write_bytes(rendered)
     assert w.main(["start", s])[1]["ok"]
     (v,) = la.of("vendor")
-    assert v["spec"]["argv"] == [f"{VENDOR_PREFIX['linux']}/bin/codex"]
+    assert v["spec"]["argv"] == [f"{VENDOR_PREFIX['linux']}/bin/codex", "-c", 'web_search="disabled"']
+
+
+def test_codex_launch_pins_web_search_over_a_trusted_repo_layer(env):
+    """WF-1a L3 r1 W1: the session's repo is trusted in CODEX_HOME's config, so its own ``.codex/config.toml`` is a
+    Codex config layer ranked above CODEX_HOME's; a repo asking for ``web_search = "live"`` still launches with
+    the ``-c`` override, the layer above both (run: 1026-2/wf1af/RETURN.md)."""
+    w, la, _ = env
+    s = _rendered(w, "egress", "interactive", "codex", "brokered", blob=_blob(vendor="codex"))
+    S = _S(w, s)
+    cfg = (S / "config" / "codex" / "config.toml").read_text()
+    assert 'web_search = "disabled"' in cfg.splitlines() and 'trust_level = "trusted"' in cfg.splitlines()
+    (S / "repo" / ".codex").mkdir(parents=True, exist_ok=True)
+    (S / "repo" / ".codex" / "config.toml").write_text('web_search = "live"\n')
+    assert w.main(["start", s])[1]["ok"]
+    (v,) = la.of("vendor")
+    argv = v["spec"]["argv"]
+    assert argv[0] == f"{VENDOR_PREFIX['linux']}/bin/codex"
+    assert argv[1:] == ["-c", 'web_search="disabled"']
 
 
 def test_vendor_env_holds_handles_clone_and_forwarder_do_not(env):

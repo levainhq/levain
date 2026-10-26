@@ -679,3 +679,58 @@ def test_golden_text_per_os_vendor_class():
         got[(host, vendor, "egress")] = _digest(rd.render(*egress(host, vendor)))
         got[(host, vendor, "none")] = _digest(rd.render(*verifier(host, vendor)))
     assert got == GOLD_DIGESTS
+
+
+def test_egress_route_without_hosts_renders_no_allow_rule():
+    """WF-1a L3 r1 ruling (route_hosts has no producer until WF-1b): an egress route the session names with no hosts
+    entry renders no allow rule, so the fetch prompts or is denied and the front still decides (fail closed)."""
+    for host in ("darwin", "linux"):
+        blob, facts = egress(host, "claude")
+        assert "github" in blob.routes and ROUTES["github"] == "egress" and facts.route_hosts == {}
+        s = rd.render_cc_settings(blob, facts)
+        assert "allow" not in s["permissions"]
+        assert not any(k == "permissions.allow" for k in rd.expected_effective_cc(blob, facts))
+        assert "WebFetch(" not in rd.render(blob, facts).file("root/settings.json").data.decode()
+
+
+class _Boom:
+    def __iter__(self):
+        raise RuntimeError("not a host list")
+
+
+def test_egress_hosts_malformed_facts_refused_by_name():
+    """WF-1a L3 r1 W2: a route_hosts fact of the wrong shape is refused ``bad-config``, never a raw traceback."""
+    for bad in (None, ["github"], {"github": _Boom()}, {"github": ("github.com", None)}, {"github": "github.com"},
+                {"github": {"github.com": 1}}, {"github": ("github.com", b"api.github.com")}):
+        blob, facts = egress("darwin", route_hosts=bad)
+        e = refused(rd.render, blob, facts)
+        assert e.name == "bad-config", bad
+
+
+def test_egress_hosts_scoped_to_the_egress_class():
+    """WF-1a L3 r1 W4: only an egress-class session reads route_hosts; the none class renders none of it."""
+    blob, facts = verifier(route_hosts={"github": ("NOT A HOST",)})
+    assert rd.egress_hosts(blob, facts) == ()
+    rd.render(blob, facts)
+
+
+def test_codex_launch_pins_web_search_above_a_trusted_repo():
+    """WF-1a L3 r1 W1, from the run (1026-2/wf1af/RETURN.md, Codex 0.162.1 app-server ``config/read``): a trusted
+    repo's ``.codex/config.toml`` ``web_search = "live"`` wins over CODEX_HOME's ``disabled``; a ``-c`` override
+    is the ``sessionFlags`` layer above it. The launch args parse as Codex parses ``-c`` (a TOML value)."""
+    import tomllib
+
+    args = rd.CODEX_LAUNCH_ARGS
+    assert len(args) % 2 == 0 and all(f == "-c" for f in args[::2])
+    pinned = {}
+    for kv in args[1::2]:
+        k, _, v = kv.partition("=")
+        pinned[k] = tomllib.loads(f"x = {v}")["x"]
+    assert pinned == {"web_search": rd.CODEX_WEB_SEARCH} and rd.CODEX_WEB_SEARCH == "disabled"
+
+
+def test_repo_settings_proxy_env_of_the_wrong_shape_is_malformed():
+    """WF-1a L3 r1 LOW-2: an ``env`` that is not an object is refused as malformed before any name is matched."""
+    for env in (["HTTPS_PROXY"], "HTTPS_PROXY=x", None, 1):
+        got = rd.repo_loosening_refusals({".claude/settings.json": {"env": env}})
+        assert [x.name for x in got] == ["repo-settings-malformed"], env
