@@ -187,15 +187,30 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
     reader that finds the rescue stale too raises ``TimeoutError`` at once and starts nothing, and a new rescue starts only
     once one of them returns. The abandoned build, if it ever returns or raises, gives its own caller its view or its
     exception but neither caches it nor removes the replacement, and the readers that waited on it look again (the cache or
-    the replacement), never taking its result. A write's own read (``ctx.fresh``) and a view that carries an error
-    are never cached."""
+    the replacement), never taking its result. The bound covers every build: a write's own read (``ctx.fresh``) and a read
+    whose store signature cannot be taken build without a flight, but take a slot of the same count and raise ``TimeoutError``
+    at once when both are out. Those two, and a view that carries an error, are never cached."""
     def build() -> SubstrateView:
         key = id(source)
         deadline = time.monotonic() + PANEL_READ_DEADLINE_S      # one budget for all the waits of this read
         while True:
             sig = None if ctx.fresh else _store_signature(source)      # retaken on every pass: a pass is a new look
             if sig is None:
-                return source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
+                # uncached (a write's read, or a signature that cannot be taken): it takes a slot of the same per-source
+                # bound, never registers or joins a flight and never caches
+                with _view_cache_lock:
+                    if _view_builds.get(key, 0) >= VIEW_BUILDS_PER_SOURCE:
+                        raise TimeoutError(f"shared read 'view' did not finish in {PANEL_READ_DEADLINE_S:g}s")
+                    _view_builds[key] = _view_builds.get(key, 0) + 1
+                try:
+                    return source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
+                finally:
+                    with _view_cache_lock:
+                        left = _view_builds.get(key, 1) - 1
+                        if left > 0:
+                            _view_builds[key] = left
+                        else:
+                            _view_builds.pop(key, None)
             with _view_cache_lock:
                 hit = _view_cache.get(key)
                 if hit and hit[0] is source and hit[1] == sig and time.monotonic() - hit[2] < VIEW_CACHE_MAX_AGE_S:

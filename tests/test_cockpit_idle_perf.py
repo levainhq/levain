@@ -441,6 +441,81 @@ def test_with_every_build_hanging_reads_across_many_budget_windows_start_at_most
     assert key not in providers._view_flights and key not in providers._view_builds
 
 
+def test_with_no_signature_and_every_build_hanging_reads_start_at_most_two_builds(tmp_path: Path, monkeypatch) -> None:
+    """C16b: the uncached path (a signature that cannot be taken) counts its builds against the same per-source bound as a
+    flight build. While two hang, further polls raise TimeoutError at once and start nothing; one returning frees a slot."""
+    import time
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    monkeypatch.setattr(providers, "_store_signature", lambda source: None)
+    entered, hangs, calls = _hung_builds(monkeypatch, src)
+    key = id(src)
+    later: list = []
+    outs: list = []
+    try:
+        for i in range(2):                          # two uncached builds hang
+            ts, out = _readers(src, 1)
+            later += ts
+            outs.append(out)
+            assert entered[i].wait(5), f"build {i + 1} did not start"
+        for _ in range(5):                          # five more polls, bounded
+            t0 = time.monotonic()
+            ts, out = _readers(src, 1)
+            later += ts
+            ts[0].join(2)
+            assert not ts[0].is_alive(), "a poll past the bound started a build and hung"
+            assert len(out) == 1 and isinstance(out[0], TimeoutError), out
+            assert time.monotonic() - t0 < 1.0
+            assert len(calls) == 2, len(calls)
+        assert providers._view_builds.get(key) == 2
+        assert key not in providers._view_flights   # the uncached path never registers a flight
+        hangs[0].set()                              # one hung build returns: a slot is free
+        later[0].join(5)
+        assert not later[0].is_alive()
+        ts, out = _readers(src, 1)
+        later += ts
+        outs.append(out)
+        assert entered[2].wait(5), "no new build after a hung uncached build returned"
+        assert len(calls) == 3, len(calls)
+    finally:
+        for h in hangs:
+            h.set()
+        for t in later:
+            t.join(10)
+    assert not any(isinstance(o, Exception) for out in outs for o in out), outs
+    assert key not in providers._view_builds and key not in providers._view_cache
+
+
+def test_a_fresh_read_takes_the_same_per_source_slot_and_never_caches(tmp_path: Path, monkeypatch) -> None:
+    """C16b: a write's own read (``ctx.fresh``) is bounded by the same count and leaves nothing behind."""
+    from levain.cockpit.engine import ReadContext
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    entered, hangs, calls = _hung_builds(monkeypatch, src)
+    for h in hangs[1:]:
+        h.set()
+    key = id(src)
+    out: list = []
+    import threading
+
+    def go():
+        try:
+            out.append(providers._view(src, ReadContext(datetime.now(timezone.utc), fresh=True)))
+        except Exception as e:                      # noqa: BLE001
+            out.append(e)
+
+    t = threading.Thread(target=go)
+    t.start()
+    try:
+        assert entered[0].wait(5)
+        assert providers._view_builds.get(key) == 1
+    finally:
+        hangs[0].set()
+        t.join(10)
+    assert len(out) == 1 and not isinstance(out[0], Exception), out
+    assert key not in providers._view_builds and key not in providers._view_cache and key not in providers._view_flights
+
+
 def test_a_waiter_on_a_superseded_flight_gets_the_replacements_view_not_the_late_one(tmp_path: Path, monkeypatch) -> None:
     """C17: a reader parked on a flight that is then replaced does not take that flight's result: it leaves the superseded flight
     and gets the replacement's view while the superseded build still hangs; that build returns later, to its own caller only.
