@@ -622,6 +622,9 @@ _LIMIT_TOTAL_S = 10.0
 _LIMIT_ANSWER_CAP = 64 * 1024
 #: The clock every deadline in these rows is read on (a test's seam: patching it never reaches ``time`` itself).
 _clock = time.monotonic
+#: DECISION: the wait for CONTROL's ``KEYS-STATUS`` answer (keys' own report of what the operator cannot read), asked
+#: at most once per run and only when a row meets keys' 0700 directory.
+_KEYS_STATUS_S = 3.0
 #: Provider hosts whose spend limit is an operator setting Levain cannot read: host -> (what the limit is called).
 _PROVIDER_LIMIT_SETTINGS = {"api.anthropic.com": "workspace spend limit", "api.openai.com": "project spend limit"}
 
@@ -742,7 +745,35 @@ def _check_route_trust(store: Path) -> CheckResult:
     return CheckResult(name, True, f"pinned to {t.fingerprint} for store {t.store_id}")
 
 
-def _check_spend_ledger(store: Path) -> CheckResult:
+def _keys_status_asker(run_dir: Path, budget_s: float) -> Any:
+    """A callable answering CONTROL's ``KEYS-STATUS`` (3c-9 session D: keys' report of its ledger size and the
+    brokered routes it serves, which the operator's account cannot read), asked on its first call only and answered
+    within ``budget_s`` of that call; ``None`` for any failure (CONTROL or keys unreachable, a refusal, an answer off its shape), which a
+    row says as held by keys."""
+    memo: list = []
+
+    def ask() -> Any:
+        if not memo:
+            memo.append(_ask_keys_status(run_dir, _clock() + budget_s))
+        return memo[0]
+    return ask
+
+
+def _ask_keys_status(run_dir: Path, deadline: float) -> dict | None:
+    left = deadline - _clock()
+    if left <= 0:
+        return None
+    try:
+        from levain.slot import control
+        from levain.slot.control_client import ControlClient
+
+        with ControlClient(run_dir / "control" / "control.sock", timeout=left) as c:
+            return control._keys_status_answer(c.call("KEYS-STATUS"))
+    except Exception:  # noqa: BLE001 - any failure is "not told", said as held by keys
+        return None
+
+
+def _check_spend_ledger(store: Path, keys_status: Any = lambda: None) -> CheckResult:
     name = "spend ledger"
     path = store / "keys" / "ledger.jsonl"
     try:
@@ -750,6 +781,9 @@ def _check_spend_ledger(store: Path) -> CheckResult:
     except FileNotFoundError:
         return CheckResult(name, True, "not created yet (keys opens it when it first starts)")
     except PermissionError:
+        told = keys_status()
+        if told is not None and told["ledger_bytes"] is not None:
+            return CheckResult(name, True, f"{told['ledger_bytes']:,} bytes (one line per call), as keys reports it")
         return CheckResult(name, True, "held by keys: your account cannot read its size", neutral=True)
     except OSError as exc:
         return CheckResult(name, True, f"could not be read ({exc})", warn=True)
@@ -811,13 +845,14 @@ def _brokered_pairs(policies: Any) -> set:
             if p.type == "brokered" and p.upstream is not None and p.upstream.host and p.credential}
 
 
-def _dispatch_pairs(store: Path, deadline: float) -> tuple[set, CheckResult | None]:
+def _dispatch_pairs(store: Path, deadline: float, keys_status: Any = lambda: None) -> tuple[set, CheckResult | None]:
     """The brokered ``(host, credential)`` pairs of the dispatch routes keys serves, and a row when they cannot be
     told. Read as keys starts (``KeysRoutes.load``, inside the run's ``deadline``); a load ``problem`` means keys
     refuses every dispatch route, so it is the warning and no pairs. Otherwise a route counts in each generation where
     keys' own pin rule (``KeysRoutes.policy``) would serve it, so a route the head generation dropped does not count.
     keys' head sits in keys' own 0700 directory, so the operator's account often cannot read it, which is said as such
-    (neutral). Any failure of the read is this row's warning, never the loss of the base map's rows."""
+    (neutral) unless keys' own report (``keys_status``, CONTROL's ``KEYS-STATUS``) gives the pairs it serves. Any
+    failure of the read is this row's warning, never the loss of the base map's rows."""
     from levain import trust_anchor
     from levain.slot import Refused
     from levain.slot import routemaps
@@ -829,6 +864,12 @@ def _dispatch_pairs(store: Path, deadline: float) -> tuple[set, CheckResult | No
     except FileNotFoundError:
         return set(), None
     except PermissionError:
+        told = keys_status()
+        if told is not None:
+            pairs = {(h, c) for h, c in told["routes"]}
+            if told["routes_problem"] is not None:
+                return pairs, CheckResult(name, True, f"keys reports: {told['routes_problem']}", warn=True)
+            return pairs, None
         return set(), CheckResult(name, True, "held by keys: your account cannot read the dispatch route maps, so "
                                   "the ceilings of their credentials are not shown",
                                   "Run `sudo levain doctor` to read them as root.", neutral=True)
@@ -966,7 +1007,7 @@ def _openrouter_limit_row(store: Path, cred: str, name: str, fetch: Any, timeout
     return CheckResult(name, True, f"key limit {_usd(lim)} total, {_usd(rem)} remaining")
 
 
-def _check_invoice_ceiling(store: Path, fetch: Any) -> list[CheckResult]:
+def _check_invoice_ceiling(store: Path, fetch: Any, keys_status: Any = lambda: None) -> list[CheckResult]:
     """The provider-side limit on each brokered credential in the routes keys serves (the base map and the dispatch
     route maps; design §2.2, the invoice ceiling): OpenRouter's is read within one total deadline; Anthropic's and
     OpenAI's are operator settings Levain cannot read, said as that; any other provider's is said to be unknown."""
@@ -977,7 +1018,7 @@ def _check_invoice_ceiling(store: Path, fetch: Any) -> list[CheckResult]:
     pairs, problem = _base_pairs(store)
     if problem is not None:
         rows.append(CheckResult("invoice ceiling", True, problem, warn=True))
-    more, dispatch_row = _dispatch_pairs(store, deadline)
+    more, dispatch_row = _dispatch_pairs(store, deadline, keys_status)
     pairs |= more
     if dispatch_row is not None:
         rows.append(dispatch_row)
@@ -1037,23 +1078,28 @@ def _guarded(name: str, build: Any) -> list[CheckResult]:
 
 
 def _check_slot_keys(*, host: str | None = None, store: Path | None = None, running: Any = None,
-                     fetch: Any = None) -> list[CheckResult]:
+                     fetch: Any = None, keys_status: Any = None) -> list[CheckResult]:
     """The 3c-9 rows over the brokered-spend install: ``route trust``, ``keys service``, ``spend ledger`` and one
     ``invoice ceiling`` row per brokered credential. Read-only and read as the OPERATOR, so a fact in keys' own
     0700 directory is said as held by keys, never as healthy or failed. No rows before the isolation install. Each
-    row is built on its own (:func:`_guarded`). ``running``/``fetch``: a test's seams."""
+    row is built on its own (:func:`_guarded`). A row that meets keys' directory asks keys through CONTROL instead
+    (``keys_status``; the default asks the installed CONTROL, and with a test's ``store`` it asks nothing).
+    ``running``/``fetch``: a test's seams."""
     from levain.slot import layout
 
     if host is None:
         host = "darwin" if sys.platform == "darwin" else "linux"
+    if keys_status is None:
+        keys_status = (_keys_status_asker(layout.RUN[host], _KEYS_STATUS_S) if store is None
+                       else (lambda: None))
     store = store if store is not None else layout.STORE.get(host)
     if store is None or not (store / "policy").is_dir():
         return []
     rows = _guarded("route trust", lambda: _check_route_trust(store))
     rows += _guarded("keys service", lambda: _check_keys_service(host, running or _unit_running,
                                                                  _egress_in_service(store)))
-    rows += _guarded("spend ledger", lambda: _check_spend_ledger(store))
-    rows += _guarded("invoice ceiling", lambda: _check_invoice_ceiling(store, fetch))
+    rows += _guarded("spend ledger", lambda: _check_spend_ledger(store, keys_status))
+    rows += _guarded("invoice ceiling", lambda: _check_invoice_ceiling(store, fetch, keys_status))
     return rows
 
 
