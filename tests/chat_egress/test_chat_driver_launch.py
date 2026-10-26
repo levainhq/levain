@@ -79,6 +79,88 @@ def _chat_tmp(tmp: Path) -> Path:
     return d
 
 
+def _describe_children(pids) -> list[str]:
+    """Each pid as `pid ppid pgid state command` from `ps`, which lists a zombie on macOS and Linux alike (Linux's
+    pgrep lists one too; macOS's does not): what a leftover child of this process is, named in the failure."""
+    if not pids:
+        return []
+    out = subprocess.run(["ps", "-o", "pid=,ppid=,pgid=,stat=,command=", "-p", ",".join(str(p) for p in pids)],
+                         capture_output=True, text=True).stdout
+    return [" ".join(line.split()) for line in out.splitlines()] or [f"{p}: gone by the time ps ran" for p in pids]
+
+
+def _record_spawns(monkeypatch) -> list[tuple[int, list[str], subprocess.Popen]]:
+    """Record (pid, argv, the Popen) of every Popen this process starts from here on: a zombie's `ps` command carries
+    no argv on Linux (`[python3] <defunct>`), so a leftover is told apart by what it was started as. Holding the Popen
+    keeps its exit status (`returncode`) and stops subprocess's own cleanup of a dropped one."""
+    spawned: list[tuple[int, list[str], subprocess.Popen]] = []
+    real = subprocess.Popen
+
+    class Recording(real):
+        def __init__(self, args, *a, **k):
+            super().__init__(args, *a, **k)
+            spawned.append((self.pid, [str(x) for x in (args if isinstance(args, (list, tuple)) else [args])], self))
+    monkeypatch.setattr(subprocess, "Popen", Recording)
+    return spawned
+
+
+def _ping_spawns(spawned, tmp: Path) -> dict[int, subprocess.Popen]:
+    """The renew ping's two detached children among the recorded spawns: its notify command (`ping.sh`, argv[0] the
+    absolute path) and its record writer (`python -P -m levain.webpush send`, `webpush.sender.spawn`)."""
+    return {pid: proc for pid, argv, proc in list(spawned)
+            if argv[0] == str(tmp / "ping.sh") or "levain.webpush" in argv}
+
+
+def _wait_detached(procs: dict[int, subprocess.Popen], timeout: float = 10.0) -> dict[int, int | None]:
+    """Reap each detached child once it exits, up to `timeout` s in all; pid -> exit status, None for one still
+    running then. The renew ping's notify command and its record writer are started detached and never waited on by
+    design (`consent.adapters.claude_code.notify`, `webpush.sender.spawn`), so the test reaps its own."""
+    end = time.monotonic() + timeout
+    status = {pid: proc.poll() for pid, proc in procs.items()}
+    while any(rc is None for rc in status.values()) and time.monotonic() < end:
+        time.sleep(0.05)
+        status = {pid: proc.poll() for pid, proc in procs.items()}
+    return status
+
+
+def _in_process_table(pids) -> list[int]:
+    """Which of `pids` `ps` still lists (a zombie included, on macOS and Linux alike)."""
+    if not pids:
+        return []
+    out = subprocess.run(["ps", "-o", "pid=", "-p", ",".join(str(p) for p in pids)],
+                         capture_output=True, text=True).stdout
+    return sorted(int(x) for x in out.split())
+
+
+def _only_the_ping_is_left(spawned, before: set[int], tmp: Path) -> set[int]:
+    """After a real launch whose renew ping fired (`_notify_queue(tmp)`): every other process this one started since
+    `before` is exited, reaped by its owner (never polled here, which would reap it) and gone from the process table (the glue included), and the ping's two detached
+    children are reaped here once they exit 0. Returns the ping's pids. Neither ping child is waited on by the launch,
+    so either may outlive its end (Linux CI 10-25 failed a bare child count on the pid just before the CLI's, the
+    slot the record writer takes), and the record writer is spawned after the notify command, so the census waits for
+    both spawns to be recorded first."""
+    from .test_launch import _node_children
+
+    end = time.monotonic() + 10.0
+    while len(_ping_spawns(spawned, tmp)) < 2 and time.monotonic() < end:
+        time.sleep(0.05)
+    ping = _ping_spawns(spawned, tmp)
+    assert len(ping) == 2, f"the renew ping started {len(ping)} detached children, expected 2: {sorted(ping)}"
+    left = {p.pid for p in _node_children()} - before
+    print(f"RUN children left: {_describe_children(sorted(left))}; the renew ping's {sorted(ping)}")
+    assert left - set(ping) == set(), _describe_children(sorted(left - set(ping)))   # the glue, and anything else, is gone
+    others = {pid: proc for pid, _argv, proc in list(spawned) if pid not in ping}
+    unreaped = sorted(pid for pid, proc in others.items() if proc.returncode is None)
+    assert unreaped == [], f"started and not exited or not reaped: {_describe_children(unreaped)}"
+    still = _in_process_table(sorted(others))
+    assert still == [], f"in the process table after the launch ended: {_describe_children(still)}"
+    status = _wait_detached(ping)
+    assert all(rc == 0 for rc in status.values()), (
+        f"the renew ping's children exit 0 (pid: status, None = still running): {status}; "
+        f"{_describe_children([pid for pid, rc in status.items() if rc != 0])}")
+    return set(ping)
+
+
 class _FakeEgress:
     launch_id = "L1"
 
@@ -447,6 +529,7 @@ def test_run_two_real_launches_on_one_service(tmp_path, monkeypatch):
     real_start = lm.start_egress
     monkeypatch.setattr(lm, "start_egress", lambda **kw: pems.append(kw["ca_pem"]) or real_start(**kw))
     before = {p.pid for p in _node_children()}
+    spawned = _record_spawns(monkeypatch)
     svc = cd.ChatEgressService(state_dir=tmp_path / "state", store=store, queue_dir=q, node=envmod.node_bin(),
                                srt_prefix=envmod.srt_prefix(), now=NOW)
     ends = []
@@ -479,7 +562,7 @@ def test_run_two_real_launches_on_one_service(tmp_path, monkeypatch):
         assert out.egress.glue_exit == 0 and out.egress.final_flush is not None and out.failures == ()
         assert out.tmp_leftovers == ()
     assert lines == [cd.renew_message(renew.RenewDue("k-soon", "a.example", NOW + timedelta(days=2)))]   # pinged once
-    assert {p.pid for p in _node_children()} <= before and dm.service_threads() == []
+    assert len(_only_the_ping_is_left(spawned, before, tmp_path)) == 2 and dm.service_threads() == []
 
 
 def _second_launch(store) -> str:

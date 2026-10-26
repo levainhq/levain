@@ -22,7 +22,8 @@ from levain.chat_egress import launch as lm
 from levain.chat_egress import renew
 from levain.consent.adapters import claude_code
 
-from .test_chat_driver_launch import _STOPPED, _chat_tmp, _cli, _FakeEgress, _kill_group, _members
+from .test_chat_driver_launch import (_STOPPED, _chat_tmp, _cli, _FakeEgress, _kill_group, _members,
+                                     _only_the_ping_is_left, _record_spawns)
 
 NOW = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
 
@@ -402,6 +403,7 @@ def test_run_a_real_launch_whose_stop_egress_fails_once(tmp_path, monkeypatch):
         record_id="k-soon", canonical_host="a.example", credential_source="svc", declared_repos=frozenset(),
         attach=True, credential_account="acct", incarnation="1:x")])
     before = {p.pid for p in _node_children()}
+    spawned = _record_spawns(monkeypatch)
     svc = cd.ChatEgressService(state_dir=tmp_path / "state", store=store, queue_dir=q, node=envmod.node_bin(),
                                srt_prefix=envmod.srt_prefix(), now=NOW)
     t = _chat_tmp(tmp_path / "run")
@@ -442,7 +444,7 @@ def test_run_a_real_launch_whose_stop_egress_fails_once(tmp_path, monkeypatch):
     assert second.cli == first.cli and second.complete and second.failures == ()
     assert second.egress.glue_exit == 0 and second.egress.final_flush is not None and len(stops) == 2
     assert not t.exists() and _members(proc.pid) == []
-    assert {p.pid for p in _node_children()} <= before and dm.service_threads() == []
+    assert len(_only_the_ping_is_left(spawned, before, tmp_path)) == 2 and dm.service_threads() == []
 
 
 # --- chatint (`1025-25/cdfix3/VERIFY_ALL.md`, complement N1): the Linux group wait reads /proc --------------------
