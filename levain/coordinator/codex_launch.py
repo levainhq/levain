@@ -63,7 +63,6 @@ launch whose thread keeps answering with an error other than "not loaded" stays 
 """
 from __future__ import annotations
 
-import base64
 import contextlib
 import hashlib
 import json
@@ -71,7 +70,6 @@ import os
 import shlex
 import socket
 import sqlite3
-import struct
 import sys
 import time
 from collections.abc import Iterator
@@ -80,6 +78,7 @@ from typing import Any
 
 from levain.contracts.canon import canonical_bytes
 from levain.coordinator import lease as lease_mod
+from levain.coordinator.codex_wire import _CALL_TIMEOUT, _CONNECT_TIMEOUT, CodexError, WsFraming
 from levain.coordinator.lease import LeaseRefused
 from levain.coordinator.store import CoordError, CoordStore
 
@@ -94,19 +93,7 @@ _GATE_TRUSTED = "wired to this install and trusted by Codex"
 _HOOKS_ROW = "Codex hooks"
 _HOOKS_OFF = "turned off by"
 DAEMON_REMEDY = "codex app-server daemon start"
-_CONNECT_TIMEOUT = 10.0
-_CALL_TIMEOUT = 60.0
-_MAX_MESSAGE = 16 * 1024 * 1024 + 4096     # the daemon's own header names 16777216 bytes unfragmented
-_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 UNLISTED_RECHECK = 2.0
-
-
-class CodexError(Exception):
-    """The daemon could not be reached, or answered with an error (``.error`` holds its error object then)."""
-
-    def __init__(self, message: str, error: Any = None) -> None:
-        super().__init__(message)
-        self.error = error
 
 
 def codex_home() -> Path:
@@ -119,83 +106,23 @@ def control_socket(home: Path | None = None) -> Path:
 
 
 # --- the client: WebSocket (RFC 6455) over the unix socket, JSON-RPC without the "jsonrpc" field ----------------
-class _Client:
+class _Client(WsFraming):
+    """The framing lives in :mod:`levain.coordinator.codex_wire` (CH-D3 S1 moved it there for the chat wire); this
+    single-shot client keeps its calls."""
+
     def __init__(self, path: Path, timeout: float = _CONNECT_TIMEOUT) -> None:
-        self._s = socket.socket(socket.AF_UNIX)
-        try:
-            self._s.settimeout(timeout)
-            self._s.connect(str(path))
-            key = base64.b64encode(os.urandom(16))
-            self._s.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                            b"Sec-WebSocket-Key: " + key + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                chunk = self._s.recv(4096)
-                if not chunk or len(buf) > 65536:
-                    raise CodexError("the daemon closed the connection during the WebSocket handshake")
-                buf += chunk
-            head, self._buf = buf.split(b"\r\n\r\n", 1)
-            lines = head.split(b"\r\n")
-            if b" 101 " not in lines[0] + b" ":
-                raise CodexError(f"the daemon refused the WebSocket upgrade: {lines[0][:120].decode(errors='replace')}")
-            want = base64.b64encode(hashlib.sha1(key + _GUID).digest())
-            accept = next((ln.split(b":", 1)[1].strip() for ln in lines[1:]
-                           if ln.lower().startswith(b"sec-websocket-accept:")), None)
-            if accept != want:
-                raise CodexError("the daemon's WebSocket accept key does not match")
-        except BaseException:
-            self._s.close()
-            raise
+        super().__init__(path, timeout)
         self._n = 0
 
-    def close(self) -> None:
-        with contextlib.suppress(OSError):
-            self._send(8, b"")
-        self._s.close()
-
-    def _send(self, op: int, payload: bytes) -> None:
-        n = len(payload)
-        head = bytes([0x80 | op]) + (bytes([0x80 | n]) if n < 126 else
-                                     bytes([0x80 | 126]) + struct.pack(">H", n) if n < 65536 else
-                                     bytes([0x80 | 127]) + struct.pack(">Q", n))
-        mask = os.urandom(4)
-        self._s.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
-
-    def _need(self, n: int) -> bytes:
-        while len(self._buf) < n:
-            chunk = self._s.recv(65536)
-            if not chunk:
-                raise CodexError("the daemon closed the connection")
-            self._buf += chunk
-        out, self._buf = self._buf[:n], self._buf[n:]
-        return out
-
     def _message(self) -> dict[str, Any]:
-        msg = b""
         while True:
-            h = self._need(2)
-            fin, op, n = h[0] & 0x80, h[0] & 0x0F, h[1] & 0x7F
-            if n == 126:
-                n = struct.unpack(">H", self._need(2))[0]
-            elif n == 127:
-                n = struct.unpack(">Q", self._need(8))[0]
-            if h[1] & 0x80 or len(msg) + n > _MAX_MESSAGE:
-                raise CodexError("the daemon sent a frame this client does not take (masked, or too large)")
-            payload = self._need(n)
-            if op == 9:
-                self._send(10, payload)
-            elif op == 8:
-                raise CodexError("the daemon closed the connection")
-            elif op in (0, 1, 2):
-                msg += payload
-                if fin:
-                    try:
-                        got = json.loads(msg.decode("utf-8"))
-                    except (UnicodeDecodeError, ValueError) as exc:
-                        raise CodexError(f"the daemon sent a message that is not JSON ({exc})") from None
-                    if isinstance(got, dict):
-                        return got
-                    msg = b""
+            msg = self.recv_message()
+            try:
+                got = json.loads(msg.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise CodexError(f"the daemon sent a message that is not JSON ({exc})") from None
+            if isinstance(got, dict):
+                return got
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
         self._send(1, json.dumps({"method": method, "params": params}).encode())
