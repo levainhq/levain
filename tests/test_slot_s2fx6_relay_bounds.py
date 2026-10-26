@@ -100,7 +100,7 @@ def test_stop_signal_abandons_the_rest_at_once_on_a_terminal_that_trickles(tmp_p
     err = r.stderr()
     assert took < 5                          # not the 8 s the trickling terminal would have kept the drain
     assert int(re.search(r"your terminal did not take the session's last (\d+) bytes", err).group(1)) > 0
-    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "start", "teardown"]
+    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "probe", "start", "teardown"]
 
 
 # --- r4-2: a master still written after the helper exited is read for a bounded time ---------------------------------
@@ -131,7 +131,7 @@ def test_a_process_left_writing_after_the_helper_exited_does_not_hold_the_relay(
                 pass
     err = r.stderr()
     assert took < 15
-    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "start", "teardown"]
+    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "probe", "start", "teardown"]
     assert re.search(r"the vendor's terminal was still being written 0\.5 s after its helper exited: the relay "
                      r"stopped reading it \(\d+ bytes it held, and whatever came after, not shown\)", err)
 

@@ -184,7 +184,7 @@ def test_an_os_failure_at_the_pty_is_named_after_teardown(tmp_path: Path, monkey
         raise OSError(24, "Too many open files")
     r.seams.openpty = emfile
     assert r.run() == 1
-    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "teardown"]
+    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "probe", "teardown"]
     assert "refused os-error: [Errno 24] Too many open files" in r.stderr()
 
 
@@ -268,7 +268,7 @@ def test_stalled_terminal_does_not_block_a_stop_or_teardown(tmp_path: Path, monk
         os.close(out_r)
         os.close(out_w)
     err = r.stderr()
-    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "start", "teardown"]
+    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "probe", "start", "teardown"]
     assert f"session {SESSION} ended RETAINED" in err
     assert re.search(r"your terminal did not take the session's last \d+ bytes", err)
 

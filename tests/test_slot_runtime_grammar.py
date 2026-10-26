@@ -57,7 +57,7 @@ def test_every_verb_parses_for_the_operator():
         "render": ["render", S], "start": ["start", S], "resume": ["resume", S], "teardown": ["teardown", S],
         "confirm-identity": ["confirm-identity", S, "yes"], "adopt-open": ["adopt-open", S],
         "adopt-verify": ["adopt-verify", S, "--bundle-digest", "sha256:" + "0" * 64],
-        "discard": ["discard", S], "restore": ["restore", S], "status": ["status", S],
+        "discard": ["discard", S], "restore": ["restore", S], "status": ["status", S], "probe": ["probe", S],
     }
     assert set(good) == set(rg.VERBS)
     for verb, a in good.items():
@@ -71,9 +71,9 @@ def test_every_verb_parses_for_the_operator():
 
 
 def test_lease_column():
-    # §5.1 Lease: prepare (nonce), render, start, resume, teardown, confirm-identity; not the other four.
+    # §5.1 Lease: prepare (nonce), render, start, resume, teardown, confirm-identity, probe (V13); not the rest.
     assert {v for v in rg.VERBS if argv_for(v).needs_lease} == {
-        "prepare", "render", "start", "resume", "teardown", "confirm-identity"}
+        "prepare", "render", "start", "resume", "teardown", "confirm-identity", "probe"}
 
 
 def argv_for(verb):
@@ -173,8 +173,8 @@ def test_class_kind_auth_rows():
 # --- §5.1 the _levain_dispatch rule ----------------------------------------------------------------
 
 @pytest.mark.parametrize("a", [["adopt-open", S], ["discard", S], ["restore", S], ["confirm-identity", S, "yes"],
-                               ["adopt-open", "../x"], ["confirm-identity"]])
-def test_dispatch_caller_refused_its_four_verbs_before_argv(a):
+                               ["adopt-open", "../x"], ["confirm-identity"], ["probe", S], ["probe"]])
+def test_dispatch_caller_refused_its_forbidden_verbs_before_argv(a):
     assert refused_argv(a, caller=DISPATCH) == "verb-not-allowed-for-caller"
 
 
@@ -278,7 +278,8 @@ def test_stdin_encoding_refusals(raw, name):
 
 
 def test_no_stdin_verbs():
-    for verb in ("start", "resume", "teardown", "confirm-identity", "adopt-open", "discard", "restore", "status"):
+    for verb in ("start", "resume", "teardown", "confirm-identity", "adopt-open", "discard", "restore", "status",
+                 "probe"):
         assert parse_stdin(verb, b"") is None
         assert refused_stdin(verb, b"{}") == "unexpected-stdin"
     assert refused_stdin("PREPARE", b"{}") == "unknown-verb"

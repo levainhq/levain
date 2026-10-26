@@ -11,7 +11,8 @@ What it renders, per (host, vendor, class):
   pre-seeded as ``<S>/config/codex/config.toml`` (§5.5: the one ``config.toml`` under ``CODEX_HOME`` ``start``
   accepts).
 - ``<S>/root/gitconfig`` (``GIT_CONFIG_GLOBAL``), ``<S>/root/env`` (§3.4, exactly), ``<S>/root/profile.sb`` (macOS,
-  §8.1 + §24). ⛔ A profile never holds a ``syscall`` operation (trg-069): :func:`render_profile` refuses its own
+  §8.1 + §24), and beside it for an egress slot ``<S>/root/probe.sb``, V13's probe profile (``render_profile(...,
+  probe=True)``). ⛔ A profile never holds a ``syscall`` operation (trg-069): :func:`render_profile` refuses its own
   output if the word appears anywhere in it.
 - ``<S>/root/readset-template/info/attributes`` (kind ``dispatch|planner|verifier``, §5.4 step 3): the clone's
   template, exactly :data:`READSET_ATTRIBUTES`.
@@ -655,9 +656,14 @@ def _profile_bytes(facts: WallFacts) -> bytes:
     return text.encode("utf-8")
 
 
-def render_profile(blob: RenderBlob, facts: RenderFacts) -> bytes:
+def render_profile(blob: RenderBlob, facts: RenderFacts, *, probe: bool = False) -> bytes:
     """§8.1's classes as SBPL, every path the real ``/private/...`` path, in the forms runs/macos-RM2 and
     runs/macos-RM1b measured (``vm/rm2_profile.sb.in``, ``vm/rm1b_profile.sb.in``), through :func:`profile_lines`.
+
+    ``probe=True`` is V13's probe profile ``<S>/root/probe.sb`` (DESIGN_V13_REV2 §5, head R1): the same lines with
+    exactly ``(deny network-outbound)`` left out. Under ``(allow default)`` outbound is then allowed, so the probe
+    child measures pf alone; the bind and inbound denials, the unix-socket allows and every file, IPC and Mach rule
+    stay. The wall binds this file to the probe's connector argv only (``wall._check_spec``).
 
     Network block (§24): egress without own loopback = outbound to ``localhost:<gwport>`` only; with it,
     outbound/bind/inbound ``localhost:*`` (pf isolates the slots); none class = nothing. AF_UNIX: ``<S>/sock``
@@ -669,7 +675,7 @@ def render_profile(blob: RenderBlob, facts: RenderFacts) -> bytes:
         raise Refused("unsupported-host", "profile.sb is macOS only")
     S = str(facts.S)
     writable = SLOT_WRITABLE + (DRIVER_WRITABLE if facts.slot.slot_class == "none" else ())
-    network = ["(deny network-outbound)", "(deny network-bind)", "(deny network-inbound)"]
+    network = ([] if probe else ["(deny network-outbound)"]) + ["(deny network-bind)", "(deny network-inbound)"]
     if facts.slot.slot_class == "egress":
         if own_loopback(blob, facts):
             network += ['(allow network-outbound (remote ip "localhost:*"))',
@@ -739,6 +745,8 @@ def render(blob: RenderBlob, facts: RenderFacts) -> Rendered:
         files.append(RenderedFile("root/driver.env", env_text(envs["driver"]), 0, rgid, fmode))
     if facts.host == "darwin":
         files.append(RenderedFile("root/profile.sb", render_profile(blob, facts), 0, rgid, fmode))
+        if facts.slot.slot_class == "egress":      # V13: only an egress slot is probed
+            files.append(RenderedFile("root/probe.sb", render_profile(blob, facts, probe=True), 0, rgid, fmode))
     if facts.kind in READSET_KINDS:
         # §2.1: root : root 0644 whatever the class, so the slot can read it and no slot group can change it.
         files.append(RenderedFile(READSET_ATTRIBUTES_PATH, READSET_ATTRIBUTES, 0, 0, 0o644))

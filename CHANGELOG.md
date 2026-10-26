@@ -97,6 +97,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Changed
 - **A coordinator store made by an earlier version is updated the first time a `levain` command that writes to it
   opens it:** the review history gains one column, and every entry is kept as it was.
+- **`levain doctor` has an agent firewall probe row:** each agent slot's last recorded probe result, with its age and
+  session. An open wall fails the row; an unknown or inconclusive result, or a closed one older than a day, warns; a
+  slot never probed says so. Doctor reads the record and never probes.
 
 ### Fixed
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
@@ -132,6 +135,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Chat stores made by an earlier release are brought current when they are opened,** in one transaction that keeps
   every row, replaces any view, trigger or index whose text changed, and checks the file's integrity before committing.
   A store on a file Levain cannot write is read as it is and never changed.
+- **The firewall self-probe** (`levain session` stays hidden): the root runtime helper has a `probe <session>` verb that
+  connects to the vendor's own addresses as the slot user inside its wall and compares the result with the same
+  connects made by root. A session launch runs it between preparing the slot and starting the agent, and starts only
+  when the slot could not reach the vendor directly while root could; a probe that cannot tell (no address resolved,
+  none reachable by root, a probe that did not answer, an answer not exactly the expected shape) is refused by name,
+  never treated as safe. On macOS the probe runs again every minute while the session lives; a slot that reaches the
+  vendor ends the session (its work kept), and so do two probes in a row that cannot answer, or five in a row that
+  cannot tell (for example because the host is offline). Each probe's result is recorded per slot.
 
 ## [0.11.26] — 2026-10-25
 
