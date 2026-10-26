@@ -609,23 +609,61 @@ def write_front_policy(seams: "Seams", slot: SlotId, front_uid: int, data: bytes
 FRONT_LOG_MODE = 0o640
 
 
-def _open_front_log_dir(store: "Store", slot: SlotId, front_uid: Optional[int]) -> Optional[int]:
-    """The checking half of :func:`prepare_front_log`, read-only: ``L/gw/`` opened through ``store.dir(..., trusted=
-    True)`` (a link, a non-directory, a wrong owner or a group/other-writable mode is ``bad-root``), then
-    ``L/gw/slot<n>/`` opened ``O_NOFOLLOW|O_DIRECTORY`` below it and held to :func:`_front_dir_ok`. Only a miss of
-    one of those two (``_openat_dir`` raises ``store-missing`` on ``FileNotFoundError`` and on nothing else) is
+def _statat_dir(parent: int, name: str, where: str) -> os.stat_result:
+    """``name`` below ``parent`` stat'd without following a link and without opening it, so a caller who may search
+    ``parent`` but not read ``name`` gets a verdict: absent (``FileNotFoundError``, and nothing else) is
+    ``store-missing``; a link or any other non-directory is ``bad-root``, as :func:`_openat_dir` refuses them."""
+    try:
+        st = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        raise Refused("store-missing", where) from None
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refused("bad-root", f"{where} is not a directory")
+    return st
+
+
+def _open_front_log_dir(store: "Store", slot: SlotId, front_uid: Optional[int], *,
+                        open_slot: bool = True) -> Optional[int]:
+    """The checking half of :func:`prepare_front_log`: ``L/gw/`` opened through ``store.dir(..., trusted=True)`` (a
+    link, a non-directory, a wrong owner or a group/other-writable mode is ``bad-root``), then ``L/gw/slot<n>/``
+    stat'd below it by :func:`_statat_dir` and held to :func:`_front_dir_ok`. The stat needs search on ``L/gw/`` only,
+    never read on ``L/gw/slot<n>/`` (setup's row, ``layout.slot_store_rows``, gives the operator no access to it).
+    Only a miss of one of those two (each raises ``store-missing`` on ``FileNotFoundError`` and on nothing else) is
     rewritten as the pre-move install, naming the dir that is missing and :func:`layout.repair_line`; a
-    ``store-missing`` from elsewhere keeps its own text. An fd on ``L/gw/slot<n>/`` for the caller to close; with
-    ``front_uid`` None (no front account to judge the slot dir by) only ``L/gw/`` is walked and None is returned.
-    Any other ``OSError`` of the walk is raised as it is."""
+    ``store-missing`` from elsewhere keeps its own text.
+
+    With ``open_slot`` (root's caller), ``L/gw/slot<n>/`` is then opened ``O_NOFOLLOW|O_DIRECTORY`` through the same
+    ``L/gw/`` fd and refused ``bad-root`` unless the fd is the dir that was judged (its ``st_dev``, ``st_ino``): a dir
+    moved, swapped or removed between the stat and the open is never used. The fd is returned for the caller to close.
+    None without ``open_slot``, or with ``front_uid`` None (no front account to judge the slot dir by: only ``L/gw/``
+    is walked). Any other ``OSError`` of the walk is raised as it is."""
     seams = store.seams
-    where = f"gw/slot{slot.index}"
+    name = f"slot{slot.index}"
+    where = f"gw/{name}"
     gw = f"{store.path}/gw"
     try:
         with store.dir("gw", trusted=True) as gfd:
             if front_uid is None:
                 return None
-            fd = _openat_dir(gfd, f"slot{slot.index}", where)
+            st = _statat_dir(gfd, name, where)
+            if not _front_dir_ok(st, seams, front_uid):
+                raise Refused("bad-root", f"{where} is not the front account's alone")
+            if not open_slot:
+                return None
+            try:
+                fd = _openat_dir(gfd, name, where)
+            except Refused as e:
+                if e.name != "store-missing":
+                    raise
+                raise Refused("bad-root", f"{where} changed while it was checked") from None
+            try:
+                got = os.fstat(fd)
+                if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
+                    raise Refused("bad-root", f"{where} changed while it was checked")
+            except BaseException:
+                os.close(fd)
+                raise
+            return fd
     except Refused as e:
         if e.name != "store-missing" or e.detail not in (gw, where):
             raise
@@ -633,22 +671,16 @@ def _open_front_log_dir(store: "Store", slot: SlotId, front_uid: Optional[int]) 
                 else f"{store.path}/{where}: the front log dir is missing")
         raise Refused("store-missing", f"{what} (an install made before it existed); run "
                       f"`{repair_line(seams.host)}` once") from None
-    try:
-        if not _front_dir_ok(os.fstat(fd), seams, front_uid):
-            raise Refused("bad-root", f"{where} is not the front account's alone")
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
 
 
 def check_front_log_dirs(store: "Store", slot: SlotId, front_uid: Optional[int] = None) -> List[Refused]:
     """What a session start on egress ``slot`` would refuse about its front log dirs, without making, chowning or
     writing anything: the front account looked up as render's :func:`slot_ids` does (when ``front_uid`` is not
-    given), then :func:`prepare_front_log`'s own walk (:func:`_open_front_log_dir`). The refusals in the order the
-    runtime meets them, empty when the start would pass them; a missing front account is followed by the ``L/gw/``
-    half, which needs no account. Raises the walk's other ``OSError`` (an unreadable dir) and whatever
-    ``seams.account_uid`` raises that is not a ``Refused``."""
+    given), then :func:`prepare_front_log`'s own walk (:func:`_open_front_log_dir`) up to its final open, which only
+    root's caller makes (``levain doctor`` runs as the operator, who may search ``L/gw/`` but not read
+    ``L/gw/slot<n>/``). The refusals in the order the runtime meets them, empty when the start would pass them; a
+    missing front account is followed by the ``L/gw/`` half, which needs no account. Raises the walk's other
+    ``OSError`` (an unreadable dir) and whatever ``seams.account_uid`` raises that is not a ``Refused``."""
     found: List[Refused] = []
     if front_uid is None:
         try:
@@ -656,12 +688,9 @@ def check_front_log_dirs(store: "Store", slot: SlotId, front_uid: Optional[int] 
         except Refused as e:
             found.append(e)
     try:
-        fd = _open_front_log_dir(store, slot, front_uid)
+        _open_front_log_dir(store, slot, front_uid, open_slot=False)
     except Refused as e:
         found.append(e)
-    else:
-        if fd is not None:
-            os.close(fd)
     return found
 
 
@@ -670,7 +699,8 @@ def prepare_front_log(store: "Store", slot: SlotId, front_uid: int) -> None:
     ``seams.trusted`` (``store.dir(..., trusted=True)`` refuses it ``bad-root``); ``L/gw/slot<n>/`` is the front
     account's (setup's row, ``layout.slot_store_rows``), no group or other write. Either dir missing (an install made
     before the log moved to the store) is ``store-missing`` naming :func:`layout.repair_line`. Those checks are
-    :func:`_open_front_log_dir`, the walk :func:`check_front_log_dirs` runs read-only for ``levain doctor``. The log
+    :func:`_open_front_log_dir`, the walk :func:`check_front_log_dirs` runs read-only for ``levain doctor``; only here
+    is ``L/gw/slot<n>/`` then opened, and only if it is still the dir the walk judged. The log
     is made ``O_EXCL|O_NOFOLLOW`` when absent; one already there (the slot's earlier sessions: an audit trail, never
     truncated) must be a regular file with one link, owned by the front account or root. Either way it is then chowned
     front account : root and set to :data:`FRONT_LOG_MODE`, so a log a front made under a loose umask is put right. A

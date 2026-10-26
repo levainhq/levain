@@ -336,6 +336,72 @@ def test_an_unreadable_front_log_dir_is_a_warning_never_absent_or_green(tmp_path
     assert "e0 (permission denied" in row.detail
 
 
+@pytest.mark.skipif(os.getuid() == 0, reason="root reads a mode-0 dir")
+def test_a_front_log_dir_the_operator_cannot_read_is_judged_by_its_stat(tmp_path):
+    """``L/gw/slot<n>/`` is the front account's 2750 (``layout.slot_store_rows``): the operator running the doctor may
+    search ``L/gw/`` but not read it, so an open of it would be EACCES on every healthy install. The check judges it
+    by its stat through ``L/gw/``'s fd: a mode-0 dir this test owns stands in for the front account's dir, and the row
+    is green (an open of it is refused, the stat is not)."""
+    store = _doctor_store(tmp_path, {"e0": "reusable"}, gw=(0,))
+    os.chmod(store / "gw" / "slot0", 0)
+    try:
+        with pytest.raises(PermissionError):
+            os.close(os.open(store / "gw" / "slot0", os.O_RDONLY | os.O_DIRECTORY))
+        row, _ = _front_row(store)
+    finally:
+        os.chmod(store / "gw" / "slot0", 0o755)
+    assert row.ok and not row.warn, row
+    # the row the mode-0 dir stands in for
+    (r,) = [r for r in layout.slot_store_rows("linux", H.SlotId("egress", 0)) if str(r.path).endswith("gw/slot0")]
+    assert r.mode == 0o2750 and r.owner == "_levain_gw0"
+
+
+@pytest.mark.parametrize("swap", ["replaced", "removed", "linked"])
+def test_prepare_front_log_refuses_a_slot_dir_changed_after_it_was_judged(tmp_path, monkeypatch, swap):
+    """S-8: the walk judges ``L/gw/slot<n>/`` by its stat, and root's open after it must reach that same dir (its
+    ``st_dev``, ``st_ino``). Here the dir is changed between the stat and the open: replaced by a fresh dir that
+    passes the same predicate, removed, or replaced by a link to a good dir. Each is ``bad-root``, never the
+    pre-move ``store-missing``, and no log is made in what took its place."""
+    w = _world(tmp_path)
+    slot0 = w.L / "gw" / "slot0"
+    real = H._statat_dir
+
+    def judged_then_changed(parent, name, where):
+        st = real(parent, name, where)
+        os.rename(slot0, tmp_path / "judged")
+        if swap == "replaced":
+            _dirs(w.L, "gw/slot0", mode=st.st_mode & 0o7777)
+        elif swap == "linked":
+            _dirs(tmp_path, "elsewhere", mode=st.st_mode & 0o7777)
+            os.symlink(tmp_path / "elsewhere", slot0)
+        return st
+    monkeypatch.setattr(H, "_statat_dir", judged_then_changed)
+    store = H.Store(w.seams)
+    try:
+        with pytest.raises(H.Refused) as e:
+            H.prepare_front_log(store, H.SlotId("egress", 0), FRONT_UID)
+    finally:
+        store.close()
+    assert e.value.name == "bad-root", e.value
+    assert "gw/slot0" in e.value.detail and layout.repair_line(w.seams.host) not in e.value.detail
+    assert not any(p.name == H.FRONT_LOG_NAME for p in tmp_path.rglob("*"))
+
+
+def test_the_doctor_check_never_opens_the_slot_dir(tmp_path, monkeypatch):
+    """S-8: ``check_front_log_dirs`` stops at the stat; only ``prepare_front_log`` opens ``L/gw/slot<n>/``."""
+    store = _doctor_store(tmp_path, {"e0": "reusable"}, gw=(0,))
+    opened = []
+    real = os.open
+
+    def spy(path, flags, *a, **k):
+        opened.append(str(path))
+        return real(path, flags, *a, **k)
+    monkeypatch.setattr(H.os, "open", spy)
+    row, _ = _front_row(store)
+    assert row.ok and not row.warn, row
+    assert "gw" in opened and not any(p.endswith("slot0") for p in opened), opened
+
+
 def test_doctor_front_row_without_a_front_account_fails_naming_the_slot(tmp_path):
     """codex HIGH 1: render refuses ``account-missing`` (``slot_ids``), so the row fails, never a warning or green."""
     store = _doctor_store(tmp_path, {"e0": "reusable", "e1": "reusable"}, gw=(0, 1))
@@ -347,6 +413,9 @@ def test_doctor_front_row_without_a_front_account_fails_naming_the_slot(tmp_path
     row, _ = _front_row(store, _test_user_seams(account_uid=gone))
     assert not row.ok and not row.warn and not row.upgrade_pending
     assert _named(row) == {"e1"} and "e1: _levain_gw1 (account-missing)" in row.detail
+    # O-s3b8af5-2: repair re-renders owner and mode (install_helper.plan_repair's row_steps) and refuses a missing
+    # account (_check_rendered_accounts), so the hint says so rather than promising repair fixes what is named
+    assert "never makes a missing account" in row.hint and "does not replace a link" in row.hint, row.hint
 
 
 # --- the real seams: the default construction and account_uid's raise contract -------------------------------------
