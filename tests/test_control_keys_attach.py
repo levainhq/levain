@@ -8,6 +8,7 @@ keys refuses uid 0, so the process tests skip as root."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import shutil
@@ -883,3 +884,30 @@ def test_the_card_outlives_the_diagnostic_records_bound_and_counts_a_ref_once(tm
     assert _over(control, att, S1, 1, 7)["ok"]                                          # the same ref, again
     assert _cards(control) == {S1: {"microdollars": 7, "calls": 1, "unproven": False, "model_mismatch": False},
                                S2: {"microdollars": 4, "calls": 4, "unproven": False, "model_mismatch": False}}
+
+
+def _purge(control, session: str) -> None:
+    with control.store.lock(session):
+        control._write(control.store.get(session), state=R.PURGED, event_kind="state")
+
+
+def test_a_purged_session_loses_its_card_at_once(tmp_path):
+    # verify r2 R3 (codex MED): the card and its ref set go when the record goes PURGED, not when an unrelated
+    # session's first report happens to prune; STATUS never shows a PURGED record's card.
+    control, att = _bare_attached(tmp_path, S1, S2)
+    assert _over(control, att, S1, 1, 7)["ok"] and _over(control, att, S2, 2, 3)["ok"]
+    _purge(control, S1)
+    assert S1 not in control._cards and S2 in control._cards
+    assert _cards(control).get(S1) is None
+    assert _over(control, att, S1, 3, 9)["ok"]                    # a late report: recorded, no card made again
+    assert S1 not in control._cards and len(control.spend_overruns(S1)) == 2
+
+
+def test_a_record_gone_on_a_reload_loses_its_card(tmp_path):
+    # verify r2 R3: the reload of an unsettled record (StateStore._settle -> on_settle) finding it gone or PURGED
+    control, att = _bare_attached(tmp_path, S1, S2)
+    assert _over(control, att, S1, 1, 7)["ok"] and _over(control, att, S2, 2, 3)["ok"]
+    old1, old2 = control.store.get(S1), control.store.get(S2)
+    control._on_settle(old1, None)
+    control._on_settle(old2, dataclasses.replace(old2, state=R.PURGED))
+    assert control._cards == {}

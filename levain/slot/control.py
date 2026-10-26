@@ -1055,8 +1055,8 @@ class Control:
         #: (session, ref) -> the SPEND-OVERRUN record, oldest first, bounded (diagnostics; never a revoke).
         self._overruns: collections.OrderedDict[tuple[str, tuple], dict[str, object]] = collections.OrderedDict()
         #: L3 r1 Q6: session -> (its card ``{microdollars, calls, unproven, model_mismatch}``, the refs counted in it),
-        #: kept while the session has a record (pruned when a new session's first report arrives), never evicted by
-        #: the diagnostics' bound, so a ref is counted once for the session's life (R4 §4)
+        #: kept while the session has a record not PURGED (dropped when it is PURGED or gone, verify r2 R3), never
+        #: evicted by the diagnostics' bound, so a ref is counted once for the session's life (R4 §4)
         self._cards: dict[str, tuple[dict[str, object], set[tuple]]] = {}
         #: the sessions keys reported FRONT-LOST for, oldest first, bounded (doctor / tests).
         self.front_lost: collections.deque[str] = collections.deque(maxlen=SPEND_OVERRUNS_MAX)
@@ -1199,6 +1199,8 @@ class Control:
                 with self._mu:
                     self._owed[new.session] = new.generation
             raise
+        if new.state == R.PURGED:
+            self._drop_card(new.session)
         self._emit(new)
 
     def _event_of(self, rec: R.SessionState) -> dict[str, object] | None:
@@ -1410,6 +1412,8 @@ class Control:
         """A record reloaded after a write that failed past its rename (:meth:`StateStore._settle`). If the
         failed write moved it out of live, the revoke's after-acts are owed, since its writer answered an error
         and ran none; if it is live with no live lease bound, it is revoked as a lease EOF would."""
+        if new is None or new.state == R.PURGED:
+            self._drop_card(new.session if new is not None else old.session if old is not None else None)
         if new is None:
             return
         if new.state not in R.LIVE_STATES and (old is None or old.state in R.LIVE_STATES):
@@ -2653,12 +2657,11 @@ class Control:
         ref_key = (ref[0], ref[1], ref[2])
         key = (session, ref_key)
         with self._mu:
-            if session not in self._cards:
-                self._prune_cards_locked()
+            if session not in self._cards and session in self._prune_cards_locked():
                 self._cards[session] = ({"microdollars": 0, "calls": 0, "unproven": False, "model_mismatch": False},
                                         set())
-            card, counted = self._cards[session]
-            if ref_key not in counted:
+            card, counted = self._cards.get(session, (None, None))
+            if card is not None and counted is not None and ref_key not in counted:
                 if len(counted) >= SPEND_OVERRUN_REFS_MAX:
                     raise Refused("out-of-range", f"over {SPEND_OVERRUN_REFS_MAX} overrun refs for {session}")
                 counted.add(ref_key)
@@ -2673,12 +2676,23 @@ class Control:
                     self._overruns.popitem(last=False)
         return {}
 
-    def _prune_cards_locked(self) -> None:
-        """L3 r1 Q6: the cards of sessions whose record is gone (caller holds ``_mu``): a card lives as long as its
-        session's record. Memory only (:meth:`StateStore.in_memory`: no disk read under the lock)."""
+    def _prune_cards_locked(self) -> set[str]:
+        """L3 r1 Q6: the cards of sessions whose record is gone or PURGED (caller holds ``_mu``): a card lives as
+        long as its session's record. Returns the sessions that have a record not PURGED, so a report for any other
+        session makes no card (verify r2 R3: none to show, and none to outlive it). Memory only
+        (:meth:`StateStore.in_memory`: no disk read under the lock)."""
         have = {r.session for r in self.store.in_memory() if r.state != R.PURGED}
         for s in [s for s in self._cards if s not in have]:
             del self._cards[s]
+        return have
+
+    def _drop_card(self, session: str | None) -> None:
+        """verify r2 R3: a session's card and the refs counted in it, removed when its record is PURGED (written by
+        :meth:`_put`) or found gone or PURGED on a reload (:meth:`_on_settle`)."""
+        if session is None:
+            return
+        with self._mu:
+            self._cards.pop(session, None)
 
     def _op_sessions(self, conn: Conn, args: dict) -> dict[str, object]:
         """3c design r3 §2.1 (e), the reconcile: ``SESSIONS {digests}``, the token digests keys holds a cached resolve
