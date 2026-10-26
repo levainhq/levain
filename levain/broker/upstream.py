@@ -7,8 +7,9 @@ exchange's credential upstream (the fencing token checked at the resource on eve
 
 The raw writer and the plaintext writer under it are private to `Upstream`: no method, property or return value hands
 either out. There are exactly two ways to an `Upstream`:
-`open_exchange` (an exchange is mandatory) and `refresh_post` (the maintenance form, local to that function, used for
-the one refresh request it was given).
+`open_exchange` (an exchange is mandatory) and `_maintenance_round_trip` (the maintenance form, local to that function,
+used for the one request it was given), whose two callers are `refresh_post` (the credential refresh) and `limit_get`
+(keys' read of an OpenRouter key's limit, its host fixed in the function).
 
 The path to a vendor: `pick_address` resolves the route's host ONCE and passes every answer through the front's
 `refused_address` (all or nothing); `_connect` opens plain TCP to that address literal; `_handshake` runs TLS on that
@@ -88,8 +89,8 @@ class BadResponse(EOFError):
 
 
 class RefreshRequest(NamedTuple):
-    """The one request `refresh_post` sends: the address already validated, the host for SNI and the hostname check,
-    and the request's bytes as the credential layer built them."""
+    """The one request a maintenance round trip sends (`refresh_post`'s or `limit_get`'s): the address already
+    validated, the host for SNI and the hostname check, and the request's bytes as its caller built them."""
 
     addr: str
     port: int
@@ -110,7 +111,7 @@ class Upstream:
     through, never read, never handed out.
 
     The exchange form gates every write on its exchange. The maintenance form (`Upstream.maintenance`) has no exchange
-    and carries only the refresh request; its one constructor is `refresh_post`."""
+    and carries only one maintenance request; its one constructor is `_maintenance_round_trip`."""
 
     __slots__ = ("_reader", "_writer", "_keepalive", "_exchange")
 
@@ -126,7 +127,7 @@ class Upstream:
 
     @classmethod
     def maintenance(cls, reader: Any, writer: Any, *, _keepalive: Any) -> "Upstream":
-        """The ungated form, for the refresh request alone. It holds no exchange and no session credential."""
+        """The ungated form, for one maintenance request alone. It holds no exchange and no session credential."""
         up = cls.__new__(cls)
         up._reader = reader
         up._writer = writer
@@ -168,8 +169,8 @@ class Upstream:
         return ok
 
     def _graceful_close(self) -> None:
-        """Private: reached only from an exchange's release and from `refresh_post`. A detached exchange is never
-        closed gracefully, since a close would flush what `abort()` discards."""
+        """Private: reached only from an exchange's release and from `_maintenance_round_trip`. A detached exchange is
+        never closed gracefully, since a close would flush what `abort()` discards."""
         self._writer.close()
 
     async def wait_closed(self) -> None:
@@ -235,9 +236,9 @@ def _resume_or_lost(resume: Callable[[], None]) -> Callable[[], None]:
 
 async def _handshake(addr: str, port: int, host: str) -> Tuple[Any, Any, Any]:
     """TLS on `_connect`'s connection, returning `(reader, writer, plain_writer)`; called ONLY by `open_exchange` and
-    `refresh_post`. One `try` spans the whole ownership interval, from the transport `_connect` returns to the return
-    the constructor consumes, and aborts whatever transport it holds on ANY exit by exception (3.9's `start_tls` closes
-    the transport only around its own handshake wait, and owns nothing after it returns)."""
+    `_maintenance_round_trip`. One `try` spans the whole ownership interval, from the transport `_connect` returns to
+    the return the constructor consumes, and aborts whatever transport it holds on ANY exit by exception (3.9's
+    `start_tls` closes the transport only around its own handshake wait, and owns nothing after it returns)."""
     plain_reader, plain_writer = await _connect(addr, port)
     tls = None
     try:
@@ -259,9 +260,10 @@ async def _handshake(addr: str, port: int, host: str) -> Tuple[Any, Any, Any]:
 
 
 async def _await_handshake(task: "asyncio.Future", timeout: float) -> Tuple[Any, Any, Any]:
-    """A `_handshake` task's result, bounded by `timeout` (asyncio.TimeoutError past it), for the refresh, which has
-    no exchange to store a late result on. Unlike 3.9's `wait_for`, a handshake that completes as the wait ends (the
-    deadline, or a cancel of the caller) is not dropped: its transports are aborted here before the exit."""
+    """A `_handshake` task's result, bounded by `timeout` (asyncio.TimeoutError past it), for the maintenance round
+    trip, which has no exchange to store a late result on. Unlike 3.9's `wait_for`, a handshake that completes as the
+    wait ends (the deadline, or a cancel of the caller) is not dropped: its transports are aborted here before the
+    exit."""
     try:
         await asyncio.wait({task}, timeout=timeout)
     except BaseException:
@@ -383,17 +385,17 @@ def h11_bytes(conn: "h11.Connection", event: Any) -> bytes:
 
 def client_after_request(method: bytes) -> "h11.Connection":
     """An h11 client connection placed after a request of `method` with no body, so it parses that request's
-    response (a HEAD's response has no body). For the refresh, whose request bytes the credential layer built."""
+    response (a HEAD's response has no body). For the maintenance round trip, whose request bytes its caller built."""
     conn = h11.Connection(our_role=h11.CLIENT)
     for ev in (h11.Request(method=method, target=b"/", headers=[(b"host", b"refresh")]), h11.EndOfMessage()):
         h11_bytes(conn, ev)
     return conn
 
 
-async def _read_response(up: Upstream) -> RefreshResponse:
-    """Read the refresh's one response through `up`: its head by HEAD_TIMEOUT_S, its body by IDLE_S per read, the body
-    at most REFRESH_BODY_CAP."""
-    conn = client_after_request(b"POST")
+async def _read_response(up: Upstream, method: bytes) -> RefreshResponse:
+    """Read a maintenance request's one response through `up` (the response to a `method` request): its head by
+    HEAD_TIMEOUT_S, its body by IDLE_S per read, the body at most REFRESH_BODY_CAP."""
+    conn = client_after_request(method)
     loop = asyncio.get_running_loop()
     head = await read_head(up, conn, loop.time() + HEAD_TIMEOUT_S)
     body = b""
@@ -407,8 +409,9 @@ async def _read_response(up: Upstream) -> RefreshResponse:
     return RefreshResponse(head.status_code, [(bytes(n), bytes(v)) for n, v in head.headers], body)
 
 
-async def refresh_post(request: RefreshRequest) -> Any:
-    """The refresh's entry point: build the maintenance `Upstream` here, send THIS request, read its response, close,
+async def _maintenance_round_trip(request: RefreshRequest, method: bytes) -> RefreshResponse:
+    """The one maintenance round trip, shared by `refresh_post` and `limit_get` (its two callers): build the
+    maintenance `Upstream` here, send THIS request, read its one response (parsed as the response to `method`), close,
     and return the response only. The `Upstream` never leaves this function; every exit aborts it. The connect and the
     TLS handshake share one CONNECT_TIMEOUT_S deadline (a cancel inside `_handshake` aborts what it holds)."""
     reader, writer, plain_writer = await _await_handshake(
@@ -419,13 +422,44 @@ async def refresh_post(request: RefreshRequest) -> Any:
         if request.body:
             up.write(request.body)
         await up.drain()
-        response = await _read_response(up)
+        response = await _read_response(up, method)
         up._graceful_close()
         try:
             await asyncio.wait_for(up.wait_closed(), GRACE)
         except Exception:
-            _note(logging.DEBUG, "levain gw-keys: refresh graceful close ended early")
+            _note(logging.DEBUG, "levain gw-keys: maintenance graceful close ended early")
     finally:
         if not up.abort():
             _note(logging.WARNING, "levain gw-keys: dropped an unclosed transport")
     return response
+
+
+async def refresh_post(request: RefreshRequest) -> Any:
+    """The refresh's entry point: the credential layer's request, sent as built, through the maintenance round trip.
+    Its one caller is creds.py's `_post`."""
+    return await _maintenance_round_trip(request, b"POST")
+
+
+#: the provider-limit read's port (an attribute, so a test points it at a local server)
+LIMIT_PORT = 443
+#: the provider-limit read's target on `policy.OPENROUTER_HOST`: OpenRouter's "Get current API key"
+LIMIT_TARGET = b"/api/v1/key"
+
+
+async def limit_get(header: Tuple[bytes, bytes]) -> RefreshResponse:
+    """keys' read of an OpenRouter key's own limit (D1): `GET /api/v1/key` on `policy.OPENROUTER_HOST`, fixed here
+    (the caller passes only the credential's header, never a host, an address or a target), resolved by
+    `pick_address` (every answer checked), no body, one response of at most REFRESH_BODY_CAP, no redirect followed.
+    Its one caller is keys' limit refresher, which bounds the whole call by its own deadline."""
+    from levain.broker.policy import OPENROUTER_HOST
+
+    addr = await pick_address(OPENROUTER_HOST, LIMIT_PORT)
+    conn = h11.Connection(our_role=h11.CLIENT)
+    try:
+        head = h11_bytes(conn, h11.Request(method=b"GET", target=LIMIT_TARGET, headers=[
+            (b"host", OPENROUTER_HOST.encode("ascii")), (b"accept", b"application/json"),
+            (b"accept-encoding", b"identity"), (b"connection", b"close"), header]))
+    except h11.LocalProtocolError:
+        raise Refused("malformed", "credential header") from None
+    head += h11_bytes(conn, h11.EndOfMessage())
+    return await _maintenance_round_trip(RefreshRequest(addr, LIMIT_PORT, OPENROUTER_HOST, head, b""), b"GET")

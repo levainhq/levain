@@ -34,6 +34,8 @@ NETWORK_SITES = (
     # keys' attach client (S1 3c-3): its one long-lived KEYS-ATTACH connection to CONTROL's socket.
     ("keys.py", "Keys._attach_open", "open_unix_connection", "asyncio.open_unix_connection", 1),
     # keys' upstream client: plain TCP to the validated address (the one connect seam), and TLS on that connection.
+    # keys' OpenRouter limit read (3c-9 D1, `upstream.limit_get`) opens through these two seams and adds no site of its
+    # own; its one caller is pinned by rule (c) (LIMIT_GET_CALLERS) in test_broker_capability_ast.py.
     ("upstream.py", "_connect", "open_connection", "asyncio.open_connection", 1),
     ("upstream.py", "_handshake", "start_tls", "loop.start_tls", 1),
     # NOT a network call: h11's serializer (`Connection.send` returns bytes and does no I/O) matches the API name

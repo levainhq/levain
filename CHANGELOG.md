@@ -47,6 +47,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   the held pings), or when you say `loud`, `away`, `remote` or `back`, and it leaves the queue only once every phone
   still paired has taken it; a failed push is tried again a few minutes later. `levain ping status` says what the rule
   does now, why, and how many pings are held.
+- **`levain doctor` run as your own account shows what the keys service reports,** instead of "held by keys": the
+  spend ledger's size, the credentials of the routes keys serves (saying when keys' answer could not list every route,
+  and never listing a credential keys does not serve), and each OpenRouter key's spending limit as keys last read it,
+  with how long ago. keys reads those limits itself, when it starts and every five minutes; if its latest read failed
+  the row says why, and a key past its limit shows as exhausted. Asking doctor never makes keys contact OpenRouter.
+  When keys or CONTROL cannot be reached, or CONTROL has not yet connected to keys, the rows still say "held by keys".
+  `sudo levain doctor`, which reads the key itself, checks OpenRouter's answer exactly as keys does.
 
 ### Fixed
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is

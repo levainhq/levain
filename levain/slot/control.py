@@ -611,14 +611,35 @@ class _Pending:
     answer: dict | None = None
 
 
+#: keys' ``LIMIT_MICRODOLLARS_MAX`` (CONTROL does not import keys; ``test_keys_status`` holds the two equal)
+_MICRODOLLARS_MAX = 10 ** 15
+#: one ``limits`` entry of keys' ``STATUS`` (D1): each field and the check its value must pass
+_KEY_LIMIT_FIELDS: dict[str, Callable[[object], bool]] = {
+    "credential": lambda v: type(v) is str and bool(v),
+    "age_s": lambda v: v is None or (type(v) is int and v >= 0),
+    "limit_microdollars": lambda v: v is None or (type(v) is int and 0 <= v <= _MICRODOLLARS_MAX),
+    "remaining_microdollars": lambda v: v is None or (type(v) is int and abs(v) <= _MICRODOLLARS_MAX),   # overdrawn
+    "reset": lambda v: v is None or (type(v) is str and bool(v)),
+    "byok": lambda v: v is None or type(v) is bool,
+    "failed": lambda v: v is None or (type(v) is str and bool(v)),
+}
+
+
 def _keys_status_answer(ans: Mapping[str, object]) -> dict[str, object]:
-    """keys' ``STATUS`` answer, exactly ``{ledger_bytes: uint | null, routes: [[host, name]..], routes_problem: str |
-    null, routes_truncated: uint}``, or ``Refused("keys-answer")``."""
-    if set(ans) != {"ledger_bytes", "routes", "routes_problem", "routes_truncated"}:
+    """keys' ``STATUS`` answer, exactly ``{ledger_bytes: uint | null, limits: [entry..], limits_truncated: uint,
+    routes: [[host, name]..], routes_problem: str | null, routes_truncated: uint}``, each ``limits`` entry exactly
+    :data:`_KEY_LIMIT_FIELDS`, or ``Refused("keys-answer")``."""
+    if set(ans) != {"ledger_bytes", "limits", "limits_truncated", "routes", "routes_problem", "routes_truncated"}:
         raise Refused("keys-answer", "fields")
     size, routes, problem, cut = ans["ledger_bytes"], ans["routes"], ans["routes_problem"], ans["routes_truncated"]
+    limits, lcut = ans["limits"], ans["limits_truncated"]
     if type(cut) is not int or cut < 0:
         raise Refused("keys-answer", "routes_truncated")
+    if type(lcut) is not int or lcut < 0:
+        raise Refused("keys-answer", "limits_truncated")
+    if type(limits) is not list or any(type(e) is not dict or set(e) != set(_KEY_LIMIT_FIELDS)
+                                       or not all(ok(e[k]) for k, ok in _KEY_LIMIT_FIELDS.items()) for e in limits):
+        raise Refused("keys-answer", "limits")
     if size is not None and (type(size) is not int or size < 0):
         raise Refused("keys-answer", "ledger_bytes")
     if type(routes) is not list or any(type(r) is not list or len(r) != 2 or any(type(x) is not str or not x for x in r)
@@ -626,7 +647,8 @@ def _keys_status_answer(ans: Mapping[str, object]) -> dict[str, object]:
         raise Refused("keys-answer", "routes")
     if problem is not None and type(problem) is not str:
         raise Refused("keys-answer", "routes_problem")
-    return {"ledger_bytes": size, "routes": routes, "routes_problem": problem, "routes_truncated": cut}
+    return {"ledger_bytes": size, "limits": limits, "limits_truncated": lcut, "routes": routes,
+            "routes_problem": problem, "routes_truncated": cut}
 
 
 class KeysAdmin:

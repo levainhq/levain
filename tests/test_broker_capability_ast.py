@@ -79,6 +79,14 @@ NAME_ALLOW = {
 
 #: rule (c): `refresh_post`'s callers: EXACTLY one, the credential layer's refresh (creds.py `_post`, session 3b-5b)
 REFRESH_POST_CALLERS = 1
+#: rule (c): the one function that builds the maintenance `Upstream`, and its callers in `upstream.py`, one call each
+MAINTENANCE_TRIP = "_maintenance_round_trip"
+MAINTENANCE_TRIP_CALLERS = ("refresh_post", "limit_get")
+#: rule (c): `limit_get`'s callers (3c-9 D1): EXACTLY one, a direct `upstream.limit_get(...)` in keys' limit
+#: refresher, named by its definition path. Its own count, so REFRESH_POST_CALLERS keeps meaning the credential
+#: exchange.
+LIMIT_GET_CALLERS = 1
+LIMIT_GET_SITE = (KEYS, "Keys._read_limit")
 
 #: rule (f): each method called directly on `self._writer`, bound to the one `Upstream` method allowed to call it
 WRITER_BIND = {"write": "write", "close": "_graceful_close", "wait_closed": "wait_closed", "drain": "drain",
@@ -110,12 +118,12 @@ KEEPALIVE_SITES = Counter({
     ("maintenance", "attr-store"): 1,   # the maintenance form's one slot fill
     ("maintenance", "name-load"): 1,
     ("open_exchange", "keyword"): 1,
-    ("refresh_post", "keyword"): 1,
+    ("_maintenance_round_trip", "keyword"): 1,
     ("abort", "attr-load"): 1,          # self._keepalive.transport.abort(), the plain transport's abort
 })
 
 #: rule (h): the only (file, definition path) pairs that may call `_graceful_close`
-GRACEFUL_CALLERS = {("broker/keys.py", "release_exchange"), ("broker/upstream.py", "refresh_post")}
+GRACEFUL_CALLERS = {("broker/keys.py", "release_exchange"), ("broker/upstream.py", "_maintenance_round_trip")}
 
 #: the reflection rule: each reflective callable -> which positional arguments are names ("all" = every one; None =
 #: refused outright, it has no name argument)
@@ -124,7 +132,8 @@ REFLECT = {"getattr": (1,), "setattr": (1,), "vars": None, "attrgetter": "all", 
 REFLECT_MODULE_FUNCS = ("__import__", "import_module")
 #: the attribute names a literal reflective name may not be: the private set, the API set, and the other names the
 #: rules bind (the socket constructor, the seams, the maintenance form and its one caller)
-REFLECT_REFUSED = frozenset(PRIVATE) | API | {"socket", "_connect", "_handshake", "maintenance", "refresh_post"}
+REFLECT_REFUSED = frozenset(PRIVATE) | API | {"socket", "_connect", "_handshake", "maintenance", "refresh_post",
+                                               "limit_get", MAINTENANCE_TRIP}
 #: the top-level modules a literal reflective import may not name
 REFLECT_REFUSED_MODULES = frozenset(NET_MODULES) | {m.split(".")[0] for m in HTTP_MODULES}
 
@@ -347,20 +356,37 @@ def rule_b(mods: Dict[str, Module]) -> List[str]:
 
 def rule_c(mods: Dict[str, Module]) -> List[str]:
     """(c) Every load of `maintenance` (attribute or name) anywhere in `levain/` is refused except the one direct call
-    `Upstream.maintenance(...)` inside `upstream.refresh_post`; `refresh_post` has exactly REFRESH_POST_CALLERS
-    callers, each a direct call in `creds.py`."""
+    `Upstream.maintenance(...)` inside `upstream._maintenance_round_trip`; that function is loaded only as one direct
+    call in each of MAINTENANCE_TRIP_CALLERS; `refresh_post` has exactly REFRESH_POST_CALLERS callers, each a direct
+    call in `creds.py`; `limit_get` has exactly LIMIT_GET_CALLERS callers, each a direct `upstream.limit_get(...)` at
+    LIMIT_GET_SITE."""
     out = []
     callers = 0
     the_call = 0
+    trips: Counter = Counter()
+    limit_callers = 0
     for rel, mod in mods.items():
         for n in _identifier_loads(mod, "maintenance"):
-            ok = (rel == UPSTREAM and mod.qualname(n) == "refresh_post" and mod.is_call_func(n)
+            ok = (rel == UPSTREAM and mod.qualname(n) == MAINTENANCE_TRIP and mod.is_call_func(n)
                   and isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "Upstream")
             if ok:
                 the_call += 1
             else:
                 out.append(f"(c) maintenance loaded other than as the direct Upstream.maintenance(...) call in "
-                           f"refresh_post: {mod.where(n)}")
+                           f"{MAINTENANCE_TRIP}: {mod.where(n)}")
+        for n in _identifier_loads(mod, MAINTENANCE_TRIP):
+            if rel == UPSTREAM and mod.is_call_func(n) and isinstance(n, ast.Name) \
+                    and mod.qualname(n) in MAINTENANCE_TRIP_CALLERS:
+                trips[mod.qualname(n)] += 1
+            else:
+                out.append(f"(c) {MAINTENANCE_TRIP} loaded other than as a direct call in "
+                           f"{'/'.join(MAINTENANCE_TRIP_CALLERS)}: {mod.where(n)}")
+        for n in _identifier_loads(mod, "limit_get"):
+            limit_callers += 1
+            if not ((rel, mod.qualname(n)) == LIMIT_GET_SITE and mod.is_call_func(n) and isinstance(n, ast.Attribute)
+                    and isinstance(n.value, ast.Name) and n.value.id == "upstream"):
+                out.append(f"(c) limit_get loaded other than as a direct upstream.limit_get(...) call in "
+                           f"{LIMIT_GET_SITE[1]}: {mod.where(n)}")
         for n in _identifier_loads(mod, "refresh_post"):
             callers += 1
             if not (rel == CREDS and mod.is_call_func(n) and isinstance(n, ast.Attribute)
@@ -368,20 +394,26 @@ def rule_c(mods: Dict[str, Module]) -> List[str]:
                 out.append(f"(c) refresh_post loaded other than as a direct upstream.refresh_post(...) call in "
                            f"creds.py: {mod.where(n)}")
     if the_call != 1:
-        out.append(f"(c) the direct Upstream.maintenance(...) call in refresh_post occurs {the_call} times, expected "
-                   f"once")
+        out.append(f"(c) the direct Upstream.maintenance(...) call in {MAINTENANCE_TRIP} occurs {the_call} times, "
+                   f"expected once")
+    for q in MAINTENANCE_TRIP_CALLERS:
+        if trips[q] != 1:
+            out.append(f"(c) {MAINTENANCE_TRIP} is called {trips[q]} times in {q}, expected once")
     if callers != REFRESH_POST_CALLERS:
         out.append(f"(c) refresh_post has {callers} callers, expected exactly {REFRESH_POST_CALLERS}")
+    if limit_callers != LIMIT_GET_CALLERS:
+        out.append(f"(c) limit_get has {limit_callers} callers, expected exactly {LIMIT_GET_CALLERS}")
     return out
 
 
 def rule_d(mods: Dict[str, Module]) -> List[str]:
-    """(d) `_handshake` is called only by `open_exchange` and `refresh_post`, across all of `levain/`."""
+    """(d) `_handshake` is called only by `open_exchange` and `_maintenance_round_trip`, across all of `levain/`."""
     out = []
     for rel, mod in mods.items():
         for n in _identifier_loads(mod, "_handshake"):
-            if not (rel == UPSTREAM and mod.is_call_func(n) and mod.qualname(n) in ("open_exchange", "refresh_post")):
-                out.append(f"(d) _handshake load outside open_exchange/refresh_post: {mod.where(n)}")
+            if not (rel == UPSTREAM and mod.is_call_func(n)
+                    and mod.qualname(n) in ("open_exchange", MAINTENANCE_TRIP)):
+                out.append(f"(d) _handshake load outside open_exchange/{MAINTENANCE_TRIP}: {mod.where(n)}")
     return out
 
 
@@ -657,7 +689,7 @@ def rule_g(mods: Dict[str, Module]) -> List[str]:
 
 def rule_h(mods: Dict[str, Module]) -> List[str]:
     """(h) POSITIVE: every load of `._graceful_close` in `levain/broker/**` is a direct call in `release_exchange` or
-    `refresh_post`, each named by its full definition path."""
+    `_maintenance_round_trip`, each named by its full definition path."""
     out = []
     for rel, mod in mods.items():
         if not rel.startswith("broker/"):
@@ -785,7 +817,7 @@ def _files(*keysets) -> Tuple[str, ...]:
 RULES = (
     ("a", (UPSTREAM, "Upstream"), rule_a),
     ("b", (UPSTREAM, "Upstream"), rule_b),
-    ("c", (UPSTREAM, "Upstream", CREDS), rule_c),
+    ("c", (UPSTREAM, "Upstream", CREDS, KEYS), rule_c),
     ("d", (UPSTREAM, "Upstream"), rule_d),
     ("e", (UPSTREAM, "Upstream"), rule_e),
     ("f", (UPSTREAM, "Upstream"), rule_f),

@@ -39,8 +39,9 @@ The admin server (design 1.5 "The admin connection", "Fencing", "Order inside on
   every check re-run by keys itself (`levain.slot.routemaps`), keys' own head written durably before it serves or acks;
   its file work is one transaction at a time (`KeysRoutes.txn`) and is waited out even when a preemption cancels it.
 - STATUS (3c-9 session D) takes no argument and changes nothing: the reservation ledger's size and the brokered
-  (upstream host, credential name) pairs keys serves, which CONTROL relays to the operator (`KEYS-STATUS`); names
-  only, never a credential's bytes, and no upstream connection.
+  (upstream host, credential name) pairs keys serves, and (D1) each served OpenRouter key's limit as keys' own
+  refresher last read it, with its age, which CONTROL relays to the operator (`KEYS-STATUS`); names and numbers only,
+  never a credential's bytes, and no upstream connection: STATUS answers from memory, the refresher reads.
 - a newer connection PREEMPTS in five steps: bump the epoch, fence every live exchange (marked detached, so its next
   upstream write is refused) and stop reading the old one; cancel its request tasks and
   await them, bounded; the fail-closed clear in two phases (`reg_high` kept); close the old connection; adopt.
@@ -140,6 +141,7 @@ NOFILE_TERMS = {
     "transient": TRANSIENT_NAMED + 2 * ACCEPT_BACKLOG,
     "admin": ADMIN_CONNS,
     "attach": 1,   # the one KEYS-ATTACH connection to CONTROL
+    "limit": 1,    # the limit refresher's one upstream connection (its reads are one at a time)
     "reload": 16,  # one RELOAD at a time (its lock): a file read, then ssh-keygen's two input pipes, its three
                    # stdio pipes and the exec error pipe, then the head's temp and directory [judged by 3c4, 10-23,
                    # against subprocess.run(capture_output=True, pass_fds=two pipes): 2*2 + 3*2 + 2 + 2 = 14]
@@ -183,6 +185,21 @@ ADMIN_FRAME_MAX = 64 * 1024
 #: from its end and the cut counted, because a frame past the cap makes CONTROL's reader close the admin connection,
 #: and that EOF revokes every session registered on it (L3 r1 K1).
 STATUS_ANSWER_MAX = ADMIN_FRAME_MAX // 2
+#: keys' own read of each served OpenRouter key's limit (D1, 1025+40 rulings 3, DECISIONS): one read's whole deadline
+#: (resolve, connect, TLS, request, response), and the wait between passes; the first pass runs at start. Attributes
+#: on Keys (`key_limit_s`, `key_limit_every_s`) so a test scales them. No CONTROL answer waits on a read.
+KEY_LIMIT_S = 5.0
+KEY_LIMIT_EVERY_S = 300.0
+#: why the latest limit read failed: a fixed token each (doctor words every one), never text from the response
+LIMIT_FAILURES = ("no-credential", "host-mismatch", "expired", "bad-credential", "address-refused", "unreachable",
+                  "timeout", "http-2xx", "http-3xx", "http-4xx", "http-5xx", "http-other", "bad-body", "bad-value",
+                  "internal")
+#: the largest microdollar amount a limit read carries (10**15 microdollars = one billion dollars), either sign for
+#: `limit_remaining` (an overdrawn key's is negative), never negative for `limit`; a number past it or not finite is
+#: `bad-value`, never a number
+LIMIT_MICRODOLLARS_MAX = 10 ** 15
+#: OpenRouter's `limit_reset` as keys carries it: a short period word
+LIMIT_RESET_RE = re.compile(r"[a-z_]{1,32}\Z")
 #: once an admin frame's first byte is in, the rest of its length and its body must arrive within this, and an
 #: answer's write must drain within it (the connection idles legitimately only BETWEEN frames).
 ADMIN_FRAME_S = 10.0
@@ -1024,6 +1041,12 @@ class Keys:
         self.unclaimed_s = V23_S
         self.attach_attempt_s = ATTACH_ATTEMPT_S
         self._attach_task: Optional[asyncio.Task] = None
+        #: the OpenRouter limit refresher (D1): its task (`_serve` starts it, never an in-process Keys), its clocks, and
+        #: credential name -> `KeyLimit`, the last read of each served OpenRouter key
+        self._limit_task: Optional[asyncio.Task] = None
+        self.key_limit_s = KEY_LIMIT_S
+        self.key_limit_every_s = KEY_LIMIT_EVERY_S
+        self.key_limits: Dict[str, KeyLimit] = {}
         #: the attach sends in flight (FRONT-LOST, SPEND-OVERRUN), kept so none is collected mid-send
         self._attach_sends: Set[asyncio.Task] = set()
         #: the reservation ledger (`main()` opens it; `_serve` attaches and closes it). None refuses every admit
@@ -1209,10 +1232,11 @@ class Keys:
         """Shutdown is a transition (design 1.5 "Shutdown's order"), run once behind the latch: wait for a start() in
         progress to return (its only awaits are its server creations); phase 1 over every registration; (1) the
         listeners' synchronous close; (2) phase 2; (2b) the adopted admin connection's transport aborted and its
-        read loop and request tasks cancelled (the EOF path the read loop runs finds the table empty); (3) the
-        credential layer's detached tasks cancelled; (4) ONE bounded wait over the listeners' closure, the detached
-        exchange tasks and the admin tasks, nothing cancelled by the wait itself. Steps (1) to (3) have no await between
-        them, and a failure of one step never skips the rest."""
+        read loop and request tasks cancelled (the EOF path the read loop runs finds the table empty), and the
+        attachment's and the limit refresher's tasks cancelled; (3) the credential layer's detached tasks cancelled;
+        (4) ONE bounded wait over the listeners' closure, the detached exchange tasks and the admin tasks, nothing
+        cancelled by the wait itself. Steps (1) to (3) have no await between them, and a failure of one step never
+        skips the rest."""
         assert self._done is not None and self.state_lock is not None
         try:
             if self._starting is not None:
@@ -1236,7 +1260,7 @@ class Keys:
                         t.cancel()
                         admin_tasks.add(t)
             self._attach_close(self.attached)   # (2b) the attachment too, its client and its sends cancelled
-            for t in {self._attach_task} | set(self._attach_sends):
+            for t in {self._attach_task, self._limit_task} | set(self._attach_sends):   # (2b) and the limit refresher
                 if t is not None and t is not asyncio.current_task() and not t.done():
                     t.cancel()
                     admin_tasks.add(t)
@@ -2596,17 +2620,31 @@ class Keys:
     def status(self) -> dict:
         """`STATUS` (3c-9 session D): read-only, no upstream connection, never a credential's bytes. `ledger_bytes`:
         the reservation ledger's size (None when keys has none or cannot stat it). `routes`: the brokered `[upstream
-        host, credential name]` pairs keys would serve now, sorted: the base map's (a base id that is also a dispatch
-        id is refused at use by `_route_policy`, so it is not one) and each dispatch generation's whose pin rule
-        (`KeysRoutes.policy`) holds. `routes_problem`: why a part of that set cannot be told (that part is then left
-        out, as keys refuses it), else None. `routes_truncated`: how many pairs past STATUS_ANSWER_MAX were left off
-        the end of `routes`."""
+        host, credential name]` pairs keys would serve now, sorted (`served_pairs`). `routes_problem`: why a part of
+        that set cannot be told (that part is then left out, as keys refuses it), else None. `limits` (D1): one entry
+        per OpenRouter credential among those pairs, sorted by name, as the limit refresher last read it
+        (`KeyLimit.entry`; never read yet is `age_s` and `failed` both None), from memory only. `limits_truncated`
+        and `routes_truncated`: how many entries past STATUS_ANSWER_MAX were left off the end of each list, `limits`
+        given the room first."""
         size = None
         if self.ledger is not None:
             try:
                 size = os.stat(self.ledger.path).st_size
             except OSError:
                 size = None
+        pairs, problems = self.served_pairs()
+        now = time.monotonic()
+        limits = [self.key_limits.get(c, KeyLimit()).entry(c, now) for c in _openrouter_names(pairs)]
+        out = {"ledger_bytes": size, "limits": limits, "limits_truncated": 0,
+               "routes": sorted([h, c] for h, c in pairs), "routes_problem": "; ".join(problems) or None,
+               "routes_truncated": 0}
+        return _within_budget(out, [("limits", "limits_truncated"), ("routes", "routes_truncated")])
+
+    def served_pairs(self) -> Tuple[Set[Tuple[str, str]], List[str]]:
+        """The brokered `(upstream host, credential name)` pairs keys would serve now, and why a part of that set
+        cannot be told: the base map's (a base id that is also a dispatch id is refused at use by `_route_policy`,
+        so it is not one) and each dispatch generation's whose pin rule (`KeysRoutes.policy`) holds. Local reads only
+        (the base map's stat-keyed parse)."""
         pairs: Set[Tuple[str, str]] = set()
         problems: List[str] = []
         ids = None if self.routes is None else self.routes.route_ids()
@@ -2631,9 +2669,68 @@ class Keys:
                     except (RouteRefused, KeyError):
                         continue
                     pairs |= _brokered([pol])
-        out = {"ledger_bytes": size, "routes": sorted([h, c] for h, c in pairs),
-               "routes_problem": "; ".join(problems) or None, "routes_truncated": 0}
-        return _within_budget(out, "routes", "routes_truncated")
+        return pairs, problems
+
+    # -- the OpenRouter limit refresher (D1, 1025+40 rulings) --
+
+    def start_limits(self) -> None:
+        """Start the limit refresher once (`_serve` calls it after the listeners are served, and nothing else in keys
+        does, so an in-process Keys opens no upstream connection unless its caller starts this): a pass at once, then
+        one every `key_limit_every_s`, until the shutdown latch (`_close` cancels it)."""
+        self._in_loop()
+        if self._limit_task is None and not self.closing:
+            self._limit_task = asyncio.ensure_future(self._limit_loop())
+
+    async def _limit_loop(self) -> None:
+        while not self.closing:
+            try:
+                await self.limit_pass()
+            except Exception as e:   # a defect in one pass never ends the refresher
+                _note(logging.WARNING, "levain gw-keys: limit pass failed (%s)", type(e).__name__)
+            await asyncio.sleep(self.key_limit_every_s)
+
+    async def limit_pass(self) -> None:
+        """Read the limit of each OpenRouter credential keys serves now, one at a time, and forget the credentials it
+        no longer serves."""
+        names = _openrouter_names(self.served_pairs()[0])
+        for gone in set(self.key_limits) - set(names):
+            del self.key_limits[gone]
+        for name in names:
+            if self.closing:
+                return
+            try:
+                got = await self._read_limit(name)
+            except Exception as e:   # one credential's defect never starves the rest of the pass (L3 r1 E2)
+                _note(logging.WARNING, "levain gw-keys: limit read for %s failed (%s)", name, type(e).__name__)
+                got = "internal"
+            self.key_limits.setdefault(name, KeyLimit()).record(got, time.monotonic())
+
+    async def _read_limit(self, name: str) -> Union[str, Tuple[Optional[int], Optional[int], Optional[str],
+                                                                   Optional[bool]]]:
+        """One read of `name`'s limit: `(limit, remaining, reset, byok)` (microdollars, `_limit_values`), or the
+        failure's token from LIMIT_FAILURES. The credential is observed (never refreshed: `unexpired`, not `fresh`)
+        and must be bound to `policy.OPENROUTER_HOST`; the whole call is bounded by `key_limit_s`."""
+        try:
+            cred = self._cred_store().observe(name)
+        except norm.Refused:
+            return "no-credential"
+        if codec.OPENROUTER_HOST not in cred.hosts:
+            return "host-mismatch"
+        try:
+            unexpired(self.cred_lifecycle, cred)
+        except norm.Refused:
+            return "expired"
+        try:
+            async with asyncio.timeout(self.key_limit_s) as deadline:
+                resp = await upstream.limit_get(cred.header_pair())
+        except norm.Refused as r:
+            return "address-refused" if r.name == "address-refused" else "bad-credential"
+        except upstream.BadResponse:
+            return "bad-body"
+        except (OSError, EOFError):   # a refused, reset or kernel-timed-out connect, a TLS failure, a lost connection
+            # TimeoutError is an OSError, so keys' own deadline lands here too: only that is `timeout`
+            return "timeout" if deadline.expired() else "unreachable"
+        return _limit_values(resp)
 
     def _dispatch_policy(self, route: str, pin: Optional["routemaps.Pin"]) -> Optional[RoutePolicy]:
         """The dispatch map's policy for `route` under the session's `pin` (R4 §2's three-part rule,
@@ -3103,18 +3200,110 @@ class Keys:
             got += len(payload)
 
 
-def _within_budget(out: dict, key: str, count: str) -> dict:
-    """`out` with its list `out[key]` cut from the end until the whole answer, framed as the largest `id` and `ok`
-    would frame it, is within STATUS_ANSWER_MAX; `out[count]` is how many were cut."""
-    items = out[key]
-    fixed = len(canon.canonical_bytes({**out, "id": JSON_INT_MAX, "ok": True, key: [], count: len(items)}))
-    kept = 0
-    for it in items:
-        fixed += len(canon.canonical_bytes(it)) + 1   # the item and its comma
-        if fixed > STATUS_ANSWER_MAX:
-            break
-        kept += 1
-    return {**out, key: items[:kept], count: len(items) - kept}
+def _within_budget(out: dict, lists: Sequence[Tuple[str, str]]) -> dict:
+    """`out` with each list `out[key]` of `lists` `(key, count)` cut from its end until the whole answer, framed as the
+    largest `id` and `ok` would frame it, is within STATUS_ANSWER_MAX; the lists are given the room in their order,
+    and `out[count]` is how many of that list were cut."""
+    empty = {k: [] for k, _ in lists}
+    counts = {c: len(out[k]) for k, c in lists}
+    used = len(canon.canonical_bytes({**out, "id": JSON_INT_MAX, "ok": True, **empty, **counts}))
+    res = dict(out)
+    for key, count in lists:
+        items, kept = out[key], 0
+        for it in items:
+            if used + len(canon.canonical_bytes(it)) + 1 > STATUS_ANSWER_MAX:   # the item and its comma
+                break
+            used += len(canon.canonical_bytes(it)) + 1
+            kept += 1
+        res[key], res[count] = items[:kept], len(items) - kept
+        if kept < len(items):
+            used = STATUS_ANSWER_MAX   # a list cut: nothing after it is kept, so a later short item never jumps it
+    return res
+
+
+def _openrouter_names(pairs: Set[Tuple[str, str]]) -> List[str]:
+    """The credential names among `pairs` whose upstream host is `policy.OPENROUTER_HOST`, sorted."""
+    return sorted({c for h, c in pairs if h == codec.OPENROUTER_HOST})
+
+
+class KeyLimit:
+    """One OpenRouter credential's limit as the refresher last read it: the values and the monotonic time of the last
+    GOOD read (None: never read well), and the latest attempt's failure token (None: it succeeded, or none ran)."""
+
+    __slots__ = ("good_at", "values", "failed")
+
+    def __init__(self) -> None:
+        self.good_at: Optional[float] = None
+        self.values: Tuple[Optional[int], Optional[int], Optional[str], Optional[bool]] = (None, None, None, None)
+        self.failed: Optional[str] = None
+
+    def record(self, got: object, now: float) -> None:
+        if isinstance(got, str):
+            self.failed = got if got in LIMIT_FAILURES else "bad-body"
+        else:
+            self.values, self.good_at, self.failed = got, now, None   # type: ignore[assignment]
+
+    def entry(self, credential: str, now: float) -> dict:
+        """STATUS's entry: `age_s` (whole seconds since the last good read, None if none), the last good read's
+        values, and the latest failure."""
+        limit, remaining, reset, byok = self.values
+        age = None if self.good_at is None else max(0, int(now - self.good_at))
+        return {"credential": credential, "age_s": age, "limit_microdollars": limit,
+                "remaining_microdollars": remaining, "reset": reset, "byok": byok, "failed": self.failed}
+
+
+def _microdollars(v: object, *, signed: bool = False) -> Optional[int]:
+    """OpenRouter's dollar amount `v` (a JSON number or null) as integer microdollars; `ValueError` when it is not a
+    number (a bool is not), not finite, past LIMIT_MICRODOLLARS_MAX in size, or negative unless `signed`."""
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError("not a number")
+    try:
+        f = float(v)
+    except OverflowError:
+        raise ValueError("out of range") from None
+    if f != f or f in (float("inf"), float("-inf")):
+        raise ValueError("not finite")
+    if abs(f) > LIMIT_MICRODOLLARS_MAX / 1_000_000:   # bounded BEFORE the product, which overflows to inf (L3 r1 E1)
+        raise ValueError("out of range")
+    m = round(f * 1_000_000)
+    if not (-LIMIT_MICRODOLLARS_MAX if signed else 0) <= m <= LIMIT_MICRODOLLARS_MAX:
+        raise ValueError("out of range")
+    return m
+
+
+def _limit_values(resp: "upstream.RefreshResponse") -> Union[str, Tuple[Optional[int], Optional[int], Optional[str],
+                                                                         Optional[bool]]]:
+    """`GET /api/v1/key`'s answer as `(limit, remaining, reset, byok)`, or a failure token: a status other than 200
+    is its class (`http-4xx`), a 200's body is `key_status_values`'."""
+    if resp.status != 200:
+        cls = resp.status // 100
+        return f"http-{cls}xx" if 2 <= cls <= 5 else "http-other"
+    return key_status_values(resp.body)
+
+
+def key_status_values(body: bytes) -> Union[str, Tuple[Optional[int], Optional[int], Optional[str], Optional[bool]]]:
+    """THE validation of an OpenRouter key status body, shared by keys' refresher and doctor's root read (L3 r1 E3):
+    `(limit, remaining, reset, byok)` in microdollars, or `bad-body` for a body that is not `{"data": {...}}` with
+    `limit` and `limit_remaining` present, or `bad-value` for an amount `_microdollars` refuses (a negative
+    `limit_remaining` is a reading: an overdrawn key) or a `limit_reset` / `include_byok_in_limit` of another type.
+    The rest of the body is dropped."""
+    try:
+        data = json.loads(body.decode("utf-8"))["data"]   # Infinity / NaN parse: _microdollars refuses them
+        limit, left = data["limit"], data["limit_remaining"]
+        reset, byok = data.get("limit_reset"), data.get("include_byok_in_limit")
+    except Exception:
+        return "bad-body"
+    try:
+        lim, rem = _microdollars(limit), _microdollars(left, signed=True)
+    except ValueError:
+        return "bad-value"
+    if reset is not None and not (isinstance(reset, str) and LIMIT_RESET_RE.match(reset)):
+        return "bad-value"
+    if byok is not None and type(byok) is not bool:
+        return "bad-value"
+    return lim, rem, reset, byok
 
 
 def _brokered(policies: object) -> Set[Tuple[str, str]]:
@@ -3233,6 +3422,7 @@ async def _serve(keys: Keys, front_path: str, gid: Optional[int], admin_path: st
         if keys.servers and not keys.closing:   # a trigger before or during start: nothing is served
             print(f"levain gw-keys: ready front={front_path} admin={admin_path}", file=sys.stderr, flush=True)
             keys.start_attach()
+            keys.start_limits()
         await keys.wait_done()
         print("levain gw-keys: stopped", file=sys.stderr, flush=True)
         return 0

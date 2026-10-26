@@ -969,29 +969,107 @@ def _served_pairs(store: Path, deadline: float, keys_status: Any) -> tuple[set, 
 
 
 def _usd(v: float) -> str:
-    return f"${v:,.2f}"
-
-
-def _number(v: object) -> float | None:
-    """``v`` as a finite float when it is a JSON number (a bool is not), else ``None``; a number past float range
-    is not usable."""
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        return None
-    try:
-        f = float(v)
-    except OverflowError:
-        return None
-    return f if f == f and f not in (float("inf"), float("-inf")) else None
+    return ("-" if v < 0 else "") + f"${abs(v):,.2f}"
 
 
 _RESET_PERIOD = {"daily": "day", "weekly": "week", "monthly": "month"}
 
 
-def _openrouter_limit_row(store: Path, cred: str, name: str, fetch: Any, timeout: float) -> CheckResult:
-    """The ceiling row for one OpenRouter credential: its key status read with that credential, or why not. Never
-    hangs and every outcome is its own row text. GET /api/v1/key answers ``data`` with (OpenRouter's API reference,
-    "Get current API key") ``limit`` (USD, nullable), ``limit_remaining`` (nullable), ``limit_reset`` (nullable
-    string: the period the limit resets over) and ``include_byok_in_limit`` (boolean)."""
+#: keys' limit-read failure tokens (``levain.broker.keys.LIMIT_FAILURES``), each as the row says it
+_LIMIT_FAILURE_WORDS = {
+    "no-credential": "keys has no usable credential file for it",
+    "host-mismatch": "the credential is not bound to openrouter.ai",
+    "expired": "the credential's access token has expired",
+    "bad-credential": "the credential's header cannot be sent",
+    "address-refused": "openrouter.ai resolved to an address keys refuses",
+    "unreachable": "OpenRouter could not be reached",
+    "timeout": "OpenRouter did not answer within keys' deadline",
+    "http-2xx": "OpenRouter answered with a status other than 200",
+    "http-3xx": "OpenRouter answered with a redirect, which keys does not follow",
+    "http-4xx": "OpenRouter refused the request (a 4xx status)",
+    "http-5xx": "OpenRouter failed the request (a 5xx status)",
+    "http-other": "OpenRouter answered with an unexpected status",
+    "bad-body": "OpenRouter answered with something that was not a key status",
+    "bad-value": "OpenRouter's key status had a value keys does not carry",
+    "internal": "keys hit an internal error reading it (keys' log names it)",
+}
+
+
+def _limit_failure_words(token: str) -> str:
+    return _LIMIT_FAILURE_WORDS.get(token, "keys reported a failure this doctor does not know")
+
+
+def _limit_age_words(age_s: int) -> str:
+    if age_s < 60:
+        return "less than a minute ago"
+    if age_s < 2 * 3600:
+        return f"{age_s // 60} min ago"
+    return f"{age_s // 3600} h ago"
+
+
+_LIMIT_HINT_SET = ("Set a per-key credit limit with no reset period, counting BYOK usage, at "
+                   "openrouter.ai/settings/keys.")
+
+
+def _unusable_numbers(name: str, said: str = "") -> CheckResult:
+    return CheckResult(name, True, "OpenRouter's key status had no usable numbers; the key limit was not read" + said,
+                       warn=True)
+
+
+def _limit_verdict(name: str, lim: float | None, rem: float | None, reset: object, byok: object,
+                   said: str = "") -> CheckResult:
+    """THE interpretation of an OpenRouter key status (US dollars), shared by the root read and keys' report so both
+    give the same verdict: no limit, unusable numbers, exhausted, a per-period cap, BYOK not counted, or a total
+    limit. ``said`` (keys' "as keys read it ..." words) ends every text."""
+    if lim is None:
+        return CheckResult(name, True, "no credit limit is set on this key: nothing at the provider bounds the "
+                           "invoice" + said, _LIMIT_HINT_SET, warn=True)
+    if rem is None:
+        return _unusable_numbers(name, said)
+    problems = []
+    if rem <= 0:
+        problems.append("the key is exhausted: OpenRouter will refuse its calls")
+    if reset is not None:
+        period = _RESET_PERIOD.get(reset, reset) if isinstance(reset, str) else "period"
+        problems.append(f"cap {_usd(lim)} per {period}, not a total: spend can pass it across periods")
+    if byok is False:
+        problems.append("BYOK usage is not counted against this limit")
+    if problems:
+        return CheckResult(name, True, f"key limit {_usd(lim)}, {_usd(rem)} remaining; " + "; ".join(problems) + said,
+                           _LIMIT_HINT_SET, warn=True)
+    return CheckResult(name, True, f"key limit {_usd(lim)} total, {_usd(rem)} remaining" + said)
+
+
+def _keys_limit_row(cred: str, name: str, held: tuple, keys_status: Any) -> CheckResult:
+    """The ceiling row from keys' own report (D1: keys' refresher reads each served OpenRouter key's limit and
+    ``KEYS-STATUS`` carries its last read, in microdollars, with its age), for an operator whose account cannot open
+    the credential; the held words when keys did not tell it."""
+    told = keys_status()
+    entry = None if told is None else next((e for e in told["limits"] if e["credential"] == cred), None)
+    if entry is None:
+        more = ("; keys' answer had no room for it" if told is not None and told["limits_truncated"] else "")
+        return CheckResult(name, True, held[0] + more, held[1], warn=True)
+    failed = entry["failed"]
+    if entry["age_s"] is None:
+        if failed is None:
+            return CheckResult(name, True, "keys has not read this key's limit yet (it reads at start, then every "
+                               "few minutes)", held[1], warn=True)
+        return CheckResult(name, True, "the key limit was not read: keys' read failed "
+                           f"({_limit_failure_words(failed)})", held[1], warn=True)
+    said = f" (as keys read it {_limit_age_words(entry['age_s'])}"
+    said += f"; its latest read failed: {_limit_failure_words(failed)})" if failed is not None else ")"
+    lim, rem = entry["limit_microdollars"], entry["remaining_microdollars"]
+    return _limit_verdict(name, None if lim is None else lim / 1_000_000, None if rem is None else rem / 1_000_000,
+                          entry["reset"], entry["byok"], said)
+
+
+def _openrouter_limit_row(store: Path, cred: str, name: str, fetch: Any, timeout: float,
+                          keys_status: Any = lambda: None) -> CheckResult:
+    """The ceiling row for one OpenRouter credential: its key status read with that credential, or, when the
+    operator's account cannot open it, keys' own last read of it (``keys_status``), or why not. Never hangs and every
+    outcome is its own row text. GET /api/v1/key answers ``data`` with (OpenRouter's API reference, "Get current API
+    key") ``limit`` (USD, nullable), ``limit_remaining`` (nullable), ``limit_reset`` (nullable string: the period the
+    limit resets over) and ``include_byok_in_limit`` (boolean)."""
     from levain.broker import creds, policy
 
     held = (f"the key limit was not read: {cred} is held by keys and your account cannot open it",
@@ -1000,7 +1078,7 @@ def _openrouter_limit_row(store: Path, cred: str, name: str, fetch: Any, timeout
     try:
         dir_fd = os.open(store / "keys" / "cred", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except PermissionError:
-        return CheckResult(name, True, held[0], held[1], warn=True)
+        return _keys_limit_row(cred, name, held, keys_status)
     except FileNotFoundError:
         return CheckResult(name, True, f"no credential file for {cred} (the credential directory does not exist); "
                            "keys refuses calls on this route until it is set; the key limit was not read", warn=True)
@@ -1009,7 +1087,7 @@ def _openrouter_limit_row(store: Path, cred: str, name: str, fetch: Any, timeout
     try:
         raw = creds.read_file(dir_fd, cred)
     except PermissionError:
-        return CheckResult(name, True, held[0], held[1], warn=True)
+        return _keys_limit_row(cred, name, held, keys_status)
     except creds.Unparseable as exc:
         return CheckResult(name, True, f"the credential file for {cred} is not usable ({exc}); the key limit was "
                            "not read", warn=True)
@@ -1038,34 +1116,17 @@ def _openrouter_limit_row(store: Path, cred: str, name: str, fetch: Any, timeout
                            warn=True)
     if status != 200:
         return CheckResult(name, True, f"OpenRouter answered {status}; the key limit was not read", warn=True)
-    hint_set = ("Set a per-key credit limit with no reset period, counting BYOK usage, at "
-                "openrouter.ai/settings/keys.")
-    try:
-        data = json.loads(body.decode("utf-8"))["data"]
-        limit, left = data["limit"], data["limit_remaining"]
-        reset, byok = data.get("limit_reset"), data.get("include_byok_in_limit")
-    except Exception:  # noqa: BLE001 - an answer of another shape is said as such
+    from levain.broker import keys
+
+    got = keys.key_status_values(body)   # keys' own validation, so both paths give one verdict (L3 r1 E3)
+    if got == "bad-body":
         return CheckResult(name, True, "OpenRouter answered with something that was not a key status; "
                                        "the key limit was not read", warn=True)
-    if limit is None:
-        return CheckResult(name, True, "no credit limit is set on this key: nothing at the provider bounds the "
-                                       "invoice", hint_set, warn=True)
-    lim, rem = _number(limit), _number(left)
-    if lim is None or rem is None:
-        return CheckResult(name, True, "OpenRouter's key status had no usable numbers; the key limit was not read",
-                           warn=True)
-    problems = []
-    if rem <= 0:
-        problems.append("the key is exhausted: OpenRouter will refuse its calls")
-    if reset is not None:
-        period = _RESET_PERIOD.get(reset, reset) if isinstance(reset, str) else "period"
-        problems.append(f"cap {_usd(lim)} per {period}, not a total: spend can pass it across periods")
-    if byok is False:
-        problems.append("BYOK usage is not counted against this limit")
-    if problems:
-        return CheckResult(name, True, f"key limit {_usd(lim)}, {_usd(rem)} remaining; " + "; ".join(problems),
-                           hint_set, warn=True)
-    return CheckResult(name, True, f"key limit {_usd(lim)} total, {_usd(rem)} remaining")
+    if isinstance(got, str):
+        return _unusable_numbers(name)
+    lim, rem, reset, byok = got
+    return _limit_verdict(name, None if lim is None else lim / 1_000_000, None if rem is None else rem / 1_000_000,
+                          reset, byok)
 
 
 def _check_invoice_ceiling(store: Path, fetch: Any, keys_status: Any = lambda: None) -> list[CheckResult]:
@@ -1094,7 +1155,7 @@ def _check_invoice_ceiling(store: Path, fetch: Any, keys_status: Any = lambda: N
     for host, cred in sorted(pairs):
         name = f"invoice ceiling ({cred})" if uses[cred] == 1 else f"invoice ceiling ({cred} at {host})"
         rows.extend(_guarded(name, lambda host=host, cred=cred, name=name: _ceiling_row(
-            store, host, cred, name, fetch, deadline)))
+            store, host, cred, name, fetch, deadline, keys_status)))
     return rows
 
 
@@ -1109,7 +1170,8 @@ def _cred_dir_exists(store: Path) -> bool:
     return True
 
 
-def _ceiling_row(store: Path, host: str, cred: str, name: str, fetch: Any, deadline: float) -> CheckResult:
+def _ceiling_row(store: Path, host: str, cred: str, name: str, fetch: Any, deadline: float,
+                 keys_status: Any = lambda: None) -> CheckResult:
     from levain.broker import policy
 
     if host == policy.OPENROUTER_HOST:
@@ -1117,7 +1179,7 @@ def _ceiling_row(store: Path, host: str, cred: str, name: str, fetch: Any, deadl
         if left <= 0:
             return CheckResult(name, True, "the key limit was not read: the time allowed for the provider reads "
                                "in this run was used up", warn=True)
-        return _openrouter_limit_row(store, cred, name, fetch, min(_LIMIT_FETCH_TIMEOUT_S, left))
+        return _openrouter_limit_row(store, cred, name, fetch, min(_LIMIT_FETCH_TIMEOUT_S, left), keys_status)
     if host in _PROVIDER_LIMIT_SETTINGS:
         return CheckResult(name, True, f"not readable; set a {_PROVIDER_LIMIT_SETTINGS[host]} in the provider "
                            "console, since Levain's authorized cap does not bound the provider's invoice",
