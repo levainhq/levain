@@ -2,12 +2,12 @@
 (format /3) is migrated in place to /4 when this code opens it, keeping its jobs, and a Levain that knows only an older
 format refuses a newer store.
 
-The /1 store is made by this module's own schema with F11's and W2-a's statements left out, which is 0.11.10's schema
-exactly (`diff <(git show v0.11.10:levain/dispatch/jobs.py | sed -n '/^_SCHEMA = (/,/^)/p') <(sed -n
-'/^_SCHEMA = (/,/^)/p' levain/dispatch/jobs.py)` prints only the authorise_signatures and run_records lines); the /2
-store leaves out W2-a's alone, 0.11.12's schema (the same diff against v0.11.12 prints only the run_records lines);
-the /3 store leaves out only F11-C's envelope tables, 0.11.13's schema (the same diff against v0.11.13 prints only the
-job_envelopes and job_threads lines).
+The /1 store is made by this module's own schema with F11's and W2-a's statements left out, the /2 store leaves out
+W2-a's alone, and the /3 store leaves out only F11-C's envelope tables (V1_SCHEMA, V2_SCHEMA and V3_SCHEMA below). Each
+is that release's schema up to the statements the later schema added to tables that release already had (a column such
+as run_records.ticket) or to tables it lacked (verifier_refusals, event_cursor): the exact difference is
+`diff <(git show v0.11.NN:levain/dispatch/jobs.py | sed -n '/^_SCHEMA = (/,/^)/p') <(sed -n '/^_SCHEMA = (/,/^)/p'
+levain/dispatch/jobs.py)` for NN in 10, 12, 13, and is not restated here.
 A real 0.11.12 store opened by this code, and refused by 0.11.12 once migrated, is the W2-a run
 (project_memory/1020-f11/w2a_run/RUN.txt)."""
 from __future__ import annotations

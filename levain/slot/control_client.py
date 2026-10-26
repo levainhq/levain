@@ -23,11 +23,13 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator, Union
 
 from levain.slot import Refused
 from levain.slot.control import FrameMalformed, FrameTooLarge, encode_frame, read_frame
+from levain.slot.events import check_event
 
 #: CONTRACT §11 V23: the window a ``locked`` refusal is retried in.
 V23_SECONDS = 10.0
@@ -157,4 +159,184 @@ class ControlClient:
         return nonce
 
 
-__all__ = ["ControlClient", "LOCKED_RETRY_FIRST_S", "LOCKED_RETRY_MAX_S", "V23_SECONDS"]
+# -- SESSION-EVENTS: the stream (CONTRACT §3.6) ---------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Hello:
+    """The stream's opening. ``same_journal`` is None when the caller named no ``journal_id``, else whether the hello's
+    is the one named (False: the caller's cursor is another journal's and must restart from 0)."""
+    journal_id: str
+    oldest_seq: int
+    newest_seq: int
+    same_journal: bool | None
+
+
+@dataclass(frozen=True)
+class Gap:
+    """Events past the cursor were pruned before they could be sent; the stream continues from ``oldest_seq``."""
+    oldest_seq: int
+
+
+@dataclass(frozen=True)
+class Reset:
+    """The cursor is past this journal's newest seq (another journal's): the stream sent this and ended."""
+    newest_seq: int
+
+
+@dataclass(frozen=True)
+class StreamError:
+    """CONTROL ended the stream with ``{kind:"error", error}`` (a journal poisoned under the stream)."""
+    error: str
+
+
+@dataclass(frozen=True)
+class Event:
+    """One journal event (``levain-session-event/1``): ``body`` is the whole frame, ``seq`` and ``kind`` read from it."""
+    seq: int
+    kind: str
+    body: dict = field(compare=False)
+
+
+Frame = Union[Hello, Gap, Reset, StreamError, Event]
+
+#: how an :class:`EventStream` ended (``outcome``); ``None`` while it can still yield
+CLOSED = "closed"          # CONTROL closed the connection between frames (its stop, a stalled reader dropped)
+RESET = "reset"            # a :class:`Reset` frame ended it
+ERROR = "error"            # a :class:`StreamError` frame ended it
+DEADLINE = "deadline"      # no frame within the caller's ``read_deadline``
+BROKEN = "broken"          # a frame off the wire's shape, or a socket error mid-frame
+CANCELLED = "cancelled"    # the caller closed it
+
+
+class EventStream:
+    """``SESSION-EVENTS`` on its own connection: iterating yields the :class:`Hello`, then :class:`Gap` /
+    :class:`Reset` / :class:`StreamError` / :class:`Event` values in the order CONTROL sent them. The iterator ends on
+    a reset, an error frame, EOF, the read deadline, a broken frame or :meth:`close`, and ``outcome`` names which.
+    The caller never writes on the connection (CONTROL ends a stream on any byte from its peer); closing it cancels.
+    There is no heartbeat: an idle stream sends nothing, so ``read_deadline`` (None: wait for ever) is the only
+    timeout, and a caller reconnects from its own persisted cursor."""
+
+    def __init__(self, sock: socket.socket, hello: Hello) -> None:
+        self._sock: socket.socket | None = sock
+        self.hello = hello
+        self.outcome: str | None = None
+        self._hello_due = True
+        # a close() from another thread while a read is in flight only shuts the socket down; the reader closes the fd
+        self._mu = threading.Lock()
+        self._reading = False
+
+    def __iter__(self) -> Iterator[Frame]:
+        return self
+
+    def __next__(self) -> Frame:
+        if self._hello_due:
+            self._hello_due = False
+            return self.hello
+        with self._mu:
+            sock = self._sock
+            if sock is None:
+                raise StopIteration
+            self._reading = True
+        try:
+            obj = read_frame(sock)
+        except socket.timeout:
+            self._end(DEADLINE)
+            raise StopIteration from None
+        except (OSError, FrameMalformed, FrameTooLarge):
+            self._end(BROKEN)
+            raise StopIteration from None
+        finally:
+            with self._mu:
+                self._reading = False
+        if obj is None:
+            self._end(CLOSED)
+            raise StopIteration
+        frame = _stream_frame(obj)
+        if frame is None:
+            self._end(BROKEN)
+            raise StopIteration
+        if isinstance(frame, Reset):
+            self._end(RESET)
+        elif isinstance(frame, StreamError):
+            self._end(ERROR)
+        return frame
+
+    def _end(self, outcome: str) -> None:
+        with self._mu:
+            if self.outcome is None:
+                self.outcome = outcome
+            sock = self._sock
+            if sock is None:
+                return
+            # a read in flight on another thread: shut down only. On Darwin a shutdown wakes a reader waiting in
+            # poll() (a timed recv) and a close of the fd under it need not, so that reader closes the fd on waking.
+            reading = self._reading and outcome == CANCELLED
+            if not reading:
+                self._sock = None
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        if not reading:
+            sock.close()
+
+    def close(self) -> None:
+        """Cancel the stream (CONTROL sees the EOF); a reader blocked on another thread wakes and its iteration ends.
+        Idempotent; a stream already ended keeps its outcome."""
+        self._hello_due = False
+        self._end(CANCELLED)
+
+    def __enter__(self) -> "EventStream":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+def _int(v: object) -> bool:
+    return type(v) is int and v >= 0
+
+
+def _stream_frame(obj: dict) -> Frame | None:
+    """A frame read after the hello as its typed value; None for one off the wire's shape."""
+    kind = obj.get("kind")
+    if kind == "gap" and _int(obj.get("oldest_seq")):
+        return Gap(obj["oldest_seq"])
+    if kind == "reset" and _int(obj.get("newest_seq")):
+        return Reset(obj["newest_seq"])
+    if kind == "error" and type(obj.get("error")) is str:
+        return StreamError(obj["error"])
+    # a stored event is the server's levain-session-event/1 object, checked by the server's own checker
+    if kind not in ("hello", "gap", "reset", "error") and check_event(obj) is None:
+        return Event(obj["seq"], obj["kind"], obj)
+    return None
+
+
+def follow_events(path: Path | str, after_seq: int, journal_id: str | None = None, *, timeout: float = 10.0,
+                  read_deadline: float | None = None) -> EventStream:
+    """Open ``SESSION-EVENTS {after_seq}`` on a new connection to CONTROL at ``path`` and read its hello (``timeout``
+    bounds the connect and the hello). A refusal of the verb raises :class:`Refused` by its name, a connection that
+    cannot be made or answers off the wire's shape ``Refused("control-down")``; either way the connection is closed.
+    ``journal_id``: the journal the caller's cursor belongs to, compared with the hello's (:attr:`Hello.same_journal`).
+    The connection then belongs to the returned :class:`EventStream`."""
+    client = ControlClient(path, timeout=timeout)
+    try:
+        with client._mu:
+            ans = client._exchange("SESSION-EVENTS", {"after_seq": after_seq})
+        if ans["ok"] is not True:
+            raise Refused(ans["refused"], "SESSION-EVENTS")
+        jid, oldest, newest = ans.get("journal_id"), ans.get("oldest_seq"), ans.get("newest_seq")
+        if ans.get("kind") != "hello" or type(jid) is not str or not _int(oldest) or not _int(newest):
+            raise client._down("SESSION-EVENTS answered no hello")
+        sock, client._sock = client._sock, None
+        assert sock is not None
+    except BaseException:
+        client.close()
+        raise
+    sock.settimeout(read_deadline)
+    return EventStream(sock, Hello(jid, oldest, newest, None if journal_id is None else jid == journal_id))
+
+
+__all__ = ["BROKEN", "CANCELLED", "CLOSED", "ControlClient", "DEADLINE", "ERROR", "Event", "EventStream", "Frame",
+           "Gap", "Hello", "LOCKED_RETRY_FIRST_S", "LOCKED_RETRY_MAX_S", "RESET", "Reset", "StreamError",
+           "V23_SECONDS", "follow_events"]

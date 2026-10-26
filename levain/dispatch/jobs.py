@@ -122,7 +122,8 @@ if TYPE_CHECKING:
 __all__ = [
     "CAUSES", "DB_NAME", "EDGES", "FORMAT", "STATES", "TERMINAL", "UNSIGNED_LEASE", "CapabilityRefused",
     "ENVELOPE_EVIDENCE_KEYS", "EnvelopeEnd", "EnvelopeRefused", "Job", "envelope_evidence",
-    "JobStore", "JobStoreError", "SignatureRefused", "Transition", "TransitionRefused", "default_dispatch_dir",
+    "JobStore", "JobStoreError", "AlreadyRecorded", "RecordConflict", "SignatureRefused", "Transition",
+    "TransitionRefused", "default_dispatch_dir", "report_of",
 ]
 
 log = logging.getLogger("levain.dispatch.jobs")
@@ -230,6 +231,17 @@ class JobStoreError(DispatchError):
 
 class TransitionRefused(DispatchError):
     """A transition the edge table does not allow from the job's current state, or a job that does not exist."""
+
+
+class AlreadyRecorded(TransitionRefused):
+    """:meth:`JobStore.record_verification` refused a repeat: the store already holds THIS event's outcome for the run
+    (this ticket and its report's digest as the run record's, or this ticket and outcome as the refusal that failed
+    the job)."""
+
+
+class RecordConflict(TransitionRefused):
+    """:meth:`JobStore.record_verification` refused an event whose run already holds a record of another report or of
+    another ticket, or whose ticket already failed the job with another outcome."""
 
 
 class SignatureRefused(DispatchError):
@@ -425,10 +437,12 @@ _SCHEMA = (
     "WHEN EXISTS (SELECT 1 FROM job_filers WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a job filer is never replaced'); END",
     # one verified (or failed) RUN's artifact record (F11 §7), written by the verifier writer alone: the record's
-    # canonical bytes, its artifact digest, and the digest of the verifier envelope it was read from; a run is
-    # recorded once
+    # canonical bytes, its artifact digest, the digest of the verifier envelope it was read from, and the verifier
+    # ticket whose event it took (what a repeat is matched on beside the digest: a session can publish a byte copy of
+    # another session's envelope under its own ticket); a run is recorded once. A row with no ticket (a writer that
+    # kept none) matches no repeat, so its follower sends no ACK
     "CREATE TABLE IF NOT EXISTS run_records (job_id TEXT NOT NULL REFERENCES jobs(id), run INTEGER NOT NULL, "
-    "record TEXT NOT NULL, digest TEXT NOT NULL, envelope_digest TEXT NOT NULL, at TEXT NOT NULL, "
+    "record TEXT NOT NULL, digest TEXT NOT NULL, envelope_digest TEXT NOT NULL, at TEXT NOT NULL, ticket TEXT, "
     "PRIMARY KEY (job_id, run))",
     *_append_only("run_records", "a run record is written once"),
     "CREATE TRIGGER IF NOT EXISTS run_records_no_replace BEFORE INSERT ON run_records "
@@ -456,6 +470,21 @@ _SCHEMA = (
     "CREATE TRIGGER IF NOT EXISTS handoffs_no_replace BEFORE INSERT ON handoffs "
     "WHEN EXISTS (SELECT 1 FROM handoffs WHERE job_id = NEW.job_id OR bundle_id = NEW.bundle_id "
     "OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a handoff row is never replaced'); END",
+    # the verifier outcome that failed a job verifier_refused: its run, the run's ticket and the terminal event's own
+    # report field (the refusal it named, or the digest), so a repeat of that event is known by ticket and outcome,
+    # never by a refusal name alone; written in the failing transaction, once per job, never replaced. A job failed
+    # verifier_refused with no row here (a writer that kept none) matches no repeat, so its follower sends no ACK
+    "CREATE TABLE IF NOT EXISTS verifier_refusals (job_id TEXT PRIMARY KEY REFERENCES jobs(id), "
+    "run INTEGER NOT NULL, ticket TEXT NOT NULL, event_refused TEXT, event_digest TEXT, at TEXT NOT NULL, "
+    "CHECK ((event_refused IS NULL) != (event_digest IS NULL)))",
+    *_append_only("verifier_refusals", "a verifier refusal is recorded once"),
+    "CREATE TRIGGER IF NOT EXISTS verifier_refusals_no_replace BEFORE INSERT ON verifier_refusals "
+    "WHEN EXISTS (SELECT 1 FROM verifier_refusals WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a verifier refusal is never replaced'); END",
+    # dispatch's SESSION-EVENTS cursor (CONTRACT §3.6 "dispatch persists its cursor"): at most one row, the journal
+    # the cursor belongs to and the last seq the follower finished (levain.dispatch.follow); rewritten, never appended
+    "CREATE TABLE IF NOT EXISTS event_cursor (one INTEGER PRIMARY KEY CHECK (one = 1), journal_id TEXT NOT NULL, "
+    "seq INTEGER NOT NULL CHECK (seq >= 0))",
     "CREATE TRIGGER IF NOT EXISTS cancel_signatures_no_replace BEFORE INSERT ON cancel_signatures "
     "WHEN EXISTS (SELECT 1 FROM cancel_signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a cancel is never replaced'); END",
@@ -546,6 +575,31 @@ def _terminal_event(event: Any, run: VerifierRun) -> tuple[str | None, str | Non
         raise DispatchError(f"the session event's state is not {' or '.join(_SESSION_TERMINAL)}")
     if not isinstance(event.get("at"), str):
         raise DispatchError("the session event carries no at stamp")
+    return report_of(event)
+
+
+def _verified_at(at: str) -> str:
+    """A run record's ``verified_at`` from the terminal event's ``at``: CONTROL stamps events to the second
+    (:func:`levain.slot.records.timestamp`), re-written in the job store's stamp (:func:`utc_stamp`), losslessly; a
+    stamp already in the store's form is kept. Anything else is a :class:`DispatchError`."""
+    from levain.slot import records as SR
+
+    try:
+        return utc_stamp(parse_stamp(at))
+    except ConsentError:
+        pass
+    try:
+        return utc_stamp(datetime.fromtimestamp(SR.epoch_of(at), timezone.utc))
+    except (TypeError, ValueError):
+        raise DispatchError("the session event's at is not a timestamp") from None
+
+
+def report_of(event: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """``(refusal name, None)`` or ``(None, envelope digest)`` from a verifier's terminal event's report fields, and a
+    ``ticket`` that is a string: anything else is a :class:`DispatchError`. The one shape check of those fields, read
+    by :func:`_terminal_event` and by the SESSION-EVENTS follower before it resolves or writes anything."""
+    if not isinstance(event.get("ticket"), str):
+        raise DispatchError("the session event's ticket is not a string")
     has_digest, has_refused = "verifier_report_digest" in event, "verifier_report_refused" in event
     if has_digest == has_refused:
         raise DispatchError("the session event carries exactly one of verifier_report_digest and "
@@ -556,6 +610,35 @@ def _terminal_event(event: Any, run: VerifierRun) -> tuple[str | None, str | Non
     if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
         raise DispatchError("the session event's verifier_report_digest is not sha256:<64 hex>")
     return None, digest
+
+
+def _refuse_repeat(conn: sqlite3.Connection, job: Job, run: int, ticket: str, refused: str | None,
+                   digest: str | None) -> None:
+    """Refuse a verifier outcome job ``job`` cannot take for run ``run`` (ticket ``ticket``): :class:`AlreadyRecorded`
+    when the store holds this outcome (the run's record carries this ticket and this report digest, or the refusal
+    that failed the job is this ticket's with this outcome), :class:`RecordConflict` when the run's record is another
+    report's or another ticket's, or this ticket failed the job with another outcome, :class:`TransitionRefused` when
+    the job is past verifying by any other cause (another run's refusal among them) or the run's record of this
+    digest keeps no ticket. Returns when the job is verifying and the run unrecorded. Matched on the stored ticket,
+    never by checking the envelope again: a true repeat may come after its ACK let the reaper trash the envelope."""
+    row = conn.execute("SELECT envelope_digest, ticket FROM run_records WHERE job_id = ? AND run = ?",
+                       (job.id, run)).fetchone()
+    if row is not None:
+        if refused is None and row[0] == digest and row[1] is None:
+            raise TransitionRefused(f"run {run} of job {job.id} is already recorded, with this report and no ticket "
+                                    "kept; it matches no repeat")
+        if refused is None and row[0] == digest and row[1] == ticket:
+            raise AlreadyRecorded(f"run {run} of job {job.id} is already recorded, with this report")
+        raise RecordConflict(f"run {run} of job {job.id} is already recorded, with another report or ticket; a run "
+                             "record is never replaced")
+    held = conn.execute("SELECT run, ticket, event_refused, event_digest FROM verifier_refusals WHERE job_id = ?",
+                        (job.id,)).fetchone()
+    if held is not None and (held[0], held[1]) == (run, ticket):
+        if (held[2], held[3]) == (refused, digest):
+            raise AlreadyRecorded(f"job {job.id} already failed on this ticket's refusal")
+        raise RecordConflict(f"ticket {ticket[:64]} already failed job {job.id} with another outcome")
+    if job.state != "verifying":
+        raise TransitionRefused(f"job {job.id} is {job.state}; only a verifying job records its verifier")
 
 
 def _stored_record(job_id: str, run: Any, text: Any, digest: Any) -> ArtifactRecord:
@@ -678,6 +761,10 @@ class JobStore:
             if "jobs" in tables and "writer_format" not in {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}:
                 # a store from before /5: its rows keep no writer format (the check is on insert only)
                 conn.execute("ALTER TABLE jobs ADD COLUMN writer_format TEXT")
+            if "run_records" in tables and "ticket" not in {r[1] for r in conn.execute(
+                    "PRAGMA table_info(run_records)")}:
+                # a store whose run records keep no ticket: its rows keep none (they match no repeat)
+                conn.execute("ALTER TABLE run_records ADD COLUMN ticket TEXT")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
             if row is None:
@@ -708,6 +795,35 @@ class JobStore:
     def stamp(self) -> str:
         """Now, on the store's own clock: the one clock a land judges expiry and record age by."""
         return self._stamp()
+
+    # --- the SESSION-EVENTS cursor (levain.dispatch.follow) --------------------------------------------------------
+    def event_cursor(self) -> tuple[str, int] | None:
+        """``(journal_id, seq)``: the journal and the last event seq the follower finished; None before the first."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT journal_id, seq FROM event_cursor WHERE one = 1").fetchone()
+        finally:
+            conn.close()
+        return None if row is None else (row[0], row[1])
+
+    def set_event_cursor(self, journal_id: str, seq: int) -> None:
+        """Persist the cursor past event ``seq`` of journal ``journal_id`` in its own write transaction. Within one
+        journal the cursor never moves backward (the same seq again is a no-op); a cursor of another journal is set
+        only after :meth:`drop_event_cursor`. Either refusal is a :class:`DispatchError`, the cursor unchanged."""
+        if type(journal_id) is not str or not journal_id or type(seq) is not int or seq < 0:
+            raise DispatchError("an event cursor is a journal id and a seq >= 0")
+        with self._write() as conn:
+            cur = conn.execute("INSERT INTO event_cursor (one, journal_id, seq) VALUES (1, ?, ?) ON CONFLICT (one) "
+                               "DO UPDATE SET seq = excluded.seq WHERE event_cursor.journal_id = excluded.journal_id "
+                               "AND excluded.seq >= event_cursor.seq", (journal_id, seq))
+            if cur.rowcount != 1:
+                raise DispatchError(f"the event cursor does not move to seq {seq} of journal {journal_id[:64]}: it "
+                                    "never moves backward, and another journal's starts after drop_event_cursor")
+
+    def drop_event_cursor(self) -> None:
+        """Forget the cursor (its journal is gone: the follower restarts from 0)."""
+        with self._write() as conn:
+            conn.execute("DELETE FROM event_cursor")
 
     @contextmanager
     def _swept(self) -> Iterator[tuple[sqlite3.Connection, str]]:
@@ -1308,7 +1424,8 @@ class JobStore:
         A refused event, a minted run that is not a contract entry and its steps (:data:`ENTRY_REFUSED`), a minted
         verifier entry that is not the template's (:data:`NOT_THE_TEMPLATES`), both checked before anything is
         staged, or an envelope :func:`levain.dispatch.verifier_report.check_envelope` refuses fails
-        the job with cause ``verifier_refused``, the evidence the refusal's name, and writes no record. A report that
+        the job with cause ``verifier_refused``, the evidence the refusal's name, keeps the ticket and the event's
+        own report field beside it (what a repeat is matched on), and writes no run record. A report that
         checks: the run's commit is staged (:func:`levain.dispatch.adopt.stage_commit`, ``verified_at`` the event's
         ``at``, so the staged sha re-derives from the record alone), its record built and judged by
         :func:`levain.dispatch.adopt.artifact_problem`, then written; a ``fail`` result fails the job
@@ -1326,13 +1443,7 @@ class JobStore:
         refused, report_digest = _terminal_event(event, run)
         with self._swept() as (conn, _stamp):
             job = self._must_load(conn, run.job_id)
-            recorded = conn.execute("SELECT 1 FROM run_records WHERE job_id = ? AND run = ?",
-                                    (job.id, run.run)).fetchone() is not None
-        if job.state != "verifying":
-            raise TransitionRefused(f"job {job.id} is {job.state}; only a verifying job records its verifier")
-        if recorded:
-            raise TransitionRefused(f"run {run.run} of job {job.id} is already recorded; a run record is never "
-                                    "replaced")
+            _refuse_repeat(conn, job, run.run, run.ticket, refused, report_digest)
         if repo != job.repo:
             raise DispatchError(f"the verifier ran for another repository than job {job.id}'s")
         contract = job.contract
@@ -1358,7 +1469,7 @@ class JobStore:
                 name = exc.name
         record: ArtifactRecord | None = None
         if name is None:
-            verified_at = event["at"]
+            verified_at = _verified_at(event["at"])
             fields = dict(job_id=job.id, run=run.run, contract_digest=job.digest, base=contract.base, tree=tree,
                           verifier={"id": entry["verifier_id"], "hash": entry["verifier_artifact_digest"],
                                     "kind": entry["declared_kind"], "result": report.result},
@@ -1374,29 +1485,32 @@ class JobStore:
             problem = adopt.artifact_problem(repo, job, record)
             if problem is not None:
                 raise DispatchError(problem)
-        lost: str | None = None
+        lost: TransitionRefused | None = None
         with self._swept() as (conn, stamp):
             current = self._must_load(conn, job.id)
             if current.state != "verifying":
-                lost = current.state
+                try:
+                    _refuse_repeat(conn, current, run.run, run.ticket, refused, report_digest)
+                except TransitionRefused as exc:
+                    lost = exc
             elif record is None:
                 assert name is not None
                 # another writer may have recorded this run since the pre-read: its record stands, and this
                 # writer's infrastructure failure is refused rather than failing a job that holds it
-                if conn.execute("SELECT 1 FROM run_records WHERE job_id = ? AND run = ?",
-                                (job.id, run.run)).fetchone() is not None:
-                    raise TransitionRefused(f"run {run.run} of job {job.id} is already recorded; a run record is "
-                                            "never replaced")
+                _refuse_repeat(conn, current, run.run, run.ticket, refused, report_digest)
                 self._apply(conn, job.id, "failed", "verifier_refused", stamp, name)
+                conn.execute("INSERT INTO verifier_refusals (job_id, run, ticket, event_refused, event_digest, at) "
+                             "VALUES (?, ?, ?, ?, ?, ?)", (job.id, run.run, run.ticket, refused, report_digest, stamp))
             else:
                 try:
-                    conn.execute("INSERT INTO run_records (job_id, run, record, digest, envelope_digest, at) "
-                                 "VALUES (?, ?, ?, ?, ?, ?)",
+                    conn.execute("INSERT INTO run_records (job_id, run, record, digest, envelope_digest, at, ticket) "
+                                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                                  (job.id, record.run, canonical(record.to_mapping()), adopt.artifact_digest(record),
-                                  report.digest, stamp))
-                except sqlite3.IntegrityError:
-                    raise TransitionRefused(f"run {record.run} of job {job.id} is already recorded; a run record "
-                                            "is never replaced") from None
+                                  report.digest, stamp, run.ticket))
+                except sqlite3.IntegrityError as exc:
+                    _refuse_repeat(conn, current, run.run, run.ticket, refused, report_digest)
+                    # not a repeat of this run: a named refusal, never a raw sqlite3 error
+                    raise DispatchError(f"the run record was refused by the store: {str(exc)[:200]}") from None
                 failure = report.first_failure
                 if failure is not None:
                     self._apply(conn, job.id, "failed", "verifier_fail", stamp,
@@ -1422,7 +1536,7 @@ class JobStore:
             except adopt.GitFault:
                 pass
         if lost is not None:
-            raise TransitionRefused(f"job {job.id} is {lost}; only a verifying job records its verifier")
+            raise lost
         return out
 
     def run_records(self, job_id: str) -> list[ArtifactRecord]:
