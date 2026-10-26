@@ -167,7 +167,7 @@ def test_the_sheet_reads_a_pending_request_with_what_a_passkey_may_sign(home, tm
         assert [o["key"] for o in r3["options"]] == ["deny"] and "laptop" in r3["note"], r3
         # the card's body names the sheet
         status, body = _call(url, f"/cockpit/consent/{_q(t2)}.json")
-        assert status == 200 and body["sheet"] is True, body
+        assert status == 200 and body["sheet"] is True and body["sheet_v"] == r["sha256"], body
         # the sheet's page is the same shell as the sign sheet's
         status, page = _call(url, f"/sign/consent/{_q(t2)}", token=None)
         assert status == 200 and b"/sign.js" in page
@@ -210,4 +210,21 @@ def test_a_cockpit_whose_page_the_queue_would_refuse_starts_no_ceremony(home, tm
         status, out = _call(url, f"/cockpit/consent/{_q(rid)}/challenge",
                             {"decision": "deny", "signer_fp": home.phone.fp})
         assert (status, out["error"]) == (422, "answer_refused") and "nothing was signed" in out["message"], out
+    assert _queue(home).get(rid)[1] == "pending"
+
+
+def test_the_refusal_before_the_ceremony_stands_on_the_queues_own_refusal(home, tmp_path, monkeypatch) -> None:
+    """The premise of the refusal above, measured: with it lifted, an answer signed on the ported page converts (the page
+    is the pinned one) and the queue itself refuses it, recording nothing."""
+    from levain import web_server
+
+    monkeypatch.setattr(web_server.ConsentSheet, "elsewhere", lambda self: None)
+    rid = _file(home)
+    with _serving(tmp_path / "inst", signer=_signer(home, origin=PORTED), extra_hosts=[RP]) as (url, _httpd):
+        base = f"/cockpit/consent/{_q(rid)}"
+        status, c = _call(url, base + "/challenge", {"decision": "deny", "signer_fp": home.phone.fp})
+        assert status == 200, c
+        status, out = _call(url, base + "/answer", {"payload": c["payload"],
+                                                    **home.phone.assertion(c["challenge"], origin=PORTED)})
+        assert (status, out["error"]) == (422, "answer_refused") and f"https://{RP}" in out["message"], out
     assert _queue(home).get(rid)[1] == "pending"

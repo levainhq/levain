@@ -419,6 +419,11 @@ class ConsentSheet:
             out["line"] = encode(out["payload"]).decode("utf-8")
         return out, waiter
 
+    @staticmethod
+    def version(request: Any, state: str) -> str:
+        """The version a sheet row and a card's link name one request by: over the request and its state."""
+        return hashlib.sha256(json.dumps([request.id, request.digest, request.tier, state]).encode()).hexdigest()
+
     def row(self, request_id: str) -> "dict[str, Any] | None":
         """The sheet's row for one request that is open to a passkey here (pending: an answer; undecided: a ruling),
         else None. ``signers``: the active passkeys enrolled on ``rp_id`` in the cockpit the request's hook names; an
@@ -440,7 +445,7 @@ class ConsentSheet:
         request, state = got
         mode = "answer" if state == "pending" else "rule"
         cut = filed_input(request) is UNSHOWN
-        version = hashlib.sha256(json.dumps([request.id, request.digest, request.tier, state]).encode()).hexdigest()
+        version = self.version(request, state)
         row: dict[str, Any] = {
             "id": request.id, "kind": "consent", "mode": mode, "state": state, "sha256": version,
             "title": f"{visible(request.tool_name)} · {request.tier}", "requester": visible(request.agent),
@@ -1455,6 +1460,8 @@ class _Handler(GuardedHandler):
                         # OS-2: this cockpit answers (pending) or rules (undecided) it with a passkey in the sheet
                         payload["sheet"] = (self.server.consent_sheet is not None
                                             and entry.state in ("pending", "undecided"))
+                        if payload["sheet"]:      # the version the card's link carries (its preselect's guard)
+                            payload["sheet_v"] = ConsentSheet.version(entry.request, entry.state)
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                 raise
             except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
