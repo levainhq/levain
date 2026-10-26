@@ -60,7 +60,7 @@ from levain.broker.gwwire import FrameReader, FrontSide, HoldingReader, WireErro
 from levain.broker.norm import REASON, STATUS, Refused  # noqa: F401 - STATUS and Refused are re-exported
 from levain.broker import norm
 from levain.broker.policy import (CONNECT_TYPES, ROUTE_TYPES, PolicyError, RoutePolicy,  # noqa: F401 - re-exported
-                                  _HOSTNAME, parse_route)
+                                  is_host_name, parse_route)
 from levain.broker.stub import GWPORT_BASE, SLOTS, clear_stale_socket, peer_uid
 
 POLICY_FORMAT = "levain-front-session/1"
@@ -347,11 +347,15 @@ def connect_target(policy: FrontPolicy, target: bytes) -> tuple[ConnectRoute, in
 REFUSED_HOST_CAP = 253
 
 
-def refused_host_fields(target: bytes) -> dict:
+def refused_host_fields(target: object) -> dict:
     """The requested host of a refused CONNECT, for its log line (wfetch DESIGN §2.3): ``{"host": h}`` when the
-    target's host part is at most :data:`REFUSED_HOST_CAP` bytes and is a host name in the policy's grammar
-    (lowercased) or an address literal without a scope id; else ``{"host_invalid": True, "host_len": n}``. The host
-    is slot-supplied, so nothing else of it is logged."""
+    target's host part is at most :data:`REFUSED_HOST_CAP` bytes and, lowercased as :func:`connect_target` matches
+    it, passes the policy's host grammar (:func:`levain.broker.policy.is_host_name`), or is an address literal
+    spelled exactly as ``ipaddress`` prints it (no scope id); else ``{"host_invalid": True, "host_len": n}``, and
+    ``{"host_invalid": True}`` for a target that is not bytes. The host is slot-supplied, so nothing else of it is
+    logged."""
+    if type(target) is not bytes:
+        return {"host_invalid": True}
     m = re.match(rb"\[([^\]]*)\](?::[0-9]*)?\Z", target)
     raw = m.group(1) if m else (target.rpartition(b":")[0] if b":" in target else target)
     if len(raw) <= REFUSED_HOST_CAP:
@@ -359,13 +363,16 @@ def refused_host_fields(target: bytes) -> dict:
             text = raw.decode("ascii")
         except UnicodeDecodeError:
             text = None
-        if text is not None and _HOSTNAME.match(text.lower()):
-            return {"host": text.lower()}
-        if text is not None and "%" not in text:
+        if text is not None:
+            low = text.lower()
+            if is_host_name(low):
+                return {"host": low}
             try:
-                return {"host": str(ipaddress.ip_address(text))}
+                addr = str(ipaddress.ip_address(text))
             except ValueError:
-                pass
+                addr = None
+            if addr == text and "%" not in text:
+                return {"host": addr}
     return {"host_invalid": True, "host_len": len(raw)}
 
 
