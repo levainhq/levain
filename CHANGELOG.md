@@ -38,6 +38,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   Password Manager, and others), and `levain cockpit keys` shows them; rerunning it for a passkey already enrolled fills
   in what was never written and never replaces an id already held. These are display facts only: what a key may sign is
   still decided by its class alone.
+- **Phone pushes follow one rule:** a ping is pushed unless you are muted, and then only when it is urgent (a request
+  that is holding an agent), you are away, or your Mac has seen no input for 5 minutes. `levain ping quiet [30m]` and
+  `levain ping sleep` mute: urgent pings still come through `quiet`, and `sleep` holds everything until you next touch
+  the keyboard or mouse (or for an hour when this Mac cannot report its input). `levain ping loud [30m]` pushes
+  everything for a while over any mute (`loud off` ends it); `away`, `remote` and `back` are optional overrides. A held
+  ping is never lost: it is pushed when your Mac has been idle for 5 minutes, when a mute ends (one summary push, then
+  the held pings), or when you say `loud`, `away`, `remote` or `back`, and it leaves the queue only once every phone
+  still paired has taken it; a failed push is tried again a few minutes later. `levain ping status` says what the rule
+  does now, why, and how many pings are held.
 
 ### Fixed
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is

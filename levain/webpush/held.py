@@ -42,6 +42,7 @@ TICK_SECS = 30.0
 SPAWN_GAP_SECS = 30.0   # :func:`flush_if_due` starts a flush child at most this often
 LOCK_NAME = "flush.lock"
 STAMP_NAME = "flush.spawned"
+SPAWN_LOCK_NAME = "flush.spawn.lock"
 
 
 def _db(queue_dir: Path | str) -> Path:
@@ -99,13 +100,28 @@ def _plan_now(queue_dir: Path | str, at: float, idle: Callable[[], float | None]
     return plan(items, presence.read_word(queue_dir), _idle_source(idle)(), at)
 
 
+def _inside_spawn_gap(queue_dir: Path | str) -> bool:
+    """True when a flush child was started within :data:`SPAWN_GAP_SECS` (the stamp's age). Any fault reads as False."""
+    try:
+        return time.time() - os.lstat(Path(queue_dir) / "webpush" / STAMP_NAME).st_mtime < SPAWN_GAP_SECS
+    except OSError:
+        return False
+
+
 def due(queue_dir: Path | str | None, *, now: float | None = None,
-        idle: Callable[[], float | None] | None = None) -> bool:
-    """True when :func:`flush` would release something now (a ping under a live claim is not due). Cheap when nothing is
-    held; any fault reads as False."""
+        idle: Callable[[], float | None] | None = None, throttled: bool = False) -> bool:
+    """True when :func:`flush` would release something now (a ping under a live claim is not due). Cheap in order: the
+    held count, then (``throttled``) the spawn gap, then whether a phone is live, and only then the desk's idle reading;
+    any fault reads as False. With no live subscription nothing is due, so no flush child is started for it."""
     if not count(queue_dir):
         return False
+    if throttled and _inside_spawn_gap(queue_dir):
+        return False
     try:
+        from levain.webpush import live
+
+        if not live(queue_dir):
+            return False
         active, muted = _plan_now(queue_dir, time.time() if now is None else now, idle)
         return bool(active or muted)
     except Exception:  # noqa: BLE001 - checked again at the next call
@@ -113,8 +129,13 @@ def due(queue_dir: Path | str | None, *, now: float | None = None,
 
 
 def _pushed(results: list[tuple[int, int]]) -> bool:
-    """A push reached the phone when any subscription answered 2xx; no answer, no subscription, or a refusal did not."""
-    return any(200 <= status < 300 for _, status in results)
+    """A held ping is done when the push reached the phones: there was at least one subscription, one answered 2xx, and
+    every other one answered 2xx too or is retired (:func:`levain.webpush.sender.retires`). A device that failed, gave no
+    answer, or was refused for a reason that does not retire it keeps the ping held for the retry."""
+    from levain.webpush import sender
+
+    return (bool(results) and any(200 <= status < 300 for _, status in results)
+            and all(200 <= status < 300 or sender.retires(status) for _, status in results))
 
 
 def _single_flight(queue_dir: Path | str) -> int | None:
@@ -192,45 +213,69 @@ def _flush(queue_dir: Path | str, at: float, idle: Callable[[], float | None] | 
     return pushed
 
 
-def _spawn_due(queue_dir: Path | str) -> bool:
-    """True when no flush child was started within :data:`SPAWN_GAP_SECS` (and stamps this start); a stamp that cannot
-    be read or written reads as due."""
-    path = Path(queue_dir) / "webpush" / STAMP_NAME
+def _spawn_child(queue_dir: Path | str) -> bool:
+    from levain.launch import child_env
+
+    env = child_env()
+    root = str(Path(__file__).resolve().parents[2])   # a source checkout: -P leaves the child no other way to import levain
+    getsite = getattr(site, "getsitepackages", None)   # absent in some older virtualenv builds
+    installed = [d for d in (getsite() if getsite else []) + [site.getusersitepackages()] if isinstance(d, str)]
+    if not any(root == str(Path(d).resolve()) for d in installed):
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (root, env.get("PYTHONPATH")) if p)
+    subprocess.Popen([sys.executable, "-P", "-m", "levain.webpush", "flush", "--queue-dir",
+                      str(Path(queue_dir).resolve())], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True, env=env, cwd=os.sep)
+    return True
+
+
+def _spawn_throttled(queue_dir: Path | str) -> bool:
+    """Start a flush child unless one was started within :data:`SPAWN_GAP_SECS`. The stamp check, the spawn and the stamp
+    run under a non-blocking ``flock`` on ``flush.spawn.lock``: a process that finds the lock held reads as not due
+    (another is spawning now), and the stamp is written only after the child started, so a failed spawn is retried at the
+    next call. A lock or stamp that cannot be had for another reason spawns without the throttle."""
+    base = Path(queue_dir) / "webpush"
+    try:
+        fd = os.open(base / SPAWN_LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return _spawn_child(queue_dir)
     try:
         try:
-            if time.time() - os.lstat(path).st_mtime < SPAWN_GAP_SECS:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        except OSError:
+            return _spawn_child(queue_dir)
+        stamp = base / STAMP_NAME
+        try:
+            if time.time() - os.lstat(stamp).st_mtime < SPAWN_GAP_SECS:
                 return False
         except FileNotFoundError:
             pass
-        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
-        os.utime(path)
-    except OSError:
+        except OSError:
+            return _spawn_child(queue_dir)
+        _spawn_child(queue_dir)
+        try:
+            os.close(os.open(stamp, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+            os.utime(stamp)
+        except OSError:
+            pass
         return True
-    return True
+    finally:
+        os.close(fd)
 
 
 def flush_if_due(queue_dir: Path | str | None, *, throttle: bool = True) -> bool:
     """Start a detached ``python -m levain.webpush flush`` when something held is due (:func:`due`); True when it
     started. The gate hook calls this on every call, so it costs one read-only count when nothing is held, and a due
-    check that finds something starts a child at most every :data:`SPAWN_GAP_SECS`, so a burst of hooks does not spawn
-    a burst of processes (``throttle=False``, for a word the operator just said, skips that gap: one running flush still
-    stands any second one down)."""
-    if queue_dir is None or not due(queue_dir) or (throttle and not _spawn_due(queue_dir)):
+    check that finds something starts a child at most every :data:`SPAWN_GAP_SECS` (:func:`_spawn_throttled`), so a burst
+    of hooks does not spawn a burst of processes (``throttle=False``, for a word the operator just said, skips that gap:
+    one running flush still stands any second one down)."""
+    if queue_dir is None or not due(queue_dir, throttled=throttle):
         return False
     try:
-        from levain.launch import child_env
-
-        env = child_env()
-        root = str(Path(__file__).resolve().parents[2])   # a source checkout: -P leaves the child no other way to import levain
-        installed = [d for d in site.getsitepackages() + [site.getusersitepackages()] if isinstance(d, str)]
-        if not any(root == str(Path(d).resolve()) for d in installed):
-            env["PYTHONPATH"] = os.pathsep.join(p for p in (root, env.get("PYTHONPATH")) if p)
-        subprocess.Popen([sys.executable, "-P", "-m", "levain.webpush", "flush", "--queue-dir",
-                          str(Path(queue_dir).resolve())], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True, env=env, cwd=os.sep)
+        return _spawn_child(queue_dir) if not throttle else _spawn_throttled(queue_dir)
     except Exception:  # noqa: BLE001 - a failed flush never fails the gate
         return False
-    return True
 
 
 def tick(queue_dir: Path | str, stop, *, every: float = TICK_SECS) -> None:

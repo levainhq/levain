@@ -113,6 +113,12 @@ class _Dead(int):
     fault (VapidPkHashMismatch: the subscription was made under another Levain install's key), so no later ping fares better."""
 
 
+def retires(status: int) -> bool:
+    """True when the push service's answer retires the subscription: 404 or 410, or a refusal that names the key
+    (:class:`_Dead`). The one rule :func:`deliver` retires by and :mod:`levain.webpush.held` reads a retired device by."""
+    return status in (404, 410) or isinstance(status, _Dead)
+
+
 def _post(req: urllib.request.Request) -> int:
     try:
         with _OPENER.open(req, timeout=TIMEOUT) as resp:
@@ -169,12 +175,13 @@ def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str |
     results: list[tuple[int, int]] = []
     for sub, r in reqs:
         if r is None:   # bad stored keys or an endpoint off the allowlist: no later ping fares better
-            status, retire = 0, True
+            status = _Dead(0)
+            retire = True
         elif r is _TRANSIENT:
             status, retire = 0, False
         else:
             status = answered.get(sub["id"], UNKNOWN)
-            retire = status in (404, 410) or isinstance(status, _Dead)
+            retire = retires(status)
         store.add_delivery(ping_id, sub["id"], status, retire=retire)
         results.append((sub["id"], status))
     return results

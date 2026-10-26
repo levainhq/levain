@@ -397,3 +397,160 @@ def test_h6_sleep_without_an_idle_reading_ends_at_a_bound_and_status_says_so(tmp
     text = presence.describe(tmp_path, now=NOW + 60, idle=lambda: None)
     assert "idle source unavailable" in text
     assert "idle source unavailable" not in presence.describe(tmp_path, now=NOW + 60, idle=lambda: 5000.0)
+
+
+# --- fix round r2: E1/H1 (every device answered or was retired), H5 (one spawn under a burst) --------------------------
+
+def _deliver_returns(monkeypatch, results):
+    monkeypatch.setattr(sender, "deliver", lambda *a, **kw: list(results))
+
+
+def test_e1_a_ping_is_released_only_when_every_device_answered_or_was_retired(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    _hold(tmp_path, "active")
+    cases = [
+        ([(1, 201), (2, 500)], False),                        # one device failed: held for the retry
+        ([(1, 201), (2, sender.UNKNOWN)], False),
+        ([(1, 201), (2, 0)], False),
+        ([(1, 201), (2, 429)], False),                        # a 4xx that does not retire is a failure
+        ([(1, 500), (2, 410)], False),                        # no device got it
+        ([], False),
+        ([(1, 201), (2, 410)], True),                         # the other device is gone for good
+        ([(1, 201), (2, 404)], True),
+        ([(1, 201), (2, sender._Dead(400))], True),
+        ([(1, 201), (2, 202)], True),
+    ]
+    from levain.webpush.store import HELD_LEASE_SECS
+
+    at = NOW
+    for results, released in cases:
+        _deliver_returns(monkeypatch, results)
+        n = held.flush(tmp_path, now=at, idle=lambda: INACTIVE)
+        assert (n == 1 and held.count(tmp_path) == 0) == released, results
+        if released:
+            _hold(tmp_path, "active")
+        at += HELD_LEASE_SECS + 1
+
+
+def test_e1_a_device_with_unusable_keys_is_a_retirement_not_a_failure(tmp_path, monkeypatch):
+    import urllib.request
+
+    store = PushStore(tmp_path)
+    for n in (1, 2):
+        store.subscribe_unowned(f"https://fcm.googleapis.com/fcm/send/e1-{n}", "p", "a", f"phone{n}",
+                                datetime.now(timezone.utc))
+    _hold(tmp_path, "active")
+    monkeypatch.setattr(sender, "_prepare", lambda qdir, sub, data, topic:
+                        None if sub["endpoint"].endswith("e1-2") else urllib.request.Request("https://x/", data=b""))
+    monkeypatch.setattr(sender, "_post", lambda req: 201)
+    assert held.flush(tmp_path, now=NOW, idle=lambda: INACTIVE) == 1
+    assert held.count(tmp_path) == 0
+
+
+def test_h5_concurrent_due_checks_start_exactly_one_flush_child(tmp_path, monkeypatch):
+    import os
+    import threading
+    import time as _t
+
+    _phone(tmp_path)
+    _hold(tmp_path, "active")
+    stamp = tmp_path / "webpush" / held.STAMP_NAME
+    stamp.touch()
+    os.utime(stamp, (NOW, NOW))   # a stale stamp: every thread sees "long ago" until one of them re-stamps
+    started = []
+
+    def popen(argv, **kw):
+        _t.sleep(0.05)   # a slow spawn: every other thread arrives while this one is mid-spawn
+        started.append(argv)
+
+    real_utime = held.os.utime
+
+    def slow_utime(*a, **kw):
+        _t.sleep(0.05)   # widen the check-then-stamp window so an unguarded one is hit every run
+        return real_utime(*a, **kw)
+
+    monkeypatch.setattr(held.subprocess, "Popen", popen)
+    monkeypatch.setattr(held.os, "utime", slow_utime)
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: INACTIVE)
+    go = threading.Barrier(8)
+    out = []
+
+    def run():
+        go.wait()
+        out.append(held.flush_if_due(tmp_path))
+
+    threads = [threading.Thread(target=run) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(started) == 1 and out.count(True) == 1, (out, len(started))
+
+
+def test_h5_a_spawn_that_failed_leaves_no_stamp_so_the_next_call_retries(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    _hold(tmp_path, "active")
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: INACTIVE)
+
+    def boom(argv, **kw):
+        raise OSError("no fork")
+
+    monkeypatch.setattr(held.subprocess, "Popen", boom)
+    assert held.flush_if_due(tmp_path) is False
+    started = []
+    monkeypatch.setattr(held.subprocess, "Popen", lambda argv, **kw: started.append(argv))
+    assert held.flush_if_due(tmp_path) is True and len(started) == 1
+
+
+def test_d1_a_site_module_without_getsitepackages_still_spawns(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    _hold(tmp_path, "active")
+    started = []
+    monkeypatch.setattr(held.subprocess, "Popen", lambda argv, **kw: started.append(argv))
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: INACTIVE)
+    monkeypatch.delattr(held.site, "getsitepackages")
+    assert held.flush_if_due(tmp_path) is True and len(started) == 1
+
+
+def _idle_reads(monkeypatch, value):
+    reads = []
+
+    def idle():
+        reads.append(1)
+        return value
+
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", idle)
+    return reads
+
+
+def test_d2_a_throttled_gate_inside_the_spawn_gap_reads_no_idle(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    _hold(tmp_path, "active")
+    (tmp_path / "webpush" / held.STAMP_NAME).touch()   # a child started just now
+    reads = _idle_reads(monkeypatch, INACTIVE)
+    started = []
+    monkeypatch.setattr(held.subprocess, "Popen", lambda argv, **kw: started.append(argv))
+    assert held.flush_if_due(tmp_path) is False
+    assert reads == [] and started == []
+
+
+def test_d2_the_word_path_without_the_throttle_still_reads_idle(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    _hold(tmp_path, "active")
+    (tmp_path / "webpush" / held.STAMP_NAME).touch()
+    reads = _idle_reads(monkeypatch, INACTIVE)
+    started = []
+    monkeypatch.setattr(held.subprocess, "Popen", lambda argv, **kw: started.append(argv))
+    assert held.flush_if_due(tmp_path, throttle=False) is True
+    assert reads and len(started) == 1
+
+
+def test_d3_no_live_subscription_means_nothing_is_due_and_no_child(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    _hold(tmp_path, "active")
+    PushStore(tmp_path).retire_subscription("https://fcm.googleapis.com/fcm/send/held-test")
+    reads = _idle_reads(monkeypatch, INACTIVE)
+    started = []
+    monkeypatch.setattr(held.subprocess, "Popen", lambda argv, **kw: started.append(argv))
+    assert held.due(tmp_path) is False
+    assert held.flush_if_due(tmp_path) is False and started == [] and reads == []
