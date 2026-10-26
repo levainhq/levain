@@ -1353,6 +1353,12 @@ def _echo_or_outside(conn: sqlite3.Connection, now: str, item: ChatEvent, window
                            cause=f"a user item from outside Levain ({len(found)} candidate sends)")
 
 
+class _Handled(NamedTuple):
+    """One control event in the handled-control record: its state and whether it was interrupted."""
+    state: str
+    interrupted: bool = False
+
+
 class _Control(NamedTuple):
     """One control line of a batch: its identity (the event's position and vendor id), the trip that asks for the
     turn's interrupt, and the named reply."""
@@ -1511,12 +1517,13 @@ class ChatService:
         self._seat_item = seat_item
         self._filed: dict[str, set[str]] = {}            # launch -> the seat items' dedupe keys filed while attached
         # launch -> the control events this session was sent something for, by the event's identity (its stream
-        # position and vendor id, which carries the request id) -> "done" (its reply was confirmed, or its
-        # interrupt confirmed or answered no_such_request: nothing is sent for it again), "open" (tried, not done:
-        # tried again) or "stale" (open when the launch was activated or re-enabled: its reply is tried again, an
-        # interrupt naming no turn is not, since it would reach a turn started after that). A committed batch's
-        # events are dropped from it
-        self._handled: dict[str, dict[tuple[str, str], str]] = {}
+        # position and vendor id, which carries the request id) -> two facts. Its state: "done" (its reply was
+        # confirmed, or its interrupt confirmed or answered no_such_request: nothing is sent for it again), "open"
+        # (tried, not done: tried again) or "stale" (open when the launch was activated or re-enabled: its reply is
+        # tried again, an interrupt naming no turn is not, since it would reach a turn started after that). And
+        # whether it was interrupted (an interrupt sent for it was confirmed or answered no_such_request): that
+        # interrupt is never sent again, only its reply is retried. A committed batch's events are dropped from it
+        self._handled: dict[str, dict[tuple[str, str], _Handled]] = {}
 
     def _launch_lock(self, launch_id: str) -> threading.Lock:
         with self._guard:
@@ -2059,6 +2066,17 @@ class ChatService:
             if getattr(canary, "ok", None) is not True:
                 raise CoordError("an activation accepts only a canary verdict that passed")
             verdict_id = canary_verdict_id(canary)
+        # a launch that does not exist gets no lock: the registry holds attached and real launches only
+        self._chat._read(lambda conn: _worker_launch(conn, launch_id))
+        with self._launch_lock(launch_id):
+            seq = self._activation_row(launch_id, kind, detail, digest, spawn_nonce, verdict_id, containment_digest)
+            self._stale_handled(launch_id)
+        self._file_latches(launch_id)
+        return seq
+
+    def _activation_row(self, launch_id: str, kind: str, detail: str, digest: str | None, spawn_nonce: str | None,
+                        verdict_id: str | None, containment_digest: str | None) -> int:
+        """:meth:`activate`'s row, in its own transaction (the caller holds the launch's mutex). The seq."""
         with self._chat._write() as (conn, now):
             harness = _launch_state(conn, launch_id)[2]
             if harness == "claude" and (spawn_nonce is None or kind == "live" and (
@@ -2073,28 +2091,28 @@ class ChatService:
                     "= ? AND evidence_sha256 IS NOT NULL LIMIT 1", (launch_id, spawn_nonce)).fetchone() is not None:
                 raise CoordError("stage 1 of this child is recorded already; a replay opens no second first send; "
                                  "nothing was written")
-            seq = record_check(conn, now, launch_id, kind, "activation", detail, evidence_sha256=digest,
-                               spawn_nonce=spawn_nonce, canary_verdict_id=verdict_id,
-                               containment_digest=containment_digest)
-        self._stale_handled(launch_id)
-        self._file_latches(launch_id)
-        return seq
+            return record_check(conn, now, launch_id, kind, "activation", detail, evidence_sha256=digest,
+                                spawn_nonce=spawn_nonce, canary_verdict_id=verdict_id,
+                                containment_digest=containment_digest)
 
     def _stale_handled(self, launch_id: str) -> None:
-        """After an activation or a re-enable: every control event still open in the handled record turns stale, so
-        an interrupt it asked for and that names no turn never reaches a turn started after it."""
+        """After an activation or a re-enable, in the same hold of the launch's mutex as its commit (so no read
+        holds an entry across it): every control event still open in the handled record turns stale, so an
+        interrupt it asked for and that names no turn never reaches a turn started after it."""
         with self._guard:
             record = self._handled.get(launch_id, {})
-            record.update([(ident, "stale") for ident, state in record.items() if state == "open"])
+            record.update([(ident, h._replace(state="stale")) for ident, h in record.items() if h.state == "open"])
 
     def reenable(self, launch_id: str, owner: str) -> int:
         """Your re-enable (§4.2): clears a latch only while the latest check read live again. ``owner`` is the
         authenticated client. The service never writes this row itself."""
         owner = chat_lease.check_owner(owner)
-        with self._chat._write() as (conn, now):
-            seq = record_check(conn, now, launch_id, "reenabled", "operator", f"re-enabled by {owner}",
-                               by="operator")
-        self._stale_handled(launch_id)
+        self._chat._read(lambda conn: _worker_launch(conn, launch_id))
+        with self._launch_lock(launch_id):
+            with self._chat._write() as (conn, now):
+                seq = record_check(conn, now, launch_id, "reenabled", "operator", f"re-enabled by {owner}",
+                                   by="operator")
+            self._stale_handled(launch_id)
         return seq
 
     def composer(self, launch_id: str, owner: str) -> Composer:
@@ -2178,27 +2196,30 @@ class ChatService:
         non-approval control request gets its named error reply through ``reject_control`` (§8.1), bounded by
         :data:`READ_DEADLINE`. Then, when a trip asked for it or a reply failed, ONE interrupt of the turn (§8.1, O6:
         the CLI's pending requests abort); an interrupt that is refused or ambiguous leaves the latch as the record.
-        The handled-control record (``_handled``) decides what is sent: nothing for a control event already done, and
-        no interrupt naming no turn for one left over from before the launch's last activation. What failed, for the
+        The handled-control record (``_handled``) decides what is sent: nothing for a control event already done, no
+        second interrupt for one already interrupted, and no interrupt naming no turn for one left over from before the
+        launch's last activation or re-enable. What failed, for the
         caller to latch ``tripwire:unanswerable_control`` in the batch's transaction."""
         with self._guard:
             record = self._handled.setdefault(launch_id, {})
-            state = {c.ident: record.setdefault(c.ident, "open") for c in controls}
-        failed, stops, unanswered = [], [], False
+            held = {c.ident: record.setdefault(c.ident, _Handled("open")) for c in controls}
+        failed, stops, unanswered = [], [], []
         for c in controls:
-            if state[c.ident] == "done":
+            state, interrupted = held[c.ident]
+            if state == "done":
                 continue
-            if c.stop is not None and (c.stop.turn_id is not None or state[c.ident] == "open"):
+            if c.stop is not None and not interrupted and (c.stop.turn_id is not None or state == "open"):
                 stops.append(c)
             if c.reply is None:
                 continue
             why = self._reject(launch_id, session, c.reply)
             if why is None:
                 with self._guard:
-                    record[c.ident] = "done"
+                    record[c.ident] = _Handled("done", interrupted)
                 continue
             failed.append(f"{c.reply.request_id[:40]}: {why}")
-            unanswered = unanswered or state[c.ident] == "open"
+            if state == "open" and not interrupted:
+                unanswered.append(c)
         if stops or unanswered:
             turn = next((c.stop.turn_id for c in stops if c.stop.turn_id is not None), None)
             try:
@@ -2207,7 +2228,9 @@ class ChatService:
                 got = None                            # detached or wedged: the latch stands, and close is the stop
             if got is not None and got.outcome in ("confirmed", "no_such_request"):
                 with self._guard:
-                    record.update((c.ident, "done") for c in stops)
+                    # a stop carries no reply, so an interrupted stop is done; an unanswered reply is retried
+                    record.update((c.ident, _Handled("done", True)) for c in stops)
+                    record.update((c.ident, record[c.ident]._replace(interrupted=True)) for c in unanswered)
         return failed
 
     def _reject(self, launch_id: str, session: Any, reply: ControlReply) -> str | None:
