@@ -4,16 +4,10 @@ no "jsonrpc" field, ``initialize`` naming ``codexHome``, and ``-32600 "thread no
 daemon does not have. No test here reaches a real Codex."""
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import shutil
-import socket
 import sqlite3
-import struct
 import tempfile
-import threading
-import uuid
 from pathlib import Path
 
 import pytest
@@ -21,112 +15,7 @@ import pytest
 from levain.coordinator import codex_launch as cx
 from levain.coordinator import launch as cl
 from levain.coordinator.store import CoordStore
-
-_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-
-
-class FakeDaemon:
-    """A daemon on ``<home>/app-server-control/app-server-control.sock``: one thread per connection."""
-
-    def __init__(self, home: Path) -> None:
-        self.home = home
-        self.threads: dict[str, dict] = {}
-        self.calls: list[tuple[str, dict]] = []
-        path = cx.control_socket(home)
-        path.parent.mkdir(parents=True)
-        self.sock = socket.socket(socket.AF_UNIX)
-        self.sock.bind(str(path))
-        self.sock.listen(8)
-        threading.Thread(target=self._accept, daemon=True).start()
-
-    def close(self) -> None:
-        self.sock.close()
-
-    def _accept(self) -> None:
-        while True:
-            try:
-                conn, _ = self.sock.accept()
-            except OSError:
-                return
-            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
-
-    @staticmethod
-    def _recv(conn: socket.socket, n: int) -> bytes:
-        out = b""
-        while len(out) < n:
-            chunk = conn.recv(n - len(out))
-            if not chunk:
-                raise EOFError
-            out += chunk
-        return out
-
-    def _serve(self, conn: socket.socket) -> None:
-        try:
-            head = b""
-            while b"\r\n\r\n" not in head:
-                head += conn.recv(1)
-            key = next(ln.split(b":", 1)[1].strip() for ln in head.split(b"\r\n")
-                       if ln.lower().startswith(b"sec-websocket-key:"))
-            accept = base64.b64encode(hashlib.sha1(key + _GUID).digest())
-            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nconnection: Upgrade\r\nupgrade: websocket\r\n"
-                         b"sec-websocket-accept: " + accept + b"\r\n\r\n")
-            while True:
-                h = self._recv(conn, 2)
-                op, n = h[0] & 0x0F, h[1] & 0x7F
-                if n == 126:
-                    n = struct.unpack(">H", self._recv(conn, 2))[0]
-                elif n == 127:
-                    n = struct.unpack(">Q", self._recv(conn, 8))[0]
-                mask = self._recv(conn, 4)
-                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(self._recv(conn, n)))
-                if op == 8:
-                    return
-                msg = json.loads(payload)
-                assert "jsonrpc" not in msg
-                if "id" not in msg:
-                    continue
-                reply = self._answer(msg["method"], msg.get("params") or {})
-                body = json.dumps({"id": msg["id"], **reply}).encode()
-                ln = len(body)
-                frame = bytes([0x81]) + (bytes([ln]) if ln < 126 else bytes([126]) + struct.pack(">H", ln))
-                conn.sendall(frame + body)
-        except (EOFError, OSError):
-            return
-        finally:
-            conn.close()
-
-    def _answer(self, method: str, p: dict) -> dict:
-        self.calls.append((method, p))
-        tid = p.get("threadId")
-        if method == "initialize":
-            return {"result": {"codexHome": str(self.home)}}
-        if method == "thread/start":
-            tid = str(uuid.uuid4())
-            self.threads[tid] = {"id": tid, "sessionId": tid, "cwd": p["cwd"], "name": None,
-                                 "status": {"type": "idle"}, "turns": []}
-            return {"result": {"thread": self.threads[tid]}}
-        if tid not in self.threads:
-            return {"error": {"code": -32600, "message": f"thread not loaded: {tid}"}}
-        th = self.threads[tid]
-        if method == "thread/name/set":
-            th["name"] = p["name"]
-            return {"result": {}}
-        if method == "turn/start":
-            turn = {"id": str(uuid.uuid4()), "status": "inProgress"}
-            th["turns"].insert(0, turn)
-            th["status"] = {"type": "active", "activeFlags": []}
-            return {"result": {"turn": turn}}
-        if method == "thread/read":
-            return {"result": {"thread": {k: v for k, v in th.items() if k != "turns"}}}
-        if method == "thread/turns/list":
-            return {"result": {"data": th["turns"]}}
-        if method == "turn/interrupt":
-            for t in th["turns"]:
-                if t["id"] == p["turnId"]:
-                    t["status"] = "interrupted"
-            th["status"] = {"type": "idle"}
-            return {"result": {}}
-        return {"error": {"code": -32601, "message": f"unknown method {method}"}}
+from tests._codex_fake_daemon import FakeDaemon
 
 
 @pytest.fixture
