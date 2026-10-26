@@ -67,10 +67,11 @@
     const b = el("button", "dev-btn", "Close");
     b.type = "button";
     b.id = "sheet-close";
-    b.addEventListener("click", () => tell("close"));
+    b.addEventListener("click", () => askClose());
     p.replaceChildren(b);
-    // a key pressed in this frame is this document's event, never the cockpit's: Escape closes the overlay from here
-    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") tell("close"); });
+    // a key pressed in this frame is this document's event, never the cockpit's: Escape closes the overlay from here,
+    // except the Escape that ends an IME composition (keyCode 229 on browsers that report it only there)
+    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !ev.isComposing && ev.keyCode !== 229) askClose(); });
   })();
 
   function storedToken() {
@@ -94,7 +95,8 @@
   const decodable = (t) => typeof t === "string" && /^[A-Za-z0-9_-]+$/.test(t) && t.length % 4 !== 1;
   const unb64u = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
                                         (c) => c.charCodeAt(0));
-  const why = (r) => (r.body && typeof r.body.message === "string" && r.body.message) || ("refused (HTTP " + r.status + ")");
+  // the server's words without their closing stop: the caller's sentence supplies its own punctuation
+  const why = (r) => ((r.body && typeof r.body.message === "string" && r.body.message.replace(/[.\s]+$/, "")) || ("refused (HTTP " + r.status + ")"));
   const usable = window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
     && !!(navigator.credentials && navigator.credentials.get);
 
@@ -116,8 +118,9 @@
       .then((res) => res.json().then((j) => ({ ok: res.ok, status: res.status, body: j && typeof j === "object" ? j : {} }),
                                      () => (late ? none() : { ok: false, status: res.status, body: {} })),
             none);
-    const deadline = new Promise((r) => setTimeout(() => { late = true; r(none()); }, FETCH_TIMEOUT_MS + 1000));
-    return Promise.race([got, deadline]).finally(() => clearTimeout(timer));
+    let stop;
+    const deadline = new Promise((r) => { stop = setTimeout(() => { late = true; r(none()); }, FETCH_TIMEOUT_MS + 1000); });
+    return Promise.race([got, deadline]).finally(() => { clearTimeout(timer); clearTimeout(stop); });
   }
   const call = (route, body) => within(route, { method: "POST", headers: headers(true), body: JSON.stringify(body) });
   // the request as the cockpit holds it now: {request, rp_id, ...}, {closed}, {unpaired} or {error}
@@ -201,15 +204,22 @@
 
   // what is being signed, beside the controls: the page's expectation at the tap ("page"), then the line the challenge
   // carries ("server"), which after a signature is the line signed
-  function signing(text, source, done) {
+  // `label`: "Signing" while the ceremony runs; "Signed", "Not signed" or "Not confirmed" once it has ended
+  function signing(text, source, label) {
     let n = $("sheet-signing");
     if (!n) {
       n = el("p", "sheet-signing");
       n.id = "sheet-signing";
       $("sheet-actions").before(n);
     }
-    n.textContent = (done ? "Signed: " : "Signing: ") + text;
+    n.dataset.text = text;
+    n.textContent = label + ": " + text;
     n.dataset.source = source;
+  }
+  // the line already shown keeps its text and takes the ending's label, so it never reads as in progress afterwards
+  function relabel(label) {
+    const n = $("sheet-signing");
+    if (n && typeof n.dataset.text === "string") n.textContent = label + ": " + n.dataset.text;
   }
 
   let busy = false;
@@ -222,12 +232,13 @@
       if (busy) return;
       busy = true;
       lock(true);
-      if (expect) signing(expect, "page", false);
+      if (expect) signing(expect, "page", "Signing");
       whom(rp, signers, held, acts).then((k) => (k ? ceremony(r, rp, k, choice, words) : "unsigned"))
         .catch(() => "unsigned")
         .then((done) => {
           if (done === "signed") { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
-          if (done === "unsure") return settle(r, () => { busy = false; lock(false); });
+          if (done === "unsure") { relabel("Not confirmed"); return settle(r, () => { relabel("Not signed"); busy = false; lock(false); }); }
+          relabel("Not signed");
           busy = false;
           lock(false);
         });
@@ -295,15 +306,36 @@
   function settle(r, release) {
     say($("sheet-note").textContent + " Checking where it stands…", "bad");
     return readRequest().then((got) => {
-      if (got.request && got.request.sha256 === r.sha256 && !got.request.refused) {
+      if (stillOpen(r, got)) {
         say("Not signed: the cockpit says this request is still open, unsigned, on the version shown; you can sign it again.", "bad");
         return release();
       }
       $("sheet").dataset.state = "closed";
-      say(got.closed ? "This request is no longer open (it may have been signed from here): the cockpit shows what landed."
-          : got.request ? "This request changed while it was being signed: reload it and read it again."
-          : "Where this request stands could not be read (" + String(got.error || "no reply") + "): reload before signing again.",
-          "bad");
+      say(standing(got), "bad");
+      tell("reload");
+    });
+  }
+  const stillOpen = (r, got) => !!(got.request && got.request.sha256 === r.sha256 && !got.request.refused);
+  // what a read that did not find the request open and unchanged says
+  function standing(got) {
+    return got.unpaired ? "This device's key was not accepted when the request was read again: pair it again, then reload before signing."
+      : got.closed ? "This request is no longer open (it may have been signed from here): the cockpit shows what landed."
+      : got.request ? "This request changed while it was being signed: reload it and read it again."
+      : "Where this request stands could not be read (" + String(got.error || "no reply") + "): reload before signing again.";
+  }
+  // Close / Escape. Idle: the cockpit closes the overlay and reads its board again. While a ceremony is in flight the
+  // outcome is not known, so the line reads "Not confirmed", the request is read again and the sheet stays; a second
+  // close leaves
+  let closeAsked = false;
+  function askClose() {
+    if (!busy || closeAsked) return tell("close");
+    closeAsked = true;
+    relabel("Not confirmed");
+    say("Signing is still in progress, so it is not confirmed. Checking where the request stands… (close again to leave).", "bad");
+    return readRequest().then((got) => {
+      say(got.request && got.request.sha256 && !got.request.refused
+          ? "The request is still open and unsigned as of this check; the signature in progress may yet land (close again to leave)."
+          : standing(got), "bad");
       tell("reload");
     });
   }
@@ -352,7 +384,7 @@
     return call(base + "challenge", body).then((c) => {
       if (!c.ok) return unsigned("Not signed: " + why(c));
       if (!decodable(c.body.challenge)) return unsigned("The cockpit sent a malformed challenge");
-      if (typeof c.body.line === "string") { line = c.body.line; signing(line, "server", false); }
+      if (typeof c.body.line === "string") { line = c.body.line; signing(line, "server", "Signing"); }
       say("Confirm with your passkey to sign…" + (line ? " " + line : ""));
       // the passkey asked for by its id when one decodes; an id that does not is dropped (the OS's own list), never a throw
       const allow = k.rawId && decodable(k.rawId) ? unb64u(k.rawId) : null;
@@ -382,7 +414,7 @@
           const by = typeof a.body.signer_fp === "string" && a.body.signer_fp ? a.body.signer_fp : fp;
           const ns = typeof a.body.namespace === "string" && a.body.namespace ? " in " + a.body.namespace : "";
           say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + by + ns + (line ? ": " + line : ""), "ok");
-          if (line) signing(line, "server", true);
+          if (line) signing(line, "server", "Signed");
           $("sheet").dataset.state = "signed";
           return "signed";
         });

@@ -487,3 +487,151 @@ def test_h8_the_signed_line_never_prints_undefined(tmp_path: Path, monkeypatch) 
         ])
     said = out["values"][-1]
     assert "undefined" not in said and rig.pk.key.fingerprint in said, said
+
+
+# --- L3 verify r2 (H9-H14) ---------------------------------------------------------------------------------------------
+
+COUNT_RELOADS = ("(() => { window.__reloads = 0; const t = window.LevainCockpitTransport; const r = t.reload.bind(t); "
+                 "t.reload = () => { window.__reloads++; return r(); }; return 1; })()")
+OPEN_FRAMED = [{"until": STRIP_FACET + " && 1", "ms": 30000},
+               {"eval": COUNT_RELOADS},
+               {"eval": f"{OPEN_SHEET}.click() || 1"},
+               {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state === 'open'", "ms": 30000}]
+CLOSE_IN_FRAME = f"{IN}.getElementById('sheet-close').click() || 1"
+WAIT_RELOAD = {"eval": "new Promise((r) => setTimeout(() => r(window.__reloads), 2500))"}
+# a reply the cockpit refuses the device for
+UNPAIRED_READ = "(real, u, o) => Promise.resolve({ ok: false, status: 403, json: () => Promise.resolve({}) })"
+
+
+@needs_browser
+def test_h9_a_close_from_the_sheet_re_reads_the_board(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, *OPEN_FRAMED,
+            {"eval": CLOSE_IN_FRAME},
+            {"until": f"!{FRAME} && 1", "ms": 5000},
+            WAIT_RELOAD,
+        ])
+    assert out["values"][-1] >= 1, out["values"]                     # the cockpit under it read again
+
+
+@needs_browser
+def test_h9_a_close_while_a_ceremony_is_in_flight_shows_it_unsure_until_the_re_read_settles_it(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), *OPEN_FRAMED,
+            _stub(f"{FRAME}.contentWindow"),
+            {"eval": f"{FRAME}.contentWindow.__stub['/challenge'] = {HANG}; "
+                     f"{IN}.querySelector('#sheet-actions [data-choice=\"b\"]').click() || 1"},
+            {"eval": CLOSE_IN_FRAME},
+            {"until": f"{FRAME}.contentWindow.__reads >= 1 && /still open/.test({IN}.getElementById('sheet-note').textContent) && 1",
+             "ms": 30000, "may_timeout": True},
+            {"eval": f"!!{FRAME}"},                                   # the overlay stayed: a ceremony was in flight
+            {"eval": f"{IN}.getElementById('sheet-note').textContent"},
+            {"eval": f"{IN}.getElementById('sheet-signing').textContent"},
+            WAIT_RELOAD,
+            {"eval": CLOSE_IN_FRAME},                                  # a second close leaves
+            {"until": f"!{FRAME} && 1", "ms": 5000},
+        ])
+    v = out["values"]
+    assert not isinstance(v[7], dict), v                               # the re-read ran
+    assert v[8] is True, v
+    assert "still open" in v[9], v                                     # what the re-read found, the ceremony still pending
+    assert v[10].startswith("Not confirmed:"), v
+    assert v[11] >= 1, v
+
+
+@needs_browser
+def test_h10_and_h13_an_unsigned_line_is_relabelled_and_the_notice_has_no_double_stop(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    refused = ("(real, u, o) => Promise.resolve(new Response(JSON.stringify({message: 'The request expired.'}), "
+               "{status: 403, headers: {'Content-Type': 'application/json'}}))")
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig), _stub(),
+            {"eval": f"window.__stub['/challenge'] = {refused}; {_button('b')}.click() || 1"},
+            {"until": f"/nothing was signed/.test({NOTE}) && {NOTE}", "ms": 30000},
+            {"eval": SIGNING},
+        ])
+    note, shown = out["values"][-2:]
+    assert ".;" not in note and ".." not in note, note               # H13
+    assert note == "Not signed: The request expired; nothing was signed.", note
+    assert shown.startswith("Not signed:"), shown                    # H10: never "Signing:" after the end
+
+
+@needs_browser
+def test_h10_after_unsure_the_signing_line_reads_not_confirmed(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig), _stub(),
+            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; {_button('b')}.click() || 1"},
+            {"until": f"window.__reads >= 1 && {ENABLED} && 1", "ms": 30000},
+            {"eval": SIGNING},
+        ])
+    # the read finds the same version open: "Not signed:" now, since that read settled it
+    assert out["values"][-1].startswith("Not signed:"), out["values"]
+
+
+@needs_browser
+def test_h10_while_the_re_read_is_pending_the_line_is_not_confirmed(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig), _stub(),
+            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; window.__stub['.json'] = {HANG}; "
+                     f"{_button('b')}.click() || 1"},
+            {"until": f"window.__reads >= 1 && 1", "ms": 30000},
+            {"eval": SIGNING},
+            {"eval": NOTE},
+        ])
+    shown = out["values"][-2]
+    assert shown.startswith("Not confirmed:"), out["values"]
+
+
+@needs_browser
+def test_h11_a_refused_re_read_names_the_unpaired_device_not_no_reply(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig), _stub(),
+            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; window.__stub['.json'] = {UNPAIRED_READ}; "
+                     f"{_button('b')}.click() || 1"},
+            {"until": f"{STATE} === 'closed' && {NOTE}", "ms": 30000},
+        ])
+    note = out["values"][-1]
+    assert "no reply" not in note and "not accepted" in note, note
+
+
+@needs_browser
+def test_h12_an_escape_during_composition_does_not_close_the_overlay(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, *OPEN_FRAMED,
+            {"eval": f"(() => {{ const b = {IN}.querySelector('#sheet-actions button'); "
+                     f"b.dispatchEvent(new ({FRAME}.contentWindow.KeyboardEvent)('keydown', {{key: 'Escape', isComposing: true, bubbles: true}})); "
+                     "return 1; })()"},
+            {"eval": "new Promise((r) => setTimeout(() => r(!!document.getElementById('levain-sign-sheet-frame')), 600))"},
+        ])
+    assert out["values"][-1] is True, out["values"]
+
+
+@needs_browser
+def test_h14_no_deadline_timer_is_left_pending_after_a_fetch_settles(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    track = ("(() => { const w = window; w.__live = new Map(); const st = w.setTimeout.bind(w), ct = w.clearTimeout.bind(w); "
+             "w.setTimeout = (f, ms, ...a) => { const id = st(() => { w.__live.delete(id); f(...a); }, ms); w.__live.set(id, ms); return id; }; "
+             "w.clearTimeout = (id) => { w.__live.delete(id); return ct(id); }; return 1; })()")
+    refused = ("(real, u, o) => Promise.resolve(new Response('{}', {status: 403, headers: {'Content-Type': 'application/json'}}))")
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(rig), _stub(), {"eval": track},
+            # a real challenge post, answered by the real server's refusal path is not needed: a stubbed refusal is a whole fetch
+            {"eval": f"window.__stub['/challenge'] = {refused}; {_button('b')}.click() || 1"},
+            {"until": f"/nothing was signed/.test({NOTE}) && 1", "ms": 30000},
+            {"eval": "[...window.__live.values()].filter((ms) => ms >= 15000).length"},
+        ])
+    assert out["values"][-1] == 0, out["values"]

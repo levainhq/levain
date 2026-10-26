@@ -4937,7 +4937,7 @@
   // The sheet /sign/<id> shown as a same-origin iframe over this page: the sheet runs its own ceremony and tells this page
   // "signed", "reload" or "close" by postMessage, read only from this origin and from that frame. Its headers let only this
   // origin frame it. Signing there changes the board, so the board reads again after a signature, and after a sign whose
-  // outcome the sheet could not learn ("reload"). While it is open everything behind it is inert.
+  // outcome the sheet could not learn ("reload"), and after any close. While it is open everything behind it is inert.
   const SIGN_SHEET_ID = "levain-sign-sheet";
   let signSheetInerted = [];      // what openSignSheet made inert (and closeSignSheet gives back): never what was already
   function signSheetButton(r) {
@@ -4989,6 +4989,12 @@
     signSheetInerted = [];
     veil.remove();
     if (!document.getElementById("levain-modal")) document.body.classList.remove("modal-open");
+    rereadBoard();      // a sheet closed over a ceremony in flight leaves its outcome to the board
+  }
+  function rereadBoard() {
+    signListed = null;
+    const t = window.LevainCockpitTransport;
+    if (t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
   }
   window.addEventListener("message", (ev) => {
     const frame = document.getElementById(SIGN_SHEET_ID + "-frame");
@@ -4997,9 +5003,7 @@
     if (what === "close") closeSignSheet();
     else if (what === "signed" || what === "reload") {
       // the sheet's line stays on it until it is closed; the board under it reads again
-      signListed = null;
-      const t = window.LevainCockpitTransport;
-      if (t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
+      rereadBoard();
     }
   });
   window.LevainSignSheet = { open: openSignSheet, close: closeSignSheet };
