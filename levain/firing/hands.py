@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
 
+from levain.hands_live import SECURE_PATH, _secure
 from levain.launch import child_env
 from levain.slot import SUDO
 
@@ -85,9 +86,6 @@ HANDS_MARKER = "Levain hands user"
 #: service the OS allocates from (2026-10-07, ruling (a): a tombstone, never a
 #: deletion). Starts with :data:`HANDS_MARKER`, so it is still recognisably Levain's.
 RETIRED_MARKER = {"darwin": "Levain hands user (retired)", "linux": "Levain hands user,retired"}
-
-#: Where root resolves a bare program name: root-owned directories only.
-SECURE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
 #: Ids are taken from the top of these ranges downward, skipping any id in use or retired.
 #: macOS: below 500 sorts with the system accounts; macOS 15 claimed 301-304 for new daemons and its
@@ -628,7 +626,7 @@ def sudoers_text(operator: str, hands_user: str, net_group: str | None = None) -
 def _abs(name: str) -> str:
     """A program for root to run, resolved on :data:`SECURE_PATH` (the bare name if not found, so a
     plan built on a host without the tool still renders; running it then fails)."""
-    return shutil.which(name, path=SECURE_PATH) or name
+    return _secure(name)
 
 
 @dataclass(frozen=True)

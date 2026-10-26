@@ -10,9 +10,10 @@ modules and calls, and review beat each a new way (a parent-relative import, an 
 ``import_module``, ``pydoc.locate``), so the list now names what is allowed instead of what is not.
 Adding a stdlib module to the package means adding it here, on purpose, in review.
 
-One module outside the package is allowed, by name (``ALLOWED_OUTSIDE``): ``levain.trust_anchor``, the
-trust-anchor rule ``confirm`` uses, which root's route-map check runs without importing this package.
-It is held to more than the package is: it may import ``ALLOWED_STDLIB`` roots and nothing of ``levain``.
+Two modules outside the package are allowed, by name (``ALLOWED_OUTSIDE``): ``levain.trust_anchor``, the
+trust-anchor rule ``confirm`` uses, which root's route-map check runs without importing this package, and
+``levain.hands_live``, the hands user's liveness check and lock the automation executor shares with ws-git.
+Each is held to more than the package is: it may import ``ALLOWED_STDLIB`` roots and nothing of ``levain``.
 
 Also flagged: the builtin loader names (``__import__``, ``__builtins__``, ``exec``, ``eval``, a bare
 ``compile``) and any attribute chain off the name ``levain`` other than ``levain.autonomic`` (an
@@ -40,11 +41,11 @@ PKG = ROOT / "levain" / "autonomic"
 
 ALLOWED_STDLIB = frozenset({
     "__future__", "collections", "contextlib", "copy", "dataclasses", "datetime", "enum", "fcntl",
-    "hashlib", "json", "logging", "math", "os", "pathlib", "re", "sqlite3", "subprocess", "tempfile",
-    "threading", "types",
+    "hashlib", "json", "logging", "math", "os", "pathlib", "platform", "re", "shutil", "sqlite3", "subprocess",
+    "tempfile", "threading", "time", "types",
     "typing", "unicodedata",
 })
-ALLOWED_OUTSIDE = frozenset({"levain.trust_anchor"})
+ALLOWED_OUTSIDE = frozenset({"levain.trust_anchor", "levain.hands_live"})
 _LOADER_NAMES = frozenset({"__import__", "__builtins__", "exec", "eval", "compile"})
 
 

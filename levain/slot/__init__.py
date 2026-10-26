@@ -8,10 +8,9 @@ with no root, and a refusal is raised while planning, before the first step. The
 from __future__ import annotations
 
 
-#: The elevator by absolute path, the ONE home: a bare ``sudo`` would run whatever the operator's PATH finds first. This
-#: package ``__init__`` imports nothing, so root's ``/usr/bin/python3`` (3.9) and every importer can reach it. A host
-#: whose sudo is elsewhere fails closed.
-SUDO = "/usr/bin/sudo"
+#: The elevator by absolute path, from its one home (:data:`levain.hands_live.SUDO`, stdlib only and 3.9-valid, so
+#: root's ``/usr/bin/python3`` and every importer reach it through this package).
+from levain.hands_live import SUDO  # noqa: E402,F401
 
 #: CONTRACT §3.3: a ``levain-control/1`` frame's cap, the canonical JSON bytes after the 4-byte length
 FRAME_MAX = 64 * 1024

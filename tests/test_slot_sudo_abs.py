@@ -56,7 +56,7 @@ def test_one_home_for_the_sudo_path() -> None:
 def test_no_file_in_levain_spells_sudo_itself_outside_the_home() -> None:
     from pathlib import Path
     root = Path(adopt_view.__file__).resolve().parents[1]
-    home = root / "slot" / "__init__.py"
+    home = root / "hands_live.py"
     hits = [f"{p.relative_to(root)}:{n}" for p in sorted(root.rglob("*.py")) if p != home
             for n in sudo_spellings(p.read_text(encoding="utf-8"))]
     assert not hits, hits

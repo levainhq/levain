@@ -33,12 +33,15 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from levain import hands_live
 from levain.firing.hands import SECURE_PATH, WORKSPACE_ROOT, _abs
+from levain.hands_live import (  # noqa: F401 - HANDS_LOCK and proc_hides_processes are imported from here
+    HANDS_LOCK, LIVENESS_TIMEOUT, HandsLiveError, _open_lock, proc_hides_processes, take_exclusive,
+)
 from levain.launch import child_env
 from levain.slot import SUDO
 
@@ -82,7 +85,7 @@ def _real_git() -> str:
     return _abs("git")
 
 
-class WsGitError(RuntimeError):
+class WsGitError(HandsLiveError):
     """ws-git / ws-adopt refused."""
 
 
@@ -212,109 +215,20 @@ def _run_relayed(argv: list[str]) -> int:
     return proc.wait()
 
 
-#: The per-user agents launchd starts for a uid on its own once it has run Apple code, measured on a
-#: CI runner 2026-10-07 (exact paths), plus XPC services, which launchd alone starts. They live on
-#: the sealed system volume, which no user can write.
-_DARWIN_USER_AGENTS = frozenset({
-    "/usr/sbin/cfprefsd", "/usr/sbin/distnoted", "/usr/libexec/lsd", "/usr/libexec/trustd",
-    "/usr/libexec/secd", "/usr/libexec/containermanagerd", "/usr/libexec/secinitd",
-    "/usr/libexec/UserEventAgent",
-})
-_DARWIN_XPC_SERVICE = re.compile(r"^/System/Library/[^\0]+\.xpc/Contents/MacOS/[^/]+$")
-
-
-def _darwin_agent(ppid: str, path: str) -> bool:
-    return ppid == "1" and (path in _DARWIN_USER_AGENTS or bool(_DARWIN_XPC_SERVICE.match(path)))
-
-
-def proc_hides_processes(mountinfo: str) -> bool:
-    """Whether ``/proc`` is mounted with ``hidepid`` (other users' processes invisible), from
-    ``/proc/self/mountinfo`` text."""
-    for line in mountinfo.splitlines():
-        fields = line.split()
-        if len(fields) > 4 and fields[4] == "/proc" and re.search(r"hidepid=(?!0\b|off\b)", line):
-            return True
-    return False
-
-
-#: How long a caller outside the session-end sweep gives :func:`entity_session_live` before it
-#: cannot tell (a refusal).
-LIVENESS_TIMEOUT = 10.0
-
-
 def entity_session_live(hands_uid: int, *, timeout: float | None = None) -> bool:
-    """Whether anything runs as the hands user right now. The workspace is the hands user's and the
-    operator can only read it, so whatever can change it while ws-git works (an entity session's
-    bash, anything it left running) runs as that user: this is the session's liveness measured where
-    it cannot be missed, an orphaned background job included. Raises when it cannot tell (a process
-    table the operator cannot see all of), so callers fail closed. It is checked once, when a command
-    starts; a session started while the command runs is not seen. With ``timeout``, the whole check
-    takes at most that long, and one that runs out cannot tell (raises)."""
-    deadline = None if timeout is None else time.monotonic() + timeout
-
-    def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        left = None if deadline is None else deadline - time.monotonic()
-        try:
-            if left is not None and left <= 0:
-                raise subprocess.TimeoutExpired(argv, 0)
-            return subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                                  cwd="/", env=child_env(), timeout=left)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise WsGitError(f"cannot tell whether the entity is running ({argv[0]}: {exc}); refusing") from None
-
-    if platform.system() == "Linux":
-        try:
-            mounts = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
-        except OSError as exc:
-            raise WsGitError(f"cannot tell whether the entity is running ({exc}); refusing") from None
-        if proc_hides_processes(mounts):
-            raise WsGitError("cannot tell whether the entity is running (/proc hides other users' "
-                             "processes); refusing")
-    def pids() -> set[str]:
-        r = run([_abs("pgrep"), "-U", str(hands_uid)])
-        if r.returncode not in (0, 1):
-            raise WsGitError(f"cannot tell whether the entity is running (pgrep: {r.stderr.strip() or r.returncode}); "
-                             "refusing")
-        return set(r.stdout.split())
-
-    found = pids()
-    if not found:
-        return False
-    if platform.system() != "Darwin":
-        return True
-    # macOS starts per-user system agents for any uid that has run Apple code (git and python3 in
-    # /usr/bin are xcrun shims). Those, and only those, are not a session; an orphan of the
-    # entity's is. The pid set is read again after ps: a process that exited and forked in between
-    # would otherwise leave only agents in view.
-    ps = run(["/bin/ps", "-o", "pid=,ppid=,comm=", "-p", ",".join(sorted(found))])
-    rows = {}
-    for ln in ps.stdout.splitlines():
-        parts = ln.split(None, 2)
-        if len(parts) == 3:
-            rows[parts[0]] = (parts[1], parts[2].strip())
-    if not all(_darwin_agent(ppid, path) for ppid, path in rows.values()):
-        return True
-    if set(rows) != found or pids() != found:
-        raise WsGitError("cannot tell whether the entity is running (its processes changed while being read); "
-                         "refusing")
-    return False
-
-
-#: Per entity, in the operator's tree (out of the hands user's reach). A session of a hands entity
-#: holds it SHARED for its whole life (several chat sessions may run at once); ws-git and ws-adopt
-#: hold it EXCLUSIVE for their whole run. So no session starts while they work, and they never start
-#: while a session is open. Busy is a refusal on both sides, never a wait without end.
-HANDS_LOCK = "hands.lock"
-
-
-def _open_lock(entity_dir: Path | str) -> int:
-    return os.open(Path(entity_dir) / ".levain" / HANDS_LOCK,
-                   os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
+    """:func:`levain.hands_live.entity_session_live`, its :class:`~levain.hands_live.HandsLiveError` raised as
+    :class:`WsGitError` with the same text, so every caller here and every ``except WsGitError`` is unchanged."""
+    try:
+        return hands_live.entity_session_live(hands_uid, timeout=timeout)
+    except WsGitError:
+        raise
+    except HandsLiveError as exc:
+        raise WsGitError(str(exc)) from None
 
 
 def hold_session_lock(entity_dir: Path | str, *, wait: float = 10.0) -> int:
     """Take the shared hands lock for a session; returns the fd, which the session closes when it
-    ends. Waits up to ``wait`` seconds for a running ws-git or ws-adopt, then refuses."""
+    ends. Waits up to ``wait`` seconds for a running ws-git, ws-adopt or automation fire, then refuses."""
     import fcntl
     import time
 
@@ -327,7 +241,7 @@ def hold_session_lock(entity_dir: Path | str, *, wait: float = 10.0) -> int:
         except BlockingIOError:
             if time.monotonic() >= deadline:
                 os.close(fd)
-                raise WsGitError("levain ws-git or ws-adopt is working in this entity's workspace; "
+                raise WsGitError("levain ws-git, ws-adopt or an automation is working in this entity's workspace; "
                                  "start the session when it finishes") from None
             time.sleep(0.2)
         except BaseException:
@@ -367,17 +281,9 @@ class _exclusive:
         self.fd: int | None = None
 
     def __enter__(self) -> "_exclusive":
-        import fcntl
-
-        self.fd = _open_lock(self.entity_dir)
-        try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(self.fd)
-            raise WsGitError("a session of this entity is open; this waits until it ends") from None
-        except BaseException:
-            os.close(self.fd)
-            raise
+        self.fd = take_exclusive(self.entity_dir)
+        if self.fd is None:
+            raise WsGitError("a session of this entity is open; this waits until it ends")
         return self
 
     def __exit__(self, *exc: object) -> None:
