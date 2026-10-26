@@ -28,8 +28,8 @@ from typing import Any, NamedTuple
 
 __all__ = [
     "CONTROL_REPLIES", "MODE", "MODE_ALLOWED_SHAPE", "TRIPWIRES", "UNPARSEABLE", "ControlReply", "Trip",
-    "TripwireContext", "TripwireWindow", "launch_roots", "mode_trip", "read_exempt", "read_target_within",
-    "reported_mode_trip",
+    "TripwireContext", "TripwireWindow", "control_line", "launch_roots", "mode_trip", "read_exempt",
+    "read_target_within", "reported_mode_trip",
 ]
 
 TRIPWIRES = ("deficit", "unexpected_rule", "unexpected_hook", "mode_changed", "accepted_without_host",
@@ -122,6 +122,37 @@ def reported_mode_trip(e: Any) -> Trip | None:
     return mode_trip(e.body)
 
 
+def control_line(e: Any) -> tuple[Trip | None, ControlReply | None] | None:
+    """The trip and the reply an inbound control line (or a line the session could not parse) gives; None for any
+    other event. It reads no window state: the CLI waits on the request whether or not the batch that carries it is
+    recorded, so a batch that crosses a boundary is answered by it too."""
+    if e.hook is not None or e.cancel_of is not None or e.kind != "error":
+        return None
+    vid = e.vendor_id
+    if vid.startswith(UNPARSEABLE):
+        return Trip("unanswerable_control", "the session read a line it could not parse", True, e.turn_id), None
+    if vid.startswith(CONTROL):
+        return _control(vid[len(CONTROL):], e.control_subtype, e.turn_id)
+    return None
+
+
+def _control(request_id: str, subtype: Any, turn_id: str | None) -> tuple[Trip | None, ControlReply | None]:
+    if not request_id:
+        return Trip("unanswerable_control", "a control_request with no usable request_id", True, turn_id), None
+    if subtype == _APPROVAL:
+        # never answered outside the one door (reject_control refuses it), so the CLI would wait on it: latch, and
+        # the turn's interrupt aborts its pending requests (§8.1, O6)
+        return Trip("unexpected_control", "a can_use_tool request arrived as a non-approval control request", True,
+                    turn_id), None
+    if isinstance(subtype, str) and subtype in CONTROL_REPLIES:
+        text, latches = CONTROL_REPLIES[subtype]
+    else:
+        named = subtype if isinstance(subtype, str) and subtype else "this request"
+        text, latches = f"levain does not answer {named[:80]}", True
+    trip = Trip("unexpected_control", f"inbound control_request {str(subtype)[:60]!r}: {text}") if latches else None
+    return trip, ControlReply(request_id, text)
+
+
 class _Call(NamedTuple):
     tool_name: str | None
     tool_input: Any
@@ -197,10 +228,9 @@ class TripwireWindow:
         mode = reported_mode_trip(e)
         if mode is not None or e.kind == "error" and vid.startswith(MODE):
             return mode, None
-        if e.kind == "error" and vid.startswith(UNPARSEABLE):
-            return Trip("unanswerable_control", "the session read a line it could not parse", True, e.turn_id), None
-        if e.kind == "error" and vid.startswith(CONTROL):
-            return self._control(vid[len(CONTROL):], e.control_subtype, e.turn_id)
+        control = control_line(e)
+        if control is not None:
+            return control
         if e.kind == "tool_call":
             if isinstance(e.call_id, str) and e.call_id:
                 self.calls[e.call_id] = _Call(e.tool_name, e.tool_input)
@@ -214,22 +244,6 @@ class TripwireWindow:
         if e.kind == "tool_result":
             return self._result(e), None
         return None, None
-
-    def _control(self, request_id: str, subtype: Any, turn_id: str | None) -> tuple[Trip | None, ControlReply | None]:
-        if not request_id:
-            return Trip("unanswerable_control", "a control_request with no usable request_id", True, turn_id), None
-        if subtype == _APPROVAL:
-            # never answered outside the one door (reject_control refuses it), so the CLI would wait on it: latch, and
-            # the turn's interrupt aborts its pending requests (§8.1, O6)
-            return Trip("unexpected_control", "a can_use_tool request arrived as a non-approval control request", True,
-                        turn_id), None
-        if isinstance(subtype, str) and subtype in CONTROL_REPLIES:
-            text, latches = CONTROL_REPLIES[subtype]
-        else:
-            named = subtype if isinstance(subtype, str) and subtype else "this request"
-            text, latches = f"levain does not answer {named[:80]}", True
-        trip = Trip("unexpected_control", f"inbound control_request {str(subtype)[:60]!r}: {text}") if latches else None
-        return trip, ControlReply(request_id, text)
 
     def _result(self, e: Any) -> Trip | None:
         call_id = e.call_id if isinstance(e.call_id, str) and e.call_id else None

@@ -65,7 +65,8 @@ from levain.cockpit.consent import parse_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import chat_lease
 from levain.coordinator.chat_lease import TURN_LEASE_SCHEMA, TurnLease, TurnRefused, TurnView
-from levain.coordinator.chat_tripwires import Trip, TripwireContext, TripwireWindow, mode_trip, reported_mode_trip
+from levain.coordinator.chat_tripwires import (Trip, TripwireContext, TripwireWindow, control_line, mode_trip,
+                                               reported_mode_trip)
 from levain.coordinator.driver import (CommandResult, InterruptCommand, LivenessEvidence, NotSent, SendCommand,
                                        SendResult, SessionMeta)
 from levain.coordinator.store import WORDS_MAX, CoordError, _append_only, _in, next_gseq, schema_present
@@ -1884,7 +1885,8 @@ class ChatService:
         with self._guard:
             if window is not None and crossed is None and self._sessions.get(launch_id) is session:
                 self._windows[launch_id] = window
-            self._replied.get(launch_id, set()).difference_update(r.request_id for r in replies)
+            if crossed is None:                       # a crossing batch stays unrecorded: its re-read is no new reply
+                self._replied.get(launch_id, set()).difference_update(r.request_id for r in replies)
         self._file_latches(launch_id)
         if crossed is not None:
             raise CoordError(f"launch {launch_id}'s vendor read crossed a boundary (a boundary event that is not its "
@@ -2084,8 +2086,8 @@ class ChatService:
         """§4.4 on Claude, before the write transaction: ``(window copy, the batch's own trips, each event's trips,
         control replies)``. The copy observes each event the write records new and that is not history; the mode is
         read from the session (a meta that cannot be read trips). A batch that crosses a boundary is not recorded, so
-        nothing of it feeds the window, but a mode one of its lines reports is still kept. An effective gap drops the
-        counts and, with a call open, trips."""
+        nothing of it feeds the window, but a mode one of its lines reports is still kept and each of its control lines
+        is still answered or interrupted. An effective gap drops the counts and, with a call open, trips."""
         at: list[list[Trip]] = [[] for _ in seen]
         if not claude:
             return None, [], at, []
@@ -2094,7 +2096,11 @@ class ChatService:
         early += [mode] if mode is not None else []
         new = [(i, raw, e) for i, (raw, e, old, f) in enumerate(zip(raws, seen, backfill, fresh)) if f and not old]
         if crossed is not None:
-            early += [t for t in (reported_mode_trip(raw) for _i, raw, _e in new) if t is not None]
+            for _i, raw, _e in new:
+                reported = reported_mode_trip(raw)
+                trip, reply = control_line(raw) or (None, None)
+                early += [t for t in (reported, trip) if t is not None]
+                replies += [reply] if reply is not None else []
             return window, early, at, replies
         was_open = bool(window.calls)
         for i, raw, e in new:
