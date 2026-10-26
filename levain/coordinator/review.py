@@ -7,7 +7,9 @@ What it holds, in the coordinator's own store (``dispatch.db``):
   event, open again after a ``reopened`` one. Tables are append-only like the rest of the store.
 - **Three review modes** (RULED, *"also on review modes"*): ``manual`` (you), ``fresh`` (a fresh session you asked,
   recorded as you) and ``coordinator`` (the actor reviewing itself). An item marked ``authority_relevant`` can never be
-  cleared in ``coordinator`` mode, and the SQL refuses it, so no caller has to remember.
+  cleared in ``coordinator`` mode, and the SQL refuses it, so no caller has to remember. A fourth mode, ``signed``, is
+  no caller's to pick: it is the clear the operator's passkey signed (:func:`clear_signed`), and its event names the
+  sign request, so a reader tells it from the laptop's unsigned ``manual`` clear.
 - **The push records**: a SIGN reply points at a request in ``queue.db``, an ANSWER reply at a question in
   ``questions.db``. Writing one is what a delivery layer does when it files the request; whether it is still WAITING is
   read from the queue's own state (:func:`waiting_on_you`), never stored here ("waiting on you" is derived).
@@ -39,9 +41,11 @@ from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator.store import ACTORS, CoordError, CoordStore, _append_only, _in
 
-__all__ = ["FEEDS", "FEED_LABELS", "MODES", "NEAR_STOP", "NO_SPLIT_AFTER", "REVIEW_SCHEMA", "Item", "clear_item", "collect_feeds",
-           "feed_dead_seats", "feed_digest", "feed_end", "feed_envelopes", "feed_no_split", "file_item", "file_know",
-           "QueuePage", "get_item", "last_pass", "list_items", "push_answer", "push_sign", "queue_page", "record_pass", "reopen_item", "waiting_on_you"]
+__all__ = ["FEEDS", "FEED_LABELS", "MODES", "NEAR_STOP", "NO_SPLIT_AFTER", "REVIEW_SCHEMA", "SIGNED", "SIGN_REQUEST_TTL",
+           "SIGN_TIER", "CoordNotFound", "Item", "SignedClearRefused", "body_fields", "clear_item", "clear_message",
+           "clear_signed", "collect_feeds", "feed_dead_seats", "feed_digest", "feed_end", "feed_envelopes", "feed_no_split",
+           "file_clear_request", "file_item", "file_know", "QueuePage", "get_item", "last_pass", "list_items",
+           "push_answer", "push_sign", "queue_page", "record_pass", "reopen_item", "waiting_on_you"]
 
 FEEDS = ("receipt", "seat", "envelope", "end", "digest", "know", "doubt", "contradiction")
 # a seat's words for each feed: the ONE table every surface draws from (the cockpit panel, the phone route); the
@@ -50,6 +54,15 @@ FEED_LABELS = {"receipt": "Drop not split", "seat": "Seat died", "envelope": "En
                "end": "Session ended at a limit", "digest": "Unseen digest", "know": "Know", "doubt": "Doubt",
                "contradiction": "Contradiction"}
 MODES = ("manual", "fresh", "coordinator")
+# c4-mut R4: the mode of a clear the operator's passkey signed. Never a caller's to pick (MODES are): only
+# clear_signed writes it, and the table holds a signed event to the sign request it names (and only a signed one
+# names one)
+SIGNED = "signed"
+# what the passkey of a signed clear must cover: the class a thread envelope's signature needs (envelope.SIGN_TIER),
+# since an authority-relevant item is filed over a signed envelope [judged by lane-c4mut2, 10-25, against that constant]
+SIGN_TIER = "T2"
+# how long a signed clear's sign request stays open: one ceremony, read and signed on the spot
+SIGN_REQUEST_TTL = timedelta(minutes=10)
 # C0 §3.3 [seat: N = 10]: a drop with no split receipt after this long is a review item
 NO_SPLIT_AFTER = timedelta(minutes=10)
 # [judged by c4, 1022+18, against nothing measured]: an envelope whose stop is this near is "near its limit"
@@ -68,16 +81,27 @@ _MAX_PAGES = 20
 _PUSH_KINDS = ("sign", "answer")
 _REF_STORE = {"sign": "queue.db", "answer": "questions.db"}
 
+# review_events as this levain makes it: a store made before R4 holds the first six columns and the narrower mode CHECK,
+# and migrate_events rebuilds it (the store's ensure-schema path), every row kept as it was
+_EVENTS_TABLE = (
+    "CREATE TABLE IF NOT EXISTS review_events (item_id TEXT NOT NULL REFERENCES review_items(item_id), "
+    "seq INTEGER NOT NULL, op TEXT NOT NULL CHECK (op IN ('cleared', 'reopened')), "
+    f"mode TEXT NOT NULL CHECK ({_in('mode', (*MODES, SIGNED))}), "
+    "by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator')), at TEXT NOT NULL, sign_request_id TEXT, "
+    f"PRIMARY KEY (item_id, seq), CHECK ((mode = '{SIGNED}') = (sign_request_id IS NOT NULL)), "
+    f"CHECK (mode != '{SIGNED}' OR op = 'cleared'))")
+# (name, type, notnull, pk) of review_events before R4, then the column R4 adds
+_EVENTS_BEFORE = [("item_id", "TEXT", 1, 1), ("seq", "INTEGER", 1, 2), ("op", "TEXT", 1, 0), ("mode", "TEXT", 1, 0),
+                  ("by", "TEXT", 1, 0), ("at", "TEXT", 1, 0)]
+_EVENTS_NOW = [*_EVENTS_BEFORE, ("sign_request_id", "TEXT", 0, 0)]
+
 REVIEW_SCHEMA: tuple[str, ...] = (
     # dedupe_key is what makes a feed idempotent; by is who filed it (a feed is the service, a KNOW the coordinator)
     "CREATE TABLE IF NOT EXISTS review_items (item_id TEXT PRIMARY KEY, thread_id TEXT REFERENCES threads(thread_id), "
     f"feed TEXT NOT NULL CHECK ({_in('feed', FEEDS)}), dedupe_key TEXT NOT NULL UNIQUE, body TEXT NOT NULL, "
     "authority_relevant INTEGER NOT NULL CHECK (authority_relevant IN (0, 1)), "
     f"by TEXT NOT NULL CHECK ({_in('by', ACTORS)}), at TEXT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS review_events (item_id TEXT NOT NULL REFERENCES review_items(item_id), "
-    f"seq INTEGER NOT NULL, op TEXT NOT NULL CHECK (op IN ('cleared', 'reopened')), "
-    f"mode TEXT NOT NULL CHECK ({_in('mode', MODES)}), by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator')), "
-    "at TEXT NOT NULL, PRIMARY KEY (item_id, seq))",
+    _EVENTS_TABLE,
     # a feed's watermark (the dead-seat scan): append-only rows, the latest is the mark, and it never moves back
     "CREATE TABLE IF NOT EXISTS review_marks (feed TEXT NOT NULL, seq INTEGER NOT NULL, value INTEGER NOT NULL, "
     "at TEXT NOT NULL, PRIMARY KEY (feed, seq))",
@@ -110,6 +134,21 @@ REVIEW_SCHEMA: tuple[str, ...] = (
 )
 
 
+def ensure_one_signature(conn: sqlite3.Connection) -> None:
+    """One passkey signature clears at most once: a unique index on ``review_events.sign_request_id`` where it is set,
+    made by the store's ensure path (every writer runs it before it writes), after the schema's statements and only on
+    a table that has the column (an event without the column cannot be a signed clear). Not in
+    :data:`REVIEW_SCHEMA`: a reader finds a store current by the names that schema creates
+    (:func:`levain.coordinator.store.schema_present`), and a store made before this index is still read."""
+    if "sign_request_id" in {r[1] for r in conn.execute("PRAGMA table_info(review_events)")}:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS review_events_one_signature ON review_events "
+                     "(sign_request_id) WHERE sign_request_id IS NOT NULL")
+
+
+class CoordNotFound(CoordError):
+    """No review item has the id asked for. A surface classifies it by this type (404), never by its words."""
+
+
 @dataclass(frozen=True)
 class Item:
     item_id: str
@@ -120,7 +159,7 @@ class Item:
     by: str
     at: str
     state: str          # open or cleared, derived from the latest event
-    last: tuple[str, str, str, str] | None   # (op, mode, by, at) of the latest event
+    last: tuple[str, str, str, str, int] | None   # (op, mode, by, at, seq) of the latest event
 
 
 def _text(name: str, value: Any, high: int = _TEXT_MAX) -> str:
@@ -130,11 +169,17 @@ def _text(name: str, value: Any, high: int = _TEXT_MAX) -> str:
 
 
 def _item(conn: sqlite3.Connection, row: tuple[Any, ...]) -> Item:
-    last = conn.execute("SELECT op, mode, by, at FROM review_events WHERE item_id = ? ORDER BY seq DESC LIMIT 1",
+    last = conn.execute("SELECT op, mode, by, at, seq FROM review_events WHERE item_id = ? ORDER BY seq DESC LIMIT 1",
                         (row[0],)).fetchone()
     return Item(row[0], row[1], row[2], json.loads(row[4]), bool(row[5]), row[6], row[7],
                 "cleared" if last is not None and last[0] == "cleared" else "open",
                 None if last is None else tuple(last))
+
+
+def body_fields(item: Item) -> dict[str, Any]:
+    """An item's body as fields, for every surface that draws one: ``{}`` when the stored body is not a JSON object
+    (the store holds whatever a feed wrote; a row is drawn either way)."""
+    return item.body if isinstance(item.body, dict) else {}
 
 
 _COLS = "item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at"
@@ -206,10 +251,12 @@ def _file_checked(store: CoordStore, feed: str, body: Mapping[str, Any], *, dedu
 
 
 def get_item(store: CoordStore, item_id: str) -> Item:
-    with read_transaction(store._connect) as conn:
+    """One item, as it is now. Like every review transition it makes no store: no store is :class:`StoreAbsent`, a
+    missing item :class:`CoordNotFound`."""
+    with read_transaction(lambda: store._connect(create=False)) as conn:
         row = conn.execute(f"SELECT {_COLS} FROM review_items WHERE item_id = ?", (str(item_id),)).fetchone()
         if row is None:
-            raise CoordError(f"no review item {str(item_id)[:40]}")
+            raise CoordNotFound(f"no review item {str(item_id)[:40]}")
         return _item(conn, row)
 
 
@@ -232,7 +279,8 @@ def list_items(store: CoordStore, *, include_cleared: bool = False, feed: str | 
 # an item with its latest event, in one statement: the item is open unless that event cleared it (as :func:`_item` reads it)
 _LATEST = ("FROM review_items i LEFT JOIN review_events e ON e.item_id = i.item_id AND e.seq = "
            "(SELECT MAX(seq) FROM review_events WHERE item_id = i.item_id)")
-_LATEST_COLS = "i.item_id, i.thread_id, i.feed, i.dedupe_key, i.body, i.authority_relevant, i.by, i.at, e.op, e.mode, e.by, e.at"
+_LATEST_COLS = ("i.item_id, i.thread_id, i.feed, i.dedupe_key, i.body, i.authority_relevant, i.by, i.at, e.op, e.mode, "
+                "e.by, e.at, e.seq")
 
 
 @dataclass(frozen=True)
@@ -245,7 +293,7 @@ class QueuePage:
 
 
 def _joined(row: tuple[Any, ...]) -> Item:
-    last = None if row[8] is None else (row[8], row[9], row[10], row[11])
+    last = None if row[8] is None else (row[8], row[9], row[10], row[11], row[12])
     return Item(row[0], row[1], row[2], json.loads(row[4]), bool(row[5]), row[6], row[7],
                 "cleared" if row[8] == "cleared" else "open", last)
 
@@ -262,17 +310,23 @@ def queue_page(conn: sqlite3.Connection, *, open_limit: int, cleared_limit: int)
     return QueuePage(total, [_joined(r) for r in opened], [_joined(r) for r in cleared])
 
 
-def _review(store: CoordStore, item_id: str, op: str, mode: str, token: object) -> Item:
+def _review(store: CoordStore, item_id: str, op: str, mode: str, token: object, plain_only: bool = False,
+            still: Callable[[Item], None] | None = None) -> Item:
     if mode not in MODES:
         raise CoordError(f"a review mode is one of {', '.join(MODES)}")
     by = "coordinator" if mode == "coordinator" else "operator"
-    with store._write(by, token) as (conn, now):
+    with store._write(by, token, create=False) as (conn, now):
         row = conn.execute(f"SELECT {_COLS} FROM review_items WHERE item_id = ?", (str(item_id),)).fetchone()
         if row is None:
-            raise CoordError(f"no review item {str(item_id)[:40]}")
-        state = _item(conn, row).state
-        if op == "cleared" and state != "open" or op == "reopened" and state != "cleared":
-            raise CoordError(f"item {item_id} is already {state}")
+            raise CoordNotFound(f"no review item {str(item_id)[:40]}")
+        item = _item(conn, row)
+        if still is not None:
+            still(item)          # the caller's own check, on the item as this transaction sees it; a raise writes nothing
+        if op == "cleared" and item.state != "open" or op == "reopened" and item.state != "cleared":
+            raise CoordError(f"item {item_id} is already {item.state}")
+        if op == "cleared" and plain_only and row[5]:
+            raise CoordError(f"item {item_id} is yours to clear: it is cleared on your passkey's signature "
+                             f"(the signed clear), or on the laptop: levain coord review clear {item_id}")
         if op == "cleared" and by == "coordinator" and row[5]:
             raise CoordError("an authority-relevant item is cleared by you or a fresh session you asked, never by "
                              "the coordinator reviewing itself")
@@ -283,14 +337,167 @@ def _review(store: CoordStore, item_id: str, op: str, mode: str, token: object) 
         return _item(conn, row)      # read after the insert: the state it now has
 
 
-def clear_item(store: CoordStore, item_id: str, *, mode: str = "manual", token: object = None) -> Item:
+def clear_item(store: CoordStore, item_id: str, *, mode: str = "manual", token: object = None,
+               plain_only: bool = False, still: Callable[[Item], None] | None = None) -> Item:
     """Clear an open item in ``mode``. ``coordinator`` mode writes as the coordinator, so it needs the lease token, and
-    it is refused for an authority-relevant item."""
-    return _review(store, item_id, "cleared", mode, token)
+    it is refused for an authority-relevant item. ``plain_only`` is a clear sent on a device's token (the cockpit's and
+    the phone's Clear): it is refused for an authority-relevant item too, whose clear the head ruled signed-only
+    (1025+25): :func:`clear_signed`, or the laptop's own clear. ``still(item)`` runs inside the write transaction on the
+    item as it is then, before anything is written; it refuses by raising. A missing item is :class:`CoordNotFound`, a
+    missing store :class:`StoreAbsent` (none is made)."""
+    return _review(store, item_id, "cleared", mode, token, plain_only, still)
 
 
-def reopen_item(store: CoordStore, item_id: str, *, mode: str = "manual", token: object = None) -> Item:
-    return _review(store, item_id, "reopened", mode, token)
+def reopen_item(store: CoordStore, item_id: str, *, mode: str = "manual", token: object = None,
+                plain_only: bool = False, still: Callable[[Item], None] | None = None) -> Item:
+    """Reopen a cleared item. A reopen clears nothing, so ``plain_only`` (a device's token) refuses none. ``still`` and
+    the refusals are :func:`clear_item`'s."""
+    return _review(store, item_id, "reopened", mode, token, plain_only, still)
+
+
+# --- the signed clear (c4-mut session 2, head rulings R1-R5) ---------------------------------------------------------
+class SignedClearRefused(CoordError):
+    """A signed clear refused at the door, with the HTTP ``status`` and the ``error`` word a surface answers it with."""
+
+    def __init__(self, status: int, error: str, message: str) -> None:
+        super().__init__(message)
+        self.status, self.error = status, error
+
+
+def migrate_events(conn: sqlite3.Connection) -> bool:
+    """R4's migration of a ``review_events`` made before it (session 1's six columns and narrower mode CHECK) to
+    :data:`_EVENTS_TABLE`, run ONLY by the store's ensure-schema path (:meth:`levain.coordinator.store.CoordStore.
+    _ensure`), inside its ``BEGIN IMMEDIATE``, before the schema's statements, which then recreate the table's
+    triggers; that path runs ``PRAGMA integrity_check`` before it commits. True when it rebuilt the table.
+
+    The rebuild is SQLite's documented procedure for a constraint change (sqlite.org/lang_altertable.html, "Making
+    Other Kinds Of Table Schema Changes"): a new table, every row copied with its ``rowid`` (the cleared page orders by
+    it) and a NULL request, the old table dropped, the new one renamed. Every stored value is kept as it was. A table
+    of any other shape is left as it is."""
+    cols = [(r[1], r[2], r[3], r[5]) for r in conn.execute("PRAGMA table_info(review_events)")]
+    if cols != _EVENTS_BEFORE:
+        return False
+    conn.execute(_EVENTS_TABLE.replace("CREATE TABLE IF NOT EXISTS review_events ", "CREATE TABLE review_events_r4 ", 1))
+    conn.execute("INSERT INTO review_events_r4 (rowid, item_id, seq, op, mode, by, at) "
+                 "SELECT rowid, item_id, seq, op, mode, by, at FROM review_events")
+    conn.execute("DROP TABLE review_events")
+    conn.execute("ALTER TABLE review_events_r4 RENAME TO review_events")
+    return True
+
+
+def clear_message(item: Item) -> str:
+    """What a signed clear signs (R3): ``levain review clear <item_id> <state> <last event at>#<its seq>`` (``none``
+    for an item never cleared or reopened). The row version's own inputs, the event's seq among them, so a signature
+    over one version clears no other, even when two transitions share one clock reading."""
+    last = f"{item.last[3]}#{item.last[4]}" if item.last is not None else "none"
+    return f"levain review clear {item.item_id} {item.state} {last}"
+
+
+def file_clear_request(store: CoordStore, item_id: str, *, queue_dir: Path, reuse: bool = False) -> str:
+    """File levain's own sign request for the signed clear of the open "yours to clear" item ``item_id`` in the sign
+    directory of ``queue_dir`` (namespace :data:`levain.contracts.namespaces.REVIEW_CLEAR_NAMESPACE`, open for
+    :data:`SIGN_REQUEST_TTL`) and return its id. ``reuse``: the open request over the item as it is now, when one has
+    half its time left, is answered instead of a new one (:func:`levain.consent.sign.levain_request_for`; the phone's
+    door, which files on every tap). CoordError when there is no such item, it is not open, or it is not yours to
+    clear (a plain item is cleared as it is)."""
+    from levain.consent.sign import file_levain_request, levain_request_for
+    from levain.contracts.namespaces import REVIEW_CLEAR_NAMESPACE
+
+    item = get_item(store, item_id)
+    if item.state != "open":
+        raise CoordError(f"item {item_id} is already {item.state}")
+    if not item.authority_relevant:
+        raise CoordError(f"item {item_id} is not yours to clear: it is cleared as it is, with no signature")
+    filing = levain_request_for if reuse else file_levain_request
+    return filing(Path(queue_dir), REVIEW_CLEAR_NAMESPACE, clear_message(item),
+                  title=f"Clear a review item: {FEED_LABELS.get(item.feed, item.feed)}",
+                  ttl_s=SIGN_REQUEST_TTL.total_seconds())
+
+
+def clear_signed(store: CoordStore, item_id: str, *, queue_dir: Path, request_id: object,
+                 keys: Callable[[], Mapping[str, Any]]) -> Item:
+    """Clear ``item_id`` on the operator's passkey signature (R3, R4): the sign request ``request_id`` in
+    ``queue_dir``'s sign directory must be levain's own in :data:`levain.contracts.namespaces.REVIEW_CLEAR_NAMESPACE`,
+    signed (not open, not denied) and unexpired; its signature must verify (:func:`levain.authority.verify_link_sig`)
+    over its message in that namespace by a key ``keys()`` names (the active passkeys enrolled for the Signer's name),
+    whose class covers :data:`SIGN_TIER`. The verify runs before the write; inside the write transaction the message
+    is recomputed from the item as it is now (:func:`clear_message`) and compared byte for byte, so a signature over an
+    older version (the item cleared or reopened since) clears nothing. The event is mode :data:`SIGNED` with the
+    request's id. Refusals are :class:`SignedClearRefused`; a missing item is :class:`CoordNotFound` and a missing
+    store :class:`StoreAbsent` (none is made), as on every other review transition."""
+    import hashlib
+
+    from levain.authority import VerifierUnavailable, verify_link_sig
+    from levain.consent.queue import class_covers
+    from levain.consent.sign import SignRefused, read_request, request_id_ok, sign_dir, state_of
+    from levain.contracts.namespaces import REVIEW_CLEAR_NAMESPACE
+
+    def refuse(why: str) -> SignedClearRefused:
+        return SignedClearRefused(403, "sign_required", f"item {item_id} is cleared only on your passkey's "
+                                  f"signature: {why}; nothing was cleared")
+
+    if not request_id_ok(request_id):
+        raise refuse("no sign request was named")
+    rid = str(request_id)
+    try:
+        request = read_request(Path(queue_dir), rid)
+    except SignRefused:
+        raise refuse(f"there is no sign request {rid}") from None
+    if request.namespace != REVIEW_CLEAR_NAMESPACE or request.refused is not None:
+        raise refuse(f"sign request {rid} is not a review clear levain filed")
+    state = state_of(Path(queue_dir), rid)
+    if state != "signed":
+        raise refuse(f"sign request {rid} is {'denied' if state == 'denied' else 'not signed'}")
+    if request.expires_at is None or request.expires_at <= datetime.now(timezone.utc):
+        raise refuse(f"sign request {rid} expired")
+    message = request.message.encode("utf-8")
+    d = sign_dir(Path(queue_dir))
+    try:
+        record = json.loads((d / f"{rid}.signed.json").read_text(encoding="utf-8"))
+        signature = (d / f"{rid}.sig").read_text(encoding="ascii")
+    except (OSError, ValueError):
+        raise refuse(f"the signature of sign request {rid} cannot be read") from None
+    if (not isinstance(record, dict) or record.get("namespace") != REVIEW_CLEAR_NAMESPACE
+            or record.get("message_sha256") != hashlib.sha256(message).hexdigest()):
+        raise refuse(f"the record of sign request {rid} is not over its message")
+    try:
+        active = keys()
+    except SignRefused as exc:
+        raise SignedClearRefused(503, "unavailable", f"the passkeys cannot be read now ({exc}): nothing was cleared; "
+                                 "send it again") from None
+    fp = record.get("signer_fp")
+    key = active.get(fp) if isinstance(fp, str) else None
+    if key is None:
+        raise refuse(f"{str(fp)[:80]} is not an active passkey enrolled here")
+    if not class_covers(key.key_class, SIGN_TIER):
+        raise refuse(f"a {key.key_class} passkey does not cover {SIGN_TIER}")
+    try:
+        verified = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
+                                   namespace=REVIEW_CLEAR_NAMESPACE)
+    except VerifierUnavailable as exc:
+        raise SignedClearRefused(503, "unavailable", f"the signature could not be verified now ({exc}): nothing was "
+                                 "cleared; send it again") from None
+    if not verified:
+        raise refuse(f"the signature of sign request {rid} does not verify")
+    with store._write("operator", create=False) as (conn, now):
+        row = conn.execute(f"SELECT {_COLS} FROM review_items WHERE item_id = ?", (str(item_id),)).fetchone()
+        if row is None:
+            raise CoordNotFound(f"no review item {str(item_id)[:40]}")
+        if clear_message(_item(conn, row)) != request.message:
+            raise SignedClearRefused(409, "stale", f"sign request {rid} was signed for another version of item "
+                                     f"{item_id} (it was cleared or reopened since): nothing was cleared; sign again")
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM review_events WHERE item_id = ?",
+                           (str(item_id),)).fetchone()[0]
+        try:
+            conn.execute("INSERT INTO review_events (item_id, seq, op, mode, by, at, sign_request_id) "
+                         "VALUES (?, ?, 'cleared', ?, 'operator', ?, ?)", (str(item_id), seq, SIGNED, now, rid))
+        except sqlite3.IntegrityError as exc:
+            # only the unique index on the signature is a replay; any other integrity fault stays a store fault
+            if "review_events.sign_request_id" not in str(exc):
+                raise
+            raise SignedClearRefused(409, "stale", f"sign request {rid} already cleared an item: nothing was cleared; "
+                                     "sign again") from None
+        return _item(conn, row)
 
 
 # --- the push records (C0 §3.3) ----------------------------------------------------------------------------------

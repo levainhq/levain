@@ -2641,3 +2641,8 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .pair-actions[hidden] { display: none; }
 .pair-veil { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: var(--sp-6); box-sizing: border-box; background: var(--bg); }
 .pair-actions .dev-btn { min-height: var(--hit-min, 44px); }
+
+/* a review queue row's "yours to clear" line: its own line, wrapped whole, so the command it names is never cut */
+.review-mine { display: block; white-space: normal; overflow-wrap: anywhere; }
+body.ke .row:has(> .clause.clampable) > .ext-meta.review-mine:not(.clause):not(.clause-toggle):not(.ck-rowaddr):not(.verb-actions) {
+  grid-column: 1 / -1; grid-row: 4; overflow: visible; text-overflow: clip; white-space: normal; min-height: 0; line-height: var(--lh-list); }

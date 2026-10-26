@@ -31,7 +31,9 @@ DOC = {
         {"namespace": "levain-dispatch-cancel", "status": "reserved", "owner": "levain/dispatch/sign.py"},
         {"namespace": "levain-dispatch-config", "status": "reserved", "owner": "levain/dispatch/control.py"},
         {"namespace": "levain-dispatch-authorise", "status": "reserved", "owner": "levain/dispatch/adopt.py"},
+        {"namespace": "levain-thread-envelope", "status": "reserved", "owner": "levain/coordinator/envelope.py"},
         {"namespace": "levain-allowed-signers", "status": "reserved", "owner": "levain/qbroker/signers.py"},
+        {"namespace": "levain-review-clear", "status": "shipped", "owner": "levain/coordinator/review.py"},
     ],
     "families": [{"prefix": "levain-team-", "taken": ["entry"],
                   "rule": "P1's envelope kinds; no envelope kind is named 'entry'; a member is registered as its "

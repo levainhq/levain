@@ -60,7 +60,11 @@ The rules, each a refusal before anything is signed:
     (:mod:`levain.contracts.namespaces`): a passkey's challenge is the SSHSIG signed-data blob of the message
     (:func:`levain.consent.passkey.challenge`), so a request in a namespace levain itself verifies (a consent
     answer's, a ruling's, a team ledger commit's in ``git``) would make a phone signature that levain accepts as one.
-    Refused at the flag and again at every signing, whatever the flags say;
+    Refused at the flag and again at every signing, whatever the flags say. The one exception is levain's OWN
+    requests (``LEVAIN_SIGN_REQUESTS`` in :mod:`levain.contracts.namespaces`, filed by :func:`file_levain_request`):
+    every Signer serves them by id, no listing shows one levain filed, and a request file in one is refused (and
+    listed so) unless its message is exactly the grammar levain files there, so a caller can neither name such a
+    namespace nor make one say anything levain would not ask;
   - what the operator reads is what is signed: the message is UTF-8 text of at most :data:`MESSAGE_MAX` bytes, and a
     message, title or requester holding a control character other than newline and tab, a Unicode format character
     (bidi controls, zero-width characters), a line or paragraph separator, a space other than U+0020, or a
@@ -129,7 +133,7 @@ import threading
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -143,7 +147,8 @@ __all__ = ["BINDING_KEEP_S", "CHOICE_FORMAT", "CHOICE_MARK", "COMPOSE_BINDINGS",
            "LIST_MAX", "LOCK_WAIT_S", "MESSAGE_MAX", "OPTION_TEXT_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES",
            "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "WRITE_IN_MAX", "SignRefused", "SignRequest", "Signer",
            "bind_compose", "choice_line", "compose_bindings", "deep_link", "draft_bindings", "error_word",
-           "namespace_problem", "parse_choice", "passkey_key_source", "read_request", "request_id_ok", "sign_dir",
+           "file_levain_request", "namespace_problem", "parse_choice", "passkey_key_source", "read_request",
+           "request_id_ok", "sign_dir",
            "sign_root", "signed_bytes", "state_of", "write_in_problem"]
 
 REQUEST_FORMAT = "levain-sign-request/1"
@@ -260,6 +265,73 @@ def namespace_problem(namespace: object) -> str | None:
     if namespace in REFUSED_NAMESPACES or namespace in REGISTRY or namespace.startswith(tuple(FAMILIES)):
         return f"namespace {namespace!r} is one levain or ssh verifies signatures in: never signed on request"
     return None
+
+
+def _levain_namespace(namespace: object) -> bool:
+    """Whether ``namespace`` is one levain files its own sign requests in (``levain.contracts.namespaces``
+    ``LEVAIN_SIGN_REQUESTS``): every Signer serves it, though no caller may name it."""
+    from levain.contracts.namespaces import LEVAIN_SIGN_REQUESTS
+
+    return isinstance(namespace, str) and namespace in LEVAIN_SIGN_REQUESTS
+
+
+def _request_namespace_problem(namespace: object, message: str, choice: bool) -> str | None:
+    """Why a request FILE's namespace (with its message) is not one a phone may sign: a caller's namespace by
+    :func:`namespace_problem`; one of levain's own only when its message is exactly the grammar levain files there,
+    as a plain request (so a signature in it can only ever say what levain itself asks)."""
+    from levain.contracts.namespaces import LEVAIN_SIGN_REQUESTS
+
+    if not _levain_namespace(namespace):
+        return namespace_problem(namespace)
+    if choice or re.fullmatch(LEVAIN_SIGN_REQUESTS[str(namespace)], message) is None:
+        return (f"namespace {namespace!r} is levain's own: it holds only the plain message levain files there, never "
+                "one a caller wrote")
+    return None
+
+
+def file_levain_request(queue_dir: Path, namespace: str, message: str, *, title: str, ttl_s: float) -> str:
+    """File one of levain's OWN sign requests (a plain request, requester ``levain``) in ``namespace``, one of
+    ``LEVAIN_SIGN_REQUESTS``, open for ``ttl_s`` seconds, and return its id. ``ValueError`` for a namespace that is not
+    levain's or a message outside its grammar: nothing is written. The file is written whole, never over another."""
+    from levain.cockpit.consent import utc_stamp
+
+    if not _levain_namespace(namespace):
+        raise ValueError(f"{str(namespace)[:80]!r} is not a namespace levain files its own sign requests in")
+    title = title[:_TEXT_MAX]
+    problem = _request_namespace_problem(namespace, message, False) or _text_problem(title, "title")
+    if problem is not None:
+        raise ValueError(problem)
+    rid = "lv-" + secrets.token_hex(16)
+    d = sign_dir(queue_dir)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    body = {"format": REQUEST_FORMAT, "id": rid, "namespace": namespace, "message": message, "title": title,
+            "requester": "levain", "expires_at": utc_stamp(_now() + timedelta(seconds=ttl_s))}
+    _publish(_write_new, d / f"{rid}.json", json.dumps(body) + "\n", f"sign request {rid} already exists")
+    return rid
+
+
+def levain_request_for(queue_dir: Path, namespace: str, message: str, *, title: str, ttl_s: float) -> str:
+    """The id of levain's own open sign request in ``namespace`` over exactly ``message`` that has at least half of
+    ``ttl_s`` left to be signed in, or else of a new one (:func:`file_levain_request`). The look and the filing run
+    under the queue lock, so two calls at once leave one request. For a door that files on every tap (the phone's
+    review sign-request), so a retry or a second tap files no second request; a signed or denied one is never
+    reused."""
+    d = sign_dir(queue_dir)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with _queue_lock(queue_dir):
+        keep = _now() + timedelta(seconds=ttl_s / 2)
+        for path in sorted(d.glob("lv-*.json")):
+            rid = path.name[:-len(".json")]
+            if not request_id_ok(rid) or state_of(queue_dir, rid) != "open":
+                continue
+            try:
+                got = read_request(queue_dir, rid)
+            except SignRefused:
+                continue
+            if (got.refused is None and got.requester == "levain" and got.namespace == namespace
+                    and got.message == message and got.expires_at is not None and got.expires_at > keep):
+                return rid
+        return file_levain_request(queue_dir, namespace, message, title=title, ttl_s=ttl_s)
 
 
 def _text_problem(text: str, what: str) -> str | None:
@@ -505,7 +577,7 @@ def read_request(queue_dir: Path, request_id: str) -> SignRequest:
         problem = f"recommended {str(recommended)[:20]!r} is not one of the request's option keys"
     if problem is None and not isinstance(write_in, bool):
         problem = "write_in is true or false"
-    problem = namespace_problem(namespace) or problem
+    problem = _request_namespace_problem(namespace, message, "options" in data) or problem
     longest = max((len(("\n" + choice_line(k, t)).encode("utf-8")) for k, t in options), default=0)
     if write_in is True:                # the longest write-in: WRITE_IN_MAX characters of at most 4 UTF-8 bytes each
         longest = max(longest, len(("\n" + choice_line(WRITE_IN_KEY, "")).encode("utf-8")) + 4 * WRITE_IN_MAX)
@@ -843,10 +915,14 @@ class Signer:
                 raise ValueError("release_pin: this Signer holds no pin")
             self._pins -= 1
 
-    def _ours(self, request: SignRequest) -> bool:
+    def _ours(self, request: SignRequest, *, listing: bool = False) -> bool:
         """A request in a namespace this port signs, or a refused one whose namespace no signer could own (malformed,
         or one levain or ssh verifies in): the operator still sees it, and may deny it. With no namespaces at all,
-        nothing is ours."""
+        nothing is ours, except a request in one of levain's OWN namespaces (``LEVAIN_SIGN_REQUESTS``), which every
+        Signer serves by its id and no ``listing`` shows (the surface that filed it shows it), unless it is refused: a
+        file there that is not levain's own message is listed as refused, like any other."""
+        if _levain_namespace(request.namespace):
+            return not listing or (request.refused is not None and bool(self.namespaces))
         if not self.namespaces:
             return False
         return request.namespace in self.namespaces or (
@@ -941,7 +1017,8 @@ class Signer:
                 if state_of(self.queue_dir, rid) != "open":   # a decided request is never parsed again
                     continue
                 request = read_request(self.queue_dir, rid)
-                if not self._ours(request) or (request.expires_at is not None and request.expires_at <= now):
+                if not self._ours(request, listing=True) or (request.expires_at is not None
+                                                             and request.expires_at <= now):
                     continue
             except SignRefused:
                 continue                      # gone since the directory was read
@@ -965,7 +1042,7 @@ class Signer:
         """The one listing row for ``request_id`` (as :meth:`page` draws it, a refused request included), or None when
         it is not an open, unexpired request in a namespace this port signs. Reads that one file, whatever the
         listing's cap, so a page never decides "no longer open" from a listing that stopped short of it."""
-        if not self.namespaces or not request_id_ok(request_id):
+        if not request_id_ok(request_id):
             return None
         try:
             if state_of(self.queue_dir, request_id) != "open":
@@ -984,7 +1061,7 @@ class Signer:
         outside the flags is never said to exist). Display only: nothing here is read as a decision. The namespace of
         a signed request is the one its record names when that record can be read, else its request file's."""
         gone = {"id": request_id, "state": "gone"}
-        if not self.namespaces or not request_id_ok(request_id):
+        if not request_id_ok(request_id):
             return gone
         record: Any = None
         marker = state_of(self.queue_dir, request_id)      # read once: every branch below answers from this one read
@@ -995,7 +1072,7 @@ class Signer:
             except (OSError, SignRefused, UnicodeDecodeError, ValueError, RecursionError):
                 record = None
         if isinstance(record, dict) and isinstance(record.get("namespace"), str):
-            if record["namespace"] not in self.namespaces:
+            if record["namespace"] not in self.namespaces and not _levain_namespace(record["namespace"]):
                 return gone
         else:
             try:

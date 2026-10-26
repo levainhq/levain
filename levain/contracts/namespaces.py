@@ -13,6 +13,8 @@ from __future__ import annotations
 
 # F9's device line signature (F12 verifies it in-process).
 TEAM_ENTRY_NAMESPACE = "levain-team-entry"
+# The operator's passkey clear of a "yours to clear" coordinator review item (c4-mut head ruling R2).
+REVIEW_CLEAR_NAMESPACE = "levain-review-clear"
 
 # namespace -> (status, owner, meaning). status is "shipped" (a released levain uses it) or "reserved" (a design
 # names it; nothing signs in it yet).
@@ -50,6 +52,18 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     "levain-allowed-signers": ("reserved", "levain/qbroker/signers.py",
                                "the dispatch trust root's signature over the answer-signer snapshot "
                                "(CONTRACT c6 §3.7)"),
+    REVIEW_CLEAR_NAMESPACE: ("shipped", "levain/coordinator/review.py",
+                             "the operator's passkey clear of a 'yours to clear' coordinator review item, over the "
+                             "item's id, state and last event"),
+}
+
+# The levain namespaces levain's OWN sign requests are filed in (levain.consent.sign serves them on every Signer,
+# whatever namespaces its caller gave it): namespace -> the one message grammar levain files there. A caller still
+# never names one (``levain.consent.sign.namespace_problem`` refuses every name beginning ``levain``), and a request
+# file in one whose message is not exactly this grammar is refused, so a phone signature in it can only ever say
+# what levain itself asks.
+LEVAIN_SIGN_REQUESTS: dict[str, str] = {
+    REVIEW_CLEAR_NAMESPACE: r"levain review clear rv-[0-9a-f]{32} open \S+",
 }
 
 # Reserved families: prefix -> the rule. A family reserves the prefix against any other meaning; it registers

@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from levain import unshowable
-from levain.autonomic.durable_sqlite import BUSY_WAIT_S, open_durable, read_transaction, write_transaction
+from levain.autonomic.durable_sqlite import BUSY_WAIT_S, _set_wal, open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.contracts.canon import canonical, canonical_bytes
@@ -375,23 +375,76 @@ class CoordStore:
         # the lease is checked by every opener's coordinator writes, so its tables are every opener's
         return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA)
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = self._jobs._connect()
+    def _connect(self, *, create: bool = True) -> sqlite3.Connection:
+        """A connection with this opener's schema ensured, once per store object (:meth:`_ensure`). ``create=False``
+        never makes the directory, the file or a coordinator store (:meth:`_open_existing`); a coordinator store already
+        there is still brought current, as every opener's is."""
+        conn = self._jobs._connect() if create else self._open_existing()
         if not self._ready:
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                try:
-                    for stmt in self._statements():
-                        conn.execute(stmt)
-                    _replies_gseq(conn)
-                    conn.execute("COMMIT")
-                except BaseException:
-                    _rollback(conn)
-                    raise
+                self._ensure(conn, create=create)
             except BaseException:
                 conn.close()
                 raise
             self._ready = True
+        return conn
+
+    def _ensure(self, conn: sqlite3.Connection, *, create: bool) -> None:
+        """The ONE ensure-schema path: in one ``BEGIN IMMEDIATE``, R4's ``review_events`` rebuild
+        (:func:`levain.coordinator.review.migrate_events`), every statement of this opener's schema, the review events'
+        one-signature index (:func:`levain.coordinator.review.ensure_one_signature`), the replies' sequence; after a
+        rebuild, ``PRAGMA integrity_check`` must answer ``ok`` before the transaction commits (any failure rolls all of
+        it back). ``create=False``: a file holding no coordinator store is :class:`StoreAbsent`,
+        decided under the write lock, and nothing is made."""
+        from levain.coordinator.review import ensure_one_signature, migrate_events
+
+        if not create:
+            if "threads" not in _names(conn):
+                raise StoreAbsent(f"{self.path} holds no coordinator store")
+            JobStore._ensure_schema(conn)      # the dispatch store's own format steps, as its own opener runs them
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not create and "threads" not in _names(conn):
+                raise StoreAbsent(f"{self.path} holds no coordinator store")
+            rebuilt = migrate_events(conn)
+            for stmt in self._statements():
+                conn.execute(stmt)
+            ensure_one_signature(conn)
+            _replies_gseq(conn)
+            if rebuilt:
+                check = conn.execute("PRAGMA integrity_check").fetchall()
+                if check != [("ok",)]:
+                    raise CoordError(f"the review_events rebuild left {self.path} failing its integrity check "
+                                     f"({check[:3]}); nothing was changed")
+            conn.execute("COMMIT")
+        except BaseException:
+            _rollback(conn)
+            raise
+
+    def _open_existing(self) -> sqlite3.Connection:
+        """A read-write connection to the coordinator's file that never makes it: the directory rule read with
+        ``lstat`` (:meth:`_check_directory_readonly`), the file opened ``mode=rw`` (SQLite creates no file in that
+        mode), open_durable's PRAGMAs (it takes no URI). Raises :class:`StoreAbsent` when there is no file to open."""
+        self._check_directory_readonly()
+        if not self.path.exists():
+            raise StoreAbsent(f"no coordinator store at {self.path}")
+        try:
+            conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=rw", uri=True, timeout=BUSY_WAIT_S,
+                                   isolation_level=None)
+        except sqlite3.OperationalError:
+            if not self.path.exists():          # removed between the check and the open
+                raise StoreAbsent(f"no coordinator store at {self.path}") from None
+            raise
+        try:
+            _set_wal(conn)
+            conn.execute(f"PRAGMA busy_timeout = {int(BUSY_WAIT_S * 1000)}")
+            conn.execute("PRAGMA synchronous = FULL")
+            conn.execute("PRAGMA fullfsync = ON")
+            conn.execute("PRAGMA checkpoint_fullfsync = ON")
+            conn.execute("PRAGMA foreign_keys = ON")
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     def _read_connect(self) -> sqlite3.Connection:
@@ -467,15 +520,22 @@ class CoordStore:
         return meta.get("format") == FORMAT and "store_id" in meta
 
     @contextmanager
-    def _write(self, by: str | None = None, token: object = None) -> Iterator[tuple[sqlite3.Connection, str]]:
+    def _write(self, by: str | None = None, token: object = None, *,
+               create: bool = True) -> Iterator[tuple[sqlite3.Connection, str]]:
         """One write transaction. A write ``by`` the coordinator is fenced here, inside it: refused unless ``token``
         is the live lease's (C0 §6). Your writes and the service's carry no token.
+
+        ``create=False`` (a review transition: a clear or a reopen that finds no store says so) makes no store: the
+        connection is :meth:`_connect`'s non-creating one, and the coordinator's tables are checked INSIDE the
+        transaction (:class:`StoreAbsent` when the file does not hold them).
 
         Every write that commits is followed, outside its transaction, by the ONE awake reconcile (C7), whatever the
         write moved (a thread's state, a detach, a beat of either kind). A write that rolls back reconciles nothing."""
         if by != "coordinator" and token is not None:
             raise CoordError("a lease token is the coordinator's; your own writes carry none")
-        with write_transaction(self._connect) as conn:
+        with write_transaction(lambda: self._connect(create=create)) as conn:
+            if not create and not self._schema_current(conn, base=True):
+                raise StoreAbsent(f"{self.path} does not hold the coordinator's current tables")
             now = self._stamp()
             if by == "coordinator":
                 from levain.coordinator.lease import fence, record_write

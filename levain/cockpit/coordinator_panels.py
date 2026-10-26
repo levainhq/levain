@@ -8,8 +8,14 @@ them, and nothing here decides anything: every row names the command that does, 
 
 The panels exist only while the coordinator's tables are in ``dispatch.db`` (a discoverer registered with ``retire``;
 the file alone proves nothing, the job store shares it): an install that never used the coordinator draws neither,
-never an empty card. The queue's clear and reopen are NOT offered here (head
-ruling, ``project_memory/1025-25/c4b/RULINGS_OBS.md``): ``review.clear_item`` and ``review.reopen_item`` are the data path.
+never an empty card.
+
+The queue's rows are ``review:<item_id>``, the open items and the most recently cleared ones (:data:`CLEARED_SHOWN`).
+A row offers the kernel's ``review_clear`` (an open item not marked "yours to clear"), ``review_clear_signed`` (an open
+one that is, cleared on the operator's passkey signature) or ``review_reopen`` (a cleared one); the verbs and their
+credential rule live in :mod:`levain.cockpit.verbs` (head ruling 1025+25, c4b RULINGS_OBS item 1). A row's
+version is its item, its state and its latest event, never its age line, so a Clear is refused as stale only
+when the item changed.
 """
 from __future__ import annotations
 
@@ -19,15 +25,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from levain.cockpit.engine import ProviderSpec, ReadContext
-from levain.cockpit.results import Read, Result, RowIn
+from levain.cockpit.engine import ProviderSpec, ReadContext, row_version_of
+from levain.cockpit.results import Absent, Read, Result, RowIn
 from levain.cockpit.consent import ConsentError, parse_stamp
 from levain.dispatch.jobs import JobStoreError
 
-__all__ = ["REVIEW_ID", "MORNING_ID", "coordinator_discoverer"]
+__all__ = ["CLEARED_SHOWN", "REVIEW_ID", "REVIEW_ROW_PREFIX", "MORNING_ID", "coordinator_discoverer", "review_version"]
 
 REVIEW_ID = "review-queue"
+REVIEW_ROW_PREFIX = "review:"
+REVIEW_FACETS = frozenset({"review_state", "review_authority"})
+# the cleared items the queue panel lists after the open ones, newest clear first (each is a reopen away)
+CLEARED_SHOWN = 10
 MORNING_ID = "coord-morning"
+# the kernel's verbs on a queue row (levain.cockpit.verbs registers them)
+REVIEW_VERBS = ("review_clear", "review_reopen", "review_clear_signed")
+# what a queue row's version is taken over: every stored field (``_review_stored``), as the panel's spec declares it
+_REVIEW_VERSION_FIELDS = ("*",)
 _ROW_MAX = 400
 _LEAD_MIN = 40
 _SHORTENED = " … [command shortened: not runnable as shown]"
@@ -81,6 +95,37 @@ def _waiting_line(waiting: dict[str, Any], ran_at: str | None = None) -> str:
     return line
 
 
+def _review_stored(i: Any) -> dict[str, Any]:
+    """What a queue row's version is taken over: the item, its state and its latest event (the age in the line moves
+    with the clock, so it is drawn and never versioned)."""
+    return {"item_id": i.item_id, "state": i.state, "last": list(i.last) if i.last is not None else None}
+
+
+def review_version(i: Any) -> str:
+    """The version the queue panel draws for item ``i`` (a :class:`levain.coordinator.review.Item`): the ONE
+    computation, which the review verbs recompute inside the store's write to refuse a Clear or Reopen of an item that
+    moved after the actor drew it, and which the phone's queue rows carry."""
+    return row_version_of(_review_stored(i), _REVIEW_VERSION_FIELDS)
+
+
+def _review_row(i: Any, now: datetime) -> RowIn:
+    """One queue row, versioned over :func:`_review_stored`."""
+    from levain.coordinator import review
+
+    label = review.FEED_LABELS.get(i.feed, i.feed)
+    mine = " · yours to clear" if i.authority_relevant else ""
+    body = review.body_fields(i)
+    text = str(body.get("text") or body.get("summary") or body.get("reason") or "").strip()
+    if i.state == "cleared" and i.last is not None:
+        head = f"{label} · cleared {_age(i.last[3], now)}{mine}"
+    else:
+        head = f"{label} · {_age(i.at, now)}{mine}"
+    drawn = _row(REVIEW_ROW_PREFIX + i.item_id, head, text or f"{i.feed} item {i.item_id}")
+    return RowIn(id=drawn.id, title=drawn.title, body=drawn.body,
+                 facets={"review_state": i.state, "review_authority": bool(i.authority_relevant)},
+                 stored=_review_stored(i))
+
+
 def _review_rows(store: Any, now: datetime) -> tuple[tuple[RowIn, ...], str]:
     from levain.autonomic.durable_sqlite import read_transaction
     from levain.coordinator import review
@@ -88,16 +133,31 @@ def _review_rows(store: Any, now: datetime) -> tuple[tuple[RowIn, ...], str]:
     qdir = Path(store.directory)
     with read_transaction(store.open_readonly) as conn:     # one snapshot for the queue, what waits and the last pass
         items = review.list_items(store, conn=conn)
+        # one past what is shown: whether older clears exist, said in the note (they reopen from the laptop)
+        cleared = review.queue_page(conn, open_limit=0, cleared_limit=CLEARED_SHOWN + 1).cleared
         waiting = review.waiting_on_you(store, sign_open=review.queue_request_open(qdir),
                                         answer_open=review.question_open(qdir), conn=conn)
         ran_at = review.last_pass(conn)
-    rows = []
-    for i in reversed(items):        # newest first: list_items is oldest first
-        label = review.FEED_LABELS.get(i.feed, i.feed)
-        mine = " · yours to clear" if i.authority_relevant else ""
-        text = str(i.body.get("text") or i.body.get("summary") or i.body.get("reason") or "").strip()
-        rows.append(_row(i.item_id, f"{label} · {_age(i.at, now)}{mine}", text or f"{i.feed} item {i.item_id}"))
-    return tuple(rows), _waiting_line(waiting, ran_at)
+    older = len(cleared) > CLEARED_SHOWN
+    # newest first (list_items is oldest first), then the newest clears
+    rows = [_review_row(i, now) for i in reversed(items)] + [_review_row(i, now) for i in cleared[:CLEARED_SHOWN]]
+    note = _waiting_line(waiting, ran_at)
+    if older:
+        note += f" · Cleared shows the {CLEARED_SHOWN} newest clears; older ones: levain coord review list --all"
+    return tuple(rows), note
+
+
+def _review_one(store: Any, row_id: str, now: datetime) -> RowIn | None:
+    """The row ``row_id`` read from the store, for a verb's write (open or cleared, listed or not), or None."""
+    from levain.autonomic.durable_sqlite import read_transaction
+    from levain.coordinator import review
+
+    if not row_id.startswith(REVIEW_ROW_PREFIX):
+        return None
+    item_id = row_id[len(REVIEW_ROW_PREFIX):]
+    with read_transaction(store.open_readonly) as conn:
+        found = [i for i in review.list_items(store, include_cleared=True, conn=conn) if i.item_id == item_id]
+    return _review_row(found[0], now) if found else None
 
 
 def _morning_rows(c: dict[str, Any]) -> tuple[RowIn, ...]:
@@ -201,6 +261,11 @@ def coordinator_discoverer(directory: Callable[[], Path | str | None], *,
                 return Read(rows=(_unreadable(e),))
             return Read(rows=rows, note=note)
 
+        def review_read_one(ctx: ReadContext, row_id: str) -> Result:
+            store = _store_at(directory)
+            row = None if store is None else _review_one(store, row_id, now_fn())
+            return Absent("no such review item") if row is None else Read(rows=(row,))
+
         def morning_read(ctx: ReadContext) -> Result:
             try:
                 store = _store_at(directory)
@@ -216,6 +281,8 @@ def coordinator_discoverer(directory: Callable[[], Path | str | None], *,
                          rank=21, order="legacy.source", version_fields=("*",), size="medium", span=1,
                          empty="Nothing waits after the night."),
             ProviderSpec(REVIEW_ID, "list", "Review queue", "gate", review_read, region="operate", rank=22,
-                         order="legacy.source", version_fields=("*",), size="medium", span=1, empty="Nothing waits in the review queue."),
+                         order="decision.review", version_fields=_REVIEW_VERSION_FIELDS, size="medium", span=1,
+                         empty="Nothing waits in the review queue.", facets=REVIEW_FACETS, read_one=review_read_one,
+                         verbs=REVIEW_VERBS),
         ]
     return discover

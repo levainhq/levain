@@ -131,6 +131,9 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "note_open_total": ("int", _is_int),   # how many notes are open in all (a listing shows a page of them)
     # DESIGN_SIGN D5: a question or note a caller filed a levain sign request for; an id, never the request's words
     "sign": ("object {request: id}", _is_sign_facet),
+    # a coordinator review queue row (levain.cockpit.coordinator_panels): its state and whether it is "yours to clear"
+    "review_state": ("enum", _enum("open", "cleared")),
+    "review_authority": ("bool", _is_bool),
     "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what the Build tab's session row draws (the provider's own measures, no full cwd)
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
 }
@@ -398,6 +401,14 @@ def _session_key(row: RowIn, today: date) -> tuple:
 register_ordering(
     Ordering("session.recency", _session_key, _session_group,
              (("active", "Active"), ("quiet", "Quiet")), uncounted=frozenset({"quiet"})),
+    builtin=True,
+)
+# the coordinator review queue (levain.cockpit.coordinator_panels): the source's order (open newest first, then the
+# newest clears), grouped by state; only the open items count, so a cleared one listed for its Reopen is not a figure
+register_ordering(
+    Ordering("decision.review", lambda row, today: (),
+             lambda row, today: "cleared" if row.facets.get("review_state") == "cleared" else "open",
+             (("open", "Open"), ("cleared", "Cleared")), uncounted=frozenset({"cleared"})),
     builtin=True,
 )
 # rows a migrated source already ordered (an external panel, design §6.2): one constant key, and the stable

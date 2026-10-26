@@ -241,8 +241,9 @@ _SIGN_ACTIONS = ("challenge", "answer", "deny")
 # POST /cockpit/sign/compose (DESIGN_SIGN D5, the compose contract): {verb, params, client_txn} -> {request}, the caller's
 # compose_signer filing a sign request for a signed verb's params (one per draft while it is open); the page then runs the
 # ceremony on that id. Which request each draft filed is recorded durably beside the Signer's requests
-# (levain.consent.sign.bind_compose), the record the kernel's sign check reads. Served only when make_server was given a
-# compose_signer (and a signer to run the ceremony): without one it is 404.
+# (levain.consent.sign.bind_compose), the record the kernel's sign check reads. Served beside a signer (the
+# ceremony): levain files the request for its own kernel signed verbs (verbs.KERNEL_COMPOSERS, c4-mut R1), the caller's
+# compose_signer for every other; without a signer it is 404.
 _SIGN_COMPOSE = "/cockpit/sign/compose"
 _COMPOSE_WAIT_S = 30.0        # how long a second compose of one draft waits for the first's compose_signer call
 # GET /cockpit/sign/<id>.json: ONE request's listing row, behind the listing's gate, so a page never reads "no longer
@@ -1427,7 +1428,8 @@ class _Handler(GuardedHandler):
         caller's ``compose_signer`` files a sign request for a SIGNED verb's params and names it; the page runs the
         ceremony on that id and only then posts the verb with ``sign_request``. The verb must be one this server serves
         with ``sign`` set, and the params its fields; a ``ValueError`` from the compose_signer is a 400 carrying its
-        words (the reason the operator reads). The kernel files nothing itself and signs nothing.
+        words (the reason the operator reads). A KERNEL signed verb's request is filed by levain's own composer
+        (``levain.cockpit.verbs.KERNEL_COMPOSERS``) ahead of the compose_signer; the kernel signs nothing.
 
         ``client_txn`` is the draft's one identity (the page mints it when the signed draft is first sent and keeps it
         with the draft): the same ``(verb, client_txn)`` names the SAME request while that request is open, so a lost
@@ -1441,11 +1443,13 @@ class _Handler(GuardedHandler):
         outside the server's lock. A draft with no live binding while ``COMPOSE_LIVE_MAX`` bindings are live is
         refused 429 ``too_many_open`` before anything is filed (``levain.consent.sign.draft_bindings``); a draft
         already bound is answered whatever the count."""
-        from levain.consent.sign import SignRefused, bind_compose, draft_bindings, error_word, request_id_ok
-        from levain.cockpit.verbs import SIGN_PARAM
+        from levain.consent.sign import SignRefused, bind_compose, draft_bindings, error_word, request_id_ok, sign_dir
+        from levain.cockpit.verbs import KERNEL_COMPOSERS, SIGN_PARAM
 
-        compose = self.server.compose_signer
-        if compose is None:     # the route is not served without one; an explicit check survives `python -O`
+        if self.server.signer is None or (self.server.compose_signer is None and not (
+                isinstance(req, dict) and isinstance(req.get("verb"), str) and req["verb"] in KERNEL_COMPOSERS)):
+            # no Signer: the route is not served (an explicit check survives `python -O`); no compose_signer: it files
+            # only levain's own kernel requests, and is the 404 it always was for anything else
             return {"error": "not_found", "message": "no such route"}, 404
         if not isinstance(req, dict) or set(req) != {"verb", "params", "client_txn"}:
             return {"error": "bad_request", "message": "request keys must be ['client_txn', 'params', 'verb']"}, 400
@@ -1457,6 +1461,21 @@ class _Handler(GuardedHandler):
             return {"error": "unknown_verb", "message": f"no such verb: {str(name)[:80]!r}"}, 404
         if not spec.sign:
             return {"error": "not_signed", "message": f"{spec.name!r} is not a signed verb: it is sent as it is"}, 400
+        # c4-mut R1: a KERNEL signed verb's request is levain's own to file (its namespace no caller may name); every
+        # other signed verb's is the caller's compose_signer's, and without one this route files nothing for it
+        kernel = KERNEL_COMPOSERS.get(spec.name) if not self.server.verb_registry.is_downstream(spec.name) else None
+        compose: "Callable[[str, dict[str, Any]], str] | None" = self.server.compose_signer
+        if kernel is not None:
+            cockpit, own = self._cockpit(), self.server.signer
+            compose = lambda _verb, p: kernel(p, cockpit, own)   # noqa: E731
+            try:
+                # levain's own request may be the first this queue ever holds: the bindings' lock lives in its directory
+                sign_dir(own.queue_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
+            except OSError as exc:
+                return {"error": "unavailable", "message": f"the sign directory cannot be made ({exc}): nothing was "
+                        "filed; send again"}, 503
+        if compose is None:
+            return {"error": "not_found", "message": f"this cockpit files no sign request for {spec.name!r}"}, 404
         if not isinstance(params, dict):
             return {"error": "bad_request", "message": "'params' must be a JSON object"}, 400
         bad = sorted(set(params) - set(spec.fields)) if spec.fields is not None else []
@@ -2193,7 +2212,9 @@ class _Handler(GuardedHandler):
         # gesture is the operator's passkey, and the page that carries it must be this cockpit's own.
         sign = _sign_route(route) if self.server.signer is not None else None
         # the compose route (DESIGN_SIGN D5) rides exactly that gate: it files a request the operator's passkey then signs
-        compose = route == _SIGN_COMPOSE and self.server.compose_signer is not None
+        # (served beside a Signer, where levain files the request for its own kernel signed verbs (c4-mut R1), or a
+        # compose_signer)
+        compose = route == _SIGN_COMPOSE and (self.server.signer is not None or self.server.compose_signer is not None)
         # and the grants' passkey revoke (PLAN M17 "9a"): the same ceremony class, the same gate
         grant = grant_route(route, _GRANT_PREFIX) if self.server.grant_phone is not None else None
         if (sign is not None or compose or grant is not None) and not self._off_box_token_valid():
@@ -2301,7 +2322,7 @@ class _Handler(GuardedHandler):
                         credential=self._credential(), install_class=self._install_class(),
                         route={"/edit": "edit", "/action": "action"}.get(route, "cockpit"),
                         job_runtime=self.server.job_runtime, broker=self.server.broker,
-                        signed_for=self._signed_for)
+                        signed_for=self._signed_for, signer=self.server.signer)
             except EditError as exc:
                 self._send_json({**exc.extra, "error": exc.code, "message": str(exc)}, exc.http_status)
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
@@ -2534,8 +2555,8 @@ def make_server(
     ceremony on it, and only after a signed result posts the verb with the params plus ``sign_request: <id>``. The
     kernel, not the callable, keeps a draft to one request: the same ``(verb, client_txn)`` returns the request it
     filed while that request is open, without calling the callable again. A ``ValueError`` it raises is a 400
-    carrying its words. It needs a ``signer`` (else ``ValueError``); without it the route is 404 and the page sends
-    no signed verb at all."""
+    carrying its words. It needs a ``signer`` (else ``ValueError``); without it the route files a request only for a
+    kernel signed verb (levain's own composer, ``levain.cockpit.verbs.KERNEL_COMPOSERS``) and is 404 for every other."""
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)

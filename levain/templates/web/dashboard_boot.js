@@ -659,6 +659,17 @@
     return postVerb(action, {}, {});
   }
 
+  // clear or reopen a coordinator review item: the row's own offered review_clear / review_reopen (C1, no confirm, no
+  // params). The kernel refuses it on a shared surface token (a paired device only) and 409s a row that changed. The
+  // signed clear (review_clear_signed) carries {item, sign_request} and its draft's `signTxn`, which keys the send
+  async function reviewItem(rowId, verb, params, signTxn) {
+    if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
+    const row = live.rows[rowId];
+    const action = row && Array.isArray(row.actions) ? row.actions.find((a) => a && a.verb === verb) : null;
+    if (!action) return { ok: false, error: "not_offered", message: "the cockpit no longer offers that here; nothing was sent" };
+    return postVerb(action, params || {}, signTxn ? { signTxn: signTxn } : {});
+  }
+
   // Draw what the last write said on its row (or in the status line when the row is gone). The status
   // line carries it either way.
   function showNotice() {
@@ -764,7 +775,7 @@
         if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
         window.LevainDashboard.render(mview, mview.writable
-          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, dismissNote, onJobsIdle, recall } : { recall });
+          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;

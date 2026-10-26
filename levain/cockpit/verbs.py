@@ -418,6 +418,185 @@ def _note_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, An
     return {"dismissed": n}
 
 
+# a coordinator review queue row (levain.cockpit.coordinator_panels): clear on an open item that is not "yours to clear",
+# reopen on a cleared one
+_REVIEW_PREFIX = "review:"
+_CLEARABLE_REVIEW_ROW = lambda r: (str(r.get("id", "")).startswith(_REVIEW_PREFIX)   # noqa: E731
+                                   and _facet(r, "review_state") == "open" and _facet(r, "review_authority") is False)
+_REOPENABLE_REVIEW_ROW = lambda r: (str(r.get("id", "")).startswith(_REVIEW_PREFIX)   # noqa: E731
+                                    and _facet(r, "review_state") == "cleared")
+# an open "yours to clear" item: cleared only on the operator's passkey signature (review_clear_signed)
+_SIGNABLE_REVIEW_ROW = lambda r: (str(r.get("id", "")).startswith(_REVIEW_PREFIX)   # noqa: E731
+                                  and _facet(r, "review_state") == "open" and _facet(r, "review_authority") is True)
+DEVICE_REQUIRED = ("a review item is cleared or reopened from a paired device: this page carries the shared surface "
+                   "token, which does not name who holds it (pair this browser: 'Pair a device' on the Paired devices "
+                   "card, then open its link here)")
+# a dispatch's ``paired``: the transport's own answer to "is the device this request came from still paired?", True or
+# False, re-asked at the write; it raises EditError (503) when the paired-device store cannot be read now
+Paired = Callable[[], bool]
+
+
+def _broker_paired(credential: dict[str, Any], broker: "Broker | None") -> "Paired | None":
+    """The cockpit's ``paired`` for a credential the server resolved to a paired device (``paired-<id>``): that device
+    looked up in the broker's journal, the paired-device store, each time it is asked. None for any other credential, or
+    with no broker (no paired device can exist without one)."""
+    from levain.cockpit.firejournal import PAIRED_PREFIX
+
+    name = str(credential.get("name") or "")
+    if credential.get("class") != "token" or not name.startswith(PAIRED_PREFIX) or broker is None:
+        return None
+    device = name[len(PAIRED_PREFIX):]
+
+    def live() -> bool:
+        db = broker.active_db()
+        if db is None:
+            raise EditError("source_unavailable", 503, "the paired-device store cannot be read now (the broker is not "
+                            "active); try again")
+        return db.device_live(device)
+    return live
+
+
+def _review_fire(op: str) -> Callable[..., dict[str, Any]]:
+    """Clear or reopen one review item, mode ``manual``, as the operator (head ruling 1025+25, c4b RULINGS_OBS item 1),
+    for the cockpit and the phone alike (each is a transport into :func:`dispatch`). Only a PAIRED device writes: the
+    transport names it in ``paired`` (the shared surface token has none, since any holder of it could clear as you).
+    Inside the store's write, on the item as it is then, the device is asked again (a revoke that landed since the
+    request was authenticated refuses it) and the item's version is compared with the one the row was drawn at (a
+    clear and reopen behind the actor's back refuses it). The store refuses a "yours to clear" item on this path
+    (``plain_only``): its clear is ruled signed-only. It authorises nothing and tells no agent anything, so it is C1."""
+    def fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
+        from levain.cockpit.coordinator_panels import review_version
+        from levain.cockpit.providers import _dispatch_dir
+        from levain.coordinator import review
+        from levain.coordinator.store import CoordError, CoordStore, StoreAbsent
+
+        if params:
+            raise EditError("bad_request", 400, "a review clear or reopen takes no parameters")
+        paired = target.get("paired")
+        if paired is None:
+            raise EditError("device_required", 403, DEVICE_REQUIRED)
+        row = target["row"]
+        rid = str(row["id"])
+        if not rid.startswith(_REVIEW_PREFIX):
+            raise EditError("bad_request", 400, f"{rid[:60]!r} is not a review queue row")
+        directory = target.get("dispatch_dir") or _dispatch_dir(target.get("consent_reader"))
+        if directory is None:
+            raise EditError("not_built", 501, "this cockpit names no coordinator store")
+        drawn = row["version"]
+
+        def still(item: Any) -> None:
+            if not paired():
+                raise EditError("device_revoked", 403, "this device is no longer paired, so it clears nothing")
+            if review_version(item) != drawn:
+                raise EditError("stale", 409, f"row {rid!r} changed since it was rendered")
+
+        act = review.clear_item if op == "clear" else review.reopen_item
+        try:
+            item = act(CoordStore(Path(directory)), rid[len(_REVIEW_PREFIX):], mode="manual", plain_only=True,
+                       still=still)
+        except (review.CoordNotFound, StoreAbsent) as exc:
+            raise EditError("not_found", 404, str(exc)) from None
+        except CoordError as exc:
+            raise EditError("refused", 409, str(exc)) from None
+        except (OSError, sqlite3.Error) as exc:
+            raise EditError("source_unavailable", 503, f"the coordinator store cannot be written now: {exc}") from None
+        # never a top-level "state": the page reads that key as a write's outcome (dashboard_boot.js resultWords)
+        return {"item": item.item_id, "review_state": item.state}
+    return fire
+
+
+def _refuse_raised_review(verb: VerbSpec, tier: Tier, row: "dict[str, Any] | None") -> None:
+    """A review verb a signed standing policy raised above C1 (head ruling 1025+32, fix r1 item 3): refused here, on
+    every surface, with the paths that do clear it named. Above C1 a verb goes to the broker, and no broker effect
+    applies a review write, so it would only ever be refused there, in words that name no way through."""
+    from levain.cockpit.coordinator_panels import REVIEW_VERBS
+
+    if verb.name not in REVIEW_VERBS:
+        return
+    item = str((row or {}).get("id", ""))[len(_REVIEW_PREFIX):] or "<item>"
+    cmd = "reopen" if verb.name == "review_reopen" else "clear"
+    signed = ("" if verb.name != "review_clear" else
+              "the passkey-signed clear ('clear with passkey', offered on an item that is yours to clear) or ")
+    # the laptop's clear of an item that is yours to clear is a manual one: say so where it stands in for the signed
+    unsigned = " (recorded as a manual clear, unsigned)" if verb.name == "review_clear_signed" else ""
+    raise _refuse("review_raised", 403,
+                  f"{verb.name!r} is {tier} here (a signed standing policy raised it), and a review item is cleared "
+                  f"or reopened from the cockpit only at C1, never as a pending: use {signed}the laptop's own "
+                  f"command, levain coord review {cmd} {item}{unsigned}")
+
+
+def refuse_raised_review(name: str, item_id: str, policy: "TierPolicy") -> None:
+    """The kernel's raised-review refusal (:func:`_refuse_raised_review`, on the tier :meth:`VerbSpec.tier` gives under
+    ``policy``) for a review door outside the kernel: the phone's signed clear, which files its request and clears at
+    the store's door (``levain.phone_server``). :class:`levain.writes.EditError` ``review_raised`` (403) when ``policy``
+    raised kernel verb ``name`` above C1 for the item ``item_id``."""
+    verb = next(v for v in KERNEL_VERBS if v.name == name)
+    row = {"id": _REVIEW_PREFIX + item_id}
+    tier = verb.tier({}, row, "", datetime.now().astimezone().date(), policy=policy)
+    if tier != "C1":
+        _refuse_raised_review(verb, tier, row)
+
+
+def _review_signed_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any],
+                        confirm: bool) -> dict[str, Any]:
+    """Clear one "yours to clear" review item on the operator's passkey signature (c4-mut R3, R4): the kernel already
+    checked that ``sign_request`` names the request a compose filed for exactly ``{item}`` and that it is signed
+    (:func:`_require_sign_request`); the door (:func:`levain.coordinator.review.clear_signed`) verifies the signature
+    itself against the Signer's enrolled passkeys and the item as it is now. Any credential that reached the kernel may
+    send it: the passkey signature names who cleared, which the shared surface token cannot (head ruling obs 2)."""
+    from levain.cockpit.providers import _dispatch_dir
+    from levain.coordinator import review
+    from levain.coordinator.store import CoordError, CoordStore, StoreAbsent
+
+    item_id = str(target["row"]["id"])[len(_REVIEW_PREFIX):]
+    if set(params) != {"item", SIGN_PARAM} or params["item"] != item_id:
+        raise EditError("bad_request", 400, f"a signed clear names its item ({item_id!r}) and its sign request")
+    signer = target.get("signer")
+    directory = target.get("dispatch_dir") or _dispatch_dir(target.get("consent_reader"))
+    if signer is None or directory is None:
+        raise EditError("not_built", 501, "this cockpit runs no passkey ceremony or names no coordinator store")
+    try:
+        item = review.clear_signed(CoordStore(Path(directory)), item_id, queue_dir=signer.queue_dir,
+                                   request_id=params[SIGN_PARAM], keys=signer.keys)
+    except review.SignedClearRefused as exc:
+        raise EditError(exc.error, exc.status, str(exc)) from None
+    except (review.CoordNotFound, StoreAbsent) as exc:
+        raise EditError("not_found", 404, str(exc)) from None
+    except CoordError as exc:
+        raise EditError("refused", 409, str(exc)) from None
+    except (OSError, sqlite3.Error) as exc:
+        raise EditError("source_unavailable", 503, f"the coordinator store cannot be written now: {exc}") from None
+    return {"item": item.item_id, "review_state": item.state, "mode": item.last[1] if item.last else None}
+
+
+def _review_compose(params: dict[str, Any], cockpit: "Cockpit", signer: Any) -> str:
+    """Levain's own composer for ``review_clear_signed`` (c4-mut R1): file the sign request over the item as it is now
+    (:func:`levain.coordinator.review.file_clear_request`) and name it. ``ValueError`` (the compose route's 400) with
+    the words the operator reads when there is nothing to sign."""
+    from levain.cockpit.providers import _dispatch_dir
+    from levain.consent.sign import SignRefused
+    from levain.coordinator import review
+    from levain.coordinator.store import CoordError, CoordStore
+
+    item = params.get("item")
+    if set(params) != {"item"} or not isinstance(item, str):
+        raise ValueError("a signed clear names one review item, as 'item'")
+    directory = _dispatch_dir(getattr(cockpit, "consent_reader", None))
+    if directory is None:
+        raise ValueError("this cockpit names no coordinator store")
+    try:
+        return review.file_clear_request(CoordStore(Path(directory)), item, queue_dir=signer.queue_dir)
+    except (CoordError, SignRefused, OSError, sqlite3.Error) as exc:
+        raise ValueError(f"nothing to sign: {exc}") from None
+
+
+# c4-mut R1: the KERNEL signed verbs levain files its own sign request for, ahead of the embedder's compose_signer
+# (which files a request only for its own downstream verbs): verb -> (params, cockpit, signer) -> the request id
+KERNEL_COMPOSERS: dict[str, Callable[[dict[str, Any], "Cockpit", Any], str]] = {
+    "review_clear_signed": _review_compose,
+}
+
+
 def _question_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
     """Answer one question (Q-2b): the operator's words or option key, recorded once and unsigned, channel
     ``cockpit``, then delivered to the agent's session on a daemon thread (a resume settles in seconds, and a verb
@@ -513,6 +692,13 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("note_dismiss", "dismiss", "marks an agent's note read (it tells the agent nothing and authorises "
              "nothing)", "row", floor="C1", tier_fn=_const("C1"), reversible=False, fire=_note_fire,
              applies_to=_OPEN_NOTE_ROW),
+    VerbSpec("review_clear", "clear", "clears a coordinator review item as you (it authorises nothing)", "row",
+             floor="C1", tier_fn=_const("C1"), fire=_review_fire("clear"), applies_to=_CLEARABLE_REVIEW_ROW),
+    VerbSpec("review_reopen", "reopen", "puts a cleared review item back in the queue", "row", floor="C1",
+             tier_fn=_const("C1"), fire=_review_fire("reopen"), applies_to=_REOPENABLE_REVIEW_ROW),
+    VerbSpec("review_clear_signed", "clear", "clears an item that is yours to clear, on your passkey's signature (it "
+             "authorises nothing)", "row", fields=("item",), floor="C1", tier_fn=_const("C1"), reversible=False,
+             fire=_review_signed_fire, applies_to=_SIGNABLE_REVIEW_ROW, sign=True),
     VerbSpec("operator_state", "set state", "sets your freeform state line", "value",
              fields=("text",), floor="C1", tier_fn=_const("C1"), fire=_operator_state_fire,
              legacy_kind="operator_state"),
@@ -835,19 +1021,25 @@ def dispatch(
     *, registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | None", req: Any,
     credential: dict[str, Any], install_class: str, route: Literal["cockpit", "edit", "action"],
     job_runtime: "JobRuntime | None" = None, broker: "Broker | None" = None, signed_for: "SignedFor | None" = None,
+    signer: Any = None, paired: "Paired | None" = None, dispatch_dir: "Path | None" = None,
 ) -> dict[str, Any]:
+    """``paired``: a transport that authenticated the request as a paired device on its own store (the phone app,
+    for the phone port) names the check here; the cockpit's server passes none and the kernel asks its broker's journal
+    (:func:`_broker_paired`). ``dispatch_dir``: the coordinator store's directory for a cockpit with no consent reader
+    to name it (the phone app's)."""
     # the tier at issue governs, from a FRESH snapshot taken once for this request and bound for its
     # source reads (K2b-3b §0.1, §8d row 6)
     auth = cockpit.authority()
     with bound(auth):
         return _dispatch(registry, cockpit, scope, req, credential, install_class, route, job_runtime, broker, auth,
-                         signed_for)
+                         signed_for, signer, paired, dispatch_dir)
 
 
 def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | None", req: Any,
               credential: dict[str, Any], install_class: str, route: Literal["cockpit", "edit", "action"],
               job_runtime: "JobRuntime | None", broker: "Broker | None", auth: "RequestAuthority",
-              signed_for: "SignedFor | None" = None) -> dict[str, Any]:
+              signed_for: "SignedFor | None" = None, signer: Any = None, paired: "Paired | None" = None,
+              dispatch_dir: "Path | None" = None) -> dict[str, Any]:
     if credential.get("class") not in ("token", "device"):
         raise _refuse("credential_required", 403, "a write needs a credential (the write token)")
     if not isinstance(req, dict):
@@ -933,6 +1125,8 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     tier = verb.tier(params, row, label, today, policy=auth.policy)
     floor = verb.rendered_tier(row, label, today, policy=auth.policy)
     gesture = gesture_for(tier, credential["class"], install_class)
+    if tier != "C1":            # its preview too: no gesture would ever apply it
+        _refuse_raised_review(verb, tier, row)
     # before the key check: a fire previewed at T2 carries a key, so a T2->C1 move must answer as one
     _check_moved(req, tier, gesture)
     # a broker pending's replay is keyed by it (K2b §2), so a T2/T3 takes one on any verb, and so does a device's C1;
@@ -961,7 +1155,16 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         raise _refuse("not_built", 501, f"{verb.name!r} has no handler")
     target: dict[str, Any] = {"panel_id": panel_id, "row_id": req.get("row_id"), "row": row,
                               "source": _SURFACE_SOURCE.get(str(credential.get("name")), "web"),
-                              "questions": cockpit.question_store, "notes": getattr(cockpit, "note_store", None)}
+                              "questions": cockpit.question_store, "notes": getattr(cockpit, "note_store", None),
+                              # whether the request came from a paired device, asked of that device's store (a review
+                              # verb writes only for one), and where the coordinator store is (the directory the review
+                              # panel reads)
+                              "paired": paired if paired is not None else _broker_paired(credential, broker),
+                              "consent_reader": getattr(cockpit, "consent_reader", None),
+                              "dispatch_dir": dispatch_dir,
+                              # the server's Signer (levain.consent.sign): a signed review clear is verified against
+                              # its passkeys; None on a server that runs no passkey ceremony
+                              "signer": signer}
     if verb.binding == "value":
         supplied = req.get("panel_version")
         target["check"] = lambda: _check_value_version(cockpit, panel_id, supplied)

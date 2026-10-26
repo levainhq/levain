@@ -31,8 +31,11 @@ it serves only these:
     ``consent.json`` lists the newest phone drops and their drop receipts as ``coord_drops`` and the store identity as
     ``coord_store_id`` (:mod:`levain.coordinator.phone`). ``GET /coord.json`` (the same token gate) lists the
     coordinator's review queue as ``coord_review`` and its morning card as ``coord_morning`` (each with a ``*_note``
-    when it cannot be read); the page asks for it only while its Review tab is shown. A read-only view, no route here
-    clears or reopens an item.
+    when it cannot be read); the page asks for it only while its Review tab is shown. ``POST
+    /coord/review/<item>/clear`` and ``/reopen`` (a paired device's token only) clear or reopen a plain item as you; a
+    "yours to clear" item is cleared only on a passkey signature: ``POST /coord/review/<item>/sign-request`` files
+    levain's own sign request over it, the page signs it on ``/sign/<id>/challenge`` and ``answer``, then sends
+    ``/coord/review/<item>/clear`` with ``{sign_request}`` (:func:`levain.coordinator.review.clear_signed`).
   - ``POST /grant/<id>/revoke-challenge`` and ``.../revoke``: a consent grant revoked with a passkey made on the
     https name (the one authority link a passkey may sign), the challenge naming the grant's ``instance`` as listed,
     the link built and held here and verified by the authority log itself;
@@ -109,6 +112,11 @@ _SIGN_STATE = re.compile(r"/sign/([A-Za-z0-9_-]{8,64})/state")    # GET: where a
 _DISPATCH_ROUTE = re.compile(
     r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel|authorise-challenge|authorise)")
 _COORD_ROUTE = re.compile(r"/coord/(drop|envelope-review|envelope-challenge)")
+# a coordinator review item cleared or reopened as you, mode manual: a paired device only (head ruling 1025+25), never a
+# "yours to clear" item (the store refuses it on this path: its clear is ruled signed-only). The cockpit's verb kernel
+# decides a plain clear or reopen, through the phone app (_PhoneServer.coord_review is only its transport); a "yours to
+# clear" item's signed clear is decided at the store's door on the passkey signature
+_COORD_REVIEW_ROUTE = re.compile(r"/coord/review/(rv-[0-9a-f]{32})/(clear|reopen|sign-request)")
 _GRANT_PREFIX = "/grant/"
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
@@ -405,9 +413,10 @@ class _PhoneHandler(GuardedHandler):
         note = _NOTE_ROUTE.fullmatch(route)
         dispatch = _DISPATCH_ROUTE.fullmatch(route)
         coord = _COORD_ROUTE.fullmatch(route)
+        coord_review = _COORD_REVIEW_ROUTE.fullmatch(route)
         grant = _grant_route(route)
         if (consent is None and sign is None and question is None and note is None and dispatch is None
-                and coord is None and grant is None and route != _KEY_LINE):
+                and coord is None and coord_review is None and grant is None and route != _KEY_LINE):
             if not self._app_post(route):
                 self._reject(404, "not_found", "no such route")
             return
@@ -424,6 +433,10 @@ class _PhoneHandler(GuardedHandler):
             # the coordinator store takes drops from a paired device only, never this run's transient phone token
             self._reject(403, "device_required", "a drop is sent from a paired device; this run's phone link opens "
                                                  "the queue only")
+            return
+        if coord_review is not None and cred[0] != "device":
+            self._reject(403, "device_required", "a review item is cleared from a paired device; this run's phone "
+                                                 "link opens the queue only")
             return
         if self._refuse_non_json():
             return
@@ -442,7 +455,9 @@ class _PhoneHandler(GuardedHandler):
                  or (dispatch is not None and dispatch.group(2) in ("answer", "cancel", "authorise"))
                  # a drop waits too: the outbox resends it anyway, but one carrying a signed envelope holds a ceremony
                  or (coord is not None and coord.group(1) == "drop")
-                 or (grant is not None and grant[1] == "revoke"))
+                 or (grant is not None and grant[1] == "revoke")
+                 # a signed review clear carries a signature too
+                 or (coord_review is not None and isinstance(req, dict) and "sign_request" in req))
         if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
             return
@@ -455,6 +470,8 @@ class _PhoneHandler(GuardedHandler):
                 result = self.server.dispatch_step(dispatch.group(1), dispatch.group(2), req)
             elif coord is not None:
                 result = self.server.coord_step(coord.group(1), req, device=cred[1])
+            elif coord_review is not None:
+                result = self.server.coord_review(coord_review.group(1), coord_review.group(2), req, device=cred[1])
             elif grant is not None:
                 result = self.server.grant_step(grant[0], grant[1], req)
             elif question is not None and question.group(2) == "rule":
@@ -530,20 +547,46 @@ class _PhoneServer(ThreadingHTTPServer):
 
         with self._app_lock:
             if self._phone_app is None:
-                self._phone_app = PhoneApp(self.queue_dir)
+                self._phone_app = PhoneApp(self.queue_dir, dispatch_dir=self.dispatch_dir)
             return self._phone_app
+
+    def _push(self) -> Any:
+        from levain.webpush.store import PushStore
+
+        with self._app_lock:
+            if self._push_store is None:
+                self._push_store = PushStore(self.queue_dir)
+            return self._push_store
+
+    def device_live(self, device_id: str) -> bool:
+        """Whether ``device_id`` is still a paired, unrevoked device: asked again at a review write, inside the
+        coordinator store's write transaction (a revoke that landed after the request's token was checked refuses the
+        write). A store that cannot be read raises :class:`levain.writes.EditError` (503)."""
+        from levain.webpush import devices
+        from levain.writes import EditError
+
+        store = self._push()
+        try:
+            try:
+                store.path.lstat()
+            except FileNotFoundError:
+                return False
+            conn = store.connection()
+            try:
+                return any(d["id"] == device_id and d["revoked_at"] is None for d in devices.list_devices(conn))
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 - every store fault is the same answer: not known now
+            raise EditError("source_unavailable", 503, f"the paired-device store cannot be read now "
+                            f"({type(exc).__name__}); try again") from None
 
     def device_for(self, token: str) -> "str | None":
         """The paired device a token belongs to, or None for a token no live device holds. No push store yet means no
         device was ever paired, and none is created here. A store that cannot be read raises :class:`PhoneError`
         (503), so a paired phone hears "try again", never "unpaired"."""
         from levain.webpush import devices
-        from levain.webpush.store import PushStore
 
-        with self._app_lock:
-            if self._push_store is None:
-                self._push_store = PushStore(self.queue_dir)
-            store = self._push_store
+        store = self._push()
         try:
             try:
                 store.path.lstat()
@@ -903,6 +946,101 @@ class _PhoneServer(ThreadingHTTPServer):
             return self.coord.step(action, req, device=device)
         except CoordRefused as exc:
             raise PhoneError(exc.status, exc.error, exc.message) from None
+
+    def coord_review(self, item_id: str, action: str, req: Any, *, device: "str | None") -> dict[str, Any]:
+        """``/coord/review/<item_id>/(clear|reopen|sign-request)`` for the paired ``device``.
+
+        A plain clear or reopen (body ``{"version": ...}``, the version the Review tab drew) is only a transport into
+        the phone app's one kernel write (:meth:`levain.phone_app.PhoneApp.fire`, the verbs ``review_clear`` /
+        ``review_reopen``), which reads the row, compares its version, tiers the verb under the install's signed
+        standing policy and fires only a direct gesture; the device is asked again inside the store's write
+        (:meth:`device_live`). A "yours to clear" item is never cleared there: the kernel offers no plain Clear on
+        its row, and the store refuses one (``plain_only``).
+
+        ``sign-request`` (``{}``) files levain's own sign request for the signed clear of a "yours to clear" item
+        (:func:`levain.coordinator.review.file_clear_request`; the open one over the item as it is now, while half its
+        time is left, is answered again instead of a second filed) and answers its listing row and the passkeys that may
+        sign it; ``clear`` with ``{"sign_request": ...}`` clears it on that signature, verified at the store's door
+        against the passkeys this port signs with (:func:`levain.coordinator.review.clear_signed`, mode ``signed``).
+        Before either, the verb ``review_clear_signed`` is tiered under the signed standing policy of the cockpit those
+        passkeys are enrolled in, and refused as the cockpit's kernel refuses it when a policy raised it above C1
+        (:func:`levain.cockpit.verbs.refuse_raised_review`); a request is filed only while a passkey is enrolled to sign
+        it, and a missing, closed or plain item is its own 404 / 409 before that. A directory holding no coordinator
+        store is 404, and nothing is made; a store or sign directory that cannot be read or written now is 503."""
+        from levain.authority import AuthorityError, VerifierUnavailable
+        from levain.cockpit.coordinator_panels import REVIEW_ID, REVIEW_ROW_PREFIX
+        from levain.cockpit.verbs import refuse_raised_review
+        from levain.consent.answering import passkey_keys
+        from levain.consent.sign import SignRefused, error_word, sign_root
+        from levain.coordinator import review
+        from levain.coordinator.store import CoordError, CoordStore, StoreAbsent
+        from levain.phone_app import PhoneAppError
+        from levain.writes import EditError
+
+        if device is None:
+            raise PhoneError(403, "device_required", "a review item is cleared from a paired device")
+        plain = action in ("clear", "reopen") and isinstance(req, dict) and set(req) == {"version"} \
+            and isinstance(req["version"], str)
+        signed = action == "clear" and isinstance(req, dict) and set(req) == {"sign_request"}
+        filing = action == "sign-request" and req == {}
+        if not (plain or signed or filing):
+            raise PhoneError(400, "bad_request", "a review clear or reopen carries only the row's 'version' (the one "
+                                                 "the queue showed); a signed clear only 'sign_request'; a "
+                                                 "sign-request nothing")
+        if plain:
+            body = {"verb": "review_clear" if action == "clear" else "review_reopen", "panel_id": REVIEW_ID,
+                    "row_id": REVIEW_ROW_PREFIX + item_id, "row_version": req["version"], "params": {}}
+            try:
+                out = self.phone_app().fire(body, paired=lambda: self.device_live(device))
+            except PhoneAppError as exc:
+                if exc.error == "not_offered":         # the panel is drawn only while the coordinator's tables exist
+                    raise PhoneError(404, "not_found", "there is no coordinator review queue here") from None
+                raise PhoneError(exc.status, exc.error, str(exc)) from None
+            return {"item_id": out["item"], "state": out["review_state"], "mode": "manual"}
+        # one snapshot of the signing cockpit's authority log: the standing policy the verb is tiered under, and the
+        # passkeys enrolled there (the door re-reads its keys inside the clear)
+        try:
+            snap = self._source(sign_root(self.queue_dir))()
+        except SignRefused as exc:
+            raise PhoneError(exc.status, error_word(exc.status), str(exc)) from None
+        except (AuthorityError, VerifierUnavailable, OSError, sqlite3.Error) as exc:
+            raise PhoneError(503, "unavailable", f"the cockpit's passkeys and standing policy cannot be read now "
+                                                 f"({exc}): nothing was filed or cleared") from None
+        try:
+            refuse_raised_review("review_clear_signed", item_id, snap.policy)
+        except EditError as exc:
+            raise PhoneError(exc.http_status, exc.code, str(exc)) from None
+        store = CoordStore(self.coord.dispatch_dir)
+        try:
+            if filing:
+                signers = [k.fingerprint for k in passkey_keys(snap, self.rp_id)]
+                if not signers:
+                    # the item's own refusal (404 / 409) outranks "enrol a passkey"; the filing below validates again
+                    item = review.get_item(store, item_id)
+                    if item.state != "open":
+                        raise CoordError(f"item {item_id} is already {item.state}")
+                    if not item.authority_relevant:
+                        raise CoordError(f"item {item_id} is not yours to clear: it is cleared as it is, with no "
+                                         "signature")
+                    raise PhoneError(422, "no_passkey", f"no passkey is enrolled for {self.rp_id} to sign the clear of "
+                                                        f"item {item_id}: enrol one first; nothing was filed")
+                # levain's own request over the item as it is now; the page signs it on /sign/<id>/ and then clears
+                rid = review.file_clear_request(store, item_id, queue_dir=self.queue_dir, reuse=True)
+                return {"request": self.signer.row(rid, signers), "signers": signers}
+            item = review.clear_signed(store, item_id, queue_dir=self.queue_dir, request_id=req["sign_request"],
+                                       keys=self._sign_keys)
+        except review.SignedClearRefused as exc:
+            raise PhoneError(exc.status, exc.error, str(exc)) from None
+        except (review.CoordNotFound, StoreAbsent, FileNotFoundError) as exc:
+            raise PhoneError(404, "not_found", str(exc) or "there is no coordinator review queue here") from None
+        except SignRefused as exc:
+            raise PhoneError(exc.status, error_word(exc.status), str(exc)) from None
+        except (CoordError, ValueError) as exc:
+            raise PhoneError(409, "refused", str(exc)) from None
+        except (OSError, sqlite3.Error) as exc:
+            raise PhoneError(503, "source_unavailable", f"the coordinator store cannot be read or written now: {exc}"
+                             ) from None
+        return {"item_id": item.item_id, "state": item.state, "mode": item.last[1] if item.last else None}
 
     def _enrolled(self, memo: "dict[Path, list[str] | str]") -> list[str]:
         """The passkey keys enrolled on this name in every cockpit a consent hook names (what the page's enrol

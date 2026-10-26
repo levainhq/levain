@@ -97,6 +97,11 @@
    "namespace": "levain-allowed-signers",
    "status": "reserved",
    "owner": "levain/qbroker/signers.py"
+  },
+  {
+   "namespace": "levain-review-clear",
+   "status": "shipped",
+   "owner": "levain/coordinator/review.py"
   }
  ],
  "families": [

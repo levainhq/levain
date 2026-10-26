@@ -49,11 +49,15 @@ def test_the_queue_lists_open_items_newest_first_with_feed_label_age_and_who_cle
     ck = _cockpit(d)
     assert REVIEW_ID in _ids(ck)
     panel = ck.panel(REVIEW_ID)
-    assert [r["id"] for r in panel["rows"]][0] == mine.item_id            # newest open first; the cleared one is absent
-    assert len(panel["rows"]) == 2 and done.item_id not in [r["id"] for r in panel["rows"]]
+    # newest open first, then the cleared one (listed so it can be reopened)
+    assert [r["id"] for r in panel["rows"]][0] == "review:" + mine.item_id
+    assert [r["id"] for r in panel["rows"]][2] == "review:" + done.item_id and len(panel["rows"]) == 3
     bodies = [r["body"] for r in panel["rows"]]
     assert bodies[0].startswith("Doubt · just now · yours to clear: ") and "the receipt does not match" in bodies[0]
     assert bodies[1].startswith("Seat died · just now: ")
+    assert bodies[2].startswith("Session ended at a limit · cleared just now: ")
+    assert panel["count"] == 2                    # the cleared row is listed for its Reopen, never counted
+    assert [r["facets"]["review_state"] for r in panel["rows"]] == ["open", "open", "cleared"]
     # the delivery pass has not run in this store: an empty "waiting" is not "nothing waits"
     assert panel["note"].startswith("Not known yet: the delivery pass has not run yet")
     assert "Nothing is waiting" not in panel["note"]
@@ -127,9 +131,10 @@ def test_the_morning_card_rows_for_away_undecided_budget_and_waiting(tmp_path: P
     assert rows["error:0"].endswith("undecided: boom")
 
 
-def test_the_served_cockpit_draws_the_panels_by_the_stores_presence_and_offers_no_verb(tmp_path: Path, monkeypatch) -> None:
+def test_the_served_cockpit_draws_the_panels_by_the_stores_presence(tmp_path: Path, monkeypatch) -> None:
     """Through make_server (which attaches the consent reader whose directory the panels read), over the store a
-    LEVAIN_HOME names: absent -> no panel; present -> both, with no verb on either."""
+    LEVAIN_HOME names: absent -> no panel; present -> both. The morning card offers no verb; the queue's row offers
+    review_clear (tests/test_review_clear_paths.py holds who may fire it)."""
     import json
     import urllib.error
     import urllib.request
@@ -156,7 +161,8 @@ def test_the_served_cockpit_draws_the_panels_by_the_stores_presence_and_offers_n
         for pid in (REVIEW_ID, MORNING_ID):
             status, body = get(f"{url}/cockpit/panel/{pid}.json?profile=full")
             assert status == 200 and body["rows"], (pid, status, body)
-            assert not body.get("verbs"), body
+            offered = {a["verb"] for r in body["rows"] for a in r.get("actions") or ()}
+            assert offered == ({"review_clear"} if pid == REVIEW_ID else set()), (pid, offered)
 
 
 def _tree_bytes(d: Path) -> dict[str, bytes]:

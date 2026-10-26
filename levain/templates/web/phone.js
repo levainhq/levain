@@ -170,11 +170,16 @@
   // recomputed. Clear and reopen are not offered here. It is its own read, not /consent.json's: asked for only while the
   // Review tab is shown, and never again while a previous ask is still out, so the 10 s tick cannot stack requests
   let coordAsking = false;
+  // a signed clear's passkey picker is open (reviewSigned): no read redraws the queue under it, so its buttons stay
+  // until one is picked or it is cancelled, and then the queue is read again
+  let reviewPicking = false;
   function loadCoord() {
-    if (!token || coordAsking || !$("review") || $("review").hidden) return;
+    if (!token || coordAsking || reviewPicking || !$("review") || $("review").hidden) return;
     coordAsking = true;
     call("GET", "/coord.json").then((r) => {
-      if ($("review").hidden) return;      // the tab was left while this was out: nothing to draw; showing it again asks again
+      // the tab was left, or a passkey picker opened while this was out: nothing to draw (a picker open is kept as it is);
+      // showing the tab again asks again
+      if ($("review").hidden || reviewPicking) return;
       const bad = r.ok ? "" : why(r);
       drawReview(r.ok ? r.body : { coord_review_note: bad, coord_morning_note: bad });
     }).catch(() => { /* the panel keeps what it showed; while the tab is shown the 10 s tick asks again */ }).finally(() => { coordAsking = false; });
@@ -193,7 +198,118 @@
     if (i.authority_relevant) head.appendChild(el("span", "tier", "yours to clear"));
     card.append(head, el("div", "note-what", typeof i.text === "string" ? i.text : ""));
     if (i.state === "cleared") card.appendChild(el("div", "where", "cleared " + ago(i.cleared_at, now)));
+    // Clear (a plain open item) or Reopen (a cleared one), as you, from this paired phone (the run token's link is told
+    // it opens the queue only). A "yours to clear" item is never cleared on a device token alone: its Clear is signed
+    // with your passkey (reviewSigned), or it is cleared on the laptop
+    const key = "review\u0000" + i.item_id;   // never a consent, question or note id
+    const msg = el("div", "note");
+    const say = (text, kind) => { notes.set(key, [text, kind || ""]); msg.textContent = text; msg.className = "note " + (kind || ""); };
+    if (notes.has(key)) say(notes.get(key)[0], notes.get(key)[1]);
+    if (i.authority_relevant && i.state !== "cleared") {
+      const signed = el("button", "quiet", "Clear with passkey");
+      signed.type = "button";
+      const row = el("div", "actions");
+      signed.addEventListener("click", () => reviewSigned(i, say, signed, row));
+      row.appendChild(signed);
+      card.append(row, el("div", "where", "or on the laptop: levain coord review clear " + i.item_id), msg);
+      return card;
+    }
+    const action = i.state === "cleared" ? "reopen" : "clear";
+    const go = el("button", "quiet", action === "clear" ? "Clear" : "Reopen");
+    go.type = "button";
+    go.addEventListener("click", () => {
+      if (busy) return;
+      busy++;
+      go.disabled = true;
+      // the version this card was drawn at: the server refuses a Clear or Reopen of an item that moved since (409)
+      call("POST", "/coord/review/" + encodeURIComponent(i.item_id) + "/" + action, { version: String(i.version || "") }).then((a) => {
+        if (!a.ok) { go.disabled = false; return say("not " + (action === "clear" ? "cleared" : "reopened") + ": " + why(a), "bad"); }
+        // said on this card only (never kept for the item): the redraw moves it to its new group
+        notes.delete(key);
+        msg.textContent = action === "clear" ? "cleared" : "reopened";
+        msg.className = "note ok";
+      }).catch((e) => { go.disabled = false; say("the page failed (" + ((e && e.name) || "error") + "); try again", "bad"); })
+        .finally(() => { busy--; setTimeout(loadCoord, 300); });
+    });
+    const row = el("div", "actions");
+    row.appendChild(go);
+    card.append(row, msg);
     return card;
+  }
+  // The signed clear of a "yours to clear" item (c4-mut R5): levain files its own sign request over the item as it is now
+  // (POST /coord/review/<id>/sign-request), this phone's passkey signs it on /sign/<id>/challenge and answer, and only a
+  // signed request is sent with the clear. Every step that fails leaves the item open and says why; the next tap files anew.
+  function reviewSigned(i, say, go, actions) {
+    if (busy || reviewPicking) return;     // an open picker belongs to its card until a pick or Cancel
+    busy++;
+    go.disabled = true;
+    let picking = false;
+    const item = encodeURIComponent(i.item_id);
+    const fail = (text) => { go.disabled = false; say(text, "bad"); };
+    const sign = (r, fp, rawId) => {
+      say("asking for the challenge…");
+      return call("POST", "/sign/" + encodeURIComponent(r.id) + "/challenge", { signer_fp: fp, request_sha256: r.sha256 }).then((c) => {
+        if (!c.ok) return fail("not signed: " + why(c));
+        say("confirm with your passkey to sign…");
+        const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+        if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
+        return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+          say("verifying the signature…");
+          return call("POST", "/sign/" + encodeURIComponent(r.id) + "/answer", {
+            authenticator_data: b64u(cred.response.authenticatorData), client_data_json: b64u(cred.response.clientDataJSON),
+            signature: b64u(cred.response.signature) }).then((a) => {
+            if (!a.ok) return fail("not signed: " + why(a));
+            say("signed; clearing…");
+            return call("POST", "/coord/review/" + item + "/clear", { sign_request: r.id }).then((x) => {
+              if (!x.ok) return fail("signed, but not cleared: " + why(x));
+              say("cleared with your passkey", "ok");
+              notes.delete("review\u0000" + i.item_id);   // the card moves to Cleared on the next read
+            });
+          });
+        }, (e) => fail(declined(e, "nothing was signed")));
+      });
+    };
+    say("filing it for your signature…");
+    call("POST", "/coord/review/" + item + "/sign-request", {}).then((f) => {
+      if (!f.ok) return fail("not cleared: " + why(f));
+      const r = f.body.request;
+      const signers = Array.isArray(f.body.signers) ? f.body.signers : [];
+      if (!r || r.refused) return fail("not signable: " + (r && r.refused ? r.refused : "the request is not open"));
+      const local = mine();
+      const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
+      if (known.length === 1) return sign(r, known[0], local[known[0]]);
+      if (!known.length && signers.length === 1) return sign(r, signers[0], null);
+      if (!signers.length) return fail(f.body.note || "no passkey is enrolled for this name");
+      // more than one could sign: the operator picks the one this phone holds, as on a sign card; the card is kept
+      // (no refresh) until a pick or Cancel
+      go.disabled = false;
+      picking = reviewPicking = true;
+      say("more than one passkey is enrolled for this name; pick the one this phone holds:");
+      const closePicker = () => { reviewPicking = false; for (const old of actions.querySelectorAll(".pick")) old.remove(); };
+      for (const fp of known.length ? known : signers) {
+        const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
+        p.type = "button";
+        p.addEventListener("click", () => {
+          if (busy) return;
+          busy++;
+          closePicker();
+          go.disabled = true;
+          sign(r, fp, known.length ? local[fp] : null).catch((e) => fail("the page failed (" + ((e && e.name) || "error") + "); try again"))
+            .finally(() => { busy--; setTimeout(loadCoord, 300); });
+        });
+        actions.appendChild(p);
+      }
+      const cancel = el("button", "quiet pick", "Cancel");
+      cancel.type = "button";
+      cancel.addEventListener("click", () => {
+        if (busy) return;
+        closePicker();
+        say("nothing was signed; the item stays open");
+        setTimeout(loadCoord, 300);
+      });
+      actions.appendChild(cancel);
+    }).catch((e) => fail("the page failed (" + ((e && e.name) || "error") + "); try again"))
+      .finally(() => { busy--; if (!picking) setTimeout(loadCoord, 300); });
   }
   function drawReview(data) {
     if (!$("review-list")) return;
@@ -206,6 +322,8 @@
     $("review-meta").textContent = rn ? "can't read the review queue: " + rn : !rv ? "no coordinator store yet"
       : total ? total + " open" + (total > open.length ? " (" + open.length + " shown)" : "") : "nothing to review";
     $("review-list").replaceChildren(...open.map((i) => reviewCard(i, rv.now)));
+    // a picker this redraw removed cannot be cancelled: its flag goes with it, so a later tap is not refused for good
+    if (!$("review-list").querySelector(".pick")) reviewPicking = false;
     $("review-cleared-meta").textContent = rn ? "can't read" : cleared.length ? "newest first" : "none";
     $("review-cleared").replaceChildren(...cleared.map((i) => reviewCard(i, rv.now)));
     const mc = data.coord_morning && typeof data.coord_morning === "object" ? data.coord_morning : null;

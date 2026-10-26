@@ -1,8 +1,9 @@
 """The phone page's Review tab, in headless Chrome at a phone's width (390), over the real phone server.
 
 The tab shows the coordinator's morning card and its review queue (open items with feed label, title and age, and the
-newest cleared ones), READ-ONLY: the page offers no clear or reopen and sends no POST. A queue that cannot be read says
-so. Screenshots go to ``LEVAIN_SHOT_DIR`` when it is set (the lane's RUN), else the test's tmp dir."""
+newest cleared ones). Its only controls are Clear on a plain open item, Reopen on a cleared one (c4mut: a paired
+phone's write) and Clear with passkey on a "yours to clear" item, which also names the laptop command; drawing the tab sends no POST. A queue that
+cannot be read says so. Screenshots go to ``LEVAIN_SHOT_DIR`` when it is set (the lane's RUN), else the test's tmp dir."""
 from __future__ import annotations
 
 import os
@@ -36,7 +37,7 @@ def _seed(qdir: Path) -> None:
 
 
 @needs_browser
-def test_the_review_tab_shows_the_queue_and_the_card_and_offers_no_write(world, tmp_path: Path) -> None:
+def test_the_review_tab_shows_the_queue_and_the_card_and_only_clear_and_reopen(world, tmp_path: Path) -> None:
     shots = Path(os.environ.get("LEVAIN_SHOT_DIR") or tmp_path)
     _seed(world["qdir"])
     dev = device_token(world["qdir"])
@@ -52,7 +53,7 @@ def test_the_review_tab_shows_the_queue_and_the_card_and_offers_no_write(world, 
             {"eval": "document.getElementById('review-meta').textContent"},
             {"eval": "[...document.querySelectorAll('#review-cleared .review-item')].map(c => c.textContent)"},
             {"eval": "document.getElementById('morning').textContent"},
-            {"eval": "document.querySelectorAll('#review button, #review input, #review textarea').length"},
+            {"eval": "[...document.querySelectorAll('#review button, #review input, #review textarea')].map(b => b.textContent)"},
             {"eval": "document.documentElement.scrollWidth <= window.innerWidth"},
             {"eval": "[...document.querySelectorAll('#tabs button')].map(b => b.textContent + (b.getAttribute('aria-selected') === 'true' ? '*' : ''))"},
             {"eval": "(() => { const d = document.querySelector('#morning details'); const was = d.open; d.open = true; return [was, d.textContent]; })()"},
@@ -66,7 +67,8 @@ def test_the_review_tab_shows_the_queue_and_the_card_and_offers_no_write(world, 
     assert len(cleared) == 1 and "Know" in cleared[0] and "cleared" in cleared[0], cleared
     assert "1 waiting on you" not in morning_text and "0 waiting on you" in morning_text and "(1 unreadable)" in morning_text, morning_text
     assert "2 in the review queue" in morning_text, morning_text
-    assert controls == 0, "the Review tab is read-only: no button, input or textarea"
+    assert controls == ["Clear", "Clear with passkey", "Reopen"], controls    # the yours-to-clear one is signed
+    assert any("or on the laptop" in t and "levain coord review clear" in t for t in queue), queue
     assert fits is True
     assert tabs[-1] == "Review*", tabs
     assert v[11][0] is False and "review queue: 2 open" in v[11][1], v[11]      # the card's own lines, closed until tapped

@@ -325,6 +325,14 @@
                             offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct"),
                             sign: signOf(f) };
         }
+        // a coordinator review item: its state, whether it is "yours to clear", and the one verb the kernel offers on it
+        // here (review_clear on a plain open item, review_reopen on a cleared one), drawn as a button on the row
+        if (head.id === "review-queue" && typeof r.id === "string" && r.id.indexOf("review:") === 0) {
+          const f = r.facets || {};
+          const offer = (Array.isArray(r.actions) ? r.actions : []).find((a) => a && (a.verb === "review_clear" || a.verb === "review_reopen" || a.verb === "review_clear_signed") && a.gesture === "direct");
+          line.review = { id: r.id, item: r.id.slice("review:".length), state: f.review_state === "cleared" ? "cleared" : "open",
+                          mine: f.review_authority === true, verb: offer ? offer.verb : "" };
+        }
         // an agent's note: who filed it, when, and whether it was dismissed; its words are fetched with the page's token
         // (dashboard_core.js noteBody). It carries no answer and no authority: `offered` is only the kernel's dismiss
         if (head.id === "decisions" && typeof r.id === "string" && r.id.indexOf("note:") === 0) {

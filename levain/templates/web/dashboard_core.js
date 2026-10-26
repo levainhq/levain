@@ -98,6 +98,8 @@
   let answerQuestion = null;
   // Dismiss an agent's note (the manifest source only): `dismissNote(rowId) → Promise<{ok}|{ok:false,...}>`. It tells the agent nothing.
   let dismissNote = null;
+  // Clear or reopen a coordinator review item (the manifest source only): `reviewItem(rowId, verb) → Promise<{ok}|{ok:false,...}>`.
+  let reviewItem = null;
   let pollJob = null;
   // The episode-search READ transport (GET /recall.json), injected by the boot layer so the core
   // stays token-agnostic — the boot layer attaches the off-box token (spore-220 gates /recall.json
@@ -259,6 +261,7 @@
     cancelPending = opts && typeof opts.cancelPending === "function" ? opts.cancelPending : null;
     answerQuestion = opts && typeof opts.answerQuestion === "function" ? opts.answerQuestion : null;
     dismissNote = opts && typeof opts.dismissNote === "function" ? opts.dismissNote : null;
+    reviewItem = opts && typeof opts.reviewItem === "function" ? opts.reviewItem : null;
     pollJob = opts && typeof opts.pollJob === "function" ? opts.pollJob : null;
     onJobsIdle = opts && typeof opts.onJobsIdle === "function" ? opts.onJobsIdle : null;
     recall = opts && typeof opts.recall === "function" ? opts.recall : null;
@@ -4015,6 +4018,63 @@
 
   // A waiting pending's cancel: posted with the gesture's intent and no preview. A gesture a browser
   // cannot perform is disabled with the gesture as its title.
+  // A review queue row's one control: Clear on a plain open item, Reopen on a cleared one, posted as the row's own offered
+  // verb. The server takes it only from a paired device's credential and says so on this shared-token page. A "yours to
+  // clear" item is cleared only on your passkey's signature (review_clear_signed): its button files levain's own sign
+  // request (signedCompose), runs the ceremony, and only then posts the verb with `sign_request`; the row also names the
+  // laptop command, which clears it unsigned.
+  function appendReviewVerb(row, rv) {
+    if (rv.mine && rv.state === "open") {
+      // drawn on the row itself, never in the hover-revealed verb group: it is words to read, not a control
+      row.appendChild(el("div", "ext-meta review-mine", (rv.verb === "review_clear_signed" && reviewItem ? "or " : "not cleared here: ")
+        + "on the laptop, levain coord review clear " + rv.item));
+      if (rv.verb === "review_clear_signed" && reviewItem) appendReviewSigned(row, rv);
+      return;
+    }
+    const wrap = el("span", "verb-actions");
+    if (!rv.verb || !reviewItem) return;
+    const clear = rv.verb === "review_clear";
+    const b = verbBtn(clear ? "clear" : "reopen", clear ? "clear this review item as you" : "put it back in the queue", async () => {
+      b.disabled = true;
+      let res;
+      try { res = await reviewItem(rv.id, rv.verb); } catch (e) { res = { ok: false, message: "the " + (clear ? "clear" : "reopen") + " could not be sent" }; }
+      if (res && res.ok) return;   // the board re-reads and the row shows its new state
+      b.disabled = false;
+      verbErr(wrap, res);
+    });
+    wrap.appendChild(b);
+    appendRowVerbs(row, wrap);
+  }
+
+  // The signed clear of a "yours to clear" item: the draft is {item} on the review panel (its one identity, signedCompose),
+  // signed with the passkey, then sent as the row's review_clear_signed with `sign_request` under that draft's key. A send
+  // that landed, or a definite refusal (a 4xx: a signature over an older version, say), forgets the draft, so the next
+  // tap files and signs again; an answer that never came keeps it.
+  function appendReviewSigned(row, rv) {
+    const wrap = el("span", "verb-actions");
+    const msg = el("span", "edit-msg", "");
+    const say = (t, k) => { msg.className = "edit-msg" + (k === "bad" ? " err" : k === "ok" ? "" : " busy"); msg.textContent = t; };
+    const params = { item: rv.item };
+    const b = verbBtn("clear with passkey", "clear this item on your passkey's signature", async () => {
+      b.disabled = true;
+      let res;
+      try {
+        const s = await signedCompose("review_clear_signed", "review-queue", params, say, row);
+        if (!s.ok) { b.disabled = false; return; }
+        say("clearing…");
+        res = await reviewItem(rv.id, "review_clear_signed", Object.assign({}, params, { sign_request: s.request }), s.txn);
+      } catch (e) { res = { ok: false, message: "the clear could not be sent" }; }
+      if ((res && res.ok) || (res && typeof res.status === "number" && res.status >= 400 && res.status < 500)) {
+        signDraftDrop("review_clear_signed", "review-queue", params);
+      }
+      if (res && res.ok) return;   // the board re-reads and the row moves to Cleared
+      b.disabled = false;
+      verbErr(wrap, res);
+    });
+    wrap.append(b, msg);
+    appendRowVerbs(row, wrap);
+  }
+
   function buildPendingCancel(c) {
     const wrap = el("span", "verb-actions");
     const b = verbBtn("cancel", "cancel this waiting request", async () => {
@@ -5956,6 +6016,7 @@
       appendClause(row, o.text != null ? String(o.text) : "");  // per-item expand, like episodes
       if (typeof o.session === "string" && o.session) row.appendChild(sessionTxControl(o.session));
       if (o.cancel && cancelPending) appendRowVerbs(row, buildPendingCancel(o.cancel));
+      if (o.review) appendReviewVerb(row, o.review);
       host.appendChild(row);
     }
     if (slotDue) host.appendChild(standingSlots());

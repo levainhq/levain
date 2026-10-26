@@ -105,14 +105,22 @@ def test_a_queue_or_card_that_cannot_be_read_is_its_own_note_and_never_an_empty_
     assert listed["coord_store_read"] is True and listed["coord_store_id"] == store.store_id()
 
 
-def test_the_phone_port_has_no_review_write() -> None:
-    """No route or step on the phone port clears or reopens: the page is read-only until a verb path exists."""
-    from levain import phone_server
+def test_the_phone_port_writes_the_queue_only_through_its_device_route() -> None:
+    """The one review write on the phone port is ``coord_review`` (a paired device: c4mut,
+    tests/test_review_clear_paths.py), and it is only a transport: the clear and the reopen are the cockpit verb
+    kernel's (``levain.cockpit.verbs``, through ``PhoneApp.fire``: c4mut fix r1 F1). Neither the phone port, the phone
+    app nor the coordinator routes' own module calls the store's transitions."""
+    import inspect
+
+    from levain import phone_app, phone_server
+    from levain.cockpit import verbs
     from levain.coordinator import phone
 
-    for mod in (phone_server, phone):
+    for mod in (phone, phone_server, phone_app):
         src = Path(mod.__file__).read_text(encoding="utf-8")
         assert "clear_item" not in src and "reopen_item" not in src, mod.__name__
+    assert "fire(" in inspect.getsource(phone_server._PhoneServer.coord_review)
+    assert "plain_only=True" in inspect.getsource(verbs._review_fire)
 
 
 # --- L3 r1 fixes (c4c-fix) -----------------------------------------------------------------------------------------

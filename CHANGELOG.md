@@ -24,6 +24,28 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   could not read the queue, and never "Nothing is waiting on you" in those cases; a section the morning card could not
   read says so instead of showing zero. A command too long for a cockpit row is cut with a visible "shortened" mark.
   On a phone other than an iPhone the page says "your screen lock" where it said Face ID.
+- **Clear and reopen a coordinator review item from the cockpit or the phone.** The cockpit's Review queue and the
+  phone's Review tab offer Clear on an open item and Reopen on a cleared one, as you. Only a paired device can do it
+  (the shared page token cannot). The cockpit's queue also lists the ten most recently cleared items, under Cleared, so
+  one can be reopened, and says when older cleared items exist and where to see them; its count is still the open
+  items. A Clear or Reopen of an item that changed after you saw it (or in the same instant), or sent from a device
+  revoked meanwhile, is refused and writes nothing, and neither ever creates a coordinator store. If your signed
+  standing policy raises a review Clear or Reopen above its usual tier, or the authority log cannot be read, the
+  cockpit and the phone refuse it and say how to clear it instead. When the coordinator store cannot be read or written
+  for a moment the phone says "try again later". `levain coord review list` and the phone's queue show an item whose
+  stored details are not in the expected shape, and `levain coord review clear` on a directory with no coordinator
+  store says so and creates nothing.
+- **An item marked "yours to clear" can be cleared with your passkey.** "Clear with passkey" on the cockpit or the
+  phone asks you to sign the item's clear, and only a signature from a passkey enrolled here, over the item as it is
+  now, clears it. One signature clears an item at most once: sent again, it is refused as out of date. The store
+  records it as a signed clear; `levain coord review clear` on the laptop still clears it unsigned, recorded as manual,
+  and is what the cockpit and the phone point to when your signed standing policy raises the passkey Clear above its
+  usual tier (the phone refuses that before asking you to sign). On the phone, a second tap or a retry reuses the open
+  request instead of filing another; with no passkey enrolled it says so and files nothing, and an item that does not
+  exist, is already cleared or needs no signature is named as such instead of asking you to enrol a passkey. Where more
+  than one passkey is enrolled, the picker stays on screen until you pick one or tap Cancel: a queue refresh already
+  under way does not remove it, and Clear with passkey on another card leaves it as it is. Any store fault on a signed
+  clear other than an already-used signature is reported as the store being unavailable.
 - **`levain doctor` reports the brokered-spend install.** New rows: whether the dispatch route trust is pinned (and to
   which key; `trust.pub` is checked with `ssh-keygen` the way Levain verifies a route map, so a damaged key file fails),
   whether the keys service runs (an install with no egress slot says so instead of failing), the spend ledger's size,
@@ -71,6 +93,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   and is plain UTF-8; comments in the file are never taken for keys. Re-enrolling a key under another name, or with
   fewer permissions than its line has, is refused: remove it first. `undo` removes the file too, so a later setup for
   another person starts with no listed keys.
+
+### Changed
+- **A coordinator store made by an earlier version is updated the first time a `levain` command that writes to it
+  opens it:** the review history gains one column, and every entry is kept as it was.
 
 ### Fixed
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is

@@ -281,7 +281,10 @@ class CoordPhone:
     def review_view(self, store: Any, page: Any) -> dict[str, Any]:
         """The review queue as the phone shows it, from ``page`` (one :func:`levain.coordinator.review.queue_page`
         read): ``{"open": [...], "open_total", "cleared": [...], "now"}``, an item
-        ``{item_id, feed, label, authority_relevant, text, at, state, cleared_at}`` with its text display-safe."""
+        ``{item_id, feed, label, authority_relevant, text, at, state, cleared_at, version}`` with its text display-safe.
+        ``version`` is the row version the cockpit's queue panel draws (:func:`levain.cockpit.coordinator_panels.
+        review_version`): a Clear or Reopen sends it back, and the kernel refuses it once the item has moved."""
+        from levain.cockpit.coordinator_panels import review_version
         from levain.cockpit.display_safe import visible
         from levain.cockpit.consent import utc_stamp
         from levain.coordinator import review
@@ -289,8 +292,9 @@ class CoordPhone:
         def row(i: Any) -> dict[str, Any]:
             return {"item_id": i.item_id, "feed": i.feed, "label": review.FEED_LABELS.get(i.feed, i.feed),
                     "authority_relevant": i.authority_relevant,
-                    "text": visible(str(i.body.get("text", ""))[:300]), "at": i.at, "state": i.state,
-                    "cleared_at": i.last[3] if i.state == "cleared" and i.last is not None else None}
+                    "text": visible(str(review.body_fields(i).get("text", ""))[:300]), "at": i.at, "state": i.state,
+                    "cleared_at": i.last[3] if i.state == "cleared" and i.last is not None else None,
+                    "version": review_version(i)}
 
         return {"open": [row(i) for i in page.open], "open_total": page.open_total,
                 "cleared": [row(i) for i in page.cleared], "now": utc_stamp(self._clock())}

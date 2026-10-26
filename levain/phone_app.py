@@ -38,6 +38,7 @@ import os
 import re
 import sqlite3
 import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,9 @@ __all__ = ["PHONE_VERBS", "BOARD_PANELS", "PhoneApp", "PhoneAppError"]
 PHONE_VERBS: dict[str, frozenset[str]] = {
     "tray": frozenset({"spore_descend", "spore_surface_at"}),
     "state": frozenset({"operator_state"}),
+    # the coordinator review queue (c4mut): Clear / Reopen, for a paired device only (the kernel's review verbs refuse
+    # a write with no ``paired`` check); its rows are drawn by the phone's own Review tab (GET /coord.json)
+    "review-queue": frozenset({"review_clear", "review_reopen"}),
 }
 BOARD_PANELS = ("tray", "loops", "keep")          # b1's order: the Tray you act on, then the two you read
 _CREDENTIAL = {"class": "token", "name": "phone", "device_class": None}
@@ -92,10 +96,13 @@ class PhoneApp:
     decision, which runs under the write lock alone so the reads answer while ssh-keygen runs (its retier reads the
     cockpit from that thread, as the laptop's server reads its cockpit from several)."""
 
-    def __init__(self, queue_dir: Path, *, marker_directory: Path | None = None) -> None:
+    def __init__(self, queue_dir: Path, *, marker_directory: Path | None = None,
+                 dispatch_dir: Path | None = None) -> None:
         from levain.authority import ReplayCache
 
         self.queue_dir = Path(queue_dir)
+        # the coordinator store's directory (the phone port's dispatch directory; default the queue's own)
+        self.dispatch_dir = Path(dispatch_dir) if dispatch_dir is not None else self.queue_dir
         self._marker_directory = marker_directory
         self._lock = threading.Lock()
         # the phone's writes take one broker at a time (each holds the data root's write lock while it answers); a
@@ -133,6 +140,10 @@ class PhoneApp:
             self._governed = True       # an unreadable marker is never taken for a reported install
         source = SubstrateSource.local(install)
         cockpit = build_default_cockpit(source)
+        from levain.cockpit.coordinator_panels import coordinator_discoverer
+
+        # the review queue over this port's dispatch directory (this cockpit has no consent reader to name it)
+        cockpit.discover(coordinator_discoverer(lambda: self.dispatch_dir), retire=True)
         registry = VerbRegistry({})
         # no broker here: the class web_server's broker_install_class gives a server without one, so no reported
         # gesture renders that this port would then refuse
@@ -205,9 +216,11 @@ class PhoneApp:
                     "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
 
     # --- the one write path ----------------------------------------------------------------------------------------
-    def fire(self, req: Any) -> dict[str, Any]:
+    def fire(self, req: Any, *, paired: Callable[[], bool] | None = None) -> dict[str, Any]:
         """One verb from the phone: refused unless the panel and verb are on :data:`PHONE_VERBS` and the kernel's dry
-        run says the gesture is direct; then the same request, for real, through the same kernel."""
+        run says the gesture is direct; then the same request, for real, through the same kernel. ``paired`` is the
+        phone port's check that the request came from a still-paired device (``dispatch``'s), for a verb that writes
+        only for one (the review verbs); a run-token request passes none."""
         from levain.cockpit.verbs import dispatch
         from levain.writes import EditError
 
@@ -231,13 +244,13 @@ class PhoneApp:
                                         f"cannot be read now ({auth.authority_error}), so the phone takes no writes; "
                                         "reading still works")
             try:
-                dry = dispatch(registry=registry, cockpit=cockpit, scope=source.write_scope,
-                               req={**body, "dry_run": True}, credential=dict(_CREDENTIAL),
-                               install_class=install_class, route="cockpit")
+                common = {"registry": registry, "cockpit": cockpit, "scope": source.write_scope,
+                          "install_class": install_class, "route": "cockpit", "paired": paired,
+                          "dispatch_dir": self.dispatch_dir}
+                dry = dispatch(req={**body, "dry_run": True}, credential=dict(_CREDENTIAL), **common)
                 if dry.get("gesture") != "direct":
                     raise PhoneAppError(403, "laptop_only", f"{verb!r} here needs the laptop (tier {dry.get('tier')})")
-                return dispatch(registry=registry, cockpit=cockpit, scope=source.write_scope, req=body,
-                                credential=dict(_CREDENTIAL), install_class=install_class, route="cockpit")
+                return dispatch(req=body, credential=dict(_CREDENTIAL), **common)
             except EditError as exc:
                 raise PhoneAppError(exc.http_status, exc.code, str(exc)) from None
 
