@@ -584,14 +584,20 @@ def _probe_one(path: Path, now: float, R: Any, Refused: Any) -> tuple[int, str]:
         if type(rec) is not dict or set(rec) != _PROBE_KEYS or rec["format"] != _PROBE_RECORD_FORMAT \
                 or rec["outcome"] not in _PROBE_OUTCOMES or not all(type(rec[k]) is str for k in _PROBE_KEYS):
             raise ValueError("shape")
+    except (ContractError, ValueError):
+        return 2, "record unreadable (not a levain-probe-result/1 record)"
+    outcome = rec["outcome"]
+    sess, cause = unshowable.mark(rec["session"][:64], allow=""), unshowable.mark(rec["cause"][:96], allow="")
+    try:
         parsed = time.strptime(rec["at"], P.RECORD_AT_FORMAT)
         if time.strftime(P.RECORD_AT_FORMAT, parsed) != rec["at"]:
             raise ValueError("at")
         at = calendar.timegm(parsed)
-    except (ContractError, ValueError, OverflowError):
+    except (ValueError, OverflowError):
+        if outcome == "open":
+            return 3, f"OPEN at its last probe (stamp unreadable): the slot reached a vendor address ({cause}; session {sess})"
         return 2, "record unreadable (not a levain-probe-result/1 record)"
-    age, outcome = now - at, rec["outcome"]
-    sess, cause = unshowable.mark(rec["session"][:64], allow=""), unshowable.mark(rec["cause"][:96], allow="")
+    age = now - at
     future = age < -_PROBE_SKEW_S
     if outcome == "open":
         when = f"stamped in the future ({rec['at']})" if future else f"{_age_text(age)} ago"

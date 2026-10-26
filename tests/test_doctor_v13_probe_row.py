@@ -150,3 +150,16 @@ def test_cause_and_session_are_marked_before_display(tmp_path: Path):
     row = _row(store)
     assert "\x1b" not in row.detail and "\x07" not in row.detail
     assert row.detail.count("U+001B") == 2
+
+
+@pytest.mark.parametrize("at", ["2027-1-15T09:00:00Z", "2027-02-30T00:00:00Z", "not a stamp"])
+def test_an_open_record_with_an_unreadable_stamp_stays_a_failure(tmp_path: Path, at: str):
+    """L3 class (verify r2 M1): open is a failure whatever its stamp says, so a stamp that fails the parse or the
+    round trip is appended to the failure, never a reason to read the record as unreadable at warn."""
+    store = _store(tmp_path, {"e0": "reusable"}, pool=(1, 0))
+    obj = {"format": RECORD_FORMAT, "at": at, "session": SESS, "outcome": "open", "cause": "firewall-open"}
+    (store / "slots" / "e0" / RECORD_NAME).write_bytes(canon.canonical_bytes(obj))
+    row = _row(store)
+    assert not row.ok and not row.warn
+    assert "e0: OPEN at its last probe (stamp unreadable)" in row.detail and SESS in row.detail
+    assert "firewall-open" in row.detail
