@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import io
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -644,6 +645,64 @@ def test_read_next_after_a_null_cursor_does_not_resurrect_an_older_one(cs, world
     svc.ingest(world["launch"], ReadBatch((), None, None, False))     # the vendor's stream reset: no cursor
     svc.read_next(world["launch"])
     assert s.cursors[-1] is None
+
+
+# --- L3 r1 K2: an interrupt pins its session's lifetime; K9: its turn id is checked -----------------------------------
+class Blocking(ScriptedSession):
+    def __init__(self, log, **kw) -> None:
+        super().__init__(**kw)
+        self.log = log
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def interrupt(self, command):
+        self.log.append(("interrupt", "start", self.closed))
+        self.entered.set()
+        assert self.release.wait(5)
+        self.log.append(("interrupt", "end", self.closed))
+        return super().interrupt(command)
+
+    def close(self):
+        self.log.append(("close",))
+        super().close()
+
+
+def test_detach_waits_for_an_interrupt_in_flight_and_refuses_new_ones(cs, world):
+    log: list[tuple] = []
+    s1 = Blocking(log)
+    svc = ready(cs, world, s1)
+    got: dict = {}
+    s2 = Interrupts()
+    a = threading.Thread(target=lambda: got.setdefault("a", svc.interrupt(world["launch"], "t-1")))
+    b = threading.Thread(target=svc.detach, args=(world["launch"],))
+    try:
+        a.start()
+        assert s1.entered.wait(5)
+        b.start()
+        b.join(0.3)
+        assert b.is_alive() and not s1.closed                          # the close waits for the interrupt
+        with pytest.raises(CoordError, match="being detached"):
+            svc.interrupt(world["launch"], "t-1")                      # no new pin on a session being detached
+        with pytest.raises(CoordError, match="detach it first"):
+            svc.attach(world["launch"], s2)                            # nothing replaces it before it is closed
+    finally:
+        s1.release.set()
+        for t in (a, b):
+            if t.ident is not None:
+                t.join(5)
+    assert got["a"].outcome == "confirmed"
+    assert log == [("interrupt", "start", False), ("interrupt", "end", False), ("close",)]
+    svc.attach(world["launch"], s2)
+    assert svc.interrupt(world["launch"], "t-2").outcome == "confirmed"
+    assert [x.turn_id for x in s2.got] == ["t-2"]
+
+
+@pytest.mark.parametrize("turn_id", [7, "", "t" * 513, "t-1\nt-2", b"t-1"])
+def test_interrupt_refuses_a_turn_id_that_is_not_one(cs, world, turn_id):
+    s = Interrupts()
+    svc = ready(cs, world, s)
+    with pytest.raises(CoordError, match="turn id"):
+        svc.interrupt(world["launch"], turn_id)
+    assert s.got == []
 
 
 # --- the released shape (v0.11.25's CHAT_SCHEMA, frozen) -------------------------------------------------------------

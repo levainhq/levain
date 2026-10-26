@@ -1192,13 +1192,20 @@ class ChatService:
     Each launch has one mutex, the service's: a send holds it from its preflight to its outcome (so two sends never
     meet inside one session), a read holds it from its first read of the store to its last write, and attaching or
     detaching a session takes it. No driver method runs inside a write transaction: the session is called first and
-    its answers are carried into short transactions that hold only store work."""
+    its answers are carried into short transactions that hold only store work.
+
+    :meth:`interrupt` takes no launch mutex; it PINS the session it calls instead (``_pins``), and :meth:`detach`
+    refuses new pins (``_detaching``) and waits for the pinned interrupts to return before it closes the session, so
+    an interrupt never reaches a session that was closed or replaced under it."""
 
     def __init__(self, store: ChatStore, *, fault: Callable[[str], None] | None = None) -> None:
         self._chat = store
         self._sessions: dict[str, Any] = {}
         self._locks: dict[str, threading.Lock] = {}
-        self._guard = threading.Lock()                 # held only to read or change the two dicts
+        self._pins: dict[str, int] = {}               # launch -> interrupts in flight on its attached session
+        self._detaching: set[str] = set()             # launches whose session takes no new pin
+        self._guard = threading.Lock()                 # held only to read or change the dicts and the set
+        self._unpinned = threading.Condition(self._guard)
         self._fault_hook = fault
 
     def _launch_lock(self, launch_id: str) -> threading.Lock:
@@ -1223,12 +1230,18 @@ class ChatService:
             raise CoordError(f"launch {str(launch_id)[:40]} already has a driver session; detach it first")
 
     def detach(self, launch_id: str) -> None:
-        """Forget the launch's session and close it, once any send or read of the launch in flight has finished."""
+        """Forget the launch's session and close it, once any send or read of the launch in flight has finished and
+        every interrupt already pinned to it has returned; an interrupt arriving meanwhile is refused."""
         if self._session(launch_id) is None:
             return
         with self._launch_lock(launch_id):
             with self._guard:
-                session = self._sessions.pop(launch_id, None)
+                self._detaching.add(launch_id)
+                try:
+                    self._unpinned.wait_for(lambda: not self._pins.get(launch_id))
+                    session = self._sessions.pop(launch_id, None)
+                finally:
+                    self._detaching.discard(launch_id)
             if session is not None:
                 session.close()
 
@@ -1549,14 +1562,28 @@ class ChatService:
         nothing. This half only calls ``session.interrupt`` with a fresh op_id and returns what the session said;
         it writes nothing (the in-flight approval rows a stop cancels are CH-D1c's). It does not wait on the launch's
         mutex: a stop never queues behind a send in flight. A driver that raises, or returns anything but a
-        :class:`~levain.coordinator.driver.CommandResult`, is ``ambiguous``."""
-        session = self._session(launch_id)
-        if session is None:
-            raise CoordError(f"no driver session is attached to launch {str(launch_id)[:40]}; nothing was sent")
+        :class:`~levain.coordinator.driver.CommandResult`, is ``ambiguous``. The session is pinned for the call:
+        :meth:`detach` neither closes nor replaces it until the call returns, and refuses a new interrupt meanwhile.
+        ``turn_id`` is None or one line of plain text, as a recorded vendor turn id is (:func:`record_event`)."""
+        if turn_id is not None:
+            _line("an interrupt's turn id", turn_id)
+        with self._guard:
+            session = self._sessions.get(launch_id)
+            if session is None:
+                raise CoordError(f"no driver session is attached to launch {str(launch_id)[:40]}; nothing was sent")
+            if launch_id in self._detaching:
+                raise CoordError(f"launch {str(launch_id)[:40]}'s driver session is being detached; nothing was sent")
+            self._pins[launch_id] = self._pins.get(launch_id, 0) + 1
         try:
             got = session.interrupt(InterruptCommand("op-" + secrets.token_hex(16), turn_id))
         except Exception as exc:  # noqa: BLE001 - any driver exception is an unknown outcome
             return CommandResult("ambiguous", _cause_text(f"the driver raised {type(exc).__name__}: {_said(exc)}"))
+        finally:
+            with self._guard:
+                self._pins[launch_id] -= 1
+                if not self._pins[launch_id]:
+                    del self._pins[launch_id]
+                self._unpinned.notify_all()
         if not isinstance(got, CommandResult) or type(got.outcome) is not str or got.outcome not in (
                 "confirmed", "ambiguous", "rejected", "no_such_request"):
             return CommandResult("ambiguous", "the driver returned no command result")
