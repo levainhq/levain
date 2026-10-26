@@ -547,6 +547,31 @@ def test_t5_readable_child():
         {"192.0.2.10": "b", "2001:db8::10": "c"}
 
 
+def test_t5_a_connect_dominates_an_unknown_line():
+    """L3 r1 X2 (codex MED): IPv4 connected and IPv6 unsupported on the host is a confirmed open wall, never unknown."""
+    from levain.slot.probe import parse_result, verdict
+
+    got = parse_result(b"c 192.0.2.10\nu 2001:db8::10 EAFNOSUPPORT\nend\n", ["192.0.2.10", "2001:db8::10"])
+    assert got == {"192.0.2.10": "c", "2001:db8::10": "u"}
+    with pytest.raises(Refused) as e:
+        verdict(A, {}, got, {})
+    assert e.value.name == "firewall-open" and e.value.detail == "api.anthropic.com 192.0.2.10"
+    assert parse_result(b"u 192.0.2.10 errno999\nc 2001:db8::10\nend\n", ["192.0.2.10", "2001:db8::10"]) == \
+        {"192.0.2.10": "u", "2001:db8::10": "c"}
+
+
+@pytest.mark.parametrize("raw", [b"u 192.0.2.10\nc 2001:db8::10\nend\n",
+                                 b"u 192.0.2.10 not-an-errno\nc 2001:db8::10\nend\n",
+                                 b"u 192.0.2.10 EAFNOSUPPORT x\nc 2001:db8::10\nend\n",
+                                 b"u 192.0.2.10 EAFNOSUPPORT\nu 192.0.2.10 EAFNOSUPPORT\nc 2001:db8::10\nend\n",
+                                 b"u 192.0.2.10 EAFNOSUPPORT\nb 2001:db8::10 timeout\nend\n",
+                                 b"u 192.0.2.10 bad-address\nu 2001:db8::10 EINVAL\nend\n"])
+def test_t5_malformed_or_unanswered_u_stays_unknown(raw):
+    from levain.slot.probe import parse_result
+
+    assert _refused(parse_result, raw, ["192.0.2.10", "2001:db8::10"]) == "firewall-probe-unknown:child"
+
+
 def test_n6_the_whole_hold_is_under_ends_lock_wait():
     from levain.slot import end as E
     from levain.slot import proc as PR
@@ -803,6 +828,26 @@ def test_t6_firewall_open_names_host_and_address_on_stderr_only(penv):
     assert line == {"ok": False, "refused": "firewall-open"}
     assert "api.anthropic.com 2001:db8::10" in w.last_err
     assert _record(w)["outcome"] == "open" and len(pr.killpgs) == 1 and pr.kills == []
+
+
+@pytest.mark.parametrize("other", [f"b {IP6} timeout", f"u {IP6} EAFNOSUPPORT"])
+def test_t6_open_is_decided_before_control_after(penv, other):
+    """L3 r1 X3 (codex MED): a confirmed ``c`` is ``firewall-open`` (recorded) even when the second CONTROL would
+    raise (EMFILE from the selector); the second CONTROL is never run once the slot connected."""
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    pr.result = f"c {IP4}\n{other}\nend\n".encode()
+    real = pr.connect
+
+    def connect(ips):
+        if pr.rounds >= 1:
+            raise OSError(errno.EMFILE, "too many open files")
+        return real(ips)
+    w.seams.probe.connect = connect
+    w.steps.clear()
+    assert w.main(["probe", s])[1] == {"ok": False, "refused": "firewall-open"}
+    assert "probe-control-after" not in w.steps
+    assert _record(w)["outcome"] == "open"
 
 
 def test_t6_no_eof_kills_the_group_then_reaps_before_release(penv):

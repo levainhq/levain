@@ -23,7 +23,8 @@ of the whole B3 policy (R7): no UDP or ICMP is probed.
    kills the slot's domain: at ACTIVE that is the vendor. Released, then the reaper is woken (``start._wake``), as
    ``start`` does.
 5. ``probe-control-after``: CONTROL again (codex MED: an address counts as closed only when root connected to it both
-   before and after the slot could not).
+   before and after the slot could not). Not run when the slot connected to any address: that is ``firewall-open``
+   at once (L3 r1 X3).
 6. :func:`verdict`, and the slot's last-probe record ``L/slots/<tag>/probe`` (``levain-probe-result/1``, N10) for
    every real verdict; never for ``session-busy``, ``slot-not-ours`` or ``not-probeable:*``.
 
@@ -38,6 +39,7 @@ Root never imports the supervisor or the operator's launch code here (R4); the c
 """
 from __future__ import annotations
 
+import errno
 import os
 import selectors
 import signal
@@ -170,10 +172,20 @@ def resolve(hosts: Sequence[str], seams: ProbeSeams) -> Tuple[List[Tuple[str, st
 
 # --- the child's result and the verdict (§4, N2, codex MED CONTROL-after) --------------------------------------------
 
+def _errno_word(word: str) -> bool:
+    """A ``u`` line's cause as the child spells it: an errno name, ``errno<n>`` or ``bad-address``."""
+    return (word in _ERRNO_NAMES or word == "bad-address"
+            or (word.startswith("errno") and word[5:].isdigit() and len(word) <= 11))
+
+
+_ERRNO_NAMES = frozenset(errno.errorcode.values())
+
+
 def parse_result(raw: bytes, addrs: Sequence[str]) -> Dict[str, str]:
-    """The child's result as ``{ip: "c" | "b"}`` for exactly ``addrs``, or ``firewall-probe-unknown:child``: more
-    than ``RESULT_MAX`` bytes, not ASCII, no final ``end`` line, a ``u`` line, a ``b`` whose cause is not N2's set,
-    an address missing, repeated or not asked for, or any other line."""
+    """The child's result as ``{ip: "c" | "b" | "u"}`` for exactly ``addrs``, or ``firewall-probe-unknown:child``:
+    more than ``RESULT_MAX`` bytes, not ASCII, no final ``end`` line, a ``b`` whose cause is not N2's set, a ``u``
+    whose cause is not an errno word, an address missing, repeated or not asked for, any other line, or a ``u`` line
+    with no ``c`` line (X2: a valid ``c`` dominates, so a host without IPv6 still reports the address it reached)."""
     def unknown(why: str) -> Refused:
         return Refused(f"{UNKNOWN}:child", why)
 
@@ -194,6 +206,8 @@ def parse_result(raw: bytes, addrs: Sequence[str]) -> Dict[str, str]:
             kind = PC.CONNECTED
         elif len(parts) == 3 and parts[0] == PC.BLOCKED and parts[2] in blocked:
             kind = PC.BLOCKED
+        elif len(parts) == 3 and parts[0] == PC.UNKNOWN and _errno_word(parts[2]):
+            kind = PC.UNKNOWN
         else:
             raise unknown(f"line {line[:80]!r}")
         if parts[1] not in want or parts[1] in got:
@@ -201,6 +215,9 @@ def parse_result(raw: bytes, addrs: Sequence[str]) -> Dict[str, str]:
         got[parts[1]] = kind
     if set(got) != want:
         raise unknown(f"{len(want - set(got))} address(es) missing")
+    kinds = set(got.values())
+    if PC.UNKNOWN in kinds and PC.CONNECTED not in kinds:
+        raise unknown(f"{sum(k == PC.UNKNOWN for k in got.values())} address(es) unknown, none connected")
     return got
 
 
@@ -211,14 +228,19 @@ def verdict(addrs: Sequence[Tuple[str, str]], before: Mapping[str, bool], probed
     otherwise ``:no-control-connect``."""
     if not addrs:
         raise Refused(f"{INCONCLUSIVE}:dns", "no address resolved")
-    for host, ip in addrs:
-        if probed.get(ip) == PC.CONNECTED:
-            raise Refused(OPEN, f"{host} {ip}")
+    check_open(addrs, probed)
     for host, ip in addrs:
         if before.get(ip) and after.get(ip) and probed.get(ip) == PC.BLOCKED:
             return {"probe": "closed", "address": ip, "host": host, "addresses": len(addrs)}
     raise Refused(f"{INCONCLUSIVE}:no-control-connect",
                   f"root connected to no address both before and after the probe ({len(addrs)} tried)")
+
+
+def check_open(addrs: Sequence[Tuple[str, str]], probed: Mapping[str, str]) -> None:
+    """``firewall-open`` (host and address in the detail) for the first address the slot connected to."""
+    for host, ip in addrs:
+        if probed.get(ip) == PC.CONNECTED:
+            raise Refused(OPEN, f"{host} {ip}")
 
 
 def control(seams: ProbeSeams, ips: Sequence[str]) -> Dict[str, bool]:
@@ -337,6 +359,7 @@ def _run(ctx: H.Ctx, a: R.Alloc) -> Dict[str, object]:
     finally:
         seams.at("probe-release")
         SS._wake(seams)
+    check_open(addrs, probed)      # X3: decided before the second CONTROL, whose failure must not hide it
     seams.at("probe-control-after")
     after = control(ps, ips)
     return verdict(addrs, before, probed, after)
