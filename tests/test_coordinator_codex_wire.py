@@ -525,6 +525,15 @@ def test_the_registry_covers_every_pinned_server_request_and_only_approvals_are_
     assert "thread/settings/updated" not in cw.OPT_OUT_NOTIFICATIONS
 
 
+def test_the_relied_on_notifications_are_marked_and_exclude_the_experimental_one():
+    table = cw.PINNED_SURFACE[cw.PINNED_VERSION]["ServerNotification"]
+    relied = cw.RELIED_NOTIFICATIONS[cw.PINNED_VERSION]
+    assert relied <= set(table)
+    assert "thread/settings/updated" in table and "thread/settings/updated" not in relied
+    assert {"turn/started", "turn/completed", "item/started", "item/completed", "serverRequest/resolved",
+            "item/fileChange/patchUpdated", "thread/status/changed", "thread/closed", "error"} <= relied
+
+
 def test_the_pinned_surface_matches_the_installed_codex_schema(tmp_path):
     codex = shutil.which("codex")
     if codex is None:

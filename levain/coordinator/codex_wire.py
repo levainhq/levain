@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 __all__ = ["BOOTSTRAP_FRAME_CAP", "CATCH_ALL", "NO_ID", "OPT_OUT_NOTIFICATIONS", "PINNED_SURFACE", "PINNED_VERSION",
-           "SERVER_REQUESTS", "CodexError", "CodexWire", "Inbound", "LineFraming", "ServerRequestRow", "WsFraming",
+           "RELIED_NOTIFICATIONS", "SERVER_REQUESTS", "CodexError", "CodexWire", "Inbound", "LineFraming", "ServerRequestRow", "WsFraming",
            "server_request_row"]
 
 _CONNECT_TIMEOUT = 10.0
@@ -293,6 +293,18 @@ PINNED_SURFACE: Mapping[str, Mapping[str, Mapping[str, tuple[str, ...]]]] = {
             "mcpServer/startupStatus/updated": ("name", "status"),
         },
     },
+}
+
+# The notifications the CH-D3 session relies on (rev 3 §4 / §8.2), per pinned version: each is mapped to an event or read
+# as state. `thread/settings/updated` is in the table above but NOT here: it is experimental in the Codex source and
+# never reaches a client that sent `experimentalApi: false`; one that arrives is an anomaly, not evidence. Adding a
+# version means re-reading each method's `#[experimental]` mark in that tag's source, which the schema test cannot see.
+RELIED_NOTIFICATIONS: Mapping[str, frozenset[str]] = {
+    "0.162.1": frozenset((
+        "thread/started", "thread/status/changed", "thread/closed", "turn/started", "turn/completed", "item/started",
+        "item/completed", "item/fileChange/patchUpdated", "item/commandExecution/terminalInteraction",
+        "serverRequest/resolved", "hook/started", "hook/completed", "item/autoApprovalReview/started",
+        "item/autoApprovalReview/completed", "error")),
 }
 
 # rev 1 §3.2's list: the streaming deltas and the token / rate-limit / startup-status updates no event is made from
