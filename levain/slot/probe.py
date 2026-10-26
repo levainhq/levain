@@ -350,7 +350,7 @@ def _probe_fenced(ctx: H.Ctx, a: R.Alloc, ips: Sequence[str]) -> Dict[str, str]:
     seams.at("probe-spawn")
     res_r, res_w = os.pipe()
     pid: Optional[int] = None
-    reaped = False
+    may_signal = True                        # False from the moment the reap is invoked
     try:
         try:
             pid = seams.spawn(argv, spec.to_json(), cgroup, res_w, True)
@@ -363,18 +363,20 @@ def _probe_fenced(ctx: H.Ctx, a: R.Alloc, ips: Sequence[str]) -> Dict[str, str]:
         if not ps.exited(pid, max(0.0, end - seams.monotonic())):
             raise Refused(f"{UNKNOWN}:unreaped", "the child did not exit after its result")
         _kill_group(ps, pid)                 # X4: the leader exited and is not reaped yet, so pid is still its own
+        # Y1: cleared BEFORE the reap is invoked, never after it returns. wait_within can reap and then raise (a
+        # signal handler firing as it restores its own), and past a reap pid may name another process. The cost of
+        # clearing early: a raise inside wait_within before its waitpid leaves one zombie, never a signal sent.
+        may_signal = False
         try:
             status = seams.wait_within(pid, max(0.0, end - seams.monotonic()))
-        except Refused:
-            reaped = True                    # wait_within killed the pid and polled its reap itself
+        except Refused:                      # wait_within killed the pid and polled its reap itself
             raise Refused(f"{UNKNOWN}:unreaped", "the child did not exit after its result") from None
-        reaped = True
         if status != 0:
             raise Refused(f"{UNKNOWN}:child", f"exit {status}")
         return parse_result(raw, ips)
     finally:
         os.close(res_r)
-        if pid is not None and not reaped:   # the leader is unreaped here: group first, then the child killed + reaped
+        if pid is not None and may_signal:   # the leader is unreaped here: group first, then the child killed + reaped
             _kill_group(ps, pid)
             seams.kill(pid)
         seams.at("probe-reaped")

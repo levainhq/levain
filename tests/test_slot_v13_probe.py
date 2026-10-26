@@ -610,6 +610,7 @@ class Probe:
         self.status = 0
         self.hold_open = False       # keep a copy of the write end: no EOF ever arrives
         self.no_exit = False         # the result arrives, but the child never exits
+        self.raise_after_reap = None  # an exception wait_within raises right after its reap (Y1)
         self.spawns, self.killpgs, self.kills, self.waits, self.held = [], [], [], [], []
         self.events = []             # ("killpg" | "wait" | "kill" | "exited", pid) in call order
         self.kept = []
@@ -661,6 +662,8 @@ class Probe:
             return self.la.wait_within(pid, bound)
         self.waits.append(pid)
         self.events.append(("wait", pid))
+        if self.raise_after_reap is not None:
+            raise self.raise_after_reap
         return self.status
 
     def kill(self, pid):
@@ -937,6 +940,22 @@ def test_t6_result_without_exit_kills_the_group_then_the_child(penv):
     assert w.main(["probe", s])[1]["refused"] == "firewall-probe-unknown:unreaped"
     pid = pr.spawns[0]["pid"]
     assert pr.events == [("exited", pid), ("killpg", pid), ("kill", pid)]
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("a signal handler raised"), KeyboardInterrupt()])
+def test_y1_an_exception_right_after_the_reap_never_signals_again(penv, exc):
+    """L3 r2 Y1 (codex): wait_within reaps the leader and then raises (a signal handler firing while it restores its
+    handlers). The pid may already name another process: nothing after the reap may signal it or its group."""
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    pr.raise_after_reap = exc
+    try:
+        w.main(["probe", s])
+    except BaseException:            # KeyboardInterrupt may leave main; the order below is the test
+        pass
+    pid = pr.spawns[0]["pid"]
+    assert pr.events == [("exited", pid), ("killpg", pid), ("wait", pid)]
+    assert pr.kills == []
 
 
 def _fork(body):
