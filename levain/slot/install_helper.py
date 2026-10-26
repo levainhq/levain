@@ -1743,7 +1743,9 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
                        *removals("R10"),            # R1b: entries after the flip (their sudoers rule went at R5)
                        # the vendor CLIs re-copied, so a vendor updated since the last repair reaches the slot;
                        # a failed copy does not stop R11/R12: the report step after them fails the run (ruling V6)
-                       *root_tree.vendor_steps(host, operator, failed=vendor_failed)])
+                       *root_tree.vendor_steps(host, operator, failed=vendor_failed),
+                       # the versions the copies kept, removed only with no session live (ruling V18)
+                       *vendor_prune_steps(host)])
     steps += F("R11", sudoers_steps(host, operator))                                              # R11
     steps += F("R12", [*removals("R12"),            # R1b: the removed units' files
                        *units.install_steps(host, services),                                     # R12
@@ -1931,6 +1933,32 @@ def live_lease_sessions(sessions: Path) -> tuple[str, ...]:
         except (Refused, OSError):
             live.append(name[:-len(".json")])
     return tuple(live)
+
+
+def vendor_prune_live(store: Path) -> tuple[str, ...]:
+    """The live-session evidence :func:`levain.slot.root_tree.prune_vendor` reads (head ruling V18): this run's
+    :meth:`Quiesce.live` when it holds ``L/slots/pool.lock`` (the same count preflight's ``live-lease`` refusal took,
+    under the hold that keeps a ``prepare`` from leasing beneath the prune). With no ``pool.lock`` no ``prepare`` can
+    lease, so the session records' ``lease_live`` (:func:`live_lease_sessions`) are the evidence. A ``pool.lock``
+    this process does not hold counts as live: nothing keeps a lease from starting beneath the prune."""
+    L = Path(store)
+    q = _QUIESCING.get(_store_key(L))
+    if q is not None and q.held:
+        return q.live()
+    if os.path.lexists(L / "slots" / "pool.lock"):
+        return (f"{L / 'slots' / 'pool.lock'} not held by this run",)
+    return live_lease_sessions(L / "sessions")
+
+
+def vendor_prune_steps(host: HostOS, *, store: Path | None = None) -> list[Step]:
+    """One step per versioned vendor package: :func:`levain.slot.root_tree.prune_vendor` with
+    :func:`vendor_prune_live`, read when the step runs. ``allow_fail``: a prune never stops the plan."""
+    L = Path(store) if store is not None else STORE[host]
+
+    def prune(name: str) -> Callable[[], tuple[bool, str]]:
+        return lambda: root_tree.prune_vendor(host, name, live=lambda: vendor_prune_live(L))
+    return [Step(f"remove the old versions of root's {name} copy in {root_tree.VENDOR_PREFIX[host]} (only with no "
+                 "session live)", call=prune(name), allow_fail=True) for name in root_tree.VENDOR_UNITS]
 
 
 def count_live_leases(sessions: Path) -> int:

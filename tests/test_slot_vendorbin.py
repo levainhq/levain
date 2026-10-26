@@ -708,7 +708,7 @@ def test_v14_an_upgrade_keeps_the_version_it_replaced(env):
     ok, why = _codex_copy(env)
     assert ok and "copied" in why, why
     v3 = _active_root(env.prefix).name
-    assert _versions(env.prefix) == sorted([v2, v3]) and not os.path.exists(running), _versions(env.prefix)
+    assert _versions(env.prefix) == sorted([v1, v2, v3]) and os.path.exists(running), _versions(env.prefix)   # V18
     assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid()) == ""
 
 
@@ -787,3 +787,214 @@ def test_v15_a_link_at_the_lock_is_refused(env):
     ok, why = _codex_copy(env)
     assert not ok and ".lock" in why, why
     assert not os.path.lexists(env.tmp / "elsewhere")
+
+
+# --- f4 (1026-14 RULINGS "vendorbin verify r3" V18-V21) -----------------------------------------------------------
+
+def _v3(env):
+    return _codex_pkg(env, extra={"bin/codex": (MACHO + b"v3", 0o755)})
+
+
+def _fails_on(*paths: Path):
+    """An fsync that raises EIO for a directory whose inode is one of ``paths`` (taken now)."""
+    inos = {os.stat(p).st_ino for p in paths}
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        if stat.S_ISDIR(st.st_mode) and st.st_ino in inos:
+            raise OSError(5, "Input/output error")
+        os.fsync(fd)
+    return fsync
+
+
+def test_v18_two_upgrades_keep_the_version_a_live_session_started_on(env):
+    """RED at 95eac6af: the second upgrade removed v1, which a session started before the first one still spawns
+    ``codex-path/rg`` from (codex resolves its physical version dir at start)."""
+    _codex_pkg(env)
+    assert _codex_copy(env)[0]
+    running = os.path.realpath(_active_root(env.prefix) / "codex-path" / "rg")
+    _v2(env)
+    assert _codex_copy(env)[0]
+    _v3(env)
+    ok, why = _codex_copy(env)
+    assert ok and "copied" in why, why
+    assert os.path.isfile(running), running
+    assert len(_versions(env.prefix)) == 3, _versions(env.prefix)
+
+
+def _three_versions(env) -> str:
+    _codex_pkg(env)
+    _codex_copy(env)
+    _v2(env)
+    _codex_copy(env)
+    _v3(env)
+    _codex_copy(env)
+    return _active_root(env.prefix).name
+
+
+def _prune(env, live):
+    return RT.prune_vendor("darwin", "codex", live=live, prefix=env.prefix, fchown=env.fchown, chown=env.chown,
+                           root_uid=os.getuid())
+
+
+def test_v18_the_prune_keeps_every_version_while_a_session_is_live(env):
+    _three_versions(env)
+    before = _versions(env.prefix)
+    ok, why = _prune(env, lambda: ("sess-1",))
+    assert ok and "sess-1" in why and "kept" in why, why
+    assert _versions(env.prefix) == before
+
+
+def test_v18_the_prune_removes_every_non_active_version_once_no_session_is_live(env):
+    v3 = _three_versions(env)
+    stale = env.prefix / "codex" / ".staging.12345.dead.partial"
+    _exe(stale / "bin" / "codex", MACHO + b"half")
+    ok, why = _prune(env, lambda: ())
+    assert ok and "removed" in why, why
+    assert _versions(env.prefix) == [v3] and not os.path.lexists(stale)
+    assert os.path.isfile(env.prefix / "codex" / ".lock")
+    assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid()) == ""
+
+
+def test_v18_the_prune_keeps_everything_when_the_live_check_fails(env):
+    _three_versions(env)
+    before = _versions(env.prefix)
+
+    def live():
+        raise OSError(5, "Input/output error")
+    ok, why = _prune(env, live)
+    assert ok and "kept" in why, why
+    assert _versions(env.prefix) == before
+
+
+def test_v18_the_prune_with_no_active_version_removes_nothing(env):
+    _three_versions(env)
+    before = _versions(env.prefix)
+    os.unlink(env.prefix / "bin" / "codex")
+    ok, why = _prune(env, lambda: ())
+    assert ok and "nothing" in why, why
+    assert _versions(env.prefix) == before
+
+
+def test_v18_repair_prunes_after_the_vendor_copies_and_never_stops_on_it(tmp_path):
+    from tests.test_repair_plan import _pre_change, _plan
+
+    facts, rf = _pre_change(tmp_path)
+    steps = _plan(facts, rf).steps
+    whys = [s.why for s in steps]
+    prune = [i for i, w in enumerate(whys) if w.startswith("remove the old versions")]
+    copies = [i for i, w in enumerate(whys) if w.startswith("place root's copy")]
+    assert len(prune) == 1 and copies and prune[0] > max(copies), whys
+    assert steps[prune[0]].allow_fail
+
+
+def test_v18_the_live_check_is_the_runs_quiesce_and_fails_closed_without_it(tmp_path, monkeypatch):
+    from levain.slot import install_helper as IH
+
+    store = tmp_path / "L"
+    (store / "slots").mkdir(parents=True)
+    monkeypatch.setattr(IH, "live_lease_sessions", lambda d: ("from-records",))
+    assert IH.vendor_prune_live(store) == ("from-records",)          # no pool.lock: no prepare can lease
+    (store / "slots" / "pool.lock").write_bytes(b"")
+    assert IH.vendor_prune_live(store)                              # a lock no run holds: counted live
+    monkeypatch.setattr(IH, "live_lease_sessions", lambda d: ())
+    assert IH.vendor_prune_live(store)
+
+    class Held:
+        held = True
+
+        def live(self):
+            return ("from-quiesce",)
+    monkeypatch.setitem(IH._QUIESCING, IH._store_key(store), Held())
+    assert IH.vendor_prune_live(store) == ("from-quiesce",)
+
+
+def test_v19_a_staged_dir_fsync_failure_aborts_before_the_switch(env):
+    """RED at 95eac6af: a staged directory's fsync failure was a warning, and the link switched to it."""
+    _codex_pkg(env)
+    _codex_copy(env)
+    v1 = _active_root(env.prefix).name
+    _v2(env)
+    bin_dir, pdir = env.prefix / "bin", env.prefix / "codex"
+    keep = {os.stat(p).st_ino for p in (bin_dir, pdir, env.prefix)}
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        if stat.S_ISDIR(st.st_mode) and st.st_ino not in keep:
+            raise OSError(5, "Input/output error")
+        os.fsync(fd)
+    ok, why = _codex_copy(env, fsync=fsync)
+    assert not ok and "unchanged" in why, why
+    assert _active_root(env.prefix).name == v1
+
+
+def test_v19_the_version_dirs_parent_fsync_failure_aborts_before_the_switch(env):
+    _codex_pkg(env)
+    _codex_copy(env)
+    v1 = _active_root(env.prefix).name
+    _v2(env)
+    ok, why = _codex_copy(env, fsync=_fails_on(env.prefix / "codex"))
+    assert not ok and "unchanged" in why, why
+    assert _active_root(env.prefix).name == v1
+    ok, why = _codex_copy(env)                       # the next repair finishes it
+    assert ok, why
+    assert (_active_root(env.prefix) / "codex-path" / "rg").read_bytes() == MACHO + b"rg-v2"
+
+
+def test_v19_the_link_dirs_fsync_failure_after_the_switch_is_indeterminate(env):
+    _codex_pkg(env)
+    _codex_copy(env)
+    _v2(env)
+    ok, why = _codex_copy(env, fsync=_fails_on(env.prefix / "bin"))
+    assert not ok and "indeterminate" in why, why
+    assert (_active_root(env.prefix) / "codex-path" / "rg").read_bytes() == MACHO + b"rg-v2"
+    ok, why = _codex_copy(env, fsync=_fails_on(env.prefix / "bin"))   # still not durable: never "already matches"
+    assert not ok and "indeterminate" in why, why
+    ok, why = _codex_copy(env)
+    assert ok and "already" in why, why
+
+
+def test_v20_a_rollback_reuses_the_kept_version_and_never_removes_it(env):
+    """RED at 95eac6af: a copy back to v1's bytes removed v1's kept directory and renamed a new copy over its name,
+    so a session still running on it met ENOENT in between."""
+    _codex_pkg(env)
+    _codex_copy(env)
+    v1 = _active_root(env.prefix)
+    ino = os.stat(v1).st_ino
+    _v2(env)
+    _codex_copy(env)
+    _codex_pkg(env)
+    ok, why = _codex_copy(env)
+    assert ok and "copied" not in why, why
+    assert _active_root(env.prefix) == v1.resolve() and os.stat(v1).st_ino == ino
+    assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid()) == ""
+
+
+def test_v20_a_damaged_kept_version_is_never_removed_by_a_copy(env):
+    _codex_pkg(env)
+    _codex_copy(env)
+    v1 = _active_root(env.prefix)
+    ino = os.stat(v1).st_ino
+    _v2(env)
+    _codex_copy(env)
+    os.chmod(v1 / "codex-resources" / "voice", 0o775)                # v1's dir no longer passes _tree_problem
+    _codex_pkg(env)
+    ok, why = _codex_copy(env)
+    assert ok and "copied" in why, why
+    now = _active_root(env.prefix)
+    assert now != v1.resolve() and now.name.startswith(v1.name + "."), now
+    assert os.stat(v1).st_ino == ino
+    assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid()) == ""
+
+
+def test_v21_a_structural_problem_in_a_matching_active_version_is_rebuilt(env):
+    """RED at 95eac6af: a link where a directory belongs made the ``same`` branch fail, and every repair after it."""
+    _codex_pkg(env)
+    _codex_copy(env)
+    (env.tmp / "elsewhere").mkdir()
+    os.symlink(env.tmp / "elsewhere", _active_root(env.prefix) / "codex-resources" / "evil")
+    ok, why = _codex_copy(env)
+    assert ok and "copied" in why, why
+    assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid()) == ""
+    ok, why = _codex_copy(env)
+    assert ok and "already" in why, why

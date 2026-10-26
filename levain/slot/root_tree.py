@@ -16,6 +16,7 @@ import os
 import re
 import shlex
 import stat
+from contextlib import contextmanager
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, Mapping, Optional
@@ -606,7 +607,8 @@ VENDOR_UNITS: Mapping[str, VendorUnit] = {
 #: The name prefix of a package's staging directory beside its versions while a new version is copied; each run's is
 #: unique (head ruling V15), and one left by a crashed run is removed under the lock.
 _STAGING = ".staging."
-#: The lock file in ``<prefix>/<name>/`` a package copy holds (exclusive flock) for its whole run (head ruling V15).
+#: The lock file in ``<prefix>/<name>/`` a package copy or prune holds (exclusive flock) for its whole run (head
+#: ruling V15).
 _VENDOR_LOCK = ".lock"
 #: DECISION (lane vbf3): how long a package copy waits for another run's lock before it fails, the active version
 #: unchanged. A whole codex copy is one package's bytes; a holder past this is wedged, and repair must still finish.
@@ -993,15 +995,28 @@ def _fsync_dirs(dirs: Iterable[Path], fsync: Callable[[int], None]) -> list:
     return warnings
 
 
-def _version_name(manifest: Path) -> str:
-    """The package's ``version`` from its (root's copy of the) manifest, as a directory-name part; "unknown" when it
-    cannot be read."""
+def _fsync_strict(dirs: Iterable[Path], fsync: Callable[[int], None]) -> None:
+    """Each directory fsync'd; OSError naming the first that fails (head ruling V19: before a switch, a directory that
+    is not durable stops the publish)."""
+    for d in dirs:
+        try:
+            dfd = os.open(d, os.O_RDONLY)
+            try:
+                fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as e:
+            raise OSError(e.errno, f"could not fsync {d} ({e.strerror or e})") from None
+
+
+def _version_name(manifest: bytes) -> str:
+    """The package's ``version`` from its manifest's bytes, as a directory-name part; "unknown" when it cannot be
+    read."""
     import json
 
     try:
-        with open(manifest, "rb") as f:
-            v = json.loads(f.read(1 << 16).decode("utf-8")).get("version")
-    except (OSError, ValueError, AttributeError):
+        v = json.loads(manifest[:1 << 16].decode("utf-8")).get("version")
+    except (ValueError, AttributeError):
         v = None
     v = re.sub(r"[^A-Za-z0-9._+-]", "_", v)[:64].lstrip(".") if isinstance(v, str) else ""
     return v or "unknown"
@@ -1043,23 +1058,25 @@ def _rmtree(path: Path) -> str:
     return ""
 
 
-def _copy_package(host: HostOS, name: str, unit: VendorUnit, root: str, srcs: list, base: Path, *,
-                  fchown: Callable[[int, int, int], None], fsync: Callable[[int], None],
-                  chown: Callable[[str, int, int], None], lchown: Callable[[str, int, int], None],
-                  root_uid: int) -> tuple:
-    """:func:`_publish_package` run holding ``<prefix>/<name>/.lock`` (head ruling V15): root's 0600 regular file,
-    opened without following a link, flocked exclusively; a second run waits up to :data:`VENDOR_LOCK_WAIT_S` for it.
-    A lock that cannot be opened, or is still held at the bound, fails the copy with the active version unchanged."""
+class _LockFailed(Exception):
+    """A package's lock could not be opened or taken within :data:`VENDOR_LOCK_WAIT_S`."""
+
+
+@contextmanager
+def _package_lock(base: Path, name: str, *, fchown: Callable[[int, int, int], None],
+                  chown: Callable[[str, int, int], None], root_uid: int) -> Iterator[None]:
+    """``<prefix>/<name>/.lock`` held for the body (head ruling V15): root's 0600 regular file, opened without
+    following a link, flocked exclusively; a second holder waits up to :data:`VENDOR_LOCK_WAIT_S` for it.
+    :class:`_LockFailed` when it cannot be opened or is still held at the bound."""
     import fcntl
     import time
 
-    pdir = base / name
-    lock = pdir / _VENDOR_LOCK
+    lock = base / name / _VENDOR_LOCK
     try:
         _ensure_dirs(base, [f"{name}/x"], chown=chown, root_uid=root_uid)
         fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0), 0o600)
     except OSError as e:
-        return False, f"{name}: cannot open {lock} ({e.strerror or e}); the active {name} is unchanged"
+        raise _LockFailed(f"cannot open {lock} ({e.strerror or e})") from None
     try:
         try:
             st = os.fstat(fd)
@@ -1076,15 +1093,64 @@ def _copy_package(host: HostOS, name: str, unit: VendorUnit, root: str, srcs: li
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        return False, (f"{name}: {lock} is still held by another copy after {VENDOR_LOCK_WAIT_S:g} s;"
-                                       f" not copied, the active {name} is unchanged")
+                        raise _LockFailed(f"{lock} is still held by another run after {VENDOR_LOCK_WAIT_S:g} s")
                     time.sleep(0.1)
         except OSError as e:
-            return False, f"{name}: cannot lock {lock} ({e.strerror or e}); the active {name} is unchanged"
-        return _publish_package(host, name, unit, root, srcs, base, fchown=fchown, fsync=fsync, chown=chown,
-                                lchown=lchown, root_uid=root_uid)
+            raise _LockFailed(f"cannot lock {lock} ({e.strerror or e})") from None
+        yield
     finally:
         os.close(fd)
+
+
+def _copy_package(host: HostOS, name: str, unit: VendorUnit, root: str, srcs: list, base: Path, *,
+                  fchown: Callable[[int, int, int], None], fsync: Callable[[int], None],
+                  chown: Callable[[str, int, int], None], lchown: Callable[[str, int, int], None],
+                  root_uid: int) -> tuple:
+    """:func:`_publish_package` run holding the package's lock (:func:`_package_lock`). A lock that cannot be opened,
+    or is still held at the bound, fails the copy with the active version unchanged."""
+    try:
+        with _package_lock(base, name, fchown=fchown, chown=chown, root_uid=root_uid):
+            return _publish_package(host, name, unit, root, srcs, base, fchown=fchown, fsync=fsync, chown=chown,
+                                    lchown=lchown, root_uid=root_uid)
+    except _LockFailed as e:
+        return False, f"{name}: {e}; not copied, the active {name} is unchanged"
+
+
+def _holds_exactly(d: Path, srcs: list, modes: Mapping[str, int]) -> bool:
+    """``d`` holds exactly the files of ``srcs`` (``(rel, path, fd, mode)``) and no other, each with its source's
+    bytes; False on any OSError."""
+    try:
+        held = {os.path.relpath(os.path.join(x, f), d) for x, _, files in os.walk(d, followlinks=False) for f in files}
+        if held != set(modes):
+            return False
+        for rel, _, fd, _ in srcs:
+            dfd = _open_regular(str(d / rel))
+            try:
+                if not _fds_equal(fd, dfd):
+                    return False
+            finally:
+                os.close(dfd)
+    except OSError:
+        return False
+    return True
+
+
+def _reusable(d: Path, unit: VendorUnit, srcs: list, modes: Mapping[str, int], root_uid: int) -> bool:
+    """A kept version directory a copy can switch to as it is (head ruling V20): no link, it passes
+    :func:`_tree_problem`, holds exactly these files and bytes, and each file is at the mode it would be copied at."""
+    try:
+        if os.path.islink(d) or not os.path.isdir(d) or _tree_problem(d, unit, root_uid):
+            return False
+        if not _holds_exactly(d, srcs, modes):
+            return False
+        return all(stat.S_IMODE(os.lstat(d / rel).st_mode) == m for rel, m in modes.items())
+    except OSError:
+        return False
+
+
+def _indeterminate(name: str, link: Path, target: Path, e: OSError) -> str:
+    return (f"{name}: {link} names {target}, but {e.strerror or e}: whether that survives a crash is indeterminate "
+            "(repair again)")
 
 
 def _publish_package(host: HostOS, name: str, unit: VendorUnit, root: str, srcs: list, base: Path, *,
@@ -1093,77 +1159,84 @@ def _publish_package(host: HostOS, name: str, unit: VendorUnit, root: str, srcs:
                      root_uid: int) -> tuple:
     """Publish the package read from ``root`` (``srcs``: ``(rel, path, fd, mode)``) as the active version (head ruling
     V8; the frame of Homebrew's ``opt`` link, Nix profiles and Capistrano's ``current``: stage a complete versioned
-    tree, then switch one name atomically). The caller holds the package's lock. When the active version already holds
-    exactly these files with these bytes, its owners and modes are set again in place (V9) and nothing is copied. Else
-    any staging directory a crashed run left is removed, every file is copied into a staging directory unique to this
-    run (``<prefix>/<name>/.staging.<pid>.<random>.partial``), the staged tree must pass :func:`_tree_problem`, it is
-    renamed to ``<version>-<digest>``, and a new link is renamed over ``bin/<name>``. Then every entry of
-    ``<prefix>/<name>`` but the new version, the version it replaced (V14: a session started on it resolved that
-    physical directory and spawns from it) and the lock is removed. A failure before the link's rename leaves the
-    active version as it was. The result ends by requiring :func:`unit_problem` to be "" (a repair that leaves a
-    problem fails)."""
+    tree, then switch one name atomically). The caller holds the package's lock. This path NEVER removes a version
+    directory (head rulings V18, V20: a session resolved its physical version directory at start and spawns from it to
+    its end); :func:`prune_vendor` does, when no session is live.
+
+    1. The active version already holds exactly these files with these bytes: its owners and modes are set again in
+       place (V9) and nothing is copied. If that cannot be done (a link where a directory belongs), it is rebuilt as
+       below (V21).
+    2. Else a kept version that :func:`_reusable` accepts is switched to as it is (V20, a rollback).
+    3. Else any staging directory a crashed run left is removed, every file is copied into a staging directory unique
+       to this run (``<prefix>/<name>/.staging.<pid>.<random>.partial``), the staged directories are fsync'd, the
+       tree must pass :func:`_tree_problem`, and it is renamed to ``<version>-<digest>``, or to that name with this
+       run's own suffix when a directory of that name is there already (never removed, never renamed over).
+
+    Before the link switches, the new version's directories and ``<prefix>/<name>`` are fsync'd and any failure there
+    stops the publish with the active version as it was (V19). Then a new link is renamed over ``bin/<name>`` and
+    :func:`unit_problem` must be "". A failure to fsync ``bin`` after that is reported as an indeterminate publish,
+    never a success; so is one in step 1, so a re-run after an indeterminate publish settles it."""
     import hashlib
     import secrets
 
-    pdir, link = base / name, base / "bin" / name
+    pdir, bindir = base / name, base / "bin"
+    link = bindir / name
     modes = {rel: mode for rel, _, _, mode in srcs}
     active, _ = _active_dir(base, name, root_uid)
-    same = active is not None and os.path.isdir(active)
-    if same:
+    if active is not None and os.path.isdir(active) and _holds_exactly(active, srcs, modes):
         try:
-            held = {os.path.relpath(os.path.join(d, x), active)
-                    for d, _, files in os.walk(active, followlinks=False) for x in files}
-            same = held == set(modes)
-            for rel, _, fd, _ in srcs:
-                if not same:
-                    break
-                dfd = _open_regular(str(active / rel))   # type: ignore[operator]
-                try:
-                    same = _fds_equal(fd, dfd)
-                finally:
-                    os.close(dfd)
-        except OSError:
-            same = False
-    if same:
-        try:
-            _fix_tree(active, unit, modes, chown=chown, root_uid=root_uid)       # type: ignore[arg-type]
+            _fix_tree(active, unit, modes, chown=chown, root_uid=root_uid)
             _own_dir(pdir, chown=chown, root_uid=root_uid)
-        except OSError as e:
-            return False, f"{name}: setting root's owner and modes on {active} failed ({e.strerror or e})"
-        problem = unit_problem(host, name, prefix=base, root_uid=root_uid)
-        if problem:
-            return False, f"{name}: {problem}; repair could not fix it"
-        return True, f"{name}: {active} already matches {root}"
+        except OSError:
+            pass                       # V21: a structure set-in-place cannot mend is rebuilt below
+        else:
+            problem = unit_problem(host, name, prefix=base, root_uid=root_uid)
+            if problem:
+                return False, f"{name}: {problem}; repair could not fix it"
+            try:
+                _fsync_strict([pdir, bindir], fsync)
+            except OSError as e:
+                return False, _indeterminate(name, link, active, e)
+            return True, f"{name}: {active} already matches {root}"
+    manifest = next((os.pread(fd, 1 << 16, 0) for rel, _, fd, _ in srcs if rel == unit.manifest), b"")
+    version = _version_name(manifest)
     staging = pdir / f"{_STAGING}{os.getpid()}.{secrets.token_hex(4)}.partial"
+    final: Optional[Path] = None
+    total = 0
     try:
         _ensure_dirs(base, [f"{name}/x"], chown=chown, root_uid=root_uid)
-        for stale in sorted(os.listdir(pdir)):
-            if stale.startswith(_STAGING):
-                why = _rmtree(pdir / stale)
-                if why:
-                    raise OSError(why)
-        os.mkdir(staging, 0o700)
-        _own_dir(staging, chown=chown, root_uid=root_uid)
-        dirs = _ensure_dirs(staging, list(modes), chown=chown, root_uid=root_uid)
-        digest = hashlib.sha256()
-        total = 0
-        for rel, path, fd, mode in srcs:
-            st = os.fstat(fd)
-            digest.update(f"{rel}\0{mode:o}\0{st.st_size}\0".encode())
-            total += _copy_one(fd, st, path, staging / rel, mode, fchown=fchown, fsync=fsync, digest=digest)
-        warnings = _fsync_dirs([*reversed(dirs), staging], fsync)
-        problem = _tree_problem(staging, unit, root_uid)
-        if problem:
-            raise OSError(f"the staged copy is not whole: {problem}")
-        dirname = f"{_version_name(staging / unit.manifest)}-{digest.hexdigest()[:12]}"
-        final = pdir / dirname
-        if active is not None and final == active:
-            dirname = f"{dirname}.{os.getpid()}"     # same digest, other bytes: the active version is never replaced
-            final = pdir / dirname
-        why = _rmtree(final)
-        if why:
-            raise OSError(why)
-        os.rename(staging, final)
+        for entry in sorted(os.listdir(pdir)):
+            if (entry.startswith(f"{version}-") and (active is None or entry != active.name)
+                    and _reusable(pdir / entry, unit, srcs, modes, root_uid)):
+                final = pdir / entry
+                break
+        reused = final is not None
+        if reused:
+            _fsync_strict([Path(d) for d, _, _ in os.walk(final, topdown=False, followlinks=False)], fsync)
+        else:
+            for stale in sorted(os.listdir(pdir)):
+                if stale.startswith(_STAGING):
+                    why = _rmtree(pdir / stale)
+                    if why:
+                        raise OSError(why)
+            os.mkdir(staging, 0o700)
+            _own_dir(staging, chown=chown, root_uid=root_uid)
+            dirs = _ensure_dirs(staging, list(modes), chown=chown, root_uid=root_uid)
+            digest = hashlib.sha256()
+            for rel, path, fd, mode in srcs:
+                st = os.fstat(fd)
+                digest.update(f"{rel}\0{mode:o}\0{st.st_size}\0".encode())
+                total += _copy_one(fd, st, path, staging / rel, mode, fchown=fchown, fsync=fsync, digest=digest)
+            _fsync_strict([*reversed(dirs), staging], fsync)
+            problem = _tree_problem(staging, unit, root_uid)
+            if problem:
+                raise OSError(f"the staged copy is not whole: {problem}")
+            stem = f"{version}-{digest.hexdigest()[:12]}"
+            final = pdir / stem
+            while os.path.lexists(final):        # V20: a directory of this name is kept, whatever is in it
+                final = pdir / f"{stem}.{os.getpid()}.{secrets.token_hex(2)}"
+            os.rename(staging, final)
+        _fsync_strict([pdir], fsync)
     except _Changed as e:
         _rmtree(staging)
         return False, (f"{name}: vendor-changed-during-copy: {e}; not copied, the active {name} is unchanged (repair "
@@ -1171,10 +1244,10 @@ def _publish_package(host: HostOS, name: str, unit: VendorUnit, root: str, srcs:
     except OSError as e:
         _rmtree(staging)
         return False, f"{name}: copying {root} to {pdir} failed ({e.strerror or e}); the active {name} is unchanged"
-    tmp = base / "bin" / f".{name}.link.partial"
+    tmp = bindir / f".{name}.link.partial"
     try:
         _rmtree(tmp)
-        os.symlink(f"../{name}/{dirname}/bin/{name}", tmp)
+        os.symlink(f"../{name}/{final.name}/bin/{name}", tmp)
         if os.lstat(tmp).st_uid != root_uid:
             lchown(str(tmp), 0, 0)
         os.rename(tmp, link)
@@ -1182,18 +1255,60 @@ def _publish_package(host: HostOS, name: str, unit: VendorUnit, root: str, srcs:
         _rmtree(tmp)
         return False, (f"{name}: switching {link} to {final} failed ({e.strerror or e}); the active {name} is "
                        "unchanged")
-    warnings += _fsync_dirs([pdir, base / "bin"], fsync)
-    keep = {dirname, _VENDOR_LOCK} | ({active.name} if active is not None else set())
-    for old in sorted(os.listdir(pdir)):
-        if old not in keep:
-            why = _rmtree(pdir / old)
-            if why:
-                warnings.append(f"warning: {why}")
     problem = unit_problem(host, name, prefix=base, root_uid=root_uid)
     if problem:
         return False, f"{name}: {problem} after the switch to {final}"
-    line = (f"{name}: copied {len(srcs)} files of its package {root} to {final} ({total} bytes, root's) and switched "
-            f"{link} to it")
+    try:
+        _fsync_strict([bindir], fsync)
+    except OSError as e:
+        return False, _indeterminate(name, link, final, e)
+    if not reused:
+        return True, (f"{name}: copied {len(srcs)} files of its package {root} to {final} ({total} bytes, root's) and "
+                      f"switched {link} to it")
+    return True, f"{name}: {final}, kept from an earlier run, already holds {root}; switched {link} to it"
+
+
+def prune_vendor(host: HostOS, name: str, *, live: Callable[[], Iterable[str]], prefix: Optional[Path] = None,
+                 fchown: Callable[[int, int, int], None] = os.fchown, chown: Callable[[str, int, int], None] = os.chown,
+                 root_uid: int = 0) -> tuple:
+    """Head ruling V18: remove every entry of ``<prefix>/<name>/`` but the active version and the lock (the versions
+    copies kept, and staging a crashed run left), holding the package's lock, and only when ``live()`` names no live
+    session. ``live`` is the caller's evidence from Levain's own lease state (repair passes
+    ``install_helper.vendor_prune_live``). Never fails a run: always ``(True, line)``; a live session, a ``live`` that
+    raises, no active version or a lock that cannot be taken keeps every version and says so."""
+    base = prefix if prefix is not None else VENDOR_PREFIX[host]
+    if name not in VENDOR_UNITS:
+        return True, f"{name}: one file, no versions to prune"
+    pdir = base / name
+    if os.path.islink(pdir) or not os.path.isdir(pdir):
+        return True, f"{name}: no {pdir}; nothing to prune"
+    removed: list = []
+    warnings: list = []
+    try:
+        with _package_lock(base, name, fchown=fchown, chown=chown, root_uid=root_uid):
+            try:
+                held = tuple(live())
+            except Exception as e:
+                return True, f"{name}: every version kept (the live-session check failed: {e})"
+            if held:
+                return True, (f"{name}: every version kept while {len(held)} session(s) are live: "
+                              f"{', '.join(held[:5])}")
+            active, why = _active_dir(base, name, root_uid)
+            if active is None:
+                return True, f"{name}: no active version ({why}); nothing pruned"
+            for old in sorted(os.listdir(pdir)):
+                if old in (active.name, _VENDOR_LOCK):
+                    continue
+                w = _rmtree(pdir / old)
+                if w:
+                    warnings.append(f"warning: {w}")
+                else:
+                    removed.append(old)
+    except _LockFailed as e:
+        return True, f"{name}: {e}; nothing pruned"
+    except OSError as e:
+        return True, f"{name}: pruning {pdir} failed ({e.strerror or e})"
+    line = f"{name}: removed {', '.join(removed)} from {pdir}" if removed else f"{name}: nothing to prune in {pdir}"
     return True, "; ".join([line, *warnings])
 
 
@@ -1213,9 +1328,9 @@ def copy_vendor(host: HostOS, name: str, *, home: str, operator_uid: int, prefix
     A vendor not found, a package not whole, or a source file :func:`_source_problem` refuses is a SKIP with a line
     (``(True, ...)``), and the copy already there, if any, is kept. A failed copy is ``(False, ...)``:
     ``vendor-changed-during-copy`` when a source changed under the read (repair copies it again on its next run).
-    The directories are fsync'd once every file is renamed into place; one that fails is a warning on a successful
-    line. ``root_uid``: the owner a copy left alone must have (tests pass their own uid, since their
-    ``fchown``/``chown`` only record)."""
+    Claude Code's directories are fsync'd once its file is renamed into place; one that fails is a warning on a
+    successful line (V7; a package's fsync rules are :func:`_publish_package`'s, V19). ``root_uid``: the owner a copy
+    left alone must have (tests pass their own uid, since their ``fchown``/``chown`` only record)."""
     base = prefix if prefix is not None else VENDOR_PREFIX[host]
     dest = vendor_bin(host, name, prefix=prefix)
     have = os.path.lexists(dest)
