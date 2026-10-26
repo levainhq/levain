@@ -155,7 +155,7 @@ def test_a_bio_socket_read_is_bounded_by_its_deadline_not_the_sockets_timeout() 
     from .tls_rig import _BioSocket
     c, peer = _silent_peer(5.0)
     inc, out = ssl.MemoryBIO(), ssl.MemoryBIO()
-    obj = ssl.create_default_context().wrap_bio(inc, out, server_side=False)
+    obj = _no_name_ctx().wrap_bio(inc, out, server_side=False)
     t0 = time.monotonic()
     b = _BioSocket(obj, inc, out, c, t0 + 0.2)
     try:
