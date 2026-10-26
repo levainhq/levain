@@ -46,7 +46,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   runtime with real clients (curl, git, requests, pip, npm, uv) and sweeps every artifact of a run for leaked
   credentials. `levain.chat_egress.report` reads one launch's rows and the glue's event file into the wall total (exact
   after a clean end, marked unknown or crashed after a crash), per-reason counts, duplicate rows, and the path,
-  credential-in-query and cap counts. No `levain` command prints it yet.
+  credential-in-query and cap counts. No `levain` command prints it yet. The suite also covers the TLS path with a held
+  key (the key reaches only its own host and no file or log; SNI, `Host` and request-smuggling forms reach the origin as
+  nothing), `Expect: 100-continue`, pipelining behind a held card, a decider crash, and a client leaving while its card
+  is held. A sandboxed client's SOCKS attempt is still refused, and now counted as a `socks` wall in the report.
 - **Dispatch can follow the control plane's session events.** It reads them from a cursor it keeps across restarts
   (never moved backward), records a verifier's result from them and acknowledges it (`ARTIFACT-ACK`) only when dispatch
   holds that outcome, so the reaper can clear a finished session early. It recognises a repeated verifier refusal only by

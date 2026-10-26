@@ -92,12 +92,23 @@ class RecordingOrigin:
         with self._lock:
             self.bytes_in += n
 
+    def snapshot(self) -> dict:
+        """One consistent read of what reached the origin, taken under the lock every counter and `reqs.append` uses:
+        connections, bytes, the parsed requests, and `unaccounted` = bytes read minus the bytes of every parsed
+        request (`raw_head` + the 4-byte blank line + `raw_body`), i.e. a partial head or body no request explains.
+        A request is appended before its response is sent, so a caller that has the response of a request sees it
+        here."""
+        with self._lock:
+            return {"conns": self.conns, "bytes": self.bytes_in, "wrap_failures": list(self.wrap_failures),
+                    "reqs": [(r.method, r.target) for r in self.reqs],
+                    "unaccounted": self.bytes_in - sum(len(r.raw_head) + 4 + len(r.raw_body) for r in self.reqs)}
+
     def touched(self) -> dict:
         """What reached the origin at the connection and byte level; parsed requests are only the subset that survived
         a TLS wrap and the origin's own parser."""
-        with self._lock:
-            return {"conns": self.conns, "bytes": self.bytes_in, "wrap_failures": list(self.wrap_failures),
-                    "reqs": [(r.method, r.target) for r in self.reqs]}
+        snap = self.snapshot()
+        snap.pop("unaccounted")
+        return snap
 
     def assert_untouched(self, settle: float = 0.3) -> None:
         """The "reaches nothing" oracle: zero accepted connections, zero bytes, no wrap failure and no parsed request,

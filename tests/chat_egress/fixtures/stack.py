@@ -316,6 +316,7 @@ class ProdGlueRun:
         self.key_on_plain = False
         self.answer = answer
         self.stopped = None
+        self.mp = None                                   # set by start(); stop() may run on a start that never got there
 
     @property
     def ca(self) -> Path:
@@ -339,7 +340,8 @@ class ProdGlueRun:
 
         from ..decider_rig import Desk, Live, Lookup
         from ..test_launch import real_launch
-        sys.path.insert(0, str(envmod.GLUE_DIR))
+        if str(envmod.GLUE_DIR) not in sys.path:
+            sys.path.insert(0, str(envmod.GLUE_DIR))
         import decider_spike4 as spike  # noqa: E402  (its make_ca: an RSA CA srt's node-forge accepts)
 
         p, pki = self.rig.ports, self.rig.pki
@@ -411,5 +413,6 @@ class ProdGlueRun:
             if self.e is not None and self.stopped is None:
                 self.stopped = lm.stop_egress(self.e)
         finally:
-            self.mp.undo()
+            if self.mp is not None:
+                self.mp.undo()
         return self.stopped

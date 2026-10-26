@@ -9,6 +9,7 @@ not hold). What the client sees meanwhile (an interim `100 Continue`, the pipeli
 
 from __future__ import annotations
 
+import re
 import socket
 import time
 
@@ -94,11 +95,27 @@ def test_expect_100_continue_denied_sends_no_byte_upstream(make_origin, make_lau
     origin.assert_untouched()
 
 
+def check_pipelined(answer: str, *, early: dict, final: dict, lines: list) -> None:
+    """The A13 pipelining read, one place so the control below can hand it a broken proxy's facts. `early` and `final`
+    are `RecordingOrigin.snapshot()` reads (requests and unaccounted bytes from one moment each).
+
+    Held: in `early`, before his answer, no byte of the POST is at the origin (not a parsed request, and no stray
+    partial head or body either), whichever way he is about to answer. After: in `final`, the POST is at the origin
+    only if he allowed it, with every byte accounted for, and the pipelined `/after` reached the origin exactly once
+    whichever way he answered. The client side is today's behaviour: denied -> a 403 then a 200; allowed -> two 200s.
+    Both in order (the POST's answer first). The ordering edge stays a known edge: real clients do not pipeline."""
+    assert ("POST", "/w") not in early["reqs"] and early["unaccounted"] == 0, early
+    assert final["unaccounted"] == 0, final
+    assert (("POST", "/w") in final["reqs"]) == (answer == "allowed"), final["reqs"]
+    assert final["reqs"].count(("GET", "/after")) == 1, final["reqs"]
+    assert lines == [b"HTTP/1.1 200 OK" if answer == "allowed" else b"HTTP/1.1 403 Forbidden", b"HTTP/1.1 200 OK"], lines
+
+
 @pytest.mark.parametrize("answer", ["denied", "allowed"])
 def test_a_get_pipelined_behind_a_held_post(make_origin, make_launch_, answer) -> None:
     """First run (round 2 never ran it): POST (carded) and GET in one write on one connection. Before his answer the
     origin has nothing of the POST and another connection is served; after it, the POST reaches the origin only if he
-    allowed it. The pipelined GET's fate (when it reaches the origin, which responses the client gets) is printed."""
+    allowed it. The pipelined GET is a silent read and is forwarded without waiting on the POST's verdict."""
     origin = make_origin()
     L = make_launch_(origin)
     P = L.origin_port
@@ -110,24 +127,64 @@ def test_a_get_pipelined_behind_a_held_post(make_origin, make_launch_, answer) -
                   .encode())
         filed = _wait(lambda: len(L.desk.filed) == 1)
         time.sleep(0.5)
-        early = origin.touched()
         other = L.request("GET", "/other", timeout=10)
+        early = origin.snapshot()                        # one read, after every other request, before his answer
         L.desk.answer["card-1"] = answer
         reply = _read_for(s, 8.0)
     finally:
         s.close()
-    targets = [(r.method, r.target) for r in origin.reqs]
-    lines = [ln for ln in reply.split(b"\r\n") if ln.startswith(b"HTTP/1.1")]
+    time.sleep(0.3)
+    final = origin.snapshot()
+    lines = re.findall(rb"HTTP/1\.1 \d{3} [A-Za-z ]+?(?=\r\n)", reply)
     print(f"RUN R15-10-A13 pipelining ({answer}): filed {filed} early {early} other {other[0]} {other[2]:.2f}s; "
-          f"status lines {lines}; "
-          f"origin {targets}")
-    # the carded POST is not at the origin before his answer (/other is asked for after this read); the pipelined GET
-    # is a silent read and is NOT held behind it (first run, 10-25: forwarded before the POST's verdict)
-    assert filed and ("POST", "/w") not in early["reqs"], early
-    assert other[0] == 200 and other[2] < 5.0
-    assert (("POST", "/w") in targets) == (answer == "allowed"), targets
-    assert reply.startswith(b"HTTP/1.1 " + (b"200" if answer == "allowed" else b"403")), reply[:200]
+          f"status lines {lines}; origin {final['reqs']}")
+    assert filed and other[0] == 200 and other[2] < 5.0
+    check_pipelined(answer, early=early, final=final, lines=lines)
     assert L.stop() == 0
+
+
+def test_the_pipelining_read_is_red_for_a_proxy_that_drops_the_get_or_leaks_part_of_the_post(make_origin) -> None:
+    """The control for the read above: each broken proxy's facts handed to `check_pipelined`, in BOTH answers (one that
+    silently drops `/after`, one whose partial POST head reached the origin as bytes only, one that forwarded the POST
+    before his answer), and the snapshot itself seeing a partial head sent straight at an origin."""
+    def facts(answer, *, early_reqs=(), early_extra=0, final_extra=0, drop_after=False):
+        post = [("POST", "/w")] if answer == "allowed" else []
+        reqs = [("GET", "/other")] + post + ([] if drop_after else [("GET", "/after")])
+        ok = b"HTTP/1.1 200 OK" if answer == "allowed" else b"HTTP/1.1 403 Forbidden"
+        return dict(early={"reqs": [("GET", "/other"), *early_reqs], "unaccounted": early_extra},
+                    final={"reqs": reqs, "unaccounted": final_extra},
+                    lines=[ok] if drop_after else [ok, b"HTTP/1.1 200 OK"])
+    for answer in ("denied", "allowed"):
+        check_pipelined(answer, **facts(answer))
+        for broken in (facts(answer, drop_after=True), facts(answer, early_extra=20), facts(answer, final_extra=20),
+                       facts(answer, early_reqs=[("POST", "/w")])):
+            with pytest.raises(AssertionError):
+                check_pipelined(answer, **broken)
+    origin = make_origin()
+    s = socket.create_connection(("127.0.0.1", origin.port), timeout=5)
+    try:
+        s.sendall(b"POST /w HTTP/1.1\r\nHost: x\r\nContent-Le")
+        assert _wait(lambda: origin.snapshot()["unaccounted"] > 0, 5.0), origin.snapshot()
+    finally:
+        s.close()
+
+
+def test_one_snapshot_sees_a_post_that_arrives_between_two_separate_reads(make_origin) -> None:
+    """Why `early` is one snapshot: the earlier read took the request list and the unaccounted byte count at two
+    different moments. A POST forwarded between them (here sent by hand at the origin) is absent from the first read and
+    fully accounted for by the second, so neither shows it; the one snapshot taken after it does."""
+    origin = make_origin()
+    reqs_then = origin.touched()["reqs"]
+    s = socket.create_connection(("127.0.0.1", origin.port), timeout=5)
+    try:
+        s.sendall(b"POST /w HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+        assert _wait(lambda: ("POST", "/w") in origin.snapshot()["reqs"], 5.0), origin.snapshot()
+        snap = origin.snapshot()
+        assert ("POST", "/w") not in reqs_then and snap["unaccounted"] == 0       # the split read: both clean
+        with pytest.raises(AssertionError):
+            check_pipelined("allowed", early=snap, final=snap, lines=[b"HTTP/1.1 200 OK", b"HTTP/1.1 200 OK"])
+    finally:
+        s.close()
 
 
 def test_the_oracle_is_red_when_the_proxy_forwards_the_post_unheld(make_origin, make_leaky_plain) -> None:
@@ -141,5 +198,12 @@ def test_the_oracle_is_red_when_the_proxy_forwards_the_post_unheld(make_origin, 
         s.sendall(f"POST /w HTTP/1.1\r\nHost: pub.rb.test:{P}\r\nContent-Length: 5\r\n\r\nhello"
                   f"GET /after HTTP/1.1\r\nHost: pub.rb.test:{P}\r\nConnection: close\r\n\r\n".encode())
         assert _wait(lambda: ("POST", "/w") in origin.touched()["reqs"], 5.0), origin.touched()
+        assert _wait(lambda: ("GET", "/after") in origin.snapshot()["reqs"], 5.0), origin.snapshot()
+        snap = origin.snapshot()        # no answer was ever given: the held-until-answer read, in the allowed parameterization
+        for answer in ("denied", "allowed"):
+            with pytest.raises(AssertionError):
+                check_pipelined(answer, early=snap, final=snap,
+                                lines=[b"HTTP/1.1 200 OK" if answer == "allowed" else b"HTTP/1.1 403 Forbidden",
+                                       b"HTTP/1.1 200 OK"])
     finally:
         s.close()

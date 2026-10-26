@@ -261,6 +261,92 @@ def test_b7_the_client_leaves_mid_hold_then_his_allow_forwards_nothing(rig, glue
     assert o.seen.origin_bytes() == 0 and o.lookups == []
 
 
+class _GatedState:
+    """Replaces `desk.state` on one desk: the first call for `card_id` parks inside the call (the decider's poll in
+    flight) until `release` is set, then returns `final`. Every other call answers as the desk does."""
+
+    def __init__(self, desk, card_id: str, final: str) -> None:
+        self.desk, self.card_id, self.final = desk, card_id, final
+        self.entered, self.release, self.returned = threading.Event(), threading.Event(), threading.Event()
+        self.parked = False
+        self._park_lock = threading.Lock()
+        self.real = type(desk).state.__get__(desk)
+        desk.state = self
+
+    def __call__(self, card_id: str) -> str:
+        with self._park_lock:                            # check-and-set: only the first caller for the card parks
+            park = card_id == self.card_id and not self.parked
+            if park:
+                self.parked = True
+        if park:
+            self.entered.set()
+            self.release.wait(15)
+            self.returned.set()
+            return self.final
+        return self.real(card_id)
+
+    def restore(self) -> None:
+        self.release.set()
+        self.desk.__dict__.pop("state", None)
+
+
+def _b7_race(rig, glue, scheme: str, final: str, *, client_leaves: bool):
+    port = rig.ports.http if scheme == "http" else rig.ports.tls
+    n = len(glue.desk.filed)
+    card = f"card-{n + 1}"
+    gate = _GatedState(glue.desk, card, final)
+    try:
+        o = Obs(rig, glue)
+        url = f"{scheme}://s.rb.test:{port}/b7r-{scheme}-{final}-{client_leaves}"
+        if client_leaves:
+            res = clients.curl(glue.port, glue.ca, url, "-X", "POST", "-d", "x=1", max_time=1.5)
+            assert res.rc == 28 and gate.entered.is_set() and not gate.returned.is_set(), (res, gate.entered)
+            assert _wait(lambda: card in glue.desk.ended), glue.desk.ended    # the card ended while the call is parked
+            gate.release.set()                                                # the late answer arrives now
+        else:
+            threading.Timer(1.0, gate.release.set).start()
+            res = clients.curl(glue.port, glue.ca, url, "-X", "POST", "-d", "x=1")
+        assert gate.returned.wait(10)
+        o.done(settle=1.5)
+    finally:
+        gate.restore()
+    return res, o
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_b7_an_allow_in_flight_when_the_client_leaves_forwards_nothing(rig, glue, verdict, scheme):
+    """The race itself: the decider's poll of the card is parked inside `state()` when curl gives up; the close ends the
+    card; THEN the parked call returns his `allowed`, which meets an ended request.
+
+    What this can and cannot go red on: with the client gone, srt forwards nothing whatever the decider answers, so no
+    end-to-end probe here can fail on "the decider honours a late allow"; that property is held by srt AND the
+    decider. The decider-level guarantee is the card-ENDED-while-parked assertion in `_b7_race` (it went red when
+    the close's `Event.ENDED` was made a no-op) and the terminal-state handling in `lifecycle.step`. A late `denied`
+    is not parameterized: it adds no coverage over `allowed`. [judged by 1025+40 head, 10-25, against lane-s9s2b2's
+    mutation run]"""
+    final = "allowed"
+    res, o = _b7_race(rig, glue, scheme, final, client_leaves=True)
+    verdict(f"CHD2 R3 B7 race {scheme} late {final}", "answer returned after the card ended; nothing dialed",
+            f"curl rc={res.rc} | {o.facts()}")
+    assert o.seen.origin_bytes() == 0 and o.lookups == []
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_b7_race_control_the_same_gated_answer_with_the_client_present_forwards(rig, glue, verdict, scheme):
+    """The control: the identical parked-then-released `allowed`, the client still there, reaches the origin; so the
+    gate delivers a real allow and the observers above would see one."""
+    res, o = _b7_race(rig, glue, scheme, "allowed", client_leaves=False)
+    verdict(f"CHD2 R3 B7 race control {scheme}", "gated allow, client present: forwarded, 200", f"{client(res)} | {o.facts()}")
+    assert res.status == 200 and "POST /b7r-" in o.raw and o.lookups == ["s.rb.test"]
+
+
+def test_a_glue_whose_start_never_ran_stops_without_raising(rig):
+    """`_start` registers the glue with the rig before `start()` runs; if `start()` raises early (an import, the PKI
+    assert), `Rig.stop()` still calls `stop()` on it, which must not raise and mask the real failure."""
+    g = ProdGlueRun(rig, "never-started")
+    assert g.stop() is None
+
+
 def test_b7_control_the_client_stays_and_the_allow_forwards(rig, glue, verdict):
     n = len(glue.desk.filed)
 

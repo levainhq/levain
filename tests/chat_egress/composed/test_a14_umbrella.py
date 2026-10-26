@@ -4,7 +4,10 @@ condition, quoted item by item. `ITEMS` maps each quoted item to the test ids th
 - every id names a test that exists (a Python test function by AST, a node test by its title's opening words);
 - every item has at least one id; an item whose map is partial also sits in `GAPS`, saying what is not held;
 - the quotes are the row's, verbatim and all of them, read from the conditions file in the levain project-memory
-  checkout (`CHD2_DOCS_DIR`, as `test_doc_checks.py`; skipped where it is absent).
+  checkout (`CHD2_DOCS_DIR`, as `test_doc_checks.py`). That one check is LOCAL-ONLY by design: project memory is a
+  separate repo, so in CI it skips, and a conditions row that adds, drops or renames an item with `ITEMS` left stale
+  is caught on a machine that has the file, not in CI. What CI does hold: an `ITEMS` entry naming a test that does not
+  exist fails (`test_every_item_maps_to_tests_that_exist`), and so does an item with no id.
 
 Which test holds which item is a reading, recorded per item [judged by lane-s9s2b, 10-25, against each test's body].
 """
@@ -120,9 +123,22 @@ def test_the_checker_can_fail() -> None:
 
 @pytest.mark.parametrize("item", list(ITEMS), ids=[f"item{i}" for i in range(len(ITEMS))])
 def test_every_item_maps_to_tests_that_exist(item) -> None:
-    ids = ITEMS[item]
+    _check_item(item, ITEMS)
+
+
+def _check_item(item: str, items: dict[str, list[str]]) -> None:
+    ids = items[item]
     assert ids, f"no test for {item!r}"
     assert missing(ids) == [], missing(ids)
+
+
+def test_an_item_with_no_id_or_a_stale_id_fails_with_no_project_memory_present() -> None:
+    """The gate CI holds without the conditions file: the per-item check is a pure function of `ITEMS` and the test tree."""
+    some = next(iter(ITEMS))
+    _check_item(some, ITEMS)
+    for broken in ({some: []}, {some: ["composed/test_a14_gaps.py::test_renamed_away"]}):
+        with pytest.raises(AssertionError):
+            _check_item(some, broken)
 
 
 def test_the_gaps_are_named_items() -> None:
@@ -132,12 +148,13 @@ def test_the_gaps_are_named_items() -> None:
 def _row_quotes(text: str) -> list[str]:
     lines = text.splitlines()
     i = next(k for k, ln in enumerate(lines) if ln.startswith("- **R15-10-A14**"))
-    j = next(k for k in range(i + 1, len(lines)) if lines[k].startswith("- **"))
+    j = next((k for k in range(i + 1, len(lines)) if lines[k].startswith("- **")), len(lines))
     return [" ".join(q.split()) for q in re.findall(r'\*"(.*?)"\*', "\n".join(lines[i:j]), re.S)]
 
 
 def test_the_items_are_the_rows_quotes_verbatim_and_all_of_them() -> None:
     path = DOCS / "CHD2_BUILD_CONDITIONS_REV15.md"
     if not path.is_file():
-        pytest.skip(f"{path} is not on this machine (CHD2_DOCS_DIR)")
+        pytest.skip(f"{path} is not on this machine (CHD2_DOCS_DIR): the quote comparison is local-only by design; "
+                    "the id-exists checks above still run here")
     assert _row_quotes(path.read_text()) == list(ITEMS)
