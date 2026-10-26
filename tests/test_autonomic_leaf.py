@@ -40,9 +40,9 @@ ROOT = Path(__file__).resolve().parents[1]   # the checkout under test, from thi
 PKG = ROOT / "levain" / "autonomic"
 
 ALLOWED_STDLIB = frozenset({
-    "__future__", "collections", "contextlib", "copy", "dataclasses", "datetime", "enum", "fcntl",
-    "hashlib", "json", "logging", "math", "os", "pathlib", "platform", "re", "shutil", "sqlite3", "subprocess",
-    "tempfile", "threading", "time", "types",
+    "__future__", "collections", "contextlib", "copy", "dataclasses", "datetime", "enum", "errno", "fcntl",
+    "grp", "hashlib", "json", "logging", "math", "os", "pathlib", "platform", "pwd", "re", "shutil", "sqlite3",
+    "stat", "subprocess", "tempfile", "threading", "time", "types",
     "typing", "unicodedata",
 })
 ALLOWED_OUTSIDE = frozenset({"levain.trust_anchor", "levain.hands_live"})
