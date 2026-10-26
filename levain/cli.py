@@ -3619,7 +3619,7 @@ def _cmd_binding_policy_create(args: argparse.Namespace) -> int:
         # G1-4), so a control, a bidi override or a newline in the guard file cannot hide or forge a line of it
         print(_term_safe(f"lets {', '.join(sorted(actions))} run at {args.lowest} without asking, "
                          f"until {grant['expires_at']}."))
-        print("its guard, stopping every fire it covers whose event trips a kill:")
+        print("its guard (checked now, when it is signed; levain does not check it at fire yet):")
         for i, entry in enumerate(guard):
             print(_term_safe(f"  [{i}] why it might be wrong: {entry['rationale']}"))
             print(_term_safe(f"      kill: {json.dumps(entry['kill_predicate'], sort_keys=True)}"))

@@ -53,6 +53,9 @@ def test_create_prints_what_it_hands_over_before_signing_and_signs_the_stores_id
     out = capsys.readouterr().out
     assert cli._POLICY_WARNING in out and "advisory" in out
     assert out.index(cli._POLICY_WARNING) < out.index("signed: gp-0123456789ab")
+    # O-g1f1-2 (1026-22 RULINGS "G1"): the read-back claims only the check that runs, the one at signing
+    assert "its guard (checked now, when it is signed; levain does not check it at fire yet):" in out
+    assert "stopping every fire" not in out
     g = dict(cw.state().policy.grants["gp-0123456789ab"])
     assert g["store_id"] == cw.store_id and g["lowest_posture"] == "ON_LOOP"
     assert dict(g["actions"]["link0"]) == {"cls": 1, "reversible": True, "external": False, "financial": False}
