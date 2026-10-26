@@ -104,3 +104,41 @@ def test_the_phone_card_stays_frozen_while_the_port_verifies_and_a_later_listing
     assert "not confirmed" in v[-4], v
     assert v[-2] and all(v[-2]), v                                  # the redrawn card offers nothing that signs
     assert (_signed(port.qdir, RID) or {}).get("choice") == "b"
+
+
+@needs_browser
+@needs_ssh
+def test_the_deep_link_sign_button_is_frozen_too_while_the_port_verifies(tmp_path: Path, port: _Port, monkeypatch) -> None:
+    """L3 r1 (codex MED, complement 1): the freeze reached only the card's `.actions`, so the deep link's picked
+    Sign button stayed live over an unsettled answer."""
+    import levain.authority as authority
+    from levain.consent import sign as signmod
+    from tests.test_phone_sign_preselect import _v, deep_link
+
+    _file(port.qdir, RID)
+    go = threading.Event()
+    real = authority.verify_link_sig
+
+    def held(*a, **k):
+        go.wait(60)
+        return real(*a, **k)
+
+    monkeypatch.setattr(authority, "verify_link_sig", held)
+    monkeypatch.setattr(signmod, "ATTEMPT_WAIT_S", 0.5)
+    timer = threading.Timer(9.0, go.set)
+    timer.daemon = True
+    timer.start()
+    picked = "document.querySelector('.req.sign.linked .picked button')"
+    try:
+        out = _drive(tmp_path, deep_link(port.url, RID, TOK) + f"&choice=b&v={_v(port.qdir, RID)}", [
+            PHONE, port.authenticator(), {"until": picked + " && 1", "ms": 30000},
+            {"eval": SENT_THEN_LOST.format(tail=ANSWER)},
+            {"eval": f"{picked}.click() || 1"},
+            {"until": f"/still verifying/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 30000},
+            {"eval": AFTER.format(ms=2500)},
+            {"eval": f"[{picked}].map((b) => !b || b.disabled)"},
+        ])
+    finally:
+        go.set()
+    v = out["values"]
+    assert v[-1] == [True], v

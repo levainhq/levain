@@ -841,7 +841,8 @@
     // and the port is asked about it again; a settled answer redraws the list
     const pend = signUnsettled.get(r.id);
     if (pend && !r.refused) {
-      for (const x of actions.querySelectorAll("button.allow, input")) x.disabled = true;
+      // every control on the card that signs, the deep link's picked button included, not only those in `actions`
+      for (const x of card.querySelectorAll("button.allow, button.pick, input")) x.disabled = true;
       if (!signAsking.has(r.id)) {
         signAsking.add(r.id);
         askAttempt(r.id, pend).then((st) => {
