@@ -303,3 +303,190 @@ def test_routes_trust_replace_through_main(old):
     assert rc == 0, err.getvalue()
     got = json.loads(out.getvalue())
     assert got["verb"] == "routes-trust" and got["store_id"] == OTHER_STORE and got["replaced"]["store_id"] == STORE_ID
+
+
+# --- L3 r1 Q1: a replace killed part way (the intent marker) ----------------------------------------------------------
+
+INTENT = ".replace-intent"
+
+
+def _killed(old, point: str, req: bytes | None = None) -> None:
+    """The replace run in a child and SIGKILLed at ``point`` (``tests/_routes_replace_kill.py``)."""
+    import subprocess
+    import sys
+    rq = old.L / "req.bin"
+    rq.write_bytes(req if req is not None else _req(old.new, OTHER_STORE))
+    root = str(Path(__file__).resolve().parent.parent)
+    p = subprocess.run([sys.executable, "-m", "tests._routes_replace_kill", str(old.L), str(rq), point],
+                       cwd=root, env=dict(os.environ, PYTHONPATH=root), capture_output=True, text=True, timeout=60)
+    assert p.returncode == -9, (p.returncode, p.stdout, p.stderr)
+    rq.unlink()
+
+
+def _control_start(old):
+    from levain.slot import control as C
+    control = C.Control(C.StateStore(old.L / "sessions"), ME, dispatch_uid=ME + 1, routes=RM.ControlRoutes(old.routes))
+    control.start(wake=False)
+    return control
+
+
+KILL_POINTS = ["mkdir:2", "rename:2", "mkdir:3", "rename:3", "written"]
+
+
+@pytest.mark.parametrize("point", KILL_POINTS)
+def test_a_killed_replace_leaves_its_marker_and_control_refuses_to_start(old, point):
+    _killed(old, point)
+    marker = old.routes / INTENT
+    assert marker.exists()
+    with pytest.raises(Refused) as e:
+        _control_start(old)
+    assert e.value.name == "routes-trust-replace-unfinished"
+    from levain.slot.grammar import replace_intent_problem
+    assert replace_intent_problem(old.routes) is not None          # keys' start reads the same test
+    with pytest.raises(Refused) as e:
+        _plain(old, _req(old.new, OTHER_STORE))                    # the plain verb never steps over it
+    assert e.value.name == "routes-trust-replace-unfinished"
+
+
+@pytest.mark.parametrize("point", KILL_POINTS[:-1])
+def test_a_rerun_rolls_a_killed_replace_back(old, point):
+    """A rerun asking for the OLD pair: the half-done replace is rolled back first, then it is the same pair, so
+    nothing more moves; the store is byte for byte what it was before the killed run, and CONTROL starts on it."""
+    before = _snapshot(old.L)
+    _killed(old, point)
+    got = _replace(old, _req(old.signer, STORE_ID))
+    assert got["recovered"] == "rolled-back" and got["aside"] is None
+    assert _snapshot(old.L) == before
+    assert not [p for p in old.routes.iterdir() if p.name.startswith(".replaced-") or p.name == INTENT]
+    _control_start(old)
+    cr = RM.ControlRoutes(old.routes)
+    cr.start_pass()
+    assert cr.problem is None and cr.active().store_id == STORE_ID
+
+
+@pytest.mark.parametrize("point", KILL_POINTS)
+def test_a_rerun_of_the_same_replace_ends_as_one_clean_replace(old, point):
+    before = _snapshot(old.L)
+    _killed(old, point)
+    got = _replace(old, _req(old.new, OTHER_STORE))
+    assert got["recovered"] == ("completed" if point == "written" else "rolled-back")
+    asides = [p for p in old.routes.iterdir() if p.name.startswith(".replaced-")]
+    assert len(asides) == 1 and not (old.routes / INTENT).exists()
+    moved = {k.replace("routes/dispatch/", "dispatch/").replace("routes/verifiers/", "verifiers/")
+             .replace("keys/routemap.head", "routemap.head").replace("routes/trust.", "trust."): v
+             for k, v in before.items() if k != "routes/base.json"}
+    assert {str(p.relative_to(asides[0])): p.read_bytes() for p in asides[0].rglob("*") if p.is_file()} == moved
+    assert RM.read_trust(old.routes).store_id == OTHER_STORE
+    assert os.listdir(old.dispatch) == [] and os.listdir(old.routes / "verifiers") == []
+    _control_start(old)
+
+
+def test_a_marker_that_does_not_parse_is_left_for_the_operator(old):
+    (old.routes / INTENT).write_bytes(b"not json")
+    before = _snapshot(old.L)
+    with pytest.raises(Refused) as e:
+        _replace(old, _req(old.new, OTHER_STORE))
+    assert e.value.name == "routes-trust-replace-unfinished" and INTENT in e.value.detail
+    assert _snapshot(old.L) == before
+
+
+def test_a_failed_put_back_keeps_the_aside_and_the_marker(old, monkeypatch):
+    """complement MED 1: a rename back that fails never lets the aside be removed with the entry still in it."""
+    real_write, real_rename = IH.R.write_durably, os.rename
+
+    def write(path, data, **kw):
+        if Path(path) == old.routes / "trust.json":
+            raise OSError(28, "No space left on device")
+        return real_write(path, data, **kw)
+
+    def rename(src, dst, *a, **kw):
+        if Path(src).name == "dispatch" and Path(src).parent.name.startswith(".replaced-"):
+            raise OSError(5, "Input/output error")
+        return real_rename(src, dst, *a, **kw)
+    monkeypatch.setattr(IH.R, "write_durably", write)
+    monkeypatch.setattr(IH.os, "rename", rename)
+    with pytest.raises(Refused) as e:
+        _replace(old, _req(old.new, OTHER_STORE))
+    assert e.value.name == "routes-trust-write-failed" and "FAILED" in e.value.detail
+    asides = [p for p in old.routes.iterdir() if p.name.startswith(".replaced-")]
+    assert len(asides) == 1 and (asides[0] / "dispatch").is_dir() and str(asides[0]) in e.value.detail
+    assert (old.routes / INTENT).exists()
+
+
+# --- L3 r1 Q2: keys running ---------------------------------------------------------------------------------------------
+
+def test_refused_while_keys_holds_its_ledger(old):
+    path = old.L / "keys" / "ledger.jsonl"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _refused(old, "keys-running")
+    finally:
+        os.close(fd)
+
+
+def test_keys_cannot_start_while_the_replace_holds_its_ledger(old, monkeypatch):
+    from levain.broker import ledger
+    path = old.L / "keys" / "ledger.jsonl"
+    os.close(os.open(path, os.O_RDWR | os.O_CREAT, 0o600))
+    seen = []
+    real = IH._set_aside
+
+    def spy(*a, **kw):
+        try:
+            os.close(ledger.Ledger.open(str(path))._fd)
+            seen.append("opened")
+        except ledger.LedgerOpenError as e:
+            seen.append(e.name)
+        return real(*a, **kw)
+    monkeypatch.setattr(IH, "_set_aside", spy)
+    _replace(old, _req(old.new, OTHER_STORE))
+    assert seen == ["ledger-locked"]
+
+
+# --- L3 r1 Q7 / Q8 / Q9 -------------------------------------------------------------------------------------------------
+
+def test_no_sessions_dir_is_no_references(old):
+    shutil.rmtree(old.L / "sessions")
+    got = _replace(old, _req(old.new, OTHER_STORE))
+    assert got["store_id"] == OTHER_STORE
+    st = os.lstat(old.L / "sessions")
+    assert stat.S_ISDIR(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o700 and st.st_uid == ME
+    assert os.listdir(old.L / "sessions") == []        # no lock file of root's left for CONTROL to trip on
+
+
+def test_any_exception_after_the_put_back_is_a_write_failed_refusal(old, monkeypatch):
+    """deepseek MED 3: an exception of no expected class, after every entry moved, is undone and named."""
+    before = _snapshot(old.L)
+    real = IH._set_aside
+
+    def boom(*a, **kw):
+        real(*a, **kw)
+        raise ValueError("an unexpected shape")
+    monkeypatch.setattr(IH, "_set_aside", boom)
+    with pytest.raises(Refused) as e:
+        _replace(old, _req(old.new, OTHER_STORE))
+    assert e.value.name == "routes-trust-write-failed" and "back in place" in e.value.detail
+    assert _snapshot(old.L) == before
+
+
+def test_a_record_that_does_not_parse_is_named(old):
+    (old.L / "sessions" / f"{SESSION}.json").write_bytes(b"not a record")
+    e = _refused(old, "routes-trust-in-use")
+    assert f"{SESSION}.json" in e.detail
+
+
+def test_a_record_in_a_state_the_helper_does_not_know_counts_as_live(old, monkeypatch):
+    class Rec:
+        session, state = SESSION, "SOMETHING-NEW"
+    monkeypatch.setattr(IH.R, "parse_state", lambda data: Rec)
+    assert IH._session_live(b"{}", SESSION) is True
+
+
+def test_keys_refuses_to_start_on_a_killed_replace(old, capsys):
+    from levain.broker import keys as K
+    _killed(old, "rename:2")
+    rc = K.main(["--runtime-root", str(old.L / "run"), "--lib-root", str(old.L), "--control", str(old.L / "c.sock"),
+                 "--test-single-uid"])
+    assert rc == 3 and "routes-trust-replace-unfinished" in capsys.readouterr().err
+    assert not (old.L / "keys" / "ledger.jsonl").exists()          # refused before the ledger is opened

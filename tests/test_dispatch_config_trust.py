@@ -129,7 +129,7 @@ def test_config_trust_with_no_store_points_at_init(capsys, ddir, root, helper):
 def test_the_default_helper_is_sudo_routes_trust():
     # the conftest stub stands in for it in every test, so the default is read from the source
     import inspect
-    assert "\nROUTES_TRUST_HELPER: Callable[[bytes], tuple[int, str, str]] = _sudo_routes_trust\n" in inspect.getsource(
+    assert "\nROUTES_TRUST_HELPER: Callable[..., tuple[int, str, str]] = _sudo_routes_trust\n" in inspect.getsource(
         dcli)
     assert dcli.ROUTES_TRUST_HELPER is not dcli._sudo_routes_trust and dcli.ROUTES_TRUST_HELPER(b"{}")[0] == 127
     assert dcli.ROUTES_TRUST_REQUEST == IH.ROUTES_TRUST_REQUEST
@@ -165,3 +165,17 @@ def test_sudo_that_cannot_run_is_a_named_refusal_not_a_traceback(capsys, ddir, r
     code, out, _ = _init(capsys, ddir, root, keys)
     assert code == 2
     assert "NOT pinned (sudo-failed" in out and "slots are not set up" not in out
+
+
+def test_the_trust_line_names_a_replace_that_did_not_finish_and_its_recovery():
+    """L3 r1 Q1/Q2: a plain `config trust` over a half-done replace says to stop both services and replace; a replace
+    that first finished or undid one says which; a rotation says to start both services again."""
+    line = dcli._trust_line({"pinned": False, "refused": "routes-trust-replace-unfinished", "why": "marker"})
+    assert "Stop both and run `levain dispatch config trust --replace`" in line
+    pin = {"pinned": True, "refused": None, "why": "", "replaced": {"store_id": "f" * 32}, "aside": "/L/a",
+           "recovered": "rolled-back"}
+    line = dcli._trust_line(pin)
+    assert line.startswith("A replace that did not finish was undone first.")
+    assert "Start the control and keys services again" in line
+    assert dcli._trust_line(dict(pin, replaced=None, recovered="completed")).startswith(
+        "A replace that did not finish was finished first. The route trust is pinned")

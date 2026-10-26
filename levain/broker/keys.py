@@ -104,6 +104,7 @@ from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.slot import Refused as RouteRefused
 from levain.slot import routemaps
+from levain.slot.grammar import replace_intent_problem
 
 T = TypeVar("T")
 
@@ -3518,6 +3519,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 gid = g
             else:
                 admin_gid = g
+    # L3 r1 Q1: a routes-trust --replace that did not finish (its intent marker in L/routes) refuses the start before
+    # the ledger or a route map is read: keys' head may be half moved
+    problem = replace_intent_problem(os.path.join(a.lib_root, "routes"))
+    if problem is not None:
+        print(f"levain gw-keys: refused: routes-trust-replace-unfinished: {problem}", file=sys.stderr)
+        return 3
     raise_nofile()
     # the ONE credential writer (design 1.8): its executor made here at start, its thread at the first commit; it is
     # the credential layer shutdown's latch and step (3) call. Closed after the loop, whatever ended it.

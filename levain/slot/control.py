@@ -70,7 +70,7 @@ from levain.slot import events as EV
 from levain.slot import lineage as LN
 from levain.slot import routemaps
 from levain.slot import tickets as T
-from levain.slot.grammar import INDEX_SPACE
+from levain.slot.grammar import INDEX_SPACE, replace_intent_problem
 from levain.slot.layout import STORE, session_repo
 from levain.slot.runtime_grammar import HANDLE_BYTES, _handle, _keys
 
@@ -1108,8 +1108,13 @@ class Control:
 
     def _start_pass(self, wake: bool = True) -> None:
         """:meth:`start` after the journal lock: the route maps' start pass, the records, the ticket journal, the
-        revoke pass."""
+        revoke pass. A ``routes-trust --replace`` that did not finish (its intent marker in the routes dir,
+        :func:`levain.slot.grammar.replace_intent_problem`) refuses the start ``routes-trust-replace-unfinished``
+        before any of it: the route maps are half moved."""
         if self.routes is not None:
+            problem = replace_intent_problem(self.routes.dir)
+            if problem is not None:
+                raise Refused("routes-trust-replace-unfinished", problem)
             self.routes.start_pass()
         if self.verifiers is not None:
             self.verifiers.start_pass()

@@ -31,6 +31,26 @@ VERBS = ("setup", "repair", "undo", "replenish", "set-retention", "set-dispatch-
 LEASE_EXEMPT = frozenset({"purge", "force-retire", "set-credential", "remove-credential", "set-limits", "routes-base",
                           "routes-trust", "enrol-authority-signer", "remove-authority-signer"})
 
+#: Q16, L3 r1 Q1: the intent marker ``routes-trust --replace`` writes in ``L/routes`` before its first move and removes
+#: after the new pair is read back. While it is there a replace is half done: CONTROL's start and keys' start refuse
+#: ``routes-trust-replace-unfinished`` (:func:`replace_intent_problem`), and the next ``--replace`` finishes or undoes it
+#: before anything else. Here because CONTROL, keys and the install helper all import this module.
+ROUTES_REPLACE_INTENT = ".replace-intent"
+
+
+def replace_intent_problem(routes_dir: "os.PathLike[str] | str") -> str | None:
+    """None when no half-done ``routes-trust --replace`` is marked in ``routes_dir``; else why a service must not
+    start. A marker that cannot be checked (any error but its absence) is a problem too: a start never assumes it away."""
+    path = os.path.join(routes_dir, ROUTES_REPLACE_INTENT)
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"{path} cannot be checked ({e.strerror or e})"
+    return f"{path} marks a routes-trust --replace that did not finish: run levain dispatch config trust --replace"
+
+
 #: A credential's name: the pattern of :data:`levain.broker.creds.NAME_RE`, written here because the broker module
 #: needs the optional h11 and this module is imported where it may be absent; a test pins the two equal.
 CREDENTIAL_NAME_RE = re.compile(r"[a-z0-9-]{1,48}")

@@ -1005,8 +1005,9 @@ def _sudo_routes_trust(data: bytes, *, replace: bool = False) -> tuple[int, str,
     return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
 
 
-#: how ``config init`` / ``config trust`` reach root's ``routes-trust`` (a test replaces it)
-ROUTES_TRUST_HELPER: Callable[[bytes], tuple[int, str, str]] = _sudo_routes_trust
+#: how ``config init`` / ``config trust`` reach root's ``routes-trust`` (a test replaces it); called ``(data)`` or
+#: ``(data, replace=True)``
+ROUTES_TRUST_HELPER: Callable[..., tuple[int, str, str]] = _sudo_routes_trust
 ROUTES_TRUST_REQUEST = "levain-routes-trust-request/1"
 
 
@@ -1017,7 +1018,7 @@ def _pin_route_trust(store: dctl.ControlStore, *, refuse: bool = True, replace: 
     ``{"pinned": bool, "refused": <root's refusal name or None>, "why": <text>}``; a key the log no longer allows
     is a :class:`dctl.ConfigRefused`, or with ``refuse`` False the refusal ``preflight`` (nothing sent to root).
     ``replace`` (Q16) sends ``routes-trust --replace``, which rotates a pin naming another store or key; its answer's
-    ``replaced`` and ``aside`` are passed on."""
+    ``replaced``, ``aside`` and ``recovered`` are passed on."""
     from levain.contracts.canon import canonical_bytes
 
     fp, sid = store.trust_root(), store.store_id()
@@ -1037,7 +1038,8 @@ def _pin_route_trust(store: dctl.ControlStore, *, refuse: bool = True, replace: 
     if isinstance(answer, dict) and answer.get("ok") is True:
         pin: dict[str, Any] = {"pinned": True, "refused": None, "why": ""}
         if replace:
-            pin.update(replaced=answer.get("replaced"), aside=answer.get("aside"))
+            pin.update(replaced=answer.get("replaced"), aside=answer.get("aside"),
+                       recovered=answer.get("recovered"))
         return pin
     if isinstance(answer, dict) and isinstance(answer.get("refused"), str):
         return {"pinned": False, "refused": answer["refused"], "why": stderr.strip()[-300:]}
@@ -1046,14 +1048,22 @@ def _pin_route_trust(store: dctl.ControlStore, *, refuse: bool = True, replace: 
 
 
 def _trust_line(pin: dict[str, Any]) -> str:
+    recovered = pin.get("recovered")
+    before = ({"completed": "A replace that did not finish was finished first. ",
+               "rolled-back": "A replace that did not finish was undone first. "}.get(recovered, "")
+              if pin["pinned"] else "")
     if pin["pinned"] and isinstance(pin.get("replaced"), dict):
         was = pin["replaced"].get("store_id")
-        return ("The route trust is pinned in L/routes (trust.pub, trust.json), replacing "
+        return (before + "The route trust is pinned in L/routes (trust.pub, trust.json), replacing "
                 f"{'the pin to store ' + _safe(str(was)) if was else 'a pin that did not parse'}; the old store's "
-                f"route maps and keys' head are in {_safe(str(pin.get('aside')))}. Start the control service again, "
-                "then sign this store's route map.")
+                f"route maps and keys' head are in {_safe(str(pin.get('aside')))}. Start the control and keys services "
+                "again, then sign this store's route map.")
     if pin["pinned"]:
-        return "The route trust is pinned in L/routes (trust.pub, trust.json)."
+        return before + "The route trust is pinned in L/routes (trust.pub, trust.json)."
+    if pin["refused"] == "routes-trust-replace-unfinished":
+        return (f"The route trust is NOT pinned (routes-trust-replace-unfinished: {_safe(pin['why'])}): a replace "
+                "did not finish, and the control and keys services refuse to start until it does. Stop both and run "
+                "`levain dispatch config trust --replace`.")
     if pin["refused"] == "not-set-up":
         return ("The route trust is NOT pinned: slots are not set up on this host; after setup, run "
                 "`levain dispatch config trust`.")
@@ -1421,8 +1431,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                                        "files), as init does: after slots are set up, or when doctor names them missing.")
     ct.add_argument("--replace", action="store_true",
                     help="Rotate root's pin when it names another store or key (a new store, a lost laptop key). Stop "
-                         "the control service first; refused while an open ticket or a live session uses the old "
-                         "store. The old store's route maps are set aside, not deleted.")
+                         "the control and keys services first; refused while an open ticket or a live session uses "
+                         "the old store. The old store's route maps are set aside, not deleted. Also finishes or "
+                         "undoes a replace that did not finish.")
     data_root(ct)
     cg = csub.add_parser("sign", help="Sign a body as the next item of its kind and accept it, after reading it.")
     cg.add_argument("kind", choices=dctl.KINDS)

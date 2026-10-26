@@ -18,6 +18,8 @@ re-runs through the install helper.
 """
 from __future__ import annotations
 
+import base64
+import contextlib
 import errno
 import fcntl
 import functools
@@ -25,7 +27,6 @@ import json
 import os
 import re
 import select
-import shutil
 import selectors
 import signal
 import stat
@@ -56,8 +57,8 @@ from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Gro
                                   membership_pairs, membership_steps, revive_steps,
                                   shared_group_steps, shared_groups_of, member_state, group_state, uid_retires,
                                   account_state, remove_member_steps, remove_group_steps, remove_account_steps)
-from levain.slot.grammar import (KEY_TYPE_NAMES, LEASE_EXEMPT, PUBLIC_KEY_RE, SESSION_RE, VERBS, InstallCommand,
-                                 check_roots, parse_install_argv)
+from levain.slot.grammar import (KEY_TYPE_NAMES, LEASE_EXEMPT, PUBLIC_KEY_RE, ROUTES_REPLACE_INTENT, SESSION_RE, VERBS,
+                                 InstallCommand, check_roots, parse_install_argv)
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
                              SlotClass, SlotId, allocate, check_capacity, choose_indices, in_own_range,
                              is_levain_account, loopback_alias, read_retired_ids, retired_ids_text, spent_indices)
@@ -2756,17 +2757,32 @@ def _trust_file_holds(path: Path, data: bytes, *, max_bytes: int = 64 * 1024) ->
 #: directory, which is made again empty with the old one's owner, group and mode: CONTROL's route-map generations and
 #: head, its verifier generations and head (signed under the same trust root, 3c-8), and keys' head.
 REPLACE_ASIDE = ((("routes", "dispatch"), True), (("routes", "verifiers"), True), (("keys", "routemap.head"), False))
+#: each entry by the name it has in the aside dir (and in the intent marker's ``moved``)
+_ASIDE_BY_NAME = {parts[-1]: (parts, is_dir) for parts, is_dir in REPLACE_ASIDE}
 #: DECISION: the most session records a replace reads to find the live ones (far above any pool's sessions).
 REPLACE_SESSIONS_MAX = 65536
+#: L3 r1 Q1: the intent marker's format (:data:`levain.slot.grammar.ROUTES_REPLACE_INTENT`): the aside dir's name, the
+#: entries found there to move, the old pin's bytes (base64; null for a file that was not there), and the sha256 of each
+#: file of the new pair, so a rerun can undo the replace from the marker alone, or finish one whose new pair is in force.
+REPLACE_INTENT_FORMAT = "levain-routes-replace/1"
+_INTENT_KEYS = frozenset({"format", "aside", "moved", "old", "new"})
+_ASIDE_NAME = re.compile(r"\.replaced-[0-9]{8}T[0-9]{6}Z(-[0-9]{1,6})?\Z")
+_PAIR_NAMES = ("trust.pub", "trust.json")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+#: the old pin's two files, base64, with the marker's own keys (each file is read at most 64 KiB)
+_INTENT_MAX = 256 * 1024
+#: the states :func:`_session_live` knows to be past live; any other state, a new one included, counts as live
+_NOT_LIVE = frozenset(R.STATES) - R.LIVE_STATES
 
 
 def _session_live(data: bytes, session: str) -> bool:
-    """One ``L/sessions/<session>.json``: live (:data:`levain.slot.records.LIVE_STATES`) or not. A record that does not
-    parse, or names another session, is ``ValueError``: the replace then cannot rule the session out."""
+    """One ``L/sessions/<session>.json``: live unless its state is one this helper knows to be past live
+    (:data:`_NOT_LIVE`; a state it does not know counts as live). A record that does not parse, or names another
+    session, raises: the replace then cannot rule the session out."""
     rec = R.parse_state(data)
     if rec.session != session:
         raise ValueError(f"{session}.json names {rec.session}")
-    return rec.state in R.LIVE_STATES
+    return rec.state not in _NOT_LIVE
 
 
 def _control_references(sessions: Path) -> tuple[frozenset, frozenset]:
@@ -2774,62 +2790,111 @@ def _control_references(sessions: Path) -> tuple[frozenset, frozenset]:
     reads them: every session record (``s-*.json``), and the ticket journal rebuilt by
     :class:`levain.slot.tickets.TicketStore`'s own reader, never compacted or written. The route-map generations are
     :meth:`TicketStore.referenced_generations` of the live sessions (an OPEN ticket's, and a ticket's bound to a live
-    session, R4 §5), the verifier ones :meth:`TicketStore.referenced_verifier_generations`. Anything that cannot be
-    read whole is ``routes-trust-in-use``: a replace never rules a reference out by not reading it."""
+    session, R4 §5), the verifier ones :meth:`TicketStore.referenced_verifier_generations`. No ``sessions`` dir is no
+    references (L3 r1 Q7). Anything else that cannot be read whole is ``routes-trust-in-use``, naming the file: a
+    replace never rules a reference out by not reading it."""
     try:
-        live = set()
         names = sorted(n for n in os.listdir(sessions) if n.startswith("s-") and n.endswith(".json"))
-        if len(names) > REPLACE_SESSIONS_MAX:
-            raise ValueError(f"over {REPLACE_SESSIONS_MAX} session records")
-        for name in names:
+    except FileNotFoundError:
+        return frozenset(), frozenset()
+    except OSError as e:
+        raise Refused("routes-trust-in-use", f"{sessions} cannot be listed ({e.strerror or e}); nothing was "
+                                             "replaced") from None
+    if len(names) > REPLACE_SESSIONS_MAX:
+        raise Refused("routes-trust-in-use", f"over {REPLACE_SESSIONS_MAX} session records in {sessions}; nothing "
+                                             "was replaced")
+    live = set()
+    for name in names:
+        try:
             data = R.read_record(sessions / name)
             if data is not None and _session_live(data, name[:-len(".json")]):
                 live.add(name[:-len(".json")])
+        except (Refused, OSError, ValueError, KeyError, TypeError) as e:
+            raise Refused("routes-trust-in-use", f"session record {sessions / name} cannot be read whole "
+                                                 f"({_why(e)}): fix or remove it; nothing was replaced") from None
+    try:
         store = T.TicketStore(sessions / T.JOURNAL, sessions / "unused-ceiling")
         store._by_attempt, store._by_ticket = store._rebuild(store._read())
         return store.referenced_generations(live), store.referenced_verifier_generations()
-    except FileNotFoundError:
-        raise Refused("routes-trust-in-use", f"{sessions} is not there: whether a session references the old store "
-                                             "cannot be read") from None
     except (Refused, OSError, ValueError, KeyError, TypeError) as e:
-        raise Refused("routes-trust-in-use", f"CONTROL's records cannot be read whole ({getattr(e, 'name', '')} "
-                                             f"{getattr(e, 'detail', '') or e}); nothing was replaced") from None
+        raise Refused("routes-trust-in-use", f"the ticket journal {sessions / T.JOURNAL} cannot be read whole "
+                                             f"({_why(e)}); nothing was replaced") from None
+
+
+def _why(e: BaseException) -> str:
+    if isinstance(e, Refused):
+        return f"{e.name} {e.detail}".strip()
+    return f"{type(e).__name__}: {getattr(e, 'strerror', None) or e}"
 
 
 @contextmanager
-def _control_held(sessions: Path) -> Iterator[None]:
-    """CONTROL's single-CONTROL lock (:meth:`levain.slot.tickets.TicketStore.acquire`'s ``flock`` on
-    ``tickets.jsonl.lock``) taken by root, non-blocking, and held through the block: a CONTROL that holds it is running
-    (``control-running``: stop it, then replace), and one that starts while root holds it refuses its own start, so no
-    ticket is minted against the old store between the reference check and the move. A lock file that is not there is
-    made as CONTROL would make it, 0600 and owned as ``L/sessions`` is, so CONTROL can take it afterwards."""
-    path = sessions / (T.JOURNAL + ".lock")
+def _flock_held(path: Path, refusal: str, running: str, *, create_as: Optional[os.stat_result]) -> Iterator[None]:
+    """An exclusive ``flock`` on a service's single-instance lock file, taken non-blocking and held through the block:
+    held elsewhere is ``refusal`` (``running`` says what to do), and a service starting while root holds it refuses its
+    own start. A lock file that is not there is made 0600 owned as ``create_as`` says (CONTROL's), or, with no
+    ``create_as``, not made: the service never ran, and the block runs unlocked."""
     try:
         try:
-            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except FileNotFoundError:
-            st = os.lstat(sessions)
+            if create_as is None:
+                yield
+                return
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             try:
                 have = os.fstat(fd)
-                if (have.st_uid, have.st_gid) != (st.st_uid, st.st_gid):
-                    os.fchown(fd, st.st_uid, st.st_gid)
+                if (have.st_uid, have.st_gid) != (create_as.st_uid, create_as.st_gid):
+                    os.fchown(fd, create_as.st_uid, create_as.st_gid)
             except OSError:
                 os.close(fd)
                 raise
     except OSError as e:
-        raise Refused("routes-trust-in-use", f"CONTROL's journal lock {path}: {e.strerror or e}") from None
+        raise Refused("routes-trust-in-use", f"the lock {path}: {e.strerror or e}") from None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise Refused("control-running", "CONTROL holds its ticket journal: stop the control service, then run "
-                                             "the replace again") from None
+            raise Refused(refusal, running) from None
         except OSError as e:
-            raise Refused("routes-trust-in-use", f"CONTROL's journal lock {path}: {e.strerror or e}") from None
+            raise Refused("routes-trust-in-use", f"the lock {path}: {e.strerror or e}") from None
         yield
     finally:
         os.close(fd)                          # closing the only descriptor releases the flock
+
+
+@contextmanager
+def _services_held(L: Path) -> Iterator[None]:
+    """CONTROL and keys held stopped through the block, in that order (L3 r1 Q2): CONTROL's single-CONTROL lock
+    (:meth:`levain.slot.tickets.TicketStore.acquire`'s ``flock`` on ``L/sessions/tickets.jsonl.lock``;
+    ``control-running``), then keys' ledger lock (:meth:`levain.broker.ledger.Ledger.open`'s ``flock`` on
+    ``L/keys/ledger.jsonl``; ``keys-running``), so neither mints, reloads or commits a head against the old store
+    between the reference check and the last write. A missing CONTROL lock file is made as CONTROL would make it,
+    owned as ``L/sessions`` is. A missing ``L/sessions`` (L3 r1 Q7) is made root 0700 and no lock file is made in it:
+    no CONTROL can hold or take a lock in a directory only root can enter, and setup's chown of the directory would
+    not reach a root-owned 0600 lock file left in it [judged by lane-r3c9f, 10-26, against ``row_steps``' per-row
+    chown; not run]. A missing ledger: keys never ran, so no RELOAD of an old CONTROL is in flight in it (a RELOAD comes
+    from CONTROL's attach, and CONTROL is held) [judged by lane-r3c9f, 10-26, against codex's L3 r1 HIGH; not run]."""
+    sessions = L / "sessions"
+    made = False
+    try:
+        st = os.lstat(sessions)
+    except FileNotFoundError:
+        try:
+            os.mkdir(sessions, 0o700)
+            os.chmod(sessions, 0o700)
+        except OSError as e:
+            raise Refused("routes-trust-in-use", f"{sessions} is not there and cannot be made ({e.strerror or e})"
+                          ) from None
+        made = True
+        st = os.lstat(sessions)
+    except OSError as e:
+        raise Refused("routes-trust-in-use", f"{sessions}: {e.strerror or e}") from None
+    control = (contextlib.nullcontext() if made else
+               _flock_held(sessions / (T.JOURNAL + ".lock"), "control-running", "CONTROL holds its ticket journal: "
+                           "stop the control service, then run the replace again", create_as=st))
+    with control, _flock_held(L / "keys" / "ledger.jsonl", "keys-running", "keys holds its ledger: stop the keys "
+                              "service, then run the replace again", create_as=None):
+        yield
 
 
 def _aside_entries(L: Path) -> list[tuple[Path, Optional[os.stat_result]]]:
@@ -2850,34 +2915,73 @@ def _aside_entries(L: Path) -> list[tuple[Path, Optional[os.stat_result]]]:
     return out
 
 
-def _set_aside(L: Path, routes: Path, old_pair: Mapping[str, Optional[bytes]],
-               undo: list[Callable[[], None]]) -> Path:
-    """Q16's move: a fresh root 0700 ``L/routes/.replaced-<UTC time>``, a copy of the old pin's two files in it, then
-    each :data:`REPLACE_ASIDE` entry renamed into it (a directory made again empty, with the old one's owner, group
-    and mode), every directory touched fsynced. Each act that changed the live tree pushes its inverse on ``undo``
-    (applied last-first by the caller when the replace fails before the new pair is in force)."""
-    entries = _aside_entries(L)
+def _aside_path(routes: Path) -> Path:
+    """A fresh ``L/routes/.replaced-<UTC time>[-n]`` name (not made)."""
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     aside = routes / f".replaced-{stamp}"
     n = 1
     while os.path.lexists(aside):
         n += 1
         aside = routes / f".replaced-{stamp}-{n}"
+    return aside
+
+
+def _intent_of(aside: Path, entries: Sequence[tuple[Path, Optional[os.stat_result]]],
+               old_pair: Mapping[str, Optional[bytes]], pair: Sequence[tuple[str, bytes]]) -> dict:
+    import hashlib
+    return {"format": REPLACE_INTENT_FORMAT, "aside": aside.name,
+            "moved": [p.name for p, st in entries if st is not None],
+            "old": {n: None if old_pair[n] is None else base64.b64encode(old_pair[n]).decode("ascii")
+                    for n in _PAIR_NAMES},
+            "new": {n: hashlib.sha256(d).hexdigest() for n, d in pair}}
+
+
+def _read_intent(routes: Path) -> Optional[dict]:
+    """The intent marker of a replace that did not finish, checked whole, or None when there is none. One that cannot
+    be read or does not parse is ``routes-trust-replace-unfinished``: it is left for the operator, never guessed at."""
+    marker = routes / ROUTES_REPLACE_INTENT
+    try:
+        raw = R.read_record(marker, max_bytes=_INTENT_MAX)
+        if raw is None:
+            return None
+        obj = canon.parse(raw)
+        ok = (type(obj) is dict and set(obj) == _INTENT_KEYS and obj["format"] == REPLACE_INTENT_FORMAT
+              and type(obj["aside"]) is str and _ASIDE_NAME.fullmatch(obj["aside"]) is not None
+              and type(obj["moved"]) is list and len(set(obj["moved"])) == len(obj["moved"])
+              and all(type(m) is str and m in _ASIDE_BY_NAME for m in obj["moved"])
+              and type(obj["old"]) is dict and set(obj["old"]) == set(_PAIR_NAMES)
+              and type(obj["new"]) is dict and set(obj["new"]) == set(_PAIR_NAMES)
+              and all(type(v) is str and _SHA256_HEX.fullmatch(v) for v in obj["new"].values())
+              and type(obj["old"]["trust.json"]) is str
+              and all(v is None or type(v) is str for v in obj["old"].values()))
+        if ok:
+            obj["old"] = {n: None if v is None else base64.b64decode(v, validate=True) for n, v in obj["old"].items()}
+            return obj
+        why = "it does not hold a replace's intent"
+    except (Refused, OSError, ValueError, canon.ContractError) as e:
+        why = _why(e)
+    raise Refused("routes-trust-replace-unfinished", f"{marker} marks a replace that did not finish and cannot be read "
+                                                     f"({why}): put L/routes and keys' head right by hand (any "
+                                                     "L/routes/.replaced-* dir holds what was moved), then remove it")
+
+
+def _set_aside(L: Path, routes: Path, aside: Path, entries: Sequence[tuple[Path, Optional[os.stat_result]]],
+               old_pair: Mapping[str, Optional[bytes]]) -> None:
+    """Q16's move, run with the intent marker already durable: ``aside`` made root 0700, a copy of the old pin's two
+    files in it, then each :data:`REPLACE_ASIDE` entry renamed into it (a directory made again empty, with the old
+    one's owner, group and mode), every directory touched fsynced. A failure part way is undone from the marker
+    (:func:`_roll_back`)."""
     os.mkdir(aside, 0o700)
     os.chmod(aside, 0o700)
-    undo.append(lambda: shutil.rmtree(aside))
     for name, data in old_pair.items():
         if data is not None:
             R.write_durably(aside / name, data, mode=0o600, fsync=gen_mod._full_fsync)
     for p, st in entries:
         if st is None:
             continue
-        dst = aside / p.name
-        os.rename(p, dst)
-        undo.append(functools.partial(os.rename, dst, p))
+        os.rename(p, aside / p.name)
         if stat.S_ISDIR(st.st_mode):
             os.mkdir(p, 0o700)
-            undo.append(functools.partial(os.rmdir, p))
             made = os.lstat(p)
             if (made.st_uid, made.st_gid) != (st.st_uid, st.st_gid):
                 os.lchown(p, st.st_uid, st.st_gid)
@@ -2886,6 +2990,182 @@ def _set_aside(L: Path, routes: Path, old_pair: Mapping[str, Optional[bytes]],
         problem = _fsync_dir(d)
         if problem is not None:
             raise OSError(errno.EIO, problem)
+
+
+def _roll_back(L: Path, routes: Path, intent: Mapping) -> tuple[list[str], Optional[Path]]:
+    """Undo a replace from its intent marker alone, whatever point it reached (each step tests what is there, so it
+    may run again after a crash of its own): the old pin's bytes put back, each moved entry renamed back (the empty
+    directory the replace made in its place removed first), then every parent fsynced. Returns the steps that failed,
+    and the aside dir when it is kept. Only when every step succeeded are the pin copies removed from the aside and
+    the aside removed, and then only if empty (anything else in it keeps it, named); with any failure it is kept whole.
+    The caller removes the marker only when nothing failed."""
+    problems: list[str] = []
+    aside = routes / intent["aside"]
+    for name in _PAIR_NAMES:
+        try:
+            if R.read_record(routes / name, max_bytes=64 * 1024) != intent["old"][name]:
+                _put_back(routes / name, intent["old"][name])
+        except Exception as e:                                       # fail closed: every failure is named
+            problems.append(f"put back {name}: {_why(e)}")
+    for name in intent["moved"]:
+        parts, is_dir = _ASIDE_BY_NAME[name]
+        p, src = L.joinpath(*parts), aside / name
+        try:
+            if not os.path.lexists(src):
+                if not os.path.lexists(p):
+                    problems.append(f"{p} is neither in place nor in {aside}")
+                continue                                             # never moved
+            if os.path.lexists(p):
+                if not is_dir:
+                    problems.append(f"{p} and {src} are both there")
+                    continue
+                os.rmdir(p)                                          # the empty one the replace made
+            os.rename(src, p)
+        except Exception as e:
+            problems.append(f"move {name} back: {_why(e)}")
+    for d in sorted({routes, L / "keys"} | ({aside} if os.path.isdir(aside) else set())):
+        if os.path.isdir(d):
+            try:
+                problem = _fsync_dir(d)
+            except Exception as e:
+                problem = f"{d} not synced ({_why(e)})"
+            if problem is not None:
+                problems.append(problem)
+    if problems or not os.path.lexists(aside):
+        return problems, aside if os.path.lexists(aside) else None
+    for name in _PAIR_NAMES:
+        copy = aside / name
+        try:
+            if R.read_record(copy, max_bytes=64 * 1024) == intent["old"][name]:
+                os.unlink(copy)
+            os.unlink(aside / (name + ".tmp"))                       # a copy's temp a kill left
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass                                                     # left in the aside, which is then kept
+    try:
+        os.rmdir(aside)
+    except OSError:
+        return problems, aside
+    problem = _fsync_dir(routes)
+    if problem is not None:
+        problems.append(problem)
+    return problems, None
+
+
+def _replace_complete(L: Path, routes: Path, intent: Mapping) -> bool:
+    """The replace the marker names reached its end: every entry it moved is in the aside with its place made again,
+    and both files of the new pair hold the marker's digests, root's and 0644."""
+    import hashlib
+    aside = routes / intent["aside"]
+    for name in intent["moved"]:
+        parts, is_dir = _ASIDE_BY_NAME[name]
+        if not os.path.lexists(aside / name):
+            return False
+        if is_dir:
+            try:
+                st = os.lstat(L.joinpath(*parts))
+            except OSError:
+                return False
+            if not stat.S_ISDIR(st.st_mode):
+                return False
+    for name in _PAIR_NAMES:
+        try:
+            data = R.read_record(routes / name, max_bytes=64 * 1024)
+        except (Refused, OSError):
+            return False
+        if data is None or hashlib.sha256(data).hexdigest() != intent["new"][name] \
+                or not _trust_file_holds(routes / name, data):
+            return False
+    return True
+
+
+def _finish_intent(routes: Path, warn: Callable[[str], object]) -> None:
+    """The marker removed: the replace (or its undo) is whole. Its directory fsync failing only warns: a marker that
+    comes back after a crash names a replace a rerun finds complete (or undone) and removes again."""
+    os.unlink(routes / ROUTES_REPLACE_INTENT)
+    problem = _fsync_dir(routes)
+    if problem is not None:
+        warn(f"levain install-helper: warning: {problem}\n")
+
+
+def _recover(L: Path, routes: Path, intent: Mapping, warn: Callable[[str], object]) -> str:
+    """A rerun's first act when a replace did not finish (L3 r1 Q1): ``completed`` when it reached its end
+    (:func:`_replace_complete`: only the marker is removed), else ``rolled-back`` (:func:`_roll_back`). An undo with
+    a failed step keeps the marker and refuses ``routes-trust-replace-unfinished``, naming the steps and the aside."""
+    if _replace_complete(L, routes, intent):
+        _finish_intent(routes, warn)
+        return "completed"
+    problems, kept = _roll_back(L, routes, intent)
+    if problems:
+        raise Refused("routes-trust-replace-unfinished", f"undoing the replace that did not finish FAILED "
+                                                         f"({'; '.join(problems)}): {routes / ROUTES_REPLACE_INTENT} "
+                                                         f"stays; what was moved is in {kept}")
+    if kept is not None:
+        warn(f"levain install-helper: the replace that did not finish is undone; {kept} held more than it moved and "
+             "is kept\n")
+    _finish_intent(routes, warn)
+    return "rolled-back"
+
+
+def _replace_store(L: Path, routes: Path, pair: Sequence[tuple[str, bytes]], *, fsync: Callable[[int], None] | None,
+                   warn: Callable[[str], object]) -> Path:
+    """Q16's rotation, with CONTROL and keys held stopped (:func:`_services_held`): the reference check
+    (``routes-trust-in-use``, nothing moved); the layout check (``routes-trust-replace-layout``); the intent marker
+    written durably; the old store set aside (:func:`_set_aside`); the new pair written and read back; the marker
+    removed. Any exception between the marker and the read-back is undone from the marker (:func:`_roll_back`) and,
+    unless it is ``KeyboardInterrupt`` or ``SystemExit`` (re-raised after the undo), refused
+    ``routes-trust-write-failed``; an undo with a failed step keeps the marker and the aside and names both. Returns the
+    aside dir."""
+    gens, vgens = _control_references(L / "sessions")
+    if gens or vgens:
+        held = [f"generation {g}" for g in sorted(gens)] + [f"verifier generation {g}" for g in sorted(vgens)]
+        raise Refused("routes-trust-in-use", f"{', '.join(held)} of the pinned store is referenced by an open ticket "
+                                             "or a live session; nothing was replaced (let them end or cancel the "
+                                             "tickets, then replace)")
+    old_pair = {name: R.read_record(routes / name, max_bytes=64 * 1024) for name in _PAIR_NAMES}
+    entries = _aside_entries(L)
+    aside = _aside_path(routes)
+    intent = _intent_of(aside, entries, old_pair, pair)
+    marker = routes / ROUTES_REPLACE_INTENT
+    try:
+        R.write_durably(marker, canon.canonical_bytes(intent), mode=0o600, fsync=gen_mod._full_fsync)
+    except R.NotDurable:
+        pass                                  # in place, perhaps not durable: undone below like any later failure
+    except OSError as e:
+        raise Refused("routes-trust-write-failed", f"the intent marker {marker}: {e.strerror or e}; nothing was "
+                                                   "replaced") from None
+    try:
+        if R.read_record(marker, max_bytes=_INTENT_MAX) != canon.canonical_bytes(intent):
+            raise OSError(errno.EIO, f"{marker} does not hold the intent when read back")
+        problem = _fsync_dir(routes)                  # again: a NotDurable above is durable once this succeeds
+        if problem is not None:
+            raise OSError(errno.EIO, problem)
+        _set_aside(L, routes, aside, entries, old_pair)
+        _write_trust_pair(routes, pair, fsync=fsync, warn=warn)
+    except BaseException as e:
+        problems, kept = _roll_back(L, routes, dict(intent, old=old_pair))   # the old bytes, not their base64
+        if not problems:
+            try:
+                _finish_intent(routes, warn)
+            except Exception as u:
+                problems.append(f"remove {marker}: {_why(u)}")
+        what = e.detail if isinstance(e, Refused) else _why(e)
+        if problems:
+            raise Refused("routes-trust-write-failed", f"{what}; putting the old store back FAILED "
+                                                       f"({'; '.join(problems)}): the old store is in {kept or aside}; "
+                                                       f"{marker} stays, so CONTROL and keys refuse to start until a "
+                                                       "replace finishes or undoes it") from None
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise Refused("routes-trust-write-failed", f"{what}; the old pin and store are back in place"
+                                                   + (f" ({kept} is kept: it held more than was moved)" if kept
+                                                      else "")) from None
+    try:
+        _finish_intent(routes, warn)
+    except OSError as e:
+        raise Refused("routes-trust-write-failed", f"the new pin is in force, but {marker} could not be removed "
+                                                   f"({e.strerror or e}): run the replace again to finish") from None
     return aside
 
 
@@ -2906,14 +3186,13 @@ def run_routes_trust(caller_uid: int, host: HostOS, *, read: Callable[[int], byt
     warns. Before the answer both files are read back and must hold the pair (``routes-trust-write-failed``).
 
     ``replace`` (Q16, ``routes-trust --replace``) rotates a pin to another store or key; with the pinned pair, or no
-    pin, it is the plain verb. Under the install lock, in this order: CONTROL's own journal lock taken and held to the
-    end (:func:`_control_held`: ``control-running`` while CONTROL runs); CONTROL's records read
-    (:func:`_control_references`): any route-map or verifier generation an open ticket or a live session references is
-    ``routes-trust-in-use``, and nothing is moved; the old store set aside whole (:func:`_set_aside`); the new pair
-    written and read back as above. A failure anywhere from the set-aside through the read-back puts the old pin and
-    every moved entry back (``routes-trust-write-failed``; a step of that put-back that fails is named in the detail,
-    with the set-aside dir). The answer adds ``replaced`` (the old ``{store_id, fingerprint}``, None for each the old
-    ``trust.json`` did not parse to; None when nothing was replaced) and ``aside`` (the set-aside dir, or None)."""
+    pin, it is the plain verb. A rotation runs with CONTROL and keys held stopped (:func:`_services_held`;
+    ``control-running`` / ``keys-running``) and is :func:`_replace_store`. A replace that did not finish leaves its
+    intent marker (:data:`levain.slot.grammar.ROUTES_REPLACE_INTENT`): the plain verb then refuses
+    ``routes-trust-replace-unfinished``, and ``replace`` first finishes or undoes it (:func:`_recover`, under the same
+    holds), then goes on as above. The answer adds ``replaced`` (the old ``{store_id, fingerprint}``, None for each the
+    old ``trust.json`` did not parse to; None when nothing was replaced), ``aside`` (the set-aside dir, or None) and
+    ``recovered`` (``completed`` / ``rolled-back`` for a replace that did not finish, else None)."""
     import hashlib
 
     rs = store_seams or RH.Seams(host=host)
@@ -2928,74 +3207,53 @@ def run_routes_trust(caller_uid: int, host: HostOS, *, read: Callable[[int], byt
     warn = (err or sys.stderr).write
     replaced: Optional[dict] = None
     aside: Optional[Path] = None
-    with lock():
-        _check_operator("routes-trust", caller_uid, rs)
+    recovered: Optional[str] = None
+
+    def pinned() -> Optional[dict]:
         try:
             have = _trust_on_disk(routes)
         except Refused:
             if not replace:
                 raise
-            have = {"store_id": None, "fingerprint": None}       # does not parse: set aside like any other pin
+            return {"store_id": None, "fingerprint": None}         # does not parse: set aside like any other pin
         if have is not None and have != trust and not replace:
             raise Refused("routes-trust-exists", f"pinned to store {str(have.get('store_id'))[:32]} and key "
                                                  f"{str(have.get('fingerprint'))[:51]}; rotation is --replace's")
-        if have is None or have == trust:
+        return have
+
+    with lock():
+        _check_operator("routes-trust", caller_uid, rs)
+        intent = _read_intent(routes)
+        if intent is not None and not replace:
+            raise Refused("routes-trust-replace-unfinished", f"{routes / ROUTES_REPLACE_INTENT} marks a replace that "
+                                                             "did not finish: run routes-trust --replace")
+        have = pinned() if intent is None else None
+        if intent is None and (have is None or have == trust):
             _write_trust_pair(routes, pair, fsync=fsync, warn=warn)
         else:
-            replaced = {"store_id": have.get("store_id"), "fingerprint": have.get("fingerprint")}
-            sessions = rs.L / "sessions"
-            with _control_held(sessions):
-                gens, vgens = _control_references(sessions)
-                if gens or vgens:
-                    held = [f"generation {g}" for g in sorted(gens)] + [f"verifier generation {g}"
-                                                                         for g in sorted(vgens)]
-                    raise Refused("routes-trust-in-use", f"{', '.join(held)} of the pinned store is referenced by an "
-                                                         "open ticket or a live session; nothing was replaced (let "
-                                                         "them end or cancel the tickets, then replace)")
-                old_pair = {name: R.read_record(routes / name, max_bytes=64 * 1024) for name, _ in pair}
-                undo: list[Callable[[], None]] = []
-                try:
-                    aside = _set_aside(rs.L, routes, old_pair, undo)
-                    _write_trust_pair(routes, pair, fsync=fsync, warn=warn, undo=undo, old=old_pair)
-                except BaseException as e:
-                    problems = []
-                    for act in reversed(undo):
-                        try:
-                            act()
-                        except OSError as u:
-                            problems.append(f"{getattr(act, 'func', act).__name__}: {u.strerror or u}")
-                    what = (e.detail if isinstance(e, Refused)
-                            else f"{type(e).__name__}: {getattr(e, 'strerror', '') or e}")
-                    if problems:
-                        raise Refused("routes-trust-write-failed", f"{what}; putting the old store back FAILED "
-                                                                   f"({'; '.join(problems)}): the old store is in "
-                                                                   f"{aside}") from None
-                    if isinstance(e, Refused) and not undo:
-                        raise                                    # refused before anything moved (the layout)
-                    if isinstance(e, (Refused, OSError)):
-                        raise Refused("routes-trust-write-failed", f"{what}; the old pin and store are back in "
-                                                                   "place") from None
-                    raise
+            with _services_held(rs.L):
+                if intent is not None:
+                    recovered = _recover(rs.L, routes, intent, warn)
+                    have = pinned()
+                if have is None or have == trust:
+                    _write_trust_pair(routes, pair, fsync=fsync, warn=warn)
+                else:
+                    replaced = {"store_id": have.get("store_id"), "fingerprint": have.get("fingerprint")}
+                    aside = _replace_store(rs.L, routes, pair, fsync=fsync, warn=warn)
     out: dict[str, object] = {"verb": "routes-trust", "store_id": req["store_id"], "fingerprint": req["fingerprint"],
                               "digest": "sha256:" + hashlib.sha256(pub).hexdigest()}
     if replace:
-        out.update(replaced=replaced, aside=None if aside is None else str(aside))
+        out.update(replaced=replaced, aside=None if aside is None else str(aside), recovered=recovered)
     return out
 
 
 def _write_trust_pair(routes: Path, pair: Sequence[tuple[str, bytes]], *, fsync: Callable[[int], None] | None,
-                      warn: Callable[[str], object], undo: list[Callable[[], None]] | None = None,
-                      old: Mapping[str, Optional[bytes]] | None = None) -> None:
+                      warn: Callable[[str], object]) -> None:
     """:func:`run_routes_trust`'s write: each of ``pair`` in order, unless it already holds (:func:`_trust_file_holds`),
-    then both read back. With ``undo`` (the replace), each write first pushes the put-back of that file's ``old``
-    bytes (or its removal, when there were none), and a ``trust.json`` renamed but not durable is in force, so it
-    warns and answers as the plain verb does."""
+    then both read back. A ``trust.json`` renamed but not durable is in force, so it warns and answers."""
     for name, data in pair:
         if _trust_file_holds(routes / name, data):
             continue
-        if undo is not None and old is not None:
-            prior = old.get(name)
-            undo.append(functools.partial(_put_back, routes / name, prior))
         try:
             R.write_durably(routes / name, data, mode=0o644, fsync=fsync or gen_mod._full_fsync)
         except R.NotDurable as e:
@@ -3013,7 +3271,8 @@ def _write_trust_pair(routes: Path, pair: Sequence[tuple[str, bytes]], *, fsync:
 
 
 def _put_back(path: Path, data: Optional[bytes]) -> None:
-    """A replace's put-back of one pin file: its old bytes, root 0644, or no file when there was none."""
+    """A replace's put-back of one pin file: its old bytes, root 0644, or no file when there was none (the caller
+    fsyncs the directory)."""
     if data is None:
         try:
             os.unlink(path)
