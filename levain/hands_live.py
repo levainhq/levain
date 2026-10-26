@@ -1,9 +1,10 @@
 """levain.hands_live — whether anything runs as a hands user, the stop of all of it, and the hands lock.
 
-One home for what ws-git, the session lifecycle and the automation executor each check before the hands user's
-workspace may change: :func:`entity_session_live` (the liveness check), :func:`sweep_hands_user` (the session-end stop),
-the per-entity hands lock (:data:`HANDS_LOCK`, :func:`take_exclusive`), and the root-owned PATH and elevator every child
-here is started with (:data:`SECURE_PATH`, :data:`SUDO`).
+One home for what ws-git and the session lifecycle check before the hands user's workspace may change, and what the
+automation executor (autogrant A1b, ``levain.autonomic``) is to share with them: :func:`entity_session_live` (the
+liveness check), :func:`sweep_hands_user` (the session-end stop), the per-entity hands lock (:data:`HANDS_LOCK`,
+:func:`take_exclusive`), and the root-owned PATH and elevator every child here is started with (:data:`SECURE_PATH`,
+:data:`SUDO`).
 
 Held like :mod:`levain.trust_anchor`: stdlib only and nothing of ``levain``, so ``levain.autonomic`` may import it
 (the leaf test's ``ALLOWED_OUTSIDE``), and 3.9-valid, since root's ``/usr/bin/python3`` imports it through

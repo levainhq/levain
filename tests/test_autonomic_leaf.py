@@ -12,7 +12,7 @@ Adding a stdlib module to the package means adding it here, on purpose, in revie
 
 Two modules outside the package are allowed, by name (``ALLOWED_OUTSIDE``): ``levain.trust_anchor``, the
 trust-anchor rule ``confirm`` uses, which root's route-map check runs without importing this package, and
-``levain.hands_live``, the hands user's liveness check and lock the automation executor shares with ws-git.
+``levain.hands_live``, the hands user's liveness check and lock, which ws-git and the automation executor share.
 Each is held to more than the package is: it may import ``ALLOWED_STDLIB`` roots and nothing of ``levain``.
 
 Also flagged: the builtin loader names (``__import__``, ``__builtins__``, ``exec``, ``eval``, a bare
