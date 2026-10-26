@@ -97,8 +97,8 @@ ROUTE_TYPES = ("egress", "brokered", "subscription_passthrough")   # §4.1
 PROXY_ENV = frozenset(n for b in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY") for n in (b, b.lower()))
 #: wfetch RULINGS Q3: Codex's server-side search mode until Phill rules (fail closed: the front cannot see it).
 CODEX_WEB_SEARCH = "disabled"
-#: The Codex launch's ``-c`` overrides (``start.vendor_argv``), the layer above every config file: a repo the session
-#: trusts can set ``web_search`` in its own ``.codex/config.toml``, which Codex ranks above ``CODEX_HOME``'s file.
+#: The Codex launch's ``-c`` overrides (``start.vendor_argv``), the layer above every config file, so ``web_search``
+#: holds even if the repo's own ``.codex/config.toml`` were loaded (``codex_config`` files the repo untrusted).
 CODEX_LAUNCH_ARGS = ("-c", f'web_search="{CODEX_WEB_SEARCH}"')
 _TERM_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}", re.ASCII)
 #: DECISION: the slot's ``/var/folders/<xx>/<id>`` subtree (the parent of its ``DARWIN_USER_DIR``, as R-M2 measured
@@ -605,8 +605,14 @@ def codex_config(blob: RenderBlob, facts: RenderFacts) -> dict[str, Any]:
     (R-M2 ran it with its sandbox bypassed), so as with CC the OS wall is the sandbox. Linux leaves Codex's
     sandbox_mode at its default (no run measured it inside the view). DECISION: ``cli_auth_credentials_store =
     "file"``, so a passthrough login lands in ``auth.json`` (the file ``keep/`` parks, §2.1), never a keychain.
-    DECISION: ``[projects."<S>/repo"] trust_level = "trusted"``, the trust pre-seed (no run measured Codex's TUI
-    trust dialog). Brokered: the provider block runs/macos-RB 1e measured (env-only base URL did not work)."""
+    ``[projects."<S>/repo"] trust_level = "untrusted"``: Codex then leaves out the repo's own ``.codex/`` layer
+    (its words: "To load project-local config, hooks, and exec policies, update its trust setting"). Filed
+    ``trusted``, the repo's ``.codex/config.toml`` ranked above this file and its ``sandbox_mode``,
+    ``approval_policy`` and ``web_search`` were the effective ones (1026-2/wf1ag, Codex 0.162.1 ``config/read``).
+    With no entry at all, a thread's sandbox under this file's Linux shape was ``readOnly``; ``untrusted`` gave
+    ``workspaceWrite``, as ``trusted`` did. Whether the TUI asks a trust question for an ``untrusted`` entry: no run
+    measured it.
+    Brokered: the provider block runs/macos-RB 1e measured (env-only base URL did not work)."""
     check_facts(blob, facts)
     top: dict[str, Any] = {"approval_policy": "never", "cli_auth_credentials_store": "file",
                            "web_search": CODEX_WEB_SEARCH}
@@ -621,7 +627,7 @@ def codex_config(blob: RenderBlob, facts: RenderFacts) -> dict[str, Any]:
         tables[f"model_providers.{CODEX_PROVIDER}"] = {
             "name": CODEX_PROVIDER, "base_url": f"http://127.0.0.1:{facts.gwport}/r/{brokered}/v1",
             "env_key": TOKEN_ENV["codex"], "wire_api": "responses"}
-    tables[f"projects.{_toml_str(str(facts.S / 'repo'))}"] = {"trust_level": "trusted"}
+    tables[f"projects.{_toml_str(str(facts.S / 'repo'))}"] = {"trust_level": "untrusted"}
     return {"top": top, "tables": tables}
 
 
