@@ -256,3 +256,19 @@ def test_cli_words_write_the_word_and_status_says_why(tmp_path, capsys, monkeypa
     for w in ("sleep", "away", "remote", "back"):
         assert _cli(tmp_path, w) == 0
     assert _cli(tmp_path, "status") == 0
+
+
+@pytest.mark.parametrize("word,on_file", [("sleep", "sleep"), ("away", "away"), ("remote", "remote"),
+                                          ("quiet", "quiet"), ("back", "loud")])
+def test_what_a_standing_loud_leaves_on_file_after_each_word(tmp_path, word, on_file):
+    """Pins the contract the module docstring states (it passes against the code as written; it is a pin, not a
+    reproduction): a 2 h loud is replaced on file by any word but ``back``, which keeps it."""
+    set_word(tmp_path, "loud", duration="2h", now=NOW)
+    set_word(tmp_path, word, duration="5m" if word in ("quiet", "remote") else None, now=NOW + 10)
+    assert presence.read_word(tmp_path)["word"] == on_file
+
+
+def test_loud_off_ends_a_standing_loud(tmp_path):
+    set_word(tmp_path, "loud", duration="2h", now=NOW)
+    assert set_word(tmp_path, "loud", duration="off", now=NOW + 10) is None
+    assert presence.read_word(tmp_path) is None
