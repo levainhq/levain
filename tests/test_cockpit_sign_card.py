@@ -309,12 +309,15 @@ def test_the_listing_names_the_page_the_ceremony_is_pinned_to(tmp_path, monkeypa
 
 # --- the page half, in headless Chrome (D6 5 and the compose round trip) ---------------------------------------------
 
-STRIP_FACET = "document.querySelector('#ck-needs .needs-question .sign-facet .sign-option')"
-FACET_NOTE = "(document.querySelector('#ck-needs .needs-question .sign-note') || {}).textContent"
-OPTION_B = ("[...document.querySelectorAll('#ck-needs .needs-question .sign-option')]"
+# the answer controls live in the focus view: the first read of them taps the strip's question row, which opens it
+OPEN_Q = ("(document.querySelector('#levain-modal .needs-question') || "
+          "((r) => r && (r.click(), null))(document.querySelector('#ck-needs .needs-row.needs-question')))")
+STRIP_FACET = f"{OPEN_Q} && document.querySelector('#levain-modal .needs-question .sign-facet .sign-option')"
+FACET_NOTE = f"(({OPEN_Q}, document.querySelector('#levain-modal .needs-question .sign-note')) || {{}}).textContent"
+OPTION_B = ("[...document.querySelectorAll('#levain-modal .needs-question .sign-option')]"
             ".find(b => /^\\(b\\)/.test(b.textContent))")
-WRITE_IN = "document.querySelector('#ck-needs .needs-question .sign-write-in')"
-WORDS_BTN = ("[...document.querySelectorAll('#ck-needs .needs-question .sign-option')]"
+WRITE_IN = "document.querySelector('#levain-modal .needs-question .sign-write-in')"
+WORDS_BTN = ("[...document.querySelectorAll('#levain-modal .needs-question .sign-option')]"
              ".find(b => /sign my words/.test(b.textContent))")
 BOX = "document.querySelector('[data-ck-compose=recipient]').closest('.tray-dump')"
 BOX_MSG = f"({BOX}.querySelector('.edit-msg') || {{}}).textContent"
@@ -343,10 +346,10 @@ def test_d6_5_a_signed_question_and_a_signed_message_end_to_end(tmp_path, monkey
             DESKTOP, rig.authenticator(),
             {"until": STRIP_FACET + " && 1", "ms": 30000},
             # the request's own options are the buttons, the recommendation is not; no unsigned answer is drawn
-            {"eval": "JSON.stringify({opts: [...document.querySelectorAll('#ck-needs .needs-question .sign-option')]"
-                     ".map(b => b.textContent), unsigned: !!document.querySelector('#ck-needs .needs-question "
-                     ".question-words'), lines: [...document.querySelectorAll('#ck-needs .needs-question .sign-line')]"
-                     ".map(x => x.textContent), blocks: getComputedStyle(document.querySelector('#ck-needs "
+            {"eval": "JSON.stringify({opts: [...document.querySelectorAll('#levain-modal .needs-question .sign-option')]"
+                     ".map(b => b.textContent), unsigned: !!document.querySelector('#levain-modal .needs-question "
+                     ".question-words'), lines: [...document.querySelectorAll('#levain-modal .needs-question .sign-line')]"
+                     ".map(x => x.textContent), blocks: getComputedStyle(document.querySelector('#levain-modal "
                      ".needs-q-blocks')).whiteSpace})"},
             # 1. a cancelled passkey on the write-in: nothing signed, the words stay and the box is usable again
             {"user_verified": False},
@@ -419,8 +422,8 @@ def test_a_page_the_ceremony_is_not_pinned_to_says_where_to_sign_and_draws_no_an
         out = _drive(tmp_path, f"{url}/#write_token={TOK}", [
             DESKTOP,
             {"until": f"/^sign on /.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
-            {"eval": "document.querySelectorAll('#ck-needs .needs-question .sign-option, #ck-needs .needs-question "
-                     ".question-option, #ck-needs .needs-question .question-words').length"},
+            {"eval": "document.querySelectorAll('#levain-modal .needs-question .sign-option, #levain-modal .needs-question "
+                     ".question-option, #levain-modal .needs-question .question-words').length"},
             {"until": BOX + " && 1"},
             _send("hello"),
             {"until": f"/^sign on /.test({BOX_MSG}) && {BOX_MSG}"},

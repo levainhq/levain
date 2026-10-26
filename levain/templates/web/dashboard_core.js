@@ -4782,6 +4782,10 @@
   const signWhy = (r) => (r.body && typeof r.body.message === "string" && r.body.message) || ("refused (HTTP " + r.status + ")");
   const signNotes = new Map();     // request id -> [text, kind, sha256]: what the last ceremony said, kept across redraws
   const signWriteIns = new Map();  // request id -> {sha256, words}: a write-in being typed, kept for the version it was typed on
+  // request id -> what a card drawn while that request's attempt is in flight must undo when the attempt gives its card back.
+  // The focus view builds its card again each time it opens, so a card drawn mid-attempt is frozen (its buttons and words box
+  // disabled) and registers here; the attempt's end releases it, and a signed or unknowable one stays frozen
+  const signPending = new Map();
   let signBusy = 0;                // a ceremony (or a passkey pick) in progress: a second tap anywhere does nothing
   let signListed = null;           // {at, got}: the last listing, shared by every card of one render
   // which enrolled passkey THIS browser used: fingerprint -> credential id, so the OS prompt asks for that one. Browser
@@ -4994,6 +4998,7 @@
         if (signBusy) return say(SIGN_BUSY, "bad");   // the lease holds a second tap, never a button drawn disabled
         signBusy++;
         lock(true);
+        if (!signPending.has(id)) signPending.set(id, new Set());
         let done = "unsigned";
         let rearm = true;     // false: the card stays frozen (signed, or "not sure" until a read finds the version open)
         signWho(Object.assign({}, listing, { signers: signers }), acts, say)
@@ -5037,6 +5042,7 @@
             signBusy--;
             for (const p of acts.querySelectorAll(".sign-pick")) p.remove();
             lock(!rearm);
+            if (rearm) { const later = signPending.get(id); signPending.delete(id); if (later) for (const f of later) f(); }
             signListed = null;
             // a signed (or not-knowable) answer may have closed the request: the board reads again (a row its caller has
             // answered leaves). A definite "nothing was signed" changed nothing, so nothing is read again under the operator
@@ -5075,6 +5081,7 @@
         // the words being signed are frozen from the tap until the ceremony ends; only a definite "nothing was signed"
         // unfreezes them, so a retry is a new tap over the same words
         freeze = { release: () => { box.readOnly = box.disabled = false; } };
+        if (signPending.has(id)) box.readOnly = box.disabled = true;
         b.addEventListener("click", () => {
           if (signBusy) return say(SIGN_BUSY, "bad");
           const w = box.value.trim();
@@ -5090,6 +5097,10 @@
       lock(false);
       sheetBtn = signSheetButton(r, say);
       acts.appendChild(sheetBtn);
+      if (signPending.has(id)) {
+        lock(true);
+        signPending.get(id).add(() => { lock(false); if (freeze) freeze.release(); });
+      }
       wrap.appendChild(acts);
       if (options.length) {
         const lines = el("div", "sign-lines ext-meta", "an option signs the request's message with its line appended:");

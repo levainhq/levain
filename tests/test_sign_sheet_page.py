@@ -160,7 +160,7 @@ def test_a_refused_user_verification_signs_nothing_and_the_option_signs_again(tm
 
 FRAME = "document.getElementById('levain-sign-sheet-frame')"
 IN = f"({FRAME} && {FRAME}.contentDocument)"
-OPEN_SHEET = "document.querySelector('#ck-needs .needs-question .sign-facet .sign-sheet-open')"
+OPEN_SHEET = "document.querySelector('#levain-modal .needs-question .sign-facet .sign-sheet-open')"
 
 
 @needs_browser
@@ -782,8 +782,8 @@ def test_h20_one_open_read_while_the_answer_is_still_landing_keeps_the_sheet_fro
 
 # --- landing integration fixes (I1-I7) ------------------------------------------------------------------------------
 
-CARD_OPTION_A = "document.querySelector('#ck-needs .needs-question .sign-facet .sign-option')"
-CARD_NOTE = "document.querySelector('#ck-needs .needs-question .sign-facet .sign-note').textContent"
+CARD_OPTION_A = "document.querySelector('#levain-modal .needs-question .sign-facet .sign-option')"
+CARD_NOTE = "document.querySelector('#levain-modal .needs-question .sign-facet .sign-note').textContent"
 PARENT_X = "document.querySelector('#levain-sign-sheet .modal-close')"
 
 

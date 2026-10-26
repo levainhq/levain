@@ -22,7 +22,7 @@ from levain.cockpit.verbs import SIGN_PARAM, VerbRegistry, VerbSpec
 from levain.web_server import make_server
 from levain.writes import ActionVerb
 from tests.test_cockpit_flip_parity import _drive, needs_browser
-from tests.test_cockpit_sign_card import (BOX, BOX_MSG, DESKTOP, FACET_NOTE, OPEN, OPTION_B, QRID, STRIP_FACET, TOK,
+from tests.test_cockpit_sign_card import (BOX, BOX_MSG, DESKTOP, FACET_NOTE, OPEN, OPEN_Q, OPTION_B, QRID, STRIP_FACET, TOK,
                                           TXN, WORDS_BTN, WRITE_IN, _Rig, _send, needs_ssh)
 from tests.test_cockpit_sign_routes import _call
 
@@ -190,17 +190,21 @@ NEVER_SENT = ("(() => {{ const real = window.fetch; let armed = true; window.fet
               "if (armed && String(u).endsWith({tail})) {{ armed = false; return Promise.reject(new TypeError('lost')); }} "
               "return real.apply(this, arguments); }}; return 1; }})()")
 CLEARED = f"{BOX} && {BOX}.querySelector('.tray-dump-ta').value === '' && 1"
-# what a panel refetch does to a card it draws again: the strip's card is replaced by a fresh one
-REDRAW = ("(() => { const c = document.querySelector('#ck-needs .needs-question'); if (c) c.remove(); "
-          "delete document.getElementById('ck-needs').dataset.sig; window.LevainCockpitTransport.reload(); return 1; })()")
-PICKS = "document.querySelectorAll('#ck-needs .needs-question .sign-pick').length"
+# what a board read does: the strip's rows are drawn again from a fresh view. The card open in the focus view is not the
+# strip's, so it is neither removed nor drawn again by it: `__card` marks it and CARD_KEPT checks it is still the one on the page
+REDRAW = ("(() => { window.__card = document.querySelector('#levain-modal .needs-question'); const h = document.getElementById('ck-needs'); "
+          "h.replaceChildren(); delete h.dataset.sig; window.LevainCockpitTransport.reload(); return 1; })()")
+STRIP_BACK = "document.querySelectorAll('#ck-needs .needs-row').length > 0"
+CARD_KEPT = f"(window.__card && window.__card.isConnected && window.__card === document.querySelector('#levain-modal .needs-question') && {STRIP_BACK})"
+CLOSE_FOCUS = "(document.querySelector('#levain-modal .modal-close').click(), 1)"
+PICKS = "document.querySelectorAll('#levain-modal .needs-question .sign-pick').length"
 COUNT_RELOADS = ("(() => { const t = window.LevainCockpitTransport; const o = t.reload; window.__reloads = 0; "
                  "t.reload = function () { window.__reloads++; return o.apply(this, arguments); }; return 1; })()")
 RELOADS_AFTER = "new Promise((r) => setTimeout(() => r(window.__reloads), 2500))"
 
 
 def _pick(fp: str) -> dict:
-    return {"eval": f"[...document.querySelectorAll('#ck-needs .needs-question .sign-pick')].find(b => b.title === "
+    return {"eval": f"[...document.querySelectorAll('#levain-modal .needs-question .sign-pick')].find(b => b.title === "
                     f"{json.dumps(fp)}).click() || 1"}
 
 
@@ -257,13 +261,14 @@ def test_a_pick_list_a_redraw_detached_releases_the_card_and_a_write_in_survives
             {"eval": f"{OPTION_B}.click() || 1"},
             {"until": PICKS},
             {"eval": REDRAW},
-            {"until": f"(() => {{ const b = {OPTION_B}; return b && b.isConnected && !b.disabled && 1; }})()"},
-            {"eval": "new Promise((r) => setTimeout(() => r(1), 800))"},
+            {"until": f"{CARD_KEPT} && {PICKS} === 3 && 1", "ms": 20000},   # the board read left the open card, and its pick list, alone
+            {"eval": "[...document.querySelectorAll('#levain-modal .needs-question .sign-pick')]"
+                     ".find(b => b.textContent === 'dismiss').click() || 1"},
             # R9
             {"eval": COUNT_RELOADS},
             {"eval": f"{OPTION_B}.click() || 1"},
             {"until": PICKS, "may_timeout": True},
-            {"eval": "[...document.querySelectorAll('#ck-needs .needs-question .sign-pick')]"
+            {"eval": "[...document.querySelectorAll('#levain-modal .needs-question .sign-pick')]"
                      ".find(b => b.textContent === 'dismiss').click() || 1"},
             {"eval": RELOADS_AFTER},
             # R6
@@ -277,7 +282,11 @@ def test_a_pick_list_a_redraw_detached_releases_the_card_and_a_write_in_survives
             {"until": f"!{WRITE_IN}.disabled && {WRITE_IN}.value", "may_timeout": True},
             {"eval": OPEN % QRID},
             {"eval": REDRAW},
-            {"until": f"{WRITE_IN} && {WRITE_IN}.isConnected && document.querySelector('#ck-needs .sign-facet .sign-option') && 1"},
+            {"until": f"{CARD_KEPT} && {WRITE_IN}.value && 1", "ms": 20000},   # a board read leaves the typed words in the open card
+            {"eval": f"{WRITE_IN}.value"},
+            # closed and opened again: the words are offered again (the request still reads open)
+            {"eval": CLOSE_FOCUS},
+            {"until": f"({OPEN_Q}, {WRITE_IN}) && {WRITE_IN}.value && 1", "ms": 20000},
             {"eval": f"{WRITE_IN}.value"},
         ])
     v = out["values"]
@@ -287,7 +296,8 @@ def test_a_pick_list_a_redraw_detached_releases_the_card_and_a_write_in_survives
     assert "not sure this was signed" in v[16], v[16]
     assert v[17] == "only after the backup", v[17]       # kept, and editable again: the request still reads open
     assert v[18] is True and rig.nothing_signed(QRID)
-    assert v[21] == "only after the backup", v[21]       # a card drawn again offers the same words
+    assert v[21] == "only after the backup", v[21]       # a board read left the words where they were typed
+    assert v[24] == "only after the backup", v[24]       # and a focus view opened again offers the same words
 
 
 @needs_browser
@@ -300,7 +310,7 @@ def test_past_the_listings_cap_the_card_signs_and_a_message_sends(tmp_path, monk
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
             {"until": STRIP_FACET + " && 1", "ms": 30000, "may_timeout": True},
-            {"eval": "[...document.querySelectorAll('#ck-needs .needs-question .sign-option')].map(b => b.textContent)"},
+            {"eval": "[...document.querySelectorAll('#levain-modal .needs-question .sign-option')].map(b => b.textContent)"},
             {"until": BOX + " && 1"},
             _send("past the cap"),
             {"until": CLEARED, "ms": 30000, "may_timeout": True},

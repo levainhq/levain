@@ -35,16 +35,17 @@ def test_a_typed_question_answer_survives_a_new_consent_arriving(tmp_path: Path,
         t = threading.Thread(target=late, daemon=True)
         t.start()
         out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
-            {"until": "document.querySelector('#ck-needs .question-words')"},
-            {"eval": "(() => { const ta = document.querySelector('#ck-needs .question-words'); ta.value = 'my half-typed ruling';"
+            {"eval": "document.querySelector('#ck-needs .needs-question').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .question-words')"},
+            {"eval": "(() => { const ta = document.querySelector('#levain-modal .question-words'); ta.value = 'my half-typed ruling';"
                      " ta.dispatchEvent(new Event('input', {bubbles: true}));"
-                     " window.__ta = ta; return document.querySelectorAll('#ck-needs .needs-card').length; })()"},
+                     " window.__ta = ta; return document.querySelectorAll('#ck-needs .needs-row').length; })()"},
             {"eval": "new Promise((res) => { const t0 = Date.now(); const tick = async () => {"
                      " try { window.__r = String(await window.LevainCockpitView.refetchPanel('decisions')); } catch (e) { window.__r = String(e); }"
-                     " const n = document.querySelectorAll('#ck-needs .needs-card').length;"
+                     " const n = document.querySelectorAll('#ck-needs .needs-row').length;"
                      " if ([...document.querySelectorAll('#ck-needs .consent-tool')].some((e) => e.textContent === 'Edit') || Date.now() - t0 > 20000) return res(JSON.stringify({n,"
-                     " same: document.querySelector('#ck-needs .question-words') === window.__ta,"
-                     " value: (document.querySelector('#ck-needs .question-words') || {}).value, r: window.__r, tools: [...document.querySelectorAll('#ck-needs .consent-tool')].map((e) => e.textContent)}));"
+                     " same: document.querySelector('#levain-modal .question-words') === window.__ta,"
+                     " value: (document.querySelector('#levain-modal .question-words') || {}).value, r: window.__r, tools: [...document.querySelectorAll('#ck-needs .consent-tool')].map((e) => e.textContent)}));"
                      " setTimeout(tick, 250); }; tick(); })"}])["values"]
         t.join(timeout=5)
     assert not errs, errs
