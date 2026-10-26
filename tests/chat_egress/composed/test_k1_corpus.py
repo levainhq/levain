@@ -194,9 +194,22 @@ def test_curl_with_each_listed_query_name_is_carded_never_forwarded_gated(make_o
         assert L.stop() == 0
     finally:
         stop.set()
-    assert origin.reqs == []
+    origin.assert_untouched()
     steps = {r.deciding_step for r in L.records.rows(L.launch_id) if r.kind == "egress_attempt"}
     assert steps == {"card:credential_in_query:denied"}, steps
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="curl is not installed on this machine")
+def test_the_oracle_is_red_when_the_proxy_forwards_a_credential_query(make_origin, make_leaky_plain, tmp_path) -> None:
+    """The curl probe below it through an open relay: the origin oracle (`assert_untouched`) must fail."""
+    origin = make_origin()
+    L = make_leaky_plain(origin)
+    n = sorted(PINNED_QUERY)[0]
+    p = _curl_get(L, tmp_path, f"{n}=QV{n.upper()}")
+    print("RUN RED CONTROL curl credential query:", p.stdout.strip())
+    with pytest.raises(AssertionError) as red:
+        origin.assert_untouched()
+    print("RUN RED CONTROL curl credential query oracle:", str(red.value)[:200])
 
 
 @pytest.mark.skipif(shutil.which("curl") is None, reason="curl is not installed on this machine")
@@ -207,7 +220,7 @@ def test_curl_with_each_listed_query_name_is_a_wall_under_open_network(make_orig
         p = _curl_get(L, tmp_path, f"{n}=QV{n.upper()}")
         assert p.stdout.strip() == "403", (n, p.stdout)
     assert L.stop() == 0
-    assert origin.reqs == []
+    origin.assert_untouched()
     steps = {r.deciding_step for r in L.records.rows(L.launch_id) if r.kind == "egress_attempt"}
     assert steps == {"wall:credential_in_query"}, steps
 
