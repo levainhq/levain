@@ -72,6 +72,9 @@ MAX_DOCUMENT_BYTES = 256 * 1024
 #: Where ``undo_document`` moves a document, inside the workspace.
 UNDONE_DIR = ".levain-undone"
 
+#: The write's temporary file is ``.<name>`` + this + a token the parent chose, beside the document.
+_TMP_MARK = ".levain-write-"
+
 #: The developer tools' fixed location on macOS; C1, the first interpreter candidate, lives under it. A module
 #: constant so a test can point it at a scratch tree.
 _CLT_ROOT = "/Library/Developer/CommandLineTools"
@@ -89,6 +92,8 @@ _PATH = "/usr/bin:/bin"
 
 #: Each probe and each operator-side program call: at most this long.
 PROBE_TIMEOUT = 5.0
+#: After a child is killed (or its kill refused), the wait for it to exit: at most this long.
+_REAP_TIMEOUT = PROBE_TIMEOUT
 #: The child refuses to link its document past this many seconds from its start; the parent waits this plus
 #: ``_CHILD_GRACE_S`` for it to exit.
 CHILD_DEADLINE_S = 30
@@ -145,15 +150,25 @@ def _chain(real: str) -> List[str]:
 def _call(argv: List[str], *, env: Dict[str, str], timeout: float, retry_timeout: bool = False,
           stdin: Optional[bytes] = None) -> "subprocess.CompletedProcess[bytes]":
     """One program run with a bounded wait; ``retry_timeout`` runs it once more on a timeout. Raises
-    ``subprocess.TimeoutExpired`` or ``OSError``."""
+    ``subprocess.TimeoutExpired`` or ``OSError``.
+
+    Not ``subprocess.run``: on a timeout it kills the child and then waits for it without a bound, and a probe's
+    child is sudo, which runs as root, so the kill from the operator uid can be refused; the wait would then last
+    as long as the hands-user process under sudo. Here the kill is best effort and every wait after it is bounded
+    (:func:`_reap`); a child left running is the caller's to stop (the plan sweeps the hands user)."""
     tries = 2 if retry_timeout else 1
     for n in range(tries):
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/", env=env)
         try:
-            return subprocess.run(argv, input=stdin, stdin=None if stdin is not None else subprocess.DEVNULL,
-                                  capture_output=True, cwd="/", env=env, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            if n == tries - 1:
-                raise
+            out, err = proc.communicate(input=stdin, timeout=timeout)
+        except BaseException as e:
+            _kill(proc)
+            _reap(proc)
+            if isinstance(e, subprocess.TimeoutExpired) and n < tries - 1:
+                continue
+            raise
+        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
     raise AssertionError("unreachable")   # pragma: no cover
 
 
@@ -332,7 +347,8 @@ exit 0
 """
 
 # Run by the chosen Python with -I -S (no site, no environment, nothing imported from the workspace) as the hands
-# user. argv: the expected uid, seconds to the link deadline, the workspace, the document's name, then the target's
+# user. argv: the expected uid, seconds to the link deadline, the workspace, the document's name, the temporary
+# file's token (the parent's, so the parent judges exactly this child's temporary file), then the target's
 # components. The body arrives on stdin. Every directory is opened with O_NOFOLLOW from the one before it, so a
 # link anywhere stops the write; the document is written beside its name and LINKED to it, so an existing name is
 # never replaced. Exit 0 prints the new file's uid, inode and size.
@@ -340,7 +356,8 @@ _WRITE_SCRIPT = r"""
 import json, os, sys, time
 t0 = time.monotonic()
 F = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-uid, budget, ws, name, parts = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5:]
+uid, budget, ws, name, token, parts = (int(sys.argv[1]), float(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5],
+                                       sys.argv[6:])
 if os.geteuid() != uid:
     sys.exit(3)
 d = os.open(ws, os.O_RDONLY | os.O_DIRECTORY | F)
@@ -357,7 +374,7 @@ for part in parts:
     d = nd
     if os.fstat(d).st_uid != uid:
         sys.exit(4)
-tmp = "." + name + ".levain-write-" + str(os.getpid())
+tmp = "." + name + "%(tmp_mark)s" + token
 w = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | F, 0o644, dir_fd=d)
 try:
     got = 0
@@ -396,7 +413,7 @@ except BaseException:
 r = os.open(name, os.O_RDONLY | F, dir_fd=d)
 st = os.fstat(r)
 print(json.dumps({"uid": st.st_uid, "ino": st.st_ino, "size": st.st_size}))
-""" % {"max": MAX_DOCUMENT_BYTES}
+""" % {"max": MAX_DOCUMENT_BYTES, "tmp_mark": _TMP_MARK}
 
 # Run as _WRITE_SCRIPT is. argv: the expected uid, seconds to the deadline, the workspace, the recorded sha256, the
 # document's name, then the target's components. Moves <target>/<name> to <workspace>/.levain-undone/<name> (a link,
@@ -474,9 +491,14 @@ def _parse(action_name: str, payload: str) -> Optional[Dict[str, object]]:
 
 def _target_parts(target: str) -> Optional[List[str]]:
     """A target's components (``ws_git.put_parts``'s rule: relative, no ``.``, ``..`` or empty part, no NUL), and
-    never under :data:`UNDONE_DIR`; ``None`` when it breaks the rule."""
+    never under :data:`UNDONE_DIR`; ``None`` when it breaks the rule, or when the filesystem encoding cannot carry
+    it (a lone surrogate): the child's argv could never be built, so that is permanent, never a failed start."""
     parts = target.split("/")
     if not target or any(p in ("", ".", "..") or "\0" in p for p in parts) or parts[0] == UNDONE_DIR:
+        return None
+    try:
+        os.fsencode(target)
+    except UnicodeError:
         return None
     return parts
 
@@ -508,11 +530,16 @@ def hands_reserved(executor: object, *, held: Optional[Reservation] = None) -> I
     lock file cannot be opened); (2) the plan (its clause when it fails); (3) whether anything runs as the hands
     user (``hands_busy:live``, ``hands_busy:cannot_tell``). The liveness check runs after the plan's probes, so a
     process a probe leaves behind is answered here, as busy. Not ready: the lock is released before the block
-    runs. Ready: the lock is held until the block exits. Any other executor: ready, nothing taken."""
+    runs. Ready: the lock is held until the block exits. A subclass of :class:`HandsExecutor` is not one (its
+    methods are its own): ``hands_unready:executor_type``, nothing taken, nothing of it run. Any other executor:
+    ready, nothing taken."""
     if held is not None and held.executor is executor:
         yield held
         return
-    if not isinstance(executor, HandsExecutor):
+    if isinstance(executor, HandsExecutor) and type(executor) is not HandsExecutor:
+        yield _closed(Reservation(executor, ready=False, reason="hands_unready:executor_type"))
+        return
+    if type(executor) is not HandsExecutor:
         r = Reservation(executor, ready=True)
         try:
             yield r
@@ -648,7 +675,9 @@ class HandsExecutor:
                 operator_home, str(s.workspace), str(WORKSPACE_ROOT[s.host]), "--", *_chain(s.python)]
         try:
             r = _call(prop, env={"PATH": _PATH}, timeout=PROBE_TIMEOUT)
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
+            return _after_probe_timeout(s, "sudo_refused")
+        except OSError:
             return "sudo_refused"
         if r.returncode != 0:
             said = r.stdout.decode("utf-8", "replace").strip()
@@ -659,7 +688,7 @@ class HandsExecutor:
         try:
             r = _call(probe, env={"PATH": _PATH}, timeout=PROBE_TIMEOUT)
         except subprocess.TimeoutExpired:
-            return "python_unproven:probe_timeout"
+            return _after_probe_timeout(s, "python_unproven:probe_timeout")
         except OSError:
             return "sudo_refused"
         if r.returncode != 0:
@@ -699,7 +728,7 @@ class HandsExecutor:
         ``None``. Never raises."""
         try:
             plan = reservation.plan if reservation is not None else None
-            if not isinstance(plan, HandsPlan):
+            if type(self) is not HandsExecutor or type(plan) is not HandsPlan:
                 return "cannot_tell"
             return "live" if entity_session_live(plan.uid, timeout=LIVENESS_TIMEOUT) else None
         except Exception:
@@ -715,9 +744,11 @@ class HandsExecutor:
         non-blocking work runs: attribute checks, :meth:`preflight`, the argv, the child's start. ``ok`` only
         when the child exited 0, the hands user was then shown quiescent, and the disk shows the one expected
         result. Raises :class:`NotStarted` when no child was started, :class:`OutcomeUnknown` for everything
-        else that is not ``ok``."""
-        if (reservation is None or reservation.executor is not self or not reservation.ready
-                or not isinstance(reservation.plan, HandsPlan)):
+        else that is not ``ok``, except that an interrupt (a ``BaseException`` that is not an ``Exception``) while
+        the child runs passes through once the child is stopped, the hands user swept and the child reaped (the
+        outcome is just as unknown). A subclass holds no reservation (``no_reservation``)."""
+        if (type(self) is not HandsExecutor or reservation is None or reservation.executor is not self
+                or not reservation.ready or type(reservation.plan) is not HandsPlan):
             raise NotStarted("no_reservation")
         if not reservation.open:
             raise NotStarted("reservation_closed")
@@ -729,10 +760,13 @@ class HandsExecutor:
         assert doc is not None   # preflight read it
         name, target, sha = str(doc["name"]), str(doc["target"]), str(doc["sha256"])
         parts = _target_parts(target) or []
+        tmp = ""
         if action_name == "write_document":
             body: Optional[bytes] = str(doc["body"]).encode("utf-8", "surrogatepass")
+            token = os.urandom(8).hex()
+            tmp = "." + name + _TMP_MARK + token
             argv = [*plan.prefix, "-I", "-S", "-c", _WRITE_SCRIPT, str(plan.uid), str(CHILD_DEADLINE_S),
-                    str(plan.workspace), name, *parts]
+                    str(plan.workspace), name, token, *parts]
         else:
             body = None
             argv = [*plan.prefix, "-I", "-S", "-c", _UNDO_SCRIPT, str(plan.uid), str(CHILD_DEADLINE_S),
@@ -743,24 +777,53 @@ class HandsExecutor:
                                     start_new_session=True)
         except Exception as e:
             raise NotStarted(f"spawn_failed:{_spawn_why(e)}") from e
-        child = _wait(proc, body)
-        swept = sweep_hands_user(plan.user, uid=plan.uid)
+        # From here a child exists. Whatever ends the wait, an interrupt included: the child is sent a kill (best
+        # effort: it is sudo, root, which the operator uid may not signal), the hands user is swept (what runs
+        # under sudo is the hands user's), then a bounded wait reaps the child and its pipes are closed.
+        swept: Optional[str]
+        try:
+            try:
+                child = _wait(proc, body)
+            except BaseException:
+                _kill(proc)
+                raise
+        finally:
+            try:
+                swept = _sweep(plan)
+            finally:
+                _reap(proc)
         if swept is not None:
-            raise OutcomeUnknown(f"{child}:not_quiescent")
+            raise OutcomeUnknown(f"{child}:{swept}")
         if child != "exit_0":
             raise OutcomeUnknown(f"{child}:not_read")
         if action_name == "write_document":
             assert body is not None
-            disk = _read_written(plan, parts, name, body)
+            disk, stale = _read_written(plan, parts, name, body, tmp)
             if disk != "ok":
                 raise OutcomeUnknown(f"{child}:{disk}")
             rel = "/".join([*parts, name])
-            return ExecutionResult(ok=True, detail=str(plan.workspace / rel), downstream_id=f"{plan.user}:{rel}")
+            detail = str(plan.workspace / rel)
+            if stale:
+                detail += f" (left by an earlier run: {', '.join(stale)})"
+            return ExecutionResult(ok=True, detail=detail, downstream_id=f"{plan.user}:{rel}")
         disk = _read_undone(plan, parts, name, sha)
         if disk != "ok":
             raise OutcomeUnknown(f"{child}:{disk}")
         rel = f"{UNDONE_DIR}/{name}"
         return ExecutionResult(ok=True, detail=str(plan.workspace / rel), downstream_id=f"{plan.user}:{rel}")
+
+
+def _after_probe_timeout(s: _Static, why: str) -> str:
+    """``why``, after the hands user is swept: a probe's timeout stops sudo at most, and what sudo started as the
+    hands user would otherwise outlive it and hold every later reservation at ``hands_busy:live``. The plan runs
+    under the exclusive hands lock, so no session owns the user while it is swept. The answer is a refusal either
+    way, so a sweep that fails or raises changes nothing here; the next reservation's liveness check reads what
+    is left."""
+    try:
+        sweep_hands_user(s.user, uid=s.uid)
+    except Exception:
+        pass
+    return why
 
 
 def _spawn_why(e: BaseException) -> str:
@@ -770,9 +833,20 @@ def _spawn_why(e: BaseException) -> str:
     return type(e).__name__
 
 
+def _sweep(plan: HandsPlan) -> Optional[str]:
+    """After the child: ``None`` when every process of the hands user was stopped and shown gone, else
+    ``not_quiescent``, or ``sweep:<Type>`` when the sweep raised (it is not the child's answer, so it is never
+    let out as one)."""
+    try:
+        left = sweep_hands_user(plan.user, uid=plan.uid)
+    except Exception as e:
+        return f"sweep:{type(e).__name__}"
+    return None if left is None else "not_quiescent"
+
+
 def _wait(proc: "subprocess.Popen[bytes]", body: Optional[bytes]) -> str:
     """The child's end, as a short name: ``exit_<n>`` (or the code's name), ``signal_<n>``, ``timeout``, or
-    ``error:<Type>``. A child that outlives its wait is killed and reaped."""
+    ``error:<Type>``. A child that outlives its wait is sent a kill; the caller reaps it."""
     try:
         proc.communicate(input=body, timeout=CHILD_DEADLINE_S + _CHILD_GRACE_S)
     except subprocess.TimeoutExpired:
@@ -790,11 +864,27 @@ def _wait(proc: "subprocess.Popen[bytes]", body: Optional[bytes]) -> str:
 
 
 def _kill(proc: "subprocess.Popen[bytes]") -> None:
+    """SIGKILL, best effort and nothing else: a refused kill (``PermissionError`` on a root parent) is not waited
+    on here, so no later step depends on it."""
     try:
         proc.kill()
-        proc.wait(timeout=PROBE_TIMEOUT)
     except Exception:
         pass
+
+
+def _reap(proc: "subprocess.Popen[bytes]") -> None:
+    """Wait at most :data:`_REAP_TIMEOUT` for the child to exit, then close its pipes. Never raises an
+    ``Exception``; a child still running then is left to the ``Popen`` object's own cleanup."""
+    try:
+        proc.wait(timeout=_REAP_TIMEOUT)
+    except Exception:
+        pass
+    for f in (proc.stdin, proc.stdout, proc.stderr):
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
 
 
 _RD = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
@@ -853,21 +943,26 @@ def _leaf_is(d: int, name: str, plan: HandsPlan, *, size: Optional[int], sha: st
         os.close(f)
 
 
-def _read_written(plan: HandsPlan, parts: List[str], name: str, body: bytes) -> str:
-    """What the disk shows after a write: ``ok`` only for the one expected file and no temporary file left."""
+def _read_written(plan: HandsPlan, parts: List[str], name: str, body: bytes, tmp: str) -> Tuple[str, List[str]]:
+    """What the disk shows after a write: ``ok`` only for the one expected file with THIS child's temporary file
+    (``tmp``, the name the parent gave it) gone. Beside the answer, the temporary files of the same document an
+    earlier run left (a crash, a killed child): reported, never read as this child's."""
     try:
         d = _open_dir(plan, parts)
     except OSError as e:
-        return f"dir:{_errno_name(e)}"
+        return f"dir:{_errno_name(e)}", []
     try:
         seen = _leaf_is(d, name, plan, size=len(body), sha=hashlib.sha256(body).hexdigest())
         if seen != "ok":
-            return seen
-        if any(e.startswith("." + name + ".levain-write-") for e in os.listdir(d)):
-            return "tmp_left"
-        return "ok"
+            return seen, []
+        try:
+            os.stat(tmp, dir_fd=d, follow_symlinks=False)
+            return "tmp_left", []
+        except FileNotFoundError:
+            pass
+        return "ok", sorted(e for e in os.listdir(d) if e.startswith("." + name + _TMP_MARK))
     except OSError as e:
-        return f"unreadable:{_errno_name(e)}"
+        return f"unreadable:{_errno_name(e)}", []
     finally:
         os.close(d)
 

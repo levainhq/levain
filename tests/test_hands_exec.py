@@ -148,51 +148,95 @@ def test_preflight_names_each_permanent_reason(tmp_path):
     assert pf("undo_document", good, context_id="c-1", journaled=False) == "payload_mismatch"   # carries a body
 
 
+@pytest.mark.parametrize("target", ["notes/\ud800x", "\udbff", "a/b\ud83d"])
+def test_a_target_the_filesystem_cannot_encode_is_a_permanent_mismatch(tmp_path, monkeypatch, target):
+    # B1-9 (complement LOW 2): a lone high surrogate passed the target rule, then the child's argv failed to encode
+    # in Popen: spawn_failed, "may be delivered again", forever
+    assert json.loads(json.dumps(target)) == target   # a JSON payload can carry it
+    with pytest.raises(UnicodeEncodeError):
+        os.fsencode(target)
+    rec = _Recorder().install(monkeypatch)
+    ex = _executor(tmp_path)
+    p = _payload(ex.user, target=target)
+    assert ex.preflight("write_document", p, context_id="c-1", journaled=True) == "payload_mismatch"
+    with pytest.raises(X.NotStarted) as e:
+        ex.execute_reserved("write_document", p, context_id="c-1", reservation=_ready(ex, _plan(ex, tmp_path)),
+                            journaled=True)
+    assert str(e.value) == "permanent:payload_mismatch" and rec.events == []
+
+
 # --- execute: starts nothing; execute_reserved's non-starts record no hands argv -----------------------------------
 
 class _Recorder:
     """Stands in for subprocess.Popen / run and the liveness and stop calls, recording each."""
 
-    def __init__(self, popen_raises: BaseException | None = None, communicate_raises: BaseException | None = None):
+    def __init__(self, popen_raises: BaseException | None = None, communicate_raises: BaseException | None = None,
+                 kill_raises: BaseException | None = None, sweep_raises: BaseException | None = None):
         self.events: list = []
         self.popen_raises = popen_raises
         self.communicate_raises = communicate_raises
+        self.kill_raises = kill_raises
+        self.sweep_raises = sweep_raises
 
     def install(self, monkeypatch):
         rec = self
         real = subprocess
+
+        class Pipe:
+            def __init__(self, which):
+                self.which = which
+
+            def close(self):
+                rec.events.append(("close", self.which))
 
         class P:
             def __init__(self, argv, **kw):
                 rec.events.append(("popen", list(argv)))
                 if rec.popen_raises is not None:
                     raise rec.popen_raises
-                self.returncode = 0
+                self.returncode = None
+                self.stdin = Pipe("stdin") if kw.get("stdin") is real.PIPE else None
+                self.stdout, self.stderr = Pipe("stdout"), Pipe("stderr")
 
             def communicate(self, input=None, timeout=None):
                 rec.events.append(("communicate", timeout))
                 if rec.communicate_raises is not None:
                     raise rec.communicate_raises
+                self.returncode = 0
                 return b"", b""
+
+            def poll(self):
+                return self.returncode
 
             def kill(self):
                 rec.events.append(("kill",))
+                if rec.kill_raises is not None:
+                    raise rec.kill_raises
 
             def wait(self, timeout=None):
+                rec.events.append(("wait", timeout))
                 return -9
 
         def run(argv, **kw):
             rec.events.append(("run", list(argv)))
             return real.CompletedProcess(argv, 0, b"", b"")
 
+        def sweep(user, **kw):
+            rec.events.append(("sweep", user))
+            if rec.sweep_raises is not None:
+                raise rec.sweep_raises
+            return None
+
         fake = types.SimpleNamespace(Popen=P, run=run, PIPE=real.PIPE, DEVNULL=real.DEVNULL,
                                      TimeoutExpired=real.TimeoutExpired, CompletedProcess=real.CompletedProcess)
         monkeypatch.setattr(X, "subprocess", fake)
         monkeypatch.setattr(X, "entity_session_live",
                             lambda uid, **kw: rec.events.append(("live", uid)) or False)
-        monkeypatch.setattr(X, "sweep_hands_user",
-                            lambda user, **kw: rec.events.append(("sweep", user)) or None)
+        monkeypatch.setattr(X, "sweep_hands_user", sweep)
         return self
+
+    def kinds(self):
+        return [k for k, *_ in self.events]
 
     def argvs(self):
         return [e for e in self.events if e[0] in ("popen", "run")]
@@ -264,7 +308,50 @@ def test_a_child_that_outlives_its_wait_is_unknown_and_the_hands_user_is_swept(t
         ex.execute_reserved("write_document", _payload(ex.user), context_id="c-1",
                             reservation=_ready(ex, _plan(ex, tmp_path)), journaled=True)
     assert str(e.value) == "timeout:not_read"
-    assert [k for k, *_ in rec.events] == ["popen", "communicate", "kill", "sweep"]
+    # the sweep before the reap: a parent the kill cannot stop (sudo, root) exits once its hands child is gone
+    assert rec.kinds() == ["popen", "communicate", "kill", "sweep", "wait", "close", "close", "close"]
+
+
+def test_a_kill_the_root_parent_refuses_still_sweeps_then_reaps_and_closes_the_pipes(tmp_path, monkeypatch):
+    # B1-3 (complement LOW 1): the child's parent is sudo (root), so kill() from the operator uid can raise
+    # PermissionError; the reap and the pipe close must not depend on it
+    rec = _Recorder(communicate_raises=subprocess.TimeoutExpired(["x"], 1),
+                    kill_raises=PermissionError(errno.EPERM, "Operation not permitted")).install(monkeypatch)
+    ex = _executor(tmp_path)
+    with pytest.raises(OutcomeUnknown) as e:
+        ex.execute_reserved("write_document", _payload(ex.user), context_id="c-1",
+                            reservation=_ready(ex, _plan(ex, tmp_path)), journaled=True)
+    assert str(e.value) == "timeout:not_read"
+    kinds = rec.kinds()
+    assert kinds.index("kill") < kinds.index("sweep") < kinds.index("wait")
+    assert sorted(e[1] for e in rec.events if e[0] == "close") == ["stderr", "stdin", "stdout"]
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit(1)])
+def test_an_interrupt_during_the_wait_kills_sweeps_reaps_and_closes_then_passes_through(tmp_path, monkeypatch,
+                                                                                         interrupt):
+    # B1-3 (codex MED): a BaseException in communicate skipped the kill and the sweep, and the reservation's lock
+    # was released with the child still running. After the cleanup the interrupt passes through, as every
+    # BaseException does in this module; the journal records the effect `unknown` on it
+    rec = _Recorder(communicate_raises=interrupt).install(monkeypatch)
+    ex = _executor(tmp_path)
+    with pytest.raises(type(interrupt)):
+        ex.execute_reserved("write_document", _payload(ex.user), context_id="c-1",
+                            reservation=_ready(ex, _plan(ex, tmp_path)), journaled=True)
+    assert rec.kinds() == ["popen", "communicate", "kill", "sweep", "wait", "close", "close", "close"]
+
+
+def test_a_sweep_that_raises_after_the_child_ran_is_unknown_by_its_type(tmp_path, monkeypatch):
+    # B1-6: sweep_hands_user can raise what it does not catch (entity_session_live's text-mode run() decodes the
+    # process table and catches only OSError and TimeoutExpired: a UnicodeDecodeError passes both)
+    bad = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    rec = _Recorder(sweep_raises=bad).install(monkeypatch)
+    ex = _executor(tmp_path)
+    with pytest.raises(OutcomeUnknown) as e:
+        ex.execute_reserved("write_document", _payload(ex.user), context_id="c-1",
+                            reservation=_ready(ex, _plan(ex, tmp_path)), journaled=True)
+    assert str(e.value) == "exit_0:sweep:UnicodeDecodeError"
+    assert rec.kinds()[-4:] == ["wait", "close", "close", "close"]
 
 
 def test_nothing_between_the_reservation_and_the_child_calls_liveness_or_run(tmp_path, monkeypatch):
@@ -290,41 +377,55 @@ def _ws(tmp_path: Path) -> Path:
 def test_write_script_rows(tmp_path):
     ws = _ws(tmp_path)
     body = b"one document\n"
-    ok = _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-1.md", "a", "b"], body)
+    ok = _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-1.md", "tok", "a", "b"], body)
     assert ok.returncode == 0, ok.stderr
     doc = ws / "a" / "b" / "c-1.md"
     assert doc.read_bytes() == body and (doc.stat().st_mode & 0o777) == 0o644
     assert json.loads(ok.stdout)["size"] == len(body)
     assert sorted(os.listdir(ws / "a" / "b")) == ["c-1.md"]
     # exists: never replaced, the tmp removed
-    again = _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-1.md", "a", "b"], b"other")
+    again = _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-1.md", "tok", "a", "b"], b"other")
     assert again.returncode == 6 and doc.read_bytes() == body and sorted(os.listdir(ws / "a" / "b")) == ["c-1.md"]
     # a symlink at the name: link refuses, nothing written through it
     (ws / "a" / "b" / "c-2.md").symlink_to(tmp_path / "outside")
-    assert _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-2.md", "a", "b"], body).returncode == 6
+    assert _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-2.md", "tok", "a", "b"], body).returncode == 6
     assert not (tmp_path / "outside").exists()
     # not the expected uid: exit 3 before touching anything
-    assert _run_script(X._WRITE_SCRIPT, [ME + 1, 30, ws, "c-3.md", "z"], body).returncode == 3
+    assert _run_script(X._WRITE_SCRIPT, [ME + 1, 30, ws, "c-3.md", "tok", "z"], body).returncode == 3
     assert not (ws / "z").exists()
     # a workspace owned by another uid: exit 4
-    assert _run_script(X._WRITE_SCRIPT, [ME, 30, "/private/tmp" if DARWIN else "/tmp", "c-4.md"], body).returncode == 4
+    other = "/private/tmp" if DARWIN else "/tmp"
+    assert _run_script(X._WRITE_SCRIPT, [ME, 30, other, "c-4.md", "tok"], body).returncode == 4
     # over the cap: exit 5, no tmp left
-    big = _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-5.md", "a"], b"x" * (X.MAX_DOCUMENT_BYTES + 1))
+    big = _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-5.md", "tok", "a"], b"x" * (X.MAX_DOCUMENT_BYTES + 1))
     assert big.returncode == 5 and os.listdir(ws / "a") == ["b"]
     # past the deadline: exit 7, no document, no tmp
-    late = _run_script(X._WRITE_SCRIPT, [ME, 0, ws, "c-6.md", "a"], body)
+    late = _run_script(X._WRITE_SCRIPT, [ME, 0, ws, "c-6.md", "tok", "a"], body)
     assert late.returncode == 7 and os.listdir(ws / "a") == ["b"]
     # a symlinked component: refused, nothing written past it
     (ws / "link").symlink_to(ws / "a")
-    bad = _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-7.md", "link", "b"], body)
+    bad = _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-7.md", "tok", "link", "b"], body)
     assert bad.returncode not in (0, 6) and not (ws / "a" / "b" / "c-7.md").exists()
+    # B1-7: the temporary file is the parent's name (the token), so an earlier run's leftover beside it is neither
+    # touched nor in the way; and this run's own name already taken is never written through (O_EXCL)
+    stale = ws / "a" / "b" / ".c-8.md.levain-write-4242"
+    stale.write_bytes(b"from a crashed run")
+    ok8 = _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-8.md", "t8", "a", "b"], body)
+    assert ok8.returncode == 0, ok8.stderr
+    assert (ws / "a" / "b" / "c-8.md").read_bytes() == body and stale.read_bytes() == b"from a crashed run"
+    assert not (ws / "a" / "b" / ".c-8.md.levain-write-t8").exists()
+    taken = ws / "a" / "b" / ".c-9.md.levain-write-t9"
+    taken.write_bytes(b"in the way")
+    t9 = _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-9.md", "t9", "a", "b"], body)
+    assert t9.returncode not in (0, 6) and not (ws / "a" / "b" / "c-9.md").exists()
+    assert taken.read_bytes() == b"in the way"
 
 
 def test_undo_script_rows(tmp_path):
     ws = _ws(tmp_path)
     body = b"one document\n"
     sha = hashlib.sha256(body).hexdigest()
-    assert _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-1.md", "a"], body).returncode == 0
+    assert _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-1.md", "tok", "a"], body).returncode == 0
     # changed bytes: refused, nothing moved
     assert _run_script(X._UNDO_SCRIPT, [ME, 30, ws, "0" * 64, "c-1.md", "a"]).returncode == 8
     assert (ws / "a" / "c-1.md").exists() and not (ws / X.UNDONE_DIR).exists()
@@ -334,7 +435,7 @@ def test_undo_script_rows(tmp_path):
     # absent now: exit 9
     assert _run_script(X._UNDO_SCRIPT, [ME, 30, ws, sha, "c-1.md", "a"]).returncode == 9
     # a second document of the same name: the moved one is never replaced
-    assert _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-1.md", "a"], body).returncode == 0
+    assert _run_script(X._WRITE_SCRIPT, [ME, 30, ws, "c-1.md", "tok", "a"], body).returncode == 0
     assert _run_script(X._UNDO_SCRIPT, [ME, 30, ws, sha, "c-1.md", "a"]).returncode == 6
     assert (ws / "a" / "c-1.md").exists()
     assert _run_script(X._UNDO_SCRIPT, [ME + 1, 30, ws, sha, "c-1.md", "a"]).returncode == 3
@@ -357,6 +458,8 @@ def _real_child(monkeypatch, *, after=None, swept=None):
     seen = []
 
     def popen(argv, **kw):
+        if "-I" not in argv:   # an operator-side call (the interpreter selection's ls): as it is
+            return real_popen(argv, **kw)
         i = argv.index("-I")
         cut = ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", argv[i - 1], *argv[i:]]
         seen.append(cut)
@@ -414,8 +517,8 @@ def test_a_second_link_or_a_tmp_left_after_an_exit_0_is_unknown(tmp_path, monkey
         ex.execute_reserved("write_document", _payload(ex.user), context_id="c-1", reservation=_ready(ex, plan),
                             journaled=True)
     assert str(e.value) == "exit_0:linked"
-    tmp = ws / "notes" / "in" / ".c-2.md.levain-write-1"
-    _real_child(monkeypatch, after=lambda: tmp.write_text("left"))
+    # THIS child's temporary file left beside the document (its name is the one the parent gave the child)
+    seen = _real_child(monkeypatch, after=lambda: (ws / "notes" / "in" / _tmp_of(seen[-1])).write_text("left"))
     with pytest.raises(OutcomeUnknown) as e:
         ex.execute_reserved("write_document", _payload(ex.user, name="c-2.md"), context_id="c-2",
                             reservation=_ready(ex, plan), journaled=True)
@@ -425,6 +528,29 @@ def test_a_second_link_or_a_tmp_left_after_an_exit_0_is_unknown(tmp_path, monkey
         ex.execute_reserved("write_document", _payload(ex.user, name="c-3.md"), context_id="c-3",
                             reservation=_ready(ex, plan), journaled=True)
     assert str(e.value) == "exit_0:other_bytes"
+
+
+def _tmp_of(argv: list) -> str:
+    """The temporary name the parent gave the write child: ``.<name>.levain-write-<token>``."""
+    i = argv.index("-c")
+    return "." + argv[i + 5] + ".levain-write-" + argv[i + 6]
+
+
+def test_a_stale_tmp_from_an_earlier_run_is_reported_and_never_tmp_left(tmp_path, monkeypatch):
+    # B1-7: a crashed or killed earlier write leaves `.<name>.levain-write-<old>`; every later success read it as
+    # this child's and answered tmp_left, forever. The parent judges only the name it gave this child
+    ex = _executor(tmp_path)
+    ws = _ws(tmp_path)
+    plan = _plan(ex, ws, _python())
+    d = ws / "notes" / "in"
+    d.mkdir(parents=True)
+    (d / ".c-1.md.levain-write-4242").write_text("from a crashed run")
+    _real_child(monkeypatch)
+    r = ex.execute_reserved("write_document", _payload(ex.user), context_id="c-1", reservation=_ready(ex, plan),
+                            journaled=True)
+    assert r.ok and r.downstream_id == f"{ex.user}:notes/in/c-1.md"
+    assert r.detail == f"{d / 'c-1.md'} (left by an earlier run: .c-1.md.levain-write-4242)"
+    assert (d / "c-1.md").read_text() == "hello\n" and (d / ".c-1.md.levain-write-4242").exists()
 
 
 def test_a_real_undo_moves_the_document_only_with_its_recorded_bytes(tmp_path, monkeypatch):
@@ -543,6 +669,35 @@ def test_a_held_handle_is_never_taken_again(tmp_path, monkeypatch):
             assert inner is outer and inner.open
         assert outer.open   # the nested block does not close the taker's reservation
     assert len(takes) == 1 and events == ["plan"]
+
+
+def test_a_subclass_is_refused_at_every_proof_boundary(tmp_path, monkeypatch):
+    # B1-4 (codex MED + complement LOW 3): `isinstance` let a subclass's own _plan run inside hands_reserved, and
+    # its forged plan was yielded as proven; the inherited execute_reserved then launched the forged prefix
+    ex = _executor(tmp_path)
+    forged = X.HandsPlan(user=ex.user, uid=ME, home="/", workspace=tmp_path, python="/bin/sh", python_rule="strict",
+                         prefix=("/bin/sh",))
+    ran: list = []
+
+    class Sub(X.HandsExecutor):
+        __slots__ = ()
+
+        def _plan(self):
+            ran.append("plan")
+            return forged
+
+    sub = Sub(entity_dir=ex.entity_dir, user=ex.user)
+    monkeypatch.setattr(X, "entity_session_live", lambda uid, **kw: False)
+    monkeypatch.setattr(X, "take_exclusive", lambda d: pytest.fail("took the lock for a subclass"))
+    with X.hands_reserved(sub) as r:
+        assert (r.ready, r.reason, r.plan, r.open) == (False, "hands_unready:executor_type", None, False)
+    assert ran == []
+    rec = _Recorder().install(monkeypatch)
+    with pytest.raises(X.NotStarted) as e:   # a reservation it built for itself
+        sub.execute_reserved("write_document", _payload(ex.user), context_id="c-1",
+                             reservation=X.Reservation(sub, ready=True, plan=forged), journaled=True)
+    assert str(e.value) == "no_reservation" and rec.events == []
+    assert sub.last_check(X.Reservation(sub, ready=True, plan=forged)) == "cannot_tell"
 
 
 def test_another_executor_type_is_ready_and_takes_nothing(tmp_path, monkeypatch):
@@ -759,13 +914,27 @@ def test_an_acl_on_any_component_refuses(tmp_path):
 def _ls(monkeypatch, answers):
     calls = []
 
-    def run(argv, **kw):
-        calls.append(argv)
-        a = answers.pop(0)
-        if isinstance(a, BaseException):
-            raise a
-        return subprocess.CompletedProcess(argv, a[0], a[1].encode(), b"")
-    fake = types.SimpleNamespace(run=run, DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired)
+    class P:
+        stdin = stdout = stderr = None
+
+        def __init__(self, argv, **kw):
+            calls.append(argv)
+            self.answer = answers.pop(0)
+            self.returncode = None
+
+        def communicate(self, input=None, timeout=None):
+            if isinstance(self.answer, BaseException):
+                raise self.answer
+            self.returncode = self.answer[0]
+            return self.answer[1].encode(), b""
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return self.returncode
+    fake = types.SimpleNamespace(Popen=P, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL,
+                                 TimeoutExpired=subprocess.TimeoutExpired, CompletedProcess=subprocess.CompletedProcess)
     monkeypatch.setattr(X, "subprocess", fake)
     monkeypatch.setattr(X, "_anchor", lambda p: None)
     return calls
@@ -845,6 +1014,7 @@ def test_the_plan_reads_each_probe_answer(tmp_path, monkeypatch, prop, interp, w
             raise OSError(errno.ENOENT, "no sudo")
         return subprocess.CompletedProcess(argv, a[0], a[1].encode(), b"")
     monkeypatch.setattr(X, "_call", call)
+    monkeypatch.setattr(X, "sweep_hands_user", lambda user, **kw: None)
     got = ex._plan()
     if want == "plan":
         assert isinstance(got, X.HandsPlan) and got.uid == 450 and got.python == static.python
@@ -860,6 +1030,55 @@ def test_the_plan_reads_each_probe_answer(tmp_path, monkeypatch, prop, interp, w
     assert p[15:] == X._chain(static.python)
     if len(calls) > 1:
         assert calls[1][-4:-1] == ["-I", "-S", "-c"] and "os.geteuid() == 450" in calls[1][-1]
+
+
+@pytest.mark.parametrize("which, want", [(1, "sudo_refused"), (2, "python_unproven:probe_timeout")])
+def test_a_probe_timeout_sweeps_the_hands_user_before_answering(tmp_path, monkeypatch, which, want):
+    # B1-8: a probe's timeout stops sudo at most; what sudo started as the hands user outlived it, and every later
+    # reservation answered hands_busy:live with nothing to stop it
+    ex = _executor(tmp_path)
+    static = X._Static(user=ex.user, uid=450, home="/var/empty", host="darwin", workspace=tmp_path / "ws",
+                       python="/opt/py/bin/python3.9", python_rule="strict")
+    monkeypatch.setattr(X.HandsExecutor, "_static", lambda self: static)
+    events: list = []
+
+    def call(argv, **kw):
+        events.append("call")
+        if len(events) == which:
+            raise subprocess.TimeoutExpired(argv, 5)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+    monkeypatch.setattr(X, "_call", call)
+    monkeypatch.setattr(X, "sweep_hands_user", lambda user, **kw: events.append(("sweep", user, kw.get("uid"))))
+    assert ex._plan() == want
+    assert events == ["call"] * which + [("sweep", ex.user, 450)]
+    # a sweep that raises still answers the probe's clause (the answer is a refusal either way)
+    events.clear()
+    monkeypatch.setattr(X, "sweep_hands_user", lambda user, **kw: events.append("sweep") or 1 / 0)
+    assert ex._plan() == want and events[-1] == "sweep"
+
+
+def test_call_never_waits_without_bound_on_a_child_it_cannot_kill(monkeypatch):
+    # with B1-8: subprocess.run's timeout path kills the child, then waits for it WITHOUT a bound. A probe's child
+    # is sudo (root): kill() from the operator uid can raise PermissionError, and the wait then lasts as long as
+    # the hands-user process does, so the sweep after the timeout is never reached
+    victims: list = []
+    real_kill = subprocess.Popen.kill
+
+    def refused(self):
+        victims.append(self)
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+    monkeypatch.setattr(subprocess.Popen, "kill", refused)
+    monkeypatch.setattr(X, "_REAP_TIMEOUT", 0.2, raising=False)
+    import time
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            X._call(["/bin/sleep", "4"], env={"PATH": "/usr/bin:/bin"}, timeout=0.3)
+        assert time.monotonic() - t0 < 2.0
+    finally:
+        for p in victims:
+            real_kill(p)
+            p.wait()
 
 
 def test_a_plan_that_raises_is_not_ready_and_releases_the_lock(tmp_path, monkeypatch):
