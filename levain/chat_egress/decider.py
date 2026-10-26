@@ -8,7 +8,8 @@ first and drains the second, and composes, per request, in this order (the first
      id survives the refusal; it is logged and counted).
   2. the audit value (item 2): no one well-formed `x-levain-audit` -> deny `audit-missing`; a value already
      spent this launch, or a new one once `max_audit_ids` are spent (503 `audit_cap`) -> denied, no row.
-  3. the ONE route lookup (`keys.lookup`, R15-18-L1) and the launch's mode, read live (`LiveSetting`, C1).
+  3. the ONE route lookup (`keys.lookup`, R15-18-L1) and the launch's mode, read live (`LiveSetting`, C1) and capped
+     at the mode the launch started with (`Capped`, Q-R15-9: a tightening applies live, a loosening never does).
   4. `parse.walls` (R-2 .. R-4), then R-5's header strip (`strip.strip`; too many credential names -> deny).
   5. C-3: `resolver.Resolver` (bounded, timed out) and `guard.address_wall`: any non-public answer walls
      `non_public_address` BEFORE any card (R15-10-A4); no answer denies.
@@ -296,6 +297,35 @@ class LiveSetting:
                 return self._closed_value
 
 
+STRICTEST_FIRST = (classify.GATED, classify.OPEN_NETWORK)
+"""The modes, strictest first: `Capped` answers whichever of two values comes first here."""
+
+
+def _stricter(a: str, b: str) -> str:
+    rank = {m: i for i, m in enumerate(STRICTEST_FIRST)}
+    return min(a, b, key=lambda m: rank.get(m, -1)) if a in rank and b in rank else STRICTEST_FIRST[0]
+
+
+class Capped:
+    """The decider's mode per request (Q-R15-9: "tightening the standing default applies live; loosening applies from
+    the next launch"): the stricter of the live setting's answer and ``launched``, the mode the launch started with,
+    fixed for its life. A value outside `STRICTEST_FIRST` on either side answers the strictest mode."""
+
+    def __init__(self, live: Any, launched: str) -> None:
+        self._live = live
+        self.launched = launched if launched in STRICTEST_FIRST else STRICTEST_FIRST[0]
+
+    @property
+    def reader(self) -> threading.Thread | None:
+        return getattr(self._live, "reader", None)
+
+    def get(self) -> str:
+        return _stricter(self._live.get(), self.launched)
+
+    def close(self) -> None:
+        self._live.close()
+
+
 class Fixed:
     """A setting that does not change for the launch."""
 
@@ -377,7 +407,9 @@ class Decider:
     launch_id    the chat launch (the rows' launch id; a `launches` row of the dispatch store)
     records      `records.EgressRecords` over that dispatch store
     routes       the launch's `keys.RouteSet` (built once, at launch)
-    mode         a `LiveSetting` / `Fixed` of `classify.GATED` or `classify.OPEN_NETWORK`
+    mode         a `LiveSetting` / `Fixed` of `classify.GATED` or `classify.OPEN_NETWORK`, held as `Capped` at
+                 `launch_mode` (Q-R15-9): the mode the launch started with, as `launch.start_egress` read it for the
+                 header and digest; when None, `mode` is read once here
     liveness     `keys.AuthorityLiveness` (or any `keys.Liveness`); credentials: `keys.LaunchCredentials`
     cards        a `CardDesk`; resolver: a `resolver.Resolver`
     """
@@ -385,10 +417,11 @@ class Decider:
     def __init__(self, link: socket.socket, obs: socket.socket, *, launch_id: str, records: rec.EgressRecords,
                  routes: keys.RouteSet, mode: Any, liveness: Any, credentials: keys.LaunchCredentials,
                  cards: CardDesk, resolver: Resolver, limits: Limits = Limits(),
-                 link_fault: Callable[[int], int | None] | None = None) -> None:
+                 link_fault: Callable[[int], int | None] | None = None, launch_mode: str | None = None) -> None:
         self.link = Link(link, fault=link_fault)
         self._obs = obs
-        self.launch_id, self.records, self.routes, self.mode = launch_id, records, routes, mode
+        self.launch_id, self.records, self.routes = launch_id, records, routes
+        self.mode = Capped(mode, mode.get() if launch_mode is None else launch_mode)
         self.liveness, self.credentials, self.cards, self.resolver = liveness, credentials, cards, resolver
         self.limits = limits
         self.adverts = advert.AdvertisementSet()
