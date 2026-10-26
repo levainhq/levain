@@ -441,7 +441,7 @@ def _read_slot_dirs(slots: Path) -> tuple[dict[str, tuple[str, str]], list[str]]
 
 
 def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
-                          free_bytes: Any = None) -> list[CheckResult]:
+                          free_bytes: Any = None, now: float | None = None) -> list[CheckResult]:
     """Read-only rows over the isolation install's facts the OPERATOR can read (doctor runs as the operator): the
     pool's configured counts (``policy/pool``), the slots' state files (root-owned 0644 in 0755 dirs; the group is
     ``wheel`` on macOS) and the store volume's free space. Nothing is leased, probed or run as a slot user. A fact that
@@ -480,6 +480,12 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
         rows = _slot_rows(store, layout, R, Refused)
     except OSError as exc:
         rows = [CheckResult("agent slots", True, f"could not be read ({_slot_why(exc)})", warn=True)]
+    else:
+        try:
+            rows += _probe_rows(store, R, Refused, time.time() if now is None else now)
+        except OSError as exc:
+            rows.append(CheckResult("agent firewall probe", True, f"could not be read ({_slot_why(exc)})",
+                                    warn=True))
 
     try:
         free = (free_bytes if free_bytes is not None
@@ -532,6 +538,105 @@ def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResu
                             "The pool is below its configured counts; its install helper replenishes it.")]
     return [CheckResult("agent slots", True, detail + (f"; not usable (extra): {', '.join(bad)}" if bad else "")
                         + note)]
+
+
+#: V13 (O4, N10): the record root writes after each firewall probe, beside the slot's state (levain.slot.probe's
+#: RECORD_NAME / RECORD_FORMAT; a test holds the two equal). Doctor reads it and never probes.
+_PROBE_RECORD_NAME = "probe"
+_PROBE_RECORD_FORMAT = "levain-probe-result/1"
+_PROBE_KEYS = frozenset({"format", "at", "session", "outcome", "cause"})
+_PROBE_OUTCOMES = ("closed", "open", "inconclusive", "unknown")
+#: DECISION (V13 §7): a closed result older than this is said stale; a gauge says its own age.
+_PROBE_STALE_S = 24 * 3600
+_PROBE_SKEW_S = 300           # DECISION: a stamp this far ahead of the clock is not read as fresh
+
+
+def _age_text(s: float) -> str:
+    s = max(0, int(s))
+    if s < 120:
+        return f"{s} s"
+    if s < 120 * 60:
+        return f"{s // 60} min"
+    if s < 48 * 3600:
+        return f"{s // 3600} h"
+    return f"{s // 86400} days"
+
+
+def _probe_one(path: Path, now: float, R: Any, Refused: Any) -> tuple[int, str]:
+    """(level, words) for one slot's record: level 0 ok, 1 not probed yet, 2 warn, 3 bad. The stamp is parsed with
+    the writer's own format (``levain.slot.probe.RECORD_AT_FORMAT``) and must spell back to itself; an ``open``
+    record is a failure whatever its stamp says (a stamp anomaly is appended); the record's text is marked before
+    it is shown."""
+    import calendar
+
+    from levain import unshowable
+    from levain.contracts import ContractError, canon
+    from levain.slot import probe as P
+
+    try:
+        raw = R.read_record(path, max_bytes=_SLOT_RECORD_CAP)
+    except (Refused, OSError) as exc:
+        return 2, f"record unreadable ({_slot_why(exc)})"
+    if raw is None:
+        return 1, "not probed yet"
+    try:
+        rec = canon.parse(raw)
+        if type(rec) is not dict or set(rec) != _PROBE_KEYS or rec["format"] != _PROBE_RECORD_FORMAT \
+                or rec["outcome"] not in _PROBE_OUTCOMES or not all(type(rec[k]) is str for k in _PROBE_KEYS):
+            raise ValueError("shape")
+    except (ContractError, ValueError):
+        return 2, "record unreadable (not a levain-probe-result/1 record)"
+    outcome = rec["outcome"]
+    sess, cause = unshowable.mark(rec["session"][:64], allow=""), unshowable.mark(rec["cause"][:96], allow="")
+    try:
+        parsed = time.strptime(rec["at"], P.RECORD_AT_FORMAT)
+        if time.strftime(P.RECORD_AT_FORMAT, parsed) != rec["at"]:
+            raise ValueError("at")
+        at = calendar.timegm(parsed)
+    except (ValueError, OverflowError):
+        if outcome == "open":
+            return 3, f"OPEN at its last probe (stamp unreadable): the slot reached a vendor address ({cause}; session {sess})"
+        return 2, "record unreadable (not a levain-probe-result/1 record)"
+    age = now - at
+    future = age < -_PROBE_SKEW_S
+    if outcome == "open":
+        when = f"stamped in the future ({rec['at']})" if future else f"{_age_text(age)} ago"
+        return 3, f"OPEN at its last probe, {when}: the slot reached a vendor address (session {sess})"
+    if future:
+        return 2, f"stamped in the future ({rec['at']}; session {sess})"
+    when = f"{_age_text(age)} ago"
+    if outcome != "closed":
+        return 2, f"{outcome} ({cause}) {when} (session {sess})"
+    if age > _PROBE_STALE_S:
+        return 2, f"closed {when}, stale: over {_PROBE_STALE_S // 3600} h (session {sess})"
+    return 0, f"closed {when} (session {sess})"
+
+
+def _probe_rows(store: Path, R: Any, Refused: Any, now: float) -> list[CheckResult]:
+    """The ``agent firewall probe`` row (V13 §7, O4): each in-service egress slot's LAST RECORDED probe, as a gauge
+    naming its age. Doctor leases nothing and probes nothing: the record is what the last session launch (and, on
+    macOS, its re-probes) found. OPEN is a failure; unknown, inconclusive, unreadable and stale results warn; a slot
+    never probed is said so and never read as healthy. No egress slot in service: no row."""
+    found, _ignored = _read_slot_dirs(store / "slots")
+    tags = [t for t, v in sorted(found.items()) if t.startswith("e") and v[0] not in R.OUT_OF_SERVICE]
+    if not tags:
+        return []
+    per = [(t, *_probe_one(store / "slots" / t / _PROBE_RECORD_NAME, now, R, Refused)) for t in tags]
+    level = max(lv for _t, lv, _w in per)
+    detail = "; ".join(f"{t}: {w}" for t, _lv, w in per)
+    name = "agent firewall probe"
+    if level == 3:
+        return [CheckResult(name, False, detail,
+                            "A session on that slot reached the vendor directly, outside the slot's network wall "
+                            "(pf on macOS, the slot's network namespace on Linux): the wall did not hold. Every "
+                            "launch probes again and refuses while it is open.")]
+    if level == 2:
+        return [CheckResult(name, True, detail,
+                            "The last probe could not show the wall holding, or its result is old. The next session "
+                            "launch on that slot probes again, and refuses to start unless the wall holds.", warn=True)]
+    if level == 1:
+        return [CheckResult(name, True, detail + " (each session launch probes its slot)", neutral=True)]
+    return [CheckResult(name, True, detail)]
 
 
 def _qbroker_running(host: str) -> bool | None:
