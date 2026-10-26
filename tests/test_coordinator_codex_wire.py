@@ -899,8 +899,8 @@ def test_f5_a_line_that_starts_with_a_brace_but_is_not_json_is_unparseable_not_a
 
 def _stalled_writer(wire: CodexWire, daemon: FakeDaemon) -> threading.Thread:
     """A big call mid-send with the daemon not reading: it holds the write lock for its 30 s deadline."""
+    daemon.gated.clear()                # before `reading`: a gate the daemon sets between the two clears survives
     daemon.reading.clear()
-    daemon.gated.clear()
     wire.notify("turn/interrupt", {"threadId": "x", "turnId": "y"})     # frees the daemon's parked read
     assert daemon.gated.wait(5.0), "the daemon never reached its gate"  # so the big call below blocks
     t = threading.Thread(target=lambda: _within(lambda: wire.call("hooks/list", {"pad": "z" * (4 << 20)},
