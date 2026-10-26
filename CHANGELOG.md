@@ -25,6 +25,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **The cockpit's sign card no longer says nothing was signed after one read.** When an answer's reply is lost it stays
   frozen, reads the request twice, and comes back only if it is still open both times. Cancelling a passkey prompt on
   the card keeps the remembered passkey.
+- **`levain doctor` reports the agent-session reaper, CONTROL and held sessions.** It says whether the reaper is
+  passing, whether CONTROL answers, and any session stuck mid-end with the step that failed. It does not call a state
+  healthy that it cannot establish now (a stale or contradicted pass record, an unanswered CONTROL); run as root it says
+  CONTROL was not asked; an oversized or refused CONTROL answer reads as "could not list", not as a failure.
 - **`levain binding graduate` says what is missing, and still exits 1.** It names the autonomic store (with its path;
   `--store-dir` takes the same store `policy create` signs) and that no executor can yet run a binding effect; a store
   or gate it cannot read is reported as a reason, not a traceback. `levain binding policy create --help` says that
