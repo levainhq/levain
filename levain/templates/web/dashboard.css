@@ -1609,7 +1609,9 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .masthead .livechip { font-size: 0; gap: 0; }
   body.ke .masthead #jumpbtn { font-size: 0; width: var(--hit-min); padding: 0; justify-content: center; }
   body.ke .masthead #jumpbtn::before { content: "\2315"; font-size: var(--fs-title); }
-  body.ke .masthead #calmbtn { order: 3; margin-left: auto; }   /* the first row has no room for a fourth control: Calm sits right-aligned under the tabs */
+  /* Calm is an icon beside the search icon, the same size, in the first row; its name is its aria-label and title ("Calm on" / "Calm off") */
+  body.ke .masthead #calmbtn { font-size: 0; width: var(--hit-min); padding: 0; justify-content: center; }
+  body.ke .masthead #calmbtn::before { content: "\2248"; font-size: var(--fs-title); }
   body.ke .masthead .themesw button { width: 36px; font-size: var(--fs-micro); }
   /* the brand takes what the first row leaves instead of claiming its own width, so a wider font cannot push the theme switch
      onto a row of its own (Linux Chrome's fonts did, in CI) */
@@ -1618,7 +1620,16 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .masthead .brand .wordmark { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   body.ke .masthead .brand .wordmark::before { margin-right: var(--sp-3); vertical-align: middle; }
 }
-@media (max-width: 400px) { body.ke .masthead { column-gap: var(--sp-2); } }   /* room for the default wordmark at 375px */
+@media (max-width: 400px) {   /* room for the first row's four controls (Sync, Calm, Jump, the theme switch) and whatever is left of the wordmark, at 375px */
+  body.ke .masthead { column-gap: var(--sp-2); }
+  body.ke .masthead #refresh { padding-inline: var(--sp-3); }
+  body.ke .masthead .themesw button { width: 30px; }
+}
+@media (max-width: 340px) {   /* 320px: the same four controls, a little closer, so the theme switch stays on the first row */
+  body.ke .masthead #refresh { padding-inline: var(--sp-2); }
+  body.ke .masthead #jumpbtn, body.ke .masthead #calmbtn { width: 40px; }
+  body.ke .masthead .themesw button { width: 26px; }
+}
 
 /* AN EMPTY CARD is a slim bar, last in its zone (a card with a list behind it keeps its place and its height). Beside a tall
    neighbour an empty card used to leave a void under it; as a bar at the end of the zone it takes one thin full-width line, and the

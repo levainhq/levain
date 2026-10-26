@@ -50,15 +50,14 @@ def _page(tmp_path: Path, steps: list[dict]) -> list:
 
 @needs_browser
 def test_the_phone_bar_is_two_rows_with_the_tabs_across_the_width(tmp_path: Path) -> None:
-    """K2 r2 (L2-9): brand, status dot, Sync and the theme switch on one row, the four tabs across the width on the next; no horizontal scroll.
-    The Calm control has no room on the first row at phone widths: it sits right-aligned on a third, so the bar's bound is three short rows."""
+    """K2 r2 (L2-9): brand, status dot, Sync and the theme switch on one row, the four tabs across the width on the next; no horizontal scroll."""
     vals = _page(tmp_path, [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"until": "document.querySelector('.masthead .seg') && document.querySelector('.band .clock') && document.querySelector('.masthead .indicators button')"}, {"eval": """(() => {
       const box = (e) => e.getBoundingClientRect(), q = (s) => document.querySelector(s);
       const bar = q('.masthead'), seg = q('.masthead .seg'), theme = q('.masthead .themesw'), brand = q('.masthead .brand');
       return { segTop: box(seg).top, clockTop: box(q('.band .clock')).top, segShare: box(seg).width / innerWidth, barH: box(bar).height,
         oneRow: Math.abs(box(theme).top - box(brand).top) < 24 && box(theme).bottom < box(seg).top, sw: document.documentElement.scrollWidth, vw: innerWidth }; })()"""}])
     got = vals[2]
-    assert got["segTop"] < got["clockTop"] and got["segShare"] > 0.85 and got["oneRow"] and got["barH"] < 190 and got["sw"] <= got["vw"], got
+    assert got["segTop"] < got["clockTop"] and got["segShare"] > 0.85 and got["oneRow"] and got["barH"] < 150 and got["sw"] <= got["vw"], got
 
 
 @needs_browser

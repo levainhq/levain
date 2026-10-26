@@ -2033,6 +2033,8 @@
     for (const b of document.querySelectorAll("[data-calm-toggle]")) {
       b.setAttribute("aria-pressed", on ? "true" : "false");
       b.textContent = on ? "Calm on" : "Calm off";
+      b.setAttribute("aria-label", b.textContent);     // the phone shows an icon only: its name is this
+      b.title = b.textContent;
     }
   }
   function setCalm(on, keep) {

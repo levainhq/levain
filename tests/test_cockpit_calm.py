@@ -101,3 +101,27 @@ out.tick = [K.AGE_TICK_MS, K.CALM_AGE_TICK_MS];
     assert out["full"] == [out["tick"][0]] and out["calm0"] is False
     assert out["calm1"] is True and out["after"] == [out["tick"][0], out["tick"][1]] and out["armed"] is True and out["cleared"] == 1
     assert out["tick"][1] > out["tick"][0]
+
+
+@needs_browser
+@pytest.mark.parametrize("width", [320, 375, 430])
+def test_on_a_phone_calm_is_an_icon_in_the_first_row_beside_search_the_same_size(tmp_path, monkeypatch, width):
+    """C5: no third row. Calm is icon-only (its name is its aria-label and title), the size of the search icon, on the first
+    row with Sync, search and the theme switch: every one inside the viewport and none overlapping another."""
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = """(() => { const q = (s) => document.querySelector(s), r = (e) => e.getBoundingClientRect();
+      const ids = ['#refresh', '#calmbtn', '#jumpbtn', '.masthead .themesw'].map((s) => r(q(s)));
+      const c = q('#calmbtn'), j = r(q('#jumpbtn')), cr = r(c), tabs = r(q('.masthead .seg'));
+      let overlap = false; for (let a = 0; a < ids.length; a++) for (let b = a + 1; b < ids.length; b++)
+        if (ids[a].left < ids[b].right - 0.5 && ids[b].left < ids[a].right - 0.5 && ids[a].top < ids[b].bottom - 0.5 && ids[b].top < ids[a].bottom - 0.5) overlap = true;
+      return JSON.stringify({ sameRow: ids.every((b) => Math.abs(b.top - ids[0].top) < 30), belowTabs: cr.top >= tabs.top,
+        sameSize: Math.abs(cr.width - j.width) < 1 && Math.abs(cr.height - j.height) < 1, inside: ids.every((b) => b.left >= 0 && b.right <= innerWidth),
+        overlap, textHidden: getComputedStyle(c).fontSize === '0px', label: c.getAttribute('aria-label'), title: c.title, pressed: c.getAttribute('aria-pressed'),
+        sw: document.documentElement.scrollWidth, vw: innerWidth }); })()"""
+    out = _run(tmp_path, src, [{"eval": "new Promise(r => setTimeout(r, 300))"}, {"eval": probe}, CLICK, {"eval": probe}],
+               first={"emulate": {"w": width, "h": 800, "dpr": 2, "mobile": True}})
+    off, on = json.loads(out[-3]), json.loads(out[-1])
+    for got, name, pressed in ((off, "Calm off", "false"), (on, "Calm on", "true")):
+        assert got["sameRow"] and not got["belowTabs"] and got["sameSize"] and got["inside"] and not got["overlap"], got
+        assert got["textHidden"] and got["label"] == name and got["title"] == name and got["pressed"] == pressed, got
+        assert got["sw"] <= got["vw"], got
