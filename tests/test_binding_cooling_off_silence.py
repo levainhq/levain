@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from levain.autonomic import Posture
+from tests.autonomic_test_only_confinement import test_only_confined_executor  # noqa: F401  (the root-run closure has no conftest)
 from tests.test_autonomic_gate_coverage import LATER, CWorld, _covering  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
