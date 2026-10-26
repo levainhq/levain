@@ -51,3 +51,16 @@ def test_a_symlink_in_the_marks_place_is_no_proof(tmp_path: Path, passkey) -> No
     mark.unlink()
     mark.symlink_to(real)
     assert signmod._proof(tmp_path, RID, AID) is None
+
+
+def test_a_symlink_in_the_attempts_dir_settles_unknown_never_a_500(tmp_path: Path, passkey) -> None:
+    signer, key, sign = passkey
+    _file(tmp_path, RID)
+    real = tmp_path / "elsewhere.json"
+    real.write_text("{}")
+    record = attempts_dir(tmp_path) / f"{RID}.{AID}.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.symlink_to(real)
+    assert signmod._settle_orphan(tmp_path, RID, AID) == {"state": "unknown"}
+    assert signmod._settle_orphan(tmp_path, RID, AID) == {"state": "unknown"}   # nothing was written through it
+    assert real.read_text() == "{}"

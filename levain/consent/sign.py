@@ -917,6 +917,8 @@ def _settle_orphan(queue_dir: Path, request_id: str, attempt: str) -> "dict[str,
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         return None
+    except OSError:     # ELOOP on a symlink, or any other open failure: a record that cannot be read as one is unknown
+        return {"state": "unknown"}
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return {"state": "unknown"}

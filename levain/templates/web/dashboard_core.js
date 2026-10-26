@@ -4780,6 +4780,15 @@
   // card's, and one drawn afresh after its request left the listing): each is told every answer and drops itself once its
   // facet is off the page, so a facet drawn later never takes the ask away from one still shown
   const signPending = new Map();
+  const signSettledIds = new Set();   // request ids whose signNotes entry is a settled outcome (signed or refused), shown even once the request is gone
+  function signSettledSaid(st) {
+    if (st.state === "signed") {
+      return ["signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
+              + " (its reply was lost; the cockpit confirmed it)", "ok"];
+    }
+    const why = typeof st.reason === "string" && st.reason ? st.reason.replace(/[.\s]+$/, "") : "refused";
+    return ["not signed: " + why + (/nothing was signed/.test(why) ? "" : "; nothing was signed") + ": sign it again", "bad"];
+  }
   function signAskPending(id) {
     const p = signPending.get(id);
     if (!p || p.asking) return;
@@ -4789,7 +4798,14 @@
       .catch(() => ({ state: "" }))
       .then((st) => {
         if (signPending.get(id) !== p) return;
-        if (st.state === "signed" || st.state === "refused") signPending.delete(id);
+        if (st.state === "signed" || st.state === "refused") {
+          // the outcome is kept before the entry goes, so a facet drawn later (or on a repaint) shows it
+          const prev = signNotes.get(id);
+          const said = signSettledSaid(st);
+          signNotes.set(id, [said[0], said[1], prev ? prev[2] : ""]);
+          signSettledIds.add(id);
+          signPending.delete(id);
+        }
         for (const view of [...p.views]) { try { view(st); } catch (e) { p.views.delete(view); } }
       })
       .catch(() => undefined)
@@ -4945,6 +4961,7 @@
   // Ask the cockpit where the answer with `attempt` on request `id` stands, after its reply was lost (`said`: what the card
   // said then). Resolves as signCeremony does; "unsure" puts the request in signPending.
   function signSettle(id, attempt, line, choice, fp, say, said) {
+    signSettledIds.delete(id);
     say(said + "; asking the cockpit where it stands…", "bad");
     return signAttempt(id, attempt).catch((e) => ({ state: "", why: "the read failed (" + ((e && e.name) || "error") + ")" }))
       .then((st) => {
@@ -5060,7 +5077,7 @@
       }
       if (!r) {
         // answered here: its signed line stays until the row itself leaves; else it was answered, denied or expired elsewhere
-        return show(kept && kept[1] === "ok" ? kept[0] : "this sign request is no longer open; the card updates on the next read", kept && kept[1]);
+        return show(kept && (kept[1] === "ok" || signSettledIds.has(id)) ? kept[0] : "this sign request is no longer open; the card updates on the next read", kept && kept[1]);
       }
       if (kept && kept[2] !== (r.sha256 || "")) signNotes.delete(id);
       if (r.refused) return show("not signable: " + r.refused, "bad");

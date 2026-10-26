@@ -103,3 +103,53 @@ def test_a_fresh_facet_asks_on_every_board_read_until_the_answer_reads_refused(t
     assert v[10].startswith("not signed:") and "nothing was signed" in v[10], v
     assert asked.count("pending") >= 2 and asked[-1] == "refused", asked   # asked on later board reads, not dropped
     assert rig.nothing_signed(QRID)
+
+
+REOPEN_PANEL = f"({ROW} || ({HISTORY}, 1)) && 1"
+
+
+@needs_browser
+@needs_ssh
+def test_a_facet_drawn_after_the_answer_settled_refused_says_so_and_keeps_saying_it(tmp_path: Path,
+                                                                                   monkeypatch) -> None:
+    """L3 r2 codex MED: once the answer settled and its request is gone, a facet drawn afterwards found nothing
+    pending and said only "no longer open"; a repaint kept that. It now says what the cockpit settled."""
+    rig = _Rig(tmp_path, monkeypatch)
+
+    def attempt(self, request_id: str, req: Any) -> Any:
+        out = real(self, request_id, req)
+        if out["state"] == "pending":                 # the request leaves while its answer still verifies
+            (rig.qdir / "sign" / f"{request_id}.json").unlink(missing_ok=True)
+        return out
+
+    real = type(rig.signer).attempt
+    monkeypatch.setattr(type(rig.signer), "attempt", attempt)
+    with rig.serving():
+        go = _hold_verify(monkeypatch, 8.0)
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"eval": CARD_SENT_THEN_LOST.format(tail=json.dumps("/answer"))},
+            {"eval": f"{OPTION_B}.click() || 1"},
+            {"until": f"/still verifying/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
+            {"eval": READS_EVERY_1500},
+            {"until": f"/not signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 45000},   # settled, nobody drawn yet
+            {"eval": "clearInterval(window.__reads) || 1"},
+            {"eval": AFTER.format(ms=2500)},                  # past the page's 2 s listing reuse
+            {"eval": HISTORY},
+            {"until": f"{ROW} && 1", "ms": 30000},
+            {"eval": OPEN_ROW},                               # a facet drawn fresh after the answer settled
+            {"until": f"/not signed|no longer open/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
+            {"eval": AFTER.format(ms=300)},
+            {"eval": ROW_NOTE},
+            {"eval": "window.LevainCockpitTransport.reload() && 1"},                      # a repaint
+            {"eval": AFTER.format(ms=2500)},
+            {"eval": REOPEN_PANEL},
+            {"until": f"{ROW} && 1", "ms": 30000},
+            {"eval": f"({ROW}.querySelector('.sign-note') ? 1 : ({OPEN_ROW}, 1))"},
+            {"until": f"/not signed|no longer open/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
+        ])
+        go.set()
+    v = out["values"]
+    for note in (v[11], v[13], v[-1]):
+        assert note.startswith("not signed:") and "nothing was signed" in note, v
+    assert rig.nothing_signed(QRID)
