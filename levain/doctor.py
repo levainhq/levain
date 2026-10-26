@@ -157,6 +157,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_slot_isolation())
     core.extend(_check_slot_limits())
     core.extend(_check_slot_keys())
+    core.extend(_check_slot_services())
     for r in core:
         _emit(r)
     print(spend_cap_note())
@@ -1329,6 +1330,210 @@ def _check_slot_keys(*, host: str | None = None, store: Path | None = None, runn
                                                                  _egress_in_service(store)))
     rows += _guarded("spend ledger", lambda: _check_spend_ledger(store, keys_status))
     rows += _guarded("invoice ceiling", lambda: _check_invoice_ceiling(store, fetch, keys_status))
+    return rows
+
+
+#: DECISION (S1 6b): a heartbeat whose pass ended longer ago than this is a reaper that has stopped passing; ten
+#: minutes is well past the pass worker's tick (``levain.slot.reaper.V11_S``), room for a long pass.
+_REAPER_STALE_S = 600
+_REAPER_SKEW_S = 300           # DECISION: an `ended_at` this far ahead of the clock is not read as fresh
+_REAPER_BEAT_KEYS = frozenset({"boot_id", "pass_seq", "started_at", "ended_at", "control", "held", "skipped"})
+_CONTROL_ASK_S = 3.0           # DECISION: one deadline for CONTROL's STATUS answer
+_HELD_NAMED = 5                # DECISION: held sessions named in a row before "and N more"
+_SKIP_SHOWN = 3                # DECISION: failed reaper steps named in a row before "and N more"
+
+
+def _read_beat(run: Path) -> tuple[str, Any]:
+    """(kind, value) for the reaper's heartbeat (``R/reaper/pass.json``, written by ``Reaper.write_heartbeat``): ``ok``
+    with the parsed record; ``absent``; ``closed`` when this account cannot open the directory (it is ``root`` and
+    group ``levain-wake``, 0750, so an operator outside that group cannot); ``bad`` with why. A fact that cannot be
+    read is never read as a healthy one."""
+    from levain.contracts import ContractError, canon
+    from levain.slot import Refused
+    from levain.slot import records as R
+    from levain.slot.grammar import SESSION_RE
+    from levain.slot.reaper import HEARTBEAT
+
+    path = run / "reaper" / HEARTBEAT
+    try:
+        raw = R.read_record(path, max_bytes=_SLOT_RECORD_CAP)
+    except PermissionError:
+        return "closed", None
+    except (Refused, OSError) as exc:
+        return "bad", _slot_why(exc)
+    if raw is None:
+        return "absent", None
+    try:
+        rec = canon.parse(raw)
+        if (type(rec) is not dict or not {"pass_seq", "ended_at", "control", "held", "skipped"} <= set(rec)
+                or not set(rec) <= _REAPER_BEAT_KEYS or type(rec["pass_seq"]) is not int
+                or rec["control"] not in ("up", "down") or type(rec["ended_at"]) is not str
+                or type(rec["held"]) is not list or type(rec["skipped"]) is not list
+                or not all(type(s) is str and SESSION_RE.fullmatch(s) for s in rec["held"])
+                or not all(type(s) is str for s in rec["skipped"])):
+            raise ValueError("shape")
+        R.epoch_of(rec["ended_at"])
+    except (ContractError, ValueError):
+        return "bad", "not a reaper pass record"
+    return "ok", rec
+
+
+def _beat_age(rec: dict, now: float) -> float:
+    from levain.slot import records as R
+
+    return now - R.epoch_of(rec["ended_at"])
+
+
+def _failed_steps(rec: dict) -> list[str]:
+    """The pass's own failures: a whole step that raised (``step<N>:<Error>``). The per-item ``skipped`` names (a slot
+    or session busy this pass) are the reaper's normal deferrals, and ``:seam-unbuilt`` names a step the reaper does
+    not carry yet; neither is a fault."""
+    return [s for s in rec["skipped"] if s.startswith("step") and not s.endswith(":seam-unbuilt")]
+
+
+def _check_reaper(host: str, beat: tuple[str, Any], running: Any, now: float) -> CheckResult:
+    from levain import unshowable
+    from levain.slot.reaper import V11_S
+
+    name = "agent reaper"
+    up = running(host, "reaper")
+    if up is False:
+        return CheckResult(name, False, "not running: ended sessions are not cleaned up, held ones are not retried, "
+                           "and the space brake does not run",
+                           "Run `sudo levain setup-isolation` (a repair run starts it).")
+    kind, rec = beat
+    lead = "running" if up is True else "could not be checked"
+    soft = up is not True
+    if kind == "closed":
+        return CheckResult(name, True, f"{lead}; its pass record is readable only by root and the levain-wake group, "
+                           "so this account cannot see its last pass", neutral=not soft, warn=soft)
+    if kind == "absent":
+        return CheckResult(name, True, f"{lead}, and has written no pass record yet", warn=True,
+                           hint=f"It passes about every {int(V11_S)} s; if this stays, look at its service log.")
+    if kind == "bad":
+        return CheckResult(name, True, f"{lead}; its pass record cannot be read ({rec})", warn=True)
+    age = _beat_age(rec, now)
+    if age < -_REAPER_SKEW_S:
+        return CheckResult(name, True, f"{lead}; its last pass is stamped in the future ({rec['ended_at']})", warn=True)
+    if age > _REAPER_STALE_S:
+        return CheckResult(name, False, f"{lead}, but its last pass ended {_age_text(age)} ago (pass {rec['pass_seq']}): "
+                           f"it passes about every {int(V11_S)} s, so the pass worker has stopped",
+                           "Restart the service: `sudo levain setup-isolation` (a repair run restarts it).")
+    failed = _failed_steps(rec)
+    detail = f"{lead}; pass {rec['pass_seq']} ended {_age_text(age)} ago"
+    if failed:
+        shown = ", ".join(unshowable.mark(s[:64], allow="") for s in failed[:_SKIP_SHOWN])
+        more = f" and {len(failed) - _SKIP_SHOWN} more" if len(failed) > _SKIP_SHOWN else ""
+        return CheckResult(name, True, f"{detail}; a step failed in that pass: {shown}{more}", warn=True,
+                           hint="The pass goes on past a failed step; the reaper's service log names the fault.")
+    return CheckResult(name, True, detail, warn=soft)
+
+
+def _ask_control_status(run: Path, deadline: float) -> tuple[bool, Any]:
+    """(True, records) when CONTROL answers the operator's ``STATUS`` (the operator's own session records, read-only,
+    the verb ``PEER_VERBS['operator']`` carries); (False, why) otherwise. CONTROL's own frame codec is used, and
+    ``deadline`` bounds the whole exchange."""
+    import socket
+
+    try:
+        from levain.slot import control
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as raw:
+            s = _ByDeadline(raw, deadline)
+            s.connect(str(run / "control" / "control.sock"))
+            s.sendall(control.encode_frame({"v": 1, "op": "STATUS", "id": 1}))
+            ans = control.read_frame(s)  # type: ignore[arg-type]
+    except FileNotFoundError:
+        return False, "no control socket"
+    except PermissionError:
+        return False, "this account may not open the control socket"
+    except TimeoutError:
+        return False, "no answer in time"
+    except Exception as exc:  # noqa: BLE001 - any other failure is "did not answer"
+        return False, f"{type(exc).__name__}"
+    if ans is None or ans.get("id") != 1:
+        return False, "closed without an answer"
+    if ans.get("ok") is not True:
+        return False, f"refused ({str(ans.get('error', ''))[:40]})"
+    recs = ans.get("records")
+    if type(recs) is not list or not all(type(r) is dict for r in recs):
+        return False, "an answer off its shape"
+    return True, recs
+
+
+def _check_control(host: str, running: Any, status: tuple[bool, Any], beat: tuple[str, Any]) -> CheckResult:
+    name = "agent control"
+    up = running(host, "control")
+    if up is False:
+        return CheckResult(name, False, "not running: no session can start, and ending ones wait",
+                           "Run `sudo levain setup-isolation` (a repair run starts it).")
+    answered, why = status
+    if not answered:
+        return CheckResult(name, False, f"{'running' if up else 'unit state unknown'}, but does not answer ({why})",
+                           "Run `sudo levain setup-isolation`; if it stays, look at CONTROL's service log.")
+    if beat[0] == "ok" and beat[1]["control"] == "down":
+        return CheckResult(name, False, "answers this account, but the reaper's last pass could not reach it",
+                           "The reaper and CONTROL disagree about the control socket; restart both with "
+                           "`sudo levain setup-isolation`.")
+    return CheckResult(name, True, "answers" if up is True else "answers (its unit state could not be read)",
+                       warn=up is None)
+
+
+def _check_held(status: tuple[bool, Any], beat: tuple[str, Any]) -> CheckResult:
+    from levain import unshowable
+    from levain.slot import records as R
+
+    name = "agent held sessions"
+    held: dict[str, str] = {}
+    if status[0]:
+        for rec in status[1]:
+            if rec.get("state") == R.HELD and type(rec.get("session")) is str:
+                step = rec.get("failed_step")
+                tries = rec.get("held_attempts")
+                held[rec["session"]] = (f"{unshowable.mark(step[:32], allow='')}" if type(step) is str else "?") + (
+                    f" ({tries} tries)" if type(tries) is int else "")
+    if beat[0] == "ok":
+        for s in beat[1]["held"]:
+            held.setdefault(s, "")
+    if not held:
+        if not status[0] and beat[0] != "ok":
+            return CheckResult(name, True, "could not be read: CONTROL did not answer and the reaper's pass record "
+                               "is closed to this account", warn=True)
+        return CheckResult(name, True, "none")
+    shown = [f"{s} at {w}" if w else s for s, w in sorted(held.items())[:_HELD_NAMED]]
+    more = f" and {len(held) - _HELD_NAMED} more" if len(held) > _HELD_NAMED else ""
+    return CheckResult(name, False, f"{len(held)} stuck mid-end: {'; '.join(shown)}{more}; each keeps its slot leased "
+                       "and its tree untouched while the reaper retries",
+                       "The reaper retries with a backoff; if the named step keeps failing, its service log says why.")
+
+
+def _check_slot_services(*, host: str | None = None, store: Path | None = None, run: Path | None = None,
+                         running: Any = None, status: Any = None, now: float | None = None) -> list[CheckResult]:
+    """The 6b rows over the isolation install's two root-side services, read as the OPERATOR: ``agent reaper`` (its
+    unit and its last pass record), ``agent control`` (its unit, an answered ``STATUS``, and what the reaper last
+    saw of it) and ``agent held sessions`` (the operator's sessions CONTROL reports stuck in HELD, plus any the
+    reaper's pass record names). The pass record is root-and-``levain-wake``-only, so an account outside that
+    group gets CONTROL's word alone and the reaper row says what it cannot see. No rows before the isolation
+    install (``agent sessions`` says that). Each row is built on its own (:func:`_guarded`). ``running``/``status``:
+    a test's seams (``status`` returns what :func:`_ask_control_status` does)."""
+    from levain.slot import layout
+
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    run = run if run is not None else layout.RUN.get(host)
+    if store is None or run is None or not (store / "policy").is_dir():
+        return []
+    when = time.time() if now is None else now
+    up = running or _unit_running
+    answer = (status if status is not None else lambda: _ask_control_status(run, _clock() + _CONTROL_ASK_S))()
+    try:
+        beat = _read_beat(run)
+    except Exception:  # noqa: BLE001 - a heartbeat read that raises is a row below, not a lost doctor
+        beat = ("bad", "could not be read")
+    rows = _guarded("agent reaper", lambda: _check_reaper(host, beat, up, when))
+    rows += _guarded("agent control", lambda: _check_control(host, up, answer, beat))
+    rows += _guarded("agent held sessions", lambda: _check_held(answer, beat))
     return rows
 
 
