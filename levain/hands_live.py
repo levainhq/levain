@@ -1,7 +1,7 @@
 """levain.hands_live — whether anything runs as a hands user, the stop of all of it, and the hands lock.
 
 One home for what ws-git and the session lifecycle check before the hands user's workspace may change, and what the
-automation executor (autogrant A1b, ``levain.autonomic``) is to share with them: :func:`entity_session_live` (the
+automation executor (:mod:`levain.autonomic.hands_exec`) shares with them: :func:`entity_session_live` (the
 liveness check), :func:`sweep_hands_user` (the session-end stop), the per-entity hands lock (:data:`HANDS_LOCK`,
 :func:`take_exclusive`), and the root-owned PATH and elevator every child here is started with (:data:`SECURE_PATH`,
 :data:`SUDO`).
@@ -14,6 +14,7 @@ as its own ``WsGitError`` with the same text.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import platform
 import re
@@ -27,6 +28,20 @@ from typing import Dict, List, Optional, Set, Union
 #: host whose sudo is elsewhere fails closed.
 SUDO = "/usr/bin/sudo"
 
+#: Every hands user's name matches this; anything else is refused. With :data:`WORKSPACE_ROOT`,
+#: :data:`HANDS_UID_RANGE` and :func:`hands_user_name`, one home for setup (``levain.firing.hands``) and the
+#: automation executor (``levain.autonomic.hands_exec``). Here, not in the autonomic package, because root's
+#: route-map check imports setup without that package (``tests/test_ci_root_closure.py``).
+HANDS_USER_RE = re.compile(r"^_levain_[a-z0-9]{1,12}_[0-9a-f]{6}$")
+
+#: Where each host keeps the hands users' workspaces.
+WORKSPACE_ROOT = {"darwin": Path("/Users/Shared/levain"), "linux": Path("/var/lib/levain")}
+
+#: The ids setup allocates hands users from, top down. macOS: below 500 sorts with the system accounts, and the
+#: low end is the dangerous end (macOS claims low ids for new daemons). Linux: the top of the usual
+#: system-account range.
+HANDS_UID_RANGE = {"darwin": range(499, 399, -1), "linux": range(999, 899, -1)}
+
 #: Where root resolves a bare program name: root-owned directories only.
 SECURE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -39,6 +54,17 @@ LIVENESS_TIMEOUT = 10.0
 #: hold it EXCLUSIVE for their whole run. So no session starts while they work, and they never start
 #: while a session is open. Busy is a refusal on both sides, never a wait without end.
 HANDS_LOCK = "hands.lock"
+
+
+def hands_user_name(entity_dir: Union[Path, str]) -> str:
+    """The hands user's name for this entity: a slug of the directory name plus a hash of the
+    resolved path, so two entities with the same directory name still get different users."""
+    resolved = Path(entity_dir).expanduser().resolve()
+    slug = re.sub(r"[^a-z0-9]", "", resolved.name.lower())[:12] or "entity"
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:6]
+    name = f"_levain_{slug}_{digest}"
+    assert HANDS_USER_RE.match(name), name
+    return name
 
 
 class HandsLiveError(RuntimeError):

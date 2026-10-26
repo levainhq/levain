@@ -721,7 +721,7 @@ def test_the_session_end_sweep_kills_every_process_of_the_hands_user_and_verifie
     process of the hands user, as that user, and checks that none of the entity's is left."""
     import subprocess as sp
 
-    from levain.firing import confinement, ws_git
+    from levain.firing import confinement
 
     calls: list[list[str]] = []
     monkeypatch.setattr(confinement.subprocess, "run",
@@ -753,8 +753,6 @@ def test_the_sweep_never_waits_longer_than_its_timeout_on_a_stalled_step(monkeyp
 
     monkeypatch.setattr(confinement.subprocess, "run", stalled)
     import time
-
-    from levain.firing import ws_git
 
     monkeypatch.setattr("levain.hands_live.entity_session_live", lambda uid, **kw: True)
     t0 = time.monotonic()
@@ -796,7 +794,7 @@ def test_the_sweep_takes_the_known_uid_and_says_when_it_ran_out_of_time(monkeypa
     import subprocess as sp
     import time
 
-    from levain.firing import confinement, ws_git
+    from levain.firing import confinement
 
     def no_lookup(name):
         raise AssertionError("the sweep looked the user up by name")
