@@ -1,0 +1,206 @@
+"""The dispatch service (CONTRACT §1.3): its unit's on-failure restart policy, its store row (``L/dispatch``), and its
+program ``levain/slot/services/dispatch.py``: the supervisor lock (W2-d DESIGN U5), the follower as its body, and the
+exits each unit manager reads (the lock loser's 0, a SIGTERM death, EX_CONFIG for a store of the wrong shape)."""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import os
+import plistlib
+import signal
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import pytest
+
+from levain.slot import layout, service_boot, units
+from levain.slot.services import dispatch as SD
+
+ROOT = Path(__file__).resolve().parents[1]
+
+#: sha256 of each OTHER service's render on main bcb41e68 (``launchd_plist_text``, ``systemd_unit_text``; pf has no
+#: Linux unit): the on-failure change must leave every one byte-unchanged.
+_BASE_RENDERS = {
+    "control": ("83f103c1d60e52f419f385bd32937619f331debbf01ea5683df517af3c8dbc50",
+                "231c2096278f0f51ed339d15dc8b8fdfafa7989e0e2e616e267995e275909c2d"),
+    "keys": ("1b6690acd5459a61b7f5661ad848c2022fc5cdd7abe9944dd823248ef2f1c242",
+             "ea1c8d3db8cf129979306b769467116cf432abbfd41bc01790103f5ed4aa8752"),
+    "qbroker": ("ba7065b38fcc837b669c64022aaf074f61121f7e1a2a73da038cde787cc95f52",
+                "f57330c86d79cf0968eadc1c8722f7fbcf749d8ca0b040875137b948c1d1f103"),
+    "reaper": ("0e43ef1cd8e4169f92da574c9ed5a7636fabe2875e47c0e8b15ae9d32474f074",
+               "bba7ea59e0cfd3ec98488124db756571e22c2cd14f05e05613866750e453292b"),
+    "pf": ("02d446fbdf4eed0270e5092d57ef3af5142edb11e4d18c6ec39b7b30051d5777", None),
+}
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_dispatch_unit_is_on_failure_and_every_other_render_is_unchanged():
+    d = units.by_name("dispatch")
+    assert d.restart == "on-failure"
+    assert plistlib.loads(units.launchd_plist_text(d).encode())["KeepAlive"] == {"SuccessfulExit": False}
+    text = units.systemd_unit_text(d)
+    assert "Restart=on-failure\nRestartSec=5\n" in text and "Restart=always" not in text
+    others = {s.name: s for s in units.SERVICES if s.name != "dispatch"}
+    assert set(others) == set(_BASE_RENDERS)
+    for name, (plist, unit) in _BASE_RENDERS.items():
+        assert _sha(units.launchd_plist_text(others[name])) == plist, name
+        if unit is not None:
+            assert _sha(units.systemd_unit_text(others[name])) == unit, name
+
+
+@pytest.mark.parametrize("host", ("darwin", "linux"))
+def test_dispatch_store_row_and_program_install(host):
+    rows = {r.path: r for r in layout.base_store_rows(host, "op")}
+    row = rows[layout.STORE[host] / "dispatch"]
+    assert (row.owner, row.group, row.mode, row.kind) == ("_levain_dispatch", "_levain_dispatch", 0o700, "dir")
+    assert layout.dispatch_store_dir(host) == row.path
+    # the program exists in this package, so setup installs the unit (no pending line names it)
+    have, pending = units.built_services(host, ROOT / "levain")
+    assert "dispatch" in {s.name for s in have}
+    assert not [p for p in pending if "dispatch" in p]
+
+
+@pytest.fixture
+def sdir(tmp_path: Path) -> Path:
+    d = tmp_path / "dispatch"
+    d.mkdir(mode=0o700)
+    return d
+
+
+def _main(sdir: Path, *, wait_s: float = 0.2, rc: int = 0):
+    calls: list = []
+    died: list = []
+    out = SD.main(["--store-dir", str(sdir), "--socket", "/x/control.sock", "--export-dir", "/x/export"],
+                  wait_s=wait_s, follow=lambda argv: calls.append(list(argv)) or rc,
+                  die=lambda: died.append(True) or -15)
+    return out, calls, died
+
+
+def test_holder_runs_the_follower_over_its_store_then_dies_by_sigterm(sdir):
+    out, calls, died = _main(sdir)
+    assert calls == [["--store-dir", str(sdir), "--socket", "/x/control.sock", "--export-dir", "/x/export"]]
+    assert died == [True] and out == -15
+    lock = sdir / SD.LOCK_NAME
+    assert lock.is_file() and (lock.stat().st_mode & 0o777) == 0o600
+    # a follower that exits non-zero (another runner holds follow.lock: 75) is that exit, relaunched by on-failure
+    out, _, died = _main(sdir, rc=75)
+    assert out == 75 and died == []
+
+
+def test_lock_loser_exits_zero_and_runs_nothing(sdir, capfd):
+    fd = os.open(str(sdir / SD.LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)     # another open file description
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        out, calls, died = _main(sdir, wait_s=0.3)
+    finally:
+        os.close(fd)
+    assert (out, calls, died) == (0, [], [])
+    assert f"another dispatch supervisor holds {sdir / SD.LOCK_NAME}" in capfd.readouterr().err
+    # released: the next start takes it
+    out, calls, _ = _main(sdir)
+    assert len(calls) == 1
+
+
+def test_a_restart_race_hands_over_within_the_bound(sdir):
+    fd = os.open(str(sdir / SD.LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    threading.Timer(0.3, os.close, (fd,)).start()        # the old holder finishes shutting down
+    out, calls, _ = _main(sdir, wait_s=5.0)
+    assert len(calls) == 1 and out == -15
+
+
+def test_a_store_of_the_wrong_shape_is_ex_config(tmp_path, sdir):
+    os.chmod(sdir, 0o750)
+    assert _main(sdir)[0] == SD.EX_CONFIG                  # group-readable store dir
+    os.chmod(sdir, 0o700)
+    lock = sdir / SD.LOCK_NAME
+    lock.write_text("")
+    os.chmod(lock, 0o644)
+    assert _main(sdir)[0] == SD.EX_CONFIG                  # a lockfile other than 0600
+    lock.unlink()
+    (tmp_path / "elsewhere").write_text("")
+    os.chmod(tmp_path / "elsewhere", 0o600)                # a target of the right shape: only O_NOFOLLOW refuses it
+    lock.symlink_to(tmp_path / "elsewhere")
+    assert _main(sdir)[0] == SD.EX_CONFIG                  # a link at the lock's path is never followed
+    lock.unlink()
+    link = tmp_path / "linked"
+    link.symlink_to(sdir)
+    assert _main(link)[0] == SD.EX_CONFIG                  # nor a link as the store dir
+    assert _main(tmp_path / "absent")[0] == SD.EX_CONFIG
+
+
+def test_service_entry_runs_the_program_on_the_layout_store(capfd, monkeypatch):
+    """The unit's path: ``service_boot.main(["dispatch"])`` runs the program as ``__main__`` with its own name left in
+    argv; it parses (no usage error) and reaches the store check of :func:`layout.dispatch_store_dir`, which on this
+    machine is absent (no install), so the program exits EX_CONFIG naming that path."""
+    host = "darwin" if sys.platform == "darwin" else "linux"
+    if layout.dispatch_store_dir(host).exists():
+        pytest.skip("an installed L/dispatch on this machine")
+    monkeypatch.setattr(sys, "argv", ["/usr/local/libexec/levain/service-entry", "dispatch"])   # the unit's argv
+    with pytest.raises(SystemExit) as e:
+        service_boot.main(["dispatch"], check=lambda h, n: (True, ""))
+    assert e.value.code == SD.EX_CONFIG
+    assert f"refused: {layout.dispatch_store_dir(host)}" in capfd.readouterr().err
+
+
+def test_main_parses_the_entry_argv_with_layout_defaults(monkeypatch):
+    seen: dict = {}
+
+    def fake_take(directory, *, wait_s):
+        seen["dir"], seen["wait"] = directory, wait_s
+        return None
+    monkeypatch.setattr(SD, "take_supervisor_lock", fake_take)
+    assert SD.main(["dispatch"]) == 0
+    host = "darwin" if sys.platform == "darwin" else "linux"
+    assert seen == {"dir": layout.dispatch_store_dir(host), "wait": SD.LOCK_WAIT_S}
+
+
+def test_refuses_root(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    assert SD.main([]) == SD.EX_USAGE
+
+
+def _env() -> dict:
+    return {**os.environ, "PYTHONPATH": str(ROOT)}
+
+
+def test_the_program_as_its_own_process_holds_the_lock_and_dies_by_sigterm(sdir, tmp_path):
+    """The real program and the real follower runner: CONTROL absent (the follower logs control-down and waits). A
+    second start in this process meets the first PROCESS's lock and exits 0; SIGTERM, sent only once the follower's
+    handler is known installed (its first stop line), ends the process by SIGTERM."""
+    proc = subprocess.Popen([sys.executable, "-m", "levain.slot.services.dispatch", "--store-dir", str(sdir),
+                             "--socket", str(tmp_path / "no-control.sock"), "--export-dir", str(tmp_path / "export")],
+                            env=_env(), cwd=str(ROOT), stderr=subprocess.PIPE, text=True)
+    lines: list = []
+    ready = threading.Event()
+
+    def read() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            lines.append(line)
+            if "the follower stopped" in line:
+                ready.set()
+    t = threading.Thread(target=read, daemon=True)
+    t.start()
+    try:
+        if not ready.wait(20.0):
+            pytest.fail(f"the follower never logged its first stop: {lines!r}")
+        out, calls, _ = _main(sdir, wait_s=0.3)
+        assert (out, calls) == (0, [])                     # a true duplicate: exit 0, nothing run
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=20.0) == -signal.SIGTERM
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10.0)
+        t.join(timeout=5.0)
+    text = "".join(lines)
+    assert f"holding {sdir / SD.LOCK_NAME}" in text and "control-down" in text
+    # the lock is free again and was never replaced
+    out, calls, _ = _main(sdir)
+    assert len(calls) == 1
