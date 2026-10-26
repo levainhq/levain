@@ -994,6 +994,87 @@ def test_x4_exited_unreaped_on_real_children():
         os.waitpid(pid, 0)
 
 
+def _hide_watches(monkeypatch, waitid=None, pidfd_open=None):
+    """Y2's seam: the probe module sees a host with no kqueue and (unless given) no pidfd_open; ``waitid`` stands in
+    for the host's. Only ``exited_unreaped`` runs while it is in place."""
+    import select as real_select
+    import types
+
+    from levain.slot import probe as PB
+
+    fake_os = types.SimpleNamespace(close=os.close, P_PID=os.P_PID, WEXITED=os.WEXITED, WNOHANG=os.WNOHANG,
+                                    WNOWAIT=os.WNOWAIT)
+    if waitid is not None:
+        fake_os.waitid = waitid
+    if pidfd_open is not None:
+        fake_os.pidfd_open = pidfd_open
+    monkeypatch.setattr(PB, "os", fake_os)
+    monkeypatch.setattr(PB, "select", types.SimpleNamespace(poll=real_select.poll, POLLIN=real_select.POLLIN))
+    return PB.exited_unreaped
+
+
+def test_y2_no_kqueue_no_pidfd_falls_back_to_a_waitid_poll(monkeypatch):
+    """L3 r2 Y2 (codex MED): a Linux kernel without pidfd_open (Debian 10, 4.19) must still see the exit, by
+    ``waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`` polled within the bound (it observes the exit, never reaps)."""
+    calls = []
+
+    def waitid(idtype, pid, options):
+        calls.append((idtype, pid, options))
+        return None if len(calls) < 3 else object()     # not yet, not yet, exited
+
+    watch = _hide_watches(monkeypatch, waitid=waitid)
+    assert watch(4242, 2.0) is True
+    assert calls[0] == (os.P_PID, 4242, os.WEXITED | os.WNOHANG | os.WNOWAIT) and len(calls) == 3
+
+
+def test_y2_waitid_poll_stops_at_the_bound_and_on_no_child(monkeypatch):
+    import time
+
+    calls = []
+    watch = _hide_watches(monkeypatch, waitid=lambda *a: calls.append(a))
+    t0 = time.monotonic()
+    assert watch(4242, 0.1) is False
+    assert 0.1 <= time.monotonic() - t0 < 1.0 and len(calls) >= 2
+
+    def gone(*a):
+        raise ChildProcessError(10, "no child")
+
+    watch = _hide_watches(monkeypatch, waitid=gone)
+    assert watch(4242, 1.0) is False
+
+
+def test_y2_pidfd_open_unsupported_falls_back_to_waitid(monkeypatch):
+    """Python built with pidfd_open, running on a kernel without it: ENOSYS from the call, then the waitid poll."""
+    import errno
+
+    def no_pidfd(pid):
+        raise OSError(errno.ENOSYS, "Function not implemented")
+
+    watch = _hide_watches(monkeypatch, waitid=lambda *a: object(), pidfd_open=no_pidfd)
+    assert watch(4242, 1.0) is True
+
+
+def test_y2_no_watch_at_all_is_false(monkeypatch):
+    assert _hide_watches(monkeypatch)(4242, 0.05) is False
+
+
+@pytest.mark.skipif(not hasattr(os, "waitid"), reason="no waitid on this host (macOS): the seam tests above hold it")
+def test_y2_waitid_fallback_on_real_children(monkeypatch):
+    import time
+
+    watch = _hide_watches(monkeypatch, waitid=os.waitid)
+    pid = _fork(lambda: None)
+    time.sleep(0.2)
+    assert watch(pid, 1.0) is True
+    assert os.waitpid(pid, 0)[0] == pid                 # not reaped by the watch
+    pid = _fork(lambda: time.sleep(5))
+    try:
+        assert watch(pid, 0.2) is False
+    finally:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+
+
 @pytest.mark.parametrize("result,status", [(b"garbage\n", 0), (None, 3), (b"x" * 5000, 0)])
 def test_t6_bad_result_is_unknown_and_leaves_no_group(penv, result, status):
     import signal

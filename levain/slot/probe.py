@@ -90,38 +90,77 @@ RECORD_FORMAT = "levain-probe-result/1"
 _RECORDED = {OPEN: "open", INCONCLUSIVE: "inconclusive", UNKNOWN: "unknown"}
 
 
+#: Y2: the waitid fallback's longest nap between polls (it starts at 1 ms and doubles up to this)
+WAITID_NAP_S = 0.05
+
+
 def exited_unreaped(pid: int, timeout: float) -> bool:
     """True when ``pid``, the caller's own child, has exited within ``timeout`` seconds, WITHOUT reaping it (X4: the
     group is killed while the leader is a zombie, so neither its pid nor its group id can have been reused). macOS:
     a kqueue ``NOTE_EXIT`` watch (on a child that is already a zombie the registration itself answers ``ESRCH``,
-    measured on this Mac 10-25); Linux: a pidfd, readable once the process has exited (kernel 5.3+). Anything that
-    cannot watch answers False, which the probe reads as unknown, never as the wall."""
-    try:
-        if hasattr(select, "kqueue"):
-            kq = select.kqueue()
-            try:
-                ev = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-                                   fflags=select.KQ_NOTE_EXIT)
-                got = kq.control([ev], 1, timeout)
-            finally:
-                kq.close()
-            for g in got:
-                if g.flags & select.KQ_EV_ERROR:
-                    return g.data == errno.ESRCH          # registered on our own zombie: it has exited
-                if g.fflags & select.KQ_NOTE_EXIT:
-                    return True
-            return False
-        fd = os.pidfd_open(pid)                           # type: ignore[attr-defined]  # Linux, Python 3.9+
+    measured on this Mac 10-25); Linux: a pidfd, readable once the process has exited (kernel 5.3+); a host with
+    neither, or whose ``pidfd_open`` call fails (an older kernel answers ``ENOSYS``): ``waitid`` with ``WNOWAIT``
+    polled within ``timeout`` (Y2), which observes the exit and leaves the child unreaped. A host with none of the
+    three answers False, which the probe reads as unknown, never as the wall."""
+    if getattr(select, "kqueue", None) is not None:
+        return _exited_kqueue(pid, timeout)
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if pidfd_open is not None:
         try:
-            poller = select.poll()
-            poller.register(fd, select.POLLIN)
-            return bool(poller.poll(int(timeout * 1000)))
+            fd = pidfd_open(pid)
+        except OSError:
+            pass                                          # no pidfd from this kernel: the waitid poll below
+        else:
+            try:
+                poller = select.poll()
+                poller.register(fd, select.POLLIN)
+                return bool(poller.poll(int(timeout * 1000)))
+            except OSError:
+                return False
+            finally:
+                os.close(fd)
+    if getattr(os, "waitid", None) is not None:
+        return _exited_waitid(pid, timeout)
+    return False
+
+
+def _exited_kqueue(pid: int, timeout: float) -> bool:
+    try:
+        kq = select.kqueue()
+        try:
+            ev = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                               fflags=select.KQ_NOTE_EXIT)
+            got = kq.control([ev], 1, timeout)
         finally:
-            os.close(fd)
+            kq.close()
     except OSError as e:
-        return e.errno == errno.ESRCH and hasattr(select, "kqueue")
-    except AttributeError:                                # no kqueue and no pidfd_open on this host
-        return False
+        return e.errno == errno.ESRCH                     # registered on our own zombie: it has exited
+    for g in got:
+        if g.flags & select.KQ_EV_ERROR:
+            return g.data == errno.ESRCH                  # the same answer, delivered as an event
+        if g.fflags & select.KQ_NOTE_EXIT:
+            return True
+    return False
+
+
+def _exited_waitid(pid: int, timeout: float) -> bool:
+    """Y2: ``waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`` polled until it reports the exit or ``timeout``
+    passes. ``WNOWAIT`` leaves the child waitable, so the reap stays ``wait_within``'s; no child by that pid = False."""
+    end = time.monotonic() + timeout
+    nap = 0.001
+    while True:
+        try:
+            if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return True
+        except InterruptedError:
+            continue
+        except OSError:                                   # ECHILD: not our child, or already reaped
+            return False
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(nap, left))
+        nap = min(nap * 2, WAITID_NAP_S)
 
 
 @dataclass
