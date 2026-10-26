@@ -147,6 +147,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_baton(install))
     core.extend(_check_host_awake())
     core.extend(_check_cockpit_authority(install))
+    core.extend(_check_authority_signers(install))
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
@@ -2432,6 +2433,128 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
                                    warn=True)]
     return rows + [CheckResult(name, True,
                                f"{len(laptops)} {LAPTOP} keys enrolled (head at seq {auth.authority.seq})")]
+
+
+#: What each refusal of the install helper's ``enrol-authority-signer`` / ``remove-authority-signer`` means, in the
+#: words a row's hint uses. A test greps ``levain/slot/install_helper.py`` for every ``Refused("authority-signer...")``
+#: and holds this table to exactly those names.
+AUTHORITY_SIGNER_REFUSALS: dict[str, str] = {
+    "authority-signer-key": "a key was not one the authority log would enrol (a passkey goes in --passkey)",
+    "authority-signer-verifier": "ssh-keygen could not read a key, or named another fingerprint for it",
+    "authority-signer-changed": "the key is already listed under another name or with fewer permissions: "
+                                "remove-authority-signer it first, then enrol",
+    "authority-signers-unsafe": "the signers file is not root's alone (another account can write it or its folder)",
+    "authority-signers-unreadable": "the signers file cannot be read whole, is not plain UTF-8, or is too big",
+    "authority-signers-too-large": "the file would pass its size limit; nothing was written",
+    "authority-signers-write-failed": "the file could not be written; the earlier file stands",
+}
+
+
+def authority_signer_sudo_line(host: str) -> str:
+    """The one ``sudo`` line that enrols the signers: the install helper's real path, then the verb with the flags
+    :func:`levain.slot.grammar.parse_install_argv` accepts (a test parses this line with the placeholders filled)."""
+    from levain.slot import layout
+
+    return (f"sudo {layout.install_helper_path(host)} enrol-authority-signer --principal YOUR_NAME "  # type: ignore[arg-type]
+            "--public-key '<type> <base64>' [--passkey '<type> <base64>' ...] [--confirm]")
+
+
+def _authority_signers_hint(host: str, *, why: str | None = None) -> str:
+    from levain.slot import layout
+
+    helper = layout.install_helper_path(host)         # type: ignore[arg-type]
+    refusals = "; ".join(f"{n}: {m}" for n, m in AUTHORITY_SIGNER_REFUSALS.items())
+    lead = f"{why} " if why else ""
+    return (f"{lead}Run `{authority_signer_sudo_line(host)}`: the laptop key is its .pub file's `<type> <base64>`, "
+            "each phone passkey (the opt-in names) its own --passkey, and `levain cockpit keys` lists the "
+            "fingerprints the helper prints back, to compare. To take a key out again, "
+            f"`sudo {helper} remove-authority-signer --key SHA256:...`. If the helper refuses, its answer names "
+            f"why. {refusals}.")
+
+
+def _check_authority_signers(install: Path, *, signers: Path | None = None, now: Any = None) -> list[CheckResult]:
+    """Root's authority-signers file and the graduation policies it anchors (14b DESIGN_REV2 S5, rows 1 and 2).
+
+    Only for an install with a cockpit authority log (no journal, or an uninitialised log, gives no row: there is
+    nothing yet to graduate). ``authority signers`` is a WARNING, never a failure, while nothing can graduate: the
+    file is missing, is not a file :func:`levain.trust_anchor.trust_anchor_problem` trusts, cannot be read, or lists
+    no key for ``levain-authority``; nothing else is broken. ``graduation policies`` is a WARNING per live policy
+    whose born or current signer root does not list (it covers nothing until a listed key signs it again). It is
+    read-only: the journal opens read-only and root's file is only read. ``signers`` and ``now`` are test seams."""
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from levain import authority as auth
+    from levain.autonomic import coverage as cov
+    from levain.autonomic.confirm import _SIGNERS_FILE_OWNERS
+    from levain.cockpit.firejournal import DB_NAME
+    from levain.graduation_policy import graduation_policies
+    from levain.slot import root_tree
+    from levain.trust_anchor import trust_anchor_problem
+
+    root = install / ".levain" / "cockpit"
+    journal = root / DB_NAME
+    if not journal.is_file():
+        return []
+    host = "darwin" if sys.platform == "darwin" else "linux"
+    path = signers if signers is not None else root_tree.authority_signers_path(host)   # type: ignore[arg-type]
+    state: Any = None
+    try:
+        conn = sqlite3.connect(f"file:{journal}?mode=ro", uri=True, timeout=2, isolation_level=None)
+        try:
+            pinned = auth.read_anchor(auth.anchor_path(root))          # before the replay's first SELECT
+            conn.execute("BEGIN")
+            state = auth.snapshot(conn)
+            auth.check_anchor(state, pinned, path=auth.anchor_path(root))
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+    except auth.NotInitialised:
+        return []
+    except (sqlite3.Error, auth.AuthorityError, OSError):
+        state = None                       # the cockpit authority row reports a log that cannot be read
+    name = "authority signers"
+    if not path.exists() and not path.is_symlink():
+        keys, row = None, CheckResult(
+            name, True, f"nothing can graduate: no enrolled authority signer ({path} does not exist)",
+            _authority_signers_hint(host), warn=True)
+    else:
+        problem, resolved = trust_anchor_problem(path, what="authority signers file", owners=_SIGNERS_FILE_OWNERS)
+        keys = None
+        if problem is not None:
+            row = CheckResult(
+                name, True, f"nothing can graduate: {problem}",
+                _authority_signers_hint(host, why="The helper will not write over it (authority-signers-unsafe), so "
+                                                  "remove the file as root first, or fix its owner and mode."),
+                warn=True)
+        else:
+            try:
+                raw = Path(resolved or path).read_bytes()
+            except OSError as exc:
+                raw = None
+                row = CheckResult(name, True, f"nothing can graduate: {path} cannot be read ({exc.strerror or exc})",
+                                  _authority_signers_hint(host), warn=True)
+            if raw is not None:
+                keys = cov.authority_keys(cov.parse_root_signers(raw))
+                if keys:
+                    row = CheckResult(name, True, f"{len(keys)} key(s) root lists for levain-authority ({path})")
+                else:
+                    keys = None
+                    row = CheckResult(name, True, f"nothing can graduate: {path} lists no key for levain-authority",
+                                      _authority_signers_hint(host), warn=True)
+    rows = [row]
+    if state is None:
+        return rows
+    when = now if now is not None else datetime.now(timezone.utc)
+    stale = sorted(p.grant_id for p in graduation_policies(state) if when < p.expires_at
+                   and (keys is None or not cov.anchored(p, keys)))
+    if stale:
+        rows.append(CheckResult(
+            "graduation policies", True,
+            f"{len(stale)} live policy(ies) no root-listed key signed ({', '.join(stale)}); each covers nothing",
+            "Enrol the signer (the authority signers row has the one sudo line), or sign the policy again with a key "
+            "root lists.", warn=True))
+    return rows
 
 
 def _quarantine_row(name: str, root: Path, key: Any, why: str, *, stuck: bool = False) -> CheckResult:
