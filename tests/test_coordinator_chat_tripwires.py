@@ -1137,3 +1137,96 @@ def test_i2_a_re_enable_makes_an_open_interrupt_naming_no_turn_stale(cs, claude,
     assert not latched(cs, claude["launch"])
     _refused(svc, claude["launch"], crossing)         # the batch from before the re-enable, read again
     assert [c.turn_id for c in s.interrupts] == [None]
+
+
+# --- L3 verify r4 (1026-3 d1b4j): an interrupted event is never interrupted again; activation under the mutex -------
+class Refusing(Shaky):
+    """Every reply fails (``raise``: OSError; ``no_such_request``: that answer); interrupts answer as Shaky's do."""
+
+    def __init__(self, how: str, *outcomes: str, **kw) -> None:
+        super().__init__(*(outcomes or ("confirmed",)), **kw)
+        self.how, self.asked = how, 0
+
+    def reject_control(self, request_id, text):
+        self.asked += 1
+        if self.how == "raise":
+            raise OSError("broken pipe")
+        return CommandResult("no_such_request", "no such request")
+
+
+@pytest.mark.parametrize("how", ["raise", "no_such_request"])
+def test_j1_a_failed_reply_re_read_five_times_is_interrupted_once(cs, claude, root, how):
+    svc, s, _ = up(cs, claude, root, session=Refusing(how))
+    crossing = _cross_with(event("error", "control:ctl-e", "00000100", turn_id="t-1", control_subtype="elicitation"))
+    for _ in range(5):
+        _refused(svc, claude["launch"], crossing)
+    assert s.asked == 5                               # the reply is tried again on every read
+    assert len(s.interrupts) == 1                     # its interrupt went through once and is never sent again
+    assert "tripwire:unanswerable_control" in trips(cs, claude["launch"]) and latched(cs, claude["launch"])
+
+
+def test_j1_a_failed_reply_whose_interrupt_failed_is_interrupted_again(cs, claude, root):
+    svc, s, _ = up(cs, claude, root, session=Refusing("raise", "ambiguous", "confirmed"))
+    crossing = _cross_with(event("error", "control:ctl-e", "00000100", turn_id="t-1", control_subtype="elicitation"))
+    for _ in range(4):
+        _refused(svc, claude["launch"], crossing)
+    assert s.asked == 4 and len(s.interrupts) == 2
+
+
+def test_j1_a_stale_failed_reply_whose_interrupt_went_through_is_not_interrupted_again(cs, claude, root):
+    from tests.test_coordinator_chat_liveness import activate
+    svc, s, _ = up(cs, claude, root, session=Refusing("raise"))
+    crossing = _cross_with(event("error", "control:ctl-x", "00000100", turn_id="t-1", control_subtype="can_use_tool"))
+    elicit = event("error", "control:ctl-e", "00000099", turn_id="t-1", control_subtype="elicitation")
+    batch = crossing._replace(events=(elicit,) + crossing.events)
+    _refused(svc, claude["launch"], batch)            # one interrupt, of t-1, for both events
+    activate(svc, claude)
+    _refused(svc, claude["launch"], batch)
+    assert [c.turn_id for c in s.interrupts] == ["t-1"] and s.asked == 2
+
+
+@pytest.mark.parametrize("writer", ["activate", "reenable"])
+def test_j3_an_activation_or_re_enable_racing_a_read_waits_for_its_interrupt(cs, claude, root, writer):
+    import threading
+    from levain.coordinator.chat import CoordError
+    from tests.test_coordinator_chat_liveness import activate
+    order, racers, armed = [], [], []
+
+    class Racing(Session):
+        def reject_control(self, request_id, text):
+            if not armed:
+                return super().reject_control(request_id, text)
+
+            def write():
+                try:
+                    if writer == "activate":
+                        activate(svc, claude)
+                    else:
+                        svc.reenable(claude["launch"], "cockpit:tab-a")
+                    order.append(writer)
+                except CoordError:                    # a re-enable after the read's own latch is refused
+                    order.append(f"{writer} refused")
+            t = threading.Thread(target=write)
+            racers.append(t)
+            t.start()
+            t.join(0.5)                               # the writer lands now unless it waits on the launch's mutex
+            raise OSError("broken pipe")
+
+        def interrupt(self, command):
+            order.append(("interrupt", command.turn_id))
+            return super().interrupt(command)
+
+    svc, s, _ = up(cs, claude, root, session=Racing(), probe=Probe(Verdict(True, "ok")))
+    if writer == "reenable":                          # a latch whose latest probe read live, so a re-enable is allowed
+        s.inbound("ctl-0", "hook_callback", turn_id="t-0")
+        svc.read_next(claude["launch"])
+        s.show("turn_ended", "t-9", turn_id="t-9")
+        svc.read_next(claude["launch"])
+        assert latched(cs, claude["launch"])
+    armed.append(True)
+    s.inbound("ctl-1", "elicitation", turn_id="t-1")
+    svc.read_next(claude["launch"])
+    for t in racers:
+        t.join(5)
+    # the interrupt the read asked for goes out before the write, which waited for the read to end
+    assert order[0] == ("interrupt", None) and order[1] in (writer, f"{writer} refused") and len(order) == 2
