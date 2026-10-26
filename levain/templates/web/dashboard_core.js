@@ -3726,7 +3726,7 @@
           for (const c of chips) c.setAttribute("aria-pressed", want.has(c.dataset.value) ? "true" : "false");
           const now = pressedNow();
           pick.selectedIndex = optAt(now.length === 1 ? optOf.get(now[0]) : (now.length ? several : everyone));
-          if (remember !== false) composePick[pickKey] = now;
+          if (remember !== false) { composePick[pickKey] = now; ctl.needsChoice = false; if (ctl.onPick) ctl.onPick(); }
           chipAddr();
         }
         // a rebuild of this box (every refetch of the panel) keeps what the person chose, as far as it is still in the enum
@@ -3737,10 +3737,13 @@
         const dflt = Array.isArray(f.default) ? f.default.filter((v) => inEnum.has(v)) : [];
         const start = keptNow && (keptNow.length || !kept.length) ? keptNow : dflt;
         // a declared default that names a seat (which the card does not draw) cannot start pressed: an empty pick is "everyone", so
-        // a send with nothing pressed is refused rather than widened (a pick the person makes themselves is a send like any other)
+        // a send from that untouched state is refused rather than widened. A pick the person makes themselves (a chip, the picker,
+        // "everyone" included, or one kept from before this rebuild) is a send like any other: `needsChoice` goes at their first pick.
         const seatDefault = !!seatPrefix && Array.isArray(f.default) && f.default.some((v) => typeof v === "string" && v.startsWith(seatPrefix));
-        controls.push({ f: f, nodes: chips.concat([pick]), read: pressedNow, set: setTo, chips: chips, pickKey: pickKey, initial: start,
-                        default: dflt, seatDefault: seatDefault });
+        const keptEveryone = Array.isArray(kept) && kept.length === 0;
+        const ctl = { f: f, nodes: chips.concat([pick]), read: pressedNow, set: setTo, chips: chips, pickKey: pickKey, initial: start,
+                      default: dflt, needsChoice: seatDefault && !start.length && !keptEveryone, onPick: null };
+        controls.push(ctl);
         continue;
       }
       if (f.kind === "multiselect") {
@@ -3794,8 +3797,11 @@
     const msg = el("span", "edit-msg", "");
     row.append(go, msg);
     box.appendChild(row);
-    const NO_SEAT_DEFAULT = "this card's default reader is a seat, which is messaged from its page; choose a reader. Nothing was sent";
-    if (chipCtl && chipCtl.seatDefault && !chipCtl.initial.length) { msg.className = "edit-msg"; msg.textContent = NO_SEAT_DEFAULT; }
+    const NO_SEAT_DEFAULT = "this card's default reader is a seat, which is messaged from its page; choose a reader";
+    const NO_SEAT_REFUSED = NO_SEAT_DEFAULT + ". Nothing was sent";
+    if (chipCtl && chipCtl.needsChoice) { msg.className = "edit-msg"; msg.textContent = NO_SEAT_DEFAULT; }
+    // the person's pick answers those words, so they go with it
+    if (chipCtl) chipCtl.onPick = () => { if (msg.textContent === NO_SEAT_DEFAULT || msg.textContent === NO_SEAT_REFUSED) { msg.className = "edit-msg"; msg.textContent = ""; } };
     // a landed send's "sent" goes at the next keystroke, so it never sits beside an unsent draft
     box.addEventListener("input", () => { if (stay && msg.textContent === "sent") { msg.className = "edit-msg"; msg.textContent = ""; } });
 
@@ -3913,9 +3919,9 @@
       return res;
     };
     go.addEventListener("click", () => {
-      if (stay && !commitAction) { setDisabled(true); msg.className = "edit-msg err"; msg.textContent = "this page can no longer send; nothing was sent"; return; }
+      if (!commitAction) { setDisabled(true); msg.className = "edit-msg err"; msg.textContent = "this page can no longer send; nothing was sent"; return; }
       const c = collect();
-      if (chipCtl && chipCtl.seatDefault && !chipCtl.read().length) { msg.className = "edit-msg err"; msg.textContent = NO_SEAT_DEFAULT; return; }
+      if (chipCtl && chipCtl.needsChoice && !chipCtl.read().length) { msg.className = "edit-msg err"; msg.textContent = NO_SEAT_REFUSED; return; }
       if (stay && (!chipCtl || chipCtl.read().length !== 1)) { msg.className = "edit-msg err"; msg.textContent = "no reader to send to; nothing was sent"; return; }
       if (c.error) { msg.className = "edit-msg err"; msg.textContent = c.error; return; }
       const sendKey = keyForSend(c.params);  // stable across a retry of THIS content (above)

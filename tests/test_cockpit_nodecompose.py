@@ -225,3 +225,60 @@ def test_a_page_that_turned_read_only_drops_the_send_with_words_not_a_type_error
     got, has_ta, said, errs = json.loads(out["values"][-1])
     posts = [p for p in _verb_posts(out) if not p.get("dry_run")]
     assert not [e for e in errs if "ResizeObserver" not in e] and posts == [] and (not has_ta or (said and "nothing was sent" in said)), out["values"][-1]
+
+
+SEAT_DEFAULT = {"default": ["seat:ledgerline"], "transient_prefix": "seat:", "gone_match": "no_live_seat"}
+PICK = "document.querySelector('[data-ck-compose=recipient-pick]')"
+
+
+@needs_browser
+def test_an_everyone_the_person_chose_on_a_seat_default_card_is_sent(tmp_path, monkeypatch):
+    # R1 (codex MED, fix r1 verify): only the untouched seat default is refused; a reader pressed and let go, or "everyone" picked, is a choice
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    by_chip = CHIPS + ".find(c => c.dataset.value === 'cli').click(); " + CHIPS + ".find(c => c.dataset.value === 'cli').click(); 1"
+    by_pick = "const p = %s; p.selectedIndex = 0; p.dispatchEvent(new Event('change')); 1" % PICK
+    for choose in (by_chip, by_pick):
+        with _serve_inbox(src, ENUM, None, SEAT_DEFAULT) as (url, _httpd):
+            out = _drive(tmp_path, f"{url}/{BUILD}#write_token=T", [DESKTOP, {"until": "document.querySelector('[data-ck-compose=recipient]')"},
+                                                                    {"eval": choose}, {"eval": "window.__old = %s; 1" % CARD_BOX}, {"eval": CARD_SEND},
+                                                                    {"until": "%s !== window.__old" % CARD_BOX}])
+        real = [p for p in _verb_posts(out) if not p.get("dry_run")]
+        assert len(real) == 1 and not real[0]["params"].get("for"), (choose, _verb_posts(out), out["values"])
+
+
+@needs_browser
+def test_the_seat_default_words_ask_for_a_reader_and_go_once_one_is_chosen(tmp_path, monkeypatch):
+    # R3 (deepseek MED 2 + LOW 6): before any send the words ask for a reader (nothing was attempted); a refused send says nothing
+    # was sent; a reader pressed afterwards clears them
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    press = CHIPS + ".find(c => c.dataset.value === 'cli').click(); " + CARD_MSG
+    with _serve_inbox(src, ENUM, None, SEAT_DEFAULT) as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/{BUILD}#write_token=T", [DESKTOP, {"until": "document.querySelector('[data-ck-compose=recipient]')"},
+                                                                {"eval": CARD_MSG}, {"eval": CARD_SEND}, {"eval": CARD_MSG}, {"eval": press}])
+    first, refused, after = out["values"][-4], out["values"][-2], out["values"][-1]
+    assert "choose a reader" in first and "nothing was sent" not in first.lower(), out["values"]
+    assert "nothing was sent" in refused.lower() and after == "", out["values"]
+    assert _verb_posts(out) == [], _verb_posts(out)
+
+
+@needs_browser
+def test_a_card_box_that_outlived_a_read_only_render_says_so_on_click_and_on_enter(tmp_path, monkeypatch):
+    # R2 (deepseek MED 1 + LOW 4): the read-only refusal is said by every action box, not only the seat page's. The box is kept across the
+    # read-only render by moving it out of the board first (the render replaces the board), so its handler runs with no commit transport.
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    spy = ("window.__orig = window.LevainDashboard.render; window.LevainDashboard.render = (v, o) => { window.__v = v; return window.__orig(v, o); }; "
+           "window.__errs = []; window.addEventListener('error', e => window.__errs.push(String(e.message))); "
+           "window.addEventListener('unhandledrejection', e => window.__errs.push(String(e.reason))); 1")
+    keep = "window.__b = %s; window.__b.querySelector('.tray-dump-ta').value = 'hi'; document.body.appendChild(window.__b); 1" % CARD_BOX
+    readonly = "window.__orig(window.__v, {}); 1"
+    click = "window.__b.querySelector('.tray-dump-btn').click(); 1"
+    enter = ("const t = window.__b.querySelector('.tray-dump-ta'); t.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', metaKey: true, bubbles: true})); "
+             "window.__b.querySelector('.tray-dump-ta').tagName")
+    said = "JSON.stringify([(window.__b.querySelector('.edit-msg') || {}).textContent, window.__errs])"
+    for act in (click, enter):
+        out = _out(tmp_path, src, [{"eval": spy}, {"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"}, {"until": "window.__v"},
+                                   {"eval": keep}, {"eval": readonly}, {"until": "1", "ms": 500}, {"eval": act}, {"until": "1", "ms": 500}, {"eval": said}],
+                   first=DESKTOP)
+        text, errs = json.loads(out["values"][-1])
+        assert text and "nothing was sent" in text.lower(), (act, out["values"])
+        assert not [e for e in errs if "ResizeObserver" not in e] and [p for p in _verb_posts(out) if not p.get("dry_run")] == [], (act, out["values"])
