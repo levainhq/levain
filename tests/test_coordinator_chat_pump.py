@@ -224,3 +224,35 @@ def test_restart_between_probing_and_verdict_judges_before_the_next_line(cs, cla
     assert r.state == "refused" and "check is running" in r.cause and s2.written == []
     restarted.read_next(claude["launch"])
     assert kinds(cs, claude["launch"])[-2:] == [("probing", "send"), ("live", "send")]
+
+
+# --- broken fake (§12): a service that routes a request during probing -------------------------------------------
+class _RoutesDuringProbing(ChatService):
+    """BROKEN FAKE: routes a step's new events without running the boundary's probe first (it is left for a later
+    step)."""
+
+    late = False
+
+    def _probe_pending(self, launch_id, session):
+        if not self.late:
+            super()._probe_pending(launch_id, session)
+
+
+def _routes_after_verdict(svc_cls, cs, world) -> bool:
+    route = Route(cs, world["launch"])
+    svc = svc_cls(cs, probe=Probe(Verdict(True, "ok")), route=route, sleep=lambda _s: None)
+    activate(svc, world)
+    s = ScriptedSession()
+    svc.attach(world["launch"], s)
+    svc.read_next(world["launch"])
+    route.calls.clear()
+    s.show("turn_started", "t-1", turn_id="t-1")
+    s.inbound("req-1", "can_use_tool", tool_name="Bash", tool_input={}, turn_id="t-1")
+    svc.late = True
+    svc.read_next(world["launch"])
+    return [c[1] for c in route.calls] == ["live"]
+
+
+def test_broken_fake_routes_during_probing(store, cs):
+    assert _routes_after_verdict(ChatService, cs, _world(store, "codex"))
+    assert not _routes_after_verdict(_RoutesDuringProbing, cs, _world(store, "codex"))
