@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -52,6 +53,12 @@ def _site_dirs(home: Path) -> list[Path]:
 
 def _covered(policy: C.CrownJewelsPolicy, p: Path) -> bool:
     return any(p == Path(t) or p.is_relative_to(Path(t)) for t in policy.persistence_write_subtrees)
+
+
+def _names_real(msg: str, p: Path) -> bool:
+    """The refusal names ``p``'s real path itself (as the site, or as the real path of a linked one), not a
+    spelling that merely ends with it."""
+    return re.search(rf"(below|really) {re.escape(str(p.resolve()))}[,)]", msg) is not None
 
 
 def _interpreters() -> list[str]:
@@ -380,7 +387,37 @@ def test_a_symlinked_userbase_whose_real_lib_is_too_wide_refuses_the_floor(home:
     with pytest.raises(C.ConfinementError) as err:
         _policy(tmp_path)
     msg = " ".join(str(err.value).split())
-    assert "$PYTHONUSERBASE" in msg and "/lib" in msg and "fail-closed" in msg
+    assert "$PYTHONUSERBASE" in msg and _names_real(msg, Path('/lib')) and "fail-closed" in msg
+
+
+def test_a_userbase_linked_to_usr_refuses_the_floor(home: Path, tmp_path: Path, monkeypatch) -> None:
+    """CI run 40378399674: on a usrmerge Linux ``/lib`` is ``/usr/lib``, three parts, so the part count alone let
+    it through. A base linked to ``/usr`` names ``/usr/lib`` on any system: a directory the runtime loads from."""
+    link = tmp_path / "usrlink"
+    link.symlink_to("/usr")
+    monkeypatch.setenv("PYTHONUSERBASE", str(link))
+    with pytest.raises(C.ConfinementError) as err:
+        _policy(tmp_path)
+    msg = " ".join(str(err.value).split())
+    assert "$PYTHONUSERBASE" in msg and _names_real(msg, Path('/usr/lib')) and "fail-closed" in msg
+
+
+def test_every_existing_system_runtime_root_is_too_wide_to_deny(tmp_path: Path) -> None:
+    """The roster, enumerated: each member that exists here, resolved, and the interpreter's own roots."""
+    checked = []
+    for p in (*C.SYSTEM_RUNTIME_ROOTS, Path(sys.base_prefix), Path(sys.executable).parent, Path("/bin/sh").parent):
+        if p.exists():
+            assert C.too_wide_to_deny(p.resolve(), tmp_path / "h"), p
+            checked.append(p)
+    assert Path("/usr") in checked   # the roster is not vacuous on any system the tests run on
+
+
+def test_an_ordinary_userbase_lib_is_not_too_wide(home: Path, tmp_path: Path) -> None:
+    """The control: a dedicated base under the operator's own tree is denied, not refused."""
+    lib = tmp_path / "pyuser" / "lib"
+    lib.mkdir(parents=True)
+    assert not C.too_wide_to_deny(lib.resolve(), home, tmp_path / "ws", tmp_path / "entity")
+    assert not C.too_wide_to_deny((home / ".local" / "lib").resolve(), home / "other")
 
 
 @live

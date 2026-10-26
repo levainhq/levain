@@ -276,6 +276,7 @@ __all__ = [
     "levain_home_base",
     "levain_home_spellings",
     "too_wide_to_deny",
+    "SYSTEM_RUNTIME_ROOTS",
     "ConfinementConfig",
     "load_confinement_config",
     "ShellResult",
@@ -2132,10 +2133,36 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
 _MAX_LISTED_STORES = 256
 
 
+# The system directories a runtime loads from. Denying one whole (a $PYTHONUSERBASE linked to /usr names
+# /usr/lib; on a usrmerge Linux /lib IS /usr/lib) would break the agent's own tools with no clear refusal, so
+# :func:`too_wide_to_deny` names each that exists, resolved. tests/test_user_site_floor.py enumerates it.
+SYSTEM_RUNTIME_ROOTS: tuple[Path, ...] = tuple(Path(p) for p in (
+    "/lib", "/lib64", "/usr", "/usr/lib", "/usr/lib64", "/usr/local", "/usr/local/lib", "/bin", "/sbin",
+    "/usr/bin", "/usr/sbin", "/System", "/Library", "/opt/homebrew", "/opt/homebrew/lib",
+))
+
+
+def _system_runtime_roots() -> list[Path]:
+    """:data:`SYSTEM_RUNTIME_ROOTS` plus this interpreter's ``sys.base_prefix``, the directory of
+    ``sys.executable`` and the directory of ``/bin/sh``: each that exists, resolved."""
+    out: list[Path] = []
+    for p in (*SYSTEM_RUNTIME_ROOTS, Path(sys.base_prefix), Path(sys.executable).parent, Path("/bin/sh").parent):
+        try:
+            if p.exists():
+                r = p.resolve()
+                if r not in out:
+                    out.append(r)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return out
+
+
 def too_wide_to_deny(d: Path, home: Path, *within: Path) -> bool:
     """Whether the subtree ``d`` is too wide to deny whole: a filesystem root, two path parts or fewer, a
-    shared temp directory, or a directory that is or holds ``home`` or any of ``within`` (by file identity,
-    :func:`_inside_by_identity`). A ``d`` INSIDE one of them is not too wide. The one predicate for the floor
+    shared temp directory, or a directory that is or holds ``home``, any of ``within`` or a system runtime
+    root (:func:`_system_runtime_roots`), by file identity (:func:`_inside_by_identity`). A ``d`` INSIDE
+    ``home`` or ``within`` is not too wide unless it holds a runtime root (a uv-managed interpreter's
+    ``sys.base_prefix`` sits under the home). The one predicate for the floor
     (:func:`_hides_the_entity`, ``within`` = the entity and its workspace) and the consent adapters'
     ``protected_paths`` (``within`` = the event's cwd when it has one)."""
     shared = {Path("/tmp").resolve(), Path("/var/tmp").resolve()}
@@ -2144,7 +2171,7 @@ def too_wide_to_deny(d: Path, home: Path, *within: Path) -> bool:
     except Exception:  # noqa: BLE001 - no usable temp directory: the fixed /tmp and /var/tmp checks stand
         pass
     return (str(d) == d.anchor or len(d.parts) <= 2 or d in shared
-            or any(_inside_by_identity(d, p) for p in (home, *within)))
+            or any(_inside_by_identity(d, p) for p in (home, *within, *_system_runtime_roots())))
 
 
 def _hides_the_entity(d: Path, home: Path, entity_dir: Path, workspace: Path) -> bool:
@@ -2791,11 +2818,16 @@ def build_policy(
     for root, label in user_site_roots:
         if label == _USERBASE_LABEL and too_wide_to_deny(root, home, ws, ed, *tool_dirs, *gnupg_homes,
                                                           *_runtime_roots()):
+            try:
+                real = root.resolve()
+            except (OSError, RuntimeError, ValueError):
+                real = root
+            where = str(root) if real == root else f"{root} (really {real})"
             raise ConfinementError(
-                f"$PYTHONUSERBASE puts your Python user site below {root}, and denying writes there would take "
-                "a filesystem root, a shared temp directory, your home, the workspace, the entity or a tool's "
-                "directory with it — refusing to build the floor (fail-closed). Point PYTHONUSERBASE at a "
-                "dedicated absolute directory, or unset it."
+                f"$PYTHONUSERBASE puts your Python user site below {where}, and denying writes there would "
+                "take a filesystem root, a system directory, a shared temp directory, your home, the workspace, "
+                "the entity or a tool's directory with it — refusing to build the floor (fail-closed). Point "
+                "PYTHONUSERBASE at a dedicated absolute directory, or unset it."
             )
     persistence_write_subtrees = _dedup([
         p
