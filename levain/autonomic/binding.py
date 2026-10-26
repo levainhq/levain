@@ -73,10 +73,11 @@ from pathlib import Path
 from typing import Any, Iterator, Protocol, runtime_checkable
 
 from levain.autonomic.authority import AuthorityScope
-from levain.autonomic.db import DB_NAME, STORE_FORMAT_V2, AutonomicDB, StoreFormatError, _marker
+from levain.autonomic.db import DB_NAME, STORE_FORMAT_V2, AutonomicDB, StoreFormatError, store_marker
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.journal import RunJournal, durable_replace
-from levain.autonomic.schema3 import STORE_FORMAT_V3
+from levain.autonomic.schema3 import (STORE_FORMAT_V3, StoreNewerThanLevain, StoreSchemaMismatch, expected_fingerprint,
+                                      fingerprint, format_n)
 from levain.autonomic.kill import Kleene, assert_kill_pure, kill_outcome
 from levain.autonomic.monitor import assert_trajectory_pure
 from levain.autonomic.posture import Posture
@@ -898,12 +899,11 @@ def _parse_json_registry(text: str) -> tuple[list[dict[str, Any]], str | None]:
 class _StoreAsItIs:
     """R14-9: the store directory's database opened as it is: no table is created, no column added, no format step
     run, so a store with runs in flight (the store the ``/2 -> /3`` upgrade, I15, is designed to refuse) still takes
-    a pause. The store must exist
-    and carry a format whose ``bindings`` and ``fences`` tables this module writes as it writes ``/2`` (``/2`` or
-    ``/3``); any other marker, or none, is refused in every transaction and nothing is written. The same ``read`` /
-    ``write`` contract as :class:`~levain.autonomic.db.AutonomicDB`."""
-
-    FORMATS = (STORE_FORMAT_V2, STORE_FORMAT_V3)
+    a pause. The store must exist and carry a format whose ``bindings`` and ``fences`` tables this module writes as it
+    writes ``/2``: ``/2``, or ``/3`` whose schema fingerprint is this code's (the check
+    :class:`~levain.autonomic.schema3.AutonomicStore3` makes on open). Any other store is refused in every
+    transaction, before anything is written. The same ``read`` / ``write`` contract as
+    :class:`~levain.autonomic.db.AutonomicDB`; every connection runs with ``recursive_triggers = ON``."""
 
     def __init__(self, directory: Path | str) -> None:
         self.directory = Path(directory)
@@ -912,14 +912,29 @@ class _StoreAsItIs:
     def _connect(self) -> sqlite3.Connection:
         if not self.path.is_file():
             raise StoreFormatError(f"no autonomic store at {self.path}")
-        return open_durable(self.path)
+        conn = open_durable(self.path)
+        try:
+            conn.execute("PRAGMA recursive_triggers = ON")
+        except BaseException:
+            conn.close()
+            raise
+        return conn
 
-    @classmethod
-    def _check_format(cls, conn: sqlite3.Connection) -> None:
-        marker = _marker(conn)
-        if marker not in cls.FORMATS:
-            raise StoreFormatError(f"store format {marker!r} is not one of {', '.join(map(repr, cls.FORMATS))}: "
-                                   "nothing is written to it")
+    @staticmethod
+    def _check_format(conn: sqlite3.Connection) -> None:
+        marker = store_marker(conn)
+        if marker == STORE_FORMAT_V2:
+            return
+        if marker == STORE_FORMAT_V3:
+            if fingerprint(conn) != expected_fingerprint():
+                raise StoreSchemaMismatch(f"store-schema-mismatch: the store's DDL is not this levain's "
+                                          f"({STORE_FORMAT_V3}); it is not rewritten")
+            return
+        n = format_n(marker)
+        if n is not None and n > 3:
+            raise StoreNewerThanLevain(f"store-newer-than-levain: store format {marker!r}; upgrade levain")
+        raise StoreFormatError(f"store format {marker!r} is not {STORE_FORMAT_V2!r} or {STORE_FORMAT_V3!r}: "
+                               "nothing is written to it")
 
     @contextmanager
     def write(self) -> Iterator[sqlite3.Connection]:
@@ -951,7 +966,7 @@ class BindingStore:
                  journal: RunJournal | None = None, upgrade: bool = True) -> None:
         # ``path`` is the store DIRECTORY (see :mod:`levain.autonomic.db`): the registry is the
         # ``bindings`` table of the database in it, shared with the run journal. ``upgrade=False`` opens an
-        # existing store as it is, with no schema or format step (R14-9: ``levain binding pause|resume``)
+        # existing store as it is, with no schema or format step (R14-9: ``levain binding pause|resume|abandon``)
         self.db = AutonomicDB(path) if upgrade else _StoreAsItIs(path)
         self.path = self.db.directory
         self._validator = validator
@@ -1477,6 +1492,36 @@ class BindingStore:
         absent. Locked read-modify-write; the seal is unaffected (``status`` is not sealed). Any
         target other than ``ACTIVE`` (including an idempotent one: a revoke repeated on a claimed
         one-shot is how a person cancels its run) fences the binding's admitted runs first."""
+        return self._set_status(binding_id, status) is not None
+
+    def pause(self, binding_id: str) -> int | None:
+        """:meth:`set_status` to ``PAUSED`` (its admitted runs fenced in the same transaction): the binding's fence
+        generation after the pause, or ``None`` if the binding is absent. ``ValueError`` as :meth:`set_status`."""
+        return self._set_status(binding_id, BindingStatus.PAUSED)
+
+    def abandon(self, binding_id: str) -> int | None:
+        """R15-1: fence the binding's admitted runs (:meth:`_fence`, the fence a pause or revoke writes) and change
+        nothing else: its status stays as it is. The remedy for a binding :meth:`set_status` cannot pause, a REVOKED
+        or EXPIRED one (a claimed one-shot is REVOKED with its run admitted under the old fence). Each call fences
+        again. Returns the fence generation, or ``None`` if the binding is absent. ``ValueError`` for an ACTIVE or
+        PAUSED binding: it can fire again (on its next event, or once resumed), so it is paused, not abandoned."""
+        with self._locked() as conn:
+            records = self._read_raw(for_mutation=True, conn=conn)
+            rec = next((r for r in records if r.get("binding_id") == binding_id), None)
+            if rec is None:
+                return None
+            try:
+                current = BindingStatus(rec.get("status"))
+            except ValueError as e:
+                raise ValueError(f"binding {binding_id!r} has an unparseable status {rec.get('status')!r}") from e
+            if not current.is_inert:
+                raise ValueError(f"binding {binding_id} is {current.value}, so it can fire again; "
+                                 f"`levain binding pause {binding_id}` fences its runs")
+            self._fence(rec, conn)
+            return RunJournal._generation_in(conn, binding_id)
+
+    def _set_status(self, binding_id: str, status: BindingStatus) -> int | None:
+        # set_status's transaction: the binding's fence generation after it, or None when the binding is absent
         if not isinstance(status, BindingStatus):
             raise TypeError(f"status must be a BindingStatus, got {type(status).__name__}")
         with self._locked() as conn:
@@ -1499,8 +1544,8 @@ class BindingStore:
                         self._fence(rec, conn)   # stops admitted runs, in this transaction
                     rec["status"] = status.value
                     self._write_raw(records, conn)
-                    return True
-            return False
+                    return RunJournal._generation_in(conn, binding_id)
+            return None
 
     def ratify(self, binding_id: str) -> Binding | None:
         """The governed PAUSED→ACTIVE ratify-write (Slice 4 / the last 3b remainder): take a compiled
