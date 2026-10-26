@@ -114,9 +114,6 @@ def store_marker(conn: sqlite3.Connection) -> str | None:
     return None if row is None else row[0]
 
 
-_marker = store_marker   # the name it had before it was public
-
-
 def _check_format(conn: sqlite3.Connection) -> None:
     # inside the caller's transaction, after it began: a store migrated by another connection since this object
     # opened it is refused here. A write holds the write lock from its BEGIN IMMEDIATE, so no migration commits

@@ -77,7 +77,7 @@ from levain.autonomic.db import DB_NAME, STORE_FORMAT_V2, AutonomicDB, StoreForm
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.journal import RunJournal, durable_replace
 from levain.autonomic.schema3 import (STORE_FORMAT_V3, StoreNewerThanLevain, StoreSchemaMismatch, expected_fingerprint,
-                                      fingerprint, format_n)
+                                      fingerprint, format_n, preflight)
 from levain.autonomic.kill import Kleene, assert_kill_pure, kill_outcome
 from levain.autonomic.monitor import assert_trajectory_pure
 from levain.autonomic.posture import Posture
@@ -901,9 +901,10 @@ class _StoreAsItIs:
     run, so a store with runs in flight (the store the ``/2 -> /3`` upgrade, I15, is designed to refuse) still takes
     a pause. The store must exist and carry a format whose ``bindings`` and ``fences`` tables this module writes as it
     writes ``/2``: ``/2``, or ``/3`` whose schema fingerprint is this code's (the check
-    :class:`~levain.autonomic.schema3.AutonomicStore3` makes on open). Any other store is refused in every
-    transaction, before anything is written. The same ``read`` / ``write`` contract as
-    :class:`~levain.autonomic.db.AutonomicDB`; every connection runs with ``recursive_triggers = ON``."""
+    :class:`~levain.autonomic.schema3.AutonomicStore3` makes on open). Any other store is refused through a read-only
+    connection before the durable one sets its PRAGMAs (A1-R3), and again in every transaction, before anything is
+    written. The same ``read`` / ``write`` contract as :class:`~levain.autonomic.db.AutonomicDB`; every connection runs
+    with ``recursive_triggers = ON``."""
 
     def __init__(self, directory: Path | str) -> None:
         self.directory = Path(directory)
@@ -912,6 +913,7 @@ class _StoreAsItIs:
     def _connect(self) -> sqlite3.Connection:
         if not self.path.is_file():
             raise StoreFormatError(f"no autonomic store at {self.path}")
+        preflight(self.path, self._check_format)
         conn = open_durable(self.path)
         try:
             conn.execute("PRAGMA recursive_triggers = ON")
@@ -924,6 +926,11 @@ class _StoreAsItIs:
     def _check_format(conn: sqlite3.Connection) -> None:
         marker = store_marker(conn)
         if marker == STORE_FORMAT_V2:
+            missing = [t for t in ("bindings", "fences") if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (t,)).fetchone() is None]
+            if missing:
+                raise StoreFormatError(f"the {STORE_FORMAT_V2!r} store has no {' or '.join(missing)} table: nothing "
+                                       "is written to it")
             return
         if marker == STORE_FORMAT_V3:
             if fingerprint(conn) != expected_fingerprint():
@@ -967,6 +974,9 @@ class BindingStore:
         # ``path`` is the store DIRECTORY (see :mod:`levain.autonomic.db`): the registry is the
         # ``bindings`` table of the database in it, shared with the run journal. ``upgrade=False`` opens an
         # existing store as it is, with no schema or format step (R14-9: ``levain binding pause|resume|abandon``)
+        if not upgrade and journal is not None:
+            raise ValueError("BindingStore: upgrade=False opens the store as it is, and a run journal opens it with "
+                             "its schema and format steps")
         self.db = AutonomicDB(path) if upgrade else _StoreAsItIs(path)
         self.path = self.db.directory
         self._validator = validator

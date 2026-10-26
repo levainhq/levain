@@ -6,7 +6,9 @@ environment-fault counts are kept by the database itself (autogrant DESIGN rev 7
 here keeps the name it had in the probed prototypes (levain project_memory ``1026-16/autogrant14/probes/rev73_schema.py``,
 ``1026-20/rev74/probes/rev74_schema.py``, ``1026-20/rev74b/probes/rev74b_schema.py``) [judged by lane a1c1, 10-26:
 assembled from their line ranges; the changes are the tunables (R14-4), the meta triggers (O-74b-4) and the
-environment-fault writer (R14-2)].
+environment-fault writer (R14-2)]; the A1c1 L3 round-1 fixes then added ``<t>_legacy_frozen``,
+``effects_in_legacy_run`` and the ``holds.decisions`` generation, and made ``pendings_born`` a born-open rule [lane
+a1c1d, 10-26].
 
 This module builds a ``/3`` store FRESH. :class:`AutonomicStore3` creates one in an empty directory and opens one it
 made; a ``/1`` or ``/2`` store is refused by its format (:class:`StoreNeedsUpgrade`) and left as it was: the upgrade of
@@ -41,6 +43,7 @@ _log = logging.getLogger("levain.autonomic.schema3")
 
 STORE_FORMAT_V3 = "levain-autonomic/3"
 _FORMAT_PREFIX = "levain-autonomic/"
+_FORMAT_DIGITS = 9
 
 # R14-4: the tunables, by meta key. The triggers read the meta row (``_tune``); the opener writes these values.
 HELD_LIMIT = 5             # I5: the delivery held the HELD_LIMIT-th time closes its subject `refused`
@@ -61,11 +64,15 @@ SUBJECT_REASON = "subject:?*"
 
 
 def format_n(marker: object) -> int | None:
-    """The ``n`` of a ``levain-autonomic/<n>`` marker (no leading zero), else None."""
+    """The ``n`` of a ``levain-autonomic/<n>`` marker (ASCII digits, from 1, no leading zero, at most
+    :data:`_FORMAT_DIGITS` of them), else None. The bound comes before ``int()``, which raises ``ValueError`` on a
+    digit string past Python's integer-string limit."""
     if not isinstance(marker, str) or not marker.startswith(_FORMAT_PREFIX):
         return None
     tail = marker[len(_FORMAT_PREFIX):]
-    return int(tail) if tail.isdigit() and not (len(tail) > 1 and tail[0] == "0") else None
+    if not (0 < len(tail) <= _FORMAT_DIGITS and tail.isascii() and tail.isdigit() and tail[0] != "0"):
+        return None
+    return int(tail)
 
 # ---- rev 7.3 (rev73_schema.py): tables, columns, helpers, triggers, the close path, reaper selections ----
 CONFIRM_RUNGS = "('COOLING_OFF', 'CONFIRM', 'CONFIRM_ELEVATED')"   # Posture.needs_confirm, by name
@@ -103,7 +110,10 @@ ALL_MODES = ("fired", "refused", "killed", "timed_out", "outcome_unknown")
 
 # (table, column, type): added in place, as db.py's _ADDED_COLUMNS does
 V3_COLUMNS = (("runs", "seal", "TEXT"), ("runs", "started_at", "TEXT"), ("effects", "seal", "TEXT"),
-              ("cancels", "receipt_id", "TEXT"), ("holds", "trigger_event", "TEXT"))
+              ("cancels", "receipt_id", "TEXT"), ("holds", "trigger_event", "TEXT"),
+              # A1-R2: the hold's decision generation, the number of decisions it ever took (holds_move steps it
+              # in the statement that decides; a hold_decisions row carries it)
+              ("holds", "decisions", "INTEGER NOT NULL DEFAULT 0 CHECK (decisions >= 0)"))
 
 # D70: the columns the whole-row triggers below were written against (a test pins PRAGMA table_info to these)
 KNOWN_COLUMNS = {
@@ -115,7 +125,7 @@ KNOWN_COLUMNS = {
     "gate_receipts": ("receipt_id", "subject", "record", "projected", "seq"),
     "holds": ("hold_id", "run_id", "effect_id", "binding_id", "digest", "at", "pending", "pending_id", "chain",
               "chained", "decided", "decided_by", "decided_posture", "seq", "signer", "signature", "challenge", "fence",
-              "trigger_event"),
+              "trigger_event", "decisions"),
     "held_counts": ("subject", "n", "last_reason", "mark"),
     "closing": ("subject",),
 }
@@ -329,18 +339,15 @@ V3_TRIGGERS = (
            "I4: done is fired, unknown is outcome_unknown", "BEFORE UPDATE ON effects"),
     _abort("effects_final", "OLD.state != 'intent'", "D54: an ended effect is final", "BEFORE UPDATE ON effects"),
     _abort("effects_final_d", "OLD.state != 'intent'", "D54: an ended effect is final", "BEFORE DELETE ON effects"),
-    # ---- manual pendings: open->firing (with its decision), open|firing->terminal (with its receipt)
-    _abort("pendings_born", f"NEW.state = 'terminal' AND NOT {_has(_PEN, 'NEW.receipt_id')}",
-           "D54: a pending ends only with its receipt", "BEFORE INSERT ON manual_pendings"),
+    # ---- manual pendings: born open; open->firing (with its decision), open|firing->terminal (with its receipt)
+    _abort("pendings_born", "NEW.state IS NOT 'open' OR NEW.receipt_id IS NOT NULL OR NEW.decision IS NOT NULL",
+           "D54: a pending is born open, unreceipted and undecided", "BEFORE INSERT ON manual_pendings"),
     _abort("pendings_move", "NOT (" + _same("pending_id", "seal", "seq") + " AND ("
            "(OLD.state = 'open' AND NEW.state = 'firing' AND NEW.receipt_id IS NULL AND NEW.decision IS NOT NULL) OR "
            f"(OLD.state IN ('open', 'firing') AND NEW.state = 'terminal' AND NEW.decision IS OLD.decision AND "
            f"{_has(_PEN, 'NEW.receipt_id')})))", "D54/D70: an illegal pending transition",
            "BEFORE UPDATE ON manual_pendings"),
     _abort("pendings_final_d", "1", "D55: a pending subject is never deleted", "BEFORE DELETE ON manual_pendings"),
-    _abort("pendings_born_mode", "NEW.state = 'terminal' AND NOT "
-           + _mode("NEW.receipt_id", TERMINAL_MODES[("manual_pendings", "terminal")]),
-           "I4: a pending terminal_state its state permits", "BEFORE INSERT ON manual_pendings"),
     _abort("pendings_move_mode", "NEW.state = 'terminal' AND OLD.state != 'terminal' AND NOT "
            + _mode("NEW.receipt_id", TERMINAL_MODES[("manual_pendings", "terminal")]),
            "I4: a pending terminal_state its state permits", "BEFORE UPDATE ON manual_pendings"),
@@ -409,18 +416,23 @@ V3_TRIGGERS = (
     _abort("holds_event_born", "NEW.trigger_event IS NOT NULL AND (NOT json_valid(NEW.trigger_event) "
            "OR json_type(NEW.trigger_event) IS NOT 'object')", "I6: a sealed trigger event is a JSON object",
            "BEFORE INSERT ON holds"),
-    _abort("holds_born_open", "NEW.decided IS NOT NULL OR " + " OR ".join(f"NEW.{c} IS NOT NULL" for c in _HOLD_DECISION),
+    _abort("holds_born_open", "NEW.decided IS NOT NULL OR NEW.decisions IS NOT 0 OR "
+           + " OR ".join(f"NEW.{c} IS NOT NULL" for c in _HOLD_DECISION),
            "I3: a hold is born undecided", "BEFORE INSERT ON holds"),
+    # A1-R2: the decision generation steps by one in the statement that decides (approve, reject), and only there
     _abort("holds_move", "NOT (" + _same(*_HOLD_IDENT) + " AND ("
            # unchanged
-           "(" + _same("decided", *_HOLD_DECISION) + ") OR "
+           "(" + _same("decided", "decisions", *_HOLD_DECISION) + ") OR "
            # approve: open -> 1 (ends nothing)
-           "(OLD.decided IS NULL AND NEW.decided IS 1 AND NEW.decided_by IS NOT NULL) OR "
+           "(OLD.decided IS NULL AND NEW.decided IS 1 AND NEW.decided_by IS NOT NULL "
+           "AND NEW.decisions IS OLD.decisions + 1) OR "
            # reopen (V _reopen_in): 1 -> open, every decision column cleared together, before its effect exists
-           "(OLD.decided IS 1 AND NEW.decided IS NULL AND " + " AND ".join(f"NEW.{c} IS NULL" for c in _HOLD_DECISION)
+           "(OLD.decided IS 1 AND NEW.decided IS NULL AND NEW.decisions IS OLD.decisions AND "
+           + " AND ".join(f"NEW.{c} IS NULL" for c in _HOLD_DECISION)
            + " AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.run_id = NEW.run_id AND e.effect_id = NEW.effect_id)) OR "
            # reject: open -> 0, only once the run's cancel (with its receipt, cancels_receipted) is written
-           "(OLD.decided IS NULL AND NEW.decided IS 0 AND NEW.decided_by IS NOT NULL AND NEW.signer IS NULL AND "
+           "(OLD.decided IS NULL AND NEW.decided IS 0 AND NEW.decided_by IS NOT NULL "
+           "AND NEW.decisions IS OLD.decisions + 1 AND NEW.signer IS NULL AND "
            "NEW.signature IS NULL AND NEW.challenge IS NULL AND NEW.fence IS NULL AND "
            "EXISTS (SELECT 1 FROM cancels c WHERE c.run_id = NEW.run_id AND c.receipt_id IS NOT NULL))))",
            "I3: an illegal hold transition", "BEFORE UPDATE ON holds"),
@@ -479,12 +491,15 @@ CLOSE_PATH = (
     "END",
 )
 
-# D57's selections (the lease test for 'intent' / 'firing' rows is applied by the caller, inside the write txn)
-REAP_EFFECTS = "SELECT run_id, effect_id, seal FROM effects WHERE state = 'intent'"
+# D57's selections (the lease test for 'intent' / 'firing' rows is applied by the caller, inside the write txn). A1-R1:
+# none selects a legacy row (frozen: LEGACY_TRIGGERS would refuse its close); an unstamped intent effect in a legacy run
+# is selected (rev74 DETAIL step 7: the reaper closes a poisoned intent after the upgrade)
+REAP_EFFECTS = "SELECT run_id, effect_id, seal FROM effects WHERE state = 'intent' AND legacy = 0"
 # D71: unstarted is POSITIVE evidence (started_at IS NULL), never the absence of an intent row
 REAP_FENCED_RUNS = """
 SELECT r.run_id, r.seal FROM runs r JOIN fences f ON f.binding_id = r.binding_id
  WHERE f.generation > r.generation
+   AND r.legacy = 0
    AND r.started_at IS NULL
    AND NOT EXISTS (SELECT 1 FROM gate_receipts g WHERE g.subject = 'run:' || r.run_id)
 """
@@ -494,6 +509,7 @@ REAP_PENDINGS = "SELECT pending_id, seal FROM manual_pendings WHERE state = 'fir
 REAP_MIDCHAIN_RUNS = """
 SELECT r.run_id, r.seal FROM runs r JOIN fences f ON f.binding_id = r.binding_id
  WHERE f.generation > r.generation
+   AND r.legacy = 0
    AND r.started_at IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.run_id = r.run_id AND e.state NOT IN ('done', 'unknown'))
    AND (SELECT COUNT(*) FROM effects e WHERE e.run_id = r.run_id AND e.state IN ('done', 'unknown'))
@@ -509,7 +525,8 @@ SELECT r.run_id, r.seal FROM runs r JOIN fences f ON f.binding_id = r.binding_id
 # whose receipt says fired=false (I10's pick, 13a2: terminal_state fired, envelope fired = execution.ok = false; D94).
 REAP_UNKNOWN_LINK_RUNS = """
 SELECT r.run_id, r.seal FROM runs r
- WHERE r.started_at IS NOT NULL
+ WHERE r.legacy = 0
+   AND r.started_at IS NOT NULL
    AND EXISTS (SELECT 1 FROM effects e WHERE e.run_id = r.run_id AND (e.state = 'unknown' OR (e.state = 'done'
                AND EXISTS (SELECT 1 FROM gate_receipts g WHERE g.receipt_id = e.receipt_id
                            AND json_extract(g.record, '$.fired') = 0))))
@@ -548,11 +565,13 @@ DECISION_TRIGGERS = (
     "CREATE TRIGGER IF NOT EXISTS holds_decision_log AFTER UPDATE OF decided ON holds "
     "WHEN OLD.decided IS NULL AND NEW.decided IS NOT NULL BEGIN "
     "INSERT INTO hold_decisions (hold_id, run_id, pending_id, by, n) VALUES (NEW.hold_id, NEW.run_id, NEW.pending_id, "
-    "NEW.decided_by, (SELECT COUNT(*) + 1 FROM hold_decisions WHERE hold_id = NEW.hold_id)); END",
+    "NEW.decided_by, NEW.decisions); END",
+    # A1-R2: n is the hold's decision generation, which only a deciding statement steps (holds_move); the primary key
+    # refuses a second row for it
     _abort("hold_decisions_born", "NOT EXISTS (SELECT 1 FROM holds h WHERE h.hold_id = NEW.hold_id "
            "AND h.run_id IS NEW.run_id AND h.pending_id IS NEW.pending_id AND h.decided IS NOT NULL "
-           "AND h.decided_by IS NEW.by) OR NEW.n IS NOT (SELECT COUNT(*) + 1 FROM hold_decisions WHERE hold_id = NEW.hold_id)",
-           "R13-6: a decision row is the next decision of a decided hold", "BEFORE INSERT ON hold_decisions"),
+           "AND h.decided_by IS NEW.by AND h.decisions IS NEW.n)",
+           "R13-6: a decision row is the current decision of a decided hold", "BEFORE INSERT ON hold_decisions"),
     _abort("hold_decisions_u", "1", "R13-6: a decision row is never changed", "BEFORE UPDATE ON hold_decisions"),
     _abort("hold_decisions_d", "1", "R13-6: a decision row is never removed", "BEFORE DELETE ON hold_decisions"),
 )
@@ -564,8 +583,15 @@ LEGACY_TRIGGERS = tuple(
                "I15: a row is legacy only from the /2 -> /3 upgrade", f"BEFORE INSERT ON {tbl}"),
         _abort(f"{tbl}_legacy_fixed", "NEW.legacy IS NOT OLD.legacy",
                "I15: the legacy mark never moves", f"BEFORE UPDATE ON {tbl}"),
+        # A1-R1: a legacy row is frozen whole [judged by lane a1c1d, 10-26, against levain project_memory
+        # 1026-20/rev74/DETAIL.md I15 steps 3-7: no column of a stamped row changes after the upgrade]; an unstamped
+        # row in a legacy run (a backfilled or poisoned intent effect) is not, and closes as any row does
+        _abort(f"{tbl}_legacy_frozen", "OLD.legacy = 1",
+               "I15: a legacy row is frozen (no change after the upgrade)", f"BEFORE UPDATE ON {tbl}"),
     )
 ) + (
+    _abort("effects_in_legacy_run", "EXISTS (SELECT 1 FROM runs WHERE run_id = NEW.run_id AND legacy = 1)",
+           "I15: a legacy run is frozen (no effect after the upgrade)", "BEFORE INSERT ON effects"),
     _abort("cancels_in_legacy_run", "EXISTS (SELECT 1 FROM runs WHERE run_id = NEW.run_id AND legacy = 1)",
            "I15: a legacy run is frozen (no close after the upgrade)", "BEFORE INSERT ON cancels"),
     _abort("holds_in_legacy_run", "EXISTS (SELECT 1 FROM runs WHERE run_id = NEW.run_id AND legacy = 1)",
@@ -859,9 +885,51 @@ class StoreSchemaMismatch(StoreFormatError):
 
 
 def _check_format(conn: sqlite3.Connection) -> None:
-    marker = vdb._marker(conn)
+    marker = vdb.store_marker(conn)
     if marker != STORE_FORMAT_V3:
         raise StoreFormatError(f"store format {marker!r} is not {STORE_FORMAT_V3!r}")
+
+
+def refuse_unless_this_v3(conn: sqlite3.Connection) -> None:
+    """A database that holds tables is this code's ``/3`` store (format marker and fingerprint), else refused by why."""
+    marker = vdb.store_marker(conn)
+    n = format_n(marker)
+    if marker is None:
+        raise StoreFormatError("the database holds tables but no store format marker: it is not an "
+                               "autonomic store, and is not taken over")
+    if n is None:
+        raise StoreFormatError(f"store format {marker!r} is not a levain-autonomic format")
+    if n > 3:
+        raise StoreNewerThanLevain(f"store-newer-than-levain: store format {marker!r} is newer than "
+                                   f"this levain's {STORE_FORMAT_V3!r}; upgrade levain")
+    if n < 3:
+        raise StoreNeedsUpgrade(f"store-needs-upgrade: store format {marker!r} is older than "
+                                f"{STORE_FORMAT_V3!r}, and this levain does not upgrade it: it is "
+                                "left as it was")
+    if fingerprint(conn) != expected_fingerprint():
+        raise StoreSchemaMismatch(f"store-schema-mismatch: the store's DDL is not this levain's "
+                                  f"({STORE_FORMAT_V3}); it is not rewritten")
+
+
+def _holds_tables(conn: sqlite3.Connection) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is not None
+
+
+def preflight(path: Path, check: Callable[[sqlite3.Connection], None]) -> None:
+    """A1-R3: ``check`` the database at ``path`` through a read-only connection (``mode=ro``, no PRAGMA set), before
+    any durability PRAGMA can change it (:func:`open_durable` switches a database to WAL): a store ``check`` refuses
+    is left as it was. The opener checks again on the durable connection, inside its own transactions."""
+    conn = sqlite3.connect(Path(path).absolute().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+    try:
+        check(conn)
+    finally:
+        conn.close()
+
+
+def _preflight_v3(conn: sqlite3.Connection) -> None:
+    # an empty database is the one AutonomicStore3 creates a store in
+    if _holds_tables(conn):
+        refuse_unless_this_v3(conn)
 
 
 class AutonomicStore3:
@@ -881,6 +949,8 @@ class AutonomicStore3:
                 raise StoreFormatError(f"store {self.path} has disappeared")
         elif not self.directory.exists():
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not self._ready and self.path.exists():
+            preflight(self.path, _preflight_v3)
         conn = open_durable(self.path)
         try:
             conn.execute("PRAGMA recursive_triggers = ON")
@@ -907,7 +977,7 @@ class AutonomicStore3:
         rolling its read back."""
         conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
         try:
-            if conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
+            if not _holds_tables(conn):
                 if not write:
                     _rollback(conn)
                     return True
@@ -918,23 +988,7 @@ class AutonomicStore3:
                 ddl_v3(conn)
                 triggers_v3(conn)
             else:
-                marker = vdb._marker(conn)
-                n = format_n(marker)
-                if marker is None:
-                    raise StoreFormatError("the database holds tables but no store format marker: it is not an "
-                                           "autonomic store, and is not taken over")
-                if n is None:
-                    raise StoreFormatError(f"store format {marker!r} is not a levain-autonomic format")
-                if n > 3:
-                    raise StoreNewerThanLevain(f"store-newer-than-levain: store format {marker!r} is newer than "
-                                               f"this levain's {STORE_FORMAT_V3!r}; upgrade levain")
-                if n < 3:
-                    raise StoreNeedsUpgrade(f"store-needs-upgrade: store format {marker!r} is older than "
-                                            f"{STORE_FORMAT_V3!r}, and this levain does not upgrade it: it is "
-                                            "left as it was")
-                if fingerprint(conn) != expected_fingerprint():
-                    raise StoreSchemaMismatch(f"store-schema-mismatch: the store's DDL is not this levain's "
-                                              f"({STORE_FORMAT_V3}); it is not rewritten")
+                refuse_unless_this_v3(conn)
                 if tunables_differ(conn):
                     if not write:
                         _rollback(conn)
@@ -983,8 +1037,10 @@ def close_subject(conn: sqlite3.Connection, *, subject: str, record: dict, state
     ``close_subject_do`` trigger refuses it unless exactly one terminal row carries the receipt). ``state`` is an
     effect's ``done`` | ``unknown``; ``reason`` a run's or request's close reason; ``result`` an effect's result
     text. The record is strict JSON (no NaN or Infinity: ``receipts_content`` refuses it, R13-8). Returns the
-    receipt id (``record["id"]``)."""
+    receipt id (``record["id"]``); a record with no id is a ``ValueError`` before anything is written."""
     _in_write(conn, "close_subject")
+    if not isinstance(record, dict) or record.get("id") is None:
+        raise ValueError(f"close_subject: the receipt record for {subject} has no id: {record!r:.200}")
     text = json.dumps(record, ensure_ascii=False, allow_nan=False)
     seq = conn.execute("SELECT IFNULL(MAX(seq), 0) + 1 FROM gate_receipts").fetchone()[0]
     conn.execute("INSERT INTO close_subject (receipt_id, subject, record, seq, state, reason, result) "
@@ -1019,11 +1075,22 @@ def dry_run_close(conn: sqlite3.Connection, subject: str, record_for: Callable[[
         try:
             close_subject(conn, subject=subject, record=record_for(terminal_state), state=state,
                           reason=None if kind in ("effect", "pending") else f"dry_run:{terminal_state}")
-        except Exception as e:  # noqa: BLE001 -- every builder or store fault refuses the admission
-            raise CloseUnbuildable(f"close_unbuildable:{terminal_state}:{type(e).__name__}:{e}") from e
-        finally:
-            conn.execute("ROLLBACK TO dry_run_close")
-            conn.execute("RELEASE dry_run_close")
+        except BaseException as e:
+            # A1-R4: a fault that rolled the transaction back (SQLITE_FULL, IOERR) took the savepoint with it; the
+            # undo then fails, and that failure must not replace the fault that refuses the admission
+            try:
+                _undo_savepoint(conn)
+            except sqlite3.Error as undo:
+                _log.warning("autonomic store: dry_run_close savepoint not undone after %s: %s", type(e).__name__, undo)
+            if isinstance(e, Exception):   # every builder or store fault refuses the admission
+                raise CloseUnbuildable(f"close_unbuildable:{terminal_state}:{type(e).__name__}:{e}") from e
+            raise
+        _undo_savepoint(conn)   # a close that succeeded is undone, or its error is raised: its writes never stay
+
+
+def _undo_savepoint(conn: sqlite3.Connection) -> None:
+    conn.execute("ROLLBACK TO dry_run_close")
+    conn.execute("RELEASE dry_run_close")
 
 
 # ---- held counts (I5 / I11 / R13-6) ---------------------------------------------------------------------------------

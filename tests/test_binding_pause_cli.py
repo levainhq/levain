@@ -299,3 +299,76 @@ def test_an_abandoned_one_shot_s_claimed_run_does_not_take_its_next_action(tmp_p
         assert cli.main(["binding", "abandon", b.binding_id, "--store-dir", str(path.parent)]) == 0
     w.sweep(LATER)
     assert w.outbox() == ([] if abandoned else ["link0"])
+
+
+# ---- A1c1 L3 round 1 (levain project_memory 1026-22/a1c1/L3_r1.txt, L3_r1_deepseek.txt) ------------------------------
+def _sidecars(path) -> list[str]:
+    return sorted(p.name for p in path.parent.iterdir() if p.name != path.name)
+
+
+@pytest.mark.parametrize("ddl, why", [
+    (["CREATE TABLE foo (x)"], "not paused: store format None is not"),
+    (["CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+      "INSERT INTO meta VALUES ('format', 'other/1')"], "not paused: store format 'other/1' is not"),
+    # A1-R3 (deepseek): a /2 marker over a database without the tables a pause writes
+    (["CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+      f"INSERT INTO meta VALUES ('format', '{vdb.STORE_FORMAT_V2}')", "CREATE TABLE bindings (binding_id TEXT, "
+      "record TEXT, seq INTEGER)"], "not paused: the 'levain-autonomic/2' store has no fences table"),
+])
+def test_a_foreign_database_is_refused_before_its_journal_mode_or_files_change(tmp_path, capsys, ddl, why):
+    # A1-R3 (codex): the durable opener switches a database to WAL; a refused store must keep its rollback journal
+    path = tmp_path / "store" / vdb.DB_NAME
+    path.parent.mkdir()
+    c = sqlite3.connect(path, isolation_level=None)
+    for st in ddl:
+        c.execute(st)
+    assert c.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    c.close()
+    before = path.read_bytes()
+    for verb in ("pause", "abandon", "resume"):
+        assert cli.main(["binding", verb, "bind-x", "--store-dir", str(path.parent)]) == 1
+        word = {"pause": "paused", "abandon": "abandoned", "resume": "resumed"}[verb]
+        assert capsys.readouterr().err.startswith(why.replace("not paused", f"not {word}"))
+    with pytest.raises(vdb.StoreFormatError):
+        schema3.AutonomicStore3(path.parent).meta("format")
+    assert path.read_bytes() == before                 # the header's journal-mode bytes included
+    assert _sidecars(path) == []                       # no -wal, no -shm, no -journal
+
+
+def test_abandon_accepts_exactly_the_inert_statuses(tmp_path):
+    # deepseek LOW: abandon is the remedy for the statuses set_status cannot pause; pinned by name, every status
+    assert {st for st in BindingStatus if st.is_inert} == {BindingStatus.REVOKED, BindingStatus.EXPIRED}
+    for st in BindingStatus:
+        store = BindingStore(tmp_path / st.value)
+        b = _binding(Posture.COOLING_OFF)
+        store.add(b)
+        if st is not BindingStatus.PAUSED:
+            store.set_status(b.binding_id, st)
+        assert store.get(b.binding_id).status is st
+        if st in (BindingStatus.REVOKED, BindingStatus.EXPIRED):
+            fence = _fence(tmp_path / st.value / vdb.DB_NAME, b.binding_id)
+            assert store.abandon(b.binding_id) == fence + 1
+        else:
+            with pytest.raises(ValueError, match="so it can fire again"):
+                store.abandon(b.binding_id)
+
+
+def test_an_as_is_store_takes_no_run_journal(tmp_path):
+    from levain.autonomic.journal import RunJournal
+
+    with pytest.raises(ValueError, match="upgrade=False opens the store as it is"):
+        BindingStore(tmp_path / "store", upgrade=False, journal=RunJournal(tmp_path / "store"))
+
+
+def test_a_corrupt_registry_record_is_the_one_line_refusal(busy, capsys):
+    # complement LOW 4: _read_raw(for_mutation=True) on a corrupt registry raises ValueError (measured by lane a1c1d
+    # over not-JSON, a list, an unhashable or unknown status, a broken guard, a 100000-deep array), which the verbs print
+    w, b, path = busy
+    c = sqlite3.connect(path, isolation_level=None)
+    c.execute("UPDATE bindings SET record = '{nope' WHERE binding_id = ?", (b.binding_id,))
+    c.close()
+    for verb, word in (("pause", "paused"), ("resume", "resumed"), ("abandon", "abandoned")):
+        assert cli.main(["binding", verb, b.binding_id, "--store-dir", str(path.parent)]) == 1
+        err = capsys.readouterr().err
+        assert err.startswith(f"not {word}: binding store ") and "a record is not JSON" in err
+        assert err.count("\n") == 1

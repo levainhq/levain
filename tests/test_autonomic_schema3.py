@@ -255,7 +255,7 @@ def test_a_reopen_does_not_restart_the_held_count(store):
     tx(c, ("INSERT INTO runs (run_id, binding_id, generation, seal) VALUES ('p', 'b', 0, ?)", (RUN_SEAL,)),
        ("INSERT INTO holds (hold_id, run_id, effect_id, binding_id, digest, pending_id, seq) "
         "VALUES ('h-p', 'p', 'link-0', 'b', 'd', 'pp', 1)",),
-       ("UPDATE holds SET decided = 1, decided_by = 'on-loop' WHERE hold_id = 'h-p'",))
+       ("UPDATE holds SET decided = 1, decisions = decisions + 1, decided_by = 'on-loop' WHERE hold_id = 'h-p'",))
     fault = lambda conn: s.count_held(conn, subj, "subject:fault")  # noqa: E731
     tx(c, fault, fault)
     mark = lambda: c.execute(f"SELECT {s._progress(':s')}", {"s": subj}).fetchone()[0]  # noqa: E731
@@ -289,8 +289,8 @@ def test_a_re_approval_is_progress_and_restarts_the_count(store):
     tx(c, ("INSERT INTO runs (run_id, binding_id, generation, seal) VALUES ('q', 'b', 0, ?)", (RUN_SEAL,)),
        ("INSERT INTO holds (hold_id, run_id, effect_id, binding_id, digest, pending_id, seq) "
         "VALUES ('h-q', 'q', 'link-0', 'b', 'd', 'qq', 2)",),
-       ("UPDATE holds SET decided = 1, decided_by = 'on-loop' WHERE hold_id = 'h-q'",), fault, fault,
-       (REOPEN, ("h-q",)), ("UPDATE holds SET decided = 1, decided_by = 'human' WHERE hold_id = 'h-q'",), fault)
+       ("UPDATE holds SET decided = 1, decisions = decisions + 1, decided_by = 'on-loop' WHERE hold_id = 'h-q'",), fault, fault,
+       (REOPEN, ("h-q",)), ("UPDATE holds SET decided = 1, decisions = decisions + 1, decided_by = 'human' WHERE hold_id = 'h-q'",), fault)
     assert c.execute("SELECT n FROM held_counts WHERE subject = ?", (subj,)).fetchone() == (1,)
     assert c.execute("SELECT by, n FROM hold_decisions WHERE hold_id = 'h-q'").fetchall() == [("on-loop", 1),
                                                                                              ("human", 2)]
@@ -386,7 +386,7 @@ def test_no_effect_row_is_removed_and_the_delete_sweep_is_pinned(store):
        ("INSERT INTO runs (run_id, binding_id, generation, seal) VALUES ('p', 'b', 0, ?)", (RUN_SEAL,)),
        ("INSERT INTO holds (hold_id, run_id, effect_id, binding_id, digest, pending_id, seq) "
         "VALUES ('h-p', 'p', 'link-0', 'b', 'd', 'pp', 1)",),
-       ("UPDATE holds SET decided = 1, decided_by = 'on-loop' WHERE hold_id = 'h-p'",),
+       ("UPDATE holds SET decided = 1, decisions = decisions + 1, decided_by = 'on-loop' WHERE hold_id = 'h-p'",),
        ("INSERT INTO bindings (binding_id, record, seq) VALUES ('b', '{}', 1)",),
        ("INSERT INTO fences (binding_id, generation) VALUES ('b', 1)",),
        ("INSERT INTO graduation_steps (at, old_id, new_id, family, from_posture, to_posture, clean_count, "
@@ -691,7 +691,7 @@ def test_an_unattended_approve_reopen_loop_does_not_restart_the_held_count(tmp_p
     counts = {"request:p:link-0": [], "pending:pp": []}
     for k, by in log:
         if k == "decide:1":
-            tx(c, ("UPDATE holds SET decided = 1, decided_by = ? WHERE hold_id = 'h-p'", (by,)))
+            tx(c, ("UPDATE holds SET decided = 1, decisions = decisions + 1, decided_by = ? WHERE hold_id = 'h-p'", (by,)))
         else:
             tx(c, (REOPEN, ("h-p",)),
                *(lambda conn, subj=subj: counts[subj].append(s.count_held(conn, subj, "subject:fault"))
