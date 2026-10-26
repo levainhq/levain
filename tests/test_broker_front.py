@@ -129,15 +129,15 @@ def test_connect_refuses_unsafe_targets():
 
 def test_refused_connect_line_names_the_host():
     """wfetch DESIGN §2.3 / WF-1 item 4: the refused line carries the requested host (the DONE test's "gateway log
-    line" for an off-list WebFetch), bounded: a host part that is neither a host name nor an address literal, or
-    longer than a DNS name, is logged only as its length."""
+    line" for an off-list WebFetch), bounded: a host part that is not a host name the CONNECT grammar accepts (an address
+    literal included), or longer than a DNS name, is logged only as its length."""
     async def body(ask, log: Path, front: Front, up_bytes) -> None:
         long_name = ("a" * 60 + ".") * 5 + "example"
         for target, want in (("evil.example:443", {"host": "evil.example"}),
                              ("EVIL.Example:443", {"host": "evil.example"}),
                              ("ok.example:22", {"host": "ok.example"}),
-                             ("[::1]:443", {"host": "::1"}),
-                             ("93.184.215.14:443", {"host": "93.184.215.14"}),
+                             ("[::1]:443", {"host_invalid": True, "host_len": 3}),
+                             ("93.184.215.14:443", {"host_invalid": True, "host_len": 13}),
                              ("loop.example:443", {"host": "loop.example"}),
                              (long_name + ":443", {"host_invalid": True, "host_len": len(long_name)}),
                              ("a_b!x:443", {"host_invalid": True, "host_len": 5}),
@@ -746,8 +746,8 @@ def test_front_entry_point_refuses_to_serve_without_keys_and_go(tmp_path, monkey
 
 def test_refused_host_fields_uses_the_policy_grammar():
     """WF-1a L3 r1 W3: the logged host is the requested text only when it passes the policy's one host grammar (the
-    grammar the front's CONNECT list was parsed with) or is an address literal spelled canonically; a numeric-dotted
-    or legacy-IPv4 spelling, a non-canonical address and a non-bytes target are ``host_invalid``."""
+    grammar the front's CONNECT list was parsed with); an address literal, a bracketed authority, a numeric-dotted
+    or legacy-IPv4 spelling and a non-bytes target are ``host_invalid``."""
     from levain.broker import front as F
     from levain.broker import policy as P
 
@@ -762,8 +762,10 @@ def test_refused_host_fields_uses_the_policy_grammar():
                          (b"[0:0::1]:443", {"host_invalid": True, "host_len": 6}),
                          (b"[::FFFF:1.2.3.4]:443", {"host_invalid": True, "host_len": 14}),
                          (b"EVIL.Example:443", {"host": "evil.example"}),
-                         (b"[::1]:443", {"host": "::1"}),
-                         (b"93.184.215.14:443", {"host": "93.184.215.14"})):
+                         (b"[::1]:443", {"host_invalid": True, "host_len": 3}),
+                         (b"93.184.215.14:443", {"host_invalid": True, "host_len": 13})):
         assert F.refused_host_fields(target) == want, target
+    for target in (b"93.184.215.14:443", b"[::1]:443", b"::1:443", b"[evil.example]:443"):
+        assert "host" not in F.refused_host_fields(target), target
     for target in ("evil.example:443", 443, None, bytearray(b"evil.example:443")):
         assert F.refused_host_fields(target) == {"host_invalid": True}, target
