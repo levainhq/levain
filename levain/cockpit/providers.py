@@ -112,13 +112,21 @@ def _stat_of(p: Path | None) -> tuple | None:
         st = os.stat(p)
     except OSError:
         return None
-    return (st.st_ino, st.st_mtime_ns, st.st_size)
+    # ctime and mode so a chmod (which moves neither mtime nor size) is seen too
+    return (st.st_ino, st.st_mtime_ns, st.st_size, st.st_ctime_ns, st.st_mode)
 
 
 def _store_signature(source: Any) -> tuple | None:
     """What a build of this source reads that moves when the store does: the anneal files (the db with its WAL,
     the continuity file, the crystals, the spores), the state-line file, and the edit-log ledger. None when the
-    source names none of them, which is no signal and so no caching."""
+    source names none of them, or the signature cannot be taken: no signal, so no caching, never an exception."""
+    try:
+        return _signature_of(source)
+    except Exception:       # noqa: BLE001 — a partial source or a failing stat builds normally, uncached
+        return None
+
+
+def _signature_of(source: Any) -> tuple | None:
     anneal = getattr(source, "anneal", None)
     db = getattr(anneal, "episodic_db", None)
     if db is None:
@@ -126,7 +134,8 @@ def _store_signature(source: Any) -> tuple | None:
     ledger = getattr(getattr(source, "write_scope", None), "ledger_root", None)
     root = getattr(source, "install_root", None)
     ledger = ledger if ledger is not None else (Path(root) / ".levain" if root is not None else None)
-    files = [db, Path(f"{db}-wal"), Path(f"{db}-shm"), anneal.continuity_md, anneal.crystal_json, anneal.spores_json,
+    # no -shm: it is not a write signal; the db and its -wal move on every write
+    files = [db, Path(f"{db}-wal"), anneal.continuity_md, anneal.crystal_json, anneal.spores_json,
              getattr(source, "context_json", None), Path(ledger) / "edits.jsonl" if ledger is not None else None]
     if root is not None:
         # the config docs: the install dir, its seed/ and activation/ dirs (a removed or added file moves the
@@ -142,27 +151,63 @@ def _store_signature(source: Any) -> tuple | None:
     return tuple(_stat_of(Path(f)) if f is not None else None for f in files)
 
 
+class _Flight:
+    """One build in progress for a source: the readers that arrive meanwhile wait on it and share its view."""
+    __slots__ = ("done", "sig", "view")
+
+    def __init__(self, sig: tuple) -> None:
+        self.done = threading.Event()
+        self.sig = sig
+        self.view: SubstrateView | None = None
+
+
+_view_flights: dict[int, _Flight] = {}
+
+
 def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
     """The view for this read cycle. Within a cycle the memo shares one build; across cycles an unchanged store
-    (``_store_signature``) serves the view built before, up to ``VIEW_CACHE_MAX_AGE_S``. A write's own read
-    (``ctx.fresh``) and a view that carries an error are never cached."""
+    (``_store_signature``) serves the view built before, up to ``VIEW_CACHE_MAX_AGE_S``. A miss is single-flight:
+    one build per source runs and the readers that arrive meanwhile wait for it and share its view; a build that
+    raises stores nothing and wakes them, and the next of them builds. A write's own read (``ctx.fresh``) and a
+    view that carries an error are never cached."""
     def build() -> SubstrateView:
         sig = None if ctx.fresh else _store_signature(source)
+        if sig is None:
+            return source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
         key = id(source)
-        if sig is not None:
+        while True:
             with _view_cache_lock:
                 hit = _view_cache.get(key)
-            if hit and hit[0] is source and hit[1] == sig and time.monotonic() - hit[2] < VIEW_CACHE_MAX_AGE_S:
-                return hit[3]
-        # the signature is taken BEFORE the build: a change landing mid-build leaves a stale signature on the
-        # stored view, so the next read sees a mismatch and rebuilds
-        view = source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
-        if sig is not None and not view.errors:
-            with _view_cache_lock:
-                _view_cache[key] = (source, sig, time.monotonic(), view)
-                while len(_view_cache) > VIEW_CACHE_SOURCES:
-                    _view_cache.pop(next(iter(_view_cache)))
-        return view
+                if hit and hit[0] is source and hit[1] == sig and time.monotonic() - hit[2] < VIEW_CACHE_MAX_AGE_S:
+                    return hit[3]
+                flight = _view_flights.get(key)
+                if flight is None:
+                    flight = _view_flights[key] = _Flight(sig)
+                    mine = True
+                else:
+                    mine = False
+            if not mine:
+                flight.done.wait()
+                if flight.view is not None and flight.sig == sig:
+                    return flight.view
+                continue            # it raised, or saw another store state: look again
+            try:
+                # the signature is taken BEFORE the build: a change landing mid-build leaves a stale signature on the
+                # stored view, so the next read sees a mismatch and rebuilds
+                view = source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
+                flight.view = view          # the readers waiting on this flight share it, an errored view too
+                if not view.errors:
+                    with _view_cache_lock:
+                        _view_cache.pop(key, None)      # re-insert at the tail, so the eviction below drops the oldest
+                        _view_cache[key] = (source, sig, time.monotonic(), view)
+                        while len(_view_cache) > VIEW_CACHE_SOURCES:
+                            _view_cache.pop(next(iter(_view_cache)))
+                return view
+            finally:
+                with _view_cache_lock:
+                    if _view_flights.get(key) is flight:
+                        del _view_flights[key]
+                flight.done.set()
     return ctx.memo("view", build)
 
 

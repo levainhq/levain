@@ -71,6 +71,14 @@
     return Date.parse(iso.indexOf("T") < 0 || /(Z|[+-]\d\d:?\d\d)$/i.test(iso) ? iso : iso + "Z");
   }
 
+  // The kernel sends a save's STAMP, never its age (an age moves every second and would change the panel's etag on an
+  // idle store). The page draws the age from the stamp against the server's clock and redraws it on its own timer:
+  // AGE_TICK_MS is that timer's one interval, so a display tier can slow or stop every age on the page by changing it.
+  const AGE_TICK_MS = 30000;
+  const SAVE_STAMP = "last save at";
+  let serverOffsetMs = 0;       // the server's clock minus this browser's, as of the last snapshot
+  const serverNow = () => Date.now() + serverOffsetMs;
+
   function ageLabel(iso, now, prefix) {
     const t = parseIso(iso);
     if (isNaN(t)) return "";
@@ -78,6 +86,33 @@
     const u = s >= 86400 ? Math.floor(s / 86400) + "d" : s >= 3600 ? Math.floor(s / 3600) + "h"
       : s >= 60 ? Math.floor(s / 60) + "m" : s + "s";
     return (prefix || "") + u + " ago";
+  }
+
+  const savedAge = (iso, nowMs) => ageLabel(iso, nowMs, "") || "unknown";
+  // the Health panel's save stamp as a metric a reader can read: an age that tickAges keeps current; no readable stamp reads "unknown"
+  function saveMetric(m, nowMs) {
+    const iso = typeof m.value === "string" && !isNaN(parseIso(m.value)) ? m.value : null;
+    return Object.assign({}, m, { label: "last save", value: iso ? savedAge(iso, nowMs || serverNow()) : "unknown", age_at: iso });
+  }
+  let ageTimer = 0;
+  function tickAges() {
+    let live = 0;
+    for (const n of (typeof document !== "undefined" && document.querySelectorAll ? Array.from(document.querySelectorAll("[data-age-at]")) : [])) {
+      if (!n.isConnected) continue;
+      live++;
+      const t = savedAge(n.dataset.ageAt, serverNow());
+      if (n.textContent !== t) n.textContent = t;
+      if (n.dataset.ageTitle && n.parentNode && n.parentNode.title !== undefined) n.parentNode.title = n.dataset.ageTitle + ": " + t;
+    }
+    if (!live && ageTimer) { root.clearInterval(ageTimer); ageTimer = 0; }
+  }
+  // a node that shows a save's age: tagged with its stamp, and the one timer started if it is not running
+  function ageNode(node, m, titled) {
+    if (!m.age_at) return node;
+    node.dataset.ageAt = m.age_at;
+    if (titled) node.dataset.ageTitle = m.label;      // the row's tooltip carries the age too
+    if (!ageTimer) ageTimer = root.setInterval(tickAges, AGE_TICK_MS);
+    return node;
   }
 
   function badgeText(b) {
@@ -363,9 +398,9 @@
       need(Array.isArray(ms) && ms.every((m) => isObj(m) && typeof m.label === "string"
         && (m.value == null || typeof m.value === "string" || isNum(m.value)) && (m.unit == null || typeof m.unit === "string")
         && (m.read == null || typeof m.read === "string") && (m.detail == null || typeof m.detail === "string")), "metrics");
-      out.metrics = ms;
+      out.metrics = ms.map((m) => (m.label === SAVE_STAMP ? saveMetric(m, nowMs) : m));
       out.typed = true;
-      out.lines = ms.map((m) => ({
+      out.lines = out.metrics.map((m) => ({
         meta: m.label,
         text: [m.value == null ? "" : m.value + (m.unit ? " " + m.unit : ""), m.read || "", m.detail || ""].filter(Boolean).join(" — ") || (m.status || "unknown"),   // the detail rides along: the focus filter, the jump box and a touch reader have no hover
         accent: m.status === "warn" || m.status === "bad", dim: m.status === "unknown" }));
@@ -614,6 +649,7 @@
     noteRepos(snap.panels);
     const m = snap.manifest;
     const gen = parseIso(m.generated_at);
+    serverOffsetMs = isNaN(gen) ? 0 : gen - Date.now();
     let now = isNaN(gen) ? Date.now() : gen;   // the server's clock, so a skewed browser cannot misreport ages
     const genAt = now;
     for (const p of Object.values(snap.panels || {})) {
@@ -1037,7 +1073,7 @@
       row.appendChild(el("span", "op-l", m.label));
       const fig = m.value == null ? "" : m.value + (m.unit ? " " + m.unit : "");
       // a state is never colour alone: with no figure and no reading, the word stands in
-      row.appendChild(el("span", "v", [fig, m.read || ""].filter(Boolean).join(" · ") || st));
+      row.appendChild(ageNode(el("span", "v", [fig, m.read || ""].filter(Boolean).join(" · ") || st), m, true));
       // the row stays one line and a tile cuts its reading: the tooltip holds the whole reading, then the detail
       const whole = [[fig, m.read || ""].filter(Boolean).join(" · "), typeof m.detail === "string" ? m.detail : ""].filter(Boolean).join(" · ");
       if (whole) row.title = m.label + ": " + whole;
@@ -1276,7 +1312,7 @@
       }
       if (nf) {
         const row = el("div", "row");
-        for (const m of figsAll.slice(0, nf)) { const c = el("span"); c.append(el("b", "num", figure(m.value) + (m.unit ? " " + m.unit : "")), document.createTextNode(m.label)); row.appendChild(c); }
+        for (const m of figsAll.slice(0, nf)) { const c = el("span"); c.append(ageNode(el("b", "num", figure(m.value) + (m.unit ? " " + m.unit : "")), m), document.createTextNode(m.label)); row.appendChild(c); }
         host.appendChild(row);
       }
       s.hidden = ms.length - nd - nf;
@@ -2671,7 +2707,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, AGE_TICK_MS, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

@@ -133,3 +133,169 @@ def test_a_config_doc_edit_or_removal_rebuilds(counted) -> None:
     shutil.rmtree(root / "seed")
     ck.panel("health")
     assert len(calls) == 3
+
+
+# ---- L3 round 1 fixes (K3, K5, K6, K7, K8) ----------------------------------------------------------------
+
+def _gate_build(monkeypatch, src, *, fail_first: bool = False):
+    """Make ``source.build`` block on an event so concurrent readers pile up behind one miss."""
+    import threading
+    entered, release, calls = threading.Event(), threading.Event(), []
+    real = type(src).build
+
+    def build(self, **kw):
+        calls.append(1)
+        entered.set()
+        release.wait(10)
+        if fail_first and len(calls) == 1:
+            raise RuntimeError("first build fails")
+        return real(self, **kw)
+
+    monkeypatch.setattr(type(src), "build", build)
+    return entered, release, calls
+
+
+def _readers(src, n: int):
+    import threading
+    from levain.cockpit.engine import ReadContext
+    out: list = []
+
+    def go():
+        try:
+            out.append(providers._view(src, ReadContext(datetime.now(timezone.utc))))
+        except Exception as e:                      # noqa: BLE001
+            out.append(e)
+
+    ts = [threading.Thread(target=go) for _ in range(n)]
+    for t in ts:
+        t.start()
+    return ts, out
+
+
+def test_concurrent_misses_share_one_build(tmp_path: Path, monkeypatch) -> None:
+    """K3: a miss is single-flight: readers that arrive while a build runs wait for it and share its view."""
+    import time
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    entered, release, calls = _gate_build(monkeypatch, src)
+    ts, out = _readers(src, 6)
+    entered.wait(5)
+    time.sleep(0.3)                                 # the other five are now at the miss too
+    release.set()
+    for t in ts:
+        t.join(10)
+    assert len(calls) == 1, len(calls)
+    assert len(out) == 6 and all(v is out[0] for v in out)
+
+
+def test_a_failed_build_is_not_cached_and_the_waiters_build_or_raise(tmp_path: Path, monkeypatch) -> None:
+    """K3: a failing build raises to its own caller, stores nothing, and wakes the waiters, which build for themselves."""
+    import time
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    entered, release, calls = _gate_build(monkeypatch, src, fail_first=True)
+    ts, out = _readers(src, 3)
+    entered.wait(5)
+    time.sleep(0.3)
+    release.set()
+    for t in ts:
+        t.join(10)
+    assert len(out) == 3
+    errs = [o for o in out if isinstance(o, Exception)]
+    views = [o for o in out if not isinstance(o, Exception)]
+    assert len(errs) == 1 and len(views) == 2
+    assert views[0] is views[1]                     # the second builder's view is shared with the last waiter
+    assert len(calls) == 2, len(calls)
+    from levain.cockpit.engine import ReadContext
+    assert providers._view(src, ReadContext(datetime.now(timezone.utc))) is views[0]   # and it was cached
+
+
+def test_a_permission_change_on_the_store_is_seen(counted) -> None:
+    """K5: chmod moves ctime and mode but not inode, mtime or size."""
+    import os
+    root, src, ck, _clock, calls = counted
+    ck.panel("health")
+    db = src.anneal.episodic_db
+    os.chmod(db, 0o000)
+    try:
+        try:
+            ck.panel("health")
+        except Exception:                           # noqa: BLE001
+            pass
+    finally:
+        os.chmod(db, 0o600)
+    assert len(calls) == 2, len(calls)
+
+
+def test_the_shared_memory_file_is_not_part_of_the_signature(counted) -> None:
+    """K6: -shm is touched by readers, so it must not invalidate the view; db and -wal move on writes."""
+    root, src, ck, _clock, calls = counted
+    ck.panel("health")
+    shm = Path(f"{src.anneal.episodic_db}-shm")
+    shm.write_bytes(b"x" * 64)
+    ck.panel("health")
+    shm.write_bytes(b"y" * 128)
+    ck.panel("graph")
+    assert len(calls) == 1, len(calls)
+
+
+def test_a_signature_that_cannot_be_taken_means_no_caching_not_an_exception(tmp_path: Path, monkeypatch) -> None:
+    """K7: a source missing an anneal path attribute builds normally every read."""
+    from types import SimpleNamespace
+    from levain.cockpit.engine import ReadContext
+    built: list[int] = []
+    anneal = SimpleNamespace(episodic_db=tmp_path / "m.db")            # no continuity_md, crystal_json, spores_json
+    fake = SimpleNamespace(anneal=anneal, build=lambda **kw: built.append(1) or SimpleNamespace(errors={}, health=None))
+    assert providers._store_signature(fake) is None
+    for _ in range(2):
+        providers._view(fake, ReadContext(datetime.now(timezone.utc)))
+    assert len(built) == 2
+
+
+def test_a_stat_that_raises_means_no_caching(counted, monkeypatch) -> None:
+    root, src, ck, _clock, calls = counted
+    monkeypatch.setattr(providers, "_stat_of", lambda p: (_ for _ in ()).throw(RuntimeError("stat blew up")))
+    ck.panel("health")
+    ck.panel("health")
+    assert len(calls) == 2
+
+
+def test_the_store_stamp_is_utc_whether_the_wrap_stamp_is_z_or_naive() -> None:
+    """K8: anneal's wraps.wrapped_at is written as ...Z (UTC); a naive value is read as UTC, the same as the age
+    oracle in dashboard.health_oracles, so the page and the oracle agree."""
+    from types import SimpleNamespace
+    h = SimpleNamespace(save_age_hours=1.0, last_wrap_at="2026-10-26T18:47:46Z")
+    assert providers._save_stamp(h) == "2026-10-26T18:47:46+00:00"
+    h = SimpleNamespace(save_age_hours=1.0, last_wrap_at="2026-10-26T18:47:46")
+    assert providers._save_stamp(h) == "2026-10-26T18:47:46+00:00"
+    h = SimpleNamespace(save_age_hours=None, last_wrap_at="2026-10-26T18:47:46Z")
+    assert providers._save_stamp(h) is None
+
+
+def test_a_hot_source_is_not_evicted_before_a_colder_one(tmp_path: Path) -> None:
+    """The eviction drops the entry stored longest ago; re-storing a source (its store changed) moves it to the tail."""
+    from types import SimpleNamespace
+    from levain.cockpit.engine import ReadContext
+
+    def fake(i: int):
+        d = tmp_path / str(i)
+        d.mkdir()
+        files = {n: d / n for n in ("m.db", "c.md", "c.json", "s.json")}
+        for f in files.values():
+            f.write_text("x")
+        built: list[int] = []
+        anneal = SimpleNamespace(episodic_db=files["m.db"], continuity_md=files["c.md"], crystal_json=files["c.json"],
+                                 spores_json=files["s.json"])
+        return SimpleNamespace(anneal=anneal, built=built,
+                               build=lambda **kw: built.append(1) or SimpleNamespace(errors={})), files["s.json"]
+
+    srcs = [fake(i) for i in range(providers.VIEW_CACHE_SOURCES)]
+    first = srcs[0][0]
+    for s, _ in srcs:
+        providers._view(s, ReadContext(datetime.now(timezone.utc)))
+    srcs[0][1].write_text("changed in size")                   # the first source's store moves: it is rebuilt and re-stored
+    providers._view(first, ReadContext(datetime.now(timezone.utc)))
+    extra, _ = fake(99)
+    providers._view(extra, ReadContext(datetime.now(timezone.utc)))      # one past the bound: the oldest-stored goes
+    providers._view(first, ReadContext(datetime.now(timezone.utc)))
+    assert len(first.built) == 2, "the just-rebuilt source was evicted by the store that rebuilt it"
