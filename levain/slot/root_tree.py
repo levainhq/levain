@@ -1483,11 +1483,13 @@ def vendor_steps(host: HostOS, operator: str, *, lookup: Optional[Callable[[str]
     return steps
 
 
-def vendor_report_step(failed: list) -> Step:
+def vendor_report_step(failed: list, *, allow_fail: bool = False) -> Step:
     """The step that fails the run when a :func:`vendor_steps` copy failed earlier in it, planned after the steps a
-    vendor copy must not block: repair plans it after R11's sudoers rules and R12's units, setup after its units."""
+    vendor copy must not block: repair plans it after R11's sudoers rules and R12's units, setup after its units.
+    ``allow_fail``: setup's form (ruling V23), so a copy that fails on every run is printed as skipped and never keeps
+    the operator record from being written; repair keeps the failing form."""
     return Step("report the vendor CLI copies that failed earlier in this run (none: nothing to report)",
-                call=lambda: (not failed, "; ".join(failed)))
+                call=lambda: (not failed, "; ".join(failed)), allow_fail=allow_fail)
 
 
 def check_sources(source: Path, h11_dir: Path) -> None:

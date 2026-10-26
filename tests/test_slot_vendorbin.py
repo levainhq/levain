@@ -998,3 +998,53 @@ def test_v21_a_structural_problem_in_a_matching_active_version_is_rebuilt(env):
     assert RT.unit_problem("darwin", "codex", prefix=env.prefix, root_uid=os.getuid()) == ""
     ok, why = _codex_copy(env)
     assert ok and "already" in why, why
+
+
+def _failing_vendor_steps(failed):
+    def fake(host, operator, *, failed, **kw):
+        def call():
+            failed.append("codex: copying failed (EIO)")
+            return False, "codex: copying failed (EIO)"
+        return [RT.Step("place root's copy of codex", call=call, allow_fail=True)]
+    return fake
+
+
+def test_v23_a_vendor_copy_failing_on_every_run_does_not_stop_setup_before_the_operator_record(monkeypatch):
+    from levain.firing.hands import Plan, run_plan
+    from levain.slot import install_helper as IH
+    from levain.firing import hands
+    from tests.test_slot_install_plan import _facts, _setup
+
+    real = hands.shutil.which
+    monkeypatch.setattr(hands.shutil, "which", lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}")
+    monkeypatch.setattr(RT, "vendor_steps", _failing_vendor_steps(None))
+    steps = list(IH.plan_setup(_setup(), _facts("linux")).steps)
+    whys = [s.why for s in steps]
+    copy = next(i for i, w in enumerate(whys) if w.startswith("place root's copy"))
+    report = next(i for i, w in enumerate(whys) if w.startswith("report the vendor CLI copies"))
+    record = next(i for i, w in enumerate(whys) if w.startswith("record ") and "one operator" in w)
+    assert copy < report < record and steps[report].allow_fail
+    ran = []
+    tail = RT.Step("the operator record", call=lambda: (ran.append(1), (True, ""))[1])
+    plan = Plan("linux", "op", "h", 1, Path("/x"), Path("/y"), steps=(steps[copy], steps[report], tail))
+    out: list = []
+    assert run_plan(plan, dry_run=False, emit=out.append) == 0
+    assert ran == [1]
+    assert any(o.strip().startswith("skipped (") and "codex" in o and "EIO" in o for o in out), out
+
+
+def test_v23_repair_with_the_same_failure_still_fails_the_run(monkeypatch, tmp_path):
+    from levain.firing.hands import Plan, run_plan
+    from tests.test_repair_plan import _pre_change, _plan
+
+    monkeypatch.setattr(RT, "vendor_steps", _failing_vendor_steps(None))
+    facts, rf = _pre_change(tmp_path)
+    steps = list(_plan(facts, rf).steps)
+    whys = [s.why for s in steps]
+    copy = next(i for i, w in enumerate(whys) if w.startswith("place root's copy"))
+    report = next(i for i, w in enumerate(whys) if w.startswith("report the vendor CLI copies"))
+    assert not steps[report].allow_fail
+    plan = Plan("linux", "op", "h", 1, Path("/x"), Path("/y"), steps=(steps[copy], steps[report]))
+    out: list = []
+    assert run_plan(plan, dry_run=False, emit=out.append) == 1
+    assert any("FAILED" in o and "codex" in o for o in out), out

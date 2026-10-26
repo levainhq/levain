@@ -694,7 +694,7 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         *restart,
         *root_tree.tree_steps(host, package, h11_dir=h11_dir, generation=target, current=current),
         # The vendor CLIs a session execs, COPIED into the prefix tree_steps made (head ruling 1026+8). A failed copy
-        # does not stop setup here: the report step after the units fails the run with it (ruling V6).
+        # does not stop setup here: the report step after the units prints it as skipped (ruling V23).
         *root_tree.vendor_steps(host, cmd.operator, failed=vendor_failed),
         *confinement,
         # Before the first start: each service's started_after threshold (row 33 §2.5).
@@ -705,7 +705,9 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         # Each slot's §3.5 Pool state once everything the slot needs is in place, before the rule that lets
         # prepare run (prepare picks only from these).
         *slot_state_steps(host, alloc.slots),
-        root_tree.vendor_report_step(vendor_failed),
+        # Setup's report is allow_fail (ruling V23): a copy that fails on every run is printed as skipped and never
+        # keeps the sudoers rules, the install record or the operator record from being written.
+        root_tree.vendor_report_step(vendor_failed, allow_fail=True),
         *sudoers_steps(host, cmd.operator),
         # Row 33 §2.5: the install record before the operator record; setup's completion is still the latter.
         Step(f"write the install record {shape_path} (completed_txn {txn})", call=record),
