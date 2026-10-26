@@ -7,14 +7,17 @@ first drawn, each now run on the real glue and decider:
   R15-12-B3): a forwarded read carries none of the three to the origin.
 - *"A decider crash fails closed with a visible state."*: the decider's link cut under a running glue: the glue exits
   non-zero with no final flush, nothing after it reaches the origin, and K1's report says crashed.
+- *"Open network + keyed write (finding 4)."*: composed over TLS with a held key, as R15-10-A11 rules it (a card).
 
-Each has its negative control: the same bytes through an open relay (`LeakyPlain`) reach the origin.
+The first three have a negative control (the same bytes through an open relay, `LeakyPlain`, reach the origin, or a
+clean stop reads exact); the last its control (an anonymous POST under open network is forwarded).
 """
 
 from __future__ import annotations
 
 import json
 import socket
+import threading
 import time
 
 import pytest
@@ -135,3 +138,38 @@ def test_control_a_clean_stop_writes_the_final_flush_and_reads_exact(make_origin
     assert L.stop() == 0
     rep = report.build(L.records.rows(L.launch_id), L.events.read_bytes().splitlines(keepends=True))
     assert rep.walls.exact and not rep.walls.crashed, rep.walls
+
+
+def test_open_network_a_keyed_write_is_a_card_and_an_anonymous_one_is_silent(make_tls_launch) -> None:
+    """*"Open network + keyed write (finding 4)."* as R15-10-A11 rules it (*"`open network` + POST to a setup host = a
+    card."*; an anonymous POST under `open network` stays silent, K4): the keyed POST files a card, nothing reaches the
+    origin and the held key is not read before his answer, and his deny is a 403; the anonymous POST is forwarded."""
+    from levain.chat_egress import classify
+
+    from .tls_rig import KEYED
+    L = make_tls_launch(secret="HELDKEYOPEN9", mode=classify.OPEN_NETWORK)
+    body = b"x=1"
+
+    def post(host: str) -> bytes:
+        return L.raw(f"POST /w HTTP/1.1\r\nHost: {host}:{L.origin_port}\r\nContent-Type: text/plain\r\nContent-Length: "
+                     f"{len(body)}\r\nConnection: close\r\n\r\n".encode() + body, connect_host=host, sni=host)
+    seen: dict = {}
+
+    def answer() -> None:
+        end = time.monotonic() + 10
+        while not L.desk.filed and time.monotonic() < end:
+            time.sleep(0.05)
+        seen["before"] = (L.origin.touched(), L.store.reads)
+        L.desk.answer["card-1"] = "denied"
+    t = threading.Thread(target=answer, daemon=True)
+    t.start()
+    resp = post(KEYED)
+    t.join(10)
+    print("RUN R15-10-A11 open network keyed write:", resp[:40], "cards", len(L.desk.filed), "before answer", seen)
+    assert len(L.desk.filed) == 1 and resp.startswith(b"HTTP/1.1 403"), resp[:200]
+    before, reads = seen["before"]
+    assert before["conns"] == 0 and before["bytes"] == 0 and reads == 0, seen
+    L.origin.assert_untouched()
+    anon = post(UNKEYED)                                 # the control: K4, silent under open network
+    assert anon.startswith(b"HTTP/1.1 200") and len(L.desk.filed) == 1, anon[:200]
+    assert [(r.method, r.target, r.body) for r in L.origin.reqs] == [("POST", "/w", body)]
