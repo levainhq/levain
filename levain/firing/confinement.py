@@ -606,36 +606,41 @@ def _git_config_overrides(environ=None) -> tuple[list[Path], list[Path]]:
     return list(_dedup_paths(subtrees)), list(_dedup_paths(files))
 
 
-def _python_userbase_override(home: Path, workspace: Path, environ=None) -> tuple[list[Path], str | None]:
-    """``(subtrees, note)`` for the Python user site ``$PYTHONUSERBASE`` moves, read from ``environ``
-    (default ``os.environ``: the operator's, at policy build). CPython takes the value as written: unset or
-    empty means the default layout, which the floor already holds. An ABSOLUTE value that is neither the home
-    itself nor an ancestor of the home or of the workspace is one more persistence subtree. Otherwise (a relative
-    value, the home, or such an ancestor) it is NOT added, since a write deny there would take the home or the
-    workspace with it, and ``note`` is the one line the run banner and doctor print saying the user site is
-    outside the floor."""
+def python_user_site_roots(home: Path, environ=None) -> tuple[list[tuple[Path, str]], str | None]:
+    """``(roots, note)``: the operator's Python user-site trees for ``home`` as ``(path, label)``, and the line the
+    run banner and doctor print when ``$PYTHONUSERBASE`` puts the user site where no tree can hold it. The ONE
+    derivation of those trees: :func:`build_policy`'s persistence floor and the consent adapters' file-tool check
+    both read it. A ``.pth``, ``usercustomize.py`` or package there runs in every later Python of the operator's
+    that does not disable the user site (-I, -s, a venv; -EP does not). site.py puts the site below
+    ``<base>/lib`` (``lib/pythonX.Y/site-packages``; a macOS framework build's ``lib/python/site-packages``), the
+    base being ``~/.local``, a framework build's ``~/Library/Python/X.Y``, or ``$PYTHONUSERBASE`` as written. So:
+    ``~/.local/lib``; on macOS ``~/Library/Python`` whole, so a Python version installed later is covered too;
+    and for an ABSOLUTE ``$PYTHONUSERBASE`` its ``lib`` only (:func:`build_policy` refuses one
+    :func:`too_wide_to_deny` names). Read from ``environ`` (default ``os.environ``: the operator's, at policy
+    build); an empty value means the default layout. A RELATIVE value, ``~/...`` included (site.py does not
+    expand ``~``), resolves against whatever directory each Python starts in, so no tree holds it: the note."""
     env = os.environ if environ is None else environ
+    roots = [(home / ".local" / "lib", "operator Python user site"),
+             *(((home / "Library" / "Python", "operator Python user site (macOS framework)"),)
+               if platform.system() == "Darwin" else ())]
     value = env.get("PYTHONUSERBASE", "")
     if not value:
-        return [], None
-    if not os.path.isabs(value):
-        why = "a relative path, which Python resolves against whatever directory it starts in"
-    else:
-        base = Path(os.path.normpath(value))
-        spellings = {base, Path(os.path.realpath(base))}
-        anchors = {h for a in (home, workspace) for h in (Path(os.path.normpath(a)), Path(os.path.realpath(a)))}
-        if not any(a == b or a.is_relative_to(b) for a in anchors for b in spellings):
-            return [base], None
-        why = "your home or a directory holding your home or the workspace"
-    return [], (f"\u26a0 Python user site NOT in the floor: $PYTHONUSERBASE is {value!r} ({why}), so the "
-                "entity may plant a .pth there that your later Python runs; point it at a dedicated absolute "
-                "directory, or unset it")
+        return roots, None
+    if os.path.isabs(value):
+        return [*roots, (Path(os.path.normpath(value)) / "lib", _USERBASE_LABEL)], None
+    return roots, (f"\u26a0 Python user site NOT in the floor: $PYTHONUSERBASE is the relative path {value!r}, "
+                   "which Python resolves against whatever directory it starts in (it does not expand ~), so the "
+                   "entity may plant a .pth there that your later Python runs; point it at a dedicated absolute "
+                   "directory, or unset it")
 
 
-def python_userbase_note(workspace: Path | str, environ=None) -> str | None:
+_USERBASE_LABEL = "operator Python user site ($PYTHONUSERBASE)"
+
+
+def python_userbase_note(home: Path | str, environ=None) -> str | None:
     """The run banner's and doctor's line when ``$PYTHONUSERBASE`` puts the user site outside the floor
-    (:func:`_python_userbase_override`), else None."""
-    return _python_userbase_override(Path.home(), Path(workspace).expanduser(), environ)[1]
+    (:func:`python_user_site_roots`), else None."""
+    return python_user_site_roots(Path(home), environ)[1]
 
 
 def _cred_dir_sources() -> list[Path]:
@@ -2779,23 +2784,24 @@ def build_policy(
     # On Linux an absent derived file under a directory nobody here can create makes bwrap refuse to
     # start (its mountpoint cannot be made): fail-closed, and accepted as a known edge (L3 r4).
     git_env_subtrees, git_env_files = _git_config_overrides()
-    userbase_subtrees, _ = _python_userbase_override(home, ws)
+    user_site_roots, _ = python_user_site_roots(home)
+    for root, label in user_site_roots:
+        if label == _USERBASE_LABEL and too_wide_to_deny(root, home, ws, ed, *tool_dirs, *gnupg_homes,
+                                                          *_runtime_roots()):
+            raise ConfinementError(
+                f"$PYTHONUSERBASE puts your Python user site below {root}, and denying writes there would take "
+                "a filesystem root, a shared temp directory, your home, the workspace, the entity or a tool's "
+                "directory with it — refusing to build the floor (fail-closed). Point PYTHONUSERBASE at a "
+                "dedicated absolute directory, or unset it."
+            )
     persistence_write_subtrees = _dedup([
         p
         for root, label in (
             (home / "bin", "operator bin"),
             (home / ".local" / "bin", "operator local bin"),
-            # The Python user site: a .pth, usercustomize.py or package there runs in every later
-            # Python of the operator's that does not disable it (-I, -s, a venv; -EP does not).
-            # CPython puts it, with PYTHONUSERBASE unset, under ~/.local/lib, or for a macOS
-            # framework build under ~/Library/Python (tests/test_user_site_floor.py asks each
-            # interpreter on the machine). The whole tree, so a Python version installed after this
-            # build is covered too; it costs the entity `pip install --user`.
-            (home / ".local" / "lib", "operator Python user site"),
-            *(((home / "Library" / "Python", "operator Python user site (macOS framework)"),)
-              if platform.system() == "Darwin" else ()),
-            # Where the operator's $PYTHONUSERBASE moves it; one the floor cannot hold is a banner line.
-            *((t, "operator Python user site ($PYTHONUSERBASE)") for t in userbase_subtrees),
+            # The Python user site (python_user_site_roots; tests/test_user_site_floor.py asks each
+            # interpreter on the machine where it puts it). It costs the entity `pip install --user`.
+            *user_site_roots,
             (home / "Library" / "LaunchAgents", "operator LaunchAgents"),
             (home / ".config" / "git", "operator git config"),
             *((t, "operator git config ($XDG_CONFIG_HOME)") for t in git_env_subtrees),
@@ -7224,7 +7230,17 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             if real.is_dir() and not real.is_symlink():
                 argv += ["--ro-bind", str(real), str(real)]
                 persist_ro.append(real)
-            continue   # a file where a tree would be holds nothing below it
+                continue
+            anc = real.parent
+            if anc in ro_store_dirs or _in_tool_view(anc) or _in_persist_ro(anc) or not _bash_may_write(anc):
+                continue   # bash cannot replace it either: nothing can come to live below it
+            # bash could unlink it, make the directory and plant below it (verify r2, codex HIGH)
+            raise ConfinementError(
+                f"{real} is not a directory, and the Linux floor protects it as one (it is where your "
+                "Python user site, the agents' configuration or a shell's startup files live): bash could "
+                "replace it with a directory and plant files your later sessions run. Refusing to grant "
+                "bash hands (fail-closed). To use bash, remove it or move it out of the way."
+            )
         anc = _nearest_existing(real)
         if (anc == ws_real or anc.is_relative_to(ws_real)) and not os.access(anc, os.W_OK):
             # A hands workspace (owned by the hands user; this process has read access only): bash

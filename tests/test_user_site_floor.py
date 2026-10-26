@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -115,21 +116,23 @@ def test_the_linux_plan_binds_the_local_lib_tree_read_only(home: Path, tmp_path:
     ws = home / "proj" / "ws"
     ws.mkdir()
     argv, _ = C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
-    ro = [argv[i + 2] for i, a in enumerate(argv) if a == "--ro-bind" and argv[i + 1] == argv[i + 2]]
-    assert str(home / ".local" / "lib") in ro
+    real = os.path.realpath(home / ".local" / "lib")
+    assert (real, real) in _ro_binds(argv)
 
 
 @live
 def test_live_confined_bash_cannot_plant_in_the_user_site(home: Path, tmp_path: Path) -> None:
     policy = _policy(tmp_path)
+    q = shlex.quote
     with C.select_provider().spawn_shell(policy) as sh:
-        assert sh.run(f"echo x > {home}/.zshenv 2>&1", timeout=20).exit_code != 0  # the control
+        assert sh.run(f"echo x > {q(str(home / '.zshenv'))} 2>&1", timeout=20).exit_code != 0  # the control
         for d in _site_dirs(home):
-            r = sh.run(f"mkdir -p {d} 2>&1; echo 'import os' > {d}/x.pth 2>&1", timeout=20)
+            r = sh.run(f"mkdir -p {q(str(d))} 2>&1; echo 'import os' > {q(str(d / 'x.pth'))} 2>&1", timeout=20)
             assert r.exit_code != 0, (d, r.output)
             assert not (d / "x.pth").exists()
         # Elsewhere under ~/.local stays writable: the deny is the lib tree, not the whole folder.
-        ok = sh.run(f"mkdir -p {home}/.local/state/tool && echo x > {home}/.local/state/tool/f", timeout=20)
+        tool = home / ".local" / "state" / "tool"
+        ok = sh.run(f"mkdir -p {q(str(tool))} && echo x > {q(str(tool / 'f'))}", timeout=20)
         assert ok.exit_code == 0, ok.output
 
 
@@ -140,12 +143,13 @@ def test_live_an_existing_user_site_cannot_be_planted_or_renamed_into(home: Path
     staged = tmp_path / "ws"
     policy = _policy(tmp_path)
     staged.mkdir(exist_ok=True)
+    q = shlex.quote
     with C.select_provider().spawn_shell(policy) as sh:
-        assert sh.run(f"echo 'import os' > {staged}/x.pth", timeout=20).exit_code == 0
+        assert sh.run(f"echo 'import os' > {q(str(staged / 'x.pth'))}", timeout=20).exit_code == 0
         for d in _site_dirs(home):
-            r = sh.run(f"mv {staged}/x.pth {d}/x.pth 2>&1", timeout=20)
+            r = sh.run(f"mv {q(str(staged / 'x.pth'))} {q(str(d / 'x.pth'))} 2>&1", timeout=20)
             assert r.exit_code != 0 and not (d / "x.pth").exists(), (d, r.output)
-            r = sh.run(f"mv {d} {d}.old 2>&1", timeout=20)
+            r = sh.run(f"mv {q(str(d))} {q(str(d) + '.old')} 2>&1", timeout=20)
             assert r.exit_code != 0 and d.is_dir(), (d, r.output)
 
 
@@ -160,8 +164,9 @@ def _linux_plan(home: Path, monkeypatch) -> tuple[list[str], list[str]]:
     return C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
 
 
-def _ro_binds(argv: list[str]) -> list[str]:
-    return [argv[i + 2] for i, a in enumerate(argv) if a == "--ro-bind" and argv[i + 1] == argv[i + 2]]
+def _ro_binds(argv: list[str]) -> list[tuple[str, str]]:
+    """Every ``--ro-bind SRC DST`` as ``(SRC, DST)``, so a caller compares the two separately."""
+    return [(argv[i + 1], argv[i + 2]) for i, a in enumerate(argv) if a == "--ro-bind"]
 
 
 def test_the_linux_plan_protects_an_absent_local_lib(home: Path, tmp_path: Path, monkeypatch) -> None:
@@ -172,7 +177,7 @@ def test_the_linux_plan_protects_an_absent_local_lib(home: Path, tmp_path: Path,
     assert not os.path.lexists(lib) and (home / ".local").is_dir()
     argv, create_first = _linux_plan(home, monkeypatch)
     real = os.path.realpath(lib)
-    assert real in _ro_binds(argv)
+    assert (real, real) in _ro_binds(argv)
     assert real in create_first
     assert os.path.realpath(home / ".local" / "bin") in create_first   # the sibling it is handled like
 
@@ -202,7 +207,9 @@ def test_an_absolute_dedicated_userbase_joins_the_floor(home: Path, tmp_path: Pa
     assert _covered(policy, base / "lib" / f"python{_XY}" / "site-packages" / "x.pth")
     assert crown_jewel_reason(policy, base / "lib" / f"python{_XY}" / "site-packages" / "x.pth")
     assert crown_jewel_reason(policy, base / "lib" / f"python{_XY}" / "site-packages" / "x.pth", write=False) is None
-    assert C.python_userbase_note(tmp_path / "ws") is None
+    # U3 (verify r2, codex MED): only the user-site subtree below the base, not the base whole
+    assert not _covered(policy, base / "notes" / "f") and crown_jewel_reason(policy, base / "notes" / "f") is None
+    assert C.python_userbase_note(home) is None
     # Asked of the interpreter itself: the site it uses under this variable is inside the floor.
     out = subprocess.run([sys.executable, "-c", "import site; print(site.getusersitepackages())"],
                          capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
@@ -214,26 +221,57 @@ def test_an_unset_or_empty_userbase_adds_nothing_and_says_nothing(home: Path, tm
     baseline = set(_policy(tmp_path).persistence_write_subtrees)
     monkeypatch.setenv("PYTHONUSERBASE", "")
     assert set(_policy(tmp_path).persistence_write_subtrees) == baseline
-    assert C.python_userbase_note(tmp_path / "ws") is None
+    assert C.python_userbase_note(home) is None
 
 
-@pytest.mark.parametrize("which", ["relative", "home", "ancestor of home", "ancestor of the workspace"])
-def test_a_userbase_the_floor_cannot_hold_is_named_not_added(home: Path, tmp_path: Path, monkeypatch,
-                                                            which: str) -> None:
-    ws = tmp_path / "ws"
-    entity = tmp_path / "entity"
-    if which == "ancestor of the workspace":
-        ws = tmp_path / "outside" / "ws"
-    value = {"relative": "pyuser", "home": str(home), "ancestor of home": str(tmp_path),
-             "ancestor of the workspace": str(tmp_path / "outside")}[which]
-    (entity / ".levain").mkdir(parents=True)
-    monkeypatch.delenv("PYTHONUSERBASE", raising=False)
-    baseline = set(build_policy(entity, workspace=ws, deny_standard_creds=False).persistence_write_subtrees)
+@pytest.mark.parametrize("value", ["pyuser", "~/pyuser"])
+def test_a_relative_userbase_is_named_not_added(home: Path, tmp_path: Path, monkeypatch, value: str) -> None:
+    """A relative value, ``~/...`` included, is resolved against whatever directory each Python starts in: no tree
+    holds it, so it is the banner's line. Asked of the interpreter, not reasoned: site.py leaves ``~`` as written."""
+    baseline = set(_policy(tmp_path).persistence_write_subtrees)
     monkeypatch.setenv("PYTHONUSERBASE", value)
-    policy = build_policy(entity, workspace=ws, deny_standard_creds=False)
-    assert set(policy.persistence_write_subtrees) == baseline
-    note = C.python_userbase_note(ws)
-    assert note is not None and "PYTHONUSERBASE" in note and repr(value) in note and "NOT in the floor" in note
+    assert set(_policy(tmp_path).persistence_write_subtrees) == baseline
+    note = C.python_userbase_note(home)
+    assert note is not None and repr(value) in note and "NOT in the floor" in note
+    out = subprocess.run([sys.executable, "-c", "import site; print(site.getusersitepackages())"],
+                         capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+                         env={"HOME": str(home), "PYTHONUSERBASE": value, "PATH": "/usr/bin:/bin"})
+    assert out.returncode == 0 and out.stdout.startswith(value + "/lib/"), out
+
+
+@pytest.mark.parametrize("which", ["home", "ancestor of home", "shared temp"])
+def test_a_wide_absolute_userbase_protects_its_lib_only(home: Path, tmp_path: Path, monkeypatch, which: str) -> None:
+    """U3: a base that is the home, holds it, or is /tmp gets its ``lib`` protected (where site.py puts the site in
+    both layouts) and nothing else, so the home, the workspace and /tmp stay as they were."""
+    base = {"home": home, "ancestor of home": tmp_path, "shared temp": Path("/tmp")}[which]
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    policy = _policy(tmp_path)
+    assert _covered(policy, base / "lib" / f"python{_XY}" / "site-packages" / "x.pth")
+    assert crown_jewel_reason(policy, base / "lib" / "python" / "site-packages" / "usercustomize.py")
+    assert crown_jewel_reason(policy, base / "scratch" / "f") is None   # beside lib (home entries are floor anyway)
+    assert C.python_userbase_note(home) is None
+
+
+@pytest.mark.parametrize("which", ["filesystem root", "holds the workspace", "holds the entity"])
+def test_a_userbase_whose_site_is_too_wide_refuses_the_floor(home: Path, tmp_path: Path, monkeypatch,
+                                                            which: str) -> None:
+    """U3 + U4: a ``<base>/lib`` that :func:`too_wide_to_deny` names (a filesystem root's, or one holding the
+    workspace or the entity's store) refuses the floor by name, with the remedy."""
+    entity, ws = tmp_path / "entity", tmp_path / "ws"
+    base = {"filesystem root": Path("/"), "holds the workspace": tmp_path / "b1",
+            "holds the entity": tmp_path / "b2"}[which]
+    if which == "holds the workspace":
+        ws = base / "lib" / "ws"
+    if which == "holds the entity":
+        entity = base / "lib" / "entity"
+    (entity / ".levain").mkdir(parents=True)
+    ws.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    with pytest.raises(C.ConfinementError) as err:
+        build_policy(entity, workspace=ws, deny_standard_creds=False)
+    msg = " ".join(str(err.value).split())
+    assert "$PYTHONUSERBASE" in msg and str(Path(os.path.normpath(base)) / "lib") in msg
+    assert "dedicated absolute directory" in msg and "fail-closed" in msg
 
 
 def test_the_run_banner_and_doctor_print_the_userbase_line(home: Path, tmp_path: Path, monkeypatch, capsys) -> None:
@@ -244,8 +282,8 @@ def test_the_run_banner_and_doctor_print_the_userbase_line(home: Path, tmp_path:
         episodic_path = tmp_path / "e.db"
         crystal_path = tmp_path / "c.json"
 
-    monkeypatch.setenv("PYTHONUSERBASE", str(home))
-    note = C.python_userbase_note(tmp_path / "ws")
+    monkeypatch.setenv("PYTHONUSERBASE", "pyuser")
+    note = C.python_userbase_note(home)
     _print_banner(tmp_path, _Binding(), model="m", with_tools=True, bash_ok=True, user_site_note=note)
     out = " ".join(capsys.readouterr().out.split())
     assert "Python user site NOT in the floor: $PYTHONUSERBASE is" in out
@@ -278,11 +316,30 @@ def test_a_workspace_inside_the_local_lib_tree_is_refused_by_what_it_is(home: Pa
 @live
 def test_live_a_dedicated_userbase_cannot_be_planted(home: Path, tmp_path: Path, monkeypatch) -> None:
     base = tmp_path / "pyuser"
+    base.mkdir()   # the operator's base exists; an absent one is an ancestor of the tree, which bash cannot create
     monkeypatch.setenv("PYTHONUSERBASE", str(base))
     policy = _policy(tmp_path)
     site_dir = base / "lib" / f"python{_XY}" / "site-packages"
+    q = shlex.quote
     with C.select_provider().spawn_shell(policy) as sh:
-        r = sh.run(f"mkdir -p {site_dir} 2>&1; echo 'import os' > {site_dir}/x.pth 2>&1", timeout=20)
+        r = sh.run(f"mkdir -p {q(str(site_dir))} 2>&1; echo 'import os' > {q(str(site_dir / 'x.pth'))} 2>&1",
+                   timeout=20)
         assert r.exit_code != 0 and not (site_dir / "x.pth").exists(), r.output
-        ok = sh.run(f"mkdir -p {tmp_path}/beside && echo x > {tmp_path}/beside/f", timeout=20)   # the control
+        # the controls: beside the base, and inside the base beside its lib (U3: the base is not denied whole)
+        ok = sh.run(f"mkdir -p {q(str(tmp_path / 'beside'))} && echo x > {q(str(tmp_path / 'beside' / 'f'))} && "
+                    f"mkdir -p {q(str(base / 'share'))} && echo x > {q(str(base / 'share' / 'f'))}", timeout=20)
         assert ok.exit_code == 0, ok.output
+
+
+# --- U2: a non-directory where the Linux plan's ~/.local/lib tree would be -------------------------------------------
+
+def test_the_linux_plan_refuses_a_file_where_the_local_lib_tree_would_be(home: Path, tmp_path: Path,
+                                                                        monkeypatch) -> None:
+    """U2 (verify r2, codex HIGH): with ~/.local/lib a regular file, bash could unlink it, make the directory and
+    plant below it. The plan refuses by name with the remedy rather than skip the bind."""
+    lib = home / ".local" / "lib"
+    lib.write_text("not a directory\n")
+    with pytest.raises(C.ConfinementError) as err:
+        _linux_plan(home, monkeypatch)
+    msg = " ".join(str(err.value).split())
+    assert os.path.realpath(lib) in msg and "not a directory" in msg and "remove it or move it" in msg

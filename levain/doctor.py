@@ -2337,13 +2337,11 @@ def _check_confinement(install: Path) -> list[CheckResult]:
         # The host can sandbox bash, but the entity's localhost deny can still drop it or take its
         # network. `levain run` asks the SAME resolver with the same config, so the two agree.
         bash_ok, refusal, offline = resolve_localhost_deny(cfg.allow_localhost_outbound)
-        # The line `levain run` prints when $PYTHONUSERBASE puts the user site outside the floor, judged
-        # against the entity's default (or hands) workspace: a `--workspace` elsewhere is run's to judge.
+        # The line `levain run` prints when $PYTHONUSERBASE puts the user site outside the floor.
         try:
             from levain.firing.confinement import python_userbase_note
-            from levain.session import WORKSPACE_SUBDIR
 
-            note = python_userbase_note(getattr(cfg, "hands_workspace", None) or install / WORKSPACE_SUBDIR)
+            note = python_userbase_note(Path.home())   # build_policy's home
         except Exception:  # noqa: BLE001 — never let a diagnosis break the whole doctor run
             note = None
         tail = f"\n      {note}" if note else ""

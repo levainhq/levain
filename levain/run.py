@@ -958,8 +958,7 @@ def _banner_for(
         try:
             from levain.firing.confinement import python_userbase_note
 
-            user_site_note = python_userbase_note(getattr(session, "workspace", None)
-                                                  or session.entity_dir / WORKSPACE_SUBDIR)
+            user_site_note = python_userbase_note(Path.home())   # build_policy's home
         except Exception:  # noqa: BLE001 — a note that cannot be computed must never break the banner
             user_site_note = None
     _print_banner(
