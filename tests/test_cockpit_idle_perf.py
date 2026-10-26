@@ -272,47 +272,57 @@ def test_a_waiter_on_a_hung_build_raises_the_timeout_at_the_deadline_and_does_no
 
 
 # ---- C12: a hung build's flight is replaced once it is older than the panel read budget (one rescue per budget window) ----
+# ---- C16-C19: at most two outstanding builds per source; a superseded flight's result is never consumed by its waiters ----
 
-def _hung_builds(monkeypatch, src, deadline: float = 0.4):
-    """Build call 1 hangs on ``hangs[0]``, call 2 on ``hangs[1]``; later calls build at once. ``entered[i]`` is set as call i+1 starts."""
+def _hung_builds(monkeypatch, src, deadline: float = 3.0, raise_on: tuple = ()):
+    """Build call i (1-based, up to 6) hangs on ``hangs[i-1]``, then raises if i is in ``raise_on`` or builds; later calls build
+    at once. ``entered[i-1]`` is set as call i starts. The deadline only bounds the waits: a flight goes stale by ``_age``."""
     import threading
     monkeypatch.setattr(providers, "VIEW_FLIGHT_WAIT_S", 0.1, raising=False)
     monkeypatch.setattr(providers, "PANEL_READ_DEADLINE_S", deadline, raising=False)
     real = type(src).build
-    entered, hangs, calls = [threading.Event(), threading.Event()], [threading.Event(), threading.Event()], []
+    entered, hangs, calls = [threading.Event() for _ in range(6)], [threading.Event() for _ in range(6)], []
 
     def build(self, **kw):
         calls.append(1)
         n = len(calls)
-        if n <= 2:
+        if n <= len(hangs):
             entered[n - 1].set()
             hangs[n - 1].wait(20)
+            if n in raise_on:
+                raise RuntimeError(f"build {n} fails")
         return real(self, **kw)
 
     monkeypatch.setattr(type(src), "build", build)
     return entered, hangs, calls
 
 
+def _age(src) -> None:
+    """C19: the registered flight of ``src`` is made older than any panel budget, under the lock (never by sleeping)."""
+    with providers._view_cache_lock:
+        providers._view_flights[id(src)].started -= 3600.0
+
+
 def test_a_read_after_a_hung_build_outlives_the_deadline_builds_and_the_late_build_does_not_overwrite_its_view(tmp_path: Path, monkeypatch) -> None:
     """C12: a builder that hangs past the panel budget no longer blocks the source: the next read replaces its flight and builds.
     When the hung build returns at last, its caller gets its own view, but the cache keeps the replacement's."""
-    import time
     _root, src = _install(tmp_path)
     _wrap(src)
     entered, hangs, calls = _hung_builds(monkeypatch, src)
     hangs[1].set()                                  # only the first build hangs
+    key = id(src)
     ts, out = _readers(src, 1)
     try:
         assert entered[0].wait(5)
-        time.sleep(0.5)                             # the hung flight is now older than the budget
+        _age(src)                                   # the hung flight is now older than the budget
         ts2, out2 = _readers(src, 1)
         ts2[0].join(5)
         assert len(out2) == 1 and not isinstance(out2[0], Exception), out2
         assert len(calls) == 2, len(calls)
-        key = id(src)
         assert providers._view_cache[key][3] is out2[0]
     finally:
-        hangs[0].set()
+        for h in hangs:
+            h.set()
         ts[0].join(10)
     assert len(out) == 1 and not isinstance(out[0], Exception) and out[0] is not out2[0], out
     assert providers._view_cache[key][3] is out2[0], "the abandoned build overwrote the newer view"
@@ -326,14 +336,14 @@ def test_an_abandoned_build_returning_late_leaves_the_replacement_flight_and_pub
     import time
     _root, src = _install(tmp_path)
     _wrap(src)
-    entered, hangs, calls = _hung_builds(monkeypatch, src, deadline=0.6)
+    entered, hangs, calls = _hung_builds(monkeypatch, src)
     key = id(src)
     ts, out = _readers(src, 1)
     ts2: list = []
     ts3: list = []
     try:
         assert entered[0].wait(5)
-        time.sleep(0.7)
+        _age(src)
         ts2, out2 = _readers(src, 1)
         assert entered[1].wait(2), "no reader replaced the hung flight"
         replacement = providers._view_flights.get(key)
@@ -345,7 +355,7 @@ def test_an_abandoned_build_returning_late_leaves_the_replacement_flight_and_pub
         hit = providers._view_cache.get(key)
         assert hit is None or hit[3] is not out[0], "the abandoned build published its view"
         ts3, out3 = _readers(src, 1)                # arrives while the replacement builds: it joins
-        time.sleep(0.2)
+        time.sleep(0.2)                             # time for it to build if it were going to (the deadline is 3 s)
         assert len(calls) == 2, len(calls)
         hangs[1].set()
         for t in ts2 + ts3:
@@ -366,15 +376,15 @@ def test_several_readers_arriving_after_a_hung_build_outlived_the_deadline_start
     import time
     _root, src = _install(tmp_path)
     _wrap(src)
-    entered, hangs, calls = _hung_builds(monkeypatch, src, deadline=0.6)
+    entered, hangs, calls = _hung_builds(monkeypatch, src)
     ts, out = _readers(src, 1)
     ts2: list = []
     try:
         assert entered[0].wait(5)
-        time.sleep(0.7)
+        _age(src)
         ts2, out2 = _readers(src, 5)
         assert entered[1].wait(2), "no reader replaced the hung flight"
-        time.sleep(0.2)                             # the other four are at the replacement now
+        time.sleep(0.2)                             # the other four are at the replacement now (the deadline is 3 s)
         hangs[1].set()
         for t in ts2:
             t.join(5)
@@ -385,6 +395,131 @@ def test_several_readers_arriving_after_a_hung_build_outlived_the_deadline_start
             t.join(10)
     assert len(calls) == 2, len(calls)
     assert len(out2) == 5 and not isinstance(out2[0], Exception) and all(v is out2[0] for v in out2), out2
+
+
+def test_with_every_build_hanging_reads_across_many_budget_windows_start_at_most_two_builds(tmp_path: Path, monkeypatch) -> None:
+    """C16 bound: a source holds at most two outstanding builds, the abandoned one and one rescue. While both hang, a reader that
+    finds the rescue stale too raises TimeoutError at once and starts nothing; a new rescue starts only after one of them returns."""
+    import time
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    entered, hangs, calls = _hung_builds(monkeypatch, src)
+    key = id(src)
+    ts, out = _readers(src, 1)
+    later: list = []
+    out2: list = []
+    out4: list = []
+    try:
+        assert entered[0].wait(5)
+        _age(src)
+        ts2, out2 = _readers(src, 1)                # the rescue
+        later += ts2
+        assert entered[1].wait(5), "no reader replaced the hung flight"
+        for _ in range(5):                          # five more budget windows, the rescue hung as well
+            _age(src)
+            t0 = time.monotonic()
+            ts3, out3 = _readers(src, 1)
+            later += ts3
+            ts3[0].join(2)
+            assert not ts3[0].is_alive(), "a reader past the bound started or joined a build"
+            assert len(out3) == 1 and isinstance(out3[0], TimeoutError), out3
+            assert time.monotonic() - t0 < 1.0      # at once, not at the 3 s deadline
+            assert len(calls) == 2, len(calls)
+        hangs[0].set()                              # the abandoned build returns: one build outstanding
+        ts[0].join(5)
+        _age(src)
+        ts4, out4 = _readers(src, 1)
+        later += ts4
+        assert entered[2].wait(5), "no new rescue after an outstanding build returned"
+        assert len(calls) == 3, len(calls)
+    finally:
+        for h in hangs:
+            h.set()
+        for t in ts + later:
+            t.join(10)
+    assert not any(isinstance(o, Exception) for o in out + out2 + out4), (out, out2, out4)
+    assert key not in providers._view_flights and key not in providers._view_builds
+
+
+def test_a_waiter_on_a_superseded_flight_gets_the_replacements_view_not_the_late_one(tmp_path: Path, monkeypatch) -> None:
+    """C17: a reader parked on a flight that is then replaced does not take that flight's result: it leaves the superseded flight
+    and gets the replacement's view while the superseded build still hangs; that build returns later, to its own caller only.
+    (The waiter is joined before the superseded build is released: a build in progress shows a transient -wal, which is part of
+    the signature, so a look taken during it misses the cache and builds once more; that is a property of the signature.)"""
+    import time
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    entered, hangs, calls = _hung_builds(monkeypatch, src)
+    ts, out = _readers(src, 1)
+    later: list = []
+    outw: list = []
+    outr: list = []
+    try:
+        assert entered[0].wait(5)
+        tw, outw = _readers(src, 1)                 # parks on flight 1
+        later += tw
+        time.sleep(0.2)                             # time to park (the deadline is 3 s)
+        assert len(calls) == 1, len(calls)
+        _age(src)
+        tr, outr = _readers(src, 1)
+        later += tr
+        assert entered[1].wait(5), "no reader replaced the hung flight"
+        hangs[1].set()                              # the replacement finishes first
+        tr[0].join(5)
+        tw[0].join(2)
+        assert not tw[0].is_alive(), "the waiter stayed parked on the superseded flight"
+        hangs[0].set()                              # then the superseded build returns
+        ts[0].join(5)
+    finally:
+        for h in hangs:
+            h.set()
+        for t in ts + later:
+            t.join(10)
+    assert not isinstance(out[0], Exception) and not isinstance(outr[0], Exception) and out[0] is not outr[0], (out, outr)
+    assert outw == [outr[0]], "the waiter consumed the superseded flight's view"
+    assert len(calls) == 2, len(calls)
+
+
+def test_an_abandoned_build_that_raises_leaves_the_replacement_and_wakes_its_waiter_onto_it(tmp_path: Path, monkeypatch) -> None:
+    """C18: the abandoned build RAISES: its own caller gets the exception, the replacement stays registered and is the one that
+    publishes, and a reader parked on the abandoned flight is woken and gets the replacement's view, not the exception."""
+    import time
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    entered, hangs, calls = _hung_builds(monkeypatch, src, raise_on=(1,))
+    # one wait slice spans the whole test, so the parked waiter is woken by the abandoned build's exit, not by a slice ending
+    monkeypatch.setattr(providers, "VIEW_FLIGHT_WAIT_S", 2.5, raising=False)
+    key = id(src)
+    ts, out = _readers(src, 1)
+    later: list = []
+    outw: list = []
+    outr: list = []
+    try:
+        assert entered[0].wait(5)
+        tw, outw = _readers(src, 1)                 # parks on the flight that will be abandoned
+        later += tw
+        time.sleep(0.2)                             # time to park (the deadline is 3 s)
+        _age(src)
+        tr, outr = _readers(src, 1)
+        later += tr
+        assert entered[1].wait(5), "no reader replaced the hung flight"
+        replacement = providers._view_flights.get(key)
+        hangs[0].set()                              # the abandoned build raises
+        ts[0].join(5)
+        assert len(out) == 1 and isinstance(out[0], RuntimeError), out
+        assert providers._view_flights.get(key) is replacement, "the raising build removed the replacement flight"
+        hangs[1].set()
+        tr[0].join(5)
+        tw[0].join(5)
+    finally:
+        for h in hangs:
+            h.set()
+        for t in ts + later:
+            t.join(10)
+    assert len(outr) == 1 and not isinstance(outr[0], Exception), outr
+    assert outw == [outr[0]], "the waiter on the abandoned flight got its exception, not the replacement's view"
+    assert providers._view_cache[key][3] is outr[0] and key not in providers._view_flights
+    assert len(calls) == 2, len(calls)
 
 
 def test_the_flight_wait_is_a_quarter_of_the_panel_read_budget() -> None:

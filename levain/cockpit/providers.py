@@ -156,18 +156,24 @@ def _signature_of(source: Any) -> tuple | None:
 
 class _Flight:
     """One build in progress for a source: the readers that arrive meanwhile wait on it and share its view. ``started``
-    (monotonic) lets a later reader see that the build has outlived the panel read budget and replace the flight."""
-    __slots__ = ("done", "sig", "started", "view", "exc")
+    (monotonic) lets a later reader see that the build has outlived the panel read budget and replace the flight;
+    ``superseded`` is set (under the lock) when it is replaced, and its waiters then look again instead of taking its result."""
+    __slots__ = ("done", "sig", "started", "superseded", "view", "exc")
 
     def __init__(self, sig: tuple) -> None:
         self.done = threading.Event()
         self.sig = sig
         self.started = time.monotonic()
+        self.superseded = False
         self.view: SubstrateView | None = None
         self.exc: BaseException | None = None
 
 
 _view_flights: dict[int, _Flight] = {}
+# builds started for a source and not yet returned, the registered flight's and an abandoned one's; a source holds at most
+# VIEW_BUILDS_PER_SOURCE of them (the abandoned build and one rescue), so builds that keep hanging cost a bounded number of threads
+VIEW_BUILDS_PER_SOURCE = 2
+_view_builds: dict[int, int] = {}
 
 
 def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
@@ -176,9 +182,12 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
     one build per source runs and the readers that arrive meanwhile wait for it, on the same flight, until the panel
     deadline (``PANEL_READ_DEADLINE_S``), when they raise ``TimeoutError``; they never build for themselves. They share its view; a build that raises stores nothing and its waiters get the same
     exception. A new flight starts when the old one has finished, or when a reader finds it older than the panel read
-    budget (a hung build): that reader replaces it and builds, and later readers join the replacement, so a source has
-    at most one new build per budget window. The abandoned build, if it ever returns, gives its own caller its view but
-    neither caches it nor removes the replacement. A write's own read (``ctx.fresh``) and a view that carries an error
+    budget (a hung build): that reader replaces it and builds, and later readers join the replacement. A source holds at
+    most ``VIEW_BUILDS_PER_SOURCE`` builds that have not returned (the abandoned one and one rescue): while both are out, a
+    reader that finds the rescue stale too raises ``TimeoutError`` at once and starts nothing, and a new rescue starts only
+    once one of them returns. The abandoned build, if it ever returns or raises, gives its own caller its view or its
+    exception but neither caches it nor removes the replacement, and the readers that waited on it look again (the cache or
+    the replacement), never taking its result. A write's own read (``ctx.fresh``) and a view that carries an error
     are never cached."""
     def build() -> SubstrateView:
         key = id(source)
@@ -193,17 +202,29 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
                     return hit[3]
                 flight = _view_flights.get(key)
                 # a flight older than the budget is a hung build: replace it (under the lock, so one reader does)
-                if flight is None or time.monotonic() - flight.started >= PANEL_READ_DEADLINE_S:
+                stale = flight is not None and time.monotonic() - flight.started >= PANEL_READ_DEADLINE_S
+                if flight is None or stale:
+                    if _view_builds.get(key, 0) >= VIEW_BUILDS_PER_SOURCE:
+                        # the bound: the builds already out have not returned, so start none (the page handles the timeout)
+                        raise TimeoutError(f"shared read 'view' did not finish in {PANEL_READ_DEADLINE_S:g}s")
+                    if stale:
+                        flight.superseded = True
                     flight = _view_flights[key] = _Flight(sig)
+                    _view_builds[key] = _view_builds.get(key, 0) + 1
                     mine = True
                 else:
                     mine = False
             if not mine:
                 # only the flight's builder builds: a waiter keeps waiting on the same flight, in VIEW_FLIGHT_WAIT_S slices,
-                # until the panel deadline, then raises the timeout the memo's own deadline raises (the page handles it)
+                # until the panel deadline, then raises the timeout the memo's own deadline raises (the page handles it).
+                # A flight replaced meanwhile is left when the slice ends (or when it exits): its result is not this reader's to take.
                 while not flight.done.wait(max(0.0, min(VIEW_FLIGHT_WAIT_S, deadline - time.monotonic()))):
+                    if flight.superseded:
+                        break
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"shared read 'view' did not finish in {PANEL_READ_DEADLINE_S:g}s")
+                if flight.superseded:
+                    continue            # look again: the replacement's cached view, or the replacement flight
                 if flight.sig == sig:
                     if flight.exc is not None:
                         raise flight.exc            # the builder's failure is every waiter's, not a chain of rebuilds
@@ -228,9 +249,15 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
                 flight.exc = e
                 raise
             finally:
+                # every exit (a view, an exception, a BaseException) ends this build's count and pops only its own flight
                 with _view_cache_lock:
                     if _view_flights.get(key) is flight:
                         del _view_flights[key]
+                    left = _view_builds.get(key, 1) - 1
+                    if left > 0:
+                        _view_builds[key] = left
+                    else:
+                        _view_builds.pop(key, None)
                 flight.done.set()
     return ctx.memo("view", build)
 
