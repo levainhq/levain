@@ -84,32 +84,50 @@ def kill_quietly(proc: "subprocess.Popen[bytes]") -> None:
         pass
 
 
-def reap_quietly(proc: "subprocess.Popen[bytes]", timeout: float) -> None:
-    """Wait at most ``timeout`` for the child to exit, then close its pipes. Never raises an ``Exception``; a
-    child still running then is left to the ``Popen`` object's own cleanup."""
-    try:
-        proc.wait(timeout=max(0.0, timeout))
-    except Exception:
-        pass
+def _close_pipes(proc: "subprocess.Popen[bytes]") -> None:
+    """Close the child's three pipes, each one tried whatever closing another raised. Never raises an
+    ``Exception``; an interrupt raised by a close passes through once all three were tried."""
+    pending: Optional[BaseException] = None
     for f in (proc.stdin, proc.stdout, proc.stderr):
         if f is not None:
             try:
                 f.close()
             except Exception:
                 pass
+            except BaseException as e:
+                if pending is None:
+                    pending = e
+    if pending is not None:
+        raise pending
+
+
+def reap_quietly(proc: "subprocess.Popen[bytes]", timeout: float) -> None:
+    """Wait at most ``timeout`` for the child to exit, then close its pipes; the close is tried even when the wait
+    is interrupted. Never raises an ``Exception``; an interrupt passes through once the pipes were closed. A child
+    still running then is left to the ``Popen`` object's own cleanup."""
+    try:
+        try:
+            proc.wait(timeout=max(0.0, timeout))
+        except Exception:
+            pass
+    finally:
+        _close_pipes(proc)
 
 
 def run_bounded(argv: List[str], *, env: Dict[str, str], timeout: Optional[float], retry_timeout: bool = False,
                 stdin: Optional[bytes] = None, reap_timeout: float = _REAP_TIMEOUT,
                 popen: Optional[type] = None) -> "subprocess.CompletedProcess[bytes]":
     """One program run from ``/`` with a bounded wait, its output as bytes; ``retry_timeout`` runs it once more on
-    a timeout. Raises ``subprocess.TimeoutExpired``, ``OSError``, or whatever interrupted the wait.
+    a timeout, but only when the first child was seen to exit: one still running after its bounded reap (its kill
+    refused) is not run beside, and the timeout is raised. Raises ``subprocess.TimeoutExpired``, ``OSError``, or
+    whatever interrupted the wait.
 
     Not ``subprocess.run``: on a timeout (or an interrupt) it kills the child and then waits for it without a bound,
     and when the child runs as root (sudo) the kill from the operator uid can be refused, so that wait lasts as long
     as the child does (``tests/test_hands_live.py``'s unkillable-child tests). Here the kill is best effort and the wait after it is at most
-    ``reap_timeout``; a child left running is the caller's to stop. ``popen`` is the ``Popen`` to start it with
-    (default: ``subprocess.Popen``, looked up at call time)."""
+    ``reap_timeout``; a child left running is the caller's to stop. The kill, the reap and the pipes' close are each
+    tried whatever interrupts the one before; an interrupt passes through after them. ``popen`` is the ``Popen`` to
+    start it with (default: ``subprocess.Popen``, looked up at call time)."""
     start = popen if popen is not None else subprocess.Popen
     tries = 2 if retry_timeout else 1
     for n in range(tries):
@@ -118,9 +136,11 @@ def run_bounded(argv: List[str], *, env: Dict[str, str], timeout: Optional[float
         try:
             out, err = proc.communicate(input=stdin, timeout=timeout)
         except BaseException as e:
-            kill_quietly(proc)
-            reap_quietly(proc, reap_timeout)
-            if isinstance(e, subprocess.TimeoutExpired) and n < tries - 1:
+            try:
+                kill_quietly(proc)
+            finally:
+                reap_quietly(proc, reap_timeout)
+            if isinstance(e, subprocess.TimeoutExpired) and n < tries - 1 and proc.returncode is not None:
                 continue
             raise
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)

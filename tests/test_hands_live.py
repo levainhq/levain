@@ -207,3 +207,91 @@ def test_a_sweep_whose_children_cannot_be_killed_still_ends_within_its_bound(mon
     finally:
         _reap_all(spawned)
     assert said is not None and took < 2.5, (took, said)
+
+
+# --- a1f4: no retry over a child still running; an interrupt never skips the reap or a pipe's close -----------------
+
+class _Pipe:
+    def __init__(self, log: list, name: str):
+        self.log, self.name = log, name
+
+    def close(self):
+        self.log.append(("close", self.name))
+
+
+def _stand_in(log: list, *, communicate=None, kill=None, wait=None, dies_on_kill: bool = False) -> type:
+    """A ``Popen`` stand-in: each of ``communicate``, ``kill``, ``wait`` raises the exception given for it (a timeout
+    by default for ``communicate``), and every call is logged. ``dies_on_kill``: a kill sets a returncode."""
+    class P:
+        def __init__(self, argv, **kw):
+            log.append("start")
+            self.returncode = None
+            self.stdin, self.stdout, self.stderr = (_Pipe(log, n) for n in ("in", "out", "err"))
+
+        def communicate(self, input=None, timeout=None):
+            log.append("communicate")
+            raise communicate or subprocess.TimeoutExpired("x", timeout or 0)
+
+        def kill(self):
+            log.append("kill")
+            if kill is not None:
+                raise kill
+            if dies_on_kill:
+                self.returncode = -9
+
+        def wait(self, timeout=None):
+            log.append("wait")
+            if wait is not None:
+                raise wait
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("x", timeout or 0)
+            return self.returncode
+    return P
+
+
+def test_a_timeout_is_not_retried_while_the_first_child_still_runs():
+    # deepseek MED (1026-22 a1ab L3): a refused kill left the first child running after the bounded reap, and
+    # retry_timeout started a second beside it
+    log: list = []
+    P = _stand_in(log, kill=PermissionError(1, "Operation not permitted"))
+    with pytest.raises(subprocess.TimeoutExpired):
+        hands_live.run_bounded(["x"], env={}, timeout=0.1, retry_timeout=True, reap_timeout=0.0, popen=P)
+    assert log.count("start") == 1, log
+    # a child the kill did stop is retried, as before
+    log.clear()
+    P = _stand_in(log, dies_on_kill=True)
+    with pytest.raises(subprocess.TimeoutExpired):
+        hands_live.run_bounded(["x"], env={}, timeout=0.1, retry_timeout=True, reap_timeout=0.0, popen=P)
+    assert log.count("start") == 2, log
+
+
+def test_an_interrupt_during_the_kill_still_reaps_and_closes_every_pipe():
+    # codex LOW + complement LOW 3: the interrupt escaped kill_quietly and the reap was skipped
+    log: list = []
+    P = _stand_in(log, kill=KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        hands_live.run_bounded(["x"], env={}, timeout=0.1, reap_timeout=0.0, popen=P)
+    assert log[-4:] == ["wait", ("close", "in"), ("close", "out"), ("close", "err")], log
+
+
+def test_an_interrupt_during_the_reap_wait_still_closes_every_pipe():
+    log: list = []
+    P = _stand_in(log, wait=KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        hands_live.run_bounded(["x"], env={}, timeout=0.1, reap_timeout=0.0, popen=P)
+    assert log[-4:] == ["wait", ("close", "in"), ("close", "out"), ("close", "err")], log
+
+
+def test_an_interrupt_closing_one_pipe_still_closes_the_others():
+    log: list = []
+    P = _stand_in(log)
+    p = P(["x"])
+
+    class Interrupting(_Pipe):
+        def close(self):
+            super().close()
+            raise KeyboardInterrupt
+    p.stdin = Interrupting(log, "in")
+    with pytest.raises(KeyboardInterrupt):
+        hands_live.reap_quietly(p, 0.0)
+    assert [e for e in log if isinstance(e, tuple)] == [("close", "in"), ("close", "out"), ("close", "err")], log
