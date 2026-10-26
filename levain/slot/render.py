@@ -902,8 +902,10 @@ def refuse_readback(expected: Mapping[str, Any], observed: Any) -> None:
 
 def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     """``docs``: repo-relative file name (``.claude/settings.json``, ``.claude/settings.local.json``) -> its parsed
-    JSON. Refused by key: every ``sandbox`` key in host_guard's ``_LOOSENING_TRUE`` that is ``true`` and every one
-    in ``_LOOSENING_NONEMPTY`` that is non-empty (the keys whose merge across layers the flag layer cannot pin),
+    JSON. Refused by key: every ``sandbox`` key in host_guard's ``_LOOSENING_TRUE`` that is ``true`` or not a bool,
+    and every one in ``_LOOSENING_NONEMPTY`` that is non-empty or not a list of strings (the keys whose merge across
+    layers the flag layer cannot pin; a ``sandbox.network`` or ``sandbox.filesystem`` that is not an object is
+    ``repo-settings-malformed``),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
     its meaning to CC is unmeasured), and an ``env`` naming the queue's vars or a :data:`PROXY_ENV` name. A
     document that is not an object is refused ``repo-settings-malformed``.
@@ -936,12 +938,31 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
         if not isinstance(sb, Mapping):
             out.append(Refused("repo-settings-malformed", f"{path}: sandbox"))
             continue
+        bad_sub = sorted(s for s in ("network", "filesystem") if s in sb and not isinstance(sb[s], Mapping))
+        for sub in bad_sub:
+            out.append(Refused("repo-settings-malformed", f"{path}: sandbox.{sub}"))
+        if bad_sub:
+            continue
+        # Exact type first (RULINGS 1026-10 Q5, host_guard's managed check's twin): a falsy non-list passed the
+        # not-empty check, and a schema type error can drop CC's sandbox block silently. The type is membership:
+        # a _LOOSENING_TRUE key is a bool, a _LOOSENING_NONEMPTY key a list of strings.
         for keys in _LOOSENING_TRUE:
-            if _get(sb, keys) is True:
+            v = _get(sb, keys)
+            if v is _MISSING:
+                continue
+            if type(v) is not bool:
+                out.append(_refused("loosening", "sandbox." + ".".join(keys),
+                                    f"{path}: must be bool, got {type(v).__name__}"))
+            elif v:
                 out.append(_refused("loosening", "sandbox." + ".".join(keys), f"{path}: true"))
         for keys in _LOOSENING_NONEMPTY:
             v = _get(sb, keys)
-            if v is not _MISSING and v:
+            if v is _MISSING:
+                continue
+            if type(v) is not list or any(type(i) is not str for i in v):
+                out.append(_refused("loosening", "sandbox." + ".".join(keys),
+                                    f"{path}: must be a list of strings, got {type(v).__name__}"))
+            elif v:
                 out.append(_refused("loosening", "sandbox." + ".".join(keys), f"{path}: not empty"))
     return out
 
