@@ -318,6 +318,16 @@ def test_count_held_and_the_triggers_share_one_reason_rule(store, reason):
     c.close()
 
 
+def test_every_trigger_this_module_defines_is_defined_once():
+    # O-a1c1b-5: no shadowed copy of a trigger the installed set replaces (the held triggers were defined twice, one
+    # copy filtered out at install)
+    def names(stmts):
+        return [t.split("CREATE TRIGGER IF NOT EXISTS ", 1)[1].split(" ", 1)[0] for t in stmts]
+    defined = names(s.V3_TRIGGERS + s.HELD_TRIGGERS + s.DECISION_TRIGGERS + s.LEGACY_TRIGGERS + s.CLOSE_PATH
+                    + s.DELETE_TRIGGERS + s.ENV_TRIGGERS + s.META_TRIGGERS)
+    assert sorted(defined) == sorted(set(defined)) == sorted(names(s.ALL_TRIGGERS))
+
+
 def test_a_held_limit_close_needs_its_count_at_the_bound(store):
     c = raw(store)
     subj = "request:p:link-0"

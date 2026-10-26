@@ -436,14 +436,7 @@ V3_TRIGGERS = (
     # ---- held_counts (I5 -> I11): consecutive subject-specific holds of a LIVE subject; never replaced or removed
     _abort("held_new", "EXISTS (SELECT 1 FROM held_counts WHERE subject = NEW.subject)",
            "D69: a row is never replaced", "BEFORE INSERT ON held_counts"),
-    _abort("held_born", f"NOT IFNULL(NEW.n = 1 AND NEW.mark IS {_progress('NEW.subject')} "
-           f"AND NEW.last_reason GLOB '{SUBJECT_REASON}' AND NOT {_closed('NEW.subject')}, 0)",
-           "I11: a held count is born 1, at the live subject mark, for a subject fault", "BEFORE INSERT ON held_counts"),
-    _abort("held_move", f"NOT IFNULL(NEW.subject IS OLD.subject AND NEW.last_reason GLOB '{SUBJECT_REASON}' "
-           f"AND NOT {_closed('NEW.subject')} AND NEW.mark IS {_progress('NEW.subject')} AND ("
-           "(NEW.n = OLD.n + 1 AND NEW.mark IS OLD.mark) OR (NEW.n = 1 AND NEW.mark > OLD.mark)), 0)",
-           "I11: a held count rises by one at the same mark, or restarts at 1 only on progress",
-           "BEFORE UPDATE ON held_counts"),
+    # held_born / held_move: HELD_TRIGGERS
     _abort("held_final_d", "1", "I5: a held count is never removed", "BEFORE DELETE ON held_counts"),
     # I11: a held_limit close is backed by a count at the bound (a writer cannot invent one)
     # I11 / D87 probe: a close names a run that exists (run ids are deterministic, run_id_for: a close written before
@@ -581,15 +574,7 @@ LEGACY_TRIGGERS = tuple(
            + _run_of_request("'request:' || NEW.request_id") + " AND legacy = 1)", "I15: a legacy run is frozen (no request close after the upgrade)", "BEFORE INSERT ON requests"),
 )
 
-_REPLACED = {"held_born", "held_move"}
-
-
-def _name(stmt: str) -> str:
-    return stmt.split("CREATE TRIGGER IF NOT EXISTS ", 1)[1].split(" ", 1)[0]
-
-
-V74_TRIGGERS = tuple(t for t in V3_TRIGGERS if _name(t) not in _REPLACED) + HELD_TRIGGERS + DECISION_TRIGGERS \
-    + LEGACY_TRIGGERS
+V74_TRIGGERS = V3_TRIGGERS + HELD_TRIGGERS + DECISION_TRIGGERS + LEGACY_TRIGGERS
 
 INVARIANT = """
 SELECT 'terminal_without_receipt', 'run:' || c.run_id FROM cancels c
