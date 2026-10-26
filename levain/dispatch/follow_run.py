@@ -31,7 +31,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-from levain.dispatch.follow import _PERMANENT_TAKES, EventFollower, FollowStopped, VerifierCall
+from levain.dispatch.follow import PERMANENT_TAKES, EventFollower, FollowStopped, VerifierCall
 from levain.dispatch.jobs import JobStore
 from levain.slot import Refused
 from levain.slot import control_client as CC
@@ -48,7 +48,7 @@ LASTING_S = 300.0
 #: stop names a later attempt can succeed at: CONTROL coming back, the machine's I/O, and the takes the follower parks
 #: after ``follow.TAKE_FAILURE_LIMIT`` failures (the bundle may arrive; they come round at the backoff, up to
 #: :data:`BACKOFF_MAX_S`)
-RETRYABLE = frozenset({"control-down", "artifact-io", "take-failed", *_PERMANENT_TAKES})
+RETRYABLE = frozenset({"control-down", "artifact-io", "take-failed", *PERMANENT_TAKES})
 #: step outcomes the loop knows: a stream that ended (``levain.slot.control_client`` outcomes) and the follower's two
 #: cursor drops; ``DEADLINE`` and ``CANCELLED`` are handled before this set is consulted
 _ENDED = frozenset({CC.CLOSED, CC.RESET, CC.ERROR, CC.BROKEN, "journal-changed", "reset"})
@@ -84,6 +84,8 @@ class FollowRunner:
         try:
             while not self._stopped.is_set():
                 before = self.follower.jobs.event_cursor()
+                if self._stopped.is_set():              # a stop that landed during the read enters no step
+                    return
                 try:
                     stepped = self.follower.step()
                 except (FollowStopped, Refused) as e:
@@ -197,16 +199,21 @@ def main(argv: Optional[Sequence[str]] = None, *, resolve: Callable[[Mapping[str
                 if requested:
                     runner.stop()                       # off the handler: it takes the follower's locks
         finally:
-            for s, h in old.items():
-                signal.signal(s, h)
             runner.stop()
             if worker.is_alive():
                 worker.join()
+            _restore_handlers(old, signal.signal)       # last: a signal during the final step is still ours
         if failed:
             raise failed[0]
         return 0
     finally:
         os.close(fd)
+
+
+def _restore_handlers(old: Mapping[int, Any], install: Callable[[int, Any], Any]) -> None:
+    """Put the previous handlers back; one installed from C reads back as None, which ``signal.signal`` refuses."""
+    for s, h in old.items():
+        install(s, signal.SIG_DFL if h is None else h)
 
 
 def _stop_request_handler(requested: list[int]) -> Callable[[int, Any], None]:

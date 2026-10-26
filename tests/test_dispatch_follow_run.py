@@ -213,25 +213,29 @@ def test_a_cancelled_step_ends_run_without_a_wait():
     assert waits.delays == [] and f.steps == 1
 
 
+def test_a_stop_between_the_cursor_read_and_the_step_enters_no_step():
+    """A stop that lands after the loop's check, in the cursor read just before the step, enters no step at all."""
+    f = FakeFollower([])
+    runner = FR.FollowRunner(f, wait=Waits())
+    f.jobs.event_cursor = lambda: runner.stop()
+    runner.run()
+    assert f.steps == 0 and f.closed >= 1
+
+
 def test_a_step_that_raises_once_stop_is_set_is_the_clean_end():
-    """A stop that lands between the loop's check and the step leaves the step on a closed follower; whatever that
-    raises (a closed socket, a closed store handle) is the stop, not a failure."""
+    """A stop that lands during a step on a closed follower: whatever that raises (a closed socket, a closed store
+    handle) is the stop, not a failure."""
+    runner: list = []
+
     class Closed(FakeFollower):
         def step(self):
             self.steps += 1
-            if self.closed:
-                raise OSError("bad file descriptor")
-            return F.Stepped(CC.CLOSED)
+            runner[0].stop()
+            raise OSError("bad file descriptor")
 
     f = Closed([])
-    runner = FR.FollowRunner(f, wait=Waits())
-
-    def stop_between_check_and_step() -> None:
-        runner.stop()
-
-    real = f.jobs.event_cursor
-    f.jobs.event_cursor = lambda: (stop_between_check_and_step(), real())[1]
-    runner.run()                                                # does not raise
+    runner.append(FR.FollowRunner(f, wait=Waits()))
+    runner[0].run()                                             # does not raise
     assert f.steps == 1 and f.closed >= 1
 
 
@@ -275,22 +279,39 @@ def test_the_signal_handler_takes_no_lock_a_second_signal_could_find_held(store)
 # -- the entry ----------------------------------------------------------------------------------------------------
 
 
-def test_main_takes_an_artifact_acks_it_and_ends_on_sigterm(store, served, tmp_path):  # noqa: F811
+def test_main_takes_an_artifact_acks_it_and_ends_on_sigterm(store, served, tmp_path, monkeypatch):  # noqa: F811
     """main() in this process: its own JobStore at --store-dir, the follower of --socket, takes from --export-dir;
-    the artifact event is taken and acked, and SIGTERM ends main with 0."""
+    the artifact event is taken and acked, and the installed SIGTERM handler, called directly, ends main with 0."""
     session, ticket, seq = published(served)
     (tmp_path / "export").mkdir()
     export = exported(tmp_path / "export", session, ticket)
     done: list = []
 
-    before = signal.getsignal(signal.SIGTERM)
+    handlers: dict = {}
+    runners: list = []
+    real_signal, real_runner = signal.signal, FR.FollowRunner
+
+    def recording_signal(num, h):
+        handlers[num] = h
+        return real_signal(num, h)
+
+    class Recording(real_runner):
+        def __init__(self, *a, **k) -> None:
+            super().__init__(*a, **k)
+            runners.append(self)
+
+    monkeypatch.setattr(signal, "signal", recording_signal)
+    monkeypatch.setattr(FR, "FollowRunner", Recording)
 
     def term() -> None:
         ok = until(lambda: served.control.store.get(session).fields.get("artifact_acked") is True)
         done.append(ok)
-        # signal only a process whose handler main() installed; with the default action SIGTERM would end pytest
-        if signal.getsignal(signal.SIGTERM) is not before:
-            os.kill(os.getpid(), signal.SIGTERM)
+        # the handler main() installed is called directly: nothing signals this process, and a failure ends main
+        # on a bounded wait instead of hanging it
+        if ok and until(lambda: signal.SIGTERM in handlers):
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+        elif runners:
+            runners[0].stop()
 
     t = threading.Thread(target=term, daemon=True)
     t.start()
@@ -343,6 +364,45 @@ def test_two_sigterms_in_a_row_still_end_the_program_with_0(store, served, tmp_p
             proc.kill()
             proc.communicate()
     assert proc.returncode == 0, err.decode()
+
+
+def test_main_restores_the_signal_handlers_only_after_the_runner_has_ended(store, served, tmp_path, monkeypatch):  # noqa: F811
+    """A SIGTERM during a slow final step must still reach our handler, so the previous handlers come back last."""
+    events: list = []
+    handlers: dict = {}
+    real_signal, real_runner = signal.signal, FR.FollowRunner
+
+    def recording_signal(num, h):
+        handlers[num] = h
+        events.append(("signal", num))
+        return real_signal(num, h)
+
+    class Recording(real_runner):
+        def run(self) -> None:
+            try:
+                super().run()
+            finally:
+                events.append("ended")
+
+    monkeypatch.setattr(signal, "signal", recording_signal)
+    monkeypatch.setattr(FR, "FollowRunner", Recording)
+    (tmp_path / "export").mkdir()
+
+    def term() -> None:
+        if until(lambda: signal.SIGTERM in handlers):
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    threading.Thread(target=term, daemon=True).start()
+    assert FR.main(["--store-dir", str(store.directory), "--socket", str(served.path),
+                    "--export-dir", str(tmp_path / "export")]) == 0
+    assert events.index("ended") < max(i for i, e in enumerate(events) if e != "ended" and e[1] == signal.SIGTERM)
+    assert events.count(("signal", signal.SIGTERM)) == 2
+
+
+def test_a_previous_handler_of_none_is_restored_as_the_default():
+    restored: list = []
+    FR._restore_handlers({signal.SIGTERM: None, signal.SIGINT: signal.SIG_IGN}, lambda s, h: restored.append((s, h)))
+    assert restored == [(signal.SIGTERM, signal.SIG_DFL), (signal.SIGINT, signal.SIG_IGN)]
 
 
 def test_a_held_lock_is_refused_before_the_store_is_opened(tmp_path):
