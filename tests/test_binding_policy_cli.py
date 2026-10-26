@@ -111,9 +111,40 @@ def test_list_says_which_signer_root_does_not_list_and_which_the_log_revoked(cw,
     assert f"last renewed by {cw.fp('pk')} (REVOKED in the log: covers nothing)" in capsys.readouterr().out
 
 
-def test_graduate_without_a_binding_driver_says_nothing_graduates(capsys):
+def test_graduate_with_no_store_names_the_path_policy_create_would_use(capsys):
+    from levain.autonomic.db import DB_NAME, default_store_dir
+
     assert cli.main(["binding", "graduate"]) == 1
-    assert "no binding driver" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "nothing graduates" in err
+    assert f"no autonomic store at {default_store_dir() / DB_NAME}" in err
+    assert "executor_not_confined" in err
+
+
+def test_graduate_with_a_store_present_drops_the_store_blocker_and_keeps_the_executor_one(capsys):
+    from levain.autonomic.db import default_store_dir
+
+    AutonomicDB(default_store_dir()).meta("store_id")
+    assert cli.main(["binding", "graduate"]) == 1
+    err = capsys.readouterr().err
+    assert "no autonomic store" not in err
+    assert "executor_not_confined" in err
+
+
+def test_graduate_reads_the_executor_reason_from_the_gate_not_a_restatement(capsys, monkeypatch):
+    from levain.autonomic.gate import EfferentGate
+
+    monkeypatch.setattr(EfferentGate, "binding_effect_refusal", lambda self: "some_other_reason")
+    assert cli.main(["binding", "graduate"]) == 1
+    err = capsys.readouterr().err
+    assert "some_other_reason" in err and "executor_not_confined" not in err
+
+
+def test_policy_create_help_says_cooling_off_is_denied_on_silence_while_nothing_auto_fires(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["binding", "policy", "create", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "COOLING_OFF" in text and "denied on silence" in text and "like CONFIRM" in text
 
 
 def test_a_renew_whose_policy_lapses_while_it_is_signed_is_refused(cw, capsys, monkeypatch):
@@ -243,7 +274,7 @@ def test_list_says_a_signer_absent_from_the_log_apart_from_a_revoked_one(cw, cap
 def test_graduate_takes_the_cockpit_flags(capsys, tmp_path):
     # RULINGS_R1 item 11 (deepseek 6): the engine S6 wires reads the same --data-root / --path as the policy verbs
     assert cli.main(["binding", "graduate", "--data-root", str(tmp_path), "--preview"]) == 1
-    assert "no binding driver" in capsys.readouterr().err
+    assert "nothing graduates" in capsys.readouterr().err
 
 
 def test_graduate_with_an_error_step_prints_what_committed_and_exits_1(capsys, monkeypatch, tmp_path):
