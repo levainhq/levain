@@ -41,6 +41,7 @@ Root never imports the supervisor or the operator's launch code here (R4); the c
 from __future__ import annotations
 
 import errno
+import fcntl
 import os
 import select
 import selectors
@@ -405,12 +406,16 @@ def _run(ctx: H.Ctx, a: R.Alloc) -> Dict[str, object]:
 
 
 def _record(ctx: H.Ctx, a: R.Alloc, outcome: str, cause: str) -> None:
-    """N10: the slot's last-probe record, root 0644, replaced whole. A failed write is noted, never the answer."""
+    """N10: the slot's last-probe record, root 0644, replaced whole. A failed write is noted, never the answer.
+    Written after the session lock is released, so two probes of one slot can overlap here; X5: each replace holds an
+    exclusive ``flock`` on the slot's directory, so the temp name ``replace_at`` reuses is never shared."""
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ctx.seams.clock()))
     data = canon.canonical_bytes({"format": RECORD_FORMAT, "at": stamp, "session": a.session,
                                   "outcome": outcome, "cause": cause})
     try:
-        ctx.store.replace(("slots", a.slot.tag), RECORD_NAME, data, mode=0o644)
+        with ctx.store.dir("slots", a.slot.tag) as fd:
+            fcntl.flock(fd, fcntl.LOCK_EX)              # released when the store closes fd
+            H.replace_at(fd, RECORD_NAME, data, mode=0o644, fsync=ctx.seams.fsync)
     except (OSError, Refused) as e:
         SS._note(f"probe record not written: {type(e).__name__}")
 

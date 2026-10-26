@@ -746,6 +746,55 @@ def test_t6_rendered_probe_closed_in_order_spawned_under_the_lock(penv, monkeypa
     assert (w.L / "slots" / "e0" / "probe").stat().st_mode & 0o777 == 0o644
 
 
+def test_x5_overlapping_record_writes_are_serialized(penv, monkeypatch):
+    """L3 r1 X5 (codex MED): two probes' record writes overlap (A is inside its fsync when B starts). Each must
+    publish a whole record in turn; neither may unlink the other's temp and fail or publish the other's file."""
+    import threading
+
+    from levain.slot import probe as PB
+    from levain.slot import runtime_helper as H
+    from levain.slot import start as SS
+
+    w, la, table, pr = penv
+    s = _rendered_probe(w)
+    a = w.alloc(s)
+    notes = []
+    monkeypatch.setattr(SS, "_note", notes.append)
+    a_in, b_done = threading.Event(), threading.Event()
+    real = w.seams.fsync
+    first = []
+
+    def fsync(fd):
+        if not first:
+            first.append(fd)
+            a_in.set()
+            b_done.wait(0.5)          # B runs here unless the write is serialized (then B waits for A)
+        return real(fd)
+    monkeypatch.setattr(w.seams, "fsync", fsync)
+
+    def write(outcome):
+        ctx = H.Ctx(w.seams, H.Store(w.seams), 0, "operator", 0, {})
+        try:
+            PB._record(ctx, a, outcome, outcome)
+        finally:
+            ctx.store.close()
+
+    ta = threading.Thread(target=write, args=("open",))
+    ta.start()
+    assert a_in.wait(5)
+
+    def b():
+        write("closed")
+        b_done.set()
+    tb = threading.Thread(target=b)
+    tb.start()
+    ta.join(5)
+    tb.join(5)
+    assert notes == []
+    assert _record(w)["outcome"] == "closed"
+    assert sorted(p.name for p in (w.L / "slots" / "e0").iterdir() if p.name.startswith("probe")) == ["probe"]
+
+
 def test_t6_active_session_is_probeable(penv):
     from tests.test_slot_s2f3_start import _started
 
