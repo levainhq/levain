@@ -97,3 +97,15 @@ def test_doctor_fails_when_a_workspace_or_user_config_turns_the_hooks_off(instal
     (install / ".claude" / "settings.local.json").write_text("{not json")
     assert doctor._check_hooks_off(install, "claude-code", home=home) == []
     assert doctor._check_hooks_off(install, "codex", home=home, codex_home=codex_home) == []
+
+
+def test_doctor_s_own_call_with_no_home_reads_the_user_settings(install, tmp_path, monkeypatch):
+    """L3 r1 (deepseek MED 1, CH-D1c-A) said ``_hooks_off_files`` hands ``_settings_files`` a ``home`` of ``None``
+    when doctor omits it. Run 2026-10-26 in a scratch ``$HOME``, doctor's own form (no ``home``) raised nothing:
+    ``_hooks_off_files`` binds ``Path.home()`` before that call. This pins the form doctor uses."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    user = tmp_path / "home" / ".claude" / "settings.json"
+    user.parent.mkdir(parents=True)
+    user.write_text(json.dumps({"disableAllHooks": True}))
+    (r,) = doctor._check_hooks_off(install, "claude-code")
+    assert not r.ok and str(user) in r.detail
