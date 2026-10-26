@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.26] — 2026-10-25
+
 ### Added
 - **`levain chat setup` installs chat's one Node dependency** (`@anthropic-ai/sandbox-runtime` 0.0.81, pinned by
   integrity hash) into your Levain home, never globally, and records a hash of the whole installed tree. Chat needs
@@ -16,6 +18,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   still; never with reduced motion.
 
 ### Fixed
+- **The cockpit no longer loses a script when a browser opens many connections at once.** Levain's web servers
+  accepted only 5 waiting connections, so a page load through a proxy such as `tailscale serve` (one upstream
+  connection per request) could have a script's connection reset at random: the board then said "read failed:
+  undefined is not an object (evaluating 'window.LevainCockpitView.fromManifest')", or stayed on "connecting…". The
+  cockpit, phone, init, docs and team view servers now queue up to 128 waiting connections.
 - **Two sessions making their first call at the same moment no longer have one call refused with `database is
   locked`.** On a store not yet created (the queue broker's `limits.db` on a fresh install, or any other Levain store),
   opening it now waits for the other opener, up to the same 30 seconds as any other lock, including on the macOS

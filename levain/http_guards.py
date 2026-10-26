@@ -24,9 +24,16 @@ from typing import Any
 from urllib.parse import unquote_plus
 
 __all__ = [
+    "LISTEN_BACKLOG",
     "GuardedHandler",
     "host_header_allowed",
 ]
+
+# The listen queue every Levain HTTP server binds with (its ``request_queue_size``). The stdlib default is 5, and on
+# macOS a connection past a full queue is RESET: a dashboard load opens the stylesheet and its scripts at once, each its
+# own connection through a proxy such as ``tailscale serve``, and lost a random script (2026-10-25, the iOS cockpit's
+# "window.LevainCockpitView.fromManifest" error). The kernel caps it at kern.ipc.somaxconn / net.core.somaxconn.
+LISTEN_BACKLOG = 128
 
 # A write only ever legitimately originates from our own dashboard page (which sends
 # ``Sec-Fetch-Site: same-origin``) or a non-browser client that sends NO Sec-Fetch-
