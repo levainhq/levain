@@ -175,12 +175,23 @@ def test_the_sheet_reads_a_pending_request_with_what_a_passkey_may_sign(home, tm
 
 def test_an_undecided_request_is_ruled_in_the_ruling_namespace_and_delivered(home, tmp_path, monkeypatch) -> None:
     """The late ruling (``levain consent rule`` on the phone's ``rule-challenge`` / ``rule``): only an undecided request
-    takes one, signed in the ruling namespace; its delivery runs once it verifies (stubbed here: no session resumes)."""
+    takes one, signed in the ruling namespace; its delivery runs once it verifies (stubbed here: no session resumes).
+    L3 r1 C1: the ruling is answered as soon as it is recorded, never held on its delivery (the stub below does not
+    return until after the reply has arrived; held, the reply would wait out the delivery)."""
+    import threading
+
     from levain.consent import delivery
 
-    delivered = []
-    monkeypatch.setattr(delivery, "deliver", lambda queue, request_id, notify=None: delivered.append(request_id)
-                        or type("D", (), {"route": "hook", "reason": "stub"})())
+    delivered: list[str] = []
+    release, finished = threading.Event(), threading.Event()
+
+    def slow_deliver(queue, request_id, notify=None):
+        release.wait(30)
+        delivered.append(request_id)
+        finished.set()
+        return type("D", (), {"route": "hook", "reason": "stub"})()
+
+    monkeypatch.setattr(delivery, "deliver", slow_deliver)
     rid = _file(home, hold=timedelta(microseconds=1))
     assert _queue(home).mark_undecided(rid).state == "undecided"
     fp = home.phone.fp
@@ -194,9 +205,11 @@ def test_an_undecided_request_is_ruled_in_the_ruling_namespace_and_delivered(hom
         assert status == 200 and c["challenge"] == _b64u(challenge(ruling_message(c["payload"]), RULING_NAMESPACE))
         assert c["line"] == ruling_message(c["payload"]).decode()
         status, out = _call(url, base + "/rule", {"payload": c["payload"], **home.phone.assertion(c["challenge"], origin=PAGE)})
-        assert status == 200 and out["decision"] == "allow" and out["delivery"] == {"route": "hook", "reason": "stub"}
+        assert status == 200 and out["decision"] == "allow" and out["delivery"]["route"] == "pending", out
+        assert delivered == [] and _queue(home).get(rid)[1] == "allowed"     # recorded, its delivery still running
+        release.set()
+        assert finished.wait(30)
     assert delivered == [rid]
-    assert _queue(home).get(rid)[1] == "allowed"             # the ruling decided it
 
 
 def test_a_cockpit_whose_page_the_queue_would_refuse_starts_no_ceremony(home, tmp_path) -> None:
@@ -228,3 +241,59 @@ def test_the_refusal_before_the_ceremony_stands_on_the_queues_own_refusal(home, 
                                                     **home.phone.assertion(c["challenge"], origin=PORTED)})
         assert (status, out["error"]) == (422, "answer_refused") and f"https://{RP}" in out["message"], out
     assert _queue(home).get(rid)[1] == "pending"
+
+
+def test_a_consent_link_opened_from_another_site_reaches_the_sheet_and_nothing_else(home, tmp_path) -> None:
+    """L3 r1 C2: a consent sheet link opened from mail or another site is a top-level navigation, admitted as
+    ``/sign/<id>`` is (the sign sheet's cross-site test, on the consent sheet); its data stays same-origin only."""
+    rid = _file(home)
+    nav = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
+    with _serving(tmp_path / "inst", signer=_signer(home), extra_hosts=[RP]) as (url, _httpd):
+        page = f"/sign/consent/{_q(rid)}"
+        status, body = _call(url, page, token=None, extra=nav)
+        assert status == 200 and b"/sign.js" in body
+        assert _call(url, page + "?utm=x", token=None, extra=nav)[0] == 200
+        assert _call(url, page, token=None, extra={**nav, "Sec-Fetch-Dest": "iframe"})[0] == 403
+        assert _call(url, page, token=None, extra={**nav, "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"})[0] == 403
+        assert _call(url, page + "/", token=None, extra=nav)[0] == 403
+        assert _call(url, f"/cockpit/consent/{_q(rid)}/sheet.json", extra=nav)[0] == 403
+
+
+def test_the_card_body_names_only_the_answers_the_sheet_offers(home, tmp_path) -> None:
+    """L3 r1 C3: ``sheet_choices`` is the sheet row's own options, so a card routes to the sheet only an answer a passkey
+    may sign here: T2 both, T3 deny only, and none where no passkey may sign (a ported page) while the sheet still opens
+    to say why."""
+    t2, t3 = _file(home, "T2", name="a"), _file(home, "T3", name="b")
+    with _serving(tmp_path / "inst", signer=_signer(home), extra_hosts=[RP]) as (url, _httpd):
+        b2 = _call(url, f"/cockpit/consent/{_q(t2)}.json")[1]
+        b3 = _call(url, f"/cockpit/consent/{_q(t3)}.json")[1]
+        assert b2["sheet_choices"] == ["allow", "deny"] and b3["sheet_choices"] == ["deny"], (b2, b3)
+        assert b3["sheet_v"] == _call(url, f"/cockpit/consent/{_q(t3)}/sheet.json")[1]["request"]["sha256"]
+    with _serving(tmp_path / "inst2", signer=_signer(home, origin=PORTED), extra_hosts=[RP]) as (url, _httpd):
+        b2 = _call(url, f"/cockpit/consent/{_q(t2)}.json")[1]
+        assert b2["sheet"] is True and b2["sheet_choices"] == [], b2
+
+
+def test_a_request_past_its_hold_inside_the_grace_is_not_open_to_the_sheet(home, tmp_path) -> None:
+    """L3 r1 C4: past ``expires_at`` but inside UNDECIDED_GRACE the queue still reads the request pending (for the
+    hook's undecided mark) and applies no answer to it, so the sheet reads it closed and the card names no sheet."""
+    rid = _file(home, hold=timedelta(microseconds=1))
+    assert _queue(home).get(rid)[1] == "pending"            # inside the grace: the queue's own read
+    with _serving(tmp_path / "inst", signer=_signer(home), extra_hosts=[RP]) as (url, _httpd):
+        assert _call(url, f"/cockpit/consent/{_q(rid)}/sheet.json")[0] == 404
+        status, body = _call(url, f"/cockpit/consent/{_q(rid)}.json")
+        if status == 200:                                    # the listing may already show it past its hold
+            assert body["sheet"] is False and body["sheet_choices"] == [], body
+
+
+def test_the_version_binds_every_field_the_sheet_shows_as_decided() -> None:
+    """L3 r1 C5: the sheet's version changes when any field it shows as the thing decided changes."""
+    from levain.web_server import ConsentSheet
+
+    row = {"id": "r1", "state": "pending", "title": "Write · T2", "requester": "claude_code", "message": "m",
+           "expires_at": "2026-10-26T00:00:00Z", "options": [{"key": "allow"}, {"key": "deny"}]}
+    base = ConsentSheet.version(row, "d")
+    for key, value in (("title", "Bash · T2"), ("requester", "codex"), ("message", "m2"), ("expires_at", None),
+                       ("state", "undecided"), ("options", [{"key": "deny"}]), ("note", "laptop only")):
+        assert ConsentSheet.version({**row, key: value}, "d") != base, key
+    assert ConsentSheet.version(row, "d2") != base
