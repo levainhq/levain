@@ -60,7 +60,7 @@ from levain.broker.gwwire import FrameReader, FrontSide, HoldingReader, WireErro
 from levain.broker.norm import REASON, STATUS, Refused  # noqa: F401 - STATUS and Refused are re-exported
 from levain.broker import norm
 from levain.broker.policy import (CONNECT_TYPES, ROUTE_TYPES, PolicyError, RoutePolicy,  # noqa: F401 - re-exported
-                                  parse_route)
+                                  _HOSTNAME, parse_route)
 from levain.broker.stub import GWPORT_BASE, SLOTS, clear_stale_socket, peer_uid
 
 POLICY_FORMAT = "levain-front-session/1"
@@ -341,6 +341,32 @@ def connect_target(policy: FrontPolicy, target: bytes) -> tuple[ConnectRoute, in
     if route is None:
         raise Refused("host-not-allowed", "off-list")
     return route, port
+
+
+#: the most of a refused CONNECT's host the log line carries: a DNS name's length.
+REFUSED_HOST_CAP = 253
+
+
+def refused_host_fields(target: bytes) -> dict:
+    """The requested host of a refused CONNECT, for its log line (wfetch DESIGN §2.3): ``{"host": h}`` when the
+    target's host part is at most :data:`REFUSED_HOST_CAP` bytes and is a host name in the policy's grammar
+    (lowercased) or an address literal without a scope id; else ``{"host_invalid": True, "host_len": n}``. The host
+    is slot-supplied, so nothing else of it is logged."""
+    m = re.match(rb"\[([^\]]*)\](?::[0-9]*)?\Z", target)
+    raw = m.group(1) if m else (target.rpartition(b":")[0] if b":" in target else target)
+    if len(raw) <= REFUSED_HOST_CAP:
+        try:
+            text = raw.decode("ascii")
+        except UnicodeDecodeError:
+            text = None
+        if text is not None and _HOSTNAME.match(text.lower()):
+            return {"host": text.lower()}
+        if text is not None and "%" not in text:
+            try:
+                return {"host": str(ipaddress.ip_address(text))}
+            except ValueError:
+                pass
+    return {"host_invalid": True, "host_len": len(raw)}
 
 
 # --- the TLS ClientHello (domain fronting) ----------------------------------------------------------------------
@@ -1119,6 +1145,7 @@ class Front:
             return
         except (asyncio.IncompleteReadError, asyncio.TimeoutError):
             return
+        target: Optional[bytes] = None
         try:
             conn, req = parse_head_conn(head)
             if req.method != b"CONNECT":
@@ -1130,10 +1157,11 @@ class Front:
                     raise Refused("route-not-allowed")
                 await BrokeredExchange(self, pol, conn, req, path, query, reader, writer).run()
                 return
-            route, port = connect_target(self.policy, req.target)
+            target = req.target
+            route, port = connect_target(self.policy, target)
             ureader, uwriter, addr = await self._open_upstream(route, port)
         except Refused as r:
-            await self._refuse(reader, writer, r)
+            await self._refuse(reader, writer, r, target)
             return
         # The upstream is open before the 200 so an unreachable one is still answered 502 / 504. The ClientHello
         # comes after the 200, so a refused hello leaves that connection opened with no byte sent on it.
@@ -1254,8 +1282,11 @@ class Front:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _refuse(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, r: Refused) -> None:
-        self._log({"event": "refused", "refused": r.name, "detail": r.detail})
+    async def _refuse(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, r: Refused,
+                      target: Optional[bytes] = None) -> None:
+        """Answer ``r`` and log it; a refused CONNECT's line also names its host (:func:`refused_host_fields`)."""
+        self._log({"event": "refused", "refused": r.name, "detail": r.detail,
+                   **(refused_host_fields(target) if target is not None else {})})
         body = r.name.encode() + b"\n"
         writer.write(b"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
                      b"X-Levain-Refused: %s\r\nConnection: close\r\n\r\n%s"
