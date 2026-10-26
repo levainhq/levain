@@ -829,8 +829,9 @@ def _attempt_room(queue_dir: Path) -> None:
                           "nothing was signed, try again later", 429)
 
 
-def _begin_attempt(queue_dir: Path, request_id: str, attempt: str) -> int:
-    """Record ``attempt`` as pending and return the descriptor holding its ``flock``: held for as long as its answer
+def _begin_attempt(queue_dir: Path, request_id: str, attempt: str, namespace: str | None = None) -> int:
+    """Record ``attempt`` as pending (with ``namespace``, the request's, when it is known: what a status read gates
+    on, :meth:`Signer.attempt`) and return the descriptor holding its ``flock``: held for as long as its answer
     runs, so a reader that can take the lock knows no answer is running for it. The lock is taken on the new file
     before it is linked into place, so no reader ever sees the record unlocked while its answer runs. A record already
     there (the attempt was answered, or a status read fenced it) is a 409: nothing is signed by this answer."""
@@ -839,7 +840,8 @@ def _begin_attempt(queue_dir: Path, request_id: str, attempt: str) -> int:
     _attempt_room(queue_dir)
     path, _ = _attempt_paths(queue_dir, request_id, attempt)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
-    text = json.dumps({"id": request_id, "attempt": attempt, "state": "pending", "at": utc_stamp(_now())}) + "\n"
+    text = json.dumps({"id": request_id, "attempt": attempt, "state": "pending", **_ns_field(namespace),
+                       "at": utc_stamp(_now())}) + "\n"
     try:
         fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError as exc:
@@ -889,12 +891,20 @@ def _proof(queue_dir: Path, request_id: str, attempt: str) -> "dict[str, Any] | 
     return out
 
 
-def _settle_attempt(queue_dir: Path, request_id: str, attempt: str, outcome: "dict[str, Any]") -> None:
-    """Write the attempt's final record (``outcome`` holds its state), replacing the pending one."""
+def _ns_field(namespace: object) -> "dict[str, str]":
+    """``{"request_namespace": namespace}`` for a record, or nothing when the namespace is not known."""
+    return {"request_namespace": namespace} if isinstance(namespace, str) else {}
+
+
+def _settle_attempt(queue_dir: Path, request_id: str, attempt: str, outcome: "dict[str, Any]",
+                    namespace: object = None) -> None:
+    """Write the attempt's final record (``outcome`` holds its state, ``namespace`` the request's as the pending
+    record kept it), replacing the pending one."""
     from levain.cockpit.consent import utc_stamp
 
     path, _ = _attempt_paths(queue_dir, request_id, attempt)
-    _write_over(path, json.dumps({"id": request_id, "attempt": attempt, **outcome, "at": utc_stamp(_now())}) + "\n")
+    _write_over(path, json.dumps({"id": request_id, "attempt": attempt, **outcome, **_ns_field(namespace),
+                                  "at": utc_stamp(_now())}) + "\n")
 
 
 def _settle_orphan(queue_dir: Path, request_id: str, attempt: str) -> "dict[str, Any] | None":
@@ -919,7 +929,7 @@ def _settle_orphan(queue_dir: Path, request_id: str, attempt: str) -> "dict[str,
             return now
         outcome = _proof(queue_dir, request_id, attempt) or {
             "state": "refused", "reason": "the cockpit stopped while this answer was running: nothing was signed"}
-        _settle_attempt(queue_dir, request_id, attempt, outcome)
+        _settle_attempt(queue_dir, request_id, attempt, outcome, now.get("request_namespace"))
         return _read_attempt(path)
     finally:
         os.close(fd)
@@ -1172,6 +1182,15 @@ class Signer:
         return request.namespace in self.namespaces or (
             request.refused is not None and namespace_problem(request.namespace) is not None)
 
+    def _namespace_ours(self, namespace: str) -> bool:
+        """:meth:`_ours` for a request known only by its namespace (what an attempt record keeps): the same answer,
+        since a request whose namespace :func:`namespace_problem` refuses is always read refused."""
+        if _levain_namespace(namespace):
+            return True
+        if not self.namespaces:
+            return False
+        return namespace in self.namespaces or namespace_problem(namespace) is not None
+
     def _open(self, request_id: str) -> SignRequest:
         """The request, refused unless it is open, unexpired, signable and in a namespace this port signs."""
         request = read_request(self.queue_dir, request_id)
@@ -1384,9 +1403,11 @@ class Signer:
         An optional ``attempt`` (an id the page made for this one answer, :data:`_ATTEMPT_ID`) is recorded as
         pending once its own id and the request id are well formed, before the answer is checked, and settled on every
         way out: ``signed`` with this reply, or
-        ``refused`` with the refusal's words; a refusal after which the signature store proves this attempt's signature
-        (a write that failed after the completion marker was linked) settles signed. :meth:`attempt` reads it. An
-        attempt already recorded is a 409: one attempt is one answer."""
+        ``refused`` with the refusal's words; a refusal of an answer that reached its own writes, after which the
+        signature store proves this attempt's signature (a write that failed after the completion marker was linked),
+        settles signed. A settle that fails is logged and the answer's own reply or refusal still goes out (the record
+        stays pending, and a status read settles it by the proof). The record keeps the request's namespace.
+        :meth:`attempt` reads it. An attempt already recorded is a 409: one attempt is one answer."""
         if not isinstance(req, dict) or "attempt" not in req:
             return self._answer(request_id, req, None)
         attempt = req["attempt"]
@@ -1396,26 +1417,45 @@ class Signer:
         if not request_id_ok(request_id):
             raise SignRefused("no such sign request", 404)
         _, mark_path = _attempt_paths(self.queue_dir, request_id, attempt)
+        wrote: list[bool] = []
 
-        def mark(signature: str) -> None:
-            # which signature this attempt is about to write, on disk before the .sig is: what a later reader proves by
+        def mark(signature: str | None) -> None:
+            # with a signature: which one this attempt is about to write, on disk before the .sig is (what a later
+            # reader proves by); with None: this answer is past every refusal and about to write the .sig
+            if signature is None:
+                wrote.append(True)
+                return
             _publish(_write_new, mark_path, hashlib.sha256(signature.encode("ascii")).hexdigest() + "\n",
                      f"attempt {attempt} already marked a signature")
 
-        fd = _begin_attempt(self.queue_dir, request_id, attempt)
+        try:
+            namespace: str | None = read_request(self.queue_dir, request_id).namespace
+        except SignRefused:
+            namespace = None                       # no request file: the answer is refused below, and recorded so
+
+        def settle(outcome: "dict[str, Any]") -> None:
+            try:
+                _settle_attempt(self.queue_dir, request_id, attempt, outcome, namespace)
+            except (OSError, SignRefused) as exc:  # the pending record stays: a status read settles it by the proof
+                _log.warning("attempt %s on %s was not settled: %s", attempt, request_id, exc)
+
+        def proved() -> "dict[str, Any] | None":
+            # only an answer that reached its own writes can be proved by the store: another answer of the same
+            # assertion marks the same signature, and its .sig is not this attempt's
+            return _proof(self.queue_dir, request_id, attempt) if wrote else None
+
+        fd = _begin_attempt(self.queue_dir, request_id, attempt, namespace)
         try:
             try:
                 result = self._answer(request_id, {k: v for k, v in req.items() if k != "attempt"}, mark)
             except SignRefused as exc:
-                outcome = _proof(self.queue_dir, request_id, attempt) or {"state": "refused", "reason": str(exc)}
-                _settle_attempt(self.queue_dir, request_id, attempt, outcome)
+                settle(proved() or {"state": "refused", "reason": str(exc)})
                 raise
             except BaseException as exc:
-                outcome = _proof(self.queue_dir, request_id, attempt) or {
-                    "state": "refused", "reason": f"the answer failed ({type(exc).__name__}): nothing was signed"}
-                _settle_attempt(self.queue_dir, request_id, attempt, outcome)
+                settle(proved() or {
+                    "state": "refused", "reason": f"the answer failed ({type(exc).__name__}): nothing was signed"})
                 raise
-            _settle_attempt(self.queue_dir, request_id, attempt, {"state": "signed", **result})
+            settle({"state": "signed", **result})
             return result
         finally:
             os.close(fd)
@@ -1427,7 +1467,10 @@ class Signer:
         ``unknown`` is a record that cannot be read: it says nothing either way. An attempt this server never saw is
         FENCED: recorded refused now, so its answer arriving later is refused (409) and "refused" stays true. A pending
         attempt whose answer is no longer running (its process stopped) is settled by what the signature store proves
-        (:func:`_settle_orphan`). 404 for a request that is not one this port signs."""
+        (:func:`_settle_orphan`). 404 for a request that is not one this port signs: a record is gated on the request
+        namespace it kept (so a settled answer still reads after its request file is gone), and only an attempt with no
+        record (one this read would fence) or a record that kept none reads the request file. A fence that never
+        reads back by the deadline reads ``unknown``."""
         import time
 
         from levain.cockpit.consent import utc_stamp
@@ -1438,19 +1481,39 @@ class Signer:
         problem = _attempt_problem(attempt)
         if problem is not None:
             raise SignRefused(problem, 400)
-        if not request_id_ok(request_id) or not self._ours(read_request(self.queue_dir, request_id)):
+        if not request_id_ok(request_id):
             raise SignRefused("no such sign request", 404)
+
+        def request() -> SignRequest:
+            found = read_request(self.queue_dir, request_id)
+            if not self._ours(found):
+                raise SignRefused("no such sign request", 404)
+            return found
+
         path, _ = _attempt_paths(self.queue_dir, request_id, attempt)
         deadline = time.monotonic() + ATTEMPT_WAIT_S
+        gated = False
         while True:
             found = _read_attempt(path)
+            if found is not None and not gated:
+                ns = found.get("request_namespace")
+                if isinstance(ns, str):
+                    if not self._namespace_ours(ns):
+                        raise SignRefused("no such sign request", 404)
+                else:
+                    request()                      # a record that kept no namespace: the request file decides
+                gated = True
             if found is None:
                 # the answer never reached this server (or has not yet): fence it, so "refused" stays true
+                if time.monotonic() >= deadline:
+                    found = {"state": "unknown"}
+                    break
+                ns = request().namespace
                 _attempt_room(self.queue_dir)
                 try:
                     _write_new(path, json.dumps({"id": request_id, "attempt": attempt, "state": "refused",
                                                  "reason": "this answer never reached the cockpit: nothing was signed",
-                                                 "at": utc_stamp(_now())}) + "\n")
+                                                 **_ns_field(ns), "at": utc_stamp(_now())}) + "\n")
                 except FileExistsError:
                     continue                       # its answer recorded it first: read that
                 except OSError as exc:
@@ -1470,9 +1533,10 @@ class Signer:
                         if isinstance(found.get(k), str)})
         return out
 
-    def _answer(self, request_id: str, req: Any, mark: "Callable[[str], None] | None") -> dict[str, Any]:
+    def _answer(self, request_id: str, req: Any, mark: "Callable[[str | None], None] | None") -> dict[str, Any]:
         """:meth:`answer` without the attempt record. ``mark`` (the attempt's) is told the signature after it verifies
-        and before anything is written."""
+        and before anything is written, and told None under the lock once every refusal is behind it, just before the
+        ``.sig`` is written."""
         from levain.authority import VerifierUnavailable, verify_link_sig
         from levain.cockpit.consent import utc_stamp
         from levain.consent.passkey import PasskeyError, answer_signature_problem, b64url_decode, to_sshsig
@@ -1527,6 +1591,8 @@ class Signer:
                 del self._challenged[request_id]
                 raise SignRefused(changed, 409)
             d, signed_at = sign_dir(self.queue_dir), utc_stamp(_now())
+            if mark is not None:
+                mark(None)
             record = {"signer_fp": key.fingerprint, "public_key": key.public_key, "namespace": request.namespace,
                       "message_sha256": hashlib.sha256(message).hexdigest(), "signed_at": signed_at}
             if bound[2] is not None:
