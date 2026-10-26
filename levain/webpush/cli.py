@@ -71,6 +71,12 @@ def _word(args: argparse.Namespace) -> int:
     except presence.PresenceError as e:
         print(f"levain ping {args.word}: {e}")
         return 2
+    try:   # a word can make held pings due (loud, away, remote, back, a quiet ended): start their push now
+        from levain.webpush import held
+
+        held.flush_if_due(qdir, throttle=False)
+    except Exception:  # noqa: BLE001 - the word is written; the next gate call or the server tick flushes
+        pass
     print(presence.describe(qdir))
     return 0
 

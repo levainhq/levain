@@ -458,6 +458,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
     if not isinstance(event, Mapping) or event.get("hook_event_name") != GATE_EVENT:
         return None
+    flush_held_pings(queue)   # first, so no return below (a halted session, limits, malformed) skips it
     tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
     session = event.get("session_id")
     has_session = isinstance(session, str) and bool(session)
@@ -481,7 +482,6 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         return _with_rulings(limited, queue, session)   # a late End on the limit reaches a halted Codex session
     try:
         send_repings(queue, settings)
-        flush_held_pings(queue)
     except Exception:
         pass  # a re-ping is a ping: it never fails the gate
     if still_away is None:

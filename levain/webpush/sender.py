@@ -133,14 +133,13 @@ def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body:
     """Record the ping (``command``: whether the notify command started for it, None when none is set), push it to each live subscription concurrently; returns (subscription id, HTTP status)
     pairs (status 0: no answer; :data:`UNKNOWN`: none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription, and so does a refusal that names the key (:class:`_Dead`). Every
     store write happens in this thread; the workers only talk to the push services. ``push=False`` pushes nothing; with
-    ``hold`` (the reason, see :meth:`PushStore.hold`) the recorded ping also waits in the held queue for
+    ``hold`` (the reason, see :meth:`PushStore.add_ping`) the recorded ping also waits in the held queue for
     :func:`levain.webpush.held.flush`."""
     qdir = Path(queue_dir)
     store = PushStore(qdir)
-    ping_id = store.add_ping(kind, ref, title, body, command)
+    # the ping row and its held row are one transaction: a ping is never recorded as held-for-later and then lost
+    ping_id = store.add_ping(kind, ref, title, body, command, hold=(url, hold) if hold and not push else None)
     if not push:   # the caller saw no live phone, or the presence rule held the push
-        if hold:
-            store.hold(ping_id, url, hold)
         return []
     return deliver(qdir, store, ping_id, kind=kind, ref=ref, title=title, body=body, url=url)
 

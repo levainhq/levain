@@ -11,7 +11,9 @@ Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newe
 - ``quiet [duration]`` and ``sleep`` are the only holding words. ``quiet`` mutes for its duration (default
   :data:`DEFAULT_SECS`, at most :data:`MAX_SECS`); an urgent ping still pushes through it. ``sleep`` mutes until the
   operator's next input at this machine after saying it (input is read from the macOS HID idle time: he has typed since
-  when ``now - idle`` is later than the word), urgent pings included.
+  when ``now - idle`` is later than the word), urgent pings included. With no idle reading (not macOS, or the read
+  failed) it cannot see his input, so it ends :data:`SLEEP_BLIND_SECS` after the word and ``levain ping status`` says the
+  idle source is unavailable.
 - ``loud [duration|off]`` turns pings on for its duration, over every other parameter, a mute included; only its timer,
   ``quiet`` or ``loud off`` ends it, never ``back``.
 - ``away`` pushes at once until input at this machine more than :data:`AWAY_GRACE_SECS` after it (a line typed just
@@ -40,7 +42,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["ACTIVE_WINDOW_SECS", "AWAY_GRACE_SECS", "DEFAULT_SECS", "MAX_SECS", "URGENT_KINDS", "WORDS", "Decision",
+__all__ = ["ACTIVE_WINDOW_SECS", "AWAY_GRACE_SECS", "DEFAULT_SECS", "MAX_SECS", "SLEEP_BLIND_SECS", "URGENT_KINDS", "WORDS", "Decision",
            "PresenceError", "decide", "describe", "parse_duration", "read_word", "set_word", "should_push"]
 
 ACTIVE_WINDOW_SECS = 5 * 60
@@ -48,6 +50,7 @@ AWAY_GRACE_SECS = 3 * 60
 DEFAULT_SECS = 60 * 60
 MAX_SECS = 24 * 3600
 MIN_SECS = 60
+SLEEP_BLIND_SECS = DEFAULT_SECS   # with no idle reading, `sleep` cannot see his next input: it ends this long after the word
 WORDS = ("away", "back", "sleep", "quiet", "loud", "remote")
 TIMED = ("quiet", "loud", "remote")
 # urgent = a ping about a request that holds an agent until the operator answers: the hook's wait (``consent``, the
@@ -135,7 +138,8 @@ def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = 
     if _active(word, "loud", now):
         return Decision(True, "pushing", "loud: pings on until its timer ends, over every other parameter")
     seen = None if idle is None else now - max(0.0, idle)   # when he last did something here
-    if word and word["word"] == "sleep" and not (seen is not None and seen > word["ts"]):
+    if word and word["word"] == "sleep" and (now < word["ts"] + SLEEP_BLIND_SECS if seen is None
+                                             else not seen > word["ts"]):
         return Decision(False, "muted", "sleep: nothing is pushed until his next input here, urgent pings included", "sleep")
     if urgent:
         return Decision(True, "pushing", "urgent")
@@ -222,7 +226,16 @@ def describe(queue_dir: Path | str, *, now: float | None = None,
     pings are held for the phone."""
     ts = time.time() if now is None else now
     word = read_word(queue_dir)
-    d = should_push(queue_dir, "ping", now=ts, idle=idle)
+    try:
+        if idle is None:
+            from levain.consent.auto_away import input_idle_seconds as idle
+        reading = idle()
+    except Exception:  # noqa: BLE001 - no reading: the rule reads the desk as inactive
+        reading = None
+    d = should_push(queue_dir, "ping", now=ts, idle=lambda: reading)
+    if word is not None and word["word"] == "sleep" and reading is None and ts < word["ts"] + SLEEP_BLIND_SECS:
+        end = time.strftime("%H:%M", time.localtime(word["ts"] + SLEEP_BLIND_SECS))
+        d = Decision(d.push, d.state, f"{d.why}; idle source unavailable, so sleep ends at {end}", d.by)
     on_file = "no word" if word is None else (word["word"] if "until" not in word else
                                               f"{word['word']} until {time.strftime('%H:%M', time.localtime(word['until']))}")
     from levain.webpush import held

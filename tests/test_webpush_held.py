@@ -196,3 +196,204 @@ def test_the_send_child_flushes_held_pings_after_a_push_but_not_after_a_held_one
     assert run({**base, "push": False, "hold": "active"}) == 0 and flushed == [tmp_path]
     assert run({**base, "push": False, "hold": 3}) == 2   # a hold that is not a word is refused
     assert child.main(["flush", "--queue-dir", str(tmp_path)]) == 0 and flushed == [tmp_path, tmp_path]
+
+
+# --- fix round r1: H1 (release only on success, leased claim), H2, H3, H4, H5, H6 --------------------------------------
+
+def _status(monkeypatch, status):
+    monkeypatch.setattr(sender, "_post", lambda req: status)
+
+
+def test_h1_a_push_that_failed_keeps_the_ping_held_until_the_lease_ends_then_retries_it(tmp_path, monkeypatch):
+    from levain.webpush.store import HELD_LEASE_SECS
+
+    _phone(tmp_path)
+    _fake(monkeypatch)
+    _hold(tmp_path, "active")
+    at = NOW
+    for bad in (0, sender.UNKNOWN, 500):
+        _status(monkeypatch, bad)
+        assert held.flush(tmp_path, now=at, idle=lambda: INACTIVE) == 0
+        assert held.count(tmp_path) == 1
+        at += HELD_LEASE_SECS + 1   # past the lease: the next flush may retry it
+    _status(monkeypatch, 201)
+    assert held.flush(tmp_path, now=at, idle=lambda: INACTIVE) == 1
+    assert held.count(tmp_path) == 0
+
+
+def test_h1_a_claim_inside_its_lease_is_not_taken_by_a_second_flush(tmp_path, monkeypatch):
+    from levain.webpush.store import HELD_LEASE_SECS
+
+    _phone(tmp_path)
+    _fake(monkeypatch)
+    _hold(tmp_path, "active")
+    store = PushStore(tmp_path)
+    [item] = store.held_items(now=NOW)
+    assert store.claim_held([item["ping_id"]], now=NOW) == [item["ping_id"]]
+    assert store.claim_held([item["ping_id"]], now=NOW + 5) == []
+    assert store.held_items(now=NOW + 5) == []
+    assert held.count(tmp_path) == 1   # still held: status says so
+    assert store.claim_held([item["ping_id"]], now=NOW + HELD_LEASE_SECS + 1) == [item["ping_id"]]
+
+
+def test_h1_a_delivery_that_raises_keeps_that_ping_and_the_rest_still_go(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    _fake(monkeypatch)
+    _hold(tmp_path, "active", ref="question:1", body="one")
+    _hold(tmp_path, "active", ref="question:2", body="two")
+    real = sender.deliver
+
+    def deliver(qdir, store, ping_id, **kw):
+        if kw["body"] == "one":
+            raise RuntimeError("boom")
+        return real(qdir, store, ping_id, **kw)
+
+    monkeypatch.setattr(sender, "deliver", deliver)
+    assert held.flush(tmp_path, now=NOW, idle=lambda: INACTIVE) == 1
+    assert held.count(tmp_path) == 1   # "one" stays held; "two" went
+
+
+def test_h1_a_summary_that_raises_does_not_lose_the_held_pings(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    sent = _fake(monkeypatch)
+    set_word(tmp_path, "quiet", duration="10", now=NOW)
+    _hold(tmp_path, "quiet", body="kept")
+    real = sender.send
+
+    def send(qdir, **kw):
+        if kw["kind"] == "summary":
+            raise RuntimeError("summary down")
+        return real(qdir, **kw)
+
+    monkeypatch.setattr(sender, "send", send)
+    assert held.flush(tmp_path, now=NOW + 700, idle=lambda: ACTIVE) == 1
+    assert held.count(tmp_path) == 0 and b"kept" in sent[0]
+
+
+def test_h2_the_ping_row_and_the_held_row_are_one_transaction(tmp_path):
+    import sqlite3
+
+    _hold(tmp_path, "active")   # creates the store
+    db = tmp_path / "webpush" / "webpush.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TRIGGER no_more_held BEFORE INSERT ON held BEGIN SELECT RAISE(ABORT, 'full'); END")
+    conn.commit()
+    conn.close()
+    before = len(PushStore(tmp_path).record())
+    try:
+        _hold(tmp_path, "active", ref="question:2")
+    except Exception:
+        pass
+    else:
+        raise AssertionError("the held insert failed and send did not")
+    assert len(PushStore(tmp_path).record()) == before   # no ping row without its held row
+
+
+from tests.test_consent_queue import authority, clock, keys, queue  # noqa: E402,F401
+
+
+def _ct(monkeypatch, mod, name="flush_held_pings"):
+    calls = []
+    monkeypatch.setattr(mod, name, lambda q: calls.append(q.directory))
+    return calls
+
+
+def test_h3_the_claude_code_gate_flushes_on_a_limit_return_and_when_repings_raise(queue, monkeypatch):
+    from pathlib import Path
+
+    from levain.consent.adapters import claude_code as cc
+
+    calls = _ct(monkeypatch, cc)
+    monkeypatch.setattr(cc, "_limits", lambda *a, **kw: {"limited": True})
+    ev = {"hook_event_name": cc.GATE_EVENT, "tool_name": "Write", "tool_input": {"file_path": "/w/x"}, "cwd": "/w",
+          "session_id": "s1"}
+    assert cc.gate(ev, queue, cc.AdapterSettings(), home=Path("/home/u")) == {"limited": True}
+    assert calls == [queue.directory]
+    malformed = {"hook_event_name": cc.GATE_EVENT, "tool_name": "Write", "tool_input": {}, "cwd": "/w"}
+    cc.gate(malformed, queue, cc.AdapterSettings(), home=Path("/home/u"))
+    assert len(calls) == 2
+    monkeypatch.setattr(cc, "_limits", lambda *a, **kw: None)
+    monkeypatch.setattr(cc, "send_repings", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("x")))
+    try:
+        cc.gate(ev, queue, cc.AdapterSettings(), home=Path("/home/u"))
+    except Exception:
+        pass
+    assert len(calls) == 3
+
+
+def test_h3_the_codex_gate_flushes_for_a_halted_session_and_a_limit_return(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from levain.consent.adapters import codex as cx
+    from levain.consent import ConsentQueue, authority_source
+
+    calls = _ct(monkeypatch, cx)
+    queue = ConsentQueue(tmp_path / "q", authority=authority_source(tmp_path / "q", anchor=None))
+    ev = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": "/work/p",
+          "session_id": "s1", "turn_id": "t1", "tool_use_id": "c1"}
+    monkeypatch.setattr(queue, "is_halted", lambda agent, session: 1)
+    cx.gate(ev, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    assert calls == [queue.directory]
+    monkeypatch.setattr(queue, "is_halted", lambda agent, session: None)
+    monkeypatch.setattr(cx, "_limits", lambda *a, **kw: {"limited": True})
+    cx.gate(ev, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    assert len(calls) == 2
+
+
+def _word_cli(tmp_path, word, duration=None):
+    import argparse
+
+    from levain.webpush import cli
+
+    return cli._word(argparse.Namespace(queue_dir=tmp_path, word=word, duration=duration))
+
+
+def test_h4_a_word_that_changes_the_rule_starts_a_flush_of_what_is_now_due(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    _fake(monkeypatch)
+    _hold(tmp_path, "active")
+    started = []
+    monkeypatch.setattr(held.subprocess, "Popen", lambda argv, **kw: started.append(argv))
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: ACTIVE)
+    assert _word_cli(tmp_path, "quiet", "30m") == 0 and started == []   # a mute releases nothing
+    assert _word_cli(tmp_path, "loud", "30m") == 0
+    assert len(started) == 1 and "flush" in started[0]
+
+
+def test_h5_a_burst_of_due_checks_starts_one_flush_child(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    _hold(tmp_path, "active")
+    started = []
+    monkeypatch.setattr(held.subprocess, "Popen", lambda argv, **kw: started.append(argv))
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: INACTIVE)
+    results = [held.flush_if_due(tmp_path) for _ in range(5)]
+    assert results == [True, False, False, False, False] and len(started) == 1
+
+
+def test_h5_a_flush_already_running_makes_a_second_one_stand_down(tmp_path, monkeypatch):
+    import fcntl
+    import os
+
+    _phone(tmp_path)
+    sent = _fake(monkeypatch)
+    _hold(tmp_path, "active")
+    fd = os.open(tmp_path / "webpush" / "flush.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        assert held.flush(tmp_path, now=NOW, idle=lambda: INACTIVE) == 0
+        assert held.count(tmp_path) == 1 and sent == []
+    finally:
+        os.close(fd)
+    assert held.flush(tmp_path, now=NOW, idle=lambda: INACTIVE) == 1
+
+
+def test_h6_sleep_without_an_idle_reading_ends_at_a_bound_and_status_says_so(tmp_path):
+    from levain.webpush.presence import SLEEP_BLIND_SECS
+
+    set_word(tmp_path, "sleep", now=NOW)
+    word = presence.read_word(tmp_path)
+    assert presence.decide(NOW + 60, word, None, urgent=True).push is False
+    assert presence.decide(NOW + SLEEP_BLIND_SECS + 1, word, None, urgent=True).push is True
+    text = presence.describe(tmp_path, now=NOW + 60, idle=lambda: None)
+    assert "idle source unavailable" in text
+    assert "idle source unavailable" not in presence.describe(tmp_path, now=NOW + 60, idle=lambda: 5000.0)
