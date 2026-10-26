@@ -15,6 +15,18 @@ from tests.autonomic_test_only_confinement import test_only_confined_executor  #
 from tests.autonomic_test_only_coverage import test_only_every_effect_covered  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+def _vendor_installed(monkeypatch):
+    """Every test that reaches ``start``'s ``vendor`` step runs against a store with no vendor prefix, so the step
+    passes here; tests/test_slot_vendorbin.py tests the real check (and re-patches ``vendor_ready`` where it runs
+    ``start`` against it). A test that blocks the module's import (``sys.modules`` entry None) never reaches it."""
+    try:
+        import levain.slot.start as _start
+    except ImportError:
+        return
+    monkeypatch.setattr(_start, "vendor_ready", lambda host, vendor: None)
+
+
 LIVE_SEATBELT_ENV = "LEVAIN_LIVE_SEATBELT"
 LIVE_SEATBELT_REASON = (
     f"applies a LIVE macOS Seatbelt profile on this host, off unless {LIVE_SEATBELT_ENV}=1: a hand-written Seatbelt "

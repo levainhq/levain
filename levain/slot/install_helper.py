@@ -675,6 +675,7 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         new = gen_mod.InstallShape(target, versions[0], versions[1], txn, dict(noted), _shape_of(desired))
         return gen_mod.write_record_durably(shape_path, gen_mod.shape_text(new))
 
+    vendor_failed: list[str] = []
     steps: list[Step] = [
         # FIRST (§25): the exact allocation, before anything is made, so an interrupted run re-plans it.
         intent_write_step(host, intent),
@@ -693,6 +694,9 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         *pool_config_steps(host, cmd.slots, cmd.verifier_slots),
         *restart,
         *root_tree.tree_steps(host, package, h11_dir=h11_dir, generation=target, current=current),
+        # The vendor CLIs a session execs, COPIED into the prefix tree_steps made (head ruling 1026+8). A failed copy
+        # does not stop setup here: the report step after the units prints it as skipped (ruling V23).
+        *root_tree.vendor_steps(host, cmd.operator, failed=vendor_failed),
         *confinement,
         # Before the first start: each service's started_after threshold (row 33 §2.5).
         Step("note each service's started_after threshold (before the first start)", call=note),
@@ -702,6 +706,9 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         # Each slot's §3.5 Pool state once everything the slot needs is in place, before the rule that lets
         # prepare run (prepare picks only from these).
         *slot_state_steps(host, alloc.slots),
+        # Setup's report is allow_fail (ruling V23): a copy that fails on every run is printed as skipped and never
+        # keeps the sudoers rules, the install record or the operator record from being written.
+        root_tree.vendor_report_step(vendor_failed, allow_fail=True),
         *sudoers_steps(host, cmd.operator),
         # Row 33 §2.5: the install record before the operator record; setup's completion is still the latter.
         Step(f"write the install record {shape_path} (completed_txn {txn})", call=record),
@@ -1713,6 +1720,7 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     if finished is not None:
         steps.append(Step(f"remove the finished repair journal {INTENT_PATH[host]} (its txn is install-shape's "
                           "completed_txn)", (root_tree._tools(host)["rm"], "-f", str(INTENT_PATH[host]))))
+    vendor_failed: list[str] = []
     F = functools.partial(_faulted, fault)
     if continuing is None:                          # phase B starts at R4b: phase A journalled R1-R3
         steps += F("R1", [intent_write_step(host, first)])                                        # R1
@@ -1735,10 +1743,16 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
         steps += F("R9", [root_tree.flip_step(host, target,                                       # R9
                                               fault=(lambda pt: fault("R9", pt)) if fault else None)])
     steps += F("R10", [*root_tree.entry_steps(host),                                              # R10
-                       *removals("R10")])           # R1b: entries after the flip (their sudoers rule went at R5)
+                       *removals("R10"),            # R1b: entries after the flip (their sudoers rule went at R5)
+                       # the vendor CLIs re-copied, so a vendor updated since the last repair reaches the slot;
+                       # a failed copy does not stop R11/R12: the report step after them fails the run (ruling V6)
+                       *root_tree.vendor_steps(host, operator, failed=vendor_failed),
+                       # the versions the copies kept, removed only with no session live (ruling V18)
+                       *vendor_prune_steps(host, failed=vendor_failed)])
     steps += F("R11", sudoers_steps(host, operator))                                              # R11
     steps += F("R12", [*removals("R12"),            # R1b: the removed units' files
-                       *units.install_steps(host, services)])                                     # R12
+                       *units.install_steps(host, services),                                     # R12
+                       root_tree.vendor_report_step(vendor_failed)])
     if rf.legacy or gen_change:
         steps += F("R13", [root_tree.gc_step(host, keep)])                                        # R13
     steps += F("R14", [Step(f"write the install record {shape_path} (completed_txn {run_txn}, last host act)",
@@ -1922,6 +1936,41 @@ def live_lease_sessions(sessions: Path) -> tuple[str, ...]:
         except (Refused, OSError):
             live.append(name[:-len(".json")])
     return tuple(live)
+
+
+def vendor_prune_live(store: Path) -> tuple[str, ...]:
+    """The live-session evidence :func:`levain.slot.root_tree.prune_vendor` reads (head ruling V18): this run's
+    :meth:`Quiesce.live` when it holds ``L/slots/pool.lock`` (the same count preflight's ``live-lease`` refusal took,
+    under the hold that keeps a ``prepare`` from leasing beneath the prune). With no ``pool.lock`` no ``prepare`` can
+    lease, so the session records' ``lease_live`` (:func:`live_lease_sessions`) are the evidence. A ``pool.lock``
+    this process does not hold counts as live: nothing keeps a lease from starting beneath the prune."""
+    L = Path(store)
+    q = _QUIESCING.get(_store_key(L))
+    if q is not None and q.held:
+        return q.live()
+    if os.path.lexists(L / "slots" / "pool.lock"):
+        return (f"{L / 'slots' / 'pool.lock'} not held by this run",)
+    return live_lease_sessions(L / "sessions")
+
+
+def vendor_prune_steps(host: HostOS, *, store: Path | None = None, failed: list | None = None) -> list[Step]:
+    """One step per versioned vendor package: :func:`levain.slot.root_tree.prune_vendor` with
+    :func:`vendor_prune_live`, read when the step runs. ``allow_fail``: a prune never stops the plan. ``failed`` is
+    the sink :func:`levain.slot.root_tree.vendor_steps` appends a failed or indeterminate copy's line to (each line
+    starts ``<name>:``): a unit with a line there is not pruned, because the previous version may still be the one a
+    crash restores (head ruling V25)."""
+    L = Path(store) if store is not None else STORE[host]
+    sink = failed if failed is not None else []
+
+    def prune(name: str) -> Callable[[], tuple[bool, str]]:
+        def run() -> tuple[bool, str]:
+            if any(str(line).startswith(f"{name}:") for line in sink):
+                return True, (f"{name}: every version kept (this run's copy of {name} did not finish durably, so "
+                              "the previous version may be the one a crash restores)")
+            return root_tree.prune_vendor(host, name, live=lambda: vendor_prune_live(L))
+        return run
+    return [Step(f"remove the old versions of root's {name} copy in {root_tree.VENDOR_PREFIX[host]} (only with no "
+                 "session live)", call=prune(name), allow_fail=True) for name in root_tree.VENDOR_UNITS]
 
 
 def count_live_leases(sessions: Path) -> int:
