@@ -1,4 +1,4 @@
-"""WF-1b fix round 1 (head rulings W1, W2 on the L3 r1 review): a user-written CONNECT route that admits a shipped
+"""WF-1b fix round 1 (head rulings W1, W2 on the L3 r1 review): a user-written egress route that admits a shipped
 ``egress-default`` host wins (the merge omits that host from ``egress-default`` and says so); a clash between two
 routes the merge does not ship is refused naming both routes and the ``base.json`` remedy, by the merge and by
 ``routes-egress`` alike; a CONNECT route naming one host twice is refused by keys' own parser."""
@@ -30,7 +30,7 @@ def _routes_base(L):
     return got, err.getvalue()
 
 
-# --- W1: the user's CONNECT route wins over egress-default ---------------------------------------------------------------
+# --- W1: the user's egress route wins over egress-default ---------------------------------------------------------------
 
 @pytest.mark.parametrize("fmt", ["levain-routes-base/1", VR.BASE_FORMAT])
 def test_the_pre_wf1b_map_with_a_users_pypi_route_merges(L, fmt):
@@ -91,11 +91,17 @@ def test_every_shipped_host_on_a_users_route_ships_no_egress_default(L):
     assert sum("route mine" in x for x in err.splitlines()) == len(F3)
 
 
-def test_a_users_passthrough_route_wins_too(L):
-    _write_map(L, [{"route": "sub", "type": "subscription_passthrough", "hosts": ["github.com"]}])
-    _routes_base(L)
-    parsed = P.parse_base_map(_read_map(L))
-    assert "github.com" not in parsed["egress-default"].hosts
+def test_a_users_passthrough_route_on_a_shipped_host_is_refused(L):
+    # head ruling on f1 observation 9: only an egress route (every session carries it) wins a shipped host; a
+    # passthrough route reaches only the sessions that pick it, so trimming would take pypi.org from the others
+    _write_map(L, [{"route": "sub", "type": "subscription_passthrough", "hosts": ["pypi.org"]}])
+    before = (L / "routes" / "base.json").read_bytes()
+    with pytest.raises(Refused) as e:
+        _routes_base(L)
+    assert e.value.name == "base-map-unmergeable"
+    d = e.value.detail
+    assert "host pypi.org is on routes egress-default and sub" in d and "edit route sub in base.json" in d
+    assert (L / "routes" / "base.json").read_bytes() == before
 
 
 # --- W1: a clash the merge cannot resolve is refused naming both routes and base.json ------------------------------------

@@ -14,8 +14,9 @@ route can fall back, ``Codec.checks_answered_model``) a response naming another 
 model's row (3c-9, ``levain.broker.codec.answered_other``).
 
 The merge is by route id: every shipped id is replaced whole by its shipped entry, every other entry of the map is
-kept as written. The operator's route wins over ``egress-default``: a host one of the map's own CONNECT routes already
-admits is left off ``egress-default`` and named (:func:`_shipped_for`). The result is parsed by
+kept as written. The operator's route wins over ``egress-default``: a host one of the map's own ``egress`` routes already
+admits is left off ``egress-default`` and named (:func:`_shipped_for`); any other route of the map on a shipped host
+is a clash, refused. The result is parsed by
 :func:`levain.broker.policy.parse_base_map` (keys' own parser) and checked by :func:`connect_host_clashes` before root
 writes it, so root never writes a map keys would refuse or a map whose egress hosts the front would refuse in every
 session.
@@ -136,13 +137,15 @@ class MergeRefused(ValueError):
 
 def _shipped_for(kept: Sequence[object]) -> Tuple[List[dict], List[str]]:
     """``(the shipped routes for a map keeping ``kept``, one note per omitted host)``. The user's route wins: a host
-    that a kept CONNECT route (``egress`` or ``subscription_passthrough``) already admits is left off
-    ``egress-default`` (the host stays reachable through that route, in the sessions that carry it: every interactive
-    session for an ``egress`` route, ``supervisor.pick_routes``), and an ``egress-default`` with no host left is
-    not shipped. ``kept`` entries are parsed by the caller; a malformed one is skipped here."""
+    that a kept ``egress`` route already admits is left off ``egress-default`` (every interactive session carries
+    every egress route, ``supervisor.pick_routes``, so the host stays reachable everywhere), and an
+    ``egress-default`` with no host left is not shipped. A ``subscription_passthrough`` (or brokered) route does not
+    win: only the sessions that pick it carry it, so trimming would take the host from the rest; that clash is left
+    for :func:`connect_host_clashes` to refuse. ``kept`` entries are parsed by the caller; a malformed one is skipped
+    here."""
     owner: Dict[str, str] = {}
     for entry in kept:
-        if type(entry) is dict and entry.get("type") in P.CONNECT_TYPES and type(entry.get("hosts")) is list:
+        if type(entry) is dict and entry.get("type") == "egress" and type(entry.get("hosts")) is list:
             for h in entry["hosts"]:
                 if type(h) is str:
                     owner.setdefault(h, entry["route"])
@@ -165,7 +168,7 @@ def merge(doc: object) -> Tuple[dict, List[str], List[str]]:
     absent, merged as the empty map). A ``/1`` map is carried to ``/2``: its egress and passthrough entries are the
     same objects in both formats; a ``/1`` brokered entry that is not a vendor id has no price table and is refused
     ``base-map-unmergeable`` (the operator's own brokered route is never rewritten by root). A host the map's own
-    CONNECT route admits is left off ``egress-default``, one note each (:func:`_shipped_for`). The result is parsed by
+    egress route admits is left off ``egress-default``, one note each (:func:`_shipped_for`). The result is parsed by
     keys' parser and checked by :func:`connect_host_clashes`; a refusal there is ``base-map-unmergeable`` too."""
     if doc is None:
         doc = {"format": BASE_FORMAT, "routes": []}
