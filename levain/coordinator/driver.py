@@ -219,6 +219,9 @@ class ScriptedSession:
         # request_id -> the request.subtype of every inbound control_request not yet answered or rejected, recorded
         # on arrival before anything else sees the request (§8.1); the scripted vendor's raw key IS its request_id
         self._inbound: dict[str, str] = {}
+        # request_id -> "writing" while its one reply is being written, "ambiguous" once a write failed after its
+        # bytes may have left; either way no second reply is written for it
+        self._replying: dict[str, str] = {}
         self.received: list[str] = []       # every raw inbound line, as the vendor sent it
 
     # --- the scripted vendor -------------------------------------------------------------------------------------
@@ -248,6 +251,9 @@ class ScriptedSession:
         line = json.dumps({"type": "control_request", "request_id": request_id, "request": request}, sort_keys=True)
         digest = "sha256:" + hashlib.sha256(line.encode("utf-8")).hexdigest()
         with self._lock:
+            # a replayed id keeps its first subtype: re-registering it would move it across the one door (§8.1)
+            if self._inbound.get(request_id, subtype) != subtype:
+                raise ValueError(f"request {request_id[:40]} is already pending as {self._inbound[request_id][:40]}")
             self._inbound[request_id] = subtype
             self.received.append(line)
         if subtype == APPROVAL_SUBTYPE:
@@ -261,12 +267,20 @@ class ScriptedSession:
         self._write_line({"op_id": command.op_id, "text": command.text, "mode": command.mode,
                           "expected_turn_id": command.expected_turn_id})
 
-    def _write_line(self, line: dict[str, Any]) -> None:
+    @staticmethod
+    def _frame(line: dict[str, Any]) -> str:
+        """``line`` as the transport writes it; a line JSON cannot hold raises here, before any byte leaves."""
+        return json.dumps(line, sort_keys=True) + "\n"
+
+    def _write_line(self, line: dict[str, Any], text: str | None = None) -> None:
+        """Hand ``line`` (framed as ``text``, else framed here) to the transport (``written``), then append it to the
+        log. A raise after the framing is a write whose bytes may have left."""
+        text = self._frame(line) if text is None else text
         self.written.append(line)
         if self._log is not None:
             fd = os.open(self._log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             try:
-                os.write(fd, (json.dumps(line, sort_keys=True) + "\n").encode("utf-8"))
+                os.write(fd, text.encode("utf-8"))
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -315,31 +329,66 @@ class ScriptedSession:
 
     def answer(self, command: ApprovalAnswer) -> CommandResult:
         """Frame the service's reply with the transport id and write it once. An id this session holds no request
-        for is ``no_such_request``; one whose recorded subtype is not an approval raises (nothing is written)."""
-        with self._lock:
-            subtype = self._inbound.get(command.raw_vendor_key)
+        for is ``no_such_request``; one whose recorded subtype is not an approval raises (nothing is written). The
+        request is forgotten only after its write succeeded (:meth:`_reply_once`)."""
+        key = command.raw_vendor_key
+        line = {"type": "control_response", "response": {"subtype": "success", "request_id": key,
+                                                          "response": dict(command.reply)}}
+
+        def check(subtype: str | None) -> CommandResult | None:
             if subtype is None:
                 return CommandResult("no_such_request", "the scripted vendor holds no such request")
             if subtype != APPROVAL_SUBTYPE:
-                raise ValueError(f"request {command.raw_vendor_key[:40]} is {subtype[:40]}, not an approval")
-            del self._inbound[command.raw_vendor_key]
-        self._write_line({"type": "control_response", "response": {
-            "subtype": "success", "request_id": command.raw_vendor_key, "response": dict(command.reply)}})
-        return CommandResult("confirmed", "answered")
+                raise ValueError(f"request {key[:40]} is {subtype[:40]}, not an approval")
+            return None
+
+        return self._reply_once(key, line, check, CommandResult("confirmed", "answered"))
 
     def reject_control(self, request_id: str, text: str) -> CommandResult:
-        """Write the error literal (:func:`_control_error`) to a recorded non-approval request and forget it. An id
-        not recorded raises ``ValueError("no such inbound request")``; a recorded ``can_use_tool`` raises too: no
-        approval, a deny included, leaves the one door (§8.1)."""
-        with self._lock:
-            subtype = self._inbound.get(request_id)
+        """Write the error literal (:func:`_control_error`) to a recorded non-approval request and forget it once the
+        write succeeded. An id not recorded raises ``ValueError("no such inbound request")``; a recorded
+        ``can_use_tool`` raises too: no approval, a deny included, leaves the one door (§8.1)."""
+        def check(subtype: str | None) -> CommandResult | None:
             if subtype is None:
                 raise ValueError("no such inbound request")
             if subtype == APPROVAL_SUBTYPE:
                 raise ValueError("a can_use_tool request is answered only through the one door, never rejected here")
+            return None
+
+        return self._reply_once(request_id, _control_error(request_id, text), check,
+                                CommandResult("confirmed", "rejected with the error literal"))
+
+    def _reply_once(self, request_id: str, line: dict[str, Any], check: Callable[[str | None], CommandResult | None],
+                    done: CommandResult) -> CommandResult:
+        """The one reply to an inbound request. ``line`` is already built (a reply that cannot be read raised before
+        this). A request whose reply is being written, or whose write failed after its bytes may have left, is
+        ``ambiguous`` and gets no second write. Otherwise ``check`` (the recorded subtype) may refuse; the request is
+        marked writing, the line written, and only then forgotten. A line that cannot be framed leaves it answerable;
+        a write that raised after the framing leaves it ``ambiguous``."""
+        with self._lock:
+            if request_id in self._replying:
+                return CommandResult("ambiguous", f"a reply to request {request_id[:40]} is being written or may "
+                                                  "already have reached the vendor")
+            refused = check(self._inbound.get(request_id))
+            if refused is not None:
+                return refused
+            self._replying[request_id] = "writing"
+        try:
+            text = self._frame(line)
+        except BaseException:
+            with self._lock:
+                del self._replying[request_id]
+            raise
+        try:
+            self._write_line(line, text)
+        except Exception as exc:  # noqa: BLE001 - the line reached the transport; whether it left is unknown
+            with self._lock:
+                self._replying[request_id] = "ambiguous"
+            return CommandResult("ambiguous", f"the reply may have reached the vendor ({type(exc).__name__})")
+        with self._lock:
+            del self._replying[request_id]
             del self._inbound[request_id]
-        self._write_line(_control_error(request_id, text))
-        return CommandResult("confirmed", "rejected with the error literal")
+        return done
 
     def interrupt(self, command: InterruptCommand) -> CommandResult:
         return CommandResult("confirmed", "interrupted")

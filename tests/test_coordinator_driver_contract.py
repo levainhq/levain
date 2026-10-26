@@ -7,6 +7,7 @@ import ast
 import hashlib
 import inspect
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -141,3 +142,92 @@ def test_driver_still_imports_nothing_from_consent():
     mods = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
     mods |= {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     assert not any(m.startswith("levain") for m in mods)
+
+
+# --- L3 r1 K5: a reply is forgotten only after its write; K8: an inbound id keeps its first subtype ----------------------
+class Unreadable(Mapping):
+    def __getitem__(self, key):
+        raise RuntimeError("unreadable reply")
+
+    def __iter__(self):
+        raise RuntimeError("unreadable reply")
+
+    def __len__(self):
+        return 1
+
+
+def test_answer_with_an_unreadable_reply_writes_nothing_and_stays_answerable():
+    s = ScriptedSession()
+    s.inbound("req-1", "can_use_tool", tool_name="Bash")
+    with pytest.raises(RuntimeError, match="unreadable"):
+        s.answer(answer("req-1", Unreadable()))
+    assert s.written == [] and s._inbound == {"req-1": "can_use_tool"}
+    assert s.answer(answer("req-1")) == CommandResult("confirmed", "answered")
+
+
+def test_answer_with_a_reply_that_cannot_be_framed_writes_nothing_and_stays_answerable():
+    s = ScriptedSession()
+    s.inbound("req-1", "can_use_tool", tool_name="Bash")
+    with pytest.raises(TypeError):
+        s.answer(answer("req-1", {"behavior": "deny", "message": {"not", "json"}}))
+    assert s.written == [] and s._inbound == {"req-1": "can_use_tool"}
+    assert s.answer(answer("req-1")).outcome == "confirmed"
+
+
+def test_reject_control_text_that_cannot_be_framed_writes_nothing_and_stays_rejectable():
+    s = ScriptedSession()
+    s.inbound("req-2", "hook_callback")
+    with pytest.raises(TypeError):
+        s.reject_control("req-2", object())
+    assert s.written == [] and s._inbound == {"req-2": "hook_callback"}
+    assert s.reject_control("req-2", "levain registers no SDK hooks").outcome == "confirmed"
+
+
+@pytest.mark.parametrize("subtype", ["can_use_tool", "elicitation"])
+def test_a_write_that_may_have_left_is_ambiguous_and_never_written_again(tmp_path, subtype):
+    # the line reached the transport (ScriptedSession.written), then its log write failed: the bytes may have left
+    s = ScriptedSession(log_path=tmp_path)                              # a directory: the log append raises
+    s.inbound("req-1", subtype, tool_name="Bash")
+
+    def reply():
+        return s.answer(answer("req-1")) if subtype == "can_use_tool" else s.reject_control("req-1", "no")
+
+    got = reply()
+    assert got.outcome == "ambiguous" and len(s.written) == 1
+    again = reply()
+    assert again.outcome == "ambiguous" and len(s.written) == 1           # never a second reply
+    assert s._inbound == {"req-1": subtype}
+
+
+def test_a_reply_in_flight_is_not_written_twice():
+    class Reentrant(ScriptedSession):
+        nested = None
+
+        def _write_line(self, line, text=None):
+            if self.nested is None:
+                self.nested = self.answer(answer("req-1"))               # a second reply while the first is writing
+            super()._write_line(line, text)
+
+    s = Reentrant()
+    s.inbound("req-1", "can_use_tool", tool_name="Bash")
+    assert s.answer(answer("req-1")).outcome == "confirmed"
+    assert s.nested.outcome == "ambiguous" and len(s.written) == 1 and s._inbound == {}
+
+
+def test_inbound_replay_with_another_subtype_is_refused():
+    s = ScriptedSession()
+    s.inbound("req-1", "hook_callback")
+    with pytest.raises(ValueError, match="already"):
+        s.inbound("req-1", "can_use_tool", tool_name="Bash")
+    assert s._inbound == {"req-1": "hook_callback"} and len(s.received) == 1
+    assert [e.kind for e in s.read(None).events] == ["error"]
+    with pytest.raises(ValueError, match="not an approval"):
+        s.answer(answer("req-1"))
+    assert s.reject_control("req-1", "levain registers no SDK hooks").outcome == "confirmed"
+
+
+def test_inbound_replay_with_the_same_subtype_keeps_the_record():
+    s = ScriptedSession()
+    s.inbound("req-1", "can_use_tool", tool_name="Bash")
+    s.inbound("req-1", "can_use_tool", tool_name="Bash")
+    assert s._inbound == {"req-1": "can_use_tool"}
