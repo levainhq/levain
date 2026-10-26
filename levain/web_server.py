@@ -120,7 +120,8 @@ from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, Ver
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.consent.grant_phone import grant_route
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
-from levain.http_guards import _WRITE_SEC_FETCH_ALLOWED as _SAME_ORIGIN, LISTEN_BACKLOG, GuardedHandler
+from levain.http_guards import _CSP, _WRITE_SEC_FETCH_ALLOWED as _SAME_ORIGIN, LISTEN_BACKLOG, GuardedHandler
+from levain.sign_request_id import ID as _SIGN_REQUEST_ID
 from levain.http_guards import host_header_allowed  # the off-box read gate; importable here since before 2026-10-03
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
@@ -255,6 +256,26 @@ _SIGN_ONE_SUFFIX = ".json"
 # beside a Signer: without one every path here is 404, and the page's revoke button copies the terminal line.
 _GRANT_LIST_PATH = "/cockpit/grant/list.json"
 _GRANT_PREFIX = "/cockpit/grant/"
+# ONESURFACE OS-1: the sign sheet, GET /sign/<id> (a sign request id), a static shell whose one script is /sign.js; what
+# it shows and signs are the routes above. Served only beside a Signer. It alone may be framed, and only by its own
+# origin (the cockpit's overlay, Q2): the one policy http_guards stamps, with frame-ancestors 'self' in place of 'none'.
+_SHEET_PREFIX = "/sign/"
+_SHEET_PAGE = "sign.html"
+_SHEET_CSP = _CSP.replace("frame-ancestors 'none'", "frame-ancestors 'self'")
+if _SHEET_CSP == _CSP:     # pragma: no cover - a reworded policy must not leave the sheet unframable by surprise
+    raise ImportError("levain.web_server: the shared CSP names no frame-ancestors 'none' for the sheet to replace")
+# The cockpit page that shows the sheet over itself may frame its own origin (default-src 'none' refuses any frame);
+# it stays unframable itself.
+_COCKPIT_PAGE = "/"
+_COCKPIT_PAGE_CSP = _CSP + "; frame-src 'self'"
+
+
+def _sheet_id(path: str) -> "str | None":
+    """The request id of ``GET /sign/<id>``, else None."""
+    rid = path[len(_SHEET_PREFIX):] if path.startswith(_SHEET_PREFIX) else ""
+    return rid if _SIGN_REQUEST_ID.fullmatch(rid) is not None else None
+
+
 # one extra Host value (make_server extra_hosts): a DNS name or IPv4 literal and an optional trailing dot, never a port
 _EXTRA_HOST = re.compile(r"(?=[^:]{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
                          r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?")
@@ -526,6 +547,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/pair": ("pair.html", "text/html; charset=utf-8"),
     "/pair.js": ("pair.js", "text/javascript; charset=utf-8"),
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
+    # The sign sheet's script (OS-1): its page is GET /sign/<id>, served by _route beside a Signer.
+    "/sign.js": ("sign.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -550,7 +573,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
 _RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
-                                       _GRANT_PREFIX)
+                                       _GRANT_PREFIX, _SHEET_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -990,6 +1013,27 @@ class _Handler(GuardedHandler):
     server: _LevainHTTPServer  # narrow the type for typed attribute access
     _credential_cache: Any = _UNSET
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
+    # (Content-Security-Policy, X-Frame-Options) in place of http_guards' for this one response (send_header), else None
+    _frame_headers: "tuple[str, str] | None" = None
+
+    def send_header(self, keyword: str, value: str) -> None:
+        """The security headers as http_guards stamps them, except on the two responses of the sign sheet's overlay
+        (OS-1, Q2): the sheet's own page, which its own origin may frame (``frame-ancestors 'self'``, ``SAMEORIGIN``),
+        and the cockpit page that frames it (``frame-src 'self'``, itself still unframable)."""
+        if self._frame_headers is not None:
+            if keyword == "Content-Security-Policy":
+                value = self._frame_headers[0]
+            elif keyword == "X-Frame-Options":
+                value = self._frame_headers[1]
+        super().send_header(keyword, value)
+
+    def _send_framing(self, frame_headers: "tuple[str, str]", *args: Any, **kw: Any) -> None:
+        """``_send`` with ``frame_headers`` on this response only."""
+        self._frame_headers = frame_headers
+        try:
+            self._send(*args, **kw)
+        finally:
+            self._frame_headers = None
 
     def _cross_site_pair_navigation(self) -> bool:
         """P2 L3 r1 F1: a pair link opened from webmail or another site is a top-level ``GET /pair`` navigation and
@@ -997,8 +1041,10 @@ class _Handler(GuardedHandler):
         with no data (its code rides the fragment, its claim is a same-origin POST), so ``_route`` lets exactly this
         request past the cross-site refusal, Host check kept. Exact raw path, GET only, a document navigation only: a
         cross-site fetch, subresource or frame of it, HEAD, ``/pair?..`` and every other path stay refused; framing is
-        refused anyway (X-Frame-Options DENY)."""
-        return (self.command == "GET" and self.path == "/pair"
+        refused anyway (X-Frame-Options DENY). The sign sheet ``GET /sign/<id>`` is the same class (OS-1: a sign link
+        opened from a message or a mail page; a static shell whose reads are same-origin and gated), exact raw path too;
+        a cross-site frame of it is refused here, its own-origin frame is what its headers admit."""
+        return (self.command == "GET" and (self.path == "/pair" or _sheet_id(self.path) is not None)
                 and self.headers.get("Sec-Fetch-Site") == "cross-site"
                 and self.headers.get("Sec-Fetch-Mode") == "navigate"
                 and self.headers.get("Sec-Fetch-Dest") == "document")
@@ -1338,8 +1384,9 @@ class _Handler(GuardedHandler):
                                    "origin": origin}, 200
             else:
                 row = signer.row(one, signers)
-                payload, status = (({"request": row, "signers": signers, "credentials": credentials, "origin": origin},
-                                    200) if row is not None
+                # `rp_id`: the name a passkey record in the browser is kept under (the sign sheet writes and reads it there)
+                payload, status = (({"request": row, "signers": signers, "credentials": credentials, "origin": origin,
+                                     "rp_id": signer.rp_id}, 200) if row is not None
                                    else ({"error": "not_open", "message": "this sign request is not open"}, 404))
             if note is not None and status == 200:
                 payload["note"] = note
@@ -1351,6 +1398,15 @@ class _Handler(GuardedHandler):
             self.server.request_gate.release()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
+
+    def _serve_sheet(self, *, head: bool) -> None:
+        """``GET /sign/<id>`` (OS-1): the sign sheet's page, the same bytes for every id (the id is read from the path
+        by ``/sign.js``), framable only by this origin. Without a signer, 404."""
+        if self.server.signer is None:
+            self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
+            return
+        self._send_framing((_SHEET_CSP, "SAMEORIGIN"), self.server.levain_assets[_SHEET_PAGE], "text/html; charset=utf-8",
+                           head=head)
 
     def _sign_read_admitted(self, *, head: bool, what: str) -> bool:
         """The sign reads' gate past ``_route`` (the sign listing's and the grant listing's, one code path): same-origin
@@ -1841,6 +1897,11 @@ class _Handler(GuardedHandler):
         # Strip any query string; route on the bare path against the allowlist.
         path = self.path.split("?", 1)[0]
 
+        # The sign sheet: a static shell, token-free like the app shell (its reads carry the token), and like every
+        # sign route 404 without a signer.
+        if _sheet_id(path) is not None:
+            self._serve_sheet(head=head)
+            return
         # The sign listing runs the write gate's own checks (a token on every bind), stricter than the off-box gate
         # below, so it is routed before it; without a signer it is 404 to everyone (the route's name is public).
         if path == _SIGN_LIST_PATH or _sign_one(path) is not None:
@@ -2081,7 +2142,11 @@ class _Handler(GuardedHandler):
         asset = _ASSETS.get(path)
         if asset is not None:
             filename, content_type = asset
-            self._send(self.server.levain_assets[filename], content_type, head=head)
+            if path == _COCKPIT_PAGE:
+                self._send_framing((_COCKPIT_PAGE_CSP, "DENY"), self.server.levain_assets[filename], content_type,
+                                   head=head)
+            else:
+                self._send(self.server.levain_assets[filename], content_type, head=head)
             return
 
         # Downstream-registered static assets (cached bytes, ungated — same class as the
@@ -2809,6 +2874,7 @@ def make_server(
                          "read-only source given no write_token or surface_tokens); pass a write_token")
 
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
+    assets[_SHEET_PAGE] = load_web_asset(_SHEET_PAGE).encode("utf-8")
     httpd = _LevainHTTPServer((host, port), _Handler)
     httpd.levain_source = source
     httpd.levain_assets = assets

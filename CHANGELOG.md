@@ -7,6 +7,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **The cockpit signs in an overlay sheet.** A sign card opens `/sign/<id>` over the cockpit; the sheet shows the one
+  request, freezes a written answer when you tap Sign and shows the exact line being signed, then the line that was
+  signed. Before asking for a passkey it checks that a key enrolled for the cockpit may sign the request, and says what
+  is needed when none may. If a reply is lost it reads the request twice, about a second and a half apart, and unlocks
+  only if it is still open both times; closing mid-signature says it is not confirmed and checks first. Escape closes the
+  sheet (not mid-composition), Tab cannot reach the cockpit behind it, and a cockpit that stops answering is given up on.
+  The sheet is the only page the cockpit lets be framed, and only by its own origin.
 - **The cockpit's `!N` badge breathes when a new decision waits on you.** It pulses for about half a minute, then sits
   still; it does not pulse at all when your system asks for reduced motion.
 - **`levain binding policy create|renew|revoke|list` signs the graduation policies** that let a standing binding run
