@@ -268,20 +268,56 @@ def test_a_file_with_no_final_newline_gains_one(L, keys):
     ("pk", None),           # a passkey's material as the laptop key
     ("a", "b"),             # an ssh key as a passkey
     ("a", "ec"),            # an ecdsa ssh key as a passkey (not an sk key)
+    ("a", "sshsk"),         # an OpenSSH FIDO key (application ssh:) as a passkey
 ])
 def test_a_key_custody_problem_refuses_is_refused_before_any_write(L, keys, laptop, passkey):
-    argv = _enrol_argv("phill", keys[laptop][0], *([keys[passkey][0]] if passkey else []))
+    pk = _ssh_sk_key(b"ssh:") if passkey == "sshsk" else keys[passkey][0] if passkey else None
+    argv = _enrol_argv("phill", keys[laptop][0], *([pk] if pk else []))
     lock = _Lock()
     with pytest.raises(Refused) as e:
         _act(L, argv, lock=lock)
     assert e.value.name == "authority-signer-key" and lock.calls == [] and not _path(L).exists()
 
 
-def test_the_admitted_laptop_types_are_the_custody_tables():
-    """The laptop rule asks ``custody_problem`` itself; this names what it admits so a change to the table is seen."""
-    admitted = {t for t in sorted(authority._LAPTOP_KEY_TYPES | {"ssh-rsa", "ecdsa-sha2-nistp384"})
-                if IH.authority_key_problem(f"{t} AAAA", passkey=False) is None}
-    assert admitted == set(authority._LAPTOP_KEY_TYPES)
+def _ssh_sk_key(application: bytes) -> str:
+    """An ``sk-ecdsa`` key line with ``application`` (an OpenSSH FIDO key's is ``ssh:...``), on a real P-256 point."""
+    import base64
+    import struct
+
+    def string(b: bytes) -> bytes:
+        return struct.pack(">I", len(b)) + b
+    point = base64.b64decode(" ".join(WebAuthnKey().public_key.split()[:2]).split()[1])
+    # the passkey stand-in's own curve and point, its application replaced
+    w = IH._Wire(point)
+    w.string()
+    curve, q = w.string(), w.string()
+    blob = string(IH.PASSKEY_KEY_TYPE.encode()) + string(curve) + string(q) + string(application)
+    return f"{IH.PASSKEY_KEY_TYPE} {base64.b64encode(blob).decode()}"
+
+
+def test_the_custody_rule_root_holds_is_the_authority_logs(keys):
+    """Root imports no authority store, so :func:`IH.authority_key_problem` is written there; it admits exactly what
+    ``levain.authority.custody_problem`` admits: a laptop key some stated laptop custody takes, a passkey that is
+    custody ``passkey`` for a display-phone key with a passkey's material."""
+    samples = [keys[n][0] for n in ("a", "ec", "rsa", "pk", "pk2")] + [
+        _ssh_sk_key(b"ssh:"), _ssh_sk_key(b"ssh:levain"), "sk-ssh-ed25519@openssh.com AAAA", "ecdsa-sha2-nistp384 AAAA",
+        "ecdsa-sha2-nistp256 AAAA", "ssh-dss AAAA"]
+    for key in samples:
+        t = key.split()[0]
+        laptop = any(authority.custody_problem(authority.LAPTOP, c, t, public_key=key) is None
+                     for c in authority.CUSTODIES if c != authority.UNSTATED)
+        phone = (authority.custody_problem(authority.DISPLAY_PHONE, authority.PASSKEY, t, public_key=key) is None
+                 and authority.custody_mismatch(key, authority.PASSKEY) is None)
+        assert (IH.authority_key_problem(key, passkey=False) is None) == laptop, key
+        assert (IH.authority_key_problem(key, passkey=True) is None) == phone, key
+        assert IH.is_passkey_material(key) == authority.is_passkey_material(key), key
+    assert IH.authority_key_problem(keys["pk"][0], passkey=True) is None
+    assert IH.authority_key_problem(_ssh_sk_key(b"ssh:"), passkey=False) is None
+
+
+def test_the_namespaces_and_passkey_type_are_the_readers():
+    assert IH.AUTHORITY_NAMESPACE == AUTHORITY_NAMESPACE and IH.CONFIRM_NAMESPACE == confirm.NAMESPACE
+    assert authority._CUSTODY_KEY_TYPES[authority.PASSKEY] == {IH.PASSKEY_KEY_TYPE}
 
 
 def test_an_ecdsa_laptop_key_enrols(L, keys):

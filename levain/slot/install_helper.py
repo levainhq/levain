@@ -35,9 +35,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, ClassVar, ContextManager, Iterable, Iterator, Mapping, Optional, Sequence, TextIO, Tuple
 
-from levain import authority as _authority
-from levain.autonomic import confirm as _confirm
-from levain.autonomic.coverage import AUTHORITY_NAMESPACE, authority_keys, parse_root_signers
+from levain.authority_sig import NAMESPACE as AUTHORITY_NAMESPACE, _Wire
 from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HandsSetupError, HostOS, Step, _abs, _kill_all, host_os, run_plan
 from levain.launch import child_env
@@ -2796,28 +2794,55 @@ def run_routes_trust(caller_uid: int, host: HostOS, *, read: Callable[[int], byt
 # --- enrol-authority-signer / remove-authority-signer (14b DESIGN_REV2 S5, DESIGN_REV3 §7) --------------------------
 
 SIGNER_VERBS = ("enrol-authority-signer", "remove-authority-signer")
+#: The confirm gate's namespace (``levain.autonomic.confirm.NAMESPACE``; a test holds the two equal). Root imports
+#: neither ``levain.authority`` nor ``levain.autonomic`` (``tests/test_ci_root_closure.py``), so the custody rule below
+#: is written here too, held equal to ``levain.authority.custody_problem`` by the tests.
+CONFIRM_NAMESPACE = "levain-confirm"
+#: The one key type a WebAuthn passkey is (``levain.authority``'s custody table entry for ``passkey``).
+PASSKEY_KEY_TYPE = "sk-ecdsa-sha2-nistp256@openssh.com"
 #: DECISION: the most root's allowed-signers file may hold for these verbs to read it.
 AUTHORITY_SIGNERS_MAX = 256 * 1024
 _BLOB_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 
 
+def is_passkey_material(public_key: str) -> bool:
+    """``levain.authority.is_passkey_material``, written here (root imports no authority store; a test holds the two
+    equal): a :data:`PASSKEY_KEY_TYPE` key whose application is a web rpId, where an OpenSSH FIDO key's is ``ssh:``."""
+    import base64
+    import struct
+
+    parts = public_key.split()
+    if len(parts) < 2 or parts[0] != PASSKEY_KEY_TYPE:
+        return False
+    try:
+        wire = _Wire(base64.b64decode(parts[1], validate=True))
+        if wire.string() != PASSKEY_KEY_TYPE.encode("ascii"):
+            return False
+        wire.string()                  # curve
+        wire.string()                  # point
+        application = wire.string()
+        wire.end()
+    except (ValueError, struct.error):
+        return False
+    return not application.startswith(b"ssh:")
+
+
 def authority_key_problem(public_key: str, *, passkey: bool) -> str | None:
     """Why ``public_key`` may not be enrolled with root, or None: the authority log's own custody rule
-    (``levain.authority.custody_problem``), so root lists no key the log would refuse to enrol. The laptop key
-    (``passkey`` False): some custody the rule admits for a laptop-presence key (``unstated`` aside: it is for a
-    carried legacy key, and this line is a new enrolment). A ``--passkey``: custody ``passkey`` for a display-phone
-    key, and its material is a passkey's (``levain.authority.custody_mismatch``)."""
+    (``levain.authority.custody_problem``; the tests hold this equal to it), so root lists no key the log would refuse
+    to enrol. The laptop key (``passkey`` False): a type some stated laptop-presence custody admits
+    (:data:`TRUST_KEY_TYPES`, the custody table's union) and not a passkey's material. A ``--passkey``: a
+    :data:`PASSKEY_KEY_TYPE` key whose material is a passkey's."""
     key_type = public_key.split()[0]
     if passkey:
-        return (_authority.custody_problem(_authority.DISPLAY_PHONE, _authority.PASSKEY, key_type,
-                                           public_key=public_key)
-                or _authority.custody_mismatch(public_key, _authority.PASSKEY))
-    if any(_authority.custody_problem(_authority.LAPTOP, c, key_type, public_key=public_key) is None
-           for c in _authority.CUSTODIES if c != _authority.UNSTATED):
+        if not is_passkey_material(public_key):
+            return f"not a WebAuthn passkey (a {PASSKEY_KEY_TYPE} key made on a web origin)"
         return None
-    if _authority.is_passkey_material(public_key):
+    if is_passkey_material(public_key):
         return "the key is a WebAuthn passkey: name it with --passkey, never as the laptop key"
-    return f"no custody the authority log admits for a {_authority.LAPTOP} key takes a {key_type} key"
+    if key_type not in TRUST_KEY_TYPES:
+        return f"no laptop-presence custody takes a {key_type} key (one of {', '.join(sorted(TRUST_KEY_TYPES))})"
+    return None
 
 
 def blob_fingerprint(public_key: str) -> str | None:
@@ -2937,7 +2962,7 @@ def run_authority_signer(cmd: InstallCommand, caller_uid: int, host: HostOS, *,
         if fp != blob_fingerprint(key):
             raise Refused("authority-signer-verifier", f"ssh-keygen names {fp} for a key whose blob hashes to "
                                                        f"{blob_fingerprint(key)}")
-        ns = (AUTHORITY_NAMESPACE, _confirm.NAMESPACE) if cmd.confirm and not passkey else (AUTHORITY_NAMESPACE,)
+        ns = (AUTHORITY_NAMESPACE, CONFIRM_NAMESPACE) if cmd.confirm and not passkey else (AUTHORITY_NAMESPACE,)
         wanted.append((key, ns, fp))
     new = {key: _signer_text(cmd.principal, ns, key) for key, ns, _ in wanted}
     with lock():
@@ -2954,11 +2979,6 @@ def run_authority_signer(cmd: InstallCommand, caller_uid: int, host: HostOS, *,
                     placed.add(k)
         out.extend(new[k] for k, _, _ in wanted if k not in placed)
         data = _signers_bytes(out)
-        # the reader's own parse of what is about to be written: each key listed, in its namespaces
-        listed = {s.key: s.namespaces for s in parse_root_signers(data)}
-        if not all(listed.get(k) == frozenset(ns) for k, ns, _ in wanted) or not {k for k, _, _ in wanted} <= \
-                authority_keys(parse_root_signers(data)):
-            raise Refused("authority-signer-line", "the coverage reader would not list the new lines as written")
         written = _write_signers(path, data, err, fsync)
     for _, ns, fp in wanted:
         errw.write(f"levain install-helper: {fp} enrolled in {path} for {','.join(ns)}; compare it with "
