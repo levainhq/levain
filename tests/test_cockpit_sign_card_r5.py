@@ -93,14 +93,14 @@ def test_h2_an_answer_that_never_left_reads_open_and_only_then_the_card_comes_ba
             {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
             {"eval": f"{OPTION_B}.click() || 1"},
             {"until": f"/not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
-            {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 5000},
+            {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 8000},
             {"eval": OPEN % QRID},
             {"eval": f"{OPTION_B}.click() || 1"},
             {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
         ])
     v = out["values"]
     assert str(v[5]).startswith("not sure this was signed"), v[5]
-    assert "still reads open" in v[6] and "nothing was signed" in v[6], v[6]   # said once the read came back
+    assert "still reads open" in v[6] and "second read" in v[6], v[6]   # said once the second read came back
     assert v[7] is True                                   # it was open: nothing had been signed
     assert rig.verifies(QRID)                             # and the card signed it on the next tap
 

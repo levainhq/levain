@@ -4724,8 +4724,8 @@
   }
   // The passkey prompt for `fp` on rpId `rp` (the challenge's), `pk` without allowCredentials: asks for `rawId`'s passkey
   // when that id decodes, else for none (the OS's own list), never a throw. An id this browser remembered that does not
-  // decode is forgotten; one the authenticator refuses (NotAllowedError, which a passkey since removed reads as) is
-  // forgotten and asked once more with no id
+  // decode is forgotten; one the authenticator refuses (NotAllowedError, which a passkey since removed reads as, and a
+  // cancel too) is asked once more with no id, and stays remembered until a passkey signs (signKeep replaces it)
   function signAsk(pk, rp, fp, rawId) {
     const local = !!rawId && typeof rp === "string" && signMine(rp)[fp] === rawId;
     const id = rawId && signDecodable(rawId) ? signUnb64u(rawId) : null;
@@ -4734,7 +4734,6 @@
       allow ? { allowCredentials: [{ type: "public-key", id: allow }] } : {}) });
     return ask(id).catch((e) => {
       if (!(e && e.name === "NotAllowedError" && id && local)) throw e;
-      signForget(rp, fp);
       return ask(null);
     });
   }
@@ -4799,7 +4798,7 @@
     say(choice !== undefined ? "asking for the challenge for (" + choice + ")…" : "asking for the challenge…");
     return signCall(base + "challenge", body).then((c) => {
       if (!c.ok) { say(signWhy(c), "bad"); return { done: "unsigned" }; }
-      if (!signDecodable(c.body.challenge)) { say("the cockpit sent a malformed challenge; nothing was signed", "bad"); return { done: "unsigned" }; }
+      if (!c.body || !signDecodable(c.body.challenge)) { say("the cockpit sent a malformed challenge; nothing was signed", "bad"); return { done: "unsigned" }; }
       // the exact line the signature appends, from the server's bytes: what is shown is what is signed
       if (typeof c.body.line === "string") line = c.body.line;
       say("confirm with your passkey to sign…" + (line ? " " + line : ""));
@@ -4840,6 +4839,8 @@
     const signers = Array.isArray(listing.signers) ? listing.signers : [];
     const rp = (listing.origin || "").replace(/^https?:\/\//, "").replace(/:\d+$/, "");
     const local = signMine(rp);
+    // an entry that cannot be an id (empty, null, not text) names no passkey: it is dropped before it decides who signs
+    for (const k of Object.keys(local)) if (!signDecodable(local[k])) { signForget(rp, k); delete local[k]; }
     const held = listing.credentials && typeof listing.credentials === "object" ? listing.credentials : {};
     const idOf = (fp) => (Object.prototype.hasOwnProperty.call(local, fp) ? local[fp]
       : (Object.prototype.hasOwnProperty.call(held, fp) && held[fp] && typeof held[fp].credential_id === "string"
@@ -4925,21 +4926,28 @@
           .then((out) => {
             done = out.done;
             // only a signature spends the words. "Not sure" keeps them and every button frozen until a read of the
-            // request by its id shows the same version still open (so nothing was signed); anything else leaves the card
+            // request by its id shows the same version still open twice running; anything else leaves the card
             // frozen and says so, and the board reads again below (a redrawn card offers the words only if still open)
             if (out.done === "signed") { signWriteIns.delete(id); rearm = false; return undefined; }
             if (out.done === "unsigned") { if (freeze) freeze.release(); return undefined; }
             rearm = false;
             const said = (signNotes.get(id) || [""])[0];
-            return signOne(id).then((one) => {
-              if (one.request && one.request.sha256 === r.sha256 && !one.request.refused) {
+            const readOne = () => Promise.resolve().then(() => signOne(id)).catch((e) => ({ error: "the read failed (" + ((e && e.name) || "error") + ")" }));
+            const stillOpen = (one) => !!one.request && one.request.sha256 === r.sha256 && !one.request.refused;
+            const settled = (one) => say(said + (one.error ? "; where it stands could not be read (" + one.error + ")"
+              : one.request ? "; the request changed while it was being signed" : "; the request is no longer open")
+              + ": the board reads it again", "bad");
+            // one open read does not show nothing was signed: the answer may still be verifying. The card stays frozen,
+            // and comes back only if a second read, after the board's own delay, finds the same version still open
+            return readOne().then((first) => {
+              if (!stillOpen(first)) return settled(first);
+              say(said + "; the request reads open now; not confirmed", "bad");
+              return new Promise((res) => setTimeout(res, 1500)).then(readOne).then((second) => {
+                if (!stillOpen(second)) return settled(second);
                 rearm = true;
                 if (freeze) freeze.release();
-                return say(said + "; the request still reads open on this version, so nothing was signed: sign it again", "bad");
-              }
-              say(said + (one.error ? "; where it stands could not be read (" + one.error + ")"
-                : one.request ? "; the request changed while it was being signed" : "; the request is no longer open")
-                + ": the board reads it again", "bad");
+                return say(said + "; the request still reads open on a second read: sign it again", "bad");
+              });
             });
           })
           .catch(() => { /* the ceremony said what happened; the lease is released below */ })
@@ -4951,7 +4959,7 @@
             // a signed (or not-knowable) answer may have closed the request: the board reads again (a row its caller has
             // answered leaves). A definite "nothing was signed" changed nothing, so nothing is read again under the operator
             const t = window.LevainCockpitTransport;
-            if (done !== "unsigned" && t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
+            if (done !== "unsigned" && !rearm && t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
           });
       };
       const options = Array.isArray(r.options) ? r.options : [];
