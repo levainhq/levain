@@ -230,6 +230,16 @@ def test_a_concurrent_launch_waits_on_an_in_flight_ping_and_retries_when_it_fail
 _real_kill = os.kill
 
 
+def _describe_children(pids) -> list[str]:
+    """Each pid as `pid ppid pgid state command` from `ps`, which lists a zombie on macOS and Linux alike (Linux's
+    pgrep lists one too; macOS's does not): what a leftover child of this process is, named in the failure."""
+    if not pids:
+        return []
+    out = subprocess.run(["ps", "-o", "pid=,ppid=,pgid=,stat=,command=", "-p", ",".join(str(p) for p in pids)],
+                         capture_output=True, text=True).stdout
+    return [" ".join(line.split()) for line in out.splitlines()] or [f"{p}: gone by the time ps ran" for p in pids]
+
+
 def _record_signals(monkeypatch, proc: subprocess.Popen) -> list:
     """Record every non-zero signal sent by pid (``kill``) or by group (``killpg``), with the Popen's returncode."""
     sent: list = []
@@ -442,7 +452,10 @@ def test_run_a_real_launch_whose_stop_egress_fails_once(tmp_path, monkeypatch):
     assert second.cli == first.cli and second.complete and second.failures == ()
     assert second.egress.glue_exit == 0 and second.egress.final_flush is not None and len(stops) == 2
     assert not t.exists() and _members(proc.pid) == []
-    assert {p.pid for p in _node_children()} <= before and dm.service_threads() == []
+    left = {p.pid for p in _node_children()} - before
+    print(f"RUN l5node children left: {_describe_children(sorted(left))}")
+    assert not left, _describe_children(sorted(left))
+    assert dm.service_threads() == []
 
 
 # --- chatint (`1025-25/cdfix3/VERIFY_ALL.md`, complement N1): the Linux group wait reads /proc --------------------
