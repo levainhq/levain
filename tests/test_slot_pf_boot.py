@@ -1,0 +1,231 @@
+"""The ``com.levain.pf`` boot one-shot (CONTRACT §23, §24): after a reboot pf is disabled, the ``com.apple/levain``
+anchor is empty and lo0 has none of the slots' ``127.0.1.x`` aliases (measured in r3c10-vm 10-26, adoptvm RETURN
+"Environment notes"), so every session start refused ``firewall-open`` / ``loopback-alias-down`` until an operator
+redid them by hand. The unit was in :data:`levain.slot.units.SERVICES` with no program, so setup and repair printed
+``pending: ... com.levain.pf not installed`` and installed nothing.
+
+Plan and program assertions run against fakes; nothing here touches pf, lo0 or launchd."""
+from __future__ import annotations
+
+import os
+import subprocess
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+
+from levain.slot import Refused, pf, service_boot, units
+from levain.slot.ids import SlotId, loopback_alias
+from levain.slot.services import pf as PS
+
+ROOT = Path(__file__).resolve().parents[1]
+EGRESS = (SlotId("egress", 0), SlotId("egress", 1))
+VERIFY = (SlotId("none", 0),)
+
+
+# --- the reproduced failure: setup / repair installed no com.levain.pf ---------------------------------------------
+
+
+def test_the_pf_program_exists_so_setup_installs_the_unit():
+    have, pending = units.built_services("darwin", ROOT / "levain")
+    assert "pf" in {s.name for s in have}
+    assert not [p for p in pending if "com.levain.pf" in p], pending
+
+
+def test_linux_has_no_pf_unit():
+    have, _ = units.built_services("linux", ROOT / "levain")
+    assert "pf" not in {s.name for s in have}
+
+
+def test_the_unit_runs_this_program_as_root_and_is_retried_only_on_failure():
+    import plistlib
+
+    svc = units.by_name("pf")
+    job = plistlib.loads(units.launchd_plist_text(svc).encode())
+    assert job["UserName"] == "root" and job["RunAtLoad"] is True
+    assert job["KeepAlive"] == {"SuccessfulExit": False}
+    assert job["ProgramArguments"][-1] == "pf"
+    # service-entry runs levain.slot.services.<name> for a root service with no run-dir wait
+    assert svc.user == "root" and "pf" not in service_boot.RUN_DIR_OF
+
+
+# --- boot_steps ---------------------------------------------------------------------------------------------------
+
+
+def test_boot_steps_are_setups_aliases_then_the_recorded_rules_then_the_enable_reference():
+    steps = pf.boot_steps(EGRESS + VERIFY)
+    aliases = pf.alias_steps(EGRESS + VERIFY)
+    assert steps[:len(aliases)] == aliases
+    assert [s.argv[3] for s in aliases] == [loopback_alias(s) for s in EGRESS]   # verifier pairs get none
+    rest = steps[len(aliases):]
+    assert [s.why for s in rest] == [
+        f"load the recorded rules {pf.ANCHOR_FILE} into the pf anchor {pf.ANCHOR}",
+        f"create {pf.PF_TOKEN.parent}",
+        f"take pf's enable reference, its token kept in {pf.PF_TOKEN}",
+    ]
+    # the one-shot never writes the rules file: only setup, replenish and repair do
+    assert not [s for s in steps if s.write is not None]
+
+
+def test_setups_load_and_enable_steps_are_unchanged():
+    ids, uid = {}, 3987            # the darwin slot range, counted down (test_slot_s2fx4_macos's _ids)
+    for s in EGRESS:
+        for name in s.accounts:
+            ids[name], uid = uid, uid - 1
+    steps = pf.load_steps(EGRESS, ids)
+    assert [s.why for s in steps[1:]] == [f"load the rules into the pf anchor {pf.ANCHOR}",
+                                          f"create {pf.PF_TOKEN.parent}",
+                                          f"take pf's enable reference, its token kept in {pf.PF_TOKEN}"]
+    assert steps[1].argv == ("/sbin/pfctl", "-o", "none", "-a", "com.apple/levain", "-f", "/etc/pf.anchors/levain")
+
+
+class _Pfctl:
+    def __init__(self, rc=0, err=""):
+        self.rc, self.err, self.calls = rc, err, []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, self.rc, "", self.err)
+
+
+def _rules(tmp_path: Path, text: str = pf.ANCHOR_HEADER + " (test)\nblock out quick proto tcp user 1\n",
+           mode: int = 0o644) -> Path:
+    p = tmp_path / "levain"
+    p.write_text(text)
+    os.chmod(p, mode)
+    return p
+
+
+def _as_root_owner(monkeypatch):
+    """The rules file in tmp is this test's; read it as root's (the check under test is the header and the mode)."""
+    real = os.fstat
+
+    def fstat(fd):
+        st = real(fd)
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, *tuple(st)[6:10]))
+    monkeypatch.setattr(pf.os, "fstat", fstat)
+
+
+def test_load_recorded_anchor_loads_the_file_as_it_is(tmp_path, monkeypatch):
+    _as_root_owner(monkeypatch)
+    path, run = _rules(tmp_path), _Pfctl()
+    assert pf.load_recorded_anchor(path, run=run) == (True, "")
+    assert run.calls == [("/sbin/pfctl", "-o", "none", "-a", "com.apple/levain", "-f", str(path))]
+
+
+@pytest.mark.parametrize("text,mode,why", [
+    ("pass all\n", 0o644, "does not start with"),
+    (pf.ANCHOR_HEADER + "\n", 0o666, "writable by root alone"),
+])
+def test_load_recorded_anchor_refuses_a_file_that_is_not_levains(tmp_path, monkeypatch, text, mode, why):
+    _as_root_owner(monkeypatch)
+    run = _Pfctl()
+    ok, msg = pf.load_recorded_anchor(_rules(tmp_path, text, mode), run=run)
+    assert not ok and why in msg and "nothing loaded" in msg
+    assert run.calls == []
+
+
+def test_load_recorded_anchor_refuses_a_file_owned_by_another_user(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("as root the tmp file is root's")
+    run = _Pfctl()
+    ok, msg = pf.load_recorded_anchor(_rules(tmp_path), run=run)
+    assert not ok and "is not root's file" in msg and run.calls == []
+
+
+def test_load_recorded_anchor_refuses_a_link_and_a_missing_file(tmp_path):
+    run = _Pfctl()
+    target = _rules(tmp_path)
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    assert not pf.load_recorded_anchor(link, run=run)[0]
+    ok, msg = pf.load_recorded_anchor(tmp_path / "absent", run=run)
+    assert not ok and "cannot open" in msg
+    assert run.calls == []
+
+
+def test_load_recorded_anchor_reports_pfctls_failure(tmp_path, monkeypatch):
+    _as_root_owner(monkeypatch)
+    ok, msg = pf.load_recorded_anchor(_rules(tmp_path), run=_Pfctl(1, "syntax error"))
+    assert not ok and "syntax error" in msg
+
+
+def test_after_a_reboot_the_old_token_is_released_as_gone_and_the_new_one_kept(tmp_path):
+    """A reboot drops every pf reference, so the recorded token names one pf no longer knows: ``-E`` first (pf is then
+    enabled), and ``-X old`` answers ``pf: token invalid`` (measured, 1c VM row C21), which is released-as-gone."""
+    token = tmp_path / "pf.token"
+    token.write_text("111\n")
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(tuple(argv))
+        if argv[1] == "-E":
+            return subprocess.CompletedProcess(argv, 0, "", "pf enabled\nToken : 222\n")
+        return subprocess.CompletedProcess(argv, 1, "", "pf: token invalid\n")
+
+    assert pf.take_enable_reference(token, run=run)[0]
+    assert calls == [("/sbin/pfctl", "-E"), ("/sbin/pfctl", "-X", "111")]
+    assert token.read_text() == "222\n"
+
+
+# --- the program ----------------------------------------------------------------------------------------------------
+
+
+@contextmanager
+def _free():
+    yield 3
+
+
+@contextmanager
+def _busy():
+    raise Refused("install-busy", "another install-helper run holds the lock")
+    yield 3   # pragma: no cover
+
+
+def _main(run_rc: int = 0, **kw):
+    ran: list = []
+    args = dict(platform="darwin", euid=lambda: 0, lock=_free, slots=lambda: EGRESS,
+                run=lambda steps: (ran.append(list(steps)), run_rc)[1])
+    args.update(kw)
+    return PS.main([], **args), ran
+
+
+def test_main_runs_boot_steps_for_the_slots_in_service():
+    rc, ran = _main()
+    assert rc == 0
+    assert [s.why for s in ran[0]] == [s.why for s in pf.boot_steps(EGRESS)]
+
+
+def test_main_with_nothing_installed_exits_0_and_runs_nothing():
+    rc, ran = _main(slots=lambda: None)
+    assert rc == 0 and ran == []
+
+
+def test_main_while_an_install_verb_holds_the_lock_exits_tempfail_so_launchd_retries():
+    rc, ran = _main(lock=_busy)
+    assert rc == PS.EX_BUSY == 75 and ran == []
+
+
+def test_a_failed_step_exits_non_zero_so_launchd_retries():
+    rc, _ = _main(run_rc=1)
+    assert rc == 1
+
+
+def test_another_refusal_under_the_lock_exits_non_zero():
+    def slots():
+        raise Refused("bad-root", "/var/levain is a link")
+    rc, ran = _main(slots=slots)
+    assert rc == 1 and ran == []
+
+
+def test_main_refuses_a_non_root_caller_and_another_host():
+    assert _main(euid=lambda: 501)[0] == PS.EX_NOPERM
+    assert _main(platform="linux")[0] == PS.EX_CONFIG
+
+
+def test_installed_egress_slots_with_no_store_is_none(monkeypatch, tmp_path):
+    from levain.slot import runtime_helper as RH
+
+    real = RH.Seams
+    monkeypatch.setattr(RH, "Seams", lambda **kw: real(**{**kw, "store": tmp_path / "absent"}))
+    assert PS.installed_egress_slots() is None

@@ -5,11 +5,14 @@ tcp/udp only; ICMP is the profile's (§8.1). An egress slot may open tcp to its 
 its own lo0 alias, and nothing else; its alias is closed to every other uid. A verifier pair (driver
 and child) may open nothing. Rules name users by NUMERIC uid (§23). :func:`anchor_rules` is the ONE
 function that renders the rules; :func:`alias_steps` is the ONE list of alias Steps, shared by setup,
-replenish and the ``com.levain.pf`` boot one-shot (aliases do not survive a reboot).
+replenish and the ``com.levain.pf`` boot one-shot (:func:`boot_steps`: a reboot leaves pf disabled, the
+anchor empty and no alias on lo0).
 
 The rules load into the sub-anchor ``com.apple/levain``, which Apple's stock ``/etc/pf.conf`` already
 evaluates through ``anchor "com.apple/*"`` (§23). Levain never edits ``/etc/pf.conf`` and never reloads
-it: ``pfctl -f /etc/pf.conf`` flushes the main ruleset and every other service's dynamic anchors.
+it: ``pfctl -f /etc/pf.conf`` replaces the main ruleset other services may have changed. Apple's own
+``com.apple.pfctl`` job runs that reload at boot, in no order with the one-shot; a reload left the rules
+loaded in ``com.apple/levain`` in place [measured in r3c10-vm 10-26, lane pfboot raw m1].
 pf's enable reference is taken with ``pfctl -E`` and its token kept in :data:`PF_TOKEN`, so undo
 releases exactly that reference (``pfctl -X``) and pf stays enabled for whoever else enabled it.
 """
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Mapping
@@ -240,11 +244,64 @@ def load_steps(slots: Iterable[SlotId], ids: Mapping[str, int]) -> list[Step]:
         Step(f"write the pf rules {ANCHOR_FILE} (checked with pfctl -n)",
              write=(ANCHOR_FILE, anchor_text(slots, ids), 0o644),
              validate=(PFCTL, "-n", *PF_OPTIMIZE, "-a", ANCHOR, "-f")),
-        Step(f"load the rules into the pf anchor {ANCHOR}",
-             (PFCTL, *PF_OPTIMIZE, "-a", ANCHOR, "-f", str(ANCHOR_FILE))),
+        Step(f"load the rules into the pf anchor {ANCHOR}", _LOAD_ARGV),
+        *_enable_steps(),
+    ]
+
+
+#: The ONE argv that loads the rules file into the anchor (setup, replenish, repair and the boot one-shot).
+_LOAD_ARGV = (PFCTL, *PF_OPTIMIZE, "-a", ANCHOR, "-f", str(ANCHOR_FILE))
+
+
+def _enable_steps() -> list[Step]:
+    return [
         Step(f"create {PF_TOKEN.parent}", ("/bin/mkdir", "-p", "-m", "755", str(PF_TOKEN.parent))),
         Step(f"take pf's enable reference, its token kept in {PF_TOKEN}", call=lambda: take_enable_reference()),
     ]
+
+
+def _is_rules_file(st: os.stat_result, head: bytes) -> str:
+    """Why the file is not one :func:`anchor_text` wrote and root alone can change, or ``""``."""
+    if not stat.S_ISREG(st.st_mode):
+        return "is not a regular file"
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        return f"is not root's file, writable by root alone ({st.st_uid}, {stat.S_IMODE(st.st_mode):04o})"
+    if not head.startswith(ANCHOR_HEADER.encode()):
+        return f"does not start with {ANCHOR_HEADER!r}"
+    return ""
+
+
+def load_recorded_anchor(path: Path = ANCHOR_FILE, run: Run = subprocess.run) -> tuple[bool, str]:
+    """Load the rules file setup, replenish or repair last wrote, as it is, into :data:`ANCHOR` (the boot one-shot).
+    It is never rewritten here. A file that is not Levain's (:func:`_is_rules_file`) is refused and nothing is loaded.
+    The file's parent, ``/etc/pf.anchors``, is root's, so no other user can swap the file between the check and
+    ``pfctl``'s own open."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as e:
+        return False, f"cannot open the pf rules {path}: {e.strerror or e}"
+    try:
+        why = _is_rules_file(os.fstat(fd), os.read(fd, len(ANCHOR_HEADER)))
+    finally:
+        os.close(fd)
+    if why:
+        return False, f"{path} {why}: nothing loaded"
+    argv = _LOAD_ARGV if path == ANCHOR_FILE else (*_LOAD_ARGV[:-1], str(path))
+    r = run(list(argv), capture_output=True, text=True, env=child_env())
+    if r.returncode != 0:
+        return False, f"pfctl could not load {path}: {(r.stderr or r.stdout or '').strip()}"
+    return True, ""
+
+
+def boot_steps(slots: Iterable[SlotId]) -> list[Step]:
+    """What a reboot undoes, redone (the ``com.levain.pf`` one-shot): each egress slot's lo0 alias
+    (:func:`alias_steps`), the anchor loaded from its recorded rules file (:func:`load_recorded_anchor`), and pf's
+    enable reference taken again (a reboot drops every reference; the token recorded before it names one pf no longer
+    knows, which :func:`take_enable_reference` releases as gone). Setup's order: the aliases before the rules."""
+    return [*alias_steps(slots),
+            Step(f"load the recorded rules {ANCHOR_FILE} into the pf anchor {ANCHOR}",
+                 call=lambda: load_recorded_anchor()),
+            *_enable_steps()]
 
 
 #: Read by the alias ``skip_if`` s; ``/sbin/ifconfig lo0`` prints one ``inet <addr> netmask <mask>``
@@ -280,7 +337,7 @@ def alias_steps(slots: Iterable[SlotId]) -> list[Step]:
 
 
 __all__ = ["ANCHOR", "ANCHOR_FILE", "GWPORT_BASE", "IFCONFIG", "PFCTL", "PF_OPTIMIZE", "PF_TOKEN", "PF_TOKEN_GONE", "alias_absent", "alias_present",
-           "alias_steps", "anchor_rules", "anchor_text", "gwport", "load_steps",
+           "alias_steps", "anchor_rules", "anchor_text", "boot_steps", "gwport", "load_recorded_anchor", "load_steps",
            "release_enable_reference", "take_enable_reference"]
 
 
