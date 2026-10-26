@@ -784,7 +784,8 @@ def sandbox_verdict(agent: str, version: str | None, ws: Path, output: RunOutput
     if failed:
         return CanaryResult(agent, version, "FAIL", "; ".join(failed), str(ws))
     detail = ("the host's evidence agrees: control file read back, real home untouched, listener quiet, planted hook "
-              "never ran; stopped: " + ", ".join(ESCAPE_PROBES))
+              "never ran; stopped: " + ", ".join(ESCAPE_PROBES) + ". A PASS shows the wall stopped the probes the "
+              "courier ran; it does not prove anything against a model trying to deceive")
     if host.discard_note:
         detail += f"; NOTE {host.discard_note}"
     return CanaryResult(agent, version, "PASS", detail, str(ws))
@@ -906,9 +907,9 @@ def _scratch_repo(workspace: Path | None) -> Path:
 
 def _session_of(text: str) -> tuple[str, str]:
     """(session id, why none): the retained session the transcript names."""
-    m = _SESSION_RETAINED.search(text)
-    if m:
-        return m.group(1), ""
+    found = _SESSION_RETAINED.findall(text)
+    if found:   # the supervisor prints its line at teardown, after anything the model echoed
+        return found[-1], ""
     if _SESSION_ANY.search(text):
         return "", "the session did not end RETAINED"
     return "", "the transcript names no session"

@@ -36,9 +36,11 @@ PREFIX = "LEVAIN-PROBE v1"
 OFF_LIST = ("1.1.1.1", 443)
 TIMEOUT = 3.0
 HERE = os.path.dirname(os.path.abspath(__file__))
-# A direct connect that fails with one of these was refused by something that answered or denied the call: it names
-# a wall. A timeout or an unreachable network does not (a dead network reads the same), so those are ambiguous.
-WALL_ERRNOS = ("EPERM", "EACCES", "ECONNREFUSED")
+# The one refusal Levain's own egress wall (the session's proxy, levain/broker/front.py) gives an off-list CONNECT:
+# status 403 with the header `X-Levain-Refused: host-not-allowed`. Only that reads STOPPED; every other failure
+# (another status, a timeout, an unreachable network, a refused direct connect) could be the machine, not the wall.
+WALL_STATUS = 403
+WALL_REFUSAL = "host-not-allowed"
 
 
 def say(nonce, name, status, detail=""):
@@ -66,31 +68,38 @@ def control_workspace_write(nonce):
 
 
 def proxy_connect(target):
-    """('status', code) after a CONNECT through the session's proxy, or ('error', why)."""
+    """('status', code, refusal) after a CONNECT through the session's proxy (refusal = the value of its
+    X-Levain-Refused header, "" when it sent none), or ('error', why, "")."""
     raw = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
     parsed = urllib.parse.urlsplit(raw if "://" in raw else "http://" + raw)
     if not raw or not parsed.hostname or not parsed.port:
-        return "error", "no-proxy"
+        return "error", "no-proxy", ""
     try:
         with socket.create_connection((parsed.hostname, parsed.port), timeout=TIMEOUT) as conn:
             conn.settimeout(TIMEOUT)
             conn.sendall(f"CONNECT {target[0]}:{target[1]} HTTP/1.1\r\nHost: {target[0]}:{target[1]}\r\n\r\n".encode())
             head = b""
-            while b"\n" not in head and len(head) < 512:
-                chunk = conn.recv(256)
+            while b"\r\n\r\n" not in head and len(head) < 2048:
+                chunk = conn.recv(512)
                 if not chunk:
                     break
                 head += chunk
     except OSError as exc:
-        return "error", errname(exc)
-    parts = head.split(b"\n", 1)[0].split()
+        return "error", errname(exc), ""
+    lines = head.split(b"\n")
+    parts = lines[0].split()
     if len(parts) >= 2 and parts[0].startswith(b"HTTP/") and parts[1].isdigit():
-        return "status", int(parts[1])
-    return "error", "no-status-line"
+        refusal = ""
+        for line in lines[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"x-levain-refused":
+                refusal = value.strip().decode("ascii", "replace")
+        return "status", int(parts[1]), refusal
+    return "error", "no-status-line", ""
 
 
 def net_control(nonce, allowed):
-    kind, got = proxy_connect((allowed, 443))
+    kind, got, _ = proxy_connect((allowed, 443))
     if kind == "status" and got == 200:
         return say(nonce, "net_control", "OK", "proxy-200")
     say(nonce, "net_control", "ERROR", f"{kind}-{got}")
@@ -109,10 +118,9 @@ def home_write(nonce, home):
 
 
 def offlist_host(nonce):
-    kind, got = proxy_connect(OFF_LIST)
+    kind, got, refusal = proxy_connect(OFF_LIST)
     if kind == "status" and got == 200:
         return say(nonce, "offlist_host", "ESCAPED", "proxy-200")
-    refused = kind == "status" and 400 <= got < 600
     try:
         conn = socket.create_connection(OFF_LIST, timeout=TIMEOUT)
     except OSError as exc:
@@ -120,9 +128,9 @@ def offlist_host(nonce):
     else:
         conn.close()
         return say(nonce, "offlist_host", "ESCAPED", "direct")
-    if direct in WALL_ERRNOS or refused:
-        return say(nonce, "offlist_host", "STOPPED", f"proxy-{got}" if refused else direct)
-    say(nonce, "offlist_host", "ERROR", f"{direct}-could-not-tell")
+    if kind == "status" and got == WALL_STATUS and refusal == WALL_REFUSAL:
+        return say(nonce, "offlist_host", "STOPPED", f"proxy-{got}-{refusal}")
+    say(nonce, "offlist_host", "ERROR", f"{kind}-{got}-{direct}-could-not-tell")
 
 
 def cockpit_loopback(nonce, port):

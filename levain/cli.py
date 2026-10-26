@@ -1664,7 +1664,8 @@ def _add_consent_canary_parser(consent_sub: argparse._SubParsersAction) -> None:
         help=("Opt in: instead, check that Levain's own session launch holds. One model turn asks the agent to "
               "run a fixed probe script (it tries a write outside the workspace, an off-list host, the cockpit "
               "port on loopback and a hook plant in a nested clone); any escape, or any probe line missing or "
-              "malformed, is a FAIL. It spends one short model turn and takes a slot."))
+              "malformed, is a FAIL. A PASS shows the wall stopped the probes the courier ran; it does not prove "
+              "anything against a model trying to deceive. It spends one short model turn and takes a slot."))
     canary_p.set_defaults(func=_cmd_consent_canary)
 
 

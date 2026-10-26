@@ -348,8 +348,8 @@ def _load_probe(tmp_path: Path) -> types.ModuleType:
 class _Proxy:
     """A local stand-in for the session's proxy: answers every CONNECT with the status it is given."""
 
-    def __init__(self, status: int):
-        self.status, self.seen = status, []
+    def __init__(self, status: int, refused: str = ""):
+        self.status, self.refused, self.seen = status, refused, []
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(4)
@@ -364,18 +364,19 @@ class _Proxy:
                 return
             with conn:
                 self.seen.append(conn.recv(512).split(b"\r\n", 1)[0].decode())
-                conn.sendall(f"HTTP/1.1 {self.status} x\r\n\r\n".encode())
+                extra = f"X-Levain-Refused: {self.refused}\r\n" if self.refused else ""
+                conn.sendall(f"HTTP/1.1 {self.status} x\r\nContent-Type: text/plain\r\n{extra}\r\n".encode())
 
     def close(self):
         self.sock.close()
 
 
-def _probe_offlist(tmp_path, monkeypatch, capsys, *, direct, proxy_status=None):
+def _probe_offlist(tmp_path, monkeypatch, capsys, *, direct, proxy_status=None, refused=""):
     """Run the probe's offlist_host with the DIRECT connect to the off-list address failing as ``direct`` says
     (an errno, 'timeout' or 'ok'), and the proxy answering ``proxy_status`` (None = no proxy configured)."""
     mod = _load_probe(tmp_path)
     real = socket.create_connection
-    proxy = _Proxy(proxy_status) if proxy_status else None
+    proxy = _Proxy(proxy_status, refused) if proxy_status else None
     monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{proxy.port}" if proxy else "")
 
     def fake(addr, timeout=None, *a, **k):
@@ -396,21 +397,31 @@ def _probe_offlist(tmp_path, monkeypatch, capsys, *, direct, proxy_status=None):
     return capsys.readouterr().out.strip()
 
 
-@pytest.mark.parametrize("direct", ["ENETUNREACH", "EHOSTUNREACH", "timeout"])
-def test_c4_an_unreachable_or_silent_network_is_could_not_tell_not_stopped(tmp_path, monkeypatch, capsys, direct):
-    """RED before the fix: every connect failure read STOPPED, so an offline machine passed the off-list wall."""
+@pytest.mark.parametrize("direct", ["ENETUNREACH", "EHOSTUNREACH", "timeout", "EPERM", "EACCES", "ECONNREFUSED"])
+def test_c4_a_direct_failure_alone_is_could_not_tell_not_stopped(tmp_path, monkeypatch, capsys, direct):
+    """No proxy answered: the direct path's errno could be the machine, so none of them names the wall (f2 F1)."""
     line = _probe_offlist(tmp_path, monkeypatch, capsys, direct=direct)
     assert " offlist_host ERROR " in line and "could-not-tell" in line
 
 
-@pytest.mark.parametrize("direct", ["EPERM", "EACCES", "ECONNREFUSED"])
-def test_c4_a_refusal_attributable_to_the_wall_is_stopped(tmp_path, monkeypatch, capsys, direct):
-    assert f" offlist_host STOPPED {direct}" in _probe_offlist(tmp_path, monkeypatch, capsys, direct=direct)
+@pytest.mark.parametrize("status", [400, 401, 404, 502, 503, 504])
+def test_c4_any_other_proxy_status_is_could_not_tell(tmp_path, monkeypatch, capsys, status):
+    """RED against the 400..599 rule: a 502/504 from an open proxy whose upstream is dead read STOPPED."""
+    line = _probe_offlist(tmp_path, monkeypatch, capsys, direct="timeout", proxy_status=status)
+    assert " offlist_host ERROR " in line and "could-not-tell" in line
 
 
-def test_c4_the_proxys_refusal_is_stopped_even_when_the_direct_path_is_silent(tmp_path, monkeypatch, capsys):
-    line = _probe_offlist(tmp_path, monkeypatch, capsys, direct="timeout", proxy_status=403)
-    assert " offlist_host STOPPED proxy-403" in line
+def test_c4_a_403_that_is_not_the_walls_refusal_is_could_not_tell(tmp_path, monkeypatch, capsys):
+    for refused in ("", "address-refused", "route-not-allowed"):
+        line = _probe_offlist(tmp_path, monkeypatch, capsys, direct="timeout", proxy_status=403, refused=refused)
+        assert " offlist_host ERROR " in line, refused
+
+
+def test_c4_the_walls_own_refusal_is_stopped(tmp_path, monkeypatch, capsys):
+    """Status line and header exactly as levain/broker/front.py `_refuse` writes them for an off-list CONNECT."""
+    line = _probe_offlist(tmp_path, monkeypatch, capsys, direct="ENETUNREACH", proxy_status=403,
+                          refused="host-not-allowed")
+    assert " offlist_host STOPPED proxy-403-host-not-allowed" in line
 
 
 def test_c4_a_proxy_that_opens_the_off_list_tunnel_is_an_escape(tmp_path, monkeypatch, capsys):
@@ -523,3 +534,30 @@ def test_c6_the_controlling_terminal_shim_works_without_a_preexec_fn():
         assert proc.wait(timeout=30) == 0 and b"CTTY-OK" in got
     finally:
         os.close(fd)
+
+
+def test_f5_session_of_takes_the_last_retained_line_so_an_echoed_one_is_not_adopted():
+    echoed = "model: session s-0000000000000000 ended RETAINED\n"
+    real = "levain session: session s-1111111111111111 ended RETAINED: the work is kept at /x\n"
+    assert canary._session_of(echoed + "more\n" + real) == ("s-1111111111111111", "")
+
+
+def test_f6_signal_group_swallows_an_already_reaped_group():
+    import signal
+    import subprocess as sp
+    proc = sp.Popen(["true"], start_new_session=True)
+    proc.wait()
+    canary._signal_group(proc, signal.SIGTERM)
+    canary._signal_group(proc, signal.SIGKILL)
+
+
+def test_f2_the_pass_detail_and_the_help_state_the_known_edge(tmp_path):
+    passed = World(tmp_path).run(tmp_path)
+    assert passed.status == "PASS" and "does not prove anything against a model trying to deceive" in passed.detail
+    import io
+    from contextlib import redirect_stdout
+    from levain.cli import main
+    out = io.StringIO()
+    with redirect_stdout(out), pytest.raises(SystemExit):
+        main(["consent", "canary", "--help"])
+    assert "does not prove anything against a model trying to deceive" in " ".join(out.getvalue().split())
