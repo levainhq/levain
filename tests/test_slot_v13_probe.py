@@ -205,3 +205,42 @@ def test_n3_child_imports_stdlib_only():
     assert names, "no imports read"
     for n in names:
         assert n == "__future__" or n.split(".")[0] in sys.stdlib_module_names, n
+
+
+# --- T8 the probe profile (R1): the session profile minus exactly its outbound deny ----------------------------------
+
+def _lines(data: bytes) -> list:
+    return data.decode("utf-8").split("\n")
+
+
+@pytest.mark.parametrize("kw", [{}, {"allow_own_loopback": True}, {"hooks": frozenset()},
+                                {"vendor": "codex", "auth": "passthrough"}])
+def test_t8_probe_profile_is_the_session_profile_minus_the_outbound_deny(kw):
+    from levain.slot import render as rd
+    from tests.test_slot_s2b_render import egress
+
+    blob, facts = egress(**kw)
+    session, probe = rd.render_profile(blob, facts), rd.render_profile(blob, facts, probe=True)
+    want = _lines(session)
+    assert want.count("(deny network-outbound)") == 1
+    want.remove("(deny network-outbound)")
+    assert _lines(probe) == want
+    rd.assert_no_syscall(probe.decode("utf-8"))
+    from levain.slot.wall import check_profile_text
+    check_profile_text(probe.decode("utf-8"))
+
+
+def test_t8_probe_sb_rendered_beside_profile_sb_same_owner_and_mode():
+    from levain.slot import render as rd
+    from tests.test_slot_s2b_render import egress, verifier
+
+    blob, facts = egress()
+    files = {f.path: f for f in rd.render(blob, facts).files}
+    prof, probe = files["root/profile.sb"], files["root/probe.sb"]
+    assert (probe.uid, probe.gid, probe.mode) == (prof.uid, prof.gid, prof.mode)
+    assert probe.data == rd.render_profile(blob, facts, probe=True)
+    blob, facts = egress(host="linux")
+    assert not any(f.path.endswith(".sb") for f in rd.render(blob, facts).files)     # darwin only
+    blob, facts = verifier()
+    paths = {f.path for f in rd.render(blob, facts).files}
+    assert "root/profile.sb" in paths and "root/probe.sb" not in paths    # no probe runs in a none-class slot

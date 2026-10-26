@@ -563,9 +563,9 @@ def _digest(r) -> str:
 #: Every file (path, owner, mode, bytes) of each (OS x vendor x class) render, pinned. The full text of each was
 #: read once when these were taken; a change here is a change to what a confined session loads.
 GOLD_DIGESTS = {
-    ("darwin", "claude", "egress"): "24c289333f977f99",
+    ("darwin", "claude", "egress"): "47601d17095c0001",    # V13: + root/probe.sb (the rest unchanged)
     ("darwin", "claude", "none"): "3ef89c7358a401ec",
-    ("darwin", "codex", "egress"): "cd24c1b8e030351d",
+    ("darwin", "codex", "egress"): "682bfd7ae3303973",     # V13: + root/probe.sb (the rest unchanged)
     ("darwin", "codex", "none"): "309384e358924b92",
     ("linux", "claude", "egress"): "98ce399830ec8e9e",
     ("linux", "claude", "none"): "c5ec670282a4d84a",
