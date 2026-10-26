@@ -401,9 +401,8 @@ class ConsentSheet:
     def step(self, request_id: str, action: str, req: Any) -> "dict[str, Any]":
         """``POST /cockpit/consent/<id>/<action>``: the phone port's :meth:`answer_step` reply; a challenge's also
         carries ``line``, the exact text signed (the record's JCS bytes). A ruling is answered as soon as the queue has
-        recorded it, with ``delivery`` ``pending``: its delivery runs on its own thread and is never waited on here
-        (the phone port waits up to its ``_DELIVERY_WAIT`` for it, longer than the sheet waits for a reply); where it
-        landed is the queue's own record. :class:`ConsentRefused` with the phone port's status, word and words."""
+        recorded it, with ``delivery`` ``pending``: its delivery runs on its own thread and is never waited on here;
+        where it landed is the queue's own record. :class:`ConsentRefused` with the phone port's status, word and words."""
         from levain.phone_server import _AWAIT, PhoneError, _PhoneServer
 
         problem = self.elsewhere()
