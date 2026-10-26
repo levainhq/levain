@@ -170,7 +170,7 @@ class _Flight:
 
 
 _view_flights: dict[int, _Flight] = {}
-# builds started for a source and not yet returned, the registered flight's and an abandoned one's; a source holds at most
+# builds started for a source and not yet returned, a flight's, an abandoned one's, an uncached read's; a source holds at most
 # VIEW_BUILDS_PER_SOURCE of them (the abandoned build and one rescue), so builds that keep hanging cost a bounded number of threads
 VIEW_BUILDS_PER_SOURCE = 2
 _view_builds: dict[int, int] = {}
