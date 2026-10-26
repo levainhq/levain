@@ -22,6 +22,9 @@ from levain.coordinator.driver import CommandResult, InterruptCommand, ReadBatch
 from levain.coordinator.envelopes import EnvelopeStore
 from levain.coordinator.store import CoordError, Part, next_gseq
 
+# CH-D1b-3: a service's verdict comes from its probe; these worlds are Claude launches, whose every send is a boundary
+# (R9), so their services carry a probe that reads live and a retry wait that does not sleep
+LIVE = {"probe": lambda _launch, _evidence: chat.Verdict(True, "scripted probe: live"), "sleep": lambda _s: None}
 T0 = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
 ME = "cockpit:tab-a"
 CHAT_TABLES = ("chat_messages", "chat_outbox_events", "chat_events", "chat_cursors", "chat_anomalies",
@@ -88,7 +91,7 @@ def raw(qdir):
 def ready(cs, world, session):
     with cs._write() as (conn, now):
         record_check(conn, now, world["launch"], "live", "activation", "test")
-    svc = ChatService(cs)
+    svc = ChatService(cs, **LIVE)
     svc.attach(world["launch"], session)
     svc.read_next(world["launch"])
     return svc
@@ -403,13 +406,23 @@ def _released_store(qdir, store, world):
                       body="hello", normalized="hello")
     chat.record_cursor(c, now, launch_id=world["launch"], vendor_cursor="00000001", complete_through="00000001",
                        gap=False)
-    record_check(c, now, world["launch"], "live", "activation", "released")
+    # v0.11.25's record_check SQL (CH-D1b-3's writer names two columns this table does not have yet)
+    c.execute("INSERT INTO chat_launch_checks (launch_id, seq, gseq, kind, source, evidence_sha256, spawn_nonce, "
+              "detail, by, at) VALUES (?, 1, ?, 'live', 'activation', NULL, NULL, 'released', 'service', ?)",
+              (world["launch"], chat.next_gseq(c, now), now))
     c.execute("COMMIT")
     return c, m
 
 
+# the columns a released table had: a column CHAT_ADDED_COLUMNS adds later is compared by its own test
+# (test_released_store_gains_the_activation_columns_and_their_rule), not as a change to the rows
+_RELEASED_COLUMNS = {"chat_launch_checks": "launch_id, seq, gseq, kind, source, evidence_sha256, spawn_nonce, detail, "
+                                           "by, at"}
+
+
 def _rows(c):
-    return {t: c.execute(f"SELECT rowid, * FROM {t} ORDER BY rowid").fetchall() for t in CHAT_TABLES}
+    return {t: c.execute(f"SELECT rowid, {_RELEASED_COLUMNS.get(t, '*')} FROM {t} ORDER BY rowid").fetchall()
+            for t in CHAT_TABLES}
 
 
 def _view_sql(c):
@@ -536,7 +549,7 @@ def test_read_next_resumes_from_the_last_persisted_cursor(cs, world):
     svc.detach(world["launch"])
     again = Recording()
     again._shown, again._n = list(s._shown), s._n                      # the same vendor thread, a new session
-    restarted = ChatService(cs)
+    restarted = ChatService(cs, **LIVE)
     restarted.attach(world["launch"], again)
     assert restarted.read_next(world["launch"]) == 0
     assert again.cursors == ["00000002"]
@@ -544,7 +557,7 @@ def test_read_next_resumes_from_the_last_persisted_cursor(cs, world):
 
 def test_read_next_without_a_session_is_refused(cs, world):
     with pytest.raises(CoordError, match="no driver session"):
-        ChatService(cs).read_next(world["launch"])
+        ChatService(cs, **LIVE).read_next(world["launch"])
 
 
 # --- §9: the unfenced interrupt (the approval-row half is CH-D1c's) ---------------------------------------------------
@@ -579,21 +592,21 @@ def test_interrupt_driver_failure_is_ambiguous(cs, world):
     svc = ready(cs, world, Interrupts(raises=ConnectionError("pipe closed")))
     got = svc.interrupt(world["launch"], "t-1")
     assert got.outcome == "ambiguous" and "ConnectionError" in got.detail
-    svc2 = ChatService(cs)
+    svc2 = ChatService(cs, **LIVE)
     svc2.attach(world["launch"], Interrupts(result="not a result"))
     assert svc2.interrupt(world["launch"], "t-1").outcome == "ambiguous"
 
 
 def test_interrupt_without_a_session_is_refused(cs, world):
     with pytest.raises(CoordError, match="no driver session"):
-        ChatService(cs).interrupt(world["launch"], "t-1")
+        ChatService(cs, **LIVE).interrupt(world["launch"], "t-1")
 
 
 # --- L3 r1 K1: a first batch's backfill is classified against its own frontier ---------------------------------------
 def _attached(cs, world, session):
     with cs._write() as (conn, now):
         record_check(conn, now, world["launch"], "live", "activation", "test")
-    svc = ChatService(cs)
+    svc = ChatService(cs, **LIVE)
     svc.attach(world["launch"], session)
     return svc
 
@@ -1009,3 +1022,28 @@ RELEASED_CHAT_SCHEMA_V0_11_25 = (
     'd, a.by, a.envelope_id, NULL, NULL, a.value, a.at FROM envelope_attenuations a JOIN envelope_binds b'
     ' ON b.envelope_id = a.envelope_id WHERE a.thread_id IS NULL',
 )
+
+
+def test_released_store_gains_the_activation_columns_and_their_rule(qdir, store, world):
+    # CH-D1b-3: rev 7's two chat_launch_checks columns reach a v0.11.25 table by ALTER, and their rule (a trigger, as
+    # ALTER adds no CHECK) holds there exactly as in a new store
+    c, _m = _released_store(qdir, store, world)
+    assert "canary_verdict_id" not in {r[1] for r in c.execute("PRAGMA table_info(chat_launch_checks)")}
+    c.close()
+    cs = ChatStore(store)
+    cs._connect().close()
+    c = raw(qdir)
+    assert {"canary_verdict_id", "containment_digest"} <= {r[1] for r in c.execute(
+        "PRAGMA table_info(chat_launch_checks)")}
+    assert c.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'chat_launch_checks_canary'"
+                     ).fetchone()
+    with cs._write() as (conn, now):
+        with pytest.raises(sqlite3.IntegrityError, match="canary verdict id"):
+            conn.execute("INSERT INTO chat_launch_checks (launch_id, seq, gseq, kind, source, detail, by, at, "
+                         "canary_verdict_id, containment_digest) VALUES (?, 2, ?, 'live', 'turn_start', 'x', "
+                         "'service', ?, ?, ?)", (world["launch"], chat.next_gseq(conn, now), now, "ab" * 32, "cd" * 32))
+        record_check(conn, now, world["launch"], "live", "activation", "stage 2", spawn_nonce="0" * 32,
+                     canary_verdict_id="ab" * 32, containment_digest="cd" * 32)
+    assert c.execute("SELECT canary_verdict_id, containment_digest FROM chat_launch_checks ORDER BY seq"
+                     ).fetchall() == [(None, None), ("ab" * 32, "cd" * 32)]
+    assert c.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
