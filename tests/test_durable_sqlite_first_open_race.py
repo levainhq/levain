@@ -345,3 +345,44 @@ def test_a_begin_that_stays_busy_past_the_bound_raises(monkeypatch):
         with D.write_transaction(lambda: conn):
             pass
     assert conn.closed
+
+
+# Two openers that meet busy on the same new file both retry the WAL switch. Measured (RETURN race39): with the same
+# pause schedule in both, they kept colliding, each try a busy answer for both within a fraction of a millisecond of
+# the other, round after round; on CI both calls of one trial were refused. So the pause is not the same from one
+# opener to the next.
+
+class _Waits:
+    """Stands in for ``threading`` inside the module: every ``Event().wait(t)`` is recorded, none sleeps."""
+
+    def __init__(self):
+        self.pauses = []
+        waits = self
+
+        class Event:
+            def wait(self, t):
+                waits.pauses.append(t)
+        self.Event = Event
+
+
+def _pauses_through_busy(monkeypatch, n_busy):
+    from levain.autonomic import durable_sqlite as D
+    waits = _Waits()
+    monkeypatch.setattr(D, "threading", waits)
+    D._set_wal(_Answers(*([_err("database is locked", 5)] * n_busy), "wal"))
+    return waits.pauses
+
+
+def test_two_openers_meeting_busy_together_do_not_retry_in_step(monkeypatch):
+    a = _pauses_through_busy(monkeypatch, 8)
+    b = _pauses_through_busy(monkeypatch, 8)
+    assert len(a) == len(b) == 8
+    assert a != b
+
+
+def test_each_wal_retry_pause_stays_within_half_and_one_and_a_half_of_its_step(monkeypatch):
+    for _ in range(20):
+        step = 0.001
+        for p in _pauses_through_busy(monkeypatch, 10):
+            assert 0.5 * step <= p < 1.5 * step
+            step = min(step * 2, 0.05)
