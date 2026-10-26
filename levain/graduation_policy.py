@@ -61,6 +61,9 @@ UNREADABLE_HEAD: tuple[int, str] = (-1, "unreadable")
 
 _MOVED = EffectiveCover(COVER_MOVED, None, None)
 
+# the graduation grants _graduation_policy has warned have no grant_born entry (one warning per grant per process)
+_UNBORN_WARNED: set[str] = set()
+
 
 def _connect(db: Path, timeout: float) -> sqlite3.Connection:
     # read-only: the source never writes the cockpit journal (and never creates one)
@@ -71,18 +74,28 @@ def _connect(db: Path, timeout: float) -> sqlite3.Connection:
 class TermedGraduationPolicy(GraduationPolicy):
     """A replayed graduation policy with its signed ``min_clean_fires``: the clean fires the honest engine waits for
     before it graduates a binding under this policy (``levain.autonomic.graduation.graduate_due``). Advisory against
-    a writer of the levain home; the gate never reads it."""
+    a writer of the levain home; the gate never reads it.
 
-    min_clean_fires: int
+    The term has one source, the signed terms (1026-21 RULINGS G1-5): construction reads it from them, and refuses a
+    ``min_clean_fires`` passed beside terms that say another. Only terms that carry none (a policy built outside an
+    authority log, which requires the term on every graduation policy) take the passed value."""
+
+    min_clean_fires: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if "min_clean_fires" in self._terms:
+            signed = self._terms["min_clean_fires"]
+            if self.min_clean_fires is not None and self.min_clean_fires != signed:
+                raise ValueError(f"min_clean_fires {self.min_clean_fires!r} is not its signed term {signed!r}")
+            object.__setattr__(self, "min_clean_fires", signed)
         if type(self.min_clean_fires) is not int or self.min_clean_fires < 0:
             raise ValueError("min_clean_fires is a non-negative integer")
 
     @classmethod
-    def of(cls, policy: GraduationPolicy, *, min_clean_fires: int) -> "TermedGraduationPolicy":
-        return cls(**{f.name: getattr(policy, f.name) for f in fields(GraduationPolicy)},
+    def of(cls, policy: GraduationPolicy, *, min_clean_fires: int | None = None) -> "TermedGraduationPolicy":
+        """``policy`` with its signed ``min_clean_fires``; ``min_clean_fires`` only for terms that carry none."""
+        return cls(**{f.name: getattr(policy, f.name) for f in fields(GraduationPolicy) if f.init},
                    min_clean_fires=min_clean_fires)
 
 
@@ -112,6 +125,10 @@ def _graduation_policy(state: _auth.AuthoritySnapshot, gid: str, grant: object) 
     incarnation = _auth.graduation_incarnation(state, gid)
     links = _auth.graduation_links(state, gid)
     born_seq = state.grant_born.get(gid)
+    if born_seq is None and gid not in _UNBORN_WARNED:
+        # a graduation grant the replay holds with no born link is a replay defect, not a revoke: say it, once
+        _UNBORN_WARNED.add(gid)
+        _log.warning("graduation policy %r covers nothing: the replay has no grant_born entry for it", gid)
     if incarnation is None or links is None or born_seq is None:
         return None
     born_key, current_key = (state.keys.get(fp) for fp in links)
@@ -121,11 +138,10 @@ def _graduation_policy(state: _auth.AuthoritySnapshot, gid: str, grant: object) 
     born = born_key.public_key
     current = current_key.public_key if RENEW_NEEDS_ANCHOR else born
     record = _auth._thaw(grant)
-    # the log requires min_clean_fires on every graduation policy; the engine walks it
+    # the log requires min_clean_fires on every graduation policy; the engine walks it, read from the signed terms
     return TermedGraduationPolicy.of(
         GraduationPolicy.from_record(record, incarnation=incarnation, born=born_seq, born_signer=born,
-                                     current_signer=current),
-        min_clean_fires=record.get("min_clean_fires"))
+                                     current_signer=current))
 
 
 class AuthorityCoverage:

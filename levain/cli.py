@@ -3615,12 +3615,15 @@ def _cmd_binding_policy_create(args: argparse.Namespace) -> int:
                  "expires_at": utc_stamp(now + life), "triggers": sorted(set(args.triggers)) if args.triggers else None,
                  "families": sorted(set(args.families)) if args.families else None, "store_id": store_id,
                  "min_clean_fires": args.min_clean, "guard": guard}
-        print(f"lets {', '.join(sorted(actions))} run at {args.lowest} without asking, until {grant['expires_at']}.")
+        # the read-back the signer reads before the signature: every dynamic line terminal-safe (1026-21 RULINGS
+        # G1-4), so a control, a bidi override or a newline in the guard file cannot hide or forge a line of it
+        print(_term_safe(f"lets {', '.join(sorted(actions))} run at {args.lowest} without asking, "
+                         f"until {grant['expires_at']}."))
         print("its guard, stopping every fire it covers whose event trips a kill:")
         for i, entry in enumerate(guard):
-            print(f"  [{i}] why it might be wrong: {entry['rationale']}")
-            print(f"      kill: {json.dumps(entry['kill_predicate'], sort_keys=True)}")
-            print(f"      drill (an event it stops): {json.dumps(entry['kill_drill'], sort_keys=True)}")
+            print(_term_safe(f"  [{i}] why it might be wrong: {entry['rationale']}"))
+            print(_term_safe(f"      kill: {json.dumps(entry['kill_predicate'], sort_keys=True)}"))
+            print(_term_safe(f"      drill (an event it stops): {json.dumps(entry['kill_drill'], sort_keys=True)}"))
         print("where several policies cover one effect, the strictest rung's policy authorizes it, and its guard "
               "applies.")
         print(f"warning: {_POLICY_WARNING}.")
@@ -3629,7 +3632,7 @@ def _cmd_binding_policy_create(args: argparse.Namespace) -> int:
         print(f"min clean fires {args.min_clean} ({_ADVISORY}: the engine's walk, not a limit on a writer).")
         new = _signed_append(args, {"op": "create_grant", "grant": grant}, now)
     except (ValueError, *_cockpit_refusals()) as exc:
-        print(f"policy refused: {exc}", file=sys.stderr)
+        print(_term_safe(f"policy refused: {exc}"), file=sys.stderr)
         return 1
     print(f"signed: {gid} at seq {new.seq} for {store_id}, until {grant['expires_at']}")
     print("it covers nothing until its signer is in root's allowed-signers file (levain-authority).")

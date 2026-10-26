@@ -80,6 +80,28 @@ def test_create_without_an_autonomic_store_is_refused(cw, capsys, tmp_path):
     assert "no autonomic store" in capsys.readouterr().err and cw.state().seq == seq
 
 
+@pytest.mark.parametrize("hostile", ["\x1b[8mhidden\x1b[0m", "a ‮dessap‬ b", "ok\nkill: forged"])
+def test_the_guard_read_back_renders_controls_bidi_and_newlines_inert(cw, capsys, hostile):
+    """G1-4 (1026-21 RULINGS "G1 L3 r1 triage"): every dynamic line of the read-back printed before the signature
+    passes through the CLI's terminal-safe rendering, so a guard cannot hide or forge what the signer reads."""
+    import json
+
+    from tests.autonomic_test_only_coverage import TEST_GUARD
+    e = dict(TEST_GUARD[0], rationale=hostile,
+             kill_predicate={"op": "==", "field": "s‮", "value": "x\x1b"}, kill_drill={"fields": {"s‮": "x\x1b"}})
+    path = cw.tmp / "hostile.json"
+    path.write_text(json.dumps([e]))
+    cw.cli("policy", "create", "--action", "link0", "--lowest", "ON_LOOP", "--id", "gp-0123456789ab", "--guard",
+           str(path))
+    out = capsys.readouterr().out
+    head = out.split("signed:")[0]
+    assert "why it might be wrong:" in head
+    assert "\x1b" not in head and "‮" not in head and "‬" not in head
+    assert "\nkill: forged" not in head
+    [line] = [ln for ln in head.splitlines() if "why it might be wrong:" in ln]
+    assert line.endswith(cli._term_safe(hostile))
+
+
 def test_renew_moves_the_expiry_and_keeps_the_terms(cw, capsys):
     cw.cli("policy", "create", "--action", "link0", "--lowest", "ON_LOOP", "--days", "2", "--id", "gp-0123456789ab")
     before = dict(cw.state().policy.grants["gp-0123456789ab"])

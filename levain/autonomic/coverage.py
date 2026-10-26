@@ -12,9 +12,10 @@ envelope in the authority log that signs ``actions`` (each at its whole risk dic
   :func:`anchored` (both signers root-listed), :func:`live` (anchored, unexpired, inside the cap at ``now``, and
   signed with a guard).
 - :func:`guard_problem`: what a policy's signed ``guard`` must be (every entry a rationale, a kill predicate this
-  package can evaluate and a drill that trips it, each inside the sign-time caps). The authority log refuses to sign
-  a policy it finds a problem in; a replayed policy whose guard has one is refused by :meth:`GraduationPolicy.
-  from_record` (it covers nothing), and a policy signed with no guard covers nothing (:func:`live`).
+  package can evaluate and a drill it does not confidently let through, each inside the sign-time caps). The
+  authority log refuses to sign a policy it finds a problem in; a replayed policy whose guard has one is refused by
+  :meth:`GraduationPolicy.from_record` (it covers nothing), and a policy signed with no guard covers nothing
+  (:func:`live`).
 - :func:`operative`: the rung a candidate below ``CONFIRM`` runs at, and the fence's cover value.
 - :class:`CoverageSnapshot`: what a source caches. Its ``token`` is a property over its own ``head``, the digest
   of the root-file bytes it holds and its ``store_id``, and its signers are parsed from those same bytes, so no
@@ -33,6 +34,7 @@ the package implements :class:`CoverageSource` and hands the gate plain values.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -131,14 +133,36 @@ def _kill_depth(node: Any) -> int:
     return 1
 
 
+class _NotJSON(Exception):
+    """A guard field that is not JSON with string keys (``_json_form``)."""
+
+
+def _json_form(value: Any) -> tuple[str, int]:
+    # ``value``'s canonical text and its UTF-8 size; _NotJSON for a value that is not JSON with string keys,
+    # UnicodeEncodeError for text no UTF-8 holds (a lone surrogate)
+    try:
+        if not _str_keys(value):
+            raise _NotJSON
+        text = _canonical(value)
+    except (TypeError, ValueError, RecursionError):
+        raise _NotJSON from None
+    return text, len(text.encode("utf-8"))
+
+
 def guard_problem(guard: Any) -> str | None:
     """Why ``guard`` cannot be a graduation policy's signed guard, or ``None``. A guard is a non-empty list of at most
     :data:`GUARD_MAX_ENTRIES` entries, and EVERY entry is complete (DESIGN D83): exactly :data:`GUARD_ENTRY_FIELDS`, a
     non-blank ``rationale`` of at most :data:`GUARD_RATIONALE_MAX` characters, a ``kill_predicate`` this package's
     kill substrate evaluates (``kill_purity_error``) within :data:`GUARD_KILL_MAX_BYTES` and
     :data:`GUARD_KILL_MAX_DEPTH`, and a ``kill_drill`` (a concrete event, an object within
-    :data:`GUARD_DRILL_MAX_BYTES`) that the kill does not confidently let through (the compiler's drill gate). Never
-    raises."""
+    :data:`GUARD_DRILL_MAX_BYTES`), every field JSON text UTF-8 can hold.
+
+    The drill must not be one the kill confidently lets through (``kill_outcome`` FALSE: the compiler's drill gate).
+    A drill the kill cannot decide (UNKNOWN: a field it names is absent, or an operand it cannot compare) is accepted:
+    ``kill_trips``, the fire-time reading, treats UNKNOWN as a trip (fail-safe). Such a drill does not show the kill
+    can ever answer TRUE.
+
+    Never raises: an evaluation inside it that raises is answered as a problem naming the entry and the field."""
     if not isinstance(guard, (list, tuple)) or not guard:
         return "the guard is a non-empty list of entries"
     if len(guard) > GUARD_MAX_ENTRIES:
@@ -147,23 +171,34 @@ def guard_problem(guard: Any) -> str | None:
         what = f"guard[{i}]"
         if not isinstance(entry, Mapping):
             return f"{what} is not an object"
-        if set(entry) != GUARD_ENTRY_FIELDS:
-            return f"{what} must carry exactly {', '.join(sorted(GUARD_ENTRY_FIELDS))}"
         try:
-            if not _str_keys(entry):
-                raise ValueError
-            # one JSON form of the entry: what the kill substrate reads is plain dicts and lists, never a caller's
-            # mapping type
-            kill_text = _canonical(entry["kill_predicate"])
-            drill_text = _canonical(entry["kill_drill"])
-        except (TypeError, ValueError, RecursionError):
-            return f"{what} is not JSON with string keys"
+            keys = set(entry)
+        except Exception as exc:  # noqa: BLE001 - a mapping that cannot list its keys is a problem, never a raise
+            return f"{what} cannot be read ({type(exc).__name__})"
+        if keys != GUARD_ENTRY_FIELDS:
+            return f"{what} must carry exactly {', '.join(sorted(GUARD_ENTRY_FIELDS))}"
+        why = _entry_problem(what, entry)
+        if why is not None:
+            return why
+    return None
+
+
+def _entry_problem(what: str, entry: Mapping[str, Any]) -> str | None:
+    # one complete entry's problem (guard_problem's rule); ``at`` names the field each step reads, so an evaluation
+    # that raises is answered for that field
+    at = "rationale"
+    try:
         rationale = entry["rationale"]
         if not isinstance(rationale, str) or not rationale.strip():
             return f"{what}.rationale must be non-blank text (why this might be wrong)"
         if len(rationale) > GUARD_RATIONALE_MAX:
             return f"{what}.rationale is longer than {GUARD_RATIONALE_MAX} characters"
-        if len(kill_text.encode("utf-8")) > GUARD_KILL_MAX_BYTES:
+        rationale.encode("utf-8")
+        # one JSON form of each field: what the kill substrate reads is plain dicts and lists, never a caller's
+        # mapping type
+        at = "kill_predicate"
+        kill_text, kill_size = _json_form(entry["kill_predicate"])
+        if kill_size > GUARD_KILL_MAX_BYTES:
             return f"{what}.kill_predicate is longer than {GUARD_KILL_MAX_BYTES} bytes"
         kill = json.loads(kill_text)
         why = kill_purity_error(kill)
@@ -172,13 +207,21 @@ def guard_problem(guard: Any) -> str | None:
         depth = _kill_depth(kill)
         if depth > GUARD_KILL_MAX_DEPTH:
             return f"{what}.kill_predicate nests {depth} deep, more than {GUARD_KILL_MAX_DEPTH}"
-        if len(drill_text.encode("utf-8")) > GUARD_DRILL_MAX_BYTES:
+        at = "kill_drill"
+        drill_text, drill_size = _json_form(entry["kill_drill"])
+        if drill_size > GUARD_DRILL_MAX_BYTES:
             return f"{what}.kill_drill is longer than {GUARD_DRILL_MAX_BYTES} bytes"
         drill = json.loads(drill_text)
         if not isinstance(drill, dict):
             return f"{what}.kill_drill must be an object (a concrete event)"
         if kill_outcome(kill, drill) is Kleene.FALSE:
             return f"{what}.kill_drill does not trip its kill: a drill is an event the kill stops"
+    except _NotJSON:
+        return f"{what}.{at} is not JSON with string keys"
+    except UnicodeError:
+        return f"{what}.{at} is not text UTF-8 can hold (a lone surrogate)"
+    except Exception as exc:  # noqa: BLE001 - the rule answers every entry with a problem string, never a raise
+        return f"{what}.{at}: the gate cannot evaluate it ({type(exc).__name__})"
     return None
 
 
@@ -242,6 +285,9 @@ class GraduationPolicy:
     store_id: str
     born: int
     terms_text: str
+    # the signed terms construction parsed from terms_text (1026-21 RULINGS G1-6): what guarded, guard and a
+    # subclass's terms read, so nothing parses them again per peek
+    _terms: Any = field(default=None, init=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         # a policy built directly, not through from_record, is held to the shape from_record builds: any other is a
@@ -265,9 +311,9 @@ class GraduationPolicy:
                 raise ValueError(f"{what} is None or a public key string")
         if not isinstance(self.store_id, str) or not self.store_id:
             raise ValueError(f"store_id {str(self.store_id)[:40]!r} is not a store's id")
-        self._check_terms()
+        object.__setattr__(self, "_terms", self._check_terms())
 
-    def _check_terms(self) -> None:
+    def _check_terms(self) -> dict[str, Any]:
         # the terms are the bytes the incarnation names, and they say what every field says
         if type(self.born) is not int or self.born < 1:
             raise ValueError("born is the seq of the link that brought the policy in")
@@ -302,17 +348,18 @@ class GraduationPolicy:
             why = guard_problem(terms["guard"])
             if why is not None:
                 raise ValueError(f"the policy's signed guard covers nothing: {why}")
+        return terms
 
     @property
     def guarded(self) -> bool:
         """Whether the policy was signed with a guard (construction holds it to :func:`guard_problem`)."""
-        return "guard" in json.loads(self.terms_text)
+        return "guard" in self._terms
 
     @property
     def guard(self) -> tuple[dict[str, Any], ...]:
-        """The guard the policy was signed with, read from :attr:`terms_text` (``()`` when it carries none): a fresh
-        copy on every read, so no caller can change what another reads."""
-        return tuple(json.loads(self.terms_text).get("guard") or ())
+        """The guard the policy was signed with, as construction parsed it from :attr:`terms_text` (``()`` when it
+        carries none): a fresh copy on every read, so no caller can change what another reads."""
+        return tuple(copy.deepcopy(self._terms.get("guard") or ()))
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any], *, incarnation: str, born: int, born_signer: str | None,

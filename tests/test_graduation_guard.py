@@ -53,8 +53,13 @@ def world(tmp_path) -> World:
     return World(tmp_path)
 
 
+def drill(**fields) -> dict:
+    """A drill in the one shape these tests use: an event's ``fields`` (``TEST_GUARD``'s shape too)."""
+    return {"fields": fields}
+
+
 def entry(**over) -> dict:
-    e = {"rationale": "a spoofed sender", "kill_predicate": dict(KILL), "kill_drill": {"dmarc": "fail"}}
+    e = {"rationale": "a spoofed sender", "kill_predicate": dict(KILL), "kill_drill": drill(dmarc="fail")}
     e.update(over)
     return e
 
@@ -122,12 +127,12 @@ _SHAPE = "grant.guard must be a list of objects"     # the record's own shape re
     ([entry(rationale="r" * (GUARD_RATIONALE_MAX + 1))], f"longer than {GUARD_RATIONALE_MAX} characters"),
     ([entry(kill_predicate={"op": "matches", "field": "x", "value": "y"})], "not a kill the gate can evaluate"),
     ([entry(kill_predicate={"op": "in", "field": "x", "value": []})], "not a kill the gate can evaluate"),
-    ([entry(kill_drill={"dmarc": "pass"})], "kill_drill does not trip its kill"),
+    ([entry(kill_drill=drill(dmarc="pass"))], "kill_drill does not trip its kill"),
     ([entry()] * (GUARD_MAX_ENTRIES + 1), f"more than {GUARD_MAX_ENTRIES}"),
     ([entry(kill_predicate=nested(GUARD_KILL_MAX_DEPTH + 1))], f"more than {GUARD_KILL_MAX_DEPTH}"),
     ([entry(kill_predicate={"op": "in", "field": "x", "value": ["v" * 50] * 100})],
      f"longer than {GUARD_KILL_MAX_BYTES} bytes"),
-    ([entry(kill_drill={"dmarc": "fail", "pad": "p" * GUARD_DRILL_MAX_BYTES})],
+    ([entry(kill_drill=drill(dmarc="fail", pad="p" * GUARD_DRILL_MAX_BYTES))],
      f"longer than {GUARD_DRILL_MAX_BYTES} bytes"),
 ])
 def test_an_incomplete_or_oversized_guard_is_refused_at_sign(world, guard, why):
@@ -204,7 +209,7 @@ def test_a_policy_cannot_carry_terms_its_incarnation_does_not_name(world):
     [p] = graduation_policies(world.state())
     terms = json.loads(p.terms_text)
     terms["guard"] = [entry(kill_predicate={"op": "==", "field": "dmarc", "value": "none"},
-                            kill_drill={"dmarc": "none"})]
+                            kill_drill=drill(dmarc="none"))]
     altered = auth._canonical(terms)
     with pytest.raises(ValueError, match="not the ones the policy's incarnation names"):
         dataclasses.replace(p, terms_text=altered)
@@ -231,6 +236,88 @@ def test_the_guard_read_is_a_copy(world):
     [p] = graduation_policies(world.state())
     p.guard[0]["kill_predicate"]["value"] = "pass"
     assert p.guard[0]["kill_predicate"] == KILL
+
+
+# --- G1 L3 r1 (1026-21 RULINGS "G1 L3 r1 triage" G1-3, G1-6, G1-8) ------------------------------------------------
+
+_HUGE = 10 ** 400        # an integer JSON carries; the kill substrate's float() of it overflows
+_GT5 = {"op": ">", "field": "n", "value": 5}
+
+
+@pytest.mark.parametrize("guard,names", [
+    ([entry(kill_predicate=_GT5, kill_drill=drill(n=_HUGE))], "guard[0].kill_drill"),
+    ([entry(kill_predicate={"op": ">", "field": "n", "value": _HUGE}, kill_drill=drill(n=1))],
+     "guard[0].kill_predicate"),
+    ([entry(kill_predicate={"op": "in", "field": "n", "value": [_HUGE]}, kill_drill=drill(n=1))],
+     "guard[0].kill_drill"),
+    ([entry(kill_predicate={"op": "==", "field": "s", "value": "\ud800"})], "guard[0].kill_predicate"),
+    ([entry(kill_drill=drill(dmarc="fail", s="\ud800"))], "guard[0].kill_drill"),
+    ([entry(rationale="why \ud800")], "guard[0].rationale"),
+    ([entry(), entry(kill_drill={"fields": {"dmarc": "fail"}, 1: "x"})], "guard[1].kill_drill"),
+    ([entry(kill_predicate={"op": "==", "field": "dmarc", "value": "fail", 1: "x"})], "guard[0].kill_predicate"),
+])
+def test_guard_problem_never_raises_and_names_the_entry_and_field(guard, names):
+    """G1-3 and G1-8 (deepseek #6): an overflowing number, a lone surrogate or a non-string key in any field is a
+    problem string naming the entry and the field, never an exception out of the one rule."""
+    why = guard_problem(guard)
+    assert why is not None and why.startswith(names), why
+
+
+@pytest.mark.parametrize("seam,exc,names", [
+    ("kill_outcome", TypeError("'>' not supported between instances of 'str' and 'int'"), "guard[0].kill_drill"),
+    ("_kill_depth", RecursionError("maximum recursion depth exceeded"), "guard[0].kill_predicate"),
+    ("kill_purity_error", OverflowError("int too large to convert to float"), "guard[0].kill_predicate"),
+])
+def test_guard_problem_answers_an_evaluation_that_raises(monkeypatch, seam, exc, names):
+    """G1-3: whatever an evaluation inside the rule raises (the kill substrate promises never to, and the overflow
+    above shows a promise is not a proof) is a problem string naming the entry and the field."""
+    import levain.autonomic.coverage as coverage
+
+    def raises(*_a, **_k):
+        raise exc
+    monkeypatch.setattr(coverage, seam, raises)
+    why = guard_problem([entry()])
+    assert why is not None and why.startswith(names) and type(exc).__name__ in why, why
+
+
+def test_a_drill_the_kill_cannot_decide_is_accepted_as_a_trip():
+    """G1-3 (deepseek's ``"abc" > 5``) and G1-7: the kill substrate answers UNKNOWN for a non-numeric operand, never a
+    TypeError; an UNKNOWN drill is accepted because the fire-time ``kill_trips`` stops on UNKNOWN (fail-safe)."""
+    from levain.autonomic.kill import Kleene, kill_outcome, kill_trips
+    assert kill_outcome(_GT5, drill(n="abc")) is Kleene.UNKNOWN and kill_trips(_GT5, drill(n="abc"))
+    assert guard_problem([entry(kill_predicate=_GT5, kill_drill=drill(n="abc"))]) is None
+
+
+def test_a_guard_the_gate_cannot_evaluate_is_refused_at_sign_and_by_the_policy_object(world):
+    """G1-3 end to end: the append refuses it as the log's own refusal (no OverflowError out of the append), and a
+    record carrying it is a ValueError from ``from_record`` (the replay source's one refusal)."""
+    from levain.autonomic.coverage import GraduationPolicy
+    from tests.autonomic_test_only_coverage import terms_incarnation
+    bad = [entry(kill_predicate=_GT5, kill_drill=drill(n=_HUGE))]
+    seq = world.state().seq
+    assert "is refused at sign: guard[0].kill_drill" in world.refused({"op": "create_grant",
+                                                                       "grant": grad(world, guard=bad)})
+    assert world.state().seq == seq
+    record = {k: v for k, v in grad(world, guard=bad).items()}
+    with pytest.raises(ValueError, match=r"guard\[0\]\.kill_drill"):
+        GraduationPolicy.from_record(record, incarnation=terms_incarnation(record, 1), born=1, born_signer=None,
+                                     current_signer=None)
+
+
+def test_the_signed_terms_are_parsed_once_at_construction(world, monkeypatch):
+    """G1-6: ``guarded``, ``guard`` and ``min_clean_fires`` read what construction parsed; ``live`` (every policy, every
+    peek) parses nothing."""
+    import levain.autonomic.coverage as coverage
+    world.link({"op": "create_grant", "grant": grad(world)})
+    [p] = graduation_policies(world.state())
+    view = snapshot_of(world)
+
+    def no_parse(*_a, **_k):
+        raise AssertionError("the signed terms were parsed after construction")
+    monkeypatch.setattr(coverage.json, "loads", no_parse)
+    assert p.guarded and live(p, world.clock.now, view._root_keys)
+    assert list(p.guard) == [dict(e) for e in TEST_GUARD]
+    assert p.min_clean_fires == grad(world)["min_clean_fires"]
 
 
 def test_an_unlisted_signer_covers_nothing_and_two_covering_policies_name_the_strictest_rungs_least_value(world):
@@ -327,7 +414,7 @@ def test_the_cli_refuses_a_guard_it_could_not_sign_before_signing_and_prints_the
     j = Journey(tmp_path, monkeypatch)
     seq = j.auth.state().seq
     bad = tmp_path / "bad.json"
-    bad.write_text(json.dumps([entry(kill_drill={"dmarc": "pass"})]))
+    bad.write_text(json.dumps([entry(kill_drill=drill(dmarc="pass"))]))
     assert j.cli("policy", "create", "--action", "link0", "--lowest", "ON_LOOP", "--id", GP, "--guard", str(bad)) == 1
     assert "kill_drill does not trip its kill" in capsys.readouterr().err and j.auth.state().seq == seq
     assert j.cli("policy", "create", "--action", "link0", "--lowest", "ON_LOOP", "--id", GP, "--guard",

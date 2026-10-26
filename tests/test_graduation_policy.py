@@ -254,6 +254,33 @@ def test_the_replayed_policy_carries_its_signed_min_clean_fires(world):
     assert isinstance(p, gp.TermedGraduationPolicy) and p.min_clean_fires == 100
 
 
+def test_min_clean_fires_has_one_source_the_signed_terms(world):
+    """G1-5 (1026-21 RULINGS "G1 L3 r1 triage"): the term is read from the policy's signed ``terms_text``; a caller
+    value that disagrees is refused, never carried beside the signed one."""
+    create(world, min_clean_fires=100)
+    [p] = gp.graduation_policies(world.state())
+    assert gp.TermedGraduationPolicy.of(p).min_clean_fires == 100
+    assert gp.TermedGraduationPolicy.of(p, min_clean_fires=100).min_clean_fires == 100
+    with pytest.raises(ValueError, match="not its signed term"):
+        gp.TermedGraduationPolicy.of(p, min_clean_fires=5)
+
+
+def test_a_graduation_grant_the_replay_has_no_birth_for_warns_once(world, caplog):
+    """G1-8 (deepseek #4): a graduation grant present in the policy but absent from ``grant_born`` covers nothing, and
+    says so once per grant, so a replay defect is not read as a revoke."""
+    import dataclasses
+    import logging
+    create(world)
+    state = world.state()
+    unborn = dataclasses.replace(state, grant_born={})
+    gp._UNBORN_WARNED.discard(GP)
+    with caplog.at_level(logging.WARNING, logger="levain.graduation_policy"):
+        assert gp.graduation_policies(unborn) == () and gp.graduation_policies(unborn) == ()
+    said = [r.getMessage() for r in caplog.records if GP in r.getMessage()]
+    assert len(said) == 1 and "grant_born" in said[0], said
+    assert [q.grant_id for q in gp.graduation_policies(state)] == [GP]
+
+
 # --- S4 slice 1, L3 r1 fixes (1025-25/14b_s4/RULINGS_S1_R1.md) ---------------------------------------------------
 
 def copy_db(src: Path, dst: Path) -> None:
