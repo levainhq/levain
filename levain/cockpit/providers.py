@@ -98,7 +98,7 @@ def _store_label(db: Path) -> str:
 
 
 # A built view is served again until one of the files it reads changes, or this many seconds pass. The age bound
-# is for what a file signature cannot see: the seed/config docs, the state line's expiry, the jar's day.
+# is for what a file signature cannot see: the state line's expiry, the jar's day, and files below seed/ or activation/.
 VIEW_CACHE_MAX_AGE_S = 30.0
 VIEW_CACHE_SOURCES = 8
 _view_cache: dict[int, tuple[Any, tuple, float, SubstrateView]] = {}
@@ -128,6 +128,17 @@ def _store_signature(source: Any) -> tuple | None:
     ledger = ledger if ledger is not None else (Path(root) / ".levain" if root is not None else None)
     files = [db, Path(f"{db}-wal"), Path(f"{db}-shm"), anneal.continuity_md, anneal.crystal_json, anneal.spores_json,
              getattr(source, "context_json", None), Path(ledger) / "edits.jsonl" if ledger is not None else None]
+    if root is not None:
+        # the config docs: the install dir, its seed/ and activation/ dirs (a removed or added file moves the
+        # dir) and every file directly in them (an edit in place moves only the file), and the config file
+        root = Path(root)
+        files += [root, root / ".levain" / "config.json"]
+        for d in (root / "seed", root / "activation"):
+            files.append(d)
+            try:
+                files += sorted(d.iterdir())
+            except OSError:
+                pass
     return tuple(_stat_of(Path(f)) if f is not None else None for f in files)
 
 

@@ -119,3 +119,17 @@ def test_the_cache_is_bounded_in_age(counted, monkeypatch) -> None:
     monkeypatch.setattr(providers.time, "monotonic", lambda real=providers.time.monotonic: real() + providers.VIEW_CACHE_MAX_AGE_S + 1)
     ck.panel("health")
     assert len(calls) == 2
+
+
+def test_a_config_doc_edit_or_removal_rebuilds(counted) -> None:
+    root, _s, ck, _clock, calls = counted
+    origin = root / "seed" / "origin.md"
+    assert origin.exists()
+    ck.panel("health")
+    origin.write_text(origin.read_text() + "\nmore words in place\n")
+    ck.panel("health")
+    assert len(calls) == 2
+    import shutil
+    shutil.rmtree(root / "seed")
+    ck.panel("health")
+    assert len(calls) == 3
