@@ -126,6 +126,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   it. When the machine (not the artifact) fails to read the export, the follower stops by name and tries again on its
   next step; an artifact that can never be taken (missing bundle, wrong digest) is set aside after three tries, without
   an acknowledgement, so it no longer blocks later events. Nothing runs it yet.
+- **Chat records a vendor's copy of your own message as an echo, not as an outside line.** When a worker's thread
+  shows the words you just sent, in the same turn and within a minute, it no longer takes the turn away from you; any
+  other line typed outside Levain still does. The timeline marks the echo as the vendor's copy.
+- **Chat stores made by an earlier release are brought current when they are opened,** in one transaction that keeps
+  every row, replaces any view, trigger or index whose text changed, and checks the file's integrity before committing.
+  A store on a file Levain cannot write is read as it is and never changed.
 
 ## [0.11.26] — 2026-10-25
 
