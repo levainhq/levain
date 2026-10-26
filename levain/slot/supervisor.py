@@ -20,9 +20,9 @@ It holds two things the slot must never reach: the LEASE (the CONTROL connection
 Every helper call answers exactly one canonical JSON line (§5 preamble) that :func:`parse_helper_line` reads; ``start``
 answers on the pty after the vendor's own bytes, so :func:`start_result` reads it from the stream's tail.
 
-The firewall self-probe (§2c 9: "the launcher connects off-list AS the slot uid and refuses to start if it succeeds")
-needs the slot's uid, which only root can take, and §5.1 has no verb for it: :attr:`Seams.firewall_probe` is the
-named seam, ``None`` until a helper verb exists, and every launch says it did not run.
+The firewall self-probe (§2c 9, V13) is the helper's ``probe`` verb: root connects to the vendor's own addresses as
+the slot uid inside its wall. It runs between ``render`` and ``start`` and the launch proceeds only on ``closed``
+(:meth:`Supervisor._launch_probe`).
 """
 from __future__ import annotations
 
@@ -711,7 +711,8 @@ START_GRACE_S = 10.0       # DECISION: after teardown, how long `start` gets to 
 #: DECISION: the wall each helper verb gets before it is ended (TERM, then KILL) and refused ``helper-timeout``.
 #: prepare takes two locks and an ATTACH; render validates, starts the front and mints; teardown is END (freeze,
 #: kill, retain), the longest. Generous: they bound a wedge, they do not time normal work.
-HELPER_DEADLINE_S: Mapping[str, float] = {"prepare": 120.0, "render": 300.0, "teardown": 600.0}
+#: probe: root's bounded DNS, CONTROL before and after, the session lock and the child's reap (V13 §6).
+HELPER_DEADLINE_S: Mapping[str, float] = {"prepare": 120.0, "render": 300.0, "probe": 45.0, "teardown": 600.0}
 HELPER_DEADLINE_DEFAULT_S = 120.0
 _HELPER_OUT_MAX = 1 << 20  # DECISION: a helper answer past this is no single line: refused malformed
 _HELPER_ERR_KEEP = 1 << 16
@@ -759,7 +760,7 @@ class Request:
 @dataclass
 class Seams:
     """Every act with a real default. ``helper`` is the argv prefix the verbs follow (tests run a fake helper script
-    there, no sudo); ``firewall_probe(session)`` is §2c 9's seam (``None``: no helper verb exists, said at launch)."""
+    there, no sudo)."""
 
     host: str = field(default_factory=_host)
     helper: Optional[Sequence[str]] = None
@@ -776,7 +777,6 @@ class Seams:
     err: Optional[IO[str]] = None
     uid: Callable[[], int] = os.getuid
     env: Optional[Mapping[str, str]] = None
-    firewall_probe: Optional[Callable[[str], None]] = None
     tmp_parent: Optional[Path] = None
     start_grace_s: float = START_GRACE_S
     helper_deadline_s: Mapping[str, float] = field(default_factory=lambda: dict(HELPER_DEADLINE_S))
@@ -1161,10 +1161,7 @@ class Supervisor:
             self._check()
             self.helper("render", session, stdin=blob)
             self._check()
-            if self.s.firewall_probe is None:
-                self.say("firewall self-probe not run: the runtime helper has no verb for it yet (BUILD_PLAN §2c 9)")
-            else:
-                self.s.firewall_probe(session)
+            self._launch_probe(session)
             self._check()
             ok = self._start(session)
         except Refused as e:
@@ -1178,6 +1175,16 @@ class Supervisor:
             finally:
                 self._end_start()
         return 0 if ok and self.stop_signal is None else 1
+
+    def _launch_probe(self, session: str) -> None:
+        """V13 at launch (R2): the session starts only on ``closed``. Every refusal (``firewall-open``, every
+        ``inconclusive``, every ``unknown``) raises through :meth:`helper`, and an ``ok`` that is not ``closed`` is
+        refused ``firewall-probe-malformed``."""
+        out = self.helper("probe", session)
+        if out.get("probe") != "closed":
+            raise Refused("firewall-probe-malformed", "probe")
+        self.say(f"firewall self-probe: closed ({out.get('host')} {out.get('address')} not reachable as the slot; "
+                 f"{out.get('addresses')} addresses)")
 
     def _teardown(self, session: str) -> bool:
         try:

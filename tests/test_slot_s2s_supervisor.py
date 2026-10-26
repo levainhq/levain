@@ -70,7 +70,8 @@ verb, args = sys.argv[1], sys.argv[2:]
 store, log = os.environ["FAKE_STORE"], os.environ["FAKE_LOG"]
 data = sys.stdin.buffer.read().decode() if verb in ("prepare", "render") else ""
 with open(log, "a") as f:
-    f.write(json.dumps({"verb": verb, "args": args, "stdin": data, "fds": fds, "tty": os.isatty(0)}) + "\n")
+    f.write(json.dumps({"verb": verb, "args": args, "stdin": data, "fds": fds, "tty": os.isatty(0),
+                        "null0": os.path.samestat(os.fstat(0), os.stat(os.devnull))}) + "\n")
 def line(obj):
     sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
     sys.stdout.flush()
@@ -122,6 +123,32 @@ elif verb == "start":
     else:
         os.write(1, b"bye no newline ")
         line({"exit": 3, "ok": True})
+elif verb == "probe":
+    # FAKE_PROBES: one outcome per probe call, in order (the last repeats): closed, malformed, slow:<s> (then
+    # closed), hang, or a refusal name.
+    seq = os.environ.get("FAKE_PROBES", "closed").split(",")
+    count = os.path.join(store, "probes")
+    n = int(open(count).read()) if os.path.exists(count) else 0
+    with open(count, "w") as f:
+        f.write(str(n + 1))
+    what = seq[min(n, len(seq) - 1)]
+    if what.startswith("slow:"):
+        open(os.path.join(store, "probing"), "w").close()
+        time.sleep(float(what[5:]))
+        os.remove(os.path.join(store, "probing"))
+        what = "closed"
+    if what == "hang":
+        open(os.path.join(store, "probing"), "w").close()
+        while True:
+            time.sleep(0.05)
+    if what == "closed":
+        line({"address": "192.0.2.10", "addresses": 2, "host": "api.anthropic.com", "ok": True, "probe": "closed"})
+    elif what == "malformed":
+        line({"ok": True, "probe": "open"})
+    else:
+        sys.stderr.write("levain runtime-helper: refused %%s: api.anthropic.com 192.0.2.10\n" %% what)
+        line({"ok": False, "refused": what})
+        sys.exit(1)
 elif verb == "teardown":
     open(os.path.join(store, "torn"), "w").close()
     line({"ok": True, "state": os.environ.get("FAKE_END", "RETAINED")})
@@ -264,7 +291,7 @@ def test_full_sequence_against_fake_helper(tmp_path: Path, monkeypatch: pytest.M
     rig = Rig(tmp_path, monkeypatch)
     code = rig.run()
     v = rig.verbs()
-    assert [x["verb"] for x in v] == ["prepare", "render", "start", "teardown"]
+    assert [x["verb"] for x in v] == ["prepare", "render", "probe", "start", "teardown"]
     assert v[0]["args"] == ["egress", "interactive", "claude", "brokered"]
     assert v[0]["stdin"] == '{"lease_nonce":"nonce-XYZ"}'
     blob = json.loads(v[1]["stdin"])
@@ -279,7 +306,6 @@ def test_full_sequence_against_fake_helper(tmp_path: Path, monkeypatch: pytest.M
     err = rig.stderr()
     assert f"session {SESSION} ended RETAINED: the work is kept at {rig.store}/retained/{SESSION}/tree" in err
     assert "claude exited 3" in err
-    assert "firewall self-probe not run" in err
 
 
 def test_every_child_holds_only_fds_0_1_2_and_start_has_a_pty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -287,8 +313,8 @@ def test_every_child_holds_only_fds_0_1_2_and_start_has_a_pty(tmp_path: Path, mo
     rig = Rig(tmp_path, monkeypatch)
     rig.run()
     v = rig.verbs()
-    assert [x["fds"] for x in v] == [[0, 1, 2]] * 4
-    assert [x["tty"] for x in v] == [False, False, True, False]
+    assert [x["fds"] for x in v] == [[0, 1, 2]] * 5
+    assert [x["tty"] for x in v] == [False, False, False, True, False]
     out = rig.out.read_bytes()
     assert b"fds=[0, 1, 2]" in out
 
@@ -339,7 +365,7 @@ def test_sigterm_mid_session_tears_down_then_closes_the_lease(tmp_path: Path, mo
     t.start()
     code = rig.run()
     t.join(5)
-    assert [x["verb"] for x in rig.verbs()] == ["prepare", "render", "start", "teardown"]
+    assert [x["verb"] for x in rig.verbs()] == ["prepare", "render", "probe", "start", "teardown"]
     assert code == 1
     assert "SIGTERM: ending session" in rig.stderr()
     assert f"session {SESSION} ended RETAINED" in rig.stderr()

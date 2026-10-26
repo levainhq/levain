@@ -90,7 +90,7 @@ def test_vendor_exit_with_a_stalled_terminal_goes_to_the_bounded_drain_and_teard
         closing(out_r, out_w)
     err = r.stderr()
     assert took < 20
-    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "start", "teardown"]
+    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "probe", "start", "teardown"]
     assert f"session {SESSION} ended RETAINED" in err
     left = int(re.search(r"your terminal did not take the session's last (\d+) bytes", err).group(1))
     assert left >= 4 * 65536                 # all of it was still held, and all of it is counted
@@ -215,7 +215,7 @@ def test_held_status_lines_never_block_the_runs_return(tmp_path: Path, monkeypat
         r.seams.err.close()
     assert took < 25
     assert sup.unshown_lines >= 5            # the launch line, the session, the probe, the exit, the teardown
-    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "start", "teardown"]
+    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "probe", "start", "teardown"]
     assert r.calls[-1] == ("close",)         # the lease closed before the held lines were tried
 
 
@@ -263,7 +263,7 @@ def test_stdout_error_mid_session_ends_the_relay_into_teardown(tmp_path: Path, m
     assert "your terminal refused the session's output" in err
     assert int(re.search(r"your terminal did not take the session's last (\d+) bytes", err).group(1)) > 0
     assert "start did not exit after the vendor's terminal closed" not in err   # no wait on a vendor still running
-    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "start", "teardown"]
+    assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "probe", "start", "teardown"]
     assert f"session {SESSION} ended RETAINED" in err
 
 
