@@ -19,6 +19,7 @@ WAIT = {"eval": "new Promise(r => setTimeout(r, 300))"}
 HTML = "document.documentElement.classList.contains('calm')"
 BTN = "(() => { const b = document.getElementById('calmbtn'); return JSON.stringify([b.getAttribute('aria-pressed'), b.textContent]); })()"
 CLICK = {"eval": "document.getElementById('calmbtn').click(); 1"}
+CLICK_PHONE = {"eval": "document.getElementById('calmphone').click(); 1"}
 # a probe element that asks for an infinite animation: under Calm the page's one rule must win over it
 ANIM = ("(() => { const d = document.createElement('div'); d.style.animation = 'spin 1s linear infinite'; document.body.appendChild(d); "
         "const n = getComputedStyle(d).animationName; d.remove(); return n; })()")
@@ -103,25 +104,47 @@ out.tick = [K.AGE_TICK_MS, K.CALM_AGE_TICK_MS];
     assert out["tick"][1] > out["tick"][0]
 
 
+# the first row's element rects at 13c4d885 (before any Calm control), measured in a scratch checkout of that commit with this test's emulation
+# (fixture of test_cockpit_k7_build, 800 px tall, dpr 2): [left, top, right, bottom]
+ROW1_AT_13C4D885 = {
+    320: {"brand": [28, 38, 50, 54], "live": [54, 43, 61, 50], "sync": [65, 24, 120, 68], "jump": [124, 24, 168, 68], "theme": [172, 24, 292, 68], "tabs": [28, 76, 305, 124]},
+    375: {"brand": [28, 38, 105, 54], "live": [109, 43, 116, 50], "sync": [120, 24, 175, 68], "jump": [179, 24, 223, 68], "theme": [227, 24, 347, 68], "tabs": [28, 76, 347, 124]},
+    430: {"brand": [28, 38, 144, 54], "live": [152, 43, 159, 50], "sync": [167, 24, 222, 68], "jump": [230, 24, 274, 68], "theme": [282, 24, 402, 68], "tabs": [28, 76, 402, 124]},
+}
+
+
 @needs_browser
 @pytest.mark.parametrize("width", [320, 375, 430])
-def test_on_a_phone_calm_is_an_icon_in_the_first_row_beside_search_the_same_size(tmp_path, monkeypatch, width):
-    """C5: no third row. Calm is icon-only (its name is its aria-label and title), the size of the search icon, on the first
-    row with Sync, search and the theme switch: every one inside the viewport and none overlapping another."""
+def test_on_a_phone_the_first_row_is_untouched_and_calm_is_a_labelled_button_beside_the_clock(tmp_path, monkeypatch, width):
+    """C8: the phone bar's first row and tabs have the geometry they had at 13c4d885 (the wordmark as whole as it was), and Calm is a
+    text-labelled button of full touch size at the right of the clock and date: in the viewport, overlapping nothing. The masthead copy is
+    hidden on a phone; the two stay in step (label, aria-pressed) whichever is pressed."""
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    probe = """(() => { const q = (s) => document.querySelector(s), r = (e) => e.getBoundingClientRect();
-      const ids = ['#refresh', '#calmbtn', '#jumpbtn', '.masthead .themesw'].map((s) => r(q(s)));
-      const c = q('#calmbtn'), j = r(q('#jumpbtn')), cr = r(c), tabs = r(q('.masthead .seg'));
-      let overlap = false; for (let a = 0; a < ids.length; a++) for (let b = a + 1; b < ids.length; b++)
-        if (ids[a].left < ids[b].right - 0.5 && ids[b].left < ids[a].right - 0.5 && ids[a].top < ids[b].bottom - 0.5 && ids[b].top < ids[a].bottom - 0.5) overlap = true;
-      return JSON.stringify({ sameRow: ids.every((b) => Math.abs(b.top - ids[0].top) < 30), belowTabs: cr.top >= tabs.top,
-        sameSize: Math.abs(cr.width - j.width) < 1 && Math.abs(cr.height - j.height) < 1, inside: ids.every((b) => b.left >= 0 && b.right <= innerWidth),
-        overlap, textHidden: getComputedStyle(c).fontSize === '0px', label: c.getAttribute('aria-label'), title: c.title, pressed: c.getAttribute('aria-pressed'),
-        sw: document.documentElement.scrollWidth, vw: innerWidth }); })()"""
-    out = _run(tmp_path, src, [{"eval": "new Promise(r => setTimeout(r, 300))"}, {"eval": probe}, CLICK, {"eval": probe}],
+    probe = """(() => { const q = (s) => document.querySelector(s), r = (e) => { const b = e.getBoundingClientRect(); return [Math.round(b.left), Math.round(b.top), Math.round(b.right), Math.round(b.bottom)]; };
+      const wm = q('.masthead .brand .wordmark'), c = q('#calmphone'), cr = c.getBoundingClientRect(), m = q('#calmbtn');
+      const tr = (e) => { const g = document.createRange(); g.selectNodeContents(e); return g.getBoundingClientRect(); };   // the text's own box: .clock and .date are block-wide
+      const others = [['masthead', q('.masthead').getBoundingClientRect()], ['clock', tr(q('.clockbox .clock'))], ['date', tr(q('.clockbox .date'))],
+        ...['.band-state', '.band-meta'].map((s) => q(s)).filter(Boolean).map((e) => [e.className, tr(e)])];
+      const hit = (a, b) => a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5;
+      const textRight = Math.max(tr(q('.clockbox .clock')).right, tr(q('.clockbox .date')).right);
+      return JSON.stringify({ row1: { brand: r(q('.masthead .brand')), live: r(q('.masthead .livechip')), sync: r(q('#refresh')), jump: r(q('#jumpbtn')), theme: r(q('.masthead .themesw')), tabs: r(q('.masthead .seg')) },
+        wordmarkCut: wm.scrollWidth > wm.clientWidth, cr: [Math.round(cr.left), Math.round(cr.top), Math.round(cr.right), Math.round(cr.bottom)],
+        inside: cr.left >= 0 && cr.right <= innerWidth && cr.top >= 0 && cr.bottom <= innerHeight, h: cr.height, rightOfClock: cr.left >= textRight,
+        overlaps: others.filter(([, b]) => b.width > 0 && hit(cr, b)).map(([n]) => n),
+        text: c.textContent, fontSize: getComputedStyle(c).fontSize, pressed: c.getAttribute('aria-pressed'), label: c.getAttribute('aria-label'), mastheadCalmShown: getComputedStyle(m).display !== 'none',
+        mastheadText: m.textContent, mastheadPressed: m.getAttribute('aria-pressed'), sw: document.documentElement.scrollWidth, vw: innerWidth }); })()"""
+    press_masthead = {"eval": "document.getElementById('calmbtn').click(); 1"}
+    out = _run(tmp_path, src, [{"eval": "new Promise(r => setTimeout(r, 300))"}, {"eval": probe}, CLICK_PHONE, {"eval": probe}, CLICK_PHONE, press_masthead, {"eval": probe}],
                first={"emulate": {"w": width, "h": 800, "dpr": 2, "mobile": True}})
-    off, on = json.loads(out[-3]), json.loads(out[-1])
-    for got, name, pressed in ((off, "Calm off", "false"), (on, "Calm on", "true")):
-        assert got["sameRow"] and not got["belowTabs"] and got["sameSize"] and got["inside"] and not got["overlap"], got
-        assert got["textHidden"] and got["label"] == name and got["title"] == name and got["pressed"] == pressed, got
+    off, on, back = json.loads(out[-6]), json.loads(out[-4]), json.loads(out[-1])
+    # off; the phone button pressed (on); the phone button pressed off, then the hidden masthead button pressed on by script (on again)
+    for got in (off, on, back):
+        for key, rect in ROW1_AT_13C4D885[width].items():
+            assert all(abs(a - b) <= 1 for a, b in zip(got["row1"][key], rect)), (key, got["row1"][key], rect)
+        assert width == 320 or not got["wordmarkCut"], got   # whole where 13c4d885 had it whole (375 and 430); at 320 it was already the dot alone
+        assert got["inside"] and got["rightOfClock"] and got["h"] >= 36 and not got["overlaps"], got
+        assert got["fontSize"] != "0px" and got["text"] in ("Calm off", "Calm on") and got["mastheadCalmShown"] is False, got
         assert got["sw"] <= got["vw"], got
+        assert got["text"] == got["mastheadText"] == got["label"] and got["pressed"] == got["mastheadPressed"], got
+    assert (off["text"], on["text"], back["text"]) == ("Calm off", "Calm on", "Calm on"), (off["text"], on["text"], back["text"])
+    assert (off["pressed"], on["pressed"], back["pressed"]) == ("false", "true", "true")
