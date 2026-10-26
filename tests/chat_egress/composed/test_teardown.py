@@ -9,6 +9,8 @@ import pytest
 
 from .conftest import _shutdown
 
+pytestmark = pytest.mark.chat_egress_srt
+
 
 def test_shutdown_after_stop_leaves_an_unrelated_descriptor_that_reused_the_number_open(make_origin,
                                                                                          make_launch_) -> None:
