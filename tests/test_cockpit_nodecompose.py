@@ -346,3 +346,42 @@ def test_a_job_verb_confirmed_after_the_page_turned_read_only_says_nothing_was_s
     assert text and "nothing was sent" in text.lower(), out["values"]
     assert jobs == 0, out["values"]
     assert not [e for e in errs if "ResizeObserver" not in e] and [p for p in _verb_posts(out) if not p.get("dry_run")] == [], out["values"]
+
+
+@needs_browser
+def test_a_signed_send_whose_page_turned_read_only_during_the_ceremony_says_nothing_was_sent_and_posts_nothing(tmp_path, monkeypatch):
+    # X1 (complement MED 1 + codex MED, fix r4 verify): a signed verb passes the commitAction check, then awaits the ceremony; a read-only
+    # render during that await takes commitAction away. The ceremony is held at its first read (the sign listing) and released after the render.
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    spy = ("window.__orig = window.LevainDashboard.render; window.LevainDashboard.render = (v, o) => { window.__v = v; window.__o = o; return window.__orig(v, o); }; "
+           "window.__errs = []; window.addEventListener('error', e => window.__errs.push(String(e.message))); "
+           "window.addEventListener('unhandledrejection', e => window.__errs.push(String(e.reason))); 1")
+    # pass 1: an unsigned send, to read the verb, panel and params the box posts (they key the signed draft)
+    probe = ("(() => { window.__posts = []; window.__orig(window.__v, Object.assign({}, window.__o, {commitAction: async (...a) => { window.__posts.push(a); return {ok: false, message: 'probe'}; }})); "
+             "const b = %s; b.querySelector('.tray-dump-ta').value = 'hi'; b.querySelector('.tray-dump-btn').click(); const y = b.querySelector('.verb-confirm'); if (y) y.click(); return 1; })()") % CARD_BOX
+    # pass 2: the same words as a signed send whose draft is already signed; the listing read that precedes it is held
+    canon = ("const canon = (v) => Array.isArray(v) ? '[' + v.map(canon).join(',') + ']' : v && typeof v === 'object' ? "
+             "'{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + canon(v[k])).join(',') + '}' : JSON.stringify(v === undefined ? null : v); ")
+    held = (canon + "const p = window.__posts[0]; "
+            "sessionStorage.setItem('levain-signed-drafts', JSON.stringify({[canon([p[0], p[4] || null, p[1]])]: {txn: 't1', request: 'np-r1', signed: true, at: Date.now()}})); "
+            "for (const s of Object.values(window.__v.action_verbs || {})) { if (s) s.sign = true; } "
+            "window.LevainCockpitTransport = {headers: () => ({'X-Levain-Write-Token': 'tok'})}; "
+            "const realFetch = window.fetch; window.__release = null; "
+            "window.fetch = (u, o) => /sign\\.json/.test(String(u)) ? new Promise((res) => { window.__release = () => res(new Response(JSON.stringify("
+            "{requests: [], signers: [], origin: location.origin}), {status: 200, headers: {'Content-Type': 'application/json'}})); }) : realFetch(u, o); "
+            "window.__posts = []; window.__orig(window.__v, Object.assign({}, window.__o, {commitAction: async (...a) => { window.__posts.push(a); return {ok: true}; }})); "
+            "window.__b = %s; window.__b.querySelector('.tray-dump-ta').value = 'hi'; document.body.appendChild(window.__b); "
+            "window.__b.querySelector('.tray-dump-btn').click(); const y = window.__b.querySelector('.verb-confirm'); if (y) y.click(); return typeof window.__release; ") % CARD_BOX
+    held = "(() => { " + held + "})()"
+    readonly = "window.__orig(window.__v, {}); 1"
+    release = "window.__release(); 1"
+    said = "JSON.stringify([(window.__b.querySelector('.edit-msg') || {}).textContent, window.__errs, window.__posts.length])"
+    out = _out(tmp_path, src, [{"eval": spy}, {"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"}, {"until": "window.__v"},
+                               {"eval": probe}, {"until": "window.__posts.length === 1"},
+                               {"eval": held}, {"until": "window.__release"}, {"eval": readonly}, {"eval": release}, {"until": "1", "ms": 800}, {"eval": said}],
+               first=DESKTOP)
+    assert "function" in [x for x in out["values"] if isinstance(x, str)], out["values"]     # the ceremony was held at its listing read
+    text, errs, posts = json.loads(out["values"][-1])
+    assert text and "nothing was sent" in text.lower(), out["values"]
+    assert posts == 0, out["values"]
+    assert not [e for e in errs if "ResizeObserver" not in e], out["values"]
