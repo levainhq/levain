@@ -117,6 +117,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   and is plain UTF-8; comments in the file are never taken for keys. Re-enrolling a key under another name, or with
   fewer permissions than its line has, is refused: remove it first. `undo` removes the file too, so a later setup for
   another person starts with no listed keys.
+- **`levain dispatch config trust --replace` rotates root's route-trust pin** to a new dispatch store or a new laptop
+  key. Stop the control and keys services first; it is refused while an open ticket or a live session still uses the
+  old store, or while keys runs. The old store's route maps, verifier configuration and keys' head are moved to
+  `L/routes/.replaced-<time>`, not deleted, and both restart at the new store; it says where the old store was set aside.
+  If anything fails part way, the old pin and store are put back. A replace interrupted part way leaves a marker; until
+  a `--replace` is run again, the control and keys services refuse to start, and that run first finishes the
+  interrupted replace or puts the old store back. On an install where keys never ran, the replace also holds keys off.
 
 ### Changed
 - **A coordinator store made by an earlier version is updated the first time a `levain` command that writes to it
@@ -124,6 +131,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **`levain doctor` has an agent firewall probe row:** each agent slot's last recorded probe result, with its age and
   session. An open wall fails the row; an unknown or inconclusive result, or a closed one older than a day, warns; a
   slot never probed says so. Doctor reads the record and never probes.
+- **A metered request with a `route` or a `models` fallback list (other than exactly its own model) is refused
+  `model-not-allowed`.** A response that says another model ran is no longer priced as the requested model: the call is
+  charged its whole hold, or the cost the provider reports when that is more, and the session stops as for an overrun.
+  The check that a response came from the requested model applies to OpenRouter (openai-chat) routes only; an Anthropic
+  response is settled at its reported usage, as before. On those routes a response naming the model as null, or naming
+  two different models across a stream, counts as another model.
+- **CONTROL's `STATUS` carries `budget_overrun` on a session stopped for an overrun:** the amount over, the number of
+  calls, whether any was unproven, and `model_mismatch`. A session stopped because another model answered is shown even
+  when it was charged no more than its hold.
 
 ### Fixed
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
@@ -131,6 +147,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Two sessions making their first call at the same moment on a fresh install could both be refused with
   `database is locked`.** Opening a new store now spaces its retries at random, so the two openers no longer keep
   colliding.
+- **A session's `budget_overrun` in CONTROL's `STATUS` goes away when the session is purged.**
+- **On an OpenRouter route, a response from another model that reports a cost above the call's hold but no token
+  counts is charged that cost** (it was charged only the hold).
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - **The graduation engine behind `levain binding graduate`.** Once the binding driver is wired, it takes the steps a
@@ -170,6 +189,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   never treated as safe. On macOS the probe runs again every minute while the session lives; a slot that reaches the
   vendor ends the session (its work kept), and so do two probes in a row that cannot answer, or five in a row that
   cannot tell (for example because the host is offline). Each probe's result is recorded per slot.
+- **Chat checks that a worker's hooks are still live at every turn** and refuses messages while a check runs; a check
+  that cannot run is retried, then turns chat off for that worker until you re-enable it. A stuck worker connection no
+  longer freezes chat: a read or an interrupt that does not answer gives up after a bounded wait.
+- **Dispatch has a runner for its event follower** (`python -m levain.dispatch.follow_run --store-dir <dir>`): it follows
+  CONTROL's event stream, retries a CONTROL that is down with a growing wait, waits five minutes between retries of a
+  stop no retry can fix, and stops cleanly on SIGTERM. No installed service runs it yet.
 
 ## [0.11.26] — 2026-10-25
 
