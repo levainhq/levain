@@ -8,7 +8,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Added
 - **The cockpit's `!N` badge breathes when a new decision waits on you.** It pulses for about half a minute, then sits
-  still; never with reduced motion.
+  still; it does not pulse at all when your system asks for reduced motion.
 - **`levain binding policy create|renew|revoke|list` signs the graduation policies** that let a standing binding run
   below confirm (cooling-off or on-loop) without asking: the actions it may run at the risk Levain's manifest gives
   them, the lowest rung, and an expiry at most 30 days out. A policy covers only while its signing keys are listed in
@@ -51,7 +51,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   nothing), `Expect: 100-continue`, pipelining behind a held card, a decider crash, and a client leaving while its card
   is held. A sandboxed client's SOCKS attempt is still refused, and now counted as a `socks` wall in the report.
 - **Dispatch can follow the control plane's session events.** It reads them from a cursor it keeps across restarts
-  (never moved backward), records a verifier's result from them and acknowledges it (`ARTIFACT-ACK`) only when dispatch
+  (never moved past an event it could not finish; a new journal or a reset replays from the start), records a verifier's result from them and acknowledges it (`ARTIFACT-ACK`) only when dispatch
   holds that outcome, so the reaper can clear a finished session early. It recognises a repeated verifier refusal only by
   its ticket and outcome, stops on a run already holding another report or on a malformed or off-schema event before
   anything is written, reports a gap in the event stream with the count of events lost, and wakes a read waiting on its
