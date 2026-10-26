@@ -1,8 +1,8 @@
 """CH-D2 S9 session 2b: the R15-10-A14 items no composed test held when the umbrella map (`test_a14_umbrella.py`) was
 first drawn, each now run on the real glue and decider:
 
-- *"R-1's smuggling suite, run through the actual srt parser."*: the one form `test_smuggling.py` does not send,
-  `Transfer-Encoding: chunked, identity` (plain and TLS), reaches the origin as nothing.
+- *"R-1's smuggling suite, run through the actual srt parser."*: the row's `TE: chunked, identity` form
+  (`Transfer-Encoding: chunked, identity`, plain and TLS) reaches the origin as nothing.
 - *"... `X-Original-URL`, `X-Rewrite-URL` and `X-Forwarded-Host` handling."* (expected verdict STRIPPED, row
   R15-12-B3): a forwarded read carries none of the three to the origin.
 - *"A decider crash fails closed with a visible state."*: the decider's link cut under a running glue: the glue exits
