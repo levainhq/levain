@@ -395,7 +395,7 @@ DEFAULT_FEEDS_INTERVAL = 300
 # [judged by lane-c4ft, 10-26, against nothing measured]: a run is SQLite reads and a few writes, so two minutes is far
 # above what it needs and far below the interval. It makes "restartable" true for the reason DEFAULT_SEAT_MAX_SECONDS
 # does: launchd coalesces per label, so a hung run would otherwise stop every later one.
-DEFAULT_FEEDS_MAX_SECONDS = 120.0
+DEFAULT_FEEDS_MAX_SECONDS = 120
 
 
 def build_feeds_spec(
@@ -405,12 +405,12 @@ def build_feeds_spec(
     levain_home: Path | None = None,
     interval: int = DEFAULT_FEEDS_INTERVAL,
     label: str = DEFAULT_FEEDS_LABEL,
-    max_seconds: float | None = DEFAULT_FEEDS_MAX_SECONDS,
+    max_seconds: int | None = DEFAULT_FEEDS_MAX_SECONDS,
     log_dir: Path | None = None,
 ) -> DaemonSpec:
     """The periodic spec that runs ``levain coord review feeds`` and exits: no model, no keep-alive, not at login.
 
-    ``--max-seconds`` is EMITTED into the argv when set, so a reader of the unit file sees the bound. ``queue_dir`` and
+    ``--max-seconds`` (whole seconds) is EMITTED into the argv when set, so a reader of the unit file sees the bound. ``queue_dir`` and
     ``levain_home`` are written down at install time because a login-launched unit carries neither the shell's
     ``$LEVAIN_HOME`` nor its cwd: without them the unit would read the default store while the operator's is elsewhere.
     The run itself holds a lock (:func:`levain.coordinator.deliver.run_exclusive`), so a run that outlives the interval
@@ -421,7 +421,7 @@ def build_feeds_spec(
     if queue_dir is not None:
         argv += ["--queue-dir", str(queue_dir.expanduser().resolve())]
     if max_seconds is not None:
-        argv += ["--max-seconds", f"{max_seconds:g}"]
+        argv += ["--max-seconds", str(max_seconds)]
     env = _daemon_env(invocation)
     if levain_home is not None:
         env["LEVAIN_HOME"] = str(levain_home.expanduser().resolve())

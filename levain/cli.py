@@ -1210,9 +1210,9 @@ def main(argv: list[str] | None = None) -> int:
                          help="The consent queue's directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
     d_feeds.add_argument("--interval", type=int, default=300,
                          help="Seconds between runs (default: 300).")
-    d_feeds.add_argument("--max-seconds", type=float, default=None, dest="max_seconds",
-                         help="Wall-clock bound per run (default: 120; 0 disables it, and a hung run then stops "
-                              "every later one).")
+    d_feeds.add_argument("--max-seconds", type=int, default=None, dest="max_seconds",
+                         help="Whole seconds >= 1: the kernel ends a run still going after this long (default: 120; "
+                              "0 disables it, and a hung run then stops every later one).")
     d_feeds.add_argument("--label", default="com.levainhq.levain.feeds",
                          help="Service label (default: com.levainhq.levain.feeds).")
     d_feeds.add_argument("--dry-run", action="store_true", dest="dry_run",
@@ -4267,9 +4267,9 @@ def _cmd_daemon_install_feeds(args: argparse.Namespace) -> int:
     provider, err = _daemon_provider()
     if provider is None:
         return err
-    if args.max_seconds is not None and (not math.isfinite(args.max_seconds) or args.max_seconds < 0):
-        print(f"levain daemon install-feeds: --max-seconds must be a finite number >= 0, got {args.max_seconds!r}. "
-              f"Use 0 to disable the bound, or omit the flag for the default ({daemon.DEFAULT_FEEDS_MAX_SECONDS:g}s).",
+    if args.max_seconds is not None and args.max_seconds < 0:
+        print(f"levain daemon install-feeds: --max-seconds must be a whole number >= 0, got {args.max_seconds!r}. "
+              f"Use 0 to disable the bound, or omit the flag for the default ({daemon.DEFAULT_FEEDS_MAX_SECONDS}s).",
               file=sys.stderr)
         return 2
     max_secs = (daemon.DEFAULT_FEEDS_MAX_SECONDS if args.max_seconds is None
@@ -4277,15 +4277,15 @@ def _cmd_daemon_install_feeds(args: argparse.Namespace) -> int:
     home = os.environ.get("LEVAIN_HOME")
     try:
         spec = daemon.build_feeds_spec(
-            working_dir=Path(home) if home else Path.home(),
+            working_dir=Path.home(),
             queue_dir=args.queue_dir, levain_home=Path(home) if home else None,
             interval=args.interval, label=args.label, max_seconds=max_secs,
         )
-    except ValueError as exc:
+    except (ValueError, daemon.DaemonError) as exc:
         print(f"levain daemon install-feeds: {exc}", file=sys.stderr)
         return 2
     if max_secs is not None and max_secs >= args.interval:
-        print(f"  ⓘ the run bound ({max_secs:g}s) is >= the cadence ({args.interval}s): launchd coalesces per label, "
+        print(f"  ⓘ the run bound ({max_secs}s) is >= the cadence ({args.interval}s): launchd coalesces per label, "
               f"so a long run skips intervals.")
     if max_secs is None:
         print("  ⚠ NO WALL-CLOCK BOUND: a run that hangs never exits, and launchd coalesces per label, so no later run "
@@ -4293,7 +4293,7 @@ def _cmd_daemon_install_feeds(args: argparse.Namespace) -> int:
     if args.dry_run:
         plan = provider.would_install(spec)
         print(f"install-feeds dry-run for {plan.label} (NOTHING is changed):")
-        print(f"  cadence: every {spec.start_interval}s, bound {'none' if max_secs is None else f'{max_secs:g}s'}")
+        print(f"  cadence: every {spec.start_interval}s, bound {'none' if max_secs is None else f'{max_secs}s'}")
         print(f"  argv:    {' '.join(spec.argv)}")
         print(f"  unit:    {plan.unit_path}")
         print(f"  live:    {plan.current.load_state} — {plan.current.detail}")

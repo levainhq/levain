@@ -37,7 +37,7 @@ from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import parse_stamp
 from levain.coordinator import review
 from levain.coordinator.first_reader import _HARNESS_OF
-from levain.coordinator.store import CoordStore
+from levain.coordinator.store import CoordError, CoordStore
 
 __all__ = ["Delivery", "FEEDS_LOCK", "deliver", "faults", "pass_line", "run", "run_exclusive", "waiting_lines"]
 
@@ -152,12 +152,14 @@ def run(store: CoordStore, *, queue_dir: Path | str | None = None) -> dict[str, 
     """The feed runner: every mechanical feed (:func:`levain.coordinator.review.collect_feeds`), then the delivery pass.
     ``{"feeds": ..., "delivery": ...}``. Run again with nothing changed it files nothing: the feeds dedupe by key and
     the pointers by id. A run with no fault, on a store that existed, leaves a mark
-    (:func:`levain.coordinator.review.record_pass`), which is how a display that only reads says when this pass last
-    read everything."""
+    (:func:`levain.coordinator.review.record_pass`) only when it filed or delivered something, so a scheduled run that
+    finds nothing new adds no row (the mark is append-only); a display that only reads says when this pass last CHANGED
+    something, not when it last looked."""
     existed = _has_store(store)
     ran = {"feeds": review.collect_feeds(store, queue_dir=queue_dir),
            "delivery": deliver(store, queue_dir=queue_dir).as_dict()}
-    if existed and not faults(ran):      # a pass that read nothing, or not all, is not "the last time it looked"
+    changed = bool(ran["feeds"].get("created")) or bool(ran["delivery"].get("created"))
+    if existed and changed and not faults(ran):      # a pass that read nothing, or not all, is not "the last time"
         review.record_pass(store)
     return ran
 
@@ -168,19 +170,32 @@ FEEDS_LOCK = "feeds.lock"
 def run_exclusive(store: CoordStore, *, queue_dir: Path | str | None = None) -> dict[str, Any] | None:
     """:func:`run` under a non-blocking exclusive lock on ``<store directory>/feeds.lock``, so a scheduled run and a
     manual one (or two schedules) never overlap. ``None`` when another run holds it: the caller skips, it does not wait.
-    The lock is the kernel's (``flock``) and dies with the process, so a killed run leaves nothing to clear. A host
-    without ``fcntl`` runs unlocked: its feeds are idempotent by key, so an overlap files nothing twice."""
+    Only contention is a skip (EAGAIN, EWOULDBLOCK, EACCES); any other failure to open or lock raises
+    :class:`CoordError` with its message, so a broken lock never reads as a quiet skip. The store directory is checked
+    by the store's own rule (a real directory, this uid's, closed to others, never a symlink) BEFORE the lock file is
+    made in it. The lock is the kernel's (``flock``) and dies with the process, so a killed run leaves nothing to
+    clear. A host without ``fcntl`` runs unlocked: its feeds are idempotent by key, so an overlap files nothing twice."""
     try:
         import fcntl
     except ImportError:
         return run(store, queue_dir=queue_dir)
-    Path(store.directory).mkdir(parents=True, exist_ok=True, mode=0o700)       # a fresh home has no store yet
-    fd = os.open(Path(store.directory) / FEEDS_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    import errno
+
+    from levain.dispatch.jobs import DispatchError
+
+    lock = Path(store.directory) / FEEDS_LOCK
+    try:
+        store._jobs._check_directory()
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except (OSError, DispatchError) as exc:
+        raise CoordError(f"the feeds lock {lock} cannot be opened: {exc}") from exc
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return None
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                return None
+            raise CoordError(f"the feeds lock {lock} cannot be taken: {exc}") from exc
         return run(store, queue_dir=queue_dir)
     finally:
         os.close(fd)

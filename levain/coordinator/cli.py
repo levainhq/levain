@@ -19,10 +19,10 @@ import json
 import os
 import re
 import secrets
+import signal
 import sqlite3
 import subprocess
 import sys
-import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -1329,6 +1329,53 @@ def _coord_c6(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
     return 0
 
 
+def _coord_review_feeds(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord review feeds``: one exclusive run, optionally bounded by the kernel. With ``--max-seconds N`` the
+    process arms ``alarm(N)`` with SIGALRM at its default action, so the kernel ends a run stuck past it (exit by
+    signal, no Python code involved); the alarm is disarmed only after every line of output is written and flushed."""
+    from levain.coordinator import deliver
+
+    limit = getattr(args, "max_seconds", None) or 0
+    if not isinstance(limit, int) or limit < 0:
+        raise CoordError("--max-seconds is a whole number of seconds >= 1, or 0 for no bound")
+    armed = False
+    if limit:
+        if hasattr(signal, "SIGALRM"):
+            # launchd coalesces per label, so a hung scheduled run would otherwise stop every later one
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            signal.alarm(limit)
+            armed = True
+        else:
+            print("levain coord review feeds: no run bound on this platform (no SIGALRM)", file=sys.stderr)
+    try:
+        ran = deliver.run_exclusive(store)
+        if ran is None:
+            _emit(out, args.json, {"skipped": True, "feeds": {}, "delivery": {},
+                                   "reason": "another feeds run holds the lock"},
+                  "feeds: skipped, another run is in progress")
+            _flush(out)
+            return 0
+        delivery = ran["delivery"]
+        faults = deliver.faults(ran)
+        ran["new_items"] = len(ran["feeds"].get("created", []))
+        lines = [f"feeds: {ran['new_items']} new review item(s)",
+                 f"delivery: {len(delivery['signs'])} SIGN and {len(delivery['answers'])} ANSWER pointer(s) "
+                 f"reached, {delivery['created']} new"]
+        lines += [f"could not read: {f}" for f in faults]
+        _emit(out, args.json, ran, "\n".join(lines))
+        _flush(out)
+        return 1 if faults else 0
+    finally:
+        if armed:
+            signal.alarm(0)
+
+
+def _flush(out: Any) -> None:
+    flush = getattr(out, "flush", None)
+    if flush is not None:
+        flush()
+
+
 def _coord_review(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
     """``levain coord review list|clear|reopen|feeds`` (C4-a): the review queue. ``list`` and ``feeds`` run the feed
     runner first (:func:`levain.coordinator.deliver.run`, the one call a panel's read path will make too)."""
@@ -1342,40 +1389,9 @@ def _coord_review(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> i
               f"{item.item_id} {'cleared' if cmd == 'clear' else 'reopened'} ({args.mode})")
         return 0
     if cmd == "feeds":
-        limit = getattr(args, "max_seconds", None) or 0
-        if limit < 0 or limit != limit or limit == float("inf"):
-            raise CoordError("--max-seconds is a finite number of seconds, 0 for none")
-        timer = None
-        if limit:
-            # a run stuck past its bound exits: launchd coalesces per label, so a hung scheduled run would otherwise
-            # stop every later one. Each write is its own transaction, so a cut run leaves nothing half-filed.
-            def _stop() -> None:
-                print(f"levain coord review feeds: stopped after {limit:g}s", file=sys.stderr, flush=True)
-                os._exit(3)
-            timer = threading.Timer(limit, _stop)
-            timer.daemon = True
-            timer.start()
-        try:
-            ran = deliver.run_exclusive(store)
-        finally:
-            if timer is not None:
-                timer.cancel()
-        if ran is None:
-            _emit(out, args.json, {"skipped": "another feeds run holds the lock"},
-                  "feeds: skipped, another run is in progress")
-            return 0
-    else:
-        ran = deliver.run(store)
-    delivery = ran["delivery"]
+        return _coord_review_feeds(args, out, store)
+    ran = deliver.run(store)
     faults = deliver.faults(ran)
-    if cmd == "feeds":
-        ran["new_items"] = len(ran["feeds"].get("created", []))
-        lines = [f"feeds: {ran['new_items']} new review item(s)",
-                 f"delivery: {len(delivery['signs'])} SIGN and {len(delivery['answers'])} ANSWER pointer(s) "
-                 f"reached, {delivery['created']} new"]
-        lines += [f"could not read: {f}" for f in faults]
-        _emit(out, args.json, ran, "\n".join(lines))
-        return 1 if faults else 0
     waiting = review.waiting_on_you(store, sign_open=review.queue_request_open(store.directory),
                                     answer_open=review.question_open(store.directory))
     items = review.list_items(store, include_cleared=args.all, feed=args.feed)
@@ -1652,8 +1668,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     rvf = rv_sub.add_parser("feeds", help="Run the feeds and the delivery pass once and say what they reached.",
                             description="Takes a lock: while another feeds run holds it this one skips (exit 0). "
                                         "levain daemon install-feeds runs this on a schedule.")
-    rvf.add_argument("--max-seconds", dest="max_seconds", type=float, default=None,
-                     help="Stop (exit 3) if the run is still going after this many seconds (default: no bound).")
+    rvf.add_argument("--max-seconds", dest="max_seconds", type=int, default=None,
+                     help="Whole seconds >= 1: the kernel ends the run (SIGALRM) if it is still going after this "
+                          "long. 0 or omitted: no bound.")
     for p in (rvl, rvc, rvo, rvf):
         common(p)
         p.set_defaults(func=run_coord)

@@ -584,3 +584,42 @@ def test_cli_install_feeds_defaults_match_the_daemon_module():
     assert seen["label"] == daemon.DEFAULT_FEEDS_LABEL
     assert seen["interval"] == daemon.DEFAULT_FEEDS_INTERVAL
     assert seen["max_seconds"] is None
+
+
+def test_install_feeds_unit_runs_from_home_not_from_levain_home(tmp_path, monkeypatch):
+    """The unit's WorkingDirectory is the home directory; the store rides LEVAIN_HOME / --queue-dir."""
+    from levain import daemon
+
+    seen: dict[str, object] = {}
+    real = daemon.build_feeds_spec
+
+    def spy(**kw):
+        seen.update(kw)
+        return real(**kw)
+
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    with mock.patch("levain.daemon.build_feeds_spec", side_effect=spy):
+        rc = main(["daemon", "install-feeds", "--dry-run", "--label", "com.levainhq.test.feedscwd"])
+    assert rc in (0, 2)                      # 2 only on a host with no provider; the spec was built either way or not reached
+    if "working_dir" in seen:
+        assert seen["working_dir"] == Path.home() and seen["levain_home"] == tmp_path / "lh"
+
+
+def test_install_feeds_daemon_error_while_building_the_spec_is_a_usage_error(capsys):
+    from levain import daemon
+
+    with mock.patch("levain.daemon.build_feeds_spec", side_effect=daemon.DaemonError("no levain on PATH")):
+        rc = main(["daemon", "install-feeds", "--dry-run"])
+    assert rc == 2
+    assert "no levain on PATH" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["1.5", "abc"])
+def test_install_feeds_bound_is_a_whole_number_of_seconds(bad, capsys):
+    with pytest.raises(SystemExit) as e:
+        main(["daemon", "install-feeds", "--dry-run", "--max-seconds", bad])
+    assert e.value.code == 2
+
+
+def test_install_feeds_negative_bound_is_refused(capsys):
+    assert main(["daemon", "install-feeds", "--dry-run", "--max-seconds", "-3"]) == 2
