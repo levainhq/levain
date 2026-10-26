@@ -41,16 +41,17 @@ class _Lock:
 @pytest.fixture
 def helper(L, monkeypatch):
     """Root's side: the install helper's own ``main`` with ``routes-trust`` over ``L``; records each request."""
-    sent = []
+    sent, argvs = [], []
 
-    def call(data: bytes):
+    def call(data: bytes, *, replace: bool = False):
         sent.append(data)
+        argvs.append(["routes-trust", *(["--replace"] if replace else [])])
         out, err = io.StringIO(), io.StringIO()
         run_trust = functools.partial(IH.run_routes_trust, store_seams=RH.Seams(host="darwin", store=L,
                                                                                 trusted=lambda st: True))
         seams = IH.Seams(euid=lambda: 0, host=lambda: "darwin", lock=_Lock(), stdin=io.BytesIO(data).read,
                          routes_trust=run_trust)
-        rc = IH.main(["routes-trust"], env={"SUDO_UID": str(ME)}, seams=seams, out=out, err=err)
+        rc = IH.main(argvs[-1], env={"SUDO_UID": str(ME)}, seams=seams, out=out, err=err)
         return rc, out.getvalue(), err.getvalue()
     monkeypatch.setattr(dcli, "ROUTES_TRUST_HELPER", call)
     return sent
@@ -92,6 +93,23 @@ def test_root_refusing_is_exit_2_naming_the_remedy(capsys, ddir, root, keys, L, 
     code, out, _ = _init(capsys, ddir, root, keys)
     assert code == 2
     assert "NOT pinned (routes-trust-exists" in out and "levain dispatch config trust" in out
+
+
+def test_config_trust_replace_rotates_a_pin_naming_another_store(capsys, ddir, root, keys, L, helper):
+    """Q16 through the CLI: the plain verb names `--replace` as the remedy, and `config trust --replace` sends root's
+    `routes-trust --replace`, which sets the old pin aside and pins this store."""
+    old = '{"fingerprint":"SHA256:' + "A" * 43 + '","format":"levain-routes-trust/1","store_id":"' + "f" * 32 + '"}'
+    (L / "routes" / "trust.json").write_text(old)
+    (L / "sessions").mkdir(mode=0o700)
+    code, out, _ = _init(capsys, ddir, root, keys)
+    assert code == 2 and "levain dispatch config trust --replace" in out
+    code, out, _ = run(capsys, "config", "trust", "--replace", "--dispatch-dir", str(ddir), "--data-root", root)
+    assert code == 0, out
+    assert "replacing the pin to store " + "f" * 32 in out
+    t = routemaps.read_trust(L / "routes")
+    assert t.fingerprint == keys["laptop"].fp and t.store_id != "f" * 32
+    aside = [p for p in (L / "routes").iterdir() if p.name.startswith(".replaced-")]
+    assert len(aside) == 1 and (aside[0] / "trust.json").read_text() == old
 
 
 def test_no_install_helper_leaves_init_ok_and_says_so(capsys, ddir, root, keys, monkeypatch):

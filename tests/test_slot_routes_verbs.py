@@ -86,8 +86,9 @@ def test_both_verbs_parse_bare_are_built_and_lease_exempt():
         assert verb in VERBS and verb in LEASE_EXEMPT and verb in IH.BUILT_VERBS
         assert parse_install_argv([verb]).verb == verb
         with pytest.raises(Refused) as e:
-            parse_install_argv([verb, "--replace"])
+            parse_install_argv([verb, "--replace" if verb == "routes-base" else "--force"])
         assert e.value.name == "extra-argv"
+    assert parse_install_argv(["routes-trust", "--replace"]).replace is True     # Q16 (3c-9)
 
 
 def test_the_seams_defaults_are_the_real_verbs():

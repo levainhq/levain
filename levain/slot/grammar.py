@@ -93,6 +93,7 @@ class InstallCommand:
     passkeys: tuple[str, ...] = ()
     confirm: bool = False                 # the laptop key's line names levain-confirm too
     key_fingerprint: str | None = None    # remove-authority-signer --key
+    replace: bool = False                 # routes-trust --replace (3c design r3 Q16; R4 §5 3c-9)
 
 
 def _uint(token: str, field: str, lo: int, hi: int) -> int:
@@ -284,6 +285,12 @@ def parse_install_argv(argv: Sequence[str]) -> InstallCommand:
         if not FINGERPRINT_RE.fullmatch(rest[1]):
             raise Refused("bad-token", f"--key: {rest[1][:60]!r} is not SHA256:<43 base64>")
         return InstallCommand(verb, key_fingerprint=rest[1])
+    if verb == "routes-trust" and rest:
+        # Q16: the one flag, rotating the pin to another store or key; the request still comes on stdin.
+        if rest[0] != "--replace":
+            raise Refused("extra-argv", repr(rest[0]))
+        _exact(verb, rest, 1)
+        return InstallCommand(verb, replace=True)
     if verb == "repair" and rest:
         # Row 33 (head ruling Q1, a §5.2 amendment): ``repair --source PATH``, the operator's installed levain
         # package dir, checked as ``--root`` is. The helper checks ownership, the final component and links.

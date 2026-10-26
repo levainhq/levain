@@ -25,6 +25,7 @@ import json
 import os
 import re
 import select
+import shutil
 import selectors
 import signal
 import stat
@@ -45,6 +46,7 @@ from levain.slot import removal as RM
 from levain.slot import generation as gen_mod
 from levain.slot import proc as PR
 from levain.slot import records as R
+from levain.slot import tickets as T
 from levain.slot import runtime_helper as RH
 from levain.slot import store_verbs as SV
 from levain.slot.root_intent import PhaseFailed
@@ -2750,21 +2752,168 @@ def _trust_file_holds(path: Path, data: bytes, *, max_bytes: int = 64 * 1024) ->
     return st.st_uid == os.geteuid() and stat.S_IMODE(st.st_mode) == 0o644
 
 
+#: Q16: what ``routes-trust --replace`` sets aside with the old pin, each a path under ``L`` and whether it is a
+#: directory, which is made again empty with the old one's owner, group and mode: CONTROL's route-map generations and
+#: head, its verifier generations and head (signed under the same trust root, 3c-8), and keys' head.
+REPLACE_ASIDE = ((("routes", "dispatch"), True), (("routes", "verifiers"), True), (("keys", "routemap.head"), False))
+#: DECISION: the most session records a replace reads to find the live ones (far above any pool's sessions).
+REPLACE_SESSIONS_MAX = 65536
+
+
+def _session_live(data: bytes, session: str) -> bool:
+    """One ``L/sessions/<session>.json``: live (:data:`levain.slot.records.LIVE_STATES`) or not. A record that does not
+    parse, or names another session, is ``ValueError``: the replace then cannot rule the session out."""
+    rec = R.parse_state(data)
+    if rec.session != session:
+        raise ValueError(f"{session}.json names {rec.session}")
+    return rec.state in R.LIVE_STATES
+
+
+def _control_references(sessions: Path) -> tuple[frozenset, frozenset]:
+    """The route-map and verifier generations CONTROL's records still reference, read from disk as CONTROL's own start
+    reads them: every session record (``s-*.json``), and the ticket journal rebuilt by
+    :class:`levain.slot.tickets.TicketStore`'s own reader, never compacted or written. The route-map generations are
+    :meth:`TicketStore.referenced_generations` of the live sessions (an OPEN ticket's, and a ticket's bound to a live
+    session, R4 §5), the verifier ones :meth:`TicketStore.referenced_verifier_generations`. Anything that cannot be
+    read whole is ``routes-trust-in-use``: a replace never rules a reference out by not reading it."""
+    try:
+        live = set()
+        names = sorted(n for n in os.listdir(sessions) if n.startswith("s-") and n.endswith(".json"))
+        if len(names) > REPLACE_SESSIONS_MAX:
+            raise ValueError(f"over {REPLACE_SESSIONS_MAX} session records")
+        for name in names:
+            data = R.read_record(sessions / name)
+            if data is not None and _session_live(data, name[:-len(".json")]):
+                live.add(name[:-len(".json")])
+        store = T.TicketStore(sessions / T.JOURNAL, sessions / "unused-ceiling")
+        store._by_attempt, store._by_ticket = store._rebuild(store._read())
+        return store.referenced_generations(live), store.referenced_verifier_generations()
+    except FileNotFoundError:
+        raise Refused("routes-trust-in-use", f"{sessions} is not there: whether a session references the old store "
+                                             "cannot be read") from None
+    except (Refused, OSError, ValueError, KeyError, TypeError) as e:
+        raise Refused("routes-trust-in-use", f"CONTROL's records cannot be read whole ({getattr(e, 'name', '')} "
+                                             f"{getattr(e, 'detail', '') or e}); nothing was replaced") from None
+
+
+@contextmanager
+def _control_held(sessions: Path) -> Iterator[None]:
+    """CONTROL's single-CONTROL lock (:meth:`levain.slot.tickets.TicketStore.acquire`'s ``flock`` on
+    ``tickets.jsonl.lock``) taken by root, non-blocking, and held through the block: a CONTROL that holds it is running
+    (``control-running``: stop it, then replace), and one that starts while root holds it refuses its own start, so no
+    ticket is minted against the old store between the reference check and the move. A lock file that is not there is
+    made as CONTROL would make it, 0600 and owned as ``L/sessions`` is, so CONTROL can take it afterwards."""
+    path = sessions / (T.JOURNAL + ".lock")
+    try:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            st = os.lstat(sessions)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                have = os.fstat(fd)
+                if (have.st_uid, have.st_gid) != (st.st_uid, st.st_gid):
+                    os.fchown(fd, st.st_uid, st.st_gid)
+            except OSError:
+                os.close(fd)
+                raise
+    except OSError as e:
+        raise Refused("routes-trust-in-use", f"CONTROL's journal lock {path}: {e.strerror or e}") from None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused("control-running", "CONTROL holds its ticket journal: stop the control service, then run "
+                                             "the replace again") from None
+        except OSError as e:
+            raise Refused("routes-trust-in-use", f"CONTROL's journal lock {path}: {e.strerror or e}") from None
+        yield
+    finally:
+        os.close(fd)                          # closing the only descriptor releases the flock
+
+
+def _aside_entries(L: Path) -> list[tuple[Path, Optional[os.stat_result]]]:
+    """:data:`REPLACE_ASIDE` as ``(path, lstat or None when absent)``, checked before anything moves: an entry meant to
+    be a directory that is another kind (a link included) is ``routes-trust-replace-layout``."""
+    out = []
+    for parts, is_dir in REPLACE_ASIDE:
+        p = L.joinpath(*parts)
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            out.append((p, None))
+            continue
+        if stat.S_ISDIR(st.st_mode) != is_dir or stat.S_ISLNK(st.st_mode):
+            raise Refused("routes-trust-replace-layout", f"{p} is not the {'directory' if is_dir else 'file'} the "
+                                                         "install made; nothing was replaced")
+        out.append((p, st))
+    return out
+
+
+def _set_aside(L: Path, routes: Path, old_pair: Mapping[str, Optional[bytes]],
+               undo: list[Callable[[], None]]) -> Path:
+    """Q16's move: a fresh root 0700 ``L/routes/.replaced-<UTC time>``, a copy of the old pin's two files in it, then
+    each :data:`REPLACE_ASIDE` entry renamed into it (a directory made again empty, with the old one's owner, group
+    and mode), every directory touched fsynced. Each act that changed the live tree pushes its inverse on ``undo``
+    (applied last-first by the caller when the replace fails before the new pair is in force)."""
+    entries = _aside_entries(L)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    aside = routes / f".replaced-{stamp}"
+    n = 1
+    while os.path.lexists(aside):
+        n += 1
+        aside = routes / f".replaced-{stamp}-{n}"
+    os.mkdir(aside, 0o700)
+    os.chmod(aside, 0o700)
+    undo.append(lambda: shutil.rmtree(aside))
+    for name, data in old_pair.items():
+        if data is not None:
+            R.write_durably(aside / name, data, mode=0o600, fsync=gen_mod._full_fsync)
+    for p, st in entries:
+        if st is None:
+            continue
+        dst = aside / p.name
+        os.rename(p, dst)
+        undo.append(functools.partial(os.rename, dst, p))
+        if stat.S_ISDIR(st.st_mode):
+            os.mkdir(p, 0o700)
+            undo.append(functools.partial(os.rmdir, p))
+            made = os.lstat(p)
+            if (made.st_uid, made.st_gid) != (st.st_uid, st.st_gid):
+                os.lchown(p, st.st_uid, st.st_gid)
+            os.chmod(p, stat.S_IMODE(st.st_mode))
+    for d in {aside, routes, *(p.parent for p, st in entries if st is not None)}:
+        problem = _fsync_dir(d)
+        if problem is not None:
+            raise OSError(errno.EIO, problem)
+    return aside
+
+
 def run_routes_trust(caller_uid: int, host: HostOS, *, read: Callable[[int], bytes],
                      lock: Callable[[], ContextManager[object]], store_seams: RH.Seams | None = None,
                      err: TextIO | None = None, fsync: Callable[[int], None] | None = None,
-                     fingerprint: Callable[[str], str] = key_fingerprint) -> dict[str, object]:
+                     fingerprint: Callable[[str], str] = key_fingerprint, replace: bool = False) -> dict[str, object]:
     """``routes-trust`` (Q15 r3): pin the dispatch trust root in ``L/routes``. Before the install lock: the operator
     check, the request (:func:`read_trust_request`) and ``ssh-keygen -l`` of its key naming exactly its fingerprint
     (``routes-trust-fingerprint`` otherwise). Root reads no authority log: the request comes from the operator's own
     ``levain dispatch config init``, which ran the may-sign-configuration test against it, and the password proves the
     operator. UNDER the lock: the operator check again; an existing ``trust.json`` naming another store or key is
-    ``routes-trust-exists`` (rotation is Q16's); then ``trust.pub`` and LAST ``trust.json``
+    ``routes-trust-exists`` unless ``replace``; then ``trust.pub`` and LAST ``trust.json``
     (:func:`levain.slot.records.write_durably`, root 0644), so a reader finding both finds a matched pair. A file is
     left only when its bytes, owner and mode are already root's (:func:`_trust_file_holds`); any other is written
     again. A failure before ``trust.json``'s rename refuses ``routes-trust-write-failed`` (``trust.pub`` renamed but
     not durable included: ``trust.json`` is then not written); ``trust.json`` renamed but not durable answers ok and
-    warns. Before the answer both files are read back and must hold the pair (``routes-trust-write-failed``)."""
+    warns. Before the answer both files are read back and must hold the pair (``routes-trust-write-failed``).
+
+    ``replace`` (Q16, ``routes-trust --replace``) rotates a pin to another store or key; with the pinned pair, or no
+    pin, it is the plain verb. Under the install lock, in this order: CONTROL's own journal lock taken and held to the
+    end (:func:`_control_held`: ``control-running`` while CONTROL runs); CONTROL's records read
+    (:func:`_control_references`): any route-map or verifier generation an open ticket or a live session references is
+    ``routes-trust-in-use``, and nothing is moved; the old store set aside whole (:func:`_set_aside`); the new pair
+    written and read back as above. A failure anywhere from the set-aside through the read-back puts the old pin and
+    every moved entry back (``routes-trust-write-failed``; a step of that put-back that fails is named in the detail,
+    with the set-aside dir). The answer adds ``replaced`` (the old ``{store_id, fingerprint}``, None for each the old
+    ``trust.json`` did not parse to; None when nothing was replaced) and ``aside`` (the set-aside dir, or None)."""
     import hashlib
 
     rs = store_seams or RH.Seams(host=host)
@@ -2774,34 +2923,104 @@ def run_routes_trust(caller_uid: int, host: HostOS, *, read: Callable[[int], byt
         raise Refused("routes-trust-fingerprint", "the key does not have the request's fingerprint")
     trust = {"format": "levain-routes-trust/1", "store_id": req["store_id"], "fingerprint": req["fingerprint"]}
     routes = _routes_dir(rs, host)
+    pub = (req["public_key"] + "\n").encode("ascii")
+    pair = (("trust.pub", pub), ("trust.json", canon.canonical_bytes(trust)))
+    warn = (err or sys.stderr).write
+    replaced: Optional[dict] = None
+    aside: Optional[Path] = None
     with lock():
         _check_operator("routes-trust", caller_uid, rs)
-        have = _trust_on_disk(routes)
-        if have is not None and have != trust:
+        try:
+            have = _trust_on_disk(routes)
+        except Refused:
+            if not replace:
+                raise
+            have = {"store_id": None, "fingerprint": None}       # does not parse: set aside like any other pin
+        if have is not None and have != trust and not replace:
             raise Refused("routes-trust-exists", f"pinned to store {str(have.get('store_id'))[:32]} and key "
                                                  f"{str(have.get('fingerprint'))[:51]}; rotation is --replace's")
-        pub = (req["public_key"] + "\n").encode("ascii")
-        pair = (("trust.pub", pub), ("trust.json", canon.canonical_bytes(trust)))
-        for name, data in pair:
-            if _trust_file_holds(routes / name, data):
-                continue
-            try:
-                R.write_durably(routes / name, data, mode=0o644, fsync=fsync or gen_mod._full_fsync)
-            except R.NotDurable as e:
-                if name == "trust.pub":
-                    raise Refused("routes-trust-write-failed", f"trust.pub is in place but not durable "
-                                                               f"({e.strerror}); trust.json was not written") from None
-                (err or sys.stderr).write(f"levain install-helper: warning: trust.json written but not durable "
-                                          f"({e.strerror}): it is in force now and may not survive a crash; run it "
-                                          "again\n")
-            except OSError as e:
-                raise Refused("routes-trust-write-failed", f"{name}: {e.strerror or e}") from None
-        for name, data in pair:
-            if not _trust_file_holds(routes / name, data):
-                raise Refused("routes-trust-write-failed", f"{name} does not hold the requested pair when read back "
-                                                           "(bytes, root's owner, 0644)")
-    return {"verb": "routes-trust", "store_id": req["store_id"], "fingerprint": req["fingerprint"],
-            "digest": "sha256:" + hashlib.sha256(pub).hexdigest()}
+        if have is None or have == trust:
+            _write_trust_pair(routes, pair, fsync=fsync, warn=warn)
+        else:
+            replaced = {"store_id": have.get("store_id"), "fingerprint": have.get("fingerprint")}
+            sessions = rs.L / "sessions"
+            with _control_held(sessions):
+                gens, vgens = _control_references(sessions)
+                if gens or vgens:
+                    held = [f"generation {g}" for g in sorted(gens)] + [f"verifier generation {g}"
+                                                                         for g in sorted(vgens)]
+                    raise Refused("routes-trust-in-use", f"{', '.join(held)} of the pinned store is referenced by an "
+                                                         "open ticket or a live session; nothing was replaced (let "
+                                                         "them end or cancel the tickets, then replace)")
+                old_pair = {name: R.read_record(routes / name, max_bytes=64 * 1024) for name, _ in pair}
+                undo: list[Callable[[], None]] = []
+                try:
+                    aside = _set_aside(rs.L, routes, old_pair, undo)
+                    _write_trust_pair(routes, pair, fsync=fsync, warn=warn, undo=undo, old=old_pair)
+                except BaseException as e:
+                    problems = []
+                    for act in reversed(undo):
+                        try:
+                            act()
+                        except OSError as u:
+                            problems.append(f"{getattr(act, 'func', act).__name__}: {u.strerror or u}")
+                    what = (e.detail if isinstance(e, Refused)
+                            else f"{type(e).__name__}: {getattr(e, 'strerror', '') or e}")
+                    if problems:
+                        raise Refused("routes-trust-write-failed", f"{what}; putting the old store back FAILED "
+                                                                   f"({'; '.join(problems)}): the old store is in "
+                                                                   f"{aside}") from None
+                    if isinstance(e, Refused) and not undo:
+                        raise                                    # refused before anything moved (the layout)
+                    if isinstance(e, (Refused, OSError)):
+                        raise Refused("routes-trust-write-failed", f"{what}; the old pin and store are back in "
+                                                                   "place") from None
+                    raise
+    out: dict[str, object] = {"verb": "routes-trust", "store_id": req["store_id"], "fingerprint": req["fingerprint"],
+                              "digest": "sha256:" + hashlib.sha256(pub).hexdigest()}
+    if replace:
+        out.update(replaced=replaced, aside=None if aside is None else str(aside))
+    return out
+
+
+def _write_trust_pair(routes: Path, pair: Sequence[tuple[str, bytes]], *, fsync: Callable[[int], None] | None,
+                      warn: Callable[[str], object], undo: list[Callable[[], None]] | None = None,
+                      old: Mapping[str, Optional[bytes]] | None = None) -> None:
+    """:func:`run_routes_trust`'s write: each of ``pair`` in order, unless it already holds (:func:`_trust_file_holds`),
+    then both read back. With ``undo`` (the replace), each write first pushes the put-back of that file's ``old``
+    bytes (or its removal, when there were none), and a ``trust.json`` renamed but not durable is in force, so it
+    warns and answers as the plain verb does."""
+    for name, data in pair:
+        if _trust_file_holds(routes / name, data):
+            continue
+        if undo is not None and old is not None:
+            prior = old.get(name)
+            undo.append(functools.partial(_put_back, routes / name, prior))
+        try:
+            R.write_durably(routes / name, data, mode=0o644, fsync=fsync or gen_mod._full_fsync)
+        except R.NotDurable as e:
+            if name == "trust.pub":
+                raise Refused("routes-trust-write-failed", f"trust.pub is in place but not durable "
+                                                           f"({e.strerror}); trust.json was not written") from None
+            warn(f"levain install-helper: warning: trust.json written but not durable ({e.strerror}): it is in "
+                 "force now and may not survive a crash; run it again\n")
+        except OSError as e:
+            raise Refused("routes-trust-write-failed", f"{name}: {e.strerror or e}") from None
+    for name, data in pair:
+        if not _trust_file_holds(routes / name, data):
+            raise Refused("routes-trust-write-failed", f"{name} does not hold the requested pair when read back "
+                                                       "(bytes, root's owner, 0644)")
+
+
+def _put_back(path: Path, data: Optional[bytes]) -> None:
+    """A replace's put-back of one pin file: its old bytes, root 0644, or no file when there was none."""
+    if data is None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
+    R.write_durably(path, data, mode=0o644, fsync=gen_mod._full_fsync)
 
 
 # --- enrol-authority-signer / remove-authority-signer (14b DESIGN_REV2 S5, DESIGN_REV3 §7) --------------------------
@@ -3675,7 +3894,9 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
         return seams.routes_base(caller_uid, host, lock=lambda: seams.lock(host), err=err)
     if cmd.verb == "routes-trust":
         # As set-limits: the request and its fingerprint are checked before the lock, the write under it.
-        return seams.routes_trust(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err)
+        # --replace (Q16) is passed only when given, so a seam written for the plain verb still takes it.
+        return seams.routes_trust(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err,
+                                  **({"replace": True} if cmd.replace else {}))
     if cmd.verb in SIGNER_VERBS:
         # As routes-trust: argv's keys are checked and fingerprinted before the lock, the file written under it.
         return seams.authority_signer(cmd, caller_uid, host, lock=lambda: seams.lock(host), err=err)
