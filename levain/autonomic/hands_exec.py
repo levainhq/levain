@@ -664,7 +664,7 @@ class HandsExecutor:
         prop = [SUDO, "-n", "-u", s.user, _ENV, "-i", f"PATH={_PATH}", _SH, "-c", _PROPERTY_SH, "levain-property",
                 operator_home, str(s.workspace), str(WORKSPACE_ROOT[s.host]), "--", *_chain(s.python)]
         try:
-            r = _call(prop, env={"PATH": _PATH}, timeout=PROBE_TIMEOUT)
+            r = _probe(s, prop)
         except subprocess.TimeoutExpired:
             return _after_probe_timeout(s, "sudo_refused")
         except OSError:
@@ -676,7 +676,7 @@ class HandsExecutor:
             return "sudo_refused"
         probe = [*prefix, "-I", "-S", "-c", f"import os, sys; sys.exit(0 if os.geteuid() == {s.uid} else 3)"]
         try:
-            r = _call(probe, env={"PATH": _PATH}, timeout=PROBE_TIMEOUT)
+            r = _probe(s, probe)
         except subprocess.TimeoutExpired:
             return _after_probe_timeout(s, "python_unproven:probe_timeout")
         except OSError:
@@ -731,9 +731,10 @@ class HandsExecutor:
     def execute_reserved(self, action_name: str, payload: str, *, context_id: str,
                          reservation: Optional[Reservation], journaled: bool) -> ExecutionResult:
         """Run the effect on the plan ``reservation`` holds. Between the caller's intent and the child only
-        non-blocking work runs: attribute checks, :meth:`preflight`, the argv, the child's start. ``ok`` only
-        when the child exited 0, the hands user was then shown quiescent, and the disk shows the one expected
-        result. Raises :class:`NotStarted` when no child was started, :class:`OutcomeUnknown` for everything
+        non-blocking work runs: attribute checks, :meth:`preflight`, the temporary name's length against the
+        workspace's ``NAME_MAX`` (a name the child could never create is permanent, never a start), the argv, the
+        child's start. ``ok`` only when the child exited 0, the hands user was then shown quiescent, and the disk
+        shows the one expected result. Raises :class:`NotStarted` when no child was started, :class:`OutcomeUnknown` for everything
         else that is not ``ok``, except that an interrupt (a ``BaseException`` that is not an ``Exception``) while
         the child runs passes through once the child is stopped, the hands user swept and the child reaped (the
         outcome is just as unknown). A subclass holds no reservation (``no_reservation``)."""
@@ -755,6 +756,8 @@ class HandsExecutor:
             body: Optional[bytes] = str(doc["body"]).encode("utf-8", "surrogatepass")
             token = os.urandom(8).hex()
             tmp = "." + name + _TMP_MARK + token
+            if len(os.fsencode(tmp)) > _name_max(plan.workspace):
+                raise NotStarted("permanent:payload_mismatch:name_too_long")
             argv = [*plan.prefix, "-I", "-S", "-c", _WRITE_SCRIPT, str(plan.uid), str(CHILD_DEADLINE_S),
                     str(plan.workspace), name, token, *parts]
         else:
@@ -803,17 +806,45 @@ class HandsExecutor:
         return ExecutionResult(ok=True, detail=str(plan.workspace / rel), downstream_id=f"{plan.user}:{rel}")
 
 
-def _after_probe_timeout(s: _Static, why: str) -> str:
-    """``why``, after the hands user is swept: a probe's timeout stops sudo at most, and what sudo started as the
-    hands user would otherwise outlive it and hold every later reservation at ``hands_busy:live``. The plan runs
-    under the exclusive hands lock, so no session owns the user while it is swept. The answer is a refusal either
-    way, so a sweep that fails or raises changes nothing here; the next reservation's liveness check reads what
-    is left."""
+def _probe(s: _Static, argv: List[str]) -> "subprocess.CompletedProcess[bytes]":
+    """:func:`_call` for a probe that runs as the hands user. Its timeout and an ``OSError`` are the plan's to
+    answer; anything else that ends it, an interrupt included, also stops sudo at most, so the hands user is swept
+    (:func:`_sweep_after_probe`) before it passes through."""
+    try:
+        return _call(argv, env={"PATH": _PATH}, timeout=PROBE_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        raise
+    except BaseException:
+        _sweep_after_probe(s)
+        raise
+
+
+def _sweep_after_probe(s: _Static) -> None:
+    """Sweep the hands user after a probe ended without its answer: that stops sudo at most, and what sudo started
+    as the hands user would otherwise outlive it and hold every later reservation at ``hands_busy:live``. The plan
+    runs under the exclusive hands lock (``test_the_plan_has_exactly_one_caller``: its one caller is
+    :func:`hands_reserved`), so no session owns the user while it is swept. The plan answers a refusal (or passes
+    an interrupt through) either way, so a sweep that fails or raises an ``Exception`` changes nothing here; the
+    next reservation's liveness check reads what is left."""
     try:
         sweep_hands_user(s.user, uid=s.uid)
     except Exception:
         pass
+
+
+def _after_probe_timeout(s: _Static, why: str) -> str:
+    """``why``, after the hands user is swept (:func:`_sweep_after_probe`)."""
+    _sweep_after_probe(s)
     return why
+
+
+def _name_max(path: Path) -> int:
+    """The longest name, in bytes, ``path``'s filesystem takes: ``pathconf``'s answer, or 255 when it gives none."""
+    try:
+        n = os.pathconf(str(path), "PC_NAME_MAX")
+    except (OSError, ValueError):
+        return 255
+    return n if isinstance(n, int) and n > 0 else 255
 
 
 def _spawn_why(e: BaseException) -> str:
@@ -920,7 +951,8 @@ def _leaf_is(d: int, name: str, plan: HandsPlan, *, size: Optional[int], sha: st
 def _read_written(plan: HandsPlan, parts: List[str], name: str, body: bytes, tmp: str) -> Tuple[str, List[str]]:
     """What the disk shows after a write: ``ok`` only for the one expected file with THIS child's temporary file
     (``tmp``, the name the parent gave it) gone. Beside the answer, the temporary files of the same document an
-    earlier run left (a crash, a killed child): reported, never read as this child's."""
+    earlier run left (a crash, a killed child), as :func:`_stale_names` shows them: reported, never read as this
+    child's."""
     try:
         d = _open_dir(plan, parts)
     except OSError as e:
@@ -934,11 +966,27 @@ def _read_written(plan: HandsPlan, parts: List[str], name: str, body: bytes, tmp
             return "tmp_left", []
         except FileNotFoundError:
             pass
-        return "ok", sorted(e for e in os.listdir(d) if e.startswith("." + name + _TMP_MARK))
+        return "ok", _stale_names(sorted(e for e in os.listdir(d) if e.startswith("." + name + _TMP_MARK)))
     except OSError as e:
         return f"unreadable:{_errno_name(e)}", []
     finally:
         os.close(d)
+
+
+#: Of the temporary files an earlier run left, the detail names at most this many, each cut to this many characters.
+_STALE_NAMES = 5
+_STALE_NAME_CHARS = 80
+
+
+def _stale_names(names: List[str]) -> List[str]:
+    """``names`` (the hands user's to choose: any number, any bytes) as the detail shows them: the first
+    :data:`_STALE_NAMES`, each by ``repr`` so no control byte reaches a terminal, cut to :data:`_STALE_NAME_CHARS`
+    characters (``...`` after the quote marks a cut one), then ``and <n> more``."""
+    out = [repr(n) if len(n) <= _STALE_NAME_CHARS else repr(n[:_STALE_NAME_CHARS]) + "..."
+           for n in names[:_STALE_NAMES]]
+    if len(names) > _STALE_NAMES:
+        out.append(f"and {len(names) - _STALE_NAMES} more")
+    return out
 
 
 def _read_undone(plan: HandsPlan, parts: List[str], name: str, sha: str) -> str:

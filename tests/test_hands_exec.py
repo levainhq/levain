@@ -549,7 +549,7 @@ def test_a_stale_tmp_from_an_earlier_run_is_reported_and_never_tmp_left(tmp_path
     r = ex.execute_reserved("write_document", _payload(ex.user), context_id="c-1", reservation=_ready(ex, plan),
                             journaled=True)
     assert r.ok and r.downstream_id == f"{ex.user}:notes/in/c-1.md"
-    assert r.detail == f"{d / 'c-1.md'} (left by an earlier run: .c-1.md.levain-write-4242)"
+    assert r.detail == f"{d / 'c-1.md'} (left by an earlier run: '.c-1.md.levain-write-4242')"
     assert (d / "c-1.md").read_text() == "hello\n" and (d / ".c-1.md.levain-write-4242").exists()
 
 
@@ -929,7 +929,8 @@ def _ls(monkeypatch, answers):
             return self.answer[1].encode(), b""
 
         def kill(self):
-            pass
+            # a kill that lands: the child is then seen to exit, so a timeout may be retried (run_bounded)
+            self.returncode = -9
 
         def wait(self, timeout=None):
             return self.returncode
@@ -1089,3 +1090,115 @@ def test_a_plan_that_raises_is_not_ready_and_releases_the_lock(tmp_path, monkeyp
         fd = take_exclusive(ex.entity_dir)
         assert fd is not None
         os.close(fd)
+
+
+# --- a1f4 (1026-22 a1ab L3 fix round) --------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("which", [1, 2])
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit, ValueError])
+def test_anything_but_a_timeout_or_a_failed_start_in_a_probe_sweeps_then_passes_through(tmp_path, monkeypatch,
+                                                                                        which, exc):
+    # complement LOW 2: an interrupt during a probe killed sudo but never swept what sudo had started as the hands
+    # user (B1-8's orphan, by another path)
+    ex = _executor(tmp_path)
+    static = X._Static(user=ex.user, uid=450, home="/var/empty", host="darwin", workspace=tmp_path / "ws",
+                       python="/opt/py/bin/python3.9", python_rule="strict")
+    monkeypatch.setattr(X.HandsExecutor, "_static", lambda self: static)
+    events: list = []
+
+    def call(argv, **kw):
+        events.append("call")
+        if len(events) == which:
+            raise exc()
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+    monkeypatch.setattr(X, "_call", call)
+    monkeypatch.setattr(X, "sweep_hands_user", lambda user, **kw: events.append(("sweep", user, kw.get("uid"))))
+    with pytest.raises(exc):
+        ex._plan()
+    assert events == ["call"] * which + [("sweep", ex.user, 450)]
+
+
+def test_a_failed_probe_start_does_not_sweep(tmp_path, monkeypatch):
+    # nothing ran as the hands user, so there is nothing to stop
+    ex = _executor(tmp_path)
+    static = X._Static(user=ex.user, uid=450, home="/var/empty", host="darwin", workspace=tmp_path / "ws",
+                       python="/opt/py/bin/python3.9", python_rule="strict")
+    monkeypatch.setattr(X.HandsExecutor, "_static", lambda self: static)
+    events: list = []
+
+    def call(argv, **kw):
+        raise OSError(errno.ENOENT, "no sudo")
+    monkeypatch.setattr(X, "_call", call)
+    monkeypatch.setattr(X, "sweep_hands_user", lambda user, **kw: events.append("sweep"))
+    assert ex._plan() == "sudo_refused" and events == []
+
+
+def _no_popen(monkeypatch) -> list:
+    started: list = []
+
+    def popen(argv, **kw):
+        started.append(argv)
+        raise AssertionError("a child was started")
+    fake = types.SimpleNamespace(Popen=popen, run=subprocess.run, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL,
+                                 TimeoutExpired=subprocess.TimeoutExpired, CompletedProcess=subprocess.CompletedProcess)
+    monkeypatch.setattr(X, "subprocess", fake)
+    return started
+
+
+@pytest.mark.parametrize("name_max", [150, None])
+def test_a_temporary_name_past_the_directorys_name_max_is_refused_before_any_child(tmp_path, monkeypatch, name_max):
+    # deepseek MED + complement LOW 6: `.<name>.levain-write-<16 hex>` overflowed NAME_MAX for a final name that
+    # was itself legal; the child failed ENAMETOOLONG and the write read as unknown
+    ex = _executor(tmp_path)
+    ws = _ws(tmp_path)
+    plan = _plan(ex, ws)
+    cid = "c" * 125                           # the name is <cid>.md, 128 bytes: _NAME_RE's longest
+    tmp_len = len("." + cid + ".md" + X._TMP_MARK) + 16
+    assert tmp_len == 159
+
+    def pathconf(path, what):
+        assert (str(path), what) == (str(ws), "PC_NAME_MAX")
+        if name_max is None:
+            raise OSError(errno.EINVAL, "no answer")
+        return name_max
+    monkeypatch.setattr(X.os, "pathconf", pathconf)
+    started = _no_popen(monkeypatch)
+    payload = _payload(ex.user, name=cid + ".md")
+    if name_max is None:
+        # no answer: 255, which 159 fits; the child is started (the stand-in refuses it)
+        with pytest.raises(X.NotStarted) as e:
+            ex.execute_reserved("write_document", payload, context_id=cid, reservation=_ready(ex, plan),
+                                journaled=True)
+        assert str(e.value) == "spawn_failed:AssertionError" and len(started) == 1
+        return
+    with pytest.raises(X.NotStarted) as e:
+        ex.execute_reserved("write_document", payload, context_id=cid, reservation=_ready(ex, plan), journaled=True)
+    assert str(e.value) == "permanent:payload_mismatch:name_too_long" and started == []
+
+
+def test_the_name_rule_caps_the_name_in_ascii_bytes():
+    # the tmp name's other bound: _NAME_RE admits ASCII only, at most 128 characters, so 128 bytes
+    assert X._NAME_RE.fullmatch("a" * 128) and not X._NAME_RE.fullmatch("a" * 129)
+    assert not X._NAME_RE.fullmatch("aé.md")
+
+
+def test_stale_tmp_names_in_the_detail_are_capped_and_escaped(tmp_path, monkeypatch):
+    # complement LOW 4: the names are the hands user's to choose, any number and any bytes, and went into detail
+    ex = _executor(tmp_path)
+    ws = _ws(tmp_path)
+    plan = _plan(ex, ws, _python())
+    d = ws / "notes" / "in"
+    d.mkdir(parents=True)
+    stale = [f".c-1.md.levain-write-{i}" for i in range(6)] + [".c-1.md.levain-write-\x1b[2J" + "x" * 150]
+    for n in stale:
+        (d / n).write_text("left")
+    _real_child(monkeypatch)
+    r = ex.execute_reserved("write_document", _payload(ex.user), context_id="c-1", reservation=_ready(ex, plan),
+                            journaled=True)
+    assert r.ok
+    note = r.detail.split(" (left by an earlier run: ", 1)[1]
+    assert "\x1b" not in note and note.endswith(", and 2 more)")
+    shown = note[:-len(", and 2 more)")].split(", ")
+    first = sorted(stale)[0]                # the long one: ESC sorts before the digits
+    assert first == stale[-1] and len(first) > X._STALE_NAME_CHARS
+    assert shown == [repr(first[:X._STALE_NAME_CHARS]) + "..."] + [repr(n) for n in sorted(stale)[1:5]], shown
