@@ -50,7 +50,7 @@ refused, with the reason, never skipped. The result lands beside the request:
 An answer whose reply the page never got (the network dropped it, the page's deadline passed) may have signed, or may
 still be verifying: no read of the request can tell that from "nothing was signed". So the page names each answer with an
 attempt id it made, and the Signer keeps that answer's outcome in ``<queue_dir>/sign/.attempts/<id>.<attempt>.json``
-(:data:`ATTEMPTS_DIR`), ``pending`` from before anything is checked, then ``signed`` or ``refused`` with the reason, on
+(:data:`ATTEMPTS_DIR`), ``pending`` from before the answer is checked, then ``signed`` or ``refused`` with the reason, on
 every way out (:meth:`Signer.answer`). ``POST .../attempt`` asks it (:meth:`Signer.attempt`): it waits up to
 :data:`ATTEMPT_WAIT_S` while the answer runs, and an attempt it never saw is recorded refused on the spot, so that answer
 arriving later is refused too and "refused" never turns out false. A pending record is held under an ``flock`` for as long
@@ -1351,7 +1351,8 @@ class Signer:
         assertion's credential id) is recorded as the signing key's after both files are written (:meth:`_learn`).
 
         An optional ``attempt`` (an id the page made for this one answer, :data:`_ATTEMPT_ID`) is recorded as
-        pending before anything else is checked and settled on every way out: ``signed`` with this reply, or
+        pending once its own id and the request id are well formed, before the answer is checked, and settled on every
+        way out: ``signed`` with this reply, or
         ``refused`` with the refusal's words; a refusal after which the signature store proves this attempt's signature
         (a write that failed after the completion marker was linked) settles signed. :meth:`attempt` reads it. An
         attempt already recorded is a 409: one attempt is one answer."""

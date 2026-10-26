@@ -1,10 +1,10 @@
 """The cockpit card's sign path against the classes the card's L3 r1 named (project_memory/1025-43/signcard/RULINGS_L3_R1.md
 S1-S7), over the rig and helpers of test_cockpit_sign_card_r5.
 
-S1: one open read after an answer whose reply was lost is not proof nothing was signed (the server may still be verifying):
-the card stays frozen and says the request "reads open now; not confirmed", and comes back only when a second read finds
-the same version still open. S2: a cancelled prompt keeps the remembered passkey. S3: a remembered entry that cannot be an
-id is purged before the card decides who signs. S5: a read that rejects is said. S6: a re-armed card is not redrawn."""
+S1: no read of the request after an answer whose reply was lost is proof nothing was signed (the server may still be
+verifying): the card asks the cockpit about the answer's attempt, and an attempt the cockpit never saw is fenced, so an
+answer arriving after that read is refused and the card that came back stays right. S2: a cancelled prompt keeps the remembered passkey. S3: a remembered entry that cannot be an
+id is purged before the card decides who signs. S5: an attempt read that rejects is said, and the card stays frozen. S6: a re-armed card is not redrawn."""
 from __future__ import annotations
 
 import json

@@ -2,8 +2,8 @@
 sheet's L3 r1 named (project_memory/1025-40/os1/RULINGS_L3_R1.md H2, H4, H7, H8), over the rig of test_cockpit_sign_card:
 headless Chrome on ``http://localhost:<port>`` with a virtual authenticator holding the passkey the Signer's keys name.
 
-H2: an answer whose reply did not come back ("not sure") never re-arms the card: its buttons stay frozen while the request
-is read again, and come back only when that read finds the same version still open. H4: a challenge that is not
+H2: an answer whose reply did not come back ("not sure") never re-arms the card on a read of the request: the cockpit is
+asked about the answer's attempt, and the card comes back only when it says that attempt was refused. H4: a challenge that is not
 base64url is named and no passkey is asked. H4/H7: a remembered credential id that does not decode is dropped (the OS's
 own list), never a throw that blocks every tap; a remembered id the authenticator refuses (NotAllowedError) is asked once
 more without it, and the record then names the passkey that signed. H8: a reply missing its fields never prints
