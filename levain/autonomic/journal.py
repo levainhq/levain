@@ -79,7 +79,7 @@ from levain.autonomic.db import AutonomicDB
 
 __all__ = [
     "EffectStatus", "EffectOutcome", "HoldResult", "RunJournal", "RunRef", "JournalCorruptError",
-    "JournalConflictError", "UNSIGNED_DECIDER",
+    "JournalConflictError", "EffectNotStarted", "UNSIGNED_DECIDER",
     "run_id_for", "hold_id_for", "effect_digest", "needs_signature", "AUTHORIZED", "RECHECK", "decision_key",
 ]
 
@@ -95,6 +95,12 @@ class JournalConflictError(JournalCorruptError):
     """A write the store's constraints refuse (a second hold with a pending id another hold has). A
     :class:`JournalCorruptError`, so every caller that fails closed on one fails closed on this; the
     name says what happened."""
+
+
+class EffectNotStarted(Exception):
+    """Raised by an effect function to say that no effect began: nothing was started, so the effect may
+    be delivered again. Raising it after any part of the effect began breaks that contract, and the
+    journal cannot detect it."""
 
 
 class EffectStatus(str, enum.Enum):
