@@ -128,7 +128,7 @@ class AuthorityCoverage:
     ``cockpit_root`` holds the cockpit journal and the authority anchor (``levain.authority.anchor_path``).
     ``allowed_signers`` is root's allowed-signers file: an absolute path that must pass ``trust_anchor_problem`` for
     the owners :mod:`levain.autonomic.confirm` trusts, or nothing is covered. ``store_id`` is the autonomic store's
-    own id (its ``meta`` row): only a policy signed for it covers. Neither method raises."""
+    own id (its ``meta`` row): only a policy signed for it covers. :meth:`refresh` and :meth:`peek` never raise."""
 
     def __init__(self, cockpit_root: Path | str, *, allowed_signers: Path | str, store_id: str,
                  ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN, cache: _auth.ReplayCache | None = None,
