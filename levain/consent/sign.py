@@ -990,8 +990,10 @@ class Signer:
         ``overflow`` counts the request files not read (at least that many when the directory holds more than one
         listing looks at). A refused one carries ``refused``, its ``sha256`` and none of its text: what cannot be
         shown truthfully is not shown, and a file that is not a sign request is listed as refused, never skipped.
-        A challenge whose request this listing read and found no longer listable (gone, expired, answered) is
-        dropped; one past the cap or the directory scan was never read, so its challenge is kept."""
+        A challenge whose request this listing read and found no longer signable here (gone, expired, answered, or
+        not this port's) is dropped; one past the cap or the directory scan was never read, so its challenge is kept.
+        Not being listed is not closure: a request levain filed in its own namespace is never listed and stays
+        signable by id, so its challenge survives the listing."""
         if not self.namespaces:
             return {"rows": [], "overflow": 0}
         names: list[str] = []
@@ -1009,6 +1011,7 @@ class Signer:
             names = []
         names.sort()
         now, rows, read = _now(), [], 0
+        signable: set[str] = set()            # read, open, unexpired and signable here: listed or not
         for rid in names:
             if len(rows) >= LIST_MAX:
                 break
@@ -1017,8 +1020,11 @@ class Signer:
                 if state_of(self.queue_dir, rid) != "open":   # a decided request is never parsed again
                     continue
                 request = read_request(self.queue_dir, rid)
-                if not self._ours(request, listing=True) or (request.expires_at is not None
-                                                             and request.expires_at <= now):
+                if request.expires_at is not None and request.expires_at <= now:
+                    continue
+                if request.refused is None and self._ours(request):
+                    signable.add(rid)
+                if not self._ours(request, listing=True):
                     continue
             except SignRefused:
                 continue                      # gone since the directory was read
@@ -1028,13 +1034,12 @@ class Signer:
                              "refused": f"not a sign request: it cannot be read ({type(exc).__name__})"})
                 continue
             rows.append(_row(rid, request, signers))
-        listed = {r["id"] for r in rows if not r.get("refused")}
-        # a challenge is dropped only for a request this listing READ and did not list: one past the cap (or past the
-        # directory scan) was never looked at, so the listing says nothing about it
+        # a challenge is dropped only for a request this listing READ and found no longer signable: one past the cap
+        # (or past the directory scan) was never looked at, so the listing says nothing about it
         looked, scanned = set(names[:read]), set(names)
         with self._lock:
             for rid in [rid for rid in self._challenged
-                        if rid not in listed and (rid in looked or (rid not in scanned and not more))]:
+                        if rid not in signable and (rid in looked or (rid not in scanned and not more))]:
                 del self._challenged[rid]
         return {"rows": rows, "overflow": len(names) - read + (1 if more else 0)}
 
