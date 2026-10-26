@@ -203,7 +203,8 @@ def test_settled_row_is_whole_from_lineage_base_and_the_response(monkeypatch):
 
     async def go(d):
         async with KeysWorld(d, monkeypatch) as w:
-            frames = await w.q(TICKETED, response=(http_json({"type": "message", "model": "glm-5.2-0901",
+            # a dated variant of the checked model (3c-9: any other model would be charged its hold, not priced)
+            frames = await w.q(TICKETED, response=(http_json({"type": "message", "model": MODEL + "-20260901",
                                                               "usage": usage}), b""))
             return frames, w.lines()
 
@@ -214,7 +215,7 @@ def test_settled_row_is_whole_from_lineage_base_and_the_response(monkeypatch):
     assert set(base) == set(LN.RECORD_CHECKS)
     row = st["meta"]["lineage"]
     cost = codec.price_usage(codec.Usage(3, 4, 0, 2), codec_price())
-    want = dict(base, settled="yes", ended_at=row["ended_at"], model_answered="glm-5.2-0901",
+    want = dict(base, settled="yes", ended_at=row["ended_at"], model_answered=MODEL + "-20260901",
                 provider_answered="unknown", cost_reported=None, tokens_in=5, tokens_out=4, cost_microdollars=cost,
                 overrun=None, status=200)
     assert row == want
@@ -233,7 +234,7 @@ def test_overrun_row_is_settled_yes_with_its_overrun(monkeypatch):
     # H6-7: an overrun row is `settled: "yes"` plus `overrun` (the settled amount is known; the overrun its own fact)
     async def go(d):
         async with KeysWorld(d, monkeypatch) as w:
-            frames = await w.q(TICKETED, response=(http_json({"model": "glm-5.2", "usage": {
+            frames = await w.q(TICKETED, response=(http_json({"model": MODEL, "usage": {
                 "input_tokens": 0, "output_tokens": 100000}}), b""))
             return frames, w.lines()
 
@@ -389,7 +390,9 @@ def test_the_one_metadata_reader():
     # what is not printable ASCII 1..128, or not a finite non-negative number, was not said
     for bad in ({"model": "é"}, {"model": "x" * 129}, {"model": 5}, {"model": ""},
                 {"usage": {"cost": True}}, {"usage": {"cost": -1}}, {"usage": {"cost": "0.1"}}):
-        assert body("openai-chat", bad).metadata() == codec.Metadata(), bad
+        # 3c-9: a model stated outside the grammar is recorded as not said, and marked, so the settle fails closed
+        want = codec.Metadata(model_unreadable="model" in bad)
+        assert body("openai-chat", bad).metadata() == want, bad
     # a body past the copy cap, or cut short, said nothing readable; a stopped stream keeps what it read before
     cut = codec.CODECS["openai-chat"].usage(b"application/json")
     cut.feed(b'{"model": "m-1", "usag')

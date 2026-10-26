@@ -348,6 +348,10 @@ class _Reader:
         from levain.broker import codec
         return codec.Usage(in_=OVER["input_tokens"], out=OVER["output_tokens"], cache_write=0, cache_read=0)
 
+    def metadata(self):
+        from levain.broker import codec
+        return codec.Metadata()       # the real reader's: the response named no model (3c-9's settle reads it)
+
 
 def test_an_in_flight_settle_stops_only_the_registration_it_started_on(monkeypatch):
     # L3 r2 complement LOW 2: an exchange admitted under a registration that has since left (DROP-SESSION, or a
@@ -397,3 +401,56 @@ def test_a_settle_that_raises_still_stops_the_session(monkeypatch):
             return {"stopped": set(s.k.budget_stopped)}
 
     assert _run(go)["stopped"] == {"s0"}
+
+
+# --- 3c-9, the 1-GLM-route bound's settle half (R4 §5 CARRIED) ----------------------------------------------------------
+
+def _answered(model: str, usage: dict) -> bytes:
+    """`usage_response` whose body also names the model that answered (OpenRouter prices at the model that ran)."""
+    body = json.dumps({"type": "message", "model": model, "usage": usage}).encode()
+    return (b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\nconnection: close\r\n\r\n"
+            % len(body) + body)
+
+
+@pytest.mark.parametrize("answered,stops", [("m2", True), ("m1-20251001", False), ("m1-2025-10-01", False),
+                                             ("m1", False), ("m1x", True), ("m1-2025", True), (123, True)])
+def test_a_response_from_another_model_charges_the_hold_and_stops_the_session(py, answered, stops):
+    # The checked model is `m1`. A response whose top-level `model` is neither it nor a dated variant of it is never
+    # priced at `m1`'s row: its hold is charged whole and the session stops. False if the settle is `m1`'s price of
+    # the usage (UNDER_COST, below the hold), or the next `Q` is served.
+    async def go() -> dict:
+        async with World(py, [_answered(answered, UNDER), R.usage_response(UNDER)]) as w:
+            for g in w.up.gates:
+                g.set()
+            first = await w.front.q(attempts=5)
+            await until(lambda: len(_resolutions(w.keys.ledger_path)) == 1)
+            second = await w.front.q(attempts=5)
+            return {"first": first, "second": second, "res": _resolutions(w.keys.ledger_path)[0], "rc": w.keys.stop()}
+
+    out = asyncio.run(asyncio.wait_for(go(), 120))
+    assert out["first"].get("status") == 200, out["first"]
+    res = out["res"]
+    if stops:
+        assert (res["kind"], res["settled"], res["overrun"]) == ("settled", HOLD, 0), res
+        assert out["second"].get("refused") == "budget-overrun", out["second"]
+    else:
+        assert (res["kind"], res["settled"], res["overrun"]) == ("settled", UNDER_COST, 0), res
+        assert out["second"].get("status") == 200, out["second"]
+    assert out["rc"] == 0
+
+
+def test_another_model_reporting_more_than_the_hold_is_charged_what_it_reports(py):
+    # OpenRouter's usage accounting (`usage.cost`, USD) is what the provider charged for the model that ran: when it
+    # is past the hold, the charge is it (the overrun booked and sent), never the checked model's price.
+    async def go() -> dict:
+        async with World(py, [_answered("m2", dict(UNDER, cost=0.01))]) as w:
+            w.up.gates[0].set()
+            first = await w.front.q(attempts=5)
+            await until(lambda: len(_resolutions(w.keys.ledger_path)) == 1)
+            return {"first": first, "res": _resolutions(w.keys.ledger_path)[0], "second": await w.front.q(attempts=5),
+                    "rc": w.keys.stop()}
+
+    out = asyncio.run(asyncio.wait_for(go(), 120))
+    res = out["res"]
+    assert (res["kind"], res["settled"], res["overrun"]) == ("settled", HOLD, 10_000 - HOLD), res
+    assert out["second"].get("refused") == "budget-overrun" and out["rc"] == 0, out

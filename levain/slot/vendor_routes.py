@@ -3,8 +3,9 @@
 
 One route per vendor whose models carry a price row in :mod:`levain.broker.vendor_prices`: Anthropic's Messages API,
 priced for every Claude row there. The OpenRouter row (``z-ai/glm-5.2``) gets no base route: no interactive session
-picks one (``supervisor.VENDOR_HOSTS`` names no OpenRouter host), dispatch routes come from the signed route map, and
-the Diogenes ``models`` / ``route`` fallback finding (1024 carried item) is open until its codec bound lands.
+picks one (``supervisor.VENDOR_HOSTS`` names no OpenRouter host), and dispatch routes come from the signed route map.
+A body's ``models`` fallback list or ``route`` is refused at the check, and a response naming another model is charged
+past the checked model's row (3c-9, ``levain.broker.codec.answered_other``).
 
 The merge is by route id: every id here is replaced whole by its shipped entry, every other entry of the map is kept
 as written. The result is parsed by :func:`levain.broker.policy.parse_base_map` (keys' own parser) before root writes

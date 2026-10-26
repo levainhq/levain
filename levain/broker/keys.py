@@ -2357,15 +2357,29 @@ class Keys:
 
         A ticketed exchange's resolution carries keys' whole `/3` row (H6-28; `lineage_row`): `uncertain` with the
         call's metadata and no counts, or `settled: "yes"` with its counts, its cost and, past the hold, `overrun`
-        (H6-7). `status` is the upstream's (the relayed `R`)."""
+        (H6-7). `status` is the upstream's (the relayed `R`).
+
+        3c-9 (R4 §5 CARRIED): a response that says another model ran than `model`, the checked one
+        (:func:`levain.broker.codec.answered_other`), is never priced at `model`'s row: it is charged its whole hold, or
+        the cost the response reports when that is more, and the session stops as for an overrun (with no usage it is
+        `uncertain` at its hold, as any call, and the session stops too). `SPEND-OVERRUN` goes only for a charge past
+        the hold (CONTROL refuses an overrun of 0)."""
         usage = reader.result()
+        md = reader.metadata()
+        other = bool(model) and codec.answered_other(md, model)
+        current = self.by_session.get(reg.session) is reg
         if usage is None:
+            if other and current:
+                self.budget_stopped.add(reg.session)
             hold.uncertain(reader.reason, self._row_meta(hold, "uncertain", reader, status))
             return
-        cost = codec.price_usage(usage, price)
-        stopped = cost > hold.amount and self.by_session.get(reg.session) is reg
-        if stopped:
+        if other:
+            cost = max(hold.amount, md.cost_reported or 0)
+        else:
+            cost = codec.price_usage(usage, price)
+        if (other or cost > hold.amount) and current:
             self.budget_stopped.add(reg.session)
+        stopped = cost > hold.amount and current
         try:
             hold.settle(cost, dict(usage.meta(), **self._row_meta(hold, "yes", reader, status, usage, cost)))
         finally:

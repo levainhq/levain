@@ -169,13 +169,18 @@ class Codec:
     def check(self, obj: Mapping[str, Any], prices: Optional[Mapping[str, Price]], *, dispatch: bool,
               model_requested: Optional[str] = None) -> Checked:
         """The model has a price entry (else `model-not-allowed`); a ticketed run's `model` is its ticket's
-        `model_requested` (else `model-not-allowed`); then the unboundable shapes: a dispatch route refuses them
+        `model_requested` (else `model-not-allowed`); no `route`, and no `models` but exactly `[model]` (else
+        `model-not-allowed`); then the unboundable shapes: a dispatch route refuses them
         `body-unbounded:<what>` (403), an interactive one returns them as `unproven`."""
         model = obj.get("model")
         if not isinstance(model, str) or not prices or model not in prices:
             raise norm.Refused("model-not-allowed", "no price entry for the model")
         if model_requested is not None and model != model_requested:
             raise norm.Refused("model-not-allowed", "not the ticket's model")
+        # 3c-9 (R4 §5 CARRIED): a provider's fallback list or router choice may run another model than `model`, and
+        # OpenRouter prices the request at the model that ran; the hold and the settle price `model` only
+        if "route" in obj or ("models" in obj and obj["models"] != [model]):
+            raise norm.Refused("model-not-allowed", "a fallback list or route may run another model")
         price = prices[model]
         found = self._unbounded(obj, price)
         if found and dispatch:
@@ -432,10 +437,29 @@ class Metadata:
     """What a response says about itself (S1 3c-6c, head ruling H6-6: ONE reader, here; 3c-9's settle check reuses it):
     its top-level `model`, the provider that served it (`provider`, OpenRouter's), and the cost it reports
     (`usage.cost`, OpenRouter's usage accounting, in USD credits) as integer microdollars. None = the response did
-    not say (the lineage row records `"unknown"` for the two strings and `null` for the cost, H6-21)."""
+    not say (the lineage row records `"unknown"` for the two strings and `null` for the cost, H6-21).
+    `model_unreadable`: the response did state a top-level `model`, outside the recorded grammar (3c-9: the settle
+    cannot rule such a model the checked one, so it fails closed on it; the lineage row still records `"unknown"`)."""
     model: Optional[str] = None
     provider: Optional[str] = None
     cost_reported: Optional[int] = None
+    model_unreadable: bool = False
+
+
+#: 3c-9: a dated variant of a checked model, as a provider names the snapshot that ran (`<model>-20251001` or
+#: `<model>-2025-10-01`); the settle prices such an answer at the checked model's row
+_DATED = re.compile(r"-(?:[0-9]{8}|[0-9]{4}-[0-9]{2}-[0-9]{2})\Z")
+
+
+def answered_other(md: Metadata, model: str) -> bool:
+    """3c-9 (R4 §5 CARRIED): the response says another model ran than `model`, the checked one: its top-level `model`
+    is neither `model` nor a dated variant of it, or it stated one outside the recorded grammar. A response that names
+    no model is not another model (the codec's own usage is then the only evidence, as for every call)."""
+    if md.model_unreadable:
+        return True
+    if md.model is None or md.model == model:
+        return False
+    return not (md.model.startswith(model) and _DATED.fullmatch(md.model[len(model):]) is not None)
 
 
 def _answered(v: Any) -> Optional[str]:
@@ -464,6 +488,8 @@ def _note_metadata(md: Dict[str, Any], obj: Any) -> None:
     m, p = _answered(obj.get("model")), _answered(obj.get("provider"))
     if m is not None:
         md["model"] = m
+    elif obj.get("model") is not None:
+        md["model_unreadable"] = True        # once stated unreadably, a later readable chunk does not clear it
     if p is not None:
         md["provider"] = p
     u = obj.get("usage")
@@ -608,7 +634,7 @@ class UsageReader:
             except (ValueError, RecursionError):
                 self._body_read = True
         md = self._md
-        return Metadata(md.get("model"), md.get("provider"), md.get("cost"))
+        return Metadata(md.get("model"), md.get("provider"), md.get("cost"), bool(md.get("model_unreadable")))
 
     def result(self) -> Optional[Usage]:
         """The reported usage once the relay has ended, or None (no usage: cut, past a cap, none reported). An event

@@ -120,7 +120,20 @@ REFUSALS = [
     ("R12", "anthropic-messages", '{"model":"m1","max_tokens":"100"}', {}, "body-json"),
     ("R12b", "openai-chat", '{"model":"m1","max_tokens":true}', {}, "body-json"),
     ("R12c", "openai-chat", '{"model":"m1","n":"3"}', {}, "body-json"),
+    # 3c-9, the 1-GLM-route bound (R4 §5 CARRIED): OpenRouter prices a request at the model that ran, so a fallback
+    # list or a router choice would settle at the checked model's row whatever ran (Diogenes' construction, R13)
+    ("R13", "openai-chat", '{"model":"m1","models":["m1","m2"],"route":"fallback","messages":[]}', {},
+     "model-not-allowed"),
+    ("R13b", "openai-chat", '{"model":"m1","models":["m1","m2"],"messages":[]}', {"dispatch": True},
+     "model-not-allowed"),
+    ("R13c", "openai-chat", '{"model":"m1","route":"fallback","messages":[]}', {}, "model-not-allowed"),
+    ("R13d", "openai-chat", '{"model":"m1","models":"m1","messages":[]}', {}, "model-not-allowed"),
+    ("R13e", "anthropic-messages", '{"model":"m1","max_tokens":1,"models":["m2"]}', {}, "model-not-allowed"),
 ]
+
+
+def test_a_models_list_of_exactly_the_model_is_admitted():
+    assert isinstance(_go("openai-chat", '{"model":"m1","models":["m1"],"messages":[]}', EO, dispatch=True), tuple)
 
 
 @pytest.mark.parametrize("row", REFUSALS, ids=[r[0] for r in REFUSALS])
