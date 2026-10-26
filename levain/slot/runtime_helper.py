@@ -53,7 +53,7 @@ from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
 from levain.slot.ids import SlotId, in_own_range
-from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE
+from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE, admits_root, store_dir_row
 from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
                                          bind_stdin, ok_line, parse_runtime_argv, parse_stdin, refusal_line)
 
@@ -94,9 +94,8 @@ def _host() -> str:
     return "darwin" if sys.platform == "darwin" else "linux"
 
 
-def _root_trusted(st: os.stat_result) -> bool:
-    """A store directory root may act below: root-owned, not group- or other-writable."""
-    return st.st_uid == 0 and not st.st_mode & 0o022
+#: What a store directory root acts below must be: the layout's root shape (:func:`layout.admits_root`).
+_root_trusted = admits_root
 
 
 def _fchown(fd: int, uid: int, gid: int, rel: str) -> None:
@@ -747,8 +746,10 @@ class Store:
             self.fd = -1
 
     def open_dir(self, *parts: str, trusted: bool = True) -> int:
-        """An fd on ``L/<parts…>``. ``trusted``: the LAST component must pass ``seams.trusted`` (every
-        intermediate always must)."""
+        """An fd on ``L/<parts…>``. ``trusted``: the LAST component must be trusted (every intermediate always
+        must): its layout row (:func:`layout.store_dir_row`) is root's, or it has none, and the open dir passes
+        ``seams.trusted``. A dir whose row another account owns is never trusted, whatever is on disk: that account
+        could write where root acts."""
         cur = os.dup(self.fd)
         where = str(self.path)
         try:
@@ -759,8 +760,12 @@ class Store:
                 nxt = _openat_dir(cur, p, where)
                 os.close(cur)
                 cur = nxt
-                if (trusted or i < len(parts) - 1) and not self.seams.trusted(os.fstat(cur)):
-                    raise Refused("bad-root", where)
+                if trusted or i < len(parts) - 1:
+                    row = store_dir_row(self.seams.host, parts[:i + 1])
+                    if row is not None and row.owner != "root":
+                        raise Refused("bad-root", f"{where}: its layout row is {row.owner}'s, not root's")
+                    if not self.seams.trusted(os.fstat(cur)):
+                        raise Refused("bad-root", where)
             return cur
         except BaseException:
             os.close(cur)
