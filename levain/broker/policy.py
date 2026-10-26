@@ -112,13 +112,16 @@ def is_host_name(h: object) -> bool:
 
 
 def hosts(route: str, raw: object) -> list[str]:
-    """A route's ``hosts`` list: non-empty, every entry passing :func:`is_host_name`."""
+    """A route's ``hosts`` list: non-empty, every entry passing :func:`is_host_name`, none named twice (the front
+    refuses a CONNECT host admitted twice, so a map holding one would fail every session that carries the route)."""
     if not isinstance(raw, list) or not raw:
         raise PolicyError(f"route {route}: hosts must be a non-empty list")
     out = []
     for h in raw:
         if not is_host_name(h):
             raise PolicyError(f"route {route}: host {h!r} is not a lowercase A-label host name")
+        if h in out:
+            raise PolicyError(f"route {route}: host {h} named twice")
         out.append(h)
     return out
 

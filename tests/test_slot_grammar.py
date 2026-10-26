@@ -30,6 +30,7 @@ def test_every_verb_parses():
         "force-retire": ["force-retire", "egress", "63", "--max-inodes", "100", "--max-seconds", "30"],
         "set-credential": ["set-credential", "anthropic"], "remove-credential": ["remove-credential", "anthropic"],
         "set-limits": ["set-limits"], "routes-base": ["routes-base"], "routes-trust": ["routes-trust"],
+        "routes-egress": ["routes-egress"],
         "enrol-authority-signer": ["enrol-authority-signer", "--principal", "alice", "--public-key",
                                    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA=="],
         "remove-authority-signer": ["remove-authority-signer", "--key", "SHA256:" + "A" * 43],
