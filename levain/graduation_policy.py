@@ -192,7 +192,13 @@ class AuthorityCoverage:
             _log.warning("graduation coverage: authority head unreadable (%s): %s", type(exc).__name__, exc)
             return UNREADABLE_HEAD
 
-    def _replay(self) -> _auth.AuthoritySnapshot:
+    def replay(self, *, check_anchor: bool = True) -> _auth.AuthoritySnapshot:
+        """The log's verified replay, in one read-only transaction: the read ``refresh`` makes, for a caller that
+        reports on the log (``levain doctor``) rather than decides coverage. ``check_anchor=False`` leaves the
+        anchor comparison to the caller, who then holds the replay even where the anchor refuses it."""
+        return self._replay(check_anchor=check_anchor)
+
+    def _replay(self, *, check_anchor: bool = True) -> _auth.AuthoritySnapshot:
         """The verified, anchored replay of the log, in one read transaction."""
         pinned = _auth.read_anchor(_auth.anchor_path(self._root))   # before the transaction's first SELECT
         conn = _connect(self._root / DB_NAME, _REFRESH_BUSY_TIMEOUT)
@@ -209,7 +215,8 @@ class AuthorityCoverage:
             conn.execute("COMMIT")
         finally:
             conn.close()
-        _auth.check_anchor(state, pinned, path=_auth.anchor_path(self._root))
+        if check_anchor:
+            _auth.check_anchor(state, pinned, path=_auth.anchor_path(self._root))
         return state
 
     def _anchor_admits(self, state: _auth.AuthoritySnapshot) -> tuple[bool, _auth.Anchor | None]:

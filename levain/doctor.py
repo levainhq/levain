@@ -2756,14 +2756,13 @@ def _check_authority_signers(install: Path, *, signers: Path | None = None, now:
 
 
 def _authority_signers_rows(install: Path, signers: Path | None, now: Any) -> list[CheckResult]:
-    import sqlite3
     from datetime import datetime, timezone
 
     from levain import authority as auth
     from levain.autonomic import coverage as cov
     from levain.autonomic.confirm import _SIGNERS_FILE_OWNERS
     from levain.cockpit.firejournal import DB_NAME
-    from levain.graduation_policy import _connect, graduation_policies
+    from levain.graduation_policy import AuthorityCoverage, graduation_policies
     from levain.slot import Refused, root_tree
     from levain.slot.install_helper import _read_signers
     from levain.trust_anchor import trust_anchor_problem
@@ -2779,20 +2778,15 @@ def _authority_signers_rows(install: Path, signers: Path | None, now: Any) -> li
     state: Any = None
     log_problem: str | None = None
     try:
-        conn = _connect(journal, 2)
+        pinned = auth.read_anchor(auth.anchor_path(root))              # before the replay's first SELECT
+        # the gate's own read-only replay; the store id is the gate's autonomic store's, which a doctor row never uses
+        state = AuthorityCoverage(root, allowed_signers=path, store_id="doctor").replay(check_anchor=False)
         try:
-            pinned = auth.read_anchor(auth.anchor_path(root))          # before the replay's first SELECT
-            conn.execute("BEGIN")
-            state = auth.snapshot(conn)
-            try:
-                auth.check_anchor(state, pinned, path=auth.anchor_path(root))
-            except auth.NotInitialised as exc:         # the log replayed, so it is initialised: its anchor is the gap
-                state = None
-                rows.append(CheckResult("authority anchor", True, f"the anchor check could not run: {exc}",
-                                        "The cockpit authority row has the log's state.", warn=True))
-            conn.execute("COMMIT")
-        finally:
-            conn.close()
+            auth.check_anchor(state, pinned, path=auth.anchor_path(root))
+        except auth.NotInitialised as exc:             # the log replayed, so it is initialised: its anchor is the gap
+            state = None
+            rows.append(CheckResult("authority anchor", True, f"the anchor check could not run: {exc}",
+                                    "The cockpit authority row has the log's state.", warn=True))
     except auth.NotInitialised:
         return []
     except Exception as exc:  # noqa: BLE001 - a log that cannot be replayed is a row of its own, never a quiet pass
