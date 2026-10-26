@@ -9,8 +9,10 @@ It runs as root under the install lock (:func:`levain.slot.intent.install_lock`)
 setup, replenish, repair or undo, which write the same rules file and token. The unit's ``KeepAlive`` is
 ``SuccessfulExit: false`` (:func:`levain.slot.units.launchd_plist_text`): launchd starts it again after a non-zero
 exit, and leaves it after 0. So an install verb holding the lock (:data:`EX_BUSY`) and a step that fails (1) are tried
-again; a machine with nothing installed exits 0. The install verbs run the same alias and load steps themselves, so a
-run that finds the lock held loses nothing by waiting for the next start.
+again; a machine with nothing installed exits 0, and so does a run that leaves pf's enable state uncertain
+(:data:`levain.slot.pf.ENABLE_UNCERTAIN`), since a retry would only add a reference no token names. The install verbs
+run the same alias and load steps themselves, so a run that finds the lock held loses nothing by waiting for the next
+start.
 """
 from __future__ import annotations
 
@@ -58,8 +60,20 @@ def _lock() -> ContextManager[int]:
     return install_lock("darwin")
 
 
+#: What :func:`_run` returns when a step failed with :data:`levain.slot.pf.ENABLE_UNCERTAIN`; never an exit status.
+RC_UNCERTAIN = 2
+
+
 def _run(steps) -> int:
-    return run_plan(SimpleNamespace(steps=tuple(steps)), dry_run=False, emit=_log)   # type: ignore[arg-type]
+    lines: list = []
+
+    def emit(msg: str) -> None:
+        lines.append(msg)
+        _log(msg)
+    rc = run_plan(SimpleNamespace(steps=tuple(steps)), dry_run=False, emit=emit)   # type: ignore[arg-type]
+    if rc != 0 and lines and lines[-1].strip().startswith(f"FAILED: {pf.ENABLE_UNCERTAIN}"):
+        return RC_UNCERTAIN
+    return rc
 
 
 def main(argv: Optional[Sequence[str]] = None, *, platform: str = sys.platform,
@@ -69,7 +83,10 @@ def main(argv: Optional[Sequence[str]] = None, *, platform: str = sys.platform,
          rules_present: Callable[[], bool] = lambda: os.path.lexists(pf.ANCHOR_FILE),
          run: Callable[[list], int] = _run) -> int:
     """0: every step ran or was already done, or nothing is installed, or no egress slot is in service and there is no
-    rules file to load. :data:`EX_BUSY`: an install verb holds the lock. 1: a step failed (its line is on stderr).
+    rules file to load, or pf's enable state is uncertain (:data:`levain.slot.pf.ENABLE_UNCERTAIN`: a retry would take
+    one more reference no token names, so it is the exit launchd leaves; the line is on stderr and the steps after it,
+    the anchor load among them, did not run). :data:`EX_BUSY`: an install verb holds the lock. 1: a step failed (its
+    line is on stderr).
     :data:`EX_NOPERM` / :data:`EX_CONFIG`: not root / not macOS. With no egress slot in service a rules file that IS
     there is still loaded: it carries the verifier pairs' rules too (:func:`levain.slot.pf.anchor_rules`)."""
     if platform != "darwin":
@@ -94,13 +111,17 @@ def main(argv: Optional[Sequence[str]] = None, *, platform: str = sys.platform,
             return EX_BUSY
         _log(f"refused {e.name}: {e.detail}")
         return 1
+    if rc == RC_UNCERTAIN:
+        _log("not retried: pf stays enabled by a reference no token names, and each retry would take another; the next"
+             " boot, or a setup, replenish or repair, takes the reference again")
+        return 0
     if rc != 0:
         return 1
     _log(f"restored pf for {len(found)} egress slot(s): aliases, the {pf.ANCHOR} rules, pf's enable reference")
     return 0
 
 
-__all__ = ["EX_BUSY", "EX_CONFIG", "EX_NOPERM", "installed_egress_slots", "main"]
+__all__ = ["EX_BUSY", "EX_CONFIG", "EX_NOPERM", "RC_UNCERTAIN", "installed_egress_slots", "main"]
 
 
 if __name__ == "__main__":

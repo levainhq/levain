@@ -122,6 +122,9 @@ Run = Callable[..., "subprocess.CompletedProcess[str]"]
 #: else enabled pf; "pf: token invalid" for a token pf no longer knows while pf stays enabled. Any other
 #: text KEEPS the token: a release that may not have happened is never recorded as done.
 PF_TOKEN_GONE = ("pf not enabled", "pf: token invalid")
+#: How :func:`take_enable_reference` starts a failure that leaves a Levain reference pf holds and no token names: pf
+#: stays enabled, and a retry would only add another such reference.
+ENABLE_UNCERTAIN = "pf enable state uncertain"
 
 
 def _token_gone(r: "subprocess.CompletedProcess[str]") -> bool:
@@ -204,10 +207,17 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
     """``pfctl -E`` and store its token, readable by root alone (§23). The new reference is taken BEFORE
     an earlier run's is released, so pf never sits with no Levain reference between the two. If the old
     one cannot be released, the new one is given back and the old token stays recorded, so a re-run that
-    completes holds one recorded reference. A token write that fails gives the new reference back too, so the boot
-    one-shot's launchd retries never pile up references no token names. A crash between ``-E`` and the token write,
-    or a ``-E`` whose output names no token, leaves one reference with no record; pf then stays enabled, which is the
-    fail-closed side (known edge). A token path that cannot be read is refused before ``-E``."""
+    completes holds one recorded reference. A token write that fails with no old reference released gives the new one
+    back too, so the boot one-shot's launchd retries never pile up references no token names.
+
+    Once the old reference is released, the new one is NEVER given back: it may be all that holds pf on under running
+    sessions (L3 verify r2 codex HIGH). A token write that fails then keeps it held, unrecorded, and answers
+    :data:`ENABLE_UNCERTAIN`, as does a give-back that fails (the reference stays, named by no token). That answer is
+    not retried (:func:`levain.slot.services.pf.main` exits 0 on it), since each retry would take one more reference no
+    token names. The reference left unrecorded outlives an undo, which keeps pf enabled: the fail-closed side (known
+    edge), and so is a crash between ``-E`` and the token write, or a ``-E`` whose output names no token (L3 r1
+    codex MED 2: unparseable ``-E`` output needs a pfctl format change; it fails as an ordinary, retried step). A token
+    path that cannot be read is refused before ``-E``."""
     readable, old, note = _read_token(token_path)
     if not readable:
         return False, note
@@ -222,14 +232,19 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
         ok, why = _release(old, run)
         if not ok:
             back, back_why = _release(new, run)
-            return False, why + ("" if back else f"; and the new reference {new} could not be given back: {back_why}")
+            if back:
+                return False, why
+            return False, f"{ENABLE_UNCERTAIN}: {why}; and the new reference {new} could not be given back: {back_why}"
     try:
         _write_token(token_path, new)
     except OSError as e:
+        failed = f"cannot record the pf token {new} in {token_path}: {e.strerror or e}"
+        if old is not None:
+            return False, f"{ENABLE_UNCERTAIN}: {failed}; reference {new} kept (the old one {old} is released)"
         back, back_why = _release(new, run)
-        return False, (f"cannot record the pf token {new} in {token_path}: {e.strerror or e}; "
-                       + (f"reference {new} given back" if back
-                          else f"and the new reference {new} could not be given back: {back_why}"))
+        if back:
+            return False, f"{failed}; reference {new} given back"
+        return False, f"{ENABLE_UNCERTAIN}: {failed}; and the new reference {new} could not be given back: {back_why}"
     return True, note
 
 
@@ -282,7 +297,10 @@ def load_recorded_anchor(path: Path = ANCHOR_FILE, run: Run = subprocess.run) ->
     """Load the rules file setup, replenish or repair last wrote, as it is, into :data:`ANCHOR` (the boot one-shot).
     It is never rewritten here. A file that is not Levain's (:func:`_is_rules_file`) is refused and nothing is loaded.
     The file's parent, ``/etc/pf.anchors``, is root's (root:wheel 0755, measured on the build Mac 10-26), so no
-    other user can swap the file between the check and ``pfctl``'s own open."""
+    other user can swap the file between the check and ``pfctl``'s own open. Known edges (L3 verify r2, not built: each
+    needs root or a changed ``/etc/pf.anchors``): the check reads the open descriptor and ``pfctl`` reopens the path, so a
+    parent made writable by another user (mode or ACL) could swap the file between them; and the header is read before
+    the regular-file check, so a FIFO there fails as an ordinary, retried step rather than a clean refusal."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError as e:

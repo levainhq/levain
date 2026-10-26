@@ -297,3 +297,86 @@ def test_the_real_run_plan_fails_on_a_step_that_answers_false():
     assert rc == 1
 
 
+# --- L3 verify r2 fixes (f2) -----------------------------------------------------------------------------------------
+
+
+def _pfctl(x_rc: dict):
+    """A fake pfctl: ``-E`` answers token 222; ``-X <token>`` exits ``x_rc.get(token, 0)`` (1 = ``pfctl: busy``)."""
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(tuple(argv))
+        if argv[1] == "-E":
+            return subprocess.CompletedProcess(argv, 0, "", "pf enabled\nToken : 222\n")
+        rc = x_rc.get(argv[2], 0)
+        return subprocess.CompletedProcess(argv, rc, "", "pfctl: busy\n" if rc else "")
+    return run, calls
+
+
+def _no_space(path, value):
+    raise OSError(28, "No space left on device")
+
+
+def test_a_token_write_that_fails_after_the_old_reference_was_released_keeps_the_new_one(tmp_path, monkeypatch):
+    """L3 verify r2 codex HIGH (fix-introduced): the recorded reference 111 may be the only one holding pf on under
+    running sessions. Once ``-X 111`` released it, giving 222 back too would turn pf off, so 222 is kept and the result
+    is the non-retriable :data:`pf.ENABLE_UNCERTAIN` (a retry would take another reference no token names)."""
+    token = tmp_path / "pf.token"
+    token.write_text("111\n")
+    run, calls = _pfctl({})
+    monkeypatch.setattr(pf, "_write_token", _no_space)
+    ok, why = pf.take_enable_reference(token, run=run)
+    assert calls == [("/sbin/pfctl", "-E"), ("/sbin/pfctl", "-X", "111")]   # 222 is never given back
+    assert not ok and why.startswith(pf.ENABLE_UNCERTAIN)
+    assert "222" in why and "No space left on device" in why
+
+
+def test_a_token_write_that_fails_with_no_old_reference_gives_the_new_one_back_and_is_retriable(tmp_path, monkeypatch):
+    run, calls = _pfctl({})
+    monkeypatch.setattr(pf, "_write_token", _no_space)
+    ok, why = pf.take_enable_reference(tmp_path / "pf.token", run=run)
+    assert calls == [("/sbin/pfctl", "-E"), ("/sbin/pfctl", "-X", "222")]
+    assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN)
+
+
+def test_a_give_back_that_cannot_be_proven_is_non_retriable(tmp_path, monkeypatch):
+    """L3 verify r2 codex MED 1: a give-back of 222 that fails leaves a reference no token names; launchd's retry would
+    take another, so both give-back failures (after a failed write, after a failed release of the old) are
+    :data:`pf.ENABLE_UNCERTAIN`."""
+    run, _ = _pfctl({"222": 1})
+    monkeypatch.setattr(pf, "_write_token", _no_space)
+    ok, why = pf.take_enable_reference(tmp_path / "pf.token", run=run)
+    assert not ok and why.startswith(pf.ENABLE_UNCERTAIN) and "busy" in why
+
+    token = tmp_path / "pf.token2"
+    token.write_text("111\n")
+    run, calls = _pfctl({"111": 1, "222": 1})
+    ok, why = pf.take_enable_reference(token, run=run)
+    assert calls == [("/sbin/pfctl", "-E"), ("/sbin/pfctl", "-X", "111"), ("/sbin/pfctl", "-X", "222")]
+    assert not ok and why.startswith(pf.ENABLE_UNCERTAIN) and token.read_text() == "111\n"
+
+
+def test_an_old_release_that_fails_with_a_give_back_that_works_stays_retriable(tmp_path):
+    token = tmp_path / "pf.token"
+    token.write_text("111\n")
+    run, _ = _pfctl({"111": 1})
+    ok, why = pf.take_enable_reference(token, run=run)
+    assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN) and token.read_text() == "111\n"
+
+
+def test_the_one_shot_exits_0_on_an_uncertain_enable_so_launchd_does_not_retry(capsys):
+    """KeepAlive ``SuccessfulExit: false`` restarts every non-zero exit, so 0 is the one exit launchd leaves; the line on
+    stderr names the state, and the steps after the enable (the anchor load) do not run."""
+    from levain.firing.hands import Step
+
+    later = []
+    steps = [Step("enable", call=lambda: (False, f"{pf.ENABLE_UNCERTAIN}: reference 222 held, token not recorded")),
+             Step("load", call=lambda: (later.append(1), (True, ""))[1])]
+    rc = PS.main([], platform="darwin", euid=lambda: 0, lock=_free, slots=lambda: EGRESS,
+                 run=lambda _: PS._run(steps))
+    assert rc == 0 and later == []
+    err = capsys.readouterr().err
+    assert pf.ENABLE_UNCERTAIN in err and "not retried" in err
+    # an ordinary failed step is still retried
+    assert PS.main([], platform="darwin", euid=lambda: 0, lock=_free, slots=lambda: EGRESS,
+                   run=lambda _: PS._run([Step("boom", call=lambda: (False, "boom"))])) == 1
