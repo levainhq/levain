@@ -141,6 +141,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   calls, whether any was unproven, and `model_mismatch`. A session stopped because another model answered is shown even
   when it was charged no more than its hold.
 
+- **A Claude Code session's settings skip WebFetch's hostname preflight, and claude.ai connectors are off in every
+  session.** The egress hosts are not pre-allowed: an on-list WebFetch still asks first, and the gateway still decides.
+- **Codex sessions start with web search disabled on the command line,** so a repository's own Codex config cannot turn
+  it back on.
+- **A repo settings file that sets a proxy variable** (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `ALL_PROXY`, any case)
+  **is refused at launch, by name.**
+- **The gateway's log line for a refused connection names the host that was asked for,** when it is a valid host name or
+  a plainly written address.
+
 ### Fixed
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
   refilled,** so a keys failure cannot leave the pool short.
@@ -192,9 +201,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Chat checks that a worker's hooks are still live at every turn** and refuses messages while a check runs; a check
   that cannot run is retried, then turns chat off for that worker until you re-enable it. A stuck worker connection no
   longer freezes chat: a read or an interrupt that does not answer gives up after a bounded wait.
-- **Dispatch has a runner for its event follower** (`python -m levain.dispatch.follow_run --store-dir <dir>`): it follows
+- **Dispatch has a runner for its event follower** (`python -m levain.dispatch.follow_run`, with `--store-dir` defaulting to the dispatch store directory): it follows
   CONTROL's event stream, retries a CONTROL that is down with a growing wait, waits five minutes between retries of a
   stop no retry can fix, and stops cleanly on SIGTERM. No installed service runs it yet.
+- **An isolated install runs a dispatch service as `_levain_dispatch`.** It takes a single-instance lock in its own
+  store (`/var/levain/dispatch`), follows CONTROL's event stream into the dispatch job store, and restarts only when it
+  crashes. A copy that gives up waiting for the lock exits 75 and is restarted; a clean return counts as a signal stop
+  only when SIGTERM or SIGINT was received, and any other clean return is an error exit (70) and is restarted. A bad
+  command line, a lock error, or a store directory that is not exactly mode 0700 exits 78, and so does a run as root;
+  any other user but `_levain_dispatch` exits 77. On Linux, exits 77 and 78 are not restarted, and every Levain service
+  unit stays down after a wrong-user exit (77) instead of restarting every few seconds. Its lockfile is created 0600
+  under any umask. It launches no dispatch runs yet.
 
 ## [0.11.26] — 2026-10-25
 
