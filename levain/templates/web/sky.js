@@ -274,7 +274,9 @@
     var clock = o.now || function () { return Date.now(); };
     var reduce = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
     var calmOn = function () { var h = document.documentElement; return !!(h && h.classList && h.classList.contains('calm')); };   // the page's Calm control: the same as the OS asking
-    var ambientOn = o.ambient !== false && !strip && !(reduce && reduce.matches) && !calmOn();
+    // ambientOn is the user's Ambient preference; Calm never writes it. The motion that runs is the preference AND not Calm.
+    var ambientOn = o.ambient !== false && !strip && !(reduce && reduce.matches);
+    var motionOn = function () { return ambientOn && !calmOn(); };
 
     var root = el('div', { class: 'sky-panel' });
     root.style.position = 'relative';
@@ -332,11 +334,11 @@
     }
     toggle.addEventListener('click', function () {
       ambientOn = !ambientOn; setToggle();
-      if (!ambientOn) { meteors = []; draw(); }
+      if (!motionOn()) { meteors = []; draw(); }
     });
     function onReduce() { if (reduce && reduce.matches && ambientOn) { ambientOn = false; setToggle(); meteors = []; draw(); } }
     if (reduce && reduce.addEventListener) reduce.addEventListener('change', onReduce);
-    function onCalm() { if (calmOn() && ambientOn) { ambientOn = false; setToggle(); meteors = []; draw(); } }
+    function onCalm() { if (calmOn() && meteors.length) { meteors = []; draw(); } }
     window.addEventListener('levain-calm', onCalm);
     setToggle();
 
@@ -571,7 +573,7 @@
     }
 
     function launch(e) {
-      if (!ambientOn || !model || (!e.repo && offView(e, model.single))) return;
+      if (!motionOn() || !model || (!e.repo && offView(e, model.single))) return;
       if (e.kind !== 'commit' && !(e.kind === 'review' && !e.ok)) return;   // commits and failures streak; the rest just appear
       meteors.push({ e: e, row: model.rowOf(e), born: performance.now(), x: 0, y: 0, tx: 0, ty: 0, len: 60, a: 1, fail: e.kind === 'review' });
       schedule();

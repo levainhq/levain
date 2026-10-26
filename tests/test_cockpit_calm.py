@@ -148,3 +148,70 @@ def test_on_a_phone_the_first_row_is_untouched_and_calm_is_a_labelled_button_bes
         assert got["text"] == got["mastheadText"] == got["label"] and got["pressed"] == got["mastheadPressed"], got
     assert (off["text"], on["text"], back["text"]) == ("Calm off", "Calm on", "Calm on"), (off["text"], on["text"], back["text"])
     assert (off["pressed"], on["pressed"], back["pressed"]) == ("false", "true", "true")
+
+
+# ---- C11: Calm suppresses the sky's EFFECTIVE motion and never writes the user's Ambient preference ----------------------
+# sky.js runs whole on a fake canvas (the harness of test_cockpit_sky.py, cut before its own mount); `pending` is the count of animation
+# frames the sky has asked for, which a launched meteor raises and a still sky leaves at 0.
+
+def _sky_calm_script() -> str:
+    from tests.test_cockpit_sky import _FAKE
+    head = _FAKE.split("const h = sky.mount")[0]
+    return head + r"""
+const wl = {};
+global.addEventListener = (t, f) => { (wl[t] = wl[t] || []).push(f); };
+let calm = !!I.calmAtMount;
+document.documentElement.classList = { contains: c => c === 'calm' && calm };
+const setCalm = on => { calm = on; (wl['levain-calm'] || []).forEach(f => f({})); };
+const h = sky.mount(new El('div'), mk(I.base), Object.assign({ now: () => NOW }, I.opts || {}));
+const toggle = all.find(e => e.attrs['class'] === 'sky-toggle');
+const pressed = () => toggle.attrs['aria-pressed'];
+let n = 0;
+const commit = () => mk(I.base.concat([{ kind: 'commit', at: new Date(NOW - 60000 * (++n)).toISOString(), repo: 'tally', agent: null, outcome: 'ok' }]));
+const out = { log: [] };
+for (const s of I.steps) {
+  if (s === 'calm_on') setCalm(true);
+  else if (s === 'calm_off') setCalm(false);
+  else if (s === 'click') toggle.listeners.click.forEach(f => f({}));
+  else if (s === 'commit') { const before = sky.stats.pending; h.update(commit()); out.log.push(['launch', sky.stats.pending - before]); }
+  out.log.push([s, pressed()]);
+}
+h.destroy();
+console.log(JSON.stringify(out));
+"""
+
+
+def _sky_calm(tmp_path, steps, calm_at_mount=False):
+    import subprocess
+    from tests.test_cockpit_sky import NODE, _LEVAIN_FEED, _NOW, SKY
+    script = tmp_path / "sky_calm.cjs"
+    script.write_text(_sky_calm_script())
+    payload = {"sky": str(SKY), "base": _LEVAIN_FEED, "feeds": [_LEVAIN_FEED], "now": _NOW, "steps": steps, "calmAtMount": calm_at_mount}
+    out = subprocess.run([NODE, str(script)], input=json.dumps(payload), capture_output=True, text=True, check=True).stdout
+    return json.loads(out.strip().splitlines()[-1])["log"]
+
+
+def _launched(log):
+    return [d for k, d in log if k == "launch"]
+
+
+def test_ambient_toggled_under_calm_records_the_preference_and_the_sky_stays_still_until_calm_is_off(tmp_path):
+    # order 1: Calm on, then Ambient pressed twice (off, then on again), then Calm off
+    log = _sky_calm(tmp_path, ["calm_on", "click", "commit", "click", "commit", "calm_off", "commit"])
+    states = [d for k, d in log if k in ("calm_on", "click", "calm_off")]
+    assert states == ["true", "false", "true", "true"], log           # Calm itself leaves the preference pressed; each click is recorded
+    assert _launched(log) == [0, 0, 1], log                            # still under Calm whatever Ambient says; motion back per the preference
+
+
+def test_calm_off_restores_motion_per_the_preference_set_while_it_was_on(tmp_path):
+    # order 2: Calm on, Ambient off while it is on, Calm off -> the preference (off) holds, the sky stays still
+    log = _sky_calm(tmp_path, ["calm_on", "click", "calm_off", "commit"])
+    assert [d for k, d in log if k in ("click", "calm_off")] == ["false", "false"], log
+    assert _launched(log) == [0], log
+
+
+def test_ambient_off_before_calm_stays_off_after_calm_and_a_page_mounted_under_calm_shows_the_preference_on(tmp_path):
+    log = _sky_calm(tmp_path, ["click", "calm_on", "calm_off", "commit"])
+    assert [d for k, d in log if k in ("click", "calm_on", "calm_off")] == ["false", "false", "false"] and _launched(log) == [0], log
+    mounted = _sky_calm(tmp_path, ["commit", "calm_off", "commit"], calm_at_mount=True)
+    assert _launched(mounted) == [0, 1] and [d for k, d in mounted if k == "calm_off"] == ["true"], mounted

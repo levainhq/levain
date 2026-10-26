@@ -100,8 +100,8 @@ def _store_label(db: Path) -> str:
 # A built view is served again until one of the files it reads changes, or this many seconds pass. The age bound
 # is for what a file signature cannot see: the state line's expiry, the jar's day, and files below seed/ or activation/.
 VIEW_CACHE_MAX_AGE_S = 30.0
-# how long a reader waits on another reader's build before it builds for itself (a build that hangs must not hang its waiters):
-# a quarter of a panel's read budget, so the wait and the build that follows it both fit inside that budget
+# the slice a reader waits on another reader's build before it looks at its own deadline; a waiter never builds, it waits on the
+# same flight until the panel read budget ends and then raises the panel timeout
 VIEW_FLIGHT_WAIT_S = PANEL_READ_DEADLINE_S / 4
 VIEW_CACHE_SOURCES = 8
 _view_cache: dict[int, tuple[Any, tuple, float, SubstrateView]] = {}
@@ -171,12 +171,13 @@ _view_flights: dict[int, _Flight] = {}
 def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
     """The view for this read cycle. Within a cycle the memo shares one build; across cycles an unchanged store
     (``_store_signature``) serves the view built before, up to ``VIEW_CACHE_MAX_AGE_S``. A miss is single-flight:
-    one build per source runs and the readers that arrive meanwhile wait for it (up to ``VIEW_FLIGHT_WAIT_S``, then
-    they build for themselves, and cache that view only if the store signature is still the one they looked at) and share its view; a build that raises stores nothing and its waiters get the same
-    exception. A write's own read (``ctx.fresh``) and a
+    one build per source runs and the readers that arrive meanwhile wait for it, on the same flight, until the panel
+    deadline (``PANEL_READ_DEADLINE_S``), when they raise ``TimeoutError``; they never build for themselves. They share its view; a build that raises stores nothing and its waiters get the same
+    exception. A new flight starts only after the old one has finished. A write's own read (``ctx.fresh``) and a
     view that carries an error are never cached."""
     def build() -> SubstrateView:
         key = id(source)
+        deadline = time.monotonic() + PANEL_READ_DEADLINE_S      # one budget for all the waits of this read
         while True:
             sig = None if ctx.fresh else _store_signature(source)      # retaken on every pass: a pass is a new look
             if sig is None:
@@ -192,19 +193,11 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
                 else:
                     mine = False
             if not mine:
-                if not flight.done.wait(VIEW_FLIGHT_WAIT_S):
-                    # the builder is slow or hung: build for itself, and keep the view only if the store is still the one
-                    # this reader looked at (otherwise every waiter would leave an uncached build behind)
-                    view = source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
-                    if not view.errors and _store_signature(source) == sig:
-                        with _view_cache_lock:
-                            hit = _view_cache.get(key)
-                            if not (hit and hit[0] is source and hit[1] == sig):
-                                _view_cache.pop(key, None)
-                                _view_cache[key] = (source, sig, time.monotonic(), view)
-                                while len(_view_cache) > VIEW_CACHE_SOURCES:
-                                    _view_cache.pop(next(iter(_view_cache)))
-                    return view
+                # only the flight's builder builds: a waiter keeps waiting on the same flight, in VIEW_FLIGHT_WAIT_S slices,
+                # until the panel deadline, then raises the timeout the memo's own deadline raises (the page handles it)
+                while not flight.done.wait(max(0.0, min(VIEW_FLIGHT_WAIT_S, deadline - time.monotonic()))):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"shared read 'view' did not finish in {PANEL_READ_DEADLINE_S:g}s")
                 if flight.sig == sig:
                     if flight.exc is not None:
                         raise flight.exc            # the builder's failure is every waiter's, not a chain of rebuilds

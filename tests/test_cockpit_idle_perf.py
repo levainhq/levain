@@ -208,13 +208,41 @@ def test_a_failed_build_is_not_cached_and_the_waiters_see_its_exception(tmp_path
     assert len(calls) == 2 and not isinstance(view, Exception)
 
 
-def test_a_waiter_on_a_hung_build_builds_for_itself_after_the_wait(tmp_path: Path, monkeypatch) -> None:
-    """K9b: a builder that never returns does not hang its waiters: past VIEW_FLIGHT_WAIT_S they build for themselves."""
+def test_a_slow_build_with_several_concurrent_readers_is_one_build(tmp_path: Path, monkeypatch) -> None:
+    """C10: only the flight's builder builds. The wait slice (VIEW_FLIGHT_WAIT_S) expires several times while the one build is
+    slow, and no waiter builds for itself: exactly one build call, every reader gets that view."""
     import threading
     import time
     _root, src = _install(tmp_path)
     _wrap(src)
-    monkeypatch.setattr(providers, "VIEW_FLIGHT_WAIT_S", 0.5, raising=False)
+    monkeypatch.setattr(providers, "VIEW_FLIGHT_WAIT_S", 0.1, raising=False)
+    real = type(src).build
+    entered, calls = threading.Event(), []
+
+    def build(self, **kw):
+        calls.append(1)
+        entered.set()
+        time.sleep(1.5)                              # several wait slices long
+        return real(self, **kw)
+
+    monkeypatch.setattr(type(src), "build", build)
+    ts, out = _readers(src, 5)
+    entered.wait(5)
+    for t in ts:
+        t.join(15)
+    assert len(calls) == 1, len(calls)
+    assert len(out) == 5 and all(v is out[0] for v in out) and not isinstance(out[0], Exception), out
+
+
+def test_a_waiter_on_a_hung_build_raises_the_timeout_at_the_deadline_and_does_not_build(tmp_path: Path, monkeypatch) -> None:
+    """C10: a builder that never returns does not hang its waiters, and they do not build: at the panel deadline they raise
+    TimeoutError (the fault the page already handles); a new flight starts only after the old one finished."""
+    import threading
+    import time
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    monkeypatch.setattr(providers, "VIEW_FLIGHT_WAIT_S", 0.1, raising=False)
+    monkeypatch.setattr(providers, "PANEL_READ_DEADLINE_S", 0.6, raising=False)
     real = type(src).build
     hang, entered, calls = threading.Event(), threading.Event(), []
 
@@ -229,56 +257,24 @@ def test_a_waiter_on_a_hung_build_builds_for_itself_after_the_wait(tmp_path: Pat
     ts, out = _readers(src, 1)
     entered.wait(5)
     t0 = time.monotonic()
-    ts2, out2 = _readers(src, 1)
-    ts2[0].join(8)
+    ts2, out2 = _readers(src, 3)
+    for t in ts2:
+        t.join(8)
     waited = time.monotonic() - t0
+    assert len(out2) == 3 and all(isinstance(o, TimeoutError) for o in out2), out2
+    assert 0.5 <= waited < 5, waited
+    assert len(calls) == 1, "a waiter built for itself"
     hang.set()
     ts[0].join(10)
-    assert out2 and not isinstance(out2[0], Exception) and waited < 5, (out2, waited)
+    from levain.cockpit.engine import ReadContext
+    view = providers._view(src, ReadContext(datetime.now(timezone.utc)))      # the old flight finished: a new one may start
+    assert not isinstance(view, Exception)
 
 
 def test_the_flight_wait_is_a_quarter_of_the_panel_read_budget() -> None:
     """K10b: the wait is an expression of the budget constant, so it moves with it and stays inside it."""
     from levain.cockpit.engine import PANEL_READ_DEADLINE_S
     assert providers.VIEW_FLIGHT_WAIT_S <= PANEL_READ_DEADLINE_S / 4
-
-
-def test_a_waiter_that_timed_out_caches_its_build_only_if_the_signature_still_matches(tmp_path: Path, monkeypatch) -> None:
-    """K10b: a timed-out waiter's view is stored when the store is still the one it looked at, and is not stored when the
-    store moved while it built."""
-    import threading
-    import time
-    from levain.cockpit.engine import ReadContext
-    for moved in (False, True):
-        root, src = _install(tmp_path / ("m" if moved else "s"))
-        _wrap(src)
-        monkeypatch.setattr(providers, "VIEW_FLIGHT_WAIT_S", 0.3, raising=False)
-        real = type(src).build
-        hang, entered, calls = threading.Event(), threading.Event(), []
-
-        def build(self, **kw):
-            calls.append(1)
-            if len(calls) == 1:
-                entered.set()
-                hang.wait(20)
-            elif moved:
-                SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="moved mid-build", tier="hot", salience=2)
-            return real(self, **kw)
-
-        monkeypatch.setattr(type(src), "build", build)
-        providers._view_cache.clear()
-        ts, _o = _readers(src, 1)
-        entered.wait(5)
-        view = providers._view(src, ReadContext(datetime.now(timezone.utc)))
-        stored = providers._view_cache.get(id(src))
-        hang.set()
-        ts[0].join(10)
-        monkeypatch.undo()
-        assert not isinstance(view, Exception)
-        if moved:
-            assert stored is None or stored[3] is not view, "a view built across a store change must not be cached"
-        else:
-            assert stored is not None and stored[3] is view, "an unchanged store's late build is cached"
 
 
 def test_the_signature_is_retaken_when_a_reader_looks_again(tmp_path: Path, monkeypatch) -> None:
