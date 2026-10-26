@@ -26,7 +26,7 @@ const GEN = "2026-10-12T12:00:00+00:00";
 const regions = { hero: [], brief: [], widgets: ["health"], header: [], zones: [{ id: "operate", title: "Work", grid: 3, panels: [], cards: [] }] };
 const healthPanel = (stamp) => ({ metrics: [
   { label: "write path", value: "live", status: "ok" }, { label: "wraps", value: 1, status: "unknown" },
-  ...(stamp === undefined ? [] : [{ label: "last save at", value: stamp, status: "unknown" }]) ] });
+  ...(stamp === undefined ? [] : [{ label: "last save at", value: stamp, status: "unknown", detail: "the wrap at the stamp" }]) ] });
 const draw = (stamp, ctx) => {
   const heads = { health: head("health", "status-dots", "Health") };
   const m = fixture(heads, { health: head("health", "status-dots", "Health", { value: healthPanel(stamp) }) }, { regions });
@@ -105,6 +105,40 @@ out.nul = age(null); out.bad = age("garbage"); out.ok = age("2026-10-12T10:00:00
     assert out["nul"] is None and out["bad"] is None and 1.99 < out["ok"] < 2.01
 
 
+def test_a_tick_keeps_the_row_tooltips_detail_and_changes_only_the_age(tmp_path: Path) -> None:
+    out = run_node(BODY + r"""
+globalThis.setInterval = () => 1; globalThis.clearInterval = () => {};
+N.prototype.isConnected = true;
+const r = draw("2026-10-12T11:55:00+00:00");
+const aged = () => r.host.all((n) => n.dataset && n.dataset.ageAt);
+document.querySelectorAll = (sel) => (sel === "[data-age-at]" ? aged() : []);
+const rows = () => r.host.all((n) => n.title && /last save/.test(n.title));
+for (const row of rows()) for (const k of row.kids) k.parentNode = row;      // the fake DOM keeps no parent link
+out.before = rows().map((n) => n.title);
+const real = Date.now; Date.now = () => real() + 3600000;
+K.tickAges();
+out.after = rows().map((n) => n.title); out.text = r.host.textContent;
+Date.now = real;
+""", tmp_path)
+    assert out["before"] and "5m ago" in out["before"][0]
+    assert "1h ago" in out["after"][0] and "5m ago" not in out["after"][0]
+    assert "the wrap at the stamp" in out["before"][0] and "the wrap at the stamp" in out["after"][0], out["after"]
+
+
+def test_a_tick_before_the_fragment_is_mounted_does_not_stop_the_timer(tmp_path: Path) -> None:
+    out = run_node(BODY + r"""
+const cleared = [];
+globalThis.setInterval = () => 7; globalThis.clearInterval = (id) => cleared.push(id);
+N.prototype.isConnected = false;                    // built into a fragment the page has not attached yet
+const r = draw("2026-10-12T11:55:00+00:00");
+const aged = () => r.host.all((n) => n.dataset && n.dataset.ageAt);
+document.querySelectorAll = (sel) => (sel === "[data-age-at]" ? aged() : []);
+K.tickAges();
+out.cleared = cleared; out.armed = K.ageTimerArmed();
+""", tmp_path)
+    assert out["cleared"] == [] and out["armed"] is True
+
+
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 
@@ -136,6 +170,7 @@ def test_the_default_cockpits_health_panel_shows_an_age_that_moves_in_a_real_pag
         # two hours pass on the page's clock with no server event, then the page's own tick runs
         {"eval": "(window.__real = Date.now, Date.now = function(){ return window.__real() + 7200000 }, LevainCockpitKinds.tickAges(), 'ticked')"},
         {"eval": grab},
+        {"eval": "(function(){var n=document.querySelector('[data-age-at]');return n&&n.parentNode?n.parentNode.title:null})()"},
     ]
     steps_file = tmp_path / "steps.json"
     steps_file.write_text(json.dumps(steps))
@@ -153,3 +188,5 @@ def test_the_default_cockpits_health_panel_shows_an_age_that_moves_in_a_real_pag
     assert before and "ago" in before and "T" not in before.split("\n", 1)[-1], before
     assert armed is True
     assert "2h ago" in after and "ago" in after, after
+    title = vals[6]
+    assert title and title.startswith("last save: 2h ago"), title      # the tooltip kept its label and moved only the age

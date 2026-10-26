@@ -188,8 +188,9 @@ def test_concurrent_misses_share_one_build(tmp_path: Path, monkeypatch) -> None:
     assert len(out) == 6 and all(v is out[0] for v in out)
 
 
-def test_a_failed_build_is_not_cached_and_the_waiters_build_or_raise(tmp_path: Path, monkeypatch) -> None:
-    """K3: a failing build raises to its own caller, stores nothing, and wakes the waiters, which build for themselves."""
+def test_a_failed_build_is_not_cached_and_the_waiters_see_its_exception(tmp_path: Path, monkeypatch) -> None:
+    """K3/K9c: a failing build raises to its caller, stores nothing, and the readers waiting on it get the same exception
+    (no chain of serial rebuilds); the next read builds afresh."""
     import time
     _root, src = _install(tmp_path)
     _wrap(src)
@@ -200,14 +201,63 @@ def test_a_failed_build_is_not_cached_and_the_waiters_build_or_raise(tmp_path: P
     release.set()
     for t in ts:
         t.join(10)
-    assert len(out) == 3
-    errs = [o for o in out if isinstance(o, Exception)]
-    views = [o for o in out if not isinstance(o, Exception)]
-    assert len(errs) == 1 and len(views) == 2
-    assert views[0] is views[1]                     # the second builder's view is shared with the last waiter
-    assert len(calls) == 2, len(calls)
+    assert len(out) == 3 and all(isinstance(o, RuntimeError) for o in out), out
+    assert len(calls) == 1, len(calls)
     from levain.cockpit.engine import ReadContext
-    assert providers._view(src, ReadContext(datetime.now(timezone.utc))) is views[0]   # and it was cached
+    view = providers._view(src, ReadContext(datetime.now(timezone.utc)))      # nothing was cached: this builds
+    assert len(calls) == 2 and not isinstance(view, Exception)
+
+
+def test_a_waiter_on_a_hung_build_builds_for_itself_after_the_wait(tmp_path: Path, monkeypatch) -> None:
+    """K9b: a builder that never returns does not hang its waiters: past VIEW_FLIGHT_WAIT_S they build for themselves."""
+    import threading
+    import time
+    _root, src = _install(tmp_path)
+    _wrap(src)
+    monkeypatch.setattr(providers, "VIEW_FLIGHT_WAIT_S", 0.5, raising=False)
+    real = type(src).build
+    hang, entered, calls = threading.Event(), threading.Event(), []
+
+    def build(self, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            entered.set()
+            hang.wait(20)
+        return real(self, **kw)
+
+    monkeypatch.setattr(type(src), "build", build)
+    ts, out = _readers(src, 1)
+    entered.wait(5)
+    t0 = time.monotonic()
+    ts2, out2 = _readers(src, 1)
+    ts2[0].join(8)
+    waited = time.monotonic() - t0
+    hang.set()
+    ts[0].join(10)
+    assert out2 and not isinstance(out2[0], Exception) and waited < 5, (out2, waited)
+
+
+def test_the_signature_is_retaken_when_a_reader_looks_again(tmp_path: Path, monkeypatch) -> None:
+    """K9d: a reader whose flight saw another store state loops, and the loop takes a fresh signature."""
+    import time
+    root, src = _install(tmp_path)
+    _wrap(src)
+    taken = []
+    real_sig = providers._store_signature
+    monkeypatch.setattr(providers, "_store_signature", lambda source: (taken.append(1), real_sig(source))[1])
+    entered, release, calls = _gate_build(monkeypatch, src)
+    spores = root / ".levain" / "memory.spores.json"
+    ts, _o = _readers(src, 1)
+    entered.wait(5)
+    SporeStore(spores).add(type="task", text="one", tier="hot", salience=2)
+    ts2, _o2 = _readers(src, 1)                     # its signature differs from the flight's: it waits, then looks again
+    time.sleep(0.3)
+    n_before = len(taken)
+    SporeStore(spores).add(type="task", text="two", tier="hot", salience=2)
+    release.set()
+    for t in ts + ts2:
+        t.join(10)
+    assert len(taken) > n_before, (len(taken), n_before)
 
 
 def test_a_permission_change_on_the_store_is_seen(counted) -> None:

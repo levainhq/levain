@@ -96,21 +96,28 @@
   }
   let ageTimer = 0;
   function tickAges() {
-    let live = 0;
+    let any = 0;
     for (const n of (typeof document !== "undefined" && document.querySelectorAll ? Array.from(document.querySelectorAll("[data-age-at]")) : [])) {
+      any++;      // a node not yet attached still keeps the timer: it is drawn, only not on the page yet
       if (!n.isConnected) continue;
-      live++;
       const t = savedAge(n.dataset.ageAt, serverNow());
-      if (n.textContent !== t) n.textContent = t;
-      if (n.dataset.ageTitle && n.parentNode && n.parentNode.title !== undefined) n.parentNode.title = n.dataset.ageTitle + ": " + t;
+      const text = [t, n.dataset.ageRead || ""].filter(Boolean).join(" · ");
+      if (n.textContent !== text) n.textContent = text;
+      // only the age part of the row's tooltip moves; its reading and detail stay
+      if (n.dataset.ageTitle && n.parentNode && n.parentNode.title !== undefined)
+        n.parentNode.title = n.dataset.ageTitle + ": " + [text, n.dataset.ageDetail || ""].filter(Boolean).join(" · ");
     }
-    if (!live && ageTimer) { root.clearInterval(ageTimer); ageTimer = 0; }
+    if (!any && ageTimer) { root.clearInterval(ageTimer); ageTimer = 0; }
   }
   // a node that shows a save's age: tagged with its stamp, and the one timer started if it is not running
   function ageNode(node, m, titled) {
     if (!m.age_at) return node;
     node.dataset.ageAt = m.age_at;
-    if (titled) node.dataset.ageTitle = m.label;      // the row's tooltip carries the age too
+    if (titled) {                                       // the row's tooltip carries the age too, beside the reading and detail
+      node.dataset.ageTitle = m.label;
+      node.dataset.ageRead = m.read || "";
+      node.dataset.ageDetail = typeof m.detail === "string" ? m.detail : "";
+    }
     if (!ageTimer) ageTimer = root.setInterval(tickAges, AGE_TICK_MS);
     return node;
   }

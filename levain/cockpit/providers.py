@@ -100,6 +100,8 @@ def _store_label(db: Path) -> str:
 # A built view is served again until one of the files it reads changes, or this many seconds pass. The age bound
 # is for what a file signature cannot see: the state line's expiry, the jar's day, and files below seed/ or activation/.
 VIEW_CACHE_MAX_AGE_S = 30.0
+# how long a reader waits on another reader's build before it builds for itself (a build that hangs must not hang its waiters)
+VIEW_FLIGHT_WAIT_S = 10.0
 VIEW_CACHE_SOURCES = 8
 _view_cache: dict[int, tuple[Any, tuple, float, SubstrateView]] = {}
 _view_cache_lock = threading.Lock()
@@ -153,12 +155,13 @@ def _signature_of(source: Any) -> tuple | None:
 
 class _Flight:
     """One build in progress for a source: the readers that arrive meanwhile wait on it and share its view."""
-    __slots__ = ("done", "sig", "view")
+    __slots__ = ("done", "sig", "view", "exc")
 
     def __init__(self, sig: tuple) -> None:
         self.done = threading.Event()
         self.sig = sig
         self.view: SubstrateView | None = None
+        self.exc: BaseException | None = None
 
 
 _view_flights: dict[int, _Flight] = {}
@@ -167,15 +170,16 @@ _view_flights: dict[int, _Flight] = {}
 def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
     """The view for this read cycle. Within a cycle the memo shares one build; across cycles an unchanged store
     (``_store_signature``) serves the view built before, up to ``VIEW_CACHE_MAX_AGE_S``. A miss is single-flight:
-    one build per source runs and the readers that arrive meanwhile wait for it and share its view; a build that
-    raises stores nothing and wakes them, and the next of them builds. A write's own read (``ctx.fresh``) and a
+    one build per source runs and the readers that arrive meanwhile wait for it (up to ``VIEW_FLIGHT_WAIT_S``, then
+    they build for themselves) and share its view; a build that raises stores nothing and its waiters get the same
+    exception. A write's own read (``ctx.fresh``) and a
     view that carries an error are never cached."""
     def build() -> SubstrateView:
-        sig = None if ctx.fresh else _store_signature(source)
-        if sig is None:
-            return source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
         key = id(source)
         while True:
+            sig = None if ctx.fresh else _store_signature(source)      # retaken on every pass: a pass is a new look
+            if sig is None:
+                return source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
             with _view_cache_lock:
                 hit = _view_cache.get(key)
                 if hit and hit[0] is source and hit[1] == sig and time.monotonic() - hit[2] < VIEW_CACHE_MAX_AGE_S:
@@ -187,10 +191,14 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
                 else:
                     mine = False
             if not mine:
-                flight.done.wait()
-                if flight.view is not None and flight.sig == sig:
-                    return flight.view
-                continue            # it raised, or saw another store state: look again
+                if not flight.done.wait(VIEW_FLIGHT_WAIT_S):
+                    return source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
+                if flight.sig == sig:
+                    if flight.exc is not None:
+                        raise flight.exc            # the builder's failure is every waiter's, not a chain of rebuilds
+                    if flight.view is not None:
+                        return flight.view
+                continue            # it saw another store state: look again
             try:
                 # the signature is taken BEFORE the build: a change landing mid-build leaves a stale signature on the
                 # stored view, so the next read sees a mismatch and rebuilds
@@ -203,6 +211,9 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
                         while len(_view_cache) > VIEW_CACHE_SOURCES:
                             _view_cache.pop(next(iter(_view_cache)))
                 return view
+            except BaseException as e:
+                flight.exc = e
+                raise
             finally:
                 with _view_cache_lock:
                     if _view_flights.get(key) is flight:
