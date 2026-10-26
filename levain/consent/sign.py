@@ -211,6 +211,7 @@ _BINDINGS_MAX = 16 * 1024 * 1024        # bytes of the bindings file a reader ta
 # leading dot keeps it out of a listing.
 ATTEMPTS_DIR = ".attempts"
 _ATTEMPT_ID = re.compile(r"[A-Za-z0-9_-]{16,64}")
+_MARK = re.compile(rb"([0-9a-f]{64})\n?")   # an attempt mark: one sha256, lowercase hex, an optional newline
 # how long a status read waits for a pending attempt to settle: under the page's own deadline over one read (sign.js and
 # dashboard_core.js give a read 15 s), so a read that waited still comes back
 ATTEMPT_WAIT_S = 8.0
@@ -844,7 +845,10 @@ def _proof(queue_dir: Path, request_id: str, attempt: str) -> "dict[str, Any] | 
     _, mark = _attempt_paths(queue_dir, request_id, attempt)
     d = sign_dir(queue_dir)
     try:
-        want = mark.read_text(encoding="ascii").strip()
+        m = _MARK.fullmatch(_read_bytes(mark))
+        if m is None:
+            return None
+        want = m.group(1).decode("ascii")
         record = json.loads(_read_bytes(d / f"{request_id}.signed.json"))
         have = hashlib.sha256(_read_bytes(d / f"{request_id}.sig")).hexdigest()
     except (OSError, SignRefused, UnicodeDecodeError, ValueError, RecursionError):
@@ -875,10 +879,12 @@ def _settle_orphan(queue_dir: Path, request_id: str, attempt: str) -> "dict[str,
     the answer still runs."""
     path, _ = _attempt_paths(queue_dir, request_id, attempt)
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         return None
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {"state": "unknown"}
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
