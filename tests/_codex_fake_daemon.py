@@ -124,6 +124,7 @@ class FakeDaemon:
         self.bad_frames: list[bytes] = []
         self.reading = threading.Event()
         self.reading.set()
+        self.gated = threading.Event()                  # set when a connection stops at the closed ``reading`` gate
         self.conns: list[Conn] = []
         self.hooks: list[dict[str, Any]] = []
         self.before_reply: dict[str, Callable[[Conn, dict, dict], None]] = {}
@@ -170,6 +171,7 @@ class FakeDaemon:
                     raise EOFError
                 head += got
                 if len(head) > 8192:
+                    conn.close()
                     return
             key = next(ln.split(b":", 1)[1].strip() for ln in head.split(b"\r\n")
                        if ln.lower().startswith(b"sec-websocket-key:"))
@@ -181,6 +183,8 @@ class FakeDaemon:
                          _ws_frame(body, op, fin, declared)))
             self.conns.append(c)
             while True:
+                if not self.reading.is_set():
+                    self.gated.set()
                 self.reading.wait()
                 h = self._recv(conn, 2)
                 op, n = h[0] & 0x0F, h[1] & 0x7F
@@ -224,6 +228,8 @@ class FakeDaemon:
         def serve() -> None:
             try:
                 while True:
+                    if not self.reading.is_set():
+                        self.gated.set()
                     self.reading.wait()
                     line = inp.readline()
                     if not line:

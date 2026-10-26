@@ -69,7 +69,7 @@ _MAX_MESSAGE = 16 * 1024 * 1024 + 4096     # the daemon's own header names 16777
 _GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 BOOTSTRAP_FRAME_CAP = 256
 _LATE_IDS_CAP = 1024
-_READER_SEND_TIMEOUT = 2.0  # every send the reader thread makes (a pong, the -32600 answer); a failed one ends the wire
+_READER_SEND_TIMEOUT = 2.0  # the reader's sends (pong, -32600): a pong whose lock was not got is skipped, any other failure ends the wire
 _CLOSE_TIMEOUT = 1.0       # shutdown's wait for the write lock, then for its close frame
 _WRITE_SLICE = 0.05         # a blocked write re-checks for shutdown this often
 
@@ -80,6 +80,10 @@ class CodexError(Exception):
     def __init__(self, message: str, error: Any = None) -> None:
         super().__init__(message)
         self.error = error
+
+
+class _NotStarted(CodexError):
+    """A send's write lock was not acquired by its deadline: not one byte of it went out, the stream is intact."""
 
 
 class _Oversize(Exception):
@@ -112,6 +116,7 @@ class _Framing:
         self._wake_r: int | None = None
         self._wake_w: int | None = None
         self._wake_lock = threading.Lock()      # wake() and _close_wake() never interleave: no write to a reused fd
+        self._shut = False                      # guarded by _wake_lock: shutdown() runs its body once
         self._on_wake: Callable[[], None] = lambda: None
 
     def arm(self, on_wake: Callable[[], None]) -> None:
@@ -149,7 +154,7 @@ class _Framing:
         :class:`CodexError` and mark the stream broken (a part of a message may be out)."""
         left = None if deadline is None else deadline - time.monotonic()
         if not self._wlock.acquire(timeout=-1 if left is None else max(0.0, left)):
-            raise CodexError("a send could not start within its deadline (another send holds the connection)")
+            raise _NotStarted("a send could not start within its deadline (another send holds the connection)")
         try:
             if self._broken:
                 raise CodexError("an earlier send failed part-way; the connection's output is unusable")
@@ -174,6 +179,11 @@ class _Framing:
                 raise
         finally:
             self._wlock.release()
+
+    def _first_shutdown(self) -> bool:
+        with self._wake_lock:
+            first, self._shut = not self._shut, True
+        return first
 
     def _close_wake(self) -> None:
         with self._wake_lock:
@@ -230,7 +240,9 @@ class WsFraming(_Framing):
 
     def shutdown(self) -> None:
         """Unblock a reader waiting in :meth:`recv_message` (it then sees the connection closed) and any blocked writer;
-        bounded: a close frame goes out only if the write lock frees within :data:`_CLOSE_TIMEOUT`."""
+        bounded: a close frame goes out only if the write lock frees within :data:`_CLOSE_TIMEOUT`. Once only."""
+        if not self._first_shutdown():
+            return
         if self._wake_r is None:
             with contextlib.suppress(OSError, CodexError):
                 self._send(8, b"")
@@ -317,7 +329,10 @@ class WsFraming(_Framing):
                 continue
             payload = self._need(n)
             if op == 9:
-                self._send(10, payload, time.monotonic() + _READER_SEND_TIMEOUT)
+                try:
+                    self._send(10, payload, time.monotonic() + _READER_SEND_TIMEOUT)
+                except _NotStarted:
+                    pass                    # a writer holds the lock: nothing went out, a later ping gets its own try
             elif op == 8:
                 raise CodexError("the daemon closed the connection")
             elif op in (0, 1, 2):
@@ -394,6 +409,8 @@ class LineFraming(_Framing):
 
     def shutdown(self) -> None:
         """End Levain's write end (the peer sees end of input) and the reader; bounded like :meth:`WsFraming.shutdown`."""
+        if not self._first_shutdown():
+            return
         self._closing = True
         self.wake()
         held = self._wlock.acquire(timeout=_CLOSE_TIMEOUT)
@@ -776,6 +793,8 @@ class CodexWire:
                 raise CodexError(f"{item.method}: the request is from a dead connection ({item.gen})")
             if self._closed is not None:
                 raise CodexError(f"{item.method}: the connection is closed ({self._closed})")
+            if item.token not in self._pending:
+                raise CodexError(f"{item.method}: request {item.token} was already answered")
         body: dict[str, Any] = {"id": item.id}
         if error is None:
             body["result"] = result

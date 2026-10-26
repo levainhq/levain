@@ -321,7 +321,7 @@ def test_g2_an_oversize_message_closes_the_wire_as_a_protocol_fault(daemon, tran
     try:
         wire.start_thread({"cwd": "/tmp"})
         daemon.conns[-1].send_raw(b"x" * (cw._MAX_MESSAGE + 1))
-        got = _collect(wire, 2, 10.0)
+        got = _collect(wire, 1, 10.0)
         assert [i.kind for i in got] == ["closed"], got
         assert f"over {cw._MAX_MESSAGE}" in got[0].detail and wire.closed, (got, wire.closed)
     finally:
@@ -900,8 +900,9 @@ def test_f5_a_line_that_starts_with_a_brace_but_is_not_json_is_unparseable_not_a
 def _stalled_writer(wire: CodexWire, daemon: FakeDaemon) -> threading.Thread:
     """A big call mid-send with the daemon not reading: it holds the write lock for its 30 s deadline."""
     daemon.reading.clear()
-    wire.notify("turn/interrupt", {"threadId": "x", "turnId": "y"})   # the daemon is parked in a read: this frame frees it
-    time.sleep(0.3)                                                 # to its next stop at the gate, so the big one blocks
+    daemon.gated.clear()
+    wire.notify("turn/interrupt", {"threadId": "x", "turnId": "y"})     # frees the daemon's parked read
+    assert daemon.gated.wait(5.0), "the daemon never reached its gate"  # so the big call below blocks
     t = threading.Thread(target=lambda: _within(lambda: wire.call("hooks/list", {"pad": "z" * (4 << 20)},
                                                                   timeout=30.0), 40.0), daemon=True)
     t.start()
@@ -933,16 +934,55 @@ def test_g1_the_readers_auto_answer_has_a_short_deadline_and_a_failed_one_fails_
         _within(wire.close, 3.0)
 
 
-def test_g1_a_pong_that_cannot_be_sent_fails_the_wire_in_the_readers_deadline(daemon):
-    # codex / complement LOW: the pong ran on the reader thread under the 60 s call deadline
+def test_h1_a_pong_that_never_got_the_lock_is_skipped_and_the_wire_stays_up(daemon):
+    # complement MED-LOW: a slow but healthy daemon pinged while a large write held the lock past the pong deadline
     wire = _open(daemon, "ws")
     try:
-        _stalled_writer(wire, daemon)
+        t = _stalled_writer(wire, daemon)
         daemon.conns[-1].ping(b"pp")
-        assert _wait_closed(wire, 5.0), "the reader waited out the call deadline"
+        time.sleep(cw._READER_SEND_TIMEOUT + 1.0)           # past the reader's deadline for the pong
+        assert wire.closed is None, wire.closed
+        daemon.reading.set()
+        t.join(15.0)
+        assert not t.is_alive() and daemon.bad_frames == []
+        daemon.conns[-1].ping(b"again")                     # a later ping gets its own try
+        end = time.monotonic() + 3.0
+        while b"again" not in daemon.pongs and time.monotonic() < end:
+            time.sleep(0.01)
+        assert b"again" in daemon.pongs and b"pp" not in daemon.pongs and wire.closed is None
     finally:
         daemon.reading.set()
         _within(wire.close, 3.0)
+
+
+def test_h2_a_duplicate_reply_is_already_answered_whatever_its_result(daemon):
+    # deepseek LOW: the second reply serialised first, so an unserialisable result raised TypeError
+    wire = _open(daemon, "ws")
+    try:
+        tid = wire.start_thread({"cwd": "/tmp"})["thread"]["id"]
+        daemon.conns[-1].request("item/commandExecution/requestApproval", fake.command_approval(tid, "t1", "c"), 7)
+        (item,) = [i for i in _collect(wire, 2, 3.0) if i.kind == "request"]
+        wire.reply(item, result={"decision": "decline"})
+        with pytest.raises(CodexError, match="already answered"):
+            wire.reply(item, result=object())
+    finally:
+        wire.close()
+
+
+def test_h4_close_is_idempotent_and_sends_one_close_frame(daemon, monkeypatch):
+    # deepseek LOW: close() after the epilogue's shutdown sent a second close frame and waited again
+    wire = _open(daemon, "ws")
+    ops: list[int] = []
+    real = type(wire._framing)._send
+
+    def counting(self, op, payload, *args, **kw):
+        ops.append(op)
+        return real(self, op, payload, *args, **kw)
+
+    monkeypatch.setattr(type(wire._framing), "_send", counting)
+    wire.close()
+    wire.close()
+    assert ops.count(8) == 1, ops
 
 
 def test_g3_a_wake_cannot_write_to_a_descriptor_closed_under_it(daemon, monkeypatch):
