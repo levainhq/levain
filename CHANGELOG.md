@@ -60,6 +60,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   when it turns read-only while the passkey prompt is open). The tap no longer jumps to the message card further down
   the page, and that card now sends to the desk, the cockpit's other readers or everyone: an untouched card asks you
   to choose a reader instead of sending to a default.
+- **`sudo install-helper enrol-authority-signer`**: enrols the keys whose signatures can make a graduation policy
+  count. One run lists the laptop key (`--public-key`, add `--confirm` to let it sign approvals too) and each phone
+  passkey (`--passkey`, repeatable) in root's allowed-signers file, `/private/var/levain/policy/authority_signers`
+  (`/var/levain/policy/authority_signers` on Linux), and prints each key's fingerprint to compare with
+  `levain cockpit keys`. Keys are typed on the command line; root reads nothing the operator's account can write.
+  A key the authority log would refuse to enrol is refused. `remove-authority-signer --key <fingerprint>` takes a key
+  out again. Running either twice changes nothing. Both refuse to touch root's signer file unless it is root's alone
+  (a file or folder another account can write is refused, its lines never re-written as root's), can be read whole,
+  and is plain UTF-8; comments in the file are never taken for keys. Re-enrolling a key under another name, or with
+  fewer permissions than its line has, is refused: remove it first. `undo` removes the file too, so a later setup for
+  another person starts with no listed keys.
 
 ### Fixed
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
