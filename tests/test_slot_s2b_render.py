@@ -613,7 +613,7 @@ name = "levain"
 wire_api = "responses"
 
 [projects."/private/var/levain/live/{S}/repo"]
-trust_level = "trusted"
+trust_level = "untrusted"
 """
 
 GOLD_CODEX_LINUX = f"""approval_policy = "never"
@@ -628,7 +628,7 @@ name = "levain"
 wire_api = "responses"
 
 [projects."/var/levain/live/{S}/repo"]
-trust_level = "trusted"
+trust_level = "untrusted"
 """
 
 
@@ -642,14 +642,14 @@ def _digest(r) -> str:
 #: Every file (path, owner, mode, bytes) of each (OS x vendor x class) render, pinned. The full text of each was
 #: read once when these were taken; a change here is a change to what a confined session loads.
 GOLD_DIGESTS = {
-    ("darwin", "claude", "egress"): "add92e76017a907f",
-    ("darwin", "claude", "none"): "5339f14eebd60e6c",
-    ("darwin", "codex", "egress"): "c104d9ecb1c8ec31",
-    ("darwin", "codex", "none"): "0781e57368c7ff34",
-    ("linux", "claude", "egress"): "6dfa33ae720145c0",
-    ("linux", "claude", "none"): "0699994457ecf098",
-    ("linux", "codex", "egress"): "be6dac9f952b5103",
-    ("linux", "codex", "none"): "e4181d5b141f2e74",
+    ("darwin", "claude", "egress"): "873cb0c57bd5157d",
+    ("darwin", "claude", "none"): "dd0f5dad5c38e0b8",
+    ("darwin", "codex", "egress"): "b8411e7cc570d868",
+    ("darwin", "codex", "none"): "7441ce40b3226c61",
+    ("linux", "claude", "egress"): "b463aaf9983d28cf",
+    ("linux", "claude", "none"): "c9796d76e53b1d57",
+    ("linux", "codex", "egress"): "b180ddc588d8ece9",
+    ("linux", "codex", "none"): "673582e9c5e81a4e",
 }
 
 
@@ -714,10 +714,25 @@ def test_egress_hosts_scoped_to_the_egress_class():
     rd.render(blob, facts)
 
 
+def test_codex_files_the_session_repo_untrusted():
+    """wf1af return rulings (THE CLASS), from the run (1026-2/wf1ag/RETURN.md, Codex 0.162.1 app-server
+    ``config/read``): a ``trusted`` repo's ``.codex/config.toml`` outranked every key this file sets; ``untrusted``
+    keeps that layer out. Every session that renders a Codex config files its repo, and only its repo, so."""
+    for host, vendor, auth in itertools.product(("darwin", "linux"), ("claude", "codex"), ("brokered", "passthrough")):
+        blob, facts = egress(host, vendor, auth=auth)
+        tables = rd.codex_config(blob, facts)["tables"]
+        projects = {k: v for k, v in tables.items() if k.startswith("projects.")}
+        assert projects == {f"projects.{rd._toml_str(str(facts.S / 'repo'))}": {"trust_level": "untrusted"}}
+        assert 'trust_level = "trusted"' not in rd.codex_toml(blob, facts).decode()
+    blob, facts = verifier(vendor="codex")
+    assert 'trust_level = "untrusted"' in rd.codex_toml(blob, facts).decode().splitlines()
+
+
 def test_codex_launch_pins_web_search_above_a_trusted_repo():
     """WF-1a L3 r1 W1, from the run (1026-2/wf1af/RETURN.md, Codex 0.162.1 app-server ``config/read``): a trusted
     repo's ``.codex/config.toml`` ``web_search = "live"`` wins over CODEX_HOME's ``disabled``; a ``-c`` override
-    is the ``sessionFlags`` layer above it. The launch args parse as Codex parses ``-c`` (a TOML value)."""
+    is the ``sessionFlags`` layer above it, kept now that the repo is filed untrusted. The launch args parse as
+    Codex parses ``-c`` (a TOML value)."""
     import tomllib
 
     args = rd.CODEX_LAUNCH_ARGS
