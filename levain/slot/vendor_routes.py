@@ -1,9 +1,14 @@
-"""The vendor brokered routes the install helper merges into ``L/routes/base.json`` (3c design §4, 3c-9:
-``routes-base``; R4 §1.3: the install helper "ships the vendor table and refreshes it on repair/upgrade").
+"""The vendor routes the install helper merges into ``L/routes/base.json`` (3c design §4, 3c-9: ``routes-base``;
+R4 §1.3: the install helper "ships the vendor table and refreshes it on repair/upgrade").
 
-One route per vendor whose models carry a price row in :mod:`levain.broker.vendor_prices`: Anthropic's Messages API,
-priced for every Claude row there. The OpenRouter row (``z-ai/glm-5.2``) gets no base route: no interactive session
-picks one (``supervisor.VENDOR_HOSTS`` names no OpenRouter host), and dispatch routes come from the signed route map.
+Claude's ``subscription_passthrough`` route (CONTRACT §4.1; 1026-10 rulings R1-R4) is the CONNECT host list a
+``--auth passthrough`` session of the slot's own Claude login may tunnel to. Its hosts are derived from Anthropic's
+published Claude Code network requirements, not invented: :data:`CLAUDE_NETWORK_DOC`.
+
+One brokered route per vendor whose models carry a price row in :mod:`levain.broker.vendor_prices`: Anthropic's
+Messages API, priced for every Claude row there. The OpenRouter row (``z-ai/glm-5.2``) gets no base route: no
+interactive session picks one (``supervisor.VENDOR_HOSTS`` names no OpenRouter host), and dispatch routes come from the
+signed route map.
 A body's ``models`` fallback list or ``route`` is refused at the check, and on the openai-chat codec (the one whose
 route can fall back, ``Codec.checks_answered_model``) a response naming another model is not priced at the checked
 model's row (3c-9, ``levain.broker.codec.answered_other``).
@@ -58,8 +63,26 @@ def anthropic_route() -> dict:
     }
 
 
+#: the source of :func:`claude_passthrough_route`'s hosts, its "Network access requirements" table
+CLAUDE_NETWORK_DOC = "https://code.claude.com/docs/en/network-config"
+
+#: the rows of that table a CLI subscription login and its turns need inside the slot: ``api.anthropic.com`` (Claude
+#: API requests), ``claude.ai`` (claude.ai account authentication), ``platform.claude.com`` (OAuth token exchange,
+#: refresh and revocation, for claude.ai accounts too). The browser-side sign-in hosts (``claude.com``,
+#: ``sso.claude.com``) are opened by the operator's own browser, outside the slot; the telemetry, error-reporting,
+#: update, plugin and connector rows are no login's and are not shipped.
+CLAUDE_PASSTHROUGH_HOSTS = ("api.anthropic.com", "claude.ai", "platform.claude.com")
+
+
+def claude_passthrough_route() -> dict:
+    """The slot's own Claude login, tunnelled end to end (the front logs host and bytes, never a request line); never
+    a dispatch route (CONTRACT §4.1). It shares ``api.anthropic.com`` with :func:`anthropic_route`; a session carries
+    one or the other by its auth (render refuses ``auth-routes-mismatch`` otherwise)."""
+    return {"route": "claude-subscription", "type": "subscription_passthrough", "hosts": list(CLAUDE_PASSTHROUGH_HOSTS)}
+
+
 def vendor_routes() -> List[dict]:
-    return [anthropic_route()]
+    return [anthropic_route(), claude_passthrough_route()]
 
 
 class MergeRefused(ValueError):
@@ -117,5 +140,5 @@ def reverted_fields(doc: object) -> Dict[str, List[str]]:
     return out
 
 
-__all__ = ["ANTHROPIC_SESSION_CAP", "BASE_FORMAT", "CLAUDE_MODELS", "MergeRefused", "anthropic_route", "merge",
-           "reverted_fields", "vendor_routes"]
+__all__ = ["ANTHROPIC_SESSION_CAP", "BASE_FORMAT", "CLAUDE_MODELS", "CLAUDE_NETWORK_DOC", "CLAUDE_PASSTHROUGH_HOSTS",
+           "MergeRefused", "anthropic_route", "claude_passthrough_route", "merge", "reverted_fields", "vendor_routes"]
