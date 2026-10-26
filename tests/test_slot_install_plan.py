@@ -270,7 +270,8 @@ def test_install_verbs_refuse_with_live_lease(verb):
     cmd = parse_install_argv(argv)
     facts = _set_up("linux", live_leases=1) if verb != "setup" else _facts("linux", live_leases=1)
     assert LEASE_EXEMPT == {"purge", "force-retire", "set-credential", "remove-credential", "set-limits",
-                            "routes-base", "routes-trust", "enrol-authority-signer", "remove-authority-signer"}
+                            "routes-base", "routes-trust", "routes-egress", "enrol-authority-signer",
+                            "remove-authority-signer"}
     if verb in LEASE_EXEMPT:
         preflight(cmd, facts)                 # the lease-exempt verbs pass
     else:
@@ -338,8 +339,8 @@ STORE_DIRS = {
     "sessions/front-reg": ("_levain_control", "_levain_control", 0o700),
     "slots": ("R", "R", 0o755), "retained": ("R", "R", 0o700), "trash": ("R", "R", 0o700),
     "staging": ("R", "R", 0o711), "export": ("R", "R", 0o755),
-    "export/operator": ("_levain_export", "levain-export", 0o2750),
-    "export/dispatch": ("_levain_export", "levain-dispatch-export", 0o2750),
+    "export/operator": ("R", "levain-export", 0o750),
+    "export/dispatch": ("R", "levain-dispatch-export", 0o750),
     "queue/requests": ("_levain_qbroker", "levain-queue", 0o2750),
     "queue/answers": ("OP", "levain-queue", 0o2770),
     "contracts": ("_levain_dispatch", "levain-queue", 0o2750),
@@ -365,7 +366,8 @@ def test_store_layout(host):
         assert rows[L / rel if rel else L] == want, rel
         p = str(L / rel if rel else L)
         mk = [i for i, s in enumerate(plan.steps) if s.argv and s.argv[-1] == p and s.argv[0].endswith("mkdir")]
-        chmod = [i for i, s in enumerate(plan.steps) if s.argv and s.argv[-1] == p and s.argv[0].endswith("chmod")]
+        chmod = [i for i, s in enumerate(plan.steps) if s.argv and s.argv[-1] == p and s.argv[0].endswith("chmod")
+                 and s.argv[1] != "-N"]                     # -N: the macOS ACL clear (tests/test_slot_layout_acl.py)
         assert mk and chmod and mk[0] < chmod[0] and plan.steps[chmod[0]].argv[1] == f"{mode:04o}", rel
     # a verifier slot has no keep/ (§2.1: L/slots/e<n>/keep only)
     assert L / "slots/v0/keep" not in rows

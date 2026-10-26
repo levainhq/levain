@@ -44,7 +44,7 @@ BUNDLE_OID = b"0123456789abcdef0123456789abcdef01234567"
 BUNDLE = (b"# v2 git bundle\n" + BUNDLE_OID + b" HEAD\n" + BUNDLE_OID + b" refs/heads/main\n\n"
           + b"bundle-bytes " * 64)
 BASE = {"format": "levain-routes-base/1", "routes": [
-    {"route": "anthropic", "type": "brokered"}, {"route": "github", "type": "egress"},
+    {"route": "anthropic", "type": "brokered"}, {"route": "github", "type": "egress", "hosts": ["github.com"]},
     {"route": "claude-sub", "type": "subscription_passthrough"}]}
 
 

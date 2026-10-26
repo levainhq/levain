@@ -594,7 +594,10 @@ VERIFY_WRITABLE = (".verify",)
 #: s5 §5b (HEAD_r10 Q-r7-5): the one protected object, the users' data, under every spelling macOS gives it.
 EXPORT_READ_DENIED = ("/Users", "/System/Volumes/Data/Users", "/Volumes")
 #: s5 §5b: an export target's devices on macOS, NOT the slot's set (no tty, no ptmx, no dtracehelper).
-EXPORT_DEVICES = ("/dev/null", "/dev/zero")
+#: ``/dev/urandom``: the target's interpreter (``/usr/bin/python3``) reads it at startup for hash randomization and
+#: exits ``Fatal Python error`` without it (measured in a slot-runtime VM, 1026+8 wallexec). The profile allows each
+#: device for write as well as read; the node is ``crw-rw-rw-`` on macOS, so any account can write it outside a wall.
+EXPORT_DEVICES = ("/dev/null", "/dev/zero", "/dev/urandom")
 #: s5 §5b: the start of the Mach allow-list; the list git and the importer need is measured on the VM (5g).
 EXPORT_MACH_ALLOW = ("com.apple.system.opendirectoryd.libinfo",)
 #: s5 §5b: ``--cap-drop ALL`` with only the two capabilities the stage spends on its drop added back. The stage
@@ -615,7 +618,7 @@ _EXPORT_SCOPE = {"importer": "export.scope", "verifier": "verify.scope"}
 def export_wall_facts(host: str, role: str) -> WallFacts:
     """The importer's or the verifier's wall (s5 §5b capability list): the one writable path ``L/export/.work``
     (``.verify``), the cwd there, fd 4 kept (the bounded result pipe). macOS: ``(allow default)`` reads less the
-    three user-data subpaths, ``/dev/null`` and ``/dev/zero`` the only devices, all network and IPC denied, Mach
+    three user-data subpaths, :data:`EXPORT_DEVICES` the only devices, all network and IPC denied, Mach
     denied but for the allow-list. Linux: fresh net, IPC, PID and UTS namespaces, a new session, capabilities
     dropped (:data:`EXPORT_CAPS`), ro ``/usr`` ``/etc`` (+ the import tree and helper dir where ``/usr`` does not
     hold them), bwrap's minimal ``/dev``, nothing of the operator's and no socket dir."""
