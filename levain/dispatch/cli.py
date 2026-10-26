@@ -1018,7 +1018,7 @@ def _pin_route_trust(store: dctl.ControlStore, *, refuse: bool = True, replace: 
     ``{"pinned": bool, "refused": <root's refusal name or None>, "why": <text>}``; a key the log no longer allows
     is a :class:`dctl.ConfigRefused`, or with ``refuse`` False the refusal ``preflight`` (nothing sent to root).
     ``replace`` (Q16) sends ``routes-trust --replace``, which rotates a pin naming another store or key; its answer's
-    ``replaced``, ``aside`` and ``recovered`` are passed on."""
+    ``replaced``, ``aside``, ``recovered`` and ``recovered_aside`` are passed on."""
     from levain.contracts.canon import canonical_bytes
 
     fp, sid = store.trust_root(), store.store_id()
@@ -1039,7 +1039,7 @@ def _pin_route_trust(store: dctl.ControlStore, *, refuse: bool = True, replace: 
         pin: dict[str, Any] = {"pinned": True, "refused": None, "why": ""}
         if replace:
             pin.update(replaced=answer.get("replaced"), aside=answer.get("aside"),
-                       recovered=answer.get("recovered"))
+                       recovered=answer.get("recovered"), recovered_aside=answer.get("recovered_aside"))
         return pin
     if isinstance(answer, dict) and isinstance(answer.get("refused"), str):
         return {"pinned": False, "refused": answer["refused"], "why": stderr.strip()[-300:]}
@@ -1049,9 +1049,13 @@ def _pin_route_trust(store: dctl.ControlStore, *, refuse: bool = True, replace: 
 
 def _trust_line(pin: dict[str, Any]) -> str:
     recovered = pin.get("recovered")
-    before = ({"completed": "A replace that did not finish was finished first. ",
-               "rolled-back": "A replace that did not finish was undone first. "}.get(recovered, "")
+    before = ({"completed": "A replace that did not finish was finished first",
+               "rolled-back": "A replace that did not finish was undone first"}.get(recovered, "")
               if pin["pinned"] else "")
+    if before:
+        kept = pin.get("recovered_aside")
+        before += (f"; the store it set aside is in {_safe(str(kept))}. " if kept and recovered == "completed" else
+                   f"; {_safe(str(kept))} held more than it moved and is kept. " if kept else ". ")
     if pin["pinned"] and isinstance(pin.get("replaced"), dict):
         was = pin["replaced"].get("store_id")
         return (before + "The route trust is pinned in L/routes (trust.pub, trust.json), replacing "
@@ -1069,7 +1073,7 @@ def _trust_line(pin: dict[str, Any]) -> str:
                 "`levain dispatch config trust`.")
     if pin["refused"] == "routes-trust-exists":
         return (f"The route trust is NOT pinned (routes-trust-exists: {_safe(pin['why'])}): root holds a pin to "
-                "another store or key. To rotate it to this store, stop the control service and run "
+                "another store or key. To rotate it to this store, stop the control and keys services and run "
                 "`levain dispatch config trust --replace`.")
     return (f"The route trust is NOT pinned ({pin['refused'] or 'the helper did not answer'}: {_safe(pin['why'])}); "
             "dispatch routes are refused until it is. Run `levain dispatch config trust`.")

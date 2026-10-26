@@ -179,3 +179,17 @@ def test_the_trust_line_names_a_replace_that_did_not_finish_and_its_recovery():
     assert "Start the control and keys services again" in line
     assert dcli._trust_line(dict(pin, replaced=None, recovered="completed")).startswith(
         "A replace that did not finish was finished first. The route trust is pinned")
+
+
+def test_the_trust_line_names_the_aside_a_recovery_left_and_both_services_to_stop():
+    """verify r2 R4 / R5: a recovered replace's aside is named; `routes-trust-exists` says to stop control AND keys
+    (the replace refuses `keys-running` otherwise)."""
+    pin = {"pinned": True, "refused": None, "why": "", "replaced": None, "aside": None, "recovered": "completed",
+           "recovered_aside": "/L/routes/.replaced-1"}
+    assert dcli._trust_line(pin).startswith("A replace that did not finish was finished first; the store it set aside "
+                                            "is in /L/routes/.replaced-1. The route trust is pinned")
+    line = dcli._trust_line(dict(pin, recovered="rolled-back"))
+    assert line.startswith("A replace that did not finish was undone first; /L/routes/.replaced-1 held more than it "
+                           "moved and is kept. The route trust is pinned")
+    line = dcli._trust_line({"pinned": False, "refused": "routes-trust-exists", "why": "w"})
+    assert "stop the control and keys services and run" in line

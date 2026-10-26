@@ -374,6 +374,11 @@ def test_a_rerun_of_the_same_replace_ends_as_one_clean_replace(old, point):
     assert got["recovered"] == ("completed" if point == "written" else "rolled-back")
     asides = [p for p in old.routes.iterdir() if p.name.startswith(".replaced-")]
     assert len(asides) == 1 and not (old.routes / INTENT).exists()
+    # verify r2 R4: the one aside is named, by the recovery that finished it or by the replace that ran after the undo
+    if point == "written":
+        assert (got["recovered_aside"], got["aside"]) == (str(asides[0]), None)
+    else:
+        assert (got["recovered_aside"], got["aside"]) == (None, str(asides[0]))
     moved = {k.replace("routes/dispatch/", "dispatch/").replace("routes/verifiers/", "verifiers/")
              .replace("keys/routemap.head", "routemap.head").replace("routes/trust.", "trust."): v
              for k, v in before.items() if k != "routes/base.json"}
@@ -413,6 +418,33 @@ def test_a_failed_put_back_keeps_the_aside_and_the_marker(old, monkeypatch):
     asides = [p for p in old.routes.iterdir() if p.name.startswith(".replaced-")]
     assert len(asides) == 1 and (asides[0] / "dispatch").is_dir() and str(asides[0]) in e.value.detail
     assert (old.routes / INTENT).exists()
+
+
+def test_a_rolled_back_aside_that_is_kept_is_named(old):
+    """verify r2 R4 (deepseek MED): an undone replace whose aside held more than it moved keeps it, and the answer
+    names it."""
+    _killed(old, "rename:3")
+    (asides,) = [p for p in old.routes.iterdir() if p.name.startswith(".replaced-")]
+    (asides / "an-operator-note").write_text("x")
+    got = _replace(old, _req(old.signer, STORE_ID))
+    assert (got["recovered"], got["recovered_aside"], got["aside"]) == ("rolled-back", str(asides), None)
+    assert (asides / "an-operator-note").exists()
+
+
+@pytest.mark.parametrize("point", ["rename:2", "written"])
+def test_a_marker_the_recovery_cannot_remove_is_a_named_refusal(old, monkeypatch, point):
+    """verify r2 R4 (deepseek MED): the undo (or the finish) done, the marker's unlink failing is
+    ``routes-trust-replace-unfinished`` naming the marker, never a raw OSError; the marker stays, so both services
+    still refuse to start."""
+    _killed(old, point)
+
+    def fail(routes, warn):
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(IH, "_finish_intent", fail)
+    with pytest.raises(Refused) as e:
+        _replace(old, _req(old.new, OTHER_STORE))
+    assert e.value.name == "routes-trust-replace-unfinished"
+    assert str(old.routes / INTENT) in e.value.detail and (old.routes / INTENT).exists()
 
 
 # --- L3 r1 Q2: keys running ---------------------------------------------------------------------------------------------

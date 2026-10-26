@@ -3111,13 +3111,26 @@ def _finish_intent(routes: Path, warn: Callable[[str], object]) -> None:
         warn(f"levain install-helper: warning: {problem}\n")
 
 
-def _recover(L: Path, routes: Path, intent: Mapping, warn: Callable[[str], object]) -> str:
+def _recover(L: Path, routes: Path, intent: Mapping, warn: Callable[[str], object]) -> tuple[str, Optional[Path]]:
     """A rerun's first act when a replace did not finish (L3 r1 Q1): ``completed`` when it reached its end
-    (:func:`_replace_complete`: only the marker is removed), else ``rolled-back`` (:func:`_roll_back`). An undo with
-    a failed step keeps the marker and refuses ``routes-trust-replace-unfinished``, naming the steps and the aside."""
+    (:func:`_replace_complete`: only the marker is removed), else ``rolled-back`` (:func:`_roll_back`). Returns that
+    and the aside dir still on disk (verify r2 R4): the completed replace's (it holds the old store), or a rolled-back
+    one's that held more than it moved; None when the undo removed it. An undo with a failed step keeps the marker and
+    refuses ``routes-trust-replace-unfinished``, naming the steps and the aside; so does a marker that cannot be
+    removed after (verify r2 R4), naming it."""
+    def finish(what: str, aside: Optional[Path]) -> tuple[str, Optional[Path]]:
+        try:
+            _finish_intent(routes, warn)
+        except OSError as e:
+            raise Refused("routes-trust-replace-unfinished", f"the replace that did not finish is {what}, but "
+                                                             f"{routes / ROUTES_REPLACE_INTENT} could not be removed "
+                                                             f"({e.strerror or e}): run the replace again"
+                                                             + (f"; the old store is in {aside}" if aside else "")
+                          ) from None
+        return ("completed" if what == "finished" else "rolled-back"), aside
+
     if _replace_complete(L, routes, intent):
-        _finish_intent(routes, warn)
-        return "completed"
+        return finish("finished", routes / intent["aside"])
     problems, kept = _roll_back(L, routes, intent)
     if problems:
         raise Refused("routes-trust-replace-unfinished", f"undoing the replace that did not finish FAILED "
@@ -3126,8 +3139,7 @@ def _recover(L: Path, routes: Path, intent: Mapping, warn: Callable[[str], objec
     if kept is not None:
         warn(f"levain install-helper: the replace that did not finish is undone; {kept} held more than it moved and "
              "is kept\n")
-    _finish_intent(routes, warn)
-    return "rolled-back"
+    return finish("undone", kept)
 
 
 def _replace_store(L: Path, routes: Path, pair: Sequence[tuple[str, bytes]], *, fsync: Callable[[int], None] | None,
@@ -3214,7 +3226,8 @@ def run_routes_trust(caller_uid: int, host: HostOS, *, read: Callable[[int], byt
     ``routes-trust-replace-unfinished``, and ``replace`` first finishes or undoes it (:func:`_recover`, under the same
     holds), then goes on as above. The answer adds ``replaced`` (the old ``{store_id, fingerprint}``, None for each the
     old ``trust.json`` did not parse to; None when nothing was replaced), ``aside`` (the set-aside dir, or None) and
-    ``recovered`` (``completed`` / ``rolled-back`` for a replace that did not finish, else None)."""
+    ``recovered`` (``completed`` / ``rolled-back`` for a replace that did not finish, else None) and
+    ``recovered_aside`` (the aside dir that replace left on disk, :func:`_recover`; else None)."""
     import hashlib
 
     rs = store_seams or RH.Seams(host=host)
@@ -3230,6 +3243,7 @@ def run_routes_trust(caller_uid: int, host: HostOS, *, read: Callable[[int], byt
     replaced: Optional[dict] = None
     aside: Optional[Path] = None
     recovered: Optional[str] = None
+    recovered_aside: Optional[Path] = None
 
     def pinned() -> Optional[dict]:
         try:
@@ -3255,7 +3269,7 @@ def run_routes_trust(caller_uid: int, host: HostOS, *, read: Callable[[int], byt
         else:
             with _services_held(rs.L):
                 if intent is not None:
-                    recovered = _recover(rs.L, routes, intent, warn)
+                    recovered, recovered_aside = _recover(rs.L, routes, intent, warn)
                     have = pinned()
                 if have is None or have == trust:
                     _write_trust_pair(routes, pair, fsync=fsync, warn=warn)
@@ -3265,7 +3279,8 @@ def run_routes_trust(caller_uid: int, host: HostOS, *, read: Callable[[int], byt
     out: dict[str, object] = {"verb": "routes-trust", "store_id": req["store_id"], "fingerprint": req["fingerprint"],
                               "digest": "sha256:" + hashlib.sha256(pub).hexdigest()}
     if replace:
-        out.update(replaced=replaced, aside=None if aside is None else str(aside), recovered=recovered)
+        out.update(replaced=replaced, aside=None if aside is None else str(aside), recovered=recovered,
+                   recovered_aside=None if recovered_aside is None else str(recovered_aside))
     return out
 
 
