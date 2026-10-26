@@ -332,7 +332,7 @@ def test_an_unreadable_front_log_dir_is_a_warning_never_absent_or_green(tmp_path
         row, _ = _front_row(store)
     finally:
         os.chmod(store / "gw", 0o755)
-    assert row.ok and row.warn and not row.upgrade_pending and "could not be read" in row.detail, row
+    assert row.ok and row.warn and not row.upgrade_pending and "could not be checked" in row.detail, row
     assert "e0 (permission denied" in row.detail
 
 
@@ -477,7 +477,7 @@ def test_an_account_lookup_that_raises_otherwise_is_could_not_be_read(tmp_path, 
     def broken(name):
         raise exc
     row, _ = _front_row(store, _test_user_seams(account_uid=broken))
-    assert row.ok and row.warn and "could not be read: e0 (" in row.detail, row
+    assert row.ok and row.warn and "could not be checked, so not judged: e0 (" in row.detail, row
 
 
 # --- S-6: only the gw / gw/slot<n> miss is rewritten as the missing front log dir -------------------------------------
@@ -496,3 +496,91 @@ def test_a_store_missing_from_elsewhere_keeps_its_own_message(tmp_path, monkeypa
         store.close()
     assert e.value.name == "store-missing" and e.value.detail == "something-else"
     assert "front log dir is missing" not in str(e.value)
+
+
+# --- r5: the row's clauses, the opened slot dir re-judged, every slot account -----------------------------------------
+
+#: the row's clause headers (doctor._front_log_rows): refused, refused until the missing dir is made, not checked
+_CLAUSES = ("refused, so no session on them starts: ", "refused until the missing dir is made: ",
+            "could not be checked, so not judged: ")
+
+
+def _clauses(row) -> dict:
+    """Each clause header the detail carries -> the slot tags named under it (a tag is ``[ev]<n>`` before ``: `` or
+    `` (``)."""
+    found, at = {}, sorted((row.detail.find(h), h) for h in _CLAUSES if h in row.detail)
+    for i, (start, h) in enumerate(at):
+        end = at[i + 1][0] if i + 1 < len(at) else len(row.detail)
+        found[h] = set(re.findall(r"\b([ev]\d+)(?=[:, ]|$)", row.detail[start + len(h):end]))
+    return found
+
+
+@pytest.mark.parametrize("kinds", [("absent", "unread"), ("refused", "unread"), ("refused", "absent"),
+                                   ("absent", "refused", "unread")])
+def test_each_slot_is_said_under_its_own_verdict(tmp_path, kinds):
+    """codex r5 MED: e0's dir genuinely absent, e1's account lookup a directory-service fault, e2's dir group-writable.
+    Each slot is named only under its own clause: one never judged is never said refused, and the could-not-be-checked
+    clause is kept beside a failure. The verdict is the worst real one: a refusal fails, only-absent is
+    upgrade-pending."""
+    tags = {"absent": "e0", "unread": "e1", "refused": "e2"}
+    live = {tags[k]: "reusable" for k in kinds}
+    gw = tuple(int(tags[k][1:]) for k in kinds if k != "absent")
+    store = _doctor_store(tmp_path, live, gw=gw)
+    if "refused" in kinds:
+        os.chmod(store / "gw" / "slot2", 0o775)
+
+    def acct(name):
+        if name.endswith("1"):
+            raise OSError(5, "Input/output error")
+        return FRONT_UID
+    row, _ = _front_row(store, _test_user_seams(account_uid=acct))
+    want = {h: {tags[k]} for k, h in zip(("refused", "absent", "unread"), _CLAUSES) if k in kinds}
+    assert _clauses(row) == want, row.detail
+    assert not row.ok and not row.warn, row
+    assert row.upgrade_pending == ("refused" not in kinds), row
+    if "unread" in kinds:
+        assert "Input/output error" in row.detail and "not judged" in row.hint, row
+
+
+def test_prepare_front_log_re_judges_the_opened_slot_dir(tmp_path, monkeypatch):
+    """complement r5 LOW 1: the front account owns ``L/gw/slot<n>/`` and can chmod it between the stat and root's open:
+    the same inode, so the identity check passes. The opened fd is held to the same predicate, and no log is made."""
+    w = _world(tmp_path)
+    slot0 = w.L / "gw" / "slot0"
+    real = H._openat_dir
+
+    def chmod_then_open(parent, name, where):
+        if name == "slot0":
+            os.chmod(slot0, 0o775)
+        return real(parent, name, where)
+    monkeypatch.setattr(H, "_openat_dir", chmod_then_open)
+    store = H.Store(w.seams)
+    try:
+        with pytest.raises(H.Refused) as e:
+            H.prepare_front_log(store, H.SlotId("egress", 0), FRONT_UID)
+    finally:
+        store.close()
+    assert e.value.name == "bad-root" and "gw/slot0" in e.value.detail, e.value
+    assert not (slot0 / H.FRONT_LOG_NAME).exists()
+
+
+@pytest.mark.parametrize("refusal", ["account-missing", "account-out-of-range"])
+def test_a_missing_slot_account_fails_the_row_as_render_refuses(tmp_path, refusal):
+    """complement r5 LOW 2: render's ``slot_ids`` looks up both accounts of the slot, and no other doctor row reads the
+    slot account [judged by s3b8af7, 10-26, against git grep of levain/doctor.py], so this row does: a missing or
+    out-of-range ``_levain_s0`` fails it, as render would."""
+    store = _doctor_store(tmp_path, {"e0": "reusable"}, gw=(0,))
+
+    def acct(name):
+        if name == "_levain_s0":
+            if refusal == "account-missing":
+                raise H.Refused("account-missing", name)
+            return 5                                # outside §1.1's slot range
+        return FRONT_UID
+    seams = _test_user_seams(account_uid=acct)
+    with pytest.raises(H.Refused) as e:
+        {n: H.account_in_range(seams, n) for n in H.SlotId("egress", 0).accounts}     # slot_ids' own loop
+    assert e.value.name == refusal
+    row, _ = _front_row(store, seams)
+    assert not row.ok and not row.warn and not row.upgrade_pending, row
+    assert f"({refusal})" in row.detail and "_levain_s0" in row.detail and _named(row) == {"e0"}, row.detail

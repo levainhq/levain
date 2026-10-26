@@ -634,8 +634,9 @@ def _open_front_log_dir(store: "Store", slot: SlotId, front_uid: Optional[int], 
     ``store-missing`` from elsewhere keeps its own text.
 
     With ``open_slot`` (root's caller), ``L/gw/slot<n>/`` is then opened ``O_NOFOLLOW|O_DIRECTORY`` through the same
-    ``L/gw/`` fd and refused ``bad-root`` unless the fd is the dir that was judged (its ``st_dev``, ``st_ino``): a dir
-    moved, swapped or removed between the stat and the open is never used. The fd is returned for the caller to close.
+    ``L/gw/`` fd and refused ``bad-root`` unless the fd is the dir that was judged (its ``st_dev``, ``st_ino``) and
+    its own fstat still passes :func:`_front_dir_ok`: a dir moved, swapped, removed or re-moded between the stat and
+    the open is never used. The fd is returned for the caller to close.
     None without ``open_slot``, or with ``front_uid`` None (no front account to judge the slot dir by: only ``L/gw/``
     is walked). Any other ``OSError`` of the walk is raised as it is."""
     seams = store.seams
@@ -661,6 +662,9 @@ def _open_front_log_dir(store: "Store", slot: SlotId, front_uid: Optional[int], 
                 got = os.fstat(fd)
                 if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
                     raise Refused("bad-root", f"{where} changed while it was checked")
+                # the front account owns it and may chmod the same inode between the stat and the open
+                if not _front_dir_ok(got, seams, front_uid):
+                    raise Refused("bad-root", f"{where} is not the front account's alone")
             except BaseException:
                 os.close(fd)
                 raise
@@ -676,18 +680,22 @@ def _open_front_log_dir(store: "Store", slot: SlotId, front_uid: Optional[int], 
 
 def check_front_log_dirs(store: "Store", slot: SlotId, front_uid: Optional[int] = None) -> List[Refused]:
     """What a session start on egress ``slot`` would refuse about its front log dirs, without making, chowning or
-    writing anything: the front account looked up as render's :func:`slot_ids` does (when ``front_uid`` is not
-    given), then :func:`prepare_front_log`'s own walk (:func:`_open_front_log_dir`) up to its final open, which only
-    root's caller makes (``levain doctor`` runs as the operator, who may search ``L/gw/`` but not read
-    ``L/gw/slot<n>/``). The refusals in the order the runtime meets them, empty when the start would pass them; a
-    missing front account is followed by the ``L/gw/`` half, which needs no account. Raises the walk's other
-    ``OSError`` (an unreadable dir) and whatever ``seams.account_uid`` raises that is not a ``Refused``."""
+    writing anything: each of the slot's accounts looked up as render's :func:`slot_ids` does (when ``front_uid`` is
+    not given), then :func:`prepare_front_log`'s own walk (:func:`_open_front_log_dir`) up to its final open, which
+    only root's caller makes (``levain doctor`` runs as the operator, who may search ``L/gw/`` but not read
+    ``L/gw/slot<n>/``). The refusals in the order the runtime meets them, empty when the start would pass them; every
+    refused account is listed (render stops at the first), then the walk (with no front account, its ``L/gw/`` half,
+    which needs no account). Raises the walk's other ``OSError`` (an unreadable dir) and whatever
+    ``seams.account_uid`` raises that is not a ``Refused``."""
     found: List[Refused] = []
     if front_uid is None:
-        try:
-            front_uid = account_in_range(store.seams, slot.accounts[1])
-        except Refused as e:
-            found.append(e)
+        ids: Dict[str, int] = {}
+        for name in slot.accounts:
+            try:
+                ids[name] = account_in_range(store.seams, name)
+            except Refused as e:
+                found.append(e)
+        front_uid = ids.get(slot.accounts[1])
     try:
         _open_front_log_dir(store, slot, front_uid, open_slot=False)
     except Refused as e:

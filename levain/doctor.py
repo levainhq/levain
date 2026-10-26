@@ -548,12 +548,13 @@ def _front_log_rows(store: Path, host: str, layout: Any, R: Any, seams: Any = No
     """The ``agent front logs`` row: for each in-service egress slot, what a session start would refuse about its
     front log dirs (``L/gw/``, ``L/gw/slot<n>/``, S1 3b-8a), asked of the runtime itself
     (``runtime_helper.check_front_log_dirs``: render's own front-account lookup and ``prepare_front_log``'s own walk
-    up to its final open, read-only), never re-derived here. Every slot's refusal is gathered into the one row. A
-    ``store-missing`` there is a dir that is genuinely absent (the walk raises it only on ``FileNotFoundError``): an
-    install made before the dir existed, upgrade-pending with the repair line. Any other refusal (``bad-root``: a
-    link, a non-directory, a wrong owner or mode; ``account-missing``) fails the row and is not upgrade-pending. What
-    the walk cannot read is a warning. No egress slot: no row. ``seams``: the runtime's, for tests (its ``store`` is
-    set to ``store``); the default reads the real accounts."""
+    up to its final open, read-only), never re-derived here. Every slot is gathered into the one row, each named
+    under its own clause only. A ``store-missing`` there is a dir that is genuinely absent (the walk raises it only on
+    ``FileNotFoundError``): an install made before the dir existed, said with the repair line. Any other refusal
+    (``bad-root``: a link, a non-directory, a wrong owner or mode; ``account-missing``, ``account-out-of-range``) is
+    said refused. What the walk cannot read is said not judged, never refused. The row's verdict is the worst real
+    one: any refusal fails it, absences alone make it upgrade-pending, unread alone warns. No egress slot: no row.
+    ``seams``: the runtime's, for tests (its ``store`` is set to ``store``); the default reads the real accounts."""
     import dataclasses
 
     from levain.slot import Refused
@@ -591,21 +592,27 @@ def _front_log_rows(store: Path, host: str, layout: Any, R: Any, seams: Any = No
     finally:
         st.close()
 
-    def said(groups: dict[str, list[str]]) -> list[str]:
-        return [f"{', '.join(ts)}: {why}" for why, ts in groups.items()]
+    def said(header: str, groups: dict[str, list[str]]) -> list[str]:
+        return [header + "; ".join(f"{', '.join(ts)}: {why}" for why, ts in groups.items())] if groups else []
 
-    if absent or failed:
-        detail = "; ".join(said(failed) + said(absent)
-                           + ([f"could not be read: {', '.join(unread)}"] if unread else []))
-        return [CheckResult(name, False, f"every session on the slot(s) named is refused: {detail}",
-                            f"Run `{layout.repair_line(host)}` once (an install made before the front log moved to the "
-                            "store has none)." if not failed else
+    # each slot under its own verdict only: a slot never judged is never said refused (codex L3 r5)
+    clauses = (said("refused, so no session on them starts: ", failed)
+               + said("refused until the missing dir is made: ", absent)
+               + (["could not be checked, so not judged: " + ", ".join(unread)] if unread else []))
+    detail = ". ".join(clauses)
+    unjudged = (" What could not be checked is not judged; run the doctor again once it can read them."
+                if unread else "")
+    if failed:
+        return [CheckResult(name, False, detail,
                             f"Look at what is named. `{layout.repair_line(host)}` sets each dir's owner and mode back "
                             "to setup's; it does not replace a link or a file standing where a dir belongs, and it "
-                            "never makes a missing account (undo, then setup, does).",
-                            upgrade_pending=not failed)]
+                            "never makes a missing account (undo, then setup, does)." + unjudged)]
+    if absent:
+        return [CheckResult(name, False, detail,
+                            f"Run `{layout.repair_line(host)}` once (an install made before the front log moved to the "
+                            "store has none)." + unjudged, upgrade_pending=True)]
     if unread:
-        return [CheckResult(name, True, f"could not be read: {', '.join(unread)}", warn=True)]
+        return [CheckResult(name, True, detail, unjudged.strip(), warn=True)]
     return [CheckResult(name, True, f"{len(tags)} egress slot(s), each with its front log directory")]
 
 
