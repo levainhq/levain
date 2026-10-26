@@ -122,6 +122,12 @@ jobs:
         # needs it as much as the tests do.
         run: python -m pip install --upgrade pip pytest "$(python tests/ci/root_closure.py h11-spec)"
 
+      - name: Install h11 for the runner's /usr/bin/python3
+        # The keys process tests (tests/test_broker_keys_process.py, tests/test_control_keys_attach.py) also run keys
+        # under /usr/bin/python3, the interpreter the root run names (ROOT_PYTHON), and b2_keys_rig.require_h11 fails
+        # under CI when it cannot import h11. Same step, same floor, as the `test` job.
+        run: sudo /usr/bin/python3 -m pip install --break-system-packages "$(python tests/ci/root_closure.py h11-spec)"
+
       - name: Byte-compile the root-run import closure
         run: python tests/ci/root_closure.py compile
 
