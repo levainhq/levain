@@ -1383,8 +1383,9 @@ class _Handler(GuardedHandler):
                                    "origin": origin}, 200
             else:
                 row = signer.row(one, signers)
-                payload, status = (({"request": row, "signers": signers, "credentials": credentials, "origin": origin},
-                                    200) if row is not None
+                # `rp_id`: the name a passkey record in the browser is kept under (the sign sheet writes and reads it there)
+                payload, status = (({"request": row, "signers": signers, "credentials": credentials, "origin": origin,
+                                     "rp_id": signer.rp_id}, 200) if row is not None
                                    else ({"error": "not_open", "message": "this sign request is not open"}, 404))
             if note is not None and status == 200:
                 payload["note"] = note

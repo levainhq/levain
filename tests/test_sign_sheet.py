@@ -151,3 +151,12 @@ def test_a_link_opened_from_another_site_reaches_the_sheet_and_nothing_else(shee
 def test_a_malformed_id_is_not_a_sheet(sheet) -> None:
     for path in ("/sign/short", "/sign/a b c d e f g", "/sign/" + "a" * 65, "/sign/np-sign..route", f"{SHEET}/"):
         assert _raw(sheet["url"], path.replace(" ", "%20"))[0] == 404, path
+
+
+def test_the_one_request_read_names_the_rp_id_the_sheet_keys_its_passkey_record_on(sheet) -> None:
+    """H6: the sheet remembers which passkey this browser used under the rpId and reads it back under the same one; that
+    value is the read's ``rp_id`` (the Signer's), not the page's hostname, which can differ from it."""
+    import json as _json
+    status, _h, body = _raw(sheet["url"], f"/cockpit/sign/{RID}.json", headers={"X-Levain-Write-Token": TOK})
+    assert status == 200
+    assert _json.loads(body)["rp_id"] == RP
