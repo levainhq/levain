@@ -1813,11 +1813,13 @@ class PermissionContext:
         self.close()
 
 
-def permission_context(queue_dir: Path, *, environ: Mapping[str, str], home: Path) -> PermissionContext:
-    """The setup :func:`main` runs before it reads the event, for ``queue_dir``: the settings file, one queue over it
-    holding ``home`` (the away mark, the hold and every recheck read it), the settings with the away mark applied,
-    and the recheck over that queue. ``environ`` is carried for the caller's core call; nothing here reads it."""
-    settings = load_settings(queue_dir)
+def permission_context(queue_dir: Path, *, environ: Mapping[str, str], home: Path,
+                       settings: AdapterSettings | None = None) -> PermissionContext:
+    """The setup :func:`main` runs before it reads the event, for ``queue_dir``: the settings file (or ``settings``,
+    when the caller already loaded it), one queue over it holding ``home`` (the away mark, the hold and every recheck
+    read it), the settings with the away mark applied, and the recheck over that queue. ``environ`` is carried for
+    the caller's core call; nothing here reads it."""
+    settings = settings if settings is not None else load_settings(queue_dir)
     queue = _queue_for(queue_dir, settings, home=home)
     settings = with_away_mark(settings, queue_dir, AGENT, queue=queue)
     return PermissionContext(queue=queue, settings=settings,
@@ -1850,7 +1852,10 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         queue_dir = Path(args.queue_dir) if args.queue_dir else queue_dir_for(environ)
         if home is None:
             raise RuntimeError("could not determine the home directory")
-        with permission_context(queue_dir, environ=environ, home=home) as pc:
+        # loaded here, not only inside permission_context: when building the queue raises, gate_failed still
+        # protects the cockpit root these settings name (L3 r1, complement MED 1)
+        settings = load_settings(queue_dir)
+        with permission_context(queue_dir, environ=environ, home=home, settings=settings) as pc:
             queue, settings = pc.queue, pc.settings
             event = json.loads(stdin.read())
             if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:

@@ -1516,3 +1516,43 @@ def test_every_gate_call_checks_for_held_phone_pings(queue, monkeypatch):
     monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
     cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     assert calls == [queue.directory]
+
+
+@pytest.mark.parametrize("why", ["symlink loop", "source raises"])
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm", "-journal"])
+def test_a_queue_that_will_not_open_still_tags_the_configured_cockpit_store(tmp_path, monkeypatch, suffix, why):
+    """L3 r1 (complement MED 1, CH-D1c-A): ``main`` loads the settings before the queue is built, so when building
+    it raises, :func:`gate_failed` still protects the configured cockpit's authority store and its sqlite sidecars:
+    a bypass-mode Write there is denied with the hard stop, never left to the session's mode. Reproduced with the
+    real hook on Python 3.12: a ``cockpit.db`` that is a symlink loop made ``Path.resolve`` in the authority source
+    raise, and the Write got no decision. Python 3.13's ``resolve`` returns a loop unresolved, so the other case
+    makes the source raise directly."""
+    import sys
+
+    if why == "symlink loop" and sys.version_info >= (3, 13):
+        pytest.skip("Path.resolve raises on a symlink loop only before Python 3.13")
+    monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    if why == "symlink loop":
+        os.symlink(root / "cockpit.db", root / "cockpit.db")
+    else:
+        def raising(*a, **kw):
+            raise RuntimeError("the authority source could not be built")
+        monkeypatch.setattr(cc, "authority_source", raising)
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(root)}))
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with pytest.raises(RuntimeError):   # the window this test is about: building the queue raised
+        cc.permission_context(qdir, environ=h4_env(), home=h4_home())
+    target = f"{root / 'cockpit.db'}{suffix}"
+    write = {"hook_event_name": "PreToolUse", "tool_name": "Write", "cwd": str(ws), "session_id": "sess-1",
+             "permission_mode": "bypassPermissions", "tool_use_id": "toolu_1",
+             "tool_input": {"file_path": target, "content": "x"}}
+    out = io.StringIO()
+    assert cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(write)), stdout=out) == 0
+    got = json.loads(out.getvalue())
+    assert got["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert got["continue"] is False and target in got["hookSpecificOutput"]["permissionDecisionReason"]
