@@ -206,7 +206,10 @@ def main(argv: Sequence[str], *, alarm: Callable[[int], object] = signal.alarm,
     data = result_text(addrs, connect(addrs))
     view = memoryview(data)
     while view:
-        view = view[write(fd, view):]
+        n = write(fd, view)
+        if n <= 0:          # no byte moved: give root no ``end`` line (unknown) rather than spin to the alarm
+            return 3
+        view = view[n:]
     close(fd)
     return 0
 

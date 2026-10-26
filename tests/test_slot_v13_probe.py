@@ -204,6 +204,22 @@ def test_t11_child_main_alarm_first_then_lines_then_end():
     assert bytes(written) == b"b 192.0.2.1 timeout\nc 2001:db8::1\nu 192.0.2.3 EINVAL\nend\n"
 
 
+@pytest.mark.parametrize("n", [0, -1])
+def test_t11_child_write_of_nothing_is_a_nonzero_exit_not_a_loop(n):
+    """L3 r1 X6: a write that moves no byte ends the child with a nonzero code, never a spin until its alarm."""
+    calls = []
+
+    def write(fd, data):
+        calls.append(len(data))
+        if len(calls) > 3:
+            raise AssertionError("the write loop spun")
+        return n
+
+    rc = PC.main(["--result-fd", "4", "192.0.2.1"], alarm=lambda s: None, write=write, close=lambda fd: None,
+                 connect=lambda a: {"192.0.2.1": ("b", "timeout")})
+    assert rc not in (0, 2) and len(calls) == 1
+
+
 @pytest.mark.parametrize("argv", [[], ["--result-fd", "4"], ["--result-fd", "2", "192.0.2.1"],
                                   ["--fd", "4", "192.0.2.1"], ["--result-fd", "4", "192.0.2.1", "192.0.2.1"],
                                   ["--result-fd", "4", "api.anthropic.com"],
