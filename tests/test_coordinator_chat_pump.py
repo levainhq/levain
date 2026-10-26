@@ -46,9 +46,10 @@ def test_request_during_probing_routes_after_verdict(cs, world):
     s.show("turn_started", "t-1", turn_id="t-1")
     s.inbound("req-1", "can_use_tool", tool_name="Bash", tool_input={"command": "ls"}, turn_id="t-1")
     svc.read_next(world["launch"])
-    (keys, latest, enabled), = route.calls
-    assert keys == ("turn_started:t-1", "approval_request:req-1")
-    assert (latest, enabled) == ("live", True)               # routed after the turn's verdict, never under probing
+    svc.read_next(world["launch"])
+    # a read ends at its boundary (the driver contract): the turn start is judged, then the request behind it is read
+    # and routed, each after the turn's verdict, never under probing
+    assert route.calls == [(("turn_started:t-1",), "live", True), (("approval_request:req-1",), "live", True)]
 
 
 def test_request_during_not_live_verdict_routes_under_not_live(cs, world):
