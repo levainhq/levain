@@ -24,6 +24,7 @@ from levain.consent.passkey import challenge
 from levain.consent.queue import ConsentQueue, authority_source
 from levain.consent.record import RULING_NAMESPACE, answer_message, ruling_message
 from levain.consent.sign import Signer
+from tests._h4 import h4_home
 from tests.test_cockpit_sign_routes import _call, _serving
 from tests.test_dispatch_phone import _b64u
 from tests.test_grant_phone import RP, world  # noqa: F401  (world is a fixture)
@@ -44,7 +45,7 @@ def _signer(world: Any, origin: str = PAGE) -> Signer:
 
 def _queue(world: Any) -> ConsentQueue:
     return ConsentQueue(world.qdir, authority=authority_source(world.root / "cockpit.db",
-                                                               anchor=auth.anchor_path(world.root)))
+                                                               anchor=auth.anchor_path(world.root)), home=h4_home())
 
 
 def _file(world: Any, tier: str = "T2", *, name: str = "a.txt", hold: timedelta = timedelta(minutes=5),

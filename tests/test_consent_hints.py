@@ -142,7 +142,9 @@ def test_no_decision_path_imports_the_hints() -> None:
                 names = [mod, *(f"{mod}.{a.name}" for a in node.names)]
             if watched & set(names) and f.name != "hints.py":
                 users.add(str(f.relative_to(ROOT)))
-    assert users == {"cockpit/hintview.py", "consent/listing.py"}, sorted(users)
+    # web_server.py renders the signing sheet's title / requester / message with ``visible`` and nothing else; the sheet's
+    # allow / deny / refused branches read the key set, ``cut`` and ``problem``, never the displayed strings
+    assert users == {"cockpit/hintview.py", "consent/listing.py", "web_server.py"}, sorted(users)
     # hintview reaches hints; listing reaches hintview only
     assert "levain.consent.hints" not in (ROOT / "consent" / "listing.py").read_text(encoding="utf-8")
     # the display guard sits outside the hints: the engine and display_safe reach neither (they are not in `users`)

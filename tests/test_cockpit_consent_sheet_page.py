@@ -27,6 +27,7 @@ from levain.consent.answering import passkey_keys
 from levain.consent.queue import ConsentQueue, authority_source
 from levain.consent.sign import Signer
 from levain.web_server import make_server
+from tests._h4 import h4_home
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_sign_card import DESKTOP, TOK, _free_port, needs_ssh
@@ -65,7 +66,7 @@ class _ConsentRig:
         (self.qdir / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(root), "away_mode": False,
                                                                 "away_hold_seconds": 0}))
         source = authority_source(root / "cockpit.db", anchor=anchor_path(root))
-        self.queue = ConsentQueue(self.qdir, authority=source)
+        self.queue = ConsentQueue(self.qdir, authority=source, home=h4_home())
         self.rid = self.file(tier)
         self.port = _free_port()
         self.origin = f"http://localhost:{self.port}"

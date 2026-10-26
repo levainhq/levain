@@ -447,7 +447,8 @@ class ConsentSheet:
         from levain.consent.listing import UNSHOWN, filed_input
         from levain.consent.queue import AnswerRefused, ConsentQueue, authority_source, class_covers
 
-        got = ConsentQueue(self.queue_dir, authority=authority_source(self.queue_dir, anchor=None)).get(request_id)
+        got = ConsentQueue(self.queue_dir, home=Path.home(),
+                           authority=authority_source(self.queue_dir, anchor=None)).get(request_id)
         if got is None or got[1] not in ("pending", "undecided"):
             return None
         request, state = got
