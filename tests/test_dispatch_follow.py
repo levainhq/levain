@@ -515,3 +515,137 @@ def test_a_re_delivered_write_meets_the_repeat_seam_never_the_written_one(store,
     assert f.step().outcome == CC.DEADLINE
     assert hits == ["written", "repeat", "acked"] and acked(served)
     f.close()
+
+
+# -- slice 2: the executor's export artifact is read, then acked ------------------------------------------------------
+
+ART_DIGEST = "sha256:" + "a" * 64
+
+
+def exported(tmp_path, session, ticket, named=None, **over):
+    """Root's published file for ``session`` under a fresh export dir, as ``levain-dispatch-artifact/1``."""
+    import json
+    from levain.dispatch import export as X
+    obj = {"format": X.FORMAT, "session": named or session, "ticket": ticket, "manifest_digest": "sha256:" + "c" * 64,
+           "bundle": "bundle", "bundle_digest": "sha256:" + "d" * 64, "files": 2, "bytes": 64}
+    obj.update(over)
+    (tmp_path / session).mkdir(exist_ok=True)
+    (tmp_path / session / X.FILE).write_text(json.dumps(obj))
+    return tmp_path
+
+
+def artifact_follower(d, export_dir, **kw):
+    return F.EventFollower.at(d.store, d.rig.path, d.resolve, read_deadline=0.5, fault=d.fault, export_dir=export_dir,
+                              **kw)
+
+
+def published(served, **fields):
+    """A bound executor session retained with an artifact field CAS'd, and the ticket CONTROL journaled for it."""
+    from tests.test_tickets import SESSION
+    bound_session(served)
+    to_retained(served)
+    cas(served, R.RETAINED, R.RETAINED, SESSION, **(fields or {"artifact_digest": ART_DIGEST}))
+    ev = served.kept()[-1]
+    assert ev["kind"] == "artifact"
+    return SESSION, ev["ticket"], ev["seq"]
+
+
+def test_a_read_artifact_is_acked_and_the_cursor_moves(store, repo, served, tmp_path):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, ticket, seq = published(served)
+    f = artifact_follower(d, exported(tmp_path, session, ticket))
+    assert f.step().outcome == CC.DEADLINE
+    assert served.control.store.get(session).fields.get("artifact_acked") is True
+    assert store.event_cursor()[1] == seq
+    f.close()
+
+
+def test_an_artifact_with_no_bundle_is_acked_too(store, repo, served, tmp_path):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, ticket, _ = published(served)
+    f = artifact_follower(d, exported(tmp_path, session, ticket, bundle=None, bundle_digest=None))
+    f.step()
+    assert served.control.store.get(session).fields.get("artifact_acked") is True
+    f.close()
+
+
+def test_no_export_dir_acks_nothing(store, repo, served):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, _, seq = published(served)
+    f = artifact_follower(d, None)
+    f.step()
+    assert "artifact_acked" not in served.control.store.get(session).fields
+    assert store.event_cursor()[1] == seq
+    f.close()
+
+
+@pytest.mark.parametrize("case", ["absent", "garbled", "partial", "other-session", "other-ticket", "bad-shape"])
+def test_an_artifact_that_is_not_whole_is_passed_unacked_and_the_cursor_moves(store, repo, served, tmp_path, case):  # noqa: F811
+    """A malformed or partial export is never acked: the retained work waits for the reaper's own fallback, and the
+    stream moves on (a stalled follower would hold every later event)."""
+    from levain.dispatch import export as X
+    d = Dispatch(store, repo, served)
+    session, ticket, seq = published(served)
+    if case == "garbled":
+        (tmp_path / session).mkdir()
+        (tmp_path / session / X.FILE).write_text("{not json")
+    elif case == "partial":
+        exported(tmp_path, session, ticket)
+        p = tmp_path / session / X.FILE
+        p.write_text(p.read_text()[:40])
+    elif case == "other-session":
+        exported(tmp_path, session, ticket, named="s-" + "f" * 16)
+    elif case == "other-ticket":
+        exported(tmp_path, session, "another-" + ticket)
+    elif case == "bad-shape":
+        exported(tmp_path, session, ticket, bundle=None)          # a null bundle that still names a digest
+    f = artifact_follower(d, tmp_path)
+    assert f.step().outcome == CC.DEADLINE
+    assert "artifact_acked" not in served.control.store.get(session).fields
+    assert store.event_cursor()[1] == seq
+    f.close()
+
+
+def test_a_failed_artifact_is_passed_unacked(store, repo, served, tmp_path):  # noqa: F811
+    """The export holds nothing for `artifact_failed`; dispatch took nothing, so nothing is acked."""
+    d = Dispatch(store, repo, served)
+    session, _, seq = published(served, artifact_failed="adopt-space-exhausted")
+    f = artifact_follower(d, tmp_path)
+    f.step()
+    assert "artifact_acked" not in served.control.store.get(session).fields
+    assert store.event_cursor()[1] == seq
+    f.close()
+
+
+@pytest.mark.parametrize("where", ["acked"])
+def test_a_crash_after_the_ack_re_delivers_and_converges(store, repo, served, tmp_path, where):  # noqa: F811
+    d = Dispatch(store, repo, served)
+    session, ticket, seq = published(served)
+    export = exported(tmp_path, session, ticket)
+    d.faults[where] = True
+    f = artifact_follower(d, export)
+    with pytest.raises(Crash):
+        f.step()
+    assert served.control.store.get(session).fields.get("artifact_acked") is True
+    cur = store.event_cursor()
+    assert cur is None or cur[1] < seq
+    f.close()
+    f2 = artifact_follower(d, export)
+    f2.step()
+    assert store.event_cursor()[1] == seq
+    assert served.control.store.get(session).fields.get("artifact_acked") is True
+    f2.close()
+
+
+def test_an_ack_control_refuses_stops_the_follower_by_name_with_the_cursor_unmoved(store, repo, served, tmp_path):  # noqa: F811
+    """CONTROL's record carries another digest than the event the follower read: `artifact-not-published`."""
+    d = Dispatch(store, repo, served)
+    session, ticket, seq = published(served)
+    export = exported(tmp_path, session, ticket)
+    cas(served, R.RETAINED, R.RETAINED, session, artifact_digest="sha256:" + "e" * 64)
+    f = artifact_follower(d, export)
+    with pytest.raises(F.FollowStopped) as e:
+        f.step()
+    assert e.value.name == "artifact-not-published"
+    assert "artifact_acked" not in served.control.store.get(session).fields
+    f.close()
