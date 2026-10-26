@@ -23,6 +23,12 @@ EGRESS = (SlotId("egress", 0), SlotId("egress", 1))
 VERIFY = (SlotId("none", 0),)
 
 
+@pytest.fixture(autouse=True)
+def _kept_in_tmp(tmp_path, monkeypatch):
+    """The kept-reference note's home (``/var/run/levain``) moved under this test's tmp dir, apart from the token's."""
+    monkeypatch.setattr(pf, "PF_KEPT", tmp_path / "var-run" / "levain" / "pf.token.kept", raising=False)
+
+
 # --- the reproduced failure: setup / repair installed no com.levain.pf ---------------------------------------------
 
 
@@ -326,7 +332,8 @@ def test_a_token_write_that_fails_after_the_old_reference_was_released_keeps_the
     run, calls = _pfctl({})
     monkeypatch.setattr(pf, "_write_token", _no_space)
     ok, why = pf.take_enable_reference(token, run=run)
-    assert calls == [("/sbin/pfctl", "-E"), ("/sbin/pfctl", "-X", "111")]   # 222 is never given back
+    assert calls == [("/sbin/pfctl", "-E"), ("/sbin/pfctl", "-X", "111"),   # 222 is never given back
+                     ("/usr/sbin/sysctl", "-n", "kern.boottime")]           # the note's boot (P8)
     assert not ok and why.startswith(pf.ENABLE_UNCERTAIN)
     assert "222" in why and "No space left on device" in why
 
@@ -483,7 +490,7 @@ def test_two_runs_with_the_token_path_unwritable_hold_one_reference_and_neither_
     every ~10 s for as long as the path stayed unwritable. Run 2 must give 333 back AND not be retried."""
     token = _blocked(tmp_path)
     token.write_text("111\n")
-    pfctl = _Refs(["111"])
+    pfctl = _Booted(["111"])
     ok, why = pf.take_enable_reference(token, run=pfctl)
     assert not ok and why.startswith(pf.ENABLE_UNCERTAIN) and pfctl.held == ["222"]
     ok, why = pf.take_enable_reference(token, run=pfctl)
@@ -499,7 +506,7 @@ def test_after_a_reboot_a_kept_reference_pf_no_longer_holds_is_the_ordinary_retr
     gives its new reference back and is retried, as f3 ruled."""
     token = _blocked(tmp_path)
     token.write_text("111\n")
-    pfctl = _Refs(["111"])
+    pfctl = _Booted(["111"])
     assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
     pfctl.held = []                                                  # the reboot
     ok, why = pf.take_enable_reference(token, run=pfctl)
@@ -509,8 +516,101 @@ def test_after_a_reboot_a_kept_reference_pf_no_longer_holds_is_the_ordinary_retr
 def test_a_run_whose_write_works_again_records_its_token_and_drops_the_note(tmp_path):
     token = _blocked(tmp_path)
     token.write_text("111\n")
-    pfctl = _Refs(["111"])
+    pfctl = _Booted(["111"])
     assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
     (tmp_path / ".pf.token.tmp").rmdir()                             # the path is writable again
     assert pf.take_enable_reference(token, run=pfctl) == (True, "")
-    assert token.read_text() == "333\n" and sorted(os.listdir(tmp_path)) == ["pf.token"]
+    assert token.read_text() == "333\n" and sorted(os.listdir(tmp_path)) == ["pf.token", "var-run"]
+    assert _noted_kept(tmp_path) == []
+
+
+# --- L3 verify r5 (f5): P8 the note is boot-scoped and only the TOKEN column counts, P9 it lives apart from the token -
+
+
+class _Booted(_Refs):
+    """:class:`_Refs` plus ``sysctl -n kern.boottime`` (the measured layout) and rows other processes hold."""
+
+    def __init__(self, held=(), boot=1792860815, others=()):
+        super().__init__(held)
+        self.boot, self.others = boot, list(others)
+
+    def __call__(self, argv, **kw):
+        if argv[0] == "/usr/sbin/sysctl":
+            return subprocess.CompletedProcess(argv, 0, f"{{ sec = {self.boot}, usec = 967376 }} Sat Oct 24 12:53:35"
+                                                        " 2026\n", "")
+        r = super().__call__(argv, **kw)
+        if argv[1:] == ["-s", "References"]:
+            r.stdout += "".join(f"{pid:<8} {name:<28} {tok:<24} 0 days 00:{pid % 60:02d}:01\n"
+                                for pid, name, tok in self.others)
+        return r
+
+
+def _noted_kept(tmp_path) -> list:
+    return [p for p in tmp_path.rglob("*.kept")]
+
+
+def test_a_noted_token_seen_only_in_another_rows_pid_is_not_held(tmp_path):
+    """P8 (r5 codex MED, deepseek MED): ``_kept_held`` matched the noted token against every field of every row, so a
+    PID (or a timestamp field) equal to it read as held, and a run that should retry exited 0 with the anchor unloaded.
+    Here someone released 222 after run 1 noted it; another process's row carries 222 as its PID."""
+    token = _blocked(tmp_path)
+    token.write_text("111\n")
+    pfctl = _Booted(["111"])
+    assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
+    pfctl.held.remove("222")
+    pfctl.others = [(222, "socketfilterfw", "9988776655")]
+    ok, why = pf.take_enable_reference(token, run=pfctl)
+    assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN), why
+
+
+def test_a_note_from_an_earlier_boot_is_ignored_and_removed(tmp_path):
+    """P8: a note carries the boot it was written in; after a reboot, even a token pf now lists under the same number
+    is not the reference that run kept, so the run gives its new one back and is retried, and the note is gone."""
+    token = _blocked(tmp_path)
+    token.write_text("111\n")
+    pfctl = _Booted(["111"])
+    assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
+    assert _noted_kept(tmp_path)
+    pfctl.boot += 3600                                              # the reboot ...
+    pfctl.held, pfctl.next = ["222"], 333                           # ... and pf lists 222 again, another reference
+    ok, why = pf.take_enable_reference(token, run=pfctl)
+    assert not ok and not why.startswith(pf.ENABLE_UNCERTAIN), why
+    assert pfctl.held == ["222"] and _noted_kept(tmp_path) == []
+
+
+def test_a_token_dir_that_cannot_be_written_still_leaves_a_note_so_run_two_is_not_retried(tmp_path):
+    """P9 (r5 complement MED): the note shared the token's directory, so a read-only or permission-denied state dir
+    failed both writes and run 2 looped as before. The note's own home is apart from the token's."""
+    d = tmp_path / "db"
+    d.mkdir()
+    token = d / "pf.token"
+    token.write_text("111\n")
+    os.chmod(d, 0o500)
+    try:
+        pfctl = _Booted(["111"])
+        assert pf.take_enable_reference(token, run=pfctl)[1].startswith(pf.ENABLE_UNCERTAIN)
+        ok, why = pf.take_enable_reference(token, run=pfctl)
+        assert not ok and why.startswith(pf.ENABLE_UNCERTAIN), why
+        assert pfctl.held == ["222"]
+    finally:
+        os.chmod(d, 0o700)
+
+
+def test_only_the_token_column_of_a_references_row_is_read():
+    measured = "946      pfctl                        8485652482348616732      0 days 00:00:21"   # pfbootvm raw r2
+    long_name = "1203     Some Helper (with spaces) x  4242                     12 days 03:04:05"
+    rows = ["TOKENS:", "PID      Process Name                 TOKEN                    TIMESTAMP", measured, long_name]
+    assert [m.group(1) for m in map(pf._REF_ROW.fullmatch, rows) if m] == ["8485652482348616732", "4242"]
+
+
+def test_a_note_that_is_not_one_is_removed_and_one_with_no_boot_time_to_check_is_left(tmp_path):
+    kept = pf.PF_KEPT
+    kept.parent.mkdir(parents=True)
+    kept.write_text("222\n")                                        # f4's layout: no boot
+    assert pf._kept_held(kept, _Booted(["222"])) is None and not kept.exists()
+    kept.write_text("222 1792860815.967376\n")
+
+    def no_sysctl(argv, **kw):
+        return subprocess.CompletedProcess(argv, 1, "", "sysctl: unknown oid\n")
+    assert pf._kept_held(kept, no_sysctl) is None and kept.exists()  # which boot is unknown: neither used nor removed
+    assert pf._kept_held(kept, _Booted(["222"])) == "222"
