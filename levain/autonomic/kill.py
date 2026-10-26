@@ -167,7 +167,8 @@ def kill_purity_error(predicate: Any, *, _depth: int = 0) -> str | None:
     if isinstance(val, float) and not math.isfinite(val):
         return f"leaf op {op!r} 'value' must be finite (a non-finite threshold never matches)"
     if op in _NUMERIC_OPS and _as_number(val) is None:
-        return f"numeric op {op!r} requires a finite-numeric 'value', got {val!r}"
+        shown = "an integer past float range" if isinstance(val, int) and not isinstance(val, bool) else repr(val)
+        return f"numeric op {op!r} requires a finite-numeric 'value', got {shown}"
     return None
 
 
@@ -314,11 +315,17 @@ def _dig(container: Any, path: str) -> Any:
 
 def _as_number(x: Any) -> float | None:
     """Coerce to a FINITE float, or None. Bools are NOT numbers (no True==1). A numeric string
-    coerces. Mirrors ``events._as_number`` (confident-case parity)."""
+    coerces. Mirrors ``events._as_number`` (confident-case parity). An integer past float range
+    (JSON carries one; ``float()`` of it raises OverflowError) is None: not comparable here, so a
+    numeric leaf over it is UNKNOWN, never a raise out of the never-raises evaluator."""
     if isinstance(x, bool):
         return None
     if isinstance(x, (int, float)):
-        return float(x) if math.isfinite(x) else None
+        try:
+            f = float(x)
+        except OverflowError:
+            return None
+        return f if math.isfinite(f) else None
     if isinstance(x, str):
         try:
             f = float(x)

@@ -240,12 +240,11 @@ def test_the_guard_read_is_a_copy(world):
 
 # --- G1 L3 r1 (1026-21 RULINGS "G1 L3 r1 triage" G1-3, G1-6, G1-8) ------------------------------------------------
 
-_HUGE = 10 ** 400        # an integer JSON carries; the kill substrate's float() of it overflows
+_HUGE = 10 ** 400        # an integer JSON carries and a float cannot hold
 _GT5 = {"op": ">", "field": "n", "value": 5}
 
 
 @pytest.mark.parametrize("guard,names", [
-    ([entry(kill_predicate=_GT5, kill_drill=drill(n=_HUGE))], "guard[0].kill_drill"),
     ([entry(kill_predicate={"op": ">", "field": "n", "value": _HUGE}, kill_drill=drill(n=1))],
      "guard[0].kill_predicate"),
     ([entry(kill_predicate={"op": "in", "field": "n", "value": [_HUGE]}, kill_drill=drill(n=1))],
@@ -288,18 +287,26 @@ def test_a_drill_the_kill_cannot_decide_is_accepted_as_a_trip():
     assert guard_problem([entry(kill_predicate=_GT5, kill_drill=drill(n="abc"))]) is None
 
 
+def test_a_drill_past_float_range_is_unknown_so_it_is_accepted_as_a_trip():
+    """O-g1f1-1 (1026-22 RULINGS "G1"): a drill number past float range is one the kill cannot compare, so the kill
+    answers UNKNOWN (never an OverflowError) and the drill is accepted as a trip, as for any UNKNOWN drill."""
+    from levain.autonomic.kill import Kleene, kill_outcome, kill_trips
+    assert kill_outcome(_GT5, drill(n=_HUGE)) is Kleene.UNKNOWN and kill_trips(_GT5, drill(n=_HUGE))
+    assert guard_problem([entry(kill_predicate=_GT5, kill_drill=drill(n=_HUGE))]) is None
+
+
 def test_a_guard_the_gate_cannot_evaluate_is_refused_at_sign_and_by_the_policy_object(world):
     """G1-3 end to end: the append refuses it as the log's own refusal (no OverflowError out of the append), and a
     record carrying it is a ValueError from ``from_record`` (the replay source's one refusal)."""
     from levain.autonomic.coverage import GraduationPolicy
     from tests.autonomic_test_only_coverage import terms_incarnation
-    bad = [entry(kill_predicate=_GT5, kill_drill=drill(n=_HUGE))]
+    bad = [entry(kill_predicate={"op": ">", "field": "n", "value": _HUGE}, kill_drill=drill(n=1))]
     seq = world.state().seq
-    assert "is refused at sign: guard[0].kill_drill" in world.refused({"op": "create_grant",
+    assert "is refused at sign: guard[0].kill_predicate" in world.refused({"op": "create_grant",
                                                                        "grant": grad(world, guard=bad)})
     assert world.state().seq == seq
     record = {k: v for k, v in grad(world, guard=bad).items()}
-    with pytest.raises(ValueError, match=r"guard\[0\]\.kill_drill"):
+    with pytest.raises(ValueError, match=r"guard\[0\]\.kill_predicate"):
         GraduationPolicy.from_record(record, incarnation=terms_incarnation(record, 1), born=1, born_signer=None,
                                      current_signer=None)
 
