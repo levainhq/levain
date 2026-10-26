@@ -1124,3 +1124,16 @@ def test_h5_a_stale_failed_reply_is_tried_again_but_interrupts_no_new_turn(cs, c
     activate(svc, claude)
     _refused(svc, claude["launch"], crossing)
     assert [c.turn_id for c in s.interrupts] == [None]
+
+
+def test_i2_a_re_enable_makes_an_open_interrupt_naming_no_turn_stale(cs, claude, root):
+    svc, s, _ = up(cs, claude, root, session=Shaky("ambiguous", "confirmed"), probe=Probe(Verdict(True, "ok")))
+    crossing = _cross_with(event("error", "control:ctl-x", "00000100", turn_id=None, control_subtype="can_use_tool"))
+    _refused(svc, claude["launch"], crossing)         # its interrupt is ambiguous: the event stays open
+    assert [c.turn_id for c in s.interrupts] == [None] and latched(cs, claude["launch"])
+    s.show("turn_ended", "t-9", turn_id="t-9")        # a result line: probed live again, with no activation
+    svc.read_next(claude["launch"])
+    svc.reenable(claude["launch"], "cockpit:tab-a")
+    assert not latched(cs, claude["launch"])
+    _refused(svc, claude["launch"], crossing)         # the batch from before the re-enable, read again
+    assert [c.turn_id for c in s.interrupts] == [None]

@@ -1511,10 +1511,11 @@ class ChatService:
         self._seat_item = seat_item
         self._filed: dict[str, set[str]] = {}            # launch -> the seat items' dedupe keys filed while attached
         # launch -> the control events this session was sent something for, by the event's identity (its stream
-        # position and vendor id, which carries the request id) -> "done" (its reply was confirmed, or its interrupt
-        # confirmed or answered no_such_request: nothing is sent for it again), "open" (tried, not done: tried again) or
-        # "stale" (open when the launch was activated again: its reply is tried again, an interrupt naming no turn
-        # is not, since it would reach the new activation's turn). A committed batch's events are dropped from it
+        # position and vendor id, which carries the request id) -> "done" (its reply was confirmed, or its
+        # interrupt confirmed or answered no_such_request: nothing is sent for it again), "open" (tried, not done:
+        # tried again) or "stale" (open when the launch was activated or re-enabled: its reply is tried again, an
+        # interrupt naming no turn is not, since it would reach a turn started after that). A committed batch's
+        # events are dropped from it
         self._handled: dict[str, dict[tuple[str, str], str]] = {}
 
     def _launch_lock(self, launch_id: str) -> threading.Lock:
@@ -2075,19 +2076,26 @@ class ChatService:
             seq = record_check(conn, now, launch_id, kind, "activation", detail, evidence_sha256=digest,
                                spawn_nonce=spawn_nonce, canary_verdict_id=verdict_id,
                                containment_digest=containment_digest)
-        with self._guard:                             # a new activation: what was tried before it is stale
-            record = self._handled.get(launch_id, {})
-            record.update([(ident, "stale") for ident, state in record.items() if state == "open"])
+        self._stale_handled(launch_id)
         self._file_latches(launch_id)
         return seq
+
+    def _stale_handled(self, launch_id: str) -> None:
+        """After an activation or a re-enable: every control event still open in the handled record turns stale, so
+        an interrupt it asked for and that names no turn never reaches a turn started after it."""
+        with self._guard:
+            record = self._handled.get(launch_id, {})
+            record.update([(ident, "stale") for ident, state in record.items() if state == "open"])
 
     def reenable(self, launch_id: str, owner: str) -> int:
         """Your re-enable (§4.2): clears a latch only while the latest check read live again. ``owner`` is the
         authenticated client. The service never writes this row itself."""
         owner = chat_lease.check_owner(owner)
         with self._chat._write() as (conn, now):
-            return record_check(conn, now, launch_id, "reenabled", "operator", f"re-enabled by {owner}",
-                                by="operator")
+            seq = record_check(conn, now, launch_id, "reenabled", "operator", f"re-enabled by {owner}",
+                               by="operator")
+        self._stale_handled(launch_id)
+        return seq
 
     def composer(self, launch_id: str, owner: str) -> Composer:
         """:func:`composer_state` for ``owner``, read without the write lock."""
