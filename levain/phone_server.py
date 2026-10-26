@@ -1087,8 +1087,9 @@ class _PhoneServer(ThreadingHTTPServer):
                 keyfacts.attested(raw, line)
             except (PasskeyError, keyfacts.KeyFactsError) as exc:
                 raise PhoneError(422, "bad_passkey", str(exc)) from None
-            # re-encoded from the bytes checked, so the command carries nothing but base64url
-            attested = " --attested " + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+            # re-encoded from the bytes checked, so the command carries nothing but base64url; joined by "=" since
+            # the value starts with "-" for some rp_ids, which argparse would read as an option
+            attested = " --attested=" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
         # one file per passkey: two devices enrolled on one name must not overwrite each other's file
         name = f"passkey-{self.rp_id.split('.')[0]}-{hashlib.sha256(line.encode('ascii')).hexdigest()[:8]}.pub"
         roots = hook_roots(self.queue_dir)

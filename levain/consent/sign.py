@@ -120,6 +120,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -135,6 +136,8 @@ from typing import Any, Callable, Iterator
 from levain import unshowable
 from levain.idempotency import DEFAULT_WINDOW_S as _GATE_WINDOW_S
 from levain.sign_request_id import ID as _ID, request_id_ok
+
+_log = logging.getLogger(__name__)
 
 __all__ = ["BINDING_KEEP_S", "CHOICE_FORMAT", "CHOICE_MARK", "COMPOSE_BINDINGS", "COMPOSE_LIVE_MAX", "ERROR_WORDS",
            "LIST_MAX", "LOCK_WAIT_S", "MESSAGE_MAX", "OPTION_TEXT_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES",
@@ -878,24 +881,28 @@ class Signer:
             held = keyfacts.read(self._facts_root())
         except (keyfacts.KeyFactsError, SignRefused, OSError):
             return {}
+        except Exception as exc:   # noqa: BLE001 -- display only: it never costs the listing
+            _log.warning("the key facts were not read: %s: %s", type(exc).__name__, exc)
+            return {}
         return {fp: {"credential_id": held[fp].credential_id, "provider": keyfacts.provider_text(held[fp])}
                 for fp in signers if fp in held and held[fp].credential_id}
 
     def _learn(self, fingerprint: str, raw_id: Any) -> None:
         """Record ``raw_id``, reported with an assertion that verified under ``fingerprint``'s key, as that key's
         credential id. Display only, so anything that keeps it from being recorded is dropped: it never costs the
-        signature already recorded."""
-        import sqlite3
-
-        from levain.cockpit import keyfacts
-        from levain.cockpit.consent import utc_stamp
-
+        signature already recorded. A refused id is dropped silently; anything else is logged."""
         if raw_id is None:
             return
+        refused: "type[Exception] | tuple[()]" = ()
         try:
+            from levain.cockpit import keyfacts
+            refused = keyfacts.KeyFactsError
+            from levain.cockpit.consent import utc_stamp
+
             keyfacts.learn(self._facts_root(), fingerprint, keyfacts.raw_id_bytes(raw_id), now=utc_stamp(_now()))
-        except (keyfacts.KeyFactsError, SignRefused, OSError, sqlite3.Error):
-            return
+        except Exception as exc:   # noqa: BLE001 -- the answer is already signed and published
+            if not isinstance(exc, refused):
+                _log.warning("the credential id of %s was not recorded: %s: %s", fingerprint, type(exc).__name__, exc)
 
     def listing(self, signers: "list[str]") -> list[dict[str, Any]]:
         """The rows of :meth:`page`."""

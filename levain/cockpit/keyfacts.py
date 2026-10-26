@@ -9,10 +9,11 @@ it gives each key; nothing in that replay, the consent hook or a verifier reads 
 ``key_facts.db`` beside ``cockpit.db``, keyed by the key's fingerprint, so the log and the signers file the broker
 writes keep their exact format.
 
-A fact is written only beside a verified signature by that key's holder:
+A fact is written only by the operator's enrol command or beside a verified signature by that key's holder:
   - at enrolment (:func:`record_enrolment`), from the creation's authenticatorData (:func:`attested`), whose attested
     public key must be the enrolled key and whose rpIdHash must be its application, in the call that signed the
-    enrol link;
+    enrol link; or by a rerun of that enrol for the key already enrolled (:func:`repair_enrolment`), which fills a
+    missing row and never overwrites a different id;
   - on a passkey signature (:func:`learn`), the credential id the browser reported with an assertion that verified
     under that key, and never over a different id already held.
 A wrong fact can only make a page ask for the wrong credential (the browser then offers none) or name the wrong
@@ -28,14 +29,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 __all__ = ["DB_NAME", "PROVIDERS", "Attested", "KeyFacts", "KeyFactsError", "attested", "learn", "provider_name",
-           "provider_text", "raw_id_bytes", "read", "record_enrolment"]
+           "provider_text", "raw_id_bytes", "read", "record_enrolment", "repair_enrolment"]
 
 DB_NAME = "key_facts.db"
 _ZERO = "00000000-0000-0000-0000-000000000000"
 _AT = 0x40                          # authenticatorData flag: attested credential data present
+_ED = 0x80                          # authenticatorData flag: an extensions map follows the credential
 _HEAD = 32 + 1 + 4                  # rpIdHash || flags || signCount
 _CRED_MAX = 1023                    # WebAuthn's longest credential id
 _CRED_MIN = 16                      # WebAuthn asks an authenticator for an id of at least 16 bytes
+_CRED_TEXT_MAX = -(-_CRED_MAX // 3) * 4     # the longest id's base64url, padded: no longer text decodes to an id
 _FIELD_MAX = 16 * 1024              # a real creation's authenticatorData is a few hundred bytes
 
 # AAGUID -> provider, from github.com/passkeydeveloper/passkey-authenticator-aaguids (aaguid.json, read 2026-10-25).
@@ -89,6 +92,9 @@ def raw_id_bytes(text: object) -> bytes:
     """A browser's ``rawId`` (base64url) as bytes, refused unless it is a credential id's length."""
     from levain.consent.passkey import PasskeyError, b64url_decode
 
+    if isinstance(text, str) and len(text) > _CRED_TEXT_MAX:
+        raise KeyFactsError(f"raw_id is {len(text)} characters; a credential id's base64url is at most "
+                            f"{_CRED_TEXT_MAX}")
     try:
         raw = b64url_decode(text, "raw_id")
     except PasskeyError as exc:
@@ -106,7 +112,9 @@ def _aaguid_text(raw: bytes) -> str:
 def attested(authenticator_data: bytes, public_key: str) -> Attested:
     """The credential id and AAGUID in a passkey creation's ``authenticatorData``, refused unless it attests exactly
     ``public_key`` (an ``sk-ecdsa`` passkey line, :func:`levain.consent.passkey.public_key_line`): its rpIdHash is the
-    key's application, its attested-credential flag is set, and its COSE key holds the key's own x and y."""
+    key's application, its attested-credential flag is set, and the credential public key (decoded as one COSE map
+    at its offset, :func:`_cose_point`) is an ES256 P-256 key whose x and y are the enrolled point. Nothing after that
+    map is read: with the extensions flag clear, any byte there refuses the creation."""
     from levain.consent.passkey import PasskeyError, _key_parts
 
     if not isinstance(authenticator_data, bytes) or len(authenticator_data) > _FIELD_MAX:
@@ -136,11 +144,57 @@ def attested(authenticator_data: bytes, public_key: str) -> Attested:
     start = _HEAD + 18
     if not _CRED_MIN <= size <= _CRED_MAX or start + size > len(d):
         raise KeyFactsError("the attested credential id is not a credential id's length")
-    cose = d[start + size:]
-    # CBOR: map label -2 (0x21) and -3 (0x22), each a 32-byte string (0x58 0x20): the key's x and y
-    if b"\x21\x58\x20" + x not in cose or b"\x22\x58\x20" + y not in cose:
+    cx, cy, end = _cose_point(d, start + size)
+    if (cx, cy) != (x, y):
         raise KeyFactsError("the attested credential's public key is not the key being enrolled")
+    if not d[32] & _ED and end != len(d):
+        raise KeyFactsError("the attested authenticatorData has trailing bytes after its credential public key")
     return Attested(credential_id=d[start:start + size], aaguid=_aaguid_text(aaguid))
+
+
+def _cbor_head(d: bytes, i: int) -> tuple[int, int, int]:
+    """One CBOR item head at ``d[i]``: (major type, argument, offset after the head). Only the 0-, 1- and 2-byte
+    argument forms a COSE EC2 key uses are read."""
+    if i >= len(d):
+        raise KeyFactsError("the attested credential public key is cut short")
+    major, ai = d[i] >> 5, d[i] & 0x1F
+    if ai < 24:
+        return major, ai, i + 1
+    width = {24: 1, 25: 2}.get(ai)
+    if width is None or i + 1 + width > len(d):
+        raise KeyFactsError("the attested credential public key is not a COSE key this cockpit reads")
+    return major, int.from_bytes(d[i + 1:i + 1 + width], "big"), i + 1 + width
+
+
+def _cbor_value(d: bytes, i: int) -> tuple[int | bytes, int]:
+    """An integer (major 0 or 1) or a byte string (major 2) at ``d[i]``, and the offset after it."""
+    major, arg, i = _cbor_head(d, i)
+    if major == 0:
+        return arg, i
+    if major == 1:
+        return -1 - arg, i
+    if major == 2 and i + arg <= len(d):
+        return d[i:i + arg], i + arg
+    raise KeyFactsError("the attested credential public key is not a COSE key this cockpit reads")
+
+
+def _cose_point(d: bytes, i: int) -> tuple[bytes, bytes, int]:
+    """The x and y of the COSE_Key map at ``d[i]``, refused unless it is EC2 (kty 2), ES256 (alg -7) on P-256
+    (crv 1) with 32-byte coordinates; and the offset after the map. A label held twice is refused."""
+    major, count, i = _cbor_head(d, i)
+    if major != 5 or not 5 <= count <= 16:
+        raise KeyFactsError("the attested credential public key is not a COSE key map")
+    fields: dict[int, int | bytes] = {}
+    for _ in range(count):
+        label, i = _cbor_value(d, i)
+        if not isinstance(label, int) or label in fields:
+            raise KeyFactsError("the attested credential public key is not a COSE key this cockpit reads")
+        fields[label], i = _cbor_value(d, i)
+    x, y = fields.get(-2), fields.get(-3)
+    if (fields.get(1), fields.get(3), fields.get(-1)) != (2, -7, 1) or not (
+            isinstance(x, bytes) and isinstance(y, bytes) and len(x) == len(y) == 32):
+        raise KeyFactsError("the attested credential public key is not an ES256 P-256 key")
+    return x, y, i
 
 
 def provider_name(aaguid: str | None) -> str | None:
@@ -179,6 +233,30 @@ def record_enrolment(root: Path, fingerprint: str, facts: Attested, *, now: str)
         conn.close()
 
 
+def repair_enrolment(root: Path, fingerprint: str, facts: Attested, *, now: str) -> bool:
+    """Hold ``facts`` for an already-enrolled key when its row is missing, or holds the same credential id without
+    the enrolment's AAGUID (so rerunning an enrol whose facts were never written recovers them). True when it wrote.
+    KeyFactsError when another credential id is held: a held id is never overwritten."""
+    want = _b64u(facts.credential_id)
+    conn = _connect(root)
+    try:
+        with conn:
+            # the write lock before the read: an id learned meanwhile waits on it (or times out), never lands between
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT credential_id, aaguid, source FROM key_facts WHERE fingerprint = ?",
+                               (fingerprint,)).fetchone()
+            if row is not None and row[0] is not None and row[0] != want:
+                raise KeyFactsError(f"{fingerprint} already holds another credential id ({row[0]}); a held id is "
+                                    "never overwritten")
+            if row == (want, facts.aaguid, "enrol"):
+                return False
+            conn.execute("INSERT OR REPLACE INTO key_facts VALUES (?, ?, ?, 'enrol', ?)",
+                         (fingerprint, want, facts.aaguid, now))
+            return True
+    finally:
+        conn.close()
+
+
 def learn(root: Path, fingerprint: str, raw_id: bytes, *, now: str) -> bool:
     """Hold ``raw_id`` as ``fingerprint``'s credential id, reported with an assertion that verified under that key.
     Written only when the key has no id held; True when it wrote. An id that differs from the one held is kept out."""
@@ -197,7 +275,7 @@ def learn(root: Path, fingerprint: str, raw_id: bytes, *, now: str) -> bool:
 def read(root: Path) -> dict[str, KeyFacts]:
     """Every held fact by fingerprint; empty when nothing was ever recorded. KeyFactsError when the store is there
     and cannot be read."""
-    path = Path(root) / DB_NAME
+    path = Path(root).absolute() / DB_NAME      # as_uri() refuses a relative path
     if not path.exists():
         return {}
     try:
@@ -206,6 +284,6 @@ def read(root: Path) -> dict[str, KeyFacts]:
             rows = conn.execute("SELECT fingerprint, credential_id, aaguid, source, recorded_at FROM key_facts").fetchall()
         finally:
             conn.close()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, ValueError) as exc:
         raise KeyFactsError(f"the key facts in {path} cannot be read: {exc}") from None
     return {r[0]: KeyFacts(*r) for r in rows}

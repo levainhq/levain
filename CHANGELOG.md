@@ -32,6 +32,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   the credential, with when it resets and whether it leaves BYOK usage out or is used up; Anthropic's and OpenAI's are
   named as settings to make in the provider console. All provider reads together take at most ten seconds and never
   fail the check. It says so when `ssh-keygen` cannot run or no credential is set at all.
+- **The cockpit remembers which passkey belongs to each enrolled key.** The first time a passkey signs from the cockpit,
+  its credential id is recorded, so any browser (a new one, a re-paired one) asks for that passkey directly.
+  `levain cockpit enroll --attested` records a new passkey's credential id and its provider (iCloud Keychain, Google
+  Password Manager, and others), and `levain cockpit keys` shows them; rerunning it for a passkey already enrolled fills
+  in what was never written and never replaces an id already held. These are display facts only: what a key may sign is
+  still decided by its class alone.
 
 ### Fixed
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is

@@ -211,8 +211,11 @@ def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, signe
     and custody (nothing is signed); ``warning`` says the link committed but its anchor did not advance.
 
     ``attested`` is a passkey creation's authenticatorData: checked against the key before anything is signed
-    (:func:`levain.cockpit.keyfacts.attested`), and its credential id and AAGUID recorded beside the key only when
-    this call signed the enrol link. They are display facts outside the log, never authority."""
+    (:func:`levain.cockpit.keyfacts.attested`), and its credential id and AAGUID recorded beside the key. For a key
+    this call enrols they are written after the enrol link commits; for a key already enrolled the same way, nothing
+    is signed and they fill a missing row (:func:`levain.cockpit.keyfacts.repair_enrolment`), so rerunning an enrol
+    whose facts were never written recovers them, and ``warning`` names a different credential id already held.
+    They are display facts outside the log, never authority."""
     from levain.cockpit import keyfacts
 
     if key_class not in _CLASS_RANK:
@@ -239,7 +242,15 @@ def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, signe
                             "key for another class)")
         if old.custody != custody:
             raise KeyError_(f"{fp} is enrolled with custody {old.custody!r}; a key keeps its custody")
-        return _row(old), False, None
+        warning = None
+        if facts is not None:
+            try:
+                keyfacts.repair_enrolment(Path(data_root), fp, facts, now=_now(clock).isoformat())
+            except keyfacts.KeyFactsError as exc:
+                warning = f"its credential id and provider were kept as held: {exc}"
+            except (OSError, sqlite3.Error) as exc:
+                warning = f"its credential id and provider were not recorded: {exc}"
+        return _row(old), False, warning
     new = _append(db, {"op": "enrol", "fingerprint": fp, "public_key": public_key, "class": key_class,
                        "custody": custody}, signer_fp=signer_fp, sign=sign, clock=clock, ssh_keygen=ssh_keygen)
     key = new.key(fp)
