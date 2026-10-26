@@ -307,7 +307,8 @@ RELIED_NOTIFICATIONS: Mapping[str, frozenset[str]] = {
         "item/autoApprovalReview/completed", "error")),
 }
 
-# rev 1 §3.2's list: the streaming deltas and the token / rate-limit / startup-status updates no event is made from
+# exactly the ten methods of CH-D3 §3.2: the streaming deltas and the token / rate-limit / startup-status updates no
+# event is made from (a test holds the list disjoint from RELIED_NOTIFICATIONS)
 OPT_OUT_NOTIFICATIONS: tuple[str, ...] = (
     "item/agentMessage/delta", "item/reasoning/textDelta", "item/reasoning/summaryTextDelta",
     "item/reasoning/summaryPartAdded", "item/commandExecution/outputDelta", "item/fileChange/outputDelta",

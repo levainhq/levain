@@ -534,6 +534,16 @@ def test_the_relied_on_notifications_are_marked_and_exclude_the_experimental_one
             "item/fileChange/patchUpdated", "thread/status/changed", "thread/closed", "error"} <= relied
 
 
+def test_the_opt_out_list_is_exactly_the_ten_and_disjoint_from_the_relied_on_list():
+    assert sorted(cw.OPT_OUT_NOTIFICATIONS) == sorted((
+        "item/agentMessage/delta", "item/reasoning/textDelta", "item/reasoning/summaryTextDelta",
+        "item/reasoning/summaryPartAdded", "item/commandExecution/outputDelta", "item/fileChange/outputDelta",
+        "command/exec/outputDelta", "thread/tokenUsage/updated", "account/rateLimits/updated",
+        "mcpServer/startupStatus/updated"))
+    assert len(set(cw.OPT_OUT_NOTIFICATIONS)) == 10
+    assert not set(cw.OPT_OUT_NOTIFICATIONS) & cw.RELIED_NOTIFICATIONS[cw.PINNED_VERSION]
+
+
 def test_the_pinned_surface_matches_the_installed_codex_schema(tmp_path):
     codex = shutil.which("codex")
     if codex is None:
