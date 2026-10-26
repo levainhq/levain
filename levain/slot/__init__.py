@@ -8,8 +8,8 @@ with no root, and a refusal is raised while planning, before the first step. The
 from __future__ import annotations
 
 
-#: The elevator by absolute path, from its one home (:data:`levain.hands_live.SUDO`, stdlib only and 3.9-valid, so
-#: root's ``/usr/bin/python3`` and every importer reach it through this package).
+#: The elevator by absolute path, re-exported from its one home, ``levain.hands_live.SUDO``. The rule: this package
+#: ``__init__`` reaches nothing but that module, which must stay importable by root's ``/usr/bin/python3`` (3.9).
 from levain.hands_live import SUDO  # noqa: E402,F401
 
 #: CONTRACT §3.3: a ``levain-control/1`` frame's cap, the canonical JSON bytes after the 4-byte length

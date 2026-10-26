@@ -13,7 +13,7 @@ Adding a stdlib module to the package means adding it here, on purpose, in revie
 Two modules outside the package are allowed, by name (``ALLOWED_OUTSIDE``): ``levain.trust_anchor``, the
 trust-anchor rule ``confirm`` uses, which root's route-map check runs without importing this package, and
 ``levain.hands_live``, the hands user's liveness check and lock, which ws-git and the automation executor share.
-Each is held to more than the package is: it may import ``ALLOWED_STDLIB`` roots and nothing of ``levain``.
+Each is held to more than the package is: it may import ``ALLOWED_OUTSIDE_STDLIB`` roots and nothing of ``levain``.
 
 Also flagged: the builtin loader names (``__import__``, ``__builtins__``, ``exec``, ``eval``, a bare
 ``compile``) and any attribute chain off the name ``levain`` other than ``levain.autonomic`` (an
@@ -41,10 +41,12 @@ PKG = ROOT / "levain" / "autonomic"
 
 ALLOWED_STDLIB = frozenset({
     "__future__", "collections", "contextlib", "copy", "dataclasses", "datetime", "enum", "errno", "fcntl",
-    "grp", "hashlib", "json", "logging", "math", "os", "pathlib", "platform", "pwd", "re", "shutil", "sqlite3",
-    "stat", "subprocess", "tempfile", "threading", "time", "types",
-    "typing", "unicodedata",
+    "grp", "hashlib", "json", "logging", "math", "os", "pathlib", "platform", "pwd", "re", "sqlite3", "stat",
+    "subprocess", "tempfile", "threading", "types", "typing", "unicodedata",
 })
+# What the modules named in ALLOWED_OUTSIDE may import: kept apart so a stdlib module they need never
+# widens the closed package's own list above.
+ALLOWED_OUTSIDE_STDLIB = ALLOWED_STDLIB | frozenset({"shutil", "time"})
 ALLOWED_OUTSIDE = frozenset({"levain.trust_anchor", "levain.hands_live"})
 _LOADER_NAMES = frozenset({"__import__", "__builtins__", "exec", "eval", "compile"})
 
@@ -120,8 +122,8 @@ def test_each_allowed_outside_module_imports_only_the_stdlib_allowlist():
     for name in sorted(ALLOWED_OUTSIDE):
         tree = ast.parse((ROOT / (name.replace(".", "/") + ".py")).read_text(encoding="utf-8"))
         bad = [n for n in ast.walk(tree)
-               if isinstance(n, ast.ImportFrom) and (n.level or (n.module or "").split(".")[0] not in ALLOWED_STDLIB)
-               or isinstance(n, ast.Import) and any(a.name.split(".")[0] not in ALLOWED_STDLIB for a in n.names)
+               if isinstance(n, ast.ImportFrom) and (n.level or (n.module or "").split(".")[0] not in ALLOWED_OUTSIDE_STDLIB)
+               or isinstance(n, ast.Import) and any(a.name.split(".")[0] not in ALLOWED_OUTSIDE_STDLIB for a in n.names)
                or isinstance(n, ast.Name) and n.id in _LOADER_NAMES]
         assert bad == [], (name, [ast.dump(n) for n in bad])
 
