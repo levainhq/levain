@@ -290,10 +290,29 @@ def test_the_version_binds_every_field_the_sheet_shows_as_decided() -> None:
     """L3 r1 C5: the sheet's version changes when any field it shows as the thing decided changes."""
     from levain.web_server import ConsentSheet
 
+    allow = {"key": "allow", "text": "Allow", "line": "answer allow: request r1"}
+    deny = {"key": "deny", "text": "Deny", "line": "answer deny: request r1"}
     row = {"id": "r1", "state": "pending", "title": "Write · T2", "requester": "claude_code", "message": "m",
-           "expires_at": "2026-10-26T00:00:00Z", "options": [{"key": "allow"}, {"key": "deny"}]}
+           "expires_at": "2026-10-26T00:00:00Z", "options": [allow, deny]}
     base = ConsentSheet.version(row, "d")
     for key, value in (("title", "Bash · T2"), ("requester", "codex"), ("message", "m2"), ("expires_at", None),
-                       ("state", "undecided"), ("options", [{"key": "deny"}]), ("note", "laptop only")):
+                       ("state", "undecided"), ("options", [deny]), ("note", "laptop only")):
         assert ConsentSheet.version({**row, key: value}, "d") != base, key
     assert ConsentSheet.version(row, "d2") != base
+
+
+def test_the_version_binds_each_options_shown_words_and_signed_line() -> None:
+    """L3 r2 C5: an option whose shown text or exact signed line changes under the same key reads as changed, so an
+    open card's link never preselects words it did not show."""
+    from levain.web_server import ConsentSheet
+
+    allow = {"key": "allow", "text": "Allow", "line": "answer allow: request r1"}
+    deny = {"key": "deny", "text": "Deny", "line": "answer deny: request r1"}
+    row = {"id": "r1", "state": "pending", "title": "Write · T2", "requester": "claude_code", "message": "m",
+           "expires_at": "2026-10-26T00:00:00Z", "options": [allow, deny]}
+    base = ConsentSheet.version(row, "d")
+    for field, value in (("text", "Allow always"), ("line", "rule allow: request r1")):
+        assert ConsentSheet.version({**row, "options": [{**allow, field: value}, deny]}, "d") != base, field
+    # the same content reads as the same version, whatever order a dict's keys were built in
+    swapped = [{"line": o["line"], "text": o["text"], "key": o["key"]} for o in row["options"]]
+    assert ConsentSheet.version({**row, "options": swapped}, "d") == base

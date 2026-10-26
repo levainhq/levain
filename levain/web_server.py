@@ -424,11 +424,12 @@ class ConsentSheet:
     @staticmethod
     def version(row: "dict[str, Any]", digest: str) -> str:
         """The version a sheet row and a card's link name one request by: over the request's digest and every field
-        the row shows as the thing decided (its state, title, requester, message, hold and the options offered), so a
-        request whose shown words or offered answers changed reads as changed."""
+        the row shows as the thing decided (its state, title, requester, message, hold and each option offered whole:
+        its key, its shown text and the exact line it signs), so a request whose shown words, offered answers or signed
+        lines changed reads as changed."""
         shown = [row["id"], digest, row["state"], row["title"], row["requester"], row["message"], row["expires_at"],
-                 [o["key"] for o in row["options"]], row.get("refused"), row.get("note")]
-        return hashlib.sha256(json.dumps(shown).encode()).hexdigest()
+                 [[o["key"], o["text"], o["line"]] for o in row["options"]], row.get("refused"), row.get("note")]
+        return hashlib.sha256(json.dumps(shown, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
     def row(self, request_id: str) -> "dict[str, Any] | None":
         """The sheet's row for one request that is open to a passkey here (pending: an answer; undecided: a ruling),
