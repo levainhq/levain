@@ -742,3 +742,28 @@ def test_front_entry_point_refuses_to_serve_without_keys_and_go(tmp_path, monkey
         return "returned"
 
     assert asyncio.run(run()) == "refused"
+
+
+def test_refused_host_fields_uses_the_policy_grammar():
+    """WF-1a L3 r1 W3: the logged host is the requested text only when it passes the policy's one host grammar (the
+    grammar the front's CONNECT list was parsed with) or is an address literal spelled canonically; a numeric-dotted
+    or legacy-IPv4 spelling, a non-canonical address and a non-bytes target are ``host_invalid``."""
+    from levain.broker import front as F
+    from levain.broker import policy as P
+
+    assert not hasattr(F, "_HOSTNAME")
+    for h in ("evil.example", "api.github.com"):
+        assert P.is_host_name(h) and P.hosts("r", [h]) == [h]
+    for h in ("127.1", "0x7f.0x1", "foo.123", "Evil.example", "a", "", None, b"x.example", "x.example."):
+        assert not P.is_host_name(h), h
+    for target, want in ((b"127.1:443", {"host_invalid": True, "host_len": 5}),
+                         (b"0x7f.0x1:443", {"host_invalid": True, "host_len": 8}),
+                         (b"foo.123:443", {"host_invalid": True, "host_len": 7}),
+                         (b"[0:0::1]:443", {"host_invalid": True, "host_len": 6}),
+                         (b"[::FFFF:1.2.3.4]:443", {"host_invalid": True, "host_len": 14}),
+                         (b"EVIL.Example:443", {"host": "evil.example"}),
+                         (b"[::1]:443", {"host": "::1"}),
+                         (b"93.184.215.14:443", {"host": "93.184.215.14"})):
+        assert F.refused_host_fields(target) == want, target
+    for target in ("evil.example:443", 443, None, bytearray(b"evil.example:443")):
+        assert F.refused_host_fields(target) == {"host_invalid": True}, target
