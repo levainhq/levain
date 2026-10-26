@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from tests._h4 import h4_home
 
 cryptography = pytest.importorskip("cryptography")
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
@@ -160,7 +161,7 @@ def consent_verdict(tmp: Path, custody: str, **sig) -> str | None:
     pk = WebAuthnKey()
     lg = _log(tmp, pk, "display-phone", custody)
     clock = Clock(NOW)
-    q = ConsentQueue(tmp / "home" / "consent", authority=lg.source, clock=clock)
+    q = ConsentQueue(tmp / "home" / "consent", authority=lg.source, clock=clock, home=h4_home())
     request = FakeAgent(q).ask()
     payload = answer_payload(queue_id=q.queue_id, request=request, decision="allow", signer_fp=pk.fp,
                              signed_at=utc_stamp(clock()), receipts_head=receipts_head(q))

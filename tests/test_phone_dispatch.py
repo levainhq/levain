@@ -14,6 +14,7 @@ from levain.dispatch.jobs import DB_NAME, JobStore
 from levain.phone_server import make_phone_server
 from tests.test_dispatch_phone import RP, file_job, phone_for, refused, repo, world  # noqa: F401, F811  (fixtures)
 from tests.test_phone_server import _TOK, _call
+from tests._h4 import h4_home
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -121,7 +122,7 @@ def test_a_dispatch_signature_is_never_a_consent_answer_and_a_consent_answer_nev
     job = file_job(world)
     dp = phone_for(world, page_origin=None)
     key = world["phone"]
-    queue = ConsentQueue(world["qdir"], authority=world["source"])
+    queue = ConsentQueue(world["qdir"], authority=world["source"], home=h4_home())
     rid = queue.file(agent="claude_code", agent_session_id="s", tool_name="Write",
                      tool_input={"file_path": "/tmp/x.txt", "content": "hi"}, cwd="/w", hold=timedelta(minutes=5),
                      tier="T2", event_id="dispatch-phone-1").id
@@ -148,7 +149,7 @@ def test_a_dispatch_signature_is_never_a_consent_answer_and_a_consent_answer_nev
 
 
 def test_a_dispatch_dir_that_is_a_file_leaves_the_consent_listing_intact(world, tmp_path: Path) -> None:
-    queue = ConsentQueue(world["qdir"], authority=world["source"])
+    queue = ConsentQueue(world["qdir"], authority=world["source"], home=h4_home())
     rid = queue.file(agent="claude_code", agent_session_id="s", tool_name="Write",
                      tool_input={"file_path": "/tmp/x.txt", "content": "hi"}, cwd="/w", hold=timedelta(minutes=5),
                      tier="T2", event_id="dispatch-flat-1").id
@@ -171,7 +172,7 @@ def test_a_faulting_keys_source_keeps_the_consent_cards_and_lists_the_jobs_unsig
     import levain.consent.answering as answering
 
     job = file_job(world)
-    queue = ConsentQueue(world["qdir"], authority=world["source"])
+    queue = ConsentQueue(world["qdir"], authority=world["source"], home=h4_home())
     rid = queue.file(agent="claude_code", agent_session_id="s", tool_name="Write",
                      tool_input={"file_path": "/tmp/x.txt", "content": "hi"}, cwd="/w", hold=timedelta(minutes=5),
                      tier="T2", event_id="dispatch-keys-fault-1").id

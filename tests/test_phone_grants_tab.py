@@ -28,6 +28,7 @@ from levain.consent.queue import ConsentQueue, authority_source
 from levain.phone_server import make_phone_server
 from tests.test_cockpit_flip_parity import _drive as _page_drive, needs_browser
 from tests.test_grant_phone import ORIGIN, RP, _now, world  # noqa: F401  (world is a fixture)
+from tests._h4 import h4_home
 
 HERE = Path(__file__).resolve().parent
 PHONE_JS = HERE.parent / "levain" / "templates" / "web" / "phone.js"
@@ -187,7 +188,7 @@ def _grant(world, gid: str, tool: str) -> None:
 def _answered(world, tool: str, name: str, outcome: str) -> str:
     """One call a standing grant answered at the gate, then ran (``accepted``) or was refused after the allow."""
     source = authority_source(world.root / "cockpit.db", anchor=auth.anchor_path(world.root))
-    queue = ConsentQueue(world.qdir, authority=source)
+    queue = ConsentQueue(world.qdir, authority=source, home=h4_home())
     tool_input = {"file_path": str(world.ws / name), "content": "x"}
     r = queue.file(agent="claude_code", agent_session_id="s1", tool_name=tool, tool_input=tool_input, cwd=str(world.ws),
                    hold=timedelta(minutes=5))

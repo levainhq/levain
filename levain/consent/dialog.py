@@ -57,7 +57,7 @@ def observe(agent: str, event: str, payload: Any, queue_dir: Path | None = None)
         if not (qdir / DB_NAME).is_file():
             return None
         # no authority: recording an outcome verifies nothing and decides nothing
-        queue = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
+        queue = ConsentQueue(qdir, home=Path.home(), authority=authority_source(qdir, anchor=None))
         if event in TOOL_EVENTS:
             name = payload.get("tool_name")
             if not isinstance(name, str) or not name:

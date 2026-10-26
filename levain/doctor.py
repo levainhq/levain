@@ -3229,7 +3229,7 @@ def _hooks_off_files(install: Path, adapter: str, *, home: Path | None = None,
     if adapter == "claude-code":
         from levain.consent.adapters.claude_code import _settings_files
 
-        files = [p for kind, p in _settings_files(str(install), home, None) if kind == "json"]
+        files = [p for kind, p in _settings_files(str(install), home, None, environ=os.environ) if kind == "json"]
         for f in dict.fromkeys(files):
             try:
                 data = json.loads(f.read_text())

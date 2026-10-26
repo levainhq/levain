@@ -43,6 +43,7 @@ from levain.qbroker.store import QueueStore
 from tests.test_consent_queue import Key, Log
 from tests.test_dispatch_contract import POLICY, git, make_repo, registry, submission, template
 from tests.test_qbroker import bound_gid, write_answer
+from tests._h4 import h4_env
 
 ME = os.getuid()
 CAP = "cap-w2c3"
@@ -187,7 +188,7 @@ def granted(q, rid):
 
 
 def gate(adapter, event, s, **kw):
-    kw = {"home": s["home"], "expected_uid": ME, "hold": HOLD, **kw}
+    kw = {"home": s["home"], "environ": h4_env(), "expected_uid": ME, "hold": HOLD, **kw}
     if adapter == "codex":
         return cx.slot_gate(event, codex_dir=s["home"] / ".codex", **kw)
     return cc.slot_gate(event, **kw)

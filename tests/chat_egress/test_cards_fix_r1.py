@@ -40,6 +40,7 @@ from levain.coordinator.lease import LAUNCH_KINDS, _launch_event
 from levain.coordinator.store import CoordStore
 from tests.chat_egress.test_classify import frame, route_for
 from tests.chat_egress.test_records import GET, make_launch
+from tests._h4 import h4_home
 
 JS = Path(cards.__file__).parents[1] / "templates" / "web" / "dashboard_core.js"
 LAUNCH = "ln-" + "0" * 32
@@ -54,7 +55,7 @@ def _card(fr=None, **kw) -> dict:
 
 def _queue(d: Path) -> ConsentQueue:
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return ConsentQueue(d, authority=authority_source(d, anchor=None))
+    return ConsentQueue(d, authority=authority_source(d, anchor=None), home=h4_home())
 
 
 def _words() -> dict[str, str]:

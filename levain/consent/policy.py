@@ -269,14 +269,17 @@ def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
-def _resolved(target: Any, cwd: str) -> str | None:
-    """``target`` as a path (``~`` expanded, joined to ``cwd`` when relative), only when the filesystem resolves
+def _resolved(target: Any, cwd: str, *, home: str | os.PathLike[str]) -> str | None:
+    """``target`` as a path (``~`` expanded under ``home``, joined to ``cwd`` when relative), only when the filesystem
+    resolves
     it to exactly its lexical normal form: no existing component on it is a symlink. A ``..`` component in the
     target as given matches nothing, link or no link. ``None`` for anything else, or anything that is not a usable
     path."""
     if not isinstance(target, str) or not target or "\x00" in target or ".." in target.split(os.sep):
         return None
-    raw = os.path.expanduser(target) if target == "~" or target.startswith("~/") else target
+    # os.path.expanduser's own join, with ``home`` for $HOME
+    raw = ((os.fspath(home).rstrip(os.sep) + target[1:]) or os.sep) if target == "~" or target.startswith("~/") \
+        else target
     joined = raw if os.path.isabs(raw) else os.path.join(cwd, raw)
     try:
         lexical = os.path.normpath(joined)
@@ -316,9 +319,11 @@ def _declared_targets(declared: Mapping[str, str], tool_input: Any) -> list[Any]
 
 
 def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, tool_input: Any, posture: Any,
-                  now: datetime) -> str | None:
+                  now: datetime, home: str | os.PathLike[str]) -> str | None:
     """Why ``grant`` does not answer ``request`` at ``now`` for ``tool_input`` under ``posture``; ``None`` when
-    every criterion holds (module docstring). ``tool_input`` must be the input the request's digest was computed
+    every criterion holds (module docstring). ``home`` is this machine's home directory for the home check and a
+    ``~`` target (the queue's, :class:`ConsentQueue`). ``tool_input`` must be the input the request's digest was
+    computed
     from: anything else is refused here, so what was checked is what is answered."""
     if not consent_grant(grant):
         return "not a consent grant"   # an egress grant, or one of a kind this levain does not know
@@ -360,7 +365,7 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
         return "the workspace cannot be resolved"
     # the signed string is the directory's real path (checked at append); a rename and a symlink in its place, or
     # a log written where home is elsewhere, must not widen it
-    if root != workspace or not os.path.isdir(root) or consent_root_problem(root) is not None:
+    if root != workspace or not os.path.isdir(root) or consent_root_problem(root, home=home) is not None:
         return "the workspace is not, here and now, the directory the grant was signed for"
     if not _within(cwd, root):
         return "the working directory is outside the grant's workspace"
@@ -369,7 +374,7 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
         paths = (paths or []) + declared_paths
     if paths is not None:
         for target in paths:
-            where = _resolved(target, request.cwd)
+            where = _resolved(target, request.cwd, home=home)
             if where is None or not _within(where, root):
                 return "a target is outside the grant's workspace"
     return None

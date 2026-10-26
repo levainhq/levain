@@ -14,6 +14,7 @@ from levain.consent.listing import read_listing
 from levain.consent.queue import ConsentQueue, authority_source
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_sessions import _put
+from tests._h4 import h4_home
 
 SID, SID_OTHER = "zq-q8-session-cc-7701", "zq-q8-session-cc-7702"
 CWD = "/zq/q8 full/it's-here"
@@ -42,7 +43,7 @@ def _queue(tmp_path: Path, monkeypatch) -> ConsentQueue:
     home = tmp_path / "levain_home"
     monkeypatch.setenv("LEVAIN_HOME", str(home))
     (home / "consent").mkdir(parents=True, mode=0o700)
-    return ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None))
+    return ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
 
 
 # ---- the reader -------------------------------------------------------------------------------------------------

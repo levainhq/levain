@@ -23,6 +23,7 @@ from levain.cockpit.consent import utc_stamp
 from levain.cockpit.firejournal import CockpitDB
 from levain.consent import policy
 from levain.consent.queue import ConsentQueue, authority_source
+from tests._h4 import h4_home
 
 T = "mcp__fsw__write_file"
 
@@ -58,7 +59,7 @@ class Scratch:
         qdir = tmp_path / "home" / "consent"
         qdir.mkdir(parents=True, mode=0o700)
         self.queue = ConsentQueue(qdir, authority=authority_source(self.root / "cockpit.db",
-                                                                    anchor=anchor_path(self.root)))
+                                                                    anchor=anchor_path(self.root)), home=h4_home())
 
     def sign(self, m: bytes) -> str:
         return subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", str(self.key), "-n", auth.NAMESPACE],

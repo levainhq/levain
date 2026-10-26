@@ -21,6 +21,7 @@ from levain.coordinator.cli import run_coord
 from tests.test_consent_queue import Log, keys  # noqa: F401 - fixtures
 from tests.test_coordinator_envelope import ctx, repo, snapshot  # noqa: F401 - fixtures
 from tests.test_coordinator_first_reader import SEAT, Band
+from tests._h4 import h4_home
 
 HOLD = timedelta(hours=3)
 
@@ -35,7 +36,7 @@ def cq(band, keys, tmp_path):  # noqa: F811
     (tmp_path / "auth").mkdir()
     lg = Log(tmp_path / "auth", keys)
     lg.enrol("laptop", "laptop-presence")
-    return ConsentQueue(band.store.directory, authority=lg.source)
+    return ConsentQueue(band.store.directory, authority=lg.source, home=h4_home())
 
 
 def _file(cq, band, *, session=SEAT, command="git push origin main"):

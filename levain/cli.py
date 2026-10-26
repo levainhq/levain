@@ -2732,7 +2732,7 @@ def _reading_queue(qdir: Path) -> object:
     directory, which sqlite cannot open as a log), so nothing read through it can ever verify."""
     from levain.consent.queue import ConsentQueue, authority_source
 
-    return ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
+    return ConsentQueue(qdir, home=Path.home(), authority=authority_source(qdir, anchor=None))
 
 
 # What the terminal must never receive raw from an agent-sourced string: every character levain.unshowable calls
@@ -2838,7 +2838,8 @@ def _cmd_consent_answer(args: argparse.Namespace) -> int:
             raise AnswerRefused(f"request {request.id} is already {state}")
         refuse_cut_display(request, "from the terminal")
         root = _answer_root(args, qdir, request)
-        queue = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
+        queue = ConsentQueue(qdir, home=Path.home(),
+                             authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
         signer_fp, sign = ssh_signer(args.signing_key, namespace=ANSWER_NAMESPACE)
         # the queue's own record: it carries the head of its receipt log (Q11), which the answer then signs
         payload = queue.answer_payload(request.id, args.decision, signer_fp)
@@ -2979,7 +2980,8 @@ def _delivery_queue(qdir: Path, request: object) -> object:
     from levain.consent.queue import ConsentQueue, authority_source
 
     root = answer_root(qdir, request)
-    return ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
+    return ConsentQueue(qdir, home=Path.home(),
+                        authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
 
 
 def _cmd_consent_rule(args: argparse.Namespace) -> int:
@@ -3010,7 +3012,8 @@ def _cmd_consent_rule(args: argparse.Namespace) -> int:
         if args.decision == "allow":
             refuse_cut_display(request, "from the terminal")   # a deny is signed even over a cut display
         root = _answer_root(args, qdir, request)
-        queue = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
+        queue = ConsentQueue(qdir, home=Path.home(),
+                             authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
         signer_fp, sign = ssh_signer(args.signing_key, namespace=RULING_NAMESPACE)
         payload = queue.ruling_payload(request.id, args.decision, signer_fp)
         print(_term_safe(f"ruling on gap {gap_label(gapped.gap, request.agent_session_id)}: "

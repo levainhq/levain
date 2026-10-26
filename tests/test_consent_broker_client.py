@@ -26,6 +26,7 @@ from levain.qbroker.server import SlotListener
 from levain.qbroker.signers import SignersSource
 from levain.qbroker.store import QueueStore
 from tests.test_qbroker import FakeResolver, Key, bound_gid, write_answer, write_signers
+from tests._h4 import h4_env
 
 CAP = "cap-slot-1"
 SESSION = Resolved(session="slot1-session", kind="interactive", run=None)
@@ -126,7 +127,7 @@ def event_of(adapter, ws, **kw):
 
 
 def kw_of(adapter, tmp_path):
-    kw = {"home": tmp_path / "home", "expected_uid": ME}
+    kw = {"home": tmp_path / "home", "environ": h4_env(), "expected_uid": ME}
     return kw if adapter == "cc" else {**kw, "codex_dir": tmp_path / "home" / ".codex"}
 
 
@@ -212,7 +213,7 @@ def run_main(module, event):
 
 @pytest.mark.parametrize("module", [cc, cx])
 def test_main_in_a_slot_opens_no_local_queue(module, L, slot, ws, tmp_path, monkeypatch):
-    monkeypatch.setattr(module, "_queue_for", lambda *a: pytest.fail("a local ConsentQueue in a slot"))
+    monkeypatch.setattr(module, "_queue_for", lambda *a, **k: pytest.fail("a local ConsentQueue in a slot"))
     # every call asks GATE (F10 S2b-2): the hook finds no broker account on a test machine and denies, with no local
     # queue on the way
     ev = cc_event(ws, tool_name="Bash", tool_input={"command": "ls"}) if module is cc else cx_event(ws, gated=False)
@@ -224,7 +225,7 @@ def test_main_in_a_slot_opens_no_local_queue(module, L, slot, ws, tmp_path, monk
 
 @pytest.mark.parametrize("module", [cc, cx])
 def test_a_permission_request_in_a_slot_gets_no_decision(module, L, slot, ws, monkeypatch):
-    monkeypatch.setattr(module, "_queue_for", lambda *a: pytest.fail("a local ConsentQueue in a slot"))
+    monkeypatch.setattr(module, "_queue_for", lambda *a, **k: pytest.fail("a local ConsentQueue in a slot"))
     ev = cc_event(ws) if module is cc else cx_event(ws)
     ev["hook_event_name"] = "PermissionRequest"
     assert run_main(module, ev) == ""
@@ -283,7 +284,7 @@ def test_a_slot_with_no_cap_denies(adapter, L, slot, ws, tmp_path, monkeypatch):
 
 def test_a_cap_the_broker_does_not_know_is_refused_and_denies(L, slot, ws, tmp_path):
     out = cc.slot_gate(cc_event(ws), hold=HOLD, home=tmp_path / "home",
-                       client=BrokerClient(str(slot.path), "cap-unknown-to-control", expected_uid=ME))
+                       client=BrokerClient(str(slot.path), "cap-unknown-to-control", expected_uid=ME), environ=h4_env())
     assert out["continue"] is False and "the gate could not run" in out["hookSpecificOutput"][
         "permissionDecisionReason"]
 

@@ -7,6 +7,7 @@ from levain.consent.adapters import claude_code
 from levain.webpush import held, presence, sender
 from levain.webpush.presence import ACTIVE_WINDOW_SECS, set_word
 from levain.webpush.store import PushStore
+from tests._h4 import h4_env, h4_home
 
 NOW = 1_000_000.0
 ACTIVE, INACTIVE = 10.0, ACTIVE_WINDOW_SECS + 1.0
@@ -307,15 +308,15 @@ def test_h3_the_claude_code_gate_flushes_on_a_limit_return_and_when_repings_rais
     monkeypatch.setattr(cc, "_limits", lambda *a, **kw: {"limited": True})
     ev = {"hook_event_name": cc.GATE_EVENT, "tool_name": "Write", "tool_input": {"file_path": "/w/x"}, "cwd": "/w",
           "session_id": "s1"}
-    assert cc.gate(ev, queue, cc.AdapterSettings(), home=Path("/home/u")) == {"limited": True}
+    assert cc.gate(ev, queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env()) == {"limited": True}
     assert calls == [queue.directory]
     malformed = {"hook_event_name": cc.GATE_EVENT, "tool_name": "Write", "tool_input": {}, "cwd": "/w"}
-    cc.gate(malformed, queue, cc.AdapterSettings(), home=Path("/home/u"))
+    cc.gate(malformed, queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     assert len(calls) == 2
     monkeypatch.setattr(cc, "_limits", lambda *a, **kw: None)
     monkeypatch.setattr(cc, "send_repings", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("x")))
     try:
-        cc.gate(ev, queue, cc.AdapterSettings(), home=Path("/home/u"))
+        cc.gate(ev, queue, cc.AdapterSettings(), home=Path("/home/u"), environ=h4_env())
     except Exception:
         pass
     assert len(calls) == 3
@@ -328,15 +329,15 @@ def test_h3_the_codex_gate_flushes_for_a_halted_session_and_a_limit_return(tmp_p
     from levain.consent import ConsentQueue, authority_source
 
     calls = _ct(monkeypatch, cx)
-    queue = ConsentQueue(tmp_path / "q", authority=authority_source(tmp_path / "q", anchor=None))
+    queue = ConsentQueue(tmp_path / "q", authority=authority_source(tmp_path / "q", anchor=None), home=h4_home())
     ev = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": "/work/p",
           "session_id": "s1", "turn_id": "t1", "tool_use_id": "c1"}
     monkeypatch.setattr(queue, "is_halted", lambda agent, session: 1)
-    cx.gate(ev, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    cx.gate(ev, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"), environ=h4_env())
     assert calls == [queue.directory]
     monkeypatch.setattr(queue, "is_halted", lambda agent, session: None)
     monkeypatch.setattr(cx, "_limits", lambda *a, **kw: {"limited": True})
-    cx.gate(ev, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    cx.gate(ev, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"), environ=h4_env())
     assert len(calls) == 2
 
 

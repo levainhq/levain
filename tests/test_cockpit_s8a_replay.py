@@ -23,6 +23,7 @@ from levain.consent.queue import ConsentQueue, authority_source
 from levain.consent.questions import QuestionStore
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_topology import _Reader
+from tests._h4 import h4_home
 
 NOW = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 B = NOW - timedelta(hours=5)          # "10:00": the day's base in these tests
@@ -83,7 +84,7 @@ def _rig(tmp_path: Path, monkeypatch) -> tuple[Any, Path, Path, Path]:
     _record(root, "s-late", str(work / "late"), _m(100), NOW - timedelta(minutes=2))
     _events(root, "s-late", [("prompt", _m(101), "go")])
     # a consent request session a waits on: filed 11:00, its hold ending 12:00 (expired, so decided then)
-    q = ConsentQueue(cdir, authority=authority_source(cdir, anchor=None), clock=lambda: _m(60))
+    q = ConsentQueue(cdir, authority=authority_source(cdir, anchor=None), clock=lambda: _m(60), home=h4_home())
     q.file(agent="claude_code", agent_session_id="s-a", tool_name="Bash", tool_input={"command": "git push"},
            cwd=str(work / "a"), hold=timedelta(minutes=60), event_id="e-replay")
     # a question session b waits on: filed 11:00, answered 12:00

@@ -235,7 +235,7 @@ def verify(queue_dir: Path | str, *,
             root = answer_root(qdir, request)
             return authority_source(root / "cockpit.db", anchor=anchor_path(root))
 
-    reading = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
+    reading = ConsentQueue(qdir, home=Path.home(), authority=authority_source(qdir, anchor=None))
     cols = ", ".join(_FIELDS) + ", state, decided_at, answer, signature, signer_fp, via"
     try:
         with reading._read_as_is(frozenset({"requests", "receipts"}), whole=True) as conn:

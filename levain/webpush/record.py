@@ -41,7 +41,7 @@ def outcome_of(queue_dir: Path, ref: Any, *, _queue: Any = None, _questions: Any
             if _queue is None:
                 from levain.consent.queue import ConsentQueue, authority_source
 
-                _queue = ConsentQueue(queue_dir, authority=authority_source(queue_dir, anchor=None))
+                _queue = ConsentQueue(queue_dir, home=Path.home(), authority=authority_source(queue_dir, anchor=None))
             got = _queue.get(key)
             if got is None:
                 return {"state": "gone", "words": "no longer in the queue"}
@@ -75,7 +75,7 @@ def record(queue_dir: Path, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             try:
                 from levain.consent.queue import ConsentQueue, authority_source
 
-                queue = ConsentQueue(queue_dir, authority=authority_source(queue_dir, anchor=None))
+                queue = ConsentQueue(queue_dir, home=Path.home(), authority=authority_source(queue_dir, anchor=None))
             except Exception:  # noqa: BLE001 - outcome_of says "unread" per row
                 queue = None
         if kind == "question" and questions is None:

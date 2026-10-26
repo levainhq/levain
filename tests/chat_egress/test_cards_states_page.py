@@ -36,6 +36,7 @@ from tests.test_cockpit_consent_rows import OPEN_DECISIONS
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_consent_queue import Key, Log, signed
+from tests._h4 import h4_home
 
 NARROW = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
 needs_ssh = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="ssh-keygen signs the answers")
@@ -78,7 +79,7 @@ def test_every_card_state_is_served_from_the_rows_and_drawn(tmp_path, monkeypatc
     (tmp_path / "auth").mkdir()
     log = Log(tmp_path / "auth", {"laptop": Key(keydir, "laptop")})
     log.enrol("laptop", "laptop-presence")
-    q = ConsentQueue(consent, authority=log.source)
+    q = ConsentQueue(consent, authority=log.source, home=h4_home())
     store = CoordStore(consent)
     records = rec.EgressRecords(store)
     live, stopped = _launch(store, live=True), _launch(store, live=False)
@@ -102,7 +103,7 @@ def test_every_card_state_is_served_from_the_rows_and_drawn(tmp_path, monkeypatc
     answer(cards["denied"][1], "deny")
     records.write_attempt(live, cards["denied"][0]["request"], Verdict.DENY, GET)
     past = datetime.now(timezone.utc) - timedelta(minutes=5)       # filed five minutes ago: its 100 s hold ran out
-    cards["expired"] = filed(live, "expired.example", ConsentQueue(consent, authority=log.source, clock=lambda: past))
+    cards["expired"] = filed(live, "expired.example", ConsentQueue(consent, authority=log.source, clock=lambda: past, home=h4_home()))
     records.write_attempt(live, cards["expired"][0]["request"], Verdict.DENY, GET)
     cards["ended"] = filed(live, "ended.example")
     assert q.withdraw(cards["ended"][1].id, note="egress: the client closed")   # C0's CARD_ENDED
@@ -196,7 +197,7 @@ def test_a_card_whose_dispatch_store_cannot_be_read_heads_unreadable(tmp_path, m
     (tmp_path / "auth").mkdir()
     log = Log(tmp_path / "auth", {"laptop": Key(keydir, "laptop")})
     log.enrol("laptop", "laptop-presence")
-    q = ConsentQueue(consent, authority=log.source)
+    q = ConsentQueue(consent, authority=log.source, home=h4_home())
     live = _launch(CoordStore(consent), live=True)
     c = _card(live, "unreadable.example")
     r = file_card(q, c, agent_session_id="s", cwd="/w")
@@ -228,7 +229,7 @@ def test_every_card_state_and_unreadable_heads_its_own_label(tmp_path, monkeypat
     (tmp_path / "auth").mkdir()
     log = Log(tmp_path / "auth", {"laptop": Key(keydir, "laptop")})
     log.enrol("laptop", "laptop-presence")
-    q = ConsentQueue(consent, authority=log.source)
+    q = ConsentQueue(consent, authority=log.source, home=h4_home())
     live = _launch(CoordStore(consent), live=True)
     words = [s.value for s in CardState if s is not CardState.PENDING] + [listing.UNREADABLE]   # a pending row carries none
     rows: dict[str, object] = {}

@@ -1943,11 +1943,11 @@ def _require_aware(now: Any) -> None:
         raise AuthorityError("`now` must be an aware datetime; a naive one has no zone")
 
 
-def consent_root_problem(workspace: str) -> str | None:
+def consent_root_problem(workspace: str, *, home: str | os.PathLike[str]) -> str | None:
     """Why the directory ``workspace`` names, on THIS machine, cannot be a consent grant's root (None when it can):
-    it is ``/``, or this machine's home directory or above it. Read at append and again at every decision, since
-    a log written elsewhere names another home."""
-    home = os.path.expanduser("~")
+    it is ``/``, or ``home`` (this machine's home directory) or above it. Read at append and again at every
+    decision, since a log written elsewhere names another home."""
+    home = os.fspath(home)
     if workspace == "/" or any(_path_within(h, workspace) for h in {os.path.normpath(home), os.path.realpath(home)}):
         return f"the workspace {workspace[:200]} is / or the home directory or above it; name a project directory"
     return None
@@ -2056,7 +2056,7 @@ def _consent_home_check(grants: list[Any]) -> None:
         if not canonical:
             raise AuthorityError(f"the workspace {ws[:200]} must be an existing directory named by its real path "
                                  "(no symlink on it)")
-        problem = consent_root_problem(ws)
+        problem = consent_root_problem(ws, home=os.path.expanduser("~"))   # append time, off the core path
         if problem is not None:
             raise AuthorityError(problem)
 
