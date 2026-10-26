@@ -252,6 +252,7 @@ import time
 import unicodedata
 import urllib.parse
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, NoReturn
@@ -2132,18 +2133,19 @@ LEVAIN_HOME_STATE_DIRS = (AUTONOMIC_STORE_DIR, COCKPIT_KEY_DIR, "consent", GRANT
                           _ssh_agent.HOST_KEYS_DIR, "coordinator", "chat-node")
 
 
-def levain_home_base(home: Path) -> Path:
-    """The levain home the floor denies, ``$LEVAIN_HOME`` else ``<home>/.levain``, absolute (an empty
-    ``$LEVAIN_HOME`` is unset, a relative one is taken against the cwd now), not resolved: the floor adds
+def levain_home_base(home: Path, *, environ: Mapping[str, str]) -> Path:
+    """The levain home the floor denies, ``LEVAIN_HOME`` in ``environ`` else ``<home>/.levain``, absolute (an
+    empty ``LEVAIN_HOME`` is unset, a relative one is taken against the cwd now), not resolved: the floor adds
     the other spellings. Raises :class:`ConfinementError` when it cannot be resolved (fail-closed)."""
-    return levain_home_spellings(home)[0]
+    return levain_home_spellings(home, environ=environ)[0]
 
 
-def levain_home_spellings(home: Path) -> tuple[Path, list[Path]]:
+def levain_home_spellings(home: Path, *, environ: Mapping[str, str]) -> tuple[Path, list[Path]]:
     """:func:`levain_home_base` and its :func:`_spellings`, under one ``ConfinementError`` naming
-    ``$LEVAIN_HOME`` as written when either step fails. The consent adapters derive the directory they
-    protect from file tools from it too (``levain.consent.adapters.claude_code.protected_paths``)."""
-    raw = os.environ.get("LEVAIN_HOME")
+    ``$LEVAIN_HOME`` as written when either step fails. ``environ`` is required and is the only environment
+    read. The consent adapters derive the directory they protect from file tools from it too
+    (``levain.consent.adapters.claude_code.protected_paths``)."""
+    raw = environ.get("LEVAIN_HOME")
     try:
         base = Path(raw).expanduser() if raw else home / ".levain"
         base = Path(os.path.abspath(base))
@@ -2154,7 +2156,8 @@ def levain_home_spellings(home: Path) -> tuple[Path, list[Path]]:
         ) from exc
 
 
-def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path) -> tuple[Path, list[Path]]:
+def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path, *,
+                        environ: Mapping[str, str]) -> tuple[Path, list[Path]]:
     """The floor's subtrees for the levain home, ``$LEVAIN_HOME`` else ``~/.levain``, made absolute as its
     readers make it (``levain.autonomic.db.default_store_dir``, ``levain.consent.queue.default_queue_dir``:
     an empty ``$LEVAIN_HOME`` is unset, a relative one is taken against the cwd now). Returns the home and
@@ -2167,7 +2170,7 @@ def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path) -> tuple[
     name: the shape before the whole-home deny plus the consent queue, so that layout keeps the old class
     edge (a new directory must add itself to the tuple). Refuses (fail-closed) a home that cannot be
     resolved, or a named directory that would hide the entity's own home, entity or workspace."""
-    base, whole = levain_home_spellings(home)
+    base, whole = levain_home_spellings(home, environ=environ)
     if not any(_hides_the_entity(d, home, entity_dir, workspace) for d in whole):
         return base, whole
     out: list[Path] = []
@@ -2446,7 +2449,7 @@ def build_policy(
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
     # The whole levain home, one subtree, so an operator-state directory under it is covered without
     # naming itself; the by-name fallback for a home that overlaps the entity is in the helper.
-    levain_base, levain_home_jewels = _levain_home_jewels(home, ed, ws)
+    levain_base, levain_home_jewels = _levain_home_jewels(home, ed, ws, environ=os.environ)
     subtrees.extend(levain_home_jewels)
     # The cockpit authority the consent settings in that home name: its log and anchor sit outside it.
     authority_jewels = _consent_authority_jewels(levain_base, home, ed, ws)

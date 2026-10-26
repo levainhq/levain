@@ -27,7 +27,7 @@ def lhome(tmp_path, monkeypatch):
 
 
 def _tagged(tool, inp, home):
-    prot = cc.protected_paths(default_queue_dir(), cc.AdapterSettings(), home=h4_home())
+    prot = cc.protected_paths(default_queue_dir(), cc.AdapterSettings(), environ=h4_env(), home=h4_home())
     return cc.targets_agent_config(tool, inp, "/work/proj", home=home, protected=prot, environ=h4_env())
 
 
@@ -55,10 +55,10 @@ def test_bash_into_the_levain_home_stays_unparsed(lhome):
 
 
 def test_the_queue_dir_stays_protected_inside_and_outside_the_home(lhome, tmp_path):
-    inside = cc.protected_paths(default_queue_dir(), cc.AdapterSettings(), home=h4_home())
+    inside = cc.protected_paths(default_queue_dir(), cc.AdapterSettings(), environ=h4_env(), home=h4_home())
     assert Path(os.path.abspath(default_queue_dir())) in inside
     elsewhere = tmp_path / "q"
-    got = cc.protected_paths(elsewhere, cc.AdapterSettings(), home=h4_home())
+    got = cc.protected_paths(elsewhere, cc.AdapterSettings(), environ=h4_env(), home=h4_home())
     assert Path(os.path.abspath(elsewhere)) in got
     assert cc.targets_agent_config("Write", {"file_path": str(elsewhere / "queue.db")}, "/work/proj",
                                    home=lhome, protected=got, environ=h4_env())
@@ -66,9 +66,10 @@ def test_the_queue_dir_stays_protected_inside_and_outside_the_home(lhome, tmp_pa
 
 def test_the_adapter_and_the_floor_name_the_same_levain_home(lhome, tmp_path, monkeypatch):
     """One derivation (:func:`levain.firing.confinement.levain_home_base`), at $LEVAIN_HOME and at the default."""
-    assert levain_home_base(Path.home()) in cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), home=h4_home())
+    assert levain_home_base(Path.home(), environ=h4_env()) in cc.protected_paths(tmp_path / "q", cc.AdapterSettings(),
+                                                                                 environ=h4_env(), home=h4_home())
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "elsewhere"))
-    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), home=h4_home())
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), environ=h4_env(), home=h4_home())
     assert Path(os.path.abspath(tmp_path / "elsewhere")) in got
     assert not any(p == lhome / ".levain" for p in got)
 
@@ -83,16 +84,16 @@ def test_protected_paths_and_the_floor_agree_on_a_non_default_levain_home(lhome,
     ent = tmp_path / "entities" / "coyote"
     (ent / ".levain").mkdir(parents=True)
     (ent / "workspace").mkdir()
-    base = levain_home_base(Path.home())
+    base = levain_home_base(Path.home(), environ=h4_env())
     assert base == Path(os.path.abspath(elsewhere))
     assert base in build_policy(ent).deny_read_write
-    assert base in cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), home=h4_home())
+    assert base in cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), environ=h4_env(), home=h4_home())
 
 
 def test_a_levain_home_at_or_above_the_users_home_falls_back_to_its_state_dirs(lhome, monkeypatch):
     """As the floor does for a home it cannot hide whole: $LEVAIN_HOME=$HOME must not tag every file in the home."""
     monkeypatch.setenv("LEVAIN_HOME", str(lhome))
-    got = cc.protected_paths(default_queue_dir(), cc.AdapterSettings(), home=h4_home())
+    got = cc.protected_paths(default_queue_dir(), cc.AdapterSettings(), environ=h4_env(), home=h4_home())
     assert lhome not in got and Path(os.path.abspath(lhome)) not in got
     assert {lhome / name for name in LEVAIN_HOME_STATE_DIRS} <= set(got)
     assert not _tagged("Write", {"file_path": str(lhome / "project" / "main.py"), "content": "x"}, lhome)
@@ -139,7 +140,7 @@ def test_a_levain_home_the_floor_cannot_deny_whole_falls_back_in_the_adapter_too
     lh, cwd = _case(kind, lhome, tmp_path)
     monkeypatch.setenv("LEVAIN_HOME", lh)
     base = Path(os.path.abspath(lh))
-    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), cwd=cwd, home=h4_home())
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), cwd=cwd, environ=h4_env(), home=h4_home())
     assert base not in got
     assert {base / name for name in LEVAIN_HOME_STATE_DIRS} <= set(got)
     unrelated = str(Path(cwd) / "src" / "app.py") if kind == "workspace" else str(base / "lane14b-unrelated.txt")
@@ -156,17 +157,17 @@ def test_the_floor_and_the_adapter_share_one_fallback_predicate(lhome, tmp_path,
 
     ordinary = tmp_path / "state" / "lv"
     monkeypatch.setenv("LEVAIN_HOME", str(ordinary))
-    assert ordinary in cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), home=h4_home())
+    assert ordinary in cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), environ=h4_env(), home=h4_home())
     monkeypatch.setattr(cf, "too_wide_to_deny", lambda d, home, *within: True)
     assert cf._hides_the_entity(ordinary, lhome, tmp_path / "e", tmp_path / "e" / "workspace")
-    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), home=h4_home())
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), environ=h4_env(), home=h4_home())
     assert ordinary not in got and ordinary / "autonomic" in got
 
 
 def test_protected_paths_does_not_raise_on_an_unresolvable_levain_home(lhome, tmp_path, monkeypatch):
     """It fails closed for the store, never an outage of every tool: the default levain home plus the queue dir."""
     monkeypatch.setenv("LEVAIN_HOME", "~lane14b_no_such_user/lv")
-    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), home=h4_home())
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), environ=h4_env(), home=h4_home())
     assert Path(os.path.abspath(tmp_path / "q")) in got
     assert lhome / ".levain" in got
 
@@ -176,7 +177,7 @@ def test_protected_paths_does_not_raise_when_the_home_cannot_be_found(lhome, tmp
         raise RuntimeError("Could not determine home directory.")
 
     monkeypatch.setattr(Path, "home", classmethod(no_home))
-    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), home=None)   # no home bound
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), environ=h4_env(), home=None)   # no home bound
     assert Path(os.path.abspath(tmp_path / "q")) in got
     assert cc.operator_home(h4_env()) / ".levain" in got
 
@@ -202,7 +203,7 @@ def test_an_unresolvable_levain_home_denies_no_read_and_still_gates_the_store(lh
 def test_protected_paths_takes_the_injected_home(lhome, tmp_path):
     alt = tmp_path / "alt"
     (alt / ".levain").mkdir(parents=True)
-    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), home=alt)
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), environ=h4_env(), home=alt)
     assert alt / ".levain" in got
     assert lhome / ".levain" not in got
 
@@ -306,7 +307,7 @@ def test_a_failing_gettempdir_still_protects_the_resolved_custom_levain_home(lho
     a store write under a custom ``$LEVAIN_HOME`` was ungated."""
     custom = _custom_home(tmp_path, monkeypatch)
     _no_tempdir(monkeypatch)
-    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), home=h4_home())
+    got = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), environ=h4_env(), home=h4_home())
     assert Path(os.path.abspath(custom)) in got
     assert lhome / ".levain" not in got
 
@@ -319,7 +320,7 @@ def test_a_failing_predicate_returns_the_resolved_base_never_the_default_home(lh
         raise RuntimeError("predicate")
 
     monkeypatch.setattr(confinement, "too_wide_to_deny", boom)
-    got = cc.levain_home_protected(None, None)
+    got = cc.levain_home_protected(None, None, environ=h4_env())
     assert got == [Path(os.path.abspath(custom))]
 
 
@@ -413,7 +414,7 @@ def test_a_levain_home_on_a_symlink_is_agent_config_at_every_spelling(lhome, tmp
     base = {"link": link, "real": real, "real_parent": Path(os.path.realpath(link.parent)) / link.name}[via]
     store = base / "autonomic" / "autonomic.db"
     qdir = tmp_path / "q"
-    got = cc.protected_paths(qdir, cc.AdapterSettings(), cwd=str(lhome), home=h4_home())
+    got = cc.protected_paths(qdir, cc.AdapterSettings(), cwd=str(lhome), environ=h4_env(), home=h4_home())
     assert cc.targets_agent_config("Edit", {"file_path": str(store), "old_string": "a", "new_string": "b"},
                                    str(lhome), home=lhome, protected=got, environ=h4_env())
     assert cx.targets_agent_config("apply_patch", _patch(store), str(lhome), home=lhome,

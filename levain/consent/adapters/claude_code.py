@@ -212,15 +212,16 @@ def _absolute_root(root: Any) -> str | None:
         return None
 
 
-def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path,
+def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path, environ: Mapping[str, str],
                     cwd: str | None = None) -> tuple[Path, ...]:
     """What the adapter itself trusts, so a file tool writing any of it is agent config (codex Q2 r1 #1): the
     queue directory (the adapter settings and the queue database live in it); the whole levain home, the
     directory the confinement floor denies (:func:`levain.firing.confinement.levain_home_spellings`, one
     derivation for both), so a write to the autonomic binding store or any other operator state there is a tagged
     request (14b Q5); and, when a cockpit data root is configured, its authority database (and sqlite's sidecars)
-    and the authority anchor. ``home`` is the one :func:`targets_agent_config` expands ``~`` under (required: the
-    hook binds it once at its top); ``cwd``, when absolute, stands in for the workspace. A levain home the floor's
+    and the authority anchor. ``home`` is the one :func:`targets_agent_config` expands ``~`` under and ``environ``
+    the one whose ``LEVAIN_HOME`` names the levain home (both required: the hook binds them once at its top);
+    ``cwd``, when absolute, stands in for the workspace. A levain home the floor's
     own predicate finds too
     wide to deny whole (:func:`levain.firing.confinement.too_wide_to_deny`: a filesystem root, a path of two parts
     or fewer, a shared temp directory, or one holding the home or the cwd) is named by its state directories instead
@@ -228,7 +229,7 @@ def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path,
     would be agent config. Never raises on the levain home: one that cannot be resolved is ``<home>/.levain``
     (fail closed for the store, never an outage of every tool). Bash is still never parsed: a shell write there
     is not tagged here."""
-    out = [Path(os.path.abspath(queue_dir)), *levain_home_protected(home, cwd)]
+    out = [Path(os.path.abspath(queue_dir)), *levain_home_protected(home, cwd, environ=environ)]
     if settings.cockpit_data_root:
         root = Path(settings.cockpit_data_root)
         db = root / "cockpit.db"
@@ -236,14 +237,14 @@ def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path,
     return tuple(out)
 
 
-def levain_home_protected(home: Path | None, cwd: str | None) -> list[Path]:
-    """:func:`protected_paths`' share of the levain home; never raises. Also what :func:`queue_unresolved` (and
-    Codex's) classify with when no queue directory could be resolved."""
+def levain_home_protected(home: Path | None, cwd: str | None, *, environ: Mapping[str, str]) -> list[Path]:
+    """:func:`protected_paths`' share of the levain home, named by ``LEVAIN_HOME`` in ``environ``; never raises.
+    Also what :func:`queue_unresolved` (and Codex's) classify with when no queue directory could be resolved."""
     from levain.firing.confinement import LEVAIN_HOME_STATE_DIRS, levain_home_spellings, too_wide_to_deny  # lazy
 
     try:
         user_home = Path(home) if home is not None else Path.home()
-        base, spellings = levain_home_spellings(user_home)
+        base, spellings = levain_home_spellings(user_home, environ=environ)
         try:
             within = (Path(cwd),) if isinstance(cwd, str) and os.path.isabs(cwd) else ()
             if any(too_wide_to_deny(d, user_home, *within) for d in spellings):
@@ -810,7 +811,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, enviro
     posture = mode if isinstance(mode, str) and mode else None
     if policy is None and nothing_can_decide(settings):
         return None
-    protected = protected_paths(Path(queue.directory), settings, home=home, cwd=cwd)
+    protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected)
     if agent_config and unconfined(cwd, home=home, environ=environ):
         return None  # an unconfined session (Q10 D2): its dialog answers, as the gate left the call to its mode (L1-7)
@@ -1403,7 +1404,7 @@ def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSett
     if got.go:
         if got.extended and gate_class(tool_name, tool_input, cwd, home=home, environ=environ,
                                        protected=protected_paths(Path(queue.directory), settings, home=home,
-                                                                 cwd=cwd)) is not None:
+                                                                 environ=environ, cwd=cwd)) is not None:
             return _pre("deny", limits.retry_text(got.extended))
         return None
     stop = {"continue": False, "stopReason": "levain: stopped by a budget the operator set; it goes on when he "
@@ -1482,7 +1483,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         return gate_output(decision)
 
     tier = gate_class(tool_name, tool_input, cwd, home=home, environ=environ,
-                      protected=protected_paths(Path(queue.directory), settings, home=home, cwd=cwd))
+                      protected=protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd))
     if tier is None:
         return None
     what = _what(tool_name, tool_input)
@@ -1574,7 +1575,7 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings, *, home:
         if not isinstance(tool_name, str) or not isinstance(cwd, str) or not cwd:
             return None
         tier = gate_class(tool_name, tool_input, cwd, home=home, environ=environ,
-                          protected=protected_paths(queue_dir, settings, home=home, cwd=cwd))
+                          protected=protected_paths(queue_dir, settings, home=home, environ=environ, cwd=cwd))
         what = _what(tool_name, tool_input)
     except Exception:
         tier, what = "irreversible", "this call"
@@ -1598,7 +1599,7 @@ def queue_unresolved(event: Any, *, home: Path | None, environ: Mapping[str, str
         if not isinstance(tool_name, str) or not isinstance(cwd, str) or not os.path.isabs(cwd):
             return None
         tier = gate_class(tool_name, tool_input, cwd, home=home, environ=environ,
-                          protected=tuple(levain_home_protected(home, cwd)))
+                          protected=tuple(levain_home_protected(home, cwd, environ=environ)))
         what = _what(tool_name, tool_input)
     except Exception:
         tier, what = "irreversible", "this call"

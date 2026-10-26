@@ -233,7 +233,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     posture = posture if isinstance(posture, str) and posture else None
     if policy is None and nothing_can_decide(settings):
         return None
-    protected = protected_paths(Path(queue.directory), settings, home=home, cwd=cwd)
+    protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home,
                                         codex_dir=_codex_dir_or(codex_dir, environ, home), environ=environ,
                                         protected=protected)
@@ -529,7 +529,7 @@ def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSett
     if got.go:
         if got.extended and gate_class(tool_name, tool_input, cwd, home=home, environ=environ, codex_dir=codex_dir,
                                        protected=protected_paths(Path(queue.directory), settings, home=home,
-                                                                 cwd=cwd)) is not None:
+                                                                 environ=environ, cwd=cwd)) is not None:
             return _deny(limits.retry_text(got.extended))
         return None
     return _deny(got.text)
@@ -589,7 +589,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     tier: str | None = "irreversible"           # until classified: a failure before that denies with the latch's tier
     what = "this call"
     try:
-        protected = protected_paths(qdir, settings, home=home, cwd=cwd)
+        protected = protected_paths(qdir, settings, home=home, environ=environ, cwd=cwd)
         git_cache: dict[Any, Any] = {}   # one git budget for the gate call (L3 r3 G1), its description included
         what = _call_what(tool_name, tool_input, cwd, home=home, environ=environ, codex_dir=codex_dir,
                           protected=protected,
@@ -684,7 +684,7 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings, *, home:
         if any(not isinstance(v, str) or not v for v in (tool_name, cwd, session)) or not os.path.isabs(cwd):
             tier, what = "irreversible", "this call"
         else:
-            protected = protected_paths(queue_dir, settings, home=home, cwd=cwd)
+            protected = protected_paths(queue_dir, settings, home=home, environ=environ, cwd=cwd)
             git_cache: dict[Any, Any] = {}   # one git budget for the call
             tier = gate_class(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected,
                               git_cache=git_cache)
@@ -708,7 +708,7 @@ def queue_unresolved(event: Any, *, home: Path | None, environ: Mapping[str, str
         session = event.get("session_id")
         if any(not isinstance(v, str) or not v for v in (tool_name, cwd, session)) or not os.path.isabs(cwd):
             return could_not_run("this call")
-        protected = tuple(levain_home_protected(home, cwd))
+        protected = tuple(levain_home_protected(home, cwd, environ=environ))
         git_cache: dict[Any, Any] = {}
         if gate_class(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected,
                       git_cache=git_cache) is None:

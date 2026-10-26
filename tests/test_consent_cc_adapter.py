@@ -419,7 +419,7 @@ def test_real_core_without_authority_is_no_decision(tmp_path):
 def test_the_adapters_own_trust_root_is_agent_config(tmp_path, rel):
     """P1 (codex 1): the adapter settings, the queue db, the authority db and its anchor are T3, policy-ineligible."""
     settings = cc.AdapterSettings(cockpit_data_root=str(tmp_path / "cockpit"))
-    protected = cc.protected_paths(tmp_path / "consent", settings, home=h4_home())
+    protected = cc.protected_paths(tmp_path / "consent", settings, environ=h4_env(), home=h4_home())
     assert cc.targets_agent_config("Write", {"file_path": str(tmp_path / rel)}, "/work/proj", protected=protected, environ=h4_env(), home=h4_home())
     assert not cc.targets_agent_config("Write", {"file_path": str(tmp_path / "other.json")}, "/work/proj",
                                        protected=protected, environ=h4_env(), home=h4_home())
@@ -986,7 +986,8 @@ def test_the_directory_holding_the_authority_database_is_tagged(tmp_path):
     """L3 r1 codex MED: a protected FILE (cockpit.db) is a root, so its directory with the name in another field
     was not tagged."""
     root = tmp_path / "trust"
-    protected = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(cockpit_data_root=str(root)), home=h4_home())
+    protected = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(cockpit_data_root=str(root)), environ=h4_env(),
+                                   home=h4_home())
     for inp in ({"directory": str(root), "filename": "cockpit.db"}, {"path": str(root / "cockpit.db")}):
         assert cc.targets_agent_config("mcp__fs__w", inp, str(tmp_path), home=tmp_path / "h", protected=protected, environ=h4_env())
 
