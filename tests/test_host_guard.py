@@ -972,6 +972,17 @@ def test_managed_mach_lookup_that_adds_nothing_is_accepted(ent):
     assert "m.json: sandbox.network.allowMachLookup must be list, got str" in probs
 
 
+@pytest.mark.parametrize("bad", [False, "", 0, None, {}], ids=repr)
+def test_managed_allow_read_of_the_wrong_type_refuses(ent, bad):
+    """L3 r1 (codex 2): a falsy non-list allowRead passed the not-empty check and nothing else; Claude Code expects a
+    list, and a schema type error can drop the sandbox block silently, so the wrong type refuses like every pinned
+    key."""
+    roots = hg.cc_writable_roots(ent)
+    probs = hg.check_managed_settings([("m.json", {"sandbox": {"filesystem": {"allowRead": bad}}})], roots)
+    assert f"m.json: sandbox.filesystem.allowRead must be list, got {type(bad).__name__}" in probs
+    assert hg.check_managed_settings([("m.json", {"sandbox": {"filesystem": {"allowRead": []}}})], roots) == []
+
+
 def test_the_pinned_block_closes_mach_lookup_apple_events_and_nested_namespaces():
     block = hg.cc_sandbox_block("/x")
     assert block["network"]["allowMachLookup"] == []

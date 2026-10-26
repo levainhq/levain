@@ -240,7 +240,9 @@ class LiveSetting:
     a read finishing after the close arms nothing, and a `get()` waiting on a read is woken by the close.
     `get_ex()` answers the same value paired with whether it came from a real read (an in-`allowed` value the read
     returned) rather than `fail_closed` standing in for one (timeout, error, out-of-`allowed` value, closed).
-    `reader` is the read thread while it lives (the decider's close reports it: a read cannot be cancelled)."""
+    `reader` is the read thread while it lives (the decider's close reports it: a read cannot be cancelled).
+    `watch(fn)`: `fn` gets every real read's value on the read thread before any `get()` waiting on that read is
+    woken; reads run one at a time, so `fn` sees them in the order they started (`Capped` ratchets there)."""
 
     def __init__(self, read: Callable[[], str], *, allowed: tuple[str, ...] = classify.MODES,
                  fail_closed: str = classify.GATED, timeout_s: float = 2.0) -> None:
@@ -249,6 +251,10 @@ class LiveSetting:
         self._flight: tuple[float, threading.Event, dict] | None = None
         self._thread: threading.Thread | None = None
         self._closed = False
+        self._watchers: list[Callable[[str], None]] = []
+
+    def watch(self, fn: Callable[[str], None]) -> None:
+        self._watchers.append(fn)
 
     @property
     def reader(self) -> threading.Thread | None:
@@ -270,7 +276,13 @@ class LiveSetting:
             except BaseException as exc:     # noqa: BLE001
                 box["e"] = exc
             finally:
-                done.set()
+                try:
+                    v = box.get("v")
+                    if not self._closed and "e" not in box and v in self._allowed:
+                        for fn in list(self._watchers):
+                            fn(v)
+                finally:
+                    done.set()
 
         self._flight = (now, done, box)
         self._thread = threading.Thread(target=work, name="levain-egress-setting", daemon=True)
@@ -323,13 +335,22 @@ class Capped:
     timeout, an error, a value outside the allowed modes) answers the strictest mode for that `get()` alone. A
     setting with no `get_ex` has every read counted real. A value outside `STRICTEST_FIRST` on either side answers
     the strictest mode. `get()` is called from concurrent decision threads: the hold is updated under a lock (the
-    live read happens outside it)."""
+    live read happens outside it). A setting with `watch` (`LiveSetting`) also moves the hold as each real read
+    finishes, before that read answers anyone and before the next read can start, so no `get()` answers looser
+    than a read that started before its own (L3 r1, codex 1: a later read reaching the lock first)."""
 
     def __init__(self, live: Any, launched: str) -> None:
         self._live = live
         self.launched = launched if launched in STRICTEST_FIRST else STRICTEST_FIRST[0]
         self._held = self.launched
         self._lock = threading.Lock()
+        watch = getattr(live, "watch", None)
+        if watch is not None:
+            watch(self._ratchet)
+
+    def _ratchet(self, live: str) -> None:
+        with self._lock:
+            self._held = _stricter(live, self._held)
 
     @property
     def reader(self) -> threading.Thread | None:
@@ -433,9 +454,9 @@ class Decider:
     records      `records.EgressRecords` over that dispatch store
     routes       the launch's `keys.RouteSet` (built once, at launch)
     mode         a `LiveSetting` / `Fixed` of `classify.GATED` or `classify.OPEN_NETWORK`, held as `Capped` (a
-                 ratchet, Q-R15-9) starting at `launch_mode`: the mode the launch started with, as passed by the
-                 caller (`launch.start_egress` passes the read its header and digest came from); when None, `mode`
-                 is read once here
+                 ratchet, Q-R15-9) starting at `launch_mode` (required): the mode the launch started with, as
+                 passed by the caller (`launch.start_egress` passes the read its header and digest came from); the
+                 constructor never reads `mode`
     liveness     `keys.AuthorityLiveness` (or any `keys.Liveness`); credentials: `keys.LaunchCredentials`
     cards        a `CardDesk`; resolver: a `resolver.Resolver`
     """
@@ -443,11 +464,11 @@ class Decider:
     def __init__(self, link: socket.socket, obs: socket.socket, *, launch_id: str, records: rec.EgressRecords,
                  routes: keys.RouteSet, mode: Any, liveness: Any, credentials: keys.LaunchCredentials,
                  cards: CardDesk, resolver: Resolver, limits: Limits = Limits(),
-                 link_fault: Callable[[int], int | None] | None = None, launch_mode: str | None = None) -> None:
+                 link_fault: Callable[[int], int | None] | None = None, launch_mode: str) -> None:
         self.link = Link(link, fault=link_fault)
         self._obs = obs
         self.launch_id, self.records, self.routes = launch_id, records, routes
-        self.mode = Capped(mode, mode.get() if launch_mode is None else launch_mode)
+        self.mode = Capped(mode, launch_mode)
         self.liveness, self.credentials, self.cards, self.resolver = liveness, credentials, cards, resolver
         self.limits = limits
         self.adverts = advert.AdvertisementSet()

@@ -198,12 +198,15 @@ class Rig:
         oa, ob = socket.socketpair()
         self.desk = Desk()
         self.lookup = lookup or Lookup()
+        setting = setting or dm.Fixed(mode)
+        if launch_mode is None:              # the rig stands in for start_egress: one read, before the decider
+            launch_mode = setting.get()
         self.d = dm.Decider(a, oa, launch_id=self.launch, records=self.records,
-                            routes=routes or keys.RouteSet.of([]), mode=setting or dm.Fixed(mode), liveness=Live(),
+                            routes=routes or keys.RouteSet.of([]), mode=setting, liveness=Live(),
                             credentials=keys.LaunchCredentials(NoStore()), cards=self.desk,
                             resolver=Resolver(self.lookup, max_lookups=4, timeout_s=resolver_timeout),
                             limits=limits or dm.Limits(card_poll_s=0.05, stop_drain_s=0.5), link_fault=link_fault,
-                            **({} if launch_mode is None else {"launch_mode": launch_mode}))
+                            launch_mode=launch_mode)
         if not start_obs:
             self.d._obs_loop = lambda: None          # no reader thread: only the decisions drain
         self.srt = SrtEnd(b)

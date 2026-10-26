@@ -1537,7 +1537,8 @@ def check_managed_settings(docs: Sequence[tuple[str, Any]], roots: Sequence[Path
             node = sb.get(sub, {})
             for k in sorted((set(node) - allowed) if isinstance(node, Mapping) else {"<not an object>"}):
                 problems.append(f"{path}: sandbox.{sub}.{k} is not a key hosting can vet")
-        for keys, typ in {**_SANDBOX_TYPES, ("filesystem", "denyRead"): list}.items():
+        for keys, typ in {**_SANDBOX_TYPES, ("filesystem", "denyRead"): list,
+                          ("filesystem", "allowRead"): list}.items():
             v = _get(sb, keys)
             if v is not _MISSING and type(v) is not typ:
                 problems.append(f"{path}: sandbox.{'.'.join(keys)} must be {typ.__name__}, got {type(v).__name__}")

@@ -94,10 +94,59 @@ def test_the_launch_mode_passed_is_the_cap_and_no_second_read_is_made(rig) -> No
     assert reads["n"] >= 1                                   # the request read the live setting; the cap won
 
 
-def test_with_no_launch_mode_passed_the_decider_reads_it_once_at_construction(rig) -> None:
-    standing = {"mode": classify.OPEN_NETWORK}
-    r = rig(setting=dm.LiveSetting(lambda: standing["mode"]))
-    assert r.d.mode.launched == classify.OPEN_NETWORK
+def test_the_decider_takes_the_launch_mode_and_never_reads_at_construction() -> None:
+    """RULINGS 1026-10 Q3: `launch_mode` is keyword-only and required, so no constructor does a live read."""
+    import inspect
+
+    p = inspect.signature(dm.Decider.__init__).parameters["launch_mode"]
+    assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is inspect.Parameter.empty
+
+
+def test_a_later_read_never_answers_looser_than_an_earlier_reads_tightening() -> None:
+    """L3 r1 (codex 1; RULINGS 1026-10 Q1): request A's read returns gated; request B, arriving while A's read is in
+    flight, reads after the standing default reopened. A is descheduled between its read returning and the ratchet
+    (the seam below holds A there); B must still answer gated, because an earlier-started read returned gated."""
+    import threading
+
+    g, o = classify.GATED, classify.OPEN_NETWORK
+    standing = {"mode": g}
+    first_in, first_go = threading.Event(), threading.Event()
+    calls = {"n": 0}
+
+    def read() -> str:
+        v = standing["mode"]                                 # the value as of the read's start
+        calls["n"] += 1
+        if calls["n"] == 1:
+            first_in.set()
+            first_go.wait(10)
+        return v
+
+    a_paused, a_go = threading.Event(), threading.Event()
+
+    class DescheduledA(dm.LiveSetting):
+        def get_ex(self):
+            got = super().get_ex()
+            if threading.current_thread().name == "A":
+                a_paused.set()
+                a_go.wait(10)
+            return got
+
+    c = dm.Capped(DescheduledA(read, timeout_s=5), o)
+    out: dict[str, str] = {}
+    ta = threading.Thread(target=lambda: out.__setitem__("A", c.get()), name="A")
+    tb = threading.Thread(target=lambda: out.__setitem__("B", c.get()), name="B")
+    ta.start()
+    assert first_in.wait(5)                                  # A's read is in flight, about to answer gated
+    tb.start()                                               # B arrives during A's read
+    time.sleep(0.05)
+    standing["mode"] = o                                     # the revoke is undone before B's own read starts
+    first_go.set()
+    assert a_paused.wait(5)
+    tb.join(5)
+    a_go.set()
+    ta.join(5)
+    assert calls["n"] == 2                                   # two real reads: A's (gated) and B's (open)
+    assert out == {"A": g, "B": g}
 
 
 def test_capped_is_the_stricter_of_the_two() -> None:
