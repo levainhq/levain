@@ -378,7 +378,7 @@ class RunJournal:
     def _start_in(conn: sqlite3.Connection, run_id: str, binding_id: str, generation: int, *,
                   seal: str | None = None) -> None:
         """Admit ``run_id`` in the caller's write transaction, read first (O-75-3, DESIGN r71): a run that exists is
-        left as it is, with no statement on ``runs`` (on a ``/3`` store a BEFORE INSERT trigger refuses even an
+        left as it is, with no write to ``runs`` (on a ``/3`` store a BEFORE INSERT trigger refuses even an
         ``INSERT OR IGNORE`` of a row that exists); one that does not is inserted, with ``seal`` when given (a ``/3``
         store refuses a run born without one)."""
         if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is not None:
