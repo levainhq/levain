@@ -63,6 +63,7 @@ def test_the_moved_names_have_one_home():
 def test_the_children_get_the_secure_path_and_only_the_locale(monkeypatch):
     monkeypatch.setenv("LANG", "en_US.UTF-8")
     monkeypatch.setenv("LC_CTYPE", "UTF-8")
+    monkeypatch.setenv("LC_TERMINAL", "iTerm2")     # LC_-prefixed, not a locale category: not carried
     monkeypatch.setenv("SECRET_TOKEN", "nope")
     envs: list[dict] = []
 
@@ -71,9 +72,17 @@ def test_the_children_get_the_secure_path_and_only_the_locale(monkeypatch):
         return subprocess.CompletedProcess(argv, 1, b"", b"")
     monkeypatch.setattr(hands_live, "run_bounded", run)
     assert hands_live.entity_session_live(4_000_017) is False
-    locale = {k: v for k, v in os.environ.items() if k == "LANG" or k.startswith("LC_")}
+    locale = {k: os.environ[k] for k in hands_live._LOCALE_NAMES if k in os.environ}
     assert envs == [{"PATH": hands_live.SECURE_PATH, **locale}]
-    assert locale["LC_CTYPE"] == "UTF-8" and "SECRET_TOKEN" not in envs[0]
+    assert locale["LC_CTYPE"] == "UTF-8" and locale["LANG"] == "en_US.UTF-8"
+    assert "SECRET_TOKEN" not in envs[0] and "LC_TERMINAL" not in envs[0]
+
+
+def test_every_carried_locale_name_is_on_the_launch_allowlist():
+    # hands_live cannot import levain.launch (stdlib only), so it names its locale itself: none may be off the list
+    # levain.launch.child_env would carry
+    from levain import launch
+    assert all(launch.allowed(k) for k in hands_live._LOCALE_NAMES)
 
 
 def test_the_exclusive_take_is_refused_while_a_session_holds_the_lock_shared(tmp_path):
@@ -249,36 +258,40 @@ def _stand_in(log: list, *, communicate=None, kill=None, wait=None, dies_on_kill
     return P
 
 
-def test_a_timeout_is_not_retried_while_the_first_child_still_runs():
+def test_a_timeout_is_not_retried_while_the_first_child_still_runs(monkeypatch):
     # deepseek MED (1026-22 a1ab L3): a refused kill left the first child running after the bounded reap, and
     # retry_timeout started a second beside it
     log: list = []
     P = _stand_in(log, kill=PermissionError(1, "Operation not permitted"))
+    monkeypatch.setattr(hands_live.subprocess, "Popen", P)
     with pytest.raises(subprocess.TimeoutExpired):
-        hands_live.run_bounded(["x"], env={}, timeout=0.1, retry_timeout=True, reap_timeout=0.0, popen=P)
+        hands_live.run_bounded(["x"], env={}, timeout=0.1, retry_timeout=True, reap_timeout=0.0)
     assert log.count("start") == 1, log
     # a child the kill did stop is retried, as before
     log.clear()
     P = _stand_in(log, dies_on_kill=True)
+    monkeypatch.setattr(hands_live.subprocess, "Popen", P)
     with pytest.raises(subprocess.TimeoutExpired):
-        hands_live.run_bounded(["x"], env={}, timeout=0.1, retry_timeout=True, reap_timeout=0.0, popen=P)
+        hands_live.run_bounded(["x"], env={}, timeout=0.1, retry_timeout=True, reap_timeout=0.0)
     assert log.count("start") == 2, log
 
 
-def test_an_interrupt_during_the_kill_still_reaps_and_closes_every_pipe():
+def test_an_interrupt_during_the_kill_still_reaps_and_closes_every_pipe(monkeypatch):
     # codex LOW + complement LOW 3: the interrupt escaped kill_quietly and the reap was skipped
     log: list = []
     P = _stand_in(log, kill=KeyboardInterrupt())
+    monkeypatch.setattr(hands_live.subprocess, "Popen", P)
     with pytest.raises(KeyboardInterrupt):
-        hands_live.run_bounded(["x"], env={}, timeout=0.1, reap_timeout=0.0, popen=P)
+        hands_live.run_bounded(["x"], env={}, timeout=0.1, reap_timeout=0.0)
     assert log[-4:] == ["wait", ("close", "in"), ("close", "out"), ("close", "err")], log
 
 
-def test_an_interrupt_during_the_reap_wait_still_closes_every_pipe():
+def test_an_interrupt_during_the_reap_wait_still_closes_every_pipe(monkeypatch):
     log: list = []
     P = _stand_in(log, wait=KeyboardInterrupt())
+    monkeypatch.setattr(hands_live.subprocess, "Popen", P)
     with pytest.raises(KeyboardInterrupt):
-        hands_live.run_bounded(["x"], env={}, timeout=0.1, reap_timeout=0.0, popen=P)
+        hands_live.run_bounded(["x"], env={}, timeout=0.1, reap_timeout=0.0)
     assert log[-4:] == ["wait", ("close", "in"), ("close", "out"), ("close", "err")], log
 
 

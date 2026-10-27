@@ -24,11 +24,19 @@ import pytest
 import levain.autonomic.hands_exec as X
 from levain.autonomic.executor import ExecutionResult, OutcomeUnknown
 from levain.autonomic.journal import EffectNotStarted
+from levain import hands_live
 from levain.hands_live import take_exclusive
 
 ROOT = Path(__file__).resolve().parents[1]
 DARWIN = platform.system() == "Darwin"
 ME = os.getuid()
+
+
+def _fake_subprocess(monkeypatch, fake) -> None:
+    """``fake`` as the ``subprocess`` of this module and of ``levain.hands_live``, whose ``run_bounded`` starts the
+    children ``_call`` runs."""
+    monkeypatch.setattr(X, "subprocess", fake)
+    monkeypatch.setattr(hands_live, "subprocess", fake)
 
 
 def _python() -> str:
@@ -229,7 +237,7 @@ class _Recorder:
 
         fake = types.SimpleNamespace(Popen=P, run=run, PIPE=real.PIPE, DEVNULL=real.DEVNULL,
                                      TimeoutExpired=real.TimeoutExpired, CompletedProcess=real.CompletedProcess)
-        monkeypatch.setattr(X, "subprocess", fake)
+        _fake_subprocess(monkeypatch, fake)
         monkeypatch.setattr(X, "entity_session_live",
                             lambda uid, **kw: rec.events.append(("live", uid)) or False)
         monkeypatch.setattr(X, "sweep_hands_user", sweep)
@@ -476,7 +484,7 @@ def _real_child(monkeypatch, *, after=None, swept=None):
 
     fake = types.SimpleNamespace(Popen=popen, run=subprocess.run, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL,
                                  TimeoutExpired=subprocess.TimeoutExpired, CompletedProcess=subprocess.CompletedProcess)
-    monkeypatch.setattr(X, "subprocess", fake)
+    _fake_subprocess(monkeypatch, fake)
     monkeypatch.setattr(X, "sweep_hands_user", lambda user, **kw: swept)
     return seen
 
@@ -709,7 +717,10 @@ def test_another_executor_type_is_ready_and_takes_nothing(tmp_path, monkeypatch)
 
 # --- static_problem: each clause by name ----------------------------------------------------------------------------
 
-def _pw(uid=450, gid=450, home="/var/empty"):
+def _pw(uid=None, gid=450, home="/var/empty"):
+    # by default a uid inside this host's hands range (Darwin 450, Linux 950), so the clauses after the range are reached
+    if uid is None:
+        uid = X.HANDS_UID_RANGE[X._host()][49]
     return types.SimpleNamespace(pw_uid=uid, pw_gid=gid, pw_dir=home)
 
 
@@ -936,7 +947,7 @@ def _ls(monkeypatch, answers):
             return self.returncode
     fake = types.SimpleNamespace(Popen=P, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL,
                                  TimeoutExpired=subprocess.TimeoutExpired, CompletedProcess=subprocess.CompletedProcess)
-    monkeypatch.setattr(X, "subprocess", fake)
+    _fake_subprocess(monkeypatch, fake)
     monkeypatch.setattr(X, "_anchor", lambda p: None)
     return calls
 
@@ -1141,7 +1152,7 @@ def _no_popen(monkeypatch) -> list:
         raise AssertionError("a child was started")
     fake = types.SimpleNamespace(Popen=popen, run=subprocess.run, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL,
                                  TimeoutExpired=subprocess.TimeoutExpired, CompletedProcess=subprocess.CompletedProcess)
-    monkeypatch.setattr(X, "subprocess", fake)
+    _fake_subprocess(monkeypatch, fake)
     return started
 
 

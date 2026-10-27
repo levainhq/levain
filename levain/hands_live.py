@@ -115,8 +115,7 @@ def reap_quietly(proc: "subprocess.Popen[bytes]", timeout: float) -> None:
 
 
 def run_bounded(argv: List[str], *, env: Dict[str, str], timeout: Optional[float], retry_timeout: bool = False,
-                stdin: Optional[bytes] = None, reap_timeout: float = _REAP_TIMEOUT,
-                popen: Optional[type] = None) -> "subprocess.CompletedProcess[bytes]":
+                stdin: Optional[bytes] = None, reap_timeout: float = _REAP_TIMEOUT) -> "subprocess.CompletedProcess[bytes]":
     """One program run from ``/`` with a bounded wait, its output as bytes; ``retry_timeout`` runs it once more on
     a timeout, but only when the first child was seen to exit: one still running after its bounded reap (its kill
     refused) is not run beside, and the timeout is raised. Raises ``subprocess.TimeoutExpired``, ``OSError``, or
@@ -126,12 +125,11 @@ def run_bounded(argv: List[str], *, env: Dict[str, str], timeout: Optional[float
     and when the child runs as root (sudo) the kill from the operator uid can be refused, so that wait lasts as long
     as the child does (``tests/test_hands_live.py``'s unkillable-child tests). Here the kill is best effort and the wait after it is at most
     ``reap_timeout``; a child left running is the caller's to stop. The kill, the reap and the pipes' close are each
-    tried whatever interrupts the one before; an interrupt passes through after them. ``popen`` is the ``Popen`` to
-    start it with (default: ``subprocess.Popen``, looked up at call time)."""
-    start = popen if popen is not None else subprocess.Popen
+    tried whatever interrupts the one before; an interrupt passes through after them. The child is started by this
+    module's ``subprocess.Popen``, called directly with ``env`` (``tests/test_launch.py``'s spawn scan)."""
     tries = 2 if retry_timeout else 1
     for n in range(tries):
-        proc = start(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/", env=env)
         try:
             out, err = proc.communicate(input=stdin, timeout=timeout)
@@ -153,11 +151,17 @@ def _secure(name: str) -> str:
     return shutil.which(name, path=SECURE_PATH) or name
 
 
+#: The locale names a child here is given from the operator's environment: ``LANG`` and the POSIX ``LC_*`` categories.
+_LOCALE_NAMES = ("LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME")
+
+
 def _child_env() -> Dict[str, str]:
-    """The environment of every child here: :data:`SECURE_PATH`, plus the operator's ``LANG`` and ``LC_*``
-    so ``ps`` prints as it would under the operator's locale. pgrep, ps and kill need nothing else."""
+    """The environment of every child here: :data:`SECURE_PATH`, plus the operator's :data:`_LOCALE_NAMES` that are
+    set, so ``ps`` prints as it would under the operator's locale. pgrep, ps and kill need nothing else. Built by name,
+    not from :func:`levain.launch.child_env`, which this stdlib-only module cannot import; every name here is on that
+    allowlist too."""
     env = {"PATH": SECURE_PATH}
-    env.update((k, v) for k, v in os.environ.items() if k == "LANG" or k.startswith("LC_"))
+    env.update((k, os.environ[k]) for k in _LOCALE_NAMES if k in os.environ)
     return env
 
 
