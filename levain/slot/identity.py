@@ -68,6 +68,42 @@ def identity_call(ctx: Optional[H.Ctx], vendor: str, a: Optional[R.Alloc] = None
     return oid
 
 
+#: §7.6: root reads at most this much of the identity call's stdout.
+PROFILE_ANSWER_MAX = 64 * 1024
+
+
+def parse_profile_answer(exit_code: int, out: bytes) -> str:
+    """IG-3: root's judgement of :mod:`levain.slot.identity_child`'s line. The observed id is the profile's
+    ``account.uuid`` when the child exited 0, its line is within :data:`PROFILE_ANSWER_MAX`, the server answered 200
+    and the body is JSON holding a uuid that fits ``OBSERVED_ID_RE``; anything else is ``identity-unparsable``."""
+    import json
+
+    def bad(why: str) -> Refused:
+        return Refused("identity-unparsable", why)
+
+    if exit_code != 0:
+        raise bad(f"identity call exit {exit_code}")
+    if len(out) > PROFILE_ANSWER_MAX:
+        raise bad("answer over 64 KiB")
+    try:
+        ans = json.loads(out.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise bad("answer is not JSON") from None
+    if type(ans) is not dict or type(ans.get("status")) is not int:
+        raise bad("no status")
+    if ans["status"] != 200:
+        raise bad(f"HTTP {ans['status']}")
+    try:
+        prof = json.loads(ans["body"]) if type(ans.get("body")) is str else None
+    except ValueError:
+        prof = None
+    acct = prof.get("account") if type(prof) is dict else None
+    uuid = acct.get("uuid") if type(acct) is dict else None
+    if type(uuid) is not str or not R.OBSERVED_ID_RE.fullmatch(uuid):
+        raise bad("no account.uuid")
+    return uuid
+
+
 def read_record(ctx: H.Ctx, session: str) -> Optional[R.SessionState]:
     """CONTROL's state record (§7.2), or None when absent: read as a HINT for a CAS CONTROL checks (§7.1)."""
     data = ctx.store.read(("sessions",), f"{session}.json", trusted=False)

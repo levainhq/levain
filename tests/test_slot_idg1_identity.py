@@ -372,3 +372,119 @@ def test_ask_reads_one_line_from_a_terminal(tmp_path):
         finally:
             os.close(master)
             os.close(slave)
+
+
+# --- IG-3: the Claude profile call's two halves (not wired to a wall target yet) -------------------------------------
+
+import http.server
+import json
+import threading
+
+from levain.slot import identity_child as IC
+
+UUID = "4f6c1a2e-0b7d-4c9e-8a31-2d5e6f708192"
+
+
+class _Profile(http.server.BaseHTTPRequestHandler):
+    status = 200
+    body = json.dumps({"account": {"uuid": UUID, "email": "x@example.com"}, "organization": {"uuid": "o"}})
+    seen: list = []
+
+    def do_GET(self):
+        type(self).seen.append((self.path, dict(self.headers)))
+        data = self.body.encode()
+        self.send_response(self.status)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def profile_server():
+    _Profile.seen = []
+    _Profile.status = 200
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Profile)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{srv.server_port}/api/oauth/profile"
+    srv.shutdown()
+    srv.server_close()
+
+
+def _creds(tmp_path, token="tok-SECRET-123"):
+    cfg = tmp_path / "claude"
+    cfg.mkdir()
+    (cfg / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": token}}))
+    return {"CLAUDE_CONFIG_DIR": str(cfg)}
+
+
+def _run_child(env, url):
+    """The child's main (its exit and stdout line) aimed at ``url`` instead of the real profile endpoint."""
+    import io
+    out = io.StringIO()
+    real = IC.fetch
+    IC.fetch = lambda e, **kw: real(e, url=url)
+    try:
+        code = IC.main(env=env, out=out)
+    finally:
+        IC.fetch = real
+    return code, out.getvalue().encode()
+
+
+def test_child_sends_the_bearer_and_beta_and_root_takes_the_uuid(tmp_path, profile_server):
+    code, out = _run_child(_creds(tmp_path), profile_server)
+    ((path, headers),) = _Profile.seen
+    assert path == "/api/oauth/profile"
+    h = {k.lower(): v for k, v in headers.items()}
+    assert h["authorization"] == "Bearer tok-SECRET-123" and h["anthropic-beta"] == IC.OAUTH_BETA
+    assert b"tok-SECRET-123" not in out                            # the token never reaches stdout
+    assert ID.parse_profile_answer(code, out) == UUID
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_non_200_is_unparsable(tmp_path, profile_server, status):
+    _Profile.status = status
+    code, out = _run_child(_creds(tmp_path), profile_server)
+    assert json.loads(out) == {"status": status, "body": ""}
+    with pytest.raises(Refused) as e:
+        ID.parse_profile_answer(code, out)
+    assert e.value.name == "identity-unparsable"
+
+
+@pytest.mark.parametrize("body", ["not json", json.dumps({"account": {}}), json.dumps({"account": {"uuid": "a b"}}),
+                                  json.dumps({"account": {"uuid": 7}}), json.dumps([]), json.dumps({"uuid": UUID})])
+def test_a_bad_profile_body_is_unparsable(tmp_path, profile_server, body, monkeypatch):
+    monkeypatch.setattr(_Profile, "body", body)
+    code, out = _run_child(_creds(tmp_path), profile_server)
+    with pytest.raises(Refused) as e:
+        ID.parse_profile_answer(code, out)
+    assert e.value.name == "identity-unparsable"
+
+
+def test_no_credential_no_request(tmp_path, profile_server):
+    code, out = _run_child({"CLAUDE_CONFIG_DIR": str(tmp_path)}, profile_server)
+    assert (code, json.loads(out)) == (1, {"error": "no-token"}) and _Profile.seen == []
+    with pytest.raises(Refused):
+        ID.parse_profile_answer(code, out)
+
+
+def test_an_unreachable_server_names_no_token(tmp_path):
+    code, out = _run_child(_creds(tmp_path), "http://127.0.0.1:9/api/oauth/profile")
+    assert (code, json.loads(out)) == (1, {"error": "request-failed"})
+
+
+@pytest.mark.parametrize("code,out", [(0, b"x" * (64 * 1024 + 1)), (1, b'{"status":200,"body":"{}"}'),
+                                      (0, b"\xff"), (0, b'{"body":"{}"}'), (0, b'{"status":"200","body":"{}"}')])
+def test_root_parser_refuses_the_rest(code, out):
+    with pytest.raises(Refused) as e:
+        ID.parse_profile_answer(code, out)
+    assert e.value.name == "identity-unparsable"
+
+
+def test_claude_call_still_refuses_until_wired():
+    with pytest.raises(Refused) as e:
+        ID.identity_call(None, "claude")
+    assert e.value.name == "identity-call-unbuilt"
