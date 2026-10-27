@@ -1659,13 +1659,23 @@ def _add_consent_canary_parser(consent_sub: argparse._SubParsersAction) -> None:
     canary_p.add_argument("--agent", required=True, choices=("claude_code", "codex"))
     canary_p.add_argument("--workspace", type=Path, default=None,
                           help="Scratch workspace: a new or empty directory (default: a new temporary one).")
+    canary_p.add_argument("--sandbox", action="store_true",
+                          help=("Instead, check the confinement: one model turn runs a fixed probe through "
+                                "`levain session`, which tries a fixed set of escapes; exit 1 on any escape or an "
+                                "unclear run."))
+    canary_p.add_argument("--cockpit-url", default=None, metavar="URL",
+                          help=("With --sandbox: the cockpit whose port the probe aims at (default: the address "
+                                "`levain cockpit sign --url` defaults to); loopback only."))
     canary_p.set_defaults(func=_cmd_consent_canary)
 
 
 def _cmd_consent_canary(args: argparse.Namespace) -> int:
     from levain.consent.canary import cli_canary
 
-    return cli_canary(args.agent, args.workspace)
+    if args.cockpit_url is not None and not args.sandbox:
+        print("levain consent canary: --cockpit-url only applies with --sandbox", file=sys.stderr)
+        return 2
+    return cli_canary(args.agent, args.workspace, sandbox=args.sandbox, cockpit_url=args.cockpit_url)
 
 
 def _add_consent_ledger_parser(consent_sub: argparse._SubParsersAction) -> None:
@@ -2639,6 +2649,12 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
     cs_phone.add_argument("--token-file", dest="token_file", type=Path, default=None,
                           help="Keep the phone token in FILE (mode 0600): read it from there when FILE exists, else "
                                "make one and write it, so a restart keeps the links the phone already holds.")
+    cs_phone.add_argument("--redirect-to", dest="redirect_to", default=None, metavar="ORIGIN",
+                          help="Serve ONLY a redirect: every link the phone already holds for this port opens on "
+                               "the cockpit at ORIGIN (https://<name>:<port>), a sign link on that request's sheet "
+                               "(/sign/<id>), its token dropped and never forwarded. Nothing else is served, no "
+                               "token is made, and --link-file then holds {page: ORIGIN/} only. Takes no "
+                               "--queue-dir, --sign-namespace or --token-file.")
     cs_phone.set_defaults(func=_cmd_consent_phone)
 
     from levain.consent.sign_setting import add_parser as add_signed_answers_parser
@@ -2705,9 +2721,19 @@ def _sign_namespace(text: str) -> str:
 
 
 def _cmd_consent_phone(args: argparse.Namespace) -> int:
-    from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_server
+    from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_redirect, run_phone_server
 
     from levain.consent.queue import default_queue_dir
+
+    if args.redirect_to is not None:
+        full = [flag for flag, given in (("--queue-dir", args.queue_dir), ("--sign-namespace", args.sign_namespaces),
+                                         ("--token-file", args.token_file)) if given]
+        if full:
+            print(f"--redirect-to serves only the redirect: drop {', '.join(full)}", file=sys.stderr)
+            return 2
+        return run_phone_redirect(args.redirect_to, name=args.name, tailscale=args.tailscale,
+                                  port=DEFAULT_PHONE_PORT if args.port is None else args.port,
+                                  link_file=args.link_file.expanduser() if args.link_file is not None else None)
 
     # the phone port may start before any agent has filed a request: a queue with no database yet lists nothing
     qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()

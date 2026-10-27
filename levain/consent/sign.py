@@ -369,21 +369,39 @@ def parse_choice(signed: bytes, *, write_in: bool = False) -> "tuple[str, str, s
     return message, m.group(1), m.group(2)
 
 
-def deep_link(page: str, request_id: str, token: str | None = None, *, choice: str | None = None,
-              version: str | None = None) -> str:
-    """The phone page link that opens straight onto sign request ``request_id``'s card: ``page`` (the printed
-    ``https://<name>/``) with ``#sign=<id>``, and this run's ``phone_token`` first when given (a browser that has not
-    opened this run's link needs it; the fragment never reaches the server or its logs). ``choice``, an option key
-    (never the write-in's :data:`WRITE_IN_KEY`), is the option the operator already tapped elsewhere, and ``version``
-    the request's ``sha256`` (the hex digest of its file's bytes, :attr:`SignRequest.sha256`, or the first 16 hex of
-    it) as filed when he tapped it. A choice needs its version; a version alone is the base link an app adds
-    ``&choice=<key>`` to when he taps an option. The link carries ``v=<the first 16 hex>`` and then ``choice=<key>``
-    (the page reads them in any order), and the page offers to sign that option with one tap only while the listed
-    request has that version; ``v=`` alone draws the plain card. It is page state only, never what is signed: the
-    bytes are built from the request file (:func:`signed_bytes`), and a key the card does not offer, or another
-    version, draws nothing but a line."""
-    from urllib.parse import quote
+_COCKPIT_ORIGIN = re.compile(r"(https?)://([a-z0-9.-]{1,253})(?::([0-9]{1,5}))?/?")
+_LOCAL_HTTP = frozenset({"localhost", "127.0.0.1"})
 
+
+def cockpit_origin(text: object) -> str:
+    """The cockpit's bare origin, normalised (lowercase, no trailing ``/``): ``https://<host name>[:<port>]``, or
+    ``http://`` for ``localhost`` / ``127.0.0.1`` only (this machine's own browser). Anything else (a path, a query,
+    a fragment, credentials, a backslash, an address, a malformed name, a port outside 1..65535) is
+    :class:`ValueError`. The one rule for a sign link's origin and the old phone port's redirect target."""
+    from levain.consent.passkey import is_host_name
+
+    m = _COCKPIT_ORIGIN.fullmatch(text.lower()) if isinstance(text, str) and text.isascii() else None
+    if m is not None:
+        scheme, host, port = m.groups()
+        good_port = port is None or 0 < int(port) < 65536
+        good_host = host in _LOCAL_HTTP if scheme == "http" else (is_host_name(host) or host == "localhost")
+        if good_port and good_host:
+            return f"{scheme}://{host}" + (f":{int(port)}" if port is not None else "")
+    raise ValueError(f"{str(text)[:80]!r} is not a bare origin (https://<name>[:<port>])")
+
+
+def deep_link(origin: str, request_id: str, *, choice: str | None = None, version: str | None = None) -> str:
+    """The link that opens the cockpit's sign sheet on sign request ``request_id`` (ONESURFACE OS-4):
+    ``<origin>/sign/<id>``, ``origin`` being the cockpit's bare origin by :func:`cockpit_origin` (a trailing ``/``
+    allowed, nothing else). It carries no credential: the sheet's reads take the paired device's own token, which
+    never rides a link. ``choice``, an option key (never the write-in's :data:`WRITE_IN_KEY`), is the option the
+    operator already tapped elsewhere, and ``version`` the request's ``sha256`` (the hex digest of its file's bytes,
+    :attr:`SignRequest.sha256`, or the first 16 hex of it) as filed when he tapped it. A choice needs its version; a
+    version alone is the base link an app adds ``&choice=<key>`` to when he taps an option. The fragment carries
+    ``v=<the first 16 hex>`` and then ``choice=<key>``, and the sheet offers to sign that option with one tap only
+    while the listed request has that version; ``v=`` alone draws the plain sheet. It is page state only, never what
+    is signed: the bytes are built from the request file (:func:`signed_bytes`), and a key the sheet does not offer,
+    or another version, draws nothing but a line."""
     if _ID.fullmatch(request_id or "") is None:
         raise ValueError(f"{str(request_id)[:80]!r} is not a sign request id")
     if choice is not None and version is None:
@@ -392,12 +410,9 @@ def deep_link(page: str, request_id: str, token: str | None = None, *, choice: s
         raise ValueError(f"{str(choice)[:20]!r} is not an option key ([a-z0-9]{{1,8}})")
     if version is not None and (not isinstance(version, str) or _VERSION.fullmatch(version) is None):
         raise ValueError(f"{str(version)[:80]!r} is not a request's sha256 (64 or its first 16 lower-case hex)")
-    parts = ([f"phone_token={quote(token, safe='')}"] if token else []) + [f"sign={request_id}"]
-    if version is not None:
-        parts.append(f"v={version[:16]}")
-    if choice is not None:
-        parts.append(f"choice={choice}")
-    return page.split("#", 1)[0] + "#" + "&".join(parts)
+    link = f"{cockpit_origin(origin)}/sign/{request_id}"
+    frag = ([f"v={version[:16]}"] if version is not None else []) + ([f"choice={choice}"] if choice is not None else [])
+    return link + ("#" + "&".join(frag) if frag else "")
 
 
 def _option_text_problem(text: object, what: str, most: int = OPTION_TEXT_MAX) -> str | None:

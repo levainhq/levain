@@ -114,6 +114,7 @@ from levain.cockpit.routes import VARY as COCKPIT_VARY
 from levain.cockpit.routes import handle_get as handle_cockpit_get
 from levain.cockpit.routes import EVENTS_PATH, is_cockpit_path
 from levain.cockpit import stream as cockpit_stream
+from levain.cockpit import threads as cockpit_threads
 from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb,
                                   record_served_verbs, retier)
 
@@ -736,7 +737,25 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
     # The sign sheet's script (OS-1): its page is GET /sign/<id>, served by _route beside a Signer.
     "/sign.js": ("sign.js", "text/javascript; charset=utf-8"),
+    # The thread view (CH-U1a): the Build tab's Threads zone, over GET /cockpit/threads.json and /cockpit/thread/<id>.json.
+    "/thread_view.js": ("thread_view.js", "text/javascript; charset=utf-8"),
 }
+
+
+# ONESURFACE OS-4: web push on this origin (levain.webpush.routes), served beside a Signer, whose queue holds the push
+# store. The worker, manifest and icons are app shell (token-free, no data); the two reads and three writes need a
+# token on every bind; the phone port's own pairing (/webpush/pair, /webpush/pair/redeem) is not served here: this
+# origin pairs through /pair.
+_PUSH_GET = frozenset({"/webpush/key", "/webpush/record"})
+_PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened"})
+_PUSH_SUBSCRIBE = "/webpush/subscribe"
+_PUSH_PREFIX = "/webpush/"
+
+
+def _push_static() -> frozenset[str]:
+    from levain.webpush.routes import STATIC_PATHS
+
+    return STATIC_PATHS
 
 
 # The chat routes (K1 part 2, `levain serve --chat`). Served only when the server holds a ChatHost;
@@ -756,11 +775,12 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/edit",
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
-    _GRANT_LIST_PATH,
-} | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
+    _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH,
+} | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
 _RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
-                                       _GRANT_PREFIX, _SHEET_PREFIX)
+                                       _GRANT_PREFIX, _SHEET_PREFIX, _PUSH_PREFIX, cockpit_threads.THREAD_PREFIX,
+                                       _NOTE_BODY_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -871,14 +891,16 @@ def build_substrate_json(
     # `writable` is a transport capability, deliberately NOT a SubstrateView field;
     # guard the namespace so a future to_dict() field of the same name can't be
     # silently clobbered (caught in tests, never in prod — complement L3).
-    assert "writable" not in payload, "SubstrateView.to_dict() collided with transport `writable`"
+    if "writable" in payload:
+        raise RuntimeError("SubstrateView.to_dict() collided with transport `writable`")
     payload["writable"] = source.write_scope is not None
     # OFF-BOX write signal (spore-129): true iff this surface is writable AND bound off-loopback,
     # i.e. the server's POST /edit will REQUIRE the X-Levain-Write-Token header (see do_POST).
     # It tells the frontend to attach the device-held token. The handler computes the predicate
     # (it owns the bound-address fact) and, since K2a, also sets it on any writable surface,
     # because every write needs the token there; default False here.
-    assert "write_token_required" not in payload, "to_dict() collided with transport `write_token_required`"
+    if "write_token_required" in payload:
+        raise RuntimeError("to_dict() collided with transport `write_token_required`")
     payload["write_token_required"] = write_token_required
     # Inline external panels (the read-only extra-PANEL seam): a per-request provider returns
     # full panel descriptors+data; split each into a layout entry (kind:"external") + its data
@@ -886,7 +908,8 @@ def build_substrate_json(
     # panels. The provider is a DOWNSTREAM read (e.g. the Bridge's inbox) — gated like this whole
     # route. FAIL-SOFT: a provider fault degrades to no extra panels, never breaks the cockpit.
     if extra_panels is not None:
-        assert "extra_panels" not in payload, "to_dict() collided with transport `extra_panels`"
+        if "extra_panels" in payload:
+            raise RuntimeError("to_dict() collided with transport `extra_panels`")
         try:
             panels = extra_panels()
             # the provider CONTRACT is a list/tuple of dicts; coerce anything else (None, an
@@ -952,7 +975,8 @@ def build_substrate_json(
     # verbs are registered (a read-only serve passes none), so the frontend renders no compose
     # affordance at all even if a panel still declares an `action` (NO THEATER).
     if extra_verbs:
-        assert "action_verbs" not in payload, "to_dict() collided with transport `action_verbs`"
+        if "action_verbs" in payload:
+            raise RuntimeError("to_dict() collided with transport `action_verbs`")
         payload["action_verbs"] = {
             # `idempotent` tells the frontend to mint + send a client `idempotency_key` for this
             # verb (the at-most-once retry token); `job` tells it the POST returns a job HANDLE to
@@ -1321,7 +1345,8 @@ class _Handler(GuardedHandler):
         name = None
         for n, tok in sorted(self.server.surface_tokens.items()):
             # RQ-6: make_server refuses a surface name with the paired prefix; this holds it at the point of use
-            assert not n.startswith(PAIRED_PREFIX), f"surface token name {n!r} is in the paired namespace"
+            if n.startswith(PAIRED_PREFIX):
+                raise RuntimeError(f"surface token name {n!r} is in the paired namespace")
             if tok and hmac.compare_digest(supplied, tok.encode("utf-8")) and name is None:
                 name = n
         if name is not None:
@@ -1639,6 +1664,80 @@ class _Handler(GuardedHandler):
             return False
         return True
 
+    def _serve_push(self, path: str, *, head: bool, read: bool = False) -> None:
+        """A web push GET (OS-4) through :func:`levain.webpush.routes.handle` over the Signer's queue: an app-shell
+        file (no query reaches it, so the manifest never carries a pairing code), or with ``read`` the key or the
+        record, behind :meth:`_sign_read_admitted`."""
+        from levain.webpush import routes as push_routes
+
+        queue = self.server.signer.queue_dir
+        if not read:
+            status, body, ctype = push_routes.handle("GET", path, {}, b"", queue_dir=queue, authorized=False,
+                                                     device_id=None) or (404, b"not found\n", "text/plain")
+            self._send(body, ctype, status=status, head=head)
+            return
+        if not self._sign_read_admitted(head=head, what="push reads"):
+            return
+        try:
+            try:
+                got = push_routes.handle("GET", path, {}, b"", queue_dir=queue, authorized=True,
+                                         device_id=str(self._credential()["name"]))
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
+            except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer
+                got = 500, json.dumps({"error": "internal", "message": type(exc).__name__}).encode("utf-8"), "json"
+            status, body, _ = got
+            self._send(body, "application/json; charset=utf-8", status=status, head=head,
+                       headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+        finally:
+            self.server.request_gate.release()
+
+    def _push_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any] | bytes, int]":
+        """A web push POST (OS-4), its credential already checked: only a PAIRED device subscribes (a surface token
+        has no revoke that could stop the pings), and every subscription is stored under the device's credential
+        name, with this cockpit's journal as its device's authority: the send asks the journal whether the device is
+        live (:func:`levain.webpush.store.live_rows`), so a revoke stops its pings whether or not :meth:`_retire_push`
+        ran, and the subscribe asks it again inside its own write."""
+        from levain.webpush import routes as push_routes
+
+        name = str(self._credential()["name"])
+        if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
+            return {"error": "device_required", "message": "turn pings on from a paired device: pair it from the "
+                    "Devices panel first"}, 403
+        broker = self.server.broker
+        got = push_routes.handle("POST", route, {}, raw, queue_dir=self.server.signer.queue_dir, authorized=True,
+                                 device_id=name, journal=broker.data_root if broker is not None else None)
+        if got is None:                 # every route in _PUSH_POST is one of handle's
+            raise RuntimeError(f"push route {route} not handled")
+        return got[1], got[0]
+
+    def _retire_push(self, device_ids: "list[str]", now: datetime) -> "str | None":
+        """Tidy-up after a revoke (OS-4): the revoked paired devices' push subscriptions marked retired. Not the
+        guard: every send asks the journal, so a revoked device gets no ping either way. A note when the push store
+        could not be written (the revoke itself has committed), else None."""
+        if self.server.signer is None or not device_ids:
+            return None
+        from levain.webpush.store import PushStore, retire_device_subscriptions
+
+        try:
+            conn = PushStore(self.server.signer.queue_dir).connection()
+        except Exception as exc:  # noqa: BLE001 - the revoke stands and the send refuses the device
+            _log.warning("paired device revoke: push store not opened", exc_info=True)
+            return f"its push subscriptions were not tidied ({type(exc).__name__}); no ping reaches it"
+        try:
+            with conn:
+                for device in device_ids:
+                    retire_device_subscriptions(conn, PAIRED_PREFIX + str(device), now)
+        except Exception as exc:  # noqa: BLE001 - the revoke stands and the send refuses the device
+            _log.warning("paired device revoke: push subscriptions not tidied", exc_info=True)
+            return f"its push subscriptions were not tidied ({type(exc).__name__}); no ping reaches it"
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - a close fault after the commit says nothing about the retirement
+                _log.warning("paired device revoke: push store close failed", exc_info=True)
+        return None
+
     def _serve_grant_list(self, *, head: bool) -> None:
         """``GET /cockpit/grant/list.json``: :meth:`levain.consent.grant_phone.GrantPhone.listing` (each grant with
         ``instance`` and ``signers``, the passkeys that may revoke it, and the notes) plus ``origin``, the page the
@@ -1909,6 +2008,37 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
+    def _serve_threads(self, path: str, *, head: bool) -> None:
+        """``GET /cockpit/threads.json`` and ``GET /cockpit/thread/<th-id>.json`` (CH-U1a): the coordinator's threads and
+        one thread's stream, read-only (:func:`levain.cockpit.threads.serve_threads`). A thread carries the operator's
+        lines and the agent's words and tool calls, so it rides the consent body's gate: reached only through
+        ``_route``, then a surface token on every bind, before the store is opened. ``dispatch.db`` lives in the consent
+        directory, resolved as the egress reading resolves it: a reader whose ``directory`` is None reads the default
+        queue, as the egress reading does; a reader with no ``directory`` attribute reads nothing."""
+        if not self._off_box_token_valid():
+            self._send(json.dumps({"error": "forbidden", "message": (
+                f"the thread record needs this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
+            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
+                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            return
+        reader = self.server.consent_reader
+        if not hasattr(reader, "directory"):
+            status, payload = ((200, {"threads": [], "truncated": False}) if path == cockpit_threads.THREADS_LIST_PATH
+                               else (404, {"error": "not_found", "message": "no such thread recorded"}))
+        else:
+            from levain.consent.queue import default_queue_dir
+
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                return
+            try:
+                status, payload = cockpit_threads.serve_threads(
+                    path, "", directory=reader.directory if reader.directory is not None else default_queue_dir())
+            finally:
+                self.server.request_gate.release()
+        self._send(cockpit_threads.encode(payload), "application/json; charset=utf-8", status=status, head=head,
+                   headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
     def _serve_session_log(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/session/<stem>.json``: one agent session's transcript (``session_log.read_session``). The
         consent body's gate: reached only through ``_route``, then a surface token on every bind, judged by
@@ -2165,6 +2295,13 @@ class _Handler(GuardedHandler):
         if consent_read is not None:                # its read rides the sign listing's gate exactly
             self._serve_consent_sheet(consent_read, head=head)
             return
+        # Web push (OS-4), beside a Signer only: the app shell token-free, the reads on the sign reads' own gate
+        if self.server.signer is not None and path in _push_static():
+            self._serve_push(path, head=head)
+            return
+        if self.server.signer is not None and path in _PUSH_GET:
+            self._serve_push(path, head=head, read=True)
+            return
         # The sign listing runs the write gate's own checks (a token on every bind), stricter than the off-box gate
         # below, so it is routed before it; without a signer it is 404 to everyone (the route's name is public).
         if path == _SIGN_LIST_PATH or _sign_one(path) is not None:
@@ -2228,6 +2365,9 @@ class _Handler(GuardedHandler):
             return
         if path.startswith(_SESSION_LOG_PREFIX) and path.endswith(_SESSION_LOG_SUFFIX):
             self._serve_session_log(path, head=head)
+            return
+        if cockpit_threads.is_threads_path(path):
+            self._serve_threads(path, head=head)
             return
 
         if is_cockpit_path(path):
@@ -2547,7 +2687,10 @@ class _Handler(GuardedHandler):
         grant = grant_route(route, _GRANT_PREFIX) if self.server.grant_phone is not None else None
         # and the consent family's answer and ruling (OS-2): the same ceremony class, the same gate
         consent = _consent_sign_route(route) if self.server.consent_sheet is not None else None
-        if (sign is not None or compose or grant is not None or consent is not None) and not self._off_box_token_valid():
+        # and web push (OS-4): a token on every bind
+        push = route in _PUSH_POST and self.server.signer is not None
+        if (sign is not None or compose or grant is not None or consent is not None or push) \
+                and not self._off_box_token_valid():
             return self._reject(403, "credential_required", "missing or invalid write token")
         if self._write_token_required() and not self._off_box_token_valid():
             return self._reject(403, "forbidden", "missing or invalid write token")
@@ -2562,7 +2705,7 @@ class _Handler(GuardedHandler):
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
-                and consent is None):
+                and consent is None and not push):
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -2606,6 +2749,18 @@ class _Handler(GuardedHandler):
                     self._send_json({"error": "not_found", "message": "no such route"}, 404)
                     return
                 self._send_chat(self._chat_post(route, host, req))
+                return
+            if push:
+                try:
+                    out, status = self._push_post(route, raw)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    out, status = {"error": "internal", "message": type(exc).__name__}, 500
+                if isinstance(out, bytes):
+                    self._send(out, "application/json; charset=utf-8", status=status)
+                else:
+                    self._send_json(out, status)
                 return
             if compose:
                 # the caller's compose_signer files the request: like the ceremony, no read-only refusal applies to it
@@ -2774,6 +2929,9 @@ class _Handler(GuardedHandler):
                 if status == 200:
                     with srv.pair_epoch_lock:       # after the commit, never inside it (RU-3)
                         srv.pair_epoch += 1
+                    note = self._retire_push(list(payload.get("revoked") or []), now)
+                    if note is not None:
+                        payload["push_note"] = note
                 elif payload.get("error") == "bad_request" and "no such device" in payload.get("message", ""):
                     status = 404
             self._pair_send(payload, status, cache_control="no-store")

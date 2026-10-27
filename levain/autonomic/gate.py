@@ -72,7 +72,7 @@ from levain.autonomic.store import GateReceiptStore
 from levain.autonomic.transport import ConfirmDecision, ConfirmProposal, ConfirmTransport
 from levain.autonomic.trust import IntentProvenance, SignalAuth, TrustContext
 
-__all__ = ["GateOutcome", "EfferentGate", "binding_family"]
+__all__ = ["GateOutcome", "EfferentGate", "binding_family", "receipt_by"]
 
 _log = logging.getLogger("levain.autonomic.gate")
 
@@ -225,6 +225,14 @@ def _default_summary(request: ActionRequest) -> str:
     action shape — recipient, subject, …) should inject a richer, §1.2-attributed ``summarize``."""
     head = request.payload.strip().replace("\n", " ")[:160]
     return f"{request.action_name}: {head}"
+
+
+def receipt_by(decider: str | None, grantor: str | None) -> str:
+    """The receipt's decider (the frozen ``human | binding | on-loop`` enum) for a decision by ``decider`` under an
+    authority granted by ``grantor``: a person's decision is ``human``; any other is the autonomous actor, ``binding``
+    for a binding's authority, else ``on-loop``. A hold records ``decider`` itself (``on-loop`` for silence), so the two
+    differ for a binding's silence approval (O-p2-1 R3-2)."""
+    return "human" if decider == "human" else ("binding" if grantor == "binding" else "on-loop")
 
 
 def _is_chained(hold: dict[str, Any]) -> bool:
@@ -1076,8 +1084,7 @@ class EfferentGate:
         # a first estimate is the decider's; one given by a resolver that did not make the decision is not
         estimate = None if already_approved else decision.first_estimate
         verdict = "approved" if decider == "human" else "auto"
-        by = decider if decider == "human" else (
-            "binding" if authority.grantor == "binding" else "on-loop")
+        by = receipt_by(decider, authority.grantor)
         run = RunRef(hold["run_id"], hold["effect_id"], chained=_is_chained(hold))
         # No kill predicates or trigger event on the resolve-fire: a binding's known-danger kills were
         # evaluated when this effect was proposed, and they are deterministic over the immutable trigger

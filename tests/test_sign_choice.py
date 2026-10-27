@@ -147,12 +147,22 @@ def test_a_plain_message_holding_the_choice_mark_never_verifies_as_a_choice(tmp_
         parse_choice(("x\n" + choice_line("a", "y") + "\n" + choice_line("b", "z")).encode())
 
 
-def test_the_deep_link_opens_on_one_card() -> None:
-    assert deep_link("https://h.ts.net/", "np-run0001-c9f2a1") == "https://h.ts.net/#sign=np-run0001-c9f2a1"
-    assert deep_link("https://h.ts.net/#old", "np-run0001-c9f2a1", "a/b") == \
-        "https://h.ts.net/#phone_token=a%2Fb&sign=np-run0001-c9f2a1"
-    with pytest.raises(ValueError):
-        deep_link("https://h.ts.net/", "x&phone_token=evil")
+def test_the_deep_link_opens_the_sheet_and_carries_no_secret() -> None:
+    # ONESURFACE OS-4: the cockpit's sheet on the one origin, the id in the path; a link never carries a token
+    assert deep_link("https://h.ts.net:8443/", "np-run0001-c9f2a1") == "https://h.ts.net:8443/sign/np-run0001-c9f2a1"
+    assert deep_link("https://h.ts.net:8443", "np-run0001-c9f2a1") == "https://h.ts.net:8443/sign/np-run0001-c9f2a1"
+    with pytest.raises(TypeError):
+        deep_link("https://h.ts.net/", "np-run0001-c9f2a1", "a/b")     # no token argument any more
+    for bad in ("x&phone_token=evil", "../../x", "np-run0001-c9f2a1#v=0"):
+        with pytest.raises(ValueError):
+            deep_link("https://h.ts.net/", bad)
+    for page in ("https://h.ts.net/#old", "https://h.ts.net/phone.html", "https://h.ts.net/?t=1", "h.ts.net",
+                 "https://u@h.ts.net/", "https://h ts.net/", "https://a.com\\.b/", "https://box.ts.net\\evil",
+                 "https://good..com", "http://evil.example", "https://10.0.0.1", "https://h.ts.net:0"):
+        with pytest.raises(ValueError):
+            deep_link(page, "np-run0001-c9f2a1")
+    # the rule the redirect's target is configured by (phone_server.redirect_origin), stated once
+    assert deep_link("HTTP://LocalHost:8080/", "np-run0001-c9f2a1") == "http://localhost:8080/sign/np-run0001-c9f2a1"
 
 
 def test_the_signed_answers_setting_reads_off_authority_only_or_all(tmp_path: Path) -> None:

@@ -107,7 +107,7 @@ def test_the_reaper_selections_skip_legacy_rows_and_keep_the_unstamped_intent(le
     assert legacy.execute(s.REAP_MIDCHAIN_RUNS).fetchall() == []
     assert legacy.execute(s.REAP_UNKNOWN_LINK_RUNS).fetchall() == []
     # the poisoned intent (legacy 0) in the legacy run is still the reaper's, and closes
-    assert legacy.execute(s.REAP_EFFECTS).fetchall() == [("old", "link-1", None)]
+    assert legacy.execute(s.REAP_EFFECTS).fetchall() == [("old", "link-1", 1, None)]   # O-p2-1: keyed by attempt
     tx(legacy, lambda c: s.close_subject(c, subject="effect:old:link-1", state="unknown",
                                          record=rec("g-x", "effect:old:link-1", "outcome_unknown", fired=False)))
     assert legacy.execute(s.REAP_EFFECTS).fetchall() == []
