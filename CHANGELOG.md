@@ -135,12 +135,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   other host is still refused at the gateway, and the refusal now names how to allow it.
 - **The install helper's `routes-egress` verb sets your own extra egress hosts** (JSON on stdin; an empty list removes
   them). They apply to sessions started afterwards. If your route map already has your own egress route for one of the
-  shipped hosts (for example `pypi.org`), your route keeps it and the shipped list leaves it off; setup, repair and
-  `routes-base` say so. A map where two of your routes name the same host, a route that lists the same host twice, or a
-  subscription route that names one of those shipped egress hosts is refused when the map is merged, with the route
-  names and the fix (edit `routes/base.json`), instead of every session failing at its gateway (the shipped Claude route,
-  below, is a passthrough route, not an egress one, so it is not such a case); `routes-egress` refuses to write over such
-  a map.
+  `egress-default` hosts (for example `pypi.org`), your route keeps it and the shipped list leaves it off; setup, repair
+  and `routes-base` say so. A map where two of your routes name the same host, a route that lists the same host twice, a
+  subscription route that names one of those `egress-default` hosts, or your own egress route that names a host the
+  shipped Claude route below also names (`claude.ai`, `platform.claude.com`) is refused when the map is merged, with
+  the route names and the fix (edit `routes/base.json`), instead of every session failing at its gateway;
+  `routes-egress` refuses to write over such a map.
 - **The cockpit has a Calm switch.** On, the agents graph and the sky stop moving and the page's animations and transitions stop, and the
   ages on the page refresh every two minutes instead of faster, so an open cockpit tab costs the laptop far less; every
   number, card and answer stays. It is remembered on that device. On a desktop bar too narrow for the label it shows as an
