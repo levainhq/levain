@@ -315,15 +315,16 @@ _HELD_DECISION = (
     f"AND ((h.decided_posture IS NULL AND {_absent('NEW.seal', '$.decision.posture')}) "
     "OR (h.decided_posture IS NOT NULL AND json_type(NEW.seal, '$.decision.posture') = 'text' "
     "AND json_extract(NEW.seal, '$.decision.posture') = h.decided_posture)))")
-# R3-1 as amended by R4-2 and int-I6: with no hold, the retry re-uses P's authority, its grant and its cover
-# (_same_authority), at a posture rank no lower than P's (both ranks known), and a human P's retry is human (10.Q2(b),
-# in the note's own NULL-safe words: R2-2 replaced it only for a link with a hold)
+# R3-1 as amended by R4-2, int-I6 and R15-5 S1 J4: with no hold, the retry re-uses P's authority: its actor (the same
+# text `by`, as _HELD_TIED binds a same-generation held retry; this subsumes 10.Q2(b), a human P's retry is human), its
+# grant and its cover (_same_authority), at a posture rank no lower than P's (both ranks known)
 _HOLDLESS_AUTHORITY = (
     f"EXISTS (SELECT 1 {_PREV} AND {_same_authority('NEW.seal', 'p.seal')} "
+    "AND json_type(NEW.seal, '$.by') = 'text' AND json_type(p.seal, '$.by') = 'text' "
+    "AND json_extract(NEW.seal, '$.by') = json_extract(p.seal, '$.by') "
     "AND json_type(NEW.seal, '$.posture') = 'text' AND json_type(p.seal, '$.posture') = 'text' "
     f"AND {_rank('NEW.seal')} IS NOT NULL AND {_rank('p.seal')} IS NOT NULL "
-    f"AND {_rank('NEW.seal')} >= {_rank('p.seal')} "
-    "AND (json_extract(p.seal, '$.by') IS NOT 'human' OR json_extract(NEW.seal, '$.by') IS 'human'))")
+    f"AND {_rank('NEW.seal')} >= {_rank('p.seal')})")
 
 # int-I1 (O-p2-1 integration fix round 1): on a held link (where _HELD_DECISION has bound $.decision to the hold's
 # current decision) the seal's top-level fields are that decision's: the actor is human exactly when the decider is
@@ -379,7 +380,8 @@ RETRY_TRIGGERS = (
     # 10.Q2(a) + R2-2 + R3-1 + R3-2 + R4-2: who may retry
     _abort("effects_attempt_authority", f"NEW.attempt > 1 AND NOT IFNULL(({_LINK_HELD} AND {_HELD_DECISION}) "
            f"OR (NOT {_LINK_HELD} AND {_HOLDLESS_AUTHORITY}), 0)",
-           "R3-1/R3-2: a retry carries the current decision of its link, or the cover of its predecessor at no lower posture",
+           "R3-1/R3-2: a retry carries the current decision of its link, or the actor and cover of its predecessor "
+           "at no lower posture",
            "BEFORE INSERT ON effects"),
 )
 

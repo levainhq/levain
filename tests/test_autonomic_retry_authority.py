@@ -388,13 +388,13 @@ def test_count_held_refuses_an_attempt_that_is_not_an_int_from_1(store, bad):
     c.close()
 
 
-# ---- R3-1 + R4-2: a hold-less retry re-uses its predecessor's cover, at no lower posture ------------------------------
+# ---- R3-1 + R4-2 + J4: a hold-less retry re-uses its predecessor's actor and cover, at no lower posture --------------
 @pytest.mark.parametrize("first, retry", [
     (seal(grant=DROP, cover=DROP), seal(grant=DROP, cover=DROP)),     # both absent: the keys omitted
     (seal(grant=None, cover=None), seal(grant=None, cover=None)),     # both absent: JSON null
     (seal(grant=DROP, cover=DROP), seal(grant=None, cover=None)),     # one builder omits, one writes null
     (seal(cover="none"), seal(cover="none")),                         # the same cover text
-    (seal(), seal(posture="COOLING_OFF", by="human")),                # a higher posture
+    (seal(by="human"), seal(posture="COOLING_OFF", by="human")),      # a higher posture, the same actor
 ])
 def test_a_hold_less_retry_on_its_predecessors_authority_is_admitted(store, first, retry):
     c = raw(store)
@@ -413,6 +413,11 @@ def test_a_hold_less_retry_on_its_predecessors_authority_is_admitted(store, firs
     (seal(), seal(posture=None)),                                     # posture JSON null
     (seal(), seal(posture="SIDEWAYS")),                               # posture not a Posture
     (seal(), seal(posture=1)),                                        # posture as its rank number
+    (seal(), seal(by="binding")),                                     # J4: another actor
+    (seal(by="binding"), seal(by="on-loop")),
+    (seal(), seal(posture="COOLING_OFF", by="human")),                # J4: a person retrying a non-human attempt
+    (seal(), seal(by=DROP)),                                          # actor absent
+    (seal(), seal(by=None)),                                          # actor JSON null
 ])
 def test_a_hold_less_retry_that_widens_or_loses_its_authority_is_refused(store, first, retry):
     c = raw(store)
@@ -658,8 +663,10 @@ def test_a_hold_less_retry_never_drops_a_human_decider(store, first, retry):
 
 
 @pytest.mark.parametrize("first, retry", [
-    (seal(by="human"), seal(by="human")), (seal(by="on-loop"), seal(by="binding")), (seal(), seal(by="human"))])
-def test_a_hold_less_retry_keeps_or_raises_its_decider(store, first, retry):
+    (seal(by="human"), seal(by="human")), (seal(by="on-loop"), seal(by="on-loop")),
+    (seal(by="binding"), seal(by="binding"))])
+def test_a_hold_less_retry_keeps_its_decider(store, first, retry):
+    # R15-5 S1 J4: the retry's actor is its predecessor's (raising it is refused too: see the widening table above)
     c = raw(store)
     first_attempt(c, first)
     tx(c, attempt(2, retry))
