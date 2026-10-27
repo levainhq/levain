@@ -1593,6 +1593,7 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
 @media (min-width: 1041px) and (max-width: 1280px) {
   body.ke .masthead #calmbtn { font-size: 0; padding: var(--sp-3); }
   body.ke .masthead #calmbtn::before { content: "\2248"; font-size: var(--fs-title); }
+  body.ke .masthead #calmbtn[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
 }
 @media (max-width: 720px) {
   body.ke .band { grid-template-columns: 1fr; gap: var(--sp-4); }

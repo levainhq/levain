@@ -446,3 +446,27 @@ def test_a_store_that_refuses_removal_leaves_an_empty_layout_not_the_old_one(tmp
     ])
     assert out[-2]["left"] == ["tray", "now"], out[-2]
     assert out[-1] == [False, 0], out[-1]
+
+
+# Calm "on" in the icon band: a filled key background like the theme switch's pressed button; the labelled form (outside the band) is unchanged
+CALM_ON = ("(() => { const b = document.getElementById('calmbtn'), bg = () => getComputedStyle(b).backgroundColor;"
+           " const pressedTheme = document.querySelector('.themesw button[aria-pressed=\"true\"]');"
+           " const off = bg(), offPressed = b.getAttribute('aria-pressed'); b.click();"
+           " return new Promise(r => setTimeout(r, 500)).then(() => ({ off, offPressed, on: bg(), onPressed: b.getAttribute('aria-pressed'),"
+           " theme: pressedTheme ? getComputedStyle(pressedTheme).backgroundColor : null })); })()")
+
+
+@needs_browser
+def test_calm_on_in_the_icon_band_has_the_filled_background_of_the_theme_switchs_pressed_button(tmp_path: Path) -> None:
+    got = _run(tmp_path, [{"eval": CALM_ON}], width=1100)[-1]
+    assert got["offPressed"] == "false" and got["onPressed"] == "true", got
+    assert got["theme"], got
+    assert got["on"] != got["off"], got
+    assert got["on"] == got["theme"], got
+
+
+@needs_browser
+def test_calm_on_at_1440_keeps_the_labelled_look_with_no_filled_background(tmp_path: Path) -> None:
+    got = _run(tmp_path, [{"eval": CALM_ON}], width=1440)[-1]
+    assert got["offPressed"] == "false" and got["onPressed"] == "true", got
+    assert got["on"] == got["off"], got
