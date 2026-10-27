@@ -1,6 +1,6 @@
 """A1c1 part 2: the run journal's terminals on a ``levain-autonomic/3`` store (autogrant DESIGN r6.6 §r66.1, rev 7
 §r7.1-r7.2): every close carries its receipt, WON or LOST, and a hold decision steps its generation (O-a1c1d-1).
-/3 stays unwired (R15-5): these drive ``schema3.AutonomicStore3`` directly."""
+These drive ``schema3.AutonomicStore3`` directly."""
 from __future__ import annotations
 
 import json

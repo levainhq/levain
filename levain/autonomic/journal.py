@@ -826,8 +826,8 @@ class RunJournal:
 # ---- the ``levain-autonomic/3`` side (autogrant A1c1 part 2) ------------------------------------------------------
 # On a /3 store a terminal (a run's close, an effect's end, a pending's end) is written with its gate receipt in one
 # statement (``schema3.close_subject``), and the store refuses any other way. These functions run inside a write
-# transaction of :class:`levain.autonomic.schema3.AutonomicStore3`. Nothing in the engine opens a /3 store yet (the
-# R15-5 wiring gate): V's :class:`RunJournal` above stays on /2.
+# transaction of :class:`levain.autonomic.schema3.AutonomicStore3`. V's :class:`RunJournal` above opens only a /2 store
+# (:class:`~levain.autonomic.db.AutonomicDB`); a /3 store is wired in only with A1c2's sealed admission (R15-5).
 
 class Terminal(str, enum.Enum):
     """Whether a close this call made was the subject's one terminal (WON) or found it already closed (LOST)."""
