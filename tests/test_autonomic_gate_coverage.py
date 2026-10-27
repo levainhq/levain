@@ -188,11 +188,20 @@ def test_authority_moving_between_decision_and_admission_is_stale_then_held(tmp_
     w = CWorld(tmp_path, coverage=src)
     w.mint(Posture.ON_LOOP)
     if move == "revoke":
-        src.after_refresh = lambda: src.revoke("gp-a")                       # the head moves
+        mover = lambda: src.revoke("gp-a")                                  # noqa: E731 — the head moves
     elif move == "root_edit":
-        src.after_refresh = lambda: src.set_root(root_file())               # the signer gone, no head move
+        mover = lambda: src.set_root(root_file())                           # noqa: E731 — the signer gone
     else:
-        src.after_refresh = lambda: setattr(w, "now", EXPIRES)              # it lapses, no head move
+        mover = lambda: setattr(w, "now", EXPIRES)                          # noqa: E731 — it lapses
+    real = src.peek_cover
+
+    def peek_then_move(effect, now):
+        # the authority moves right after the fire check's peek (A1c2), so the admission's fence reads the move
+        got = real(effect, now)
+        if src.peeks == 1:
+            mover()
+        return got
+    src.peek_cover = peek_then_move
     first = w.dispatch("s1").outcome
     assert first.held and first.reason == "journal:stale" and not first.fired
     again = w.dispatch("s1").outcome                                         # decided again, under what holds now
