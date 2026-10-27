@@ -382,3 +382,141 @@ def _v2_run(tmp_path) -> str:
 @pytest.mark.usefixtures("test_only_confined_executor", "test_only_every_effect_covered")
 def test_a_v2_run_through_the_gate_is_what_it_was_at_be0af189(tmp_path):
     assert _v2_run(tmp_path).split("\n", 1)[0] == V2_RUN_DIGEST
+
+
+# ---- fix round 1 (levain project_memory 1027-9/op21c/FIX_r1.md) ------------------------------------------------------
+def test_g1_an_attempt_of_a_link_whose_hold_is_open_is_refused_and_nothing_is_written(store):
+    with store.write() as c:
+        run(c)
+        open_hold(c)
+        assert J.intent_in(c, "r", "link-0", digest="d", by="human", posture="CONFIRM") == "hold_open"
+        assert rows(c) == []
+
+
+def test_g1_an_attempt_whose_digest_is_not_the_approved_one_is_refused_and_nothing_is_written(store):
+    with store.write() as c:
+        run(c)
+        open_hold(c)
+        silence_approve(c)
+        assert J.intent_in(c, "r", "link-0", digest="B", by="binding", posture="COOLING_OFF", grant=GRANT,
+                           cover=COVER) == "digest_changed"
+        assert rows(c) == []
+
+
+def test_g1_a_retry_whose_digest_is_not_the_approved_one_is_refused_before_the_store_sees_it(store):
+    with store.write() as c:
+        run(c)
+        open_hold(c)
+        silence_approve(c)
+        held_intent(c)
+        not_started(c, 1, grant_guard=GUARD)
+    with store.write() as c:
+        assert J.intent_in(c, "r", "link-0", digest="B", by="binding", posture="COOLING_OFF", grant=GRANT,
+                           cover=COVER) == "digest_changed"
+        assert rows(c) == [(1, "not_started")]
+
+
+def test_g2_a_not_started_close_after_the_run_was_cancelled_commits_without_a_count(store):
+    with store.write() as c:
+        run(c)
+        assert plain_intent(c) == 1
+    with store.write() as c:   # another transaction cancels the run while the attempt is in flight
+        assert J.close_run_in(c, "r", reason="cancelled", receipt=receipt("cx", "run:r", "killed")).terminal \
+            is Terminal.WON
+    with store.write() as c:   # the executor then reports EffectNotStarted
+        out = not_started(c, 1)
+        assert (out.closed, out.held, out.run_closed) == (Closed(Terminal.WON, "ns1"), 0, None)
+    with store.read() as c:
+        assert rows(c) == [(1, "not_started")]
+        assert c.execute("SELECT COUNT(*) FROM held_counts").fetchone() == (0,)
+        assert J.poisoned_in(c, lambda r, e: False) == []
+        assert s.invariant(c) == []
+
+
+def test_g4_a_not_started_close_of_an_attempt_that_does_not_exist_is_a_key_error(store):
+    with store.write() as c:
+        run(c)
+        plain_intent(c)
+        with pytest.raises(KeyError):
+            J.close_not_started_in(c, "r", "link-0", 3, why="spawn", receipt=receipt("ns3", subj(3), "refused"),
+                                   run_receipt=lambda reason: receipt("run3", "run:r", "refused"))
+        assert c.execute("SELECT COUNT(*) FROM gate_receipts").fetchone() == (0,)
+
+
+def test_g4_a_not_started_close_of_an_ended_attempt_is_lost_and_uncounted(store):
+    with store.write() as c:
+        run(c, links=2)
+        plain_intent(c)
+        J.close_effect_in(c, "r", "link-0", state="done", receipt=receipt("e1", subj(1), "fired"), result=1)
+        out = not_started(c, 1)
+        assert (out.closed, out.held, out.run_closed) == (Closed(Terminal.LOST, "e1"), 0, None)
+        assert c.execute("SELECT COUNT(*) FROM held_counts").fetchone() == (0,)
+
+
+def test_g5_alternating_not_started_reasons_still_reach_the_bound(store):
+    # the count's subject is the link's request; the reason is only its last_reason, so a varying why cannot dodge it
+    limit = int(store.meta("held_limit"))
+    with store.write() as c:
+        run(c)
+    for n in range(1, limit + 1):
+        why = ("spawn", "no_route")[n % 2]
+        with store.write() as c:
+            assert plain_intent(c) == n
+            out = J.close_not_started_in(c, "r", "link-0", n, why=why,
+                                         receipt=receipt(f"ns{n}", subj(n), "refused"),
+                                         run_receipt=lambda reason: receipt(f"run{n}", "run:r", "refused"))
+        assert out.held == n
+    assert out.run_closed is not None and out.run_closed.terminal is Terminal.WON
+    with store.read() as c:
+        assert s.invariant(c) == []
+
+
+def test_g6_a_seal_of_a_link_whose_hold_is_undecided_is_refused(store):
+    with store.write() as c:
+        run(c)
+        open_hold(c)
+        with pytest.raises(ValueError, match="undecided"):
+            J.effect_seal_in(c, "r", "link-0", by="human", posture="CONFIRM")
+
+
+@pytest.mark.parametrize("terms", ["[1]", '"text"', "null", "3"])
+def test_g7_grant_terms_that_are_json_but_not_an_object_are_a_clear_error(store, terms):
+    with store.write() as c:
+        run(c)
+        with pytest.raises(ValueError, match="terms_text"):
+            J.effect_seal_in(c, "r", "link-0", by="binding", posture="ON_LOOP", grant={**GRANT, "terms_text": terms},
+                             cover=COVER)
+
+
+@pytest.mark.parametrize("run_id, effect_id", [("a:b", "link-0"), ("a#b", "link-0"), ("r", "link#0")])
+def test_g8_intent_in_refuses_an_id_no_effect_subject_can_name_before_any_read(store, run_id, effect_id):
+    reads = []
+    with store.write() as c:
+        c.set_trace_callback(reads.append)
+        with pytest.raises(ValueError, match="split ambiguously"):
+            J.intent_in(c, run_id, effect_id, digest="d", by="on-loop", posture="ON_LOOP")
+        c.set_trace_callback(None)
+        assert reads == []
+
+
+def test_g1_an_attempt_of_a_link_whose_hold_was_denied_is_refused_and_nothing_is_written(store):
+    with store.write() as c:
+        run(c)
+        open_hold(c)
+        assert J.decide_in(c, H, approve=False, digest="d", by="human",
+                           receipt=receipt("rj", "run:r", "refused")).ok
+        assert J.intent_in(c, "r", "link-0", digest="d", by="human", posture="CONFIRM") == "hold_denied"
+        assert rows(c) == []
+
+
+def test_g2_a_retry_closed_after_its_run_was_cancelled_keeps_the_count_as_it_stood(store):
+    two_attempts(store)                     # attempt 1 counted (held 1); attempt 2 in flight
+    with store.write() as c:
+        J.close_run_in(c, "r", reason="cancelled", receipt=receipt("cx", "run:r", "killed"))
+    with store.write() as c:
+        out = not_started(c, 2)
+        assert (out.closed, out.held, out.run_closed) == (Closed(Terminal.WON, "ns2"), 1, None)
+        assert c.execute("SELECT n, attempt FROM held_counts").fetchall() == [(1, 1)]
+    with store.read() as c:
+        assert rows(c) == [(1, "not_started"), (2, "not_started")]
+        assert s.invariant(c) == []

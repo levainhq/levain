@@ -1020,7 +1020,8 @@ def effect_seal_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, by:
     "posture"}`` copied from :func:`levain.autonomic.schema3.hold_decision` (``decided_by``, not the receipt actor:
     a silence approval is ``on-loop`` there and ``binding`` in ``$.by``), on every attempt; the store's
     ``effects_attempt_authority`` admits a retry only with the current decision's values. No hold: no
-    ``$.decision``."""
+    ``$.decision``. A hold not yet decided is a ``ValueError`` (there is no decision to seal), and so is a grant whose
+    ``terms_text`` is JSON but not an object."""
     from levain.autonomic.schema3 import hold_decision
     run = conn.execute("SELECT json_extract(seal, '$.guard') FROM runs WHERE run_id = ?", (run_id,)).fetchone()
     if run is None:
@@ -1029,11 +1030,17 @@ def effect_seal_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, by:
     grant_guard: Any = []
     if isinstance(grant, dict):
         terms = grant.get("terms_text")
-        grant_guard = (json.loads(terms).get("guard") if isinstance(terms, str) else None) or []
+        parsed = json.loads(terms) if isinstance(terms, str) else None
+        if isinstance(terms, str) and not isinstance(parsed, dict):
+            raise ValueError(f"effect_seal_in: grant {grant.get('id')!r} terms_text is not a JSON object: {terms:.80}")
+        grant_guard = (parsed.get("guard") if parsed is not None else None) or []
     seal: dict[str, Any] = {"floor": floor, "grant_guard": grant_guard, "by": by, "posture": posture,
                             "grant": grant, "cover": cover}
-    decision = hold_decision(conn, hold_id_for(run_id, effect_id))
+    hold_id = hold_id_for(run_id, effect_id)
+    decision = hold_decision(conn, hold_id)
     if decision is not None:
+        if conn.execute("SELECT decided FROM holds WHERE hold_id = ?", (hold_id,)).fetchone()[0] is None:
+            raise ValueError(f"effect_seal_in: hold {hold_id!r} is undecided: there is no decision to seal")
         seal["decision"] = {"generation": decision[0], "by": decision[1], "posture": decision[2]}
     return _canonical(seal)
 
@@ -1045,7 +1052,23 @@ def intent_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, digest: 
     latest attempt + 1 (the store admits a retry only after a counted ``not_started``). R2-6: ``revalidate(conn)``
     (the admission's re-check of authority and the risk fence) runs BEFORE the insert; a refusal (any string) is
     returned with nothing written, so the hold may still reopen (``holds_move`` refuses a reopen once a row of the link
-    is not ``not_started``). Returns the attempt number inserted, sealed by :func:`effect_seal_in`."""
+    is not ``not_started``). Returns the attempt number inserted, sealed by :func:`effect_seal_in`.
+
+    Before that, for ANY attempt, a link with a hold is refused with nothing written unless every hold of the link is
+    decided APPROVE for ``digest`` (O-p2-1 fix round 1 G1; the store's ``effects_attempt_authority`` checks only a
+    retry): ``hold_open`` (undecided), ``hold_denied``, or ``digest_changed`` (the /2 admission cancels its run for
+    that one; here the caller does). An id :func:`~levain.autonomic.schema3.effect_subject` refuses is its
+    ``ValueError``, before any read."""
+    from levain.autonomic.schema3 import effect_subject
+    effect_subject(run_id, effect_id)
+    for decided, held_digest in conn.execute("SELECT decided, digest FROM holds WHERE run_id = ? AND effect_id = ?",
+                                             (run_id, effect_id)).fetchall():
+        if decided is None:
+            return "hold_open"
+        if decided != 1:
+            return "hold_denied"
+        if held_digest != digest:
+            return "digest_changed"
     latest = latest_effect(conn, run_id, effect_id)
     attempt = 1 if latest is None else latest.attempt + 1
     if revalidate is not None:
@@ -1073,13 +1096,25 @@ def close_not_started_in(conn: sqlite3.Connection, run_id: str, effect_id: str, 
     transaction, in the order A1 requires: the receipted close (receipt mode ``refused``, row result
     ``not_started:<why>``), then the link's held count naming this attempt, then, at the bound, the run's close
     ``held_limit:not_started:<why>`` with ``run_receipt(reason)``. A retry is a later transaction (:func:`intent_in`).
-    LOST (and no count) when the attempt already ended."""
-    from levain.autonomic.schema3 import count_held, effect_subject, held_limit
-    closed = _close_in(conn, effect_subject(run_id, effect_id, attempt), receipt, state="not_started",
-                       result=f"not_started:{why}")
+    ``KeyError`` when the attempt has no row. LOST, with ``held`` 0 and no count, when the attempt already ended
+    (``held`` is then not the link's count). When the link's request is already closed (another transaction cancelled
+    the run while the attempt was in flight), the close is recorded and nothing is counted: ``held`` is the link's
+    count as it stood and ``run_closed`` None."""
+    from levain.autonomic.schema3 import _closed, count_held, effect_subject, held_limit
+    subject = effect_subject(run_id, effect_id, attempt)
+    row = effect_attempt(conn, run_id, effect_id, attempt)
+    if row is None:
+        raise KeyError(f"effect {run_id}/{effect_id} attempt {attempt} was never admitted")
+    if row.state != "intent":
+        return NotStarted(Closed(Terminal.LOST, row.receipt_id), 0, None)
+    closed = _close_in(conn, subject, receipt, state="not_started", result=f"not_started:{why}")
     if closed.terminal is Terminal.LOST:
         return NotStarted(closed, 0, None)
-    n = count_held(conn, f"request:{run_id}:{effect_id}", f"subject:not_started:{why}", attempt=attempt)
+    request = f"request:{run_id}:{effect_id}"
+    if conn.execute(f"SELECT {_closed(':s')}", {"s": request}).fetchone()[0]:
+        stood = conn.execute("SELECT n FROM held_counts WHERE subject = ?", (request,)).fetchone()
+        return NotStarted(closed, 0 if stood is None else stood[0], None)
+    n = count_held(conn, request, f"subject:not_started:{why}", attempt=attempt)
     if n < held_limit(conn):
         return NotStarted(closed, n, None)
     reason = f"held_limit:not_started:{why}"
