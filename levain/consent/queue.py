@@ -525,8 +525,9 @@ class Decision:
     it filed for the input it is holding (``ExternalGateRequest.digest``). ``via`` says how it was answered:
     ``signature`` (``signer_fp`` is the key) or ``grant`` (``signer_fp`` is None; ``grant_id`` names the standing
     grant, ``grant_seq``/``grant_hash`` the authority link that created or last renewed it, ``posture`` the
-    agent's reported posture it matched), or ``ruling`` (a late ruling on an undecided request: ``signer_fp`` is
-    the key, ``gap`` the request's gap number)."""
+    agent's reported posture it matched), ``ruling`` (a late ruling on an undecided request: ``signer_fp`` is
+    the key, ``gap`` the request's gap number), or ``contained_shell`` (a contained-shell grant answered a chat
+    call: the grant fields as for ``grant``)."""
     request_id: str
     decision: str
     signer_fp: str | None

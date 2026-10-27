@@ -85,8 +85,7 @@ def tool_input_digest(tool_input: Any) -> str:
     in its domain; a float (outside it) falls back to sorted compact JSON, under another prefix so the two
     schemes never compare equal. A mapping key that is not a string, anywhere in the input, raises ``TypeError``
     (json would coerce ``{1: "a"}`` to ``{"1": "a"}``, a digest of an input the agent never sent: L3 r2 codex D4).
-    Any other object JSON cannot encode is digested as its ``str``: no JSON-decoded input holds one, and
-    ``tests/test_coordinator_review.py`` records datetimes through the ledger this way."""
+    Any other object JSON cannot encode is digested as its ``str``; no JSON-decoded input holds one."""
     try:
         return "jcs:" + value_sha256(tool_input)
     except ConsentError:
