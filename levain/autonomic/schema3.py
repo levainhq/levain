@@ -165,8 +165,29 @@ def _guard_complete(seal_sql: str) -> str:
             "AND json_type(g.value, '$.kill_predicate') = 'object' AND json_type(g.value, '$.kill_drill') = 'object')")
 
 
+def _link_key(a: str) -> str:
+    # a link's key, '<run_id>:<effect_id>', of the effects / holds row aliased `a` (run ids carry no ':')
+    return f"{a}.run_id || ':' || {a}.effect_id"
+
+
+def _attempt_key(a: str) -> str:
+    # O-p2-1 section 4: an attempt's key: the link's key, then '#<n>' for attempt n >= 2 only (attempt 1 keeps the
+    # subject every receipt and V row already has)
+    return f"{_link_key(a)} || CASE WHEN {a}.attempt > 1 THEN '#' || {a}.attempt ELSE '' END"
+
+
+def _effect_subj(a: str) -> str:
+    # O-p2-1 section 4: THE spelling of an effects row's receipt subject in SQL (effect_subject is the Python twin)
+    return "'effect:' || " + _attempt_key(a)
+
+
+def _link_request(a: str) -> str:
+    # the request subject of the link an effects / holds row aliased `a` belongs to (one per link, every attempt)
+    return "'request:' || " + _link_key(a)
+
+
 _RUN = "'run:' || NEW.run_id"
-_EFF = "'effect:' || NEW.run_id || ':' || NEW.effect_id"
+_EFF = _effect_subj("NEW")
 _PEN = "'pending:' || NEW.pending_id"
 _REQ = "'request:' || NEW.request_id"
 # the run a receipt's subject belongs to (run ids carry no ':'); NULL for a pending
@@ -195,10 +216,13 @@ def _progress(subj: str) -> str:
     # R14-1: a decision counts only when someone took it: the silence default's (UNSIGNED_DECIDER) is not progress,
     # or a coverage answer that flaps between the sweep's read and the admission's (approve, then reopen, every
     # sweep) restarts the held count every cycle and the subject never reaches HELD_LIMIT
+    # O-p2-1 section 5: a link's attempts are ONE unit of progress (COUNT DISTINCT effect_id), or every not_started
+    # attempt would read as progress and restart the count that bounds them
     r = _run_of_request(subj)
     taken = f"by IS NOT '{UNSIGNED_DECIDER}'"
     return (f"(CASE WHEN {subj} GLOB 'request:?*' THEN "
-            f"(SELECT COUNT(*) FROM effects WHERE run_id = {r}) + (SELECT COUNT(*) FROM holds WHERE run_id = {r}) "
+            f"(SELECT COUNT(DISTINCT effect_id) FROM effects WHERE run_id = {r}) "
+            f"+ (SELECT COUNT(*) FROM holds WHERE run_id = {r}) "
             f"+ (SELECT COUNT(*) FROM hold_decisions WHERE run_id = {r} AND {taken}) "
             f"WHEN {subj} GLOB 'pending:?*' THEN IFNULL((SELECT CASE state WHEN 'open' THEN 0 WHEN 'firing' THEN 1 "
             f"ELSE 2 END FROM manual_pendings WHERE 'pending:' || pending_id = {subj}), "
@@ -208,11 +232,12 @@ def _progress(subj: str) -> str:
 
 
 def _closed(subj: str) -> str:
-    # I11: the subject is past (LOST), read from TERMINAL rows, never from a receipt's existence
+    # I11: the subject is past (LOST), read from TERMINAL rows, never from a receipt's existence. O-p2-1 section 5: a
+    # link whose only attempts are not_started is still a live request (an attempt that did not start ends nothing)
     r = _run_of_request(subj)
     return (f"(CASE WHEN {subj} GLOB 'request:?*' THEN EXISTS (SELECT 1 FROM requests WHERE 'request:' || request_id "
             f"= {subj}) OR EXISTS (SELECT 1 FROM cancels WHERE run_id = {r}) OR EXISTS (SELECT 1 FROM effects e "
-            f"WHERE 'request:' || e.run_id || ':' || e.effect_id = {subj}) "
+            f"WHERE {_link_request('e')} = {subj} AND e.state != 'not_started') "
             f"WHEN {subj} GLOB 'pending:?*' THEN EXISTS (SELECT 1 FROM manual_pendings WHERE 'pending:' || pending_id "
             f"= {subj} AND state = 'terminal') OR EXISTS (SELECT 1 FROM holds h WHERE 'pending:' || h.pending_id = "
             f"{subj} AND (h.decided IS NOT NULL OR EXISTS (SELECT 1 FROM cancels c WHERE c.run_id = h.run_id))) "
@@ -242,8 +267,13 @@ V3_TRIGGERS = (
     # ---- D69: no row is ever replaced (every PK / UNIQUE column, checked before the conflict can resolve)
     _abort("runs_new", "EXISTS (SELECT 1 FROM runs WHERE run_id = NEW.run_id)",
            "D69: a row is never replaced", "BEFORE INSERT ON runs"),
-    _abort("effects_new", "EXISTS (SELECT 1 FROM effects WHERE run_id = NEW.run_id AND effect_id = NEW.effect_id)",
-           "D69: a row is never replaced", "BEFORE INSERT ON effects"),
+    _abort("effects_new", "EXISTS (SELECT 1 FROM effects WHERE run_id = NEW.run_id AND effect_id = NEW.effect_id "
+           "AND attempt = NEW.attempt)", "D69: a row is never replaced", "BEFORE INSERT ON effects"),
+    # O-p2-1 B1a PLACEHOLDER: a link's first row is attempt 1, and no retry (attempt >= 2) is admitted until B1b's
+    # effects_attempt (retry legality, authority, witness) replaces this trigger under the same name
+    _abort("effects_attempt", "NEW.attempt IS NOT 1 OR EXISTS (SELECT 1 FROM effects e WHERE e.run_id = NEW.run_id "
+           "AND e.effect_id = NEW.effect_id AND e.attempt IS NOT 1)",
+           "O-p2-1: only attempt 1 of a link is admitted (no retry rule yet)", "BEFORE INSERT ON effects"),
     _abort("cancels_new", "EXISTS (SELECT 1 FROM cancels WHERE run_id = NEW.run_id)",
            "D69: a row is never replaced", "BEFORE INSERT ON cancels"),
     _abort("pendings_new", "EXISTS (SELECT 1 FROM manual_pendings WHERE pending_id = NEW.pending_id "
