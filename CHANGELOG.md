@@ -139,7 +139,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `routes-base` say so. A map where two of your routes name the same host, a route that lists the same host twice, or a
   subscription route that names one of those shipped egress hosts is refused when the map is merged, with the route
   names and the fix (edit `routes/base.json`), instead of every session failing at its gateway (the shipped Claude route,
-  below, is not such a case: your own route for Claude wins over it); `routes-egress` refuses to write over such a map.
+  below, is a passthrough route, not an egress one, so it is not such a case); `routes-egress` refuses to write over such
+  a map.
 - **The cockpit has a Calm switch.** On, the agents graph and the sky stop moving and the page's animations and transitions stop, and the
   ages on the page refresh every two minutes instead of faster, so an open cockpit tab costs the laptop far less; every
   number, card and answer stays. It is remembered on that device. On a desktop bar too narrow for the label it shows as an
@@ -162,7 +163,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   each give a reason the policy might be wrong, a kill (an event condition) and a drill (an example event the kill must
   not let through). Levain prints the guard back before signing and refuses a kill it could not evaluate, a drill the
   kill lets through, an entry missing any of the three, or a guard past the size limits. The guard is checked when the
-  policy is signed, not yet when a binding fires. A policy with a guard is written `levain-authority/3`, which an older
+  policy is signed, not yet when a binding fires. Every policy created now carries a guard and is written
+  `levain-authority/3`, which an older
   levain stops at instead of reading. A graduation policy signed without a guard no longer covers anything (its bindings
   wait at CONFIRM again) and cannot be renewed: revoke it and create it again with `--guard`. The graduation card's
   command line includes `--guard <guard.json>`.
