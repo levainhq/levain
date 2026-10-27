@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -154,10 +155,11 @@ _CHILD = textwrap.dedent("""
 """)
 
 
-def _crash_inside_fn(root: Path) -> RunJournal:
+def _crash_inside_fn(root: Path, child: str = _CHILD) -> RunJournal:
     """A child process records link-0's intent and is SIGKILLed inside ``fn``, before its end is written. While it
-    is inside, the reaper leaves the attempt in flight."""
-    p = subprocess.Popen([sys.executable, "-c", _CHILD.format(tests=str(Path(__file__).parent), root=str(root))],
+    is inside, the reaper leaves the attempt in flight. A child that exits on its own before the kill fails the
+    helper with the child's own stderr, whatever else failed first."""
+    p = subprocess.Popen([sys.executable, "-c", child.format(tests=str(Path(__file__).parent), root=str(root))],
                          env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     j = RunJournal(s.AutonomicStore3(root / "store"))
     try:
@@ -169,8 +171,10 @@ def _crash_inside_fn(root: Path) -> RunJournal:
         assert j._lease_held("r1", "link-0")
         assert upkeep3.reap(j) == {"effect:r1:link-0": s.IN_FLIGHT}
     finally:
-        os.kill(p.pid, signal.SIGKILL)
-        assert p.wait(timeout=10) == -signal.SIGKILL
+        p.send_signal(signal.SIGKILL)          # a no-op on a child already reaped by poll()
+        rc = p.wait(timeout=10)
+        err = p.communicate()[1].decode()
+        assert rc == -signal.SIGKILL, f"the child exited on its own ({rc}) before the kill:\n{err}"
     return j
 
 
@@ -233,12 +237,27 @@ def test_doctor_shows_a_held_count_at_the_bound_as_an_invariant_row(j, tmp_path)
         in ok.detail
 
 
+def _bytes(path: Path) -> bytes | None:
+    return path.read_bytes() if path.exists() else None
+
+
 def test_doctor_reads_the_store_without_writing_it(j, tmp_path):
-    _held_at_bound(j)
+    """The store is in WAL mode, so a write lands in ``-wal`` first: a connection held open keeps the frames the
+    journal wrote there (no checkpoint on its close), and doctor's read leaves both the db and those frames as they
+    were. ``-shm`` is the readers' own index (a reader writes its read mark there), so it is not compared."""
+    import sqlite3
     db = tmp_path / "store" / "autonomic.db"
-    before = (db.stat().st_mtime_ns, db.stat().st_size)
-    doctor._check_autonomic_store(tmp_path / "store")
-    assert (db.stat().st_mtime_ns, db.stat().st_size) == before
+    wal = db.with_name(db.name + "-wal")
+    keeper = sqlite3.connect(db)
+    try:
+        keeper.execute("SELECT 1 FROM meta").fetchall()
+        _held_at_bound(j)
+        before = (_bytes(db), _bytes(wal))
+        assert before[1], "the journal's frames are in the -wal while a connection stays open"
+        assert [r.ok for r in doctor._check_autonomic_store(tmp_path / "store")] == [False]
+        assert (_bytes(db), _bytes(wal)) == before
+    finally:
+        keeper.close()
 
 
 def test_doctor_has_no_autonomic_row_without_a_v3_store(tmp_path):
@@ -254,3 +273,185 @@ def test_doctor_fails_a_v3_store_whose_schema_is_not_this_levains(j, tmp_path):
     c.close()
     [row] = doctor._check_autonomic_store(tmp_path / "store")
     assert not row.ok and "store-schema-mismatch" in row.detail
+
+
+# ---- r155s3fx: fix round 1 (levain project_memory 1027-19/r155s3fx/BRIEF.md F1-F7) ------------------------------------
+_CHILD_EXITS = textwrap.dedent("""
+    import os, sys
+    from pathlib import Path
+    sys.stderr.write("CHILD-BOOM: the child failed on its own\\n")
+    sys.stderr.flush()
+    (Path({root!r}) / "inside").write_text("1")
+    os._exit(3)  # {tests!r}
+""")
+
+
+def test_the_crash_helper_surfaces_a_child_that_exited_before_the_kill(tmp_path):
+    with pytest.raises(AssertionError, match="CHILD-BOOM"):
+        _crash_inside_fn(tmp_path, child=_CHILD_EXITS)
+
+
+def test_doctor_reads_this_users_store_and_says_so(j, tmp_path):
+    """F1: the store a user's autonomic commands write is per user (``default_store_dir``: ``$LEVAIN_HOME/autonomic``,
+    the default of every ``--store-dir``), not per install, so doctor reads that one and its row says whose it is."""
+    from levain.autonomic.db import default_store_dir
+    home = default_store_dir()
+    RunJournal(s.AutonomicStore3(home)).start("r1", binding_id="b",
+                                              seal=run_seal(confirm_class=False, guard=[], links=1))
+    [row] = doctor._check_autonomic_store()
+    assert row.ok and str(home) in row.detail and "this user's store ($LEVAIN_HOME/autonomic)" in row.detail
+
+
+def test_a_doctor_test_never_reads_the_operators_real_store():
+    """F1: every test runs with its own ``$LEVAIN_HOME`` (tests/conftest.py ``_isolate_levain_home``), so a
+    ``_run_doctor`` test reads a scratch store, never the account's ``~/.levain``."""
+    import pwd
+    from levain.autonomic.db import default_store_dir
+    real = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve() / ".levain"
+    assert os.environ.get("LEVAIN_HOME")
+    assert not default_store_dir().is_relative_to(real)
+
+
+def _plain_db(path: Path, marker: str | None) -> Path:
+    import sqlite3
+    path.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(path / "autonomic.db", isolation_level=None)
+    c.execute("CREATE TABLE IF NOT EXISTS bindings (x)")
+    if marker is not None:
+        c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        c.execute("INSERT INTO meta VALUES ('format', ?)", (marker,))
+    c.close()
+    return path
+
+
+@pytest.mark.parametrize("marker, says", [
+    ("levain-autonomic/4", "store-newer-than-levain"),
+    (None, "no store format marker"),
+    ("someone-else/1", "is not a levain-autonomic format"),
+])
+def test_doctor_fails_a_store_of_a_format_it_cannot_read(tmp_path, marker, says):
+    """F2: a store doctor cannot read as /3, /2 or /1 gets a FAIL row, worded by refuse_unless_this_v3's refusal."""
+    [row] = doctor._check_autonomic_store(_plain_db(tmp_path / "store", marker))
+    assert not row.ok and not row.warn and says in row.detail
+
+
+@pytest.mark.parametrize("marker", ["levain-autonomic/1", "levain-autonomic/2"])
+def test_doctor_has_no_row_for_a_v1_or_v2_store(tmp_path, marker):
+    assert doctor._check_autonomic_store(_plain_db(tmp_path / "store", marker)) == []
+
+
+def test_doctor_has_no_row_for_an_empty_database(tmp_path):
+    (tmp_path / "store").mkdir()
+    (tmp_path / "store" / "autonomic.db").write_bytes(b"")
+    assert doctor._check_autonomic_store(tmp_path / "store") == []
+
+
+def test_a_failed_not_started_read_is_reported_never_raised(j, tmp_path, monkeypatch):
+    """F3: the liveness read keeps going without the set, and its result names the failed read: the receipts the set
+    would have named count as their receipts say (``refused``)."""
+    import sqlite3
+    assert _effect(j, _not_yet).status is EffectStatus.HELD
+    trace = GateReceiptStore(tmp_path / "receipts.jsonl")
+
+    def locked(conn):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(s, "not_started_receipts", locked)
+    stats = upkeep3.gate_liveness(j, trace)
+    assert stats["by_terminal_state"] == {"refused": 1}
+    assert stats["not_started_unread"].endswith("database is locked")   # the journal's own error type wraps it
+
+
+def test_a_liveness_read_whose_set_reads_has_no_unread_key(j, tmp_path):
+    assert _effect(j, _not_yet).status is EffectStatus.HELD
+    assert "not_started_unread" not in upkeep3.gate_liveness(j, GateReceiptStore(tmp_path / "r.jsonl"))
+
+
+@pytest.mark.parametrize("decision, verdict", [
+    ({"generation": 1, "by": "human", "posture": "COOLING_OFF"}, "approved"),
+    ({"generation": 1, "by": "on-loop", "posture": "COOLING_OFF"}, "auto"),
+    (None, "auto"),
+])
+def test_a_reaped_effect_receipts_verdict_is_its_sealed_deciders(j, decision, verdict):
+    """F4: ``approved`` only for a decision a human made, as the gate's own fire of a journaled hold words it
+    (levain/autonomic/gate.py ``verdict = "approved" if decider == "human" else "auto"``): a cooling-off hold approved
+    by its silence (``on-loop``) is ``auto``."""
+    seal = {"floor": [], "grant_guard": [], "by": "binding", "posture": "COOLING_OFF", "grant": None, "cover": None}
+    if decision is not None:
+        seal["decision"] = decision
+    record = upkeep3.reaper_record(j, "2026-10-27T12:00:00+00:00")("effect:r1:link-0", json.dumps(seal),
+                                                                   "outcome_unknown", None)
+    assert record["action_face"]["gate"]["verdict"] == verdict
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_doctor_fails_a_store_it_cannot_open(j, tmp_path):
+    """F5: an existing store doctor cannot read is a FAIL: unreadable cannot be told from corrupt."""
+    db = tmp_path / "store" / "autonomic.db"
+    db.chmod(0)
+    try:
+        [row] = doctor._check_autonomic_store(tmp_path / "store")
+    finally:
+        db.chmod(0o600)
+    assert not row.ok and not row.warn and "cannot be read" in row.detail
+
+
+def test_doctor_fails_rather_than_aborts_when_the_invariant_read_raises(j, tmp_path, monkeypatch):
+    def broken(conn):
+        raise ValueError("a row the query cannot read")
+    monkeypatch.setattr(s, "invariant", broken)
+    [row] = doctor._check_autonomic_store(tmp_path / "store")
+    assert not row.ok and not row.warn and "ValueError: a row the query cannot read" in row.detail
+
+
+def test_doctor_fails_a_corrupt_store(tmp_path):
+    (tmp_path / "store").mkdir()
+    (tmp_path / "store" / "autonomic.db").write_bytes(b"not a database" * 512)
+    [row] = doctor._check_autonomic_store(tmp_path / "store")
+    assert not row.ok and not row.warn and "cannot be read" in row.detail
+
+
+# F7: a /3 manual pending has no owner lease (upkeep3._pending_owner_unknown says every firing pending is in flight).
+# That is safe only while nothing writes one: this tripwire fails when a module under levain/ gains a string that
+# writes the table, so the pending lease is built with the first writer.
+_PENDING_READS = re.compile(r"^\s*SELECT\b", re.I)
+_PENDING_WRITES = re.compile(r"\b(INSERT|REPLACE)\b[^;]*\bINTO\s+manual_pendings\b|\bUPDATE\s+manual_pendings\b", re.I)
+
+
+def _pending_writers(root: Path) -> list[str]:
+    """Each string literal under ``root`` that names ``manual_pendings`` and is not a read, as ``file:line: text``.
+    In schema3.py (the store's DDL, its INVARIANT and the reaper's close) only an INSERT or REPLACE INTO the table
+    counts; in any other module every string naming the table must be a SELECT."""
+    import io
+    import tokenize
+    out = []
+    for path in sorted(root.rglob("*.py")):
+        for tok in tokenize.generate_tokens(io.StringIO(path.read_text()).readline):
+            if tok.type != tokenize.STRING or "manual_pendings" not in tok.string:
+                continue
+            text = tok.string.lstrip("rbfuRBFU").strip("'\"")
+            if path.name == "schema3.py":
+                bad = bool(re.search(r"\b(INSERT|REPLACE)\b[^;]*\bINTO\s+manual_pendings\b", text, re.I))
+            else:
+                bad = not _PENDING_READS.search(text) or bool(_PENDING_WRITES.search(text))
+            if bad:
+                out.append(f"{path.relative_to(root)}:{tok.start[0]}: {text[:120]}")
+    return out
+
+
+def test_no_module_writes_a_manual_pending_without_its_lease():
+    root = Path(__file__).resolve().parent.parent / "levain"
+    assert _pending_writers(root) == [], (
+        "a module writes /3 manual_pendings rows: build the pending lease the reaper tests "
+        "(upkeep3._pending_owner_unknown) with it (levain project_memory 1027-19/RULINGS.md, R15-5 S3 O3)")
+
+
+def test_the_pending_tripwire_catches_a_writer(tmp_path):
+    (tmp_path / "schema3.py").write_text('X = "UPDATE manual_pendings SET state = 1"\n'
+                                         'Y = "INSERT OR IGNORE INTO manual_pendings (pending_id) VALUES (?)"\n')
+    (tmp_path / "other.py").write_text('# manual_pendings in a comment is not a string\n'
+                                       'A = "SELECT 1 FROM manual_pendings"\n'
+                                       'B = "INSERT INTO manual_pendings VALUES (?)"\n'
+                                       'C = "manual_pendings"\n'
+                                       'D = "SELECT 1; UPDATE manual_pendings SET x = 1"\n')
+    found = [f.split(": ", 1)[0] for f in _pending_writers(tmp_path)]
+    assert found == ["other.py:3", "other.py:4", "other.py:5", "schema3.py:2"]

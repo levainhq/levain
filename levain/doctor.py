@@ -2798,40 +2798,55 @@ _INVARIANT_MEANS = {
 
 
 def _check_autonomic_store(store_dir: Path | None = None) -> list[CheckResult]:
-    """The autonomic store's own consistency read, for a ``levain-autonomic/3`` store only (R15-5 S3): one FAIL row
-    per row of its INVARIANT (``schema3.invariant``), else one row naming its legacy rows (``schema3.census``) and the
-    receipts not yet copied to the receipt file. No row without a store, or for a store of another format. The store
-    is read through a read-only connection, in one snapshot, and never written."""
+    """The autonomic store's own consistency read (R15-5 S3). The store is this user's, not the install's: the one
+    ``default_store_dir()`` names (``$LEVAIN_HOME/autonomic``, else ``~/.levain/autonomic``), the default of every
+    ``levain binding`` command's ``--store-dir``; ``store_dir`` reads another.
+      - No row without a database, for an empty one, or for a ``levain-autonomic/1`` or ``/2`` store (those are the
+        ``levain binding`` commands' to report).
+      - A ``levain-autonomic/3`` store: one FAIL row per row of its INVARIANT (``schema3.invariant``), else one row
+        naming its legacy rows (``schema3.census``) and the receipts not yet copied to the receipt file.
+      - Any other database there (a newer format, tables with no marker, a schema not this levain's): a FAIL row
+        worded by ``schema3.refuse_unless_this_v3``'s refusal.
+      - A database that cannot be opened or read, or a read that raises: a FAIL row, since an unreadable store cannot
+        be told from a corrupt one. Doctor goes on to its next check.
+    The store is read through a read-only connection, in one snapshot, and never written."""
     from levain.autonomic import schema3
-    from levain.autonomic.db import DB_NAME, default_store_dir, store_marker
+    from levain.autonomic.db import DB_NAME, STORE_FORMAT_V1, STORE_FORMAT_V2, default_store_dir, store_marker
 
     db = (store_dir.expanduser() if store_dir is not None else default_store_dir()) / DB_NAME
     if not db.is_file():
         return []
     name = "autonomic store"
+    where = f"{db}" + (" (this user's store ($LEVAIN_HOME/autonomic), not the install's)" if store_dir is None
+                       else "")
+    conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(db.absolute().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=2)
-    except sqlite3.Error as e:
-        return [CheckResult(name, True, f"{db} cannot be read ({e})", warn=True)]
-    try:
         conn.execute("BEGIN")
-        if store_marker(conn) != schema3.STORE_FORMAT_V3:
+        marker = store_marker(conn)
+        if marker in (STORE_FORMAT_V1, STORE_FORMAT_V2):
+            return []
+        if marker is None and conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
             return []
         try:
             schema3.refuse_unless_this_v3(conn)
         except schema3.StoreFormatError as e:
-            return [CheckResult(name, False, f"{db}: {e}")]
+            return [CheckResult(name, False, f"{where}: {e}")]
         rows = schema3.invariant(conn)
         legacy = len(schema3.census(conn))
         unprojected = conn.execute("SELECT COUNT(*) FROM gate_receipts WHERE projected = 0").fetchone()[0]
-    except sqlite3.Error as e:
-        return [CheckResult(name, True, f"{db} cannot be read ({e})", warn=True)]
+    except Exception as e:  # noqa: BLE001 -- one store doctor cannot read is a FAIL row, never the end of doctor
+        return [CheckResult(name, False, f"{where} cannot be read ({type(e).__name__}: {e})",
+                            "Check the file's owner and permissions; a store this user can read that still fails "
+                            "to read may be corrupt.")]
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     if rows:
-        return [CheckResult(f"{name} INVARIANT", False, f"{kind} {subject}: {_INVARIANT_MEANS.get(kind, kind)}")
+        return [CheckResult(f"{name} INVARIANT", False,
+                            f"{kind} {subject}: {_INVARIANT_MEANS.get(kind, kind)}, in {where}")
                 for kind, subject in rows]
-    return [CheckResult(name, True, f"{schema3.STORE_FORMAT_V3} at {db}: invariant holds; {legacy} legacy row(s); "
+    return [CheckResult(name, True, f"{schema3.STORE_FORMAT_V3} at {where}: invariant holds; {legacy} legacy row(s); "
                                     f"{unprojected} receipt(s) not yet in the receipt file")]
 
 

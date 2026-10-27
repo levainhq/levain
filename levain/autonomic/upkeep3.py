@@ -65,17 +65,29 @@ def gate_liveness(journal: RunJournal, receipt_store: GateReceiptStore, *, limit
     holds every receipt committed before this call. Then it passes the store's ``not_started`` set, which
     ``gate_liveness`` reads after the trace (R2-4), so every listed receipt in the trace is counted as
     ``not_started``. A projection that fails is logged and the tally goes on over the file as it is: the set may then
-    name receipts the trace lacks, and those count nowhere."""
+    name receipts the trace lacks, and those count nowhere. A read of the set that fails is not raised: the tally goes
+    on without it, so each not_started receipt counts as its receipt says (``refused``), and the result gains
+    ``not_started_unread`` (``"<error type>: <message>"``) to say that ``by_terminal_state`` is not split. The trace
+    read itself (``GateReceiptStore.read``) raises as it does for the plain call."""
     _v3(journal, "gate_liveness")
     try:
         project(journal, receipt_store)
-    except Exception as e:  # noqa: BLE001 -- a liveness read reports, it never raises
+    except Exception as e:  # noqa: BLE001 -- the tally runs over the file as it is
         _log.warning("upkeep3: receipts not projected before the liveness read (%s): %s", type(e).__name__, e)
+    unread: list[str] = []
 
     def listed() -> frozenset[str]:
-        with journal._read() as conn:
-            return schema3.not_started_receipts(conn)
-    return _gate_liveness(receipt_store, limit=limit, not_started=listed)
+        try:
+            with journal._read() as conn:
+                return schema3.not_started_receipts(conn)
+        except Exception as e:  # noqa: BLE001 -- named in the result, never raised
+            _log.warning("upkeep3: the not_started set was not read (%s): %s", type(e).__name__, e)
+            unread.append(f"{type(e).__name__}: {e}")
+            return frozenset()
+    stats = _gate_liveness(receipt_store, limit=limit, not_started=listed)
+    if unread:
+        stats["not_started_unread"] = unread[0]
+    return stats
 
 
 def _binding_of(journal: RunJournal, run_id: str) -> str | None:
@@ -87,8 +99,10 @@ def _binding_of(journal: RunJournal, run_id: str) -> str | None:
 def reaper_record(journal: RunJournal, created_at: str) -> Callable[[str, str | None, str, str | None], dict]:
     """The receipt builder :func:`levain.autonomic.schema3.reap` calls, ``record_for(subject, seal, terminal_state,
     reason)``, built from the subject's sealed row alone (D56), since nothing else of the owner survives it:
-      - an effect attempt: its seal's rung, its actor ``by`` (verdict ``approved`` when the seal carries a hold's
-        decision, else ``auto``), and its ``floor`` / ``grant_guard`` (``receipts_carry_guard``);
+      - an effect attempt: its seal's rung, its actor ``by``, its verdict from the sealed hold decision's decider
+        (``approved`` only when ``$.decision.by`` is ``human``, else ``auto``, as the gate's own fire of a journaled
+        hold words it in ``EfferentGate``'s resolve path), and its ``floor`` / ``grant_guard``
+        (``receipts_carry_guard``);
       - a run: a refusal by ``on-loop`` at ``REFUSE_ESCALATE`` (a run seal holds no rung), carrying the run's guard;
       - a pending: a refusal by ``on-loop`` at ``REFUSE_ESCALATE``, no guard.
     Each receipt is built with the gate's ``/3`` builder (``EfferentGate._v3_receipt``), so the face is the frozen
@@ -102,7 +116,8 @@ def reaper_record(journal: RunJournal, created_at: str) -> Callable[[str, str | 
         if kind == "effect":
             run_id = schema3._effect_key(subject)[0]
             posture = Posture[sealed["posture"]]
-            verdict, by = ("approved" if "decision" in sealed else "auto"), sealed["by"]
+            decided_by = (sealed.get("decision") or {}).get("by")
+            verdict, by = ("approved" if decided_by == "human" else "auto"), sealed["by"]
             guard, grant_guard = sealed.get("floor"), sealed.get("grant_guard")
         else:
             run_id = subject[4:] if kind == "run" else None
@@ -124,8 +139,9 @@ def reaper_record(journal: RunJournal, created_at: str) -> Callable[[str, str | 
 
 
 def _pending_owner_unknown(pending_id: str) -> bool:
-    # no levain code writes a /3 manual pending or holds a pending lease (`git grep manual_pendings -- levain`: schema3
-    # and one journal read), so no owner can be tested: a firing pending is left as in flight
+    # no levain code writes a /3 manual pending or holds a pending lease, so no owner can be tested: a firing pending
+    # is left as in flight. tests/test_autonomic_upkeep3.py::test_no_module_writes_a_manual_pending_without_its_lease
+    # fails when a writer arrives
     return True
 
 
