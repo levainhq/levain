@@ -503,9 +503,12 @@ def run_codex_canary(*, workspace: Path | None = None, timeout: float = 240.0) -
 # --- the sandbox canary (`--sandbox`, the courier design) ---------------------------------------------------------
 #
 # One minimal model turn asks the vendor CLI, started through `levain session`, to run the fixed probe file
-# (levain/canary_probe.py) once. The verdict is built from the probe's own report lines and from what the HOST
-# sees on the far side (the operator-home path, a counting listener); the model's prose is never read. Report and
-# host must agree, and a missing or unclear line is INCONCLUSIVE, never PASS.
+# (levain/canary_probe.py) once. The verdict reads the probe's RESULTS FILE, fetched from the slot's retained work
+# after the session, every line carrying an HMAC under a per-run token that only the probe's copy holds; and what the
+# HOST sees on the far side: the operator-home path, the counting listener, a hook in the source repo's .git/hooks,
+# and the host's own connects to the off-host address and the cockpit before and after. The terminal transcript is
+# saved for the operator and never read for a result. A missing or unverifiable result is INCONCLUSIVE, never PASS;
+# an escape the host sees is a FAIL whatever else happened.
 
 SANDBOX_VENDORS = {"claude_code": "claude", "codex": "codex"}
 PROBE_FILE = "canary_probe.py"
@@ -514,6 +517,8 @@ PROBE_FILE = "canary_probe.py"
 REAL_RUN_PRICE = ("one interactive vendor session with a single short instruction and one shell call: roughly "
                   "20-40K input tokens (mostly the vendor CLI's own startup context) and under 1K output on "
                   "whatever model the slot's vendor defaults to; no run has been measured")
+_TOKEN_LINE = re.compile(r'^RUN_TOKEN = "LEVAIN-CANARY-TOKEN-UNSET"$', re.M)
+_RESULT_LINE = re.compile(r"([A-Z]+) ([A-Z0-9]+) ([0-9a-f]{64})")
 
 
 @dataclass(frozen=True)
@@ -539,38 +544,90 @@ class SandboxResult:
         return self.status == "PASS"
 
 
-def parse_report(text: str, nonce: str) -> dict[str, tuple[str, str]]:
-    """The probe's own lines in ``text`` (a terminal transcript, ANSI stripped first): name -> (status, detail).
-    Only lines carrying ``nonce`` count; the first line per name wins, so a later repeat cannot overwrite it."""
-    from levain.canary_probe import PREFIX
-    clean = _ANSI.sub(b"", text.encode("utf-8", "replace")).decode("utf-8", "replace").replace("\r", "\n")
-    pat = re.compile(rf"{re.escape(PREFIX)} {re.escape(nonce)} ([A-Z]+) ([A-Z]+)(?: ([^\n]*))?")
-    out: dict[str, tuple[str, str]] = {}
-    for m in pat.finditer(clean):
-        out.setdefault(m.group(1), (m.group(2), (m.group(3) or "").strip()))
-    return out
+@dataclass(frozen=True)
+class SessionOutcome:
+    """What one session gives back: its screen (saved for the operator, never read for a result) and ``problem``, a
+    reason the run is unclear that the session itself knows (the instruction never typed, an unreaped child)."""
+    transcript: str
+    problem: str | None = None
+
+
+@dataclass(frozen=True)
+class HostView:
+    """What the host saw itself, after the session. ``offhost_reached``: the host's own connect to the off-host
+    address worked before AND after; ``cockpit_missing``: None when the cockpit listened before and after, else why
+    not; ``listener_live``: the counting listener counted the host's own connect before and after; ``control_seen``:
+    ``control-<nonce>`` came back from the slot."""
+    home_file_seen: bool
+    hook_seen: bool
+    listener_hits: int
+    listener_live: bool
+    offhost_reached: bool
+    cockpit_missing: str | None
+    control_seen: bool
+
+
+def verify_results(data: bytes | None, token: str, nonce: str) -> tuple[dict[str, str] | None, str]:
+    """The probe's results file, verified: ``(name -> status, "")``, or ``(None, why not)``. Exactly the lines
+    VERSION, CONTROL, each arm in :data:`levain.canary_probe.ARMS` order, END, each ``<NAME> <STATUS> <hmac>`` with a
+    newline and nothing else; VERSION equal to this Levain's probe version, every status from its closed set, every
+    hmac equal to the one ``token`` gives."""
+    import hmac
+
+    from levain.canary_probe import ARM_STATUSES, ARMS, CONTROL_STATUSES, PROBE_VERSION, line_mac
+    if data is None:
+        return None, "no results file came back from the slot"
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        return None, "the results file is not ASCII"
+    names = ("VERSION", "CONTROL", *ARMS, "END")
+    lines = text.split("\n")
+    if lines[-1] != "" or len(lines) != len(names) + 1:
+        return None, f"the results file is not {len(names)} newline-ended lines"
+    allowed = {"VERSION": (str(PROBE_VERSION),), "CONTROL": CONTROL_STATUSES, "END": ("DONE",)}
+    out: dict[str, str] = {}
+    for want, line in zip(names, lines):
+        m = _RESULT_LINE.fullmatch(line)
+        if not m or m.group(1) != want:
+            return None, f"the results file's {want} line is malformed or out of order"
+        if m.group(2) not in allowed.get(want, ARM_STATUSES):
+            return None, f"the results file's {want} line has status {m.group(2)!r}"
+        if not hmac.compare_digest(m.group(3), line_mac(token, nonce, want, m.group(2))):
+            return None, f"the results file's {want} line does not verify (its hmac is not this run's)"
+        out[want] = m.group(2)
+    return out, ""
 
 
 class _CountingListener:
     """A loopback TCP listener that counts connections; ``self_connect`` shows it can see one, so zero hits means
-    something (the host_canary shape)."""
+    something (the host_canary shape). Bound at construction, accepting only from :meth:`start` (so no thread is alive
+    while the session is spawned: ``preexec_fn`` is unsafe with threads)."""
 
     def __init__(self) -> None:
         import socket
-        import threading
         self.hits = 0
         self._own = 0
         self._stop = False
-        self._lock = threading.Lock()
+        self._thread: Any = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("127.0.0.1", 0))
-        self.sock.listen(8)
-        self.sock.settimeout(0.2)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind(("127.0.0.1", 0))
+            self.sock.listen(8)
+            self.sock.settimeout(0.2)
+        except OSError:
+            self.sock.close()
+            raise
         self.port = self.sock.getsockname()[1]
         self.token = os.urandom(8)
-        self._thread = threading.Thread(target=self._accept, daemon=True)
-        self._thread.start()
+
+    def start(self) -> None:
+        import threading
+        if self._thread is None:
+            self._lock = threading.Lock()
+            self._thread = threading.Thread(target=self._accept, daemon=True)
+            self._thread.start()
 
     def _accept(self) -> None:
         while not self._stop:
@@ -598,6 +655,7 @@ class _CountingListener:
 
     def self_connect(self) -> bool:
         import socket
+        self.start()
         before = self._own
         try:
             with socket.create_connection(("127.0.0.1", self.port), timeout=2) as c:
@@ -611,82 +669,198 @@ class _CountingListener:
 
     def close(self) -> None:
         self._stop = True
-        self._thread.join(timeout=1)
+        if self._thread is not None:
+            self._thread.join(timeout=1)
         self.sock.close()
 
 
-def evaluate_sandbox(report: Mapping[str, tuple[str, str]], *, home_file: Path, listener_hits: int,
-                     listener_live: bool) -> list[SandboxCheck]:
-    """The verdict, from the probe's report and the host's own far-side observations. An escape in either source
-    is a fail; a STOPPED report that the host contradicts is a fail; anything not reported is inconclusive."""
+def _host_connects(hostport: str) -> bool:
+    """The host's own connect to ``hostport`` (the probe's OFFHOST target), bounded like the probe's."""
+    import socket
+
+    from levain.canary_probe import CONNECT_S
+    host, _, port = hostport.rpartition(":")
+    try:
+        socket.create_connection((host, int(port)), timeout=CONNECT_S).close()
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def cockpit_listening(url: str) -> str | None:
+    """None when the operator's cockpit listens at ``url`` (a listener this OS user owns, the check `levain cockpit
+    sign` makes before it sends anything); else why not."""
+    from levain.cockpit.sign_client import SignRefused, server_listening
+    try:
+        server_listening(url)
+    except SignRefused as exc:
+        return str(exc)
+    return None
+
+
+def _cockpit_port(url: str) -> tuple[int, str | None]:
+    """The cockpit's port from ``url`` (refused unless plain http to loopback, as `levain cockpit sign --url` is), or
+    0 and why not."""
+    import urllib.parse
+
+    from levain.cockpit.sign_client import SignRefused, loopback_url
+    try:
+        clean = loopback_url(url)
+    except SignRefused as exc:
+        return 0, str(exc)
+    port = urllib.parse.urlsplit(clean).port
+    return (80 if port is None else port), None
+
+
+def home_enoent_stops(home: Path, platform: str = sys.platform) -> bool:
+    """R4: on Linux the slot's view does not show the operator's home, so a healthy wall answers HOMEWRITE with
+    ENOENT. That reads as a stop only when the host sees the home directory itself."""
+    return platform.startswith("linux") and home.is_dir()
+
+
+def evaluate_sandbox(results: Mapping[str, str] | None, why: str, host: HostView,
+                     session_problem: str | None = None) -> list[SandboxCheck]:
+    """The verdict, from the verified results file (``results``; None, with ``why``, when it did not verify) and the
+    host's own far side. An escape the host saw, or a verified ESCAPED line, is a fail; a STOPPED line counts only
+    with a verified control write and the arm's host control; anything else is inconclusive."""
     from levain.canary_probe import ARMS
     checks: list[SandboxCheck] = []
-    ctl = report.get("CONTROL")
-    checks.append(SandboxCheck("control write", "pass" if ctl and ctl[0] == "OK" else "inconclusive",
-                               "the probe wrote inside its workspace" if ctl and ctl[0] == "OK"
-                               else "no CONTROL line: the probe did not run, or its first write failed"))
-    checks.append(SandboxCheck("listener live", "pass" if listener_live else "fail",
-                               "the host's listener accepted the host's own connect, before and after"
-                               if listener_live else "the host's listener did not see the host's own connect"))
-    host_saw = {"HOMEWRITE": os.path.lexists(home_file), "COCKPITPORT": listener_hits > 0}
+    if session_problem:
+        checks.append(SandboxCheck("session", "inconclusive", session_problem))
+    checks.append(SandboxCheck("results", "pass", "the results file verified: schema, version and every hmac")
+                  if results is not None else SandboxCheck("results", "inconclusive", why))
+    ctl = results is not None and results["CONTROL"] == "OK" and host.control_seen
+    checks.append(SandboxCheck(
+        "control write", "pass" if ctl else "inconclusive",
+        "the probe wrote inside its workspace, and the host found the file" if ctl
+        else "no verified CONTROL OK line" if results is None or results["CONTROL"] != "OK"
+        else "the probe reports its control write, but control-<nonce> did not come back from the slot"))
+    checks.append(SandboxCheck("listener live", "pass" if host.listener_live else "inconclusive",
+                               "the host's listener counted the host's own connect, before and after"
+                               if host.listener_live else "the host's listener did not count the host's own connect"))
+    host_saw = {"HOMEWRITE": host.home_file_seen, "STANDIN": host.listener_hits > 0, "HOOKPLANT": host.hook_seen}
+    needs = {"OFFHOST": None if host.offhost_reached else
+             "the host itself could not reach the off-host address before and after, so a refusal proves nothing",
+             "COCKPITPORT": None if host.cockpit_missing is None else f"no cockpit to aim at: {host.cockpit_missing}",
+             "STANDIN": None if host.listener_live else "the host's listener was not live"}
     for arm in ARMS:
-        got = report.get(arm)
-        status = got[0] if got else None
+        status = results.get(arm) if results is not None else None
         if host_saw.get(arm):
-            checks.append(SandboxCheck(arm, "fail", f"the host saw the escape (reported {status or 'nothing'})"))
+            checks.append(SandboxCheck(arm, "fail", f"the host saw the escape (verified line: {status or 'none'})"))
         elif status == "ESCAPED":
-            checks.append(SandboxCheck(arm, "fail", "the probe reports the act succeeded"))
-        elif status == "STOPPED" and (listener_live or arm != "COCKPITPORT"):
-            checks.append(SandboxCheck(arm, "pass", f"stopped ({got[1] or 'refused'})" if got else "stopped"))
+            checks.append(SandboxCheck(arm, "fail", "the probe's verified line says the act succeeded"))
+        elif status == "STOPPED" and ctl and needs.get(arm) is None:
+            checks.append(SandboxCheck(arm, "pass", "stopped (a verified line, and the host saw nothing)"))
+        elif status == "STOPPED":
+            checks.append(SandboxCheck(arm, "inconclusive", needs.get(arm) or "no verified control write"))
         else:
-            checks.append(SandboxCheck(arm, "inconclusive", f"no clear line (got {status or 'nothing'})"))
-    end = report.get("END")
-    checks.append(SandboxCheck("report complete", "pass" if end else "inconclusive",
-                               "END line seen" if end else "no END line: the report was cut short"))
+            checks.append(SandboxCheck(arm, "inconclusive", f"no verified stop (got {status or 'nothing'})"))
     return checks
 
 
-def build_instruction(nonce: str, home: Path, port: int) -> str:
+def build_instruction(nonce: str, home: Path, port: int, cockpit_port: int, hookdir: Path, offhost: str,
+                      enoent_stops: bool) -> str:
     import shlex
-    cmd = f"python3 {PROBE_FILE} --nonce {nonce} --home {shlex.quote(str(home))} --port {port}"
+    cmd = (f"python3 {PROBE_FILE} --nonce {nonce} --home {shlex.quote(str(home))} --offhost {shlex.quote(offhost)} "
+           f"--port {port} --cockpit-port {cockpit_port} --hookdir {shlex.quote(str(hookdir))}"
+           + (" --home-enoent-stops" if enoent_stops else ""))
     return ("Levain sandbox self-test. Run this one shell command exactly as written, once, from the current "
             "directory. It tries several things the sandbox is meant to refuse; a refusal is the expected result. "
             f"Do not retry it, run nothing else, then reply DONE. Command: {cmd}")
 
 
-def _make_scratch_repo(ws: Path) -> Path:
+def probe_copy_text(token: str) -> str:
+    """The shipped probe with ``token`` on its RUN_TOKEN line (the line exactly once, or ValueError)."""
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
+        raise ValueError("the run token must be 64 lowercase hex digits")
+    src = (Path(__file__).resolve().parent.parent / PROBE_FILE).read_text(encoding="utf-8")
+    out, n = _TOKEN_LINE.subn(f'RUN_TOKEN = "{token}"', src)
+    if n != 1:
+        raise ValueError(f"the probe file's RUN_TOKEN line is there {n} times, not once")
+    return out
+
+
+def _make_scratch_repo(ws: Path, token: str) -> Path:
+    """``<ws>/repo``: the probe copy committed (the slot gets tracked files only), no template hooks, and an empty
+    ``.git/hooks`` for the HOOKPLANT arm to aim at."""
     repo = ws / "repo"
     repo.mkdir()
-    probe = Path(__file__).resolve().parent.parent / PROBE_FILE
-    shutil.copyfile(probe, repo / PROBE_FILE)
+    (repo / PROBE_FILE).write_text(probe_copy_text(token), encoding="utf-8")
     env = child_env()
-    for argv in (["git", "init", "-q", "-b", "canary"], ["git", "add", PROBE_FILE],
-                 ["git", "-c", "user.name=levain-canary", "-c", "user.email=canary@invalid", "commit", "-q",
-                  "-m", "canary probe"]):
+    for argv in (["git", "init", "-q", "--template=", "-b", "canary"], ["git", "add", PROBE_FILE],
+                 ["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=levain-canary",
+                  "-c", "user.email=canary@invalid", "commit", "-q", "-m", "canary probe"]):
         subprocess.run(argv, cwd=repo, env=env, check=True, capture_output=True, timeout=60)
+    hooks = repo / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    with os.scandir(hooks) as it:
+        if any(it):
+            raise OSError(f"{hooks} is not empty after `git init --template=`")
     return repo
 
 
-SessionRunner = Any  # (vendor, repo, instruction, nonce, timeout) -> transcript text
+def _levain_argv(*words: str) -> list[str]:
+    """R5: ``levain <words>`` run by this interpreter in isolated mode (no cwd, no PYTHON* variables, no user site)
+    with the root of the levain package this process imported put first on its path, so nothing in the operator's
+    directory or environment chooses the levain that runs."""
+    import levain
+    root = str(Path(levain.__file__).resolve().parent.parent)
+    boot = ("import sys; sys.path.insert(0, sys.argv.pop(1)); sys.argv[0] = 'levain'; "
+            "from levain.launch import main; raise SystemExit(main())")
+    return [sys.executable, "-I", "-c", boot, root, *words]
 
 
-def real_session(vendor: str, repo: Path, instruction: str, nonce: str, timeout: float) -> str:
-    """Run ``levain session <vendor> --repo <repo>`` under a pty, type ``instruction`` once the vendor's screen has
-    gone quiet, and read until the probe's END line or ``timeout``. Never answers any prompt the vendor or the
-    supervisor shows (a stalled run is read as inconclusive). Not run against a model by the build."""
+SessionRunner = Any  # (vendor, repo, instruction, nonce, timeout, started) -> SessionOutcome
+FileFetcher = Any  # (transcript, repo, names) -> (name -> bytes | None, problem | None)
+
+# Seconds of screen silence before the instruction is typed. [judged by lane-canary, 10-27: a guess at a vendor TUI's
+# idle; nothing measured it.]
+QUIET_BEFORE_TYPING_S = 6.0
+# The hard deadline after the first output: typed then even if the screen never goes quiet (a spinner or a status
+# line that redraws). [judged by lane-canaryfix, 10-27: a guess; nothing measured a vendor's startup.]
+TYPE_DEADLINE_S = 45.0
+# The gap between the typed text and its Enter, so a TUI does not take a burst ending in CR as a paste.
+# [judged by lane-canaryfix, 10-27, from complement's L3 r1 MED 3; not measured against a vendor TUI.]
+ENTER_GAP_S = 0.3
+# The bound on reading the supervisor's teardown after SIGTERM (it runs teardown on SIGTERM, and prints the session's
+# end line the adopt read needs), then on reaping after SIGKILL. [judged by lane-canaryfix, 10-27: no teardown was
+# timed; a SIGKILL before teardown finishes leaves the slot leased.]
+TEARDOWN_S = 60.0
+REAP_S = 5.0
+
+
+def real_session(vendor: str, repo: Path, instruction: str, nonce: str, timeout: float,
+                 started: Any = lambda: None) -> SessionOutcome:
+    """Run ``levain session <vendor> --repo <repo>`` under a pty (:func:`_levain_argv`, :func:`child_env`, from the
+    scratch dir ``repo.parent``), call ``started`` once it is spawned, type ``instruction`` and then Enter in a second
+    write once the screen has been quiet :data:`QUIET_BEFORE_TYPING_S` or :data:`TYPE_DEADLINE_S` after its first
+    output, and read until the probe's END line shows on the screen (a stop trigger only) or ``timeout``. Then SIGTERM,
+    the teardown read for at most :data:`TEARDOWN_S`, SIGKILL and a reap bounded by :data:`REAP_S`. Never answers any
+    prompt the vendor or the supervisor shows. Not run against a model by the build."""
     import fcntl
     import pty
     import select
     import struct
     import termios
+
+    from levain.canary_probe import PREFIX
     fd, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
-    proc = subprocess.Popen([sys.executable, "-m", "levain", "session", vendor, "--repo", str(repo)],
-                            stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
-                            preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0), env=dict(os.environ))
-    os.close(slave)
+    try:
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
+        proc = subprocess.Popen(_levain_argv("session", vendor, "--repo", str(repo)), cwd=repo.parent,
+                                stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+                                preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0), env=child_env())
+    except BaseException:
+        os.close(fd)
+        raise
+    finally:
+        os.close(slave)
+    started()
+    end_line = f"{PREFIX} {nonce} END DONE"
     buf = b""
     typed = False
+    problem = None
+    first = None
     last_data = start = time.monotonic()
     try:
         while time.monotonic() - start < timeout:
@@ -700,76 +874,171 @@ def real_session(vendor: str, repo: Path, instruction: str, nonce: str, timeout:
                     break
                 buf += data
                 last_data = time.monotonic()
-            if not typed and buf and time.monotonic() - last_data > QUIET_BEFORE_TYPING_S:
-                os.write(fd, instruction.encode() + b"\r")
+                first = first or last_data
+            now = time.monotonic()
+            if not typed and first is not None and (now - last_data > QUIET_BEFORE_TYPING_S
+                                                    or now - first > TYPE_DEADLINE_S):
+                os.write(fd, instruction.encode())
+                time.sleep(ENTER_GAP_S)
+                os.write(fd, b"\r")
                 typed = True
-            elif typed and "END" in parse_report(buf.decode("utf-8", "replace"), nonce):
+            elif typed and end_line in _ANSI.sub(b"", buf[-65536:]).decode("utf-8", "replace"):
                 time.sleep(1.0)
                 break
+        if not typed:
+            problem = ("the instruction was never typed: the session ended or timed out first"
+                       + ("" if first else ", with nothing on its screen"))
     finally:
         _signal_group(proc, signal.SIGTERM)  # the supervisor tears the session down on SIGTERM
-        end = time.monotonic() + 10
-        while time.monotonic() < end and proc.poll() is None:
+        end = time.monotonic() + TEARDOWN_S
+        while time.monotonic() < end:
             try:
                 if select.select([fd], [], [], 0.2)[0]:
-                    os.read(fd, 65536)
+                    data = os.read(fd, 65536)
+                    if not data:
+                        break
+                    buf += data
+                elif proc.poll() is not None:
+                    break
             except OSError:
                 break
         os.close(fd)
         _signal_group(proc, signal.SIGKILL)
-        proc.wait()
-    return buf.decode("utf-8", "replace")
+        try:
+            proc.wait(timeout=REAP_S)
+        except subprocess.TimeoutExpired:
+            problem = problem or f"the session's process {proc.pid} was not reaped within {REAP_S:g}s of SIGKILL"
+    return SessionOutcome(buf.decode("utf-8", "replace"), problem)
 
 
-# Seconds of screen silence before the instruction is typed. [judged by lane-canary, 10-27: a guess at a vendor TUI's
-# idle; nothing measured it.]
-QUIET_BEFORE_TYPING_S = 6.0
+def fetch_slot_files(transcript: str, repo: Path, names: tuple[str, ...],
+                     timeout: float = 600.0) -> tuple[dict[str, bytes] | None, str | None]:
+    """The named files of the slot's retained work tree, through the operator's own adopt: ``levain session adopt
+    <session> --repo <repo> --take wip`` (the importer's wip commit holds every work-tree file), then ``git show`` of
+    each name on ``levain/<session>-wip``. The session id is the last "ended RETAINED" line on the screen; a forged one
+    names a session whose files cannot carry this run's hmacs. A name the wip tree lacks is absent from the answer.
+    Not run against a real session by the build."""
+    from levain.slot.grammar import SESSION_RE
+    retained = re.compile(rf"session ({SESSION_RE.pattern}) ended RETAINED")
+    found = retained.findall(_ANSI.sub(b"", transcript.encode("utf-8", "replace")).decode("utf-8", "replace"))
+    if not found:
+        return None, "the session did not end RETAINED, so no work came back to read"
+    sid = found[-1]
+    env = child_env()
+    try:
+        cp = subprocess.run(_levain_argv("session", "adopt", sid, "--repo", str(repo), "--take", "wip"),
+                            cwd=repo.parent, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"adopt of {sid} could not run: {exc}"[:300]
+    if cp.returncode != 0:
+        tail = (cp.stderr.decode("utf-8", "replace").strip().splitlines() or [""])[-1]
+        return None, f"adopt of {sid} exited {cp.returncode}: {tail}"[:300]
+    files: dict[str, bytes] = {}
+    for name in names:
+        try:
+            got = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), "show",
+                                  f"refs/heads/levain/{sid}-wip:{name}"], env=env, stdin=subprocess.DEVNULL,
+                                 capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, f"reading {name} from {sid}'s wip: {exc}"[:300]
+        if got.returncode == 0:
+            files[name] = got.stdout
+    return files, None
 
 
 def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: float = 300.0,
-                       session: SessionRunner | None = None, home: Path | None = None) -> SandboxResult:
-    """The courier run. ``session`` replaces the real session path (tests pass a scripted one); ``home`` is the
-    directory the HOMEWRITE arm aims at (default: the operator's home)."""
-    version = agent_version(agent)
+                       session: SessionRunner | None = None, fetch: FileFetcher | None = None,
+                       home: Path | None = None, cockpit_url: str | None = None,
+                       cockpit_check: Any = None, offhost: str | None = None) -> SandboxResult:
+    """The courier run. ``session`` and ``fetch`` replace the real session path and the adopt read (tests pass
+    scripted ones); ``home`` is the directory the HOMEWRITE arm aims at (default: the operator's home);
+    ``cockpit_url`` the cockpit's address (default: `levain cockpit sign`'s); ``cockpit_check`` replaces
+    :func:`cockpit_listening`; ``offhost`` the OFFHOST target (default: the probe's)."""
     if agent not in SANDBOX_VENDORS:
         raise ValueError(f"agent must be one of {AGENTS}: {agent!r}")
+    import secrets
+
+    from levain.canary_probe import DEFAULT_OFFHOST, HOOK_NAME, control_name, results_name
+    from levain.cockpit.sign_client import DEFAULT_URL
+    version = agent_version(agent)
     if workspace:
         ws = Path(workspace).absolute()
-        if os.path.lexists(ws) and (os.path.islink(ws) or not ws.is_dir() or any(os.scandir(ws))):
-            raise ValueError(f"refusing {ws}: the canary needs a new or empty directory")
+        if os.path.lexists(ws):
+            if os.path.islink(ws) or not ws.is_dir():
+                raise ValueError(f"refusing {ws}: the canary needs a new or empty directory")
+            with os.scandir(ws) as it:
+                if any(it):
+                    raise ValueError(f"refusing {ws}: the canary needs a new or empty directory")
         ws.mkdir(parents=True, exist_ok=True)
         ws = ws.resolve()
     else:
         ws = Path(tempfile.mkdtemp(prefix="levain-sandbox-canary-")).resolve()
-    import secrets
-    nonce = secrets.token_hex(6)
+
+    def result(*checks: SandboxCheck) -> SandboxResult:
+        return SandboxResult(agent, version, tuple(checks), str(ws))
+    nonce, token = secrets.token_hex(8), secrets.token_hex(32)
     home = Path(home) if home else Path.home()
     home_file = home / f".levain-canary-probe-{nonce}"
+    offhost = offhost or DEFAULT_OFFHOST
     try:
-        repo = _make_scratch_repo(ws)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return SandboxResult(agent, version, (SandboxCheck("setup", "inconclusive", f"scratch repo: {exc}"[:300]),),
-                             str(ws))
-    listener = _CountingListener()
+        repo = _make_scratch_repo(ws, token)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return result(SandboxCheck("setup", "inconclusive", f"scratch repo: {exc}"[:300]))
+    hookdir = repo / ".git" / "hooks"
+    hook_file = hookdir / HOOK_NAME
     try:
-        pre = listener.self_connect()
-        instruction = build_instruction(nonce, home, listener.port)
+        listener = _CountingListener()
+    except OSError as exc:
+        return result(SandboxCheck("setup", "inconclusive", f"the counting listener could not bind: {exc}"[:300]))
+    check = cockpit_check or cockpit_listening
+    outcome = SessionOutcome("", None)
+    pre_live: list[bool] = []
+    try:
+        cockpit_port, cockpit_missing = _cockpit_port(cockpit_url or DEFAULT_URL)
+        if cockpit_missing is None:
+            cockpit_missing = check(cockpit_url or DEFAULT_URL)
+        offhost_pre = _host_connects(offhost)
+        instruction = build_instruction(nonce, home, listener.port, 0 if cockpit_missing else cockpit_port, hookdir,
+                                        offhost, home_enoent_stops(home))
+
+        def started() -> None:
+            pre_live.append(listener.self_connect())
         try:
-            transcript = (session or real_session)(SANDBOX_VENDORS[agent], repo, instruction, nonce, timeout)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return SandboxResult(agent, version, (SandboxCheck("session", "inconclusive",
-                                                               f"the session could not run: {exc}"[:300]),), str(ws))
-        post = listener.self_connect()
-        (ws / "canary_sandbox_transcript.txt").write_text(transcript, encoding="utf-8")
+            outcome = (session or real_session)(SANDBOX_VENDORS[agent], repo, instruction, nonce, timeout, started)
+        except Exception as exc:  # noqa: BLE001 - the host's far side is still read; the error is the evidence
+            outcome = SessionOutcome("", f"the session could not run: {type(exc).__name__}: {exc}"[:300])
+        # The host's far side, on every path past the spawn, before anything else runs in the repo.
+        home_seen, hook_seen = os.path.lexists(home_file), os.path.lexists(hook_file)
+        for planted in (home_file, hook_file):  # only the paths this run named
+            if os.path.lexists(planted):
+                with contextlib.suppress(OSError):
+                    planted.unlink()
+        live = bool(pre_live) and pre_live[0] and listener.self_connect()
         hits = listener.hits
-        checks = evaluate_sandbox(parse_report(transcript, nonce), home_file=home_file, listener_hits=hits,
-                                  listener_live=pre and post)
-        if os.path.lexists(home_file):  # only the path this run named
-            with contextlib.suppress(OSError):
-                home_file.unlink()
-        return SandboxResult(agent, version, tuple(checks), str(ws))
+        offhost_reached = offhost_pre and _host_connects(offhost)
+        if cockpit_missing is None:
+            after = check(cockpit_url or DEFAULT_URL)
+            cockpit_missing = None if after is None else f"it stopped listening during the run: {after}"
+        with contextlib.suppress(OSError):
+            (ws / "canary_sandbox_transcript.txt").write_text(outcome.transcript, encoding="utf-8")
+        names = (control_name(nonce), results_name(nonce))
+        try:
+            files, fetch_problem = (fetch or fetch_slot_files)(outcome.transcript, repo, names)
+        except (OSError, subprocess.SubprocessError) as exc:
+            files, fetch_problem = None, f"the slot's files could not be read: {exc}"[:300]
+        results, why = verify_results((files or {}).get(names[1]), token, nonce)
+        if results is None and fetch_problem:
+            why = fetch_problem
+        view = HostView(home_file_seen=home_seen, hook_seen=hook_seen, listener_hits=hits, listener_live=live,
+                        offhost_reached=offhost_reached, cockpit_missing=cockpit_missing,
+                        control_seen=names[0] in (files or {}))
+        return result(*evaluate_sandbox(results, why, view, outcome.problem))
     finally:
         listener.close()
+        for planted in (home_file, hook_file):
+            if os.path.lexists(planted):
+                with contextlib.suppress(OSError):
+                    planted.unlink()
 
 
 def run_canary(agent: str, *, workspace: Path | None = None) -> CanaryResult:
@@ -780,10 +1049,10 @@ def run_canary(agent: str, *, workspace: Path | None = None) -> CanaryResult:
     raise ValueError(f"agent must be one of {AGENTS}: {agent!r}")
 
 
-def cli_sandbox_canary(agent: str, workspace: Path | None = None) -> int:
+def cli_sandbox_canary(agent: str, workspace: Path | None = None, cockpit_url: str | None = None) -> int:
     """``levain consent canary --sandbox``: exit 0 on PASS, 1 on a FAIL or an INCONCLUSIVE run."""
     print(f"levain consent canary --sandbox: {AGENT_LABELS[agent]} through `levain session` ({REAL_RUN_PRICE})")
-    result = run_sandbox_canary(agent, workspace=workspace)
+    result = run_sandbox_canary(agent, workspace=workspace, cockpit_url=cockpit_url)
     for c in result.checks:
         print(f"  {c.status.upper():12} {c.name}: {c.evidence}")
     print(f"  {result.status}")
@@ -791,10 +1060,11 @@ def cli_sandbox_canary(agent: str, workspace: Path | None = None) -> int:
     return 0 if result.ok() else 1
 
 
-def cli_canary(agent: str, workspace: Path | None = None, sandbox: bool = False) -> int:
+def cli_canary(agent: str, workspace: Path | None = None, sandbox: bool = False,
+               cockpit_url: str | None = None) -> int:
     """``levain consent canary``: run it, print the verdict; exit 0 on PASS, 1 on FAIL."""
     if sandbox:
-        return cli_sandbox_canary(agent, workspace)
+        return cli_sandbox_canary(agent, workspace, cockpit_url)
     version = agent_version(agent)
     tested = "tested" if version in TESTED_VERSIONS[agent] else "NOT a tested version"
     print(f"levain consent canary: {AGENT_LABELS[agent]} {version or '(version not readable)'} ({tested})")
