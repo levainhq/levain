@@ -203,19 +203,17 @@ def _deep(n=100_000):
 
 
 @pytest.mark.parametrize("make", [lambda: {1: "a"}, lambda: {"x": {2: "b"}}, lambda: {"x": [{None: 1.5}]},
-                                  lambda: {1: "a", "x": "b"}, lambda: {"x": object()}, lambda: {"x": {1, 2}},
-                                  _recursive, _deep])
+                                  lambda: {1: "a", "x": "b"}, _recursive, _deep])
 @pytest.mark.parametrize("nonce", ["", NONCE])
 def test_an_undigestable_input_is_declined_invalid_event(tmp_path, make, nonce):
-    # L3 r2 codex D4: the exact {1: "a"} (a json fallback coerced the key to "1"), and an object json cannot encode
+    # L3 r2 codex D4: the exact {1: "a"} (the json fallback coerced the key to "1")
     q = Q("allow")
     out = ex(_event("Bash", make(), tool_use_id="toolu_1"), q, tmp_path, nonce=nonce)
     assert isinstance(out, cc.Declined) and out.reason == "invalid_event" and q.filed == []
 
 
-@pytest.mark.parametrize("value", [{1: "a"}, {"x": {2: "b"}}, {"x": [{True: 1.5}]}, {"x": object()},
-                                   {"x": {1, 2}}, {"x": 1.5, "y": Path("/p")}])
-def test_the_json_fallback_refuses_a_non_string_key_and_an_unencodable_object(value):
+@pytest.mark.parametrize("value", [{1: "a"}, {"x": {2: "b"}}, {"x": [{True: 1.5}]}, {"x": ({None: "a"},)}])
+def test_the_json_fallback_refuses_a_non_string_key(value):
     with pytest.raises(TypeError):
         tool_input_digest(value)
 

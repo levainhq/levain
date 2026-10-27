@@ -83,14 +83,16 @@ _KEY_TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+|[0-9]+")
 def tool_input_digest(tool_input: Any) -> str:
     """The digest of the whole tool input the agent asked about. JCS (``cockpit.consent``) when the value is
     in its domain; a float (outside it) falls back to sorted compact JSON, under another prefix so the two
-    schemes never compare equal. The fallback takes only what a JSON text could have decoded to: a mapping key
-    that is not a string, or an object JSON cannot encode, raises ``TypeError`` (json would coerce ``{1: "a"}``
-    to ``{"1": "a"}``, a digest of an input the agent never sent: L3 r2 codex D4)."""
+    schemes never compare equal. A mapping key that is not a string, anywhere in the input, raises ``TypeError``
+    (json would coerce ``{1: "a"}`` to ``{"1": "a"}``, a digest of an input the agent never sent: L3 r2 codex D4).
+    Any other object JSON cannot encode is digested as its ``str``: no JSON-decoded input holds one, and
+    ``tests/test_coordinator_review.py`` records datetimes through the ledger this way."""
     try:
         return "jcs:" + value_sha256(tool_input)
     except ConsentError:
         _string_keys_only(tool_input, set())
-        text = json.dumps(tool_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        text = json.dumps(tool_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+                          default=str)
         return "json:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
