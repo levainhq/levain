@@ -360,3 +360,28 @@ def test_the_cockpits_own_key_is_told_to_pair_first_and_keeps_nothing(rig, tmp_p
     v = out["values"]
     assert v[3].startswith("Pings need this browser's own key"), v
     assert v[4] == "Turn on", v                                  # the browser's subscription was dropped too
+
+
+@needs_browser
+def test_a_failed_key_read_is_asked_again_and_the_pings_row_appears(rig, tmp_path, monkeypatch) -> None:
+    """A first GET /webpush/key that fails (not a 200, not a 404) is not "this cockpit serves no web push": the panel asks
+    again on its next read and shows the row."""
+    from levain.webpush import routes, vapid
+
+    real, calls = vapid.ensure_keys, []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("key store busy")
+        return real(*a, **k)
+
+    monkeypatch.setattr(routes.vapid, "ensure_keys", flaky)
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _):
+        _dev, tok = _pair(port, label="iPhone")
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token={tok}", [
+            {"until": f"{_ROW} && !{_ROW}.hidden && 1", "ms": 20000},
+        ])
+    assert len(calls) >= 2, calls
+    assert out["values"][0] == 1, out

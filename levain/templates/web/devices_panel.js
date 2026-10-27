@@ -187,6 +187,7 @@
       try {
         const res = await api("GET", "/webpush/key", undefined, READ_TIMEOUT_MS);
         if (res.status === 200 && typeof res.data.key === "string") pushKey = res.data.key;
+        else if (res.status !== 200 && res.status !== 404) { pushAsked = false; return; }   // a 5xx or odd answer: ask again on the next read
       } catch (_) { pushAsked = false; return; }      // no answer: ask again on the next read
     }
     if (!pushKey) return;                               // this cockpit serves no web push: no row

@@ -887,14 +887,16 @@ def build_substrate_json(
     # `writable` is a transport capability, deliberately NOT a SubstrateView field;
     # guard the namespace so a future to_dict() field of the same name can't be
     # silently clobbered (caught in tests, never in prod — complement L3).
-    assert "writable" not in payload, "SubstrateView.to_dict() collided with transport `writable`"
+    if "writable" in payload:
+        raise RuntimeError("SubstrateView.to_dict() collided with transport `writable`")
     payload["writable"] = source.write_scope is not None
     # OFF-BOX write signal (spore-129): true iff this surface is writable AND bound off-loopback,
     # i.e. the server's POST /edit will REQUIRE the X-Levain-Write-Token header (see do_POST).
     # It tells the frontend to attach the device-held token. The handler computes the predicate
     # (it owns the bound-address fact) and, since K2a, also sets it on any writable surface,
     # because every write needs the token there; default False here.
-    assert "write_token_required" not in payload, "to_dict() collided with transport `write_token_required`"
+    if "write_token_required" in payload:
+        raise RuntimeError("to_dict() collided with transport `write_token_required`")
     payload["write_token_required"] = write_token_required
     # Inline external panels (the read-only extra-PANEL seam): a per-request provider returns
     # full panel descriptors+data; split each into a layout entry (kind:"external") + its data
@@ -902,7 +904,8 @@ def build_substrate_json(
     # panels. The provider is a DOWNSTREAM read (e.g. the Bridge's inbox) — gated like this whole
     # route. FAIL-SOFT: a provider fault degrades to no extra panels, never breaks the cockpit.
     if extra_panels is not None:
-        assert "extra_panels" not in payload, "to_dict() collided with transport `extra_panels`"
+        if "extra_panels" in payload:
+            raise RuntimeError("to_dict() collided with transport `extra_panels`")
         try:
             panels = extra_panels()
             # the provider CONTRACT is a list/tuple of dicts; coerce anything else (None, an
@@ -968,7 +971,8 @@ def build_substrate_json(
     # verbs are registered (a read-only serve passes none), so the frontend renders no compose
     # affordance at all even if a panel still declares an `action` (NO THEATER).
     if extra_verbs:
-        assert "action_verbs" not in payload, "to_dict() collided with transport `action_verbs`"
+        if "action_verbs" in payload:
+            raise RuntimeError("to_dict() collided with transport `action_verbs`")
         payload["action_verbs"] = {
             # `idempotent` tells the frontend to mint + send a client `idempotency_key` for this
             # verb (the at-most-once retry token); `job` tells it the POST returns a job HANDLE to
@@ -1337,7 +1341,8 @@ class _Handler(GuardedHandler):
         name = None
         for n, tok in sorted(self.server.surface_tokens.items()):
             # RQ-6: make_server refuses a surface name with the paired prefix; this holds it at the point of use
-            assert not n.startswith(PAIRED_PREFIX), f"surface token name {n!r} is in the paired namespace"
+            if n.startswith(PAIRED_PREFIX):
+                raise RuntimeError(f"surface token name {n!r} is in the paired namespace")
             if tok and hmac.compare_digest(supplied, tok.encode("utf-8")) and name is None:
                 name = n
         if name is not None:
