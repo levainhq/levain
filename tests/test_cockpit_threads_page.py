@@ -120,3 +120,24 @@ def test_a_late_reply_for_an_abandoned_navigation_never_repaints(tmp_path, seede
     race = json.loads(next(v for v in reversed(out["values"]) if isinstance(v, str)))
     assert race[:3] == ["B", "B", "D"], race
     assert race[3] in (None, "Nothing has been said in this thread yet."), race     # no error text over D
+
+
+@needs_browser
+def test_a_launch_with_an_unreadable_composer_is_not_called_launchless(tmp_path, seeded):
+    qdir, _world = seeded
+    httpd = _serve(qdir)
+    try:
+        out = _drive(tmp_path, f"http://127.0.0.1:{httpd.server_address[1]}/", [
+            {"until": "document.querySelector('.tv-row')"},
+            {"eval": "JSON.stringify({unread: LevainThreadView.threadModel({thread_id: 't', launch_id: 'L1', composer: null}).composer,"
+                     " none: LevainThreadView.threadModel({thread_id: 't', launch_id: null, composer: null}).composer,"
+                     " answered: LevainThreadView.threadModel({thread_id: 't', stream: [{kind: 'vendor_approval_resolved', body: 'leak'}]})"
+                     ".stream[0].text})"},
+        ])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    got = json.loads(next(v for v in reversed(out["values"]) if isinstance(v, str)))
+    assert got["unread"] == "The launch's state could not be read.", got
+    assert got["none"] == "This thread has no worker launch.", got
+    assert got["answered"] == "An approval was answered.", got

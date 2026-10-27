@@ -31,20 +31,23 @@
     if (own(KIND_LABEL, kind)) return KIND_LABEL[kind];
     return String(kind).indexOf("attenuation_") === 0 ? "narrowed" : String(kind).replace(/_/g, " ");
   }
-  function composerWords(c) {
-    if (!c) return "This thread has no worker launch.";
+  function composerWords(c, launchId) {
+    if (!c) return launchId ? "The launch's state could not be read." : "This thread has no worker launch.";
     var w = own(COMPOSER_WORDS, c.state) ? COMPOSER_WORDS[c.state] : "The composer state is not known.";
     return c.why && c.state !== "writable" ? w + " (" + c.why + ")" : w;
   }
 
-  var APPROVAL_WORDS = "An approval was asked; answer it in Needs you.";
+  var APPROVAL_WORDS = {
+    vendor_approval_request: "An approval was asked; answer it in Needs you.",
+    vendor_approval_resolved: "An approval was answered."
+  };
 
   function line(it) {
     var who = it.kind === "message" ? it.source : (it.source === "vendor" ? "agent side" : it.source);
     var status = it.status ? String(it.status).replace(/_/g, " ") : "";
     return {
       gseq: it.gseq, kind: it.kind, label: label(it.kind), who: who,
-      text: it.kind === "vendor_approval_request" ? APPROVAL_WORDS : (it.body == null ? "" : String(it.body)),
+      text: own(APPROVAL_WORDS, it.kind) ? APPROVAL_WORDS[it.kind] : (it.body == null ? "" : String(it.body)),
       status: status, unverified: it.unverified === true, truncated: it.truncated === true,
       tool: it.tool ? { open: it.tool.open === true } : null,
       at: it.at || ""
@@ -53,7 +56,7 @@
 
   function threadModel(body) {
     return {
-      id: String(body.thread_id), gap: body.gap === true, composer: composerWords(body.composer),
+      id: String(body.thread_id), gap: body.gap === true, composer: composerWords(body.composer, body.launch_id),
       before: (body.before || []).map(line), stream: (body.stream || []).map(line)
     };
   }
@@ -64,7 +67,7 @@
       rows: (body.threads || []).map(function (t) {
         return {
           id: String(t.thread_id), latest: t.latest_gseq == null ? "no record yet" : "gseq " + t.latest_gseq,
-          at: t.latest_at || "", composer: composerWords(t.composer), state: t.composer ? t.composer.state : "none"
+          at: t.latest_at || "", composer: composerWords(t.composer, t.launch_id), state: t.composer ? t.composer.state : "none"
         };
       })
     };

@@ -1,6 +1,7 @@
 """CH-U1a: the thread view's read half over a real ``dispatch.db`` built with ChatService + ScriptedSession."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -188,3 +189,30 @@ def test_the_list_holds_only_threads_with_a_launch_or_a_chat_record_newest_activ
     ids = [t["thread_id"] for t in threads.thread_list(qdir)["threads"]]
     assert bare not in ids
     assert ids == [late, world["thread"]]      # the newer launch leads though neither has a chat line
+
+
+def test_a_launch_only_thread_reports_its_launch_as_its_latest_activity(qdir, clock):
+    store = EnvelopeStore(qdir, clock=clock)
+    world = _world(store)                    # a worker launch, no chat line
+    cs = ChatStore(store)
+    cs._connect().close()
+    [row] = threads.thread_list(qdir)["threads"]
+    assert row["thread_id"] == world["thread"]
+    c = sqlite3.connect(qdir / "dispatch.db")
+    gseq, at = c.execute("SELECT gseq, at FROM launches WHERE launch_id = ?", (world["launch"],)).fetchone()
+    c.close()
+    assert (row["latest_gseq"], row["latest_at"]) == (gseq, at)
+
+
+def test_a_chat_line_newer_than_the_launch_supplies_the_latest_activity(seeded):
+    qdir, world = seeded
+    [row] = threads.thread_list(qdir)["threads"]
+    last = threads.thread_stream(qdir, world["thread"])["stream"][-1]
+    assert (row["latest_gseq"], row["latest_at"]) == (last["gseq"], last["at"])
+
+
+def test_an_approval_body_never_reaches_the_json_in_either_kind():
+    for kind in ("vendor_approval_request", "vendor_approval_resolved"):
+        row = dataclasses.replace(_row(kind, "approval_request:req-77", "L-A"), body="Bash rm x req-77")
+        item = threads._item(row, {}, set())
+        assert item["body"] is None and "req-77" not in json.dumps(item), item

@@ -80,8 +80,8 @@ def _chat_readable(conn: sqlite3.Connection) -> bool:
 
 def thread_list(directory: Path | str) -> dict[str, Any]:
     """Every thread with a worker launch or a chat record, newest activity first (at most ``LIST_MAX``). Activity is
-    the larger of the thread's latest chat ``gseq`` and its latest worker launch's ``gseq``, so a new launch is
-    ordered by when it began."""
+    the larger of the thread's latest chat ``gseq`` and its latest worker launch's ``gseq``; ``latest_gseq`` and
+    ``latest_at`` report that activity, so a launch-only thread is not "no record yet"."""
     conn = _open(directory)
     if conn is None:
         return {"threads": [], "truncated": False}
@@ -95,13 +95,16 @@ def thread_list(directory: Path | str) -> dict[str, Any]:
             launch_g = ("(SELECT MAX(l.gseq) FROM launches l, json_each(l.threads) j WHERE j.value = t.thread_id "
                         "AND l.role = 'worker')") if _has(conn, "launches") else "NULL"
             rows = conn.execute(
-                f"SELECT thread_id, cg FROM (SELECT t.thread_id AS thread_id, {chat_g} AS cg, {launch_g} AS lg "
+                f"SELECT thread_id, cg, lg FROM (SELECT t.thread_id AS thread_id, {chat_g} AS cg, {launch_g} AS lg "
                 "FROM threads t) WHERE cg IS NOT NULL OR lg IS NOT NULL "
                 "ORDER BY MAX(COALESCE(cg, 0), COALESCE(lg, 0)) DESC, thread_id LIMIT ?", (LIST_MAX + 1,)).fetchall()
             out = []
-            for thread_id, latest in rows[:LIST_MAX]:
-                at = conn.execute("SELECT at FROM chat_timeline WHERE thread_id = ? AND gseq = ?",
-                                  (thread_id, latest)).fetchone() if latest is not None else None
+            for thread_id, cg, lg in rows[:LIST_MAX]:
+                latest = max(g for g in (cg, lg) if g is not None)
+                # the row that supplied the activity gseq also supplies its time
+                at = (conn.execute("SELECT at FROM chat_timeline WHERE thread_id = ? AND gseq = ?",
+                                   (thread_id, latest)).fetchone() if cg == latest
+                      else conn.execute("SELECT at FROM launches WHERE gseq = ?", (latest,)).fetchone())
                 launch, composer = _composer(conn, thread_id)
                 out.append({"thread_id": thread_id, "latest_gseq": latest, "latest_at": at[0] if at else None,
                             "launch_id": launch, "composer": composer})
@@ -135,10 +138,13 @@ def _event_facts(conn: sqlite3.Connection, launches: set[str]) -> tuple[dict[tup
 def _item(row: chat.TimelineRow, facts: Mapping[tuple[str, str], tuple[str | None, int, int]],
           done: set[tuple[str, str]]) -> dict[str, Any]:
     call_id, truncated, backfill = facts.get((row.launch_id or "", row.ref_id), (None, 0, 0))
-    # an approval's ref is the kind alone: the vendor's control-request id is not a queue request id, so it is not offered
-    ref = row.ref_id.partition(":")[0] if row.kind in _APPROVAL_KINDS else row.ref_id
+    # an approval's ref is the kind alone and its body is dropped: the vendor's control-request id is not a queue request
+    # id, and a driver may put the tool name, its input or that id in the body, so none of it is offered
+    approval = row.kind in _APPROVAL_KINDS
+    ref = row.ref_id.partition(":")[0] if approval else row.ref_id
     item: dict[str, Any] = {"gseq": row.gseq, "kind": row.kind, "source": row.source, "ref": ref,
-                            "launch_id": row.launch_id, "status": row.status, "body": row.body, "at": row.at,
+                            "launch_id": row.launch_id, "status": row.status, "body": None if approval else row.body,
+                            "at": row.at,
                             "echo_of": row.echo_of, "truncated": bool(truncated), "backfill": bool(backfill)}
     if row.kind == "message" and row.source == "operator":
         item["unverified"] = True       # no signature check exists on the record, so the view never says "verified"
