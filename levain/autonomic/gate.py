@@ -1008,10 +1008,12 @@ class EfferentGate:
                 **({"terminal_state": terminal} if terminal else {}),
             )
 
+        started: list[EffectOutcome] = []   # the journal's report of an effect an end found started
+
         def end_unstarted(rung: Posture, reason: str) -> GateOutcome | None:
             # end the run unless the effect started, with this refusal's receipt on /3: the refusal's outcome, or None
-            # when the effect started (the journal's to report: the fire below runs nothing). The /3 close says itself
-            # whether it counted (R15-5 S2 fix round 1 F1: no WON/LOST read from receipt ids)
+            # when the effect started (the journal's to report, kept in ``started``: the fire below runs nothing). The
+            # /3 close says itself whether it counted (R15-5 S2 fix round 1 F1: no WON/LOST read from receipt ids)
             try:
                 if self._journal_v3:
                     build = self._pending_cancels(pending, hold, created_at, rung)
@@ -1031,6 +1033,7 @@ class EfferentGate:
                     execution=None, binding_id=binding_id,
                 )
             if isinstance(got, EffectOutcome):
+                started.append(got)
                 return None
             if isinstance(got, Closed):
                 return self._refused_v3(rung, reason, got.receipt_id if got.terminal is Terminal.WON else None,
@@ -1038,12 +1041,37 @@ class EfferentGate:
             return deny(rung, reason, by="on-loop")
 
         def ended(rung: Posture, reason: str, status: EffectStatus) -> GateOutcome:
-            # an approval the journal stopped for good. RULINGS 1027-18 R5: on /3 a run already closed (cancelled, or
-            # its effect poisoned) has its close as its receipt, so nothing goes to the file; a fence closes nothing
-            # (its owner closes the run), so a fenced one keeps its file receipt (O3)
-            if self._journal_v3 and status in (EffectStatus.CANCELLED, EffectStatus.POISONED):
+            # an approval the journal stopped for good. RULINGS 1027-18 R5: on /3 a cancelled run has its close as its
+            # receipt, so nothing goes to the file; a fence closes nothing (its owner closes the run), so a fenced one
+            # keeps its file receipt (O3). A poisoned effect closed its attempt, not the run (R15-5 S2 fix round 2
+            # P1): its receipt is the one its attempt ended with, and an attempt left intent (no end written) has
+            # none, so it gets the file receipt
+            if self._journal_v3 and status is EffectStatus.CANCELLED:
                 return self._refused_v3(rung, reason, None, binding_id)
+            if self._journal_v3 and status is EffectStatus.POISONED:
+                try:
+                    rid = self._journal.latest_receipt(hold["run_id"], hold["effect_id"])  # type: ignore[union-attr]
+                except Exception as e:  # noqa: BLE001
+                    _log.error("efferent gate resolve: poisoned effect's receipt not read (%s): %s",
+                               type(e).__name__, e)
+                    rid = None
+                if rid is not None:
+                    return GateOutcome(posture=rung, fired=False, refused=True, deferred=False, reason=reason,
+                                       receipt_id=rid, execution=None, binding_id=binding_id)
             return deny(rung, reason, by="on-loop")
+
+        def fire_request(estimate: object | None) -> ActionRequest:
+            # No kill predicates or trigger event on the resolve-fire: a binding's known-danger kills were
+            # evaluated when this effect was proposed, and they are deterministic over the immutable trigger
+            # event, so evaluating them again would give the same verdict. A kill grammar that read fire-time
+            # world state would have to be evaluated again here.
+            return ActionRequest(
+                action_name=pending.action_name, payload=pending.payload, context_id=pending.context_id,
+                query_text=pending.query_text, query_date=pending.query_date,
+                trust=_RESOLVED_TRUST, grounded=True, authority=self._authority_of(pending),
+                producers=pending.producers, proposal_id=pending.proposal_id,
+                actor_first_estimate=estimate, run=RunRef(hold["run_id"], hold["effect_id"], chained=_is_chained(hold)),
+            )
 
         def reject(posture: Posture, reason: str, **kw: Any) -> GateOutcome:
             if self._journal_v3:
@@ -1119,6 +1147,12 @@ class EfferentGate:
             reason = "decided_rung_refuses"
             if hold.get("decided") is not True:
                 return reject(posture, reason)
+            if started:
+                # the stop-reason branch found the effect started: the journal's report of it, and no second end
+                # (R15-5 S2 fix round 2 P3)
+                out = started[0]
+                return (self._replayed(fire_request(None), out, created_at) if out.status is EffectStatus.REPLAYED
+                        else self._journal_stop(fire_request(None), out, posture))
             stopped = end_unstarted(posture, reason)
             # an effect that started under it is not run again here, nor fired at a rung with no execution path
             return stopped if stopped is not None else self._refuse_open(f"{reason}:effect_started", binding_id)
@@ -1164,18 +1198,9 @@ class EfferentGate:
         estimate = None if already_approved else decision.first_estimate
         verdict = "approved" if decider == "human" else "auto"
         by = receipt_by(decider, authority.grantor)
-        run = RunRef(hold["run_id"], hold["effect_id"], chained=_is_chained(hold))
-        # No kill predicates or trigger event on the resolve-fire: a binding's known-danger kills were
-        # evaluated when this effect was proposed, and they are deterministic over the immutable trigger
-        # event, so evaluating them again would give the same verdict. A kill grammar that read fire-time
-        # world state would have to be evaluated again here.
-        request = ActionRequest(
-            action_name=pending.action_name, payload=pending.payload, context_id=pending.context_id,
-            query_text=pending.query_text, query_date=pending.query_date,
-            trust=_RESOLVED_TRUST, grounded=True, authority=authority,
-            producers=pending.producers, proposal_id=pending.proposal_id,
-            actor_first_estimate=estimate, run=run,
-        )
+        request = fire_request(estimate)
+        run = request.run
+        assert run is not None
         assert fence is not None   # every path here re-derived the risk inputs
         chain = hold.get("chain")
         expect = decision_key(hold) if already_approved else None
@@ -2185,15 +2210,30 @@ class EfferentGate:
         written, makes the decision not terminal (:meth:`_cancel_unrecorded`). A run another path closed first keeps
         that close (LOST): the outcome names no receipt of its own."""
         assert self._journal is not None and request.run is not None
-        try:
-            receipt = self._run_receipt(request.run.run_id, created_at=created_at, action_name=request.action_name,
-                                        proposal_id=request.proposal_id, posture=posture,
-                                        face=face(), grant=grant)
-            closed = self._journal.cancel(request.run.run_id, reason=close_reason, receipt=receipt)
-        except KeyError:
+
+        def not_admitted() -> GateOutcome:
             # a run this store never admitted: nothing to close, and nothing held for a retry (R15-5 S2 fix round 1 F5)
             return GateOutcome(posture=posture, fired=False, refused=True, deferred=False, reason="run_not_admitted",
                                receipt_id=None, execution=None, binding_id=request.authority.binding_id)
+        try:
+            self._journal.run_guard(request.run.run_id)   # KeyError only for a run never admitted (its seal's read)
+        except KeyError:
+            return not_admitted()
+        except Exception:  # noqa: BLE001 — the receipt build below reads it again and reports its fault
+            pass
+        try:
+            # a KeyError here is a fault in the build, never "not admitted" (R15-5 S2 fix round 2 P2)
+            receipt = self._run_receipt(request.run.run_id, created_at=created_at, action_name=request.action_name,
+                                        proposal_id=request.proposal_id, posture=posture,
+                                        face=face(), grant=grant)
+        except Exception as e:  # noqa: BLE001 — a decision whose receipt cannot be built is not terminal
+            _log.error("efferent gate: run %s close receipt not built (%s): %s", request.run.run_id,
+                       type(e).__name__, e)
+            return self._cancel_unrecorded(request, posture, close_reason)
+        try:
+            closed = self._journal.cancel(request.run.run_id, reason=close_reason, receipt=receipt)
+        except KeyError:
+            return not_admitted()
         except JournalConflictError as e:
             if self._run_complete(request.run.run_id):
                 # every sealed link of the run ended (the store's I2 refuses its close): the run is over, nothing
