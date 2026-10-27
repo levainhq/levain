@@ -139,6 +139,29 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `routes-base` say so. A map where two of your routes name the same host, a route that lists the same host twice, or a
   subscription route that names a shipped host is refused when the map is merged, with the route names and the fix (edit
   `routes/base.json`), instead of every session failing at its gateway; `routes-egress` refuses to write over such a map.
+- **The cockpit has a Calm switch.** On, the agents graph and the sky stop moving and the page's animations slow, and the
+  ages on the page refresh every two minutes instead of faster, so an open cockpit tab costs the laptop far less; every
+  number, card and answer stays. It is remembered on that device. On a desktop bar too narrow for the label it shows as an
+  icon, filled while Calm is on; on a phone it sits at the right of the clock and date.
+- **A Levain session can sign in to your own Claude subscription.** The base route map now includes `claude-subscription`,
+  which lets a `levain session --auth passthrough claude` session reach `api.anthropic.com`, `claude.ai` and
+  `platform.claude.com` and nothing else; telemetry, error-reporting and update hosts are not included. `levain setup`
+  and `repair` add it to an existing install; if you already have your own Claude passthrough route, the merge keeps
+  yours, skips the shipped one, and says so each time it runs.
+- **A slot's network front keeps a log.** Each egress slot's gateway writes its tunnels and refusals to `front.log` in
+  the slot's gateway directory; the log is capped (one rotated copy), mode 0640, and never written through a link.
+- **`levain binding pause|resume|abandon <id>`.** `pause` stops a binding from firing and stops runs it already started
+  before their next action; `resume` makes a paused binding fire on its next event; `abandon` stops the runs a revoked or
+  expired binding already started. Each opens the autonomic store as it is and prints one line (exit 1 with the reason
+  when it cannot).
+- **Graduation policies carry a guard.** `levain binding policy create` needs `--guard FILE`, a JSON list of entries that
+  each give a reason the policy might be wrong, a kill (an event condition) and a drill (an example event the kill must
+  not let through). Levain prints the guard back before signing and refuses a kill it could not evaluate, a drill the
+  kill lets through, an entry missing any of the three, or a guard past the size limits. The guard is checked when the
+  policy is signed, not yet when a binding fires. A policy with a guard is written `levain-authority/3`, which an older
+  levain stops at instead of reading. A graduation policy signed without a guard no longer covers anything (its bindings
+  wait at CONFIRM again) and cannot be renewed: revoke it and create it again with `--guard`. The graduation card's
+  command line includes `--guard <guard.json>`.
 
 ### Changed
 - **A coordinator store made by an earlier version is updated the first time a `levain` command that writes to it
@@ -218,6 +241,22 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `com.apple.trustd.agent` let a sandboxed command make macOS fetch a web address of its choosing, outside Levain's proxy.
   Such a key holding the wrong type (for example `false` or `""` where a list belongs), or a list holding anything but
   strings, is refused by key name instead of launching.
+- **A stuck cockpit read no longer wedges its panel until restart.** After the panel's time budget the cockpit starts a
+  fresh read, holds at most two outstanding builds per source, and a panel waiting on the stuck read gets the fresh
+  one's result. An idle store now costs the cockpit nothing (no time-derived etag, a cached view).
+- **Turning on the system's reduced-motion setting no longer switches Ambient off for good.** The sky stays still while
+  the setting is on, and the motion you chose comes back when you turn it off; Calm never writes the Ambient preference.
+- **`levain binding resume` refuses a binding whose stored record is damaged** (a hand-corrupted counter) instead of
+  making it live; pausing or revoking it still works. The pause, resume and abandon commands also read a store through a
+  read-only connection first, so a database they refuse is left exactly as it was, and refuse a `/2` store missing a
+  column.
+- **`levain doctor`'s "agent front logs" row judges what a session start would.** It asks the runtime's own walk about
+  each egress slot's front log directory (missing account, a `gw/` that is a file, a link, a wrong owner or mode fail
+  the row; only a genuinely missing directory reads as upgrade-pending), names each slot under its own result, and no
+  longer warns "could not be read" on a healthy install. A session refused for a missing front log directory names the
+  directory that is missing.
+- **`levain binding policy create`'s read-back no longer overstates a guard.** A kill condition that hits an unexpected
+  internal error, or an event number too large for a float, now stops the fire instead of crashing the check.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - **The graduation engine behind `levain binding graduate`.** Once the binding driver is wired, it takes the steps a
