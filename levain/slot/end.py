@@ -139,6 +139,11 @@ CREDENTIALS: Mapping[str, tuple[tuple[bytes, ...], bytes]] = {
     "codex": ((b"config", b"codex"), b"auth.json"),
 }
 CREDENTIAL_FILES = tuple(CREDENTIALS.values())
+#: IG-1 (1027-18 RULINGS): ``L/retained/<s>/replaced/``, where END puts the credential a confirmed re-login replaces in
+#: ``keep/``. It is inside the session's own retained directory, so discard, restore and purge carry it with the session.
+REPLACED = "replaced"
+#: DECISION: a ``levain-baseline/1`` file is five short fields; one past this is not root's baseline.
+BASELINE_MAX_BYTES = 4096
 VAR_FOLDERS_NAME = b".levain-var-folders"     # CONTRACT §7.4: macOS /private/var/folders/<slot>
 
 #: The refusals that mean "past the manifest budget": HELD ``failed_step:"manifest_budget"``, whose
@@ -231,7 +236,8 @@ class EndFacts:
     Linux. ``lease_seq``: the lease root's slot state
     file must still show (§3.5 Pool). ``child_uid``: a verifier pair's child (§1, §5.6), frozen, killed and
     proven gone with the slot uid. ``vendor`` + ``auth``: a credential is parked on a passthrough session
-    only. The defaults fail closed: no ``lease_seq`` = ``slot-not-ours``, no ``auth`` = nothing parked."""
+    only. ``kind``: alloc's; only a ``login`` session can replace a parked credential (IG-1). The defaults fail
+    closed: no ``lease_seq`` = ``slot-not-ours``, no ``auth`` = nothing parked, no ``kind`` = nothing replaced."""
 
     session: str
     slot: SlotId
@@ -243,6 +249,7 @@ class EndFacts:
     child_uid: int | None = None
     vendor: str | None = None
     auth: str | None = None
+    kind: str | None = None
 
     @property
     def uids(self) -> tuple[int, ...]:
@@ -283,6 +290,10 @@ class EndFacts:
         return self.slot.slot_dir(self.store) / "keep"
 
     @property
+    def replaced(self) -> Path:
+        return self.retained / REPLACED
+
+    @property
     def slot_state(self) -> Path:
         return self.slot.slot_dir(self.store) / "state"
 
@@ -316,14 +327,14 @@ def _is_id(x: object) -> bool:
 
 def facts_from_alloc(alloc: Mapping[str, object], *, store: Path, var_folders: Path | None = None) -> EndFacts:
     """The END facts of a parsed ``levain-alloc/1`` record: ``session``, ``slot{class,index}``,
-    ``slot_uid``, ``slot_gid``, ``lease_seq``, ``child_uid`` (none class), ``vendor``, ``auth``. Anything
-    else in it is not END's."""
+    ``slot_uid``, ``slot_gid``, ``lease_seq``, ``child_uid`` (none class), ``vendor``, ``auth``, ``kind``
+    (absent = None). Anything else in it is not END's."""
     try:
         slot = alloc["slot"]
         facts = EndFacts(alloc["session"], SlotId(slot["class"], slot["index"]),  # type: ignore[index]
                          alloc["slot_uid"], alloc["slot_gid"], Path(store), var_folders,  # type: ignore[arg-type]
                          alloc["lease_seq"], alloc.get("child_uid"), alloc["vendor"],  # type: ignore[arg-type]
-                         alloc["auth"])  # type: ignore[arg-type]
+                         alloc["auth"], alloc.get("kind"))  # type: ignore[arg-type]
     except (KeyError, TypeError) as e:
         raise Refused("alloc-malformed", f"END facts: {e}") from None
     if not _is_id(facts.slot_uid) or not _is_id(facts.slot_gid):
@@ -335,6 +346,8 @@ def facts_from_alloc(alloc: Mapping[str, object], *, store: Path, var_folders: P
         raise Refused("alloc-malformed", "child_uid is a uid, present exactly for the none class")
     if not isinstance(facts.vendor, str) or not isinstance(facts.auth, str):
         raise Refused("alloc-malformed", "vendor / auth")
+    if facts.kind is not None and not isinstance(facts.kind, str):
+        raise Refused("alloc-malformed", "kind")
     facts.intent   # validates the session id
     return facts
 
@@ -1679,14 +1692,85 @@ def _open_subdir(base: Path, parts: tuple[bytes, ...]) -> int | None:
     return fd
 
 
-def park_move(facts: EndFacts) -> None:
+def confirmed_relogin(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _root_owned) -> bool:
+    """IG-1: whether this session is a ``login`` whose ``confirm-identity yes`` was given. Root's facts only: alloc's
+    kind ``login`` on a session that parks, and root's baseline file (a regular file, not followed, the expected owner,
+    at most :data:`BASELINE_MAX_BYTES`) passing :func:`levain.slot.identity.check_baseline` whole and naming THIS
+    session and vendor. ``confirm-identity yes`` writes it under ``L/alloc/<s>.lock``, the lock END holds, and only
+    while the record is running, so no yes can land while END reads it. Anything else is False."""
+    if facts.kind != "login" or not facts.parks:
+        return False
+    # identity imports runtime_helper, which imports this module: a top-level import here would be a cycle.
+    from levain.slot import identity as ID
+    try:
+        fd = os.open(facts.slot.slot_dir(facts.store) / ID.BASELINE_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or not owner_ok(st) or st.st_size > BASELINE_MAX_BYTES:
+            return False
+        data = os.read(fd, BASELINE_MAX_BYTES + 1)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    try:
+        obj = ID.check_baseline(canon.parse(data))
+    except (ContractError, Refused):
+        return False
+    return obj["session"] == facts.session and obj["vendor"] == facts.vendor
+
+
+def _own_dir(path: Path, owner_ok: Callable[[os.stat_result], bool]) -> None:
+    """``path`` made root 0700 (its parent fsynced) or, when it exists, checked a real directory with the expected
+    owner (a planted link is never followed): else ``bad-root``."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or not owner_ok(st):
+            raise Refused("bad-root", f"{path} is not a directory with the expected owner") from None
+        return
+    fsync_dir(path.parent)
+
+
+def _set_aside(facts: EndFacts, kfd: int, name: bytes, owner_ok: Callable[[os.stat_result], bool],
+               fault: Fault) -> None:
+    """IG-1: the parked credential a confirmed re-login replaces, renamed (never opened) from ``keep/`` into
+    ``L/retained/<s>/replaced/``, both directories then fsynced. A ``replaced/`` entry already there is never
+    replaced (``replaced-occupied``)."""
+    _own_dir(facts.retained, owner_ok)
+    _own_dir(facts.replaced, owner_ok)
+    fault("park:replace:dirs")
+    rfd = os.open(facts.replaced, _DIR_FLAGS)
+    try:
+        try:
+            os.stat(name, dir_fd=rfd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise Refused("replaced-occupied", f"{facts.replaced}/{name.decode('ascii')} already holds a file")
+        os.rename(name, name, src_dir_fd=kfd, dst_dir_fd=rfd)
+        os.fsync(kfd)
+        os.fsync(rfd)
+    finally:
+        os.close(rfd)
+
+
+def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _root_owned,
+              fault: Fault = _no_fault) -> None:
     """Move the session vendor's credential file to ``keep/`` by rename, never opening it, on a
     passthrough session only (L1-F1): on any other, a file at a credential path is ordinary work, retained.
     Only a non-directory is moved; absent = already parked or never made. A ``keep/`` entry already there
     is never replaced (``keep-occupied``, HELD park), so a planted file cannot overwrite a parked login;
-    ``keep/`` is root-only, so the check and the rename cannot race. keep/ (root 0700, install's) is made
-    if it is missing (DECISION). A redo that finds the source gone and ``keep/`` holding it (a rename whose
-    fsyncs did not finish) still fsyncs both directories (codex r1 6)."""
+    ``keep/`` is root-only, so the check and the rename cannot race. The one exception is a
+    :func:`confirmed_relogin` (IG-1): the parked entry is first set aside into ``replaced/`` (:func:`_set_aside`),
+    then the new login is parked. In that order, a death at any point leaves the new login in the session tree or
+    in ``keep/`` (the old one in ``keep/`` or ``replaced/``); a redo after the set-aside finds ``keep/`` empty and
+    parks, and one after the park finds the source gone.
+    keep/ (root 0700, install's) is made if it is missing (DECISION). A redo that finds the source gone and
+    ``keep/`` holding it (a rename whose fsyncs did not finish) still fsyncs both directories (codex r1 6)."""
     cred = facts.credential
     if cred is None or not os.path.isdir(facts.live):
         return
@@ -1715,7 +1799,11 @@ def park_move(facts: EndFacts) -> None:
             except FileNotFoundError:
                 pass
             else:
-                raise Refused("keep-occupied", f"{facts.keep}/{name.decode('ascii')} already holds a credential")
+                if not confirmed_relogin(facts, owner_ok=owner_ok):
+                    raise Refused("keep-occupied",
+                                  f"{facts.keep}/{name.decode('ascii')} already holds a credential")
+                _set_aside(facts, kfd, name, owner_ok, fault)
+                fault("park:replace:aside")
             os.rename(name, name, src_dir_fd=dfd, dst_dir_fd=kfd)
             os.fsync(dfd)
             os.fsync(kfd)
@@ -1725,9 +1813,11 @@ def park_move(facts: EndFacts) -> None:
         os.close(dfd)
 
 
-def park_plan(facts: EndFacts) -> Plan:
+def park_plan(facts: EndFacts, seams: "EndSeams | None" = None) -> Plan:
     # DECISION: park's `commit` is its CAS; the step itself re-syncs keep/ so a redo is durable.
-    return Plan("park", (Phase("move", lambda: park_move(facts)),
+    owner_ok = seams.owner_ok if seams is not None else _root_owned
+    fault = seams.fault if seams is not None else _no_fault
+    return Plan("park", (Phase("move", lambda: park_move(facts, owner_ok=owner_ok, fault=fault)),
                          Phase("commit", lambda: fsync_dir(facts.keep) if os.path.isdir(facts.keep) else None)))
 
 
@@ -2015,7 +2105,7 @@ def _held_name(intent: str, e: PhaseFailed) -> str:
 
 def _plan_for(facts: EndFacts, seams: EndSeams, caps: Caps) -> Callable[[RootIntent], Plan]:
     def plan_for(ri: RootIntent) -> Plan:
-        return retain_plan(facts, seams, ri, caps=caps) if ri.intent == "retain" else park_plan(facts)
+        return retain_plan(facts, seams, ri, caps=caps) if ri.intent == "retain" else park_plan(facts, seams)
     return plan_for
 
 
@@ -2164,10 +2254,11 @@ def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, cap
             if pending.intent == "retain":
                 return RETAINED
         if pending is None and start <= 2:
-            begin(facts.intent, park_plan(facts), started_at=seams.now(), cas=cas,
+            begin(facts.intent, park_plan(facts, seams), started_at=seams.now(), cas=cas,
                   fault=seams.fault, retry=seams.retry)
         elif start > 2:
-            park_move(facts)   # idempotent; no journal and no CAS: the record is already past it
+            # idempotent; no journal and no CAS: the record is already past it
+            park_move(facts, owner_ok=seams.owner_ok, fault=seams.fault)
 
         step = "init"
         if os.path.lexists(facts.tree):
@@ -2211,6 +2302,7 @@ __all__ = ["BUDGET_REFUSALS", "CAS_RETRY_SECONDS", "CLASSES", "CREDENTIALS", "CR
            "default_meta_reader", "default_strip", "digest_bytes", "end_lock", "end_session", "entry_type",
            "facts_from_alloc", "foreign_links", "fork_run_as", "iter_manifest", "iter_meta", "keep_shape_ok",
            "linux_meta", "linux_strip", "mark_cloned", "object_record", "os_chown", "outside_link_bytes",
-           "park_move", "park_plan", "read_as_session", "read_slot_state", "reconcile_session", "repo_cloned",
+           "REPLACED", "confirmed_relogin", "park_move", "park_plan", "read_as_session", "read_slot_state",
+           "reconcile_session", "repo_cloned",
            "retain_plan", "send_cas", "tree_manifest", "unbuilt_freeze", "unbuilt_kill", "unbuilt_no_process",
            "utc_now", "walk"]
