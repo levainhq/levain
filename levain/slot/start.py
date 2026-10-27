@@ -40,6 +40,9 @@ CONTROL checks, never as a fact root acts on.
 9. ``active``: CAS RENDERED -> ACTIVE; then the helper stays the vendor's parent until it exits: ``{ok, exit}``.
    A vendor that exec'd but is not recorded ACTIVE is killed with its whole domain (Linux: the session cgroup;
    macOS: every process of the slot uid), then reaped.
+10. ``identity`` (kind ``login`` only, after the vendor exits): :func:`levain.slot.identity.record_login_identity`
+   CASes what the vendor's identity call observed into the state record, for ``confirm-identity`` to read. A
+   refused CAS is noted, never the verb's answer: the login ran.
 
 Steps 4-9 run under the session END lock (:func:`_start_fenced`, the spawn fence), released after the CAS's answer.
 
@@ -64,6 +67,7 @@ from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence, 
 from levain.contracts import canon
 from levain.slot import Refused, wall
 from levain.slot import end as E
+from levain.slot import identity as ID
 from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import render as RD
@@ -640,7 +644,15 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     finally:
         _wake(seams)        # every release: an END that waited on the lock, or refused end-busy, is retried now
     seams.at("wait")
-    return {"exit": seams.wait(pid)}
+    code = seams.wait(pid)
+    if a.kind == "login":
+        seams.at("identity")
+        try:
+            ID.record_login_identity(ctx, a, code)
+        except Refused as e:
+            # The login ran; what it observed is not recorded, so confirm-identity yes refuses no-observed-id.
+            _note(f"identity of {a.session} not recorded: {e.name}")
+    return {"exit": code}
 
 
 def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:

@@ -724,6 +724,8 @@ REPROBE_S = 60.0           # CONTRACT V13: the macOS re-probe's period, start to
 URGENT_DRAIN_S = 1.0       # N4: the final drain's bound when the session ends on ``firewall-open``
 _NOTES_MAX = 32            # DECISION: re-probe notes kept for the end of the relay; past this they are counted
 REPROBE_SKIPS_MAX = 5      # L1: consecutive skipped re-probes that end the session (at REPROBE_S apart, ~5 min)
+CONFIRM_S = 300.0          # DECISION: how long a login session's confirm prompt waits for his answer (then: no answer)
+_CONFIRM_LINE_MAX = 64     # DECISION: an answer line longer than this is taken as "no"
 
 
 def _pty_pending(fd: int) -> int:
@@ -887,6 +889,9 @@ class Seams:
     kill_grace_s: float = KILL_GRACE_S
     reprobe_s: float = REPROBE_S
     clock: Callable[[], float] = time.monotonic
+    #: a login session's confirm prompt -> True (yes), False (no) or None (no answer); None = his terminal
+    #: (:meth:`Supervisor._ask`)
+    confirm: Optional[Callable[[str], Optional[bool]]] = None
 
     def __post_init__(self) -> None:
         if self.helper is None:
@@ -1001,6 +1006,7 @@ class Supervisor:
         self._output_failed = False           # the operator's stdout refused a write (not EAGAIN): the relay ended
         self._reset_untaken = False           # the reporting-mode reset did not reach his terminal whole
         self.unshown_lines = 0                # held status lines stderr never took (the end-of-run drain's count)
+        self._vendor_exit: object = None      # the vendor's exit as start's pty line printed it (display only)
 
     # -- small ------------------------------------------------------------------------------------------------------
 
@@ -1357,6 +1363,8 @@ class Supervisor:
             self._launch_probe(session)
             self._check()
             ok = self._start(session)
+            if ok and self.req.kind == "login":
+                self._confirm_identity(session)
         except Refused as e:
             self.say(f"refused {e.name}" + (f": {e.detail}" if e.detail else ""))
         finally:
@@ -1449,8 +1457,84 @@ class Supervisor:
         except Refused as e:
             self.say(f"start refused {e.name}")
             return False
+        self._vendor_exit = res.get("exit")
         self.say(f"{self.req.vendor} exited {res.get('exit')}" + ("" if code == 0 else f" (helper exit {code})"))
         return code == 0
+
+    # -- a login session's confirm-identity (§5.1, §7.6) ---------------------------------------------------------------
+
+    def _confirm_identity(self, session: str) -> None:
+        """After a login session's vendor exited and BEFORE teardown (the lease is live, which the helper's verb
+        needs): his answer to the confirm prompt goes to ``confirm-identity <session> yes|no``. Root decides what
+        is written: the baseline only on ``yes``, only from the id root recorded at ``start``. No answer (a stop
+        signal, EOF, :data:`CONFIRM_S`) sends nothing. Claude is not asked: its identity call is unbuilt (IG-3), and
+        root would refuse ``no-observed-id``. A refusal is said, never raised: teardown still runs."""
+        if self.stop_signal is not None:
+            return
+        if self.req.vendor == "claude":
+            self.say("no baseline written for this slot: the Claude identity call is not built yet "
+                     "(identity-call-unbuilt)")
+            return
+        if self._vendor_exit != 0:
+            self.say(f"the login exited {self._vendor_exit}: no baseline written")
+            return
+        prompt = ("levain: Codex has no server-validated identity call, so this login is recorded as not a check: "
+                  "Levain cannot tell which account it is. Keep it as this slot's Codex baseline? [y/N] ")
+        answer = (self.s.confirm or self._ask)(prompt)
+        if answer is None or self.stop_signal is not None:
+            self.say("no answer: no baseline written")
+            return
+        try:
+            self.helper("confirm-identity", session, "yes" if answer else "no", stdin=None)
+        except Refused as e:
+            self.say(f"confirm-identity refused {e.name}: no baseline written")
+            return
+        self.say("baseline written: this slot's Codex login is its baseline (not a check)" if answer
+                 else "not confirmed: no baseline written")
+
+    def _ask(self, prompt: str) -> Optional[bool]:
+        """The prompt on stderr, one line read from his terminal (cooked again once the relay ended), watching the
+        wake pipe so a stop signal ends the wait. ``y`` / ``yes`` (any case) is True; any other line False; a stop,
+        EOF, a stdin that is not a terminal, or :data:`CONFIRM_S` without a line is None."""
+        fd = self.s.stdin
+        if not os.isatty(fd):
+            return None
+        try:
+            self.err.write(prompt)
+            self.err.flush()
+        except OSError:
+            return None
+        deadline = self.s.clock() + CONFIRM_S
+        buf = bytearray()
+        while self.stop_signal is None:
+            left = deadline - self.s.clock()
+            if left <= 0:
+                return None
+            rl = [fd] + ([self._wake_r] if self._wake_r >= 0 else [])
+            try:
+                ready = select.select(rl, [], [], min(left, 0.5))[0]
+            except InterruptedError:
+                continue
+            if self._wake_r in ready:
+                try:
+                    os.read(self._wake_r, 64)
+                except BlockingIOError:
+                    pass
+            if fd in ready:
+                try:
+                    chunk = os.read(fd, _CONFIRM_LINE_MAX)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    return None
+                if not chunk:
+                    return None
+                buf += chunk
+                if b"\n" in buf:
+                    return buf.split(b"\n", 1)[0].strip().lower() in (b"y", b"yes")
+                if len(buf) > _CONFIRM_LINE_MAX:
+                    return False
+        return None
 
     def _winsize(self, master: int) -> None:
         if not os.isatty(self.s.stdin):

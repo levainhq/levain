@@ -1192,14 +1192,9 @@ class SlotView:
 
 
 def _baseline_vendor(data: Optional[bytes]) -> Optional[str]:
-    if data is None:
-        return None
-    try:
-        obj = canon.parse(data)
-    except ContractError:
-        return "?"
-    v = obj.get("vendor") if type(obj) is dict else None
-    return v if v in VENDORS else "?"
+    from levain.slot import identity as ID
+
+    return ID.baseline_vendor(data)
 
 
 def parse_slot_state_of(data: bytes, slot: SlotId) -> R.SlotState:
@@ -2161,6 +2156,12 @@ def _teardown(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     from levain.slot import start as SS
 
     return SS.teardown(ctx, req, blob)
+
+
+def _confirm_identity(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    from levain.slot import identity as ID
+
+    return ID.confirm_identity(ctx, req, blob)
 
 
 def _probe(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
@@ -3342,7 +3343,7 @@ def restore(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
 VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, object]]] = {
     "prepare": prepare, "render": render, "resume": resume, "status": status,
     "start": _start, "teardown": _teardown, "adopt-open": adopt_open, "adopt-verify": adopt_verify,
-    "discard": discard, "restore": restore, "probe": _probe,
+    "discard": discard, "restore": restore, "probe": _probe, "confirm-identity": _confirm_identity,
 }
 
 
