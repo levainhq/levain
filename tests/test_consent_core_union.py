@@ -62,6 +62,12 @@ class Q:
     def answer_by_grant(self, request_id, **kw):
         return None
 
+    def answer_by_contained_shell_grant(self, request_id, **kw):
+        return None
+
+    def answered_via(self, request_id):
+        return None
+
     def take_gate_allow(self, *a, **kw):
         return self.take
 

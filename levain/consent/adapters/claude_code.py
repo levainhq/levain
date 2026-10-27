@@ -806,23 +806,28 @@ RECHECK_EVERY = 1.0
 
 def hold_for_answer(queue: ConsentQueue, request: ExternalGateRequest, wait: float, *, tool_input: Any,
                     posture: str | None, still_away: Callable[[], tuple[bool, str, str]] | None = None,
+                    contained_launch: ContainedLaunchProof | None = None,
                     ) -> tuple[Decision | None, str | None]:
     """Wait up to ``wait`` seconds for a verified decision on ``request``: ``(decision, None)``, or
     ``(None, why)`` when ``still_away`` (re-read every :data:`RECHECK_EVERY` seconds) says away mode ended (the
     operator is back, or no key could sign), ``why`` its reason, or ``(None, None)`` when the wait ran out or the
     request stopped being pending. With no
     ``still_away`` it is one :meth:`ConsentQueue.await_decision` of ``wait``. The wait can run past ``wait`` by one
-    ``still_away`` call."""
+    ``still_away`` call. ``contained_launch`` is passed to every read (a contained-shell answer is delivered only
+    with the proof it was answered under); it is passed only when given, so a queue a hook caller hands in is
+    read exactly as before."""
+    proof = {} if contained_launch is None else {"contained_launch": contained_launch}
     if still_away is None:
-        return _verified(queue.await_decision(request.id, wait, tool_input=tool_input, posture=posture), request), \
-            None
+        return _verified(queue.await_decision(request.id, wait, tool_input=tool_input, posture=posture, **proof),
+                         request), None
     end = time.monotonic() + wait
     while True:
         left = end - time.monotonic()
         if left <= 0:
             return None, None
         piece, started = min(left, RECHECK_EVERY), time.monotonic()
-        got = _verified(queue.await_decision(request.id, piece, tool_input=tool_input, posture=posture), request)
+        got = _verified(queue.await_decision(request.id, piece, tool_input=tool_input, posture=posture, **proof),
+                        request)
         if got is not None:
             return got, None
         if time.monotonic() - started < piece or end - time.monotonic() <= 0:
@@ -863,17 +868,18 @@ class Declined:
     never a question. ``call`` is ``None`` only when the event was too malformed to name one."""
     call: CoreCall | None
     reason: Literal["invalid_event", "unconfined", "sandbox_escape_requested", "egress_not_levain",
-                    "contained_launch_mismatch"]
+                    "contained_launch_mismatch", "contained_delivery_refused"]
 
 
 DECLINED_REASONS = frozenset({"invalid_event", "unconfined", "sandbox_escape_requested", "egress_not_levain",
-                              "contained_launch_mismatch"})
+                              "contained_launch_mismatch", "contained_delivery_refused"})
 DECLINE_MESSAGES: Mapping[str, str] = MappingProxyType({
     "invalid_event": "levain could not read this request",
     "unconfined": "levain refuses agent-config writes from an unconfined session",
     "sandbox_escape_requested": "no sandbox escape in chat: run the command again without dangerouslyDisableSandbox",
     "egress_not_levain": "this launch's network is not the one levain built, so levain opens nothing for it",
-    "contained_launch_mismatch": "levain could not match this call to the launch it came from"})
+    "contained_launch_mismatch": "levain could not match this call to the launch it came from",
+    "contained_delivery_refused": "this launch's containment changed since the answer was given; ask again"})
 
 CoreResult = Decided | Abstained | Declined
 
@@ -920,7 +926,10 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
     A gate allow the take spent whose request cannot be read on a second try is ``Abstained(take_unread)``,
     nothing filed.
     A chat call's request is filed with ``event_source="chat"`` (its own ``chat:`` event id); a hook caller's is
-    filed exactly as before."""
+    filed exactly as before. ``contained_launch``, when given, reaches the policy answer (a contained-shell grant
+    answers only with it), the hold and the withdraw-race re-read; a chat call whose row the queue holds allowed by
+    a contained-shell grant that this call's proof cannot take delivery of is ``Declined(contained_delivery_refused)``
+    (R8-6)."""
     if getattr(queue, "directory", None) is None:
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
     if not isinstance(launch_nonce, str):
@@ -1003,21 +1012,27 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
     try:
         got: Decision | None = None
         if not agent_config and request.tier != AGENT_CONFIG_TIER:
-            got = _verified(guarded_policy(request, queue, posture=posture, tool_input=tool_input, policy=policy),
-                            request)
+            got = _verified(guarded_policy(request, queue, posture=posture, tool_input=tool_input, policy=policy,
+                                           contained_launch=contained_launch), request)
         wait = min(hold, max(0.0, deadline - clock()))
         back = None
         if got is None and wait > 0:
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
-                                        still_away=still_away)
+                                        still_away=still_away, contained_launch=contained_launch)
         if got is None:
             note = f"away mode ended ({back}); the native dialog stands" if back else \
                 "the hook stopped waiting; the native dialog stands"
             # `settled` is set only after this withdraw returns: if the withdraw itself raises, the finally retries it
             if not queue.withdraw(request.id, note=note):
                 # Not pending any more: an answer may have landed between the wait and the withdraw.
-                got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
+                got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture,
+                                               **({} if contained_launch is None
+                                                  else {"contained_launch": contained_launch})), request)
         settled = True
+        if got is None and launch_nonce and queue.answered_via(request.id) == ("allowed", "contained_shell"):
+            # R8-6: levain allowed this row by a contained-shell grant, and this call's proof (or none) cannot take
+            # delivery of it: a deny with its own cause, never a card for a row levain already allowed
+            return Declined(call, "contained_delivery_refused")
         return Decided(call, request, got) if got is not None else Abstained(call, "hold_expired", request, "")
     finally:
         if not settled:

@@ -445,21 +445,31 @@ def contained_shell_refusal(grant: Mapping[str, Any], request: ExternalGateReque
 
 
 def decide(request: ExternalGateRequest, queue: ConsentQueue, *, posture: str | None = None,
-           tool_input: Any = None) -> Decision | None:
+           tool_input: Any = None, contained_launch: ContainedLaunchProof | None = None) -> Decision | None:
     """The policy answer for ``request`` on ``queue``, or ``None``. ``posture`` is the agent session's own
     permission posture as its event reports it (Claude Code's ``permission_mode``), ``None`` when absent;
     ``tool_input`` is the input the request was filed for (``None``: not given, so no answer). The queue finds
-    a grant in a fresh replay, records the answer and returns it as delivery re-verifies it."""
+    a grant in a fresh replay, records the answer and returns it as delivery re-verifies it: a consent grant
+    first (:meth:`~levain.consent.queue.ConsentQueue.answer_by_grant`, which never matches a contained-shell
+    grant), then, only with a ``contained_launch`` proof (a chat call's), a contained-shell grant
+    (:meth:`~levain.consent.queue.ConsentQueue.answer_by_contained_shell_grant`)."""
     if request.tier == AGENT_CONFIG_TIER or posture is None or tool_input is None:
         return None
-    return queue.answer_by_grant(request.id, tool_input=tool_input, posture=posture)
+    got = queue.answer_by_grant(request.id, tool_input=tool_input, posture=posture)
+    if got is None and contained_launch is not None:
+        got = queue.answer_by_contained_shell_grant(request.id, tool_input=tool_input, posture=posture,
+                                                    contained_launch=contained_launch)
+    return got
 
 
 def guarded_policy(request: ExternalGateRequest, queue: ConsentQueue, *, posture: str | None = None,
-                   tool_input: Any = None, policy: Policy | None = None) -> Decision | None:
+                   tool_input: Any = None, policy: Policy | None = None,
+                   contained_launch: ContainedLaunchProof | None = None) -> Decision | None:
     """``policy`` (default :func:`decide`), called as ``policy(request, queue, posture=posture,
-    tool_input=tool_input)``, with ruling 3b item 1 asserted first: a request filed at :data:`AGENT_CONFIG_TIER`
-    never reaches it."""
+    tool_input=tool_input)``, plus ``contained_launch=`` only when a proof is given (so a policy written for the
+    hook, which never has one, is called as before), with ruling 3b item 1 asserted first: a request filed at
+    :data:`AGENT_CONFIG_TIER` never reaches it."""
     if request.tier == AGENT_CONFIG_TIER:
         raise PolicyNotEligible(f"request {request.id} targets agent config: never eligible for a policy answer")
-    return (policy or decide)(request, queue, posture=posture, tool_input=tool_input)
+    proof = {} if contained_launch is None else {"contained_launch": contained_launch}
+    return (policy or decide)(request, queue, posture=posture, tool_input=tool_input, **proof)

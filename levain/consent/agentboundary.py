@@ -916,7 +916,7 @@ def _map(queue_id: str, row: _Row, outcome: tuple[str, str, str] | None, evidenc
 
     decision, status, refusal, approval = "require-approval", "blocked", None, None
     if rstate == "allowed":
-        if via == "grant":
+        if via in ("grant", "contained_shell"):
             decision = "allow"
         elif via not in ("signature", "ruling"):
             raise ExportError(f"receipt {seq}: an allowed request with via {via!r}")

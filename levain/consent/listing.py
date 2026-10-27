@@ -135,6 +135,8 @@ def audit_line(entry: ConsentEntry) -> str:
     if entry.state == "allowed":
         if entry.via == "grant":
             return f"allowed by standing grant {entry.grant_id or '(unnamed)'}"
+        if entry.via == "contained_shell":
+            return f"allowed by contained-shell grant {entry.grant_id or '(unnamed)'}"
         return f"allowed by signed answer, key {entry.signer_fp or '(unknown)'}"
     if entry.state == "denied":
         return f"denied by signed answer, key {entry.signer_fp or '(unknown)'}"
@@ -477,11 +479,11 @@ def _open_ro(directory: Path | str | None) -> sqlite3.Connection | None:
 
 
 def _check_format(conn: sqlite3.Connection) -> None:
-    from levain.consent.queue import PRIOR_FORMAT, STORE_FORMAT, QueueStoreError
+    from levain.consent.queue import MIGRATES_FROM, STORE_FORMAT, QueueStoreError
 
     fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
-    # a store of the previous format holds the same request columns; a queue migrates it on its next open
-    if fmt is None or fmt[0] not in (STORE_FORMAT, PRIOR_FORMAT):
+    # a store of an earlier format holds the same request columns; a queue migrates it on its next open
+    if fmt is None or (fmt[0] != STORE_FORMAT and fmt[0] not in MIGRATES_FROM):
         raise QueueStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {STORE_FORMAT!r}")
 
 
@@ -572,7 +574,7 @@ def read_listing(directory: Path | str | None = None, *, now: datetime, span: ti
         elif state == "undecided":
             undecided.append(ConsentEntry(request, state, None, None, None, decided_at, None, gaps.get(request.id)))
         elif decided_at is not None and decided_at >= horizon:
-            gid = _grant_id_of(answer) if via == "grant" else None
+            gid = _grant_id_of(answer) if via in ("grant", "contained_shell") else None
             recent.append(ConsentEntry(request, state, via, signer_fp, gid, decided_at, outcomes.get(request.id),
                                        gaps.get(request.id)))
     pending.sort(key=lambda e: (e.request.received_at, e.request.id))
