@@ -3,8 +3,10 @@ IG-2, IG-3, IG-4 G1): the per-vendor identity call, the observed id root records
 baseline ``confirm-identity yes`` writes.
 
 * The identity call (:func:`identity_call`): one function per vendor. Codex has no server-validated call, so its
-  observed id is the literal :data:`NOT_A_CHECK` (IG-2, published per §7.6 "not a check"). Claude's call is not
-  built (IG-3 is open): it refuses ``identity-call-unbuilt``.
+  observed id is the literal :data:`NOT_A_CHECK` (IG-2, published per §7.6 "not a check"). Claude's (IG-3, G1b):
+  :mod:`levain.slot.identity_child` run AS THE SLOT through wall's ``identity`` target (start's
+  :func:`levain.slot.start.identity_capture`), its line judged by root (:func:`parse_profile_answer`): the profile's
+  ``account.uuid``.
 * A ``login`` session's ``start`` runs it as its last step, after the vendor exits (:func:`record_login_identity`),
   and CASes the result into the state record's ``identity``: ``{observed_id}`` when the call answered, else
   ``{result: <refusal name>}``. A vendor that exited non-zero is not asked: ``{result: login-exit-nonzero}``.
@@ -51,7 +53,13 @@ def _codex_call(ctx: Optional[H.Ctx], a: Optional[R.Alloc]) -> str:
 
 
 def _claude_call(ctx: Optional[H.Ctx], a: Optional[R.Alloc]) -> str:
-    raise Refused("identity-call-unbuilt", "the Claude identity call waits on IG-3")
+    """IG-3: the child spawned as the slot (start's :func:`~levain.slot.start.identity_capture`), its line judged
+    here. Only for a session: with no ``ctx`` or alloc there is nothing to run as."""
+    if ctx is None or a is None:
+        raise Refused("internal", "the Claude identity call runs for a session")
+    from levain.slot import start as SS
+
+    return parse_profile_answer(*SS.identity_capture(ctx, a))
 
 
 IDENTITY_CALLS: Mapping[str, Callable[[Optional[H.Ctx], Optional[R.Alloc]], str]] = {
