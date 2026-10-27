@@ -142,6 +142,9 @@ CREDENTIAL_FILES = tuple(CREDENTIALS.values())
 #: IG-1 (1027-18 RULINGS): ``L/retained/<s>/replaced/``, where END puts the credential a confirmed re-login replaces in
 #: ``keep/``. It is inside the session's own retained directory, so discard, restore and purge carry it with the session.
 REPLACED = "replaced"
+#: IG-1 D1 (1027-19 RULINGS): ``L/retained/<s>/unconfirmed/``, where END puts a ``login`` session's NEW credential when
+#: ``keep/`` is occupied and no ``confirm-identity yes`` names the session. Carried with the session as ``replaced/`` is.
+UNCONFIRMED = "unconfirmed"
 #: DECISION: a ``levain-baseline/1`` file is five short fields; one past this is not root's baseline.
 BASELINE_MAX_BYTES = 4096
 VAR_FOLDERS_NAME = b".levain-var-folders"     # CONTRACT §7.4: macOS /private/var/folders/<slot>
@@ -292,6 +295,10 @@ class EndFacts:
     @property
     def replaced(self) -> Path:
         return self.retained / REPLACED
+
+    @property
+    def unconfirmed(self) -> Path:
+        return self.retained / UNCONFIRMED
 
     @property
     def slot_state(self) -> Path:
@@ -1735,27 +1742,29 @@ def _own_dir(path: Path, owner_ok: Callable[[os.stat_result], bool]) -> None:
     fsync_dir(path.parent)
 
 
-def _set_aside(facts: EndFacts, kfd: int, name: bytes, owner_ok: Callable[[os.stat_result], bool],
-               fault: Fault) -> None:
-    """IG-1: the parked credential a confirmed re-login replaces, renamed (never opened) from ``keep/`` into
-    ``L/retained/<s>/replaced/``, both directories then fsynced. A ``replaced/`` entry already there is never
-    replaced (``replaced-occupied``)."""
+def _set_aside(facts: EndFacts, sfd: int, name: bytes, dest: Path, occupied: str,
+               owner_ok: Callable[[os.stat_result], bool], fault: Fault, point: str) -> None:
+    """IG-1: a credential renamed (never opened) from the directory ``sfd`` into ``dest``, a directory inside
+    ``L/retained/<s>/`` (both made root 0700 if missing), then both directories fsynced: the parked credential a
+    confirmed re-login replaces (``keep/`` -> ``replaced/``), or the new credential of a login with no yes (the
+    session tree -> ``unconfirmed/``, D1). An entry already at ``dest`` is never replaced (``occupied``)."""
     _own_dir(facts.retained, owner_ok)
-    _own_dir(facts.replaced, owner_ok)
-    fault("park:replace:dirs")
-    rfd = os.open(facts.replaced, _DIR_FLAGS)
+    _own_dir(dest, owner_ok)
+    fault(f"{point}:dirs")
+    rfd = os.open(dest, _DIR_FLAGS)
     try:
         try:
             os.stat(name, dir_fd=rfd, follow_symlinks=False)
         except FileNotFoundError:
             pass
         else:
-            raise Refused("replaced-occupied", f"{facts.replaced}/{name.decode('ascii')} already holds a file")
-        os.rename(name, name, src_dir_fd=kfd, dst_dir_fd=rfd)
-        os.fsync(kfd)
+            raise Refused(occupied, f"{dest}/{name.decode('ascii')} already holds a file")
+        os.rename(name, name, src_dir_fd=sfd, dst_dir_fd=rfd)
+        os.fsync(sfd)
         os.fsync(rfd)
     finally:
         os.close(rfd)
+    fault(f"{point}:aside")
 
 
 def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _root_owned,
@@ -1768,9 +1777,12 @@ def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _
     :func:`confirmed_relogin` (IG-1): the parked entry is first set aside into ``replaced/`` (:func:`_set_aside`),
     then the new login is parked. In that order, a death at any point leaves the new login in the session tree or
     in ``keep/`` (the old one in ``keep/`` or ``replaced/``); a redo after the set-aside finds ``keep/`` empty and
-    parks, and one after the park finds the source gone.
+    parks, and one after the park finds the source gone. A ``login`` session that is not confirmed (D1) parks
+    nothing: its new credential is set aside into ``unconfirmed/`` and ``keep/`` is not touched, so the session
+    still retains and its slot is released. Only another kind refuses ``keep-occupied``.
     keep/ (root 0700, install's) is made if it is missing (DECISION). A redo that finds the source gone and
-    ``keep/`` holding it (a rename whose fsyncs did not finish) still fsyncs both directories (codex r1 6)."""
+    ``keep/`` or ``unconfirmed/`` holding the name (a rename whose fsyncs did not finish) still fsyncs the source
+    directory and that one (codex r1 6)."""
     cred = facts.credential
     if cred is None or not os.path.isdir(facts.live):
         return
@@ -1782,9 +1794,10 @@ def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _
         try:
             st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
         except FileNotFoundError:
-            if os.path.lexists(facts.keep / os.fsdecode(name)):
-                os.fsync(dfd)
-                fsync_dir(facts.keep)
+            for dest in (facts.keep, facts.unconfirmed):
+                if os.path.lexists(dest / os.fsdecode(name)):
+                    os.fsync(dfd)
+                    fsync_dir(dest)
             return
         if stat.S_ISDIR(st.st_mode):
             return
@@ -1799,11 +1812,16 @@ def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _
             except FileNotFoundError:
                 pass
             else:
-                if not confirmed_relogin(facts, owner_ok=owner_ok):
+                if confirmed_relogin(facts, owner_ok=owner_ok):
+                    _set_aside(facts, kfd, name, facts.replaced, "replaced-occupied", owner_ok, fault,
+                               "park:replace")
+                elif facts.kind == "login":
+                    _set_aside(facts, dfd, name, facts.unconfirmed, "unconfirmed-occupied", owner_ok, fault,
+                               "park:unconfirmed")
+                    return
+                else:
                     raise Refused("keep-occupied",
                                   f"{facts.keep}/{name.decode('ascii')} already holds a credential")
-                _set_aside(facts, kfd, name, owner_ok, fault)
-                fault("park:replace:aside")
             os.rename(name, name, src_dir_fd=dfd, dst_dir_fd=kfd)
             os.fsync(dfd)
             os.fsync(kfd)
@@ -2302,7 +2320,7 @@ __all__ = ["BUDGET_REFUSALS", "CAS_RETRY_SECONDS", "CLASSES", "CREDENTIALS", "CR
            "default_meta_reader", "default_strip", "digest_bytes", "end_lock", "end_session", "entry_type",
            "facts_from_alloc", "foreign_links", "fork_run_as", "iter_manifest", "iter_meta", "keep_shape_ok",
            "linux_meta", "linux_strip", "mark_cloned", "object_record", "os_chown", "outside_link_bytes",
-           "REPLACED", "confirmed_relogin", "park_move", "park_plan", "read_as_session", "read_slot_state",
+           "REPLACED", "UNCONFIRMED", "confirmed_relogin", "park_move", "park_plan", "read_as_session", "read_slot_state",
            "reconcile_session", "repo_cloned",
            "retain_plan", "send_cas", "tree_manifest", "unbuilt_freeze", "unbuilt_kill", "unbuilt_no_process",
            "utc_now", "walk"]
