@@ -20,6 +20,7 @@ from levain.web_server import make_server
 from levain.webpush.store import PushStore
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import PROXY, T, _call, _pair, _serve
+from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_sign_card import _free_port
 
 NS = "flow-needs-phill"
@@ -294,3 +295,68 @@ def test_a_paired_subscription_without_its_journal_is_refused_and_an_unreadable_
     (tmp_path / "bad").mkdir()
     (tmp_path / "bad" / "cockpit.db").write_bytes(b"not a database")
     assert paired_device_live(tmp_path / "bad", PAIRED_PREFIX + "d-1") is False
+
+
+# --- the cockpit page's own control (fix round 1, P4): the Devices panel turns pings on for this browser ------------
+
+def _fake_push(sub: dict[str, Any]) -> str:
+    """An in-page stand-in for the browser's push service only: the permission is granted and ``subscribe`` hands back
+    ``sub`` (a test reaches no real push service). The page code, the worker and the server are real."""
+    import json
+
+    return ("(() => { const s = " + json.dumps(sub) + "; let held = null;"
+            " const fake = { endpoint: s.endpoint, toJSON: () => s, unsubscribe: async () => { held = null; return true; } };"
+            " Notification.requestPermission = async () => 'granted';"
+            " PushManager.prototype.subscribe = async function () { held = fake; return fake; };"
+            " PushManager.prototype.getSubscription = async function () { return held; };"
+            " return 1; })()")
+
+
+_ROW = "document.querySelector('.dev-pings')"
+_WORKER_KV = ("new Promise((ok) => { const o = indexedDB.open('levain-sw', 1); o.onerror = () => ok('no db');"
+              " o.onsuccess = () => { try { const st = o.result.transaction('kv').objectStore('kv'); const a = st.get('header');"
+              " const b = st.get('token'); b.onsuccess = () => ok([a.result, b.result]); } catch (e) { ok(String(e)); } }; })")
+
+
+def _panel(tok: str, sub: dict[str, Any], extra: "list[dict]") -> "list[dict]":
+    return [{"until": f"{_ROW} && !{_ROW}.hidden", "ms": 20000}, {"eval": _fake_push(sub)},
+            {"eval": f"{_ROW}.querySelector('button').click() || 1"}, *extra]
+
+
+@needs_browser
+def test_the_devices_panel_turns_pings_on_for_a_paired_browser(rig, pushes, tmp_path) -> None:
+    from levain.webpush import live
+
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _):
+        dev, tok = _pair(port, label="iPhone")
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token={tok}", _panel(tok, _sub(7), [
+            {"until": f"{_ROW}.querySelector('button').textContent === 'Turn off'", "ms": 20000},
+            {"eval": f"{_ROW}.querySelector('.dev-meta').textContent"},
+            # the worker writes what it was told asynchronously: wait until it holds it
+            {"until": f"{_WORKER_KV}.then((r) => Array.isArray(r) && r[1] === {tok!r} && r)", "ms": 20000},
+        ]))
+        assert any(p.startswith("/webpush/subscribe ") for p in out["posts"]), out["posts"]
+        assert [s["device_id"] for s in PushStore(qdir).live_subscriptions()] == [PAIRED_PREFIX + dev]
+        assert live(qdir) is True
+        assert _notify(qdir) is True
+    v = out["values"]
+    assert v[4].startswith("on:"), v
+    assert v[5] == ["X-Levain-Write-Token", tok], v              # the worker sends the open under the cockpit's header
+    assert pushes == [_sub(7)["endpoint"]]
+
+
+@needs_browser
+def test_the_cockpits_own_key_is_told_to_pair_first_and_keeps_nothing(rig, tmp_path) -> None:
+
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _):
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token={T}", _panel(T, _sub(8), [
+            {"until": "document.querySelector('.dev-note') && !document.querySelector('.dev-note').hidden"
+                      " && document.querySelector('.dev-note').textContent", "ms": 20000},
+            {"eval": f"{_ROW}.querySelector('button').textContent"},
+        ]))
+        assert PushStore(qdir).live_subscriptions() == []
+    v = out["values"]
+    assert v[3].startswith("Pings need this browser's own key"), v
+    assert v[4] == "Turn on", v                                  # the browser's subscription was dropped too

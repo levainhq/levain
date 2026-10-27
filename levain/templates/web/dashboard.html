@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Levain · substrate control</title>
 <link rel="stylesheet" href="/dashboard.css" />
+<!-- OS-4: the Home Screen web app a phone turns pings on in (served beside a Signer, as /sw.js is) -->
+<link rel="manifest" href="/app.webmanifest" />
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
 <!-- cockpit_view.js loads here, not at the end of the body: its first act is to set the chosen theme, so a stored light theme never
      flashes dark (the CSP forbids an inline script). Everything else in it runs when the document is ready. -->
 <script src="/cockpit_view.js"></script>
