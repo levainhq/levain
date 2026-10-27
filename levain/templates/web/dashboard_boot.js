@@ -47,6 +47,10 @@
   // for daily-driver convenience on the operator's personal device; the native keychain is the
   // real fix at Lane 1.
   const WRITE_TOKEN_KEY = "levain_write_token";
+  // `storage` never fires in the document that changed the token, so every same-page set or remove announces it here
+  // for the zones that follow the token (the Threads zone); other tabs still arrive through `storage`.
+  const TOKEN_CHANGE_EVENT = "levain:write-token-change";
+  function announceTokenChange() { try { window.dispatchEvent(new Event(TOKEN_CHANGE_EVENT)); } catch (_) { /* no events */ } }
   // Set by pair.js when this browser was paired by a link: its key is a DEVICE key, so when it is refused the way back is
   // pairing again from a paired device, never typing the owner's token (P2 L3 r1 F6). MUST equal pair.js PAIRED_MARK_KEY.
   const PAIRED_MARK_KEY = "levain_paired_device";
@@ -68,6 +72,7 @@
       if (/^[\x21-\x7e]+$/.test(tok)) {
         window.localStorage.setItem(WRITE_TOKEN_KEY, tok);
         window.localStorage.removeItem(PAIRED_MARK_KEY);   // the owner's own link: this browser holds the owner's key now
+        announceTokenChange();
       }
       else console.warn("levain: the write token in the link is not a header-safe string; not stored");
     } catch (_) { /* no history or storage: the prompt still works */ }
@@ -118,12 +123,12 @@
     }
     const tok = (window.prompt("Write token (printed when this server started: on its startup line, or in the daemon's log):") || "").trim();
     if (tok) tokenDeclined = false;
-    if (tok) { try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); } catch (_) { /* ignore */ } }
+    if (tok) { try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); announceTokenChange(); } catch (_) { /* ignore */ } }
     return tok;
   }
   // Drop a stored token so the next attempt re-prompts (a mistyped / rotated token).
   function dropToken() {
-    try { window.localStorage.removeItem(WRITE_TOKEN_KEY); } catch (_) { /* ignore */ }
+    try { window.localStorage.removeItem(WRITE_TOKEN_KEY); announceTokenChange(); } catch (_) { /* ignore */ }
   }
   // Headers for a READ (GET): attach the stored off-box token OPPORTUNISTICALLY if we hold one.
   // Harmless on a loopback / read-only surface (the server skips the read gate there); REQUIRED on
@@ -914,6 +919,7 @@
     new MutationObserver(sync).observe(document.body, { attributes: true, attributeFilter: ["data-mode"] });
     document.addEventListener("visibilitychange", sync);
     window.addEventListener("storage", (e) => { if (e.key === WRITE_TOKEN_KEY) sync(); });
+    window.addEventListener("levain:write-token-change", sync);   // the same page's own set / remove (dashboard_boot's token handling)
     sync();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);

@@ -73,7 +73,7 @@ def test_the_view_script_is_app_shell_and_the_routes_are_reserved(tmp_path):
             assert b"LevainThreadView" in r.read()
         with urllib.request.urlopen(base + "/", timeout=10) as r:  # noqa: S310 - loopback
             assert b'<script src="/thread_view.js"></script>' in r.read()
-    for path in (threads.THREADS_LIST_PATH, "/cockpit/thread/x.json", "/thread_view.js"):
+    for path in (threads.THREADS_LIST_PATH, "/cockpit/thread/x.json", "/thread_view.js", "/cockpit/note/9.json"):
         with pytest.raises(ValueError):
             make_server(src, port=0, extra_json={path: lambda: {}})
 
@@ -127,3 +127,31 @@ def test_the_build_tab_zone_reads_only_while_build_is_shown_and_hides_without_a_
     assert board_reads == 0
     assert row == world["thread"] and hidden_with_token is False
     assert after_leaving == 0
+
+
+@needs_browser
+def test_a_token_changed_in_this_page_updates_the_zone_without_a_reload(tmp_path, seeded):
+    """``storage`` never fires in the document that changed the token, so the zone listens for the page's own event:
+    a rejection that drops the token hides the zone and stops the poll; a stored token shows it and starts it."""
+    _qdir, world = seeded
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        out = _drive(tmp_path, base + "/", [
+            {"until": "document.querySelector('[data-mode-tab=board]')"},
+            {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); location.reload(); 1"},
+            {"until": "document.querySelector('.th-zone') && document.querySelector('[data-mode-tab=build]')"},
+            {"eval": _COUNT},
+            {"eval": "document.querySelector('[data-mode-tab=build]').click(); 1"},
+            {"until": "document.querySelector('.th-zone .tv-row')"},
+            # a rotated token: the page's own read path meets the rejection and drops the stored token in this document
+            {"eval": "localStorage.setItem('levain_write_token', 'rotated-away'); window.prompt = () => ''; "
+                     "LevainCockpitTransport.readJson('/cockpit/threads.json').catch(() => 0).then(() => 1)"},
+            {"eval": "localStorage.getItem('levain_write_token')"},
+            {"eval": "document.querySelector('.th-zone').hidden"},
+            {"eval": "window.__th0 = window.__th(); new Promise(r => setTimeout(() => r(window.__th() - window.__th0), 4500))"},
+        ])
+    v = out["values"]
+    token_after_rejection, hidden, reads_after = v[7], v[8], v[9]
+    assert token_after_rejection in (None, "")
+    assert hidden is True
+    assert reads_after == 0

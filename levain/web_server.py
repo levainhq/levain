@@ -779,7 +779,8 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
 _RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
-                                       _GRANT_PREFIX, _SHEET_PREFIX, _PUSH_PREFIX, cockpit_threads.THREAD_PREFIX)
+                                       _GRANT_PREFIX, _SHEET_PREFIX, _PUSH_PREFIX, cockpit_threads.THREAD_PREFIX,
+                                       _NOTE_BODY_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -2012,8 +2013,8 @@ class _Handler(GuardedHandler):
         one thread's stream, read-only (:func:`levain.cockpit.threads.serve_threads`). A thread carries the operator's
         lines and the agent's words and tool calls, so it rides the consent body's gate: reached only through
         ``_route``, then a surface token on every bind, before the store is opened. ``dispatch.db`` lives in the consent
-        directory, resolved as the egress reading resolves it: a reader naming no queue reads nothing, never the
-        default queue's."""
+        directory, resolved as the egress reading resolves it: a reader whose ``directory`` is None reads the default
+        queue, as the egress reading does; a reader with no ``directory`` attribute reads nothing."""
         if not self._off_box_token_valid():
             self._send(json.dumps({"error": "forbidden", "message": (
                 f"the thread record needs this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
