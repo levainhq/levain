@@ -163,7 +163,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   each give a reason the policy might be wrong, a kill (an event condition) and a drill (an example event the kill must
   not let through). Levain prints the guard back before signing and refuses a kill it could not evaluate, a drill the
   kill lets through, an entry missing any of the three, or a guard past the size limits. The guard is checked when the
-  policy is signed, and again just before a step it covers fires (see Groundwork). Every policy created now carries a guard and is written
+  policy is signed, and, once the binding driver is wired, again just before a step it covers fires (see Groundwork). Every policy created now carries a guard and is written
   `levain-authority/3`, which an older
   levain stops at instead of reading. A graduation policy signed without a guard no longer covers anything (its bindings
   wait at CONFIRM again) and cannot be renewed: revoke it and create it again with `--guard`. The graduation card's
@@ -204,9 +204,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **A session's `budget_overrun` in CONTROL's `STATUS` goes away when the session is purged.**
 - **On an OpenRouter route, a response from another model that reports a cost above the call's hold but no token
   counts is charged that cost** (it was charged only the hold).
-- **The cockpit's top bar no longer runs over its tabs between 1041 and 1100 px wide** when the system font is wider
-  than macOS's: up to 1100 px the bar takes two rows, with the tabs across the second, and Calm shows its icon from
-  1101 px.
+- **The cockpit's top bar no longer runs over its tabs between 1041 and 1099 px wide** in a font wider than macOS's
+  system font (Linux's default font, or Verdana): up to 1100 px the bar stacks, with the tabs on a row of their own, and
+  Calm shows its icon from 1101 to 1280 px.
 - **The levain home a consent hook protects comes from the environment the hook read when it started,** the same as
   everything else on its decision path. When the hook cannot open its queue, a write to the configured cockpit's
   authority store is still refused.
@@ -272,9 +272,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **A step a graduation policy covers is checked again just before it fires.** Once the binding driver is wired, the
   step about to run reads its cover afresh: if the cover changed since the step was decided, or cannot be read, the
   step is held and no receipt is written. The run is refused and ended when the policy does not sign this action at this risk, cover value
-  and rung, when its guard is incomplete, or when the guard cannot be evaluated (no trigger event, or a condition it
-  cannot read). A guard kill that trips, or cannot tell whether it trips, ends the run, and the cancel names the policy
-  and the guard entry.
+  and rung, when its guard is incomplete, or when the guard cannot be evaluated (no trigger event, or evaluating a
+  condition fails with an error). A guard kill that trips, or reads as unknown, ends the run, and the cancel names the
+  policy and the guard entry.
 - **The graduation engine behind `levain binding graduate`.** Once the binding driver is wired, it takes the steps a
   policy covers, records each, and prints the one `levain binding policy create` line for a step none covers; the steps
   already taken stay printed when a later one fails, and a binding that changed during the run (revoked, paused,
