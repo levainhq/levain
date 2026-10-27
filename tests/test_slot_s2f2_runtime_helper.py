@@ -277,8 +277,11 @@ def test_configured_slots_read_from_store(world):
     assert world.calls == [] and "floor" not in world.steps
 
 
-def test_unbuilt_verbs_answer_by_name(world):
+def test_unbuilt_verbs_answer_by_name(world, monkeypatch):
+    """A grammar verb with no handler answers ``verb-unbuilt:<verb>`` (every runtime verb is built since 1027+18
+    idg1's confirm-identity, so the handler is taken away here)."""
     s = _prepared(world)
+    monkeypatch.delitem(H.VERB_HANDLERS, "confirm-identity")
     assert world.main(["confirm-identity", s, "yes"])[1]["refused"] == "verb-unbuilt:confirm-identity"
 
 
