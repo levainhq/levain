@@ -2814,13 +2814,16 @@ def _check_autonomic_store(store_dir: Path | None = None) -> list[CheckResult]:
     from levain.autonomic.db import DB_NAME, STORE_FORMAT_V1, STORE_FORMAT_V2, default_store_dir, store_marker
 
     db = (store_dir.expanduser() if store_dir is not None else default_store_dir()) / DB_NAME
-    if not db.is_file():
-        return []
     name = "autonomic store"
     where = f"{db}" + (" (this user's store ($LEVAIN_HOME/autonomic), not the install's)" if store_dir is None
                        else "")
     conn: sqlite3.Connection | None = None
     try:
+        try:
+            if not stat.S_ISREG(db.stat().st_mode):
+                return []
+        except FileNotFoundError:
+            return []
         conn = sqlite3.connect(db.absolute().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=2)
         conn.execute("BEGIN")
         marker = store_marker(conn)

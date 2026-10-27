@@ -116,7 +116,8 @@ def reaper_record(journal: RunJournal, created_at: str) -> Callable[[str, str | 
         if kind == "effect":
             run_id = schema3._effect_key(subject)[0]
             posture = Posture[sealed["posture"]]
-            decided_by = (sealed.get("decision") or {}).get("by")
+            decision = sealed.get("decision")
+            decided_by = decision.get("by") if isinstance(decision, dict) else None
             verdict, by = ("approved" if decided_by == "human" else "auto"), sealed["by"]
             guard, grant_guard = sealed.get("floor"), sealed.get("grant_guard")
         else:

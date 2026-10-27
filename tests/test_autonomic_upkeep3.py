@@ -7,6 +7,7 @@ it (levain project_memory 1027-11/RULINGS.md "R15-5", 1027-11/r155scout/SCOUT.md
   - doctor shows every INVARIANT row, A1's second row (``held_at_bound_unclosed``) among them."""
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -370,6 +371,7 @@ def test_a_liveness_read_whose_set_reads_has_no_unread_key(j, tmp_path):
     ({"generation": 1, "by": "human", "posture": "COOLING_OFF"}, "approved"),
     ({"generation": 1, "by": "on-loop", "posture": "COOLING_OFF"}, "auto"),
     (None, "auto"),
+    ("legacy", "auto"),
 ])
 def test_a_reaped_effect_receipts_verdict_is_its_sealed_deciders(j, decision, verdict):
     """F4: ``approved`` only for a decision a human made, as the gate's own fire of a journaled hold words it
@@ -395,6 +397,22 @@ def test_doctor_fails_a_store_it_cannot_open(j, tmp_path):
     assert not row.ok and not row.warn and "cannot be read" in row.detail
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches a mode-000 directory")
+def test_doctor_fails_rather_than_aborts_when_the_store_directory_is_not_searchable(j, tmp_path):
+    """The existence probe is inside the guarded read: a store directory this user cannot search is a FAIL row."""
+    store = tmp_path / "store"
+    store.chmod(0)
+    try:
+        [row] = doctor._check_autonomic_store(store)
+    finally:
+        store.chmod(0o700)
+    assert not row.ok and not row.warn and "cannot be read" in row.detail
+
+
+def test_doctor_has_no_row_for_a_missing_store(tmp_path):
+    assert doctor._check_autonomic_store(tmp_path / "nowhere") == []
+
+
 def test_doctor_fails_rather_than_aborts_when_the_invariant_read_raises(j, tmp_path, monkeypatch):
     def broken(conn):
         raise ValueError("a row the query cannot read")
@@ -413,28 +431,41 @@ def test_doctor_fails_a_corrupt_store(tmp_path):
 # F7: a /3 manual pending has no owner lease (upkeep3._pending_owner_unknown says every firing pending is in flight).
 # That is safe only while nothing writes one: this tripwire fails when a module under levain/ gains a string that
 # writes the table, so the pending lease is built with the first writer.
-_PENDING_READS = re.compile(r"^\s*SELECT\b", re.I)
-_PENDING_WRITES = re.compile(r"\b(INSERT|REPLACE)\b[^;]*\bINTO\s+manual_pendings\b|\bUPDATE\s+manual_pendings\b", re.I)
+_PENDING_WRITE = re.compile(r"\b(?:INSERT|REPLACE)\b[^;]*?\bINTO\s+manual_pendings\b[^;]*|"
+                            r"\bUPDATE\s+manual_pendings\b[^;]*", re.I)
+# Every statement under levain/ that writes manual_pendings, by module and exact (whitespace-normalised) text: a new
+# one anywhere, schema3.py included, fails the tripwire until its pending lease is built and it is named here.
+_PENDING_WRITES_KNOWN = {
+    ("schema3.py", "UPDATE manual_pendings SET state = 'terminal', receipt_id = NEW.receipt_id "
+                   "WHERE NEW.subject = 'pending:' || pending_id AND state IN ('open', 'firing')"),
+    ("schema3.py", "UPDATE manual_pendings SET state = 'terminal', receipt_id = ? WHERE pending_id = ? "
+                   "AND state IN ('open', 'firing')"),
+}
+
+
+def _string_texts(tree: ast.AST):
+    """Every string in ``tree`` as ``(line, text)``: a str constant, and an f-string with its constant parts joined and
+    each substitution as ``{}``. Adjacent literals are one constant to the parser, so a split statement is whole."""
+    inside_fstring = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.JoinedStr):
+            inside_fstring.update(id(c) for c in ast.walk(node) if isinstance(c, ast.Constant))
+            parts = [v.value if isinstance(v, ast.Constant) else "{}" for v in node.values]
+            yield node.lineno, "".join(parts)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in inside_fstring:
+            yield node.lineno, node.value
 
 
 def _pending_writers(root: Path) -> list[str]:
-    """Each string literal under ``root`` that names ``manual_pendings`` and is not a read, as ``file:line: text``.
-    In schema3.py (the store's DDL, its INVARIANT and the reaper's close) only an INSERT or REPLACE INTO the table
-    counts; in any other module every string naming the table must be a SELECT."""
-    import io
-    import tokenize
+    """Each INSERT, REPLACE or UPDATE of ``manual_pendings`` in a string under ``root`` that is not in
+    ``_PENDING_WRITES_KNOWN``, as ``file:line: text``."""
     out = []
     for path in sorted(root.rglob("*.py")):
-        for tok in tokenize.generate_tokens(io.StringIO(path.read_text()).readline):
-            if tok.type != tokenize.STRING or "manual_pendings" not in tok.string:
-                continue
-            text = tok.string.lstrip("rbfuRBFU").strip("'\"")
-            if path.name == "schema3.py":
-                bad = bool(re.search(r"\b(INSERT|REPLACE)\b[^;]*\bINTO\s+manual_pendings\b", text, re.I))
-            else:
-                bad = not _PENDING_READS.search(text) or bool(_PENDING_WRITES.search(text))
-            if bad:
-                out.append(f"{path.relative_to(root)}:{tok.start[0]}: {text[:120]}")
+        for line, text in _string_texts(ast.parse(path.read_text())):
+            for m in _PENDING_WRITE.finditer(text):
+                stmt = " ".join(m.group(0).split())
+                if (path.name, stmt) not in _PENDING_WRITES_KNOWN:
+                    out.append(f"{path.relative_to(root)}:{line}: {stmt[:120]}")
     return out
 
 
@@ -446,12 +477,20 @@ def test_no_module_writes_a_manual_pending_without_its_lease():
 
 
 def test_the_pending_tripwire_catches_a_writer(tmp_path):
-    (tmp_path / "schema3.py").write_text('X = "UPDATE manual_pendings SET state = 1"\n'
-                                         'Y = "INSERT OR IGNORE INTO manual_pendings (pending_id) VALUES (?)"\n')
+    (tmp_path / "schema3.py").write_text('X = "update manual_pendings SET state = 1"\n'
+                                         'Y = "INSERT OR IGNORE INTO manual_pendings (pending_id) VALUES (?)"\n'
+                                         'Z = "UPDATE manual_pendings SET state = \'terminal\', receipt_id = ? '
+                                         'WHERE pending_id = ? " "AND state IN (\'open\', \'firing\')"\n')
     (tmp_path / "other.py").write_text('# manual_pendings in a comment is not a string\n'
                                        'A = "SELECT 1 FROM manual_pendings"\n'
                                        'B = "INSERT INTO manual_pendings VALUES (?)"\n'
                                        'C = "manual_pendings"\n'
-                                       'D = "SELECT 1; UPDATE manual_pendings SET x = 1"\n')
+                                       'D = "SELECT 1; UPDATE manual_pendings SET x = 1"\n'
+                                       'n = 1\n'
+                                       'E = f"INSERT INTO manual_pendings VALUES ({n})"\n'
+                                       'F = f"replace into {n} manual_pendings" "x"\n'
+                                       'G = f"REPLACE INTO manual_pendings (a) VALUES (?)" " -- {n}"\n'
+                                       'H = "INSERT INTO " "manual_pendings VALUES (1)"\n')
     found = [f.split(": ", 1)[0] for f in _pending_writers(tmp_path)]
-    assert found == ["other.py:3", "other.py:4", "other.py:5", "schema3.py:2"]
+    assert found == ["other.py:3", "other.py:5", "other.py:7", "other.py:9", "other.py:10", "schema3.py:1",
+                     "schema3.py:2"]
