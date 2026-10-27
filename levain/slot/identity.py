@@ -199,8 +199,8 @@ def _slot_names_lease(ctx: H.Ctx, a: R.Alloc) -> bool:
         return False
     try:
         st = H.parse_slot_state_of(raw, a.slot)
-    except (Refused, ValueError, RecursionError):
-        raise Refused("slot-state-unreadable", a.slot.tag) from None
+    except (ValueError, RecursionError):
+        raise Refused("slot-state-malformed", a.slot.tag) from None
     return st.state == "leased" and st.session == a.session and st.lease_seq == a.lease_seq
 
 
@@ -211,7 +211,7 @@ def confirm_identity(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, o
     ``confirm-kind:<kind>``); the session lock (TRY, ``session-busy``: END takes the same one, so a baseline write and
     the park never overlap); the record running (``not-active:<state>``). ``no`` ends there, writing nothing.
     ``yes``: the record's ``identity.observed_id`` (else ``no-observed-id[:<result>]``); the slot's state still names
-    this lease (else ``slot-lease-moved``; a state file that does not parse, ``slot-state-unreadable``); the
+    this lease (else ``slot-lease-moved``; a state file that does not parse, ``slot-state-malformed``); the
     field-only CAS of ``identity`` = ``{observed_id, result: confirmed}`` at the generation read (the lease proof,
     and the id is the one CONTROL holds at that generation); then the baseline written, and the answer says so
     (``{baseline: written}``). A crash between the CAS and the write leaves no baseline, and ``yes`` again writes

@@ -249,13 +249,13 @@ def test_x9_an_answer_outside_yes_no_is_refused_by_name(env):
 
 # --- X11: a torn slot-state file ------------------------------------------------------------------------------------------
 
-def test_x11_a_torn_slot_state_is_slot_state_unreadable(env):
-    """deepseek LOW 5: the field-only CAS's precheck refuses by its own name; nothing is written."""
+def test_x11_a_torn_slot_state_is_slot_state_malformed(env):
+    """deepseek LOW 5: the field-only CAS precheck refuses with the one slot-state name, slot-state-malformed; nothing is written."""
     w, la, _ = env
     s = _login(w, la, "codex")
     p = E0.slot_dir(w.L) / "state"
     p.write_bytes(p.read_bytes()[:20])
-    assert w.main(["confirm-identity", s, "yes"])[1]["refused"] == "slot-state-unreadable"
+    assert w.main(["confirm-identity", s, "yes"])[1]["refused"] == "slot-state-malformed"
     assert not _baseline(w).exists()
 
 
