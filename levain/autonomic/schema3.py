@@ -668,11 +668,45 @@ def clear_closing_left(conn: sqlite3.Connection) -> list[str]:
     return left
 
 
-def adopt_orphan(conn: sqlite3.Connection, receipt_id: str, subject: str, terminal_state: str) -> None:
+ADOPTED = "adopted"
+IN_FLIGHT = "in_flight"
+
+
+def effect_subject(run_id: str, effect_id: str) -> str:
+    """The subject of an effect's receipt, ``effect:<run_id>:<effect_id>``. A run id holding ``:`` is refused: the
+    subject is split at its first colon (here, in the journal, in the store's triggers), and only a colonless run id
+    makes that split name one effect. ``effect_id`` may hold colons."""
+    if ":" in run_id:
+        raise ValueError(f"run id {run_id!r} holds a colon: an effect subject would split ambiguously")
+    return f"effect:{run_id}:{effect_id}"
+
+
+def _effect_key(subject: str) -> tuple[str, str]:
+    # ``effect:<run_id>:<effect_id>``: a subject that does not split is refused as the store refuses a bad row
+    run_id, sep, effect_id = subject[7:].partition(":")
+    if not (run_id and sep and effect_id):
+        raise sqlite3.IntegrityError(f"R13-1: malformed effect subject {subject!r}")
+    return run_id, effect_id
+
+
+def adopt_orphan(conn: sqlite3.Connection, receipt_id: str, subject: str, terminal_state: str, *,
+                 lease_held: Callable[[str, str], bool], pending_lease_held: Callable[[str], bool]) -> str:
     """The D57 repair of one orphan receipt, in the caller's write transaction: write the subject's terminal row
     carrying the orphan's id (the terminal-row triggers check it against the receipt: ``cancels_receipted``,
     ``cancels_mode``, ``effects_close``, ``effects_close_mode``, ``requests_receipted``, ``pendings_move``). A receipt
-    whose terminal_state its subject cannot end in is refused by those triggers and stays an INVARIANT row (doctor)."""
+    whose terminal_state its subject cannot end in is refused by those triggers and stays an INVARIANT row (doctor).
+    R14-10: the D57 lease test comes first: an ``effect:`` orphan whose owner holds its lease (``lease_held(run_id,
+    effect_id)``, V :meth:`RunJournal._lease_held`), or a ``firing`` pending whose owner holds its pending lease
+    (``pending_lease_held(pending_id)``), is in flight, and is left as it is (:data:`IN_FLIGHT`)."""
+    if subject.startswith("effect:"):
+        run_id, effect_id = _effect_key(subject)
+        if lease_held(run_id, effect_id):
+            return IN_FLIGHT
+    if subject.startswith("pending:"):
+        firing = conn.execute("SELECT 1 FROM manual_pendings WHERE pending_id = ? AND state = 'firing'",
+                              (subject[8:],)).fetchone()
+        if firing is not None and pending_lease_held(subject[8:]):
+            return IN_FLIGHT
     if subject.startswith("run:"):
         conn.execute("INSERT INTO cancels (run_id, reason, receipt_id) VALUES (?, ?, ?)",
                      (subject[4:], ORPHAN_REASON, receipt_id))
@@ -680,7 +714,7 @@ def adopt_orphan(conn: sqlite3.Connection, receipt_id: str, subject: str, termin
         conn.execute("INSERT INTO requests (request_id, reason, receipt_id) VALUES (?, ?, ?)",
                      (subject[8:], ORPHAN_REASON, receipt_id))
     elif subject.startswith("effect:"):
-        run_id, effect_id = subject[7:].split(":", 1)
+        run_id, effect_id = _effect_key(subject)
         state = {"fired": "done", "outcome_unknown": "unknown"}.get(terminal_state)
         if state is None:
             raise sqlite3.IntegrityError(f"R13-1: an effect receipt in {terminal_state!r} ends no effect row")
@@ -695,6 +729,7 @@ def adopt_orphan(conn: sqlite3.Connection, receipt_id: str, subject: str, termin
             raise sqlite3.IntegrityError("R13-1: no live pending row adopts this receipt")
     else:
         raise sqlite3.IntegrityError(f"R13-1: unknown subject {subject!r}")
+    return ADOPTED
 
 
 MIN_SQLITE = (3, 38, 0)   # JSON1 built in by default from 3.38.0 (json_each / json_tree / json_extract in every trigger)
@@ -1219,22 +1254,100 @@ def record_success(conn: sqlite3.Connection, subject: str, now: datetime | None 
 
 
 # ---- the orphan reaper (R13-1) --------------------------------------------------------------------------------------
-def reap_orphans(conn: sqlite3.Connection) -> tuple[list[str], list[str], list[str]]:
+def reap_orphans(conn: sqlite3.Connection, *, lease_held: Callable[[str, str], bool],
+                 pending_lease_held: Callable[[str], bool]) -> tuple[list[str], dict[str, str]]:
     """The D57 repair, in the caller's write transaction: clear every leftover ``closing`` mark first (a standing pass
-    for ``receipts_via_close``), then adopt each orphan receipt, one SAVEPOINT each. Returns (marks cleared, subjects
-    adopted, subjects not adopted: still INVARIANT rows, for doctor)."""
+    for ``receipts_via_close``), then each orphan receipt in its own SAVEPOINT. Returns (marks cleared, {subject:
+    :data:`ADOPTED` | :data:`IN_FLIGHT` | ``unadoptable: <the fault>``}): an unadoptable orphan stays an INVARIANT row,
+    for doctor. A fault on one orphan (the store's refusal, a lease callback's ``OSError``, a malformed subject) is
+    that orphan's outcome, and the repair goes on to the next."""
     _in_write(conn, "reap_orphans")
     cleared = clear_closing_left(conn)
-    adopted, left = [], []
+    out: dict[str, str] = {}
     for rid, subject, ts in conn.execute(REAP_ORPHAN_RECEIPTS).fetchall():
         conn.execute("SAVEPOINT reap_orphan")
         try:
-            adopt_orphan(conn, rid, subject, ts)
+            out[subject] = adopt_orphan(conn, rid, subject, ts, lease_held=lease_held,
+                                        pending_lease_held=pending_lease_held)
             conn.execute("RELEASE reap_orphan")
-            adopted.append(subject)
-        except sqlite3.Error as e:
+        except Exception as e:  # noqa: BLE001 -- one orphan's fault never stops the repair (D57)
             conn.execute("ROLLBACK TO reap_orphan")
             conn.execute("RELEASE reap_orphan")
-            _log.warning("autonomic store: orphan receipt %s of %s not adopted: %s", rid, subject, e)
-            left.append(subject)
-    return cleared, adopted, left
+            _log.warning("autonomic store: orphan receipt %s of %s not adopted (%s): %s", rid, subject,
+                         type(e).__name__, e)
+            out[subject] = f"unadoptable: {e}" if isinstance(e, sqlite3.Error) else \
+                f"unadoptable: {type(e).__name__}: {e}"
+    return cleared, out
+
+
+# ---- the D57 reaper's pass (A1c1 part 2) ----------------------------------------------------------------------------
+# Each selection, what it closes and how: (query, subject prefix, effect state, terminal_state, run close reason);
+# _REAP_KEYS names the columns that key one row of a subject prefix's selection. The order is the pass's: an effect
+# closed first can make its run an input of a later selection in the same pass, and a fenced run with an unknown or
+# failed link is an input of both REAP_UNKNOWN_LINK_RUNS and REAP_MIDCHAIN_RUNS, so unknown-link (I12) runs first and
+# closes it with its own reason.
+REAP_PASS = (
+    (REAP_EFFECTS, "effect", "unknown", "outcome_unknown", None),
+    (REAP_PENDINGS, "pending", None, "outcome_unknown", None),
+    (REAP_FENCED_RUNS, "run", None, "refused", "journal:fenced"),
+    (REAP_UNKNOWN_LINK_RUNS, "run", None, "refused", "unknown-link"),
+    (REAP_MIDCHAIN_RUNS, "run", None, "refused", "fenced-mid-chain"),
+)
+_REAP_KEYS = {"effect": ("run_id", "effect_id"), "pending": ("pending_id",), "run": ("run_id",)}
+CLOSED = "closed"
+
+
+def _subject_of(kind: str, row: tuple) -> str:
+    return effect_subject(row[0], row[1]) if kind == "effect" else f"{kind}:{row[0]}"
+
+
+def reap(store: AutonomicStore3, *, lease_held: Callable[[str, str], bool],
+         pending_lease_held: Callable[[str], bool],
+         record_for: Callable[[str, str | None, str, str | None], dict]) -> dict[str, str]:
+    """One D57 pass over a ``/3`` store: the orphan repair (:func:`reap_orphans`), then every live subject that can
+    no longer progress (:data:`REAP_PASS`), each closed with one receipt in its OWN write transaction, so a fault on
+    one never blocks the rest. Inside that transaction the subject is selected again and its lease tested (an
+    ``intent`` effect by ``lease_held(run_id, effect_id)``, a ``firing`` pending by ``pending_lease_held(pending_id)``:
+    an owner still inside it is :data:`IN_FLIGHT`, left as it is). ``record_for(subject, seal, terminal_state,
+    reason)`` builds the receipt record from the subject's sealed row (the face builder, D56); a builder or store
+    fault leaves that subject live for the next pass. Returns {subject: :data:`CLOSED` | :data:`IN_FLIGHT` |
+    ``refused: <why>``} plus the orphan repair's outcomes (a subject the repair reported on is not selected again in
+    this pass); a second pass over a quiet store returns {}."""
+    out: dict[str, str] = {}
+    with store.write() as conn:
+        _cleared, orphans = reap_orphans(conn, lease_held=lease_held, pending_lease_held=pending_lease_held)
+    out.update(orphans)
+    for query, kind, state, terminal_state, reason in REAP_PASS:
+        keyed = f"SELECT * FROM ({query}) WHERE " + " AND ".join(f"{k} = ?" for k in _REAP_KEYS[kind])
+        with store.read() as conn:
+            # a subject the orphan repair reported on keeps that outcome: it holds a receipt already, and its close
+            # is the repair's (the store refuses a second receipt for it)
+            candidates = []
+            for r in conn.execute(query).fetchall():
+                try:
+                    subject = _subject_of(kind, r)
+                except ValueError as e:   # a colon in a run id: left live, not selectable by subject
+                    _log.error("autonomic store: reaper skips %s row %r: %s", kind, r[:len(_REAP_KEYS[kind])], e)
+                    continue
+                if subject not in orphans:
+                    candidates.append((subject, tuple(r[:len(_REAP_KEYS[kind])])))
+        for subject, key in candidates:
+            try:
+                with store.write() as conn:
+                    row = conn.execute(keyed, key).fetchone()
+                    if row is None:
+                        continue   # closed or moved since the read
+                    if kind == "effect" and lease_held(row[0], row[1]):
+                        out[subject] = IN_FLIGHT
+                        continue
+                    if kind == "pending" and pending_lease_held(row[0]):
+                        out[subject] = IN_FLIGHT
+                        continue
+                    seal = row[-1]
+                    close_subject(conn, subject=subject, record=record_for(subject, seal, terminal_state, reason),
+                                  state=state, reason=reason)
+                    out[subject] = CLOSED
+            except Exception as e:  # noqa: BLE001 -- one subject's fault never stops the pass (D57)
+                _log.error("autonomic store: reaper left %s live (%s): %s", subject, type(e).__name__, e)
+                out[subject] = f"refused: {type(e).__name__}: {e}"
+    return out

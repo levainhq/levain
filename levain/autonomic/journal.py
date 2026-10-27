@@ -81,6 +81,8 @@ __all__ = [
     "EffectStatus", "EffectOutcome", "HoldResult", "RunJournal", "RunRef", "JournalCorruptError",
     "JournalConflictError", "EffectNotStarted", "UNSIGNED_DECIDER",
     "run_id_for", "hold_id_for", "effect_digest", "needs_signature", "AUTHORIZED", "RECHECK", "decision_key",
+    "Terminal", "Receipt", "Closed", "close_run_in", "close_unstarted", "close_effect_in", "decide_in",
+    "unprojected_receipts", "mark_projected",
 ]
 
 _log = logging.getLogger(__name__)
@@ -144,6 +146,8 @@ class HoldResult:
     # an approval written by this call: its :func:`decision_key`, which the caller hands to ``effect`` as
     # ``expect`` so the effect runs only under the decision it wrote
     decision: tuple | None = None
+    # a rejection on a ``levain-autonomic/3`` store (:func:`decide_in`): the close of the hold's run
+    closed: "Closed | None" = None
 
 
 @dataclass(frozen=True)
@@ -221,6 +225,8 @@ RECHECK = "recheck"
 # check (made outside the write transaction) and the admission; after that the effect is held.
 _ADMIT_TRIES = 3
 _RETRY = object()
+# How many write transactions the not-started transition tries before it fails closed (autogrant r6.2 (a)).
+_NOT_STARTED_TRIES = 3
 
 
 def decision_key(hold: dict[str, Any]) -> tuple:
@@ -238,6 +244,11 @@ def effect_digest(*, action_name: str, payload: str, context_id: str) -> str:
     """The digest of exactly what an effect will do: the bytes a decision approves."""
     text = _canonical({"action_name": action_name, "payload": payload, "context_id": context_id})
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _has_decisions(conn: sqlite3.Connection) -> bool:
+    """Whether this store's ``holds`` carries the decision generation (``levain-autonomic/3``)."""
+    return any(r[1] == "decisions" for r in conn.execute("PRAGMA table_info(holds)"))
 
 
 def durable_fsync(fd: int) -> None:
@@ -667,12 +678,18 @@ class RunJournal:
 
     def _run_effect(self, run_id: str, effect_id: str, fn: Callable[[], Any], lease: int) -> EffectOutcome:
         """Run ``fn`` outside any transaction (the lease marks it in flight), then commit its result,
-        or ``unknown`` if it raised. The lease is released last."""
+        or ``unknown`` if it raised. ``fn`` raising :class:`EffectNotStarted` says nothing began: the intent row
+        is removed and the effect is HELD ``not_started:<why>`` (its hold's decision untouched), so the next
+        delivery runs it. The lease is released last."""
         try:
             try:
                 result = fn()
                 encoded = json.dumps(result)
+            except EffectNotStarted as e:
+                # B1-1: before the unknown branch below, which would poison an effect that never began
+                return self._not_started(run_id, effect_id, e)
             except BaseException:
+                # B1-3: anything else (KeyboardInterrupt and SystemExit included) may have begun the effect
                 with self._write() as conn:
                     conn.execute("UPDATE effects SET state = 'unknown' WHERE run_id = ? AND effect_id = ?",
                                  (run_id, effect_id))
@@ -683,6 +700,29 @@ class RunJournal:
         finally:
             self._drop_lease(run_id, effect_id, lease)
         return EffectOutcome(EffectStatus.DONE, result)
+
+    def _not_started(self, run_id: str, effect_id: str, exc: EffectNotStarted) -> EffectOutcome:
+        """The not-started transition (autogrant r5.1, bounded by r6.2): remove the ``intent`` row in one write
+        transaction, retried on a store that does not take the write (:class:`JournalCorruptError`) up to
+        :data:`_NOT_STARTED_TRIES` times, never on a :class:`JournalConflictError`. After the last failure the
+        error is raised and the row stays ``intent``: once the lease drops it reads POISONED (fail closed). The
+        caller still holds the lease throughout, so a concurrent admission reads IN_FLIGHT, never POISONED."""
+        hold_id = hold_id_for(run_id, effect_id)
+        for attempt in range(1, _NOT_STARTED_TRIES + 1):
+            try:
+                with self._write() as conn:
+                    conn.execute("DELETE FROM effects WHERE run_id = ? AND effect_id = ? AND state = 'intent'",
+                                 (run_id, effect_id))
+                    held = self._hold_row(conn, hold_id) is not None
+                return EffectOutcome(EffectStatus.HELD, hold_id=hold_id if held else None, why=f"not_started:{exc}")
+            except JournalConflictError:
+                raise
+            except JournalCorruptError as e:
+                if attempt == _NOT_STARTED_TRIES:
+                    raise
+                _log.warning("run journal: not-started %s/%s not recorded (attempt %d): %s", run_id, effect_id,
+                             attempt, e)
+        raise AssertionError("unreachable")   # the loop returns or raises
 
     def note_receipt(self, run_id: str, effect_id: str, receipt_id: str) -> None:
         """Record that the receipt for this effect was persisted, so a replay does not write another."""
@@ -698,6 +738,19 @@ class RunJournal:
         conn.execute("UPDATE holds SET decided = NULL, decided_by = NULL, decided_posture = NULL, signer = NULL, "
                      "signature = NULL, challenge = NULL, fence = NULL WHERE hold_id = ? AND decided = 1",
                      (hold_id,))
+
+    @staticmethod
+    def _decide_in(conn: sqlite3.Connection, hold_id: str, *, approve: bool, by: str | None, posture: str | None,
+                   signer: str | None, signature: str | None, challenge: str | None, fence: str | None) -> int:
+        """The write-once decision of an undecided hold, in the caller's transaction; returns the rows it decided
+        (0 or 1). On a store whose ``holds`` carries the decision generation (``levain-autonomic/3``,
+        ``holds.decisions``) the same statement steps it by one (O-a1c1d-1: the ``holds_move`` trigger refuses a
+        decision that does not); a ``/2`` store has no such column and the statement does not name it."""
+        steps = "decisions = decisions + 1, " if _has_decisions(conn) else ""
+        return conn.execute(
+            f"UPDATE holds SET {steps}decided = ?, decided_by = ?, decided_posture = ?, signer = ?, signature = ?, "
+            "challenge = ?, fence = ? WHERE hold_id = ? AND decided IS NULL",
+            (1 if approve else 0, by, posture, signer, signature, challenge, fence, hold_id)).rowcount
 
     def decide(self, hold_id: str, *, approve: bool, digest: str, by: str | None = None,
                posture: str | None = None, signer: str | None = None, signature: str | None = None,
@@ -725,11 +778,9 @@ class RunJournal:
             if h["digest"] != digest:
                 return HoldResult(False, "digest_mismatch")
             signed = approve and needs_signature(by)
-            conn.execute("UPDATE holds SET decided = ?, decided_by = ?, decided_posture = ?, signer = ?, "
-                         "signature = ?, challenge = ?, fence = ? WHERE hold_id = ? AND decided IS NULL",
-                         (1 if approve else 0, by, posture, signer if signed else None,
-                          signature if signed else None, challenge if signed else None,
-                          fence if signed else None, hold_id))
+            self._decide_in(conn, hold_id, approve=approve, by=by, posture=posture,
+                            signer=signer if signed else None, signature=signature if signed else None,
+                            challenge=challenge if signed else None, fence=fence if signed else None)
             if not approve:
                 conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)",
                              (h["run_id"], "rejected"))
@@ -770,3 +821,183 @@ class RunJournal:
         with self._write() as conn:   # the write lock: an owner cannot commit 'done' while this checks
             rows = conn.execute("SELECT run_id, effect_id, state FROM effects WHERE state != 'done'").fetchall()
             return sorted((r, e) for r, e, state in rows if state == "unknown" or not self._lease_held(r, e))
+
+
+# ---- the ``levain-autonomic/3`` side (autogrant A1c1 part 2) ------------------------------------------------------
+# On a /3 store a terminal (a run's close, an effect's end, a pending's end) is written with its gate receipt in one
+# statement (``schema3.close_subject``), and the store refuses any other way. These functions run inside a write
+# transaction of :class:`levain.autonomic.schema3.AutonomicStore3`. V's :class:`RunJournal` above opens only a /2 store
+# (:class:`~levain.autonomic.db.AutonomicDB`); a /3 store is wired in only with A1c2's sealed admission (R15-5).
+
+class Terminal(str, enum.Enum):
+    """Whether a close this call made was the subject's one terminal (WON) or found it already closed (LOST)."""
+    WON = "won"
+    LOST = "lost"
+
+
+@dataclass(frozen=True)
+class Receipt:
+    """A gate receipt ready to commit: its id and its record (the record names the id: ``receipts_content``)."""
+    receipt_id: str
+    record: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, dict) or self.record.get("id") != self.receipt_id:
+            raise ValueError(f"Receipt {self.receipt_id!r}: its record does not name it")
+
+
+@dataclass(frozen=True)
+class Closed:
+    """The result of a run-, request-, effect- or pending-closing write. WON: this call's receipt id and reason.
+    LOST: the earlier closer's (``receipt_id`` is None for a pre-/3 close that carries none)."""
+    terminal: Terminal
+    receipt_id: str | None
+    reason: str | None = None
+
+
+def _insert_receipt(conn: sqlite3.Connection, receipt: Receipt, *, subject: str, state: str | None = None,
+                    reason: str | None = None, result: str | None = None) -> None:
+    """The one place this module writes a receipt: ``schema3.close_subject`` (the receipt and its subject's terminal
+    row in one statement)."""
+    from levain.autonomic.schema3 import close_subject
+    close_subject(conn, subject=subject, record=receipt.record, state=state, reason=reason, result=result)
+
+
+def _closer_of(conn: sqlite3.Connection, subject: str) -> Closed | None:
+    """The close already recorded for ``subject``, or None: read from its TERMINAL row only (``schema3._closed``,
+    I11), never from a receipt's existence. A receipt for ``subject`` with no terminal row (an orphan, D57's to adopt)
+    is :class:`JournalCorruptError`: the subject is neither closed nor closable here, and reading it LOST would leave
+    it live behind the answer."""
+    kind, _, key = subject.partition(":")
+    row = None
+    if kind == "run":
+        row = conn.execute("SELECT receipt_id, reason FROM cancels WHERE run_id = ?", (key,)).fetchone()
+    elif kind == "request":
+        row = conn.execute("SELECT receipt_id, reason FROM requests WHERE request_id = ?", (key,)).fetchone()
+    elif kind == "effect":
+        run_id, _, effect_id = key.partition(":")
+        row = conn.execute("SELECT receipt_id, NULL FROM effects WHERE run_id = ? AND effect_id = ? "
+                           "AND state IN ('done', 'unknown')", (run_id, effect_id)).fetchone()
+    elif kind == "pending":
+        row = conn.execute("SELECT receipt_id, NULL FROM manual_pendings WHERE pending_id = ? AND state = 'terminal'",
+                           (key,)).fetchone()
+    if row is not None:
+        return Closed(Terminal.LOST, row[0], row[1])
+    got = conn.execute("SELECT receipt_id FROM gate_receipts WHERE subject = ?", (subject,)).fetchone()
+    if got is not None:
+        raise JournalCorruptError(f"{subject}: receipt {got[0]!r} has no terminal row (an orphan: the reaper adopts "
+                                  "it); not closed here")
+    return None
+
+
+def _close_in(conn: sqlite3.Connection, subject: str, receipt: Receipt, *, reason: str | None = None,
+              state: str | None = None, result: str | None = None) -> Closed:
+    """Close ``subject`` with ``receipt`` in the caller's write transaction: WON when this call wrote its terminal,
+    LOST (nothing written) when it was already closed. Decided by a read under the write lock, never by catching
+    the store's refusal (that is the backstop for a writer that skips the read)."""
+    earlier = _closer_of(conn, subject)
+    if earlier is not None:
+        return earlier
+    _insert_receipt(conn, receipt, subject=subject, state=state, reason=reason, result=result)
+    return Closed(Terminal.WON, receipt.receipt_id, reason)
+
+
+def close_run_in(conn: sqlite3.Connection, run_id: str, *, reason: str, receipt: Receipt) -> Closed:
+    """End run ``run_id`` (a refusal, a kill, a timeout) with its receipt. ``KeyError`` if it was never admitted."""
+    if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is None:
+        raise KeyError(f"run {run_id!r} was never started")
+    return _close_in(conn, f"run:{run_id}", receipt, reason=reason)
+
+
+def close_unstarted(conn: sqlite3.Connection, run_id: str, effect_id: str, *, reason: str,
+                    receipt: Receipt) -> Closed | None:
+    """End run ``run_id`` unless ``effect_id`` has started, in the caller's write transaction (V
+    :meth:`RunJournal.cancel_unstarted`'s check, now with the receipt): None when the effect has a row (started: the
+    caller reads its barrier; nothing written), else the close. ``KeyError`` if the run was never admitted."""
+    if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is None:
+        raise KeyError(f"run {run_id!r} was never started")
+    if conn.execute("SELECT 1 FROM effects WHERE run_id = ? AND effect_id = ?", (run_id, effect_id)).fetchone():
+        return None
+    return _close_in(conn, f"run:{run_id}", receipt, reason=reason)
+
+
+_EFFECT_ENDS = {"done": "fired", "unknown": "outcome_unknown"}
+
+
+def close_effect_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, state: str, receipt: Receipt,
+                    result: Any = None) -> Closed:
+    """End an ``intent`` effect ``done`` (with ``result``, JSON-encoded here) or ``unknown``, with its receipt, in
+    the caller's write transaction. LOST when the effect already ended. ``KeyError`` when it has no row."""
+    if state not in _EFFECT_ENDS:
+        raise ValueError(f"close_effect_in: state {state!r} is not done or unknown")
+    from levain.autonomic.schema3 import effect_subject
+    subject = effect_subject(run_id, effect_id)      # refuses a run id holding a colon, before any read
+    row = conn.execute("SELECT state, receipt_id FROM effects WHERE run_id = ? AND effect_id = ?",
+                       (run_id, effect_id)).fetchone()
+    if row is None:
+        raise KeyError(f"effect {run_id}/{effect_id} was never admitted")
+    if row[0] != "intent":
+        return Closed(Terminal.LOST, row[1])
+    encoded = json.dumps(result) if state == "done" else None
+    return _close_in(conn, subject, receipt, state=state, result=encoded)
+
+
+def decide_in(conn: sqlite3.Connection, hold_id: str, *, approve: bool, digest: str, by: str,
+              posture: str | None = None, signer: str | None = None, signature: str | None = None,
+              challenge: str | None = None, fence: str | None = None,
+              receipt: Receipt | None = None) -> HoldResult:
+    """:meth:`RunJournal.decide` on a ``/3`` store, in the caller's write transaction. A rejection ends the hold's run
+    with ``receipt`` first (the ``holds_move`` trigger takes a rejection only once its run's receipted close exists):
+    WON closes it now; LOST means another path closed it before, and the decision is still recorded
+    (``HoldResult.closed`` says which). An approval is not terminal and takes no receipt. ``by`` names the decider
+    (``holds_move`` refuses a decision without one); a missing one is refused before anything is written, and the
+    close and the decision are one step (a SAVEPOINT): a fault in either leaves neither."""
+    if not isinstance(by, str) or not by:
+        raise ValueError(f"decide_in: a decision names its decider (by={by!r})")
+    if approve and receipt is not None:
+        raise ValueError("decide_in: an approval is not terminal; it takes no receipt")
+    if not approve and receipt is None:
+        raise ValueError("decide_in: a rejection ends its run, and on this store a run ends only with its receipt")
+    if approve and needs_signature(by) and not (signer and signature and challenge and fence):
+        return HoldResult(False, "unsigned_approval")
+    row = RunJournal._hold_row(conn, hold_id)
+    if row is None:
+        return HoldResult(False, "unknown_hold")
+    h = RunJournal._hold_dict(row)
+    if h["decided"] is not None:
+        return HoldResult(False, "already_decided")
+    if h["digest"] != digest:
+        return HoldResult(False, "digest_mismatch")
+    signed = approve and needs_signature(by)
+    conn.execute("SAVEPOINT decide_in")
+    try:
+        closed = None if approve else \
+            _close_in(conn, f"run:{h['run_id']}", receipt, reason="rejected")  # type: ignore[arg-type]
+        RunJournal._decide_in(conn, hold_id, approve=approve, by=by, posture=posture,
+                              signer=signer if signed else None, signature=signature if signed else None,
+                              challenge=challenge if signed else None, fence=fence if signed else None)
+    except BaseException as e:
+        try:
+            conn.execute("ROLLBACK TO decide_in")
+            conn.execute("RELEASE decide_in")
+        except sqlite3.Error as undo:
+            # a fault that rolled the whole transaction back took the savepoint with it: nothing of either stays
+            _log.warning("decide_in: savepoint not undone after %s: %s", type(e).__name__, undo)
+        raise
+    conn.execute("RELEASE decide_in")
+    if not approve:
+        return HoldResult(True, "rejected", closed=closed)
+    return HoldResult(True, "approved", decision=decision_key(RunJournal._hold_dict(RunJournal._hold_row(conn, hold_id))))
+
+
+def unprojected_receipts(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """``(receipt_id, record text)`` of every receipt not yet projected to the receipt file, oldest first."""
+    return [(r, t) for r, t in conn.execute("SELECT receipt_id, record FROM gate_receipts WHERE projected = 0 "
+                                            "ORDER BY seq")]
+
+
+def mark_projected(conn: sqlite3.Connection, receipt_ids: list[str]) -> int:
+    """Mark receipts projected (``0 -> 1`` only: ``receipts_final_u``), in the caller's write transaction. Returns
+    how many moved."""
+    return sum(conn.execute("UPDATE gate_receipts SET projected = 1 WHERE receipt_id = ? AND projected = 0",
+                            (rid,)).rowcount for rid in receipt_ids)

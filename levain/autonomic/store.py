@@ -19,13 +19,16 @@ import fcntl
 import hashlib
 import json
 import logging
+import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from levain.autonomic.journal import durable_fsync
 from levain.autonomic.posture import Posture
 
-__all__ = ["GateReceiptStore", "StoredGateReceipt"]
+__all__ = ["GateReceiptStore", "StoredGateReceipt", "gate_record"]
 
 _log = logging.getLogger("levain.autonomic.store")
 
@@ -45,16 +48,16 @@ class StoredGateReceipt:
 
 
 def _receipt_id(
-    *, created_at: str, context_id: str, action_name: str, fired: bool, action_face: dict[str, Any]
+    *, created_at: str, context_id: str, action_name: str, fired: bool, action_face: dict[str, Any],
+    subject: str | None = None,
 ) -> str:
     """A stable, sortable, CONTENT-ADDRESSED id: ``<created_at>-<8hex>`` over the decision's identity
     (context + action + the gate verdict + ``fired``). Deterministic in inputs (testable); the
     ``created_at`` prefix keeps the log chronologically sortable.
 
-    NOTE — ids are DETERMINISTIC, the store does NOT dedup (L1-MED-1 / L2-M3). The append store is
-    append-only and never collapses records; two appends with the same id write two JSONL lines. A
-    consumer should key by ``id`` + treat a repeat as the same decision (not assume global
-    uniqueness). ``fired`` is in the basis so a retry that FAILED then SUCCEEDED at the same
+    NOTE — ids are DETERMINISTIC, and ``append`` does NOT dedup (L1-MED-1 / L2-M3): two appends with the
+    same id write two JSONL lines. ``read`` returns the first line of an id; a consumer reading the file
+    itself should key by ``id`` + treat a repeat as the same decision (not assume global uniqueness). ``fired`` is in the basis so a retry that FAILED then SUCCEEDED at the same
     ``created_at`` gets a DISTINCT id rather than colliding (the production clock is wall-now, so
     real collisions are already near-impossible; this hardens the fixed-clock/retry edge)."""
     gate = action_face.get("gate") or {}
@@ -62,8 +65,63 @@ def _receipt_id(
         f"{created_at}\x00{context_id}\x00{action_name}\x00"
         f"{gate.get('verdict', '')}\x00{gate.get('by', '')}\x00{int(fired)}"
     )
+    if subject is not None:
+        # autogrant r7.0: a receipt of a subject (a /3 store) has the subject in its basis, so two subjects never
+        # share an id
+        basis = f"{subject}\x00{basis}"
     h = hashlib.sha256(basis.encode()).hexdigest()[:8]
     return f"{created_at}-{h}"
+
+
+def gate_record(*, created_at: str, action_name: str, proposal_id: str | None, posture: Posture, fired: bool,
+                action_face: dict[str, Any], subject: str | None = None) -> tuple[str, dict[str, Any]]:
+    """The receipt id and record, built before any write: the one builder of the record shape. ``subject`` names
+    the subject a ``levain-autonomic/3`` receipt closes (``run:`` / ``effect:`` / ``pending:`` / ``request:``): the
+    record's envelope then carries it (the store's ``receipts_content`` trigger checks it against the row) and the
+    id's basis includes it. Without it the record is exactly :meth:`GateReceiptStore.append`'s."""
+    context_id = str(action_face.get("context_id", ""))
+    rid = _receipt_id(created_at=created_at, context_id=context_id, action_name=action_name, fired=fired,
+                      action_face=action_face, subject=subject)
+    record: dict[str, Any] = {
+        "id": rid,
+        "kind": "gate",
+        "created_at": created_at,
+        "action_name": action_name,
+        "proposal_id": proposal_id,
+        "posture": posture.name,
+        "fired": fired,
+        "action_face": action_face,
+    }
+    if subject is not None:
+        record["subject"] = subject
+    return rid, record
+
+
+_GATE_KEYS = ("id", "created_at", "action_name", "posture", "fired", "action_face")
+
+
+def _records_in(raw: bytes) -> dict[str, list[dict[str, Any]]]:
+    # every JSON object line in the file's bytes, by its id; a line that does not decode or parse (a torn tail), or
+    # names no string id, is skipped, never raised
+    out: dict[str, list[dict[str, Any]]] = {}
+    for piece in raw.split(b"\n"):
+        try:
+            rec = json.loads(piece.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and isinstance(rec.get("id"), str):
+            out.setdefault(rec["id"], []).append(rec)
+    return out
+
+
+def _canon(rec: dict[str, Any]) -> str:
+    # the serialized form, so that 0 and false, 1 and 1.0 are different records (Python's == says they are equal)
+    return json.dumps(rec, sort_keys=True, ensure_ascii=False)
+
+
+def _is_gate(rec: dict[str, Any]) -> bool:
+    # a line :meth:`GateReceiptStore.read` returns (kind gate, every field it reads)
+    return rec.get("kind") == "gate" and all(k in rec for k in _GATE_KEYS)
 
 
 class GateReceiptStore:
@@ -88,21 +146,8 @@ class GateReceiptStore:
         resolve racing the daemon sweep — can otherwise interleave/duplicate audit lines. The lock is
         held only across the single ``write`` (the JSON is built first); a crash can still truncate
         the LAST line (skipped on read)."""
-        context_id = str(action_face.get("context_id", ""))
-        rid = _receipt_id(
-            created_at=created_at, context_id=context_id, action_name=action_name,
-            fired=fired, action_face=action_face,
-        )
-        record = {
-            "id": rid,
-            "kind": "gate",
-            "created_at": created_at,
-            "action_name": action_name,
-            "proposal_id": proposal_id,
-            "posture": posture.name,
-            "fired": fired,
-            "action_face": action_face,
-        }
+        rid, record = gate_record(created_at=created_at, action_name=action_name, proposal_id=proposal_id,
+                                  posture=posture, fired=fired, action_face=action_face)
         line = json.dumps(record, ensure_ascii=False) + "\n"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as fh:
@@ -113,8 +158,66 @@ class GateReceiptStore:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
         return rid
 
+    def project_rows(self, rows: Sequence[tuple[str, str]]) -> list[str]:
+        """Project committed receipt rows (``(receipt_id, record text)``) into the file: append each one the file
+        does not hold, then make the file and its directory entry durable (autogrant r66.5). Returns the id of every
+        row the file now holds, in row order; the caller marks a row projected only after this returns, so a stop or
+        power loss before the flush leaves the mark unset and the next projection appends again what did not
+        survive. A row counts as held only when a line equal to its record is in the file: a line that is no
+        complete gate record (foreign, partial) is passed over and the row appended; a complete gate record under
+        the row's id with other content keeps the row out of the return, so it is never marked. The file is read as
+        bytes and each line decoded on its own, so a torn tail (a crash mid-line, mid-character) is skipped and ended
+        with a newline, never raised."""
+        made: list[Path] = []     # the directories this call creates, leaf first
+        anc = self.path.parent
+        while not anc.exists() and anc != anc.parent:
+            made.append(anc)
+            anc = anc.parent
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        done: list[str] = []
+        with self.path.open("a+b") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                fh.seek(0)
+                raw = fh.read()
+                have = _records_in(raw)
+                fh.seek(0, os.SEEK_END)
+                if raw and not raw.endswith(b"\n"):
+                    fh.write(b"\n")
+                for rid, text in rows:
+                    want = json.loads(text)
+                    lines = [r for r in have.get(rid, ()) if _is_gate(r)]
+                    if any(_canon(r) != _canon(want) for r in lines):
+                        # a complete gate record under this id that is not this receipt: ``read`` could return it
+                        # for this id, so the row is never marked projected (doctor reads it unprojected)
+                        _log.error("efferent store: %s holds another record under receipt id %s: not projected",
+                                   self.path, rid)
+                        continue
+                    if not lines:
+                        fh.write(text.encode("utf-8") + b"\n")
+                        have.setdefault(rid, []).append(want)
+                    done.append(rid)
+                fh.flush()
+                durable_fsync(fh.fileno())
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        # the file's directory entry, on every projection: whoever created the file (an ``append``, a projection
+        # stopped before this line) may not have flushed it, and the file existing says nothing about that
+        # and the entry of each directory this call created, in ITS parent, up to the first that already existed
+        for d in (self.path.parent, *made[1:], anc if made else None):
+            if d is None:
+                continue
+            dfd = os.open(d, os.O_RDONLY)
+            try:
+                durable_fsync(dfd)
+            finally:
+                os.close(dfd)
+        return done
+
     def read(self, *, limit: int | None = None) -> list[StoredGateReceipt]:
-        """Read gate records NEWEST-FIRST. A blank/malformed line is skipped with a WARNING (one bad
+        """Read gate records NEWEST-FIRST, by ARRIVAL: file order, so a receipt projected after a stop reads as newer
+        than receipts written after it. A record id repeated in the file (a projection repeated after a stop) is
+        read once, at its first line. A blank/malformed line is skipped with a WARNING (one bad
         historical line never breaks the surface — fail-soft); a non-``gate`` line is skipped
         silently (forward-compat if the file is ever co-mingled). A missing file returns ``[]`` via a
         ``FileNotFoundError`` CATCH (the read/exists race is not atomic). ``errors="replace"`` so a
@@ -130,6 +233,7 @@ class GateReceiptStore:
             _log.warning("efferent store: read failed (%s): %s — returning []", type(e).__name__, e)
             return []
         out: list[StoredGateReceipt] = []
+        seen: set[str] = set()
         for lineno, line in enumerate(raw.splitlines(), start=1):
             line = line.strip()
             if not line:
@@ -140,6 +244,8 @@ class GateReceiptStore:
                     _log.warning("efferent store: skipping non-object line %d (%s)", lineno, type(rec).__name__)
                     continue
                 if rec.get("kind") != "gate":
+                    continue
+                if rec.get("id") in seen:
                     continue
                 out.append(
                     StoredGateReceipt(
@@ -152,6 +258,7 @@ class GateReceiptStore:
                         action_face=rec["action_face"],
                     )
                 )
+                seen.add(rec["id"])
             except (json.JSONDecodeError, KeyError, TypeError) as e:
                 _log.warning("efferent store: skipping malformed line %d (%s)", lineno, type(e).__name__)
                 continue
