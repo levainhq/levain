@@ -7,6 +7,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **Pings come from the cockpit's own origin.** The cockpit serves web push itself (service worker, manifest,
+  `/webpush/*`), behind its credential. The Devices panel turns pings on for the browser you are using: pair it, then
+  Turn on; on a phone, add the cockpit to the Home Screen and pair it from there. Only a paired device can turn pings
+  on, and a revoked device gets no ping, whatever happened to its stored subscriptions: every send checks the device
+  is still paired.
+- **Sign links open the cockpit's sheet and carry no token.** `levain.consent.sign.deep_link` builds
+  `<origin>/sign/<id>`. `levain consent phone --redirect-to <origin>` runs the old phone port as a redirect only: links
+  you already hold open the cockpit's sign sheet, and the token in them is dropped, never sent on.
 - **The cockpit signs in an overlay sheet.** A sign card opens `/sign/<id>` over the cockpit; the sheet shows the one
   request, freezes a written answer when you tap Sign and shows the exact line being signed, then the line that was
   signed. Before asking for a passkey it checks that a key enrolled for the cockpit may sign the request, and says what
