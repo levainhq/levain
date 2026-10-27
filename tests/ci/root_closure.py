@@ -250,6 +250,10 @@ LAZY_SITES = {
     'levain/authority.py::_ranks::from levain.cockpit.firejournal import _CLASS_RANK': 'root',
     'levain/authority.py::_stamp::from levain.cockpit.consent import utc_stamp': 'root',
     'levain/autonomic/journal.py::RunJournal._barrier::from levain.autonomic.binding import registry_bars': 'root',
+    # root: lazy because ``schema3`` imports ``journal`` at module level (a hoist is a cycle); ``schema3`` is already a closure member through ``binding``'s import-time import, so this row adds nothing to the closure
+    'levain/autonomic/journal.py::_insert_receipt::from levain.autonomic.schema3 import close_subject': 'root',
+    # root: the same cycle and the same already-member target as ``_insert_receipt`` above
+    'levain/autonomic/journal.py::close_effect_in::from levain.autonomic.schema3 import effect_subject': 'root',
     'levain/cockpit/authority.py::RequestAuthority.capture::from levain import authority as auth': 'root',
     'levain/cockpit/authority.py::RequestAuthority.capture::from levain.cockpit.firejournal import UNINITIALISED, _meta, conn_init_hint': 'root',
     'levain/cockpit/authority.py::RequestAuthority.fence::from levain.cockpit.firejournal import authority_fence': 'root',
