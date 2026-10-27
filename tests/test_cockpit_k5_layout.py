@@ -198,7 +198,7 @@ FULL_BAR = ("(() => { %s"
             " return new Promise(r => setTimeout(r, 200)).then(() => { const m = q('.masthead'), t = q('.masthead .seg'), u = q('.masthead .unit'), ro = q('.masthead .readout');"
             " const jl = document.querySelector('.jar-label');"
             " return { sw: vw.scrollWidth, cw: vw.clientWidth, unitLeft: Math.round(u.left), tabsRight: Math.round(t.right), readoutRight: Math.round(ro.right), mastRight: Math.round(m.right),"
-            " nameCut: n.scrollWidth > n.clientWidth, unitW: Math.round(u.width), nat, nameShrunk: n.clientWidth < Math.min(natE, n.clientWidth + 1) && Math.round(u.width) < nat, dbg: [Math.round(u.width), Math.round(ro.width), Math.round(ro.left), Math.round(q('.masthead .indicators').width), Math.round(q('.masthead .themesw').width), Math.round(q('.masthead .brand').width), Math.round(t.left)], nameW: n.clientWidth, jarCut: jl ? jl.scrollWidth > jl.clientWidth : null }; }); })()")
+            " nameCut: n.scrollWidth > n.clientWidth, unitW: Math.round(u.width), nat, nameW: n.clientWidth, jarCut: jl ? jl.scrollWidth > jl.clientWidth : null }; }); })()")
 VERDANA = "for (const e of document.querySelectorAll('*')) e.style.fontFamily = 'Verdana, sans-serif';"
 NO_JAR = "document.getElementById('jar').hidden = true;"
 LONG_JAR = ("const j = document.getElementById('jar'); j.hidden = false; j.innerHTML = '<svg viewBox=\"0 0 16 20\"></svg><span class=\"jar-label\">'"
@@ -225,9 +225,26 @@ def test_the_jar_label_gives_way_before_the_name_does(tmp_path: Path, width: int
     assert got["nat"] - got["unitW"] <= 1, got                                 # while the name kept its whole width
 
 
+# the starter jar as the page draws it (renderJar's 26x34 svg + label), visible; its icon must keep its room beside the indicators
+REAL_JAR = ("const j = document.getElementById('jar'); j.hidden = false; j.innerHTML = '<svg viewBox=\"0 0 26 34\"><path d=\"M5 8 H21 V28 H5 Z\"></path></svg>"
+            "<span class=\"jar-label\">starter: 14 today</span>';")
+JAR_ICON = ("(() => { const s = document.querySelector('#jar svg').getBoundingClientRect(), i = document.querySelector('.masthead .indicators').getBoundingClientRect();"
+            " return { svgW: Math.round(s.width), svgRight: Math.round(s.right * 10) / 10, indLeft: Math.round(i.left * 10) / 10 }; })()")
+
+
+@needs_browser
+@pytest.mark.parametrize("font, width", [("", 1041), ("", 1100), ("", 1180), (VERDANA, 1100), (VERDANA, 1180)],
+                         ids=["native-1041", "native-1100", "native-1180", "verdana-1100", "verdana-1180"])
+def test_the_jar_icon_keeps_its_room_and_never_overlaps_the_indicators(tmp_path: Path, width: int, font: str) -> None:
+    out = _run(tmp_path, [{"eval": FULL_BAR % (font, REAL_JAR)}, {"eval": JAR_ICON}], width=width)
+    icon = out[-1]
+    assert icon["svgW"] > 0, icon
+    assert icon["svgRight"] <= icon["indLeft"], icon                       # the icon ends before the live/status cluster begins
+
+
 # the Calm control beside the name, from just above the stacked breakpoint to a wide bar (Verdana from 1100: its 1041 bar overflows on main too)
 CALM = ("(() => { const b = document.getElementById('calmbtn'), r = b.getBoundingClientRect(); b.focus();"
-        " return { label: getComputedStyle(b).fontSize, w: Math.round(r.width), name: b.getAttribute('aria-label'), title: b.title, focused: document.activeElement === b, shown: r.width > 0 }; })()")
+        " const cs = getComputedStyle(b), pb = getComputedStyle(b, '::before'), g = document.createElement('span'); g.textContent = '\u2248'; g.style.cssText = 'font:' + pb.font + ';letter-spacing:' + pb.letterSpacing + ';padding:0;margin:0;border:0'; b.appendChild(g); const em = g.getBoundingClientRect().width; g.remove(); return { label: cs.fontSize, w: Math.round(r.width), bound: Math.ceil(parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth) + em), name: b.getAttribute('aria-label'), title: b.title, focused: document.activeElement === b, shown: r.width > 0 }; })()")
 
 
 @needs_browser
@@ -244,6 +261,7 @@ def test_calm_beside_the_name_never_overflows_the_bar_and_keeps_its_name_as_an_i
     assert calm["shown"] and calm["focused"] and calm["name"] in ("Calm off", "Calm on") and calm["title"] == calm["name"], calm
     if width <= 1280:
         assert calm["label"] == "0px", calm                                  # the icon form: the visible text is gone, the name stays
+        assert calm["w"] <= calm["bound"], (calm["w"], calm["bound"])                             # and the button is only its padding + the glyph's measured width, not a label-wide key
     else:
         assert calm["label"] != "0px" and calm["w"] > 60, calm               # wide enough for the labelled form
 

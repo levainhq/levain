@@ -1230,7 +1230,7 @@ body.ke .masthead .readout { gap: var(--sp-4); flex: 1; justify-content: flex-en
 body.ke .masthead .unit { gap: 0; flex: 0 1 auto; min-width: 0; }   /* shrink order when the bar is full: the jar (see .jar) first, the name only when nothing else can give, and then with an ellipsis */
 body.ke .masthead .unit-label { display: none; }
 body.ke .masthead .entity { font: var(--fw-bold) var(--fs-lead) var(--round); color: var(--text); max-width: 14ch; }
-body.ke .masthead .jar { gap: var(--sp-3); font: var(--fw-regular) var(--fs-meta) var(--sans); white-space: nowrap; min-width: 0; flex-shrink: 1000; }
+body.ke .masthead .jar { gap: var(--sp-3); font: var(--fw-regular) var(--fs-meta) var(--sans); white-space: nowrap; min-width: calc(16px + var(--sp-3)); flex-shrink: 1000; }   /* the 16px icon (flex: none) and its gap keep their room; only the label gives way */
 body.ke .masthead .jar svg { width: 16px; height: 20px; flex: none; }
 body.ke .masthead .jar-label { font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; }
 body.ke .masthead .indicators { flex-wrap: nowrap; gap: var(--sp-3); flex: none; display: flex; align-items: center; }
@@ -1591,7 +1591,7 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
 }
 /* Between the stacked breakpoint and the width where the labelled Calm button fits beside the name, Calm shows its icon; the label stays its accessible name (aria-label + title, set by the page) */
 @media (min-width: 1041px) and (max-width: 1280px) {
-  body.ke .masthead #calmbtn { font-size: 0; padding: var(--sp-3); }
+  body.ke .masthead #calmbtn { font-size: 0; padding: var(--sp-3); gap: 0; }   /* the zero-size label is still a flex item: without gap: 0 the bar's gap sits between it and the glyph */
   body.ke .masthead #calmbtn::before { content: "\2248"; font-size: var(--fs-title); }
   body.ke .masthead #calmbtn[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
 }
