@@ -364,7 +364,8 @@ def test_forged_orphans_are_detected_and_the_reaper_adopts_each_adoptable_one(st
         [("receipt_without_terminal", x) for x in ("run:victim", "effect:v2:link-0", "run:v3", "run:v4", "run:v5")]
         + [("closing_left", "run:v4"), ("closing_left", "run:v5")])
     out = []
-    tx(c, lambda conn: out.append(s.reap_orphans(conn, lease_held=lambda r, e: False)))
+    tx(c, lambda conn: out.append(s.reap_orphans(conn, lease_held=lambda r, e: False,
+                                                  pending_lease_held=lambda p: False)))
     [(cleared, outcomes)] = out
     assert cleared == ["run:v4", "run:v5"]
     assert {k: v for k, v in outcomes.items() if v == s.ADOPTED} == dict.fromkeys(

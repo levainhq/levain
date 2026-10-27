@@ -78,17 +78,20 @@ def test_an_orphan_on_an_effect_in_flight_is_not_adopted_until_its_owner_is_gone
     # RED (rev 7.4's adoption, no lease test): the reaper ends an effect its owner is still inside
     with store.write() as c:
         c.execute("SAVEPOINT red")
-        s.adopt_orphan(c, "orph-e", "effect:r1:link-0", "fired", lease_held=lambda r, e: False)
+        s.adopt_orphan(c, "orph-e", "effect:r1:link-0", "fired", lease_held=lambda r, e: False,
+                       pending_lease_held=lambda pid: False)
         assert c.execute("SELECT state FROM effects").fetchone() == ("done",)
         c.execute("ROLLBACK TO red")
         c.execute("RELEASE red")
     with store.write() as c:
-        assert s.reap_orphans(c, lease_held=leases._lease_held) == ([], {"effect:r1:link-0": s.IN_FLIGHT})
+        assert s.reap_orphans(c, lease_held=leases._lease_held, pending_lease_held=lambda pid: False) == (
+            [], {"effect:r1:link-0": s.IN_FLIGHT})
     with store.read() as c:
         assert c.execute("SELECT state, receipt_id FROM effects").fetchone() == ("intent", None)
     leases._drop_lease("r1", "link-0", fd)                       # the owner exits
     with store.write() as c:
-        assert s.reap_orphans(c, lease_held=leases._lease_held) == ([], {"effect:r1:link-0": s.ADOPTED})
+        assert s.reap_orphans(c, lease_held=leases._lease_held, pending_lease_held=lambda pid: False) == (
+            [], {"effect:r1:link-0": s.ADOPTED})
     with store.read() as c:
         assert c.execute("SELECT state, receipt_id FROM effects").fetchone() == ("done", "orph-e")
         assert s.invariant(c) == []
@@ -156,3 +159,79 @@ def test_a_subject_whose_receipt_cannot_be_built_stays_live_and_the_pass_goes_on
         assert s.invariant(c) == []
     assert s.reap(store, lease_held=leases._lease_held, pending_lease_held=lambda pid: False,
                   record_for=record_for) == {"run:a": s.CLOSED}
+
+
+def pending(c, pid, seq, state="firing"):
+    c.execute("INSERT INTO manual_pendings (pending_id, seal, state, seq) VALUES (?, '{}', 'open', ?)", (pid, seq))
+    if state == "firing":
+        c.execute("UPDATE manual_pendings SET state = 'firing', decision = '{}' WHERE pending_id = ?", (pid,))
+
+
+# ---- L3 r1 (codex 4): an orphan pending's owner holds its pending lease: in flight, not adopted ----------------------
+def test_an_orphan_on_a_leased_firing_pending_is_left_in_flight(store, leases):
+    with store.write() as c:
+        pending(c, "p1", 1)
+    forge_orphan(store, "pending:p1", "orph-p", "outcome_unknown")
+    with store.write() as c:
+        assert s.reap_orphans(c, lease_held=leases._lease_held, pending_lease_held=lambda pid: pid == "p1") \
+            == ([], {"pending:p1": s.IN_FLIGHT})
+    with store.read() as c:
+        assert c.execute("SELECT state, receipt_id FROM manual_pendings").fetchone() == ("firing", None)
+    with store.write() as c:
+        assert s.reap_orphans(c, lease_held=leases._lease_held, pending_lease_held=lambda pid: False) \
+            == ([], {"pending:p1": s.ADOPTED})
+    with store.read() as c:
+        assert c.execute("SELECT state, receipt_id FROM manual_pendings").fetchone() == ("terminal", "orph-p")
+        assert s.invariant(c) == []
+
+
+# ---- L3 r1 (codex 5): a fenced run with an unknown link closes as unknown-link -------------------------------------
+def test_a_fenced_run_with_an_unknown_link_closes_as_unknown_link(store, leases):
+    with store.write() as c:
+        run(c, "fu", binding="bf")
+        intent(c, "fu")
+        end(c, "fu", "link-0", "unknown")
+        c.execute("INSERT INTO fences (binding_id, generation) VALUES ('bf', 1)")
+    assert s.reap(store, lease_held=leases._lease_held, pending_lease_held=lambda pid: False,
+                  record_for=record_for) == {"run:fu": s.CLOSED}
+    with store.read() as c:
+        assert c.execute("SELECT run_id, reason FROM cancels").fetchall() == [("fu", "unknown-link")]
+
+
+# ---- L3 r1 (codex 7 / complement 1): a fault on one orphan never stops the rest --------------------------------------
+def test_a_lease_fault_or_a_malformed_subject_on_one_orphan_never_stops_the_rest(store, leases):
+    with store.write() as c:
+        run(c, "r1")
+        intent(c, "r1")
+        run(c, "r2", started=False)
+    forge_orphan(store, "effect:r1:link-0", "orph-e", "fired")
+    forge_orphan(store, "effect:bare", "orph-bad", "fired")
+    forge_orphan(store, "run:r2", "orph-r", "refused")
+
+    def lease_fault(run_id, effect_id):
+        raise PermissionError(13, "lease file", run_id)
+
+    with store.write() as c:
+        _cleared, out = s.reap_orphans(c, lease_held=lease_fault, pending_lease_held=lambda pid: False)
+    assert out["run:r2"] == s.ADOPTED
+    assert out["effect:r1:link-0"].startswith("unadoptable: PermissionError")
+    assert out["effect:bare"].startswith("unadoptable:")
+    with store.read() as c:
+        assert c.execute("SELECT run_id, receipt_id FROM cancels").fetchall() == [("r2", "orph-r")]
+        assert c.execute("SELECT state FROM effects").fetchone() == ("intent",)
+    # through the pass: the orphan fault is reported and the per-kind selections still run
+    with store.write() as c:
+        run(c, "f", started=False, binding="bf")
+        c.execute("INSERT INTO fences (binding_id, generation) VALUES ('bf', 1)")
+    out = s.reap(store, lease_held=lease_fault, pending_lease_held=lambda pid: False, record_for=record_for)
+    assert out["run:f"] == s.CLOSED and out["effect:r1:link-0"].startswith("unadoptable: PermissionError")
+
+
+# ---- L3 r1 (complement 5): an orphan's outcome is not overwritten by the later per-kind pass ------------------------
+def test_an_unadoptable_orphan_keeps_its_outcome_in_the_pass(store, leases):
+    with store.write() as c:
+        run(c, "r1")
+        intent(c, "r1")
+    forge_orphan(store, "effect:r1:link-0", "orph-e", "refused")   # a terminal_state no effect row ends in
+    out = s.reap(store, lease_held=leases._lease_held, pending_lease_held=lambda pid: False, record_for=record_for)
+    assert out["effect:r1:link-0"].startswith("unadoptable:")
