@@ -1440,13 +1440,15 @@ def send_cas(seams: EndSeams, target: str, fields: Mapping[str, object]) -> None
 def _init_step(facts: EndFacts, seams: EndSeams) -> None:
     """A fresh ``L/retained/<s>/`` (root 0700). Redone after a crash: an existing one is accepted only
     when it is a real directory with the right owner holding no ``tree`` yet. The parent's fsync runs on a redo
-    too: the crashed run may have made ``retained/<s>/`` and died before syncing its entry."""
+    too, and before the ``retained-exists`` refusal: the crashed run may have made ``retained/<s>/`` and died before
+    syncing its entry."""
     try:
         os.mkdir(facts.retained, 0o700)
     except FileExistsError:
         st = os.lstat(facts.retained)
         if not stat.S_ISDIR(st.st_mode) or not seams.owner_ok(st):
             raise Refused("bad-root", f"{facts.retained} is not a directory with the expected owner") from None
+        fsync_dir(facts.retained.parent)
         if os.path.lexists(facts.tree):
             raise Refused("retained-exists", str(facts.tree)) from None
     fsync_dir(facts.retained.parent)
@@ -1754,9 +1756,20 @@ def _resync(facts: EndFacts, dfd: int, owner_ok: Callable[[os.stat_result], bool
     ``unconfirmed/`` that exists (checked as :func:`_own_dir` checks it, with ``retained/<s>/`` and its parent).
     Fsyncs are idempotent, so every run does them, a first run as well as a redo, before any credential moves."""
     os.fsync(dfd)
-    if os.path.isdir(facts.keep):
-        fsync_dir(facts.keep.parent)
-        fsync_dir(facts.keep)
+    try:
+        kst = os.lstat(facts.keep)
+    except FileNotFoundError:
+        kst = None
+    except OSError as e:
+        raise Refused("bad-root", f"{facts.keep}: {e.strerror or e}") from None
+    if kst is not None:
+        if not stat.S_ISDIR(kst.st_mode):
+            raise Refused("bad-root", f"{facts.keep} is not a real directory")
+        try:
+            fsync_dir(facts.keep.parent)
+            fsync_dir(facts.keep)
+        except OSError as e:
+            raise Refused("bad-root", f"{facts.keep}: {e.strerror or e}") from None
     for dest in (facts.replaced, facts.unconfirmed):
         if os.path.lexists(dest):
             _own_dir(facts.retained, owner_ok, fault, "park:resync:retained")
@@ -1764,16 +1777,17 @@ def _resync(facts: EndFacts, dfd: int, owner_ok: Callable[[os.stat_result], bool
             fsync_dir(dest)
 
 
-def _set_aside(facts: EndFacts, sfd: int, name: bytes, dest: Path, occupied: str,
+def _set_aside(facts: EndFacts, sfd: int, src: Path, name: bytes, dest: Path, occupied: str,
                owner_ok: Callable[[os.stat_result], bool], fault: Fault, point: str) -> None:
     """IG-1: a credential renamed (never opened) from the directory ``sfd`` into ``dest``, a directory inside
     ``L/retained/<s>/`` (both made root 0700 if missing), then both directories fsynced: the parked credential a
     confirmed re-login replaces (``keep/`` -> ``replaced/``), or the new credential of a login with no yes (the
-    session tree -> ``unconfirmed/``, D1). Only a regular file is moved (``lstat``, never followed): anything else
+    session tree -> ``unconfirmed/``, D1); ``src`` is the directory ``sfd`` is open on, named in a refusal.
+    Only a regular file is moved (``lstat``, never followed): anything else
     refuses ``keep-occupied``, as before IG-1. An entry already at ``dest`` is never replaced (``occupied``)."""
     st = os.stat(name, dir_fd=sfd, follow_symlinks=False)
     if not stat.S_ISREG(st.st_mode):
-        raise Refused("keep-occupied", f"{facts.keep}/{name.decode('ascii')} already holds a credential")
+        raise Refused("keep-occupied", f"{src}/{name.decode('ascii')} already holds a credential")
     _own_dir(facts.retained, owner_ok, fault, f"{point}:retained-made")
     _own_dir(dest, owner_ok, fault, f"{point}:dest-made")
     fault(f"{point}:dirs")
@@ -1840,10 +1854,11 @@ def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _
                 pass
             else:
                 if confirmed_relogin(facts, owner_ok=owner_ok):
-                    _set_aside(facts, kfd, name, facts.replaced, "replaced-occupied", owner_ok, fault,
+                    _set_aside(facts, kfd, facts.keep, name, facts.replaced, "replaced-occupied", owner_ok, fault,
                                "park:replace")
                 elif facts.kind == "login":
-                    _set_aside(facts, dfd, name, facts.unconfirmed, "unconfirmed-occupied", owner_ok, fault,
+                    tree_dir = facts.live.joinpath(*(x.decode("ascii") for x in parts))
+                    _set_aside(facts, dfd, tree_dir, name, facts.unconfirmed, "unconfirmed-occupied", owner_ok, fault,
                                "park:unconfirmed")
                     return
                 else:

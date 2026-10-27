@@ -231,10 +231,16 @@ CRASH_POINTS = {
     "park:after:commit": {"replaced": "old", "keep": "new"},
     "park:before:cas": {"replaced": "old", "keep": "new"},
     "park:after:cas": {"replaced": "old", "keep": "new"},
+    # Only a REDO passes these two (a first run has no replaced/ yet); they move nothing, so a crash at either leaves
+    # the credentials where the crash that forced the redo left them (test_a_crash_inside_the_resync_converges).
+    "park:resync:retained": {"replaced": "old", "tree": "new"},
+    "park:resync:dest": {"replaced": "old", "tree": "new"},
 }
+#: The points a first run passes.
+FIRST_RUN_POINTS = [p for p in CRASH_POINTS if ":resync:" not in p]
 
 
-@pytest.mark.parametrize("point", list(CRASH_POINTS))
+@pytest.mark.parametrize("point", FIRST_RUN_POINTS)
 def test_a_crash_at_each_park_point_leaves_one_credential_parked_or_in_the_tree(tmp_path, point):
     w = login_world(tmp_path)
     confirm(w)
@@ -264,7 +270,7 @@ def test_the_fault_points_are_the_ones_a_park_passes(tmp_path):
     seen: list = []
     ctl = Control()
     assert end_session(w.facts, w.seams(ctl, fault=seen.append), record_state=REVOKED) == RETAINED
-    assert [p for p in seen if p.startswith("park:")] == list(CRASH_POINTS)
+    assert [p for p in seen if p.startswith("park:")] == FIRST_RUN_POINTS
 
 
 _KILL_CHILD = """
@@ -456,16 +462,21 @@ D1_POINTS = {
     "park:after:commit": {"keep": "old", "unconfirmed": "new"},
     "park:before:cas": {"keep": "old", "unconfirmed": "new"},
     "park:after:cas": {"keep": "old", "unconfirmed": "new"},
+    # Only a REDO passes these two, as in CRASH_POINTS.
+    "park:resync:retained": {"keep": "old", "unconfirmed": "new"},
+    "park:resync:dest": {"keep": "old", "unconfirmed": "new"},
 }
+D1_FIRST_RUN_POINTS = [p for p in D1_POINTS if ":resync:" not in p]
 #: The HELD retry starts from the journal at ``move``, so it never passes ``begin``'s two points.
-D1_HELD_POINTS = {p: at for p, at in D1_POINTS.items() if p not in ("park:before:move", "park:after:move")}
+D1_HELD_POINTS = {p: at for p, at in D1_POINTS.items()
+                  if p not in ("park:before:move", "park:after:move") and ":resync:" not in p}
 
 
 def test_the_d1_fault_points_are_the_ones_a_park_passes(tmp_path):
     w = login_world(tmp_path)
     seen: list = []
     assert end_session(w.facts, w.seams(Control(), fault=seen.append), record_state=REVOKED) == RETAINED
-    assert [p for p in seen if p.startswith("park:")] == list(D1_POINTS)
+    assert [p for p in seen if p.startswith("park:")] == D1_FIRST_RUN_POINTS
     w, ctl = held_before_d1(tmp_path / "held")
     seen.clear()
     reconcile_session(w.facts, w.seams(ctl, fault=seen.append), held_attempts=1)
@@ -482,7 +493,7 @@ def _crash_once(point):
     return fault, fired
 
 
-@pytest.mark.parametrize("point", list(D1_POINTS))
+@pytest.mark.parametrize("point", D1_FIRST_RUN_POINTS)
 def test_a_crash_at_each_d1_point_converges(tmp_path, point):
     w = login_world(tmp_path)
     ctl = Control()
@@ -733,3 +744,87 @@ def test_the_init_step_fsyncs_l_retained_before_the_tree_moves_in_on_a_redo_too(
     end_mod._init_step(w.facts, w.seams(Control()))
     monkeypatch.undo()
     assert _ino(w.facts.retained.parent) in {v for k, v in log if k == "sync"}, "L/retained/ not fsynced"
+
+
+def test_the_init_step_fsyncs_l_retained_before_the_retained_exists_refusal(tmp_path, monkeypatch):
+    """H2b': the redo that finds ``retained/<s>/tree`` already there refuses ``retained-exists``; the parent entry the
+    crashed run may have left unsynced is fsynced first, since a refusal is a replay too."""
+    w = login_world(tmp_path)
+    os.mkdir(w.facts.retained, 0o700)
+    os.mkdir(w.facts.tree)
+    log = _trace_sync(monkeypatch)
+    with pytest.raises(end_mod.Refused) as e:
+        end_mod._init_step(w.facts, w.seams(Control()))
+    monkeypatch.undo()
+    assert "retained-exists" in str(e.value)
+    assert _ino(w.facts.retained.parent) in {v for k, v in log if k == "sync"}, "L/retained/ not fsynced"
+
+
+# --- G2 L3 r2: the note's source, keep/ as a link, the resync's own crash points ------------------------------------
+
+
+def test_the_keep_occupied_note_names_the_directory_the_entry_is_in(tmp_path):
+    """C1: a link in the session tree (D1) is reported at the tree, a non-file in keep/ (IG-1) at keep/."""
+    w = login_world(tmp_path)
+    _not_a_file(w.S / "config" / "claude" / NAME, "link", tmp_path)
+    ctl = Control()
+    assert end_session(w.facts, w.seams(ctl), record_state=REVOKED) == HELD
+    note = next(n for n in w.notes if "keep-occupied" in n)
+    assert str(w.S / "config" / "claude") in note and str(w.facts.keep) not in note
+    w = login_world(tmp_path / "c")
+    confirm(w)
+    _not_a_file(w.facts.keep / NAME, "dir", tmp_path)
+    ctl = Control()
+    assert end_session(w.facts, w.seams(ctl), record_state=REVOKED) == HELD
+    assert str(w.facts.keep) in next(n for n in w.notes if "keep-occupied" in n)
+
+
+@pytest.mark.parametrize("what", ["link", "file"])
+def test_a_keep_that_is_not_a_real_directory_is_bad_root_and_never_fsynced_through(tmp_path, monkeypatch, what):
+    """C2: ``keep/`` as a link (to a decoy directory) or a plain file ends HELD ``bad-root``, named; the resync never
+    follows the link to fsync the decoy."""
+    w = login_world(tmp_path)
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    os.unlink(w.facts.keep / NAME)
+    os.rmdir(w.facts.keep)
+    if what == "link":
+        os.symlink(decoy, w.facts.keep)
+    else:
+        w.facts.keep.write_bytes(b"")
+    log = _trace_sync(monkeypatch)
+    ctl = Control()
+    assert end_session(w.facts, w.seams(ctl), record_state=REVOKED) == HELD
+    monkeypatch.undo()
+    assert ctl.failed_step == "park" and any("bad-root" in n for n in w.notes)
+    assert _ino(decoy) not in {v for k, v in log if k == "sync"}
+    assert (w.S / "config" / "claude" / NAME).read_bytes() == CRED
+
+
+@pytest.mark.parametrize("path,origin", [("confirmed", "park:replace:renamed"),
+                                         ("unconfirmed", "park:unconfirmed:renamed")])
+@pytest.mark.parametrize("point", ["park:resync:retained", "park:resync:dest"])
+def test_a_crash_inside_the_resync_converges(tmp_path, path, origin, point):
+    """C3: a redo (forced by a crash after the set-aside's rename) that itself dies in its resync moves nothing, and the
+    next restart converges."""
+    w = login_world(tmp_path)
+    if path == "confirmed":
+        confirm(w)
+    ctl = Control()
+    fault, fired = _crash_once(origin)
+    with pytest.raises(Crash):
+        end_session(w.facts, w.seams(ctl, fault=fault), record_state=REVOKED)
+    assert fired == [origin]
+    fault2, fired2 = _crash_once(point)
+    with pytest.raises(Crash):
+        seams = w.seams(ctl, fault=fault2)
+        reconcile_session(w.facts, seams)
+        end_session(w.facts, seams, record_state=ctl.state, failed_step=ctl.failed_step)
+    assert fired2 == [point]
+    table = CRASH_POINTS if path == "confirmed" else D1_POINTS
+    assert where(w) == table[point]
+    seams = w.seams(ctl)
+    reconcile_session(w.facts, seams)
+    assert end_session(w.facts, seams, record_state=ctl.state, failed_step=ctl.failed_step) == RETAINED
+    assert where(w) == ({"keep": "new", "replaced": "old"} if path == "confirmed"
+                        else {"keep": "old", "unconfirmed": "new"})
