@@ -144,6 +144,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
         core.extend(_check_hands_isolation(install))
     core.extend(_check_floor_placeholders())
     core.extend(_check_store(install))
+    core.extend(_check_autonomic_store())
     core.extend(_check_baton(install))
     core.extend(_check_host_awake())
     core.extend(_check_cockpit_authority(install))
@@ -2782,6 +2783,56 @@ def _check_store(install: Path) -> list[CheckResult]:
         ]
     label = f"reachable ({len(tables)} table(s): {', '.join(tables[:3])}{'…' if len(tables) > 3 else ''})"
     return [CheckResult(".levain/memory.db", True, label)]
+
+
+# what each row of a levain-autonomic/3 store's INVARIANT (schema3.INVARIANT) means, in the doctor's words
+_INVARIANT_MEANS = {
+    "terminal_without_receipt": "a closed run, effect, pending or request whose receipt is missing",
+    "receipts_per_subject_gt_1": "more than one receipt for one subject",
+    "receipt_without_terminal": "a receipt whose subject never closed (the reaper adopts it when it can)",
+    "closing_left": "a close statement's mark left behind (the reaper clears it)",
+    "hold_rejected_without_run_close": "a rejected hold whose run was not closed",
+    "not_started_uncounted": "an attempt that did not start, with no held count naming it, so its retry is refused",
+    "held_at_bound_unclosed": "a held count at its bound with neither its run's close nor its request's close",
+}
+
+
+def _check_autonomic_store(store_dir: Path | None = None) -> list[CheckResult]:
+    """The autonomic store's own consistency read, for a ``levain-autonomic/3`` store only (R15-5 S3): one FAIL row
+    per row of its INVARIANT (``schema3.invariant``), else one row naming its legacy rows (``schema3.census``) and the
+    receipts not yet copied to the receipt file. No row without a store, or for a store of another format. The store
+    is read through a read-only connection, in one snapshot, and never written."""
+    from levain.autonomic import schema3
+    from levain.autonomic.db import DB_NAME, default_store_dir, store_marker
+
+    db = (store_dir.expanduser() if store_dir is not None else default_store_dir()) / DB_NAME
+    if not db.is_file():
+        return []
+    name = "autonomic store"
+    try:
+        conn = sqlite3.connect(db.absolute().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=2)
+    except sqlite3.Error as e:
+        return [CheckResult(name, True, f"{db} cannot be read ({e})", warn=True)]
+    try:
+        conn.execute("BEGIN")
+        if store_marker(conn) != schema3.STORE_FORMAT_V3:
+            return []
+        try:
+            schema3.refuse_unless_this_v3(conn)
+        except schema3.StoreFormatError as e:
+            return [CheckResult(name, False, f"{db}: {e}")]
+        rows = schema3.invariant(conn)
+        legacy = len(schema3.census(conn))
+        unprojected = conn.execute("SELECT COUNT(*) FROM gate_receipts WHERE projected = 0").fetchone()[0]
+    except sqlite3.Error as e:
+        return [CheckResult(name, True, f"{db} cannot be read ({e})", warn=True)]
+    finally:
+        conn.close()
+    if rows:
+        return [CheckResult(f"{name} INVARIANT", False, f"{kind} {subject}: {_INVARIANT_MEANS.get(kind, kind)}")
+                for kind, subject in rows]
+    return [CheckResult(name, True, f"{schema3.STORE_FORMAT_V3} at {db}: invariant holds; {legacy} legacy row(s); "
+                                    f"{unprojected} receipt(s) not yet in the receipt file")]
 
 
 def _check_cockpit_authority(install: Path) -> list[CheckResult]:
