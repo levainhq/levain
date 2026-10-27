@@ -2128,9 +2128,19 @@ def resume(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
 def status(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     """Read-only (§5.1): the caller's alloc records (``supervisor_uid == SUDO_UID``; dispatch: ticketed only).
     DECISION: the answer is ``{records:[levain-alloc/1…]}`` sorted by session; a named session the caller does not
-    hold is ``no-session``."""
+    hold is ``no-session``. A named ``login`` session whose state record holds an ``identity`` (past start's identity
+    step, §7.6) also answers ``identity``: CONTROL's field, which the slot cannot write, so the supervisor's
+    confirm prompt is decided and shown from it (1027-18 RULINGS G1b, the root-sourced id display)."""
     if req.session is not None:
-        return {"records": [R.alloc_record(read_alloc(ctx, req.session))]}
+        from levain.slot import identity as ID
+
+        a = read_alloc(ctx, req.session)
+        ans: Dict[str, object] = {"records": [R.alloc_record(a)]}
+        rec = ID.read_record(ctx, a.session) if a.kind == "login" else None
+        ident = rec.fields.get("identity") if rec is not None else None
+        if ident is not None:
+            ans["identity"] = dict(ident)
+        return ans
     out = []
     with ctx.store.dir("alloc") as fd:
         names = sorted(os.listdir(fd))

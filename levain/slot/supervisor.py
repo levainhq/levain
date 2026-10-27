@@ -415,6 +415,25 @@ def parse_helper_line(data: bytes, verb: str) -> Dict[str, object]:
     return _answer(data[:-1], verb)
 
 
+def identity_answer(ans: Mapping[str, object]) -> Tuple[Optional[str], Optional[str]]:
+    """``status <session>``'s ``identity`` (CONTROL's state-record field) as (observed id, result), checked by
+    records' own rules before it decides or is shown; absent is (None, None). Anything else is
+    ``identity-answer-malformed``."""
+    from levain.slot.records import _REASON_RE, OBSERVED_ID_RE
+
+    ident = ans.get("identity")
+    if ident is None:
+        return None, None
+    if type(ident) is not dict or not set(ident) <= {"observed_id", "result"}:
+        raise Refused("identity-answer-malformed", "identity")
+    oid, result = ident.get("observed_id"), ident.get("result")
+    if oid is not None and (type(oid) is not str or not OBSERVED_ID_RE.fullmatch(oid)):
+        raise Refused("identity-answer-malformed", "identity.observed_id")
+    if result is not None and (type(result) is not str or not _REASON_RE.fullmatch(result)):
+        raise Refused("identity-answer-malformed", "identity.result")
+    return oid, result
+
+
 #: §5.1 prepare's answer for an egress session: ``levain-prepare-result/1 {session, slot:{class,index}, gwport,
 #: staging}`` (the supervisor only ever prepares egress, so ``gwport`` is required).
 PREPARE_KEYS = frozenset({"format", "session", "slot", "staging", "gwport"})
@@ -1006,7 +1025,6 @@ class Supervisor:
         self._output_failed = False           # the operator's stdout refused a write (not EAGAIN): the relay ended
         self._reset_untaken = False           # the reporting-mode reset did not reach his terminal whole
         self.unshown_lines = 0                # held status lines stderr never took (the end-of-run drain's count)
-        self._vendor_exit: object = None      # the vendor's exit as start's pty line printed it (display only)
 
     # -- small ------------------------------------------------------------------------------------------------------
 
@@ -1457,7 +1475,6 @@ class Supervisor:
         except Refused as e:
             self.say(f"start refused {e.name}")
             return False
-        self._vendor_exit = res.get("exit")
         self.say(f"{self.req.vendor} exited {res.get('exit')}" + ("" if code == 0 else f" (helper exit {code})"))
         return code == 0
 
@@ -1465,46 +1482,67 @@ class Supervisor:
 
     def _confirm_identity(self, session: str) -> None:
         """After a login session's vendor exited and BEFORE teardown (the lease is live, which the helper's verb
-        needs): his answer to the confirm prompt goes to ``confirm-identity <session> yes|no``. Root decides what
-        is written: the baseline only on ``yes``, only from the id root recorded at ``start``. No answer (a stop
-        signal, EOF, :data:`CONFIRM_S`) sends nothing. Claude is not asked: its identity call is unbuilt (IG-3), and
-        root would refuse ``no-observed-id``. A refusal is said, never raised: teardown still runs."""
+        needs): whether to ask, and the id the prompt shows, come from root's state record, read through ``status
+        <session>`` (its ``identity``: CONTROL's field, which the slot cannot write). Start's pty tail is never read
+        for it: the slot can write that tail. His answer goes to ``confirm-identity <session> yes|no``; root writes
+        the baseline only on ``yes``, only from that record, and says so (``{baseline: written}``), which is the
+        only answer reported as written. No answer (a stop signal, EOF, :data:`CONFIRM_S`) sends nothing. A refusal
+        is said, never raised: teardown still runs."""
+        from levain.slot.identity import BASELINE_WRITTEN, NOT_A_CHECK
+
         if self.stop_signal is not None:
             return
-        if self.req.vendor == "claude":
-            self.say("no baseline written for this slot: the Claude identity call is not built yet "
-                     "(identity-call-unbuilt)")
+        try:
+            oid, result = identity_answer(self.helper("status", session, stdin=None))
+        except Refused as e:
+            self.say(f"no baseline written: refused {e.name}")
             return
-        if self._vendor_exit != 0:
-            self.say(f"the login exited {self._vendor_exit}: no baseline written")
+        if oid is None:
+            if result == "identity-call-unbuilt":
+                self.say("no baseline written for this slot: the Claude identity call is not built yet "
+                         "(identity-call-unbuilt)")
+            else:
+                self.say("no baseline written for this slot: " + (f"the identity step recorded {result}"
+                                                                   if result else "no identity was recorded"))
             return
-        prompt = ("levain: Codex has no server-validated identity call, so this login is recorded as not a check: "
-                  "Levain cannot tell which account it is. Keep it as this slot's Codex baseline? [y/N] ")
+        name = {"claude": "Claude", "codex": "Codex"}.get(self.req.vendor, self.req.vendor)
+        if oid == NOT_A_CHECK:
+            prompt = (f"levain: {name} has no server-validated identity call, so this login is recorded as not a "
+                      f"check: Levain cannot tell which account it is. Keep it as this slot's {name} baseline? "
+                      "[y/N] ")
+        else:
+            prompt = (f"levain: this login is {name} account {oid} (the server's answer). Keep it as this slot's "
+                      f"{name} baseline? [y/N] ")
         answer = (self.s.confirm or self._ask)(prompt)
         if answer is None or self.stop_signal is not None:
             self.say("no answer: no baseline written")
             return
         try:
-            self.helper("confirm-identity", session, "yes" if answer else "no", stdin=None)
+            res = self.helper("confirm-identity", session, "yes" if answer else "no", stdin=None)
         except Refused as e:
-            self.say(f"confirm-identity refused {e.name}: no baseline written")
+            self.say(f"no baseline written: refused {e.name}")
             return
-        self.say("baseline written: this slot's Codex login is its baseline (not a check)" if answer
-                 else "not confirmed: no baseline written")
+        if not answer:
+            self.say("not confirmed: no baseline written")
+        elif res == {"baseline": BASELINE_WRITTEN}:
+            self.say(f"baseline written: this slot's {name} login is its baseline"
+                     + (" (not a check)" if oid == NOT_A_CHECK else f" (account {oid})"))
+        else:
+            self.say("no baseline written: root's answer did not say it wrote one")
 
     def _ask(self, prompt: str) -> Optional[bool]:
         """The prompt on stderr, one line read from his terminal (cooked again once the relay ended), watching the
-        wake pipe so a stop signal ends the wait. ``y`` / ``yes`` (any case) is True; any other line False; a stop,
-        EOF, a stdin that is not a terminal, or :data:`CONFIRM_S` without a line is None."""
+        wake pipe so a stop signal ends the wait. ``y`` / ``yes`` (any case) is True; any other line False (one past
+        :data:`_CONFIRM_LINE_MAX` is False, and the rest of it is flushed from his terminal's input); a stop, EOF, a
+        stdin that is not a terminal, or :data:`CONFIRM_S` without a line is None. The deadline starts before the
+        prompt is written, and the write is non-blocking within it: a stderr that is not reading cannot hold the
+        lease open."""
         fd = self.s.stdin
         if not os.isatty(fd):
             return None
-        try:
-            self.err.write(prompt)
-            self.err.flush()
-        except OSError:
-            return None
         deadline = self.s.clock() + CONFIRM_S
+        if not self._write_prompt(prompt, time.monotonic() + CONFIRM_S):
+            return None
         buf = bytearray()
         while self.stop_signal is None:
             left = deadline - self.s.clock()
@@ -1533,8 +1571,42 @@ class Supervisor:
                 if b"\n" in buf:
                     return buf.split(b"\n", 1)[0].strip().lower() in (b"y", b"yes")
                 if len(buf) > _CONFIRM_LINE_MAX:
+                    try:
+                        termios.tcflush(fd, termios.TCIFLUSH)
+                    except termios.error:
+                        pass
                     return False
         return None
+
+    def _write_prompt(self, prompt: str, deadline: float) -> bool:
+        """``prompt`` on stderr, non-blocking, before ``deadline`` (``time.monotonic``) or a stop signal: ``True``
+        only when it was taken whole."""
+        try:
+            fd = self.err.fileno()
+        except (AttributeError, OSError, ValueError):
+            fd = -1
+        if fd < 0:                            # not an fd (a test's StringIO): it cannot stall
+            try:
+                self.err.write(prompt)
+                self.err.flush()
+                return True
+            except (OSError, ValueError):
+                return False
+        data = bytearray(prompt.encode(getattr(self.err, "encoding", None) or "utf-8", "backslashreplace"))
+        try:
+            was = os.get_blocking(fd)
+            os.set_blocking(fd, False)
+        except OSError:
+            return False
+        try:
+            if not self._flush_err(fd, deadline):
+                return False
+            return self._drain(fd, data, deadline) is None and not data
+        finally:
+            try:
+                os.set_blocking(fd, was)
+            except OSError:
+                pass
 
     def _winsize(self, master: int) -> None:
         if not os.isatty(self.s.stdin):

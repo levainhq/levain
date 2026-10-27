@@ -37,6 +37,8 @@ BASELINE_MODE = 0o600
 NOT_A_CHECK = "not-a-check"
 CONFIRMED = "confirmed"
 LOGIN_FAILED = "login-exit-nonzero"
+#: ``confirm-identity yes``'s answer once the file is written: the supervisor says "written" on this only.
+BASELINE_WRITTEN = "written"
 #: the states a session's lease is live in past render (§7.3): the only ones confirm runs in.
 _RUNNING = (R.ACTIVE, R.BRAKED)
 _VENDORS = ("claude", "codex")
@@ -87,7 +89,7 @@ def parse_profile_answer(exit_code: int, out: bytes) -> str:
         raise bad("answer over 64 KiB")
     try:
         ans = json.loads(out.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (ValueError, RecursionError):      # UnicodeDecodeError is a ValueError
         raise bad("answer is not JSON") from None
     if type(ans) is not dict or type(ans.get("status")) is not int:
         raise bad("no status")
@@ -95,7 +97,7 @@ def parse_profile_answer(exit_code: int, out: bytes) -> str:
         raise bad(f"HTTP {ans['status']}")
     try:
         prof = json.loads(ans["body"]) if type(ans.get("body")) is str else None
-    except ValueError:
+    except (ValueError, RecursionError):
         prof = None
     acct = prof.get("account") if type(prof) is dict else None
     uuid = acct.get("uuid") if type(acct) is dict else None
@@ -195,20 +197,29 @@ def _slot_names_lease(ctx: H.Ctx, a: R.Alloc) -> bool:
     raw = ctx.store.read(("slots", a.slot.tag), "state")
     if raw is None:
         return False
-    st = H.parse_slot_state_of(raw, a.slot)
+    try:
+        st = H.parse_slot_state_of(raw, a.slot)
+    except (Refused, ValueError, RecursionError):
+        raise Refused("slot-state-unreadable", a.slot.tag) from None
     return st.state == "leased" and st.session == a.session and st.lease_seq == a.lease_seq
 
 
 def confirm_identity(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
-    """§5.1 ``confirm-identity <session> yes|no``. In order: the operator only (the grammar already refuses
-    ``_levain_dispatch``); the caller's alloc (:func:`runtime_helper.read_alloc`), kind ``login`` (else
+    """§5.1 ``confirm-identity <session> yes|no``. In order: a session and a yes|no answer (``no-session``,
+    ``bad-answer``: refused, never asserted, though the grammar already checks both); the operator only (the grammar
+    already refuses ``_levain_dispatch``); the caller's alloc (:func:`runtime_helper.read_alloc`), kind ``login`` (else
     ``confirm-kind:<kind>``); the session lock (TRY, ``session-busy``: END takes the same one, so a baseline write and
     the park never overlap); the record running (``not-active:<state>``). ``no`` ends there, writing nothing.
     ``yes``: the record's ``identity.observed_id`` (else ``no-observed-id[:<result>]``); the slot's state still names
-    this lease (else ``slot-lease-moved``); the field-only CAS of ``identity`` = ``{observed_id, result: confirmed}``
-    at the generation read (the lease proof, and the id is the one CONTROL holds at that generation); then the
-    baseline written. A crash between the CAS and the write leaves no baseline, and ``yes`` again writes it."""
-    assert req.session is not None and req.answer in ("yes", "no")
+    this lease (else ``slot-lease-moved``; a state file that does not parse, ``slot-state-unreadable``); the
+    field-only CAS of ``identity`` = ``{observed_id, result: confirmed}`` at the generation read (the lease proof,
+    and the id is the one CONTROL holds at that generation); then the baseline written, and the answer says so
+    (``{baseline: written}``). A crash between the CAS and the write leaves no baseline, and ``yes`` again writes
+    it."""
+    if req.session is None:
+        raise Refused("no-session", "confirm-identity names its session")
+    if req.answer not in ("yes", "no"):
+        raise Refused("bad-answer", "confirm-identity wants yes|no")
     if ctx.caller != OPERATOR:
         raise Refused("verb-not-allowed-for-caller", "confirm-identity is the operator's")
     a = H.read_alloc(ctx, req.session)
@@ -235,9 +246,9 @@ def confirm_identity(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, o
         ctx.call("CAS", session=a.session, generation=rec.generation, **{"from": rec.state, "to": rec.state},
                  fields={"identity": {"observed_id": oid, "result": CONFIRMED}})
         ctx.store.replace(("slots", a.slot.tag), BASELINE_NAME, data, mode=BASELINE_MODE)
-    return {}
+    return {"baseline": BASELINE_WRITTEN}
 
 
-__all__ = ["BASELINE_FORMAT", "BASELINE_KEYS", "CONFIRMED", "IDENTITY_CALLS", "LOGIN_FAILED", "NOT_A_CHECK",
-           "baseline_bytes", "baseline_vendor", "check_baseline", "confirm_identity", "identity_call",
+__all__ = ["BASELINE_FORMAT", "BASELINE_KEYS", "BASELINE_WRITTEN", "CONFIRMED", "IDENTITY_CALLS", "LOGIN_FAILED",
+           "NOT_A_CHECK", "baseline_bytes", "baseline_vendor", "check_baseline", "confirm_identity", "identity_call",
            "record_login_identity"]

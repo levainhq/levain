@@ -105,7 +105,7 @@ def test_confirm_yes_writes_the_baseline_from_the_record(env):
     w, la, _ = env
     s = _login(w, la, "codex")
     n = len(w.calls)
-    assert w.main(["confirm-identity", s, "yes"])[1] == {"ok": True}
+    assert w.main(["confirm-identity", s, "yes"])[1] == {"ok": True, "baseline": "written"}
     data = _baseline(w).read_bytes()
     assert canon.parse(data) == {"format": "levain-baseline/1", "vendor": "codex", "observed_id": "not-a-check",
                                  "confirmed_at": R.timestamp(w.seams.clock()), "session": s}
@@ -230,7 +230,7 @@ def test_a_crash_between_the_cas_and_the_write_is_finished_by_a_second_yes(env, 
     assert not _baseline(w).exists()
     assert w.state(s).fields["identity"]["result"] == "confirmed"
     monkeypatch.setattr(H.Store, "replace", real)
-    assert w.main(["confirm-identity", s, "yes"])[1] == {"ok": True}
+    assert w.main(["confirm-identity", s, "yes"])[1] == {"ok": True, "baseline": "written"}
     assert canon.parse(_baseline(w).read_bytes())["session"] == s
 
 
@@ -296,10 +296,13 @@ class _Sup(SV.Supervisor):
         self.prompts: list[str] = []
         self.calls: list[tuple] = []
         self.said: list[str] = []
-        self.reply: object = {}
-        self._vendor_exit = 0
+        self.reply: object = {"baseline": "written"}
+        #: what ``status <session>`` answers as root's record (1027-18 idg1fx X6); its call is not recorded in calls
+        self.identity = {"observed_id": "not-a-check"} if vendor == "codex" else {"result": "identity-call-unbuilt"}
 
     def helper(self, *args, stdin=b"", stoppable=True):
+        if args[0] == "status":
+            return {"records": [], "identity": self.identity}
         self.calls.append(args)
         if isinstance(self.reply, Refused):
             raise self.reply
@@ -351,7 +354,7 @@ def test_supervisor_confirm_refusal_is_said_not_raised():
 
 def test_supervisor_failed_login_is_not_asked():
     sup = _Sup("codex", True)
-    sup._vendor_exit = 1
+    sup.identity = {"result": "login-exit-nonzero"}
     sup._confirm_identity("s-0000000000000001")
     assert sup.calls == [] and sup.prompts == []
 
@@ -418,19 +421,22 @@ def _creds(tmp_path, token="tok-SECRET-123"):
     cfg = tmp_path / "claude"
     cfg.mkdir()
     (cfg / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": token}}))
-    return {"CLAUDE_CONFIG_DIR": str(cfg)}
+    return {"CLAUDE_CONFIG_DIR": str(cfg), "HTTPS_PROXY": "http://127.0.0.1:9"}
 
 
 def _run_child(env, url):
-    """The child's main (its exit and stdout line) aimed at ``url`` instead of the real profile endpoint."""
+    """The child's main (its exit and stdout line) aimed at ``url`` instead of the real profile endpoint, with that
+    url's origin standing in for :data:`IC.ORIGIN`. The plain-http fake server is reached directly: ``HTTPS_PROXY``
+    is present (the child requires one) but ``ProxyHandler`` maps only https to it."""
     import io
     out = io.StringIO()
-    real = IC.fetch
+    real, origin = IC.fetch, IC.ORIGIN
     IC.fetch = lambda e, **kw: real(e, url=url)
+    IC.ORIGIN = IC._origin(url)
     try:
         code = IC.main(env=env, out=out)
     finally:
-        IC.fetch = real
+        IC.fetch, IC.ORIGIN = real, origin
     return code, out.getvalue().encode()
 
 
@@ -465,7 +471,7 @@ def test_a_bad_profile_body_is_unparsable(tmp_path, profile_server, body, monkey
 
 
 def test_no_credential_no_request(tmp_path, profile_server):
-    code, out = _run_child({"CLAUDE_CONFIG_DIR": str(tmp_path)}, profile_server)
+    code, out = _run_child({"CLAUDE_CONFIG_DIR": str(tmp_path), "HTTPS_PROXY": "http://127.0.0.1:9"}, profile_server)
     assert (code, json.loads(out)) == (1, {"error": "no-token"}) and _Profile.seen == []
     with pytest.raises(Refused):
         ID.parse_profile_answer(code, out)
