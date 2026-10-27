@@ -201,7 +201,7 @@ FULL_BAR = ("(() => { %s"
             " return { sw: vw.scrollWidth, cw: vw.clientWidth, unitLeft: Math.round(u.left), tabsRight: Math.round(t.right), readoutRight: Math.round(ro.right), mastRight: Math.round(m.right),"
             " nameCut: n.scrollWidth > n.clientWidth, unitW: Math.round(u.width), nat, nameW: n.clientWidth, jarCut: jl ? jl.scrollWidth > jl.clientWidth : null }; }); })()")
 # the width thresholds below were measured with macOS's native font; any other platform's default font is as wide as the forced Verdana
-# (CI's Linux Chrome at 1041 puts unitLeft 455 against tabsRight 509; Verdana here puts 453 against 508), so there a "native" case takes the wide-font thresholds
+# (CI's Linux Chrome at 1041, under the old 1040 breakpoint, put unitLeft 455 against tabsRight 509), so there a "native" case takes the wide-font thresholds
 def _wide(font: str) -> bool:
     return bool(font) or sys.platform != "darwin"
 
@@ -241,8 +241,8 @@ JAR_ICON = ("(() => { const s = document.querySelector('#jar svg').getBoundingCl
 
 
 @needs_browser
-@pytest.mark.parametrize("font, width", [("", 1041), ("", 1100), ("", 1180), (VERDANA, 1100), (VERDANA, 1180)],
-                         ids=["native-1041", "native-1100", "native-1180", "verdana-1100", "verdana-1180"])
+@pytest.mark.parametrize("font, width", [("", 1101), ("", 1180), (VERDANA, 1101), (VERDANA, 1180)],
+                         ids=["native-1101", "native-1180", "verdana-1101", "verdana-1180"])
 def test_the_jar_icon_keeps_its_room_and_never_overlaps_the_indicators(tmp_path: Path, width: int, font: str) -> None:
     out = _run(tmp_path, [{"eval": FULL_BAR % (font, REAL_JAR)}, {"eval": JAR_ICON}], width=width)
     icon = out[-1]
@@ -250,22 +250,20 @@ def test_the_jar_icon_keeps_its_room_and_never_overlaps_the_indicators(tmp_path:
     assert icon["svgRight"] <= icon["indLeft"], icon                       # the icon ends before the live/status cluster begins
 
 
-# the Calm control beside the name, from just above the stacked breakpoint to a wide bar (Verdana from 1100: its 1041 bar overflows on main too)
+# the Calm control beside the name, from just above the stacked breakpoint to a wide bar, in either font
 CALM = ("(() => { const b = document.getElementById('calmbtn'), r = b.getBoundingClientRect(); b.focus();"
         " const cs = getComputedStyle(b), pb = getComputedStyle(b, '::before'), g = document.createElement('span'); g.textContent = '\u2248'; g.style.cssText = 'font:' + pb.font + ';letter-spacing:' + pb.letterSpacing + ';padding:0;margin:0;border:0'; b.appendChild(g); const em = g.getBoundingClientRect().width; g.remove(); return { label: cs.fontSize, w: Math.round(r.width), bound: Math.ceil(parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth) + em), name: b.getAttribute('aria-label'), title: b.title, focused: document.activeElement === b, shown: r.width > 0 }; })()")
 
 
 @needs_browser
-@pytest.mark.parametrize("font, width", [("", 1041), ("", 1100), ("", 1180), ("", 1280), ("", 1281), ("", 1340), ("", 1440),
-                                         (VERDANA, 1100), (VERDANA, 1180), (VERDANA, 1280), (VERDANA, 1340), (VERDANA, 1440)],
-                         ids=[f"{n}-{w}" for n, w in [("native", 1041), ("native", 1100), ("native", 1180), ("native", 1280), ("native", 1281), ("native", 1340), ("native", 1440),
-                                                      ("verdana", 1100), ("verdana", 1180), ("verdana", 1280), ("verdana", 1340), ("verdana", 1440)]])
+@pytest.mark.parametrize("font, width", [("", 1101), ("", 1180), ("", 1280), ("", 1281), ("", 1340), ("", 1440),
+                                         (VERDANA, 1101), (VERDANA, 1180), (VERDANA, 1280), (VERDANA, 1340), (VERDANA, 1440)],
+                         ids=[f"{n}-{w}" for n, w in [("native", 1101), ("native", 1180), ("native", 1280), ("native", 1281), ("native", 1340), ("native", 1440),
+                                                      ("verdana", 1101), ("verdana", 1180), ("verdana", 1280), ("verdana", 1340), ("verdana", 1440)]])
 def test_calm_beside_the_name_never_overflows_the_bar_and_keeps_its_name_as_an_icon(tmp_path: Path, width: int, font: str) -> None:
     out = _run(tmp_path, [{"eval": FULL_BAR % (font, NO_JAR)}, {"eval": CALM}], width=width)
     geo, calm = out[-2], out[-1]
-    assert geo["sw"] <= geo["cw"] and geo["readoutRight"] <= geo["mastRight"], geo
-    if not (_wide(font) and width < 1100):                                   # a wide font's 1041 bar overlaps the tabs on main too (see CALM's note)
-        assert geo["unitLeft"] >= geo["tabsRight"], geo
+    assert geo["sw"] <= geo["cw"] and geo["unitLeft"] >= geo["tabsRight"] and geo["readoutRight"] <= geo["mastRight"], geo
     if width >= (1180 if _wide(font) else 1100):
         assert geo["unitW"] > 0, geo                                         # the name is not squeezed out entirely (it was at 1100 native with the labelled button)
     assert calm["shown"] and calm["focused"] and calm["name"] in ("Calm off", "Calm on") and calm["title"] == calm["name"], calm
@@ -486,7 +484,7 @@ CALM_ON = ("(() => { const b = document.getElementById('calmbtn'), bg = () => ge
 
 @needs_browser
 def test_calm_on_in_the_icon_band_has_the_filled_background_of_the_theme_switchs_pressed_button(tmp_path: Path) -> None:
-    got = _run(tmp_path, [{"eval": CALM_ON}], width=1100)[-1]
+    got = _run(tmp_path, [{"eval": CALM_ON}], width=1180)[-1]
     assert got["offPressed"] == "false" and got["onPressed"] == "true", got
     assert got["theme"], got
     assert got["on"] != got["off"], got
