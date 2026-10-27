@@ -452,11 +452,54 @@ def _header(headers: Sequence[Tuple[bytes, bytes]], name: bytes) -> bytes:
     return b""
 
 
+#: the largest response body `upstream_error` reads, and its field shapes
+UPSTREAM_ERROR_BODY_MAX = 8192
+UPSTREAM_ERROR_MESSAGE_MAX = 200
+_ERR_TYPE = re.compile(r"[a-z_]{1,64}")
+_ERR_REQUEST_ID = re.compile(r"req_[A-Za-z0-9]{1,64}")
+_ERR_TOKENISH = re.compile(r"[A-Za-z0-9_-]{20,}")
+
+
+def _json_media(content_type: bytes) -> bool:
+    """True for a content-type whose media type is application/json (parameters ignored)."""
+    return content_type.split(b";", 1)[0].strip().lower() == b"application/json"
+
+
+def upstream_error_of(body: bytes, scanner: Scanner) -> Optional[dict]:
+    """The exchange record's `upstream_error` for an error response's whole `body`: `{"type", "message",
+    "request_id"}` read from the vendor's JSON error, or None when the body is not that. `type` is kept only when it
+    is `[a-z_]{1,64}` (else None), `message` is cut to UPSTREAM_ERROR_MESSAGE_MAX characters, scanned as one block by
+    the exchange's own `scanner` (its count is left as the relay made it) and has every run of 20 or more
+    `[A-Za-z0-9_-]` characters replaced by `<redacted>`, `request_id` is kept only when it is `req_[A-Za-z0-9]{1,64}`."""
+    try:
+        doc = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    err = doc.get("error") if type(doc) is dict else None
+    if type(err) is not dict:
+        return None
+    typ = err.get("type")
+    typ = typ if type(typ) is str and _ERR_TYPE.fullmatch(typ) else None
+    msg = err.get("message")
+    if type(msg) is str:
+        before = scanner.count
+        scanned, _ = scanner.value(msg[:UPSTREAM_ERROR_MESSAGE_MAX].encode("utf-8"))
+        scanner.count = before   # the same bytes were already counted when the relay scanned the body
+        msg = _ERR_TOKENISH.sub("<redacted>", scanned.decode("utf-8", "replace"))
+    else:
+        msg = None
+    rid = doc.get("request_id")
+    rid = rid if type(rid) is str and _ERR_REQUEST_ID.fullmatch(rid) else None
+    if typ is None and msg is None:
+        return None
+    return {"type": typ, "message": msg, "request_id": rid}
+
+
 def new_record(session: str, q: dict) -> dict:
     """An exchange's gw.jsonl record as admission makes it: names and counts only, never a value of the request."""
     return {"session": session, "slot": None, "route": q["route"], "method": q["method"], "template": None,
             "status": None, "refused": None, "bytes_up": 0, "bytes_down": 0, "upstream_address": None,
-            "redactions": 0, "t0": time.monotonic()}
+            "redactions": 0, "upstream_error": None, "t0": time.monotonic()}
 
 
 class GwLog:
@@ -2334,7 +2377,9 @@ class Keys:
                 await conn.writer.drain()
                 reader = meter[0].usage(_header(resp.headers, b"content-type"), meter[2])
                 conn.usage = reader   # a cut relay's lineage row reads what the response said (H6-6)
-                await self._relay_body(conn, up, hconn, scanner, rec, reader)
+                await self._relay_body(conn, up, hconn, scanner, rec, reader,
+                                       errors=resp.status_code >= 400
+                                       and _json_media(_header(resp.headers, b"content-type")))
                 return not conn.detached   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it
 
             if not await self._against_front(ff, side, up, work()):
@@ -2582,17 +2627,23 @@ class Keys:
         return out
 
     async def _relay_body(self, conn: Conn, up: Upstream, hconn: "h11.Connection", scanner: Scanner,
-                          rec: dict, reader: "codec.UsageReader") -> None:
+                          rec: dict, reader: "codec.UsageReader", errors: bool = False) -> None:
         """`b`* `e`: each body read relayed at once through the scanner (no buffering but the held possible start of a
         secret), each frame drained before the next read, so a slow front pauses the upstream's reader. Each read is
         handed to the usage `reader` first, which keeps its own bounded side copy and never changes or holds the
         relayed bytes. A detached exchange relays nothing more: `detached` is checked before every frame, after each
-        read and each drain."""
+        read and each drain. `errors` (an error status with a JSON body) keeps a side copy of the body up to
+        UPSTREAM_ERROR_BODY_MAX bytes for the record's `upstream_error`; a longer body has none."""
         w = conn.writer
+        side: Optional[bytearray] = bytearray() if errors else None
         while True:
             part = await upstream_step(upstream.read_body(up, hconn, self.idle_s))
             if part is not None:
                 reader.feed(part)
+                if side is not None:
+                    side += part
+                    if len(side) > UPSTREAM_ERROR_BODY_MAX:
+                        side = None
             out = scanner.feed(part) if part is not None else scanner.flush()
             for i in range(0, len(out), BODY_FRAME):
                 if conn.detached:
@@ -2603,6 +2654,8 @@ class Keys:
                 await w.drain()
             if part is None:
                 break
+        if side is not None:
+            rec["upstream_error"] = upstream_error_of(bytes(side), scanner)
         if conn.detached:
             return
         w.write(gwwire.encode(b"e"))
