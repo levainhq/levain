@@ -53,7 +53,7 @@ from levain.autonomic.confirm import (
 )
 from levain.autonomic.coverage import (
     COVER_MOVED, COVER_NONE, CoverageSource, CoverageView, Effect, EffectiveCover, GraduationPolicy, Uncovered,
-    guard_problem, operative,
+    covered, guard_problem, operative,
 )
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
@@ -725,6 +725,8 @@ class EfferentGate:
         if clamped is not None and cover is not None and cover != COVER_NONE:
             check = self._fire_check(request, clamped, cover)
             if check.kind is _Check.KILL:
+                # ``by`` is the receipt's decider (the frozen human | binding | on-loop enum), as for the binding's
+                # own kill; the policy whose guard tripped is named in the reason, which the run's cancel carries
                 kill_by = "binding" if request.authority.grantor == "binding" else "on-loop"
                 _log.warning("efferent gate KILL: %r — %s", request.action_name, check.reason)
                 return self._kill(request, created_at, posture, kill_by, request.actor_first_estimate,
@@ -2005,10 +2007,14 @@ class EfferentGate:
         """The fire check of an effect the clamp covered at cover value ``decided`` (1026-20 RULINGS R13-2: typed,
         in this order): ``peek_cover`` at a fresh clock read; a cover that moved or cannot be read is TRANSIENT
         (``cover:moved``); a value other than ``decided`` is STALE (``cover:stale``); then REFUSE when no policy
-        authorizes the value (``no_authorizing_policy``, G1-2), when its guard is incomplete
-        (``grant_guard_incomplete``), when there is no trigger event to evaluate it on
+        authorizes the value (``no_authorizing_policy``, G1-2: the peek names none, or one whose cover value is not
+        the seen value, whose lowest rung is not the seen rung, or that does not cover ``effect``), when its guard
+        is incomplete (``grant_guard_incomplete``), when there is no trigger event to evaluate it on
         (``guard_unevaluable:no_event``) or an evaluation raises (``guard_unevaluable:predicate``); KILL when an
-        entry's kill trips on the event (``kill_trips``: UNKNOWN trips); else PERMIT. Never raises."""
+        entry's kill trips on the event (``kill_trips``: UNKNOWN trips); else PERMIT. Never raises.
+
+        Only the one policy the peek names is evaluated: the policy whose cover value the decision was made under.
+        Any other policy covering the same effect neither authorizes this fire nor guards it."""
         source = self._coverage
         try:
             now = self._clock()
@@ -2021,7 +2027,14 @@ class EfferentGate:
         if seen.value != decided:
             return _FireCheck(_Check.STALE, "cover:stale")
         grant = seen.policy
-        if not isinstance(grant, GraduationPolicy):
+        # the policy must itself give this value at this rung and sign this action at this risk: a policy the peek
+        # names beside the value is not taken on the source's word
+        try:
+            authorizes = (isinstance(grant, GraduationPolicy) and grant.cover_value == seen.value
+                          and grant.lowest_posture == seen.posture and covered(grant, effect))
+        except Exception:  # noqa: BLE001 — a policy that cannot be checked authorizes nothing
+            authorizes = False
+        if not authorizes:
             return _FireCheck(_Check.REFUSE, "no_authorizing_policy")
         try:
             guard = grant.guard

@@ -23,12 +23,12 @@ import pytest
 import levain.autonomic.gate as gate_module
 from levain.autonomic import Posture, RunRef
 from levain.autonomic.binding import binding_invocation
-from levain.autonomic.coverage import COVER_MOVED, EffectiveCover
+from levain.autonomic.coverage import COVER_MOVED, Cover, EffectiveCover
 from levain.autonomic.journal import EffectStatus, EffectOutcome
 
 pytest.importorskip("cryptography")
-from tests.autonomic_test_only_coverage import TEST_GUARD  # noqa: E402
-from tests.test_autonomic_gate_coverage import CWorld, _covering  # noqa: E402
+from tests.autonomic_test_only_coverage import STORE, TEST_GUARD, policy  # noqa: E402
+from tests.test_autonomic_gate_coverage import EXPIRES, CWorld, _covering  # noqa: E402
 from tests.test_autonomic_journal_wiring import LOW, _single_builder  # noqa: E402
 from tests.test_graduation_journey import Journey  # noqa: E402
 
@@ -165,3 +165,78 @@ def test_journal_stop_maps_a_held_not_started_to_held(tmp_path):
                                Posture.ON_LOOP)
     assert out.held and not out.refused and not out.fired and out.hold_id == "h-1"
     assert out.reason == "journal:held:not_started:busy"
+
+
+# --- codex L3 r1 MED: the policy beside the cover value must itself authorize THIS fire -----------------------------
+# On ae2695c8 each arm below FIRED link0: the check evaluated the guard of whatever policy the peek named beside the
+# decided value, without asking whether that policy gives the value, at that rung, for this action at this risk.
+
+_OTHER = policy("gp-b", {"evil": LOW}, expires_at=EXPIRES, guard=QUIET)   # signs another action
+
+
+class _Forged:
+    """A source whose every cover names ``_OTHER`` and ``_OTHER``'s own cover value, for any declared effect: the
+    clamp covers link0 under that value, and the peek names a policy that does not sign link0."""
+
+    token = ((0, ""), "", STORE)
+
+    def cover(self, effect, now):
+        if effect.action_risk is None:
+            return Cover(None, "none")
+        return Cover(Posture.ON_LOOP, _OTHER.cover_value, _OTHER)
+
+    def refresh(self):
+        return self
+
+    def peek(self, effect, now):
+        return self.cover(effect, now).value
+
+    def peek_cover(self, effect, now):
+        c = self.cover(effect, now)
+        return EffectiveCover(c.value, c.posture, c.policy)
+
+
+def test_a_policy_that_does_not_sign_the_effect_authorizes_no_fire(tmp_path):
+    w = CWorld(tmp_path, coverage=_Forged())
+    w.binding = w.mint(Posture.ON_LOOP)
+    d = w.dispatch("forged")
+    assert not d.outcome.fired and d.outcome.refused and d.outcome.reason == "no_authorizing_policy"
+    assert w.outbox() == []
+
+
+def test_a_policy_other_than_the_one_that_gives_the_value_authorizes_no_fire(tmp_path, monkeypatch):
+    w, src = _world(tmp_path)
+    real = src.peek_cover
+    monkeypatch.setattr(src, "peek_cover", lambda e, now: dataclasses.replace(real(e, now), policy=_OTHER))
+    d = w.dispatch("swapped")
+    assert not d.outcome.fired and d.outcome.refused and d.outcome.reason == "no_authorizing_policy"
+    assert w.outbox() == []
+
+
+def test_a_policy_whose_lowest_rung_is_not_the_seen_rung_authorizes_no_fire(tmp_path, monkeypatch):
+    w, src = _world(tmp_path)
+    real = src.peek_cover
+    monkeypatch.setattr(src, "peek_cover",
+                        lambda e, now: dataclasses.replace(real(e, now), posture=Posture.ABOVE_LOOP))
+    d = w.dispatch("rung")
+    assert not d.outcome.fired and d.outcome.refused and d.outcome.reason == "no_authorizing_policy"
+    assert w.outbox() == []
+
+
+# --- deepseek L3 r1 MED: where a policy-guard kill is recorded -----------------------------------------------------
+# Measured, not changed: the clamp never lowers a rung (a covered rung is the stricter of the candidate and the
+# policy's lowest), so the kill is recorded at the rung the effect would have run at, never below the binding's own.
+# ``gate.by`` is the receipt's frozen decider enum (human | binding | on-loop); the policy is named in the kill's
+# reason, which the run's cancel row carries.
+
+def test_a_policy_guard_kill_is_recorded_at_the_covered_rung_and_names_the_policy(tmp_path):
+    w = CWorld(tmp_path, coverage=_covering("link0", lowest="COOLING_OFF", guard=TRIPS))
+    w.binding = w.mint(Posture.ON_LOOP)
+    o = w.dispatch("killed").outcome
+    assert o.killed and not o.fired and w.outbox() == []
+    assert o.posture is Posture.COOLING_OFF                     # the policy's rung, stricter than the binding's
+    assert o.reason == "policy_guard_kill:gp-a:guard_0_tripped"
+    assert [r for _, r in _cancels(w)] == ["killed:" + o.reason]
+    [rec] = w.receipts.read()
+    assert rec.action_face["terminal_state"] == "killed"
+    assert rec.action_face["gate"] == {"verdict": "denied", "by": "binding", "binding_id": w.binding.binding_id}

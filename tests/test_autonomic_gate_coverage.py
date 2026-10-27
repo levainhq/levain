@@ -193,17 +193,19 @@ def test_authority_moving_between_decision_and_admission_is_stale_then_held(tmp_
         mover = lambda: src.set_root(root_file())                           # noqa: E731 — the signer gone
     else:
         mover = lambda: setattr(w, "now", EXPIRES)                          # noqa: E731 — it lapses
-    real = src.peek_cover
+    real = w.gate._fire_check
+    moved: list[bool] = []
 
-    def peek_then_move(effect, now):
-        # the authority moves right after the fire check's peek (A1c2), so the admission's fence reads the move
-        got = real(effect, now)
-        if src.peeks == 1:
+    def check_then_move(*args):
+        # the authority moves right after the fire check (A1c2), once, so the admission's fence reads the move
+        got = real(*args)
+        if not moved:
+            moved.append(True)
             mover()
         return got
-    src.peek_cover = peek_then_move
+    w.gate._fire_check = check_then_move
     first = w.dispatch("s1").outcome
-    assert first.held and first.reason == "journal:stale" and not first.fired
+    assert moved and first.held and first.reason == "journal:stale" and not first.fired
     again = w.dispatch("s1").outcome                                         # decided again, under what holds now
     assert again.pending and again.posture is Posture.CONFIRM and not again.fired
     assert w.outbox() == []
