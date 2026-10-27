@@ -220,6 +220,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   a plainly written address.
 
 ### Fixed
+- **A brokered call the vendor refuses now records the vendor's error in the gateway log** (`upstream_error` in
+  `gw.jsonl`: the error type, a short message and the request id, with any configured credential redacted), so a
+  refusal such as a 400 says why instead of only its status.
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
   refilled,** so a keys failure cannot leave the pool short.
 - **Two sessions making their first call at the same moment on a fresh install could both be refused with
