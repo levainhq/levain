@@ -155,11 +155,11 @@ def _call(argv: List[str], *, env: Dict[str, str], timeout: float, retry_timeout
     """One program run with a bounded wait; ``retry_timeout`` runs it once more on a timeout. Raises
     ``subprocess.TimeoutExpired`` or ``OSError``.
 
-    :func:`levain.hands_live.run_bounded`, with this module's ``Popen`` and :data:`_REAP_TIMEOUT`: a probe's child
-    is sudo, whose kill from the operator uid can be refused, so no wait after the kill is unbounded; a child left
-    running is the caller's to stop (the plan sweeps the hands user)."""
+    :func:`levain.hands_live.run_bounded`, with :data:`_REAP_TIMEOUT`: a probe's child is sudo, whose kill from the
+    operator uid can be refused, so no wait after the kill is unbounded; a child left running is the caller's to stop
+    (the plan sweeps the hands user)."""
     return run_bounded(argv, env=env, timeout=timeout, retry_timeout=retry_timeout, stdin=stdin,
-                       reap_timeout=_REAP_TIMEOUT, popen=subprocess.Popen)
+                       reap_timeout=_REAP_TIMEOUT)
 
 
 def acl_problem(paths: List[str], *, host: str) -> Optional[str]:
