@@ -288,6 +288,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   guard is refused at signing instead of the check crashing.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- **The autonomic store can keep every attempt of an effect (store format /3).** A retry carries the authority of the
+  attempt before it (the same grant and cover); an attempt on a held link carries the hold's current decision, names
+  who decided (a person or not) as that decision does, and fires no lower than the rung it decided. An attempt that
+  never started is closed as refused, with its reason. The store refuses an unknown actor or posture and a run with no
+  id. Nothing writes a /3 store yet.
 - **A step a graduation policy covers is checked again just before it fires.** Once the binding driver is wired, the
   step about to run reads its cover afresh: if the cover changed since the step was decided, or cannot be read, the
   step is held and no receipt is written. The run is refused and ended when the policy does not sign this action at this risk, cover value
