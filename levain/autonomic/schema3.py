@@ -303,8 +303,8 @@ _HELD_DECISION = (
     "OR (h.decided_posture IS NOT NULL AND json_type(NEW.seal, '$.decision.posture') = 'text' "
     "AND json_extract(NEW.seal, '$.decision.posture') = h.decided_posture)))")
 # R3-1 as amended by R4-2: with no hold, the retry re-uses P's cover (both grant-less and cover-less, or the same cover
-# text) at a posture rank no lower than P's (both ranks known), and a human P's retry is human (10.Q2(b): R2-2 replaced
-# it only for a link with a hold; both `by` typed text)
+# text) at a posture rank no lower than P's (both ranks known), and a human P's retry is human (10.Q2(b), in the note's
+# own NULL-safe words: R2-2 replaced it only for a link with a hold)
 _HOLDLESS_AUTHORITY = (
     f"EXISTS (SELECT 1 {_PREV} AND (({_absent('NEW.seal', '$.grant')} AND {_absent('p.seal', '$.grant')} "
     f"AND {_absent('NEW.seal', '$.cover')} AND {_absent('p.seal', '$.cover')}) "
@@ -313,10 +313,19 @@ _HOLDLESS_AUTHORITY = (
     "AND json_type(NEW.seal, '$.posture') = 'text' AND json_type(p.seal, '$.posture') = 'text' "
     f"AND {_rank('NEW.seal')} IS NOT NULL AND {_rank('p.seal')} IS NOT NULL "
     f"AND {_rank('NEW.seal')} >= {_rank('p.seal')} "
-    "AND json_type(NEW.seal, '$.by') = 'text' AND json_type(p.seal, '$.by') = 'text' "
-    "AND (json_extract(p.seal, '$.by') != 'human' OR json_extract(NEW.seal, '$.by') = 'human'))")
+    "AND (json_extract(p.seal, '$.by') IS NOT 'human' OR json_extract(NEW.seal, '$.by') IS 'human'))")
+
+# S1: the hold on the link approves this attempt's payload (decided 1 is an approval, 0 a rejection: V _decide_in)
+_HOLD_APPROVES = ("EXISTS (SELECT 1 FROM holds h WHERE h.run_id = NEW.run_id AND h.effect_id = NEW.effect_id "
+                  "AND h.decided IS 1 AND h.digest = NEW.digest)")
 
 RETRY_TRIGGERS = (
+    # S1: ANY attempt of a held link, attempt 1 included, runs only under that hold's approval of its own payload (an
+    # open, reopened or rejected hold, or one for another digest, admits nothing); a retry also needs the decision in
+    # its seal (effects_attempt_authority)
+    _abort("effects_held_link", f"{_LINK_HELD} AND NOT IFNULL({_HOLD_APPROVES}, 0)",
+           "S1: an attempt on a held link runs only under the approval of its hold for that payload",
+           "BEFORE INSERT ON effects"),
     # section 5: attempt 1 opens a link (no row yet); attempt n > 1 follows the link's LATEST row, attempt n - 1,
     # ended not_started, of the same digest (a retry after fired / outcome_unknown, or of another payload, is refused)
     _abort("effects_attempt", "NOT IFNULL(CASE WHEN NEW.attempt = 1 THEN NOT EXISTS (SELECT 1 FROM effects e "
@@ -841,9 +850,11 @@ ADOPTED = "adopted"
 IN_FLIGHT = "in_flight"
 
 
-# the longest attempt suffix read: an attempt is an SQLite INTEGER (10**18 < 2**63), and int() of a digit run past
-# sys.get_int_max_str_digits() raises ValueError, never the IntegrityError a malformed subject gets (F7)
-_ATTEMPT_DIGITS = 18
+# an attempt is an SQLite INTEGER, so at most _ATTEMPT_MAX; a suffix is read only to its digit count (len(str()) of
+# the top) so int() never meets a digit run past sys.get_int_max_str_digits(), whose ValueError is not the
+# IntegrityError a malformed subject gets (F7, H3)
+_ATTEMPT_MAX = 2 ** 63 - 1
+_ATTEMPT_DIGITS = len(str(_ATTEMPT_MAX))
 
 
 def _attempt_tail(s: str) -> str | None:
@@ -858,27 +869,28 @@ def effect_subject(run_id: str, effect_id: str, attempt: int = 1) -> str:
     :func:`_effect_key` splits it back). The subject is split at its FIRST colon (here, in the journal, in the store's
     triggers), so a run id holds no colon (``runs_sealed`` refuses one too) and may hold ``#``. The attempt is read
     only as a trailing ``#<digits>``, so an effect id may hold colons and ``#``, but never END in ``#<digits>``.
-    ``attempt`` is an int >= 1, never a bool."""
+    ``attempt`` is an int from 1 to SQLite's INTEGER top, never a bool."""
     if not run_id or ":" in run_id:
         raise ValueError(f"run id {run_id!r} is empty or holds a colon: an effect subject would split ambiguously")
     if not effect_id or _attempt_tail(effect_id) is not None:
         raise ValueError(f"effect id {effect_id!r} is empty or ends in '#<digits>': an effect subject would split "
                          "ambiguously")
-    if type(attempt) is not int or attempt < 1:
-        raise ValueError(f"attempt {attempt!r} is not an int >= 1")
+    if type(attempt) is not int or not 1 <= attempt <= _ATTEMPT_MAX:
+        raise ValueError(f"attempt {attempt!r} is not an int from 1 to {_ATTEMPT_MAX}")
     return f"effect:{run_id}:{effect_id}" + (f"#{attempt}" if attempt > 1 else "")
 
 
 def _effect_key(subject: str) -> tuple[str, str, int]:
     # ``effect:<run_id>:<effect_id>[#<n>]`` -> (run_id, effect_id, attempt), effect_subject's inverse: a subject that
     # does not split, or an attempt spelled another way than effect_subject spells it (``#1``, ``#02``, a digit run
-    # longer than _ATTEMPT_DIGITS), is refused as the store refuses a bad row
+    # longer than _ATTEMPT_DIGITS or past _ATTEMPT_MAX), is refused as the store refuses a bad row
     run_id, sep, rest = subject[7:].partition(":")
     n = _attempt_tail(rest)
     effect_id, attempt = rest, 1
     if n is not None:   # 0 stands for a non-canonical spelling, refused below
         effect_id = rest[:-len(n) - 1]
         attempt = int(n) if len(n) <= _ATTEMPT_DIGITS and n[0] != "0" else 0
+        attempt = attempt if attempt <= _ATTEMPT_MAX else 0
     if not (run_id and sep and effect_id) or _attempt_tail(effect_id) is not None or (n is not None and attempt < 2):
         raise sqlite3.IntegrityError(f"R13-1: malformed effect subject {subject!r}")
     return run_id, effect_id, attempt
@@ -1371,21 +1383,23 @@ def count_held(conn: sqlite3.Connection, subject: str, reason: str, *, attempt: 
 
     O-p2-1: ``attempt`` is the link attempt whose not_started close this count records (the witness a retry of the
     next attempt needs, R2-1); one that is not the link's latest, not_started attempt raises ValueError before any
-    write (the held triggers refuse it too). A count of an attempt the row already names at the same mark returns the
-    stored count and writes nothing (R3-3). A count with no attempt keeps the attempt the row names (P1)."""
+    write and before the stored-count return (the held triggers refuse it too). A count of an attempt the row already
+    names at the same mark returns the stored count and writes nothing (R3-3). A count with no attempt keeps the
+    attempt the row names (P1)."""
     _in_write(conn, "count_held")
     if not isinstance(reason, str) or conn.execute("SELECT ? GLOB ?", (reason, SUBJECT_REASON)).fetchone()[0] != 1:
         raise ValueError(f"count_held: reason {reason!r} is not {SUBJECT_REASON!r} (a subject-specific fault)")
-    if attempt is not None and (type(attempt) is not int or attempt < 1):
-        raise ValueError(f"count_held: attempt {attempt!r} is not an int >= 1")
+    if attempt is not None and (type(attempt) is not int or not 1 <= attempt <= _ATTEMPT_MAX):
+        raise ValueError(f"count_held: attempt {attempt!r} is not an int from 1 to {_ATTEMPT_MAX}")
     mark = conn.execute(f"SELECT {_progress(':s')}", {"s": subject}).fetchone()[0]
-    row = conn.execute("SELECT n, mark, attempt FROM held_counts WHERE subject = ?", (subject,)).fetchone()
-    if attempt is not None and row is not None and row[2] == attempt and row[1] == mark:
-        return row[0]
-    # F12: the triggers' own witness, asked first, so a stale attempt is a caller fault (ValueError), not a store one
+    # F12 + H2: the triggers' own witness, asked before the R3-3 return below and before any write, so a stale
+    # attempt is a caller fault (ValueError), not a store one, even when the row already names it
     if attempt is not None and conn.execute(f"SELECT {_latest_not_started(':s', ':a')}",
                                             {"s": subject, "a": attempt}).fetchone()[0] != 1:
         raise ValueError(f"count_held: attempt {attempt} is not the latest not_started attempt of {subject!r}")
+    row = conn.execute("SELECT n, mark, attempt FROM held_counts WHERE subject = ?", (subject,)).fetchone()
+    if attempt is not None and row is not None and row[2] == attempt and row[1] == mark:
+        return row[0]
     if row is None:
         conn.execute("INSERT INTO held_counts (subject, n, last_reason, mark, attempt) VALUES (?, 1, ?, ?, ?)",
                      (subject, reason, mark, attempt))

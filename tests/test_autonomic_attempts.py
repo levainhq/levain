@@ -198,7 +198,10 @@ def rows_of(c, run_id="r", effect_id="link-0"):
     (("r", "foo#bar"), "effect:r:foo#bar"), (("r", "foo#bar", 2), "effect:r:foo#bar#2"),
     (("r", "link-0#"), "effect:r:link-0#"), (("r", "link-0#-2"), "effect:r:link-0#-2"),
     (("r", "link-0#٢"), "effect:r:link-0#٢"), (("r", "a:b"), "effect:r:a:b"),
-    (("r", "link-0", 10 ** 18 - 1), "effect:r:link-0#" + "9" * 18)])
+    (("r", "link-0", 10 ** 18 - 1), "effect:r:link-0#" + "9" * 18),
+    # H3: every SQLite INTEGER attempt round-trips, to its 19-digit top
+    (("r", "link-0", 10 ** 18), "effect:r:link-0#1" + "0" * 18),
+    (("r", "link-0", 2 ** 63 - 1), "effect:r:link-0#9223372036854775807")])
 def test_an_effect_subject_names_its_attempt_and_round_trips(args, subject):
     assert s.effect_subject(*args) == subject
     run_id, effect_id = args[:2]
@@ -208,7 +211,7 @@ def test_an_effect_subject_names_its_attempt_and_round_trips(args, subject):
 @pytest.mark.parametrize("args", [("r:x", "link-0"), ("", "link-0"), ("r", ""), ("r", "link-0#2"),
                                   ("r", "link-0#02"), ("r", "link-0#2", 3), ("r", "link-0", 0),
                                   ("r", "link-0", -1), ("r", "link-0", True), ("r", "link-0", "2"),
-                                  ("r", "link-0", 2.0)])
+                                  ("r", "link-0", 2.0), ("r", "link-0", 2 ** 63)])
 def test_effect_subject_refuses_what_would_not_split_back(args):
     with pytest.raises(ValueError):
         s.effect_subject(*args)
@@ -218,7 +221,9 @@ def test_effect_subject_refuses_what_would_not_split_back(args):
                                      "effect:r:link-0#2#3", "effect:r:#2", "effect::link-0",
                                      "effect:r", "effect:r:",
                                      # F7: a digit run past _ATTEMPT_DIGITS is malformed, not int()'s ValueError
-                                     "effect:r:link-0#1" + "0" * 5000, "effect:r:link-0#" + "1" * 19])
+                                     "effect:r:link-0#1" + "0" * 5000, "effect:r:link-0#" + "1" * 20,
+                                     # H3: past SQLite's INTEGER top (2**63 - 1) in 19 digits
+                                     "effect:r:link-0#9223372036854775808", "effect:r:link-0#" + "9" * 19])
 def test_effect_key_refuses_a_non_canonical_subject(subject):
     with pytest.raises(sqlite3.IntegrityError, match="malformed effect subject"):
         s._effect_key(subject)

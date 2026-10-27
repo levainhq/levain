@@ -366,7 +366,7 @@ def test_a_born_count_naming_an_attempt_needs_that_attempt_not_started_and_lates
     c.close()
 
 
-@pytest.mark.parametrize("bad", [True, 0, -1, 1.0, "1"])
+@pytest.mark.parametrize("bad", [True, 0, -1, 1.0, "1", 2 ** 63])   # 2**63: past SQLite's INTEGER (H3)
 def test_count_held_refuses_an_attempt_that_is_not_an_int_from_1(store, bad):
     c = raw(store)
     first_attempt(c)
@@ -632,12 +632,11 @@ def test_the_not_started_close_does_not_move_the_mark_and_a_null_count_takes_the
     (seal(by="human"), seal(by="on-loop")),       # 10.Q2(b): a human attempt's retry is human
     (seal(by="human"), seal(by=DROP)),
     (seal(by="human"), seal(by=None)),
-    (seal(by=DROP), seal()),                      # the predecessor's by unknown
-    (seal(), seal(by=1)),
+    (seal(by="human"), seal(by=1)),
 ])
 def test_a_hold_less_retry_never_drops_a_human_decider(store, first, retry):
     # F4 (complement LOW): 10.Q2(b)'s `by` clause stands on the hold-less branch (R2-2 replaced 10.Q2(b) only for a
-    # link with a hold), in R3-1's typed shape
+    # link with a hold), written as the note writes it: NULL-safe IS / IS NOT, `by` not required to be text (H1)
     c = raw(store)
     first_attempt(c, first)
     with pytest.raises(sqlite3.IntegrityError, match=AUTHORITY):
@@ -646,7 +645,10 @@ def test_a_hold_less_retry_never_drops_a_human_decider(store, first, retry):
 
 
 @pytest.mark.parametrize("first, retry", [
-    (seal(by="human"), seal(by="human")), (seal(by="on-loop"), seal(by="binding")), (seal(), seal(by="human"))])
+    (seal(by="human"), seal(by="human")), (seal(by="on-loop"), seal(by="binding")), (seal(), seal(by="human")),
+    # H1: a predecessor with no `$.by` is not human, so 10.Q2(b) admits its retry; so does a non-text `by` that is
+    # not a human's
+    (seal(by=DROP), seal()), (seal(by=None), seal(by=DROP)), (seal(), seal(by=1))])
 def test_a_hold_less_retry_keeps_or_raises_its_decider(store, first, retry):
     c = raw(store)
     first_attempt(c, first)
@@ -704,4 +706,82 @@ def test_a_request_close_clears_the_at_bound_row(store):
     tx(c, lambda conn: s.close_subject(conn, subject=SUBJ, record=rec("q", SUBJ, "refused"),
                                        reason="held_limit:subject:unavailable"))
     assert s.invariant(c) == []
+    c.close()
+
+
+# ---- fix round 2 (1027+9 op21fix2): the L3 r2 findings and the queued S1, each RED first -----------------------------
+def test_count_held_refuses_a_stale_attempt_even_when_the_row_already_names_it(store):
+    # H2 (codex, reproduced): attempt 2 is the link's latest (its intent does not move the mark: _progress counts a
+    # link once), and the row still names attempt 1 at that mark; count_held(attempt=1) returned 1 instead of refusing
+    c = raw(store)
+    first_attempt(c)
+    tx(c, attempt(2))
+    assert held_row(c) == (1, 1)
+    with pytest.raises(ValueError, match="latest not_started attempt"):
+        tx(c, count(1))
+    assert held_row(c) == (1, 1)
+    c.close()
+
+
+def test_count_held_of_the_latest_attempt_already_counted_returns_the_stored_count(store):
+    # R3-3 still holds for the attempt that IS the latest not_started: the repeat writes nothing
+    c = raw(store)
+    first_attempt(c)
+    tx(c, count(1))
+    assert held_row(c) == (1, 1)
+    c.close()
+
+
+HELD = "S1: an attempt on a held link runs only under the approval of its hold for that payload"
+
+
+def test_attempt_1_under_an_open_hold_is_refused(store):
+    # S1 (B2's L3 codex HIGH): the first attempt of a held link is not covered by the retry rules (attempt > 1)
+    c = raw(store)
+    tx(c, started_run, ("INSERT INTO holds (hold_id, run_id, effect_id, binding_id, digest, seq) "
+                        "VALUES ('h', 'r', 'link-0', 'b', 'd', 1)",))
+    with pytest.raises(sqlite3.IntegrityError, match=HELD):
+        tx(c, attempt(1))
+    tx(c, approve, attempt(1))   # the same insert once the hold approves its payload
+    c.close()
+
+
+def test_attempt_1_under_an_approved_hold_for_another_digest_is_refused(store):
+    c = raw(store)
+    tx(c, started_run, HOLD_A, approve)
+    with pytest.raises(sqlite3.IntegrityError, match=HELD):
+        tx(c, attempt(1, digest="B"))
+    tx(c, attempt(1, digest="A"))
+    c.close()
+
+
+def test_attempt_1_under_a_reopened_hold_is_refused(store):
+    c = raw(store)
+    tx(c, started_run, HOLD_A, approve, REOPEN)
+    with pytest.raises(sqlite3.IntegrityError, match=HELD):
+        tx(c, attempt(1, digest="A"))
+    c.close()
+
+
+def test_an_attempt_under_a_denied_hold_is_refused_whatever_its_seal_says(tmp_path):
+    # S1's polarity: a denied hold (decided 0) whose generation, decider and posture the seal matches admits nothing,
+    # attempt 1 included. A real reject is written only once the run is closed (holds_move), so the hold is built
+    # with a live run, leaving the S1 rule alone to refuse
+    def build(c):
+        c.execute("INSERT INTO runs (run_id, binding_id, generation, seal, started_at) VALUES ('r', 'b', 0, ?, 't')",
+                  (canon({"context_id": "c", "confirm_class": False, "guard": [], "links": 1}),))
+        c.execute("INSERT INTO holds (hold_id, run_id, effect_id, binding_id, digest, seq, decided, decided_by, "
+                  "decisions) VALUES ('h', 'r', 'link-0', 'b', 'd', 1, 0, 'human', 1)")
+    c = raw(hand_built(tmp_path, build))
+    with pytest.raises(sqlite3.IntegrityError, match=HELD):
+        tx(c, attempt(1, seal(decision={"generation": 1, "by": "human", "posture": None})))
+    c.close()
+
+
+def test_a_retry_under_a_denied_hold_is_refused_by_the_decisions_polarity(tmp_path):
+    # S1's second question: _HELD_DECISION reads `h.decided IS 1` (approve; reject is 0), so a denied hold's matching
+    # generation/by/posture admits no retry; asserted here with the authority rule's own message
+    c = raw(hand_built(tmp_path, ended_link("not_started", "refused", hold_decided=0)))
+    with pytest.raises(sqlite3.IntegrityError, match=HELD + "|" + AUTHORITY):
+        tx(c, attempt(2, seal(decision={"generation": 1, "by": "human", "posture": None})))
     c.close()
