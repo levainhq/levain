@@ -19,6 +19,12 @@ SUBJ = "request:r:link-0"
 LEGAL = "O-p2-1: attempt 1 opens a link"
 COUNTED = "R2-1: a retry follows the count of its predecessor"
 AUTHORITY = "R3-1/R3-2: a retry carries"
+# int fix I3: effects_held_link checks a held attempt's decision on EVERY attempt, so a held retry whose decision is
+# wrong is refused by it or by effects_attempt_authority, whichever trigger SQLite runs first; int fix I2:
+# effects_known refuses an unknown actor or posture whichever attempt carries it
+HELD_AUTHORITY = "S1: an attempt on a held link|R3-1/R3-2: a retry carries"
+KNOWN_AUTHORITY = "int-I2: an effect is sealed by a known actor|R3-1/R3-2: a retry carries"
+KNOWN = "int-I2: an effect is sealed by a known actor"
 MISSING = object()
 DROP = object()   # seal(cover=DROP): the key is removed (absent)
 
@@ -28,8 +34,15 @@ def canon(o) -> str:
 
 
 def seal(**fields) -> str:
-    # an effect seal; a field given DROP (or MISSING) is left out of the object: absent, not JSON null
+    # an effect seal; a field given DROP (or MISSING) is left out of the object: absent, not JSON null. With a
+    # decision object, the top-level actor and rung default to that decision's (int fix I1: effects_held_tied), so a
+    # test of the decision clause varies only the decision
     d = {"floor": [], "grant_guard": [], "by": "on-loop", "posture": "ON_LOOP", "grant": None, "cover": "none"}
+    dec = fields.get("decision")
+    if isinstance(dec, dict):
+        d["by"] = "human" if dec.get("by") == "human" else "on-loop"
+        if dec.get("posture") in Posture.__members__:
+            d["posture"] = dec["posture"]
     for k, v in fields.items():
         if v is DROP or v is MISSING:
             d.pop(k, None)
@@ -400,12 +413,11 @@ def test_a_hold_less_retry_on_its_predecessors_authority_is_admitted(store, firs
     (seal(), seal(posture=None)),                                     # posture JSON null
     (seal(), seal(posture="SIDEWAYS")),                               # posture not a Posture
     (seal(), seal(posture=1)),                                        # posture as its rank number
-    (seal(posture="SIDEWAYS"), seal()),                               # the predecessor's posture unknown
 ])
 def test_a_hold_less_retry_that_widens_or_loses_its_authority_is_refused(store, first, retry):
     c = raw(store)
     first_attempt(c, first)
-    with pytest.raises(sqlite3.IntegrityError, match=AUTHORITY):
+    with pytest.raises(sqlite3.IntegrityError, match=KNOWN_AUTHORITY):
         tx(c, attempt(2, retry))
     c.close()
 
@@ -440,8 +452,8 @@ def test_a_held_retry_on_the_current_decision_is_admitted(store):
 def test_a_held_retry_whose_decision_is_not_the_holds_is_refused(store, decision):
     c = raw(store)
     first_attempt(c, seal(decision=GEN1), hold=True)
-    with pytest.raises(sqlite3.IntegrityError, match=AUTHORITY):
-        tx(c, attempt(2, seal(decision=decision)))
+    with pytest.raises(sqlite3.IntegrityError, match=HELD_AUTHORITY):
+        tx(c, attempt(2, seal(decision=decision, by="human", posture="CONFIRM")))
     c.close()
 
 
@@ -636,23 +648,32 @@ def test_the_not_started_close_does_not_move_the_mark_and_a_null_count_takes_the
 ])
 def test_a_hold_less_retry_never_drops_a_human_decider(store, first, retry):
     # F4 (complement LOW): 10.Q2(b)'s `by` clause stands on the hold-less branch (R2-2 replaced 10.Q2(b) only for a
-    # link with a hold), written as the note writes it: NULL-safe IS / IS NOT, `by` not required to be text (H1)
+    # link with a hold), written as the note writes it: NULL-safe IS / IS NOT. A retry whose `by` is absent, null or
+    # not text is also effects_known's refusal (int fix I2), whichever trigger SQLite runs first
     c = raw(store)
     first_attempt(c, first)
-    with pytest.raises(sqlite3.IntegrityError, match=AUTHORITY):
+    with pytest.raises(sqlite3.IntegrityError, match=KNOWN_AUTHORITY):
         tx(c, attempt(2, retry))
     c.close()
 
 
 @pytest.mark.parametrize("first, retry", [
-    (seal(by="human"), seal(by="human")), (seal(by="on-loop"), seal(by="binding")), (seal(), seal(by="human")),
-    # H1: a predecessor with no `$.by` is not human, so 10.Q2(b) admits its retry; so does a non-text `by` that is
-    # not a human's
-    (seal(by=DROP), seal()), (seal(by=None), seal(by=DROP)), (seal(), seal(by=1))])
+    (seal(by="human"), seal(by="human")), (seal(by="on-loop"), seal(by="binding")), (seal(), seal(by="human"))])
 def test_a_hold_less_retry_keeps_or_raises_its_decider(store, first, retry):
     c = raw(store)
     first_attempt(c, first)
     tx(c, attempt(2, retry))
+    c.close()
+
+
+@pytest.mark.parametrize("sl", [seal(by=DROP), seal(by=None), seal(by=1), seal(by="garbage"),
+                                seal(posture="SIDEWAYS"), seal(posture="REFUSE_ESCALATE")])
+def test_an_attempt_with_an_actor_or_posture_outside_the_enums_is_refused_at_attempt_1(store, sl):
+    # int fix I2 replaces H1 (a seal with no / a null / a non-text `by` was admitted): the store refuses it whichever
+    # attempt carries it, so no retry rule ever reads it
+    c = raw(store)
+    with pytest.raises(sqlite3.IntegrityError, match=KNOWN):
+        tx(c, started_run, attempt(1, sl))
     c.close()
 
 
@@ -742,7 +763,7 @@ def test_attempt_1_under_an_open_hold_is_refused(store):
                         "VALUES ('h', 'r', 'link-0', 'b', 'd', 1)",))
     with pytest.raises(sqlite3.IntegrityError, match=HELD):
         tx(c, attempt(1))
-    tx(c, approve, attempt(1))   # the same insert once the hold approves its payload
+    tx(c, approve, attempt(1, seal(decision=GEN1)))   # once the hold approves its payload, carrying that decision
     c.close()
 
 
@@ -750,8 +771,8 @@ def test_attempt_1_under_an_approved_hold_for_another_digest_is_refused(store):
     c = raw(store)
     tx(c, started_run, HOLD_A, approve)
     with pytest.raises(sqlite3.IntegrityError, match=HELD):
-        tx(c, attempt(1, digest="B"))
-    tx(c, attempt(1, digest="A"))
+        tx(c, attempt(1, seal(decision=GEN1), digest="B"))
+    tx(c, attempt(1, seal(decision=GEN1), digest="A"))
     c.close()
 
 

@@ -407,9 +407,13 @@ def test_a_links_attempts_are_one_unit_of_progress(tmp_path):
 
 def test_a_hold_reopens_after_its_link_did_not_start_and_not_after_it_ran(store):
     c = raw(store)
+    # a held attempt carries its decision and that decision's actor (int fix I1 + I3)
+    held = canon({**json.loads(EFF_SEAL), "by": "human", "decision": {"generation": 1, "by": "human", "posture": None}})
     tx(c, started_run,
        ("INSERT INTO holds (hold_id, run_id, effect_id, binding_id, digest, seq) VALUES ('h', 'r', 'link-0', 'b', 'd', 1)",),
-       ("UPDATE holds SET decided = 1, decisions = decisions + 1, decided_by = 'human' WHERE hold_id = 'h'",), intent)
+       ("UPDATE holds SET decided = 1, decisions = decisions + 1, decided_by = 'human' WHERE hold_id = 'h'",),
+       ("INSERT INTO effects (run_id, effect_id, digest, state, seal) VALUES ('r', 'link-0', 'd', 'intent', ?)",
+        (held,)))
     with pytest.raises(sqlite3.IntegrityError, match="I3"):
         tx(c, (REOPEN, ("h",)))
     tx(c, close_not_started, (REOPEN, ("h",)))

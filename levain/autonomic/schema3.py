@@ -35,7 +35,7 @@ from pathlib import Path
 
 from levain.autonomic import db as vdb
 from levain.autonomic.db import StoreFormatError
-from levain.autonomic.journal import UNSIGNED_DECIDER
+from levain.autonomic.journal import RECEIPT_ACTORS, UNSIGNED_DECIDER
 from levain.autonomic.posture import Posture
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
@@ -273,15 +273,28 @@ def _abort(name: str, when: str, why: str, on: str) -> str:
     return f"CREATE TRIGGER IF NOT EXISTS {name} {on} WHEN {when} BEGIN SELECT RAISE(ABORT, '{why}'); END"
 
 
-def _rank(seal_sql: str) -> str:
-    # 10.Q2 / R2-3: a seal's posture as its Posture rank, emitted from the enum; no ELSE, so an unknown name is NULL
+def _rank(seal_sql: str, path: str = "$.posture") -> str:
+    # 10.Q2 / R2-3: a posture name in a seal as its Posture rank, emitted from the enum; no ELSE, so an unknown name is
+    # NULL
     whens = " ".join(f"WHEN '{p.name}' THEN {int(p)}" for p in Posture)
-    return f"(CASE json_extract({seal_sql}, '$.posture') {whens} END)"
+    return f"(CASE json_extract({seal_sql}, '{path}') {whens} END)"
 
 
 def _absent(doc: str, path: str) -> str:
     # R4-2: a missing key and a JSON null are one absence (the effects_grant_shape idiom)
     return f"IFNULL(json_type({doc}, '{path}'), 'null') = 'null'"
+
+
+def _same_authority(a: str, b: str) -> str:
+    # R3-1 + int-I6: two seals carry one authority: the same grant (both absent, or structurally equal objects) and the
+    # same cover (both absent, or the same text)
+    ga, gb = f"json_extract({a}, '$.grant')", f"json_extract({b}, '$.grant')"
+    return (f"(({_absent(a, '$.grant')} AND {_absent(b, '$.grant')}) "
+            f"OR (json_type({a}, '$.grant') = 'object' AND json_type({b}, '$.grant') = 'object' "
+            f"AND {_json_eq(ga, gb)})) "
+            f"AND (({_absent(a, '$.cover')} AND {_absent(b, '$.cover')}) "
+            f"OR (json_type({a}, '$.cover') = 'text' AND json_type({b}, '$.cover') = 'text' "
+            f"AND json_extract({a}, '$.cover') = json_extract({b}, '$.cover')))")
 
 
 # O-p2-1: the link's previous attempt P of an insert NEW (attempt n - 1)
@@ -302,30 +315,52 @@ _HELD_DECISION = (
     f"AND ((h.decided_posture IS NULL AND {_absent('NEW.seal', '$.decision.posture')}) "
     "OR (h.decided_posture IS NOT NULL AND json_type(NEW.seal, '$.decision.posture') = 'text' "
     "AND json_extract(NEW.seal, '$.decision.posture') = h.decided_posture)))")
-# R3-1 as amended by R4-2: with no hold, the retry re-uses P's cover (both grant-less and cover-less, or the same cover
-# text) at a posture rank no lower than P's (both ranks known), and a human P's retry is human (10.Q2(b), in the note's
-# own NULL-safe words: R2-2 replaced it only for a link with a hold)
+# R3-1 as amended by R4-2 and int-I6: with no hold, the retry re-uses P's authority, its grant and its cover
+# (_same_authority), at a posture rank no lower than P's (both ranks known), and a human P's retry is human (10.Q2(b),
+# in the note's own NULL-safe words: R2-2 replaced it only for a link with a hold)
 _HOLDLESS_AUTHORITY = (
-    f"EXISTS (SELECT 1 {_PREV} AND (({_absent('NEW.seal', '$.grant')} AND {_absent('p.seal', '$.grant')} "
-    f"AND {_absent('NEW.seal', '$.cover')} AND {_absent('p.seal', '$.cover')}) "
-    "OR (json_type(NEW.seal, '$.cover') = 'text' AND json_type(p.seal, '$.cover') = 'text' "
-    "AND json_extract(NEW.seal, '$.cover') = json_extract(p.seal, '$.cover'))) "
+    f"EXISTS (SELECT 1 {_PREV} AND {_same_authority('NEW.seal', 'p.seal')} "
     "AND json_type(NEW.seal, '$.posture') = 'text' AND json_type(p.seal, '$.posture') = 'text' "
     f"AND {_rank('NEW.seal')} IS NOT NULL AND {_rank('p.seal')} IS NOT NULL "
     f"AND {_rank('NEW.seal')} >= {_rank('p.seal')} "
     "AND (json_extract(p.seal, '$.by') IS NOT 'human' OR json_extract(NEW.seal, '$.by') IS 'human'))")
 
-# S1: the hold on the link approves this attempt's payload (decided 1 is an approval, 0 a rejection: V _decide_in)
-_HOLD_APPROVES = ("EXISTS (SELECT 1 FROM holds h WHERE h.run_id = NEW.run_id AND h.effect_id = NEW.effect_id "
-                  "AND h.decided IS 1 AND h.digest = NEW.digest)")
+# int-I1 (O-p2-1 integration fix round 1): on a held link (where _HELD_DECISION has bound $.decision to the hold's
+# current decision) the seal's top-level fields are that decision's: the actor is human exactly when the decider is
+# (gate.receipt_by: a person's decision is `human`, any other the autonomous actor), the rung is a known one no lower
+# than the decided rung (gate._decided_rung fires at max(the proposal's, the decided)), and an attempt after one minted
+# from the SAME decision generation carries that predecessor's actor, grant and cover. A predecessor of an older
+# generation binds nothing here: the retry runs on the new decision (R3-5)
+_HELD_TIED = (
+    "(json_extract(NEW.seal, '$.decision.by') = 'human') = (json_extract(NEW.seal, '$.by') = 'human') "
+    f"AND {_rank('NEW.seal')} IS NOT NULL AND ({_absent('NEW.seal', '$.decision.posture')} "
+    f"OR ({_rank('NEW.seal', '$.decision.posture')} IS NOT NULL "
+    f"AND {_rank('NEW.seal')} >= {_rank('NEW.seal', '$.decision.posture')})) "
+    f"AND NOT EXISTS (SELECT 1 {_PREV} AND json_extract(p.seal, '$.decision.generation') IS "
+    "json_extract(NEW.seal, '$.decision.generation') AND NOT IFNULL(json_type(p.seal, '$.by') = 'text' "
+    "AND json_extract(p.seal, '$.by') = json_extract(NEW.seal, '$.by') "
+    f"AND {_same_authority('NEW.seal', 'p.seal')}, 0))")
+# int-I2: an effect is sealed by an actor of the frozen receipt enum, at a Posture name with an execution path
+_KNOWN_ACTOR = (
+    "json_type(NEW.seal, '$.by') = 'text' AND json_extract(NEW.seal, '$.by') IN ("
+    + ", ".join(f"'{a}'" for a in RECEIPT_ACTORS) + ") "
+    f"AND json_type(NEW.seal, '$.posture') = 'text' AND {_rank('NEW.seal')} IS NOT NULL "
+    f"AND json_extract(NEW.seal, '$.posture') != '{Posture.REFUSE_ESCALATE.name}'")
 
 RETRY_TRIGGERS = (
-    # S1: ANY attempt of a held link, attempt 1 included, runs only under that hold's approval of its own payload (an
-    # open, reopened or rejected hold, or one for another digest, admits nothing); a retry also needs the decision in
-    # its seal (effects_attempt_authority)
-    _abort("effects_held_link", f"{_LINK_HELD} AND NOT IFNULL({_HOLD_APPROVES}, 0)",
-           "S1: an attempt on a held link runs only under the approval of its hold for that payload",
+    # S1 + int-I3: ANY attempt of a held link, attempt 1 included, runs only under that hold's approval of its own
+    # payload (an open, reopened or rejected hold, or one for another digest, admits nothing) and carries that decision
+    # in its seal (_HELD_DECISION)
+    _abort("effects_held_link", f"{_LINK_HELD} AND NOT IFNULL({_HELD_DECISION}, 0)",
+           "S1: an attempt on a held link runs only under the approval of its hold for that payload, and carries it",
            "BEFORE INSERT ON effects"),
+    # int-I1: and its top-level actor, rung, grant and cover are that decision's (judged only once the decision holds,
+    # so a seal without one is effects_held_link's refusal alone)
+    _abort("effects_held_tied", f"{_LINK_HELD} AND IFNULL({_HELD_DECISION}, 0) AND NOT IFNULL({_HELD_TIED}, 0)",
+           "int-I1: a held attempt carries the actor, posture and grant of its decision", "BEFORE INSERT ON effects"),
+    # int-I2: every attempt, held or not
+    _abort("effects_known", f"NOT IFNULL({_KNOWN_ACTOR}, 0)",
+           "int-I2: an effect is sealed by a known actor at an executing posture", "BEFORE INSERT ON effects"),
     # section 5: attempt 1 opens a link (no row yet); attempt n > 1 follows the link's LATEST row, attempt n - 1,
     # ended not_started, of the same digest (a retry after fired / outcome_unknown, or of another payload, is refused)
     _abort("effects_attempt", "NOT IFNULL(CASE WHEN NEW.attempt = 1 THEN NOT EXISTS (SELECT 1 FROM effects e "
@@ -371,7 +406,7 @@ V3_TRIGGERS = (
            "OR IFNULL(json_type(NEW.seal, '$.confirm_class'), 'absent') NOT IN ('true', 'false') "
            "OR json_type(NEW.seal, '$.guard') IS NOT 'array' OR NEW.started_at IS NOT NULL "
            "OR json_type(NEW.seal, '$.links') IS NOT 'integer' OR json_extract(NEW.seal, '$.links') < 1 "
-           "OR instr(NEW.run_id, ':') > 0",
+           "OR NOT IFNULL(typeof(NEW.run_id) = 'text' AND NEW.run_id != '' AND instr(NEW.run_id, ':') = 0, 0)",
            "D56/D68/D71/I2: a run is born sealed (class, guard, links) and unstarted", "BEFORE INSERT ON runs"),
     _abort("runs_guarded", f"json_extract(NEW.seal, '$.confirm_class') = 1 AND NOT {_guard_complete('NEW.seal')}",
            "D68: a confirm-class run is admitted only with its complete guard", "BEFORE INSERT ON runs"),
@@ -1412,8 +1447,8 @@ def count_held(conn: sqlite3.Connection, subject: str, reason: str, *, attempt: 
 
 def hold_decision(conn: sqlite3.Connection, hold_id: str) -> tuple[int, str | None, str | None] | None:
     """R4-1: the decision a ``/3`` hold holds now, ``(generation, decided_by, decided_posture)``, the three values a
-    retry's ``$.decision`` must carry (``effects_attempt_authority``); None for no such hold. ``/3`` only: a ``/2``
-    ``holds`` table has no ``decisions`` column, so no shared ``/2`` read is changed for it."""
+    held attempt's ``$.decision`` must carry (``effects_held_link``, every attempt); None for no such hold. ``/3``
+    only: a ``/2`` ``holds`` table has no ``decisions`` column, so no shared ``/2`` read is changed for it."""
     row = conn.execute("SELECT decisions, decided_by, decided_posture FROM holds WHERE hold_id = ?",
                        (hold_id,)).fetchone()
     return None if row is None else (row[0], row[1], row[2])

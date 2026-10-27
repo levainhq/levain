@@ -76,10 +76,11 @@ from pathlib import Path
 from typing import Any
 
 from levain.autonomic.db import AutonomicDB
+from levain.autonomic.posture import Posture
 
 __all__ = [
     "EffectStatus", "EffectOutcome", "HoldResult", "RunJournal", "RunRef", "JournalCorruptError",
-    "JournalConflictError", "EffectNotStarted", "UNSIGNED_DECIDER",
+    "JournalConflictError", "EffectNotStarted", "UNSIGNED_DECIDER", "RECEIPT_ACTORS",
     "run_id_for", "hold_id_for", "effect_digest", "needs_signature", "AUTHORIZED", "RECHECK", "decision_key",
     "Terminal", "Receipt", "Closed", "close_run_in", "close_unstarted", "close_effect_in", "decide_in",
     "unprojected_receipts", "mark_projected", "poisoned_in", "approved_unrun_in",
@@ -229,6 +230,8 @@ _HOLD_COLUMNS = ("hold_id, binding_id, run_id, effect_id, digest, at, pending, c
                  "decided_by, decided_posture, signer, signature, challenge, fence")
 # A decider whose approval needs no signature: the silence default, decided by the gate itself.
 UNSIGNED_DECIDER = "on-loop"
+# The frozen receipt actor enum (``by`` on a receipt and on an effect seal; gate.receipt_by maps a decider into it).
+RECEIPT_ACTORS = ("human", "binding", "on-loop")
 
 
 def needs_signature(by: str | None) -> bool:
@@ -403,7 +406,10 @@ class RunJournal:
         """Admit ``run_id`` in the caller's write transaction, read first (O-75-3, DESIGN r71): a run that exists is
         left as it is, with no write to ``runs`` (on a ``/3`` store a BEFORE INSERT trigger refuses even an
         ``INSERT OR IGNORE`` of a row that exists); one that does not is inserted, with ``seal`` when given (a ``/3``
-        store refuses a run born without one)."""
+        store refuses a run born without one). On that ``/3`` path an empty run id is a ``ValueError`` before any read
+        (int-I4; the store's ``runs_sealed`` refuses one too); the ``/2`` path is unchanged."""
+        if seal is not None and (not isinstance(run_id, str) or not run_id):
+            raise ValueError(f"int-I4: a run id is a non-empty str, not {run_id!r}")
         if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is not None:
             return
         if seal is None:
@@ -1019,10 +1025,14 @@ def effect_seal_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, by:
     R3-2 / R4-1: when the link has a hold, ``$.decision`` is the hold's decision NOW, ``{"generation", "by",
     "posture"}`` copied from :func:`levain.autonomic.schema3.hold_decision` (``decided_by``, not the receipt actor:
     a silence approval is ``on-loop`` there and ``binding`` in ``$.by``), on every attempt; the store's
-    ``effects_attempt_authority`` admits a retry only with the current decision's values. No hold: no
+    ``effects_held_link`` admits an attempt of a held link only with the current decision's values. No hold: no
     ``$.decision``. A hold not yet decided is a ``ValueError`` (there is no decision to seal), and so is a grant whose
-    ``terms_text`` is JSON but not an object."""
+    ``terms_text`` is JSON but not an object, and so is an actor or posture :func:`_check_actor` refuses.
+
+    On a held link the store also ties the top-level ``by`` / ``posture`` / ``grant`` / ``cover`` to that decision
+    (``effects_held_tied``): the caller passes the values the gate fires the decision with."""
     from levain.autonomic.schema3 import hold_decision
+    _check_actor(by, posture)
     run = conn.execute("SELECT json_extract(seal, '$.guard') FROM runs WHERE run_id = ?", (run_id,)).fetchone()
     if run is None:
         raise KeyError(f"run {run_id!r} was never started")
@@ -1045,6 +1055,15 @@ def effect_seal_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, by:
     return _canonical(seal)
 
 
+def _check_actor(by: object, posture: object) -> None:
+    # int-I2 (the store twin is effects_known): a receipt actor of the frozen enum, and a posture that is a Posture name
+    # with an execution path (REFUSE_ESCALATE has none)
+    if by not in RECEIPT_ACTORS:
+        raise ValueError(f"int-I2: an effect's actor is one of {RECEIPT_ACTORS}, not {by!r}")
+    if not isinstance(posture, str) or posture not in Posture.__members__ or posture == Posture.REFUSE_ESCALATE.name:
+        raise ValueError(f"int-I2: an effect fires at an executing Posture name, not {posture!r}")
+
+
 def intent_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, digest: str, by: str, posture: str,
               grant: dict[str, Any] | None = None, cover: str | None = None,
               revalidate: Callable[[sqlite3.Connection], str | None] | None = None) -> int | str:
@@ -1055,12 +1074,13 @@ def intent_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, digest: 
     is not ``not_started``). Returns the attempt number inserted, sealed by :func:`effect_seal_in`.
 
     Before that, for ANY attempt, a link with a hold is refused with nothing written unless every hold of the link is
-    decided APPROVE for ``digest`` (O-p2-1 fix round 1 G1; the store's ``effects_attempt_authority`` checks only a
-    retry): ``hold_open`` (undecided), ``hold_denied``, or ``digest_changed`` (the /2 admission cancels its run for
-    that one; here the caller does). An id :func:`~levain.autonomic.schema3.effect_subject` refuses is its
-    ``ValueError``, before any read."""
+    decided APPROVE for ``digest`` (O-p2-1 fix round 1 G1; the store's ``effects_held_link`` refuses the same insert
+    for every attempt): ``hold_open`` (undecided), ``hold_denied``, or ``digest_changed`` (the /2 admission cancels
+    its run for that one; here the caller does). An id :func:`~levain.autonomic.schema3.effect_subject` refuses is its
+    ``ValueError``, before any read, and so is an actor or posture :func:`_check_actor` refuses (int-I2)."""
     from levain.autonomic.schema3 import effect_subject
     effect_subject(run_id, effect_id)
+    _check_actor(by, posture)
     for decided, held_digest in conn.execute("SELECT decided, digest FROM holds WHERE run_id = ? AND effect_id = ?",
                                              (run_id, effect_id)).fetchall():
         if decided is None:
@@ -1099,8 +1119,11 @@ def close_not_started_in(conn: sqlite3.Connection, run_id: str, effect_id: str, 
     ``KeyError`` when the attempt has no row. LOST, with ``held`` 0 and no count, when the attempt already ended
     (``held`` is then not the link's count). When the link's request is already closed (another transaction cancelled
     the run while the attempt was in flight), the close is recorded and nothing is counted: ``held`` is the link's
-    count as it stood and ``run_closed`` None."""
+    count as it stood and ``run_closed`` None. A ``why`` that is not a non-empty str is a ``ValueError`` before any
+    read (the store would refuse its ``not_started:`` marker mid-close)."""
     from levain.autonomic.schema3 import _closed, count_held, effect_subject, held_limit
+    if not isinstance(why, str) or not why:
+        raise ValueError(f"close_not_started_in: why {why!r} is not a non-empty str")
     subject = effect_subject(run_id, effect_id, attempt)
     row = effect_attempt(conn, run_id, effect_id, attempt)
     if row is None:
