@@ -375,9 +375,20 @@ class RunJournal:
                      "DO UPDATE SET generation = MAX(generation, excluded.generation)", (binding_id, generation))
 
     @staticmethod
-    def _start_in(conn: sqlite3.Connection, run_id: str, binding_id: str, generation: int) -> None:
-        conn.execute("INSERT OR IGNORE INTO runs (run_id, binding_id, generation) VALUES (?, ?, ?)",
-                     (run_id, binding_id, int(generation)))
+    def _start_in(conn: sqlite3.Connection, run_id: str, binding_id: str, generation: int, *,
+                  seal: str | None = None) -> None:
+        """Admit ``run_id`` in the caller's write transaction, read first (O-75-3, DESIGN r71): a run that exists is
+        left as it is, with no statement on ``runs`` (on a ``/3`` store a BEFORE INSERT trigger refuses even an
+        ``INSERT OR IGNORE`` of a row that exists); one that does not is inserted, with ``seal`` when given (a ``/3``
+        store refuses a run born without one)."""
+        if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is not None:
+            return
+        if seal is None:
+            conn.execute("INSERT INTO runs (run_id, binding_id, generation) VALUES (?, ?, ?)",
+                         (run_id, binding_id, int(generation)))
+        else:
+            conn.execute("INSERT INTO runs (run_id, binding_id, generation, seal) VALUES (?, ?, ?, ?)",
+                         (run_id, binding_id, int(generation), seal))
 
     def generation(self, binding_id: str) -> int:
         """The binding's current governance generation: its fence (0 if never fenced)."""
