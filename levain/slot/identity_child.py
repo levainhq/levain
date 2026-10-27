@@ -6,10 +6,8 @@ bearer goes to :data:`ORIGIN` only, and no redirect is followed: a 3xx is the fi
 ``{"status": <http status>, "body": <the response text>}`` for root to judge (:func:`levain.slot.identity.
 parse_profile_answer`); a failure before an answer is ``{"error": <a fixed name>}``. The token stays inside this
 process: it is never printed, logged or put in an error. Stdlib only and 3.9-valid (it runs under the root tree's
-interpreter).
-
-NOT WIRED YET: no wall target launches this module (handoff in 1027-18/idg1/RETURN.md); the Claude call still refuses
-``identity-call-unbuilt``.
+interpreter). Launched by wall's ``identity`` target (:data:`levain.slot.wall.IDENTITY_MODULE`), from start's
+:func:`levain.slot.start.identity_capture`.
 """
 from __future__ import annotations
 

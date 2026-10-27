@@ -272,8 +272,9 @@ def test_x6_status_answers_the_records_identity(env):
 
 def test_x6_status_answers_a_claude_logins_result(env):
     w, la, _ = env
+    w.seams.capture = lambda argv, spec, cgroup, bound: (1, b'{"error":"no-token"}\n')   # G1b: the child, faked
     s = _login(w, la, "claude")
-    assert w.main(["status", s])[1]["identity"] == {"result": "identity-call-unbuilt"}
+    assert w.main(["status", s])[1]["identity"] == {"result": "identity-unparsable"}
 
 
 def test_x6_status_with_no_identity_has_no_key(env):

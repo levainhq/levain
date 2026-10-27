@@ -42,7 +42,8 @@ CONTROL checks, never as a fact root acts on.
    macOS: every process of the slot uid), then reaped.
 10. ``identity`` (kind ``login`` only, after the vendor exits): :func:`levain.slot.identity.record_login_identity`
    CASes what the vendor's identity call observed into the state record, for ``confirm-identity`` to read. A
-   refused CAS is noted, never the verb's answer: the login ran.
+   refused CAS is noted, never the verb's answer: the login ran. Claude's call spawns its child as the slot
+   (:func:`identity_capture`, under the session END lock); Codex's spawns nothing.
 
 Steps 4-9 run under the session END lock (:func:`_start_fenced`, the spawn fence), released after the CAS's answer.
 
@@ -711,25 +712,7 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
 
     if egress and seams.host == "linux":
         seams.at("forwarder")
-        spec = _spec(ctx, a, "forwarder")
-        argv, cgroup = launch(ctx, a, spec)
-        ready_r, ready_w = os.pipe()
-        fpid: Optional[int] = None
-        try:
-            try:
-                fpid = seams.spawn(argv, spec.to_json(), cgroup, ready_w, True)   # lives until the helper exits
-            finally:
-                os.close(ready_w)
-            ready = _readable(ready_r, FORWARDER_READY_S) and os.read(ready_r, 1) == wall.EXEC_OK
-        except BaseException:
-            if fpid is not None:
-                _abandon(ctx, a, fpid, "forwarder-not-ready")      # spawned, then the ready read failed
-            raise
-        finally:
-            os.close(ready_r)
-        if not ready:
-            _abandon(ctx, a, fpid, "forwarder-not-ready")
-            raise Refused("forwarder-not-ready", f"no ready byte within {FORWARDER_READY_S:g}s")
+        _spawn_forwarder(ctx, a)
 
     seams.at("secrets")
     handles = secret_env(ctx, a)
@@ -766,6 +749,79 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
         _abandon(ctx, a, pid, "active-refused")
         raise
     return pid
+
+
+def _spawn_forwarder(ctx: H.Ctx, a: R.Alloc) -> None:
+    """Linux egress (§9.1): the slot's TCP -> ``gw.sock`` relay in the netns, detached, live until the helper exits;
+    ready only on its ready byte within :data:`FORWARDER_READY_S`, else its domain is killed and ``forwarder-not-ready``.
+    Runs under the session END lock."""
+    seams = ctx.seams
+    spec = _spec(ctx, a, "forwarder")
+    argv, cgroup = launch(ctx, a, spec)
+    ready_r, ready_w = os.pipe()
+    fpid: Optional[int] = None
+    try:
+        try:
+            fpid = seams.spawn(argv, spec.to_json(), cgroup, ready_w, True)   # lives until the helper exits
+        finally:
+            os.close(ready_w)
+        ready = _readable(ready_r, FORWARDER_READY_S) and os.read(ready_r, 1) == wall.EXEC_OK
+    except BaseException:
+        if fpid is not None:
+            _abandon(ctx, a, fpid, "forwarder-not-ready")      # spawned, then the ready read failed
+        raise
+    finally:
+        os.close(ready_r)
+    if not ready:
+        _abandon(ctx, a, fpid, "forwarder-not-ready")
+        raise Refused("forwarder-not-ready", f"no ready byte within {FORWARDER_READY_S:g}s")
+
+
+# --- the Claude identity call's child (§7.6; 1027-18 RULINGS IG-3, G1b) ------------------------------------------------
+
+def identity_capture(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
+    """The Claude identity call's slot side (:mod:`levain.slot.identity_child`) run AS THE SLOT through wall's
+    ``identity`` target, after the login's vendor exited; its exit status and its stdout, drained by root within
+    :data:`levain.slot.identity.PROFILE_ANSWER_MAX` (the runtime helper's capture). In order, under the session END
+    lock (the spawn fence, as every spawn into the slot):
+
+    1. the alloc re-read unchanged and the record still running (ACTIVE or BRAKED), else ``identity-window`` /
+       ``not-active:<STATE>``: an END that ran since the vendor exited is never raced;
+    2. Linux egress: the session's kill domain ended and proven (the forwarder start left running is a slot-uid
+       process too);
+    3. no process of the slot uid (proc.py's END proof, as clone-check's window), else ``identity-window``: the slot
+       has no process left to change its credential between this read and END's park [reasoned; known edge, macOS:
+       a launchd job the vendor registered in the slot's domain could start one before END's bootout];
+    4. Linux egress: a fresh forwarder (:func:`_spawn_forwarder`), so the call reaches the passthrough tunnel;
+    5. the child, its output captured. A capture or spawn failure is ``identity-unparsable`` (root read no answer).
+    """
+    seams = ctx.seams
+    try:
+        with H.session_lock(ctx, a.session):
+            if H.read_alloc(ctx, a.session) != a:
+                raise Refused("identity-window", f"{a.session}: the alloc changed")
+            rec = read_record(ctx, a.session)
+            if rec is None or rec.state not in (R.ACTIVE, R.BRAKED):
+                raise Refused(f"not-active:{rec.state if rec else 'none'}", a.session)
+            relay = a.slot.slot_class == "egress" and seams.host == "linux"
+            if relay:
+                res, _ = kill_domain(ctx, a)
+                if not res.proven:
+                    raise Refused("identity-window", f"the kill domain was not proven empty: {res.name}")
+            if not _no_slot_process(ctx, a):
+                raise Refused("identity-window", "a slot-uid process is alive after the login")
+            if relay:
+                _spawn_forwarder(ctx, a)
+            spec = _spec(ctx, a, "identity")
+            argv, cgroup = launch(ctx, a, spec)
+            try:
+                return seams.capture(argv, spec.to_json(), cgroup, ID.PROFILE_ANSWER_MAX)
+            except Refused as e:
+                raise Refused("identity-unparsable", f"capture: {e.name}") from None
+            except OSError as e:
+                raise Refused("identity-unparsable", f"capture: errno {e.errno}") from None
+    finally:
+        _wake(seams)        # an END that waited on the lock, or refused end-busy, is retried now
 
 
 def _wake(seams: H.Seams) -> None:
