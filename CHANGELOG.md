@@ -310,6 +310,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   guard is refused at signing instead of the check crashing.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- Groundwork for chat approvals: the store now has tables for each approval request a chat session raises and everything that happens to it (asked, decided, answered, cancelled), kept in the same append-only style as the rest of the chat record. Nothing in `levain` writes to them yet, so there is no change you can see. A store from 0.11.25 or later is brought up to date the first time it is opened for writing, keeping every row it already had; opening one read-only changes nothing.
 - **A contained-shell grant can answer a Levain chat launch's Bash calls.** It answers only a chat call carrying the
   proof of the launch it was granted for, never a Claude Code or Codex hook call; it is listed, counted and revocable
   like any standing grant, and an answer it gave stops being delivered once it is revoked. Nothing launches a chat
