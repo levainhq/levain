@@ -120,6 +120,7 @@ LAZY_SITES = {
     'levain/slot/control.py::Control._drop_until_acked::from levain.slot.control_client import V23_SECONDS   # lazy: a module-level import would be circular': 'root',
     # S1 3c-4: ``levain.slot.routemaps`` (CONTROL, keys) parses the dispatch route map with ``parse_routemap``
     'levain/broker/policy.py::parse_routemap::from levain.dispatch import routemap_rules as rules': 'root',
+    'levain/slot/end.py::confirmed_relogin::from levain.slot import identity as ID': 'root',
     'levain/slot/export_run.py::_store_delete::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/export_run.py::mount_path::from levain.slot import wall': 'root',
     'levain/slot/export_run.py::scope_path::from levain.slot import wall': 'root',
