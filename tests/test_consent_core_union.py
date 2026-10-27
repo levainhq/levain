@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from levain.consent.adapters import claude_code as cc
-from levain.consent.contained import ContainedLaunchProof, CoreCall, core_call_of, plain_dns_host
+from levain.consent.contained import CONTAINMENT_FORMAT, ContainedLaunchProof, CoreCall, core_call_of
 from levain.consent.queue import Decision
 from levain.consent.record import ExternalGateRequest
 from tests._decide_scenarios import _event, run_all
@@ -217,21 +217,23 @@ def test_hook_path_unchanged_by_escape_decline(tmp_path):
     assert isinstance(out, cc.Decided) and len(q.filed) == 1
 
 
-# --- a SandboxNetworkAccess ask in chat is declined (Q-R15-4 REC: loopback_host, egress_not_levain) --------
+# --- a SandboxNetworkAccess ask in chat is declined (rev 15, R15-2: under (o) it is the egress_not_levain latch) --
 
-@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "foo.localhost.", "[::1]", "2130706433", "a.com:443"])
-def test_sandbox_net_non_dns_host_is_declined_loopback_host(tmp_path, host):
+@pytest.mark.parametrize("inp", [{"host": "pypi.org"}, {"host": "pypi.org", "port": 443}, {"host": "127.0.0.1"},
+                                 {"host": "localhost"}, {}, "pypi.org"])
+@pytest.mark.parametrize("with_proof", [True, False])
+def test_any_sandbox_net_ask_in_chat_is_declined_egress_not_levain(tmp_path, inp, with_proof):
     q = Q("allow")
-    out = ex(_event("SandboxNetworkAccess", {"host": host}, tool_use_id="toolu_1"), q, tmp_path, nonce=NONCE)
-    assert isinstance(out, cc.Declined) and out.reason == "loopback_host" and q.filed == []
-
-
-@pytest.mark.parametrize("inp", [{"host": "pypi.org"}, {"host": "pypi.org", "port": 443}, {}, "pypi.org"])
-def test_any_other_sandbox_net_ask_in_chat_is_declined_egress_not_levain(tmp_path, inp):
-    q = Q("allow")
-    out = ex(_event("SandboxNetworkAccess", inp, tool_use_id="toolu_1"), q, tmp_path, nonce=NONCE,
-             proof=_proof(tmp_path))
+    e = _event("SandboxNetworkAccess", inp, tool_use_id="toolu_1")
+    out = ex(e, q, tmp_path, nonce=NONCE, proof=_proof(tmp_path) if with_proof else None)
     assert isinstance(out, cc.Declined) and out.reason == "egress_not_levain" and q.filed == []
+    assert out.call == core_call_of(e, launch_nonce=NONCE)
+
+
+def test_sandbox_net_on_the_hook_path_is_filed_as_before(tmp_path):
+    q = Q("allow")
+    out = ex(_event("SandboxNetworkAccess", {"host": "127.0.0.1"}), q, tmp_path)
+    assert isinstance(out, cc.Decided) and len(q.filed) == 1
 
 
 # --- levain.consent.contained -------------------------------------------------------------------------------
@@ -269,29 +271,33 @@ def test_core_call_digest_changes_with_each_field():
 
 
 def test_core_call_of_derives_as_decide_does():
-    e = _event(tool_use_id="toolu_1", agent_id="a1", tool_input=None)
+    e = {**_event(tool_use_id="toolu_1", agent_id="a1"), "tool_input": None}
     call = core_call_of(e, launch_nonce="")
     assert call.session == "ceedbaa9-2e6d-433f-b374-0ad96dd5f62d#agent:a1" and call.call_id == "toolu_1"
     assert call.input_digest == core_call_of({**e, "tool_input": {}}, launch_nonce="").input_digest
     assert core_call_of(_event(), launch_nonce="").call_id == ""
 
 
-@pytest.mark.parametrize("event", [_event(session_id=""), _event(cwd=None), _event(tool_use_id=3),
-                                   _event(agent_id=5), "x"])
+@pytest.mark.parametrize("event", [_event(session_id=""), _event(cwd=None), _event(tool_name=""), "x"])
 def test_core_call_of_refuses_an_event_that_names_no_call(event):
     with pytest.raises(ValueError):
         core_call_of(event, launch_nonce="")
 
 
-@pytest.mark.parametrize("host", ["127.1", "2130706433", "0x7f.1", "0x7f000001", "0177.0.0.1", "0.0.0.0",
-                                  "localhost.", "LOCALHOST", "foo.localhost.", "[::ffff:7f00:1]", "::1", "1.2.3.4",
-                                  "a..b", "-a.com", "a.com:443", "user@a.com", "single", "", "a b.com", None])
-def test_plain_dns_host_declines(host):
-    assert plain_dns_host(host) is None
+@pytest.mark.parametrize("bad", [{"tool_use_id": 3}, {"tool_use_id": ""}, {}])
+def test_core_call_of_a_chat_call_needs_a_tool_use_id(bad):
+    e = {k: v for k, v in _event().items() if k != "tool_use_id"} | bad
+    with pytest.raises(ValueError):
+        core_call_of(e, launch_nonce=NONCE)
+    assert core_call_of(e, launch_nonce="").call_id == ""
 
 
-@pytest.mark.parametrize("host,name", [("pypi.org", "pypi.org"), ("files.pythonhosted.org", "files.pythonhosted.org"),
-                                       ("registry.npmjs.org.", "registry.npmjs.org"),
-                                       ("xn--bcher-kva.example", "xn--bcher-kva.example"), ("PyPI.org", "pypi.org")])
-def test_plain_dns_host_accepts(host, name):
-    assert plain_dns_host(host) == name
+def test_core_call_of_ignores_what_decide_ignores():
+    # decide files a non-string agent_id's call under the bare session and a non-string tool_use_id with no
+    # event id; the hook caller's call says the same, so its result names the request decide files
+    call = core_call_of(_event(agent_id=5, tool_use_id=3), launch_nonce="")
+    assert call.session == "ceedbaa9-2e6d-433f-b374-0ad96dd5f62d" and call.call_id == ""
+
+
+def test_containment_format_is_the_ruled_one():
+    assert CONTAINMENT_FORMAT == "levain-containment/4"

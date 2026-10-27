@@ -10,8 +10,8 @@ Two values the chat core passes beside an event (CH-D1 §3.4):
   contained-shell grant binds, the canary verdict and the launch directory. It is a same-uid, in-process consistency
   value, never a signature: the signed fact is the grant's ``containment_digest``. A hook caller passes ``None``.
 
-:func:`plain_dns_host` is the one "is this a plain DNS name" test (rev 9, R9-7): the chat core declines a
-``SandboxNetworkAccess`` ask for anything else, and the egress proxy (CH-D2) uses the same function.
+:data:`CONTAINMENT_FORMAT` names the format of the ``containment_digest`` a contained-shell grant binds (rev 15,
+Q-R15-8): a launch profile of another format is another containment class, so no grant signed for one answers the other.
 """
 from __future__ import annotations
 
@@ -25,11 +25,12 @@ from typing import Any
 
 from levain.consent.record import tool_input_digest
 
-__all__ = ["ContainedLaunchProof", "CoreCall", "core_call_of", "plain_dns_host"]
+__all__ = ["CONTAINMENT_FORMAT", "ContainedLaunchProof", "CoreCall", "core_call_of"]
+
+CONTAINMENT_FORMAT = "levain-containment/4"
 
 _HEX32 = re.compile(r"[0-9a-f]{32}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
-_LABEL = re.compile(r"[a-z0-9-]{1,63}")
 
 
 @dataclass(frozen=True)
@@ -76,10 +77,12 @@ class CoreCall:
 
 
 def core_call_of(event: Mapping[str, Any], *, launch_nonce: str) -> CoreCall:
-    """The :class:`CoreCall` of a PermissionRequest ``event``. Pure: it reads only ``event``. Raises
-    :class:`ValueError` when the event cannot name a call: no session, tool name or cwd (non-empty strings), an
-    ``agent_id`` or ``tool_use_id`` that is not a string, or, for a chat call (``launch_nonce`` not ``""``), no
-    ``tool_use_id``; an input :func:`tool_input_digest` cannot digest raises what it raises."""
+    """The :class:`CoreCall` of a PermissionRequest ``event``. Pure: it reads only ``event``. It derives the session
+    and the call id as ``decide`` does (an ``agent_id`` that is not a non-empty string is ignored; a ``tool_use_id``
+    that is not a non-empty string is ``""``), so a hook caller's result names the request ``decide`` files. Raises
+    :class:`ValueError` when the event cannot name a call: not an object, no session, tool name or cwd (non-empty
+    strings), a launch nonce that is not a string, or, for a chat call (``launch_nonce`` not ``""``), no
+    ``tool_use_id``; and what :func:`tool_input_digest` raises on an input it cannot digest."""
     if not isinstance(launch_nonce, str):
         raise ValueError("the launch nonce is not a string")
     if not isinstance(event, Mapping):
@@ -91,13 +94,9 @@ def core_call_of(event: Mapping[str, Any], *, launch_nonce: str) -> CoreCall:
     agent_id = event.get("agent_id")
     if isinstance(agent_id, str) and agent_id:
         session = f"{session}#agent:{agent_id}"
-    elif agent_id is not None and not isinstance(agent_id, str):
-        raise ValueError("the event's agent_id is not a string")
     call_id = event.get("tool_use_id")
-    if call_id is None:
-        call_id = ""
     if not isinstance(call_id, str):
-        raise ValueError("the event's tool_use_id is not a string")
+        call_id = ""
     if launch_nonce and not call_id:
         raise ValueError("a chat call has no tool_use_id")
     tool_input = event.get("tool_input", {})
@@ -106,29 +105,3 @@ def core_call_of(event: Mapping[str, Any], *, launch_nonce: str) -> CoreCall:
     return CoreCall(session=session, call_id=call_id, tool_name=tool_name, input_digest=tool_input_digest(tool_input),
                     cwd=cwd, launch_nonce=launch_nonce)
 
-
-def plain_dns_host(host: Any) -> str | None:
-    """``host`` normalised as a plain DNS name, or ``None`` (= decline). Lower-cased, ONE trailing ``.`` stripped;
-    ``None`` when: not a string; empty or longer than 253 characters; any ``[`` ``]`` ``:`` ``%`` ``/`` ``@`` or
-    whitespace; any label empty, longer than 63 characters or outside ``[a-z0-9-]``; a label starting or ending with
-    ``-``; the final label all digits or starting ``0x``; the name ``localhost`` or under ``.localhost``; fewer than
-    two labels. Never resolves anything: where a plain name RESOLVES is the egress proxy's check (CH-D2)."""
-    if not isinstance(host, str):
-        return None
-    name = host.lower()
-    if name.endswith("."):
-        name = name[:-1]
-    if not name or len(name) > 253 or any(c in name for c in "[]:%/@") or any(c.isspace() for c in name):
-        return None
-    labels = name.split(".")
-    if len(labels) < 2:
-        return None
-    for label in labels:
-        if not _LABEL.fullmatch(label) or label.startswith("-") or label.endswith("-"):
-            return None
-    last = labels[-1]
-    if last.isdigit() or last.startswith("0x"):
-        return None
-    if labels[-1] == "localhost":
-        return None
-    return name

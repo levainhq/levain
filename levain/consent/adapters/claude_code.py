@@ -54,7 +54,8 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
-from typing import IO, Any
+from types import MappingProxyType
+from typing import IO, Any, Literal
 
 from levain.authority import anchor_path
 # FILE_TOOLS, MCP_PATH_FIELDS, PolicyNotEligible and guarded_policy are re-exported: this module's names since Q2
@@ -75,6 +76,7 @@ from levain.consent.adapters.rules import (  # noqa: F401 - the rules' one home;
     GIT_STATE_FILES, _is_config_path, _is_git_config,
 )
 from levain.consent.broker_client import in_slot
+from levain.consent.contained import ContainedLaunchProof, CoreCall, core_call_of
 from levain.consent.record import ExternalGateRequest
 
 AGENT = CLAUDE_CODE_AGENT
@@ -482,20 +484,32 @@ def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bo
     (:data:`AGENT_CONFIG_TIER`, never grant-eligible) only an active key whose class can sign a T3 allow counts;
     a standing grant never does, nor does away mode: a held T3 call that no key can sign only halts its session
     (L3 r1 codex 6, r2)."""
+    return nothing_can_decide_why(settings, tier) is not None
+
+
+def nothing_can_decide_why(settings: AdapterSettings, tier: str | None = None) -> str | None:
+    """Why :func:`nothing_can_decide` holds, in words for the operator, or ``None`` when something can decide. The
+    one body of that judgement: :func:`nothing_can_decide` is this being not ``None``."""
     if settings.away_mode and tier != AGENT_CONFIG_TIER:
-        return False
+        return None
     root = settings.cockpit_data_root
-    if not root or not (Path(root) / "cockpit.db").is_file():
-        return True
+    if not root:
+        return "no cockpit data root in the consent settings"
+    if not (Path(root) / "cockpit.db").is_file():
+        return "the cockpit names no ledger (no cockpit.db)"
     try:
         snap = authority_source(Path(root) / "cockpit.db", anchor=anchor_path(root))()
     except Exception:
-        return True  # an authority that does not replay verifies nothing
+        return "the cockpit's ledger does not replay"  # an authority that does not replay verifies nothing
     if tier == AGENT_CONFIG_TIER:
         from levain.consent.queue import class_covers
 
-        return not any(class_covers(key.key_class, tier) for key in snap.active_keys())
-    return not snap.active_keys() and not _a_consent_grant_in_force(snap.policy.grants.values())
+        if any(class_covers(key.key_class, tier) for key in snap.active_keys()):
+            return None
+        return "no enrolled key can sign an agent-config allow"
+    if snap.active_keys() or _a_consent_grant_in_force(snap.policy.grants.values()):
+        return None
+    return "no enrolled key and no standing grant in force"
 
 
 def _a_consent_grant_in_force(grants: Iterable[Any]) -> bool:
@@ -806,14 +820,73 @@ def hold_for_answer(queue: ConsentQueue, request: ExternalGateRequest, wait: flo
             return None, why
 
 
+# --- the core result (CH-D1 §3.4): decide_ex tags every exit; decide() is its hook output -------------------
+
+@dataclass(frozen=True)
+class Decided:
+    """A verified answer for ``call``: ``decision`` passed :func:`_verified` against ``request`` (the request filed
+    for the call, or on the take path the request the take's decision names)."""
+    call: CoreCall
+    request: ExternalGateRequest
+    decision: Decision
+
+
+@dataclass(frozen=True)
+class Abstained:
+    """No answer: nothing could decide (``no_decider``, nothing filed, ``request`` ``None``, ``why`` the reason), or
+    the hold ended without one (``hold_expired``: a zero hold, a timeout, away mode ending, a lost withdraw race;
+    ``request`` the filed request, ``why`` ``""``). Each becomes the operator's own question."""
+    call: CoreCall
+    reason: Literal["no_decider", "hold_expired"]
+    request: ExternalGateRequest | None
+    why: str
+
+
+@dataclass(frozen=True)
+class Declined:
+    """A call levain refuses outright: in chat each becomes a DENY carrying :data:`DECLINE_MESSAGES` [reason],
+    never a question. ``call`` is ``None`` only when the event was too malformed to name one."""
+    call: CoreCall | None
+    reason: Literal["invalid_event", "unconfined", "sandbox_escape_requested", "egress_not_levain"]
+
+
+DECLINED_REASONS = frozenset({"invalid_event", "unconfined", "sandbox_escape_requested", "egress_not_levain"})
+DECLINE_MESSAGES: Mapping[str, str] = MappingProxyType({
+    "invalid_event": "levain could not read this request",
+    "unconfined": "levain refuses agent-config writes from an unconfined session",
+    "sandbox_escape_requested": "no sandbox escape in chat: run the command again without dangerouslyDisableSandbox",
+    "egress_not_levain": "this launch's network is not the one levain built, so levain opens nothing for it"})
+
+CoreResult = Decided | Abstained | Declined
+
+# the vendor's key that asks to run a Bash call outside its sandbox (R8-5); its value is never read
+SANDBOX_ESCAPE_KEY = "dangerouslyDisableSandbox"
+# the vendor's tool name for a sandboxed network ask (rev 15, R15-2: under §3.8.5(o) none should reach the core)
+SANDBOX_NET_TOOL = "SandboxNetworkAccess"
+
+
 def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, environ: Mapping[str, str], home: Path,
-           claude_pid: int | None = None, max_hold: float = DEFAULT_MAX_HOLD,
-           policy: Policy | None = None, clock: Callable[[], float] = time.monotonic,
-           idle: Callable[[], float | None] | None = None,
-           still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
-    """The hook's output for one event, or ``None`` for no decision. Raises on anything unexpected (after
-    withdrawing the request it filed, so no ghost stays pending); the caller (:func:`main`) turns that into no
-    decision. ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. The hold is
+           claude_pid: int | None = None, **kw: Any) -> dict[str, Any] | None:
+    """The hook's output for one event, or ``None`` for no decision: :func:`hook_output` of a :class:`Decided`
+    result of :func:`decide_ex` (called with ``launch_nonce=""`` and ``contained_launch=None``), else ``None``.
+    Raises what :func:`decide_ex` raises; the caller (:func:`main`) turns that into no decision."""
+    out = decide_ex(event, queue, settings, environ=environ, home=home, claude_pid=claude_pid, launch_nonce="",
+                    contained_launch=None, **kw)
+    return hook_output(out.decision) if isinstance(out, Decided) else None
+
+
+def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, environ: Mapping[str, str], home: Path,
+              launch_nonce: str, contained_launch: ContainedLaunchProof | None,
+              claude_pid: int | None = None, max_hold: float = DEFAULT_MAX_HOLD,
+              policy: Policy | None = None, clock: Callable[[], float] = time.monotonic,
+              idle: Callable[[], float | None] | None = None,
+              still_away: Callable[[], tuple[bool, str, str]] | None = None) -> CoreResult:
+    """The core's result for one event, tagged (:data:`CoreResult`), every result bound to the :class:`CoreCall`
+    :func:`core_call_of` computes from ``event``. ``launch_nonce`` is ``""`` for every hook caller and the launch's
+    spawn nonce for a chat call; ``contained_launch`` is ``None`` for every hook caller and the launch's SH1
+    capability (or ``None``, withheld) for a chat call. Both are required, so no caller can leave either out.
+    Raises on anything unexpected (after withdrawing the request it filed, so no ghost stays pending).
+    ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. The hold is
     :func:`away_hold` (``idle`` is its input-idle source, default the platform's); ``still_away`` (:func:`main`
     passes :func:`still_away_from`) ends a hold early when it says away mode ended (the operator is back, or no
     key could sign), leaving the native dialog to ask. ``policy``
@@ -823,38 +896,57 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, enviro
     bypass ruling 3b item 1. What
     the adapter trusts (:func:`protected_paths`) is taken from ``queue.directory``, ``settings``, ``home`` and the
     event's cwd here, never as a list from the caller, so no call can leave it out; a queue without a directory
-    raises before anything is filed."""
+    raises before anything is filed. A chat call (``launch_nonce`` not ``""``) is declined before anything is
+    filed when it has no ``tool_use_id``, when it is Bash with :data:`SANDBOX_ESCAPE_KEY` in its input (any
+    value), and when it is :data:`SANDBOX_NET_TOOL` (any input); a hook caller's call is never declined for these."""
     if getattr(queue, "directory", None) is None:
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
+    if not isinstance(launch_nonce, str):
+        raise TypeError("launch_nonce must be a string (\"\" for a hook caller)")
+    if contained_launch is not None and not isinstance(contained_launch, ContainedLaunchProof):
+        raise TypeError("contained_launch must be a ContainedLaunchProof or None")
     deadline = clock() + max(0.0, float(max_hold)) - CLEANUP_RESERVE
     if not isinstance(event, Mapping) or event.get("hook_event_name") != EVENT:
-        return None
+        return Declined(None, "invalid_event")
     tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
     session = event.get("session_id")
     if not isinstance(tool_name, str) or not tool_name or not isinstance(cwd, str) or not cwd \
             or not isinstance(session, str) or not session:
-        return None
+        return Declined(None, "invalid_event")
     if tool_input is None:
         tool_input = {}  # an MCP tool with no arguments arrives without tool_input (Q0 item 4)
-    agent_id = event.get("agent_id")
-    if isinstance(agent_id, str) and agent_id:
-        session = f"{session}#agent:{agent_id}"
+    try:
+        call = core_call_of(event, launch_nonce=launch_nonce)
+    except ValueError:
+        return Declined(None, "invalid_event")   # a chat call with no tool_use_id, or an input with no digest
+    if launch_nonce:
+        if tool_name == "Bash" and isinstance(tool_input, Mapping) and SANDBOX_ESCAPE_KEY in tool_input:
+            return Declined(call, "sandbox_escape_requested")
+        if tool_name == SANDBOX_NET_TOOL:
+            return Declined(call, "egress_not_levain")
+    session = call.session
     tool_use_id = event.get("tool_use_id")
     mode = event.get("permission_mode")
     posture = mode if isinstance(mode, str) and mode else None
     if policy is None and nothing_can_decide(settings):
-        return None
+        return Abstained(call, "no_decider", None, nothing_can_decide_why(settings) or "nothing can decide")
     protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected)
     if agent_config and unconfined(cwd, home=home, environ=environ):
-        return None  # an unconfined session (Q10 D2): its dialog answers, as the gate left the call to its mode (L1-7)
+        # an unconfined session (Q10 D2): its dialog answers, as the gate left the call to its mode (L1-7)
+        return Declined(call, "unconfined")
     if agent_config:
         # the gate already asked the operator about this call and delivered an allow, and Claude Code shows its
-        # dialog anyway on a path it protects: deliver that allow once, never a second question
+        # dialog anyway on a path it protects: deliver that allow once, never a second question. The take is
+        # delivered only as the verified decision of the request it names (R7-9); any other take is no take.
         took = queue.take_gate_allow(AGENT, session, tool_name, tool_input, cwd=cwd, within=GATE_ALLOW_REUSE,
                                      posture=posture, event=EVENT)
         if took is not None:
-            return hook_output(took)
+            got_row = queue.get(took.request_id) if isinstance(took, Decision) else None
+            if got_row is not None:
+                taken = _verified(took, got_row[0])
+                if taken is not None:
+                    return Decided(call, got_row[0], taken)
     hold = min(away_hold(settings, AGENT, idle), max(0.0, deadline - clock()))
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
@@ -881,7 +973,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, enviro
                 # Not pending any more: an answer may have landed between the wait and the withdraw.
                 got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
         settled = True
-        return hook_output(got) if got is not None else None
+        return Decided(call, request, got) if got is not None else Abstained(call, "hold_expired", request, "")
     finally:
         if not settled:
             # An exception between file() and the withdraw: withdraw now so no ghost request stays answerable
