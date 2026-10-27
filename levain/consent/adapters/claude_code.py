@@ -76,7 +76,10 @@ from levain.consent.adapters.rules import (  # noqa: F401 - the rules' one home;
     GIT_STATE_FILES, _is_config_path, _is_git_config,
 )
 from levain.consent.broker_client import in_slot
-from levain.consent.contained import ContainedLaunchProof, CoreCall, core_call_of
+from levain.consent.contained import SANDBOX_ESCAPE_KEY as SANDBOX_ESCAPE_KEY
+from levain.consent.contained import SANDBOX_NET_TOOL as SANDBOX_NET_TOOL
+from levain.consent.contained import ContainedLaunchProof, CoreCall, core_call_of, sandbox_escape_requested, \
+    sandbox_net_tool
 from levain.consent.record import ExternalGateRequest
 
 AGENT = CLAUDE_CODE_AGENT
@@ -473,7 +476,7 @@ def _under_hooks_path(path: Path, cwd: str, cache: dict[Any, Any] | None = None,
         return True   # a path that cannot be examined (or no operator home to ask git as) is tagged
 
 
-def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bool:
+def nothing_can_decide(settings: AdapterSettings, tier: str | None = None, *, contained_shell: bool = False) -> bool:
     """No explicit word on and the cockpit the settings point at replays to no active key and no standing grant (or
     has no database, or does not replay): no grant or signed answer can verify and no hold is asked (input idle
     holds only for an enrolled key, :func:`away_hold`), so the hook
@@ -483,11 +486,14 @@ def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bo
     before any key was enrolled is not something that can decide (L3 r1 codex MED). For ``tier`` T3
     (:data:`AGENT_CONFIG_TIER`, never grant-eligible) only an active key whose class can sign a T3 allow counts;
     a standing grant never does, nor does away mode: a held T3 call that no key can sign only halts its session
-    (L3 r1 codex 6, r2)."""
-    return nothing_can_decide_why(settings, tier) is not None
+    (L3 r1 codex 6, r2). With ``contained_shell`` (:func:`decide_ex` sets it for a chat Bash call that carries its
+    launch's proof, the one call an SH1 grant can answer) an unexpired contained-shell grant counts too (L3 r1
+    complement MED)."""
+    return nothing_can_decide_why(settings, tier, contained_shell=contained_shell) is not None
 
 
-def nothing_can_decide_why(settings: AdapterSettings, tier: str | None = None) -> str | None:
+def nothing_can_decide_why(settings: AdapterSettings, tier: str | None = None, *,
+                           contained_shell: bool = False) -> str | None:
     """Why :func:`nothing_can_decide` holds, in words for the operator, or ``None`` when something can decide. The
     one body of that judgement: :func:`nothing_can_decide` is this being not ``None``."""
     if settings.away_mode and tier != AGENT_CONFIG_TIER:
@@ -509,20 +515,27 @@ def nothing_can_decide_why(settings: AdapterSettings, tier: str | None = None) -
         return "no enrolled key can sign an agent-config allow"
     if snap.active_keys() or _a_consent_grant_in_force(snap.policy.grants.values()):
         return None
+    if contained_shell:
+        from levain.authority import contained_shell_grant
+
+        if _a_consent_grant_in_force(snap.policy.grants.values(), kind=contained_shell_grant):
+            return None
     return "no enrolled key and no standing grant in force"
 
 
-def _a_consent_grant_in_force(grants: Iterable[Any]) -> bool:
-    """Whether any grant is a consent grant that has not expired: the two criteria of ``grant_refusal`` that hold
-    for every request (L3 r2 codex MED: an expired or other-kind grant answers nothing)."""
+def _a_consent_grant_in_force(grants: Iterable[Any], *, kind: Callable[[Any], bool] | None = None) -> bool:
+    """Whether any grant is a consent grant (or, with ``kind``, a grant ``kind`` accepts) that has not expired: the
+    two criteria of ``grant_refusal`` that hold for every request (L3 r2 codex MED: an expired or other-kind grant
+    answers nothing)."""
     from datetime import datetime, timezone
 
     from levain.authority import consent_grant
     from levain.cockpit.consent import parse_stamp
 
+    is_kind = consent_grant if kind is None else kind
     now = datetime.now(timezone.utc)
     for grant in grants:
-        if not consent_grant(grant):
+        if not is_kind(grant):
             continue
         try:
             if now < parse_stamp(grant.get("expires_at")):
@@ -833,11 +846,13 @@ class Decided:
 
 @dataclass(frozen=True)
 class Abstained:
-    """No answer: nothing could decide (``no_decider``, nothing filed, ``request`` ``None``, ``why`` the reason), or
-    the hold ended without one (``hold_expired``: a zero hold, a timeout, away mode ending, a lost withdraw race;
-    ``request`` the filed request, ``why`` ``""``). Each becomes the operator's own question."""
+    """No answer: nothing could decide (``no_decider``, nothing filed, ``request`` ``None``, ``why`` the reason), the
+    gate's allow was taken but the request it names could not be read, twice (``take_unread``, nothing filed,
+    ``request`` ``None``, ``why`` the take's request id), or the hold ended without one (``hold_expired``: a zero hold,
+    a timeout, away mode ending, a lost withdraw race; ``request`` the filed request, ``why`` ``""``). Each becomes
+    the operator's own question."""
     call: CoreCall
-    reason: Literal["no_decider", "hold_expired"]
+    reason: Literal["no_decider", "hold_expired", "take_unread"]
     request: ExternalGateRequest | None
     why: str
 
@@ -847,22 +862,21 @@ class Declined:
     """A call levain refuses outright: in chat each becomes a DENY carrying :data:`DECLINE_MESSAGES` [reason],
     never a question. ``call`` is ``None`` only when the event was too malformed to name one."""
     call: CoreCall | None
-    reason: Literal["invalid_event", "unconfined", "sandbox_escape_requested", "egress_not_levain"]
+    reason: Literal["invalid_event", "unconfined", "sandbox_escape_requested", "egress_not_levain",
+                    "contained_launch_mismatch"]
 
 
-DECLINED_REASONS = frozenset({"invalid_event", "unconfined", "sandbox_escape_requested", "egress_not_levain"})
+DECLINED_REASONS = frozenset({"invalid_event", "unconfined", "sandbox_escape_requested", "egress_not_levain",
+                              "contained_launch_mismatch"})
 DECLINE_MESSAGES: Mapping[str, str] = MappingProxyType({
     "invalid_event": "levain could not read this request",
     "unconfined": "levain refuses agent-config writes from an unconfined session",
     "sandbox_escape_requested": "no sandbox escape in chat: run the command again without dangerouslyDisableSandbox",
-    "egress_not_levain": "this launch's network is not the one levain built, so levain opens nothing for it"})
+    "egress_not_levain": "this launch's network is not the one levain built, so levain opens nothing for it",
+    "contained_launch_mismatch": "levain could not match this call to the launch it came from"})
 
 CoreResult = Decided | Abstained | Declined
 
-# the vendor's key that asks to run a Bash call outside its sandbox (R8-5); its value is never read
-SANDBOX_ESCAPE_KEY = "dangerouslyDisableSandbox"
-# the vendor's tool name for a sandboxed network ask (rev 15, R15-2: under §3.8.5(o) none should reach the core)
-SANDBOX_NET_TOOL = "SandboxNetworkAccess"
 
 
 def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, environ: Mapping[str, str], home: Path,
@@ -896,9 +910,15 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
     bypass ruling 3b item 1. What
     the adapter trusts (:func:`protected_paths`) is taken from ``queue.directory``, ``settings``, ``home`` and the
     event's cwd here, never as a list from the caller, so no call can leave it out; a queue without a directory
-    raises before anything is filed. A chat call (``launch_nonce`` not ``""``) is declined before anything is
-    filed when it has no ``tool_use_id``, when it is Bash with :data:`SANDBOX_ESCAPE_KEY` in its input (any
-    value), and when it is :data:`SANDBOX_NET_TOOL` (any input); a hook caller's call is never declined for these.
+    raises before anything is filed. A ``contained_launch`` that is not of the right shape, or whose spawn nonce is
+    not ``launch_nonce`` (a hook caller's ``""`` included), is ``Declined(contained_launch_mismatch)`` before
+    anything is filed. A chat call (``launch_nonce`` not ``""``) is declined before anything is
+    filed when it has no ``tool_use_id``, when it asks to leave its sandbox
+    (:func:`~levain.consent.contained.sandbox_escape_requested`: a Bash call with the :data:`SANDBOX_ESCAPE_KEY` key,
+    any value) and when it is :data:`SANDBOX_NET_TOOL` (:func:`~levain.consent.contained.sandbox_net_tool`, any
+    input); each name is also matched case-folded and namespaced; a hook caller's call is never declined for these.
+    A gate allow the take spent whose request cannot be read on a second try is ``Abstained(take_unread)``,
+    nothing filed.
     A chat call's request is filed with ``event_source="chat"`` (its own ``chat:`` event id); a hook caller's is
     filed exactly as before."""
     if getattr(queue, "directory", None) is None:
@@ -919,19 +939,27 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
         tool_input = {}  # an MCP tool with no arguments arrives without tool_input (Q0 item 4)
     try:
         call = core_call_of(event, launch_nonce=launch_nonce)
-    except ValueError:
-        return Declined(None, "invalid_event")   # a chat call with no tool_use_id, or an input with no digest
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        # a chat call with no tool_use_id, or an input the digest cannot take: a non-string key, a cycle, a nesting
+        # deeper than the interpreter's stack (L3 r1 codex MED)
+        return Declined(None, "invalid_event")
+    if contained_launch is not None and (not launch_nonce or contained_launch.problem() is not None
+                                         or contained_launch.spawn_nonce != launch_nonce):
+        # the proof is this launch's or none: never another launch's, never on a hook call (L3 r1 codex HIGH)
+        return Declined(call, "contained_launch_mismatch")
     if launch_nonce:
-        if tool_name == "Bash" and isinstance(tool_input, Mapping) and SANDBOX_ESCAPE_KEY in tool_input:
+        if sandbox_escape_requested(tool_name, tool_input):
             return Declined(call, "sandbox_escape_requested")
-        if tool_name == SANDBOX_NET_TOOL:
+        if sandbox_net_tool(tool_name):
             return Declined(call, "egress_not_levain")
     session = call.session
     tool_use_id = event.get("tool_use_id")
     mode = event.get("permission_mode")
     posture = mode if isinstance(mode, str) and mode else None
-    if policy is None and nothing_can_decide(settings):
-        return Abstained(call, "no_decider", None, nothing_can_decide_why(settings) or "nothing can decide")
+    # the one call an SH1 grant can answer (policy.contained_shell_refusal: exactly Bash, a chat call, a proof)
+    sh1 = {"contained_shell": True} if launch_nonce and contained_launch is not None and tool_name == "Bash" else {}
+    if policy is None and nothing_can_decide(settings, **sh1):
+        return Abstained(call, "no_decider", None, nothing_can_decide_why(settings, **sh1) or "nothing can decide")
     protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected)
     if agent_config and unconfined(cwd, home=home, environ=environ):
@@ -945,6 +973,12 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
                                      posture=posture, event=EVENT)
         if took is not None:
             got_row = queue.get(took.request_id) if isinstance(took, Decision) else None
+            if got_row is None and isinstance(took, Decision):
+                # the take already spent the gate's allow: read once more, and if the request is still not there,
+                # file nothing (a second row would ask the operator again for a call they allowed: L3 r1 deepseek)
+                got_row = queue.get(took.request_id)
+                if got_row is None:
+                    return Abstained(call, "take_unread", None, took.request_id)
             if got_row is not None:
                 taken = _verified(took, got_row[0])
                 if taken is not None:

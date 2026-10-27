@@ -25,9 +25,17 @@ from typing import Any
 
 from levain.consent.record import tool_input_digest
 
-__all__ = ["CONTAINMENT_FORMAT", "ContainedLaunchProof", "CoreCall", "core_call_of"]
+__all__ = ["CONTAINMENT_FORMAT", "SANDBOX_ESCAPE_KEY", "SANDBOX_NET_TOOL", "ContainedLaunchProof", "CoreCall",
+           "core_call_of", "sandbox_escape_requested", "sandbox_net_tool", "vendor_name_is"]
 
 CONTAINMENT_FORMAT = "levain-containment/4"
+
+# the vendor's key that asks to run a Bash call outside its sandbox (R8-5); its value is never read
+SANDBOX_ESCAPE_KEY = "dangerouslyDisableSandbox"
+# the vendor's tool name for a sandboxed network ask (rev 15, R15-2: under §3.8.5(o) none should reach the core)
+SANDBOX_NET_TOOL = "SandboxNetworkAccess"
+# what may stand before a documented name in a namespaced variant of it ("mcp__srv__Bash", "x.Bash")
+_NAMESPACE_SEPARATORS = frozenset("_.:/")
 
 _HEX32 = re.compile(r"[0-9a-f]{32}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -71,9 +79,35 @@ class CoreCall:
     launch_nonce: str          # the spawn nonce for a chat launch; "" for every hook caller
 
     def digest(self) -> str:
-        """sha256 (hex) of the canonical JSON of the six fields: sorted keys, compact separators."""
-        text = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        """sha256 (hex) of the canonical JSON of the six fields: sorted keys, compact separators, ASCII (a lone
+        surrogate in a field is escaped, never an encoding error)."""
+        text = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def vendor_name_is(name: Any, documented: str) -> bool:
+    """Whether ``name`` (a tool name or an input key) is the vendor's ``documented`` name or a variant of it: equal,
+    equal case-folded, or, case-folded, ending in it right after a namespace separator (``_ . : /``). Only a DECLINE
+    uses this (it can only refuse more); what a grant answers stays an exact match."""
+    if not isinstance(name, str):
+        return False
+    if name == documented:
+        return True
+    folded, want = name.casefold(), documented.casefold()
+    return folded == want or (len(folded) > len(want) and folded.endswith(want)
+                              and folded[-len(want) - 1] in _NAMESPACE_SEPARATORS)
+
+
+def sandbox_escape_requested(tool_name: Any, tool_input: Any) -> bool:
+    """Whether a call asks to leave its sandbox: a Bash call (:func:`vendor_name_is`) whose input object holds the
+    :data:`SANDBOX_ESCAPE_KEY` key or a variant of it, at the top level, whatever its value."""
+    return vendor_name_is(tool_name, "Bash") and isinstance(tool_input, Mapping) \
+        and any(vendor_name_is(key, SANDBOX_ESCAPE_KEY) for key in tool_input)
+
+
+def sandbox_net_tool(tool_name: Any) -> bool:
+    """Whether ``tool_name`` is the vendor's sandboxed network ask (:data:`SANDBOX_NET_TOOL`) or a variant of it."""
+    return vendor_name_is(tool_name, SANDBOX_NET_TOOL)
 
 
 def core_call_of(event: Mapping[str, Any], *, launch_nonce: str) -> CoreCall:

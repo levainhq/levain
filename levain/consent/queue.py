@@ -268,6 +268,10 @@ _SCHEMA = (
     # a hook's own event id names one permission event: a retry of it, at any time, is refused
     "CREATE UNIQUE INDEX IF NOT EXISTS requests_hook_event ON requests (agent, agent_session_id, event_id) "
     "WHERE event_id LIKE 'hook:%'",
+    # and the chat core's own id for a vendor call: a retry of it is refused too (an index a store made before it
+    # gains on its next open, as dialog_outcomes; the format is unchanged, and no released levain files a chat: row)
+    "CREATE UNIQUE INDEX IF NOT EXISTS requests_chat_event ON requests (agent, agent_session_id, event_id) "
+    "WHERE event_id LIKE 'chat:%'",
     _receipts_table("receipts"),
     # terminal is terminal; the only moves are pending -> a terminal state (never by a ruling), pending -> undecided
     # (with no answer) and undecided -> allowed/denied by a ruling; a request's fields never change; nothing is
@@ -1007,7 +1011,7 @@ class ConsentQueue:
         row is never a gate's row (:meth:`take_gate_allow` takes only ``hook:`` rows) and never meets a gate filing of
         the same tool-use id in the hook-event index. Either
         way two filings are two requests, never one returned twice: a hook event id is unique per agent and
-        session in the store, so filing the same event again raises, at any time. ``resume`` is what a later
+        session in the store (a ``hook:`` and a ``chat:`` id each), so filing the same event again raises, at any time. ``resume`` is what a later
         resume of the session needs (``permission_mode``, ``invocation`` one of :data:`INVOCATIONS`,
         ``codex_pid`` / ``claude_pid`` the agent's process, ``claude_started`` / ``claude_flags`` that process's
         start time and the option names on its command line (never their values) as the OS reported them,
@@ -1323,16 +1327,16 @@ class ConsentQueue:
             args: tuple[Any, ...] = (agent, agent_session_id, tool_name, digest)
             row = None
             if use_id is not None:
-                for prefix in ("hook:", "chat:"):
-                    row = conn.execute("SELECT id, state, decided_at " + where + " AND event_id = ? "
-                                       "ORDER BY received_at DESC, rowid DESC LIMIT 1",
-                                       args + (prefix + use_id,)).fetchone()
-                    if row is not None:
-                        break
+                # the newest filing of this id, of either prefix (L3 r1: a hook row is not preferred to a newer chat row)
+                row = conn.execute("SELECT id, state, decided_at " + where + " AND event_id IN (?, ?) "
+                                   "ORDER BY received_at DESC, rowid DESC LIMIT 1",
+                                   args + ("hook:" + use_id, "chat:" + use_id)).fetchone()
             if row is None:
                 # a request that carries another call's id, of either prefix, is not this call's; one with none (a
-                # PermissionRequest Claude Code and Codex send without it) could be
-                extra = " AND event_id NOT LIKE 'hook:%' AND event_id NOT LIKE 'chat:%'" if use_id is not None else ""
+                # PermissionRequest Claude Code and Codex send without it) could be, but never a chat-core row,
+                # which always carries its call's id (L3 r1 deepseek MED 2)
+                extra = " AND event_id NOT LIKE 'hook:%' AND event_id NOT LIKE 'chat:%'" if use_id is not None \
+                    else " AND event_id NOT LIKE 'chat:%'"
                 row = conn.execute("SELECT id, state, decided_at " + where + extra +
                                    " ORDER BY (state = 'pending') DESC, received_at DESC, rowid DESC LIMIT 1",
                                    args).fetchone()

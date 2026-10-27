@@ -233,9 +233,11 @@ _OPERATOR_SUBREASONS = frozenset({"class", "revoked", "late"})
 _REFUSAL_AFTER = SETTLE - _CLOCK_SLACK
 
 
-def _tool_use_id_of(event_id: str) -> str | None:
+def _tool_use_id_of(event_id: Any) -> str | None:
     """The tool-use id a request filed with its call's id carries: what follows a ``hook:`` (a hook) or ``chat:`` (the chat
-    core) prefix, else ``None`` (a request filed without one)."""
+    core) prefix, else ``None`` (a request filed without one, or an event id that is not a string)."""
+    if not isinstance(event_id, str):
+        return None
     return event_id.split(":", 1)[1] if event_id.startswith(("hook:", "chat:")) else None
 
 

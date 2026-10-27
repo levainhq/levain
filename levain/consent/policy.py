@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Any
 from levain.authority import (consent_grant, consent_grant_tool_problem, consent_mcp_declaration, consent_mcp_input_fits,
                               consent_root_problem, contained_shell_grant)
 from levain.cockpit.consent import ConsentError, parse_stamp
-from levain.consent.contained import ContainedLaunchProof
+from levain.consent.contained import ContainedLaunchProof, sandbox_escape_requested
 from levain.consent.record import tool_input_digest
 
 if TYPE_CHECKING:
@@ -386,9 +386,11 @@ def contained_shell_refusal(grant: Mapping[str, Any], request: ExternalGateReque
                             contained_launch: ContainedLaunchProof | None) -> str | None:
     """Why the contained-shell grant ``grant`` (SH1) does not answer ``request`` from the launch ``contained_launch``
     proves, at ``now``, for ``tool_input`` under ``posture``; ``None`` when every criterion holds. Checked in this
-    order, the first failing one named: a proof of the right shape; a contained-shell grant; not agent config; the
+    order, the first failing one named: a proof of the right shape; a contained-shell grant; a chat call (its
+    event id ``chat:`` and a call id); not agent config; the
     grant's agent; the tool is exactly ``Bash`` (no case fold, no strip, never an MCP tool); the input an object
-    without the ``dangerouslyDisableSandbox`` key (any value; the command is never read); the input the request was
+    without the ``dangerouslyDisableSandbox`` key or a case-folded or namespaced variant of it
+    (:func:`~levain.consent.contained.sandbox_escape_requested`; any value; the command is never read); the input the request was
     filed for; the posture; unexpired; the grant's ``containment_digest`` is the proof's ``profile_digest``; the
     request's directory is the launch's; the launch's directory inside the grant's workspace, which is, here and
     now, the directory the grant was signed for and not ``/`` or ``home`` or above it."""
@@ -397,6 +399,9 @@ def contained_shell_refusal(grant: Mapping[str, Any], request: ExternalGateReque
         return "no contained launch"
     if not contained_shell_grant(grant):
         return "not a contained-shell grant"
+    if not isinstance(request.event_id, str) or not request.event_id.startswith("chat:") \
+            or request.event_id == "chat:":
+        return "not a chat call"   # the grant is chat-only: a hook row is never answered by it (L3 r1 codex HIGH)
     if request.tier == AGENT_CONFIG_TIER:
         return "agent config is never answered by a grant"
     if grant.get("agent") != request.agent:
@@ -405,7 +410,7 @@ def contained_shell_refusal(grant: Mapping[str, Any], request: ExternalGateReque
         return "not the Bash tool"
     if not isinstance(tool_input, Mapping):
         return "the input is not an object"
-    if "dangerouslyDisableSandbox" in tool_input:
+    if sandbox_escape_requested(request.tool_name, tool_input):
         return "the call asks to leave the sandbox"
     try:
         if tool_input_digest(tool_input) != request.tool_input_digest:

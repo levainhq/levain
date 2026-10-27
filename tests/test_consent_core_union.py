@@ -111,7 +111,8 @@ def test_declined_reasons_are_the_literal_and_each_has_a_message():
     assert set(typing.get_args(hints["reason"])) == cc.DECLINED_REASONS
     assert set(cc.DECLINE_MESSAGES) == cc.DECLINED_REASONS
     assert all(isinstance(m, str) and m for m in cc.DECLINE_MESSAGES.values())
-    assert set(typing.get_args(typing.get_type_hints(cc.Abstained)["reason"])) == {"no_decider", "hold_expired"}
+    assert set(typing.get_args(typing.get_type_hints(cc.Abstained)["reason"])) == {"no_decider", "hold_expired",
+                                                                                   "take_unread"}
 
 
 # --- each exit of decide maps to one tag -------------------------------------------------------------------
@@ -185,11 +186,11 @@ def test_take_path_uses_request_not_tuple(tmp_path):
     assert out.request.id == q.take.request_id and q.filed == []
 
 
-@pytest.mark.parametrize("how", ["get_none", "other_digest"])
-def test_take_path_unverified_take_falls_through_to_file(tmp_path, how):
-    q = Q(None, get=how != "get_none")
-    took = _take(q)
-    q.take = replace(took, request_digest="sha256:other") if how == "other_digest" else took
+def test_take_path_unverified_take_falls_through_to_file(tmp_path):
+    # a take whose request is read but does not verify is no take; a take whose request cannot be read is
+    # Abstained(take_unread), nothing filed (fix round 1, D6: tests/test_consent_d1cb_fix_r1.py)
+    q = Q(None)
+    q.take = replace(_take(q), request_digest="sha256:other")
     out = ex(_event(*CONFIG), q, tmp_path)
     assert len(q.filed) == 1 and isinstance(out, cc.Abstained) and out.reason == "hold_expired"
     assert cc.decide(_event(*CONFIG), q, AWAY, environ=env(tmp_path), home=tmp_path, idle=lambda: None) is None
