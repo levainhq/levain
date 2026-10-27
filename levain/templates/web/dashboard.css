@@ -1591,6 +1591,9 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
 }
 /* Between the stacked breakpoint and the width where the labelled Calm button fits beside the name, Calm shows its icon; the label stays its accessible name (aria-label + title, set by the page) */
 @media (1100px < width <= 1280px) {
+  /* the media width counts a classic scrollbar (Linux, 15px) that the bar cannot use: at 1101 there CI's Linux Chrome put
+     the readout 1px over the tabs with the bar's wide gaps (run 40505814450), so the band's gaps are the narrower step */
+  body.ke .masthead { gap: var(--sp-4); }
   body.ke .masthead #calmbtn { font-size: 0; padding: var(--sp-3); gap: 0; }   /* the zero-size label is still a flex item: without gap: 0 the bar's gap sits between it and the glyph */
   body.ke .masthead #calmbtn::before { content: "\2248"; font-size: var(--fs-title); }
   body.ke .masthead #calmbtn[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
