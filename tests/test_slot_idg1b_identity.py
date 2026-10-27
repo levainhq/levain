@@ -267,14 +267,28 @@ def test_darwin_claude_login_runs_under_the_session_profile(tmp_path):
     assert c["slot_procs"] == [] and c["forwarders"] == []
 
 
-def test_darwin_a_lingering_slot_process_spawns_no_child(tmp_path):
-    """macOS has no session cgroup and no forwarder: a slot-uid process alive after the login is refused, never killed
-    here (END's domain kill is END's)."""
+def test_darwin_a_lingering_slot_process_is_ended_before_the_child(tmp_path):
+    """macOS: launchd's per-uid agents (``distnoted``) run as the slot uid and outlive the vendor; the domain is ended
+    and proven (END's own kill, proc.end_domain) before the child, so the call is not refused for them."""
     w, la, table = _darwin(tmp_path, vendor_lingers=True)
     calls = _capture(w, la, table)
     s = _login(w, la, "claude")
+    assert w.state(s).fields["identity"] == {"observed_id": UUID}
+    (c,) = calls
+    assert c["slot_procs"] == [] and la.of("vendor")[0]["pid"] not in table.procs
+
+
+def test_darwin_an_unkillable_slot_process_spawns_no_child(tmp_path):
+    w, la, table = _darwin(tmp_path, vendor_lingers=False)
+    calls = _capture(w, la, table)
+
+    def plant(step):
+        if step == "identity":
+            table.add(99002, w.alloc(w.session).slot_uid, immortal=True)
+    w.on_step = plant
+    s = _login(w, la, "claude")
     assert w.state(s).fields["identity"] == {"result": "identity-window"}
-    assert calls == [] and la.of("vendor")[0]["pid"] in table.procs
+    assert calls == []
 
 
 def test_the_claude_call_needs_a_session():

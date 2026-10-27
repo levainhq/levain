@@ -787,11 +787,12 @@ def identity_capture(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
 
     1. the alloc re-read unchanged and the record still running (ACTIVE or BRAKED), else ``identity-window`` /
        ``not-active:<STATE>``: an END that ran since the vendor exited is never raced;
-    2. Linux egress: the session's kill domain ended and proven (the forwarder start left running is a slot-uid
-       process too);
+    2. the session's kill domain ended and proven (:func:`kill_domain`, END's own kill), else ``identity-window``:
+       Linux, the forwarder start left running is a slot-uid process; macOS, launchd's per-uid agents (``distnoted``)
+       run as the slot uid and outlive the vendor (1019-s1design HANDOFF, 1026-14 RULINGS #5), and the bootout ends
+       them and the domain a vendor-registered job would start from;
     3. no process of the slot uid (proc.py's END proof, as clone-check's window), else ``identity-window``: the slot
-       has no process left to change its credential between this read and END's park [reasoned; known edge, macOS:
-       a launchd job the vendor registered in the slot's domain could start one before END's bootout];
+       has no process left to change its credential between this read and END's park;
     4. Linux egress: a fresh forwarder (:func:`_spawn_forwarder`), so the call reaches the passthrough tunnel;
     5. the child, its output captured. A capture or spawn failure is ``identity-unparsable`` (root read no answer).
     """
@@ -803,14 +804,12 @@ def identity_capture(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
             rec = read_record(ctx, a.session)
             if rec is None or rec.state not in (R.ACTIVE, R.BRAKED):
                 raise Refused(f"not-active:{rec.state if rec else 'none'}", a.session)
-            relay = a.slot.slot_class == "egress" and seams.host == "linux"
-            if relay:
-                res, _ = kill_domain(ctx, a)
-                if not res.proven:
-                    raise Refused("identity-window", f"the kill domain was not proven empty: {res.name}")
+            res, _ = kill_domain(ctx, a)
+            if not res.proven:
+                raise Refused("identity-window", f"the kill domain was not proven empty: {res.name}")
             if not _no_slot_process(ctx, a):
                 raise Refused("identity-window", "a slot-uid process is alive after the login")
-            if relay:
+            if a.slot.slot_class == "egress" and seams.host == "linux":
                 _spawn_forwarder(ctx, a)
             spec = _spec(ctx, a, "identity")
             argv, cgroup = launch(ctx, a, spec)
