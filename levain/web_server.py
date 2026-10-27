@@ -114,6 +114,7 @@ from levain.cockpit.routes import VARY as COCKPIT_VARY
 from levain.cockpit.routes import handle_get as handle_cockpit_get
 from levain.cockpit.routes import EVENTS_PATH, is_cockpit_path
 from levain.cockpit import stream as cockpit_stream
+from levain.cockpit import threads as cockpit_threads
 from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb,
                                   record_served_verbs, retier)
 
@@ -736,6 +737,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
     # The sign sheet's script (OS-1): its page is GET /sign/<id>, served by _route beside a Signer.
     "/sign.js": ("sign.js", "text/javascript; charset=utf-8"),
+    # The thread view (CH-U1a): the Build tab's Threads zone, over GET /cockpit/threads.json and /cockpit/thread/<id>.json.
+    "/thread_view.js": ("thread_view.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -772,11 +775,11 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/edit",
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
-    _GRANT_LIST_PATH,
+    _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
 _RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
-                                       _GRANT_PREFIX, _SHEET_PREFIX, _PUSH_PREFIX)
+                                       _GRANT_PREFIX, _SHEET_PREFIX, _PUSH_PREFIX, cockpit_threads.THREAD_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -2004,6 +2007,37 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
+    def _serve_threads(self, path: str, *, head: bool) -> None:
+        """``GET /cockpit/threads.json`` and ``GET /cockpit/thread/<th-id>.json`` (CH-U1a): the coordinator's threads and
+        one thread's stream, read-only (:func:`levain.cockpit.threads.serve_threads`). A thread carries the operator's
+        lines and the agent's words and tool calls, so it rides the consent body's gate: reached only through
+        ``_route``, then a surface token on every bind, before the store is opened. ``dispatch.db`` lives in the consent
+        directory, resolved as the egress reading resolves it: a reader naming no queue reads nothing, never the
+        default queue's."""
+        if not self._off_box_token_valid():
+            self._send(json.dumps({"error": "forbidden", "message": (
+                f"the thread record needs this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
+            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
+                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            return
+        reader = self.server.consent_reader
+        if not hasattr(reader, "directory"):
+            status, payload = ((200, {"threads": [], "truncated": False}) if path == cockpit_threads.THREADS_LIST_PATH
+                               else (404, {"error": "not_found", "message": "no such thread recorded"}))
+        else:
+            from levain.consent.queue import default_queue_dir
+
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                return
+            try:
+                status, payload = cockpit_threads.serve_threads(
+                    path, "", directory=reader.directory if reader.directory is not None else default_queue_dir())
+            finally:
+                self.server.request_gate.release()
+        self._send(cockpit_threads.encode(payload), "application/json; charset=utf-8", status=status, head=head,
+                   headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
     def _serve_session_log(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/session/<stem>.json``: one agent session's transcript (``session_log.read_session``). The
         consent body's gate: reached only through ``_route``, then a surface token on every bind, judged by
@@ -2330,6 +2364,9 @@ class _Handler(GuardedHandler):
             return
         if path.startswith(_SESSION_LOG_PREFIX) and path.endswith(_SESSION_LOG_SUFFIX):
             self._serve_session_log(path, head=head)
+            return
+        if cockpit_threads.is_threads_path(path):
+            self._serve_threads(path, head=head)
             return
 
         if is_cockpit_path(path):

@@ -854,3 +854,68 @@
   });
   load();
 })();
+
+// CH-U1a: the Build tab's Threads zone. The coordinator's threads and one thread's stream, read-only, drawn by
+// thread_view.js (LevainThreadView) over GET /cockpit/threads.json and /cockpit/thread/<id>.json. Those routes need the
+// page's write token on every bind, so the zone stays hidden on a page holding none. It polls only while the Build tab
+// is shown and the page is visible; leaving stops the poll, and coming back starts again at the thread list.
+(function () {
+  "use strict";
+  const WRITE_TOKEN_KEY = "levain_write_token";
+  let section = null, host = null, view = null;
+
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  }
+  function token() { try { return window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { return ""; } }
+
+  function build() {
+    section = el("section", "ck-zone th-zone");
+    section.dataset.zone = "threads";
+    section.dataset.modes = "build";
+    section.hidden = true;
+    const head = el("div", "zone-head");
+    head.appendChild(el("div", "zone-title", "Threads"));
+    head.appendChild(el("span", "zone-gloss", "what each coordinator thread said, in the order it happened"));
+    section.appendChild(head);
+    const grid = el("div", "ck-zgrid th-grid");
+    const panel = el("div", "panel k-list th-panel");
+    panel.dataset.modes = "build";   // dashboard.css hides a zone whose panel names no tab for the current mode
+    const ph = el("div", "phead");
+    ph.appendChild(el("h2", null, "Coordinator threads"));
+    panel.appendChild(ph);
+    host = el("div", "pbody th-body");
+    panel.appendChild(host);
+    grid.appendChild(panel);
+    section.appendChild(grid);
+    const main = document.querySelector("main.frame");
+    if (main) main.appendChild(section); else document.body.appendChild(section);
+  }
+
+  function sync() {
+    const want = !!token() && document.body.dataset.mode === "build" && document.visibilityState !== "hidden";
+    section.hidden = !token();
+    if (want && !view) {
+      host.replaceChildren();
+      const T = window.LevainCockpitTransport;
+      view = window.LevainThreadView.mount(host, { headers: () => (T ? T.headers() : {}) });
+    } else if (!want && view) {
+      view.stop();
+      view = null;
+    }
+  }
+
+  function start() {
+    if (!window.LevainThreadView || !document.querySelector("main.frame")) return;
+    build();
+    new MutationObserver(sync).observe(document.body, { attributes: true, attributeFilter: ["data-mode"] });
+    document.addEventListener("visibilitychange", sync);
+    window.addEventListener("storage", (e) => { if (e.key === WRITE_TOKEN_KEY) sync(); });
+    sync();
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+  else start();
+})();
