@@ -36,6 +36,7 @@ from pathlib import Path
 from levain.autonomic import db as vdb
 from levain.autonomic.db import StoreFormatError
 from levain.autonomic.journal import UNSIGNED_DECIDER
+from levain.autonomic.posture import Posture
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 
@@ -89,9 +90,10 @@ V3_TABLES = (
     # D72: the terminal row of a request subject (a cancel=False refusal); request_id = '<run_id>:<effect_id>'
     "CREATE TABLE IF NOT EXISTS requests (request_id TEXT PRIMARY KEY, reason TEXT NOT NULL, "
     "receipt_id TEXT NOT NULL)",
-    # I5: how many times a live subject was held by a fault; at HELD_LIMIT it closes `refused`
+    # I5: how many times a live subject was held by a fault; at HELD_LIMIT it closes `refused`. O-p2-1 R2-1: `attempt`
+    # is the link's latest attempt whose not_started this count recorded (NULL: a count with no effect attempt)
     "CREATE TABLE IF NOT EXISTS held_counts (subject TEXT PRIMARY KEY, n INTEGER NOT NULL CHECK (n >= 1), "
-    "last_reason TEXT NOT NULL, mark INTEGER NOT NULL)",
+    "last_reason TEXT NOT NULL, mark INTEGER NOT NULL, attempt INTEGER)",
     # I11: the subject a close_subject statement is closing (empty outside one statement; INVARIANT closing_left)
     "CREATE TABLE IF NOT EXISTS closing (subject TEXT PRIMARY KEY)",
     # I11: the one way a receipt row is written: receipt + its subject's terminal row, in one statement
@@ -129,7 +131,7 @@ KNOWN_COLUMNS = {
     "holds": ("hold_id", "run_id", "effect_id", "binding_id", "digest", "at", "pending", "pending_id", "chain",
               "chained", "decided", "decided_by", "decided_posture", "seq", "signer", "signature", "challenge", "fence",
               "trigger_event", "decisions"),
-    "held_counts": ("subject", "n", "last_reason", "mark"),
+    "held_counts": ("subject", "n", "last_reason", "mark", "attempt"),
     "closing": ("subject",),
 }
 _HOLD_IDENT = ("hold_id", "run_id", "effect_id", "binding_id", "digest", "at", "pending", "pending_id", "chain",
@@ -271,17 +273,76 @@ def _abort(name: str, when: str, why: str, on: str) -> str:
     return f"CREATE TRIGGER IF NOT EXISTS {name} {on} WHEN {when} BEGIN SELECT RAISE(ABORT, '{why}'); END"
 
 
+def _rank(seal_sql: str) -> str:
+    # 10.Q2 / R2-3: a seal's posture as its Posture rank, emitted from the enum; no ELSE, so an unknown name is NULL
+    whens = " ".join(f"WHEN '{p.name}' THEN {int(p)}" for p in Posture)
+    return f"(CASE json_extract({seal_sql}, '$.posture') {whens} END)"
+
+
+def _absent(doc: str, path: str) -> str:
+    # R4-2: a missing key and a JSON null are one absence (the effects_grant_shape idiom)
+    return f"IFNULL(json_type({doc}, '{path}'), 'null') = 'null'"
+
+
+# O-p2-1: the link's previous attempt P of an insert NEW (attempt n - 1)
+_PREV = ("FROM effects p WHERE p.run_id = NEW.run_id AND p.effect_id = NEW.effect_id "
+         "AND p.attempt = NEW.attempt - 1")
+_LINK_HELD = "EXISTS (SELECT 1 FROM holds h WHERE h.run_id = NEW.run_id AND h.effect_id = NEW.effect_id)"
+# R3-2 as amended by R4-2: with a hold on the link, the seal's $.decision is the hold's CURRENT decision. Every field is
+# type-checked first and compared with `=` to a column checked IS NOT NULL (R3-1); a NULL decided_posture is matched
+# by an explicit absence, witnessed by the hold row
+_HELD_DECISION = (
+    "EXISTS (SELECT 1 FROM holds h WHERE h.run_id = NEW.run_id AND h.effect_id = NEW.effect_id AND h.decided IS 1 "
+    "AND h.decisions IS NOT NULL AND h.decided_by IS NOT NULL "
+    "AND json_type(NEW.seal, '$.decision.generation') = 'integer' "
+    "AND json_extract(NEW.seal, '$.decision.generation') = h.decisions "
+    "AND json_type(NEW.seal, '$.decision.by') = 'text' AND json_extract(NEW.seal, '$.decision.by') = h.decided_by "
+    f"AND ((h.decided_posture IS NULL AND {_absent('NEW.seal', '$.decision.posture')}) "
+    "OR (h.decided_posture IS NOT NULL AND json_type(NEW.seal, '$.decision.posture') = 'text' "
+    "AND json_extract(NEW.seal, '$.decision.posture') = h.decided_posture)))")
+# R3-1 as amended by R4-2: with no hold, the retry re-uses P's cover (both grant-less and cover-less, or the same cover
+# text) at a posture rank no lower than P's (both ranks known)
+_HOLDLESS_AUTHORITY = (
+    f"EXISTS (SELECT 1 {_PREV} AND (({_absent('NEW.seal', '$.grant')} AND {_absent('p.seal', '$.grant')} "
+    f"AND {_absent('NEW.seal', '$.cover')} AND {_absent('p.seal', '$.cover')}) "
+    "OR (json_type(NEW.seal, '$.cover') = 'text' AND json_type(p.seal, '$.cover') = 'text' "
+    "AND json_extract(NEW.seal, '$.cover') = json_extract(p.seal, '$.cover'))) "
+    "AND json_type(NEW.seal, '$.posture') = 'text' AND json_type(p.seal, '$.posture') = 'text' "
+    f"AND {_rank('NEW.seal')} IS NOT NULL AND {_rank('p.seal')} IS NOT NULL "
+    f"AND {_rank('NEW.seal')} >= {_rank('p.seal')})")
+
+RETRY_TRIGGERS = (
+    # section 5: attempt 1 opens a link (no row yet); attempt n > 1 follows the link's LATEST row, attempt n - 1,
+    # ended not_started, of the same digest (a retry after fired / outcome_unknown, or of another payload, is refused)
+    _abort("effects_attempt", "NOT IFNULL(CASE WHEN NEW.attempt = 1 THEN NOT EXISTS (SELECT 1 FROM effects e "
+           "WHERE e.run_id = NEW.run_id AND e.effect_id = NEW.effect_id) ELSE "
+           f"EXISTS (SELECT 1 {_PREV} AND p.state = 'not_started' AND p.digest = NEW.digest) "
+           "AND NOT EXISTS (SELECT 1 FROM effects q WHERE q.run_id = NEW.run_id AND q.effect_id = NEW.effect_id "
+           "AND q.attempt >= NEW.attempt) END, 0)",
+           "O-p2-1: attempt 1 opens a link; attempt n follows attempt n-1 not_started, same digest",
+           "BEFORE INSERT ON effects"),
+    # A1 + R2-1: the predecessor's not_started was COUNTED (the link's request count names attempt n - 1) and the
+    # count is under the bound
+    _abort("effects_attempt_counted", "NEW.attempt > 1 AND NOT IFNULL(EXISTS (SELECT 1 FROM held_counts h "
+           f"WHERE h.subject = {_link_request('NEW')} AND h.attempt IS NOT NULL AND h.attempt = NEW.attempt - 1 "
+           f"AND h.n < {_HELD_LIMIT_SQL}), 0)",
+           "R2-1: a retry follows the count of its predecessor, under the held bound", "BEFORE INSERT ON effects"),
+    # 10.Q2(a) + R2-2 + R3-1 + R3-2 + R4-2: who may retry
+    _abort("effects_attempt_authority", f"NEW.attempt > 1 AND NOT IFNULL(({_LINK_HELD} AND {_HELD_DECISION}) "
+           f"OR (NOT {_LINK_HELD} AND {_HOLDLESS_AUTHORITY}), 0)",
+           "R3-1/R3-2: a retry carries the current decision of its link, or the cover of its predecessor at no lower posture",
+           "BEFORE INSERT ON effects"),
+)
+
+
 V3_TRIGGERS = (
     # ---- D69: no row is ever replaced (every PK / UNIQUE column, checked before the conflict can resolve)
     _abort("runs_new", "EXISTS (SELECT 1 FROM runs WHERE run_id = NEW.run_id)",
            "D69: a row is never replaced", "BEFORE INSERT ON runs"),
     _abort("effects_new", "EXISTS (SELECT 1 FROM effects WHERE run_id = NEW.run_id AND effect_id = NEW.effect_id "
            "AND attempt = NEW.attempt)", "D69: a row is never replaced", "BEFORE INSERT ON effects"),
-    # O-p2-1 B1a PLACEHOLDER: a link's first row is attempt 1, and no retry (attempt >= 2) is admitted until B1b's
-    # effects_attempt (retry legality, authority, witness) replaces this trigger under the same name
-    _abort("effects_attempt", "NEW.attempt IS NOT 1 OR EXISTS (SELECT 1 FROM effects e WHERE e.run_id = NEW.run_id "
-           "AND e.effect_id = NEW.effect_id AND e.attempt IS NOT 1)",
-           "O-p2-1: only attempt 1 of a link is admitted (no retry rule yet)", "BEFORE INSERT ON effects"),
+    # O-p2-1: the retry rules (legality, the counted witness, authority)
+    *RETRY_TRIGGERS,
     _abort("cancels_new", "EXISTS (SELECT 1 FROM cancels WHERE run_id = NEW.run_id)",
            "D69: a row is never replaced", "BEFORE INSERT ON cancels"),
     _abort("pendings_new", "EXISTS (SELECT 1 FROM manual_pendings WHERE pending_id = NEW.pending_id "
@@ -296,7 +357,7 @@ V3_TRIGGERS = (
            "OR IFNULL(json_type(NEW.seal, '$.confirm_class'), 'absent') NOT IN ('true', 'false') "
            "OR json_type(NEW.seal, '$.guard') IS NOT 'array' OR NEW.started_at IS NOT NULL "
            "OR json_type(NEW.seal, '$.links') IS NOT 'integer' OR json_extract(NEW.seal, '$.links') < 1 "
-           "OR instr(NEW.run_id, ':') > 0",
+           "OR instr(NEW.run_id, ':') > 0 OR instr(NEW.run_id, '#') > 0",
            "D56/D68/D71/I2: a run is born sealed (class, guard, links) and unstarted", "BEFORE INSERT ON runs"),
     _abort("runs_guarded", f"json_extract(NEW.seal, '$.confirm_class') = 1 AND NOT {_guard_complete('NEW.seal')}",
            "D68: a confirm-class run is admitted only with its complete guard", "BEFORE INSERT ON runs"),
@@ -615,13 +676,23 @@ ATTEMPT_INDEXES = (
     "CREATE UNIQUE INDEX IF NOT EXISTS holds_one_link ON holds (run_id, effect_id)",
 )
 
+# O-p2-1 R2-1: a count that names an attempt names the link's LATEST attempt, ended not_started (NULL: no attempt)
+_HELD_ATTEMPT = ("(NEW.attempt IS NULL OR EXISTS (SELECT 1 FROM effects a WHERE " + _link_request("a")
+                 + " = NEW.subject AND a.attempt = NEW.attempt AND a.state = 'not_started' AND NOT EXISTS ("
+                 "SELECT 1 FROM effects b WHERE b.run_id = a.run_id AND b.effect_id = a.effect_id "
+                 "AND b.attempt > a.attempt)))")
 HELD_TRIGGERS = (
     _abort("held_born", f"NOT IFNULL(NEW.n = 1 AND NEW.mark IS {_progress('NEW.subject')} "
-           f"AND NEW.last_reason GLOB '{SUBJECT_REASON}' AND NOT {_closed('NEW.subject')}, 0)",
+           f"AND NEW.last_reason GLOB '{SUBJECT_REASON}' AND NOT {_closed('NEW.subject')} AND {_HELD_ATTEMPT}, 0)",
            "I11: a held count is born 1, at the live subject mark, for a subject fault", "BEFORE INSERT ON held_counts"),
+    # a same-mark rise records a new attempt (R3-3, R4-4: both NULL, or both named and the attempt rises) or carries
+    # the named attempt forward for an attempt-less fault (P1); a restart on progress may name any witnessed attempt
     _abort("held_move", f"NOT IFNULL(NEW.subject IS OLD.subject AND NEW.last_reason GLOB '{SUBJECT_REASON}' "
-           f"AND NOT {_closed('NEW.subject')} AND NEW.mark IS {_progress('NEW.subject')} AND ("
-           "(NEW.n = OLD.n + 1 AND NEW.mark IS OLD.mark) OR (NEW.n = 1 AND NEW.mark > OLD.mark)), 0)",
+           f"AND NOT {_closed('NEW.subject')} AND NEW.mark IS {_progress('NEW.subject')} AND {_HELD_ATTEMPT} AND ("
+           "(NEW.n = OLD.n + 1 AND NEW.mark IS OLD.mark AND ((OLD.attempt IS NULL AND NEW.attempt IS NULL) "
+           "OR (OLD.attempt IS NOT NULL AND NEW.attempt IS NOT NULL AND NEW.attempt > OLD.attempt) "
+           "OR (OLD.attempt IS NOT NULL AND NEW.attempt IS OLD.attempt))) "
+           "OR (NEW.n = 1 AND NEW.mark > OLD.mark)), 0)",
            "I11: a held count rises by one at the same mark, or restarts at 1 only on progress",
            "BEFORE UPDATE ON held_counts"),
 )
@@ -672,6 +743,9 @@ V74_TRIGGERS = V3_TRIGGERS + HELD_TRIGGERS + DECISION_TRIGGERS + LEGACY_TRIGGERS
 # O-p2-1 (A8): the states an effects row ENDS in, each carrying its receipt
 _EFFECT_ENDS = "('done', 'unknown', 'not_started')"
 
+# O-p2-1 R2-1 / glm F4 / R2-10 / R3-4: not_started_uncounted is a LIVE link (the held triggers' own _closed) whose
+# latest attempt ended not_started with no count naming it (effects_attempt_counted refuses its retry); the remedy is
+# the count, or the operator cancelling the run, which closes the link and clears the row
 INVARIANT = f"""
 SELECT 'terminal_without_receipt', 'run:' || c.run_id FROM cancels c
  WHERE c.legacy = 0 AND (c.receipt_id IS NULL OR NOT EXISTS (SELECT 1 FROM gate_receipts g
@@ -705,6 +779,13 @@ UNION ALL
 SELECT 'hold_rejected_without_run_close', 'run:' || h.run_id FROM holds h
  WHERE h.decided = 0 AND h.legacy = 0 AND NOT EXISTS (SELECT 1 FROM cancels c JOIN gate_receipts g ON g.receipt_id = c.receipt_id
        AND g.subject = 'run:' || c.run_id WHERE c.run_id = h.run_id)
+UNION ALL
+SELECT 'not_started_uncounted', {_effect_subj('ns')} FROM effects ns
+ WHERE ns.state = 'not_started' AND ns.legacy = 0
+   AND NOT EXISTS (SELECT 1 FROM effects x WHERE x.run_id = ns.run_id AND x.effect_id = ns.effect_id
+                   AND x.attempt > ns.attempt)
+   AND NOT EXISTS (SELECT 1 FROM held_counts hc WHERE hc.subject = {_link_request('ns')} AND hc.attempt IS ns.attempt)
+   AND NOT {_closed(_link_request('ns'))}
 """
 
 LEGACY_CENSUS = " UNION ALL ".join(
@@ -1249,23 +1330,48 @@ def held_limit(conn: sqlite3.Connection) -> int:
     return int(conn.execute("SELECT value FROM meta WHERE key = 'held_limit'").fetchone()[0])
 
 
-def count_held(conn: sqlite3.Connection, subject: str, reason: str) -> int:
+def count_held(conn: sqlite3.Connection, subject: str, reason: str, *, attempt: int | None = None) -> int:
     """Count one subject-specific hold of a live subject, in the caller's write transaction: born 1 at the subject's
     progress mark; +1 at the same mark; back to 1 when the mark moved. Returns the count (the caller closes the
-    subject ``refused`` with reason ``held_limit:<reason>`` at :func:`held_limit`). ``reason`` is ``subject:<why>``."""
+    subject ``refused`` with reason ``held_limit:<reason>`` at :func:`held_limit`). ``reason`` is ``subject:<why>``.
+
+    O-p2-1: ``attempt`` is the link attempt whose not_started close this count records (the witness a retry of the
+    next attempt needs, R2-1); the held triggers refuse one that is not the link's latest, not_started attempt. A
+    count of an attempt the row already names at the same mark returns the stored count and writes nothing (R3-3). A
+    count with no attempt keeps the attempt the row names (P1)."""
     _in_write(conn, "count_held")
     if not isinstance(reason, str) or conn.execute("SELECT ? GLOB ?", (reason, SUBJECT_REASON)).fetchone()[0] != 1:
         raise ValueError(f"count_held: reason {reason!r} is not {SUBJECT_REASON!r} (a subject-specific fault)")
+    if attempt is not None and (type(attempt) is not int or attempt < 1):
+        raise ValueError(f"count_held: attempt {attempt!r} is not an int >= 1")
     mark = conn.execute(f"SELECT {_progress(':s')}", {"s": subject}).fetchone()[0]
-    row = conn.execute("SELECT n, mark FROM held_counts WHERE subject = ?", (subject,)).fetchone()
+    row = conn.execute("SELECT n, mark, attempt FROM held_counts WHERE subject = ?", (subject,)).fetchone()
     if row is None:
-        conn.execute("INSERT INTO held_counts (subject, n, last_reason, mark) VALUES (?, 1, ?, ?)",
-                     (subject, reason, mark))
+        conn.execute("INSERT INTO held_counts (subject, n, last_reason, mark, attempt) VALUES (?, 1, ?, ?, ?)",
+                     (subject, reason, mark, attempt))
         return 1
+    if attempt is not None and row[2] == attempt and row[1] == mark:
+        return row[0]
     n = row[0] + 1 if mark == row[1] else 1
-    conn.execute("UPDATE held_counts SET n = ?, mark = ?, last_reason = ? WHERE subject = ?",
-                 (n, mark, reason, subject))
+    conn.execute("UPDATE held_counts SET n = ?, mark = ?, last_reason = ?, attempt = ? WHERE subject = ?",
+                 (n, mark, reason, row[2] if attempt is None else attempt, subject))
     return n
+
+
+def hold_decision(conn: sqlite3.Connection, hold_id: str) -> tuple[int, str | None, str | None] | None:
+    """R4-1: the decision a ``/3`` hold holds now, ``(generation, decided_by, decided_posture)``, the three values a
+    retry's ``$.decision`` must carry (``effects_attempt_authority``); None for no such hold. ``/3`` only: a ``/2``
+    ``holds`` table has no ``decisions`` column, so no shared ``/2`` read is changed for it."""
+    row = conn.execute("SELECT decisions, decided_by, decided_posture FROM holds WHERE hold_id = ?",
+                       (hold_id,)).fetchone()
+    return None if row is None else (row[0], row[1], row[2])
+
+
+def not_started_receipts(conn: sqlite3.Connection) -> frozenset[str]:
+    """10.Q1: the receipt ids of every effects row ended ``not_started`` (each carries its receipt: D54). Their
+    receipts say ``refused``: this set is what tells them apart for a by-mode reader (10.Q1 / R2-4 name
+    ``gate_liveness``; no reader takes it yet, /3 is unwired)."""
+    return frozenset(r for (r,) in conn.execute("SELECT receipt_id FROM effects WHERE state = 'not_started'"))
 
 
 # ---- environment faults (R13-7, R14-2) ------------------------------------------------------------------------------

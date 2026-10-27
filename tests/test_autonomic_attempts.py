@@ -125,8 +125,8 @@ def store(tmp_path):
 
 def hand_built(tmp_path, rows, name="hand") -> s.AutonomicStore3:
     """A /3 store whose rows ``rows(c)`` are written after :func:`ddl_v3` and before :func:`triggers_v3` (the window
-    the I15 upgrade stamps legacy rows in): the B1a placeholder refuses every attempt >= 2 insert, so a test that needs
-    one writes it here. The store is then this code's (fingerprint) and its own opener takes it."""
+    the I15 upgrade stamps legacy rows in): an attempt >= 2 row the retry rules would refuse without its counted,
+    authorised predecessor is written here. The store is then this code's (fingerprint) and its own opener takes it."""
     st = s.AutonomicStore3(tmp_path / name)
     st.directory.mkdir(parents=True)
     c = sqlite3.connect(st.path, isolation_level=None)
@@ -223,6 +223,9 @@ def test_a_not_started_close_ends_the_attempt_with_a_refused_receipt(store):
         (1, "not_started", "not_started:spawn", "ns:effect:r:link-0")]
     face = json.loads(c.execute("SELECT record FROM gate_receipts").fetchone()[0])
     assert (face["fired"], face["action_face"]["terminal_state"]) == (False, "refused")
+    # R2-1 / R3-4: until it is counted, a live link's not_started attempt is an invariant row
+    assert s.invariant(c) == [("not_started_uncounted", "effect:r:link-0")]
+    tx(c, lambda conn: s.count_held(conn, "request:r:link-0", "subject:not_started:spawn", attempt=1))
     assert s.invariant(c) == []
     assert c.execute(s.REAP_ORPHAN_RECEIPTS).fetchall() == []
     assert s.TERMINAL_MODES[("effects", "not_started")] == ("refused",)
@@ -306,16 +309,21 @@ def test_a_second_end_on_one_link_is_refused_at_its_close(tmp_path):
 
 
 # ---- the B1a placeholder for effects_attempt (B1b builds the retry rule) -------------------------------------------
-def test_until_the_retry_rule_an_attempt_past_1_is_refused(store):
+def test_a_retry_follows_its_counted_predecessor_and_numbers_are_never_skipped_or_reused(store):
+    # the retry rules in full: tests/test_autonomic_retry_authority.py
     c = raw(store)
+    retry = lambda n: ("INSERT INTO effects (run_id, effect_id, digest, state, seal, attempt) "  # noqa: E731
+                       "VALUES ('r', 'link-0', 'd', 'intent', ?, ?)", (EFF_SEAL, n))
     tx(c, started_run, intent, close_not_started)
-    for n in (2, 3):
-        with pytest.raises(sqlite3.IntegrityError, match="O-p2-1: only attempt 1"):
-            tx(c, ("INSERT INTO effects (run_id, effect_id, digest, state, seal, attempt) "
-                   "VALUES ('r', 'link-0', 'd', 'intent', ?, ?)", (EFF_SEAL, n)))
-    with pytest.raises(sqlite3.IntegrityError, match="D69"):
+    with pytest.raises(sqlite3.IntegrityError, match="R2-1"):
+        tx(c, retry(2))   # not counted yet
+    tx(c, lambda conn: s.count_held(conn, "request:r:link-0", "subject:not_started:spawn", attempt=1))
+    with pytest.raises(sqlite3.IntegrityError, match="O-p2-1: attempt 1 opens a link|R2-1|R3-1/R3-2"):
+        tx(c, retry(3))   # no attempt 2 to follow: each retry rule refuses it, the first to fire raises
+    with pytest.raises(sqlite3.IntegrityError, match="D69|O-p2-1: attempt 1 opens a link"):
         tx(c, intent)
-    assert rows_of(c) == [(1, "not_started", "ns:effect:r:link-0")]
+    tx(c, retry(2))
+    assert rows_of(c) == [(1, "not_started", "ns:effect:r:link-0"), (2, "intent", None)]
     c.close()
 
 
@@ -501,7 +509,8 @@ def test_the_invariant_reads_each_attempts_subject(tmp_path):
         by_hand(c, "r", "link-0", 2, "done", receipt="ns1")              # carries attempt 1's receipt
         by_hand(c, "r", "link-1", 1, "not_started", receipt="gone", result="not_started:x")
     c = raw(hand_built(tmp_path, build))
-    assert sorted(s.invariant(c)) == [("terminal_without_receipt", "effect:r:link-0#2"),
+    assert sorted(s.invariant(c)) == [("not_started_uncounted", "effect:r:link-1"),
+                                      ("terminal_without_receipt", "effect:r:link-0#2"),
                                       ("terminal_without_receipt", "effect:r:link-1")]
     c.close()
 
