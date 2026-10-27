@@ -344,8 +344,8 @@ def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, i
     """What each standing grant answered: ``{grant id: {"count", "last_at", "recent", "refused_count"}}`` for
     ``grants``, each ``(id, seq, hash)`` of the link that created or last changed it. An answer counts for a grant only when its
     stored answer names all three (``grant_id``, ``grant_seq``, ``grant_hash``), so a grant revoked and made again
-    under the same id starts with nothing. Read from the requests the queue allowed by a grant (``via = 'grant'``),
-    over the queue's whole history. ``recent`` holds the newest ``recent`` of them, each ``{"request_id", "at",
+    under the same id starts with nothing. Read from the requests the queue allowed by a grant (``via = 'grant'``,
+    or ``'contained_shell'`` for a contained-shell grant), over the queue's whole history. ``recent`` holds the newest ``recent`` of them, each ``{"request_id", "at",
     "tool", "cwd", "outcome"}``; ``outcome`` is the authority ledger's word for whether that call then ran
     (``accepted``, ``refused``, ``unknown`` when the ledger holds no row for it). ``refused_count`` is how many of
     ALL its calls (not only the newest ``recent``) the ledger reads as refused, so a refusal older than those still
@@ -375,7 +375,7 @@ def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, i
                     raise
         conn.execute("BEGIN")
         _check_format(conn)
-        match = ("via = 'grant' AND state = 'allowed' AND json_extract(answer, '$.grant_id') = ? "
+        match = ("via IN ('grant', 'contained_shell') AND state = 'allowed' AND json_extract(answer, '$.grant_id') = ? "
                  "AND json_extract(answer, '$.grant_seq') = ? AND json_extract(answer, '$.grant_hash') = ?")
         links: dict[str, tuple[int, str]] = {}
         for gid, seq, link_hash in wanted_grants:
@@ -453,7 +453,7 @@ def _read_ledger_into(conn: sqlite3.Connection, out: "dict[str, dict[str, Any]]"
             "json_extract(r.answer, '$.grant_hash'), COUNT(*) FROM requests r "
             f"JOIN (SELECT DISTINCT request_id FROM {_PER_CALL} WHERE phase = 'pre' AND outcome = 'refused') f "
             "ON f.request_id = r.id "
-            "WHERE r.via = 'grant' AND r.state = 'allowed' AND (json_extract(r.answer, '$.grant_id'), "
+            "WHERE r.via IN ('grant', 'contained_shell') AND r.state = 'allowed' AND (json_extract(r.answer, '$.grant_id'), "
             "json_extract(r.answer, '$.grant_seq'), json_extract(r.answer, '$.grant_hash')) IN (VALUES "
             + ", ".join("(?, ?, ?)" for _ in chunk) + ") GROUP BY 1, 2, 3", params).fetchall()
         got = {(gid, seq, h): int(n) for gid, seq, h, n in rows}

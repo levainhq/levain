@@ -355,6 +355,8 @@ def gate_output(decision: Decision) -> dict[str, Any]:
         how = f"your ruling on gap #{decision.gap} (key {decision.signer_fp})"
     elif decision.via == "grant":
         how = f"your standing consent grant {decision.grant_id}"
+    elif decision.via == "contained_shell":
+        how = f"your standing contained-shell grant {decision.grant_id}"
     else:
         how = f"a signed levain answer (key {decision.signer_fp})"
     return decision_output(decision.decision, how)

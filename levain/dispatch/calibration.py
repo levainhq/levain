@@ -12,9 +12,9 @@ because it is meant to read the queue without writing it; this module writes not
   or a late ruling (``via`` ruling). The operator's judgment, on that one call.
 * ``undecided``: the hold ended with no answer and no ruling yet. Its own class, never a label in either direction: there
   is no human judgment on it. One later ruled becomes an allow or deny label by its ruling.
-* a standing grant's allow (``via`` grant) is EXCLUDED and only counted: a grant is a judgment made once, ahead of the
-  call, over a class of calls. It is not a fresh human judgment on this call, and counting it would score the judge
-  against a rule the operator already wrote.
+* a standing grant's allow (``via`` grant or contained_shell) is EXCLUDED and only counted: a grant is a judgment
+  made once, ahead of the call, over a class of calls. It is not a fresh human judgment on this call, and counting it
+  would score the judge against a rule the operator already wrote.
 * expired and withdrawn requests went to the agent's own dialog; the queue holds no human verdict on them, so they are
   not labels either.
 
@@ -124,7 +124,7 @@ def read_labels(directory: Path | str | None = None, *, now: datetime, span: tim
     contexts: dict[str, JudgeContext] = {}
     grants = cut = 0
     for entry in (*listing.recent, *listing.undecided):
-        if entry.state not in ("undecided", "allowed", "denied") or entry.via == "grant":
+        if entry.state not in ("undecided", "allowed", "denied") or entry.via in ("grant", "contained_shell"):
             grants += entry.state in ("allowed", "denied")
             continue
         # an allowed or denied row with any via other than signature or ruling carries no signed judgment this layer
