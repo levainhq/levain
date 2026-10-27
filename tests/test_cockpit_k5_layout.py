@@ -4,6 +4,8 @@ empty line gets no controls. K5_DESIGN.md is the spec."""
 from __future__ import annotations
 
 import json
+
+import pytest
 from pathlib import Path
 
 from tests.test_cockpit_flip_parity import _drive, needs_browser
@@ -186,6 +188,41 @@ def test_the_entity_name_in_the_bar_is_not_truncated_at_1440_with_a_saved_layout
     out = _run(tmp_path, _seed("JSON.stringify({v: 1, zones: {operate: {order: ['now', 'tray']}}, collapsed: ['loops']})") + [
         {"eval": "const e = document.getElementById('entity'); [e.scrollWidth, e.clientWidth, e.textContent]"}])[-1]
     assert out[0] <= out[1], out
+
+
+# a full bar just above the stacked-layout breakpoint, in a font wider than the design's: Verdana forced on every element (inline, a <style> is blocked)
+FULL_BAR = ("(() => { %s"
+            " const n = document.getElementById('entity'); n.textContent = 'WWWWWWWWWWWWWW'; %s"
+            " const q = (s) => document.querySelector(s).getBoundingClientRect(), vw = document.documentElement, ue = document.querySelector('.masthead .unit');"
+            " ue.style.flex = 'none'; const nat = Math.round(q('.masthead .unit').width), natE = n.scrollWidth; ue.style.flex = '';"
+            " return new Promise(r => setTimeout(r, 200)).then(() => { const m = q('.masthead'), t = q('.masthead .seg'), u = q('.masthead .unit'), ro = q('.masthead .readout');"
+            " const jl = document.querySelector('.jar-label');"
+            " return { sw: vw.scrollWidth, cw: vw.clientWidth, unitLeft: Math.round(u.left), tabsRight: Math.round(t.right), readoutRight: Math.round(ro.right), mastRight: Math.round(m.right),"
+            " nameCut: n.scrollWidth > n.clientWidth, unitW: Math.round(u.width), nat, nameShrunk: n.clientWidth < Math.min(natE, n.clientWidth + 1) && Math.round(u.width) < nat, dbg: [Math.round(u.width), Math.round(ro.width), Math.round(ro.left), Math.round(q('.masthead .indicators').width), Math.round(q('.masthead .themesw').width), Math.round(q('.masthead .brand').width), Math.round(t.left)], nameW: n.clientWidth, jarCut: jl ? jl.scrollWidth > jl.clientWidth : null }; }); })()")
+VERDANA = "for (const e of document.querySelectorAll('*')) e.style.fontFamily = 'Verdana, sans-serif';"
+NO_JAR = "document.getElementById('jar').hidden = true;"
+LONG_JAR = ("const j = document.getElementById('jar'); j.hidden = false; j.innerHTML = '<svg viewBox=\"0 0 16 20\"></svg><span class=\"jar-label\">'"
+            " + 'a jar label that is far too long to fit beside the name'.repeat(3) + '</span>';")
+
+
+@needs_browser
+@pytest.mark.parametrize("font, width", [("", 1180), ("", 1240), (VERDANA, 1280), (VERDANA, 1340)], ids=["native-1180", "native-1240", "verdana-1280", "verdana-1340"])
+def test_a_full_bar_truncates_the_name_with_an_ellipsis_and_never_overflows_into_the_tabs(tmp_path: Path, width: int, font: str) -> None:
+    out = _run(tmp_path, [{"eval": FULL_BAR % (font, NO_JAR)}], width=width)[-1]
+    assert out["sw"] <= out["cw"], out                                     # nothing widens the page
+    assert out["unitLeft"] >= out["tabsRight"], out                        # the readout stays right of the tabs
+    assert out["readoutRight"] <= out["mastRight"], out
+    assert out["unitW"] <= out["nat"], out
+    assert out["unitW"] == out["nat"] or out["nameCut"], out               # a name the bar cannot hold whole ends in an ellipsis rather than being clipped off the bar
+
+
+@needs_browser
+@pytest.mark.parametrize("font, width", [("", 1400), ("", 1500), (VERDANA, 1460), (VERDANA, 1560)], ids=["native-1400", "native-1500", "verdana-1460", "verdana-1560"])
+def test_the_jar_label_gives_way_before_the_name_does(tmp_path: Path, width: int, font: str) -> None:
+    got = _run(tmp_path, [{"eval": FULL_BAR % (font, LONG_JAR)}], width=width)[-1]
+    assert got["sw"] <= got["cw"] and got["unitLeft"] >= got["tabsRight"], got
+    assert got["jarCut"] is True, got                                      # the label is what shrank (its text overflows its box: ellipsized)
+    assert got["nat"] - got["unitW"] <= 1, got                                 # while the name kept its whole width
 
 
 @needs_browser
