@@ -684,7 +684,7 @@ def test_a_born_run_id_may_hold_a_hash_and_its_attempts_split_back(store):
 
 
 def test_one_form_reads_that_a_receipt_says_nothing_fired():
-    # F6 (deepseek MED): effects_close_mode reads `fired` as I10 and REAP_FAILED_RUNS do; receipts_content types it a
+    # F6 (deepseek MED): effects_close_mode reads `fired` as I10 and REAP_UNKNOWN_LINK_RUNS do; receipts_content types it a
     # JSON boolean at birth, so the forms could not disagree on a stored record (next test)
     every = "\n".join(s.ALL_TRIGGERS) + s.INVARIANT + s.REAP_ORPHAN_RECEIPTS
     assert "json_type(g.record, '$.fired')" not in every
