@@ -864,18 +864,30 @@ def _insert_receipt(conn: sqlite3.Connection, receipt: Receipt, *, subject: str,
 
 
 def _closer_of(conn: sqlite3.Connection, subject: str) -> Closed | None:
-    """The close already recorded for ``subject``, or None. Read from the receipt table, and for a run or request
-    from its terminal row too (a pre-/3 cancel carries no receipt)."""
-    if subject.startswith("run:"):
-        row = conn.execute("SELECT receipt_id, reason FROM cancels WHERE run_id = ?", (subject[4:],)).fetchone()
-        if row is not None:
-            return Closed(Terminal.LOST, row[0], row[1])
-    elif subject.startswith("request:"):
-        row = conn.execute("SELECT receipt_id, reason FROM requests WHERE request_id = ?", (subject[8:],)).fetchone()
-        if row is not None:
-            return Closed(Terminal.LOST, row[0], row[1])
+    """The close already recorded for ``subject``, or None: read from its TERMINAL row only (``schema3._closed``,
+    I11), never from a receipt's existence. A receipt for ``subject`` with no terminal row (an orphan, D57's to adopt)
+    is :class:`JournalCorruptError`: the subject is neither closed nor closable here, and reading it LOST would leave
+    it live behind the answer."""
+    kind, _, key = subject.partition(":")
+    row = None
+    if kind == "run":
+        row = conn.execute("SELECT receipt_id, reason FROM cancels WHERE run_id = ?", (key,)).fetchone()
+    elif kind == "request":
+        row = conn.execute("SELECT receipt_id, reason FROM requests WHERE request_id = ?", (key,)).fetchone()
+    elif kind == "effect":
+        run_id, _, effect_id = key.partition(":")
+        row = conn.execute("SELECT receipt_id, NULL FROM effects WHERE run_id = ? AND effect_id = ? "
+                           "AND state IN ('done', 'unknown')", (run_id, effect_id)).fetchone()
+    elif kind == "pending":
+        row = conn.execute("SELECT receipt_id, NULL FROM manual_pendings WHERE pending_id = ? AND state = 'terminal'",
+                           (key,)).fetchone()
+    if row is not None:
+        return Closed(Terminal.LOST, row[0], row[1])
     got = conn.execute("SELECT receipt_id FROM gate_receipts WHERE subject = ?", (subject,)).fetchone()
-    return None if got is None else Closed(Terminal.LOST, got[0])
+    if got is not None:
+        raise JournalCorruptError(f"{subject}: receipt {got[0]!r} has no terminal row (an orphan: the reaper adopts "
+                                  "it); not closed here")
+    return None
 
 
 def _close_in(conn: sqlite3.Connection, subject: str, receipt: Receipt, *, reason: str | None = None,
@@ -928,14 +940,18 @@ def close_effect_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, st
     return _close_in(conn, f"effect:{run_id}:{effect_id}", receipt, state=state, result=encoded)
 
 
-def decide_in(conn: sqlite3.Connection, hold_id: str, *, approve: bool, digest: str, by: str | None = None,
+def decide_in(conn: sqlite3.Connection, hold_id: str, *, approve: bool, digest: str, by: str,
               posture: str | None = None, signer: str | None = None, signature: str | None = None,
               challenge: str | None = None, fence: str | None = None,
               receipt: Receipt | None = None) -> HoldResult:
     """:meth:`RunJournal.decide` on a ``/3`` store, in the caller's write transaction. A rejection ends the hold's run
     with ``receipt`` first (the ``holds_move`` trigger takes a rejection only once its run's receipted close exists):
     WON closes it now; LOST means another path closed it before, and the decision is still recorded
-    (``HoldResult.closed`` says which). An approval is not terminal and takes no receipt."""
+    (``HoldResult.closed`` says which). An approval is not terminal and takes no receipt. ``by`` names the decider
+    (``holds_move`` refuses a decision without one); a missing one is refused before anything is written, and the
+    close and the decision are one step (a SAVEPOINT): a fault in either leaves neither."""
+    if not isinstance(by, str) or not by:
+        raise ValueError(f"decide_in: a decision names its decider (by={by!r})")
     if approve and receipt is not None:
         raise ValueError("decide_in: an approval is not terminal; it takes no receipt")
     if not approve and receipt is None:
@@ -951,10 +967,22 @@ def decide_in(conn: sqlite3.Connection, hold_id: str, *, approve: bool, digest: 
     if h["digest"] != digest:
         return HoldResult(False, "digest_mismatch")
     signed = approve and needs_signature(by)
-    closed = None if approve else _close_in(conn, f"run:{h['run_id']}", receipt, reason="rejected")  # type: ignore[arg-type]
-    RunJournal._decide_in(conn, hold_id, approve=approve, by=by, posture=posture,
-                          signer=signer if signed else None, signature=signature if signed else None,
-                          challenge=challenge if signed else None, fence=fence if signed else None)
+    conn.execute("SAVEPOINT decide_in")
+    try:
+        closed = None if approve else \
+            _close_in(conn, f"run:{h['run_id']}", receipt, reason="rejected")  # type: ignore[arg-type]
+        RunJournal._decide_in(conn, hold_id, approve=approve, by=by, posture=posture,
+                              signer=signer if signed else None, signature=signature if signed else None,
+                              challenge=challenge if signed else None, fence=fence if signed else None)
+    except BaseException as e:
+        try:
+            conn.execute("ROLLBACK TO decide_in")
+            conn.execute("RELEASE decide_in")
+        except sqlite3.Error as undo:
+            # a fault that rolled the whole transaction back took the savepoint with it: nothing of either stays
+            _log.warning("decide_in: savepoint not undone after %s: %s", type(e).__name__, undo)
+        raise
+    conn.execute("RELEASE decide_in")
     if not approve:
         return HoldResult(True, "rejected", closed=closed)
     return HoldResult(True, "approved", decision=decision_key(RunJournal._hold_dict(RunJournal._hold_row(conn, hold_id))))

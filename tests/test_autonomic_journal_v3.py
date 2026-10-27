@@ -210,3 +210,62 @@ def test_unprojected_receipts_are_listed_oldest_first_and_marked_once(store):
     with pytest.raises(sqlite3.IntegrityError, match="never rewritten"):
         with store.write() as c:
             c.execute("UPDATE gate_receipts SET projected = 0 WHERE receipt_id = 'g3'")
+
+
+# ---- L3 r1 (codex 1): LOST is read from terminal rows only; a receipt with no terminal is refused --------------------
+def _orphan(c, subject, rid, ts):
+    # raw DML past the close path (the R13-1 forgery): a receipt row with no terminal row
+    seq = c.execute("SELECT IFNULL(MAX(seq), 0) + 1 FROM gate_receipts").fetchone()[0]
+    c.execute("INSERT INTO closing (subject) VALUES (?)", (subject,))
+    c.execute("INSERT INTO gate_receipts (receipt_id, subject, record, seq) VALUES (?, ?, ?, ?)",
+              (rid, subject, json.dumps(receipt(rid, subject, ts).record), seq))
+    c.execute("DELETE FROM closing WHERE subject = ?", (subject,))
+
+
+def test_a_receipt_with_no_terminal_row_is_refused_never_read_as_lost(store):
+    with store.write() as c:
+        run(c)
+        intent(c, "r1", "link-0")
+        _orphan(c, "run:r1", "orphan", "refused")
+        _orphan(c, "effect:r1:link-0", "orphan-e", "fired")
+    with store.write() as c:
+        with pytest.raises(J.JournalCorruptError, match="no terminal row"):
+            J.close_run_in(c, "r1", reason="denied:x", receipt=receipt("g1", "run:r1", "refused"))
+        with pytest.raises(J.JournalCorruptError, match="no terminal row"):
+            J.close_effect_in(c, "r1", "link-0", state="done", receipt=receipt("e1", "effect:r1:link-0", "fired"))
+    with store.read() as c:
+        assert c.execute("SELECT COUNT(*) FROM cancels").fetchone() == (0,)
+
+
+# ---- L3 r1 (codex 6): a rejection with no decider is refused before its close; close + decide are one step -----------
+def test_a_rejection_with_no_decider_is_refused_before_its_run_is_closed(store):
+    h = hold_id_for("r1", "link-0")
+    with store.write() as c:
+        run(c)
+        hold(c)
+        for by in (None, ""):
+            with pytest.raises(ValueError, match="decider"):
+                J.decide_in(c, h, approve=False, digest="d", by=by, receipt=receipt("g1", "run:r1", "refused"))
+    with store.read() as c:
+        assert c.execute("SELECT COUNT(*) FROM cancels").fetchone() == (0,)
+        assert c.execute("SELECT decided FROM holds").fetchall() == [(None,)]
+
+
+def test_a_decision_that_fails_after_its_close_leaves_neither(store, monkeypatch):
+    h = hold_id_for("r1", "link-0")
+    with store.write() as c:
+        run(c)
+        hold(c)
+
+    def boom(*a, **k):
+        raise sqlite3.IntegrityError("the decision statement failed")
+
+    monkeypatch.setattr(RunJournal, "_decide_in", staticmethod(boom))
+    with store.write() as c:
+        with pytest.raises(sqlite3.IntegrityError, match="decision statement"):
+            J.decide_in(c, h, approve=False, digest="d", by="human", receipt=receipt("g1", "run:r1", "refused"))
+        # the caller catches and commits: the run must not be closed behind an undecided hold
+    with store.read() as c:
+        assert c.execute("SELECT COUNT(*) FROM cancels").fetchone() == (0,)
+        assert c.execute("SELECT COUNT(*) FROM gate_receipts").fetchone() == (0,)
+        assert c.execute("SELECT decided FROM holds").fetchall() == [(None,)]
