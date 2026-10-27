@@ -636,6 +636,8 @@ NOT_ROOT_TESTS = {
         "test_only_confined_executor", _CONFTEST_EXECUTOR),
     "tests/test_autonomic_graduation.py": ("needs conftest's test_only_confined_executor fixture",
         "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_attempts_readers.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
     "tests/test_autonomic_l3_fixes.py": ("its enrolled test key verifies only under conftest's autouse signers-owner "
                                          "fixture", "confirm_signers", _CONFTEST_SIGNERS),
     "tests/test_autonomic_l3_r2_fixes.py": ("its enrolled test key verifies only under conftest's autouse "
