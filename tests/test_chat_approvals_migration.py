@@ -24,7 +24,8 @@ from tests import _chat_schema_snapshots as snap
 T0 = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
 CHAT_TABLES = ("chat_messages", "chat_outbox_events", "chat_events", "chat_cursors", "chat_launch_checks")
 NEW_OBJECTS = ("chat_approvals", "chat_approval_events", "chat_approval_one_decision", "chat_approval_one_attempt",
-               "chat_approval_one_redelivery", "chat_approval_one_written", "chat_approval_events_next")
+               "chat_approval_one_redelivery", "chat_approval_one_written", "chat_approval_one_core_result",
+               "chat_approval_events_next")
 
 
 class Clock:
@@ -138,7 +139,7 @@ def test_migrated_store_takes_approval_rows_and_shows_them(tmp_path, shape, caps
     cs = ChatStore(EnvelopeStore(qdir, clock=Clock()))
     nonce = "0123456789abcdef0123456789abcdef"
     with cs._write() as (conn, now):
-        got = ca.record_quarantine(conn, now, launch_id=launch, spawn_nonce=nonce, raw_line=b"x")
+        got = ca.record_quarantine(conn, now, launch_id=launch, spawn_nonce=nonce, raw_line=b"x", transport_key="r")
         ca.append_event(conn, now, launch_id=launch, key=got.row.vendor_request_key, kind="core_started", by="service",
                         cause="t")
     kinds = [r["kind"] for r in run_show(qdir, thread, capsys)["timeline"]]

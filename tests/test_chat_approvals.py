@@ -108,7 +108,7 @@ def host(cs, launch, c, *, tool_use_id="toolu_1", tool="Bash", tool_input=None, 
     tool_input = {"command": "ls"} if tool_input is None else tool_input
     with cs._write() as (conn, now):
         return arrive(conn, now, launch_id=launch, raw_vendor_key=claude_raw_key(nonce, tool_use_id),
-                      vendor_turn_id=turn, vendor_call_id=tool_use_id, approval_id=None, kind="host",
+                      transport_key=f"req-{tool_use_id}", vendor_turn_id=turn, vendor_call_id=tool_use_id, approval_id=None, kind="host",
                       available_decisions=("allow", "deny"), tool_name=tool, tool_input=tool_input, ctx=c,
                       spawn_nonce=nonce)
 
@@ -145,8 +145,8 @@ def test_durable_key_suffix_must_be_lower_hex(cs, claude, tmp_path, suffix):
     with pytest.raises(sqlite3.IntegrityError):
         with cs._write() as (conn, now):
             conn.execute("INSERT INTO chat_approvals (launch_id, vendor_request_key, gseq, raw_vendor_key, "
-                         "vendor_turn_id, kind, route, available_decisions, tool_name, tool_input_digest, "
-                         "spawn_nonce, at) VALUES (?, ?, ?, ?, 't', 'host', 'core', '[]', 'Bash', 'jcs:x', ?, ?)",
+                         "transport_key, vendor_turn_id, kind, route, available_decisions, tool_name, tool_input_digest, "
+                         "spawn_nonce, at) VALUES (?, ?, ?, ?, 'r', 't', 'host', 'core', '[]', 'Bash', 'jcs:x', ?, ?)",
                          (claude["launch"], raw + ":call:" + suffix, chat.next_gseq(conn, now), raw, NONCE, now))
 
 
@@ -187,7 +187,7 @@ def test_claude_request_without_tool_use_id_denied(cs, claude, tmp_path):
         claude_raw_key(NONCE, 17)
     line = b'{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash"}}'
     with cs._write() as (conn, now):
-        got = record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=line)
+        got = record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=line, transport_key="req-q")
     assert got.disposition == "quarantined"
     assert (got.row.kind, got.row.route, got.row.tool_name, got.row.available_decisions) == \
         ("quarantine", "quarantine", "", ("deny",))
@@ -197,9 +197,9 @@ def test_claude_request_without_tool_use_id_denied(cs, claude, tmp_path):
 def test_quarantine_key_is_sha_of_raw_bytes(cs, claude):
     a, b = b'{"a":1}', b'{"a": 1}'
     with cs._write() as (conn, now):
-        r1 = record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=a)
-        r2 = record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=b)
-        again = record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=a)
+        r1 = record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=a, transport_key="req-q")
+        r2 = record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=b, transport_key="req-q")
+        again = record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=a, transport_key="req-q")
     assert r1.row.vendor_request_key != r2.row.vendor_request_key
     assert again.disposition == "replay" and again.row.vendor_request_key == r1.row.vendor_request_key
     raw, digest = quarantine_raw_key(NONCE, a)
@@ -209,7 +209,7 @@ def test_quarantine_key_is_sha_of_raw_bytes(cs, claude):
 
 def test_quarantine_never_calls_core_or_cards(cs, claude):
     with cs._write() as (conn, now):
-        q = record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=b"junk")
+        q = record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=b"junk", transport_key="req-q")
     assert q.row.route != "core"
     assert record_abstain(cs, launch_id=claude["launch"], vendor_request_key=q.row.vendor_request_key,
                           precursor={"cause": "abstained:hold_expired"}) == "no_card"
@@ -229,9 +229,10 @@ def test_quarantine_row_checks(cs, claude, change):
     with pytest.raises(sqlite3.IntegrityError):
         with cs._write() as (conn, now):
             conn.execute(
-                "INSERT INTO chat_approvals (launch_id, vendor_request_key, gseq, raw_vendor_key, vendor_turn_id, kind, "
-                "route, available_decisions, tool_name, tool_input_digest, targets_agent_config, spawn_nonce, at) "
-                f"VALUES (?, ?, ?, {values['raw_vendor_key']}, '-', {values['kind']}, {values['route']}, '[]', "
+                "INSERT INTO chat_approvals (launch_id, vendor_request_key, gseq, raw_vendor_key, transport_key, "
+                "vendor_turn_id, kind, route, available_decisions, tool_name, tool_input_digest, targets_agent_config, "
+                "spawn_nonce, at) "
+                f"VALUES (?, ?, ?, {values['raw_vendor_key']}, 'r', '-', {values['kind']}, {values['route']}, '[]', "
                 f"{values['tool_name']}, ?, {values['targets_agent_config']}, ?, ?)",
                 (claude["launch"], key, chat.next_gseq(conn, now), digest, NONCE, now))
 
@@ -241,8 +242,8 @@ def test_host_row_needs_a_nonce(cs, claude):
     with pytest.raises(sqlite3.IntegrityError):
         with cs._write() as (conn, now):
             conn.execute("INSERT INTO chat_approvals (launch_id, vendor_request_key, gseq, raw_vendor_key, "
-                         "vendor_turn_id, kind, route, available_decisions, tool_name, tool_input_digest, at) "
-                         "VALUES (?, ?, ?, ?, 't', 'host', 'core', '[]', 'Bash', 'jcs:x', ?)",
+                         "transport_key, vendor_turn_id, kind, route, available_decisions, tool_name, tool_input_digest, "
+                         "at) VALUES (?, ?, ?, ?, 'r', 't', 'host', 'core', '[]', 'Bash', 'jcs:x', ?)",
                          (claude["launch"], durable_key(raw, "Bash", "jcs:x"), chat.next_gseq(conn, now), raw, now))
 
 
@@ -296,7 +297,8 @@ def test_arrival_stores_the_harness_classification(cs, claude, codex, tmp_path):
     with cs._write() as (conn, now):
         got = arrive(conn, now, launch_id=codex["launch"], raw_vendor_key=codex_raw_key("item/fileChange/requestApproval",
                                                                                          "it-1", "ap-1"),
-                     vendor_turn_id="t-1", vendor_call_id="it-1", approval_id="ap-1", kind="file_change",
+                     transport_key="17", vendor_turn_id="t-1", vendor_call_id="it-1", approval_id="ap-1",
+                     kind="file_change",
                      available_decisions=("accept", "decline"), tool_name=tool, tool_input=inp, ctx=c)
     assert got.disposition == "routed" and got.row.route == "native" and got.row.targets_agent_config is False
 
@@ -325,7 +327,7 @@ def test_codex_not_live_deny_is_the_rows_refusing_decision(cs, codex, tmp_path):
     with cs._write() as (conn, now):
         record_check(conn, now, codex["launch"], "not_live", "turn_start", "x")
         got = arrive(conn, now, launch_id=codex["launch"], raw_vendor_key=codex_raw_key("m", "i", None),
-                     vendor_turn_id="t", vendor_call_id="i", approval_id=None, kind="command",
+                     transport_key="18", vendor_turn_id="t", vendor_call_id="i", approval_id=None, kind="command",
                      available_decisions=("accept", "decline", "cancel"), tool_name="commandExecution",
                      tool_input={"command": "ls", "cwd": "/w"}, ctx=ctx(tmp_path))
     assert got.disposition == "denied" and dict(got.attempt.reply) == {"decision": "decline"}
@@ -392,7 +394,7 @@ def test_two_racing_attempts_one_commits(cs, claude, tmp_path):
 
 def test_event_kinds_are_the_fourteen():
     assert len(ca.APPROVAL_EVENT_KINDS) == 14 and "answer_written" in ca.APPROVAL_EVENT_KINDS
-    assert len(ca.APPROVAL_SCHEMA) and sum("CREATE UNIQUE INDEX" in s for s in ca.APPROVAL_SCHEMA) == 4
+    assert len(ca.APPROVAL_SCHEMA) and sum("CREATE UNIQUE INDEX" in s for s in ca.APPROVAL_SCHEMA) == 5
 
 
 # --- record_abstain: five durable checks ------------------------------------------------------------------------
@@ -531,13 +533,13 @@ def test_cancelled_hold_is_never_card(cs, claude, tmp_path, cause, terminal):
     assert got == ("abstained", f"cancelled: {cause}")                    # never `none`: no card
 
 
-def test_cancelled_driver_lost_already_committed_is_not_written_twice(cs, claude, tmp_path):
+def test_cancelled_driver_lost_already_committed_is_gets_no_second_row(cs, claude, tmp_path):
     row = _request(cs, claude, tmp_path)
     with cs._write() as (conn, now):
         ca.mark_driver_lost(conn, now, row.launch_id, "kill")
     record_cancelled(cs, launch_id=row.launch_id, vendor_request_key=row.vendor_request_key, cause="kill",
                      tag="decided")
-    assert events(cs, row.launch_id, row.vendor_request_key) == ["driver_lost", "core_result"]
+    assert events(cs, row.launch_id, row.vendor_request_key) == ["driver_lost"]
 
 
 def test_each_cancel_producer_commits_before_set(cs, claude, tmp_path):
@@ -639,3 +641,196 @@ def test_context_is_a_frozen_named_tuple(tmp_path):
         c.cwd = "/elsewhere"                                                  # type: ignore[misc]
     assert isinstance(c.environ, type(MappingProxyType({}))) and not isinstance(c.queue_dir, str)
     assert isinstance(Path(c.cwd), Path)
+
+
+# --- fix round 1 ------------------------------------------------------------------------------------------------
+def _codex(cs, launch, c, *, kind="command", decisions=None, item="it-1", tool="commandExecution", inp=None):
+    with cs._write() as (conn, now):
+        return arrive(conn, now, launch_id=launch, raw_vendor_key=codex_raw_key(f"m/{kind}", item, None),
+                      transport_key=f"rpc-{item}", vendor_turn_id="t-1", vendor_call_id=item, approval_id=None,
+                      kind=kind, available_decisions=decisions, tool_name=tool,
+                      tool_input={"command": "ls", "cwd": "/w"} if inp is None else inp, ctx=c)
+
+
+def _not_live(cs, launch):
+    with cs._write() as (conn, now):
+        record_check(conn, now, launch, "not_live", "tripwire:deficit", "x")
+
+
+def _scripted_with(request_id, tool="Bash", tool_input=None):
+    from levain.coordinator.driver import ScriptedSession
+    s = ScriptedSession()
+    s.inbound(request_id, "can_use_tool", tool_name=tool, tool_input=tool_input or {"command": "ls"})
+    return s
+
+
+def _answer_for(attempt, key=None):
+    from levain.coordinator.driver import ApprovalAnswer
+    return ApprovalAnswer(attempt.op_id, attempt.vendor_request_key, attempt.raw_vendor_key if key is None else key,
+                          attempt.reply)
+
+
+# R1: the reply is addressed by the transport key, not the identity key
+def test_claude_attempt_answer_reaches_the_session_by_the_transport_key(cs, claude, tmp_path):
+    _not_live(cs, claude["launch"])
+    got = host(cs, claude["launch"], ctx(tmp_path), tool_use_id="toolu_7")        # transport key "req-toolu_7"
+    assert got.disposition == "denied" and got.row.raw_vendor_key != got.row.transport_key
+    session = _scripted_with("req-toolu_7")
+    assert got.attempt.raw_vendor_key == "req-toolu_7"
+    assert session.answer(_answer_for(got.attempt)).outcome == "confirmed"
+    # the identity key is not an id the session holds (this is what addressing by it did before the fix)
+    other = _scripted_with("req-toolu_7")
+    assert other.answer(_answer_for(got.attempt, key=got.row.raw_vendor_key)).outcome == "no_such_request"
+
+
+def test_latch_attempt_for_a_claude_row_reaches_the_session(cs, claude, tmp_path):
+    row = host(cs, claude["launch"], ctx(tmp_path), tool_use_id="toolu_8").row
+    (attempt,) = latch_not_live(cs, launch_id=claude["launch"], source="tripwire:deficit", cause="x")
+    assert attempt.vendor_request_key == row.vendor_request_key
+    assert _scripted_with("req-toolu_8").answer(_answer_for(attempt)).outcome == "confirmed"
+
+
+def test_quarantine_row_keeps_the_transport_key_and_its_deny_reaches_the_session(cs, claude):
+    line = b'{"type":"control_request","request_id":"req-q9","request":{"subtype":"can_use_tool"}}'
+    with cs._write() as (conn, now):
+        q = record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=line,
+                              transport_key="req-q9")
+    assert q.row.transport_key == "req-q9"
+    (attempt,) = latch_not_live(cs, launch_id=claude["launch"], source="tripwire:deficit", cause="x")
+    assert attempt.raw_vendor_key == "req-q9" and attempt.reply["behavior"] == "deny"
+    assert _scripted_with("req-q9").answer(_answer_for(attempt)).outcome == "confirmed"
+
+
+def test_transport_key_is_required_and_nonempty(cs, claude):
+    with pytest.raises(CoordError, match="transport key"):
+        with cs._write() as (conn, now):
+            arrive(conn, now, launch_id=claude["launch"], raw_vendor_key=claude_raw_key(NONCE, "t"), transport_key="",
+                   vendor_turn_id="t", vendor_call_id="t", approval_id=None, kind="host", available_decisions=None,
+                   tool_name="Bash", tool_input={}, ctx=ctx(Path("/tmp")), spawn_nonce=NONCE)
+
+
+# R2: a Codex denial is always buildable
+def test_codex_permission_request_is_denied_with_empty_permissions(cs, codex, tmp_path):
+    _not_live(cs, codex["launch"])
+    got = _codex(cs, codex["launch"], ctx(tmp_path), kind="permission", decisions=None, tool="permissions",
+                 inp={"permissions": {}})
+    assert got.disposition == "denied" and dict(got.attempt.reply) == {"permissions": {}}
+    assert got.row.available_decisions == () and got.attempt.raw_vendor_key == "rpc-it-1"
+
+
+def test_codex_command_without_decisions_is_denied_with_the_pinned_decline(cs, codex, tmp_path):
+    _not_live(cs, codex["launch"])
+    got = _codex(cs, codex["launch"], ctx(tmp_path), decisions=None)
+    assert got.disposition == "denied" and dict(got.attempt.reply) == {"decision": "decline"}
+    other = _codex(cs, codex["launch"], ctx(tmp_path), item="it-2", decisions=("accept", "acceptForSession"))
+    assert dict(other.attempt.reply) == {"decision": "decline"}
+
+
+def test_codex_deny_replies_match_the_wire_registry():
+    from levain.coordinator.codex_wire import SERVER_REQUESTS
+    assert dict(SERVER_REQUESTS["item/permissions/requestApproval"].reply) == {"permissions": {}}
+    for m in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
+        assert dict(SERVER_REQUESTS[m].reply) == {"decision": "decline"}
+
+
+def test_latch_commits_when_a_codex_request_offers_no_decision(cs, codex, tmp_path):
+    c = ctx(tmp_path)
+    perm = _codex(cs, codex["launch"], c, kind="permission", decisions=None, tool="permissions", inp={"permissions": {}})
+    cmd = _codex(cs, codex["launch"], c, item="it-2", decisions=())
+    attempts = latch_not_live(cs, launch_id=codex["launch"], source="turn_start", cause="x")
+    assert {a.vendor_request_key for a in attempts} == {perm.row.vendor_request_key, cmd.row.vendor_request_key}
+    assert chat.liveness(cs._connect(), codex["launch"]).latched is True
+
+
+def test_latch_one_undeniable_request_does_not_undo_the_verdict_or_the_others(cs, claude, tmp_path, monkeypatch):
+    c = ctx(tmp_path)
+    bad, good = (host(cs, claude["launch"], c, tool_use_id=f"toolu_{i}").row for i in (1, 2))
+    real = ca._deny_attempt
+
+    def flaky(conn, now, row, *, cause):
+        out = real(conn, now, row, cause=cause)
+        if row.vendor_request_key == bad.vendor_request_key:
+            raise CoordError("cannot build")                    # after its two rows: its savepoint must roll them back
+        return out
+
+    monkeypatch.setattr(ca, "_deny_attempt", flaky)
+    attempts = latch_not_live(cs, launch_id=claude["launch"], source="tripwire:deficit", cause="x")
+    assert [a.vendor_request_key for a in attempts] == [good.vendor_request_key]
+    assert events(cs, claude["launch"], bad.vendor_request_key) == ["answer_refused"]
+    assert events(cs, claude["launch"], good.vendor_request_key) == ["decision_observed", "answer_attempted"]
+    assert chat.liveness(cs._connect(), claude["launch"]).latched is True
+
+
+# R3: a decided request is the door's, not the latch's
+def test_latch_skips_a_request_that_already_has_a_decision(cs, claude, tmp_path):
+    row = _request(cs, claude, tmp_path)
+    _ev(cs, row, "decision_observed", decision="allow")
+    assert latch_not_live(cs, launch_id=claude["launch"], source="tripwire:deficit", cause="x") == []
+    assert events(cs, row.launch_id, row.vendor_request_key) == ["decision_observed"]
+    assert chat.liveness(cs._connect(), claude["launch"]).latched is True
+
+
+# R4: the two core-result writers are idempotent
+def test_record_abstain_retry_writes_one_card(cs, claude, tmp_path):
+    row = _request(cs, claude, tmp_path)
+    assert _abstain(cs, row) == "card"
+    assert _abstain(cs, row) == "no_card"
+    assert events(cs, row.launch_id, row.vendor_request_key) == ["core_result"]
+
+
+def test_record_cancelled_retry_writes_one_result_and_one_terminal(cs, claude, tmp_path):
+    row = _request(cs, claude, tmp_path)
+    for _ in range(2):
+        record_cancelled(cs, launch_id=row.launch_id, vendor_request_key=row.vendor_request_key, cause="stop", tag="x")
+    assert events(cs, row.launch_id, row.vendor_request_key) == ["core_result", "driver_lost"]
+
+
+def test_core_result_unique_index_holds_for_any_writer(cs, claude, tmp_path):
+    row = _request(cs, claude, tmp_path)
+    _ev(cs, row, "core_result", decision="none")
+    with pytest.raises(sqlite3.IntegrityError):
+        _ev(cs, row, "core_result", decision="none")
+
+
+@pytest.mark.parametrize("terminal", ["turn_ended", "resolved_outside", "driver_lost", "decided_after_turn",
+                                      "answer_confirmed", "answer_ambiguous"])
+def test_cancel_and_abstain_after_a_terminal_write_nothing(cs, claude, tmp_path, terminal):
+    row = _request(cs, claude, tmp_path)
+    _ev(cs, row, terminal)
+    record_cancelled(cs, launch_id=row.launch_id, vendor_request_key=row.vendor_request_key, cause="not_live", tag="x")
+    assert _abstain(cs, row) == "decided_after_turn"
+    assert events(cs, row.launch_id, row.vendor_request_key) == [terminal]
+
+
+def test_cancel_and_abstain_after_an_attempt_write_nothing(cs, claude, tmp_path):
+    row = _request(cs, claude, tmp_path)
+    _ev(cs, row, "decision_observed", decision="deny")
+    _ev(cs, row, "answer_attempted", reply="{}", op_id="op-1")
+    record_cancelled(cs, launch_id=row.launch_id, vendor_request_key=row.vendor_request_key, cause="not_live", tag="x")
+    assert _abstain(cs, row) == "no_card"
+    assert events(cs, row.launch_id, row.vendor_request_key) == ["decision_observed", "answer_attempted"]
+
+
+def test_abstain_after_a_cancel_result_writes_no_card(cs, claude, tmp_path):
+    row = _request(cs, claude, tmp_path)
+    record_cancelled(cs, launch_id=row.launch_id, vendor_request_key=row.vendor_request_key, cause="not_live", tag="x")
+    assert _abstain(cs, row) == "decided_after_turn"
+    assert events(cs, row.launch_id, row.vendor_request_key) == ["core_result", "decided_after_turn"]
+
+
+# R5: only the current activation's ambiguity is a stop card
+def test_ambiguity_of_a_replaced_child_is_no_stop_card(cs, claude, tmp_path):
+    row = _request(cs, claude, tmp_path)
+    _ev(cs, row, "answer_ambiguous")
+    assert len(cs._read(lambda conn: ambiguous_stops(conn, row.launch_id))) == 1
+    _activate(cs, row.launch_id, NONCE2)
+    assert cs._read(lambda conn: ambiguous_stops(conn, row.launch_id)) == []
+
+
+# R7: a carded request is denied by the latch, by intent
+def test_latch_denies_a_carded_request(cs, claude, tmp_path):
+    row = _request(cs, claude, tmp_path)
+    assert _abstain(cs, row) == "card"
+    (attempt,) = latch_not_live(cs, launch_id=claude["launch"], source="tripwire:deficit", cause="x")
+    assert attempt.vendor_request_key == row.vendor_request_key
+    assert events(cs, row.launch_id, row.vendor_request_key) == ["core_result", "decision_observed", "answer_attempted"]

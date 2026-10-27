@@ -61,6 +61,9 @@ TERMINAL_KINDS = ("turn_ended", "resolved_outside", "driver_lost", "decided_afte
 CANCEL_CAUSES = ("turn_ended", "not_live", "control_cancel_request", "stop", "kill", "stdin closed", "service shutdown")
 # the causes whose terminal row is driver_lost; the others are decided_after_turn (§3.4 record_cancelled)
 _DRIVER_LOST_CAUSES = ("stop", "kill", "stdin closed", "service shutdown")
+# a request carrying any of these gets no further core_result and no further terminal from record_cancelled /
+# record_abstain
+_SETTLED_KINDS = frozenset(TERMINAL_KINDS) | {"core_result", "answer_attempted"}
 _CAUSE_MAX = 200
 _HEX32 = re.compile(r"[0-9a-f]{32}")
 _DENY_DECISIONS = ("decline", "cancel", "denied", "abort")      # a Codex row's refusing decisions, best first
@@ -70,13 +73,14 @@ APPROVAL_SCHEMA: tuple[str, ...] = (
     # hex), so no writer can store an alias; the quarantine CHECKs are rev 7 (R7-7)
     "CREATE TABLE IF NOT EXISTS chat_approvals (launch_id TEXT NOT NULL REFERENCES launches(launch_id), "
     "vendor_request_key TEXT NOT NULL, gseq INTEGER NOT NULL UNIQUE, raw_vendor_key TEXT NOT NULL, "
+    "transport_key TEXT NOT NULL, "
     "vendor_turn_id TEXT NOT NULL, vendor_call_id TEXT, approval_id TEXT, "
     f"kind TEXT NOT NULL CHECK ({_in('kind', APPROVAL_KINDS)}), "
     f"route TEXT NOT NULL CHECK ({_in('route', ROUTES)}), available_decisions TEXT NOT NULL, "
     "tool_name TEXT NOT NULL, tool_input_digest TEXT NOT NULL, "
     "targets_agent_config INTEGER NOT NULL DEFAULT 0 CHECK (targets_agent_config IN (0, 1)), "
     "spawn_nonce TEXT, at TEXT NOT NULL, PRIMARY KEY (launch_id, vendor_request_key), "
-    "CHECK (length(raw_vendor_key) > 0 AND length(tool_input_digest) > 0), "
+    "CHECK (length(raw_vendor_key) > 0 AND length(transport_key) > 0 AND length(tool_input_digest) > 0), "
     "CHECK (spawn_nonce IS NULL OR (length(spawn_nonce) = 32 AND spawn_nonce NOT GLOB '*[^0-9a-f]*')), "
     "CHECK (substr(vendor_request_key, 1, length(raw_vendor_key) + 6) = raw_vendor_key || ':call:' "
     "AND length(vendor_request_key) = length(raw_vendor_key) + 70 "
@@ -119,6 +123,9 @@ APPROVAL_SCHEMA: tuple[str, ...] = (
     "vendor_request_key, transport_gen) WHERE kind = 'answer_redelivered'",
     "CREATE UNIQUE INDEX IF NOT EXISTS chat_approval_one_written ON chat_approval_events (launch_id, "
     "vendor_request_key) WHERE kind = 'answer_written'",
+    # one core result per request: a retried abstain or cancel cannot write a second card row
+    "CREATE UNIQUE INDEX IF NOT EXISTS chat_approval_one_core_result ON chat_approval_events (launch_id, "
+    "vendor_request_key) WHERE kind = 'core_result'",
 )
 
 # §2.8: the view's approval branch, two arms appended to chat.CHAT_SCHEMA's chat_timeline: the request as it was asked
@@ -256,15 +263,17 @@ class ApprovalRow:
     targets_agent_config: bool
     spawn_nonce: str | None
     at: str
+    transport_key: str      # the driver's Event.request_key: the id a reply is addressed by (raw_vendor_key is identity)
 
 
 _COLUMNS = ("launch_id, vendor_request_key, gseq, raw_vendor_key, vendor_turn_id, vendor_call_id, approval_id, kind, "
-            "route, available_decisions, tool_name, tool_input_digest, targets_agent_config, spawn_nonce, at")
+            "route, available_decisions, tool_name, tool_input_digest, targets_agent_config, spawn_nonce, at, "
+            "transport_key")
 
 
 def _row(values: Sequence[Any]) -> ApprovalRow:
     v = list(values)
-    return ApprovalRow(*v[:9], tuple(json.loads(v[9])), v[10], v[11], bool(v[12]), v[13], v[14])
+    return ApprovalRow(*v[:9], tuple(json.loads(v[9])), v[10], v[11], bool(v[12]), v[13], v[14], v[15])
 
 
 def approval(conn: sqlite3.Connection, launch_id: str, vendor_request_key: str) -> ApprovalRow | None:
@@ -276,7 +285,9 @@ def approval(conn: sqlite3.Connection, launch_id: str, vendor_request_key: str) 
 @dataclass(frozen=True)
 class Attempt:
     """A deny whose two rows (``decision_observed``, ``answer_attempted``) committed: the caller now writes ``reply`` to
-    the session (``ApprovalAnswer(op_id, vendor_request_key, raw_vendor_key, reply)``) and records the outcome."""
+    the session (``ApprovalAnswer(op_id, vendor_request_key, raw_vendor_key, reply)``) and records the outcome.
+    ``raw_vendor_key`` here is the row's TRANSPORT key (the driver's ``Event.request_key``), the id the session
+    addresses a reply by; the row's identity key is ``vendor_request_key``."""
     launch_id: str
     vendor_request_key: str
     raw_vendor_key: str
@@ -319,8 +330,9 @@ def _kinds(conn: sqlite3.Connection, launch_id: str, key: str) -> set[str]:
 
 def pending_requests(conn: sqlite3.Connection, launch_id: str, *, unattempted: bool = False) -> list[str]:
     """The launch's request keys with none of the terminal kinds of §8.7 step 1, in arrival order. ``unattempted`` also
-    leaves out a request that already carries ``answer_attempted`` (the latch's list)."""
-    blocked = TERMINAL_KINDS + (("answer_attempted",) if unattempted else ())
+    leaves out a request that already carries ``answer_attempted`` or ``decision_observed`` (the latch's list: a decided
+    request is the door's, and a second ``decision_observed`` would break its unique index)."""
+    blocked = TERMINAL_KINDS + (("answer_attempted", "decision_observed") if unattempted else ())
     return [k for (k,) in conn.execute(
         "SELECT a.vendor_request_key FROM chat_approvals a WHERE a.launch_id = ? AND NOT EXISTS (SELECT 1 FROM "
         "chat_approval_events e WHERE e.launch_id = a.launch_id AND e.vendor_request_key = a.vendor_request_key AND "
@@ -358,14 +370,20 @@ def _reply_text(reply: Mapping[str, Any]) -> str:
 
 
 def _deny_reply(row: ApprovalRow, cause: str) -> tuple[Mapping[str, Any], str]:
-    """The refusal a row's harness understands: Claude's ``{"behavior": "deny", "message": ...}``; Codex's first refusing
-    decision among the row's ``available_decisions`` (a row offering none cannot be denied, a store fault)."""
+    """The refusal a row's harness understands, always buildable: Claude's ``{"behavior": "deny", "message": ...}``;
+    Codex's, by the request's method: ``item/permissions/requestApproval`` (kind ``permission``) is denied with
+    ``{"permissions": {}}`` and carries no decision list; a command or file-change approval uses the first refusing
+    decision among its ``available_decisions`` (the list is optional on the wire), else the pinned default
+    ``{"decision": "decline"}``. (``codex_wire.SERVER_REQUESTS`` holds these replies; the literals are unconfirmed
+    against a live Codex.)"""
     if row.spawn_nonce is not None or row.kind == "quarantine":
         return {"behavior": "deny", "message": f"Levain: the gate is not live ({cause})"}, "deny"
+    if row.kind == "permission":
+        return {"permissions": {}}, "deny"
     for want in _DENY_DECISIONS:
         if want in row.available_decisions:
             return {"decision": want}, want
-    raise CoordError(f"approval request {row.vendor_request_key[:60]!r} offers no refusing decision")
+    return {"decision": "decline"}, "decline"
 
 
 def _deny_attempt(conn: sqlite3.Connection, now: str, row: ApprovalRow, *, cause: str) -> Attempt:
@@ -378,7 +396,7 @@ def _deny_attempt(conn: sqlite3.Connection, now: str, row: ApprovalRow, *, cause
                  by="service", cause=cause, decision=decision)
     append_event(conn, now, launch_id=row.launch_id, key=row.vendor_request_key, kind="answer_attempted",
                  by="service", cause=cause, decision=decision, reply=text, op_id=op_id)
-    return Attempt(row.launch_id, row.vendor_request_key, row.raw_vendor_key, op_id, reply,
+    return Attempt(row.launch_id, row.vendor_request_key, row.transport_key, op_id, reply,
                    hashlib.sha256(text.encode()).hexdigest())
 
 
@@ -400,17 +418,18 @@ def _launch_harness(conn: sqlite3.Connection, launch_id: str) -> str:
 
 
 def _insert(conn: sqlite3.Connection, now: str, **f: Any) -> ApprovalRow:
-    conn.execute(f"INSERT INTO chat_approvals ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    conn.execute(f"INSERT INTO chat_approvals ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                  (f["launch_id"], f["key"], next_gseq(conn, now), f["raw"], f["turn"], f["call"], f["approval_id"],
                   f["kind"], f["route"], json.dumps(list(f["decisions"])), f["tool_name"], f["digest"],
-                  int(f["tagged"]), f["nonce"], now))
+                  int(f["tagged"]), f["nonce"], now, f["transport"]))
     got = approval(conn, f["launch_id"], f["key"])
     assert got is not None
     return got
 
 
-def arrive(conn: sqlite3.Connection, now: str, *, launch_id: str, raw_vendor_key: str, vendor_turn_id: str,
-           vendor_call_id: str | None, approval_id: str | None, kind: str, available_decisions: Sequence[str],
+def arrive(conn: sqlite3.Connection, now: str, *, launch_id: str, raw_vendor_key: str, transport_key: str,
+           vendor_turn_id: str, vendor_call_id: str | None, approval_id: str | None, kind: str,
+           available_decisions: Sequence[str] | None,
            tool_name: str, tool_input: Any, ctx: ChatLaunchContext, protected: tuple[Path, ...] = (),
            spawn_nonce: str | None = None) -> Arrival:
     """§8.1 in the caller's ``BEGIN IMMEDIATE``, minus the core call: compute the durable key from the raw key and the
@@ -419,7 +438,8 @@ def arrive(conn: sqlite3.Connection, now: str, *, launch_id: str, raw_vendor_key
     committed here as an :class:`Attempt` (a request that arrives after a latch meets this). ``probing``: the caller
     waits for the verdict. Otherwise the row's ``route``: ``core`` for a Claude host request, else ``native``. A call the
     key cannot be built from (an input that cannot be digested, a tool name that is not a non-empty string) raises
-    :class:`CoordError`: the caller writes a quarantine row instead."""
+    :class:`CoordError`: the caller writes a quarantine row instead. ``transport_key`` is the driver's
+    ``Event.request_key`` (what a reply is addressed by); ``available_decisions`` is optional (``None`` stores ``()``)."""
     from levain.coordinator import chat
     from levain.consent.record import tool_input_digest
     harness = _launch_harness(conn, launch_id)
@@ -429,6 +449,8 @@ def arrive(conn: sqlite3.Connection, now: str, *, launch_id: str, raw_vendor_key
         raise CoordError("uncorrelatable: no usable tool name")
     if kind == "host" and spawn_nonce is None:
         raise CoordError("a host request names the child it came from")
+    if not isinstance(transport_key, str) or not transport_key:
+        raise CoordError("a request names the transport key its reply is addressed by")
     try:
         digest = tool_input_digest(tool_input)
     except (TypeError, ValueError):
@@ -437,9 +459,10 @@ def arrive(conn: sqlite3.Connection, now: str, *, launch_id: str, raw_vendor_key
     held = approval(conn, launch_id, key)
     if held is not None:
         return Arrival("replay", held)
-    row = _insert(conn, now, launch_id=launch_id, key=key, raw=raw_vendor_key, turn=vendor_turn_id, call=vendor_call_id,
+    row = _insert(conn, now, launch_id=launch_id, key=key, raw=raw_vendor_key, transport=transport_key,
+                  turn=vendor_turn_id, call=vendor_call_id,
                   approval_id=approval_id, kind=kind, route="core" if kind == "host" else "native",
-                  decisions=tuple(available_decisions), tool_name=tool_name, digest=digest, nonce=spawn_nonce,
+                  decisions=tuple(available_decisions or ()), tool_name=tool_name, digest=digest, nonce=spawn_nonce,
                   tagged=agent_config_tagged(harness, tool_name, tool_input, ctx, protected=protected))
     fold = chat.liveness(conn, launch_id)
     if not fold.enabled and not (fold.latest == "probing" and not fold.latched):
@@ -450,18 +473,22 @@ def arrive(conn: sqlite3.Connection, now: str, *, launch_id: str, raw_vendor_key
 
 
 def record_quarantine(conn: sqlite3.Connection, now: str, *, launch_id: str, spawn_nonce: str, raw_line: bytes,
-                      vendor_turn_id: str = "-") -> Arrival:
+                      transport_key: str, vendor_turn_id: str = "-") -> Arrival:
     """The rowless-deny row (R7-7): a Claude ``can_use_tool`` the service cannot key as a host row is written
     ``kind = 'quarantine'``, ``tool_name = ''``, ``targets_agent_config = 1``, its digest the ``sha256`` of the raw
     line's bytes. The same bytes replay to the same row. Its one answer is a deny through the one door; it never reaches
-    the core and never becomes a card."""
+    the core and never becomes a card. ``transport_key`` is the line's own ``request_id`` (the driver's
+    ``Event.request_key``): the deny is addressed by it."""
     _launch_harness(conn, launch_id)
+    if not isinstance(transport_key, str) or not transport_key:
+        raise CoordError("a quarantined request names the transport key its deny is addressed by")
     raw, digest = quarantine_raw_key(spawn_nonce, raw_line)
     key = durable_key(raw, "", digest)
     held = approval(conn, launch_id, key)
     if held is not None:
         return Arrival("replay", held)
-    row = _insert(conn, now, launch_id=launch_id, key=key, raw=raw, turn=vendor_turn_id, call=None, approval_id=None,
+    row = _insert(conn, now, launch_id=launch_id, key=key, raw=raw, transport=transport_key, turn=vendor_turn_id,
+                  call=None, approval_id=None,
                   kind="quarantine", route="quarantine", decisions=("deny",), tool_name="", digest=digest, tagged=True,
                   nonce=spawn_nonce)
     return Arrival("quarantined", row)
@@ -537,20 +564,22 @@ def mark_driver_lost(conn: sqlite3.Connection, now: str, launch_id: str, cause: 
 def record_cancelled(store: "ChatStore", *, launch_id: str, vendor_request_key: str, cause: str, tag: str) -> None:
     """§3.4 R7-8: a cancelled core call, in one transaction: ``core_result`` (``decision`` the union's ``tag``, cause
     ``cancelled: <cause>``) then the named terminal row: ``driver_lost`` for ``stop`` / ``kill`` / ``stdin closed`` /
-    ``service shutdown``, else ``decided_after_turn``; a terminal of that kind the producer already committed is not
-    written twice. Never a card, never forwarded. (``result=out`` of the design is its ``tag``: this module does not
+    ``service shutdown``, else ``decided_after_turn``. Idempotent: a request that already carries a ``core_result``, an
+    ``answer_attempted`` or any terminal kind gets nothing written (a retry, or a request a producer already settled).
+    Never a card, never forwarded. (``result=out`` of the design is its ``tag``: this module does not
     import the consent core's union.)"""
     if cause not in CANCEL_CAUSES:
         raise CoordError(f"a cancel cause is one of {', '.join(CANCEL_CAUSES)}")
     with store._write() as (conn, now):
         if approval(conn, launch_id, vendor_request_key) is None:
             raise CoordError(f"no approval request {vendor_request_key[:60]!r} on launch {launch_id}")
+        if _kinds(conn, launch_id, vendor_request_key) & _SETTLED_KINDS:
+            return                    # idempotent: a retry, or a request already settled, gets no second row of any kind
         append_event(conn, now, launch_id=launch_id, key=vendor_request_key, kind="core_result", by="core",
                      decision=tag, cause=f"cancelled: {cause}")
         terminal = "driver_lost" if cause in _DRIVER_LOST_CAUSES else "decided_after_turn"
-        if terminal not in _kinds(conn, launch_id, vendor_request_key):
-            append_event(conn, now, launch_id=launch_id, key=vendor_request_key, kind=terminal, by="service",
-                         cause=f"cancelled: {cause}")
+        append_event(conn, now, launch_id=launch_id, key=vendor_request_key, kind=terminal, by="service",
+                     cause=f"cancelled: {cause}")
 
 
 def record_abstain(store: "ChatStore", *, launch_id: str, vendor_request_key: str,
@@ -585,6 +614,8 @@ def record_abstain(store: "ChatStore", *, launch_id: str, vendor_request_key: st
             return "no_card"
         if have & set(TERMINAL_KINDS):
             return "decided_after_turn"
+        if "core_result" in have:
+            return "no_card"                      # idempotent: the card (or the cancel's result) is already written
         if _ended_turn(conn, row):
             return refuse("abstain after the turn ended")
         fold = chat.liveness(conn, launch_id)
@@ -603,16 +634,29 @@ def latch_not_live(store: "ChatStore", *, launch_id: str, source: str, cause: st
     """R9-3: ONE ``BEGIN IMMEDIATE``: the ``not_live`` verdict row, then for EVERY request of the launch that is pending
     and has no ``answer_attempted``, ``decision_observed`` (by service) + ``answer_attempted`` with the refusal its
     harness understands. One :class:`Attempt` per request; the caller writes each one's bytes after the commit, THEN
-    sets the cancel. A failed commit raises and writes nothing: no bytes, no cancel. A request that had an attempt before
-    the latch is left to that attempt (the one-call window of R10-7)."""
+    sets the cancel. A failed commit raises and writes nothing: no bytes, no cancel. A request that had an attempt or a
+    decision before the latch is left to it (the one-call window of R10-7). A request whose deny cannot be written is
+    rolled back under its own savepoint and recorded as ``answer_refused``; the verdict row commits regardless.
+    A request already carded (``core_result none``) is denied too, by intent: the latch fails closed (pinned by
+    ``test_latch_denies_a_carded_request``)."""
     from levain.coordinator import chat
     with store._write() as (conn, now):
         chat.record_check(conn, now, launch_id, "not_live", source, chat._cause_text(cause))
         out = []
-        for key in pending_requests(conn, launch_id, unattempted=True):
+        for n, key in enumerate(pending_requests(conn, launch_id, unattempted=True)):
             row = approval(conn, launch_id, key)
             assert row is not None
-            out.append(_deny_attempt(conn, now, row, cause=f"not_live: {_clip(cause)}"))
+            point = f"latch_{n}"
+            conn.execute(f"SAVEPOINT {point}")
+            try:
+                out.append(_deny_attempt(conn, now, row, cause=f"not_live: {_clip(cause)}"))
+            except (sqlite3.DatabaseError, CoordError) as exc:
+                # one request whose deny cannot be written never undoes the verdict or the other denies: its own
+                # savepoint rolls back and the failure is a row (answer_refused) on that request
+                conn.execute(f"ROLLBACK TO {point}")
+                append_event(conn, now, launch_id=launch_id, key=key, kind="answer_refused", by="service",
+                             cause=f"not_live: deny could not be built: {_clip(exc)}")
+            conn.execute(f"RELEASE {point}")
         return out
 
 
@@ -636,7 +680,8 @@ class AmbiguousStop:
 
 def ambiguous_stops(conn: sqlite3.Connection, launch_id: str) -> list[AmbiguousStop]:
     """Every request of a live launch (its latest launch event is ``active``) whose LAST approval event is
-    ``answer_ambiguous`` and whose turn has not ended; one per request, empty when the launch ended or a later event
+    ``answer_ambiguous`` and whose turn is live (:func:`turn_live`: not ended, and its child is the latest activation's);
+    one per request, empty when the launch ended or a later event
     settled the request. A store that has no approval tables yet (an older file opened read-only) has none."""
     have = {n for (n,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     if "chat_approvals" not in have or "chat_approval_events" not in have:
@@ -651,6 +696,6 @@ def ambiguous_stops(conn: sqlite3.Connection, launch_id: str) -> list[AmbiguousS
             "chat_approval_events x WHERE x.launch_id = a.launch_id AND x.vendor_request_key = a.vendor_request_key) "
             "WHERE a.launch_id = ? AND e.kind = 'answer_ambiguous' ORDER BY a.gseq", (launch_id,)).fetchall():
         row = approval(conn, launch_id, key)
-        if row is not None and not _ended_turn(conn, row):
+        if row is not None and turn_live(conn, row) is None:
             out.append(AmbiguousStop(launch_id, key, at))
     return out
