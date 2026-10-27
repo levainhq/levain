@@ -22,9 +22,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from levain.authority import (CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, AuthorityError, StaleHead, UnsignedLink,
-                              VerifierUnavailable, anchor_path, append, consent_grant, consent_grant_tool_problem,
-                              consent_resolved_workspace, inert_grant, passkey_revocable, prepare)
+from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, AuthorityError,
+                              StaleHead, UnsignedLink, VerifierUnavailable, anchor_path, append, consent_grant,
+                              consent_grant_tool_problem, consent_resolved_workspace, contained_shell_grant,
+                              inert_grant, passkey_revocable, prepare)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
@@ -40,7 +41,10 @@ class GrantChanged(KeyError_):
 
 @dataclass(frozen=True)
 class ConsentGrant:
-    """A consent grant as the replay holds it, with the authority link that created or last renewed it."""
+    """A consent grant as the replay holds it, with the authority link that created or last renewed it. A
+    contained-shell grant (:data:`levain.authority.CONSENT_CONTAINED_SHELL_KIND`) is one too, with its
+    ``containment_digest``: it answers a contained chat launch's Bash calls, and is listed and revoked like the
+    others."""
     id: str
     agent: str
     tools: tuple[str, ...]
@@ -52,6 +56,8 @@ class ConsentGrant:
     kind: str = CONSENT_GRANT_KIND
     # a consent-mcp grant's declarations: tool -> field -> kind (empty for a consent grant)
     mcp_fields: dict[str, dict[str, str]] = field(default_factory=dict, hash=False)
+    # a contained-shell grant's containment digest ("" for every other kind)
+    containment_digest: str = ""
 
     @classmethod
     def of(cls, grant: Mapping[str, Any], link: tuple[int, str] | None) -> ConsentGrant:
@@ -59,10 +65,14 @@ class ConsentGrant:
         return cls(grant["id"], grant["agent"], tuple(grant["tools"]), grant["workspace"], tuple(grant["postures"]),
                    grant["expires_at"], None if link is None else link[0], None if link is None else link[1],
                    str(grant["kind"]), {str(t): {str(k): str(v) for k, v in f.items()}
-                                        for t, f in (declared or {}).items()})
+                                        for t, f in (declared or {}).items()},
+                   str(grant["containment_digest"]) if grant.get("kind") == CONSENT_CONTAINED_SHELL_KIND else "")
 
     def tool_problem(self, tool: str) -> str | None:
-        """Why this grant answers nothing for ``tool`` (:func:`levain.authority.consent_grant_tool_problem`)."""
+        """Why this grant answers nothing for ``tool`` (:func:`levain.authority.consent_grant_tool_problem`; a
+        contained-shell grant names exactly ``Bash``, the one tool the replay lets it name)."""
+        if self.kind == CONSENT_CONTAINED_SHELL_KIND:
+            return None if tool == "Bash" else f"{str(tool)[:200]!r}: a contained-shell grant answers only Bash"
         return consent_grant_tool_problem({"kind": self.kind, "agent": self.agent, "mcp_fields": self.mcp_fields},
                                           tool)
 
@@ -262,6 +272,8 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
         if g.kind == CONSENT_MCP_GRANT_KIND:
             row["mcp_fields"] = {visible(t): {visible(k): visible(v) for k, v in f.items()}
                                  for t, f in g.mcp_fields.items()}
+        if g.kind == CONSENT_CONTAINED_SHELL_KIND:
+            row["containment_digest"] = visible(g.containment_digest)
         rows.append(row)
     for gid, kind, expires_at, seq in inert:
         rows.append({**common(gid, kind, expires_at, seq), "state": "inert"})
@@ -296,7 +308,7 @@ def _split(state: Any) -> tuple[list[ConsentGrant], list[tuple[str, str, str, in
     inert: list[tuple[str, str, str, int | None]] = []
     for gid, g in sorted(state.policy.grants.items()):
         link = state.grant_link(gid)
-        if consent_grant(g):
+        if consent_grant(g) or contained_shell_grant(g):
             consent.append(ConsentGrant.of(g, link))
         elif inert_grant(g):
             inert.append((gid, str(g["kind"]), str(g["expires_at"]), None if link is None else link[0]))

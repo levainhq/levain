@@ -750,7 +750,8 @@ def gate_row(agent: str, queue_dir: Path | str, event: Mapping[str, Any], sessio
              tool_input: Any, cwd: str, *, decision: Any = None, refused: str | None = None,
              request_id: str | None = None) -> str | None:
     """File a gated call's row at decision time, from the gate's own answer: a verified allow is phase ``pre``,
-    stamped with its authority (``answer`` / ``grant`` / ``ruling``, the answering request); anything the gate
+    stamped with its authority (``answer`` / ``grant`` / ``ruling``, the answering request; a contained-shell
+    grant's allow is ``grant``); anything the gate
     denied is ``denied_by_gate`` (stamp ``unknown``, outcome ``refused``), its ``decision`` saying how (``deny``,
     ``undecided``, ``halted``, ``failed``, or ``floor`` for the T3 floor, where no enrolled key could approve it).
     Every row carries the event's ``permission_mode`` (:func:`_common`). ``session`` is the gate's own key. None on
@@ -760,7 +761,9 @@ def gate_row(agent: str, queue_dir: Path | str, event: Mapping[str, Any], sessio
         ledger = Ledger(queue_dir, busy_seconds=HOOK_BUSY_SECONDS)
         if decision is not None and getattr(decision, "decision", None) == "allow":
             via = getattr(decision, "via", None)
-            return ledger.record_call(**common, phase="pre", stamp=via if via in ("grant", "ruling") else "answer",
+            # a contained-shell grant is a standing grant: its allow is no operator's answer
+            stamp = "grant" if via in ("grant", "contained_shell") else "ruling" if via == "ruling" else "answer"
+            return ledger.record_call(**common, phase="pre", stamp=stamp,
                                       request_id=getattr(decision, "request_id", None),
                                       stamp_detail={"decision": "allow", "source": "levain_gate"})
         how = "deny" if decision is not None else (refused or "deny")

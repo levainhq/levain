@@ -161,7 +161,7 @@ def _raw_sql(queue, *statements):
 def test_verify_refuses_a_prior_format_store_and_names_the_command_that_migrates_it(scratch, tmp_path, capsys):
     # F1. Seen red on a9a66aea: rc 0, "receipts: 0", a /3 store with receipts read as an empty, clean log
     from levain.authority import anchor_path as _anchor
-    from levain.consent.queue import PRIOR_FORMAT, ConsentQueue, authority_source
+    from levain.consent.queue import ConsentQueue, authority_source
     from tests.test_consent_queue_v4 import _v3_module
 
     queue, _, _, root = scratch
@@ -172,11 +172,11 @@ def test_verify_refuses_a_prior_format_store_and_names_the_command_that_migrates
     assert old.withdraw(gone.id)
     rc, out, err = _verify_cli(queue, root, capsys)
     assert rc == 1, out
-    assert f"UNREADABLE: {queue.path} is in format {PRIOR_FORMAT!r}" in out and "levain consent pending" in out
+    assert f"UNREADABLE: {queue.path} is in format {v3.STORE_FORMAT!r}" in out and "levain consent pending" in out
     assert "receipts:" not in out
     conn = sqlite3.connect(queue.path)
     try:                                                             # verify never migrates or writes
-        assert conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()[0] == PRIOR_FORMAT
+        assert conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()[0] == v3.STORE_FORMAT
     finally:
         conn.close()
     # the advice is true: `levain consent pending` migrates it, and verify then reads the log

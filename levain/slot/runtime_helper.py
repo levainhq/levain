@@ -1192,14 +1192,9 @@ class SlotView:
 
 
 def _baseline_vendor(data: Optional[bytes]) -> Optional[str]:
-    if data is None:
-        return None
-    try:
-        obj = canon.parse(data)
-    except ContractError:
-        return "?"
-    v = obj.get("vendor") if type(obj) is dict else None
-    return v if v in VENDORS else "?"
+    from levain.slot import identity as ID
+
+    return ID.baseline_vendor(data)
 
 
 def parse_slot_state_of(data: bytes, slot: SlotId) -> R.SlotState:
@@ -2133,9 +2128,19 @@ def resume(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
 def status(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     """Read-only (§5.1): the caller's alloc records (``supervisor_uid == SUDO_UID``; dispatch: ticketed only).
     DECISION: the answer is ``{records:[levain-alloc/1…]}`` sorted by session; a named session the caller does not
-    hold is ``no-session``."""
+    hold is ``no-session``. A named ``login`` session whose state record holds an ``identity`` (past start's identity
+    step, §7.6) also answers ``identity``: CONTROL's field, which the slot cannot write, so the supervisor's
+    confirm prompt is decided and shown from it (1027-18 RULINGS G1b, the root-sourced id display)."""
     if req.session is not None:
-        return {"records": [R.alloc_record(read_alloc(ctx, req.session))]}
+        from levain.slot import identity as ID
+
+        a = read_alloc(ctx, req.session)
+        ans: Dict[str, object] = {"records": [R.alloc_record(a)]}
+        rec = ID.read_record(ctx, a.session) if a.kind == "login" else None
+        ident = rec.fields.get("identity") if rec is not None else None
+        if ident is not None:
+            ans["identity"] = dict(ident)
+        return ans
     out = []
     with ctx.store.dir("alloc") as fd:
         names = sorted(os.listdir(fd))
@@ -2161,6 +2166,12 @@ def _teardown(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     from levain.slot import start as SS
 
     return SS.teardown(ctx, req, blob)
+
+
+def _confirm_identity(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    from levain.slot import identity as ID
+
+    return ID.confirm_identity(ctx, req, blob)
 
 
 def _probe(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
@@ -3342,7 +3353,7 @@ def restore(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
 VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, object]]] = {
     "prepare": prepare, "render": render, "resume": resume, "status": status,
     "start": _start, "teardown": _teardown, "adopt-open": adopt_open, "adopt-verify": adopt_verify,
-    "discard": discard, "restore": restore, "probe": _probe,
+    "discard": discard, "restore": restore, "probe": _probe, "confirm-identity": _confirm_identity,
 }
 
 

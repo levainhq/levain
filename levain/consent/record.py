@@ -83,13 +83,35 @@ _KEY_TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+|[0-9]+")
 def tool_input_digest(tool_input: Any) -> str:
     """The digest of the whole tool input the agent asked about. JCS (``cockpit.consent``) when the value is
     in its domain; a float (outside it) falls back to sorted compact JSON, under another prefix so the two
-    schemes never compare equal."""
+    schemes never compare equal. A mapping key that is not a string, anywhere in the input, raises ``TypeError``
+    (json would coerce ``{1: "a"}`` to ``{"1": "a"}``, a digest of an input the agent never sent: L3 r2 codex D4).
+    Any other object JSON cannot encode is digested as its ``str``; no JSON-decoded input holds one."""
     try:
         return "jcs:" + value_sha256(tool_input)
     except ConsentError:
+        _string_keys_only(tool_input, set())
         text = json.dumps(tool_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
                           default=str)
         return "json:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _string_keys_only(value: Any, path: set[int]) -> None:
+    """Raise ``TypeError`` at a dict key that is not a string, anywhere in ``value``; a cycle raises ``ValueError``
+    as ``json.dumps`` does."""
+    if isinstance(value, dict):
+        children: Any = value.values()
+        if any(not isinstance(k, str) for k in value):
+            raise TypeError("a mapping key is not a string")
+    elif isinstance(value, (list, tuple)):
+        children = value
+    else:
+        return
+    if id(value) in path:
+        raise ValueError("Circular reference detected")
+    path.add(id(value))
+    for child in children:
+        _string_keys_only(child, path)
+    path.discard(id(value))
 
 
 def _secret_named(key: Any) -> bool:

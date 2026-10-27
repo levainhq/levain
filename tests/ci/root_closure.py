@@ -188,6 +188,10 @@ LAZY_SITES = {
     'levain/slot/runtime_helper.py::verify_sealed_run::from levain.slot import adopt_verify as AV': 'root',
     'levain/slot/runtime_helper.py::verify_sealed_run::from levain.slot import export_run as ER': 'root',
     'levain/slot/runtime_helper.py::verify_sealed_run::from levain.slot import importer as IM': 'root',
+    # the identity gate (1027+18 idg1): confirm-identity's handler and the baseline reader prepare runs
+    'levain/slot/runtime_helper.py::_baseline_vendor::from levain.slot import identity as ID': 'root',
+    'levain/slot/runtime_helper.py::_confirm_identity::from levain.slot import identity as ID': 'root',
+    'levain/slot/runtime_helper.py::status::from levain.slot import identity as ID': 'root',
     # the root discard / restore verbs (VERB_HANDLERS, operator-uid caller; land16)
     'levain/slot/runtime_helper.py::_store_verb::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/runtime_helper.py::_store_verb::from levain.slot.root_intent import PhaseFailed': 'root',
@@ -295,8 +299,6 @@ LAZY_SITES = {
     'levain/dispatch/registry.py::driver_template_path::from levain import verifier_drivers': 'operator',
     # operator: ``body_refusal`` <- ``dispatch/cli.py`` and ``dispatch/control.py``; the follower reads no registry
     'levain/dispatch/registry.py::_verifier_entry_problem::from levain.verifier_drivers import output_compare': 'operator',
-    # operator: <- ``StandingPolicy.apply`` (``git grep -n 'policy.apply(' -- levain`` finds ``levain/cockpit/broker.py`` and ``verbs.py`` only) and ``classify`` / ``_validate_policy`` / ``_apply_policy_op`` (the replay, ``_step``)
-    'levain/authority.py::_tiers::from levain.cockpit.verbs import TIERS': 'operator',
     # operator: <- ``_validate_egress_key`` (``_validate_grant`` <- ``_validate_policy`` / ``_apply_policy_op``, the replay: the authority replay (``_step`` <- ``_replay_entry`` <- ``snapshot``, run by ``consent.queue.AuthoritySource`` and ``cockpit.authority.RequestAuthority.capture``); the queue broker builds its ``AuthoritySnapshot`` from published signers (``qbroker.grants.contract_authority``) and runs neither (``git grep -n -e 'snapshot(' -e 'authority_source' -e 'RequestAuthority(' -- levain/qbroker`` finds none)) and ``levain/chat_egress/advert.py``
     'levain/authority.py::egress_key_host_problem::from levain.chat_egress.parse import canonical_host': 'operator',
     # operator: <- ``_validate_egress_key`` (the replay's grant validation, as ``egress_key_host_problem``) and ``levain/chat_egress/advert.py``
@@ -638,6 +640,16 @@ NOT_ROOT_TESTS = {
     "tests/test_autonomic_gate_coverage_r2.py": ("needs conftest's test_only_confined_executor fixture",
         "test_only_confined_executor", _CONFTEST_EXECUTOR),
     "tests/test_autonomic_graduation.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_attempts_readers.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_gate_v3_s2.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_gate_v3_s2f.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_gate_v3_s2fx.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_gate_v3_s2fx2.py": ("needs conftest's test_only_confined_executor fixture",
         "test_only_confined_executor", _CONFTEST_EXECUTOR),
     "tests/test_autonomic_l3_fixes.py": ("its enrolled test key verifies only under conftest's autouse signers-owner "
                                          "fixture", "confirm_signers", _CONFTEST_SIGNERS),

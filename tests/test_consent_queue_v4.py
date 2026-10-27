@@ -22,7 +22,7 @@ from levain.cockpit.consent import utc_stamp
 from levain.consent import ANSWER_NAMESPACE, AnswerRefused, ConsentQueue, QueueStoreError, answer_message
 from levain.consent.listing import read_listing
 from levain.consent.queue import (
-    PRIOR_FORMAT, RULED_ALLOW_LAPSE, RULING_SKEW, SNOOZE_MAX_MINUTES, STORE_FORMAT, UNDECIDED_GRACE, Decision,
+    MIGRATES_FROM, PRIOR_FORMAT, RULED_ALLOW_LAPSE, RULING_SKEW, SNOOZE_MAX_MINUTES, STORE_FORMAT, UNDECIDED_GRACE, Decision,
     Ruling,
 )
 from levain.consent.receipt_log import verify as verify_receipts
@@ -584,7 +584,7 @@ def _dump(path):
 
 def test_a_v3_store_built_by_the_v3_code_migrates_in_place_row_for_row(tmp_path, keys):
     v3 = _v3_module()
-    assert v3.STORE_FORMAT == PRIOR_FORMAT
+    assert v3.STORE_FORMAT in MIGRATES_FROM and v3.STORE_FORMAT != PRIOR_FORMAT
     log = _own_log(tmp_path, keys)
     clock = Clock(NOW)
     d = tmp_path / "consent"
@@ -602,7 +602,7 @@ def test_a_v3_store_built_by_the_v3_code_migrates_in_place_row_for_row(tmp_path,
     old.sweep()
     old.close_unrun(agent="claude_code", agent_session_id="sess-1", event="stop")
     before, meta_before = _dump(d / "queue.db")
-    assert meta_before["format"] == PRIOR_FORMAT and len(before["receipts"]) == 5
+    assert meta_before["format"] == v3.STORE_FORMAT and len(before["receipts"]) == 5
 
     new = ConsentQueue(d, authority=log.source, clock=clock, home=h4_home())
     assert new.get(open_.id)[1] == "pending"                # the first open migrates
@@ -626,8 +626,8 @@ def test_a_v3_store_built_by_the_v3_code_migrates_in_place_row_for_row(tmp_path,
     report = verify_receipts(d, authority_for=lambda request: log.source)
     assert report.ok and set(report.unchained) == {allowed.id, denied.id} and not report.mismatches
     assert report.last_signed.request_id == open_.id and report.last_signed.size == 6
-    # a levain that knows only /3 refuses the /4 store
-    with pytest.raises(v3.QueueStoreError, match="levain-consent-queue/4"):
+    # a levain that knows only /3 refuses the store it migrated to (/5 since CH-D1c-B: /3 migrates straight there)
+    with pytest.raises(v3.QueueStoreError, match=STORE_FORMAT):
         v3.ConsentQueue(d, authority=v3.authority_source(log.path, anchor=None)).pending()
 
 
