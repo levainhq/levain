@@ -202,12 +202,40 @@ def _deep(n=100_000):
     return d
 
 
-@pytest.mark.parametrize("make", [lambda: {1: "a", "x": "b"}, _recursive, _deep])
+@pytest.mark.parametrize("make", [lambda: {1: "a"}, lambda: {"x": {2: "b"}}, lambda: {"x": [{None: 1.5}]},
+                                  lambda: {1: "a", "x": "b"}, lambda: {"x": object()}, lambda: {"x": {1, 2}},
+                                  _recursive, _deep])
 @pytest.mark.parametrize("nonce", ["", NONCE])
 def test_an_undigestable_input_is_declined_invalid_event(tmp_path, make, nonce):
+    # L3 r2 codex D4: the exact {1: "a"} (a json fallback coerced the key to "1"), and an object json cannot encode
     q = Q("allow")
     out = ex(_event("Bash", make(), tool_use_id="toolu_1"), q, tmp_path, nonce=nonce)
     assert isinstance(out, cc.Declined) and out.reason == "invalid_event" and q.filed == []
+
+
+@pytest.mark.parametrize("value", [{1: "a"}, {"x": {2: "b"}}, {"x": [{True: 1.5}]}, {"x": object()},
+                                   {"x": {1, 2}}, {"x": 1.5, "y": Path("/p")}])
+def test_the_json_fallback_refuses_a_non_string_key_and_an_unencodable_object(value):
+    with pytest.raises(TypeError):
+        tool_input_digest(value)
+
+
+def test_the_json_fallback_still_digests_a_float_and_a_string_keyed_tree():
+    assert tool_input_digest({"a": 1.5, "b": [{"c": 2.5}]}).startswith("json:")
+    assert tool_input_digest({"a": 1}).startswith("jcs:")
+
+
+# --- L3 r2 complement LOW 3: an SH1 grant never counts for an agent-config call -----------------------------
+
+def test_an_sh1_grant_does_not_count_for_an_agent_config_call(tmp_path, monkeypatch):
+    # Bash is never agent config today (targets_agent_config does not parse Bash), so this pins the order should
+    # that change: with only an SH1 grant, an agent-config call is no_decider, never a T3 row no key can sign
+    settings = _only_sh1(monkeypatch, tmp_path, _sh1(str(tmp_path)))
+    monkeypatch.setattr(cc, "targets_agent_config", lambda *a, **kw: True)
+    q = Q(None)
+    out = ex(_event("Bash", INPUT, tool_use_id="toolu_1"), q, tmp_path, settings=settings, nonce=NONCE,
+             proof=_proof(tmp_path))
+    assert isinstance(out, cc.Abstained) and out.reason == "no_decider" and q.filed == []
 
 
 def test_core_call_digest_survives_a_lone_surrogate():

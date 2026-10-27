@@ -956,12 +956,21 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
     tool_use_id = event.get("tool_use_id")
     mode = event.get("permission_mode")
     posture = mode if isinstance(mode, str) and mode else None
-    # the one call an SH1 grant can answer (policy.contained_shell_refusal: exactly Bash, a chat call, a proof)
-    sh1 = {"contained_shell": True} if launch_nonce and contained_launch is not None and tool_name == "Bash" else {}
+    # the one call an SH1 grant can answer (policy.contained_shell_refusal: exactly Bash, a chat call, a proof, never
+    # agent config); for that call agent_config is known before the no-decider gate, for every other call after it
+    sh1: dict[str, bool] = {}
+    agent_config: bool | None = None
+    if launch_nonce and contained_launch is not None and tool_name == "Bash":
+        protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
+        agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ,
+                                            protected=protected)
+        sh1 = {} if agent_config else {"contained_shell": True}
     if policy is None and nothing_can_decide(settings, **sh1):
         return Abstained(call, "no_decider", None, nothing_can_decide_why(settings, **sh1) or "nothing can decide")
-    protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
-    agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected)
+    if agent_config is None:
+        protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
+        agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ,
+                                            protected=protected)
     if agent_config and unconfined(cwd, home=home, environ=environ):
         # an unconfined session (Q10 D2): its dialog answers, as the gate left the call to its mode (L1-7)
         return Declined(call, "unconfined")
