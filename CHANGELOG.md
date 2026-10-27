@@ -256,7 +256,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   longer warns "could not be read" on a healthy install. A session refused for a missing front log directory names the
   directory that is missing.
 - **`levain binding policy create`'s read-back no longer overstates a guard.** A kill condition that hits an unexpected
-  internal error, or an event number too large for a float, now stops the fire instead of crashing the check.
+  internal error, or an event number too large for a float, now reads as a kill Levain could not evaluate, so the
+  guard is refused at signing instead of the check crashing.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - **The graduation engine behind `levain binding graduate`.** Once the binding driver is wired, it takes the steps a
