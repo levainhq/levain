@@ -44,7 +44,7 @@ def _v3_store(tmp_path) -> tuple[RunJournal, BindingStore]:
 
 
 # ---- a: BindingStore.admit seals a /3 run through the one run-seal builder ------------------------------------------
-@pytest.mark.parametrize("posture, links, confirm_class", [(Posture.ON_LOOP, 1, False), (Posture.CONFIRM, 2, True)])
+@pytest.mark.parametrize("posture, links, confirm_class", [(Posture.ON_LOOP, 1, True), (Posture.CONFIRM, 2, True)])
 def test_a_v3_admission_seals_the_run_from_the_admitted_binding(tmp_path, posture, links, confirm_class):
     j, store = _v3_store(tmp_path)
     b = _binding(posture, links=links)

@@ -58,8 +58,8 @@ from levain.autonomic.coverage import (
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
 from levain.autonomic.journal import (
-    AUTHORIZED, RECHECK, UNSIGNED_DECIDER, EffectEnd, EffectOutcome, EffectStatus, JournalCorruptError, Receipt,
-    RunJournal, RunRef, Terminal, V3Fire, decision_key, effect_digest, hold_id_for, needs_signature,
+    AUTHORIZED, RECHECK, UNSIGNED_DECIDER, Closed, EffectEnd, EffectOutcome, EffectStatus, JournalConflictError,
+    JournalCorruptError, Receipt, RunJournal, RunRef, Terminal, V3Fire, decision_key, effect_digest, hold_id_for, needs_signature,
 )
 from levain.autonomic.kill import kill_trips
 from levain.autonomic.monitor import TrajectoryObserver, prediction_diverged
@@ -982,9 +982,11 @@ class EfferentGate:
             # hold (with the digest it was opened with; the record's own bytes are not trusted).
             _log.error("efferent gate resolve: INTEGRITY failure on hold %s — REJECTED (no fire)", hold_id)
             if self._journal_v3:
+                # a /3 rejection closes its run with its receipt (as a /2 one writes its cancels row), so the outcome
+                # names that receipt, an unreadable pending's too (R15-5 S2 fix round 1 F3)
                 return self._reject_v3(hold, decision, pending, created_at, Posture.REFUSE_ESCALATE,
                                        "integrity:unreadable_pending" if pending is None else "integrity:seal_mismatch",
-                                       binding_id, open_after=pending is None)
+                                       binding_id)
             self._journal.decide(hold_id, approve=False, digest=hold["digest"], by=decision.by)
             if pending is None:
                 return self._refuse_open("integrity:unreadable_pending", binding_id)
@@ -1005,6 +1007,43 @@ class EfferentGate:
                 verdict="denied", by=by, reason=reason, actor_first_estimate=decision.first_estimate,
                 **({"terminal_state": terminal} if terminal else {}),
             )
+
+        def end_unstarted(rung: Posture, reason: str) -> GateOutcome | None:
+            # end the run unless the effect started, with this refusal's receipt on /3: the refusal's outcome, or None
+            # when the effect started (the journal's to report: the fire below runs nothing). The /3 close says itself
+            # whether it counted (R15-5 S2 fix round 1 F1: no WON/LOST read from receipt ids)
+            try:
+                if self._journal_v3:
+                    build = self._pending_cancels(pending, hold, created_at, rung)
+                    assert build is not None
+                    got: Closed | EffectOutcome | None = self._journal.end_unstarted(  # type: ignore[union-attr]
+                        hold["run_id"], hold["effect_id"], reason=reason, receipt=build(reason))
+                else:
+                    got = self._journal.cancel_unstarted(hold["run_id"], hold["effect_id"], reason=reason)  # type: ignore[union-attr]
+            except KeyError:
+                return self._refuse_open("run_not_admitted", binding_id)
+            except Exception as e:  # noqa: BLE001
+                _log.error("efferent gate resolve: could not cancel run %s (%s): %s", hold["run_id"],
+                           type(e).__name__, e)
+                return GateOutcome(
+                    posture=rung, fired=False, refused=False, deferred=False, held=True,
+                    reason=f"cancel_unrecorded:{reason}", receipt_id=None,
+                    execution=None, binding_id=binding_id,
+                )
+            if isinstance(got, EffectOutcome):
+                return None
+            if isinstance(got, Closed):
+                return self._refused_v3(rung, reason, got.receipt_id if got.terminal is Terminal.WON else None,
+                                        binding_id)
+            return deny(rung, reason, by="on-loop")
+
+        def ended(rung: Posture, reason: str, status: EffectStatus) -> GateOutcome:
+            # an approval the journal stopped for good. RULINGS 1027-18 R5: on /3 a run already closed (cancelled, or
+            # its effect poisoned) has its close as its receipt, so nothing goes to the file; a fence closes nothing
+            # (its owner closes the run), so a fenced one keeps its file receipt (O3)
+            if self._journal_v3 and status in (EffectStatus.CANCELLED, EffectStatus.POISONED):
+                return self._refused_v3(rung, reason, None, binding_id)
+            return deny(rung, reason, by="on-loop")
 
         def reject(posture: Posture, reason: str, **kw: Any) -> GateOutcome:
             if self._journal_v3:
@@ -1039,6 +1078,7 @@ class EfferentGate:
             return self._refuse_open(why or "revalidate:registry_unreadable", binding_id)
         stop_reason = why or "revalidate:risk_floor_rose"
         signed_decision = hold.get("decided") is True and needs_signature(hold.get("by"))
+        silence = False
         if signed_decision and fence is None:
             # A person's approval whose risk cannot be re-derived now. It ends, with a receipt, only once the
             # journal has stopped its run for good (a revoke fences it); otherwise nothing changes, since the
@@ -1049,32 +1089,16 @@ class EfferentGate:
             except KeyError:
                 return self._refuse_open("run_not_admitted", binding_id)
             if barrier is not None and barrier.status in (EffectStatus.FENCED, EffectStatus.CANCELLED):
-                return deny(effective, f"journal:{barrier.status.value}", by="on-loop")
+                return ended(effective, f"journal:{barrier.status.value}", barrier.status)
             return self._refuse_open(stop_reason, binding_id)
         elif hold.get("decided") is True and not signed_decision and effective > self._decided_rung(hold, posture):
             # Approved at a lower rung by the silence default (no person, no signature to ask for again):
             # the run ends instead, with a receipt. Only while the effect has not started,
             # checked in the cancel's own transaction: one that ran (or is running) is the journal's to
             # report, and the fire below reports it without running anything.
-            try:
-                build = self._pending_cancels(pending, hold, created_at, effective)
-                stop_receipt = build(stop_reason) if build is not None else None
-                started = self._journal.cancel_unstarted(hold["run_id"], hold["effect_id"], reason=stop_reason,
-                                                         receipt=stop_receipt)
-            except KeyError:
-                return self._refuse_open("run_not_admitted", binding_id)
-            except Exception as e:  # noqa: BLE001
-                _log.error("efferent gate resolve: could not cancel run %s (%s): %s", hold["run_id"],
-                           type(e).__name__, e)
-                return GateOutcome(
-                    posture=effective, fired=False, refused=False, deferred=False, held=True,
-                    reason=f"cancel_unrecorded:{stop_reason}", receipt_id=None,
-                    execution=None, binding_id=binding_id,
-                )
-            if started is None:
-                if stop_receipt is not None:   # /3: the close carried this refusal's receipt
-                    return self._refused_v3(effective, stop_reason, self._closed_with(hold, stop_receipt), binding_id)
-                return deny(effective, stop_reason, by="on-loop")
+            stopped = end_unstarted(effective, stop_reason)
+            if stopped is not None:
+                return stopped
         elif signed_decision:
             # A person's approval that stands fires at the rung it was signed at. The journal checks it at
             # admission (``_authorize_admission``): the rung needed then, and the signature over the challenge
@@ -1087,30 +1111,30 @@ class EfferentGate:
             # was recorded at (RULINGS O-p2-1 / R15-5: the seal is max(effective, decided); the /3 store refuses an
             # attempt sealed below its decision's rung, effects_held_tied)
             posture = self._decided_rung(hold, effective)
+            silence = True
+
+        if posture is Posture.REFUSE_ESCALATE:
+            # R15-5 S2 fix round 1 R1 (codex r1 HIGH 3): the rung a standing decision was recorded at is the rung it
+            # fires at, and REFUSE_ESCALATE has none (a record the journal's decide now refuses): it ends, never fires
+            reason = "decided_rung_refuses"
+            if hold.get("decided") is not True:
+                return reject(posture, reason)
+            stopped = end_unstarted(posture, reason)
+            # an effect that started under it is not run again here, nor fired at a rung with no execution path
+            return stopped if stopped is not None else self._refuse_open(f"{reason}:effect_started", binding_id)
 
         decider_now = hold.get("by") if hold.get("decided") is True else decision.by
-        if self._journal_v3 and posture.needs_confirm and not needs_signature(decider_now):
+        if silence and self._journal_v3 and posture.needs_confirm and not needs_signature(decider_now):
             # RULINGS 1027-14 "R15-5 S2" O2: a silence fire at a confirm rung needs a sealed grant on /3
-            # (effects_guarded), and the resolve path holds none: it is a refusal, closed with its receipt, never fired
+            # (effects_guarded), and the resolve path holds none: it is a refusal, closed with its receipt, never
+            # fired. Only on the silence branch (F2): after the stop-reason branch found its effect started, the fire
+            # below reports that effect, and no second end is written
             reason = "unattended_confirm_without_grant"
             if hold.get("decided") is not True:
                 return reject(posture, reason)
-            try:
-                build = self._pending_cancels(pending, hold, created_at, posture)
-                assert build is not None
-                stop_receipt = build(reason)
-                started = self._journal.cancel_unstarted(hold["run_id"], hold["effect_id"], reason=reason,
-                                                         receipt=stop_receipt)
-            except KeyError:
-                return self._refuse_open("run_not_admitted", binding_id)
-            except Exception as e:  # noqa: BLE001
-                _log.error("efferent gate resolve: could not close run %s (%s): %s", hold["run_id"],
-                           type(e).__name__, e)
-                return GateOutcome(posture=posture, fired=False, refused=False, deferred=False, held=True,
-                                   reason=f"cancel_unrecorded:{reason}", receipt_id=None, execution=None,
-                                   binding_id=binding_id)
-            if started is None:
-                return self._refused_v3(posture, reason, self._closed_with(hold, stop_receipt), binding_id)
+            stopped = end_unstarted(posture, reason)
+            if stopped is not None:
+                return stopped
             # the effect started before: the fire below runs nothing and reports what the journal recorded
 
         signed: bytes | None = None
@@ -1233,10 +1257,11 @@ class EfferentGate:
                 return self._resolve_hold(won, decision, chain_owned=chain_owned, stale_retry=False)
         if fired.fired or fired.replayed or fired.receipt_id is not None or fired.execution is not None:
             return fired   # (an execution without a receipt: the effect ran and failed, the receipt did not land)
-        if fired.refused and fired.reason in ("journal:fenced", "journal:cancelled", "journal:poisoned"):
+        stops = {f"journal:{s.value}": s for s in (EffectStatus.FENCED, EffectStatus.CANCELLED, EffectStatus.POISONED)}
+        if fired.refused and fired.reason in stops:
             # an approval the journal stopped for good (fenced or cancelled since the decision, or an
             # outcome already unknown): a terminal end, so it gets a receipt like every other one
-            return deny(posture, fired.reason, by="on-loop")
+            return ended(posture, fired.reason, stops[fired.reason])
         # APPROVED, effect not yet run (a fault, a registry that cannot be read or does not grant the run
         # now, the effect in flight elsewhere):
         # the decision stands, so this is not a refusal. The approval runs once on a later delivery or
@@ -1249,20 +1274,15 @@ class EfferentGate:
 
     def _pending_cancels(self, pending: PendingAction, hold: dict[str, Any], created_at: str,
                          posture: Posture) -> Callable[[str], Receipt] | None:
-        """:meth:`_cancel_receipts` for the run of a journaled pending (None on a ``/2`` journal)."""
+        """:meth:`_cancel_receipts` for the run of a journaled pending (None on a ``/2`` journal, before ``pending`` is
+        read)."""
+        if not self._journal_v3:
+            return None
         return self._cancel_receipts(created_at=created_at, action_name=pending.action_name,
                                      proposal_id=pending.proposal_id, context_id=pending.context_id,
                                      query_text=pending.query_text, query_date=pending.query_date,
                                      producers=pending.producers, authority=self._authority_of(pending),
                                      posture=posture, run_id=hold["run_id"])
-
-    def _closed_with(self, hold: dict[str, Any], receipt: Receipt) -> str | None:
-        """``receipt``'s id when it is the one that closed the hold's run, else None (another path closed it first)."""
-        try:
-            return receipt.receipt_id if self._journal.run_closer(hold["run_id"]) == receipt.receipt_id else None  # type: ignore[union-attr]
-        except Exception as e:  # noqa: BLE001 — the close stands; only its id is unread
-            _log.error("efferent gate: run %s close not read (%s): %s", hold["run_id"], type(e).__name__, e)
-            return None
 
     @staticmethod
     def _refused_v3(posture: Posture, reason: str, receipt_id: str | None, binding_id: str | None) -> GateOutcome:
@@ -1275,12 +1295,11 @@ class EfferentGate:
 
     def _reject_v3(self, hold: dict[str, Any], decision: ConfirmDecision, pending: PendingAction | None,
                    created_at: str, posture: Posture, reason: str, binding_id: str | None, *,
-                   terminal: str | None = None, open_after: bool = False) -> GateOutcome:
+                   terminal: str | None = None) -> GateOutcome:
         """A rejection of a hold on a ``/3`` journal: its receipt is built first and the one write-once decision closes
         the run with it (:func:`~levain.autonomic.journal.decide_in`); nothing is appended to the receipt file. A
         receipt that cannot be built records nothing (the decision stays open). ``pending`` None (unreadable): the
-        receipt names only what the hold row does. ``open_after``: the outcome is a refusal that records nothing
-        further (as on ``/2``)."""
+        receipt names only what the hold row does."""
         assert self._journal is not None
         try:
             if pending is not None:
@@ -1305,8 +1324,6 @@ class EfferentGate:
             return self._refuse_open(f"reject_unrecorded:{reason}", binding_id)
         if not d.ok:
             return self._refuse_open(f"journal:{d.reason}", binding_id)
-        if open_after:
-            return self._refuse_open(reason, binding_id)
         won = d.closed is not None and d.closed.terminal is Terminal.WON
         return self._refused_v3(posture, reason, receipt.receipt_id if won else None, binding_id)
 
@@ -2173,6 +2190,19 @@ class EfferentGate:
                                         proposal_id=request.proposal_id, posture=posture,
                                         face=face(), grant=grant)
             closed = self._journal.cancel(request.run.run_id, reason=close_reason, receipt=receipt)
+        except KeyError:
+            # a run this store never admitted: nothing to close, and nothing held for a retry (R15-5 S2 fix round 1 F5)
+            return GateOutcome(posture=posture, fired=False, refused=True, deferred=False, reason="run_not_admitted",
+                               receipt_id=None, execution=None, binding_id=request.authority.binding_id)
+        except JournalConflictError as e:
+            if self._run_complete(request.run.run_id):
+                # every sealed link of the run ended (the store's I2 refuses its close): the run is over, nothing
+                # closed it before (F4)
+                return GateOutcome(posture=posture, fired=False, refused=not killed, deferred=False, killed=killed,
+                                   reason=f"{reason}; run_completed", receipt_id=None, execution=None,
+                                   binding_id=request.authority.binding_id)
+            _log.error("efferent gate: could not close run %s (%s): %s", request.run.run_id, type(e).__name__, e)
+            return self._cancel_unrecorded(request, posture, close_reason)
         except Exception as e:  # noqa: BLE001 — nothing durable says the run is over
             _log.error("efferent gate: could not close run %s (%s): %s", request.run.run_id, type(e).__name__, e)
             return self._cancel_unrecorded(request, posture, close_reason)
@@ -2182,6 +2212,14 @@ class EfferentGate:
             reason=reason if won else f"{reason}; run_closed_before", receipt_id=receipt.receipt_id if won else None,
             execution=None, binding_id=request.authority.binding_id,
         )
+
+    def _run_complete(self, run_id: str) -> bool:
+        """Whether every sealed link of a ``/3`` run ended (False when that cannot be read)."""
+        try:
+            return self._journal.run_complete(run_id)  # type: ignore[union-attr]
+        except Exception as e:  # noqa: BLE001
+            _log.error("efferent gate: run %s completeness not read (%s): %s", run_id, type(e).__name__, e)
+            return False
 
     def _deny_fields(self, *, created_at, action_name, proposal_id, context_id, query_text, query_date,
                      producers, authority: AuthorityScope, posture: Posture, verdict: str, by: str,
@@ -2571,7 +2609,8 @@ class EfferentGate:
         """RULINGS 1027-11 "R15-5" (revalidation): the grant a ``/3`` attempt seals, read again from current state in
         the admission's write transaction (the journal's ``revalidate``, run before the insert; the signature check,
         :meth:`_authorize_admission`, stays outside it). None while the coverage source still names this grant's
-        incarnation for ``effect`` and it has not expired; ``bad:grant_revoked`` / ``bad:grant_expired`` refuse
+        incarnation for ``effect``, with the same signed terms, and it has not expired; ``bad:grant_revoked`` /
+        ``bad:grant_terms_changed`` / ``bad:grant_expired`` refuse
         (STALE: decided again); ``unavailable:<why>`` when the source or the clock cannot be read (HELD)."""
         try:
             now = self._clock()
@@ -2582,6 +2621,8 @@ class EfferentGate:
         policy_now = getattr(seen, "policy", None)
         if not isinstance(policy_now, GraduationPolicy) or policy_now.incarnation != grant.incarnation:
             return "bad:grant_revoked"
+        if policy_now.terms_text != grant.terms_text:
+            return "bad:grant_terms_changed"
         if expired:
             return "bad:grant_expired"
         return None

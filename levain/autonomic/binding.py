@@ -962,12 +962,24 @@ class _StoreAsItIs:
             yield conn
 
 
+def run_confirm_class(binding: Binding) -> bool:
+    """Whether a run of ``binding`` can fire an effect at a confirm rung (RULINGS 1027-18 R3 (i)): the highest rung
+    the gate's resolution can give any of its links, at fire. That resolution is ``max(the link's sealed or earned
+    rung, the manifest's floor for the action, the floor of the binding's tools)``, then, below CONFIRM, the
+    graduation clamp, which gives CONFIRM to an effect no live policy covers (``EfferentGate._clamp``). Of those
+    inputs, the manifest and the tools' floors are the gate's (its manifest and ``binding_risk``, not this store's),
+    and the cover is read only at fire, from a coverage source a revoke or an expiry moves after the admission: none
+    is known here. So the class is the confirm class, fail closed, for every binding: a run that may need a person's
+    decision carries D68's complete guard (``runs_guarded``)."""
+    return True
+
+
 def run_seal_for(binding: Binding) -> str:
     """The seal a ``levain-autonomic/3`` run of ``binding`` is born with (R15-5 S2), from the snapshot
     :meth:`BindingStore.admit` admits it under, through the one run-seal builder
-    (:func:`~levain.autonomic.journal.run_seal`): ``confirm_class`` when the binding's sealed rung needs a confirm,
-    ``guard`` its sealed floor, ``links`` its goal's links."""
-    return run_seal(confirm_class=binding.posture.needs_confirm, guard=[g.to_dict() for g in binding.guard],
+    (:func:`~levain.autonomic.journal.run_seal`): ``confirm_class`` from :func:`run_confirm_class`, ``guard`` its
+    sealed floor, ``links`` its goal's links."""
+    return run_seal(confirm_class=run_confirm_class(binding), guard=[g.to_dict() for g in binding.guard],
                     links=len(binding.goal))
 
 
@@ -992,15 +1004,17 @@ class BindingStore:
         if not upgrade and journal is not None:
             raise ValueError("BindingStore: upgrade=False opens the store as it is, and a run journal opens it with "
                              "its schema and format steps")
+        # The run journal the fire path admits runs into: the SAME database, so a pause and its fence,
+        # an admission and a one-shot's claim, are each one transaction. None: no journaled runs. The
+        # caller's ``path`` is compared BEFORE anything is opened or adopted (a /3 journal's db is adopted
+        # below, and comparing its directory with itself would pass any path)
+        if journal is not None and journal.directory.resolve() != Path(path).resolve():
+            raise ValueError("BindingStore: the run journal must live in the same store directory")
         # over a ``levain-autonomic/3`` journal the registry is that store's (R15-5 S2): AutonomicDB refuses a /3 store
         self.db = journal.db if journal is not None and journal.v3 else \
             AutonomicDB(path) if upgrade else _StoreAsItIs(path)
         self.path = self.db.directory
         self._validator = validator
-        # The run journal the fire path admits runs into: the SAME database, so a pause and its fence,
-        # an admission and a one-shot's claim, are each one transaction. None: no journaled runs.
-        if journal is not None and journal.directory.resolve() != self.path.resolve():
-            raise ValueError("BindingStore: the run journal must live in the same store directory")
         self._journal = journal
 
     # --- transactions -------------------------------------------------------------------

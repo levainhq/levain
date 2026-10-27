@@ -483,10 +483,7 @@ class RunJournal:
             return
         if run_receipt is None:
             raise ValueError(f"a /3 run closes only with its receipt: no run_receipt for {reason!r}")
-        complete = conn.execute(
-            "SELECT (SELECT COUNT(*) FROM effects e WHERE e.run_id = ? AND e.state IN ('done', 'unknown')) >= "
-            "(SELECT json_extract(r.seal, '$.links') FROM runs r WHERE r.run_id = ?)", (run_id, run_id)).fetchone()[0]
-        if not complete:
+        if not _run_complete_in(conn, run_id):
             close_run_in(conn, run_id, reason=reason, receipt=run_receipt(reason))
 
     def cancel_unstarted(self, run_id: str, effect_id: str, *, reason: str,
@@ -497,11 +494,8 @@ class RunJournal:
         ``KeyError`` if the run was never started. On a ``/3`` journal the close carries ``receipt`` (required),
         and a link whose latest attempt ended ``not_started`` has not started (:func:`close_unstarted`)."""
         if self._v3:
-            receipt = _required(receipt, reason)
-            with self._write() as conn:
-                if close_unstarted(conn, run_id, effect_id, reason=reason, receipt=receipt) is None:
-                    return self._barrier(conn, run_id, effect_id, None)
-                return None
+            got = self.end_unstarted(run_id, effect_id, reason=reason, receipt=receipt)
+            return got if isinstance(got, EffectOutcome) else None
         with self._write() as conn:
             if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is None:
                 raise KeyError(f"run {run_id!r} was never started")
@@ -510,6 +504,21 @@ class RunJournal:
                 return self._barrier(conn, run_id, effect_id, None)
             conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)", (run_id, reason))
             return None
+
+    def end_unstarted(self, run_id: str, effect_id: str, *, reason: str,
+                      receipt: Receipt | None) -> Closed | EffectOutcome:
+        """:meth:`cancel_unstarted` on a ``/3`` journal, saying itself whether its close counted: the run's
+        :class:`Closed` (WON: ``receipt`` closed it; LOST: another close came first, its id), or the barrier of the
+        started effect (nothing closed). A caller never infers WON/LOST by comparing receipt ids. ``KeyError`` for a
+        run never admitted; ``ValueError`` on a ``/2`` journal."""
+        if not self._v3:
+            raise ValueError("end_unstarted is a /3 close: a /2 journal uses cancel_unstarted")
+        receipt = _required(receipt, reason)
+        with self._write() as conn:
+            closed = close_unstarted(conn, run_id, effect_id, reason=reason, receipt=receipt)
+            if closed is None:
+                return self._barrier(conn, run_id, effect_id, None)
+            return closed
 
     @property
     def store_id(self) -> str:
@@ -1039,6 +1048,14 @@ class RunJournal:
             raise KeyError(f"run {run_id!r} was never started")
         return json.loads(row[0]) if row[0] is not None else []
 
+    def run_complete(self, run_id: str) -> bool:
+        """Whether every sealed link of a ``/3`` run ended done or unknown: the store refuses its close (I2,
+        ``cancels_not_completed``). False on a ``/2`` journal (its runs carry no link count)."""
+        if not self._v3:
+            return False
+        with self._read() as conn:
+            return _run_complete_in(conn, run_id)
+
     def run_closer(self, run_id: str) -> str | None:
         """The receipt id a ``/3`` run was closed with, or None while it is open (or on a ``/2`` journal)."""
         if not self._v3:
@@ -1109,6 +1126,8 @@ class RunJournal:
 
         On a ``/3`` journal this is :func:`decide_in`: a rejection closes its run with ``receipt`` (required there,
         refused with an approval) and ``by`` is required."""
+        if approve:
+            _check_decided_posture(posture)
         if self._v3:
             with self._write() as conn:
                 return decide_in(conn, hold_id, approve=approve, digest=digest, by=by, posture=posture,  # type: ignore[arg-type]
@@ -1347,6 +1366,13 @@ def _close_in(conn: sqlite3.Connection, subject: str, receipt: Receipt, *, reaso
     return Closed(Terminal.WON, receipt.receipt_id, reason)
 
 
+def _run_complete_in(conn: sqlite3.Connection, run_id: str) -> bool:
+    # the store's I2 (cancels_not_completed): a run whose sealed links all ended done or unknown is never closed
+    return bool(conn.execute(
+        "SELECT (SELECT COUNT(*) FROM effects e WHERE e.run_id = ? AND e.state IN ('done', 'unknown')) >= "
+        "(SELECT json_extract(r.seal, '$.links') FROM runs r WHERE r.run_id = ?)", (run_id, run_id)).fetchone()[0])
+
+
 def close_run_in(conn: sqlite3.Connection, run_id: str, *, reason: str, receipt: Receipt) -> Closed:
     """End run ``run_id`` (a refusal, a kill, a timeout) with its receipt. ``KeyError`` if it was never admitted."""
     if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is None:
@@ -1474,6 +1500,14 @@ def _check_actor(by: object, posture: object) -> None:
         raise ValueError(f"int-I2: an effect fires at an executing Posture name, not {posture!r}")
 
 
+def _check_decided_posture(posture: object) -> None:
+    # R15-5 S2 fix round 1 R1 (codex r1 HIGH 3): an approval's recorded rung is the rung its effect fires at
+    # (EfferentGate._decided_rung), so it names an executing Posture or none (REFUSE_ESCALATE has no execution path)
+    if posture is not None and (not isinstance(posture, str) or posture not in Posture.__members__
+                                or posture == Posture.REFUSE_ESCALATE.name):
+        raise ValueError(f"an approval is recorded at an executing Posture name or none, not {posture!r}")
+
+
 def intent_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, digest: str, by: str, posture: str,
               grant: dict[str, Any] | None = None, cover: str | None = None,
               revalidate: Callable[[sqlite3.Connection], str | None] | None = None
@@ -1571,6 +1605,8 @@ def decide_in(conn: sqlite3.Connection, hold_id: str, *, approve: bool, digest: 
         raise ValueError(f"decide_in: a decision names its decider (by={by!r})")
     if approve and receipt is not None:
         raise ValueError("decide_in: an approval is not terminal; it takes no receipt")
+    if approve:
+        _check_decided_posture(posture)
     if not approve and receipt is None:
         raise ValueError("decide_in: a rejection ends its run, and on this store a run ends only with its receipt")
     if approve and needs_signature(by) and not (signer and signature and challenge and fence):
