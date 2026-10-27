@@ -97,17 +97,26 @@ def gate_record(*, created_at: str, action_name: str, proposal_id: str | None, p
     return rid, record
 
 
-def _ids_in(raw: bytes) -> set[str]:
-    # every record id in the file's bytes; a line that does not decode or parse (a torn tail) is skipped, never raised
-    ids: set[str] = set()
+_GATE_KEYS = ("id", "created_at", "action_name", "posture", "fired", "action_face")
+
+
+def _records_in(raw: bytes) -> dict[str, list[dict[str, Any]]]:
+    # every JSON object line in the file's bytes, by its id; a line that does not decode or parse (a torn tail), or
+    # names no string id, is skipped, never raised
+    out: dict[str, list[dict[str, Any]]] = {}
     for piece in raw.split(b"\n"):
         try:
             rec = json.loads(piece.decode("utf-8", errors="replace"))
-            if isinstance(rec, dict) and isinstance(rec.get("id"), str):
-                ids.add(rec["id"])
-        except (ValueError, KeyError, TypeError):
+        except ValueError:
             continue
-    return ids
+        if isinstance(rec, dict) and isinstance(rec.get("id"), str):
+            out.setdefault(rec["id"], []).append(rec)
+    return out
+
+
+def _is_gate(rec: dict[str, Any]) -> bool:
+    # a line :meth:`GateReceiptStore.read` returns (kind gate, every field it reads)
+    return rec.get("kind") == "gate" and all(k in rec for k in _GATE_KEYS)
 
 
 class GateReceiptStore:
@@ -145,38 +154,51 @@ class GateReceiptStore:
         return rid
 
     def project_rows(self, rows: Sequence[tuple[str, str]]) -> list[str]:
-        """Project committed receipt rows (``(receipt_id, record text)``) into the file: append each one whose id the
-        file does not hold, then make the file durable (autogrant r66.5). Returns every row id the file now holds;
-        the caller marks a row projected only after this returns, so a stop or power loss before the flush leaves
-        the mark unset and the next projection appends again what did not survive. The file is read as bytes and
-        each line decoded on its own, so a torn tail (a crash mid-line, mid-character) is skipped and ended with a
-        newline, never raised."""
-        created = not self.path.exists()
+        """Project committed receipt rows (``(receipt_id, record text)``) into the file: append each one the file
+        does not hold, then make the file and its directory entry durable (autogrant r66.5). Returns the id of every
+        row the file now holds, in row order; the caller marks a row projected only after this returns, so a stop or
+        power loss before the flush leaves the mark unset and the next projection appends again what did not
+        survive. A row counts as held only when a line equal to its record is in the file: a line that is no
+        complete gate record (foreign, partial) is passed over and the row appended; a complete gate record under
+        the row's id with other content keeps the row out of the return, so it is never marked. The file is read as
+        bytes and each line decoded on its own, so a torn tail (a crash mid-line, mid-character) is skipped and ended
+        with a newline, never raised."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        done: list[str] = []
         with self.path.open("a+b") as fh:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             try:
                 fh.seek(0)
                 raw = fh.read()
-                have = _ids_in(raw)
+                have = _records_in(raw)
                 fh.seek(0, os.SEEK_END)
                 if raw and not raw.endswith(b"\n"):
                     fh.write(b"\n")
                 for rid, text in rows:
-                    if rid not in have:
+                    want = json.loads(text)
+                    lines = [r for r in have.get(rid, ()) if _is_gate(r)]
+                    if any(r != want for r in lines):
+                        # a complete gate record under this id that is not this receipt: ``read`` could return it
+                        # for this id, so the row is never marked projected (doctor reads it unprojected)
+                        _log.error("efferent store: %s holds another record under receipt id %s: not projected",
+                                   self.path, rid)
+                        continue
+                    if not lines:
                         fh.write(text.encode("utf-8") + b"\n")
-                        have.add(rid)
+                        have.setdefault(rid, []).append(want)
+                    done.append(rid)
                 fh.flush()
                 durable_fsync(fh.fileno())
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        if created:
-            dfd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                durable_fsync(dfd)   # the new file's directory entry
-            finally:
-                os.close(dfd)
-        return [rid for rid, _ in rows if rid in have]
+        # the file's directory entry, on every projection: whoever created the file (an ``append``, a projection
+        # stopped before this line) may not have flushed it, and the file existing says nothing about that
+        dfd = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            durable_fsync(dfd)
+        finally:
+            os.close(dfd)
+        return done
 
     def read(self, *, limit: int | None = None) -> list[StoredGateReceipt]:
         """Read gate records NEWEST-FIRST, by ARRIVAL: file order, so a receipt projected after a stop reads as newer

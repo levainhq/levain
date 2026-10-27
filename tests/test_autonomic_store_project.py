@@ -48,7 +48,7 @@ def test_project_rows_is_durable_before_it_returns(tmp_path, monkeypatch):
     calls.clear()
     rid2, rec2 = _row("run:r2")
     assert st.project_rows([(rid2, json.dumps(rec2))]) == [rid2]
-    assert [c.st_ino for c in calls] == [file_ino]                 # the file existed: no directory flush
+    assert [c.st_ino for c in calls] == [file_ino, dir_ino]        # the file existed: its directory still flushed
 
 
 def test_project_rows_reads_a_torn_multibyte_tail(tmp_path):
@@ -99,3 +99,40 @@ def test_a_file_of_odd_lines_never_stops_a_projection(tmp_path, bad):
     path.write_bytes(bad)
     rid, rec = _row("run:r1")
     assert GateReceiptStore(path).project_rows([(rid, json.dumps(rec))]) == [rid]
+
+
+# ---- L3 r1 (codex 2 / complement 2): the directory is flushed on every projection ------------------------------------
+def test_a_projection_into_a_file_it_did_not_create_still_flushes_its_directory(tmp_path, monkeypatch):
+    path = tmp_path / "r.jsonl"
+    st = GateReceiptStore(path)
+    st.append(created_at="2026-10-26T09:00:00+00:00", action_name="send", proposal_id=None,
+              posture=Posture.ON_LOOP, fired=False, action_face=FACE)   # append created it, with no directory flush
+    calls = []
+    monkeypatch.setattr(S, "durable_fsync", lambda fd: calls.append(os.fstat(fd).st_ino))
+    rid, rec = _row("run:r1")
+    assert st.project_rows([(rid, json.dumps(rec))]) == [rid]
+    assert calls == [os.stat(path).st_ino, os.stat(tmp_path).st_ino]
+
+
+# ---- L3 r1 (codex 3): only a line equal to the db receipt counts as projected ----------------------------------------
+@pytest.mark.parametrize("foreign", [{"kind": "future"}, {"kind": "gate"}, {"kind": "gate", "created_at": "x"}])
+def test_a_foreign_or_partial_line_with_the_same_id_is_not_the_projection(tmp_path, foreign):
+    path = tmp_path / "r.jsonl"
+    rid, rec = _row("run:r1")
+    path.write_text(json.dumps({"id": rid, **foreign}) + "\n")
+    st = GateReceiptStore(path)
+    assert st.project_rows([(rid, json.dumps(rec))]) == [rid]
+    assert [json.loads(x) for x in path.read_text().splitlines()][-1] == rec   # the real receipt was appended
+    [got] = st.read()
+    assert (got.id, got.action_face) == (rid, rec["action_face"])
+
+
+def test_a_complete_gate_line_with_the_same_id_and_other_content_is_never_marked(tmp_path):
+    path = tmp_path / "r.jsonl"
+    rid, rec = _row("run:r1")
+    other = dict(rec, action_name="something-else")
+    path.write_text(json.dumps(other) + "\n")
+    rid2, rec2 = _row("run:r2")
+    st = GateReceiptStore(path)
+    assert st.project_rows([(rid, json.dumps(rec)), (rid2, json.dumps(rec2))]) == [rid2]   # the other row goes on
+    assert st.project_rows([(rid, json.dumps(rec))]) == []                                 # and stays unmarked
