@@ -72,9 +72,10 @@ def offhost():
 
 
 def _run(tmp_path: Path, offhost: str, act=None, *, status=None, control=True, files=None, problem=None,
-         cockpit=None, transcript="", discard=None, sessions=None):
+         cockpit=None, transcript="", discard=None, sessions=None, fetch_log=None):
     """One run with a scripted session (``act(instruction, repo, nonce)`` runs inside it, may raise) and a scripted
-    fetch that hands back a results file signed with the run's own token (``status`` overrides), or ``files``."""
+    fetch that hands back a results file signed with the run's own token (``status`` overrides), or ``files``; the
+    session id each fetch was given is appended to ``fetch_log``."""
     home = tmp_path / "home"
     home.mkdir()
     seen = {}
@@ -86,7 +87,9 @@ def _run(tmp_path: Path, offhost: str, act=None, *, status=None, control=True, f
             act(instruction, repo, nonce)
         return canary.SessionOutcome(transcript or _old_lines(nonce), problem)
 
-    def fetch(transcript, repo, names):
+    def fetch(sid, repo, names):
+        if fetch_log is not None:
+            fetch_log.append(sid)
         if files is not None:
             return files(seen), None
         got = {names[1]: _results(_token(repo), seen["nonce"], _digest(seen["instruction"]), **(status or {}))}
@@ -538,23 +541,17 @@ def test_a_raise_from_started_still_reaps_the_child_and_closes_the_pty(tmp_path,
 
 
 
-def test_the_retained_session_is_the_last_ended_retained_line():
-    assert canary.retained_session("nothing here") is None
-    assert canary.retained_session(f"session s-ffffffffffffffff ended RETAINED\r\nsession {SID} ended RETAINED\r\n") == SID
-    assert canary.retained_session("session s-1 ended RETAINED") is None
-
-
 def test_the_discard_takes_the_store_session_cloned_from_this_runs_commit_on_every_path(tmp_path, offhost):
     """R8': the id comes from the store (the session whose base is the scratch commit), never from the screen, and the
     discard runs whether or not the results verified; RED at 2182c457: a missing results file left it retained."""
-    calls, bases = [], []
+    calls, bases, fetched = [], [], []
 
     def sessions(base):
         bases.append(base)
         return [SID], None
     result, seen = _run(tmp_path, offhost, transcript="session s-ffffffffffffffff ended RETAINED",
-                        sessions=sessions, discard=lambda sid, repo: calls.append((sid, repo)))
-    assert result.status == "PASS" and result.notes == () and calls == [(SID, seen["repo"])]
+                        sessions=sessions, discard=lambda sid, repo: calls.append((sid, repo)), fetch_log=fetched)
+    assert result.status == "PASS" and result.notes == () and calls == [(SID, seen["repo"])] and fetched == [SID]
     assert bases == [canary.scratch_head(seen["repo"])]
     for name, files in (("missing", lambda seen: {}), ("forged", lambda seen: {
             canary_probe.results_name(seen["nonce"]): _results("0" * 64, seen["nonce"], _digest(seen["instruction"]))})):
@@ -565,6 +562,42 @@ def test_the_discard_takes_the_store_session_cloned_from_this_runs_commit_on_eve
         assert result.status == "INCONCLUSIVE" and calls == [SID] and result.notes == ()
 
 
+def test_the_slot_files_are_read_from_the_store_session_never_the_screens(tmp_path, offhost, monkeypatch):
+    """r8b: the screen names one session, the store authenticates another; only the store's is adopted, and the
+    discard takes the same one lookup. RED at c5f13ef2: the real fetch adopted the screen's s-ffffffffffffffff."""
+    log = tmp_path / "levain_calls.txt"
+    record = f"import sys; open({str(log)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')"
+    monkeypatch.setattr(canary, "_levain_argv", lambda *w: [sys.executable, "-I", "-c", record, *w])
+    home = tmp_path / "home"
+    home.mkdir()
+    lookups, discards = [], []
+
+    def session(vendor, repo, instruction, nonce, timeout, started):
+        started()
+        return canary.SessionOutcome("session s-ffffffffffffffff ended RETAINED\r\n", None)
+    result = canary.run_sandbox_canary("claude_code", workspace=tmp_path / "ws", session=session, home=home,
+                                       cockpit_url="http://127.0.0.1:7420", offhost=offhost,
+                                       cockpit_check=lambda url: None,
+                                       discard=lambda sid, repo: discards.append(sid),
+                                       sessions=lambda base: lookups.append(base) or ([SID], None))
+    adopted = [line.split()[2] for line in log.read_text().splitlines() if line.startswith("session adopt ")]
+    assert adopted == [SID], adopted
+    assert len(lookups) == 1 and discards == [SID]
+    assert result.status == "INCONCLUSIVE"  # the stand-in adopt leaves no wip branch, so nothing verifies
+
+
+def test_no_slot_files_are_read_unless_the_store_authenticates_one_session(tmp_path, offhost):
+    for name, answer, says in (("none", ([], None), "holds 0 sessions"),
+                               ("two", ([SID, "s-ffffffffffffffff"], None), "holds 2 sessions"),
+                               ("unread", (None, "sudo: a password is required"), "a password is required")):
+        (tmp_path / name).mkdir()
+        fetched = []
+        result, _ = _run(tmp_path / name, offhost, transcript=f"session {SID} ended RETAINED",
+                         sessions=lambda base, a=answer: a, fetch_log=fetched)
+        assert fetched == [] and result.status == "INCONCLUSIVE", name
+        assert says in {c.name: c.evidence for c in result.checks}["results"], name
+
+
 def test_the_discard_is_skipped_with_a_note_unless_exactly_one_session_matches(tmp_path, offhost):
     for name, answer, says in (("none", ([], None), "holds 0 sessions"),
                                ("two", ([SID, "s-ffffffffffffffff"], None), "holds 2 sessions"),
@@ -573,7 +606,7 @@ def test_the_discard_is_skipped_with_a_note_unless_exactly_one_session_matches(t
         calls = []
         result, _ = _run(tmp_path / name, offhost, sessions=lambda base, a=answer: a,
                          discard=lambda sid, repo: calls.append(sid))
-        assert calls == [] and result.status == "PASS" and says in result.notes[0], name
+        assert calls == [] and result.status == "INCONCLUSIVE" and says in result.notes[0], name
         assert "nothing was discarded" in result.notes[0]
 
 
@@ -583,10 +616,11 @@ def test_a_discard_or_lookup_that_fails_is_a_note_never_the_verdict(tmp_path, of
 
     def boom(*args):
         raise RuntimeError("store gone")
-    for name, kw in (("d", {"discard": boom}), ("l", {"sessions": boom})):
+    for name, kw, status in (("d", {"discard": boom}, "PASS"), ("l", {"sessions": boom}, "INCONCLUSIVE")):
         (tmp_path / name).mkdir()
         result, _ = _run(tmp_path / name, offhost, **kw)
-        assert result.status == "PASS" and "store gone" in result.notes[0], name
+        assert result.status == status and "store gone" in result.notes[0], name
+        assert len(result.notes) == 1, "a failed lookup is one note, not one per use"
 
 
 def test_no_lookup_or_discard_when_no_session_was_started(tmp_path, offhost, monkeypatch):
@@ -672,11 +706,6 @@ def test_discard_slot_session_reports_a_failure_instead_of_raising(tmp_path, mon
     assert "could not run" in canary.discard_slot_session("s-1", tmp_path / "repo")
     monkeypatch.setattr(canary, "_levain_argv", lambda *w: [sys.executable, "-I", "-c", "pass"])
     assert canary.discard_slot_session("s-1", tmp_path / "repo") is None
-
-
-def test_fetch_without_a_retained_line_reads_nothing(tmp_path):
-    files, problem = canary.fetch_slot_files("LEVAIN-PROBE x END DONE", tmp_path, ("a",))
-    assert files is None and "RETAINED" in problem
 
 
 def test_the_cli_flag_routes_to_the_sandbox_run_and_exits_by_verdict(monkeypatch, capsys):

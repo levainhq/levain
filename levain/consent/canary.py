@@ -829,7 +829,7 @@ def _levain_argv(*words: str) -> list[str]:
 
 
 SessionRunner = Any  # (vendor, repo, instruction, nonce, timeout, started) -> SessionOutcome
-FileFetcher = Any  # (transcript, repo, names) -> (name -> bytes | None, problem | None)
+FileFetcher = Any  # (session id, repo, names) -> (name -> bytes | None, problem | None)
 
 # Seconds of screen silence before the instruction is typed. [judged by lane-canary, 10-27: a guess at a vendor TUI's
 # idle; nothing measured it.]
@@ -929,15 +929,6 @@ def real_session(vendor: str, repo: Path, instruction: str, nonce: str, timeout:
     return SessionOutcome(buf.decode("utf-8", "replace"), problem)
 
 
-def retained_session(transcript: str) -> str | None:
-    """The session id on the last "session <id> ended RETAINED" line of the screen, or None. The screen is the
-    model's too, so the id is a claim: files read from it are trusted only through their hmacs."""
-    from levain.slot.grammar import SESSION_RE
-    retained = re.compile(rf"session ({SESSION_RE.pattern}) ended RETAINED")
-    found = retained.findall(_ANSI.sub(b"", transcript.encode("utf-8", "replace")).decode("utf-8", "replace"))
-    return found[-1] if found else None
-
-
 def discard_slot_session(sid: str, repo: Path, timeout: float = 180.0) -> str | None:
     """R8: ``levain session discard <sid>`` for the canary's own retained scratch session; None when it went
     through, else why not (one line). Never raises."""
@@ -982,16 +973,13 @@ def store_sessions(base_oid: str) -> tuple[list[str] | None, str | None]:
             and isinstance(r.get("base"), dict) and r["base"].get("oid") == base_oid], None
 
 
-def fetch_slot_files(transcript: str, repo: Path, names: tuple[str, ...],
+def fetch_slot_files(sid: str, repo: Path, names: tuple[str, ...],
                      timeout: float = 600.0) -> tuple[dict[str, bytes] | None, str | None]:
-    """The named files of the slot's retained work tree, through the operator's own adopt: ``levain session adopt
-    <session> --repo <repo> --take wip`` (the importer's wip commit holds every work-tree file), then ``git show`` of
-    each name on ``levain/<session>-wip``. The session id is the last "ended RETAINED" line on the screen
-    (:func:`retained_session`); a forged one names a session whose files cannot carry this run's hmacs. A name the wip tree lacks is absent from the answer.
-    Not run against a real session by the build."""
-    sid = retained_session(transcript)
-    if sid is None:
-        return None, "the session did not end RETAINED, so no work came back to read"
+    """The named files of session ``sid``'s retained work tree, through the operator's own adopt: ``levain session
+    adopt <sid> --repo <repo> --take wip`` (the importer's wip commit holds every work-tree file), then ``git show``
+    of each name on ``levain/<sid>-wip``. ``sid`` is the one the store authenticated (:func:`_own_session`), never
+    one read from the screen. A name the wip tree lacks is absent from the answer. Not run against a real session
+    by the build."""
     env = child_env()
     try:
         cp = subprocess.run(_levain_argv("session", "adopt", sid, "--repo", str(repo), "--take", "wip"),
@@ -1024,11 +1012,12 @@ def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: fl
     ``cockpit_url`` the cockpit's address (default: `levain cockpit sign`'s); ``cockpit_check`` replaces
     :func:`cockpit_listening`; ``offhost`` the OFFHOST target (default: the probe's); ``discard`` replaces
     :func:`discard_slot_session`, called ``(session id, repo)``; ``sessions`` replaces :func:`store_sessions`.
-    R8: once a session was started, on every exit path after the evidence is read, the canary discards its own
-    retained scratch session. Its id is never taken from the screen (the model's to forge): it is the one session
-    in the operator's store whose alloc records the scratch repo's commit as its base (:func:`scratch_head`, unique
-    to this run). No such session or several, a store that cannot be read, or a discard that fails is a note
-    beside the verdict, never part of it, and nothing is discarded."""
+    R8: the session id is never taken from the screen (the model's to forge): it is the one session in the
+    operator's store whose alloc records the scratch repo's commit as its base (:func:`scratch_head`, unique to this
+    run), looked up once: after the session ends, or in the cleanup when the run stopped before that. The slot files are read from that session only; no such session
+    or several, or a store that cannot be read, reads no files (INCONCLUSIVE) and discards nothing, with a note.
+    Once a session was started, on every exit path after the evidence is read, the canary discards that session; a
+    discard that fails is a note beside the verdict, never part of it."""
     if agent not in SANDBOX_VENDORS:
         raise ValueError(f"agent must be one of {AGENTS}: {agent!r}")
     import secrets
@@ -1072,6 +1061,7 @@ def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: fl
     checks: list[SandboxCheck] = []
     notes: list[str] = []
     spawned = False
+    own: tuple[str | None, str | None] | None = None  # (authenticated sid, why not): one lookup per run
     try:
         cockpit, cockpit_missing = _cockpit_endpoint(cockpit_url or DEFAULT_URL)
         if cockpit_missing is None:
@@ -1107,10 +1097,15 @@ def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: fl
         with contextlib.suppress(OSError):
             (ws / "canary_sandbox_transcript.txt").write_text(outcome.transcript, encoding="utf-8")
         names = (control_name(nonce), results_name(nonce))
-        try:
-            files, fetch_problem = (fetch or fetch_slot_files)(outcome.transcript, repo, names)
-        except (OSError, subprocess.SubprocessError) as exc:
-            files, fetch_problem = None, f"the slot's files could not be read: {exc}"[:300]
+        own = _own_session(base, sessions or store_sessions)
+        sid, unauthenticated = own
+        if sid is None:
+            files, fetch_problem = None, f"{unauthenticated}, so no slot files were read"
+        else:
+            try:
+                files, fetch_problem = (fetch or fetch_slot_files)(sid, repo, names)
+            except (OSError, subprocess.SubprocessError) as exc:
+                files, fetch_problem = None, f"the slot's files could not be read: {exc}"[:300]
         results, why = verify_results((files or {}).get(names[1]), token, nonce, digest)
         if results is None and fetch_problem:
             why = fetch_problem
@@ -1125,24 +1120,34 @@ def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: fl
                 with contextlib.suppress(OSError):
                     planted.unlink()
         if spawned:
-            notes.extend(_discard_own_session(base, repo, sessions or store_sessions, discard or discard_slot_session))
+            if own is None:  # the run stopped before its lookup
+                own = _own_session(base, sessions or store_sessions)
+            sid, unauthenticated = own
+            if sid is None:
+                notes.append(f"{unauthenticated}, so no slot files were read and nothing was discarded")
+            else:
+                notes.extend(_discard_own_session(sid, repo, discard or discard_slot_session))
     return result(*checks, notes=tuple(notes))
 
 
-def _discard_own_session(base: str, repo: Path, sessions: Any, discard: Any) -> list[str]:
-    """R8: discard the one store session cloned from this run's scratch commit ``base``; the notes to show (none
-    when it went through). Never raises."""
+def _own_session(base: str, sessions: Any) -> tuple[str | None, str | None]:
+    """R8: the one store session cloned from this run's scratch commit ``base``: ``(sid, None)``, or ``(None, why
+    not)`` for zero, several, or a store that cannot be read. Never raises."""
     try:
         ids, problem = sessions(base)
     except Exception as exc:  # noqa: BLE001 - a lookup never changes the verdict or masks an error
         ids, problem = None, f"the session lookup raised {type(exc).__name__}: {exc}"[:300]
     if ids is None:
-        return [f"the scratch session was not looked up ({problem}), so nothing was discarded"]
+        return None, f"the scratch session was not looked up ({problem})"
     if len(ids) != 1:
         found = ", ".join(ids[:8]) if ids else "none"
-        return [f"the store holds {len(ids)} sessions cloned from this run's scratch repo ({found}), not one, so "
-                "nothing was discarded"]
-    sid = ids[0]
+        return None, f"the store holds {len(ids)} sessions cloned from this run's scratch repo ({found}), not one"
+    return ids[0], None
+
+
+def _discard_own_session(sid: str, repo: Path, discard: Any) -> list[str]:
+    """R8: discard ``sid``, the session :func:`_own_session` authenticated; the notes to show (none when it went
+    through). Never raises."""
     try:
         problem = discard(sid, repo)
     except Exception as exc:  # noqa: BLE001 - a discard never changes the verdict or masks an error
