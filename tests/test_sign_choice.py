@@ -157,9 +157,12 @@ def test_the_deep_link_opens_the_sheet_and_carries_no_secret() -> None:
         with pytest.raises(ValueError):
             deep_link("https://h.ts.net/", bad)
     for page in ("https://h.ts.net/#old", "https://h.ts.net/phone.html", "https://h.ts.net/?t=1", "h.ts.net",
-                 "https://u@h.ts.net/"):
+                 "https://u@h.ts.net/", "https://h ts.net/", "https://a.com\\.b/", "https://box.ts.net\\evil",
+                 "https://good..com", "http://evil.example", "https://10.0.0.1", "https://h.ts.net:0"):
         with pytest.raises(ValueError):
             deep_link(page, "np-run0001-c9f2a1")
+    # the rule the redirect's target is configured by (phone_server.redirect_origin), stated once
+    assert deep_link("HTTP://LocalHost:8080/", "np-run0001-c9f2a1") == "http://localhost:8080/sign/np-run0001-c9f2a1"
 
 
 def test_the_signed_answers_setting_reads_off_authority_only_or_all(tmp_path: Path) -> None:

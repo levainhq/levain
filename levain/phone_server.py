@@ -1436,26 +1436,19 @@ def _drop_link_file(path: Path) -> None:
 
 _REDIRECT_PAGES = frozenset({"/", "/phone.html"})
 _REDIRECT_SCRIPT = "/phone_redirect.js"
-_REDIRECT_ORIGIN = re.compile(r"(https?)://([a-z0-9.-]{1,253})(?::([0-9]{1,5}))?/?")
-_LOCAL_HTTP = frozenset({"localhost", "127.0.0.1"})
 
 
 def redirect_origin(text: object) -> str:
-    """``--redirect-to``: the cockpit's bare origin, normalised (lowercase, no trailing ``/``): ``https://<host
-    name>[:<port>]``, or ``http://`` for ``localhost`` / ``127.0.0.1`` only (this machine's own browser). Anything else
-    (a path, a query, a fragment, credentials, an address, a port outside 1..65535) is :class:`ValueError`: the page
-    sends every link it is opened with there, so it is configured whole, never read from a link."""
-    from levain.consent.passkey import is_host_name
+    """``--redirect-to``: the cockpit's bare origin by :func:`levain.consent.sign.cockpit_origin`'s one rule (the
+    rule sign links are built by). The page sends every link it is opened with there, so it is configured whole,
+    never read from a link."""
+    from levain.consent.sign import cockpit_origin
 
-    m = _REDIRECT_ORIGIN.fullmatch(text.lower()) if isinstance(text, str) and text.isascii() else None
-    if m is not None:
-        scheme, host, port = m.groups()
-        good_port = port is None or 0 < int(port) < 65536
-        good_host = host in _LOCAL_HTTP if scheme == "http" else (is_host_name(host) or host == "localhost")
-        if good_port and good_host:
-            return f"{scheme}://{host}" + (f":{int(port)}" if port is not None else "")
-    raise ValueError(f"--redirect-to: {str(text)[:80]!r} is not the cockpit's origin (https://<name>[:<port>], "
-                     "nothing after it)")
+    try:
+        return cockpit_origin(text)
+    except ValueError:
+        raise ValueError(f"--redirect-to: {str(text)[:80]!r} is not the cockpit's origin (https://<name>[:<port>], "
+                         "nothing after it)") from None
 
 
 def _redirect_page(origin: str) -> str:
@@ -1510,11 +1503,13 @@ class _RedirectServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], *, name: str, origin: str) -> None:
         from levain.web_server import load_web_asset
 
-        script = load_web_asset("phone_redirect.js").encode("utf-8")     # read before binding: no socket on a fault
+        # both built before binding: a fault leaves no socket
+        script = load_web_asset("phone_redirect.js").encode("utf-8")
+        page = _redirect_page(origin).encode("utf-8")
         super().__init__(address, _RedirectHandler)
         self.allowed_hosts = _LOOPBACK_HOSTS | {str(self.server_address[0]).lower(), name}
         self.origin = origin
-        self.page = _redirect_page(origin).encode("utf-8")
+        self.page = page
         self.script = script
 
 

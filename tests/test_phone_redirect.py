@@ -159,6 +159,31 @@ def test_the_link_file_holds_the_page_only(tmp_path: Path, monkeypatch) -> None:
     assert not link.exists()              # removed when the run stops
 
 
+def test_a_failed_link_file_write_keeps_the_file_another_run_wrote(tmp_path: Path, monkeypatch) -> None:
+    from levain import phone_server
+    from levain.consent import sign
+
+    link = tmp_path / "link.json"
+    theirs = json.dumps({"page": "https://box.tail1.ts.net:8443/", "pid": os.getpid() + 1}) + "\n"
+    link.write_text(theirs)
+
+    def refuse(*a: Any, **k: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(sign, "_write_over", refuse)
+    monkeypatch.setattr(phone_server._RedirectServer, "serve_forever", lambda self: pytest.fail("served"))
+    rc = phone_server.run_phone_redirect("https://box.tail1.ts.net:8443", name="localhost", tailscale=False, port=0,
+                                         link_file=link)
+    assert rc == 1 and link.read_text() == theirs
+
+
+def test_the_script_reads_a_sign_id_by_the_servers_own_rule() -> None:
+    from levain.sign_request_id import ID
+
+    script = (Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "phone_redirect.js").read_text()
+    assert f"/^{ID.pattern}$/.test(id)" in script
+
+
 def test_the_cli_runs_the_redirect_mode(monkeypatch) -> None:
     from levain import phone_server
     from levain.cli import main
