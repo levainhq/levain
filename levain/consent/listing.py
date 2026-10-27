@@ -135,6 +135,8 @@ def audit_line(entry: ConsentEntry) -> str:
     if entry.state == "allowed":
         if entry.via == "grant":
             return f"allowed by standing grant {entry.grant_id or '(unnamed)'}"
+        if entry.via == "contained_shell":
+            return f"allowed by contained-shell grant {entry.grant_id or '(unnamed)'}"
         return f"allowed by signed answer, key {entry.signer_fp or '(unknown)'}"
     if entry.state == "denied":
         return f"denied by signed answer, key {entry.signer_fp or '(unknown)'}"
@@ -342,8 +344,8 @@ def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, i
     """What each standing grant answered: ``{grant id: {"count", "last_at", "recent", "refused_count"}}`` for
     ``grants``, each ``(id, seq, hash)`` of the link that created or last changed it. An answer counts for a grant only when its
     stored answer names all three (``grant_id``, ``grant_seq``, ``grant_hash``), so a grant revoked and made again
-    under the same id starts with nothing. Read from the requests the queue allowed by a grant (``via = 'grant'``),
-    over the queue's whole history. ``recent`` holds the newest ``recent`` of them, each ``{"request_id", "at",
+    under the same id starts with nothing. Read from the requests the queue allowed by a grant (``via = 'grant'``,
+    or ``'contained_shell'`` for a contained-shell grant), over the queue's whole history. ``recent`` holds the newest ``recent`` of them, each ``{"request_id", "at",
     "tool", "cwd", "outcome"}``; ``outcome`` is the authority ledger's word for whether that call then ran
     (``accepted``, ``refused``, ``unknown`` when the ledger holds no row for it). ``refused_count`` is how many of
     ALL its calls (not only the newest ``recent``) the ledger reads as refused, so a refusal older than those still
@@ -373,7 +375,7 @@ def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, i
                     raise
         conn.execute("BEGIN")
         _check_format(conn)
-        match = ("via = 'grant' AND state = 'allowed' AND json_extract(answer, '$.grant_id') = ? "
+        match = ("via IN ('grant', 'contained_shell') AND state = 'allowed' AND json_extract(answer, '$.grant_id') = ? "
                  "AND json_extract(answer, '$.grant_seq') = ? AND json_extract(answer, '$.grant_hash') = ?")
         links: dict[str, tuple[int, str]] = {}
         for gid, seq, link_hash in wanted_grants:
@@ -451,7 +453,7 @@ def _read_ledger_into(conn: sqlite3.Connection, out: "dict[str, dict[str, Any]]"
             "json_extract(r.answer, '$.grant_hash'), COUNT(*) FROM requests r "
             f"JOIN (SELECT DISTINCT request_id FROM {_PER_CALL} WHERE phase = 'pre' AND outcome = 'refused') f "
             "ON f.request_id = r.id "
-            "WHERE r.via = 'grant' AND r.state = 'allowed' AND (json_extract(r.answer, '$.grant_id'), "
+            "WHERE r.via IN ('grant', 'contained_shell') AND r.state = 'allowed' AND (json_extract(r.answer, '$.grant_id'), "
             "json_extract(r.answer, '$.grant_seq'), json_extract(r.answer, '$.grant_hash')) IN (VALUES "
             + ", ".join("(?, ?, ?)" for _ in chunk) + ") GROUP BY 1, 2, 3", params).fetchall()
         got = {(gid, seq, h): int(n) for gid, seq, h, n in rows}
@@ -477,11 +479,11 @@ def _open_ro(directory: Path | str | None) -> sqlite3.Connection | None:
 
 
 def _check_format(conn: sqlite3.Connection) -> None:
-    from levain.consent.queue import PRIOR_FORMAT, STORE_FORMAT, QueueStoreError
+    from levain.consent.queue import MIGRATES_FROM, STORE_FORMAT, QueueStoreError
 
     fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
-    # a store of the previous format holds the same request columns; a queue migrates it on its next open
-    if fmt is None or fmt[0] not in (STORE_FORMAT, PRIOR_FORMAT):
+    # a store of an earlier format holds the same request columns; a queue migrates it on its next open
+    if fmt is None or (fmt[0] != STORE_FORMAT and fmt[0] not in MIGRATES_FROM):
         raise QueueStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {STORE_FORMAT!r}")
 
 
@@ -572,7 +574,7 @@ def read_listing(directory: Path | str | None = None, *, now: datetime, span: ti
         elif state == "undecided":
             undecided.append(ConsentEntry(request, state, None, None, None, decided_at, None, gaps.get(request.id)))
         elif decided_at is not None and decided_at >= horizon:
-            gid = _grant_id_of(answer) if via == "grant" else None
+            gid = _grant_id_of(answer) if via in ("grant", "contained_shell") else None
             recent.append(ConsentEntry(request, state, via, signer_fp, gid, decided_at, outcomes.get(request.id),
                                        gaps.get(request.id)))
     pending.sort(key=lambda e: (e.request.received_at, e.request.id))

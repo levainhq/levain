@@ -1,0 +1,21 @@
+{
+ "agent_config_signed": "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}",
+ "agent_config_take": "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}",
+ "allow_at_await": "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}",
+ "deny_at_await": "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"deny\",\"message\":\"Denied by a signed levain answer (key SHA256:k).\"},\"hookEventName\":\"PermissionRequest\"}}",
+ "escape_key_on_hook_path": "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}",
+ "grant_answer_says_so": "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"},\"systemMessage\":\"levain: allowed by your standing consent grant g1 (posture default); `levain consent grant revoke g1` ends it.\"}",
+ "mcp_without_input": "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}",
+ "no_cwd": "null",
+ "no_session": "null",
+ "not_a_mapping": "null",
+ "nothing_can_decide": "null",
+ "other_hook_event": "null",
+ "race_allow_after_withdraw": "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}",
+ "sandbox_net_on_hook_path": "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}",
+ "silence": "null",
+ "subagent": "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}",
+ "tool_name_not_str": "null",
+ "unconfined_agent_config": "null",
+ "zero_hold_deny": "null"
+}
