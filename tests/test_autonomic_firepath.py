@@ -113,7 +113,12 @@ def _bound(gate, sealed=None):
     return _binding_authority(binding_id), run
 
 
-def _fire_request(gate, *, risk=LOW_INTERNAL, ratified=None, kill_predicates=(), trigger_event=None,
+# the trigger event of a gate-level binding fire: a binding fire always carries one (firepath/chainpath), and the
+# fire check evaluates the covering policy's guard on it (tests/test_autonomic_fire_check.py)
+_EVENT = {"type": "time", "id": "e", "fields": {}}
+
+
+def _fire_request(gate, *, risk=LOW_INTERNAL, ratified=None, kill_predicates=(), trigger_event=_EVENT,
                   signal=SignalAuth.STRONG, predicted_trajectory=None, action="deliver",
                   confidence=1.0, sealed=None):
     """An autonomous binding fire request on an admitted run: intent-free, human-absent
@@ -240,9 +245,10 @@ def test_known_danger_kill_does_not_trip_lets_fire(tmp_path):
 
 
 def test_known_danger_kill_inert_for_manual_fire(tmp_path):
-    """No kill_predicates / no trigger_event ⇒ the kill check is inert (a manual fire is unaffected)."""
+    """No kill_predicates ⇒ the kill check is inert (a manual fire is unaffected). (A covered binding fire with no
+    trigger event is refused by the fire check: ``tests/test_autonomic_fire_check.py``.)"""
     g = _gate(tmp_path)
-    out = g.gate(_fire_request(g, kill_predicates=(), trigger_event=None))
+    out = g.gate(_fire_request(g, kill_predicates=()))
     assert out.fired and not out.killed
 
 
@@ -630,7 +636,7 @@ def _clamped_dispatch(tmp_path, cover):
     src = TestOnlyCoverage([policy("gp-1", cover, expires_at=_LATER)] if cover else [])
     fd = FireDispatcher(store=st, gate=_gate(tmp_path, executor=ex, coverage=src),
                         predicate_match=_match_field_eq, request_builder=_builder(), clock=lambda: FIXED)
-    return fd.dispatch({"type": "time", "id": "e", "fields": {"tick": "1"}}), ex
+    return fd.dispatch({"type": "time", "id": "e", "fields": {"tick": "1", "dmarc": "pass"}}), ex
 
 
 def test_an_on_loop_binding_with_no_policy_is_held_at_confirm(tmp_path):

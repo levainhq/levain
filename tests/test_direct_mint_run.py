@@ -33,6 +33,13 @@ INBOX, HANDS_USER, TARGET = "notes", "levain-hands-x", "inbox-notes"
 GP = "gp-0a1b2c3d4e5f"
 
 
+# the policy's signed guard (A1c2 evaluates it on each event at the fire): a kill an inbox.file event carries the
+# fields of; a kill naming a field the event lacks (an email's dmarc) is UNKNOWN there, which trips (fail-safe)
+INBOX_GUARD = {"rationale": "an oversized entry is the case this could be wrong about",
+               "kill_predicate": {"op": ">", "field": "size", "value": MAX_ENTRY_BYTES},
+               "kill_drill": {"fields": {"size": MAX_ENTRY_BYTES + 1}}}
+
+
 def template(posture: Posture, *, created_at: str) -> Binding:
     """DESIGN §3.5's sealed core, as written there."""
     return Binding.create(
@@ -89,7 +96,8 @@ def test_direct_mint_fires_on_loop_then_holds_at_confirm_after_revoke(tmp_path):
     auth.link({"op": "create_grant", "grant": grad(
         auth, GP, days=30, actions={"write_document": {"cls": 1, "reversible": True, "external": False,
                                                        "financial": False}},
-        triggers=["inbox.file"], families=[binding_family(b)], store_id=store_id, min_clean_fires=0)})
+        triggers=["inbox.file"], families=[binding_family(b)], store_id=store_id, min_clean_fires=0,
+        guard=[INBOX_GUARD])})
 
     def fire(n: int):
         [d] = dispatcher.dispatch({"type": "inbox.file", "id": f"clm-{n}",

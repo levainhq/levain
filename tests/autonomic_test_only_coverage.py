@@ -152,16 +152,37 @@ class TestOnlyCoverage:
         return peek_cover_snapshot(cached, (head, digest, self.store_id), effect, now)
 
 
+# The guard of the policies that authorize _EveryDeclaredEffect's covers (1026-21 RULINGS O-g1-8: the fire check
+# refuses a covered value no policy authorizes). Its kill is ``exists`` of a field no test event carries, so it lets
+# every event through (``exists`` on an absent field is FALSE, never UNKNOWN), and its drill carries the field, so it
+# trips.
+_NEVER_FIELD = "levain_test_only_never_present"
+EVERY_EFFECT_GUARD = ({"rationale": "test only: the gate covering every declared effect, as before the clamp",
+                       "kill_predicate": {"op": "exists", "field": _NEVER_FIELD},
+                       "kill_drill": {_NEVER_FIELD: True}},)
+_EVERY_EFFECT_EXPIRES = _dt.datetime(2099, 1, 1, tzinfo=_dt.timezone.utc)
+
+
+@functools.lru_cache(maxsize=None)
+def _every_effect_policy(action_name: str, action_risk: ActionRisk) -> GraduationPolicy:
+    # a policy signing exactly this action at exactly this risk (any trigger, any family), so the fire check's
+    # ``covered`` holds for the effect it is read for and for no other action
+    return policy("gp-test-only-every", {action_name: action_risk}, expires_at=_EVERY_EFFECT_EXPIRES,
+                  guard=EVERY_EFFECT_GUARD)
+
+
 class _EveryDeclaredEffect:
     """A view and source covering every effect whose action the manifest declares, at ON_LOOP: the rung the
-    gate decided stands (the floor can still raise it), as before the clamp."""
+    gate decided stands (the floor can still raise it), as before the clamp. Each cover names a policy signing
+    that effect's action at its risk, whose guard trips on no test event."""
 
     token = ((0, ""), "", STORE)
 
     def cover(self, effect: Effect, now: _dt.datetime) -> Cover:
         if effect.action_risk is None:
             return Cover(None, "none")
-        return Cover(Posture.ON_LOOP, "test-only@every-declared-effect")
+        p = _every_effect_policy(effect.action_name, effect.action_risk)
+        return Cover(Posture.ON_LOOP, p.cover_value, p)
 
     def refresh(self) -> CoverageView:
         return self
@@ -171,7 +192,7 @@ class _EveryDeclaredEffect:
 
     def peek_cover(self, effect: Effect, now: _dt.datetime) -> EffectiveCover:
         cover = self.cover(effect, now)
-        return EffectiveCover(cover.value, cover.posture, None)   # no signed policy authorizes it
+        return EffectiveCover(cover.value, cover.posture, cover.policy)
 
 
 _EVERY_DECLARED_EFFECT = _EveryDeclaredEffect()   # one object: a policy swap hands the same source on

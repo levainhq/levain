@@ -43,6 +43,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from dataclasses import dataclass
+from enum import Enum
 
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.binding import Binding, BindingStore, _scan_in, binding_family
@@ -51,7 +52,8 @@ from levain.autonomic.confirm import (
     verify_signature_status,
 )
 from levain.autonomic.coverage import (
-    COVER_MOVED, COVER_NONE, CoverageSource, CoverageView, Effect, Uncovered, operative,
+    COVER_MOVED, COVER_NONE, CoverageSource, CoverageView, Effect, EffectiveCover, GraduationPolicy, Uncovered,
+    covered, guard_problem, operative,
 )
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
@@ -73,6 +75,21 @@ from levain.autonomic.trust import IntentProvenance, SignalAuth, TrustContext
 __all__ = ["GateOutcome", "EfferentGate", "binding_family"]
 
 _log = logging.getLogger("levain.autonomic.gate")
+
+
+class _Check(Enum):
+    """The fire check's outcome kinds (1026-20 RULINGS R13-2): typed, never a reason string classified later."""
+    PERMIT = "permit"
+    KILL = "kill"
+    REFUSE = "refuse"          # permanent: the run ends with a receipt
+    TRANSIENT = "transient"    # the cover moved or could not be read: nothing ends
+    STALE = "stale"            # the cover is not the decided one: decided again
+
+
+@dataclass(frozen=True)
+class _FireCheck:
+    kind: _Check
+    reason: str
 
 # The confirm window: how long a proposed confirm-class action waits before the silence default
 # (sweep) resolves it (cooling-off auto-fires; confirm drops). Generous default — the operator may
@@ -665,6 +682,7 @@ class EfferentGate:
         if request.ratified_posture is not None:
             binding, sealed_refusal = self._ratified_refusal(request)
         cover: str | None = None
+        clamped: Effect | None = None
         if posture < Posture.CONFIRM and self._clamps(request.authority):
             if binding is None and sealed_refusal is None:
                 binding = self._binding_or_none(request.authority.binding_id, request.continuation, None)
@@ -673,6 +691,7 @@ class EfferentGate:
             except _FamilyUnreadable:
                 return self._deny(request, created_at, Posture.REFUSE_ESCALATE, _FAMILY_UNREADABLE, cancel=False)
             posture, cover = self._clamp(posture, effect)
+            clamped = effect
 
         # 3. the KNOWN-danger kill (Slice 4 — the first runtime consumer of the 3a.5 kill substrate,
         # closing codex's 3a.5 L3 finding #1) — evaluated BEFORE the §1.5 screen (complement L3): a
@@ -697,6 +716,33 @@ class EfferentGate:
             _log.warning("efferent gate REFUSE: %r carries ratified_posture %s (%s)", request.action_name,
                          request.ratified_posture.name if request.ratified_posture else None, sealed_refusal)
             return self._deny(request, created_at, Posture.REFUSE_ESCALATE, sealed_refusal, cancel=False)
+
+        # 3c. the fire check (1026-20 RULINGS R13-2, 1026-21 RULINGS G1-1/G1-2): an effect a policy covers fires
+        # only once that policy, read again with its cover value, authorizes it and its signed guard lets the
+        # trigger event through. After the binding's own kill (a kill-worthy trigger keeps that KILL receipt) and
+        # after 3b (a request carrying a rung its sealed binding does not is refused without ending the run, never
+        # ended by this check).
+        if clamped is not None and cover is not None and cover != COVER_NONE:
+            check = self._fire_check(request, clamped, cover)
+            if check.kind is _Check.KILL:
+                # ``by`` is the receipt's decider (the frozen human | binding | on-loop enum), as for the binding's
+                # own kill; the policy whose guard tripped is named in the reason, which the run's cancel carries
+                kill_by = "binding" if request.authority.grantor == "binding" else "on-loop"
+                _log.warning("efferent gate KILL: %r — %s", request.action_name, check.reason)
+                return self._kill(request, created_at, posture, kill_by, request.actor_first_estimate,
+                                  reason=check.reason)
+            if check.kind is _Check.REFUSE:
+                _log.warning("efferent gate REFUSE: %r — %s", request.action_name, check.reason)
+                return self._deny(request, created_at, Posture.REFUSE_ESCALATE, check.reason)
+            if check.kind is not _Check.PERMIT:
+                # TRANSIENT and STALE: nothing ended; deliver the event again and it is decided again (no
+                # receipt, as the journal's STALE writes none)
+                _log.info("efferent gate: %r not fired (%s): decided again on the next delivery",
+                          request.action_name, check.reason)
+                return GateOutcome(
+                    posture=posture, fired=False, refused=False, deferred=False, reason=check.reason,
+                    receipt_id=None, execution=None, binding_id=request.authority.binding_id, held=True,
+                )
 
         # 4. the §1.5 refuse stack (confidence + groundedness + injection) — require confidence iff
         # autonomous. Scan the FULL trigger surface (the action payload AND the proposal/query text that
@@ -1956,6 +2002,59 @@ class EfferentGate:
             if kill_trips(kp, request.trigger_event):
                 return f"known_danger_kill:guard_kill_{i}_tripped"
         return None
+
+    def _fire_check(self, request: ActionRequest, effect: Effect, decided: str) -> _FireCheck:
+        """The fire check of an effect the clamp covered at cover value ``decided`` (1026-20 RULINGS R13-2: typed,
+        in this order): ``peek_cover`` at a fresh clock read; a cover that moved or cannot be read is TRANSIENT
+        (``cover:moved``); a value other than ``decided`` is STALE (``cover:stale``); then REFUSE when no policy
+        authorizes the value (``no_authorizing_policy``, G1-2: the peek names none, or one whose cover value is not
+        the seen value, whose lowest rung is not the seen rung, or that does not cover ``effect``), when its guard
+        is incomplete (``grant_guard_incomplete``), when there is no trigger event to evaluate it on
+        (``guard_unevaluable:no_event``) or an evaluation raises (``guard_unevaluable:predicate``); KILL when an
+        entry's kill trips on the event (``kill_trips``: UNKNOWN trips); else PERMIT. Never raises.
+
+        Only the one policy the peek names is evaluated: the policy whose cover value the decision was made under.
+        Any other policy covering the same effect neither authorizes this fire nor guards it."""
+        source = self._coverage
+        try:
+            now = self._clock()
+            seen = source.peek_cover(effect, now) if source is not None else None
+        except Exception as e:  # noqa: BLE001 — a peek that cannot answer is a moved cover
+            _log.warning("efferent gate: the fire check's peek RAISED (%s): %s", type(e).__name__, e)
+            seen = None
+        if not isinstance(seen, EffectiveCover) or not isinstance(seen.value, str) or seen.value == COVER_MOVED:
+            return _FireCheck(_Check.TRANSIENT, COVER_MOVED)
+        if seen.value != decided:
+            return _FireCheck(_Check.STALE, "cover:stale")
+        grant = seen.policy
+        # the policy must itself give this value at this rung and sign this action at this risk: a policy the peek
+        # names beside the value is not taken on the source's word
+        try:
+            authorizes = (isinstance(grant, GraduationPolicy) and grant.cover_value == seen.value
+                          and grant.lowest_posture == seen.posture and covered(grant, effect))
+        except Exception:  # noqa: BLE001 — a policy that cannot be checked authorizes nothing
+            authorizes = False
+        if not authorizes:
+            return _FireCheck(_Check.REFUSE, "no_authorizing_policy")
+        try:
+            guard = grant.guard
+            incomplete = not grant.guarded or guard_problem(list(guard)) is not None
+        except Exception:  # noqa: BLE001 — a guard that cannot be read authorizes nothing
+            incomplete = True
+        if incomplete:
+            return _FireCheck(_Check.REFUSE, "grant_guard_incomplete")
+        if request.trigger_event is None:
+            return _FireCheck(_Check.REFUSE, "guard_unevaluable:no_event")
+        for i, entry in enumerate(guard):
+            try:
+                tripped = kill_trips(entry["kill_predicate"], request.trigger_event)
+            except Exception as e:  # noqa: BLE001 — a kill that cannot be evaluated authorizes nothing
+                _log.error("efferent gate: policy %s guard[%d] RAISED (%s): %s", grant.grant_id, i,
+                           type(e).__name__, e)
+                return _FireCheck(_Check.REFUSE, "guard_unevaluable:predicate")
+            if tripped:
+                return _FireCheck(_Check.KILL, f"policy_guard_kill:{grant.grant_id}:guard_{i}_tripped")
+        return _FireCheck(_Check.PERMIT, "")
 
     # =================================================================================================
     # The prediction-error KILL path (Slice 3a.5 — the autonomous unknown-danger backstop).

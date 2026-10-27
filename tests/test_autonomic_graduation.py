@@ -299,6 +299,7 @@ def _req(gate, *, risk, ratified, sealed=None):
                            hops=0, human_present=False),
         grounded=True, authority=AuthorityScope(grantor="binding", grant="g", binding_id=binding_id, hops=0),
         overall_confidence=1.0, directive_confidence=1.0, risk=risk, ratified_posture=ratified, run=run,
+        trigger_event={"type": "time", "id": "e", "fields": {}},   # the fire check evaluates a policy guard on it
     )
 
 

@@ -188,13 +188,24 @@ def test_authority_moving_between_decision_and_admission_is_stale_then_held(tmp_
     w = CWorld(tmp_path, coverage=src)
     w.mint(Posture.ON_LOOP)
     if move == "revoke":
-        src.after_refresh = lambda: src.revoke("gp-a")                       # the head moves
+        mover = lambda: src.revoke("gp-a")                                  # noqa: E731 — the head moves
     elif move == "root_edit":
-        src.after_refresh = lambda: src.set_root(root_file())               # the signer gone, no head move
+        mover = lambda: src.set_root(root_file())                           # noqa: E731 — the signer gone
     else:
-        src.after_refresh = lambda: setattr(w, "now", EXPIRES)              # it lapses, no head move
+        mover = lambda: setattr(w, "now", EXPIRES)                          # noqa: E731 — it lapses
+    real = w.gate._fire_check
+    moved: list[bool] = []
+
+    def check_then_move(*args):
+        # the authority moves right after the fire check (A1c2), once, so the admission's fence reads the move
+        got = real(*args)
+        if not moved:
+            moved.append(True)
+            mover()
+        return got
+    w.gate._fire_check = check_then_move
     first = w.dispatch("s1").outcome
-    assert first.held and first.reason == "journal:stale" and not first.fired
+    assert moved and first.held and first.reason == "journal:stale" and not first.fired
     again = w.dispatch("s1").outcome                                         # decided again, under what holds now
     assert again.pending and again.posture is Posture.CONFIRM and not again.fired
     assert w.outbox() == []
