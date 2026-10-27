@@ -369,20 +369,19 @@ def parse_choice(signed: bytes, *, write_in: bool = False) -> "tuple[str, str, s
     return message, m.group(1), m.group(2)
 
 
-def deep_link(page: str, request_id: str, token: str | None = None, *, choice: str | None = None,
-              version: str | None = None) -> str:
-    """The phone page link that opens straight onto sign request ``request_id``'s card: ``page`` (the printed
-    ``https://<name>/``) with ``#sign=<id>``, and this run's ``phone_token`` first when given (a browser that has not
-    opened this run's link needs it; the fragment never reaches the server or its logs). ``choice``, an option key
-    (never the write-in's :data:`WRITE_IN_KEY`), is the option the operator already tapped elsewhere, and ``version``
-    the request's ``sha256`` (the hex digest of its file's bytes, :attr:`SignRequest.sha256`, or the first 16 hex of
-    it) as filed when he tapped it. A choice needs its version; a version alone is the base link an app adds
-    ``&choice=<key>`` to when he taps an option. The link carries ``v=<the first 16 hex>`` and then ``choice=<key>``
-    (the page reads them in any order), and the page offers to sign that option with one tap only while the listed
-    request has that version; ``v=`` alone draws the plain card. It is page state only, never what is signed: the
-    bytes are built from the request file (:func:`signed_bytes`), and a key the card does not offer, or another
-    version, draws nothing but a line."""
-    from urllib.parse import quote
+def deep_link(origin: str, request_id: str, *, choice: str | None = None, version: str | None = None) -> str:
+    """The link that opens the cockpit's sign sheet on sign request ``request_id`` (ONESURFACE OS-4):
+    ``<origin>/sign/<id>``, ``origin`` being the cockpit's bare origin (``https://<name>:<port>``, a trailing ``/``
+    allowed, nothing else). It carries no credential: the sheet's reads take the paired device's own token, which
+    never rides a link. ``choice``, an option key (never the write-in's :data:`WRITE_IN_KEY`), is the option the
+    operator already tapped elsewhere, and ``version`` the request's ``sha256`` (the hex digest of its file's bytes,
+    :attr:`SignRequest.sha256`, or the first 16 hex of it) as filed when he tapped it. A choice needs its version; a
+    version alone is the base link an app adds ``&choice=<key>`` to when he taps an option. The fragment carries
+    ``v=<the first 16 hex>`` and then ``choice=<key>``, and the sheet offers to sign that option with one tap only
+    while the listed request has that version; ``v=`` alone draws the plain sheet. It is page state only, never what
+    is signed: the bytes are built from the request file (:func:`signed_bytes`), and a key the sheet does not offer,
+    or another version, draws nothing but a line."""
+    from urllib.parse import urlsplit
 
     if _ID.fullmatch(request_id or "") is None:
         raise ValueError(f"{str(request_id)[:80]!r} is not a sign request id")
@@ -392,12 +391,17 @@ def deep_link(page: str, request_id: str, token: str | None = None, *, choice: s
         raise ValueError(f"{str(choice)[:20]!r} is not an option key ([a-z0-9]{{1,8}})")
     if version is not None and (not isinstance(version, str) or _VERSION.fullmatch(version) is None):
         raise ValueError(f"{str(version)[:80]!r} is not a request's sha256 (64 or its first 16 lower-case hex)")
-    parts = ([f"phone_token={quote(token, safe='')}"] if token else []) + [f"sign={request_id}"]
-    if version is not None:
-        parts.append(f"v={version[:16]}")
-    if choice is not None:
-        parts.append(f"choice={choice}")
-    return page.split("#", 1)[0] + "#" + "&".join(parts)
+    try:
+        parts = urlsplit(origin)
+        parts.port
+    except (ValueError, TypeError, AttributeError):
+        parts = None
+    if (parts is None or parts.scheme not in ("https", "http") or not parts.hostname or "@" in parts.netloc
+            or parts.path not in ("", "/") or parts.query or parts.fragment or "#" in origin or "?" in origin):
+        raise ValueError(f"{str(origin)[:80]!r} is not a bare origin (https://<name>[:<port>])")
+    link = f"{parts.scheme}://{parts.netloc}/sign/{request_id}"
+    frag = ([f"v={version[:16]}"] if version is not None else []) + ([f"choice={choice}"] if choice is not None else [])
+    return link + ("#" + "&".join(frag) if frag else "")
 
 
 def _option_text_problem(text: object, what: str, most: int = OPTION_TEXT_MAX) -> str | None:

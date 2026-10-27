@@ -2639,6 +2639,12 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
     cs_phone.add_argument("--token-file", dest="token_file", type=Path, default=None,
                           help="Keep the phone token in FILE (mode 0600): read it from there when FILE exists, else "
                                "make one and write it, so a restart keeps the links the phone already holds.")
+    cs_phone.add_argument("--redirect-to", dest="redirect_to", default=None, metavar="ORIGIN",
+                          help="Serve ONLY a redirect: every link the phone already holds for this port opens on "
+                               "the cockpit at ORIGIN (https://<name>:<port>), a sign link on that request's sheet "
+                               "(/sign/<id>), its token dropped and never forwarded. Nothing else is served, no "
+                               "token is made, and --link-file then holds {page: ORIGIN/} only. Takes no "
+                               "--queue-dir, --sign-namespace or --token-file.")
     cs_phone.set_defaults(func=_cmd_consent_phone)
 
     from levain.consent.sign_setting import add_parser as add_signed_answers_parser
@@ -2705,9 +2711,19 @@ def _sign_namespace(text: str) -> str:
 
 
 def _cmd_consent_phone(args: argparse.Namespace) -> int:
-    from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_server
+    from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_redirect, run_phone_server
 
     from levain.consent.queue import default_queue_dir
+
+    if args.redirect_to is not None:
+        full = [flag for flag, given in (("--queue-dir", args.queue_dir), ("--sign-namespace", args.sign_namespaces),
+                                         ("--token-file", args.token_file)) if given]
+        if full:
+            print(f"--redirect-to serves only the redirect: drop {', '.join(full)}", file=sys.stderr)
+            return 2
+        return run_phone_redirect(args.redirect_to, name=args.name, tailscale=args.tailscale,
+                                  port=DEFAULT_PHONE_PORT if args.port is None else args.port,
+                                  link_file=args.link_file.expanduser() if args.link_file is not None else None)
 
     # the phone port may start before any agent has filed a request: a queue with no database yet lists nothing
     qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
