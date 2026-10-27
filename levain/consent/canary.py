@@ -1014,8 +1014,9 @@ def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: fl
     :func:`discard_slot_session`, called ``(session id, repo)``; ``sessions`` replaces :func:`store_sessions`.
     R8: the session id is never taken from the screen (the model's to forge): it is the one session in the
     operator's store whose alloc records the scratch repo's commit as its base (:func:`scratch_head`, unique to this
-    run), looked up once: after the session ends, or in the cleanup when the run stopped before that. The slot files are read from that session only; no such session
-    or several, or a store that cannot be read, reads no files (INCONCLUSIVE) and discards nothing, with a note.
+    run), looked up once: after the session ends, or in the cleanup when the run stopped before that. The slot
+    files are read from that session only; no such session or several, or a store that cannot be read, reads no
+    files (INCONCLUSIVE) and discards nothing, with a note.
     Once a session was started, on every exit path after the evidence is read, the canary discards that session; a
     discard that fails is a note beside the verdict, never part of it."""
     if agent not in SANDBOX_VENDORS:
