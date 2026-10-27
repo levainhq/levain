@@ -1659,13 +1659,16 @@ def _add_consent_canary_parser(consent_sub: argparse._SubParsersAction) -> None:
     canary_p.add_argument("--agent", required=True, choices=("claude_code", "codex"))
     canary_p.add_argument("--workspace", type=Path, default=None,
                           help="Scratch workspace: a new or empty directory (default: a new temporary one).")
+    canary_p.add_argument("--sandbox", action="store_true",
+                          help=("Instead, check the confinement: one model turn runs a fixed probe through "
+                                "`levain session`, which tries four escapes; exit 1 on any escape or an unclear run."))
     canary_p.set_defaults(func=_cmd_consent_canary)
 
 
 def _cmd_consent_canary(args: argparse.Namespace) -> int:
     from levain.consent.canary import cli_canary
 
-    return cli_canary(args.agent, args.workspace)
+    return cli_canary(args.agent, args.workspace, sandbox=args.sandbox)
 
 
 def _add_consent_ledger_parser(consent_sub: argparse._SubParsersAction) -> None:
