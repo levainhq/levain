@@ -61,6 +61,9 @@ DYNAMIC_SITES = {
     # V13: the probe's connector child (stdlib only), built by launch_spec and matched by the stage's spec check
     "levain/slot/wall.py::launch_spec::" 'argv = module_argv(host, PROBE_MODULE, "--result-fd", str(PROBE_RESULT_FD), *probe_addrs)': ("levain.slot.probe_child",),
     "levain/slot/wall.py::_check_probe_spec::" 'prefix = module_argv(h, PROBE_MODULE, "--result-fd", str(PROBE_RESULT_FD))': ("levain.slot.probe_child",),
+    # G1b: the Claude identity call's child (stdlib only), built by launch_spec and matched by the stage's spec check
+    "levain/slot/wall.py::launch_spec::argv = module_argv(host, IDENTITY_MODULE)": ("levain.slot.identity_child",),
+    "levain/slot/wall.py::_check_identity_spec::" 'host = next((h for h in ("darwin", "linux") if s.argv == module_argv(h, IDENTITY_MODULE)': ("levain.slot.identity_child",),
     "levain/slot/wall.py::stage_argv::" 'return module_argv(host, "levain.slot.wall", "--spec-fd", str(spec_fd))': ("levain.slot.wall",),
     "levain/slot/wall.py::trampoline_argv::" 'return module_argv("darwin", "levain.slot.wall", "--exec-fd", str(exec_fd), "--", *argv)': ("levain.slot.wall",),
     # in-process ``importlib`` calls, none run by a root process (empty = no module seeded); each row's reason:
@@ -117,6 +120,7 @@ LAZY_SITES = {
     'levain/slot/control.py::Control._drop_until_acked::from levain.slot.control_client import V23_SECONDS   # lazy: a module-level import would be circular': 'root',
     # S1 3c-4: ``levain.slot.routemaps`` (CONTROL, keys) parses the dispatch route map with ``parse_routemap``
     'levain/broker/policy.py::parse_routemap::from levain.dispatch import routemap_rules as rules': 'root',
+    'levain/slot/end.py::confirmed_relogin::from levain.slot import identity as ID': 'root',
     'levain/slot/export_run.py::_store_delete::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/export_run.py::mount_path::from levain.slot import wall': 'root',
     'levain/slot/export_run.py::scope_path::from levain.slot import wall': 'root',
@@ -192,6 +196,8 @@ LAZY_SITES = {
     'levain/slot/runtime_helper.py::_baseline_vendor::from levain.slot import identity as ID': 'root',
     'levain/slot/runtime_helper.py::_confirm_identity::from levain.slot import identity as ID': 'root',
     'levain/slot/runtime_helper.py::status::from levain.slot import identity as ID': 'root',
+    # G1b: the Claude identity call spawns its child through start (identity is imported by start at module level)
+    'levain/slot/identity.py::_claude_call::from levain.slot import start as SS': 'root',
     # the root discard / restore verbs (VERB_HANDLERS, operator-uid caller; land16)
     'levain/slot/runtime_helper.py::_store_verb::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/runtime_helper.py::_store_verb::from levain.slot.root_intent import PhaseFailed': 'root',
@@ -220,6 +226,8 @@ LAZY_SITES = {
     'levain/slot/wall.py::_check_probe_spec::from levain.slot.grammar import SESSION_RE': 'root',
     'levain/slot/wall.py::_check_probe_spec::from levain.slot.layout import STORE': 'root',
     'levain/slot/wall.py::_check_probe_spec::from levain.slot.probe_child import MAX_ADDRS, probe_address': 'root',
+    'levain/slot/wall.py::_check_identity_spec::from levain.slot.grammar import SESSION_RE': 'root',
+    'levain/slot/wall.py::_check_identity_spec::from levain.slot.layout import STORE': 'root',
     'levain/slot/wall.py::module_argv::from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON, boot_path_code': 'root',
     'levain/slot/wall.py::clone_argv::from levain.slot.render import READSET_KINDS, READSET_TEMPLATE': 'root',
     'levain/slot/wall.py::clone_argv::from levain.slot.runtime_grammar import KINDS': 'root',

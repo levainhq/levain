@@ -29,8 +29,9 @@ fresh ``/dev/shm``, tmpfs, the session dir and the socket dirs) built by bwrap i
 
 Targets: ``vendor``, ``clone`` (§5.4 step 3: by the SAME path as the vendor), ``clone-check`` (the post-clone
 check's ``git`` children, §5.4 step 3 (b), by that same path), ``step`` (a verifier step, §5.6 step 2), ``driver``
-(§5.6 step 3), ``forwarder`` (Linux egress, §9.1), ``front`` (§5.1 render (4)) and ``probe`` (V13: the firewall
-self-probe's connector, an egress slot's, under ``<S>/root/probe.sb`` on macOS). The export targets
+(§5.6 step 3), ``forwarder`` (Linux egress, §9.1), ``front`` (§5.1 render (4)), ``probe`` (V13: the firewall
+self-probe's connector, an egress slot's, under ``<S>/root/probe.sb`` on macOS) and ``identity`` (§7.6, IG-3: the
+Claude identity call's child, an egress slot's, under the session's own ``profile.sb``). The export targets
 ``importer`` and ``verifier`` (s5 §5b) run as their own singletons (:func:`export_principal`), ROOT-launched
 through the same stage by their own spec builder (:func:`export_launch_spec`) and walls (:class:`WallFacts`).
 
@@ -84,6 +85,10 @@ READY_FD = EXEC_FD
 PROBE_RESULT_FD = EXEC_FD
 PROBE_MODULE = "levain.slot.probe_child"
 PROBE_PROFILE = "probe.sb"
+#: §7.6 (1027-18 RULINGS IG-3, G1b): the Claude identity call's slot side, run from the root tree as the slot with
+#: the session's env file (its ``HTTPS_PROXY`` and ``CLAUDE_CONFIG_DIR``); its stdout is root's to drain (the runtime
+#: helper's capture). :func:`_check_identity_spec` binds the target to exactly this module's argv.
+IDENTITY_MODULE = "levain.slot.identity_child"
 #: DECISION: the front's fixed argv from root (lane F3 b): at most this many strings of at most 4 KiB, no NUL.
 _FRONT_ARGS = 16
 
@@ -91,7 +96,7 @@ SPEC_CAP = 64 * 1024
 ENV_CAP = 64 * 1024
 PROFILE_CAP = 1024 * 1024
 
-TARGETS = ("vendor", "clone", "clone-check", "step", "driver", "forwarder", "front", "probe")
+TARGETS = ("vendor", "clone", "clone-check", "step", "driver", "forwarder", "front", "probe", "identity")
 #: s5 §5b: the export wall's targets, each ROOT-launched by :func:`export_launch_spec`, never by
 #: :func:`launch_spec` (which is slot-shaped). The stage runs either spec with the same machinery.
 EXPORT_TARGETS = ("importer", "verifier")
@@ -195,13 +200,13 @@ def export_principal(host: str, role: str, ids: Mapping[str, int], shared: Mappi
 
 
 def target_account(slot, target: str) -> str:
-    """The account a target runs as (§1, §5.4, §5.6): an egress slot's vendor, clone, forwarder and V13 probe run as
-    ``_levain_s<n>``, its front as ``_levain_gw<n>``; a verifier pair's clone and steps run as the CHILD
+    """The account a target runs as (§1, §5.4, §5.6): an egress slot's vendor, clone, forwarder, V13 probe and
+    identity call run as ``_levain_s<n>``, its front as ``_levain_gw<n>``; a verifier pair's clone and steps run as the CHILD
     ``_levain_c<n>``, its driver as ``_levain_v<n>``. Any other pairing is refused."""
     first, second = slot.accounts
     if slot.slot_class == "egress":
         table = {"vendor": first, "clone": first, "clone-check": first, "forwarder": first, "front": second,
-                 "probe": first}
+                 "probe": first, "identity": first}
     else:
         table = {"clone": second, "clone-check": second, "step": second, "driver": first}
     if target not in table:
@@ -294,6 +299,8 @@ def _check_spec(s: Spec) -> None:
         _check_probe_spec(s)
     elif s.profile is not None and PurePosixPath(s.profile).name == PROBE_PROFILE:
         raise Refused("spec-malformed", f"{s.target} under the probe profile")
+    if s.target == "identity":
+        _check_identity_spec(s)
 
 
 def _check_probe_spec(s: Spec) -> None:
@@ -327,6 +334,30 @@ def _check_probe_spec(s: Spec) -> None:
     want = str(S / "root" / PROBE_PROFILE) if host == "darwin" else None
     if s.profile != want:
         raise Refused("spec-malformed", f"probe: profile {s.profile!r} is not {want!r}")
+
+
+def _check_identity_spec(s: Spec) -> None:
+    """G1b: an ``identity`` spec is EXACTLY the one :func:`launch_spec` builds: the root-tree module launcher running
+    :data:`IDENTITY_MODULE` with no argument; cwd ``<S>/tmp``; the session's env file ``<S>/root/env``; no extra env,
+    resolve, exec fd or kept fd; the slot's NPROC; on macOS (the launcher's host) ``<S>/root/profile.sb``, on Linux no
+    profile. Run by the plan half and by the stage (:func:`parse_spec`), so the stage never runs an
+    identity-labelled spec root would not have built."""
+    from levain.slot.grammar import SESSION_RE
+    from levain.slot.layout import STORE
+
+    if s.extra_env or s.resolve or s.exec_fd is not None or s.keep_fds or s.nproc != NPROC:
+        raise Refused("spec-malformed", "identity: env, resolve, fds or nproc")
+    cwd = PurePosixPath(s.cwd)
+    S = cwd.parent
+    host = next((h for h in ("darwin", "linux") if s.argv == module_argv(h, IDENTITY_MODULE)
+                 and S.parent == PurePosixPath(str(STORE[h])) / "live"), None)
+    if host is None or cwd.name != "tmp" or not SESSION_RE.fullmatch(S.name):
+        raise Refused("spec-malformed", "identity: argv or cwd is not the identity child's")
+    if s.env_file != str(S / "root" / "env"):
+        raise Refused("spec-malformed", f"identity: env file {s.env_file!r}")
+    want = str(S / "root" / "profile.sb") if host == "darwin" else None
+    if s.profile != want:
+        raise Refused("spec-malformed", f"identity: profile {s.profile!r} is not {want!r}")
 
 
 def parse_spec(data: bytes) -> Spec:
@@ -460,6 +491,10 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
     * ``probe`` (V13, egress): :data:`PROBE_MODULE` from the root tree with ``--result-fd`` and ``probe_addrs``, cwd
       ``<S>/tmp``, keeping :data:`PROBE_RESULT_FD`; on macOS the profile is ALWAYS ``<S>/root/probe.sb`` (any other
       is refused); no env file. ``argv`` and ``keep_fds`` are built here, never the caller's.
+    * ``identity`` (§7.6, IG-3, egress): :data:`IDENTITY_MODULE` from the root tree, no argument, cwd ``<S>/tmp``,
+      the session's env file ``<S>/root/env`` (any other is refused), no kept fd; on macOS the session's
+      ``<S>/root/profile.sb`` (any other is refused). ``argv`` is built here, never the caller's. Its stdout is
+      root's to drain (the runtime helper's capture).
     * ``front``: drop + assert only (§8.2 last sentence): no profile, no ``RLIMIT_NPROC`` (V3 is per SLOT),
       no env file; its env is ``extra_env`` alone, cwd ``/``, one extra fd (the GO pipe). ``argv`` is the front
       module's FIXED arguments, root's (never slot-supplied), appended after the module.
@@ -522,6 +557,18 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
             profile = want
         argv = module_argv(host, PROBE_MODULE, "--result-fd", str(PROBE_RESULT_FD), *probe_addrs)
         cwd, keep_fds = S / "tmp", (PROBE_RESULT_FD,)
+    elif target == "identity":
+        if argv or tuple(keep_fds):
+            raise Refused("spec-malformed", "the identity call builds its own argv and keeps no fd")
+        want = str(root_layer / "env")
+        if env_file is not None and env_file != want:
+            raise Refused("spec-malformed", f"the identity call reads only {want}")
+        if host == "darwin":
+            want = str(root_layer / "profile.sb")
+            if profile is not None and profile != want:
+                raise Refused("spec-malformed", f"the identity call runs only under {want}")
+        argv = module_argv(host, IDENTITY_MODULE)
+        cwd = S / "tmp"
     else:   # front
         if len(argv) > _FRONT_ARGS or not all(
                 isinstance(a, str) and "\x00" not in a and len(a.encode("utf-8", "surrogatepass")) <= _STEP_ARG_BYTES
@@ -531,7 +578,7 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
         cwd = PurePosixPath("/")
 
     slot_target = target != "front"
-    if env_file is None and target in ("vendor", "clone", "clone-check", "step", "driver"):
+    if env_file is None and target in ("vendor", "clone", "clone-check", "step", "driver", "identity"):
         # A verifier renders two env files (§3.4: the driver's HOME is <S>/driver, the child's <S>).
         env_file = str(root_layer / ("driver.env" if target == "driver" else "env"))
     if env_file is not None and (target in ("front", "forwarder") or not _under(env_file, root_layer)):
