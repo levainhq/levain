@@ -99,8 +99,9 @@ _LIT = re.compile(r'"([^"]*)"\Z')
 def _patterns() -> set:
     """Every ``(parts, trusted)`` a ``store.dir`` / ``open_dir`` / ``read`` / ``replace`` / ``create`` call in
     ``levain/slot`` names, a non-literal component as ``WILD``; a call whose first component is starred (a session's
-    own parts) names no layout row and is left out. Every component but the last is always checked trusted
-    (``Store.open_dir``), so each prefix is a trusted open too."""
+    own parts) names no layout row and is left out, as is one with a ``...`` argument (prose naming a call, such as
+    ``store.dir(..., trusted=True)`` in a docstring, not a call). Every component but the last is always checked
+    trusted (``Store.open_dir``), so each prefix is a trusted open too."""
     root = Path(slot_pkg.__file__).parent
     out = set()
     for f in sorted(root.rglob("*.py")):
@@ -110,7 +111,7 @@ def _patterns() -> set:
             if m.group(1):
                 rest = " ".join(t for t in toks if "=" in t)
             toks = [t for t in toks if "=" not in t]
-            if not toks or toks[0].startswith("*"):
+            if not toks or toks[0].startswith("*") or "..." in toks:
                 continue
             parts = []
             for t in toks:
@@ -206,8 +207,12 @@ def test_the_root_predicate_is_every_root_rows_own_shape(host):
     rows = _dir_rows(host)
     assert [p for p, r in rows.items() if r.owner == "root" and r.mode & 0o022] == []
     assert RH.Seams().trusted is LY.admits_root
-    # store_dir_row answers None for a slot's dirs, so they take the root shape: every slot row must be root's
-    assert {r.owner for s in SLOTS for r in LY.slot_store_rows(host, s)} == {"root"}
+    # store_dir_row answers None for a slot's dirs, so a trusted open of one demands the root shape. The one slot row
+    # that is not root's is an egress slot's front log dir (3b-8a T1, the front account's): no trusted open may name it
+    trusted = set(_trusted_rows(host))
+    others = {p for p, r in rows.items() if r.owner != "root" and LY.store_dir_row(host, p) is None}
+    assert others == {("gw", f"slot{s.index}") for s in SLOTS if s.slot_class == "egress"}
+    assert not others & trusted, others & trusted
     for parts, r in rows.items():
         st = os.stat_result((stat.S_IFDIR | r.mode, 1, 1, 2, _uid(r.owner), _gid(r.group), 0, 0, 0, 0))
         assert LY.admits_root(st) is (r.owner == "root"), parts

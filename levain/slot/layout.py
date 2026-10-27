@@ -148,7 +148,8 @@ def admits_root(st: os.stat_result) -> bool:
 
 def store_dir_row(host: HostOS, parts: Iterable[str]) -> "Row | None":
     """The :func:`base_store_rows` directory row of ``L/<parts>``, or None for a dir no base row makes (a session's or
-    a slot's: every :func:`slot_store_rows` row is root's)."""
+    a slot's, so a trusted open of one demands the root shape; the one :func:`slot_store_rows` row that is not root's,
+    an egress slot's ``L/gw/slot<n>/``, is never opened trusted: tests/test_slot_layout_trust.py)."""
     return _store_dir_rows(host).get(tuple(parts))
 
 
