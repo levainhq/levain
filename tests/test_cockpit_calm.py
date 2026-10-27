@@ -117,6 +117,46 @@ ROW1_AT_13C4D885 = {
 }
 
 
+ROW1_ORDER = ("brand", "live", "sync", "jump", "theme")   # the controls that share the first row, left to right; the tabs are the second row
+
+
+def _row1_defects(row1: dict, width: int) -> list:
+    """Font-independent geometry of the first row (rects are [left, top, right, bottom]): the defects found, [] when it is sound."""
+    rects = [(k, row1[k]) for k in ROW1_ORDER]
+    bad = []
+    for (ka, a), (kb, b) in zip(rects, rects[1:]):
+        if b[0] < a[0]:
+            bad.append(f"{kb} is left of {ka}")
+        if a[2] > b[0]:
+            bad.append(f"{ka} overlaps {kb} horizontally ({a[2]} > {b[0]})")
+    for k, r in rects:
+        if r[0] < 0 or r[2] > width:
+            bad.append(f"{k} leaves the {width}px viewport ({r[0]}..{r[2]})")
+    centres = [(k, (r[1] + r[3]) / 2) for k, r in rects]
+    bound = max(r[3] - r[1] for _, r in rects) / 2   # centres of one row differ by less than half its tallest control
+    if max(c for _, c in centres) - min(c for _, c in centres) >= bound:
+        bad.append(f"the controls do not share one row (centres {centres}, bound {bound})")
+    tabs = row1["tabs"]   # the second row: no control of the first may reach into it (touching edges is allowed)
+    for k, r in rects:
+        if r[3] > tabs[1] and r[0] < tabs[2] and tabs[0] < r[2]:
+            bad.append(f"{k} overlaps the tabs ({k} bottom {r[3]} > tabs top {tabs[1]})")
+    return bad
+
+
+@pytest.mark.parametrize("width,mutate,expect", [
+    (375, lambda r: r.update(sync=[r["sync"][0] + 10, r["sync"][1], r["sync"][2] + 10, r["sync"][3]]), "sync overlaps jump"),
+    (375, lambda r: r.update(theme=[r["theme"][0] + 40, r["theme"][1], r["theme"][2] + 40, r["theme"][3]]), "theme leaves the 375px viewport"),
+    (375, lambda r: r.update(jump=[r["jump"][0], r["jump"][1] + 30, r["jump"][2], r["jump"][3] + 30]), "do not share one row"),
+    (375, lambda r: r.update(live=[10, r["live"][1], 17, r["live"][3]]), "is left of"),
+    (375, lambda r: r.update(jump=[r["jump"][0], r["jump"][1] + 21, r["jump"][2], r["jump"][3] + 21]), "jump overlaps the tabs"),
+])
+def test_the_row_invariants_catch_a_real_defect_and_pass_the_known_good_row(width, mutate, expect):
+    good = {k: list(v) for k, v in ROW1_AT_13C4D885[width].items()}
+    assert _row1_defects(good, width) == []
+    mutate(good)
+    assert any(expect in d for d in _row1_defects(good, width)), _row1_defects(good, width)
+
+
 @needs_browser
 @pytest.mark.parametrize("width", [320, 375, 430])
 def test_on_a_phone_the_first_row_is_untouched_and_calm_is_a_labelled_button_beside_the_clock(tmp_path, monkeypatch, width):
@@ -150,6 +190,7 @@ def test_on_a_phone_the_first_row_is_untouched_and_calm_is_a_labelled_button_bes
                 assert all(abs(a - b) <= 1 for a, b in zip(got["row1"][key], rect)), (key, got["row1"][key], rect)
             if got is not off:   # calm moves nothing, on every platform: the font-independent check, so it never compares `off` with itself
                 assert all(abs(a - b) <= 1 for a, b in zip(got["row1"][key], off["row1"][key])), (key, got["row1"][key], off["row1"][key])
+        assert _row1_defects(got["row1"], width) == [], got["row1"]   # every platform: order, no overlap, inside the viewport, one row
         assert width == 320 or not got["wordmarkCut"], got   # whole where 13c4d885 had it whole (375 and 430); at 320 it was already the dot alone
         assert got["inside"] and got["rightOfClock"] and got["h"] >= 36 and not got["overlaps"], got
         assert got["fontSize"] != "0px" and got["text"] in ("Calm off", "Calm on") and got["mastheadCalmShown"] is False, got
