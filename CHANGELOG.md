@@ -7,6 +7,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **The cockpit's Build tab has a Threads section.** It shows the coordinator's threads and one thread's stream in the
+  order it happened, with running tool calls, approvals shown as a line pointing you to Needs you, and your own lines
+  marked unverified. It needs the page's write token and is read-only for now.
 - **Pings come from the cockpit's own origin.** The cockpit serves web push itself (service worker, manifest,
   `/webpush/*`), behind its credential. The Devices panel turns pings on for the browser you are using: pair it, then
   Turn on; on a phone, add the cockpit to the Home Screen and pair it from there. Only a paired device can turn pings
