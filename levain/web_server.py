@@ -739,6 +739,22 @@ _ASSETS: dict[str, tuple[str, str]] = {
 }
 
 
+# ONESURFACE OS-4: web push on this origin (levain.webpush.routes), served beside a Signer, whose queue holds the push
+# store. The worker, manifest and icons are app shell (token-free, no data); the two reads and three writes need a
+# token on every bind; the phone port's own pairing (/webpush/pair, /webpush/pair/redeem) is not served here: this
+# origin pairs through /pair.
+_PUSH_GET = frozenset({"/webpush/key", "/webpush/record"})
+_PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened"})
+_PUSH_SUBSCRIBE = "/webpush/subscribe"
+_PUSH_PREFIX = "/webpush/"
+
+
+def _push_static() -> frozenset[str]:
+    from levain.webpush.routes import STATIC_PATHS
+
+    return STATIC_PATHS
+
+
 # The chat routes (K1 part 2, `levain serve --chat`). Served only when the server holds a ChatHost;
 # reserved either way, so a downstream route can never claim them.
 _CHAT_GET_ROUTES = ("/chat.json", "/chat/session.json", "/chat/job.json")
@@ -757,10 +773,10 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
     _GRANT_LIST_PATH,
-} | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
+} | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
 _RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
-                                       _GRANT_PREFIX, _SHEET_PREFIX)
+                                       _GRANT_PREFIX, _SHEET_PREFIX, _PUSH_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -1639,6 +1655,69 @@ class _Handler(GuardedHandler):
             return False
         return True
 
+    def _serve_push(self, path: str, *, head: bool, read: bool = False) -> None:
+        """A web push GET (OS-4) through :func:`levain.webpush.routes.handle` over the Signer's queue: an app-shell
+        file (no query reaches it, so the manifest never carries a pairing code), or with ``read`` the key or the
+        record, behind :meth:`_sign_read_admitted`."""
+        from levain.webpush import routes as push_routes
+
+        queue = self.server.signer.queue_dir
+        if not read:
+            status, body, ctype = push_routes.handle("GET", path, {}, b"", queue_dir=queue, authorized=False,
+                                                     device_id=None) or (404, b"not found\n", "text/plain")
+            self._send(body, ctype, status=status, head=head)
+            return
+        if not self._sign_read_admitted(head=head, what="push reads"):
+            return
+        try:
+            try:
+                got = push_routes.handle("GET", path, {}, b"", queue_dir=queue, authorized=True,
+                                         device_id=str(self._credential()["name"]))
+            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                raise
+            except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer
+                got = 500, json.dumps({"error": "internal", "message": type(exc).__name__}).encode("utf-8"), "json"
+            status, body, _ = got
+            self._send(body, "application/json; charset=utf-8", status=status, head=head,
+                       headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+        finally:
+            self.server.request_gate.release()
+
+    def _push_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any] | bytes, int]":
+        """A web push POST (OS-4), its credential already checked: only a PAIRED device subscribes (a surface token
+        has no revoke that could stop the pings), and every subscription is stored under the device's credential
+        name, so a revoke here retires it (:meth:`_retire_push`)."""
+        from levain.webpush import routes as push_routes
+
+        name = str(self._credential()["name"])
+        if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
+            return {"error": "device_required", "message": "turn pings on from a paired device: pair it from the "
+                    "Devices panel first"}, 403
+        got = push_routes.handle("POST", route, {}, raw, queue_dir=self.server.signer.queue_dir, authorized=True,
+                                 device_id=name)
+        assert got is not None          # every route in _PUSH_POST is one of handle's
+        return got[1], got[0]
+
+    def _retire_push(self, device_ids: "list[str]", now: datetime) -> "str | None":
+        """The revoked paired devices' push subscriptions retired (OS-4), so no ping is sent to a revoked device; the
+        reason as a note when the push store cannot be written (the revoke itself has committed), else None."""
+        if self.server.signer is None or not device_ids:
+            return None
+        from levain.webpush.store import PushStore, retire_device_subscriptions
+
+        try:
+            conn = PushStore(self.server.signer.queue_dir).connection()
+            try:
+                with conn:
+                    for device in device_ids:
+                        retire_device_subscriptions(conn, PAIRED_PREFIX + str(device), now)
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 - the revoke stands; the note says its pings may not have stopped
+            _log.warning("paired device revoke: push subscriptions not retired", exc_info=True)
+            return f"its push subscriptions could not be retired ({type(exc).__name__}): run the revoke again"
+        return None
+
     def _serve_grant_list(self, *, head: bool) -> None:
         """``GET /cockpit/grant/list.json``: :meth:`levain.consent.grant_phone.GrantPhone.listing` (each grant with
         ``instance`` and ``signers``, the passkeys that may revoke it, and the notes) plus ``origin``, the page the
@@ -2165,6 +2244,13 @@ class _Handler(GuardedHandler):
         if consent_read is not None:                # its read rides the sign listing's gate exactly
             self._serve_consent_sheet(consent_read, head=head)
             return
+        # Web push (OS-4), beside a Signer only: the app shell token-free, the reads on the sign reads' own gate
+        if self.server.signer is not None and path in _push_static():
+            self._serve_push(path, head=head)
+            return
+        if self.server.signer is not None and path in _PUSH_GET:
+            self._serve_push(path, head=head, read=True)
+            return
         # The sign listing runs the write gate's own checks (a token on every bind), stricter than the off-box gate
         # below, so it is routed before it; without a signer it is 404 to everyone (the route's name is public).
         if path == _SIGN_LIST_PATH or _sign_one(path) is not None:
@@ -2547,7 +2633,10 @@ class _Handler(GuardedHandler):
         grant = grant_route(route, _GRANT_PREFIX) if self.server.grant_phone is not None else None
         # and the consent family's answer and ruling (OS-2): the same ceremony class, the same gate
         consent = _consent_sign_route(route) if self.server.consent_sheet is not None else None
-        if (sign is not None or compose or grant is not None or consent is not None) and not self._off_box_token_valid():
+        # and web push (OS-4): a token on every bind
+        push = route in _PUSH_POST and self.server.signer is not None
+        if (sign is not None or compose or grant is not None or consent is not None or push) \
+                and not self._off_box_token_valid():
             return self._reject(403, "credential_required", "missing or invalid write token")
         if self._write_token_required() and not self._off_box_token_valid():
             return self._reject(403, "forbidden", "missing or invalid write token")
@@ -2562,7 +2651,7 @@ class _Handler(GuardedHandler):
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
-                and consent is None):
+                and consent is None and not push):
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -2606,6 +2695,18 @@ class _Handler(GuardedHandler):
                     self._send_json({"error": "not_found", "message": "no such route"}, 404)
                     return
                 self._send_chat(self._chat_post(route, host, req))
+                return
+            if push:
+                try:
+                    out, status = self._push_post(route, raw)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    out, status = {"error": "internal", "message": type(exc).__name__}, 500
+                if isinstance(out, bytes):
+                    self._send(out, "application/json; charset=utf-8", status=status)
+                else:
+                    self._send_json(out, status)
                 return
             if compose:
                 # the caller's compose_signer files the request: like the ceremony, no read-only refusal applies to it
@@ -2774,6 +2875,9 @@ class _Handler(GuardedHandler):
                 if status == 200:
                     with srv.pair_epoch_lock:       # after the commit, never inside it (RU-3)
                         srv.pair_epoch += 1
+                    note = self._retire_push(list(payload.get("revoked") or []), now)
+                    if note is not None:
+                        payload["push_note"] = note
                 elif payload.get("error") == "bad_request" and "no such device" in payload.get("message", ""):
                     status = 404
             self._pair_send(payload, status, cache_control="no-store")

@@ -1,7 +1,9 @@
-// Levain phone page service worker: show a pushed nudge, and on a tap open the page and record the open.
-// A service worker cannot read localStorage, so the page hands its credential over with postMessage and the
-// worker keeps it in IndexedDB; the credential is only ever sent back to this origin.
+// Levain's push service worker (the phone port's, and the cockpit's since ONESURFACE OS-4): show a pushed nudge, and
+// on a tap open the page and record the open. A service worker cannot read localStorage, so the page hands its
+// credential over with postMessage and the worker keeps it in IndexedDB; the credential is only ever sent back to this
+// origin, under the header the page named (the cockpit's write-token header; the phone port's when none is named).
 const DB = 'levain-sw', STORE = 'kv';
+const HEADERS = ['X-Levain-Phone-Token', 'X-Levain-Write-Token'];
 
 function kv(mode, fn) {
   return new Promise((resolve, reject) => {
@@ -23,7 +25,8 @@ self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
 self.addEventListener('message', (e) => {
   const d = e.data || {};
   if (d.type === 'levain-token' && typeof d.token === 'string') {
-    e.waitUntil(kv('readwrite', (s) => s.put(d.token, 'token')));
+    const header = HEADERS.includes(d.header) ? d.header : HEADERS[0];
+    e.waitUntil(kv('readwrite', (s) => { s.put(header, 'header'); return s.put(d.token, 'token'); }));
   }
 });
 
@@ -68,9 +71,11 @@ self.addEventListener('notificationclick', (e) => {
     const timer = setTimeout(() => ctl.abort(), 4000);
     try {
       const token = await kv('readonly', (s) => s.get('token'));
+      const named = await kv('readonly', (s) => s.get('header'));
+      const header = HEADERS.includes(named) ? named : HEADERS[0];
       const r = await fetch('/webpush/opened', {
         method: 'POST',
-        headers: Object.assign({ 'Content-Type': 'application/json' }, token ? { 'X-Levain-Phone-Token': token } : {}),
+        headers: Object.assign({ 'Content-Type': 'application/json' }, token ? { [header]: token } : {}),
         body: JSON.stringify({ ping: data.ping }),
         signal: ctl.signal,
       });
