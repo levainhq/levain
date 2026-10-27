@@ -714,3 +714,22 @@ def test_an_unconfirmed_login_never_sets_aside_a_link_from_the_tree(tmp_path):
     assert end_session(w.facts, w.seams(ctl), record_state=REVOKED) == HELD
     assert ctl.failed_step == "park" and any("keep-occupied" in n for n in w.notes)
     assert not os.path.lexists(unconfirmed(w)) and where(w)["keep"] == "old"
+
+
+# --- the init step's redo (1027-19 RULINGS "G2 L3 r1": replay finishes every durability step the original run owed) ----
+
+
+@pytest.mark.parametrize("redo", [False, True])
+def test_the_init_step_fsyncs_l_retained_before_the_tree_moves_in_on_a_redo_too(tmp_path, monkeypatch, redo):
+    """``retained/<s>/`` made by a crashed run may have its entry in ``L/retained/`` unsynced; the redo finds the
+    directory there, and must still fsync ``L/retained/`` before the retain steps move the live tree into it. The
+    power loss itself cannot be simulated; what is asserted is the fsync call."""
+    w = login_world(tmp_path)
+    if redo:
+        os.mkdir(w.facts.retained, 0o700)           # what the crashed run's init step left
+    else:
+        assert not w.facts.retained.exists()
+    log = _trace_sync(monkeypatch)
+    end_mod._init_step(w.facts, w.seams(Control()))
+    monkeypatch.undo()
+    assert _ino(w.facts.retained.parent) in {v for k, v in log if k == "sync"}, "L/retained/ not fsynced"

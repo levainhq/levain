@@ -1439,16 +1439,17 @@ def send_cas(seams: EndSeams, target: str, fields: Mapping[str, object]) -> None
 
 def _init_step(facts: EndFacts, seams: EndSeams) -> None:
     """A fresh ``L/retained/<s>/`` (root 0700). Redone after a crash: an existing one is accepted only
-    when it is a real directory with the right owner holding no ``tree`` yet."""
+    when it is a real directory with the right owner holding no ``tree`` yet. The parent's fsync runs on a redo
+    too: the crashed run may have made ``retained/<s>/`` and died before syncing its entry."""
     try:
         os.mkdir(facts.retained, 0o700)
-        fsync_dir(facts.retained.parent)
     except FileExistsError:
         st = os.lstat(facts.retained)
         if not stat.S_ISDIR(st.st_mode) or not seams.owner_ok(st):
             raise Refused("bad-root", f"{facts.retained} is not a directory with the expected owner") from None
         if os.path.lexists(facts.tree):
             raise Refused("retained-exists", str(facts.tree)) from None
+    fsync_dir(facts.retained.parent)
     os.chmod(facts.retained, 0o700)   # a real directory, checked above or just made
     if not os.path.isdir(facts.live):
         raise Refused("live-missing", str(facts.live))
