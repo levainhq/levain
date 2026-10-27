@@ -20,6 +20,8 @@ GUARD = [{"rationale": "spoofed sender", "kill_predicate": {"op": "==", "field":
           "kill_drill": {"dmarc": "fail"}}]
 GRANT = {"born": 1, "id": "g1", "incarnation": "1:inc",
          "terms_text": json.dumps({"kind": "graduation", "id": "g1", "guard": GUARD})}
+GRANT2 = {"born": 1, "id": "g2", "incarnation": "1:inc",
+          "terms_text": json.dumps({"kind": "graduation", "id": "g2", "guard": GUARD})}
 COVER = "1:inc@c1"
 FENCE = "fence-1"
 
@@ -56,9 +58,10 @@ def world(tmp_path):
     return RunJournal(s.AutonomicStore3(tmp_path / "store")), Receipts()
 
 
-def fire(rc: Receipts, run_id: str, *, by="on-loop", posture="ON_LOOP", grant=None, cover=None, revalidate=None):
-    return V3Fire(by=by, posture=posture, grant=grant, cover=cover, revalidate=revalidate, end_receipt=rc.end,
-                  run_receipt=rc.run(run_id))
+def fire(rc: Receipts, run_id: str, *, by="on-loop", posture="ON_LOOP", grant=None, cover=None, revalidate=None,
+         end_receipt=None, run_receipt=None):
+    return V3Fire(by=by, posture=posture, grant=grant, cover=cover, revalidate=revalidate,
+                  end_receipt=end_receipt or rc.end, run_receipt=run_receipt or rc.run(run_id))
 
 
 def effect(j, rc, run_id, effect_id="link-0", *, fn=lambda: "sent", digest="d", needs_decision=False,
@@ -176,6 +179,42 @@ def test_an_executor_that_raises_ends_unknown_with_its_receipt_and_is_poisoned(w
     assert effect(j, rc, "r1").status is EffectStatus.POISONED
 
 
+@pytest.mark.parametrize("verdict", ["hold_open", "hold_denied", "digest_changed"])
+def test_a_revalidate_refusal_never_reads_as_a_hold_refusal(world, verdict):
+    # F3 (codex MED): the caller's revalidate saying a hold refusal's word is still the caller's refusal (STALE, or
+    # REOPENED on an approved hold), never the store hold's (nothing cancelled, no hold invented)
+    j, rc = world
+    start(j)
+    out = effect(j, rc, "r1", revalidate=lambda conn: verdict)
+    assert out.status is EffectStatus.STALE and out.why == verdict and out.hold_id is None
+    assert rows(j) == [] and cancel_of(j) is None
+    assert effect(j, rc, "r1").status is EffectStatus.DONE
+    start(j, "r2")
+    effect(j, rc, "r2", needs_decision=True)
+    assert j.decide(hold_id_for("r2", "link-0"), approve=True, digest="d", by="on-loop", posture="ON_LOOP").ok
+    out = effect(j, rc, "r2", authorize=ok, revalidate=lambda conn: verdict)
+    assert out.status is EffectStatus.REOPENED and out.why == verdict and cancel_of(j, "r2") is None
+    assert j.get_hold(hold_id_for("r2", "link-0"))["decided"] is None
+
+
+def test_intent_in_types_its_refusals_by_who_refused(world):
+    j, rc = world
+    start(j)
+    with j.db.write() as c:
+        got = J.intent_in(c, "r1", "link-0", digest="d", by="on-loop", posture="ON_LOOP",
+                          revalidate=lambda conn: "hold_denied")
+    assert type(got) is J.RevalidateRefusal and got == "hold_denied"
+    with j.db.write() as c:   # a revalidate cannot speak as the hold, even with the hold's type
+        got = J.intent_in(c, "r1", "link-0", digest="d", by="on-loop", posture="ON_LOOP",
+                          revalidate=lambda conn: J.HoldRefusal("hold_denied"))
+    assert type(got) is J.RevalidateRefusal and got == "hold_denied"
+    j.hold("r1", "link-0", digest="d", pending={"pending_id": "p1"})
+    with j.db.write() as c:
+        got = J.intent_in(c, "r1", "link-0", digest="d", by="on-loop", posture="ON_LOOP",
+                          revalidate=lambda conn: "never asked")
+    assert type(got) is J.HoldRefusal and got == "hold_open"
+
+
 def test_a_revalidate_refusal_writes_nothing_and_does_not_start_the_run(world):
     j, rc = world
     start(j)
@@ -205,7 +244,15 @@ def test_an_effect_whose_receipt_cannot_be_built_is_refused_before_it_fires(worl
     assert calls == [] and rows(j) == []
 
 
-def test_a_fired_effect_whose_receipt_cannot_be_built_is_poisoned_never_fired_again(world):
+def result_of(j, run_id="r1", effect_id="link-0"):
+    with j.db.read() as c:
+        return c.execute("SELECT result FROM effects WHERE run_id = ? AND effect_id = ? ORDER BY attempt DESC",
+                         (run_id, effect_id)).fetchone()[0]
+
+
+def test_a_fired_effect_whose_receipt_cannot_be_built_closes_outcome_unknown_never_fired_again(world):
+    # F1 (L3 r1 codex HIGH): the effect ran, so its attempt ends with the outcome_unknown receipt built at admission,
+    # and the row says the outcome was not recorded; never left `intent` unreceipted
     j, rc = world
     start(j)
 
@@ -215,16 +262,88 @@ def test_a_fired_effect_whose_receipt_cannot_be_built_is_poisoned_never_fired_ag
         return rc.end(e)
 
     calls = []
-    v3 = V3Fire(by="on-loop", posture="ON_LOOP", end_receipt=end, run_receipt=rc.run("r1"))
     with pytest.raises(RuntimeError, match="receipt store down"):
-        j.effect("r1", "link-0", digest="d", fence=FENCE, fence_now=lambda c: FENCE, fn=lambda: calls.append(1), v3=v3)
-    assert rows(j) == [("link-0", 1, "intent", None)]
+        effect(j, rc, "r1", fn=lambda: calls.append(1), end_receipt=end)
+    [(_, attempt, state, rid)] = rows(j)
+    assert (attempt, state) == (1, "unknown") and rid is not None and receipt_mode(j, rid) == "outcome_unknown"
+    assert result_of(j) == "outcome_unrecorded:RuntimeError:receipt store down"
     assert effect(j, rc, "r1", fn=lambda: calls.append(1)).status is EffectStatus.POISONED
     assert calls == [1]
     with pytest.raises(JournalConflictError, match="I2"):
         start(j, "r2")
         effect(j, rc, "r2")
         j.cancel("r2", reason="late", receipt=rc.run("r2")("late"))
+
+
+def test_a_fired_receipt_the_store_refuses_closes_outcome_unknown(world):
+    # F1: the fired receipt is built (its result-dependent part), but the store refuses its record: the same end
+    j, rc = world
+    start(j)
+
+    def end(e: EffectEnd) -> Receipt:
+        got = rc.end(e)
+        if not e.dry_run and e.terminal_state == "fired":
+            return Receipt(got.receipt_id, {**got.record, "subject": "effect:elsewhere:link-0"})
+        return got
+
+    with pytest.raises(JournalConflictError, match="I4/I10"):
+        effect(j, rc, "r1", end_receipt=end)
+    [(_, _, state, rid)] = rows(j)
+    assert state == "unknown" and receipt_mode(j, rid) == "outcome_unknown"
+    assert result_of(j).startswith("outcome_unrecorded:JournalConflictError:")
+
+
+def test_every_end_receipt_but_fired_is_built_at_admission_before_fn_runs(world):
+    # the construct: after fn the journal only selects a receipt built before it ran (the fired one excepted)
+    j, rc = world
+    start(j)
+    seen = []
+
+    def fn():
+        seen.extend((e.terminal_state, e.dry_run) for e in rc.ends)
+        rc.ends.clear()
+        return "sent"
+
+    assert effect(j, rc, "r1", fn=fn).status is EffectStatus.DONE
+    assert sorted(seen) == [("outcome_unknown", False), ("refused", False)]
+    assert [(e.terminal_state, e.dry_run) for e in rc.ends] == [("fired", False)]
+
+
+def test_a_done_effect_whose_attempt_another_close_ended_is_a_conflict_never_done(world):
+    # F5 (complement D2): the attempt was ended by another writer while fn ran: the caller is told, never handed DONE
+    # with that other close's receipt
+    j, rc = world
+    start(j)
+
+    def fn():
+        with j.db.write() as c:
+            other = rc.end(EffectEnd("r1", "link-0", 1, "effect:r1:link-0", "unknown", "outcome_unknown",
+                                     {"floor": [], "grant_guard": []}))
+            J.close_effect_in(c, "r1", "link-0", state="unknown", receipt=other, attempt=1)
+        return "sent"
+
+    with pytest.raises(JournalConflictError, match="ended by another close"):
+        effect(j, rc, "r1", fn=fn)
+    [(_, _, state, rid)] = rows(j)
+    assert state == "unknown" and receipt_mode(j, rid) == "outcome_unknown"
+    assert effect(j, rc, "r1").status is EffectStatus.POISONED
+
+
+def test_a_not_started_attempt_another_close_ended_is_a_conflict_never_held(world):
+    # F5's twin on the not_started end: HELD would invite a retry the link (now ended) can never admit
+    j, rc = world
+    start(j)
+
+    def fn():
+        with j.db.write() as c:
+            other = rc.end(EffectEnd("r1", "link-0", 1, "effect:r1:link-0", "unknown", "outcome_unknown",
+                                     {"floor": [], "grant_guard": []}))
+            J.close_effect_in(c, "r1", "link-0", state="unknown", receipt=other, attempt=1)
+        raise EffectNotStarted("spawn refused")
+
+    with pytest.raises(JournalConflictError, match="did not start, but it was ended by another close"):
+        effect(j, rc, "r1", fn=fn)
+    assert [r[2] for r in rows(j)] == ["unknown"]
 
 
 # ---- a held link: approve, deny ----------------------------------------------------------------------------------------
@@ -312,20 +431,28 @@ def test_a_not_started_attempt_closes_receipted_and_the_retry_carries_its_held_a
         seals = [json.loads(x) for (x,) in c.execute("SELECT seal FROM effects ORDER BY attempt")]
     assert seals[0] == seals[1] and seals[1]["decision"] == {"generation": 1, "by": "on-loop",
                                                              "posture": "COOLING_OFF"}
-    assert [e.subject for e in rc.ends] == ["effect:r1:link-0", "effect:r1:link-0#2"]
+    assert [e.subject for e in rc.ends if e.terminal_state == "fired"] == ["effect:r1:link-0#2"]
+    with j.db.read() as c:
+        assert c.execute("SELECT subject FROM gate_receipts WHERE receipt_id = ?", (rid,)).fetchone()[0] \
+            == "effect:r1:link-0"
     again = effect(j, rc, "r1", fn=lambda: "twice", **auth)      # the link reads at its latest attempt: done
     assert again.status is EffectStatus.REPLAYED and again.result == "sent" and again.receipt_id == out.receipt_id
 
 
-def test_a_holdless_retry_with_weaker_authority_is_refused_by_the_store(world):
+AUTH = dict(by="binding", posture="COOLING_OFF", grant=GRANT, cover=COVER)
+
+
+@pytest.mark.parametrize("weaker", [dict(by="on-loop"), dict(by="human"), dict(posture="ON_LOOP"), dict(grant=GRANT2),
+                                    dict(cover="1:inc@c2")], ids=["by-on-loop", "by-human", "posture", "grant", "cover"])
+def test_a_holdless_retry_with_weaker_authority_is_refused_by_the_store(world, weaker):
+    # complement D3 + codex J4: every field of the predecessor's authority binds the hold-less retry
     j, rc = world
     start(j)
-    assert effect(j, rc, "r1", fn=_not_yet, by="binding", posture="COOLING_OFF", grant=GRANT,
-                  cover=COVER).status is EffectStatus.HELD
+    assert effect(j, rc, "r1", fn=_not_yet, **AUTH).status is EffectStatus.HELD
     with pytest.raises(JournalConflictError, match="R3-1/R3-2"):
-        effect(j, rc, "r1", by="binding", posture="COOLING_OFF", grant=GRANT, cover="1:inc@c2")
-    assert effect(j, rc, "r1", by="binding", posture="COOLING_OFF", grant=GRANT,
-                  cover=COVER).status is EffectStatus.DONE
+        effect(j, rc, "r1", **{**AUTH, **weaker})
+    assert rows(j)[-1][1:3] == (1, "not_started")
+    assert effect(j, rc, "r1", **AUTH).status is EffectStatus.DONE
 
 
 def test_not_started_attempts_at_the_held_bound_close_the_run(world):
@@ -339,6 +466,39 @@ def test_not_started_attempts_at_the_held_bound_close_the_run(world):
     assert out.status is EffectStatus.CANCELLED and out.why == "held_limit:not_started:spawn refused"
     assert cancel_of(j)[0] == "held_limit:not_started:spawn refused"
     assert len(rows(j)) == limit and effect(j, rc, "r1").status is EffectStatus.CANCELLED
+
+
+def test_the_held_limit_run_receipt_is_built_at_admission_and_a_failing_builder_refuses_the_attempt(world):
+    # F2 (complement D1 + deepseek MED): the run receipt the bound needs is built, and its close dry-run, before fn
+    # runs; a builder that raises refuses the attempt there, so the not_started close can never roll back after fn
+    j, rc = world
+    start(j)
+    with j.db.read() as c:
+        limit = s.held_limit(c)
+    built, broken = [], [True]
+
+    def run_receipt(reason):
+        if broken[0]:
+            built.append(None)
+            raise RuntimeError("run receipt store down")
+        got = rc.run("r1")(reason)
+        built.append(got.receipt_id)
+        return got
+
+    for n in range(1, limit):
+        assert effect(j, rc, "r1", fn=_not_yet, run_receipt=run_receipt).status is EffectStatus.HELD
+    assert built == []                     # built only for the attempt whose not_started would reach the bound
+    calls = []
+    with pytest.raises(s.CloseUnbuildable, match="held_limit"):
+        effect(j, rc, "r1", fn=lambda: calls.append(1) or _not_yet(), run_receipt=run_receipt)
+    assert calls == [] and [r[2] for r in rows(j)] == ["not_started"] * (limit - 1) and cancel_of(j) is None
+    broken[0] = False
+    built.clear()
+    out = effect(j, rc, "r1", fn=lambda: calls.append(1) or _not_yet(), run_receipt=run_receipt)
+    assert out.status is EffectStatus.CANCELLED and calls == [1] and len(built) == 1
+    reason, rid = cancel_of(j)
+    assert reason == "held_limit:not_started:spawn refused" and rid == built[0]   # the receipt built at admission
+    assert receipt_mode(j, rid) == "refused"
 
 
 def test_an_empty_not_started_reason_still_closes_the_attempt(world):

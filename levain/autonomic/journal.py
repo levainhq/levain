@@ -71,7 +71,7 @@ import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -88,7 +88,7 @@ __all__ = [
     "Terminal", "Receipt", "Closed", "close_run_in", "close_unstarted", "close_effect_in", "decide_in",
     "unprojected_receipts", "mark_projected", "poisoned_in", "approved_unrun_in",
     "EffectRow", "latest_effect", "effect_attempt", "effect_seal_in", "intent_in", "NotStarted", "close_not_started_in",
-    "run_seal", "EffectEnd", "V3Fire",
+    "run_seal", "EffectEnd", "V3Fire", "HoldRefusal", "RevalidateRefusal",
 ]
 
 _log = logging.getLogger(__name__)
@@ -790,9 +790,16 @@ class RunJournal:
         insert), then the run's ``started_at`` (D71: set with its first intent, once), then the lease, then the insert
         of the attempt sealed with the caller's authority (the store's triggers judge it). After the insert, the dry run
         of every end the attempt can have (R13-8 / R14-3, :func:`~levain.autonomic.schema3.dry_run_close`): an attempt
-        whose receipt cannot be built is refused here, before it fires. A refusal is read as ``authorize``'s answers
-        are (:meth:`_refused3`)."""
-        from levain.autonomic.schema3 import CLOSE_STATES, dry_run_close, effect_subject, utc_text
+        whose receipt cannot be built is refused here, before it fires. A refusal is read by who made it
+        (:meth:`_refused3`).
+
+        Every receipt an end may need is BUILT here, before ``fn`` runs, and held in the :class:`_Admitted3` (R15-5 S1
+        fix round 1): the ``outcome_unknown`` and the ``refused`` (not_started) receipts, and the run's
+        ``held_limit`` receipt when this attempt's not_started close would reach the held bound. The dry run closes
+        with exactly those receipts; only the ``fired`` receipt, whose record depends on the result, is built after
+        ``fn`` (and checked here by a ``dry_run`` build). A builder that raises refuses the attempt
+        (:class:`~levain.autonomic.schema3.CloseUnbuildable`), nothing written."""
+        from levain.autonomic.schema3 import CLOSE_STATES, CloseUnbuildable, dry_run_close, effect_subject, utc_text
 
         def admit(c: sqlite3.Connection) -> str | None:
             refused = v3.revalidate(c) if v3.revalidate is not None else None
@@ -809,23 +816,72 @@ class RunJournal:
         seal = json.loads(effect_attempt(conn, run_id, effect_id, got).seal)  # type: ignore[union-attr, arg-type]
         adm = _Admitted3(taken[-1], run_id, effect_id, got, effect_subject(run_id, effect_id, got), seal)
         ends = dict(CLOSE_STATES["effect"])   # terminal_state -> the row's end
-        dry_run_close(conn, adm.subject, lambda ts: v3.end_receipt(adm.end(ends[ts], ts, dry_run=True)).record)
-        return adm
+        built: dict[str, Receipt] = {}
+
+        def record_for(ts: str) -> dict:
+            # the fired receipt is result-dependent: a dry_run build, rebuilt after fn. Every other end's receipt is
+            # built once, here, and kept: the dry run closes with the receipt the end will carry
+            if ts == "fired":
+                return _receipt_of(v3.end_receipt(adm.end(ends[ts], ts, dry_run=True))).record
+            built[ts] = _receipt_of(v3.end_receipt(adm.end(ends[ts], ts)))
+            return built[ts].record
+
+        dry_run_close(conn, adm.subject, record_for)
+        adm = replace(adm, unknown=built["outcome_unknown"], not_started=built["refused"])
+        return replace(adm, held_limit=self._held_limit_receipt(conn, adm, v3, CloseUnbuildable))
+
+    @staticmethod
+    def _held_limit_receipt(conn: sqlite3.Connection, adm: _Admitted3, v3: V3Fire,
+                            unbuildable: type[Exception]) -> Receipt | None:
+        """F2: the run receipt this attempt's not_started close would need at the held bound, built now, or None when
+        that close would not reach the bound. Decided by running the close itself (:func:`close_not_started_in`, the
+        kept ``refused`` receipt, the count, and at the bound the run close with the receipt built here) inside a
+        SAVEPOINT, then rolled back: the run close is dry-run on the exact receipt the real one carries. The receipt
+        is built with reason :data:`HELD_LIMIT_REASON` (the attempt's why is not known yet; the cancels row carries
+        it). A builder or store fault raises ``unbuildable`` (the admission rolls back whole)."""
+        kept: list[Receipt] = []
+
+        def build(reason: str) -> Receipt:
+            kept.append(_receipt_of(v3.run_receipt(HELD_LIMIT_REASON)))
+            return kept[-1]
+
+        conn.execute("SAVEPOINT held_limit_dry_run")
+        try:
+            close_not_started_in(conn, adm.run_id, adm.effect_id, adm.attempt, why="dry_run",
+                                 receipt=adm.not_started, run_receipt=build)  # type: ignore[arg-type]
+        except BaseException as e:
+            try:
+                conn.execute("ROLLBACK TO held_limit_dry_run")
+                conn.execute("RELEASE held_limit_dry_run")
+            except sqlite3.Error as undo:
+                # a fault that rolled the transaction back took the savepoint with it (as dry_run_close's undo)
+                _log.warning("run journal: held_limit dry run not undone after %s: %s", type(e).__name__, undo)
+            if isinstance(e, Exception):
+                raise unbuildable(f"close_unbuildable:held_limit:{type(e).__name__}:{e}") from e
+            raise
+        conn.execute("ROLLBACK TO held_limit_dry_run")
+        conn.execute("RELEASE held_limit_dry_run")
+        return kept[0] if kept else None
 
     def _refused3(self, conn: sqlite3.Connection, run_id: str, hold_id: str, refused: str, approved: bool,
                   v3: V3Fire) -> EffectOutcome | object:
-        """What an :func:`intent_in` refusal stops, nothing inserted. Its hold checks: ``hold_open`` HELD,
-        ``hold_denied`` CANCELLED, ``digest_changed`` the run cancelled (as :meth:`_admit_in` does). A
-        ``v3.revalidate`` refusal in ``authorize``'s grammar: :data:`RECHECK` checks again, ``unavailable:<why>`` is
-        HELD, anything else REOPENS an approved hold (REOPENED) and is STALE (decide it again) for an effect with
-        none. The journal applies the caller's verdict; it never makes one."""
-        if refused == "hold_open":
-            return EffectOutcome(EffectStatus.HELD, hold_id=hold_id)
-        if refused == "hold_denied":
-            return EffectOutcome(EffectStatus.CANCELLED)
-        if refused == "digest_changed":
-            self._cancel_in(conn, run_id, "digest_changed", v3.run_receipt)
-            return EffectOutcome(EffectStatus.CANCELLED)
+        """What an :func:`intent_in` refusal stops, nothing inserted, read by its type (who refused). A
+        :class:`HoldRefusal` (the link's hold): ``hold_open`` HELD, ``hold_denied`` CANCELLED, ``digest_changed`` the
+        run cancelled (as :meth:`_admit_in` does). A :class:`RevalidateRefusal` (``v3.revalidate``), in
+        ``authorize``'s grammar whatever its text: :data:`RECHECK` checks again, ``unavailable:<why>`` is HELD,
+        anything else REOPENS an approved hold (REOPENED) and is STALE (decide it again) for an effect with none. The
+        journal applies the caller's verdict; it never makes one."""
+        if type(refused) is HoldRefusal:
+            if refused == "hold_open":
+                return EffectOutcome(EffectStatus.HELD, hold_id=hold_id)
+            if refused == "hold_denied":
+                return EffectOutcome(EffectStatus.CANCELLED)
+            if refused == "digest_changed":
+                self._cancel_in(conn, run_id, "digest_changed", v3.run_receipt)
+                return EffectOutcome(EffectStatus.CANCELLED)
+            raise AssertionError(f"intent_in refused with an unknown hold refusal {refused!r}")
+        if type(refused) is not RevalidateRefusal:
+            raise AssertionError(f"intent_in refused with an untyped refusal {refused!r}")
         if refused == RECHECK:
             return _RETRY
         if refused.startswith("unavailable:"):
@@ -886,11 +942,14 @@ class RunJournal:
     def _run_effect3(self, run_id: str, effect_id: str, fn: Callable[[], Any], adm: _Admitted3,
                      v3: V3Fire) -> EffectOutcome:
         """:meth:`_run_effect` on a ``/3`` store: ``fn`` outside any transaction, under the lease, then the attempt's
-        end and its receipt in one statement (:func:`close_effect_in`, receipt built by ``v3.end_receipt`` before the
-        write): ``done`` (receipt ``fired``), or ``unknown`` (``outcome_unknown``) when ``fn`` raised anything but
-        :class:`EffectNotStarted` (B1-3: the exception is raised again after the close). A receipt that cannot be
-        built or written leaves the attempt ``intent``: once the lease drops it reads POISONED, never fired twice. The
-        lease is released last."""
+        end and its receipt in one statement (:func:`close_effect_in`): ``done`` with the ``fired`` receipt
+        ``v3.end_receipt`` builds from the result, or ``unknown`` with the ``outcome_unknown`` receipt built at
+        admission when ``fn`` raised anything but :class:`EffectNotStarted` (B1-3: the exception is raised again after
+        the close). When the fired receipt cannot be built or written, the effect ran and its outcome is not
+        recorded: the attempt ends ``unknown`` with the admission's receipt, its row's result
+        ``outcome_unrecorded:<error>``, and that error is raised. Only a store that takes neither write leaves the
+        attempt ``intent`` (POISONED once the lease drops, never fired twice). An attempt another close already ended
+        is :class:`JournalConflictError`, never DONE with that close's receipt. The lease is released last."""
         try:
             try:
                 result = fn()
@@ -898,17 +957,29 @@ class RunJournal:
             except EffectNotStarted as e:
                 # B1-1 on /3: before the unknown branch below, which would poison an effect that never began
                 return self._not_started3(run_id, effect_id, adm, e, v3)
-            except BaseException as e:
-                receipt = v3.end_receipt(adm.end("unknown", "outcome_unknown", error=e))
+            except BaseException:
                 with self._write() as conn:
-                    close_effect_in(conn, run_id, effect_id, state="unknown", receipt=receipt, attempt=adm.attempt)
+                    close_effect_in(conn, run_id, effect_id, state="unknown", attempt=adm.attempt,
+                                    receipt=adm.unknown)  # type: ignore[arg-type]
                 raise
-            receipt = v3.end_receipt(adm.end("done", "fired", result=result))
-            with self._write() as conn:
-                closed = close_effect_in(conn, run_id, effect_id, state="done", receipt=receipt, result=result,
-                                         attempt=adm.attempt)
+            try:
+                receipt = _receipt_of(v3.end_receipt(adm.end("done", "fired", result=result)))
+                with self._write() as conn:
+                    closed = close_effect_in(conn, run_id, effect_id, state="done", receipt=receipt, result=result,
+                                             attempt=adm.attempt)
+            except BaseException as e:
+                # F1: past the point of no return; the receipt built before fn ran ends the attempt
+                with self._write() as conn:
+                    close_effect_in(conn, run_id, effect_id, state="unknown", attempt=adm.attempt,
+                                    why=f"outcome_unrecorded:{type(e).__name__}:{e}",
+                                    receipt=adm.unknown)  # type: ignore[arg-type]
+                raise
         finally:
             self._drop_lease(run_id, effect_id, adm.lease)
+        if closed.terminal is Terminal.LOST:
+            raise JournalConflictError(f"run journal {self.db.path}: {run_id}/{effect_id} attempt {adm.attempt} ran, "
+                                       f"but it was ended by another close (receipt {closed.receipt_id!r}) while in "
+                                       f"flight: its result {result!r:.200} is not recorded")
         return EffectOutcome(EffectStatus.DONE, result, receipt_id=closed.receipt_id)
 
     def _not_started3(self, run_id: str, effect_id: str, adm: _Admitted3, exc: EffectNotStarted,
@@ -918,16 +989,31 @@ class RunJournal:
         closes ``held_limit:not_started:<why>`` (:func:`close_not_started_in`, one write transaction). The caller holds
         the (run, effect) lease from the intent insert through this close (A4). Retried as :meth:`_not_started` is.
         HELD ``not_started:<why>`` (the next delivery admits the next attempt), or CANCELLED when the run is closed at
-        the bound. ``why`` is the exception's text, or its class name when that is empty."""
+        the bound. ``why`` is the exception's text, or its class name when that is empty. Both receipts are the ones
+        built at admission (:meth:`_intent3`): nothing here builds one, so no builder can roll the close back. An
+        attempt another close already ended is :class:`JournalConflictError`."""
         why = str(exc) or type(exc).__name__
         hold_id = hold_id_for(run_id, effect_id)
-        receipt = v3.end_receipt(adm.end("not_started", "refused", error=exc))
+
+        def run_receipt(reason: str) -> Receipt:
+            if adm.held_limit is None:
+                # the admission's dry run of this close did not reach the bound; only this link's not_started
+                # closes count it, and its lease is held, so a later close reaching it means the store moved under us
+                raise JournalConflictError(f"run journal {self.db.path}: {run_id}/{effect_id} attempt {adm.attempt} "
+                                           f"reached the held bound its admission did not ({reason})")
+            return adm.held_limit
+
         for attempt in range(1, _NOT_STARTED_TRIES + 1):
             try:
                 with self._write() as conn:
-                    got = close_not_started_in(conn, run_id, effect_id, adm.attempt, why=why, receipt=receipt,
-                                               run_receipt=v3.run_receipt)
+                    got = close_not_started_in(conn, run_id, effect_id, adm.attempt, why=why,
+                                               receipt=adm.not_started,  # type: ignore[arg-type]
+                                               run_receipt=run_receipt)
                     held = self._hold_row(conn, hold_id) is not None
+                if got.closed.terminal is Terminal.LOST:
+                    raise JournalConflictError(f"run journal {self.db.path}: {run_id}/{effect_id} attempt "
+                                               f"{adm.attempt} did not start, but it was ended by another close "
+                                               f"(receipt {got.closed.receipt_id!r}) while in flight")
                 if got.run_closed is not None:
                     return EffectOutcome(EffectStatus.CANCELLED, hold_id=hold_id if held else None,
                                          why=got.run_closed.reason)
@@ -1103,8 +1189,10 @@ class EffectEnd:
     """One end of a ``/3`` effect attempt, what its receipt is built from (:attr:`V3Fire.end_receipt`): the attempt
     and its receipt subject, the row's end (``done`` | ``unknown`` | ``not_started``) and its receipt terminal_state
     (``fired`` | ``outcome_unknown`` | ``refused``), the attempt's seal (its ``floor`` / ``grant_guard`` are what the
-    receipt must carry: ``receipts_carry_guard``), what ``fn`` returned or raised, and ``dry_run`` for the admission's
-    check that every end can be written (nothing is kept)."""
+    receipt must carry: ``receipts_carry_guard``), and for ``fired`` what ``fn`` returned. The ``outcome_unknown`` and
+    ``refused`` receipts are built at admission, before ``fn`` runs, and kept for the end (``result`` None); ``fired``
+    is built after ``fn`` with its ``result``, and once at admission with ``dry_run`` True (that receipt is checked
+    and dropped)."""
     run_id: str
     effect_id: str
     attempt: int
@@ -1113,7 +1201,6 @@ class EffectEnd:
     terminal_state: str
     seal: dict[str, Any]
     result: Any = None
-    error: BaseException | None = None
     dry_run: bool = False
 
 
@@ -1122,9 +1209,11 @@ class V3Fire:
     """What a ``/3`` effect admission takes from its caller (:meth:`RunJournal.effect`). The journal never decides
     authority: ``by`` (the receipt actor), ``posture`` (the rung it fires at), ``grant`` and ``cover`` are sealed as
     given (:func:`effect_seal_in`) and the store's triggers judge them. ``revalidate(conn)`` runs in the admission's
-    transaction before the insert (R2-6): None admits, a string refuses in ``authorize``'s grammar. ``end_receipt``
-    builds an end's receipt; ``run_receipt(reason)`` the receipt of a run close the journal makes itself (a changed
-    digest, the held bound)."""
+    transaction before the insert (R2-6): None admits, a string refuses in ``authorize``'s grammar (whatever its text:
+    :class:`RevalidateRefusal`). ``end_receipt`` builds an end's receipt (:class:`EffectEnd`); ``run_receipt(reason)``
+    the receipt of a run close the journal makes itself: a changed digest (at admission), and the held bound, built
+    at admission with reason :data:`HELD_LIMIT_REASON` when the attempt's not_started would reach it. Every builder
+    returns a fresh receipt id per call."""
     by: str
     posture: str
     end_receipt: Callable[[EffectEnd], Receipt]
@@ -1134,20 +1223,43 @@ class V3Fire:
     revalidate: Callable[[sqlite3.Connection], str | None] | None = None
 
 
+# the reason a held_limit run receipt is built with, at admission (the attempt's why is the cancels row's)
+HELD_LIMIT_REASON = "held_limit:not_started"
+
+
+def _receipt_of(got: object) -> Receipt:
+    if not isinstance(got, Receipt):
+        raise TypeError(f"a receipt builder returned {type(got).__name__}, not a Receipt")
+    return got
+
+
+class HoldRefusal(str):
+    """An :func:`intent_in` refusal made by the link's hold: ``hold_open``, ``hold_denied`` or ``digest_changed``."""
+
+
+class RevalidateRefusal(str):
+    """An :func:`intent_in` refusal made by its caller's ``revalidate``, its text as returned (a text that spells a
+    :class:`HoldRefusal` is still the caller's)."""
+
+
 @dataclass(frozen=True)
 class _Admitted3:
-    """An admitted ``/3`` attempt: its lease fd, link, attempt number, receipt subject and seal."""
+    """An admitted ``/3`` attempt: its lease fd, link, attempt number, receipt subject and seal, and the receipts its
+    ends carry, built at admission (:meth:`RunJournal._intent3`): ``unknown`` (``outcome_unknown``), ``not_started``
+    (``refused``), and ``held_limit`` (the run's, None when this attempt's not_started would not reach the bound)."""
     lease: int
     run_id: str
     effect_id: str
     attempt: int
     subject: str
     seal: dict[str, Any]
+    unknown: Receipt | None = None
+    not_started: Receipt | None = None
+    held_limit: Receipt | None = None
 
-    def end(self, state: str, terminal_state: str, *, result: Any = None, error: BaseException | None = None,
-            dry_run: bool = False) -> EffectEnd:
+    def end(self, state: str, terminal_state: str, *, result: Any = None, dry_run: bool = False) -> EffectEnd:
         return EffectEnd(self.run_id, self.effect_id, self.attempt, self.subject, state, terminal_state, self.seal,
-                         result=result, error=error, dry_run=dry_run)
+                         result=result, dry_run=dry_run)
 
 
 @dataclass(frozen=True)
@@ -1232,13 +1344,17 @@ _EFFECT_ENDS = {"done": "fired", "unknown": "outcome_unknown"}
 
 
 def close_effect_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, state: str, receipt: Receipt,
-                    result: Any = None, attempt: int | None = None) -> Closed:
+                    result: Any = None, attempt: int | None = None, why: str | None = None) -> Closed:
     """End an ``intent`` effect ``done`` (with ``result``, JSON-encoded here) or ``unknown``, with its receipt, in
-    the caller's write transaction. ``attempt`` names the attempt (O-p2-1); None is the link's latest, the only one
-    that can be ``intent``. The receipt's subject is that attempt's (:func:`~levain.autonomic.schema3.effect_subject`).
-    LOST when the attempt already ended. ``KeyError`` when it has no row."""
+    the caller's write transaction. ``why`` is an ``unknown`` row's result text (what is known of that end, e.g. an
+    outcome not recorded); a ``done`` takes none. ``attempt`` names the attempt (O-p2-1); None is the link's latest,
+    the only one that can be ``intent``. The receipt's subject is that attempt's
+    (:func:`~levain.autonomic.schema3.effect_subject`). LOST when the attempt already ended. ``KeyError`` when it has
+    no row."""
     if state not in _EFFECT_ENDS:
         raise ValueError(f"close_effect_in: state {state!r} is not done or unknown")
+    if why is not None and (state != "unknown" or not isinstance(why, str)):
+        raise ValueError(f"close_effect_in: why {why!r} is an unknown end's text")
     from levain.autonomic.schema3 import effect_subject
     effect_subject(run_id, effect_id)      # refuses a run id holding a colon, before any read
     row = latest_effect(conn, run_id, effect_id) if attempt is None else effect_attempt(conn, run_id, effect_id, attempt)
@@ -1246,7 +1362,7 @@ def close_effect_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, st
         raise KeyError(f"effect {run_id}/{effect_id} was never admitted")
     if row.state != "intent":
         return Closed(Terminal.LOST, row.receipt_id)
-    encoded = json.dumps(result) if state == "done" else None
+    encoded = json.dumps(result) if state == "done" else why
     return _close_in(conn, effect_subject(run_id, effect_id, row.attempt), receipt, state=state, result=encoded)
 
 
@@ -1333,16 +1449,19 @@ def _check_actor(by: object, posture: object) -> None:
 
 def intent_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, digest: str, by: str, posture: str,
               grant: dict[str, Any] | None = None, cover: str | None = None,
-              revalidate: Callable[[sqlite3.Connection], str | None] | None = None) -> int | str:
+              revalidate: Callable[[sqlite3.Connection], str | None] | None = None
+              ) -> int | HoldRefusal | RevalidateRefusal:
     """Admit the link's next attempt, in the caller's write transaction: attempt 1 for a link with no row, else the
     latest attempt + 1 (the store admits a retry only after a counted ``not_started``). R2-6: ``revalidate(conn)``
     (the admission's re-check of authority and the risk fence) runs BEFORE the insert; a refusal (any string) is
     returned with nothing written, so the hold may still reopen (``holds_move`` refuses a reopen once a row of the link
-    is not ``not_started``). Returns the attempt number inserted, sealed by :func:`effect_seal_in`.
+    is not ``not_started``), as a :class:`RevalidateRefusal` whatever its text. Returns the attempt number inserted,
+    sealed by :func:`effect_seal_in`.
 
     Before that, for ANY attempt, a link with a hold is refused with nothing written unless every hold of the link is
     decided APPROVE for ``digest`` (O-p2-1 fix round 1 G1; the store's ``effects_held_link`` refuses the same insert
-    for every attempt): ``hold_open`` (undecided), ``hold_denied``, or ``digest_changed`` (the /2 admission cancels
+    for every attempt), as a :class:`HoldRefusal`: ``hold_open`` (undecided), ``hold_denied``, or ``digest_changed``
+    (the /2 admission cancels
     its run for that one; here the caller does). An id :func:`~levain.autonomic.schema3.effect_subject` refuses is its
     ``ValueError``, before any read, and so is an actor or posture :func:`_check_actor` refuses (int-I2)."""
     from levain.autonomic.schema3 import effect_subject
@@ -1351,17 +1470,17 @@ def intent_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, digest: 
     for decided, held_digest in conn.execute("SELECT decided, digest FROM holds WHERE run_id = ? AND effect_id = ?",
                                              (run_id, effect_id)).fetchall():
         if decided is None:
-            return "hold_open"
+            return HoldRefusal("hold_open")
         if decided != 1:
-            return "hold_denied"
+            return HoldRefusal("hold_denied")
         if held_digest != digest:
-            return "digest_changed"
+            return HoldRefusal("digest_changed")
     latest = latest_effect(conn, run_id, effect_id)
     attempt = 1 if latest is None else latest.attempt + 1
     if revalidate is not None:
         refused = revalidate(conn)
         if refused is not None:
-            return refused
+            return RevalidateRefusal(str(refused))   # str() drops any subclass: the caller cannot speak as the hold
     seal = effect_seal_in(conn, run_id, effect_id, by=by, posture=posture, grant=grant, cover=cover)
     conn.execute("INSERT INTO effects (run_id, effect_id, attempt, digest, pid, state, seal) "
                  "VALUES (?, ?, ?, ?, ?, 'intent', ?)", (run_id, effect_id, attempt, digest, os.getpid(), seal))

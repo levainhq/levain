@@ -261,7 +261,7 @@ LAZY_SITES = {
     'levain/autonomic/journal.py::effect_seal_in::from levain.autonomic.schema3 import hold_decision': 'root',
     # root: the same cycle and the same already-member target as ``_insert_receipt`` above (R15-5 S1)
     'levain/autonomic/journal.py::RunJournal.__init__::from levain.autonomic.schema3 import AutonomicStore3': 'root',
-    'levain/autonomic/journal.py::RunJournal._intent3::from levain.autonomic.schema3 import CLOSE_STATES, dry_run_close, effect_subject, utc_text': 'root',
+    'levain/autonomic/journal.py::RunJournal._intent3::from levain.autonomic.schema3 import CLOSE_STATES, CloseUnbuildable, dry_run_close, effect_subject, utc_text': 'root',
     'levain/cockpit/authority.py::RequestAuthority.capture::from levain import authority as auth': 'root',
     'levain/cockpit/authority.py::RequestAuthority.capture::from levain.cockpit.firejournal import UNINITIALISED, _meta, conn_init_hint': 'root',
     'levain/cockpit/authority.py::RequestAuthority.fence::from levain.cockpit.firejournal import authority_fence': 'root',
