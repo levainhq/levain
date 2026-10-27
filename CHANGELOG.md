@@ -7,6 +7,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **A passthrough login asks whether to keep that account as the slot's baseline.** Once
+  `levain session codex --auth passthrough --login` exits, Levain shows the account from its own session record (never
+  the session's terminal output) and asks whether to keep it. Codex has no server-checked identity, so the baseline
+  records it as "not a check". Claude logins are told the identity check is not built yet and write no baseline.
 - **The cockpit's Build tab has a Threads section.** It shows the coordinator's threads and one thread's stream in the
   order it happened, with running tool calls, approvals shown as a line pointing you to Needs you, and your own lines
   marked unverified. It needs the page's write token and is read-only for now.
