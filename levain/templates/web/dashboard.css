@@ -1589,6 +1589,11 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .masthead .jar, body.ke .masthead .stamp { order: 3; }
   body.ke .masthead .entity { display: none; }
 }
+/* Between the stacked breakpoint and the width where the labelled Calm button fits beside the name, Calm shows its icon; the label stays its accessible name (aria-label + title, set by the page) */
+@media (min-width: 1041px) and (max-width: 1280px) {
+  body.ke .masthead #calmbtn { font-size: 0; padding: var(--sp-3); }
+  body.ke .masthead #calmbtn::before { content: "\2248"; font-size: var(--fs-title); }
+}
 @media (max-width: 720px) {
   body.ke .band { grid-template-columns: 1fr; gap: var(--sp-4); }
   body.ke .band-state { padding-left: 0; border-left: 0; }

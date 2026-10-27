@@ -225,6 +225,29 @@ def test_the_jar_label_gives_way_before_the_name_does(tmp_path: Path, width: int
     assert got["nat"] - got["unitW"] <= 1, got                                 # while the name kept its whole width
 
 
+# the Calm control beside the name, from just above the stacked breakpoint to a wide bar (Verdana from 1100: its 1041 bar overflows on main too)
+CALM = ("(() => { const b = document.getElementById('calmbtn'), r = b.getBoundingClientRect(); b.focus();"
+        " return { label: getComputedStyle(b).fontSize, w: Math.round(r.width), name: b.getAttribute('aria-label'), title: b.title, focused: document.activeElement === b, shown: r.width > 0 }; })()")
+
+
+@needs_browser
+@pytest.mark.parametrize("font, width", [("", 1041), ("", 1100), ("", 1180), ("", 1280), ("", 1281), ("", 1340), ("", 1440),
+                                         (VERDANA, 1100), (VERDANA, 1180), (VERDANA, 1280), (VERDANA, 1340), (VERDANA, 1440)],
+                         ids=[f"{n}-{w}" for n, w in [("native", 1041), ("native", 1100), ("native", 1180), ("native", 1280), ("native", 1281), ("native", 1340), ("native", 1440),
+                                                      ("verdana", 1100), ("verdana", 1180), ("verdana", 1280), ("verdana", 1340), ("verdana", 1440)]])
+def test_calm_beside_the_name_never_overflows_the_bar_and_keeps_its_name_as_an_icon(tmp_path: Path, width: int, font: str) -> None:
+    out = _run(tmp_path, [{"eval": FULL_BAR % (font, NO_JAR)}, {"eval": CALM}], width=width)
+    geo, calm = out[-2], out[-1]
+    assert geo["sw"] <= geo["cw"] and geo["unitLeft"] >= geo["tabsRight"] and geo["readoutRight"] <= geo["mastRight"], geo
+    if width >= (1180 if font else 1100):
+        assert geo["unitW"] > 0, geo                                         # the name is not squeezed out entirely (it was at 1100 native with the labelled button)
+    assert calm["shown"] and calm["focused"] and calm["name"] in ("Calm off", "Calm on") and calm["title"] == calm["name"], calm
+    if width <= 1280:
+        assert calm["label"] == "0px", calm                                  # the icon form: the visible text is gone, the name stays
+    else:
+        assert calm["label"] != "0px" and calm["w"] > 60, calm               # wide enough for the labelled form
+
+
 @needs_browser
 def test_a_pinned_card_gets_no_move_control_and_every_move_control_shown_changes_the_order(tmp_path: Path) -> None:
     ORDER = "[...document.querySelectorAll('.ck-zgrid .panel')].map(p => p.dataset.ckPanel).join(',')"
