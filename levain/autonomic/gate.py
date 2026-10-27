@@ -195,6 +195,7 @@ class _Fence:
     # the policy that authorized the fire and its cover value (the fire check's), sealed on a /3 attempt
     grant: GraduationPolicy | None = None
     cover: str | None = None
+    effect: Effect | None = None    # what the grant was read for (its revalidation reads it again)
 
 
 def _authority_from(a: dict[str, Any]) -> AuthorityScope:
@@ -792,7 +793,7 @@ class EfferentGate:
             fence = None
             if request.run is not None:
                 # the fence: the very risk inputs this rung was just decided from
-                fence = self._forward_fence(request, manifest_risk, risk, cover, grant)
+                fence = self._forward_fence(request, manifest_risk, risk, cover, grant, clamped)
             return self._fire(
                 request=request, created_at=created_at, posture=posture,
                 verdict="auto", by=by, actor_first_estimate=request.actor_first_estimate,
@@ -1770,12 +1771,13 @@ class EfferentGate:
         return None
 
     def _forward_fence(self, request: ActionRequest, manifest_risk: ActionRisk | None,
-                       risk: ActionRisk, cover: str | None, grant: GraduationPolicy | None = None) -> _Fence:
+                       risk: ActionRisk, cover: str | None, grant: GraduationPolicy | None = None,
+                       effect: Effect | None = None) -> _Fence:
         """The fence of a journaled request fired on the forward path: the inputs its rung was decided
         from (the binding's risk the request carries, or for an action the manifest classifies alone, the
         manifest's entry, and the clamp's cover value when it was consulted), and how to read them again at
-        admission. ``grant`` is the policy the fire check read for that cover value (None when none ran): a ``/3``
-        attempt seals it with the cover."""
+        admission. ``grant`` is the policy the fire check read for that cover value, for ``effect`` (None when none
+        ran): a ``/3`` attempt seals it with the cover, and revalidates it in its admission (:meth:`_v3_fire`)."""
         assert request.run is not None
         with_binding = request.risk is not None
         value = _risk_fence(manifest_risk, risk if with_binding else None, cover)
@@ -1785,7 +1787,8 @@ class EfferentGate:
         clamped = cover is not None
         return _Fence(value, lambda conn: self._fence_now(conn, request.action_name, binding_id, effect_id,
                                                           chain, with_binding=with_binding, clamped=clamped),
-                      grant=grant, cover=cover if grant is not None else None)
+                      grant=grant, cover=cover if grant is not None else None,
+                      effect=effect if grant is not None else None)
 
     def _unattended_approval_allowed(self, pending: PendingAction, posture: Posture,
                                      now: _dt.datetime | None = None) -> bool:
@@ -2555,8 +2558,33 @@ class EfferentGate:
 
         run_receipt = self._request_cancels(request, created_at, posture)
         assert run_receipt is not None
+        effect = fence.effect if fence is not None else None
+        revalidate = None
+        if grant is not None and effect is not None:
+            def revalidate(conn: sqlite3.Connection) -> str | None:
+                return self._grant_refusal(grant, effect)
         return V3Fire(by=by, posture=posture.name, end_receipt=end_receipt, run_receipt=run_receipt,
-                      grant=self._grant_record(grant), cover=fence.cover if fence is not None else None)
+                      grant=self._grant_record(grant), cover=fence.cover if fence is not None else None,
+                      revalidate=revalidate)
+
+    def _grant_refusal(self, grant: GraduationPolicy, effect: Effect) -> str | None:
+        """RULINGS 1027-11 "R15-5" (revalidation): the grant a ``/3`` attempt seals, read again from current state in
+        the admission's write transaction (the journal's ``revalidate``, run before the insert; the signature check,
+        :meth:`_authorize_admission`, stays outside it). None while the coverage source still names this grant's
+        incarnation for ``effect`` and it has not expired; ``bad:grant_revoked`` / ``bad:grant_expired`` refuse
+        (STALE: decided again); ``unavailable:<why>`` when the source or the clock cannot be read (HELD)."""
+        try:
+            now = self._clock()
+            seen = self._coverage.peek_cover(effect, now) if self._coverage is not None else None
+            expired = now >= grant.expires_at
+        except Exception as e:  # noqa: BLE001 — a grant that cannot be read again authorizes nothing now
+            return f"unavailable:grant_unreadable:{type(e).__name__}"
+        policy_now = getattr(seen, "policy", None)
+        if not isinstance(policy_now, GraduationPolicy) or policy_now.incarnation != grant.incarnation:
+            return "bad:grant_revoked"
+        if expired:
+            return "bad:grant_expired"
+        return None
 
     def _replayed(self, request: ActionRequest, out: EffectOutcome, created_at: str) -> GateOutcome:
         """The outcome for an effect that already ran in this run: the RECORDED result, the executor

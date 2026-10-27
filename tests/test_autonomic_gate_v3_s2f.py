@@ -290,3 +290,78 @@ def test_f_an_integrity_reject_closes_the_run_with_its_receipt(tmp_path):
     assert out.refused and out.reason == "integrity:seal_mismatch" and out.receipt_id == rid and reason == "rejected"
     assert w.receipts.read() == []
 
+
+# ---- e: the grant is revalidated inside the admission's transaction ---------------------------------------------------
+from tests.autonomic_test_only_coverage import TestOnlyCoverage, policy as grant_policy  # noqa: E402
+
+_LATER = FIXED + _dt.timedelta(days=10)
+
+
+class _FenceBlindCoverage(TestOnlyCoverage):
+    """A source whose cover VALUE (what the risk fence digests at admission, ``peek``) stays the granted policy's
+    after a revoke, while ``peek_cover`` (the policy) moves: the interleaving only the grant's own revalidation sees."""
+
+    __test__ = False
+
+    def __init__(self, p) -> None:
+        super().__init__([p])
+        self._pinned = p.cover_value
+
+    def peek(self, effect, now):
+        return self._pinned
+
+
+def _granted_world(tmp_path, src) -> V3World:
+    w = V3World(tmp_path)
+    w.gate = EfferentGate(confirm_signers=confirm_signers(), manifest=w.gate._manifest, store=w.receipts,
+                          executor=w.gate._executor, clock=lambda: FIXED, transport=_Transport(),
+                          pending_store=w.pending, journal=w.journal, binding_risk=lambda b, i: w.tool_risk[i],
+                          coverage=src)
+    w.chains = ChainExecutor(gate=w.gate, request_builder=_chain_builder, trust_resolver=_trust,
+                             clock=lambda: FIXED, binding_store=w.store)
+    w.dispatcher = FireDispatcher(
+        store=w.store, gate=w.gate, predicate_match=lambda p, e: e.get("fields", {}).get(p["field"]) == p["value"],
+        request_builder=_single_builder, clock=lambda: FIXED, chain_executor=w.chains)
+    return w
+
+
+def _revoke_after_the_verify(w: V3World, src: TestOnlyCoverage, gid: str) -> None:
+    # the journal's _authorized (the check outside the write transaction) runs, then the revoke lands, then the
+    # admission's transaction
+    real = w.journal._authorized
+
+    def authorized(*a, **kw):
+        got = real(*a, **kw)
+        src.revoke(gid)
+        return got
+    w.journal._authorized = authorized
+
+
+def test_e_a_revoke_between_the_verify_and_the_transaction_never_fires(tmp_path):
+    src = TestOnlyCoverage([grant_policy("g1", {"link0": LOW}, expires_at=_LATER)])
+    w = _granted_world(tmp_path, src)
+    w.mint(chain=False)
+    _revoke_after_the_verify(w, src, "g1")
+    [out] = _gate_outcomes(w.dispatch("e1"))
+    assert not out.fired and out.held, out
+    assert w.outbox() == [] and w.q("SELECT * FROM effects") == []
+
+
+def test_e_a_revoke_the_fence_cannot_see_is_refused_by_the_revalidation(tmp_path):
+    src = _FenceBlindCoverage(grant_policy("g1", {"link0": LOW}, expires_at=_LATER))
+    w = _granted_world(tmp_path, src)
+    w.mint(chain=False)
+    _revoke_after_the_verify(w, src, "g1")
+    [out] = _gate_outcomes(w.dispatch("e1"))
+    assert not out.fired and out.reason == "journal:stale:grant_revoked", out
+    assert w.outbox() == [] and w.q("SELECT * FROM effects") == []
+
+
+def test_e_an_unrevoked_grant_fires_and_is_sealed(tmp_path):
+    src = TestOnlyCoverage([grant_policy("g1", {"link0": LOW}, expires_at=_LATER)])
+    w = _granted_world(tmp_path, src)
+    w.mint(chain=False)
+    [out] = _gate_outcomes(w.dispatch("e1"))
+    assert out.fired, out
+    [(seal,)] = w.q("SELECT seal FROM effects")
+    assert json.loads(seal)["grant"]["id"] == "g1"
