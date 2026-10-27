@@ -364,8 +364,13 @@ def test_forged_orphans_are_detected_and_the_reaper_adopts_each_adoptable_one(st
         [("receipt_without_terminal", x) for x in ("run:victim", "effect:v2:link-0", "run:v3", "run:v4", "run:v5")]
         + [("closing_left", "run:v4"), ("closing_left", "run:v5")])
     out = []
-    tx(c, lambda conn: out.append(s.reap_orphans(conn)))
-    assert out == [(["run:v4", "run:v5"], ["run:victim", "effect:v2:link-0", "run:v4", "run:v5"], ["run:v3"])]
+    tx(c, lambda conn: out.append(s.reap_orphans(conn, lease_held=lambda r, e: False)))
+    [(cleared, outcomes)] = out
+    assert cleared == ["run:v4", "run:v5"]
+    assert {k: v for k, v in outcomes.items() if v == s.ADOPTED} == dict.fromkeys(
+        ["run:victim", "effect:v2:link-0", "run:v4", "run:v5"], s.ADOPTED)
+    assert list(outcomes) == ["run:victim", "effect:v2:link-0", "run:v3", "run:v4", "run:v5"]
+    assert outcomes["run:v3"].startswith("unadoptable: I4")
     assert s.invariant(c) == [("receipt_without_terminal", "run:v3")]     # a fired run receipt: detected only
     with pytest.raises(sqlite3.IntegrityError, match="D69"):
         tx(c, lambda conn: s.close_subject(conn, subject="run:victim", record=rec("legit", "run:victim", "refused"),
