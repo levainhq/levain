@@ -49,7 +49,7 @@ class StoredGateReceipt:
 
 def _receipt_id(
     *, created_at: str, context_id: str, action_name: str, fired: bool, action_face: dict[str, Any],
-    subject: str | None = None,
+    subject: str | None = None, posture: str = "",
 ) -> str:
     """A stable, sortable, CONTENT-ADDRESSED id: ``<created_at>-<8hex>`` over the decision's identity
     (context + action + the gate verdict + ``fired``). Deterministic in inputs (testable); the
@@ -67,8 +67,10 @@ def _receipt_id(
     )
     if subject is not None:
         # autogrant r7.0: a receipt of a subject (a /3 store) has the subject in its basis, so two subjects never
-        # share an id
-        basis = f"{subject}\x00{basis}"
+        # share an id; and its terminal_state (R15-5 S2): the ends of one attempt are built together at admission, at
+        # one created_at with one verdict, and outcome_unknown and refused must not share one; and its posture
+        # (R15-5 S2 fix round 1 F1): two closes of one subject built at two rungs are two records
+        basis = f"{subject}\x00{action_face.get('terminal_state', '')}\x00{posture}\x00{basis}"
     h = hashlib.sha256(basis.encode()).hexdigest()[:8]
     return f"{created_at}-{h}"
 
@@ -81,7 +83,7 @@ def gate_record(*, created_at: str, action_name: str, proposal_id: str | None, p
     id's basis includes it. Without it the record is exactly :meth:`GateReceiptStore.append`'s."""
     context_id = str(action_face.get("context_id", ""))
     rid = _receipt_id(created_at=created_at, context_id=context_id, action_name=action_name, fired=fired,
-                      action_face=action_face, subject=subject)
+                      action_face=action_face, subject=subject, posture=posture.name)
     record: dict[str, Any] = {
         "id": rid,
         "kind": "gate",

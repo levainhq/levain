@@ -102,7 +102,7 @@ chaining. Delivery checks the head's shape, never the log (that is the apply's a
 
 The store is ``<levain home>/consent/queue.db``, opened through :mod:`levain.autonomic.durable_sqlite` (WAL,
 synchronous FULL); every write is one ``BEGIN IMMEDIATE``, serialized by SQLite. The directory is the
-operator's alone (0700, refused otherwise). A store of the previous format (:data:`PRIOR_FORMAT`) is migrated
+operator's alone (0700, refused otherwise). A store of an earlier format (:data:`MIGRATES_FROM`) is migrated
 in place on open, in one transaction, its rows unchanged; any other format is refused, and a levain that knows
 only the previous format refuses this one.
 
@@ -144,7 +144,8 @@ from levain.autonomic.receipt import build_action_face, build_gate_face, build_g
 from levain.cockpit.authority import RequestAuthority
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, _TIER_NEEDS
-from levain.consent.policy import grant_refusal
+from levain.consent.contained import ContainedLaunchProof
+from levain.consent.policy import contained_shell_refusal, grant_refusal
 from levain.consent.receipt_log import head as receipts_head
 from levain.consent.receipt_log import LogUnreadable, head_problem, head_refusal
 from levain.consent.record import (
@@ -154,16 +155,19 @@ from levain.consent.record import (
     ruling_message, ruling_payload, tool_input_digest,
 )
 
-__all__ = ["DB_NAME", "INVOCATIONS", "MODEL_MAX", "MODEL_UNKNOWN", "PRIOR_FORMAT", "REFUSED_BUSY_MS", "REFUSED_KINDS", "REFUSED_PER_REQUEST",
+__all__ = ["CONTAINED_SHELL_ANSWER_FORMAT", "DB_NAME", "INVOCATIONS", "MIGRATES_FROM", "MODEL_MAX", "MODEL_UNKNOWN",
+           "PRIOR_FORMAT", "REFUSED_BUSY_MS", "REFUSED_KINDS", "REFUSED_PER_REQUEST",
            "REFUSED_REASONS", "REFUSED_UNENROLLED_PER_REQUEST", "REFUSED_SUBREASONS", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
            "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "AwayMark", "ConsentQueue", "Decision",
            "ANSWER_KEYS", "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "StoreNotCurrent",
            "answer_refusal", "authority_source", "default_queue_dir", "gap_label", "session_handle", "signer_refusal"]
 
 DB_NAME = "queue.db"
-STORE_FORMAT = "levain-consent-queue/4"
-# the format this one migrates from in place; the listing reads either
-PRIOR_FORMAT = "levain-consent-queue/3"
+STORE_FORMAT = "levain-consent-queue/5"
+# the format before this one; /5 adds only the ``contained_shell`` via (CH-D1c-B)
+PRIOR_FORMAT = "levain-consent-queue/4"
+# the formats this one migrates from in place, by one rebuild (:func:`_migrate_from_prior`); the listing reads each
+MIGRATES_FROM: tuple[str, ...] = ("levain-consent-queue/3", PRIOR_FORMAT)
 STATES: tuple[str, ...] = ("pending", "allowed", "denied", "expired", "withdrawn", "undecided")
 TERMINAL: frozenset[str] = frozenset({"allowed", "denied", "expired", "withdrawn"})
 # the keys of a signed answer record (``ANSWER_FORMAT``); public so another store's answers are checked by the same set
@@ -172,6 +176,11 @@ ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "
 _ANSWER_KEYS = ANSWER_KEYS
 _GRANT_ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
                                 "grant_id", "grant_seq", "grant_hash", "posture"})
+# the record stored when a contained-shell grant (SH1) answered a chat call: a grant answer's keys plus the five
+# fields of the launch proof it was given under (the proof's ``profile_digest`` stored as ``containment_digest``)
+CONTAINED_SHELL_ANSWER_FORMAT = "levain-contained-shell-answer/1"
+_CONTAINED_SHELL_ANSWER_KEYS = _GRANT_ANSWER_KEYS | {"launch_id", "spawn_nonce", "containment_digest",
+                                                    "canary_verdict_id", "cwd"}
 _RULING_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "gap", "decision", "signer_fp",
                           "signed_at", "receipts_head"})
 # an answer / ruling APPLIED in the format from before the receipts were chained (``.../1``, Q11) has no
@@ -180,8 +189,9 @@ _RULING_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", 
 _ANSWER_KEYS_UNCHAINED = _ANSWER_KEYS - {"receipts_head"}
 _RULING_KEYS_UNCHAINED = _RULING_KEYS - {"receipts_head"}
 _LEAVE_KEYS = frozenset({"format", "queue_id", "mark_id", "agent", "decision", "signer_fp", "signed_at"})
-# how a decided request was answered: a signed answer, a standing consent grant, or a late ruling on an undecided one
-VIA: tuple[str, ...] = ("signature", "grant", "ruling")
+# how a decided request was answered: a signed answer, a standing consent grant, a late ruling on an undecided one,
+# or a contained-shell grant (a chat call, delivered only with the launch proof it was answered under)
+VIA: tuple[str, ...] = ("signature", "grant", "ruling", "contained_shell")
 # a ruled allow not taken by the call it rules on within this long of the queue applying it (its decided_at, the
 # queue's own clock) pre-authorises nothing; nor does one applied this long or more after it was signed
 RULED_ALLOW_LAPSE = timedelta(hours=24)
@@ -238,6 +248,8 @@ REFUSED_BUSY_MS = 2000
 # a chat launch's egress card (chat_egress.cards.EGRESS_TOOL): filed with its card's own display, and decided only by
 # a signed answer, never a standing grant (Q-R15-7)
 EGRESS_TOOL = "levain_egress"
+# who files a request (:meth:`ConsentQueue.file`), and so the prefix of its stored event id
+EVENT_SOURCES = ("hook", "chat")
 
 def _requests_table(name: str) -> str:
     return (f"CREATE TABLE IF NOT EXISTS {name} (id TEXT PRIMARY KEY, agent TEXT NOT NULL, "
@@ -247,7 +259,7 @@ def _requests_table(name: str) -> str:
             "state TEXT NOT NULL DEFAULT 'pending' "
             "CHECK (state IN ('pending','allowed','denied','expired','withdrawn','undecided')), "
             "decided_at TEXT, answer TEXT, signature TEXT, signer_fp TEXT, note TEXT, "
-            "via TEXT CHECK (via IS NULL OR via IN ('signature','grant','ruling')))")
+            "via TEXT CHECK (via IS NULL OR via IN ('signature','grant','ruling','contained_shell')))")
 
 
 def _receipts_table(name: str) -> str:
@@ -266,6 +278,10 @@ _SCHEMA = (
     # a hook's own event id names one permission event: a retry of it, at any time, is refused
     "CREATE UNIQUE INDEX IF NOT EXISTS requests_hook_event ON requests (agent, agent_session_id, event_id) "
     "WHERE event_id LIKE 'hook:%'",
+    # and the chat core's own id for a vendor call: a retry of it is refused too (an index a store made before it
+    # gains on its next open, as dialog_outcomes; the format is unchanged, and no released levain files a chat: row)
+    "CREATE UNIQUE INDEX IF NOT EXISTS requests_chat_event ON requests (agent, agent_session_id, event_id) "
+    "WHERE event_id LIKE 'chat:%'",
     _receipts_table("receipts"),
     # terminal is terminal; the only moves are pending -> a terminal state (never by a ruling), pending -> undecided
     # (with no answer) and undecided -> allowed/denied by a ruling; a request's fields never change; nothing is
@@ -430,8 +446,9 @@ _AUTHORITY_NOW_UNREADABLE = "the authority log cannot be replayed now"
 _REBUILT_TRIGGERS = ("requests_frozen", "requests_kept", "receipts_frozen", "receipts_kept")
 
 
-def _migrate_from_prior(conn: sqlite3.Connection) -> None:
-    """Inside the caller's write transaction: rebuild ``requests`` (its state and via checks) and ``receipts``
+def _migrate_from_prior(conn: sqlite3.Connection, found: str) -> None:
+    """Inside the caller's write transaction, for a store of ``found`` (one of :data:`MIGRATES_FROM`): rebuild
+    ``requests`` (its state and via checks) and ``receipts``
     (its uniqueness, per request and state) under the new definitions, copying every row with its rowid and
     seq, and mark the store this format. SQLite cannot alter a CHECK or drop a column's UNIQUE in place, hence
     the copy. The caller then runs the schema, which recreates the indexes and triggers dropped with the old
@@ -451,8 +468,15 @@ def _migrate_from_prior(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE receipts_next RENAME TO receipts")
     after = {t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("requests", "receipts")}
     if after != before:
-        raise QueueStoreError(f"the migration from {PRIOR_FORMAT} copied {after} rows of {before}")
+        raise QueueStoreError(f"the migration from {found} copied {after} rows of {before}")
     conn.execute("UPDATE meta SET value = ? WHERE key = 'format'", (STORE_FORMAT,))
+
+
+def _proof_fields(proof: ContainedLaunchProof) -> dict[str, str]:
+    """The five fields of a launch proof as a contained-shell answer record stores them."""
+    return {"launch_id": proof.launch_id, "spawn_nonce": proof.spawn_nonce,
+            "containment_digest": proof.profile_digest, "canary_verdict_id": proof.canary_verdict_id,
+            "cwd": proof.cwd}
 
 
 def _model_of(value: Any) -> str | None:
@@ -487,7 +511,7 @@ class QueueStoreError(RuntimeError):
 
 class StoreNotCurrent(QueueStoreError):
     """A read that needs the current store's tables found none to read: an empty database, a store of
-    :data:`PRIOR_FORMAT` not yet migrated, or one lacking a table (``_read_as_is`` with ``whole``)."""
+    :data:`MIGRATES_FROM` not yet migrated, or one lacking a table (``_read_as_is`` with ``whole``)."""
 
 
 class AnswerRefused(Exception):
@@ -501,8 +525,9 @@ class Decision:
     it filed for the input it is holding (``ExternalGateRequest.digest``). ``via`` says how it was answered:
     ``signature`` (``signer_fp`` is the key) or ``grant`` (``signer_fp`` is None; ``grant_id`` names the standing
     grant, ``grant_seq``/``grant_hash`` the authority link that created or last renewed it, ``posture`` the
-    agent's reported posture it matched), or ``ruling`` (a late ruling on an undecided request: ``signer_fp`` is
-    the key, ``gap`` the request's gap number)."""
+    agent's reported posture it matched), ``ruling`` (a late ruling on an undecided request: ``signer_fp`` is
+    the key, ``gap`` the request's gap number), or ``contained_shell`` (a contained-shell grant answered a chat
+    call: the grant fields as for ``grant``)."""
     request_id: str
     decision: str
     signer_fp: str | None
@@ -889,8 +914,8 @@ class ConsentQueue:
                     "SELECT 1 FROM meta WHERE key = 'format'").fetchone() is None):
                 raise QueueStoreError("the database holds tables but no consent-queue format marker")
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if tables else None
-            if row is not None and row[0] == PRIOR_FORMAT:
-                _migrate_from_prior(conn)
+            if row is not None and row[0] in MIGRATES_FROM:
+                _migrate_from_prior(conn, row[0])
             elif row is not None and row[0] != STORE_FORMAT:
                 raise QueueStoreError(f"store format {row[0]!r} is not {STORE_FORMAT!r}")
             elif row is not None and _AWAY_TABLES - tables and _AWAY_TABLES & tables:
@@ -921,7 +946,7 @@ class ConsentQueue:
     def _read_as_is(self, tables: frozenset[str], *, whole: bool = False) -> Iterator[sqlite3.Connection | None]:
         """A read snapshot of the store as it stands, opened read-only: never created, migrated or given its schema
         (no write lock, no sync). ``None`` for an empty database (one the queue has not set up yet), a store of
-        :data:`PRIOR_FORMAT`, which predates ``tables``, or a current-format store holding none of ``tables`` (made
+        :data:`MIGRATES_FROM`, which predates ``tables``, or a current-format store holding none of ``tables`` (made
         before them); raises :class:`QueueStoreError` for any other format, a database with no format marker, and a
         current-format store holding some of ``tables`` but not all (damaged, never read as holding nothing).
         With ``whole`` (a reader that needs ``tables`` themselves, never their absence) each of those ``None``
@@ -936,11 +961,11 @@ class ConsentQueue:
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in have else None
             if whole and not have:
                 raise StoreNotCurrent(f"{self.path} holds no consent queue (an empty database)")
-            if whole and row is not None and row[0] == PRIOR_FORMAT:
+            if whole and row is not None and row[0] in MIGRATES_FROM:
                 raise StoreNotCurrent(
-                    f"{self.path} is in format {PRIOR_FORMAT!r}, from before {STORE_FORMAT!r}, and is read only "
+                    f"{self.path} is in format {row[0]!r}, from before {STORE_FORMAT!r}, and is read only "
                     "once migrated: `levain consent pending` migrates it in place")
-            if not have or (row is not None and row[0] == PRIOR_FORMAT):
+            if not have or (row is not None and row[0] in MIGRATES_FROM):
                 conn.execute("COMMIT")
                 yield None
                 return
@@ -994,13 +1019,18 @@ class ConsentQueue:
 
     def file(self, *, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, cwd: str,
              hold: timedelta, tier: str = "T2", event_id: str | None = None,
-             resume: Mapping[str, Any] | None = None, model: Any = None) -> ExternalGateRequest:
+             resume: Mapping[str, Any] | None = None, model: Any = None,
+             event_source: str = "hook") -> ExternalGateRequest:
         """File one gate an agent is waiting on; its hold (``expires_at``) ends ``hold`` after now, after which no
         answer applies and only the hook's :meth:`mark_undecided` does until it expires. ``tier`` must be one an
         allow can be signed at (``T2`` or ``T3``). ``event_id`` is the hook's own unique id for this
-        permission event when its agent has one; without it the request gets an unpredictable one. Either
+        permission event when its agent has one; without it the request gets an unpredictable one.
+        ``event_source`` says who files it: ``"hook"`` (every hook caller) stores ``"hook:" + event_id``; ``"chat"``
+        (the chat core, :data:`EVENT_SOURCES`) stores ``"chat:" + event_id`` and needs an ``event_id``, so a chat-core
+        row is never a gate's row (:meth:`take_gate_allow` takes only ``hook:`` rows) and never meets a gate filing of
+        the same tool-use id in the hook-event index. Either
         way two filings are two requests, never one returned twice: a hook event id is unique per agent and
-        session in the store, so filing the same event again raises, at any time. ``resume`` is what a later
+        session in the store (a ``hook:`` and a ``chat:`` id each), so filing the same event again raises, at any time. ``resume`` is what a later
         resume of the session needs (``permission_mode``, ``invocation`` one of :data:`INVOCATIONS`,
         ``codex_pid`` / ``claude_pid`` the agent's process, ``claude_started`` / ``claude_flags`` that process's
         start time and the option names on its command line (never their values) as the OS reported them,
@@ -1015,12 +1045,15 @@ class ConsentQueue:
             raise ConsentError(f"tier must be one of {tuple(_TIER_NEEDS)}: {tier!r}")
         if not isinstance(hold, timedelta) or hold <= timedelta(0):
             raise ConsentError("hold must be a positive timedelta")
-        if event_id is None:
+        if event_source not in EVENT_SOURCES:
+            raise ConsentError(f"event_source must be one of {', '.join(EVENT_SOURCES)}")
+        if event_id is None and event_source == "hook":
             event = "rand:" + os.urandom(16).hex()
         elif isinstance(event_id, str) and event_id:
-            event = "hook:" + event_id
+            event = event_source + ":" + event_id
         else:
-            raise ConsentError("event_id must be a non-empty string")
+            raise ConsentError("event_id must be a non-empty string" + (
+                " (a chat-core filing always names its call)" if event_source == "chat" else ""))
         if tool_name == EGRESS_TOOL:
             # a chat launch's egress card: its own display, in a fixed field order, never cut, after the card's whole
             # check and its filing's agent, tier, hold and event id (chat_egress.cards.filed_display)
@@ -1210,11 +1243,13 @@ class ConsentQueue:
                       producers=[request.agent])
         if grant is not None:
             gid = grant["grant_id"]
+            kind = "contained-shell-grant" if grant["format"] == CONTAINED_SHELL_ANSWER_FORMAT else "standing-grant"
+            launch = f" launch={grant['launch_id']}" if kind == "contained-shell-grant" else ""
             return build_gate_face(
                 **common, gate=build_gate_verdict(verdict="approved", by="binding", binding_id=gid),
                 authority=AuthorityScope(grantor="binding", binding_id=gid,
-                                         grant=f"standing-grant:{gid}@{grant['grant_seq']}:{grant['grant_hash']} "
-                                               f"posture={grant['posture']}"),
+                                         grant=f"{kind}:{gid}@{grant['grant_seq']}:{grant['grant_hash']} "
+                                               f"posture={grant['posture']}{launch}"),
                 terminal_state="fired", downstream_id=request.id)
         if state in ("allowed", "denied"):
             grant_text = f"signed-answer:{signer_fp}" if gap is None else f"signed-ruling:{signer_fp} gap=#{gap}"
@@ -1313,12 +1348,16 @@ class ConsentQueue:
             args: tuple[Any, ...] = (agent, agent_session_id, tool_name, digest)
             row = None
             if use_id is not None:
-                row = conn.execute("SELECT id, state, decided_at " + where + " AND event_id = ? "
-                                   "ORDER BY received_at DESC, rowid DESC LIMIT 1", args + ("hook:" + use_id,)).fetchone()
+                # the newest filing of this id, of either prefix (L3 r1: a hook row is not preferred to a newer chat row)
+                row = conn.execute("SELECT id, state, decided_at " + where + " AND event_id IN (?, ?) "
+                                   "ORDER BY received_at DESC, rowid DESC LIMIT 1",
+                                   args + ("hook:" + use_id, "chat:" + use_id)).fetchone()
             if row is None:
-                # a request that carries another call's id is not this call's; one with none (a PermissionRequest
-                # Claude Code and Codex send without it) could be
-                extra = " AND event_id NOT LIKE 'hook:%'" if use_id is not None else ""
+                # a request that carries another call's id, of either prefix, is not this call's; one with none (a
+                # PermissionRequest Claude Code and Codex send without it) could be, but never a chat-core row,
+                # which always carries its call's id (L3 r1 deepseek MED 2)
+                extra = " AND event_id NOT LIKE 'hook:%' AND event_id NOT LIKE 'chat:%'" if use_id is not None \
+                    else " AND event_id NOT LIKE 'chat:%'"
                 row = conn.execute("SELECT id, state, decided_at " + where + extra +
                                    " ORDER BY (state = 'pending') DESC, received_at DESC, rowid DESC LIMIT 1",
                                    args).fetchone()
@@ -2452,14 +2491,106 @@ class ConsentQueue:
                         request_digest=request.digest, via="grant", grant_id=gid, grant_seq=payload["grant_seq"],
                         grant_hash=payload["grant_hash"], posture=posture)
 
-    def decision(self, request_id: str, *, tool_input: Any = None, posture: str | None = None
-                 ) -> Decision | Ruling | None:
+    # --- contained-shell grants (SH1, CH-D1c-B) -------------------------------------------------------
+    def _matching_contained_shell_grant(self, authority: AuthoritySnapshot, request: ExternalGateRequest, *,
+                                        tool_input: Any, posture: Any, now: datetime,
+                                        contained_launch: ContainedLaunchProof) -> tuple[str, int, str] | None:
+        """``(grant_id, link seq, link hash)`` of the first contained-shell grant (by id) in ``authority`` that
+        answers ``request`` from the launch ``contained_launch`` proves, or ``None``."""
+        for gid in sorted(authority.policy.grants):
+            link = authority.grant_link(gid)
+            if link is not None and contained_shell_refusal(
+                    authority.policy.grants[gid], request, tool_input=tool_input, posture=posture, now=now,
+                    home=self.home, contained_launch=contained_launch) is None:
+                return gid, link[0], link[1]
+        return None
+
+    def answer_by_contained_shell_grant(self, request_id: str, *, tool_input: Any, posture: str,
+                                        contained_launch: ContainedLaunchProof) -> Decision | None:
+        """Answer ``request_id`` with a contained-shell grant (SH1) when one covers it: :meth:`answer_by_grant`'s
+        shape, with :func:`levain.consent.policy.contained_shell_refusal` as the criteria and the launch's proof
+        as one more input. Records ``pending -> allowed`` with ``via`` ``contained_shell`` and a
+        :data:`CONTAINED_SHELL_ANSWER_FORMAT` record (the grant, its link, the posture and the proof's five
+        fields), then returns the decision as :meth:`decision` delivers it to a caller holding this same proof.
+        ``None`` when no grant covers it, the proof is not of the right shape, the request is not pending, or
+        the log cannot be replayed: the request is left as it was."""
+        if not isinstance(contained_launch, ContainedLaunchProof) or contained_launch.problem() is not None:
+            return None
+        authority = self._fresh_authority()
+        if authority is None or not authority.policy.grants:
+            return None
+        moved = False
+        with self._write() as conn:
+            request, state, stamp = self._settle(conn, request_id)
+            if request is not None and state == "pending" and request.expires_at > stamp \
+                    and request.tool_name != EGRESS_TOOL:
+                found = self._matching_contained_shell_grant(authority, request, tool_input=tool_input,
+                                                             posture=posture, now=parse_stamp(stamp),
+                                                             contained_launch=contained_launch)
+                if found is not None:
+                    queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
+                    record = {**grant_answer_payload(queue_id=queue_id, request=request, grant_id=found[0],
+                                                     grant_seq=found[1], grant_hash=found[2], posture=posture),
+                              "format": CONTAINED_SHELL_ANSWER_FORMAT, **_proof_fields(contained_launch)}
+                    moved = self._transition(conn, request, "allowed", stamp=stamp,
+                                             answer=answer_message(record).decode("utf-8"), via="contained_shell",
+                                             grant=record)
+        if not moved:
+            return None
+        return self.decision(request_id, tool_input=tool_input, posture=posture, contained_launch=contained_launch)
+
+    def _contained_shell_decision(self, row: Mapping[str, Any], request: ExternalGateRequest, queue_id: str,
+                                  payload: Mapping[str, Any], *, tool_input: Any, posture: Any,
+                                  contained_launch: ContainedLaunchProof | None) -> Decision | None:
+        """A contained-shell-answered row's decision, re-verified now, for a caller holding ``contained_launch``:
+        :meth:`_grant_decision`'s checks, the stored proof fields equal to the caller's proof (all five), and the
+        named grant still in a fresh replay at the link recorded, with
+        :func:`~levain.consent.policy.contained_shell_refusal` ``None`` at the queue's clock. A caller with no
+        proof (every hook caller) gets ``None``: the hook never delivers a contained-shell answer."""
+        if not isinstance(contained_launch, ContainedLaunchProof) or contained_launch.problem() is not None:
+            return None
+        if set(payload) != _CONTAINED_SHELL_ANSWER_KEYS or payload["format"] != CONTAINED_SHELL_ANSWER_FORMAT \
+                or payload["queue_id"] != queue_id or payload["request_id"] != request.id \
+                or payload["request_digest"] != request.digest or payload["expires_at"] != request.expires_at \
+                or payload["decision"] != "allow" or row["state"] != "allowed" or row["signer_fp"] is not None \
+                or request.tool_name == EGRESS_TOOL:
+            return None
+        if tool_input is None or not isinstance(posture, str) or payload["posture"] != posture:
+            return None
+        if any(payload[k] != v for k, v in _proof_fields(contained_launch).items()):
+            return None
+        gid = payload["grant_id"]
+        authority = self._fresh_authority()
+        grant = None if authority is None or not isinstance(gid, str) else authority.policy.grants.get(gid)
+        if grant is None or authority.grant_link(gid) != (payload["grant_seq"], payload["grant_hash"]) \
+                or contained_shell_refusal(grant, request, tool_input=tool_input, posture=posture,
+                                           now=_now_utc(self._clock), home=self.home,
+                                           contained_launch=contained_launch) is not None:
+            return None
+        return Decision(request_id=request.id, decision="allow", signer_fp=None, decided_at=row["decided_at"],
+                        request_digest=request.digest, via="contained_shell", grant_id=gid,
+                        grant_seq=payload["grant_seq"], grant_hash=payload["grant_hash"], posture=posture)
+
+    def answered_via(self, request_id: str) -> tuple[str, str | None] | None:
+        """``(state, via)`` as the row stores them, or ``None`` for an unknown or unsealed request. Read only:
+        says how a request was answered, never that the answer is good (:meth:`decision` re-verifies)."""
+        with self._read() as conn:
+            row = self._row(conn, request_id)
+        if row is None or self._request_of(row) is None:
+            return None
+        return row["state"], row["via"]
+
+    def decision(self, request_id: str, *, tool_input: Any = None, posture: str | None = None,
+                 contained_launch: ContainedLaunchProof | None = None) -> Decision | Ruling | None:
         """The decision of a terminal request, re-verified now. A signed answer: the stored answer must be the
         canonical record of this row's decision for this queue and request, decided before its expiry, and its
         signature must verify under a key a fresh replay holds active (and of a class covering the tier, for an
         allow). A grant answer (``via`` ``grant``): delivered only to a caller holding the request's tool input
         and the posture recorded, while the grant still answers it in a fresh replay (:meth:`_grant_decision`);
-        without ``tool_input`` it is ``None``. A late ruling (``via`` ``ruling``) comes back as a :class:`Ruling`,
+        without ``tool_input`` it is ``None``. A contained-shell answer (``via`` ``contained_shell``): delivered only
+        to a caller holding, besides those, the launch proof it was answered under
+        (:meth:`_contained_shell_decision`); with ``contained_launch`` ``None`` (the default, every hook caller) it
+        is ``None``, and every other ``via`` ignores ``contained_launch``. A late ruling (``via`` ``ruling``) comes back as a :class:`Ruling`,
         INFORMATION and never a deliverable decision (a ruled allow is delivered only by :meth:`take_ruled_allow`,
         once; ``taken`` says whether it has been): the stored ruling must name this row's decision and signer and
         verify for the request's gap number under a fresh replay (:meth:`_verified_ruling`). ``None`` while
@@ -2483,6 +2614,9 @@ class ConsentQueue:
                                          taken=taken is not None)
         if row["via"] == "grant":
             return self._grant_decision(row, request, queue_id[0], payload, tool_input=tool_input, posture=posture)
+        if row["via"] == "contained_shell":
+            return self._contained_shell_decision(row, request, queue_id[0], payload, tool_input=tool_input,
+                                                  posture=posture, contained_launch=contained_launch)
         if row["via"] != "signature":
             return None
         named = payload.get("decision")
@@ -2498,13 +2632,15 @@ class ConsentQueue:
 
     def await_decision(self, request_id: str, timeout: float, *, poll: float = 0.1,
                        sleep: Callable[[float], None] = time.sleep, tool_input: Any = None,
-                       posture: str | None = None) -> Decision | Ruling | None:
+                       posture: str | None = None, contained_launch: ContainedLaunchProof | None = None
+                       ) -> Decision | Ruling | None:
         """Wait up to ``timeout`` seconds for a verified decision. ``None`` is NO decision: the request's hold
         ended (its ``expires_at``), it expired, was withdrawn, went undecided, is unknown, its stored answer no longer verifies, or it is still
         pending when the wait ends (the adapter then outputs nothing, so the native dialog stands, and withdraws or
         lets it expire). A request ruled late returns its :class:`Ruling`, information only, as :meth:`decision`
         does. ``poll`` below 1ms (or not a number) is 1ms. ``tool_input`` / ``posture`` are passed to
-        :meth:`decision` (a grant answer is delivered only with them)."""
+        :meth:`decision` (a grant answer is delivered only with them), and so is ``contained_launch`` (a
+        contained-shell answer is delivered only with its proof)."""
         poll = poll if poll >= 0.001 else 0.001             # NaN compares false: it becomes 1ms too
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
@@ -2512,7 +2648,8 @@ class ConsentQueue:
             if got is None:
                 return None
             if got[1] != "pending":
-                return self.decision(request_id, tool_input=tool_input, posture=posture)
+                return self.decision(request_id, tool_input=tool_input, posture=posture,
+                                     contained_launch=contained_launch)
             if got[0].expires_at <= utc_stamp(_now_utc(self._clock)):
                 return None                          # the hold ended: the hook marks it undecided
             left = deadline - time.monotonic()

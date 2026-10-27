@@ -38,8 +38,9 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from levain.authority import (consent_grant, consent_grant_tool_problem, consent_mcp_declaration, consent_mcp_input_fits,
-                              consent_root_problem)
+                              consent_root_problem, contained_shell_grant)
 from levain.cockpit.consent import ConsentError, parse_stamp
+from levain.consent.contained import ContainedLaunchProof, sandbox_escape_requested
 from levain.consent.record import tool_input_digest
 
 if TYPE_CHECKING:
@@ -47,7 +48,7 @@ if TYPE_CHECKING:
     from levain.consent.record import ExternalGateRequest
 
 __all__ = ["AGENT_CONFIG_TIER", "AGENT_FILE_TOOLS", "FILE_TOOLS", "GLOB_TOOLS", "MCP_PATH_FIELDS", "Policy",
-           "PolicyNotEligible", "Targets", "decide", "grant_refusal", "grant_targets", "guarded_policy",
+           "PolicyNotEligible", "Targets", "contained_shell_refusal", "decide", "grant_refusal", "grant_targets", "guarded_policy",
            "mcp_config_candidates", "register_targets", "targets"]
 
 # The tier an agent_config request is filed at: an allow then needs a key class covering T3.
@@ -380,22 +381,95 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
     return None
 
 
+def contained_shell_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, tool_input: Any,
+                            posture: Any, now: datetime, home: str | os.PathLike[str],
+                            contained_launch: ContainedLaunchProof | None) -> str | None:
+    """Why the contained-shell grant ``grant`` (SH1) does not answer ``request`` from the launch ``contained_launch``
+    proves, at ``now``, for ``tool_input`` under ``posture``; ``None`` when every criterion holds. Checked in this
+    order, the first failing one named: a proof of the right shape; a contained-shell grant; a chat call (its
+    event id ``chat:`` and a call id); not agent config; the
+    grant's agent; the tool is exactly ``Bash`` (no case fold, no strip, never an MCP tool); the input an object
+    without the ``dangerouslyDisableSandbox`` key or a case-folded or namespaced variant of it
+    (:func:`~levain.consent.contained.sandbox_escape_requested`; any value; the command is never read); the input the request was
+    filed for; the posture; unexpired; the grant's ``containment_digest`` is the proof's ``profile_digest``; the
+    request's directory is the launch's; the launch's directory inside the grant's workspace, which is, here and
+    now, the directory the grant was signed for and not ``/`` or ``home`` or above it."""
+    if contained_launch is None or not isinstance(contained_launch, ContainedLaunchProof) \
+            or contained_launch.problem() is not None:
+        return "no contained launch"
+    if not contained_shell_grant(grant):
+        return "not a contained-shell grant"
+    if not isinstance(request.event_id, str) or not request.event_id.startswith("chat:") \
+            or request.event_id == "chat:":
+        return "not a chat call"   # the grant is chat-only: a hook row is never answered by it (L3 r1 codex HIGH)
+    if request.tier == AGENT_CONFIG_TIER:
+        return "agent config is never answered by a grant"
+    if grant.get("agent") != request.agent:
+        return "the grant is for another agent"
+    if request.tool_name != "Bash":
+        return "not the Bash tool"
+    if not isinstance(tool_input, Mapping):
+        return "the input is not an object"
+    if sandbox_escape_requested(request.tool_name, tool_input):
+        return "the call asks to leave the sandbox"
+    try:
+        if tool_input_digest(tool_input) != request.tool_input_digest:
+            return "not the input the request was filed for"
+        expires = parse_stamp(grant.get("expires_at"))
+    except (ConsentError, TypeError, ValueError, RecursionError):
+        return "the grant or the tool input cannot be read"
+    if posture != "default" or posture not in (grant.get("postures") or ()):
+        return "posture"
+    if not now < expires:
+        return "expired"
+    if grant.get("containment_digest") != contained_launch.profile_digest:
+        return "another containment"
+    workspace = grant.get("workspace")
+    if not isinstance(workspace, str) or not os.path.isabs(request.cwd):
+        return "no workspace to match"
+    try:
+        root = os.path.realpath(workspace)
+        cwd = os.path.realpath(request.cwd)
+    except (OSError, ValueError):
+        return "the workspace cannot be resolved"
+    if cwd != contained_launch.cwd:
+        return "not this launch's directory"
+    if not _within(contained_launch.cwd, root):
+        return "outside the grant's workspace"
+    if root != workspace or not os.path.isdir(root):
+        return "the workspace is not, here and now, the directory the grant was signed for"
+    problem = consent_root_problem(root, home=home)
+    if problem is not None:
+        return problem
+    return None
+
+
 def decide(request: ExternalGateRequest, queue: ConsentQueue, *, posture: str | None = None,
-           tool_input: Any = None) -> Decision | None:
+           tool_input: Any = None, contained_launch: ContainedLaunchProof | None = None) -> Decision | None:
     """The policy answer for ``request`` on ``queue``, or ``None``. ``posture`` is the agent session's own
     permission posture as its event reports it (Claude Code's ``permission_mode``), ``None`` when absent;
     ``tool_input`` is the input the request was filed for (``None``: not given, so no answer). The queue finds
-    a grant in a fresh replay, records the answer and returns it as delivery re-verifies it."""
+    a grant in a fresh replay, records the answer and returns it as delivery re-verifies it: a consent grant
+    first (:meth:`~levain.consent.queue.ConsentQueue.answer_by_grant`, which never matches a contained-shell
+    grant), then, only with a ``contained_launch`` proof (a chat call's), a contained-shell grant
+    (:meth:`~levain.consent.queue.ConsentQueue.answer_by_contained_shell_grant`)."""
     if request.tier == AGENT_CONFIG_TIER or posture is None or tool_input is None:
         return None
-    return queue.answer_by_grant(request.id, tool_input=tool_input, posture=posture)
+    got = queue.answer_by_grant(request.id, tool_input=tool_input, posture=posture)
+    if got is None and contained_launch is not None:
+        got = queue.answer_by_contained_shell_grant(request.id, tool_input=tool_input, posture=posture,
+                                                    contained_launch=contained_launch)
+    return got
 
 
 def guarded_policy(request: ExternalGateRequest, queue: ConsentQueue, *, posture: str | None = None,
-                   tool_input: Any = None, policy: Policy | None = None) -> Decision | None:
+                   tool_input: Any = None, policy: Policy | None = None,
+                   contained_launch: ContainedLaunchProof | None = None) -> Decision | None:
     """``policy`` (default :func:`decide`), called as ``policy(request, queue, posture=posture,
-    tool_input=tool_input)``, with ruling 3b item 1 asserted first: a request filed at :data:`AGENT_CONFIG_TIER`
-    never reaches it."""
+    tool_input=tool_input)``, plus ``contained_launch=`` only when a proof is given (so a policy written for the
+    hook, which never has one, is called as before), with ruling 3b item 1 asserted first: a request filed at
+    :data:`AGENT_CONFIG_TIER` never reaches it."""
     if request.tier == AGENT_CONFIG_TIER:
         raise PolicyNotEligible(f"request {request.id} targets agent config: never eligible for a policy answer")
-    return (policy or decide)(request, queue, posture=posture, tool_input=tool_input)
+    proof = {} if contained_launch is None else {"contained_launch": contained_launch}
+    return (policy or decide)(request, queue, posture=posture, tool_input=tool_input, **proof)

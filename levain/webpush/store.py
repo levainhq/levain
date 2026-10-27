@@ -36,6 +36,64 @@ class PushStoreError(RuntimeError):
     """The push store cannot be opened safely."""
 
 
+class DeviceNotLive(PushStoreError):
+    """A subscribe for a device its own authority no longer holds as live (revoked after its credential was read)."""
+
+
+# A subscription the cockpit stored is under its paired device's credential name, ``paired-<id>``
+# (:data:`levain.cockpit.firejournal.PAIRED_PREFIX`; a test pins the two equal), and its ``journal`` column holds the
+# cockpit's data root, whose pairing journal is that device's one authority. Every other subscription's device is a
+# row of this store's own ``devices`` table.
+PAIRED_PREFIX = "paired-"
+_JOURNAL_DB = "cockpit.db"     # levain.cockpit.firejournal.DB_NAME (pinned equal by the same test)
+_JOURNAL_WAIT_S = 0.25         # a gate reads liveness: a journal writer must not stall it
+
+
+def paired_device_live(journal: "str | Path | None", device_id: str) -> bool:
+    """Whether the paired device ``device_id`` (``paired-<id>``) is unrevoked in the cockpit pairing journal under
+    ``journal``, read through a read-only connection that never creates the file. Anything else, an unreadable
+    journal included, is False: a push to a device that may be revoked is never sent on a guess."""
+    if not journal or not device_id.startswith(PAIRED_PREFIX):
+        return False
+    try:
+        path = (Path(journal) / _JOURNAL_DB).resolve(strict=True)
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=_JOURNAL_WAIT_S)
+        try:
+            row = conn.execute("SELECT revoked_at FROM paired_devices WHERE id = ?",
+                               (device_id[len(PAIRED_PREFIX):],)).fetchone()
+        finally:
+            conn.close()
+    except (OSError, ValueError, RuntimeError, sqlite3.Error):
+        return False
+    return row is not None and row[0] is None
+
+
+def live_rows(conn: sqlite3.Connection, *, first: bool = False) -> list[dict[str, Any]]:
+    """The live subscriptions, by the one rule every reader uses (the gate's :func:`levain.webpush.live` and the
+    send's :meth:`PushStore.live_subscriptions`): not retired, and its device live in its own authority, a row of
+    ``devices`` not revoked, or for a ``paired-`` device, unrevoked in the cockpit journal the row names, asked now.
+    A device no authority holds is not live. ``first`` stops at the first live one."""
+    out: list[dict[str, Any]] = []
+    asked: dict[tuple[Any, str], bool] = {}
+    for r in conn.execute("SELECT s.*, d.id AS _dev, d.revoked_at AS _dev_revoked FROM subscriptions s "
+                          "LEFT JOIN devices d ON d.id = s.device_id WHERE s.retired_at IS NULL ORDER BY s.id"):
+        row = dict(r)
+        dev, dev_revoked = row.pop("_dev"), row.pop("_dev_revoked")
+        device = row.get("device_id") or ""
+        if device.startswith(PAIRED_PREFIX):
+            key = (row.get("journal"), device)
+            if key not in asked:
+                asked[key] = paired_device_live(row.get("journal"), device)
+            ok = asked[key]
+        else:
+            ok = dev is not None and dev_revoked is None
+        if ok:
+            out.append(row)
+            if first:
+                break
+    return out
+
+
 def now_stamp() -> str:
     return datetime.now(timezone.utc).strftime(STAMP)
 
@@ -145,6 +203,9 @@ class PushStore:
             if "subscribed" not in {r[1] for r in conn.execute("PRAGMA table_info(subscriptions)")}:
                 conn.execute("ALTER TABLE subscriptions ADD COLUMN subscribed INTEGER NOT NULL DEFAULT 0")
                 conn.execute("UPDATE subscriptions SET subscribed = id")
+            # ``journal``: the cockpit data root whose pairing journal holds a ``paired-`` device (live_rows)
+            if "journal" not in {r[1] for r in conn.execute("PRAGMA table_info(subscriptions)")}:
+                conn.execute("ALTER TABLE subscriptions ADD COLUMN journal TEXT")
             # ``command``: 1 the operator's notify command started for this ping, 0 it was set and could not start,
             # NULL none was set (and every ping recorded before the column existed)
             if "command" not in {r[1] for r in conn.execute("PRAGMA table_info(pings)")}:
@@ -179,15 +240,24 @@ class PushStore:
             yield conn
 
     # --- subscriptions -------------------------------------------------------------------------------
-    def add_subscription(self, endpoint: str, p256dh: str, auth: str, device_id: str) -> int:
+    def add_subscription(self, endpoint: str, p256dh: str, auth: str, device_id: str, *,
+                         journal: "str | Path | None" = None) -> int:
         """Store (or revive, with fresh keys) the subscription for ``endpoint`` under ``device_id``; returns its id.
         A revived row takes the device that subscribed it now, so it is never live under a device revoked before.
         Live subscriptions are capped per device and overall: the least recently subscribed retire first, never the
-        one just stored."""
+        one just stored. A ``paired-`` device needs ``journal``, its cockpit data root, and is asked again there
+        inside this write: one revoked since its credential was read raises :class:`DeviceNotLive`, nothing
+        stored (the send asks the journal again, :func:`live_rows`, so this bounds the window, it is not the
+        guard)."""
         if not isinstance(device_id, str) or not device_id:
             raise ValueError("a subscription is always stored under a device")
+        if device_id.startswith(PAIRED_PREFIX) and not journal:
+            raise ValueError("a paired device's subscription names its pairing journal")
         with self.write() as c:
-            return _subscribe(c, endpoint, p256dh, auth, device_id)
+            if device_id.startswith(PAIRED_PREFIX) and not paired_device_live(journal, device_id):
+                raise DeviceNotLive(f"{device_id} is not a live paired device")
+            return _subscribe(c, endpoint, p256dh, auth, device_id,
+                              journal=str(journal) if device_id.startswith(PAIRED_PREFIX) else None)
 
     def subscribe_unowned(self, endpoint: str, p256dh: str, auth: str, label: Any,
                           now: datetime) -> tuple[int, tuple[str, str] | None]:
@@ -211,11 +281,9 @@ class PushStore:
                              (now_stamp(), endpoint)).rowcount > 0
 
     def live_subscriptions(self) -> list[dict[str, Any]]:
+        # a subscription whose device was revoked is not live even if a revoke left its row unretired (live_rows)
         with self.read() as c:
-            # a subscription whose device was revoked is not live even if a revoke left its row unretired
-            return [dict(r) for r in c.execute(
-                "SELECT s.* FROM subscriptions s LEFT JOIN devices d ON d.id = s.device_id "
-                "WHERE s.retired_at IS NULL AND (d.id IS NULL OR d.revoked_at IS NULL) ORDER BY s.id")]
+            return live_rows(c)
 
     # --- the record ----------------------------------------------------------------------------------
     def add_ping(self, kind: str, ref: str | None, title: str, body: str, command: bool | None = None, *,
@@ -290,15 +358,16 @@ class PushStore:
             return pings
 
 
-def _subscribe(c: sqlite3.Connection, endpoint: str, p256dh: str, auth: str, device_id: str) -> int:
+def _subscribe(c: sqlite3.Connection, endpoint: str, p256dh: str, auth: str, device_id: str, *,
+               journal: str | None = None) -> int:
     """The body of :meth:`PushStore.add_subscription`, in the caller's write transaction."""
     nxt = "(SELECT COALESCE(MAX(subscribed), 0) + 1 FROM subscriptions)"
     c.execute(
-        "INSERT INTO subscriptions (device_id, endpoint, p256dh, auth, created, subscribed) "
-        f"VALUES (?,?,?,?,?,{nxt}) "
+        "INSERT INTO subscriptions (device_id, endpoint, p256dh, auth, created, subscribed, journal) "
+        f"VALUES (?,?,?,?,?,{nxt},?) "
         "ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, "
-        f"device_id = excluded.device_id, retired_at = NULL, subscribed = {nxt}",
-        (device_id, endpoint, p256dh, auth, now_stamp()))
+        f"device_id = excluded.device_id, retired_at = NULL, subscribed = {nxt}, journal = excluded.journal",
+        (device_id, endpoint, p256dh, auth, now_stamp(), journal))
     row = c.execute("SELECT id, device_id FROM subscriptions WHERE endpoint = ?", (endpoint,)).fetchone()
     sid, owner = int(row[0]), row[1]
     at = now_stamp()

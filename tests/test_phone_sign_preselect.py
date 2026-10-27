@@ -123,6 +123,14 @@ _PICKED = ("(() => { const c = document.querySelector('.req.sign.linked'); if (!
            "first: document.getElementById('requests').firstChild === c }; })()")
 
 
+def _legacy_link(page: str, rid: str, token: str) -> str:
+    """The phone page's own link shape (phone.js reads it until OS-6 deletes the page): ``deep_link`` builds the
+    cockpit sheet's now, with no token, so these page tests build the legacy one by hand."""
+    from urllib.parse import quote
+
+    return page.split("#", 1)[0] + f"#phone_token={quote(token, safe='')}&sign={rid}"
+
+
 def _signed(qdir: Path, rid: str) -> "dict | None":
     f = qdir / "sign" / f"{rid}.signed.json"
     return json.loads(f.read_text()) if f.exists() else None
@@ -131,15 +139,14 @@ def _signed(qdir: Path, rid: str) -> "dict | None":
 # --- the link --------------------------------------------------------------------------------------------------------
 
 
-def test_the_deep_link_carries_his_pick_and_its_version_after_the_card_and_only_an_option_key() -> None:
+def test_the_deep_link_carries_his_pick_and_its_version_after_the_sheet_and_only_an_option_key() -> None:
     sha = "0123456789abcdef" + "f" * 48
     # the version alone is the base link an app adds `&choice=<key>` to; with a choice the link is that base plus it
-    base = deep_link("https://h.ts.net/", RID, "a/b", version=sha)
-    assert base == f"https://h.ts.net/#phone_token=a%2Fb&sign={RID}&v=0123456789abcdef"
-    assert deep_link("https://h.ts.net/", RID, "a/b", choice="b", version=sha) == base + "&choice=b"
-    assert deep_link("https://h.ts.net/", RID, choice="b", version=sha[:16]) == \
-        f"https://h.ts.net/#sign={RID}&v=0123456789abcdef&choice=b"
-    assert deep_link("https://h.ts.net/", RID) == f"https://h.ts.net/#sign={RID}"
+    base = deep_link("https://h.ts.net:8443/", RID, version=sha)
+    assert base == f"https://h.ts.net:8443/sign/{RID}#v=0123456789abcdef"
+    assert deep_link("https://h.ts.net:8443/", RID, choice="b", version=sha) == base + "&choice=b"
+    assert deep_link("https://h.ts.net:8443/", RID, choice="b", version=sha[:16]) == base + "&choice=b"
+    assert deep_link("https://h.ts.net:8443/", RID) == f"https://h.ts.net:8443/sign/{RID}"
     for bad in ("*", "", "B", "toolongkey", "a&sign=x", "a b"):
         with pytest.raises(ValueError):
             deep_link("https://h.ts.net/", RID, choice=bad, version=sha)
@@ -196,7 +203,7 @@ def test_his_pick_opens_as_one_sign_button_whose_tap_signs_exactly_that_option(t
     _file(port.qdir, RID)
     for i in range(3):                       # cards that sort before it: the linked one must still come first
         _file(port.qdir, f"np-aaa0000{i}-aaaa", options=None, message=f"filler {i}")
-    link = deep_link(port.url, RID, TOK) + f"&choice=b&v={_v(port.qdir, RID)}"   # by hand: the page is under test
+    link = _legacy_link(port.url, RID, TOK) + f"&choice=b&v={_v(port.qdir, RID)}"   # by hand: the page is under test
     got = _drive(tmp_path, link, [
         PHONE, port.authenticator(),
         {"until": "document.querySelector('.req.sign.linked')"},
@@ -226,7 +233,7 @@ def test_his_pick_opens_as_one_sign_button_whose_tap_signs_exactly_that_option(t
 @needs_ssh
 def test_with_a_pick_another_option_still_signs_instead(tmp_path: Path, port: _Port) -> None:
     _file(port.qdir, RID)
-    got = _drive(tmp_path, deep_link(port.url, RID, TOK) + f"&choice=b&v={_v(port.qdir, RID)}", [
+    got = _drive(tmp_path, _legacy_link(port.url, RID, TOK) + f"&choice=b&v={_v(port.qdir, RID)}", [
         PHONE, port.authenticator(),
         {"until": "document.querySelector('.req.sign.linked .picked')"},
         {"eval": "[...document.querySelectorAll('.req.sign.linked .actions .option')]"
@@ -258,7 +265,7 @@ def test_a_pick_the_card_does_not_offer_draws_nothing_and_says_so(tmp_path: Path
                   {"eval": _PICKED}]
         if n == 0:
             steps.append(_shot(tmp_path, "pick-forged-390.png"))
-    first = deep_link(port.url, cases[0][0], TOK) + "&choice=" + cases[0][1] + "&v=" + _v(port.qdir, cases[0][0])
+    first = _legacy_link(port.url, cases[0][0], TOK) + "&choice=" + cases[0][1] + "&v=" + _v(port.qdir, cases[0][0])
     got = _drive(tmp_path, first, steps)
     seen = [v for v in got["values"] if isinstance(v, dict) and "miss" in v]
     assert len(seen) == 4, got["values"]
@@ -294,7 +301,7 @@ def test_a_picked_link_to_a_request_no_longer_open_says_where_it_stands_on_the_f
                       "ms": 6000})
         if n == 0:
             steps.append(_shot(tmp_path, "pick-signed-already-390.png"))
-    _drive(tmp_path, deep_link(port.url, "np-sign0001-aaaa", TOK) + "&choice=b", steps)
+    _drive(tmp_path, _legacy_link(port.url, "np-sign0001-aaaa", TOK) + "&choice=b", steps)
 
 
 # --- L3 r1 (project_memory 1025-18/preselect/RULINGS_R1.md) -----------------------------------------------------------
@@ -336,7 +343,7 @@ def test_a_pick_for_a_request_not_listed_draws_nothing_on_another_card_offering_
     line or the miss line, on the first listing and on the next."""
     _file(port.qdir, RID)                                           # offers (a) and (b)
     asked = _asks(port, ["open"])
-    link = deep_link(port.url, "np-unls0001-aaaa", TOK) + "&choice=a&v=0123456789abcdef"
+    link = _legacy_link(port.url, "np-unls0001-aaaa", TOK) + "&choice=a&v=0123456789abcdef"
     got = _drive(tmp_path, link, [
         PHONE, {"until": "document.querySelector('.req.sign .req-head')"}, {"eval": _ALL_PICKS},
         _shot(tmp_path, "pick-unlisted-r1-390.png"), {**_SLEEP, "ms": 11000}, {"eval": _ALL_PICKS}])
@@ -363,7 +370,7 @@ def test_a_pick_made_on_an_earlier_version_of_the_item_draws_no_shortcut(tmp_pat
                   {"eval": _PICKED}]
         if n == 0:
             steps.append(_shot(tmp_path, "pick-stale-version-r1-390.png"))
-    got = _drive(tmp_path, deep_link(port.url, RID, TOK) + f"&choice=b&v={old}", steps)
+    got = _drive(tmp_path, _legacy_link(port.url, RID, TOK) + f"&choice=b&v={old}", steps)
     seen = [v for v in got["values"] if isinstance(v, dict) and "miss" in v]
     assert len(seen) == 2, got["values"]
     assert seen[0]["picked"] is None and seen[0]["miss"] == "this item changed since your tap: read it and pick again", seen
@@ -383,7 +390,7 @@ def test_only_a_terminal_state_lets_a_picked_link_go_and_a_failed_or_open_answer
     asked = _asks(port, [RuntimeError("a passing fault"), "gone", "signed"])
     rid = "np-late0001-aaaa"
     words = f"the linked sign request {rid} is already signed here"
-    got = _drive(tmp_path, deep_link(port.url, rid, TOK) + f"&choice=b&v=0123456789abcdef", [
+    got = _drive(tmp_path, _legacy_link(port.url, rid, TOK) + f"&choice=b&v=0123456789abcdef", [
         PHONE, {"until": "document.getElementById('status').textContent.includes('waiting on you')"},
         {**_SLEEP, "ms": 2000}, {"eval": "document.getElementById('status').textContent"},
         {"until": f"document.getElementById('status').textContent.includes({json.dumps(words)})", "ms": 30000},
@@ -399,7 +406,7 @@ def test_a_picked_link_asks_nothing_while_the_sign_side_has_a_fault(tmp_path: Pa
     """r1 item 3: while the listing carries ``sign_note`` (here: no passkey enrolled), the state route is not asked."""
     asked = _asks(port, ["signed"])
     port.srv._sign_keys = lambda: {}
-    _drive(tmp_path, deep_link(port.url, "np-flt00001-aaaa", TOK) + "&choice=b&v=0123456789abcdef", [
+    _drive(tmp_path, _legacy_link(port.url, "np-flt00001-aaaa", TOK) + "&choice=b&v=0123456789abcdef", [
         PHONE, {"until": "document.getElementById('status').textContent.includes('waiting on you')"},
         {**_SLEEP, "ms": 11000}])
     assert asked == [], asked
@@ -450,7 +457,7 @@ def test_the_app_built_link_sign_v_choice_draws_the_shortcut_and_v_alone_draws_n
     ``&choice=<key>`` after it, so the page reads the fragment's keys in any order. ``v=`` alone is a plain card: no
     shortcut, no pick line, no miss line."""
     _file(port.qdir, RID)
-    base = deep_link(port.url, RID, TOK) + f"&v={_v(port.qdir, RID)}"     # by hand: the page is under test here
+    base = _legacy_link(port.url, RID, TOK) + f"&v={_v(port.qdir, RID)}"     # by hand: the page is under test here
     steps: list[dict] = [PHONE]
     for n, frag in enumerate((f"sign={RID}&v={_v(port.qdir, RID)}&choice=b", f"sign={RID}&v={_v(port.qdir, RID)}")):
         if n:

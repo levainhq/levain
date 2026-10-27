@@ -1,8 +1,8 @@
 // levain devices_panel.js — the cockpit's Devices panel (per-device pairing, PAIR_DESIGN.md REV 1-6).
 //
-// Lists the paired devices (GET /cockpit/pair/devices.json), mints a one-time pairing link (POST /cockpit/pair/offer {label}) and
-// revokes a device and its family (POST /cockpit/pair/revoke {id}). It rides the page's own credential: the token the cockpit
-// keeps in localStorage "levain_write_token" (dashboard_boot.js WRITE_TOKEN_KEY). Everything is drawn with textContent: this
+// Lists the paired devices (GET /cockpit/pair/devices.json), mints a one-time pairing link (POST /cockpit/pair/offer {label}),
+// revokes a device and its family (POST /cockpit/pair/revoke {id}), and turns pings on for this browser (OS-4, /webpush/*).
+// It rides the page's own credential: the token the cockpit keeps in localStorage "levain_write_token" (dashboard_boot.js WRITE_TOKEN_KEY). Everything is drawn with textContent: this
 // file shares a page with that token, so it adds no HTML sink. A server with no writable cockpit answers 404 and the panel never
 // appears; a page with no usable credential shows nothing either.
 (function () {
@@ -17,6 +17,14 @@
   // skip reads while the stored token is still it, so a fresh token (a new link, the prompt) brings the panel back.
   let running = null, rerun = false, gone = false, refused = "";
   const READ_TIMEOUT_MS = 20000;
+  // ONESURFACE OS-4: pings for THIS browser. The row appears only where the cockpit serves web push (GET /webpush/key
+  // answers, beside a Signer). Only a paired device's key may subscribe (the server answers 403 device_required to the
+  // cockpit's own key), so every subscription has a revoke above it. The worker (/sw.js) keeps the key to record an
+  // open, and is told to send it under this page's header (H), on every read, so a re-paired browser hands it the new one.
+  const PUSH_OK = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+  let pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
+  const b64uToBytes = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
+                                             (c) => c.charCodeAt(0));
 
   function token() { try { return window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { return ""; } }
   function el(tag, cls, text) {
@@ -70,6 +78,17 @@
     const body = el("div", "pbody dev-body");
     list = el("div", "dev-list");
     body.appendChild(list);
+    pingRow = el("div", "dev-row dev-pings"); pingRow.hidden = true;
+    const pm = el("div", "dev-main");
+    pm.appendChild(el("div", "dev-name", "Pings on this browser"));
+    pingState = el("div", "dev-meta", "");
+    pm.appendChild(pingState);
+    pingRow.appendChild(pm);
+    pingBtn = el("button", "dev-btn", "Turn on");
+    pingBtn.type = "button";
+    pingBtn.addEventListener("click", () => { if (pingBtn.dataset.on === "1") turnOff(); else turnOn(); });
+    pingRow.appendChild(pingBtn);
+    body.appendChild(pingRow);
 
     const form = el("form", "dev-offer");
     labelIn = el("input", "dev-label");
@@ -147,7 +166,84 @@
     if (!devs.length) list.appendChild(el("p", "dev-none", "No device is paired yet. Pair one below: it gets its own key, and you can revoke it here."));
     for (const d of devs) list.appendChild(row(d));
     if (!labelIn.value) labelIn.placeholder = "name the new device, e.g. iPad";
+    pings();
     return true;
+  }
+
+  // ---- pings (OS-4) -------------------------------------------------------------------------------------------------
+  // The page's registration of /sw.js, or null (none yet: pings were never turned on in this browser)
+  function registration() {
+    return navigator.serviceWorker.getRegistration("/").catch(() => null);
+  }
+  // The worker keeps the key it sends with an open; told the header every time, so it never falls back to another port's
+  function giveToken(reg) {
+    const t = token(), w = reg && (reg.active || reg.waiting || reg.installing);
+    if (t && w) w.postMessage({ type: "levain-token", token: t, header: H });
+  }
+  async function pings() {
+    if (!PUSH_OK) return;
+    if (!pushAsked) {
+      pushAsked = true;
+      try {
+        const res = await api("GET", "/webpush/key", undefined, READ_TIMEOUT_MS);
+        if (res.status === 200 && typeof res.data.key === "string") pushKey = res.data.key;
+        else if (res.status !== 200 && res.status !== 404) { pushAsked = false; return; }   // a 5xx or odd answer: ask again on the next read
+      } catch (_) { pushAsked = false; return; }      // no answer: ask again on the next read
+    }
+    if (!pushKey) return;                               // this cockpit serves no web push: no row
+    pingRow.hidden = false;
+    const reg = await registration();
+    giveToken(reg);
+    const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
+    pingBtn.dataset.on = sub ? "1" : "";
+    pingBtn.textContent = sub ? "Turn off" : "Turn on";
+    pingBtn.setAttribute("aria-label", sub ? "Turn pings off on this browser" : "Turn pings on for this browser");
+    pingState.textContent = sub ? "on: a sign request or a question pings this browser"
+      : Notification.permission === "denied" ? "off: this browser blocks notifications from this page"
+      : "off: turn on to be pinged here when the cockpit needs you";
+  }
+  async function turnOn() {
+    pingBtn.disabled = true; say("");
+    let sub = null;
+    try {
+      // the permission prompt must come straight from the tap, so it is the first thing this handler does
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") { say("Pings stay off: the browser did not allow notifications for this page."); return; }
+      await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+      const reg = await navigator.serviceWorker.ready;
+      const old = await reg.pushManager.getSubscription();
+      if (old) await old.unsubscribe().catch(() => {});
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(pushKey) });
+      const j = sub.toJSON();
+      const res = await api("POST", "/webpush/subscribe", { endpoint: j.endpoint, keys: j.keys });
+      if (res.status !== 200) {
+        // a browser subscription the cockpit does not hold would read "on" and never ping
+        await sub.unsubscribe().catch(() => {});
+        say(res.data.error === "device_required"
+          ? "Pings need this browser's own key: make a pairing link above, open it in this browser, then turn pings on."
+          : "Could not turn pings on (" + (res.data.message || res.status) + ").");
+        return;
+      }
+      giveToken(reg);
+      say("Pings are on for this browser.");
+    } catch (e) {
+      if (sub) await sub.unsubscribe().catch(() => {});
+      say("Could not turn pings on: " + ((e && e.message) || e));
+    } finally { pingBtn.disabled = false; pings(); }
+  }
+  async function turnOff() {
+    pingBtn.disabled = true; say("");
+    try {
+      const reg = await registration();
+      const sub = reg ? await reg.pushManager.getSubscription() : null;
+      if (sub) {
+        const endpoint = sub.endpoint;
+        await sub.unsubscribe();
+        await api("POST", "/webpush/unsubscribe", { endpoint: endpoint });
+      }
+      say("Pings are off for this browser.");
+    } catch (e) { say("Could not turn pings off: " + ((e && e.message) || e)); }
+    finally { pingBtn.disabled = false; pings(); }
   }
 
   function refresh() {

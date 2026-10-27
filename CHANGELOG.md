@@ -7,6 +7,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **The cockpit's Build tab has a Threads section.** It shows the coordinator's threads and one thread's stream in the
+  order it happened, with running tool calls, approvals shown as a line pointing you to Needs you, and your own lines
+  marked unverified. It needs the page's write token and is read-only for now.
+- **Pings come from the cockpit's own origin.** The cockpit serves web push itself (service worker, manifest,
+  `/webpush/*`), behind its credential. The Devices panel turns pings on for the browser you are using: pair it, then
+  Turn on; on a phone, add the cockpit to the Home Screen and pair it from there. Only a paired device can turn pings
+  on, and a revoked device gets no ping, whatever happened to its stored subscriptions: every send checks the device
+  is still paired.
+- **Sign links open the cockpit's sheet and carry no token.** `levain.consent.sign.deep_link` builds
+  `<origin>/sign/<id>`. `levain consent phone --redirect-to <origin>` runs the old phone port as a redirect only: links
+  you already hold open the cockpit's sign sheet, and the token in them is dropped, never sent on.
 - **`levain consent canary --sandbox` checks the confinement.** It asks the agent, started through `levain session`,
   to run one fixed probe that tries five escapes (a write in your home, a host off the allow-list, your cockpit's port,
   a stand-in port the canary counts, a git hook in the repository the session was cloned from). The verdict comes from
@@ -178,6 +189,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   command line includes `--guard <guard.json>`.
 
 ### Changed
+- **The consent queue's store moves to format 5, one way.** The first consent hook call or `levain` command that opens
+  it migrates it in place (from format 3 or 4), keeping every request, signed answer and receipt. An older levain then
+  refuses that store: its hook makes no decision (the agent's own permission dialog asks), standing grants stop
+  answering, and agent-config edits are denied. There is no way back to format 4, so upgrade every levain that shares
+  the store (the hook, the cockpit, the CLI) together.
 - **A coordinator store made by an earlier version is updated the first time a `levain` command that writes to it
   opens it:** the review history gains one column, and every entry is kept as it was.
 - **`levain doctor` has an agent firewall probe row:** each agent slot's last recorded probe result, with its age and
@@ -204,6 +220,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   a plainly written address.
 
 ### Fixed
+- **A brokered call the vendor refuses now records the vendor's error in the gateway log** (`upstream_error` in
+  `gw.jsonl`: the error type, a short message and the request id, with any configured credential redacted), so a
+  refusal such as a 400 says why instead of only its status.
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
   refilled,** so a keys failure cannot leave the pool short.
 - **Two sessions making their first call at the same moment on a fresh install could both be refused with
@@ -277,6 +296,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   guard is refused at signing instead of the check crashing.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- **A contained-shell grant can answer a Levain chat launch's Bash calls.** It answers only a chat call carrying the
+  proof of the launch it was granted for, never a Claude Code or Codex hook call; it is listed, counted and revocable
+  like any standing grant, and an answer it gave stops being delivered once it is revoked. Nothing launches a chat
+  session that uses it yet (CH-D2).
+- **The autonomic store can keep every attempt of an effect (store format /3).** A retry carries the authority of the
+  attempt before it (the same grant and cover); an attempt on a held link carries the hold's current decision, names
+  who decided (a person or not) as that decision does, and fires no lower than the rung it decided. An attempt that
+  never started is closed as refused, with its reason. The store refuses an unknown actor or posture and a run with no
+  id. Nothing writes a /3 store yet.
 - **A step a graduation policy covers is checked again just before it fires.** Once the binding driver is wired, the
   step about to run reads its cover afresh: if the cover changed since the step was decided, or cannot be read, the
   step is held and no receipt is written. The run is refused and ended when the policy does not sign this action at this risk, cover value

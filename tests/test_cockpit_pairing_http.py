@@ -671,3 +671,16 @@ def test_g5_a_starter_thread_that_cannot_start_is_a_503_and_is_retried(src, monk
         monkeypatch.undo()
         st, out, _ = _call(port, "GET", "/cockpit/pair/devices.json", token=T)
         assert st == 200 and out["devices"] == [], out
+
+
+def test_rq6_the_point_of_use_check_raises_without_assert(src) -> None:
+    """RQ-6 at the point of use: a paired-namespace name reaching the token loop is refused by a raise, so
+    ``python -O`` cannot strip it."""
+    with _serve(src) as (port, httpd):
+        httpd.surface_tokens["paired-d-0123456789ab"] = "x" * 40
+        handler = httpd.RequestHandlerClass
+        h = handler.__new__(handler)
+        h.server = httpd
+        h.headers = {}
+        with pytest.raises(RuntimeError, match="paired namespace"):
+            h._resolve_credential()
