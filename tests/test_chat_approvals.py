@@ -834,3 +834,59 @@ def test_latch_denies_a_carded_request(cs, claude, tmp_path):
     (attempt,) = latch_not_live(cs, launch_id=claude["launch"], source="tripwire:deficit", cause="x")
     assert attempt.vendor_request_key == row.vendor_request_key
     assert events(cs, row.launch_id, row.vendor_request_key) == ["core_result", "decision_observed", "answer_attempted"]
+
+
+# --- fix round 2 -------------------------------------------------------------------------------------------------
+def _arrive_with_transport(cs, launch, c, transport):
+    with cs._write() as (conn, now):
+        return arrive(conn, now, launch_id=launch, raw_vendor_key=claude_raw_key(NONCE, "toolu_1"),
+                      transport_key=transport, vendor_turn_id="t-1", vendor_call_id="toolu_1", approval_id=None,
+                      kind="host", available_decisions=("allow", "deny"), tool_name="Bash",
+                      tool_input={"command": "ls"}, ctx=c, spawn_nonce=NONCE)
+
+
+def test_replay_with_a_new_transport_key_is_addressed_by_the_current_one(cs, claude, tmp_path):
+    c = ctx(tmp_path)
+    first = _arrive_with_transport(cs, claude["launch"], c, "req-old")
+    again = _arrive_with_transport(cs, claude["launch"], c, "req-new")
+    assert again.disposition == "replay" and again.row.vendor_request_key == first.row.vendor_request_key
+    assert again.row.transport_key == "req-new"
+    attempts = latch_not_live(cs, launch_id=claude["launch"], source="tripwire:deficit", cause="x")
+    assert [a.raw_vendor_key for a in attempts] == ["req-new"]
+
+
+def test_quarantine_replay_with_a_new_transport_key_is_addressed_by_the_current_one(cs, claude):
+    def q(transport):
+        with cs._write() as (conn, now):
+            return record_quarantine(conn, now, launch_id=claude["launch"], spawn_nonce=NONCE, raw_line=b"junk",
+                                     transport_key=transport)
+    q("req-old")
+    assert q("req-new").row.transport_key == "req-new"
+    attempts = latch_not_live(cs, launch_id=claude["launch"], source="tripwire:deficit", cause="x")
+    assert [a.raw_vendor_key for a in attempts] == ["req-new"]
+
+
+def test_only_transport_key_may_change_on_an_approval_row(cs, claude, tmp_path):
+    _request(cs, claude, tmp_path)
+    with cs._write() as (conn, _now):
+        conn.execute("UPDATE chat_approvals SET transport_key = 'req-x'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        with cs._write() as (conn, _now):
+            conn.execute("UPDATE chat_approvals SET tool_name = 'Other'")
+
+
+def test_cancel_after_a_card_still_writes_the_terminal(cs, claude, tmp_path):
+    row = _request(cs, claude, tmp_path)
+    assert _abstain(cs, row) == "card"
+    assert row.vendor_request_key in cs._read(lambda conn: ca.pending_requests(conn, row.launch_id))
+    record_cancelled(cs, launch_id=row.launch_id, vendor_request_key=row.vendor_request_key,
+                     cause="control_cancel_request", tag="x")
+    assert events(cs, row.launch_id, row.vendor_request_key) == ["core_result", "decided_after_turn"]
+    assert row.vendor_request_key not in cs._read(lambda conn: ca.pending_requests(conn, row.launch_id))
+
+
+def test_cancel_after_decision_observed_writes_nothing(cs, claude, tmp_path):
+    row = _request(cs, claude, tmp_path)
+    _ev(cs, row, "decision_observed", decision="deny")
+    record_cancelled(cs, launch_id=row.launch_id, vendor_request_key=row.vendor_request_key, cause="not_live", tag="x")
+    assert events(cs, row.launch_id, row.vendor_request_key) == ["decision_observed"]

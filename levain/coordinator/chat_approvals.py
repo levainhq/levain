@@ -61,12 +61,15 @@ TERMINAL_KINDS = ("turn_ended", "resolved_outside", "driver_lost", "decided_afte
 CANCEL_CAUSES = ("turn_ended", "not_live", "control_cancel_request", "stop", "kill", "stdin closed", "service shutdown")
 # the causes whose terminal row is driver_lost; the others are decided_after_turn (§3.4 record_cancelled)
 _DRIVER_LOST_CAUSES = ("stop", "kill", "stdin closed", "service shutdown")
-# a request carrying any of these gets no further core_result and no further terminal from record_cancelled /
-# record_abstain
-_SETTLED_KINDS = frozenset(TERMINAL_KINDS) | {"core_result", "answer_attempted"}
+# record_cancelled leaves a request carrying any of these alone: a terminal, or one the decision door owns
+_CANCEL_SKIP_KINDS = frozenset(TERMINAL_KINDS) | {"answer_attempted", "decision_observed"}
 _CAUSE_MAX = 200
 _HEX32 = re.compile(r"[0-9a-f]{32}")
 _DENY_DECISIONS = ("decline", "cancel", "denied", "abort")      # a Codex row's refusing decisions, best first
+
+_FROZEN_APPROVAL_COLUMNS = ("launch_id", "vendor_request_key", "gseq", "raw_vendor_key", "vendor_turn_id",
+                            "vendor_call_id", "approval_id", "kind", "route", "available_decisions", "tool_name",
+                            "tool_input_digest", "targets_agent_config", "spawn_nonce", "at", "rowid")
 
 APPROVAL_SCHEMA: tuple[str, ...] = (
     # §2.5: one vendor approval request. The key CHECKs pin the deterministic shape (raw key + ':call:' + 64 lowercase
@@ -90,7 +93,13 @@ APPROVAL_SCHEMA: tuple[str, ...] = (
     "CHECK ((kind = 'quarantine') = (tool_name = '')), "
     "CHECK (kind <> 'quarantine' OR (targets_agent_config = 1 AND spawn_nonce IS NOT NULL "
     "AND raw_vendor_key = 'quarantine:' || spawn_nonce || ':' || tool_input_digest)))",
-    *_append_only("chat_approvals", "a chat approval"),
+    # append-only but for the one column a replay refreshes: transport_key (the id a reply is addressed by on the
+    # CURRENT connection); every other column is frozen
+    "CREATE TRIGGER IF NOT EXISTS chat_approvals_frozen BEFORE UPDATE ON chat_approvals WHEN "
+    + " OR ".join(f"NEW.{c} IS NOT OLD.{c}" for c in _FROZEN_APPROVAL_COLUMNS)
+    + " BEGIN SELECT RAISE(ABORT, 'a chat approval is append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS chat_approvals_kept BEFORE DELETE ON chat_approvals "
+    "BEGIN SELECT RAISE(ABORT, 'a chat approval is append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS chat_approvals_no_replace BEFORE INSERT ON chat_approvals WHEN EXISTS (SELECT 1 FROM "
     "chat_approvals WHERE (launch_id = NEW.launch_id AND vendor_request_key = NEW.vendor_request_key) "
     "OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a chat approval is never replaced'); END",
@@ -427,6 +436,18 @@ def _insert(conn: sqlite3.Connection, now: str, **f: Any) -> ApprovalRow:
     return got
 
 
+def _refresh_transport(conn: sqlite3.Connection, held: ApprovalRow, transport_key: str) -> ApprovalRow:
+    """A replay (same durable key) carries the CURRENT connection's transport id: record it, the one column the table
+    lets change, so a later deny is addressed to the live id."""
+    if held.transport_key == transport_key:
+        return held
+    conn.execute("UPDATE chat_approvals SET transport_key = ? WHERE launch_id = ? AND vendor_request_key = ?",
+                 (transport_key, held.launch_id, held.vendor_request_key))
+    got = approval(conn, held.launch_id, held.vendor_request_key)
+    assert got is not None
+    return got
+
+
 def arrive(conn: sqlite3.Connection, now: str, *, launch_id: str, raw_vendor_key: str, transport_key: str,
            vendor_turn_id: str, vendor_call_id: str | None, approval_id: str | None, kind: str,
            available_decisions: Sequence[str] | None,
@@ -458,7 +479,7 @@ def arrive(conn: sqlite3.Connection, now: str, *, launch_id: str, raw_vendor_key
     key = durable_key(raw_vendor_key, tool_name, digest)
     held = approval(conn, launch_id, key)
     if held is not None:
-        return Arrival("replay", held)
+        return Arrival("replay", _refresh_transport(conn, held, transport_key))
     row = _insert(conn, now, launch_id=launch_id, key=key, raw=raw_vendor_key, transport=transport_key,
                   turn=vendor_turn_id, call=vendor_call_id,
                   approval_id=approval_id, kind=kind, route="core" if kind == "host" else "native",
@@ -486,7 +507,7 @@ def record_quarantine(conn: sqlite3.Connection, now: str, *, launch_id: str, spa
     key = durable_key(raw, "", digest)
     held = approval(conn, launch_id, key)
     if held is not None:
-        return Arrival("replay", held)
+        return Arrival("replay", _refresh_transport(conn, held, transport_key))
     row = _insert(conn, now, launch_id=launch_id, key=key, raw=raw, transport=transport_key, turn=vendor_turn_id,
                   call=None, approval_id=None,
                   kind="quarantine", route="quarantine", decisions=("deny",), tool_name="", digest=digest, tagged=True,
@@ -564,8 +585,9 @@ def mark_driver_lost(conn: sqlite3.Connection, now: str, launch_id: str, cause: 
 def record_cancelled(store: "ChatStore", *, launch_id: str, vendor_request_key: str, cause: str, tag: str) -> None:
     """§3.4 R7-8: a cancelled core call, in one transaction: ``core_result`` (``decision`` the union's ``tag``, cause
     ``cancelled: <cause>``) then the named terminal row: ``driver_lost`` for ``stop`` / ``kill`` / ``stdin closed`` /
-    ``service shutdown``, else ``decided_after_turn``. Idempotent: a request that already carries a ``core_result``, an
-    ``answer_attempted`` or any terminal kind gets nothing written (a retry, or a request a producer already settled).
+    ``service shutdown``, else ``decided_after_turn``. Idempotent: a request already carrying a terminal kind,
+    ``answer_attempted`` or ``decision_observed`` gets nothing written (the decision door owns it); one with a
+    ``core_result`` (a card) but no terminal gets the terminal only.
     Never a card, never forwarded. (``result=out`` of the design is its ``tag``: this module does not
     import the consent core's union.)"""
     if cause not in CANCEL_CAUSES:
@@ -573,10 +595,12 @@ def record_cancelled(store: "ChatStore", *, launch_id: str, vendor_request_key: 
     with store._write() as (conn, now):
         if approval(conn, launch_id, vendor_request_key) is None:
             raise CoordError(f"no approval request {vendor_request_key[:60]!r} on launch {launch_id}")
-        if _kinds(conn, launch_id, vendor_request_key) & _SETTLED_KINDS:
-            return                    # idempotent: a retry, or a request already settled, gets no second row of any kind
-        append_event(conn, now, launch_id=launch_id, key=vendor_request_key, kind="core_result", by="core",
-                     decision=tag, cause=f"cancelled: {cause}")
+        have = _kinds(conn, launch_id, vendor_request_key)
+        if have & _CANCEL_SKIP_KINDS:
+            return                    # idempotent: a retry, a settled request, or one the decision door owns
+        if "core_result" not in have:  # a card (core_result none) withdrawn later still gets its terminal, no 2nd result
+            append_event(conn, now, launch_id=launch_id, key=vendor_request_key, kind="core_result", by="core",
+                         decision=tag, cause=f"cancelled: {cause}")
         terminal = "driver_lost" if cause in _DRIVER_LOST_CAUSES else "decided_after_turn"
         append_event(conn, now, launch_id=launch_id, key=vendor_request_key, kind=terminal, by="service",
                      cause=f"cancelled: {cause}")
