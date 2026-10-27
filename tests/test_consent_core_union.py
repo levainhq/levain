@@ -301,3 +301,14 @@ def test_core_call_of_ignores_what_decide_ignores():
 
 def test_containment_format_is_the_ruled_one():
     assert CONTAINMENT_FORMAT == "levain-containment/4"
+
+
+# --- R8-6: the chat core files under its own event source; a hook caller files as before --------------------
+
+def test_a_chat_call_is_filed_with_the_chat_event_source(tmp_path):
+    q = Q(None)
+    ex(_event(tool_use_id="toolu_1"), q, tmp_path, nonce=NONCE)
+    assert q.filed[0]["event_source"] == "chat" and q.filed[0]["event_id"] == "toolu_1"
+    q = Q(None)
+    ex(_event(tool_use_id="toolu_1"), q, tmp_path)
+    assert "event_source" not in q.filed[0]

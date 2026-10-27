@@ -898,7 +898,9 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
     event's cwd here, never as a list from the caller, so no call can leave it out; a queue without a directory
     raises before anything is filed. A chat call (``launch_nonce`` not ``""``) is declined before anything is
     filed when it has no ``tool_use_id``, when it is Bash with :data:`SANDBOX_ESCAPE_KEY` in its input (any
-    value), and when it is :data:`SANDBOX_NET_TOOL` (any input); a hook caller's call is never declined for these."""
+    value), and when it is :data:`SANDBOX_NET_TOOL` (any input); a hook caller's call is never declined for these.
+    A chat call's request is filed with ``event_source="chat"`` (its own ``chat:`` event id); a hook caller's is
+    filed exactly as before."""
     if getattr(queue, "directory", None) is None:
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
     if not isinstance(launch_nonce, str):
@@ -953,7 +955,7 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER,
                          event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
                          resume=resume_meta_of(event, environ=environ, claude_pid=claude_pid),
-                         model=event.get("model"))
+                         model=event.get("model"), **({"event_source": "chat"} if launch_nonce else {}))
     settled = False
     try:
         got: Decision | None = None

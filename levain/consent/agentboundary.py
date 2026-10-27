@@ -233,6 +233,12 @@ _OPERATOR_SUBREASONS = frozenset({"class", "revoked", "late"})
 _REFUSAL_AFTER = SETTLE - _CLOCK_SLACK
 
 
+def _tool_use_id_of(event_id: str) -> str | None:
+    """The tool-use id a request filed with its call's id carries: what follows a ``hook:`` (a hook) or ``chat:`` (the chat
+    core) prefix, else ``None`` (a request filed without one)."""
+    return event_id.split(":", 1)[1] if event_id.startswith(("hook:", "chat:")) else None
+
+
 class ExportError(ValueError):
     """The queue cannot be exported: not a readable current-format store, or a row no receipt can be made of."""
 
@@ -769,7 +775,7 @@ class _Evidence:
         """``(status, time)`` of the ledger row that is this request's call: the same agent, session, tool and
         input digest, a tool-use id equal when both carry one (an equal one is preferred), the time not before
         ``lower`` and before ``upper``, the earliest such row no earlier request took. ``None`` when there is none."""
-        use_id = row.event_id[len("hook:"):] if row.event_id.startswith("hook:") else self._pre.get(row.qid)
+        use_id = _tool_use_id_of(row.event_id) or self._pre.get(row.qid)
         best: tuple[tuple[Any, ...], tuple[Any, ...], str] | None = None
         for p in self._posts.get((row.agent, row.session, row.tool, row.digest), ()):
             if p[0] in self._claimed or (use_id is not None and p[3] is not None and p[3] != use_id):

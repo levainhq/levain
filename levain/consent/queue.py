@@ -238,6 +238,8 @@ REFUSED_BUSY_MS = 2000
 # a chat launch's egress card (chat_egress.cards.EGRESS_TOOL): filed with its card's own display, and decided only by
 # a signed answer, never a standing grant (Q-R15-7)
 EGRESS_TOOL = "levain_egress"
+# who files a request (:meth:`ConsentQueue.file`), and so the prefix of its stored event id
+EVENT_SOURCES = ("hook", "chat")
 
 def _requests_table(name: str) -> str:
     return (f"CREATE TABLE IF NOT EXISTS {name} (id TEXT PRIMARY KEY, agent TEXT NOT NULL, "
@@ -994,11 +996,16 @@ class ConsentQueue:
 
     def file(self, *, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, cwd: str,
              hold: timedelta, tier: str = "T2", event_id: str | None = None,
-             resume: Mapping[str, Any] | None = None, model: Any = None) -> ExternalGateRequest:
+             resume: Mapping[str, Any] | None = None, model: Any = None,
+             event_source: str = "hook") -> ExternalGateRequest:
         """File one gate an agent is waiting on; its hold (``expires_at``) ends ``hold`` after now, after which no
         answer applies and only the hook's :meth:`mark_undecided` does until it expires. ``tier`` must be one an
         allow can be signed at (``T2`` or ``T3``). ``event_id`` is the hook's own unique id for this
-        permission event when its agent has one; without it the request gets an unpredictable one. Either
+        permission event when its agent has one; without it the request gets an unpredictable one.
+        ``event_source`` says who files it: ``"hook"`` (every hook caller) stores ``"hook:" + event_id``; ``"chat"``
+        (the chat core, :data:`EVENT_SOURCES`) stores ``"chat:" + event_id`` and needs an ``event_id``, so a chat-core
+        row is never a gate's row (:meth:`take_gate_allow` takes only ``hook:`` rows) and never meets a gate filing of
+        the same tool-use id in the hook-event index. Either
         way two filings are two requests, never one returned twice: a hook event id is unique per agent and
         session in the store, so filing the same event again raises, at any time. ``resume`` is what a later
         resume of the session needs (``permission_mode``, ``invocation`` one of :data:`INVOCATIONS`,
@@ -1015,12 +1022,15 @@ class ConsentQueue:
             raise ConsentError(f"tier must be one of {tuple(_TIER_NEEDS)}: {tier!r}")
         if not isinstance(hold, timedelta) or hold <= timedelta(0):
             raise ConsentError("hold must be a positive timedelta")
-        if event_id is None:
+        if event_source not in EVENT_SOURCES:
+            raise ConsentError(f"event_source must be one of {', '.join(EVENT_SOURCES)}")
+        if event_id is None and event_source == "hook":
             event = "rand:" + os.urandom(16).hex()
         elif isinstance(event_id, str) and event_id:
-            event = "hook:" + event_id
+            event = event_source + ":" + event_id
         else:
-            raise ConsentError("event_id must be a non-empty string")
+            raise ConsentError("event_id must be a non-empty string" + (
+                " (a chat-core filing always names its call)" if event_source == "chat" else ""))
         if tool_name == EGRESS_TOOL:
             # a chat launch's egress card: its own display, in a fixed field order, never cut, after the card's whole
             # check and its filing's agent, tier, hold and event id (chat_egress.cards.filed_display)
@@ -1313,12 +1323,16 @@ class ConsentQueue:
             args: tuple[Any, ...] = (agent, agent_session_id, tool_name, digest)
             row = None
             if use_id is not None:
-                row = conn.execute("SELECT id, state, decided_at " + where + " AND event_id = ? "
-                                   "ORDER BY received_at DESC, rowid DESC LIMIT 1", args + ("hook:" + use_id,)).fetchone()
+                for prefix in ("hook:", "chat:"):
+                    row = conn.execute("SELECT id, state, decided_at " + where + " AND event_id = ? "
+                                       "ORDER BY received_at DESC, rowid DESC LIMIT 1",
+                                       args + (prefix + use_id,)).fetchone()
+                    if row is not None:
+                        break
             if row is None:
-                # a request that carries another call's id is not this call's; one with none (a PermissionRequest
-                # Claude Code and Codex send without it) could be
-                extra = " AND event_id NOT LIKE 'hook:%'" if use_id is not None else ""
+                # a request that carries another call's id, of either prefix, is not this call's; one with none (a
+                # PermissionRequest Claude Code and Codex send without it) could be
+                extra = " AND event_id NOT LIKE 'hook:%' AND event_id NOT LIKE 'chat:%'" if use_id is not None else ""
                 row = conn.execute("SELECT id, state, decided_at " + where + extra +
                                    " ORDER BY (state = 'pending') DESC, received_at DESC, rowid DESC LIMIT 1",
                                    args).fetchone()
