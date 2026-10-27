@@ -94,9 +94,11 @@ def test_a_busy_server_answers_503_not_a_dead_connection(tmp_path, seeded):
                 httpd.request_gate.release()
 
 
-_COUNT = ("window.__th = 0; const f0 = window.fetch; window.fetch = function (u, o) {"
-          " if (String(u).indexOf('/cockpit/thread') === 0) window.__th++; return f0.call(this, u, o); }; 1")
-_WAIT = "new Promise(r => setTimeout(() => r(window.__th), 2600))"
+# the thread reads the page has made, from resource timing (thread_view.js binds fetch at mount, so a wrapper installed
+# later would never see them)
+_READS = "performance.getEntriesByType('resource').filter(e => e.name.indexOf('/cockpit/thread') > 0).length"
+_COUNT = f"performance.setResourceTimingBufferSize(10000); window.__th = () => {_READS}; 1"
+_WAIT = "new Promise(r => setTimeout(() => r(window.__th()), 2600))"
 
 
 @needs_browser
@@ -116,8 +118,8 @@ def test_the_build_tab_zone_reads_only_while_build_is_shown_and_hides_without_a_
             {"until": "document.querySelector('.th-zone .tv-row')"},
             {"eval": "document.querySelector('.th-zone .tv-row').getAttribute('data-thread')"},
             {"eval": "document.querySelector('.th-zone').hidden"},
-            {"eval": "document.querySelector('[data-mode-tab=board]').click(); window.__th0 = window.__th; 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(window.__th - window.__th0), 4500))"},   # left Build: polling stopped
+            {"eval": "document.querySelector('[data-mode-tab=board]').click(); window.__th0 = window.__th(); 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(window.__th() - window.__th0), 4500))"},   # left Build: polling stopped
         ])
     v = out["values"]
     hidden_without_token, board_reads, row, hidden_with_token, after_leaving = v[1], v[6], v[9], v[10], v[12]
