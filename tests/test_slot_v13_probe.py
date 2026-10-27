@@ -458,6 +458,8 @@ def test_t3_probe_hosts_ordered_tuples_within_vendor_hosts_and_shipped_upstreams
         assert set(hosts) <= SV.VENDOR_HOSTS[vendor] | upstreams, vendor
     assert set(PB.PROBE_HOSTS) == set(SV.VENDOR_HOSTS)
     for r in VR.vendor_routes():          # every shipped route's upstream IS probed for each vendor it serves
+        if "upstream" not in r:           # a CONNECT route (subscription_passthrough) has hosts, no upstream
+            continue
         for vendor in [v for v in SV.VENDOR_HOSTS if SV._hosts(r) & SV.VENDOR_HOSTS[v]]:
             assert r["upstream"]["host"] in PB.PROBE_HOSTS[vendor], (r["route"], vendor)
 

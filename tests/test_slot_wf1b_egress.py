@@ -82,7 +82,7 @@ def _base(L):
 
 def test_routes_base_on_the_empty_map_writes_anthropic_and_egress_default(L):
     got = IH.run_routes_base(ME, "darwin", lock=_Lock(), store_seams=_rs(L), err=io.StringIO())
-    assert got == {"verb": "routes-base", "routes": ["anthropic", "egress-default"], "written": True}
+    assert got == {"verb": "routes-base", "routes": ["anthropic", "claude-subscription", "egress-default"], "written": True}
     parsed = P.parse_base_map(_read_map(L))
     assert parsed["egress-default"].type == "egress" and list(parsed["egress-default"].hosts) == F3
     # the route the merge ships is replaced whole by id, as the vendor route is
@@ -274,7 +274,8 @@ def test_base_routes_carry_the_hosts_of_every_route(L):
     _base(L)
     _egress(L, ["crates.io"])
     types, hosts = RH.base_routes(_Store((L / "routes" / "base.json").read_bytes()))
-    assert types == {"anthropic": "brokered", "egress-default": "egress", "egress-operator": "egress"}
+    assert types == {"anthropic": "brokered", "claude-subscription": "subscription_passthrough",
+                     "egress-default": "egress", "egress-operator": "egress"}
     assert hosts["egress-default"] == tuple(F3) and hosts["egress-operator"] == ("crates.io",)
     assert hosts["anthropic"] == ("api.anthropic.com",)
     assert RH.base_route_types(_Store((L / "routes" / "base.json").read_bytes())) == types

@@ -36,7 +36,7 @@ def _routes_base(L):
 def test_the_pre_wf1b_map_with_a_users_pypi_route_merges(L, fmt):
     _write_map(L, [OLD_PYPI], fmt)
     got, err = _routes_base(L)
-    assert got == {"verb": "routes-base", "routes": ["anthropic", "egress-default"], "written": True}
+    assert got == {"verb": "routes-base", "routes": ["anthropic", "claude-subscription", "egress-default"], "written": True}
     parsed = P.parse_base_map(_read_map(L))
     assert list(parsed["pypi"].hosts) == ["pypi.org"]
     assert list(parsed["egress-default"].hosts) == [h for h in F3 if h != "pypi.org"]
@@ -61,7 +61,7 @@ def test_the_setup_step_merges_the_old_map_and_names_the_omission(L):
     step, = IH.base_routes_merge_steps("darwin", store=L)
     ok, line = step.call()
     assert ok, line
-    assert line.startswith("merged the shipped routes anthropic, egress-default")
+    assert line.startswith("merged the shipped routes anthropic, claude-subscription, egress-default")
     assert "pypi.org" in line and "route pypi" in line
 
 
@@ -85,7 +85,7 @@ def test_an_operator_host_a_later_release_ships_stays_on_egress_operator(L):
 def test_every_shipped_host_on_a_users_route_ships_no_egress_default(L):
     _write_map(L, [{"route": "mine", "type": "egress", "hosts": list(F3)}])
     got, err = _routes_base(L)
-    assert got["routes"] == ["anthropic"]
+    assert got["routes"] == ["anthropic", "claude-subscription"]
     parsed = P.parse_base_map(_read_map(L))
     assert "egress-default" not in parsed and list(parsed["mine"].hosts) == F3
     assert sum("route mine" in x for x in err.splitlines()) == len(F3)
