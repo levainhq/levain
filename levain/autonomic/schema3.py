@@ -549,6 +549,23 @@ KNOWN_COLUMNS = {k: tuple(v) for k, v in KNOWN_COLUMNS.items()}
 for _t in LEGACY_TABLES:
     KNOWN_COLUMNS[_t] = KNOWN_COLUMNS[_t] + ("legacy",)
 KNOWN_COLUMNS["hold_decisions"] = ("hold_id", "run_id", "pending_id", "by", "n")
+# O-p2-1 (A6(b), R2-7): the attempt number, LAST, so no positional reader of a /2 row shifts
+KNOWN_COLUMNS["effects"] = KNOWN_COLUMNS["effects"] + ("attempt",)
+
+# O-p2-1 (A6(a)): the /3 effects table as authored; ddl_v3 creates it under this text (the stored DDL is this text on
+# every path, never SQLite's rename rewrite). One row per ATTEMPT of a link: the key gains `attempt`, and a link's
+# attempt ends `not_started` when nothing ran (section 3)
+EFFECTS_V3 = ("CREATE TABLE effects (run_id TEXT NOT NULL, effect_id TEXT NOT NULL, digest TEXT NOT NULL, "
+              "pid INTEGER, state TEXT NOT NULL CHECK (state IN ('intent', 'done', 'unknown', 'not_started')), "
+              "result TEXT, receipt_id TEXT, seal TEXT, legacy INTEGER NOT NULL DEFAULT 0 CHECK (legacy IN (0, 1)), "
+              "attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1), PRIMARY KEY (run_id, effect_id, attempt))")
+# O-p2-1 (section 2, R2-8, R4-3): one end per link, one live attempt per link, one hold per link
+ATTEMPT_INDEXES = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS effects_one_end ON effects (run_id, effect_id) "
+    "WHERE state IN ('done', 'unknown')",
+    "CREATE UNIQUE INDEX IF NOT EXISTS effects_one_live ON effects (run_id, effect_id) WHERE state = 'intent'",
+    "CREATE UNIQUE INDEX IF NOT EXISTS holds_one_link ON holds (run_id, effect_id)",
+)
 
 HELD_TRIGGERS = (
     _abort("held_born", f"NOT IFNULL(NEW.n = 1 AND NEW.mark IS {_progress('NEW.subject')} "
@@ -831,12 +848,26 @@ KNOWN_COLUMNS["env_health"] = ("k", "at")
 
 def ddl_v3(conn: sqlite3.Connection) -> None:
     """The ``/3`` tables and columns over a ``/2`` schema, in the caller's write transaction. An upgrade stamps its
-    legacy rows between this and :func:`triggers_v3` (no trigger is installed yet)."""
+    legacy rows between this and :func:`triggers_v3` (no trigger is installed yet).
+
+    O-p2-1 (A6, R2-7, R2-8): SQLite cannot change a primary key in place, so ``effects`` is rebuilt to
+    :data:`EFFECTS_V3` after the added columns: the old table is renamed away, the authored text created, every row
+    copied with attempt 1, the old table dropped. The rebuild alone is skipped when ``attempt`` is already there; the
+    indexes after it are made every time (``IF NOT EXISTS``). A unique index that a stored row violates (two holds on
+    one link, P2) raises here, and the caller's transaction rolls the whole upgrade back."""
     for stmt in V3_TABLES + V74_TABLES + V74B_TABLES:
         conn.execute(stmt)
     for table, column, kind in V3_COLUMNS + V74_COLUMNS:
         if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+    if "attempt" not in {r[1] for r in conn.execute("PRAGMA table_info(effects)")}:
+        cols = ", ".join(KNOWN_COLUMNS["effects"][:-1])
+        conn.execute("ALTER TABLE effects RENAME TO effects_v2")
+        conn.execute(EFFECTS_V3)
+        conn.execute(f"INSERT INTO effects ({cols}, attempt) SELECT {cols}, 1 FROM effects_v2")
+        conn.execute("DROP TABLE effects_v2")
+    for stmt in ATTEMPT_INDEXES:
+        conn.execute(stmt)
 
 
 def triggers_v3(conn: sqlite3.Connection) -> None:
