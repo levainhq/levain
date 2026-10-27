@@ -136,6 +136,10 @@ def _row1_defects(row1: dict, width: int) -> list:
     bound = max(r[3] - r[1] for _, r in rects) / 2   # centres of one row differ by less than half its tallest control
     if max(c for _, c in centres) - min(c for _, c in centres) >= bound:
         bad.append(f"the controls do not share one row (centres {centres}, bound {bound})")
+    tabs = row1["tabs"]   # the second row: no control of the first may reach into it (touching edges is allowed)
+    for k, r in rects:
+        if r[3] > tabs[1] and r[0] < tabs[2] and tabs[0] < r[2]:
+            bad.append(f"{k} overlaps the tabs ({k} bottom {r[3]} > tabs top {tabs[1]})")
     return bad
 
 
@@ -144,6 +148,7 @@ def _row1_defects(row1: dict, width: int) -> list:
     (375, lambda r: r.update(theme=[r["theme"][0] + 40, r["theme"][1], r["theme"][2] + 40, r["theme"][3]]), "theme leaves the 375px viewport"),
     (375, lambda r: r.update(jump=[r["jump"][0], r["jump"][1] + 30, r["jump"][2], r["jump"][3] + 30]), "do not share one row"),
     (375, lambda r: r.update(live=[10, r["live"][1], 17, r["live"][3]]), "is left of"),
+    (375, lambda r: r.update(jump=[r["jump"][0], r["jump"][1] + 21, r["jump"][2], r["jump"][3] + 21]), "jump overlaps the tabs"),
 ])
 def test_the_row_invariants_catch_a_real_defect_and_pass_the_known_good_row(width, mutate, expect):
     good = {k: list(v) for k, v in ROW1_AT_13C4D885[width].items()}
