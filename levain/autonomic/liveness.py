@@ -22,6 +22,7 @@ it counts, it never decides (``canonical_object_model_plus_replaceable_surfaces`
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from levain.autonomic.binding import BindingStatus, BindingStore, Guard
@@ -122,7 +123,8 @@ def binding_liveness(store: BindingStore) -> dict[str, Any]:
     }
 
 
-def gate_liveness(receipt_store: GateReceiptStore, *, limit: int | None = None) -> dict[str, Any]:
+def gate_liveness(receipt_store: GateReceiptStore, *, limit: int | None = None,
+                  not_started: Callable[[], frozenset[str]] | None = None) -> dict[str, Any]:
     """Tally the terminal-decision mix from the gate-receipt trace. ``limit`` bounds the read to the
     most recent N receipts (None = the whole trace).
 
@@ -137,8 +139,17 @@ def gate_liveness(receipt_store: GateReceiptStore, *, limit: int | None = None) 
         any legacy pre-3a.5 receipt that predates the field).
       - ``by_verdict`` — the decision-CLASS mix (approved / denied / auto).
       - ``by_refuse_class`` — the refuse taxonomy where stamped (today: ``kill_triggered``).
+
+    ``not_started`` (a ``levain-autonomic/3`` store, O-p2-1 10.Q1): returns the receipt ids of the effect attempts
+    that ended ``not_started`` (``schema3.not_started_receipts``). Their receipts say ``refused`` (the frozen mode
+    set has no ``not_started``), so a listed receipt counts under ``by_terminal_state["not_started"]`` instead; every
+    other key is unchanged. It is called AFTER the trace is read (R2-4): a ``/3`` receipt reaches the trace only
+    from the store's ``gate_receipts`` (``journal.unprojected_receipts``), written in the same statement as its row's
+    end, so the set read later covers every such receipt the trace holds. None: the output is what it was without
+    the keyword.
     """
     receipts = receipt_store.read(limit=limit)
+    listed = not_started() if not_started is not None else frozenset()
     by_terminal: dict[str, int] = {}
     by_verdict: dict[str, int] = {}
     by_refuse: dict[str, int] = {}
@@ -148,7 +159,7 @@ def gate_liveness(receipt_store: GateReceiptStore, *, limit: int | None = None) 
             fired += 1
         face = r.action_face if isinstance(r.action_face, dict) else {}
         ts = face.get("terminal_state")
-        ts_key = ts if isinstance(ts, str) else "null"
+        ts_key = "not_started" if r.id in listed else ts if isinstance(ts, str) else "null"
         by_terminal[ts_key] = by_terminal.get(ts_key, 0) + 1
         gate = face.get("gate")
         if isinstance(gate, dict):
