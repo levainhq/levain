@@ -269,3 +269,13 @@ def test_a_decision_that_fails_after_its_close_leaves_neither(store, monkeypatch
         assert c.execute("SELECT COUNT(*) FROM cancels").fetchone() == (0,)
         assert c.execute("SELECT COUNT(*) FROM gate_receipts").fetchone() == (0,)
         assert c.execute("SELECT decided FROM holds").fetchall() == [(None,)]
+
+
+def test_a_run_id_with_a_colon_is_refused_where_an_effect_subject_is_built(store):
+    # RED: ``effect:a:b:c`` splits at its first colon as run "a", effect "b:c": two different effects, one subject
+    with store.write() as c:      # (the store refuses such a run row itself: "instr(NEW.run_id, ':')")
+        with pytest.raises(ValueError, match="colon"):
+            J.close_effect_in(c, "a:b", "c", state="done", receipt=receipt("e", "effect:a:b:c", "fired"))
+    with pytest.raises(ValueError, match="colon"):
+        s.effect_subject("a:b", "c")
+    assert s.effect_subject("r1", "x:y") == "effect:r1:x:y"          # a colon in the effect id splits unambiguously

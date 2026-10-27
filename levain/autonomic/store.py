@@ -114,6 +114,11 @@ def _records_in(raw: bytes) -> dict[str, list[dict[str, Any]]]:
     return out
 
 
+def _canon(rec: dict[str, Any]) -> str:
+    # the serialized form, so that 0 and false, 1 and 1.0 are different records (Python's == says they are equal)
+    return json.dumps(rec, sort_keys=True, ensure_ascii=False)
+
+
 def _is_gate(rec: dict[str, Any]) -> bool:
     # a line :meth:`GateReceiptStore.read` returns (kind gate, every field it reads)
     return rec.get("kind") == "gate" and all(k in rec for k in _GATE_KEYS)
@@ -163,6 +168,11 @@ class GateReceiptStore:
         the row's id with other content keeps the row out of the return, so it is never marked. The file is read as
         bytes and each line decoded on its own, so a torn tail (a crash mid-line, mid-character) is skipped and ended
         with a newline, never raised."""
+        made: list[Path] = []     # the directories this call creates, leaf first
+        anc = self.path.parent
+        while not anc.exists() and anc != anc.parent:
+            made.append(anc)
+            anc = anc.parent
         self.path.parent.mkdir(parents=True, exist_ok=True)
         done: list[str] = []
         with self.path.open("a+b") as fh:
@@ -177,7 +187,7 @@ class GateReceiptStore:
                 for rid, text in rows:
                     want = json.loads(text)
                     lines = [r for r in have.get(rid, ()) if _is_gate(r)]
-                    if any(r != want for r in lines):
+                    if any(_canon(r) != _canon(want) for r in lines):
                         # a complete gate record under this id that is not this receipt: ``read`` could return it
                         # for this id, so the row is never marked projected (doctor reads it unprojected)
                         _log.error("efferent store: %s holds another record under receipt id %s: not projected",
@@ -193,11 +203,15 @@ class GateReceiptStore:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
         # the file's directory entry, on every projection: whoever created the file (an ``append``, a projection
         # stopped before this line) may not have flushed it, and the file existing says nothing about that
-        dfd = os.open(self.path.parent, os.O_RDONLY)
-        try:
-            durable_fsync(dfd)
-        finally:
-            os.close(dfd)
+        # and the entry of each directory this call created, in ITS parent, up to the first that already existed
+        for d in (self.path.parent, *made[1:], anc if made else None):
+            if d is None:
+                continue
+            dfd = os.open(d, os.O_RDONLY)
+            try:
+                durable_fsync(dfd)
+            finally:
+                os.close(dfd)
         return done
 
     def read(self, *, limit: int | None = None) -> list[StoredGateReceipt]:

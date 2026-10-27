@@ -930,6 +930,8 @@ def close_effect_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, st
     the caller's write transaction. LOST when the effect already ended. ``KeyError`` when it has no row."""
     if state not in _EFFECT_ENDS:
         raise ValueError(f"close_effect_in: state {state!r} is not done or unknown")
+    from levain.autonomic.schema3 import effect_subject
+    subject = effect_subject(run_id, effect_id)      # refuses a run id holding a colon, before any read
     row = conn.execute("SELECT state, receipt_id FROM effects WHERE run_id = ? AND effect_id = ?",
                        (run_id, effect_id)).fetchone()
     if row is None:
@@ -937,7 +939,7 @@ def close_effect_in(conn: sqlite3.Connection, run_id: str, effect_id: str, *, st
     if row[0] != "intent":
         return Closed(Terminal.LOST, row[1])
     encoded = json.dumps(result) if state == "done" else None
-    return _close_in(conn, f"effect:{run_id}:{effect_id}", receipt, state=state, result=encoded)
+    return _close_in(conn, subject, receipt, state=state, result=encoded)
 
 
 def decide_in(conn: sqlite3.Connection, hold_id: str, *, approve: bool, digest: str, by: str,

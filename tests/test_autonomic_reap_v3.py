@@ -235,3 +235,13 @@ def test_an_unadoptable_orphan_keeps_its_outcome_in_the_pass(store, leases):
     forge_orphan(store, "effect:r1:link-0", "orph-e", "refused")   # a terminal_state no effect row ends in
     out = s.reap(store, lease_held=leases._lease_held, pending_lease_held=lambda pid: False, record_for=record_for)
     assert out["effect:r1:link-0"].startswith("unadoptable:")
+
+
+def test_every_reap_selection_ends_in_its_seal_after_the_key_columns_reap_names(store):
+    # RED (r[:-1] as the key): a selection with a column beyond key + seal would bind the wrong count
+    with store.read() as c:
+        for query, kind, _state, _ts, _reason in s.REAP_PASS:
+            names = [d[0] for d in c.execute(query).description]
+            assert tuple(names[:-1]) == s._REAP_KEYS[kind], (kind, names)
+            assert names[-1] == "seal"
+

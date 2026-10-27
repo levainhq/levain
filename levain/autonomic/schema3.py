@@ -672,6 +672,15 @@ ADOPTED = "adopted"
 IN_FLIGHT = "in_flight"
 
 
+def effect_subject(run_id: str, effect_id: str) -> str:
+    """The subject of an effect's receipt, ``effect:<run_id>:<effect_id>``. A run id holding ``:`` is refused: the
+    subject is split at its first colon (here, in the journal, in the store's triggers), and only a colonless run id
+    makes that split name one effect. ``effect_id`` may hold colons."""
+    if ":" in run_id:
+        raise ValueError(f"run id {run_id!r} holds a colon: an effect subject would split ambiguously")
+    return f"effect:{run_id}:{effect_id}"
+
+
 def _effect_key(subject: str) -> tuple[str, str]:
     # ``effect:<run_id>:<effect_id>``: a subject that does not split is refused as the store refuses a bad row
     run_id, sep, effect_id = subject[7:].partition(":")
@@ -1289,7 +1298,7 @@ CLOSED = "closed"
 
 
 def _subject_of(kind: str, row: tuple) -> str:
-    return f"effect:{row[0]}:{row[1]}" if kind == "effect" else f"{kind}:{row[0]}"
+    return effect_subject(row[0], row[1]) if kind == "effect" else f"{kind}:{row[0]}"
 
 
 def reap(store: AutonomicStore3, *, lease_held: Callable[[str, str], bool],
@@ -1313,8 +1322,15 @@ def reap(store: AutonomicStore3, *, lease_held: Callable[[str, str], bool],
         with store.read() as conn:
             # a subject the orphan repair reported on keeps that outcome: it holds a receipt already, and its close
             # is the repair's (the store refuses a second receipt for it)
-            candidates = [(_subject_of(kind, r), r[:-1]) for r in conn.execute(query).fetchall()
-                          if _subject_of(kind, r) not in orphans]
+            candidates = []
+            for r in conn.execute(query).fetchall():
+                try:
+                    subject = _subject_of(kind, r)
+                except ValueError as e:   # a colon in a run id: left live, not selectable by subject
+                    _log.error("autonomic store: reaper skips %s row %r: %s", kind, r[:len(_REAP_KEYS[kind])], e)
+                    continue
+                if subject not in orphans:
+                    candidates.append((subject, tuple(r[:len(_REAP_KEYS[kind])])))
         for subject, key in candidates:
             try:
                 with store.write() as conn:
