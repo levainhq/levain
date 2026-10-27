@@ -292,8 +292,6 @@ LAZY_SITES = {
     'levain/dispatch/registry.py::driver_template_path::from levain import verifier_drivers': 'operator',
     # operator: ``body_refusal`` <- ``dispatch/cli.py`` and ``dispatch/control.py``; the follower reads no registry
     'levain/dispatch/registry.py::_verifier_entry_problem::from levain.verifier_drivers import output_compare': 'operator',
-    # operator: <- ``StandingPolicy.apply`` (``git grep -n 'policy.apply(' -- levain`` finds ``levain/cockpit/broker.py`` and ``verbs.py`` only) and ``classify`` / ``_validate_policy`` / ``_apply_policy_op`` (the replay, ``_step``)
-    'levain/authority.py::_tiers::from levain.cockpit.verbs import TIERS': 'operator',
     # operator: <- ``_validate_egress_key`` (``_validate_grant`` <- ``_validate_policy`` / ``_apply_policy_op``, the replay: the authority replay (``_step`` <- ``_replay_entry`` <- ``snapshot``, run by ``consent.queue.AuthoritySource`` and ``cockpit.authority.RequestAuthority.capture``); the queue broker builds its ``AuthoritySnapshot`` from published signers (``qbroker.grants.contract_authority``) and runs neither (``git grep -n -e 'snapshot(' -e 'authority_source' -e 'RequestAuthority(' -- levain/qbroker`` finds none)) and ``levain/chat_egress/advert.py``
     'levain/authority.py::egress_key_host_problem::from levain.chat_egress.parse import canonical_host': 'operator',
     # operator: <- ``_validate_egress_key`` (the replay's grant validation, as ``egress_key_host_problem``) and ``levain/chat_egress/advert.py``

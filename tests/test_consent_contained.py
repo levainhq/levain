@@ -214,3 +214,11 @@ def test_contained_shell_grant_change_classes():
 def test_proof_fields_are_compared_by_value(ws):
     # the proof is a frozen value: a changed field is another proof, never the same one
     assert _proof(ws) == _proof(ws) and replace(_proof(ws), launch_id="L2") != _proof(ws)
+
+
+def test_the_replay_tier_order_is_the_cockpits():
+    """``levain.authority`` holds its own tier order so root's replay never imports ``levain.cockpit.verbs`` (which
+    reaches ``anneal_memory``); this holds the copy equal to the cockpit's, where that import resolves."""
+    pytest.importorskip("anneal_memory")
+    from levain.cockpit.verbs import TIERS
+    assert auth._tiers() == TIERS

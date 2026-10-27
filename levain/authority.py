@@ -509,9 +509,14 @@ def _ranks() -> Mapping[str, int]:
     return _CLASS_RANK
 
 
+# The cockpit's tier order, held here because the replay (run by root) needs it and ``levain.cockpit.verbs`` imports
+# ``levain.writes``, which imports ``anneal_memory`` (a root host has none); tests/test_consent_contained.py holds it
+# equal to ``levain.cockpit.verbs.TIERS``.
+_TIERS: tuple[str, ...] = ("C1", "T2", "T3")
+
+
 def _tiers() -> tuple[str, ...]:
-    from levain.cockpit.verbs import TIERS
-    return TIERS
+    return _TIERS
 
 
 def _stamp(when: datetime) -> str:
