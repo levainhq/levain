@@ -14,6 +14,7 @@ Built on lane F2/2f3's harness (``World`` + the fake launches + the fake process
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -24,9 +25,12 @@ import pytest
 from levain.contracts import canon
 from levain.slot import Refused, wall
 from levain.slot import identity as ID
+from levain.slot import records as R
+from levain.slot import start as SS
 from levain.slot.ids import SlotId
 from tests.test_slot_idg1_identity import _baseline, _login
 from tests.test_slot_s2d_wall import IDS, S, SESSION, SHARED, V0, spec
+from tests.test_slot_s2f2_runtime_helper import Client
 from tests.test_slot_s2f3_start import DARWIN_IDS, _world
 from tests.vendor_tree import vendor_installed, vendor_prefix  # noqa: F401 - autouse, the real vendor check
 
@@ -296,3 +300,176 @@ def test_the_claude_call_needs_a_session():
         ID.identity_call(None, "claude")
     assert e.value.name == "internal"
 
+
+
+# --- fix round 1 (1027-19 RULINGS "G1b L3 r1"): every failure after the login is a named result (X1), the fresh
+# forwarder and the child never outlive the call (X2), the window branches (X3) ------------------------------------
+
+def _fail_identity_forwarder_spawn(w, la, exc):
+    """From the identity step on, a forwarder spawn raises ``exc`` (the start's own forwarder already ran)."""
+    real = w.seams.spawn
+
+    def spawn(argv, spec_json, cgroup, exec_w, detach):
+        if canon.parse(spec_json)["target"] == "forwarder":
+            raise exc
+        return real(argv, spec_json, cgroup, exec_w, detach)
+
+    def arm(step):
+        if step == "identity":
+            w.seams.spawn = spawn
+    w.on_step = arm
+
+
+@pytest.mark.parametrize("exc", [OSError(errno.EMFILE, "pipe"), OSError(errno.ENOMEM, "fork"),
+                                 Refused("cgroup-mismatch")])
+def test_a_failed_forwarder_spawn_records_identity_unparsable(env, exc):
+    """X1: the fresh forwarder's spawn failing (EMFILE, ENOMEM) after the login ran is a named result, recorded; the
+    start answers the vendor's exit."""
+    w, la, table = env
+    calls = _capture(w, la, table)
+    _fail_identity_forwarder_spawn(w, la, exc)
+    s = _login(w, la, "claude")
+    assert w.state(s).fields["identity"] == {"result": "identity-unparsable"}
+    assert calls == []
+
+
+def test_a_forwarder_with_no_ready_byte_records_identity_unparsable(env):
+    """X1: ``forwarder-not-ready`` on the identity forwarder is a spawn failure, ``identity-unparsable``; the
+    forwarder it abandoned is gone."""
+    w, la, table = env
+    calls = _capture(w, la, table)
+
+    def not_ready(step):
+        if step == "identity":
+            la.forwarder_ready = False
+    w.on_step = not_ready
+    s = _login(w, la, "claude")
+    assert w.state(s).fields["identity"] == {"result": "identity-unparsable"}
+    assert calls == []
+    assert table.of(w.alloc(s).slot_uid) == []
+
+
+@pytest.mark.parametrize("exc", [OSError(errno.ENOMEM, "x"), Refused("cgroup-mismatch"), KeyError("netns")])
+def test_a_failed_identity_launch_records_identity_unparsable(env, monkeypatch, exc):
+    """X1: building the identity child's launch argv failing is ``identity-unparsable``, and the fresh forwarder
+    started for it is ended (X2)."""
+    w, la, table = env
+    calls = _capture(w, la, table)
+    real = SS.launch
+
+    def launch(ctx, a, sp):
+        if sp.target == "identity":
+            raise exc
+        return real(ctx, a, sp)
+    monkeypatch.setattr(SS, "launch", launch)
+    s = _login(w, la, "claude")
+    assert w.state(s).fields["identity"] == {"result": "identity-unparsable"}
+    assert calls == []
+    assert table.of(w.alloc(s).slot_uid) == []                   # the fresh forwarder did not outlive the call
+    assert la.of("forwarder")[1]["pid"] in la.killed             # and was reaped
+
+
+@pytest.mark.parametrize("where", ["read_alloc", "read_record", "kill_domain", "_no_slot_process"])
+def test_a_window_check_that_raises_records_identity_window(env, monkeypatch, where):
+    """X1: an OSError from any window check (the alloc or record read, the kill, the proof) is ``identity-window``,
+    recorded, and nothing is spawned."""
+    w, la, table = env
+    calls = _capture(w, la, table)
+    target = SS.H if where == "read_alloc" else SS
+
+    def boom(*a, **k):
+        raise OSError(errno.EIO, where)
+
+    def arm(step):
+        if step == "identity":
+            monkeypatch.setattr(target, where, boom)
+    w.on_step = arm
+    s = _login(w, la, "claude")
+    assert w.state(s).fields["identity"] == {"result": "identity-window"}
+    assert calls == [] and len(la.of("forwarder")) == 1
+
+
+def test_a_changed_alloc_records_identity_window(env, monkeypatch):
+    """X3: the alloc re-read under the lock is not the one start ran: ``identity-window``, nothing killed or spawned."""
+    w, la, table = env
+    calls = _capture(w, la, table)
+
+    def arm(step):
+        if step == "identity":
+            monkeypatch.setattr(SS.H, "read_alloc", lambda ctx, s: None)
+    w.on_step = arm
+    s = _login(w, la, "claude")
+    assert w.state(s).fields["identity"] == {"result": "identity-window"}
+    assert calls == [] and len(la.of("forwarder")) == 1
+    assert la.of("vendor")[0]["pid"] in table.procs              # nothing killed
+
+
+def test_a_record_no_longer_running_spawns_nothing(env):
+    """X3: a record moved past ACTIVE since the vendor exited (an END began): ``not-active:REVOKED``, nothing killed or
+    spawned; the identity CAS is refused the same way, so nothing is recorded and the start still answers ok."""
+    w, la, table = env
+    calls = _capture(w, la, table)
+
+    def revoke(step):
+        if step == "identity":
+            st = w.state(w.session)
+            Client(w).call("CAS", session=w.session, generation=st.generation,
+                           **{"from": R.ACTIVE, "to": R.REVOKED}, fields={})
+    w.on_step = revoke
+    s = _login(w, la, "claude")
+    assert w.state(s).state == R.REVOKED and "identity" not in w.state(s).fields
+    assert calls == [] and len(la.of("forwarder")) == 1
+    assert la.of("vendor")[0]["pid"] in table.procs
+
+
+def _capture_leaving(w, la, table, answer=(0, None), *, immortal=False, cg=True):
+    """The capture, faked, leaving one slot-uid process behind it (a child's own child that outlived it)."""
+    calls = _capture(w, la, table, answer)
+    inner = w.seams.capture
+
+    def cap(argv, spec_json, cgroup, bound):
+        table.add(99100, w.alloc(w.session).slot_uid, immortal=immortal, cg=cg)
+        return inner(argv, spec_json, cgroup, bound)
+    w.seams.capture = cap
+    return calls
+
+
+def test_the_fresh_forwarder_and_the_child_never_outlive_the_call(env):
+    """X2: after a call that answered, the slot's domain is ended again before the lock is released: the fresh
+    forwarder (reaped) and anything the child left are gone."""
+    w, la, table = env
+    _capture_leaving(w, la, table)
+    s = _login(w, la, "claude")
+    assert w.state(s).fields["identity"] == {"observed_id": UUID}
+    assert table.of(w.alloc(s).slot_uid) == []
+    assert la.of("forwarder")[1]["pid"] in la.killed
+
+
+@pytest.mark.parametrize("answer", [Refused("check-timeout"), OSError(errno.ENOMEM, "fork"), (0, b"not json\n")])
+def test_a_failed_call_ends_the_domain_too(env, answer):
+    """X2: the same on a failed call."""
+    w, la, table = env
+    _capture_leaving(w, la, table, answer)
+    s = _login(w, la, "claude")
+    assert w.state(s).fields["identity"] == {"result": "identity-unparsable"}
+    assert table.of(w.alloc(s).slot_uid) == []
+    assert la.of("forwarder")[1]["pid"] in la.killed
+
+
+def test_an_unproven_kill_after_the_call_records_identity_window(env):
+    """X2: a slot-uid process the kill after the call cannot end could change the credential between the read and
+    END's park, so the answer is not kept: ``identity-window``."""
+    w, la, table = env
+    _capture_leaving(w, la, table, immortal=True)
+    s = _login(w, la, "claude")
+    assert w.state(s).fields["identity"] == {"result": "identity-window"}
+    assert la.of("forwarder")[1]["pid"] in la.killed
+
+
+def test_darwin_the_child_never_outlives_the_call(tmp_path):
+    """X2, macOS: a slot-uid process left after the child is ended (proc.end_domain) before the lock is released."""
+    w, la, table = _darwin(tmp_path, vendor_lingers=False)
+    _capture_leaving(w, la, table, cg=False)
+    s = _login(w, la, "claude")
+    assert w.state(s).fields["identity"] == {"observed_id": UUID}
+    assert table.of(w.alloc(s).slot_uid) == []

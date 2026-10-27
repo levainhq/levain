@@ -751,10 +751,10 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
     return pid
 
 
-def _spawn_forwarder(ctx: H.Ctx, a: R.Alloc) -> None:
+def _spawn_forwarder(ctx: H.Ctx, a: R.Alloc) -> int:
     """Linux egress (§9.1): the slot's TCP -> ``gw.sock`` relay in the netns, detached, live until the helper exits;
     ready only on its ready byte within :data:`FORWARDER_READY_S`, else its domain is killed and ``forwarder-not-ready``.
-    Runs under the session END lock."""
+    Its pid (the helper's unreaped child). Runs under the session END lock."""
     seams = ctx.seams
     spec = _spec(ctx, a, "forwarder")
     argv, cgroup = launch(ctx, a, spec)
@@ -775,6 +775,7 @@ def _spawn_forwarder(ctx: H.Ctx, a: R.Alloc) -> None:
     if not ready:
         _abandon(ctx, a, fpid, "forwarder-not-ready")
         raise Refused("forwarder-not-ready", f"no ready byte within {FORWARDER_READY_S:g}s")
+    return fpid  # type: ignore[return-value]
 
 
 # --- the Claude identity call's child (§7.6; 1027-18 RULINGS IG-3, G1b) ------------------------------------------------
@@ -794,33 +795,97 @@ def identity_capture(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
     3. no process of the slot uid (proc.py's END proof, as clone-check's window), else ``identity-window``: the slot
        has no process left to change its credential between this read and END's park;
     4. Linux egress: a fresh forwarder (:func:`_spawn_forwarder`), so the call reaches the passthrough tunnel;
-    5. the child, its output captured. A capture or spawn failure is ``identity-unparsable`` (root read no answer).
+    5. the child, its output captured;
+    6. the kill domain ended again (the fresh forwarder reaped) and steps 2-3's proof, whether 4-5 passed or not, so
+       neither outlives the call. On a failed 4-5 a failure here is noted; after an answer it is ``identity-window``.
+
+    The login already ran, so every failure is a :class:`Refused` the caller records: a window check's (the session
+    lock's own refusals, ``session-busy`` among them, and step 1's ``not-active:<STATE>`` keep their names) is
+    ``identity-window``, a 4-5 failure (``forwarder-not-ready`` included) is ``identity-unparsable`` (root read no
+    answer).
     """
     seams = ctx.seams
     try:
         with H.session_lock(ctx, a.session):
-            if H.read_alloc(ctx, a.session) != a:
-                raise Refused("identity-window", f"{a.session}: the alloc changed")
-            rec = read_record(ctx, a.session)
-            if rec is None or rec.state not in (R.ACTIVE, R.BRAKED):
-                raise Refused(f"not-active:{rec.state if rec else 'none'}", a.session)
-            res, _ = kill_domain(ctx, a)
-            if not res.proven:
-                raise Refused("identity-window", f"the kill domain was not proven empty: {res.name}")
-            if not _no_slot_process(ctx, a):
-                raise Refused("identity-window", "a slot-uid process is alive after the login")
-            if a.slot.slot_class == "egress" and seams.host == "linux":
-                _spawn_forwarder(ctx, a)
-            spec = _spec(ctx, a, "identity")
-            argv, cgroup = launch(ctx, a, spec)
-            try:
-                return seams.capture(argv, spec.to_json(), cgroup, ID.PROFILE_ANSWER_MAX)
-            except Refused as e:
-                raise Refused("identity-unparsable", f"capture: {e.name}") from None
-            except OSError as e:
-                raise Refused("identity-unparsable", f"capture: errno {e.errno}") from None
+            _identity_window(ctx, a)
+            return _identity_child(ctx, a)
+    except Refused:
+        raise
+    except Exception as e:   # noqa: BLE001 - the lock's own open or close: the login ran, so the answer is a name
+        raise Refused("identity-window", f"the session lock: {_why(e)}") from None
     finally:
         _wake(seams)        # an END that waited on the lock, or refused end-busy, is retried now
+
+
+def _why(e: BaseException) -> str:
+    if isinstance(e, Refused):
+        return e.name
+    return type(e).__name__ + (f" errno {e.errno}" if isinstance(e, OSError) else "")
+
+
+def _identity_window(ctx: H.Ctx, a: R.Alloc) -> None:
+    """:func:`identity_capture` steps 1-3. Any failure is ``identity-window`` but the record's ``not-active:<STATE>``."""
+    try:
+        if H.read_alloc(ctx, a.session) != a:
+            raise Refused("identity-window", f"{a.session}: the alloc changed")
+        rec = read_record(ctx, a.session)
+        if rec is None or rec.state not in (R.ACTIVE, R.BRAKED):
+            raise Refused(f"not-active:{rec.state if rec else 'none'}", a.session)
+        _identity_empty(ctx, a, (), "before the call")
+    except Refused as e:
+        if e.name == "identity-window" or e.name.startswith("not-active:"):
+            raise
+        raise Refused("identity-window", _why(e)) from None
+    except Exception as e:   # noqa: BLE001 - the login ran: a named result, never a failed start
+        raise Refused("identity-window", _why(e)) from None
+
+
+def _identity_empty(ctx: H.Ctx, a: R.Alloc, children: Sequence[int], when: str) -> None:
+    """The kill domain ended (``children``, the helper's own, reaped: by the kill, else ``seams.kill``) and proven,
+    then no slot-uid process, else ``identity-window``. Raises whatever the kill or the proof raises."""
+    reaped: frozenset = frozenset()
+    try:
+        res, reaped = kill_domain(ctx, a, children)
+    finally:
+        for pid in children:
+            if pid not in reaped:
+                ctx.seams.kill(pid)
+    if not res.proven:
+        raise Refused("identity-window", f"{when}: the kill domain was not proven empty: {res.name}")
+    if not _no_slot_process(ctx, a):
+        raise Refused("identity-window", f"{when}: a slot-uid process is alive")
+
+
+def _identity_child(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
+    """:func:`identity_capture` steps 4-6."""
+    seams = ctx.seams
+    fpid: Optional[int] = None
+    try:
+        if a.slot.slot_class == "egress" and seams.host == "linux":
+            fpid = _spawn_forwarder(ctx, a)
+        spec = _spec(ctx, a, "identity")
+        argv, cgroup = launch(ctx, a, spec)
+        answer = seams.capture(argv, spec.to_json(), cgroup, ID.PROFILE_ANSWER_MAX)
+    except BaseException as e:
+        try:
+            if fpid is not None:
+                _abandon(ctx, a, fpid, "identity-unparsable")
+            else:
+                _kill_quiet(ctx, a, "identity-unparsable")
+        except Exception as ce:   # noqa: BLE001 - noted, never raised over the call's own failure
+            _note(f"{a.session}: identity-unparsable: the kill after the call failed: {_why(ce)}")
+        if isinstance(e, Exception):
+            raise Refused("identity-unparsable", _why(e)) from None
+        raise
+    try:
+        _identity_empty(ctx, a, () if fpid is None else (fpid,), "after the call")
+    except Refused as e:
+        if e.name == "identity-window":
+            raise
+        raise Refused("identity-window", f"after the call: {_why(e)}") from None
+    except Exception as e:   # noqa: BLE001 - the answer is not kept unless the slot is proven empty after it
+        raise Refused("identity-window", f"after the call: {_why(e)}") from None
+    return answer
 
 
 def _wake(seams: H.Seams) -> None:
