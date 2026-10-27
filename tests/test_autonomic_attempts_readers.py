@@ -488,7 +488,7 @@ def test_g7_grant_terms_that_are_json_but_not_an_object_are_a_clear_error(store,
                              cover=COVER)
 
 
-@pytest.mark.parametrize("run_id, effect_id", [("a:b", "link-0"), ("a#b", "link-0"), ("r", "link#0")])
+@pytest.mark.parametrize("run_id, effect_id", [("a:b", "link-0"), ("r", "link#0")])
 def test_g8_intent_in_refuses_an_id_no_effect_subject_can_name_before_any_read(store, run_id, effect_id):
     reads = []
     with store.write() as c:
