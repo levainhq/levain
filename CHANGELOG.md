@@ -10,7 +10,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **A passthrough login asks whether to keep that account as the slot's baseline.** Once
   `levain session codex --auth passthrough --login` exits, Levain shows the account from its own session record (never
   the session's terminal output) and asks whether to keep it. Codex has no server-checked identity, so the baseline
-  records it as "not a check". Claude logins are told the identity check is not built yet and write no baseline.
+  records it as "not a check". `levain session claude --auth passthrough --login` asks the account server which account
+  the new login belongs to, as the session's own sandboxed account, and shows that account id when it asks. Anything
+  still running as the session's account is ended first. If the check fails in any way, the login still completes and
+  the failure is recorded by name; no baseline is offered. Run on a real macOS machine with two logins.
+- **Signing a slot in again now works.** When a second `levain session ... --auth passthrough --login` on the same slot
+  ends with your yes to its baseline question, the new login replaces the stored one. The old login is kept with that
+  session's retained work (discard, restore and purge carry it), not deleted.
 - **The cockpit's Build tab has a Threads section.** It shows the coordinator's threads and one thread's stream in the
   order it happened, with running tool calls, approvals shown as a line pointing you to Needs you, and your own lines
   marked unverified. It needs the page's write token and is read-only for now.
@@ -224,6 +230,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   a plainly written address.
 
 ### Fixed
+- **A login that ended without a yes on a slot that already holds a login no longer sticks.** The session used to end
+  HELD and keep its slot leased for good. Now the stored login is left as it was, the new one is kept with the
+  session's retained work instead, and the slot is released. A session already stuck this way is released by the
+  reaper's next pass.
 - **A brokered call the vendor refuses now records the vendor's error in the gateway log** (`upstream_error` in
   `gw.jsonl`: the error type, a short message and the request id, with any configured credential redacted), so a
   refusal such as a 400 says why instead of only its status.
