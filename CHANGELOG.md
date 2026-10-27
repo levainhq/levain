@@ -189,6 +189,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   command line includes `--guard <guard.json>`.
 
 ### Changed
+- **The consent queue's store moves to format 5, one way.** The first consent hook call or `levain` command that opens
+  it migrates it in place (from format 3 or 4), keeping every request, signed answer and receipt. An older levain then
+  refuses that store: its hook makes no decision (the agent's own permission dialog asks), standing grants stop
+  answering, and agent-config edits are denied. There is no way back to format 4, so upgrade every levain that shares
+  the store (the hook, the cockpit, the CLI) together.
 - **A coordinator store made by an earlier version is updated the first time a `levain` command that writes to it
   opens it:** the review history gains one column, and every entry is kept as it was.
 - **`levain doctor` has an agent firewall probe row:** each agent slot's last recorded probe result, with its age and
@@ -288,6 +293,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   guard is refused at signing instead of the check crashing.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- **A contained-shell grant can answer a Levain chat launch's Bash calls.** It answers only a chat call carrying the
+  proof of the launch it was granted for, never a Claude Code or Codex hook call; it is listed, counted and revocable
+  like any standing grant, and an answer it gave stops being delivered once it is revoked. Nothing launches a chat
+  session that uses it yet (CH-D2).
 - **The autonomic store can keep every attempt of an effect (store format /3).** A retry carries the authority of the
   attempt before it (the same grant and cover); an attempt on a held link carries the hold's current decision, names
   who decided (a person or not) as that decision does, and fires no lower than the rung it decided. An attempt that
