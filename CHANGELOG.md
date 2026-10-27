@@ -18,6 +18,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Sign links open the cockpit's sheet and carry no token.** `levain.consent.sign.deep_link` builds
   `<origin>/sign/<id>`. `levain consent phone --redirect-to <origin>` runs the old phone port as a redirect only: links
   you already hold open the cockpit's sign sheet, and the token in them is dropped, never sent on.
+- **`levain consent canary --sandbox` checks the confinement.** It asks the agent, started through `levain session`,
+  to run one fixed probe that tries five escapes (a write in your home, a host off the allow-list, your cockpit's port,
+  a stand-in port the canary counts, a git hook in the repository the session was cloned from). The verdict comes from
+  a results file the probe signs with a per-run secret over the exact command it was given, and from what Levain sees
+  outside the session, never from the agent's screen: a retyped command reads as unclear, not as a pass. It fails on
+  any escape and on an unclear run. The check reads the agent's work, and discards its scratch session afterwards,
+  from the session the store records as cloned from the run's own commit, never from what the agent's screen says.
+  `--cockpit-url` (with `--sandbox`) names the cockpit if it is not at the default address.
 - **The cockpit signs in an overlay sheet.** A sign card opens `/sign/<id>` over the cockpit; the sheet shows the one
   request, freezes a written answer when you tap Sign and shows the exact line being signed, then the line that was
   signed. Before asking for a passkey it checks that a key enrolled for the cockpit may sign the request, and says what
