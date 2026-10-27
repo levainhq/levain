@@ -94,8 +94,7 @@ CLONE_S = 600.0
 
 def read_record(ctx: H.Ctx, session: str) -> Optional[R.SessionState]:
     """The state record as a HINT (§7.1: generation + ``from`` for a CAS CONTROL checks), or None when absent."""
-    data = ctx.store.read(("sessions",), f"{session}.json", trusted=False)
-    return R.parse_state(data) if data is not None else None
+    return ID.read_record(ctx, session)
 
 
 def _list_dir(ctx: H.Ctx, parts: Sequence[str]) -> List[str]:

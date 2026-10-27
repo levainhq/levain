@@ -188,6 +188,9 @@ LAZY_SITES = {
     'levain/slot/runtime_helper.py::verify_sealed_run::from levain.slot import adopt_verify as AV': 'root',
     'levain/slot/runtime_helper.py::verify_sealed_run::from levain.slot import export_run as ER': 'root',
     'levain/slot/runtime_helper.py::verify_sealed_run::from levain.slot import importer as IM': 'root',
+    # the identity gate (1027+18 idg1): confirm-identity's handler and the baseline reader prepare runs
+    'levain/slot/runtime_helper.py::_baseline_vendor::from levain.slot import identity as ID': 'root',
+    'levain/slot/runtime_helper.py::_confirm_identity::from levain.slot import identity as ID': 'root',
     # the root discard / restore verbs (VERB_HANDLERS, operator-uid caller; land16)
     'levain/slot/runtime_helper.py::_store_verb::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/runtime_helper.py::_store_verb::from levain.slot.root_intent import PhaseFailed': 'root',

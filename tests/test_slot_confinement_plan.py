@@ -813,4 +813,4 @@ def test_helper_imports_root_tree_only(host):
     assert lines.get("levain.slot.install_helper") == [v for v in INSTALL_VERBS if v not in install_helper.BUILT_VERBS]
     assert lines.get("levain.slot.runtime_helper", []) == [v for v in RUNTIME_VERBS
                                                            if v not in runtime_helper.VERB_HANDLERS]
-    assert "setup" not in lines["levain.slot.install_helper"] and "prepare" not in lines["levain.slot.runtime_helper"]
+    assert "setup" not in lines["levain.slot.install_helper"] and "prepare" not in lines.get("levain.slot.runtime_helper", [])

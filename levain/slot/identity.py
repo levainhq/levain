@@ -19,16 +19,15 @@ reads it, and also the earlier vendor-only shape with no ``format`` key.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Dict, Mapping, Optional
+from typing import Callable, Dict, Mapping, Optional
 
 from levain.contracts import ContractError, canon
 from levain.slot import Refused
 from levain.slot import records as R
+from levain.slot import runtime_helper as H
 from levain.slot.grammar import SESSION_RE
-
-if TYPE_CHECKING:   # pragma: no cover
-    from levain.slot.runtime_grammar import RuntimeRequest
-    from levain.slot.runtime_helper import Ctx
+from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
+from levain.slot.runtime_grammar import OPERATOR, RuntimeRequest
 
 BASELINE_FORMAT = "levain-baseline/1"
 BASELINE_KEYS = frozenset({"format", "vendor", "observed_id", "confirmed_at", "session"})
@@ -45,19 +44,19 @@ _VENDORS = ("claude", "codex")
 
 # --- the identity call (§7.6) ------------------------------------------------------------------------------------------
 
-def _codex_call(ctx: Optional["Ctx"], a: Optional[R.Alloc]) -> str:
+def _codex_call(ctx: Optional[H.Ctx], a: Optional[R.Alloc]) -> str:
     return NOT_A_CHECK
 
 
-def _claude_call(ctx: Optional["Ctx"], a: Optional[R.Alloc]) -> str:
+def _claude_call(ctx: Optional[H.Ctx], a: Optional[R.Alloc]) -> str:
     raise Refused("identity-call-unbuilt", "the Claude identity call waits on IG-3")
 
 
-IDENTITY_CALLS: Mapping[str, Callable[[Optional["Ctx"], Optional[R.Alloc]], str]] = {
+IDENTITY_CALLS: Mapping[str, Callable[[Optional[H.Ctx], Optional[R.Alloc]], str]] = {
     "codex": _codex_call, "claude": _claude_call}
 
 
-def identity_call(ctx: Optional["Ctx"], vendor: str, a: Optional[R.Alloc] = None) -> str:
+def identity_call(ctx: Optional[H.Ctx], vendor: str, a: Optional[R.Alloc] = None) -> str:
     """The stable account id the vendor's identity call observed, checked against §7.6's pattern (else
     ``identity-unparsable``), or :class:`Refused` by the call's own name."""
     call = IDENTITY_CALLS.get(vendor)
@@ -69,11 +68,15 @@ def identity_call(ctx: Optional["Ctx"], vendor: str, a: Optional[R.Alloc] = None
     return oid
 
 
-def _cas_identity(ctx: "Ctx", session: str, identity: Mapping[str, str]) -> R.SessionState:
+def read_record(ctx: H.Ctx, session: str) -> Optional[R.SessionState]:
+    """CONTROL's state record (§7.2), or None when absent: read as a HINT for a CAS CONTROL checks (§7.1)."""
+    data = ctx.store.read(("sessions",), f"{session}.json", trusted=False)
+    return R.parse_state(data) if data is not None else None
+
+
+def _cas_identity(ctx: H.Ctx, session: str, identity: Mapping[str, str]) -> R.SessionState:
     """A field-only CAS of ``identity`` on a running record (the state record read as the CAS's hint, §7.1): CONTROL
     refuses it ``lease-dead`` when the session's lease is gone and ``stale-generation`` when the record moved."""
-    from levain.slot.start import read_record
-
     rec = read_record(ctx, session)
     if rec is None:
         raise Refused("no-session", session)
@@ -84,7 +87,7 @@ def _cas_identity(ctx: "Ctx", session: str, identity: Mapping[str, str]) -> R.Se
     return rec
 
 
-def record_login_identity(ctx: "Ctx", a: R.Alloc, exit_code: int) -> Dict[str, str]:
+def record_login_identity(ctx: H.Ctx, a: R.Alloc, exit_code: int) -> Dict[str, str]:
     """``start``'s last step for a ``login`` session, once the vendor exited: the identity call's answer (or its
     refusal's name) CASed into the state record. Returns what was recorded."""
     if exit_code != 0:
@@ -148,15 +151,11 @@ def baseline_vendor(data: Optional[bytes]) -> Optional[str]:
 # --- confirm-identity (§5.1) -------------------------------------------------------------------------------------------
 
 def _no_id_name(result: object) -> str:
-    from levain.slot.runtime_grammar import _NAME_RE
-
     name = f"no-observed-id:{result}" if type(result) is str else "no-observed-id"
-    return name if _NAME_RE.fullmatch(name) and len(name) <= 64 else "no-observed-id"
+    return name if _WIRE_NAME_RE.fullmatch(name) and len(name) <= 64 else "no-observed-id"
 
 
-def _slot_names_lease(ctx: "Ctx", a: R.Alloc) -> bool:
-    from levain.slot import runtime_helper as H
-
+def _slot_names_lease(ctx: H.Ctx, a: R.Alloc) -> bool:
     raw = ctx.store.read(("slots", a.slot.tag), "state")
     if raw is None:
         return False
@@ -164,7 +163,7 @@ def _slot_names_lease(ctx: "Ctx", a: R.Alloc) -> bool:
     return st.state == "leased" and st.session == a.session and st.lease_seq == a.lease_seq
 
 
-def confirm_identity(ctx: "Ctx", req: "RuntimeRequest", blob: None) -> Dict[str, object]:
+def confirm_identity(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     """§5.1 ``confirm-identity <session> yes|no``. In order: the operator only (the grammar already refuses
     ``_levain_dispatch``); the caller's alloc (:func:`runtime_helper.read_alloc`), kind ``login`` (else
     ``confirm-kind:<kind>``); the session lock (TRY, ``session-busy``: END takes the same one, so a baseline write and
@@ -173,10 +172,6 @@ def confirm_identity(ctx: "Ctx", req: "RuntimeRequest", blob: None) -> Dict[str,
     this lease (else ``slot-lease-moved``); the field-only CAS of ``identity`` = ``{observed_id, result: confirmed}``
     at the generation read (the lease proof, and the id is the one CONTROL holds at that generation); then the
     baseline written. A crash between the CAS and the write leaves no baseline, and ``yes`` again writes it."""
-    from levain.slot import runtime_helper as H
-    from levain.slot.runtime_grammar import OPERATOR
-    from levain.slot.start import read_record
-
     assert req.session is not None and req.answer in ("yes", "no")
     if ctx.caller != OPERATOR:
         raise Refused("verb-not-allowed-for-caller", "confirm-identity is the operator's")
