@@ -547,6 +547,11 @@ class EfferentGate:
         return self._coverage
 
     @property
+    def _journal_v3(self) -> bool:
+        """Whether this gate's run journal runs over a ``levain-autonomic/3`` store."""
+        return self._journal is not None and self._journal.v3
+
+    @property
     def journal(self) -> RunJournal | None:
         """The run journal this gate runs binding effects through, or ``None``. The fire path admits
         its runs into this same journal."""
@@ -1056,7 +1061,10 @@ class EfferentGate:
         elif effective is Posture.REFUSE_ESCALATE:
             return reject(posture, stop_reason)   # no rung may approve it: a decision, recorded
         else:
-            posture = effective
+            # the silence path (or no decision yet): the rung needed now, never below a rung the standing decision
+            # was recorded at (RULINGS O-p2-1 / R15-5: the seal is max(effective, decided); the /3 store refuses an
+            # attempt sealed below its decision's rung, effects_held_tied)
+            posture = self._decided_rung(hold, effective)
 
         signed: bytes | None = None
         if hold.get("decided") is None and needs_signature(decision.by):
@@ -2273,7 +2281,9 @@ class EfferentGate:
         posture = (Posture[recorded_posture] if isinstance(recorded_posture, str)
                    and recorded_posture in Posture.__members__ else Posture.REFUSE_ESCALATE)
         receipt_id = out.receipt_id
-        if receipt_id is None and request.run is not None:
+        if receipt_id is None and request.run is not None and not self._journal_v3:
+            # (/2 only: on a /3 store an effect ends done only with its receipt, written in the same statement, so
+            # there is no receipt to write again here)
             # the provenance the effect ran with, as recorded with its result (this delivery's request
             # may carry other provenance for the same bytes)
             recorded = rec.get("face")
