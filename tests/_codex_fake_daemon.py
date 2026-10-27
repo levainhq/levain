@@ -176,18 +176,34 @@ class FakeDaemon:
             self.sock = socket.socket(socket.AF_UNIX)
             self.sock.bind(str(path))
             self.sock.listen(8)
-            threading.Thread(target=self._accept, daemon=True).start()
+            self.sock.settimeout(0.2)   # the accept loop re-reads _stop; closing a listener does not wake accept on Linux
+            self._path = path
+            self._stop = threading.Event()
+            self._acceptor = threading.Thread(target=self._accept, daemon=True)
+            self._acceptor.start()
 
     def close(self) -> None:
+        """Stops and joins the accept thread before closing the listener: on Linux closing the listener does not wake
+        a thread blocked in accept(), so it lived, keeping this daemon, for the rest of the process. One connection
+        wakes the thread at once; the listener's timeout is the backstop when that connect fails."""
         if self.sock is not None:
+            self._stop.set()
+            with contextlib.suppress(OSError), socket.socket(socket.AF_UNIX) as s:
+                s.connect(str(self._path))
+            self._acceptor.join(5)
             self.sock.close()
 
     # -- transports --
     def _accept(self) -> None:
-        while True:
+        while not self._stop.is_set():
             try:
                 conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
             except OSError:
+                return
+            if self._stop.is_set():
+                conn.close()
                 return
             threading.Thread(target=self._serve_ws, args=(conn,), daemon=True).start()
 

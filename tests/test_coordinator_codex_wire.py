@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -85,6 +86,25 @@ def daemon(home):
     d = FakeDaemon(home)
     yield d
     d.close()
+
+
+def test_the_fake_daemon_close_joins_its_accept_thread(home, monkeypatch):
+    """The fake's own teardown: closing a listener does not wake a thread blocked in accept() on Linux, so a daemon
+    whose close() only closed the listener left that thread alive, holding the daemon, for the rest of the process
+    (CI on the 1026+23 landing chain: ~100 ``(_accept)`` threads alive when a later file's fd squeeze failed). Here
+    the listener's close is made a no-op for the length of close(), as Linux behaves for the blocked thread, and
+    close() must still return with the thread ended."""
+    before = set(threading.enumerate())
+    d = FakeDaemon(home)
+    started = set(threading.enumerate()) - before
+    assert started
+    real_close = socket.socket.close
+    with monkeypatch.context() as m:
+        m.setattr(socket.socket, "close", lambda self: None)
+        d.close()
+    alive = [t.name for t in started if t.is_alive()]
+    real_close(d.sock)
+    assert not alive, alive
 
 
 def _open(daemon: FakeDaemon, transport: str, cls: type[CodexWire] = CodexWire, **kw) -> CodexWire:

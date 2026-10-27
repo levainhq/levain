@@ -636,6 +636,22 @@ def _fd_users() -> str:
     return f"other threads alive: {others}; open fds: {fds}"
 
 
+def _fd_targets(fds) -> list[str]:
+    """What each fd is (its /proc link on Linux, its path on macOS), for a failure message."""
+    out = []
+    for fd in sorted(fds):
+        try:
+            if sys.platform == "darwin":
+                import fcntl
+                what = os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+            else:
+                what = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError as e:
+            what = f"? {e}"
+        out.append(f"{fd}={what}")
+    return out
+
+
 def _fd_limit(free: int) -> int:
     """The soft RLIMIT_NOFILE that leaves exactly ``free`` fd numbers open to new fds at the moment it is
     computed (the open fds counted by :func:`_open_fds`); skipped past the hard limit."""
@@ -715,11 +731,18 @@ def test_walk_fd_peak_is_bounded(world, monkeypatch):
     free = end_mod.WALK_PEAK_FDS + FD_SPARE
     assert CHAIN > free
     err = None
+    pre = _open_fds()
     with _nofile(free):
         try:
             got = len(list(end_mod.walk(world.S, world.extra)))
         except OSError as e:
             err = f"{e}; {_fd_users()}"      # while the limit is still squeezed
+    if err is not None:
+        # under the squeeze /dev/fd itself may be unlistable (CI on the 1026+23 landing chain), so the fds are
+        # listed again with the limit restored, each named, those opened since the squeeze began marked "+"
+        now = _open_fds()
+        err += (f"; {len(pre)} fds open before the squeeze; after it: "
+                f"{[('+' if fd not in pre else '') + w for fd, w in zip(sorted(now), _fd_targets(now))]}")
     assert err is None, f"{err} with {free} fds free (measured peak {count.peak})"
     assert got == expected
 
