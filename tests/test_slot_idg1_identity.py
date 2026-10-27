@@ -64,11 +64,13 @@ def test_codex_login_records_not_a_check(env):
     assert not _baseline(w).exists()                              # start never writes the baseline
 
 
-def test_claude_login_records_identity_call_unbuilt(env):
-    """IG-3 open: the Claude call is a stub that refuses ``identity-call-unbuilt``; the login itself still ran."""
+def test_claude_login_with_no_answer_records_identity_unparsable(env):
+    """IG-3: a Claude call that answers no profile records ``identity-unparsable``; the login itself still ran (the
+    wired call's own tests: tests/test_slot_idg1b_identity.py)."""
     w, la, _ = env
+    w.seams.capture = lambda argv, spec, cgroup, bound: (1, b'{"error":"no-token"}\n')   # G1b: the child, faked
     s = _login(w, la, "claude")
-    assert w.state(s).fields["identity"] == {"result": "identity-call-unbuilt"}
+    assert w.state(s).fields["identity"] == {"result": "identity-unparsable"}
     assert not _baseline(w).exists()
 
 
@@ -91,7 +93,10 @@ def test_interactive_start_runs_no_identity_step(env):
 def test_identity_call_table():
     assert ID.identity_call(None, "codex") == ID.NOT_A_CHECK
     with pytest.raises(Refused) as e:
-        ID.identity_call(None, "claude")
+        ID.identity_call(None, "claude")              # G1b: the Claude call runs for a session only
+    assert e.value.name == "internal"
+    with pytest.raises(Refused) as e:
+        ID.identity_call(None, "gemini")
     assert e.value.name == "identity-call-unbuilt"
     assert R.OBSERVED_ID_RE.fullmatch(ID.NOT_A_CHECK)
 
@@ -131,9 +136,10 @@ def test_confirm_no_writes_nothing(env):
 def test_claude_confirm_yes_refused_without_an_observed_id(env):
     """A Claude login reaches confirm with no observed id: yes is refused by name, nothing written."""
     w, la, _ = env
+    w.seams.capture = lambda argv, spec, cgroup, bound: (1, b'{"error":"no-token"}\n')   # G1b: the child, faked
     s = _login(w, la, "claude")
     line = w.main(["confirm-identity", s, "yes"])[1]
-    assert line == {"ok": False, "refused": "no-observed-id:identity-call-unbuilt"}
+    assert line == {"ok": False, "refused": "no-observed-id:identity-unparsable"}
     assert not _baseline(w).exists()
 
 
@@ -490,7 +496,8 @@ def test_root_parser_refuses_the_rest(code, out):
     assert e.value.name == "identity-unparsable"
 
 
-def test_claude_call_still_refuses_until_wired():
+def test_claude_call_is_wired():
+    """G1b: the Claude call is no longer the ``identity-call-unbuilt`` stub (its tests: test_slot_idg1b_identity.py)."""
     with pytest.raises(Refused) as e:
         ID.identity_call(None, "claude")
-    assert e.value.name == "identity-call-unbuilt"
+    assert e.value.name == "internal"

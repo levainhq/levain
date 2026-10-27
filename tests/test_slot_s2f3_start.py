@@ -163,6 +163,14 @@ class Launches:
     def of(self, target: str) -> list[dict]:
         return [r for r in self.spawns if r["target"] == target]
 
+    def capture(self, argv, spec_json, cgroup, bound):
+        """G1b: the Claude identity child is never really forked here; it answers no profile (``no-token``), so a
+        Claude login records ``identity-unparsable``. Every other target keeps the helper's own capture."""
+        if canon.parse(spec_json)["target"] == "identity":
+            self.identity_captures = getattr(self, "identity_captures", 0) + 1
+            return 1, b'{"error":"no-token"}\n'
+        return H.capture_target(argv, spec_json, cgroup, bound)
+
 
 def _fd_open(fd: int) -> bool:
     try:
@@ -180,6 +188,7 @@ def _world(tmp_path, *, host: str = "linux") -> tuple[World, Launches, Table]:
     w.session = None
     s = w.seams
     s.spawn, s.wait, s.wait_within, s.kill = la.spawn, la.wait, la.wait_within, la.kill
+    s.capture = la.capture
     s.netns_names = lambda: {"levain-e0", "levain-e1", "levain-e2", "levain-v0"}
     s.host_links = lambda: {"/bin": "usr/bin", "/sbin": "usr/sbin", "/lib": "usr/lib", "/lib64": None}
     w.cgroups: list[str] = []
