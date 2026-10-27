@@ -467,29 +467,42 @@ def _json_media(content_type: bytes) -> bool:
 
 def upstream_error_of(body: bytes, scanner: Scanner) -> Optional[dict]:
     """The exchange record's `upstream_error` for an error response's whole `body`: `{"type", "message",
-    "request_id"}` read from the vendor's JSON error, or None when the body is not that. `type` is kept only when it
-    is `[a-z_]{1,64}` (else None), `message` is cut to UPSTREAM_ERROR_MESSAGE_MAX characters, scanned as one block by
-    the exchange's own `scanner` (its count is left as the relay made it) and has every run of 20 or more
-    `[A-Za-z0-9_-]` characters replaced by `<redacted>`, `request_id` is kept only when it is `req_[A-Za-z0-9]{1,64}`."""
+    "request_id"}` read from the vendor's JSON error, or None when the body is not that. Total: any failure reading
+    the body is None, because a record must never break the relay. `message` is scanned whole by the exchange's own
+    `scanner` (a held credential anywhere in it makes the message the marker), then cut to UPSTREAM_ERROR_MESSAGE_MAX
+    characters, then has every run of 20 or more `[A-Za-z0-9_-]` characters replaced by `<redacted>`; the scanner's
+    count is left as the relay made it. `type` is kept only when it is `[a-z_]{1,64}` and `request_id` only when it is
+    `req_[A-Za-z0-9]{1,64}`, and either one the scanner would change is None."""
+    before = scanner.count
     try:
-        doc = json.loads(body.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+        return _upstream_error(body, scanner)
+    except Exception as e:
+        logging.getLogger("levain.broker").warning("upstream_error unreadable (%s)", type(e).__name__)
         return None
+    finally:
+        scanner.count = before   # the same bytes were already counted when the relay scanned the body
+
+
+def _upstream_error(body: bytes, scanner: Scanner) -> Optional[dict]:
+    doc = json.loads(body.decode("utf-8"))
     err = doc.get("error") if type(doc) is dict else None
     if type(err) is not dict:
         return None
-    typ = err.get("type")
-    typ = typ if type(typ) is str and _ERR_TYPE.fullmatch(typ) else None
+
+    def clean(v: object, shape: "re.Pattern[str]") -> Optional[str]:
+        if type(v) is not str or not shape.fullmatch(v):
+            return None
+        raw = v.encode("utf-8", "replace")
+        return v if scanner.value(raw)[0] == raw else None
+
+    typ = clean(err.get("type"), _ERR_TYPE)
     msg = err.get("message")
     if type(msg) is str:
-        before = scanner.count
-        scanned, _ = scanner.value(msg[:UPSTREAM_ERROR_MESSAGE_MAX].encode("utf-8"))
-        scanner.count = before   # the same bytes were already counted when the relay scanned the body
-        msg = _ERR_TOKENISH.sub("<redacted>", scanned.decode("utf-8", "replace"))
+        scanned, _ = scanner.value(msg.encode("utf-8", "replace"))
+        msg = _ERR_TOKENISH.sub("<redacted>", scanned.decode("utf-8", "replace")[:UPSTREAM_ERROR_MESSAGE_MAX])
     else:
         msg = None
-    rid = doc.get("request_id")
-    rid = rid if type(rid) is str and _ERR_REQUEST_ID.fullmatch(rid) else None
+    rid = clean(doc.get("request_id"), _ERR_REQUEST_ID)
     if typ is None and msg is None:
         return None
     return {"type": typ, "message": msg, "request_id": rid}

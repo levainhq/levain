@@ -21,8 +21,8 @@ MEASURED = (b'{"type":"error","error":{"type":"invalid_request_error","message":
             b'"request_id":"req_011CUabcDEFghi1234567890"}')
 
 
-def _http(status: str, body: bytes, ctype: bytes = b"application/json") -> bytes:
-    return (b"HTTP/1.1 " + status.encode() + b"\r\ncontent-type: " + ctype + b"\r\ncontent-length: "
+def _http(status: str, body: bytes, ctype: bytes = b"application/json", extra: bytes = b"") -> bytes:
+    return (b"HTTP/1.1 " + status.encode() + b"\r\ncontent-type: " + ctype + b"\r\n" + extra + b"content-length: "
             + str(len(body)).encode() + b"\r\n\r\n" + body)
 
 
@@ -137,3 +137,51 @@ def test_an_echoed_credential_is_redacted_by_the_brokers_scanner(monkeypatch):
     assert rec["upstream_error"]["message"] == RD.MARKER.decode()
     assert SECRET.encode() not in json.dumps(rec).encode() and SECRET.encode() not in _relayed(frames)
     assert rec["redactions"] == 1   # the relay's count; the message scan adds none
+
+
+# ---- fix round 1 (L3 r1 findings U1-U4)
+
+@pytest.mark.parametrize("body", [
+    b'{"error":{"type":"e","message":"\\ud800"}}',
+    b"[" * 4000 + b"]" * 4000,
+], ids=["lone-surrogate", "deep-nesting"])
+def test_an_unreadable_error_body_never_breaks_the_relay(monkeypatch, body):
+    frames, rec = _exchange(monkeypatch, _http("400 Bad Request", body))
+    assert _relayed(frames) == body and _types(frames) == b"ARbe"   # the whole body and the end frame
+    assert rec["upstream_error"] is None or "message" in rec["upstream_error"]
+
+
+def test_upstream_error_of_is_total():
+    sc = RD.Scanner([SECRET.encode()])
+    assert K.upstream_error_of(b'{"error":{"type":"e","message":"\\ud800"}}', sc) is not None
+    assert K.upstream_error_of(b"[" * 4000 + b"]" * 4000, sc) is None
+    assert K.upstream_error_of(b"\xff\xfe", sc) is None
+
+
+def test_a_long_credential_with_punctuation_is_redacted_before_the_cut():
+    cred = "a!" * 100 + "Z"                      # 201 characters, no 20-run of token characters
+    sc = RD.Scanner([cred.encode()])
+    body = json.dumps({"error": {"type": "authentication_error", "message": "bad " + cred}}).encode()
+    got = K.upstream_error_of(body, sc)
+    assert got["message"] == RD.MARKER.decode()
+    assert "a!a!a!a!" not in json.dumps(got) and sc.count == 0
+
+
+def test_a_credential_echoed_in_request_id_or_type_nulls_that_field():
+    cred = "req_ABCDEF0123456789ABCDEF0123456789"
+    sc = RD.Scanner([cred.encode(), b"leaked_type_credential"])
+    body = json.dumps({"error": {"type": "leaked_type_credential", "message": "m"}, "request_id": cred}).encode()
+    got = K.upstream_error_of(body, sc)
+    assert got == {"type": None, "message": "m", "request_id": None}
+    assert sc.count == 0
+
+
+@pytest.mark.parametrize("extra", [b"content-encoding: gzip\r\n", b"content-encoding: br\r\n"])
+def test_an_encoded_body_is_not_decoded(monkeypatch, extra):
+    frames, rec = _exchange(monkeypatch, _http("400 Bad Request", MEASURED, extra=extra))
+    assert rec["upstream_error"] is None and _relayed(frames) == b""   # refused before any body is relayed
+
+
+def test_an_identity_content_encoding_is_read(monkeypatch):
+    _, rec = _exchange(monkeypatch, _http("400 Bad Request", MEASURED, extra=b"content-encoding: identity\r\n"))
+    assert rec["upstream_error"]["type"] == "invalid_request_error"
