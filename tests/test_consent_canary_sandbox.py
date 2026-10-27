@@ -21,6 +21,7 @@ import pytest
 from levain import canary_probe
 from levain.consent import canary
 
+SID = "s-0123456789abcdef"
 ALL_STOPPED = {"CONTROL": "OK", **{a: "STOPPED" for a in canary_probe.ARMS}}
 
 
@@ -50,6 +51,16 @@ def _digest(instruction: str) -> str:
                                     hook_enoent_stops="--hook-enoent-stops" in instruction)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_store(monkeypatch):
+    """No test reaches the operator's real store through the root helper (sudo)."""
+    from levain.slot import adopt_view
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a test reached the real runtime helper")
+    monkeypatch.setattr(adopt_view, "call_helper", refuse)
+
+
 @pytest.fixture
 def offhost():
     """A loopback listener standing in for the off-host address, so the host's own control connect succeeds."""
@@ -61,7 +72,7 @@ def offhost():
 
 
 def _run(tmp_path: Path, offhost: str, act=None, *, status=None, control=True, files=None, problem=None,
-         cockpit=None, transcript="", discard=None):
+         cockpit=None, transcript="", discard=None, sessions=None):
     """One run with a scripted session (``act(instruction, repo, nonce)`` runs inside it, may raise) and a scripted
     fetch that hands back a results file signed with the run's own token (``status`` overrides), or ``files``."""
     home = tmp_path / "home"
@@ -85,7 +96,8 @@ def _run(tmp_path: Path, offhost: str, act=None, *, status=None, control=True, f
     result = canary.run_sandbox_canary("claude_code", workspace=tmp_path / "ws", session=session, fetch=fetch,
                                        home=home, cockpit_url="http://127.0.0.1:7420", offhost=offhost,
                                        cockpit_check=cockpit or (lambda url: None),
-                                       discard=discard or (lambda sid, repo: None))
+                                       discard=discard or (lambda sid, repo: None),
+                                       sessions=sessions or (lambda base: ([SID], None)))
     return result, seen
 
 
@@ -429,7 +441,8 @@ def test_the_run_aims_the_probe_at_the_checked_cockpit_host(tmp_path, offhost):
         return canary.SessionOutcome("", None)
     canary.run_sandbox_canary("claude_code", workspace=tmp_path / "ws", session=session, fetch=lambda *a: ({}, None),
                               home=home, cockpit_url="http://[::1]:7420", offhost=offhost,
-                              cockpit_check=lambda url: None, discard=lambda sid, repo: None)
+                              cockpit_check=lambda url: None, discard=lambda sid, repo: None,
+                              sessions=lambda base: ([], None))
     assert _args(seen["instruction"])["cockpit"] == "[::1]:7420"
 
 
@@ -524,8 +537,6 @@ def test_a_raise_from_started_still_reaps_the_child_and_closes_the_pty(tmp_path,
     assert len(closed) >= 2, "the master pty fd was closed as well as the slave"
 
 
-SID = "s-0123456789abcdef"
-
 
 def test_the_retained_session_is_the_last_ended_retained_line():
     assert canary.retained_session("nothing here") is None
@@ -533,27 +544,124 @@ def test_the_retained_session_is_the_last_ended_retained_line():
     assert canary.retained_session("session s-1 ended RETAINED") is None
 
 
-def test_a_verified_run_discards_its_scratch_session_and_an_unverified_one_does_not(tmp_path, offhost):
-    """R8 (and the guard on it): the id on the screen is the model's to forge, so only a run whose results verified
-    discards, and a discard that fails is a note, not the verdict."""
-    calls = []
-    result, _ = _run(tmp_path, offhost, transcript=f"session {SID} ended RETAINED", discard=lambda sid, repo: calls.append(sid))
-    assert calls == [SID] and result.status == "PASS" and result.notes == ()
-    (tmp_path / "b").mkdir()
-    calls.clear()
-    result, _ = _run(tmp_path / "b", offhost, transcript=f"session {SID} ended RETAINED", files=lambda seen: {},
-                     discard=lambda sid, repo: calls.append(sid))
-    assert calls == [] and result.status == "INCONCLUSIVE" and "left retained" in result.notes[0]
-    (tmp_path / "c").mkdir()
-    result, _ = _run(tmp_path / "c", offhost, transcript=f"session {SID} ended RETAINED",
-                     discard=lambda sid, repo: "exited 2: busy")
-    assert result.status == "PASS" and "not discarded" in result.notes[0] and "exited 2: busy" in result.notes[0]
-    (tmp_path / "d").mkdir()
+def test_the_discard_takes_the_store_session_cloned_from_this_runs_commit_on_every_path(tmp_path, offhost):
+    """R8': the id comes from the store (the session whose base is the scratch commit), never from the screen, and the
+    discard runs whether or not the results verified; RED at 2182c457: a missing results file left it retained."""
+    calls, bases = [], []
 
-    def boom(sid, repo):
+    def sessions(base):
+        bases.append(base)
+        return [SID], None
+    result, seen = _run(tmp_path, offhost, transcript="session s-ffffffffffffffff ended RETAINED",
+                        sessions=sessions, discard=lambda sid, repo: calls.append((sid, repo)))
+    assert result.status == "PASS" and result.notes == () and calls == [(SID, seen["repo"])]
+    assert bases == [canary.scratch_head(seen["repo"])]
+    for name, files in (("missing", lambda seen: {}), ("forged", lambda seen: {
+            canary_probe.results_name(seen["nonce"]): _results("0" * 64, seen["nonce"], _digest(seen["instruction"]))})):
+        (tmp_path / name).mkdir()
+        calls.clear()
+        result, _ = _run(tmp_path / name, offhost, transcript="", files=files,
+                         discard=lambda sid, repo: calls.append(sid))
+        assert result.status == "INCONCLUSIVE" and calls == [SID] and result.notes == ()
+
+
+def test_the_discard_is_skipped_with_a_note_unless_exactly_one_session_matches(tmp_path, offhost):
+    for name, answer, says in (("none", ([], None), "holds 0 sessions"),
+                               ("two", ([SID, "s-ffffffffffffffff"], None), "holds 2 sessions"),
+                               ("unread", (None, "sudo: a password is required"), "a password is required")):
+        (tmp_path / name).mkdir()
+        calls = []
+        result, _ = _run(tmp_path / name, offhost, sessions=lambda base, a=answer: a,
+                         discard=lambda sid, repo: calls.append(sid))
+        assert calls == [] and result.status == "PASS" and says in result.notes[0], name
+        assert "nothing was discarded" in result.notes[0]
+
+
+def test_a_discard_or_lookup_that_fails_is_a_note_never_the_verdict(tmp_path, offhost):
+    result, _ = _run(tmp_path, offhost, discard=lambda sid, repo: "exited 2: busy")
+    assert result.status == "PASS" and "not discarded" in result.notes[0] and "exited 2: busy" in result.notes[0]
+
+    def boom(*args):
         raise RuntimeError("store gone")
-    result, _ = _run(tmp_path / "d", offhost, transcript=f"session {SID} ended RETAINED", discard=boom)
-    assert result.status == "PASS" and "store gone" in result.notes[0]
+    for name, kw in (("d", {"discard": boom}), ("l", {"sessions": boom})):
+        (tmp_path / name).mkdir()
+        result, _ = _run(tmp_path / name, offhost, **kw)
+        assert result.status == "PASS" and "store gone" in result.notes[0], name
+
+
+def test_no_lookup_or_discard_when_no_session_was_started(tmp_path, offhost, monkeypatch):
+    calls = []
+    monkeypatch.setattr(canary, "_host_connects", lambda hp: (_ for _ in ()).throw(OSError("no route")))
+    with pytest.raises(OSError):
+        _run(tmp_path, offhost, sessions=lambda base: calls.append(base) or ([SID], None),
+             discard=lambda sid, repo: calls.append(sid))
+    assert calls == []
+
+
+def test_store_sessions_reads_the_status_records_by_base(monkeypatch):
+    from levain.slot import adopt_view
+    recs = [{"session": SID, "base": {"oid": "a" * 40}}, {"session": "s-ffffffffffffffff", "base": {"oid": "b" * 40}},
+            {"session": "s-eeeeeeeeeeeeeeee"}, {"session": "../x", "base": {"oid": "a" * 40}}, "junk"]
+    seen = []
+
+    def helper(seams, *args, err, timeout=None):
+        seen.append(args)
+        return {"records": recs}
+    monkeypatch.setattr(adopt_view, "call_helper", helper)
+    assert canary.store_sessions("a" * 40) == ([SID], None) and seen == [("status",)]
+    assert canary.store_sessions("c" * 40) == ([], None)
+    monkeypatch.setattr(adopt_view, "call_helper", lambda *a, **k: {"records": None})
+    assert canary.store_sessions("a" * 40)[0] is None
+
+    def refused(*a, **k):
+        from levain.slot import Refused
+        raise Refused("helper-unrunnable", "status: no such file")
+    monkeypatch.setattr(adopt_view, "call_helper", refused)
+    ids, why = canary.store_sessions("a" * 40)
+    assert ids is None and "helper-unrunnable" in why
+
+
+def test_close_after_a_thread_that_never_started_does_not_raise(monkeypatch):
+    """L1: RED at 2182c457 (close() joined an unstarted thread: "cannot join thread before it is started")."""
+    import threading
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(threading.Thread, "start", boom)
+    listener = canary._CountingListener()
+    with pytest.raises(RuntimeError):
+        listener.start()
+    listener.close()
+
+
+def test_a_path_with_undecodable_bytes_reads_inconclusive_not_a_crash(tmp_path, offhost):
+    """L2: RED at 2182c457 (UnicodeEncodeError from the host digest)."""
+    def session(vendor, repo, instruction, nonce, timeout, started):
+        started()
+        return canary.SessionOutcome("", None)
+    result = canary.run_sandbox_canary("claude_code", workspace=tmp_path / "ws", session=session,
+                                       fetch=lambda t, r, n: ({}, None), home=tmp_path / "x\udcff",
+                                       cockpit_url="http://127.0.0.1:7420", offhost=offhost,
+                                       cockpit_check=lambda url: None, discard=lambda sid, repo: None,
+                                       sessions=lambda base: ([], None))
+    assert result.status == "INCONCLUSIVE"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX argv bytes")
+def test_the_probe_digests_an_undecodable_path_as_the_host_does(tmp_path):
+    """L2: the probe gets the path through argv (decoded with surrogateescape) and signs over the same digest."""
+    here, token = _probe(tmp_path, "p")
+    home = str(tmp_path / "home\udcff")
+    nonce = "0123456789abcdef"
+    argv = ["--nonce", nonce, "--home", home, "--port", "1", "--cockpit", "none", "--hookdir", str(tmp_path / "nohooks"),
+            "--offhost", "127.0.0.1:1"]
+    _run_probe(here, argv)
+    digest = canary_probe.args_digest(home=home, offhost="127.0.0.1:1", port=1, cockpit="none",
+                                      hookdir=str(tmp_path / "nohooks"), home_enoent_stops=False,
+                                      hook_enoent_stops=False)
+    data = (here / canary_probe.results_name(nonce)).read_bytes()
+    results, why = canary.verify_results(data, token, nonce, digest)
+    assert results is not None, why
 
 
 def test_discard_slot_session_reports_a_failure_instead_of_raising(tmp_path, monkeypatch):

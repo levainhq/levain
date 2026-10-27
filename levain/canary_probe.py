@@ -68,10 +68,12 @@ def results_name(nonce: str) -> str:
 
 def args_digest(*, home: str, offhost: str, port: int, cockpit: str, hookdir: str, home_enoent_stops: bool,
                 hook_enoent_stops: bool) -> str:
-    """SHA-256 over every argument the host chose, in a fixed order (NUL-separated, so no value runs into the next)."""
+    """SHA-256 over every argument the host chose, in a fixed order (NUL-separated, so no value runs into the next).
+    UTF-8 with ``surrogateescape``: a path holding bytes that are not UTF-8 reaches both sides as the same escaped
+    string (the host's ``Path``, the probe's ``argv``), so both digest the same bytes."""
     parts = (home, offhost, str(int(port)), cockpit, hookdir, "1" if home_enoent_stops else "0",
              "1" if hook_enoent_stops else "0")
-    return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+    return hashlib.sha256("\0".join(parts).encode("utf-8", "surrogateescape")).hexdigest()
 
 
 def line_mac(token: str, nonce: str, digest: str, name: str, status: str) -> str:

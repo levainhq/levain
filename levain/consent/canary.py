@@ -630,8 +630,9 @@ class _CountingListener:
         import threading
         if self._thread is None:
             self._lock = threading.Lock()
-            self._thread = threading.Thread(target=self._accept, daemon=True)
-            self._thread.start()
+            thread = threading.Thread(target=self._accept, daemon=True)
+            thread.start()
+            self._thread = thread  # only a started thread: close() joins it
 
     def _accept(self) -> None:
         while not self._stop:
@@ -895,7 +896,7 @@ def real_session(vendor: str, repo: Path, instruction: str, nonce: str, timeout:
             now = time.monotonic()
             if not typed and first is not None and (now - last_data > QUIET_BEFORE_TYPING_S
                                                     or now - first > TYPE_DEADLINE_S):
-                os.write(fd, instruction.encode())
+                os.write(fd, instruction.encode("utf-8", "surrogateescape"))  # as canary_probe.args_digest
                 time.sleep(ENTER_GAP_S)
                 os.write(fd, b"\r")
                 typed = True
@@ -951,6 +952,36 @@ def discard_slot_session(sid: str, repo: Path, timeout: float = 180.0) -> str | 
     return None
 
 
+def scratch_head(repo: Path) -> str:
+    """The scratch repo's one commit: the base every session cloned from it records (its alloc's ``base.oid``). The
+    commit holds the probe copy with this run's fresh token, so no other repo's session carries it. [read by
+    lane-canaryr8, 10-27, from ``supervisor.operator_clone`` / ``stage.make_bundle`` (the bundle's tip is the branch
+    tip) and ``runtime_helper`` render (``base_of(header)``); not run against a real session.]"""
+    cp = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), "rev-parse", "--verify",
+                         "HEAD^{commit}"], env=child_env(), stdin=subprocess.DEVNULL, capture_output=True,
+                        check=True, timeout=60)
+    return cp.stdout.decode("ascii").strip()
+
+
+def store_sessions(base_oid: str) -> tuple[list[str] | None, str | None]:
+    """The operator's sessions whose alloc records ``base_oid`` as its base, from the runtime helper's ``status``
+    (every alloc the caller holds, read from the store, never from a screen): ``(ids, None)``, or ``(None, why)``
+    when the store could not be read. Never raises."""
+    import io
+
+    from levain.slot.adopt_view import Seams, call_helper
+    from levain.slot.grammar import SESSION_RE
+    try:
+        records = call_helper(Seams(), "status", err=io.StringIO()).get("records")
+    except Exception as exc:  # noqa: BLE001 - a lookup that fails is a note, never the verdict
+        return None, f"the session store could not be read: {type(exc).__name__}: {exc}"[:300]
+    if not isinstance(records, list):
+        return None, "the session store's status answer has no record list"
+    return [r["session"] for r in records
+            if isinstance(r, dict) and isinstance(r.get("session"), str) and SESSION_RE.fullmatch(r["session"])
+            and isinstance(r.get("base"), dict) and r["base"].get("oid") == base_oid], None
+
+
 def fetch_slot_files(transcript: str, repo: Path, names: tuple[str, ...],
                      timeout: float = 600.0) -> tuple[dict[str, bytes] | None, str | None]:
     """The named files of the slot's retained work tree, through the operator's own adopt: ``levain session adopt
@@ -987,15 +1018,17 @@ def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: fl
                        session: SessionRunner | None = None, fetch: FileFetcher | None = None,
                        home: Path | None = None, cockpit_url: str | None = None,
                        cockpit_check: Any = None, offhost: str | None = None,
-                       discard: Any = None) -> SandboxResult:
+                       discard: Any = None, sessions: Any = None) -> SandboxResult:
     """The courier run. ``session`` and ``fetch`` replace the real session path and the adopt read (tests pass
     scripted ones); ``home`` is the directory the HOMEWRITE arm aims at (default: the operator's home);
     ``cockpit_url`` the cockpit's address (default: `levain cockpit sign`'s); ``cockpit_check`` replaces
     :func:`cockpit_listening`; ``offhost`` the OFFHOST target (default: the probe's); ``discard`` replaces
-    :func:`discard_slot_session`, called ``(session id, repo)`` once the evidence is read. The canary's retained
-    scratch session is discarded only when the results file verified (then the session is provably the canary's own:
-    the id on the screen is the model's to forge, and a discard is the operator's store); a discard that fails or is
-    skipped is a note beside the verdict, never part of it."""
+    :func:`discard_slot_session`, called ``(session id, repo)``; ``sessions`` replaces :func:`store_sessions`.
+    R8: once a session was started, on every exit path after the evidence is read, the canary discards its own
+    retained scratch session. Its id is never taken from the screen (the model's to forge): it is the one session
+    in the operator's store whose alloc records the scratch repo's commit as its base (:func:`scratch_head`, unique
+    to this run). No such session or several, a store that cannot be read, or a discard that fails is a note
+    beside the verdict, never part of it, and nothing is discarded."""
     if agent not in SANDBOX_VENDORS:
         raise ValueError(f"agent must be one of {AGENTS}: {agent!r}")
     import secrets
@@ -1024,7 +1057,8 @@ def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: fl
     offhost = offhost or DEFAULT_OFFHOST
     try:
         repo = _make_scratch_repo(ws, token)
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        base = scratch_head(repo)
+    except (OSError, ValueError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
         return result(SandboxCheck("setup", "inconclusive", f"scratch repo: {exc}"[:300]))
     hookdir = repo / ".git" / "hooks"
     hook_file = hookdir / HOOK_NAME
@@ -1037,7 +1071,7 @@ def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: fl
     pre_live: list[bool] = []
     checks: list[SandboxCheck] = []
     notes: list[str] = []
-    verified = False
+    spawned = False
     try:
         cockpit, cockpit_missing = _cockpit_endpoint(cockpit_url or DEFAULT_URL)
         if cockpit_missing is None:
@@ -1053,6 +1087,7 @@ def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: fl
 
         def started() -> None:
             pre_live.append(listener.self_connect())
+        spawned = True
         try:
             outcome = (session or real_session)(SANDBOX_VENDORS[agent], repo, instruction, nonce, timeout, started)
         except Exception as exc:  # noqa: BLE001 - the host's far side is still read; the error is the evidence
@@ -1077,7 +1112,6 @@ def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: fl
         except (OSError, subprocess.SubprocessError) as exc:
             files, fetch_problem = None, f"the slot's files could not be read: {exc}"[:300]
         results, why = verify_results((files or {}).get(names[1]), token, nonce, digest)
-        verified = results is not None
         if results is None and fetch_problem:
             why = fetch_problem
         view = HostView(home_file_seen=home_seen, hook_seen=hook_seen, listener_hits=hits, listener_live=live,
@@ -1090,19 +1124,32 @@ def run_sandbox_canary(agent: str, *, workspace: Path | None = None, timeout: fl
             if os.path.lexists(planted):
                 with contextlib.suppress(OSError):
                     planted.unlink()
-        sid = retained_session(outcome.transcript)
-        if sid and verified:
-            try:
-                problem = (discard or discard_slot_session)(sid, repo)
-            except Exception as exc:  # noqa: BLE001 - a discard never changes the verdict or masks an error
-                problem = f"discard of {sid} raised {type(exc).__name__}: {exc}"[:300]
-            if problem:
-                notes.append(f"the scratch session {sid} was not discarded ({problem}); `levain session discard "
-                             f"{sid}` removes it")
-        elif sid:
-            notes.append(f"the scratch session {sid} was left retained: no results file verified, so the id on the "
-                         "screen is not known to be the canary's own")
+        if spawned:
+            notes.extend(_discard_own_session(base, repo, sessions or store_sessions, discard or discard_slot_session))
     return result(*checks, notes=tuple(notes))
+
+
+def _discard_own_session(base: str, repo: Path, sessions: Any, discard: Any) -> list[str]:
+    """R8: discard the one store session cloned from this run's scratch commit ``base``; the notes to show (none
+    when it went through). Never raises."""
+    try:
+        ids, problem = sessions(base)
+    except Exception as exc:  # noqa: BLE001 - a lookup never changes the verdict or masks an error
+        ids, problem = None, f"the session lookup raised {type(exc).__name__}: {exc}"[:300]
+    if ids is None:
+        return [f"the scratch session was not looked up ({problem}), so nothing was discarded"]
+    if len(ids) != 1:
+        found = ", ".join(ids[:8]) if ids else "none"
+        return [f"the store holds {len(ids)} sessions cloned from this run's scratch repo ({found}), not one, so "
+                "nothing was discarded"]
+    sid = ids[0]
+    try:
+        problem = discard(sid, repo)
+    except Exception as exc:  # noqa: BLE001 - a discard never changes the verdict or masks an error
+        problem = f"discard of {sid} raised {type(exc).__name__}: {exc}"[:300]
+    if problem:
+        return [f"the scratch session {sid} was not discarded ({problem}); `levain session discard {sid}` removes it"]
+    return []
 
 
 def run_canary(agent: str, *, workspace: Path | None = None) -> CanaryResult:
