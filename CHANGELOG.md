@@ -137,23 +137,27 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   them). They apply to sessions started afterwards. If your route map already has your own egress route for one of the
   shipped hosts (for example `pypi.org`), your route keeps it and the shipped list leaves it off; setup, repair and
   `routes-base` say so. A map where two of your routes name the same host, a route that lists the same host twice, or a
-  subscription route that names a shipped host is refused when the map is merged, with the route names and the fix (edit
-  `routes/base.json`), instead of every session failing at its gateway; `routes-egress` refuses to write over such a map.
-- **The cockpit has a Calm switch.** On, the agents graph and the sky stop moving and the page's animations slow, and the
+  subscription route that names one of those shipped egress hosts is refused when the map is merged, with the route
+  names and the fix (edit `routes/base.json`), instead of every session failing at its gateway (the shipped Claude route,
+  below, is not such a case: your own route for Claude wins over it); `routes-egress` refuses to write over such a map.
+- **The cockpit has a Calm switch.** On, the agents graph and the sky stop moving and the page's animations and transitions stop, and the
   ages on the page refresh every two minutes instead of faster, so an open cockpit tab costs the laptop far less; every
   number, card and answer stays. It is remembered on that device. On a desktop bar too narrow for the label it shows as an
   icon, filled while Calm is on; on a phone it sits at the right of the clock and date.
 - **A Levain session can sign in to your own Claude subscription.** The base route map now includes `claude-subscription`,
-  which lets a `levain session --auth passthrough claude` session reach `api.anthropic.com`, `claude.ai` and
-  `platform.claude.com` and nothing else; telemetry, error-reporting and update hosts are not included. `levain setup`
-  and `repair` add it to an existing install; if you already have your own Claude passthrough route, the merge keeps
-  yours, skips the shipped one, and says so each time it runs.
+  which lets a passthrough session reach `api.anthropic.com`, `claude.ai` and `platform.claude.com` and nothing else;
+  telemetry, error-reporting and update hosts are not included. For now a passthrough session runs only as a sign-in:
+  `levain session claude --repo PATH --auth passthrough --login`. `levain setup` and `repair` add the route to an
+  existing install; if you already have your own passthrough route for Claude, the merge keeps yours, skips the shipped
+  one, and says so each time it runs.
 - **A slot's network front keeps a log.** Each egress slot's gateway writes its tunnels and refusals to `front.log` in
   the slot's gateway directory; the log is capped (one rotated copy), mode 0640, and never written through a link.
 - **`levain binding pause|resume|abandon <id>`.** `pause` stops a binding from firing and stops runs it already started
-  before their next action; `resume` makes a paused binding fire on its next event; `abandon` stops the runs a revoked or
-  expired binding already started. Each opens the autonomic store as it is and prints one line (exit 1 with the reason
-  when it cannot).
+  before their next action; `resume` makes a paused binding fireable again (it refuses a revoked or expired binding, and
+  a confirm-class one with no kill in its sealed guard); `abandon` stops the runs a revoked or expired binding already
+  started, and on an active or paused binding pauses it instead. Bindings do not fire yet in this build (no binding
+  driver is wired), so these set the state the driver will read. Each opens the autonomic store as it is and prints one
+  line (exit 1 with the reason when it cannot).
 - **Graduation policies carry a guard.** `levain binding policy create` needs `--guard FILE`, a JSON list of entries that
   each give a reason the policy might be wrong, a kill (an event condition) and a drill (an example event the kill must
   not let through). Levain prints the guard back before signing and refuses a kill it could not evaluate, a drill the
@@ -252,9 +256,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   column.
 - **`levain doctor`'s "agent front logs" row judges what a session start would.** It asks the runtime's own walk about
   each egress slot's front log directory (missing account, a `gw/` that is a file, a link, a wrong owner or mode fail
-  the row; only a genuinely missing directory reads as upgrade-pending), names each slot under its own result, and no
-  longer warns "could not be read" on a healthy install. A session refused for a missing front log directory names the
-  directory that is missing.
+  the row; a genuinely missing directory also fails it, marked upgrade-pending with the repair line), names each slot
+  under its own result, and no longer warns "could not be read" on a healthy install. A session start is refused for a
+  missing front log directory too, and names the directory that is missing.
 - **`levain binding policy create`'s read-back no longer overstates a guard.** A kill condition that hits an unexpected
   internal error, or an event number too large for a float, now reads as a kill Levain could not evaluate, so the
   guard is refused at signing instead of the check crashing.
