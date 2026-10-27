@@ -148,8 +148,10 @@ def hand_built(tmp_path, rows, name="hand") -> s.AutonomicStore3:
 
 
 def started_run(c, run_id="r", *, links=1, guard=(), binding="b"):
-    c.execute("INSERT INTO runs (run_id, binding_id, generation, seal, started_at) VALUES (?, ?, 0, ?, 't')",
+    # born unstarted, then started once (runs_sealed / runs_u, D71)
+    c.execute("INSERT INTO runs (run_id, binding_id, generation, seal) VALUES (?, ?, 0, ?)",
               (run_id, binding, run_seal(links, guard)))
+    c.execute("UPDATE runs SET started_at = 't' WHERE run_id = ?", (run_id,))
 
 
 def by_hand(c, run_id, effect_id, attempt, state, *, receipt=None, result=None, seal=EFF_SEAL, legacy=0):

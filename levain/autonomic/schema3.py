@@ -102,6 +102,9 @@ V3_TABLES = (
 TERMINAL_MODES = {
     ("effects", "done"): ("fired",),
     ("effects", "unknown"): ("outcome_unknown",),
+    # O-p2-1 section 3: an attempt that did not start; its receipt claims no effect fired (the frozen receipt
+    # contract's terminal_state set is not changed)
+    ("effects", "not_started"): ("refused",),
     ("cancels", None): ("refused", "killed", "timed_out"),
     ("manual_pendings", "terminal"): ("fired", "refused", "killed", "timed_out", "outcome_unknown"),
     ("requests", None): ("refused",),
@@ -184,6 +187,11 @@ def _effect_subj(a: str) -> str:
 def _link_request(a: str) -> str:
     # the request subject of the link an effects / holds row aliased `a` belongs to (one per link, every attempt)
     return "'request:' || " + _link_key(a)
+
+
+def _run_requests(run: str) -> str:
+    # the prefix every request subject of the run `run` (an SQL expression) starts with
+    return f"'request:' || {run} || ':'"
 
 
 _RUN = "'run:' || NEW.run_id"
@@ -358,15 +366,22 @@ V3_TRIGGERS = (
            "AND json_extract(NEW.seal, '$.by') IS NOT 'human' AND NOT (json_type(NEW.seal, '$.grant') IS 'object' AND "
            + _guard_complete("json_extract(NEW.seal, '$.grant.terms_text')") + ")",
            "D67/D75/I1: a confirm-class fire no human decided needs a signed grant guard", "BEFORE INSERT ON effects"),
-    _abort("effects_ident", "NOT (" + _same("run_id", "effect_id", "digest", "pid", "seal") + ")",
+    _abort("effects_ident", "NOT (" + _same("run_id", "effect_id", "attempt", "digest", "pid", "seal") + ")",
            "D70: an effect identity and seal are immutable", "BEFORE UPDATE ON effects"),
     _abort("effects_close", f"OLD.state = 'intent' AND ((NEW.state = 'intent' AND NEW.receipt_id IS NOT NULL) OR "
            f"(NEW.state != 'intent' AND (NEW.receipt_id IS NULL OR NOT {_has(_EFF, 'NEW.receipt_id')})))",
            "D54: an effect ends only with its receipt", "BEFORE UPDATE ON effects"),
-    _abort("effects_close_mode", "OLD.state = 'intent' AND NEW.state IN ('done', 'unknown') AND NOT "
+    # O-p2-1 section 3 + A5: not_started is a refused receipt with no refuse_class that says nothing fired, and the
+    # row's result carries the marker 'not_started:<why>' (a kill or prudential refusal never reads as not started)
+    _abort("effects_close_mode", "OLD.state = 'intent' AND NEW.state IN ('done', 'unknown', 'not_started') AND NOT "
            f"((NEW.state = 'done' AND {_mode('NEW.receipt_id', TERMINAL_MODES[('effects', 'done')])}) OR "
-           f"(NEW.state = 'unknown' AND {_mode('NEW.receipt_id', TERMINAL_MODES[('effects', 'unknown')])}))",
-           "I4: done is fired, unknown is outcome_unknown", "BEFORE UPDATE ON effects"),
+           f"(NEW.state = 'unknown' AND {_mode('NEW.receipt_id', TERMINAL_MODES[('effects', 'unknown')])}) OR "
+           f"(NEW.state = 'not_started' AND {_mode('NEW.receipt_id', TERMINAL_MODES[('effects', 'not_started')])} "
+           "AND IFNULL(NEW.result GLOB 'not_started:?*', 0) AND EXISTS (SELECT 1 FROM gate_receipts g "
+           "WHERE g.receipt_id = NEW.receipt_id AND json_type(g.record, '$.fired') = 'false' "
+           "AND IFNULL(json_type(g.record, '$.action_face.refuse_class'), 'null') = 'null')))",
+           "I4: done is fired, unknown is outcome_unknown, not_started is refused with its marker",
+           "BEFORE UPDATE ON effects"),
     _abort("effects_final", "OLD.state != 'intent'", "D54: an ended effect is final", "BEFORE UPDATE ON effects"),
     _abort("effects_final_d", "OLD.state != 'intent'", "D54: an ended effect is final", "BEFORE DELETE ON effects"),
     # ---- manual pendings: born open; open->firing (with its decision), open|firing->terminal (with its receipt)
@@ -405,14 +420,14 @@ V3_TRIGGERS = (
            # I10 (13a): fired=false with terminal_state fired only for an effect still intent (it closes done)
            "OR (json_extract(NEW.record, '$.fired') = 0 AND "
            "json_extract(NEW.record, '$.action_face.terminal_state') = 'fired' AND NOT (NEW.subject GLOB 'effect:*' "
-           "AND EXISTS (SELECT 1 FROM effects e WHERE NEW.subject = 'effect:' || e.run_id || ':' || e.effect_id "
+           f"AND EXISTS (SELECT 1 FROM effects e WHERE NEW.subject = {_effect_subj('e')} "
            "AND e.state = 'intent')))",
            "I4/I10: a receipt record names its own row", "BEFORE INSERT ON gate_receipts"),
     # D68/I1: an effect's receipt carries the effect's sealed guard; a run's or request's carries the run's floor
     # (null when empty); compared structurally (complement r11 8)
     # D98: an effect's receipt carries its seal's floor (action_face.guard) and grant_guard (action_face.grant_guard)
-    _abort("receipts_carry_guard", "EXISTS (SELECT 1 FROM effects e WHERE NEW.subject = 'effect:' || e.run_id || ':' "
-           "|| e.effect_id AND NOT (" + _json_eq(
+    _abort("receipts_carry_guard", f"EXISTS (SELECT 1 FROM effects e WHERE NEW.subject = {_effect_subj('e')} "
+           "AND NOT (" + _json_eq(
                "(CASE WHEN json_array_length(e.seal, '$.floor') > 0 THEN json_extract(e.seal, '$.floor') END)",
                "json_extract(NEW.record, '$.action_face.guard')") + " AND " + _json_eq(
                "(CASE WHEN json_array_length(e.seal, '$.grant_guard') > 0 THEN json_extract(e.seal, '$.grant_guard') END)",
@@ -459,7 +474,9 @@ V3_TRIGGERS = (
            # reopen (V _reopen_in): 1 -> open, every decision column cleared together, before its effect exists
            "(OLD.decided IS 1 AND NEW.decided IS NULL AND NEW.decisions IS OLD.decisions AND "
            + " AND ".join(f"NEW.{c} IS NULL" for c in _HOLD_DECISION)
-           + " AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.run_id = NEW.run_id AND e.effect_id = NEW.effect_id)) OR "
+           # O-p2-1 section 5: an attempt that did not start is not the link's effect (a retry may need the reopen)
+           + " AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.run_id = NEW.run_id AND e.effect_id = NEW.effect_id "
+           "AND e.state != 'not_started')) OR "
            # reject: open -> 0, only once the run's cancel (with its receipt, cancels_receipted) is written
            "(OLD.decided IS NULL AND NEW.decided IS 0 AND NEW.decided_by IS NOT NULL "
            "AND NEW.decisions IS OLD.decisions + 1 AND NEW.signer IS NULL AND "
@@ -487,8 +504,8 @@ V3_TRIGGERS = (
            "I11: a close names an admitted run", "BEFORE INSERT ON cancels"),
     # (no requests twin: D72's run_not_admitted request closes a request whose run has no row, by design)
     _abort("cancels_held_limit", f"NEW.reason GLOB 'held_limit:*' AND NOT EXISTS (SELECT 1 FROM held_counts h "
-           f"WHERE h.n >= {_HELD_LIMIT_SQL} AND (substr(h.subject, 1, length('request:' || NEW.run_id || ':')) = "
-           "'request:' || NEW.run_id || ':' OR h.subject IN (SELECT 'pending:' || pending_id FROM holds "
+           f"WHERE h.n >= {_HELD_LIMIT_SQL} AND (substr(h.subject, 1, length({_run_requests('NEW.run_id')})) = "
+           f"{_run_requests('NEW.run_id')} OR h.subject IN (SELECT 'pending:' || pending_id FROM holds "
            "WHERE run_id = NEW.run_id AND pending_id IS NOT NULL)))",
            "I11: a held_limit close needs its count at the bound", "BEFORE INSERT ON cancels"),
     _abort("requests_held_limit", f"NEW.reason GLOB 'held_limit:*' AND NOT EXISTS (SELECT 1 FROM held_counts h "
@@ -500,7 +517,7 @@ V3_TRIGGERS = (
 # the receipt AND its subject's terminal row and refuses the statement unless exactly one terminal row now carries it.
 _ONE_TERMINAL = ("(SELECT COUNT(*) FROM cancels WHERE receipt_id = NEW.receipt_id) "
                  "+ (SELECT COUNT(*) FROM requests WHERE receipt_id = NEW.receipt_id) "
-                 "+ (SELECT COUNT(*) FROM effects WHERE receipt_id = NEW.receipt_id AND state IN ('done', 'unknown')) "
+                 "+ (SELECT COUNT(*) FROM effects WHERE receipt_id = NEW.receipt_id AND state IN ('done', 'unknown', 'not_started')) "
                  "+ (SELECT COUNT(*) FROM manual_pendings WHERE receipt_id = NEW.receipt_id AND state = 'terminal')")
 CLOSE_PATH = (
     _abort("receipts_via_close", "NOT EXISTS (SELECT 1 FROM closing WHERE subject = NEW.subject)",
@@ -513,7 +530,7 @@ CLOSE_PATH = (
     "INSERT INTO requests (request_id, reason, receipt_id) SELECT substr(NEW.subject, 9), NEW.reason, NEW.receipt_id "
     "WHERE NEW.subject GLOB 'request:?*'; "
     "UPDATE effects SET state = NEW.state, result = NEW.result, receipt_id = NEW.receipt_id "
-    "WHERE NEW.subject GLOB 'effect:?*' AND NEW.subject = 'effect:' || run_id || ':' || effect_id AND state = 'intent'; "
+    f"WHERE NEW.subject GLOB 'effect:?*' AND NEW.subject = {_effect_subj('effects')} AND state = 'intent'; "
     "UPDATE manual_pendings SET state = 'terminal', receipt_id = NEW.receipt_id "
     "WHERE NEW.subject = 'pending:' || pending_id AND state IN ('open', 'firing'); "
     "DELETE FROM closing WHERE subject = NEW.subject; "
@@ -524,7 +541,7 @@ CLOSE_PATH = (
 # D57's selections (the lease test for 'intent' / 'firing' rows is applied by the caller, inside the write txn). A1-R1:
 # none selects a legacy row (frozen: LEGACY_TRIGGERS would refuse its close); an unstamped intent effect in a legacy run
 # is selected (rev74 DETAIL step 7: the reaper closes a poisoned intent after the upgrade)
-REAP_EFFECTS = "SELECT run_id, effect_id, seal FROM effects WHERE state = 'intent' AND legacy = 0"
+REAP_EFFECTS = "SELECT run_id, effect_id, attempt, seal FROM effects WHERE state = 'intent' AND legacy = 0"
 # D71: unstarted is POSITIVE evidence (started_at IS NULL), never the absence of an intent row
 REAP_FENCED_RUNS = """
 SELECT r.run_id, r.seal FROM runs r JOIN fences f ON f.binding_id = r.binding_id
@@ -534,14 +551,15 @@ SELECT r.run_id, r.seal FROM runs r JOIN fences f ON f.binding_id = r.binding_id
    AND NOT EXISTS (SELECT 1 FROM gate_receipts g WHERE g.subject = 'run:' || r.run_id)
 """
 REAP_PENDINGS = "SELECT pending_id, seal FROM manual_pendings WHERE state = 'firing'"
-# I2 / D76: fenced mid-chain = fenced AND started AND every existing effect terminal AND fewer terminal effects than
-# the links sealed at admission (so a completed run, and a run with an effect still intent, is never an input)
+# I2 / D76: fenced mid-chain = fenced AND started AND no effect attempt intent AND fewer done/unknown effects than
+# the links sealed at admission (so a completed run, and a run with an effect still intent, is never an input). O-p2-1
+# section 5: an attempt that ended not_started is not live, so a run whose open link only did not start is an input
 REAP_MIDCHAIN_RUNS = """
 SELECT r.run_id, r.seal FROM runs r JOIN fences f ON f.binding_id = r.binding_id
  WHERE f.generation > r.generation
    AND r.legacy = 0
    AND r.started_at IS NOT NULL
-   AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.run_id = r.run_id AND e.state NOT IN ('done', 'unknown'))
+   AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.run_id = r.run_id AND e.state = 'intent')
    AND (SELECT COUNT(*) FROM effects e WHERE e.run_id = r.run_id AND e.state IN ('done', 'unknown'))
        < json_extract(r.seal, '$.links')
    AND NOT EXISTS (SELECT 1 FROM cancels c WHERE c.run_id = r.run_id)
@@ -560,7 +578,7 @@ SELECT r.run_id, r.seal FROM runs r
    AND EXISTS (SELECT 1 FROM effects e WHERE e.run_id = r.run_id AND (e.state = 'unknown' OR (e.state = 'done'
                AND EXISTS (SELECT 1 FROM gate_receipts g WHERE g.receipt_id = e.receipt_id
                            AND json_extract(g.record, '$.fired') = 0))))
-   AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.run_id = r.run_id AND e.state NOT IN ('done', 'unknown'))
+   AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.run_id = r.run_id AND e.state = 'intent')
    AND (SELECT COUNT(*) FROM effects e WHERE e.run_id = r.run_id AND e.state IN ('done', 'unknown'))
        < json_extract(r.seal, '$.links')
    AND NOT EXISTS (SELECT 1 FROM cancels c WHERE c.run_id = r.run_id)
@@ -651,14 +669,17 @@ LEGACY_TRIGGERS = tuple(
 
 V74_TRIGGERS = V3_TRIGGERS + HELD_TRIGGERS + DECISION_TRIGGERS + LEGACY_TRIGGERS
 
-INVARIANT = """
+# O-p2-1 (A8): the states an effects row ENDS in, each carrying its receipt
+_EFFECT_ENDS = "('done', 'unknown', 'not_started')"
+
+INVARIANT = f"""
 SELECT 'terminal_without_receipt', 'run:' || c.run_id FROM cancels c
  WHERE c.legacy = 0 AND (c.receipt_id IS NULL OR NOT EXISTS (SELECT 1 FROM gate_receipts g
        WHERE g.receipt_id = c.receipt_id AND g.subject = 'run:' || c.run_id))
 UNION ALL
-SELECT 'terminal_without_receipt', 'effect:' || e.run_id || ':' || e.effect_id FROM effects e
- WHERE e.legacy = 0 AND e.state IN ('done', 'unknown') AND (e.receipt_id IS NULL OR NOT EXISTS (SELECT 1 FROM gate_receipts g
-       WHERE g.receipt_id = e.receipt_id AND g.subject = 'effect:' || e.run_id || ':' || e.effect_id))
+SELECT 'terminal_without_receipt', {_effect_subj('e')} FROM effects e
+ WHERE e.legacy = 0 AND e.state IN {_EFFECT_ENDS} AND (e.receipt_id IS NULL OR NOT EXISTS (SELECT 1 FROM gate_receipts g
+       WHERE g.receipt_id = e.receipt_id AND g.subject = {_effect_subj('e')}))
 UNION ALL
 SELECT 'terminal_without_receipt', 'pending:' || p.pending_id FROM manual_pendings p
  WHERE p.state = 'terminal' AND (p.receipt_id IS NULL OR NOT EXISTS (SELECT 1 FROM gate_receipts g
@@ -673,7 +694,7 @@ UNION ALL
 SELECT 'receipt_without_terminal', g.subject FROM gate_receipts g
  WHERE NOT EXISTS (SELECT 1 FROM cancels c WHERE c.receipt_id = g.receipt_id AND g.subject = 'run:' || c.run_id)
    AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.receipt_id = g.receipt_id
-                   AND g.subject = 'effect:' || e.run_id || ':' || e.effect_id AND e.state IN ('done', 'unknown'))
+                   AND g.subject = {_effect_subj('e')} AND e.state IN {_EFFECT_ENDS})
    AND NOT EXISTS (SELECT 1 FROM manual_pendings p WHERE p.receipt_id = g.receipt_id
                    AND g.subject = 'pending:' || p.pending_id AND p.state = 'terminal')
    AND NOT EXISTS (SELECT 1 FROM requests q WHERE q.receipt_id = g.receipt_id
@@ -688,15 +709,15 @@ SELECT 'hold_rejected_without_run_close', 'run:' || h.run_id FROM holds h
 
 LEGACY_CENSUS = " UNION ALL ".join(
     f"SELECT '{t}', {k} FROM {t} WHERE legacy = 1" for t, k in (
-        ("runs", "run_id"), ("cancels", "run_id"), ("effects", "run_id || ':' || effect_id"), ("holds", "hold_id"))
+        ("runs", "run_id"), ("cancels", "run_id"), ("effects", _attempt_key("effects")), ("holds", "hold_id"))
 ) + " ORDER BY 1, 2"
 
 
-REAP_ORPHAN_RECEIPTS = """
+REAP_ORPHAN_RECEIPTS = f"""
 SELECT g.receipt_id, g.subject, json_extract(g.record, '$.action_face.terminal_state') FROM gate_receipts g
  WHERE NOT EXISTS (SELECT 1 FROM cancels c WHERE c.receipt_id = g.receipt_id AND g.subject = 'run:' || c.run_id)
    AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.receipt_id = g.receipt_id
-                   AND g.subject = 'effect:' || e.run_id || ':' || e.effect_id AND e.state IN ('done', 'unknown'))
+                   AND g.subject = {_effect_subj('e')} AND e.state IN {_EFFECT_ENDS})
    AND NOT EXISTS (SELECT 1 FROM manual_pendings p WHERE p.receipt_id = g.receipt_id
                    AND g.subject = 'pending:' || p.pending_id AND p.state = 'terminal')
    AND NOT EXISTS (SELECT 1 FROM requests q WHERE q.receipt_id = g.receipt_id
@@ -719,21 +740,33 @@ ADOPTED = "adopted"
 IN_FLIGHT = "in_flight"
 
 
-def effect_subject(run_id: str, effect_id: str) -> str:
-    """The subject of an effect's receipt, ``effect:<run_id>:<effect_id>``. A run id holding ``:`` is refused: the
-    subject is split at its first colon (here, in the journal, in the store's triggers), and only a colonless run id
-    makes that split name one effect. ``effect_id`` may hold colons."""
-    if ":" in run_id:
-        raise ValueError(f"run id {run_id!r} holds a colon: an effect subject would split ambiguously")
-    return f"effect:{run_id}:{effect_id}"
+def effect_subject(run_id: str, effect_id: str, attempt: int = 1) -> str:
+    """The subject of an effect attempt's receipt: ``effect:<run_id>:<effect_id>`` for attempt 1 and
+    ``effect:<run_id>:<effect_id>#<n>`` for attempt n >= 2 (O-p2-1 section 4; ``_effect_subj`` is the SQL twin). A run
+    id holding ``:`` or ``#`` is refused: the subject is split at its first colon (here, in the journal, in the store's
+    triggers), and only a colonless run id makes that split name one effect. ``effect_id`` may hold colons, never
+    ``#`` (the attempt is split off at the last ``#``). ``attempt`` is an int >= 1, never a bool."""
+    if ":" in run_id or "#" in run_id:
+        raise ValueError(f"run id {run_id!r} holds a colon or '#': an effect subject would split ambiguously")
+    if "#" in effect_id:
+        raise ValueError(f"effect id {effect_id!r} holds '#': an effect subject would split ambiguously")
+    if type(attempt) is not int or attempt < 1:
+        raise ValueError(f"attempt {attempt!r} is not an int >= 1")
+    return f"effect:{run_id}:{effect_id}" + (f"#{attempt}" if attempt > 1 else "")
 
 
-def _effect_key(subject: str) -> tuple[str, str]:
-    # ``effect:<run_id>:<effect_id>``: a subject that does not split is refused as the store refuses a bad row
-    run_id, sep, effect_id = subject[7:].partition(":")
-    if not (run_id and sep and effect_id):
+def _effect_key(subject: str) -> tuple[str, str, int]:
+    # ``effect:<run_id>:<effect_id>[#<n>]`` -> (run_id, effect_id, attempt): a subject that does not split, or one
+    # attempt spelled another way than effect_subject spells it (``#1``, ``#02``), is refused as the store refuses a
+    # bad row
+    run_id, sep, rest = subject[7:].partition(":")
+    effect_id, hsep, n = rest.rpartition("#") if "#" in rest else (rest, "", "")
+    ok = bool(run_id and sep and effect_id) and "#" not in run_id and "#" not in effect_id
+    if hsep:
+        ok = ok and n.isascii() and n.isdigit() and n[0] != "0" and int(n) >= 2
+    if not ok:
         raise sqlite3.IntegrityError(f"R13-1: malformed effect subject {subject!r}")
-    return run_id, effect_id
+    return run_id, effect_id, int(n) if hsep else 1
 
 
 def adopt_orphan(conn: sqlite3.Connection, receipt_id: str, subject: str, terminal_state: str, *,
@@ -746,8 +779,8 @@ def adopt_orphan(conn: sqlite3.Connection, receipt_id: str, subject: str, termin
     effect_id)``, V :meth:`RunJournal._lease_held`), or a ``firing`` pending whose owner holds its pending lease
     (``pending_lease_held(pending_id)``), is in flight, and is left as it is (:data:`IN_FLIGHT`)."""
     if subject.startswith("effect:"):
-        run_id, effect_id = _effect_key(subject)
-        if lease_held(run_id, effect_id):
+        run_id, effect_id, _attempt = _effect_key(subject)
+        if lease_held(run_id, effect_id):   # the lease is the link's: its attempts are serial (effects_one_live)
             return IN_FLIGHT
     if subject.startswith("pending:"):
         firing = conn.execute("SELECT 1 FROM manual_pendings WHERE pending_id = ? AND state = 'firing'",
@@ -761,12 +794,14 @@ def adopt_orphan(conn: sqlite3.Connection, receipt_id: str, subject: str, termin
         conn.execute("INSERT INTO requests (request_id, reason, receipt_id) VALUES (?, ?, ?)",
                      (subject[8:], ORPHAN_REASON, receipt_id))
     elif subject.startswith("effect:"):
-        run_id, effect_id = _effect_key(subject)
+        run_id, effect_id, attempt = _effect_key(subject)
+        # O-p2-1 R2-9: a `refused` receipt is never adopted (a not_started close is one close_subject statement, so
+        # it is never an orphan's half, and its row marker cannot be read from the receipt); it stays an INVARIANT row
         state = {"fired": "done", "outcome_unknown": "unknown"}.get(terminal_state)
         if state is None:
             raise sqlite3.IntegrityError(f"R13-1: an effect receipt in {terminal_state!r} ends no effect row")
         n = conn.execute("UPDATE effects SET state = ?, receipt_id = ? WHERE run_id = ? AND effect_id = ? "
-                         "AND state = 'intent'", (state, receipt_id, run_id, effect_id)).rowcount
+                         "AND attempt = ? AND state = 'intent'", (state, receipt_id, run_id, effect_id, attempt)).rowcount
         if n != 1:
             raise sqlite3.IntegrityError("R13-1: no intent effect row adopts this receipt")
     elif subject.startswith("pending:"):
@@ -1165,7 +1200,7 @@ def close_subject(conn: sqlite3.Connection, *, subject: str, record: dict, state
 CLOSE_STATES = {
     "run": tuple((t, None) for t in TERMINAL_MODES[("cancels", None)]),
     "request": tuple((t, None) for t in TERMINAL_MODES[("requests", None)]),
-    "effect": (("fired", "done"), ("outcome_unknown", "unknown")),
+    "effect": (("fired", "done"), ("outcome_unknown", "unknown"), ("refused", "not_started")),
     "pending": tuple((t, None) for t in TERMINAL_MODES[("manual_pendings", "terminal")]),
 }
 
@@ -1183,11 +1218,14 @@ def dry_run_close(conn: sqlite3.Connection, subject: str, record_for: Callable[[
     kind = subject.split(":", 1)[0]
     if kind not in CLOSE_STATES:
         raise ValueError(f"dry_run_close: unknown subject {subject!r}")
+    if kind == "effect":
+        _effect_key(subject)   # O-p2-1 A3: one attempt, one subject; a non-canonical spelling is refused, not closed
     for terminal_state, state in CLOSE_STATES[kind]:
         conn.execute("SAVEPOINT dry_run_close")
         try:
             close_subject(conn, subject=subject, record=record_for(terminal_state), state=state,
-                          reason=None if kind in ("effect", "pending") else f"dry_run:{terminal_state}")
+                          reason=None if kind in ("effect", "pending") else f"dry_run:{terminal_state}",
+                          result="not_started:dry_run" if state == "not_started" else None)
         except BaseException as e:
             # A1-R4: a fault that rolled the transaction back (SQLITE_FULL, IOERR) took the savepoint with it; the
             # undo then fails, and that failure must not replace the fault that refuses the admission
@@ -1354,12 +1392,12 @@ REAP_PASS = (
     (REAP_UNKNOWN_LINK_RUNS, "run", None, "refused", "unknown-link"),
     (REAP_MIDCHAIN_RUNS, "run", None, "refused", "fenced-mid-chain"),
 )
-_REAP_KEYS = {"effect": ("run_id", "effect_id"), "pending": ("pending_id",), "run": ("run_id",)}
+_REAP_KEYS = {"effect": ("run_id", "effect_id", "attempt"), "pending": ("pending_id",), "run": ("run_id",)}
 CLOSED = "closed"
 
 
 def _subject_of(kind: str, row: tuple) -> str:
-    return effect_subject(row[0], row[1]) if kind == "effect" else f"{kind}:{row[0]}"
+    return effect_subject(row[0], row[1], row[2]) if kind == "effect" else f"{kind}:{row[0]}"
 
 
 def reap(store: AutonomicStore3, *, lease_held: Callable[[str, str], bool],
