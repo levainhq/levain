@@ -290,10 +290,12 @@ _PREV = ("FROM effects p WHERE p.run_id = NEW.run_id AND p.effect_id = NEW.effec
 _LINK_HELD = "EXISTS (SELECT 1 FROM holds h WHERE h.run_id = NEW.run_id AND h.effect_id = NEW.effect_id)"
 # R3-2 as amended by R4-2: with a hold on the link, the seal's $.decision is the hold's CURRENT decision. Every field is
 # type-checked first and compared with `=` to a column checked IS NOT NULL (R3-1); a NULL decided_posture is matched
-# by an explicit absence, witnessed by the hold row
+# by an explicit absence, witnessed by the hold row. The hold is for this attempt's payload (its digest): a decision
+# on another payload authorises nothing here, and a link held for another payload is still held (_LINK_HELD), so the
+# retry is refused, never sent to the hold-less rule
 _HELD_DECISION = (
     "EXISTS (SELECT 1 FROM holds h WHERE h.run_id = NEW.run_id AND h.effect_id = NEW.effect_id AND h.decided IS 1 "
-    "AND h.decisions IS NOT NULL AND h.decided_by IS NOT NULL "
+    "AND h.digest = NEW.digest AND h.decisions IS NOT NULL AND h.decided_by IS NOT NULL "
     "AND json_type(NEW.seal, '$.decision.generation') = 'integer' "
     "AND json_extract(NEW.seal, '$.decision.generation') = h.decisions "
     "AND json_type(NEW.seal, '$.decision.by') = 'text' AND json_extract(NEW.seal, '$.decision.by') = h.decided_by "
@@ -301,7 +303,8 @@ _HELD_DECISION = (
     "OR (h.decided_posture IS NOT NULL AND json_type(NEW.seal, '$.decision.posture') = 'text' "
     "AND json_extract(NEW.seal, '$.decision.posture') = h.decided_posture)))")
 # R3-1 as amended by R4-2: with no hold, the retry re-uses P's cover (both grant-less and cover-less, or the same cover
-# text) at a posture rank no lower than P's (both ranks known)
+# text) at a posture rank no lower than P's (both ranks known), and a human P's retry is human (10.Q2(b): R2-2 replaced
+# it only for a link with a hold; both `by` typed text)
 _HOLDLESS_AUTHORITY = (
     f"EXISTS (SELECT 1 {_PREV} AND (({_absent('NEW.seal', '$.grant')} AND {_absent('p.seal', '$.grant')} "
     f"AND {_absent('NEW.seal', '$.cover')} AND {_absent('p.seal', '$.cover')}) "
@@ -309,7 +312,9 @@ _HOLDLESS_AUTHORITY = (
     "AND json_extract(NEW.seal, '$.cover') = json_extract(p.seal, '$.cover'))) "
     "AND json_type(NEW.seal, '$.posture') = 'text' AND json_type(p.seal, '$.posture') = 'text' "
     f"AND {_rank('NEW.seal')} IS NOT NULL AND {_rank('p.seal')} IS NOT NULL "
-    f"AND {_rank('NEW.seal')} >= {_rank('p.seal')})")
+    f"AND {_rank('NEW.seal')} >= {_rank('p.seal')} "
+    "AND json_type(NEW.seal, '$.by') = 'text' AND json_type(p.seal, '$.by') = 'text' "
+    "AND (json_extract(p.seal, '$.by') != 'human' OR json_extract(NEW.seal, '$.by') = 'human'))")
 
 RETRY_TRIGGERS = (
     # section 5: attempt 1 opens a link (no row yet); attempt n > 1 follows the link's LATEST row, attempt n - 1,
@@ -357,7 +362,7 @@ V3_TRIGGERS = (
            "OR IFNULL(json_type(NEW.seal, '$.confirm_class'), 'absent') NOT IN ('true', 'false') "
            "OR json_type(NEW.seal, '$.guard') IS NOT 'array' OR NEW.started_at IS NOT NULL "
            "OR json_type(NEW.seal, '$.links') IS NOT 'integer' OR json_extract(NEW.seal, '$.links') < 1 "
-           "OR instr(NEW.run_id, ':') > 0 OR instr(NEW.run_id, '#') > 0",
+           "OR instr(NEW.run_id, ':') > 0",
            "D56/D68/D71/I2: a run is born sealed (class, guard, links) and unstarted", "BEFORE INSERT ON runs"),
     _abort("runs_guarded", f"json_extract(NEW.seal, '$.confirm_class') = 1 AND NOT {_guard_complete('NEW.seal')}",
            "D68: a confirm-class run is admitted only with its complete guard", "BEFORE INSERT ON runs"),
@@ -439,7 +444,7 @@ V3_TRIGGERS = (
            f"(NEW.state = 'unknown' AND {_mode('NEW.receipt_id', TERMINAL_MODES[('effects', 'unknown')])}) OR "
            f"(NEW.state = 'not_started' AND {_mode('NEW.receipt_id', TERMINAL_MODES[('effects', 'not_started')])} "
            "AND IFNULL(NEW.result GLOB 'not_started:?*', 0) AND EXISTS (SELECT 1 FROM gate_receipts g "
-           "WHERE g.receipt_id = NEW.receipt_id AND json_type(g.record, '$.fired') = 'false' "
+           "WHERE g.receipt_id = NEW.receipt_id AND json_extract(g.record, '$.fired') = 0 "
            "AND IFNULL(json_type(g.record, '$.action_face.refuse_class'), 'null') = 'null')))",
            "I4: done is fired, unknown is outcome_unknown, not_started is refused with its marker",
            "BEFORE UPDATE ON effects"),
@@ -676,21 +681,29 @@ ATTEMPT_INDEXES = (
     "CREATE UNIQUE INDEX IF NOT EXISTS holds_one_link ON holds (run_id, effect_id)",
 )
 
-# O-p2-1 R2-1: a count that names an attempt names the link's LATEST attempt, ended not_started (NULL: no attempt)
-_HELD_ATTEMPT = ("(NEW.attempt IS NULL OR EXISTS (SELECT 1 FROM effects a WHERE " + _link_request("a")
-                 + " = NEW.subject AND a.attempt = NEW.attempt AND a.state = 'not_started' AND NOT EXISTS ("
-                 "SELECT 1 FROM effects b WHERE b.run_id = a.run_id AND b.effect_id = a.effect_id "
-                 "AND b.attempt > a.attempt)))")
+def _latest_not_started(subj: str, attempt: str) -> str:
+    # O-p2-1 R2-1: attempt `attempt` of the link of request subject `subj` is the link's LATEST attempt, ended
+    # not_started (the held triggers' witness; count_held asks the same before it writes, F12)
+    return ("EXISTS (SELECT 1 FROM effects a WHERE " + _link_request("a") + f" = {subj} AND a.attempt = {attempt} "
+            "AND a.state = 'not_started' AND NOT EXISTS (SELECT 1 FROM effects b WHERE b.run_id = a.run_id "
+            "AND b.effect_id = a.effect_id AND b.attempt > a.attempt))")
+
+
+# a count that names an attempt names that witness (NULL: no attempt)
+_HELD_ATTEMPT = f"(NEW.attempt IS NULL OR {_latest_not_started('NEW.subject', 'NEW.attempt')})"
 HELD_TRIGGERS = (
     _abort("held_born", f"NOT IFNULL(NEW.n = 1 AND NEW.mark IS {_progress('NEW.subject')} "
            f"AND NEW.last_reason GLOB '{SUBJECT_REASON}' AND NOT {_closed('NEW.subject')} AND {_HELD_ATTEMPT}, 0)",
            "I11: a held count is born 1, at the live subject mark, for a subject fault", "BEFORE INSERT ON held_counts"),
-    # a same-mark rise records a new attempt (R3-3, R4-4: both NULL, or both named and the attempt rises) or carries
-    # the named attempt forward for an attempt-less fault (P1); a restart on progress may name any witnessed attempt
+    # a same-mark rise records a new attempt (R3-3, R4-4: both NULL, or a named attempt above the old one or above
+    # none, F3) or carries the named attempt forward for an attempt-less fault (P1); a restart on progress may name any
+    # witnessed attempt. A carried attempt was witnessed when it was written: only a NEW attempt is witnessed again
+    # (F2: a later successor of the carried attempt does not refuse the carry)
     _abort("held_move", f"NOT IFNULL(NEW.subject IS OLD.subject AND NEW.last_reason GLOB '{SUBJECT_REASON}' "
-           f"AND NOT {_closed('NEW.subject')} AND NEW.mark IS {_progress('NEW.subject')} AND {_HELD_ATTEMPT} AND ("
+           f"AND NOT {_closed('NEW.subject')} AND NEW.mark IS {_progress('NEW.subject')} "
+           f"AND (NEW.attempt IS OLD.attempt OR {_HELD_ATTEMPT}) AND ("
            "(NEW.n = OLD.n + 1 AND NEW.mark IS OLD.mark AND ((OLD.attempt IS NULL AND NEW.attempt IS NULL) "
-           "OR (OLD.attempt IS NOT NULL AND NEW.attempt IS NOT NULL AND NEW.attempt > OLD.attempt) "
+           "OR (NEW.attempt IS NOT NULL AND (OLD.attempt IS NULL OR NEW.attempt > OLD.attempt)) "
            "OR (OLD.attempt IS NOT NULL AND NEW.attempt IS OLD.attempt))) "
            "OR (NEW.n = 1 AND NEW.mark > OLD.mark)), 0)",
            "I11: a held count rises by one at the same mark, or restarts at 1 only on progress",
@@ -745,7 +758,9 @@ _EFFECT_ENDS = "('done', 'unknown', 'not_started')"
 
 # O-p2-1 R2-1 / glm F4 / R2-10 / R3-4: not_started_uncounted is a LIVE link (the held triggers' own _closed) whose
 # latest attempt ended not_started with no count naming it (effects_attempt_counted refuses its retry); the remedy is
-# the count, or the operator cancelling the run, which closes the link and clears the row
+# the count, or the operator cancelling the run, which closes the link and clears the row. O-p2-1 A1:
+# held_at_bound_unclosed is a request's count at the bound with neither its run's close nor its request's close (A1's
+# order writes that close in the count's own transaction)
 INVARIANT = f"""
 SELECT 'terminal_without_receipt', 'run:' || c.run_id FROM cancels c
  WHERE c.legacy = 0 AND (c.receipt_id IS NULL OR NOT EXISTS (SELECT 1 FROM gate_receipts g
@@ -786,6 +801,11 @@ SELECT 'not_started_uncounted', {_effect_subj('ns')} FROM effects ns
                    AND x.attempt > ns.attempt)
    AND NOT EXISTS (SELECT 1 FROM held_counts hc WHERE hc.subject = {_link_request('ns')} AND hc.attempt IS ns.attempt)
    AND NOT {_closed(_link_request('ns'))}
+UNION ALL
+SELECT 'held_at_bound_unclosed', hb.subject FROM held_counts hb
+ WHERE hb.subject GLOB 'request:?*' AND hb.n >= {_HELD_LIMIT_SQL}
+   AND NOT EXISTS (SELECT 1 FROM requests q WHERE 'request:' || q.request_id = hb.subject)
+   AND NOT EXISTS (SELECT 1 FROM cancels c WHERE c.run_id = {_run_of_request('hb.subject')})
 """
 
 LEGACY_CENSUS = " UNION ALL ".join(
@@ -821,33 +841,47 @@ ADOPTED = "adopted"
 IN_FLIGHT = "in_flight"
 
 
+# the longest attempt suffix read: an attempt is an SQLite INTEGER (10**18 < 2**63), and int() of a digit run past
+# sys.get_int_max_str_digits() raises ValueError, never the IntegrityError a malformed subject gets (F7)
+_ATTEMPT_DIGITS = 18
+
+
+def _attempt_tail(s: str) -> str | None:
+    # the digits of a trailing '#<ASCII digits>' of s (the only spelling an attempt suffix has), else None
+    _head, hsep, n = s.rpartition("#")
+    return n if hsep and n.isascii() and n.isdigit() else None
+
+
 def effect_subject(run_id: str, effect_id: str, attempt: int = 1) -> str:
     """The subject of an effect attempt's receipt: ``effect:<run_id>:<effect_id>`` for attempt 1 and
-    ``effect:<run_id>:<effect_id>#<n>`` for attempt n >= 2 (O-p2-1 section 4; ``_effect_subj`` is the SQL twin). A run
-    id holding ``:`` or ``#`` is refused: the subject is split at its first colon (here, in the journal, in the store's
-    triggers), and only a colonless run id makes that split name one effect. ``effect_id`` may hold colons, never
-    ``#`` (the attempt is split off at the last ``#``). ``attempt`` is an int >= 1, never a bool."""
-    if ":" in run_id or "#" in run_id:
-        raise ValueError(f"run id {run_id!r} holds a colon or '#': an effect subject would split ambiguously")
-    if "#" in effect_id:
-        raise ValueError(f"effect id {effect_id!r} holds '#': an effect subject would split ambiguously")
+    ``effect:<run_id>:<effect_id>#<n>`` for attempt n >= 2 (O-p2-1 section 4; ``_effect_subj`` is the SQL twin, and
+    :func:`_effect_key` splits it back). The subject is split at its FIRST colon (here, in the journal, in the store's
+    triggers), so a run id holds no colon (``runs_sealed`` refuses one too) and may hold ``#``. The attempt is read
+    only as a trailing ``#<digits>``, so an effect id may hold colons and ``#``, but never END in ``#<digits>``.
+    ``attempt`` is an int >= 1, never a bool."""
+    if not run_id or ":" in run_id:
+        raise ValueError(f"run id {run_id!r} is empty or holds a colon: an effect subject would split ambiguously")
+    if not effect_id or _attempt_tail(effect_id) is not None:
+        raise ValueError(f"effect id {effect_id!r} is empty or ends in '#<digits>': an effect subject would split "
+                         "ambiguously")
     if type(attempt) is not int or attempt < 1:
         raise ValueError(f"attempt {attempt!r} is not an int >= 1")
     return f"effect:{run_id}:{effect_id}" + (f"#{attempt}" if attempt > 1 else "")
 
 
 def _effect_key(subject: str) -> tuple[str, str, int]:
-    # ``effect:<run_id>:<effect_id>[#<n>]`` -> (run_id, effect_id, attempt): a subject that does not split, or one
-    # attempt spelled another way than effect_subject spells it (``#1``, ``#02``), is refused as the store refuses a
-    # bad row
+    # ``effect:<run_id>:<effect_id>[#<n>]`` -> (run_id, effect_id, attempt), effect_subject's inverse: a subject that
+    # does not split, or an attempt spelled another way than effect_subject spells it (``#1``, ``#02``, a digit run
+    # longer than _ATTEMPT_DIGITS), is refused as the store refuses a bad row
     run_id, sep, rest = subject[7:].partition(":")
-    effect_id, hsep, n = rest.rpartition("#") if "#" in rest else (rest, "", "")
-    ok = bool(run_id and sep and effect_id) and "#" not in run_id and "#" not in effect_id
-    if hsep:
-        ok = ok and n.isascii() and n.isdigit() and n[0] != "0" and int(n) >= 2
-    if not ok:
+    n = _attempt_tail(rest)
+    effect_id, attempt = rest, 1
+    if n is not None:   # 0 stands for a non-canonical spelling, refused below
+        effect_id = rest[:-len(n) - 1]
+        attempt = int(n) if len(n) <= _ATTEMPT_DIGITS and n[0] != "0" else 0
+    if not (run_id and sep and effect_id) or _attempt_tail(effect_id) is not None or (n is not None and attempt < 2):
         raise sqlite3.IntegrityError(f"R13-1: malformed effect subject {subject!r}")
-    return run_id, effect_id, int(n) if hsep else 1
+    return run_id, effect_id, attempt
 
 
 def adopt_orphan(conn: sqlite3.Connection, receipt_id: str, subject: str, terminal_state: str, *,
@@ -1336,9 +1370,9 @@ def count_held(conn: sqlite3.Connection, subject: str, reason: str, *, attempt: 
     subject ``refused`` with reason ``held_limit:<reason>`` at :func:`held_limit`). ``reason`` is ``subject:<why>``.
 
     O-p2-1: ``attempt`` is the link attempt whose not_started close this count records (the witness a retry of the
-    next attempt needs, R2-1); the held triggers refuse one that is not the link's latest, not_started attempt. A
-    count of an attempt the row already names at the same mark returns the stored count and writes nothing (R3-3). A
-    count with no attempt keeps the attempt the row names (P1)."""
+    next attempt needs, R2-1); one that is not the link's latest, not_started attempt raises ValueError before any
+    write (the held triggers refuse it too). A count of an attempt the row already names at the same mark returns the
+    stored count and writes nothing (R3-3). A count with no attempt keeps the attempt the row names (P1)."""
     _in_write(conn, "count_held")
     if not isinstance(reason, str) or conn.execute("SELECT ? GLOB ?", (reason, SUBJECT_REASON)).fetchone()[0] != 1:
         raise ValueError(f"count_held: reason {reason!r} is not {SUBJECT_REASON!r} (a subject-specific fault)")
@@ -1346,12 +1380,16 @@ def count_held(conn: sqlite3.Connection, subject: str, reason: str, *, attempt: 
         raise ValueError(f"count_held: attempt {attempt!r} is not an int >= 1")
     mark = conn.execute(f"SELECT {_progress(':s')}", {"s": subject}).fetchone()[0]
     row = conn.execute("SELECT n, mark, attempt FROM held_counts WHERE subject = ?", (subject,)).fetchone()
+    if attempt is not None and row is not None and row[2] == attempt and row[1] == mark:
+        return row[0]
+    # F12: the triggers' own witness, asked first, so a stale attempt is a caller fault (ValueError), not a store one
+    if attempt is not None and conn.execute(f"SELECT {_latest_not_started(':s', ':a')}",
+                                            {"s": subject, "a": attempt}).fetchone()[0] != 1:
+        raise ValueError(f"count_held: attempt {attempt} is not the latest not_started attempt of {subject!r}")
     if row is None:
         conn.execute("INSERT INTO held_counts (subject, n, last_reason, mark, attempt) VALUES (?, 1, ?, ?, ?)",
                      (subject, reason, mark, attempt))
         return 1
-    if attempt is not None and row[2] == attempt and row[1] == mark:
-        return row[0]
     n = row[0] + 1 if mark == row[1] else 1
     conn.execute("UPDATE held_counts SET n = ?, mark = ?, last_reason = ?, attempt = ? WHERE subject = ?",
                  (n, mark, reason, row[2] if attempt is None else attempt, subject))
@@ -1368,10 +1406,11 @@ def hold_decision(conn: sqlite3.Connection, hold_id: str) -> tuple[int, str | No
 
 
 def not_started_receipts(conn: sqlite3.Connection) -> frozenset[str]:
-    """10.Q1: the receipt ids of every effects row ended ``not_started`` (each carries its receipt: D54). Their
-    receipts say ``refused``: this set is what tells them apart for a by-mode reader (10.Q1 / R2-4 name
-    ``gate_liveness``; no reader takes it yet, /3 is unwired)."""
-    return frozenset(r for (r,) in conn.execute("SELECT receipt_id FROM effects WHERE state = 'not_started'"))
+    """10.Q1: the receipt ids of every non-legacy effects row ended ``not_started`` (each carries its receipt: D54),
+    filtered ``legacy = 0`` as the other /3 readers are. Their receipts say ``refused``: this set is what tells them
+    apart for a by-mode reader (10.Q1 / R2-4 name ``gate_liveness``)."""
+    return frozenset(r for (r,) in conn.execute(
+        "SELECT receipt_id FROM effects WHERE state = 'not_started' AND legacy = 0"))
 
 
 # ---- environment faults (R13-7, R14-2) ------------------------------------------------------------------------------
@@ -1531,7 +1570,7 @@ def reap(store: AutonomicStore3, *, lease_held: Callable[[str, str], bool],
             for r in conn.execute(query).fetchall():
                 try:
                     subject = _subject_of(kind, r)
-                except ValueError as e:   # a colon in a run id: left live, not selectable by subject
+                except ValueError as e:   # an id effect_subject refuses (a legacy row): left live, not selectable
                     _log.error("autonomic store: reaper skips %s row %r: %s", kind, r[:len(_REAP_KEYS[kind])], e)
                     continue
                 if subject not in orphans:

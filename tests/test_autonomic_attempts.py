@@ -191,14 +191,22 @@ def rows_of(c, run_id="r", effect_id="link-0"):
 # ---- section 4 / R2-7 / R2-12: one attempt has exactly one subject ----------------------------------------------------
 @pytest.mark.parametrize("args, subject", [
     (("r", "link-0"), "effect:r:link-0"), (("r", "link-0", 1), "effect:r:link-0"),
-    (("r", "link-0", 2), "effect:r:link-0#2"), (("r", "link-10", 12), "effect:r:link-10#12")])
+    (("r", "link-0", 2), "effect:r:link-0#2"), (("r", "link-10", 12), "effect:r:link-10#12"),
+    # F5: one rule for '#': a run id may hold it (the subject splits at its first colon), and an effect id may hold
+    # it so long as it does not END in '#<digits>' (the only spelling of an attempt)
+    (("r#x", "link-0"), "effect:r#x:link-0"), (("r#2", "link-0", 3), "effect:r#2:link-0#3"),
+    (("r", "foo#bar"), "effect:r:foo#bar"), (("r", "foo#bar", 2), "effect:r:foo#bar#2"),
+    (("r", "link-0#"), "effect:r:link-0#"), (("r", "link-0#-2"), "effect:r:link-0#-2"),
+    (("r", "link-0#٢"), "effect:r:link-0#٢"), (("r", "a:b"), "effect:r:a:b"),
+    (("r", "link-0", 10 ** 18 - 1), "effect:r:link-0#" + "9" * 18)])
 def test_an_effect_subject_names_its_attempt_and_round_trips(args, subject):
     assert s.effect_subject(*args) == subject
     run_id, effect_id = args[:2]
     assert s._effect_key(subject) == (run_id, effect_id, args[2] if len(args) > 2 else 1)
 
 
-@pytest.mark.parametrize("args", [("r:x", "link-0"), ("r#x", "link-0"), ("r", "link-0#2"), ("r", "link-0", 0),
+@pytest.mark.parametrize("args", [("r:x", "link-0"), ("", "link-0"), ("r", ""), ("r", "link-0#2"),
+                                  ("r", "link-0#02"), ("r", "link-0#2", 3), ("r", "link-0", 0),
                                   ("r", "link-0", -1), ("r", "link-0", True), ("r", "link-0", "2"),
                                   ("r", "link-0", 2.0)])
 def test_effect_subject_refuses_what_would_not_split_back(args):
@@ -206,10 +214,11 @@ def test_effect_subject_refuses_what_would_not_split_back(args):
         s.effect_subject(*args)
 
 
-@pytest.mark.parametrize("subject", ["effect:r:link-0#1", "effect:r:link-0#02", "effect:r:link-0#", "effect:r:link-0#x",
-                                     "effect:r:link-0#-2", "effect:r:link-0#+2", "effect:r:link-0# 2",
-                                     "effect:r:link-0#2#3", "effect:r:#2", "effect:r#x:link-0", "effect::link-0",
-                                     "effect:r", "effect:r:", "effect:r:link-0#٢"])
+@pytest.mark.parametrize("subject", ["effect:r:link-0#1", "effect:r:link-0#02", "effect:r:link-0#0",
+                                     "effect:r:link-0#2#3", "effect:r:#2", "effect::link-0",
+                                     "effect:r", "effect:r:",
+                                     # F7: a digit run past _ATTEMPT_DIGITS is malformed, not int()'s ValueError
+                                     "effect:r:link-0#1" + "0" * 5000, "effect:r:link-0#" + "1" * 19])
 def test_effect_key_refuses_a_non_canonical_subject(subject):
     with pytest.raises(sqlite3.IntegrityError, match="malformed effect subject"):
         s._effect_key(subject)
@@ -611,4 +620,141 @@ def test_the_dry_run_refuses_a_non_canonical_attempt_subject(store):
     box[0] = "effect:r:link-0#1"
     with pytest.raises(sqlite3.IntegrityError, match="malformed effect subject"):
         tx(c, lambda conn: s.dry_run_close(conn, "effect:r:link-0#1", good))
+    c.close()
+
+
+# ---- fix round 1 (1027+9 op21fix): the B1a L3 r1 findings --------------------------------------------------------------
+def _upgraded_v2(d, effects):
+    """A /2 store made by V's opener with these (run_id, effect_id) intent rows (V's writers enforce no id shape),
+    upgraded by ddl_v3 + triggers_v3."""
+    AutonomicDB(d).meta("format")
+    c = sqlite3.connect(d / vdb.DB_NAME, isolation_level=None)
+    for run_id in sorted({r for r, _e in effects}):
+        c.execute("INSERT INTO runs (run_id, binding_id, generation) VALUES (?, 'b', 0)", (run_id,))
+    for run_id, effect_id in effects:
+        c.execute("INSERT INTO effects (run_id, effect_id, digest, state) VALUES (?, ?, 'd', 'intent')",
+                  (run_id, effect_id))
+    c.execute("BEGIN IMMEDIATE")
+    s.ddl_v3(c)
+    s.triggers_v3(c)
+    c.execute("COMMIT")
+    return c
+
+
+def test_sql_and_python_spell_and_split_every_legacy_hash_subject_alike(tmp_path):
+    # F5 (codex MED + deepseek MED): a '#' in a /2 run id, or inside a /2 effect id, is one subject in SQL and in
+    # Python, and the reaper's subject for each row splits back to that row
+    c = _upgraded_v2(tmp_path / "v2", [("r#x", "link-0"), ("r", "foo#bar"), ("r", "a#b:c")])
+    rows = c.execute(f"SELECT run_id, effect_id, attempt, {s._effect_subj('e')} FROM effects e "
+                     "ORDER BY run_id, effect_id").fetchall()
+    assert len(rows) == 3
+    for run_id, effect_id, attempt, sql_subject in rows:
+        assert s._subject_of("effect", (run_id, effect_id, attempt)) == sql_subject
+        assert s._effect_key(sql_subject) == (run_id, effect_id, attempt)
+    assert sorted(r[:3] for r in c.execute(s.REAP_EFFECTS)) == [r[:3] for r in rows]   # the reaper selects each
+    c.close()
+
+
+def test_a_legacy_effect_id_ending_like_an_attempt_fails_closed(tmp_path):
+    # F5 KNOWN EDGE: a /2 effect id that itself ENDS in '#<digits>' is the one shape SQL's spelling makes ambiguous
+    # (its subject reads as attempt 7 of 'link-1'). No V writer makes one (effect ids are 'link-<i>'). Python refuses
+    # to name it (the reaper logs and skips the row) and an orphan on its subject adopts no row
+    c = _upgraded_v2(tmp_path / "v2", [("r", "link-1#7")])
+    (sql_subject,) = c.execute(f"SELECT {s._effect_subj('e')} FROM effects e").fetchone()
+    with pytest.raises(ValueError, match="ends in"):
+        s._subject_of("effect", ("r", "link-1#7", 1))
+    assert s._effect_key(sql_subject) == ("r", "link-1", 7)
+    c.execute("BEGIN IMMEDIATE")
+    with pytest.raises(sqlite3.IntegrityError, match="no intent effect row adopts"):
+        s.adopt_orphan(c, "x", sql_subject, "fired", lease_held=lambda *_: False, pending_lease_held=lambda _: False)
+    c.execute("ROLLBACK")
+    c.close()
+
+
+def test_a_born_run_id_may_hold_a_hash_and_its_attempts_split_back(store):
+    # F5: runs_sealed refuses only ':' (the one character the split needs absent from a run id)
+    c = raw(store)
+    tx(c, lambda conn: started_run(conn, "r#2"), lambda conn: intent(conn, "r#2"),
+       lambda conn: close_not_started(conn, "r#2"))
+    assert rows_of(c, "r#2") == [(1, "not_started", "ns:effect:r#2:link-0")]
+    assert s._effect_key(s.effect_subject("r#2", "link-0", 2)) == ("r#2", "link-0", 2)
+    with pytest.raises(sqlite3.IntegrityError, match="D56/D68/D71/I2"):
+        tx(c, lambda conn: started_run(conn, "r:2"))
+    c.close()
+
+
+def test_one_form_reads_that_a_receipt_says_nothing_fired():
+    # F6 (deepseek MED): effects_close_mode reads `fired` as I10 and REAP_FAILED_RUNS do; receipts_content types it a
+    # JSON boolean at birth, so the forms could not disagree on a stored record (next test)
+    every = "\n".join(s.ALL_TRIGGERS) + s.INVARIANT + s.REAP_ORPHAN_RECEIPTS
+    assert "json_type(g.record, '$.fired')" not in every
+    assert "json_extract(g.record, '$.fired') = 0" in "\n".join(s.ALL_TRIGGERS)
+
+
+@pytest.mark.parametrize("fired", [0, 1, "false", None])
+def test_a_receipt_whose_fired_is_not_a_json_boolean_is_refused_at_birth(store, fired):
+    c = raw(store)
+    tx(c, started_run, intent)
+    subj = "effect:r:link-0"
+    r = rec("g", subj, "refused")
+    r["fired"] = fired
+    with pytest.raises(sqlite3.IntegrityError, match="I4"):
+        tx(c, lambda conn: s.close_subject(conn, subject=subj, record=r, state="not_started",
+                                           result="not_started:x"))
+    assert rows_of(c) == [(1, "intent", None)]
+    c.close()
+
+
+def test_the_dry_run_refuses_an_overlong_attempt_as_malformed_not_valueerror(store):
+    # F7 (deepseek): the IntegrityError contract holds past int()'s digit limit
+    c = raw(store)
+    tx(c, started_run, intent)
+    good, box = _effect_builder()
+    subj = "effect:r:link-0#1" + "0" * 5000
+    box[0] = subj
+    with pytest.raises(sqlite3.IntegrityError, match="malformed effect subject"):
+        tx(c, lambda conn: s.dry_run_close(conn, subj, good))
+    c.close()
+
+
+def test_the_dry_run_closes_every_end_with_the_real_face_builder(store):
+    # F8 (complement LOW-MED), measured: V's build_gate_face leaves refuse_class null unless the caller passes one
+    # (only the prediction-error kill does), so the not_started close is no stricter than the real builder. The record
+    # envelope ({id, kind, subject, fired}) is B2's /3 seal builder's; it is written here as the other dry-run tests do
+    from levain.autonomic.authority import AuthorityScope
+    from levain.autonomic.receipt import build_gate_face
+    inputs = {"context_id": "ctx-1", "query_text": "q", "query_date": "2026-10-27", "producers": ["afferent"],
+              "gate": {"verdict": "denied", "posture": "ON_LOOP", "by": "on-loop", "reason": "x"},
+              "authority": AuthorityScope(grantor="binding", grant="b-1", binding_id="b-1"),
+              "actor_first_estimate": None}
+    subj = "effect:r:link-0"
+
+    def build(ts, **kw):
+        face = build_gate_face(**inputs, terminal_state=ts, **kw)
+        face["guard"], face["grant_guard"] = None, None
+        return {"id": f"r-{ts}", "kind": "gate", "subject": subj, "fired": ts == "fired", "action_face": face}
+
+    c = raw(store)
+    tx(c, started_run, intent)
+    tx(c, lambda conn: s.dry_run_close(conn, subj, build))
+    with pytest.raises(s.CloseUnbuildable, match="close_unbuildable:refused:IntegrityError:I4"):
+        tx(c, lambda conn: s.dry_run_close(conn, subj, lambda ts: build(ts, refuse_class="prudential")))
+    assert rows_of(c) == [(1, "intent", None)]
+    c.close()
+
+
+def test_the_upgrade_gives_held_counts_its_attempt_column(tmp_path):
+    # F9 (deepseek HIGH, a claim) REFUTED by this run: V's /2 opener makes no held_counts table, so ddl_v3's CREATE
+    # TABLE makes it whole, attempt included; count_held names an attempt on the upgraded store
+    c = _upgraded_v2(tmp_path / "v2", [])
+    assert s.v2_columns("held_counts") == frozenset()
+    assert [r[1] for r in c.execute("PRAGMA table_info(held_counts)")] == list(s.KNOWN_COLUMNS["held_counts"])
+    c.execute("BEGIN IMMEDIATE")
+    s.write_tunables(c)
+    started_run(c)
+    intent(c)
+    close_not_started(c)
+    assert s.count_held(c, "request:r:link-0", "subject:not_started:spawn", attempt=1) == 1
+    c.execute("COMMIT")
+    assert c.execute("SELECT n, attempt FROM held_counts").fetchall() == [(1, 1)]
     c.close()

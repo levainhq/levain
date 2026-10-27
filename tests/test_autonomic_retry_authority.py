@@ -328,17 +328,23 @@ def test_a_null_count_takes_no_attempt_at_the_same_mark(store):
 def test_a_count_names_only_the_links_latest_not_started_attempt(store, n):
     c = raw(store)
     tx(c, started_run, attempt(1))
-    if n == 1:   # attempt 1 is still live: a count naming it is refused (and the request is not live: _closed)
-        with pytest.raises(sqlite3.IntegrityError, match="I11"):
+    mark = c.execute(f"SELECT {s._progress(':s')}", {"s": SUBJ}).fetchone()[0]
+    if n == 1:   # attempt 1 is still live: count_held refuses first (F12), and so does the store
+        with pytest.raises(ValueError, match="latest not_started attempt"):
             tx(c, count(1))
+        with pytest.raises(sqlite3.IntegrityError, match="I11"):
+            tx(c, ("INSERT INTO held_counts (subject, n, last_reason, mark, attempt) VALUES (?, 1, 'subject:x', ?, 1)",
+                   (SUBJ, mark)))
         c.close()
         return
     tx(c, not_started(1), count(1), attempt(2))
     tx(c, not_started(2))
-    # attempt 1 is not_started but no longer the latest: naming it is refused; attempt 3 does not exist
-    for stale in (1, 3):
-        with pytest.raises(sqlite3.IntegrityError, match="I11"):
-            tx(c, f"UPDATE held_counts SET n = n + 1, attempt = {stale}")
+    # attempt 3 does not exist: refused by count_held and by the store. (Naming attempt 1 again at the same mark is
+    # the P1 carry, which F2 admits: test_an_attempt_less_fault_after_an_uncounted_retry_ended_still_counts)
+    with pytest.raises(ValueError, match="latest not_started attempt"):
+        tx(c, count(3))
+    with pytest.raises(sqlite3.IntegrityError, match="I11"):
+        tx(c, "UPDATE held_counts SET n = n + 1, attempt = 3")
     tx(c, count(2))
     assert held_row(c) == (2, 2)
     c.close()
@@ -349,11 +355,12 @@ def test_a_born_count_naming_an_attempt_needs_that_attempt_not_started_and_lates
     tx(c, started_run, attempt(1))
     tx(c, not_started(1))
     mark = c.execute(f"SELECT {s._progress(':s')}", {"s": SUBJ}).fetchone()[0]
-    with pytest.raises(sqlite3.IntegrityError, match="I11"):
+    with pytest.raises(ValueError, match="latest not_started attempt"):
         tx(c, count(2))   # attempt 2 does not exist
-    with pytest.raises(sqlite3.IntegrityError, match="I11"):
-        tx(c, ("INSERT INTO held_counts (subject, n, last_reason, mark, attempt) VALUES (?, 1, 'subject:x', ?, 0)",
-               (SUBJ, mark)))
+    for bad in (2, 0):    # the store refuses the same rows written around count_held
+        with pytest.raises(sqlite3.IntegrityError, match="I11"):
+            tx(c, ("INSERT INTO held_counts (subject, n, last_reason, mark, attempt) VALUES (?, 1, 'subject:x', ?, ?)",
+                   (SUBJ, mark, bad)))
     tx(c, count(1))
     assert held_row(c) == (1, 1)
     c.close()
@@ -524,15 +531,6 @@ def test_the_invariant_is_clean_after_the_run_is_cancelled(store):
     c.close()
 
 
-# ---- HEAD RULING on B1a's O1: '#' in a run id is refused by the store too --------------------------------------------
-def test_a_run_id_holding_a_hash_is_refused(store):
-    c = raw(store)
-    with pytest.raises(sqlite3.IntegrityError, match="D56/D68/D71/I2"):
-        tx(c, lambda conn: started_run(conn, "r#2"))
-    tx(c, lambda conn: started_run(conn, "r2"))
-    c.close()
-
-
 # ---- R4-1 / 10.Q1: the /3-only readers --------------------------------------------------------------------------------
 def test_hold_decision_reads_the_holds_generation_decider_and_posture(store):
     c = raw(store)
@@ -554,4 +552,156 @@ def test_not_started_receipts_are_the_receipts_of_not_started_rows(store):
     tx(c, lambda conn: s.close_subject(conn, subject="effect:r:link-0#3", record=rec("f3", "effect:r:link-0#3", "fired"),
                                        state="done", result="ok"))
     assert s.not_started_receipts(c) == frozenset({"ns1", "ns2"})
+    c.close()
+
+
+# ---- fix round 1 (1027+9 op21fix): the L3 r1 findings, each RED first ------------------------------------------------
+HOLD_A = ("INSERT INTO holds (hold_id, run_id, effect_id, binding_id, digest, seq) "
+          "VALUES ('h', 'r', 'link-0', 'b', 'A', 1)")
+
+
+def test_a_held_retry_under_a_hold_for_another_digest_is_refused(store):
+    # F1 (codex HIGH): attempt 1 of payload B ends not_started and is counted; a hold for payload A on the same link
+    # is approved; attempt 2 of B carrying A's decision must not run under A's approval
+    c = raw(store)
+    tx(c, started_run, attempt(1, digest="B"))
+    tx(c, not_started(1), count(1))
+    tx(c, HOLD_A, approve)
+    with pytest.raises(sqlite3.IntegrityError, match=AUTHORITY):
+        tx(c, attempt(2, seal(decision=GEN1), digest="B"))
+    # a held link whose only hold is for another payload does not fall back to the hold-less rule either
+    with pytest.raises(sqlite3.IntegrityError, match=AUTHORITY):
+        tx(c, attempt(2, digest="B"))
+    c.close()
+
+
+def test_a_held_retry_under_the_hold_for_its_own_digest_is_admitted(store):
+    c = raw(store)
+    tx(c, started_run, attempt(1, digest="A"))
+    tx(c, not_started(1), count(1))
+    tx(c, HOLD_A, approve)
+    tx(c, attempt(2, seal(decision=GEN1), digest="A"))
+    c.close()
+
+
+def test_an_attempt_less_fault_after_an_uncounted_retry_ended_still_counts(store):
+    # F2 (complement MED): the carried attempt was witnessed when it was written; a later successor does not make the
+    # carry illegal
+    c = raw(store)
+    first_attempt(c)
+    tx(c, attempt(2))
+    tx(c, not_started(2))
+    tx(c, lambda conn: s.count_held(conn, SUBJ, "subject:unavailable"))
+    assert held_row(c) == (2, 1)
+    tx(c, count(2))
+    assert held_row(c) == (3, 2)
+    tx(c, attempt(3))
+    c.close()
+
+
+def test_a_live_retry_closes_its_request_to_every_count(store):
+    # F2's scenario as complement wrote it (the fault arrives while attempt 2 is live): the request is closed while
+    # an attempt is intent (_closed), so the count is refused before and after F2's fix; the witness is not the cause
+    c = raw(store)
+    first_attempt(c)
+    tx(c, attempt(2))
+    with pytest.raises(sqlite3.IntegrityError, match="I11"):
+        tx(c, lambda conn: s.count_held(conn, SUBJ, "subject:unavailable"))
+    c.close()
+
+
+def test_the_not_started_close_does_not_move_the_mark_and_a_null_count_takes_the_attempt(store):
+    # F3 (complement LOW): _progress counts a link once (DISTINCT effect_id), so the not_started close leaves the mark
+    # where the intent put it; an attempt-less count written between that close and the attempt's count then meets
+    # the attempt's count at the SAME mark, and the count names the attempt (+1) instead of refusing it
+    c = raw(store)
+    tx(c, started_run, attempt(1))
+    mark = lambda: c.execute(f"SELECT {s._progress(':s')}", {"s": SUBJ}).fetchone()[0]
+    before = mark()
+    tx(c, not_started(1))
+    assert mark() == before
+    tx(c, lambda conn: s.count_held(conn, SUBJ, "subject:unavailable"))
+    assert held_row(c) == (1, None)
+    tx(c, count(1))
+    assert held_row(c) == (2, 1)
+    tx(c, attempt(2))
+    c.close()
+
+
+@pytest.mark.parametrize("first, retry", [
+    (seal(by="human"), seal(by="on-loop")),       # 10.Q2(b): a human attempt's retry is human
+    (seal(by="human"), seal(by=DROP)),
+    (seal(by="human"), seal(by=None)),
+    (seal(by=DROP), seal()),                      # the predecessor's by unknown
+    (seal(), seal(by=1)),
+])
+def test_a_hold_less_retry_never_drops_a_human_decider(store, first, retry):
+    # F4 (complement LOW): 10.Q2(b)'s `by` clause stands on the hold-less branch (R2-2 replaced 10.Q2(b) only for a
+    # link with a hold), in R3-1's typed shape
+    c = raw(store)
+    first_attempt(c, first)
+    with pytest.raises(sqlite3.IntegrityError, match=AUTHORITY):
+        tx(c, attempt(2, retry))
+    c.close()
+
+
+@pytest.mark.parametrize("first, retry", [
+    (seal(by="human"), seal(by="human")), (seal(by="on-loop"), seal(by="binding")), (seal(), seal(by="human"))])
+def test_a_hold_less_retry_keeps_or_raises_its_decider(store, first, retry):
+    c = raw(store)
+    first_attempt(c, first)
+    tx(c, attempt(2, retry))
+    c.close()
+
+
+@pytest.mark.parametrize("n", [1, 3])
+def test_count_held_refuses_an_attempt_that_is_not_the_links_latest_not_started_before_writing(store, n):
+    # F12 (deepseek LOW): a clear ValueError, not the trigger's IntegrityError
+    c = raw(store)
+    first_attempt(c)
+    tx(c, attempt(2))
+    tx(c, not_started(2), count(2))
+    before = c.execute("SELECT * FROM held_counts").fetchall()
+    with pytest.raises(ValueError, match="latest not_started attempt"):
+        tx(c, lambda conn: s.count_held(conn, SUBJ, "subject:x", attempt=n))
+    assert c.execute("SELECT * FROM held_counts").fetchall() == before
+    c.close()
+
+
+def test_not_started_receipts_leave_legacy_rows_out(tmp_path):
+    # F13 (deepseek LOW): like every other /3 reader (REAP_EFFECTS, INVARIANT); a legacy row is frozen
+    c = raw(hand_built(tmp_path, lambda conn: (ended_link("not_started", "refused")(conn),
+                                               conn.execute("UPDATE effects SET legacy = 1"))))
+    assert s.not_started_receipts(c) == frozenset()
+    c.close()
+
+
+def bound(c):
+    return [r for r in s.invariant(c) if r[0] == "held_at_bound_unclosed"]
+
+
+def test_the_invariant_names_a_held_count_at_the_bound_until_a_run_or_request_close(store):
+    # OBS-6 (A1's second invariant row): at the bound the count's own transaction closes the run (A1 order); a count
+    # left at the bound with neither close is named
+    c = raw(store)
+    first_attempt(c)
+    for _ in range(s.HELD_LIMIT - 1):
+        tx(c, lambda conn: s.count_held(conn, SUBJ, "subject:unavailable"))
+    assert bound(c) == [("held_at_bound_unclosed", SUBJ)]
+    tx(c, lambda conn: s.close_subject(conn, subject="run:r", record=rec("cx", "run:r", "refused"),
+                                       reason="held_limit:subject:unavailable"))
+    assert bound(c) == []
+    assert s.invariant(c) == []
+    c.close()
+
+
+def test_a_request_close_clears_the_at_bound_row(store):
+    c = raw(store)
+    tx(c, started_run)
+    for _ in range(s.HELD_LIMIT):
+        tx(c, lambda conn: s.count_held(conn, SUBJ, "subject:unavailable"))
+    assert bound(c) == [("held_at_bound_unclosed", SUBJ)]
+    tx(c, lambda conn: s.close_subject(conn, subject=SUBJ, record=rec("q", SUBJ, "refused"),
+                                       reason="held_limit:subject:unavailable"))
+    assert s.invariant(c) == []
     c.close()
