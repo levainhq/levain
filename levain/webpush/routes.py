@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from datetime import datetime, timezone
 
 from levain.webpush import devices, ece, vapid
-from levain.webpush.store import PushStore
+from levain.webpush.store import DeviceNotLive, PushStore
 
 STATIC = Path(__file__).resolve().parent / "static"
 _STATIC_FILES = {
@@ -96,7 +96,9 @@ def _body_json(body: bytes) -> dict | None:
 
 
 def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path | str, authorized: bool,
-           device_id: str | None) -> tuple[int, bytes, str] | None:
+           device_id: str | None, journal: Path | str | None = None) -> tuple[int, bytes, str] | None:
+    """``journal``: the cockpit data root whose pairing journal holds ``device_id`` when it is a ``paired-`` device
+    (the cockpit's caller), stored with its subscription and asked again inside the subscribe's write."""
     if method == "GET" and path in _STATIC_FILES:
         name, ctype = _STATIC_FILES[path]
         data = (STATIC / name).read_bytes()
@@ -168,7 +170,10 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
         except (TypeError, KeyError, ValueError):
             return _err(400, "bad_keys", "keys.p256dh must be a P-256 point and keys.auth 16 bytes, base64url")
         if device_id is not None:
-            return _json(200, {"id": store.add_subscription(endpoint, p256dh, auth, device_id)})
+            try:
+                return _json(200, {"id": store.add_subscription(endpoint, p256dh, auth, device_id, journal=journal)})
+            except DeviceNotLive:
+                return _err(403, "credential_required", "this device was revoked")
         # the run token is not a device: the page that turns pings on becomes one, so a revoke can stop them; an
         # endpoint a live device already owns stays its own, and the page keeps the token it holds
         sid, minted = store.subscribe_unowned(endpoint, p256dh, auth, obj.get("label"), datetime.now(timezone.utc))

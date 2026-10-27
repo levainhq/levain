@@ -16,7 +16,7 @@ def live(queue_dir: Path | str | None) -> bool:
     a gate on an install with no phone costs only an ``lstat``. Any fault reads as False (a ping is optional)."""
     if queue_dir is None:
         return False
-    from levain.webpush.store import DB_NAME, DIR_NAME
+    from levain.webpush.store import DB_NAME, DIR_NAME, live_rows
 
     path = Path(queue_dir) / DIR_NAME / DB_NAME
     try:
@@ -25,9 +25,9 @@ def live(queue_dir: Path | str | None) -> bool:
             return False
         # a short wait: a gate hook reads this, and a sender holding the write lock must not stall the gate
         conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)
+        conn.row_factory = sqlite3.Row
         try:
-            return conn.execute("SELECT 1 FROM subscriptions s JOIN devices d ON d.id = s.device_id "
-                                "WHERE s.retired_at IS NULL AND d.revoked_at IS NULL LIMIT 1").fetchone() is not None
+            return bool(live_rows(conn, first=True))     # the send's own rule (PushStore.live_subscriptions)
         finally:
             conn.close()
     except (OSError, sqlite3.Error, ValueError):

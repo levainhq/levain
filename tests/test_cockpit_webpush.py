@@ -137,3 +137,160 @@ def test_an_open_is_recorded_under_the_device_that_opened_it(rig) -> None:
 def test_the_worker_sends_the_credential_under_the_header_its_page_named() -> None:
     sw = (Path(__file__).resolve().parents[1] / "levain" / "webpush" / "static" / "sw.js").read_text()
     assert "'X-Levain-Write-Token'" in sw and "'X-Levain-Phone-Token'" in sw
+
+
+# --- fix round 1: one liveness rule, checked against the cockpit's pairing journal at send time ---------------------
+
+@pytest.fixture
+def pushes(monkeypatch) -> list[str]:
+    """The consent notification's real path with two seams: the detached child runs in this process (``spawn`` only
+    detaches) and the network POST is recorded instead of sent. Returns the endpoints each push went to."""
+    from levain.webpush import presence, sender
+
+    sent: list[str] = []
+
+    def spawn(queue_dir, **kw):
+        sender.send(queue_dir, **kw)
+        return True
+
+    monkeypatch.setattr(sender, "spawn", spawn)
+    monkeypatch.setattr(sender, "_post", lambda req: sent.append(req.full_url) or 201)
+    monkeypatch.setattr(presence, "should_push", lambda *a, **k: presence.Decision(True, "pushing", "test"))
+    return sent
+
+
+def _notify(qdir: Path) -> bool:
+    from levain.consent.adapters import claude_code as cc
+
+    return cc.notify(cc.AdapterSettings(), "levain: needs you", cwd=qdir, kind="consent", ref="request:x")
+
+
+def test_a_cockpit_paired_subscription_is_live_to_the_gate_and_the_consent_ping_reaches_it(rig, pushes) -> None:
+    from levain.webpush import live
+
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _):
+        _dev, tok = _pair(port)
+        assert _call(port, "POST", "/webpush/subscribe", _sub(1), token=tok)[0] == 200
+        assert live(qdir) is True
+        assert _notify(qdir) is True
+    assert pushes == [_sub(1)["endpoint"]]
+
+
+def test_a_revoke_whose_tidy_up_fails_still_stops_every_ping(rig, pushes, monkeypatch) -> None:
+    import sqlite3
+
+    from levain.webpush import live, store as push_store
+
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _):
+        dev, tok = _pair(port)
+        _keep, keep_tok = _pair(port, label="phone")
+        assert _call(port, "POST", "/webpush/subscribe", _sub(1), token=tok)[0] == 200
+        assert _call(port, "POST", "/webpush/subscribe", _sub(2), token=keep_tok)[0] == 200
+
+        def locked(*a, **k):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(push_store, "retire_device_subscriptions", locked)
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": dev}, token=T)
+        assert st == 200 and dev in out["revoked"] and "push_note" in out, out
+        assert "again" not in out["push_note"], out          # a retry finds nothing to revoke: never advised
+        # the row was never retired, yet no reader counts it and no ping reaches it
+        assert {s["endpoint"] for s in PushStore(qdir).live_subscriptions()} == {_sub(2)["endpoint"]}
+        assert live(qdir) is True and _notify(qdir) is True
+    assert pushes == [_sub(2)["endpoint"]]
+
+
+def test_revoke_all_from_the_box_stops_every_ping_with_no_push_call(rig, pushes) -> None:
+    from levain.cockpit.firejournal import CockpitDB
+    from levain.webpush import live
+
+    src, qdir = rig
+    with _signed(src, qdir) as (port, httpd):
+        _dev, tok = _pair(port)
+        assert _call(port, "POST", "/webpush/subscribe", _sub(1), token=tok)[0] == 200
+        root = httpd.broker.data_root
+    from datetime import datetime, timezone
+
+    db = CockpitDB(root)
+    try:
+        assert db.revoke_devices(None, by="box", now=datetime.now(timezone.utc))
+    finally:
+        close = getattr(db, "close", None)
+        if close is not None:
+            close()
+    assert PushStore(qdir).live_subscriptions() == [] and live(qdir) is False
+    assert _notify(qdir) is False and pushes == []
+
+
+def test_a_subscribe_authenticated_before_a_revoke_and_committed_after_it_is_refused(rig, pushes) -> None:
+    """The two steps in order: the subscribe's headers (its credential checked and cached), the revoke, then the
+    subscribe's body. The subscribe re-checks the device inside its write and refuses; nothing is stored or sent."""
+    import json
+    import socket
+
+    from levain.webpush import live
+
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _):
+        dev, tok = _pair(port)
+        body = json.dumps(_sub(1)).encode()
+        s = socket.create_connection(("127.0.0.1", port), timeout=20)
+        try:
+            s.sendall(("POST /webpush/subscribe HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\n"
+                       "X-Levain-Write-Token: %s\r\nContent-Length: %d\r\n\r\n" % (port, tok, len(body))).encode()
+                      + body[:5])
+            st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": dev}, token=T)
+            assert st == 200 and dev in out["revoked"], out
+            s.sendall(body[5:])
+            reply = b""
+            while b"\r\n\r\n" not in reply:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                reply += chunk
+        finally:
+            s.close()
+        assert reply.startswith(b"HTTP/1.1 403") or reply.startswith(b"HTTP/1.0 403"), reply[:200]
+        assert live(qdir) is False and PushStore(qdir).live_subscriptions() == []
+        assert _notify(qdir) is False
+    assert pushes == []
+
+
+def test_a_subscription_stored_for_a_revoked_device_is_never_sent_to(rig, pushes) -> None:
+    """Whatever wrote it, a row under a revoked paired device is not live: the send asks the journal."""
+    from levain.webpush import live
+
+    src, qdir = rig
+    with _signed(src, qdir) as (port, httpd):
+        dev, tok = _pair(port)
+        assert _call(port, "POST", "/webpush/subscribe", _sub(1), token=tok)[0] == 200
+        assert _call(port, "POST", "/cockpit/pair/revoke", {"id": dev}, token=T)[0] == 200
+        store = PushStore(qdir)
+        with store.write() as c:     # a row a tidy-up never reached, revived as a stalled subscribe would
+            c.execute("UPDATE subscriptions SET retired_at = NULL")
+        assert store.live_subscriptions() == [] and live(qdir) is False
+        assert _notify(qdir) is False
+    assert pushes == []
+
+
+def test_the_push_store_names_the_journal_the_way_the_journal_does() -> None:
+    from levain.cockpit import firejournal
+    from levain.webpush import store
+
+    assert store.PAIRED_PREFIX == firejournal.PAIRED_PREFIX and store._JOURNAL_DB == firejournal.DB_NAME
+
+
+def test_a_paired_subscription_without_its_journal_is_refused_and_an_unreadable_journal_is_not_live(tmp_path) -> None:
+    from levain.webpush.store import paired_device_live
+
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    s = _sub(1)
+    with pytest.raises(ValueError):
+        PushStore(q).add_subscription(s["endpoint"], s["keys"]["p256dh"], s["keys"]["auth"], PAIRED_PREFIX + "d-1")
+    assert paired_device_live(tmp_path / "nowhere", PAIRED_PREFIX + "d-1") is False
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / "cockpit.db").write_bytes(b"not a database")
+    assert paired_device_live(tmp_path / "bad", PAIRED_PREFIX + "d-1") is False

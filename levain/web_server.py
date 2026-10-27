@@ -1686,36 +1686,47 @@ class _Handler(GuardedHandler):
     def _push_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any] | bytes, int]":
         """A web push POST (OS-4), its credential already checked: only a PAIRED device subscribes (a surface token
         has no revoke that could stop the pings), and every subscription is stored under the device's credential
-        name, so a revoke here retires it (:meth:`_retire_push`)."""
+        name, with this cockpit's journal as its device's authority: the send asks the journal whether the device is
+        live (:func:`levain.webpush.store.live_rows`), so a revoke stops its pings whether or not :meth:`_retire_push`
+        ran, and the subscribe asks it again inside its own write."""
         from levain.webpush import routes as push_routes
 
         name = str(self._credential()["name"])
         if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
             return {"error": "device_required", "message": "turn pings on from a paired device: pair it from the "
                     "Devices panel first"}, 403
+        broker = self.server.broker
         got = push_routes.handle("POST", route, {}, raw, queue_dir=self.server.signer.queue_dir, authorized=True,
-                                 device_id=name)
-        assert got is not None          # every route in _PUSH_POST is one of handle's
+                                 device_id=name, journal=broker.data_root if broker is not None else None)
+        if got is None:                 # every route in _PUSH_POST is one of handle's
+            raise RuntimeError(f"push route {route} not handled")
         return got[1], got[0]
 
     def _retire_push(self, device_ids: "list[str]", now: datetime) -> "str | None":
-        """The revoked paired devices' push subscriptions retired (OS-4), so no ping is sent to a revoked device; the
-        reason as a note when the push store cannot be written (the revoke itself has committed), else None."""
+        """Tidy-up after a revoke (OS-4): the revoked paired devices' push subscriptions marked retired. Not the
+        guard: every send asks the journal, so a revoked device gets no ping either way. A note when the push store
+        could not be written (the revoke itself has committed), else None."""
         if self.server.signer is None or not device_ids:
             return None
         from levain.webpush.store import PushStore, retire_device_subscriptions
 
         try:
             conn = PushStore(self.server.signer.queue_dir).connection()
+        except Exception as exc:  # noqa: BLE001 - the revoke stands and the send refuses the device
+            _log.warning("paired device revoke: push store not opened", exc_info=True)
+            return f"its push subscriptions were not tidied ({type(exc).__name__}); no ping reaches it"
+        try:
+            with conn:
+                for device in device_ids:
+                    retire_device_subscriptions(conn, PAIRED_PREFIX + str(device), now)
+        except Exception as exc:  # noqa: BLE001 - the revoke stands and the send refuses the device
+            _log.warning("paired device revoke: push subscriptions not tidied", exc_info=True)
+            return f"its push subscriptions were not tidied ({type(exc).__name__}); no ping reaches it"
+        finally:
             try:
-                with conn:
-                    for device in device_ids:
-                        retire_device_subscriptions(conn, PAIRED_PREFIX + str(device), now)
-            finally:
                 conn.close()
-        except Exception as exc:  # noqa: BLE001 - the revoke stands; the note says its pings may not have stopped
-            _log.warning("paired device revoke: push subscriptions not retired", exc_info=True)
-            return f"its push subscriptions could not be retired ({type(exc).__name__}): run the revoke again"
+            except Exception:  # noqa: BLE001 - a close fault after the commit says nothing about the retirement
+                _log.warning("paired device revoke: push store close failed", exc_info=True)
         return None
 
     def _serve_grant_list(self, *, head: bool) -> None:
