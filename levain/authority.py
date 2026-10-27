@@ -64,6 +64,7 @@ __all__ = [
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_data_root", "anchor_path",
     "check_anchor", "classify", "foreign_anchor",
+    "CONSENT_CONTAINED_SHELL_KIND", "contained_shell_grant",
     "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
@@ -246,6 +247,17 @@ _CONSENT_GRANT_FIELDS = frozenset({"id", "kind", "agent", "tools", "workspace", 
 CONSENT_MCP_GRANT_KIND = "consent-mcp"
 _CONSENT_MCP_GRANT_FIELDS = _CONSENT_GRANT_FIELDS | {"mcp_fields"}
 CONSENT_AGENTS = ("claude_code", "codex")
+# A contained-shell grant (SH1, CH-D1 §3.4 R7-1) answers a chat launch's Bash ask, but only from a launch whose
+# containment CLASS is the one it names (``containment_digest``: 64 lower hex, the launch profile's digest of
+# ``levain.consent.contained.CONTAINMENT_FORMAT``) and whose directory is inside its workspace. It is NOT a consent
+# grant (:func:`consent_grant` is false for it, so the generic grant path never sees it): only
+# ``levain.consent.policy.contained_shell_refusal`` reads it. Its terms are closed: agent ``claude_code``, tools
+# exactly ``["Bash"]``, postures exactly ``["default"]``; any change to them, the digest or the agent is a new grant.
+CONSENT_CONTAINED_SHELL_KIND = "consent-contained-shell"
+_CONTAINED_SHELL_FIELDS = frozenset({"id", "kind", "agent", "tools", "workspace", "postures", "containment_digest",
+                                     "expires_at"})
+_CONTAINED_SHELL_TERMS = {"agent": "claude_code", "tools": ["Bash"], "postures": ["default"]}
+_CONTAINMENT_DIGEST = re.compile(r"[0-9a-f]{64}")
 # A setup record (CH-D2, design §3.8.5(o) item 4, "re-attach: the setup record"): the operator names ONCE, under the
 # log's rule for a loosen (a laptop-presence key), a host whose requests from a chat launch of ``entity`` may carry a
 # credential Levain holds. It names the credential's SOURCE (a keychain item name the service reads at attach time)
@@ -838,6 +850,57 @@ def _consent_grant_body(grant: Mapping[str, Any], what: str, at: datetime | None
     if at is not None and expires - at > _CONSENT_GRANT_MAX:
         raise AuthorityError(f"{what} may last at most 30 days past its link's time")
     return _thaw(grant)
+
+
+def _validate_contained_shell_grant(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A contained-shell grant's shape (:data:`CONSENT_CONTAINED_SHELL_KIND`): exactly its fields, its closed terms,
+    a workspace a consent grant could name, a 64-lower-hex ``containment_digest``, and an expiry at most 30 days
+    past its link's time. The home and real-path checks are append-time (:func:`_consent_home_check`)."""
+    if set(grant) != _CONTAINED_SHELL_FIELDS:
+        raise AuthorityError(f"{what} (a contained-shell grant) must carry exactly "
+                             f"{', '.join(sorted(_CONTAINED_SHELL_FIELDS))}")
+    if grant["kind"] != CONSENT_CONTAINED_SHELL_KIND:
+        raise AuthorityError(f"{what}.kind must be {CONSENT_CONTAINED_SHELL_KIND!r}")
+    if not isinstance(grant["id"], str) or not grant["id"]:
+        raise AuthorityError(f"{what}.id must be a non-empty string")
+    for name, want in _CONTAINED_SHELL_TERMS.items():
+        got = grant[name]
+        if (list(got) if isinstance(got, (list, tuple)) else got) != want:
+            raise AuthorityError(f"{what}.{name} must be exactly {want!r}: a contained-shell grant answers only "
+                                 "Claude Code's Bash in the default posture")
+    if not isinstance(grant["workspace"], str) or not os.path.isabs(grant["workspace"]):
+        raise AuthorityError(f"{what}.workspace must be an absolute path")
+    problem = consent_workspace_problem(grant["workspace"])
+    if problem is not None:
+        raise AuthorityError(f"{what}: {problem}")
+    if not isinstance(grant["containment_digest"], str) or not _CONTAINMENT_DIGEST.fullmatch(
+            grant["containment_digest"]):
+        raise AuthorityError(f"{what}.containment_digest must be 64 lower-case hex characters")
+    expires = _parse_stamp(grant["expires_at"], f"{what}.expires_at")
+    if at is not None and expires - at > _CONSENT_GRANT_MAX:
+        raise AuthorityError(f"{what} may last at most 30 days past its link's time")
+    return _thaw(grant)
+
+
+def _contained_shell_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime,
+                                  n_exp: datetime) -> str:
+    """A contained-shell grant's change: ``renew`` when only the expiry moved later; ``tight`` when everything but
+    the workspace and expiry is the same, the workspace the same or under the old one, and the expiry no later;
+    anything else ``loose`` (another containment class or kind is another grant, never narrower)."""
+    keep = lambda g: _canonical(_thaw({k: v for k, v in g.items() if k not in ("workspace", "expires_at")}))  # noqa: E731
+    if keep(o) != keep(n):
+        return "loose"
+    if n["workspace"] == o["workspace"] and n_exp > o_exp:
+        return "renew"
+    narrower = isinstance(n["workspace"], str) and isinstance(o["workspace"], str) \
+        and _path_within(n["workspace"], o["workspace"])
+    return "tight" if narrower and n_exp <= o_exp else "loose"
+
+
+def contained_shell_grant(grant: Any) -> bool:
+    """Whether ``grant`` is a contained-shell grant this levain knows (:data:`CONSENT_CONTAINED_SHELL_KIND`)."""
+    return isinstance(grant, Mapping) and grant.get("kind") == CONSENT_CONTAINED_SHELL_KIND \
+        and _grant_kind(grant) is _GRANT_KINDS[CONSENT_CONTAINED_SHELL_KIND]
 
 
 def _validate_inert_grant(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
@@ -1440,6 +1503,10 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
                                        renew_checks=(lambda g, after: _consent_mcp_tool_check(g, after),),
                                        consent=True, passkey_revocable=True),
     EGRESS_KEY_KIND: _GrantKind(validate=_validate_egress_key, change=_egress_key_change),
+    CONSENT_CONTAINED_SHELL_KIND: _GrantKind(validate=_validate_contained_shell_grant,
+                                             change=_contained_shell_grant_change,
+                                             append_checks=(lambda g: _consent_home_check(g),),
+                                             passkey_revocable=True),
     GRADUATION_KIND: _GrantKind(validate=_validate_graduation, change=_graduation_change,
                                 append_checks=(_graduation_guard_check,), renew_checks=(_graduation_renew_check,),
                                 passkey_revocable=True, max_life=GRADUATION_GRANT_MAX, fixed=_GRADUATION_FIXED),

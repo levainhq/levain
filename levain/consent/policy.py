@@ -38,8 +38,9 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from levain.authority import (consent_grant, consent_grant_tool_problem, consent_mcp_declaration, consent_mcp_input_fits,
-                              consent_root_problem)
+                              consent_root_problem, contained_shell_grant)
 from levain.cockpit.consent import ConsentError, parse_stamp
+from levain.consent.contained import ContainedLaunchProof
 from levain.consent.record import tool_input_digest
 
 if TYPE_CHECKING:
@@ -47,7 +48,7 @@ if TYPE_CHECKING:
     from levain.consent.record import ExternalGateRequest
 
 __all__ = ["AGENT_CONFIG_TIER", "AGENT_FILE_TOOLS", "FILE_TOOLS", "GLOB_TOOLS", "MCP_PATH_FIELDS", "Policy",
-           "PolicyNotEligible", "Targets", "decide", "grant_refusal", "grant_targets", "guarded_policy",
+           "PolicyNotEligible", "Targets", "contained_shell_refusal", "decide", "grant_refusal", "grant_targets", "guarded_policy",
            "mcp_config_candidates", "register_targets", "targets"]
 
 # The tier an agent_config request is filed at: an allow then needs a key class covering T3.
@@ -377,6 +378,64 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
             where = _resolved(target, request.cwd, home=home)
             if where is None or not _within(where, root):
                 return "a target is outside the grant's workspace"
+    return None
+
+
+def contained_shell_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, tool_input: Any,
+                            posture: Any, now: datetime, home: str | os.PathLike[str],
+                            contained_launch: ContainedLaunchProof | None) -> str | None:
+    """Why the contained-shell grant ``grant`` (SH1) does not answer ``request`` from the launch ``contained_launch``
+    proves, at ``now``, for ``tool_input`` under ``posture``; ``None`` when every criterion holds. Checked in this
+    order, the first failing one named: a proof of the right shape; a contained-shell grant; not agent config; the
+    grant's agent; the tool is exactly ``Bash`` (no case fold, no strip, never an MCP tool); the input an object
+    without the ``dangerouslyDisableSandbox`` key (any value; the command is never read); the input the request was
+    filed for; the posture; unexpired; the grant's ``containment_digest`` is the proof's ``profile_digest``; the
+    request's directory is the launch's; the launch's directory inside the grant's workspace, which is, here and
+    now, the directory the grant was signed for and not ``/`` or ``home`` or above it."""
+    if contained_launch is None or not isinstance(contained_launch, ContainedLaunchProof) \
+            or contained_launch.problem() is not None:
+        return "no contained launch"
+    if not contained_shell_grant(grant):
+        return "not a contained-shell grant"
+    if request.tier == AGENT_CONFIG_TIER:
+        return "agent config is never answered by a grant"
+    if grant.get("agent") != request.agent:
+        return "the grant is for another agent"
+    if request.tool_name != "Bash":
+        return "not the Bash tool"
+    if not isinstance(tool_input, Mapping):
+        return "the input is not an object"
+    if "dangerouslyDisableSandbox" in tool_input:
+        return "the call asks to leave the sandbox"
+    try:
+        if tool_input_digest(tool_input) != request.tool_input_digest:
+            return "not the input the request was filed for"
+        expires = parse_stamp(grant.get("expires_at"))
+    except (ConsentError, TypeError, ValueError, RecursionError):
+        return "the grant or the tool input cannot be read"
+    if posture != "default" or posture not in (grant.get("postures") or ()):
+        return "posture"
+    if not now < expires:
+        return "expired"
+    if grant.get("containment_digest") != contained_launch.profile_digest:
+        return "another containment"
+    workspace = grant.get("workspace")
+    if not isinstance(workspace, str) or not os.path.isabs(request.cwd):
+        return "no workspace to match"
+    try:
+        root = os.path.realpath(workspace)
+        cwd = os.path.realpath(request.cwd)
+    except (OSError, ValueError):
+        return "the workspace cannot be resolved"
+    if cwd != contained_launch.cwd:
+        return "not this launch's directory"
+    if not _within(contained_launch.cwd, root):
+        return "outside the grant's workspace"
+    if root != workspace or not os.path.isdir(root):
+        return "the workspace is not, here and now, the directory the grant was signed for"
+    problem = consent_root_problem(root, home=home)
+    if problem is not None:
+        return problem
     return None
 
 
