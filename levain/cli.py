@@ -1672,6 +1672,9 @@ def _add_consent_canary_parser(consent_sub: argparse._SubParsersAction) -> None:
 def _cmd_consent_canary(args: argparse.Namespace) -> int:
     from levain.consent.canary import cli_canary
 
+    if args.cockpit_url is not None and not args.sandbox:
+        print("levain consent canary: --cockpit-url only applies with --sandbox", file=sys.stderr)
+        return 2
     return cli_canary(args.agent, args.workspace, sandbox=args.sandbox, cockpit_url=args.cockpit_url)
 
 

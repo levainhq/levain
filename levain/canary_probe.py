@@ -8,20 +8,26 @@ program, with nothing of Levain's importable) and tries the same escapes in the 
 * ``HOMEWRITE``: create a file named by ``--home`` (the operator's home, passed in so the same path is checked by
   the host afterwards);
 * ``OFFHOST``: a TCP connect to ``--offhost`` (an address that is on no vendor allow-list);
-* ``COCKPITPORT``: a TCP connect to ``127.0.0.1:--cockpit-port``, the operator's real cockpit (0: none was found);
+* ``COCKPITPORT``: a TCP connect to ``--cockpit`` (``host:port``, an IPv6 host in brackets), the operator's real
+  cockpit at the address the host itself checks (``none``: no cockpit was found);
 * ``STANDIN``: a TCP connect to ``127.0.0.1:--port``, the host's own counting listener (a second witness the host
   can count);
 * ``HOOKPLANT``: create an executable ``post-checkout`` hook in ``--hookdir``, the ``.git/hooks`` of the operator's
   repository the slot was cloned from (outside the slot).
 
+Every argument the host chose (home, off-host address, ports, hook directory, the two ENOENT flags) is folded into
+every line's hmac through :func:`args_digest`, so a retyped or "corrected" command yields lines the host's own digest
+does not verify: a changed argument is INCONCLUSIVE, never a STOPPED that tested something else.
+
 Before the arms, ``CONTROL`` creates ``control-<nonce>`` beside this file. The verdict reads only the results file
 ``canary-results-<nonce>`` this script writes beside itself: one line per entry, ``<NAME> <STATUS> <hmac>``, in the
-order VERSION, CONTROL, the arms, END, where hmac is HMAC-SHA256(RUN_TOKEN, ``<nonce>|<NAME>|<STATUS>``) in hex. The
+order VERSION, CONTROL, the arms, END, where hmac is HMAC-SHA256(RUN_TOKEN,
+``<nonce>|<args digest>|<NAME>|<STATUS>``) in hex. The
 lines it prints are for the person reading the screen; nothing reads them for the verdict.
 
 ESCAPED is the act succeeding. STOPPED is only an errno that a refusal produces (:data:`REFUSED_ERRNOS`) or a connect
-that timed out, plus ENOENT for HOMEWRITE when the host passed ``--home-enoent-stops`` (Linux: the host saw the home
-directory, so a wall that hides it answers ENOENT); any other failure is INCONCLUSIVE, so a dead directory never reads
+that timed out, plus ENOENT for HOMEWRITE when the host passed ``--home-enoent-stops`` and for HOOKPLANT when it
+passed ``--hook-enoent-stops`` (Linux: the host saw that directory, so a wall that hides it answers ENOENT); any other failure is INCONCLUSIVE, so a dead directory never reads
 as a wall. When CONTROL fails, every arm is INCONCLUSIVE and none is attempted.
 """
 from __future__ import annotations
@@ -35,12 +41,13 @@ import re
 import socket
 import sys
 
-PROBE_VERSION = 2
+PROBE_VERSION = 3
 PREFIX = "LEVAIN-PROBE"
 ARMS = ("HOMEWRITE", "OFFHOST", "COCKPITPORT", "STANDIN", "HOOKPLANT")
 ARM_STATUSES = ("STOPPED", "ESCAPED", "INCONCLUSIVE")
 CONTROL_STATUSES = ("OK", "FAILED")
 DEFAULT_OFFHOST = "1.1.1.1:443"
+NO_COCKPIT = "none"
 HOOK_NAME = "post-checkout"
 CONNECT_S = 4.0
 REFUSED_ERRNOS = frozenset({errno.EPERM, errno.EACCES, errno.EROFS, errno.ECONNREFUSED, errno.EHOSTUNREACH,
@@ -59,8 +66,16 @@ def results_name(nonce: str) -> str:
     return f"canary-results-{nonce}"
 
 
-def line_mac(token: str, nonce: str, name: str, status: str) -> str:
-    return hmac.new(token.encode(), f"{nonce}|{name}|{status}".encode(), hashlib.sha256).hexdigest()
+def args_digest(*, home: str, offhost: str, port: int, cockpit: str, hookdir: str, home_enoent_stops: bool,
+                hook_enoent_stops: bool) -> str:
+    """SHA-256 over every argument the host chose, in a fixed order (NUL-separated, so no value runs into the next)."""
+    parts = (home, offhost, str(int(port)), cockpit, hookdir, "1" if home_enoent_stops else "0",
+             "1" if hook_enoent_stops else "0")
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+
+
+def line_mac(token: str, nonce: str, digest: str, name: str, status: str) -> str:
+    return hmac.new(token.encode(), f"{nonce}|{digest}|{name}|{status}".encode(), hashlib.sha256).hexdigest()
 
 
 def _say(nonce: str, name: str, status: str, detail: str = "") -> None:
@@ -81,16 +96,23 @@ def _create(path: str) -> None:
         pass
 
 
+def split_hostport(hostport: str) -> tuple[str, int]:
+    """``host:port`` with an IPv6 host in brackets (``[::1]:7420``) as ``(host, port)``; ValueError when it is not."""
+    host, sep, port = hostport.rpartition(":")
+    if not sep or not host or not port.isdigit():
+        raise ValueError(f"not host:port: {hostport!r}")
+    if host.startswith("[") != host.endswith("]"):
+        raise ValueError(f"unbalanced brackets: {hostport!r}")
+    if ":" in host and not host.startswith("["):
+        raise ValueError(f"an IPv6 host needs brackets: {hostport!r}")
+    return host.strip("[]"), int(port)
+
+
 def _connect(hostport: str) -> None:
-    host, _, port = hostport.rpartition(":")
-    if int(port) == 0:
-        raise LookupError("no port was given (no cockpit found)")
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(CONNECT_S)
-    try:
-        s.connect((host, int(port)))
-    finally:
-        s.close()
+    if hostport == NO_COCKPIT:
+        raise LookupError("no cockpit was found")
+    host, port = split_hostport(hostport)
+    socket.create_connection((host, port), timeout=CONNECT_S).close()
 
 
 def _plant(hookdir: str) -> None:
@@ -100,8 +122,11 @@ def _plant(hookdir: str) -> None:
     os.chmod(hook, 0o755)
 
 
-def run(nonce: str, home: str, offhost: str, port: int, cockpit_port: int, hookdir: str, here: str, *,
-        home_enoent_stops: bool = False) -> None:
+def run(nonce: str, home: str, offhost: str, port: int, cockpit: str, hookdir: str, here: str, *,
+        home_enoent_stops: bool = False, hook_enoent_stops: bool = False) -> None:
+    digest = args_digest(home=home, offhost=offhost, port=port, cockpit=cockpit, hookdir=hookdir,
+                         home_enoent_stops=home_enoent_stops, hook_enoent_stops=hook_enoent_stops)
+    enoent_stops = {"HOMEWRITE": home_enoent_stops, "HOOKPLANT": hook_enoent_stops}
     results: list[tuple[str, str]] = [("VERSION", str(PROBE_VERSION))]
     try:
         _create(os.path.join(here, control_name(nonce)))
@@ -116,7 +141,7 @@ def run(nonce: str, home: str, offhost: str, port: int, cockpit_port: int, hookd
         results.append(("CONTROL", "OK"))
         tries = (("HOMEWRITE", _create, (os.path.join(home, f".levain-canary-probe-{nonce}"),)),
                  ("OFFHOST", _connect, (offhost,)),
-                 ("COCKPITPORT", _connect, (f"127.0.0.1:{cockpit_port}",)),
+                 ("COCKPITPORT", _connect, (cockpit,)),
                  ("STANDIN", _connect, (f"127.0.0.1:{port}",)),
                  ("HOOKPLANT", _plant, (hookdir,)))
         for name, fn, args in tries:
@@ -127,13 +152,13 @@ def run(nonce: str, home: str, offhost: str, port: int, cockpit_port: int, hookd
                 status, detail = "INCONCLUSIVE", str(exc)
             except (OSError, ValueError) as exc:
                 status, detail = _classify(exc)
-                if name == "HOMEWRITE" and home_enoent_stops and getattr(exc, "errno", None) == errno.ENOENT:
+                if enoent_stops.get(name) and getattr(exc, "errno", None) == errno.ENOENT:
                     status = "STOPPED"
             _say(nonce, name, status, detail)
             results.append((name, status))
     results.append(("END", "DONE"))
     _say(nonce, "END", "DONE", f"v{PROBE_VERSION}")
-    body = "".join(f"{n} {s} {line_mac(RUN_TOKEN, nonce, n, s)}\n" for n, s in results)
+    body = "".join(f"{n} {s} {line_mac(RUN_TOKEN, nonce, digest, n, s)}\n" for n, s in results)
     try:
         with open(os.path.join(here, results_name(nonce)), "x", encoding="ascii") as fh:
             fh.write(body)
@@ -147,14 +172,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--home", required=True)
     p.add_argument("--offhost", default=DEFAULT_OFFHOST)
     p.add_argument("--port", required=True, type=int)
-    p.add_argument("--cockpit-port", required=True, type=int)
+    p.add_argument("--cockpit", required=True)
     p.add_argument("--hookdir", required=True)
     p.add_argument("--home-enoent-stops", action="store_true")
+    p.add_argument("--hook-enoent-stops", action="store_true")
     a = p.parse_args(argv)
     if not _NONCE.fullmatch(a.nonce):
         p.error("--nonce must be 8-64 lowercase hex digits")
-    run(a.nonce, a.home, a.offhost, a.port, a.cockpit_port, a.hookdir,
-        os.path.dirname(os.path.abspath(__file__)), home_enoent_stops=a.home_enoent_stops)
+    run(a.nonce, a.home, a.offhost, a.port, a.cockpit, a.hookdir, os.path.dirname(os.path.abspath(__file__)),
+        home_enoent_stops=a.home_enoent_stops, hook_enoent_stops=a.hook_enoent_stops)
     return 0
 
 
