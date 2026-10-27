@@ -1579,7 +1579,7 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
 /* THE BAR ON A NARROW SCREEN. Two rows: the brand with the status dot, Sync and the theme switch; then the four tabs across the width.
    Under 1100px (960 until 1023+13, when the jar and the live dot overlapped the tabs between 961 and 1040; 1040 until 1027+4, when a wide font's bar overlapped them between 1041 and 1099) the read-time line and the jar sit on a third row; under 480px they go (the live dot stays), Jump becomes its icon and
    the keyboard cues go: a phone has no keyboard. Then the band stacked (clock, date, the state line, the wrap line). */
-@media (max-width: 1100px) {
+@media (width <= 1100px) {   /* range form: a zoomed page's fractional width (1100.5) falls in one band, never between two */
   body.ke .masthead { flex-wrap: wrap; row-gap: var(--sp-3); column-gap: var(--sp-3); padding-block: var(--sp-4); }
   body.ke .masthead .brand { order: 0; margin-right: auto; }
   body.ke .masthead .seg { order: 2; flex: 1 1 100%; }
@@ -1590,7 +1590,7 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .masthead .entity { display: none; }
 }
 /* Between the stacked breakpoint and the width where the labelled Calm button fits beside the name, Calm shows its icon; the label stays its accessible name (aria-label + title, set by the page) */
-@media (min-width: 1101px) and (max-width: 1280px) {
+@media (1100px < width <= 1280px) {
   body.ke .masthead #calmbtn { font-size: 0; padding: var(--sp-3); gap: 0; }   /* the zero-size label is still a flex item: without gap: 0 the bar's gap sits between it and the glyph */
   body.ke .masthead #calmbtn::before { content: "\2248"; font-size: var(--fs-title); }
   body.ke .masthead #calmbtn[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
@@ -2578,7 +2578,7 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 /* ═══════════════════════════ NARROW VIEW (1023+13): the cockpit at half a laptop screen ═══════════════════════════ */
 /* A rename editor open in the masthead takes its own line below the tabs, never a slot beside the brand (the unit is display: contents
    in the two-row bar, so the editor would otherwise be a flex item of the bar itself). */
-@media (max-width: 1100px) {
+@media (width <= 1100px) {
   body.ke .masthead .name-editor { order: 4; flex: 1 1 100%; }
   body.ke .masthead .name-input { flex: 1 1 12ch; min-width: 0; max-width: none; }
 }
