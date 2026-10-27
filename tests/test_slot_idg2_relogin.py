@@ -218,8 +218,15 @@ def test_a_planted_link_at_replaced_is_not_followed(tmp_path):
 CRASH_POINTS = {
     "park:before:move": {"keep": "old", "tree": "new"},
     "park:after:move": {"keep": "old", "tree": "new"},
+    "park:keep:made": {"keep": "old", "tree": "new"},
+    "park:replace:retained-made": {"keep": "old", "tree": "new"},
+    "park:replace:dest-made": {"keep": "old", "tree": "new"},
     "park:replace:dirs": {"keep": "old", "tree": "new"},
+    "park:replace:renamed": {"replaced": "old", "tree": "new"},
+    "park:replace:source-synced": {"replaced": "old", "tree": "new"},
     "park:replace:aside": {"replaced": "old", "tree": "new"},
+    "park:keep:renamed": {"replaced": "old", "keep": "new"},
+    "park:keep:source-synced": {"replaced": "old", "keep": "new"},
     "park:before:commit": {"replaced": "old", "keep": "new"},
     "park:after:commit": {"replaced": "old", "keep": "new"},
     "park:before:cas": {"replaced": "old", "keep": "new"},
@@ -277,7 +284,7 @@ end_session(w.facts, w.seams(ctl, fault=fault), record_state=REVOKED)
 """
 
 
-@pytest.mark.parametrize("point", ["park:replace:aside", "park:before:commit"])
+@pytest.mark.parametrize("point", ["park:replace:renamed", "park:replace:aside", "park:before:commit"])
 def test_a_sigkilled_end_converges(tmp_path, point):
     """The crash as a real process death (SIGKILL, no unwinding) between and after the two renames, then a fresh END
     in this process from the record the child left (DEAD, the park journal at ``move``)."""
@@ -438,7 +445,12 @@ def test_a_held_login_from_before_d1_releases_on_an_end_retry_alone(tmp_path):
 D1_POINTS = {
     "park:before:move": {"keep": "old", "tree": "new"},
     "park:after:move": {"keep": "old", "tree": "new"},
+    "park:keep:made": {"keep": "old", "tree": "new"},
+    "park:unconfirmed:retained-made": {"keep": "old", "tree": "new"},
+    "park:unconfirmed:dest-made": {"keep": "old", "tree": "new"},
     "park:unconfirmed:dirs": {"keep": "old", "tree": "new"},
+    "park:unconfirmed:renamed": {"keep": "old", "unconfirmed": "new"},
+    "park:unconfirmed:source-synced": {"keep": "old", "unconfirmed": "new"},
     "park:unconfirmed:aside": {"keep": "old", "unconfirmed": "new"},
     "park:before:commit": {"keep": "old", "unconfirmed": "new"},
     "park:after:commit": {"keep": "old", "unconfirmed": "new"},
@@ -520,7 +532,7 @@ end_session(w.facts, w.seams(ctl, fault=fault), record_state=REVOKED)
 """
 
 
-@pytest.mark.parametrize("point", ["park:unconfirmed:dirs", "park:unconfirmed:aside"])
+@pytest.mark.parametrize("point", ["park:unconfirmed:dirs", "park:unconfirmed:renamed", "park:unconfirmed:aside"])
 def test_a_sigkilled_unconfirmed_end_converges(tmp_path, point):
     """A real process death before and after the set-aside's rename, then a fresh END in this process from the record
     the child left (DEAD, the park journal at ``move``)."""
@@ -560,3 +572,145 @@ def test_the_unconfirmed_credential_follows_discard_restore_and_purge(tmp_path):
     assert SV.purge(sf, ss, forced=True) == R.PURGED
     assert not sf.trash.exists() and not unconfirmed(w).exists()
     assert (w.facts.keep / NAME).read_bytes() == OLD             # the parked login is untouched throughout
+
+
+# --- replay finishes every durability step the original run owed (1027-19 RULINGS "G2 L3 r1", H1 + H2) ----------------
+
+
+def _redo_points(points: dict) -> list:
+    """The points a crash at which leaves the park journal at ``move``, so the restart redoes :func:`park_move`
+    (from ``park:after:commit`` on, the move finished whole before the journal advanced)."""
+    out = []
+    for p in points:
+        if p == "park:after:commit":
+            return out
+        out.append(p)
+    return out
+
+
+def _ino(p: Path) -> tuple:
+    st = os.lstat(p)
+    return st.st_dev, st.st_ino
+
+
+def _trace_sync(monkeypatch) -> list:
+    """Every ``os.fsync`` (as the synced inode) and every rename of the credential, in call order."""
+    log: list = []
+    real_fsync, real_rename = os.fsync, os.rename
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        log.append(("sync", (st.st_dev, st.st_ino)))
+        return real_fsync(fd)
+
+    def rename(src, dst, *a, **k):
+        if os.fsdecode(src) == NAME:
+            log.append(("rename", None))
+        return real_rename(src, dst, *a, **k)
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "rename", rename)
+    return log
+
+
+def _owed(w: World) -> list:
+    """Every directory a rename or mkdir of the crashed run may have left unsynced: the credential's tree directory,
+    keep/ and its parent, and, when it exists, replaced/ or unconfirmed/ with retained/<s>/ and L/retained/."""
+    out = [w.S / "config" / "claude", w.facts.keep, w.facts.keep.parent]
+    for d in (w.facts.retained / end_mod.REPLACED, w.facts.retained / end_mod.UNCONFIRMED):
+        if os.path.lexists(d):
+            out += [d, w.facts.retained, w.facts.retained.parent]
+    return out
+
+
+@pytest.mark.parametrize("path,point", [("confirmed", p) for p in _redo_points(CRASH_POINTS)]
+                         + [("unconfirmed", p) for p in _redo_points(D1_POINTS)])
+def test_the_park_redo_resyncs_every_directory_before_the_credential_moves(tmp_path, monkeypatch, path, point):
+    """A crash at the point, then the restart (reaper step 2, then END from the record): before it renames the
+    credential at all, the redo has fsynced every directory the crashed run may have left unsynced. The power loss
+    that would make an unsynced entry vanish cannot be simulated in a test; what is asserted is the fsync calls."""
+    w = login_world(tmp_path)
+    if path == "confirmed":
+        confirm(w)
+    ctl = Control()
+    fault, fired = _crash_once(point)
+    with pytest.raises(Crash):
+        end_session(w.facts, w.seams(ctl, fault=fault), record_state=REVOKED)
+    assert fired == [point]
+    owed = _owed(w)
+    want = {p: _ino(p) for p in owed}
+    log = _trace_sync(monkeypatch)
+    seams = w.seams(ctl)
+    reconcile_session(w.facts, seams)
+    assert end_session(w.facts, seams, record_state=ctl.state, failed_step=ctl.failed_step) == RETAINED
+    monkeypatch.undo()
+    first = next((i for i, (k, _) in enumerate(log) if k == "rename"), len(log))
+    synced = {v for k, v in log[:first] if k == "sync"}
+    missing = " ".join(os.path.relpath(p, w.L) for p, i in want.items() if i not in synced)
+    assert not missing, f"not fsynced before the credential moved: {missing}"
+    assert where(w) == ({"keep": "new", "replaced": "old"} if path == "confirmed"
+                        else {"keep": "old", "unconfirmed": "new"})
+
+
+# --- the set-aside's directories and source (1027-19 RULINGS "G2 L3 r1", M1, L1, L2) ------------------------------------
+
+
+@pytest.mark.parametrize("how", ["missing", "a-file"])
+@pytest.mark.parametrize("path", ["confirmed", "unconfirmed"])
+def test_a_broken_retained_root_is_bad_root_never_an_unnamed_error(tmp_path, path, how):
+    """M1: ``L/retained/`` missing or not a directory: the set-aside's mkdir fails, and END ends HELD ``bad-root``
+    with both credentials where they were."""
+    w = login_world(tmp_path)
+    if path == "confirmed":
+        confirm(w)
+    os.rmdir(w.facts.retained.parent)
+    if how == "a-file":
+        w.facts.retained.parent.write_bytes(b"")
+    ctl = Control()
+    assert end_session(w.facts, w.seams(ctl), record_state=REVOKED) == HELD
+    assert ctl.failed_step == "park" and any("bad-root" in n for n in w.notes)
+    assert where(w) == {"keep": "old", "tree": "new"}
+
+
+@pytest.mark.parametrize("path,sub", [("confirmed", end_mod.REPLACED), ("unconfirmed", end_mod.UNCONFIRMED)])
+def test_an_existing_set_aside_dir_is_made_0700(tmp_path, path, sub):
+    """L1: an existing ``replaced/`` or ``unconfirmed/`` with the right type and owner is chmodded 0700."""
+    w = login_world(tmp_path)
+    if path == "confirmed":
+        confirm(w)
+    (w.facts.retained / sub).mkdir(parents=True)
+    os.chmod(w.facts.retained / sub, 0o755)
+    ctl = Control()
+    assert end_session(w.facts, w.seams(ctl), record_state=REVOKED) == RETAINED
+    assert os.stat(w.facts.retained / sub).st_mode & 0o777 == 0o700
+
+
+def _not_a_file(at: Path, what: str, tmp_path: Path) -> None:
+    at.unlink()
+    if what == "dir":
+        at.mkdir()
+    else:
+        (tmp_path / "target").write_bytes(OLD)
+        os.symlink(tmp_path / "target", at)
+
+
+@pytest.mark.parametrize("what", ["dir", "link"])
+def test_a_confirmed_relogin_never_sets_aside_a_non_file_at_keep(tmp_path, what):
+    """L2: only a regular file at keep/<name> is set aside; anything else refuses ``keep-occupied`` as before IG-1."""
+    w = login_world(tmp_path)
+    confirm(w)
+    _not_a_file(w.facts.keep / NAME, what, tmp_path)
+    ctl = Control()
+    assert end_session(w.facts, w.seams(ctl), record_state=REVOKED) == HELD
+    assert ctl.failed_step == "park" and any("keep-occupied" in n for n in w.notes)
+    assert os.path.lexists(w.facts.keep / NAME) and not os.path.lexists(replaced(w))
+    assert (w.S / "config" / "claude" / NAME).read_bytes() == CRED
+
+
+def test_an_unconfirmed_login_never_sets_aside_a_link_from_the_tree(tmp_path):
+    """L2, D1's source: a link at the tree's credential path is not set aside into ``unconfirmed/``."""
+    w = login_world(tmp_path)
+    _not_a_file(w.S / "config" / "claude" / NAME, "link", tmp_path)
+    ctl = Control()
+    assert end_session(w.facts, w.seams(ctl), record_state=REVOKED) == HELD
+    assert ctl.failed_step == "park" and any("keep-occupied" in n for n in w.notes)
+    assert not os.path.lexists(unconfirmed(w)) and where(w)["keep"] == "old"

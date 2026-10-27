@@ -1729,17 +1729,38 @@ def confirmed_relogin(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], b
     return obj["session"] == facts.session and obj["vendor"] == facts.vendor
 
 
-def _own_dir(path: Path, owner_ok: Callable[[os.stat_result], bool]) -> None:
-    """``path`` made root 0700 (its parent fsynced) or, when it exists, checked a real directory with the expected
-    owner (a planted link is never followed): else ``bad-root``."""
+def _own_dir(path: Path, owner_ok: Callable[[os.stat_result], bool], fault: Fault, point: str) -> None:
+    """``path`` made root 0700 or, when it exists, checked a real directory with the expected owner (a planted link is
+    never followed) and chmodded 0700; then its parent fsynced, made in this run or not, since a run that died between
+    the mkdir and that fsync left it owed. Any failure is ``bad-root``, the step HELD."""
     try:
-        os.mkdir(path, 0o700)
-    except FileExistsError:
-        st = os.lstat(path)
-        if not stat.S_ISDIR(st.st_mode) or not owner_ok(st):
-            raise Refused("bad-root", f"{path} is not a directory with the expected owner") from None
-        return
-    fsync_dir(path.parent)
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            st = os.lstat(path)
+            if not stat.S_ISDIR(st.st_mode) or not owner_ok(st):
+                raise Refused("bad-root", f"{path} is not a directory with the expected owner") from None
+            os.chmod(path, 0o700)   # a real directory, checked above
+        fault(point)
+        fsync_dir(path.parent)
+    except OSError as e:
+        raise Refused("bad-root", f"{path}: {e.strerror or e}") from None
+
+
+def _resync(facts: EndFacts, dfd: int, owner_ok: Callable[[os.stat_result], bool], fault: Fault) -> None:
+    """Every directory an earlier run of :func:`park_move` may have renamed into or out of, or made, without the fsync
+    that followed: the credential's tree directory, ``keep/`` and its parent, and each of ``replaced/`` and
+    ``unconfirmed/`` that exists (checked as :func:`_own_dir` checks it, with ``retained/<s>/`` and its parent).
+    Fsyncs are idempotent, so every run does them, a first run as well as a redo, before any credential moves."""
+    os.fsync(dfd)
+    if os.path.isdir(facts.keep):
+        fsync_dir(facts.keep.parent)
+        fsync_dir(facts.keep)
+    for dest in (facts.replaced, facts.unconfirmed):
+        if os.path.lexists(dest):
+            _own_dir(facts.retained, owner_ok, fault, "park:resync:retained")
+            _own_dir(dest, owner_ok, fault, "park:resync:dest")
+            fsync_dir(dest)
 
 
 def _set_aside(facts: EndFacts, sfd: int, name: bytes, dest: Path, occupied: str,
@@ -1747,9 +1768,13 @@ def _set_aside(facts: EndFacts, sfd: int, name: bytes, dest: Path, occupied: str
     """IG-1: a credential renamed (never opened) from the directory ``sfd`` into ``dest``, a directory inside
     ``L/retained/<s>/`` (both made root 0700 if missing), then both directories fsynced: the parked credential a
     confirmed re-login replaces (``keep/`` -> ``replaced/``), or the new credential of a login with no yes (the
-    session tree -> ``unconfirmed/``, D1). An entry already at ``dest`` is never replaced (``occupied``)."""
-    _own_dir(facts.retained, owner_ok)
-    _own_dir(dest, owner_ok)
+    session tree -> ``unconfirmed/``, D1). Only a regular file is moved (``lstat``, never followed): anything else
+    refuses ``keep-occupied``, as before IG-1. An entry already at ``dest`` is never replaced (``occupied``)."""
+    st = os.stat(name, dir_fd=sfd, follow_symlinks=False)
+    if not stat.S_ISREG(st.st_mode):
+        raise Refused("keep-occupied", f"{facts.keep}/{name.decode('ascii')} already holds a credential")
+    _own_dir(facts.retained, owner_ok, fault, f"{point}:retained-made")
+    _own_dir(dest, owner_ok, fault, f"{point}:dest-made")
     fault(f"{point}:dirs")
     rfd = os.open(dest, _DIR_FLAGS)
     try:
@@ -1760,7 +1785,9 @@ def _set_aside(facts: EndFacts, sfd: int, name: bytes, dest: Path, occupied: str
         else:
             raise Refused(occupied, f"{dest}/{name.decode('ascii')} already holds a file")
         os.rename(name, name, src_dir_fd=sfd, dst_dir_fd=rfd)
+        fault(f"{point}:renamed")
         os.fsync(sfd)
+        fault(f"{point}:source-synced")
         os.fsync(rfd)
     finally:
         os.close(rfd)
@@ -1780,9 +1807,9 @@ def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _
     parks, and one after the park finds the source gone. A ``login`` session that is not confirmed (D1) parks
     nothing: its new credential is set aside into ``unconfirmed/`` and ``keep/`` is not touched, so the session
     still retains and its slot is released. Only another kind refuses ``keep-occupied``.
-    keep/ (root 0700, install's) is made if it is missing (DECISION). A redo that finds the source gone and
-    ``keep/`` or ``unconfirmed/`` holding the name (a rename whose fsyncs did not finish) still fsyncs the source
-    directory and that one (codex r1 6)."""
+    keep/ (root 0700, install's) is made if it is missing (DECISION), its parent fsynced. Every run first fsyncs
+    every directory an earlier run may have left unsynced (:func:`_resync`), so a redo finishes the durability steps
+    the run it replays owed (codex r1 6, r1 G2 H1 + H2)."""
     cred = facts.credential
     if cred is None or not os.path.isdir(facts.live):
         return
@@ -1791,13 +1818,10 @@ def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _
     if dfd is None:
         return
     try:
+        _resync(facts, dfd, owner_ok, fault)
         try:
             st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
         except FileNotFoundError:
-            for dest in (facts.keep, facts.unconfirmed):
-                if os.path.lexists(dest / os.fsdecode(name)):
-                    os.fsync(dfd)
-                    fsync_dir(dest)
             return
         if stat.S_ISDIR(st.st_mode):
             return
@@ -1805,6 +1829,8 @@ def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _
             os.mkdir(facts.keep, 0o700)
         except FileExistsError:
             pass
+        fault("park:keep:made")
+        fsync_dir(facts.keep.parent)
         kfd = os.open(facts.keep, _DIR_FLAGS)
         try:
             try:
@@ -1823,7 +1849,9 @@ def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _
                     raise Refused("keep-occupied",
                                   f"{facts.keep}/{name.decode('ascii')} already holds a credential")
             os.rename(name, name, src_dir_fd=dfd, dst_dir_fd=kfd)
+            fault("park:keep:renamed")
             os.fsync(dfd)
+            fault("park:keep:source-synced")
             os.fsync(kfd)
         finally:
             os.close(kfd)
