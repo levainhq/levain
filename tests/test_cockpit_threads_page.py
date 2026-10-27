@@ -13,7 +13,6 @@ from tests.test_cockpit_threads import clock, qdir, seeded  # noqa: F401  (fixtu
 
 WEB = Path(threads.__file__).resolve().parents[1] / "templates" / "web"
 PAGE = Path(__file__).with_name("fixtures") / "thread_view_page.html"
-SHOT = Path("/Users/phillipclapham/.claude/jobs/095d5b71/tmp/lanes/chu1a/thread_view.png")
 
 
 def _serve(qdir: Path):
@@ -46,6 +45,7 @@ def _serve(qdir: Path):
 @needs_browser
 def test_the_list_opens_a_thread_and_draws_it_as_text(tmp_path, seeded):
     qdir, world = seeded
+    shot = tmp_path / "thread_view.png"
     httpd = _serve(qdir)
     try:
         out = _drive(tmp_path, f"http://127.0.0.1:{httpd.server_address[1]}/", [
@@ -55,18 +55,68 @@ def test_the_list_opens_a_thread_and_draws_it_as_text(tmp_path, seeded):
             {"eval": "JSON.stringify({kinds: [...document.querySelectorAll('.tv-kind')].map(k => k.textContent),"
                      " unverified: document.querySelectorAll('.tv-unverified').length,"
                      " open: document.querySelectorAll('.tv-tool-open').length, done: document.querySelectorAll('.tv-tool-done').length,"
-                     " card: document.querySelector('.tv-card').getAttribute('href'),"
+                     " links: document.querySelectorAll('.tv-line a').length,"
+                     " approval: document.querySelector('.tv-vendor_approval_request .tv-body').textContent,"
                      " bold: document.querySelectorAll('.tv-body b').length,"
                      " text: document.querySelector('.tv-message .tv-body').textContent,"
                      " composer: document.querySelector('.tv-composer').textContent})"},
-            {"shot": str(SHOT)},
+            {"shot": str(shot)},
         ])
     finally:
         httpd.shutdown()
+        httpd.server_close()
     got = json.loads(next(v for v in out["values"] if isinstance(v, str)))
     assert got["kinds"][0] == "message" and "approval" in got["kinds"], got
     assert (got["unverified"], got["open"], got["done"]) == (1, 1, 1), got
-    assert got["card"] == "/cockpit/consent/req-77.json", got
+    assert got["links"] == 0 and "answer it in Needs you" in got["approval"], got
     assert got["bold"] == 0 and "<b>build</b>" in got["text"], got     # the thread's words never become markup
     assert "read-only" in got["composer"], got
-    assert SHOT.is_file()
+    assert shot.is_file()
+
+
+_RACE = """
+(() => {
+  const host = document.createElement("div"); document.body.appendChild(host);
+  const pending = {};
+  const f = (url) => new Promise((ok, no) => { pending[url] = {ok, no}; });
+  const body = (name) => ({ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(
+    {thread_id: name, gap: false, composer: null, before: [], stream: []}))});
+  const tv = LevainThreadView.mount(host, {fetch: f, pollMs: 0});
+  const A = "/cockpit/thread/A.json", B = "/cockpit/thread/B.json";
+  tv.open("A"); tv.open("B");
+  pending[B].ok(body("B"));
+  const first = () => host.querySelector(".tv-title") && host.querySelector(".tv-title").textContent;
+  setTimeout(() => {
+    const afterB = first();
+    pending[A].ok(body("A"));                        // A answers late: it must not repaint B
+    setTimeout(() => {
+      const afterA = first();
+      tv.open("C");                                  // C is then abandoned for D; C fails late: it must not overwrite D
+      tv.open("D");
+      pending["/cockpit/thread/D.json"].ok(body("D"));
+      setTimeout(() => {
+        pending["/cockpit/thread/C.json"].no(new Error("late"));
+        setTimeout(() => { window.__race = [afterB, afterA, first(), host.querySelector(".tv-note") && host.querySelector(".tv-note").textContent]; }, 30);
+      }, 30);
+    }, 30);
+  }, 30);
+})()
+"""
+
+
+@needs_browser
+def test_a_late_reply_for_an_abandoned_navigation_never_repaints(tmp_path, seeded):
+    qdir, _world = seeded
+    httpd = _serve(qdir)
+    try:
+        out = _drive(tmp_path, f"http://127.0.0.1:{httpd.server_address[1]}/", [
+            {"until": "document.querySelector('.tv-row')"},
+            {"eval": _RACE},
+            {"until": "window.__race ? JSON.stringify(window.__race) : null"},
+        ])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    race = json.loads(next(v for v in reversed(out["values"]) if isinstance(v, str)))
+    assert race[:3] == ["B", "B", "D"], race
+    assert race[3] in (None, "Nothing has been said in this thread yet."), race     # no error text over D

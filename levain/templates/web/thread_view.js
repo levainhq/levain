@@ -3,7 +3,8 @@
 // A pure view-model plus a renderer for the two JSON bodies levain/cockpit/threads.py serves: the thread list and one
 // thread's stream. Read-only: no composer input, no send, no stop. Every word that came from a thread is set with
 // textContent, never as markup. The stream is drawn in the order the server sent (gseq); nothing here sorts it.
-// An operator line carries the server's `unverified` mark and the view says so; it never says "verified".
+// An operator line carries the server's `unverified` mark and the view says so; it never says "verified". An approval is
+// an inert line: no link, no card id (the record holds no correlation to a queue request yet).
 (function (root) {
   "use strict";
 
@@ -36,14 +37,16 @@
     return c.why && c.state !== "writable" ? w + " (" + c.why + ")" : w;
   }
 
+  var APPROVAL_WORDS = "An approval was asked; answer it in Needs you.";
+
   function line(it) {
     var who = it.kind === "message" ? it.source : (it.source === "vendor" ? "agent side" : it.source);
     var status = it.status ? String(it.status).replace(/_/g, " ") : "";
     return {
-      gseq: it.gseq, kind: it.kind, label: label(it.kind), who: who, text: it.body == null ? "" : String(it.body),
+      gseq: it.gseq, kind: it.kind, label: label(it.kind), who: who,
+      text: it.kind === "vendor_approval_request" ? APPROVAL_WORDS : (it.body == null ? "" : String(it.body)),
       status: status, unverified: it.unverified === true, truncated: it.truncated === true,
       tool: it.tool ? { open: it.tool.open === true } : null,
-      card: it.card && typeof it.card.href === "string" ? { id: String(it.card.id), href: it.card.href } : null,
       at: it.at || ""
     };
   }
@@ -86,11 +89,6 @@
     row.appendChild(head);
     if (l.text) row.appendChild(el(doc, "pre", "tv-body", l.text));
     if (l.truncated) row.appendChild(el(doc, "div", "tv-note", "Cut short; the vendor holds the rest."));
-    if (l.card) {
-      var a = el(doc, "a", "tv-card", "Open the card for " + l.card.id);
-      a.setAttribute("href", l.card.href);
-      row.appendChild(a);
-    }
     return row;
   }
 
@@ -123,7 +121,7 @@
       b.appendChild(el(doc, "span", "tv-id", r.id));
       b.appendChild(el(doc, "span", "tv-latest", r.latest));
       b.appendChild(el(doc, "span", "tv-at", r.at));
-      b.appendChild(el(doc, "span", "tv-state tv-state-" + r.state, r.composer));
+      b.appendChild(el(doc, "span", "tv-state tv-state-" + String(r.state).replace(/[^a-z_]/g, ""), r.composer));
       b.addEventListener("click", function () { onOpen(r.id); });
       host.appendChild(b);
     });
@@ -131,14 +129,14 @@
   }
 
   // mount(host, {fetch, headers, pollMs}): the list; a click opens a thread; "back" returns. Polls while mounted and
-  // redraws only when the body changed. Returns {stop, open, back}.
+  // redraws only when the body changed. Each navigation takes a new generation and a reply that is not the latest generation's is dropped, on success and on failure alike. Returns {stop, open, back}.
   function mount(host, opts) {
     opts = opts || {};
     var doc = host.ownerDocument;
     var f = opts.fetch || root.fetch.bind(root);
     var headers = opts.headers || function () { return {}; };
     var pollMs = opts.pollMs == null ? 2000 : opts.pollMs;
-    var current = null, last = "", timer = 0, stopped = false;
+    var current = null, last = "", timer = 0, stopped = false, gen = 0;
     var bar = el(doc, "div", "tv-bar"), body = el(doc, "div", "tv-body-host");
     host.appendChild(bar); host.appendChild(body);
 
@@ -154,23 +152,23 @@
     function say(text) { last = ""; clear(body); body.appendChild(el(doc, "div", "tv-note", text)); }
     function pull() {
       if (stopped) return Promise.resolve();
-      var which = current, url = which ? THREAD_PREFIX + encodeURIComponent(which) + ".json" : LIST_PATH;
+      var which = current, g = gen, url = which ? THREAD_PREFIX + encodeURIComponent(which) + ".json" : LIST_PATH;
       return f(url, { cache: "no-store", headers: headers() }).then(function (res) {
-        if (stopped || which !== current) return null;
+        if (stopped || g !== gen) return null;
         if (!res.ok) { say(res.status === 403 ? "This page carries no token for the thread record." : "The thread record could not be read."); return null; }
         return res.text().then(function (t) {
-          if (stopped || which !== current || t === last) return;
+          if (stopped || g !== gen || t === last) return;
           last = t;
           var j = JSON.parse(t);
           if (which) renderThread(doc, body, threadModel(j));
           else renderList(doc, body, listModel(j), function (id) { api.open(id); });
         });
-      }).catch(function () { if (!stopped) say("The thread record could not be read."); });
+      }).catch(function () { if (!stopped && g === gen) say("The thread record could not be read."); });
     }
     function loop() { if (!stopped && pollMs > 0) timer = setTimeout(function () { pull().then(loop); }, pollMs); }
     var api = {
-      open: function (id) { current = id; last = ""; paintBar(); return pull(); },
-      back: function () { current = null; last = ""; paintBar(); return pull(); },
+      open: function (id) { current = id; gen++; last = ""; paintBar(); return pull(); },
+      back: function () { current = null; gen++; last = ""; paintBar(); return pull(); },
       stop: function () { stopped = true; clearTimeout(timer); }
     };
     paintBar();

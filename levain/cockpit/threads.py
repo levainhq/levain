@@ -4,8 +4,9 @@ Pure readers over ``<directory>/dispatch.db`` opened ``mode=ro``: this module ne
 trigger, and writes nothing. A thread's stream is :func:`levain.coordinator.chat.timeline`: the "before the chat
 record" block, then the merged stream in ``gseq`` order, the only order a thread view promises (no ordering by
 ``at`` across it). A tool call stays open until its own completion event. A driver without ``catch_up`` shows as a
-``gap``. A card is the ``queue.db`` request an approval event names; it is a link to the consent body route, never a
-copy of the request. An operator line is ``unverified``: no signature check exists on the record.
+``gap``. An approval event is an inert line: the record holds no correlation from a vendor control-request id to a
+queue request, so the view draws no link and names no card. An operator line is ``unverified``: no signature check
+exists on the record. A store missing a table degrades only the part that table feeds.
 
 ``serve_threads`` is the handler a server mount calls; it holds no HTTP of its own."""
 from __future__ import annotations
@@ -26,12 +27,10 @@ from levain.coordinator.store import CoordError
 THREADS_LIST_PATH = "/cockpit/threads.json"
 THREAD_PREFIX = "/cockpit/thread/"
 THREAD_SUFFIX = ".json"
-CONSENT_PREFIX = "/cockpit/consent/"        # the existing consent body route a card links to
 VIEW_OWNER = "cockpit:thread-view"          # the owner whose composer the read-only view reports
 LIST_MAX = 200
 _THREAD_ID = re.compile(r"th-[0-9a-f]{32}")
-_CARD_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
-_CARD_KINDS = ("vendor_approval_request", "vendor_approval_resolved")
+_APPROVAL_KINDS = ("vendor_approval_request", "vendor_approval_resolved")
 
 
 def is_threads_path(path: str) -> bool:
@@ -60,24 +59,45 @@ def _composer(conn: sqlite3.Connection, thread_id: str) -> tuple[str | None, dic
         "ORDER BY l.gseq DESC LIMIT 1", (thread_id,)).fetchone()
     if row is None:
         return None, None
-    c = chat.composer_state(conn, utc_stamp(datetime.now(timezone.utc)), row[0], VIEW_OWNER, attached=False)
+    if not (_has(conn, "chat_messages") and _has(conn, "chat_outbox_events")):
+        return row[0], None
+    try:
+        c = chat.composer_state(conn, utc_stamp(datetime.now(timezone.utc)), row[0], VIEW_OWNER, attached=False)
+    except sqlite3.OperationalError:        # a table composer_state reads past the two checked above is missing
+        return row[0], None
     return row[0], {"state": c.state, "why": c.why, "holder": c.holder, "reenable": c.reenable,
                     "unresolved": list(c.unresolved)}
 
 
+def _chat_readable(conn: sqlite3.Connection) -> bool:
+    """Whether ``chat_timeline`` can be read: the view exists and every table it joins is present."""
+    try:
+        conn.execute("SELECT 1 FROM chat_timeline LIMIT 1").fetchall()
+    except sqlite3.OperationalError:
+        return False
+    return True
+
+
 def thread_list(directory: Path | str) -> dict[str, Any]:
-    """Every thread with a worker launch or a chat record, newest activity first (at most ``LIST_MAX``)."""
+    """Every thread with a worker launch or a chat record, newest activity first (at most ``LIST_MAX``). Activity is
+    the larger of the thread's latest chat ``gseq`` and its latest worker launch's ``gseq``, so a new launch is
+    ordered by when it began."""
     conn = _open(directory)
     if conn is None:
         return {"threads": [], "truncated": False}
     try:
         conn.execute("BEGIN")
         try:
-            if not (_has(conn, "threads") and _has(conn, "chat_timeline")):
+            if not _has(conn, "threads"):
                 return {"threads": [], "truncated": False}
+            chat_ok = _chat_readable(conn)
+            chat_g = "(SELECT MAX(c.gseq) FROM chat_timeline c WHERE c.thread_id = t.thread_id)" if chat_ok else "NULL"
+            launch_g = ("(SELECT MAX(l.gseq) FROM launches l, json_each(l.threads) j WHERE j.value = t.thread_id "
+                        "AND l.role = 'worker')") if _has(conn, "launches") else "NULL"
             rows = conn.execute(
-                "SELECT t.thread_id, (SELECT MAX(gseq) FROM chat_timeline c WHERE c.thread_id = t.thread_id) AS g "
-                "FROM threads t ORDER BY g IS NULL, g DESC, t.thread_id LIMIT ?", (LIST_MAX + 1,)).fetchall()
+                f"SELECT thread_id, cg FROM (SELECT t.thread_id AS thread_id, {chat_g} AS cg, {launch_g} AS lg "
+                "FROM threads t) WHERE cg IS NOT NULL OR lg IS NOT NULL "
+                "ORDER BY MAX(COALESCE(cg, 0), COALESCE(lg, 0)) DESC, thread_id LIMIT ?", (LIST_MAX + 1,)).fetchall()
             out = []
             for thread_id, latest in rows[:LIST_MAX]:
                 at = conn.execute("SELECT at FROM chat_timeline WHERE thread_id = ? AND gseq = ?",
@@ -94,16 +114,18 @@ def thread_list(directory: Path | str) -> dict[str, Any]:
 
 def _event_facts(conn: sqlite3.Connection, launches: set[str]) -> tuple[dict[tuple[str, str], tuple[str | None, int, int]], bool]:
     """``({(launch_id, key): (call_id, truncated, backfill)}, gap)``; ``gap`` is true when any launch's latest cursor
-    row says the driver could not catch up, or the stream holds a ``gap`` event."""
+    row says the driver could not catch up, or the stream holds a ``gap`` event. A table the store lacks adds nothing."""
     facts: dict[tuple[str, str], tuple[str | None, int, int]] = {}
     gap = False
+    has_events, has_cursors = _has(conn, "chat_events"), _has(conn, "chat_cursors")
     for launch in launches:
-        for key, call_id, truncated, backfill, kind in conn.execute(
-                "SELECT vendor_event_key, call_id, truncated, backfill, kind FROM chat_events WHERE launch_id = ?",
-                (launch,)):
-            facts[(launch, key)] = (call_id, truncated, backfill)
-            gap = gap or kind == "gap"
-        if _has(conn, "chat_cursors"):
+        if has_events:
+            for key, call_id, truncated, backfill, kind in conn.execute(
+                    "SELECT vendor_event_key, call_id, truncated, backfill, kind FROM chat_events WHERE launch_id = ?",
+                    (launch,)):
+                facts[(launch, key)] = (call_id, truncated, backfill)
+                gap = gap or kind == "gap"
+        if has_cursors:
             last = conn.execute("SELECT gap FROM chat_cursors WHERE launch_id = ? ORDER BY seq DESC LIMIT 1",
                                 (launch,)).fetchone()
             gap = gap or bool(last and last[0])
@@ -111,25 +133,24 @@ def _event_facts(conn: sqlite3.Connection, launches: set[str]) -> tuple[dict[tup
 
 
 def _item(row: chat.TimelineRow, facts: Mapping[tuple[str, str], tuple[str | None, int, int]],
-          done: set[str]) -> dict[str, Any]:
+          done: set[tuple[str, str]]) -> dict[str, Any]:
     call_id, truncated, backfill = facts.get((row.launch_id or "", row.ref_id), (None, 0, 0))
-    item: dict[str, Any] = {"gseq": row.gseq, "kind": row.kind, "source": row.source, "ref": row.ref_id,
+    # an approval's ref is the kind alone: the vendor's control-request id is not a queue request id, so it is not offered
+    ref = row.ref_id.partition(":")[0] if row.kind in _APPROVAL_KINDS else row.ref_id
+    item: dict[str, Any] = {"gseq": row.gseq, "kind": row.kind, "source": row.source, "ref": ref,
                             "launch_id": row.launch_id, "status": row.status, "body": row.body, "at": row.at,
                             "echo_of": row.echo_of, "truncated": bool(truncated), "backfill": bool(backfill)}
     if row.kind == "message" and row.source == "operator":
         item["unverified"] = True       # no signature check exists on the record, so the view never says "verified"
     if row.kind == "vendor_tool_call" and call_id:
-        item["tool"] = {"call_id": call_id, "open": call_id not in done}
-    if row.kind in _CARD_KINDS:
-        card = row.ref_id.partition(":")[2]
-        if _CARD_ID.fullmatch(card):
-            item["card"] = {"id": card, "href": CONSENT_PREFIX + urllib.parse.quote(card, safe="") + ".json"}
+        item["tool"] = {"call_id": call_id, "open": (row.launch_id or "", call_id) not in done}
     return item
 
 
 def thread_stream(directory: Path | str, thread_id: str) -> dict[str, Any] | None:
     """One thread: ``before`` (older replies, by ``at`` among themselves), ``stream`` (``gseq`` order), the ``gap``
-    flag and the composer; None for a thread the store does not hold."""
+    flag and the composer; None for a thread the store does not hold. A completion belongs to its own launch: two
+    launches may reuse a ``call_id``."""
     if _THREAD_ID.fullmatch(thread_id) is None:
         return None
     conn = _open(directory)
@@ -138,16 +159,19 @@ def thread_stream(directory: Path | str, thread_id: str) -> dict[str, Any] | Non
     try:
         conn.execute("BEGIN")
         try:
-            if not (_has(conn, "threads") and _has(conn, "chat_timeline")):
+            if not _has(conn, "threads"):
                 return None
             try:
                 before, merged = chat.timeline(conn, thread_id)
             except CoordError:
                 return None
+            except sqlite3.OperationalError:    # a table the timeline reads is missing: no lines, the rest still answers
+                before, merged = [], []
             launches = {r[0] for r in conn.execute(
-                "SELECT l.launch_id FROM launches l, json_each(l.threads) j WHERE j.value = ?", (thread_id,))}
+                "SELECT l.launch_id FROM launches l, json_each(l.threads) j WHERE j.value = ?",
+                (thread_id,))} if _has(conn, "launches") else set()
             facts, gap = _event_facts(conn, launches)
-            done = {c for (_l, k), (c, _t, _b) in facts.items() if k.startswith("tool_result:") and c}
+            done = {(lid, c) for (lid, k), (c, _t, _b) in facts.items() if k.startswith("tool_result:") and c}
             launch, composer = _composer(conn, thread_id)
             return {"thread_id": thread_id, "launch_id": launch, "composer": composer, "gap": gap,
                     "before": [_item(r, facts, done) for r in before],
@@ -170,7 +194,7 @@ def serve_threads(path: str, query: str, *, directory: Path | str) -> tuple[int,
             if body is None:
                 return 404, {"error": "not_found", "message": "no such thread recorded"}
             return 200, body
-    except (sqlite3.Error, CoordError):
+    except Exception:      # the boundary: whatever broke, the caller gets the fixed sentence and no detail
         return 500, {"error": "internal", "message": "the thread record could not be read"}
     return 404, {"error": "not_found", "message": "no such thread route"}
 
