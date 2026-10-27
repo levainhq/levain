@@ -1183,8 +1183,8 @@ def close_subject(conn: sqlite3.Connection, *, subject: str, record: dict, state
                   reason: str | None = None, result: str | None = None) -> str:
     """D92 / I11: write ``record`` as ``subject``'s receipt AND its terminal row, in one statement (the
     ``close_subject_do`` trigger refuses it unless exactly one terminal row carries the receipt). ``state`` is an
-    effect's ``done`` | ``unknown``; ``reason`` a run's or request's close reason; ``result`` an effect's result
-    text. The record is strict JSON (no NaN or Infinity: ``receipts_content`` refuses it, R13-8). Returns the
+    effect's ``done`` | ``unknown`` | ``not_started`` (with result ``not_started:<why>``); ``reason`` a run's or
+    request's close reason; ``result`` an effect's result text. The record is strict JSON (no NaN or Infinity: ``receipts_content`` refuses it, R13-8). Returns the
     receipt id (``record["id"]``); a record with no id is a ``ValueError`` before anything is written."""
     _in_write(conn, "close_subject")
     if not isinstance(record, dict) or record.get("id") is None:
