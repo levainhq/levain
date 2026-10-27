@@ -67,8 +67,9 @@ def _receipt_id(
     )
     if subject is not None:
         # autogrant r7.0: a receipt of a subject (a /3 store) has the subject in its basis, so two subjects never
-        # share an id
-        basis = f"{subject}\x00{basis}"
+        # share an id; and its terminal_state (R15-5 S2): the ends of one attempt are built together at admission, at
+        # one created_at with one verdict, and outcome_unknown and refused must not share one
+        basis = f"{subject}\x00{action_face.get('terminal_state', '')}\x00{basis}"
     h = hashlib.sha256(basis.encode()).hexdigest()[:8]
     return f"{created_at}-{h}"
 

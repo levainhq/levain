@@ -153,8 +153,11 @@ def build_gate_face(
 ) -> dict[str, Any]:
     """Build the FILLED action-face: start from the afferent slice (which emits the exact frozen
     contract shape with the efferent fields null) and overlay only the fields the gate now knows.
-    No new keys are introduced — the durable receipt stays exactly the frozen contract (a strict
-    RECEIPT_VERSION=4 / FleetView consumer reads it unchanged).
+    This face introduces no new keys: a ``/2`` receipt stays exactly the frozen contract (a strict
+    RECEIPT_VERSION=4 / FleetView consumer reads it unchanged). A ``levain-autonomic/3`` receipt's face
+    gains exactly two keys, ``guard`` and ``grant_guard`` (null when empty), overlaid by the gate's /3
+    builder (``EfferentGate._v3_receipt``), plus ``grant`` on a policy kill's run receipt only
+    (RULINGS 1027-14 "R15-5 S2" O1; the store requires them, ``receipts_carry_guard``).
 
     ``terminal_state`` (``RECEIPT_VERSION=4`` §2.1) is the termination-MODE — ``fired`` | ``refused`` |
     ``killed`` | ``timed_out`` — orthogonal to ``gate.verdict``'s decision-CLASS (``approved`` |

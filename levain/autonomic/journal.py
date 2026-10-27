@@ -1027,6 +1027,33 @@ class RunJournal:
                              attempt, e)
         raise AssertionError("unreachable")   # the loop returns or raises
 
+    def run_guard(self, run_id: str) -> list[dict[str, Any]]:
+        """The guard a ``/3`` run was sealed with (:func:`run_seal`): what a receipt of its ``run:`` subject carries
+        as ``action_face.guard`` (``receipts_carry_guard``). ``KeyError`` for a run never admitted; ``ValueError`` on
+        a ``/2`` journal (its runs carry no seal)."""
+        if not self._v3:
+            raise ValueError("a /2 run carries no seal")
+        with self._read() as conn:
+            row = conn.execute("SELECT json_extract(seal, '$.guard') FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"run {run_id!r} was never started")
+        return json.loads(row[0]) if row[0] is not None else []
+
+    def run_closer(self, run_id: str) -> str | None:
+        """The receipt id a ``/3`` run was closed with, or None while it is open (or on a ``/2`` journal)."""
+        if not self._v3:
+            return None
+        with self._read() as conn:
+            row = conn.execute("SELECT receipt_id FROM cancels WHERE run_id = ?", (run_id,)).fetchone()
+        return row[0] if row is not None else None
+
+    def latest_receipt(self, run_id: str, effect_id: str) -> str | None:
+        """The receipt id the link's latest attempt ended with on a ``/3`` journal (None while it has not ended, or
+        has no attempt)."""
+        with self._read() as conn:
+            latest = latest_effect(conn, run_id, effect_id) if self._v3 else None
+        return latest.receipt_id if latest is not None else None
+
     def note_receipt(self, run_id: str, effect_id: str, receipt_id: str) -> None:
         """Record that the receipt for this effect was persisted, so a replay does not write another. On a ``/3``
         store an ended attempt already carries its receipt (written with its end, and final): this only checks that

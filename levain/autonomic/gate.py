@@ -58,8 +58,8 @@ from levain.autonomic.coverage import (
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
 from levain.autonomic.journal import (
-    AUTHORIZED, RECHECK, UNSIGNED_DECIDER, EffectOutcome, EffectStatus, JournalCorruptError, RunJournal, RunRef,
-    decision_key, effect_digest, hold_id_for, needs_signature,
+    AUTHORIZED, RECHECK, UNSIGNED_DECIDER, EffectEnd, EffectOutcome, EffectStatus, JournalCorruptError, Receipt,
+    RunJournal, RunRef, Terminal, V3Fire, decision_key, effect_digest, hold_id_for, needs_signature,
 )
 from levain.autonomic.kill import kill_trips
 from levain.autonomic.monitor import TrajectoryObserver, prediction_diverged
@@ -68,7 +68,7 @@ from levain.autonomic.policy import policy, risk_floor
 from levain.autonomic.posture import Posture
 from levain.autonomic.receipt import build_gate_face, build_gate_verdict
 from levain.autonomic.risk import ActionManifest, ActionRisk, UnknownAction
-from levain.autonomic.store import GateReceiptStore
+from levain.autonomic.store import GateReceiptStore, gate_record
 from levain.autonomic.transport import ConfirmDecision, ConfirmProposal, ConfirmTransport
 from levain.autonomic.trust import IntentProvenance, SignalAuth, TrustContext
 
@@ -90,6 +90,8 @@ class _Check(Enum):
 class _FireCheck:
     kind: _Check
     reason: str
+    # the policy the check read (PERMIT: the grant a /3 attempt seals; KILL: the grant whose guard tripped)
+    policy: GraduationPolicy | None = None
 
 # The confirm window: how long a proposed confirm-class action waits before the silence default
 # (sweep) resolves it (cooling-off auto-fires; confirm drops). Generous default — the operator may
@@ -190,6 +192,9 @@ class _Fence:
     value: str
     read: Callable[[sqlite3.Connection], str]
     expect: tuple | None = None
+    # the policy that authorized the fire and its cover value (the fire check's), sealed on a /3 attempt
+    grant: GraduationPolicy | None = None
+    cover: str | None = None
 
 
 def _authority_from(a: dict[str, Any]) -> AuthorityScope:
@@ -735,15 +740,17 @@ class EfferentGate:
         # trigger event through. After the binding's own kill (a kill-worthy trigger keeps that KILL receipt) and
         # after 3b (a request carrying a rung its sealed binding does not is refused without ending the run, never
         # ended by this check).
+        grant: GraduationPolicy | None = None
         if clamped is not None and cover is not None and cover != COVER_NONE:
             check = self._fire_check(request, clamped, cover)
+            grant = check.policy
             if check.kind is _Check.KILL:
                 # ``by`` is the receipt's decider (the frozen human | binding | on-loop enum), as for the binding's
                 # own kill; the policy whose guard tripped is named in the reason, which the run's cancel carries
                 kill_by = "binding" if request.authority.grantor == "binding" else "on-loop"
                 _log.warning("efferent gate KILL: %r — %s", request.action_name, check.reason)
                 return self._kill(request, created_at, posture, kill_by, request.actor_first_estimate,
-                                  reason=check.reason)
+                                  reason=check.reason, grant=check.policy)
             if check.kind is _Check.REFUSE:
                 _log.warning("efferent gate REFUSE: %r — %s", request.action_name, check.reason)
                 return self._deny(request, created_at, Posture.REFUSE_ESCALATE, check.reason)
@@ -785,7 +792,7 @@ class EfferentGate:
             fence = None
             if request.run is not None:
                 # the fence: the very risk inputs this rung was just decided from
-                fence = self._forward_fence(request, manifest_risk, risk, cover)
+                fence = self._forward_fence(request, manifest_risk, risk, cover, grant)
             return self._fire(
                 request=request, created_at=created_at, posture=posture,
                 verdict="auto", by=by, actor_first_estimate=request.actor_first_estimate,
@@ -846,7 +853,8 @@ class EfferentGate:
             try:
                 h = self._journal.hold(run.run_id, run.effect_id, digest=self._digest_of(request),
                                        pending=pending.to_dict(), at=created_at, chain=request.continuation,
-                                       chained=run.chained)
+                                       chained=run.chained,
+                                       run_receipt=self._request_cancels(request, created_at, posture))
             except Exception as e:  # noqa: BLE001 — nothing was recorded: nothing proposed, nothing fired
                 _log.error("efferent gate: journal hold FAILED (%s): %s — not proposed", type(e).__name__, e)
                 return GateOutcome(
@@ -972,6 +980,10 @@ class EfferentGate:
             # the record a person was asked about is unreadable or altered: never fire it. Reject the
             # hold (with the digest it was opened with; the record's own bytes are not trusted).
             _log.error("efferent gate resolve: INTEGRITY failure on hold %s — REJECTED (no fire)", hold_id)
+            if self._journal_v3:
+                return self._reject_v3(hold, decision, pending, created_at, Posture.REFUSE_ESCALATE,
+                                       "integrity:unreadable_pending" if pending is None else "integrity:seal_mismatch",
+                                       binding_id, open_after=pending is None)
             self._journal.decide(hold_id, approve=False, digest=hold["digest"], by=decision.by)
             if pending is None:
                 return self._refuse_open("integrity:unreadable_pending", binding_id)
@@ -994,6 +1006,9 @@ class EfferentGate:
             )
 
         def reject(posture: Posture, reason: str, **kw: Any) -> GateOutcome:
+            if self._journal_v3:
+                return self._reject_v3(hold, decision, pending, created_at, posture, reason, binding_id,
+                                       terminal=kw.get("terminal"))
             d = self._journal.decide(hold_id, approve=False, digest=hold["digest"], by=decision.by)  # type: ignore[union-attr]
             if not d.ok:
                 return self._refuse_open(f"journal:{d.reason}", binding_id)
@@ -1028,7 +1043,8 @@ class EfferentGate:
             # journal has stopped its run for good (a revoke fences it); otherwise nothing changes, since the
             # cause may be one a repair clears.
             try:
-                barrier = self._journal.peek(hold["run_id"], hold["effect_id"], digest=hold["digest"])
+                barrier = self._journal.peek(hold["run_id"], hold["effect_id"], digest=hold["digest"],
+                                             run_receipt=self._pending_cancels(pending, hold, created_at, effective))
             except KeyError:
                 return self._refuse_open("run_not_admitted", binding_id)
             if barrier is not None and barrier.status in (EffectStatus.FENCED, EffectStatus.CANCELLED):
@@ -1040,7 +1056,10 @@ class EfferentGate:
             # checked in the cancel's own transaction: one that ran (or is running) is the journal's to
             # report, and the fire below reports it without running anything.
             try:
-                started = self._journal.cancel_unstarted(hold["run_id"], hold["effect_id"], reason=stop_reason)
+                build = self._pending_cancels(pending, hold, created_at, effective)
+                stop_receipt = build(stop_reason) if build is not None else None
+                started = self._journal.cancel_unstarted(hold["run_id"], hold["effect_id"], reason=stop_reason,
+                                                         receipt=stop_receipt)
             except KeyError:
                 return self._refuse_open("run_not_admitted", binding_id)
             except Exception as e:  # noqa: BLE001
@@ -1052,6 +1071,8 @@ class EfferentGate:
                     execution=None, binding_id=binding_id,
                 )
             if started is None:
+                if stop_receipt is not None:   # /3: the close carried this refusal's receipt
+                    return self._refused_v3(effective, stop_reason, self._closed_with(hold, stop_receipt), binding_id)
                 return deny(effective, stop_reason, by="on-loop")
         elif signed_decision:
             # A person's approval that stands fires at the rung it was signed at. The journal checks it at
@@ -1065,6 +1086,31 @@ class EfferentGate:
             # was recorded at (RULINGS O-p2-1 / R15-5: the seal is max(effective, decided); the /3 store refuses an
             # attempt sealed below its decision's rung, effects_held_tied)
             posture = self._decided_rung(hold, effective)
+
+        decider_now = hold.get("by") if hold.get("decided") is True else decision.by
+        if self._journal_v3 and posture.needs_confirm and not needs_signature(decider_now):
+            # RULINGS 1027-14 "R15-5 S2" O2: a silence fire at a confirm rung needs a sealed grant on /3
+            # (effects_guarded), and the resolve path holds none: it is a refusal, closed with its receipt, never fired
+            reason = "unattended_confirm_without_grant"
+            if hold.get("decided") is not True:
+                return reject(posture, reason)
+            try:
+                build = self._pending_cancels(pending, hold, created_at, posture)
+                assert build is not None
+                stop_receipt = build(reason)
+                started = self._journal.cancel_unstarted(hold["run_id"], hold["effect_id"], reason=reason,
+                                                         receipt=stop_receipt)
+            except KeyError:
+                return self._refuse_open("run_not_admitted", binding_id)
+            except Exception as e:  # noqa: BLE001
+                _log.error("efferent gate resolve: could not close run %s (%s): %s", hold["run_id"],
+                           type(e).__name__, e)
+                return GateOutcome(posture=posture, fired=False, refused=False, deferred=False, held=True,
+                                   reason=f"cancel_unrecorded:{reason}", receipt_id=None, execution=None,
+                                   binding_id=binding_id)
+            if started is None:
+                return self._refused_v3(posture, reason, self._closed_with(hold, stop_receipt), binding_id)
+            # the effect started before: the fire below runs nothing and reports what the journal recorded
 
         signed: bytes | None = None
         if hold.get("decided") is None and needs_signature(decision.by):
@@ -1114,10 +1160,15 @@ class EfferentGate:
             # records nothing; a run that is already fenced or cancelled is a rejection (it can never
             # fire), recorded as one.
             try:
-                barrier = self._journal.peek(run.run_id, run.effect_id, digest=self._digest_of(request))
+                barrier = self._journal.peek(run.run_id, run.effect_id, digest=self._digest_of(request),
+                                             run_receipt=self._pending_cancels(pending, hold, created_at, posture))
             except KeyError:
                 return self._refuse_open("run_not_admitted", binding_id)
             if barrier is not None:
+                if barrier.status is EffectStatus.FENCED and self._journal_v3:
+                    # RULINGS 1027-14 "R15-5 S2" O3: a fence is not a close (the fence's owner closes the run), and
+                    # a /3 rejection would close it; the decision is not written and the receipt is file-only
+                    return deny(posture, f"journal:{barrier.status.value}")
                 if barrier.status in (EffectStatus.FENCED, EffectStatus.CANCELLED):
                     return reject(posture, f"journal:{barrier.status.value}")
                 # BARRED (the registry cannot be read, or no longer grants the run) is a condition a
@@ -1194,6 +1245,69 @@ class EfferentGate:
             reason=f"approved_not_yet_run:{fired.reason}", receipt_id=None, execution=None,
             binding_id=binding_id,
         )
+
+    def _pending_cancels(self, pending: PendingAction, hold: dict[str, Any], created_at: str,
+                         posture: Posture) -> Callable[[str], Receipt] | None:
+        """:meth:`_cancel_receipts` for the run of a journaled pending (None on a ``/2`` journal)."""
+        return self._cancel_receipts(created_at=created_at, action_name=pending.action_name,
+                                     proposal_id=pending.proposal_id, context_id=pending.context_id,
+                                     query_text=pending.query_text, query_date=pending.query_date,
+                                     producers=pending.producers, authority=self._authority_of(pending),
+                                     posture=posture, run_id=hold["run_id"])
+
+    def _closed_with(self, hold: dict[str, Any], receipt: Receipt) -> str | None:
+        """``receipt``'s id when it is the one that closed the hold's run, else None (another path closed it first)."""
+        try:
+            return receipt.receipt_id if self._journal.run_closer(hold["run_id"]) == receipt.receipt_id else None  # type: ignore[union-attr]
+        except Exception as e:  # noqa: BLE001 — the close stands; only its id is unread
+            _log.error("efferent gate: run %s close not read (%s): %s", hold["run_id"], type(e).__name__, e)
+            return None
+
+    @staticmethod
+    def _refused_v3(posture: Posture, reason: str, receipt_id: str | None, binding_id: str | None) -> GateOutcome:
+        """A refusal whose receipt closed its ``/3`` run (``receipt_id``), or None when another close came first."""
+        return GateOutcome(
+            posture=posture, fired=False, refused=True, deferred=False,
+            reason=reason if receipt_id is not None else f"{reason}; run_closed_before", receipt_id=receipt_id,
+            execution=None, binding_id=binding_id,
+        )
+
+    def _reject_v3(self, hold: dict[str, Any], decision: ConfirmDecision, pending: PendingAction | None,
+                   created_at: str, posture: Posture, reason: str, binding_id: str | None, *,
+                   terminal: str | None = None, open_after: bool = False) -> GateOutcome:
+        """A rejection of a hold on a ``/3`` journal: its receipt is built first and the one write-once decision closes
+        the run with it (:func:`~levain.autonomic.journal.decide_in`); nothing is appended to the receipt file. A
+        receipt that cannot be built records nothing (the decision stays open). ``pending`` None (unreadable): the
+        receipt names only what the hold row does. ``open_after``: the outcome is a refusal that records nothing
+        further (as on ``/2``)."""
+        assert self._journal is not None
+        try:
+            if pending is not None:
+                fields = dict(action_name=pending.action_name, proposal_id=pending.proposal_id,
+                              context_id=pending.context_id, query_text=pending.query_text,
+                              query_date=pending.query_date, producers=pending.producers,
+                              authority=self._authority_of(pending))
+            else:
+                fields = dict(action_name="", proposal_id=None, context_id="", query_text="", query_date="",
+                              producers=(), authority=AuthorityScope(grantor="binding", grant="binding",
+                                                                     binding_id=hold.get("binding_id"), hops=0))
+            action_name, proposal_id = fields.pop("action_name"), fields.pop("proposal_id")
+            face = self._deny_face(**fields, verdict="denied", by=decision.by,
+                                   terminal_state=terminal or "refused", actor_first_estimate=decision.first_estimate)
+            receipt = self._run_receipt(hold["run_id"], created_at=created_at, action_name=action_name,
+                                        proposal_id=proposal_id, posture=posture, face=face)
+            d = self._journal.decide(hold["hold_id"], approve=False, digest=hold["digest"], by=decision.by,
+                                     receipt=receipt)
+        except Exception as e:  # noqa: BLE001 — a rejection with no receipt cannot be written: nothing recorded
+            _log.error("efferent gate resolve: rejection of %s not recorded (%s): %s", hold["hold_id"],
+                       type(e).__name__, e)
+            return self._refuse_open(f"reject_unrecorded:{reason}", binding_id)
+        if not d.ok:
+            return self._refuse_open(f"journal:{d.reason}", binding_id)
+        if open_after:
+            return self._refuse_open(reason, binding_id)
+        won = d.closed is not None and d.closed.terminal is Terminal.WON
+        return self._refused_v3(posture, reason, receipt.receipt_id if won else None, binding_id)
 
     @staticmethod
     def _refuse_open(reason: str, binding_id: str | None) -> GateOutcome:
@@ -1656,11 +1770,12 @@ class EfferentGate:
         return None
 
     def _forward_fence(self, request: ActionRequest, manifest_risk: ActionRisk | None,
-                       risk: ActionRisk, cover: str | None) -> _Fence:
+                       risk: ActionRisk, cover: str | None, grant: GraduationPolicy | None = None) -> _Fence:
         """The fence of a journaled request fired on the forward path: the inputs its rung was decided
         from (the binding's risk the request carries, or for an action the manifest classifies alone, the
         manifest's entry, and the clamp's cover value when it was consulted), and how to read them again at
-        admission."""
+        admission. ``grant`` is the policy the fire check read for that cover value (None when none ran): a ``/3``
+        attempt seals it with the cover."""
         assert request.run is not None
         with_binding = request.risk is not None
         value = _risk_fence(manifest_risk, risk if with_binding else None, cover)
@@ -1669,7 +1784,8 @@ class EfferentGate:
         effect_id = request.run.effect_id
         clamped = cover is not None
         return _Fence(value, lambda conn: self._fence_now(conn, request.action_name, binding_id, effect_id,
-                                                          chain, with_binding=with_binding, clamped=clamped))
+                                                          chain, with_binding=with_binding, clamped=clamped),
+                      grant=grant, cover=cover if grant is not None else None)
 
     def _unattended_approval_allowed(self, pending: PendingAction, posture: Posture,
                                      now: _dt.datetime | None = None) -> bool:
@@ -1896,7 +2012,7 @@ class EfferentGate:
             # decision on its binding is open.
             ran = self._journaled_execute(request, created_at=created_at, posture=posture,
                                           verdict=verdict, by=by, decided=decided, fence=fence,
-                                          executor=executor)
+                                          executor=executor, actor_first_estimate=actor_first_estimate)
             if isinstance(ran, GateOutcome):
                 return ran
             execution = ran
@@ -1946,7 +2062,13 @@ class EfferentGate:
         journaled effect ends its run (:meth:`_cancel_run`), unless ``cancel=False``: a refusal caused
         by a condition that can clear (the registry could not be read, the run is not admitted yet)
         must not end a run a re-delivery could finish. A cancel that cannot be recorded makes the deny
-        not terminal (:meth:`_cancel_unrecorded`)."""
+        not terminal (:meth:`_cancel_unrecorded`). On a ``/3`` journal that close carries the deny's receipt, and
+        nothing is appended to the receipt file (:meth:`_close_run_v3`)."""
+        if cancel and self._v3_run(request):
+            return self._close_run_v3(request, created_at, posture, f"denied:{reason}", reason, lambda: self._deny_face(
+                context_id=request.context_id, query_text=request.query_text, query_date=request.query_date,
+                producers=request.producers, authority=request.authority, verdict="denied", by="on-loop",
+                terminal_state="refused", actor_first_estimate=request.actor_first_estimate))
         if cancel and not self._cancel_run(request, f"denied:{reason}"):
             return self._cancel_unrecorded(request, posture, f"denied:{reason}")
         return self._deny_fields(
@@ -1955,6 +2077,107 @@ class EfferentGate:
             producers=request.producers, authority=request.authority, posture=posture,
             verdict="denied", by="on-loop", reason=reason,
             actor_first_estimate=request.actor_first_estimate,
+        )
+
+    @staticmethod
+    def _deny_face(*, context_id, query_text, query_date, producers, authority: AuthorityScope, verdict: str,
+                   by: str, terminal_state: str, actor_first_estimate: object | None,
+                   refuse_class: str | None = None) -> dict[str, Any]:
+        """The action face of a decision not to fire (a deny, a reject, a kill): no effect, no downstream id."""
+        return build_gate_face(
+            context_id=context_id, query_text=query_text, query_date=query_date, producers=producers,
+            gate=build_gate_verdict(verdict=verdict, by=by, binding_id=authority.binding_id),
+            authority=authority, terminal_state=terminal_state, downstream_id=None,
+            actor_first_estimate=actor_first_estimate, refuse_class=refuse_class,
+        )
+
+    def _v3_run(self, request: ActionRequest) -> bool:
+        """Whether ``request`` is a run's effect on a ``/3`` journal: every end of it is a receipted close there."""
+        return request.run is not None and self._journal_v3
+
+    @staticmethod
+    def _grant_record(grant: GraduationPolicy | None) -> dict[str, Any] | None:
+        """The sealed form of a graduation policy (the store's ``effects_grant_shape``): its signed terms, the id and
+        incarnation they name, and the seq that brought it in."""
+        if grant is None:
+            return None
+        return {"born": grant.born, "id": grant.grant_id, "incarnation": grant.incarnation,
+                "terms_text": grant.terms_text}
+
+    @staticmethod
+    def _v3_receipt(subject: str, *, created_at: str, action_name: str, proposal_id: str | None, posture: Posture,
+                    fired: bool, face: dict[str, Any], guard: list | None, grant_guard: list | None,
+                    grant: dict[str, Any] | None = None) -> Receipt:
+        """The receipt of a ``/3`` subject, built with the store's one builder (:func:`gate_record` with
+        ``subject``). Its face carries ``guard`` and ``grant_guard`` (null when empty), which the store requires of
+        every receipt whose subject sealed a guard (``receipts_carry_guard``), and ``grant`` only for a policy kill
+        (``receipts_kill_guard``). A ``/2`` receipt's face has neither key (:func:`build_gate_face`)."""
+        face = {**face, "guard": list(guard) if guard else None, "grant_guard": list(grant_guard) if grant_guard else None}
+        if grant is not None:
+            face["grant"] = grant
+        rid, record = gate_record(created_at=created_at, action_name=action_name, proposal_id=proposal_id,
+                                  posture=posture, fired=fired, action_face=face, subject=subject)
+        return Receipt(rid, record)
+
+    def _run_receipt(self, run_id: str, *, created_at: str, action_name: str, proposal_id: str | None,
+                     posture: Posture, face: dict[str, Any], grant: GraduationPolicy | None = None) -> Receipt:
+        """The receipt that closes ``run_id`` on a ``/3`` journal: its ``run:`` subject, the run seal's guard, and for
+        a policy kill (``grant``) that policy and its signed guard (D95)."""
+        assert self._journal is not None
+        return self._v3_receipt(f"run:{run_id}", created_at=created_at, action_name=action_name,
+                                proposal_id=proposal_id, posture=posture, fired=False, face=face,
+                                guard=self._journal.run_guard(run_id),
+                                grant_guard=list(grant.guard) if grant is not None else None,
+                                grant=self._grant_record(grant))
+
+    def _cancel_receipts(self, *, created_at: str, action_name: str, proposal_id: str | None, context_id: str,
+                         query_text: str, query_date: str, producers, authority: AuthorityScope,
+                         posture: Posture, run_id: str) -> Callable[[str], Receipt] | None:
+        """The builder of the receipt of a run close the journal makes itself (a changed digest, the held bound): a
+        refusal by the gate (``on-loop``), its reason in the cancels row. None on a ``/2`` journal (it takes none)."""
+        if not self._journal_v3:
+            return None
+
+        def build(reason: str) -> Receipt:
+            face = self._deny_face(context_id=context_id, query_text=query_text, query_date=query_date,
+                                   producers=producers, authority=authority, verdict="denied", by="on-loop",
+                                   terminal_state="refused", actor_first_estimate=None)
+            return self._run_receipt(run_id, created_at=created_at, action_name=action_name,
+                                     proposal_id=proposal_id, posture=posture, face=face)
+        return build
+
+    def _request_cancels(self, request: ActionRequest, created_at: str,
+                         posture: Posture) -> Callable[[str], Receipt] | None:
+        """:meth:`_cancel_receipts` for a journaled ``request``."""
+        if request.run is None:
+            return None
+        return self._cancel_receipts(created_at=created_at, action_name=request.action_name,
+                                     proposal_id=request.proposal_id, context_id=request.context_id,
+                                     query_text=request.query_text, query_date=request.query_date,
+                                     producers=request.producers, authority=request.authority, posture=posture,
+                                     run_id=request.run.run_id)
+
+    def _close_run_v3(self, request: ActionRequest, created_at: str, posture: Posture, close_reason: str,
+                      reason: str, face: Callable[[], dict[str, Any]], *,
+                      killed: bool = False, grant: GraduationPolicy | None = None) -> GateOutcome:
+        """A decision not to fire a ``/3`` run's effect: the run closes with this decision's receipt (one receipt, the
+        run's), nothing appended to the receipt file. A receipt that cannot be built, or a close that cannot be
+        written, makes the decision not terminal (:meth:`_cancel_unrecorded`). A run another path closed first keeps
+        that close (LOST): the outcome names no receipt of its own."""
+        assert self._journal is not None and request.run is not None
+        try:
+            receipt = self._run_receipt(request.run.run_id, created_at=created_at, action_name=request.action_name,
+                                        proposal_id=request.proposal_id, posture=posture,
+                                        face=face(), grant=grant)
+            closed = self._journal.cancel(request.run.run_id, reason=close_reason, receipt=receipt)
+        except Exception as e:  # noqa: BLE001 — nothing durable says the run is over
+            _log.error("efferent gate: could not close run %s (%s): %s", request.run.run_id, type(e).__name__, e)
+            return self._cancel_unrecorded(request, posture, close_reason)
+        won = closed is not None and closed.terminal is Terminal.WON
+        return GateOutcome(
+            posture=posture, fired=False, refused=not killed, deferred=False, killed=killed,
+            reason=reason if won else f"{reason}; run_closed_before", receipt_id=receipt.receipt_id if won else None,
+            execution=None, binding_id=request.authority.binding_id,
         )
 
     def _deny_fields(self, *, created_at, action_name, proposal_id, context_id, query_text, query_date,
@@ -1973,12 +2196,9 @@ class EfferentGate:
         ``timed_out`` for a silence-window DROP at sweep (the caller passes it). Orthogonal to
         ``verdict`` (always ``denied`` here)."""
         try:
-            face = build_gate_face(
-                context_id=context_id, query_text=query_text, query_date=query_date, producers=producers,
-                gate=build_gate_verdict(verdict=verdict, by=by, binding_id=authority.binding_id),
-                authority=authority, terminal_state=terminal_state, downstream_id=None,
-                actor_first_estimate=actor_first_estimate,
-            )
+            face = self._deny_face(context_id=context_id, query_text=query_text, query_date=query_date,
+                                   producers=producers, authority=authority, verdict=verdict, by=by,
+                                   terminal_state=terminal_state, actor_first_estimate=actor_first_estimate)
         except Exception as e:  # noqa: BLE001 — no effect fired; still never raise into the caller
             _log.error("efferent gate: deny receipt face build FAILED (%s): %s — refused, no receipt",
                        type(e).__name__, e)
@@ -2068,8 +2288,8 @@ class EfferentGate:
                            type(e).__name__, e)
                 return _FireCheck(_Check.REFUSE, "guard_unevaluable:predicate")
             if tripped:
-                return _FireCheck(_Check.KILL, f"policy_guard_kill:{grant.grant_id}:guard_{i}_tripped")
-        return _FireCheck(_Check.PERMIT, "")
+                return _FireCheck(_Check.KILL, f"policy_guard_kill:{grant.grant_id}:guard_{i}_tripped", grant)
+        return _FireCheck(_Check.PERMIT, "", grant)
 
     # =================================================================================================
     # The prediction-error KILL path (Slice 3a.5 — the autonomous unknown-danger backstop).
@@ -2101,23 +2321,29 @@ class EfferentGate:
         return None
 
     def _kill(self, request: ActionRequest, created_at: str, posture: Posture, by: str,
-              actor_first_estimate: object | None, *, reason: str) -> GateOutcome:
+              actor_first_estimate: object | None, *, reason: str,
+              grant: GraduationPolicy | None = None) -> GateOutcome:
         """Build + persist a KILLED receipt (``terminal_state=killed``, ``refuse_class=kill_triggered``;
         NO effect fired) and return a killed outcome. The autonomous monitor is the decider → the frozen
         ``gate.verdict`` is ``denied`` (the verdict enum has no ``killed`` — the MODE lives in
         ``terminal_state``, §2.1); ``by`` names the autonomous decider (on-loop / binding). Fail-soft on
         a face/persist fault (like ``_fire``/``_deny_fields``): the kill stands, the trace just drops.
         A kill of a journaled effect ends its run (:meth:`_cancel_run`); a cancel that cannot be
-        recorded makes the kill not terminal (:meth:`_cancel_unrecorded`)."""
+        recorded makes the kill not terminal (:meth:`_cancel_unrecorded`). On a ``/3`` journal that close carries the
+        kill's receipt (with ``grant``, the policy whose guard tripped, D95) and nothing is appended to the file."""
+        if self._v3_run(request):
+            return self._close_run_v3(request, created_at, posture, f"killed:{reason}", reason, lambda: self._deny_face(
+                context_id=request.context_id, query_text=request.query_text, query_date=request.query_date,
+                producers=request.producers, authority=request.authority, verdict="denied", by=by,
+                terminal_state="killed", actor_first_estimate=actor_first_estimate, refuse_class="kill_triggered"),
+                killed=True, grant=grant)
         if not self._cancel_run(request, f"killed:{reason}"):
             return self._cancel_unrecorded(request, posture, f"killed:{reason}")
         try:
-            face = build_gate_face(
-                context_id=request.context_id, query_text=request.query_text,
-                query_date=request.query_date, producers=request.producers,
-                gate=build_gate_verdict(verdict="denied", by=by, binding_id=request.authority.binding_id),
-                authority=request.authority, terminal_state="killed", downstream_id=None,
-                actor_first_estimate=actor_first_estimate, refuse_class="kill_triggered",
+            face = self._deny_face(
+                context_id=request.context_id, query_text=request.query_text, query_date=request.query_date,
+                producers=request.producers, authority=request.authority, verdict="denied", by=by,
+                terminal_state="killed", actor_first_estimate=actor_first_estimate, refuse_class="kill_triggered",
             )
         except Exception as e:  # noqa: BLE001 — never raise into the caller; the kill stood, drop the trace
             _log.error("efferent gate: kill receipt face build FAILED (%s): %s — killed, no receipt",
@@ -2172,7 +2398,9 @@ class EfferentGate:
         assert self._journal is not None
         try:
             barrier = self._journal.peek(request.run.run_id, request.run.effect_id,
-                                         digest=self._digest_of(request))
+                                         digest=self._digest_of(request),
+                                         run_receipt=self._request_cancels(request, created_at,
+                                                                           Posture.REFUSE_ESCALATE))
         except KeyError:
             return self._deny(request, created_at, Posture.REFUSE_ESCALATE, "run_not_admitted", cancel=False)
         except (JournalCorruptError, OSError) as e:
@@ -2210,7 +2438,8 @@ class EfferentGate:
 
     def _journaled_execute(self, request: ActionRequest, *, created_at: str, posture: Posture,
                            verdict: str, by: str, decided: bool, fence: _Fence | None,
-                           executor: Executor) -> ExecutionResult | GateOutcome:
+                           executor: Executor, actor_first_estimate: object | None = None,
+                           ) -> ExecutionResult | GateOutcome:
         """Run the executor through the journal. Returns the :class:`ExecutionResult` of an effect that
         ran now, or the :class:`GateOutcome` when the journal stopped or replayed it.
 
@@ -2220,7 +2449,11 @@ class EfferentGate:
         result, so a replay can write a receipt that never landed.
 
         ``executor`` is the object the caller checked, and the one called: it is not read again. A person's
-        approval of the effect is checked by the journal at admission (:meth:`_authorize_admission`)."""
+        approval of the effect is checked by the journal at admission (:meth:`_authorize_admission`).
+
+        On a ``/3`` journal the attempt is admitted with its :class:`~levain.autonomic.journal.V3Fire`
+        (:meth:`_v3_fire`): every receipt it can end with is built at admission and written with its end, so an effect
+        that ran returns its :class:`GateOutcome` here, carrying the journal's receipt id; the caller writes none."""
         assert self._journal is not None and request.run is not None
         run = request.run
         bar = None
@@ -2246,11 +2479,13 @@ class EfferentGate:
             return {"execution": _execution_record(result), "posture": posture.name,
                     "verdict": verdict, "by": by, "face": face}
 
+        v3 = self._v3_fire(request, created_at=created_at, posture=posture, verdict=verdict, by=by, fence=fence,
+                           actor_first_estimate=actor_first_estimate) if self._journal_v3 else None
         try:
             assert fence is not None
             out = self._journal.effect(run.run_id, run.effect_id, digest=self._digest_of(request),
                                        fence=fence.value, fence_now=fence.read, fn=call, needs_decision=decided,
-                                       authorize=self._authorize_admission, expect=fence.expect)
+                                       authorize=self._authorize_admission, expect=fence.expect, v3=v3)
         except Exception as e:  # noqa: BLE001 — the gate never raises
             if not called:
                 _log.error("efferent gate: run journal FAILED before the effect (%s): %s — nothing ran",
@@ -2262,12 +2497,66 @@ class EfferentGate:
                 )
             _log.error("executor %s on %r: outcome UNKNOWN (%s: %s) — poisoned, never retried",
                        getattr(executor, "name", "?"), request.action_name, type(e).__name__, e)
-            return ExecutionResult(ok=False, error=f"outcome_unknown:{type(e).__name__}: {e}")
+            unknown = ExecutionResult(ok=False, error=f"outcome_unknown:{type(e).__name__}: {e}")
+            if v3 is None:
+                return unknown
+            # the journal ended the attempt unknown with the receipt built at admission (or, when the store took no
+            # write, left it intent: POISONED, no receipt)
+            try:
+                rid = self._journal.latest_receipt(run.run_id, run.effect_id)
+            except Exception as read:  # noqa: BLE001
+                _log.error("efferent gate: unknown outcome's receipt not read (%s): %s", type(read).__name__, read)
+                rid = None
+            return GateOutcome(
+                posture=posture, fired=False, refused=False, deferred=False,
+                reason=f"execute_failed:{unknown.error}" + ("" if rid else "; receipt_persist_failed"),
+                receipt_id=rid, execution=unknown, binding_id=request.authority.binding_id,
+            )
         if out.status is EffectStatus.DONE:
-            return _execution_from_record(out.result.get("execution") if isinstance(out.result, dict) else None)
+            execution = _execution_from_record(out.result.get("execution") if isinstance(out.result, dict) else None)
+            if v3 is None:
+                return execution
+            return GateOutcome(
+                posture=posture, fired=execution.ok, refused=False, deferred=False,
+                reason="" if execution.ok else f"execute_failed:{execution.error}", receipt_id=out.receipt_id,
+                execution=execution, binding_id=request.authority.binding_id,
+            )
         if out.status is EffectStatus.REPLAYED:
             return self._replayed(request, out, created_at)
         return self._journal_stop(request, out, posture)
+
+    def _v3_fire(self, request: ActionRequest, *, created_at: str, posture: Posture, verdict: str, by: str,
+                 fence: _Fence | None, actor_first_estimate: object | None) -> V3Fire:
+        """What a ``/3`` admission of ``request`` takes: the receipt actor ``by``, the rung, the grant and cover the fire
+        check authorized it under (none on the resolve path: a person's decision needs none, and a silence decision at
+        a confirm rung is refused before it gets here), and the builders of every receipt its ends and the journal's own
+        run closes carry. The ends of one attempt get distinct ids (the subject and terminal_state are in the id's
+        basis); the dry-run ``fired`` receipt shares the real one's id, and it is dropped, never written."""
+        assert request.run is not None
+        grant = fence.grant if fence is not None else None
+        authority = request.authority
+
+        def end_receipt(e: EffectEnd) -> Receipt:
+            execution = None
+            if e.terminal_state == "fired" and isinstance(e.result, dict):
+                execution = _execution_from_record(e.result.get("execution"))
+            face = build_gate_face(
+                context_id=request.context_id, query_text=request.query_text, query_date=request.query_date,
+                producers=request.producers,
+                gate=build_gate_verdict(verdict=verdict, by=by, binding_id=authority.binding_id),
+                authority=authority, terminal_state=e.terminal_state,
+                downstream_id=execution.downstream_id if execution is not None else None,
+                actor_first_estimate=actor_first_estimate,
+            )
+            fired = execution.ok if execution is not None else e.terminal_state == "fired"
+            return self._v3_receipt(e.subject, created_at=created_at, action_name=request.action_name,
+                                    proposal_id=request.proposal_id, posture=posture, fired=fired, face=face,
+                                    guard=e.seal.get("floor"), grant_guard=e.seal.get("grant_guard"))
+
+        run_receipt = self._request_cancels(request, created_at, posture)
+        assert run_receipt is not None
+        return V3Fire(by=by, posture=posture.name, end_receipt=end_receipt, run_receipt=run_receipt,
+                      grant=self._grant_record(grant), cover=fence.cover if fence is not None else None)
 
     def _replayed(self, request: ActionRequest, out: EffectOutcome, created_at: str) -> GateOutcome:
         """The outcome for an effect that already ran in this run: the RECORDED result, the executor
