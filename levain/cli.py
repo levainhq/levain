@@ -1520,6 +1520,10 @@ def main(argv: list[str] | None = None) -> int:
 
     _register_session(subparsers)
 
+    from levain.upgrade import register as _register_upgrade
+
+    _register_upgrade(subparsers)
+
     args = parser.parse_args(argv)
     from levain.launch import api_key_lifted
 

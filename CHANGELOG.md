@@ -7,6 +7,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **`levain upgrade` (hidden, like `levain session`) upgrades Levain and its root side in one command.** It runs the
+  installer that put Levain there (pip, `pip --user`, pipx or uv; it refuses and prints what to run when it cannot tell),
+  restarts itself on the new code, stops with the clean-up commands printed if a session is stuck, then runs exactly
+  `sudo <install-helper> repair --source <package>`, so the root helper's own checks (including who may write the
+  source) all still apply. It asks for your password once, refuses to run as root or without a terminal, and
+  `--dry-run` prints what it would run and changes nothing. The first hop from 0.11.26 is still two commands, because
+  that release has no `upgrade`: `pip install -U 'levain[isolation]'`, then `levain upgrade`. Later hops are the one
+  hidden command. It is not `levain update`, which refreshes one install directory's hooks. Covered by tests that
+  drive every path through fakes (no real installer, sudo or root helper has been run by them).
 - **`levain session claude|codex --auth passthrough` (no `--login`) is no longer refused at launch.** The launcher
   accepts it for both vendors; if the start step then refuses because the slot's stored login answers as a different
   account, the supervisor says which account (from Levain's own session record, never the session's terminal output)
