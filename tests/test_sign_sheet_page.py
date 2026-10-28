@@ -815,11 +815,12 @@ def test_i1_an_open_sheet_holds_the_lease_so_a_card_tap_asks_for_no_challenge(tm
             {"eval": PARENT_X + ".click() || 1"},
             {"until": f"!{FRAME} && 1", "ms": 5000},
             {"eval": f"{CARD_OPTION_A}.click() || 1"},
-            {"until": f"/asking|confirm|challenge/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 30000, "may_timeout": True},
+            # a settle only: the virtual authenticator answers at once, so the note passes through "asking" and on to its
+            # final text between polls on a slow runner (run 40685220828); the proof the tap ran is the challenge POST below
+            {"until": f"/asking|confirm|challenge/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 5000, "may_timeout": True},
         ])
     v = out["values"]
     assert "already being asked for" in v[-5], v                   # while the sheet is up the tap does nothing
-    assert not isinstance(v[-1], dict), v                         # and after it closed the lease is back: the tap runs
     challenges = [p for p in out["posts"] if p.split(" ", 1)[0].endswith("/challenge")]
     assert len(challenges) == 1, out["posts"]
 
