@@ -11,8 +11,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   accepts it for both vendors; if the start step then refuses because the slot's stored login answers as a different
   account, the supervisor says which account (from Levain's own session record, never the session's terminal output)
   and that nothing was launched. For Codex it prints first that Codex has no server-checked identity, so Levain cannot
-  tell which account the stored login belongs to (not a check). Covered by unit tests only; not yet run on a real
-  terminal or machine.
+  tell which account the stored login belongs to (not a check). Run on a macOS VM for Claude only: a matching
+  login started Claude logged in and was parked again at the end, and a baseline naming another account was refused with
+  nothing launched and the parked login untouched. Not run: Codex, Linux, and a stored login older than about five and a
+  half hours (the token is not refreshed before the check, so an old one may be refused).
 - **A passthrough login asks whether to keep that account as the slot's baseline.** Once
   `levain session codex --auth passthrough --login` exits, Levain shows the account from its own session record (never
   the session's terminal output) and asks whether to keep it. Codex has no server-checked identity, so the baseline
