@@ -15,8 +15,9 @@ contract line (:func:`hook_contract`) and ``levain band`` (:func:`run_band`). Th
 nothing and never blocks the prompt. A seat that no human turn can reach (autonomous, D4) gets nothing.
 
 S2 (:mod:`levain.band_shorthand`): each delivered render stores a view row (``band_views``); the seat hook parses the
-human's prompt against the viewer's last view, records a full parse through ``QuestionStore.answer`` (channel ``cli``,
-``answer_context.via = 'seat'``, a note kept verbatim) and echoes ``recorded: ... refused: ...`` plus the viewer's delta
+human's prompt against the viewer's last view (its greatest render generation), records a full parse through ONE
+bounded ``QuestionStore.answer_with_context`` write (channel ``cli``, ``answer_context.via = 'seat'`` in the same
+transaction, a note kept verbatim) and echoes ``recorded: ... refused: ...`` plus the viewer's delta
 at the head of the next band; ``levain band answer`` is the same path (refused inside any agent session, Q1 (a)). A
 question with a Link is the one AUTHORITY kind S2 can see: shorthand records nothing on it (S3 routes it to its sheet).
 
@@ -50,8 +51,8 @@ from levain.band_shorthand import ItemInfo, Parse, View, parse
 from levain.cockpit.consent import utc_stamp
 from levain.consent.questions import HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select
 
-__all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "apply_plan", "format_echo", "hook_contract", "hook_prompt", "is_autonomous",
-           "last_view", "mark_closed_shown", "plan_for", "record_view", "render", "render_full", "render_with_closed",
+__all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
+           "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "record_view", "render", "render_full", "render_with_closed",
            "run_band", "run_band_answer"]
 
 COMPACT_AFTER = 12
@@ -75,9 +76,11 @@ BAND_SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'band numbers are append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS band_closed_shown_kept BEFORE DELETE ON band_closed_shown "
     "BEGIN SELECT RAISE(ABORT, 'band numbers are append-only'); END",
-    # S2 (D7): each render's view: what a viewer was shown, so an answer binds to it
+    # S2 (D7): each render's view: what a viewer was shown, so an answer binds to it. `gen` is the render's own
+    # generation (its wall-clock start, ns): the viewer's last view is its greatest gen, never its last commit
     "CREATE TABLE IF NOT EXISTS band_views (seq INTEGER PRIMARY KEY AUTOINCREMENT, viewer TEXT NOT NULL, "
-    "seen_through INTEGER NOT NULL, open_list TEXT NOT NULL, store_id TEXT NOT NULL, at TEXT NOT NULL)",
+    "seen_through INTEGER NOT NULL, open_list TEXT NOT NULL, store_id TEXT NOT NULL, at TEXT NOT NULL, "
+    "gen INTEGER NOT NULL)",
     "CREATE TRIGGER IF NOT EXISTS band_views_frozen BEFORE UPDATE ON band_views "
     "BEGIN SELECT RAISE(ABORT, 'band views are append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS band_views_kept BEFORE DELETE ON band_views "
@@ -193,11 +196,13 @@ def mark_closed_shown(store: QuestionStore, closed: list[int]) -> None:
 
 class Rendered(NamedTuple):
     """One render: the text, the ``closed`` band numbers it carries, the band numbers of the open items shown with a
-    number, and the header's ``band@`` high-water mark (0 when nothing was numbered)."""
+    number, the header's ``band@`` high-water mark (0 when nothing was numbered), and the render's generation (its
+    start, ``time.time_ns()``: what orders two views of one viewer, whatever order they are committed in)."""
     text: str
     closed: list[int]
     shown: list[int]
     hwm: int
+    gen: int
 
 
 def render_with_closed(store: QuestionStore | None = None) -> tuple[str, list[int]]:
@@ -212,13 +217,14 @@ def render_with_closed(store: QuestionStore | None = None) -> tuple[str, list[in
 def render_full(store: QuestionStore | None = None) -> Rendered:
     """:func:`render_with_closed` plus what the view row needs (:class:`Rendered`)."""
     store = store if store is not None else QuestionStore()
+    gen = time.time_ns()                      # before the snapshot: a later render has a greater gen
     deadline = time.monotonic() + HOOK_BUSY_MS / 1000
     items, numbers, closed = _read(store)
     refs = [i for i, _ in items if i not in numbers]
     if refs:
         numbers = {**numbers, **_number(store, refs, deadline)}
     if not items and not closed:
-        return Rendered("", [], [], 0)
+        return Rendered("", [], [], 0, gen)
     shown = [numbers[i] for i, _ in items if i in numbers]
     hwm = max([*shown, *(n for n, _ in closed)], default=0)
     head = [f"NEEDS YOU · {len(items)} open"]
@@ -236,7 +242,7 @@ def render_full(store: QuestionStore | None = None) -> Rendered:
             lines.extend(_item_lines(label, q, compact=pos >= COMPACT_AFTER))
         except Exception:                     # one item that will not render never drops the band (D13)
             lines.append(f"{label} UNREADABLE: question {ref} could not be read (listed, never dropped)")
-    return Rendered("\n".join(lines), [n for n, _ in closed], shown, hwm)
+    return Rendered("\n".join(lines), [n for n, _ in closed], shown, hwm, gen)
 
 
 def render(store: QuestionStore | None = None) -> str:
@@ -255,32 +261,41 @@ def _store_id_of(store: QuestionStore) -> str | None:
 
 
 def record_view(store: QuestionStore, viewer: str, seen_through: int, open_list: list[int],
-                deadline: float | None = None) -> None:
+                deadline: float | None = None, gen: int | None = None) -> None:
     """Store what ``viewer`` was just shown (D7), in one bounded write (by ``deadline``, ``time.monotonic()``; the hook
-    passes its own start + the bound, so a busy store costs the hook one bound in all). A busy lock records nothing
-    (the viewer's next answer is then refused as bound to an older view or to none: safe, never wrong)."""
+    passes its own start + the bound, so a busy store costs the hook one bound in all). ``gen``: the render's
+    generation (:class:`Rendered`; default now); the viewer's last view is the greatest gen, so a render committed
+    late never replaces a newer one. A view with nothing open is not written when the viewer's last view already had
+    nothing open (no row per empty prompt). A busy lock records nothing (the viewer's next answer is then refused
+    as bound to an older view or to none: safe, never wrong)."""
     sid = _store_id_of(store)
     if sid is None:
         return
+    if not open_list:
+        prev = last_view(store, viewer)
+        if prev is not None and prev.store_id == sid and not prev.open_list:
+            return
     try:
         with store._write_by(deadline if deadline is not None else time.monotonic() + HOOK_BUSY_MS / 1000) as conn:
             for stmt in BAND_SCHEMA:
                 conn.execute(stmt)
-            conn.execute("INSERT INTO band_views (viewer, seen_through, open_list, store_id, at) VALUES (?, ?, ?, ?, ?)",
+            conn.execute("INSERT INTO band_views (viewer, seen_through, open_list, store_id, at, gen) "
+                         "VALUES (?, ?, ?, ?, ?, ?)",
                          (viewer, int(seen_through), json.dumps(sorted(open_list)), sid,
-                          utc_stamp(_now_utc(store._clock))))
+                          utc_stamp(_now_utc(store._clock)), int(gen if gen is not None else time.time_ns())))
     except sqlite3.OperationalError as exc:
         if not _busy(exc):
             raise
 
 
 def last_view(store: QuestionStore, viewer: str) -> View | None:
-    """``viewer``'s most recent view, or ``None`` (never shown a band, or no views table yet)."""
+    """``viewer``'s newest view (the greatest render generation), or ``None`` (never shown a band, or no views table
+    yet)."""
     with store._peek() as conn:
         if conn is None or "band_views" not in _tables(conn):
             return None
         row = conn.execute("SELECT seen_through, open_list, store_id FROM band_views WHERE viewer = ? "
-                           "ORDER BY seq DESC LIMIT 1", (viewer,)).fetchone()
+                           "ORDER BY gen DESC, seq DESC LIMIT 1", (viewer,)).fetchone()
     if row is None:
         return None
     return View(int(row[0]), tuple(int(n) for n in json.loads(row[1])), row[2])
@@ -325,43 +340,62 @@ def plan_for(store: QuestionStore, viewer: str, text: str) -> tuple[Parse, View 
     return plan, view, questions
 
 
+class Applied(NamedTuple):
+    """What :func:`apply_plan` did: the labels recorded, the refusal texts, and the echo that says both."""
+    recorded: list[str]
+    refused: list[str]
+    echo: str
+
+
 def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question], *, viewer: str, via: str,
-               seen_through: int) -> tuple[list[str], list[str]]:
-    """Record ``plan.actions`` through the question store's own ``answer`` (channel ``cli``, the human channel a
-    terminal or a seat's typing is) and write each one's ``answer_context`` sidecar (via, viewer, the view's
-    ``seen_through``, the note verbatim). Returns ``(recorded labels, refusal texts)`` (the parser's refusals first).
-    An item closed since the view, or an error on one item, is refused for that item alone."""
+               seen_through: int, deadline: float | None = None) -> Applied:
+    """Record ``plan.actions`` with their ``answer_context`` sidecars (via, viewer, the view's ``seen_through``, the
+    note verbatim) through ONE :meth:`QuestionStore.answer_with_context` write (channel ``cli``, the human channel a
+    terminal or a seat's typing is): an answer and its context are stored together or not at all, and the lock is
+    waited for until ``deadline`` (``time.monotonic()``; the hook passes its own, ``None`` the ordinary wait). An
+    item closed since the view, or refused by the store, is refused for that item alone; the lock busy at the
+    deadline (or any store failure) records nothing and refuses each item. It never raises once it is called:
+    the echo it returns always says what was recorded."""
     recorded: list[str] = []
     refused = [r.reason for r in plan.refused]
+    todo: list[tuple[Any, dict[str, Any]]] = []
     for act in plan.actions:
-        q = questions.get(act.n)
         try:
+            q = questions.get(act.n)
             if q is None:
                 raise ValueError(f"{act.n} was not open in the band you saw; nothing recorded for it")
-            now = store.get(q.id)
-            if now is not None and now.answer is not None:
-                a = now.answer
-                what = _letter_of(now, a.value) if a.kind == "option" else "text"
+            if q.answer is not None:                          # closed in the snapshot the plan was made from
+                a = q.answer
+                what = _letter_of(q, a.value) if a.kind == "option" else "text"
                 refused.append(f"{act.n} was already answered ({what}, via {a.channel}, {a.answered_at})")
                 continue
+            entry: dict[str, Any] = {"ref": q.id, "via": via, "viewer": viewer, "seen_through": seen_through,
+                                     "note": act.note}
             if act.text is not None:
-                store.answer(q.id, text=act.text, channel="cli")
+                entry["text"] = act.text
             else:
-                key = q.options["abcdef".index(act.pick or "")][0]
-                store.answer(q.id, option=key, channel="cli")
+                entry["option"] = q.options[_LETTERS.index(act.pick or "")][0]
+            todo.append((act, entry))
         except Exception as exc:                              # one item's failure never costs the others
             refused.append(f"{act.n}: {exc}")
-            continue
-        recorded.append(act.label)
+    if todo:
         try:
-            with store._write() as conn:
-                for stmt in BAND_SCHEMA:
-                    conn.execute(stmt)
-                conn.execute("INSERT INTO answer_context (question_id, via, viewer, seen_through, note) "
-                             "VALUES (?, ?, ?, ?, ?)", (q.id, via, viewer, seen_through, act.note))
-        except Exception as exc:                              # the answer stands; only its context is lost
-            refused.append(f"{act.n}: recorded, but its context could not be saved ({type(exc).__name__})")
-    return recorded, refused
+            results: list[Any] = store.answer_with_context([e for _, e in todo], channel="cli", schema=BAND_SCHEMA,
+                                                           deadline=deadline)
+        except Exception as exc:                              # rolled back whole: nothing of it was stored
+            why = ("the question store stayed busy" if isinstance(exc, sqlite3.OperationalError) and _busy(exc)
+                   else f"the question store failed ({type(exc).__name__})")
+            results = [ValueError(f"{why}; nothing recorded for it")] * len(todo)
+        for (act, _), res in zip(todo, results):
+            if isinstance(res, Exception):
+                refused.append(f"{act.n}: {res}")
+            else:
+                recorded.append(act.label)
+    try:
+        echo = format_echo(recorded, refused, via, plan.hint)
+    except Exception:                                         # what was recorded is said, whatever the formatting
+        echo = "[Levain band answer] recorded: " + (", ".join(recorded) or "nothing")
+    return Applied(recorded, refused, echo)
 
 
 def format_echo(recorded: list[str], refused: list[str], via: str, hint: str | None = None) -> str:
@@ -383,18 +417,18 @@ def _is_relay(prompt: str, environ: Mapping[str, str]) -> bool:
     return environ.get("LEVAIN_TURN") == "relay" or prompt.lstrip().startswith("levain:")
 
 
-def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mapping[str, str]) -> str:
-    """Parse the human's prompt text; on a full parse record it (via ``seat``) and return the echo. A prompt that
-    is no answer line, a relay turn or an empty one: ``""``. Raises on a store that cannot be read (nothing is then
-    recorded)."""
+def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mapping[str, str],
+                 deadline: float | None = None) -> str:
+    """Parse the human's prompt text; on a full parse record it (via ``seat``, the lock waited for until
+    ``deadline``) and return the echo. A prompt that is no answer line, a relay turn or an empty one: ``""``. Raises
+    only before anything is recorded (a store that cannot be read); :func:`apply_plan` never raises."""
     if not isinstance(prompt, str) or not prompt.strip() or _is_relay(prompt, environ):
         return ""
     plan, view, questions = plan_for(store, viewer, prompt)
     if not plan.matched:
         return format_echo([], [], "seat", plan.hint) if plan.hint else ""
-    recorded, refused = apply_plan(store, plan, questions, viewer=viewer, via="seat",
-                                   seen_through=view.seen_through if view else 0)
-    return format_echo(recorded, refused, "seat", plan.hint)
+    return apply_plan(store, plan, questions, viewer=viewer, via="seat",
+                      seen_through=view.seen_through if view else 0, deadline=deadline).echo
 
 
 def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> str:
@@ -474,10 +508,11 @@ def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None) -> tuple
         viewer = f"claude_code:{payload['session_id']}"
     except Exception:
         return "", _no_commit
+    deadline = t0 + HOOK_BUSY_MS / 1000       # ONE bound for the hook's writes: the answers, then the view row
     echo = ""
     try:
-        echo = _seat_answer(store, viewer, payload.get("prompt"), env)
-    except Exception:                         # fail open: the prompt passes untouched
+        echo = _seat_answer(store, viewer, payload.get("prompt"), env, deadline)
+    except Exception:                         # fail open before anything is recorded: the prompt passes untouched
         echo = ""
     try:
         prev = last_view(store, viewer)
@@ -499,7 +534,7 @@ def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None) -> tuple
         except Exception:
             pass
         try:
-            record_view(store, viewer, r.hwm, r.shown, deadline=t0 + HOOK_BUSY_MS / 1000)
+            record_view(store, viewer, r.hwm, r.shown, deadline=deadline, gen=r.gen)
         except Exception:
             pass
 
@@ -525,7 +560,7 @@ def run_band(args: argparse.Namespace) -> int:
         return 1
     print(r.text or "NEEDS YOU · nothing open")
     try:
-        record_view(store, "cli", r.hwm, r.shown)
+        record_view(store, "cli", r.hwm, r.shown, gen=r.gen)
     except Exception:
         pass
     return 0
@@ -547,13 +582,12 @@ def run_band_answer(args: argparse.Namespace) -> int:
             why = plan.hint or "the whole line must be band answers, e.g. `1a, 2: rec`"
             print(f"levain band answer: refused: {why}; nothing was recorded", file=sys.stderr)
             return EXIT_REFUSED
-        recorded, refused = apply_plan(store, plan, questions, viewer="cli", via="cli",
-                                       seen_through=view.seen_through if view else 0)
     except Exception as exc:
         print(f"levain band answer: refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
-    print(format_echo(recorded, refused, "cli").replace("[Levain band answer] ", "levain band answer: "))
-    return 0 if recorded else EXIT_REFUSED
+    done = apply_plan(store, plan, questions, viewer="cli", via="cli", seen_through=view.seen_through if view else 0)
+    print(done.echo.replace("[Levain band answer] ", "levain band answer: "))
+    return 0 if done.recorded else EXIT_REFUSED
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:

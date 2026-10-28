@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from levain import band_view
+from levain.consent import band as consent_band
 from levain.consent.band import run_question
 from levain.consent.questions import Link, QuestionStore
 
@@ -14,11 +15,16 @@ OPTS = [("fix", "fixed 30 s"), ("exp", "exponential"), ("none", "fail loud")]
 SEAT = {"session_id": "seat-1"}
 
 
+PLAIN_TERMINAL = [(1111, ["-zsh"]), (1000, ["/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"])]
+
+
 @pytest.fixture(autouse=True)
 def human_terminal(monkeypatch):
-    """Tests run as a human's own terminal unless one says otherwise."""
-    for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDECODE", "LEVAIN_TURN"):
+    """Tests run as a human's own terminal unless one says otherwise: no agent variable and a process tree of a
+    shell under Terminal (never this test run's own tree, which runs under an agent)."""
+    for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDECODE", "CODEX_SANDBOX", "LEVAIN_TURN"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(consent_band, "_ancestors", lambda: iter(PLAIN_TERMINAL))
 
 
 @pytest.fixture
@@ -161,8 +167,8 @@ def test_store_id_mismatch_is_refused_and_records_nothing(store, env):
     ask(store)
     prompt(env, "hello")
     with sqlite3.connect(store.path) as c:                      # a view from another store (a deleted-and-rebuilt db)
-        c.execute("INSERT INTO band_views (viewer, seen_through, open_list, store_id, at) VALUES "
-                  "('claude_code:seat-1', 1, '[1]', 'qs-someone-else', '2026-10-28T00:00:00Z')")
+        c.execute("INSERT INTO band_views (viewer, seen_through, open_list, store_id, at, gen) VALUES "
+                  "('claude_code:seat-1', 1, '[1]', 'qs-someone-else', '2026-10-28T00:00:00Z', 9e18)")
     out = prompt(env, "1a")
     assert answers(store) == [] and "another question store" in out
 
@@ -297,3 +303,150 @@ def test_levain_band_answer_is_registered_in_the_cli(qdir, store, monkeypatch, c
     ns = parser.parse_args(["band", "--queue-dir", str(qdir), "answer", "1a"])
     assert ns.func is band_view.run_band_answer and ns.line == "1a" and ns.queue_dir == qdir
     assert parser.parse_args(["band", "--queue-dir", str(qdir)]).func is band_view.run_band
+
+
+# --- fix round 1 (L3 band2 r1) ---------------------------------------------------------------------------------------
+CODEX_CHILD = [(10, ["/bin/bash", "-lc", "levain band answer 1a"]), (42, ["/opt/homebrew/bin/codex", "exec", "go"]),
+               *PLAIN_TERMINAL]
+CLAUDE_CHILD = [(10, ["/bin/zsh", "-c", "levain band answer 1a"]), (42, ["claude", "-p"]), *PLAIN_TERMINAL]
+
+
+@pytest.mark.parametrize("how", ["codex-ancestor", "codex-sandbox", "claude-ancestor"])
+def test_a_marker_less_agent_child_is_refused_on_both_answer_verbs(store, qdir, monkeypatch, capsys, how):
+    """L3 r1 HIGH (codex): a Codex child with no CODEX_THREAD_ID (a `codex` ancestor, or CODEX_SANDBOX where the
+    process tree cannot be read) was named Codex by `levain ask` and still let through as the operator."""
+    q = ask(store)
+    band_view.run_band(argparse.Namespace(queue_dir=qdir))
+    if how == "codex-sandbox":
+        monkeypatch.setenv("CODEX_SANDBOX", "danger-full-access")
+        monkeypatch.setattr(consent_band, "_ancestors", lambda: iter(()))
+    else:
+        monkeypatch.setattr(consent_band, "_ancestors",
+                            lambda: iter(CODEX_CHILD if how == "codex-ancestor" else CLAUDE_CHILD))
+    want = "claude_code" if how == "claude-ancestor" else "codex"
+    # ONE detector: the fence and the naming of `levain ask` agree
+    assert consent_band.agent_process() == want == consent_band._agent_and_session(None, None)[0]
+    assert consent_band.agent_session_caller()
+    assert band_view.run_band_answer(argparse.Namespace(queue_dir=qdir, line="1a")) == 2
+    ns = argparse.Namespace(question_cmd="answer", ref=str(q.n), option="fix", text=None, deliver=False,
+                            queue_dir=qdir, json=False)
+    assert _question_answer(ns) == 2
+    assert answers(store) == [] and context(store) == []
+    assert "agent session" in capsys.readouterr().err
+
+
+def test_a_plain_terminal_is_no_agent_and_answers(store, qdir, capsys):
+    ask(store)
+    assert consent_band.agent_process() is None and not consent_band.agent_session_caller()
+    band_view.run_band(argparse.Namespace(queue_dir=qdir))
+    assert band_view.run_band_answer(argparse.Namespace(queue_dir=qdir, line="1a")) == 0
+    assert answers(store) == [(1, "option", "fix", "cli")]
+
+
+def test_band_answer_refuses_a_blank_line_then_more(store, qdir, capsys):
+    """L3 r1 MED (codex): a blank line ends the block; whole-line mode refuses what follows it."""
+    ask(store)
+    ask(store)
+    band_view.run_band(argparse.Namespace(queue_dir=qdir))
+    assert band_view.run_band_answer(argparse.Namespace(queue_dir=qdir, line="1a\n\n2b")) == 2
+    assert answers(store) == []
+
+
+def test_an_answer_and_its_context_are_one_write_a_failed_context_leaves_no_answer(store, env):
+    """L3 r1 MED (codex): the answer committed before its answer_context; a failure between left it without
+    provenance, and closed for good."""
+    ask(store, "one")
+    q2 = ask(store, "two")
+    prompt(env, "hello")
+    with sqlite3.connect(store.path) as c:
+        c.execute(f"CREATE TRIGGER test_no_context BEFORE INSERT ON answer_context WHEN NEW.question_id = '{q2.id}' "
+                  "BEGIN SELECT RAISE(ABORT, 'the disk said no'); END")
+    out = prompt(env, "1a, 2b")
+    assert answers(store) == [(1, "option", "fix", "cli")]
+    assert [n for n, *_ in context(store)] == [1]
+    assert store.get(q2.id).answer is None                       # still open: it can be answered again
+    assert "recorded: 1a (you, seat)" in out and "2: " in out and "refused" in out
+
+
+def test_the_store_owns_the_validation_of_an_answer_and_its_context(store, env):
+    from levain.cockpit.consent import ConsentError
+
+    q1 = ask(store, "one")
+    q2 = ask(store, "two")
+    prompt(env, "hello")                                          # the band's tables exist
+    base = {"viewer": "v", "seen_through": 2, "note": None}
+    got = store.answer_with_context([{**base, "ref": q1.id, "option": "fix", "via": "an-agent"},
+                                     {**base, "ref": q2.id, "option": "nope", "via": "cli"},
+                                     {**base, "ref": q2.id, "option": "exp", "via": "cli"}],
+                                    channel="cli", schema=band_view.BAND_SCHEMA)
+    assert isinstance(got[0], ConsentError) and "via" in str(got[0])
+    assert isinstance(got[1], ConsentError) and got[2].value == "exp"
+    assert answers(store) == [(2, "option", "exp", "cli")] and context(store) == [(2, "cli", "v", 2, None)]
+    with pytest.raises(ConsentError):
+        store.answer_with_context([], channel="seat")              # `seat` is a via, never an answers channel
+
+
+@pytest.mark.timeout(120)
+def test_a_locked_store_costs_the_hook_one_bound_not_a_30_s_wait_per_item(store, env, monkeypatch):
+    """L3 r1 HIGH (codex): each answer and context write waited the ordinary 30 s for the lock."""
+    import time
+
+    monkeypatch.setattr(band_view, "HOOK_BUSY_MS", 300)
+    for i in range(3):
+        ask(store, f"q{i}")
+    prompt(env, "hello")
+    holder = sqlite3.connect(store.path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        t = time.monotonic()
+        out, commit = band_view.hook_prompt({"session_id": "seat-1", "prompt": "1a, 2b, 3c"}, env)
+        commit()
+        took = time.monotonic() - t
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert took < 3.0, took
+    assert answers(store) == []
+    assert "recorded: nothing" in out and "busy" in out
+    assert "recorded: 1a (you, seat), 2b (you, seat), 3c (you, seat)" in prompt(env, "1a, 2b, 3c")   # retry works
+
+
+def test_an_older_render_committed_late_never_replaces_the_newer_view(store):
+    """L3 r1 MED (codex): views were ordered by commit, so a late commit of an older render became last_view."""
+    ask(store, "one")
+    old = band_view.render_full(store)
+    ask(store, "two")
+    new = band_view.render_full(store)
+    band_view.record_view(store, "v", new.hwm, new.shown, gen=new.gen)
+    band_view.record_view(store, "v", old.hwm, old.shown, gen=old.gen)  # delivered first, committed last
+    assert band_view.last_view(store, "v").open_list == (1, 2)
+
+
+def test_recorded_answers_are_said_even_when_the_echo_cannot_be_formatted(store, env, monkeypatch):
+    """L3 r1 MED (complement): an error after recording set the echo to "" and the operator was told nothing."""
+    two_seen(store, env)
+
+    def boom(*a, **k):
+        raise RuntimeError("echo broke")
+
+    monkeypatch.setattr(band_view, "format_echo", boom)
+    out = prompt(env, "1a, 2b")
+    assert len(answers(store)) == 2
+    assert "recorded: 1a, 2b" in out
+
+
+def _views(store):
+    with sqlite3.connect(store.path) as c:
+        return c.execute("SELECT seen_through, open_list FROM band_views WHERE viewer = 'claude_code:seat-1' "
+                         "ORDER BY seq").fetchall()
+
+
+def test_an_empty_band_writes_its_view_once_not_on_every_prompt(store, env):
+    """L3 r1 LOW-MED (complement): a band_views row on every prompt, empty band included."""
+    q = ask(store)
+    prompt(env, "hello")
+    store.answer(q.id, option="fix", channel="phone")
+    prompt(env, "hello")                                          # the closed notice: a view with nothing open
+    for _ in range(4):
+        assert prompt(env, "hello") == ""
+    assert _views(store) == [(1, "[1]"), (1, "[]")]

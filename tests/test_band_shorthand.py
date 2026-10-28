@@ -172,3 +172,53 @@ def test_note_attaches_to_the_entry_before_it_only():
 def test_repeat_with_a_note_keeps_the_note():
     p = run("1a\n1a because why")
     assert acts(p) == [(1, "a", None, "why", False)]
+
+
+# --- fix round 1 ----------------------------------------------------------------------------------------------------
+def _colon_line(count):
+    return ", ".join(f"{i}: a" for i in range(1, count + 1))
+
+
+@pytest.mark.timeout(10)
+def test_the_lexer_is_linear_a_5000_entry_colon_form_line_takes_under_a_second():
+    """L3 r1 HIGH (complement): each `NUM: pick` re-lexed its tail, doubling the work per entry (the hook hung)."""
+    import time
+
+    from levain.band_shorthand import _lex
+
+    line = _colon_line(5000)
+    t = time.monotonic()
+    lexed = _lex(line)
+    assert time.monotonic() - t < 1.0
+    assert lexed.error is None and len(lexed.entries) == 5000 and lexed.entries[-1].n == 5000
+    t = time.monotonic()
+    p = parse(line, View(5000, tuple(range(1, 5001)), "qs-1"), {n: INFO for n in range(1, 5001)}, "qs-1")
+    assert time.monotonic() - t < 1.0
+    assert not p.matched and not p.actions and "too long" in p.hint     # refused for length before any lexing
+
+
+@pytest.mark.timeout(10)
+def test_a_long_colon_form_line_under_the_cap_still_parses():
+    p = parse(_colon_line(30), View(30, tuple(range(1, 31)), "qs-1"), {n: INFO for n in range(1, 31)}, "qs-1")
+    assert p.matched and [a.n for a in p.actions] == list(range(1, 31)) and {a.pick for a in p.actions} == {"a"}
+
+
+def test_free_text_after_colon_picks_takes_only_the_last_ambiguous_entry():
+    # 1 and 2 are picks (their tails lex cleanly); 3 is free text (its tail "thing, more" does not)
+    assert acts(run("1: a, 2: b, 3: a thing, more")) == [(1, "a", None, None, False), (2, "b", None, None, False),
+                                                          (3, None, "a thing, more", None, False)]
+
+
+def test_a_blank_line_ends_the_answer_block_and_is_kept_in_rest():
+    """L3 r1 MED (codex): `1a\\n\\n2b` recorded both."""
+    p = run("1a\n\n2b")
+    assert [a.n for a in p.actions] == [1] and p.rest == "\n2b"
+    assert run("1a\n").rest == ""                                          # a trailing newline is nothing after
+
+
+def test_the_sweep_says_so_for_an_open_item_it_cannot_read():
+    """L3 r1 LOW (complement): an unreadable open item was skipped by "all recs" without a word."""
+    items = {n: i for n, i in ITEMS.items() if n != 4}
+    p = run("all recs", items=items)
+    assert [a.n for a in p.actions] == [1, 2, 3]
+    assert any(r.n == 4 and "could not be read" in r.reason for r in p.refused)

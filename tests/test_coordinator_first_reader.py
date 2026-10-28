@@ -121,9 +121,19 @@ def test_the_coordinator_session_is_refused_on_the_operators_answer_channel(band
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SEAT)        # Q1 (a): any agent session is refused, not only the coordinator
     assert run_question(_answer_args(band.store.directory, str(q.n), "a"), io.StringIO()) == EXIT_REFUSED
     assert band.qs.get(q.id).answer is None
-    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")              # a terminal outside any agent session is unchanged
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
     monkeypatch.delenv("CLAUDECODE", raising=False)
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.delenv("CODEX_SANDBOX", raising=False)
+    # a Codex child that carries no marker variable is still an agent session: its `codex` ancestor says so
+    monkeypatch.setattr(band_mod, "_ancestors", lambda: iter([(10, ["/bin/bash", "-lc", "levain question answer"]),
+                                                              (42, ["codex", "exec", "go"]), (1111, ["-zsh"])]))
+    assert run_question(_answer_args(band.store.directory, str(q.n), "a"), io.StringIO()) == EXIT_REFUSED
+    monkeypatch.setattr(band_mod, "_ancestors", lambda: iter([(1111, ["-zsh"])]))
+    monkeypatch.setenv("CODEX_SANDBOX", "danger-full-access")   # ... and so does CODEX_SANDBOX
+    assert run_question(_answer_args(band.store.directory, str(q.n), "a"), io.StringIO()) == EXIT_REFUSED
+    assert band.qs.get(q.id).answer is None
+    monkeypatch.delenv("CODEX_SANDBOX")                       # a terminal outside any agent session is unchanged
     assert run_question(_answer_args(band.store.directory, str(q.n), "a"), io.StringIO()) == 0
     assert band.qs.get(q.id).answer.channel == "cli"
 

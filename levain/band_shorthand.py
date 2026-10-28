@@ -12,8 +12,9 @@ Grammar (``,`` ``;`` or white space between entries)::
     SWEEP := (all | rest | others | all others) WS REC
     note  := (because | but | - | —) WS text-to-end-of-line      # attaches to the entry before it
 
-A message is the LEADING lines that each parse in full; the first line that does not ends the block and, with all
-after it, is ``rest``. A line that does not FULLY parse records nothing. Free text (``7: no longer needed``) takes the
+A message is the LEADING lines that each parse in full; the first line that does not, or a blank line, ends the
+block and, with all after it, is ``rest``. A line that does not FULLY parse records nothing; a line over
+:data:`LINE_MAX` characters is not read at all (the lexer is linear, the cap bounds it). Free text (``7: no longer needed``) takes the
 rest of its line. A pick with no number (``(a) all recs``) is never guessed onto an item.
 Rules (D7): an entry naming a number above the view's ``seen_through``, or not open in the view, is refused; a view
 of another store (``store_id``) refuses everything; the SWEEP takes only seen, open, INFORMATION items no entry
@@ -30,9 +31,14 @@ _NUM = r"[1-9][0-9]{0,6}(?![0-9])"
 _REC = r"(?:your\s+rec|you\s+rec|recs|rec|r)(?![A-Za-z0-9])"
 _SEP = re.compile(r"[,;\s]+")
 _SWEEP = re.compile(rf"(?P<sweep>(?:all\s+others|all|rest|others)\s+{_REC})", re.I)
-_ENTRY = re.compile(rf"(?P<num>{_NUM})\s*[:.)]?\s*(?:(?P<rec>{_REC})|\((?P<l1>[a-f])\)|(?P<l2>[a-f])(?![A-Za-z0-9]))",
+# `\s*(?:[:.)]\s*)?` is `\s*[:.)]?\s*` without two quantifiers splitting one run of spaces (no backtracking blow-up)
+_ENTRY = re.compile(rf"(?P<num>{_NUM})\s*(?:[:.)]\s*)?(?:(?P<rec>{_REC})|\((?P<l1>[a-f])\)|(?P<l2>[a-f])(?![A-Za-z0-9]))",
                     re.I)
-_TEXT = re.compile(rf"(?P<num>{_NUM})\s*:\s*(?P<text>\S.*)", re.I)
+# the head of a free-text entry only (NUM ":" then a word): the text is the rest of the line, sliced once when taken,
+# so trying it at every entry never scans to the end of the line
+_TEXT = re.compile(rf"(?P<num>{_NUM})\s*:\s*(?=\S)", re.I)
+# a line longer than this is never read as answers (the block ends there): the hook's work stays bounded
+LINE_MAX = 2000
 _NOTE = re.compile(r"\s+(?:(?:because|but)\s+|[-—]\s+)(?P<note>\S.*)$", re.I)
 # a first line that was MEANT as an answer: NUM LETTER, NUM ":", a bare (a), or a leading sweep
 _ATTEMPT = re.compile(rf"\s*(?:{_NUM}\s*(?:[a-f](?![A-Za-z])|:|\([a-f]\))|\([a-f]\)|(?:all|rest|others)\s+{_REC})", re.I)
@@ -107,18 +113,28 @@ class _Line:
     error: str | None = None
 
 
+def _text(line: str, t: re.Match[str]) -> _Raw:
+    return _Raw("text", int(t.group("num")), text=line[t.end():].rstrip())
+
+
 def _lex(line: str) -> _Line:
+    """One pass, left to right, linear in the line: each pattern is tried once per entry, anchored where the entry
+    starts, and the line is sliced only for the one free text taken. An entry that reads both as a pick and as the
+    start of free text (``3: a thing, more``) is the pick when the rest of the line lexes cleanly, else free text to
+    the end of the line. Free text always lexes, so on an error only the LAST such entry decides: it becomes the
+    text, and every entry before it stays (its own rest now lexes cleanly)."""
     out = _Line()
     pos = 0
     n = len(line)
+    fork: tuple[int, re.Match[str]] | None = None    # the last pick-or-text entry: (its index, its free-text head)
     while True:
         m = _SEP.match(line, pos)
         if m:
             pos = m.end()
         if pos >= n:
             return out
-        m = _SWEEP.match(line, pos)
         raw: _Raw | None = None
+        m = _SWEEP.match(line, pos)
         if m:
             raw = _Raw("sweep")
         else:
@@ -128,25 +144,18 @@ def _lex(line: str) -> _Line:
                     raw = _Raw("rec", int(m.group("num")))
                 else:
                     raw = _Raw("pick", int(m.group("num")), (m.group("l1") or m.group("l2")).lower())
-            else:
-                m = _TEXT.match(line, pos)
-                if m:
-                    out.entries.append(_Raw("text", int(m.group("num")), text=m.group("text").rstrip()))
-                    return out
         end = m.end() if m else pos
         note = _NOTE.match(line, end) if raw is not None else None
         if raw is not None and note is None and end < n and _SEP.match(line, end) is None:
-            raw = None                            # not a clean entry
-        if raw is not None and note is None and _ENTRY.match(line, pos) and (t := _TEXT.match(line, pos)):
-            # "3: a thing, more": words that merely START with a pick are free text, not a pick plus junk
-            rest_after = line[end:]
-            if rest_after.strip() and _lex(rest_after.lstrip(" ,;")).error is not None:
-                out.entries.append(_Raw("text", int(t.group("num")), text=t.group("text").rstrip()))
-                return out
+            raw = None                                   # not a clean entry
         if raw is None:
             t = _TEXT.match(line, pos)
             if t:
-                out.entries.append(_Raw("text", int(t.group("num")), text=t.group("text").rstrip()))
+                out.entries.append(_text(line, t))
+                return out
+            if fork is not None:                         # "3: a thing, more": the last pick-or-text entry is text
+                del out.entries[fork[0]:]
+                out.entries.append(_text(line, fork[1]))
                 return out
             out.error = f"could not read {line[pos:pos + 24]!r}"
             return out
@@ -154,11 +163,10 @@ def _lex(line: str) -> _Line:
             raw.note = note.group("note").rstrip()
             out.entries.append(raw)
             return out
+        if raw.kind != "sweep" and (t := _TEXT.match(line, pos)):
+            fork = (len(out.entries), t)
         out.entries.append(raw)
         pos = end
-        if pos < n and _SEP.match(line, pos) is None:
-            out.error = f"could not read {line[pos:pos + 24]!r}"
-            return out
 
 
 def parse(text: str, view: View | None, items: dict[int, ItemInfo], current_store_id: str | None = None) -> Parse:
@@ -170,9 +178,9 @@ def parse(text: str, view: View | None, items: dict[int, ItemInfo], current_stor
     hint: str | None = None
     for i, line in enumerate(lines):
         if not line.strip():
-            used = i + 1
-            continue
-        lexed = _lex(line)
+            break                                       # a blank line ends the block; it and all after are `rest`
+        lexed = _lex(line) if len(line) <= LINE_MAX else _Line(error=f"the line is too long (over {LINE_MAX} "
+                                                                     "characters)")
         if lexed.error is not None or not lexed.entries:
             if not raws and _ATTEMPT.match(line):
                 reason = lexed.error or "empty"
@@ -250,10 +258,10 @@ def parse(text: str, view: View | None, items: dict[int, ItemInfo], current_stor
             if n in taken or n > view.seen_through:
                 continue
             info = items.get(n)
-            if info is None:
-                continue
             taken.add(n)
-            if info.kind != "information":
+            if info is None:
+                refused.append(Refusal(n, f"{n} could not be read; the sweep left it alone"))
+            elif info.kind != "information":
                 refused.append(Refusal(n, f"{n} needs your signature; the sweep left it alone"))
             elif info.rec_letter is None:
                 refused.append(Refusal(n, f"{n} has no rec for the sweep to take"))

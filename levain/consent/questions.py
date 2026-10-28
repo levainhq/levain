@@ -521,6 +521,66 @@ class QuestionStore:
                          (q.id, kind, value, channel, stamp))
         return Answer(q.id, kind, value, channel, stamp)  # type: ignore[arg-type]
 
+    def answer_with_context(self, entries: list[dict[str, Any]], *, channel: str, schema: tuple[str, ...] = (),
+                            deadline: float | None = None) -> list[Answer | ConsentError]:
+        """Answer several questions, each with its ``answer_context`` row, in ONE write transaction (Q17-ALL S2,
+        D14): an entry's answer and its context are written together or not at all (a savepoint each), so no answer
+        is ever stored, or seen by a delivery reader, without its provenance. ``entries``: dicts of ``ref``, exactly
+        one of ``option`` / ``text`` (as :meth:`answer`), ``via`` (``seat`` / ``cli`` / ``cockpit`` / ``phone``),
+        ``viewer``, ``seen_through``, ``note``. ``schema``: statements run first in the same transaction (the band's
+        tables, ``answer_context`` among them). ``deadline`` (``time.monotonic()``): the write lock is waited for
+        until then (:meth:`_write_by`), else the ordinary wait. Returns one result per entry, in order: its
+        :class:`Answer`, or the :class:`ConsentError` that refused it (nothing written for it; the others proceed).
+        The lock still busy at the deadline, or any other store failure: raised, and nothing is written."""
+        if channel not in ANSWER_CHANNELS:
+            raise ConsentError(f"channel must be one of {', '.join(ANSWER_CHANNELS)}: {channel!r}")
+        out: list[Answer | ConsentError] = []
+        with (self._write_by(deadline) if deadline is not None else self._write()) as conn:
+            for stmt in schema:
+                conn.execute(stmt)
+            stamp = utc_stamp(_now_utc(self._clock))
+            for e in entries:
+                conn.execute("SAVEPOINT answer_entry")
+                try:
+                    option, text, via, note = e.get("option"), e.get("text"), e.get("via"), e.get("note")
+                    viewer, seen = e.get("viewer"), e.get("seen_through")
+                    if (option is None) == (text is None):
+                        raise ConsentError("answer with exactly one of an option key or free text")
+                    if text is not None and (not isinstance(text, str) or not text.strip() or len(text) > _TEXT_MAX
+                                             or "\x00" in text):
+                        raise ConsentError(f"text must be 1 to {_TEXT_MAX} characters, not only whitespace, "
+                                           "with no NUL")
+                    if option is not None and not isinstance(option, str):
+                        raise ConsentError("option must be a key")
+                    if via not in ("seat", "cli", "cockpit", "phone"):
+                        raise ConsentError(f"via must be seat, cli, cockpit or phone: {via!r}")
+                    if viewer is not None and (not isinstance(viewer, str) or "\x00" in viewer):
+                        raise ConsentError("viewer must be a string with no NUL")
+                    if seen is not None and (not isinstance(seen, int) or isinstance(seen, bool) or seen < 0):
+                        raise ConsentError("seen_through must be a band number")
+                    if note is not None and (not isinstance(note, str) or len(note) > _TEXT_MAX or "\x00" in note):
+                        raise ConsentError(f"note must be at most {_TEXT_MAX} characters with no NUL")
+                    q = self._by_ref(conn, e.get("ref"))
+                    if q is None:
+                        raise ConsentError(f"no such question: {e.get('ref')!r}")
+                    if q.answer is not None:
+                        raise ConsentError(f"question #{q.n} was already answered at {q.answer.answered_at}")
+                    if option is not None and option not in {k for k, _ in q.options}:
+                        raise ConsentError(f"{option!r} is not an option of question #{q.n}")
+                    kind, value = ("option", option) if option is not None else ("text", text)
+                    conn.execute("INSERT INTO answers (question_id, kind, value, channel, answered_at) "
+                                 "VALUES (?, ?, ?, ?, ?)", (q.id, kind, value, channel, stamp))
+                    conn.execute("INSERT INTO answer_context (question_id, via, viewer, seen_through, note) "
+                                 "VALUES (?, ?, ?, ?, ?)", (q.id, via, viewer, seen, note))
+                except (ConsentError, sqlite3.IntegrityError) as exc:
+                    conn.execute("ROLLBACK TO answer_entry")
+                    conn.execute("RELEASE answer_entry")
+                    out.append(exc if isinstance(exc, ConsentError) else ConsentError(str(exc)))
+                    continue
+                conn.execute("RELEASE answer_entry")
+                out.append(Answer(q.id, kind, value, channel, stamp))  # type: ignore[arg-type]
+        return out
+
     # --- delivery ------------------------------------------------------------------------------------
     def claim_answers_for(self, agent: str, agent_session_id: str) -> list[Question]:
         """This session's answered questions whose text has not reached it yet (never claimed, or claimed for a

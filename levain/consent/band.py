@@ -202,15 +202,38 @@ def _coordinator_caller(directory: Path) -> bool:
                                                                              "CODEX_THREAD_ID"))
 
 
-def agent_session_caller() -> bool:
-    """True when this process runs inside ANY agent session (a Claude Code or Codex Bash tool, ...): the same
-    environment markers this module already reads (:func:`_agent_and_session`). Q17-ALL D9, Q1 ruled (a): an
-    information answer is the operator's only through a human channel, so `levain question answer` and
-    `levain band answer` refuse here; inside a seat the human answers by typing in the seat. A label check, like
-    :func:`_coordinator_caller` (which it widens from the coordinator to every agent): it does not stop a process
-    that hides its environment, and what it keeps out is text the agent reads, never authority."""
+def agent_process() -> str | None:
+    """The agent this process runs under (``claude_code`` / ``codex``), or ``None`` for none: the ONE detector, used
+    by :func:`agent_session_caller` (the Q1 fence) and by :func:`_agent_and_session` (``levain ask``'s naming), so
+    the fence refuses every process the naming would call an agent. The nearest ancestor that is ``claude`` or
+    ``codex`` decides (a Codex run from a Claude Code shell inherits Claude Code's variables); with none found
+    (no such ancestor, or a process tree that cannot be read, as in a sandbox), the environment: ``CODEX_THREAD_ID``,
+    then ``CLAUDECODE=1`` / ``CLAUDE_CODE_SESSION_ID``, then ``CODEX_SANDBOX``."""
+    agent = next((a for _pid, args in _ancestors() if (a := _agent_of(args)) is not None), None)
+    if agent is not None:
+        return agent
     env = os.environ
-    return bool(env.get("CLAUDE_CODE_SESSION_ID") or env.get("CODEX_THREAD_ID") or env.get("CLAUDECODE") == "1")
+    if env.get("CODEX_THREAD_ID"):
+        return "codex"
+    if env.get("CLAUDECODE") == "1" or env.get("CLAUDE_CODE_SESSION_ID"):
+        return "claude_code"
+    if env.get("CODEX_SANDBOX"):
+        return "codex"
+    return None
+
+
+def agent_session_caller() -> bool:
+    """True when this process runs inside ANY agent session (a Claude Code or Codex Bash tool, a child of one with
+    no marker variable, ...): :func:`agent_process` found an agent. Q17-ALL D9, Q1 ruled (a): an information answer
+    is the operator's only through a human channel, so `levain question answer` and `levain band answer` refuse
+    here; inside a seat the human answers by typing in the seat. A label check, like :func:`_coordinator_caller`
+    (which it widens from the coordinator to every agent): it does not stop a process that hides its environment
+    and its process tree, and what it keeps out is text the agent reads, never authority.
+
+    It over-fences on purpose (fail-closed): a human's shell that inherited an agent's variables (a tmux server
+    started from inside Claude Code keeps ``CLAUDECODE=1``) or that runs under an agent process is refused, with no
+    override. Answer from a fresh terminal, the cockpit or the phone, or type the answer in the seat."""
+    return agent_process() is not None
 
 
 AGENT_ANSWER_REFUSAL = ("this runs inside an agent session, and an agent's answer is never the operator's: type the "
@@ -301,20 +324,12 @@ def _agent_of(args: list[str]) -> str | None:
 
 def _agent_and_session(agent: str | None, session: str | None) -> tuple[str, str]:
     """The agent and session the question names: the flags, else the agent's own environment. Naming only. With no
-    ``--agent``, the nearest ancestor process that is ``claude`` or ``codex`` decides (a Codex run from a Claude Code
-    shell inherits Claude Code's variables), else the environment."""
+    ``--agent``, :func:`agent_process` (the same detector the Q1 fence uses) decides."""
     env = os.environ
     if agent is None:
-        agent = next((a for _pid, args in _ancestors() if (a := _agent_of(args)) is not None), None)
+        agent = agent_process()
     if agent is None:
-        if env.get("CODEX_THREAD_ID"):
-            agent = "codex"
-        elif env.get("CLAUDECODE") == "1" or env.get("CLAUDE_CODE_SESSION_ID"):
-            agent = "claude_code"
-        elif env.get("CODEX_SANDBOX"):
-            agent = "codex"
-        else:
-            raise ValueError("cannot tell which agent is asking; pass --agent claude_code or --agent codex")
+        raise ValueError("cannot tell which agent is asking; pass --agent claude_code or --agent codex")
     if agent not in _agents():
         raise ValueError(f"--agent must be one of {sorted(_agents())}")
     if session is None:
