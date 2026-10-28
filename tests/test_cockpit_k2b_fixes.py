@@ -171,7 +171,8 @@ def test_a_finish_that_failed_once_is_finished_by_the_thread(home, spores, monke
     b = _broker(home, spores, max_wait=60.0)
     try:
         out = _move(b, spores, intent="reported")
-        assert out["state"] == "applying"
+        # the thread may finish the op before _move returns, so COMMITTED is as valid as applying
+        assert out["state"] in ("applying", "COMMITTED")
         assert _rows(b, "SELECT status FROM effects") == [("APPLIED",)]
         assert b.db is not None and b.db.due_ops(b._now()) in ([out["pending_id"]], [])
         assert _wait(lambda: _state(b, out["pending_id"]) == "COMMITTED", 3.0)

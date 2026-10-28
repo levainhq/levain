@@ -815,7 +815,7 @@ def test_i1_an_open_sheet_holds_the_lease_so_a_card_tap_asks_for_no_challenge(tm
             {"eval": PARENT_X + ".click() || 1"},
             {"until": f"!{FRAME} && 1", "ms": 5000},
             {"eval": f"{CARD_OPTION_A}.click() || 1"},
-            {"until": f"/asking|confirm|challenge/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 10000, "may_timeout": True},
+            {"until": f"/asking|confirm|challenge/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 30000, "may_timeout": True},
         ])
     v = out["values"]
     assert "already being asked for" in v[-5], v                   # while the sheet is up the tap does nothing

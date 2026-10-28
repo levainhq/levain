@@ -504,6 +504,7 @@ def test_f5_every_pair_503_carries_retry_after_and_the_claims_closes(src, quick_
         st, out, hdrs = _call(port, "POST", "/cockpit/pair/claim", {"code": "x" * 22})
         assert (st, hdrs.get("retry-after"), hdrs.get("connection")) == (503, "2", "close"), (out, hdrs)
     with _serve(src) as (port, httpd):
+        assert httpd.broker.start() is Lifecycle.ACTIVE      # quick_wait is 0.3 s: a still-ACTIVATING broker answers 503 on a loaded runner
         for gate, path, body in ((httpd.pair_claim_gate, "/cockpit/pair/claim", {"code": "x"}),
                                  (httpd.request_gate, "/cockpit/pair/offer", {})):
             held = 0
