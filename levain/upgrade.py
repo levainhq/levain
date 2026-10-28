@@ -18,8 +18,6 @@ Known edges, not handled (L3 r1):
   refusal itself stands either way.
 - ``_check_writers`` maps gid to name with one name per gid, so on a host with a group alias the pre-check's advice
   may name the alias; root's own check is unaffected.
-- An installer that authenticates through a keyring on the session bus does not get ``DBUS_SESSION_BUS_ADDRESS``;
-  configure the index through ``PIP_*``/``UV_*``/``PIPX_*`` or a netrc instead.
 """
 from __future__ import annotations
 
@@ -44,9 +42,19 @@ _NEUTRAL_CWD = "/"
 # What sudo and the installer need from the environment. Everything else is dropped.
 _BASE_ENV = frozenset({"PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "TMPDIR"})
 # The installer also needs: the dynamic loader's paths (an interpreter found only through one would not start), the
-# netrc path, and its own config namespaces (XDG_ holds pip's and uv's config dirs on Linux).
-_INSTALLER_ENV = _BASE_ENV | {"LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "NETRC"}
+# netrc path, the user base (`pip --user` installs under it, and the re-exec must look in the same place), the session
+# bus (a keyring-authenticated index; XDG_RUNTIME_DIR comes with XDG_), and its own config namespaces (XDG_ holds
+# pip's and uv's config dirs on Linux).
+_INSTALLER_ENV = _BASE_ENV | {"LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "NETRC",
+                              "PYTHONUSERBASE", "DBUS_SESSION_BUS_ADDRESS"}
 _INSTALLER_PREFIXES = ("LC_", "PIP_", "UV_", "PIPX_", "XDG_")
+# The only interpreter switches the re-exec keeps (L3 r2). Every other PYTHON* is dropped: `PYTHONPATH=.` or an empty
+# entry puts the cwd back on sys.path past -P, and PYTHONHOME/PYTHONSTARTUP/PYTHONINSPECT change what runs.
+_REEXEC_PYTHON = ("PYTHONUSERBASE", "PYTHONNOUSERSITE")
+# Path-valued names a child would read relative to its own cwd, which is `/` (L3 r2): a relative value that exists
+# from the operator's directory is made absolute against it, before the child starts.
+_PATH_VALUED = frozenset({"PIP_CONFIG_FILE", "UV_CONFIG_FILE", "NETRC", "PIP_CERT", "PIP_CLIENT_CERT", "SSL_CERT_FILE",
+                          "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "PYTHONUSERBASE"})
 
 
 class Refusal(Exception):
@@ -151,15 +159,30 @@ def decide_installer(ev: Evidence, *, python: str, which: Callable[[str], Option
 # --- the seams --------------------------------------------------------------------------------------------------
 
 
+def _anchored(env: dict) -> dict:
+    """``env`` with each relative :data:`_PATH_VALUED` value that exists from this process's cwd made absolute. Read
+    here, in the parent, before any child runs from ``/``. A value that is absent stays as given."""
+    try:
+        cwd = os.getcwd()
+    except OSError:                    # the operator's directory is gone: nothing to resolve against
+        return env
+    for k in _PATH_VALUED & env.keys():
+        v = env[k]
+        if v and not os.path.isabs(v) and os.path.exists(os.path.join(cwd, v)):
+            env[k] = os.path.normpath(os.path.join(cwd, v))
+    return env
+
+
 def installer_env(environ: Optional[Any] = None) -> dict:
-    """The installer's environment: the base names, the loader paths, its config namespaces and the network names
-    (proxies, CA bundles) from :data:`levain.launch.NETWORK`. ``PIP_*``/``UV_*``/``PIPX_*`` can hold an index URL with
-    credentials in it; that is the installer's own config, and it goes to the installer only."""
+    """The installer's environment: the base names, the loader paths, the user base, the session bus, its config
+    namespaces and the network names (proxies, CA bundles) from :data:`levain.launch.NETWORK`.
+    ``PIP_*``/``UV_*``/``PIPX_*`` can hold an index URL with credentials in it; that is the installer's own config,
+    and it goes to the installer only."""
     from levain.launch import NETWORK
 
     e = os.environ if environ is None else environ
     names = _INSTALLER_ENV | set(NETWORK)
-    return {k: v for k, v in e.items() if k in names or k.startswith(_INSTALLER_PREFIXES)}
+    return _anchored({k: v for k, v in e.items() if k in names or k.startswith(_INSTALLER_PREFIXES)})
 
 
 def sudo_env(environ: Optional[Any] = None) -> dict:
@@ -171,10 +194,12 @@ def sudo_env(environ: Optional[Any] = None) -> dict:
 
 def reexec_env(environ: Optional[Any] = None) -> dict:
     """The re-exec's environment: :func:`levain.launch.allowed_env`, the list levain's own re-exec uses (it drops
-    ``LEVAIN_CARRY_FD``, so the new image does not look for a carry it was not given)."""
+    ``LEVAIN_CARRY_FD``, so the new image does not look for a carry it was not given), with no ``PYTHON*`` name but
+    :data:`_REEXEC_PYTHON`."""
     from levain.launch import allowed_env
 
-    return allowed_env(os.environ if environ is None else environ)
+    env = allowed_env(os.environ if environ is None else environ)
+    return _anchored({k: v for k, v in env.items() if not k.startswith("PYTHON") or k in _REEXEC_PYTHON})
 
 
 def _run(argv: Sequence[str], *, env: dict, cwd: str = _NEUTRAL_CWD, capture_stderr: bool = True,
@@ -470,6 +495,7 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool) -> int:
             return EXIT_REFUSED
         # -P: `python -m` would otherwise put the cwd first on sys.path, and a `levain/` there would run instead of
         # the package just installed. Not -I, which also drops the user site and so a `pip --user` install.
+        sys.stdout.flush()      # execve discards Python's buffer: the line above would be lost under `| tee`
         s.execv(s.executable, [s.executable, "-P", "-m", "levain", "upgrade", "--no-pip",
                                *(["--verbose"] if verbose else [])], reexec_env())
         return EXIT_OK      # only reached where exec is a seam
@@ -506,15 +532,20 @@ def _sudo(s: Seams, pkg: str, gen: Optional[str], verbose: bool) -> int:
     rc, out, err = s.run(sudo_argv(s, pkg), env=sudo_env(), cwd=_NEUTRAL_CWD, capture_stderr=not verbose,
                          capture_stdout=True)
     lines = out.strip().splitlines()
+    reply: Any = None
     try:
         reply = json.loads(lines[-1]) if lines else None
     except ValueError:
-        reply = None
+        pass
     errs = err.splitlines()
     if type(reply) is not dict or "ok" not in reply:
+        what: Optional[str] = ("printed no result line" if not lines else "printed a last line that is not a result")
+    else:
+        # An ok line with a non-zero exit claims no more than an empty one (L3 r2).
+        what = "printed ok, but the exit is not 0" if reply["ok"] is True and rc != 0 else None
+    if what is not None:
         # No result line does not mean nothing ran: sudo refusing the password and a helper killed after it stopped
         # services both leave stdout empty. Say only what is known.
-        what = ("printed no result line" if not lines else "printed a last line that is not a result")
         print(f"The outcome is unknown: sudo exited {rc} and the helper {what}. If sudo refused the password, "
               "nothing ran; if the helper was stopped partway, the root side may be mid-repair, with Levain's "
               "services stopped.")

@@ -563,3 +563,94 @@ def test_has_tty_without_stdin_or_tty_is_false_and_closes(monkeypatch):
 
     monkeypatch.setattr(builtins, "open", boom)
     assert U._has_tty() is False
+
+
+# --- L3 r2 -------------------------------------------------------------------------------------------------------
+
+INTERPRETER_SWITCHES = {"PYTHONPATH": ".", "PYTHONHOME": "/x", "PYTHONSTARTUP": "./s.py", "PYTHONINSPECT": "1",
+                        "PYTHONSAFEPATH": "", "PYTHONWARNINGS": "error"}
+
+
+def _both_envs(env, capsys):
+    rc, _ = env.run(capsys)                                   # installer, then the re-exec
+    assert rc == 0 and len(env.runner.kw) == 1 and len(env.exec_envs) == 1
+    return env.runner.kw[0]["env"], env.exec_envs[0]
+
+
+@pytest.mark.parametrize("pythonpath", [".", ":/x", "/x:", "levain-shadow"])
+def test_no_interpreter_switch_reaches_the_reexec_or_the_installer(env, capsys, monkeypatch, pythonpath):
+    for k, v in {**INTERPRETER_SWITCHES, "PYTHONPATH": pythonpath}.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("PYTHONUSERBASE", "/home/op/.ub")
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
+    pip_env, exec_env = _both_envs(env, capsys)
+    for e in (exec_env, pip_env):
+        assert not set(INTERPRETER_SWITCHES) & set(e), e
+        assert e["PYTHONUSERBASE"] == "/home/op/.ub"           # a --user install and its re-exec agree on the base
+        assert "PYTHONNOUSERSITE" not in e                     # not invented when unset
+    assert [k for k in exec_env if k.startswith("PYTHON")] == ["PYTHONUSERBASE"]
+
+
+def test_pythonnousersite_reaches_the_reexec_only_when_set(env, capsys, monkeypatch):
+    monkeypatch.setenv("PYTHONNOUSERSITE", "1")
+    _, exec_env = _both_envs(env, capsys)
+    assert exec_env["PYTHONNOUSERSITE"] == "1"
+
+
+def test_ok_with_a_nonzero_exit_is_unknown_not_done(env, capsys):
+    rc, out = _ran(env, capsys, (1, '{"ok":true}\n', "sudo: killed after the reply\n"))
+    assert rc == 1 and "Done" not in out and "levain update" not in out
+    assert "unknown" in out and "exited 1" in out and "resumable" in out and "levain upgrade --no-pip" in out
+    assert "sudo: killed after the reply" in out
+
+
+def test_stdout_is_flushed_before_the_exec(env, capsys, monkeypatch):
+    import io
+    import sys
+
+    order = []
+
+    class Out(io.StringIO):
+        def flush(self):
+            order.append(("flush", self.getvalue()))
+
+    monkeypatch.setattr(sys, "stdout", Out())
+    s = env.seams()
+    s.execv = lambda p, a, e: order.append(("exec", None))
+    U.run_upgrade(seams=s)
+    kinds = [k for k, _ in order]
+    assert "exec" in kinds and "flush" in kinds[:kinds.index("exec")]
+    assert "Upgrading levain with pip" in [v for k, v in order if k == "flush"][-1]
+
+
+def test_relative_config_paths_resolve_from_the_operators_directory(env, capsys, monkeypatch, tmp_path):
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    (cwd / "pip.conf").write_text("")
+    (cwd / "netrc").write_text("")
+    (cwd / "ub").mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("PIP_CONFIG_FILE", "./pip.conf")
+    monkeypatch.setenv("NETRC", "netrc")
+    monkeypatch.setenv("PYTHONUSERBASE", "ub")
+    monkeypatch.setenv("UV_CONFIG_FILE", "missing.toml")       # relative but absent: left as given
+    monkeypatch.setenv("SSL_CERT_FILE", "/etc/ca.pem")         # absolute: left as given
+    monkeypatch.setenv("PIP_INDEX_URL", "pip.conf")            # not a path-valued name: never rewritten
+    pip_env, exec_env = _both_envs(env, capsys)
+    assert pip_env["PIP_CONFIG_FILE"] == str(cwd / "pip.conf")
+    assert pip_env["NETRC"] == str(cwd / "netrc")
+    assert pip_env["PYTHONUSERBASE"] == exec_env["PYTHONUSERBASE"] == str(cwd / "ub")
+    assert pip_env["UV_CONFIG_FILE"] == "missing.toml"
+    assert pip_env["SSL_CERT_FILE"] == "/etc/ca.pem" and pip_env["PIP_INDEX_URL"] == "pip.conf"
+
+
+def test_the_session_bus_reaches_the_installer_and_never_sudo(env, capsys, monkeypatch):
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/501/bus")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/501")
+    pip_env, _ = _both_envs(env, capsys)
+    assert pip_env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/501/bus"
+    assert pip_env["XDG_RUNTIME_DIR"] == "/run/user/501"
+    env.runner = Runner()
+    assert env.run(capsys, no_pip=True)[0] == 0
+    sudo = env.runner.kw[0]["env"]
+    assert "DBUS_SESSION_BUS_ADDRESS" not in sudo and "XDG_RUNTIME_DIR" not in sudo
