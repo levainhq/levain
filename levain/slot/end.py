@@ -1916,12 +1916,15 @@ def _shape_at(dirfd: int, name: bytes, slot_owner_ok: Callable[[os.stat_result],
 
 
 def _present(dirfd: int | None, name: bytes) -> bool:
+    """``name`` exists in ``dirfd`` (no link followed); any error but ENOENT is ``bad-root``."""
     if dirfd is None:
         return False
     try:
         os.stat(name, dir_fd=dirfd, follow_symlinks=False)
     except FileNotFoundError:
         return False
+    except OSError as e:
+        raise Refused("bad-root", f"{name.decode('ascii')}: {e.strerror or e}") from None
     return True
 
 
@@ -1931,8 +1934,11 @@ def return_move(facts: EndFacts, *, slot_owner_ok: Callable[[os.stat_result], bo
     credential directory, for an interactive passthrough session. Returns ``moved`` or ``already`` (keep/ empty, the
     tree holds it: a retry; the fsyncs are redone). Refuses, with nothing moved or deleted: ``keep-shape``
     (:func:`keep_shape_ok`'s rule applied by dirfd; refused, never deleted), ``keep-return-conflict`` (both
-    present), ``no-credential:<tag>`` (both absent), ``bad-root`` (``keep/`` not a ``owner_ok`` directory, the
-    credential directory missing, a rename error). ``slot_owner_ok`` defaults to ``st_uid == facts.slot_uid``.
+    present), ``no-credential:<tag>`` (both absent). Refuses ``bad-root`` for ``keep/`` not a ``owner_ok``
+    directory, the credential directory missing, a presence check that errors, or an error of the rename or of
+    either fsync. NOT "nothing moved": an error (an ``OSError`` fault included) after the rename leaves the one copy
+    in the tree, so the caller parks back on every ``bad-root`` (:func:`park_move` finds the source absent when
+    nothing moved). ``slot_owner_ok`` defaults to ``st_uid == facts.slot_uid``.
     Order: rename, fsync ``keep/``, fsync the tree directory, at the faults ``return:checked``, ``return:renamed``,
     ``return:source-synced``, ``return:done``. The caller holds the session END lock. The baseline and the gate are
     the caller's."""
@@ -1951,8 +1957,13 @@ def return_move(facts: EndFacts, *, slot_owner_ok: Callable[[os.stat_result], bo
             raise Refused("bad-root", f"{facts.keep}: {e.strerror or e}") from None
         kfd = None
     try:
-        if kfd is not None and not (stat.S_ISDIR(os.fstat(kfd).st_mode) and owner_ok(os.fstat(kfd))):
-            raise Refused("bad-root", f"{facts.keep} is not a directory with the expected owner")
+        if kfd is not None:
+            try:
+                kst = os.fstat(kfd)
+            except OSError as e:
+                raise Refused("bad-root", f"{facts.keep}: {e.strerror or e}") from None
+            if not (stat.S_ISDIR(kst.st_mode) and owner_ok(kst)):
+                raise Refused("bad-root", f"{facts.keep} is not a directory with the expected owner")
         in_keep, in_tree = _present(kfd, name), _present(tfd, name)
         if in_keep and in_tree:
             raise Refused("keep-return-conflict", f"{name.decode('ascii')} is in keep/ and in the session tree")

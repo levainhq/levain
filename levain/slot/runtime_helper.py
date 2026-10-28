@@ -1230,7 +1230,7 @@ def pick_slot(views: Sequence[SlotView], *, slot_class: str, kind: str, vendor: 
     """§5.1 prepare + §3.5 Pool's point-of-use rules, PURE over the views read under the pool lock.
 
     Operator: ``no-baseline:<slot>`` for ``passthrough`` + kind != ``login`` when no REUSABLE slot holds this
-    vendor's credential AND a baseline; then the named slot if REUSABLE (a named slot that is not is refused
+    vendor's credential AND a baseline, or when the named slot does not; then the named slot if REUSABLE (a named slot that is not is refused
     ``slot-not-reusable:<tag>``, never replaced: naming it asks for its credential), else (passthrough) the lowest
     credential + baseline slot, else the lowest REUSABLE (verifier: the lowest free pair). Ticketed: no ``<slot>`` argument,
     never a slot whose ``keep/`` holds a credential or that has a baseline, and ``operator-slot-reserved`` if
@@ -1253,6 +1253,10 @@ def pick_slot(views: Sequence[SlotView], *, slot_class: str, kind: str, vendor: 
     if named is not None:
         for v in reusable:
             if v.slot.index == named:
+                if auth == "passthrough" and kind != "login" and not v.holds(vendor):
+                    # naming a slot asks for ITS credential: another slot's does not admit it (L3 r1 codex)
+                    raise Refused(f"no-baseline:{v.slot.tag}", f"{v.slot.tag} holds no {vendor} credential and "
+                                                                 "baseline")
                 return v.slot
         raise Refused(f"slot-not-reusable:{SlotId(slot_class, named).tag}", "the named slot is not reusable")
     if auth == "passthrough":

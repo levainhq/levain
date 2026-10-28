@@ -130,6 +130,40 @@ def test_a_bad_baseline_refuses_bad_baseline_before_any_move(env, damage):
     assert la.spawns == [] and "identity" not in w.state(s).fields
 
 
+def _short_reads(monkeypatch, w, first: int, step: int = 7) -> None:
+    """``os.read`` of the baseline file answers at most ``first`` bytes, then ``step`` at a time (a legal short
+    read); every other read is untouched."""
+    real = os.read
+    ino = os.stat(_baseline_path(w)).st_ino
+    calls = [0]
+
+    def read(fd, n):
+        if os.fstat(fd).st_ino != ino:
+            return real(fd, n)
+        calls[0] += 1
+        return real(fd, min(n, first if calls[0] == 1 else step))
+    monkeypatch.setattr(ID.os, "read", read)
+
+
+def test_a_baseline_read_short_is_read_to_its_end(env, monkeypatch):
+    """L3 r1 (codex + deepseek): one ``os.read`` may answer short; the read loops to EOF."""
+    w, la, _ = env
+    s = _gated(w, la)
+    _short_reads(monkeypatch, w, 7)
+    assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
+
+
+def test_a_baseline_with_junk_after_a_valid_prefix_is_refused_even_read_short(env, monkeypatch):
+    w, la, _ = env
+    s = _gated(w, la)
+    valid = _baseline_path(w).read_bytes()
+    _baseline_path(w).write_bytes(valid + b" junk")
+    _short_reads(monkeypatch, w, len(valid))
+    assert w.main(["start", s])[1]["refused"] == "bad-baseline"
+    monkeypatch.undo()
+    _back_in_keep(w, s)
+
+
 # --- test 7: Claude match and differ -----------------------------------------------------------------------------------
 
 def test_claude_match_clones_and_spawns_the_vendor_once(env):
@@ -307,8 +341,95 @@ def test_a_failed_park_back_keeps_the_gates_name_notes_it_and_end_parks(env, cap
     assert "not parked back" in capsys.readouterr().err
     assert _tree(w, s).read_bytes() == b"{}" and not _keep(w).exists()        # the one copy is in the tree
     w.seams.end_overrides = overrides
+    assert w.state(s).state == R.RENDERED       # g3fx1 VERIFY (a): END parks the tree of a session never started
     assert w.main(["teardown", s])[1]["ok"]
     assert _keep(w).read_bytes() == b"{}"                                      # END's park is the backstop
+
+
+# --- g3fx1 F1: return_move fails after its rename ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("point", ["return:renamed", "return:source-synced", "return:done"])
+def test_a_return_that_fails_after_the_rename_is_parked_back(env, point):
+    """L3 r1 (3 lineages): an fsync (or a fault) after the rename refuses ``bad-root`` with the credential in the
+    tree; start parks it back before it answers."""
+    w, la, _ = env
+    s = _gated(w, la)
+    overrides = dict(w.seams.end_overrides)
+
+    def fault(p):
+        if p == point:
+            raise OSError(errno.EIO, "injected")
+    w.seams.end_overrides = {**overrides, "fault": fault}
+    assert w.main(["start", s])[1]["refused"] == "bad-root"
+    _back_in_keep(w, s)
+    assert la.spawns == [] and "identity" not in w.state(s).fields
+
+
+def test_a_return_whose_tree_fsync_fails_is_parked_back(env, monkeypatch):
+    w, la, _ = env
+    s = _gated(w, la)
+    from levain.slot import end as E
+    real = os.fsync
+    tree_dir = _tree(w, s).parent
+    armed = [True]
+
+    def fsync(fd):
+        if armed[0] and os.fstat(fd).st_ino == os.stat(tree_dir).st_ino and _tree(w, s).exists():
+            armed[0] = False
+            raise OSError(errno.EIO, "injected")
+        return real(fd)
+    monkeypatch.setattr(E.os, "fsync", fsync)
+    assert w.main(["start", s])[1]["refused"] == "bad-root"
+    monkeypatch.undo()
+    _back_in_keep(w, s)
+
+
+@pytest.mark.parametrize("make", ["conflict", "absent"])
+def test_a_pre_move_refusal_of_the_return_moves_nothing(env, make):
+    w, la, _ = env
+    s = _gated(w, la)
+    if make == "conflict":
+        _tree(w, s).write_bytes(b"[]")
+        assert w.main(["start", s])[1]["refused"] == "keep-return-conflict"
+        assert _keep(w).read_bytes() == b"{}" and _tree(w, s).read_bytes() == b"[]"
+    else:
+        _keep(w).unlink()
+        assert w.main(["start", s])[1]["refused"] == "no-credential:e0"
+        assert not _keep(w).exists() and not _tree(w, s).exists()
+
+
+# --- g3fx1 VERIFY (b): a retry after a gate refusal --------------------------------------------------------------------
+
+def test_a_retry_after_identity_changed_is_not_blocked_by_the_earlier_record(env):
+    w, la, _ = env
+    s = _gated(w, la, profile=OTHER)
+    assert w.main(["start", s])[1]["refused"] == "identity-changed"
+    assert w.state(s).fields["identity"]["result"] == "identity-changed"
+    la.profile_uuid = UUID                   # the stored login answers as the baseline's account again
+    assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
+    assert w.state(s).fields["identity"] == {"observed_id": UUID, "result": "matched"}
+    assert len(la.of("vendor")) == 1
+
+
+# --- g3fx1 F7: the record CAS refused after the call refused ----------------------------------------------------------
+
+def test_a_refused_cas_after_a_refused_call_keeps_the_calls_name_in_the_detail(env, monkeypatch):
+    w, la, _ = env
+    s = _gated(w, la)
+    recorded: list = []
+
+    def call(ctx, vendor, a=None, *, held=False):
+        raise Refused("identity-unparsable", "claude")
+
+    def cas(ctx, session, identity):
+        recorded.append(dict(identity))
+        raise Refused("lease-dead", "test")
+    monkeypatch.setattr(ID, "identity_call", call)
+    monkeypatch.setattr(ID, "_cas_gate_identity", cas)
+    with pytest.raises(Refused) as e:
+        ID.gate_check(None, w.alloc(s), {"vendor": "claude", "observed_id": UUID})   # type: ignore[arg-type]
+    assert recorded == [{"result": "identity-unparsable"}]
+    assert e.value.name == "lease-dead" and "identity-unparsable" in e.value.detail
 
 
 # --- test 12: the lock -------------------------------------------------------------------------------------------------

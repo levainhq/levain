@@ -494,6 +494,30 @@ def test_pick_slot_rules():
     assert e.value.name == "operator-slot-reserved"
 
 
+def test_pick_slot_a_named_passthrough_slot_must_itself_hold_the_credential():
+    """L3 r1 (codex): another slot holding the vendor's credential does not admit a named slot that holds none."""
+    def v(i, creds=(), baseline=None):
+        slot = SlotId("egress", i)
+        return H.SlotView(R.SlotState(slot, 0, 0, "reusable", True, "2026-10-20T00:00:00Z", None),
+                          slot, frozenset(creds), baseline)
+
+    kw = dict(slot_class="egress", kind="interactive", vendor="claude", auth="passthrough", ticketed=False)
+    views = [v(0, creds=["claude"], baseline="claude"), v(1)]
+    with pytest.raises(Refused) as e:
+        H.pick_slot(views, **kw, named=1)
+    assert e.value.name == "no-baseline:e1"
+    assert H.pick_slot(views, **kw, named=0) == SlotId("egress", 0)
+    assert H.pick_slot(views, **kw, named=None) == SlotId("egress", 0)
+    with pytest.raises(Refused) as e:          # a credential with a baseline of another vendor does not hold
+        H.pick_slot([v(0, creds=["claude"], baseline="claude"), v(1, creds=["claude"], baseline="codex")],
+                    **kw, named=1)
+    assert e.value.name == "no-baseline:e1"
+    with pytest.raises(Refused) as e:          # a named slot that is not reusable keeps its own name
+        H.pick_slot([v(0, creds=["claude"], baseline="claude")], **kw, named=2)
+    assert e.value.name == "slot-not-reusable:e2"
+    assert H.pick_slot(views, **{**kw, "kind": "login"}, named=1) == SlotId("egress", 1)   # login: no holds rule
+
+
 def test_staging_owned_by_lease_peer(world):
     s = _prepared(world)
     assert world.chown_of(f"staging/{s}") == (OP_UID, OP_GID)

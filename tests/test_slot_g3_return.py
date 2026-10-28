@@ -1,6 +1,7 @@
 """G3-1: end.return_move, the keep/ -> session-tree return (DESIGN g3 §1, tests 1-5)."""
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from pathlib import Path
@@ -217,6 +218,41 @@ def test_keep_not_root_owned_is_bad_root(w):
     with pytest.raises(Refused) as e:
         return_move(w.facts, owner_ok=lambda st: False)
     assert e.value.name == "bad-root"
+    assert w.state() == ([NAME], [])
+
+
+@pytest.mark.parametrize("err", [errno.EIO, errno.EACCES, errno.ENOTDIR])
+def test_a_presence_check_that_errors_is_bad_root_not_a_raw_oserror(w, monkeypatch, err):
+    """L3 r1 (complement): ``_present``'s fstatat errors other than ENOENT are ``bad-root``, like the rest."""
+    w.put_keep()
+    real = os.stat
+
+    def stat_(path, *a, **k):
+        if path == NAME.encode() and k.get("dir_fd") is not None:
+            raise OSError(err, "injected")
+        return real(path, *a, **k)
+    monkeypatch.setattr(os, "stat", stat_)
+    with pytest.raises(Refused) as e:
+        w.run()
+    monkeypatch.undo()
+    assert e.value.name == "bad-root"
+    assert w.state() == ([NAME], [])
+
+
+@pytest.mark.parametrize("point", ["return:renamed", "return:source-synced", "return:done"])
+def test_an_error_after_the_rename_is_bad_root_with_the_credential_in_the_tree(w, point):
+    """The docstring's claim, held: ``bad-root`` after the rename leaves the one copy in the tree (the caller parks
+    it back); before it, nothing moved."""
+    w.put_keep()
+
+    def boom(p):
+        if p == point:
+            raise OSError(errno.EIO, "injected")
+    with pytest.raises(Refused) as e:
+        w.run(fault=boom)
+    assert e.value.name == "bad-root"
+    assert w.state() == ([], [NAME])
+    park_move(w.facts, owner_ok=mine)
     assert w.state() == ([NAME], [])
 
 

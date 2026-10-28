@@ -493,6 +493,32 @@ def test_identity_changed_status_refused_is_said_and_teardown_runs(tmp_path: Pat
     assert [v["verb"] for v in r.verbs()][-1] == "teardown"
 
 
+@bounded(60)
+def test_identity_changed_text_makes_no_custody_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """L3 r1 (complement + codex): start's park-back is best-effort, so the supervisor never says where the login
+    is; teardown's own line is the only custody answer."""
+    r = g3rig(tmp_path, monkeypatch)
+    assert r.run(auth="passthrough") == 1
+    said = _said(r)
+    assert "back in the slot's keep" not in said and "is back" not in said
+    assert "Nothing was launched." in said
+
+
+@bounded(60)
+@pytest.mark.parametrize("exc", [OSError(5, "injected"), TimeoutError("injected"), ValueError("injected")])
+def test_identity_refused_never_raises_and_teardown_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                         exc: Exception) -> None:
+    r = g3rig(tmp_path, monkeypatch)
+
+    def boom(ans):
+        raise exc
+    monkeypatch.setattr(SV, "identity_answer", boom)
+    assert r.run(auth="passthrough") == 1
+    said = _said(r)
+    assert "identity-changed" in said and PLANTED not in said
+    assert [v["verb"] for v in r.verbs()][-1] == "teardown"
+
+
 def _codex_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host: str) -> Rig:
     probe = {"address": "192.0.2.10", "addresses": 2, "host": host, "ok": True, "probe": "closed"}
     r = rig(tmp_path, monkeypatch, FAKE_PROBES="raw",

@@ -1490,8 +1490,20 @@ class Supervisor:
     def _identity_refused(self, session: str) -> None:
         """``start`` refused ``identity-changed``: the account shown comes from root's ``status`` record only (its
         ``identity``), never from the pty tail, which the slot can write. The tail's refusal name only routes here;
-        the text is said only when the record also says ``identity-changed``. A refusal is said, never raised:
-        teardown still runs."""
+        the text is said only when the record also says ``identity-changed``. A refusal or any other error is said,
+        never raised: teardown still runs. No line says where the login is: start's park-back is best-effort and
+        END's park is the backstop (L3 r1), so teardown's own line is the only custody answer."""
+        try:
+            self._identity_refused_said(session)
+        except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
+            why = e.name if isinstance(e, Refused) else type(e).__name__
+            try:
+                self.say(f"identity-changed: the slot's stored login did not match its baseline; no account shown: "
+                         f"{why}")
+            except Exception:   # noqa: BLE001 - stderr itself refused; the teardown still runs
+                pass
+
+    def _identity_refused_said(self, session: str) -> None:
         try:
             oid, result = identity_answer(self.helper("status", session, stdin=None))
         except Refused as e:
@@ -1506,8 +1518,8 @@ class Supervisor:
             return
         n = self._slot_index
         self.say(f"slot {n}'s stored {name} login now answers as account {oid} (the server's answer), not the "
-                 f"account confirmed as this slot's baseline. Nothing was launched; the login is back in the "
-                 f"slot's keep. To use another account on this slot, sign in again: levain session {vendor} "
+                 f"account confirmed as this slot's baseline. Nothing was launched. To use another account on "
+                 f"this slot, sign in again: levain session {vendor} "
                  f"--auth passthrough --login --slot {n}, and answer yes.")
 
     # -- a login session's confirm-identity (§5.1, §7.6) ---------------------------------------------------------------

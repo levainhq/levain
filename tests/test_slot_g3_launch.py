@@ -12,6 +12,14 @@ def test_identity_gated_is_exactly_the_identity_calls() -> None:
     assert set(L.IDENTITY_GATED) <= set(L.VENDORS)
 
 
+def test_identity_gated_equals_the_credential_vendors_and_the_identity_calls() -> None:
+    """L3 r1 (deepseek): start runs the gate only for a vendor in end.CREDENTIALS, so a vendor launch admits with no
+    credential entry would launch ungated. The three sets are one set."""
+    from levain.slot import end as E
+
+    assert set(L.IDENTITY_GATED) == set(E.CREDENTIALS) == set(identity.IDENTITY_CALLS)
+
+
 @pytest.mark.parametrize("vendor", ["claude", "codex"])
 def test_passthrough_without_login_parses_to_interactive(vendor: str) -> None:
     req = L.parse([vendor, "--repo", "/r", "--auth", "passthrough"])

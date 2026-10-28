@@ -235,7 +235,16 @@ def read_slot_baseline(ctx: H.Ctx, a: R.Alloc) -> Dict[str, str]:
             raise Refused("bad-baseline", "owner")
         if st.st_size > BASELINE_MAX_BYTES:
             raise Refused("bad-baseline", f"{st.st_size} bytes")
-        data = os.read(fd, BASELINE_MAX_BYTES + 1)
+        buf = bytearray()
+        while len(buf) <= BASELINE_MAX_BYTES:   # one read may answer short: read to EOF, never past the cap + 1
+            try:
+                chunk = os.read(fd, BASELINE_MAX_BYTES + 1 - len(buf))
+            except OSError as e:
+                raise Refused("bad-baseline", f"read: {e.strerror or e}") from None
+            if not chunk:
+                break
+            buf += chunk
+        data = bytes(buf)
     finally:
         os.close(fd)
     if len(data) > BASELINE_MAX_BYTES:
@@ -266,12 +275,18 @@ def gate_check(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str]) -> Dict[str,
     (:func:`_cas_gate_identity`) and compared with ``baseline``. Returns what was recorded, for an equal answer.
     A call that refused is recorded ``{result: <name>}`` and raised by that name; an answer that differs is recorded
     ``{observed_id, result: identity-changed}`` and raised ``identity-changed``; a refused record CAS is raised by
-    its own name, so a launch never outruns the record. The answer is equal when the id and the vendor match and
+    its own name, so a launch never outruns the record (after a refused call, that call's name is kept in the
+    detail). The answer is equal when the id and the vendor match and
     "not a check" belongs to the vendor with no check only."""
     try:
         oid = identity_call(ctx, a.vendor, a, held=True)
     except Refused as e:
-        _cas_gate_identity(ctx, a.session, {"result": e.name})
+        try:
+            _cas_gate_identity(ctx, a.session, {"result": e.name})
+        except Refused as ce:
+            # the CAS's name is the answer (no launch outruns the record); the call's own cause stays in the detail
+            raise Refused(ce.name, f"{ce.detail}; the identity call had refused {e.name}"
+                          + (f": {e.detail}" if e.detail else "")) from None
         raise
     same = (oid == baseline["observed_id"] and baseline["vendor"] == a.vendor
             and (oid == NOT_A_CHECK) == (a.vendor == "codex"))

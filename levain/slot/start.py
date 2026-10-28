@@ -665,10 +665,11 @@ def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
     """The interactive passthrough session's keep/ return and §7.6 compare, before the clone (DESIGN g3 §1-§2), under
     the session END lock the caller holds: the slot's baseline read (:func:`levain.slot.identity.read_slot_baseline`),
     the vendor's parked credential moved from ``keep/`` into the session tree (:func:`levain.slot.end.return_move`),
-    then :func:`levain.slot.identity.gate_check`. A refusal of the baseline or of the return moves nothing. A refusal
-    after the credential reached the tree (or any other error there) is followed by a best-effort
-    :func:`levain.slot.end.park_move` of it back into ``keep/``: a failure there is noted and END's park is the
-    backstop. No baseline is written on this path."""
+    then :func:`levain.slot.identity.gate_check`. A refusal of the baseline, and the return's three refusals before
+    any move (:data:`_RETURN_UNMOVED`), move nothing. Every other failure once the return was entered (its
+    ``bad-root`` may come after its rename: L3 r1 F1), and every refusal after it, is followed by a best-effort
+    :func:`levain.slot.end.park_move` of the credential back into ``keep/`` (a no-op when it never left): a failure
+    there is noted and END's park is the backstop. No baseline is written on this path."""
     seams = ctx.seams
     seams.at("identity-gate")
     baseline = ID.read_slot_baseline(ctx, a)
@@ -676,7 +677,9 @@ def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
     es = end_seams(ctx, a)
     try:
         E.return_move(facts, slot_owner_ok=slot_owner_ok, owner_ok=es.owner_ok, fault=es.fault)
-    except Refused:
+    except Refused as e:
+        if not _return_unmoved(e.name):
+            _park_back(facts, es, a)
         raise
     except BaseException:
         _park_back(facts, es, a)
@@ -688,6 +691,14 @@ def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
     except BaseException:
         _park_back(facts, es, a)
         raise
+
+
+#: ``end.return_move``'s refusals that come before any move (``no-credential:<tag>`` by its prefix).
+_RETURN_UNMOVED = ("keep-shape", "keep-return-conflict")
+
+
+def _return_unmoved(name: str) -> bool:
+    return name in _RETURN_UNMOVED or name.startswith("no-credential:")
 
 
 def _park_back(facts: E.EndFacts, es: E.EndSeams, a: R.Alloc) -> None:
