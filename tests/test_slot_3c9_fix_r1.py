@@ -147,7 +147,7 @@ def test_routes_base_names_the_merged_ids_on_not_durable(L, monkeypatch):
     _not_durable_on(monkeypatch, "base.json")
     err = io.StringIO()
     got = IH.run_routes_base(ME, "darwin", lock=_Lock(), store_seams=_rs(L), err=err)
-    assert got == {"verb": "routes-base", "routes": ["anthropic", "claude-subscription", "egress-default"],
+    assert got == {"verb": "routes-base", "routes": ["anthropic", "claude-subscription", "codex-subscription", "egress-default"],
                    "written": True}
     assert "not durable" in err.getvalue()
 
