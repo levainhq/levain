@@ -1389,6 +1389,8 @@ class Supervisor:
             ok = self._start(session)
             if not ok and self._start_refused == "identity-changed":
                 self._identity_refused(session)
+            elif not ok and self._start_refused == "identity-expired":
+                self._identity_expired(session)
             if ok and self.req.kind == "login":
                 self._confirm_identity(session)
         except Refused as e:
@@ -1487,7 +1489,7 @@ class Supervisor:
         self.say(f"{self.req.vendor} exited {res.get('exit')}" + ("" if code == 0 else f" (helper exit {code})"))
         return code == 0
 
-    def _identity_refused(self, session: str) -> None:
+    def _identity_refused(self, session: str) -> None:  # identity-changed; see _identity_expired for the other
         """``start`` refused ``identity-changed``: the account shown comes from root's ``status`` record only (its
         ``identity``), never from the pty tail, which the slot can write. The tail's refusal name only routes here;
         the text is said only when the record also says ``identity-changed``. A refusal or any other error is said,
@@ -1500,6 +1502,32 @@ class Supervisor:
             try:
                 self.say(f"start refused identity-changed, but root's record could not be read ({why}); no account shown. "
                          "Nothing was launched.")
+            except Exception:   # noqa: BLE001 - stderr itself refused; the teardown still runs
+                pass
+
+    def _identity_expired(self, session: str) -> None:
+        """``start`` refused ``identity-expired``: the tail's refusal name only routes here; the sign-in-again text is
+        said only when root's ``status`` record also says ``identity-expired``, never from the pty tail. Any failure
+        is said as a neutral line, never raised: teardown still runs."""
+        neutral = ("start refused identity-expired, but root's record could not be read ({why}); "
+                   "Nothing was launched.")
+        try:
+            try:
+                _oid, result = identity_answer(self.helper("status", session, stdin=None))
+            except Refused as e:
+                self.say(neutral.format(why=f"refused {e.name}"))
+                return
+            if result != "identity-expired":
+                self.say(neutral.format(why="its record does not say identity-expired"))
+                return
+            vendor = self.req.vendor
+            n = self._slot_index
+            self.say(f"slot {n}'s stored {({'claude': 'Claude', 'codex': 'Codex'}).get(vendor, vendor)} login looks "
+                     f"expired or revoked. Nothing was launched. Sign in again: levain session {vendor} "
+                     f"--auth passthrough --login --slot {n}")
+        except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
+            try:
+                self.say(neutral.format(why=type(e).__name__))
             except Exception:   # noqa: BLE001 - stderr itself refused; the teardown still runs
                 pass
 
