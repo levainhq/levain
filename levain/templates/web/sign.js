@@ -211,7 +211,9 @@
     head(r.title || Noun, r.requester ? "From " + r.requester : "");
     const body = $("sheet-body");
     if (r.refused) { $("sheet").dataset.state = "refused"; return body.appendChild(el("p", "", "Not signable: " + r.refused)); }
-    body.appendChild(el("pre", "sheet-message", typeof r.message === "string" ? r.message : ""));
+    const msg = body.appendChild(el("pre", "sheet-message", typeof r.message === "string" ? r.message : ""));
+    // a dispatch job is shown whole (every path, every change): its box scrolls, it is never cut to fit
+    if (dispatch) { msg.id = "sheet-contract"; msg.tabIndex = 0; Object.assign(msg.style, { maxHeight: "50vh", overflow: "auto" }); }
     if (r.expires_at) body.appendChild(el("p", "ext-meta", "Open until " + r.expires_at));
     // what the server says about this request beside its options (a consent allow only the laptop key signs)
     if (typeof r.note === "string" && r.note && signersOf(r).length) {
@@ -225,6 +227,8 @@
     const rp = typeof got.rp_id === "string" && got.rp_id ? got.rp_id : window.location.hostname;
     const signers = signersOf(r);
     const held = got.credentials && typeof got.credentials === "object" ? got.credentials : {};
+    // a dispatch job this page cannot show whole (or read) offers nothing: it is reviewed on the laptop
+    if (dispatch && r.review) return review(r.note);
     if (!signers.length) return escalate(rp, got.note);
 
     // the keys that may sign this, with the provider the cockpit names for each (display only)
@@ -238,6 +242,25 @@
   }
 
   function signersOf(r) { return Array.isArray(r.signers) ? r.signers.filter((fp) => typeof fp === "string") : []; }
+
+  // a dispatch job the cockpit will not have signed from this page (its change set is longer than the page lists, or its
+  // record could not be read): no act and no ceremony, and where it is reviewed, in the server's words
+  function review(note) {
+    $("sheet").dataset.state = "review";
+    const card = el("div", "sheet-escalate");
+    card.id = "sheet-review";
+    card.appendChild(el("p", "", "This one needs review on the laptop: nothing is signed from this page."));
+    if (typeof note === "string" && note) card.appendChild(el("p", "ext-meta", note));
+    $("sheet-body").appendChild(card);
+  }
+  // the job read again and drawn afresh (an authorise whose challenge was not the card shown): its version, its card
+  function redraw() {
+    return readRequest().then((got) => {
+      $("sheet-body").replaceChildren();
+      $("sheet-actions").replaceChildren();
+      draw(got);
+    });
+  }
 
   // §4A.3 rule 4: no key that may sign this request, so no ceremony is started; what it needs, and where it is signed
   function escalate(rp, note) {
@@ -302,6 +325,9 @@
           relabel("Not signed");
           ended();
           busy = false;
+          // the authorise challenge was not the card this sheet showed: nothing was signed; the job is read again and
+          // drawn afresh (its new version and card), and the cockpit reads its board again
+          if (done === "changed") { tell("reload"); return redraw(); }
           lock(false);
         });
     };
@@ -352,7 +378,8 @@
       miss.id = "sheet-pick-miss";
       $("sheet-body").insertBefore(miss, $("sheet-body").firstChild);
     }
-    if (!options.length) acts.appendChild(button("Sign with your passkey", po ? "" : "dev-primary", () => run(undefined, undefined)));
+    // a dispatch job is only ever signed through an act its row offers: no options, no button (never a bare "Sign")
+    if (!options.length && !dispatch) acts.appendChild(button("Sign with your passkey", po ? "" : "dev-primary", () => run(undefined, undefined)));
     for (const o of options) {
       if (!o || typeof o.key !== "string") continue;
       const b = button("(" + o.key + ") " + String(o.text), o.key === r.recommended ? "sheet-rec" : "", tap(o));
@@ -484,6 +511,19 @@
     return call(base + steps[0], body).then((c) => {
       if (!c.ok) return unsigned("Not signed: " + why(c));
       if (!decodable(c.body.challenge)) return unsigned("The cockpit sent a malformed challenge");
+      // an authorise lands the run and branch the SERVER builds now: before any passkey is asked, the challenge's payload
+      // must be the run, branch and tier this sheet showed; a recommendation that moved since is never signed from here
+      if (dispatch && choice === "authorise") {
+        const card = r.authorise && typeof r.authorise === "object" ? r.authorise : null;
+        const p = c.body.payload && typeof c.body.payload === "object" ? c.body.payload : {};
+        if (!card || card.run === null || card.run === undefined || String(p.run) !== String(card.run)
+            || p.onto !== card.onto || c.body.tier !== card.tier) {
+          say("Not signed: the cockpit's authorise is for run " + String(p.run) + " onto " + String(p.onto)
+              + " (tier " + String(c.body.tier) + "), not run " + (card ? String(card.run) + " onto " + String(card.onto)
+              + " (tier " + String(card.tier) + ")" : "?") + " as this sheet showed; nothing was signed. Read it again below.", "bad");
+          return "changed";
+        }
+      }
       if (typeof c.body.line === "string") { line = c.body.line; signing(line, "server", "Signing"); }
       say("Confirm with your passkey to sign…" + (line ? " " + line : ""));
       // the passkey asked for by its id when one decodes; an id that does not is dropped (the OS's own list), never a throw

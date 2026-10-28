@@ -5241,9 +5241,10 @@
     if (!frame || ev.source !== frame.contentWindow || ev.origin !== window.location.origin) return;
     const what = ev.data && typeof ev.data === "object" ? ev.data.levainSheet : null;
     if (what === "ack") { clearTimeout(signSheetAsk); signSheetAsk = null; }
-    else if (what === "close") closeSignSheet();
+    else if (what === "close") { closeSignSheet(); dispatchStale(); }
     else if (what === "signed" || what === "reload") {
-      // the sheet's line stays on it until it is closed; the board under it reads again
+      // the sheet's line stays on it until it is closed; the board under it reads again, and the dispatch jobs with it
+      dispatchStale();
       rereadBoard();
     }
   });
@@ -6257,11 +6258,14 @@
     dispatchFill(slot);
     return slot;
   }
-  let dispatchFillSeq = 0;      // the newest fill wins: an older read answering late never redraws over a newer one
+  // the newest fill OF THIS SLOT wins: an older read answering late never redraws over a newer one; a sequence per slot,
+  // so a second slot (the board's and the history's) never stops the first from filling
+  const dispatchFillSeq = new WeakMap();
   function dispatchFill(slot) {
-    const n = ++dispatchFillSeq;
+    const n = (dispatchFillSeq.get(slot) || 0) + 1;
+    dispatchFillSeq.set(slot, n);
     dispatchFetch().then((b) => {
-      if (!b || n !== dispatchFillSeq) return;
+      if (!b || n !== dispatchFillSeq.get(slot)) return;
       const note = typeof b.note === "string" ? b.note : "";
       const why = typeof b.elsewhere === "string" ? b.elsewhere : "";
       if (!b.requests.length && !note) { slot.replaceChildren(); return; }
@@ -6270,6 +6274,12 @@
                            ...(why ? [el("div", "consent-note ext-meta dispatch-why", why)] : []),
                            ...b.requests.map(dispatchCard), ...over);
     }).catch(() => {});
+  }
+  // the sheet signed, asked for a reload, or closed: the dispatch read is dropped (as a board reload drops it) and every
+  // dispatch slot on the page reads again, so a job signed or cancelled there never stays on a card for the read's 30 s
+  function dispatchStale() {
+    dispatchRead = null;
+    for (const s of document.querySelectorAll(".dispatch-slot")) dispatchFill(s);
   }
   // the Decisions history's standing-rule slots (and the dispatch jobs), drawn together wherever the proposals are
   function standingSlots() {

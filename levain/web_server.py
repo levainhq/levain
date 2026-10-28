@@ -562,7 +562,11 @@ class DispatchSheet:
         return _PhoneServer._source(self, root)    # type: ignore[arg-type]
 
     def elsewhere(self) -> "str | None":
-        """Why no dispatch signature made on this cockpit's page can verify, or None."""
+        """Why no dispatch signature made on this cockpit's page can verify, or None. No pinned page is checked first:
+        ``localhost`` takes any port, never no page at all."""
+        if self.page_origin is None:
+            return ("a dispatch signature verifies only against the page this cockpit is pinned to, and it is not "
+                    "pinned to one: sign it from the terminal (levain dispatch sign)")
         if self.rp_id == "localhost" or self.page_origin == f"https://{self.rp_id}":
             return None
         return (f"a dispatch signature verifies only when signed on https://{self.rp_id} (no port), and this cockpit is "
@@ -585,37 +589,102 @@ class DispatchSheet:
 
     @staticmethod
     def version(rec: "Mapping[str, Any]") -> str:
-        """The version a sheet row and a card's link name one job by: its id, digest, state and lease."""
-        return hashlib.sha256(json.dumps([rec.get("id"), rec.get("digest"), rec.get("state"),
-                                          rec.get("lease_end")]).encode()).hexdigest()
+        """The version a sheet row and a card's link name one job by: its id, digest, state and lease, and the run,
+        branch and tier of its authorise card (so a recommendation that moved reads as changed: a pick made on the old
+        card is never offered on the new one)."""
+        card = rec.get("authorise") if isinstance(rec.get("authorise"), dict) else {}
+        return hashlib.sha256(json.dumps([rec.get("id"), rec.get("digest"), rec.get("state"), rec.get("lease_end"),
+                                          card.get("run"), card.get("onto"), card.get("tier")]).encode()).hexdigest()
+
+    @staticmethod
+    def _contract_lines(rec: "Mapping[str, Any]") -> "list[str]":
+        """The job as the sheet shows it, every field the phone's card shows (``levain dispatch show``'s): the goal in
+        full, each digest-bound contract field, EVERY read and write entry (never cut, never an ellipsis), then the
+        job's lease, signer, filer and history. The strings are the record's, already made visible."""
+        def q(v: Any) -> str:
+            return "?" if v is None or v == "" else str(v)
+
+        def entries(rows: Any) -> "list[str]":
+            return [f"  {q(e.get('path'))}  " + ("(new file)" if e.get("mode") == "new"
+                                                  else f"{q(e.get('mode'))} {q(e.get('blob'))}")
+                    for e in (rows if isinstance(rows, list) else []) if isinstance(e, dict)]
+
+        t = rec.get("template") if isinstance(rec.get("template"), dict) else {}
+        b = rec.get("budget") if isinstance(rec.get("budget"), dict) else {}
+        listed = lambda v: ", ".join(map(str, v)) if isinstance(v, (list, tuple)) else q(v)  # noqa: E731
+        tools = ", ".join(" ".join(map(str, p)) if isinstance(p, (list, tuple)) else str(p)
+                          for p in (t.get("tool_versions") or []))
+        reads, writes = rec.get("read") or [], rec.get("write") or []
+        history = [h for h in (rec.get("history") or []) if isinstance(h, dict)]
+        return [str(rec.get("goal", "")), "",
+                f"job       {q(rec.get('id'))}  [{q(rec.get('state'))}]",
+                f"repo      {q(rec.get('repo'))}",
+                f"base      {q(rec.get('base'))} (tree {q(rec.get('base_tree'))})",
+                f"digest    {q(rec.get('digest'))}",
+                f"template  {q(t.get('id'))}  tier {q(t.get('tier'))}  ({q(t.get('content_hash'))})",
+                f"executor  {q(t.get('executor'))}, models {listed(t.get('models'))} (k={q(t.get('k'))}), "
+                f"provider {q(t.get('provider'))} via {q(t.get('route'))}",
+                f"verifier  {q(t.get('verifier_id'))} ({q(t.get('verifier_kind'))}, {q(t.get('verifier_hash'))})",
+                f"tools     {tools or '(none)'}",
+                f"budget    {q(b.get('tool_calls'))} tool calls, {q(b.get('tokens'))} tokens, "
+                f"{q(b.get('dollars_cents'))} cents (executor)",
+                f"grant     {listed(rec.get('grant'))} over the write list",
+                f"expires   {q(rec.get('expires_at'))}",
+                f"lease     {q(rec.get('lease_end'))}",
+                f"policy    {q(rec.get('policy_hash'))}",
+                f"signer    {rec.get('signer_fp') or '(not signed)'}",
+                f"filed by  {rec.get('agent') or '(no agent named)'}, session {q(rec.get('session'))} "
+                f"at {q(rec.get('filed_at'))}",
+                f"read ({len(reads)}, what the executor sees and the provider receives):", *entries(reads),
+                f"write ({len(writes)}, the only files a result may change):", *entries(writes),
+                f"template write paths: {listed(t.get('write_paths'))}",
+                "history:", *[f"  {q(h.get('seq'))} {q(h.get('to_state'))} {q(h.get('cause'))} {q(h.get('at'))}"
+                              + (f"  {h['evidence']}" if h.get("evidence") else "") for h in history]]
+
+    @staticmethod
+    def _change_line(c: "Mapping[str, Any]") -> str:
+        """One change of an authorise card: its status, its line counts (a binary or gitlink has none) and its path."""
+        a, d = c.get("added"), c.get("deleted")
+        counts = f"+{a} -{d}" if isinstance(a, int) and isinstance(d, int) else "no line count"
+        flags = "".join(f" ({w})" for w in ("binary", "gitlink") if c.get(w))
+        return f"  {c.get('status')}  {counts}  {c.get('path')}{flags}"
 
     def _row(self, rec: "Mapping[str, Any]", problem: "str | None") -> "dict[str, Any]":
         """One record (:meth:`DispatchPhone.record`) as a sheet row: ``options`` the acts open to a passkey (sign, cancel,
-        authorise), each with the ``signers`` that may do THAT act (the sign tier's and the landing tier's differ)."""
+        authorise), each with the ``signers`` that may do THAT act (the sign tier's and the landing tier's differ).
+
+        The message is the whole job (:meth:`_contract_lines`) and, for an authorise card, EVERY change it lands with
+        its status and line counts. A card that does not hold every change (``change_overflow``: past the phone's own
+        cap) offers NO act: the row says it is reviewed on the laptop (``review``), as a cockpit pinned elsewhere does.
+        ``authorise``: the card's run, branch and tier, which the sheet checks the authorise challenge against."""
         from levain.dispatch.sign import FIELD_MAX
 
         job_id, state = str(rec.get("id")), str(rec.get("state"))
-        t = rec.get("template") if isinstance(rec.get("template"), dict) else {}
-        budget = rec.get("budget") if isinstance(rec.get("budget"), dict) else {}
-        writes = [str(w.get("path")) for w in rec.get("write", []) if isinstance(w, dict)]
-        lines = [str(rec.get("goal", "")), "",
-                 f"repo      {rec.get('repo')} @ {str(rec.get('base'))[:12]}",
-                 f"template  {t.get('id')} ({t.get('executor')} via {t.get('provider')}, tier {t.get('tier')})",
-                 f"budget    {budget.get('tool_calls')} tool calls, {budget.get('tokens')} tokens, "
-                 f"{budget.get('dollars_cents')} cents",
-                 f"writes    {len(writes)} path{'s' if len(writes) != 1 else ''}: "
-                 + ", ".join(writes[:12]) + (" …" if len(writes) > 12 else ""),
-                 f"expires   {rec.get('expires_at')}", f"digest    {rec.get('digest')}"]
+        lines = self._contract_lines(rec)
         card = rec.get("authorise") if isinstance(rec.get("authorise"), dict) else None
+        changes = [c for c in (card.get("changes") or []) if isinstance(c, dict)] if card is not None else []
+        over = card.get("change_overflow") if card is not None else 0
+        over = over if isinstance(over, int) and over > 0 else 0
         if card is not None and card.get("onto"):
             lines += ["", f"Authorise run {card.get('run')} onto {card.get('onto')} · tier {card.get('tier')} · "
-                          f"{card.get('files')} file(s), {card.get('changed_lines')} changed line(s)"]
-            lines += [f"  {c.get('status')}  {c.get('path')}" for c in (card.get("changes") or [])[:15]]
+                          f"{card.get('files')} file(s), {card.get('changed_lines')} changed line(s)"
+                          + (f" · staged {card.get('staged')} on {card.get('base')}" if card.get("staged") else ""),
+                      *[self._change_line(c) for c in changes]]
+            if over:
+                lines.append(f"  ({over} more change{'s are' if over != 1 else ' is'} not listed here)")
         row: dict[str, Any] = {
             "id": job_id, "kind": "dispatch", "mode": "dispatch", "state": state, "sha256": self.version(rec),
             "title": f"dispatch · {state}", "requester": rec.get("agent"), "message": "\n".join(lines),
             "expires_at": rec.get("lease_end") if state == "filed" else None, "options": [], "signers": [],
             "recommended": None, "agent": rec.get("agent"), "goal": str(rec.get("goal", ""))[:300]}
+        if card is not None and card.get("onto"):
+            row["authorise"] = {"run": card.get("run"), "onto": card.get("onto"), "tier": card.get("tier")}
+        if problem is None and over:
+            # never signed or authorised from a summary: the set the passkey would land is not all on this page
+            row["review"] = True
+            problem = (f"this run changes {card.get('files')} files and this page lists {len(changes)} of them, so "
+                       f"nothing is signed from this page: review it on the laptop (levain dispatch show {job_id}; "
+                       f"levain dispatch authorise {job_id} --run {card.get('run')} --onto {card.get('onto')})")
         if problem is not None:
             row["note"] = problem
             return row
@@ -656,16 +725,29 @@ class DispatchSheet:
     def row(self, job_id: str) -> "dict[str, Any] | None":
         """The sheet's row for one job that is still live, else None (no store, no such job, or a final state)."""
         from levain.cockpit.consent import utc_stamp
+        from levain.dispatch import DispatchError
         from levain.dispatch.jobs import TERMINAL
 
         store = self.phone._store()
         job = None if store is None else store.get(job_id)
-        if job is None or job.state in TERMINAL:
+        if job is None:
             return None
-        problem = self.elsewhere()
-        signers, note = self.phone._signers()
-        rec = self.phone.record(job, utc_stamp(self.phone._clock()), list(signers), note)
-        return self._row(rec, problem)
+        # the job's state and its record are read under pending()'s own guard: a job whose stored row cannot be read
+        # is a row that offers nothing and says why, never a 500 and never a ceremony
+        try:
+            if job.state in TERMINAL:
+                return None
+            signers, note = self.phone._signers()
+            rec = self.phone.record(job, utc_stamp(self.phone._clock()), list(signers), note)
+        except (DispatchError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+            why = (f"dispatch job {job_id} could not be read ({type(exc).__name__}), so nothing is signed from this page: "
+                   f"read it on the laptop (levain dispatch show {job_id})")
+            return {"id": job_id, "kind": "dispatch", "mode": "dispatch", "state": "unreadable",
+                    "sha256": hashlib.sha256(json.dumps([job_id, "unreadable", type(exc).__name__]).encode()).hexdigest(),
+                    "title": "dispatch · could not be read", "requester": None, "message": "", "expires_at": None,
+                    "options": [], "signers": [], "recommended": None, "agent": None, "goal": "", "review": True,
+                    "note": why}
+        return self._row(rec, self.elsewhere())
 
 
 def _extra_hosts(hosts: object) -> frozenset[str]:

@@ -269,6 +269,150 @@ def test_a_cockpit_pinned_to_a_ported_page_refuses_every_step_before_a_ceremony(
     assert _state(world, job.id) == "filed"
 
 
+# --- fix round 1 (L3 os2d r1): never sign or authorise from a truncated summary; the authorise bound to the card shown ---
+
+def _file_wide(world: Any, paths: "list[str]") -> Any:
+    """A filed job whose contract writes every path in ``paths`` (a template whose write set holds them)."""
+    from datetime import datetime, timedelta, timezone
+
+    from levain.cockpit.consent import utc_stamp
+    from tests.test_dispatch_contract import POLICY, registry, submission, template
+
+    path, base = world["repo"]
+    sub = submission(path, base, write=paths, expires_at=utc_stamp(datetime.now(timezone.utc) + timedelta(hours=2)))
+    job, _cap = JobStore(world["qdir"]).file(sub, resolve_template=registry(template(write_paths=frozenset(paths))),
+                                             policy=POLICY, filer_session="sess-1", filer_agent="claude_code")
+    return job
+
+
+def _card(changes: "list[dict[str, Any]]", *, run: int = 1, onto: str = "main", tier: str = "T2", overflow: int = 0,
+          signers: "list[str]") -> "dict[str, Any]":
+    """An authorise card in DispatchPhone._authorise_card's exact shape."""
+    return {"onto": onto, "run": run, "tier": tier, "changes": changes, "change_overflow": overflow,
+            "files": len(changes) + overflow, "changed_lines": sum(c["added"] + c["deleted"] for c in changes),
+            "signers": signers, "note": "", "problem": None, "staged": "f" * 40, "base": "e" * 40}
+
+
+def _changes(n: int) -> "list[dict[str, Any]]":
+    return [{"path": f"src/c{i:02d}.py", "status": "M" if i % 2 else "A", "added": i + 1, "deleted": i,
+             "binary": False, "gitlink": False} for i in range(n)]
+
+
+def _recommended(httpd: Any, job: Any, card: "dict[str, Any]", monkeypatch: Any) -> None:
+    """The listing's job read as recommended with ``card`` as its authorise card (the phone's record, the card swapped)."""
+    phone = httpd.dispatch_sheet.phone
+    real = phone.record
+
+    def record(j: Any, now: str, signers: "list[str]", note: str) -> "dict[str, Any]":
+        rec = real(j, now, signers, note)
+        if j.id == job.id:
+            rec.update({"state": "recommended", "can_sign": False, "authorise": card})
+        return rec
+
+    monkeypatch.setattr(phone, "record", record)
+
+
+def test_a_thirteen_path_contract_is_shown_whole_never_cut_with_an_ellipsis(world, tmp_path) -> None:
+    """codex HIGH 1: the digest binds every write path; a sheet that showed 12 and an ellipsis let a passkey sign a
+    contract whose scope it did not show. Every write path, the read set and each digest-bound field the phone shows."""
+    paths = [f"src/n{i:02d}.py" for i in range(13)]
+    job = _file_wide(world, paths)
+    with _serve(world, tmp_path) as (url, _httpd):
+        (row,) = _call(url, "/cockpit/dispatch.json")[1]["requests"]
+        got = _call(url, f"/cockpit/dispatch/{job.id}/sheet.json")[1]["request"]
+    assert got == row
+    msg = row["message"]
+    assert "…" not in msg and "..." not in msg, msg
+    for p in paths:
+        assert p in msg, (p, msg)
+    c = job.contract
+    t = c.template
+    for e in c.read:
+        assert e.path in msg and e.blob in msg, msg
+    for shown in (c.goal.split("\n")[0], c.base, c.base_tree, c.policy_hash, c.expires_at, job.digest, t.content_hash,
+                  t.verifier_hash, t.verifier_kind, t.route, t.provider, t.executor, *t.models, *c.grant,
+                  *sorted(t.write_paths), str(c.budget["tokens"])):
+        assert shown in msg, (shown, msg)
+    assert [o["key"] for o in row["options"]] == ["sign", "cancel"], row
+
+
+def test_a_sixteen_change_run_is_shown_change_by_change_with_its_counts(world, tmp_path, monkeypatch) -> None:
+    """codex HIGH 2: a recommended run of 16 changes showed 15 and Authorise landed all 16. Every change, its status
+    and its line counts, is on the sheet the Authorise is offered under."""
+    job = file_job(world)
+    key = world["phone"]
+    changes = _changes(16)
+    with _serve(world, tmp_path) as (url, httpd):
+        _recommended(httpd, job, _card(changes, signers=[key.fp]), monkeypatch)
+        (row,) = _call(url, "/cockpit/dispatch.json")[1]["requests"]
+    msg = row["message"]
+    assert "authorise" in [o["key"] for o in row["options"]], row
+    assert "…" not in msg, msg
+    for c in changes:
+        assert f"{c['status']}  +{c['added']} -{c['deleted']}  {c['path']}" in msg, (c, msg)
+    assert row["authorise"] == {"run": 1, "onto": "main", "tier": "T2"}, row
+
+
+def test_a_change_set_past_the_phones_cap_offers_nothing_and_says_review_it_on_the_laptop(world, tmp_path,
+                                                                                         monkeypatch) -> None:
+    """codex HIGH 2: ``change_overflow`` set means the card does not hold every change: no act is offered from a set
+    the sheet cannot show whole, and the row says so in the server's words."""
+    job = file_job(world)
+    key = world["phone"]
+    with _serve(world, tmp_path) as (url, httpd):
+        _recommended(httpd, job, _card(_changes(3), overflow=2, signers=[key.fp]), monkeypatch)
+        (row,) = _call(url, "/cockpit/dispatch.json")[1]["requests"]
+        got = _call(url, f"/cockpit/dispatch/{job.id}/sheet.json")[1]
+    assert row["options"] == [] and row["signers"] == [] and row["review"] is True, row
+    assert "on the laptop" in row["note"] and "levain dispatch show " + job.id in row["note"], row
+    assert got["request"]["options"] == [] and got["signers"] == [] and got["note"] == row["note"], got
+
+
+def test_the_version_binds_the_cards_run_branch_and_tier(world, tmp_path, monkeypatch) -> None:
+    """complement MED 3: a card whose recommendation moved (another run, another branch, another tier) reads as a
+    changed version, so a pick made on the old card is never offered on the new one."""
+    job = file_job(world)
+    key = world["phone"]
+    seen = []
+    with _serve(world, tmp_path) as (url, httpd):
+        for run, onto, tier in ((1, "main", "T2"), (0, "main", "T2"), (1, "work", "T2"), (1, "main", "T1")):
+            _recommended(httpd, job, _card(_changes(2), run=run, onto=onto, tier=tier, signers=[key.fp]), monkeypatch)
+            seen.append(_call(url, f"/cockpit/dispatch/{job.id}/sheet.json")[1]["request"]["sha256"])
+    assert len(set(seen)) == 4, seen
+
+
+def test_a_localhost_cockpit_with_no_pinned_page_is_elsewhere(world) -> None:
+    """deepseek MED 6: ``localhost`` short-circuited the pin; a sheet with no page_origin can verify nothing."""
+    from levain.web_server import DispatchSheet
+
+    signer = _signer(world)
+    sheet = DispatchSheet(world["qdir"], "localhost", None, signer)
+    assert sheet.elsewhere() is not None and "not pinned" in sheet.elsewhere()
+    assert DispatchSheet(world["qdir"], "localhost", "http://localhost:7428", signer).elsewhere() is None
+    assert DispatchSheet(world["qdir"], RP, PAGE, signer).elsewhere() is None
+    job = file_job(world)
+    from levain.dispatch.phone import DispatchRefused
+
+    with pytest.raises(DispatchRefused) as exc:
+        sheet.step(job.id, "challenge", {"signer_fp": world["phone"].fp})
+    assert exc.value.status == 422 and "nothing was signed" in exc.value.message
+    assert _state(world, job.id) == "filed"
+
+
+def test_a_record_that_cannot_be_read_is_a_row_with_nothing_offered(world, tmp_path, monkeypatch) -> None:
+    """complement LOW 5: row() guards DispatchPhone.record as pending() does: a job whose record cannot be read is a
+    row that offers nothing and says why, never a 500."""
+    job = file_job(world)
+    with _serve(world, tmp_path) as (url, httpd):
+        def broken(*_a: Any, **_k: Any) -> Any:
+            raise KeyError("template")
+
+        monkeypatch.setattr(httpd.dispatch_sheet.phone, "record", broken)
+        status, got = _call(url, f"/cockpit/dispatch/{job.id}/sheet.json")
+    assert status == 200 and got["request"]["options"] == [] and got["signers"] == [], got
+    assert "could not be read" in got["note"] and "KeyError" in got["note"], got
+
+
 def test_a_challenge_reply_carries_the_line_for_cancel_as_for_sign(world, tmp_path) -> None:
     job = file_job(world)
     with _serve(world, tmp_path) as (url, _httpd):
