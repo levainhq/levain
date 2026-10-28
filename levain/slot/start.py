@@ -8,9 +8,12 @@ CONTROL checks, never as a fact root acts on.
 
 ``start``, in §5.1's order, each step named for ``seams.at`` (tests observe the order and inject faults there):
 
-1. ``kind``: kind ``verifier`` answers ``verb-unbuilt:verifier`` (§5.6, session 2f); interactive passthrough answers
-   ``verb-unbuilt:identity-gate`` (the ``keep/`` return + the §7.6 gate are 2f's). A ``login`` session proceeds
-   with no ``keep/`` return: its credential is the one the vendor's login writes.
+1. ``kind``: kind ``verifier`` answers ``verb-unbuilt:verifier`` (§5.6, session 2f). A ``login`` session proceeds
+   with no ``keep/`` return: its credential is the one the vendor's login writes. An interactive passthrough
+   session runs :func:`_identity_gate` at the start of step 4, under the same lock: the slot's baseline read, the
+   parked credential returned from ``keep/`` into the session tree, the vendor's identity call recorded in the state
+   record's ``identity`` and compared with the baseline (``identity-changed`` when it differs). Any refusal there
+   precedes ``<S>/repo`` and the clone, and the credential is parked back into ``keep/``.
    ``vendor``: root's copy of the session's vendor CLI (its install unit) in ``VENDOR_PREFIX`` is not whole
    (:func:`check_vendor_installed`; setup and repair copy it there) = ``vendor-not-installed:<vendor>``, before any
    clone.
@@ -626,8 +629,6 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     seams.at("kind")
     if a.kind == "verifier":
         raise Refused("verb-unbuilt:verifier", "a verifier session's start is §5.6, session 2f's")
-    if a.auth == "passthrough" and a.kind == "interactive":
-        raise Refused("verb-unbuilt:identity-gate", "the keep/ return + the §7.6 gate are session 2f's")
     seams.at("vendor")
     vendor_ready(seams.host, a.vendor)
     egress = a.slot.slot_class == "egress"
@@ -655,6 +656,49 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     return {"exit": code}
 
 
+#: The owner rule :func:`_identity_gate` hands ``end.return_move`` for the credential's slot-owner check; ``None`` is
+#: return_move's own (``st_uid`` is alloc's slot uid).
+slot_owner_ok: Optional[Callable[[os.stat_result], bool]] = None
+
+
+def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
+    """The interactive passthrough session's keep/ return and §7.6 compare, before the clone (DESIGN g3 §1-§2), under
+    the session END lock the caller holds: the slot's baseline read (:func:`levain.slot.identity.read_slot_baseline`),
+    the vendor's parked credential moved from ``keep/`` into the session tree (:func:`levain.slot.end.return_move`),
+    then :func:`levain.slot.identity.gate_check`. A refusal of the baseline or of the return moves nothing. A refusal
+    after the credential reached the tree (or any other error there) is followed by a best-effort
+    :func:`levain.slot.end.park_move` of it back into ``keep/``: a failure there is noted and END's park is the
+    backstop. No baseline is written on this path."""
+    seams = ctx.seams
+    seams.at("identity-gate")
+    baseline = ID.read_slot_baseline(ctx, a)
+    facts = end_facts(ctx, a)
+    es = end_seams(ctx, a)
+    try:
+        E.return_move(facts, slot_owner_ok=slot_owner_ok, owner_ok=es.owner_ok, fault=es.fault)
+    except Refused:
+        raise
+    except BaseException:
+        _park_back(facts, es, a)
+        raise
+    try:
+        if seams.host == "linux" and a.cgroup:
+            seams.make_cgroup(a.cgroup)       # no clone has made it yet; the Claude child and its forwarder join it
+        ID.gate_check(ctx, a, baseline)
+    except BaseException:
+        _park_back(facts, es, a)
+        raise
+
+
+def _park_back(facts: E.EndFacts, es: E.EndSeams, a: R.Alloc) -> None:
+    """:func:`levain.slot.end.park_move` for a gate that refused: the one writer of ``keep/``. Never raises over the
+    refusal the caller is about to raise."""
+    try:
+        E.park_move(facts, owner_ok=es.owner_ok, fault=es.fault)
+    except Exception as e:   # noqa: BLE001 - the gate's own refusal is the answer; END's park is the backstop
+        _note(f"{a.session}: identity gate: the credential was not parked back: {_why(e)}")
+
+
 def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
     """``start`` from the repo step through the ACTIVE CAS, under the session END lock (``L/alloc/<session>.lock``,
     the one render takes and END waits on; reaper DESIGN RH1, the spawn fence). Every spawn into the slot (the
@@ -673,6 +717,8 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
         raise Refused("already-started", a.session)
     if rec is None or rec.state != R.RENDERED:
         raise Refused("not-rendered", f"{a.session}: {rec.state if rec else 'no record'}")   # SECRETS' own rule
+    if a.kind == "interactive" and a.auth == "passthrough" and a.vendor in E.CREDENTIALS:
+        _identity_gate(ctx, a)
     with ctx.store.dir("live", a.session) as sfd:
         _fresh_repo(ctx, a, sfd)
 
@@ -807,8 +853,7 @@ def identity_capture(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
     seams = ctx.seams
     try:
         with H.session_lock(ctx, a.session):
-            _identity_window(ctx, a)
-            return _identity_child(ctx, a)
+            return identity_capture_held(ctx, a, states=(R.ACTIVE, R.BRAKED))
     except Refused:
         raise
     except Exception as e:   # noqa: BLE001 - the lock's own open or close: the login ran, so the answer is a name
@@ -817,19 +862,26 @@ def identity_capture(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
         _wake(seams)        # an END that waited on the lock, or refused end-busy, is retried now
 
 
+def identity_capture_held(ctx: H.Ctx, a: R.Alloc, *, states: Sequence[str]) -> Tuple[int, bytes]:
+    """:func:`identity_capture` steps 1-6 with no session lock taken: the caller holds the session END lock (a second
+    ``session_lock`` would answer ``session-busy``). ``states``: the record states step 1 admits."""
+    _identity_window(ctx, a, states)
+    return _identity_child(ctx, a)
+
+
 def _why(e: BaseException) -> str:
     if isinstance(e, Refused):
         return e.name
     return type(e).__name__ + (f" errno {e.errno}" if isinstance(e, OSError) else "")
 
 
-def _identity_window(ctx: H.Ctx, a: R.Alloc) -> None:
+def _identity_window(ctx: H.Ctx, a: R.Alloc, states: Sequence[str] = (R.ACTIVE, R.BRAKED)) -> None:
     """:func:`identity_capture` steps 1-3. Any failure is ``identity-window`` but the record's ``not-active:<STATE>``."""
     try:
         if H.read_alloc(ctx, a.session) != a:
             raise Refused("identity-window", f"{a.session}: the alloc changed")
         rec = read_record(ctx, a.session)
-        if rec is None or rec.state not in (R.ACTIVE, R.BRAKED):
+        if rec is None or rec.state not in states:
             raise Refused(f"not-active:{rec.state if rec else 'none'}", a.session)
         _identity_empty(ctx, a, (), "before the call")
     except Refused as e:

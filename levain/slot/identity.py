@@ -16,11 +16,17 @@ baseline ``confirm-identity yes`` writes.
   ``identity.observed_id`` and the alloc's vendor and session, never from anything the slot wrote; ``no`` writes
   nothing. A record with no observed id refuses ``no-observed-id[:<result>]``.
 
+* An interactive passthrough session's ``start`` runs the same call before the vendor (:func:`gate_check`, with the
+  baseline from :func:`read_slot_baseline`): the answer is recorded in the state record's ``identity`` and compared
+  with the baseline's ``observed_id``; a difference refuses ``identity-changed``.
+
 The baseline file is root's, 0600, replaced atomically (temp, fsync, rename, directory fsync). :func:`baseline_vendor`
 reads it, and also the earlier vendor-only shape with no ``format`` key.
 """
 from __future__ import annotations
 
+import os
+import stat
 from typing import Callable, Dict, Mapping, Optional
 
 from levain.contracts import ContractError, canon
@@ -48,31 +54,35 @@ _VENDORS = ("claude", "codex")
 
 # --- the identity call (§7.6) ------------------------------------------------------------------------------------------
 
-def _codex_call(ctx: Optional[H.Ctx], a: Optional[R.Alloc]) -> str:
+def _codex_call(ctx: Optional[H.Ctx], a: Optional[R.Alloc], *, held: bool = False) -> str:
     return NOT_A_CHECK
 
 
-def _claude_call(ctx: Optional[H.Ctx], a: Optional[R.Alloc]) -> str:
+def _claude_call(ctx: Optional[H.Ctx], a: Optional[R.Alloc], *, held: bool = False) -> str:
     """IG-3: the child spawned as the slot (start's :func:`~levain.slot.start.identity_capture`), its line judged
-    here. Only for a session: with no ``ctx`` or alloc there is nothing to run as."""
+    here. Only for a session: with no ``ctx`` or alloc there is nothing to run as. ``held``: the caller (start's
+    pre-launch gate) already holds the session END lock and the record is RENDERED, so the lock-free
+    :func:`~levain.slot.start.identity_capture_held` runs, admitting RENDERED only."""
     if ctx is None or a is None:
         raise Refused("internal", "the Claude identity call runs for a session")
     from levain.slot import start as SS
 
+    if held:
+        return parse_profile_answer(*SS.identity_capture_held(ctx, a, states=(R.RENDERED,)))
     return parse_profile_answer(*SS.identity_capture(ctx, a))
 
 
-IDENTITY_CALLS: Mapping[str, Callable[[Optional[H.Ctx], Optional[R.Alloc]], str]] = {
-    "codex": _codex_call, "claude": _claude_call}
+IDENTITY_CALLS: Mapping[str, Callable[..., str]] = {"codex": _codex_call, "claude": _claude_call}
 
 
-def identity_call(ctx: Optional[H.Ctx], vendor: str, a: Optional[R.Alloc] = None) -> str:
+def identity_call(ctx: Optional[H.Ctx], vendor: str, a: Optional[R.Alloc] = None, *, held: bool = False) -> str:
     """The stable account id the vendor's identity call observed, checked against §7.6's pattern (else
-    ``identity-unparsable``), or :class:`Refused` by the call's own name."""
+    ``identity-unparsable``), or :class:`Refused` by the call's own name. ``held`` reaches the vendor's callable
+    (Codex ignores it)."""
     call = IDENTITY_CALLS.get(vendor)
     if call is None:
         raise Refused("identity-call-unbuilt", vendor[:32])
-    oid = call(ctx, a)
+    oid = call(ctx, a, held=held)
     if type(oid) is not str or not R.OBSERVED_ID_RE.fullmatch(oid):
         raise Refused("identity-unparsable", vendor)
     return oid
@@ -194,6 +204,85 @@ def baseline_vendor(data: Optional[bytes]) -> Optional[str]:
     return v if v in _VENDORS else "?"
 
 
+# --- the start gate (CONTRACT §7.6; DESIGN g3 §1-§2) --------------------------------------------------------------------
+
+#: DECISION: the most a baseline file may hold; ``baseline_bytes`` writes well under this.
+BASELINE_MAX_BYTES = 4096
+#: the record's ``identity.result`` for a gate that matched, that found another account, and a vendor with no check.
+GATE_MATCHED = "matched"
+GATE_CHANGED = "identity-changed"
+_BASELINE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+
+
+def read_slot_baseline(ctx: H.Ctx, a: R.Alloc) -> Dict[str, str]:
+    """``L/slots/<tag>/baseline`` for alloc's slot, read by dirfd with ``O_NOFOLLOW``: a regular file, trusted owner
+    (``seams.trusted``), at most :data:`BASELINE_MAX_BYTES`, passing :func:`check_baseline` whole and naming alloc's
+    vendor. Absent = ``no-baseline:<tag>``; any other failure (the earlier vendor-only shape included) =
+    ``bad-baseline`` with the reason in the detail."""
+    tag = a.slot.tag
+    with ctx.store.dir("slots", tag) as sfd:
+        try:
+            fd = os.open(BASELINE_NAME, _BASELINE_FLAGS, dir_fd=sfd)
+        except FileNotFoundError:
+            raise Refused(f"no-baseline:{tag}", f"slots/{tag}/baseline is absent") from None
+        except OSError as e:
+            raise Refused("bad-baseline", f"open: {e.strerror or e}") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused("bad-baseline", "not a regular file")
+        if not ctx.seams.trusted(st):
+            raise Refused("bad-baseline", "owner")
+        if st.st_size > BASELINE_MAX_BYTES:
+            raise Refused("bad-baseline", f"{st.st_size} bytes")
+        data = os.read(fd, BASELINE_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > BASELINE_MAX_BYTES:
+        raise Refused("bad-baseline", "oversize")
+    try:
+        obj = canon.parse(data)
+    except ContractError:
+        raise Refused("bad-baseline", "not canonical JSON") from None
+    base = check_baseline(obj)
+    if base["vendor"] != a.vendor:
+        raise Refused("bad-baseline", f"names {base['vendor']}, not {a.vendor}")
+    return base
+
+
+def _cas_gate_identity(ctx: H.Ctx, session: str, identity: Mapping[str, str]) -> None:
+    """A field-only RENDERED -> RENDERED CAS of ``identity`` (the lease must be live: CONTROL's ``lease-dead``)."""
+    rec = read_record(ctx, session)
+    if rec is None:
+        raise Refused("no-session", session)
+    if rec.state != R.RENDERED:
+        raise Refused("not-rendered", f"{session}: {rec.state}")
+    ctx.call("CAS", session=session, generation=rec.generation, **{"from": R.RENDERED, "to": R.RENDERED},
+             fields={"identity": dict(identity)})
+
+
+def gate_check(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str]) -> Dict[str, str]:
+    """§7.6 at start: the identity call (the caller holds the session END lock, ``held``), its answer recorded
+    (:func:`_cas_gate_identity`) and compared with ``baseline``. Returns what was recorded, for an equal answer.
+    A call that refused is recorded ``{result: <name>}`` and raised by that name; an answer that differs is recorded
+    ``{observed_id, result: identity-changed}`` and raised ``identity-changed``; a refused record CAS is raised by
+    its own name, so a launch never outruns the record. The answer is equal when the id and the vendor match and
+    "not a check" belongs to the vendor with no check only."""
+    try:
+        oid = identity_call(ctx, a.vendor, a, held=True)
+    except Refused as e:
+        _cas_gate_identity(ctx, a.session, {"result": e.name})
+        raise
+    same = (oid == baseline["observed_id"] and baseline["vendor"] == a.vendor
+            and (oid == NOT_A_CHECK) == (a.vendor == "codex"))
+    ident = {"observed_id": oid, "result": (NOT_A_CHECK if oid == NOT_A_CHECK else GATE_MATCHED) if same
+             else GATE_CHANGED}
+    _cas_gate_identity(ctx, a.session, ident)
+    if not same:
+        raise Refused(GATE_CHANGED, f"{a.slot.tag}: the observed account is not the slot's baseline")
+    return ident
+
+
 # --- confirm-identity (§5.1) -------------------------------------------------------------------------------------------
 
 def _no_id_name(result: object) -> str:
@@ -258,5 +347,5 @@ def confirm_identity(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, o
 
 
 __all__ = ["BASELINE_FORMAT", "BASELINE_KEYS", "BASELINE_WRITTEN", "CONFIRMED", "IDENTITY_CALLS", "LOGIN_FAILED",
-           "NOT_A_CHECK", "baseline_bytes", "baseline_vendor", "check_baseline", "confirm_identity", "identity_call",
-           "record_login_identity"]
+           "NOT_A_CHECK", "baseline_bytes", "baseline_vendor", "check_baseline", "confirm_identity", "gate_check",
+           "identity_call", "read_slot_baseline", "record_login_identity"]

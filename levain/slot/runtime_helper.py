@@ -2136,7 +2136,8 @@ def status(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
 
         a = read_alloc(ctx, req.session)
         ans: Dict[str, object] = {"records": [R.alloc_record(a)]}
-        rec = ID.read_record(ctx, a.session) if a.kind == "login" else None
+        rec = (ID.read_record(ctx, a.session)
+               if a.kind == "login" or (a.kind == "interactive" and a.auth == "passthrough") else None)
         ident = rec.fields.get("identity") if rec is not None else None
         if ident is not None:
             ans["identity"] = dict(ident)

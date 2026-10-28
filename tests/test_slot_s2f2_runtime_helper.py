@@ -224,12 +224,17 @@ class World:
     def slot_state(self, slot: SlotId) -> R.SlotState:
         return H.parse_slot_state_of((slot.slot_dir(self.L) / "state").read_bytes(), slot)
 
-    def give_credential(self, slot: SlotId, vendor: str = "claude", *, baseline: bool = True) -> None:
+    def give_credential(self, slot: SlotId, vendor: str = "claude", *, baseline: bool = True,
+                        observed_id: str | None = None) -> None:
+        """``observed_id`` defaults to ``not-a-check`` for codex and a fixed uuid for claude."""
         d = slot.slot_dir(self.L)
         (d / "keep" / H.CREDENTIAL_NAME[vendor]).write_bytes(b"{}")
         if baseline:
+            if observed_id is None:
+                observed_id = "not-a-check" if vendor == "codex" else "4b8e0c1a-1d2e-4f00-9a7b-0123456789ab"
             (d / "baseline").write_bytes(canon.canonical_bytes(
-                {"vendor": vendor, "account_id": "acct-1", "confirmed_at": "2026-10-20T00:00:00Z"}))
+                {"format": "levain-baseline/1", "vendor": vendor, "observed_id": observed_id,
+                 "confirmed_at": "2026-10-20T00:00:00Z", "session": "s-00000000000000ba"}))
 
     def mode(self, rel: str) -> int:
         return os.stat(self.L / rel, follow_symlinks=False).st_mode & 0o7777
