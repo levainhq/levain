@@ -285,7 +285,7 @@ def gate_check(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str]) -> Dict[str,
             _cas_gate_identity(ctx, a.session, {"result": e.name})
         except Refused as ce:
             # the CAS's name is the answer (no launch outruns the record); the call's own cause stays in the detail
-            raise Refused(ce.name, f"{ce.detail}; the identity call had refused {e.name}"
+            raise Refused(ce.name, (f"{ce.detail}; " if ce.detail else "") + f"the identity call had refused {e.name}"
                           + (f": {e.detail}" if e.detail else "")) from None
         raise
     same = (oid == baseline["observed_id"] and baseline["vendor"] == a.vendor

@@ -1498,8 +1498,8 @@ class Supervisor:
         except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
             why = e.name if isinstance(e, Refused) else type(e).__name__
             try:
-                self.say(f"identity-changed: the slot's stored login did not match its baseline; no account shown: "
-                         f"{why}")
+                self.say(f"start refused identity-changed, but root's record could not be read ({why}); no account shown. "
+                         "Nothing was launched.")
             except Exception:   # noqa: BLE001 - stderr itself refused; the teardown still runs
                 pass
 
@@ -1507,8 +1507,8 @@ class Supervisor:
         try:
             oid, result = identity_answer(self.helper("status", session, stdin=None))
         except Refused as e:
-            self.say(f"identity-changed: the slot's stored login did not match its baseline; no account shown: "
-                     f"refused {e.name}")
+            self.say(f"start refused identity-changed, but root's record could not be read (refused {e.name}); no account "
+                     "shown. Nothing was launched.")
             return
         vendor = self.req.vendor
         name = {"claude": "Claude", "codex": "Codex"}.get(vendor, vendor)
