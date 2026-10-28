@@ -6,6 +6,20 @@ Hidden like ``levain session`` (no ``help=``, so ``levain --help`` does not list
 reconciles one install directory's anneal, schema and hooks.
 
 Every effect goes through :class:`Seams`, so each path is reachable without root, an installer or sudo.
+
+Every child it starts (the installer, sudo) and its own re-exec get an environment built here, never ``os.environ``:
+:mod:`levain.launch` restores the operator's carried secrets (``GH_TOKEN``, cloud keys) into ``os.environ``, and whatever
+a child is given sits in its exec-time block, readable by every process of this user (L3 r1).
+
+Known edges, not handled (L3 r1):
+- Two upgrades at once in one environment can interleave their installer steps; nothing here locks that phase (the
+  root helper's own lock covers only the repair).
+- ``_h11`` reads ``is_link`` twice, so a path flipped between the reads can name the wrong reason in the message; the
+  refusal itself stands either way.
+- ``_check_writers`` maps gid to name with one name per gid, so on a host with a group alias the pre-check's advice
+  may name the alias; root's own check is unaffected.
+- An installer that authenticates through a keyring on the session bus does not get ``DBUS_SESSION_BUS_ADDRESS``;
+  configure the index through ``PIP_*``/``UV_*``/``PIPX_*`` or a netrc instead.
 """
 from __future__ import annotations
 
@@ -24,6 +38,15 @@ EXIT_OK, EXIT_REFUSED, EXIT_HELD, EXIT_INTERNAL = 0, 1, 3, 70
 _HELD_ROW = "agent held sessions"
 _STDERR_TAIL = 20
 _PENDING = "levain install-helper: pending:"
+# Children run from here, never the operator's directory: a cwd `pip/` package would shadow `python -m pip`, and uv
+# reads `uv.toml`/`pyproject.toml` from the cwd upward (an index the operator did not choose for this upgrade).
+_NEUTRAL_CWD = "/"
+# What sudo and the installer need from the environment. Everything else is dropped.
+_BASE_ENV = frozenset({"PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "TMPDIR"})
+# The installer also needs: the dynamic loader's paths (an interpreter found only through one would not start), the
+# netrc path, and its own config namespaces (XDG_ holds pip's and uv's config dirs on Linux).
+_INSTALLER_ENV = _BASE_ENV | {"LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "NETRC"}
+_INSTALLER_PREFIXES = ("LC_", "PIP_", "UV_", "PIPX_", "XDG_")
 
 
 class Refusal(Exception):
@@ -128,20 +151,52 @@ def decide_installer(ev: Evidence, *, python: str, which: Callable[[str], Option
 # --- the seams --------------------------------------------------------------------------------------------------
 
 
-def _run(argv: Sequence[str], *, capture_stderr: bool = True, capture_stdout: bool = False) -> tuple[int, str, str]:
+def installer_env(environ: Optional[Any] = None) -> dict:
+    """The installer's environment: the base names, the loader paths, its config namespaces and the network names
+    (proxies, CA bundles) from :data:`levain.launch.NETWORK`. ``PIP_*``/``UV_*``/``PIPX_*`` can hold an index URL with
+    credentials in it; that is the installer's own config, and it goes to the installer only."""
+    from levain.launch import NETWORK
+
+    e = os.environ if environ is None else environ
+    names = _INSTALLER_ENV | set(NETWORK)
+    return {k: v for k, v in e.items() if k in names or k.startswith(_INSTALLER_PREFIXES)}
+
+
+def sudo_env(environ: Optional[Any] = None) -> dict:
+    """sudo's environment: the base names and the locale. sudo resets the helper's environment itself; this keeps
+    the rest out of sudo's own exec-time block."""
+    e = os.environ if environ is None else environ
+    return {k: v for k, v in e.items() if k in _BASE_ENV or k.startswith("LC_")}
+
+
+def reexec_env(environ: Optional[Any] = None) -> dict:
+    """The re-exec's environment: :func:`levain.launch.allowed_env`, the list levain's own re-exec uses (it drops
+    ``LEVAIN_CARRY_FD``, so the new image does not look for a carry it was not given)."""
+    from levain.launch import allowed_env
+
+    return allowed_env(os.environ if environ is None else environ)
+
+
+def _run(argv: Sequence[str], *, env: dict, cwd: str = _NEUTRAL_CWD, capture_stderr: bool = True,
+         capture_stdout: bool = False) -> tuple[int, str, str]:
     import subprocess
 
-    p = subprocess.run(list(argv), shell=False, stdout=subprocess.PIPE if capture_stdout else None,
+    p = subprocess.run(list(argv), shell=False, env=env, cwd=cwd, stdout=subprocess.PIPE if capture_stdout else None,
                        stderr=subprocess.PIPE if capture_stderr else None, text=True)
     return p.returncode, p.stdout or "", p.stderr or ""
 
 
+def _execve(path: str, argv: list, env: dict) -> None:
+    os.execve(path, argv, env)
+
+
 def _has_tty() -> bool:
-    if not sys.stdin.isatty():
-        return False
     try:
-        os.close(os.open("/dev/tty", os.O_RDWR))
-    except OSError:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return False
+        with open("/dev/tty", "rb+", buffering=0):
+            pass
+    except (OSError, ValueError):     # ValueError: a closed stdin
         return False
     return True
 
@@ -158,30 +213,10 @@ def _held_row() -> Any:
 def _held_lines(host: str, pkg: str) -> Optional[Sequence[str]]:
     from levain import doctor
 
+    # Intent: print doctor's own clean-up commands for a held session. Doctor gains `reap_held_lines` in another
+    # change; until it is present this returns None and `_held_stop` sends the operator to `levain doctor` instead.
     fn = getattr(doctor, "reap_held_lines", None)
     return None if fn is None else fn(host, pkg)
-
-
-def _read_shape_generation(host: str) -> Optional[str]:
-    from levain.slot import generation as G
-    from levain.slot.install_helper import install_shape_path
-
-    try:
-        return G.parse_shape(install_shape_path(host).read_bytes()).generation
-    except Exception:  # noqa: BLE001 - unreadable (mode bits included) means "run the repair"
-        return None
-
-
-def _intent_present(host: str) -> bool:
-    from levain.slot.intent import INTENT_PATH
-
-    try:
-        os.lstat(INTENT_PATH[host])
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True     # unknown is not absent
-    return True
 
 
 def _current_generation(host: str) -> Optional[str]:
@@ -245,7 +280,7 @@ class Seams:
     marker_exists: Callable[[str], bool] = os.path.exists
     which: Callable[[str], Optional[str]] = lambda n: __import__("shutil").which(n)
     run: Callable[..., tuple[int, str, str]] = _run
-    execv: Callable[[str, list], Any] = os.execv
+    execv: Callable[[str, list, dict], Any] = _execve       # os.execve, always with an explicit env
     held_row: Callable[[], Any] = _held_row
     held_lines: Callable[[str, str], Optional[Sequence[str]]] = _held_lines
     read_directory: Callable[[str], Any] = _read_directory
@@ -256,8 +291,6 @@ class Seams:
     is_link: Callable[[str], bool] = os.path.islink
     gen_id: Optional[Callable[[Path, Path], str]] = None
     current_gen: Callable[[str], Optional[str]] = _current_generation
-    shape_gen: Callable[[str], Optional[str]] = _read_shape_generation
-    intent_present: Callable[[str], bool] = _intent_present
     version: Optional[str] = None
 
 
@@ -355,8 +388,8 @@ def _held_stop(s: Seams, pkg: str) -> Optional[Refusal]:
     lines = [f"Held sessions: {row.detail}"]
     cmds = s.held_lines(s.host, pkg)
     if cmds is None:
-        lines.append("This build has no printed clean-up commands for a held session; see the "
-                     f"'{_HELD_ROW}' row of `levain doctor`. Nothing was run.")
+        lines.append("This build has no printed clean-up commands for a held session. Run `levain doctor` and "
+                     f"follow its '{_HELD_ROW}' row. Nothing here ran anything.")
     else:
         lines.append("Run these, in order, as root. Nothing here ran them:")
         lines += [f"  {i}. {c}" for i, c in enumerate(list(cmds)[:5], 1)]
@@ -427,7 +460,7 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool) -> int:
 
     if argv is not None:
         print(f"Upgrading levain with {tool} (now {version})")
-        rc, _, _ = s.run(argv, capture_stderr=False)
+        rc, _, _ = s.run(argv, env=installer_env(), cwd=_NEUTRAL_CWD, capture_stderr=False)
         if rc != 0:
             print(f"The {tool} upgrade failed (exit {rc}). Nothing on the root side changed. Fix that, then run "
                   "`levain upgrade` again.")
@@ -435,8 +468,10 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool) -> int:
         if not s.exe_exists(s.executable):
             print(f"Python at {s.executable} is gone after the upgrade; run `levain upgrade --no-pip`.")
             return EXIT_REFUSED
-        s.execv(s.executable, [s.executable, "-m", "levain", "upgrade", "--no-pip",
-                               *(["--verbose"] if verbose else [])])
+        # -P: `python -m` would otherwise put the cwd first on sys.path, and a `levain/` there would run instead of
+        # the package just installed. Not -I, which also drops the user site and so a `pip --user` install.
+        s.execv(s.executable, [s.executable, "-P", "-m", "levain", "upgrade", "--no-pip",
+                               *(["--verbose"] if verbose else [])], reexec_env())
         return EXIT_OK      # only reached where exec is a seam
 
     if not isolated:
@@ -450,9 +485,10 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool) -> int:
     if stop is not None:
         raise stop
     gen = _generation(s, pkg, h11)
-    if gen is not None and _current(s, gen):
-        print("Already up to date.")
-        return EXIT_OK
+    # No "already current" skip (L3 r1): matching generation and shape say nothing about the other root rows (units,
+    # sudoers, membership) that repair re-applies, and three unlocked reads race a repair. Repair is idempotent and
+    # decides under its own lock. The cost: every run asks for the password and restarts Levain's services, even
+    # when the installer found nothing newer. `--dry-run` shows both generations without sudo.
     print("Updating the root side (stops and restarts Levain's services). sudo will ask for your password.")
     return _sudo(s, pkg, gen, verbose)
 
@@ -466,24 +502,26 @@ def _generation(s: Seams, pkg: str, h11: Path) -> Optional[str]:
         return None
 
 
-def _current(s: Seams, gen: str) -> bool:
-    return (s.current_gen(s.host) == gen and s.shape_gen(s.host) == gen and not s.intent_present(s.host))
-
-
 def _sudo(s: Seams, pkg: str, gen: Optional[str], verbose: bool) -> int:
-    rc, out, err = s.run(sudo_argv(s, pkg), capture_stderr=not verbose, capture_stdout=True)
+    rc, out, err = s.run(sudo_argv(s, pkg), env=sudo_env(), cwd=_NEUTRAL_CWD, capture_stderr=not verbose,
+                         capture_stdout=True)
     lines = out.strip().splitlines()
     try:
         reply = json.loads(lines[-1]) if lines else None
     except ValueError:
         reply = None
-    if type(reply) is not dict or "ok" not in reply:
-        if not lines:
-            print("sudo did not run the helper (password not accepted?). Nothing on the root side changed.")
-        else:
-            print(f"The helper's answer could not be read (exit {rc}). Run `levain doctor`.")
-        return EXIT_REFUSED
     errs = err.splitlines()
+    if type(reply) is not dict or "ok" not in reply:
+        # No result line does not mean nothing ran: sudo refusing the password and a helper killed after it stopped
+        # services both leave stdout empty. Say only what is known.
+        what = ("printed no result line" if not lines else "printed a last line that is not a result")
+        print(f"The outcome is unknown: sudo exited {rc} and the helper {what}. If sudo refused the password, "
+              "nothing ran; if the helper was stopped partway, the root side may be mid-repair, with Levain's "
+              "services stopped.")
+        for ln in errs[-_STDERR_TAIL:]:
+            print(ln)
+        print("Repair is resumable: run `levain upgrade --no-pip` again, then `levain doctor`.")
+        return EXIT_REFUSED
     if reply["ok"] is True:
         import levain
 

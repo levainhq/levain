@@ -23,10 +23,11 @@ RECORD = Path("/var/levain/policy/operator")
 
 class Runner:
     def __init__(self, sudo=(0, '{"ok":true}\n', ""), pip=(0, "", "")):
-        self.calls, self.sudo, self.pip = [], sudo, pip
+        self.calls, self.kw, self.sudo, self.pip = [], [], sudo, pip
 
-    def __call__(self, argv, *, capture_stderr=True, capture_stdout=False):
+    def __call__(self, argv, *, capture_stderr=True, capture_stdout=False, env=None, cwd=None):
         self.calls.append(list(argv))
+        self.kw.append({"env": env, "cwd": cwd})
         return self.sudo if argv[0] == U.SUDO else self.pip
 
 
@@ -55,7 +56,7 @@ class Env:
         (self.parent / "h11/_version.py").write_text('__version__ = "0.16.0"\n')
         self.pkg = str(self.parent / "levain")
         self.fs = {str(RECORD): (0, 0o644, stat.S_IFREG), str(HELPER): (0, 0o755, stat.S_IFREG)}
-        self.runner, self.execs = Runner(), []
+        self.runner, self.execs, self.exec_envs = Runner(), [], []
         self.euid, self.uid, self.tty = 1000 + 0, OP_UID, True
         self.installer, self.direct, self.owns = "pip", None, True
         self.markers: set[str] = set()
@@ -67,7 +68,7 @@ class Env:
         self.held_lines = lambda h, p: [f"cmd{i} {p}" for i in range(1, 6)]
         self.read_dir = lambda host: SimpleNamespace(groups={})
         self.writers = lambda parent, uid, d: None
-        self.shape, self.current, self.intent = GEN, "gen-" + "0" * 16, False
+        self.current = "gen-" + "0" * 16
         self.op_uid = OP_UID
         self.which_map = {"pipx": "/bin/pipx", "uv": "/bin/uv"}
         self.exe_exists = True
@@ -78,6 +79,10 @@ class Env:
         uid, mode, kind = self.fs[p]
         return SimpleNamespace(st_uid=uid, st_mode=kind | mode, st_gid=0)
 
+    def exec_(self, path, argv, env=None):
+        self.execs.append((path, argv))
+        self.exec_envs.append(env)
+
     def seams(self) -> U.Seams:
         return U.Seams(
             host="linux", geteuid=lambda: self.euid, getuid=lambda: self.uid, has_tty=lambda: self.tty,
@@ -87,11 +92,10 @@ class Env:
             prefix=self.prefix, base_prefix=self.base_prefix, executable="/py/bin/python",
             exe_exists=lambda p: self.exe_exists, user_site=lambda: self.user_site, stdlib=self.stdlib,
             marker_exists=lambda p: os.path.basename(p) in self.markers, which=self.which_map.get,
-            run=self.runner, execv=lambda path, argv: self.execs.append((path, argv)),
+            run=self.runner, execv=self.exec_,
             held_row=lambda: self.held, held_lines=lambda h, p: self.held_lines(h, p),
             read_directory=lambda host: self.read_dir(host), check_writers=lambda *a: self.writers(*a),
-            gen_id=lambda a, b: GEN, current_gen=lambda h: self.current, shape_gen=lambda h: self.shape,
-            intent_present=lambda h: self.intent, version="9.9.9")
+            gen_id=lambda a, b: GEN, current_gen=lambda h: self.current, version="9.9.9")
 
     def run(self, capsys, **kw):
         rc = U.run_upgrade(seams=self.seams(), **kw)
@@ -187,7 +191,7 @@ def test_installer_rows_give_their_argv(env, capsys, name, setup, argv):
     setup(env)
     rc, out = env.run(capsys)
     assert rc == 0 and env.runner.calls == [argv]
-    assert env.execs == [(PY, [PY, "-m", "levain", "upgrade", "--no-pip"])]
+    assert env.execs == [(PY, [PY, "-P", "-m", "levain", "upgrade", "--no-pip"])]
 
 
 def test_installer_pip_user_adds_user(tmp_path, capsys):
@@ -316,26 +320,7 @@ def test_a_warn_held_row_does_not_stop(env, capsys):
     assert rc == 0 and len(sudo_calls(env)) == 1
 
 
-# 11
-def test_already_current_skips_sudo(env, capsys):
-    env.current = GEN
-    rc, out = env.run(capsys, no_pip=True)
-    assert rc == 0 and "Already up to date" in out and sudo_calls(env) == []
-
-
-@pytest.mark.parametrize("what", ["shape-unreadable", "intent", "current-differs", "shape-differs"])
-def test_not_provably_current_runs_sudo(env, capsys, what):
-    env.current = GEN
-    if what == "shape-unreadable":
-        env.shape = None
-    elif what == "intent":
-        env.intent = True
-    elif what == "current-differs":
-        env.current = "gen-" + "b" * 16
-    else:
-        env.shape = "gen-" + "c" * 16
-    rc, out = env.run(capsys, no_pip=True)
-    assert rc == 0 and len(sudo_calls(env)) == 1
+# 11: superseded by L3 r1 (test_already_current_still_runs_the_repair): there is no "already current" skip.
 
 
 # 12
@@ -399,11 +384,6 @@ def test_step_failed(env, capsys):
     assert rc == 1 and "refused step-failed" in out and "line29" in out and "line9\n" not in out
 
 
-def test_no_json_line_means_sudo_did_not_run_the_helper(env, capsys):
-    rc, out = _ran(env, capsys, (1, "", "sudo: 3 incorrect password attempts\n"))
-    assert rc == 1 and "sudo did not run the helper" in out and "Nothing on the root side changed" in out
-
-
 def test_ok_prints_done_and_pending_lines(env, capsys):
     err = "progress\nlevain install-helper: pending: runtime-helper verbs\n"
     rc, out = _ran(env, capsys, (0, '{"ok":true}\n', err))
@@ -415,7 +395,7 @@ def test_ok_prints_done_and_pending_lines(env, capsys):
 # 15
 def test_exec_after_pip_and_flags_pass_through(env, capsys):
     rc, _ = env.run(capsys, verbose=True)
-    assert rc == 0 and env.execs == [(PY, [PY, "-m", "levain", "upgrade", "--no-pip", "--verbose"])]
+    assert rc == 0 and env.execs == [(PY, [PY, "-P", "-m", "levain", "upgrade", "--no-pip", "--verbose"])]
     assert sudo_calls(env) == []
 
 
@@ -453,3 +433,133 @@ def test_the_default_held_lines_come_from_doctor_and_are_absent_without_it(monke
     assert U._held_lines("darwin", "/p") is None
     monkeypatch.setattr(doctor, "reap_held_lines", lambda h, p: (f"run {p}",), raising=False)
     assert U._held_lines("darwin", "/p") == ("run /p",)
+
+
+# --- L3 r1 -------------------------------------------------------------------------------------------------------
+
+SECRETS = {"GH_TOKEN": "ghp_x", "AWS_SECRET_ACCESS_KEY": "aws_x", "AWS_SESSION_TOKEN": "aws_t",
+           "ANTHROPIC_API_KEY": "sk_x", "AWS_ACCESS_KEY_ID": "AKIA"}
+KEPT = {"PATH": "/bin:/usr/bin", "HOME": "/home/op", "USER": "op", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+        "TERM": "xterm", "TMPDIR": "/tmp/op"}
+INSTALLER_CFG = {"PIP_INDEX_URL": "https://mirror/simple", "UV_INDEX_URL": "https://mirror/simple",
+                 "PIPX_HOME": "/home/op/.pipx", "HTTPS_PROXY": "http://proxy:3128",
+                 "SSL_CERT_FILE": "/etc/ca.pem", "REQUESTS_CA_BUNDLE": "/etc/ca.pem"}
+
+
+@pytest.fixture
+def planted(monkeypatch):
+    for k, v in {**SECRETS, **KEPT, **INSTALLER_CFG}.items():
+        monkeypatch.setenv(k, v)
+
+
+def test_no_secret_reaches_the_installer_the_reexec_or_sudo(env, capsys, planted):
+    rc, _ = env.run(capsys)                                   # installer, then the re-exec
+    assert rc == 0 and len(env.runner.kw) == 1 and len(env.exec_envs) == 1
+    pip_env, exec_env = env.runner.kw[0]["env"], env.exec_envs[0]
+    env.runner = Runner()
+    rc, _ = env.run(capsys, no_pip=True)                      # stage 2: sudo
+    assert rc == 0
+    sudo_env = env.runner.kw[0]["env"]
+    for e in (pip_env, exec_env, sudo_env):
+        assert type(e) is dict and not set(SECRETS) & set(e), e
+        assert {k: e.get(k) for k in ("PATH", "HOME", "USER", "LANG", "LC_ALL")} == \
+            {k: KEPT[k] for k in ("PATH", "HOME", "USER", "LANG", "LC_ALL")}
+    assert {k: pip_env.get(k) for k in INSTALLER_CFG} == INSTALLER_CFG    # the installer keeps its own config
+    assert not set(INSTALLER_CFG) & set(sudo_env)                          # sudo needs none of it
+
+
+def test_the_real_runner_and_exec_pass_the_env_they_are_given(monkeypatch):
+    import subprocess
+
+    seen = {}
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: (seen.update(kw), SimpleNamespace(
+        returncode=0, stdout="", stderr=""))[1])
+    U._run(["x"], env={"PATH": "/bin"}, cwd="/")
+    assert seen["env"] == {"PATH": "/bin"} and seen["cwd"] == "/" and seen["shell"] is False
+    with pytest.raises(TypeError):
+        U._run(["x"])                                          # no default: a caller must choose the env
+    got = []
+    monkeypatch.setattr(os, "execve", lambda *a: got.append(a))
+    assert U.Seams().execv is not os.execv
+    U.Seams().execv("/py", ["/py"], {"PATH": "/bin"})
+    assert got == [("/py", ["/py"], {"PATH": "/bin"})]
+
+
+def test_children_run_from_a_neutral_directory(env, capsys):
+    env.run(capsys)
+    env.runner = Runner()
+    env.run(capsys, no_pip=True)
+    assert env.runner.kw[0]["cwd"] == "/"
+
+
+def test_the_reexec_cannot_be_shadowed_from_cwd_and_keeps_the_user_site(env, capsys, tmp_path):
+    import subprocess
+    import sys
+
+    env.run(capsys)
+    argv = env.execs[0][1]
+    assert argv[1:4] == ["-P", "-m", "levain"]
+    shadow = tmp_path / "cwd"
+    (shadow / "levain").mkdir(parents=True)
+    (shadow / "levain" / "__init__.py").write_text("SHADOW = True\n")
+    flags = argv[1:argv.index("-m")]
+    probe = [sys.executable, *flags, "-c",
+             "import sys, levain; print(hasattr(levain, 'SHADOW'), sys.flags.no_user_site, sys.flags.isolated)"]
+    out = subprocess.run(probe, cwd=shadow, capture_output=True, text=True,
+                         env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(Path(U.__file__).parents[1])}).stdout
+    assert out.split() == ["False", "0", "0"]     # not the cwd copy; the user site (pip --user) still on sys.path
+
+
+def test_already_current_still_runs_the_repair(env, capsys):
+    env.current = GEN                                          # root's current already names the package's generation
+    rc, out = env.run(capsys, no_pip=True)
+    assert rc == 0 and len(sudo_calls(env)) == 1 and "Already up to date" not in out
+
+
+@pytest.mark.parametrize("rc_", [1, 0])
+def test_empty_stdout_is_an_unknown_outcome_never_nothing_changed(env, capsys, rc_):
+    rc, out = _ran(env, capsys, (rc_, "", "sudo: 3 incorrect password attempts\n"))
+    assert rc == 1
+    assert "Nothing on the root side changed" not in out and "did not run" not in out
+    assert "unknown" in out and "resumable" in out and "levain upgrade --no-pip" in out
+    assert f"exit {rc_}" in out or f"exited {rc_}" in out
+    assert "sudo: 3 incorrect password attempts" in out
+    assert "password not accepted" not in out
+
+
+def test_an_unreadable_last_line_is_unknown_and_resumable(env, capsys):
+    rc, out = _ran(env, capsys, (1, "Traceback\n", "boom\n"))
+    assert rc == 1 and "unknown" in out and "levain upgrade --no-pip" in out and "boom" in out
+
+
+def test_held_fallback_says_what_to_do(env, capsys):
+    env.held = SimpleNamespace(name="agent held sessions", ok=False, detail="stuck")
+    env.held_lines = lambda h, p: None
+    rc, out = env.run(capsys, no_pip=True)
+    assert rc == 3 and "Run `levain doctor`" in out and "'agent held sessions' row" in out
+
+
+def test_has_tty_without_stdin_or_tty_is_false_and_closes(monkeypatch):
+    import builtins
+    import sys
+
+    monkeypatch.setattr(sys, "stdin", None)
+    assert U._has_tty() is False
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    closed = []
+
+    class F:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            closed.append(True)
+
+    monkeypatch.setattr(builtins, "open", lambda *a, **k: F())
+    assert U._has_tty() is True and closed == [True]
+
+    def boom(*a, **k):
+        raise OSError("no tty")
+
+    monkeypatch.setattr(builtins, "open", boom)
+    assert U._has_tty() is False
