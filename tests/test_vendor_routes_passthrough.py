@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 
 from levain.broker import policy as P
-from levain.slot import Refused, supervisor as SV, vendor_routes as VR
+from levain.slot import supervisor as SV, vendor_routes as VR
 
 #: the doc's rows a CLI subscription login + one turn needs inside the slot: the API, claude.ai account
 #: authentication, and the OAuth token exchange/refresh host (the doc: "both Console and claude.ai sign-ins require
@@ -50,14 +50,6 @@ def test_the_merged_map_parses_and_the_supervisor_picks_the_route_for_each_auth(
     assert SV.pick_routes(out["routes"], "claude", "brokered") == (VR.EGRESS_DEFAULT, "anthropic")
 
 
-def test_codex_passthrough_is_still_refused_by_name():
-    # R3: Codex's route is the same shape and comes after Claude's; until then its pick names the gap
-    out, _, _ = VR.merge(None)
-    with pytest.raises(Refused) as e:
-        SV.pick_routes(out["routes"], "codex", "passthrough")
-    assert e.value.name == "no-route:passthrough"
-
-
 #: an operator's own Claude passthrough route under another id, hand-written before one shipped (1026-10 R6)
 OPERATOR_PASS = {"route": "operator-claude-pass", "type": "subscription_passthrough", "hosts": ["api.anthropic.com"]}
 
@@ -68,7 +60,8 @@ def _upgraded(*extra):
 
 def test_merge_keeps_an_operators_claude_passthrough_route_and_adds_no_second_one():
     out, ids, notes = VR.merge(_upgraded())
-    passes = [r for r in out["routes"] if r["type"] == "subscription_passthrough"]
+    passes = [r for r in out["routes"] if r["type"] == "subscription_passthrough"
+              and SV._hosts(r) & SV.VENDOR_HOSTS["claude"]]
     assert passes == [OPERATOR_PASS]
     assert notes == ["route claude-subscription not added: your own operator-claude-pass is kept as the passthrough "
                      "route for its vendor (two would make every passthrough launch route-ambiguous)"]
@@ -80,7 +73,7 @@ def test_merge_keeps_an_operators_claude_passthrough_route_and_adds_no_second_on
 
 
 def test_the_merge_names_the_operators_route_it_kept_in_place_of_the_shipped_one():
-    assert VR.yielded_routes(_upgraded()) == {"claude-subscription": ["operator-claude-pass"]}
+    assert VR.yielded_routes(_upgraded()) == {"claude-subscription": ["operator-claude-pass"]}   # codex's is not yielded
     assert VR.yielded_routes(None) == {}
     assert VR.yielded_routes({"format": VR.BASE_FORMAT, "routes": []}) == {}
 
@@ -96,7 +89,9 @@ def test_an_operators_passthrough_route_under_the_shipped_id_is_still_replaced()
 def test_another_vendors_passthrough_route_does_not_stop_the_claude_default():
     codex = {"route": "operator-codex-pass", "type": "subscription_passthrough", "hosts": ["chatgpt.com"]}
     out, ids, notes = VR.merge({"format": VR.BASE_FORMAT, "routes": [codex]})
-    assert "claude-subscription" in ids and notes == []
+    assert "claude-subscription" in ids and "codex-subscription" not in ids
+    assert notes == ["route codex-subscription not added: your own operator-codex-pass is kept as the passthrough "
+                     "route for its vendor (two would make every passthrough launch route-ambiguous)"]
     assert SV.pick_routes(out["routes"], "claude", "passthrough") == (VR.EGRESS_DEFAULT, "claude-subscription")
     assert SV.pick_routes(out["routes"], "codex", "passthrough") == (VR.EGRESS_DEFAULT, "operator-codex-pass")
 
@@ -120,8 +115,8 @@ def test_two_operator_routes_for_claude_are_named_and_left_as_written():
     out, _, notes = VR.merge(two)
     assert notes == ["route claude-subscription not added: your routes operator-claude-pass, other-claude-pass are "
                      "all passthrough routes for its vendor; launches will refuse route-ambiguous until one is removed"]
-    assert [r["route"] for r in out["routes"] if r["type"] == "subscription_passthrough"] == [
-        "operator-claude-pass", "other-claude-pass"]
+    assert [r["route"] for r in out["routes"] if r["type"] == "subscription_passthrough"
+            and SV._hosts(r) & SV.VENDOR_HOSTS["claude"]] == ["operator-claude-pass", "other-claude-pass"]
 
 
 def test_the_brokered_and_passthrough_routes_sharing_the_api_host_are_not_a_clash():

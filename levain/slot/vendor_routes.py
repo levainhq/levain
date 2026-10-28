@@ -94,8 +94,21 @@ def claude_passthrough_route() -> dict:
     return {"route": "claude-subscription", "type": "subscription_passthrough", "hosts": list(CLAUDE_PASSTHROUGH_HOSTS)}
 
 
+#: the hosts a Codex ChatGPT-subscription login and its turns need inside the slot: ``api.openai.com`` (API requests),
+#: ``auth.openai.com`` (OAuth token exchange and refresh), ``chatgpt.com`` (the ChatGPT backend the subscription's
+#: turns go to). The browser-side sign-in page is opened by the operator's own browser, outside the slot. Disjoint
+#: from :data:`CLAUDE_PASSTHROUGH_HOSTS`, so the two passthrough routes never admit one host twice.
+CODEX_PASSTHROUGH_HOSTS = ("api.openai.com", "auth.openai.com", "chatgpt.com")
+
+
+def codex_passthrough_route() -> dict:
+    """The slot's own Codex login, tunnelled end to end; never a dispatch route (CONTRACT §4.1). Same shape as
+    :func:`claude_passthrough_route`; the vendor is told from the hosts (``vendor_hosts.VENDOR_HOSTS``)."""
+    return {"route": "codex-subscription", "type": "subscription_passthrough", "hosts": list(CODEX_PASSTHROUGH_HOSTS)}
+
+
 def vendor_routes() -> List[dict]:
-    return [anthropic_route(), claude_passthrough_route()]
+    return [anthropic_route(), claude_passthrough_route(), codex_passthrough_route()]
 
 
 #: wfetch RULINGS Q2 (a): F3's default list ("github.com, api.github.com, pypi.org, files.pythonhosted.org"), sorted
@@ -338,6 +351,7 @@ def reverted_fields(doc: object, merged: object = None) -> Dict[str, List[str]]:
 
 
 __all__ = ["ANTHROPIC_SESSION_CAP", "BASE_FORMAT", "CLAUDE_MODELS", "CLAUDE_NETWORK_DOC", "CLAUDE_PASSTHROUGH_HOSTS",
-           "EGRESS_DEFAULT", "EGRESS_DEFAULT_HOSTS", "EGRESS_OPERATOR", "MergeRefused", "anthropic_route",
-           "clash_message", "claude_passthrough_route", "connect_host_clashes", "egress_default_route", "merge",
+           "CODEX_PASSTHROUGH_HOSTS", "EGRESS_DEFAULT", "EGRESS_DEFAULT_HOSTS", "EGRESS_OPERATOR", "MergeRefused", "anthropic_route",
+           "clash_message", "claude_passthrough_route", "codex_passthrough_route",
+           "connect_host_clashes", "egress_default_route", "merge",
            "reverted_fields", "set_operator_hosts", "shipped_routes", "vendor_routes", "yielded_routes"]
