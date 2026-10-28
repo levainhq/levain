@@ -219,6 +219,13 @@ def test_each_unparsable_answer_refuses_and_parks_back(env, answer):
     assert set(_targets(la)) <= {"forwarder"}
 
 
+@pytest.mark.parametrize("status,says", [(401, True), (403, True), (500, False)])
+def test_an_auth_failure_answer_says_the_login_looks_expired(status, says):
+    with pytest.raises(Refused) as e:
+        ID.parse_profile_answer(0, _ans(status))
+    assert f"HTTP {status}" in str(e.value) and ("expired or revoked" in str(e.value)) is says
+
+
 def test_a_capture_that_times_out_refuses_identity_unparsable(env):
     w, la, _ = env
     s = _gated(w, la)

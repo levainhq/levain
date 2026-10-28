@@ -112,7 +112,8 @@ def parse_profile_answer(exit_code: int, out: bytes) -> str:
     if type(ans) is not dict or type(ans.get("status")) is not int:
         raise bad("no status")
     if ans["status"] != 200:
-        raise bad(f"HTTP {ans['status']}")
+        expired = " (the stored login looks expired or revoked: sign in to this slot again)" if ans["status"] in (401, 403) else ""
+        raise bad(f"HTTP {ans['status']}{expired}")
     try:
         prof = json.loads(ans["body"]) if type(ans.get("body")) is str else None
     except (ValueError, RecursionError):
