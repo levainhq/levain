@@ -1719,7 +1719,8 @@ def _held_commands() -> str:
 
     host = "darwin" if sys.platform == "darwin" else "linux"
     src = os.path.dirname(os.path.abspath(__file__))
-    return "\n".join(f"        {i}. {c}" for i, c in enumerate(layout.reap_held_lines(host, src), 1))
+    steps = "\n".join(f"        {i}. {c}" for i, c in enumerate(layout.reap_held_lines(host, src), 1))
+    return steps + "\n        If 3 fails, still run 4 and 5: the reaper stays stopped until 4. Step 6 asks for your password."
 
 
 def _check_slot_services(*, host: str | None = None, store: Path | None = None, run: Path | None = None,
