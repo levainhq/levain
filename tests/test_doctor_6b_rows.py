@@ -480,3 +480,17 @@ def test_a_silent_peer_is_bounded_by_the_deadline(tmp_path: Path):
         srv.close()
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_stuck_row_prints_the_commands_that_release_it_from_a_root_owned_copy():
+    """np-5da552a2 (b): no verb; the hint is the runnable sequence (stop, stage a root copy, one pass from the copy, start,
+    clean up, repair), in that order, and no step runs code from the operator-writable package."""
+    from levain.slot import layout
+
+    for host in ("darwin", "linux"):
+        lines = layout.reap_held_lines(host, "/home/op/site/levain")
+        stop, stage, run, start, clean, repair = lines
+        assert "reaper" in stop and "reaper" in start and stop != start
+        assert "cp -R /home/op/site/levain " in stage
+        assert "sys.path.insert(0, '" in run and "/home/op/site" not in run and "run_pass()" in run
+        assert repair.endswith("repair --source /home/op/site/levain")

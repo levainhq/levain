@@ -213,7 +213,12 @@ def test_a_chat_line_newer_than_the_launch_supplies_the_latest_activity(seeded):
 
 def test_an_approval_body_never_reaches_the_json_in_either_kind():
     # the last two are chat_timeline's own approval arms (APPROVAL_VIEW_ARMS), whose ref is the whole durable key
-    for kind in ("vendor_approval_request", "vendor_approval_resolved", "approval", "approval_decided"):
+    from levain.coordinator.chat_approvals import APPROVAL_EVENT_KINDS
+    for kind in ("vendor_approval_request", "vendor_approval_resolved", "approval",
+                 *("approval_" + k for k in APPROVAL_EVENT_KINDS)):
         row = dataclasses.replace(_row(kind, "can_use_tool:req-77:toolu_SECRETID", "L-A"), body="Bash rm x req-77")
         item = threads._item(row, {}, set())
         assert item["body"] is None and "req-77" not in json.dumps(item) and "toolu_SECRETID" not in json.dumps(item), item
+    # a kind that only shares the prefix is an ordinary row
+    plain = threads._item(dataclasses.replace(_row("approval_queue_note", "a:b", "L-A"), body="kept"), {}, set())
+    assert plain["body"] == "kept" and plain["ref"] == "a:b"

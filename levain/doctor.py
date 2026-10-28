@@ -1708,7 +1708,18 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
     more = f" and {len(held) - _HELD_NAMED} more" if len(held) > _HELD_NAMED else ""
     return CheckResult(name, False, f"{len(held)} stuck mid-end: {'; '.join(shown)}{more}; each keeps its slot leased "
                        "and its tree untouched while the reaper retries",
-                       "The reaper retries with a backoff; if the named step keeps failing, its service log says why.")
+                       "The reaper retries with a backoff; if the named step keeps failing, its service log says why. "
+                       "If `repair` refuses `live-lease` for this session (it was stranded by an older release's END), "
+                       "release it from this install's package, in order:\n" + _held_commands())
+
+
+def _held_commands() -> str:
+    """The numbered commands of :func:`levain.slot.layout.reap_held_lines`, for the package this doctor runs from."""
+    from levain.slot import layout
+
+    host = "darwin" if sys.platform == "darwin" else "linux"
+    src = os.path.dirname(os.path.abspath(__file__))
+    return "\n".join(f"        {i}. {c}" for i, c in enumerate(layout.reap_held_lines(host, src), 1))
 
 
 def _check_slot_services(*, host: str | None = None, store: Path | None = None, run: Path | None = None,
