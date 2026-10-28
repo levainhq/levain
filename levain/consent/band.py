@@ -202,6 +202,22 @@ def _coordinator_caller(directory: Path) -> bool:
                                                                              "CODEX_THREAD_ID"))
 
 
+def agent_session_caller() -> bool:
+    """True when this process runs inside ANY agent session (a Claude Code or Codex Bash tool, ...): the same
+    environment markers this module already reads (:func:`_agent_and_session`). Q17-ALL D9, Q1 ruled (a): an
+    information answer is the operator's only through a human channel, so `levain question answer` and
+    `levain band answer` refuse here; inside a seat the human answers by typing in the seat. A label check, like
+    :func:`_coordinator_caller` (which it widens from the coordinator to every agent): it does not stop a process
+    that hides its environment, and what it keeps out is text the agent reads, never authority."""
+    env = os.environ
+    return bool(env.get("CLAUDE_CODE_SESSION_ID") or env.get("CODEX_THREAD_ID") or env.get("CLAUDECODE") == "1")
+
+
+AGENT_ANSWER_REFUSAL = ("this runs inside an agent session, and an agent's answer is never the operator's: type the "
+                        "answer in the seat itself, or answer from a terminal outside any agent session, the cockpit "
+                        "or the phone (the item stays open)")
+
+
 def _coordinator_lines(directory: Path | str, agent: str, session: str) -> list[str]:
     """The coordinator's KNOW answers for this session (claimed once), or none. Never raises: a store that cannot be
     read now is read at the session's next hook."""
@@ -584,6 +600,8 @@ def run_question(args: argparse.Namespace, out: Any = None) -> int:
             raise ValueError("this session is the coordinator: its answer is its own, never the operator's, so it "
                              "goes `levain coord answer` (a KNOW the operator reviews, the question left open) or "
                              "`levain coord escalate`")
+        if agent_session_caller():
+            raise ValueError(AGENT_ANSWER_REFUSAL)
         store.answer(q.id, option=args.option, text=args.text, channel="cli")
         say(f"levain question: #{q.n} answered. The answer authorises nothing.")
         if q.link is not None and args.option == q.link.option:
