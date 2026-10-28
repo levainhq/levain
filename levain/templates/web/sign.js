@@ -23,6 +23,12 @@
 // same row shape, its options allow and deny), and its ceremony the phone port's own: POST .../challenge and .../answer for
 // a pending request, .../rule-challenge and .../rule for an undecided one (the row's `mode`), with the phone's exact bodies
 // ({decision, signer_fp}, then the challenge's `payload` beside the assertion).
+//
+// A dispatch job (OS-2) is the same sheet at /sign/dispatch/<job>: its read is GET /cockpit/dispatch/<job>/sheet.json (the
+// same row shape; its options sign, cancel and authorise, each with the `signers` that may do THAT act), and its ceremony
+// the phone port's own by option: sign is .../challenge then .../answer ({signer_fp}), cancel is .../cancel-challenge then
+// .../cancel ({signer_fp, reason}, the reason typed in the box the row asks for), authorise is .../authorise-challenge then
+// .../authorise ({signer_fp}); each answer is the challenge's `payload` beside the assertion, nothing else.
 (function () {
   "use strict";
 
@@ -40,16 +46,21 @@
 
   // ---- the link ----
   const consentPath = /^\/sign\/consent\/([^/]{1,480})$/.exec(location.pathname);
-  const pathId = consentPath ? null : /^\/sign\/([A-Za-z0-9_-]{8,64})$/.exec(location.pathname);
-  let id = pathId ? pathId[1] : "";
+  const dispatchPath = /^\/sign\/dispatch\/(dj-[0-9a-f]{32})$/.exec(location.pathname);     // the phone's job id shape
+  const pathId = consentPath || dispatchPath ? null : /^\/sign\/([A-Za-z0-9_-]{8,64})$/.exec(location.pathname);
+  let id = pathId ? pathId[1] : dispatchPath ? dispatchPath[1] : "";
   if (consentPath) {
     try { id = decodeURIComponent(consentPath[1]); } catch (e) { id = ""; }
     if (!/^[A-Za-z0-9._:-]{1,160}$/.test(id)) id = "";       // the server's consent id shape
   }
   const consent = !!consentPath;
-  const noun = consent ? "consent request" : "sign request";
-  const Noun = consent ? "Consent request" : "Sign request";
-  const routeOf = (rid) => (consent ? "/cockpit/consent/" : "/cockpit/sign/") + encodeURIComponent(rid);
+  const dispatch = !!dispatchPath;
+  const noun = consent ? "consent request" : dispatch ? "dispatch job" : "sign request";
+  const Noun = consent ? "Consent request" : dispatch ? "Dispatch job" : "Sign request";
+  const routeOf = (rid) => (consent ? "/cockpit/consent/" : dispatch ? "/cockpit/dispatch/" : "/cockpit/sign/") + encodeURIComponent(rid);
+  // the dispatch ceremony's two routes by the act picked (the phone's own names)
+  const DISPATCH_STEPS = { sign: ["challenge", "answer"], cancel: ["cancel-challenge", "cancel"],
+                           authorise: ["authorise-challenge", "authorise"] };
   const pm = /(?:^#|&)choice=([^&]*)(?:&|$)/.exec(location.hash);
   const vm = /(?:^#|&)v=([0-9a-f]{16})(?:&|$)/.exec(location.hash);
   let pick = "";
@@ -147,7 +158,7 @@
   const call = (route, body) => within(route, { method: "POST", headers: headers(true), body: JSON.stringify(body) });
   // the request as the cockpit holds it now: {request, rp_id, ...}, {closed}, {unpaired} or {error}
   function readRequest() {
-    return within(routeOf(id) + (consent ? "/sheet.json" : ".json"), { headers: headers(false) }).then((g) => {
+    return within(routeOf(id) + (consent || dispatch ? "/sheet.json" : ".json"), { headers: headers(false) }).then((g) => {
       if (g.status === 403) return { unpaired: true };
       if (g.status === 404) return g.body.error === "not_open" ? { closed: true } : { error: "This cockpit hosts no signing." };
       if (g.status === 0) return { error: "The " + noun + " could not be read: " + g.body.message + "." };
@@ -171,7 +182,7 @@
 
   // ---- read the request, then draw it ----
   if (!id) { head("Not a " + noun, "This link names no " + noun + "."); return; }
-  if (consent) { document.title = "Levain · consent"; $("sheet-title").textContent = Noun; $("sheet-msg").textContent = "Reading the consent request…"; }
+  if (consent || dispatch) { document.title = "Levain · " + (consent ? "consent" : "dispatch"); $("sheet-title").textContent = Noun; $("sheet-msg").textContent = "Reading the " + noun + "…"; }
   if (!storedToken()) { unpaired(false); return; }
   readRequest().then(draw);
 
@@ -180,6 +191,7 @@
     if (got.closed) {
       $("sheet").dataset.state = "closed";
       return head("Nothing to sign", consent ? "This consent request is no longer open: it was answered, ruled or it expired."
+        : dispatch ? "This dispatch job is no longer open: it was cancelled, finished or it is not in this store."
         : "This sign request is no longer open: it was signed, denied or it expired.");
     }
     if (got.error) { $("sheet").dataset.state = "error"; return head(Noun, got.error); }
@@ -189,7 +201,7 @@
       $("sheet").dataset.state = "elsewhere";
       head(r.title || Noun, "This page cannot use your passkey: sign on " + (origin || "the cockpit's https page") + ".");
       if (origin) {
-        const path = (consent ? "/sign/consent/" : "/sign/") + encodeURIComponent(id);
+        const path = (consent ? "/sign/consent/" : dispatch ? "/sign/dispatch/" : "/sign/") + encodeURIComponent(id);
         const a = el("a", "", origin + path);
         a.href = origin + path;
         $("sheet-body").appendChild(el("p", "")).appendChild(a);
@@ -267,13 +279,19 @@
     acts.hidden = false;
     const controls = [];          // every button and the write-in: frozen together for the whole ceremony
     const lock = (on) => { for (const b of controls) b.disabled = on; };
+    // a dispatch option names the keys that may do THAT act (the sign tier's and the landing tier's differ): only those are
+    // offered for it; any other row signs with the row's keys
+    const keysFor = (choice) => {
+      const o = dispatch ? (Array.isArray(r.options) ? r.options : []).find((x) => x && x.key === choice) : null;
+      return o && Array.isArray(o.signers) ? o.signers.filter((fp) => typeof fp === "string") : signers;
+    };
     const run = (choice, words, expect) => {
       if (busy) return;
       busy = true;
       active = r;
       lock(true);
       if (expect) signing(expect, "page", "Signing");
-      whom(rp, signers, held, acts).then((k) => (k ? ceremony(r, rp, k, choice, words) : "unsigned"))
+      whom(rp, keysFor(choice), held, acts).then((k) => (k ? ceremony(r, rp, k, choice, words) : "unsigned"))
         .catch(() => "unsigned")
         .then((done) => {
           if (done === "signed") { busy = false; ended(); acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
@@ -296,6 +314,27 @@
     };
     const lineOf = (o) => (o && typeof o.line === "string" ? o.line : "");
     const options = Array.isArray(r.options) ? r.options : [];
+    // a dispatch cancel carries a reason (one line, optional) typed in the box the row asks for; it is frozen as typed
+    // (trimmed) from the click on, like a write-in, and is the `words` of the run
+    let reasonBox = null;
+    if (dispatch && r.reason && typeof r.reason === "object" && options.some((o) => o && o.key === "cancel")) {
+      reasonBox = el("input", "sheet-write-in");
+      reasonBox.type = "text";
+      reasonBox.id = "sheet-reason";
+      reasonBox.maxLength = Number(r.reason.max) || 256;
+      reasonBox.placeholder = "reason for cancelling (optional)";
+      controls.push(reasonBox);
+    }
+    // what an option's tap runs: a cancel takes the reason box's words as typed now
+    const tap = (o) => () => {
+      if (busy) return;
+      if (o.key === "cancel" && reasonBox) {
+        const w = reasonBox.value.trim();
+        reasonBox.value = w;
+        return run("cancel", w, lineOf(o) + (w ? ": " + w : ""));
+      }
+      run(String(o.key), undefined, lineOf(o));
+    };
     // his pick from the link: one tap that signs that option, only on the version he tapped it on (phone.js's rule)
     const sameV = !!pickV && typeof r.sha256 === "string" && r.sha256.slice(0, 16) === pickV;
     const po = pick && sameV && /^[a-z0-9]{1,8}$/.test(pick) ? options.find((o) => o && o.key === pick) : null;
@@ -303,7 +342,7 @@
       const top = el("p", "sheet-pick", "Your pick: (" + po.key + "). Read the item; Sign (" + po.key + ") is below it.");
       top.id = "sheet-pick";
       $("sheet-body").insertBefore(top, $("sheet-body").firstChild);
-      const pb = button("Sign (" + po.key + ")", "dev-primary", () => run(String(po.key), undefined, lineOf(po)));
+      const pb = button("Sign (" + po.key + ")", "dev-primary", tap(po));
       pb.id = "sheet-picked";
       acts.appendChild(pb);
     } else if (pick) {
@@ -316,11 +355,12 @@
     if (!options.length) acts.appendChild(button("Sign with your passkey", po ? "" : "dev-primary", () => run(undefined, undefined)));
     for (const o of options) {
       if (!o || typeof o.key !== "string") continue;
-      const b = button("(" + o.key + ") " + String(o.text), o.key === r.recommended ? "sheet-rec" : "", () => run(o.key, undefined, lineOf(o)));
+      const b = button("(" + o.key + ") " + String(o.text), o.key === r.recommended ? "sheet-rec" : "", tap(o));
       b.title = "signs: " + String(o.line);
       b.dataset.choice = o.key;
       acts.appendChild(b);
     }
+    if (reasonBox) acts.appendChild(reasonBox);
     const wi = options.length && r.write_in && typeof r.write_in === "object" ? r.write_in : null;
     if (wi) {
       const box = el("input", "sheet-write-in");
@@ -339,7 +379,8 @@
       }));
     }
     if (options.length) {
-      const lines = el("div", "ext-meta", "Each option signs the message with its line appended:");
+      const lines = el("div", "ext-meta", dispatch ? "Each act signs the payload the cockpit builds for it (shown above the tap):"
+        : "Each option signs the message with its line appended:");
       for (const o of options) if (o && typeof o.line === "string") lines.appendChild(el("div", "sheet-line", o.line));
       $("sheet-body").appendChild(lines);
     }
@@ -428,10 +469,14 @@
     const fp = k.fp;
     // a consent request takes the phone port's own bodies, exactly their keys: {decision, signer_fp}, then the payload the
     // challenge returned beside the assertion; an undecided one is ruled (its own pair of routes), never answered
-    const steps = !consent ? ["challenge", "answer"] : r.mode === "rule" ? ["rule-challenge", "rule"] : ["challenge", "answer"];
-    const body = consent ? { decision: choice, signer_fp: fp } : { signer_fp: fp, request_sha256: r.sha256 };
-    if (!consent && choice !== undefined) body.choice = choice;
-    if (!consent && words !== undefined) body.write_in = words;
+    // a dispatch job takes the phone port's own: the pair of routes of the act picked (sign, cancel, authorise), {signer_fp}
+    // (a cancel's also {reason}), then the payload beside the assertion
+    const steps = dispatch ? (DISPATCH_STEPS[choice] || DISPATCH_STEPS.sign)
+      : !consent ? ["challenge", "answer"] : r.mode === "rule" ? ["rule-challenge", "rule"] : ["challenge", "answer"];
+    const body = dispatch ? { signer_fp: fp } : consent ? { decision: choice, signer_fp: fp } : { signer_fp: fp, request_sha256: r.sha256 };
+    if (dispatch && choice === "cancel") body.reason = typeof words === "string" ? words : "";
+    if (!consent && !dispatch && choice !== undefined) body.choice = choice;
+    if (!consent && !dispatch && words !== undefined) body.write_in = words;
     let sent = false, line = "";
     const unsigned = (m) => { say(/nothing was signed/.test(m) ? m : m + "; nothing was signed.", "bad"); return "unsigned"; };
     say(choice !== undefined ? "Asking for the challenge for (" + choice + ")…" : "Asking for the challenge…");
@@ -459,7 +504,7 @@
         say("Verifying the signature…");
         const answer = { authenticator_data: b64u(cred.response.authenticatorData),
           client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
-        if (consent) answer.payload = c.body.payload;
+        if (consent || dispatch) answer.payload = c.body.payload;
         else if (cred.rawId) answer.raw_id = b64u(cred.rawId);
         sent = true;          // from here on a failure may follow an answer that landed
         return call(base + steps[1], answer).then((a) => {
@@ -469,7 +514,9 @@
           const by = typeof a.body.signer_fp === "string" && a.body.signer_fp ? a.body.signer_fp : fp;
           const ns = typeof a.body.namespace === "string" && a.body.namespace ? " in " + a.body.namespace : "";
           // a consent answer's reply names its decision; a ruling's also says where its delivery stands
-          const what = a.body.choice || (consent && typeof a.body.decision === "string" ? a.body.decision : "");
+          // a dispatch reply names the job's state now (signed, cancelled, or where the land went)
+          const what = a.body.choice || (consent && typeof a.body.decision === "string" ? a.body.decision
+            : dispatch && typeof a.body.state === "string" ? a.body.state + (typeof a.body.outcome === "string" ? ", " + a.body.outcome : "") : "");
           const went = consent && a.body.delivery && typeof a.body.delivery.reason === "string" ? " · " + a.body.delivery.reason : "";
           say("signed" + (what ? " (" + what + ")" : "") + " · by " + by + ns + (line ? ": " + line : "") + went, "ok");
           if (line) signing(line, "server", "Signed"); else relabel("Signed");
