@@ -176,6 +176,7 @@ def test_a_finish_that_failed_once_is_finished_by_the_thread(home, spores, monke
         assert _rows(b, "SELECT status FROM effects") == [("APPLIED",)]
         assert b.db is not None and b.db.due_ops(b._now()) in ([out["pending_id"]], [])
         assert _wait(lambda: _state(b, out["pending_id"]) == "COMMITTED", 3.0)
+        assert calls["n"] >= 2                         # the first finish failed and a later one is what committed
     finally:
         b.stop()
 
