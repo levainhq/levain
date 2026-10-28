@@ -419,11 +419,115 @@ def test_modes_are_reset_on_a_stop_too(tmp_path: Path, monkeypatch: pytest.Monke
 
 # --- g4-7: interactive passthrough refused at parse ---------------------------------------------------------------------
 
-def test_interactive_passthrough_is_refused_before_a_slot_is_taken() -> None:
+def test_interactive_passthrough_is_refused_before_a_slot_is_taken(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(L, "IDENTITY_GATED", ("codex",))      # a vendor outside the set keeps the refusal
     with pytest.raises(Refused) as e:
         L.parse(["claude", "--repo", "/r", "--auth", "passthrough"])
     assert e.value.name == "passthrough-needs-identity-gate"
     assert L.parse(["claude", "--repo", "/r", "--auth", "passthrough", "--login"]).kind == "login"
+
+
+# --- G3-3: identity-changed and the Codex line -------------------------------------------------------------------------
+
+PLANTED = "99999999-9999-4999-8999-999999999999"
+ROOT_ID = "11111111-1111-4111-8111-111111111111"
+
+G3_START = r'''    if os.environ.get("FAKE_START") == "idchg":
+        os.write(1, ("account %s\\n" % os.environ["FAKE_PLANTED"]).encode())
+        line({"ok": False, "refused": "identity-changed"})
+        sys.exit(1)
+    if mode == "raw":'''
+G3_HELPER = (FX3_HELPER.replace('    if mode == "raw":', G3_START, 1)
+             .replace('elif verb == "teardown":', '''elif verb == "status":
+    ans = os.environ.get("FAKE_STATUS", "")
+    if ans:
+        sys.stdout.write(ans + "\\n")
+    else:
+        line({"ok": True, "identity": {"observed_id": os.environ["FAKE_ROOT_ID"], "result": "identity-changed"}})
+elif verb == "teardown":''', 1))
+assert G3_HELPER.count("idchg") == 1 and G3_HELPER.count('verb == "status"') == 1
+
+
+def g3rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **env: str) -> Rig:
+    r = Rig(tmp_path, monkeypatch, FAKE_START="idchg", FAKE_PLANTED=PLANTED, FAKE_ROOT_ID=ROOT_ID, **env)
+    r.helper.write_text(G3_HELPER)
+    return r
+
+
+def _said(r: Rig) -> str:
+    return r.stderr()
+
+
+@bounded(60)
+def test_identity_changed_shows_root_status_id_not_the_pty_tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+                                                                ) -> None:
+    r = g3rig(tmp_path, monkeypatch)
+    assert r.run(auth="passthrough") == 1
+    said = _said(r)
+    assert ROOT_ID in said and PLANTED not in said
+    assert f"slot 0's stored Claude login now answers as account {ROOT_ID}" in said
+    assert "Nothing was launched" in said
+    assert "levain session claude --auth passthrough --login --slot 0, and answer yes." in said
+    assert PLANTED.encode() in r.out.read_bytes()                       # the tail did carry the other id
+    verbs = [v["verb"] for v in r.verbs()]
+    assert verbs.index("status") < verbs.index("teardown") and verbs[-1] == "teardown"
+
+
+@bounded(60)
+def test_identity_changed_text_needs_roots_record_to_say_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ans = json.dumps({"ok": True, "identity": {"observed_id": ROOT_ID, "result": "matched"}}, sort_keys=True,
+                     separators=(",", ":"))
+    r = g3rig(tmp_path, monkeypatch, FAKE_STATUS=ans)
+    assert r.run(auth="passthrough") == 1
+    said = _said(r)
+    assert ROOT_ID not in said and PLANTED not in said and "root's record does not name an account" in said
+    assert [v["verb"] for v in r.verbs()][-1] == "teardown"
+
+
+@bounded(60)
+def test_identity_changed_status_refused_is_said_and_teardown_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+                                                                   ) -> None:
+    r = g3rig(tmp_path, monkeypatch, FAKE_REFUSE="status=lease-dead")
+    assert r.run(auth="passthrough") == 1
+    assert "refused lease-dead" in _said(r) and PLANTED not in _said(r)
+    assert [v["verb"] for v in r.verbs()][-1] == "teardown"
+
+
+def _codex_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host: str) -> Rig:
+    probe = {"address": "192.0.2.10", "addresses": 2, "host": host, "ok": True, "probe": "closed"}
+    r = rig(tmp_path, monkeypatch, FAKE_PROBES="raw",
+            FAKE_PROBE_LINE=json.dumps(probe, sort_keys=True, separators=(",", ":")))
+    base = json.loads(r.store.joinpath("routes", "base.json").read_text())
+    base["routes"].append({"route": "codex-sub", "type": "subscription_passthrough", "hosts": ["chatgpt.com"]})
+    r.store.joinpath("routes", "base.json").write_text(json.dumps(base, sort_keys=True, separators=(",", ":")))
+    return r
+
+
+@bounded(60)
+def test_codex_line_is_printed_before_start_for_codex_interactive_passthrough(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    r = _codex_rig(tmp_path, monkeypatch, "chatgpt.com")
+    SV.Supervisor(SV.Request(vendor="codex", repo=r.repo, auth="passthrough"), r.seams).run()
+    err = r.stderr()
+    line = ("Codex has no server-checked identity, so Levain cannot tell which account this slot's stored login "
+            "belongs to (not a check).")
+    assert line in err and err.index(line) < err.index("codex exited")
+    assert [v["verb"] for v in r.verbs()].index("start") >= 0
+
+
+@bounded(60)
+def test_codex_line_is_not_printed_for_other_sessions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for d in "abc":
+        (tmp_path / d).mkdir()
+    r = _codex_rig(tmp_path / "a", monkeypatch, "api.openai.com")
+    SV.Supervisor(SV.Request(vendor="codex", repo=r.repo, auth="brokered"), r.seams).run()
+    assert "codex exited" in r.stderr() and "Codex has no server-checked" not in r.stderr()
+    r = _codex_rig(tmp_path / "b", monkeypatch, "chatgpt.com")
+    SV.Supervisor(SV.Request(vendor="codex", repo=r.repo, auth="passthrough", kind="login"), r.seams).run()
+    assert "codex exited" in r.stderr() and "Codex has no server-checked" not in r.stderr()
+    r = rig(tmp_path / "c", monkeypatch)
+    r.run(auth="passthrough")
+    assert "claude exited" in r.stderr() and "Codex has no server-checked" not in r.stderr()
 
 
 # --- g4-8: the prepare answer, whole ------------------------------------------------------------------------------------
