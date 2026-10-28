@@ -30,7 +30,9 @@ def test_b7_client_gives_up_before_the_decider_answers(r3, r3_glue, verdict, pid
             f"curl rc={res.rc} client-closed@{t['client-closed']:.2f}s decision={dec['action']} aborted={dec['aborted']}@{t['decision']:.2f}s "
             f"dns={len(seen.dns)} origin={seen.origin_bytes()}B")
     assert res.rc == 28                                             # curl's own timeout
-    assert 1.2 < t["client-closed"] < 2.2 and 3.7 < t["decision"] < 5.0
+    # curl's 1.5 s clock starts before the glue logs `req` (connect and, for TLS, the handshake come first), so on a
+    # loaded runner client-closed reads well under 1.5 s from `req`; the bound only has to separate it from the decision
+    assert 0.8 < t["client-closed"] < 2.2 and 3.7 < t["decision"] < 5.0
     assert t["client-closed"] < t["decision"]                       # the glue knew BEFORE the decision came back
     assert dec["action"] == "allow" and dec["aborted"] is True
     assert seen.dns == [] and seen.origin_bytes() == 0 and not seen.event_types("onResponse")
