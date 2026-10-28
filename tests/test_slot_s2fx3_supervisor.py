@@ -432,7 +432,11 @@ def test_interactive_passthrough_is_refused_before_a_slot_is_taken(monkeypatch: 
 PLANTED = "99999999-9999-4999-8999-999999999999"
 ROOT_ID = "11111111-1111-4111-8111-111111111111"
 
-G3_START = r'''    if os.environ.get("FAKE_START") == "idchg":
+G3_START = r'''    if os.environ.get("FAKE_START") == "idexp":
+        os.write(1, b"slot 7 identity-changed identity-expired sign in again: levain session claude --slot 7\\n")
+        line({"ok": False, "refused": "identity-expired"})
+        sys.exit(1)
+    if os.environ.get("FAKE_START") == "idchg":
         os.write(1, ("account %s\\n" % os.environ["FAKE_PLANTED"]).encode())
         line({"ok": False, "refused": "identity-changed"})
         sys.exit(1)
@@ -449,7 +453,8 @@ assert G3_HELPER.count("idchg") == 1 and G3_HELPER.count('verb == "status"') == 
 
 
 def g3rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **env: str) -> Rig:
-    r = Rig(tmp_path, monkeypatch, FAKE_START="idchg", FAKE_PLANTED=PLANTED, FAKE_ROOT_ID=ROOT_ID, **env)
+    env.setdefault("FAKE_START", "idchg")
+    r = Rig(tmp_path, monkeypatch, FAKE_PLANTED=PLANTED, FAKE_ROOT_ID=ROOT_ID, **env)
     r.helper.write_text(G3_HELPER)
     return r
 
@@ -471,6 +476,26 @@ def test_identity_changed_shows_root_status_id_not_the_pty_tail(tmp_path: Path, 
     assert PLANTED.encode() in r.out.read_bytes()                       # the tail did carry the other id
     verbs = [v["verb"] for v in r.verbs()]
     assert verbs.index("status") < verbs.index("teardown") and verbs[-1] == "teardown"
+
+
+@bounded(60)
+def test_identity_expired_text_is_root_sourced_and_ignores_a_planted_tail(tmp_path: Path,
+                                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    expired = json.dumps({"ok": True, "identity": {"result": "identity-expired"}}, sort_keys=True,
+                         separators=(",", ":"))
+    r = g3rig(tmp_path, monkeypatch, FAKE_START="idexp", FAKE_STATUS=expired)
+    assert r.run(auth="passthrough") == 1
+    assert ("slot 0's stored Claude login looks expired or revoked. Nothing was launched. Sign in again: "
+            "levain session claude --auth passthrough --login --slot 0") in _said(r)
+    assert "slot 7" not in _said(r) and "identity-changed" not in _said(r)
+    # the tail alone (root's record says something else) cannot make the line be said
+    other = json.dumps({"ok": True, "identity": {"result": "matched"}}, sort_keys=True, separators=(",", ":"))
+    (tmp_path / "b").mkdir()
+    r2 = g3rig(tmp_path / "b", monkeypatch, FAKE_START="idexp", FAKE_STATUS=other)
+    assert r2.run(auth="passthrough") == 1
+    said = _said(r2)
+    assert "looks expired" not in said and "slot 7" not in said and "Nothing was launched." in said
+    assert [v["verb"] for v in r2.verbs()][-1] == "teardown"
 
 
 @bounded(60)
