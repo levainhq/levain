@@ -46,32 +46,6 @@ def repair_line(host: HostOS) -> str:
     return f"sudo {install_helper_path(host)} repair"
 
 
-def reap_held_lines(host: HostOS, source: str) -> tuple[str, ...]:
-    """The commands that release a session stuck HELD by an OLDER release's END, run as the operator in this order
-    (Phill 10-28, np-5da552a2 (b): no ``reap-held`` verb; an installed helper cannot learn a verb it was built
-    without, so ``repair`` stays the only door and refuses ``live-lease`` while the session is stuck). It stops the
-    reaper, copies the NEW package (``source``) to a root-owned directory, runs ONE reaper pass from that copy,
-    never from the operator-writable tree, starts the reaper again and removes the copy. ``repair`` follows."""
-    from levain.slot import root_tree, units
-
-    svc = next(sv for sv in units.SERVICES if sv.name == "reaper")
-    stage = "/var/root/levain-pass" if host == "darwin" else "/root/levain-pass"
-    if host == "darwin":
-        stop = f"sudo launchctl bootout system/{units.launchd_label(svc)}"
-        start = f"sudo launchctl bootstrap system {units.launchd_path(svc)}"
-    else:
-        unit = units.systemd_name(svc)
-        stop, start = f"sudo systemctl stop {unit}", f"sudo systemctl start {unit}"
-    prog = ("import sys; sys.path.insert(0, '" + stage + "'); "
-            "from levain.slot import reaper as RP, runtime_helper as H; print(RP.Reaper(H.Seams()).run_pass())")
-    return (stop,
-            f"sudo rm -rf {stage} && sudo mkdir -m 700 {stage} && sudo cp -R {source} {stage}/levain",
-            f"sudo {root_tree.ROOT_PYTHON[host]} {root_tree.PY_FLAGS} -c \"{prog}\"",
-            start,
-            f"sudo rm -rf {stage}",
-            repair_line(host) + f" --source {source}")
-
-
 def service_entry_path(host: HostOS) -> Path:
     """The one bootstrap entry every service unit runs (CONTRACT §23), beside the helpers' entries."""
     return HELPER_DIR[host] / "service-entry"

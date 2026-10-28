@@ -1713,13 +1713,39 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
                        "release it from this install's package, in order:\n" + _held_commands())
 
 
+def reap_held_lines(host: HostOS, source: str) -> tuple[str, ...]:
+    """The commands that release a session stuck HELD by an OLDER release's END, run as the operator in this order
+    (Phill 10-28, np-5da552a2 (b): no ``reap-held`` verb; an installed helper cannot learn a verb it was built
+    without, so ``repair`` stays the only door and refuses ``live-lease`` while the session is stuck). It stops the
+    reaper, copies the NEW package (``source``) to a root-owned directory, runs ONE reaper pass from that copy,
+    never from the operator-writable tree, starts the reaper again and removes the copy. ``repair`` follows."""
+    from levain.slot import layout, root_tree, units
+
+    svc = next(sv for sv in units.SERVICES if sv.name == "reaper")
+    stage = "/var/root/levain-pass" if host == "darwin" else "/root/levain-pass"
+    if host == "darwin":
+        stop = f"sudo launchctl bootout system/{units.launchd_label(svc)}"
+        start = f"sudo launchctl bootstrap system {units.launchd_path(svc)}"
+    else:
+        unit = units.systemd_name(svc)
+        stop, start = f"sudo systemctl stop {unit}", f"sudo systemctl start {unit}"
+    prog = ("import sys; sys.path.insert(0, '" + stage + "'); "
+            "from levain.slot import reaper as RP, runtime_helper as H; print(RP.Reaper(H.Seams()).run_pass())")
+    return (stop,
+            f"sudo rm -rf {stage} && sudo mkdir -m 700 {stage} && sudo cp -R {source} {stage}/levain",
+            f"sudo {root_tree.ROOT_PYTHON[host]} {root_tree.PY_FLAGS} -c \"{prog}\"",
+            start,
+            f"sudo rm -rf {stage}",
+            layout.repair_line(host) + f" --source {source}")
+
+
 def _held_commands() -> str:
-    """The numbered commands of :func:`levain.slot.layout.reap_held_lines`, for the package this doctor runs from."""
+    """The numbered commands of :func:`reap_held_lines`, for the package this doctor runs from."""
     from levain.slot import layout
 
     host = "darwin" if sys.platform == "darwin" else "linux"
     src = os.path.dirname(os.path.abspath(__file__))
-    steps = "\n".join(f"        {i}. {c}" for i, c in enumerate(layout.reap_held_lines(host, src), 1))
+    steps = "\n".join(f"        {i}. {c}" for i, c in enumerate(reap_held_lines(host, src), 1))
     return steps + "\n        If 3 fails, still run 4 and 5: the reaper stays stopped until 4. Step 6 asks for your password."
 
 
