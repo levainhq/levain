@@ -7,8 +7,8 @@ ref)``, so a number is never reused, not after a restart and not after the band 
 first time an item is SHOWN, inside one bounded write (D3); a busy lock leaves the item as ``new (number pending)``,
 never with a provisional number. The whole band is printed every time, never reordered, never cut: past
 :data:`COMPACT_AFTER` items the rest take one line each (D15), and an item that cannot be read is listed as UNREADABLE
-(D13). Closed is derived (the question has an answer) and shown ONCE as ``closed N`` in the next hook render, then it
-leaves; its number stays retired.
+(D13). Closed is derived (the question has an answer) and shown as ``closed N`` in the next hook render, then it leaves; its
+number stays retired. The notice is recorded as shown only AFTER the hook's ``emit`` returned True (at-least-once).
 
 Three seams use it: the UserPromptSubmit hook (:func:`hook_prompt`: the render, nothing parsed), the SessionStart
 contract line (:func:`hook_contract`) and ``levain band`` (:func:`run_band`). The hooks FAIL OPEN: any error prints
@@ -17,6 +17,14 @@ nothing and never blocks the prompt. A seat that no human turn can reach (autono
 Known edges, none built against (later slices): no shorthand parse and no per-viewer delta (``closed N`` is shown once
 for the store, to the first hook that renders it); no source but questions; a question the coordinator holds as first
 reader is shown as any other. ``levain band`` numbers what it shows (a first show) but consumes no ``closed``.
+A seat with no non-empty string ``session_id`` (``levain verify-hooks``) gets no band and consumes nothing.
+Also known: (1) Codex hooks are not installed by S1; Codex parity is S4's. (2) Two hooks rendering at once may both show
+the same ``closed N`` (at-least-once; no claim protocol is built). (3) A dispatch worker's first prompt can fire before
+its ``active`` launch event carries ``harness_session_id``: it is then classed non-autonomous and may be shown the band
+and a closed notice (at most a duplicate, since the notice is marked only after delivery). (4) The read snapshot waits
+up to HOOK_BUSY_MS on its own, before the write's deadline starts; a worst case is about twice the bound, and a
+store not in WAL mode is the operator's to fix (the reader then blocks on any writer). (5) An item that cannot render
+(an unreadable row, more options than letters) is listed UNREADABLE, never dropped.
 Stdlib plus the question store.
 """
 from __future__ import annotations
@@ -27,14 +35,15 @@ import os
 import sqlite3
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 from levain.cockpit.consent import utc_stamp
 from levain.consent.questions import HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select
 
-__all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "hook_contract", "hook_prompt", "is_autonomous", "render", "run_band"]
+__all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "hook_contract", "hook_prompt", "is_autonomous", "mark_closed_shown", "render",
+           "render_with_closed", "run_band"]
 
 COMPACT_AFTER = 12
 _COMPACT_WHAT = 100
@@ -110,11 +119,16 @@ def _read(store: QuestionStore) -> tuple[list[tuple[str, Question | None]], dict
     return items, numbers, closed
 
 
-def _number(store: QuestionStore, refs: list[str], closed: list[tuple[int, str]], deadline: float, mark: bool
-            ) -> dict[str, int]:
-    """Number every ``refs`` that has no number yet (in the order given) and, with ``mark``, record ``closed`` as
-    shown, in ONE write transaction waited for until ``deadline``. The numbers come back read under the lock, so two
-    writers never number a ref twice. Past the deadline: nothing written, nothing returned."""
+def _busy(exc: sqlite3.OperationalError) -> bool:
+    """Whether ``exc`` is the lock still held (SQLITE_BUSY / SQLITE_LOCKED); any other failure is the store's."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    return code is not None and (code & 0xFF) in (5, 6)
+
+
+def _number(store: QuestionStore, refs: list[str], deadline: float) -> dict[str, int]:
+    """Number every ``refs`` that has no number yet (in the order given), in ONE write transaction waited for until
+    ``deadline``. The numbers come back read under the lock, so two writers never number a ref twice. The lock still
+    busy at the deadline: nothing written, nothing returned (``new (number pending)``); any other error is raised."""
     try:
         with store._write_by(deadline) as conn:
             for stmt in BAND_SCHEMA:
@@ -129,29 +143,44 @@ def _number(store: QuestionStore, refs: list[str], closed: list[tuple[int, str]]
                     row = conn.execute("SELECT n FROM band_items WHERE source = 'question' AND ref = ?",
                                        (ref,)).fetchone()
                 got[ref] = row[0]
-            if mark:
-                for n, _ in closed:
-                    if conn.execute("SELECT 1 FROM band_closed_shown WHERE n = ?", (n,)).fetchone() is None:
-                        conn.execute("INSERT INTO band_closed_shown (n, at) VALUES (?, ?)", (n, stamp))
             return got
-    except sqlite3.OperationalError:          # the lock stayed busy until the deadline
-        return {}
+    except sqlite3.OperationalError as exc:
+        if _busy(exc):
+            return {}
+        raise
 
 
-def render(store: QuestionStore | None = None, *, consume: bool = False) -> str:
-    """The band as text: the whole of it, every time; ``""`` when nothing is open and nothing closed is due. Showing an
-    item numbers it (first show, one bounded write). ``consume`` (the hook's) also records the closed items as shown,
-    so each leaves after this render (a write that misses its deadline shows it once more); ``levain band`` numbers
-    and shows the closed ones but consumes nothing. Raises on a store that cannot be
-    trusted: the hook fails open on it."""
+def mark_closed_shown(store: QuestionStore, closed: list[int]) -> None:
+    """Record ``closed`` (band numbers) as shown, once each, in one bounded write: call it only AFTER the render was
+    delivered. A lock still busy at the deadline records nothing (the notice comes once more: at-least-once)."""
+    if not closed:
+        return
+    try:
+        with store._write_by(time.monotonic() + HOOK_BUSY_MS / 1000) as conn:
+            for stmt in BAND_SCHEMA:
+                conn.execute(stmt)
+            stamp = utc_stamp(_now_utc(store._clock))
+            for n in closed:
+                if conn.execute("SELECT 1 FROM band_closed_shown WHERE n = ?", (n,)).fetchone() is None:
+                    conn.execute("INSERT INTO band_closed_shown (n, at) VALUES (?, ?)", (n, stamp))
+    except sqlite3.OperationalError as exc:
+        if not _busy(exc):
+            raise
+
+
+def render_with_closed(store: QuestionStore | None = None) -> tuple[str, list[int]]:
+    """The band as text (the whole of it, every time; ``""`` when nothing is open and nothing closed is due) and the
+    band numbers of the ``closed`` notices it carries, consumed by nobody: the caller that DELIVERED the text hands
+    them to :func:`mark_closed_shown`. Showing an item numbers it (first show, one bounded write). Raises on a store
+    that cannot be trusted: the hook fails open on it."""
     store = store if store is not None else QuestionStore()
     deadline = time.monotonic() + HOOK_BUSY_MS / 1000
     items, numbers, closed = _read(store)
     refs = [i for i, _ in items if i not in numbers]
-    if refs or (consume and closed):
-        numbers = {**numbers, **_number(store, refs, closed, deadline, mark=consume)}
+    if refs:
+        numbers = {**numbers, **_number(store, refs, deadline)}
     if not items and not closed:
-        return ""
+        return "", []
     shown = [numbers[i] for i, _ in items if i in numbers]
     head = [f"NEEDS YOU · {len(items)} open"]
     if shown or closed:
@@ -162,11 +191,18 @@ def render(store: QuestionStore | None = None, *, consume: bool = False) -> str:
     for pos, (ref, q) in enumerate(items):
         n = numbers.get(ref)
         label = f"{n}." if n is not None else "new (number pending):"
-        if q is None:
-            lines.append(f"{label} UNREADABLE: question {ref} could not be read (listed, never dropped)")
-        else:
+        try:
+            if q is None:
+                raise ValueError("unreadable")
             lines.extend(_item_lines(label, q, compact=pos >= COMPACT_AFTER))
-    return "\n".join(lines)
+        except Exception:                     # one item that will not render never drops the band (D13)
+            lines.append(f"{label} UNREADABLE: question {ref} could not be read (listed, never dropped)")
+    return "\n".join(lines), [n for n, _ in closed]
+
+
+def render(store: QuestionStore | None = None) -> str:
+    """:func:`render_with_closed`'s text alone: a look (``levain band``) consumes no ``closed`` notice."""
+    return render_with_closed(store)[0]
 
 
 def is_autonomous(session_id: str, queue_dir: Path | str | None = None) -> bool:
@@ -190,29 +226,47 @@ def is_autonomous(session_id: str, queue_dir: Path | str | None = None) -> bool:
 
 
 def _seat_gets_band(payload: Any, environ: Mapping[str, str]) -> bool:
+    """A seat with no non-empty string ``session_id`` (``levain verify-hooks``, a malformed payload) is nobody's: no
+    band, nothing consumed."""
     from levain.consent.queue import queue_dir_for
 
     session = payload.get("session_id") if isinstance(payload, dict) else None
-    session = session if isinstance(session, str) else ""
-    return not is_autonomous(session, queue_dir_for(environ)) if session else True
+    if not isinstance(session, str) or not session:
+        return False
+    return not is_autonomous(session, queue_dir_for(environ))
 
 
-def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None) -> str:
-    """The UserPromptSubmit hook's band text (render only, no parse); ``""`` for an autonomous seat, an empty band or
-    ANY error: it never raises and never takes more than about :data:`~levain.consent.questions.HOOK_BUSY_MS`."""
+def _no_commit() -> None:
+    return None
+
+
+def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None) -> tuple[str, Callable[[], None]]:
+    """The UserPromptSubmit hook's ``(band text, commit)`` (render only, no parse): call ``commit()`` only once the
+    text was DELIVERED, to record its ``closed`` notices as shown. ``("", no-op)`` for an autonomous or id-less seat,
+    an empty band or ANY error: it never raises (``commit`` neither) and takes about
+    :data:`~levain.consent.questions.HOOK_BUSY_MS` at most per store wait."""
     try:
         from levain.consent.queue import queue_dir_for
 
         env = os.environ if environ is None else environ
         if not _seat_gets_band(payload, env):
-            return ""
-        return render(QuestionStore(queue_dir_for(env)), consume=True)
+            return "", _no_commit
+        store = QuestionStore(queue_dir_for(env))
+        text, closed = render_with_closed(store)
     except Exception:
-        return ""
+        return "", _no_commit
+
+    def commit() -> None:
+        try:
+            mark_closed_shown(store, closed)
+        except Exception:
+            pass
+
+    return text, commit
 
 
 def hook_contract(payload: Any, environ: Mapping[str, str] | None = None) -> str:
-    """The SessionStart contract line (D5 layer 1); ``""`` for an autonomous seat or on any error."""
+    """The SessionStart contract line (D5 layer 1); ``""`` for an autonomous or id-less seat or on any error."""
     try:
         return CONTRACT if _seat_gets_band(payload, os.environ if environ is None else environ) else ""
     except Exception:
@@ -223,7 +277,7 @@ def run_band(args: argparse.Namespace) -> int:
     """``levain band``: print the band as a seat would see it, consuming no ``closed``."""
     try:
         store = QuestionStore(args.queue_dir)
-        text = render(store, consume=False)
+        text = render(store)
     except Exception as exc:                  # a store that cannot be trusted: said, not hidden
         print(f"levain band: {exc}", file=sys.stderr)
         return 1
