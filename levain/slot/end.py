@@ -1901,6 +1901,94 @@ def keep_shape_ok(keep: Path, name: str, slot_uid: int, *, cap: int = V14_BYTES)
     return True, ""
 
 
+def _shape_at(dirfd: int, name: bytes, slot_owner_ok: Callable[[os.stat_result], bool], cap: int = V14_BYTES) -> str:
+    """:func:`keep_shape_ok`'s rule by ``fstatat`` on ``dirfd`` (no link followed): "" when it holds, else the reason."""
+    st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    if not stat.S_ISREG(st.st_mode):
+        return "not a regular file"
+    if st.st_nlink != 1:
+        return f"{st.st_nlink} links"
+    if not slot_owner_ok(st):
+        return f"owner {st.st_uid}, not the slot's"
+    if st.st_size > cap:
+        return f"{st.st_size} bytes > {cap}"
+    return ""
+
+
+def _present(dirfd: int | None, name: bytes) -> bool:
+    if dirfd is None:
+        return False
+    try:
+        os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def return_move(facts: EndFacts, *, slot_owner_ok: Callable[[os.stat_result], bool] | None = None,
+                owner_ok: Callable[[os.stat_result], bool] = _root_owned, fault: Fault = _no_fault) -> str:
+    """G3: the session vendor's parked credential renamed (never opened) from ``keep/`` into the session tree's
+    credential directory, for an interactive passthrough session. Returns ``moved`` or ``already`` (keep/ empty, the
+    tree holds it: a retry; the fsyncs are redone). Refuses, with nothing moved or deleted: ``keep-shape``
+    (:func:`keep_shape_ok`'s rule applied by dirfd; refused, never deleted), ``keep-return-conflict`` (both
+    present), ``no-credential:<tag>`` (both absent), ``bad-root`` (``keep/`` not a ``owner_ok`` directory, the
+    credential directory missing, a rename error). ``slot_owner_ok`` defaults to ``st_uid == facts.slot_uid``.
+    Order: rename, fsync ``keep/``, fsync the tree directory, at the faults ``return:checked``, ``return:renamed``,
+    ``return:source-synced``, ``return:done``. The caller holds the session END lock. The baseline and the gate are
+    the caller's."""
+    if facts.kind != "interactive" or not facts.parks:
+        raise Refused("bad-root", "return_move: not an interactive passthrough session of a credential vendor")
+    if slot_owner_ok is None:
+        slot_owner_ok = lambda st: st.st_uid == facts.slot_uid   # noqa: E731
+    parts, name = facts.credential   # type: ignore[misc]
+    tfd = _open_subdir(facts.live, parts) if os.path.isdir(facts.live) else None
+    try:
+        kfd: int | None = os.open(facts.keep, _DIR_FLAGS)
+    except OSError as e:
+        if e.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            if tfd is not None:
+                os.close(tfd)
+            raise Refused("bad-root", f"{facts.keep}: {e.strerror or e}") from None
+        kfd = None
+    try:
+        if kfd is not None and not (stat.S_ISDIR(os.fstat(kfd).st_mode) and owner_ok(os.fstat(kfd))):
+            raise Refused("bad-root", f"{facts.keep} is not a directory with the expected owner")
+        in_keep, in_tree = _present(kfd, name), _present(tfd, name)
+        if in_keep and in_tree:
+            raise Refused("keep-return-conflict", f"{name.decode('ascii')} is in keep/ and in the session tree")
+        if not in_keep and not in_tree:
+            raise Refused(f"no-credential:{facts.slot.tag}", f"{name.decode('ascii')} is in neither keep/ nor the tree")
+        if tfd is None:
+            raise Refused("bad-root", f"{facts.live}: the credential directory is missing")
+        try:
+            if in_tree:
+                if kfd is not None:
+                    os.fsync(kfd)
+                os.fsync(tfd)
+                bad = _shape_at(tfd, name, slot_owner_ok)
+                if bad:
+                    raise Refused("keep-shape", bad)
+                return "already"
+            bad = _shape_at(kfd, name, slot_owner_ok)   # type: ignore[arg-type]
+            if bad:
+                raise Refused("keep-shape", bad)
+            fault("return:checked")
+            os.rename(name, name, src_dir_fd=kfd, dst_dir_fd=tfd)
+            fault("return:renamed")
+            os.fsync(kfd)   # type: ignore[arg-type]
+            fault("return:source-synced")
+            os.fsync(tfd)
+            fault("return:done")
+        except OSError as e:
+            raise Refused("bad-root", f"return: {e.strerror or e}") from None
+        return "moved"
+    finally:
+        if kfd is not None:
+            os.close(kfd)
+        if tfd is not None:
+            os.close(tfd)
+
+
 # --- the reserve (CONTRACT §7.5) -------------------------------------------------------------------
 
 
@@ -2366,5 +2454,5 @@ __all__ = ["BUDGET_REFUSALS", "CAS_RETRY_SECONDS", "CLASSES", "CREDENTIALS", "CR
            "linux_meta", "linux_strip", "mark_cloned", "object_record", "os_chown", "outside_link_bytes",
            "REPLACED", "UNCONFIRMED", "confirmed_relogin", "park_move", "park_plan", "read_as_session", "read_slot_state",
            "reconcile_session", "repo_cloned",
-           "retain_plan", "send_cas", "tree_manifest", "unbuilt_freeze", "unbuilt_kill", "unbuilt_no_process",
+           "retain_plan", "return_move", "send_cas", "tree_manifest", "unbuilt_freeze", "unbuilt_kill", "unbuilt_no_process",
            "utc_now", "walk"]
