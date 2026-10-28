@@ -18,6 +18,8 @@ Known edges, not handled (L3 r1):
   refusal itself stands either way.
 - ``_check_writers`` maps gid to name with one name per gid, so on a host with a group alias the pre-check's advice
   may name the alias; root's own check is unaffected.
+- (L3 r3) ``_PATH_VALUED`` is a fixed list: a relative ``PIPX_HOME``, ``PIP_CACHE_DIR`` or similar not on it still
+  reads from ``/``. ``PYTHONNOUSERSITE`` reaches the restart but not the installer.
 """
 from __future__ import annotations
 
@@ -160,15 +162,16 @@ def decide_installer(ev: Evidence, *, python: str, which: Callable[[str], Option
 
 
 def _anchored(env: dict) -> dict:
-    """``env`` with each relative :data:`_PATH_VALUED` value that exists from this process's cwd made absolute. Read
-    here, in the parent, before any child runs from ``/``. A value that is absent stays as given."""
+    """``env`` with each relative :data:`_PATH_VALUED` value made absolute against this process's cwd. Read
+    here, in the parent, before any child runs from ``/``; existence is not tested, so a base the installer will
+    create (``PYTHONUSERBASE``) means the same place to the installer and to the restart."""
     try:
         cwd = os.getcwd()
     except OSError:                    # the operator's directory is gone: nothing to resolve against
         return env
     for k in _PATH_VALUED & env.keys():
         v = env[k]
-        if v and not os.path.isabs(v) and os.path.exists(os.path.join(cwd, v)):
+        if v and not os.path.isabs(v):
             env[k] = os.path.normpath(os.path.join(cwd, v))
     return env
 
@@ -495,7 +498,10 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool) -> int:
             return EXIT_REFUSED
         # -P: `python -m` would otherwise put the cwd first on sys.path, and a `levain/` there would run instead of
         # the package just installed. Not -I, which also drops the user site and so a `pip --user` install.
-        sys.stdout.flush()      # execve discards Python's buffer: the line above would be lost under `| tee`
+        try:
+            sys.stdout.flush()      # execve discards Python's buffer: the line above would be lost under `| tee`
+        except (OSError, ValueError):       # the reader closed (`| head`): the exec must still happen
+            pass
         s.execv(s.executable, [s.executable, "-P", "-m", "levain", "upgrade", "--no-pip",
                                *(["--verbose"] if verbose else [])], reexec_env())
         return EXIT_OK      # only reached where exec is a seam

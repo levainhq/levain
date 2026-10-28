@@ -633,14 +633,14 @@ def test_relative_config_paths_resolve_from_the_operators_directory(env, capsys,
     monkeypatch.setenv("PIP_CONFIG_FILE", "./pip.conf")
     monkeypatch.setenv("NETRC", "netrc")
     monkeypatch.setenv("PYTHONUSERBASE", "ub")
-    monkeypatch.setenv("UV_CONFIG_FILE", "missing.toml")       # relative but absent: left as given
+    monkeypatch.setenv("UV_CONFIG_FILE", "missing.toml")       # relative and absent: still anchored, the child runs from /
     monkeypatch.setenv("SSL_CERT_FILE", "/etc/ca.pem")         # absolute: left as given
     monkeypatch.setenv("PIP_INDEX_URL", "pip.conf")            # not a path-valued name: never rewritten
     pip_env, exec_env = _both_envs(env, capsys)
     assert pip_env["PIP_CONFIG_FILE"] == str(cwd / "pip.conf")
     assert pip_env["NETRC"] == str(cwd / "netrc")
     assert pip_env["PYTHONUSERBASE"] == exec_env["PYTHONUSERBASE"] == str(cwd / "ub")
-    assert pip_env["UV_CONFIG_FILE"] == "missing.toml"
+    assert pip_env["UV_CONFIG_FILE"] == str(cwd / "missing.toml")
     assert pip_env["SSL_CERT_FILE"] == "/etc/ca.pem" and pip_env["PIP_INDEX_URL"] == "pip.conf"
 
 
@@ -654,3 +654,20 @@ def test_the_session_bus_reaches_the_installer_and_never_sudo(env, capsys, monke
     assert env.run(capsys, no_pip=True)[0] == 0
     sudo = env.runner.kw[0]["env"]
     assert "DBUS_SESSION_BUS_ADDRESS" not in sudo and "XDG_RUNTIME_DIR" not in sudo
+
+
+def test_a_closed_stdout_pipe_does_not_stop_the_exec(env, monkeypatch):
+    import io
+    import sys
+
+    execed = []
+
+    class Out(io.StringIO):
+        def flush(self):
+            raise BrokenPipeError
+
+    monkeypatch.setattr(sys, "stdout", Out())
+    s = env.seams()
+    s.execv = lambda p, a, e: execed.append(a)
+    U.run_upgrade(seams=s)
+    assert execed
