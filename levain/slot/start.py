@@ -15,7 +15,8 @@ CONTROL checks, never as a fact root acts on.
    record's ``identity`` and compared with the baseline (``identity-changed`` when it differs; a login the server
    no longer accepts, ``identity-expired``). Claude only: a parked credential whose fingerprint equals the slot's
    pin passes with no call (``pinned``), and after the vendor exits :func:`_pin_after_session` pins the bytes the
-   session left when a fresh call vouches for them. Any refusal there precedes ``<S>/repo`` and the clone, and
+   session left when a fresh call vouches for them, and removes a pin the call answered against (expired, or another
+   account) for the very bytes it vouches for. Any refusal there precedes ``<S>/repo`` and the clone, and
    the credential is parked back into ``keep/``.
    ``vendor``: root's copy of the session's vendor CLI (its install unit) in ``VENDOR_PREFIX`` is not whole
    (:func:`check_vendor_installed`; setup and repair copy it there) = ``vendor-not-installed:<vendor>``, before any
@@ -770,8 +771,14 @@ def _pin_after_session(ctx: H.Ctx, a: R.Alloc) -> None:
     """After an interactive passthrough Claude exits: the identity call on the credential the session leaves, and a
     pin for those bytes ONLY when the server answered 200 for the baseline account and the file's fingerprint is
     the same before and after the call. Best-effort and local to the pin: any failure (window, shape, timeout,
-    401, another account, bytes changed, record not running) writes no pin, deletes none, and never changes
-    start's answer. The call is root's own helper-side run under the session lock, as the login path's."""
+    401, another account, bytes changed, record not running) writes no pin and never changes start's answer.
+
+    A pin never outlives a definitive answer against the bytes it vouches for (L3 r1 F1): when the server answered
+    ``identity-expired`` (401/403) or a 200 naming another account, and the pin's (sha256, size, ino) equals the
+    fingerprint the call was made on, the pin is removed (:func:`_unpin_contradicted`), so the next start makes the
+    live call. Every other failure (timeout, child, window, shape, unparsable) deletes nothing; a file the session
+    changed simply no longer matches the old pin. The call is root's own helper-side run under the session lock, as
+    the login path's. Nothing here, a Ctrl-C included, is raised over start's answer: the vendor already ran."""
     try:
         baseline = ID.read_slot_baseline(ctx, a)
         facts = end_facts(ctx, a)
@@ -780,16 +787,39 @@ def _pin_after_session(ctx: H.Ctx, a: R.Alloc) -> None:
             fp1 = _credential_fingerprint(ctx, facts)
             if fp1 is None:
                 raise Refused("no-fingerprint", a.session)
-            oid = ID.parse_profile_answer(*_identity_child(ctx, a))
+            try:
+                oid = ID.parse_profile_answer(*_identity_child(ctx, a))
+            except Refused as e:
+                if e.name == ID.EXPIRED:
+                    _unpin_contradicted(ctx, a, baseline, fp1, e.name)
+                raise
             if oid != baseline["observed_id"]:
+                _unpin_contradicted(ctx, a, baseline, fp1, ID.GATE_CHANGED)
                 raise Refused(ID.GATE_CHANGED, a.session)
             if _credential_fingerprint(ctx, facts) != fp1:
                 raise Refused("credential-changed", a.session)
             _write_pin(ctx, a, baseline, fp1)
-    except Exception as e:   # noqa: BLE001 - no pin; the session already ran
+    except BaseException as e:   # noqa: BLE001 - no pin; the session already ran and start's exit code is the answer
+        # L3 r1 F4: a KeyboardInterrupt (the terminal's Ctrl-C once wait_child restored SIGINT) is noted, never raised
+        # over {"exit": code}: the helper outlives it to answer its one line, as wait_child's own stance.
         _note(f"{a.session}: no identity pin: {_why(e)}")
     finally:
         _wake(ctx.seams)
+
+
+def _unpin_contradicted(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str], fp: Tuple[str, int, int],
+                        why: str) -> None:
+    """The slot's pin removed when it vouches for exactly ``fp``, the bytes the server just answered ``why`` for.
+    Best-effort: a failure is noted, never raised (removal only ever turns a no-call start into a live call, so a
+    removal that failed leaves today's behaviour, never a worse one)."""
+    try:
+        pin = ID.read_slot_pin(ctx, a, baseline)
+        if pin is None or (pin["sha256"], pin["size"], pin["ino"]) != fp:
+            return
+        ID.remove_slot_pin(ctx, a)
+        _note(f"{a.session}: identity pin removed: the server answered {why} for the pinned bytes")
+    except Exception as e:   # noqa: BLE001 - the session already ran
+        _note(f"{a.session}: identity pin not removed after {why}: {_why(e)}")
 
 
 #: ``end.return_move``'s refusals that come before any move (``no-credential:<tag>`` by its prefix).

@@ -34,6 +34,7 @@ import stat
 from typing import Callable, Dict, Mapping, Optional
 
 from levain.contracts import ContractError, canon
+from levain.contracts.grammar import JSON_INT_MAX
 from levain.slot import Refused
 from levain.slot import records as R
 from levain.slot import runtime_helper as H
@@ -342,7 +343,9 @@ def _check_pin_shape(obj: object) -> Dict[str, object]:
             raise Refused("bad-pin", key)
     if type(obj["size"]) is not int or not 0 <= obj["size"] <= _PIN_SIZE_MAX:
         raise Refused("bad-pin", "size")
-    if type(obj["ino"]) is not int or obj["ino"] < 0:
+    # canon.parse caps a JSON integer at JSON_INT_MAX: an inode above it could be written but never read back, so
+    # it is refused here and the file gets no pin (the live call decides every start), never a dead pin.
+    if type(obj["ino"]) is not int or not 0 <= obj["ino"] <= JSON_INT_MAX:
         raise Refused("bad-pin", "ino")
     try:
         R.check_timestamp(obj["pinned_at"], "pin.pinned_at")
@@ -383,13 +386,24 @@ def read_slot_pin(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str]) -> Option
         if len(buf) > PIN_MAX_BYTES:
             return None
         return check_pin(canon.parse(bytes(buf)), baseline, a.vendor)
-    except (OSError, ContractError, Refused):
+    except Exception:   # noqa: BLE001 - any doubt (a malformed baseline's KeyError/TypeError too) is "no pin"
         return None
 
 
 def write_slot_pin(ctx: H.Ctx, a: R.Alloc, data: bytes) -> None:
     """The pin written as the baseline is: root's, 0600, temp + fsync + rename + directory fsync."""
     ctx.store.replace(("slots", a.slot.tag), PIN_NAME, data, mode=PIN_MODE)
+
+
+def remove_slot_pin(ctx: H.Ctx, a: R.Alloc) -> None:
+    """The pin removed by root, by dirfd in the slot's root-owned directory, then the directory fsynced. An absent
+    pin is not an error. Removing a pin only ever turns a no-call start into a live-call start."""
+    with ctx.store.dir("slots", a.slot.tag) as sfd:
+        try:
+            os.unlink(PIN_NAME, dir_fd=sfd)
+        except FileNotFoundError:
+            return
+        ctx.store.seams.fsync(sfd)       # the writer's own fsync (Store.replace)
 
 
 # --- confirm-identity (§5.1) -------------------------------------------------------------------------------------------
@@ -458,4 +472,4 @@ def confirm_identity(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, o
 __all__ = ["BASELINE_FORMAT", "BASELINE_KEYS", "BASELINE_WRITTEN", "CONFIRMED", "IDENTITY_CALLS", "LOGIN_FAILED",
            "NOT_A_CHECK", "baseline_bytes", "baseline_vendor", "check_baseline", "confirm_identity", "gate_check",
            "identity_call", "read_slot_baseline", "record_login_identity", "PIN_FORMAT", "pin_bytes", "check_pin",
-           "read_slot_pin", "write_slot_pin"]
+           "read_slot_pin", "write_slot_pin", "remove_slot_pin"]

@@ -495,6 +495,7 @@ def test_identity_expired_text_is_root_sourced_and_ignores_a_planted_tail(tmp_pa
     assert r2.run(auth="passthrough") == 1
     said = _said(r2)
     assert "looks expired" not in said and "slot 7" not in said and "Nothing was launched." in said
+    assert "root's record does not say so" in said and "could not be read" not in said
     assert [v["verb"] for v in r2.verbs()][-1] == "teardown"
 
 

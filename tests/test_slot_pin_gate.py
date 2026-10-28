@@ -56,7 +56,7 @@ class Calls:
     def capture(self, argv, spec_json, cgroup, bound):
         if canon.parse(spec_json)["target"] != "identity":
             return SS.H.capture_target(argv, spec_json, cgroup, bound)
-        if self.la.of("vendor"):
+        if len(self.la.of("vendor")) > self.post:      # a vendor spawned since the last post-session call
             self.post += 1
             if self.hook:
                 self.hook()
@@ -101,12 +101,16 @@ def test_t1_a_pinned_parked_login_passes_with_no_call_and_without_the_pin_refuse
     assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
     assert calls.gate == 0 and len(la.of("vendor")) == 1
     assert w.state(s).fields["identity"] == {"observed_id": UUID, "result": "pinned"}
-    assert _pin_path(w).read_bytes() == pin          # the post-session 401 wrote nothing and deleted nothing
+    assert pin and calls.post == 1
+    # L3 r1 F1: the post-session 401 answered for the very bytes the pin vouched for, so the pin is gone
+    assert not _pin_path(w).exists()
     assert w.main(["teardown", s])[1]["ok"]
 
-    _pin_path(w).unlink()
+    # ...and the next start on those same parked bytes makes the live call and refuses expired
+    gate_before = calls.gate
     s2 = _rendered(w, "egress", "interactive", "claude", "passthrough", blob=_blob(vendor="claude", routes=PASS))
     assert w.main(["start", s2])[1]["refused"] == "identity-expired"
+    assert calls.gate == gate_before + 1
     assert w.state(s2).fields["identity"] == {"result": "identity-expired"}
     assert _keep(w).read_bytes() == CRED524 and not _tree(w, s2).exists()
 
@@ -264,7 +268,110 @@ def test_t4_no_pin_after_a_session_the_call_cannot_vouch_for(env, capsys, cause)
         calls.restore()
     assert _pin_path(w).read_bytes() == seen["pin"]
     assert canon.parse(seen["pin"])["size"] == len(CRED524)
-    assert "no identity pin" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "no identity pin" in err
+    if cause is _post_record_not_running:
+        assert "not-active" in err       # the patched read_record is the one the window reads
+
+
+# --- T4b (L3 r1 F1): a definitive answer against the pinned, unchanged bytes removes the pin ---------------------------
+
+def _post_403(c):
+    c.post_answer = lambda: (0, _ans(403))
+
+
+@pytest.mark.parametrize("cause,removed", [(_post_401, True), (_post_403, True), (_post_other_account, True),
+                                           (_post_timeout, False), (_post_unparsable, False)])
+def test_t4b_a_pin_does_not_outlive_an_answer_against_its_unchanged_bytes(env, capsys, cause, removed):
+    w, la, _ = env
+    s = _gated_with(w, la, CRED524)
+    calls = Calls(w, la)
+    pin = _put_pin(w)
+    cause(calls)
+    assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
+    assert calls.gate == 0 and calls.post == 1       # pinned start; the session left the bytes as they were
+    if removed:
+        assert not _pin_path(w).exists()
+        assert "identity pin removed" in capsys.readouterr().err
+    else:
+        assert _pin_path(w).read_bytes() == pin
+    assert w.main(["teardown", s])[1]["ok"]
+
+    gate_before = calls.gate
+    calls.post_answer = None
+    s2 = _rendered(w, "egress", "interactive", "claude", "passthrough", blob=_blob(vendor="claude", routes=PASS))
+    assert w.main(["start", s2])[1] == {"ok": True, "exit": 0}
+    assert calls.gate == gate_before + (1 if removed else 0)
+
+
+def test_t4b_a_failed_removal_is_noted_and_start_still_answers(env, capsys, monkeypatch):
+    w, la, _ = env
+    s = _gated_with(w, la, CRED524)
+    calls = Calls(w, la)
+    pin = _put_pin(w)
+    _post_401(calls)
+
+    def boom(ctx, a):
+        raise OSError(5, "injected")
+    monkeypatch.setattr(ID, "remove_slot_pin", boom)
+    assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
+    assert _pin_path(w).read_bytes() == pin
+    err = capsys.readouterr().err
+    assert "identity pin not removed after identity-expired: OSError errno 5" in err
+
+
+# --- F4: a Ctrl-C during the post-session call never costs start's answer ----------------------------------------------
+
+def test_a_keyboard_interrupt_in_the_post_session_call_is_noted_and_start_answers(env, capsys):
+    w, la, _ = env
+    s = _gated_with(w, la, CRED524)
+    calls = Calls(w, la)
+    _put_pin(w)
+
+    def ctrl_c():
+        raise KeyboardInterrupt
+    calls.post_answer = ctrl_c
+    assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
+    assert "no identity pin: KeyboardInterrupt" in capsys.readouterr().err
+
+
+# --- F5: a malformed baseline in the pin read is "no pin", never a refused start -----------------------------------------
+
+def test_a_baseline_the_pin_check_cannot_index_costs_the_live_call_not_the_start(env, monkeypatch):
+    w, la, _ = env
+    s = _gated_with(w, la, CRED524)
+    calls = Calls(w, la)
+    _put_pin(w)
+    real = ID.check_pin
+    monkeypatch.setattr(ID, "check_pin", lambda obj, b, v: real(obj, {k: x for k, x in b.items() if k != "session"}, v))
+    assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
+    assert calls.gate == 1
+    assert w.state(s).fields["identity"] == {"observed_id": UUID, "result": "matched"}
+
+
+# --- F3: an inode canon cannot round-trip gets no pin -------------------------------------------------------------------
+
+def test_an_inode_past_json_int_max_is_never_pinned(env, capsys, monkeypatch):
+    from levain.contracts.grammar import JSON_INT_MAX
+    f = dict(observed_id=UUID, baseline_session=BASE_SESSION, sha256="0" * 64, size=1, session="s-00000000000000aa",
+             pinned_at="2026-10-27T00:00:00Z")
+    assert canon.parse(ID.pin_bytes(ino=JSON_INT_MAX, **f))["ino"] == JSON_INT_MAX
+    with pytest.raises(SS.Refused) as e:
+        ID.pin_bytes(ino=JSON_INT_MAX + 1, **f)
+    assert e.value.name == "bad-pin"
+
+    w, la, _ = env
+    s = _gated_with(w, la, CRED524)
+    calls = Calls(w, la)
+    real = SS._credential_fingerprint
+
+    def big(ctx, facts):
+        fp = real(ctx, facts)
+        return None if fp is None else (fp[0], fp[1], JSON_INT_MAX + 1)
+    monkeypatch.setattr(SS, "_credential_fingerprint", big)
+    assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
+    assert calls.gate == 1 and not _pin_path(w).exists()
+    assert "identity pin not written: bad-pin" in capsys.readouterr().err
 
 
 # --- T5: codex ----------------------------------------------------------------------------------------------------------

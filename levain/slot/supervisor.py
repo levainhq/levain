@@ -1509,7 +1509,7 @@ class Supervisor:
         """``start`` refused ``identity-expired``: the tail's refusal name only routes here; the sign-in-again text is
         said only when root's ``status`` record also says ``identity-expired``, never from the pty tail. Any failure
         is said as a neutral line, never raised: teardown still runs."""
-        neutral = ("start refused identity-expired, but root's record could not be read ({why}); "
+        neutral = ("start refused identity-expired, but root's record could not be read ({why}). "
                    "Nothing was launched.")
         try:
             try:
@@ -1518,7 +1518,7 @@ class Supervisor:
                 self.say(neutral.format(why=f"refused {e.name}"))
                 return
             if result != "identity-expired":
-                self.say(neutral.format(why="its record does not say identity-expired"))
+                self.say("start refused identity-expired, but root's record does not say so. Nothing was launched.")
                 return
             vendor = self.req.vendor
             n = self._slot_index

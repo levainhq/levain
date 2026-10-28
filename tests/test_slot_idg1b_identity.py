@@ -186,7 +186,17 @@ def test_claude_confirm_yes_writes_the_uuid_baseline(env):
     assert (obj["vendor"], obj["observed_id"], obj["session"]) == ("claude", UUID, s)
 
 
-@pytest.mark.parametrize("answer", [(0, _answer(401)), (0, _answer(200, {"account": {}})), (0, b"not json\n"),
+@pytest.mark.parametrize("status", [401, 403])
+def test_an_auth_failure_records_identity_expired(env, status):
+    """PIN_DESIGN §4: on the login path a 401/403 is ``identity-expired``, and confirm refuses by that name."""
+    w, la, table = env
+    _capture(w, la, table, (0, _answer(status)))
+    s = _login(w, la, "claude")
+    assert w.state(s).fields["identity"] == {"result": "identity-expired"}
+    assert w.main(["confirm-identity", s, "yes"])[1] == {"ok": False, "refused": "no-observed-id:identity-expired"}
+
+
+@pytest.mark.parametrize("answer", [(0, _answer(500)), (0, _answer(200, {"account": {}})), (0, b"not json\n"),
                                     (1, b'{"error":"no-token"}\n'), Refused("check-output-over-bound"),
                                     Refused("check-timeout"), OSError(12, "fork")])
 def test_no_uuid_records_identity_unparsable(env, answer):

@@ -170,17 +170,21 @@ def test_claude_match_clones_and_spawns_the_vendor_once(env):
     w, la, _ = env
     s = _gated(w, la)
     cgroups_at_capture: list[int] = []
+    capture_cgroups: list = []
     real = w.seams.capture
 
     def capture(argv, spec_json, cgroup, bound):
         cgroups_at_capture.append(len(w.cgroups))
+        capture_cgroups.append(cgroup)
         return real(argv, spec_json, cgroup, bound)
     w.seams.capture = capture
     assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
     assert len(la.of("vendor")) == 1 and len(la.of("clone")) == 1
     assert w.state(s).fields["identity"] == {"observed_id": UUID, "result": "matched"}
-    # the gate's call, then the post-session pin's: the cgroup existed before the gate's child ran
-    assert la.identity_captures == 2 and cgroups_at_capture[0] == 1
+    # the gate's call, then the post-session pin's: the cgroup existed before the gate's child ran, and BOTH
+    # children were launched into the session's own cgroup (L3 r1 LOW: the post-session child is bound too)
+    assert la.identity_captures == 2 and cgroups_at_capture[0] == 1 and all(cgroups_at_capture)
+    assert capture_cgroups == [w.alloc(s).cgroup] * 2 and w.alloc(s).cgroup
     assert _tree(w, s).read_bytes() == b"{}" and not _keep(w).exists()
     assert w.steps.index("repo") < w.steps.index("identity-gate") < w.steps.index("clone")
 

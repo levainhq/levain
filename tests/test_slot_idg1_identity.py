@@ -456,14 +456,15 @@ def test_child_sends_the_bearer_and_beta_and_root_takes_the_uuid(tmp_path, profi
     assert ID.parse_profile_answer(code, out) == UUID
 
 
-@pytest.mark.parametrize("status", [401, 403, 500])
-def test_non_200_is_unparsable(tmp_path, profile_server, status):
+@pytest.mark.parametrize("status,name", [(401, "identity-expired"), (403, "identity-expired"),
+                                         (500, "identity-unparsable")])
+def test_non_200_is_expired_for_401_403_else_unparsable(tmp_path, profile_server, status, name):
     _Profile.status = status
     code, out = _run_child(_creds(tmp_path), profile_server)
     assert json.loads(out) == {"status": status, "body": ""}
     with pytest.raises(Refused) as e:
         ID.parse_profile_answer(code, out)
-    assert e.value.name == "identity-unparsable"
+    assert e.value.name == name
 
 
 @pytest.mark.parametrize("body", ["not json", json.dumps({"account": {}}), json.dumps({"account": {"uuid": "a b"}}),
