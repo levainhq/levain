@@ -29,6 +29,13 @@
 // the phone port's own by option: sign is .../challenge then .../answer ({signer_fp}), cancel is .../cancel-challenge then
 // .../cancel ({signer_fp, reason}, the reason typed in the box the row asks for), authorise is .../authorise-challenge then
 // .../authorise ({signer_fp}); each answer is the challenge's `payload` beside the assertion, nothing else.
+//
+// A coordinator drop (OS-2) is the same sheet at /sign/drop: its read is GET /cockpit/coord/drops.json (the phone's coord_*
+// listing keys), and it composes the drop's words and, optionally, an envelope. A plain drop is POST /cockpit/coord/drop. An
+// envelope is POST /cockpit/coord/envelope-review (the server keeps the body it shows), then POST .../envelope-challenge (the
+// payload, signed_at now, and the WebAuthn challenge), navigator.credentials.get, and POST .../drop carrying the envelope
+// {body_text, payload, authenticator_data, client_data_json, signature}: the phone port's /coord/<action> by name, bodies the
+// phone's own. The bytes signed are the server's; the line shown is the challenge's own `line`.
 (function () {
   "use strict";
 
@@ -47,16 +54,17 @@
   // ---- the link ----
   const consentPath = /^\/sign\/consent\/([^/]{1,480})$/.exec(location.pathname);
   const dispatchPath = /^\/sign\/dispatch\/(dj-[0-9a-f]{32})$/.exec(location.pathname);     // the phone's job id shape
-  const pathId = consentPath || dispatchPath ? null : /^\/sign\/([A-Za-z0-9_-]{8,64})$/.exec(location.pathname);
-  let id = pathId ? pathId[1] : dispatchPath ? dispatchPath[1] : "";
+  const coord = location.pathname === "/sign/drop";
+  const pathId = consentPath || dispatchPath || coord ? null : /^\/sign\/([A-Za-z0-9_-]{8,64})$/.exec(location.pathname);
+  let id = pathId ? pathId[1] : dispatchPath ? dispatchPath[1] : coord ? "drop" : "";
   if (consentPath) {
     try { id = decodeURIComponent(consentPath[1]); } catch (e) { id = ""; }
     if (!/^[A-Za-z0-9._:-]{1,160}$/.test(id)) id = "";       // the server's consent id shape
   }
   const consent = !!consentPath;
   const dispatch = !!dispatchPath;
-  const noun = consent ? "consent request" : dispatch ? "dispatch job" : "sign request";
-  const Noun = consent ? "Consent request" : dispatch ? "Dispatch job" : "Sign request";
+  const noun = consent ? "consent request" : dispatch ? "dispatch job" : coord ? "drop" : "sign request";
+  const Noun = consent ? "Consent request" : dispatch ? "Dispatch job" : coord ? "Drop" : "Sign request";
   const routeOf = (rid) => (consent ? "/cockpit/consent/" : dispatch ? "/cockpit/dispatch/" : "/cockpit/sign/") + encodeURIComponent(rid);
   // the dispatch ceremony's two routes by the act picked (the phone's own names)
   const DISPATCH_STEPS = { sign: ["challenge", "answer"], cancel: ["cancel-challenge", "cancel"],
@@ -182,9 +190,10 @@
 
   // ---- read the request, then draw it ----
   if (!id) { head("Not a " + noun, "This link names no " + noun + "."); return; }
-  if (consent || dispatch) { document.title = "Levain · " + (consent ? "consent" : "dispatch"); $("sheet-title").textContent = Noun; $("sheet-msg").textContent = "Reading the " + noun + "…"; }
+  if (consent || dispatch || coord) { document.title = "Levain · " + (consent ? "consent" : dispatch ? "dispatch" : "drop"); $("sheet-title").textContent = Noun; $("sheet-msg").textContent = "Reading the " + noun + "…"; }
   if (!storedToken()) { unpaired(false); return; }
-  readRequest().then(draw);
+  if (coord) readDrops().then(drawDrop);
+  else readRequest().then(draw);
 
   function draw(got) {
     if (got.unpaired) return unpaired(true);
@@ -444,6 +453,13 @@
   // close leaves
   let closeAsked = false;
   function askClose() {
+    if (coord && flight && !closeAsked) {
+      // a drop has no request to read again: the line says the outcome is not confirmed, and a second close leaves
+      closeAsked = true;
+      relabel("Not confirmed");
+      say("Signing is still in progress, so it is not confirmed (close again to leave).", "bad");
+      return tell("reload");
+    }
     if (!flight || closeAsked) return tell("close");
     closeAsked = true;
     relabel("Not confirmed");
@@ -568,6 +584,219 @@
       const name = (e && e.name) || "error";
       if (sent) { say("Not sure this was signed (the page failed: " + name + ").", "bad"); return "unsure"; }
       return unsigned("The page failed (" + name + ")");
+    });
+  }
+  // ---- the drop sheet (OS-2, /sign/drop) ----
+  const stamp = () => new Date().toISOString().replace(/\.(\d{3})Z$/, ".$1000Z");   // the store's fixed-width UTC form
+  const newOutboxId = () => {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    return "ph-" + Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  };
+  // the listing as the cockpit holds it now: the phone's coord_* keys, {unpaired} or {error}
+  function readDrops() {
+    return within("/cockpit/coord/drops.json", { headers: headers(false) }).then((g) => {
+      if (g.status === 403) return { unpaired: true };
+      if (g.status === 404) return { error: "This cockpit hosts no drops." };
+      if (g.status === 0) return { error: "The drops could not be read: " + g.body.message + "." };
+      if (!g.ok) return { error: "The drops could not be read (HTTP " + g.status + ")." };
+      return g.body;
+    });
+  }
+  function dropLine(d) {
+    const stages = Array.isArray(d.receipts) ? d.receipts.map((r) => r && r.stage).filter((x) => typeof x === "string") : [];
+    return String(d.sent_at || "") + " · " + (typeof d.words === "string" ? d.words.split("\n")[0].slice(0, 120) : "")
+      + " · " + (stages.join(", ") || "no receipt") + (d.envelope_id ? " · envelope " + d.envelope_id
+      : d.envelope_refused ? " · envelope not taken: " + d.envelope_refused : "");
+  }
+  function drawDrop(got) {
+    if (got.unpaired) return unpaired(true);
+    if (got.error) { $("sheet").dataset.state = "error"; return head(Noun, got.error); }
+    const body = $("sheet-body");
+    body.replaceChildren();
+    $("sheet-actions").replaceChildren();
+    head("Drop", "Words for the coordinator, delivered as a drop; optionally with an envelope your passkey signs.");
+    const origin = typeof got.origin === "string" ? got.origin : "";
+    const rp = typeof got.rp_id === "string" && got.rp_id ? got.rp_id : window.location.hostname;
+    const held = got.credentials && typeof got.credentials === "object" ? got.credentials : {};
+    const signers = Array.isArray(got.coord_signers) ? got.coord_signers.filter((fp) => typeof fp === "string") : [];
+    let storeId = typeof got.coord_store_id === "string" ? got.coord_store_id : null;
+    const storeRead = got.coord_store_read === true;
+    const drops = Array.isArray(got.coord_drops) ? got.coord_drops : [];
+    if (typeof got.coord_note === "string" && got.coord_note) body.appendChild(el("p", "ext-meta", got.coord_note));
+    if (drops.length) {
+      const list = el("pre", "sheet-message", drops.map(dropLine).join("\n"));
+      list.id = "drop-recent";
+      body.appendChild(list);
+    }
+    const words = el("textarea", "");
+    words.id = "drop-words";
+    words.rows = 4;
+    words.placeholder = "your words";
+    words.setAttribute("aria-label", "your words");
+    body.appendChild(words);
+    const det = el("details", "");
+    det.id = "drop-env";
+    det.appendChild(el("summary", "", "sign an envelope"));
+    const field = (id, label, node) => { node.id = id; const l = el("label", "ext-meta", label + " "); l.appendChild(node); det.appendChild(l); det.appendChild(el("br")); return node; };
+    const repo = field("drop-repo", "repo", el("input"));
+    repo.type = "text";
+    repo.setAttribute("list", "drop-repos");
+    const repos = el("datalist");
+    repos.id = "drop-repos";
+    for (const r of Array.isArray(got.coord_repos) ? got.coord_repos : []) if (typeof r === "string") { const o = el("option"); o.value = r; repos.appendChild(o); }
+    det.appendChild(repos);
+    const onto = field("drop-onto", "land onto", el("input"));
+    onto.type = "text";
+    onto.placeholder = "main";
+    const stop = field("drop-stop", "stop after", el("select"));
+    for (const h of ["1h", "2h", "4h", "8h", "12h", "24h"]) { const o = el("option", "", h); if (h === "2h") o.selected = true; stop.appendChild(o); }
+    const nums = {};
+    for (const k of ["calls", "tokens", "hours"]) { const n = field("drop-" + k, k, el("input")); n.type = "number"; n.min = "0"; n.placeholder = "0"; nums[k] = n; }
+    body.appendChild(det);
+    const review = el("pre", "sheet-message");
+    review.id = "drop-review";
+    review.hidden = true;
+    body.appendChild(review);
+    const acts = $("sheet-actions");
+    acts.hidden = false;
+    const send = el("button", "dev-btn", "Send drop");
+    send.type = "button";
+    send.id = "drop-send";
+    const sign = el("button", "dev-btn dev-primary", "Sign envelope with passkey");
+    sign.type = "button";
+    sign.id = "drop-sign";
+    acts.append(send, sign);
+    $("sheet").dataset.state = "open";
+    const why0 = !storeRead ? "still reading which Levain answers here; reload" : "";
+    let oid = newOutboxId();       // held for these words: a resend after a lost reply files once, never twice
+    let working = false;
+    let pending = null;            // a signed drop whose reply did not come back: sent again unchanged, never re-signed
+    const lock = (on) => { working = on; send.disabled = sign.disabled = on; words.disabled = on; };
+    const done = (a, plain) => {
+      lock(false);
+      const d = a.body.drop || {};
+      const e = a.body.envelope;
+      oid = newOutboxId();
+      pending = null;
+      words.value = "";
+      review.hidden = true;
+      review.replaceChildren();
+      acts.replaceChildren(send, sign);
+      const msg = (a.body.created === false ? "already delivered" : "delivered") + " as " + String(d.drop_id || "") + " · by "
+        + (plain ? "words only" : e && e.taken ? "envelope " + e.envelope_id + " taken" : "envelope NOT taken: " + String(e && e.refused));
+      say(msg, plain || (e && e.taken) ? "ok" : "bad");
+      tell("signed");
+      return readDrops().then((g) => { if (!g.unpaired && !g.error) { const l = $("drop-recent"); const dd = Array.isArray(g.coord_drops) ? g.coord_drops : []; if (l) l.textContent = dd.map(dropLine).join("\n"); if (typeof g.coord_store_id === "string") storeId = g.coord_store_id; } });
+    };
+    const refusal = (a, nothing) => say(nothing + ": " + why(a), "bad");
+    const post = (action, req) => call("/cockpit/coord/" + action, req);
+    const wordsOf = () => { const w = words.value; if (!w.trim()) { say("type your words first", "bad"); return null; } return w; };
+    const sendDrop = (req, plain) => post("drop", req).then((a) => {
+      if (a.ok) return done(a, plain);
+      if (a.status >= 400 && a.status < 500) { lock(false); return refusal(a, "the drop was not delivered"); }
+      // no whole reply, or the cockpit's own fault: it may have landed. The same drop (same outbox id) is sent again on a tap
+      pending = req;
+      say("Not sure the drop was delivered (" + why(a) + "); send it again, unchanged, to find out.", "bad");
+      const again = el("button", "dev-btn", "Send the same drop again");
+      again.type = "button";
+      again.addEventListener("click", () => { again.remove(); sendDrop(pending, plain); });
+      acts.appendChild(again);
+      return undefined;
+    });
+    send.addEventListener("click", () => {
+      if (working) return;
+      const w = wordsOf();
+      if (w === null) return;
+      if (why0) return say(why0, "bad");
+      lock(true);
+      sendDrop({ words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId }, true);
+    });
+    // what the envelope needs, said before any tap: never a ceremony that cannot verify
+    const cannot = !usable ? "this browser cannot use a passkey here (needs https)"
+      : origin !== window.location.origin ? "this page cannot use your passkey: sign on " + (origin || "the cockpit's https page")
+      : typeof got.elsewhere === "string" && got.elsewhere ? got.elsewhere
+      : !signers.length ? (got.coord_signer_note || "no passkey enrolled for " + rp + " can sign an envelope") : "";
+    if (cannot) { const n = el("p", "ext-meta", "Envelope: " + cannot); n.id = "drop-sign-note"; body.appendChild(n); sign.disabled = true; sign.dataset.cannot = "1"; }
+    sign.addEventListener("click", () => {
+      if (working || cannot) return;
+      const w = wordsOf();
+      if (w === null) return;
+      const r = repo.value.trim(), ont = onto.value.trim();
+      if (!r) { det.open = true; return say("name the repo the envelope lets it work in", "bad"); }
+      if (why0) return say(why0, "bad");
+      const n = (k) => { const v = nums[k].value.trim(); return v === "" ? 0 : Number(v); };
+      const spec = { where: [{ repo: r, paths: ["."] }], lands: ont ? [{ repo: r, onto: ont }] : [], stop: stop.value,
+                     budget: { tool_calls: n("calls"), tokens: n("tokens"), hours: n("hours") } };
+      lock(true);
+      busy = true;
+      const release = () => { busy = false; lock(false); };
+      whom(rp, signers, held, acts).then((k) => {
+        if (!k) { release(); return undefined; }
+        say("Building the envelope to sign…");
+        return post("envelope-review", { words: w, outbox_id: oid, spec: spec, signer_fp: k.fp, store_id: storeId }).then((c) => {
+          if (!c.ok) { release(); return refusal(c, "Nothing to sign"); }
+          // a fresh install's review made the store: only then does a null identity take the reply's
+          if (storeId === null && c.body.store_created === true && typeof c.body.store_id === "string") storeId = c.body.store_id;
+          review.textContent = (Array.isArray(c.body.view) ? c.body.view.join("\n") : "") + "\n\nenvelope digest: " + String(c.body.digest || "");
+          review.hidden = false;
+          review.tabIndex = 0;
+          say("Read the envelope, then sign it.");
+          const go = el("button", "dev-btn dev-primary", "Sign with your passkey");
+          go.type = "button";
+          const no = el("button", "dev-btn", "Dismiss");
+          no.type = "button";
+          acts.replaceChildren(go, no);
+          no.addEventListener("click", () => { review.hidden = true; review.replaceChildren(); acts.replaceChildren(send, sign); say("Not signed; your words are still here."); release(); });
+          go.addEventListener("click", () => {
+            go.disabled = no.disabled = true;
+            let sent = false;
+            flight = true;
+            const stop1 = (m) => { relabel("Not signed"); ended(); say(m, "bad"); go.disabled = no.disabled = false; };
+            post("envelope-challenge", { review_id: c.body.review_id }).then((ch) => {
+              if (!ch.ok) return stop1("Not signed: " + why(ch) + "; nothing was signed.");
+              if (!decodable(ch.body.challenge)) return stop1("The cockpit sent a malformed challenge; nothing was signed.");
+              const line = typeof ch.body.line === "string" ? ch.body.line : "";
+              if (line) signing(line, "server", "Signing");
+              say("Confirm with your passkey to sign…" + (line ? " " + line : ""));
+              const allow = k.rawId && decodable(k.rawId) ? unb64u(k.rawId) : null;
+              const ask = (aid) => {
+                const pk = { challenge: unb64u(ch.body.challenge), rpId: ch.body.rp_id, userVerification: "required", timeout: 60000 };
+                if (aid) pk.allowCredentials = [{ type: "public-key", id: aid }];
+                return navigator.credentials.get({ publicKey: pk });
+              };
+              return ask(allow).catch((e) => { if (!(e && e.name === "NotAllowedError" && allow && k.local)) throw e; return ask(null); }).then((cred) => {
+                say("Sending the signed drop…");
+                const envelope = { body_text: c.body.body_text, payload: ch.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
+                                   client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
+                sent = true;
+                if (cred.rawId && mine(rp)[k.fp] !== b64u(cred.rawId)) remember(rp, k.fp, b64u(cred.rawId));
+                return post("drop", { words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId, envelope: envelope }).then((a) => {
+                  if (a.ok) { ended(); if (line) signing(line, "server", "Signed"); else relabel("Signed"); $("sheet").dataset.state = "signed"; busy = false; return done(a, false); }
+                  if (a.status >= 400 && a.status < 500) {
+                    // refused: nothing was delivered with this signature (a stale one is signed again from the review)
+                    relabel("Not signed"); ended(); acts.replaceChildren(send, sign); review.hidden = true; review.replaceChildren(); release();
+                    return refusal(a, "the signed drop was not delivered");
+                  }
+                  relabel("Not confirmed"); ended();
+                  pending = { words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId, envelope: envelope };
+                  say("Not sure the signed drop was delivered (" + why(a) + "); send it again, unchanged, to find out.", "bad");
+                  const again = el("button", "dev-btn", "Send the signed drop again");
+                  again.type = "button";
+                  again.addEventListener("click", () => { again.remove(); busy = false; sendDrop(pending, false); });
+                  acts.replaceChildren(again);
+                  return undefined;
+                });
+              }, (e) => stop1("The passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed."));
+            }).catch((e) => {
+              const name = (e && e.name) || "error";
+              if (sent) { relabel("Not confirmed"); ended(); say("Not sure the signed drop was delivered (the page failed: " + name + ").", "bad"); return; }
+              stop1("The page failed (" + name + "); nothing was signed.");
+            });
+          });
+          return undefined;
+        });
+      }).catch(() => { release(); });
     });
   }
 })();

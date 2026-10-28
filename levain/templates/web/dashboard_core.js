@@ -5248,7 +5248,7 @@
       rereadBoard();
     }
   });
-  window.LevainSignSheet = { open: openSignSheet, openConsent: openConsentSheet, openDispatch: openDispatchSheet, close: closeSignSheet };
+  window.LevainSignSheet = { open: openSignSheet, openConsent: openConsentSheet, openDispatch: openDispatchSheet, openDrop: openDropSheet, close: closeSignSheet };
 
   // A signed verb's send (ActionVerb.sign): the server's compose_signer files a sign request for exactly these params, the
   // passkey signs it, and only then does the caller post the verb with `sign_request`. Resolves {ok: true, request, txn} or
@@ -6227,6 +6227,39 @@
     if (typeof id !== "string" || !/^dj-[0-9a-f]{32}$/.test(id)) return null;
     return openSheet("/sign/dispatch/" + encodeURIComponent(id), version, choice, "dispatch job");
   }
+  // OS-2: the sheet over a coordinator drop (/sign/drop): words, and optionally an envelope the passkey signs there
+  function openDropSheet() {
+    return openSheet("/sign/drop", "", "", "coordinator drop");
+  }
+  // the drop card: shown only while /cockpit/coord/drops.json reads (a token, a Signer, a store that answers); the Send a drop
+  // button opens the sheet, which sends and signs nothing from this page
+  function dropSlot() {
+    const slot = el("div", "coord-drop-slot");
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? t.headers() : {};
+    if (!headers["X-Levain-Write-Token"]) return slot;
+    fetchBounded("/cockpit/coord/drops.json", { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.coord_drops) ? b : null), () => null) : null),
+      () => null).then((b) => {
+        if (!b) return;
+        const row = el("div", "row consent-row coord-drop-row");
+        const head = el("div", "consent-head");
+        head.appendChild(el("b", "consent-tool", "drop"));
+        head.appendChild(el("span", "ext-meta", b.coord_drops.length + " recent from the phone port or this cockpit"));
+        row.appendChild(head);
+        const acts = el("div", "needs-actions");
+        const btn = el("button", "needs-btn", "Send a drop");
+        btn.type = "button";
+        btn.dataset.coordDrop = "open";
+        btn.title = "send words to the coordinator, optionally with an envelope your passkey signs, in the sign sheet";
+        btn.addEventListener("click", () => openDropSheet());
+        acts.appendChild(btn);
+        row.appendChild(acts);
+        if (typeof b.coord_note === "string" && b.coord_note) row.appendChild(el("div", "consent-note ext-meta", b.coord_note));
+        slot.replaceChildren(el("div", "ext-grouphead", "coordinator drop"), row);
+      }).catch(() => {});
+    return slot;
+  }
   const DISPATCH_VERB = { sign: "Sign", cancel: "Cancel job", authorise: "Authorise" };
   function dispatchCard(r) {
     const sv = (x) => (typeof x === "string" ? x : "");
@@ -6284,7 +6317,7 @@
   // the Decisions history's standing-rule slots (and the dispatch jobs), drawn together wherever the proposals are
   function standingSlots() {
     const f = document.createDocumentFragment();
-    f.append(proposalSlot(), grantSlot(), dispatchSlot());
+    f.append(proposalSlot(), grantSlot(), dispatchSlot(), dropSlot());
     return f;
   }
 
