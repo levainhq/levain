@@ -72,6 +72,10 @@ if args == ["agents", "--json"]:
     state.write_text(json.dumps(s))
     print(json.dumps(extra + [row], indent=2)); sys.exit(0)
 if args[:1] == ["stop"]:
+    if (here / "stop_noop").exists():             # the stop is accepted, the row stays listed
+        print(f"stopped {{args[1]}}"); sys.exit(0)
+    if (here / "fail_after_stop").exists():       # the list cannot be read once the stop has run
+        (here / "agents_fail").write_text("")
     state.unlink(missing_ok=True)
     print(f"stopped {{args[1]}}"); sys.exit(0)
 print("unexpected", args); sys.exit(3)
@@ -794,6 +798,52 @@ def test_an_ended_launch_still_listed_is_stopped_and_no_other_session_is_touched
     cl.watch_once(store)
     assert fake.stops() == [["stop", HID]]              # gone from the list: nothing more to stop
     assert store.coord_status()["lease"]["holder"] == "operator"
+
+
+def _over_with_successor(store, clock):
+    """An ended launch whose session still runs, and a successor wake waiting pending behind it."""
+    from datetime import timedelta
+
+    ln = started(store)
+    store.coord_take()                                  # you took over: its launch is ended, its session still runs
+    store.coord_release()                               # and handed it back: the next drop wakes a successor
+    clock[0] += timedelta(minutes=1)
+    store.accept_drop("next", surface="cli")
+    (pending,) = store.launches_unspawned()
+    return ln, pending
+
+
+def test_a_stopped_session_still_listed_refuses_the_handover(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)
+    fake.flag("stop_noop")
+    lines = cl.watch_once(store)
+    assert fake.stops() == [["stop", HID]]
+    assert any(f"launch {ln.launch_id}: its session {HID} is still listed after the stop" in x for x in lines)
+    assert store.launch(pending.launch_id).state == "pending" and len(fake.spawns()) == 1
+    lines = cl.watch_once(store)                        # the next pass: still listed, still no successor
+    assert any(f"launch {pending.launch_id}: not started, the session of an ended launch is still listed" in x
+               for x in lines)
+    assert store.launch(pending.launch_id).state == "pending" and len(fake.spawns()) == 1
+
+
+def test_a_stopped_session_that_clears_lets_the_handover_proceed(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)
+    first = len(fake.spawns())
+    cl.watch_once(store)                                # stops it; the fake's stop clears the row
+    lines = cl.watch_once(store)
+    assert f"launch {pending.launch_id} started: claude attach {HID}" in lines
+    assert len(fake.spawns()) == first + 1 and store.launch(pending.launch_id).state == "active"
+
+
+def test_an_unreadable_list_after_the_stop_is_no_evidence_of_retirement(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)
+    fake.flag("fail_after_stop")
+    spawns = len(fake.spawns())
+    lines = cl.watch_once(store)
+    assert any("not confirmed gone (`claude agents` could not be read)" in x for x in lines)
+    lines = cl.watch_once(store)
+    assert any(f"launch {pending.launch_id}: not started, `claude agents` could not be read" in x for x in lines)
+    assert len(fake.spawns()) == spawns and store.launch(pending.launch_id).state == "pending"
 
 
 def test_watch_runs_its_passes(store, fake, live_hook, monkeypatch):

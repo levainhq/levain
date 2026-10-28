@@ -419,6 +419,37 @@ def _stop_named(exe: str, name: str, where: str, *, cwd: str, env: dict[str, str
     return f"no session named {name} was listed to stop"
 
 
+def _ours(store: CoordStore, row: dict[str, Any]) -> Any:
+    """The launch of ``store`` a listed row belongs to, or None: by the ``sessionId`` its ``active`` row recorded, else
+    by its name ``levain-<role>-<launch hex>`` in that launch's own realpath directory (L3 r1 G4)."""
+    ln = store.launch_by_harness_session(row["sessionId"]) if isinstance(row.get("sessionId"), str) else None
+    if ln is None and isinstance(row.get("name"), str) and (m := _OURS.fullmatch(row["name"])):
+        ln = store.launch("ln-" + m.group(2))
+        ln = ln if ln is not None and ln.role == m.group(1) and ln.cwd \
+            and row.get("cwd") == os.path.realpath(ln.cwd) else None
+    return ln
+
+
+def _lingering(store: CoordStore, rows: list[dict[str, Any]], hid: str | None = None) -> list[dict[str, Any]]:
+    """The rows still listed of a launch that is over (only those whose id is ``hid`` when it is given)."""
+    return [r for r in rows if (hid is None or r.get("id") == hid) and (ln := _ours(store, r)) is not None
+            and ln.state in _OVER]
+
+
+def _verify_gone(store: CoordStore, hid: str, *, exe: str, env: dict[str, str]) -> bool | None:
+    """After ``claude stop <hid>``: True once a fresh list no longer has the session, False when it is listed on every
+    one of READBACK_TRIES reads, None when the last read failed (an unread list is no evidence either way)."""
+    seen: bool | None = None
+    for attempt in range(READBACK_TRIES):
+        rows = _agents(exe, cwd=str(store.directory), env=env)
+        seen = None if rows is None else bool(_lingering(store, rows, hid))
+        if seen is False:
+            return True
+        if attempt + 1 < READBACK_TRIES:
+            time.sleep(READBACK_DELAY)
+    return None if seen is None else False
+
+
 def _plain(cause: str) -> str:
     """``cause`` as the one plain line ``launch_end`` takes (never refused there for its shape)."""
     flat = " ".join(unshowable.mark(" ".join(str(cause).split()), allow="").split())
@@ -674,12 +705,29 @@ def watch_once(store: CoordStore) -> list[str]:
     return lines
 
 
+def _handover_blocked(store: CoordStore) -> str:
+    """Why a successor coordinator must not start yet, or "" when it may: a fresh ``claude agents --json`` still lists
+    the session of a launch that is over (its address would mis-route), or cannot be read (no evidence it is gone)."""
+    if not any(ln.harness == "claude" and ln.role == "coordinator" for ln in store.launches_unspawned()):
+        return ""
+    exe, env = _harness()
+    if exe is None:
+        return ""                    # launch_session says that itself
+    rows = _agents(exe, cwd=str(store.directory), env=env)
+    if rows is None:
+        return "`claude agents` could not be read, so no retired session is confirmed gone"
+    stale = _lingering(store, rows)
+    return f"the session of an ended launch is still listed ({', '.join(str(r.get('id')) for r in stale)})" \
+        if stale else ""
+
+
 def _watch_pass(store: CoordStore, lines: list[str]) -> None:
     """(a)-(e) of :func:`watch_once`, its lines appended to ``lines``; it returns early when ``claude`` cannot be
     read."""
     # lapses and expiries are written first: a launch whose starter was killed outright stays pending until someone
     # writes it expired, and only then does (d) stop the session it left
     store.coord_status()
+    blocked = _handover_blocked(store)
     for ln in store.launches_unspawned():
         if ln.harness not in ("claude", "codex"):
             lines.append(f"launch {ln.launch_id}: a {ln.harness} launch; only claude and codex are built, left "
@@ -687,6 +735,9 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
             continue
         if ln.role != "coordinator":
             lines.append(f"launch {ln.launch_id}: a {ln.role} launch; the worker brief is not built, left pending")
+            continue
+        if blocked:
+            lines.append(f"launch {ln.launch_id}: not started, {blocked} (retried next pass)")
             continue
         got = launch_session(store, ln.launch_id)
         lines.append(f"launch {got.launch_id} started: {got.attach}" if got.started
@@ -752,14 +803,7 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
                     lines.append(f"lease {held.token}: not beaten ({exc})")
     stopped: set[str] = set()
     for row in rows:
-        ln = None
-        if isinstance(row.get("sessionId"), str):
-            ln = store.launch_by_harness_session(row["sessionId"])
-        if ln is None and isinstance(row.get("name"), str) and (m := _OURS.fullmatch(row["name"])):
-            ln = store.launch("ln-" + m.group(2))
-            # by name, only in the launch's own directory (L3 r1 G4)
-            ln = ln if ln is not None and ln.role == m.group(1) and ln.cwd \
-                and row.get("cwd") == os.path.realpath(ln.cwd) else None
+        ln = _ours(store, row)
         if ln is None or ln.state not in _OVER:
             continue
         hid = _harness_id(row)
@@ -771,6 +815,11 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
         stopped.add(hid)
         lines.append(f"launch {ln.launch_id} {ln.state} ({ln.cause}): "
                      f"{_stop(exe, hid, cwd=str(store.directory), env=env)}")
+        gone = _verify_gone(store, hid, exe=exe, env=env)
+        if gone is not True:        # a stopped session still listed is a stale address: no handover until it clears
+            lines.append(f"launch {ln.launch_id}: its session {hid} is " + ("still listed after the stop"
+                         if gone is False else "not confirmed gone (`claude agents` could not be read)")
+                         + "; no successor is started until it is gone, retried next pass")
     # again after this pass's own ends, so a session found gone above loses its brief in the same pass (L3 r2)
     lines.extend(_remove_briefs(store))
 
