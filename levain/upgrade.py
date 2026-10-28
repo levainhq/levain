@@ -27,13 +27,16 @@ import argparse
 import dataclasses
 import json
 import os
+import shutil
 import stat
 import sys
+import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-SUDO = "/usr/bin/sudo"
+from levain.slot import SUDO
+
 EXIT_OK, EXIT_REFUSED, EXIT_HELD, EXIT_INTERNAL = 0, 1, 3, 70
 _HELD_ROW = "agent held sessions"
 _STDERR_TAIL = 20
@@ -306,7 +309,7 @@ class Seams:
     user_site: Callable[[], str] = _user_site
     stdlib: Optional[str] = None
     marker_exists: Callable[[str], bool] = os.path.exists
-    which: Callable[[str], Optional[str]] = lambda n: __import__("shutil").which(n)
+    which: Callable[[str], Optional[str]] = shutil.which
     run: Callable[..., tuple[int, str, str]] = _run
     execv: Callable[[str, list, dict], Any] = _execve       # os.execve, always with an explicit env
     held_row: Callable[[], Any] = _held_row
@@ -477,7 +480,7 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool) -> int:
     tool = argv = None
     if not no_pip:
         ev = gather_evidence(pkg, s.dist(), prefix=s.prefix, base_prefix=s.base_prefix, user_site=s.user_site(),
-                             stdlib=s.stdlib or __import__("sysconfig").get_path("stdlib"),
+                             stdlib=s.stdlib or sysconfig.get_path("stdlib"),
                              exists=s.marker_exists)
         tool, argv = decide_installer(ev, python=s.executable, which=s.which)
         if isolated:
