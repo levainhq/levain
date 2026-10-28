@@ -118,7 +118,12 @@ def test_the_coordinator_session_is_refused_on_the_operators_answer_channel(band
     out = io.StringIO()
     assert run_question(_answer_args(band.store.directory, str(q.n), "a"), out) == EXIT_REFUSED
     assert "this session is the coordinator" in out.getvalue() and band.qs.get(q.id).answer is None
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SEAT)        # a worker's session is not the coordinator
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SEAT)        # Q1 (a): any agent session is refused, not only the coordinator
+    assert run_question(_answer_args(band.store.directory, str(q.n), "a"), io.StringIO()) == EXIT_REFUSED
+    assert band.qs.get(q.id).answer is None
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")              # a terminal outside any agent session is unchanged
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     assert run_question(_answer_args(band.store.directory, str(q.n), "a"), io.StringIO()) == 0
     assert band.qs.get(q.id).answer.channel == "cli"
 
