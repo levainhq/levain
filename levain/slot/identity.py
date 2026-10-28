@@ -20,12 +20,16 @@ baseline ``confirm-identity yes`` writes.
   baseline from :func:`read_slot_baseline`): the answer is recorded in the state record's ``identity`` and compared
   with the baseline's ``observed_id``; a difference refuses ``identity-changed``.
 
+* A Claude pin (:func:`read_slot_pin`, :func:`write_slot_pin`) records the exact credential bytes the server last
+  vouched for as the baseline account, so an unchanged parked login passes with no call (``pinned``).
+
 The baseline file is root's, 0600, replaced atomically (temp, fsync, rename, directory fsync). :func:`baseline_vendor`
 reads it, and also the earlier vendor-only shape with no ``format`` key.
 """
 from __future__ import annotations
 
 import os
+import re
 import stat
 from typing import Callable, Dict, Mapping, Optional
 
@@ -111,9 +115,12 @@ def parse_profile_answer(exit_code: int, out: bytes) -> str:
         raise bad("answer is not JSON") from None
     if type(ans) is not dict or type(ans.get("status")) is not int:
         raise bad("no status")
+    if ans["status"] in (401, 403):
+        # a distinct name: the supervisor routes on the name alone and must tell the operator to sign in again
+        raise Refused(EXPIRED, f"HTTP {ans['status']} (the stored login looks expired or revoked: sign in to this slot "
+                               "again)")
     if ans["status"] != 200:
-        expired = " (the stored login looks expired or revoked: sign in to this slot again)" if ans["status"] in (401, 403) else ""
-        raise bad(f"HTTP {ans['status']}{expired}")
+        raise bad(f"HTTP {ans['status']}")
     try:
         prof = json.loads(ans["body"]) if type(ans.get("body")) is str else None
     except (ValueError, RecursionError):
@@ -212,6 +219,10 @@ BASELINE_MAX_BYTES = 4096
 #: the record's ``identity.result`` for a gate that matched, that found another account, and a vendor with no check.
 GATE_MATCHED = "matched"
 GATE_CHANGED = "identity-changed"
+#: the record's ``identity.result`` for a parked login the server no longer accepts (HTTP 401/403), and for a gate
+#: that passed on the slot's pin with no call.
+EXPIRED = "identity-expired"
+GATE_PINNED = "pinned"
 _BASELINE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 
 
@@ -299,6 +310,88 @@ def gate_check(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str]) -> Dict[str,
     return ident
 
 
+# --- the pin (PIN_DESIGN §3): a shortcut past the live call for bytes already verified as the baseline account -------
+
+PIN_FORMAT = "levain-pin/1"
+PIN_KEYS = frozenset({"format", "vendor", "observed_id", "baseline_session", "sha256", "size", "ino", "session",
+                      "pinned_at"})
+PIN_NAME = "pin"
+PIN_MODE = 0o600
+PIN_MAX_BYTES = 1024
+_SHA256_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
+#: the most credential bytes a pin may vouch for (end.py's V14 cap on a parked credential).
+_PIN_SIZE_MAX = 64 << 10
+
+
+def pin_bytes(*, observed_id: str, baseline_session: str, sha256: str, size: int, ino: int, session: str,
+              pinned_at: str, vendor: str = "claude") -> bytes:
+    obj = {"format": PIN_FORMAT, "vendor": vendor, "observed_id": observed_id, "baseline_session": baseline_session,
+           "sha256": sha256, "size": size, "ino": ino, "session": session, "pinned_at": pinned_at}
+    _check_pin_shape(obj)
+    return canon.canonical_bytes(obj)
+
+
+def _check_pin_shape(obj: object) -> Dict[str, object]:
+    if type(obj) is not dict or set(obj) != PIN_KEYS or obj["format"] != PIN_FORMAT:
+        raise Refused("bad-pin", "keys or format")
+    if obj["vendor"] != "claude":
+        raise Refused("bad-pin", "vendor")
+    for key, rule in (("observed_id", R.OBSERVED_ID_RE), ("baseline_session", SESSION_RE), ("session", SESSION_RE),
+                      ("sha256", _SHA256_RE)):
+        if type(obj[key]) is not str or not rule.fullmatch(obj[key]):
+            raise Refused("bad-pin", key)
+    if type(obj["size"]) is not int or not 0 <= obj["size"] <= _PIN_SIZE_MAX:
+        raise Refused("bad-pin", "size")
+    if type(obj["ino"]) is not int or obj["ino"] < 0:
+        raise Refused("bad-pin", "ino")
+    try:
+        R.check_timestamp(obj["pinned_at"], "pin.pinned_at")
+    except Refused:
+        raise Refused("bad-pin", "pinned_at") from None
+    return dict(obj)
+
+
+def check_pin(obj: object, baseline: Mapping[str, str], vendor: str) -> Dict[str, object]:
+    """A :data:`PIN_FORMAT` object usable for this start: exact keys, each value by its rule, and bound to the
+    baseline in force (its session and observed id) and to ``vendor``; else ``bad-pin``. A pin from before a
+    confirmed re-login is dead here without anything having deleted it."""
+    pin = _check_pin_shape(obj)
+    if not (pin["baseline_session"] == baseline["session"] and pin["observed_id"] == baseline["observed_id"]
+            and pin["vendor"] == baseline["vendor"] == vendor):
+        raise Refused("bad-pin", "not bound to the baseline in force")
+    return pin
+
+
+def read_slot_pin(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str]) -> Optional[Dict[str, object]]:
+    """``L/slots/<tag>/pin`` by dirfd with ``O_NOFOLLOW``, the baseline reader's pattern. Every failure is ``None``
+    (no pin): a pin only shortcuts the strict path, so a bad one costs the live call and never a launch."""
+    try:
+        with ctx.store.dir("slots", a.slot.tag) as sfd:
+            fd = os.open(PIN_NAME, _BASELINE_FLAGS, dir_fd=sfd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or not ctx.seams.trusted(st) or st.st_size > PIN_MAX_BYTES:
+                return None
+            buf = bytearray()
+            while len(buf) <= PIN_MAX_BYTES:
+                chunk = os.read(fd, PIN_MAX_BYTES + 1 - len(buf))
+                if not chunk:
+                    break
+                buf += chunk
+        finally:
+            os.close(fd)
+        if len(buf) > PIN_MAX_BYTES:
+            return None
+        return check_pin(canon.parse(bytes(buf)), baseline, a.vendor)
+    except (OSError, ContractError, Refused):
+        return None
+
+
+def write_slot_pin(ctx: H.Ctx, a: R.Alloc, data: bytes) -> None:
+    """The pin written as the baseline is: root's, 0600, temp + fsync + rename + directory fsync."""
+    ctx.store.replace(("slots", a.slot.tag), PIN_NAME, data, mode=PIN_MODE)
+
+
 # --- confirm-identity (§5.1) -------------------------------------------------------------------------------------------
 
 def _no_id_name(result: object) -> str:
@@ -364,4 +457,5 @@ def confirm_identity(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, o
 
 __all__ = ["BASELINE_FORMAT", "BASELINE_KEYS", "BASELINE_WRITTEN", "CONFIRMED", "IDENTITY_CALLS", "LOGIN_FAILED",
            "NOT_A_CHECK", "baseline_bytes", "baseline_vendor", "check_baseline", "confirm_identity", "gate_check",
-           "identity_call", "read_slot_baseline", "record_login_identity"]
+           "identity_call", "read_slot_baseline", "record_login_identity", "PIN_FORMAT", "pin_bytes", "check_pin",
+           "read_slot_pin", "write_slot_pin"]
