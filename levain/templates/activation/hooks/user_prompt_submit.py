@@ -141,6 +141,16 @@ def main() -> int:
             if patterns:
                 sections.append(hook.format_crystal_recall(patterns))
 
+        # The NEEDS YOU band (levain.band_view): the whole band, every prompt, on a seat a human can reach.
+        # Render only; it fails open to "" on any error and waits at most ~2 s on the question store.
+        try:
+            from levain.band_view import hook_prompt
+            band = hook_prompt(payload)
+            if band:
+                sections.append(band)
+        except Exception:
+            pass
+
         # Layer D — ambient nudge. Independent of the sections above.
         # Reads wrap_state, not episodes_since_wrap: with a wrap already open,
         # "run prepare_wrap" is advice that can only raise, and repeating it every
