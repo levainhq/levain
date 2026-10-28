@@ -7,6 +7,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **`levain session claude|codex --auth passthrough` (no `--login`) is no longer refused at launch.** The launcher
+  accepts it for both vendors; if the start step then refuses because the slot's stored login answers as a different
+  account, the supervisor says which account (from Levain's own session record, never the session's terminal output)
+  and that nothing was launched. For Codex it prints first that Codex has no server-checked identity, so Levain cannot
+  tell which account the stored login belongs to (not a check). Covered by unit tests only; not yet run on a real
+  terminal or machine.
 - **A passthrough login asks whether to keep that account as the slot's baseline.** Once
   `levain session codex --auth passthrough --login` exits, Levain shows the account from its own session record (never
   the session's terminal output) and asks whether to keep it. Codex has no server-checked identity, so the baseline

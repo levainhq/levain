@@ -1024,6 +1024,8 @@ class Supervisor:
         self._held: List[str] = []           # status lines a terminal that was not reading has yet to take
         self._output_failed = False           # the operator's stdout refused a write (not EAGAIN): the relay ended
         self._reset_untaken = False           # the reporting-mode reset did not reach his terminal whole
+        self._start_refused: Optional[str] = None    # the refusal name `start` printed (display routing only)
+        self._slot_index: Optional[int] = None
         self.unshown_lines = 0                # held status lines stderr never took (the end-of-run drain's count)
 
     # -- small ------------------------------------------------------------------------------------------------------
@@ -1367,6 +1369,7 @@ class Supervisor:
         session, index = prepare_answer(prep, host=self.s.host, store=self.s.store)   # type: ignore[arg-type]
         staging = self.s.store / "staging" / session                                     # type: ignore[operator]
         self.session = session
+        self._slot_index = index
         ok = False
         try:
             self.say(f"session {session} on slot {index}")
@@ -1380,7 +1383,12 @@ class Supervisor:
             self._check()
             self._launch_probe(session)
             self._check()
+            if self.req.auth == "passthrough" and self.req.kind == "interactive" and self.req.vendor == "codex":
+                self.say("Codex has no server-checked identity, so Levain cannot tell which account this slot's "
+                         "stored login belongs to (not a check).")
             ok = self._start(session)
+            if not ok and self._start_refused == "identity-changed":
+                self._identity_refused(session)
             if ok and self.req.kind == "login":
                 self._confirm_identity(session)
         except Refused as e:
@@ -1474,9 +1482,33 @@ class Supervisor:
             res = start_result(tail)
         except Refused as e:
             self.say(f"start refused {e.name}")
+            self._start_refused = e.name
             return False
         self.say(f"{self.req.vendor} exited {res.get('exit')}" + ("" if code == 0 else f" (helper exit {code})"))
         return code == 0
+
+    def _identity_refused(self, session: str) -> None:
+        """``start`` refused ``identity-changed``: the account shown comes from root's ``status`` record only (its
+        ``identity``), never from the pty tail, which the slot can write. The tail's refusal name only routes here;
+        the text is said only when the record also says ``identity-changed``. A refusal is said, never raised:
+        teardown still runs."""
+        try:
+            oid, result = identity_answer(self.helper("status", session, stdin=None))
+        except Refused as e:
+            self.say(f"identity-changed: the slot's stored login did not match its baseline; no account shown: "
+                     f"refused {e.name}")
+            return
+        vendor = self.req.vendor
+        name = {"claude": "Claude", "codex": "Codex"}.get(vendor, vendor)
+        if result != "identity-changed" or oid is None:
+            self.say("identity-changed: the slot's stored login did not match its baseline; root's record does not "
+                     "name an account, so none is shown. Nothing was launched.")
+            return
+        n = self._slot_index
+        self.say(f"slot {n}'s stored {name} login now answers as account {oid} (the server's answer), not the "
+                 f"account confirmed as this slot's baseline. Nothing was launched; the login is back in the "
+                 f"slot's keep. To use another account on this slot, sign in again: levain session {vendor} "
+                 f"--auth passthrough --login --slot {n}, and answer yes.")
 
     # -- a login session's confirm-identity (§5.1, §7.6) ---------------------------------------------------------------
 
