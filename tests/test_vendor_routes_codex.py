@@ -104,12 +104,85 @@ def test_a_merge_of_its_own_output_is_a_fixed_point_with_the_operators_codex_rou
     assert again == out and ids2 == ids and notes2 == notes
 
 
-def test_an_operator_egress_route_on_a_codex_host_is_a_clash_the_merge_refuses():
+def test_an_install_whose_egress_route_carries_an_openai_host_merges_without_the_codex_route():
+    # a legal map before codex-subscription shipped: the merge leaves the shipped route out, names why, and still
+    # writes every other shipped route (it used to refuse the whole map, base-map-unmergeable)
+    mine = {"route": "egress-operator", "type": "egress", "hosts": ["api.openai.com", "docs.example.org"]}
+    doc = {"format": VR.BASE_FORMAT, "routes": [mine]}
+    out, ids, notes = VR.merge(doc)
+    assert ids == ["anthropic", "claude-subscription", "egress-default"]
+    assert [r["route"] for r in out["routes"]] == ["egress-operator", "anthropic", "claude-subscription",
+                                                   "egress-default"]
+    assert notes == ["route codex-subscription not added: your route egress-operator already egresses "
+                     "api.openai.com; remove that host from egress-operator to enable Codex passthrough"]
+    assert VR.connect_host_clashes(P.parse_base_map(out)) == []
+    with pytest.raises(Refused) as e:
+        SV.pick_routes(out["routes"], "codex", "passthrough")
+    assert e.value.name == "no-route:passthrough"
+    assert SV.pick_routes(out["routes"], "claude", "passthrough") == (VR.EGRESS_DEFAULT, "egress-operator",
+                                                                       "claude-subscription")
+    again, ids2, notes2 = VR.merge(out)
+    assert (again, ids2, notes2) == (out, ids, notes)
+
+
+def test_the_note_names_every_host_and_each_egress_route_that_holds_one():
+    a = {"route": "egress-operator", "type": "egress", "hosts": ["auth.openai.com", "chatgpt.com"]}
+    b = {"route": "mine", "type": "egress", "hosts": ["api.openai.com"]}
+    _, ids, notes = VR.merge({"format": VR.BASE_FORMAT, "routes": [a, b]})
+    assert "codex-subscription" not in ids
+    assert notes == ["route codex-subscription not added: your route egress-operator already egresses "
+                     "auth.openai.com, chatgpt.com; remove those hosts from egress-operator to enable Codex passthrough",
+                     "route codex-subscription not added: your route mine already egresses api.openai.com; remove "
+                     "that host from mine to enable Codex passthrough"]
+
+
+def test_removing_the_host_brings_the_codex_route_back():
     mine = {"route": "egress-operator", "type": "egress", "hosts": ["chatgpt.com"]}
+    out, _, _ = VR.merge({"format": VR.BASE_FORMAT, "routes": [mine]})
+    out = VR.set_operator_hosts(out, ["docs.example.org"])
+    merged, ids, notes = VR.merge(out)
+    assert "codex-subscription" in ids and notes == []
+    assert SV.pick_routes(merged["routes"], "codex", "passthrough") == (VR.EGRESS_DEFAULT, "egress-operator",
+                                                                         "codex-subscription")
+
+
+def test_a_clash_between_two_operator_routes_on_a_codex_host_is_still_refused():
+    egress = {"route": "egress-operator", "type": "egress", "hosts": ["chatgpt.com"]}
+    other = {"route": "mine", "type": "egress", "hosts": ["chatgpt.com"]}
     with pytest.raises(VR.MergeRefused) as e:
-        VR.merge({"format": VR.BASE_FORMAT, "routes": [mine]})
+        VR.merge({"format": VR.BASE_FORMAT, "routes": [egress, other]})
     assert e.value.code == "base-map-unmergeable"
-    assert "host chatgpt.com is on routes codex-subscription and egress-operator" in e.value.detail
+    assert "host chatgpt.com is on routes egress-operator and mine" in e.value.detail
+
+
+def test_an_operator_passthrough_route_on_an_egressed_codex_host_is_still_refused():
+    # the operator's own passthrough route wins over the shipped one, but its clash with their egress route is theirs
+    egress = {"route": "egress-operator", "type": "egress", "hosts": ["chatgpt.com"]}
+    with pytest.raises(VR.MergeRefused) as e:
+        VR.merge({"format": VR.BASE_FORMAT, "routes": [egress, dict(OPERATOR_CODEX)]})
+    assert e.value.code == "base-map-unmergeable"
+    assert "host chatgpt.com is on routes egress-operator and operator-codex-pass" in e.value.detail
+
+
+def test_routes_egress_refusing_an_openai_host_names_the_remedy():
+    base, _, _ = VR.merge(None)
+    for host in CODEX_HOSTS:
+        with pytest.raises(VR.MergeRefused) as e:
+            VR.set_operator_hosts(base, [host])
+        assert e.value.code == "routes-egress-host-on-route"
+        assert e.value.detail == (f"{host} (on route codex-subscription); to egress a host of codex-subscription "
+                                  "instead of Codex passthrough, delete route codex-subscription from base.json and "
+                                  "run routes-egress again (the merge then leaves codex-subscription out)")
+    with pytest.raises(VR.MergeRefused) as e:          # other shipped routes' refusals carry no such remedy
+        VR.set_operator_hosts(base, ["claude.ai"])
+    assert e.value.detail == "claude.ai (on route claude-subscription)"
+
+
+def test_the_routes_egress_remedy_works():
+    base, _, _ = VR.merge(None)
+    without = {**base, "routes": [r for r in base["routes"] if r["route"] != "codex-subscription"]}
+    out, ids, notes = VR.merge(VR.set_operator_hosts(without, ["api.openai.com"]))
+    assert "codex-subscription" not in ids and len(notes) == 1 and "egress-operator" in notes[0]
 
 
 def test_the_claude_route_and_its_notes_are_unchanged():
