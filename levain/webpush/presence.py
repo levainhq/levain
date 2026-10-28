@@ -15,7 +15,7 @@ Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newe
   failed) it cannot see his input, so it ends :data:`SLEEP_BLIND_SECS` after the word and ``levain ping status`` says the
   idle source is unavailable.
 - ``loud [duration|off]`` turns pings on for its duration, over every other parameter, a mute included; only its timer,
-  ``quiet`` or ``loud off`` ends it, never ``back``.
+  ``loud off`` or any other word written over it (``set_word`` keeps one word on file) ends it, never ``back``.
 - ``away`` pushes at once until input at this machine more than :data:`AWAY_GRACE_SECS` after it (a line typed just
   after saying it is the parting instruction). ``remote [duration]`` pushes for its duration. ``back`` clears
   ``away``, ``remote``, ``quiet`` and ``sleep``, and leaves the measurement to decide. All optional overrides.

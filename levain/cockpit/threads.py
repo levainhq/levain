@@ -140,7 +140,7 @@ def _item(row: chat.TimelineRow, facts: Mapping[tuple[str, str], tuple[str | Non
     call_id, truncated, backfill = facts.get((row.launch_id or "", row.ref_id), (None, 0, 0))
     # an approval's ref is the kind alone and its body is dropped: the vendor's control-request id is not a queue request
     # id, and a driver may put the tool name, its input or that id in the body, so none of it is offered
-    approval = row.kind in _APPROVAL_KINDS
+    approval = row.kind in _APPROVAL_KINDS or row.kind == "approval" or row.kind.startswith("approval_")   # + chat_timeline's own arms
     ref = row.ref_id.partition(":")[0] if approval else row.ref_id
     item: dict[str, Any] = {"gseq": row.gseq, "kind": row.kind, "source": row.source, "ref": ref,
                             "launch_id": row.launch_id, "status": row.status, "body": None if approval else row.body,

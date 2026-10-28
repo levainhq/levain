@@ -212,7 +212,8 @@ def test_a_chat_line_newer_than_the_launch_supplies_the_latest_activity(seeded):
 
 
 def test_an_approval_body_never_reaches_the_json_in_either_kind():
-    for kind in ("vendor_approval_request", "vendor_approval_resolved"):
-        row = dataclasses.replace(_row(kind, "approval_request:req-77", "L-A"), body="Bash rm x req-77")
+    # the last two are chat_timeline's own approval arms (APPROVAL_VIEW_ARMS), whose ref is the whole durable key
+    for kind in ("vendor_approval_request", "vendor_approval_resolved", "approval", "approval_decided"):
+        row = dataclasses.replace(_row(kind, "can_use_tool:req-77:toolu_SECRETID", "L-A"), body="Bash rm x req-77")
         item = threads._item(row, {}, set())
-        assert item["body"] is None and "req-77" not in json.dumps(item), item
+        assert item["body"] is None and "req-77" not in json.dumps(item) and "toolu_SECRETID" not in json.dumps(item), item
