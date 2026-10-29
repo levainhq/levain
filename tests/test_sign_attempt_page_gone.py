@@ -49,13 +49,18 @@ def test_a_fresh_facet_finds_the_answer_signed_after_the_request_left_the_listin
             {"eval": HISTORY},
             {"until": f"{ROW} && 1", "ms": 30000},
             {"eval": OPEN_ROW},                               # a facet drawn fresh while the attempt is unsettled
-            {"until": ROW_SAYS.format(re="/the cockpit confirmed it|no longer open/", note=ROW_NOTE, opts=ROW_OPTIONS),
-             "ms": 30000},
+            {"eval": READS_EVERY_1500},                       # the board reads go on: the fresh facet is asked again
+            # wait for the TARGET (the signed text), never the interim "no longer open"; a board read repaints the
+            # row and its note with it, so the row is opened again whenever it reads closed
+            {"until": f"({ROW} && !{ROW}.querySelector('.sign-note') && {ROW}.querySelector('.consent-details').click(), "
+                      + ROW_SAYS.format(re="/the cockpit confirmed it/", note=ROW_NOTE, opts=ROW_OPTIONS) + ")",
+             "ms": 45000},
+            {"eval": "clearInterval(window.__reads) || 1"},
         ])
         go.set()
     v = out["values"]
     assert "still verifying" in v[3], v
-    row, drawn = json.loads(v[-1])
+    row, drawn = json.loads(v[-2])
     assert row.startswith("signed (b)") and "the cockpit confirmed it" in row, v
     assert drawn == 0, v                              # the request is no longer open: the fresh facet drew no options
     assert rig.verifies(QRID)
@@ -139,15 +144,16 @@ def test_a_facet_drawn_after_the_answer_settled_refused_says_so_and_keeps_saying
             {"eval": HISTORY},
             {"until": f"{ROW} && 1", "ms": 30000},
             {"eval": OPEN_ROW},                               # a facet drawn fresh after the answer settled
-            {"until": f"/not signed|no longer open/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
+            {"until": f"/not signed:/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
             {"eval": AFTER.format(ms=300)},
-            {"eval": ROW_NOTE},
+            # an until, not a bare sample: a board-read repaint may have removed the note at this instant
+            {"until": f"/not signed:/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
             {"eval": "window.LevainCockpitTransport.reload() && 1"},                      # a repaint
             {"eval": AFTER.format(ms=2500)},
             {"eval": REOPEN_PANEL},
             {"until": f"{ROW} && 1", "ms": 30000},
             {"eval": f"({ROW}.querySelector('.sign-note') ? 1 : ({OPEN_ROW}, 1))"},
-            {"until": f"/not signed|no longer open/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
+            {"until": f"/not signed:/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
         ])
         go.set()
     v = out["values"]
@@ -188,9 +194,9 @@ def test_a_facet_drawn_after_the_first_pass_settle_refused_still_says_why(tmp_pa
             {"eval": HISTORY},
             {"until": f"{ROW} && 1", "ms": 30000},
             {"eval": OPEN_ROW},                               # a facet drawn fresh after the request left
-            {"until": f"/not signed|no longer open/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
+            {"until": f"/not signed:/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
         ])
-    note = out["values"][-1]
+    note =out["values"][-1]
     assert note.startswith("not signed:") and "nothing was signed" in note, out["values"]
     assert rig.nothing_signed(QRID)
 
