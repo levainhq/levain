@@ -6,6 +6,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- **A Claude passthrough route without `platform.claude.com` is refused when the session's routes load, naming the
+  host and the route.** The login refresh goes to that host through the route's tunnel; your own passthrough route
+  replaces the shipped one, so one without it made every refresh fail. Levain never adds the host to your route; the
+  refusal says to. Other routes (brokered, Codex) are not checked.
+
 ### Added
 - **`levain upgrade` (hidden, like `levain session`) upgrades Levain and its root side in one command.** It runs the
   installer that put Levain there (pip, `pip --user`, pipx or uv; it refuses and prints what to run when it cannot tell),
@@ -30,8 +36,22 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   and that nothing was launched. For Codex it prints first that Codex has no server-checked identity, so Levain cannot
   tell which account the stored login belongs to (not a check). Run on a macOS VM for Claude only: a matching
   login started Claude logged in and was parked again at the end, and a baseline naming another account was refused with
-  nothing launched and the parked login untouched. Not run: Codex, Linux, and a stored login older than about five and a
-  half hours (the token is not refreshed before the check, so an old one may be refused).
+  nothing launched and the parked login untouched. Not run in that first run: Codex, Linux, and a stored login older than about five and a
+  half hours (the next entry replaces the check on a stored login).
+- **An interactive Claude passthrough start refreshes the stored login once before it checks whose it is, so an old login no longer refuses and a swapped credential file is caught.** The check runs as the slot: it
+  exchanges the stored refresh token at `platform.claude.com`, writes the rotated tokens back to the stored login
+  atomically, then asks the profile with the new access token, so the account it names is the one the file's own refresh
+  token belongs to. A dead login says to sign in again (`identity-expired`); an exchange that got no answer spends
+  nothing and says to try again (`identity-unreachable`); nothing is launched on either. This replaces the earlier
+  "reuse the login verified when the slot last parked" entry, whose whole-file pin is gone. Run on a macOS VM with real
+  accounts, Claude only: two real starts on a not-yet-expired login (the refresh token rotated and was rewritten each
+  time, no temp file left, the baseline unchanged); a file holding one account's access token beside another account's
+  refresh token was refused `identity-changed` with nothing launched; a refresh token already spent was refused
+  `identity-expired` from a real HTTP 400 `invalid_grant`. Not run: a login whose access token has really expired
+  (due once the VM's token lapses, 10-29 about 16:50 ET), Codex, Linux. Known edges: a refresh that succeeds but whose
+  exchange then stalls past 60 s keeps the old, now dead token (sign in again); `identity-unreachable` is also said
+  for an oversized credential, where a retry cannot succeed; `levain upgrade` and routes-base still accept a
+  passthrough route without the token host, and the next start refuses it.
 - **A passthrough login asks whether to keep that account as the slot's baseline.** Once
   `levain session codex --auth passthrough --login` exits, Levain shows the account from its own session record (never
   the session's terminal output) and asks whether to keep it. Codex has no server-checked identity, so the baseline

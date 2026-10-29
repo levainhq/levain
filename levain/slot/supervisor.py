@@ -53,6 +53,7 @@ from levain import unshowable
 from levain.launch import child_env
 from levain.contracts import ContractError, canon
 from levain.slot import SUDO, Refused, layout
+from levain.slot import identity_child as IC
 from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import RENDER_FORMAT, parse_stdin
 from levain.slot.vendor_hosts import VENDOR_HOSTS, _hosts
@@ -633,6 +634,13 @@ def check_repo_layer(docs: Mapping[str, Any]) -> None:
 # --- the render blob's inputs (§5.3) ---------------------------------------------------------------------------------
 
 _AUTH_ROUTE = {"brokered": "brokered", "passthrough": "subscription_passthrough"}
+#: the host the Claude identity child's refresh goes to (:data:`levain.slot.identity_child.TOKEN_ORIGIN`)
+_TOKEN_HOST = IC.TOKEN_ORIGIN[1]
+#: the host the Claude identity child's profile call goes to (:data:`levain.slot.identity_child.ORIGIN`)
+_PROFILE_HOST = IC.ORIGIN[1]
+#: every host the identity child talks to through the passthrough route's tunnel, each with what needs it
+_IDENTITY_HOSTS = ((_TOKEN_HOST, "the login refresh"), (_PROFILE_HOST, "the login check"))
+_ROUTE_ID_SAID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}", re.ASCII)
 
 
 def read_base_map(path: Path, *, read: Callable[[Path], bytes] = Path.read_bytes) -> List[Mapping[str, Any]]:
@@ -652,16 +660,33 @@ def read_base_map(path: Path, *, read: Callable[[Path], bytes] = Path.read_bytes
 def pick_routes(base: Sequence[Mapping[str, Any]], vendor: str, auth: str) -> Tuple[str, ...]:
     """Every ``egress`` route of the base map (the git hosts and registries) plus EXACTLY ONE route of the auth's
     type for this vendor (§5.3: ≤ 1 brokered + ≤ 1 passthrough per vendor; render refuses a brokered session without
-    its route). Refused ``no-route:<auth>`` / ``route-ambiguous:<auth>`` by name."""
+    its route). Refused ``no-route:<auth>`` / ``route-ambiguous:<auth>`` by name, and a Claude passthrough route lacking
+    a host the identity child talks to ``passthrough-route-lacks-token-host``."""
     need = _AUTH_ROUTE[auth]
     egress = [r["route"] for r in base if r.get("type") == "egress" and type(r.get("route")) is str]
-    mine = [r["route"] for r in base if r.get("type") == need and type(r.get("route")) is str
+    # the selected route MAPPINGS, not their ids: a later check reads the very entry chosen here, never a re-lookup by
+    # id (which could land on an egress entry or a duplicate sharing the id).
+    mine = [r for r in base if r.get("type") == need and type(r.get("route")) is str
             and _hosts(r) & VENDOR_HOSTS[vendor]]
     if not mine:
         raise Refused(f"no-route:{auth}", f"{vendor}: the base map has no {need} route")
     if len(mine) > 1:
-        raise Refused(f"route-ambiguous:{auth}", f"{vendor}: {', '.join(sorted(mine))}")
-    return tuple(sorted(set(egress))) + (mine[0],)
+        raise Refused(f"route-ambiguous:{auth}", f"{vendor}: {', '.join(sorted(r['route'] for r in mine))}")
+    route = mine[0]
+    if vendor == "claude" and auth == "passthrough":
+        # 1029 ruling (np-e5b2ebed (a)): refuse at route load and name the hosts; never merge a host into his route.
+        # The identity child POSTs the refresh to the token host and GETs the profile from the profile host, both
+        # through this route's tunnel, so a route without either makes every launch fail its identity check.
+        hs = _hosts(route)
+        missing = [(h, why) for h, why in _IDENTITY_HOSTS if h not in hs]
+        if missing:
+            rid = route["route"] if _ROUTE_ID_SAID_RE.fullmatch(route["route"]) else "(its id is not shown)"
+            names = " and ".join(h for h, _ in missing)
+            needs = (f"{missing[0][1]} needs it" if len(missing) == 1
+                     else f"{' and '.join(why for _, why in missing)} need them")
+            raise Refused("passthrough-route-lacks-token-host",
+                          f"add {names} to the hosts of route {rid} in the base map: {needs}")
+    return tuple(sorted(set(egress))) + (route["route"],)
 
 
 def git_identity(repo: Path, *, git: str = "git",
@@ -1389,6 +1414,10 @@ class Supervisor:
             ok = self._start(session)
             if not ok and self._start_refused == "identity-changed":
                 self._identity_refused(session)
+            elif not ok and self._start_refused == "identity-expired":
+                self._identity_expired(session)
+            elif not ok and self._start_refused == "identity-unreachable":
+                self._identity_unreachable(session)
             if ok and self.req.kind == "login":
                 self._confirm_identity(session)
         except Refused as e:
@@ -1487,7 +1516,7 @@ class Supervisor:
         self.say(f"{self.req.vendor} exited {res.get('exit')}" + ("" if code == 0 else f" (helper exit {code})"))
         return code == 0
 
-    def _identity_refused(self, session: str) -> None:
+    def _identity_refused(self, session: str) -> None:  # identity-changed; see _identity_expired for the other
         """``start`` refused ``identity-changed``: the account shown comes from root's ``status`` record only (its
         ``identity``), never from the pty tail, which the slot can write. The tail's refusal name only routes here;
         the text is said only when the record also says ``identity-changed``. A refusal or any other error is said,
@@ -1500,6 +1529,56 @@ class Supervisor:
             try:
                 self.say(f"start refused identity-changed, but root's record could not be read ({why}); no account shown. "
                          "Nothing was launched.")
+            except Exception:   # noqa: BLE001 - stderr itself refused; the teardown still runs
+                pass
+
+    def _identity_expired(self, session: str) -> None:
+        """``start`` refused ``identity-expired``: the tail's refusal name only routes here; the sign-in-again text is
+        said only when root's ``status`` record also says ``identity-expired``, never from the pty tail. Any failure
+        is said as a neutral line, never raised: teardown still runs."""
+        neutral = ("start refused identity-expired, but root's record could not be read ({why}). "
+                   "Nothing was launched.")
+        try:
+            try:
+                _oid, result = identity_answer(self.helper("status", session, stdin=None))
+            except Refused as e:
+                self.say(neutral.format(why=f"refused {e.name}"))
+                return
+            if result != "identity-expired":
+                self.say("start refused identity-expired, but root's record does not say so. Nothing was launched.")
+                return
+            vendor = self.req.vendor
+            n = self._slot_index
+            self.say(f"slot {n}'s stored {({'claude': 'Claude', 'codex': 'Codex'}).get(vendor, vendor)} login looks "
+                     f"expired or revoked. Nothing was launched. Sign in again: levain session {vendor} "
+                     f"--auth passthrough --login --slot {n}")
+        except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
+            try:
+                self.say(neutral.format(why=type(e).__name__))
+            except Exception:   # noqa: BLE001 - stderr itself refused; the teardown still runs
+                pass
+
+    def _identity_unreachable(self, session: str) -> None:
+        """``start`` refused ``identity-unreachable`` (the login could not be refreshed and checked: a network or
+        server failure, never a dead login): routed like :meth:`_identity_expired`, so the retry text is said only when
+        root's ``status`` record also says ``identity-unreachable``. It never tells him to sign in again."""
+        neutral = ("start refused identity-unreachable, but root's record could not be read ({why}). "
+                   "Nothing was launched.")
+        try:
+            try:
+                _oid, result = identity_answer(self.helper("status", session, stdin=None))
+            except Refused as e:
+                self.say(neutral.format(why=f"refused {e.name}"))
+                return
+            if result != "identity-unreachable":
+                self.say("start refused identity-unreachable, but root's record does not say so. "
+                         "Nothing was launched.")
+                return
+            self.say(f"could not reach Claude's sign-in server to check slot {self._slot_index}'s login. Nothing was "
+                     "launched, and the stored login is kept. Try again.")
+        except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
+            try:
+                self.say(neutral.format(why=type(e).__name__))
             except Exception:   # noqa: BLE001 - stderr itself refused; the teardown still runs
                 pass
 

@@ -170,16 +170,21 @@ def test_claude_match_clones_and_spawns_the_vendor_once(env):
     w, la, _ = env
     s = _gated(w, la)
     cgroups_at_capture: list[int] = []
+    capture_cgroups: list = []
     real = w.seams.capture
 
     def capture(argv, spec_json, cgroup, bound):
         cgroups_at_capture.append(len(w.cgroups))
+        capture_cgroups.append(cgroup)
         return real(argv, spec_json, cgroup, bound)
     w.seams.capture = capture
     assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
     assert len(la.of("vendor")) == 1 and len(la.of("clone")) == 1
     assert w.state(s).fields["identity"] == {"observed_id": UUID, "result": "matched"}
-    assert la.identity_captures == 1 and cgroups_at_capture == [1]   # the cgroup existed before the child ran
+    # the gate's call: the cgroup existed before the child ran, and
+    # the child was launched into the session's own cgroup
+    assert la.identity_captures == 1 and cgroups_at_capture[0] == 1 and all(cgroups_at_capture)
+    assert capture_cgroups == [w.alloc(s).cgroup] and w.alloc(s).cgroup
     assert _tree(w, s).read_bytes() == b"{}" and not _keep(w).exists()
     assert w.steps.index("repo") < w.steps.index("identity-gate") < w.steps.index("clone")
 
@@ -203,11 +208,12 @@ def test_claude_differ_refuses_identity_changed_with_the_credential_back_before_
 
 def _ans(status=200, body=None):
     body = {"account": {"uuid": UUID}} if body is None else body
-    return json.dumps({"status": status, "body": body if isinstance(body, str) else json.dumps(body)}).encode() + b"\n"
+    return json.dumps({"refresh": 200, "status": status,
+                       "body": body if isinstance(body, str) else json.dumps(body)}).encode() + b"\n"
 
 
 @pytest.mark.parametrize("answer", [
-    (1, b"{}"), (0, b"x" * (ID.PROFILE_ANSWER_MAX + 1)), (0, b"not json"), (0, _ans(403)), (0, _ans(body={})),
+    (1, b"{}"), (0, b"x" * (ID.PROFILE_ANSWER_MAX + 1)), (0, b"not json"), (0, _ans(500)), (0, _ans(body={})),
     (0, _ans(body={"account": {"uuid": "bad uuid"}})), (0, b'{"status":200}\n')])
 def test_each_unparsable_answer_refuses_and_parks_back(env, answer):
     w, la, _ = env
@@ -217,6 +223,15 @@ def test_each_unparsable_answer_refuses_and_parks_back(env, answer):
     _back_in_keep(w, s)
     assert w.state(s).fields["identity"] == {"result": "identity-unparsable"}
     assert set(_targets(la)) <= {"forwarder"}
+
+
+@pytest.mark.parametrize("status,name", [(401, "identity-expired"), (403, "identity-expired"),
+                                         (500, "identity-unparsable")])
+def test_an_auth_failure_answer_says_the_login_looks_expired(status, name):
+    with pytest.raises(Refused) as e:
+        ID.parse_profile_answer(0, _ans(status))
+    assert e.value.name == name
+    assert f"HTTP {status}" in str(e.value) and ("expired or revoked" in str(e.value)) is (name == "identity-expired")
 
 
 def test_a_capture_that_times_out_refuses_identity_unparsable(env):
