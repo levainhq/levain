@@ -33,7 +33,7 @@ def _seed(qdir: Path) -> None:
                      dedupe_key="end:1", authority_relevant=True)
     done = review.file_item(store, "know", {"text": "the coordinator read your word as away and set it on"}, dedupe_key="know:1")[0]
     review.clear_item(store, done.item_id)
-    review.push_sign(store, None, "np-not-in-the-queue", "sign the budget extension")
+    review.push_sign(store, None, "np-not-in-the-queue", "sign the budget extension", rec=review.NO_REC)
 
 
 @needs_browser

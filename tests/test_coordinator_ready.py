@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from levain.coordinator import ready
+from levain.coordinator import ready, review
 from levain.coordinator.lease import LeaseRefused
 from levain.coordinator.store import CoordError, CoordStore
 
@@ -34,7 +34,8 @@ def test_fixture_case(case):
 
 def test_fixture_is_flows_schema_1():
     data = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    assert data["schema"] == 1 and len(CASES) == 5
+    # flow's fixture grows by syncing it: any count, every case named once
+    assert data["schema"] == 1 and CASES and len({c["name"] for c in CASES}) == len(CASES)
 
 
 def test_every_item_carries_exactly_the_schema_fields():
@@ -466,7 +467,7 @@ def test_two_writers_racing_one_item_both_journal_in_order(store, token):
         try:
             results.append(ready.move(CoordStore(store.directory), token, "levain:gate", to=to, who=to,
                                       why="racing."))
-        except CoordError as exc:
+        except BaseException as exc:  # noqa: BLE001 - a thread that died (a busy timeout) is named below
             results.append(exc)
 
     ts = [threading.Thread(target=mover, args=(to,)) for to in ("running", "waiting")]
@@ -474,7 +475,198 @@ def test_two_writers_racing_one_item_both_journal_in_order(store, token):
         t.start()
     for t in ts:
         t.join(120)
+    assert not any(isinstance(r, BaseException) for r in results), results
     recs = ready.journal(store)
     # both moves landed, one after the other: the second's from is the first's to (never a lost update)
     assert [r["to_category"] for r in recs[1:]] in (["running", "waiting"], ["waiting", "running"])
     assert recs[2]["from_category"] == recs[1]["to_category"]
+
+
+# ------------------------------------------------------------------------------------------------ fix round 1
+def _pre_c13_store(directory, monkeypatch):
+    """A coordinator store with the schema at origin/main (``git show origin/main:levain/coordinator/store.py``): its
+    ``_statements`` is this one's less ``LIFECYCLE_SCHEMA``, so the store is made here with that one tuple empty."""
+    directory.mkdir(mode=0o700)
+    with monkeypatch.context() as m:
+        m.setattr(ready, "LIFECYCLE_SCHEMA", ())
+        old = CoordStore(directory)
+        token = old.coord_take()
+        review.file_item(old, "seat", {"text": "made before C13"}, dedupe_key="seat:pre")
+    c = sqlite3.connect(directory / "dispatch.db")
+    names = {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
+    c.close()
+    assert not names & {"ready_items", "ready_journal"} and "review_items" in names
+    return token
+
+
+def test_a_store_made_before_c13_is_current_for_every_reader(tmp_path, monkeypatch):
+    from levain.cockpit import coordinator_panels
+    from levain.coordinator import morning
+
+    d = tmp_path / "dispatch"
+    token = _pre_c13_store(d, monkeypatch)
+    store = CoordStore(d)
+    store.open_readonly().close()                                    # not StoreAbsent
+    assert [i.body["text"] for i in review.list_items(store)] == ["made before C13"]
+    assert morning.card(store, queue_dir=tmp_path / "queue")["errors"] == []
+    assert coordinator_panels._store_at(lambda: d) is not None
+    out = ready.list(store, all=True)
+    assert out["items"] == [] and out["unreadable"] == []            # an empty queue, not "unreadable"
+    assert ready.journal(store) == [] and ready.journal(store, "levain:gate") == []
+    c = _raw(store)
+    assert "ready_items" not in {r[0] for r in c.execute("SELECT name FROM sqlite_master")}   # readers made nothing
+    c.close()
+    # the first ready write migrates it, in its own transaction
+    _add(CoordStore(d), token, to="ready", tier="sonnet", done_line="green")
+    other = CoordStore(d)                                            # a second opener sees it
+    assert [i["id"] for i in ready.list(other)["items"]] == ["levain:gate"]
+    assert [r["source"] for r in ready.journal(other)] == ["add"]
+    assert [i.body["text"] for i in review.list_items(other)] == ["made before C13"]
+
+
+def test_a_pre_c13_store_is_migrated_by_the_stores_own_opener_too(tmp_path, monkeypatch):
+    d = tmp_path / "dispatch"
+    _pre_c13_store(d, monkeypatch)
+    review.file_item(CoordStore(d), "seat", {"text": "after"}, dedupe_key="seat:post")      # any read-write opener
+    c = sqlite3.connect(d / "dispatch.db")
+    assert {"ready_items", "ready_journal"} <= {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
+    c.close()
+
+
+def test_one_lifecycle_table_without_the_other_is_unreadable(store, token):
+    _add(store, token)
+    c = _raw(store)
+    c.execute("PRAGMA writable_schema = ON")
+    c.execute("DELETE FROM sqlite_master WHERE tbl_name = 'ready_journal'")
+    c.commit()
+    c.close()
+    assert ready.list(CoordStore(store.directory))["unreadable"] == ["coordinator"]
+
+
+@pytest.mark.parametrize("text, named", [
+    ("ship levain:gate now?", True), ("ship levain:gate.", True), ("levain:gate: blocked on keys", True),
+    ("(levain:gate)", True), ("levain:gate, then more", True), ("levain:gate-", True),
+    ("ship levain:gate-two now?", False), ("ship levain:gate:deploy after CI", False),
+    ("ship levain:gate:2", False), ("read levain:gate.md", False), ("levain:gate.v2 only", False),
+    ("levain:gate_x only", False), ("levain:gate+1", False), ("xlevain:gate", False), ("a.levain:gate", False),
+    ("-levain:gate", False), ("_levain:gate", False), (":levain:gate", False),
+])
+def test_needs_phill_names_whole_ids_by_the_id_alphabet(text, named):
+    by = {i["id"]: i for i in ready.derive_items(
+        {"store": [_store_row("levain:gate")], "needs_phill": [{"id": "np-1", "repo": "levain", "what": text}]})}
+    assert by["levain:gate"]["needs_phill"] is named
+    assert by["levain:gate"]["status_category"] == ("needs-you" if named else "ready")
+
+
+def test_a_dangling_link_is_unreadable_never_nothing_waiting(tmp_path):
+    d = tmp_path / "dispatch"
+    d.mkdir(mode=0o700)
+    (d / "dispatch.db").symlink_to(d / "gone.db")
+    out = ready.list(d)
+    assert out["items"] == [] and out["unreadable"] == ["coordinator"]
+    with pytest.raises(CoordError):
+        ready.journal(d)
+
+
+def test_a_missing_directory_or_file_is_no_store(tmp_path):
+    assert ready.list(tmp_path / "nope")["unreadable"] == [] and ready.journal(tmp_path / "nope") == []
+    d = tmp_path / "empty"
+    d.mkdir(mode=0o700)
+    assert ready.list(d)["unreadable"] == [] and ready.journal(d) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses any directory")
+def test_an_untraversable_directory_is_unreadable(tmp_path):
+    outer = tmp_path / "outer"
+    d = outer / "dispatch"
+    d.mkdir(parents=True, mode=0o700)
+    CoordStore(d).coord_take()
+    outer.chmod(0o000)
+    try:
+        assert ready.list(d)["unreadable"] == ["coordinator"]
+    finally:
+        outer.chmod(0o700)
+
+
+def test_an_insecure_directory_is_named_unreadable_not_raised(store, token):
+    _add(store, token, to="ready")
+    store.directory.chmod(0o755)
+    try:
+        out = ready.list(CoordStore(store.directory))
+    finally:
+        store.directory.chmod(0o700)
+    assert out["items"] == [] and out["unreadable"] == ["coordinator"]
+
+
+def _journal_only_v2(store):
+    """Direct SQL, never the API: journal v2 committed without its state row (the trigger allows one ahead)."""
+    c = _raw(store)
+    c.execute("INSERT INTO ready_journal (id, ver, gseq, ts, iso, at, repo, from_status, to_status, from_category, "
+              "to_category, who, why, source, applied_by, lease_token) VALUES ('levain:gate', 2, 99999, 0, 'i', 'a', "
+              "'levain', 'ready', 'running', 'ready', 'running', 'sql', 'by hand', 'move', NULL, 1)")
+    c.commit()
+    c.close()
+
+
+def test_a_journal_ahead_of_state_is_named_and_every_move_fails_loud(store, token):
+    _add(store, token, to="ready")
+    _add(store, token, "levain:fine", title="Fine", to="ready")
+    _journal_only_v2(store)
+    out = ready.list(CoordStore(store.directory), all=True)
+    assert out["unreadable"] == ["coordinator:levain:gate (journal v2, state v1)"]
+    assert {i["id"] for i in out["items"]} == {"levain:gate", "levain:fine"}         # shown at its state, and named
+    for verb in (ready.move, ready.correct):
+        with pytest.raises(ready.JournalAhead, match=r"levain:gate: its journal is at version 2 but its state is at "
+                                                     r"version 1") as e:
+            verb(store, token, "levain:gate", to="done", who="desk", why="landed.")
+        assert (e.value.item_id, e.value.journal_ver, e.value.state_ver) == ("levain:gate", 2, 1)
+    assert _counts(store) == (3, 2)                                              # nothing written, nothing healed
+    ready.move(store, token, "levain:fine", to="running", who="desk", why="another item still moves.")
+
+
+def test_a_state_row_with_a_wrong_shaped_depends_on_is_unreadable(store, token):
+    _add(store, token, to="ready", tier="sonnet", done_line="green")
+    c = _raw(store)
+    c.execute("INSERT INTO ready_journal (id, ver, gseq, ts, iso, at, repo, from_status, to_status, from_category, "
+              "to_category, who, why, source, applied_by, lease_token) VALUES ('levain:held', 1, 99998, 0, 'i', 'a', "
+              "'levain', NULL, 'ready', NULL, 'ready', 'sql', 'by hand', 'add', NULL, 1)")
+    c.execute("INSERT INTO ready_items (id, ver, repo, title, status, category, tier, done_line, depends_on, rank, "
+              "set_by, set_at) VALUES ('levain:held', 1, 'levain', 't', 'ready', 'ready', 'sonnet', 'g', "
+              "'\"levain:blocker\"', 1, 'sql', 'x')")
+    c.commit()
+    c.close()
+    out = ready.list(CoordStore(store.directory))
+    assert out["items"] == [] and out["unreadable"] == ["coordinator"]          # never "independently ready"
+
+
+def test_a_projection_dependency_and_a_cycle_are_refused(store, token):
+    with pytest.raises(CoordError, match="projection id"):
+        _add(store, token, depends_on=["seat:1028+15"])
+    _add(store, token, "levain:a", title="A", depends_on=["levain:b"])
+    _add(store, token, "levain:b", title="B", depends_on=["levain:c"])
+    with pytest.raises(CoordError, match="cycle"):
+        _add(store, token, "levain:c", title="C", depends_on=["levain:a"])
+    _add(store, token, "levain:c", title="C")
+    with pytest.raises(CoordError, match="cycle"):
+        ready.move(store, token, "levain:c", to="backlog", who="desk", why="hold it.", depends_on=["levain:a"])
+    ready.move(store, token, "levain:c", to="backlog", who="desk", why="hold it.", depends_on=["levain:x"])
+    assert _counts(store) == (4, 4)
+
+
+@pytest.mark.parametrize("bad", ["a\x0bb", "a\x0cb", "a\x1cb", "a\x85b", "a b", "a\x1b[31mb", "a\tb"])
+def test_a_line_with_a_break_or_a_control_character_is_refused(store, token, bad):
+    for field in ("why", "who", "title", "done_line"):
+        with pytest.raises(CoordError, match=field):
+            _add(store, token, **{field: bad})
+    assert _counts(store) == (0, 0)
+
+
+def test_a_title_is_written_no_longer_than_it_is_read(store, token):
+    with pytest.raises(CoordError, match="title"):
+        _add(store, token, title="t" * 121)
+    _add(store, token, title="t" * 120, to="ready")
+    assert ready.list(store)["items"][0]["title"] == "t" * 120
+
+
+def test_a_caller_unreadable_string_is_one_entry(store):
+    assert ready.list(store, sources={"unreadable": "band"})["unreadable"] == ["band"]

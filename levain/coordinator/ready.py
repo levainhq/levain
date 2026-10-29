@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import os
 import re
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
@@ -48,10 +49,11 @@ from typing import Any
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import parse_stamp
 from levain.coordinator.store import CoordError, CoordStore, StoreAbsent, _append_only, next_gseq
+from levain.dispatch import DispatchError
 
 __all__ = [
     "CATEGORIES", "HANDOFF_RANK_BASE", "HEALTHY_AT", "JOURNAL_SOURCES", "LIFECYCLE_SCHEMA", "SCHEMA_VERSION", "TIERS",
-    "WRITABLE_CATEGORIES", "add", "correct", "derive", "derive_items", "journal", "list", "list_ready", "move",
+    "JournalAhead", "WRITABLE_CATEGORIES", "add", "correct", "derive", "derive_items", "journal", "list", "list_ready", "move",
     "ready_counts", "replay", "slug",
 ]
 
@@ -69,7 +71,7 @@ _ITEM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9+._:-]{0,199}")
 _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 _WHO_MAX = 200
 _WHY_MAX = 1000
-_TITLE_MAX = 200
+_TITLE_MAX = 120        # the read side shows a title whole (``_one_line``'s limit): the writer takes no more
 _DONE_MAX = 1000
 _DEPENDS_MAX = 50
 
@@ -236,8 +238,13 @@ def _plan_items(rows: Sequence[Mapping[str, Any]]) -> builtins.list:
 
 
 def _names(item_id: str, text: str) -> bool:
-    """Does ``text`` name ``item_id`` as a whole id? (A neighbour id that merely extends it does not count.)"""
-    return re.search(r"(?<![A-Za-z0-9_:+.-])" + re.escape(item_id) + r"(?![A-Za-z0-9_+-])", text) is not None
+    """Does ``text`` name ``item_id`` as a whole id? A token boundary by the id alphabet (``A-Z a-z 0-9 + . _ : -``):
+    no id character before it, and after it no run of id characters that continues it into a longer id
+    (``levain:gate`` is not named by ``levain:gate-two``, ``levain:gate:2``, ``levain:gate.v2``, ``levain:gate_x``).
+    Trailing punctuation that continues nothing (``levain:gate.`` ending a sentence, ``levain:gate:`` before a
+    reason) still names it: a missed needs-you is the fail-open direction."""
+    return re.search(r"(?<![A-Za-z0-9_:+.-])" + re.escape(item_id) + r"(?![A-Za-z0-9_:+.-]*[A-Za-z0-9_+])",
+                     text) is not None
 
 
 def _sort_key(item: Mapping[str, Any]) -> tuple:
@@ -354,13 +361,64 @@ _JOURNAL_FIELDS = ("ts", "iso", "id", "repo", "from_status", "to_status", "from_
                    "why", "source", "applied_by")
 
 
+_TABLES = ("ready_items", "ready_journal")
+
+
+class JournalAhead(CoordError):
+    """An item's journal and its state rows disagree on its version (a journal record committed without its state
+    row: only a direct-SQL writer can do that, never the API's one transaction). Nothing is healed here: the repair
+    is a coordinator-side correction of the store, made knowingly."""
+
+    def __init__(self, item_id: str, journal_ver: int, state_ver: int) -> None:
+        self.item_id, self.journal_ver, self.state_ver = item_id, journal_ver, state_ver
+        super().__init__(f"{item_id}: its journal is at version {journal_ver} but its state is at version "
+                         f"{state_ver}; the store was written outside the lifecycle writer. Nothing was written; the "
+                         f"repair is a coordinator-side correction of the store, never a silent heal")
+
+    @property
+    def tag(self) -> str:
+        """Its entry in a list's ``unreadable``."""
+        return f"{STORE_SOURCE}:{self.item_id} (journal v{self.journal_ver}, state v{self.state_ver})"
+
+
+def _lifecycle_present(conn: sqlite3.Connection) -> bool:
+    """Both lifecycle tables are in the file (True) or neither is (False: a store made before C13, which every reader
+    reads as current and as no items). One without the other is a damaged store, raised."""
+    have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
+                                       _TABLES)}
+    if have and len(have) != len(_TABLES):
+        raise CoordError(f"the coordinator store holds {', '.join(sorted(have))} without the rest of the lifecycle "
+                         "tables")
+    return bool(have)
+
+
+def _diverged(conn: sqlite3.Connection, item_id: str | None = None) -> builtins.list:
+    """Every item (or ``item_id``) whose latest journal version is not its latest state version."""
+    if not _lifecycle_present(conn):
+        return []
+    q = ("SELECT j.id, MAX(j.ver), COALESCE((SELECT MAX(ver) FROM ready_items WHERE id = j.id), 0) FROM ready_journal j"
+         + ("" if item_id is None else " WHERE j.id = ?") + " GROUP BY j.id ORDER BY j.id")
+    rows = conn.execute(q, () if item_id is None else (item_id,)).fetchall()
+    return [JournalAhead(i, jv, sv) for i, jv, sv in rows if jv != sv]
+
+
+def _deps(raw: Any, item_id: str) -> builtins.list:
+    """A state row's ``depends_on``: a JSON array of item ids, or the row is unreadable (never "no dependencies")."""
+    deps = json.loads(raw)
+    if not isinstance(deps, builtins.list) or not builtins.all(isinstance(d, str) for d in deps):
+        raise ValueError(f"{item_id}'s depends_on is not a list of item ids")
+    return deps
+
+
 def _row(r: Sequence[Any]) -> dict:
     return {"id": r[0], "ver": r[1], "repo": r[2], "title": r[3], "status": r[4], "category": r[5], "tier": r[6],
-            "done_line": r[7], "depends_on": json.loads(r[8]), "rank": r[9], "set_by": r[10], "set_at": r[11],
+            "done_line": r[7], "depends_on": _deps(r[8], r[0]), "rank": r[9], "set_by": r[10], "set_at": r[11],
             "ref": f"dispatch.db#ready_items/{r[0]}@{r[1]}"}
 
 
 def _current(conn: sqlite3.Connection, item_id: str | None = None) -> builtins.list:
+    if not _lifecycle_present(conn):
+        return []
     if item_id is None:
         return [_row(r) for r in conn.execute(_CURRENT + " ORDER BY i.id")]
     return [_row(r) for r in conn.execute(_CURRENT + " AND i.id = ?", (item_id,))]
@@ -376,6 +434,23 @@ def _read(store: CoordStore, query: Any) -> Any:
         return query(conn)
 
 
+def _absent(store: CoordStore) -> bool:
+    """After a read found no store: is there truly none (the directory or the file not there, ``FileNotFoundError``
+    on ``lstat``)? Anything else there (a dangling link, a directory that cannot be traversed, a file holding no
+    current coordinator store) is a store that cannot be read, never "nothing waiting"."""
+    for p in (store.directory, store.path):
+        try:
+            os.lstat(p)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+    return False
+
+
+_READ_ERRORS = (StoreAbsent, sqlite3.Error, OSError, ValueError, CoordError, DispatchError)
+
+
 def list_ready(store: CoordStore | Path | str, *, all: bool = False, repo: str | None = None,
                sources: Mapping[str, Any] | None = None, generated: str | None = None) -> dict:
     """The ready queue (SCHEMA §3 shape): the store's items plus any caller-read ``sources`` (the band's open rows,
@@ -383,13 +458,17 @@ def list_ready(store: CoordStore | Path | str, *, all: bool = False, repo: str |
     cannot be read is named in ``unreadable`` (never "nothing waiting"); a store that was never made is no items."""
     st = _store_of(store)
     merged: dict[str, Any] = dict(sources or {})
-    unreadable = [*merged.pop("unreadable", ())]
+    given = merged.pop("unreadable", ())
+    unreadable = [given] if isinstance(given, str) else [*given]
     rows: builtins.list = []
-    if st.path.exists():
-        try:
-            rows = _read(st, _current)
-        except (StoreAbsent, sqlite3.Error, OSError, ValueError, CoordError):
+    try:
+        rows, diverged = _read(st, lambda conn: (_current(conn), _diverged(conn)))
+        unreadable.extend(d.tag for d in diverged)      # shown at its state, and named: a write to it will refuse
+    except StoreAbsent:
+        if not _absent(st):
             unreadable.append(STORE_SOURCE)
+    except _READ_ERRORS:
+        unreadable.append(STORE_SOURCE)
     merged["store"] = [*rows, *(merged.get("store") or ())]
     stamp = generated or datetime.now().astimezone().isoformat(timespec="seconds")
     out = derive(merged, generated=stamp, unreadable=unreadable)
@@ -404,17 +483,27 @@ list = list_ready       # the contract's verb (`ready.py list`); nothing in this
 
 
 def journal(store: CoordStore | Path | str, item_id: str | None = None) -> builtins.list:
-    """The journal's records (SCHEMA §6 fields, exactly), in store order. Read-only, no coordinator needed."""
+    """The journal's records (SCHEMA §6 fields, exactly), in store order. Read-only, no coordinator needed. No store,
+    or a store made before C13, has none (``[]``, as :func:`list_ready` has no items); a store that cannot be read
+    raises."""
     cols = ", ".join(_JOURNAL_FIELDS)
 
     def q(conn: sqlite3.Connection) -> builtins.list:
+        if not _lifecycle_present(conn):
+            return []
         if item_id is None:
             cur = conn.execute(f"SELECT {cols} FROM ready_journal ORDER BY gseq")
         else:
             cur = conn.execute(f"SELECT {cols} FROM ready_journal WHERE id = ? ORDER BY gseq", (item_id,))
         return [dict(zip(_JOURNAL_FIELDS, r)) for r in cur]
 
-    return _read(_store_of(store), q)
+    st = _store_of(store)
+    try:
+        return _read(st, q)
+    except StoreAbsent:
+        if _absent(st):
+            return []
+        raise
 
 
 def replay(records: Iterable[Mapping[str, Any]]) -> dict[str, str]:
@@ -430,8 +519,9 @@ def _line(name: str, value: Any, high: int) -> str:
     if not isinstance(value, str) or not value.strip():
         raise CoordError(f"{name} is required, never empty")
     value = value.strip()
-    if len(value) > high or "\n" in value or "\r" in value or "\x00" in value:
-        raise CoordError(f"{name} is one line of at most {high} characters")
+    # printable only: no line break of any kind (\x0b, \x85, \u2028 ...), no escape sequence for a terminal
+    if len(value) > high or not value.isprintable():
+        raise CoordError(f"{name} is one line of at most {high} printable characters")
     return value
 
 
@@ -484,6 +574,8 @@ def _fields(item_id: str, *, title: Any, tier: Any, done_line: Any, depends_on: 
                 raise CoordError(f"a dependency is an item id (got {str(d)[:40]!r})")
             if d == item_id:
                 raise CoordError(f"{item_id} cannot depend on itself")
+            if d.startswith(_PROJECTION_PREFIXES):
+                raise CoordError(f"{d} is a projection id (seat:, ci:, np-): never a dependency, it is never done")
             if d not in deps:
                 deps.append(d)
         if len(deps) > _DEPENDS_MAX:
@@ -519,6 +611,20 @@ def _insert_state(conn: sqlite3.Connection, state: Mapping[str, Any], *, item_id
          state["done_line"], json.dumps(state["depends_on"]), state["rank"], who, at))
 
 
+def _refuse_cycle(conn: sqlite3.Connection, item_id: str, deps: Sequence[str]) -> None:
+    """Refuse ``depends_on`` that closes a cycle through the store's current items (read under the write lock):
+    every item on it would be held forever."""
+    graph = {r["id"]: r["depends_on"] for r in _current(conn)}
+    stack, seen = [*deps], set()
+    while stack:
+        d = stack.pop()
+        if d == item_id:
+            raise CoordError(f"{item_id} depending on {', '.join(deps)} closes a dependency cycle back to itself")
+        if d not in seen:
+            seen.add(d)
+            stack.extend(graph.get(d, ()))
+
+
 def _transition(store: CoordStore, token: Any, item_id: Any, *, to: Any, who: Any, why: Any, source: str,
                 creating: bool, repo: Any = None, **fields: Any) -> dict:
     """THE write path: checks, then ONE fenced write transaction that writes the journal record and then the state
@@ -535,6 +641,12 @@ def _transition(store: CoordStore, token: Any, item_id: Any, *, to: Any, who: An
         if "title" not in changes:
             raise CoordError("a new item needs a title")
     with store._write("coordinator", token) as (conn, now):
+        if not _lifecycle_present(conn):        # a store made before C13: the write path makes the tables, in its txn
+            for stmt in LIFECYCLE_SCHEMA:
+                conn.execute(stmt)
+        diverged = _diverged(conn, item_id)     # loud and named, before a write that would fail on the journal's key
+        if diverged:
+            raise diverged[0]
         found = _current(conn, item_id)
         prior = found[0] if found else None
         if creating and prior is not None:
@@ -552,6 +664,8 @@ def _transition(store: CoordStore, token: Any, item_id: Any, *, to: Any, who: An
         else:
             state = {k: prior[k] for k in ("repo", "title", "tier", "done_line", "depends_on", "rank")}
             state.update(changes)
+        if "depends_on" in changes:
+            _refuse_cycle(conn, item_id, state["depends_on"])
         state["category"] = state["status"] = to        # v1: the status IS the category name (§3)
         if prior is not None and all(state[k] == prior[k] for k in _STATE_FIELDS):
             raise CoordError(f"{item_id} already reads so; nothing to write")
