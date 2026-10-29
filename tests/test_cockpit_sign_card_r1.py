@@ -249,7 +249,8 @@ def test_a_lost_answer_then_a_reload_posts_the_effect_once(tmp_path, monkeypatch
 def test_a_pick_list_a_redraw_detached_releases_the_card_and_a_write_in_survives_not_sure(tmp_path, monkeypatch) -> None:
     """R4: two passkeys enrolled and no record of which this browser holds: the pick list is open when the card is drawn
     again, and the new card's buttons work. R9: a dismissed pick (nothing signed) reads nothing again. R6: the write-in's
-    answer never reached the server ("not sure"): its words are kept, and the box opens again once the request reads open."""
+    answer never reached the server ("not sure"): its words are kept, and the box opens again once the cockpit says that
+    answer's attempt was refused."""
     rig = _Rig(tmp_path, monkeypatch, two_keys=True)
     fp = rig.pk.key.fingerprint
     with rig.serving() as (_url, _httpd):
@@ -278,7 +279,7 @@ def test_a_pick_list_a_redraw_detached_releases_the_card_and_a_write_in_survives
             {"eval": f"{WORDS_BTN}.click() || 1"},
             {"until": PICKS},
             _pick(fp),
-            {"until": f"/not sure this was signed/.test({FACET_NOTE}) && {FACET_NOTE}"},
+            {"until": f"/never reached the cockpit/.test({FACET_NOTE}) && {FACET_NOTE}"},
             {"until": f"!{WRITE_IN}.disabled && {WRITE_IN}.value", "may_timeout": True},
             {"eval": OPEN % QRID},
             {"eval": REDRAW},
@@ -293,8 +294,8 @@ def test_a_pick_list_a_redraw_detached_releases_the_card_and_a_write_in_survives
     assert v[2] == 3, v[2]                               # two passkeys and a dismiss
     assert v[8] == 3, v[8]                               # the new card's tap: the redraw released the lease
     assert v[10] == 0, v[10]                             # a dismissed pick read nothing again
-    assert "not sure this was signed" in v[16], v[16]
-    assert v[17] == "only after the backup", v[17]       # kept, and editable again: the request still reads open
+    assert "never reached the cockpit" in v[16], v[16]   # the cockpit refused the attempt: nothing was signed
+    assert v[17] == "only after the backup", v[17]       # kept, and editable again
     assert v[18] is True and rig.nothing_signed(QRID)
     assert v[21] == "only after the backup", v[21]       # a board read left the words where they were typed
     assert v[24] == "only after the backup", v[24]       # and a focus view opened again offers the same words

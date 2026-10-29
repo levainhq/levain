@@ -78,6 +78,17 @@
   const notes = new Map();    // request id -> [text, kind], kept across redraws
   const writeIns = new Map(); // sign request id -> {sha256, words}: the write-in being typed, kept across redraws
                               // for the version it was typed on only
+  // sign request id -> the attempt id of an answer whose reply was lost and that the port has not settled
+  // (levain.consent.sign Signer.attempt): its card is drawn frozen and asks the port again on every listing
+  const signUnsettled = new Map();
+  const signAsking = new Set();   // request ids whose attempt is being asked about now
+  // where the answer with `attempt` on request `id` stands: the port's {state, ...}, or {state: "", why} when it said nothing
+  const askAttempt = (id, attempt) => call("POST", "/sign/" + encodeURIComponent(id) + "/attempt", { attempt: attempt })
+    .then((a) => (a.ok && typeof a.body.state === "string" ? a.body : { state: "", why: why(a) }));
+  const refusedText = (st) => {
+    const w = typeof st.reason === "string" && st.reason ? st.reason.replace(/[.\s]+$/, "") : "refused";
+    return "not signed: " + w + (/nothing was signed/.test(w) ? "" : "; nothing was signed") + ": sign it again";
+  };
 
   function draw(data, seq) {
     rpId = data.rp_id || rpId;
@@ -96,6 +107,20 @@
     const memos = Array.isArray(data.notes) ? data.notes : [];
     // words typed for a request no longer listed (signed, denied, expired) go with it, so a reused id starts empty
     for (const id of writeIns.keys()) if (!signs.some((r) => r.id === id)) writeIns.delete(id);
+    // an unsettled answer whose request left the list (signed, denied, expired) has no card to ask for it: the port is
+    // asked here, and what it says is the status line's last answer
+    for (const [id, pend] of signUnsettled) {
+      if (signs.some((r) => r.id === id) || signAsking.has(id)) continue;
+      signAsking.add(id);
+      askAttempt(id, pend).then((st) => {
+        if (signUnsettled.get(id) !== pend || (st.state !== "signed" && st.state !== "refused")) return;
+        signUnsettled.delete(id);
+        last = st.state === "signed"
+          ? "signed " + (st.choice ? "(" + st.choice + ") " : "") + id + " (its reply was lost; the port confirmed it)"
+          : refusedText(st);
+        setTimeout(load, 0);
+      }).finally(() => signAsking.delete(id));
+    }
     const waiting = rows.length + gaps.length + signs.length + asks.length + jobs.length;
     const unread = (Number(data.sign_overflow) > 0 ? " \u00b7 " + Number(data.sign_overflow) + " more sign requests not shown" : "")
       + (Number(data.questions_overflow) > 0 ? " \u00b7 " + Number(data.questions_overflow) + " more questions not shown" : "")
@@ -776,7 +801,7 @@
         freeze = {
           words: null,
           signing: (line) => { shown.textContent = "signing: " + line; },
-          unsure: () => { shown.textContent = "not sure this was signed: check the list"; },
+          unsure: () => { shown.textContent = "not sure this was signed: not confirmed"; },
           release: () => {
             for (const p of actions.querySelectorAll(".pick")) p.remove();
             freeze.words = null;
@@ -812,6 +837,30 @@
     d.addEventListener("click", () => signDeny(r, say));
     actions.appendChild(d);
     card.append(actions, note);
+    // an answer whose reply was lost and that the port had not settled may still sign: nothing that signs is offered,
+    // and the port is asked about it again; a settled answer redraws the list
+    const pend = signUnsettled.get(r.id);
+    if (pend && !r.refused) {
+      // every control on the card that signs, the deep link's picked button included, not only those in `actions`
+      for (const x of card.querySelectorAll("button.allow, button.pick, input")) x.disabled = true;
+      if (!signAsking.has(r.id)) {
+        signAsking.add(r.id);
+        askAttempt(r.id, pend).then((st) => {
+          if (signUnsettled.get(r.id) !== pend) return;
+          if (st.state === "signed" || st.state === "refused") {
+            signUnsettled.delete(r.id);
+            if (st.state === "signed") writeIns.delete(r.id);
+            say(st.state === "signed" ? "signed (its reply was lost; the port confirmed it)" : refusedText(st),
+                st.state === "signed" ? "ok" : "bad");
+            setTimeout(load, 0);
+            return;
+          }
+          say((st.state === "pending" ? "the port is still verifying the last answer"
+            : "where the last answer stands could not be read (" + (st.why || st.state) + ")")
+            + ": not confirmed; this card asks again when the list is read", "bad");
+        }).finally(() => signAsking.delete(r.id));
+      }
+    }
     return card;
   }
 
@@ -833,15 +882,35 @@
   }
 
   // only a definite "nothing was signed" releases a frozen write-in: a 4xx from /challenge or /answer, any failure
-  // before /answer is sent (no challenge, the passkey cancelled or failed). After the assertion is sent, no reply,
-  // a reply that is not JSON or a 5xx may follow a signature the server already wrote: the words stay frozen and
-  // the next redraw, built from the server's list, says where it stands
+  // before /answer is sent (no challenge, the passkey cancelled or failed), or the port saying this answer's attempt
+  // was refused. After the assertion is sent, no reply, a reply that is not JSON or a 5xx may follow a signature the
+  // server already wrote, or one it is still verifying: the port is asked about the attempt (unsure, below)
   function signAnswer(r, fp, rawId, say, choice, freeze) {
     if (busy) return;   // a second activation while a ceremony runs is ignored; it never unfreezes the first's words
     busy++;
     let keep = false;   // signed, or not knowable: the frozen words stay frozen
     let sent = false;   // the assertion went to /answer
-    const unsure = (text) => { keep = true; if (freeze) freeze.unsure(); say(text, "bad"); };
+    const attempt = b64u(crypto.getRandomValues(new Uint8Array(18)));   // this answer's own id (Signer.attempt)
+    // the answer was posted and its reply was lost: the port is asked where this attempt stands. "signed" and "refused"
+    // are its word; anything else leaves the words and the card frozen until a listing's card asks again (signCard)
+    const unsure = (text) => {
+      keep = true;
+      if (freeze) freeze.unsure();
+      say(text + "; asking the port where it stands…", "bad");
+      return askAttempt(r.id, attempt).catch(() => ({ state: "" })).then((st) => {
+        if (st.state === "signed") {
+          last = "signed " + (st.choice ? "(" + st.choice + ") " : "") + (r.title || r.id);
+          if (r.id === focus) focusDone = true;
+          writeIns.delete(r.id);
+          return say("signed" + (st.choice ? " (" + st.choice + ")" : "") + " · by " + st.signer_fp + " in " + st.namespace
+                     + " (its reply was lost; the port confirmed it)", "ok");
+        }
+        if (st.state === "refused") { keep = false; return say(refusedText(st), "bad"); }
+        signUnsettled.set(r.id, attempt);
+        return say(text + (st.state === "pending" ? "; the port is still verifying it" : "; where it stands could not be read")
+                   + ": not confirmed; this card asks again when the list is read", "bad");
+      });
+    };
     const base = "/sign/" + encodeURIComponent(r.id) + "/";
     const body = { signer_fp: fp, request_sha256: r.sha256 };
     if (choice !== undefined) body.choice = choice;
@@ -859,10 +928,10 @@
         sent = true;
         return call("POST", base + "answer", {
           authenticator_data: b64u(cred.response.authenticatorData), client_data_json: b64u(cred.response.clientDataJSON),
-          signature: b64u(cred.response.signature) }).then((a) => {
+          signature: b64u(cred.response.signature), attempt: attempt }).then((a) => {
           // only the server's own refusal (a 4xx) says nothing was signed
           if (!a.ok && a.status >= 400 && a.status < 500) return say("not signed: " + why(a), "bad");
-          if (!a.ok) return unsure("not sure this was signed (" + why(a) + "): check the list");
+          if (!a.ok) return unsure("not sure this was signed (" + why(a) + ")");
           last = "signed " + (a.body.choice ? "(" + a.body.choice + ") " : "") + (r.title || r.id);
           if (r.id === focus) focusDone = true;
           keep = true;
@@ -873,7 +942,7 @@
       }, (e) => say(declined(e, "nothing was signed"), "bad"));
     }).catch((e) => {
       const name = (e && e.name) || "error";
-      if (sent) return unsure("not sure this was signed (the page failed: " + name + "): check the list");
+      if (sent) return unsure("not sure this was signed (the page failed: " + name + ")");
       say("the page failed (" + name + "); it re-reads the queue to show where this stands", "bad");
     }).finally(() => { busy--; if (!keep && freeze) freeze.release(); setTimeout(load, 1500); });
   }

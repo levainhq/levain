@@ -2,8 +2,8 @@
 sheet's L3 r1 named (project_memory/1025-40/os1/RULINGS_L3_R1.md H2, H4, H7, H8), over the rig of test_cockpit_sign_card:
 headless Chrome on ``http://localhost:<port>`` with a virtual authenticator holding the passkey the Signer's keys name.
 
-H2: an answer whose reply did not come back ("not sure") never re-arms the card: its buttons stay frozen while the request
-is read again, and come back only when that read finds the same version still open. H4: a challenge that is not
+H2: an answer whose reply did not come back ("not sure") never re-arms the card on a read of the request: the cockpit is
+asked about the answer's attempt, and the card comes back only when it says that attempt was refused. H4: a challenge that is not
 base64url is named and no passkey is asked. H4/H7: a remembered credential id that does not decode is dropped (the OS's
 own list), never a throw that blocks every tap; a remembered id the authenticator refuses (NotAllowedError) is asked once
 more without it, and the record then names the passkey that signed. H8: a reply missing its fields never prints
@@ -62,46 +62,42 @@ def _card(rig: _Rig, *steps: dict) -> list:
 
 @needs_browser
 @needs_ssh
-def test_h2_an_answer_that_landed_with_its_reply_lost_keeps_the_card_frozen_and_says_it_closed(tmp_path, monkeypatch) -> None:
+def test_h2_an_answer_that_landed_with_its_reply_lost_is_confirmed_signed_by_its_attempt(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": LOSE_REPLY.format(tail=json.dumps("/answer"))},
             {"eval": f"{OPTION_B}.click() || 1"},
-            {"until": f"/not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
+            {"until": f"/the cockpit confirmed it/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": AFTER.format(ms=2000)},
             {"eval": BUTTONS},
             {"eval": "window.__reloads"},
-            {"eval": FACET_NOTE},
         ])
     v = out["values"]
-    assert str(v[5]).startswith("not sure this was signed"), v[5]
-    assert v[7] == [True, True, True], v[7]               # frozen: the request it may have signed is closed
+    assert str(v[5]).startswith("signed (b) · by " + rig.pk.key.fingerprint), v[5]
+    assert v[7] == [True, True, True], v[7]               # frozen: the request it signed is closed
     assert v[8] >= 1, v[8]                                # and the board is told to read again
-    assert v[9].startswith("not sure this was signed") and "no longer open" in v[9], v[9]
     assert rig.verifies(QRID)                             # the answer did land
 
 
 @needs_browser
 @needs_ssh
-def test_h2_an_answer_that_never_left_reads_open_and_only_then_the_card_comes_back(tmp_path, monkeypatch) -> None:
+def test_h2_an_answer_that_never_left_is_refused_by_its_attempt_and_only_then_the_card_comes_back(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
             {"eval": f"{OPTION_B}.click() || 1"},
-            {"until": f"/not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
-            {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 8000},
+            {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 30000},
             {"eval": OPEN % QRID},
             {"eval": f"{OPTION_B}.click() || 1"},
             {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
         ])
     v = out["values"]
-    assert str(v[5]).startswith("not sure this was signed"), v[5]
-    assert "still reads open" in v[6] and "second read" in v[6], v[6]   # said once the second read came back
-    assert v[7] is True                                   # it was open: nothing had been signed
+    assert "never reached the cockpit" in v[5] and "sign it again" in v[5], v[5]   # the cockpit's word, not a read
+    assert v[6] is True                                   # it was open: nothing had been signed
     assert rig.verifies(QRID)                             # and the card signed it on the next tap
 
 
@@ -197,26 +193,35 @@ def test_h8_a_signed_reply_missing_its_fields_prints_what_was_sent_and_never_und
 
 @needs_browser
 @needs_ssh
-def test_a_focus_view_opened_again_mid_attempt_shows_the_frozen_card_and_gives_it_back_with_the_original(tmp_path, monkeypatch) -> None:
-    """An answer that never left the page is "not sure" until a second read finds the version open. The card is built
-    again when the focus view is closed and opened: while the attempt is in flight it is drawn frozen, never with live
-    buttons, and it comes back with the first card once the second read releases it."""
+def test_a_focus_view_opened_again_while_the_cockpit_verifies_shows_the_frozen_card_and_tells_it_the_answer(tmp_path, monkeypatch) -> None:
+    """An answer whose reply was lost, that the cockpit is still verifying, is asked about by its attempt, never by a read
+    of the request. The card is built again when the focus view is closed and opened: while the attempt is unsettled it
+    is drawn frozen, never with live buttons, and it is told the cockpit's word with the first card (signed here: it
+    stays frozen, the request it signed being closed)."""
+    from tests.test_sign_attempt_page import CARD_SENT_THEN_LOST, _hold_verify
+
     rig = _Rig(tmp_path, monkeypatch)
     close = "(document.querySelector('#levain-modal .modal-close').click(), 1)"
     reopen = "(document.querySelector('#ck-needs .needs-row.needs-question').click(), 1)"
     with rig.serving():
+        go = _hold_verify(monkeypatch, 6.0)
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
-            *_card(rig),
-            {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
+            DESKTOP, rig.authenticator(), {"until": STRIP_FACET + " && 1", "ms": 30000},   # the board reads go on
+            {"eval": CARD_SENT_THEN_LOST.format(tail=json.dumps("/answer"))},
             {"eval": f"{OPTION_B}.click() || 1"},
-            {"until": f"/not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
+            {"until": f"/still verifying/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": close},
             {"eval": reopen},
             {"until": "document.querySelector('#levain-modal .needs-question .sign-option') && 1", "ms": 20000},
             {"eval": BUTTONS},
-            {"until": f"!{OPTION_B}.disabled && 1", "ms": 8000},
+            {"eval": AFTER.format(ms=7000)},                  # the verify is let through meanwhile
+            {"eval": "window.LevainCockpitTransport.reload() && 1"},                 # the next board read asks again
+            {"until": f"/the cockpit confirmed it/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 45000},
             {"eval": BUTTONS},
         ])
+        go.set()
     v = out["values"]
-    assert v[9] == [True, True, True], v[9]               # drawn frozen while the attempt is in flight
-    assert v[11] == [False, False, False], v[11]          # released by the second read, this card too
+    assert v[7] == [True, True, True], v               # drawn frozen while the attempt is unsettled
+    assert v[10].startswith("signed (b)"), v          # told the cockpit's word
+    assert v[11] == [True, True, True], v             # signed: the request is closed, the card stays frozen
+    assert rig.verifies(QRID)

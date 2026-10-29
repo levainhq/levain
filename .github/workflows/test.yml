@@ -196,9 +196,16 @@ jobs:
     # pinned version and CHROME points at it. Selection is by file (every test file that names
     # `needs_browser`), because the mark is a skipif and not a registered marker, so `-m` cannot pick it.
     # The job fails if that selection is empty, if nothing was collected, or if ANY test skips.
-    name: cockpit browser tests (Python 3.13)
+    # One job ran every file in series and was within a few minutes of its 40 minute limit (35m42s on 10-29, then
+    # over it once the sign-attempt tests joined), so the files are dealt round-robin into three shards: each
+    # shard keeps the same rules (selection by file, nothing collected fails, any skip fails).
+    name: cockpit browser tests (Python 3.13, shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
     steps:
       - uses: actions/checkout@v6
 
@@ -238,9 +245,12 @@ jobs:
           echo "Chrome: $CHROME"
           "$CHROME" --version
           node --version
-          files=$(grep -l needs_browser tests/*.py | sort)
+          all=$(grep -l needs_browser tests/*.py | sort)
+          test -n "$all" || { echo "no test file names needs_browser"; exit 1; }
+          files=$(echo "$all" | awk -v k=${{ matrix.shard }} '(NR-1)%3==k')
+          echo "shard ${{ matrix.shard }} of 3:"
           echo "$files"
-          test -n "$files" || { echo "no test file names needs_browser"; exit 1; }
+          test -n "$files" || { echo "shard ${{ matrix.shard }} holds no test file"; exit 1; }
           set -o pipefail
           pytest -q -rs $files 2>&1 | tee browser.log
           # ANY skip is a failure here, whatever its reason: the whole point of this job is that these tests run

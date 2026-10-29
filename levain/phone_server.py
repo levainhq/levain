@@ -18,6 +18,8 @@ it serves only these:
     passkey to sign, in a namespace the command was started with (``--sign-namespace``), listed in ``consent.json``
     as ``sign_pending``, with ``sign_overflow`` the request files past the listing's cap (:mod:`levain.consent.sign`);
     ``GET /sign/<id>/state`` says where one a link named stands (open, signed, denied, expired, gone), token-gated;
+    ``POST /sign/<id>/attempt`` says where one answer whose reply was lost stands, by the attempt id the answer carried
+    (:meth:`levain.consent.sign.Signer.attempt`);
   - ``POST /dispatch/<job>/challenge``, ``.../answer``, ``.../cancel-challenge``, ``.../cancel``,
     ``.../authorise-challenge`` and ``.../authorise``: a filed dispatch job's contract signed, a live one
     cancelled, or a recommended one's run authorised and landed, with a passkey, verified by the job store against the same one
@@ -112,7 +114,7 @@ _QUESTION_ROUTE = re.compile(r"/question/([0-9]{1,12})/(answer|rule)")
 _NOTE_ROUTE = re.compile(r"/note/([0-9]{1,12})/dismiss")    # an agent's note, marked read: unsigned, delivers nothing
 _KEY_LINE = "/passkey/key-line"
 _SIGN_PREFIX = "/sign/"
-_SIGN_ACTIONS = ("challenge", "answer", "deny")
+_SIGN_ACTIONS = ("challenge", "answer", "deny", "attempt")
 _SIGN_STATE = re.compile(r"/sign/([A-Za-z0-9_-]{8,64})/state")    # GET: where a linked request stands (display only)
 _DISPATCH_ROUTE = re.compile(
     r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel|authorise-challenge|authorise)")
@@ -454,8 +456,10 @@ class _PhoneHandler(GuardedHandler):
             self._json({"error": "bad_request", "message": "the body is not JSON"}, 400)
             return
         # an answer carries a signature the person just made with a passkey: it waits a moment for a slot rather than
-        # throw that ceremony away; everything else answers busy at once
-        waits = ((consent is not None and consent[1] in ("answer", "rule")) or (sign is not None and sign[1] == "answer")
+        # throw that ceremony away, and so does the read of where a sign answer whose reply was lost stands; everything
+        # else answers busy at once
+        waits = ((consent is not None and consent[1] in ("answer", "rule"))
+                 or (sign is not None and sign[1] in ("answer", "attempt"))
                  or (question is not None and question.group(2) == "rule")
                  or (dispatch is not None and dispatch.group(2) in ("answer", "cancel", "authorise"))
                  # a drop waits too: the outbox resends it anyway, but one carrying a signed envelope holds a ceremony
