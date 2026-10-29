@@ -158,3 +158,172 @@ def test_undo_of_a_store_edit_without_the_store_says_so(rig, monkeypatch) -> Non
         apply_edit(scope, {"kind": "undo", "edit_id": r["id"]})
     assert ei.value.code == "not_undoable"
     assert "edited" in cont.read_text(encoding="utf-8")
+
+
+# --- FIX ROUND 1: the result identity is the store's; undo is guarded by the State section version --------
+
+def _rows(root: Path) -> list[dict]:
+    import json
+    p = root / ".levain" / "edits.jsonl"
+    return [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()] if p.exists() else []
+
+
+def _backup_dirs(root: Path) -> list[Path]:
+    b = root / ".levain" / "backups"
+    return sorted(b.iterdir()) if b.exists() else []
+
+
+def _wrap_rewrite(cont: Path, *, state: str | None, facts: str) -> None:
+    """A consolidation landing: rewrites the continuity file, other sections changed, State as given."""
+    text = cont.read_text(encoding="utf-8").replace("fact one", facts)
+    if state is not None:
+        text = text.replace(_expected(cont), state)
+    cont.write_text(text, encoding="utf-8")
+
+
+def test_a_wrap_between_the_write_and_any_reread_is_not_recorded_as_this_edit(rig, monkeypatch) -> None:
+    """A wrap lands the moment anneal releases its lock: the audit row still names the version anneal
+    returned for OUR body, and undo then refuses instead of restoring over the wrap's State."""
+    root, db, cont, scope = rig
+    orig = Store.replace_section
+    seen = []
+
+    def then_wrap(self, *a, **k):
+        res = orig(self, *a, **k)
+        seen.append(res.version)
+        _wrap_rewrite(cont, state="wrap state", facts="wrap fact")
+        return res
+
+    monkeypatch.setattr(Store, "replace_section", then_wrap)
+    r = apply_edit(scope, _state_req(_expected(cont), "new state"))
+    monkeypatch.setattr(Store, "replace_section", orig)
+    rec = _rows(root)[-1]
+    assert rec["section_version"] == seen[0] and "new_sha256" not in rec
+    assert rec["section_version"] != _state(db)[1]  # the wrap's State is not this edit's result
+    with pytest.raises(EditError) as ei:
+        apply_edit(scope, {"kind": "undo", "edit_id": r["id"]})
+    assert ei.value.code == "stale" and ei.value.http_status == 409
+    assert _state(db)[0].strip() == "wrap state" and "wrap fact" in cont.read_text(encoding="utf-8")
+    assert len(_rows(root)) == 1 and len(_backup_dirs(root)) == 1  # the refused undo left no trace
+
+
+def test_undo_after_a_state_preserving_wrap_restores_state_alone(rig) -> None:
+    root, db, cont, scope = rig
+    r = apply_edit(scope, _state_req(_expected(cont), "edited"))
+    _wrap_rewrite(cont, state=None, facts="wrap fact")
+    u = apply_edit(scope, {"kind": "undo", "edit_id": r["id"]})
+    assert u["ok"] and u["undid"] == r["id"]
+    text = cont.read_text(encoding="utf-8")
+    assert _state(db)[0].strip() == "old state"
+    assert "wrap fact" in text and "fact one" not in text  # the wrap's other sections stand
+    undo_row = _rows(root)[-1]
+    assert undo_row["prev_section_version"] == _rows(root)[0]["section_version"]
+    assert undo_row["section_version"] == _state(db)[1]
+
+
+def test_undo_after_a_state_changing_wrap_is_refused_409(rig) -> None:
+    root, db, cont, scope = rig
+    r = apply_edit(scope, _state_req(_expected(cont), "edited"))
+    _wrap_rewrite(cont, state="consolidated", facts="wrap fact")
+    before = cont.read_text(encoding="utf-8")
+    with pytest.raises(EditError) as ei:
+        apply_edit(scope, {"kind": "undo", "edit_id": r["id"]})
+    assert ei.value.code == "stale" and ei.value.http_status == 409
+    assert cont.read_text(encoding="utf-8") == before
+    assert len(_rows(root)) == 1 and len(_backup_dirs(root)) == 1
+
+
+def test_a_failed_audit_append_after_the_edit_says_committed_and_keeps_the_backup(rig, monkeypatch) -> None:
+    import levain.writes as w
+    root, db, cont, scope = rig
+
+    def boom(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(w, "_append_audit", boom)
+    with pytest.raises(EditError) as ei:
+        apply_edit(scope, _state_req(_expected(cont), "landed"))
+    e = ei.value
+    assert e.code == "committed_unaudited" and "COMMITTED" in str(e)
+    assert e.extra["committed"] is True and e.extra["section_version"] == _state(db)[1]
+    assert _state(db)[0].strip() == "landed"
+    kept = root / ".levain" / e.extra["backup"]
+    assert kept.is_file() and "old state" in kept.read_text() and e.extra["backup"] in str(e)
+
+
+def test_a_failed_audit_append_after_an_undo_says_committed_and_keeps_the_backup(rig, monkeypatch) -> None:
+    import levain.writes as w
+    root, db, cont, scope = rig
+    r = apply_edit(scope, _state_req(_expected(cont), "edited"))
+    monkeypatch.setattr(w, "_append_audit", lambda *a, **k: (_ for _ in ()).throw(PermissionError("ro")))
+    with pytest.raises(EditError) as ei:
+        apply_edit(scope, {"kind": "undo", "edit_id": r["id"]})
+    assert ei.value.code == "committed_unaudited" and ei.value.extra["committed"] is True
+    assert _state(db)[0].strip() == "old state"
+    assert (root / ".levain" / ei.value.extra["backup"]).is_file()
+
+
+def test_close_raising_after_a_written_result_is_success_with_a_warning(rig, monkeypatch) -> None:
+    from anneal_memory import StoreError
+    root, db, cont, scope = rig
+    orig_close = Store.close
+    armed = [True]
+
+    def close_then_raise(self):
+        orig_close(self)
+        if armed[0]:  # the edit's own Store is the only one apply_edit opens
+            armed[0] = False
+            raise StoreError("unable to close due to unfinalized statements", operation="close")
+
+    monkeypatch.setattr(Store, "close", close_then_raise)
+    r = apply_edit(scope, _state_req(_expected(cont), "closed badly"))
+    monkeypatch.setattr(Store, "close", orig_close)
+    assert r["ok"] and "closing the anneal store" in r["warning"]
+    assert _state(db)[0].strip() == "closed badly"
+    rec = _rows(root)[-1]
+    assert rec["section_version"] == _state(db)[1] and rec["warning"] == r["warning"]
+    assert (root / ".levain" / rec["backup"]).is_file()
+    assert apply_edit(scope, {"kind": "undo", "edit_id": r["id"]})["ok"]
+    assert _state(db)[0].strip() == "old state"
+
+
+def test_close_raising_after_a_refusal_reports_the_refusal(rig, monkeypatch) -> None:
+    from anneal_memory import StoreError
+    root, db, cont, scope = rig
+    with Store(str(db)) as wr:
+        wr.wrap_started(token="t", episode_ids=[])
+    orig_close = Store.close
+
+    def close_then_raise(self):
+        orig_close(self)
+        raise StoreError("close failed", operation="close")
+
+    monkeypatch.setattr(Store, "close", close_then_raise)
+    with pytest.raises(EditError) as ei:
+        apply_edit(scope, _state_req(_expected(cont), "during wrap"))
+    monkeypatch.setattr(Store, "close", orig_close)
+    assert ei.value.code == "wrap_in_progress"
+    assert not _rows(root) and not _backup_dirs(root)
+
+
+def test_open_wrap_refusal_leaves_no_backup_or_audit(rig) -> None:
+    root, db, cont, scope = rig
+    with Store(str(db)) as wr:
+        wr.wrap_started(token="t", episode_ids=[])
+    with pytest.raises(EditError):
+        apply_edit(scope, _state_req(_expected(cont), "during wrap"))
+    assert not _rows(root) and not _backup_dirs(root)
+
+
+def test_undo_of_a_store_row_without_a_section_version_is_refused(rig) -> None:
+    import json
+    root, db, cont, scope = rig
+    r = apply_edit(scope, _state_req(_expected(cont), "edited"))
+    p = root / ".levain" / "edits.jsonl"
+    rec = json.loads(p.read_text().splitlines()[-1])
+    rec.pop("section_version")
+    p.write_text(json.dumps(rec) + "\n")
+    with pytest.raises(EditError) as ei:
+        apply_edit(scope, {"kind": "undo", "edit_id": r["id"]})
+    assert ei.value.code == "not_undoable"
+    assert _state(db)[0].strip() == "edited"
