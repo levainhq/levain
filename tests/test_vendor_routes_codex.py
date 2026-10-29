@@ -89,7 +89,9 @@ def test_two_operator_routes_for_codex_are_named_and_left_as_written():
 
 
 def test_an_operators_claude_route_does_not_stop_the_codex_default_and_the_reverse():
-    claude = {"route": "operator-claude-pass", "type": "subscription_passthrough", "hosts": ["api.anthropic.com"]}
+    # 1029 (np-e5b2ebed (a)): an operator's Claude passthrough route must carry the token host too, or it is refused
+    claude = {"route": "operator-claude-pass", "type": "subscription_passthrough",
+              "hosts": ["api.anthropic.com", "platform.claude.com"]}
     out, ids, notes = VR.merge({"format": VR.BASE_FORMAT, "routes": [claude]})
     assert "codex-subscription" in ids and "claude-subscription" not in ids
     assert notes == ["route claude-subscription not added: your own operator-claude-pass is kept as the passthrough "
