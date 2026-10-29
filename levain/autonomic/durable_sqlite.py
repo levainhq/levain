@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -100,20 +101,19 @@ def _until_not_busy(conn: sqlite3.Connection, step: Callable[[], object]) -> obj
 
     The connection's busy handler is off while it tries (every try answers at once, so the clock bounds the call and
     a held lock is polled by the pauses), and put back after. A connection whose ``busy_timeout`` is already 0 was
-    set fail-fast on purpose: it gets one try, no retry. The clock is ``os.times().elapsed`` (``time`` is not on the
-    package's import allowlist, ``tests/test_autonomic_leaf.py``)."""
+    set fail-fast on purpose: it gets one try, no retry. The clock is ``time.monotonic()``."""
     restore = conn.execute("PRAGMA busy_timeout").fetchone()[0]
     if not restore:
         return step()
     conn.execute("PRAGMA busy_timeout = 0")
     try:
-        deadline = os.times().elapsed + restore / 1000
+        deadline = time.monotonic() + restore / 1000
         pause = 0.001
         while True:
             try:
                 return step()
             except sqlite3.OperationalError as exc:
-                if not _is_busy(exc) or os.times().elapsed + pause > deadline:
+                if not _is_busy(exc) or time.monotonic() + pause > deadline:
                     raise
             threading.Event().wait(pause)
             pause = min(pause * 2, 0.05)
@@ -134,10 +134,10 @@ def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None,
     wait = BUSY_WAIT_S if busy_s is None else max(0.0, min(float(busy_s), BUSY_WAIT_S))
     conn = sqlite3.connect(path, timeout=wait, isolation_level=None)
     try:
-        began = os.times().elapsed
+        began = time.monotonic()
         _set_wal(conn, None if busy_s is None else wait)  # sidecars -wal/-shm stay beside the database
         # One budget for the whole open: the first read waits only what the WAL switch left of it, never a second ``wait``.
-        left = wait if busy_s is None else max(0.0, wait - (os.times().elapsed - began))
+        left = wait if busy_s is None else max(0.0, wait - (time.monotonic() - began))
         conn.execute(f"PRAGMA busy_timeout = {int(left * 1000)}")
         # A first read, retried, so the statements after it meet a connection that has already read the database.
         # [judged by lane-limitsrace, 10-25, against wal.html: the last connection to close takes an exclusive lock
@@ -147,6 +147,8 @@ def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None,
         conn.execute("PRAGMA synchronous = FULL")
         conn.execute("PRAGMA fullfsync = ON")
         conn.execute("PRAGMA checkpoint_fullfsync = ON")
+        # The reduced timeout bounded only the opening; the connection runs on the full configured one.
+        conn.execute(f"PRAGMA busy_timeout = {int(wait * 1000)}")
     except BaseException:
         conn.close()
         raise

@@ -320,13 +320,13 @@ class QuestionStore:
         """A durable connection; ``open_s`` bounds the open's own waits (:func:`open_durable`'s ``busy_s``) and
         ``busy_ms`` the busy timeout after, the first-time setup included. ``deadline`` (``time.monotonic()``) replaces
         both: the open gets what is left of it, and the setup's wait what the open left, never a fresh budget each."""
-        if deadline is not None:
-            open_s = max(0.0, deadline - time.monotonic())
         if self._ready:
             if not self.path.exists():
                 raise QuestionStoreError(f"question store {self.path} has disappeared")
         else:
             self._check_directory()
+        if deadline is not None:      # after the directory checks: the open gets only what is left now
+            open_s = max(0.0, deadline - time.monotonic())
         conn = open_durable(self.path, busy_s=open_s)
         try:
             if deadline is not None:

@@ -417,6 +417,49 @@ def test_ready_by_one_deadline_covers_open_and_setup(tmp_path, monkeypatch):
     assert seen and seen[0] <= 250, seen
 
 
+def test_ready_by_computes_the_open_budget_after_the_directory_check(tmp_path, monkeypatch):
+    import time
+
+    from levain.consent import questions as Q
+
+    seen = []
+    real_check = Q.QuestionStore._check_directory
+
+    def slow_check(self):
+        time.sleep(0.3)
+        real_check(self)
+
+    real_open = Q.open_durable
+
+    def spy_open(path, **kw):
+        seen.append(kw.get("busy_s"))
+        return real_open(path, **kw)
+
+    monkeypatch.setattr(Q.QuestionStore, "_check_directory", slow_check)
+    monkeypatch.setattr(Q, "open_durable", spy_open)
+    Q.QuestionStore(tmp_path / "q").ready_by(time.monotonic() + 0.5)
+    assert seen and seen[0] <= 0.25, seen
+
+
+def test_open_durable_returns_the_full_configured_busy_timeout(tmp_path, monkeypatch):
+    import time
+
+    from levain.autonomic import durable_sqlite as D
+
+    real_set_wal = D._set_wal
+
+    def slow_wal(conn, bound):
+        time.sleep(0.3)
+        real_set_wal(conn, bound)
+
+    monkeypatch.setattr(D, "_set_wal", slow_wal)
+    conn = D.open_durable(tmp_path / "x.db", busy_s=0.5)
+    try:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 500
+    finally:
+        conn.close()
+
+
 def test_open_durable_wal_switch_and_first_read_share_one_budget(tmp_path, monkeypatch):
     import time
 

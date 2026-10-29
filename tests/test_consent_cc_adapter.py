@@ -1216,6 +1216,26 @@ def test_with_no_key_a_hook_write_is_a_plain_deny_in_every_mode_where_no_dialog_
         ("denied_by_gate", "refused", "floor")}
 
 
+@pytest.mark.parametrize("boom", [SyntaxError("broken install"), AttributeError("half-initialised"), RuntimeError("x")])
+def test_a_gate_notice_that_raises_anything_never_fails_the_gate(queue, monkeypatch, boom):
+    """An advisory notice must never take down the consent gate (boundary code): whatever it raises, the gate
+    returns the answer it would have given without it."""
+    from levain import band_view
+
+    monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
+    settings = cc.AdapterSettings()
+    want = cc.gate(_hook_write("bypassPermissions"), queue, settings, home=Path("/home/u"), environ=h4_env())
+    calls = []
+
+    def raising(*a, **kw):
+        calls.append(1)
+        raise boom
+
+    monkeypatch.setattr(band_view, "gate_notice", raising)
+    got = cc.gate(_hook_write("bypassPermissions"), queue, settings, home=Path("/home/u"), environ=h4_env())
+    assert calls and got == want and got["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
 def test_an_unconfined_session_passes_a_hook_write_and_spends_no_ruled_allow(queue, monkeypatch):
     """Q10 D2 (R3b 3a: a clear path to run an unconfined session that can edit hooks): LEVAIN_UNCONFINED=1 in the
     session's launch env passes the gated call to the mode, read at call time, and never takes a ruled allow; any

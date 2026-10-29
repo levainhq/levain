@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib.metadata
 import json
 import os
 import shutil
@@ -481,7 +482,7 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool) -> int:
     if not no_pip:
         try:
             dist = s.dist()
-        except Exception as e:  # noqa: BLE001 - no install record (a source tree) is "cannot tell", never a crash
+        except (importlib.metadata.PackageNotFoundError, OSError) as e:  # no install record (a source tree) is "cannot tell", never a crash
             raise Refusal(_cannot_tell(f"could not read the install record: {type(e).__name__}")) from None
         ev = gather_evidence(pkg, dist, prefix=s.prefix, base_prefix=s.base_prefix, user_site=s.user_site(),
                              stdlib=s.stdlib or sysconfig.get_path("stdlib"),

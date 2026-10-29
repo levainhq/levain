@@ -553,8 +553,8 @@ def _with_rulings(out: dict[str, Any] | None, queue: ConsentQueue, session: str,
         from levain.band_view import gate_notice
 
         notice = gate_notice(queue.directory, AGENT, session, cwd if isinstance(cwd, str) else None, environ)
-    except ImportError:
-        notice = None  # gate_notice swallows its own errors; only the import can fail here
+    except Exception:
+        notice = None  # an advisory notice must never fail the consent gate, whatever it raises
     context = "\n".join(c for c in (context, answers, notice) if c) or None
     if context:
         out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}
