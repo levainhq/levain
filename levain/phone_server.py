@@ -292,7 +292,8 @@ class _PhoneHandler(GuardedHandler):
                 return
             self._json(self.server.signer.state(state.group(1)) if state is not None
                        else self.server.coord.coord_listing() if route == "/coord.json"
-                       else self.server.listing(viewer=_band_viewer(cred)), head=head)
+                       # HEAD delivers no body: it never shows the band (no number, no view recorded)
+                       else self.server.listing(viewer=None if head else _band_viewer(cred)), head=head)
         except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
             self._json({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}, 500, head=head)
         finally:
@@ -678,7 +679,7 @@ class _PhoneServer(ThreadingHTTPServer):
 
     def _band(self, viewer: str) -> dict[str, Any]:
         """The NEEDS YOU band as ``viewer`` is shown it (:func:`levain.band_view.band_payload`): numbers on show, the
-        view recorded only when it changed, the ``seen_through`` and ``store_id`` an answer must carry back. A store
+        view recorded only when it changed, the ``store_id`` and ``view_id`` an answer must carry back. A store
         that cannot be read is a note, never a failed listing."""
         from levain import band_view
         from levain.consent.questions import QuestionStore
@@ -686,25 +687,27 @@ class _PhoneServer(ThreadingHTTPServer):
         try:
             return band_view.band_payload(QuestionStore(self.queue_dir), viewer)
         except Exception as exc:  # noqa: BLE001 - the rest of the listing still serves
-            return {"seen_through": None, "store_id": None, "items": [], "note": f"{type(exc).__name__}: {exc}"}
+            return {"seen_through": None, "store_id": None, "view_id": None, "items": [],
+                    "note": f"{type(exc).__name__}: {exc}"}
 
     def band_answer(self, req: Any, *, viewer: str) -> dict[str, Any]:
-        """``POST /band/answer`` ({text, seen_through, store_id}): the band's shorthand answered on the phone, channel
-        ``phone``, unsigned, bound to the view this device was last shown. Q1 RULED (a): "Information answers stay
+        """``POST /band/answer`` ({text, store_id, view_id}, the binding the listing's ``band`` carries): the band's
+        shorthand answered on the phone, channel ``phone``, unsigned, recorded only while that view is still this
+        device's newest (checked inside the write; a store failure there is 503). Q1 RULED (a): "Information answers stay
         unsigned and are accepted only from human channels; agent-typed or relayed answers are refused and the item
         stays open." The phone token (this run's, or a paired device's) is the human gate every phone write already
         passes before this runs; an authority item records nothing here (it names its signing sheet)."""
         from levain import band_view
         from levain.consent.questions import QuestionStore, QuestionStoreError
 
-        if (not isinstance(req, dict) or set(req) != {"text", "seen_through", "store_id"}
+        if (not isinstance(req, dict) or set(req) != {"text", "store_id", "view_id"}
                 or not isinstance(req["text"], str) or not isinstance(req["store_id"], str)
-                or not isinstance(req["seen_through"], int) or isinstance(req["seen_through"], bool)):
-            raise PhoneError(400, "bad_request", 'send exactly {"text": words, "seen_through": n, "store_id": id}')
+                or not isinstance(req["view_id"], int) or isinstance(req["view_id"], bool)):
+            raise PhoneError(400, "bad_request", 'send exactly {"text": words, "store_id": id, "view_id": n}')
         store = QuestionStore(self.queue_dir)
         try:
             done = band_view.answer_text(store, req["text"], viewer=viewer, channel="phone",
-                                         seen_through=req["seen_through"], store_id=req["store_id"])
+                                         store_id=req["store_id"], view_id=req["view_id"])
         except band_view.StaleBand as exc:
             raise PhoneError(409, "stale_band", str(exc)) from None
         except ValueError as exc:

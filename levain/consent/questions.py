@@ -565,7 +565,9 @@ class QuestionStore:
         return Answer(q.id, kind, value, channel, stamp)  # type: ignore[arg-type]
 
     def answer_with_context(self, entries: list[dict[str, Any]], *, channel: str, schema: tuple[str, ...] = (),
-                            deadline: float | None = None) -> list[Answer | ConsentError]:
+                            deadline: float | None = None,
+                            require: Callable[[sqlite3.Connection], None] | None = None
+                            ) -> list[Answer | ConsentError]:
         """Answer several questions, each with its ``answer_context`` row, in ONE write transaction (Q17-ALL S2,
         D14): an entry's answer and its context are written together or not at all (a savepoint each), so no answer
         is ever stored, or seen by a delivery reader, without its provenance. ``entries``: dicts of ``ref``, exactly
@@ -574,13 +576,18 @@ class QuestionStore:
         tables, ``answer_context`` among them). ``deadline`` (``time.monotonic()``): the write lock is waited for
         until then (:meth:`_write_by`), else the ordinary wait. Returns one result per entry, in order: its
         :class:`Answer`, or the :class:`ConsentError` that refused it (nothing written for it; the others proceed).
-        The lock still busy at the deadline, or any other store failure: raised, and nothing is written."""
+        The lock still busy at the deadline, or any other store failure: raised, and nothing is written.
+        ``require``: a precondition run inside the same write transaction, after ``schema`` and before any entry (the
+        band's surfaces check there that the answer's view is still the viewer's newest, S5a): whatever it raises
+        rolls the transaction back whole and is raised."""
         if channel not in ANSWER_CHANNELS:
             raise ConsentError(f"channel must be one of {', '.join(ANSWER_CHANNELS)}: {channel!r}")
         out: list[Answer | ConsentError] = []
         with (self._write_by(deadline) if deadline is not None else self._write()) as conn:
             for stmt in schema:
                 conn.execute(stmt)
+            if require is not None:
+                require(conn)
             stamp = utc_stamp(_now_utc(self._clock))
             for e in entries:
                 conn.execute("SAVEPOINT answer_entry")

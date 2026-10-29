@@ -639,9 +639,10 @@ def _question_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str
 
 
 def _band_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
-    """Answer the NEEDS YOU band by its shorthand (Q17-ALL S5a): ``{text, seen_through, store_id}``, recorded once per
-    item, unsigned, channel ``cockpit``, viewer ``cockpit:<credential>``, bound to the view that viewer was last shown
-    (:func:`levain.band_view.answer_text`), then delivered to each agent's session on a daemon thread. Q1 RULED (a):
+    """Answer the NEEDS YOU band by its shorthand (Q17-ALL S5a): ``{text, store_id, view_id}``, recorded once per
+    item, unsigned, channel ``cockpit``, viewer ``cockpit:<credential>``, only while that view is still the viewer's
+    newest, checked inside the write (:func:`levain.band_view.answer_text`; a store failure there is 503), then
+    delivered to each agent's session on a daemon thread. Q1 RULED (a):
     "Information answers stay unsigned and are accepted only from human channels; agent-typed or relayed answers are
     refused and the item stays open." The cockpit write credential is the human gate the dispatcher has already
     passed; no second check is made here, and an authority item records nothing (it names its signing sheet)."""
@@ -653,13 +654,13 @@ def _band_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, An
     store = target.get("questions")
     if store is None:
         raise EditError("not_built", 501, "this cockpit has no question store")
-    text, seen, sid = params.get("text"), params.get("seen_through"), params.get("store_id")
-    if (set(params) != {"text", "seen_through", "store_id"} or not isinstance(text, str) or not isinstance(sid, str)
-            or not isinstance(seen, int) or isinstance(seen, bool)):
-        raise EditError("bad_request", 400, "answer with exactly {text, seen_through, store_id}")
+    text, sid, vid = params.get("text"), params.get("store_id"), params.get("view_id")
+    if (set(params) != {"text", "store_id", "view_id"} or not isinstance(text, str) or not isinstance(sid, str)
+            or not isinstance(vid, int) or isinstance(vid, bool)):
+        raise EditError("bad_request", 400, "answer with exactly {text, store_id, view_id}")
     try:
         done = band_view.answer_text(store, text, viewer=f"cockpit:{target.get('credential') or 'web'}",
-                                     channel="cockpit", seen_through=seen, store_id=sid)
+                                     channel="cockpit", store_id=sid, view_id=vid)
     except band_view.StaleBand as exc:
         raise EditError("stale_band", 409, str(exc)) from None
     except ValueError as exc:
@@ -727,7 +728,7 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              "(it authorises nothing)", "row", fields=("option", "text"), floor="C1", tier_fn=_const("C1"),
              reversible=False, fire=_question_fire, applies_to=_OPEN_QUESTION_ROW),
     VerbSpec("band_answer", "answer", "records your shorthand answers to the NEEDS YOU band and sends them to the "
-             "agents (it authorises nothing)", "create", fields=("text", "seen_through", "store_id"), floor="C1",
+             "agents (it authorises nothing)", "create", fields=("text", "store_id", "view_id"), floor="C1",
              tier_fn=_const("C1"), reversible=False, fire=_band_fire),
     VerbSpec("note_dismiss", "dismiss", "marks an agent's note read (it tells the agent nothing and authorises "
              "nothing)", "row", floor="C1", tier_fn=_const("C1"), reversible=False, fire=_note_fire,

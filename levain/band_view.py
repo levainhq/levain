@@ -389,14 +389,37 @@ def record_view(store: QuestionStore, viewer: str, seen_through: int, open_list:
             raise
 
 
-def last_view(store: QuestionStore, viewer: str) -> View | None:
-    """``viewer``'s newest view (the greatest render generation), or ``None`` (never shown a band, or no views table
-    yet)."""
+_NEWEST_VIEW = "SELECT seq, seen_through, open_list, store_id FROM band_views WHERE viewer = ? ORDER BY gen DESC, seq DESC LIMIT 1"
+
+
+def _newest_view(store: QuestionStore, viewer: str) -> tuple[View, int] | None:
+    """``viewer``'s newest view (the greatest render generation) with its row id (``band_views.seq``, the VIEW ID a
+    surface's answer names: append-only and never reused, so a different view is always a different id), or
+    ``None`` (never shown a band, or no views table yet)."""
     with store._peek() as conn:
         if conn is None or "band_views" not in _tables(conn):
             return None
-        row = conn.execute("SELECT seen_through, open_list, store_id FROM band_views WHERE viewer = ? "
-                           "ORDER BY gen DESC, seq DESC LIMIT 1", (viewer,)).fetchone()
+        row = conn.execute(_NEWEST_VIEW, (viewer,)).fetchone()
+    if row is None:
+        return None
+    return View(int(row[1]), tuple(int(n) for n in json.loads(row[2])), row[3]), int(row[0])
+
+
+def last_view(store: QuestionStore, viewer: str) -> View | None:
+    """``viewer``'s newest view (the greatest render generation), or ``None`` (never shown a band, or no views table
+    yet)."""
+    got = _newest_view(store, viewer)
+    return got[0] if got is not None else None
+
+
+def _view_by_id(store: QuestionStore, viewer: str, view_id: int) -> View | None:
+    """The view ``view_id`` names, if it is one of ``viewer``'s; ``None`` otherwise. Whether it is still the viewer's
+    newest is not decided here: :func:`answer_text` decides that inside its write (:func:`_still_newest`)."""
+    with store._peek() as conn:
+        if conn is None or "band_views" not in _tables(conn):
+            return None
+        row = conn.execute("SELECT seen_through, open_list, store_id FROM band_views WHERE viewer = ? AND seq = ?",
+                           (viewer, view_id)).fetchone()
     if row is None:
         return None
     return View(int(row[0]), tuple(int(n) for n in json.loads(row[1])), row[2])
@@ -460,7 +483,12 @@ def _info_of_extra(e: Extra) -> ItemInfo:
 def plan_for_full(store: QuestionStore, viewer: str, text: str
                   ) -> tuple[Parse, View | None, dict[int, Question], dict[int, Extra]]:
     """:func:`plan_for` plus the authority items (open now) the view's numbers name."""
-    view = last_view(store, viewer)
+    return _plan_on(store, last_view(store, viewer), text)
+
+
+def _plan_on(store: QuestionStore, view: View | None, text: str
+             ) -> tuple[Parse, View | None, dict[int, Question], dict[int, Extra]]:
+    """The parser's plan for ``text`` bound to ``view``, with the questions and authority items its numbers name."""
     questions = _items_of(store, view) if view is not None else {}
     try:
         extras, unknown = _extras_of(store, view) if view is not None else ({}, set())
@@ -507,7 +535,7 @@ class Applied(NamedTuple):
 
 def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question], *, viewer: str, via: str,
                seen_through: int, deadline: float | None = None, extras: dict[int, Extra] | None = None,
-               channel: str = "cli") -> Applied:
+               channel: str = "cli", require: Callable[[sqlite3.Connection], None] | None = None) -> Applied:
     """Record ``plan.actions`` with their ``answer_context`` sidecars (via, viewer, the view's ``seen_through``, the
     note verbatim) through ONE :meth:`QuestionStore.answer_with_context` write (``channel``: ``cli`` by default, the
     human channel a terminal or a seat's typing is; the cockpit and the phone pass their own, S5a): an answer and its
@@ -515,7 +543,10 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
     waited for until ``deadline`` (``time.monotonic()``; the hook passes its own, ``None`` the ordinary wait). An
     item closed since the view, or refused by the store, is refused for that item alone; the lock busy at the
     deadline (or any store failure) records nothing and refuses each item. It never raises once it is called:
-    the echo it returns always says what was recorded.
+    the echo it returns always says what was recorded. EXCEPT a surface's answer (``require``, :func:`answer_text`):
+    ``require`` runs inside the write transaction before any answer (the write is made even with nothing to record,
+    so the check always runs), and whatever it raises, or any failure of the write itself (the lock busy, disk,
+    corruption), is RAISED with nothing recorded, so the surface answers 409 or 503, never a per-item refusal.
 
     An authority item (``plan.sheets``, D8 SIG-ONLY) records NOTHING here: its existing signing ceremony is named with
     the pick preselected (``Applied.sheets``), and only if the item is still open now: each is read again here, at
@@ -588,11 +619,13 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
         except Exception as exc:                              # one item's failure never costs the others
             refused.append(f"{act.n}: {exc}")
     ids: list[str] = []
-    if todo:
+    if todo or require is not None:
         try:
             results: list[Any] = store.answer_with_context([e for _, e in todo], channel=channel, schema=BAND_SCHEMA,
-                                                           deadline=deadline)
+                                                           deadline=deadline, require=require)
         except Exception as exc:                              # rolled back whole: nothing of it was stored
+            if require is not None:                           # a surface: 409 / 503, never a per-item refusal
+                raise
             why = ("the question store stayed busy" if isinstance(exc, sqlite3.OperationalError) and _busy(exc)
                    else f"the question store failed ({type(exc).__name__})")
             results = [ValueError(f"{why}; nothing recorded for it")] * len(todo)
@@ -638,13 +671,16 @@ def show(store: QuestionStore, viewer: str, deadline: float | None = None) -> Re
 
 
 def band_payload(store: QuestionStore, viewer: str, deadline: float | None = None) -> dict[str, Any]:
-    """What a surface lists of the band for ``viewer``: the binding an answer must carry (``seen_through``,
-    ``store_id``) and the numbered open items (``kind`` is ``information`` or ``authority``: shorthand records only
-    the first; an authority item opens its existing signing sheet). Shows the band to ``viewer`` first (:func:`show`)."""
-    r = show(store, viewer, deadline)
-    view = last_view(store, viewer)
-    if view is None:                              # no view could be stored (store absent, lock held): nothing to bind to
-        return {"seen_through": None, "store_id": None, "items": [], "note": "the band could not be recorded just now"}
+    """What a surface lists of the band for ``viewer``: the binding an answer must carry back (``store_id`` and
+    ``view_id``, the recorded view this listing is; ``seen_through`` is that view's ``band@`` mark, for display) and
+    the numbered open items (``kind`` is ``information`` or ``authority``: shorthand records only the first; an
+    authority item opens its existing signing sheet). Shows the band to ``viewer`` first (:func:`show`)."""
+    show(store, viewer, deadline)
+    got = _newest_view(store, viewer)
+    if got is None:                               # no view could be stored (store absent, lock held): nothing to bind to
+        return {"seen_through": None, "store_id": None, "view_id": None, "items": [],
+                "note": "the band could not be recorded just now"}
+    view, view_id = got
     questions = _items_of(store, view)
     try:
         extras, _unknown = _extras_of(store, view)
@@ -662,14 +698,30 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
             items.append({"n": n, "kind": "authority", "tag": e.tag, "what": e.what, "blocks": e.blocks,
                           "options": [{"letter": _LETTERS[i], "label": lab} for i, lab in enumerate(e.options)
                                       if i < len(_LETTERS)], "rec": e.rec_letter, "question": None})
-    return {"seen_through": view.seen_through, "store_id": view.store_id, "items": items, "note": ""}
+    return {"seen_through": view.seen_through, "store_id": view.store_id, "view_id": view_id, "items": items,
+            "note": ""}
 
 
 class StaleBand(ValueError):
-    """The band an answer names (``seen_through``, ``store_id``) is not the one this viewer was last shown."""
+    """The band an answer names (``store_id``, ``view_id``) is not the one this viewer was last shown."""
 
 
-def answer_text(store: QuestionStore, text: str, *, viewer: str, channel: str, seen_through: int, store_id: str,
+_STALE = "the band you answered from is not the one last shown to you; reload it and answer again (nothing was recorded)"
+
+
+def _still_newest(viewer: str, store_id: str, view_id: int) -> Callable[[sqlite3.Connection], None]:
+    """The answer's view check, run INSIDE its write transaction (``BEGIN IMMEDIATE``): the store is ``store_id`` and
+    ``view_id`` is still ``viewer``'s newest view. A view recorded after the answer was planned (a concurrent poll,
+    another tab) makes the answer stale; it can never bind to a view the viewer was not answering from."""
+    def check(conn: sqlite3.Connection) -> None:
+        sid = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
+        top = conn.execute(_NEWEST_VIEW, (viewer,)).fetchone()
+        if sid is None or sid[0] != store_id or top is None or int(top[0]) != view_id:
+            raise StaleBand(_STALE)
+    return check
+
+
+def answer_text(store: QuestionStore, text: str, *, viewer: str, channel: str, store_id: str, view_id: int,
                 deadline: float | None = None) -> Applied:
     """Record the shorthand ``text`` as an answer from a human surface (``channel`` is ``cockpit`` or ``phone``, the
     viewer ``cockpit:<credential>`` / ``phone:<device>``). Q1 RULED (a): "Information answers stay unsigned and are
@@ -678,21 +730,24 @@ def answer_text(store: QuestionStore, text: str, *, viewer: str, channel: str, s
     device's), which is the human gate; this adds no second check, and an authority item records nothing (D8: it
     opens its sheet).
 
-    The answer binds to the view the viewer was last shown (D7): ``seen_through`` and ``store_id`` must be that
-    view's, else :class:`StaleBand` is raised and nothing is recorded (a view never stored, because the lock was held
-    when it was shown, is refused the same way). The whole text must parse as band answers, else ``ValueError``,
-    nothing recorded. Items refused for themselves (closed since, not open in the view) come back in
-    ``Applied.refused``."""
+    The answer binds to the view it names (D7): ``store_id`` and ``view_id`` (:func:`band_payload`). The plan is made
+    from THAT view, and the write records it only if, inside the same transaction, it is still this viewer's newest
+    view in this store (:func:`_still_newest`); else :class:`StaleBand`, nothing recorded (a view never stored,
+    because the lock was held when it was shown, names no id and is refused the same way). The whole text must parse
+    as band answers, else ``ValueError``, nothing recorded. A store failure in the write (busy past the bound, disk,
+    corruption) is raised as itself, nothing recorded: the surfaces answer 503. Items refused for themselves (closed
+    since, not open in the view) come back in ``Applied.refused``."""
     if channel not in ("cockpit", "phone"):
         raise ValueError(f"a surface answers on the cockpit or the phone, not {channel!r}")
-    plan, view, questions, extras = plan_for_full(store, viewer, text)
-    if view is None or view.store_id != store_id or view.seen_through != seen_through:
-        raise StaleBand("the band you answered from is not the one last shown to you; reload it and answer again "
-                        "(nothing was recorded)")
+    view = _view_by_id(store, viewer, view_id)
+    if view is None:                                  # no view of this viewer's to plan from; the store is checked below
+        raise StaleBand(_STALE)
+    plan, view, questions, extras = _plan_on(store, view, text)
     if not plan.matched or plan.rest.strip():
         raise ValueError(plan.hint or "the whole text must be band answers, e.g. `1a, 2: rec`; nothing was recorded")
     return apply_plan(store, plan, questions, viewer=viewer, via=channel, seen_through=view.seen_through,
-                      deadline=deadline, extras=extras, channel=channel)
+                      deadline=deadline, extras=extras, channel=channel,
+                      require=_still_newest(viewer, store_id, view_id))
 
 
 def deliver_recorded(store: QuestionStore, done: Applied) -> None:
