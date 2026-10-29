@@ -638,6 +638,43 @@ def _question_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str
     return {"answered": n, "delivery": "started"}
 
 
+def _band_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
+    """Answer the NEEDS YOU band by its shorthand (Q17-ALL S5a): ``{text, seen_through, store_id}``, recorded once per
+    item, unsigned, channel ``cockpit``, viewer ``cockpit:<credential>``, bound to the view that viewer was last shown
+    (:func:`levain.band_view.answer_text`), then delivered to each agent's session on a daemon thread. Q1 RULED (a):
+    "Information answers stay unsigned and are accepted only from human channels; agent-typed or relayed answers are
+    refused and the item stays open." The cockpit write credential is the human gate the dispatcher has already
+    passed; no second check is made here, and an authority item records nothing (it names its signing sheet)."""
+    import threading
+
+    from levain import band_view
+    from levain.consent.questions import QuestionStoreError
+
+    store = target.get("questions")
+    if store is None:
+        raise EditError("not_built", 501, "this cockpit has no question store")
+    text, seen, sid = params.get("text"), params.get("seen_through"), params.get("store_id")
+    if (set(params) != {"text", "seen_through", "store_id"} or not isinstance(text, str) or not isinstance(sid, str)
+            or not isinstance(seen, int) or isinstance(seen, bool)):
+        raise EditError("bad_request", 400, "answer with exactly {text, seen_through, store_id}")
+    try:
+        done = band_view.answer_text(store, text, viewer=f"cockpit:{target.get('credential') or 'web'}",
+                                     channel="cockpit", seen_through=seen, store_id=sid)
+    except band_view.StaleBand as exc:
+        raise EditError("stale_band", 409, str(exc)) from None
+    except ValueError as exc:
+        raise EditError("answer_refused", 422, str(exc)) from None
+    except (QuestionStoreError, OSError, sqlite3.Error) as exc:
+        raise EditError("source_unavailable", 503, f"the question store cannot answer now: {exc}") from None
+    if not done.recorded and not done.sheets:
+        raise EditError("answer_refused", 422, "; ".join(done.refused) or "nothing was recorded")
+    if done.answered:
+        threading.Thread(target=band_view.deliver_recorded, args=(store, done), name="levain-answer-delivery",
+                         daemon=True).start()
+    return {"recorded": done.recorded, "refused": done.refused, "sheets": list(done.sheets), "echo": done.echo,
+            "delivery": "started" if done.answered else "none"}
+
+
 def _resolve_kinds(direction: str) -> Callable[[dict[str, Any]], dict[str, list[Any]]]:
     """The ``spore_kind`` values anneal takes for this row's type, so a renderer offers only those."""
     def options(row: dict[str, Any]) -> dict[str, list[Any]]:
@@ -689,6 +726,9 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("question_answer", "answer", "records your answer to an agent's question and sends it to the agent "
              "(it authorises nothing)", "row", fields=("option", "text"), floor="C1", tier_fn=_const("C1"),
              reversible=False, fire=_question_fire, applies_to=_OPEN_QUESTION_ROW),
+    VerbSpec("band_answer", "answer", "records your shorthand answers to the NEEDS YOU band and sends them to the "
+             "agents (it authorises nothing)", "create", fields=("text", "seen_through", "store_id"), floor="C1",
+             tier_fn=_const("C1"), reversible=False, fire=_band_fire),
     VerbSpec("note_dismiss", "dismiss", "marks an agent's note read (it tells the agent nothing and authorises "
              "nothing)", "row", floor="C1", tier_fn=_const("C1"), reversible=False, fire=_note_fire,
              applies_to=_OPEN_NOTE_ROW),
@@ -1156,6 +1196,8 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     target: dict[str, Any] = {"panel_id": panel_id, "row_id": req.get("row_id"), "row": row,
                               "source": _SURFACE_SOURCE.get(str(credential.get("name")), "web"),
                               "questions": cockpit.question_store, "notes": getattr(cockpit, "note_store", None),
+                              # the credential's name: the viewer a band answer binds to (``cockpit:<name>``)
+                              "credential": str(credential.get("name") or ""),
                               # whether the request came from a paired device, asked of that device's store (a review
                               # verb writes only for one), and where the coordinator store is (the directory the review
                               # panel reads)

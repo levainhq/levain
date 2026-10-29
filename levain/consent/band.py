@@ -259,8 +259,14 @@ def _send_ping(agent: str, q: Question, qdir: Path, extra: str = "") -> bool:
     try:
         adapter = _agents()[agent]
         send = getattr(adapter, "notify", _agents()["claude_code"].notify)   # Codex shares Claude Code's notify seam
-        return bool(send(adapter.load_settings(qdir), _ping_text(agent, q, qdir) + extra, cwd=qdir, kind="question",
-                         ref=f"question:{q.n}"))
+        # The ping is the first time the operator sees the item, so it numbers it (Q17-ALL D3; S5a decision B (a)):
+        # a bounded write, and a busy store or a failed write sends the old `#n` text (None).
+        from levain import band_view
+        from levain.consent.questions import QuestionStore
+
+        n = band_view.number_for_ping(QuestionStore(qdir), q.id)
+        return bool(send(adapter.load_settings(qdir), _ping_text(agent, q, qdir, n) + extra, cwd=qdir,
+                         kind="question", ref=f"question:{q.n}"))
     except Exception:  # noqa: BLE001 - see the docstring
         return False
 
@@ -353,17 +359,19 @@ def _queue_dir(args: argparse.Namespace) -> Path:
     return args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
 
 
-def _ping_text(agent: str, q: Question, qdir: Path) -> str:
-    """The ping: its first line says who asks what in plain words (a lock screen shows only that). The answer
-    command names the store's directory unless it is the default one, so it answers this question, not another
-    store's question of the same number."""
+def _ping_text(agent: str, q: Question, qdir: Path, band_n: int | None = None) -> str:
+    """The ping: its first line says who asks what in plain words (a lock screen shows only that), with the band
+    number first when it has one (``band_n``; the source tag ``question #n`` stays). The answer command names the
+    store's directory unless it is the default one, so it answers this question, not another store's question of
+    the same number."""
     import shlex
 
     from levain.consent.queue import default_queue_dir
 
     opts = "; ".join(f"{k}) {label}{' (rec)' if k == q.rec else ''}" for k, label in q.options)
     where = "" if Path(qdir) == default_queue_dir() else f" --queue-dir {shlex.quote(str(qdir))}"
-    return (f"levain: {agent} asks (question #{q.n}): {q.what}\nOptions: {opts}.\nBlocks: {q.blocks}.\n"
+    tag = f"band {band_n}, question #{q.n}" if band_n is not None else f"question #{q.n}"
+    return (f"levain: {agent} asks ({tag}): {q.what}\nOptions: {opts}.\nBlocks: {q.blocks}.\n"
             f"Answer: levain question answer {q.n}{where} --option <key> (or --text \"...\").")
 
 

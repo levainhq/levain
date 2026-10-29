@@ -112,6 +112,7 @@ _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")      # the cockpit's consent
 _ACTIONS = ("challenge", "answer", "rule-challenge", "rule")
 _QUESTION_ROUTE = re.compile(r"/question/([0-9]{1,12})/(answer|rule)")
 _NOTE_ROUTE = re.compile(r"/note/([0-9]{1,12})/dismiss")    # an agent's note, marked read: unsigned, delivers nothing
+_BAND_ANSWER = "/band/answer"      # the NEEDS YOU band's shorthand ("15b"), bound to the view this device was shown
 _KEY_LINE = "/passkey/key-line"
 _SIGN_PREFIX = "/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny", "attempt")
@@ -144,6 +145,12 @@ class PhoneError(Exception):
     def __init__(self, status: int, error: str, message: str, extra: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.status, self.error, self.message, self.extra = status, error, message, extra or {}
+
+
+def _band_viewer(cred: "tuple[str, str | None]") -> str:
+    """The viewer a phone credential is in the band's views (Q17-ALL D7): ``phone:<device>`` for a paired device,
+    ``phone:run`` for this run's phone link."""
+    return f"phone:{cred[1] or 'run'}"
 
 
 def _consent_route(route: str) -> "tuple[str, str] | None":
@@ -275,17 +282,17 @@ class _PhoneHandler(GuardedHandler):
                     self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
                 return
             try:
-                ok = self._token_ok()
+                cred = self._credential()
             except PhoneError as exc:
                 self._json({"error": exc.error, "message": exc.message}, exc.status, head=head)
                 return
-            if not ok:
+            if cred is None:
                 self._json({"error": "forbidden", "message": f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}"},
                            403, head=head)
                 return
             self._json(self.server.signer.state(state.group(1)) if state is not None
-                       else self.server.coord.coord_listing() if route == "/coord.json" else self.server.listing(),
-                       head=head)
+                       else self.server.coord.coord_listing() if route == "/coord.json"
+                       else self.server.listing(viewer=_band_viewer(cred)), head=head)
         except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
             self._json({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}, 500, head=head)
         finally:
@@ -423,7 +430,7 @@ class _PhoneHandler(GuardedHandler):
         coord_review = _COORD_REVIEW_ROUTE.fullmatch(route)
         grant = _grant_route(route)
         if (consent is None and sign is None and question is None and note is None and dispatch is None
-                and coord is None and coord_review is None and grant is None and route != _KEY_LINE):
+                and coord is None and coord_review is None and grant is None and route not in (_KEY_LINE, _BAND_ANSWER)):
             if not self._app_post(route):
                 self._reject(404, "not_found", "no such route")
             return
@@ -489,6 +496,8 @@ class _PhoneHandler(GuardedHandler):
                 result = self.server.question_answer(int(question.group(1)), req)
             elif note is not None:
                 result = self.server.note_dismiss(int(note.group(1)), req)
+            elif route == _BAND_ANSWER:
+                result = self.server.band_answer(req, viewer=_band_viewer(cred))
             else:
                 result = self.server.key_line(req)
         except PhoneError as exc:
@@ -667,9 +676,76 @@ class _PhoneServer(ThreadingHTTPServer):
             return [], f"no passkey is enrolled for {self.rp_id} in {root}"
         return keys, ""
 
-    def listing(self) -> dict[str, Any]:
+    def _band(self, viewer: str) -> dict[str, Any]:
+        """The NEEDS YOU band as ``viewer`` is shown it (:func:`levain.band_view.band_payload`): numbers on show, the
+        view recorded only when it changed, the ``seen_through`` and ``store_id`` an answer must carry back. A store
+        that cannot be read is a note, never a failed listing."""
+        from levain import band_view
+        from levain.consent.questions import QuestionStore
+
+        try:
+            return band_view.band_payload(QuestionStore(self.queue_dir), viewer)
+        except Exception as exc:  # noqa: BLE001 - the rest of the listing still serves
+            return {"seen_through": None, "store_id": None, "items": [], "note": f"{type(exc).__name__}: {exc}"}
+
+    def band_answer(self, req: Any, *, viewer: str) -> dict[str, Any]:
+        """``POST /band/answer`` ({text, seen_through, store_id}): the band's shorthand answered on the phone, channel
+        ``phone``, unsigned, bound to the view this device was last shown. Q1 RULED (a): "Information answers stay
+        unsigned and are accepted only from human channels; agent-typed or relayed answers are refused and the item
+        stays open." The phone token (this run's, or a paired device's) is the human gate every phone write already
+        passes before this runs; an authority item records nothing here (it names its signing sheet)."""
+        from levain import band_view
+        from levain.consent.questions import QuestionStore, QuestionStoreError
+
+        if (not isinstance(req, dict) or set(req) != {"text", "seen_through", "store_id"}
+                or not isinstance(req["text"], str) or not isinstance(req["store_id"], str)
+                or not isinstance(req["seen_through"], int) or isinstance(req["seen_through"], bool)):
+            raise PhoneError(400, "bad_request", 'send exactly {"text": words, "seen_through": n, "store_id": id}')
+        store = QuestionStore(self.queue_dir)
+        try:
+            done = band_view.answer_text(store, req["text"], viewer=viewer, channel="phone",
+                                         seen_through=req["seen_through"], store_id=req["store_id"])
+        except band_view.StaleBand as exc:
+            raise PhoneError(409, "stale_band", str(exc)) from None
+        except ValueError as exc:
+            raise PhoneError(422, "answer_refused", str(exc)) from None
+        except (QuestionStoreError, OSError, sqlite3.Error) as exc:
+            raise PhoneError(503, "unavailable", f"the question store cannot answer now: {exc}") from None
+        if not done.recorded and not done.sheets:
+            raise PhoneError(422, "answer_refused", "; ".join(done.refused) or "nothing was recorded",
+                             {"recorded": [], "refused": done.refused})
+        out: dict[str, Any] = {"recorded": done.recorded, "refused": done.refused, "sheets": list(done.sheets),
+                               "echo": done.echo}
+        if done.answered:
+            out[_AWAIT] = self._deliver_recorded_later(store, done)
+        return out
+
+    def _deliver_recorded_later(self, store: Any, done: Any) -> Any:
+        """As :meth:`_deliver_answer_later`, for every answer a band answer recorded."""
+        from levain import band_view
+
+        finished = threading.Event()
+
+        def run() -> None:
+            try:
+                band_view.deliver_recorded(store, done)
+            finally:
+                finished.set()
+
+        threading.Thread(target=run, name="levain-answer-delivery", daemon=True).start()
+
+        def wait(timeout: float) -> dict[str, Any]:
+            if finished.wait(timeout):
+                return {"route": "attempted", "reason": "delivery ran; `levain question list --all` shows each"}
+            return {"route": "pending", "reason": "delivery is still running; the answers are recorded either way "
+                                                  "(`levain question list --all` shows them)"}
+
+        return wait
+
+    def listing(self, viewer: str | None = None) -> dict[str, Any]:
         """``GET /consent.json``: each pending request as the cockpit's consent body shows it, plus ``signers``; and
-        each undecided one with its gap, its ``gap_label`` and whether its display was ``cut``."""
+        each undecided one with its gap, its ``gap_label`` and whether its display was ``cut``. With a ``viewer`` (the
+        route passes the credential's): ``band``, the numbered NEEDS YOU band with the binding an answer carries."""
         from levain.consent.listing import UNSHOWN, entry_body, filed_input, read_listing
         from levain.consent.push_gate import PUSH_TIER, PUSH_TOOL
         from levain.consent.queue import gap_label
@@ -716,7 +792,8 @@ class _PhoneServer(ThreadingHTTPServer):
             sign_pending, sign_overflow = page["rows"], page["overflow"]
         dispatch_pending, dispatch_note, dispatch_overflow = self.dispatch.pending()
         notes, notes_overflow, notes_note = self._notes()
-        return {"rp_id": self.rp_id, "questions": questions, "questions_overflow": questions_overflow,
+        band = {} if viewer is None else {"band": self._band(viewer)}
+        return {**band, "rp_id": self.rp_id, "questions": questions, "questions_overflow": questions_overflow,
                 "questions_note": questions_note, "notes": notes, "notes_overflow": notes_overflow,
                 "notes_note": notes_note,
                 "pending": rows, "undecided": undecided, "overflow": listing.overflow,

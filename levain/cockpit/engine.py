@@ -142,6 +142,7 @@ KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "
 QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
 QUESTION_DONE_HOURS = 24                # an answered question stays listed this long, as a decided request does
 NOTE_VERB = "note_dismiss"              # the cockpit verb a note row offers (verbs.py registers it)
+BAND_VERB = "band_answer"               # the cockpit verb that answers the NEEDS YOU band by its shorthand (verbs.py)
 
 
 def _canon(obj: Any) -> bytes:
@@ -828,7 +829,7 @@ class Cockpit:
             rowset=src.rowset if src else None, edit_class=src.edit_class if src else "",
             # question_answer applies to a question row only (VerbSpec.applies_to), so a downstream row never gets it
             verbs=tuple(dict.fromkeys((*(src.verbs if src else ()),
-                                       *((QUESTION_VERB,) if self._dec.questions is not None else ()),
+                                       *((QUESTION_VERB, BAND_VERB) if self._dec.questions is not None else ()),
                                        *((NOTE_VERB,) if self._dec.notes is not None else ())))),
             label_key=src.label_key if src else None)
         old = self._dec.spec

@@ -345,17 +345,26 @@ def _store_id_of(store: QuestionStore) -> str | None:
 
 
 def record_view(store: QuestionStore, viewer: str, seen_through: int, open_list: list[int],
-                deadline: float | None = None, gen: int | None = None, block: str | None = None) -> None:
+                deadline: float | None = None, gen: int | None = None, block: str | None = None,
+                dedupe: bool = False) -> None:
     """Store what ``viewer`` was just shown (D7), in one bounded write (by ``deadline``, ``time.monotonic()``; the hook
     passes its own start + the bound, so a busy store costs the hook one bound in all). ``gen``: the render's
     generation (:class:`Rendered`; default now); the viewer's last view is the greatest gen, so a render committed
     late never replaces a newer one. A view with nothing open is not written when the viewer's last view already had
     nothing open (no row per empty prompt). A busy lock records nothing (the viewer's next answer is then refused
     as bound to an older view or to none: safe, never wrong). ``block``: the rendered band text of the view, kept
-    (same transaction) for the Stop verifier."""
+    (same transaction) for the Stop verifier. ``dedupe`` (a polling surface, :func:`show`; S5a decision A (c)): the
+    view is written only when the viewer's last one differs in open list or high-water mark, so a poll loop adds no
+    row, and an unchanged view takes no write lock at all (decided on a read-only snapshot; two pollers racing may
+    each write one equal row, which is harmless)."""
     sid = _store_id_of(store)
     if sid is None:
         return
+    if dedupe:
+        last = last_view(store, viewer)
+        if (last is not None and last.store_id == sid and list(last.open_list) == sorted(open_list)
+                and last.seen_through == int(seen_through)):
+            return
     gen = int(gen if gen is not None else time.time_ns())
     try:
         with store._write_by(deadline if deadline is not None else time.monotonic() + HOOK_BUSY_MS / 1000) as conn:
@@ -493,13 +502,16 @@ class Applied(NamedTuple):
     refused: list[str]
     echo: str
     sheets: tuple[str, ...] = ()
+    answered: tuple[str, ...] = ()      # the ids of the questions recorded (what a delivery is asked for)
 
 
 def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question], *, viewer: str, via: str,
-               seen_through: int, deadline: float | None = None, extras: dict[int, Extra] | None = None) -> Applied:
+               seen_through: int, deadline: float | None = None, extras: dict[int, Extra] | None = None,
+               channel: str = "cli") -> Applied:
     """Record ``plan.actions`` with their ``answer_context`` sidecars (via, viewer, the view's ``seen_through``, the
-    note verbatim) through ONE :meth:`QuestionStore.answer_with_context` write (channel ``cli``, the human channel a
-    terminal or a seat's typing is): an answer and its context are stored together or not at all, and the lock is
+    note verbatim) through ONE :meth:`QuestionStore.answer_with_context` write (``channel``: ``cli`` by default, the
+    human channel a terminal or a seat's typing is; the cockpit and the phone pass their own, S5a): an answer and its
+    context are stored together or not at all, and the lock is
     waited for until ``deadline`` (``time.monotonic()``; the hook passes its own, ``None`` the ordinary wait). An
     item closed since the view, or refused by the store, is refused for that item alone; the lock busy at the
     deadline (or any store failure) records nothing and refuses each item. It never raises once it is called:
@@ -575,24 +587,26 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
             todo.append((act, entry))
         except Exception as exc:                              # one item's failure never costs the others
             refused.append(f"{act.n}: {exc}")
+    ids: list[str] = []
     if todo:
         try:
-            results: list[Any] = store.answer_with_context([e for _, e in todo], channel="cli", schema=BAND_SCHEMA,
+            results: list[Any] = store.answer_with_context([e for _, e in todo], channel=channel, schema=BAND_SCHEMA,
                                                            deadline=deadline)
         except Exception as exc:                              # rolled back whole: nothing of it was stored
             why = ("the question store stayed busy" if isinstance(exc, sqlite3.OperationalError) and _busy(exc)
                    else f"the question store failed ({type(exc).__name__})")
             results = [ValueError(f"{why}; nothing recorded for it")] * len(todo)
-        for (act, _), res in zip(todo, results):
+        for (act, entry), res in zip(todo, results):
             if isinstance(res, Exception):
                 refused.append(f"{act.n}: {res}")
             else:
                 recorded.append(act.label)
+                ids.append(entry["ref"])
     try:
         echo = format_echo(recorded, refused, via, plan.hint, sheets)
     except Exception:                                         # what was recorded is said, whatever the formatting
         echo = "[Levain band answer] recorded: " + (", ".join(recorded) or "nothing")
-    return Applied(recorded, refused, echo, tuple(sheets))
+    return Applied(recorded, refused, echo, tuple(sheets), tuple(ids))
 
 
 def format_echo(recorded: list[str], refused: list[str], via: str, hint: str | None = None,
@@ -610,6 +624,98 @@ def format_echo(recorded: list[str], refused: list[str], via: str, hint: str | N
     if sheets:
         line += "; signature needed, nothing recorded (the item closes only when your signature verifies): " + "; ".join(sheets)
     return line
+
+
+# --- S5a: the human surfaces (the cockpit and the phone) ---------------------------------------------------------------
+def show(store: QuestionStore, viewer: str, deadline: float | None = None) -> Rendered:
+    """A surface shows ``viewer`` the band (Q17-ALL S5a, decision A (c)): every open item is numbered on show (D3, the
+    bounded write ``render_full`` already does), and the viewer's view is recorded only when its open list or
+    high-water mark differs from its last one (:func:`record_view` ``dedupe``), so a poll loop grows nothing. An answer
+    from this viewer binds to this view (D7). The Board is a status look, not an answer surface: it never calls this."""
+    r = render_full(store, deadline=deadline)
+    record_view(store, viewer, r.hwm, r.shown, deadline=deadline, gen=r.gen, dedupe=True)
+    return r
+
+
+def band_payload(store: QuestionStore, viewer: str, deadline: float | None = None) -> dict[str, Any]:
+    """What a surface lists of the band for ``viewer``: the binding an answer must carry (``seen_through``,
+    ``store_id``) and the numbered open items (``kind`` is ``information`` or ``authority``: shorthand records only
+    the first; an authority item opens its existing signing sheet). Shows the band to ``viewer`` first (:func:`show`)."""
+    r = show(store, viewer, deadline)
+    view = last_view(store, viewer)
+    if view is None:                              # no view could be stored (store absent, lock held): nothing to bind to
+        return {"seen_through": None, "store_id": None, "items": [], "note": "the band could not be recorded just now"}
+    questions = _items_of(store, view)
+    try:
+        extras, _unknown = _extras_of(store, view)
+    except Exception:  # noqa: BLE001 - the questions still list; the authority items are then simply not listed
+        extras = {}
+    items: list[dict[str, Any]] = []
+    for n in view.open_list:
+        q, e = questions.get(n), extras.get(n)
+        if q is not None and q.answer is None:
+            info = _info_of(q)
+            items.append({"n": n, "kind": info.kind, "tag": _tag(q), "what": q.what, "blocks": q.blocks,
+                          "options": [{"letter": _LETTERS[i], "label": lab} for i, (_, lab) in enumerate(q.options)
+                                      if i < len(_LETTERS)], "rec": info.rec_letter, "question": q.n})
+        elif e is not None:
+            items.append({"n": n, "kind": "authority", "tag": e.tag, "what": e.what, "blocks": e.blocks,
+                          "options": [{"letter": _LETTERS[i], "label": lab} for i, lab in enumerate(e.options)
+                                      if i < len(_LETTERS)], "rec": e.rec_letter, "question": None})
+    return {"seen_through": view.seen_through, "store_id": view.store_id, "items": items, "note": ""}
+
+
+class StaleBand(ValueError):
+    """The band an answer names (``seen_through``, ``store_id``) is not the one this viewer was last shown."""
+
+
+def answer_text(store: QuestionStore, text: str, *, viewer: str, channel: str, seen_through: int, store_id: str,
+                deadline: float | None = None) -> Applied:
+    """Record the shorthand ``text`` as an answer from a human surface (``channel`` is ``cockpit`` or ``phone``, the
+    viewer ``cockpit:<credential>`` / ``phone:<device>``). Q1 RULED (a): "Information answers stay unsigned and are
+    accepted only from human channels; agent-typed or relayed answers are refused and the item stays open." The
+    surfaces call this only behind their own credential (the cockpit write token, the phone token or a paired
+    device's), which is the human gate; this adds no second check, and an authority item records nothing (D8: it
+    opens its sheet).
+
+    The answer binds to the view the viewer was last shown (D7): ``seen_through`` and ``store_id`` must be that
+    view's, else :class:`StaleBand` is raised and nothing is recorded (a view never stored, because the lock was held
+    when it was shown, is refused the same way). The whole text must parse as band answers, else ``ValueError``,
+    nothing recorded. Items refused for themselves (closed since, not open in the view) come back in
+    ``Applied.refused``."""
+    if channel not in ("cockpit", "phone"):
+        raise ValueError(f"a surface answers on the cockpit or the phone, not {channel!r}")
+    plan, view, questions, extras = plan_for_full(store, viewer, text)
+    if view is None or view.store_id != store_id or view.seen_through != seen_through:
+        raise StaleBand("the band you answered from is not the one last shown to you; reload it and answer again "
+                        "(nothing was recorded)")
+    if not plan.matched or plan.rest.strip():
+        raise ValueError(plan.hint or "the whole text must be band answers, e.g. `1a, 2: rec`; nothing was recorded")
+    return apply_plan(store, plan, questions, viewer=viewer, via=channel, seen_through=view.seen_through,
+                      deadline=deadline, extras=extras, channel=channel)
+
+
+def deliver_recorded(store: QuestionStore, done: Applied) -> None:
+    """Deliver each answer ``done`` recorded to its agent's session, one after another (a daemon thread's body: a
+    resume settles in seconds). A delivery error never undoes the answer: ``levain question deliver`` retries it."""
+    from levain.consent import band
+
+    for qid in done.answered:
+        try:
+            band.deliver_answer(store, qid)
+        except Exception:  # noqa: BLE001 - the answer stands
+            pass
+
+
+def number_for_ping(store: QuestionStore, question_id: str) -> int | None:
+    """The band number of question ``question_id``, allocated now if it has none (D3, decision B (a): the ping is
+    the first time the operator sees the item, so it is a show), in one write bounded by HOOK_BUSY_MS. ``None`` when
+    the lock stays busy or the write fails: the ping then carries the old ``#n`` text, and the number is taken at
+    the next show. Never raises."""
+    try:
+        return _number(store, [question_id], time.monotonic() + HOOK_BUSY_MS / 1000).get(question_id)
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None
 
 
 def _is_relay(prompt: str, environ: Mapping[str, str]) -> bool:

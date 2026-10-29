@@ -122,7 +122,7 @@ def test_ask_pings_through_the_agents_notify_seam(tmp_path, monkeypatch):
                       "the merge", "--queue-dir", str(tmp_path / "consent")], monkeypatch,
                      env={"CLAUDE_CODE_SESSION_ID": SESSION})
     assert code == 0 and "was pinged" in out
-    assert sent[0].splitlines()[0] == "levain: claude_code asks (question #1): merge?"
+    assert sent[0].splitlines()[0] == "levain: claude_code asks (band 1, question #1): merge?"
     assert "a) yes (rec)" in sent[0]
 
 

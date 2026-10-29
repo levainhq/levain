@@ -101,7 +101,7 @@ def test_an_unread_question_pings_after_ten_minutes_once_and_waits_on_you(desk):
     assert band.release_held_pings(desk.dir) == [] and desk.sent == []
     desk.later(seconds=1)
     assert band.release_held_pings(desk.dir) == [f"question #{q.n} (unread): the operator was pinged"]
-    assert len(desk.sent) == 1 and desk.sent[0].splitlines()[0] == f"levain: claude_code asks (question #{q.n}): " \
+    assert len(desk.sent) == 1 and desk.sent[0].splitlines()[0] == f"levain: claude_code asks (band 1, question #{q.n}): " \
                                                                       f"{q.what}"
     assert "has not read it in 10 minutes" in desk.sent[0]
     waiting = review.waiting_on_you(desk.store, sign_open=lambda _r: None,
