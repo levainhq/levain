@@ -79,6 +79,10 @@ _FIELD_MAX = 500
 _PAGE = 100
 _MAX_PAGES = 20
 _PUSH_KINDS = ("sign", "answer")
+#: the rec a record carries when nobody advised on it (the delivery pass files a raw gate request's SIGN this way): it
+#: renders as ``rec: none (authority item)`` on the band
+NO_REC = "none (authority item)"
+_REC_MAX = 500
 _REF_STORE = {"sign": "queue.db", "answer": "questions.db"}
 
 # review_events as this levain makes it: a store made before R4 holds the first six columns and the narrower mode CHECK,
@@ -521,15 +525,25 @@ class _Held(Exception):
     """Raised inside the ANSWER write when the first reader holds the question: nothing is written."""
 
 
+def _rec(kind: str, rec: object) -> str:
+    """The rec a SIGN or ANSWER body must carry (Q17-ALL D11): the coordinator's advice on what the operator should
+    pick, or :data:`NO_REC` when nobody advised. A body without one is refused."""
+    if not isinstance(rec, str) or not rec.strip() or len(rec) > _REC_MAX:
+        raise CoordError(f"a {kind.upper()} must carry the coordinator's rec (1 to {_REC_MAX} characters, e.g. "
+                         f"'a: tests green, the envelope names main'; {NO_REC!r} when there is none): "
+                         "every band item shows a rec")
+    return rec.strip()
+
+
 def _push(store: CoordStore, kind: str, thread_id: str | None, ref_id: str, text: str, extra: Mapping[str, Any],
           by: str, token: object, still_open: Callable[[str], bool | None] | None,
-          unless_held: bool = False) -> tuple[str, bool]:
+          unless_held: bool = False, rec: str | None = None) -> tuple[str, bool]:
     if kind not in _PUSH_KINDS:
         raise CoordError("a push record is a sign or an answer")
     if by not in ACTORS:
         raise CoordError(f"a record is written by one of {', '.join(ACTORS)}")
     ref = _text("a reference", ref_id, 200)
-    body = {"text": _text("the text", text), **extra}
+    body = {"text": _text("the text", text), "rec": _rec(kind, rec), **extra}
     onto = extra.get("onto")
     land = kind == "sign" and onto is not None and thread_id is not None
     closed: dict[str, bool | None] = {}
@@ -571,29 +585,32 @@ def _land_refs(conn: sqlite3.Connection, thread_id: str | None, onto: object) ->
         (thread_id,)).fetchall() if json.loads(old_body).get("onto") == onto]
 
 
-def push_sign(store: CoordStore, thread_id: str | None, request_id: str, text: str, *, onto: str | None = None,
-              by: str = "service", token: object = None,
+def push_sign(store: CoordStore, thread_id: str | None, request_id: str, text: str, *, rec: str | None = None,
+              onto: str | None = None, by: str = "service", token: object = None,
               still_open: Callable[[str], bool | None] | None = None) -> tuple[str, bool]:
-    """Record a SIGN: a pointer to the consent-queue request ``request_id``. ``(reply_id, created)``; the same request
+    """Record a SIGN: a pointer to the consent-queue request ``request_id``. ``rec`` is REQUIRED (D11): the
+    coordinator's advice, or :data:`NO_REC`; a body without one is refused. ``(reply_id, created)``; the same request
     again returns the first record. With ``onto`` and a ``thread_id``, a second land SIGN for the same (thread, onto) needs
     ``still_open`` (a request id -> open?) and is refused unless it says an explicit ``False`` for every earlier one."""
     extra: dict[str, Any] = {} if onto is None else {"onto": _text("onto", onto, 200)}
-    return _push(store, "sign", thread_id, request_id, text, extra, by, token, still_open)
+    return _push(store, "sign", thread_id, request_id, text, extra, by, token, still_open, rec=rec)
 
 
-def push_answer(store: CoordStore, thread_id: str | None, question_id: str, text: str, *, by: str = "service",
-                token: object = None) -> tuple[str, bool]:
-    """Record an ANSWER: a pointer to the question ``question_id`` in ``questions.db``. It authorises nothing."""
-    return _push(store, "answer", thread_id, question_id, text, {}, by, token, None)
+def push_answer(store: CoordStore, thread_id: str | None, question_id: str, text: str, *, rec: str | None = None,
+                by: str = "service", token: object = None) -> tuple[str, bool]:
+    """Record an ANSWER: a pointer to the question ``question_id`` in ``questions.db``. It authorises nothing. ``rec``
+    is REQUIRED (D11), as for :func:`push_sign`."""
+    return _push(store, "answer", thread_id, question_id, text, {}, by, token, None, rec=rec)
 
 
 def push_answer_unless_held(store: CoordStore, thread_id: str | None, question_id: str, text: str, *,
-                            by: str = "service", token: object = None) -> tuple[str, bool] | None:
+                            rec: str | None = None, by: str = "service",
+                            token: object = None) -> tuple[str, bool] | None:
     """:func:`push_answer` for the delivery pass: the first-reader check is made INSIDE the write transaction that
     inserts the record, and ``hold_ping`` (``first_reader``) declines a hold once the record exists. Whichever writes
     first decides; the loser is a no-op. None when the first reader holds the question (nothing written)."""
     try:
-        return _push(store, "answer", thread_id, question_id, text, {}, by, token, None, unless_held=True)
+        return _push(store, "answer", thread_id, question_id, text, {}, by, token, None, unless_held=True, rec=rec)
     except _Held:
         return None
 
@@ -620,12 +637,13 @@ def file_know(store: CoordStore, thread_id: str | None, text: str, *, by: str = 
 
 
 # --- waiting on you (derived, never stored; C0 §2) ---------------------------------------------------------------
-def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] | None = None
-                       ) -> Callable[[str], bool | None]:
+def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] | None = None,
+                       conn: sqlite3.Connection | None = None) -> Callable[[str], bool | None]:
     """A request id -> open? read from ``queue.db`` with ``mode=ro``: open while ``undecided`` or ``pending`` and not past
     the queue's own expiry rule (:meth:`ConsentQueue._expiry_due`, the one the queue's read and sweep use: a hold's end
     plus ``UNDECIDED_GRACE``), closed in any other state, ``None`` when the store or the row cannot be read. A raw read:
-    this is information, and the seal on a row is the queue's own business."""
+    this is information, and the seal on a row is the queue's own business. ``conn``: a read-only connection to
+    ``queue.db`` the caller holds (one snapshot for every request, its busy wait the caller's), else one per call."""
     from levain.consent.queue import ConsentQueue
 
     path = Path(queue_dir) / "queue.db"
@@ -633,15 +651,17 @@ def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] |
 
     def read(request_id: str) -> bool | None:
         try:
-            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+            c = conn if conn is not None else sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True,
+                                                              timeout=2.0)
         except (OSError, sqlite3.Error):
             return None
         try:
-            row = conn.execute("SELECT state, expires_at FROM requests WHERE id = ?", (request_id,)).fetchone()
+            row = c.execute("SELECT state, expires_at FROM requests WHERE id = ?", (request_id,)).fetchone()
         except sqlite3.Error:
             return None
         finally:
-            conn.close()
+            if c is not conn:
+                c.close()
         if row is None:
             return None
         if row[0] == "pending" and ConsentQueue._expiry_due(row[1], utc_stamp(now())):
@@ -650,16 +670,17 @@ def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] |
     return read
 
 
-def question_open(queue_dir: Path | str) -> Callable[[str], bool | None]:
+def question_open(queue_dir: Path | str, *, conn: sqlite3.Connection | None = None) -> Callable[[str], bool | None]:
     """A question id -> open? read through the band's own read-only path: open while it has no answer, ``None`` when
-    there is no such question or the store cannot be read (the record is then ``unresolved``, never dropped)."""
+    there is no such question or the store cannot be read (the record is then ``unresolved``, never dropped).
+    ``conn``: a read-only connection to ``questions.db`` the caller holds (one snapshot for every question)."""
     from levain.consent.questions import QuestionStore
 
     qs = QuestionStore(Path(queue_dir))
 
     def read(question_id: str) -> bool | None:
         try:
-            q = qs.get(question_id)
+            q = qs.get(question_id) if conn is None else QuestionStore._by_ref(conn, question_id)
         except Exception:  # noqa: BLE001 - a bad store is an unreadable record, not a crashed view
             return None
         return None if q is None else q.answer is None
@@ -670,7 +691,8 @@ def waiting_on_you(store: CoordStore, *, sign_open: Callable[[str], bool | None]
                    answer_open: Callable[[str], bool | None], conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """What waits on you, derived from the open SIGN and ANSWER records: ``{"threads": {thread_id: [records]},
     "loose": [records with no thread], "unresolved": [records whose state could not be read]}``. A record is
-    ``{"kind", "ref_id", "reply_id", "text"}``. A thread with no open record is absent. ``conn`` is the read
+    ``{"kind", "ref_id", "reply_id", "text"}``; a record whose stored body is not readable JSON is ``unresolved`` with
+    ``unreadable`` saying so, and the others are read as ever. A thread with no open record is absent. ``conn`` is the read
     transaction a caller already holds."""
     from levain.coordinator import budget
 
@@ -688,11 +710,21 @@ def waiting_on_you(store: CoordStore, *, sign_open: Callable[[str], bool | None]
             rows, extend = read(own)
     out: dict[str, Any] = {"threads": {}, "loose": [], "unresolved": []}
     for reply_id, thread_id, kind, ref_id, body, ref_store in rows:
+        try:
+            parsed = json.loads(body)
+            if not isinstance(parsed, dict):
+                raise ValueError("the body is not an object")
+        except (TypeError, ValueError, RecursionError):
+            # one record whose body cannot be read: unresolved, that record alone (never every other one lost)
+            out["unresolved"].append({"kind": kind, "ref_id": ref_id, "reply_id": reply_id, "text": "", "rec": None,
+                                      "ref_store": ref_store, "unreadable": "its body is not readable JSON"})
+            continue
         if ref_store == budget.SIGN_REF:
             state = extend[ref_id]
         else:
             state = (sign_open if kind == "sign" else answer_open)(ref_id)
-        rec = {"kind": kind, "ref_id": ref_id, "reply_id": reply_id, "text": json.loads(body).get("text", "")}
+        rec = {"kind": kind, "ref_id": ref_id, "reply_id": reply_id, "text": parsed.get("text", ""),
+               "rec": parsed.get("rec"), "ref_store": ref_store}
         if state is None:
             out["unresolved"].append(rec)
         elif state:

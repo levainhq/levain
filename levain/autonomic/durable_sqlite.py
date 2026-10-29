@@ -53,7 +53,7 @@ def rollback(conn: sqlite3.Connection) -> None:
         pass
 
 
-def _set_wal(conn: sqlite3.Connection) -> None:
+def _set_wal(conn: sqlite3.Connection, bound_s: float | None = None) -> None:
     """``PRAGMA journal_mode = WAL``, retried while SQLite answers busy, for about :data:`BUSY_WAIT_S`.
 
     Two processes making one new store, each switching it, saw this PRAGMA answer ``SQLITE_BUSY`` (``database is
@@ -68,14 +68,16 @@ def _set_wal(conn: sqlite3.Connection) -> None:
     Each pause is its step (doubling from 1 ms to 50 ms) scaled by a random factor in [0.5, 1.5). Two openers of one
     new file each block the other's switch, and with one fixed schedule they woke together and collided again, round
     after round (lane-race39 measured six rounds in one trial; on CI both calls of one trial were refused). The random
-    factor parts them, so one switches and the other then finds the file in WAL."""
+    factor parts them, so one switches and the other then finds the file in WAL. ``bound_s`` replaces
+    :data:`BUSY_WAIT_S` as the bound for a caller with less time (0: one try)."""
+    bound = BUSY_WAIT_S if bound_s is None else bound_s      # read at call time, never frozen at definition
     conn.execute("PRAGMA busy_timeout = 0")
     waited, pause = 0.0, 0.001
     while True:
         try:
             row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
         except sqlite3.OperationalError as exc:
-            if not _is_busy(exc) or waited + 1.5 * pause > BUSY_WAIT_S:
+            if not _is_busy(exc) or waited + 1.5 * pause > bound:
                 raise
         else:
             mode = row[0] if row else None
@@ -120,17 +122,20 @@ def _until_not_busy(conn: sqlite3.Connection, step: Callable[[], object]) -> obj
 
 
 def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None,
-                 needs: str = "this store") -> sqlite3.Connection:
+                 needs: str = "this store", busy_s: float | None = None) -> sqlite3.Connection:
     """A connection to ``path`` with the durability PRAGMAs applied, in autocommit mode so the caller
     owns every ``BEGIN``. Closed again if any PRAGMA fails. ``min_sqlite`` refuses an older library,
-    naming what ``needs`` it."""
+    naming what ``needs`` it. ``busy_s`` (default :data:`BUSY_WAIT_S`) bounds every wait of the open itself (the
+    WAL switch, the first read) and is the connection's busy timeout after: a caller on a deadline passes what is
+    left of it, and a lock held past it raises SQLite's own busy error."""
     if min_sqlite is not None and _library_version() < min_sqlite:
         raise RuntimeError(f"SQLite {sqlite3.sqlite_version} is older than "
                            f"{'.'.join(map(str, min_sqlite))}, which {needs} needs")
-    conn = sqlite3.connect(path, timeout=BUSY_WAIT_S, isolation_level=None)
+    wait = BUSY_WAIT_S if busy_s is None else max(0.0, min(float(busy_s), BUSY_WAIT_S))
+    conn = sqlite3.connect(path, timeout=wait, isolation_level=None)
     try:
-        _set_wal(conn)                                  # sidecars -wal/-shm stay beside the database
-        conn.execute(f"PRAGMA busy_timeout = {int(BUSY_WAIT_S * 1000)}")
+        _set_wal(conn, None if busy_s is None else wait)  # sidecars -wal/-shm stay beside the database
+        conn.execute(f"PRAGMA busy_timeout = {int(wait * 1000)}")
         # A first read, retried, so the statements after it meet a connection that has already read the database.
         # [judged by lane-limitsrace, 10-25, against wal.html: the last connection to close takes an exclusive lock
         # to delete the WAL and shared memory; not reproduced here, so whether this read is what stops that cleanup
