@@ -1,5 +1,5 @@
 """10-29 L3 (62b45ef6..680fee95) codex MEDs on levain/band_view.py: the empty transition, the Stop claim, the empty-view
-dedupe, and the reprint tail."""
+dedupe, and the reprint check (which keeps no tail rule)."""
 from __future__ import annotations
 
 import multiprocessing
@@ -130,14 +130,28 @@ def test_an_empty_view_is_still_recorded_when_a_nonempty_one_commits_between_rea
     assert band_view.last_view(store, "v").open_list == ()
 
 
-def test_reprint_must_end_the_reply(qdir, store, monkeypatch):
+def test_reprint_followed_by_a_trailing_blank_line_or_text_passes(qdir, store, monkeypatch):
     launch_rows(monkeypatch)
     e = env(qdir)
     ask(store)
     band = deliver("s1", e)
-    assert band_view.hook_stop({"session_id": "s1", "last_assistant_message": f"done\n\n{band}"}, e) is None
-    assert band_view.hook_stop({"session_id": "s2", "last_assistant_message": "x"}, e) is None   # never shown
+    assert band_view.hook_stop({"session_id": "s1", "last_assistant_message": f"done\n\n{band}\n\n"}, e) is None
     deliver("s3", e)
-    assert band_view.hook_stop({"session_id": "s3", "last_assistant_message": f"{band}\nand more text"}, e) is not None
-    view = SimpleNamespace(open_list=(1,), seen_through=1)
-    assert band_view._reprint_check(view, None, "band@1\n1. a\ntrailing") == ([], True)
+    assert band_view.hook_stop({"session_id": "s3", "last_assistant_message": f"{band}\nand more text"}, e) is None
+
+
+def test_legacy_view_whose_last_item_has_sublines_passes():
+    view = SimpleNamespace(open_list=(1, 2), seen_through=2)
+    msg = "band@2\n1. a\n2. b\n    a) opt\n    ! not read\n"
+    assert band_view._reprint_check(view, None, msg) == ([], False)
+
+
+def test_legacy_reprint_in_a_different_item_order_passes():
+    view = SimpleNamespace(open_list=(1, 2), seen_through=2)
+    assert band_view._reprint_check(view, None, "band@2\n2. b\n1. a") == ([], False)
+
+
+def test_claim_of_a_newer_generation_never_frees_an_older_one(qdir):
+    assert band_view._claim_retry(qdir, "v", 7) is True
+    assert band_view._claim_retry(qdir, "v", 8) is True
+    assert band_view._claim_retry(qdir, "v", 7) is False          # no inline pruning: gen 7's claim still stands

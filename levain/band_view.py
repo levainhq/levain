@@ -828,12 +828,6 @@ def _claim_retry(directory: Path | str, viewer: str, gen: int) -> bool:
             os.close(os.open(f, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
         except FileExistsError:
             return False
-        try:                                    # best effort: older generations of this viewer are spent
-            for old in f.parent.glob(f"{_claim_file(directory, viewer).name}.*"):
-                if old.name != f.name and old.name.rsplit(".", 1)[-1].isdigit() and int(old.name.rsplit(".", 1)[-1]) < int(gen):
-                    old.unlink(missing_ok=True)
-        except Exception:
-            pass
         return True
     except Exception:
         return False
@@ -862,13 +856,11 @@ def _reprint_check(view: View, block: str | None, message: str) -> tuple[list[in
         for i, ln in enumerate(lines):
             if ln != want[0]:
                 continue
-            if lines[i + 1:i + len(want)] == want[1:] and i + len(want) == len(lines):
-                return [], False                # the contiguous band ends the reply: nothing after it
+            if lines[i + 1:i + len(want)] == want[1:]:
+                return [], False
         return missing, True
     missing = [n for n in view.open_list if not any(re.match(rf"{n}\.(\s|$)", ln) for ln in lines)]
     head = not re.search(rf"band@{view.seen_through}(?!\d)", message)
-    if not missing and not head and view.open_list and not re.match(rf"{max(view.open_list)}\.(\s|$)", lines[-1]):
-        head = True                             # legacy: the last item line must end the reply too
     return missing, head
 
 
