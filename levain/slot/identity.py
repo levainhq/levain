@@ -20,8 +20,9 @@ baseline ``confirm-identity yes`` writes.
   baseline from :func:`read_slot_baseline`): the answer is recorded in the state record's ``identity`` and compared
   with the baseline's ``observed_id``; a difference refuses ``identity-changed``.
 
-* A Claude pin (:func:`read_slot_pin`, :func:`write_slot_pin`) records the exact credential bytes the server last
-  vouched for as the baseline account, so an unchanged parked login passes with no call (``pinned``).
+* Claude's child refreshes the stored login once before it asks the profile (PIN_REFRESH_DESIGN), so the account it
+  names is the one the file's own refresh token belongs to. A refresh the server refuses as a dead login is
+  ``identity-expired``; one that did not reach an answer is ``identity-unreachable`` (:func:`parse_profile_answer`).
 
 The baseline file is root's, 0600, replaced atomically (temp, fsync, rename, directory fsync). :func:`baseline_vendor`
 reads it, and also the earlier vendor-only shape with no ``format`` key.
@@ -34,7 +35,6 @@ import stat
 from typing import Callable, Dict, Mapping, Optional
 
 from levain.contracts import ContractError, canon
-from levain.contracts.grammar import JSON_INT_MAX
 from levain.slot import Refused
 from levain.slot import records as R
 from levain.slot import runtime_helper as H
@@ -93,27 +93,57 @@ def identity_call(ctx: Optional[H.Ctx], vendor: str, a: Optional[R.Alloc] = None
     return oid
 
 
+_OAUTH_WORD_RE = re.compile(r"[a-z_]{1,40}", re.ASCII)
+#: the child's fixed names for a refresh with no usable answer (``identity_child``): words, never a status or a token.
+_FIXED_NAME_RE = re.compile(r"[a-z\-]{1,32}", re.ASCII)
+
 #: §7.6: root reads at most this much of the identity call's stdout.
 PROFILE_ANSWER_MAX = 64 * 1024
 
 
 def parse_profile_answer(exit_code: int, out: bytes) -> str:
-    """IG-3: root's judgement of :mod:`levain.slot.identity_child`'s line. The observed id is the profile's
-    ``account.uuid`` when the child exited 0, its line is within :data:`PROFILE_ANSWER_MAX`, the server answered 200
-    and the body is JSON holding a uuid that fits ``OBSERVED_ID_RE``; anything else is ``identity-unparsable``."""
+    """IG-3 / PIN_REFRESH_DESIGN §4: root's judgement of :mod:`levain.slot.identity_child`'s line. The observed id is the
+    profile's ``account.uuid`` when the child exited 0, its line is within :data:`PROFILE_ANSWER_MAX`, the refresh (when
+    the line carries one) answered 200, the profile answered 200 and the body is JSON holding a uuid that fits
+    ``OBSERVED_ID_RE``. A refresh outcome is judged first, whatever the exit code:
+
+    * ``identity-expired``: the refresh answered 400 with the OAuth word ``invalid_grant``, or 401/403 with an OAuth
+      word at all; or the refresh was 200 and the profile 401/403.
+    * ``identity-unreachable``: every other refresh that did not answer 200 (a fixed name instead of a status, 429,
+      5xx, a 403 with no OAuth word, any other 4xx, a status other than 200 that is not an error). Both fail closed.
+
+    A line without a ``refresh`` key is a profile-only answer (judged as before); anything else is
+    ``identity-unparsable``."""
     import json
 
     def bad(why: str) -> Refused:
         return Refused("identity-unparsable", why)
 
-    if exit_code != 0:
-        raise bad(f"identity call exit {exit_code}")
     if len(out) > PROFILE_ANSWER_MAX:
         raise bad("answer over 64 KiB")
     try:
         ans = json.loads(out.decode("utf-8"))
     except (ValueError, RecursionError):      # UnicodeDecodeError is a ValueError
+        if exit_code != 0:
+            raise bad(f"identity call exit {exit_code}") from None
         raise bad("answer is not JSON") from None
+    if type(ans) is dict and "refresh" in ans:
+        ref = ans["refresh"]
+        word = ans.get("oauth_error")
+        word = word if type(word) is str and _OAUTH_WORD_RE.fullmatch(word) else None
+        if type(ref) is str:
+            if not _FIXED_NAME_RE.fullmatch(ref):
+                raise bad("refresh name")
+            raise Refused(UNREACHABLE, f"the refresh did not reach an answer ({ref})")
+        if type(ref) is not int:
+            raise bad("refresh outcome")
+        if ref != 200:
+            if (ref == 400 and word == "invalid_grant") or (ref in (401, 403) and word is not None):
+                raise Refused(EXPIRED, f"the refresh answered HTTP {ref} {word} (the stored login looks expired or "
+                                       "revoked: sign in to this slot again)")
+            raise Refused(UNREACHABLE, f"the refresh answered HTTP {ref}" + (f" {word}" if word else ""))
+    if exit_code != 0:
+        raise bad(f"identity call exit {exit_code}")
     if type(ans) is not dict or type(ans.get("status")) is not int:
         raise bad("no status")
     if ans["status"] in (401, 403):
@@ -220,10 +250,12 @@ BASELINE_MAX_BYTES = 4096
 #: the record's ``identity.result`` for a gate that matched, that found another account, and a vendor with no check.
 GATE_MATCHED = "matched"
 GATE_CHANGED = "identity-changed"
-#: the record's ``identity.result`` for a parked login the server no longer accepts (HTTP 401/403), and for a gate
-#: that passed on the slot's pin with no call.
+#: the record's ``identity.result`` for a parked login the server no longer accepts (a refresh answered
+#: ``invalid_grant`` or refused with an OAuth error body, or a profile 401/403 on the refreshed token), and for a
+#: check that could not reach an answer (a refresh with no usable answer: network, 429, 5xx, a non-OAuth 403, an
+#: unwritable file). The second asks for a retry, never a new login.
 EXPIRED = "identity-expired"
-GATE_PINNED = "pinned"
+UNREACHABLE = "identity-unreachable"
 _BASELINE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 
 
@@ -311,101 +343,6 @@ def gate_check(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str]) -> Dict[str,
     return ident
 
 
-# --- the pin (PIN_DESIGN §3): a shortcut past the live call for bytes already verified as the baseline account -------
-
-PIN_FORMAT = "levain-pin/1"
-PIN_KEYS = frozenset({"format", "vendor", "observed_id", "baseline_session", "sha256", "size", "ino", "session",
-                      "pinned_at"})
-PIN_NAME = "pin"
-PIN_MODE = 0o600
-PIN_MAX_BYTES = 1024
-_SHA256_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
-#: the most credential bytes a pin may vouch for (end.py's V14 cap on a parked credential).
-_PIN_SIZE_MAX = 64 << 10
-
-
-def pin_bytes(*, observed_id: str, baseline_session: str, sha256: str, size: int, ino: int, session: str,
-              pinned_at: str, vendor: str = "claude") -> bytes:
-    obj = {"format": PIN_FORMAT, "vendor": vendor, "observed_id": observed_id, "baseline_session": baseline_session,
-           "sha256": sha256, "size": size, "ino": ino, "session": session, "pinned_at": pinned_at}
-    _check_pin_shape(obj)
-    return canon.canonical_bytes(obj)
-
-
-def _check_pin_shape(obj: object) -> Dict[str, object]:
-    if type(obj) is not dict or set(obj) != PIN_KEYS or obj["format"] != PIN_FORMAT:
-        raise Refused("bad-pin", "keys or format")
-    if obj["vendor"] != "claude":
-        raise Refused("bad-pin", "vendor")
-    for key, rule in (("observed_id", R.OBSERVED_ID_RE), ("baseline_session", SESSION_RE), ("session", SESSION_RE),
-                      ("sha256", _SHA256_RE)):
-        if type(obj[key]) is not str or not rule.fullmatch(obj[key]):
-            raise Refused("bad-pin", key)
-    if type(obj["size"]) is not int or not 0 <= obj["size"] <= _PIN_SIZE_MAX:
-        raise Refused("bad-pin", "size")
-    # canon.parse caps a JSON integer at JSON_INT_MAX: an inode above it could be written but never read back, so
-    # it is refused here and the file gets no pin (the live call decides every start), never a dead pin.
-    if type(obj["ino"]) is not int or not 0 <= obj["ino"] <= JSON_INT_MAX:
-        raise Refused("bad-pin", "ino")
-    try:
-        R.check_timestamp(obj["pinned_at"], "pin.pinned_at")
-    except Refused:
-        raise Refused("bad-pin", "pinned_at") from None
-    return dict(obj)
-
-
-def check_pin(obj: object, baseline: Mapping[str, str], vendor: str) -> Dict[str, object]:
-    """A :data:`PIN_FORMAT` object usable for this start: exact keys, each value by its rule, and bound to the
-    baseline in force (its session and observed id) and to ``vendor``; else ``bad-pin``. A pin from before a
-    confirmed re-login is dead here without anything having deleted it."""
-    pin = _check_pin_shape(obj)
-    if not (pin["baseline_session"] == baseline["session"] and pin["observed_id"] == baseline["observed_id"]
-            and pin["vendor"] == baseline["vendor"] == vendor):
-        raise Refused("bad-pin", "not bound to the baseline in force")
-    return pin
-
-
-def read_slot_pin(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str]) -> Optional[Dict[str, object]]:
-    """``L/slots/<tag>/pin`` by dirfd with ``O_NOFOLLOW``, the baseline reader's pattern. Every failure is ``None``
-    (no pin): a pin only shortcuts the strict path, so a bad one costs the live call and never a launch."""
-    try:
-        with ctx.store.dir("slots", a.slot.tag) as sfd:
-            fd = os.open(PIN_NAME, _BASELINE_FLAGS, dir_fd=sfd)
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or not ctx.seams.trusted(st) or st.st_size > PIN_MAX_BYTES:
-                return None
-            buf = bytearray()
-            while len(buf) <= PIN_MAX_BYTES:
-                chunk = os.read(fd, PIN_MAX_BYTES + 1 - len(buf))
-                if not chunk:
-                    break
-                buf += chunk
-        finally:
-            os.close(fd)
-        if len(buf) > PIN_MAX_BYTES:
-            return None
-        return check_pin(canon.parse(bytes(buf)), baseline, a.vendor)
-    except Exception:   # noqa: BLE001 - any doubt (a malformed baseline's KeyError/TypeError too) is "no pin"
-        return None
-
-
-def write_slot_pin(ctx: H.Ctx, a: R.Alloc, data: bytes) -> None:
-    """The pin written as the baseline is: root's, 0600, temp + fsync + rename + directory fsync."""
-    ctx.store.replace(("slots", a.slot.tag), PIN_NAME, data, mode=PIN_MODE)
-
-
-def remove_slot_pin(ctx: H.Ctx, a: R.Alloc) -> None:
-    """The pin removed by root, by dirfd in the slot's root-owned directory, then the directory fsynced. An absent
-    pin is not an error. Removing a pin only ever turns a no-call start into a live-call start."""
-    with ctx.store.dir("slots", a.slot.tag) as sfd:
-        try:
-            os.unlink(PIN_NAME, dir_fd=sfd)
-        except FileNotFoundError:
-            return
-        ctx.store.seams.fsync(sfd)       # the writer's own fsync (Store.replace)
-
-
 # --- confirm-identity (§5.1) -------------------------------------------------------------------------------------------
 
 def _no_id_name(result: object) -> str:
@@ -471,5 +408,4 @@ def confirm_identity(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, o
 
 __all__ = ["BASELINE_FORMAT", "BASELINE_KEYS", "BASELINE_WRITTEN", "CONFIRMED", "IDENTITY_CALLS", "LOGIN_FAILED",
            "NOT_A_CHECK", "baseline_bytes", "baseline_vendor", "check_baseline", "confirm_identity", "gate_check",
-           "identity_call", "read_slot_baseline", "record_login_identity", "PIN_FORMAT", "pin_bytes", "check_pin",
-           "read_slot_pin", "write_slot_pin", "remove_slot_pin"]
+           "identity_call", "read_slot_baseline", "record_login_identity", "EXPIRED", "UNREACHABLE"]

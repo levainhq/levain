@@ -1391,6 +1391,8 @@ class Supervisor:
                 self._identity_refused(session)
             elif not ok and self._start_refused == "identity-expired":
                 self._identity_expired(session)
+            elif not ok and self._start_refused == "identity-unreachable":
+                self._identity_unreachable(session)
             if ok and self.req.kind == "login":
                 self._confirm_identity(session)
         except Refused as e:
@@ -1525,6 +1527,30 @@ class Supervisor:
             self.say(f"slot {n}'s stored {({'claude': 'Claude', 'codex': 'Codex'}).get(vendor, vendor)} login looks "
                      f"expired or revoked. Nothing was launched. Sign in again: levain session {vendor} "
                      f"--auth passthrough --login --slot {n}")
+        except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
+            try:
+                self.say(neutral.format(why=type(e).__name__))
+            except Exception:   # noqa: BLE001 - stderr itself refused; the teardown still runs
+                pass
+
+    def _identity_unreachable(self, session: str) -> None:
+        """``start`` refused ``identity-unreachable`` (the login could not be refreshed and checked: a network or
+        server failure, never a dead login): routed like :meth:`_identity_expired`, so the retry text is said only when
+        root's ``status`` record also says ``identity-unreachable``. It never tells him to sign in again."""
+        neutral = ("start refused identity-unreachable, but root's record could not be read ({why}). "
+                   "Nothing was launched.")
+        try:
+            try:
+                _oid, result = identity_answer(self.helper("status", session, stdin=None))
+            except Refused as e:
+                self.say(neutral.format(why=f"refused {e.name}"))
+                return
+            if result != "identity-unreachable":
+                self.say("start refused identity-unreachable, but root's record does not say so. "
+                         "Nothing was launched.")
+                return
+            self.say(f"could not reach Claude's sign-in server to check slot {self._slot_index}'s login. Nothing was "
+                     "launched, and the stored login is kept. Try again.")
         except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
             try:
                 self.say(neutral.format(why=type(e).__name__))

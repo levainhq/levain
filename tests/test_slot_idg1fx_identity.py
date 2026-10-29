@@ -119,7 +119,7 @@ def _allow(monkeypatch, srv, scheme="http"):
 def _main(env, url):
     out = io.StringIO()
     real = IC.fetch
-    IC.fetch = lambda e, **kw: real(e, url=url)
+    IC.fetch = lambda e, **kw: real(e, url=url, refresh=False)
     try:
         code = IC.main(env=env, out=out)
     finally:
@@ -133,7 +133,7 @@ def test_x1_a_redirect_is_the_final_answer_and_the_second_origin_receives_nothin
                                                                                   monkeypatch):
     """codex HIGH 1: a 302 to another origin is answered as the final non-200 status; the bearer is never resent."""
     _allow(monkeypatch, redirector)
-    ans = IC.fetch(_creds(tmp_path), url=_url(redirector))
+    ans = IC.fetch(_creds(tmp_path), url=_url(redirector), refresh=False)
     assert _Redirect.seen == ["/api/oauth/profile"]
     assert _Sink.seen == []
     assert ans == {"status": 302, "body": ""}
@@ -142,13 +142,13 @@ def test_x1_a_redirect_is_the_final_answer_and_the_second_origin_receives_nothin
 def test_x1_a_same_origin_redirect_is_not_followed_either(tmp_path, redirector, monkeypatch):
     _Redirect.location = _url(redirector, "/again")
     _allow(monkeypatch, redirector)
-    assert IC.fetch(_creds(tmp_path), url=_url(redirector)) == {"status": 302, "body": ""}
+    assert IC.fetch(_creds(tmp_path), url=_url(redirector), refresh=False) == {"status": 302, "body": ""}
     assert _Redirect.seen == ["/api/oauth/profile"]
 
 
 def test_x1_the_bearer_goes_only_to_the_profile_origin(tmp_path, sink):
     """No ORIGIN override: an http://127.0.0.1 url is not https://api.anthropic.com, so nothing is sent."""
-    assert IC.fetch(_creds(tmp_path), url=_url(sink)) == {"error": "bad-origin"}
+    assert IC.fetch(_creds(tmp_path), url=_url(sink), refresh=False) == {"error": "bad-origin"}
     assert _Sink.seen == []
 
 
@@ -166,14 +166,14 @@ def test_x2_no_proxy_no_request(tmp_path, sink, monkeypatch, proxy):
     env = _creds(tmp_path, proxy=False)
     if proxy is not None:
         env["HTTPS_PROXY"] = proxy
-    assert IC.fetch(env, url=_url(sink)) == {"error": "no-proxy"}
+    assert IC.fetch(env, url=_url(sink), refresh=False) == {"error": "no-proxy"}
     assert _Sink.seen == []
 
 
 def test_x2_a_malformed_proxy_is_request_failed(tmp_path, monkeypatch):
     monkeypatch.setattr(IC, "ORIGIN", ("https", "127.0.0.1", 9), raising=False)
     env = {**_creds(tmp_path, proxy=False), "HTTPS_PROXY": "http://[::1"}
-    assert IC.fetch(env, url="https://127.0.0.1:9/api/oauth/profile") == {"error": "request-failed"}
+    assert IC.fetch(env, url="https://127.0.0.1:9/api/oauth/profile", refresh=False) == {"error": "request-failed"}
 
 
 def test_x2_an_opener_that_cannot_be_built_is_request_failed(tmp_path, sink, monkeypatch):
@@ -183,7 +183,7 @@ def test_x2_an_opener_that_cannot_be_built_is_request_failed(tmp_path, sink, mon
     def broken(*a, **kw):
         raise ValueError("bad proxy")
     monkeypatch.setattr(IC.urllib.request, "ProxyHandler", broken)
-    assert IC.fetch(_creds(tmp_path), url=_url(sink)) == {"error": "request-failed"}
+    assert IC.fetch(_creds(tmp_path), url=_url(sink), refresh=False) == {"error": "request-failed"}
 
 
 # --- X3: a credential of the wrong shape is no-token -------------------------------------------------------------------

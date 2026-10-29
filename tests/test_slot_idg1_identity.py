@@ -437,7 +437,7 @@ def _run_child(env, url):
     import io
     out = io.StringIO()
     real, origin = IC.fetch, IC.ORIGIN
-    IC.fetch = lambda e, **kw: real(e, url=url)
+    IC.fetch = lambda e, **kw: real(e, url=url, refresh=False)
     IC.ORIGIN = IC._origin(url)
     try:
         code = IC.main(env=env, out=out)

@@ -13,11 +13,10 @@ CONTROL checks, never as a fact root acts on.
    session runs :func:`_identity_gate` at the start of step 4, under the same lock: the slot's baseline read, the
    parked credential returned from ``keep/`` into the session tree, the vendor's identity call recorded in the state
    record's ``identity`` and compared with the baseline (``identity-changed`` when it differs; a login the server
-   no longer accepts, ``identity-expired``). Claude only: a parked credential whose fingerprint equals the slot's
-   pin passes with no call (``pinned``), and after the vendor exits :func:`_pin_after_session` pins the bytes the
-   session left when a fresh call vouches for them, and removes a pin the call answered against (expired, or another
-   account) for the very bytes it vouches for. Any refusal there precedes ``<S>/repo`` and the clone, and
-   the credential is parked back into ``keep/``.
+   no longer accepts, ``identity-expired``; Claude's sign-in server unreachable, ``identity-unreachable``). Claude
+   only: the identity child first refreshes the stored login once (PIN_REFRESH_DESIGN) and writes the rotated tokens
+   back, then asks the profile on the new access token, so no pin or fingerprint shortcut exists. Any refusal there
+   precedes ``<S>/repo`` and the clone, and the credential is parked back into ``keep/``.
    ``vendor``: root's copy of the session's vendor CLI (its install unit) in ``VENDOR_PREFIX`` is not whole
    (:func:`check_vendor_installed`; setup and repair copy it there) = ``vendor-not-installed:<vendor>``, before any
    clone.
@@ -61,7 +60,6 @@ then SCRUBBED (proc.scrub over every uid of the slot, under the slot lock) and t
 from __future__ import annotations
 
 import errno
-import hashlib
 import os
 import re
 import select
@@ -651,8 +649,6 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         _wake(seams)        # every release: an END that waited on the lock, or refused end-busy, is retried now
     seams.at("wait")
     code = seams.wait(pid)
-    if a.kind == "interactive" and a.auth == "passthrough" and a.vendor == "claude":
-        _pin_after_session(ctx, a)
     if a.kind == "login":
         seams.at("identity")
         try:
@@ -678,11 +674,9 @@ def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
     :func:`levain.slot.end.park_move` of the credential back into ``keep/`` (a no-op when it never left): a failure
     there is noted and END's park is the backstop. No baseline is written on this path.
 
-    Claude's pin (PIN_DESIGN §4), after the return and the cgroup: the local window (kill and proof, no network), the
-    tree credential's fingerprint FP0 and the slot's pin. A usable pin whose (sha256, size, ino) equals FP0 passes
-    with ``{observed_id, result: pinned}`` recorded and NO child and NO network call. Anything else is today's live
-    :func:`gate_check`; on a match the fingerprint is taken again and, if unchanged, the pin is written best-effort
-    (a failed write is noted, never a refusal). The pin branch adds no refusal; every refusal keeps the park-back."""
+    For Claude the identity child refreshes the stored login once before it asks the profile (PIN_REFRESH_DESIGN), so
+    the account it names is the one the file's own refresh token belongs to; the vendor starts on the file the child
+    wrote back."""
     seams = ctx.seams
     seams.at("identity-gate")
     baseline = ID.read_slot_baseline(ctx, a)
@@ -700,126 +694,10 @@ def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
     try:
         if seams.host == "linux" and a.cgroup:
             seams.make_cgroup(a.cgroup)       # no clone has made it yet; the Claude child and its forwarder join it
-        fp0 = None
-        pin = None
-        if a.vendor == "claude":
-            try:
-                _identity_window(ctx, a, (R.RENDERED,))
-            except Refused:
-                pass        # gate_check repeats the window and refuses (and records) it by its own name
-            else:
-                fp0 = _credential_fingerprint(ctx, facts)
-                pin = ID.read_slot_pin(ctx, a, baseline) if fp0 is not None else None
-        if pin is not None and fp0 is not None and (pin["sha256"], pin["size"], pin["ino"]) == fp0:
-            ID._cas_gate_identity(ctx, a.session, {"observed_id": pin["observed_id"], "result": ID.GATE_PINNED})
-            return
-        ident = ID.gate_check(ctx, a, baseline)
-        if fp0 is not None and ident.get("result") == ID.GATE_MATCHED and _credential_fingerprint(ctx, facts) == fp0:
-            _write_pin(ctx, a, baseline, fp0)
+        ID.gate_check(ctx, a, baseline)
     except BaseException:
         _park_back(facts, es, a)
         raise
-
-
-def _credential_fingerprint(ctx: H.Ctx, facts: E.EndFacts) -> Optional[Tuple[str, int, int]]:
-    """``(sha256, size, ino)`` of the vendor credential in the session tree, or ``None`` (no fingerprint, so no pin
-    is used or written). Root opens it READ-ONLY by dirfd with ``O_NOFOLLOW``; the shape rule is return_move's
-    (regular, one link, the slot's, at most V14) and the bytes stay in memory. The caller holds the session lock and
-    has proven no slot-uid process, so nothing writes the file between this read and the next."""
-    try:
-        parts, name = facts.credential   # type: ignore[misc]
-        dfd = E._open_subdir(facts.live, parts) if os.path.isdir(facts.live) else None
-        if dfd is None:
-            return None
-        try:
-            fd = os.open(name, E._O_ENTRY, dir_fd=dfd)
-        finally:
-            os.close(dfd)
-        try:
-            st = os.fstat(fd)
-            owner_ok = slot_owner_ok or (lambda s: s.st_uid == facts.slot_uid)
-            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or not owner_ok(st) or st.st_size > E.V14_BYTES:
-                return None
-            h = hashlib.sha256()
-            n = 0
-            while n <= E.V14_BYTES:
-                chunk = os.read(fd, E.V14_BYTES + 1 - n)
-                if not chunk:
-                    break
-                h.update(chunk)
-                n += len(chunk)
-        finally:
-            os.close(fd)
-        if n > E.V14_BYTES or n != st.st_size:
-            return None
-        return h.hexdigest(), n, st.st_ino
-    except Exception:   # noqa: BLE001 - any doubt is "no fingerprint": the live call decides
-        return None
-
-
-def _write_pin(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str], fp: Tuple[str, int, int]) -> None:
-    """The pin for ``fp`` under ``baseline``, best-effort: a failure is noted and never changes the answer."""
-    try:
-        data = ID.pin_bytes(observed_id=baseline["observed_id"], baseline_session=baseline["session"], sha256=fp[0],
-                            size=fp[1], ino=fp[2], session=a.session, pinned_at=R.timestamp(ctx.seams.clock()))
-        ID.write_slot_pin(ctx, a, data)
-    except Exception as e:   # noqa: BLE001 - a pin only saves a later call
-        _note(f"{a.session}: identity pin not written: {_why(e)}")
-
-
-def _pin_after_session(ctx: H.Ctx, a: R.Alloc) -> None:
-    """After an interactive passthrough Claude exits: the identity call on the credential the session leaves, and a
-    pin for those bytes ONLY when the server answered 200 for the baseline account and the file's fingerprint is
-    the same before and after the call. Best-effort and local to the pin: any failure (window, shape, timeout,
-    401, another account, bytes changed, record not running) writes no pin and never changes start's answer.
-
-    A pin never outlives a definitive answer against the bytes it vouches for (L3 r1 F1): when the server answered
-    ``identity-expired`` (401/403) or a 200 naming another account, and the pin's (sha256, size, ino) equals the
-    fingerprint the call was made on, the pin is removed (:func:`_unpin_contradicted`), so the next start makes the
-    live call. Every other failure (timeout, child, window, shape, unparsable) deletes nothing; a file the session
-    changed simply no longer matches the old pin. The call is root's own helper-side run under the session lock, as
-    the login path's. Nothing here, a Ctrl-C included, is raised over start's answer: the vendor already ran."""
-    try:
-        baseline = ID.read_slot_baseline(ctx, a)
-        facts = end_facts(ctx, a)
-        with H.session_lock(ctx, a.session):
-            _identity_window(ctx, a, (R.ACTIVE, R.BRAKED))
-            fp1 = _credential_fingerprint(ctx, facts)
-            if fp1 is None:
-                raise Refused("no-fingerprint", a.session)
-            try:
-                oid = ID.parse_profile_answer(*_identity_child(ctx, a))
-            except Refused as e:
-                if e.name == ID.EXPIRED:
-                    _unpin_contradicted(ctx, a, baseline, fp1, e.name)
-                raise
-            if oid != baseline["observed_id"]:
-                _unpin_contradicted(ctx, a, baseline, fp1, ID.GATE_CHANGED)
-                raise Refused(ID.GATE_CHANGED, a.session)
-            if _credential_fingerprint(ctx, facts) != fp1:
-                raise Refused("credential-changed", a.session)
-            _write_pin(ctx, a, baseline, fp1)
-    except BaseException as e:   # noqa: BLE001 - no pin; the session already ran and start's exit code is the answer
-        # L3 r1 F4: a KeyboardInterrupt (the terminal's Ctrl-C once wait_child restored SIGINT) is noted, never raised
-        # over {"exit": code}: the helper outlives it to answer its one line, as wait_child's own stance.
-        _note(f"{a.session}: no identity pin: {_why(e)}")
-    finally:
-        _wake(ctx.seams)
-
-
-def _unpin_contradicted(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str], fp: Tuple[str, int, int],
-                        why: str) -> None:
-    """The slot's pin removed when it vouches for exactly ``fp``, the bytes the server just answered ``why`` for.
-    Best-effort: a failure is noted, never raised (removal only ever turns a no-call start into a live call, so a
-    removal that failed leaves today's behaviour, never a worse one)."""
-    try:
-        pin = ID.read_slot_pin(ctx, a, baseline)
-        if pin is None or (pin["sha256"], pin["size"], pin["ino"]) != fp:
-            return
-        ID.remove_slot_pin(ctx, a)
-        _note(f"{a.session}: identity pin removed: the server answered {why} for the pinned bytes")
-    except Exception as e:   # noqa: BLE001 - the session already ran
-        _note(f"{a.session}: identity pin not removed after {why}: {_why(e)}")
 
 
 #: ``end.return_move``'s refusals that come before any move (``no-credential:<tag>`` by its prefix).
