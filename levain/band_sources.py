@@ -9,16 +9,23 @@ NOTHING HERE IS AUTHORITY (SIG-ONLY, D8). This module reads three stores read-on
 ``dispatch.db``) and builds display rows plus the TEXT of the existing signing ceremony each item is settled by
 (:func:`sheet_text`). It records nothing and rules nothing: a decision on one of these items exists only as the
 signature the existing path verifies (the phone ``question_rule`` sheet, ``levain consent rule``, a levain sign request
-opened by :func:`levain.consent.sign.deep_link`, ``levain envelope sign``).
+on the cockpit's sign sheet, ``levain envelope sign``). A sign request is named in words, not as a
+:func:`levain.consent.sign.deep_link`: no store a band reader can see records the cockpit's origin.
 
 Rec (D11, Q2 ruled (a)): an item shows the coordinator's rec when its record carries one, else the literal text
 :data:`NO_REC` (``rec: none (authority item)``) for a raw gate request.
+
+A command the operator copies (S3 fix round 1): every value in it that a record carries (a session id, an agent, a gap
+number, a thread id, a request id) is something an agent could have written, and the operator runs the line in his
+shell. So each such value must be one plain token (:data:`TOKEN`: letters, digits and ``._:@+=-``, not starting with
+``-``); a value outside it renders NO command, only words saying why and naming the item's card. The line is then
+built with :func:`shlex.quote` on every argument as well (a no-op on a plain token; a second wall, not the first).
 Stdlib plus levain's own readers.
 """
 from __future__ import annotations
 
-import os
 import re
+import shlex
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -27,13 +34,17 @@ from typing import Any
 
 from levain.coordinator.review import NO_REC
 
-__all__ = ["Extra", "Extras", "NO_REC", "read_extras", "rec_letter_of", "sheet_text", "SOURCES"]
+__all__ = ["Extra", "Extras", "NO_REC", "TOKEN", "UnsafeValue", "consent_rule_command", "read_extras", "rec_letter_of",
+           "sheet_text", "SOURCES"]
 
 SOURCES = ("consent", "sign", "extend")
 _LETTERS = "abcdef"
 _FIELD = 300
 _REC_LETTER = re.compile(r"\s*([a-f])(?![A-Za-z0-9])")
 _RO_TIMEOUT = 2.0
+#: one argument of a command the operator copies into his shell, when its value came from a record
+TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+=-]{0,127}")
+_TOKEN_WORDS = "letters, digits and ._:@+=- only, not starting with -"
 
 
 @dataclass(frozen=True)
@@ -88,14 +99,15 @@ def _gap_of(qdir: Path, request_id: str) -> int | None:
     path = qdir / "queue.db"
     if not path.exists():
         return None
-    conn = _ro(path)
     try:
-        row = conn.execute("SELECT gap FROM gaps WHERE request_id = ?", (request_id,)).fetchone()
-    except sqlite3.Error:
+        conn = _ro(path)
+        try:
+            row = conn.execute("SELECT gap FROM gaps WHERE request_id = ?", (request_id,)).fetchone()
+        finally:
+            conn.close()
+        return None if row is None else int(row[0])
+    except (sqlite3.Error, TypeError, ValueError):
         return None
-    finally:
-        conn.close()
-    return None if row is None else int(row[0])
 
 
 def _consent(qdir: Path) -> list[dict[str, Any]]:
@@ -115,7 +127,9 @@ def _records(qdir: Path, clock: Any = None) -> tuple[dict[str, Any], dict[str, s
         with read_transaction(store.open_readonly) as conn:
             w = review.waiting_on_you(store, sign_open=review.queue_request_open(qdir, clock=clock),
                                       answer_open=review.question_open(qdir), conn=conn)
-            at = {r[0]: r[1] for r in conn.execute("SELECT reply_id, at FROM replies WHERE kind = 'sign'")}
+            # a row with no time (NULL ``at``) sorts first rather than failing the whole source
+            at = {r[0]: ("" if r[1] is None else str(r[1]))
+                  for r in conn.execute("SELECT reply_id, at FROM replies WHERE kind = 'sign'")}
     except StoreAbsent:
         return {"threads": {}, "loose": [], "unresolved": []}, {}
     return w, at
@@ -144,40 +158,20 @@ def read_extras(queue_dir: Path | str, clock: Any = None) -> Extras:
     try:
         w, at = _records(qdir, clock)
         threads = {r["reply_id"]: t for t, rs in w["threads"].items() for r in rs}
-        for rec in sorted([*_recs(w), *w["unresolved"]], key=lambda r: (at.get(r["reply_id"], ""), r["reply_id"])):
-            if rec["kind"] == "answer":
-                if rec["reply_id"] in {r["reply_id"] for r in w["unresolved"]}:
-                    continue                      # a question that cannot be read: its own item says so
-                out.escalations[rec["ref_id"]] = (_line(rec["text"]), _line(rec.get("rec") or NO_REC))
-                continue
-            unresolved = rec in w["unresolved"]
-            extend = rec["ref_store"] == budget.SIGN_REF
-            ref = rec["reply_id"]
-            thread = threads.get(ref)
-            if extend:
-                options = ("sign the extension", "leave it unsigned")
-                source, tag = "extend", "coordinator · budget"
-                data: dict[str, Any] = {"thread_id": rec["ref_id"].partition("/")[0],
-                                        "envelope_id": rec["ref_id"].partition("/")[2]}
-                head = "SIGN: extend a thread budget"
-                blocks = f"thread {data['thread_id']}'s new steps"
-                origin = f"budget SIGN {rec['ref_id']}"
-            else:
-                options = ("sign (allow)", "deny")
-                source, tag = "sign", "coordinator"
-                u = undecided.get(rec["ref_id"])
-                data = {"request_id": rec["ref_id"], "thread_id": thread,
-                        "gap": u["gap"] if u else _gap_of(qdir, rec["ref_id"]),
-                        "agent": u["agent"] if u else None, "session": u["session"] if u else None}
-                head = "SIGN"
-                blocks = f"thread {thread}" if thread else "the gated call"
-                origin = f"consent request {rec['ref_id']}" + (f" (gap #{data['gap']})" if data["gap"] else "")
-                pointed.add(rec["ref_id"])
-            text = f"{head}: {_line(rec['text'])}" if not unresolved else f"UNREADABLE: SIGN {ref} could not be read"
-            rec_text = _line(rec.get("rec") or NO_REC, 500)
-            out.items.append(Extra(source, ref, at.get(ref, ""), tag, text, options, rec_text,
-                                   rec_letter_of(rec.get("rec"), len(options)), blocks, origin,
-                                   "its state could not be read" if unresolved else None, data))
+        unresolved_ids = {str(r.get("reply_id")) for r in w["unresolved"]}
+        for rec in sorted([*_recs(w), *w["unresolved"]],
+                          key=lambda r: (at.get(r.get("reply_id")) or "", str(r.get("reply_id")))):
+            try:
+                _one_record(rec, rec.get("reply_id") in unresolved_ids, threads, at, undecided, qdir, out, pointed)
+            except Exception as exc:  # noqa: BLE001 - one record that cannot be read is listed, never the source lost
+                if rec.get("kind") == "answer":
+                    continue                      # an escalation that cannot be read: its question is still listed
+                ref = str(rec.get("reply_id") or "?")
+                src = "extend" if rec.get("ref_store") == budget.SIGN_REF else "sign"
+                out.items.append(Extra(src, ref, at.get(ref) or "", "coordinator",
+                                       f"UNREADABLE: SIGN {_line(ref, 80)} could not be read", ("sign (allow)", "deny"),
+                                       NO_REC, None, "unknown", f"coordinator record {_line(ref, 80)}",
+                                       f"its record could not be read ({type(exc).__name__})", {}))
         out.complete.update(("sign", "extend"))
     except Exception as exc:  # noqa: BLE001
         out.failed.append(f"coordinator SIGN records: {type(exc).__name__}"[:120])
@@ -186,29 +180,111 @@ def read_extras(queue_dir: Path | str, clock: Any = None) -> Extras:
             if rid in pointed:
                 continue                          # a SIGN record already lists this request, with its rec
             out.items.append(Extra(
-                "consent", rid, str(u["undecided_at"] or ""), f"{u['agent']}", f"UNDECIDED: {u['tool']}: {u['what']}",
-                ("allow", "deny"), NO_REC, None, f"the {u['agent']} session's gated call",
-                f"consent request gap #{u['gap']}", None,
-                {"request_id": rid, "gap": u["gap"], "agent": u["agent"], "session": u["session"]}))
+                "consent", rid, str(u["undecided_at"] or ""), _line(u["agent"], 40),
+                f"UNDECIDED: {_line(u['tool'], 60)}: {_line(u['what'])}", ("allow", "deny"), NO_REC, None,
+                f"the {_line(u['agent'], 40)} session's gated call", f"consent request gap #{_line(u['gap'], 20)}",
+                None, {"request_id": rid, "gap": u["gap"], "agent": u["agent"], "session": u["session"]}))
     out.items.sort(key=lambda e: (e.filed, e.ref))
     return out
 
 
-def _origin(environ: Mapping[str, str]) -> str | None:
-    from levain.consent.sign import cockpit_origin
+def _one_record(rec: dict[str, Any], unresolved: bool, threads: dict[str, str], at: dict[str, str],
+                undecided: dict[str, dict[str, Any]], qdir: Path, out: Extras, pointed: set[str]) -> None:
+    """One coordinator record onto ``out``: an ANSWER rides its question, a SIGN or budget SIGN is an item."""
+    from levain.coordinator import budget
 
-    raw = environ.get("LEVAIN_COCKPIT_ORIGIN")
-    if not raw:
-        return None
+    if rec["kind"] == "answer":
+        if unresolved:
+            return                                # a question that cannot be read: its own item says so
+        out.escalations[rec["ref_id"]] = (_line(rec["text"]), _line(rec.get("rec") or NO_REC))
+        return
+    extend = rec["ref_store"] == budget.SIGN_REF
+    ref = rec["reply_id"]
+    thread = threads.get(ref)
+    if extend:
+        options = ("sign the extension", "leave it unsigned")
+        source, tag = "extend", "coordinator · budget"
+        data: dict[str, Any] = {"thread_id": rec["ref_id"].partition("/")[0],
+                                "envelope_id": rec["ref_id"].partition("/")[2]}
+        head = "SIGN: extend a thread budget"
+        blocks = f"thread {_line(data['thread_id'], 80)}'s new steps"
+        origin = f"budget SIGN {_line(rec['ref_id'], 120)}"
+    else:
+        options = ("sign (allow)", "deny")
+        source, tag = "sign", "coordinator"
+        u = undecided.get(rec["ref_id"])
+        data = {"request_id": rec["ref_id"], "thread_id": thread,
+                "gap": u["gap"] if u else _gap_of(qdir, rec["ref_id"]),
+                "agent": u["agent"] if u else None, "session": u["session"] if u else None}
+        head = "SIGN"
+        blocks = f"thread {_line(thread, 80)}" if thread else "the gated call"
+        origin = (f"consent request {_line(rec['ref_id'], 120)}"
+                  + (f" (gap #{_line(data['gap'], 20)})" if data["gap"] else ""))
+    text = (f"{head}: {_line(rec['text'])}" if not unresolved
+            else f"UNREADABLE: SIGN {_line(ref, 80)} could not be read")
+    rec_text = _line(rec.get("rec") or NO_REC, 500)
+    out.items.append(Extra(source, ref, at.get(ref) or "", tag, text, options, rec_text,
+                           rec_letter_of(rec.get("rec"), len(options)), blocks, origin,
+                           "its state could not be read" if unresolved else None, data))
+    if not extend:
+        pointed.add(rec["ref_id"])                # listed by this SIGN: its UNDECIDED request is not listed again
+
+
+class UnsafeValue(ValueError):
+    """A value a record carries cannot go into a command the operator copies: ``what`` names it (never its text)."""
+
+    def __init__(self, what: str) -> None:
+        super().__init__(what)
+        self.what = what
+
+
+def _token(what: str, value: object) -> str:
+    if not isinstance(value, str) or TOKEN.fullmatch(value) is None:
+        raise UnsafeValue(what)
+    return value
+
+
+def _gap_arg(gap: object) -> str:
+    if isinstance(gap, bool) or not isinstance(gap, int) or gap < 1:
+        raise UnsafeValue("gap number")
+    return str(gap)
+
+
+def _command(*argv: str) -> str:
+    """One copyable command, every argument shell-quoted (each is a checked token or a fixed word already)."""
+    return "`" + shlex.join(argv) + "`"
+
+
+def consent_rule_command(gap: object, verb: str, agent: object, session: object) -> str:
+    """``levain consent rule <gap> <verb> --agent <agent> --session <session> --signing-key KEY``, without backticks.
+    ``verb`` is ``allow``, ``deny`` or the template ``allow|deny`` (the operator picks one). Every value from the
+    record must be a plain token (:data:`TOKEN`), else :class:`UnsafeValue` and no command at all."""
+    if verb not in ("allow", "deny", "allow|deny"):
+        raise ValueError(f"verb {verb!r}")
+    argv = ["levain", "consent", "rule", _gap_arg(gap), verb, "--agent", _token("agent", agent),
+            "--session", _token("session id", session), "--signing-key", "KEY"]
+    return " ".join(a if a == "allow|deny" else shlex.quote(a) for a in argv)
+
+
+def _no_command(what: str, card: str) -> str:
+    return (f"no command shown: the record's {what} is not a plain token ({_TOKEN_WORDS}), so Levain will not put it "
+            f"into a line for your shell; {card}")
+
+
+def _request_words(request_id: object) -> str:
     try:
-        return cockpit_origin(raw)
-    except ValueError:
-        return None
+        return f"request {_token('request id', request_id)}"
+    except UnsafeValue:
+        return "the request (its id is not a plain token, so it is not repeated here)"
 
 
-def _sign_file_link(qdir: Path, request_id: str, index: int, environ: Mapping[str, str]) -> str | None:
-    """The deep link into an OPEN levain sign request filed under ``request_id``, the pick preselected; ``None`` when
-    there is no such request, it is not open, or it cannot be shown."""
+def _sign_file_sheet(qdir: Path, request_id: str, index: int) -> str | None:
+    """Words naming the cockpit's sign sheet of an OPEN levain sign request filed under ``request_id``, the pick
+    preselected; ``None`` when there is no such request, it is not open, or it cannot be shown.
+
+    Words, not :func:`levain.consent.sign.deep_link`: a link needs the cockpit's origin, and nothing a band reader can
+    see records it (the web cockpit holds its page origin in memory only; the phone port writes one to a
+    ``--link-file`` whose path only its caller knows)."""
     from levain.consent import sign
 
     try:
@@ -218,32 +294,41 @@ def _sign_file_link(qdir: Path, request_id: str, index: int, environ: Mapping[st
     if req.refused or sign.state_of(qdir, request_id) != "open":
         return None
     choice = req.options[index][0] if req.options and index < len(req.options) else None
-    origin = _origin(environ)
-    if origin is None:
-        return (f"open the cockpit's sign sheet for sign request {request_id} (version {req.sha256[:16]}"
-                + (f", option {choice}" if choice else "") + ")")
-    return sign.deep_link(origin, request_id, choice=choice, version=req.sha256)
+    choice = choice if isinstance(choice, str) and sign._OPTION_KEY.fullmatch(choice) else None
+    return (f"open the cockpit's sign sheet for sign {_request_words(request_id)} (version {req.sha256[:16]}"
+            + (f", option {choice}" if choice else "") + ")")
 
 
-def sheet_text(extra: Extra, letter: str, qdir: Path | str, environ: Mapping[str, str] | None = None) -> str:
-    """The existing signing ceremony of ``extra`` with option ``letter`` preselected, as text. Nothing is recorded."""
-    env = os.environ if environ is None else environ
+def sheet_text(extra: Extra, letter: str, qdir: Path | str) -> str:
+    """The existing signing ceremony of ``extra`` with option ``letter`` preselected, as text. Nothing is recorded.
+    A command is shown only when every value it carries is a plain token (module docstring); else words say why."""
     qdir = Path(qdir)
+    if letter not in _LETTERS:
+        raise ValueError(f"no option {letter!r}")
     index = _LETTERS.index(letter)
     d = extra.data
+    verb = "allow" if index == 0 else "deny"
     if extra.source == "consent":
-        verb = "allow" if index == 0 else "deny"
-        return (f"`levain consent rule {d['gap']} {verb} --agent {d['agent']} --session {d['session']} "
-                "--signing-key KEY` (or its card)")
+        try:
+            return f"`{consent_rule_command(d.get('gap'), verb, d.get('agent'), d.get('session'))}` (or its card)"
+        except UnsafeValue as bad:
+            return _no_command(bad.what, f"rule {_request_words(d.get('request_id'))} {verb} from its card")
     if extra.source == "extend":
         if index != 0:
             return "leaving it unsigned is the decline: nothing to sign"
-        return (f"`levain envelope extend {d['thread_id']} --budget K=N,... -o FILE`, then `levain envelope sign FILE`")
-    link = _sign_file_link(qdir, d["request_id"], index, env)
-    if link is not None:
-        return link
-    verb = "allow" if index == 0 else "deny"
+        try:
+            thread = _token("thread id", d.get("thread_id"))
+        except UnsafeValue as bad:
+            return _no_command(bad.what, "extend the thread's budget from its card")
+        return (f"{_command('levain', 'envelope', 'extend', thread, '--budget', 'K=N,...', '-o', 'FILE')}, then "
+                f"{_command('levain', 'envelope', 'sign', 'FILE')}")
+    request_id = d.get("request_id")
+    sheet = _sign_file_sheet(qdir, request_id, index) if isinstance(request_id, str) else None
+    if sheet is not None:
+        return sheet
     if d.get("gap"):
-        return (f"`levain consent rule {d['gap']} {verb} --agent {d.get('agent') or 'AGENT'} "
-                f"--session {d.get('session') or 'SESSION'} --signing-key KEY`")
-    return f"rule request {d['request_id']} {verb} from its own card; Levain found no gap number for it"
+        try:
+            return f"`{consent_rule_command(d.get('gap'), verb, d.get('agent') or 'AGENT', d.get('session') or 'SESSION')}`"
+        except UnsafeValue as bad:
+            return _no_command(bad.what, f"rule {_request_words(request_id)} {verb} from its card")
+    return f"rule {_request_words(request_id)} {verb} from its own card; Levain found no gap number for it"

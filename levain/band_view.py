@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
 import sqlite3
@@ -47,7 +48,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from levain.band_shorthand import ItemInfo, Parse, View, parse
+from levain.band_shorthand import ItemInfo, Parse, Refusal, View, parse
 from levain.band_sources import Extra, Extras, read_extras, sheet_text
 from levain.cockpit.consent import utc_stamp
 from levain.consent.questions import HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select
@@ -240,7 +241,7 @@ def _extra_lines(label: str, e: Extra, compact: bool) -> list[str]:
         return [f"{label} [{e.tag}] {e.what} (listed, never dropped)"]
     if compact:
         return [f"{label} [{e.tag}] {_short(e.what, _COMPACT_WHAT)} · rec: {e.rec}"]
-    opts = "   ".join(f"{_LETTERS[i]}) {lab}" for i, lab in enumerate(e.options))
+    opts = "   ".join(f"{_LETTERS[i]}) {lab}" for i, lab in enumerate(e.options[:len(_LETTERS)]))
     return [f"{label} [{e.tag}] {e.what}   <- needs your signature",
             f"    {opts}",
             f"    rec: {e.rec} · blocks: {e.blocks} · {e.origin}"]
@@ -396,18 +397,24 @@ def _info_of(q: Question) -> ItemInfo:
     return ItemInfo("authority" if q.link is not None else "information", min(len(q.options), len(_LETTERS)), rec)
 
 
-def _extras_of(store: QuestionStore, view: View) -> dict[int, Extra]:
+def _extras_of(store: QuestionStore, view: View) -> tuple[dict[int, Extra], set[int]]:
     """The authority items behind the view's numbers that are open NOW, read fresh: one that has closed since (or whose
-    source cannot be read) is absent, so shorthand on it opens nothing."""
+    source cannot be read) is absent, so shorthand on it opens nothing. Second: the view's authority numbers whose
+    source could not be read in full just now (absent, but not known to be closed)."""
     with store._peek() as conn:
         if conn is None or "band_items" not in _tables(conn):
-            return {}
+            return {}, set()
         refs = {n: (src, ref) for n in view.open_list for src, ref in [r for r in conn.execute(
             "SELECT source, ref FROM band_items WHERE n = ? AND source != 'question'", (n,))]}
     if not refs:
-        return {}
-    open_now = {(e.source, e.ref): e for e in read_extras(store.directory, store._clock).items}
-    return {n: open_now[k] for n, k in refs.items() if k in open_now and open_now[k].unreadable is None}
+        return {}, set()
+    try:
+        now = read_extras(store.directory, store._clock)
+    except Exception:  # noqa: BLE001 - every authority number of the view is then unknown, never "closed"
+        return {}, set(refs)
+    open_now = {(e.source, e.ref): e for e in now.items}
+    got = {n: open_now[k] for n, k in refs.items() if k in open_now and open_now[k].unreadable is None}
+    return got, {n for n, (src, _ref) in refs.items() if n not in got and src not in now.complete}
 
 
 def _info_of_extra(e: Extra) -> ItemInfo:
@@ -420,12 +427,18 @@ def plan_for_full(store: QuestionStore, viewer: str, text: str
     view = last_view(store, viewer)
     questions = _items_of(store, view) if view is not None else {}
     try:
-        extras = _extras_of(store, view) if view is not None else {}
+        extras, unknown = _extras_of(store, view) if view is not None else ({}, set())
     except Exception:                        # unreadable sources: their numbers are simply not open for shorthand
-        extras = {}
+        extras, unknown = {}, set()
     infos = {n: _info_of(q) for n, q in questions.items()}
     infos.update({n: _info_of_extra(e) for n, e in extras.items()})
-    return parse(text, view, infos, _store_id_of(store)), view, questions, extras
+    plan = parse(text, view, infos, _store_id_of(store))
+    if unknown and any(r.n in unknown for r in plan.refused):
+        plan = dataclasses.replace(plan, refused=tuple(
+            Refusal(r.n, f"{r.n}: its source could not be read just now, so Levain cannot tell it is still open; "
+                         "nothing opened (try again)") if r.n in unknown and "not open in the band" in r.reason
+            else r for r in plan.refused))
+    return plan, view, questions, extras
 
 
 def plan_for(store: QuestionStore, viewer: str, text: str) -> tuple[Parse, View | None, dict[int, Question]]:
@@ -456,8 +469,7 @@ class Applied(NamedTuple):
 
 
 def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question], *, viewer: str, via: str,
-               seen_through: int, deadline: float | None = None, extras: dict[int, Extra] | None = None,
-               environ: Mapping[str, str] | None = None) -> Applied:
+               seen_through: int, deadline: float | None = None, extras: dict[int, Extra] | None = None) -> Applied:
     """Record ``plan.actions`` with their ``answer_context`` sidecars (via, viewer, the view's ``seen_through``, the
     note verbatim) through ONE :meth:`QuestionStore.answer_with_context` write (channel ``cli``, the human channel a
     terminal or a seat's typing is): an answer and its context are stored together or not at all, and the lock is
@@ -467,16 +479,20 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
     the echo it returns always says what was recorded.
 
     An authority item (``plan.sheets``, D8 SIG-ONLY) records NOTHING here: its existing signing ceremony is named with
-    the pick preselected (``Applied.sheets``), and only if the item is still open now. No ruling, signature or answer
-    is written for it by this function."""
+    the pick preselected (``Applied.sheets``), and only if the item is still open now: each is read again here, at
+    apply time, so an item closed since the plan was made opens nothing. No ruling, signature or answer is written
+    for it by this function."""
     recorded: list[str] = []
     refused = [r.reason for r in plan.refused]
     sheets: list[str] = []
+    fresh: dict[tuple[str, str], Extra] | None = None
+    fresh_complete: set[str] = set()
     for sh in plan.sheets:
         try:
             q = questions.get(sh.n)
             e = (extras or {}).get(sh.n)
             if q is not None:
+                q = store.get(q.id) or q                      # read again now: answered since the plan, or not
                 if q.answer is not None:
                     refused.append(f"{sh.n} was already answered ({q.answer.channel}, {q.answer.answered_at}); "
                                    "nothing opened")
@@ -485,7 +501,21 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
                 else:
                     sheets.append(f"{sh.label}: {_question_sheet_text(q, sh.pick)}")
             elif e is not None:
-                sheets.append(f"{sh.label}: {sheet_text(e, sh.pick, store.directory, environ)}")
+                if fresh is None:                             # once per apply, only when an authority item is named
+                    try:
+                        now = read_extras(store.directory, store._clock)
+                    except Exception:                         # noqa: BLE001 - said below, per item
+                        now = Extras(failed=["authority sources"])
+                    fresh = {(x.source, x.ref): x for x in now.items if x.unreadable is None}
+                    fresh_complete = now.complete
+                now_e = fresh.get((e.source, e.ref))
+                if now_e is not None:
+                    sheets.append(f"{sh.label}: {sheet_text(now_e, sh.pick, store.directory)}")
+                elif e.source in fresh_complete:
+                    refused.append(f"{sh.n} closed since the band you saw; nothing opened")
+                else:
+                    refused.append(f"{sh.n}: its source could not be read just now to check it is still open; "
+                                   "nothing opened (try again)")
             else:
                 refused.append(f"{sh.n} is no longer open; nothing opened")
         except Exception as exc:                              # one sheet's failure never costs the others
@@ -540,10 +570,10 @@ def format_echo(recorded: list[str], refused: list[str], via: str, hint: str | N
     line = f"[Levain band answer] recorded: {got}"
     if refused:
         line += "; refused: " + "; ".join(refused)
-    if sheets:
-        line += "; signature needed, nothing recorded (the item closes only when your signature verifies): " + "; ".join(sheets)
     if hint:
         line += f"; {hint}"
+    if sheets:
+        line += "; signature needed, nothing recorded (the item closes only when your signature verifies): " + "; ".join(sheets)
     return line
 
 
@@ -564,8 +594,7 @@ def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mappin
     if not plan.matched:
         return format_echo([], [], "seat", plan.hint) if plan.hint else ""
     return apply_plan(store, plan, questions, viewer=viewer, via="seat",
-                      seen_through=view.seen_through if view else 0, deadline=deadline, extras=extras,
-                      environ=environ).echo
+                      seen_through=view.seen_through if view else 0, deadline=deadline, extras=extras).echo
 
 
 def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> str:
@@ -725,7 +754,7 @@ def run_band_answer(args: argparse.Namespace) -> int:
     done = apply_plan(store, plan, questions, viewer="cli", via="cli", seen_through=view.seen_through if view else 0,
                       extras=extras)
     print(done.echo.replace("[Levain band answer] ", "levain band answer: "))
-    return 0 if done.recorded else EXIT_REFUSED
+    return 0 if done.recorded or done.sheets else EXIT_REFUSED
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:

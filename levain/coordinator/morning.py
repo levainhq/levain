@@ -120,9 +120,20 @@ def _undecided(qdir: Path) -> list[dict[str, Any]]:
     finally:
         conn.close()
     return [{"request_id": r[0], "agent": r[1], "session": r[2], "tool": r[3], "what": str(r[4])[:_FIELD],
-             "cwd": str(r[5])[:_FIELD], "tier": r[6], "gap": r[7], "undecided_at": r[8],
-             "rule": f"levain consent rule {r[7]} allow|deny --agent {r[1]} --session {r[2]} --signing-key KEY"}
+             "cwd": str(r[5])[:_FIELD], "tier": r[6], "gap": r[7], "undecided_at": r[8], "rule": _rule_line(r[7], r[1], r[2])}
             for r in rows]
+
+
+def _rule_line(gap: Any, agent: Any, session: Any) -> str:
+    """The late-ruling command the card prints for the operator to copy, or words when a value the request carries
+    (an agent could have written it) is not a plain token: such a value is never put in a line for his shell."""
+    from levain.band_sources import UnsafeValue, consent_rule_command
+
+    try:
+        return consent_rule_command(gap, "allow|deny", agent, session)
+    except UnsafeValue as bad:
+        return (f"no command shown (the request's {bad.what} is not a plain token, so it is not put in a line for "
+                "your shell): rule it from its card")
 
 
 def _thread_of(conn: sqlite3.Connection, store: CoordStore, request_id: str, session: str) -> str | None:
