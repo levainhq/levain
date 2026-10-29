@@ -636,6 +636,10 @@ def check_repo_layer(docs: Mapping[str, Any]) -> None:
 _AUTH_ROUTE = {"brokered": "brokered", "passthrough": "subscription_passthrough"}
 #: the host the Claude identity child's refresh goes to (:data:`levain.slot.identity_child.TOKEN_ORIGIN`)
 _TOKEN_HOST = IC.TOKEN_ORIGIN[1]
+#: the host the Claude identity child's profile call goes to (:data:`levain.slot.identity_child.ORIGIN`)
+_PROFILE_HOST = IC.ORIGIN[1]
+#: every host the identity child talks to through the passthrough route's tunnel, each with what needs it
+_IDENTITY_HOSTS = ((_TOKEN_HOST, "the login refresh"), (_PROFILE_HOST, "the login check"))
 _ROUTE_ID_SAID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}", re.ASCII)
 
 
@@ -656,25 +660,33 @@ def read_base_map(path: Path, *, read: Callable[[Path], bytes] = Path.read_bytes
 def pick_routes(base: Sequence[Mapping[str, Any]], vendor: str, auth: str) -> Tuple[str, ...]:
     """Every ``egress`` route of the base map (the git hosts and registries) plus EXACTLY ONE route of the auth's
     type for this vendor (§5.3: ≤ 1 brokered + ≤ 1 passthrough per vendor; render refuses a brokered session without
-    its route). Refused ``no-route:<auth>`` / ``route-ambiguous:<auth>`` by name."""
+    its route). Refused ``no-route:<auth>`` / ``route-ambiguous:<auth>`` by name, and a Claude passthrough route lacking
+    a host the identity child talks to ``passthrough-route-lacks-token-host``."""
     need = _AUTH_ROUTE[auth]
     egress = [r["route"] for r in base if r.get("type") == "egress" and type(r.get("route")) is str]
-    mine = [r["route"] for r in base if r.get("type") == need and type(r.get("route")) is str
+    # the selected route MAPPINGS, not their ids: a later check reads the very entry chosen here, never a re-lookup by
+    # id (which could land on an egress entry or a duplicate sharing the id).
+    mine = [r for r in base if r.get("type") == need and type(r.get("route")) is str
             and _hosts(r) & VENDOR_HOSTS[vendor]]
     if not mine:
         raise Refused(f"no-route:{auth}", f"{vendor}: the base map has no {need} route")
     if len(mine) > 1:
-        raise Refused(f"route-ambiguous:{auth}", f"{vendor}: {', '.join(sorted(mine))}")
+        raise Refused(f"route-ambiguous:{auth}", f"{vendor}: {', '.join(sorted(r['route'] for r in mine))}")
+    route = mine[0]
     if vendor == "claude" and auth == "passthrough":
-        # 1029 ruling (np-e5b2ebed (a)): refuse at route load and name the host; never merge a host into his route.
-        # The login refresh POSTs to the token host through this route's tunnel, so a route without it makes every
-        # refresh fail (identity-unreachable forever).
-        route = next(r for r in base if r.get("route") == mine[0])
-        if _TOKEN_HOST not in _hosts(route):
-            rid = mine[0] if _ROUTE_ID_SAID_RE.fullmatch(mine[0]) else "(its id is not shown)"
+        # 1029 ruling (np-e5b2ebed (a)): refuse at route load and name the hosts; never merge a host into his route.
+        # The identity child POSTs the refresh to the token host and GETs the profile from the profile host, both
+        # through this route's tunnel, so a route without either makes every launch fail its identity check.
+        hs = _hosts(route)
+        missing = [(h, why) for h, why in _IDENTITY_HOSTS if h not in hs]
+        if missing:
+            rid = route["route"] if _ROUTE_ID_SAID_RE.fullmatch(route["route"]) else "(its id is not shown)"
+            names = " and ".join(h for h, _ in missing)
+            needs = (f"{missing[0][1]} needs it" if len(missing) == 1
+                     else f"{' and '.join(why for _, why in missing)} need them")
             raise Refused("passthrough-route-lacks-token-host",
-                          f"add {_TOKEN_HOST} to the hosts of route {rid} in the base map: the login refresh needs it")
-    return tuple(sorted(set(egress))) + (mine[0],)
+                          f"add {names} to the hosts of route {rid} in the base map: {needs}")
+    return tuple(sorted(set(egress))) + (route["route"],)
 
 
 def git_identity(repo: Path, *, git: str = "git",
