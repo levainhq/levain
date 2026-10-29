@@ -116,9 +116,11 @@ def _args(tmp_path, word, said=None, duration=None):
 
 
 def _as_agent(monkeypatch, session="abc12345-seat", coordinator=False):
+    from levain.coordinator import first_reader
+
     monkeypatch.setattr(band, "agent_process", lambda: "claude_code")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", session)
-    monkeypatch.setattr(band, "_coordinator_caller", lambda directory: coordinator)
+    monkeypatch.setattr(first_reader, "is_coordinator_session", lambda directory, sess: coordinator and sess == session)
 
 
 def _as_operator(monkeypatch):
@@ -169,3 +171,85 @@ def test_cli_the_parser_takes_said_on_every_word():
     assert got.said == "heading out" and got.word == "away"
     assert top.parse_args(["ping", "remote", "2h", "--said", "x"]).duration == "2h"
     assert top.parse_args(["ping", "back"]).said is None
+
+
+# L3 round 1: identity fails closed, the role comes from the selected session, loud is the operator's
+
+def test_cli_a_second_failed_detection_does_not_turn_a_seat_into_the_operator(tmp_path, monkeypatch, capsys):
+    answers = iter(["claude_code", None, None])   # the first scan sees the seat; any later scan sees nothing
+    monkeypatch.setattr(band, "agent_process", lambda: next(answers, None))
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    assert cli._word(_args(tmp_path, "quiet", duration="30m")) == 2
+    assert "operator's own word" in capsys.readouterr().out
+    assert not _file(tmp_path).exists()
+
+
+def test_cli_a_detected_agent_whose_identity_cannot_be_named_is_refused_not_the_operator(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(band, "agent_process", lambda: "not-an-agent")
+    assert cli._word(_args(tmp_path, "back")) == 2
+    assert "levain ping back" in capsys.readouterr().out
+    assert not _file(tmp_path).exists()
+
+
+def test_cli_a_codex_seat_under_a_coordinator_is_a_seat_not_the_coordinator(tmp_path, monkeypatch, capsys):
+    from levain.coordinator import first_reader
+
+    monkeypatch.setattr(band, "agent_process", lambda: "codex")
+    monkeypatch.setenv("CODEX_THREAD_ID", "codex-seat-1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "inherited-coord")   # the coordinator's, inherited, not this seat's
+    monkeypatch.setattr(first_reader, "is_coordinator_session", lambda directory, sess: sess == "inherited-coord")
+    assert cli._word(_args(tmp_path, "quiet", said="quiet till noon", duration="1h")) == 2
+    assert "operator's own word" in capsys.readouterr().out
+    assert not _file(tmp_path).exists()
+
+
+def test_cli_the_role_check_failing_reads_as_a_seat(tmp_path, monkeypatch):
+    from levain.coordinator import first_reader
+
+    def boom(directory, sess):
+        raise OSError("store unreadable")
+
+    _as_agent(monkeypatch)
+    monkeypatch.setattr(first_reader, "is_coordinator_session", boom)
+    assert cli._word(_args(tmp_path, "quiet", said="x", duration="1h")) == 2
+    assert cli._word(_args(tmp_path, "away", said="heading out")) == 0
+    assert read_word(tmp_path)["by"]["role"] == "seat"
+
+
+@pytest.mark.parametrize("by,word", [(SEAT, "away"), (COORD, "quiet"), (COORD, "sleep")])
+def test_a_setter_cannot_replace_a_standing_loud(tmp_path, by, word):
+    set_word(tmp_path, "loud", duration="2h", now=NOW)
+    before = _file(tmp_path).read_text()
+    with pytest.raises(PresenceError, match="operator's standing word"):
+        set_word(tmp_path, word, now=NOW + 60, by=by, said="he said so")
+    assert _file(tmp_path).read_text() == before
+
+
+def test_a_setter_may_write_over_a_loud_that_has_ended_and_the_operator_over_a_live_one(tmp_path):
+    set_word(tmp_path, "loud", duration="1m", now=NOW)
+    assert set_word(tmp_path, "away", now=NOW + 3600, by=SEAT, said="heading out")["by"] == SEAT
+    set_word(tmp_path, "loud", duration="2h", now=NOW)
+    assert set_word(tmp_path, "quiet", duration="10m", now=NOW + 60)["word"] == "quiet"
+
+
+@pytest.mark.parametrize("by", [{"role": "coordinator"}, {"agent": " ", "session": "s", "role": "seat"},
+                                {"agent": 7, "role": "seat"}, "coordinator", ["seat"]])
+def test_a_setter_that_names_no_agent_is_refused_and_nothing_is_written(tmp_path, by):
+    with pytest.raises(PresenceError, match="names no agent"):
+        set_word(tmp_path, "away", by=by, said="heading out")
+    assert not _file(tmp_path).exists()
+
+
+def test_a_said_that_is_not_text_is_a_missing_quote_not_a_crash(tmp_path):
+    for said in (5, ["x"], b"x"):
+        with pytest.raises(PresenceError, match="--said"):
+            set_word(tmp_path, "away", by=SEAT, said=said)
+    assert not _file(tmp_path).exists()
+
+
+def test_cli_said_help_names_the_dash_form(capsys):
+    top = argparse.ArgumentParser()
+    cli.register(top.add_subparsers(dest="cmd"))
+    with pytest.raises(SystemExit):
+        top.parse_args(["ping", "away", "-h"])
+    assert '--said="-text"' in " ".join(capsys.readouterr().out.split())

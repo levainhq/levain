@@ -55,7 +55,7 @@ def register(subparsers) -> None:
         w.add_argument("--said", default=None, metavar="WORDS",
                        help="Run inside an agent session: the words the operator told you, quoted (required there, "
                             "recorded beside the word). Which words an agent may set: presence.SEAT_WORDS and "
-                            "COORDINATOR_WORDS.")
+                            "COORDINATOR_WORDS. (Use --said=\"-text\" if the quote starts with a dash.)")
         w.set_defaults(func=_word, word=word)
     common(sub.add_parser("status", help="Whether a ping is pushed now, and why.")).set_defaults(func=_status)
 
@@ -71,15 +71,26 @@ def _setter(qdir: Path) -> dict | None:
     :func:`band._agent_and_session` names them, role ``coordinator`` for a session Levain started as one, else ``seat``), or ``None``
     for the operator's own shell. The role is a channel label under one uid, not a boundary: it records intent."""
     from levain.consent import band
+    from levain.webpush import presence
 
-    if band.agent_process() is None:
+    agent = band.agent_process()   # detected once: a second scan that comes back empty must not make a seat the operator
+    if agent is None:
         return None
     try:
-        agent, session = band._agent_and_session(None, None)
-    except ValueError:
-        return None
-    return {"agent": agent, "session": "" if session == band.NO_SESSION else session,
-            "role": "coordinator" if band._coordinator_caller(qdir) else "seat"}
+        agent, session = band._agent_and_session(agent, None)
+    except ValueError as e:
+        raise presence.PresenceError(f"an agent session is detected but cannot be named ({e}): the word is not set") from e
+    session = "" if session == band.NO_SESSION else session
+    role = "seat"
+    if session:   # the role comes from the selected session alone, never from another agent's inherited variable
+        try:
+            from levain.coordinator.first_reader import is_coordinator_session
+
+            if is_coordinator_session(qdir, session):
+                role = "coordinator"
+        except Exception:  # noqa: BLE001 - a role that cannot be checked is the narrower one
+            pass
+    return {"agent": agent, "session": session, "role": role}
 
 
 def _word(args: argparse.Namespace) -> int:

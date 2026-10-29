@@ -25,10 +25,10 @@ predicted. With no such source, or no readable word, nothing is muted and the de
 need costs one notification, a ping he needed and never got costs the day. This host has no location signal, so
 ``not_home`` is the ``away`` word alone.
 
-A word may carry who set it. A seat the operator told ("heading out") may set only :data:`SEAT_WORDS` (``away`` and
-``remote``, the words that raise pushes), and the coordinator also :data:`COORDINATOR_WORDS`' ``quiet`` and ``sleep``;
-``back`` and ``loud`` stay his. A setter's write is refused unless it quotes his words,
-and the record keeps the setter and the quote beside the word. The setter's role comes from the caller's session
+A word may carry who set it. A seat the operator told ("heading out") may set only :data:`SEAT_WORDS`, and the
+coordinator only :data:`COORDINATOR_WORDS`; every other word, and a standing ``loud`` (no setter replaces it), stays his.
+A setter's write is refused unless it names an agent and quotes his words, and the record keeps the setter and the quote
+beside the word. The setter's role comes from the caller's session
 identity, which is a label under one uid and not a boundary: it records intent, it does not stop a process that hides
 its environment.
 
@@ -200,15 +200,19 @@ def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = 
 def check_setter(word: str, by: dict | None, said: str | None) -> str:
     """The quote to record for a setter's write, or a raised :class:`PresenceError` saying why it is refused. ``by``
     is ``{"agent", "session", "role"}`` with role ``seat`` or ``coordinator``. Pure: a refusal writes nothing."""
-    role = (by or {}).get("role")
+    if not isinstance(by, dict):
+        raise PresenceError("the setter names no agent")
+    role = by.get("role")
     if role not in ROLES:
         raise PresenceError("the setter's role is neither seat nor coordinator")
+    if not _clean(by.get("agent"), _FIELD_MAX):   # what `_provenance` requires on read, so a word written here is shown as set
+        raise PresenceError("the setter names no agent")
     allowed = COORDINATOR_WORDS if role == "coordinator" else SEAT_WORDS
     if word not in allowed:
         who = "the coordinator" if role == "coordinator" else "a seat"
         raise PresenceError(f"`{word}` is the operator's own word: {who} may set only {', '.join(f'`{w}`' for w in allowed)}"
                             " (the operator says it himself; from a terminal outside any agent session the operator sets any word)")
-    raw = said or ""
+    raw = said if isinstance(said, str) else ""
     if len(raw) > _SAID_MAX:
         raise PresenceError(f"--said is too long: quote the sentence he said, at most {_SAID_MAX} characters")
     quote = _clean(raw, _SAID_MAX)
@@ -231,6 +235,9 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
     quote = check_setter(word, by, said) if by is not None else None
     ts = time.time() if now is None else now
     prior = read_word(queue_dir)
+    if by is not None and _active(prior, "loud", ts):
+        raise PresenceError("`loud` is the operator's standing word; a seat cannot replace it "
+                            "(the operator says `loud off` himself)")
     if word == "loud" and (duration or "").strip().lower() == "off":
         if _active(prior, "loud", ts) or (prior and prior["word"] == "loud"):
             _write(queue_dir, None)
