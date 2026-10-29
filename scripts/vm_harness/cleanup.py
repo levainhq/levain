@@ -5,6 +5,11 @@ Harness code, not product code: it lives outside the shipped ``levain/`` package
 (``alloc`` / ``mint`` / ``render`` / ``revoke`` / process lister), so the logic is unit-tested without a VM or
 root. The real REVOKE is :func:`control_revoke` (the repo's own ``ControlClient`` and the ``REVOKE`` CONTROL
 verb, ``root`` caller class); the real lister runs ``ps`` with NO argv column (argv can carry secrets).
+
+Known edge (documented, deliberately not machined around): an AMBIGUOUS alloc/mint, where ``alloc`` committed or
+``mint`` created a session but the id never reached the journal (crash or lost reply in between). The walk has no
+id to REVOKE. The backstops are the ``_levain_gw<n>`` uid scan (catches any spawned process) and the slot-state
+check the VM driver (S-C) makes after the run.
 """
 from __future__ import annotations
 
@@ -12,6 +17,7 @@ import json
 import os
 import pwd
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -42,17 +48,20 @@ class Survivor:
 # -- S-A: the journal --------------------------------------------------------------------------------------
 
 class CleanupJournal:
-    """JSONL, one fsynced line per entry."""
+    """JSONL, one fsynced entry per append. The journal directory must already exist (it is not created here)."""
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.parent.is_dir():
+            raise FileNotFoundError(f"journal directory does not exist: {self.path.parent}")
 
     def append(self, entry: dict) -> None:
-        line = (json.dumps(entry, sort_keys=True) + "\n").encode()
+        # Leading newline: a torn previous line can never swallow this entry (the walker skips blank/torn lines).
+        data = memoryview(("\n" + json.dumps(entry, sort_keys=True) + "\n").encode())
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
-            os.write(fd, line)
+            while data:   # os.write may be short
+                data = data[os.write(fd, data):]
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -152,32 +161,54 @@ def scan_survivors(uids: Iterable[int | str], lister: Callable[[], str] = defaul
     return [r for r in parse_ps(lister()) if r.uid in want]
 
 
+def scan_until_clear(uids: Iterable[int | str], lister: Callable[[], str] = default_lister, *,
+                     resolve: Callable[[str], int | None] = _resolve_name,
+                     clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], object] = time.sleep,
+                     deadline_s: float = 60.0, interval_s: float = 1.0) -> list[Survivor]:
+    """REVOKE only wakes an asynchronous reaper, so poll the scan until no survivor or the deadline; report
+    survivors only then."""
+    end = clock() + deadline_s
+    while True:
+        found = scan_survivors(uids, lister, resolve=resolve)
+        if not found or clock() >= end:
+            return found
+        sleep(interval_s)
+
+
 # -- the run -----------------------------------------------------------------------------------------------
 
 def run_with_cleanup(journal: CleanupJournal, body: Callable[[CleanupJournal], object],
-                     revoke: Callable[[str], object], *, uids: Iterable[int | str] = (),
+                     revoke: Callable[[str], object], *, uids: Iterable[int | str],
                      lister: Callable[[], str] = default_lister,
-                     resolve: Callable[[str], int | None] = _resolve_name) -> None:
-    """Run ``body``; in a ``finally`` walk the journal, then scan the uids. Cleanup problems fail the run: if
-    ``body`` raised they are attached to its exception as notes, otherwise :class:`CleanupFailed` is raised."""
+                     resolve: Callable[[str], int | None] = _resolve_name,
+                     clock: Callable[[], float] = time.monotonic,
+                     sleep: Callable[[float], object] = time.sleep, deadline_s: float = 60.0) -> None:
+    """Run ``body``; in a ``finally`` walk the journal, then scan the uids (polling up to ``deadline_s``).
+    ``uids`` is required: an empty ``uids=()`` is the caller's explicit opt-out of the survivor scan. Cleanup
+    problems fail the run: if ``body`` raised they are attached to its exception as notes, otherwise
+    :class:`CleanupFailed` is raised."""
     problems: list[str] = []
+    poll = dict(clock=clock, sleep=sleep, deadline_s=deadline_s)
     try:
         body(journal)
     except BaseException as e:
-        _cleanup(journal, revoke, uids, lister, resolve, problems)
+        _cleanup(journal, revoke, uids, lister, resolve, problems, poll)
         for p in problems:
             e.add_note(f"cleanup: {p}")
         raise
-    _cleanup(journal, revoke, uids, lister, resolve, problems)
+    _cleanup(journal, revoke, uids, lister, resolve, problems, poll)
     if problems:
         raise CleanupFailed("; ".join(problems))
 
 
-def _cleanup(journal, revoke, uids, lister, resolve, problems: list[str]) -> None:
-    for f in walk_journal(journal.path, revoke):
-        problems.append(f"REVOKE {f.session} failed: {f.error}")
+def _cleanup(journal, revoke, uids, lister, resolve, problems: list[str], poll: dict) -> None:
     try:
-        for s in scan_survivors(uids, lister, resolve=resolve):
+        for f in walk_journal(journal.path, revoke):
+            problems.append(f"REVOKE {f.session} failed: {f.error}")
+    except Exception as e:   # noqa: BLE001 - a journal read/parse error must not mask the body or skip the scan
+        problems.append(f"journal walk failed: {type(e).__name__}: {e}")
+    try:
+        for s in scan_until_clear(uids, lister, resolve=resolve, **poll):
             problems.append(f"surviving process pid={s.pid} uid={s.uid} {s.ucomm} etime={s.etime}")
     except Exception as e:   # noqa: BLE001 - an unscannable uid or failed ps is a failed run, not a silent pass
         problems.append(f"uid scan failed: {type(e).__name__}: {e}")
