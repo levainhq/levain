@@ -1573,8 +1573,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         from levain.band_view import gate_notice
 
         notice = gate_notice(queue.directory, AGENT, session, cwd, environ, deliverable=not stopped)
-    except Exception:
-        notice = None  # a notice is not the gate's to fail on
+    except ImportError:
+        notice = None  # gate_notice swallows its own errors (cwd is a checked absolute str here); only the import can fail
     context = "\n".join(c for c in (context, answers, notice) if c) or None
     if context:
         out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}
