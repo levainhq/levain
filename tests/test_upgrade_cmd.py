@@ -671,3 +671,16 @@ def test_a_closed_stdout_pipe_does_not_stop_the_exec(env, monkeypatch):
     s.execv = lambda p, a, e: execed.append(a)
     U.run_upgrade(seams=s)
     assert execed
+
+
+def test_missing_dist_info_refuses_not_internal_error(env, capsys):
+    import importlib.metadata as md
+
+    def no_dist():
+        raise md.PackageNotFoundError("levain")
+
+    seams = env.seams()
+    seams.dist = no_dist
+    rc = U.run_upgrade(seams=seams)
+    out = capsys.readouterr().out
+    assert rc == 1 and "Could not tell how Levain was installed" in out and "internal error" not in out
