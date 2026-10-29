@@ -5772,6 +5772,17 @@
     modalEpisodeQuery = "";
     buildModal(null);
   }
+  // The way in for another script's focus view (the Board tab's ⤢): a custom modal with that script's own content. `live` keeps it open
+  // across a dashboard refresh and rebuilds its content then (refreshModal); a modal that is not live is closed as a Needs-you card is.
+  function openCustom(spec) {
+    if (!spec || typeof spec.build !== "function") return;
+    modalCustom = { id: String(spec.id || "custom"), title: String(spec.title || "panel"), build: spec.build, live: spec.live === true };
+    modalGlance = false;
+    modalKey = "custom:" + modalCustom.id;
+    modalReturnFocus = spec.opener || null;
+    modalEpisodeQuery = "";
+    buildModal(null);
+  }
   // The reader id a compose panel of the current view gives the seat called `name`, or null: a panel whose own action carries a recipient
   // field with a declared `transient_prefix`, whose enum (the one the view holds NOW) has prefix + name. Read from the view, never from a
   // chip on the compose card, so a card that is folded, on another tab, mid-send or drawn without that chip does not decide it.
@@ -7079,6 +7090,7 @@
     // a Needs-you card keeps its place (and any words typed into it) while the item still waits; it closes when the item is answered
     if (modalCustom) {
       if (modalCustom.page) return;   // an agent page is not tied to a waiting item
+      if (modalCustom.live) { buildModal(null); return; }   // a live view repaints from its own source and stays open
       if (!needsItems(((currentView && currentView.extra_panels || {}).decisions || {}).lines).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
       return;
     }
@@ -7266,5 +7278,5 @@
 
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

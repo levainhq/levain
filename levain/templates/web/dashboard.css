@@ -2704,7 +2704,7 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
   .th-body .tv-head .tv-at { margin-left: 0; }
 }
 
-/* C12: the Board tab's read-only ready-queue zone (board_view.js, bd-*). Six derived columns; one column on a narrow page. */
+/* C12: the Board tab's read-only ready-queue zone (board_view.js, bd-*). The tab lists cards grouped under column headings; the six columns (one on a narrow page) are the ⤢ modal's. */
 .bd-zone { margin-top: var(--sec, var(--sp-7)); }
 .bd-zone[hidden] { display: none; }
 body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
@@ -2716,6 +2716,12 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
 .bd-card { margin: 0 0 var(--sp-3); padding: var(--sp-3) var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-sm); overflow-wrap: anywhere; }
 .bd-title { font: var(--fw-semibold) var(--fs-meta)/1.4 var(--sans); color: var(--text); }
 .bd-journal { margin-top: var(--sp-2); }
+/* the tab's grouped list: a .grp-head per column, the cards as plain rows under it (the six-column body above is the modal's) */
+.bd-groups .grp-head { margin-top: var(--sp-4); }
+.bd-groups .grp-head:first-child { margin-top: 0; }
+.bd-row { padding: var(--sp-2) 0 var(--sp-2) var(--sp-3); overflow-wrap: anywhere; }
+.bd-row + .bd-row { border-top: 1px solid var(--hair-2); }
+.bd-groups .bd-empty { padding-left: var(--sp-3); margin: 0; }
 .bd-held, .bd-note { font: var(--fw-regular) var(--fs-micro)/1.5 var(--sans); color: var(--warn); }
 .bd-gloss, .bd-empty, .bd-say { margin: 0 0 var(--sp-2); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); }
 .bd-tell { margin-top: var(--sp-5); display: grid; gap: var(--sp-2); }

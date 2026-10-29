@@ -59,9 +59,41 @@ async function scenario(o) {
   await tick(); await tick();
   return { posts: seen.posts, reads: seen.reads, say: say.textContent, wordsHidden: ta.hidden, store, pre, keysRead, value: ta.value, hashAfterMount, hash: globalThis.location.hash, handlers: handlers.length };
 }
+// The grouped list and the six-column body over ONE model: what each draws, and what the mounted tab holds.
+const walk = (n, out = []) => { out.push(n); (n.children || []).forEach((c) => walk(c, out)); return out; };
+const BODY = { queue: "ok", tell: { offered: true }, columns: [
+  { category: "backlog", cards: [{ id: "levain:c", title: "Later C", repo: "levain", tier: "sonnet", held_reason: "depends on levain:a", journal: { who: "desk", iso: "t", to_category: "backlog", why: "queued it." } }] },
+  { category: "running", cards: [{ id: "levain:a", title: "Land A", repo: "levain", tier: "sonnet", journal: { who: "seat-9", iso: "t", from_category: "ready", to_category: "running", why: "took it." } }] },
+  { category: "needs-you", cards: [{ id: "q-1", title: "Ship the sweep fix", number: 3, band: true }] }] };
+async function grouped() {
+  const model = V.boardModel(BODY);
+  const g = node("div"), c = node("div");
+  V.renderGrouped(doc, g, model);
+  V.renderBoard(doc, c, model);
+  const gAll = walk(g), cAll = walk(c);
+  const text = (n) => n.textContent + n.children.map(text).join("");
+  const heads = gAll.filter((n) => n.className === "grp-head").map((n) => n.textContent);
+  const rows = gAll.filter((n) => n.className === "bd-row");
+  const host = node("div"); host.ownerDocument = doc;
+  const h = V.mount(host, { fetch: (url) => resp(200, BODY), storage: { getItem: () => null, setItem() {}, removeItem() {} }, pollMs: 0, headers: () => ({}), hash: "" });
+  const before = h.model();
+  await tick();
+  const view = walk(host);
+  return {
+    heads, rowIds: rows.map((n) => n.dataset.id), rowText: rows.map(text),
+    groupedColsBody: gAll.filter((n) => n.className === "bd-cols" || n.className === "bd-col").length,
+    boardCols: cAll.filter((n) => n.className === "bd-col").map((n) => n.dataset.category),
+    boardColsBody: cAll.filter((n) => n.className === "bd-cols").length,
+    mountedGroupHeads: view.filter((n) => n.className === "grp-head").length,
+    mountedColsBody: view.filter((n) => n.className === "bd-cols").length,
+    mountedButtons: view.filter((n) => n.tag === "button").length,
+    modelBefore: before, modelAfter: h.model() && h.model().columns.map((x) => x.category + ":" + x.cards.length),
+  };
+}
 (async () => {
   const on = { offered: true, why: null };
   const out = {};
+  out.grouped = await grouped();
   out.not_offered = await scenario({ tell: { offered: false, why: "different queue" }, listing: { coord_store_read: true, coord_store_id: "S" }, type: "hi" });
   out.unreadable = await scenario({ tell: on, listing: { coord_store_read: false, coord_store_id: null, coord_note: "store locked" }, type: "hi" });
   out.double_click = await scenario({ tell: on, listing: { coord_store_read: true, coord_store_id: "S" }, type: "hi", clicks: 2 });

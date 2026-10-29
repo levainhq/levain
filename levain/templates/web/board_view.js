@@ -1,7 +1,8 @@
 // levain board_view.js — the cockpit's read-only ready-queue board (C12).
 //
 // The audit window over the coordinator's work: six DERIVED columns (backlog, ready, running, waiting, needs-you, done)
-// drawn from GET /cockpit/board.json. Read-only: no drag, no edit, no rename (C14 is a 1.1 fast-follow). Each card shows
+// drawn from GET /cockpit/board.json. The Board tab lists the cards grouped under those column headings; the six columns
+// side by side are drawn (by renderBoard) in the panel's ⤢ focus modal. Read-only: no drag, no edit, no rename (C14 is a 1.1 fast-follow). Each card shows
 // its journal line (who moved it, when, why). The one way to change anything is the "tell the coordinator" box, which
 // sends the operator's WORDS through the existing drop route (POST /cockpit/coord/drop), with the drop sheet's own
 // outbox idiom: the outbox id is picked once per words and kept in this browser before the post, so a resend after a lost
@@ -67,14 +68,49 @@
     return n;
   }
 
-  function renderBoard(doc, host, model) {
-    host.replaceChildren();
+  // The queue's own state, said before any column (shared by the grouped tab and the modal's columns).
+  function drawNote(doc, host, model) {
     var note = [];
     if (model.queue === "none") note.push("No queue yet: the coordinator has not filed any work.");
     if (model.queue === "unreadable") note.push("The queue could not be read; this is not an empty queue.");
     model.unreadable.forEach(function (u) { note.push("Could not read: " + u + "."); });
     if (model.note && model.queue !== "none") note.push(model.note);
     if (note.length) host.appendChild(el(doc, "p", "bd-note", note.join(" ")));
+  }
+
+  // The Board tab's body: the cards GROUPED UNDER COLUMN HEADINGS (one heading per column, in the model's order, each with its
+  // count), the cards under it as list rows. The six-column body is renderBoard's, drawn in the focus modal.
+  function renderGrouped(doc, host, model) {
+    host.replaceChildren();
+    drawNote(doc, host, model);
+    var wrap = el(doc, "div", "bd-groups");
+    model.columns.forEach(function (col) {
+      var h = el(doc, "div", "grp-head", col.category + " " + col.cards.length);
+      h.dataset.category = col.category;
+      wrap.appendChild(h);
+      if (col.category === "needs-you") {
+        wrap.appendChild(el(doc, "p", "bd-gloss", "These are the Needs you band. Answer there (`" + model.hint + "`)."));
+      }
+      if (!col.cards.length) wrap.appendChild(el(doc, "p", "bd-empty", "nothing"));
+      col.cards.forEach(function (k) {
+        var row = el(doc, "div", "bd-row");
+        row.dataset.id = k.id;
+        row.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + k.title));
+        var meta = [k.repo, k.tier, k.source, k.id].filter(Boolean).join(" · ");
+        if (meta) row.appendChild(el(doc, "div", "bd-meta", meta));
+        if (k.held) row.appendChild(el(doc, "div", "bd-held", "held: " + k.held));
+        if (k.malformed) row.appendChild(el(doc, "div", "bd-held", "not well formed (no done line or tier)"));
+        if (k.unknownCategory) row.appendChild(el(doc, "div", "bd-held", "unknown category: " + k.unknownCategory));
+        if (!k.band) row.appendChild(el(doc, "div", "bd-journal", k.journal));
+        wrap.appendChild(row);
+      });
+    });
+    host.appendChild(wrap);
+  }
+
+  function renderBoard(doc, host, model) {
+    host.replaceChildren();
+    drawNote(doc, host, model);
     var wrap = el(doc, "div", "bd-cols");
     model.columns.forEach(function (col) {
       var c = el(doc, "section", "bd-col");
@@ -277,19 +313,33 @@
     host.append(view, tell);
     var tellBox = mountTell(doc, tell, opts);
     var timer = null, stopped = false;
+    var lastModel = null;       // the model of the last good pull: the ⤢ modal draws its columns from it
+    var watchers = [];
     function pull() {
       return f(BOARD_PATH, { cache: "no-store", headers: headers() }).then(function (res) {
         if (res.status === 403) { view.textContent = "The board needs this page's write token."; return; }
         if (!res.ok) { view.textContent = "The board could not be read (HTTP " + res.status + ")."; return; }
-        return res.json().then(function (b) { if (stopped) return; var m = boardModel(b); renderBoard(doc, view, m); tellBox.offer(m.tell.offered, m.tell.why); });
+        return res.json().then(function (b) {
+          if (stopped) return;
+          var m = lastModel = boardModel(b);
+          renderGrouped(doc, view, m);
+          tellBox.offer(m.tell.offered, m.tell.why);
+          watchers.slice().forEach(function (w) { w(m); });
+        });
       }).catch(function () { if (!stopped) view.textContent = "The board could not be reached."; });
     }
     function loop() { if (!stopped && pollMs > 0) timer = setTimeout(function () { pull().then(loop); }, pollMs); }
     pull().then(loop);
-    return { stop: function () { stopped = true; if (timer) clearTimeout(timer); tellBox.dispose(); }, pull: pull };
+    return {
+      stop: function () { stopped = true; watchers = []; if (timer) clearTimeout(timer); tellBox.dispose(); },
+      pull: pull,
+      model: function () { return lastModel; },
+      // `fn(model)` after every good pull; the returned function stops it
+      watch: function (fn) { watchers.push(fn); return function () { watchers = watchers.filter(function (w) { return w !== fn; }); }; }
+    };
   }
 
-  var api = { boardModel: boardModel, journalLine: journalLine, renderBoard: renderBoard, mount: mount };
+  var api = { boardModel: boardModel, journalLine: journalLine, renderBoard: renderBoard, renderGrouped: renderGrouped, mount: mount };
   root.LevainBoardView = api;
 
   // The Board tab's zone (the thread view's mounting idiom): hidden on a page holding no write token; polls only while the
@@ -318,6 +368,40 @@
     section.appendChild(grid);
     doc.querySelector("main.frame").appendChild(section);
     var view = null;
+    // ⤢ "focus this panel": the six columns, drawn by renderBoard (the same renderer), in the dashboard's own focus modal. It is
+    // drawn only when the dashboard exports the way in (a page without it has no modal to open), in the panel head and never in
+    // the mounted host (the tell box holds the one button there). The modal has no tell box. Each good pull repaints it.
+    var D = root.LevainDashboard;
+    if (D && typeof D.openCustom === "function") {
+      var expand = el(doc, "button", "pexpand");
+      expand.type = "button";
+      expand.title = "focus this panel";
+      expand.setAttribute("aria-label", "expand Board to a focus view");
+      expand.appendChild(el(doc, "span", "pexpand-ico", "⤢"));
+      var modalHost = null, unwatch = null;
+      var paint = function (m) {
+        modalHost.replaceChildren();
+        if (m) renderBoard(doc, modalHost, m);
+        else modalHost.appendChild(el(doc, "p", "bd-note", "The board has not been read yet."));
+      };
+      expand.addEventListener("click", function () {
+        if (unwatch) unwatch();
+        unwatch = null;
+        D.openCustom({
+          id: "ready-board", title: "Board", live: true, opener: expand,
+          build: function () {      // one host per build (a dashboard refresh builds again); the pull paints the latest one
+            modalHost = el(doc, "div", "bd-modal");
+            paint(view && view.model());
+            return modalHost;
+          }
+        });
+        if (view) unwatch = view.watch(function (m) {
+          if (modalHost && doc.body.contains(modalHost)) paint(m);
+          else if (unwatch) { unwatch(); unwatch = null; }
+        });
+      });
+      ph.appendChild(expand);
+    }
     function sync() {
       var want = !!token() && doc.body.dataset.mode === "board" && doc.visibilityState !== "hidden";
       section.hidden = !token();

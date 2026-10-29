@@ -230,6 +230,26 @@ def test_the_tell_box_behaves_under_node():
     assert len(same) == 1 and same[0]["outbox_id"] == "ph-old" and out["same_pending"]["reads"] == 0
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_tab_lists_cards_grouped_under_column_headings_and_the_modal_draws_the_columns():
+    """One model feeds both: `renderGrouped` (the Board tab) draws one `grp-head` per column with its count and the cards as
+    rows, no `bd-cols` body; `renderBoard` (the modal) still draws the six `bd-col`. The mounted tab holds the grouped list."""
+    g = _tell_run()["grouped"]
+    assert g["heads"] == ["backlog 1", "ready 0", "running 1", "waiting 0", "needs-you 1", "done 0"]
+    assert g["rowIds"] == ["levain:c", "levain:a", "q-1"]
+    assert g["groupedColsBody"] == 0                                              # no columns body in the panel
+    assert g["boardCols"] == ORDER and g["boardColsBody"] == 1                    # the modal's renderer is unchanged
+    assert any("held: depends on levain:a" in t and "levain · sonnet · levain:c" in t for t in g["rowText"])
+    assert any("seat-9" in t and "ready → running" in t for t in g["rowText"])    # a card's journal line
+    assert any(t.startswith("3. Ship the sweep fix") for t in g["rowText"])       # the band card's number leads
+    assert g["mountedGroupHeads"] == 6 and g["mountedColsBody"] == 0              # the mounted tab is the grouped list
+    assert g["mountedButtons"] == 1                                               # the tell box's Send is the only button in the host
+    assert g["modelBefore"] is None and g["modelAfter"] == ORDER_COUNTS           # the handle's model() is the last pull
+
+
+ORDER_COUNTS = ["backlog:1", "ready:0", "running:1", "waiting:0", "needs-you:1", "done:0"]
+
+
 def _tell_run():
     root = Path(__file__).resolve().parent.parent
     run = subprocess.run(["node", str(root / "tests" / "js_board_tell_harness.js"),
