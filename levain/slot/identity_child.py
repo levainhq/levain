@@ -52,6 +52,10 @@ OAUTH_BETA = "oauth-2025-04-20"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 #: (scheme, host, port): the one origin the refresh token is sent to.
 TOKEN_ORIGIN = ("https", "platform.claude.com", 443)
+#: The token host's front answers urllib's default ``Python-urllib/x`` agent with HTTP 403 (``error code: 1010``) before
+#: the request reaches the OAuth server (VM run 10-29: the first real refresh was refused 403, nothing spent). This is our
+#: own name, not another client's.
+TOKEN_USER_AGENT = "levain-identity-check/1"
 #: M0: ``CLIENT_ID:"9d1c250a-e61b-44d9-88ed-5944d1962f5e"``, the id Claude Code's refresh sends when the stored login
 #: names none. Claude Code 2.1.312 sends the stored one when it does (``eie(ie.refreshToken,{scopes:Ee,clientId:
 #: ie.clientId,...})`` -> ``client_id:s??on().CLIENT_ID``), and a refresh token is bound to the client it was issued to.
@@ -332,7 +336,8 @@ def _refresh(env: Mapping[str, str], cfg: str, obj: Dict[str, object], token_url
         if scope is not None:
             body_obj["scope"] = scope
         req = urllib.request.Request(token_url, data=json.dumps(body_obj).encode("utf-8"), method="POST",
-                                     headers={"Content-Type": "application/json", "Accept": "application/json"})
+                                     headers={"Content-Type": "application/json", "Accept": "application/json",
+                                              "User-Agent": TOKEN_USER_AGENT})
         slice_s = min(TOKEN_S, end - time.monotonic())
         got_x = _bounded(lambda: _exchange(env, opener, req, REFRESH_BODY_MAX, REFRESH_BODY_MAX,
                                            min(TIMEOUT_S, slice_s)), slice_s)

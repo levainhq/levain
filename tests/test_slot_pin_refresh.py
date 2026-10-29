@@ -67,6 +67,7 @@ class Server:
     def open(self, req, timeout=None):
         if req.full_url == "https://platform.claude.com/v1/oauth/token":
             assert req.get_method() == "POST" and req.headers["Content-type"] == "application/json"
+            assert req.get_header("User-agent") == IC.TOKEN_USER_AGENT     # urllib's default agent is refused 403 by the front
             body = json.loads(req.data)
             self.refreshes.append(body)
             time.sleep(self.wait)
