@@ -36,6 +36,16 @@ outcome. ``stamp_detail`` is WHITELISTED (:func:`clean_detail`): the decision's 
 a Codex turn's ``approval_policy``/``approvals_reviewer``/sandbox ``type``/profile ``type``, and levain's own short
 reasons; anything else a caller or a newer agent version adds is dropped, never stored.
 
+BOUND beside STAMP and OUTCOME: what the vendor's bound refused INSIDE a call that ran (:mod:`levain.consent.bound`).
+It informs and never authorises; it moves no stamp and no outcome. Three nullable columns (``bound``,
+``bound_denials``, ``bound_classes``) hold a class and a count, never text, and only a post row carries them. NULL
+means not recorded: a row filed by a levain before these columns, a pre or denied_by_gate row, or a hook that did not
+classify; it is never read as clean. The columns are added IN PLACE to a released store and the format marker stays
+the same, so an older levain (without them) still opens the store, writes NULL for them and stamps rows; this levain
+reads the rows an older levain wrote after the migration as ``bound=None``. A store of another format, and a
+pre-``outcome`` store, are refused as before. Known edges: Codex's one-string output cannot tell stdout from stderr,
+and WebFetch outside a slot is outside the vendor sandbox (see the bound module).
+
 Known edges (one line each): the input digest is unsalted, so a SHORT input is recoverable by dictionary; a Codex
 policy that changes mid-turn is read from the turn's FIRST ``turn_context``; a call levain allowed that something
 after it refused (the Codex sandbox, which fires no PostToolUseFailure) reads as levain's stamp with outcome
@@ -56,6 +66,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -63,11 +74,14 @@ from typing import Any
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import utc_stamp
+from levain.consent import bound as _bound
 from levain.consent import stamps as _stamps
+from levain.consent.bound import BoundRecord
 from levain.consent.queue import QueueStoreError, default_queue_dir
 from levain.consent.record import AGENTS, tool_input_digest
 
-__all__ = ["DB_NAME", "DIGEST_STAMPS", "HOOK_BUSY_SECONDS", "HOOK_FILL_BUDGET", "PHASES", "STORE_FORMAT",
+__all__ = ["DB_NAME", "DIGEST_STAMPS", "HOOK_BUSY_SECONDS", "HOOK_FILL_BUDGET", "LEDGER_ADDED_COLUMNS", "PHASES",
+           "STORE_FORMAT",
            "SUBAGENT_MARK", "WINDOW_SCOPE", "Call", "Ledger", "LedgerStoreError",
            "clean_detail", "gate_row", "hook_fill", "hook_record", "parse_when", "reconcile", "request_outcomes"]
 
@@ -78,9 +92,11 @@ FINAL_STAMPS: tuple[str, ...] = tuple(s for s in _stamps.STAMPS if s != "pending
 # the rows the weekly unseen digest lists: a standing grant or a late ruling answered them, and he was not asked
 DIGEST_STAMPS: tuple[str, ...] = ("grant", "ruling")
 _ACCESS_BY_OTHERS = 0o077
-_COLUMNS = ("id", "agent", "agent_session_id", "tool_use_id", "received_at", "tool_name", "tool_input_digest", "cwd",
-            "phase", "stamp", "outcome", "stamp_detail", "request_id", "stamped_at", "source_path", "turn_id",
-            "permission_mode")
+_BASE_COLUMNS = ("id", "agent", "agent_session_id", "tool_use_id", "received_at", "tool_name", "tool_input_digest",
+                 "cwd", "phase", "stamp", "outcome", "stamp_detail", "request_id", "stamped_at", "source_path",
+                 "turn_id", "permission_mode")
+_BOUND_COLUMNS = ("bound", "bound_denials", "bound_classes")
+_COLUMNS = _BASE_COLUMNS + _BOUND_COLUMNS
 # the only free text the ledger keeps about a stamp: levain's own reasons, from this list
 _REASONS = frozenset({"transcript_missing", "transcript_unreadable", "rollout_missing", "rollout_unreadable",
                       "result_not_written", "result_without_decision", "no_tool_use_id", "no_source", "no_turn_id",
@@ -141,6 +157,19 @@ def _sql_list(values: tuple[str, ...]) -> str:
     return ",".join("'" + v + "'" for v in values)
 
 
+# (column, declaration): the columns a released calls table gains in place (format unchanged; an older levain writes
+# NULL). Order matters: each CHECK may name only columns added before it. NULL = not recorded, never read as clean.
+LEDGER_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("bound", f"TEXT CHECK (bound IS NULL OR bound IN ({_sql_list(_bound.BOUNDS)}))"),
+    ("bound_denials", "INTEGER CHECK ((bound IS NULL) = (bound_denials IS NULL) AND (bound_denials IS NULL OR "
+                      "(typeof(bound_denials) = 'integer' "
+                      f"AND bound_denials BETWEEN 0 AND {_bound.MAX_DENIALS} "
+                      "AND (bound = 'touched') = (bound_denials > 0))))"),
+    ("bound_classes", "TEXT CHECK ((bound IS 'touched') = (bound_classes IS NOT NULL) AND (bound_classes IS NULL OR "
+                      "(length(bound_classes) BETWEEN 1 AND 80 AND bound_classes NOT GLOB '*[^a-z_,]*')))"),
+)
+
+
 _SCHEMA: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS calls ("
@@ -154,6 +183,7 @@ _SCHEMA: tuple[str, ...] = (
     "stamp_detail TEXT, request_id TEXT, stamped_at TEXT, "
     # where the stamp is read from, and the mode the hook reported: a path and two ids, never content
     "source_path TEXT, turn_id TEXT, permission_mode TEXT, "
+    + ", ".join(f"{col} {decl}" for col, decl in LEDGER_ADDED_COLUMNS) + ", "
     "CHECK ((stamp = 'pending') = (stamped_at IS NULL)), "
     # a refusal authorised nothing: it can never carry an authority stamp
     "CHECK (outcome <> 'refused' OR stamp IN ('unknown', 'pending')))",
@@ -171,7 +201,9 @@ _SCHEMA: tuple[str, ...] = (
     "AND NEW.tool_name IS OLD.tool_name AND NEW.tool_input_digest IS OLD.tool_input_digest "
     "AND NEW.cwd IS OLD.cwd AND NEW.phase IS OLD.phase AND NEW.request_id IS OLD.request_id "
     "AND NEW.source_path IS OLD.source_path AND NEW.turn_id IS OLD.turn_id "
-    "AND NEW.permission_mode IS OLD.permission_mode) "
+    "AND NEW.permission_mode IS OLD.permission_mode "
+    "AND NEW.bound IS OLD.bound AND NEW.bound_denials IS OLD.bound_denials "
+    "AND NEW.bound_classes IS OLD.bound_classes) "
     "BEGIN SELECT RAISE(ABORT, 'a ledger row moves only from pending to a final stamp, once'); END",
     "CREATE TRIGGER IF NOT EXISTS calls_kept BEFORE DELETE ON calls "
     "BEGIN SELECT RAISE(ABORT, 'ledger rows are never deleted'); END",
@@ -192,11 +224,41 @@ _SAME_CALL = ("p.agent = c.agent AND p.agent_session_id = c.agent_session_id AND
 _POST_OUTCOME = (f"CASE WHEN c.phase = 'pre' THEN COALESCE((SELECT CASE WHEN p.outcome = 'refused' THEN 'refused' "
                  f"ELSE 'accepted' END FROM calls p WHERE {_SAME_CALL} AND p.phase IN {_POST_PHASES} "
                  "ORDER BY p.rowid LIMIT 1), 'unknown') ELSE c.outcome END AS outcome")
+_PER_CALL_WHERE = (f", c.rowid AS rowid FROM calls c WHERE NOT (c.phase IN {_POST_PHASES} AND c.tool_use_id IS NOT NULL "
+                   f"AND EXISTS (SELECT 1 FROM calls p WHERE {_SAME_CALL} AND p.phase = 'pre'))) AS per_call")
+# the view the read-only readers import (request_outcomes, the listing page): it opens a store WITHOUT migrating it,
+# so it must never name a bound column an unmigrated store lacks
 _PER_CALL = (
-    "(SELECT " + ", ".join(_POST_OUTCOME if col == "outcome" else f"c.{col} AS {col}" for col in _COLUMNS)
-    + f", c.rowid AS rowid FROM calls c WHERE NOT (c.phase IN {_POST_PHASES} AND c.tool_use_id IS NOT NULL "
-    f"AND EXISTS (SELECT 1 FROM calls p WHERE {_SAME_CALL} AND p.phase = 'pre'))) AS per_call"
+    "(SELECT " + ", ".join(_POST_OUTCOME if col == "outcome" else f"c.{col} AS {col}" for col in _BASE_COLUMNS)
+    + _PER_CALL_WHERE
 )
+
+
+def _lift_bound(col: str) -> str:
+    # a gated call's per-call row is its pre row, so the bound its post row recorded is lifted onto it, as outcome is
+    return (f"CASE WHEN c.phase = 'pre' THEN (SELECT p.{col} FROM calls p WHERE {_SAME_CALL} "
+            f"AND p.phase IN {_POST_PHASES} ORDER BY p.rowid LIMIT 1) ELSE c.{col} END AS {col}")
+
+
+# the same view over every column, for the Ledger itself (it always migrates before it reads)
+_PER_CALL_FULL = (
+    "(SELECT " + ", ".join(_POST_OUTCOME if col == "outcome" else _lift_bound(col) if col in _BOUND_COLUMNS
+                           else f"c.{col} AS {col}" for col in _COLUMNS)
+    + _PER_CALL_WHERE
+)
+
+
+@lru_cache(maxsize=1)
+def _frozen_trigger_text() -> str:
+    """The current ``calls_frozen`` text as SQLite stores it (read back, never hand-normalised)."""
+    scratch = sqlite3.connect(":memory:")
+    try:
+        for stmt in _SCHEMA:
+            scratch.execute(stmt)
+        return scratch.execute("SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                               "AND name = 'calls_frozen'").fetchone()[0]
+    finally:
+        scratch.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,12 +281,17 @@ class Call:
     source_path: str | None
     turn_id: str | None
     permission_mode: str | None
+    bound: str | None = None
+    bound_denials: int | None = None
+    bound_classes: tuple[str, ...] | None = None
 
     @staticmethod
     def _of(row: sqlite3.Row | tuple[Any, ...]) -> Call:
         values = dict(zip(_COLUMNS, row))
         detail = values["stamp_detail"]
         values["stamp_detail"] = json.loads(detail) if detail else None
+        classes = values["bound_classes"]
+        values["bound_classes"] = tuple(classes.split(",")) if classes else None
         return Call(**values)
 
 
@@ -330,6 +397,16 @@ class Ledger:
             if "calls" in tables and "outcome" not in {r[1] for r in conn.execute("PRAGMA table_info(calls)")}:
                 raise LedgerStoreError(f"store format {STORE_FORMAT!r} calls table lacks the `outcome` column "
                                        "(a pre-outcome ledger.db): delete the file")
+            if "calls" in tables:
+                have = {r[1] for r in conn.execute("PRAGMA table_info(calls)")}
+                for column, decl in LEDGER_ADDED_COLUMNS:
+                    if column not in have:
+                        conn.execute(f"ALTER TABLE calls ADD COLUMN {column} {decl}")
+                # the trigger must name the new columns: replace a stored one whose text is not the current text
+                stored = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                                      "AND name = 'calls_frozen'").fetchone()
+                if stored is not None and stored[0] != _frozen_trigger_text():
+                    conn.execute("DROP TRIGGER calls_frozen")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
             if row is None:
@@ -363,7 +440,7 @@ class Ledger:
                     stamp_detail: Mapping[str, Any] | None = None, request_id: str | None = None,
                     received_at: str | datetime | None = None, source_path: str | None = None,
                     turn_id: str | None = None, permission_mode: str | None = None,
-                    outcome: str | None = None) -> str:
+                    outcome: str | None = None, bound: BoundRecord | None = None) -> str:
         """File one call and return its row id. Only the DIGEST of ``tool_input`` is kept, and ``stamp_detail`` is
         whitelisted (:func:`clean_detail`). Idempotent per ``(agent, agent_session_id, tool_use_id, phase)``: filing
         the same call again returns the first row and changes nothing (a call without a ``tool_use_id`` is never
@@ -372,7 +449,9 @@ class Ledger:
 
         ``stamp`` defaults to ``pending`` (read ``source_path`` later); a final stamp (levain's own grant, answer or
         ruling, with the answering ``request_id``) is stamped now. ``outcome`` defaults from the phase and stamp
-        (``denied_by_gate`` -> refused; pending or unknown -> unknown; else accepted)."""
+        (``denied_by_gate`` -> refused; pending or unknown -> unknown; else accepted). ``bound`` (a
+        :class:`~levain.consent.bound.BoundRecord`) is what the vendor's bound refused inside the call, and belongs
+        only on a post row."""
         if agent not in AGENTS:
             raise ValueError(f"agent {agent!r} is not one of {AGENTS}")
         if phase not in PHASES:
@@ -384,6 +463,11 @@ class Ledger:
                 raise ValueError(f"a ledger row needs a non-empty {name} (got {value!r})")
         if tool_use_id is not None and (not isinstance(tool_use_id, str) or not tool_use_id):
             raise ValueError(f"tool_use_id must be a non-empty string or None (got {tool_use_id!r})")
+        if bound is not None:
+            if not isinstance(bound, BoundRecord):
+                raise ValueError(f"bound must be a BoundRecord (got {type(bound).__name__})")
+            if phase not in ("post", "post_failure"):
+                raise ValueError("a bound is recorded only on a post row")
         if outcome is None:
             outcome = ("refused" if phase == "denied_by_gate" and stamp in ("pending", "unknown")
                        else "unknown" if stamp in ("pending", "unknown") else "accepted")
@@ -392,7 +476,8 @@ class Ledger:
         row_id = "lc-" + os.urandom(12).hex()
         values = (row_id, agent, agent_session_id, tool_use_id, _stamp_of(received_at, now, now=now), tool_name,
                   tool_input_digest(tool_input), cwd, phase, stamp, outcome, _dump(stamp_detail), request_id,
-                  None if stamp == "pending" else utc_stamp(now), source_path, turn_id, permission_mode)
+                  None if stamp == "pending" else utc_stamp(now), source_path, turn_id, permission_mode,
+                  *((bound.bound, bound.denials, bound.classes_text()) if bound is not None else (None, None, None)))
         with self._write() as conn:
             try:
                 conn.execute(f"INSERT INTO calls ({','.join(_COLUMNS)}) VALUES ({','.join('?' * len(_COLUMNS))})",
@@ -433,7 +518,7 @@ class Ledger:
         return Call._of(row) if row else None
 
     def _select(self, where: str, args: tuple[Any, ...], *, per_call: bool = False) -> list[Call]:
-        source = _PER_CALL if per_call else "calls"
+        source = _PER_CALL_FULL if per_call else "calls"
         with self._read() as conn:
             rows = conn.execute(f"SELECT {','.join(_COLUMNS)} FROM {source} WHERE {where} "
                                 "ORDER BY received_at, rowid", args).fetchall()
