@@ -46,7 +46,7 @@ def _card(item: Mapping[str, Any], rec: Mapping[str, Any] | None) -> dict[str, A
 def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
     """The band's open items as needs-you cards, and the reason they could not be read (else None)."""
     if question_store is None:
-        return [], "band"
+        return [], None        # this cockpit hosts no question store: nothing to read, nothing unreadable
     from levain import band_view
 
     try:
