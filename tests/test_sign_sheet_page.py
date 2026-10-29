@@ -280,7 +280,7 @@ def test_h1_a_write_in_is_frozen_and_normalised_at_the_click_and_the_text_signed
 
 @needs_browser
 @needs_ssh
-def test_h2_unsure_after_the_answer_landed_re_reads_and_shows_it_closed_never_re_arms(tmp_path: Path, monkeypatch) -> None:
+def test_h2_unsure_after_the_answer_landed_asks_its_attempt_and_shows_it_signed_never_re_arms(tmp_path: Path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
@@ -294,35 +294,32 @@ def test_h2_unsure_after_the_answer_landed_re_reads_and_shows_it_closed_never_re
             {"eval": f"{FRAME}.contentWindow.__stub['/answer'] = {LOST_AFTER_SEND}; 1"},
             {"eval": f"{IN}.getElementById('sheet-write-in').value = 'approve $10'; "
                      f"[...{IN}.querySelectorAll('#sheet-actions button')].find((b) => /Sign my words/.test(b.textContent)).click() || 1"},
-            {"until": f"{IN}.getElementById('sheet').dataset.state === 'closed' && 1", "ms": 30000, "may_timeout": True},
-            {"eval": f"{FRAME}.contentWindow.__reads"},
+            {"until": f"{IN}.getElementById('sheet').dataset.state === 'signed' && 1", "ms": 30000},
             {"eval": f"[...{IN}.querySelectorAll('#sheet-actions button, #sheet-actions input')].filter((b) => !b.disabled).length"},
             {"eval": f"{IN}.getElementById('sheet-note').textContent"},
             {"eval": "new Promise((r) => setTimeout(() => r(window.__reloads), 2000))"},
         ])
     v = out["values"]
-    assert not isinstance(v[7], dict), v                            # the sheet reached "closed"
-    assert v[8] >= 1, v                                              # by reading the request again
-    assert v[9] == 0, v                                              # nothing re-armed
-    assert "no longer open" in v[10], v
-    assert v[11] >= 1, v                                             # the cockpit under it was told to read again
+    assert v[8] == 0, v                                              # nothing re-armed
+    assert v[9].startswith("signed (*)") and "the cockpit confirmed it" in v[9], v
+    assert v[10] >= 1, v                                             # the cockpit under it was told to read again
     assert rig.verifies(QRID)                                        # the answer had landed
 
 
 @needs_browser
-def test_h2_unsure_with_the_identical_version_still_open_unlocks_after_the_re_read(tmp_path: Path, monkeypatch) -> None:
+def test_h2_an_answer_that_never_left_is_refused_by_its_attempt_and_the_sheet_re_arms(tmp_path: Path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
             {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; {_button('a')}.click() || 1"},
-            {"until": f"window.__reads >= 1 && {ENABLED} && {WRITE_IN_BOX} && !{WRITE_IN_BOX}.disabled && 1", "ms": 30000},
+            {"until": f"{ENABLED} && {WRITE_IN_BOX} && !{WRITE_IN_BOX}.disabled && 1", "ms": 30000},
             {"eval": STATE},
             {"eval": NOTE},
         ])
     v = out["values"]
     assert v[5] == "open", v
-    assert "still open" in v[6], v
+    assert "never reached the cockpit" in v[6] and "sign it again" in v[6], v
     assert rig.nothing_signed(QRID)
 
 
@@ -344,18 +341,18 @@ def test_h3_a_challenge_that_never_answers_ends_unsigned_at_the_deadline(tmp_pat
 
 
 @needs_browser
-def test_h3_an_answer_whose_body_never_arrives_is_unsure_and_re_reads(tmp_path: Path, monkeypatch) -> None:
+def test_h3_an_answer_whose_body_never_arrives_is_unsure_and_its_attempt_settles_it(tmp_path: Path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
             {"eval": f"window.__stub['/answer'] = {BODY_HANG}; {_button('a')}.click() || 1"},
-            {"until": f"window.__reads >= 1 && {ENABLED} && {NOTE}", "ms": 25000, "may_timeout": True},
+            {"until": f"{ENABLED} && {NOTE}", "ms": 25000, "may_timeout": True},
             {"eval": NOTE},
         ])
     v = out["values"]
-    assert isinstance(v[4], str), v                                   # the deadline fired and the re-read ran
-    assert "still open" in v[5], v                                    # the answer never reached the cockpit here
+    assert isinstance(v[4], str), v                                   # the deadline fired and the attempt was asked
+    assert "never reached the cockpit" in v[5], v                     # the answer never reached the cockpit here
     assert rig.nothing_signed(QRID)
 
 
@@ -568,41 +565,49 @@ def test_h10_after_unsure_the_signing_line_reads_not_confirmed(tmp_path: Path, m
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
             {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; {_button('b')}.click() || 1"},
-            {"until": f"window.__reads >= 1 && {ENABLED} && 1", "ms": 30000},
+            {"until": f"{ENABLED} && 1", "ms": 30000},
             {"eval": SIGNING},
         ])
-    # the read finds the same version open: "Not signed:" now, since that read settled it
+    # the cockpit says the attempt was refused: "Not signed:" now, since that read settled it
     assert out["values"][-1].startswith("Not signed:"), out["values"]
 
 
 @needs_browser
-def test_h10_while_the_re_read_is_pending_the_line_is_not_confirmed(tmp_path: Path, monkeypatch) -> None:
+def test_h10_while_the_attempt_read_is_out_the_line_is_not_confirmed(tmp_path: Path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; window.__stub['.json'] = {HANG}; "
+            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; window.__stub['/attempt'] = {HANG}; "
                      f"{_button('b')}.click() || 1"},
-            {"until": f"window.__reads >= 1 && 1", "ms": 30000},
+            {"until": f"/Asking the cockpit/.test({NOTE}) && 1", "ms": 30000},
             {"eval": SIGNING},
-            {"eval": NOTE},
+            {"eval": f"[{_button('a')}.disabled, {_button('b')}.disabled]"},
         ])
-    shown = out["values"][-2]
-    assert shown.startswith("Not confirmed:"), out["values"]
+    assert out["values"][-2].startswith("Not confirmed:"), out["values"]
+    assert out["values"][-1] == [True, True], out["values"]
 
 
 @needs_browser
-def test_h11_a_refused_re_read_names_the_unpaired_device_not_no_reply(tmp_path: Path, monkeypatch) -> None:
+def test_h11_an_attempt_read_the_cockpit_refuses_stays_not_confirmed_and_offers_check_again(tmp_path: Path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; window.__stub['.json'] = {UNPAIRED_READ}; "
+            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; window.__stub['/attempt'] = {UNPAIRED_READ}; "
                      f"{_button('b')}.click() || 1"},
-            {"until": f"{STATE} === 'closed' && {NOTE}", "ms": 30000},
+            {"until": "document.getElementById('sheet-recheck') && 1", "ms": 30000},
+            {"eval": NOTE},
+            {"eval": f"[{_button('a')}.disabled, {_button('b')}.disabled]"},
+            # the cockpit answers on the next ask: the attempt never reached it, so the controls come back
+            {"eval": "delete window.__stub['/attempt']; document.getElementById('sheet-recheck').click() || 1"},
+            {"until": f"{ENABLED} && !document.getElementById('sheet-recheck') && {NOTE}", "ms": 30000},
         ])
-    note = out["values"][-1]
-    assert "no reply" not in note and "not accepted" in note, note
+    v = out["values"]
+    assert v[-4].startswith("Not confirmed:") and "HTTP 403" in v[-4], v      # no word from the cockpit: never "not signed"
+    assert v[-3] == [True, True], v
+    assert "never reached the cockpit" in v[-1], v
+    assert rig.nothing_signed(QRID)
 
 
 @needs_browser
@@ -653,18 +658,19 @@ SIGNING_IN = f"({IN}.getElementById('sheet-signing') || {{}}).textContent"
 
 @needs_browser
 @needs_ssh
-def test_h15_a_close_after_the_re_read_settled_leaves_at_once(tmp_path: Path, monkeypatch) -> None:
+def test_h15_a_close_after_the_attempt_settled_leaves_at_once(tmp_path: Path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *OPEN_FRAMED,
             _stub(f"{FRAME}.contentWindow"),
             {"eval": f"{FRAME}.contentWindow.__stub['/answer'] = {LOST_AFTER_SEND}; {CHOICE_IN('b')}.click() || 1"},
-            {"until": f"{IN}.getElementById('sheet').dataset.state === 'closed' && 1", "ms": 30000},
-            {"eval": CLOSE_IN_FRAME},
+            {"until": f"(!{FRAME} || {IN}.getElementById('sheet').dataset.state === 'signed') && 1", "ms": 30000},
+            {"eval": f"{FRAME} ? ({CLOSE_IN_FRAME}) : 1"},
             {"eval": FRAME_STILL_UP},
         ])
     assert out["values"][-1] is False, out["values"]                  # the ceremony had ended: the close left
+    assert rig.verifies(QRID)
 
 
 @needs_browser
@@ -748,36 +754,9 @@ def test_h19_a_close_asked_in_one_ceremony_does_not_leave_the_next_one(tmp_path:
     assert v[-2] is True and v[-1].startswith("Not confirmed:"), v
 
 
-# --- H20: one open read after an unsure answer is not proof nothing was signed -----------------------------------------
+# (H20, the two-read settle, is replaced by the attempt read: tests/test_sign_attempt_page.py)
 
-# the answer is told to the page as lost at once, and reaches the server 900 ms later
-LATE_COMMIT = ("(real, u, o) => { setTimeout(() => real(u, o), 900); "
-               "return Promise.reject(new TypeError('the reply was lost')); }")
 AFTER_MS = lambda ms: f"new Promise((r) => setTimeout(r, {ms}))"  # noqa: E731
-
-
-@needs_browser
-@needs_ssh
-def test_h20_one_open_read_while_the_answer_is_still_landing_keeps_the_sheet_frozen_until_a_second_read(tmp_path: Path, monkeypatch) -> None:
-    rig = _Rig(tmp_path, monkeypatch)
-    with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
-            DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {LATE_COMMIT}; {_button('b')}.click() || 1"},
-            {"until": f"window.__reads >= 1 && 1", "ms": 30000},
-            {"eval": AFTER_MS(300)},
-            {"eval": f"[{_button('a')}.disabled, {_button('b')}.disabled]"},
-            {"eval": NOTE},
-            {"until": f"{STATE} === 'closed' && 1", "ms": 8000, "may_timeout": True},
-            {"eval": f"[{_button('a')}.disabled, {_button('b')}.disabled]"},
-            {"eval": NOTE},
-        ])
-    v = out["values"]
-    assert v[-5] == [True, True], v                       # one open read: still frozen
-    assert "not confirmed" in v[-4] and "Not signed" not in v[-4], v
-    assert v[-2] == [True, True], v                      # the second read found it closed: the controls stay frozen
-    assert "no longer open" in v[-1], v
-    assert rig.verifies(QRID)                            # the answer had landed after the first read
 
 
 # --- landing integration fixes (I1-I7) ------------------------------------------------------------------------------

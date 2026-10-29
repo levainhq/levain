@@ -16,8 +16,13 @@
 //
 // Every read and post has a deadline over its headers and its body. A ceremony ends "signed", "unsigned" (nothing can have
 // been signed: a refusal, or anything before the answer was posted) or "unsure" (the answer was posted and its reply did not
-// come back). Only "unsigned" re-arms the controls; "unsure" keeps them frozen and reads the request again, and they come
-// back only when that read finds the same version still open. A write-in is frozen as typed (trimmed) from its click on.
+// come back). Only "unsigned" re-arms the controls. A sign request's answer carries an attempt id this page made, and
+// "unsure" asks the cockpit where that attempt stands (POST /cockpit/sign/<id>/attempt, levain.consent.sign
+// Signer.attempt): "signed" shows it signed, only "refused" re-arms, and "pending" (still verifying past the cockpit's
+// wait) or no answer keeps the controls frozen, "Not confirmed", with a "Check again" that asks once more. No read of
+// the request can stand in for that: the answer may still be verifying while the request reads open. A consent request's
+// or a dispatch job's answer has no attempt record, so after "unsure" its controls stay frozen until the page is
+// reloaded. A write-in is frozen as typed (trimmed) from its click on.
 //
 // A consent request (OS-2) is the same sheet at /sign/consent/<id>: its read is GET /cockpit/consent/<id>/sheet.json (the
 // same row shape, its options allow and deny), and its ceremony the phone port's own: POST .../challenge and .../answer for
@@ -350,7 +355,8 @@
           if (done === "signed") { busy = false; ended(); acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
           if (done === "unsure") {
             relabel("Not confirmed");
-            return settle(r, () => { relabel("Not signed"); busy = false; lock(false); }).then(ended);
+            return settle(r, () => { relabel("Not signed"); busy = false; lock(false); },
+                          () => { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed"); }).then(ended);
           }
           relabel("Not signed");
           ended();
@@ -444,24 +450,60 @@
     }
   }
 
-  // "unsure": the answer was posted and no reply said what landed. One read of the request finding it open does not show
-  // nothing was signed (the answer may still be verifying), so the controls stay frozen; only a second read, after a pause,
-  // finding the same version still open gives them back (`release`). Anything else leaves them frozen, says so, and tells
-  // the cockpit to read again
-  const SETTLE_PAUSE_MS = 1500;
-  function settle(r, release) {
-    say($("sheet-note").textContent + " Checking where it stands…", "bad");
-    const closed = (got) => { $("sheet").dataset.state = "closed"; say(standing(got), "bad"); tell("reload"); };
-    return readRequest().then((first) => {
-      if (!stillOpen(r, first)) return closed(first);
-      say("The request reads open now; not confirmed (the answer may still be landing). Checking once more…", "bad");
-      return new Promise((res) => setTimeout(res, SETTLE_PAUSE_MS)).then(readRequest).then((second) => {
-        if (!stillOpen(r, second)) return closed(second);
-        say("Not signed: the cockpit says this request is still open, unsigned, on the version shown, on a second read; you can sign it again.", "bad");
+  // "unsure": the answer was posted and no reply said what landed. The cockpit is asked where THAT answer stands, by the
+  // attempt id it carried (`unsureAttempt`, set by the ceremony): "refused" gives the controls back (`release`), "signed"
+  // shows it signed (`signedNow`), and anything else leaves them frozen, "Not confirmed", with "Check again". A consent
+  // request's answer carries no attempt: its controls stay frozen and the page says to reload it
+  let unsureAttempt = null;      // {attempt, line} of the sign answer whose reply was lost, until it settles
+  function settle(r, release, signedNow) {
+    const a = unsureAttempt;
+    if (!a) {
+      say($("sheet-note").textContent + " Reload this page to see where it stands before signing again.", "bad");
+      tell("reload");
+      return Promise.resolve();
+    }
+    say($("sheet-note").textContent + " Asking the cockpit where this answer stands…", "bad");
+    // a read that fails outright is a read that said nothing: frozen, "Not confirmed", Check again; never re-armed
+    return Promise.resolve().then(() => call(routeOf(r.id) + "/attempt", { attempt: a.attempt }))
+      .catch((e) => ({ ok: false, status: 0, body: { message: "the read failed (" + ((e && e.name) || "error") + ")" } }))
+      .then((st) => {
+      const state = st.ok && st.body && typeof st.body.state === "string" ? st.body.state : "";
+      if (state === "signed") {
+        unsureAttempt = null;
+        dropRecheck();
+        const by = typeof st.body.signer_fp === "string" && st.body.signer_fp ? " · by " + st.body.signer_fp : "";
+        const ns = typeof st.body.namespace === "string" && st.body.namespace ? " in " + st.body.namespace : "";
+        say("signed" + (st.body.choice ? " (" + st.body.choice + ")" : "") + by + ns + (a.line ? ": " + a.line : "")
+            + " (its reply was lost; the cockpit confirmed it)", "ok");
+        if (a.line) signing(a.line, "server", "Signed"); else relabel("Signed");
+        $("sheet").dataset.state = "signed";
+        return signedNow();
+      }
+      if (state === "refused") {
+        unsureAttempt = null;
+        dropRecheck();
+        const reason = typeof st.body.reason === "string" && st.body.reason ? st.body.reason.replace(/[.\s]+$/, "") : "refused";
+        say("Not signed: " + reason + (/nothing was signed/.test(reason) ? "" : "; nothing was signed") + ". You can sign it again.", "bad");
         return release();
-      });
+      }
+      say(state === "pending"
+        ? "Not confirmed: the cockpit is still verifying this answer. The controls stay locked until it says; Check again asks once more."
+        : "Not confirmed: the cockpit did not say where this answer stands (" + why(st) + "). The controls stay locked; Check again asks once more.", "bad");
+      offerRecheck(r, release, signedNow);
+      tell("reload");
+      return undefined;
     });
   }
+  // "Check again": one more status read of the unsettled attempt; it is never pressed for him
+  function offerRecheck(r, release, signedNow) {
+    if ($("sheet-recheck")) return;
+    const b = el("button", "dev-btn", "Check again");
+    b.type = "button";
+    b.id = "sheet-recheck";
+    b.addEventListener("click", () => { b.disabled = true; settle(r, release, signedNow).then(() => { b.disabled = false; }); });
+    $("sheet-actions").appendChild(b);
+  }
+  function dropRecheck() { const b = $("sheet-recheck"); if (b) b.remove(); }
   const stillOpen = (r, got) => !!(got.request && got.request.sha256 === r.sha256 && !got.request.refused);
   // what a read that did not find the request open and unchanged says
   function standing(got) {
@@ -547,7 +589,11 @@
     if (dispatch && choice === "cancel") body.reason = typeof words === "string" ? words : "";
     if (!consent && !dispatch && choice !== undefined) body.choice = choice;
     if (!consent && !dispatch && words !== undefined) body.write_in = words;
-    let sent = false, line = "";
+    let sent = false, line = "", attempt = null;
+    // the answer was posted and may have landed: settle asks the cockpit about this attempt (none for a consent or a
+    // dispatch answer)
+    const unsure = () => { unsureAttempt = attempt; return "unsure"; };
+    unsureAttempt = null;
     say(choice !== undefined ? "Asking for the challenge for (" + choice + ")…" : "Asking for the challenge…");
     flight = true;        // from the request for the challenge: the signer picker before it posts nothing
     return call(base + steps[0], body).then((c) => {
@@ -593,11 +639,16 @@
         const answer = { authenticator_data: b64u(cred.response.authenticatorData),
           client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
         if (consent || dispatch) answer.payload = c.body.payload;
-        else if (cred.rawId) answer.raw_id = b64u(cred.rawId);
+        else {
+          if (cred.rawId) answer.raw_id = b64u(cred.rawId);
+          // this answer's own id: what the cockpit is asked about if its reply is lost (settle)
+          answer.attempt = b64u(crypto.getRandomValues(new Uint8Array(18)));
+          attempt = { attempt: answer.attempt, line: line };
+        }
         sent = true;          // from here on a failure may follow an answer that landed
         return call(base + steps[1], answer).then((a) => {
           if (!a.ok && a.status >= 400 && a.status < 500) return unsigned("Not signed: " + why(a));
-          if (!a.ok) { say("Not sure this was signed (" + why(a) + ").", "bad"); return "unsure"; }
+          if (!a.ok) { say("Not sure this was signed (" + why(a) + ").", "bad"); return unsure(); }
           if (cred.rawId && mine(rp)[fp] !== b64u(cred.rawId)) remember(rp, fp, b64u(cred.rawId));
           const by = typeof a.body.signer_fp === "string" && a.body.signer_fp ? a.body.signer_fp : fp;
           const ns = typeof a.body.namespace === "string" && a.body.namespace ? " in " + a.body.namespace : "";
@@ -614,7 +665,7 @@
       }, (e) => unsigned("The passkey did not sign (" + ((e && e.name) || "cancelled") + ")"));
     }).catch((e) => {
       const name = (e && e.name) || "error";
-      if (sent) { say("Not sure this was signed (the page failed: " + name + ").", "bad"); return "unsure"; }
+      if (sent) { say("Not sure this was signed (the page failed: " + name + ").", "bad"); return unsure(); }
       return unsigned("The page failed (" + name + ")");
     });
   }

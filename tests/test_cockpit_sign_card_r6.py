@@ -1,10 +1,10 @@
 """The cockpit card's sign path against the classes the card's L3 r1 named (project_memory/1025-43/signcard/RULINGS_L3_R1.md
 S1-S7), over the rig and helpers of test_cockpit_sign_card_r5.
 
-S1: one open read after an answer whose reply was lost is not proof nothing was signed (the server may still be verifying):
-the card stays frozen and says the request "reads open now; not confirmed", and comes back only when a second read finds
-the same version still open. S2: a cancelled prompt keeps the remembered passkey. S3: a remembered entry that cannot be an
-id is purged before the card decides who signs. S5: a read that rejects is said. S6: a re-armed card is not redrawn."""
+S1: no read of the request after an answer whose reply was lost is proof nothing was signed (the server may still be
+verifying): the card asks the cockpit about the answer's attempt, and an attempt the cockpit never saw is fenced, so an
+answer arriving after that read is refused and the card that came back stays right. S2: a cancelled prompt keeps the remembered passkey. S3: a remembered entry that cannot be an
+id is purged before the card decides who signs. S5: an attempt read that rejects is said, and the card stays frozen. S6: a re-armed card is not redrawn."""
 from __future__ import annotations
 
 import json
@@ -29,52 +29,41 @@ ONE_THROWS = ("(() => {{ const real = window.fetch; window.fetch = function (u, 
 
 @needs_browser
 @needs_ssh
-def test_s1_one_open_read_while_the_answer_is_still_landing_keeps_the_card_frozen_until_a_second_read(tmp_path, monkeypatch) -> None:
+def test_s1_an_answer_still_on_its_way_is_fenced_by_its_attempt_read_and_never_lands(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": LATE_COMMIT.format(tail=json.dumps("/answer"), ms=900)},
             {"eval": f"{OPTION_B}.click() || 1"},
-            {"until": f"/not confirmed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
-            {"eval": AFTER.format(ms=300)},
+            {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 30000},
+            {"eval": AFTER.format(ms=1500)},                  # past the late answer's arrival
             {"eval": BUTTONS},
             {"eval": FACET_NOTE},
-            {"eval": AFTER.format(ms=3500)},
-            {"eval": BUTTONS},
-            {"eval": FACET_NOTE},
-            {"eval": "window.__reloads"},
         ])
     v = out["values"]
-    assert "reads open now; not confirmed" in v[5], v[5]
-    assert "nothing was signed" not in v[5], v[5]         # one read does not know that
-    assert v[7] == [True, True, True], v[7]               # frozen while the answer may still land
-    assert "nothing was signed" not in v[8], v[8]
-    assert v[10] == [True, True, True], v[10]             # and after the second read: it closed, so the card stays frozen
-    assert "no longer open" in v[11], v[11]
-    assert v[12] >= 1, v[12]
-    assert rig.verifies(QRID)
+    assert "never reached the cockpit" in v[5], v[5]      # the read fenced the attempt the cockpit had not seen
+    assert v[7] == [False, False, False], v[7]
+    assert "never reached the cockpit" in v[8], v[8]
+    assert rig.nothing_signed(QRID)                       # and the answer that arrived after it was refused
 
 
 @needs_browser
 @needs_ssh
-def test_s1_s6_an_answer_that_never_left_comes_back_after_a_second_open_read_and_is_not_redrawn(tmp_path, monkeypatch) -> None:
+def test_s1_s6_an_answer_that_never_left_comes_back_on_its_attempts_refusal_and_is_not_redrawn(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
             {"eval": f"{OPTION_B}.click() || 1"},
-            {"until": f"/not confirmed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
-            {"eval": BUTTONS},
-            {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 8000},
+            {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 30000},
             {"eval": AFTER.format(ms=2500)},
             {"eval": "window.__reloads"},
         ])
     v = out["values"]
-    assert v[6] == [True, True, True], v[6]               # one read: still frozen
-    assert "still reads open" in v[7] and "second read" in v[7], v[7]
-    assert v[9] == 0, v[9]                                # a card that came back is not drawn again under the person
+    assert "never reached the cockpit" in v[5], v[5]
+    assert v[7] == 0, v[7]                                # a card that came back is not drawn again under the person
     assert rig.nothing_signed(QRID)
 
 
@@ -134,17 +123,18 @@ def test_s4_a_corrupt_record_is_no_record_and_the_card_signs(tmp_path, monkeypat
 
 @needs_browser
 @needs_ssh
-def test_s5_a_read_that_rejects_after_an_unsure_answer_is_said(tmp_path, monkeypatch) -> None:
+def test_s5_an_attempt_read_that_rejects_is_said_and_the_card_stays_frozen(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
-            {"eval": ONE_THROWS.format(tail=json.dumps(QRID + ".json"))},
+            {"eval": ONE_THROWS.format(tail=json.dumps("/attempt"))},
             {"eval": f"{OPTION_B}.click() || 1"},
             {"until": f"/could not be read/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 15000},
             {"eval": BUTTONS},
         ])
     v = out["values"]
-    assert "not sure this was signed" in v[6] and "could not be read" in v[6], v[6]
+    assert "not sure this was signed" in v[6] and "could not be read" in v[6] and "not confirmed" in v[6], v[6]
     assert v[7] == [True, True, True], v[7]               # nothing is known, so the card stays frozen
+    assert rig.nothing_signed(QRID)

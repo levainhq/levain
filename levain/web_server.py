@@ -235,12 +235,12 @@ def _is_write_route(route: str) -> bool:
 
 
 # levain's sign-request ceremony hosted by the cockpit (DESIGN_SIGN D4): GET /cockpit/sign.json lists the requests and
-# POST /cockpit/sign/<id>/{challenge,answer,deny} runs the caller's levain.consent.sign.Signer, each behind the write
+# POST /cockpit/sign/<id>/{challenge,answer,deny,attempt} runs the caller's levain.consent.sign.Signer, each behind the write
 # gate (a surface token on every bind, the Host allowlist, same-origin only, the request gate). Served only when
 # make_server was given a Signer: without one every path here is 404.
 _SIGN_LIST_PATH = "/cockpit/sign.json"
 _SIGN_PREFIX = "/cockpit/sign/"
-_SIGN_ACTIONS = ("challenge", "answer", "deny")
+_SIGN_ACTIONS = ("challenge", "answer", "deny", "attempt")
 # POST /cockpit/sign/compose (DESIGN_SIGN D5, the compose contract): {verb, params, client_txn} -> {request}, the caller's
 # compose_signer filing a sign request for a signed verb's params (one per draft while it is open); the page then runs the
 # ceremony on that id. Which request each draft filed is recorded durably beside the Signer's requests
@@ -3319,11 +3319,13 @@ class _Handler(GuardedHandler):
         # Acquire the rate-gate BEFORE any body read/drain so the read+write phase is
         # concurrency-bounded — a stalled body can't pile up unbounded threads. [L3 MED]
         # a consent answer or ruling carries a signature the person just made with a passkey: it waits a moment for a
-        # slot rather than throw that ceremony away, as on the phone port; everything else answers busy at once
+        # slot rather than throw that ceremony away, as on the phone port, and so does the read of where a sign answer
+        # whose reply was lost stands; everything else answers busy at once
         waits = ((consent is not None and consent[1] in ("answer", "rule"))
                  or (dispatch is not None and dispatch[1] in ("answer", "cancel", "authorise"))
                  # a drop carrying a signed envelope holds a ceremony the person just made, as on the phone port
-                 or (coord is not None and coord == "drop"))
+                 or (coord is not None and coord == "drop")
+                 or (sign is not None and sign[1] == "attempt"))
         if not (self.server.request_gate.acquire(timeout=5) if waits
                 else self.server.request_gate.acquire(blocking=False)):
             return self._reject(503, "busy", "server busy")
@@ -3672,7 +3674,7 @@ def make_server(
     Raises ``ValueError`` (before binding) on a disallowed non-loopback bind. [codex L3 MED]
 
     ``signer`` (DESIGN_SIGN D4) is a :class:`levain.consent.sign.Signer` the cockpit page signs sign requests
-    through: ``GET /cockpit/sign.json`` and ``POST /cockpit/sign/<id>/{challenge,answer,deny}``, each behind the
+    through: ``GET /cockpit/sign.json`` and ``POST /cockpit/sign/<id>/{challenge,answer,deny,attempt}``, each behind the
     write gate on every bind. The caller sets ``signer.page_origin`` to the page this cockpit is served on (an
     ``https://<rp_id>[:port]``, or ``http://localhost:<port>`` on localhost), and a missing or malformed one is a
     ``ValueError`` before binding: an assertion from any other page is refused. The kernel reads no signers file

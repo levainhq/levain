@@ -4804,11 +4804,52 @@
   const signWhy = (r) => (r.body && typeof r.body.message === "string" && r.body.message) || ("refused (HTTP " + r.status + ")");
   const signNotes = new Map();     // request id -> [text, kind, sha256]: what the last ceremony said, kept across redraws
   const signWriteIns = new Map();  // request id -> {sha256, words}: a write-in being typed, kept for the version it was typed on
-  // request id -> what a card drawn while that request's attempt is in flight must undo when the attempt gives its card back.
-  // The focus view builds its card again each time it opens, so a card drawn mid-attempt is frozen (its buttons and words box
-  // disabled) and registers here; the attempt's end releases it, and a signed or unknowable one stays frozen
-  const signPending = new Map();
+  // request id -> what a card drawn while that request's ceremony is in flight must undo when the ceremony gives its card back.
+  // The focus view builds its card again each time it opens, so a card drawn mid-ceremony is frozen (its buttons and words box
+  // disabled) and registers here; the ceremony's end releases it, a signed one stays frozen, and an unsure one is handed to
+  // signPending (the cockpit's word on its attempt), which freezes and releases a card drawn after it
+  const signInFlight = new Map();
   let signBusy = 0;                // a ceremony (or a passkey pick) in progress: a second tap anywhere does nothing
+  // request id -> {attempt, views, asking}: an answer whose reply was lost and that the cockpit has not yet settled. Every
+  // board read asks the cockpit about the attempt again (signRecheck, from renderNeeds: the strip keeps a card whose item
+  // did not change, so a read alone would never reach it), one ask at a time. `views` are the facets showing it (the frozen
+  // card's, and one drawn afresh after its request left the listing): each is told every answer and drops itself once its
+  // facet is off the page, so a facet drawn later never takes the ask away from one still shown
+  const signPending = new Map();
+  const signSettledIds = new Set();   // request ids whose signNotes entry is a settled outcome (signed or refused), shown even once the request is gone
+  function signSettledSaid(st) {
+    if (st.state === "signed") {
+      return ["signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
+              + " (its reply was lost; the cockpit confirmed it)", "ok"];
+    }
+    const why = typeof st.reason === "string" && st.reason ? st.reason.replace(/[.\s]+$/, "") : "refused";
+    return ["not signed: " + why + (/nothing was signed/.test(why) ? "" : "; nothing was signed") + ": sign it again", "bad"];
+  }
+  function signAskPending(id) {
+    const p = signPending.get(id);
+    if (!p || p.asking) return;
+    p.asking = true;
+    Promise.resolve()
+      .then(() => signAttempt(id, p.attempt))
+      .catch(() => ({ state: "" }))
+      .then((st) => {
+        if (signPending.get(id) !== p) return;
+        if (st.state === "signed" || st.state === "refused") {
+          // the outcome is kept before the entry goes, so a facet drawn later (or on a repaint) shows it
+          const prev = signNotes.get(id);
+          const said = signSettledSaid(st);
+          signNotes.set(id, [said[0], said[1], prev ? prev[2] : ""]);
+          signSettledIds.add(id);
+          signPending.delete(id);
+        }
+        for (const view of [...p.views]) { try { view(st); } catch (e) { p.views.delete(view); } }
+      })
+      .catch(() => undefined)
+      .then(() => { p.asking = false; });
+  }
+  function signRecheck() {
+    for (const [id, p] of signPending) if (p.views.size) signAskPending(id);
+  }
   let signListed = null;           // {at, got}: the last listing, shared by every card of one render
   // which enrolled passkey THIS browser used: fingerprint -> credential id, so the OS prompt asks for that one. Browser
   // storage may be absent or throw; the ceremony works without it (the pick list, or the OS's own list)
@@ -4857,6 +4898,17 @@
                                () => ({ ok: false, status: res.status, body: {} })),
       () => ({ ok: false, status: 0, body: { message: "the cockpit could not be reached" } }));
   }
+  // where one answer stands, by the attempt id it carried (levain.consent.sign Signer.attempt): {state: "signed" |
+  // "refused" | "pending" | "unknown", ...} as the cockpit says it, else {state: "", why} when it said nothing. The cockpit
+  // waits a few seconds while the answer is still verifying, and an attempt it never saw it records refused, so that
+  // answer arriving later is refused too
+  function signAttempt(id, attempt) {
+    // a fetch that throws as it is called is a read that failed, never a throw out of here
+    return Promise.resolve()
+      .then(() => signCall("/cockpit/sign/" + encodeURIComponent(id) + "/attempt", { attempt: attempt }))
+      .then((a) => (a.ok && a.body && typeof a.body.state === "string" ? a.body : { state: "", why: signWhy(a) }));
+  }
+  const signNewAttempt = () => signB64u(crypto.getRandomValues(new Uint8Array(18)));
   // the listing: {requests, signers, origin, note} or {error}. One read serves every card drawn within a second or two;
   // `fresh` reads again (after a ceremony, and before a compose)
   function signListing(fresh) {
@@ -4895,13 +4947,18 @@
     + ": this page cannot use your passkey";
 
   // One ceremony on listing row `r` with passkey `fp`: resolves {done: "signed"|"unsigned"|"unsure", line}. Only a definite
-  // "nothing was signed" is "unsigned": a 4xx from the challenge or the answer, or anything before the answer was sent.
+  // "nothing was signed" is "unsigned": a 4xx from the challenge or the answer, anything before the answer was sent, or the
+  // cockpit saying the answer's attempt was refused. An answer whose reply was lost is asked about by its attempt id
+  // (signSettle): "signed" and "refused" are the cockpit's word; "unsure" is left only while it is still verifying the
+  // answer, or said nothing, and the request is then held in signPending until a board read settles it.
   function signCeremony(r, fp, rawId, choice, words, say) {
     const base = "/cockpit/sign/" + encodeURIComponent(r.id) + "/";
     const body = { signer_fp: fp, request_sha256: r.sha256 };
     if (choice !== undefined) body.choice = choice;
     if (words !== undefined) body.write_in = words;
     let sent = false, line;
+    const attempt = signNewAttempt();
+    const lost = (text) => { say(text, "bad"); return signSettle(r.id, attempt, line, choice, fp, say, text); };
     say(choice !== undefined ? "asking for the challenge for (" + choice + ")…" : "asking for the challenge…");
     return signCall(base + "challenge", body).then((c) => {
       if (!c.ok) { say(signWhy(c), "bad"); return { done: "unsigned" }; }
@@ -4917,9 +4974,10 @@
         const answer = { authenticator_data: signB64u(cred.response.authenticatorData),
           client_data_json: signB64u(cred.response.clientDataJSON), signature: signB64u(cred.response.signature) };
         if (cred.rawId) answer.raw_id = signB64u(cred.rawId);
+        answer.attempt = attempt;
         return signCall(base + "answer", answer).then((a) => {
           if (!a.ok && a.status >= 400 && a.status < 500) { say("not signed: " + signWhy(a), "bad"); return { done: "unsigned" }; }
-          if (!a.ok) { say("not sure this was signed (" + signWhy(a) + "): check the list", "bad"); return { done: "unsure" }; }
+          if (!a.ok) return lost("not sure this was signed (" + signWhy(a) + ")");
           signKeep(c.body.rp_id, fp, cred);
           // the reply's fields where it names them, else what was sent; a part neither names is left out
           const chose = typeof a.body.choice === "string" && a.body.choice ? a.body.choice : choice;
@@ -4931,10 +4989,39 @@
       }, (e) => { say(signDeclined(e, "nothing was signed"), "bad"); return { done: "unsigned" }; });
     }).catch((e) => {
       const name = (e && e.name) || "error";
-      if (sent) { say("not sure this was signed (the page failed: " + name + "): check the list", "bad"); return { done: "unsure" }; }
+      if (sent) return lost("not sure this was signed (the page failed: " + name + ")");
       say("the page failed (" + name + "); nothing was signed", "bad");
       return { done: "unsigned" };
     });
+  }
+  // Ask the cockpit where the answer with `attempt` on request `id` stands, after its reply was lost (`said`: what the card
+  // said then). Resolves as signCeremony does; "unsure" puts the request in signPending.
+  function signSettle(id, attempt, line, choice, fp, say, said) {
+    signSettledIds.delete(id);
+    say(said + "; asking the cockpit where it stands…", "bad");
+    return signAttempt(id, attempt).catch((e) => ({ state: "", why: "the read failed (" + ((e && e.name) || "error") + ")" }))
+      .then((st) => {
+        if (st.state === "signed") {
+          signPending.delete(id);
+          const chose = typeof st.choice === "string" && st.choice ? st.choice : choice;
+          const by = typeof st.signer_fp === "string" && st.signer_fp ? st.signer_fp : fp;
+          const ns = typeof st.namespace === "string" && st.namespace ? " in " + st.namespace : "";
+          say("signed" + (chose ? " (" + chose + ")" : "") + " · by " + by + ns + (line ? ": " + line : "")
+              + " (its reply was lost; the cockpit confirmed it)", "ok");
+          return { done: "signed", line: line };
+        }
+        if (st.state === "refused") {
+          signPending.delete(id);
+          const why = typeof st.reason === "string" && st.reason ? st.reason.replace(/[.\s]+$/, "") : "refused";
+          say("not signed: " + why + (/nothing was signed/.test(why) ? "" : "; nothing was signed") + ": sign it again", "bad");
+          return { done: "unsigned" };
+        }
+        signPending.set(id, { attempt: attempt, views: new Set(), asking: false });
+        say(said + (st.state === "pending" ? "; the cockpit is still verifying it: not confirmed"
+          : "; where it stands could not be read (" + (st.why || st.state || "no reply") + "): not confirmed")
+          + "; the board reads it again", "bad");
+        return { done: "unsure" };
+      });
   }
   // Which passkey signs: the one this browser used before, else the only one enrolled; with several and no record, the
   // person picks (buttons put into `host`, the phone's pick list). The credential id is this browser's own record, else
@@ -4999,9 +5086,34 @@
       if (one.error) return show(one.error, "bad");
       const r = one.request;
       const kept = signNotes.get(id);
+      // an answer whose reply was lost and that the cockpit had not settled: the card is drawn frozen and asks about it
+      // (settleHere, below) before anything is offered
+      const unsettled = !!r && signPending.has(id);
+      if (!r && signPending.has(id)) {
+        // an unsettled answer whose request left the listing is never dropped: this facet is told every ask about it (on
+        // this read and on every board read, signRecheck) until the cockpit says signed or refused
+        const p = signPending.get(id);
+        const gone = (st) => {
+          if (!wrap.isConnected) { p.views.delete(gone); return; }
+          if (st.state === "signed") {
+            signWriteIns.delete(id);
+            return show("signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
+                        + " (its reply was lost; the cockpit confirmed it)", "ok");
+          }
+          if (st.state === "refused") {
+            return show("this sign request is no longer open, and the last answer here was not signed", "bad");
+          }
+          show("this sign request is no longer open; the last answer here is not confirmed, and is asked about again "
+               + "on the next read", "bad");
+        };
+        p.views.add(gone);
+        show("this sign request is no longer open; asking the cockpit where the last answer here stands", "bad");
+        signAskPending(id);
+        return;
+      }
       if (!r) {
         // answered here: its signed line stays until the row itself leaves; else it was answered, denied or expired elsewhere
-        return show(kept && kept[1] === "ok" ? kept[0] : "this sign request is no longer open; the card updates on the next read", kept && kept[1]);
+        return show(kept && (kept[1] === "ok" || signSettledIds.has(id)) ? kept[0] : "this sign request is no longer open; the card updates on the next read", kept && kept[1]);
       }
       if (kept && kept[2] !== (r.sha256 || "")) signNotes.delete(id);
       if (r.refused) return show("not signable: " + r.refused, "bad");
@@ -5016,55 +5128,82 @@
       let sheetBtn = null;    // "open the sheet": locked with the card's own controls, whether or not a key may sign
       const lock = (on) => { for (const b of buttons) b.disabled = on || !signers.length; if (sheetBtn) sheetBtn.disabled = on; };
       let freeze = null;      // the write-in's frozen state while its ceremony runs (set below when it offers one)
+      // the frozen card's view of its unsettled answer (signPending): "signed" says so and the board reads again;
+      // "refused" gives the card back; anything else keeps it frozen until the next board read asks again (signRecheck)
+      let settleView = null;
+      const settleHere = (ask) => {     // ask: false only right after the ceremony's own ask (the next board read asks)
+        const p = signPending.get(id);
+        if (!p) return;
+        if (!settleView) {
+          settleView = (st) => {
+            if (!wrap.isConnected) { p.views.delete(settleView); return; }   // a newer card shows it now
+            settleShow(st);
+          };
+        }
+        p.views.add(settleView);
+        if (ask !== false) signAskPending(id);
+      };
+      const settleShow = (st) => {
+        if (st.state === "signed") {
+          signWriteIns.delete(id);
+          say("signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
+              + " (its reply was lost; the cockpit confirmed it)", "ok");
+          rereadBoard();
+          return;
+        }
+        if (st.state === "refused") {
+          const why = typeof st.reason === "string" && st.reason ? st.reason.replace(/[.\s]+$/, "") : "refused";
+          say("not signed: " + why + (/nothing was signed/.test(why) ? "" : "; nothing was signed") + ": sign it again", "bad");
+          lock(false);
+          if (freeze) freeze.release();
+          for (const x of acts.querySelectorAll("input")) x.readOnly = x.disabled = false;
+          return;
+        }
+        say((st.state === "pending" ? "the cockpit is still verifying the last answer"
+          : "where the last answer stands could not be read" + (st.why ? " (" + st.why + ")" : ""))
+          + ": not confirmed; the card asks again on the next board read", "bad");
+      };
       const run = (choice, words) => {
         if (signBusy) return say(SIGN_BUSY, "bad");   // the lease holds a second tap, never a button drawn disabled
         signBusy++;
         lock(true);
-        if (!signPending.has(id)) signPending.set(id, new Set());
+        if (!signInFlight.has(id)) signInFlight.set(id, new Set());
         let done = "unsigned";
         let rearm = true;     // false: the card stays frozen (signed, or "not sure" until a read finds the version open)
         signWho(Object.assign({}, listing, { signers: signers }), acts, say)
-          .then((who) => (who ? signCeremony(r, who.fp, who.rawId, choice, words, say) : { done: "unsigned" }),
-                () => { say(SIGN_PICK_CLOSED, "bad"); return { done: "unsigned" }; })
-          // a ceremony that threw (past its own catch) may have sent the answer: "not sure", which reads the request
-          // again below and releases a write-in's words only if it is still open
+          .then((who) => {
+            if (!who) return { done: "unsigned" };
+            // a ceremony that throws before it returns has posted nothing: the answer is only ever sent from inside the
+            // promise it returns
+            try { return signCeremony(r, who.fp, who.rawId, choice, words, say); }
+            catch (e) { say("the page failed (" + ((e && e.name) || "error") + "); nothing was signed", "bad"); return { done: "unsigned" }; }
+          }, () => { say(SIGN_PICK_CLOSED, "bad"); return { done: "unsigned" }; })
+          // a ceremony whose own catch threw may have sent the answer, with no attempt to ask about: "not sure", and the
+          // card stays frozen
           .catch((e) => {
             say("not sure this was signed (the page failed: " + ((e && e.name) || "error") + "): check the list", "bad");
             return { done: "unsure" };
           })
           .then((out) => {
             done = out.done;
-            // only a signature spends the words. "Not sure" keeps them and every button frozen until a read of the
-            // request by its id shows the same version still open twice running; anything else leaves the card
-            // frozen and says so, and the board reads again below (a redrawn card offers the words only if still open)
+            // only a signature spends the words. "Not sure" (the cockpit has not settled the answer's attempt, or the
+            // ceremony's own catch threw) keeps them and every button frozen; an unsettled attempt is asked about again
+            // on every board read (settleHere)
             if (out.done === "signed") { signWriteIns.delete(id); rearm = false; return undefined; }
             if (out.done === "unsigned") { if (freeze) freeze.release(); return undefined; }
             rearm = false;
-            const said = (signNotes.get(id) || [""])[0];
-            const readOne = () => Promise.resolve().then(() => signOne(id)).catch((e) => ({ error: "the read failed (" + ((e && e.name) || "error") + ")" }));
-            const stillOpen = (one) => !!one.request && one.request.sha256 === r.sha256 && !one.request.refused;
-            const settled = (one) => say(said + (one.error ? "; where it stands could not be read (" + one.error + ")"
-              : one.request ? "; the request changed while it was being signed" : "; the request is no longer open")
-              + ": the board reads it again", "bad");
-            // one open read does not show nothing was signed: the answer may still be verifying. The card stays frozen,
-            // and comes back only if a second read, after the board's own delay, finds the same version still open
-            return readOne().then((first) => {
-              if (!stillOpen(first)) return settled(first);
-              say(said + "; the request reads open now; not confirmed", "bad");
-              return new Promise((res) => setTimeout(res, 1500)).then(readOne).then((second) => {
-                if (!stillOpen(second)) return settled(second);
-                rearm = true;
-                if (freeze) freeze.release();
-                return say(said + "; the request still reads open on a second read: sign it again", "bad");
-              });
-            });
+            settleHere(false);
+            return undefined;
           })
           .catch(() => { /* the ceremony said what happened; the lease is released below */ })
           .finally(() => {
             signBusy--;
             for (const p of acts.querySelectorAll(".sign-pick")) p.remove();
             lock(!rearm);
-            if (rearm) { const later = signPending.get(id); signPending.delete(id); if (later) for (const f of later) f(); }
+            // a definite "nothing was signed" gives every card drawn meanwhile back; an unsure answer is signPending's now
+            // (it freezes and releases a card drawn after it); a signed one stays frozen
+            if (rearm) { const later = signInFlight.get(id); signInFlight.delete(id); if (later) for (const f of later) f(); }
+            else if (done !== "signed") signInFlight.delete(id);
             signListed = null;
             // a signed (or not-knowable) answer may have closed the request: the board reads again (a row its caller has
             // answered leaves). A definite "nothing was signed" changed nothing, so nothing is read again under the operator
@@ -5103,7 +5242,7 @@
         // the words being signed are frozen from the tap until the ceremony ends; only a definite "nothing was signed"
         // unfreezes them, so a retry is a new tap over the same words
         freeze = { release: () => { box.readOnly = box.disabled = false; } };
-        if (signPending.has(id)) box.readOnly = box.disabled = true;
+        if (signInFlight.has(id)) box.readOnly = box.disabled = true;
         b.addEventListener("click", () => {
           if (signBusy) return say(SIGN_BUSY, "bad");
           const w = box.value.trim();
@@ -5119,11 +5258,16 @@
       lock(false);
       sheetBtn = signSheetButton(r, say);
       acts.appendChild(sheetBtn);
-      if (signPending.has(id)) {
+      if (signInFlight.has(id)) {
         lock(true);
-        signPending.get(id).add(() => { lock(false); if (freeze) freeze.release(); });
+        signInFlight.get(id).add(() => { lock(false); if (freeze) freeze.release(); });
       }
       wrap.appendChild(acts);
+      if (unsettled) {          // the last answer may still sign: nothing here is offered until the cockpit settles it
+        lock(true);
+        for (const x of acts.querySelectorAll("input")) x.readOnly = x.disabled = true;
+        settleHere();
+      }
       if (options.length) {
         const lines = el("div", "sign-lines ext-meta", "an option signs the request's message with its line appended:");
         for (const o of options) lines.appendChild(el("div", "sign-line", String(o.line)));
@@ -5703,6 +5847,7 @@
     return row;
   }
   function renderNeeds(view) {
+    signRecheck();      // a board read: every frozen card asks the cockpit about its unsettled answer again
     const host = document.getElementById("ck-needs");
     if (!host) return;
     const items = needsItems(((view.extra_panels || {}).decisions || {}).lines);
