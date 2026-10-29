@@ -198,3 +198,51 @@ def test_every_codex_gate_call_checks_for_held_phone_pings(tmp_path, monkeypatch
              "cwd": "/work/proj", "session_id": "s1", "turn_id": "t1", "tool_use_id": "c1"}
     cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"), environ=h4_env())
     assert calls == [queue.directory]
+
+
+@pytest.mark.parametrize("boom", [SyntaxError("broken install"), AttributeError("half-initialised"), RuntimeError("x")])
+def test_a_gate_notice_that_raises_anything_never_fails_the_gate(tmp_path, monkeypatch, boom):
+    """An advisory notice must never take down the consent gate (boundary code): a halted session still gets its
+    halt answer when gate_notice raises, whatever it raises."""
+    from levain import band_view
+
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    t0 = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
+    source = authority_source(qdir, anchor=None)
+    request = ConsentQueue(qdir, authority=source, clock=lambda: t0, home=h4_home()).file(
+        agent="codex", agent_session_id="S1", tool_name="apply_patch",
+        tool_input={"command": "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch"},
+        cwd=str(tmp_path), hold=timedelta(seconds=20), tier="T3")
+    assert ConsentQueue(qdir, authority=source, clock=lambda: t0 + timedelta(seconds=21), home=h4_home()).mark_undecided(
+        request.id, halt=True).gap == 1
+    calls = []
+
+    def raising(*a, **kw):
+        calls.append(1)
+        raise boom
+
+    monkeypatch.setattr(band_view, "gate_notice", raising)
+    out = json.loads(_run(qdir, _event("S1", "Bash", {"command": "ls"}, str(tmp_path))))
+    assert calls and out["hookSpecificOutput"]["permissionDecisionReason"] == cx.HALT_TEXT.format(n=1)
+
+
+def test_a_halted_session_hands_the_gate_notice_its_cwd_and_environ(tmp_path, monkeypatch):
+    # The halted branch called _with_rulings without cwd/environ, so the one-time notice was judged (and its claim
+    # taken) on ambient state instead of the event's own.
+    from levain import band_view
+
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    t0 = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
+    source = authority_source(qdir, anchor=None)
+    filed = ConsentQueue(qdir, authority=source, clock=lambda: t0, home=h4_home())
+    request = filed.file(agent="codex", agent_session_id="S1", tool_name="apply_patch",
+                         tool_input={"command": "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch"},
+                         cwd=str(tmp_path), hold=timedelta(seconds=20), tier="T3")
+    later = ConsentQueue(qdir, authority=source, clock=lambda: t0 + timedelta(seconds=21), home=h4_home())
+    assert later.mark_undecided(request.id, halt=True).gap == 1
+    seen = []
+    monkeypatch.setattr(band_view, "gate_notice", lambda d, a, s, cwd, environ=None, **kw: seen.append((cwd, environ)))
+    _run(qdir, _event("S1", "Bash", {"command": "ls -a"}, str(tmp_path)))
+    assert seen and seen[0][0] == str(tmp_path) and seen[0][1] is not None, seen

@@ -1574,7 +1574,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
 
         notice = gate_notice(queue.directory, AGENT, session, cwd, environ, deliverable=not stopped)
     except Exception:
-        notice = None  # a notice is not the gate's to fail on
+        notice = None  # an advisory notice must never fail the consent gate, whatever it raises
     context = "\n".join(c for c in (context, answers, notice) if c) or None
     if context:
         out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}

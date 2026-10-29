@@ -2129,3 +2129,17 @@ class TestOversizeWithALyingContentLength:
             "the body — the drain stranded on the socket timeout and handle_error swallowed it"
         )
         assert b"413" in raw.split(b"\r\n", 1)[0], f"expected a 413 status line, got: {raw[:120]!r}"
+
+
+def test_every_route_constant_is_reserved_against_plugin_routes():
+    # A route constant added to the module but not to the reserved sets would let a plugin route silently shadow it.
+    import levain.web_server as w
+
+    suffixes = {"_CONSENT_SHEET_READ", "_DISPATCH_SHEET_READ"}      # path tails appended to a prefix, not routes
+    missing = []
+    for name, v in sorted(vars(w).items()):
+        if not (name.startswith("_") and name.isupper() and isinstance(v, str) and v.startswith("/")) or name in suffixes:
+            continue
+        if v not in w._RESERVED_PATHS and not v.startswith(w._RESERVED_PREFIXES):
+            missing.append(name)
+    assert missing == []
