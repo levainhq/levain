@@ -9,12 +9,16 @@ First, whether or not anything else here fires: the consent requests levain left
 dialog in this session that did not run are recorded, unsigned, as not run (`levain.consent.dialog`), and the
 session's pending authority-ledger rows are stamped from the agent's own record (`levain.consent.ledger`).
 
-Prints NOTHING and exits 0 always: Codex's Stop output schema rejects `hookSpecificOutput.additionalContext`. FAIL-OPEN — the hook import is guarded and main()
-swallows everything.
+Last, the NEEDS YOU band's verifier (`levain.band_view.hook_stop`, agent "codex"): a reply that did not carry the
+band shown to this seat is blocked ONCE: stdout is `{"decision": "block", "reason": ...}` (Codex then continues with
+the reason as a new prompt; `stop_hook_active` and a per-view claim bound it to one retry). That is the only output
+(plain text is invalid for Stop, and Codex's Stop schema rejects `hookSpecificOutput.additionalContext`). Otherwise
+prints NOTHING. Exits 0 always. FAIL-OPEN — the hook import is guarded and main() swallows everything.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -26,6 +30,7 @@ except Exception:
 
 
 def main() -> int:
+    payload = {}
     try:
         payload = hook.read_stdin()
         if hasattr(hook, "consent_observe"):  # an older helper beside a newer script: no record, the hook runs
@@ -37,6 +42,14 @@ def main() -> int:
         message = payload.get("last_assistant_message")
         if isinstance(message, str) and message:
             hook.session_log(payload.get("session_id"), "reply", message)
+    except Exception:
+        pass
+    try:
+        from levain.band_view import hook_stop
+        reason = hook_stop(payload, agent="codex")
+        if reason:
+            sys.stdout.write(json.dumps({"decision": "block", "reason": reason}) + "\n")
+            sys.stdout.flush()
     except Exception:
         pass
     return 0

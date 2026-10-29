@@ -29,8 +29,8 @@ and UserPromptSubmit. The Codex-specific divergences are:
   - SessionStart `source` vocabulary is `startup|resume|clear|compact` per
     Codex 0.133 schema (matches Claude Code; empirical 0.132 saw startup|resume
     only but the matcher now covers all four for forward compatibility)
-  - Stop carries no posture (record-only, prints nothing) per the Codex Stop
-    output schema constraint above
+  - Stop carries no posture (it records the reply; its one output is the band verifier's
+    `decision: block`, see stop.py) per the Codex Stop output schema constraint above
 
 FAIL-OPEN — structural rule: the GUARANTEE that a hook never crashes or writes
 stderr noise into the operator's session is enforced at the harness ENTRY
@@ -1318,7 +1318,7 @@ def emit(additional_context: str, event_name: str) -> bool:
     `hookEventName` per the documented schema (omitting it relies on
     undocumented permissiveness — not safe for a distributable artifact).
     Stop does not use this function: its output schema does not accept
-    `hookSpecificOutput` (see module docstring); `stop.py` prints nothing.
+    `hookSpecificOutput` (see module docstring); `stop.py` prints only the band verifier's `decision: block`.
 
     Codex uses the same hook output shape as Claude Code at v1; this is the
     primary harness-coupled seam — a future non-Codex adapter that diverges

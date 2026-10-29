@@ -5151,9 +5151,7 @@ def _check_band_hooks(install: Path, agent: str) -> CheckResult:
 
     state, lacking = band_hooks_state(install / "activation" / "hooks", agent)
     if state == "wired":
-        which = "SessionStart + UserPromptSubmit + Stop verifier" if agent == "claude_code" \
-            else "SessionStart + UserPromptSubmit (Codex's Stop cannot carry the verifier)"
-        return CheckResult(BAND_HOOKS_ROW, True, f"wired: {which}")
+        return CheckResult(BAND_HOOKS_ROW, True, "wired: SessionStart + UserPromptSubmit + Stop verifier")
     return CheckResult(BAND_HOOKS_ROW, True,
                        f"{state}: {', '.join(lacking)} {'does' if len(lacking) == 1 else 'do'} not call the band "
                        "(a seat here is not shown what waits on the operator; `levain band` still lists it)",

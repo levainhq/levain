@@ -105,7 +105,7 @@ described below.
   (default 12) it also appends the **Layer D ambient nudge**.
 
 No posture rides the Stop hook (it is wired only to record the turn's final
-reply for the cockpit's session transcript, and prints nothing). Codex 0.133's `stop.command.output` schema accepts
+reply for the cockpit's session transcript; its only output is the NEEDS YOU band verifier's one `decision: block`). Codex 0.133's `stop.command.output` schema accepts
 `continue` / `decision` / `reason` / `stopReason` / `suppressOutput` /
 `systemMessage` — it does *not* accept `hookSpecificOutput.additionalContext`,
 the shape the activation mechanism produces. The Claude Code adapter folds
@@ -459,8 +459,8 @@ expect **three** swap points:
    Codex 0.133 emits `startup` / `resume` / `clear` / `compact`
    (matching Claude Code); the matcher covers all four. Re-verify the
    target harness's equivalents.
-3. **Hook events wired** — Codex wires Stop for the transcript only (it injects
-   nothing there, because of the output schema constraint); Claude Code uses SessionStart + UserPromptSubmit by the
+3. **Hook events wired** — Codex wires Stop for the transcript and the band verifier's one block (it injects
+   no context there, because of the output schema constraint); Claude Code uses SessionStart + UserPromptSubmit by the
    same architectural logic (Stop fires after the model stops). A
    different harness may wire different events; the wiring is in
    `hooks.json.template` (per Codex) or `settings.template.json` (per

@@ -217,7 +217,7 @@ def _load(path, name):
     return mod
 
 
-def test_claude_stop_script_prints_the_block_json_and_codex_stop_prints_nothing(qdir, store, monkeypatch, capsys):
+def test_claude_stop_script_prints_the_block_json(qdir, store, monkeypatch, capsys):
     launch_rows(monkeypatch, {})
     monkeypatch.setenv("LEVAIN_HOME", str(qdir.parent))
     monkeypatch.delenv("LEVAIN_SEAT", raising=False)
@@ -241,8 +241,6 @@ def test_claude_stop_script_prints_the_block_json_and_codex_stop_prints_nothing(
     # a hook that cannot even read stdin exits 0 and prints nothing
     monkeypatch.setattr(h, "read_stdin", lambda: 1 / 0)
     assert mod.main() == 0 and capsys.readouterr().out == ""
-    codex = (TEMPLATES / "adapters" / "codex" / "activation" / "hooks" / "stop.py").read_text()
-    assert "band_view" not in codex                                    # Codex's Stop cannot carry a block: L1+L2 only
 
 
 # --- Codex parity ------------------------------------------------------------------------------------------
@@ -355,7 +353,7 @@ def test_doctor_band_hooks_row(tmp_path):
     d = _hooks_dir(tmp_path / "c", wired=True)
     (d / "stop.py").write_text("pass\n")
     assert doctor._check_band_hooks(tmp_path / "c", "claude_code").detail.startswith("stale")
-    assert doctor._check_band_hooks(tmp_path / "c", "codex").detail.startswith("wired")     # codex needs no Stop
+    assert doctor._check_band_hooks(tmp_path / "c", "codex").detail.startswith("stale")     # codex needs Stop too
     assert doctor._check_band_hooks(tmp_path / "zzz", "codex").detail.startswith("absent")
 
 
@@ -370,3 +368,144 @@ def test_coordinator_brief_carries_the_band_line(tmp_path, monkeypatch):
 
     src = pathlib.Path(launch.__file__).read_text()
     assert "## The band" in src and "NEEDS YOU band is shown to you on every turn" in src
+
+
+# --- round 1 fixes ---------------------------------------------------------------------------------------------
+def test_codex_stop_script_prints_the_block_json_once(qdir, store, monkeypatch, capsys):
+    launch_rows(monkeypatch, {})
+    monkeypatch.setenv("LEVAIN_HOME", str(qdir.parent))
+    monkeypatch.delenv("LEVAIN_SEAT", raising=False)
+    ask(store)
+    deliver(store, "cx1", agent="codex", e=env(qdir))
+    mod = _load(TEMPLATES / "adapters" / "codex" / "activation" / "hooks" / "stop.py", "stop_cx")
+    h = mod.hook
+    payload = {"session_id": "cx1", "last_assistant_message": "I dropped it", "stop_hook_active": False}
+    monkeypatch.setattr(h, "read_stdin", lambda: payload)
+    monkeypatch.setattr(h, "should_fire", lambda: True)
+    monkeypatch.setattr(h, "consent_observe", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(h, "consent_ledger", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(h, "session_log", lambda *a, **k: None)
+    payload_active = dict(payload, stop_hook_active=True)
+    monkeypatch.setattr(h, "read_stdin", lambda: payload_active)
+    assert mod.main() == 0 and capsys.readouterr().out == ""           # a continuation: never blocked
+    monkeypatch.setattr(h, "read_stdin", lambda: payload)
+    assert mod.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["decision"] == "block" and "NEEDS YOU" in out["reason"]
+    assert mod.main() == 0 and capsys.readouterr().out == ""           # one reprint per view
+    monkeypatch.setattr(band_view, "hook_stop", lambda *_a, **_k: 1 / 0)
+    assert mod.main() == 0 and capsys.readouterr().out == ""           # fail open
+
+
+def test_codex_needs_the_stop_script_to_be_wired(tmp_path):
+    d = _hooks_dir(tmp_path / "c", wired=True)
+    (d / "stop.py").write_text("pass\n")
+    assert band_view.band_hooks_state(d, "codex") == ("stale", ["stop.py"])
+
+
+def test_verifier_numbered_prose_after_a_bare_header_is_not_the_band(qdir, store, monkeypatch):
+    launch_rows(monkeypatch, {})
+    e = env(qdir)
+    ask(store, "one?"), ask(store, "two?")
+    deliver(store, e=e)
+    fake = "I omitted band@2\n1. First result\n2. Second result"
+    assert stop("s1", fake, e) is not None
+
+
+def test_verifier_band_header_number_is_digit_bounded(qdir, store, monkeypatch):
+    launch_rows(monkeypatch, {})
+    e = env(qdir)
+    ask(store)
+    deliver(store, e=e)
+    # a view kept before blocks existed: the legacy check, band@1 must not be satisfied by band@10
+    sid = band_view._store_id_of(store)
+    with store._write_by(__import__("time").monotonic() + 2) as conn:
+        conn.execute("INSERT INTO band_views (viewer, seen_through, open_list, store_id, at, gen) "
+                     "VALUES ('claude_code:old', 1, '[1]', ?, 'x', 5)", (sid,))
+    got = band_view._view_row(store, "claude_code:old")
+    assert got and got[2] is None
+    assert band_view._reprint_check(got[0], None, "band@10\n1. a") == ([], True)
+    assert band_view._reprint_check(got[0], None, "band@1\n1. a") == ([], False)
+
+
+def test_verifier_checks_view_row_in_one_snapshot(qdir, store, monkeypatch):
+    launch_rows(monkeypatch, {})
+    e = env(qdir)
+    ask(store, "one?")
+    deliver(store, e=e)
+    ask(store, "two?")
+    band2 = deliver(store, e=e)
+    view, gen, block = band_view._view_row(store, "claude_code:s1")
+    assert view.open_list == (1, 2) and block == band2 and gen == band_view._view_row(store, "claude_code:s1")[1]
+
+
+def test_verifier_accepts_the_reprint_with_the_viewer_delta_line(qdir, store, monkeypatch):
+    launch_rows(monkeypatch, {})
+    e = env(qdir)
+    ask(store, "one?")
+    deliver(store, e=e)
+    ask(store, "two?")
+    text = deliver(store, e=e)
+    assert stop("s1", "ok\n\n" + text.replace("\n1.", "\n\n> 1.", 1), e) is None
+
+
+def test_hooks_dir_for_codex_never_takes_a_neighbouring_claude_install(tmp_path):
+    proj = tmp_path / "proj"
+    _hooks_dir(proj, wired=True)
+    e = {"CODEX_HOME": str(tmp_path / "none"), "CLAUDE_PROJECT_DIR": str(proj)}
+    assert band_view._find_hooks_dir("codex", str(proj), e) is None
+    assert band_view._find_hooks_dir("claude_code", str(proj), e) == proj / "activation" / "hooks"
+    cx = tmp_path / "cx"
+    cx.mkdir()
+    d = tmp_path / "other" / "activation" / "hooks"
+    cmd = f'python3 -m levain.hookrun "{d}/user_prompt_submit.py"'
+    (cx / "hooks.json").write_text(json.dumps({"hooks": {"UserPromptSubmit": [{"hooks": [{"command": cmd}]}]}}))
+    assert band_view._find_hooks_dir("codex", str(proj), {"CODEX_HOME": str(cx)}) == d
+
+
+def test_gate_notice_for_codex_with_only_a_claude_install_nearby(qdir, store, monkeypatch, tmp_path):
+    launch_rows(monkeypatch, {})
+    proj = tmp_path / "proj"
+    _hooks_dir(proj, wired=True)
+    ask(store)
+    e = env(qdir, CODEX_HOME=str(tmp_path / "none"))
+    assert "absent" in band_view.gate_notice(qdir, "codex", "cx1", str(proj), e)
+
+
+def test_gate_notice_counts_authority_items_and_fails_open_per_source(qdir, store, monkeypatch, tmp_path):
+    from levain import band_sources
+
+    launch_rows(monkeypatch, {})
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    e = env(qdir)
+    extra = band_sources.Extra(source="consent", ref="c1", filed="2026-01-01T00:00:00Z", tag="t", what="w",
+                               options=("x",), rec="a", rec_letter="a", blocks="b", origin="o")
+    monkeypatch.setattr(band_view, "read_extras", lambda *_a, **_k: band_sources.Extras(items=[extra]))
+    note = band_view.gate_notice(qdir, "claude_code", "a1", str(bare), e)       # authority item only, no question
+    assert note and "1 item needs" in note
+    ask(store)
+    assert "2 items" in band_view.gate_notice(qdir, "claude_code", "a2", str(bare), e)
+    monkeypatch.setattr(band_view, "read_extras", lambda *_a, **_k: (_ for _ in ()).throw(OSError("x")))
+    assert "at least 1 item" in band_view.gate_notice(qdir, "claude_code", "a3", str(bare), e)
+    monkeypatch.setattr(band_view, "read_extras", lambda *_a, **_k: band_sources.Extras(items=[extra], failed=["s"]))
+    assert "at least 2 items" in band_view.gate_notice(qdir, "claude_code", "a4", str(bare), e)
+
+
+def test_gate_notice_not_claimed_when_undeliverable_and_checks_the_claim_first(qdir, store, monkeypatch, tmp_path):
+    launch_rows(monkeypatch, {})
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    ask(store)
+    e = env(qdir)
+    assert band_view.gate_notice(qdir, "claude_code", "h1", str(bare), e, deliverable=False) is None
+    assert band_view.gate_notice(qdir, "claude_code", "h1", str(bare), e) is not None   # still owed: not claimed
+    # claimed: nothing heavy runs
+    for name in ("is_autonomous", "_find_hooks_dir", "_read"):
+        monkeypatch.setattr(band_view, name, lambda *_a, **_k: 1 / 0)
+    assert band_view.gate_notice(qdir, "claude_code", "h1", str(bare), e) is None
+
+
+def test_claude_gate_does_not_claim_the_notice_on_a_hard_stop():
+    src = (pathlib.Path(levain.__file__).parent / "consent" / "adapters" / "claude_code.py").read_text()
+    assert "deliverable=not stopped" in src
