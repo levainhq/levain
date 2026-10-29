@@ -72,6 +72,10 @@ if args == ["agents", "--json"]:
     state.write_text(json.dumps(s))
     print(json.dumps(extra + [row], indent=2)); sys.exit(0)
 if args[:1] == ["stop"]:
+    if (here / "stop_noop").exists():             # the stop is accepted, the row stays listed
+        print(f"stopped {{args[1]}}"); sys.exit(0)
+    if (here / "fail_after_stop").exists():       # the list cannot be read once the stop has run
+        (here / "agents_fail").write_text("")
     state.unlink(missing_ok=True)
     print(f"stopped {{args[1]}}"); sys.exit(0)
 print("unexpected", args); sys.exit(3)
@@ -229,7 +233,7 @@ def test_the_first_agents_row_has_no_pid_and_is_enough(store, fake, live_hook):
     got = cl.launch_session(store, woken(store))
     assert got.started
     agents = [c for c in fake.calls() if c["argv"] == ["agents", "--json"]]
-    assert len(agents) == 1          # the pid-less first row was taken: no wait for a pid
+    assert len(agents) == 3          # the spawn gate's two reads, then the pid-less first row, taken: no wait for a pid
 
 
 # --- run_c3b_first_a: the trust refusal ------------------------------------------------------------------------
@@ -266,8 +270,8 @@ def test_a_session_never_listed_fails(store, fake, live_hook):
     launch_id = woken(store)
     got = cl.launch_session(store, launch_id)
     assert not got.started and "started no session listed" in got.refusal
-    # the read back's tries, then one more list to stop anything under its name (nothing was listed)
-    assert len([c for c in fake.calls() if c["argv"] == ["agents", "--json"]]) == cl.READBACK_TRIES + 1
+    # the gate's two reads, the read back's tries, then one more list to stop anything under its name (nothing was listed)
+    assert len([c for c in fake.calls() if c["argv"] == ["agents", "--json"]]) == 2 + cl.READBACK_TRIES + 1
     assert "no session named" in got.refusal and fake.stops() == []
     assert store.launch(launch_id).state == "failed"
 
@@ -796,6 +800,83 @@ def test_an_ended_launch_still_listed_is_stopped_and_no_other_session_is_touched
     assert store.coord_status()["lease"]["holder"] == "operator"
 
 
+def _over_with_successor(store, clock):
+    """An ended launch whose session still runs, and a successor wake waiting pending behind it."""
+    from datetime import timedelta
+
+    ln = started(store)
+    store.coord_take()                                  # you took over: its launch is ended, its session still runs
+    store.coord_release()                               # and handed it back: the next drop wakes a successor
+    clock[0] += timedelta(minutes=1)
+    store.accept_drop("next", surface="cli")
+    (pending,) = store.launches_unspawned()
+    return ln, pending
+
+
+def test_a_stopped_session_still_listed_refuses_the_handover(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)
+    fake.flag("stop_noop")
+    lines = cl.watch_once(store)
+    assert fake.stops() == [["stop", HID]]
+    assert any(f"launch {pending.launch_id} not started: the session of an ended launch is still listed" in x
+               for x in lines)
+    assert store.launch(pending.launch_id).state == "pending" and len(fake.spawns()) == 1
+
+
+def test_launch_session_itself_refuses_while_the_old_name_is_listed(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)             # not through the watcher: any caller hits the gate
+    got = cl.launch_session(store, pending.launch_id)
+    assert not got.started and f"still listed ({HID})" in got.refusal
+    assert store.launch(pending.launch_id).state == "pending" and len(fake.spawns()) == 1
+
+
+def test_a_session_that_clears_lets_the_handover_proceed(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)
+    first = len(fake.spawns())
+    cl.watch_once(store)                                # stops it; the fake's stop clears the row
+    lines = cl.watch_once(store)
+    assert f"launch {pending.launch_id} started: claude attach {HID}" in lines
+    assert len(fake.spawns()) == first + 1 and store.launch(pending.launch_id).state == "active"
+
+
+def test_an_unreadable_list_refuses_the_handover(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)
+    fake.flag("agents_fail")
+    got = cl.launch_session(store, pending.launch_id)
+    assert not got.started and "`claude agents` could not be read" in got.refusal
+    assert len(fake.spawns()) == 1 and store.launch(pending.launch_id).state == "pending"
+
+
+def test_one_partial_list_does_not_clear_a_stale_session(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)
+    fake.flag("miss_once")                              # the first read omits the stale row, the second lists it
+    got = cl.launch_session(store, pending.launch_id)
+    assert not got.started and f"still listed ({HID})" in got.refusal
+    assert len(fake.spawns()) == 1 and store.launch(pending.launch_id).state == "pending"
+
+
+def test_a_codex_row_does_not_block_a_claude_launch(store, fake, live_hook, clock, monkeypatch):
+    from types import SimpleNamespace
+
+    ln, pending = _over_with_successor(store, clock)
+    monkeypatch.setattr(cl, "_ours", lambda st, row: SimpleNamespace(harness="codex", state="ended"))
+    got = cl.launch_session(store, pending.launch_id)
+    assert got.started, got
+
+
+def test_a_row_with_no_usable_id_never_blocks(store, fake, live_hook, clock, monkeypatch):
+    ln, pending = _over_with_successor(store, clock)
+    row = {"id": None, "sessionId": SID, "name": "x", "cwd": "/x"}
+    monkeypatch.setattr(cl, "_agents", lambda exe, **kw: [row])
+    assert cl._handover_blocked(store, "claude", {}) == ""
+
+
+def test_the_first_ever_spawn_with_an_empty_list_proceeds(store, fake, live_hook):
+    fake.others([])
+    got = cl.launch_session(store, woken(store))
+    assert got.started, got
+
+
 def test_watch_runs_its_passes(store, fake, live_hook, monkeypatch):
     monkeypatch.setattr(cl.time, "sleep", lambda s: None)
     store.accept_drop("later", surface="cli")
@@ -936,7 +1017,7 @@ def test_an_empty_list_is_a_listing_and_two_of_them_end_the_launch(store, fake, 
     assert f"launch {ln.launch_id} ended: 0 turns (its session is no longer listed)" in lines, lines
     assert store.launch(ln.launch_id).state == "ended"
     agents = [c for c in fake.calls() if c["argv"] == ["agents", "--json"]]
-    assert len(agents) == 3                              # the read back, then the two reads of this pass
+    assert len(agents) == 5                  # the spawn gate's two reads, the read back, then the two reads of this pass
 
 
 def test_one_empty_read_then_a_listing_ends_nothing(store, fake, live_hook, clock):
@@ -959,7 +1040,7 @@ def test_one_missed_read_ends_nothing(store, fake, live_hook, clock):
     cl.watch_once(store)
     assert store.launch(ln.launch_id).state == "active"
     agents = [c for c in fake.calls() if c["argv"] == ["agents", "--json"]]
-    assert len(agents) == 3                              # the read back, then the two reads of this pass
+    assert len(agents) == 5                  # the spawn gate's two reads, the read back, then the two reads of this pass
 
 
 def test_a_worker_launch_is_never_started(qdir, store, fake, live_hook):
