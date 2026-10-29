@@ -123,11 +123,83 @@ async function bus() {
   mode = 403; const before = calls.length; await two.h.pull();      // a stopped view's failed read tells nobody
   return { afterFirst, watchersAfterStop, afterRemount, steps, stoppedPullCalls: calls.length - before, thrower: typeof thrower };
 }
+// L3 r1 (codex MED): a failed read retires the Send box, keeps the typed words, and the next good read re-offers it.
+async function tellFollowsTheRead() {
+  let mode = "ok";
+  const fetch = () => (mode === "net" ? Promise.reject(new Error("offline")) : mode === "ok" ? resp(200, BODY) : resp(mode, {}));
+  const host = node("div"); host.ownerDocument = doc;
+  const h = V.mount(host, { fetch, storage: { getItem: () => null, setItem() {}, removeItem() {} }, pollMs: 0, headers: () => ({}), hash: "" });
+  await tick();
+  const ta = find(host, "textarea"), btn = find(host, "button");
+  const gate = walk(host).find((n) => n.className === "bd-note");
+  const snap = () => ({ hidden: ta.hidden, sendHidden: btn.hidden, gate: gate.textContent, gateHidden: gate.hidden, typed: ta.value });
+  const out = { good: snap() };
+  ta.value = "re levain:a: please hold";                    // words the operator already typed
+  for (const m of [403, 500, "net"]) {
+    mode = m; await h.pull(); await tick();
+    out[m] = snap();
+  }
+  mode = "ok"; await h.pull(); await tick();
+  out.again = snap();
+  h.stop();
+  return out;
+}
+// L3 r1 (complement LOW #1): a late response (good or failed) never overwrites a newer one.
+async function lateResponses() {
+  const BODY2 = { queue: "ok", tell: { offered: true }, columns: [{ category: "ready", cards: [{ id: "n", title: "N" }] }] };
+  const shape = (m) => (m ? m.columns.map((x) => x.category + ":" + x.cards.length).join(",") : "none");
+  const run = async (older, newer) => {
+    const pending = [];
+    const fetch = () => new Promise((res) => pending.push(res));
+    const shared = { model: null, failed: false, watchers: [] };
+    const calls = [];
+    const host = node("div"); host.ownerDocument = doc;
+    const h = V.mount(host, { fetch, storage: { getItem: () => null, setItem() {}, removeItem() {} }, pollMs: 0, headers: () => ({}), hash: "", bus: shared });
+    h.watch((m, failed) => calls.push(failed ? "FAILED" : shape(m)));
+    const ta = find(host, "textarea");
+    h.pull();                                                  // the second request: the mount's own is pending[0] (the older)
+    const resolveWith = async (i, x) => { pending[i](x === 403 || x === 500 ? { ok: false, status: x, json: () => Promise.resolve({}) } : { ok: true, status: 200, json: () => Promise.resolve(x) }); await tick(); };
+    await resolveWith(1, newer);                              // the newer answers first ...
+    const mid = { model: shape(shared.model), failed: shared.failed, calls: calls.slice(), hidden: ta.hidden };
+    await resolveWith(0, older);                              // ... then the older one arrives late
+    const end = { model: shape(shared.model), failed: shared.failed, calls: calls.slice(), hidden: ta.hidden, view: host.children[0].textContent };
+    h.stop();
+    return { mid, end };
+  };
+  return { lateGood: await run(BODY, BODY2), lateFail403: await run(403, BODY2), lateFail500: await run(500, BODY2), lateGoodAfterFail: await run(BODY, 500) };
+}
+// L3 r1 (complement LOW #2): the token's removal fails the bus (the open modal says so); its return clears that and tells the watchers.
+async function tokenTransitions() {
+  if (typeof V.busToken !== "function") return { missing: true };       // the view exports the token step sync() runs
+  const shared = { model: null, failed: false, watchers: [] };
+  const calls = [];
+  const watch = (m, failed) => calls.push(failed ? "FAILED" : m ? "model" : "null");
+  shared.watchers.push(watch);
+  const fetchOk = () => resp(200, BODY);
+  const host = node("div"); host.ownerDocument = doc;
+  const h = V.mount(host, { fetch: fetchOk, storage: { getItem: () => null, setItem() {}, removeItem() {} }, pollMs: 0, headers: () => ({}), hash: "", bus: shared });
+  await tick(); h.stop();
+  const out = { start: { failed: shared.failed, calls: calls.slice() } };
+  V.busToken(shared, false);
+  out.removed = { failed: shared.failed, model: shared.model, calls: calls.slice() };
+  V.busToken(shared, false);                                   // sync() fires often: a second call says nothing new
+  out.removedAgain = { calls: calls.slice() };
+  V.busToken(shared, true);
+  out.returned = { failed: shared.failed, model: shared.model, calls: calls.slice() };
+  // a bus failed by a bad READ (token present all along) is not cleared by a sync that sees the token
+  shared.failed = true; calls.length = 0;
+  V.busToken(shared, true);
+  out.readFailureKept = { failed: shared.failed, calls: calls.slice() };
+  return out;
+}
 (async () => {
   const on = { offered: true, why: null };
   const out = {};
   out.grouped = await grouped();
   out.bus = await bus();
+  out.tellFollows = await tellFollowsTheRead();
+  out.late = await lateResponses();
+  out.token = await tokenTransitions();
   out.not_offered = await scenario({ tell: { offered: false, why: "different queue" }, listing: { coord_store_read: true, coord_store_id: "S" }, type: "hi" });
   out.unreadable = await scenario({ tell: on, listing: { coord_store_read: false, coord_store_id: null, coord_note: "store locked" }, type: "hi" });
   out.double_click = await scenario({ tell: on, listing: { coord_store_read: true, coord_store_id: "S" }, type: "hi", clicks: 2 });

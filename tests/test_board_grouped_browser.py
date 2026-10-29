@@ -100,7 +100,8 @@ def test_the_tab_is_grouped_and_the_columns_live_in_the_expand_modal(tmp_path: P
     assert opened["cols"] == ORDER and opened["cards"] == 6 and opened["tells"] == 0 and opened["title"] == "Board", opened
     closed = [json.loads(x) for x in v if isinstance(x, str) and x.startswith('{"heads"')]
     assert closed[-1]["heads"] == first["heads"], closed[-1]               # Esc closed the modal; the tab is as it was
-    assert json.loads(v[-3]) == [True, True], v[-3]                     # the modal and the page fit the phone width
+    fit = next(json.loads(x) for x in v if isinstance(x, str) and x.startswith(("[true,", "[false,")))      # by shape, not position
+    assert fit == [True, True], fit                                     # the modal and the page fit the phone width
     assert not [p for p in out["posts"]], out["posts"]                      # nothing in all of this posted
 
 
@@ -150,7 +151,7 @@ def test_the_open_modal_repaints_after_the_view_is_remounted(tmp_path: Path, lh)
             {"eval": f"JSON.stringify({{open: !!{MODAL}, cols: {MODAL}.querySelectorAll('.bd-col').length}})"},
         ])
     v = out["values"]
-    assert True in v, v                                                        # a new view really replaced the old one
+    assert any(x is True for x in v), v                                        # a new view really replaced the old one (`1 == True`, so `in` would not say)
     assert json.loads(v[-1]) == {"open": True, "cols": 6}, v[-1]
 
 

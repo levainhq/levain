@@ -113,6 +113,51 @@ def test_the_validator_refuses_a_bad_category_a_non_list_columns_and_a_card_with
     _refused([good], "value")
 
 
+def test_a_non_object_column_is_refused_by_path_never_as_an_attribute_error() -> None:
+    """L3 r1 (deepseek MED). `_need_list` already refuses a non-object in `columns` (of_objects defaults on), so `col.get` is never
+    reached with a string: the refusal is the ordinary one, and names the item."""
+    good = _value(ready=[_card("levain:a")])
+    for bad in ("ready", 7, None, ["ready"]):
+        p = _panel({**good, "columns": [bad]})
+        assert p["status"] == "error" and "value.columns[0]" in p["error"] and "must be an object" in p["error"], p
+        assert "AttributeError" not in p["error"] and "has no attribute" not in p["error"], p["error"]
+
+
+def test_the_text_fields_refuse_an_invisible_character_and_a_runaway_length() -> None:
+    """L3 r1 (complement LOW #5). `id`, `title`, `repo` and `done_line` get the contract's other-kinds checks: no invisible or
+    format character (a bidi override reorders what the operator reads), and at most BOARD_TEXT_MAX characters."""
+    from levain.cockpit.engine import BOARD_TEXT_MAX
+    bidi = "Ship it ‮evil"
+    _refused(_value(ready=[_card("x", title=bidi)]), "value.columns[1].cards[0].title", "invisible")
+    _refused(_value(ready=[_card("x", title="x" * 1_000_000)]), "value.columns[1].cards[0].title", str(BOARD_TEXT_MAX))
+    _refused(_value(ready=[_card("x​id")]), "value.columns[1].cards[0].id", "invisible")
+    _refused(_value(ready=[_card("i" * (BOARD_TEXT_MAX + 1))]), "value.columns[1].cards[0].id", str(BOARD_TEXT_MAX))
+    _refused(_value(ready=[_card("x", repo="re‮po")]), "value.columns[1].cards[0].repo", "invisible")
+    _refused(_value(ready=[_card("x", repo=5)]), "value.columns[1].cards[0].repo", "string")
+    _refused(_value(ready=[_card("x", done_line="d" * (BOARD_TEXT_MAX + 1))]), "value.columns[1].cards[0].done_line", str(BOARD_TEXT_MAX))
+    _refused(_value(ready=[_card("x", done_line="a⁦b")]), "value.columns[1].cards[0].done_line", "invisible")
+    # the limit itself, a null repo / done_line, and newline + tab (shown, never marked) are fine
+    ok = _value(ready=[_card("i" * BOARD_TEXT_MAX, title="t" * BOARD_TEXT_MAX, repo=None, done_line="line one\n\tline two"),
+                       {"id": "band:1", "title": "Ship it", "band": True, "number": 3, "journal": None}])
+    assert _panel(ok)["status"] == "ok"
+
+
+def test_a_compact_read_of_a_board_is_counts_and_a_link_not_the_cards() -> None:
+    """L3 r1 (complement LOW #4). The phone's compact profile reduces a board as it reduces a topology: per-column counts, the
+    queue's own state, and the link to the full read; no card goes out."""
+    val = _value(ready=[_card("levain:a"), _card("levain:b")], done=[_card("levain:z")])
+    val["note"], val["unreadable"] = "journal missing", ["band"]
+    ck = Cockpit()
+    ck.register(ProviderSpec(id="b", kind="board", title="Board", priority="feed", read=lambda c: Read(value=val)))
+    full = ck.panel("b")
+    assert "cards" in json.dumps(full["value"])                                               # the full read is whole
+    got = ck.panel("b", profile="compact")
+    assert got["status"] == "ok" and got["next"] == "/cockpit/panel/b.json?profile=full", got
+    assert got["value"] == {"queue": "ok", "note": "journal missing", "unreadable": ["band"],
+                            "columns": [{"category": c, "count": n} for c, n in zip(BOARD_CATEGORIES, (0, 2, 0, 0, 0, 1))]}, got["value"]
+    assert "levain:a" not in json.dumps(got) and "Card" not in json.dumps(got)
+
+
 def test_a_category_is_named_once_and_two_columns_of_one_category_are_refused() -> None:
     good = _value()
     _refused({**good, "columns": good["columns"] + [good["columns"][0]]}, "value.columns[6].category", "repeated")

@@ -321,23 +321,36 @@
     // is the last good pull's model, cleared on a failed one; `bus.failed` says the latest read did not succeed.
     var bus = opts.bus || newBus();
     function pull() {
+      // a per-bus sequence number, taken at request start: only the LATEST request's answer (good or failed) is applied, so a
+      // slow older response never overwrites a newer one (the poll and a caller's `pull()` can overlap)
+      var seq = bus.seq = (bus.seq || 0) + 1;
+      var current = function () { return !stopped && seq === bus.seq; };
+      // the one place a read fails: the model is cleared, the watchers told, and the Send box retired with the words the operator
+      // already typed left in the field (the board it would have talked to is no longer readable)
+      var fail = function (line) {
+        if (!current()) return;
+        view.textContent = line;
+        busFail(bus);
+        tellBox.offer(false, "the board could not be read just now");
+      };
       return f(BOARD_PATH, { cache: "no-store", headers: headers() }).then(function (res) {
-        if (res.status === 403) { view.textContent = "The board needs this page's write token."; if (!stopped) busFail(bus); return; }
-        if (!res.ok) { view.textContent = "The board could not be read (HTTP " + res.status + ")."; if (!stopped) busFail(bus); return; }
+        if (res.status === 403) return fail("The board needs this page's write token.");
+        if (!res.ok) return fail("The board could not be read (HTTP " + res.status + ").");
         return res.json().then(function (b) {
-          if (stopped) return;
+          if (!current()) return;
           var m = bus.model = boardModel(b);
           bus.failed = false;
           renderGrouped(doc, view, m);
           tellBox.offer(m.tell.offered, m.tell.why);
           busTell(bus, m, false);
         });
-      }).catch(function () { if (!stopped) { view.textContent = "The board could not be reached."; busFail(bus); } });
+      }).catch(function () { fail("The board could not be reached."); });
     }
     function loop() { if (!stopped && pollMs > 0) timer = setTimeout(function () { pull().then(loop); }, pollMs); }
     pull().then(loop);
     return {
-      // stopping a view drops none of the page's watchers: the next view's pull reaches them
+      // stopping a view drops none of the page's watchers: the next view's pull reaches them (`watch` is used by the tests only;
+      // the page's one production subscriber, the modal's, ends itself when the modal is gone)
       stop: function () { stopped = true; if (timer) clearTimeout(timer); tellBox.dispose(); },
       pull: pull,
       model: function () { return bus.model; },
@@ -346,14 +359,27 @@
     };
   }
 
-  function newBus() { return { model: null, failed: false, watchers: [] }; }
+  function newBus() { return { model: null, failed: false, lacked: false, seq: 0, watchers: [] }; }
   function busWatch(bus, fn) { bus.watchers.push(fn); return function () { bus.watchers = bus.watchers.filter(function (w) { return w !== fn; }); }; }
   // one watcher's throw touches neither the others nor the board the pull just drew
   function busTell(bus, m, failed) { bus.watchers.slice().forEach(function (w) { try { w(m, failed); } catch (_) { /* a watcher's fault stays its own */ } }); }
   // a read that did not succeed (a 403, a 5xx, no network, the token removed): what was last read is no longer the board
   function busFail(bus) { bus.model = null; bus.failed = true; busTell(bus, null, true); }
+  // The write token's presence, as sync() sees it. Gone: what was read is not the operator's to see, so the bus fails (once; an
+  // open modal says so). Back after a gone: the failure it caused is cleared and the watchers told there is no model yet (the
+  // modal says "not read yet", never the stale line); the next mounted view pulls. A failure from a bad READ is left alone.
+  function busToken(bus, has) {
+    if (!has) {
+      if (!bus.failed) busFail(bus);
+      bus.lacked = true;
+    } else if (bus.lacked) {
+      bus.lacked = false;
+      bus.failed = false;
+      busTell(bus, bus.model, false);
+    }
+  }
 
-  var api = { boardModel: boardModel, journalLine: journalLine, renderBoard: renderBoard, renderGrouped: renderGrouped, mount: mount };
+  var api = { boardModel: boardModel, journalLine: journalLine, renderBoard: renderBoard, renderGrouped: renderGrouped, mount: mount, busToken: busToken };
   root.LevainBoardView = api;
 
   // The Board tab's zone (the thread view's mounting idiom): hidden on a page holding no write token; polls only while the
@@ -413,7 +439,8 @@
           }
         });
         // subscribed to the page's bus, not to a view: a view stopped and remounted (the tab hidden and back) leaves this
-        // subscription standing. It ends when the modal is gone (seen on the next notice).
+        // subscription standing. It ends when the modal is gone (seen on the next notice). A host detached for a moment is not
+        // "gone": the dashboard's rebuild (buildModal) is synchronous, so no notice can land between the old host and the new.
         var mine = busWatch(bus, function (m, failed) {
           if (modalHost && doc.body.contains(modalHost)) paint(m, failed);
           else mine();
@@ -425,7 +452,7 @@
     function sync() {
       var want = !!token() && doc.body.dataset.mode === "board" && doc.visibilityState !== "hidden";
       section.hidden = !token();
-      if (!token() && !bus.failed) busFail(bus);       // no token: what was read is not the operator's to see; an open modal says so
+      busToken(bus, !!token());       // no token: what was read is not the operator's to see (an open modal says so); back: that is cleared
       if (want && !view) {
         host.replaceChildren();
         var T = root.LevainCockpitTransport;

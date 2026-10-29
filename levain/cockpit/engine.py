@@ -2238,7 +2238,7 @@ class Cockpit:
                     value = _with_health(value, ctx.now)
             if profile == "compact":
                 out["value"] = _compact_value(head["kind"], value)
-                if head["priority"] == "feed" or head["kind"] in ("ambient", "brief", "topology"):
+                if head["priority"] == "feed" or head["kind"] in ("ambient", "brief", "topology", "board"):
                     out["next"] = f"/cockpit/panel/{panel_id}.json?profile=full"
                 if head["priority"] == "feed" and head["kind"] in ("line", "status-dots"):
                     out["value"] = None
@@ -3193,6 +3193,9 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
 BOARD_CATEGORIES = ("backlog", "ready", "running", "waiting", "needs-you", "done")
 BOARD_QUEUES = ("ok", "none", "unreadable")
 BOARD_CARDS_MAX = 2000
+# A card's `id`, `title`, `repo` and `done_line` are drawn as text, so each is display-safe (no invisible or format character: a
+# bidi override reorders what the operator reads) and at most this long (the coordinator's own longest field, a done line, is 1000).
+BOARD_TEXT_MAX = 1000
 
 
 def _v_board(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
@@ -3232,6 +3235,16 @@ def _v_board(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
                 raise _bad(spec, f"{c}.id", "must be a non-empty string")
             if not _is_str(card.get("title")):
                 raise _bad(spec, f"{c}.title", "must be a string")
+            for k in ("id", "title", "repo", "done_line"):
+                x = card.get(k)
+                if x is None and k in ("repo", "done_line"):
+                    continue
+                if not _is_str(x):
+                    raise _bad(spec, f"{c}.{k}", "must be a string")
+                if len(x) > BOARD_TEXT_MAX:          # before `visible`: a runaway string is never scanned
+                    raise _bad(spec, f"{c}.{k}", f"is longer than {BOARD_TEXT_MAX} characters")
+                if visible(x) != x:
+                    raise _bad(spec, f"{c}.{k}", "carries an invisible or format character (send it through display_safe.visible)")
             if card.get("journal") is not None and not isinstance(card["journal"], dict):
                 raise _bad(spec, f"{c}.journal", "must be an object or null")
     return v
@@ -3402,4 +3415,8 @@ def _compact_value(kind: str, value: Any) -> Any:
         return {"as_of": value.get("as_of"), "nodes": len(value.get("nodes") or []),
                 "tasks": len(value.get("tasks") or []),
                 "waiting": sum(1 for t in value.get("tasks") or [] if t.get("state") == "waiting")}
+    if kind == "board":
+        # the same reduction: per-column counts and the queue's own state (never the cards), the full value one link away
+        return {"queue": value.get("queue"), "note": value.get("note"), "unreadable": list(value.get("unreadable") or []),
+                "columns": [{"category": c.get("category"), "count": len(c.get("cards") or [])} for c in value.get("columns") or []]}
     return value

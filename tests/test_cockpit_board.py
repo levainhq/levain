@@ -268,6 +268,50 @@ def test_the_watchers_belong_to_the_page_and_a_failed_read_tells_them():
     assert b["stoppedPullCalls"] == 0
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_failed_read_retires_the_send_box_keeps_the_typed_words_and_the_next_good_read_offers_it_again():
+    """L3 r1 (codex MED). The Send box is offered only over a board that was just read: a 403, a 5xx or no network hides it with
+    the reason, the words already typed stay in the field, and the next good read offers it again."""
+    t = _tell_run()["tellFollows"]
+    assert t["good"]["hidden"] is False and t["good"]["sendHidden"] is False and t["good"]["gateHidden"] is True
+    for bad in ("403", "500", "net"):
+        s = t[bad]
+        assert s["hidden"] is True and s["sendHidden"] is True and s["gateHidden"] is False, (bad, s)
+        assert "the board could not be read just now" in s["gate"], (bad, s)
+        assert s["typed"] == "re levain:a: please hold", (bad, s)                      # the operator's words are kept
+    assert t["again"]["hidden"] is False and t["again"]["sendHidden"] is False and t["again"]["typed"] == "re levain:a: please hold"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_late_response_never_overwrites_a_newer_one():
+    """L3 r1 (complement LOW #1). Two overlapping pulls resolve out of order: the older response (good or failed) is dropped, so a
+    late 403/500 does not call `busFail` over a newer good read, and a late good read does not undo a newer failure."""
+    late = _tell_run()["late"]
+    newer = "backlog:0,ready:1,running:0,waiting:0,needs-you:0,done:0"        # the newer body's one card; the older BODY draws ORDER_COUNTS
+    for name in ("lateGood", "lateFail403", "lateFail500"):
+        r = late[name]
+        assert r["mid"]["model"] == newer and r["mid"]["failed"] is False, (name, r["mid"])
+        assert r["end"]["model"] == newer and r["end"]["failed"] is False, (name, r["end"])      # the late one changed nothing
+        assert r["end"]["calls"] == r["mid"]["calls"] == [newer], (name, r["end"])             # and told nobody
+        assert r["end"]["hidden"] is False, (name, r["end"])                                   # the box stays offered
+    g = late["lateGoodAfterFail"]
+    assert g["mid"]["failed"] is True and g["end"]["failed"] is True and g["end"]["model"] == "none", g
+    assert g["end"]["calls"] == ["FAILED"] and g["end"]["hidden"] is True, g
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_token_removed_fails_the_bus_and_its_return_clears_it():
+    """L3 r1 (complement LOW #2). Removing the write token fails the page's bus (an open modal says so, once); giving it back
+    clears `failed` and tells the watchers `(null, false)` (the modal says it has not read yet, never the stale line); a
+    failure that came from a bad READ is not cleared by a sync that merely sees the token."""
+    t = _tell_run()["token"]
+    assert t["start"]["failed"] is False and t["start"]["calls"] == ["model"]
+    assert t["removed"]["failed"] is True and t["removed"]["model"] is None and t["removed"]["calls"] == ["model", "FAILED"]
+    assert t["removedAgain"]["calls"] == ["model", "FAILED"]
+    assert t["returned"]["failed"] is False and t["returned"]["model"] is None and t["returned"]["calls"] == ["model", "FAILED", "null"]
+    assert t["readFailureKept"] == {"failed": True, "calls": []}
+
+
 def _tell_run():
     root = Path(__file__).resolve().parent.parent
     run = subprocess.run(["node", str(root / "tests" / "js_board_tell_harness.js"),
