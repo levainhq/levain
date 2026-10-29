@@ -57,8 +57,9 @@ def write_origin(queue_dir: Path | str, origin: object) -> Path | None:
     if good is None:
         _unlink(path)
         return None
-    tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+    tmp = None
     try:
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -70,7 +71,8 @@ def write_origin(queue_dir: Path | str, origin: object) -> Path | None:
         _unlink(path)
         return None
     finally:
-        _unlink(tmp)
+        if tmp is not None:
+            _unlink(tmp)
     return path
 
 

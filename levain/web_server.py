@@ -1559,6 +1559,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     def server_close(self) -> None:
         # K2b §4.2: the broker drains first (write admission closes; an admitted settler is waited
         # for before its lock is released), then the cockpit's refreshers stop
+        if self.published_origin is not None:      # first: a teardown step that raises below must not leave a link to this server
+            from levain.consent.cockpit_origin import withdraw_origin
+
+            withdraw_origin(*self.published_origin)
+            self.published_origin = None
         self.stream_stop.set()      # open streams end first: nothing is left holding a thread
         self.stream_watcher.stop()
         if self.broker is not None:
@@ -1567,11 +1572,6 @@ class _LevainHTTPServer(ThreadingHTTPServer):
             self.coord_sheet.close()    # no new wake; the wake threads a drop started are joined before teardown
         if self.cockpit is not None:
             self.cockpit.stop()
-        if self.published_origin is not None:
-            from levain.consent.cockpit_origin import withdraw_origin
-
-            withdraw_origin(*self.published_origin)
-            self.published_origin = None
         super().server_close()
 
     def handle_error(self, request: Any, client_address: Any) -> None:
