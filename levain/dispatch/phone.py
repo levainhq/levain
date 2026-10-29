@@ -32,6 +32,8 @@ A dispatch directory with no store lists nothing and is never created here. Stdl
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -131,6 +133,87 @@ class DispatchPhone:
                     "can_sign": job.state == "filed" and job.lease_end > now and bool(signers), "can_cancel": job.state not in TERMINAL,
                     "signers": signers, "signer_note": signer_note,
                     "authorise": shown(self._authorise_card(job))})
+        out["sha256"] = self.version(out)       # the row version a challenge names (:meth:`step_shown`)
+        return out
+
+    @staticmethod
+    def version(rec: "dict[str, Any]") -> str:
+        """The version a listed job (and the cockpit's sheet row) is named by: its id, digest, state and lease, and the
+        run, branch and tier of its authorise card (so a recommendation that moved reads as changed: a pick made on the
+        old card is never offered on the new one). The card's staged change set needs no field here: it is the diff of
+        the run's stored base and staged commit, and a run record is written once (``run_records`` refuses an update and
+        a second row for the same run), so the run pins it."""
+        card = rec.get("authorise") if isinstance(rec.get("authorise"), dict) else {}
+        return hashlib.sha256(json.dumps([rec.get("id"), rec.get("digest"), rec.get("state"), rec.get("lease_end"),
+                                          card.get("run"), card.get("onto"), card.get("tier")]).encode()).hexdigest()
+
+    CHALLENGES = ("challenge", "cancel-challenge", "authorise-challenge")
+
+    def _current(self, job_id: str) -> "dict[str, Any] | None":
+        """``{state, sha256}`` of one live job as :meth:`pending` would list it, else None (no store, no such job, or a
+        final state). A job whose record cannot be read is ``state`` ``unreadable``."""
+        from levain.cockpit.consent import utc_stamp
+        from levain.dispatch import DispatchError
+        from levain.dispatch.jobs import TERMINAL
+
+        store = self._store()
+        job = None if store is None else store.get(job_id)
+        if job is None:
+            return None
+        try:
+            if job.state in TERMINAL:
+                return None
+            signers, note = self._signers()
+            rec = self.record(job, utc_stamp(self._clock()), list(signers), note)
+        except (DispatchError, ValueError, KeyError, TypeError, IndexError, AttributeError):
+            return {"state": "unreadable", "sha256": ""}
+        return {"state": rec["state"], "sha256": self.version(rec)}
+
+    def shown(self, job_id: str, action: str, version: str,
+              row: "Callable[[str], dict[str, Any] | None] | None" = None) -> None:
+        """Refuse a challenge for job ``job_id`` unless its row's ``sha256`` (``row(job_id)``, default
+        :meth:`_current`) is ``version``, the one the page showed: a job amended, moved or ended since is a 409 in the
+        plain sign route's words, so a passkey never signs a job the page did not show. A job no longer open has no
+        row, which is also a change; an unreadable one is never challenged; a store fault is a 503 naming the exception
+        type only (its text names paths and tables)."""
+        from levain.consent.sign import error_word
+        from levain.dispatch import DispatchError
+
+        not_done = f"job {job_id} is NOT cancelled" if action == "cancel-challenge" else "nothing was signed"
+        try:
+            now = (row or self._current)(job_id)
+        except (DispatchError, OSError, sqlite3.Error) as exc:
+            raise DispatchRefused(503, "unavailable", f"the dispatch store cannot answer now ({type(exc).__name__}): "
+                                                      f"{not_done}") from None
+        if now is not None and now.get("state") == "unreadable":
+            raise DispatchRefused(409, error_word(409), f"dispatch job {job_id} could not be read, so nothing is signed "
+                                                        f"from this page: read it on the laptop (levain dispatch show "
+                                                        f"{job_id}); {not_done}")
+        if now is None or now.get("sha256") != version:
+            raise DispatchRefused(409, error_word(409), f"dispatch job {job_id} changed since it was shown: reload and "
+                                                        f"read it again; {not_done}")
+
+    def step_shown(self, job_id: str, action: str, req: Any,
+                   row: "Callable[[str], dict[str, Any] | None] | None" = None) -> dict[str, Any]:
+        """:meth:`step`, a challenge gated on the version the page showed: ``request_sha256`` in the body is taken off
+        before the body is checked and compared with the job's version now (:meth:`shown`) before the payload is built
+        and again after (an amendment while it was built). A challenge that names none (a body that is not an object
+        included) is the plain 409 before :meth:`step` is asked anything. Other actions pass through unchanged."""
+        from levain.consent.sign import error_word
+
+        version = None
+        if action in self.CHALLENGES:
+            version = req.get("request_sha256") if isinstance(req, dict) else None
+            if not isinstance(version, str) or not version:
+                raise DispatchRefused(409, error_word(409), f"the challenge for dispatch job {job_id} names no listed "
+                                                            "version: reload and read it again; "
+                                                            + (f"job {job_id} is NOT cancelled" if action == "cancel-challenge"
+                                                               else "nothing was signed"))
+            req = {k: v for k, v in req.items() if k != "request_sha256"}
+            self.shown(job_id, action, version, row)
+        out = self.step(job_id, action, req)
+        if version is not None:
+            self.shown(job_id, action, version, row)
         return out
 
     # --- the authorise card (F11-s2b §5) ---------------------------------------------------------------------------

@@ -939,7 +939,7 @@ class _PhoneServer(ThreadingHTTPServer):
         from levain.dispatch.phone import DispatchRefused
 
         try:
-            return self.dispatch.step(job_id, action, req)
+            return self.dispatch.step_shown(job_id, action, req)
         except DispatchRefused as exc:
             raise PhoneError(exc.status, exc.error, exc.message) from None
 

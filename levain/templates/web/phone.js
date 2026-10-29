@@ -68,6 +68,8 @@
             () => ({ ok: false, status: 0, body: { message: "the phone port could not be reached" } }));
   }
   const why = (r) => r.body.message || ("refused (HTTP " + r.status + ")");
+  // a refusal the server made because the job changed since this card was drawn (DispatchPhone.shown's words)
+  const staleReply = (r) => !!(r.body && typeof r.body.message === "string" && /changed since it was shown/.test(r.body.message));
 
   let busy = 0;               // a ceremony in progress holds the list still
   let last = "";              // the last answer given here: an answered request leaves the list, its result stays
@@ -1008,9 +1010,13 @@
   function dispatchRun(r, fp, rawId, say, cancel, reason) {
     if (busy) return;
     busy++;
+    let keep = false;           // a plain refusal: the list is not redrawn under the person
     const base = "/dispatch/" + encodeURIComponent(r.id) + "/";
     say("asking for the " + (cancel ? "cancel" : "signature") + " to sign\u2026");
-    call("POST", base + (cancel ? "cancel-challenge" : "challenge"), cancel ? { signer_fp: fp, reason: reason || "" } : { signer_fp: fp }).then((c) => {
+    call("POST", base + (cancel ? "cancel-challenge" : "challenge"), cancel ? { signer_fp: fp, reason: reason || "", request_sha256: r.sha256 } : { signer_fp: fp, request_sha256: r.sha256 }).then((c) => {
+      // a 409 the server made because the job changed since this card was drawn: the queue is read again (the finally's
+      // load) and the card drawn afresh; any other 409 is a plain not-signed, the card and its controls kept
+      if (!c.ok && c.status === 409 && !staleReply(c)) { keep = true; return say((cancel ? "not cancelled: " : "not signed: ") + why(c), "bad"); }
       if (!c.ok) return say(why(c), "bad");
       say("confirm with your passkey to " + (cancel ? "cancel the job" : "sign the contract") + "\u2026");
       const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
@@ -1026,7 +1032,7 @@
         say((cancel ? "cancelled" : "signed") + " \u00b7 by " + a.body.signer_fp + " \u00b7 job " + a.body.state, "ok");
       }), (e) => say(declined(e, cancel ? "the job is not cancelled" : "nothing was signed"), "bad"));
     }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
-      .finally(() => { busy--; setTimeout(load, 1500); });
+      .finally(() => { busy--; if (!keep) setTimeout(load, 1500); });
   }
 
   // M17: the Grants tab. consent.json carries `grants` (levain.consent.grant_phone): every standing grant the cockpit
