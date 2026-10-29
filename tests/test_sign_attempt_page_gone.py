@@ -196,7 +196,7 @@ def test_a_facet_drawn_after_the_first_pass_settle_refused_still_says_why(tmp_pa
             {"eval": OPEN_ROW},                               # a facet drawn fresh after the request left
             {"until": f"/not signed:/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
         ])
-    note =out["values"][-1]
+    note = out["values"][-1]
     assert note.startswith("not signed:") and "nothing was signed" in note, out["values"]
     assert rig.nothing_signed(QRID)
 
