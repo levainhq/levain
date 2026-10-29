@@ -10,7 +10,13 @@ function node(tag) {
     click() { (this.listeners.click || []).forEach((f) => f()); },
     focused: 0, sel: null, focus() { this.focused++; }, setSelectionRange(a, b) { this.sel = [a, b]; } };
 }
-const doc = { createElement: node };
+const doc = { createElement: node, activeElement: null };
+// a stub address: replaceState rewrites location.hash the way the browser does; hashchange handlers are kept to be fired
+const handlers = [];
+globalThis.location = { pathname: "/", search: "", hash: "" };
+globalThis.history = { replaceState(_s, _t, url) { const i = url.indexOf("#"); globalThis.location.hash = i < 0 ? "" : url.slice(i); } };
+globalThis.addEventListener = (t, f) => { if (t === "hashchange") handlers.push(f); };
+globalThis.removeEventListener = (t, f) => { const i = handlers.indexOf(f); if (i >= 0) handlers.splice(i, 1); };
 const find = (n, tag) => { if (n.tag === tag) return n; for (const c of n.children) { const r = find(c, tag); if (r) return r; } return null; };
 const tick = () => new Promise((r) => setTimeout(r, 5));
 let k = 0;
@@ -26,21 +32,32 @@ async function scenario(o) {
   const storage = { getItem: (k) => { keysRead.push(k); return k in store ? store[k] : null; }, setItem: (k, v) => { store[k] = String(v); }, removeItem: (k) => { delete store[k]; } };
   const seen = { posts: [], reads: 0 };
   const fetch = (url, init) => {
+    if (url === "/cockpit/board.json" && o.boardStatus) return resp(o.boardStatus, {});
     if (url === "/cockpit/board.json") return resp(200, { columns: [], queue: "ok", tell: o.tell });
     if (url === "/cockpit/coord/drops.json") { seen.reads++; return resp(200, o.listing); }
     seen.posts.push(JSON.parse(init.body));
     return resp(o.postStatus || 200, { created: true, drop: { drop_id: "d1" } });
   };
   const host = node("div"); host.ownerDocument = doc;
-    V.mount(host, { fetch, storage, pollMs: 0, headers: () => ({}), hash: o.hash });
+  globalThis.location.hash = o.hash || "";
+  doc.activeElement = o.active || null;
+  handlers.length = 0;
+  const h = V.mount(host, { fetch, storage, pollMs: 0, headers: () => ({}), hash: o.hash });
   await tick();
+  const hashAfterMount = globalThis.location.hash;
   const ta = find(host, "textarea"), btn = find(host, "button");
   const say = (function f(n) { return n.className === "bd-say" ? n : n.children.map(f).find(Boolean); })(host);
+  if (o.later) {       // the operator follows another compose link in the open page (no reload)
+    if (o.edit != null) ta.value = o.edit;
+    globalThis.location.hash = o.later;
+    handlers.slice().forEach((f) => f());
+    await tick();
+  }
   const pre = { value: ta.value, focused: ta.focused, sel: ta.sel, posts: seen.posts.length, reads: seen.reads };
   if (o.type != null) ta.value = o.type;
   for (let i = 0; i < (o.type == null ? 0 : (o.clicks || 1)); i++) btn.click();
   await tick(); await tick();
-  return { posts: seen.posts, reads: seen.reads, say: say.textContent, wordsHidden: ta.hidden, store, pre, keysRead, value: ta.value };
+  return { posts: seen.posts, reads: seen.reads, say: say.textContent, wordsHidden: ta.hidden, store, pre, keysRead, value: ta.value, hashAfterMount, hash: globalThis.location.hash, handlers: handlers.length };
 }
 (async () => {
   const on = { offered: true, why: null };
@@ -63,6 +80,18 @@ async function scenario(o) {
   out.hostile_malformed = await scenario(Object.assign({ hash: "#compose=%E0%A4%A%zz%" }, ok));
   out.hostile_control = await scenario(Object.assign({ hash: "#compose=a%00b%0Ac" }, ok));
   out.kept_wins = await scenario({ tell: on, listing: ok.listing, hash: "#compose=new", pending: { words: "A", outbox_id: "ph-old", sent_at: "x", store_id: "S" } });
+  out.hash_other_params = await scenario(Object.assign({ hash: "#board&write_token=a%2Bb+c&compose=re%20x%3A%20&z" }, ok));
+  out.hash_only_compose = await scenario(Object.assign({ hash: "#compose=re%20x%3A%20" }, ok));
+  out.hash_bare_board = await scenario(Object.assign({ hash: "#board&compose=re%20x%3A%20" }, ok));
+  out.board_fails = await scenario({ tell: on, listing: ok.listing, boardStatus: 403, hash: "#board&compose=re%20x%3A%20" });
+  out.not_offered_hash = await scenario({ tell: { offered: false, why: "different queue" }, listing: ok.listing, hash: "#board&compose=re%20x%3A%20" });
+  out.kept_wins_hash = await scenario({ tell: on, listing: ok.listing, hash: "#board&compose=new", pending: { words: "A", outbox_id: "ph-old", sent_at: "x", store_id: "S" } });
+  out.focus_elsewhere = await scenario(Object.assign({ hash: "#compose=re%20x%3A%20", active: { tag: "input" } }, ok));
+  out.focus_body = await scenario(Object.assign({ hash: "#compose=re%20x%3A%20", active: doc.body = { tag: "body" } }, ok));
+  out.surrogate = await scenario(Object.assign({ hash: "#compose=" + "a".repeat(299) + encodeURIComponent("\u{1F600}") }, ok));
+  out.hashchange_fill = await scenario(Object.assign({ hash: "#board", later: "#board&compose=re%20y%3A%20" }, ok));
+  out.hashchange_edited = await scenario(Object.assign({ hash: "#board", later: "#board&compose=re%20y%3A%20", edit: "mine" }, ok));
+  out.hashchange_kept = await scenario({ tell: on, listing: ok.listing, hash: "#board", later: "#board&compose=re%20y%3A%20", pending: { words: "A", outbox_id: "ph-old", sent_at: "x", store_id: "S" } });
   out.no_hash = await scenario(Object.assign({}, ok));
   console.log(JSON.stringify(out));
 })();

@@ -113,16 +113,18 @@
       var v = new URLSearchParams(String(hash || "").replace(/^#/, "")).get("compose");
       if (v == null) return "";
       v = v.replace(/[\u0000-\u001f\u007f]/g, " ");
-      return v.length > COMPOSE_MAX ? v.slice(0, COMPOSE_MAX) : v;
+      var cps = Array.from(v);       // by code points: a cut never splits a surrogate pair
+      return cps.length > COMPOSE_MAX ? cps.slice(0, COMPOSE_MAX).join("") : v;
     } catch (e) { return ""; }
   }
-  // once taken, the address no longer carries it (a reload does not refill words the operator sent or cleared)
+  // once the box is offered, the address no longer carries it (a reload does not refill words the operator sent or cleared).
+  // Only the compose segment goes; every other fragment part stays byte-identical.
   function forgetCompose() {
     try {
       if (!root.history || !root.location) return;
-      var p = new URLSearchParams(String(root.location.hash || "").replace(/^#/, ""));
-      p.delete("compose");
-      var rest = p.toString();
+      var rest = String(root.location.hash || "").replace(/^#/, "").split("&").filter(function (s) {
+        return s !== "compose" && s.indexOf("compose=") !== 0;
+      }).join("&");
       root.history.replaceState(null, "", root.location.pathname + root.location.search + (rest ? "#" + rest : ""));
     } catch (e) { /* the address stays */ }
   }
@@ -150,12 +152,19 @@
       gate.textContent = offered ? "" : "Telling the coordinator is off here: " + String(why || "the board has not said") + ".";
       gate.hidden = offered;
       words.hidden = send.hidden = !offered;
-      if (offered && wantFocus) {       // the field is shown now: focus it, cursor at the end of the prefill
+      if (offered && forgetPending) {   // the field is shown now: the link is spent (used, or beaten by kept words)
+        forgetPending = false;
+        forgetCompose();
+      }
+      if (offered && wantFocus) {       // focus it, cursor at the end of the prefill, unless the operator is already in another field
         wantFocus = false;
-        try { words.focus(); words.setSelectionRange(words.value.length, words.value.length); } catch (e) { /* focus is a convenience */ }
+        var ae = doc.activeElement;
+        if (!ae || ae === doc.body || ae === doc.documentElement) {
+          try { words.focus(); words.setSelectionRange(words.value.length, words.value.length); } catch (e) { /* focus is a convenience */ }
+        }
       }
     }
-    var wantFocus = false;
+    var wantFocus = false, forgetPending = false;
     offer(false, "reading the board");
     var oid = newOutboxId();
     var working = false;
@@ -236,16 +245,25 @@
       });
     });
     var left = kept();
+    // a link's `compose=` fragment part starts the words (flow's board copies/links, it never posts); never over kept words.
+    // Used or beaten by kept words, it is forgotten once the box is offered (never while hidden: the words would be lost).
+    var pre = composePrefill(opts.hash != null ? opts.hash : (root.location && root.location.hash));
+    if (pre) forgetPending = true;
     if (left) {       // an earlier visit's drop whose answer never came: shown, sent again unchanged on a tap
       words.value = left.words;
       oid = left.outbox_id;
       say.textContent = "Words kept from an earlier visit; send them again (they file once).";
-    } else {
-      // a link's `compose=` fragment part starts the words (flow's board copies/links, it never posts); never over kept words
-      var pre = composePrefill(opts.hash != null ? opts.hash : (root.location && root.location.hash));
-      if (pre) { words.value = pre; wantFocus = true; forgetCompose(); }
+    } else if (pre) { words.value = pre; wantFocus = true; }
+    // following a compose link inside an already-open cockpit (no reload) fills the same way, when nothing would be overwritten
+    function onHash() {
+      if (working || words.value !== "" || kept()) return;
+      var pre = composePrefill(root.location && root.location.hash);
+      if (!pre) return;
+      words.value = pre; wantFocus = true; forgetPending = true;
+      if (offered) offer(true);
     }
-    return { box: box, offer: offer };
+    if (root.addEventListener) root.addEventListener("hashchange", onHash);
+    return { box: box, offer: offer, dispose: function () { if (root.removeEventListener) root.removeEventListener("hashchange", onHash); } };
   }
 
   function mount(host, opts) {
@@ -268,7 +286,7 @@
     }
     function loop() { if (!stopped && pollMs > 0) timer = setTimeout(function () { pull().then(loop); }, pollMs); }
     pull().then(loop);
-    return { stop: function () { stopped = true; if (timer) clearTimeout(timer); }, pull: pull };
+    return { stop: function () { stopped = true; if (timer) clearTimeout(timer); tellBox.dispose(); }, pull: pull };
   }
 
   var api = { boardModel: boardModel, journalLine: journalLine, renderBoard: renderBoard, mount: mount };

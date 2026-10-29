@@ -252,7 +252,8 @@ def test_the_prefill_reads_no_storage_and_no_token():
     """A token beside the fragment is not read specially; the prefill path touches only the box's own pending key."""
     out = _tell_run()
     t = out["prefill_token"]
-    assert t["pre"]["value"] == "re x: " and "SECRET123" not in json.dumps(t)
+    assert t["pre"]["value"] == "re x: " and "SECRET123" not in json.dumps({k: v for k, v in t.items() if k not in ("hash", "hashAfterMount")})
+    assert t["hash"] == "#write_token=SECRET123"          # the token part of the address is left exactly as it was
     assert set(t["keysRead"]) <= {"levain-board-drop-pending"} and t["posts"] == []
 
 
@@ -266,3 +267,34 @@ def test_a_hostile_fragment_stays_inert_plain_text():
     assert out["hostile_control"]["pre"]["value"] == "a b c"
     src = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "board_view.js").read_text()
     assert "innerHTML" not in src
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_compose_fragment_is_forgotten_only_when_the_box_is_offered_and_only_that_segment():
+    """A hidden box keeps the link in the address; an offered one drops just `compose=...`, byte-identical elsewhere."""
+    out = _tell_run()
+    assert out["board_fails"]["hash"] == "#board&compose=re%20x%3A%20"          # a 403 board read: the words are not lost
+    assert out["not_offered_hash"]["hash"] == "#board&compose=re%20x%3A%20"     # telling off: the link stays for later
+    assert out["hash_other_params"]["hash"] == "#board&write_token=a%2Bb+c&z"   # nothing else re-encoded, no `board=`
+    assert out["hash_bare_board"]["hash"] == "#board"
+    assert out["hash_only_compose"]["hash"] == ""
+    assert out["hash_bare_board"]["hashAfterMount"] == "#board"                 # forgotten once offered (the mount's await)
+    assert out["kept_wins_hash"]["hash"] == "#board" and out["kept_wins_hash"]["pre"]["value"] == "A"   # beaten by kept words: spent too
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_prefill_does_not_steal_focus_and_never_splits_a_surrogate_pair():
+    out = _tell_run()
+    assert out["focus_elsewhere"]["pre"]["focused"] == 0 and out["focus_elsewhere"]["pre"]["value"] == "re x: "
+    assert out["focus_body"]["pre"]["focused"] == 1
+    v = out["surrogate"]["pre"]["value"]
+    assert v == "a" * 299 + "\U0001F600"          # 300 code points, the emoji whole (301 UTF-16 units)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_compose_link_followed_in_an_open_cockpit_fills_only_an_idle_empty_box():
+    out = _tell_run()
+    assert out["hashchange_fill"]["pre"]["value"] == "re y: " and out["hashchange_fill"]["hash"] == "#board"
+    assert out["hashchange_edited"]["pre"]["value"] == "mine"                   # unsent edits are never overwritten
+    assert out["hashchange_kept"]["pre"]["value"] == "A"                        # nor kept words
+    assert out["hashchange_fill"]["handlers"] == 1
