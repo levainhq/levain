@@ -1,0 +1,85 @@
+{
+  "schema": 1,
+  "about": "Conformance for READY_SCHEMA.md v1. Each case: `input` is every source the reader sees; `expect` lists, in the required order (repo asc, then column order backlog/ready/running/waiting/needs-you/done, then rank), the asserted fields of each item. `resolved` names closed spore ids. A reader passes when its items match `expect` on exactly those fields.",
+  "cases": [
+    {
+      "name": "dependency holds a declared-ready item back; a resolved dependency does not",
+      "input": {
+        "spores": [
+          {"id": "spore-1001", "status": "open", "text": "Build the reader", "work": {"repo": "flow", "category": "ready", "status": "ready", "tier": "sonnet", "done_line": "tests green", "depends_on": [], "rank": 1}},
+          {"id": "spore-1002", "status": "open", "text": "Build the board", "work": {"repo": "flow", "category": "ready", "status": "ready", "tier": "sonnet", "done_line": "screenshot looked at", "depends_on": ["spore-1001"], "rank": 2}},
+          {"id": "spore-1003", "status": "open", "text": "Wire the pace seat", "work": {"repo": "flow", "category": "ready", "status": "ready", "tier": "opus", "done_line": "wake fires", "depends_on": ["spore-1000"], "rank": 3}}
+        ],
+        "resolved": ["spore-1000"],
+        "needs_phill": [], "seats": [], "ci": [], "plan": []
+      },
+      "expect": [
+        {"id": "spore-1002", "repo": "flow", "status_category": "backlog", "declared_category": "ready", "independent": false, "held_reason": "depends on spore-1001", "needs_phill": false, "well_formed": true},
+        {"id": "spore-1001", "repo": "flow", "status_category": "ready", "declared_category": "ready", "independent": true, "held_reason": null, "needs_phill": false, "well_formed": true},
+        {"id": "spore-1003", "repo": "flow", "status_category": "ready", "declared_category": "ready", "independent": true, "held_reason": null, "needs_phill": false, "well_formed": true}
+      ]
+    },
+    {
+      "name": "an open needs-phill row naming a spore wins; the row is itself a needs-you item",
+      "input": {
+        "spores": [
+          {"id": "spore-1004", "status": "open", "text": "Ship the thing", "work": {"repo": "flow", "category": "ready", "status": "ready", "tier": "sonnet", "done_line": "shipped", "depends_on": [], "rank": 1}}
+        ],
+        "resolved": [],
+        "needs_phill": [{"id": "np-aaaa1111", "repo": "flow", "what": "May spore-1004 go out before Friday?", "seat": null}],
+        "seats": [], "ci": [], "plan": []
+      },
+      "expect": [
+        {"id": "np-aaaa1111", "repo": "flow", "status_category": "needs-you", "declared_category": "needs-you", "independent": false, "held_reason": null, "needs_phill": true, "well_formed": false},
+        {"id": "spore-1004", "repo": "flow", "status_category": "needs-you", "declared_category": "ready", "independent": false, "held_reason": null, "needs_phill": true, "well_formed": true}
+      ]
+    },
+    {
+      "name": "an unknown category reads as backlog; a ready item without a DONE line or tier is not well-formed",
+      "input": {
+        "spores": [
+          {"id": "spore-1005", "status": "open", "text": "Frozen thing", "work": {"repo": "flow", "category": "frozen", "status": "frozen", "tier": "sonnet", "done_line": "x", "depends_on": [], "rank": 1}},
+          {"id": "spore-1006", "status": "open", "text": "Vague thing", "work": {"repo": "flow", "category": "ready", "status": "ready", "depends_on": [], "rank": 2}}
+        ],
+        "resolved": [], "needs_phill": [], "seats": [], "ci": [], "plan": []
+      },
+      "expect": [
+        {"id": "spore-1005", "repo": "flow", "status_category": "backlog", "declared_category": "backlog", "independent": false, "held_reason": null, "needs_phill": false, "well_formed": true},
+        {"id": "spore-1006", "repo": "flow", "status_category": "ready", "declared_category": "ready", "independent": true, "held_reason": null, "needs_phill": false, "well_formed": false}
+      ]
+    },
+    {
+      "name": "projections: a live seat is running, a CI wait is waiting, a handoff spore with a pointer is a derived ready item",
+      "input": {
+        "spores": [
+          {"id": "spore-1007", "status": "open", "disposition": "handoff", "pointer": "levain/project_memory/1028-12/HANDOFF.md", "text": "Pick up the band"}
+        ],
+        "resolved": [], "needs_phill": [],
+        "seats": [{"token": "1028+12", "repo": "levain", "name": "1028+12 levain-seat"}],
+        "ci": [{"id": "levain-02da23952f", "repo": "levain", "branch": "seat/1028-12-band2"}],
+        "plan": []
+      },
+      "expect": [
+        {"id": "spore-1007", "repo": "levain", "status_category": "ready", "declared_category": "ready", "independent": true, "held_reason": null, "needs_phill": false, "well_formed": false},
+        {"id": "seat:1028+12", "repo": "levain", "status_category": "running", "declared_category": "running", "independent": false, "held_reason": null, "needs_phill": false, "well_formed": false},
+        {"id": "ci:levain-02da23952f", "repo": "levain", "status_category": "waiting", "declared_category": "waiting", "independent": false, "held_reason": null, "needs_phill": false, "well_formed": false}
+      ]
+    },
+    {
+      "name": "plan rows: slug id, numeric 'after N' fills depends_on, a design-first marker holds",
+      "input": {
+        "spores": [], "resolved": [], "needs_phill": [], "seats": [], "ci": [],
+        "plan": [
+          {"repo": "levain", "n": 1, "text": "**Land the gate** ff main when test is SUCCESS."},
+          {"repo": "levain", "n": 2, "text": "**Build the projector** after 1."},
+          {"repo": "levain", "n": 3, "text": "**The coordinator store** design first round, then build."}
+        ]
+      },
+      "expect": [
+        {"id": "levain:build-the-projector", "repo": "levain", "status_category": "backlog", "declared_category": "ready", "independent": false, "held_reason": "depends on levain:land-the-gate", "needs_phill": false, "well_formed": false},
+        {"id": "levain:the-coordinator-store", "repo": "levain", "status_category": "backlog", "declared_category": "ready", "independent": false, "held_reason": "design first", "needs_phill": false, "well_formed": false},
+        {"id": "levain:land-the-gate", "repo": "levain", "status_category": "ready", "declared_category": "ready", "independent": true, "held_reason": null, "needs_phill": false, "well_formed": false}
+      ]
+    }
+  ]
+}

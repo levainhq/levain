@@ -369,11 +369,14 @@ class CoordStore:
         """The schema this opener makes. ``base`` is the plain coordinator's alone, without a subclass's added tables."""
         from levain.coordinator.lease import LEASE_SCHEMA
         from levain.coordinator.first_reader import FIRST_READER_SCHEMA
+        from levain.coordinator.ready import LIFECYCLE_SCHEMA
         from levain.coordinator.review import REVIEW_SCHEMA
         from levain.coordinator.teamdrafts import DRAFT_SCHEMA
 
-        # the lease is checked by every opener's coordinator writes, so its tables are every opener's
-        return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA)
+        # the lease is checked by every opener's coordinator writes, so its tables are every opener's; C13's lifecycle
+        # tables (ready items + their journal) are additive, IF NOT EXISTS, like every statement here
+        return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA,
+                *LIFECYCLE_SCHEMA)
 
     def _connect(self, *, create: bool = True) -> sqlite3.Connection:
         """A connection with this opener's schema ensured, once per store object (:meth:`_ensure`). ``create=False``
