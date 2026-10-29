@@ -445,10 +445,17 @@ def _letter_of(q: Question, key: str) -> str:
 def _items_of(store: QuestionStore, view: View) -> dict[int, Question]:
     """The questions behind the view's numbers (answered or not: the apply step tells a closed one from an open
     one). A number that is no question, or one that cannot be read, is absent: the parser refuses it."""
+    return _items_read(store, view)[0]
+
+
+def _items_read(store: QuestionStore, view: View) -> tuple[dict[int, Question], bool]:
+    """:func:`_items_of`, and whether a question row could not be decoded (a corrupt row): that item is absent, but not
+    known to be closed or gone, so a surface listing the band says it may be missing items."""
     out: dict[int, Question] = {}
+    dropped = False
     with store._peek() as conn:
         if conn is None or "band_items" not in _tables(conn):
-            return out
+            return out, dropped
         for n in view.open_list:
             row = conn.execute("SELECT ref FROM band_items WHERE source = 'question' AND n = ?", (n,)).fetchone()
             if row is None:
@@ -458,9 +465,9 @@ def _items_of(store: QuestionStore, view: View) -> dict[int, Question]:
                 continue
             try:
                 out[n] = store._question_of(qrow)
-            except Exception:
-                continue
-    return out
+            except Exception:  # noqa: BLE001 - a corrupt row: absent for the parser, said by the band listing
+                dropped = True
+    return out, dropped
 
 
 def _info_of(q: Question) -> ItemInfo:
@@ -702,10 +709,11 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
         return {"seen_through": None, "store_id": None, "view_id": None, "items": [],
                 "note": "the band could not be recorded just now"}
     view, view_id = got
-    questions = _items_of(store, view)
+    questions, dropped = _items_read(store, view)
     extras_failed = False
     try:
-        extras, _unknown = _extras_of(store, view)
+        extras, unknown = _extras_of(store, view)
+        extras_failed = bool(unknown)         # an authority number whose source the second read could not read: omitted, not closed
     except Exception:  # noqa: BLE001 - the questions still list; the authority items are not, and the note says so
         extras, extras_failed = {}, True
     items: list[dict[str, Any]] = []
@@ -720,10 +728,11 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
             items.append({"n": n, "kind": "authority", "tag": e.tag, "what": e.what, "blocks": e.blocks,
                           "options": [{"letter": _LETTERS[i], "label": lab} for i, lab in enumerate(e.options)
                                       if i < len(_LETTERS)], "rec": e.rec_letter, "question": None})
-    # an authority source that was not read (a transient lock on queue.db): the items listed are the ones that were read, and
-    # the band says so, as the text render's "! not read" line does: never a healthy band that is missing items
+    # an item that was not read (a transient lock on queue.db: the first read or the second; a question row that cannot be
+    # decoded): the items listed are the ones that were read, and the band says so, as the text render's "! not read" line
+    # does: never a healthy band that is missing items
     return {"seen_through": view.seen_through, "store_id": view.store_id, "view_id": view_id, "items": items,
-            "note": _UNREAD_NOTE if (shown.failed or extras_failed) else ""}
+            "note": _UNREAD_NOTE if (shown.failed or extras_failed or dropped) else ""}
 
 
 class StaleBand(ValueError):

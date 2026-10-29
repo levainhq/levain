@@ -152,6 +152,65 @@ def test_a_failed_authority_items_read_says_so_and_still_lists_the_questions(tmp
     assert got["view_id"] is not None and len(got["items"]) == 1 and got.get("store") != "absent", got
 
 
+def test_an_authority_item_the_second_read_could_not_read_says_so_and_still_lists_the_questions(tmp_path, monkeypatch):
+    """codex OPEN (L3 r3): _extras_of turns a failed authority-source read into ({}, unknown) WITHOUT raising, and
+    band_payload discarded the unknown numbers: the view numbered an authority item, the second read failed, the item was
+    omitted and the note stayed empty (a healthy band that is missing an item)."""
+    from levain import band_sources
+
+    store = QuestionStore(tmp_path / "consent")
+    _file(store)
+    extra = band_sources.Extra(source="consent", ref="c1", filed="2026-01-01T00:00:00Z", tag="t", what="Sign the rule?",
+                               options=("yes", "no"), rec="yes", rec_letter="a", blocks="b", origin="o")
+    armed = [False]
+
+    def read(*a, **k):
+        if armed[0]:
+            raise OSError("queue.db is locked")           # the first read (the shown view) saw the item; this one cannot
+        return band_sources.Extras(items=[extra])
+
+    shown = band_view.show
+
+    def show_then_arm(*a, **k):
+        r = shown(*a, **k)
+        armed[0] = True
+        return r
+
+    monkeypatch.setattr(band_view, "read_extras", read)
+    monkeypatch.setattr(band_view, "show", show_then_arm)
+    got = band_view.band_payload(store, "cockpit:browser")
+    assert got["note"] == UNREAD, got
+    assert [i["what"] for i in got["items"]] == ["Ship the sweep fix?"], got      # the question still lists; the extra cannot
+
+
+def test_a_corrupt_question_row_says_so_and_the_other_items_still_list(tmp_path, monkeypatch):
+    """complement LOW (L3 r3): _items_of swallowed a _question_of exception, so the dropped item left the note empty."""
+    store = QuestionStore(tmp_path / "consent")
+    _file(store)
+    store.file(agent="claude_code", agent_session_id="s2", what="Rotate the key?", options=OPTS, rec="ship",
+               blocks="the key", cwd="/w")
+    real = QuestionStore._question_of                     # a staticmethod: the plain function
+    shown = band_view.show
+    armed = [False]
+
+    def show_then_arm(*a, **k):
+        r = shown(*a, **k)                                # the render read both rows fine; the listing's read cannot decode one
+        armed[0] = True
+        return r
+
+    def question_of(row):
+        q = real(row)
+        if armed[0] and q.what == "Ship the sweep fix?":
+            raise ValueError("corrupt options json")
+        return q
+
+    monkeypatch.setattr(band_view, "show", show_then_arm)
+    monkeypatch.setattr(QuestionStore, "_question_of", staticmethod(question_of))
+    got = band_view.band_payload(store, "cockpit:browser")
+    assert got["note"] == UNREAD, got
+    assert [i["what"] for i in got["items"]] == ["Rotate the key?"], got
+
+
 def test_a_permission_error_in_the_absence_check_goes_to_the_note_not_a_500_and_not_absent(tmp_path, monkeypatch):
     """complement LOW (L3 r2): a PermissionError on the db file is an OSError, not a sqlite3.Error."""
     store = QuestionStore(tmp_path / "consent")
