@@ -259,7 +259,7 @@ def test_each_discovery_hands_the_engine_fresh_read_callables(tmp_path: Path) ->
     ctx = ReadContext(datetime.now(timezone.utc))
     first = {s.id: s.read for s in discover(ctx)}
     second = {s.id: s.read for s in discover(ctx)}
-    assert set(first) == {REVIEW_ID, MORNING_ID} == set(second)
+    assert set(first) == {REVIEW_ID, MORNING_ID, "coord-status"} == set(second)
     assert all(first[i] is not second[i] for i in first)
 
 
