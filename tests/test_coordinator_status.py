@@ -213,3 +213,60 @@ def test_a_row_version_moves_with_the_store_not_the_clock(store, qdir, clock) ->
     assert [r["version"] for r in _panel(qdir, clock)["rows"]] == [r["version"] for r in first["rows"]]
     store.coord_set_agent("none")
     assert [r["version"] for r in _panel(qdir, clock)["rows"]] != [r["version"] for r in first["rows"]]
+
+
+def test_a_pending_launch_past_its_until_reads_as_the_cli_reads_it(store, qdir, clock, tmp_path) -> None:
+    """Nothing has written the expiry: the panel applies it virtually, so its state is the word ``coord_status`` reports
+    (read on a COPY of the store, since ``coord_status`` writes), and the launch row says the expiry is unrecorded."""
+    import shutil
+
+    _drop(store)
+    _claimed(store)
+    clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())
+    copy = tmp_path / "copy"
+    shutil.copytree(qdir, copy)
+    cli = CoordStore(copy, clock=clock).coord_status()
+    assert cli["wake"] == "backoff"
+    panel = _panel(qdir, clock)
+    assert _state_line(panel) == f"Coordinator: {cli['wake']}: {cli['why']}"
+    launch = next(b for i, b in _rows(panel).items() if i.startswith("launch:"))
+    assert "pending, past its until; not yet recorded as expired" in launch
+    assert store.coord_status()["wake"] == cli["wake"]      # and the real CLI agrees with the panel afterwards
+
+
+def test_the_reader_uses_the_contexts_now_unless_a_clock_is_injected(store, qdir, clock) -> None:
+    from levain.cockpit.coordinator_status import status_reader
+    from levain.cockpit.engine import ReadContext
+
+    _boot(store)
+    soon = ReadContext(T0 + timedelta(minutes=1))           # far from wall time, inside the lease
+    rows = {r.id: r.body for r in status_reader(lambda: qdir)(soon).rows}
+    assert rows["state"].startswith("Coordinator: held: ")
+    injected = {r.id: r.body for r in status_reader(lambda: qdir, lambda: T0 + lease.LEASE_TTL + timedelta(minutes=1))(soon).rows}
+    assert "idle" in injected["state"]                      # an explicitly injected clock still wins
+
+
+def test_a_store_that_vanishes_between_the_probe_and_the_read_is_the_empty_read(store, qdir, clock, monkeypatch) -> None:
+    from levain.cockpit.coordinator_status import status_reader
+    from levain.cockpit.engine import ReadContext
+    from levain.coordinator.store import StoreAbsent
+
+    real = CoordStore.open_readonly
+    calls = []
+
+    def vanishing(self, busy_s=None):
+        calls.append(1)
+        if len(calls) > 1:
+            raise StoreAbsent("gone between the probe and the read")
+        return real(self, busy_s)
+
+    monkeypatch.setattr(CoordStore, "open_readonly", vanishing)
+    got = status_reader(lambda: qdir, clock)(ReadContext(T0))
+    assert len(calls) > 1 and got.rows == ()
+
+
+def test_the_status_spec_carries_no_dead_empty_string(store, qdir, clock) -> None:
+    from levain.cockpit.engine import ReadContext
+
+    specs = coordinator_discoverer(lambda: qdir, clock=clock)(ReadContext(T0))
+    assert next(s for s in specs if s.id == COORD_STATUS_ID).empty == ""
