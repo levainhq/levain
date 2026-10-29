@@ -365,8 +365,9 @@ class CoordStore:
         self._woken: dict[str, str] = {}
 
     # --- store ---------------------------------------------------------------------------------------------------
-    def _statements(self, *, base: bool = False) -> tuple[str, ...]:
-        """The schema this opener makes. ``base`` is the plain coordinator's alone, without a subclass's added tables."""
+    def _statements(self, *, base: bool = False, lifecycle: bool = True) -> tuple[str, ...]:
+        """The schema this opener makes. ``base`` is the plain coordinator's alone, without a subclass's added tables.
+        ``lifecycle=False`` leaves out C13's additive tables (:meth:`_schema_current`'s reader gate)."""
         from levain.coordinator.lease import LEASE_SCHEMA
         from levain.coordinator.first_reader import FIRST_READER_SCHEMA
         from levain.coordinator.ready import LIFECYCLE_SCHEMA
@@ -376,7 +377,7 @@ class CoordStore:
         # the lease is checked by every opener's coordinator writes, so its tables are every opener's; C13's lifecycle
         # tables (ready items + their journal) are additive, IF NOT EXISTS, like every statement here
         return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA,
-                *LIFECYCLE_SCHEMA)
+                *(LIFECYCLE_SCHEMA if lifecycle else ()))
 
     def _connect(self, *, create: bool = True) -> sqlite3.Connection:
         """A connection with this opener's schema ensured, once per store object (:meth:`_ensure`). ``create=False``
@@ -513,9 +514,12 @@ class CoordStore:
         return conn
 
     def _schema_current(self, conn: sqlite3.Connection, *, base: bool = False) -> bool:
+        """``base`` (every display's gate, and a non-creating write's): the lifecycle tables are ADDITIVE, so a store
+        made before C13 (none of them yet) is current for every reader; a writer's ensure-schema path makes them, and
+        the ready reader reads their absence as no items (:mod:`levain.coordinator.ready`)."""
         from levain.dispatch.jobs import _SCHEMA as JOB_SCHEMA, FORMAT
 
-        if not schema_present(conn, (*JOB_SCHEMA, *self._statements(base=base))) or "gseq" not in {
+        if not schema_present(conn, (*JOB_SCHEMA, *self._statements(base=base, lifecycle=not base))) or "gseq" not in {
                 r[1] for r in conn.execute("PRAGMA table_info(replies)")} \
                 or not {"replies_gseq", "replies_gseq_no_replace"} <= _names(conn):
             return False
