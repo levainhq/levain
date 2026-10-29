@@ -134,8 +134,11 @@ def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None,
     wait = BUSY_WAIT_S if busy_s is None else max(0.0, min(float(busy_s), BUSY_WAIT_S))
     conn = sqlite3.connect(path, timeout=wait, isolation_level=None)
     try:
+        began = os.times().elapsed
         _set_wal(conn, None if busy_s is None else wait)  # sidecars -wal/-shm stay beside the database
-        conn.execute(f"PRAGMA busy_timeout = {int(wait * 1000)}")
+        # One budget for the whole open: the first read waits only what the WAL switch left of it, never a second ``wait``.
+        left = wait if busy_s is None else max(0.0, wait - (os.times().elapsed - began))
+        conn.execute(f"PRAGMA busy_timeout = {int(left * 1000)}")
         # A first read, retried, so the statements after it meet a connection that has already read the database.
         # [judged by lane-limitsrace, 10-25, against wal.html: the last connection to close takes an exclusive lock
         # to delete the WAL and shared memory; not reproduced here, so whether this read is what stops that cleanup

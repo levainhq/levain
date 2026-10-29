@@ -389,3 +389,53 @@ def test_l1_a_resume_step_is_never_replaced_and_settle_is_for_the_leasing_sessio
     conn.close()
     s.settle_resume([q.id], agent_session_id="s", outcome="started", argv=["x"], cwd="/w")
     assert s.delivery_state(q.id)[0] == "delivered"
+
+
+def test_ready_by_one_deadline_covers_open_and_setup(tmp_path, monkeypatch):
+    # A 0.5 s hook deadline: if the open burns 0.3 s, the setup's lock wait must be what is LEFT, not a fresh 0.5 s.
+    import sqlite3
+    import time
+
+    from levain.consent import questions as Q
+
+    seen = []
+    real_open = Q.open_durable
+
+    def slow_open(path, **kw):
+        time.sleep(0.3)
+        return real_open(path, **kw)
+
+    def spy_schema(conn):
+        seen.append(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        raise sqlite3.OperationalError("stop here")
+
+    monkeypatch.setattr(Q, "open_durable", slow_open)
+    monkeypatch.setattr(Q.QuestionStore, "_ensure_schema", staticmethod(spy_schema))
+    store = Q.QuestionStore(tmp_path / "q")
+    with pytest.raises(sqlite3.OperationalError):
+        store.ready_by(time.monotonic() + 0.5)
+    assert seen and seen[0] <= 250, seen
+
+
+def test_open_durable_wal_switch_and_first_read_share_one_budget(tmp_path, monkeypatch):
+    import time
+
+    from levain.autonomic import durable_sqlite as D
+
+    seen = []
+    real_set_wal = D._set_wal
+
+    def slow_wal(conn, bound):
+        time.sleep(0.3)
+        real_set_wal(conn, bound)
+
+    real_until = D._until_not_busy
+
+    def spy(conn, step):
+        seen.append(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        return real_until(conn, step)
+
+    monkeypatch.setattr(D, "_set_wal", slow_wal)
+    monkeypatch.setattr(D, "_until_not_busy", spy)
+    D.open_durable(tmp_path / "x.db", busy_s=0.5).close()
+    assert seen and seen[0] <= 250, seen
