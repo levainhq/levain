@@ -1698,8 +1698,13 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
                 return CheckResult(name, True, "not asked: run as root, CONTROL does not serve this account its "
                                    "sessions", "Run `levain doctor` as the operator to see them.", neutral=True)
             seen = {"closed": "closed to this account", "absent": "not written yet", "bad": "unreadable"}.get(beat[0])
-            why = (f"CONTROL did not answer ({status[1]}) and the reaper's pass record is {seen}" if seen
-                   else f"CONTROL did not answer ({status[1]}) and the reaper's pass record is out of date")
+            if seen:
+                state = seen
+            elif fresh is not None:     # current, but the reaper skips end_and_scrub while CONTROL is down: empty proves nothing
+                state = "current but names no held session, which proves nothing while CONTROL is down"
+            else:
+                state = "out of date"
+            why = f"CONTROL did not answer ({status[1]}) and the reaper's pass record is {state}"
             return CheckResult(name, True, f"unknown: {why}; a session stuck mid-end would not show here", warn=True)
         if beat[0] == "closed":
             return CheckResult(name, True, "none of your sessions (CONTROL shows only yours)")
@@ -1708,7 +1713,46 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
     more = f" and {len(held) - _HELD_NAMED} more" if len(held) > _HELD_NAMED else ""
     return CheckResult(name, False, f"{len(held)} stuck mid-end: {'; '.join(shown)}{more}; each keeps its slot leased "
                        "and its tree untouched while the reaper retries",
-                       "The reaper retries with a backoff; if the named step keeps failing, its service log says why.")
+                       "The reaper retries with a backoff; if the named step keeps failing, its service log says why. "
+                       "If `repair` refuses `live-lease` for this session (it was stranded by an older release's END), "
+                       "release it from this install's package, in order:\n" + _held_commands())
+
+
+def reap_held_lines(host: HostOS, source: str) -> tuple[str, ...]:
+    """The commands that release a session stuck HELD by an OLDER release's END, run as the operator in this order
+    (Phill 10-28, np-5da552a2 (b): no ``reap-held`` verb; an installed helper cannot learn a verb it was built
+    without, so ``repair`` stays the only door and refuses ``live-lease`` while the session is stuck). It stops the
+    reaper, copies the NEW package (``source``) to a root-owned directory, runs ONE reaper pass from that copy,
+    never from the operator-writable tree, starts the reaper again and removes the copy. ``repair`` follows."""
+    from levain.slot import layout, root_tree, units
+
+    svc = next(sv for sv in units.SERVICES if sv.name == "reaper")
+    stage = "/var/root/levain-pass" if host == "darwin" else "/root/levain-pass"
+    if host == "darwin":
+        stop = f"sudo launchctl bootout system/{units.launchd_label(svc)}"
+        start = f"sudo launchctl bootstrap system {units.launchd_path(svc)}"
+    else:
+        unit = units.systemd_name(svc)
+        stop, start = f"sudo systemctl stop {unit}", f"sudo systemctl start {unit}"
+    prog = ("import sys; sys.path.insert(0, '" + stage + "'); "
+            "from levain.slot import reaper as RP, runtime_helper as H; print(RP.Reaper(H.Seams()).run_pass())")
+    return (stop,
+            f"sudo rm -rf {stage} && sudo mkdir -m 700 {stage} && sudo cp -R {shlex.quote(source)} {stage}/levain",
+            f"sudo {root_tree.ROOT_PYTHON[host]} {root_tree.PY_FLAGS} -c \"{prog}\"",
+            start,
+            f"sudo rm -rf {stage}",
+            layout.repair_line(host) + f" --source {shlex.quote(source)}")
+
+
+def _held_commands() -> str:
+    """The numbered commands of :func:`reap_held_lines`, for the package this doctor runs from."""
+    from levain.slot import layout
+
+    host = "darwin" if sys.platform == "darwin" else "linux"
+    src = os.path.dirname(os.path.abspath(__file__))
+    steps = "\n".join(f"        {i}. {c}" for i, c in enumerate(reap_held_lines(host, src), 1))
+    return steps + ("\n        If 2 fails, stop and look at why: steps 3-5 need the copy. If 3 fails, still run 4 and 5."
+                      "\n        If 4 fails, run it again before 5. Step 6 asks for your password.")
 
 
 def _check_slot_services(*, host: str | None = None, store: Path | None = None, run: Path | None = None,

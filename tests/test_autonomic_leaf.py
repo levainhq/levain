@@ -42,7 +42,7 @@ PKG = ROOT / "levain" / "autonomic"
 ALLOWED_STDLIB = frozenset({
     "__future__", "collections", "contextlib", "copy", "dataclasses", "datetime", "enum", "errno", "fcntl",
     "grp", "hashlib", "json", "logging", "math", "os", "pathlib", "platform", "pwd", "re", "sqlite3", "stat",
-    "subprocess", "tempfile", "threading", "types", "typing", "unicodedata",
+    "subprocess", "tempfile", "threading", "time", "types", "typing", "unicodedata",
 })
 # What the modules named in ALLOWED_OUTSIDE may import: kept apart so a stdlib module they need never
 # widens the closed package's own list above.

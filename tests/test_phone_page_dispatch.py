@@ -412,3 +412,73 @@ def test_putting_the_page_away_dismisses_an_open_picker_and_polling_resumes(worl
     assert out["values"][2] >= 2 and out["values"][4] == 0, out             # the picker was up, then gone
     assert out["values"][7] >= 3, out                                       # busy released: the list polls again
     assert not out["values"][9].startswith("pick a passkey"), out           # no instruction left over a gone picker
+
+
+# --- 1029-5: the card's challenge names the version it showed; any 409 redraws ---------------------------------
+
+def _counting(httpd) -> "list[int]":
+    """The listing reads the server serves from here on (the card's redraw is one more)."""
+    reads: "list[int]" = []
+    real = httpd.dispatch.pending
+    httpd.dispatch.pending = lambda: reads.append(1) or real()
+    return reads
+
+
+@needs_browser
+def test_the_challenge_carries_the_listed_version_and_a_stale_409_redraws_the_card(world, tmp_path: Path) -> None:
+    """The job changed between the card and the tap (the server's current version is another): the page sent the version
+    the listing showed, was refused 'changed since it was shown', signed nothing, and read the queue again."""
+    job = file_job(world)
+    with _serve(world["qdir"], world["qdir"]) as (base, httpd):
+        reads = _counting(httpd)
+        httpd.dispatch._current = lambda _job_id: {"state": "filed", "sha256": "f" * 64}
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            _authenticator(world["phone"]),
+            {"until": CARD + " && 1"},
+            {"eval": f"JSON.stringify({{n: 0}})"},
+            {"eval": SIGN_TAP},
+            {"until": f"/changed since it was shown/.test({NOTE}) && {NOTE}", "ms": 8000},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 2600))"},          # past the redraw's 1.5 s
+        ])
+        after = len(reads)
+    assert [p.split(" ", 1)[0] for p in out["posts"]] == [f"/dispatch/{job.id}/challenge"], out["posts"]
+    (sent,) = re.findall(r'"request_sha256":"([0-9a-f]{64})"', out["posts"][0])
+    assert sent != "f" * 64                                                       # the listing's version, not the server's now
+    assert reads and after >= 2, (after, out)                                     # the first read, and the redraw's
+    assert JobStore(world["qdir"]).get(job.id).state == "filed"
+
+
+def _a_409_with(world, tmp_path: Path, message: str) -> "tuple[dict, int]":
+    from levain.dispatch.phone import DispatchRefused
+
+    file_job(world)
+    with _serve(world["qdir"], world["qdir"]) as (base, httpd):
+        reads = _counting(httpd)
+
+        def refuse(*_a):
+            raise DispatchRefused(409, "conflict", message)
+
+        httpd.dispatch.step = refuse
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            _authenticator(world["phone"]),
+            {"until": CARD + " && 1"},
+            {"eval": SIGN_TAP},
+            {"until": f"/^Not signed/i.test({NOTE}) && {NOTE}", "ms": 8000},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 2600))"},
+        ])
+        return out, len(reads)
+
+
+@needs_browser
+def test_a_different_409_also_redraws_the_list(world, tmp_path: Path) -> None:
+    out, after = _a_409_with(world, tmp_path, "dispatch job is not filed: something else is the matter")
+    assert after >= 2, (after, out)                                               # the load's read, and the redraw's
+
+
+@needs_browser
+def test_a_409_that_the_job_was_cancelled_meanwhile_rereads_the_list(world, tmp_path: Path) -> None:
+    """The card was shown as filed, the job was cancelled meanwhile: the challenge's 409 says so and the list is re-read."""
+    out, after = _a_409_with(world, tmp_path, "dispatch job is cancelled, which is final")
+    assert after >= 2, (after, out)

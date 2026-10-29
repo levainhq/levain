@@ -12,7 +12,10 @@ CONTROL checks, never as a fact root acts on.
    with no ``keep/`` return: its credential is the one the vendor's login writes. An interactive passthrough
    session runs :func:`_identity_gate` at the start of step 4, under the same lock: the slot's baseline read, the
    parked credential returned from ``keep/`` into the session tree, the vendor's identity call recorded in the state
-   record's ``identity`` and compared with the baseline (``identity-changed`` when it differs). Any refusal there
+   record's ``identity`` and compared with the baseline (``identity-changed`` when it differs; a login the server
+   no longer accepts, ``identity-expired``; Claude's sign-in server unreachable, ``identity-unreachable``). Claude
+   only: the identity child first refreshes the stored login once (PIN_REFRESH_DESIGN) and writes the rotated tokens
+   back, then asks the profile on the new access token, so no pin or fingerprint shortcut exists. Any refusal there
    precedes ``<S>/repo`` and the clone, and the credential is parked back into ``keep/``.
    ``vendor``: root's copy of the session's vendor CLI (its install unit) in ``VENDOR_PREFIX`` is not whole
    (:func:`check_vendor_installed`; setup and repair copy it there) = ``vendor-not-installed:<vendor>``, before any
@@ -57,6 +60,7 @@ then SCRUBBED (proc.scrub over every uid of the slot, under the slot lock) and t
 from __future__ import annotations
 
 import errno
+import json
 import os
 import re
 import select
@@ -72,6 +76,7 @@ from levain.contracts import canon
 from levain.slot import Refused, wall
 from levain.slot import end as E
 from levain.slot import identity as ID
+from levain.slot import identity_child as IC
 from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import render as RD
@@ -669,7 +674,11 @@ def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
     any move (:data:`_RETURN_UNMOVED`), move nothing. Every other failure once the return was entered (its
     ``bad-root`` may come after its rename: L3 r1 F1), and every refusal after it, is followed by a best-effort
     :func:`levain.slot.end.park_move` of the credential back into ``keep/`` (a no-op when it never left): a failure
-    there is noted and END's park is the backstop. No baseline is written on this path."""
+    there is noted and END's park is the backstop. No baseline is written on this path.
+
+    For Claude the identity child refreshes the stored login once before it asks the profile (PIN_REFRESH_DESIGN), so
+    the account it names is the one the file's own refresh token belongs to; the vendor starts on the file the child
+    wrote back."""
     seams = ctx.seams
     seams.at("identity-gate")
     baseline = ID.read_slot_baseline(ctx, a)
@@ -854,7 +863,9 @@ def identity_capture(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
     4. Linux egress: a fresh forwarder (:func:`_spawn_forwarder`), so the call reaches the passthrough tunnel;
     5. the child, its output captured;
     6. the kill domain ended again (the fresh forwarder reaped) and steps 2-3's proof, whether 4-5 passed or not, so
-       neither outlives the call. On a failed 4-5 a failure here is noted; after an answer it is ``identity-window``.
+       neither outlives the call. On a failed 4-5 a failure here is noted; after an answer it is ``identity-window``;
+    7. a rotated login the child could not rename into place moved there by root (:func:`promote_refresh_temp`, its
+       failure ``identity-expired``).
 
     The login already ran, so every failure is a :class:`Refused` the caller records: a window check's (the session
     lock's own refusals, ``session-busy`` among them, and step 1's ``not-active:<STATE>`` keep their names) is
@@ -948,7 +959,55 @@ def _identity_child(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
         raise Refused("identity-window", f"after the call: {_why(e)}") from None
     except Exception as e:   # noqa: BLE001 - the answer is not kept unless the slot is proven empty after it
         raise Refused("identity-window", f"after the call: {_why(e)}") from None
+    promote_refresh_temp(ctx, a, answer[1])
     return answer
+
+
+def _kept_after_spend(out: bytes) -> bool:
+    try:
+        ans = json.loads(out.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return False
+    return type(ans) is dict and ans == {"refresh": IC.KEPT_AFTER_SPEND}
+
+
+def promote_refresh_temp(ctx: H.Ctx, a: R.Alloc, out: bytes) -> None:
+    """PIN_REFRESH L3 r1 (codex HIGH 1): the identity child said :data:`levain.slot.identity_child.KEPT_AFTER_SPEND`
+    (the refresh answered 200, the server rotated the refresh token, the new login is whole and fsynced in the temp, and
+    the child's own rename onto the credential failed). The old refresh token in the credential is dead, so root moves
+    the temp onto it by rename in the session tree's credential directory (by dirfd, no link followed, never opened:
+    root holds no token), then fsyncs the directory, BEFORE anything parks the credential: the gate's park-back and
+    END's park move ``.credentials.json`` only, so a temp left beside it would strand the one live login in the retained
+    tree. Runs after :func:`_identity_empty` proved no slot process, so nothing can swap the temp under the rename. The
+    temp must be a regular 0600 file, one link, slot-owned, at most END's cap (``return_move``'s shape). Any other
+    answer is left as it is. A promote that fails is ``identity-expired``: the stored login is then the dead one, and a
+    sign-in is what repairs it. Known edge: a child SIGKILLed between the 200 and its line leaves an unpromoted temp
+    in the retained tree (the operator's own login, root-only there)."""
+    if not _kept_after_spend(out):
+        return
+    facts = end_facts(ctx, a)
+    lost = ("the refreshed login could not be moved into place; the stored one is no longer valid: sign in to this "
+            "slot again")
+    if facts.credential is None:
+        raise Refused(ID.EXPIRED, lost)
+    parts, name = facts.credential
+    temp = IC.TEMP_NAME.encode("ascii")
+    owner_ok = slot_owner_ok if slot_owner_ok is not None else (lambda st: st.st_uid == facts.slot_uid)
+    try:
+        dfd = E._open_subdir(facts.live, parts)
+        if dfd is None:
+            raise Refused(ID.EXPIRED, f"{lost} (no credential directory)")
+        try:
+            st = os.stat(temp, dir_fd=dfd, follow_symlinks=False)
+            if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and owner_ok(st)
+                    and stat.S_IMODE(st.st_mode) == 0o600 and 0 < st.st_size <= E.V14_BYTES):
+                raise Refused(ID.EXPIRED, f"{lost} (the temp is not the child's shape)")
+            os.rename(temp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError as e:
+        raise Refused(ID.EXPIRED, f"{lost} ({_why(e)})") from None
 
 
 def _wake(seams: H.Seams) -> None:

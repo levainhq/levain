@@ -323,6 +323,18 @@ def test_faults_are_503_and_say_nothing_was_signed(world, monkeypatch) -> None:
     assert JobStore(world["qdir"]).get(job.id).state == "filed"
 
 
+def test_a_store_get_that_cannot_decode_is_a_409_could_not_be_read_never_a_raw_500(world, monkeypatch) -> None:
+    job = file_job(world)
+    dp = phone_for(world)
+
+    def broken(self, job_id):
+        raise json.JSONDecodeError("bad row", "{", 0)      # a ValueError
+
+    monkeypatch.setattr(JobStore, "get", broken)
+    err = refused(dp.step_shown, job.id, "challenge", {"signer_fp": world["phone"].fp, "request_sha256": "a" * 64})
+    assert err.status == 409 and "could not be read" in err.message and "nothing was signed" in err.message
+
+
 # --- fix round 1 -----------------------------------------------------------------------------------------------------
 
 def test_the_record_carries_every_field_the_laptop_render_shows(world) -> None:

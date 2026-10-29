@@ -88,9 +88,14 @@ def test_an_unreadable_store_is_reported_not_empty(qdir):
     assert "coordinator" in out["unreadable"] and out["queue"] == "unreadable" and out["note"] != board.NO_QUEUE
 
 
-def test_an_unreadable_band_is_reported_with_the_hint(filled):
+def test_no_question_store_is_silent_not_unreadable(filled, tmp_path):
     out = board.build(filled, None)
-    assert "band" in out["unreadable"] and "levain band" in out["note"]
+    assert "band" not in out["unreadable"] and "levain band" not in (out["note"] or "")
+    out = board.build(tmp_path / "empty", None)
+    assert out["queue"] == "none" and out["note"] == board.NO_QUEUE and out["unreadable"] == []
+
+
+def test_an_unreadable_band_is_reported_with_the_hint(filled):
     (filled / "questions.db").write_bytes(b"garbage garbage garbage garbage")
     out = board.build(filled, QuestionStore(filled))
     assert "band" in out["unreadable"]

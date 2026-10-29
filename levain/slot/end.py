@@ -1819,9 +1819,10 @@ def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _
     :func:`confirmed_relogin` (IG-1): the parked entry is first set aside into ``replaced/`` (:func:`_set_aside`),
     then the new login is parked. In that order, a death at any point leaves the new login in the session tree or
     in ``keep/`` (the old one in ``keep/`` or ``replaced/``); a redo after the set-aside finds ``keep/`` empty and
-    parks, and one after the park finds the source gone. A ``login`` session that is not confirmed (D1) parks
-    nothing: its new credential is set aside into ``unconfirmed/`` and ``keep/`` is not touched, so the session
-    still retains and its slot is released. Only another kind refuses ``keep-occupied``.
+    parks, and one after the park finds the source gone. A ``login`` session that is not confirmed (D1), with
+    ``keep/`` already occupied, parks nothing: its new credential is set aside into ``unconfirmed/`` and ``keep/``
+    is not touched, so the session still retains and its slot is released; with ``keep/`` empty it parks as any
+    first login does. Only another kind refuses ``keep-occupied``.
     keep/ (root 0700, install's) is made if it is missing (DECISION), its parent fsynced. Every run first fsyncs
     every directory an earlier run may have left unsynced (:func:`_resync`), so a redo finishes the durability steps
     the run it replays owed (codex r1 6, r1 G2 H1 + H2)."""

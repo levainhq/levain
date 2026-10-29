@@ -480,3 +480,33 @@ def test_a_silent_peer_is_bounded_by_the_deadline(tmp_path: Path):
         srv.close()
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_stuck_row_prints_the_commands_that_release_it_from_a_root_owned_copy():
+    """np-5da552a2 (b): no verb; the hint is the runnable sequence (stop, stage a root copy, one pass from the copy, start,
+    clean up, repair), in that order, and no step runs code from the operator-writable package."""
+    for host in ("darwin", "linux"):
+        lines = doctor.reap_held_lines(host, "/home/op/site/levain")
+        stop, stage, run, start, clean, repair = lines
+        assert "reaper" in stop and "reaper" in start and stop != start
+        assert "cp -R /home/op/site/levain " in stage
+        assert "sys.path.insert(0, '" in run and "/home/op/site" not in run and "run_pass()" in run
+        assert repair.endswith("repair --source /home/op/site/levain")
+
+
+def test_a_package_path_with_a_space_survives_shlex_in_the_printed_commands():
+    """Diogenes 10-29 (2b7fe9d6): the operator's package path reaches sudo commands; a space must not split it."""
+    import shlex
+    src = "/home/op/my site/levain"
+    for host in ("darwin", "linux"):
+        lines = doctor.reap_held_lines(host, src)
+        assert shlex.split(lines[1])[-2] == src and shlex.split(lines[5])[-1] == src
+
+
+def test_a_fresh_pass_record_naming_no_held_session_is_not_called_out_of_date():
+    """Diogenes 10-26 (f6738797): CONTROL silent + a FRESH record with held [] is not "out of date"."""
+    rec = {"pass_seq": 7, "ended_at": R.timestamp(NOW - 30), "control": "down", "held": [], "skipped": []}
+    fresh = doctor._check_held((False, "no answer in time"), ("ok", rec), NOW)
+    stale = doctor._check_held((False, "no answer in time"), ("ok", dict(rec, ended_at=R.timestamp(NOW - 5000))), NOW)
+    assert fresh.ok and fresh.warn and "out of date" not in fresh.detail and "is current" in fresh.detail
+    assert "out of date" in stale.detail
