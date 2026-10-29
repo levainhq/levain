@@ -13,6 +13,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   refusal says to. Other routes (brokered, Codex) are not checked.
 
 ### Added
+- **The shipped base map carries a `codex-subscription` passthrough route** (hosts `api.openai.com`, `auth.openai.com`,
+  `chatgpt.com`), so `levain session codex --auth passthrough` no longer refuses `no-route:passthrough` for want of a route.
+  This adds the route only; it does not claim Codex passthrough works inside a session.
 - **`levain upgrade` (hidden, like `levain session`) upgrades Levain and its root side in one command.** It runs the
   installer that put Levain there (pip, `pip --user`, pipx or uv; it refuses and prints what to run when it cannot tell),
   restarts itself on the new code, stops with the clean-up commands printed if a session is stuck, then runs exactly
