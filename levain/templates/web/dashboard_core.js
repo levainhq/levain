@@ -4668,10 +4668,11 @@
   function bandFill(slot, say, fresh, retried) {
     bandFetch(fresh).then((b) => bandDraw(slot, b, say), (e) => {
       const m = e && e.message ? String(e.message) : "";
-      if (/no question store/.test(m)) { slot.replaceChildren(); return; }     // nothing to show on a cockpit without one
+      if (/no question store/.test(m)) { slot.replaceChildren(); slot.setAttribute("data-band-read", "none"); return; }     // nothing to show on a cockpit without one
       // the server reads one band at a time (a second look meeting the first is told "busy"): one more try, then say so
       if (!retried) { setTimeout(() => bandFill(slot, say, true, true), 700); return; }
       slot.replaceChildren(el("div", "ext-meta band-note", "the band could not be read" + (m ? ": " + m : "")));
+      slot.setAttribute("data-band-read", "error");
     });
   }
   function bandDraw(slot, b, say) {
@@ -4680,8 +4681,11 @@
     bandNumOf.clear();
     for (const it of items) if (it && Number.isInteger(it.question)) bandNumOf.set(it.question, it.n);
     const kids = [];
-    if (b.store === "absent") { slot.replaceChildren(); applyBandNumbers(); return; }   // no store yet: nothing was ever filed, so no band and no line
-    if (items.length === 0 && !say && !bandKeep && !b.note) { slot.replaceChildren(); applyBandNumbers(); return; }
+    // the settle marker the page owns: a read has landed and been drawn (a test waits on it, never on a clock)
+    const read = b.store === "absent" ? "absent" : (b.note ? "note" : "ok");
+    // no store yet: nothing was ever filed, so no band and no line, unless an answer's confirmation is still to be said
+    if (b.store === "absent" && !say && !bandKeep) { slot.replaceChildren(); slot.setAttribute("data-band-read", read); applyBandNumbers(); return; }
+    if (items.length === 0 && !say && !bandKeep && !b.note) { slot.replaceChildren(); slot.setAttribute("data-band-read", read); applyBandNumbers(); return; }
     kids.push(el("div", "ext-grouphead", "needs you · the band"));
     const msg = el("span", "edit-msg band-msg", say || bandKeep);
     const controls = [];
@@ -4765,6 +4769,7 @@
     bar.append(box, go, msg);
     kids.push(bar);
     slot.replaceChildren(...kids);
+    slot.setAttribute("data-band-read", read);
     applyBandNumbers();
   }
   function questionRow(o) {

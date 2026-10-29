@@ -417,7 +417,7 @@ def test_f7_the_cards_follow_the_live_requests_and_precede_the_resolved(tmp_path
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": f"{_CARDS}.length === 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 1200))"},          # the band read has landed by now
+            {"until": "document.querySelector('#levain-modal [data-band-slot][data-band-read=\"absent\"]')"},   # the band read has landed and been drawn
             {"eval": heads},
             {"eval": "/could not be recorded/i.test(document.getElementById('levain-modal').innerText)"},
         ])

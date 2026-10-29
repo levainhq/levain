@@ -207,12 +207,14 @@ def mark_closed_shown(store: QuestionStore, closed: list[int]) -> None:
 class Rendered(NamedTuple):
     """One render: the text, the ``closed`` band numbers it carries, the band numbers of the open items shown with a
     number, the header's ``band@`` high-water mark (0 when nothing was numbered), and the render's generation (its
-    start, ``time.time_ns()``: what orders two views of one viewer, whatever order they are committed in)."""
+    start, ``time.time_ns()``: what orders two views of one viewer, whatever order they are committed in), and whether
+    an authority source was not read (``failed``: the text then carries its ``! not read`` line)."""
     text: str
     closed: list[int]
     shown: list[int]
     hwm: int
     gen: int
+    failed: bool = False
 
 
 def render_with_closed(store: QuestionStore | None = None) -> tuple[str, list[int]]:
@@ -326,7 +328,7 @@ def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sq
         except Exception:                     # one item that will not render never drops the band (D13)
             lines.append(f"{label} UNREADABLE: {key[0]} {key[1]} could not be read (listed, never dropped)")
     lines.extend(f"! not read: {why} (items from it are missing, not closed)" for why in extras.failed)
-    return Rendered("\n".join(lines), [n for n, _ in closed_all], shown, hwm, gen)
+    return Rendered("\n".join(lines), [n for n, _ in closed_all], shown, hwm, gen, bool(extras.failed))
 
 
 def render(store: QuestionStore | None = None) -> str:
@@ -342,6 +344,17 @@ def _store_id_of(store: QuestionStore) -> str | None:
             return None
         row = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
         return row[0] if row else None
+
+
+def _store_absent(store: QuestionStore) -> bool:
+    """True only when the question store is PHYSICALLY absent (no file, or an empty one: :meth:`QuestionStore._peek`
+    yields no connection). A store that exists but is locked or unreadable, or lacks its ``store_id`` row, is not
+    absent: any sqlite error here answers ``False``, so it keeps its note and never reads as a fresh install."""
+    try:
+        with store._peek() as conn:
+            return conn is None
+    except sqlite3.Error:
+        return False
 
 
 def record_view(store: QuestionStore, viewer: str, seen_through: int, open_list: list[int],
@@ -675,13 +688,14 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
     ``view_id``, the recorded view this listing is; ``seen_through`` is that view's ``band@`` mark, for display) and
     the numbered open items (``kind`` is ``information`` or ``authority``: shorthand records only the first; an
     authority item opens its existing signing sheet). Shows the band to ``viewer`` first (:func:`show`)."""
-    show(store, viewer, deadline)
+    shown = show(store, viewer, deadline)
     got = _newest_view(store, viewer)
     if got is None:                               # no view to bind to: which of two facts is it?
-        if _store_id_of(store) is None:           # no store (no file, an empty one): nothing was ever filed, so nothing
-            #                                       ever needed a view; a read-only look, the poll set nothing up
+        if not shown.failed and _store_absent(store):   # no store file (or an empty one) AND every source read: nothing
+            #                                       was ever filed, so nothing needed a view; a read-only look, the poll set nothing up
             return {"seen_through": None, "store_id": None, "view_id": None, "items": [], "store": "absent"}
-        # a store that exists whose view could not be stored (a lock held, a write failing): said, never drawn as health
+        # a store that exists whose view could not be stored (a lock held, a write failing), or an authority source
+        # that was not read (its "! not read" line is in the text): said, never drawn as health
         return {"seen_through": None, "store_id": None, "view_id": None, "items": [],
                 "note": "the band could not be recorded just now"}
     view, view_id = got
