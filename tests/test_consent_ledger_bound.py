@@ -227,7 +227,20 @@ def test_per_call_lifts_the_post_bound(tmp_path):
     rows = ledger.window("codex", "s", "1h")
     assert len(rows) == 1
     assert rows[0].phase == "pre" and rows[0].bound == "touched" and rows[0].bound_classes == ("network", "other")
-    assert [c.phase for c in ledger.pending()] == ["post"] or ledger.pending() == []
+    # the raw rows still hold both: the pending post row carries the bound the view lifted
+    assert [(c.phase, c.bound) for c in ledger.pending()] == [("post", "touched")]
+
+
+def test_a_refile_keeps_the_first_bound(tmp_path):
+    ledger = _ledger(tmp_path)
+    first = _post(ledger)  # filed without a bound (a hook that did not classify)
+    assert _post(ledger, TOUCHED) == first
+    assert ledger.get(first).bound is None
+    stamped = _post(ledger, TOUCHED, tool_use_id="t2")
+    assert _post(ledger, BoundRecord("unknown", 0, ()), tool_use_id="t2") == stamped
+    assert ledger.get(stamped).bound == "touched"
+    # the stamp still fills once, and the bound columns stay as filed
+    assert ledger.fill_stamp(first, "grant") and ledger.get(first).bound is None
 
 
 def test_readonly_readers_on_an_unmigrated_store(tmp_path):

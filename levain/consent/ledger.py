@@ -492,6 +492,10 @@ class Ledger:
                                      (agent, agent_session_id, tool_use_id, phase)).fetchone()
                 if found is None:
                     raise
+                # the first filing's bound stands, and a later one is not attached (the trigger pins it). Unlike the
+                # stamp, a bound has no later source: it is read from the same payload the row is filed from, so a
+                # retry of that payload carries the same evidence. Known edge: a row filed by a hook that does not
+                # classify (an older levain, a stale hook script) keeps NULL ("not recorded"), never clean.
                 return found[0]
         return row_id
 

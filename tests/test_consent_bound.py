@@ -127,6 +127,29 @@ def test_webfetch_admitted_clean():  # row 6
         == BoundRecord("clean", 0, ())
 
 
+@pytest.mark.parametrize("resp", [
+    {}, {"result": "x"}, {"error": "boom"},
+    dict(FETCH_OK, code=403), dict(FETCH_OK, code=502), dict(FETCH_OK, code="200"), dict(FETCH_OK, code=True),
+    dict(FETCH_OK, code=200.0), {k: v for k, v in FETCH_OK.items() if k != "code"},
+    {k: v for k, v in FETCH_OK.items() if k != "bytes"}, dict(FETCH_OK, bytes="577"), dict(FETCH_OK, bytes=-1),
+    dict(FETCH_OK, result=None), dict(FETCH_OK, result=["Example Domain"]),
+])
+def test_webfetch_clean_needs_the_measured_success_shape(resp):  # row 6: any other mapping is not evidence
+    assert classify("claude_code", "PostToolUse", "WebFetch", URL, resp, bound_active=True) \
+        == BoundRecord("unknown", 0, ())
+
+
+def test_codex_escalated_call_is_unknown():  # Codex 0.162.1's escalation field (test_consent_codex_adapter)
+    esc = {"command": "chown root x", "sandbox_permissions": "require_escalated"}
+    out = "chown: x: Operation not permitted\n"
+    assert classify("codex", "PostToolUse", "exec_command", esc, out, bound_active=True) == BoundRecord("unknown", 0, ())
+    plain = {"command": "chown root x", "sandbox_permissions": "use_default"}
+    assert classify("codex", "PostToolUse", "exec_command", plain, out, bound_active=True).bound == "touched"
+    # the Codex field means nothing to Claude Code's Bash, whose escape is its own key
+    assert cc_bash(CC_EPERM, tool_input={"command": "x", "sandbox_permissions": "require_escalated"}).bound \
+        == "touched"
+
+
 @pytest.mark.parametrize("inp", [{}, {"url": 5}, {"url": "http://localhost/"}, {"url": "https://intranet/"},
                                  {"url": "ftp://a.b/"}, {"url": "https://a.b/" + "x" * 3000}, "https://a.b", None,
                                  {"url": "http://[::1"}])

@@ -6,7 +6,7 @@ nothing about it. This module reads the tool's OUTPUT (and, for WebFetch, the IN
 outcome. It stores a class and a count, never a url, host, path, stderr line or any echo of the command.
 
 The four bounds: ``none`` (no bound was in force over this call), ``touched`` (a measured refusal string was seen),
-``clean`` (only a WebFetch whose success is fully visible in its result), ``unknown`` (the evidence is silent or not
+``clean`` (only a WebFetch whose result is the measured success object), ``unknown`` (the evidence is silent or not
 recognised; silence is never ``clean`` for a shell or patch call, because ``curl -s`` and a write sent to
 ``/dev/null`` leave no text).
 
@@ -16,7 +16,9 @@ wider than what is emitted: ``agent_config`` and ``process_info`` are reserved f
 Known edges (one line each): Codex's ``tool_response`` is one string, stdout and stderr undistinguished, so a command
 that prints the phrase on stdout reads ``touched`` there (Claude Code separates stderr, so the same command reads
 ``unknown``); WebFetch is outside the Claude Code Bash sandbox, so its refusal rule fires only where a proxy refuses
-the fetch; a Codex patch the sandbox rejected may fire no post event at all, so it has no row to classify.
+the fetch; a Codex patch the sandbox rejected may fire no post event at all, so it has no row to classify; an
+``Operation not permitted`` the OS raises with no sandbox involved (``chown``, ``kill`` as a non-owner) inside a
+bounded call reads ``touched``, since the text is the same.
 
 Pure: no I/O, no clock, no environment. ``classify`` and ``classify_payload`` never raise, since a hook must get a
 record, not a crash.
@@ -43,6 +45,8 @@ SHELL_TOOLS = frozenset({"Bash", "shell", "exec_command", "shell_command", "loca
 PATCH_TOOL = "apply_patch"     # Codex only
 FETCH_TOOL = "WebFetch"        # Claude Code only
 _TOOL_EVENTS = ("PostToolUse", "PostToolUseFailure")
+_CODEX_ESCALATION_KEY = "sandbox_permissions"
+_CODEX_ESCALATED = "require_escalated"
 _MAX_URL = 2048
 _MAX_HOST = 253
 # case-insensitive: an OS strerror, spelled differently by Go, Python and Node
@@ -132,9 +136,19 @@ def _classify_fetch(event: str, tool_input: Any, tool_response: Any, error: Any,
     # an exact text, never a substring: a fetched page that discusses proxies must not read as a refusal
     if isinstance(text, str) and text.strip() in _FETCH_REFUSED:
         return _touched(1, ("network",))
-    if event == "PostToolUse" and isinstance(tool_response, Mapping) and bound_active is True:
+    if event == "PostToolUse" and bound_active is True and _fetch_succeeded(tool_response):
         return BoundRecord("clean", 0, ())
     return _unknown()
+
+
+def _fetch_succeeded(tool_response: Any) -> bool:
+    """True only for the MEASURED success object (``{"bytes": 577, "code": 200, "codeText": "OK", "result": ...}``):
+    an int ``code`` of 200, an int ``bytes`` and a str ``result``. Any other mapping (empty, an error shape, another
+    status, a vendor's new shape) is not evidence of success, so it reads ``unknown``, never ``clean``."""
+    if not isinstance(tool_response, Mapping):
+        return False
+    code, size, result = tool_response.get("code"), tool_response.get("bytes"), tool_response.get("result")
+    return (type(code) is int and code == 200 and type(size) is int and size >= 0 and isinstance(result, str))
 
 
 def _scan_text(agent: str, event: str, tool_response: Any, error: Any) -> str | None:
@@ -178,6 +192,12 @@ def classify(agent: str, event: str, tool_name: Any, tool_input: Any, tool_respo
         # the VALUE decides where the call ran: set true, it ran outside the sandbox
         if shell and isinstance(tool_input, Mapping) and tool_input.get(SANDBOX_ESCAPE_KEY) is True:
             return _none()
+        # a Codex call that asked to run outside its sandbox (the field and value Codex 0.162.1 sent on an escalated
+        # write_stdin input) may have run outside it, where an EPERM is the OS's and not the bound's: neither touched
+        # nor none can be claimed
+        if shell and agent == "codex" and isinstance(tool_input, Mapping) \
+                and tool_input.get(_CODEX_ESCALATION_KEY) == _CODEX_ESCALATED:
+            return _unknown()
         if fetch:
             return _classify_fetch(event, tool_input, tool_response, error, bound_active)
         text = _scan_text(agent, event, tool_response, error)
