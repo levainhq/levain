@@ -200,7 +200,7 @@ def test_a_badge_tap_runs_the_real_open_path_and_lights_the_row_that_carries_the
     patch = ("(() => { const T = window.LevainTopologyView, orig = T.render; T.render = function (v, o) { const w = JSON.parse(JSON.stringify(v)); "
              "w.hub = Object.assign({}, w.hub, {needs_open: 1, needs_first: 'np-aaaa1111', needs_first_card: 'np:np-aaaa1111', needs_first_what: 'ship or hold?'}); return orig.call(T, w, o); }; return 1; })()")
     rows = ("(() => { let h = document.getElementById('ck-needs'); if (!h) { h = document.createElement('div'); h.id = 'ck-needs'; document.body.appendChild(h); } h.hidden = false; "
-            "h.replaceChildren(...['np:np-zzzz9999', 'np:np-aaaa1111', 'np-aaaa1111'].map(id => { const d = document.createElement('div'); d.className = 'needs-card'; d.dataset.needsId = id; d.style.height = '10px'; return d; })); return 1; })()")
+            "h.replaceChildren(...['np:np-zzzz9999', 'np:np-aaaa1111', 'np-aaaa1111'].map(id => { const d = document.createElement('div'); d.className = 'needs-row'; d.dataset.needsId = id; d.style.height = '10px'; return d; })); return 1; })()")
     lit = "JSON.stringify([...document.querySelectorAll('#ck-needs .needs-lit')].map(n => n.dataset.needsId))"
     out = _run(tmp_path, src, [{"eval": patch}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"}, {"until": TV + ".dataset.lens == 'work'"}, *PRIME, {"until": BADGE % "hub" + " && " + BADGE % "hub" + ".getAttribute('role') == 'button'"}, {"eval": rows},
                                {"eval": "%s.dispatchEvent(new MouseEvent('click', {bubbles: true})); 1" % (BADGE % "hub")}, {"eval": lit}])

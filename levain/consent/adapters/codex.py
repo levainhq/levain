@@ -490,7 +490,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     limited = _limits(event, queue, settings, session, tool_name, tool_input, cwd, home=home, environ=environ,
                       codex_dir=codex_dir)
     if limited is not None:
-        return _with_rulings(limited, queue, session)   # a late End on the limit reaches a halted Codex session
+        return _with_rulings(limited, queue, session, cwd, environ)   # a late End on the limit reaches a halted Codex session
     try:
         send_repings(queue, settings)
     except Exception:
@@ -499,7 +499,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         still_away = still_away_from(Path(queue.directory) / SETTINGS_NAME, settings, queue=queue)
     out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, environ=environ,
                      codex_dir=codex_dir, sleep=sleep, still_away=still_away)
-    return _with_rulings(out, queue, session)
+    return _with_rulings(out, queue, session, cwd, environ)
 
 
 def _missing_of(event: Mapping[str, Any]) -> list[str]:
@@ -537,7 +537,8 @@ def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSett
     return _deny(got.text)
 
 
-def _with_rulings(out: dict[str, Any] | None, queue: ConsentQueue, session: str) -> dict[str, Any] | None:
+def _with_rulings(out: dict[str, Any] | None, queue: ConsentQueue, session: str,
+                  cwd: Any = None, environ: Mapping[str, str] | None = None) -> dict[str, Any] | None:
     try:
         context = ruling_context(queue, session)
     except Exception:
@@ -548,7 +549,13 @@ def _with_rulings(out: dict[str, Any] | None, queue: ConsentQueue, session: str)
         answers = question_context(queue.directory, AGENT, session)
     except Exception:
         answers = None  # undelivered answers stay for the next hook
-    context = "\n".join(c for c in (context, answers) if c) or None
+    try:
+        from levain.band_view import gate_notice
+
+        notice = gate_notice(queue.directory, AGENT, session, cwd if isinstance(cwd, str) else None, environ)
+    except Exception:
+        notice = None  # a notice is not the gate's to fail on
+    context = "\n".join(c for c in (context, answers, notice) if c) or None
     if context:
         out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}
         spec = out["hookSpecificOutput"]

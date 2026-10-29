@@ -18,10 +18,15 @@ from tests._h4 import h4_home
 DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
 TILE = "[...document.querySelectorAll('.ck-widgets .ck-card.w')].find(c => /^Decisions waiting/i.test(c.innerText))"
 SESS_TILE = "[...document.querySelectorAll('.ck-widgets .ck-card.w')].find(c => /^Sessions/i.test(c.innerText))"
-CARDS = "[...document.querySelectorAll('#ck-needs .needs-card')]"
+CARDS = "[...document.querySelectorAll('#ck-needs .needs-row')]"
 # the one consent card that carries its Open row, picked the same way for the wait, the read and the click
-CARD = "[...document.querySelectorAll('#ck-needs .needs-consent')].find(c => c.querySelector('.needs-open'))"
-READY = "document.querySelector('#ck-needs .needs-card .consent-display') && document.querySelector('#ck-needs .needs-question .question-option')"
+CARD = "[...document.querySelectorAll('#ck-needs .needs-consent')][0]"
+# the strip is a column of summary rows (tests/test_cockpit_needs_rows.py); a row is read once its second line (what it blocks, or where) arrives
+READY = ("(r => r.length === 3 && r.every(x => x.querySelector('.needs-row-sub').textContent !== ''))"
+         "([...document.querySelectorAll('#ck-needs .needs-row')])")
+# a row opens its item's focus view, where the decision controls live; `OPEN_ROW(sel)` clicks the strip row matching sel
+def OPEN_ROW(sel):
+    return "document.querySelector('#ck-needs " + sel + "').click(); 1"
 # a consent chip is drawn as its tool and gains its first words when the request body loads (async): wait for both of
 # _waiting's consent chips (an empty list would pass .every before the bar is drawn)
 CHIPS_FILLED = ("(l => l.length === 2 && l.every(b => b.textContent.includes(' ')))("
@@ -52,7 +57,7 @@ def test_the_strip_lists_what_waits_loudest_first_and_a_bare_install_has_no_stri
             {"until": "document.querySelector('.ck-widgets .ck-card.w')"},
             {"eval": "new Promise(r => setTimeout(() => r(1), 800))"},
             {"eval": "(() => { const n = document.getElementById('ck-needs'); const b = document.getElementById('ck-band');"
-                     " return [!n || n.hidden || n.offsetHeight === 0, document.querySelectorAll('.needs-card').length,"
+                     " return [!n || n.hidden || n.offsetHeight === 0, document.querySelectorAll('.needs-row').length,"
                      " !!n && /needs you/i.test(n.innerText) && n.offsetHeight > 0, b.innerText.trim().length > 0]; })()"}])["values"][-1]
     assert bare == [True, 0, False, True], bare
     tmp2 = tmp_path / "waiting"
@@ -61,14 +66,14 @@ def test_the_strip_lists_what_waits_loudest_first_and_a_bare_install_has_no_stri
     _root, src, _ids = _install(tmp2)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         got = _drive(tmp2, f"{url}/#write_token=T", [DESKTOP, {"until": READY}, {"until": CHIPS_FILLED},
-            {"eval": f"JSON.stringify({{kinds: {CARDS}.map(c => c.dataset.needsCard), tools: {CARDS}.map(c => (c.querySelector('.consent-tool')||{{}}).textContent),"
+            {"eval": f"JSON.stringify({{kinds: {CARDS}.map(c => c.dataset.needsCard), tools: {CARDS}.map(c => (c.querySelector('.needs-row-title')||{{}}).textContent),"
                      " head: document.querySelector('#ck-needs').innerText.slice(0, 40),"
                      " order: (document.querySelector('#ck-needs .needs-order') || {textContent: ''}).textContent,"
                      " bar: [...document.querySelectorAll('#ck-needs .needs-chip-btn')].map(b => b.textContent),"
                      " above: document.getElementById('ck-needs').getBoundingClientRect().top > document.getElementById('ck-hero').getBoundingClientRect().top})"}])["values"][-1]
     got = json.loads(got)
     assert got["kinds"] == ["question", "consent", "consent"], got      # as the mock draws it: the open question first, then the clocked requests, soonest expiry first
-    assert got["tools"][1:] == ["Bash", "Write"], got
+    assert got["tools"][1].startswith("Bash ") and got["tools"][2].startswith("Write "), got   # the title is the tool and its first words
     assert got["head"].lower().startswith("needs you") and got["above"] is True, got
     assert "questions first, then soonest to expire" in got["order"].lower(), got
     # the bar (the only surface on Build and Memory) leads with the clocked requests, as the mock's Build bar does
@@ -81,7 +86,8 @@ def test_a_consent_card_carries_no_rec_and_allow_and_deny_weigh_the_same_with_th
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         got = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
-            {"eval": "(() => { const c = document.querySelector('#ck-needs .needs-consent'); const bs = [...c.querySelectorAll('.needs-btn')];"
+            {"eval": OPEN_ROW(".needs-consent")}, {"until": "document.querySelector('#levain-modal .needs-consent .needs-btn')"},
+            {"eval": "(() => { const c = document.querySelector('#levain-modal .needs-consent'); const bs = [...c.querySelectorAll('.needs-btn')];"
                      " const s = (b) => { const k = getComputedStyle(b); return [k.backgroundColor, k.color, k.borderTopColor, k.fontWeight, Math.round(b.getBoundingClientRect().width)]; };"
                      " return JSON.stringify({labels: bs.map(b => b.textContent.trim()), cls: bs.map(b => b.className), styles: bs.map(s),"
                      " rec: /\\brec\\b|recommend/i.test(c.innerText) || !!c.querySelector('[class*=rec]'),"
@@ -101,21 +107,25 @@ def test_a_question_card_keeps_its_rec_and_its_cli_line_sits_behind_details(tmp_
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
-            {"until": CARD + " && document.querySelector('#ck-needs .needs-question .question-option')"},
             {"eval": "(() => { const q = document.querySelector('#ck-needs .needs-question'); return JSON.stringify({"
+                     " title: (q.querySelector('.needs-row-title')||{}).textContent, rec: (q.querySelector('.needs-row-rec')||{}).textContent,"
+                     " controls: q.querySelectorAll('.question-option, textarea, button button').length}); })()"},
+            {"eval": "(() => { const c = " + CARD + "; return JSON.stringify({inlineCmd: !!c.querySelector('.consent-code')}); })()"},
+            {"eval": OPEN_ROW(".needs-question")},
+            {"until": "document.querySelector('#levain-modal .needs-question .question-option')"},
+            {"eval": "(() => { const q = document.querySelector('#levain-modal .needs-question'); return JSON.stringify({"
                      " recText: /REC\\s+hold\\./.test(q.innerText), title: (q.querySelector('.needs-q-title')||{}).textContent, recBtn: [...q.querySelectorAll('.question-option')].map(b => [b.textContent, b.classList.contains('question-rec')]),"
                      " words: !!q.querySelector('.question-words')}); })()"},
-            {"eval": "(() => { const c = " + CARD + "; return JSON.stringify({hasOpen: !!c.querySelector('.needs-open'), inlineCmd: !!c.querySelector('.consent-code')}); })()"},
-            {"eval": CARD + ".querySelector('.needs-open').click(); 1"},
+            {"eval": OPEN_ROW(".needs-consent")},
             {"until": "document.querySelector('#levain-modal .needs-terminal .consent-code')"},
             {"eval": "JSON.stringify({cmd: document.querySelector('#levain-modal .needs-terminal .consent-code').textContent})"}])["values"]
-    q, before, after = json.loads(out[-5]), json.loads(out[-4]), json.loads(out[-1])
+    row, inline, q, after = json.loads(out[-8]), json.loads(out[-7]), json.loads(out[-4]), json.loads(out[-1])
+    assert row["title"] == "Ship the sweep fix tonight or hold it?" and row["rec"] == "rec hold" and row["controls"] == 0, row
     assert q["title"] == "Ship the sweep fix tonight or hold it?", q
     assert not any("recommended" in b[0] for b in q["recBtn"]), q          # the fill and the REC line say it
     assert q["recText"] and q["words"] and ["hold", True] == [q["recBtn"][1][0].split(" ")[0], q["recBtn"][1][1]] and q["recBtn"][0][1] is False, q
-    # The K-polish pass (Phill L2: "each should either be scrollable or open into a model with all info well organized") moved the CLI
-    # route from an inline disclosure to the card's "Open" row: the strip card carries no command, the focus view does.
-    assert before == {"hasOpen": True, "inlineCmd": False}, before
+    # the strip row carries no command and no control; the focus view carries the CLI route and the decision
+    assert inline == {"inlineCmd": False}, inline
     assert after["cmd"].startswith("levain consent answer "), after
 
 

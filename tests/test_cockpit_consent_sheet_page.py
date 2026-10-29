@@ -141,10 +141,13 @@ def test_a_consent_answer_signs_in_the_sheet_and_the_queue_verifies_it(tmp_path:
 @needs_ssh
 def test_the_needs_card_allow_opens_the_sheet_with_allow_picked_and_one_tap_signs(tmp_path: Path, monkeypatch) -> None:
     rig = _ConsentRig(tmp_path, monkeypatch)
-    allow = "document.querySelector('#ck-needs .needs-consent [data-consent-sheet=\"allow\"]')"
+    allow = "document.querySelector('#levain-modal .needs-consent [data-consent-sheet=\"allow\"]')"
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
+            # the decision controls live in the item's focus view: open it from the strip row first
+            {"until": "document.querySelector('#ck-needs .needs-consent')", "ms": 30000},
+            {"eval": "document.querySelector('#ck-needs .needs-consent').click() || 1"},
             {"until": f"{allow} && 1", "ms": 30000},
             {"eval": f"{allow}.click() || 1"},
             {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state", "ms": 30000},
@@ -155,10 +158,10 @@ def test_the_needs_card_allow_opens_the_sheet_with_allow_picked_and_one_tap_sign
                       f"{IN}.getElementById('sheet-note').textContent", "ms": 30000},
         ])
     v = out["values"]
-    assert v[2] == "open", v
-    assert v[3].startswith(f"/sign/consent/{rig.enc()}#v=") and v[3].endswith("&choice=allow"), v
-    assert v[4] == "Sign (allow)", v
-    assert str(v[6]).startswith("signed (allow)"), v
+    assert v[4] == "open", v
+    assert v[5].startswith(f"/sign/consent/{rig.enc()}#v=") and v[5].endswith("&choice=allow"), v
+    assert v[6] == "Sign (allow)", v
+    assert str(v[8]).startswith("signed (allow)"), v
     assert rig.state() == "allowed"
 
 
@@ -208,11 +211,14 @@ def test_a_t3_cards_allow_never_opens_a_sheet_that_offers_only_deny(tmp_path: Pa
     """L3 r1 C3: a passkey cannot allow a T3 request, so the card's Allow keeps the terminal line (copied, as before the
     sheet) and only Deny opens the sheet: Allow must never open a sheet whose only option is Deny."""
     rig = _ConsentRig(tmp_path, monkeypatch, tier="T3")
-    card = "document.querySelector('#ck-needs .needs-consent')"
+    card = "document.querySelector('#levain-modal .needs-consent')"
     btn = card + ".querySelector('.needs-btn[data-label=\"{}\"]')"
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
+            # the decision controls live in the item's focus view: open it from the strip row first
+            {"until": "document.querySelector('#ck-needs .needs-consent')", "ms": 30000},
+            {"eval": "document.querySelector('#ck-needs .needs-consent').click() || 1"},
             {"until": f"{btn.format('Deny')} && {btn.format('Allow')} && 1", "ms": 30000},
             {"eval": f"{btn.format('Allow')}.dataset.consentSheet || ''"},
             {"eval": f"{btn.format('Deny')}.dataset.consentSheet || ''"},
@@ -222,7 +228,7 @@ def test_a_t3_cards_allow_never_opens_a_sheet_that_offers_only_deny(tmp_path: Pa
             {"until": f"{FRAME} && {FRAME}.getAttribute('src')", "ms": 30000, "may_timeout": True},
         ])
     v = out["values"]
-    assert (v[1], v[2]) == ("", "deny"), v          # Allow is the terminal line; Deny is the sheet's
-    assert isinstance(v[4], dict) and "timeout" in v[4], v      # Allow opened no sheet
-    assert str(v[6]).endswith("&choice=deny"), v
+    assert (v[3], v[4]) == ("", "deny"), v          # Allow is the terminal line; Deny is the sheet's
+    assert isinstance(v[6], dict) and "timeout" in v[6], v      # Allow opened no sheet
+    assert str(v[8]).endswith("&choice=deny"), v
     assert rig.state() == "pending"

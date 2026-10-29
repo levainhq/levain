@@ -181,8 +181,8 @@ def test_waiting_on_you_is_read_from_the_queue_and_the_band_not_stored(store, qd
     qs = QuestionStore(qdir)
     q = qs.file(agent="claude_code", agent_session_id="sess-1", what="which branch?",
                 options=[("a", "main"), ("b", "other")], rec="a", blocks="the land", cwd="/work/proj")
-    review.push_sign(store, t.thread_id, req.id, "land the fix onto main", onto="main")
-    review.push_answer(store, t.thread_id, q.id, "which branch?")
+    review.push_sign(store, t.thread_id, req.id, "land the fix onto main", onto="main", rec=review.NO_REC)
+    review.push_answer(store, t.thread_id, q.id, "which branch?", rec=review.NO_REC)
     sign_open, answer_open = review.queue_request_open(qdir, clock=clock), review.question_open(qdir)
     w = review.waiting_on_you(store, sign_open=sign_open, answer_open=answer_open)
     assert sorted(r["kind"] for r in w["threads"][t.thread_id]) == ["answer", "sign"] and not w["unresolved"]
@@ -195,7 +195,7 @@ def test_waiting_on_you_is_read_from_the_queue_and_the_band_not_stored(store, qd
 
 def test_a_record_whose_state_cannot_be_read_is_unresolved_never_closed(store, qdir, clock):
     _d, t = _thread(store)
-    review.push_sign(store, t.thread_id, "no-such-request", "land it")
+    review.push_sign(store, t.thread_id, "no-such-request", "land it", rec=review.NO_REC)
     w = review.waiting_on_you(store, sign_open=review.queue_request_open(qdir, clock=clock),
                               answer_open=review.question_open(qdir))
     assert [r["ref_id"] for r in w["unresolved"]] == ["no-such-request"] and w["threads"] == {}
@@ -204,8 +204,8 @@ def test_a_record_whose_state_cannot_be_read_is_unresolved_never_closed(store, q
 def test_the_same_request_is_recorded_once(store, qdir, cq):
     _d, t = _thread(store)
     req = _request(cq)
-    first = review.push_sign(store, t.thread_id, req.id, "land it")
-    assert review.push_sign(store, t.thread_id, req.id, "land it") == (first[0], False)
+    first = review.push_sign(store, t.thread_id, req.id, "land it", rec=review.NO_REC)
+    assert review.push_sign(store, t.thread_id, req.id, "land it", rec=review.NO_REC) == (first[0], False)
     assert sqlite3.connect(store.path).execute("SELECT COUNT(*) FROM replies WHERE kind = 'sign'").fetchone()[0] == 1
 
 
@@ -213,13 +213,13 @@ def test_one_open_land_sign_per_thread_and_onto(store, qdir, cq, clock):
     _d, t = _thread(store)
     old, new = _request(cq, "git push 1"), _request(cq, "git push 2")
     sign_open = review.queue_request_open(qdir, clock=clock)
-    review.push_sign(store, t.thread_id, old.id, "land", onto="main", still_open=sign_open)
+    review.push_sign(store, t.thread_id, old.id, "land", onto="main", still_open=sign_open, rec=review.NO_REC)
     with pytest.raises(CoordError, match="already has an open land SIGN"):
-        review.push_sign(store, t.thread_id, new.id, "land again", onto="main", still_open=sign_open)
-    review.push_sign(store, t.thread_id, new.id, "another branch", onto="other", still_open=sign_open)   # other onto
+        review.push_sign(store, t.thread_id, new.id, "land again", onto="main", still_open=sign_open, rec=review.NO_REC)
+    review.push_sign(store, t.thread_id, new.id, "another branch", onto="other", still_open=sign_open, rec=review.NO_REC)   # other onto
     assert cq.withdraw(old.id)                       # MOVED BASE: the re-file withdraws the older one first
     assert review.push_sign(store, t.thread_id, _request(cq, "git push 3").id, "land", onto="main",
-                            still_open=sign_open)[1] is True
+                            still_open=sign_open, rec=review.NO_REC)[1] is True
 
 
 # --- the feeds -----------------------------------------------------------------------------------------------
@@ -371,20 +371,20 @@ def test_f3_a_lapsed_envelope_with_no_item_is_filed_and_a_bad_stamp_skips_only_t
 def test_f4_a_land_sign_is_refused_unless_the_state_reader_says_closed(store, qdir, cq, clock):
     _d, t = _thread(store)
     old, new, third = _request(cq, "git push 1"), _request(cq, "git push 2"), _request(cq, "git push 3")
-    review.push_sign(store, t.thread_id, old.id, "land", onto="main", still_open=review.queue_request_open(qdir, clock=clock))
+    review.push_sign(store, t.thread_id, old.id, "land", onto="main", still_open=review.queue_request_open(qdir, clock=clock), rec=review.NO_REC)
     with pytest.raises(CoordError):                                     # no reader at all
-        review.push_sign(store, t.thread_id, new.id, "land again", onto="main")
+        review.push_sign(store, t.thread_id, new.id, "land again", onto="main", rec=review.NO_REC)
     with pytest.raises(CoordError):                                     # a reader that cannot tell
-        review.push_sign(store, t.thread_id, new.id, "land again", onto="main", still_open=lambda _r: None)
+        review.push_sign(store, t.thread_id, new.id, "land again", onto="main", still_open=lambda _r: None, rec=review.NO_REC)
     assert cq.withdraw(old.id)
     assert review.push_sign(store, t.thread_id, third.id, "land", onto="main",
-                            still_open=review.queue_request_open(qdir, clock=clock))[1] is True
+                            still_open=review.queue_request_open(qdir, clock=clock), rec=review.NO_REC)[1] is True
 
 
 def test_f4_the_reader_runs_outside_the_dispatch_write_transaction(store, qdir, cq, clock):
     _d, t = _thread(store)
     old, new = _request(cq, "git push 1"), _request(cq, "git push 2")
-    review.push_sign(store, t.thread_id, old.id, "land", onto="main", still_open=review.queue_request_open(qdir, clock=clock))
+    review.push_sign(store, t.thread_id, old.id, "land", onto="main", still_open=review.queue_request_open(qdir, clock=clock), rec=review.NO_REC)
     cq.withdraw(old.id)
     seen = []
 
@@ -399,7 +399,7 @@ def test_f4_the_reader_runs_outside_the_dispatch_write_transaction(store, qdir, 
         finally:
             c.close()
         return False
-    review.push_sign(store, t.thread_id, new.id, "land", onto="main", still_open=reader)
+    review.push_sign(store, t.thread_id, new.id, "land", onto="main", still_open=reader, rec=review.NO_REC)
     assert seen == ["free"]
 
 
@@ -457,8 +457,8 @@ def test_f7_a_split_that_lands_between_scan_and_insert_files_nothing(store, cloc
 def test_f8_a_bad_questions_store_leaves_the_other_sign_records_showing(store, qdir, cq, clock):
     _d, t = _thread(store)
     req = _request(cq)
-    review.push_sign(store, t.thread_id, req.id, "land it")
-    review.push_answer(store, t.thread_id, "q-1", "which?")
+    review.push_sign(store, t.thread_id, req.id, "land it", rec=review.NO_REC)
+    review.push_answer(store, t.thread_id, "q-1", "which?", rec=review.NO_REC)
     (qdir / "questions.db").write_bytes(b"garbage" * 200)
     w = review.waiting_on_you(store, sign_open=review.queue_request_open(qdir, clock=clock), answer_open=review.question_open(qdir))
     assert [r["kind"] for r in w["threads"][t.thread_id]] == ["sign"]
@@ -468,7 +468,7 @@ def test_f8_a_bad_questions_store_leaves_the_other_sign_records_showing(store, q
 def test_f9_an_expired_request_is_not_waiting_on_you(store, qdir, cq, clock):
     _d, t = _thread(store)
     req = _request(cq)                                          # a five minute hold
-    review.push_sign(store, t.thread_id, req.id, "land it")
+    review.push_sign(store, t.thread_id, req.id, "land it", rec=review.NO_REC)
     so = review.queue_request_open(qdir, clock=clock)
     w = review.waiting_on_you(store, sign_open=so, answer_open=review.question_open(qdir))
     assert t.thread_id in w["threads"]

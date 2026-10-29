@@ -39,7 +39,7 @@ PATCH_REPLY = ("(() => {{ const real = window.fetch; let armed = true; window.fe
                "return p.then((r) => r.json()).then((b) => new Response(JSON.stringify({replace} ? {patch} : "
                "Object.assign(b, {patch})), {{ status: 200, headers: {{ 'Content-Type': 'application/json' }} }})); }} "
                "return p; }}; return 1; }})()")
-BUTTONS = "[...document.querySelectorAll('#ck-needs .needs-question .sign-option')].map((b) => b.disabled)"
+BUTTONS = "[...document.querySelectorAll('#levain-modal .needs-question .sign-option')].map((b) => b.disabled)"
 AFTER = "new Promise((r) => setTimeout(() => r(1), {ms}))"
 
 
@@ -119,7 +119,7 @@ def test_h4_a_malformed_challenge_is_named_and_no_passkey_is_asked(tmp_path, mon
             {"until": f"/nothing was signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"until": f"!{OPTION_B}.disabled && 1", "ms": 5000},
             _patch("/challenge", {"challenge": "no+such/text="}),
-            {"eval": f"(() => {{ document.querySelector('#ck-needs .needs-question .sign-note').textContent = ''; "
+            {"eval": f"(() => {{ document.querySelector('#levain-modal .needs-question .sign-note').textContent = ''; "
                      f"{OPTION_B}.click(); return 1; }})()"},
             {"until": f"/nothing was signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": "window.__gets.length"},
@@ -190,3 +190,33 @@ def test_h8_a_signed_reply_missing_its_fields_prints_what_was_sent_and_never_und
     assert "undefined" not in said, said
     assert said.startswith("signed (b) · by " + rig.pk.key.fingerprint + ": levain-sign-choice/1 chosen (b)"), said
     assert rig.verifies(QRID)
+
+
+# --- the focus view closed and opened again while an attempt is in flight ---------------------------------------------
+
+
+@needs_browser
+@needs_ssh
+def test_a_focus_view_opened_again_mid_attempt_shows_the_frozen_card_and_gives_it_back_with_the_original(tmp_path, monkeypatch) -> None:
+    """An answer that never left the page is "not sure" until a second read finds the version open. The card is built
+    again when the focus view is closed and opened: while the attempt is in flight it is drawn frozen, never with live
+    buttons, and it comes back with the first card once the second read releases it."""
+    rig = _Rig(tmp_path, monkeypatch)
+    close = "(document.querySelector('#levain-modal .modal-close').click(), 1)"
+    reopen = "(document.querySelector('#ck-needs .needs-row.needs-question').click(), 1)"
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            *_card(rig),
+            {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
+            {"eval": f"{OPTION_B}.click() || 1"},
+            {"until": f"/not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
+            {"eval": close},
+            {"eval": reopen},
+            {"until": "document.querySelector('#levain-modal .needs-question .sign-option') && 1", "ms": 20000},
+            {"eval": BUTTONS},
+            {"until": f"!{OPTION_B}.disabled && 1", "ms": 8000},
+            {"eval": BUTTONS},
+        ])
+    v = out["values"]
+    assert v[9] == [True, True, True], v[9]               # drawn frozen while the attempt is in flight
+    assert v[11] == [False, False, False], v[11]          # released by the second read, this card too

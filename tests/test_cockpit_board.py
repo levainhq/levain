@@ -1,0 +1,300 @@
+"""C12: the read-only board. Columns derived from C13's list (+ its journal) and the band; every card carries its journal
+line; no write route; the route passes the header walk; unreadable sources are reported, never hidden."""
+from __future__ import annotations
+
+import http.client
+import json
+import shutil
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from levain.cockpit import board
+from levain.consent.questions import QuestionStore
+from levain.coordinator import ready
+from levain.coordinator.store import CoordStore
+from tests.test_cockpit_k2a import TOKEN, _install, _serve
+from tests.test_cockpit_questions import OPTIONS, _file
+from tests.test_cockpit_questions import lh  # noqa: F401  (fixture)
+
+ORDER = ["backlog", "ready", "running", "waiting", "needs-you", "done"]
+
+
+def _cards(out):
+    return {c["id"]: (col["category"], c) for col in out["columns"] for c in col["cards"]}
+
+
+@pytest.fixture
+def qdir(tmp_path):
+    d = tmp_path / "q"
+    d.mkdir(mode=0o700)
+    return d
+
+
+@pytest.fixture
+def filled(qdir):
+    st = CoordStore(qdir)
+    tok = st.coord_take()
+    kw = dict(repo="levain", who="desk", why="queued it.")
+    ready.add(st, tok, "levain:a", title="Land A", to="ready", tier="sonnet", done_line="green", **kw)
+    ready.add(st, tok, "levain:b", title="Land B", to="ready", tier="sonnet", done_line="green",
+              depends_on=["levain:a"], **kw)
+    ready.add(st, tok, "levain:c", title="Later C", to="backlog", **kw)
+    ready.move(st, tok, "levain:a", to="running", who="seat-9", why="the seat took it.")
+    return qdir
+
+
+def test_empty_store_is_no_queue_yet_with_six_columns(qdir):
+    out = board.build(qdir, QuestionStore(qdir))
+    assert [c["category"] for c in out["columns"]] == ORDER and all(c["cards"] == [] for c in out["columns"])
+    assert out["queue"] == "none" and out["note"] == board.NO_QUEUE and out["unreadable"] == []
+    assert not (qdir / "dispatch.db").exists()            # reading made nothing
+    assert board.build(None, None)["queue"] == "none"
+
+
+def test_columns_are_derived_in_order_from_the_lists_categories(filled):
+    out = board.build(filled, QuestionStore(filled))
+    by = _cards(out)
+    assert by["levain:a"][0] == "running" and by["levain:b"][0] == "backlog" and by["levain:c"][0] == "backlog"
+    assert by["levain:b"][1]["held_reason"] == "depends on levain:a"
+    assert out["queue"] == "ok" and out["unreadable"] == []
+
+
+def test_each_card_carries_its_last_journal_line(filled):
+    by = _cards(board.build(filled, QuestionStore(filled)))
+    a = by["levain:a"][1]["journal"]
+    assert (a["who"], a["why"], a["source"], a["to_category"], a["from_category"]) == \
+        ("seat-9", "the seat took it.", "move", "running", "ready") and a["iso"]
+    c = by["levain:c"][1]["journal"]
+    assert (c["who"], c["source"], c["from_category"]) == ("desk", "add", None)
+    assert all(card["journal"] is not None for _, card in by.values())
+
+
+def test_needs_you_is_the_bands_items_and_nothing_else(filled):
+    qs = QuestionStore(filled)
+    _file(qs)
+    out = board.build(filled, qs)
+    col = next(c for c in out["columns"] if c["category"] == "needs-you")
+    assert col["count"] == 1 and col["cards"][0]["band"] is True and "Ship the sweep fix" in col["cards"][0]["title"]
+    assert col["cards"][0]["journal"] is None
+    assert not any(cat == "needs-you" for cat, c in _cards(out).values() if not c.get("band"))
+
+
+def test_an_unreadable_store_is_reported_not_empty(qdir):
+    (qdir / "dispatch.db").write_bytes(b"not a database at all, sixteen+ bytes")
+    out = board.build(qdir, QuestionStore(qdir))
+    assert "coordinator" in out["unreadable"] and out["queue"] == "unreadable" and out["note"] != board.NO_QUEUE
+
+
+def test_an_unreadable_band_is_reported_with_the_hint(filled):
+    out = board.build(filled, None)
+    assert "band" in out["unreadable"] and "levain band" in out["note"]
+    (filled / "questions.db").write_bytes(b"garbage garbage garbage garbage")
+    out = board.build(filled, QuestionStore(filled))
+    assert "band" in out["unreadable"]
+
+
+def test_an_unreadable_journal_is_reported_and_cards_stay(filled, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("gone")
+    monkeypatch.setattr(ready, "journal", boom)
+    out = board.build(filled, QuestionStore(filled))
+    assert "journal" in out["unreadable"] and _cards(out)["levain:a"][1]["journal"] is None
+
+
+def test_build_writes_nothing(filled):
+    before = (filled / "dispatch.db").read_bytes()
+    board.build(filled, QuestionStore(filled))
+    assert (filled / "dispatch.db").read_bytes() == before
+
+
+# ------------------------------------------------------------------------------------------ the route
+def _raw(base, path, method="GET", token=TOKEN, body=None):
+    host, port = base.removeprefix("http://").split(":")
+    c = http.client.HTTPConnection(host, int(port), timeout=10)
+    h = {"X-Levain-Write-Token": token} if token else {}
+    if body is not None:
+        h["Content-Type"] = "application/json"
+    c.request(method, path, body=body, headers=h)
+    r = c.getresponse()
+    return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
+
+
+def test_route_serves_the_board_behind_the_token(tmp_path, lh):
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = CoordStore(lh)
+    tok = st.coord_take()
+    ready.add(st, tok, "levain:a", repo="levain", title="Land A", to="ready", tier="sonnet", done_line="g",
+              who="desk", why="queued it.")
+    _file(QuestionStore(lh))
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        status, _h1, _b = _raw(base, board.BOARD_PATH, token=None)
+        assert status == 403
+        status, hdrs, data = _raw(base, board.BOARD_PATH)
+        assert status == 200 and hdrs["cache-control"] == "private, no-store"
+        body = json.loads(data)
+        by = _cards(body)
+        assert by["levain:a"][0] == "ready" and by["levain:a"][1]["journal"]["why"] == "queued it."
+        assert sum(c["count"] for c in body["columns"] if c["category"] == "needs-you") == 1
+
+
+def _snapshot(d):
+    return sorted((str(p.relative_to(d)), p.stat().st_mtime_ns, p.read_bytes() if p.is_file() else None) for p in d.rglob("*"))
+
+
+def test_route_with_no_store_is_200_no_queue_and_creates_nothing(tmp_path, lh):
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (lh / "marker").write_text("x")
+    before = _snapshot(lh)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        status, _hd, data = _raw(base, board.BOARD_PATH)
+        assert status == 200 and json.loads(data)["queue"] == "none"
+        assert _snapshot(lh) == before and not (lh / "dispatch.db").exists()
+        # control: the server really reads `lh` (a store made there is seen), so the assertion above is not vacuous
+        st = CoordStore(lh)
+        ready.add(st, st.coord_take(), "levain:a", repo="levain", title="A", to="backlog", who="desk", why="w.")
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["queue"] == "ok"
+
+
+def test_the_tell_box_is_offered_only_when_the_drop_writes_where_the_board_reads(tmp_path, qdir):
+    other = tmp_path / "other"
+    other.mkdir()
+    assert board.build(qdir, None, drop_dir=qdir)["tell"]["offered"] is True
+    off = board.build(qdir, None, drop_dir=other)["tell"]
+    assert off["offered"] is False and "different queue" in off["why"]
+    assert board.build(qdir, None)["tell"]["offered"] is False
+    assert board.build(None, None, drop_dir=qdir)["tell"]["offered"] is False
+
+
+def test_route_pins_the_tell_to_the_board_directory(tmp_path, lh):
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    other = tmp_path / "other"
+    other.mkdir()
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, httpd):
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["tell"]["offered"] is False       # no drop route here
+        httpd.coord_sheet = SimpleNamespace(queue_dir=other, close=lambda: None)
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["tell"]["offered"] is False       # a different queue
+        httpd.coord_sheet = SimpleNamespace(queue_dir=lh, close=lambda: None)
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["tell"]["offered"] is True        # the same one
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH"])
+def test_no_write_reaches_the_board(tmp_path, lh, method):
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = CoordStore(lh)
+    ready.add(st, st.coord_take(), "levain:a", repo="levain", title="A", to="backlog", who="desk", why="w.")
+    before = _snapshot(lh)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        status, _hd, data = _raw(base, board.BOARD_PATH, method=method, body=b"{}")
+    assert _snapshot(lh) == before
+    assert status in (404, 405, 422, 501) or 400 <= status < 500      # refused (an unhandled verb is 501), never a 200/500
+    assert b'"columns"' not in data
+
+
+def test_the_view_script_is_served_as_app_shell(tmp_path):
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        status, hdrs, data = _raw(base, "/board_view.js", token=None)
+        _s, _h2, page = _raw(base, "/", token=None)
+    assert status == 200 and hdrs["content-type"].startswith("text/javascript")
+    assert b'<script src="/board_view.js"></script>' in page
+    assert b"innerHTML" not in data and b"draggable" not in data
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_tell_box_behaves_under_node():
+    """The box's behaviour, run: only the drop endpoint is posted to, and only on a click that passes every gate."""
+    root = Path(__file__).resolve().parent.parent
+    run = subprocess.run(["node", str(root / "tests" / "js_board_tell_harness.js"),
+                          str(root / "levain" / "templates" / "web" / "board_view.js")],
+                         capture_output=True, text=True, timeout=60, check=True)
+    out = json.loads(run.stdout)
+    assert out["not_offered"]["posts"] == [] and out["not_offered"]["reads"] == 0 and out["not_offered"]["wordsHidden"]
+    assert out["unreadable"]["posts"] == [] and "store locked" in out["unreadable"]["say"]      # unreadable is not "no store"
+    assert len(out["double_click"]["posts"]) == 1 and out["double_click"]["reads"] == 1          # locked before the await
+    assert len(out["no_store_yet"]["posts"]) == 1 and out["no_store_yet"]["posts"][0]["store_id"] is None
+    edited = out["edited_pending"]["posts"]
+    assert len(edited) == 1 and edited[0]["words"] == "B" and edited[0]["outbox_id"] != "ph-old"   # edited words: new id
+    same = out["same_pending"]["posts"]
+    assert len(same) == 1 and same[0]["outbox_id"] == "ph-old" and out["same_pending"]["reads"] == 0
+
+
+def _tell_run():
+    root = Path(__file__).resolve().parent.parent
+    run = subprocess.run(["node", str(root / "tests" / "js_board_tell_harness.js"),
+                          str(root / "levain" / "templates" / "web" / "board_view.js")],
+                         capture_output=True, text=True, timeout=60, check=True)
+    return json.loads(run.stdout)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_compose_fragment_prefills_the_words_and_posts_nothing_by_itself():
+    """`#board&compose=re%20<id>%3A%20` starts the box's words: editable, focused, cursor at the end, nothing posted or read."""
+    out = _tell_run()
+    p = out["prefill"]
+    assert p["pre"]["value"] == "re c-12: " and p["pre"]["focused"] == 1 and p["pre"]["sel"] == [9, 9]
+    assert p["posts"] == [] and p["reads"] == 0 and p["pre"]["posts"] == 0 and p["pre"]["reads"] == 0   # no send by itself
+    assert out["prefill_plus"]["pre"]["value"] == "re c-12: "          # the address rewritten with "+" for spaces reads the same
+    e = out["prefill_edit"]                                             # the operator's edit goes out through the one drop route
+    assert len(e["posts"]) == 1 and e["posts"][0]["words"] == "re c-12: do it" and e["posts"][0]["outbox_id"].startswith("ph-")
+    assert out["no_hash"]["pre"]["value"] == "" and out["no_hash"]["pre"]["focused"] == 0
+    assert out["kept_wins"]["pre"]["value"] == "A"                      # an undelivered earlier drop is never overwritten
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_prefill_reads_no_storage_and_no_token():
+    """A token beside the fragment is not read specially; the prefill path touches only the box's own pending key."""
+    out = _tell_run()
+    t = out["prefill_token"]
+    assert t["pre"]["value"] == "re x: " and "SECRET123" not in json.dumps({k: v for k, v in t.items() if k not in ("hash", "hashAfterMount")})
+    assert t["hash"] == "#write_token=SECRET123"          # the token part of the address is left exactly as it was
+    assert set(t["keysRead"]) <= {"levain-board-drop-pending"} and t["posts"] == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_hostile_fragment_stays_inert_plain_text():
+    """Markup is a value, never parsed; a long value is cut; a malformed % and control characters do not throw."""
+    out = _tell_run()
+    assert out["hostile_markup"]["pre"]["value"] == "<img src=x onerror=alert(1)>" and out["hostile_markup"]["posts"] == []
+    assert len(out["hostile_long"]["pre"]["value"]) == 300
+    assert isinstance(out["hostile_malformed"]["pre"]["value"], str) and out["hostile_malformed"]["posts"] == []
+    assert out["hostile_control"]["pre"]["value"] == "a b c"
+    src = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "board_view.js").read_text()
+    assert "innerHTML" not in src
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_compose_fragment_is_forgotten_only_when_the_box_is_offered_and_only_that_segment():
+    """A hidden box keeps the link in the address; an offered one drops just `compose=...`, byte-identical elsewhere."""
+    out = _tell_run()
+    assert out["board_fails"]["hash"] == "#board&compose=re%20x%3A%20"          # a 403 board read: the words are not lost
+    assert out["not_offered_hash"]["hash"] == "#board&compose=re%20x%3A%20"     # telling off: the link stays for later
+    assert out["hash_other_params"]["hash"] == "#board&write_token=a%2Bb+c&z"   # nothing else re-encoded, no `board=`
+    assert out["hash_bare_board"]["hash"] == "#board"
+    assert out["hash_only_compose"]["hash"] == ""
+    assert out["hash_bare_board"]["hashAfterMount"] == "#board"                 # forgotten once offered (the mount's await)
+    assert out["kept_wins_hash"]["hash"] == "#board" and out["kept_wins_hash"]["pre"]["value"] == "A"   # beaten by kept words: spent too
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_prefill_does_not_steal_focus_and_never_splits_a_surrogate_pair():
+    out = _tell_run()
+    assert out["focus_elsewhere"]["pre"]["focused"] == 0 and out["focus_elsewhere"]["pre"]["value"] == "re x: "
+    assert out["focus_body"]["pre"]["focused"] == 1
+    v = out["surrogate"]["pre"]["value"]
+    assert v == "a" * 299 + "\U0001F600"          # 300 code points, the emoji whole (301 UTF-16 units)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_compose_link_followed_in_an_open_cockpit_fills_only_an_idle_empty_box():
+    out = _tell_run()
+    assert out["hashchange_fill"]["pre"]["value"] == "re y: " and out["hashchange_fill"]["hash"] == "#board"
+    assert out["hashchange_edited"]["pre"]["value"] == "mine"                   # unsent edits are never overwritten
+    assert out["hashchange_kept"]["pre"]["value"] == "A"                        # nor kept words
+    assert out["hashchange_fill"]["handlers"] == 1

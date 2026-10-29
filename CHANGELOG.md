@@ -13,6 +13,23 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   refusal says to. Other routes (brokered, Codex) are not checked.
 
 ### Added
+- **`levain upgrade` (hidden, like `levain session`) upgrades Levain and its root side in one command.** It runs the
+  installer that put Levain there (pip, `pip --user`, pipx or uv; it refuses and prints what to run when it cannot tell),
+  restarts itself on the new code, stops with the clean-up commands printed if a session is stuck, then runs exactly
+  `sudo <install-helper> repair --source <package>`, so the root helper's own checks (including who may write the
+  source) all still apply. It asks for your password once per run, refuses to run as root or without a terminal, and
+  `--dry-run` prints what it would run and changes nothing. It always runs the repair, even when the installer found
+  nothing newer: the repair is safe to re-run, and it is the only check of the other root rows. So every run costs a
+  password and a restart of Levain's services. The installer and sudo get only the environment they need (your
+  `PIP_*`, `UV_*`, `PIPX_*`, proxy, CA, `PYTHONUSERBASE` and session-bus settings go to the installer), never your
+  tokens or cloud keys. They run from `/`; a relative config path such as `PIP_CONFIG_FILE=./pip.conf` or
+  `NETRC=./netrc` is made absolute from your directory first. The restart onto the new code ignores the current
+  directory and gets none of your `PYTHON*` settings except `PYTHONUSERBASE` and `PYTHONNOUSERSITE`, so
+  `PYTHONPATH=.` cannot bring a local `levain/` back in. If the helper gives no result, or reports success but sudo
+  exits non-zero, it says the outcome is unknown and to run `levain upgrade --no-pip` again. The first hop from 0.11.26 is still two commands, because
+  that release has no `upgrade`: `pip install -U 'levain[isolation]'`, then `levain upgrade`. Later hops are the one
+  hidden command. It is not `levain update`, which refreshes one install directory's hooks. Covered by tests that
+  drive every path through fakes (no real installer, sudo or root helper has been run by them).
 - **`levain session claude|codex --auth passthrough` (no `--login`) is no longer refused at launch.** The launcher
   accepts it for both vendors; if the start step then refuses because the slot's stored login answers as a different
   account, the supervisor says which account (from Levain's own session record, never the session's terminal output)

@@ -160,7 +160,7 @@ def test_a_refused_user_verification_signs_nothing_and_the_option_signs_again(tm
 
 FRAME = "document.getElementById('levain-sign-sheet-frame')"
 IN = f"({FRAME} && {FRAME}.contentDocument)"
-OPEN_SHEET = "document.querySelector('#ck-needs .needs-question .sign-facet .sign-sheet-open')"
+OPEN_SHEET = "document.querySelector('#levain-modal .needs-question .sign-facet .sign-sheet-open')"
 
 
 @needs_browser
@@ -782,8 +782,8 @@ def test_h20_one_open_read_while_the_answer_is_still_landing_keeps_the_sheet_fro
 
 # --- landing integration fixes (I1-I7) ------------------------------------------------------------------------------
 
-CARD_OPTION_A = "document.querySelector('#ck-needs .needs-question .sign-facet .sign-option')"
-CARD_NOTE = "document.querySelector('#ck-needs .needs-question .sign-facet .sign-note').textContent"
+CARD_OPTION_A = "document.querySelector('#levain-modal .needs-question .sign-facet .sign-option')"
+CARD_NOTE = "document.querySelector('#levain-modal .needs-question .sign-facet .sign-note').textContent"
 PARENT_X = "document.querySelector('#levain-sign-sheet .modal-close')"
 
 
@@ -815,11 +815,12 @@ def test_i1_an_open_sheet_holds_the_lease_so_a_card_tap_asks_for_no_challenge(tm
             {"eval": PARENT_X + ".click() || 1"},
             {"until": f"!{FRAME} && 1", "ms": 5000},
             {"eval": f"{CARD_OPTION_A}.click() || 1"},
-            {"until": f"/asking|confirm|challenge/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 30000, "may_timeout": True},
+            # a settle only: the virtual authenticator answers at once, so the note passes through "asking" and on to its
+            # final text between polls on a slow runner (run 40685220828); the proof the tap ran is the challenge POST below
+            {"until": f"/asking|confirm|challenge/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 5000, "may_timeout": True},
         ])
     v = out["values"]
     assert "already being asked for" in v[-5], v                   # while the sheet is up the tap does nothing
-    assert not isinstance(v[-1], dict), v                         # and after it closed the lease is back: the tap runs
     challenges = [p for p in out["posts"] if p.split(" ", 1)[0].endswith("/challenge")]
     assert len(challenges) == 1, out["posts"]
 

@@ -127,14 +127,23 @@ def allowed_env(environ) -> dict:
     return out
 
 
-def child_env(*names: str, prefixes: tuple[str, ...] = ()) -> dict[str, str]:
+SEAT_ENV = "LEVAIN_SEAT"
+SEATS = ("autonomous", "attended")
+
+
+def child_env(*names: str, prefixes: tuple[str, ...] = (), seat: str | None = None) -> dict[str, str]:
     """The environment for a child levain starts: the allowlist, plus the carried ``names`` and
     ``prefixes`` that child needs (a git push needs the proxy variables, say). Never the whole of
     ``os.environ``: whatever a child is given sits in ITS exec-time block while it runs, readable by
-    every process of this user."""
+    every process of this user. ``seat`` (``autonomous`` | ``attended``) marks a seat levain starts, as
+    ``LEVAIN_SEAT`` (the NEEDS YOU band's D4 marker); None leaves any marker the operator set on this process."""
     env = allowed_env(os.environ)
     env.update({k: v for k, v in os.environ.items()
                 if k in names or (prefixes and k.startswith(prefixes))})
+    if seat is not None:
+        if seat not in SEATS:
+            raise ValueError(f"seat is one of {', '.join(SEATS)}")
+        env[SEAT_ENV] = seat
     return env
 
 

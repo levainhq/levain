@@ -28,8 +28,9 @@ from tests._h4 import h4_home
 
 NARROW = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
 LONG_PATH = "/repos/o/r/git/refs/" + "a" * 400 + "/tail-end"
-CARD = ("[...document.querySelectorAll('#ck-needs .needs-consent')]"
-        ".find(c => (c.querySelector('.consent-tool') || {}).textContent === 'levain_egress' && c.querySelector('.egress-kv'))")
+# the strip draws one summary row per waiting item; the card itself (with its egress rows) is drawn only in the item's focus view
+CARD = "document.querySelector('#levain-modal .needs-consent.is-full')"
+STRIP_ROW = "[...document.querySelectorAll('#ck-needs .needs-consent')]"
 HIDDEN = r"/[\u0000-\u001f\u007f-\u009f؜​-‏‪-‮⁠-⁩﻿]/"
 
 
@@ -49,7 +50,7 @@ def test_a_hostile_egress_card_draws_as_text_rows_with_the_removed_names_before_
     monkeypatch.setenv("LEVAIN_HOME", str(home))
     (home / "consent").mkdir(parents=True, mode=0o700)
     q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
-    file_card(q, _hostile("0b6f5f3e-3c1d-4c8e-9a3e-2d7b1f0c9a11"), agent_session_id="s", cwd="/w")
+    pending = file_card(q, _hostile("0b6f5f3e-3c1d-4c8e-9a3e-2d7b1f0c9a11"), agent_session_id="s", cwd="/w")
     gone = file_card(q, _hostile("1c7a6f4e-4d2e-4f9f-8b4f-3e8c2a1d0b22"), agent_session_id="s", cwd="/w")
     q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": "ls"}, cwd="/w",
            hold=timedelta(minutes=5), event_id="keep")    # a plain card beside it, drawn as before
@@ -67,7 +68,6 @@ def test_a_hostile_egress_card_draws_as_text_rows_with_the_removed_names_before_
             "  pwned: !!window.__pwned, state: (c.querySelector('.egress-state') || {}).textContent,"
             "  removed_above_path: top('removed') < top('path'), key_above_path: top('Levain adds your key for') < top('path'),"
             "  removed_in_view: top('removed') < window.innerHeight,"
-            "  plain_pre: [...document.querySelectorAll('#ck-needs .needs-consent')].filter(x => x.querySelector('.consent-display')).length,"
             "  card_text: c.textContent }); })()")
 
     def row_of(rid: str) -> str:
@@ -80,14 +80,28 @@ def test_a_hostile_egress_card_draws_as_text_rows_with_the_removed_names_before_
         return (f"[({row_of(rid)}.querySelector('.consent-audit') || {{}}).textContent,"
                 f" ({row_of(rid)}.querySelector('.egress-state') || {{}}).textContent]")
     tagged = row_of(gone.id)
+    pend_row = f"document.querySelector('#ck-needs .needs-consent[data-needs-id=\"consent:{pending.id}\"]')"
+    keep_row = f"([...document.querySelectorAll('#ck-needs .needs-consent')].find(r => /^Bash/.test(r.textContent)))"
     with _serve(_install(tmp_path)[1], surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             NARROW,
-            {"until": CARD},
+            {"until": pend_row},
+            {"eval": f"{pend_row}.click() || 1"},       # the row opens the item's focus view, where the card is drawn whole
+            {"until": f"{CARD} && {CARD}.querySelector('.egress-kv')"},
             # the card at the top of the phone's screen: "in view" then means on the card's first screen
             {"eval": f"(() => {{ {CARD}.scrollIntoView({{block: 'start'}}); return 1; }})()"},
             {"eval": read},
             {"shot": str(shots / "s7_card_phone.png")},
+            {"eval": "(() => { document.querySelector('#levain-modal .modal-close').click(); return 1; })()"},
+            {"until": "!document.getElementById('levain-modal')"},
+            # a plain card beside it still draws as before: its focus view carries the verbatim request
+            {"until": keep_row},
+            {"eval": f"{keep_row}.click() || 1"},
+            {"until": "document.querySelector('#levain-modal .needs-consent.is-full .consent-kv')"},
+            {"eval": "(c => c.querySelector('.egress-kv') ? -1 : [...c.querySelectorAll('.consent-kv dd')].filter(d => d.textContent === 'ls').length)"
+                     "(document.querySelector('#levain-modal .needs-consent.is-full'))"},
+            {"eval": "(() => { document.querySelector('#levain-modal .modal-close').click(); return 1; })()"},
+            {"until": "!document.getElementById('levain-modal')"},
             {"eval": OPEN_DECISIONS},
             {"until": f"{row_of(gone.id)} && {row_of(gone.id)}.querySelector('.consent-details')"},
             {"eval": open_row(gone.id)},
@@ -96,7 +110,7 @@ def test_a_hostile_egress_card_draws_as_text_rows_with_the_removed_names_before_
             {"eval": f"new Promise((res) => {{ {tagged}.scrollIntoView({{block: 'start'}}); setTimeout(() => res(1), 600); }})"},
             {"shot": str(shots / "s7_ended_phone.png")},
         ])["values"]
-    got = json.loads(out[2])
+    got = json.loads(out[4])
     assert got["dts"] == ["method", "scheme", "host", "port", "Levain adds your key for", "removed", "why it asks",
                           "held", "body bytes", "body", "header names", "query names", "path", "whole path length",
                           "whole path", "launch", "request"], got["dts"]
@@ -108,6 +122,6 @@ def test_a_hostile_egress_card_draws_as_text_rows_with_the_removed_names_before_
     assert got["removed_above_path"] and got["key_above_path"] and got["removed_in_view"], got
     assert "SECRETQUERYVALUE" not in got["card_text"] and "TOPSECRETTOKEN" not in got["card_text"], got
     assert got["state"].startswith("PENDING"), got
-    assert got["plain_pre"] == 1, got                                   # the Bash card still draws as it did
+    assert out[11] == 1, out                                            # the Bash card still draws as it did
     assert out[-3] == ["ENDED", "ENDEDended before a result: the request's client left, or its launch or Levain closed;"
                        " nothing was sent after that"], out[-3]

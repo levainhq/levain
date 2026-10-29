@@ -306,6 +306,12 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         f"--option KEY --token N {tail}` (or `--text WORDS`);",
         f"- leave the rest to him: `{lv} coord escalate N --why WHY --token N {tail}`.",
         "",
+        "## The band",
+        "",
+        "You are an attended seat, so the NEEDS YOU band is shown to you on every turn: end every reply with it "
+        "exactly as Levain gave it (never renumber, reorder, drop or answer its items), and say what each blocks. "
+        "The band is rendered for you by Levain; you never fetch or recompute it.",
+        "",
         "## Away and budgets",
         "",
         f"- when a drop says he is away (\"closing my eyes\"): `{lv} coord away DROP_ID --token N {tail}`. It sets away "
@@ -419,6 +425,39 @@ def _stop_named(exe: str, name: str, where: str, *, cwd: str, env: dict[str, str
     return f"no session named {name} was listed to stop"
 
 
+def _ours(store: CoordStore, row: dict[str, Any]) -> Any:
+    """The launch of ``store`` a listed row belongs to, or None: by the ``sessionId`` its ``active`` row recorded, else
+    by its name ``levain-<role>-<launch hex>`` in that launch's own realpath directory (L3 r1 G4)."""
+    ln = store.launch_by_harness_session(row["sessionId"]) if isinstance(row.get("sessionId"), str) else None
+    if ln is None and isinstance(row.get("name"), str) and (m := _OURS.fullmatch(row["name"])):
+        ln = store.launch("ln-" + m.group(2))
+        ln = ln if ln is not None and ln.role == m.group(1) and ln.cwd \
+            and row.get("cwd") == os.path.realpath(ln.cwd) else None
+    return ln
+
+
+def _lingering(store: CoordStore, rows: list[dict[str, Any]]) -> list[str]:
+    """The ids of the rows listed with a usable harness id that belong to a claude launch that is over (a codex launch
+    has its own daemon and never blocks a claude session)."""
+    return [h for r in rows if (h := _harness_id(r)) is not None and (ln := _ours(store, r)) is not None
+            and ln.harness == "claude" and ln.state in _OVER]
+
+
+def _handover_blocked(store: CoordStore, exe: str, env: dict[str, str]) -> str:
+    """Why a claude session must not start yet, or "" when it may: a session of a launch that is over is still listed
+    (its address would mis-route), or the list cannot be read. It is gone only when two successful reads
+    UNLISTED_RECHECK seconds apart both lack it; one partial list proves nothing."""
+    for attempt in range(2):
+        rows = _agents(exe, cwd=str(store.directory), env=env)
+        if rows is None:
+            return "`claude agents` could not be read, so no retired session is confirmed gone"
+        if stale := _lingering(store, rows):
+            return f"the session of an ended launch is still listed ({', '.join(stale)})"
+        if attempt == 0:
+            time.sleep(UNLISTED_RECHECK)
+    return ""
+
+
 def _plain(cause: str) -> str:
     """``cause`` as the one plain line ``launch_end`` takes (never refused there for its shape)."""
     flat = " ".join(unshowable.mark(" ".join(str(cause).split()), allow="").split())
@@ -485,6 +524,10 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
 
     if shutil.which("claude", path=child_env().get("PATH")) is None:
         return left("claude is not on PATH")
+    exe_, env_ = _harness()
+    held = _handover_blocked(store, exe_ or "claude", env_)
+    if held:
+        return left(f"{held}; retried when it is gone")
     got, why = store.launch_claim_spawn(launch_id, os.getpid())
     if why is not None:
         return Outcome(launch_id, False, refusal=why)
@@ -517,7 +560,7 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
     try:
         from levain.launch import child_env
 
-        env = child_env()
+        env = child_env(seat="attended")      # the coordinator is attachable: the band's D4 marker
         exe = shutil.which("claude", path=env.get("PATH"))
         if exe is None:
             return fail("claude is not on PATH")
@@ -571,7 +614,7 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
 def _harness() -> tuple[str | None, dict[str, str]]:
     from levain.launch import child_env
 
-    env = child_env()
+    env = child_env(seat="attended")
     return shutil.which("claude", path=env.get("PATH")), env
 
 
@@ -752,14 +795,7 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
                     lines.append(f"lease {held.token}: not beaten ({exc})")
     stopped: set[str] = set()
     for row in rows:
-        ln = None
-        if isinstance(row.get("sessionId"), str):
-            ln = store.launch_by_harness_session(row["sessionId"])
-        if ln is None and isinstance(row.get("name"), str) and (m := _OURS.fullmatch(row["name"])):
-            ln = store.launch("ln-" + m.group(2))
-            # by name, only in the launch's own directory (L3 r1 G4)
-            ln = ln if ln is not None and ln.role == m.group(1) and ln.cwd \
-                and row.get("cwd") == os.path.realpath(ln.cwd) else None
+        ln = _ours(store, row)
         if ln is None or ln.state not in _OVER:
             continue
         hid = _harness_id(row)

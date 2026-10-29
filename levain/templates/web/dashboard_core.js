@@ -271,6 +271,7 @@
     if (!board) return;
     proposalRead = null;   // an authoritative reload: a denial or a grant answered since must withdraw its card, not wait out the 30 s
     grantRead = null;      // and a grant revoked since leaves the grants slot
+    dispatchRead = null;   // and a dispatch job signed or cancelled since leaves the dispatch slot
     // the typed panels about to be dropped end their timers and mounts first
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.reset) window.LevainCockpitKinds.reset();
     const kept = captureKept(board);   // the rows the reader holds open, restored below once the board is drawn again
@@ -4506,6 +4507,20 @@
     line.append(code, btn);
     return line;
   }
+  // flow's provider puts the whole body into `blocks`, and the body starts with the title sentence: what `blocks` adds beyond
+  // the title is the part after it (trimmed, a trailing "?" or "." on the title ignored). The provider also prefixes the title with
+  // the asking repo ("flow: ..."), which the body does not carry, so the title is tried with that one-word prefix dropped too.
+  // "" when nothing is left.
+  function blocksBeyondTitle(title, blocks) {
+    const t = String(blocks || "").trim();
+    const full = String(title || "").trim();
+    for (const cand of [full, full.replace(/^[^\s:]{1,40}:\s+/, "")]) {
+      const w = cand.replace(/[?.\s]+$/, "");
+      // the prefix counts only at a word boundary: end of text, whitespace, or ?.: then whitespace/end ("Ship?" is not "Shipment ...")
+      if (w && t.startsWith(w) && /^(?:$|\s|[?.:](?:\s|$))/.test(t.slice(w.length))) return t.slice(w.length).replace(/^[?.:\s]+/, "");
+    }
+    return t;
+  }
   // `card` (the Needs-you strip's card) draws the mock's anatomy: the question as a bold title, "blocks: ...", then "REC key. words";
   // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
   function drawQuestionBody(q, slot, b, card) {
@@ -4522,7 +4537,8 @@
     const parts = [];
     if (card) {
       parts.push(el("div", "needs-q-title", sv(b.what)));
-      if (sv(b.blocks)) parts.push(el("div", "ext-meta needs-q-blocks", "blocks: " + sv(b.blocks)));
+      const more = blocksBeyondTitle(sv(b.what), sv(b.blocks));
+      if (more) parts.push(el("div", "ext-meta needs-q-blocks", "blocks: " + more));
       const recOpt = options.find((o) => o && sv(o.key) === sv(b.rec));
       if (sv(b.rec)) {
         const rl = el("div", "needs-rec");
@@ -4788,6 +4804,10 @@
   const signWhy = (r) => (r.body && typeof r.body.message === "string" && r.body.message) || ("refused (HTTP " + r.status + ")");
   const signNotes = new Map();     // request id -> [text, kind, sha256]: what the last ceremony said, kept across redraws
   const signWriteIns = new Map();  // request id -> {sha256, words}: a write-in being typed, kept for the version it was typed on
+  // request id -> what a card drawn while that request's attempt is in flight must undo when the attempt gives its card back.
+  // The focus view builds its card again each time it opens, so a card drawn mid-attempt is frozen (its buttons and words box
+  // disabled) and registers here; the attempt's end releases it, and a signed or unknowable one stays frozen
+  const signPending = new Map();
   let signBusy = 0;                // a ceremony (or a passkey pick) in progress: a second tap anywhere does nothing
   let signListed = null;           // {at, got}: the last listing, shared by every card of one render
   // which enrolled passkey THIS browser used: fingerprint -> credential id, so the OS prompt asks for that one. Browser
@@ -5000,6 +5020,7 @@
         if (signBusy) return say(SIGN_BUSY, "bad");   // the lease holds a second tap, never a button drawn disabled
         signBusy++;
         lock(true);
+        if (!signPending.has(id)) signPending.set(id, new Set());
         let done = "unsigned";
         let rearm = true;     // false: the card stays frozen (signed, or "not sure" until a read finds the version open)
         signWho(Object.assign({}, listing, { signers: signers }), acts, say)
@@ -5043,6 +5064,7 @@
             signBusy--;
             for (const p of acts.querySelectorAll(".sign-pick")) p.remove();
             lock(!rearm);
+            if (rearm) { const later = signPending.get(id); signPending.delete(id); if (later) for (const f of later) f(); }
             signListed = null;
             // a signed (or not-knowable) answer may have closed the request: the board reads again (a row its caller has
             // answered leaves). A definite "nothing was signed" changed nothing, so nothing is read again under the operator
@@ -5081,6 +5103,7 @@
         // the words being signed are frozen from the tap until the ceremony ends; only a definite "nothing was signed"
         // unfreezes them, so a retry is a new tap over the same words
         freeze = { release: () => { box.readOnly = box.disabled = false; } };
+        if (signPending.has(id)) box.readOnly = box.disabled = true;
         b.addEventListener("click", () => {
           if (signBusy) return say(SIGN_BUSY, "bad");
           const w = box.value.trim();
@@ -5096,6 +5119,10 @@
       lock(false);
       sheetBtn = signSheetButton(r, say);
       acts.appendChild(sheetBtn);
+      if (signPending.has(id)) {
+        lock(true);
+        signPending.get(id).add(() => { lock(false); if (freeze) freeze.release(); });
+      }
       wrap.appendChild(acts);
       if (options.length) {
         const lines = el("div", "sign-lines ext-meta", "an option signs the request's message with its line appended:");
@@ -5240,13 +5267,14 @@
     if (!frame || ev.source !== frame.contentWindow || ev.origin !== window.location.origin) return;
     const what = ev.data && typeof ev.data === "object" ? ev.data.levainSheet : null;
     if (what === "ack") { clearTimeout(signSheetAsk); signSheetAsk = null; }
-    else if (what === "close") closeSignSheet();
+    else if (what === "close") { closeSignSheet(); dispatchStale(); }
     else if (what === "signed" || what === "reload") {
-      // the sheet's line stays on it until it is closed; the board under it reads again
+      // the sheet's line stays on it until it is closed; the board under it reads again, and the dispatch jobs with it
+      dispatchStale();
       rereadBoard();
     }
   });
-  window.LevainSignSheet = { open: openSignSheet, openConsent: openConsentSheet, close: closeSignSheet };
+  window.LevainSignSheet = { open: openSignSheet, openConsent: openConsentSheet, openDispatch: openDispatchSheet, openDrop: openDropSheet, close: closeSignSheet };
 
   // A signed verb's send (ActionVerb.sign): the server's compose_signer files a sign request for exactly these params, the
   // passkey signs it, and only then does the caller post the verb with `sign_request`. Resolves {ok: true, request, txn} or
@@ -5403,45 +5431,28 @@
     const first = items.find((it) => it.kind === "consent");
     return parts.join(" · ") + (first && Number.isFinite(Date.parse(first.c.expiresAt)) ? " · soonest " + consentLeft(first.c.expiresAt) : "");
   }
-  function needsHead(card, kindChip, agent, tail) {
+  // the focus view's dialog title already names the tool or question number and the agent: the card's head holds only the clock or age
+  function needsHead(card, tail) {
     const head = el("div", "consent-head needs-head");
-    // the focus view's dialog title already names the tool or question number and the agent: its card head keeps only the rest
-    if (!card.classList.contains("is-full")) {
-      head.appendChild(kindChip);
-      head.appendChild(el("span", "needs-chip consent-agent", agent || "agent"));
-    }
     if (tail) head.appendChild(tail);
     card.appendChild(head);
   }
   const needsIdOf = (it) => (it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : ""));
-  // The strip's card carries one "Open" row: it opens the focus view, where the SAME card is drawn unclamped (`is-full`) and the CLI
-  // route (the digests, the note and the commands) sits under "Answer from a terminal". There is no second renderer: the full card is
-  // the strip card built again with `full` set.
-  function needsDetails(parts, note, card) {
-    if (card && card.classList.contains("is-full")) {
-      const t = el("div", "needs-terminal");
-      t.appendChild(el("div", "needs-sec-label", "Answer from a terminal"));
-      if (note) t.appendChild(el("span", "needs-phone ext-meta", note));
-      t.append(...parts);
-      return t;
-    }
-    const d = el("div", "needs-details needs-open-row");
-    const btn = el("button", "needs-open", "Open");
-    btn.type = "button";
-    btn.title = "open the whole request";
-    btn.setAttribute("aria-haspopup", "dialog");
-    btn.addEventListener("click", () => { if (card && card._needsItem) openNeedsFocus(card._needsItem, btn); });
-    d.appendChild(btn);
-    if (note) d.appendChild(el("span", "needs-phone ext-meta", note));
-    return d;
+  // The CLI route (the digests, the note and the commands) sits at the card's foot under "Answer from a terminal".
+  function needsDetails(parts, note) {
+    const t = el("div", "needs-terminal");
+    t.appendChild(el("div", "needs-sec-label", "Answer from a terminal"));
+    if (note) t.appendChild(el("span", "needs-phone ext-meta", note));
+    t.append(...parts);
+    return t;
   }
-  // The focus view of one waiting item: the card built again, unclamped. Closes when the item is answered (refreshModal).
+  // The focus view of one waiting item: its card, drawn whole. Closes when the item is answered (refreshModal).
   function openNeedsFocus(it, opener) {
     const id = needsIdOf(it);
     modalCustom = {
       id,
       title: it.kind === "consent" ? (it.c.tool || "request") + " · " + (it.c.agent || "agent") : "Question #" + it.q.n + " · " + (it.q.agent || "agent"),
-      build: () => (it.kind === "consent" ? consentCard(it.c, true) : questionCard(it.q, true)),
+      build: () => (it.kind === "consent" ? consentCard(it.c) : questionCard(it.q)),
     };
     modalGlance = false;
     modalKey = "needs:" + id;
@@ -5548,12 +5559,11 @@
   function drawConsentCard(card, slot, b) {
     const sv = (x) => (typeof x === "string" ? x : "");
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
-    const full = card.classList.contains("is-full");
     const label = (t) => el("div", "needs-sec-label", t);
     const egress = egressParts(b);
-    const parts = egress ? (full ? [label("Request"), egress.state, egress.rows] : [egress.state, egress.rows])
-      : full ? [label("Request"), consentRequest(sv(b.display), card._needsItem && card._needsItem.c.tool)] : [el("pre", "consent-display", sv(b.display))];
-    if (full) parts.push(label("Where"));
+    const parts = egress ? [label("Request"), egress.state, egress.rows]
+      : [label("Request"), consentRequest(sv(b.display), card._needsItem && card._needsItem.c.tool)];
+    parts.push(label("Where"));
     const facts = el("div", "consent-facts");
     // the server's home shortens a path under it to ~/..., the full path stays as the title (never the browser's home)
     const where = el("span", "ext-meta", "in " + (sv(b.cwd_short) || sv(b.cwd)) + " \u00b7 targets " + sv(b.targets));
@@ -5561,8 +5571,8 @@
     facts.appendChild(where);
     parts.push(facts);
     const hintBox = consentHintBox(b);
-    if (hintBox) { if (full) parts.push(label("Hint")); parts.push(hintBox); }
-    if (full && card._needsItem && Number.isFinite(Date.parse(card._needsItem.c.expiresAt))) {
+    if (hintBox) { parts.push(label("Hint"), hintBox); }
+    if (card._needsItem && Number.isFinite(Date.parse(card._needsItem.c.expiresAt))) {
       parts.push(label("Expires"), el("div", "ext-meta needs-expires", new Date(card._needsItem.c.expiresAt).toLocaleString()));
     }
     // Allow and Deny are one component at one weight: neither is filled, neither leads. An answer the sheet offers here
@@ -5601,39 +5611,37 @@
     if (acts.childElementCount) card.appendChild(acts);
     const here = choices.length === 2 ? "signs with your passkey here"
       : choices.length ? choices[0] + " signs with your passkey here" : "signs on your phone";
-    card.appendChild(needsDetails(more, here, card));
+    card.appendChild(needsDetails(more, here));
   }
-  function consentCard(c, full) {
-    const card = el("div", "needs-card needs-consent" + (full ? " is-full" : ""));
+  function consentCard(c) {
+    const card = el("div", "needs-card needs-consent is-full");
     card.dataset.needsCard = "consent";
     card._needsItem = { kind: "consent", c };
-    if (c.id && !full) card.dataset.needsId = "consent:" + c.id;
     card.dataset.needsExpires = String(c.expiresAt);
     card.dataset.needsState = String(c.state);
-    needsHead(card, el("b", "consent-tool", c.tool), c.agent, (() => {
+    needsHead(card, (() => {
       const left = el("span", "consent-left needs-left", consentLeft(c.expiresAt));
       left.dataset.consentExpires = c.expiresAt;
       if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
       return left;
     })());
-    if (c.tier) card.firstChild.insertBefore(el("span", "needs-chip", c.tier), card.firstChild.children[full ? 0 : 1]);
+    if (c.tier) card.firstChild.insertBefore(el("span", "needs-chip", c.tier), card.firstChild.firstChild);
     const slot = el("div", "needs-body ext-meta", "reading the request…");
     card.appendChild(slot);
     if (c.id) consentBody(c, card).then((b) => drawConsentCard(card, slot, b));
     else slot.textContent = "this request has no id";
     return card;
   }
-  function questionCard(q, full) {
-    const card = el("div", "needs-card needs-question" + (full ? " is-full" : ""));
+  function questionCard(q) {
+    const card = el("div", "needs-card needs-question is-full");
     card.dataset.needsCard = "question";
     card._needsItem = { kind: "question", q };
-    if (q.id && !full) card.dataset.needsId = String(q.id);
-    needsHead(card, el("span", "needs-chip", "question"), q.agent, q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null);
+    needsHead(card, q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null);
     const slot = el("div", "needs-body ext-meta", "reading the question…");
     card.appendChild(slot);
     questionBody(q, card).then((b) => {
       drawQuestionBody(q, slot, b, card);
-      if (!b.error) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], "", card));
+      if (!b.error) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], ""));
     });
     return card;
   }
@@ -5641,6 +5649,58 @@
     host.replaceChildren();
     host.hidden = true;
     delete host.dataset.sig;
+  }
+  // The strip's row (option A, Phill 10-26): one fixed-height summary per waiting item, a single button that opens the focus view.
+  // It carries no answer control: the options, the words box, Allow/Deny and the sign row live only in the focus view, where the
+  // item is drawn whole. Line one is the question's title (a consent's tool and first words), line two what it blocks (a consent's
+  // working directory), the right edge the agent, the clock or age, and "rec <key>" when the item carries one. Text is drawn with
+  // textContent and cut by CSS to one line each, so a long item never sets its row's height.
+  function needsRow(it) {
+    const row = el("button", "needs-row" + (it.kind === "consent" ? " needs-consent" : " needs-question"));
+    row.type = "button";
+    row.setAttribute("aria-haspopup", "dialog");
+    row._needsItem = it;
+    const id = needsIdOf(it);
+    if (id) row.dataset.needsId = id;
+    row.dataset.needsCard = it.kind;
+    const title = el("span", "needs-row-title", it.kind === "consent" ? (it.c.tool || "request") : "question #" + it.q.n);
+    const sub = el("span", "needs-row-sub ext-meta", "");
+    const text = el("span", "needs-row-text");
+    text.append(title, sub);
+    const side = el("span", "needs-row-side");
+    const who = el("span", "needs-chip consent-agent", (it.kind === "consent" ? it.c.agent : it.q.agent) || "agent");
+    side.appendChild(who);
+    const flat = (t) => String(t || "").replace(/\s+/g, " ").trim();
+    if (it.kind === "consent") {
+      row.dataset.needsExpires = String(it.c.expiresAt);
+      row.dataset.needsState = String(it.c.state);
+      const left = el("span", "ext-meta consent-left needs-left", consentLeft(it.c.expiresAt));
+      left.dataset.consentExpires = it.c.expiresAt;
+      if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
+      side.appendChild(left);
+      title.className = "needs-row-title consent-tool";
+      if (it.c.id) consentBody(it.c, row).then((b) => {
+        if (!b || b.error) return;
+        const w = needsFirstWords(b.display, it.c.tool);
+        if (w) title.textContent = (it.c.tool || "request") + " " + w;
+        const where = flat(b.cwd_short || b.cwd);
+        sub.textContent = where ? "in " + where + (b.targets ? " \u00b7 targets " + flat(b.targets) : "") : "";
+      });
+    } else {
+      if (it.q.age) side.appendChild(el("span", "ext-meta needs-left", "asked " + it.q.age));
+      questionBody(it.q, row).then((b) => {
+        if (!b || b.error) return;
+        const first = flat(b.what);
+        if (first) title.textContent = first;
+        const more = flat(blocksBeyondTitle(b.what, b.blocks));
+        if (more) sub.textContent = "blocks: " + more;
+        if (typeof b.rec === "string" && b.rec) side.appendChild(el("span", "needs-rec-tag needs-row-rec", "rec " + b.rec));
+      });
+    }
+    row.title = "open the whole request and decide there";
+    row.append(text, side);
+    row.addEventListener("click", () => openNeedsFocus(row._needsItem || it, row));
+    return row;
   }
   function renderNeeds(view) {
     const host = document.getElementById("ck-needs");
@@ -5665,32 +5725,27 @@
     hist.title = "decided requests, outcomes and standing-rule proposals";
     hist.addEventListener("click", () => openDecisionsHistory(hist));
     head.appendChild(hist);
-    // the cards are kept by their stable id: a card whose item still waits is moved, never rebuilt, so the words typed into a
-    // question and an open "details" survive a change in what else waits; only a card whose item has gone is dropped
+    // the rows are kept by their stable id: a row whose item still waits is moved, never rebuilt (words typed into an item live in
+    // its focus view, which stays open while the item waits: refreshModal)
     let grid = host.querySelector(".needs-grid");
     const kept = new Map();
     if (grid) for (const c of grid.children) if (c.dataset && c.dataset.needsId) kept.set(c.dataset.needsId, c);
-    const idOf = (it) => (it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : ""));
-    // a card kept by id still shows what its item says NOW: a consent whose expiry moved (extended) takes the new clock in place;
-    // one whose state changed is rebuilt unless words are typed into it or its details are open (then it is kept as it is)
-    const fresh = (it) => (it.kind === "consent" ? consentCard(it.c) : questionCard(it.q));
-    const keep = (card, it) => {
-      if (it.kind !== "consent") return card;
-      const st = it.c.state;
-      if (card.dataset.needsState !== undefined && card.dataset.needsState !== st) {
-        const ta = card.querySelector("textarea");
-        const open = card.querySelector("details[open]");
-        if (!(ta && ta.value) && !open) return consentCard(it.c);
-      }
+    // a row kept by id still shows what its item says NOW: a consent whose expiry moved (extended) takes the new clock in place;
+    // one whose state changed is rebuilt
+    const keep = (row, it) => {
+      row._needsItem = it;   // the click handler reads this, so a kept row (question or consent) opens its item as it is NOW
+      if (it.kind !== "consent") return row;
+      if (row.dataset.needsState !== undefined && row.dataset.needsState !== String(it.c.state)) return needsRow(it);
       const exp = String(it.c.expiresAt);
-      if (card.dataset.needsExpires !== exp) {
-        card.dataset.needsExpires = exp;
-        const left = card.querySelector(".consent-left");
+      if (row.dataset.needsExpires !== exp) {
+        row.dataset.needsExpires = exp;
+        row._needsItem = it;
+        const left = row.querySelector(".consent-left");
         if (left) { left.dataset.consentExpires = exp; left.textContent = consentLeft(it.c.expiresAt); }
       }
-      return card;
+      return row;
     };
-    const cards = items.map((it) => { const id = idOf(it); const k = id && kept.get(id); return k ? keep(k, it) : fresh(it); });
+    const cards = items.map((it) => { const id = needsIdOf(it); const k = id && kept.get(id); return k ? keep(k, it) : needsRow(it); });
     if (!grid) grid = el("div", "needs-grid");
     for (let i = 0; i < cards.length; i++) if (grid.children[i] !== cards[i]) grid.insertBefore(cards[i], grid.children[i] || null);
     while (grid.children.length > cards.length) grid.removeChild(grid.lastChild);
@@ -5771,9 +5826,8 @@
   function needsFocus() {
     const host = document.getElementById("ck-needs");
     if (!host || host.hidden) return false;
-    const first = host.querySelector(".needs-card");
-    if (!first || !first.offsetParent) return false;   // on Build and Memory the cards are not drawn: the bar is
-    first.tabIndex = -1;
+    const first = host.querySelector(".needs-row");
+    if (!first || !first.offsetParent) return false;   // on Build and Memory the rows are not drawn: the bar is
     if (typeof first.scrollIntoView === "function") first.scrollIntoView({ block: "center", behavior: "smooth" });
     first.focus({ preventScroll: true });
     return true;
@@ -5786,8 +5840,8 @@
     const host = document.getElementById("ck-needs");
     if (!host || host.hidden || !id) return false;
     for (const n of host.querySelectorAll(".needs-lit")) n.classList.remove("needs-lit");
-    const cards = host.querySelector(".needs-card") && host.querySelector(".needs-card").offsetParent;
-    const sel = cards ? ".needs-card" : ".needs-chip-btn";
+    const cards = host.querySelector(".needs-row") && host.querySelector(".needs-row").offsetParent;
+    const sel = cards ? ".needs-row" : ".needs-chip-btn";
     const node = Array.prototype.find.call(host.querySelectorAll(sel), (n) => n.dataset.needsId === id);
     if (!node) return false;
     if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -6200,10 +6254,136 @@
                            ...rows.map((g) => grantCard(g, inert, signList)));
     }).catch(() => {});
   }
-  // the Decisions history's two standing-rule slots, drawn together wherever the proposals are
+  // OS-2, the dispatch family: the live dispatch jobs as cards, each act (Sign, Cancel, Authorise) a button that opens the sign
+  // sheet at /sign/dispatch/<job> with that act picked. /cockpit/dispatch.json lists them as the sheet's rows (one object per
+  // job: its message, its options each with the passkeys that may do it, the version the sheet signs on). This page signs
+  // nothing: the sheet does, through the phone port's own routes. No token, a failed read, or no job: no slot.
+  let dispatchRead = null, dispatchAt = 0;
+  function dispatchFetch() {
+    if (dispatchRead && Date.now() - dispatchAt < PROPOSAL_TTL_MS) return dispatchRead;
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? t.headers() : {};
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve(null);
+    dispatchAt = Date.now();
+    const got = consentQueued(() => fetchBounded("/cockpit/dispatch.json", { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.requests) ? b : null), () => null) : null),
+      () => null), "the dispatch jobs could not be read").then((b) => {
+        if (!b || !Array.isArray(b.requests)) { if (dispatchRead === got) dispatchRead = null; return null; }
+        return b;
+      });
+    dispatchRead = got;
+    return got;
+  }
+  // OS-2: the sheet over a dispatch job (/sign/dispatch/<job>), signed, cancelled or authorised there with a passkey
+  function openDispatchSheet(id, version, choice) {
+    if (typeof id !== "string" || !/^dj-[0-9a-f]{32}$/.test(id)) return null;
+    return openSheet("/sign/dispatch/" + encodeURIComponent(id), version, choice, "dispatch job");
+  }
+  // OS-2: the sheet over a coordinator drop (/sign/drop): words, and optionally an envelope the passkey signs there
+  function openDropSheet() {
+    return openSheet("/sign/drop", "", "", "coordinator drop");
+  }
+  // the drop card: shown only while /cockpit/coord/drops.json reads (a token, a Signer, a store that answers); the Send a drop
+  // button opens the sheet, which sends and signs nothing from this page
+  // the coordinator read goes through the shared bounded read queue and is held for a moment, as the dispatch read is: rapid
+  // redraws share one read
+  let dropRead = null, dropAt = 0, dropSlotNow = null;
+  function dropFetch(headers) {
+    if (dropRead && Date.now() - dropAt < PROPOSAL_TTL_MS) return dropRead;
+    dropAt = Date.now();
+    const got = consentQueued(() => fetchBounded("/cockpit/coord/drops.json", { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.coord_drops) ? b : null), () => null) : null),
+      () => null), "the drops could not be read").then((b) => {
+        if (!b || !Array.isArray(b.coord_drops)) { if (dropRead === got) dropRead = null; return null; }
+        return b;
+      });
+    dropRead = got;
+    return got;
+  }
+  function dropSlot() {
+    const slot = el("div", "coord-drop-slot");
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? t.headers() : {};
+    if (!headers["X-Levain-Write-Token"]) return slot;
+    dropSlotNow = slot;
+    dropFetch(headers).then((b) => {
+        if (!b || slot !== dropSlotNow) return;     // only the slot the latest render made is filled; an older one is gone
+        const row = el("div", "row consent-row coord-drop-row");
+        const head = el("div", "consent-head");
+        head.appendChild(el("b", "consent-tool", "drop"));
+        head.appendChild(el("span", "ext-meta", b.coord_drops.length + " recent from the phone port or this cockpit"));
+        row.appendChild(head);
+        const acts = el("div", "needs-actions");
+        const btn = el("button", "needs-btn", "Send a drop");
+        btn.type = "button";
+        btn.dataset.coordDrop = "open";
+        btn.title = "send words to the coordinator, optionally with an envelope your passkey signs, in the sign sheet";
+        btn.addEventListener("click", () => openDropSheet());
+        acts.appendChild(btn);
+        row.appendChild(acts);
+        if (typeof b.coord_note === "string" && b.coord_note) row.appendChild(el("div", "consent-note ext-meta", b.coord_note));
+        slot.replaceChildren(el("div", "ext-grouphead", "coordinator drop"), row);
+      }).catch(() => {});
+    return slot;
+  }
+  const DISPATCH_VERB = { sign: "Sign", cancel: "Cancel job", authorise: "Authorise" };
+  function dispatchCard(r) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const row = el("div", "row consent-row dispatch-row");
+    row.setAttribute("data-dispatch-job", sv(r.id));
+    const head = el("div", "consent-head");
+    head.appendChild(el("span", "consent-agent", sv(r.agent) || "agent"));
+    head.appendChild(el("b", "consent-tool", sv(r.id)));
+    head.appendChild(el("span", "ext-meta", "dispatch job · " + sv(r.state)));
+    if (sv(r.expires_at)) head.appendChild(el("span", "consent-left", "lease ends " + r.expires_at));
+    row.appendChild(head);
+    if (sv(r.goal)) row.appendChild(el("div", "consent-display", r.goal));
+    const acts = el("div", "needs-actions");
+    for (const o of Array.isArray(r.options) ? r.options : []) {
+      if (!o || typeof o.key !== "string" || !DISPATCH_VERB[o.key]) continue;
+      const btn = el("button", "needs-btn", DISPATCH_VERB[o.key]);
+      btn.type = "button";
+      btn.dataset.dispatchAct = o.key;
+      btn.title = o.key + " this job with your passkey, in the sign sheet";
+      btn.addEventListener("click", () => openDispatchSheet(r.id, sv(r.sha256), o.key));
+      acts.appendChild(btn);
+    }
+    if (acts.childElementCount) row.appendChild(acts);
+    if (sv(r.note)) row.appendChild(el("div", "consent-note ext-meta", r.note));
+    return row;
+  }
+  function dispatchSlot() {
+    const slot = el("div", "dispatch-slot");
+    dispatchFill(slot);
+    return slot;
+  }
+  // the newest fill OF THIS SLOT wins: an older read answering late never redraws over a newer one; a sequence per slot,
+  // so a second slot (the board's and the history's) never stops the first from filling
+  const dispatchFillSeq = new WeakMap();
+  function dispatchFill(slot) {
+    const n = (dispatchFillSeq.get(slot) || 0) + 1;
+    dispatchFillSeq.set(slot, n);
+    dispatchFetch().then((b) => {
+      if (!b || n !== dispatchFillSeq.get(slot)) return;
+      const note = typeof b.note === "string" ? b.note : "";
+      const why = typeof b.elsewhere === "string" ? b.elsewhere : "";
+      if (!b.requests.length && !note) { slot.replaceChildren(); return; }
+      const over = Number.isInteger(b.overflow) && b.overflow > 0 ? [el("div", "consent-note ext-meta", b.overflow + " more not shown")] : [];
+      slot.replaceChildren(el("div", "ext-grouphead", "dispatch jobs"), ...(note ? [el("div", "consent-note ext-meta", note)] : []),
+                           ...(why ? [el("div", "consent-note ext-meta dispatch-why", why)] : []),
+                           ...b.requests.map(dispatchCard), ...over);
+    }).catch(() => {});
+  }
+  // the sheet signed, asked for a reload, or closed: the dispatch read is dropped (as a board reload drops it) and every
+  // dispatch slot on the page reads again, so a job signed or cancelled there never stays on a card for the read's 30 s
+  function dispatchStale() {
+    dispatchRead = null;
+    for (const s of document.querySelectorAll(".dispatch-slot")) dispatchFill(s);
+  }
+  // the Decisions history's standing-rule slots (and the dispatch jobs), drawn together wherever the proposals are
   function standingSlots() {
     const f = document.createDocumentFragment();
-    f.append(proposalSlot(), grantSlot());
+    f.append(proposalSlot(), grantSlot(), dispatchSlot(), dropSlot());
     return f;
   }
 
@@ -6466,6 +6646,7 @@
     modalEpisodeQuery = "";  // a fresh open starts with the recent list, not a stale query
     proposalRead = null;     // a fresh open reads the proposals again: a denial or a grant since withdraws its card
     grantRead = null;        // and the grants again: a revoke since removes its card
+    dispatchRead = null;     // and the dispatch jobs again
     buildModal(entry);
   }
 

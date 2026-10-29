@@ -101,9 +101,11 @@ def test_every_other_route_keeps_frame_ancestors_none(sheet) -> None:
         hdrs_in = {"X-Levain-Write-Token": TOK, "Content-Type": "application/json"} if method == "POST" else {}
         status, hdrs, _ = _raw(sheet["url"], path, method=method, headers=hdrs_in, body=body, read=False)
         seen.add(status)
+        # the drop sheet is a second framed sheet: the cockpit page frames it, as it frames the sign sheet
+        drop_sheet = path == web_server._COORD_SHEET and method in ("GET", "HEAD") and status == 200
         want = FRAMER_CSP if path == "/" and method in ("GET", "HEAD") and status == 200 else _CSP
-        assert hdrs.get("content-security-policy") == want, (method, path, status, hdrs)
-        assert hdrs.get("x-frame-options") == "DENY", (method, path, status)
+        assert hdrs.get("content-security-policy") == (SELF_CSP if drop_sheet else want), (method, path, status, hdrs)
+        assert hdrs.get("x-frame-options") == ("SAMEORIGIN" if drop_sheet else "DENY"), (method, path, status)
     assert {200, 404} <= seen      # the walk reached served routes and unserved ones
 
 

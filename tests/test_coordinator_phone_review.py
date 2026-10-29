@@ -78,7 +78,7 @@ def test_the_morning_card_is_the_cards_own_data_and_render(world) -> None:
     _item(store, 1)
     _item(store, 2, "end", authority_relevant=True)
     # a SIGN record whose request is not in the queue: the card reports it unreadable, and the phone repeats that
-    review.push_sign(store, None, "np-not-in-the-queue", "sign the thing")
+    review.push_sign(store, None, "np-not-in-the-queue", "sign the thing", rec=review.NO_REC)
     got = coord_for(world).coord_listing()["coord_morning"]
     card = morning.card(store)
     waiting = card["waiting"]
