@@ -44,7 +44,7 @@ def launch_rows(monkeypatch, rows):
     from levain.coordinator import lease
     from levain.coordinator.store import CoordStore
 
-    monkeypatch.setattr(CoordStore, "open_readonly", lambda self: sqlite3.connect(":memory:"))
+    monkeypatch.setattr(CoordStore, "open_readonly", lambda self, **_k: sqlite3.connect(":memory:"))
     monkeypatch.setattr(lease, "by_harness_session",
                         lambda conn, sid: SimpleNamespace(role=rows[sid]) if sid in rows else None)
 
@@ -82,7 +82,7 @@ def test_neither_fact_is_non_autonomous_and_a_broken_coordinator_store_too(qdir,
     from levain.coordinator.store import CoordStore
 
     ask(store)
-    monkeypatch.setattr(CoordStore, "open_readonly", lambda self: (_ for _ in ()).throw(OSError("unreadable")))
+    monkeypatch.setattr(CoordStore, "open_readonly", lambda self, **_k: (_ for _ in ()).throw(OSError("unreadable")))
     assert band_view.is_autonomous("x", qdir, {}) is False
     assert band_view.is_autonomous("x#agent:sub", qdir, {}) is True
 

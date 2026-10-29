@@ -245,7 +245,7 @@ def test_an_autonomous_seat_renders_nothing_and_a_human_seat_gets_the_contract(q
 
     ask(store)
     launches: dict[str, str] = {}
-    monkeypatch.setattr(CoordStore, "open_readonly", lambda self: sqlite3.connect(":memory:"))
+    monkeypatch.setattr(CoordStore, "open_readonly", lambda self, *_a, **_k: sqlite3.connect(":memory:"))
     monkeypatch.setattr(lease, "by_harness_session",
                         lambda conn, sid: SimpleNamespace(role=launches[sid]) if sid in launches else None)
     launches.update({"w1": "worker", "c1": "coordinator"})

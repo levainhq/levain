@@ -495,6 +495,261 @@ class ConsentSheet:
         return row
 
 
+# ONESURFACE OS-2, the dispatch family: a dispatch job signed, cancelled, or (once recommended) authorised with a passkey on
+# the cockpit, through the phone port's OWN class (levain.dispatch.phone.DispatchPhone, the very object phone_server builds),
+# over the Signer's queue (the dispatch directory IS the consent directory), rpId, keys and pinned page. GET
+# /cockpit/dispatch.json lists the live jobs as sheet rows, GET /cockpit/dispatch/<job>/sheet.json is the sign sheet's read
+# of one, POST /cockpit/dispatch/<job>/{challenge,answer,cancel-challenge,cancel,authorise-challenge,authorise} its
+# ceremony (the phone's /dispatch/<job>/<action> by name), all behind the sign routes' gate exactly, and GET
+# /sign/dispatch/<job> the sheet's page. Served beside a Signer only; else every path here is 404.
+_DISPATCH_JOB = re.compile(r"dj-[0-9a-f]{32}")      # phone_server._DISPATCH_ROUTE's job id
+_DISPATCH_ACTIONS = ("challenge", "answer", "cancel-challenge", "cancel", "authorise-challenge", "authorise")
+_DISPATCH_PREFIX = "/cockpit/dispatch/"
+_DISPATCH_LIST = "/cockpit/dispatch.json"
+_DISPATCH_SHEET_READ = "/sheet.json"
+_DISPATCH_SHEET_PREFIX = "/sign/dispatch/"
+
+
+def _dispatch_sign_route(route: str) -> "tuple[str, str] | None":
+    """``(job_id, action)`` for ``POST /cockpit/dispatch/<job>/<action>``, else None."""
+    if not route.startswith(_DISPATCH_PREFIX):
+        return None
+    job, sep, action = route[len(_DISPATCH_PREFIX):].partition("/")
+    if not sep or _DISPATCH_JOB.fullmatch(job) is None or action not in _DISPATCH_ACTIONS:
+        return None
+    return job, action
+
+
+def _dispatch_sheet_read(path: str) -> "str | None":
+    """The job id of ``GET /cockpit/dispatch/<job>/sheet.json``, else None."""
+    if not path.startswith(_DISPATCH_PREFIX) or not path.endswith(_DISPATCH_SHEET_READ):
+        return None
+    job = path[len(_DISPATCH_PREFIX):-len(_DISPATCH_SHEET_READ)]
+    return job if _DISPATCH_JOB.fullmatch(job) is not None else None
+
+
+def _dispatch_sheet_id(path: str) -> "str | None":
+    """The job id of ``GET /sign/dispatch/<job>`` (the sheet's page), else None."""
+    job = path[len(_DISPATCH_SHEET_PREFIX):] if path.startswith(_DISPATCH_SHEET_PREFIX) else ""
+    return job if _DISPATCH_JOB.fullmatch(job) is not None else None
+
+
+class DispatchSheet:
+    """The dispatch family on the cockpit (OS-2): :class:`levain.dispatch.phone.DispatchPhone` itself (its ``step`` is the
+    phone port's ``dispatch_step``), built as phone_server builds it: the dispatch directory is the Signer's queue, the keys
+    the Signer's own, the authority the source of the ONE cockpit that queue's hooks name (as ``_PhoneServer._source`` makes
+    it), the page origin the one the Signer is pinned to. So the checks a cockpit signature passes are the phone's: the job's
+    state, a passkey enrolled on ``rp_id`` whose class covers the tier, the assertion turned into an SSHSIG against
+    ``page_origin``, and the job store's own verification against that authority. ``signer`` supplies only display facts.
+
+    The queue's and the store's verification takes a passkey answer made on ``https://<rp_id>`` (no port; ``localhost``: any
+    port), never a pinned ``https://<name>:8443``: a cockpit pinned elsewhere lists no signer and refuses each step before
+    any ceremony, saying where it can be answered (as the consent family does)."""
+
+    def __init__(self, queue_dir: Path, rp_id: str, page_origin: "str | None", signer: "Signer") -> None:
+        from levain.authority import ReplayCache
+        from levain.consent.sign import sign_root
+        from levain.dispatch.phone import DispatchPhone
+
+        self.queue_dir, self.rp_id, self.page_origin, self.signer = Path(queue_dir), rp_id, page_origin, signer
+        self.replay_cache = ReplayCache()
+        self.phone = DispatchPhone(self.queue_dir, rp_id, page_origin, signer.keys,
+                                   lambda: self._source(sign_root(self.queue_dir)))
+
+    def _source(self, root: Path) -> Any:
+        from levain.phone_server import _PhoneServer
+
+        return _PhoneServer._source(self, root)    # type: ignore[arg-type]
+
+    def elsewhere(self) -> "str | None":
+        """Why no dispatch signature made on this cockpit's page can verify, or None. No pinned page is checked first:
+        ``localhost`` takes any port, never no page at all."""
+        if self.page_origin is None:
+            return ("a dispatch signature verifies only against the page this cockpit is pinned to, and it is not "
+                    "pinned to one: sign it from the terminal (levain dispatch sign)")
+        if self.rp_id == "localhost" or self.page_origin == f"https://{self.rp_id}":
+            return None
+        return (f"a dispatch signature verifies only when signed on https://{self.rp_id} (no port), and this cockpit is "
+                f"served on {self.page_origin}: sign it on that page or from the terminal")
+
+    def step(self, job_id: str, action: str, req: Any) -> "dict[str, Any]":
+        """``POST /cockpit/dispatch/<job>/<action>``: :meth:`DispatchPhone.step`'s reply (a challenge's also carries
+        ``line``, the exact text signed). :class:`levain.dispatch.phone.DispatchRefused` with the phone port's status, word
+        and words."""
+        from levain.dispatch.phone import DispatchRefused
+        from levain.dispatch.sign import sign_message
+
+        problem = self.elsewhere()
+        if problem is not None:
+            raise DispatchRefused(422, "sign_refused", problem + "; nothing was signed")
+        out = self.phone.step(job_id, action, req)
+        if action in ("challenge", "cancel-challenge", "authorise-challenge"):
+            out["line"] = sign_message(out["payload"]).decode("utf-8")   # all three sign the payload's canonical JSON
+        return out
+
+    @staticmethod
+    def version(rec: "Mapping[str, Any]") -> str:
+        """The version a sheet row and a card's link name one job by: its id, digest, state and lease, and the run,
+        branch and tier of its authorise card (so a recommendation that moved reads as changed: a pick made on the old
+        card is never offered on the new one)."""
+        card = rec.get("authorise") if isinstance(rec.get("authorise"), dict) else {}
+        return hashlib.sha256(json.dumps([rec.get("id"), rec.get("digest"), rec.get("state"), rec.get("lease_end"),
+                                          card.get("run"), card.get("onto"), card.get("tier")]).encode()).hexdigest()
+
+    @staticmethod
+    def _contract_lines(rec: "Mapping[str, Any]") -> "list[str]":
+        """The job as the sheet shows it, every field the phone's card shows (``levain dispatch show``'s): the goal in
+        full, each digest-bound contract field, EVERY read and write entry (never cut, never an ellipsis), then the
+        job's lease, signer, filer and history. The strings are the record's, already made visible."""
+        def q(v: Any) -> str:
+            return "?" if v is None or v == "" else str(v)
+
+        def entries(rows: Any) -> "list[str]":
+            return [f"  {q(e.get('path'))}  " + ("(new file)" if e.get("mode") == "new"
+                                                  else f"{q(e.get('mode'))} {q(e.get('blob'))}")
+                    for e in (rows if isinstance(rows, list) else []) if isinstance(e, dict)]
+
+        t = rec.get("template") if isinstance(rec.get("template"), dict) else {}
+        b = rec.get("budget") if isinstance(rec.get("budget"), dict) else {}
+        listed = lambda v: ", ".join(map(str, v)) if isinstance(v, (list, tuple)) else q(v)  # noqa: E731
+        tools = ", ".join(" ".join(map(str, p)) if isinstance(p, (list, tuple)) else str(p)
+                          for p in (t.get("tool_versions") or []))
+        reads, writes = rec.get("read") or [], rec.get("write") or []
+        history = [h for h in (rec.get("history") or []) if isinstance(h, dict)]
+        return [str(rec.get("goal", "")), "",
+                f"job       {q(rec.get('id'))}  [{q(rec.get('state'))}]",
+                f"repo      {q(rec.get('repo'))}",
+                f"base      {q(rec.get('base'))} (tree {q(rec.get('base_tree'))})",
+                f"digest    {q(rec.get('digest'))}",
+                f"template  {q(t.get('id'))}  tier {q(t.get('tier'))}  ({q(t.get('content_hash'))})",
+                f"executor  {q(t.get('executor'))}, models {listed(t.get('models'))} (k={q(t.get('k'))}), "
+                f"provider {q(t.get('provider'))} via {q(t.get('route'))}",
+                f"verifier  {q(t.get('verifier_id'))} ({q(t.get('verifier_kind'))}, {q(t.get('verifier_hash'))})",
+                f"tools     {tools or '(none)'}",
+                f"budget    {q(b.get('tool_calls'))} tool calls, {q(b.get('tokens'))} tokens, "
+                f"{q(b.get('dollars_cents'))} cents (executor)",
+                f"grant     {listed(rec.get('grant'))} over the write list",
+                f"expires   {q(rec.get('expires_at'))}",
+                f"lease     {q(rec.get('lease_end'))}",
+                f"policy    {q(rec.get('policy_hash'))}",
+                f"signer    {rec.get('signer_fp') or '(not signed)'}",
+                f"filed by  {rec.get('agent') or '(no agent named)'}, session {q(rec.get('session'))} "
+                f"at {q(rec.get('filed_at'))}",
+                f"read ({len(reads)}, what the executor sees and the provider receives):", *entries(reads),
+                f"write ({len(writes)}, the only files a result may change):", *entries(writes),
+                f"template write paths: {listed(t.get('write_paths'))}",
+                "history:", *[f"  {q(h.get('seq'))} {q(h.get('to_state'))} {q(h.get('cause'))} {q(h.get('at'))}"
+                              + (f"  {h['evidence']}" if h.get("evidence") else "") for h in history]]
+
+    @staticmethod
+    def _change_line(c: "Mapping[str, Any]") -> str:
+        """One change of an authorise card: its status, its line counts (a binary or gitlink has none) and its path."""
+        a, d = c.get("added"), c.get("deleted")
+        counts = f"+{a} -{d}" if isinstance(a, int) and isinstance(d, int) else "no line count"
+        flags = "".join(f" ({w})" for w in ("binary", "gitlink") if c.get(w))
+        return f"  {c.get('status')}  {counts}  {c.get('path')}{flags}"
+
+    def _row(self, rec: "Mapping[str, Any]", problem: "str | None") -> "dict[str, Any]":
+        """One record (:meth:`DispatchPhone.record`) as a sheet row: ``options`` the acts open to a passkey (sign, cancel,
+        authorise), each with the ``signers`` that may do THAT act (the sign tier's and the landing tier's differ).
+
+        The message is the whole job (:meth:`_contract_lines`) and, for an authorise card, EVERY change it lands with
+        its status and line counts. A card that does not hold every change (``change_overflow``: past the phone's own
+        cap) offers NO act: the row says it is reviewed on the laptop (``review``), as a cockpit pinned elsewhere does.
+        ``authorise``: the card's run, branch and tier, which the sheet checks the authorise challenge against."""
+        from levain.dispatch.sign import FIELD_MAX
+
+        job_id, state = str(rec.get("id")), str(rec.get("state"))
+        lines = self._contract_lines(rec)
+        card = rec.get("authorise") if isinstance(rec.get("authorise"), dict) else None
+        changes = [c for c in (card.get("changes") or []) if isinstance(c, dict)] if card is not None else []
+        over = card.get("change_overflow") if card is not None else 0
+        over = over if isinstance(over, int) and over > 0 else 0
+        if card is not None and card.get("onto"):
+            lines += ["", f"Authorise run {card.get('run')} onto {card.get('onto')} · tier {card.get('tier')} · "
+                          f"{card.get('files')} file(s), {card.get('changed_lines')} changed line(s)"
+                          + (f" · staged {card.get('staged')} on {card.get('base')}" if card.get("staged") else ""),
+                      *[self._change_line(c) for c in changes]]
+            if over:
+                lines.append(f"  ({over} more change{'s are' if over != 1 else ' is'} not listed here)")
+        row: dict[str, Any] = {
+            "id": job_id, "kind": "dispatch", "mode": "dispatch", "state": state, "sha256": self.version(rec),
+            "title": f"dispatch · {state}", "requester": rec.get("agent"), "message": "\n".join(lines),
+            "expires_at": rec.get("lease_end") if state == "filed" else None, "options": [], "signers": [],
+            "recommended": None, "agent": rec.get("agent"), "goal": str(rec.get("goal", ""))[:300]}
+        if card is not None and card.get("onto"):
+            row["authorise"] = {"run": card.get("run"), "onto": card.get("onto"), "tier": card.get("tier")}
+        if problem is None and over:
+            # never signed or authorised from a summary: the set the passkey would land is not all on this page
+            row["review"] = True
+            problem = (f"this run changes {card.get('files')} files and this page lists {len(changes)} of them, so "
+                       f"nothing is signed from this page: review it on the laptop (levain dispatch show {job_id}; "
+                       f"levain dispatch authorise {job_id} --run {card.get('run')} --onto {card.get('onto')})")
+        if problem is not None:
+            row["note"] = problem
+            return row
+        signers = [fp for fp in rec.get("signers", []) if isinstance(fp, str)]
+        notes: list[str] = []
+        if rec.get("can_sign"):
+            row["options"].append({"key": "sign", "text": "Sign", "signers": signers,
+                                   "line": f"sign dispatch job {job_id} (its contract's digest)"})
+        elif state == "filed" and signers:
+            notes.append("this job's lease has ended: it can no longer be signed")
+        if rec.get("can_cancel") and signers:
+            row["options"].append({"key": "cancel", "text": "Cancel the job", "signers": signers,
+                                   "line": f"cancel dispatch job {job_id}"})
+            row["reason"] = {"max": FIELD_MAX}
+        if card is not None:
+            if card.get("problem"):
+                notes.append(str(card["problem"]))
+            elif card.get("signers"):
+                row["options"].append({"key": "authorise", "signers": [s for s in card["signers"] if isinstance(s, str)],
+                                       "text": f"Authorise run {card.get('run')} onto {card.get('onto')}",
+                                       "line": f"authorise dispatch job {job_id} run {card.get('run')} onto "
+                                               f"{card.get('onto')}"})
+            elif card.get("note"):
+                notes.append(str(card["note"]))
+        if not signers and not row["options"]:
+            notes.insert(0, str(rec.get("signer_note") or f"no passkey is enrolled for {self.rp_id}"))
+        row["signers"] = sorted({fp for o in row["options"] for fp in o["signers"]})
+        if notes:
+            row["note"] = "; ".join(notes)
+        return row
+
+    def listing(self) -> "tuple[list[dict[str, Any]], str | None, int]":
+        """``(rows, note, overflow)``: every live job as a sheet row (:meth:`DispatchPhone.pending`'s listing)."""
+        records, note, overflow = self.phone.pending()
+        problem = self.elsewhere()
+        return [self._row(r, problem) for r in records], note, overflow
+
+    def row(self, job_id: str) -> "dict[str, Any] | None":
+        """The sheet's row for one job that is still live, else None (no store, no such job, or a final state)."""
+        from levain.cockpit.consent import utc_stamp
+        from levain.dispatch import DispatchError
+        from levain.dispatch.jobs import TERMINAL
+
+        store = self.phone._store()
+        job = None if store is None else store.get(job_id)
+        if job is None:
+            return None
+        # the job's state and its record are read under pending()'s own guard: a job whose stored row cannot be read
+        # is a row that offers nothing and says why, never a 500 and never a ceremony
+        try:
+            if job.state in TERMINAL:
+                return None
+            signers, note = self.phone._signers()
+            rec = self.phone.record(job, utc_stamp(self.phone._clock()), list(signers), note)
+        except (DispatchError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+            why = (f"dispatch job {job_id} could not be read ({type(exc).__name__}), so nothing is signed from this page: "
+                   f"read it on the laptop (levain dispatch show {job_id})")
+            return {"id": job_id, "kind": "dispatch", "mode": "dispatch", "state": "unreadable",
+                    "sha256": hashlib.sha256(json.dumps([job_id, "unreadable", type(exc).__name__]).encode()).hexdigest(),
+                    "title": "dispatch · could not be read", "requester": None, "message": "", "expires_at": None,
+                    "options": [], "signers": [], "recommended": None, "agent": None, "goal": "", "review": True,
+                    "note": why}
+        return self._row(rec, self.elsewhere())
+
+
 def _extra_hosts(hosts: object) -> frozenset[str]:
     """``extra_hosts`` as the Host gate compares names (:func:`levain.http_guards.host_header_allowed`: lowercase, no
     trailing dot, no port, since the gate compares host names only, for loopback too). ValueError for anything that
@@ -1114,6 +1369,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # the consent family's answer and ruling (OS-2), built by make_server beside grant_phone, under its condition; None
     # serves no consent signing route
     consent_sheet: "ConsentSheet | None" = None
+    # the dispatch family's sign, cancel and authorise (OS-2), built by make_server beside the Signer; None serves no
+    # dispatch signing route
+    dispatch_sheet: "DispatchSheet | None" = None
     # the caller's compose_signer (DESIGN_SIGN D5): (verb, params) -> the id of the sign request it filed; None serves no
     # compose route
     compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None
@@ -1261,7 +1519,8 @@ class _Handler(GuardedHandler):
         ``GET /sign/consent/<id>`` (OS-2) is the same shell over a consent request, admitted alike."""
         page = self.path.split("?", 1)[0]
         return (self.command == "GET"
-                and (self.path == "/pair" or _sheet_id(page) is not None or _consent_sheet_id(page) is not None)
+                and (self.path == "/pair" or _sheet_id(page) is not None or _consent_sheet_id(page) is not None
+                     or _dispatch_sheet_id(page) is not None)
                 and self.headers.get("Sec-Fetch-Site") == "cross-site"
                 and self.headers.get("Sec-Fetch-Mode") == "navigate"
                 and self.headers.get("Sec-Fetch-Dest") == "document")
@@ -1633,11 +1892,13 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
-    def _serve_sheet(self, *, head: bool, consent: bool = False) -> None:
+    def _serve_sheet(self, *, head: bool, consent: bool = False, dispatch: bool = False) -> None:
         """``GET /sign/<id>`` (OS-1): the sign sheet's page, the same bytes for every id (the id is read from the path
         by ``/sign.js``), framable only by this origin. Without a signer, 404. ``GET /sign/consent/<id>`` (``consent``,
-        OS-2) serves the same bytes beside a consent sheet, else 404."""
-        if (self.server.consent_sheet if consent else self.server.signer) is None:
+        OS-2) serves the same bytes beside a consent sheet, ``GET /sign/dispatch/<job>`` (``dispatch``) beside a dispatch
+        sheet, else 404."""
+        beside = self.server.consent_sheet if consent else self.server.dispatch_sheet if dispatch else self.server.signer
+        if beside is None:
             self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
             return
         self._send_framing((_SHEET_CSP, "SAMEORIGIN"), self.server.levain_assets[_SHEET_PAGE], "text/html; charset=utf-8",
@@ -1818,6 +2079,67 @@ class _Handler(GuardedHandler):
         try:
             return sheet.step(request_id, action, req), 200
         except ConsentRefused as exc:
+            return {"error": exc.error, "message": exc.message}, exc.status
+
+    def _serve_dispatch_sheet(self, job_id: "str | None", *, head: bool) -> None:
+        """``GET /cockpit/dispatch/<job>/sheet.json`` (OS-2): ``{request, signers, credentials, origin, rp_id}`` with the
+        job's sheet row (:meth:`DispatchSheet.row`), or 404 ``not_open`` once it is final or unknown;
+        ``GET /cockpit/dispatch.json`` (``job_id`` None): ``{requests, note, overflow, origin, rp_id}``, every live job as
+        a row. Behind the sign listing's gate exactly. Without a dispatch sheet, 404 ``not_found``."""
+        sheet = self.server.dispatch_sheet
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if sheet is None:
+            self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=404, head=head, cache_control="private, no-store")
+            return
+        if not self._sign_read_admitted(head=head, what="the dispatch jobs"):
+            return
+        try:
+            payload: dict[str, Any]
+            if job_id is None:
+                rows, note, overflow = sheet.listing()
+                try:
+                    credentials = sheet.signer.key_facts(sorted({fp for r in rows for fp in r["signers"]}))
+                except Exception:  # noqa: BLE001 - display facts only
+                    credentials = {}
+                payload, status = {"requests": rows, "note": note, "overflow": overflow, "credentials": credentials,
+                                   "origin": self.server.signer_page_origin, "rp_id": sheet.rp_id}, 200
+                problem = sheet.elsewhere()
+                if problem is not None:
+                    payload["elsewhere"] = problem
+            else:
+                row = sheet.row(job_id)
+                if row is None:
+                    payload, status = {"error": "not_open", "message": "this dispatch job is not open"}, 404
+                else:
+                    try:
+                        credentials = sheet.signer.key_facts(row["signers"])
+                    except Exception:  # noqa: BLE001 - display facts only
+                        credentials = {}
+                    payload, status = {"request": row, "signers": row["signers"], "credentials": credentials,
+                                       "origin": self.server.signer_page_origin, "rp_id": sheet.rp_id}, 200
+                    if row.get("note"):
+                        payload["note"] = row["note"]
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
+            status, payload = 500, _store_fault("dispatch job", exc)
+        finally:
+            self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=hdrs, cache_control="private, no-store")
+
+    def _dispatch_post(self, job_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/dispatch/<job>/<action>`` (OS-2): the dispatch sheet's reply and status, or its refusal as
+        ``{error, message}`` with the phone port's status."""
+        from levain.dispatch.phone import DispatchRefused
+
+        sheet = self.server.dispatch_sheet
+        if sheet is None:      # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        try:
+            return sheet.step(job_id, action, req), 200
+        except DispatchRefused as exc:
             return {"error": exc.error, "message": exc.message}, exc.status
 
     def _sign_post(self, request_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
@@ -2295,6 +2617,13 @@ class _Handler(GuardedHandler):
         if consent_read is not None:                # its read rides the sign listing's gate exactly
             self._serve_consent_sheet(consent_read, head=head)
             return
+        if _dispatch_sheet_id(path) is not None:    # the same sheet over a dispatch job (OS-2)
+            self._serve_sheet(head=head, dispatch=True)
+            return
+        dispatch_read = _dispatch_sheet_read(path)
+        if dispatch_read is not None or path == _DISPATCH_LIST:     # its reads ride the sign listing's gate exactly
+            self._serve_dispatch_sheet(dispatch_read, head=head)
+            return
         # Web push (OS-4), beside a Signer only: the app shell token-free, the reads on the sign reads' own gate
         if self.server.signer is not None and path in _push_static():
             self._serve_push(path, head=head)
@@ -2687,9 +3016,11 @@ class _Handler(GuardedHandler):
         grant = grant_route(route, _GRANT_PREFIX) if self.server.grant_phone is not None else None
         # and the consent family's answer and ruling (OS-2): the same ceremony class, the same gate
         consent = _consent_sign_route(route) if self.server.consent_sheet is not None else None
+        # and the dispatch family's sign, cancel and authorise (OS-2): the same ceremony class, the same gate
+        dispatch = _dispatch_sign_route(route) if self.server.dispatch_sheet is not None else None
         # and web push (OS-4): a token on every bind
         push = route in _PUSH_POST and self.server.signer is not None
-        if (sign is not None or compose or grant is not None or consent is not None or push) \
+        if (sign is not None or compose or grant is not None or consent is not None or dispatch is not None or push) \
                 and not self._off_box_token_valid():
             return self._reject(403, "credential_required", "missing or invalid write token")
         if self._write_token_required() and not self._off_box_token_valid():
@@ -2705,7 +3036,7 @@ class _Handler(GuardedHandler):
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
-                and consent is None and not push):
+                and consent is None and dispatch is None and not push):
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -2720,7 +3051,8 @@ class _Handler(GuardedHandler):
         # concurrency-bounded — a stalled body can't pile up unbounded threads. [L3 MED]
         # a consent answer or ruling carries a signature the person just made with a passkey: it waits a moment for a
         # slot rather than throw that ceremony away, as on the phone port; everything else answers busy at once
-        waits = consent is not None and consent[1] in ("answer", "rule")
+        waits = ((consent is not None and consent[1] in ("answer", "rule"))
+                 or (dispatch is not None and dispatch[1] in ("answer", "cancel", "authorise")))
         if not (self.server.request_gate.acquire(timeout=5) if waits
                 else self.server.request_gate.acquire(blocking=False)):
             return self._reject(503, "busy", "server busy")
@@ -2797,6 +3129,17 @@ class _Handler(GuardedHandler):
                 # read-only refusal applies to it
                 try:
                     payload, status = self._consent_post(consent[0], consent[1], req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if dispatch is not None:
+                # the phone's dispatch ceremony (the passkey's signature, verified by the job store, is the authority):
+                # no read-only refusal applies to it
+                try:
+                    payload, status = self._dispatch_post(dispatch[0], dispatch[1], req)
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -3445,6 +3788,9 @@ def make_server(
             # the grants' passkey revoke over the Signer's own values: its queue (whose consent hook names the ONE
             # cockpit whose log takes the revoke, as on the phone port), rpId, the page origin just pinned, its keys
             sign_queue = signer.queue_dir
+            # the dispatch family (OS-2) over the same values: the dispatch directory IS the consent directory, and the
+            # jobs a card lists are read from that store, so no second queue can disagree with it
+            httpd.dispatch_sheet = DispatchSheet(sign_queue, signer.rp_id, signer.page_origin, signer)
             # only when the grant cards this page shows come from that same queue (/cockpit/consent/grants.json reads
             # the consent reader's): two queues could name two cockpits whose grants share ids and instances, and a
             # button on one card must never revoke the other's. Different queues: no grant route, the button copies.

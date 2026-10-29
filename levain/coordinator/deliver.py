@@ -72,6 +72,27 @@ def _one_thread(conn: sqlite3.Connection, agent: str, session: str) -> str | Non
     return ln.threads[0]
 
 
+_ASKER_TAIL = " (the asker's rec; the coordinator filed none)"
+
+
+def _asker_rec(q: Any) -> str:
+    """The rec an ANSWER record the delivery pass files carries: the ASKER's, as the band shows it (``a: <label>``,
+    the display letter and its label, never the stored key), marked as the asker's. Always a valid rec: never empty,
+    never past :data:`review._REC_MAX` (a long label is cut, never the record refused), ``none`` when the question
+    names no rec it has."""
+    keys = [k for k, _ in q.options]
+    if q.rec in keys and keys.index(q.rec) < 6:
+        i = keys.index(q.rec)
+        head = f"{'abcdef'[i]}: {q.options[i][1]}"
+    else:
+        head = str(q.rec or "").strip() or "none"
+    head = " ".join(head.split())
+    room = review._REC_MAX - len(_ASKER_TAIL)
+    if len(head) > room:
+        head = head[:room - 1] + "…"
+    return head + _ASKER_TAIL
+
+
 def _has_store(store: CoordStore) -> bool:
     """The one check that a coordinator store exists here: the stamp opens (and so would make) it, so a pass on none
     reads nothing and records nothing."""
@@ -140,8 +161,7 @@ def deliver(store: CoordStore, *, queue_dir: Path | str | None = None) -> Delive
                 out.signs.append((row.id, reply_id, new))
             else:
                 text = f"question #{row.n}: {row.what}"[:_TEXT]
-                got = review.push_answer_unless_held(
-                    store, thread, row.id, text, rec=f"{row.rec} (the asker's rec; the coordinator filed none)")
+                got = review.push_answer_unless_held(store, thread, row.id, text, rec=_asker_rec(row))
                 if got is not None:             # None: the coordinator's hold landed first, which decides
                     out.answers.append((row.id, got[0], got[1]))
         except Exception as exc:  # noqa: BLE001 - one row's failure never hides the others

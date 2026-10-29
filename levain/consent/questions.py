@@ -36,6 +36,7 @@ another writer; the other reads answer empty with no ``questions.db`` and never 
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -74,6 +75,35 @@ _N_MAX = 2 ** 63 - 1                     # SQLite's INTEGER
 # not this). One deadline, not SQLite's busy_timeout per step: that counts the sleeps it asked for, not time passed
 HOOK_BUSY_MS = 2000
 _RETRY_SECONDS = 0.025
+# the deadline (``time.monotonic()``) a caller on a bound (the band's hook) sets for every read under it: a snapshot
+# then waits at most what is left of it, never a fresh HOOK_BUSY_MS per read (:func:`read_deadline`)
+_READ_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar("levain_questions_read_deadline",
+                                                                             default=None)
+
+
+@contextmanager
+def read_deadline(deadline: float | None) -> Iterator[None]:
+    """Every :meth:`QuestionStore._peek` under this block waits on a lock at most until ``deadline``
+    (``time.monotonic()``; ``None`` leaves the ordinary HOOK_BUSY_MS each). An expired deadline still reads a store no
+    one holds: it only stops the waiting."""
+    token = _READ_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _READ_DEADLINE.reset(token)
+
+
+def current_read_deadline() -> float | None:
+    """The deadline a :func:`read_deadline` block set, or ``None``: other readers on the same bound (the band's
+    authority sources) cap their own waits to it."""
+    return _READ_DEADLINE.get()
+
+
+def _read_wait_ms() -> int:
+    deadline = _READ_DEADLINE.get()
+    if deadline is None:
+        return HOOK_BUSY_MS
+    return max(0, min(HOOK_BUSY_MS, int((deadline - time.monotonic()) * 1000)))
 
 
 class QuestionStoreError(RuntimeError):
@@ -285,13 +315,15 @@ class QuestionStore:
             raise QuestionStoreError(f"question store directory {self.directory} is reachable by group or others "
                                      f"(mode {st.st_mode & 0o777:o}); it must be 0700")
 
-    def _connect(self, busy_ms: int | None = None) -> sqlite3.Connection:
+    def _connect(self, busy_ms: int | None = None, open_s: float | None = None) -> sqlite3.Connection:
+        """A durable connection; ``open_s`` bounds the open's own waits (:func:`open_durable`'s ``busy_s``) and
+        ``busy_ms`` the busy timeout after, the first-time setup included."""
         if self._ready:
             if not self.path.exists():
                 raise QuestionStoreError(f"question store {self.path} has disappeared")
         else:
             self._check_directory()
-        conn = open_durable(self.path)
+        conn = open_durable(self.path, busy_s=open_s)
         try:
             if busy_ms is not None:
                 conn.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
@@ -326,6 +358,15 @@ class QuestionStore:
             _rollback(conn)
             raise
 
+    def ready_by(self, deadline: float) -> None:
+        """Set the store up (a first number on a store no question was filed in) with every wait bounded by
+        ``deadline`` (``time.monotonic()``): the open, the WAL switch and the setup's ``BEGIN IMMEDIATE``. A lock held
+        past it raises SQLite's busy error and sets nothing up (the next caller tries again)."""
+        if self._ready:
+            return
+        left = max(0.0, deadline - time.monotonic())
+        self._connect(busy_ms=int(left * 1000), open_s=left).close()
+
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
         with write_transaction(self._connect) as conn:
@@ -339,7 +380,7 @@ class QuestionStore:
         # Only ever called after _peek found a set-up store: _connect's own setup would BEGIN IMMEDIATE at busy 0,
         # outside the retry loop below.
         assert self._ready
-        conn = self._connect(busy_ms=0)
+        conn = self._connect(busy_ms=0, open_s=max(0.0, deadline - time.monotonic()))
         try:
             while True:
                 try:
@@ -363,7 +404,8 @@ class QuestionStore:
 
     @contextmanager
     def _peek(self) -> Iterator[sqlite3.Connection | None]:
-        """Every read: a snapshot opened read-only, waiting at most :data:`HOOK_BUSY_MS` on a lock; it never
+        """Every read: a snapshot opened read-only, waiting at most :data:`HOOK_BUSY_MS` on a lock (less under a
+        :func:`read_deadline`); it never
         creates, sets up or writes the store, so a tool call with nothing to deliver takes no write lock. ``None``
         when there is no store yet (no file, an empty one, or one a filer has not set up); a store of another
         format raises :class:`QuestionStoreError`."""
@@ -375,10 +417,11 @@ class QuestionStore:
             yield None
             return
         self._check_directory()
-        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=HOOK_BUSY_MS / 1000,
+        wait_ms = _read_wait_ms()
+        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=wait_ms / 1000,
                                isolation_level=None)
         try:
-            conn.execute(f"PRAGMA busy_timeout = {HOOK_BUSY_MS}")
+            conn.execute(f"PRAGMA busy_timeout = {wait_ms}")
             conn.execute("BEGIN")
             have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in have else None

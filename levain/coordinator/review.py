@@ -637,12 +637,13 @@ def file_know(store: CoordStore, thread_id: str | None, text: str, *, by: str = 
 
 
 # --- waiting on you (derived, never stored; C0 §2) ---------------------------------------------------------------
-def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] | None = None
-                       ) -> Callable[[str], bool | None]:
+def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] | None = None,
+                       conn: sqlite3.Connection | None = None) -> Callable[[str], bool | None]:
     """A request id -> open? read from ``queue.db`` with ``mode=ro``: open while ``undecided`` or ``pending`` and not past
     the queue's own expiry rule (:meth:`ConsentQueue._expiry_due`, the one the queue's read and sweep use: a hold's end
     plus ``UNDECIDED_GRACE``), closed in any other state, ``None`` when the store or the row cannot be read. A raw read:
-    this is information, and the seal on a row is the queue's own business."""
+    this is information, and the seal on a row is the queue's own business. ``conn``: a read-only connection to
+    ``queue.db`` the caller holds (one snapshot for every request, its busy wait the caller's), else one per call."""
     from levain.consent.queue import ConsentQueue
 
     path = Path(queue_dir) / "queue.db"
@@ -650,15 +651,17 @@ def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] |
 
     def read(request_id: str) -> bool | None:
         try:
-            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+            c = conn if conn is not None else sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True,
+                                                              timeout=2.0)
         except (OSError, sqlite3.Error):
             return None
         try:
-            row = conn.execute("SELECT state, expires_at FROM requests WHERE id = ?", (request_id,)).fetchone()
+            row = c.execute("SELECT state, expires_at FROM requests WHERE id = ?", (request_id,)).fetchone()
         except sqlite3.Error:
             return None
         finally:
-            conn.close()
+            if c is not conn:
+                c.close()
         if row is None:
             return None
         if row[0] == "pending" and ConsentQueue._expiry_due(row[1], utc_stamp(now())):
@@ -667,16 +670,17 @@ def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] |
     return read
 
 
-def question_open(queue_dir: Path | str) -> Callable[[str], bool | None]:
+def question_open(queue_dir: Path | str, *, conn: sqlite3.Connection | None = None) -> Callable[[str], bool | None]:
     """A question id -> open? read through the band's own read-only path: open while it has no answer, ``None`` when
-    there is no such question or the store cannot be read (the record is then ``unresolved``, never dropped)."""
+    there is no such question or the store cannot be read (the record is then ``unresolved``, never dropped).
+    ``conn``: a read-only connection to ``questions.db`` the caller holds (one snapshot for every question)."""
     from levain.consent.questions import QuestionStore
 
     qs = QuestionStore(Path(queue_dir))
 
     def read(question_id: str) -> bool | None:
         try:
-            q = qs.get(question_id)
+            q = qs.get(question_id) if conn is None else QuestionStore._by_ref(conn, question_id)
         except Exception:  # noqa: BLE001 - a bad store is an unreadable record, not a crashed view
             return None
         return None if q is None else q.answer is None
@@ -687,7 +691,8 @@ def waiting_on_you(store: CoordStore, *, sign_open: Callable[[str], bool | None]
                    answer_open: Callable[[str], bool | None], conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """What waits on you, derived from the open SIGN and ANSWER records: ``{"threads": {thread_id: [records]},
     "loose": [records with no thread], "unresolved": [records whose state could not be read]}``. A record is
-    ``{"kind", "ref_id", "reply_id", "text"}``. A thread with no open record is absent. ``conn`` is the read
+    ``{"kind", "ref_id", "reply_id", "text"}``; a record whose stored body is not readable JSON is ``unresolved`` with
+    ``unreadable`` saying so, and the others are read as ever. A thread with no open record is absent. ``conn`` is the read
     transaction a caller already holds."""
     from levain.coordinator import budget
 
@@ -705,11 +710,19 @@ def waiting_on_you(store: CoordStore, *, sign_open: Callable[[str], bool | None]
             rows, extend = read(own)
     out: dict[str, Any] = {"threads": {}, "loose": [], "unresolved": []}
     for reply_id, thread_id, kind, ref_id, body, ref_store in rows:
+        try:
+            parsed = json.loads(body)
+            if not isinstance(parsed, dict):
+                raise ValueError("the body is not an object")
+        except (TypeError, ValueError, RecursionError):
+            # one record whose body cannot be read: unresolved, that record alone (never every other one lost)
+            out["unresolved"].append({"kind": kind, "ref_id": ref_id, "reply_id": reply_id, "text": "", "rec": None,
+                                      "ref_store": ref_store, "unreadable": "its body is not readable JSON"})
+            continue
         if ref_store == budget.SIGN_REF:
             state = extend[ref_id]
         else:
             state = (sign_open if kind == "sign" else answer_open)(ref_id)
-        parsed = json.loads(body)
         rec = {"kind": kind, "ref_id": ref_id, "reply_id": reply_id, "text": parsed.get("text", ""),
                "rec": parsed.get("rec"), "ref_store": ref_store}
         if state is None:
