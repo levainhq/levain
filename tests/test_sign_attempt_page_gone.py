@@ -29,7 +29,7 @@ OPEN_ROW = f"({ROW}.querySelector('.consent-details').click(), 1)"
 ROW_NOTE = f"(({ROW} || document).querySelector('.sign-note') || {{}}).textContent"
 ROW_OPTIONS = f"(({ROW} || document).querySelectorAll('.sign-option')).length"
 # the "not signed:" note, the row opened again whenever it reads closed (a repaint removes the note with the open state)
-NOTE_REOPENING = (f"({ROW} && !{ROW}.querySelector('.sign-note') && {ROW}.querySelector('.consent-details').click(), "
+NOTE_REOPENING = (f"({ROW} && !{ROW}.querySelector('.sign-note') && ({ROW}.querySelector('.consent-details') || {{}}).click?.(), "
                   f"/not signed:/.test({ROW_NOTE}) && {ROW_NOTE})")
 # the row's note and how many options it drew, read together once the note says `re` (a board read repaints the row)
 ROW_SAYS = "({re}.test({note}) && JSON.stringify([{note}, {opts}]))"
