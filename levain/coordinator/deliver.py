@@ -136,11 +136,12 @@ def deliver(store: CoordStore, *, queue_dir: Path | str | None = None) -> Delive
         try:
             if kind == "sign":
                 text = f"{row.agent} asks to run {row.tool_name} in {row.cwd}: {row.display}"[:_TEXT]
-                reply_id, new = review.push_sign(store, thread, row.id, text)
+                reply_id, new = review.push_sign(store, thread, row.id, text, rec=review.NO_REC)
                 out.signs.append((row.id, reply_id, new))
             else:
                 text = f"question #{row.n}: {row.what}"[:_TEXT]
-                got = review.push_answer_unless_held(store, thread, row.id, text)
+                got = review.push_answer_unless_held(
+                    store, thread, row.id, text, rec=f"{row.rec} (the asker's rec; the coordinator filed none)")
                 if got is not None:             # None: the coordinator's hold landed first, which decides
                     out.answers.append((row.id, got[0], got[1]))
         except Exception as exc:  # noqa: BLE001 - one row's failure never hides the others

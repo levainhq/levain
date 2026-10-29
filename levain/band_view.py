@@ -48,11 +48,12 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from levain.band_shorthand import ItemInfo, Parse, View, parse
+from levain.band_sources import Extra, Extras, read_extras, sheet_text
 from levain.cockpit.consent import utc_stamp
 from levain.consent.questions import HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select
 
 __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
-           "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "record_view", "render", "render_full", "render_with_closed",
+           "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed",
            "run_band", "run_band_answer"]
 
 COMPACT_AFTER = 12
@@ -151,24 +152,27 @@ def _busy(exc: sqlite3.OperationalError) -> bool:
     return code is not None and (code & 0xFF) in (5, 6)
 
 
-def _number(store: QuestionStore, refs: list[str], deadline: float) -> dict[str, int]:
+def _number(store: QuestionStore, refs: list[Any], deadline: float) -> dict[Any, int]:
     """Number every ``refs`` that has no number yet (in the order given), in ONE write transaction waited for until
-    ``deadline``. The numbers come back read under the lock, so two writers never number a ref twice. The lock still
+    ``deadline``. A ref is a question id, or ``(source, ref)`` for another source; the result is keyed as given. The numbers come back read under the lock, so two writers never number a ref twice. The lock still
     busy at the deadline: nothing written, nothing returned (``new (number pending)``); any other error is raised."""
     try:
+        if not store._ready:                  # no question was ever filed here: the store is set up for the first number
+            _ = store.store_id
         with store._write_by(deadline) as conn:
             for stmt in BAND_SCHEMA:
                 conn.execute(stmt)
             stamp = utc_stamp(_now_utc(store._clock))
-            got: dict[str, int] = {}
-            for ref in refs:
-                row = conn.execute("SELECT n FROM band_items WHERE source = 'question' AND ref = ?", (ref,)).fetchone()
+            got: dict[Any, int] = {}
+            for key in refs:
+                source, ref = key if isinstance(key, tuple) else ("question", key)
+                row = conn.execute("SELECT n FROM band_items WHERE source = ? AND ref = ?", (source, ref)).fetchone()
                 if row is None:
-                    conn.execute("INSERT INTO band_items (source, ref, numbered_at) VALUES ('question', ?, ?)",
-                                 (ref, stamp))
-                    row = conn.execute("SELECT n FROM band_items WHERE source = 'question' AND ref = ?",
-                                       (ref,)).fetchone()
-                got[ref] = row[0]
+                    conn.execute("INSERT INTO band_items (source, ref, numbered_at) VALUES (?, ?, ?)",
+                                 (source, ref, stamp))
+                    row = conn.execute("SELECT n FROM band_items WHERE source = ? AND ref = ?",
+                                       (source, ref)).fetchone()
+                got[key] = row[0]
             return got
     except sqlite3.OperationalError as exc:
         if _busy(exc):
@@ -214,35 +218,95 @@ def render_with_closed(store: QuestionStore | None = None) -> tuple[str, list[in
     return r.text, r.closed
 
 
+def _extra_state(store: QuestionStore, extras: Extras) -> tuple[dict[tuple[str, str], int], list[tuple[int, str]]]:
+    """The numbers the authority items already have, and the numbered ones of a fully read source that are no longer
+    open and not yet shown closed. Closing is read only from a source that was read in full."""
+    with store._peek() as conn:
+        if conn is None or "band_items" not in _tables(conn):
+            return {}, []
+        have = _tables(conn)
+        rows = conn.execute("SELECT n, source, ref FROM band_items WHERE source != 'question' ORDER BY n").fetchall()
+        shown_closed = ({r[0] for r in conn.execute("SELECT n FROM band_closed_shown")}
+                        if "band_closed_shown" in have else set())
+    numbers = {(src, ref): n for n, src, ref in rows}
+    still = {(e.source, e.ref) for e in extras.items}
+    closed = [(n, ref) for n, src, ref in rows
+              if src in extras.complete and (src, ref) not in still and n not in shown_closed]
+    return numbers, closed
+
+
+def _extra_lines(label: str, e: Extra, compact: bool) -> list[str]:
+    if e.unreadable:
+        return [f"{label} [{e.tag}] {e.what} (listed, never dropped)"]
+    if compact:
+        return [f"{label} [{e.tag}] {_short(e.what, _COMPACT_WHAT)} · rec: {e.rec}"]
+    opts = "   ".join(f"{_LETTERS[i]}) {lab}" for i, lab in enumerate(e.options))
+    return [f"{label} [{e.tag}] {e.what}   <- needs your signature",
+            f"    {opts}",
+            f"    rec: {e.rec} · blocks: {e.blocks} · {e.origin}"]
+
+
 def render_full(store: QuestionStore | None = None) -> Rendered:
     """:func:`render_with_closed` plus what the view row needs (:class:`Rendered`)."""
     store = store if store is not None else QuestionStore()
     gen = time.time_ns()                      # before the snapshot: a later render has a greater gen
     deadline = time.monotonic() + HOOK_BUSY_MS / 1000
     items, numbers, closed = _read(store)
-    refs = [i for i, _ in items if i not in numbers]
-    if refs:
-        numbers = {**numbers, **_number(store, refs, deadline)}
-    if not items and not closed:
+    try:
+        extras = read_extras(store.directory, store._clock)
+    except Exception as exc:  # noqa: BLE001 - the questions still render; the band says the sources were not read
+        extras = Extras(failed=[f"authority sources: {type(exc).__name__}"])
+    extra_numbers, extra_closed = _extra_state(store, extras) if extras.items or extras.complete else ({}, [])
+    filed: dict[tuple[str, str], str] = {}
+    last = ""
+    for i, q in items:                        # a row that cannot be read takes its neighbour's time: its place holds
+        last = q.filed_at if q is not None else last
+        filed[("question", i)] = last
+    entries: list[tuple[tuple[str, str], Question | Extra | None]] = [(("question", i), q) for i, q in items]
+    for e in extras.items:
+        entries.append(((e.source, e.ref), e))
+        filed[(e.source, e.ref)] = e.filed
+    new = [k for k, _ in entries if (numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)) is None]
+    new.sort(key=lambda k: filed.get(k, ""))              # each source's own filed time; a stable sort keeps ties
+    if new:
+        got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline)
+        numbers = {**numbers, **{k: v for k, v in got.items() if isinstance(k, str)}}
+        extra_numbers = {**extra_numbers, **{k: v for k, v in got.items() if isinstance(k, tuple)}}
+
+    def number_of(k: tuple[str, str]) -> int | None:
+        return numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)
+
+    closed_all = sorted([*closed, *extra_closed])
+    if not entries and not closed_all and not extras.failed:
         return Rendered("", [], [], 0, gen)
-    shown = [numbers[i] for i, _ in items if i in numbers]
-    hwm = max([*shown, *(n for n, _ in closed)], default=0)
-    head = [f"NEEDS YOU · {len(items)} open"]
-    if shown or closed:
+    order = sorted(range(len(entries)), key=lambda p: (number_of(entries[p][0]) is None,
+                                                       number_of(entries[p][0]) or 0, p))
+    shown = [n for p in order if (n := number_of(entries[p][0])) is not None]
+    hwm = max([*shown, *(n for n, _ in closed_all)], default=0)
+    head = [f"NEEDS YOU · {len(entries)} open"]
+    if shown or closed_all:
         head.append(f"band@{hwm}")
-    if closed:
-        head.append("closed " + ", ".join(str(n) for n, _ in closed))
+    if closed_all:
+        head.append("closed " + ", ".join(str(n) for n, _ in closed_all))
     lines = [" · ".join(head)]
-    for pos, (ref, q) in enumerate(items):
-        n = numbers.get(ref)
+    for pos, p in enumerate(order):
+        key, obj = entries[p]
+        n = number_of(key)
         label = f"{n}." if n is not None else "new (number pending):"
         try:
-            if q is None:
+            if obj is None:
                 raise ValueError("unreadable")
-            lines.extend(_item_lines(label, q, compact=pos >= COMPACT_AFTER))
+            if isinstance(obj, Extra):
+                lines.extend(_extra_lines(label, obj, compact=pos >= COMPACT_AFTER))
+            else:
+                lines.extend(_item_lines(label, obj, compact=pos >= COMPACT_AFTER))
+                if obj.id in extras.escalations:
+                    text, rec = extras.escalations[obj.id]
+                    lines.append(f"    escalated by the coordinator: {_short(text, 200)} · rec on record: {rec}")
         except Exception:                     # one item that will not render never drops the band (D13)
-            lines.append(f"{label} UNREADABLE: question {ref} could not be read (listed, never dropped)")
-    return Rendered("\n".join(lines), [n for n, _ in closed], shown, hwm, gen)
+            lines.append(f"{label} UNREADABLE: {key[0]} {key[1]} could not be read (listed, never dropped)")
+    lines.extend(f"! not read: {why} (items from it are missing, not closed)" for why in extras.failed)
+    return Rendered("\n".join(lines), [n for n, _ in closed_all], shown, hwm, gen)
 
 
 def render(store: QuestionStore | None = None) -> str:
@@ -332,32 +396,100 @@ def _info_of(q: Question) -> ItemInfo:
     return ItemInfo("authority" if q.link is not None else "information", min(len(q.options), len(_LETTERS)), rec)
 
 
-def plan_for(store: QuestionStore, viewer: str, text: str) -> tuple[Parse, View | None, dict[int, Question]]:
-    """The parser's plan for ``text`` bound to ``viewer``'s last view, with the questions it names."""
+def _extras_of(store: QuestionStore, view: View) -> dict[int, Extra]:
+    """The authority items behind the view's numbers that are open NOW, read fresh: one that has closed since (or whose
+    source cannot be read) is absent, so shorthand on it opens nothing."""
+    with store._peek() as conn:
+        if conn is None or "band_items" not in _tables(conn):
+            return {}
+        refs = {n: (src, ref) for n in view.open_list for src, ref in [r for r in conn.execute(
+            "SELECT source, ref FROM band_items WHERE n = ? AND source != 'question'", (n,))]}
+    if not refs:
+        return {}
+    open_now = {(e.source, e.ref): e for e in read_extras(store.directory, store._clock).items}
+    return {n: open_now[k] for n, k in refs.items() if k in open_now and open_now[k].unreadable is None}
+
+
+def _info_of_extra(e: Extra) -> ItemInfo:
+    return ItemInfo("authority", min(len(e.options), len(_LETTERS)), e.rec_letter)
+
+
+def plan_for_full(store: QuestionStore, viewer: str, text: str
+                  ) -> tuple[Parse, View | None, dict[int, Question], dict[int, Extra]]:
+    """:func:`plan_for` plus the authority items (open now) the view's numbers name."""
     view = last_view(store, viewer)
     questions = _items_of(store, view) if view is not None else {}
-    plan = parse(text, view, {n: _info_of(q) for n, q in questions.items()}, _store_id_of(store))
+    try:
+        extras = _extras_of(store, view) if view is not None else {}
+    except Exception:                        # unreadable sources: their numbers are simply not open for shorthand
+        extras = {}
+    infos = {n: _info_of(q) for n, q in questions.items()}
+    infos.update({n: _info_of_extra(e) for n, e in extras.items()})
+    return parse(text, view, infos, _store_id_of(store)), view, questions, extras
+
+
+def plan_for(store: QuestionStore, viewer: str, text: str) -> tuple[Parse, View | None, dict[int, Question]]:
+    """The parser's plan for ``text`` bound to ``viewer``'s last view, with the questions it names."""
+    plan, view, questions, _extras = plan_for_full(store, viewer, text)
     return plan, view, questions
 
 
+def _question_sheet_text(q: Question, letter: str) -> str:
+    """The ceremony of a question with a Link: the phone's ``question_rule`` sheet. The tap on the linked option signs
+    the ruling first; the answer is recorded only once it verified."""
+    link = q.link
+    label = dict(q.options).get(link.option, link.option) if link is not None else ""
+    pick = q.options[_LETTERS.index(letter)][1] if _LETTERS.index(letter) < len(q.options) else letter
+    only = "" if link is None or q.options[_LETTERS.index(letter)][0] == link.option else (
+        f"; only {label!r} carries the signed ruling")
+    return (f"open question #{q.n} on your phone and tap {pick!r}: the tap signs the ruling first and the answer is "
+            f"recorded only once it verified{only}")
+
+
 class Applied(NamedTuple):
-    """What :func:`apply_plan` did: the labels recorded, the refusal texts, and the echo that says both."""
+    """What :func:`apply_plan` did: the labels recorded, the refusal texts, and the echo that says both. ``sheets``:
+    the signing ceremonies opened for authority items (one line each); they record nothing."""
     recorded: list[str]
     refused: list[str]
     echo: str
+    sheets: tuple[str, ...] = ()
 
 
 def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question], *, viewer: str, via: str,
-               seen_through: int, deadline: float | None = None) -> Applied:
+               seen_through: int, deadline: float | None = None, extras: dict[int, Extra] | None = None,
+               environ: Mapping[str, str] | None = None) -> Applied:
     """Record ``plan.actions`` with their ``answer_context`` sidecars (via, viewer, the view's ``seen_through``, the
     note verbatim) through ONE :meth:`QuestionStore.answer_with_context` write (channel ``cli``, the human channel a
     terminal or a seat's typing is): an answer and its context are stored together or not at all, and the lock is
     waited for until ``deadline`` (``time.monotonic()``; the hook passes its own, ``None`` the ordinary wait). An
     item closed since the view, or refused by the store, is refused for that item alone; the lock busy at the
     deadline (or any store failure) records nothing and refuses each item. It never raises once it is called:
-    the echo it returns always says what was recorded."""
+    the echo it returns always says what was recorded.
+
+    An authority item (``plan.sheets``, D8 SIG-ONLY) records NOTHING here: its existing signing ceremony is named with
+    the pick preselected (``Applied.sheets``), and only if the item is still open now. No ruling, signature or answer
+    is written for it by this function."""
     recorded: list[str] = []
     refused = [r.reason for r in plan.refused]
+    sheets: list[str] = []
+    for sh in plan.sheets:
+        try:
+            q = questions.get(sh.n)
+            e = (extras or {}).get(sh.n)
+            if q is not None:
+                if q.answer is not None:
+                    refused.append(f"{sh.n} was already answered ({q.answer.channel}, {q.answer.answered_at}); "
+                                   "nothing opened")
+                elif q.link is None:
+                    refused.append(f"{sh.n} is no longer a signing item; nothing opened")
+                else:
+                    sheets.append(f"{sh.label}: {_question_sheet_text(q, sh.pick)}")
+            elif e is not None:
+                sheets.append(f"{sh.label}: {sheet_text(e, sh.pick, store.directory, environ)}")
+            else:
+                refused.append(f"{sh.n} is no longer open; nothing opened")
+        except Exception as exc:                              # one sheet's failure never costs the others
+            refused.append(f"{sh.n}: the signing sheet could not be built ({type(exc).__name__}); nothing recorded")
     todo: list[tuple[Any, dict[str, Any]]] = []
     for act in plan.actions:
         try:
@@ -392,20 +524,24 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
             else:
                 recorded.append(act.label)
     try:
-        echo = format_echo(recorded, refused, via, plan.hint)
+        echo = format_echo(recorded, refused, via, plan.hint, sheets)
     except Exception:                                         # what was recorded is said, whatever the formatting
         echo = "[Levain band answer] recorded: " + (", ".join(recorded) or "nothing")
-    return Applied(recorded, refused, echo)
+    return Applied(recorded, refused, echo, tuple(sheets))
 
 
-def format_echo(recorded: list[str], refused: list[str], via: str, hint: str | None = None) -> str:
-    """The echo: exactly what was recorded and refused (``recorded: 1a (you, seat); refused: 16 ...``)."""
-    if hint and not recorded and not refused:
+def format_echo(recorded: list[str], refused: list[str], via: str, hint: str | None = None,
+                sheets: list[str] | None = None) -> str:
+    """The echo: exactly what was recorded and refused (``recorded: 1a (you, seat); refused: 16 ...``), and the
+    signing sheets opened for authority items (``signature needed, nothing recorded: 16a: ...``)."""
+    if hint and not recorded and not refused and not sheets:
         return f"[Levain band answer] {hint}."
     got = ", ".join(f"{label} (you, {via})" for label in recorded) or "nothing"
     line = f"[Levain band answer] recorded: {got}"
     if refused:
         line += "; refused: " + "; ".join(refused)
+    if sheets:
+        line += "; signature needed, nothing recorded (the item closes only when your signature verifies): " + "; ".join(sheets)
     if hint:
         line += f"; {hint}"
     return line
@@ -424,11 +560,12 @@ def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mappin
     only before anything is recorded (a store that cannot be read); :func:`apply_plan` never raises."""
     if not isinstance(prompt, str) or not prompt.strip() or _is_relay(prompt, environ):
         return ""
-    plan, view, questions = plan_for(store, viewer, prompt)
+    plan, view, questions, extras = plan_for_full(store, viewer, prompt)
     if not plan.matched:
         return format_echo([], [], "seat", plan.hint) if plan.hint else ""
     return apply_plan(store, plan, questions, viewer=viewer, via="seat",
-                      seen_through=view.seen_through if view else 0, deadline=deadline).echo
+                      seen_through=view.seen_through if view else 0, deadline=deadline, extras=extras,
+                      environ=environ).echo
 
 
 def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> str:
@@ -577,7 +714,7 @@ def run_band_answer(args: argparse.Namespace) -> int:
         return EXIT_REFUSED
     try:
         store = QuestionStore(args.queue_dir)
-        plan, view, questions = plan_for(store, "cli", args.line)
+        plan, view, questions, extras = plan_for_full(store, "cli", args.line)
         if not plan.matched or plan.rest.strip():
             why = plan.hint or "the whole line must be band answers, e.g. `1a, 2: rec`"
             print(f"levain band answer: refused: {why}; nothing was recorded", file=sys.stderr)
@@ -585,7 +722,8 @@ def run_band_answer(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"levain band answer: refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
-    done = apply_plan(store, plan, questions, viewer="cli", via="cli", seen_through=view.seen_through if view else 0)
+    done = apply_plan(store, plan, questions, viewer="cli", via="cli", seen_through=view.seen_through if view else 0,
+                      extras=extras)
     print(done.echo.replace("[Levain band answer] ", "levain band answer: "))
     return 0 if done.recorded else EXIT_REFUSED
 

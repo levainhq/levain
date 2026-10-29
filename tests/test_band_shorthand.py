@@ -111,7 +111,7 @@ def test_no_view_refuses_everything():
 
 def test_authority_item_records_nothing():
     p = run("5a")
-    assert not p.actions and p.refused[0].reason == "5 needs your signature; nothing recorded"
+    assert not p.actions and not p.refused and [(x.n, x.pick) for x in p.sheets] == [(5, "a")]
 
 
 def test_letter_past_the_options_is_refused_for_that_item():

@@ -138,6 +138,19 @@ def _thread_of(conn: sqlite3.Connection, store: CoordStore, request_id: str, ses
     return ln.threads[0] if ln is not None and ln.role == "worker" and len(ln.threads) == 1 else None
 
 
+def _band(qdir: Path) -> dict[str, Any]:
+    """The NEEDS YOU band as the card carries it: ``{"text", "shown", "error"}``. Showing the band numbers its items
+    (a first show, as ``levain band`` does); a band that cannot be rendered is said, never an empty band."""
+    from levain import band_view
+    from levain.consent.questions import QuestionStore
+
+    try:
+        r = band_view.render_full(QuestionStore(qdir))
+    except Exception as exc:  # noqa: BLE001 - named on the card
+        return {"text": "", "shown": [], "error": f"{type(exc).__name__}: {exc}"[:_FIELD]}
+    return {"text": r.text, "shown": r.shown, "error": None}
+
+
 def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Sequence[review.Item] | None = None,
          review_total: int | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """The morning card's data (display only; see the module docstring). Every section of the coordinator's store is
@@ -193,7 +206,8 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
     items_out = [{"item_id": i.item_id, "feed": i.feed, "thread_id": i.thread_id,
                   "authority_relevant": i.authority_relevant, "text": str(i.body.get("text", ""))[:_FIELD]}
                  for i in queue]
-    return {"at": now, "away": away, "any_away": any(a.get("away") for a in away.values()),
+    band = _band(qdir)
+    return {"at": now, "away": away, "band": band, "any_away": any(a.get("away") for a in away.values()),
             "undecided": undecided, "budgets": budgets, "waiting": waiting, "delivery_ran": review.last_pass(conn), "review": items_out,
             "review_total": len(items_out) if review_total is None else review_total, "errors": errors}
 
@@ -201,6 +215,8 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
 def render(c: dict[str, Any]) -> str:
     """The card as lines for ``levain coord morning`` (a CLI view of the data; the panels are a K lane's)."""
     L = [f"morning card, {c['at']}"]
+    b = c.get("band") or {"text": "", "error": "the card carries no band"}
+    L.append(f"NEEDS YOU band: could not render ({b['error']})" if b["error"] else b["text"] or "NEEDS YOU · nothing open")
     away = [a for a, s in c["away"].items() if s.get("away")]
     unknown = [a for a, s in c["away"].items() if s.get("away") is None]
     L.append("away: " + (f"ON for {', '.join(away)}: SIGNs wait UNDECIDED; leaving takes your signature "

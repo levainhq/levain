@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-__all__ = ["Action", "ItemInfo", "Parse", "Refusal", "View", "parse"]
+__all__ = ["Action", "ItemInfo", "Parse", "Refusal", "Sheet", "View", "parse"]
 
 _NUM = r"[1-9][0-9]{0,6}(?![0-9])"
 _REC = r"(?:your\s+rec|you\s+rec|recs|rec|r)(?![A-Za-z0-9])"
@@ -55,7 +55,7 @@ class View:
 @dataclass(frozen=True)
 class ItemInfo:
     """What a numbered item is: ``kind`` is ``information`` (shorthand records an answer) or ``authority`` (it records
-    nothing: S3 routes it to its signing sheet); ``options`` the count; ``rec_letter`` the display letter of its rec."""
+    nothing: it opens its signing ceremony, see :class:`Sheet`); ``options`` the count; ``rec_letter`` the display letter of its rec."""
     kind: str
     options: int
     rec_letter: str | None
@@ -78,6 +78,20 @@ class Action:
 
 
 @dataclass(frozen=True)
+class Sheet:
+    """A pick on an AUTHORITY item (D8, SIG-ONLY): not an answer. It names the item's signing ceremony to open with
+    option ``pick`` preselected; nothing is recorded by it, and the item closes only when the existing signed path
+    verifies."""
+    n: int
+    pick: str
+    via_rec: bool = False
+
+    @property
+    def label(self) -> str:
+        return f"{self.n} rec→{self.pick}" if self.via_rec else f"{self.n}{self.pick}"
+
+
+@dataclass(frozen=True)
 class Refusal:
     n: int | None
     reason: str
@@ -96,6 +110,7 @@ class Parse:
     refused: tuple[Refusal, ...] = ()
     rest: str = ""
     hint: str | None = None
+    sheets: tuple[Sheet, ...] = ()
 
 
 @dataclass
@@ -211,6 +226,7 @@ def parse(text: str, view: View | None, items: dict[int, ItemInfo], current_stor
         else:
             by_n.setdefault(r.n, []).append(r)
     actions: list[Action] = []
+    sheets: list[Sheet] = []
     open_set = set(view.open_list)
     for n, entries in by_n.items():
         if n > view.seen_through:
@@ -221,7 +237,11 @@ def parse(text: str, view: View | None, items: dict[int, ItemInfo], current_stor
             refused.append(Refusal(n, f"{n} was not open in the band you saw; nothing recorded for it"))
             continue
         if info.kind != "information":
-            refused.append(Refusal(n, f"{n} needs your signature; nothing recorded"))
+            sheet, why = _sheet(n, entries, info)
+            if sheet is not None:
+                sheets.append(sheet)
+            else:
+                refused.append(Refusal(n, why))
             continue
         picks: list[tuple[str, str, bool]] = []          # (kind, value, via_rec)
         bad: str | None = None
@@ -270,4 +290,25 @@ def parse(text: str, view: View | None, items: dict[int, ItemInfo], current_stor
                 covered += 1
         if not covered and len(refused) == before:
             refused.append(Refusal(None, "nothing open was left for the sweep to take"))
-    return Parse(True, tuple(actions), tuple(refused), rest)
+    return Parse(True, tuple(actions), tuple(refused), rest, sheets=tuple(sheets))
+
+
+def _sheet(n: int, entries: list[_Raw], info: ItemInfo) -> tuple[Sheet | None, str]:
+    """An authority item's entries: the one pick to preselect on its signing sheet, or why there is none. Free text is
+    never a pick: a signature covers an option only."""
+    picks: dict[str, bool] = {}
+    for r in entries:
+        if r.kind == "text":
+            return None, f"{n} needs your signature on an option; words are not a pick, nothing recorded"
+        if r.kind == "rec":
+            if info.rec_letter is None:
+                return None, f"{n} needs your signature and has no rec letter to preselect; nothing recorded"
+            picks.setdefault(info.rec_letter, True)
+        elif "abcdef".index(r.letter) >= info.options:
+            return None, f"{n} has no option {r.letter}"
+        else:
+            picks[r.letter] = False
+    if len(picks) > 1:
+        return None, "conflict: " + " and ".join(f"{n}{k}" for k in picks) + "; nothing recorded"
+    (letter, via_rec), = picks.items()
+    return Sheet(n, letter, via_rec), ""

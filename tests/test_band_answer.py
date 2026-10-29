@@ -229,7 +229,7 @@ def test_an_authority_item_gets_no_answer_from_shorthand(store, env):
     out = prompt(env, "all recs, 2a")
     assert answers(store) == [(1, "option", "exp", "cli")]
     assert store.get(q2.n).answer is None
-    assert "2 needs your signature; nothing recorded" in out
+    assert "signature needed, nothing recorded" in out and "2a: open question #2 on your phone" in out
 
 
 def test_fail_open_on_a_broken_store_the_prompt_passes_and_nothing_is_recorded(store, env, qdir):
