@@ -138,10 +138,11 @@ def test_every_card_state_is_served_from_the_rows_and_drawn(tmp_path, monkeypatc
     decided = [n for n in cards if n != "pending"]
     steps = [
         NARROW,
-        {"until": f"{board} && {board}.querySelector('.egress-state')"},
-        {"eval": f"(() => {{ {board}.scrollIntoView({{block: 'start'}}); return ({state_of})({board}); }})()"},
+        # the strip draws a summary row; the card and its egress state are drawn only in the focus view, which the row opens
+        {"until": f"{board} && {board}.querySelector('.needs-row-sub') && {board}.querySelector('.needs-row-sub').textContent"},
+        {"eval": f"(() => {{ {board}.scrollIntoView({{block: 'start'}}); return !!{board}.querySelector('.egress-state'); }})()"},
         {"shot": str(shots / "s7r1_pending.png")},
-        {"eval": f"(() => {{ {board}.querySelector('.needs-open').click(); return 1; }})()"},
+        {"eval": f"{board}.click() || 1"},
         {"until": "document.querySelector('#levain-modal .needs-consent.is-full .egress-state')"},
         {"eval": "new Promise((res) => setTimeout(() => res(null), 500))"},     # the modal's fade-in, for the shot
         {"eval": f"({state_of})(document.querySelector('#levain-modal .needs-consent.is-full'))"},
@@ -170,7 +171,7 @@ def test_every_card_state_is_served_from_the_rows_and_drawn(tmp_path, monkeypatc
     with _serve(_install(tmp_path)[1], surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", steps)["values"]
     vals = [v for v in out if v is not None]
-    assert "pending" in vals, out                                   # the board's card, as first read
+    assert False in out, out                                        # the strip's row is a summary: it draws no egress state
     assert left, "the server never read the pending card's rows"
     assert "ended" in vals, out                                     # its focus view: read again, not the cached body
     heads = json.loads(next(v for v in vals if isinstance(v, str) and v.startswith('{"in_flight"') and "[" not in v))
