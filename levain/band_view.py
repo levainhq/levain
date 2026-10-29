@@ -349,11 +349,11 @@ def _store_id_of(store: QuestionStore) -> str | None:
 def _store_absent(store: QuestionStore) -> bool:
     """True only when the question store is PHYSICALLY absent (no file, or an empty one: :meth:`QuestionStore._peek`
     yields no connection). A store that exists but is locked or unreadable, or lacks its ``store_id`` row, is not
-    absent: any sqlite error here answers ``False``, so it keeps its note and never reads as a fresh install."""
+    absent: any sqlite or OS error here answers ``False``, so it keeps its note and never reads as a fresh install."""
     try:
         with store._peek() as conn:
             return conn is None
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError):                      # a lock, a corrupt file, a PermissionError on the db file
         return False
 
 
@@ -683,6 +683,9 @@ def show(store: QuestionStore, viewer: str, deadline: float | None = None) -> Re
     return r
 
 
+_UNREAD_NOTE = "a decision source could not be read just now: the band may be missing items"
+
+
 def band_payload(store: QuestionStore, viewer: str, deadline: float | None = None) -> dict[str, Any]:
     """What a surface lists of the band for ``viewer``: the binding an answer must carry back (``store_id`` and
     ``view_id``, the recorded view this listing is; ``seen_through`` is that view's ``band@`` mark, for display) and
@@ -716,8 +719,10 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
             items.append({"n": n, "kind": "authority", "tag": e.tag, "what": e.what, "blocks": e.blocks,
                           "options": [{"letter": _LETTERS[i], "label": lab} for i, lab in enumerate(e.options)
                                       if i < len(_LETTERS)], "rec": e.rec_letter, "question": None})
+    # an authority source that was not read (a transient lock on queue.db): the items listed are the ones that were read, and
+    # the band says so, as the text render's "! not read" line does: never a healthy band that is missing items
     return {"seen_through": view.seen_through, "store_id": view.store_id, "view_id": view_id, "items": items,
-            "note": ""}
+            "note": _UNREAD_NOTE if shown.failed else ""}
 
 
 class StaleBand(ValueError):

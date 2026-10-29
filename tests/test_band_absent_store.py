@@ -115,6 +115,56 @@ def test_a_sqlite_error_in_the_absence_check_goes_to_the_note_not_a_500_and_not_
     assert got.get("store") != "absent" and got["note"] == NOTE, got
 
 
+UNREAD = "a decision source could not be read just now: the band may be missing items"
+
+
+def test_a_recorded_view_with_an_unread_authority_source_says_so_and_still_lists_the_items(tmp_path):
+    """codex HIGH (L3 r2): questions.db exists and a view was recorded, but queue.db could not be read: the payload used
+    to carry the normal items and an empty note, so both clients drew a healthy band missing the unread items."""
+    store = QuestionStore(tmp_path / "consent")
+    _file(store)
+    (store.directory / "queue.db").write_bytes(b"this is not a sqlite database " * 40)    # an authority source that cannot be read
+    assert "! not read" in band_view.show(store, "cockpit:browser").text
+    got = band_view.band_payload(store, "cockpit:browser")
+    assert got["note"] == UNREAD, got
+    assert got["view_id"] is not None and len(got["items"]) == 1 and got.get("store") != "absent", got
+
+
+def test_a_recorded_view_whose_sources_all_read_carries_no_note(tmp_path):
+    store = QuestionStore(tmp_path / "consent")
+    _file(store)
+    got = band_view.band_payload(store, "cockpit:browser")
+    assert got["note"] == "" and len(got["items"]) == 1, got
+
+
+def test_a_permission_error_in_the_absence_check_goes_to_the_note_not_a_500_and_not_absent(tmp_path, monkeypatch):
+    """complement LOW (L3 r2): a PermissionError on the db file is an OSError, not a sqlite3.Error."""
+    store = QuestionStore(tmp_path / "consent")
+    _file(store)
+    shown = band_view.show
+    armed = [False]
+
+    def show_then_arm(*a, **k):
+        r = shown(*a, **k)
+        armed[0] = True
+        return r
+
+    real_peek = QuestionStore._peek
+
+    def peek(self):
+        if armed[0]:
+            raise PermissionError(13, "Permission denied")
+        return real_peek(self)
+
+    monkeypatch.setattr(band_view, "show", show_then_arm)
+    monkeypatch.setattr(band_view, "record_view", lambda *a, **k: None)
+    monkeypatch.setattr(band_view, "_newest_view", lambda *a, **k: None)
+    monkeypatch.setattr(QuestionStore, "_peek", peek)
+    got = band_view.band_payload(store, "cockpit:browser")
+    assert got.get("store") != "absent" and got["note"] == NOTE, got
+    assert band_view._store_absent(store) is False        # called straight: False, never raised
+
+
 def test_a_healthy_store_marks_nothing_absent(tmp_path):
     store = QuestionStore(tmp_path / "consent")
     _file(store)
@@ -130,6 +180,12 @@ _BAND_TEXT = ("(() => { const m = document.getElementById('levain-modal'); const
 
 # the page's own settle marker: bandDraw sets data-band-read ("absent" | "note" | "ok") on the slot after every draw
 _SETTLED = "document.querySelector('#levain-modal [data-band-slot][data-band-read=\"%s\"]')"
+
+
+# the band note and the item rows the slot drew
+_BAND_ITEMS = ("(() => { const s = document.querySelector('#levain-modal [data-band-slot]');"
+               " const n = s && s.querySelector('.band-note');"
+               " return [n ? n.textContent : null, s ? [...s.querySelectorAll('[data-band-row] .band-what')].map(x => x.textContent) : []]; })()")
 
 
 def _live_request(seed: Seed) -> None:
@@ -185,8 +241,14 @@ def test_an_absent_payload_with_an_answer_to_say_still_says_it(tmp_path, monkeyp
     seed.clock[0] = datetime.now(timezone.utc)
     _live_request(seed)
     _file(QuestionStore(seed.dir))
+    # an authority source that cannot be read just now (a transient lock on queue.db): the first draw has a recorded view
+    # AND items, and must say the band may be missing some (codex HIGH, L3 r2): the note beside the items, not a clean band
+    def unread(*a, **k):
+        raise OSError("queue.db is locked")
+
+    monkeypatch.setattr(band_view, "read_extras", unread)
     _root, src, _ids = _install(tmp_path)
-    # after the first (healthy) draw: the band read now answers "absent", and the answer's binding is made stale, so the
+    # after the first draw: the band read now answers "absent", and the answer's binding is made stale, so the
     # server refuses it ("stale_band") and the page redraws the band WITH the sentence it has to say
     patch = ("(() => { const f = window.fetch; window.fetch = function (u, o) { const url = String((u && u.url) || u);"
              " if (/\\/cockpit\\/band\\.json/.test(url)) return Promise.resolve(new Response(JSON.stringify("
@@ -202,8 +264,52 @@ def test_an_absent_payload_with_an_answer_to_say_still_says_it(tmp_path, monkeyp
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": TILE}, {"eval": OPEN_DECISIONS},
-            {"until": _SETTLED % "ok"},
+            {"until": _SETTLED % "note"},
+            {"eval": _BAND_ITEMS},
             {"eval": patch}, {"eval": send},
             {"until": said},
         ])
+    note_drawn, items_drawn = out["values"][-4]
+    assert note_drawn == UNREAD and items_drawn == ["Ship the sweep fix?"], out["values"][-4]    # the note beside the items
     assert "the band changed since it was shown" in out["values"][-1], out["values"][-1]
+
+
+# a fetch wrapper for the marker test: an answer is refused as stale (so the page redraws the SAME slot with a fresh read),
+# and that fresh read is held pending until the test releases it
+_HOLD = ("(() => { const f = window.fetch; window.fetch = function (u, o) { const url = String((u && u.url) || u);"
+         " if (/\\/cockpit\\/verb/.test(url) && o && typeof o.body === 'string' && /band_answer/.test(o.body)) {"
+         " const b = JSON.parse(o.body); b.params.view_id = 999999; o = Object.assign({}, o, {body: JSON.stringify(b)}); }"
+         " if (window.__hold && /\\/cockpit\\/band\\.json/.test(url)) { const self = this; return new Promise((res) => {"
+         " window.__release = () => { window.__hold = false; res(f.call(self, u, o)); }; }); }"
+         " return f.call(this, u, o); }; window.__hold = true; return 1; })()")
+_SEND = ("(() => { const box = document.querySelector('[data-band-slot] .band-box'); box.value = '1a';"
+         " document.querySelector('[data-band-slot] .band-send').click(); return 1; })()")
+_NO_MARKER = ("window.__release && (() => { const s = document.querySelector('#levain-modal [data-band-slot]');"
+              " return !!s && !s.hasAttribute('data-band-read'); })()")
+# the next draw throws once (bandDraw's own replaceChildren), as a draw that fails on a payload it did not expect would
+_THROW_ONCE = ("(() => { const orig = Element.prototype.replaceChildren; let n = 0;"
+               " Element.prototype.replaceChildren = function (...a) { if (!n++) throw new Error('boom'); return orig.apply(this, a); };"
+               " window.__release(); return 1; })()")
+
+
+@needs_browser
+def test_the_settle_marker_is_cleared_while_a_read_is_pending_and_a_throwing_draw_ends_in_error(tmp_path, monkeypatch):
+    """complement + codex LOW (L3 r2): (a) the marker of the last draw must not outlive the read that replaces it, or a
+    waiter for "ok" succeeds before the new read lands; (b) an exception thrown inside bandDraw must end in "error"."""
+    seed = Seed(tmp_path, now=datetime.now(timezone.utc))
+    monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
+    seed.clock[0] = datetime.now(timezone.utc)
+    _live_request(seed)
+    _file(QuestionStore(seed.dir))
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE}, {"eval": OPEN_DECISIONS},
+            {"until": _SETTLED % "ok"},
+            {"eval": _HOLD}, {"eval": _SEND},
+            {"until": _NO_MARKER, "ms": 8000},                                 # (a) the read is pending: no marker
+            {"eval": _THROW_ONCE},
+            {"until": _SETTLED % "error", "ms": 8000},                         # (b) the draw threw: the marker says error
+            {"eval": "document.querySelector('#levain-modal [data-band-slot]').textContent"},
+        ])
+    assert "could not be drawn" in out["values"][-1], out["values"][-1]               # said on the page, not drawn as health

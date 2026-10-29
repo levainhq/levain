@@ -4666,7 +4666,14 @@
     return slot;
   }
   function bandFill(slot, say, fresh, retried) {
-    bandFetch(fresh).then((b) => bandDraw(slot, b, say), (e) => {
+    slot.removeAttribute("data-band-read");     // the last draw's marker must not outlive the read that replaces it
+    bandFetch(fresh).then((b) => {
+      // a draw that throws is terminal and said (a retry draws the same payload the same way), never a marker left unset
+      try { bandDraw(slot, b, say); } catch (e) {
+        slot.setAttribute("data-band-read", "error");
+        slot.replaceChildren(el("div", "ext-meta band-note", "the band could not be drawn" + (e && e.message ? ": " + e.message : "")));
+      }
+    }, (e) => {
       const m = e && e.message ? String(e.message) : "";
       if (/no question store/.test(m)) { slot.replaceChildren(); slot.setAttribute("data-band-read", "none"); return; }     // nothing to show on a cockpit without one
       // the server reads one band at a time (a second look meeting the first is told "busy"): one more try, then say so
