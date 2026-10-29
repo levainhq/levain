@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from levain.consent.adapters import claude_code
 from levain.webpush import held, presence, sender
 from levain.webpush.presence import ACTIVE_WINDOW_SECS, set_word
@@ -11,6 +13,14 @@ from tests._h4 import h4_env, h4_home
 
 NOW = 1_000_000.0
 ACTIVE, INACTIVE = 10.0, ACTIVE_WINDOW_SECS + 1.0
+
+
+@pytest.fixture(autouse=True)
+def _as_operator(monkeypatch):
+    """These tests drive the operator's own CLI: run them as a shell outside any agent session, wherever the suite runs."""
+    from levain.consent import band
+
+    monkeypatch.setattr(band, "agent_process", lambda: None)
 
 
 def _phone(qdir):

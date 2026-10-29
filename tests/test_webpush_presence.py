@@ -17,6 +17,14 @@ NOW = 1_000_000.0
 ACTIVE, INACTIVE = 10.0, ACTIVE_WINDOW_SECS + 1.0   # idle seconds
 
 
+@pytest.fixture(autouse=True)
+def _as_operator(monkeypatch):
+    """These tests drive the operator's own CLI: run them as a shell outside any agent session, wherever the suite runs."""
+    from levain.consent import band
+
+    monkeypatch.setattr(band, "agent_process", lambda: None)
+
+
 def _w(word, **kw):
     rec = {"word": word, "ts": NOW - 100}
     rec.update(kw)
