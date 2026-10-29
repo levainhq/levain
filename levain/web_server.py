@@ -1469,6 +1469,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     signer: "Signer | None" = None
     # that pinned page_origin (the Signer refuses any other once make_server pins it), for what the page is told
     signer_page_origin: "str | None" = None
+    # (queue dir, origin) this server published for a band reader; server_close withdraws it only if still its own
+    published_origin: "tuple[Any, Any] | None" = None
     # the grants' passkey revoke (PLAN M17 "9a"), built by make_server from that Signer once it is pinned; None serves no
     # grant route
     grant_phone: "GrantPhone | None" = None
@@ -1565,6 +1567,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
             self.coord_sheet.close()    # no new wake; the wake threads a drop started are joined before teardown
         if self.cockpit is not None:
             self.cockpit.stop()
+        if self.published_origin is not None:
+            from levain.consent.cockpit_origin import withdraw_origin
+
+            withdraw_origin(*self.published_origin)
+            self.published_origin = None
         super().server_close()
 
     def handle_error(self, request: Any, client_address: Any) -> None:
@@ -4018,12 +4025,6 @@ def make_server(
             signer.pin_page_origin(problem)
             pinned = True
             httpd.signer_page_origin = signer.page_origin
-            try:        # keep the origin where a band reader (another process) finds it; only a valid https one is written
-                from levain.consent.cockpit_origin import write_origin
-
-                write_origin(signer.queue_dir, signer.page_origin)
-            except OSError:
-                pass                         # no link on the band is the fail-safe; serving is not held up by it
             from levain.consent.grant_phone import GrantPhone
             from levain.consent.sign import sign_root
 
@@ -4071,6 +4072,13 @@ def make_server(
         finally:
             httpd.server_close()
         raise
+    if signer is not None:
+        # every fallible startup step has passed: this start REPLACES the published origin (an ineligible one removes
+        # the file), kept where a band reader (another process) finds it; server_close withdraws it if still ours
+        from levain.consent.cockpit_origin import write_origin
+
+        httpd.published_origin = (signer.queue_dir, signer.page_origin)
+        write_origin(signer.queue_dir, signer.page_origin)
     # The names this server serves, beside its cockpit.db, for `levain cockpit policy raise` to check a
     # downstream verb against (levain.cockpit.verbs.SERVED_VERBS_NAME). Written last, so a server refused
     # above records nothing. Unwritable, an earlier server's record is removed so the raise of a downstream

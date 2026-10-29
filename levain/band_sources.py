@@ -417,12 +417,12 @@ def _sign_link(qdir: Path | str, request_id: object, version: object) -> str | N
     from levain.consent import sign
     from levain.consent.cockpit_origin import read_origin
 
-    origin = read_origin(qdir)
-    if origin is None:
-        return None
-    try:
+    try:                    # best-effort display: a link problem of any kind never breaks the band sheet
+        origin = read_origin(qdir)
+        if origin is None:
+            return None
         return sign.deep_link(origin, request_id, version=version)  # type: ignore[arg-type]
-    except ValueError:
+    except Exception:
         return None
 
 
