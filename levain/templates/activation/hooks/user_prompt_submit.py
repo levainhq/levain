@@ -141,6 +141,18 @@ def main() -> int:
             if patterns:
                 sections.append(hook.format_crystal_recall(patterns))
 
+        # The NEEDS YOU band (levain.band_view): the whole band, every prompt, on a seat a human can reach.
+        # Render only; it fails open to "" on any error and waits at most ~2 s on the question store.
+        # Its `closed N` notices are recorded as shown only after emit() returned True (commit_band below).
+        commit_band = None
+        try:
+            from levain.band_view import hook_prompt
+            band, commit_band = hook_prompt(payload)
+            if band:
+                sections.append(band)
+        except Exception:
+            commit_band = None
+
         # Layer D — ambient nudge. Independent of the sections above.
         # Reads wrap_state, not episodes_since_wrap: with a wrap already open,
         # "run prepare_wrap" is advice that can only raise, and repeating it every
@@ -161,6 +173,11 @@ def main() -> int:
         delivered = True
         if sections:
             delivered = hook.emit("\n\n".join(sections), "UserPromptSubmit") is True
+        if delivered and commit_band is not None and sections:
+            try:
+                commit_band()
+            except Exception:
+                pass
         if delivered and pending_sig is not None:
             hook.state_seen_record(session_id, pending_sig)
         # Session registry: after emit(), so it can never change what was delivered.

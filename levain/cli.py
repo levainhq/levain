@@ -2688,10 +2688,13 @@ def _add_limits_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _add_band_parsers(subparsers: argparse._SubParsersAction) -> None:
-    """``levain ask`` and ``levain question``: the question band (``levain.consent.band``)."""
+    """``levain ask`` and ``levain question``: the question band (``levain.consent.band``); ``levain band``: the
+    NEEDS YOU band's view (``levain.band_view``)."""
+    from levain.band_view import add_parser as add_band_view_parser
     from levain.consent.band import add_parsers
 
     add_parsers(subparsers)
+    add_band_view_parser(subparsers)
 
 
 def _add_dispatch_parsers(subparsers: argparse._SubParsersAction) -> None:

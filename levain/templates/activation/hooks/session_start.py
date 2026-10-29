@@ -126,6 +126,16 @@ def main() -> int:
         except Exception:
             pass
 
+        # 2d. The NEEDS YOU band's contract line (levain.band_view), every `source` (compact included: the
+        #     context window is rebuilt there). "" on a seat no human can reach or on any error; its own try.
+        try:
+            from levain.band_view import hook_contract
+            contract = hook_contract(payload)
+            if contract:
+                sections.append(contract)
+        except Exception:
+            pass
+
         # 3. Layer D — start-catch. Fires only on a genuinely fresh session;
         #    on `resume`/`compact` the unwrapped count reflects ongoing work.
         #    NOTE: the `source` vocabulary (startup / resume / clear / compact)
