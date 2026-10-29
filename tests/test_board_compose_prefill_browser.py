@@ -81,7 +81,7 @@ def test_the_compose_link_fills_the_box_and_posts_nothing_until_the_operator_sen
                      "document.documentElement.outerHTML.includes(" + json.dumps(TOKEN) + ")])"},
             # the operator edits the words
             {"eval": f"{BOX}.value = {BOX}.value + 'do it'; {BOX}.dispatchEvent(new Event('input', {{bubbles: true}})); {BOX}.value"},
-            {"eval": "new Promise(r => setTimeout(r, 500))"},
+            {"eval": f"new Promise(r => setTimeout(r, {POLL_MS + 500}))"},   # past a poll after the edit: an edit posts nothing
         ])
         before_send = list(out["posts"])
         out2 = _drive(tmp_path, f"{url}/", [
