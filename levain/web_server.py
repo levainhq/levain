@@ -4018,6 +4018,12 @@ def make_server(
             signer.pin_page_origin(problem)
             pinned = True
             httpd.signer_page_origin = signer.page_origin
+            try:        # keep the origin where a band reader (another process) finds it; only a valid https one is written
+                from levain.consent.cockpit_origin import write_origin
+
+                write_origin(signer.queue_dir, signer.page_origin)
+            except OSError:
+                pass                         # no link on the band is the fail-safe; serving is not held up by it
             from levain.consent.grant_phone import GrantPhone
             from levain.consent.sign import sign_root
 
