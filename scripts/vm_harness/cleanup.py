@@ -167,6 +167,7 @@ def scan_until_clear(uids: Iterable[int | str], lister: Callable[[], str] = defa
                      deadline_s: float = 60.0, interval_s: float = 1.0) -> list[Survivor]:
     """REVOKE only wakes an asynchronous reaper, so poll the scan until no survivor or the deadline; report
     survivors only then."""
+    uids = tuple(uids)   # polled repeatedly: a generator would be spent by the first scan
     end = clock() + deadline_s
     while True:
         found = scan_survivors(uids, lister, resolve=resolve)

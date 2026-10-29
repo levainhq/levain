@@ -205,6 +205,14 @@ def test_survivor_found_fails_the_run(tmp_path):
     assert ft.t >= 60   # it waited out the default deadline before reporting
 
 
+def test_uids_given_as_a_generator_are_scanned_on_every_poll(tmp_path):
+    j = CleanupJournal(tmp_path / "c.jsonl")
+    ps = PS_HEADER + "  77  00:09  0.0 front   4002\n"
+    ft = FakeTime()
+    with pytest.raises(CleanupFailed):
+        run_with_cleanup(j, lambda jr: None, lambda s: None, uids=(u for u in [4002]), lister=lambda: ps, **fast(ft))
+
+
 def test_survivor_that_exits_within_the_deadline_passes(tmp_path):
     j = CleanupJournal(tmp_path / "c.jsonl")
     ps = PS_HEADER + "  77  00:09  0.0 front   4002\n"
