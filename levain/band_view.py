@@ -357,14 +357,17 @@ def record_view(store: QuestionStore, viewer: str, seen_through: int, open_list:
     if sid is None:
         return
     gen = int(gen if gen is not None else time.time_ns())
-    if not open_list:
-        prev = last_view(store, viewer)
-        if prev is not None and prev.store_id == sid and not prev.open_list:
-            return
     try:
         with store._write_by(deadline if deadline is not None else time.monotonic() + HOOK_BUSY_MS / 1000) as conn:
             for stmt in BAND_SCHEMA:
                 conn.execute(stmt)
+            if not open_list:
+                # The empty-view dedupe is decided INSIDE the write transaction, against the newest view by gen as
+                # the transaction sees it: a render that committed a nonempty view first is never skipped past.
+                row = conn.execute("SELECT open_list, store_id FROM band_views WHERE viewer = ? "
+                                   "ORDER BY gen DESC, seq DESC LIMIT 1", (viewer,)).fetchone()
+                if row is not None and row[1] == sid and not json.loads(row[0]):
+                    return
             conn.execute("INSERT INTO band_views (viewer, seen_through, open_list, store_id, at, gen) "
                          "VALUES (?, ?, ?, ?, ?, ?)",
                          (viewer, int(seen_through), json.dumps(sorted(open_list)), sid,
@@ -740,9 +743,14 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
             if delta:
                 head, _, body = text.partition("\n")
                 text = head + "\n" + delta + ("\n" + body if body else "")
+        if not text and prev is not None and prev.open_list:
+            # Everything this viewer last saw closed (perhaps its notice consumed by another seat): say so and let the
+            # empty view be committed, or the old view stays active and the Stop verifier demands obsolete items.
+            delta = _delta_line(store, prev, r.shown)
+            text = "NEEDS YOU · 0 open" + ("\n" + delta if delta else "")
     except Exception:
         return echo, _no_commit
-    block = text                              # the band as the seat reads it (the delta line in): what Stop compares
+    block = text                             # the band as the seat reads it (the delta line in): what Stop compares
     if echo:
         text = echo + ("\n" + text if text else "")
 
@@ -794,10 +802,15 @@ def _claim_file(directory: Path | str, viewer: str) -> Path:
     return Path(directory) / "band_stop" / hashlib.sha256(viewer.encode()).hexdigest()[:24]
 
 
+def _claim_path(directory: Path | str, viewer: str, gen: int) -> Path:
+    f = _claim_file(directory, viewer)
+    return f.with_name(f"{f.name}.{int(gen)}")
+
+
 def _claimed(directory: Path | str, viewer: str, gen: int) -> bool:
     """Read-only: whether ``viewer``'s claim for ``gen`` is already taken (False when it cannot be read)."""
     try:
-        return _claim_file(directory, viewer).read_text(encoding="utf-8").strip() == str(gen)
+        return _claim_path(directory, viewer, gen).exists()
     except Exception:
         return False
 
@@ -805,15 +818,22 @@ def _claimed(directory: Path | str, viewer: str, gen: int) -> bool:
 def _claim_retry(directory: Path | str, viewer: str, gen: int) -> bool:
     """The verifier's second bound beside ``stop_hook_active``: one block per view (render generation). True when
     this call took the claim (nothing was blocked for this view yet); False when one was, or on any error (fail open:
-    an unwritable claim is no licence to block)."""
+    an unwritable claim is no licence to block). The claim is a file keyed by (viewer, gen) made with exclusive
+    creation: of any number of concurrent claimants exactly one succeeds, and a claim of another generation is a
+    different file, so an old-generation claimant can never overwrite a newer one."""
     try:
-        f = _claim_file(directory, viewer)
-        f.parent.mkdir(mode=0o700, exist_ok=True)
-        if _claimed(directory, viewer, gen):
+        f = _claim_path(directory, viewer, gen)
+        f.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            os.close(os.open(f, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except FileExistsError:
             return False
-        tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
-        tmp.write_text(str(gen), encoding="utf-8")
-        os.replace(tmp, f)
+        try:                                    # best effort: older generations of this viewer are spent
+            for old in f.parent.glob(f"{_claim_file(directory, viewer).name}.*"):
+                if old.name != f.name and old.name.rsplit(".", 1)[-1].isdigit() and int(old.name.rsplit(".", 1)[-1]) < int(gen):
+                    old.unlink(missing_ok=True)
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -842,11 +862,13 @@ def _reprint_check(view: View, block: str | None, message: str) -> tuple[list[in
         for i, ln in enumerate(lines):
             if ln != want[0]:
                 continue
-            if lines[i + 1:i + len(want)] == want[1:]:
-                return [], False
+            if lines[i + 1:i + len(want)] == want[1:] and i + len(want) == len(lines):
+                return [], False                # the contiguous band ends the reply: nothing after it
         return missing, True
     missing = [n for n in view.open_list if not any(re.match(rf"{n}\.(\s|$)", ln) for ln in lines)]
     head = not re.search(rf"band@{view.seen_through}(?!\d)", message)
+    if not missing and not head and view.open_list and not re.match(rf"{max(view.open_list)}\.(\s|$)", lines[-1]):
+        head = True                             # legacy: the last item line must end the reply too
     return missing, head
 
 
