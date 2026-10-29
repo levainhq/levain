@@ -102,3 +102,93 @@ def test_the_tab_is_grouped_and_the_columns_live_in_the_expand_modal(tmp_path: P
     assert closed[-1]["heads"] == first["heads"], closed[-1]               # Esc closed the modal; the tab is as it was
     assert json.loads(v[-3]) == [True, True], v[-3]                     # the modal and the page fit the phone width
     assert not [p for p in out["posts"]], out["posts"]                      # nothing in all of this posted
+
+
+# The page's fetch, wrapped so a test can make the board read fail (a revoked token, a dead cockpit) or change (a card appears
+# in `running`). A view binds `fetch` when it mounts, so the wrapper is installed first and a view is then mounted fresh.
+WRAP_FETCH = (
+    "window.__fail = 0; window.__extra = 0; const __of = window.fetch; "
+    "window.fetch = async (u, i) => { if (!String(u).includes('board.json')) return __of(u, i); "
+    "if (window.__fail) return new Response('{}', {status: window.__fail}); "
+    "const r = await __of(u, i); if (!window.__extra) return r; const b = await r.json(); "
+    "const run = b.columns.find(c => c.category === 'running'); "
+    "run.cards.push(Object.assign({}, run.cards[0], {id: 'levain:zz', title: 'Moved Z'})); "
+    "return new Response(JSON.stringify(b), {status: r.status}); }; 1")
+# Stop the mounted view (the tab is left) and mount a new one (the tab is back): the path sync() takes on a hide or a token toggle.
+# True when a NEW view stands in the panel afterwards.
+REMOUNT = ("(async () => { const m = document.body.dataset.mode; const v0 = document.querySelector('.bd-panel .bd-view'); "
+           "document.body.dataset.mode = 'memory'; await new Promise(r => setTimeout(r, 150)); document.body.dataset.mode = m; "
+           "await new Promise(r => setTimeout(r, 150)); const v1 = document.querySelector('.bd-panel .bd-view'); "
+           "return !!v1 && v1 !== v0; })()")
+LINE = "the board could not be read just now"
+
+
+def _cards(cat: str) -> str:
+    return f"{MODAL}.querySelectorAll('.bd-col[data-category={cat}] .bd-card').length"
+
+
+@needs_browser
+def test_the_open_modal_repaints_after_the_view_is_remounted(tmp_path: Path, lh) -> None:  # noqa: F811
+    """L3 r1 (session A, complement + codex MED). The ⤢ modal is open when its view is stopped and a new one mounted (the tab
+    away and back, as a hide or a token toggle does); the board then changes: the OPEN modal repaints with the new model."""
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _seed(lh)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (url, httpd):
+        httpd.coord_sheet = _Sheet(lh)
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1440, "h": 1000, "dpr": 1}},
+            *_reload_on(""),
+            {"until": f"{PANEL} && {PANEL}.querySelectorAll('.grp-head').length === 6"},
+            {"eval": WRAP_FETCH},
+            {"eval": f"{PANEL}.querySelector('.phead .pexpand').click(); 1"},
+            {"until": f"{MODAL} && {_cards('running')} === 1"},
+            {"eval": REMOUNT},
+            {"until": f"{PANEL}.querySelectorAll('.grp-head').length === 6"},
+            {"eval": "window.__extra = 1; 1"},                                   # the board changes after the remount
+            {"until": f"{_cards('running')} === 2", "ms": POLL_MS * 3},
+            {"eval": f"JSON.stringify({{open: !!{MODAL}, cols: {MODAL}.querySelectorAll('.bd-col').length}})"},
+        ])
+    v = out["values"]
+    assert True in v, v                                                        # a new view really replaced the old one
+    assert json.loads(v[-1]) == {"open": True, "cols": 6}, v[-1]
+
+
+@needs_browser
+def test_the_open_modal_says_so_when_the_board_cannot_be_read(tmp_path: Path, lh) -> None:  # noqa: F811
+    """L3 r1 (session A, codex MED). A failed board read (403, 5xx) or a removed write token replaces the open modal's columns
+    with the one plain line and no `.bd-card`; the next good read (or the token given back) restores the columns."""
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _seed(lh)
+    _root, src, _ids = _install(tmp_path)
+    gone = (f"{MODAL} && !{MODAL}.querySelector('.bd-col') && {MODAL}.querySelectorAll('.bd-card').length === 0 && "
+            f"[...{MODAL}.querySelectorAll('.bd-note')].map(n => n.textContent).join('|') === {json.dumps(LINE)}")
+    back = (f"{MODAL} && {MODAL}.querySelectorAll('.bd-col').length === 6 && {MODAL}.querySelectorAll('.bd-card').length === 6 "
+            f"&& ![...{MODAL}.querySelectorAll('.bd-note')].some(n => n.textContent === {json.dumps(LINE)})")
+    with _serve(src, write_token=TOKEN) as (url, httpd):
+        httpd.coord_sheet = _Sheet(lh)
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1440, "h": 1000, "dpr": 1}},
+            *_reload_on(""),
+            {"until": f"{PANEL} && {PANEL}.querySelectorAll('.grp-head').length === 6"},
+            {"eval": WRAP_FETCH},
+            {"eval": REMOUNT},                                                  # the view now reads through the wrapper
+            {"eval": f"{PANEL}.querySelector('.phead .pexpand').click(); 1"},
+            {"until": back},
+            {"eval": "window.__fail = 403; 1"},
+            {"until": gone, "ms": POLL_MS * 3},
+            {"eval": "window.__fail = 0; 1"},
+            {"until": back, "ms": POLL_MS * 3},
+            {"eval": "window.__fail = 500; 1"},
+            {"until": gone, "ms": POLL_MS * 3},
+            {"eval": "window.__fail = 0; 1"},
+            {"until": back, "ms": POLL_MS * 3},
+            # the token is removed: no read is needed, the modal says so at once; given back, the board returns
+            {"eval": "localStorage.removeItem('levain_write_token'); window.dispatchEvent(new Event('levain:write-token-change')); 1"},
+            {"until": gone, "ms": 3000},
+            {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.dispatchEvent(new Event('levain:write-token-change')); 1"},
+            {"until": back, "ms": POLL_MS * 3},
+            {"key": "Escape"},
+            {"until": f"!{MODAL}"},
+        ])
+    assert not out["posts"], out["posts"]

@@ -90,10 +90,43 @@ async function grouped() {
     modelBefore: before, modelAfter: h.model() && h.model().columns.map((x) => x.category + ":" + x.cards.length),
   };
 }
+// The shared bus (L3 r1, session A): the watchers and the last model belong to the page, not to one mounted view.
+async function bus() {
+  let mode = "ok";
+  const fetch = () => {
+    if (mode === "net") return Promise.reject(new Error("offline"));
+    if (mode === "ok") return resp(200, BODY);
+    return resp(mode, {});
+  };
+  const shared = { model: null, failed: false, watchers: [] };
+  const opts = { fetch, storage: { getItem: () => null, setItem() {}, removeItem() {} }, pollMs: 0, headers: () => ({}), hash: "", bus: shared };
+  const mk = () => { const host = node("div"); host.ownerDocument = doc; return { host, h: V.mount(host, opts) }; };
+  const shape = (m, failed) => (failed ? "FAILED" : m ? m.columns.map((x) => x.category + ":" + x.cards.length).join(",") : "none");
+  const calls = [];
+  const one = mk();
+  one.h.watch((m, failed) => calls.push(shape(m, failed)));
+  const thrower = one.h.watch(() => { throw new Error("a watcher that throws"); });
+  await tick();
+  const afterFirst = calls.slice();
+  one.h.stop();                                             // a view is stopped (hide / token toggle) ...
+  const watchersAfterStop = shared.watchers.length;
+  const two = mk();                                         // ... and a new one is mounted: the same watchers hear it
+  await tick();
+  const afterRemount = calls.slice();
+  const steps = {};
+  for (const m of [403, 500, "net", "ok"]) {
+    mode = m; await two.h.pull(); await tick();
+    steps[m] = { last: calls[calls.length - 1], model: two.h.model() && "set", failed: shared.failed, panel: two.host.children[0].textContent.slice(0, 40), heads: walk(two.host).filter((n) => n.className === "grp-head").length };
+  }
+  one.h.stop(); two.h.stop();
+  mode = 403; const before = calls.length; await two.h.pull();      // a stopped view's failed read tells nobody
+  return { afterFirst, watchersAfterStop, afterRemount, steps, stoppedPullCalls: calls.length - before, thrower: typeof thrower };
+}
 (async () => {
   const on = { offered: true, why: null };
   const out = {};
   out.grouped = await grouped();
+  out.bus = await bus();
   out.not_offered = await scenario({ tell: { offered: false, why: "different queue" }, listing: { coord_store_read: true, coord_store_id: "S" }, type: "hi" });
   out.unreadable = await scenario({ tell: on, listing: { coord_store_read: false, coord_store_id: null, coord_note: "store locked" }, type: "hi" });
   out.double_click = await scenario({ tell: on, listing: { coord_store_read: true, coord_store_id: "S" }, type: "hi", clicks: 2 });
