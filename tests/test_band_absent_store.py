@@ -137,6 +137,21 @@ def test_a_recorded_view_whose_sources_all_read_carries_no_note(tmp_path):
     assert got["note"] == "" and len(got["items"]) == 1, got
 
 
+def test_a_failed_authority_items_read_says_so_and_still_lists_the_questions(tmp_path, monkeypatch):
+    """The same class as the unread source: _extras_of raising used to leave the note empty, so both clients drew a healthy
+    band missing the authority items. The question items still list, and the note says the band may be missing items."""
+    store = QuestionStore(tmp_path / "consent")
+    _file(store)
+
+    def boom(*a, **k):
+        raise RuntimeError("authority items could not be read")
+
+    monkeypatch.setattr(band_view, "_extras_of", boom)
+    got = band_view.band_payload(store, "cockpit:browser")
+    assert got["note"] == UNREAD, got
+    assert got["view_id"] is not None and len(got["items"]) == 1 and got.get("store") != "absent", got
+
+
 def test_a_permission_error_in_the_absence_check_goes_to_the_note_not_a_500_and_not_absent(tmp_path, monkeypatch):
     """complement LOW (L3 r2): a PermissionError on the db file is an OSError, not a sqlite3.Error."""
     store = QuestionStore(tmp_path / "consent")

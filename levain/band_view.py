@@ -703,10 +703,11 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
                 "note": "the band could not be recorded just now"}
     view, view_id = got
     questions = _items_of(store, view)
+    extras_failed = False
     try:
         extras, _unknown = _extras_of(store, view)
-    except Exception:  # noqa: BLE001 - the questions still list; the authority items are then simply not listed
-        extras = {}
+    except Exception:  # noqa: BLE001 - the questions still list; the authority items are not, and the note says so
+        extras, extras_failed = {}, True
     items: list[dict[str, Any]] = []
     for n in view.open_list:
         q, e = questions.get(n), extras.get(n)
@@ -722,7 +723,7 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
     # an authority source that was not read (a transient lock on queue.db): the items listed are the ones that were read, and
     # the band says so, as the text render's "! not read" line does: never a healthy band that is missing items
     return {"seen_through": view.seen_through, "store_id": view.store_id, "view_id": view_id, "items": items,
-            "note": _UNREAD_NOTE if shown.failed else ""}
+            "note": _UNREAD_NOTE if (shown.failed or extras_failed) else ""}
 
 
 class StaleBand(ValueError):
