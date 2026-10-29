@@ -7,7 +7,8 @@ through the session's passthrough tunnel (the ``HTTPS_PROXY`` its env file names
    Claude Code's own refresh sends; M0, PIN_REFRESH_M0.md). The refresh token goes to :data:`TOKEN_ORIGIN` only. ONE
    attempt, never a retry: replaying a rotated token is what reuse detection punishes. Before the request: the file the
    write-back would produce is proven to fit :data:`CRED_MAX` (:func:`_preflight`) and the temp file is created, so
-   neither failure can come after the token is spent.
+   neither failure can come after the token is spent. The exchange is held to :data:`TOKEN_S` and the whole child to
+   :data:`DEADLINE_S`, inside root's capture bound, so root never kills it between a 200 and its write-back.
 2. WRITE the answer back before anything else: temp ``.credentials.json.levain-refresh`` (``O_EXCL|O_NOFOLLOW``, 0600)
    in the same directory, ``fsync``, ``rename`` onto the credential (tried :data:`RENAME_TRIES` times), directory
    ``fsync``. Only ``accessToken``, ``refreshToken`` (when the server returned one) and ``expiresAt`` (milliseconds, as
@@ -36,6 +37,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -65,7 +67,16 @@ REFRESH_BODY_MAX = 16 * 1024
 #: the credential file's cap, END's ``V14_BYTES`` (``return_move`` refuses ``keep-shape`` over it): the file the
 #: write-back produces is held under it BEFORE the refresh is sent (:func:`_preflight`).
 CRED_MAX = 64 * 1024
+#: each socket operation's own timeout (connect, one read); never a request's total time, which :data:`DEADLINE_S`
+#: and :data:`TOKEN_S` bound.
 TIMEOUT_S = 20.0
+#: the whole child's deadline (refresh, write-back, profile), one monotonic clock from :func:`fetch`'s start, held
+#: inside root's capture bound (``runtime_helper.CHECK_S``) so root never kills the child between a rotating 200 and
+#: its write-back.
+DEADLINE_S = 120.0
+#: the most of :data:`DEADLINE_S` the token exchange (the POST through its whole body) may take; the rest is the
+#: write-back's and the profile's. Past it the answer is abandoned (``request-failed``).
+TOKEN_S = 60.0
 #: the longest token string kept from a refresh answer (real ones are about 110 characters), and the characters one may
 #: hold: each serializes to one byte, so :func:`_preflight`'s worst case bounds the real file.
 TOKEN_MAX = 4096
@@ -87,9 +98,13 @@ KEPT_AFTER_SPEND = "kept-after-spend"
 LOST_AFTER_SPEND = "lost-after-spend"
 #: a login with no usable refresh token (:func:`_refresh`).
 NO_REFRESH_TOKEN = "no-refresh-token"
-#: seams: tests inject a fault between the 200 and the rename, or in the write.
+#: the refresh answered 200 and was written back, but :data:`DEADLINE_S` ran out before the profile answered (or
+#: before it was asked): the stored login is the new one, the account unproven.
+NO_PROFILE = "refreshed-no-profile"
+#: seams: tests inject a fault between the 200 and the rename, in the write, or in the temp's close.
 _replace = os.replace
 _write = os.write
+_close = os.close
 
 
 def _clean(tok: object) -> Optional[str]:
@@ -151,6 +166,46 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _opener(env: Mapping[str, str]) -> urllib.request.OpenerDirector:
     """The tunnel only: the env file's proxy, never the host's own proxy settings, and no redirect followed."""
     return urllib.request.build_opener(urllib.request.ProxyHandler({"https": _proxy(env)}), _NoRedirect())
+
+
+Exchange = Tuple[object, ...]
+
+
+def _exchange(env: Mapping[str, str], opener: Optional[Callable[[Mapping[str, str]], urllib.request.OpenerDirector]],
+              req: urllib.request.Request, cap: int, err_cap: int, timeout: float) -> Exchange:
+    """One request and its answer: ``("ok", status, body)`` (at most ``cap + 1`` bytes), ``("http", status, body)``
+    (an HTTP error answer, at most ``err_cap`` bytes of it) or ``("fail",)``. Never raises: an error text could quote
+    the request."""
+    try:
+        try:
+            resp = (opener or _opener)(env).open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            try:
+                raw = e.read(err_cap) if err_cap > 0 else b""
+            except Exception:   # noqa: BLE001 - the bare status stands
+                raw = b""
+            finally:
+                e.close()
+            return ("http", int(e.code), raw)
+        try:
+            return ("ok", int(resp.status), resp.read(cap + 1))
+        finally:
+            resp.close()
+    except Exception:   # noqa: BLE001
+        return ("fail",)
+
+
+def _bounded(call: Callable[[], Exchange], seconds: float) -> Optional[Exchange]:
+    """``call()``'s value when it returns within ``seconds`` of wall time, else None. The call runs in a daemon thread,
+    so no drip of headers or body can hold the child past it (a per-socket-operation timeout cannot bound a total);
+    an abandoned call dies with the process, and nothing it later receives is used."""
+    if seconds <= 0:
+        return None
+    box: list = []
+    t = threading.Thread(target=lambda: box.append(call()), daemon=True)
+    t.start()
+    t.join(seconds)
+    return box[0] if box else None
 
 
 # --- the refresh (step 1 and 2) ----------------------------------------------------------------------------------------
@@ -241,9 +296,14 @@ def _answer(raw: bytes, rt: str) -> Optional[Tuple[str, str, int]]:
 
 
 def _refresh(env: Mapping[str, str], cfg: str, obj: Dict[str, object], token_url: str,
-             opener: Optional[Callable[[Mapping[str, str]], urllib.request.OpenerDirector]]) -> Dict[str, object]:
+             opener: Optional[Callable[[Mapping[str, str]], urllib.request.OpenerDirector]],
+             end: float) -> Dict[str, object]:
     """One refresh and its write-back. Returns ``{"access": <the new access token>}`` (the file already holds it), or
     the line to print: ``{"refresh": <status>[, "oauth_error": w]}`` / ``{"refresh": <name>}``. Never raises.
+
+    The token exchange gets at most :data:`TOKEN_S`, and never past ``end`` (monotonic): with no time left the POST is
+    never sent (nothing spent); an exchange that runs past its slice is abandoned (``request-failed``; when the server
+    had already rotated, that login is lost). The write-back after a 200 is local and is never cut short by ``end``.
 
     After a 200 the temp is unlinked only when the rename moved it, or when it is not a whole copy of the new login
     (a write or fsync failed part way). A temp that holds the whole new login, fsynced, is KEPT when the rename fails
@@ -271,29 +331,24 @@ def _refresh(env: Mapping[str, str], cfg: str, obj: Dict[str, object], token_url
         scope = _scope_of(oauth)
         if scope is not None:
             body_obj["scope"] = scope
-        try:
-            req = urllib.request.Request(token_url, data=json.dumps(body_obj).encode("utf-8"), method="POST",
-                                         headers={"Content-Type": "application/json", "Accept": "application/json"})
-            resp = (opener or _opener)(env).open(req, timeout=TIMEOUT_S)
-        except urllib.error.HTTPError as e:
-            out: Dict[str, object] = {"refresh": int(e.code)}
+        req = urllib.request.Request(token_url, data=json.dumps(body_obj).encode("utf-8"), method="POST",
+                                     headers={"Content-Type": "application/json", "Accept": "application/json"})
+        slice_s = min(TOKEN_S, end - time.monotonic())
+        got_x = _bounded(lambda: _exchange(env, opener, req, REFRESH_BODY_MAX, REFRESH_BODY_MAX,
+                                           min(TIMEOUT_S, slice_s)), slice_s)
+        if got_x is None or got_x[0] == "fail":
+            return {"refresh": "request-failed"}
+        _, status, raw = got_x
+        assert isinstance(status, int) and isinstance(raw, bytes)
+        if got_x[0] == "http":
+            out: Dict[str, object] = {"refresh": status}
             try:
-                word = json.loads(e.read(REFRESH_BODY_MAX)).get("error")
+                word = json.loads(raw).get("error")
                 if isinstance(word, str) and _OAUTH_WORD_RE.fullmatch(word):
                     out["oauth_error"] = word
             except Exception:   # noqa: BLE001 - not an OAuth JSON body: the bare status stands
                 pass
-            e.close()
             return out
-        except Exception:   # noqa: BLE001 - the name only: an error text could quote the request
-            return {"refresh": "request-failed"}
-        try:
-            status = int(resp.status)
-            raw = resp.read(REFRESH_BODY_MAX + 1)
-        except Exception:   # noqa: BLE001
-            return {"refresh": "request-failed"}
-        finally:
-            resp.close()
         if status != 200:
             return {"refresh": status}
         got = _answer(raw, rt)
@@ -311,11 +366,14 @@ def _refresh(env: Mapping[str, str], cfg: str, obj: Dict[str, object], token_url
             while view:
                 view = view[_write(fd, view):]
             os.fsync(fd)
-            fd_open = False                # before the close: a close that raises is never closed twice
-            os.close(fd)
         except Exception:   # noqa: BLE001 - the temp is not a whole copy: unlinked below
             return {"refresh": spent}
         keep_temp = keep_rt != rt          # the temp is the whole new login, fsynced: never unlinked unless moved
+        fd_open = False                    # before the close: a close that raises is never closed twice
+        try:
+            _close(fd)
+        except OSError:
+            pass                           # the data is already durable: a failed close loses nothing
         for i in range(RENAME_TRIES):
             try:
                 _replace(os.path.join(cfg, TEMP_NAME), os.path.join(cfg, CREDENTIALS_NAME))
@@ -346,7 +404,10 @@ def fetch(env: Mapping[str, str], *, url: str = PROFILE_URL, token_url: str = TO
     """The refresh and the one profile request, as this process's answer object (never raises; never carries a
     token). Refused before any request: ``bad-origin`` (``url`` is not :data:`ORIGIN`, or ``token_url`` is not
     :data:`TOKEN_ORIGIN`), ``no-proxy``, ``no-token``. ``refresh=False`` is the profile call alone, for tests of its
-    own mechanics; :func:`main` never passes it."""
+    own mechanics; :func:`main` never passes it. The whole call ends within :data:`DEADLINE_S` of its start (plus
+    the local write-back): a refresh written back with no time left for the profile is ``{"refresh":
+    "refreshed-no-profile"}`` (:data:`NO_PROFILE`)."""
+    end = time.monotonic() + DEADLINE_S
     try:
         if _origin(url) != tuple(ORIGIN) or (refresh and _origin(token_url) != tuple(TOKEN_ORIGIN)):
             return {"error": "bad-origin"}
@@ -360,30 +421,25 @@ def fetch(env: Mapping[str, str], *, url: str = PROFILE_URL, token_url: str = TO
         return {"error": "no-token"}
     line: Dict[str, object] = {}
     if refresh:
-        got = _refresh(env, cred[0], cred[1], token_url, opener)
+        got = _refresh(env, cred[0], cred[1], token_url, opener, end)
         if "access" not in got:
             return got
         tok = str(got["access"])
         line["refresh"] = 200
-    try:
-        req = urllib.request.Request(url, method="GET", headers={
-            "Authorization": f"Bearer {tok}", "anthropic-beta": OAUTH_BETA, "Accept": "application/json"})
-        resp = (opener or _opener)(env).open(req, timeout=TIMEOUT_S)
-    except urllib.error.HTTPError as e:
-        e.close()
-        line.update({"status": int(e.code), "body": ""})
-        return line
-    except Exception:   # noqa: BLE001 - the name only: an error text could quote the request
+    req = urllib.request.Request(url, method="GET", headers={
+        "Authorization": f"Bearer {tok}", "anthropic-beta": OAUTH_BETA, "Accept": "application/json"})
+    left = end - time.monotonic()        # measured after the write-back: the budget never starves it
+    got_x = _bounded(lambda: _exchange(env, opener, req, BODY_MAX, 0, min(TIMEOUT_S, left)), left)
+    if got_x is None:
+        return {"refresh": NO_PROFILE} if refresh else {"error": "request-failed"}
+    if got_x[0] == "fail":
         line["error"] = "request-failed"
         return line
-    try:
-        status = int(resp.status)
-        body = resp.read(BODY_MAX + 1)
-    except Exception:   # noqa: BLE001
-        line["error"] = "request-failed"
+    _, status, body = got_x
+    assert isinstance(status, int) and isinstance(body, bytes)
+    if got_x[0] == "http":
+        line.update({"status": status, "body": ""})
         return line
-    finally:
-        resp.close()
     if len(body) > BODY_MAX:
         line["error"] = "body-too-large"
         return line

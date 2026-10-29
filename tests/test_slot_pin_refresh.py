@@ -9,6 +9,7 @@ import io
 import json
 import os
 import socket
+import time
 import urllib.error
 
 import pytest
@@ -34,10 +35,11 @@ def _cred(access="acc-A", refresh="rt-A", expires=PAST) -> bytes:
 
 
 class _Resp:
-    def __init__(self, status, body):
-        self.status, self._b = status, body
+    def __init__(self, status, body, drip=0.0):
+        self.status, self._b, self._drip = status, body, drip
 
     def read(self, n=-1):
+        time.sleep(self._drip)
         return self._b if n < 0 else self._b[:n]
 
     def close(self):
@@ -50,8 +52,9 @@ class Server:
     endpoint's answer: ``(status, body)`` or an exception. Like the real server (measured 10-29), a refresh that
     returns a new refresh token INVALIDATES the one it was sent: a second use is ``invalid_grant``."""
 
-    def __init__(self, tokens, profiles, refresh_fail=None):
+    def __init__(self, tokens, profiles, refresh_fail=None, wait=0.0, drip=0.0, profile_wait=0.0):
         self.tokens, self.profiles, self.refresh_fail = dict(tokens), profiles, refresh_fail
+        self.wait, self.drip, self.profile_wait = wait, drip, profile_wait
         self.refreshes = []
         self.profile_calls = []
 
@@ -66,6 +69,7 @@ class Server:
             assert req.get_method() == "POST" and req.headers["Content-type"] == "application/json"
             body = json.loads(req.data)
             self.refreshes.append(body)
+            time.sleep(self.wait)
             f = self.refresh_fail
             if isinstance(f, BaseException):
                 raise f
@@ -81,10 +85,11 @@ class Server:
                 ans["refresh_token"] = rt
                 del self.tokens[body["refresh_token"]]          # rotation: the old one is dead
                 self.tokens.setdefault(rt, (acc + "+", rt + "+"))
-            return _Resp(200, json.dumps(ans).encode())
+            return _Resp(200, json.dumps(ans).encode(), self.drip)
         assert req.full_url == "https://api.anthropic.com/api/oauth/profile"
         auth = req.headers["Authorization"]
         self.profile_calls.append(auth)
+        time.sleep(self.profile_wait)
         uuid = self.profiles.get(auth[len("Bearer "):])
         if uuid is None:
             raise self._err(req.full_url, 401, b"")
@@ -339,11 +344,97 @@ def test_g_a_claude_answer_with_no_refresh_is_unparsable():
     assert ID.parse_profile_answer(0, line, refreshed=False) == UUID
 
 
-def test_h_roots_capture_bound_covers_both_requests_and_the_rename_retries():
-    """H (complement LOW 6): root kills the child at CHECK_S; the token POST, the profile GET and the rename retries
-    must fit well inside it, or a kill could land after the rotation."""
+def test_h_the_childs_deadline_sits_well_inside_roots_capture_bound():
     from levain.slot import runtime_helper as H
-    assert 2 * IC.TIMEOUT_S + 0.05 * IC.RENAME_TRIES * (IC.RENAME_TRIES + 1) < H.CHECK_S
+    assert IC.TIMEOUT_S <= IC.TOKEN_S < IC.DEADLINE_S
+    assert IC.DEADLINE_S + 0.05 * IC.RENAME_TRIES * (IC.RENAME_TRIES + 1) < H.CHECK_S / 2
+
+
+def _short(monkeypatch, deadline, token):
+    monkeypatch.setattr(IC, "DEADLINE_S", deadline)
+    monkeypatch.setattr(IC, "TOKEN_S", token)
+
+
+def test_h_a_token_endpoint_that_stalls_before_its_200_is_abandoned_at_the_slice(tmp_path, monkeypatch):
+    """H (codex, r2): urllib's timeout is per socket operation, so a server dripping below it could hold the child
+    past root's kill. The exchange now ends at TOKEN_S of wall time; with no time left the POST is never sent."""
+    (tmp_path / ".credentials.json").write_bytes(_cred())
+    _short(monkeypatch, 5.0, 0.3)
+    srv = Server({"rt-A": ("acc-new", "rt-A2")}, {"acc-new": UUID}, wait=3.0)
+    t0 = time.monotonic()
+    assert IC.fetch(_env(tmp_path), opener=srv) == {"refresh": "request-failed"}
+    assert time.monotonic() - t0 < 2.0 and srv.profile_calls == []
+    assert (tmp_path / ".credentials.json").read_bytes() == _cred() and not (tmp_path / IC.TEMP_NAME).exists()
+    _short(monkeypatch, 0.0, 0.3)
+    srv2 = Server({"rt-A": ("acc-new", "rt-A2")}, {"acc-new": UUID})
+    assert IC.fetch(_env(tmp_path), opener=srv2) == {"refresh": "request-failed"} and srv2.refreshes == []
+
+
+def test_h_known_edge_a_rotating_200_whose_body_outlasts_the_token_slice_leaves_the_dead_login(tmp_path, monkeypatch):
+    (tmp_path / ".credentials.json").write_bytes(_cred())
+    _short(monkeypatch, 5.0, 0.3)
+    srv = Server({"rt-A": ("acc-new", "rt-A2")}, {"acc-new": UUID}, drip=3.0)
+    t0 = time.monotonic()
+    assert IC.fetch(_env(tmp_path), opener=srv) == {"refresh": "request-failed"}
+    assert time.monotonic() - t0 < 2.0
+    assert "rt-A" not in srv.tokens and _oauth(tmp_path / ".credentials.json")["refreshToken"] == "rt-A"
+
+
+def test_h_a_profile_that_drips_past_the_deadline_keeps_the_written_login(env, monkeypatch):
+    """After a rotating 200 is written back, a profile that runs out the deadline is refreshed-no-profile: unreachable,
+    and the login root parks is the new one (rt-A2), so the retry refreshes it."""
+    w, la, _ = env
+    s = _session(w, la, _cred(access="acc-old", refresh="rt-A"))
+    _short(monkeypatch, 0.6, 0.3)
+    srv = Server({"rt-A": ("acc-new", "rt-A2")}, {"acc-new": UUID}, profile_wait=3.0)
+    _run_child(w, srv)
+    t0 = time.monotonic()
+    assert w.main(["start", s])[1]["refused"] == "identity-unreachable"
+    assert time.monotonic() - t0 < 2.5
+    assert w.state(s).fields["identity"] == {"result": "identity-unreachable"} and len(la.of("vendor")) == 0
+    assert _oauth(_keep(w))["refreshToken"] == "rt-A2"
+
+
+def test_h_a_write_back_that_outlasts_the_deadline_is_finished_and_the_profile_skipped(tmp_path, monkeypatch):
+    (tmp_path / ".credentials.json").write_bytes(_cred())
+    _short(monkeypatch, 0.3, 0.2)
+    real = IC._write
+
+    def slow(fd, data):
+        time.sleep(0.5)
+        return real(fd, data)
+    monkeypatch.setattr(IC, "_write", slow)
+    srv = Server({"rt-A": ("acc-new", "rt-A2")}, {"acc-new": UUID})
+    assert IC.fetch(_env(tmp_path), opener=srv) == {"refresh": IC.NO_PROFILE}
+    assert srv.profile_calls == [] and _oauth(tmp_path / ".credentials.json")["refreshToken"] == "rt-A2"
+    assert not (tmp_path / IC.TEMP_NAME).exists()
+    with pytest.raises(Refused) as e:
+        ID.parse_profile_answer(1, b'{"refresh":"refreshed-no-profile"}')
+    assert e.value.name == "identity-unreachable"
+
+
+def _close_eio(fd):
+    os.close(fd)
+    raise OSError(5, "injected")
+
+
+def test_a_close_that_fails_after_the_fsync_keeps_the_temp_and_root_promotes_it(env, monkeypatch):
+    """complement LOW + deepseek LOW (r2): close raising EIO after a good fsync fell into the write's except, returned
+    lost-after-spend and unlinked a whole, durable temp. The temp is now kept from the fsync on; with the rename also
+    failing, root promotes it and the retry refreshes rt-A2."""
+    w, la, _ = env
+    s = _session(w, la, _cred(access="acc-old", refresh="rt-A"))
+    srv = Server({"rt-A": ("acc-new", "rt-A2")}, {"acc-new": UUID, "acc-new+": UUID})
+    _run_child(w, srv)
+    real_close, real_replace = IC._close, IC._replace
+    monkeypatch.setattr(IC, "_close", _close_eio)
+    monkeypatch.setattr(IC, "_replace", _boom)
+    assert w.main(["start", s])[1]["refused"] == "identity-unreachable"
+    monkeypatch.setattr(IC, "_close", real_close)
+    monkeypatch.setattr(IC, "_replace", real_replace)
+    assert _oauth(_keep(w))["refreshToken"] == "rt-A2"
+    assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
+    assert [r["refresh_token"] for r in srv.refreshes] == ["rt-A", "rt-A2"]
 
 
 def test_no_token_appears_in_the_child_line(tmp_path):
@@ -365,6 +456,7 @@ def test_no_token_appears_in_the_child_line(tmp_path):
     (b'{"refresh":"no-refresh-token"}', "identity-expired"),
     (b'{"refresh":"lost-after-spend"}', "identity-expired"),
     (b'{"refresh":"kept-after-spend"}', "identity-unreachable"),
+    (b'{"refresh":"refreshed-no-profile"}', "identity-unreachable"),
     (b'{"refresh":500,"oauth_error":"invalid_grant"}', "identity-unreachable"),
     (b'{"refresh":200,"error":"request-failed"}', "identity-unparsable"),
     (b'{"refresh":true}', "identity-unparsable"),

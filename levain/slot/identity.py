@@ -116,7 +116,8 @@ def parse_profile_answer(exit_code: int, out: bytes, *, refreshed: bool = True) 
       repairs each.
     * ``identity-unreachable``: every other refresh that did not answer 200 (a fixed name instead of a status, 429,
       5xx, a 403 with no OAuth word, any other 4xx, ``invalid_client`` / ``unauthorized_client`` / any other OAuth word:
-      a client or server fault a sign-in with the same client does not repair). Both fail closed.
+      a client or server fault a sign-in with the same client does not repair), and a refresh written back whose
+      profile ran out of the child's deadline (``refreshed-no-profile``). Both fail closed.
 
     ``refreshed`` (the default; the Claude identity call passes it): a line without ``refresh: 200`` before its profile
     answer is ``identity-unparsable``, so no path that skips the refresh can pass the gate on a stored access token
@@ -151,6 +152,9 @@ def parse_profile_answer(exit_code: int, out: bytes, *, refreshed: bool = True) 
                 # start's promote_refresh_temp moved the new login into place, else it had refused identity-expired
                 raise Refused(UNREACHABLE, "the refresh answered but the child could not write it back; root moved "
                                            "the new login into place")
+            if ref == IC.NO_PROFILE:
+                raise Refused(UNREACHABLE, "the refresh answered and was written back, but the profile did not answer "
+                                           "in time (the stored login is the new one)")
             raise Refused(UNREACHABLE, f"the refresh did not reach an answer ({ref})")
         if type(ref) is not int:
             raise bad("refresh outcome")
