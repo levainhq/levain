@@ -1569,7 +1569,13 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         answers = None if stopped else question_context(queue.directory, AGENT, session)
     except Exception:
         answers = None  # undelivered answers stay for the next hook
-    context = "\n".join(c for c in (context, answers) if c) or None
+    try:
+        from levain.band_view import gate_notice
+
+        notice = gate_notice(queue.directory, AGENT, session, cwd, environ)
+    except Exception:
+        notice = None  # a notice is not the gate's to fail on
+    context = "\n".join(c for c in (context, answers, notice) if c) or None
     if context:
         out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}
         spec = out["hookSpecificOutput"]

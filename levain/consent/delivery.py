@@ -167,7 +167,7 @@ def _env(agent: str, meta: Mapping[str, Any]) -> dict[str, str]:
     default)."""
     from levain.launch import NETWORK, child_env
 
-    env = child_env(*_AGENT_AUTH, *NETWORK)
+    env = child_env(*_AGENT_AUTH, *NETWORK, seat="attended")   # a session of the operator's: the band's D4 marker
     var = _CONFIG_VAR.get(agent)
     if var is not None and "config_dir" in meta:
         if isinstance(meta["config_dir"], str) and meta["config_dir"]:

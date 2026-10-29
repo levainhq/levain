@@ -25,7 +25,7 @@ Known edges, none built against (later slices): ``closed N`` is shown once for t
 renders it (the viewer's own delta is separate); no source but questions; a question the coordinator holds as first
 reader is shown as any other. ``levain band`` numbers what it shows (a first show) but consumes no ``closed``.
 A seat with no non-empty string ``session_id`` (``levain verify-hooks``) gets no band and consumes nothing.
-Also known: (1) Codex hooks are not installed by S1; Codex parity is S4's. (2) Two hooks rendering at once may both show
+Also known: (1) Codex hooks (L1+L2) are installed from S4; the Stop verifier is Claude Code only. (2) Two hooks rendering at once may both show
 the same ``closed N`` (at-least-once; no claim protocol is built). (3) A dispatch worker's first prompt can fire before
 its ``active`` launch event carries ``harness_session_id``: it is then classed non-autonomous and may be shown the band
 and a closed notice (at most a duplicate, since the notice is marked only after delivery). (4) The read snapshot waits
@@ -53,7 +53,7 @@ from levain.cockpit.consent import utc_stamp
 from levain.consent.questions import HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select
 
 __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
-           "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed",
+           "band_hooks_state", "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed",
            "run_band", "run_band_answer"]
 
 COMPACT_AFTER = 12
@@ -592,11 +592,14 @@ def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> st
     return "since your last message: " + " · ".join(parts)
 
 
-def is_autonomous(session_id: str, queue_dir: Path | str | None = None) -> bool:
-    """Whether no human turn can reach this seat (D4), as far as S1 reads it: the Levain launch row of the harness
-    session, a coordinator being attended and a worker not (the only worker Levain launches today is the dispatch
-    executor); no launch row, a subagent aside, is a seat the user opened: NOT autonomous (fail-safe: a band shown
-    where nobody reads it costs tokens, a band missing from a human seat drops questions)."""
+def is_autonomous(session_id: str, queue_dir: Path | str | None = None,
+                  environ: Mapping[str, str] | None = None) -> bool:
+    """Whether no human turn can reach this seat (D4). The first fact found decides: (1) the Levain launch row of the
+    harness session (a coordinator is attended; a worker is not: the only worker Levain launches is the dispatch
+    executor, and the row carries no worker kind, so a ``session`` worker will need its kind read here when its
+    brief lands); (2) the ``LEVAIN_SEAT=autonomous|attended`` marker Levain sets on the processes it starts (or the
+    user on their own script); (3) neither: NOT autonomous (fail-safe: a band shown where nobody reads it costs tokens,
+    a band missing from a human seat drops questions). Grants and posture never decide it."""
     if "#agent:" in session_id:
         return True                           # a subagent never renders: the band belongs to the session's main thread
     try:
@@ -608,8 +611,13 @@ def is_autonomous(session_id: str, queue_dir: Path | str | None = None) -> bool:
         finally:
             conn.close()
     except Exception:                         # no coordinator store, or not one to read: no launch fact
+        ln = None
+    if ln is not None and ln.role == "coordinator":
         return False
-    return ln is not None and ln.role == "worker"
+    if ln is not None and ln.role == "worker":
+        return True
+    env = os.environ if environ is None else environ
+    return env.get("LEVAIN_SEAT") == "autonomous"      # "attended", anything else or unset: a seat a human reaches
 
 
 def _seat_gets_band(payload: Any, environ: Mapping[str, str]) -> bool:
@@ -620,14 +628,14 @@ def _seat_gets_band(payload: Any, environ: Mapping[str, str]) -> bool:
     session = payload.get("session_id") if isinstance(payload, dict) else None
     if not isinstance(session, str) or not session:
         return False
-    return not is_autonomous(session, queue_dir_for(environ))
+    return not is_autonomous(session, queue_dir_for(environ), environ)
 
 
 def _no_commit() -> None:
     return None
 
 
-def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None) -> tuple[str, Callable[[], None]]:
+def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None, agent: str = "claude_code") -> tuple[str, Callable[[], None]]:
     """The UserPromptSubmit hook's ``(text, commit)``: first the parse of the human's prompt (S2, D6: a full parse is
     recorded as the operator's via ``seat``; a relay turn is never parsed), then the render, with the echo of what was
     recorded and refused and the viewer's delta. Call ``commit()`` only once the text was DELIVERED: it records the
@@ -642,7 +650,7 @@ def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None) -> tuple
         if not _seat_gets_band(payload, env):
             return "", _no_commit
         store = QuestionStore(queue_dir_for(env))
-        viewer = f"claude_code:{payload['session_id']}"
+        viewer = f"{agent}:{payload['session_id']}"
     except Exception:
         return "", _no_commit
     deadline = t0 + HOOK_BUSY_MS / 1000       # ONE bound for the hook's writes: the answers, then the view row
@@ -678,12 +686,162 @@ def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None) -> tuple
     return text, commit
 
 
-def hook_contract(payload: Any, environ: Mapping[str, str] | None = None) -> str:
+def hook_contract(payload: Any, environ: Mapping[str, str] | None = None, agent: str = "claude_code") -> str:
     """The SessionStart contract line (D5 layer 1); ``""`` for an autonomous or id-less seat or on any error."""
     try:
         return CONTRACT if _seat_gets_band(payload, os.environ if environ is None else environ) else ""
     except Exception:
         return ""
+
+
+def _view_gen(store: QuestionStore, viewer: str) -> int | None:
+    with store._peek() as conn:
+        if conn is None or "band_views" not in _tables(conn):
+            return None
+        row = conn.execute("SELECT gen FROM band_views WHERE viewer = ? ORDER BY gen DESC, seq DESC LIMIT 1",
+                           (viewer,)).fetchone()
+    return int(row[0]) if row else None
+
+
+def _claim_retry(directory: Path | str, viewer: str, gen: int) -> bool:
+    """The verifier's second bound beside ``stop_hook_active``: one block per view (render generation). True when
+    this call took the claim (nothing was blocked for this view yet); False when one was, or on any error (fail open:
+    an unwritable claim is no licence to block)."""
+    import hashlib
+
+    try:
+        d = Path(directory) / "band_stop"
+        d.mkdir(mode=0o700, exist_ok=True)
+        f = d / hashlib.sha256(viewer.encode()).hexdigest()[:24]
+        try:
+            if f.read_text(encoding="utf-8").strip() == str(gen):
+                return False
+        except FileNotFoundError:
+            pass
+        tmp = f.with_suffix(".tmp")
+        tmp.write_text(str(gen), encoding="utf-8")
+        os.replace(tmp, f)
+        return True
+    except Exception:
+        return False
+
+
+def hook_stop(payload: Any, environ: Mapping[str, str] | None = None, agent: str = "claude_code") -> str | None:
+    """The Stop hook's verifier (D5 layer 3, Claude Code): ``None`` to let the turn end, or the reason to block it once
+    because the reply dropped a band item that was shown. The check is against this seat's last view (what the
+    UserPromptSubmit hook delivered): the reply must carry the ``band@<hwm>`` line and every shown number as an
+    item line (``N.`` at a line start). BOUNDED: never when the harness says the stop is already a continuation
+    (``stop_hook_active``), at most one block per view (:func:`_claim_retry`), and FAIL OPEN on anything unreadable
+    (no view, a non-text reply, an autonomous seat, a busy or missing store). Never raises, never writes the
+    operator's data."""
+    try:
+        import re
+        from levain.consent.queue import queue_dir_for
+
+        if not isinstance(payload, dict) or payload.get("stop_hook_active"):
+            return None
+        message = payload.get("last_assistant_message")
+        if not isinstance(message, str):
+            return None
+        env = os.environ if environ is None else environ
+        if not _seat_gets_band(payload, env):
+            return None
+        directory = queue_dir_for(env)
+        store = QuestionStore(directory)
+        viewer = f"{agent}:{payload['session_id']}"
+        view = last_view(store, viewer)
+        if view is None or not view.open_list:
+            return None
+        missing = [n for n in view.open_list if not re.search(rf"(?m)^[ \t>*-]*{n}\.(\s|$)", message)]
+        head = f"band@{view.seen_through}" not in message
+        if not missing and not head:
+            return None
+        gen = _view_gen(store, viewer)
+        if gen is None or not _claim_retry(directory, viewer, gen):
+            return None
+        what = ("the items " + ", ".join(str(n) for n in missing)) if missing else "the band@ header line"
+        return (f"[Levain NEEDS YOU band] Your reply dropped {what} of the NEEDS YOU band you were given. Reprint the "
+                "whole band once, exactly as Levain gave it (the band@ line and every numbered item, unchanged), at "
+                "the end of your reply. Do not answer or renumber any item.")
+    except Exception:
+        return None
+
+
+BAND_MARK = "levain.band_view"
+
+
+def band_hooks_state(hooks_dir: Path | str, agent: str = "claude_code") -> tuple[str, list[str]]:
+    """``(state, scripts lacking the band)`` of an install's ``activation/hooks``: ``wired`` (every required script
+    calls :mod:`levain.band_view`), ``stale`` (some do: an older copy beside a newer one; ``levain update`` fixes it)
+    or ``absent`` (none, or no directory). Required: SessionStart and UserPromptSubmit, and for Claude Code the Stop
+    verifier (Codex's Stop hook cannot carry one, D5)."""
+    names = ["session_start.py", "user_prompt_submit.py"] + (["stop.py"] if agent == "claude_code" else [])
+    lacking = []
+    for n in names:
+        try:
+            has = BAND_MARK in (Path(hooks_dir) / n).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            has = False
+        if not has:
+            lacking.append(n)
+    return ("wired" if not lacking else "absent" if len(lacking) == len(names) else "stale"), lacking
+
+
+def _find_hooks_dir(agent: str, cwd: str | None, environ: Mapping[str, str]) -> Path | None:
+    """The ``activation/hooks`` directory a seat's hooks run from, found as the install is: Claude Code's
+    ``CLAUDE_PROJECT_DIR`` or the working directory and its parents; Codex's one global hooks.json names it."""
+    cands: list[Path] = []
+    if environ.get("CLAUDE_PROJECT_DIR"):
+        cands.append(Path(environ["CLAUDE_PROJECT_DIR"]))
+    if cwd:
+        p = Path(cwd)
+        cands.extend([p, *p.parents])
+    for c in cands:
+        if (c / "activation" / "hooks" / "user_prompt_submit.py").is_file():
+            return c / "activation" / "hooks"
+    if agent == "codex":
+        home = Path(environ.get("CODEX_HOME") or Path.home() / ".codex")
+        try:
+            import shlex
+
+            tree = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
+            for entry in (tree.get("hooks") or {}).get("UserPromptSubmit") or []:
+                for h in entry.get("hooks") or []:
+                    for tok in shlex.split(str(h.get("command", ""))):
+                        if tok.endswith("user_prompt_submit.py"):
+                            return Path(tok).parent
+        except Exception:
+            return None
+    return None
+
+
+def gate_notice(directory: Path | str, agent: str, session: str | None, cwd: str | None,
+                environ: Mapping[str, str] | None = None) -> str | None:
+    """The gate's fallback line (D5): a seat with the consent gate but no band hook gets, ONCE per session, one line in
+    the gate's ``additionalContext`` saying N items need the operator and the band is not installed here. ``None``
+    when the hooks are wired, nothing is open, the seat is autonomous, the line was already given, or on any error
+    (the gate never fails for it)."""
+    try:
+        env = os.environ if environ is None else environ
+        if not isinstance(session, str) or not session or "#agent:" in session:
+            return None
+        if is_autonomous(session, directory, env):
+            return None
+        hooks = _find_hooks_dir(agent, cwd, env)
+        state = band_hooks_state(hooks, agent)[0] if hooks is not None else "absent"
+        if state == "wired":
+            return None
+        items, _, _ = _read(QuestionStore(directory))
+        n = len(items)
+        if n == 0:
+            return None
+        if not _claim_retry(directory, f"gate:{agent}:{session}", 1):
+            return None
+        return (f"[Levain] {n} item{'s' if n != 1 else ''} need{'' if n != 1 else 's'} the operator; the NEEDS YOU band "
+                f"is not installed on this seat (hooks {state}: `levain update`). Tell the operator so in your reply "
+                "and point to `levain band`.")
+    except Exception:
+        return None
 
 
 def run_band(args: argparse.Namespace) -> int:
