@@ -320,3 +320,63 @@ def test_past_the_listings_cap_the_card_signs_and_a_message_sends(tmp_path, monk
     assert v[1][:2] == ["(a) Ship it tonight", "(b) Hold for the morning"], v
     assert rig.notes() == ["past the cap"], (rig.notes(), v[-1])
     assert rig.verifies("np-compose-0001")
+
+
+def test_a_served_cockpit_stores_its_origin_where_a_band_reader_finds_it(tmp_path, monkeypatch) -> None:
+    from levain.consent.cockpit_origin import read_origin
+
+    rig = _Rig(tmp_path, monkeypatch)
+    assert read_origin(rig.signer.queue_dir) is None              # nothing served yet, nothing stored
+    with rig.serving():
+        assert read_origin(rig.signer.queue_dir) is None          # an http origin (this machine's browser) is never stored
+    (tmp_path / "two").mkdir()
+    rig2 = _Rig(tmp_path / "two", monkeypatch)
+    rig2.signer.page_origin = "https://localhost:8443"
+    with rig2.serving():
+        assert read_origin(rig2.signer.queue_dir) == "https://localhost:8443"
+
+
+def _https_rig(tmp_path, monkeypatch, name, origin="https://localhost:8443"):
+    (tmp_path / name).mkdir()
+    rig = _Rig(tmp_path / name, monkeypatch)
+    rig.signer.page_origin = origin
+    return rig
+
+
+def test_the_stored_origin_follows_the_server_that_holds_it(tmp_path, monkeypatch) -> None:
+    from levain.consent.cockpit_origin import read_origin, write_origin
+
+    rig = _https_rig(tmp_path, monkeypatch, "a")
+    write_origin(rig.signer.queue_dir, "https://old.ts.net")
+    with rig.serving():
+        assert read_origin(rig.signer.queue_dir) == "https://localhost:8443"
+    assert read_origin(rig.signer.queue_dir) is None               # closed: its own origin is withdrawn
+    # a later start whose origin is ineligible (http) removes the earlier https origin
+    write_origin(rig.signer.queue_dir, "https://old.ts.net")
+    rig3 = _Rig(tmp_path, monkeypatch)
+    write_origin(rig3.signer.queue_dir, "https://old.ts.net")
+    with rig3.serving():
+        assert read_origin(rig3.signer.queue_dir) is None
+
+
+def test_close_leaves_another_instances_origin(tmp_path, monkeypatch) -> None:
+    from levain.consent.cockpit_origin import read_origin, write_origin
+
+    rig = _https_rig(tmp_path, monkeypatch, "b")
+    with rig.serving():
+        write_origin(rig.signer.queue_dir, "https://other.ts.net")  # another instance replaced it
+    assert read_origin(rig.signer.queue_dir) == "https://other.ts.net"
+
+
+def test_a_startup_failure_after_the_pin_publishes_no_origin(tmp_path, monkeypatch) -> None:
+    from levain.consent.cockpit_origin import read_origin
+    import levain.web_server as ws
+
+    rig = _https_rig(tmp_path, monkeypatch, "c")
+
+    def boom(*a, **k):
+        raise RuntimeError("attach refused")
+    monkeypatch.setattr(ws, "DispatchSheet", boom)
+    with pytest.raises(RuntimeError):
+        make_server(rig.src, host="127.0.0.1", **{**rig.kw, "port": 0})
+    assert read_origin(rig.signer.queue_dir) is None

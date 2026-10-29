@@ -1469,6 +1469,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     signer: "Signer | None" = None
     # that pinned page_origin (the Signer refuses any other once make_server pins it), for what the page is told
     signer_page_origin: "str | None" = None
+    # (queue dir, origin) this server published for a band reader; server_close withdraws it only if still its own
+    published_origin: "tuple[Any, Any] | None" = None
     # the grants' passkey revoke (PLAN M17 "9a"), built by make_server from that Signer once it is pinned; None serves no
     # grant route
     grant_phone: "GrantPhone | None" = None
@@ -1557,6 +1559,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     def server_close(self) -> None:
         # K2b §4.2: the broker drains first (write admission closes; an admitted settler is waited
         # for before its lock is released), then the cockpit's refreshers stop
+        if self.published_origin is not None:      # first: a teardown step that raises below must not leave a link to this server
+            from levain.consent.cockpit_origin import withdraw_origin
+
+            withdraw_origin(*self.published_origin)
+            self.published_origin = None
         self.stream_stop.set()      # open streams end first: nothing is left holding a thread
         self.stream_watcher.stop()
         if self.broker is not None:
@@ -4065,6 +4072,13 @@ def make_server(
         finally:
             httpd.server_close()
         raise
+    if signer is not None:
+        # every fallible startup step has passed: this start REPLACES the published origin (an ineligible one removes
+        # the file), kept where a band reader (another process) finds it; server_close withdraws it if still ours
+        from levain.consent.cockpit_origin import write_origin
+
+        httpd.published_origin = (signer.queue_dir, signer.page_origin)
+        write_origin(signer.queue_dir, signer.page_origin)
     # The names this server serves, beside its cockpit.db, for `levain cockpit policy raise` to check a
     # downstream verb against (levain.cockpit.verbs.SERVED_VERBS_NAME). Written last, so a server refused
     # above records nothing. Unwritable, an earlier server's record is removed so the raise of a downstream

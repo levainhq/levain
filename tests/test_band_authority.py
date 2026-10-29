@@ -900,3 +900,28 @@ def test_the_morning_card_band_uses_the_cards_own_coordinator_snapshot(night, cq
     c = morning.card(night.store, queue_dir=qdir)
     assert len(opened) == 1                                    # the card's snapshot, and no second one for the band
     assert "SIGN: land it" in c["band"]["text"] and c["waiting"]["threads"][night.T][0]["ref_id"] == req.id
+
+
+# --- the cockpit's stored origin: a sign request on the band carries its https deep link ---------------------------
+def test_a_stored_origin_gives_the_sign_request_its_deep_link_and_none_stored_gives_none(signreq, qdir, env):
+    from levain.consent.cockpit_origin import write_origin
+
+    assert "://" not in signreq.seen.split("release it")[1].split("NEEDS YOU")[0]      # none stored: no link, no guess
+    write_origin(qdir, "https://box.ts.net:8443")
+    seen = prompt(env, "hello")
+    version = sign.read_request(qdir, signreq.rid).sha256[:16]
+    assert f"link https://box.ts.net:8443/sign/{signreq.rid}#v={version}" in seen
+
+
+@pytest.mark.parametrize("hostile", ["http://box.ts.net", "https://box.ts.net/path", "https://u:p@box.ts.net",
+                                     "https://box.ts.net\nhttps://evil.example", "https://" + "a" * 5000,
+                                     "https://box.ts.net?x=1", "https://box.ts.net/#f", "https://1.2.3.4"])
+def test_a_poisoned_stored_origin_produces_no_link(signreq, qdir, env, hostile):
+    import json
+
+    (qdir / "cockpit-origin.json").write_text(json.dumps({"cockpit_origin": hostile}) + "\n")
+    assert "link http" not in prompt(env, "hello")
+    (qdir / "cockpit-origin.json").write_text('{"cockpit_origin": "https://box.ts.net", "x": 1}\n')
+    assert "link http" not in prompt(env, "hello")
+    (qdir / "cockpit-origin.json").write_text("not json")
+    assert "link http" not in prompt(env, "hello")

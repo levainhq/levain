@@ -9,8 +9,9 @@ NOTHING HERE IS AUTHORITY (SIG-ONLY, D8). This module reads three stores read-on
 ``dispatch.db``) and builds display rows plus the TEXT of the existing signing ceremony each item is settled by
 (:func:`sheet_text`). It records nothing and rules nothing: a decision on one of these items exists only as the
 signature the existing path verifies (the phone ``question_rule`` sheet, ``levain consent rule``, a levain sign request
-on the cockpit's sign sheet, ``levain envelope sign``). A sign request is named in words, not as a
-:func:`levain.consent.sign.deep_link`: no store a band reader can see records the cockpit's origin.
+on the cockpit's sign sheet, ``levain envelope sign``). A sign request is named in words and, when the cockpit has
+stored its origin (:mod:`levain.consent.cockpit_origin`), carries its :func:`levain.consent.sign.deep_link`; with no
+stored origin it carries no link.
 
 Rec (D11, Q2 ruled (a)): an item shows the coordinator's rec when its record carries one, else the literal text
 :data:`NO_REC` (``rec: none (authority item)``) for a raw gate request.
@@ -354,6 +355,10 @@ def _one_record(rec: dict[str, Any], unresolved: bool, threads: dict[str, str], 
             options = menu["labels"]
             data.update({k: menu[k] for k in ("menu", "version", "texts", "no_letters")})
             origin = f"{menu['origin']}; {origin}"
+            link = _sign_link(qdir, rec["ref_id"], menu["version"])
+            if link is not None:                  # the stored origin's deep link; none stored, none shown
+                data["link"] = link
+                origin = f"{origin}; link {link}"
     text = (f"{head}: {_line(rec['text'])}" if not unresolved
             else f"UNREADABLE: SIGN {_line(ref, 80)} could not be read")
     rec_text = _line(rec.get("rec") or NO_REC, 500)
@@ -404,6 +409,21 @@ def sign_request_menu(qdir: Path | str, request_id: object) -> dict[str, Any] | 
     labels = tuple(f"({k}) {_line(t, _OPTION_SHOWN)}" for k, t in req.options) + ("deny: none of these",)
     texts = tuple(t for _, t in req.options) + ("",)
     return {**base, "menu": menu, "labels": labels, "texts": texts}
+
+
+def _sign_link(qdir: Path | str, request_id: object, version: object) -> str | None:
+    """The https deep link to the cockpit's sign sheet for ``request_id``, built from the origin the cockpit stored
+    (:mod:`levain.consent.cockpit_origin`, validated on read), or None when none is stored or the link cannot be built."""
+    from levain.consent import sign
+    from levain.consent.cockpit_origin import read_origin
+
+    try:                    # best-effort display: a link problem of any kind never breaks the band sheet
+        origin = read_origin(qdir)
+        if origin is None:
+            return None
+        return sign.deep_link(origin, request_id, version=version)  # type: ignore[arg-type]
+    except Exception:
+        return None
 
 
 class UnsafeValue(ValueError):
