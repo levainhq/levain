@@ -315,16 +315,22 @@ class QuestionStore:
             raise QuestionStoreError(f"question store directory {self.directory} is reachable by group or others "
                                      f"(mode {st.st_mode & 0o777:o}); it must be 0700")
 
-    def _connect(self, busy_ms: int | None = None, open_s: float | None = None) -> sqlite3.Connection:
+    def _connect(self, busy_ms: int | None = None, open_s: float | None = None,
+                 deadline: float | None = None) -> sqlite3.Connection:
         """A durable connection; ``open_s`` bounds the open's own waits (:func:`open_durable`'s ``busy_s``) and
-        ``busy_ms`` the busy timeout after, the first-time setup included."""
+        ``busy_ms`` the busy timeout after, the first-time setup included. ``deadline`` (``time.monotonic()``) replaces
+        both: the open gets what is left of it, and the setup's wait what the open left, never a fresh budget each."""
         if self._ready:
             if not self.path.exists():
                 raise QuestionStoreError(f"question store {self.path} has disappeared")
         else:
             self._check_directory()
+        if deadline is not None:      # after the directory checks: the open gets only what is left now
+            open_s = max(0.0, deadline - time.monotonic())
         conn = open_durable(self.path, busy_s=open_s)
         try:
+            if deadline is not None:
+                busy_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
             if busy_ms is not None:
                 conn.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
             if not self._ready:
@@ -364,8 +370,7 @@ class QuestionStore:
         past it raises SQLite's busy error and sets nothing up (the next caller tries again)."""
         if self._ready:
             return
-        left = max(0.0, deadline - time.monotonic())
-        self._connect(busy_ms=int(left * 1000), open_s=left).close()
+        self._connect(deadline=deadline).close()
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:

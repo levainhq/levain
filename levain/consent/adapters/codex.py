@@ -481,7 +481,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         if halted is not None:
             _ledger_note(Path(queue.directory), event, session, str(tool_name), tool_input,
                          cwd if isinstance(cwd, str) else "", refused="halted")
-            return _with_rulings(_deny(HALT_TEXT.format(n=halted)), queue, session)
+            return _with_rulings(_deny(HALT_TEXT.format(n=halted)), queue, session, cwd, environ)
     missing = _missing_of(event)
     if missing:
         return _missing_output(missing)
@@ -554,7 +554,7 @@ def _with_rulings(out: dict[str, Any] | None, queue: ConsentQueue, session: str,
 
         notice = gate_notice(queue.directory, AGENT, session, cwd if isinstance(cwd, str) else None, environ)
     except Exception:
-        notice = None  # a notice is not the gate's to fail on
+        notice = None  # an advisory notice must never fail the consent gate, whatever it raises
     context = "\n".join(c for c in (context, answers, notice) if c) or None
     if context:
         out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}

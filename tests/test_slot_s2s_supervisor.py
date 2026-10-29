@@ -200,7 +200,7 @@ BASE = {"format": "levain-routes-base/1", "routes": [
     {"route": "openai", "type": "brokered", "hosts": ["api.openai.com"]},
     {"route": "github", "type": "egress", "hosts": ["github.com"]},
     {"route": "pypi", "type": "egress", "hosts": ["pypi.org"]},
-    {"route": "claude-sub", "type": "subscription_passthrough", "hosts": ["claude.ai", "api.anthropic.com"]}]}
+    {"route": "claude-sub", "type": "subscription_passthrough", "hosts": ["claude.ai", "api.anthropic.com", "platform.claude.com"]}]}
 
 
 class FakeLease:
@@ -612,6 +612,60 @@ def test_pick_routes() -> None:
         SV.pick_routes(r + [{"route": "anthropic2", "type": "brokered", "hosts": ["api.anthropic.com"]}],
                        "claude", "brokered")
     assert e.value.name == "route-ambiguous:brokered"
+
+
+def _lacking(*hosts: str) -> list:
+    return [r for r in BASE["routes"] if r["route"] != "claude-sub"] + [
+        {"route": "claude-sub", "type": "subscription_passthrough", "hosts": list(hosts)}]
+
+
+def test_claude_passthrough_route_without_the_token_host_is_refused_naming_it() -> None:
+    """1029 ruling (np-e5b2ebed (a)): an operator's Claude passthrough route without the refresh's token host is
+    refused when the routes load, naming the host and the route; nothing is merged into it."""
+    from levain.slot.vendor_routes import CLAUDE_PASSTHROUGH_HOSTS
+    assert SV._TOKEN_HOST in CLAUDE_PASSTHROUGH_HOSTS      # the check and the shipped route cannot drift apart
+    with pytest.raises(Refused) as e:
+        SV.pick_routes(_lacking("claude.ai", "api.anthropic.com"), "claude", "passthrough")
+    assert e.value.name == "passthrough-route-lacks-token-host"
+    assert e.value.detail == ("add platform.claude.com to the hosts of route claude-sub in the base map: "
+                              "the login refresh needs it")
+    ok = SV.pick_routes(_lacking("claude.ai", "api.anthropic.com", "platform.claude.com"), "claude", "passthrough")
+    assert ok == ("github", "pypi", "claude-sub")
+    assert SV._PROFILE_HOST == "api.anthropic.com" and SV._TOKEN_HOST == "platform.claude.com"
+    with pytest.raises(Refused) as e:                       # neither identity host: both named
+        SV.pick_routes(_lacking("claude.ai"), "claude", "passthrough")
+    assert e.value.name == "passthrough-route-lacks-token-host"
+    assert e.value.detail == ("add platform.claude.com and api.anthropic.com to the hosts of route claude-sub in the "
+                              "base map: the login refresh and the login check need them")
+
+
+def test_a_token_host_only_claude_passthrough_route_is_refused_naming_the_profile_host() -> None:
+    """codex MED (L3 on 58622ca7): the token host alone passes the refresh but the profile call to api.anthropic.com
+    is denied by the tunnel, so every launch ends identity-unparsable; refuse at load and name the profile host."""
+    with pytest.raises(Refused) as e:
+        SV.pick_routes(_lacking("platform.claude.com"), "claude", "passthrough")
+    assert e.value.name == "passthrough-route-lacks-token-host"
+    assert e.value.detail == ("add api.anthropic.com to the hosts of route claude-sub in the base map: "
+                              "the login check needs it")
+
+
+def test_the_token_host_check_reads_the_selected_route_not_an_entry_sharing_its_id() -> None:
+    """L3 on 58622ca7 (all three lineages): the selected route is checked itself, never re-found by id."""
+    good = [{"route": "claude-sub", "type": "egress", "hosts": ["github.com"]}] + _lacking(
+        "claude.ai", "api.anthropic.com", "platform.claude.com")
+    assert SV.pick_routes(good, "claude", "passthrough")[-1] == "claude-sub"   # no false refusal
+    bad = [{"route": "claude-sub", "type": "egress", "hosts": ["platform.claude.com", "api.anthropic.com"]}] + _lacking(
+        "claude.ai", "api.anthropic.com")
+    with pytest.raises(Refused) as e:                       # no false pass off the egress entry's hosts
+        SV.pick_routes(bad, "claude", "passthrough")
+    assert e.value.name == "passthrough-route-lacks-token-host"
+
+
+def test_the_token_host_rule_binds_only_a_claude_passthrough_route() -> None:
+    lacking = _lacking("claude.ai", "api.anthropic.com")
+    assert SV.pick_routes(lacking, "claude", "brokered") == ("github", "pypi", "anthropic")   # not passthrough
+    base = lacking + [{"route": "codex-sub", "type": "subscription_passthrough", "hosts": ["chatgpt.com"]}]
+    assert SV.pick_routes(base, "codex", "passthrough") == ("github", "pypi", "codex-sub")   # another vendor
 
 
 def test_read_base_map(tmp_path: Path) -> None:

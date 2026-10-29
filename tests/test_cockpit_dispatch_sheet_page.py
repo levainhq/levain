@@ -301,7 +301,7 @@ def test_an_authorise_whose_recommendation_moved_between_card_and_tap_signs_noth
     box = "document.getElementById('sheet-contract')"
     with rig.serving() as httpd:
         sheet = httpd.dispatch_sheet
-        sheet.shown = lambda *_a, **_k: None          # the server's version compare off: the sheet's card compare alone
+        sheet.phone.shown = lambda *_a, **_k: None          # the server's version compare off: the sheet's card compare alone
         real_step = sheet.step
 
         def step(job_id: str, action: str, req: Any) -> Any:

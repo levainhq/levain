@@ -51,7 +51,8 @@ def test_the_merged_map_parses_and_the_supervisor_picks_the_route_for_each_auth(
 
 
 #: an operator's own Claude passthrough route under another id, hand-written before one shipped (1026-10 R6)
-OPERATOR_PASS = {"route": "operator-claude-pass", "type": "subscription_passthrough", "hosts": ["api.anthropic.com"]}
+OPERATOR_PASS = {"route": "operator-claude-pass", "type": "subscription_passthrough",
+                 "hosts": ["api.anthropic.com", "platform.claude.com"]}
 
 
 def _upgraded(*extra):

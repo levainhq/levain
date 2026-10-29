@@ -20,17 +20,24 @@ baseline ``confirm-identity yes`` writes.
   baseline from :func:`read_slot_baseline`): the answer is recorded in the state record's ``identity`` and compared
   with the baseline's ``observed_id``; a difference refuses ``identity-changed``.
 
+* Claude's child refreshes the stored login once before it asks the profile (PIN_REFRESH_DESIGN), so the account it
+  names is the one the file's own refresh token belongs to. A refresh the server refuses as a dead login is
+  ``identity-expired``; one that did not reach an answer is ``identity-unreachable`` (:func:`parse_profile_answer`).
+  A line with no refresh is ``identity-unparsable`` for Claude.
+
 The baseline file is root's, 0600, replaced atomically (temp, fsync, rename, directory fsync). :func:`baseline_vendor`
 reads it, and also the earlier vendor-only shape with no ``format`` key.
 """
 from __future__ import annotations
 
 import os
+import re
 import stat
 from typing import Callable, Dict, Mapping, Optional
 
 from levain.contracts import ContractError, canon
 from levain.slot import Refused
+from levain.slot import identity_child as IC
 from levain.slot import records as R
 from levain.slot import runtime_helper as H
 from levain.slot.grammar import SESSION_RE
@@ -68,8 +75,8 @@ def _claude_call(ctx: Optional[H.Ctx], a: Optional[R.Alloc], *, held: bool = Fal
     from levain.slot import start as SS
 
     if held:
-        return parse_profile_answer(*SS.identity_capture_held(ctx, a, states=(R.RENDERED,)))
-    return parse_profile_answer(*SS.identity_capture(ctx, a))
+        return parse_profile_answer(*SS.identity_capture_held(ctx, a, states=(R.RENDERED,)), refreshed=True)
+    return parse_profile_answer(*SS.identity_capture(ctx, a), refreshed=True)
 
 
 IDENTITY_CALLS: Mapping[str, Callable[..., str]] = {"codex": _codex_call, "claude": _claude_call}
@@ -88,29 +95,84 @@ def identity_call(ctx: Optional[H.Ctx], vendor: str, a: Optional[R.Alloc] = None
     return oid
 
 
+_OAUTH_WORD_RE = re.compile(r"[a-z_]{1,40}", re.ASCII)
+#: the child's fixed names for a refresh with no usable answer (``identity_child``): words, never a status or a token.
+_FIXED_NAME_RE = re.compile(r"[a-z\-]{1,32}", re.ASCII)
+
 #: §7.6: root reads at most this much of the identity call's stdout.
 PROFILE_ANSWER_MAX = 64 * 1024
 
 
-def parse_profile_answer(exit_code: int, out: bytes) -> str:
-    """IG-3: root's judgement of :mod:`levain.slot.identity_child`'s line. The observed id is the profile's
-    ``account.uuid`` when the child exited 0, its line is within :data:`PROFILE_ANSWER_MAX`, the server answered 200
-    and the body is JSON holding a uuid that fits ``OBSERVED_ID_RE``; anything else is ``identity-unparsable``."""
+def parse_profile_answer(exit_code: int, out: bytes, *, refreshed: bool = True) -> str:
+    """IG-3 / PIN_REFRESH_DESIGN §4: root's judgement of :mod:`levain.slot.identity_child`'s line. The observed id is the
+    profile's ``account.uuid`` when the child exited 0, its line is within :data:`PROFILE_ANSWER_MAX`, the refresh
+    answered 200, the profile answered 200 and the body is JSON holding a uuid that fits ``OBSERVED_ID_RE``. A refresh
+    outcome is judged first, whatever the exit code:
+
+    * ``identity-expired``: the refresh answered 400 or 401 with the OAuth word ``invalid_grant`` (RFC 6749 §5.2: the
+      refresh token "is invalid, expired, revoked"; Claude Code's own test is ``status 400|401`` and
+      ``code==="invalid_grant"``), the login holds no refresh token, or the refresh rotated the token and the new one
+      could not be written (``lost-after-spend``); or the refresh was 200 and the profile 401/403. Signing in again
+      repairs each.
+    * ``identity-unreachable``: every other refresh that did not answer 200 (a fixed name instead of a status, 429,
+      5xx, a 403 with no OAuth word, any other 4xx, ``invalid_client`` / ``unauthorized_client`` / any other OAuth word:
+      a client or server fault a sign-in with the same client does not repair), and a refresh written back whose
+      profile ran out of the child's deadline (``refreshed-no-profile``). Both fail closed.
+
+    ``refreshed`` (the default; the Claude identity call passes it): a line without ``refresh: 200`` before its profile
+    answer is ``identity-unparsable``, so no path that skips the refresh can pass the gate on a stored access token
+    alone (PIN_REFRESH_DESIGN §0's swap). ``refreshed=False`` judges a profile-only line, for tests of the profile
+    call's own mechanics. Anything else is ``identity-unparsable``."""
     import json
 
     def bad(why: str) -> Refused:
         return Refused("identity-unparsable", why)
 
-    if exit_code != 0:
-        raise bad(f"identity call exit {exit_code}")
     if len(out) > PROFILE_ANSWER_MAX:
         raise bad("answer over 64 KiB")
     try:
         ans = json.loads(out.decode("utf-8"))
     except (ValueError, RecursionError):      # UnicodeDecodeError is a ValueError
+        if exit_code != 0:
+            raise bad(f"identity call exit {exit_code}") from None
         raise bad("answer is not JSON") from None
+    if type(ans) is dict and "refresh" in ans:
+        ref = ans["refresh"]
+        word = ans.get("oauth_error")
+        word = word if type(word) is str and _OAUTH_WORD_RE.fullmatch(word) else None
+        if type(ref) is str:
+            if not _FIXED_NAME_RE.fullmatch(ref):
+                raise bad("refresh name")
+            if ref == IC.NO_REFRESH_TOKEN:
+                raise Refused(EXPIRED, "the stored login holds no refresh token (sign in to this slot again)")
+            if ref == IC.LOST_AFTER_SPEND:
+                raise Refused(EXPIRED, "the refresh rotated the login and the new one could not be written (sign in "
+                                       "to this slot again)")
+            if ref == IC.KEPT_AFTER_SPEND:
+                # start's promote_refresh_temp moved the new login into place, else it had refused identity-expired
+                raise Refused(UNREACHABLE, "the refresh answered but the child could not write it back; root moved "
+                                           "the new login into place")
+            if ref == IC.NO_PROFILE:
+                raise Refused(UNREACHABLE, "the refresh answered and was written back, but the profile did not answer "
+                                           "in time (the stored login is the new one)")
+            raise Refused(UNREACHABLE, f"the refresh did not reach an answer ({ref})")
+        if type(ref) is not int:
+            raise bad("refresh outcome")
+        if ref != 200:
+            if ref in (400, 401) and word == "invalid_grant":
+                raise Refused(EXPIRED, f"the refresh answered HTTP {ref} {word} (the stored login looks expired or "
+                                       "revoked: sign in to this slot again)")
+            raise Refused(UNREACHABLE, f"the refresh answered HTTP {ref}" + (f" {word}" if word else ""))
+    elif refreshed:
+        raise bad("no refresh")
+    if exit_code != 0:
+        raise bad(f"identity call exit {exit_code}")
     if type(ans) is not dict or type(ans.get("status")) is not int:
         raise bad("no status")
+    if ans["status"] in (401, 403):
+        # a distinct name: the supervisor routes on the name alone and must tell the operator to sign in again
+        raise Refused(EXPIRED, f"HTTP {ans['status']} (the stored login looks expired or revoked: sign in to this slot "
+                               "again)")
     if ans["status"] != 200:
         raise bad(f"HTTP {ans['status']}")
     try:
@@ -211,6 +273,12 @@ BASELINE_MAX_BYTES = 4096
 #: the record's ``identity.result`` for a gate that matched, that found another account, and a vendor with no check.
 GATE_MATCHED = "matched"
 GATE_CHANGED = "identity-changed"
+#: the record's ``identity.result`` for a parked login a sign-in repairs (a refresh answered ``invalid_grant``, no
+#: refresh token, a rotated login that could not be written back, or a profile 401/403 on the refreshed token), and for
+#: a check that could not reach an answer (a refresh with no usable answer: network, 429, 5xx, a non-OAuth 403, any
+#: other OAuth word, an unwritable file before the token was spent). The second asks for a retry, never a new login.
+EXPIRED = "identity-expired"
+UNREACHABLE = "identity-unreachable"
 _BASELINE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 
 
@@ -363,4 +431,4 @@ def confirm_identity(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, o
 
 __all__ = ["BASELINE_FORMAT", "BASELINE_KEYS", "BASELINE_WRITTEN", "CONFIRMED", "IDENTITY_CALLS", "LOGIN_FAILED",
            "NOT_A_CHECK", "baseline_bytes", "baseline_vendor", "check_baseline", "confirm_identity", "gate_check",
-           "identity_call", "read_slot_baseline", "record_login_identity"]
+           "identity_call", "read_slot_baseline", "record_login_identity", "EXPIRED", "UNREACHABLE"]

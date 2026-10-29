@@ -22,6 +22,7 @@ from typing import Any
 
 from levain.cockpit.consent import utc_stamp
 from levain.coordinator import chat
+from levain.coordinator.chat_approvals import APPROVAL_EVENT_KINDS
 from levain.coordinator.store import CoordError
 
 THREADS_LIST_PATH = "/cockpit/threads.json"
@@ -31,6 +32,8 @@ VIEW_OWNER = "cockpit:thread-view"          # the owner whose composer the read-
 LIST_MAX = 200
 _THREAD_ID = re.compile(r"th-[0-9a-f]{32}")
 _APPROVAL_KINDS = ("vendor_approval_request", "vendor_approval_resolved")
+# chat_timeline's own approval arms (chat_approvals.APPROVAL_VIEW_ARMS): 'approval', and 'approval_' + each event kind
+_VIEW_APPROVAL_KINDS = frozenset(("approval", *("approval_" + k for k in APPROVAL_EVENT_KINDS)))
 
 
 def is_threads_path(path: str) -> bool:
@@ -140,8 +143,10 @@ def _item(row: chat.TimelineRow, facts: Mapping[tuple[str, str], tuple[str | Non
     call_id, truncated, backfill = facts.get((row.launch_id or "", row.ref_id), (None, 0, 0))
     # an approval's ref is the kind alone and its body is dropped: the vendor's control-request id is not a queue request
     # id, and a driver may put the tool name, its input or that id in the body, so none of it is offered
-    approval = row.kind in _APPROVAL_KINDS
-    ref = row.ref_id.partition(":")[0] if approval else row.ref_id
+    view_approval = row.kind in _VIEW_APPROVAL_KINDS
+    approval = view_approval or row.kind in _APPROVAL_KINDS
+    # the view arms' ref is the whole durable key (spawn nonce, vendor tool_use_id): a constant, never derived from it
+    ref = row.kind if view_approval else row.ref_id.partition(":")[0] if approval else row.ref_id
     item: dict[str, Any] = {"gseq": row.gseq, "kind": row.kind, "source": row.source, "ref": ref,
                             "launch_id": row.launch_id, "status": row.status, "body": None if approval else row.body,
                             "at": row.at,

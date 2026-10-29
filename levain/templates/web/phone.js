@@ -1079,7 +1079,10 @@
     busy++;
     const base = "/dispatch/" + encodeURIComponent(r.id) + "/";
     say("asking for the " + (cancel ? "cancel" : "signature") + " to sign\u2026");
-    call("POST", base + (cancel ? "cancel-challenge" : "challenge"), cancel ? { signer_fp: fp, reason: reason || "" } : { signer_fp: fp }).then((c) => {
+    call("POST", base + (cancel ? "cancel-challenge" : "challenge"), cancel ? { signer_fp: fp, reason: reason || "", request_sha256: r.sha256 } : { signer_fp: fp, request_sha256: r.sha256 }).then((c) => {
+      // any 409 on a challenge says the displayed card is no longer true (stale, cancelled, unreadable): the message
+      // is shown and the finally's load draws the queue afresh
+      if (!c.ok && c.status === 409) return say((cancel ? "not cancelled: " : "not signed: ") + why(c), "bad");
       if (!c.ok) return say(why(c), "bad");
       say("confirm with your passkey to " + (cancel ? "cancel the job" : "sign the contract") + "\u2026");
       const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
