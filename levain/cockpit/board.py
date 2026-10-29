@@ -65,8 +65,27 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
     return cards, None
 
 
-def build(store_dir: Path | str | None, question_store: Any = None, *, generated: str | None = None) -> dict[str, Any]:
-    """The board JSON: ``{schema, generated, queue, columns: [{category, cards, count}], unreadable, band_hint, note}``."""
+def _tell(store_dir: Path | str | None, drop_dir: Path | str | None) -> dict[str, Any]:
+    """Whether the "tell the coordinator" box is offered: only when the drop route writes to the SAME directory the board
+    reads (one pinned board directory for the read and the drop), else the board says why it is not offered."""
+    if drop_dir is None:
+        return {"offered": False, "why": "this cockpit hosts no coordinator drops"}
+    if store_dir is None:
+        return {"offered": False, "why": "this cockpit has no board directory to tell"}
+    try:
+        same = Path(store_dir).resolve() == Path(drop_dir).resolve()
+    except OSError:
+        same = False
+    if not same:
+        return {"offered": False, "why": "the drop route files to a different queue than the one this board reads"}
+    return {"offered": True, "why": None}
+
+
+def build(store_dir: Path | str | None, question_store: Any = None, *, generated: str | None = None,
+          drop_dir: Path | str | None = None) -> dict[str, Any]:
+    """The board JSON: ``{schema, generated, queue, columns: [{category, cards, count}], unreadable, band_hint, note, tell,
+    journal_as_of_read}``. KNOWN EDGE: the items and the journal are two read transactions (C13 exposes no single
+    snapshot), so a card's journal line is "as of read": it may be newer than the card's column for one poll."""
     unreadable: list[str] = []
     items: list[Mapping[str, Any]] = []
     journal: dict[str, Mapping[str, Any]] = {}
@@ -104,5 +123,5 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
     if band_bad:
         note = (note + "; " if note else "") + f"the needs-you band could not be read here; run `{BAND_HINT}`"
     return {"schema": 1, "generated": generated, "queue": queue, "unreadable": unreadable, "note": note,
-            "band_hint": BAND_HINT,
+            "band_hint": BAND_HINT, "tell": _tell(store_dir, drop_dir), "journal_as_of_read": True,
             "columns": [{"category": c, "count": len(by_cat[c]), "cards": by_cat[c]} for c in CATEGORIES]}

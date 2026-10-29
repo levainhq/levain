@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import http.client
 import json
+import shutil
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -138,32 +141,85 @@ def test_route_serves_the_board_behind_the_token(tmp_path, lh):
         assert sum(c["count"] for c in body["columns"] if c["category"] == "needs-you") == 1
 
 
+def _snapshot(d):
+    return sorted((str(p.relative_to(d)), p.stat().st_mtime_ns, p.read_bytes() if p.is_file() else None) for p in d.rglob("*"))
+
+
 def test_route_with_no_store_is_200_no_queue_and_creates_nothing(tmp_path, lh):
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (lh / "marker").write_text("x")
+    before = _snapshot(lh)
     _root, src, _ids = _install(tmp_path)
     with _serve(src, write_token=TOKEN) as (base, _h):
         status, _hd, data = _raw(base, board.BOARD_PATH)
-    assert status == 200 and json.loads(data)["queue"] == "none"
-    assert not (lh / "dispatch.db").exists()
+        assert status == 200 and json.loads(data)["queue"] == "none"
+        assert _snapshot(lh) == before and not (lh / "dispatch.db").exists()
+        # control: the server really reads `lh` (a store made there is seen), so the assertion above is not vacuous
+        st = CoordStore(lh)
+        ready.add(st, st.coord_take(), "levain:a", repo="levain", title="A", to="backlog", who="desk", why="w.")
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["queue"] == "ok"
+
+
+def test_the_tell_box_is_offered_only_when_the_drop_writes_where_the_board_reads(tmp_path, qdir):
+    other = tmp_path / "other"
+    other.mkdir()
+    assert board.build(qdir, None, drop_dir=qdir)["tell"]["offered"] is True
+    off = board.build(qdir, None, drop_dir=other)["tell"]
+    assert off["offered"] is False and "different queue" in off["why"]
+    assert board.build(qdir, None)["tell"]["offered"] is False
+    assert board.build(None, None, drop_dir=qdir)["tell"]["offered"] is False
+
+
+def test_route_pins_the_tell_to_the_board_directory(tmp_path, lh):
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    other = tmp_path / "other"
+    other.mkdir()
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, httpd):
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["tell"]["offered"] is False       # no drop route here
+        httpd.coord_sheet = SimpleNamespace(queue_dir=other, close=lambda: None)
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["tell"]["offered"] is False       # a different queue
+        httpd.coord_sheet = SimpleNamespace(queue_dir=lh, close=lambda: None)
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["tell"]["offered"] is True        # the same one
 
 
 @pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH"])
 def test_no_write_reaches_the_board(tmp_path, lh, method):
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = CoordStore(lh)
+    ready.add(st, st.coord_take(), "levain:a", repo="levain", title="A", to="backlog", who="desk", why="w.")
+    before = _snapshot(lh)
     _root, src, _ids = _install(tmp_path)
     with _serve(src, write_token=TOKEN) as (base, _h):
         status, _hd, data = _raw(base, board.BOARD_PATH, method=method, body=b"{}")
+    assert _snapshot(lh) == before
     assert status in (404, 405, 422, 501) or 400 <= status < 500      # refused (an unhandled verb is 501), never a 200/500
     assert b'"columns"' not in data
 
 
-def test_the_view_script_is_app_shell_with_no_edit_controls(tmp_path):
+def test_the_view_script_is_served_as_app_shell(tmp_path):
     _root, src, _ids = _install(tmp_path)
     with _serve(src, write_token=TOKEN) as (base, _h):
         status, hdrs, data = _raw(base, "/board_view.js", token=None)
         _s, _h2, page = _raw(base, "/", token=None)
     assert status == 200 and hdrs["content-type"].startswith("text/javascript")
     assert b'<script src="/board_view.js"></script>' in page
-    js = data.decode()
-    for banned in ("draggable", "dragstart", "contenteditable", "innerHTML"):
-        assert banned not in js
-    assert "/cockpit/coord/drop" in js and "outbox_id" in js
-    assert js.count('method: "POST"') == 1
+    assert b"innerHTML" not in data and b"draggable" not in data
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_tell_box_behaves_under_node():
+    """The box's behaviour, run: only the drop endpoint is posted to, and only on a click that passes every gate."""
+    root = Path(__file__).resolve().parent.parent
+    run = subprocess.run(["node", str(root / "tests" / "js_board_tell_harness.js"),
+                          str(root / "levain" / "templates" / "web" / "board_view.js")],
+                         capture_output=True, text=True, timeout=60, check=True)
+    out = json.loads(run.stdout)
+    assert out["not_offered"]["posts"] == [] and out["not_offered"]["reads"] == 0 and out["not_offered"]["wordsHidden"]
+    assert out["unreadable"]["posts"] == [] and "store locked" in out["unreadable"]["say"]      # unreadable is not "no store"
+    assert len(out["double_click"]["posts"]) == 1 and out["double_click"]["reads"] == 1          # locked before the await
+    assert len(out["no_store_yet"]["posts"]) == 1 and out["no_store_yet"]["posts"][0]["store_id"] is None
+    edited = out["edited_pending"]["posts"]
+    assert len(edited) == 1 and edited[0]["words"] == "B" and edited[0]["outbox_id"] != "ph-old"   # edited words: new id
+    same = out["same_pending"]["posts"]
+    assert len(same) == 1 and same[0]["outbox_id"] == "ph-old" and out["same_pending"]["reads"] == 0

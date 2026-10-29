@@ -2531,7 +2531,9 @@ class _Handler(GuardedHandler):
                 from levain.consent.queue import default_queue_dir
 
                 directory = reader.directory if reader.directory is not None else default_queue_dir()
-            payload = cockpit_board.build(directory, getattr(self.server, "question_store", None))
+            sheet = getattr(self.server, "coord_sheet", None)
+            payload = cockpit_board.build(directory, getattr(self.server, "question_store", None),
+                                          drop_dir=sheet.queue_dir if sheet is not None else None)
         except Exception as exc:  # noqa: BLE001 - never a dead connection
             payload = {"error": "board_unreadable", "message": f"the board could not be built ({type(exc).__name__})"}
         finally:
