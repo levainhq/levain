@@ -246,27 +246,92 @@ def test_the_reader_uses_the_contexts_now_unless_a_clock_is_injected(store, qdir
     assert "idle" in injected["state"]                      # an explicitly injected clock still wins
 
 
-def test_a_store_that_vanishes_between_the_probe_and_the_read_is_the_empty_read(store, qdir, clock, monkeypatch) -> None:
-    from levain.cockpit.coordinator_status import status_reader
-    from levain.cockpit.engine import ReadContext
-    from levain.coordinator.store import StoreAbsent
-
-    real = CoordStore.open_readonly
-    calls = []
-
-    def vanishing(self, busy_s=None):
-        calls.append(1)
-        if len(calls) > 1:
-            raise StoreAbsent("gone between the probe and the read")
-        return real(self, busy_s)
-
-    monkeypatch.setattr(CoordStore, "open_readonly", vanishing)
-    got = status_reader(lambda: qdir, clock)(ReadContext(T0))
-    assert len(calls) > 1 and got.rows == ()
-
-
 def test_the_status_spec_carries_no_dead_empty_string(store, qdir, clock) -> None:
     from levain.cockpit.engine import ReadContext
 
     specs = coordinator_discoverer(lambda: qdir, clock=clock)(ReadContext(T0))
     assert next(s for s in specs if s.id == COORD_STATUS_ID).empty == ""
+
+
+def test_an_unrecorded_expiry_shows_a_time_that_does_not_move_with_the_read(store, qdir, clock, tmp_path) -> None:
+    """The virtual state text must hold nothing the CLI will not keep: two reads of the same store at different
+    ``ctx.now`` give equal state text and version, and the CLI's state word (recording the expiry on a COPY) is the
+    panel's. The death is stamped at the launch's own until, so the backoff time is not the reader's clock."""
+    import shutil
+
+    _drop(store)
+    _claimed(store)
+    until = T0 + lease.LAUNCH_TTL
+    states = []
+    for seconds in (0, 7, 30):
+        clock.now = until + timedelta(seconds=seconds)
+        states.append(next(r for r in _panel(qdir, clock)["rows"] if r["id"] == "state"))
+    assert len({(s["body"], s["version"]) for s in states}) == 1 and states[0]["body"].startswith("Coordinator: backoff: ")
+    copy = tmp_path / "copy"
+    shutil.copytree(qdir, copy)
+    cli = CoordStore(copy, clock=lambda: until + timedelta(seconds=30)).coord_status()
+    assert cli["wake"] == "backoff" and states[0]["body"] == f"Coordinator: {cli['wake']}: {cli['why']}"
+
+
+def test_a_pending_launch_with_no_until_does_not_fault_the_panel(store, qdir, clock) -> None:
+    """A pending row holding no ``until`` (the module tolerates it in the launch row) must not turn the whole panel into
+    'Panel fault'; the state, lease and launch rows still render."""
+    _drop(store)
+    store.coord_status()
+    db = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        # a worker launch: the coordinator's own pending check reads its until too, and this is the all-roles trigger
+        guards = db.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+                            "AND sql LIKE '%append-only%'").fetchall()
+        for name, _sql in guards:
+            db.execute(f'DROP TRIGGER "{name}"')     # the fixture builds a row the API never writes
+        db.execute("UPDATE launches SET role = 'worker'")
+        db.execute("UPDATE launch_events SET until = NULL WHERE kind = 'pending'")
+        for _name, sql in guards:
+            db.execute(sql)                          # the store's guards back, so the panel's schema probe is unchanged
+        db.commit()
+    finally:
+        db.close()
+    rows = _rows(_panel(qdir, clock))
+    assert "error:panel" not in rows and {"state", "lease", "setting"} <= set(rows)
+    assert any(i.startswith("launch:") for i in rows)
+
+
+def _second_open_raises_absent(monkeypatch, *, remove_file: bool) -> list:
+    from levain.coordinator.store import StoreAbsent
+
+    real = CoordStore.open_readonly
+    calls: list = []
+
+    def second_open_fails(self, busy_s=None):
+        calls.append(1)
+        if len(calls) > 1:
+            if remove_file:
+                for suffix in ("", "-wal", "-shm"):
+                    Path(str(self.path) + suffix).unlink(missing_ok=True)
+            raise StoreAbsent("not readable on the second open")
+        return real(self, busy_s)
+
+    monkeypatch.setattr(CoordStore, "open_readonly", second_open_fails)
+    return calls
+
+
+def test_a_store_that_is_there_but_not_current_is_an_error_row_not_the_empty_read(store, qdir, clock, monkeypatch) -> None:
+    """``open_readonly`` also raises StoreAbsent for a file whose schema is not current: with the file present that
+    must not read as 'no store'."""
+    from levain.cockpit.coordinator_status import status_reader
+    from levain.cockpit.engine import ReadContext
+
+    calls = _second_open_raises_absent(monkeypatch, remove_file=False)
+    got = status_reader(lambda: qdir, clock)(ReadContext(T0))
+    assert len(calls) > 1 and len(got.rows) == 1 and got.rows[0].id.startswith("error:")
+    assert "not readable on the second open" in got.rows[0].body
+
+
+def test_a_file_removed_between_the_probe_and_the_read_is_still_the_empty_read(store, qdir, clock, monkeypatch) -> None:
+    from levain.cockpit.coordinator_status import status_reader
+    from levain.cockpit.engine import ReadContext
+
+    calls = _second_open_raises_absent(monkeypatch, remove_file=True)
+    got = status_reader(lambda: qdir, clock)(ReadContext(T0))
+    assert len(calls) > 1 and got.rows == ()

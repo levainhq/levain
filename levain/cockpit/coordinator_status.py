@@ -38,7 +38,9 @@ def _read_status(store: Any, now: datetime) -> dict[str, Any]:
     with read_transaction(store.open_readonly) as conn:     # one snapshot for the lease, the state and the launches
         st = lease.status(conn, stamp)
         held = lease.lease(conn, stamp)
-        if (held is not None and not held.live) or any(stamp >= ln.until for ln in lease._in_state(conn, "pending")):
+        # a pending launch holding no until is never past one (the launch row tolerates it the same way)
+        if (held is not None and not held.live) or any(
+                ln.until is not None and stamp >= ln.until for ln in lease._in_state(conn, "pending")):
             # a due lapse or expiry nothing has written: what a write would record, applied to a throwaway copy
             scratch = sqlite3.connect(":memory:", isolation_level=None)
             try:
@@ -112,7 +114,11 @@ def status_reader(directory: Callable[[], Path | str | None], clock: Callable[[]
                 return Read(rows=())
             try:
                 rows = status_rows(_read_status(store, now), now)
-            except StoreAbsent:             # gone between the probe and the read: the same read as no store
+            except StoreAbsent:
+                # gone between the probe and the read: the same read as no store. A file that is still there and was
+                # refused (a schema that is not current) is a store that cannot be read: its error row, not the empty read
+                if store.path.exists():
+                    raise
                 return Read(rows=())
         except Exception as e:
             return Read(rows=(_unreadable(e),))
