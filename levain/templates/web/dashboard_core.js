@@ -96,6 +96,10 @@
   let cancelPending = null;
   // Answer an agent's question (Q-2b, the manifest source only): `answerQuestion(rowId, {option}|{text}) → Promise<{ok}|{ok:false,...}>`.
   let answerQuestion = null;
+  // The NEEDS YOU band (Q17-ALL S5b, the manifest source only): `bandRead() → Promise<band>` shows the band to this cockpit
+  // credential (numbers it, records the view); `answerBand(text, storeId, viewId) → Promise<{ok}|{ok:false,...}>` answers it.
+  let bandRead = null;
+  let answerBand = null;
   // Dismiss an agent's note (the manifest source only): `dismissNote(rowId) → Promise<{ok}|{ok:false,...}>`. It tells the agent nothing.
   let dismissNote = null;
   // Clear or reopen a coordinator review item (the manifest source only): `reviewItem(rowId, verb) → Promise<{ok}|{ok:false,...}>`.
@@ -260,6 +264,8 @@
     commitJob = opts && typeof opts.commitJob === "function" ? opts.commitJob : null;
     cancelPending = opts && typeof opts.cancelPending === "function" ? opts.cancelPending : null;
     answerQuestion = opts && typeof opts.answerQuestion === "function" ? opts.answerQuestion : null;
+    bandRead = opts && typeof opts.bandRead === "function" ? opts.bandRead : null;
+    answerBand = opts && typeof opts.answerBand === "function" ? opts.answerBand : null;
     dismissNote = opts && typeof opts.dismissNote === "function" ? opts.dismissNote : null;
     reviewItem = opts && typeof opts.reviewItem === "function" ? opts.reviewItem : null;
     pollJob = opts && typeof opts.pollJob === "function" ? opts.pollJob : null;
@@ -4133,6 +4139,7 @@
       else if (spec) mountCaptureBox(p, buildActionBox(act, spec));
     }
     if (data.note) p.appendChild(richEl("div", "ext-note", data.note));
+    if (entry.id === "decisions" && bandRead) p.appendChild(bandSlot());   // the NEEDS YOU band, by number
     // the Decisions panel carries proposal cards whatever rows it holds (three old hand-allows make a card on a panel with
     // nothing pending): decided by panel id, never by the presence of a consent row. The cards lead the rows when there are
     // any (appendExternalLines mounts them); a panel that drew none gets them after the body (renderExternal, below)
@@ -4619,13 +4626,128 @@
     parts.push(wrap, words, sendWords, msg);
     slot.replaceChildren(...parts);
   }
+  // The NEEDS YOU band (Q17-ALL S5b), drawn at the head of the Decisions panel: each open item under its band number, one
+  // shorthand box ("15b", "1a 2b") and a tap on an option sending "<n><letter>". Reading the band shows it to this credential
+  // (numbers it, records the view); an answer carries the {store_id, view_id} shown. The box answers information items only
+  // (unsigned, a human channel): an authority item is listed and says it opens its signing sheet. Every string is drawn with
+  // textContent, never as HTML.
+  const bandNumOf = new Map();    // question n -> band number, from the last band read: a question row leads with it
+  let bandDraft = "";             // the shorthand typed and not sent: a redraw gives it back
+  let bandGot = null;             // the last read, shared for a moment by the slots one render draws (the server takes one at a time)
+  function bandFetch(fresh) {
+    if (!fresh && bandGot && Date.now() - bandGot.at < 2000) return bandGot.p;
+    const p = bandRead();
+    bandGot = { at: Date.now(), p: p };
+    p.catch(() => { if (bandGot && bandGot.p === p) bandGot = null; });
+    return p;
+  }
+  function applyBandNumbers() {
+    for (const row of document.querySelectorAll("[data-question-row]")) {
+      const tag = row.querySelector(".band-num");
+      const n = bandNumOf.get(Number(row.dataset.questionN));
+      if (tag) { tag.textContent = n === undefined ? "" : String(n); tag.hidden = n === undefined; }
+    }
+  }
+  function bandSlot() {
+    const slot = el("div", "band-slot");
+    slot.setAttribute("data-band-slot", "");
+    bandFill(slot, "", false);
+    return slot;
+  }
+  function bandFill(slot, say, fresh, retried) {
+    bandFetch(fresh).then((b) => bandDraw(slot, b, say), (e) => {
+      const m = e && e.message ? String(e.message) : "";
+      if (/no question store/.test(m)) { slot.replaceChildren(); return; }     // nothing to show on a cockpit without one
+      // the server reads one band at a time (a second look meeting the first is told "busy"): one more try, then say so
+      if (!retried) { setTimeout(() => bandFill(slot, say, true, true), 700); return; }
+      slot.replaceChildren(el("div", "ext-meta band-note", "the band could not be read" + (m ? ": " + m : "")));
+    });
+  }
+  function bandDraw(slot, b, say) {
+    b = b && typeof b === "object" ? b : {};
+    const items = Array.isArray(b.items) ? b.items : [];
+    bandNumOf.clear();
+    for (const it of items) if (it && Number.isInteger(it.question)) bandNumOf.set(it.question, it.n);
+    const kids = [];
+    if (items.length === 0 && !say && !b.note) { slot.replaceChildren(); applyBandNumbers(); return; }
+    kids.push(el("div", "ext-grouphead", "needs you · the band"));
+    const msg = el("span", "edit-msg band-msg", say || "");
+    const controls = [];
+    const box = el("input", "band-box");
+    box.type = "text"; box.maxLength = 400; box.value = bandDraft; box.autocomplete = "off";
+    box.setAttribute("aria-label", "answer the band by number and letter");
+    box.placeholder = "answer by number and letter, e.g. 15b";
+    const go = el("button", "undo-btn band-send", "send");
+    go.type = "button";
+    const canAnswer = !!(answerBand && b.view_id !== null && b.view_id !== undefined && typeof b.store_id === "string");
+    const send = async (text) => {
+      text = String(text || "").trim();
+      if (!text) return;
+      if (!canAnswer) { msg.textContent = "this page cannot answer the band now"; return; }
+      for (const c of controls) c.disabled = true;
+      bandGot = null;     // the board redraws on a landed answer and reads the band again: never the look from before it
+      let res;
+      try { res = await answerBand(text, b.store_id, b.view_id); } catch (e) { res = { ok: false, message: "the answer could not be sent" }; }
+      if (res && res.ok) { bandDraft = ""; box.value = ""; return; }   // the board re-reads and redraws the band
+      for (const c of controls) c.disabled = false;
+      if (res && res.error === "stale_band") {
+        // another view of the band was shown since this one: nothing was recorded; the list is read again and drawn fresh
+        bandDraft = box.value;
+        bandFill(slot, "the band changed since it was shown to you, so nothing was recorded. It is redrawn below: check the numbers and send again.", true);
+        return;
+      }
+      msg.textContent = (res && (res.detail || res.message || res.error)) || "failed";
+    };
+    box.addEventListener("input", () => { bandDraft = box.value; });
+    box.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); send(box.value); } });
+    go.addEventListener("click", () => send(box.value));
+    controls.push(box, go);
+    for (const it of items) {
+      if (!it || typeof it !== "object") continue;
+      const authority = it.kind === "authority";
+      const row = el("div", "row consent-row band-row" + (authority ? "" : " ext-accent"));
+      row.setAttribute("data-band-row", String(it.n));
+      const head = el("div", "consent-head");
+      head.appendChild(el("b", "band-num band-num-lead", String(it.n)));
+      head.appendChild(el("span", "consent-agent", typeof it.tag === "string" ? it.tag : ""));
+      if (authority) head.appendChild(el("span", "ext-meta", "needs your signature"));
+      row.appendChild(head);
+      row.appendChild(el("div", "band-what", typeof it.what === "string" ? it.what : ""));
+      const blocks = Array.isArray(it.blocks) ? it.blocks.join(", ") : (typeof it.blocks === "string" ? it.blocks : "");
+      if (blocks) row.appendChild(el("div", "ext-meta", "blocks: " + blocks));
+      const opts = el("div", "band-options");
+      for (const o of Array.isArray(it.options) ? it.options : []) {
+        const label = String(o && o.letter) + " · " + (o && typeof o.label === "string" ? o.label : "") + (o && o.letter === it.rec ? " (recommended)" : "");
+        if (authority) { opts.appendChild(el("div", "ext-meta", label)); continue; }
+        const btn = el("button", "undo-btn question-option band-option" + (o && o.letter === it.rec ? " question-rec" : ""), label);
+        btn.type = "button";
+        btn.title = "answer " + it.n + String(o && o.letter);
+        btn.addEventListener("click", () => send(String(it.n) + String(o && o.letter)));
+        controls.push(btn);
+        opts.appendChild(btn);
+      }
+      row.appendChild(opts);
+      kids.push(row);
+    }
+    if (b.note) kids.push(el("div", "ext-meta band-note", String(b.note)));
+    const bar = el("div", "band-bar");
+    bar.append(box, go, msg);
+    kids.push(bar);
+    slot.replaceChildren(...kids);
+    applyBandNumbers();
+  }
   function questionRow(o) {
     const q = o.question;
     const open = q.state === "open";
     const row = el("div", "row consent-row question-row" + (open ? " ext-accent" : " ext-dim"));
     row.setAttribute("data-question-row", "");
+    row.dataset.questionN = String(q.n);
     if (q.id) row.dataset.card = String(q.id);
     const head = el("div", "consent-head");
+    const bn = bandNumOf.get(Number(q.n));
+    const bandTag = el("b", "band-num", bn === undefined ? "" : String(bn));    // the band number leads; `#n` below is the source tag
+    bandTag.hidden = bn === undefined;
+    head.appendChild(bandTag);
     head.appendChild(el("span", "consent-agent", q.agent || "agent"));
     head.appendChild(el("b", "consent-tool", "question #" + q.n));
     head.appendChild(el("span", "ext-meta", q.options + " options"));

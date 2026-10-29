@@ -1,0 +1,261 @@
+"""Q17-ALL S5b: the NEEDS YOU band on the two human pages, in headless Chrome (its own profile, tests/_page_drive.mjs
+through ``_drive``) over the real servers: the cockpit's Decisions panel and the phone's Needs-you list.
+
+Q1 RULED (a): "Information answers stay unsigned and are accepted only from human channels; agent-typed or relayed
+answers are refused and the item stays open." The pages are the human channels; these tests drive the real shorthand
+box and the real tap, and read the stores. Screenshots go to ``LEVAIN_SHOT_DIR`` when it is set, else the tmp dir."""
+from __future__ import annotations
+
+import os
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from levain import band_view
+from levain.consent import band
+from levain.consent.questions import QuestionStore
+from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_k2a import TOKEN, _install, _serve
+
+OPTS = [("fix", "fixed 30 s"), ("exp", "exponential"), ("none", "fail loud")]
+DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
+PHONE = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
+# the Needs-you item's focus view is a modal that holds the page while it is open: it is closed first, then "all decisions"
+# opens the Decisions panel
+HISTORY = ("(document.querySelector('#levain-modal .modal-close') && document.querySelector('#levain-modal .modal-close').click(), "
+           "document.querySelector('#ck-needs .needs-history').click(), 1)")
+BAND_ROWS = "document.querySelectorAll('[data-band-row]').length"
+
+
+def _shot_dir(tmp_path: Path) -> Path:
+    d = Path(os.environ.get("LEVAIN_SHOT_DIR") or tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+@pytest.fixture
+def lh(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    (tmp_path / "lh" / "consent").mkdir(parents=True, mode=0o700)
+    return tmp_path / "lh" / "consent"
+
+
+@pytest.fixture(autouse=True)
+def _no_delivery(monkeypatch) -> list:
+    calls: list = []
+    monkeypatch.setattr(band, "deliver_answer", lambda store, ref, **kw: (
+        calls.append(ref), type("D", (), {"route": "hook", "reason": "next hook delivers it"})())[1])
+    return calls
+
+
+def _file(store: QuestionStore, what: str, **over):
+    kw = dict(agent="claude_code", agent_session_id="s1", what=what, options=OPTS, rec="exp", blocks="the feed PR", cwd="/w")
+    kw.update(over)
+    return store.file(**kw)
+
+
+def _answer(store: QuestionStore, n: int):
+    return store.get(n).answer
+
+
+def _views(store: QuestionStore, viewer: str) -> list:
+    try:
+        with sqlite3.connect(store.path) as c:
+            return c.execute("SELECT seq FROM band_views WHERE viewer = ?", (viewer,)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+# --- the cockpit's Decisions panel --------------------------------------------------------------------------------------
+
+@needs_browser
+def test_the_decisions_panel_shows_the_band_by_number_and_the_shorthand_box_answers_it(tmp_path: Path, lh) -> None:
+    shots = _shot_dir(tmp_path)
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q1, q2 = _file(store, "Which retry policy?"), _file(store, "Ship the sweep fix tonight?", rec="fix")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        out = _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
+            DESKTOP,
+            {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
+            {"eval": HISTORY},
+            {"until": f"{BAND_ROWS} === 2 && 1", "ms": 30000},
+            {"until": "[...document.querySelectorAll('[data-question-row] .band-num')].every(b => !b.hidden && b.textContent) && 1", "ms": 30000},
+            {"shot": str(shots / "cockpit_decisions_band.png"), "full": True},
+            {"eval": "[...document.querySelectorAll('[data-band-row]')].map(r => [r.dataset.bandRow, r.querySelector('.band-num').textContent])"},
+            {"eval": "[...document.querySelectorAll('[data-question-row]')].map(r => [r.querySelector('.band-num').textContent, r.querySelector('.consent-tool').textContent])"},
+            {"eval": "(() => { const b = document.querySelector('.band-box'); b.value = '2a'; b.dispatchEvent(new Event('input')); document.querySelector('.band-send').click(); return 1; })()"},
+            {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
+            {"eval": "document.querySelector('[data-band-row]').dataset.bandRow"},
+        ])
+    v = out["values"]
+    assert v[5] == [["1", "1"], ["2", "2"]], v
+    assert v[6] == [["1", "question #1"], ["2", "question #2"]], v     # the band number leads; #n is the source tag
+    assert v[9] == "1", v                                            # the band redrew without the closed item
+    a = _answer(store, q2.n)
+    assert (a.kind, a.value, a.channel) == ("option", "fix", "cockpit")
+    assert _answer(store, q1.n) is None
+    assert len(_views(store, "cockpit:browser")) >= 1                 # the Decisions panel being shown recorded this credential's view
+
+
+@needs_browser
+def test_a_tap_on_a_band_option_sends_the_shorthand_for_that_option(tmp_path: Path, lh) -> None:
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q1 = _file(store, "Which retry policy?")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
+            DESKTOP,
+            {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
+            {"eval": HISTORY},
+            {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
+            {"eval": "document.querySelector('[data-band-row] .band-option:nth-child(3)').click() || 1"},
+            {"until": f"{BAND_ROWS} === 0 && 1", "ms": 30000},
+        ])
+    assert _answer(store, q1.n).value == "none"
+
+
+@needs_browser
+def test_a_stale_cockpit_answer_redraws_the_band_says_why_and_records_nothing(tmp_path: Path, lh) -> None:
+    shots = _shot_dir(tmp_path)
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q1 = _file(store, "Which retry policy?")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        # the box holds "1a" and the page's own view is made stale from outside: a second look by the same credential
+        # (another tab) that sees a new item records a newer view before "send" is pressed
+        import threading
+        import time
+        fired = threading.Event()
+
+        def other_tab() -> None:
+            time.sleep(6)
+            _file(store, "A newer question arrives?")
+            band_view.band_payload(store, "cockpit:browser")
+            fired.set()
+        t = threading.Thread(target=other_tab, daemon=True)
+        t.start()
+        out = _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
+            DESKTOP,
+            {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
+            {"eval": HISTORY},
+            {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
+            {"eval": "(() => { const b = document.querySelector('.band-box'); b.value = '1a'; b.dispatchEvent(new Event('input')); return 1; })()"},
+            {"eval": "new Promise(r => setTimeout(r, 9000)).then(() => 1)"},     # the other tab's look lands in the meantime
+            {"eval": "(document.querySelector('.band-send').click(), 1)"},
+            {"until": "/changed since it was shown/.test((document.querySelector('.band-msg') || {}).textContent || '') && 1", "ms": 30000},
+            {"until": f"{BAND_ROWS} === 2 && 1", "ms": 30000},
+            {"shot": str(shots / "cockpit_decisions_band_stale.png"), "full": True},
+            {"eval": "document.querySelector('.band-box').value"},
+            {"eval": "(document.querySelector('.band-send').click(), 1)"},
+            {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
+        ])
+        t.join(timeout=5)
+    v = out["values"]
+    assert v[9] == "1a", v                                           # the words are kept across the redraw
+    assert _answer(store, q1.n).value == "fix"                        # the second send, from the fresh view
+
+
+# --- the phone's Needs-you list -----------------------------------------------------------------------------------------
+
+from contextlib import contextmanager  # noqa: E402
+import threading  # noqa: E402
+
+from levain.phone_server import make_phone_server  # noqa: E402
+from tests.test_phone_server import _TOK  # noqa: E402
+
+PHONE_READY = "document.getElementById('status').textContent !== 'reading the queue…' && 1"
+PHONE_ROWS = "document.querySelectorAll('#requests [data-band-row]').length"
+
+
+@contextmanager
+def _phone(qdir: Path):
+    httpd = make_phone_server(qdir, "localhost", port=0, token=_TOK, dispatch_dir=qdir)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://localhost:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+@needs_browser
+def test_the_phone_lists_the_band_by_number_and_the_shorthand_box_answers_it(tmp_path: Path, lh) -> None:
+    shots = _shot_dir(tmp_path)
+    store = QuestionStore(lh)
+    q1, q2 = _file(store, "Which retry policy?"), _file(store, "Ship the sweep fix tonight?", rec="fix")
+    with _phone(lh) as url:
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            PHONE,
+            {"until": PHONE_READY},
+            {"until": f"{PHONE_ROWS} === 2 && 1", "ms": 30000},
+            {"shot": str(shots / "phone_needs_band.png"), "full": True},
+            {"eval": "[...document.querySelectorAll('#requests [data-band-row]')].map(r => r.querySelector('.band-num').textContent)"},
+            {"eval": "[...document.querySelectorAll('#requests .ask .band-num')].map(b => b.textContent)"},
+            {"eval": "document.documentElement.scrollWidth <= window.innerWidth"},
+            {"eval": "(() => { const b = document.querySelector('.band-box'); b.value = '1b'; b.dispatchEvent(new Event('input')); document.querySelector('[data-band] .band-send').click(); return 1; })()"},
+            {"until": "/recorded/.test((document.querySelector('[data-band] .note') || {}).textContent || '') && 1", "ms": 30000},
+            {"until": f"{PHONE_ROWS} === 1 && 1", "ms": 30000},
+            {"shot": str(shots / "phone_needs_band_after.png"), "full": True},
+        ])
+    v = out["values"]
+    assert v[3] == ["1", "2"] and v[4] == ["1", "2"], v           # the band numbers lead, on the band and on the question cards
+    assert v[5] is True, v
+    a = _answer(store, q1.n)
+    assert (a.kind, a.value, a.channel) == ("option", "exp", "phone")
+    assert _answer(store, q2.n) is None
+    with sqlite3.connect(store.path) as c:
+        assert c.execute("SELECT via, viewer FROM answer_context WHERE question_id = ?", (q1.id,)).fetchone() == ("phone", "phone:run")
+
+
+@needs_browser
+def test_a_phone_answer_from_a_stale_view_redraws_the_list_and_says_why(tmp_path: Path, lh) -> None:
+    shots = _shot_dir(tmp_path)
+    store = QuestionStore(lh)
+    q1 = _file(store, "Which retry policy?")
+    with _phone(lh) as url:
+        def other_tab() -> None:
+            import time
+            time.sleep(7)
+            _file(store, "A newer question arrives?")
+            band_view.band_payload(store, "phone:run")
+        t = threading.Thread(target=other_tab, daemon=True)
+        t.start()
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            PHONE,
+            {"until": PHONE_READY},
+            {"until": f"{PHONE_ROWS} === 1 && 1", "ms": 30000},
+            {"eval": "(() => { const b = document.querySelector('.band-box'); b.focus(); b.value = '1a'; b.dispatchEvent(new Event('input')); return 1; })()"},   # typing holds the page's own refresh
+            {"eval": "new Promise(r => setTimeout(r, 9500)).then(() => 1)"},
+            {"eval": "(document.querySelector('[data-band] .band-send').click(), 1)"},
+            {"until": "/changed since it was shown/.test((document.querySelector('[data-band] .note') || {}).textContent || '') && 1", "ms": 30000},
+            {"until": f"{PHONE_ROWS} === 2 && 1", "ms": 30000},
+            {"shot": str(shots / "phone_needs_band_stale.png"), "full": True},
+            {"eval": "document.querySelector('.band-box').value"},
+            {"eval": "(document.querySelector('[data-band] .band-send').click(), 1)"},
+            {"until": f"{PHONE_ROWS} === 1 && 1", "ms": 30000},
+        ])
+        t.join(timeout=5)
+    assert out["values"][8] == "1a", out["values"]                  # the words are kept across the redraw
+    assert _answer(store, q1.n).value == "fix"                       # the second send, from the fresh view
+
+
+@needs_browser
+def test_the_old_question_card_still_answers_an_item_with_no_band_number(tmp_path: Path, lh) -> None:
+    """The per-question routes stay: a question the page was never shown a band number for (the band could not be
+    recorded, here a view-less listing) is still answered by its own card."""
+    store = QuestionStore(lh)
+    q1 = _file(store, "Which retry policy?")
+    with _phone(lh) as url:
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            PHONE,
+            {"until": PHONE_READY},
+            {"until": "document.querySelector('#requests .ask') && 1", "ms": 30000},
+            {"eval": "(() => { const b = [...document.querySelectorAll('#requests .ask button')].find(x => /fail loud/.test(x.textContent)); b.click(); return 1; })()"},
+            {"until": "/answered/.test((document.querySelector('#requests .ask .note') || {}).textContent || '') && 1", "ms": 30000},
+        ])
+    assert out["values"][-1] is not None
+    assert _answer(store, q1.n).value == "none"

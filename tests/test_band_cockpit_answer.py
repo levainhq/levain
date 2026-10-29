@@ -136,3 +136,47 @@ def test_the_verb_is_listed_by_the_decisions_panel_actions(tmp_path, lh):
     with _serve(src, write_token=TOKEN) as (base, _h):
         panel = _get(f"{base}/cockpit/panel/decisions.json", TOKEN)
     assert "band_answer" in [a["verb"] for a in panel.get("actions", [])]
+
+
+# --- S5b: the real cockpit read (GET /cockpit/band.json) --------------------------------------------------------------
+
+def _views(store: QuestionStore, viewer: str) -> list:
+    try:
+        with sqlite3.connect(store.path) as c:
+            return c.execute("SELECT seq FROM band_views WHERE viewer = ? ORDER BY seq", (viewer,)).fetchall()
+    except sqlite3.OperationalError:               # no band_views table yet: no view was ever recorded
+        return []
+
+
+def test_the_cockpit_band_read_numbers_records_the_credentials_view_and_hands_the_binding(tmp_path, lh):
+    """The Decisions panel's read: `cockpit:<credential name>` is the viewer `band_answer` binds to, so the read must
+    record exactly that viewer's view and expose the `{store_id, view_id}` the verb takes."""
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _file(store)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        got = _get(f"{base}/cockpit/band.json", TOKEN)
+        assert [i["n"] for i in got["items"]] == [1] and got["items"][0]["question"] == q.n
+        assert got["items"][0]["kind"] == "information" and got["items"][0]["rec"] == "b"
+        assert len(_views(store, "cockpit:browser")) == 1
+        again = _get(f"{base}/cockpit/band.json", TOKEN)                       # an unchanged look adds no row
+        assert again["view_id"] == got["view_id"] and len(_views(store, "cockpit:browser")) == 1
+        s, body = _verb(base, {"text": "1a", "store_id": got["store_id"], "view_id": got["view_id"]})
+        assert s == 200 and body["recorded"] == ["1a"], body
+    assert store.get(q.n).answer is not None
+
+
+def test_the_cockpit_band_read_needs_the_token_and_a_head_shows_nothing(tmp_path, lh):
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    _file(store)
+    import urllib.error
+    import urllib.request
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _get(f"{base}/cockpit/band.json")
+        assert e.value.code == 403
+        req = urllib.request.Request(f"{base}/cockpit/band.json", method="HEAD", headers={"X-Levain-Write-Token": TOKEN})
+        with urllib.request.urlopen(req, timeout=10) as r:    # noqa: S310 - loopback
+            assert r.status == 200
+    assert _views(store, "cockpit:browser") == []

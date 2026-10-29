@@ -137,7 +137,11 @@
     // a deep-linked sign request comes first and is scrolled to, once; one not listed is said, never silently lost
     const linked = focus ? signs.filter((r) => r.id === focus) : [];
     const rest = linked.length ? signs.filter((r) => r.id !== focus) : signs;
-    list.replaceChildren(...linked.map((r) => signCard(r, data.sign_note, true)), ...asks.map(questionCard),
+    const band = data.band && typeof data.band === "object" ? data.band : null;
+    bandNumOf.clear();
+    for (const it of (band && Array.isArray(band.items) ? band.items : [])) if (it && Number.isInteger(it.question)) bandNumOf.set(it.question, it.n);
+    list.replaceChildren(...(band && ((Array.isArray(band.items) && band.items.length) || band.note) ? [bandCard(band)] : []),
+                         ...linked.map((r) => signCard(r, data.sign_note, true)), ...asks.map(questionCard),
                          ...rest.map((r) => signCard(r, data.sign_note)), ...jobs.map(dispatchCard),
                          ...rows.map((r) => row(r, false)), ...gaps.map((r) => row(r, true)),
                          ...(memos.length ? [el("h2", "notes-head", "Notes · nothing to answer"), ...memos.map(noteCard)] : []));
@@ -376,11 +380,103 @@
     $("morning").replaceChildren(card);
   }
 
+  // The NEEDS YOU band (Q17-ALL S5b): each open item under its band number, one shorthand box ("15b", "1a 2b") and a tap on
+  // an option sending "<n><letter>". The listing's `band` carries the {store_id, view_id} this page was shown; an answer posts
+  // them to /band/answer and the server records it only while that is still this device's newest view (409 stale_band: nothing
+  // was recorded, the list is redrawn). Unsigned, a human channel (Q1 ruled (a)); an authority item is listed and opens its
+  // signing sheet, never answered here. Text only (never HTML) for everything an agent wrote.
+  const bandNumOf = new Map();      // question n -> band number: a question card leads with it (`#n` stays as the source tag)
+  let bandDraft = "";               // the shorthand typed and not sent: a redraw gives it back
+  function bandCard(band) {
+    const card = el("article", "req band");
+    card.setAttribute("data-band", "");
+    const items = Array.isArray(band.items) ? band.items : [];
+    const head = el("div", "req-head");
+    head.append(el("span", "tool", "Needs you"), el("span", "tier", "band"), el("span", "meta", items.length + " open"));
+    card.appendChild(head);
+    const note = el("div", "note");
+    const say = (text, kind) => { notes.set("band", [text, kind || ""]); note.textContent = text; note.className = "note " + (kind || ""); };
+    if (notes.has("band")) say(notes.get("band")[0], notes.get("band")[1]);
+    const box = el("input", "band-box");
+    box.type = "text"; box.maxLength = 400; box.value = bandDraft; box.autocomplete = "off"; box.autocapitalize = "off";
+    box.setAttribute("autocorrect", "off"); box.spellcheck = false;
+    box.setAttribute("aria-label", "answer by number and letter");
+    box.placeholder = "e.g. 15b";
+    const go = el("button", "allow band-send", "Send");
+    go.type = "button";
+    const buttons = [go];
+    const canAnswer = band.view_id !== null && band.view_id !== undefined && typeof band.store_id === "string";
+    const send = (text) => {
+      text = String(text || "").trim();
+      if (!text || busy) return;
+      if (!canAnswer) { say(band.note || "the band could not be recorded just now, so it cannot be answered", "bad"); return; }
+      busy++;
+      buttons.forEach((b) => { b.disabled = true; });
+      box.disabled = true;
+      say("sending the answer…");
+      call("POST", "/band/answer", { text: text, store_id: band.store_id, view_id: band.view_id }).then((a) => {
+        if (a.status === 409) {
+          // a different band was shown since this one: nothing was recorded; the list is redrawn from a fresh look
+          bandDraft = box.value;
+          box.blur();
+          say("the band changed since it was shown to you, so nothing was recorded. It is redrawn: check the numbers and send again.", "bad");
+          return;
+        }
+        buttons.forEach((b) => { b.disabled = false; });
+        box.disabled = false;
+        if (!a.ok) return say("not answered: " + why(a), "bad");
+        bandDraft = ""; box.value = "";
+        const b = a.body || {};
+        const rec = Array.isArray(b.recorded) ? b.recorded : [];
+        const refused = Array.isArray(b.refused) ? b.refused : [];
+        last = "answered the band" + (rec.length ? " (" + rec.length + ")" : "");
+        say((rec.length ? "recorded: " + rec.join(", ") : "nothing recorded")
+          + (refused.length ? " · refused: " + refused.join("; ") : ""), refused.length ? "bad" : "ok");
+      }).catch((e) => { buttons.forEach((b) => { b.disabled = false; }); box.disabled = false; say("the page failed (" + ((e && e.name) || "error") + "); answer again, and if it was already recorded the page says so", "bad"); })
+        .finally(() => { busy--; setTimeout(load, 300); });
+    };
+    for (const it of items) {
+      if (!it || typeof it !== "object") continue;
+      const authority = it.kind === "authority";
+      const row = el("div", "band-item");
+      row.setAttribute("data-band-row", String(it.n));
+      const top = el("div", "req-head");
+      top.append(el("b", "band-num", String(it.n)), el("span", "meta", typeof it.tag === "string" ? it.tag : ""));
+      if (authority) top.appendChild(el("span", "tier", "needs your signature"));
+      row.appendChild(top);
+      row.appendChild(el("div", "band-what", typeof it.what === "string" ? it.what : ""));
+      const blocks = Array.isArray(it.blocks) ? it.blocks.join(", ") : (typeof it.blocks === "string" ? it.blocks : "");
+      if (blocks) row.appendChild(el("div", "where", "blocks: " + blocks));
+      const acts = el("div", "actions");
+      for (const o of (Array.isArray(it.options) ? it.options : [])) {
+        const label = String(o && o.letter) + " · " + (o && typeof o.label === "string" ? o.label : "") + (o && o.letter === it.rec ? " (rec)" : "");
+        if (authority) { acts.appendChild(el("div", "where", label)); continue; }
+        const b = el("button", o && o.letter === it.rec ? "allow" : "quiet", label);
+        b.type = "button";
+        b.addEventListener("click", () => send(String(it.n) + String(o && o.letter)));
+        buttons.push(b);
+        acts.appendChild(b);
+      }
+      row.appendChild(acts);
+      card.appendChild(row);
+    }
+    if (typeof band.note === "string" && band.note) card.appendChild(el("div", "where", band.note));
+    box.addEventListener("input", () => { bandDraft = box.value; });
+    box.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); send(box.value); } });
+    go.addEventListener("click", () => send(box.value));
+    const bar = el("div", "band-bar");
+    bar.append(box, go);
+    card.append(bar, note);
+    return card;
+  }
+
   // a question: text only (never HTML) for everything the agent wrote. No passkey: the answer is unsigned and
   // authorises nothing; the server records it once and delivers it to the agent's session
   function questionCard(q) {
     const card = el("article", "req ask");
     const head = el("div", "req-head");
+    const bn = bandNumOf.get(Number(q.n));
+    if (bn !== undefined) head.appendChild(el("b", "band-num", String(bn)));    // the band number leads; `#n` is the source tag
     head.append(el("span", "tool", "question #" + q.n), el("span", "tier", "ask"), el("span", "meta", q.agent || ""));
     card.append(head, el("pre", "display", typeof q.what === "string" ? q.what : ""));
     card.appendChild(el("div", "where", "blocks: " + (q.blocks || "")));
@@ -1370,7 +1466,7 @@
   function held() {
     if (busy) return true;
     if (Array.from(document.querySelectorAll("textarea.words:not(:disabled)")).some((t) => t.value.trim() !== "")) return true;
-    return !!(document.activeElement && document.activeElement.matches("input.reason"));
+    return !!(document.activeElement && document.activeElement.matches("input.reason, input.band-box"));
   }
 
   function load() {

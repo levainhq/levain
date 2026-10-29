@@ -473,7 +473,8 @@
       rereadLatched();   // a re-read that never discards an open form: it defers while one is dirty, and stays owed
       return { ok: false, error: code, message: text, status: r.status };
     }
-    return { ok: false, error: code, message: text, status: r.status };
+    // `detail` is the server's own words for why (a band answer's refusal names the item it refused)
+    return { ok: false, error: code, message: text, status: r.status, detail: typeof d.message === "string" ? d.message : "" };
   }
 
   // One write per fingerprint at a time: a second identical submit while the first is still asking, firing or
@@ -654,6 +655,19 @@
     return postVerb(action, params, {});
   }
 
+  // The NEEDS YOU band as this credential is shown it (Q17-ALL S5b): reading it numbers what is shown and records the view
+  // the answer below binds to. Rejects when the cockpit has no band to show (no question store) or cannot read it.
+  function bandRead() { return authedReadJson("/cockpit/band.json"); }
+
+  // answer the band by its shorthand ("15b", "1a 2b"): the decisions panel's offered band_answer (C1, unsigned, a human
+  // channel), bound to the view the page was shown ({store_id, view_id}). A 409 means another view was shown since.
+  async function answerBand(text, storeId, viewId) {
+    if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
+    const action = panelActionFor("band_answer", null);
+    if (!action) return { ok: false, error: "not_offered", message: "the cockpit no longer offers an answer here; nothing was sent" };
+    return postVerb(action, { text: text, store_id: storeId, view_id: viewId }, {});
+  }
+
   // dismiss an agent's note: the row's own offered note_dismiss (C1, no confirm, no params). It tells the agent nothing;
   // the kernel's 409 on a row that changed is the answer when it was dismissed elsewhere
   async function dismissNote(rowId) {
@@ -780,7 +794,7 @@
         if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
         window.LevainDashboard.render(mview, mview.writable
-          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
+          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;

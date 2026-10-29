@@ -154,3 +154,12 @@ textarea.words { width: 100%; box-sizing: border-box; margin-top: var(--sp-4); f
 .req.review-item .note-what, .req.morning-card .note-what { font-weight: 600; overflow-wrap: anywhere; margin-top: var(--sp-3); }
 .req.morning-card { border-top: 1px dashed var(--hair); background: none; }
 .req.morning-card .morning-lines { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+
+/* Q17-ALL S5b: the NEEDS YOU band. The band number leads each item; `question #n` stays as the source tag. */
+.band-num { color: var(--accent); font: 700 17px/1.2 var(--mono); min-width: 1.6em; }
+.band-item { padding: var(--sp-4) 0; border-top: 1px solid var(--hair); }
+.band-item:first-of-type { border-top: 0; }
+.band-what { white-space: pre-wrap; overflow-wrap: anywhere; margin: var(--sp-3) 0; }
+.band-bar { display: flex; gap: var(--sp-4); align-items: center; margin-top: var(--sp-5); }
+.band-box { flex: 1 1 auto; min-width: 0; box-sizing: border-box; min-height: 44px; padding: 0 var(--sp-4); font: 16px/1.2 var(--mono);
+  color: inherit; background: transparent; border: 1px solid var(--hair-2); border-radius: 10px; }

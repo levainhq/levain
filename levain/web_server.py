@@ -151,6 +151,11 @@ _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
 # none of them and this route serves them behind EXACTLY the consent body's gate (a surface token on every bind).
 _QUESTION_BODY_PREFIX = "/cockpit/question/"
 _QUESTION_ID = re.compile(r"[1-9][0-9]{0,11}")
+# The NEEDS YOU band as THIS cockpit credential is shown it (Q17-ALL S5b): GET /cockpit/band.json. The Decisions panel
+# reads it when it is shown; it numbers what is shown and records the view (``band_view.band_payload`` for
+# ``cockpit:<credential name>``, the viewer ``band_answer`` binds to). Its words are the agents', so it rides the
+# question body's gate exactly (a surface token on every bind).
+_BAND_PATH = "/cockpit/band.json"
 # One agent note's body: GET /cockpit/note/<n>.json. Its words are the agent's, so the row carries none of them and this
 # route serves them behind the question body's gate exactly (a surface token on every bind).
 _NOTE_BODY_PREFIX = "/cockpit/note/"
@@ -1184,7 +1189,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/edit",
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
-    _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, _COORD_LIST, _COORD_SHEET,
+    _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, _COORD_LIST, _COORD_SHEET,
     cockpit_board.BOARD_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
@@ -2000,6 +2005,44 @@ class _Handler(GuardedHandler):
                 self.server.request_gate.release()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
+    def _serve_band(self, *, head: bool) -> None:
+        """``GET /cockpit/band.json``: the band as this credential is shown it (:func:`levain.band_view.band_payload`
+        for ``cockpit:<credential name>``, the exact viewer ``band_answer`` binds to): ``{seen_through, store_id,
+        view_id, items, note}``. A HEAD shows nothing (no number, no view). Behind the question body's gate: a
+        surface token on every bind. Without a question store, 404."""
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if not self._off_box_token_valid():
+            self._send(json.dumps({"error": "forbidden", "message": (
+                f"the band needs this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
+            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
+                cache_control="private, no-store")
+            return
+        store = getattr(self.server, "question_store", None)
+        if store is None:
+            self._send(json.dumps({"error": "not_found", "message": "no question store"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=404, head=head, headers=hdrs,
+                       cache_control="private, no-store")
+            return
+        if head:
+            self._send(b"", "application/json; charset=utf-8", status=200, head=True, headers=hdrs,
+                       cache_control="private, no-store")
+            return
+        if not self.server.request_gate.acquire(blocking=False):
+            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            return
+        try:
+            from levain import band_view
+            viewer = f"cockpit:{self._credential(required=True).get('name') or 'web'}"
+            status, payload = 200, band_view.band_payload(store, viewer)
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
+            status, payload = 500, _store_fault("band", exc)
+        finally:
+            self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=hdrs, cache_control="private, no-store")
 
     def _serve_sign_list(self, *, head: bool, one: "str | None" = None) -> None:
         """``GET /cockpit/sign.json``: ``{requests, signers, credentials, origin}``, the Signer's own listing rows
@@ -2950,6 +2993,9 @@ class _Handler(GuardedHandler):
             return
         if path.startswith(_QUESTION_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
             self._serve_question_body(path, head=head)
+            return
+        if path == _BAND_PATH:
+            self._serve_band(head=head)
             return
         if path.startswith(_NOTE_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
             self._serve_note_body(path, head=head)

@@ -2724,3 +2724,18 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
   .bd-cols { grid-template-columns: minmax(0, 1fr); }
   .bd-tell .dev-btn { min-height: var(--hit-min, 44px); }
 }
+
+/* Q17-ALL S5b: the NEEDS YOU band at the head of the Decisions panel. The band number leads every item (and the question row it
+   came from); `question #n` stays beside it as the source tag. One shorthand box under the list. */
+.band-slot > .ext-grouphead:first-child { margin-top: 0; }
+.band-num { color: var(--operate); font: var(--fw-bold) var(--fs-meta)/var(--lh-list) var(--mono); min-width: 1.6em; }
+.band-num[hidden] { display: none; }
+.band-num-lead { font-size: 1.15em; }
+.band-what { margin: var(--sp-2) 0 0; overflow-wrap: anywhere; white-space: pre-wrap; color: var(--text); font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--round); }
+
+.band-bar { display: flex; flex-wrap: wrap; gap: var(--sp-3); align-items: center; margin: var(--sp-3) 0 var(--sp-5); }
+.band-box { flex: 1 1 14em; min-width: 0; max-width: 24rem; box-sizing: border-box; padding: var(--sp-2) var(--sp-3); background: var(--base); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--r-sm); font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--mono); min-height: 38px; }
+.band-msg { flex: 1 1 100%; overflow-wrap: anywhere; }
+/* the band's options are always drawn (the row-verb rule that shows a row's verbs on hover is not theirs) */
+.band-options { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-2); }

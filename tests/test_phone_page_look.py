@@ -66,7 +66,7 @@ def test_request_text_is_whole_and_unclipped_at_390(world, tmp_path: Path) -> No
 # request data: what is filed must be what is drawn, byte for byte (innerText applies text-transform, so it catches a
 # CSS uppercase that textContent would not)
 DATA_PROBE = """(() => {
-  const card = document.querySelector('article.req'); const wheres = [...card.querySelectorAll('.where')];
+  const card = document.querySelector('article.req:not(.band)'); const wheres = [...card.querySelectorAll('.where')];
   const pick = (n) => { const cs = getComputedStyle(n);
     return { text: n.innerText, transform: cs.textTransform, textOverflow: cs.textOverflow, clamp: cs.webkitLineClamp,
              clipped: n.scrollWidth > n.clientWidth + 1 || n.scrollHeight > n.clientHeight + 1,
