@@ -1265,6 +1265,15 @@ def _apply_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -
     # lock, so the order can't deadlock. require=True (via _governed_continuity_lock)
     # → fail CLOSED (503) on a lock-less FS rather than edit cognition unserialized
     # [spore-091 #2].
+    # A store whose anneal has ``Store.replace_section`` owns the continuity file (on a gen-3 store the
+    # file is a projection and a hand edit is overwritten), so the edit goes through it; that call takes
+    # the continuity lock itself, so it must NOT sit inside `_governed_continuity_lock` (a second flock
+    # on another fd would deadlock). No store / no replace_section -> the file edit below, as before.
+    if _store_for_sections(scope) is not None:
+        return _apply_state_edit_via_store(
+            scope, source=source, heading=heading, path=path,
+            expected_lf=_to_lf(expected), new_lf=_to_lf(new_body), now=now,
+        )
     with _governed_continuity_lock(path):
         try:
             raw = path.read_text(encoding="utf-8")
@@ -1276,6 +1285,131 @@ def _apply_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -
             scope, source=source, heading=heading, path=path,
             prior_text=raw, new_text=new_text, action="edit", kind="state", now=now,
         )
+
+
+def _store_for_sections(scope: WriteScope) -> Path | None:
+    """The anneal store db whose ``Store.replace_section`` should carry a State write, else ``None``
+    (-> the file edit). Requires the db to exist, to own exactly ``scope.anneal.continuity_md`` (Store
+    opens ``<stem>.continuity.md`` beside the db, compared as written, as the cockpit's
+    ``section_paths_agree`` does), and this anneal's ``Store`` to have ``replace_section`` (0.9.43+)."""
+    try:
+        from anneal_memory import Store
+    except ImportError:  # pragma: no cover - anneal is a hard dependency
+        return None
+    if not hasattr(Store, "replace_section"):
+        return None
+    db = Path(scope.anneal.episodic_db)
+    if not db.is_file() or Path(scope.anneal.continuity_md) != db.with_name(f"{db.stem}.continuity.md"):
+        return None
+    return db
+
+
+_SECTION_REFUSAL_SHAPES = {  # SectionWriteResult.reason -> (code, status)
+    "wrap_in_progress": ("wrap_in_progress", 409),
+    "pipeline_tmp_present": ("wrap_in_progress", 409),
+    "store_busy": ("store_busy", 503),
+}
+
+
+def _section_refusal(res: Any) -> EditError:
+    code, status = _SECTION_REFUSAL_SHAPES.get(getattr(res, "reason", None), ("section_refused", 422))
+    return EditError(code, status, f"anneal refused the section edit: {res.reason}: {res.message}")
+
+
+def _read_live(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8") if path.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _store_section_write(
+    db: Path, heading: str, body: str, *, expected_lf: str | None, expected_hash: str | None = None,
+    before_write: Callable[[], None] | None = None,
+) -> None:
+    """One ``Store.replace_section`` bound to the version read in the SAME open. ``expected_lf`` is the
+    body the operator saw (stale -> 409, as the file path); ``before_write`` runs after the checks and
+    just before the write (backup). Raises ``EditError`` in the shapes the file path raises."""
+    from anneal_memory import AnnealMemoryError, ContinuityLockUnavailable, SectionError, Store
+
+    try:
+        with Store(str(db), read_only=False) as store:
+            try:
+                got = store.read_section(heading)
+            except SectionError as exc:
+                raise EditError("unreadable", 422, f"cannot read the {heading!r} section: {exc}") from exc
+            if got is None:
+                raise EditError("not_found", 404, f"no '## {heading}' section to edit")
+            text, version = got
+            if expected_lf is not None and _to_lf(text).strip() != expected_lf:
+                raise EditError("stale", 409,
+                                f"'## {heading}' changed since you loaded it — reload and re-edit")
+            if before_write is not None:
+                before_write()
+            res = store.replace_section(heading, body, expected_version=version)
+    except ContinuityLockUnavailable as exc:
+        raise EditError(
+            "lock_unavailable", 503,
+            "the continuity file's cross-process lock is unavailable (a lock-less "
+            "filesystem / non-POSIX volume) — refusing to edit consolidated-cognition "
+            "State unserialized; edit by hand or retry on a POSIX-locking volume",
+        ) from exc
+    except AnnealMemoryError as exc:
+        raise EditError("verb_failed", 422, f"section edit failed: {exc}") from exc
+    except OSError as exc:
+        raise EditError("store_unavailable", 503, f"anneal store unavailable: {exc}") from exc
+    if res.outcome == "written":
+        return
+    if res.outcome == "version_mismatch":
+        raise EditError("stale", 409, f"'## {heading}' changed since you loaded it — reload and re-edit")
+    raise _section_refusal(res)
+
+
+def _apply_state_edit_via_store(
+    scope: WriteScope, *, source: str, heading: str, path: Path, expected_lf: str, new_lf: str,
+    now: str | None,
+) -> dict[str, Any]:
+    """The State edit through anneal's ``Store.replace_section``. Same guards, backup and audit as
+    ``_commit`` (the backup lands before the write and is removed again if anneal refuses, so a refusal
+    leaves no trace); the audit record is appended AFTER the write because ``new_sha256`` is the hash of
+    the file anneal produced (canonicalised body), which cannot be known earlier. It is marked
+    ``via: "store"`` so undo restores the section through the store too."""
+    import shutil
+
+    if any(ln.startswith("## ") for ln in new_lf.splitlines()):
+        raise EditError(
+            "section_break", 422,
+            "a section body can't contain a '## ' heading line — it would split "
+            "the section into two",
+        )
+    db = _store_for_sections(scope)
+    assert db is not None
+    edit_id = uuid.uuid4().hex[:12]
+    prior: list[str | None] = []
+
+    def _backup_prior() -> None:
+        prior.append(_read_live(path))
+        if prior[0] is None:
+            raise EditError("unreadable", 422, "cannot read the continuity file")
+        _backup(scope.ledger_root, source, prior[0], edit_id)
+
+    try:
+        _store_section_write(db, heading, new_lf, expected_lf=expected_lf, before_write=_backup_prior)
+    except BaseException:
+        if prior:  # refused after the backup: leave no trace
+            shutil.rmtree(scope.ledger_root / _BACKUPS_NAME / edit_id, ignore_errors=True)
+        raise
+    prior_text = prior[0]
+    assert prior_text is not None
+    new_text = _read_live(path) or ""
+    _append_audit(scope.ledger_root, {
+        "id": edit_id, "ts": _now_iso(now), "kind": "state", "action": "edit", "source": source,
+        "heading": heading, "via": "store",
+        "backup": str(Path(_BACKUPS_NAME) / edit_id / source),
+        "prev_sha256": _sha256(prior_text), "new_sha256": _sha256(new_text),
+        "prev_len": len(prior_text), "new_len": len(new_text),
+    })
+    return {"ok": True, "id": edit_id, "source": source, "heading": heading}
 
 
 def _apply_entity_name(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
@@ -2162,6 +2296,15 @@ def _apply_undo(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict
     # be the least airtight path of all; refusing is correct. Other Class-A targets
     # (world.md / posture / config.json) are Levain-only — `_WRITE_LOCK` already
     # serializes them — so they take a nullcontext (no needless cross-process lock).
+    if is_continuity and record.get("via") == "store":
+        db = _store_for_sections(scope)
+        if db is None:
+            raise EditError(
+                "not_undoable", 409,
+                "this State edit went through the anneal store, which is not available here "
+                "(no store / no Store.replace_section) — it cannot be undone by a file restore",
+            )
+        return _undo_state_via_store(scope, record, edit_id, source, db, path, now)
     undo_lock = _governed_continuity_lock(path) if is_continuity else nullcontext()
 
     with undo_lock:
@@ -2246,6 +2389,61 @@ def _apply_undo(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict
         else:
             _atomic_write(path, restored)
         return {"ok": True, "id": edit_id_new, "undid": edit_id, "source": source}
+
+
+def _undo_state_via_store(
+    scope: WriteScope, record: dict[str, Any], edit_id: str, source: str, db: Path, path: Path,
+    now: str | None,
+) -> dict[str, Any]:
+    """Undo of a store-routed State edit: restore the heading's PRIOR BODY (from the edit's backup)
+    through ``Store.replace_section``, never by rewriting the file. Same most-recent-edit guard as the
+    file undo (the live file must still hash to the edit's ``new_sha256``). The section version is
+    read first and the file hash second, so a writer landing in between changes the version and anneal
+    refuses; only the section is restored, other sections are untouched."""
+    heading = record.get("heading")
+    backup_rel = record.get("backup")
+    if not isinstance(heading, str) or not isinstance(backup_rel, str):
+        raise EditError("corrupt_record", 422, "audit record has no heading/backup")
+    norm = backup_rel.replace("\\", "/")
+    if not norm.startswith("backups/"):
+        raise EditError("corrupt_record", 422, f"backup {backup_rel!r} is not a backups-tree path")
+    backup_path = _resolve_inside(scope.ledger_root, backup_rel)
+    backups_root = (scope.ledger_root / _BACKUPS_NAME).resolve()
+    if backup_path == backups_root or backups_root not in backup_path.parents:
+        raise EditError("corrupt_record", 422, f"backup {backup_rel!r} escapes the backups tree")
+    if not backup_path.is_file():
+        raise EditError("backup_missing", 422, f"backup {backup_rel!r} is gone")
+    restored_body = _current_section_body(backup_path.read_bytes().decode("utf-8"), heading)
+
+    new_id = uuid.uuid4().hex[:12]
+    prior: list[str] = []
+
+    def _guard_and_backup() -> None:
+        live = _read_live(path)
+        if live is None or _sha256(live) != record.get("new_sha256"):
+            raise EditError(
+                "stale", 409,
+                "only the most-recent edit to a file can be undone — it has changed since "
+                "(a newer edit or a consolidation/wrap landed, or it was already undone)",
+            )
+        prior.append(live)
+        _backup(scope.ledger_root, source, live, new_id)
+
+    import shutil
+
+    try:
+        _store_section_write(db, heading, restored_body, expected_lf=None, before_write=_guard_and_backup)
+    except BaseException:
+        if prior:
+            shutil.rmtree(scope.ledger_root / _BACKUPS_NAME / new_id, ignore_errors=True)
+        raise
+    _append_audit(scope.ledger_root, {
+        "id": new_id, "ts": _now_iso(now), "kind": "undo", "action": "undo", "source": source,
+        "heading": heading, "undid": edit_id, "via": "store",
+        "backup": str(Path(_BACKUPS_NAME) / new_id / source), "restored_to": backup_rel,
+        "new_sha256": _sha256(_read_live(path) or ""),
+    })
+    return {"ok": True, "id": new_id, "undid": edit_id, "source": source}
 
 
 def _commit(
