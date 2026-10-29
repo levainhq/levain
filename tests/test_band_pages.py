@@ -144,7 +144,7 @@ def test_a_stale_cockpit_answer_redraws_the_band_says_why_and_records_nothing(tm
             {"eval": "(() => { const b = document.querySelector('.band-box'); b.value = '1a'; b.dispatchEvent(new Event('input')); return 1; })()"},
             # an open state editor is unsaved work: the page defers its own passive re-reads while it is open, so the page's
             # picture of the band cannot refresh itself before the send (a self-refresh would make the view current again)
-            {"eval": "(document.querySelector('.state-edit').click(), document.querySelector('.state-editor') ? 1 : 0)"},
+            {"eval": "(document.querySelector('.state-edit').click(), document.querySelector('.state-editor').nodeType)"},   # throws if the editor did not open
             {"eval": "new Promise(r => setTimeout(r, 9000)).then(() => 1)"},     # the other tab's look lands in the meantime
             {"eval": "(document.querySelector('.band-send').click(), 1)"},
             {"until": "/changed since it was shown/.test((document.querySelector('.band-msg') || {}).textContent || '') && 1", "ms": 30000},
