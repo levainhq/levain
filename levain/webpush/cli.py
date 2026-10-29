@@ -52,6 +52,10 @@ def register(subparsers) -> None:
         if word in presence.TIMED:
             w.add_argument("duration", nargs="?", default=None,
                            help="30, 30m or 2h" + (", or `off`" if word == "loud" else "") + " (default 60 min, most 24 h).")
+        w.add_argument("--said", default=None, metavar="WORDS",
+                       help="Run inside an agent session: the words the operator told you, quoted (required there, "
+                            "recorded beside the word). Which words an agent may set: presence.SEAT_WORDS and "
+                            "COORDINATOR_WORDS.")
         w.set_defaults(func=_word, word=word)
     common(sub.add_parser("status", help="Whether a ping is pushed now, and why.")).set_defaults(func=_status)
 
@@ -62,12 +66,29 @@ def _qdir(args: argparse.Namespace) -> Path:
     return args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
 
 
+def _setter(qdir: Path) -> dict | None:
+    """Who is setting the word when an agent session is: ``{"agent", "session", "role"}`` (agent and session as
+    :func:`band._agent_and_session` names them, role ``coordinator`` for a session Levain started as one, else ``seat``), or ``None``
+    for the operator's own shell. The role is a channel label under one uid, not a boundary: it records intent."""
+    from levain.consent import band
+
+    if band.agent_process() is None:
+        return None
+    try:
+        agent, session = band._agent_and_session(None, None)
+    except ValueError:
+        return None
+    return {"agent": agent, "session": "" if session == band.NO_SESSION else session,
+            "role": "coordinator" if band._coordinator_caller(qdir) else "seat"}
+
+
 def _word(args: argparse.Namespace) -> int:
     from levain.webpush import presence
 
     qdir = _qdir(args)
     try:
-        presence.set_word(qdir, args.word, duration=getattr(args, "duration", None))
+        presence.set_word(qdir, args.word, duration=getattr(args, "duration", None), by=_setter(qdir),
+                          said=getattr(args, "said", None))
     except presence.PresenceError as e:
         print(f"levain ping {args.word}: {e}")
         return 2

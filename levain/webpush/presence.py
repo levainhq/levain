@@ -25,6 +25,13 @@ predicted. With no such source, or no readable word, nothing is muted and the de
 need costs one notification, a ping he needed and never got costs the day. This host has no location signal, so
 ``not_home`` is the ``away`` word alone.
 
+A word may carry who set it. A seat the operator told ("heading out") may set only :data:`SEAT_WORDS` (``away`` and
+``remote``, the words that raise pushes), and the coordinator also :data:`COORDINATOR_WORDS`' ``quiet`` and ``sleep``;
+``back`` and ``loud`` stay his. A setter's write is refused unless it quotes his words,
+and the record keeps the setter and the quote beside the word. The setter's role comes from the caller's session
+identity, which is a label under one uid and not a boundary: it records intent, it does not stop a process that hides
+its environment.
+
 The consent hook's own away mode (:mod:`levain.consent.away`) is a different setting (whether the hook holds a request
 for a signed answer) and is not read or changed here.
 
@@ -43,7 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 __all__ = ["ACTIVE_WINDOW_SECS", "AWAY_GRACE_SECS", "DEFAULT_SECS", "MAX_SECS", "SLEEP_BLIND_SECS", "URGENT_KINDS", "WORDS", "Decision",
-           "PresenceError", "decide", "describe", "parse_duration", "read_word", "set_word", "should_push"]
+           "PresenceError", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "read_word", "set_word", "should_push"]
 
 ACTIVE_WINDOW_SECS = 5 * 60
 AWAY_GRACE_SECS = 3 * 60
@@ -53,6 +60,11 @@ MIN_SECS = 60
 SLEEP_BLIND_SECS = DEFAULT_SECS   # with no idle reading, `sleep` cannot see his next input: it ends this long after the word
 WORDS = ("away", "back", "sleep", "quiet", "loud", "remote")
 TIMED = ("quiet", "loud", "remote")
+SEAT_WORDS = ("away", "remote")
+COORDINATOR_WORDS = SEAT_WORDS + ("quiet", "sleep")
+ROLES = ("seat", "coordinator")
+_SAID_MAX = 300
+_FIELD_MAX = 200
 # urgent = a ping about a request that holds an agent until the operator answers: the hook's wait (``consent``, the
 # default kind: the permission hook, the publish gate, the limits), the push gate's wait (``push``) and the asking-again
 # of a request still pending (``reping``). Every other kind (``question``, ``ruling``, ``summary``) waits for the rule.
@@ -91,6 +103,23 @@ def _path(queue_dir: Path | str) -> Path:
     return Path(queue_dir) / "webpush" / FILE_NAME
 
 
+def _clean(text: object, limit: int) -> str:
+    """``text`` as one printable line of at most ``limit`` characters; ``""`` for anything that is not text."""
+    if not isinstance(text, str):
+        return ""
+    return " ".join("".join(c if c.isprintable() else " " for c in text).split())[:limit]
+
+
+def _provenance(got: dict) -> dict:
+    """The ``by`` and ``said`` a record carries, cleaned, or nothing when either is missing or malformed: a record is
+    shown as set by a seat only when it names the seat and quotes his words."""
+    by, said = got.get("by"), _clean(got.get("said"), _SAID_MAX)
+    if not isinstance(by, dict) or not said or by.get("role") not in ROLES:
+        return {}
+    agent, session = _clean(by.get("agent"), _FIELD_MAX), _clean(by.get("session"), _FIELD_MAX)
+    return {"by": {"agent": agent, "session": session, "role": by["role"]}, "said": said} if agent else {}
+
+
 def _valid(got: object) -> dict | None:
     if not isinstance(got, dict) or got.get("word") not in WORDS:
         return None
@@ -101,8 +130,8 @@ def _valid(got: object) -> dict | None:
         until = got.get("until")
         if isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until):
             until = ts + DEFAULT_SECS
-        return {"word": got["word"], "ts": float(ts), "until": float(min(until, ts + MAX_SECS))}
-    return {"word": got["word"], "ts": float(ts)}
+        return {"word": got["word"], "ts": float(ts), "until": float(min(until, ts + MAX_SECS)), **_provenance(got)}
+    return {"word": got["word"], "ts": float(ts), **_provenance(got)}
 
 
 def read_word(queue_dir: Path | str | None) -> dict | None:
@@ -168,12 +197,38 @@ def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = 
         return Decision(True, "pushing", "the presence rule could not be read: pushing")
 
 
-def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, now: float | None = None) -> dict | None:
+def check_setter(word: str, by: dict | None, said: str | None) -> str:
+    """The quote to record for a setter's write, or a raised :class:`PresenceError` saying why it is refused. ``by``
+    is ``{"agent", "session", "role"}`` with role ``seat`` or ``coordinator``. Pure: a refusal writes nothing."""
+    role = (by or {}).get("role")
+    if role not in ROLES:
+        raise PresenceError("the setter's role is neither seat nor coordinator")
+    allowed = COORDINATOR_WORDS if role == "coordinator" else SEAT_WORDS
+    if word not in allowed:
+        who = "the coordinator" if role == "coordinator" else "a seat"
+        raise PresenceError(f"`{word}` is the operator's own word: {who} may set only {', '.join(f'`{w}`' for w in allowed)}"
+                            " (the operator says it himself; from a terminal outside any agent session the operator sets any word)")
+    raw = said or ""
+    if len(raw) > _SAID_MAX:
+        raise PresenceError(f"--said is too long: quote the sentence he said, at most {_SAID_MAX} characters")
+    quote = _clean(raw, _SAID_MAX)
+    if not quote:
+        raise PresenceError(f"a {role} sets `{word}` only on his words: pass --said \"<what he told you>\" "
+                            "(no words, no change)")
+    return quote
+
+
+def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, now: float | None = None,
+             by: dict | None = None, said: str | None = None) -> dict | None:
     """Write ``word`` (``duration`` for quiet, loud and remote; ``loud off`` clears a loud). Returns what is on file
     after, ``None`` when no word stands. ``back`` leaves a standing ``loud`` alone and returns it. Raises
-    :class:`PresenceError` for an unknown word, a bad duration, or a directory or file that is not safe to write."""
+    :class:`PresenceError` for an unknown word, a bad duration, or a directory or file that is not safe to write.
+    ``by`` (a seat's or the coordinator's identity, see :func:`check_setter`) and ``said`` (his words) are for an agent
+    setting a word for him: both are checked before anything is read or written, and recorded with the word. With
+    ``by`` unset the call is the operator's own and records nothing more."""
     if word not in WORDS:
         raise PresenceError(f"{word!r} is not a presence word (one of: {', '.join(WORDS)})")
+    quote = check_setter(word, by, said) if by is not None else None
     ts = time.time() if now is None else now
     prior = read_word(queue_dir)
     if word == "loud" and (duration or "").strip().lower() == "off":
@@ -191,6 +246,10 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
     rec: dict = {"word": word, "ts": ts}
     if word in TIMED:
         rec["until"] = ts + parse_duration(duration)
+    if quote is not None:
+        rec["by"] = {"agent": _clean(by.get("agent"), _FIELD_MAX), "session": _clean(by.get("session"), _FIELD_MAX),
+                     "role": by["role"]}
+        rec["said"] = quote
     _write(queue_dir, rec)
     return rec
 
@@ -241,4 +300,9 @@ def describe(queue_dir: Path | str, *, now: float | None = None,
     from levain.webpush import held
 
     n = held.count(queue_dir)
-    return f"{d.state.upper()}: {d.why} (word: {on_file}; {n} held for the phone)"
+    line = f"{d.state.upper()}: {d.why} (word: {on_file}; {n} held for the phone)"
+    if word is not None and "by" in word:
+        by = word["by"]
+        who = f"{by['agent']} {by['session']}".strip()
+        line += f"; set by {'the coordinator ' if by['role'] == 'coordinator' else ''}{who} from your words: {word['said']}"
+    return line
