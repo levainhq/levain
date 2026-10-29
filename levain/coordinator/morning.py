@@ -108,17 +108,21 @@ def _away(qdir: Path) -> dict[str, Any]:
         conn.close()
 
 
-def _undecided(qdir: Path) -> list[dict[str, Any]]:
+def _undecided(qdir: Path, conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+    """Every UNDECIDED request with its gap, oldest first. ``conn``: a read-only ``queue.db`` connection the caller
+    holds (its snapshot and its busy wait), else one of its own."""
     path = qdir / "queue.db"
-    if not path.exists():
+    if conn is None and not path.exists():
         return []
-    conn = _ro(path)
+    own = conn is None
+    c = _ro(path) if conn is None else conn
     try:
-        rows = conn.execute("SELECT r.id, r.agent, r.agent_session_id, r.tool_name, r.display, r.cwd, r.tier, g.gap, "
+        rows = c.execute("SELECT r.id, r.agent, r.agent_session_id, r.tool_name, r.display, r.cwd, r.tier, g.gap, "
                             "g.created_at FROM gaps g JOIN requests r ON r.id = g.request_id WHERE r.state = "
                             "'undecided' ORDER BY g.created_at, g.gap").fetchall()
     finally:
-        conn.close()
+        if own:
+            c.close()
     return [{"request_id": r[0], "agent": r[1], "session": r[2], "tool": r[3], "what": str(r[4])[:_FIELD],
              "cwd": str(r[5])[:_FIELD], "tier": r[6], "gap": r[7], "undecided_at": r[8], "rule": _rule_line(r[7], r[1], r[2])}
             for r in rows]
@@ -149,14 +153,15 @@ def _thread_of(conn: sqlite3.Connection, store: CoordStore, request_id: str, ses
     return ln.threads[0] if ln is not None and ln.role == "worker" and len(ln.threads) == 1 else None
 
 
-def _band(qdir: Path) -> dict[str, Any]:
+def _band(qdir: Path, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """The NEEDS YOU band as the card carries it: ``{"text", "shown", "error"}``. Showing the band numbers its items
-    (a first show, as ``levain band`` does); a band that cannot be rendered is said, never an empty band."""
+    (a first show, as ``levain band`` does); a band that cannot be rendered is said, never an empty band. ``conn``:
+    the card's own coordinator snapshot, so the band and "waiting on you" are read from the same one."""
     from levain import band_view
     from levain.consent.questions import QuestionStore
 
     try:
-        r = band_view.render_full(QuestionStore(qdir))
+        r = band_view.render_full(QuestionStore(qdir), coord_conn=conn)
     except Exception as exc:  # noqa: BLE001 - named on the card
         return {"text": "", "shown": [], "error": f"{type(exc).__name__}: {exc}"[:_FIELD]}
     return {"text": r.text, "shown": r.shown, "error": None}
@@ -217,7 +222,7 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
     items_out = [{"item_id": i.item_id, "feed": i.feed, "thread_id": i.thread_id,
                   "authority_relevant": i.authority_relevant, "text": str(i.body.get("text", ""))[:_FIELD]}
                  for i in queue]
-    band = _band(qdir)
+    band = _band(qdir, conn)
     return {"at": now, "away": away, "band": band, "any_away": any(a.get("away") for a in away.values()),
             "undecided": undecided, "budgets": budgets, "waiting": waiting, "delivery_ran": review.last_pass(conn), "review": items_out,
             "review_total": len(items_out) if review_total is None else review_total, "errors": errors}

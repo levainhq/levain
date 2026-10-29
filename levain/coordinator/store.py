@@ -485,20 +485,23 @@ class CoordStore:
             raise JobStoreError(f"dispatch store directory {self.directory} is reachable by group or others "
                                 f"(mode {st.st_mode & 0o777:o}); it must be 0700")
 
-    def open_readonly(self) -> sqlite3.Connection:
+    def open_readonly(self, busy_s: float | None = None) -> sqlite3.Connection:
         """The ONE read-only connection to the coordinator's file, for every surface that only displays it (the review
         queue, "waiting on you", the morning card, the cockpit panels, the phone route). It runs the write path's
         directory rule (:meth:`_check_directory_readonly`) but never makes the directory, the file or a table: opened
         ``mode=ro`` through ``Path.as_uri()`` (a ``?`` or ``#`` in the path stays in the path) and ``query_only``, and it
         takes no write lock, so a reader never waits on the coordinator's writer. Raises :class:`StoreAbsent` when
-        there is nothing current to read; the caller closes the connection."""
+        there is nothing current to read; the caller closes the connection. ``busy_s`` (default
+        :data:`BUSY_WAIT_S`) is how long it waits on a lock: a caller on a deadline (the band's hook) passes what is
+        left of it, and a lock held past it raises SQLite's busy error."""
         self._check_directory_readonly()
         if not self.path.exists():
             raise StoreAbsent(f"no coordinator store at {self.path}")
-        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_WAIT_S,
+        wait = BUSY_WAIT_S if busy_s is None else max(0.0, min(float(busy_s), BUSY_WAIT_S))
+        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=wait,
                                isolation_level=None)
         try:
-            conn.execute(f"PRAGMA busy_timeout = {int(BUSY_WAIT_S * 1000)}")
+            conn.execute(f"PRAGMA busy_timeout = {int(wait * 1000)}")
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA query_only = ON")
             # a display reads only the base tables: a store a plain CoordStore made (team drafts) has no envelope tables

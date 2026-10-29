@@ -28,9 +28,11 @@ A seat with no non-empty string ``session_id`` (``levain verify-hooks``) gets no
 Also known: (1) Codex hooks are not installed by S1; Codex parity is S4's. (2) Two hooks rendering at once may both show
 the same ``closed N`` (at-least-once; no claim protocol is built). (3) A dispatch worker's first prompt can fire before
 its ``active`` launch event carries ``harness_session_id``: it is then classed non-autonomous and may be shown the band
-and a closed notice (at most a duplicate, since the notice is marked only after delivery). (4) The read snapshot waits
-up to HOOK_BUSY_MS on its own, before the write's deadline starts; a worst case is about twice the bound, and a
-store not in WAL mode is the operator's to fix (the reader then blocks on any writer). (5) An item that cannot render
+and a closed notice (at most a duplicate, since the notice is marked only after delivery). (4) S3 fix round 2: the
+hook runs on ONE deadline (start + HOOK_BUSY_MS) covering the launch-row read, every snapshot, the answers' write, a
+first-time store setup and the numbering; a store held past it is said ("! not read") or left "number pending".
+The view row and the closed mark are written after delivery (``commit``): their write tries once more past the
+deadline. A store not in WAL mode is the operator's to fix (the reader then blocks on any writer). (5) An item that cannot render
 (an unreadable row, more options than letters) is listed UNREADABLE, never dropped.
 Stdlib plus the question store.
 """
@@ -49,9 +51,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from levain.band_shorthand import ItemInfo, Parse, Refusal, View, parse
-from levain.band_sources import Extra, Extras, read_extras, sheet_text
+from levain.band_sources import Extra, Extras, NotOffered, read_extras, sheet_text
 from levain.cockpit.consent import utc_stamp
-from levain.consent.questions import HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select
+from levain.consent.questions import HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select, read_deadline
 
 __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
            "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed",
@@ -158,8 +160,8 @@ def _number(store: QuestionStore, refs: list[Any], deadline: float) -> dict[Any,
     ``deadline``. A ref is a question id, or ``(source, ref)`` for another source; the result is keyed as given. The numbers come back read under the lock, so two writers never number a ref twice. The lock still
     busy at the deadline: nothing written, nothing returned (``new (number pending)``); any other error is raised."""
     try:
-        if not store._ready:                  # no question was ever filed here: the store is set up for the first number
-            _ = store.store_id
+        # no question was ever filed here: the store is set up for the first number, inside the same deadline
+        store.ready_by(deadline)
         with store._write_by(deadline) as conn:
             for stmt in BAND_SCHEMA:
                 conn.execute(stmt)
@@ -230,7 +232,7 @@ def _extra_state(store: QuestionStore, extras: Extras) -> tuple[dict[tuple[str, 
         shown_closed = ({r[0] for r in conn.execute("SELECT n FROM band_closed_shown")}
                         if "band_closed_shown" in have else set())
     numbers = {(src, ref): n for n, src, ref in rows}
-    still = {(e.source, e.ref) for e in extras.items}
+    still = {e.band_key for e in extras.items}
     closed = [(n, ref) for n, src, ref in rows
               if src in extras.complete and (src, ref) not in still and n not in shown_closed]
     return numbers, closed
@@ -242,19 +244,31 @@ def _extra_lines(label: str, e: Extra, compact: bool) -> list[str]:
     if compact:
         return [f"{label} [{e.tag}] {_short(e.what, _COMPACT_WHAT)} · rec: {e.rec}"]
     opts = "   ".join(f"{_LETTERS[i]}) {lab}" for i, lab in enumerate(e.options[:len(_LETTERS)]))
+    if not opts:                              # nothing to pick from the band: said, so no letter is guessed at
+        opts = f"no letters: {e.data.get('no_letters') or 'settle it on its own sheet'}"
     return [f"{label} [{e.tag}] {e.what}   <- needs your signature",
             f"    {opts}",
             f"    rec: {e.rec} · blocks: {e.blocks} · {e.origin}"]
 
 
-def render_full(store: QuestionStore | None = None) -> Rendered:
-    """:func:`render_with_closed` plus what the view row needs (:class:`Rendered`)."""
+def render_full(store: QuestionStore | None = None, *, deadline: float | None = None,
+                coord_conn: sqlite3.Connection | None = None) -> Rendered:
+    """:func:`render_with_closed` plus what the view row needs (:class:`Rendered`). ``deadline``
+    (``time.monotonic()``; default now + HOOK_BUSY_MS) bounds EVERY wait of the render: the question snapshots, the
+    authority sources' stores and a first-time setup of the question store; a store held past it is said ("! not
+    read") or leaves numbers pending, never a stalled prompt. ``coord_conn``: a coordinator snapshot the caller holds
+    (the morning card's), read instead of a second one."""
     store = store if store is not None else QuestionStore()
     gen = time.time_ns()                      # before the snapshot: a later render has a greater gen
-    deadline = time.monotonic() + HOOK_BUSY_MS / 1000
+    deadline = deadline if deadline is not None else time.monotonic() + HOOK_BUSY_MS / 1000
+    with read_deadline(deadline):
+        return _render_full(store, gen, deadline, coord_conn)
+
+
+def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sqlite3.Connection | None) -> Rendered:
     items, numbers, closed = _read(store)
     try:
-        extras = read_extras(store.directory, store._clock)
+        extras = read_extras(store.directory, store._clock, deadline=deadline, coord_conn=coord_conn)
     except Exception as exc:  # noqa: BLE001 - the questions still render; the band says the sources were not read
         extras = Extras(failed=[f"authority sources: {type(exc).__name__}"])
     extra_numbers, extra_closed = _extra_state(store, extras) if extras.items or extras.complete else ({}, [])
@@ -265,8 +279,10 @@ def render_full(store: QuestionStore | None = None) -> Rendered:
         filed[("question", i)] = last
     entries: list[tuple[tuple[str, str], Question | Extra | None]] = [(("question", i), q) for i, q in items]
     for e in extras.items:
-        entries.append(((e.source, e.ref), e))
-        filed[(e.source, e.ref)] = e.filed
+        if e.band_key in filed:
+            continue                          # one item per band key: its underlying request is listed once
+        entries.append((e.band_key, e))
+        filed[e.band_key] = e.filed
     new = [k for k, _ in entries if (numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)) is None]
     new.sort(key=lambda k: filed.get(k, ""))              # each source's own filed time; a stable sort keeps ties
     if new:
@@ -412,7 +428,7 @@ def _extras_of(store: QuestionStore, view: View) -> tuple[dict[int, Extra], set[
         now = read_extras(store.directory, store._clock)
     except Exception:  # noqa: BLE001 - every authority number of the view is then unknown, never "closed"
         return {}, set(refs)
-    open_now = {(e.source, e.ref): e for e in now.items}
+    open_now = {e.band_key: e for e in now.items}
     got = {n: open_now[k] for n, k in refs.items() if k in open_now and open_now[k].unreadable is None}
     return got, {n for n, (src, _ref) in refs.items() if n not in got and src not in now.complete}
 
@@ -506,12 +522,20 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
                         now = read_extras(store.directory, store._clock)
                     except Exception:                         # noqa: BLE001 - said below, per item
                         now = Extras(failed=["authority sources"])
-                    fresh = {(x.source, x.ref): x for x in now.items if x.unreadable is None}
+                    fresh = {x.band_key: x for x in now.items if x.unreadable is None}
                     fresh_complete = now.complete
-                now_e = fresh.get((e.source, e.ref))
-                if now_e is not None:
-                    sheets.append(f"{sh.label}: {sheet_text(now_e, sh.pick, store.directory)}")
-                elif e.source in fresh_complete:
+                now_e = fresh.get(e.band_key)
+                if now_e is not None and (now_e.source, now_e.options, now_e.data.get("menu"),
+                                          now_e.data.get("version")) != (e.source, e.options, e.data.get("menu"),
+                                                                         e.data.get("version")):
+                    refused.append(f"{sh.n} changed since the band you saw (its options are not the ones you picked "
+                                   "from); nothing opened")
+                elif now_e is not None:
+                    try:
+                        sheets.append(f"{sh.label}: {sheet_text(now_e, sh.pick, store.directory)}")
+                    except NotOffered as no:
+                        refused.append(f"{sh.n}: {no.why}; nothing opened")
+                elif e.band_key[0] in fresh_complete:
                     refused.append(f"{sh.n} closed since the band you saw; nothing opened")
                 else:
                     refused.append(f"{sh.n}: its source could not be read just now to check it is still open; "
@@ -621,17 +645,18 @@ def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> st
     return "since your last message: " + " · ".join(parts)
 
 
-def is_autonomous(session_id: str, queue_dir: Path | str | None = None) -> bool:
+def is_autonomous(session_id: str, queue_dir: Path | str | None = None, busy_s: float | None = None) -> bool:
     """Whether no human turn can reach this seat (D4), as far as S1 reads it: the Levain launch row of the harness
     session, a coordinator being attended and a worker not (the only worker Levain launches today is the dispatch
     executor); no launch row, a subagent aside, is a seat the user opened: NOT autonomous (fail-safe: a band shown
-    where nobody reads it costs tokens, a band missing from a human seat drops questions)."""
+    where nobody reads it costs tokens, a band missing from a human seat drops questions). ``busy_s`` (default
+    HOOK_BUSY_MS) bounds the wait on a held coordinator store; past it there is no launch fact (not autonomous)."""
     if "#agent:" in session_id:
         return True                           # a subagent never renders: the band belongs to the session's main thread
     try:
         from levain.coordinator import lease
         from levain.coordinator.store import CoordStore
-        conn = CoordStore(queue_dir).open_readonly()
+        conn = CoordStore(queue_dir).open_readonly(busy_s=HOOK_BUSY_MS / 1000 if busy_s is None else busy_s)
         try:
             ln = lease.by_harness_session(conn, session_id)
         finally:
@@ -641,15 +666,16 @@ def is_autonomous(session_id: str, queue_dir: Path | str | None = None) -> bool:
     return ln is not None and ln.role == "worker"
 
 
-def _seat_gets_band(payload: Any, environ: Mapping[str, str]) -> bool:
+def _seat_gets_band(payload: Any, environ: Mapping[str, str], deadline: float | None = None) -> bool:
     """A seat with no non-empty string ``session_id`` (``levain verify-hooks``, a malformed payload) is nobody's: no
-    band, nothing consumed."""
+    band, nothing consumed. ``deadline``: the hook's bound, which the launch-row read waits within."""
     from levain.consent.queue import queue_dir_for
 
     session = payload.get("session_id") if isinstance(payload, dict) else None
     if not isinstance(session, str) or not session:
         return False
-    return not is_autonomous(session, queue_dir_for(environ))
+    busy = None if deadline is None else max(0.0, deadline - time.monotonic())
+    return not is_autonomous(session, queue_dir_for(environ), busy)
 
 
 def _no_commit() -> None:
@@ -664,17 +690,26 @@ def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None) -> tuple
     empty band or ANY error before anything was recorded; it never raises (``commit`` neither). A render that fails
     AFTER an answer was recorded still returns the echo: what was recorded is said."""
     t0 = time.monotonic()
+    # ONE bound for the whole hook (S3 fix round 2, codex 4/5): the launch-row read, every snapshot (questions and
+    # the authority sources), the answers' write, a first-time setup, the render's numbering, then the view row.
+    # A store held past it is said ("! not read") or left pending; the prompt is never stalled behind it.
+    deadline = t0 + HOOK_BUSY_MS / 1000
+    with read_deadline(deadline):
+        return _hook_prompt(payload, environ, deadline)
+
+
+def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: float
+                 ) -> tuple[str, Callable[[], None]]:
     try:
         from levain.consent.queue import queue_dir_for
 
         env = os.environ if environ is None else environ
-        if not _seat_gets_band(payload, env):
+        if not _seat_gets_band(payload, env, deadline):
             return "", _no_commit
         store = QuestionStore(queue_dir_for(env))
         viewer = f"claude_code:{payload['session_id']}"
     except Exception:
         return "", _no_commit
-    deadline = t0 + HOOK_BUSY_MS / 1000       # ONE bound for the hook's writes: the answers, then the view row
     echo = ""
     try:
         echo = _seat_answer(store, viewer, payload.get("prompt"), env, deadline)
@@ -682,7 +717,7 @@ def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None) -> tuple
         echo = ""
     try:
         prev = last_view(store, viewer)
-        r = render_full(store)
+        r = render_full(store, deadline=deadline)
         text = r.text
         if text:
             delta = _delta_line(store, prev, r.shown)

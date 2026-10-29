@@ -332,16 +332,25 @@ def test_the_sweep_takes_information_items_only_and_skips_authority_items(night,
     assert states(qdir)[0][1] == "undecided"
 
 
+def menu_extra(qdir, rid, ref="r-1"):
+    """The Extra read_extras builds for a coordinator SIGN on sign request ``rid`` (its own menu)."""
+    menu = band_sources.sign_request_menu(qdir, rid)
+    assert menu is not None
+    data = {"request_id": rid, "gap": None, **{k: menu[k] for k in ("menu", "version", "texts", "no_letters")}}
+    return Extra("sign", ref, "", "coordinator", "SIGN: x", menu["labels"], "a", None, "x", menu["origin"], None, data,
+                 ("consent", rid))
+
+
 def test_the_ceremony_of_a_sign_request_names_its_sheet_version_and_choice_in_words(qdir):
     rid = sign.file_levain_request(qdir, REVIEW_CLEAR_NAMESPACE, "levain review clear rv-" + "ab" * 16 + " open none",
                                    title="t", ttl_s=600)
-    e = Extra("sign", "r-1", "", "coordinator", "SIGN: x", ("sign (allow)", "deny"), "a", "a", "x", "o", None,
-              {"request_id": rid, "gap": None})
+    e = menu_extra(qdir, rid)
+    assert e.options == ("sign it", "deny it (nothing is signed)")      # a plain request: exactly its ceremony
     version = sign.read_request(qdir, rid).sha256
     text = sheet_text(e, "a", qdir)
     # no deep link: nothing a band reader can see records the cockpit's origin (S3 fix round 1, item 6)
     assert text.startswith(f"open the cockpit's sign sheet for sign request {rid} (version {version[:16]}")
-    assert "://" not in text
+    assert "sign it there" in text and "://" not in text
     assert sign_files(qdir) == [f"{rid}.json"]                 # opening the sheet signs nothing
     assert "rule request" in sheet_text(Extra(**{**e.__dict__, "data": {"request_id": "np-none", "gap": None}}),
                                         "b", qdir)
@@ -570,8 +579,8 @@ def test_a_sign_record_with_no_time_and_a_malformed_one_cost_nothing_else(night,
     review.push_sign(night.store, night.T, req.id, "land it", rec="a: green")
     real = band_sources._records
 
-    def legacy(qdir_, clock=None):
-        w, at = real(qdir_, clock)
+    def legacy(qdir_, clock=None, **kw):
+        w, at = real(qdir_, clock, **kw)
         bad = {"kind": "sign", "ref_id": "np-x", "reply_id": "rp-bad", "text": "t", "rec": None}   # no ref_store
         w = {**w, "loose": [*w["loose"], bad]}
         return w, {k: None for k in at}                       # a legacy row whose time is NULL
@@ -597,7 +606,7 @@ def test_an_undecided_request_ruled_between_plan_and_apply_opens_nothing(armed, 
     n = armed.n["consent"]
     plan, view, questions, extras = band_view.plan_for_full(qs, "cli", f"{n}a")
     assert plan.sheets and n in extras
-    monkeypatch.setattr(band_sources, "_consent", lambda _q: [])   # ruled (signed) elsewhere since the plan
+    monkeypatch.setattr(band_sources, "_consent", lambda *_a: [])  # ruled (signed) elsewhere since the plan
     done = band_view.apply_plan(qs, plan, questions, viewer="cli", via="cli", seen_through=view.seen_through,
                                 extras=extras)
     assert done.sheets == () and "levain consent rule" not in done.echo and f"{n} closed since" in done.echo
@@ -607,7 +616,7 @@ def test_an_unreadable_source_is_said_never_reported_as_closed(armed, qs, monkey
     band_view.run_band(argparse.Namespace(queue_dir=qs.directory))
     n = armed.n["consent"]
 
-    def boom(_q):
+    def boom(*_a):
         raise sqlite3.OperationalError("database is locked")
     monkeypatch.setattr(band_sources, "_consent", boom)
     plan, *_ = band_view.plan_for_full(qs, "cli", f"{n}a")
@@ -625,3 +634,269 @@ def test_a_sheet_from_the_cli_exits_zero_and_records_nothing(armed, qdir, capsys
 def test_an_extra_with_more_options_than_letters_still_renders():
     e = Extra("sign", "r", "", "t", "w", tuple(f"o{i}" for i in range(8)), NO_REC, None, "x", "o")
     assert "f) o5" in band_view._extra_lines("1.", e, compact=False)[1]
+
+
+# --- S3 fix round 2 (A): a pick on a sign request opens only the action the band showed beside its letter -----------
+def write_sign_request(qdir, rid, options=None, message="ship the release?"):
+    """A caller's sign request filed under ``rid`` (a choice request when ``options`` is given)."""
+    import json
+    from datetime import datetime, timezone
+
+    from levain.cockpit.consent import utc_stamp
+
+    body = {"format": sign.CHOICE_FORMAT if options else sign.REQUEST_FORMAT, "id": rid, "namespace": "acme.deploy",
+            "message": message, "title": "release", "requester": "tests",
+            "expires_at": utc_stamp(datetime.now(timezone.utc) + timedelta(minutes=30))}
+    if options:
+        body["options"] = [{"key": k, "text": t} for k, t in options]
+    d = sign.sign_dir(qdir)
+    d.mkdir(mode=0o700, exist_ok=True)
+    (d / f"{rid}.json").write_text(json.dumps(body) + "\n")
+
+
+@pytest.fixture
+def open_ids(monkeypatch, night, cq):
+    """Request ids the consent queue reports open. A real queue id (``pend-<stamp>-<hex>``) never fits the sign
+    request id grammar, so a SIGN naming a levain sign request is reached here by stubbing the queue's answer (on a
+    real queue.db: one pending request, which the band does not list)."""
+    file_req(cq, night, "echo the queue exists")
+    ids: set[str] = set()
+    real = review.queue_request_open
+
+    def stub(queue_dir, **kw):
+        inner = real(queue_dir, **kw)
+        return lambda rid: True if rid in ids else inner(rid)
+    monkeypatch.setattr(review, "queue_request_open", stub)
+    return ids
+
+
+def sign_on_request(night, open_ids, text, rec, tail="ab"):
+    rid = "rq-" + tail * 8
+    open_ids.add(rid)
+    review.push_sign(night.store, night.T, rid, text, rec=rec)
+    return rid
+
+
+@pytest.fixture
+def signreq(night, qdir, qs, env, open_ids):
+    """A coordinator SIGN on a request that is a levain CHOICE sign request whose SECOND option is the affirmative."""
+    rid = sign_on_request(night, open_ids, "release it", "b: green")
+    write_sign_request(qdir, rid, [("no", "hold the release"), ("yes", "ship the release now")])
+    seen = prompt(env, "hello")
+    guard = Untouched(qs, qdir, night)
+    guard.n = {"sign": number_of(seen, "release it")}
+    guard.seen, guard.rid = seen, rid
+    return guard
+
+
+def test_a_choice_sign_request_shows_its_own_options_and_deny_with_their_letters(signreq):
+    assert ("a) (no) hold the release   b) (yes) ship the release now   c) deny: none of these" in signreq.seen)
+    assert "sign (allow)" not in signreq.seen
+    assert f"cockpit sign sheet, sign request {signreq.rid}" in signreq.seen
+
+
+def test_each_letter_opens_the_option_it_was_shown_beside_by_key(signreq, env):
+    n = signreq.n["sign"]
+    a = prompt(env, f"{n}a").split("NEEDS YOU")[0]
+    assert "choose option (no) 'hold the release'" in a and "(yes)" not in a
+    b = prompt(env, f"{n}b").split("NEEDS YOU")[0]
+    assert "choose option (yes) 'ship the release now'" in b
+    c = prompt(env, f"{n}c").split("NEEDS YOU")[0]
+    assert "press Deny there" in c and "nothing is signed" in c and "choose option" not in c
+    rec = prompt(env, f"{n}: rec").split("NEEDS YOU")[0]
+    assert "choose option (yes)" in rec                        # rec "b" is the letter b the operator saw
+    assert signreq.holds()
+
+
+def test_a_letter_beyond_the_shown_options_opens_nothing_and_says_why(signreq, env):
+    n = signreq.n["sign"]
+    out = prompt(env, f"{n}d").split("NEEDS YOU")[0]
+    assert f"{n} has no option d" in out and "signature needed" not in out and "cockpit" not in out
+    assert signreq.holds()
+
+
+def test_sheet_text_refuses_a_letter_the_menu_does_not_hold(qdir):
+    rid = "rq-" + "cd" * 8
+    write_sign_request(qdir, rid, [("no", "hold"), ("yes", "ship")])
+    e = menu_extra(qdir, rid)
+    for letter in "def":
+        with pytest.raises(band_sources.NotOffered, match=f"no option {letter}"):
+            sheet_text(e, letter, qdir)
+    # a sign-request item built without its own menu never falls back to a positional allow/deny
+    bare = Extra("sign", "r-1", "", "coordinator", "SIGN: x", ("sign (allow)", "deny"), "a", "a", "x", "o", None,
+                 {"request_id": rid, "gap": 3, "agent": "claude_code", "session": "sess-1"})
+    for letter in "ab":
+        with pytest.raises(band_sources.NotOffered, match="did not show"):
+            sheet_text(bare, letter, qdir)
+
+
+def test_b_on_a_plain_sign_request_is_its_deny_never_the_signing_action(night, qdir, qs, env, open_ids):
+    rid = sign_on_request(night, open_ids, "plain one", review.NO_REC)
+    write_sign_request(qdir, rid)
+    seen = prompt(env, "hello")
+    assert "a) sign it   b) deny it (nothing is signed)" in seen
+    n = number_of(seen, "plain one")
+    guard = Untouched(qs, qdir, night)
+    a = prompt(env, f"{n}a").split("NEEDS YOU")[0]
+    b = prompt(env, f"{n}b").split("NEEDS YOU")[0]
+    assert "sign it there with your passkey" in a
+    assert "press Deny there" in b and "sign it there" not in b and "levain consent rule" not in b
+    assert a.split(f"{n}a: ")[1] != b.split(f"{n}b: ")[1]
+    assert f"{n} has no option c" in prompt(env, f"{n}c") and guard.holds()
+
+
+def test_options_swapped_after_the_band_was_read_open_nothing(signreq, qdir, qs):
+    band_view.run_band(argparse.Namespace(queue_dir=qdir))
+    n = signreq.n["sign"]
+    plan, view, questions, extras = band_view.plan_for_full(qs, "cli", f"{n}a")
+    assert plan.sheets
+    write_sign_request(qdir, signreq.rid, [("yes", "ship the release now"), ("no", "hold the release")])
+    done = band_view.apply_plan(qs, plan, questions, viewer="cli", via="cli", seen_through=view.seen_through,
+                                extras=extras)
+    assert done.sheets == () and f"{n} changed since the band you saw" in done.echo
+    # and a stale extra handed straight to sheet_text: the version no longer matches, nothing opened
+    with pytest.raises(band_sources.NotOffered, match="changed since"):
+        sheet_text(extras[n], "a", qdir)
+
+
+def test_a_sign_request_with_more_options_than_letters_shows_none_and_opens_nothing(night, qdir, qs, env, open_ids):
+    rid = sign_on_request(night, open_ids, "many options", "a")
+    write_sign_request(qdir, rid, [(f"k{i}", f"option {i}") for i in range(6)])
+    seen = prompt(env, "hello")
+    assert "no letters: its 6 options and its deny do not fit" in seen
+    n = number_of(seen, "many options")
+    guard = Untouched(qs, qdir, night)
+    out = prompt(env, f"{n}a").split("NEEDS YOU")[0]
+    assert f"{n} has no option a" in out and "cockpit" not in out and guard.holds()
+
+
+# --- S3 fix round 2 (B): one band key per request; a SIGN filed later keeps the item's number ------------------------
+def test_a_sign_filed_on_a_shown_undecided_request_keeps_its_number_and_never_reports_closed(night, cq, qdir, qs):
+    req = undecided(cq, night)
+    first = band_view.render_full(qs)
+    (n,) = first.shown
+    assert "UNDECIDED: Bash" in first.text
+    review.push_sign(night.store, night.T, req.id, "land it", rec="a: green")
+    after = band_view.render_full(qs)
+    assert after.shown == [n] and after.closed == [] and f"closed {n}" not in after.text
+    assert f"{n}. [coordinator] SIGN: land it" in after.text and "undecided" in after.text
+    assert "UNDECIDED: Bash" not in after.text and "NEEDS YOU · 1 open" in after.text
+
+
+def test_a_pending_request_shown_by_its_sign_keeps_its_number_when_it_goes_undecided(night, cq, qdir, qs):
+    req = file_req(cq, night)
+    review.push_sign(night.store, night.T, req.id, "land it", rec="a")
+    (n,) = band_view.render_full(qs).shown
+    assert cq.mark_undecided(req.id).state == "undecided"
+    after = band_view.render_full(qs)
+    assert after.shown == [n] and after.closed == []
+
+
+def test_a_number_is_never_closed_while_its_request_is_open_and_the_sign_source_is_unread(night, cq, qdir, qs,
+                                                                                        monkeypatch):
+    req = undecided(cq, night)
+    review.push_sign(night.store, night.T, req.id, "land it", rec="a")
+    (n,) = band_view.render_full(qs).shown
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(band_sources, "_records", boom)
+    r = band_view.render_full(qs)
+    assert r.shown == [n] and r.closed == [] and "UNDECIDED: Bash" in r.text
+    assert "! not read: coordinator SIGN records" in r.text
+
+
+# --- S3 fix round 2 (C): one malformed reply body is one UNREADABLE item ------------------------------------------
+def test_one_malformed_reply_body_is_one_unreadable_item_and_the_others_stay(night, cq, qdir, qs):
+    from levain.coordinator.store import next_gseq
+
+    req = file_req(cq, night)
+    review.push_sign(night.store, night.T, req.id, "land it", rec="a: green")
+    q = ask(qs)
+    review.push_answer(night.store, night.T, q.id, "asks which name", rec="a")
+    other = file_req(cq, night, "git push origin other")
+    with night.store._write("service", None) as (conn, now):
+        conn.execute("INSERT INTO replies (reply_id, thread_id, kind, ref_store, ref_id, body, at, gseq) "
+                     "VALUES (?, ?, 'sign', 'queue.db', ?, ?, ?, ?)",
+                     ("rp-broken", night.T, other.id, "{not json", now, next_gseq(conn, now)))
+    w = review.waiting_on_you(night.store, sign_open=lambda _r: True, answer_open=lambda _r: True)
+    assert [r["reply_id"] for r in w["unresolved"]] == ["rp-broken"]
+    assert len(w["threads"][night.T]) == 2
+    got = read_extras(qdir, qs._clock)
+    assert got.failed == [] and q.id in got.escalations
+    assert [e.what for e in got.items if e.unreadable is None] == ["SIGN: land it"]
+    assert [(e.ref, e.band_key) for e in got.items if e.unreadable] == [("rp-broken", ("consent", other.id))]
+    text = band_view.render(qs)
+    assert "UNREADABLE: SIGN rp-broken" in text and "SIGN: land it" in text and "escalated by the coordinator" in text
+
+
+# --- S3 fix round 2 (D): the hook's one bound covers the authority reads and a first-time setup -------------------
+def hold(path):
+    """A connection holding ``path`` exclusively (no reader gets in) until closed. The fixtures' unclosed
+    connections are collected first: an exclusive lock waits for every other connection to go."""
+    import gc
+
+    gc.collect()
+    c = sqlite3.connect(path, isolation_level=None)
+    c.execute("PRAGMA locking_mode = EXCLUSIVE")
+    c.execute("BEGIN EXCLUSIVE")
+    return c
+
+
+def test_locked_authority_stores_fail_open_inside_the_hook_bound(night, cq, qdir, qs, env):
+    import time
+
+    from levain.consent.questions import HOOK_BUSY_MS
+
+    req = undecided(cq, night)
+    review.push_sign(night.store, night.T, file_req(cq, night, "git push origin dev").id, "land dev", rec="a")
+    ask(qs, "plain one")
+    assert "NEEDS YOU · 3 open" in prompt(env, "hello")
+    held = [hold(night.store.path), hold(qdir / "queue.db")]
+    try:
+        t0 = time.monotonic()
+        out, _commit = band_view.hook_prompt({"session_id": "seat-1", "prompt": "hello"}, env)
+        took = time.monotonic() - t0
+    finally:
+        for c in held:
+            c.close()
+    assert took < HOOK_BUSY_MS / 1000 + 1.0, took
+    assert "plain one" in out and "! not read: consent requests: busy past the band's time bound" in out
+    assert "! not read: coordinator SIGN records" in out and req.id not in out.split("closed")[0]
+    assert "closed" not in out.splitlines()[0]                 # nothing unread is reported closed
+
+
+def test_a_first_time_store_setup_under_a_held_lock_returns_inside_the_hook_bound(night, cq, qdir, qs, env):
+    import time
+
+    from levain.consent.questions import HOOK_BUSY_MS
+
+    undecided(cq, night)
+    assert not qs.path.exists()
+    c = hold(qs.path)                                          # an empty questions.db nobody can set up right now
+    try:
+        t0 = time.monotonic()
+        out, _commit = band_view.hook_prompt({"session_id": "seat-1", "prompt": "hello"}, env)
+        took = time.monotonic() - t0
+    finally:
+        c.close()
+    assert took < HOOK_BUSY_MS / 1000 + 1.0, took
+    assert "new (number pending): [claude_code] UNDECIDED: Bash" in out
+
+
+# --- S3 fix round 2 (E): the morning card reads the band from its own coordinator snapshot --------------------------
+def test_the_morning_card_band_uses_the_cards_own_coordinator_snapshot(night, cq, qdir, qs, monkeypatch):
+    from levain.coordinator.store import CoordStore
+
+    req = file_req(cq, night)
+    review.push_sign(night.store, night.T, req.id, "land it", rec="a")
+    opened = []
+    real = CoordStore.open_readonly
+
+    def counting(self, *a, **k):
+        opened.append(1)
+        return real(self, *a, **k)
+    monkeypatch.setattr(CoordStore, "open_readonly", counting)
+    c = morning.card(night.store, queue_dir=qdir)
+    assert len(opened) == 1                                    # the card's snapshot, and no second one for the band
+    assert "SIGN: land it" in c["band"]["text"] and c["waiting"]["threads"][night.T][0]["ref_id"] == req.id
