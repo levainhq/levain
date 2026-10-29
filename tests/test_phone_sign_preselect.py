@@ -472,3 +472,22 @@ def test_the_app_built_link_sign_v_choice_draws_the_shortcut_and_v_alone_draws_n
     assert seen[0]["top"] == "Your pick: (b). Read the item; Sign (b) is below it." and seen[0]["miss"] is None, seen
     assert seen[1]["picked"] is None and seen[1]["top"] is None and seen[1]["miss"] is None, seen
     assert seen[1]["options"] == 2 and seen[1]["first"], seen
+
+
+@needs_browser
+def test_the_linked_sign_card_stays_first_when_the_needs_you_band_is_drawn_too(tmp_path: Path, port: _Port) -> None:
+    """A sign link he followed lands on THAT card at the top: the band card (drawn while a question is open) follows it,
+    it never displaces it."""
+    from levain.consent.questions import QuestionStore
+
+    _file(port.qdir, RID)
+    QuestionStore(port.qdir).file(agent="claude_code", agent_session_id="s1", what="Ship it?",
+                                  options=[("yes", "Ship"), ("no", "Hold")], rec="yes", blocks="the release", cwd="/w")
+    link = _legacy_link(port.url, RID, TOK) + f"&v={_v(port.qdir, RID)}"
+    order = ("(() => { const k = [...document.getElementById('requests').children]; "
+             "const b = k.findIndex((c) => c.matches('.req.band')); "
+             "return { band: b, linked: k.findIndex((c) => c.matches('.req.sign.linked')) }; })()")
+    got = _drive(tmp_path, link, [PHONE, {"until": "document.querySelector('.req.sign.linked')"},
+                                  {"until": "document.querySelector('.req.band')"}, {"eval": order}])
+    seen = next(v for v in got["values"] if isinstance(v, dict) and "band" in v)
+    assert seen == {"band": 1, "linked": 0}, seen

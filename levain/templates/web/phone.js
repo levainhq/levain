@@ -140,8 +140,10 @@
     const band = data.band && typeof data.band === "object" ? data.band : null;
     bandNumOf.clear();
     for (const it of (band && Array.isArray(band.items) ? band.items : [])) if (it && Number.isInteger(it.question)) bandNumOf.set(it.question, it.n);
-    list.replaceChildren(...(band && ((Array.isArray(band.items) && band.items.length) || band.note) ? [bandCard(band)] : []),
-                         ...linked.map((r) => signCard(r, data.sign_note, true)), ...asks.map(questionCard),
+    // the linked sign card stays first (a link he followed lands on THAT card); the band card follows it
+    list.replaceChildren(...linked.map((r) => signCard(r, data.sign_note, true)),
+                         ...(band && ((Array.isArray(band.items) && band.items.length) || band.note) ? [bandCard(band)] : []),
+                         ...asks.map(questionCard),
                          ...rest.map((r) => signCard(r, data.sign_note)), ...jobs.map(dispatchCard),
                          ...rows.map((r) => row(r, false)), ...gaps.map((r) => row(r, true)),
                          ...(memos.length ? [el("h2", "notes-head", "Notes · nothing to answer"), ...memos.map(noteCard)] : []));
