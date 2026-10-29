@@ -4680,6 +4680,7 @@
     bandNumOf.clear();
     for (const it of items) if (it && Number.isInteger(it.question)) bandNumOf.set(it.question, it.n);
     const kids = [];
+    if (b.store === "absent") { slot.replaceChildren(); applyBandNumbers(); return; }   // no store yet: nothing was ever filed, so no band and no line
     if (items.length === 0 && !say && !bandKeep && !b.note) { slot.replaceChildren(); applyBandNumbers(); return; }
     kids.push(el("div", "ext-grouphead", "needs you · the band"));
     const msg = el("span", "edit-msg band-msg", say || bandKeep);

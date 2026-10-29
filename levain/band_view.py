@@ -677,7 +677,11 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
     authority item opens its existing signing sheet). Shows the band to ``viewer`` first (:func:`show`)."""
     show(store, viewer, deadline)
     got = _newest_view(store, viewer)
-    if got is None:                               # no view could be stored (store absent, lock held): nothing to bind to
+    if got is None:                               # no view to bind to: which of two facts is it?
+        if _store_id_of(store) is None:           # no store (no file, an empty one): nothing was ever filed, so nothing
+            #                                       ever needed a view; a read-only look, the poll set nothing up
+            return {"seen_through": None, "store_id": None, "view_id": None, "items": [], "store": "absent"}
+        # a store that exists whose view could not be stored (a lock held, a write failing): said, never drawn as health
         return {"seen_through": None, "store_id": None, "view_id": None, "items": [],
                 "note": "the band could not be recorded just now"}
     view, view_id = got

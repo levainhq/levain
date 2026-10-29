@@ -417,11 +417,15 @@ def test_f7_the_cards_follow_the_live_requests_and_precede_the_resolved(tmp_path
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": f"{_CARDS}.length === 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 1200))"},          # the band read has landed by now
             {"eval": heads},
+            {"eval": "/could not be recorded/i.test(document.getElementById('levain-modal').innerText)"},
         ])
-    # the band block (S5b) leads the modal: this scenario has a live request and no questions.db yet, so the band draws
-    # its heading with the store-absent note; the three cards keep their order beneath it
-    assert out["values"][-1] == ["needs you \u00b7 the band", "agents waiting on you", "standing rule proposals", "resolved"]
+    # this scenario has a live request and no questions.db yet (np-cfffc0e1 a: an absent store draws nothing), so the band
+    # draws no heading and no "could not be recorded" line; the three cards keep their order. The other half, a store that
+    # exists but cannot record a view still drawing its line, is pinned in test_band_absent_store.
+    assert out["values"][-2] == ["agents waiting on you", "standing rule proposals", "resolved"]
+    assert out["values"][-1] is False
 
 
 @needs_browser
