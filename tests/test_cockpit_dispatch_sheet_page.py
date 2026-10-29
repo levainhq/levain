@@ -528,3 +528,66 @@ def test_two_dispatch_slots_both_fill(tmp_path: Path, monkeypatch, repo) -> None
             {"until": f"{slots}.every(s => s.querySelector('[data-dispatch-job]')) && 1", "ms": 12000},
         ])
     assert out["values"][-1] == 1, out["values"]
+
+
+# --- fix 1029-2 L3 round 1 (deepseek, complement on 2be30145) ---------------------------------------------------------
+
+@needs_browser
+@needs_ssh
+def test_a_redraw_with_the_status_line_gone_is_caught_and_keeps_the_controls_locked(tmp_path: Path, monkeypatch, repo) -> None:  # noqa: F811
+    """deepseek: redraw() read #sheet-note before its promise chain, so a missing status line threw uncaught and the catch
+    that locks the controls never ran. Reproduced red: one unhandled rejection and no re-read. The status line is
+    removed the moment the refusal is said; the re-read then fails: no rejection escapes and no control is live."""
+    rig = _DispatchRig(tmp_path, monkeypatch, repo)
+    sign = "document.querySelector('#sheet-actions [data-choice=\"sign\"]')"
+    with rig.serving() as httpd:
+        _amend_at_first(httpd, rig, "challenge")
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *rig.open_top(),
+            {"eval": "(() => { window.__rej = 0; window.__reads = 0; "
+                     "window.addEventListener('unhandledrejection', () => { window.__rej++; }); "
+                     "const f = window.fetch; window.fetch = (u, o) => { if (String(u).indexOf('/sheet.json') >= 0) "
+                     "{ window.__reads++; throw new TypeError('no read'); } return f(u, o); }; "
+                     "const n = document.getElementById('sheet-note'); "
+                     "new MutationObserver(() => { if (/changed since it was shown/.test(n.textContent)) n.remove(); })"
+                     ".observe(n, { childList: true, characterData: true, subtree: true }); return 1; })()"},
+            {"eval": f"{sign}.click() || 1"},
+            {"until": "(window.__reads > 0 || window.__rej > 0) && 1", "ms": 30000},
+            {"eval": "[window.__rej, window.__reads, !document.getElementById('sheet-note'), "
+                     "[...document.querySelectorAll('#sheet-actions button, #sheet-actions input')].every(c => c.disabled)]"},
+        ])
+    v = out["values"]
+    assert v[-1] == [0, 1, True, True], v
+    assert rig.state() == "filed"
+
+
+@needs_browser
+@needs_ssh
+def test_a_409_that_is_not_a_change_is_not_signed_and_the_sheet_is_not_read_again(tmp_path: Path, monkeypatch, repo) -> None:  # noqa: F811
+    """complement LOW 1: every dispatch 409 was read as "the job changed" and the sheet re-read and redrew. The
+    authorise's "authorise it from the laptop" is a 409 that is no change: it is a plain "Not signed" in the server's
+    words, the same controls stay (unlocked), and nothing is read again. Reproduced red: the controls were redrawn."""
+    rig = _DispatchRig(tmp_path, monkeypatch, repo)
+    fp = rig.pk.key.fingerprint
+    changes = [{"path": "src/a.py", "status": "M", "added": 1, "deleted": 1, "binary": False, "gitlink": False}]
+    card = {"onto": "main", "run": 1, "tier": "T2", "changes": changes, "change_overflow": 0, "files": 1,
+            "changed_lines": 2, "signers": [fp], "note": "", "problem": None, "staged": "f" * 40, "base": "e" * 40}
+    auth = "document.querySelector('#sheet-actions [data-choice=\"authorise\"]')"
+    with rig.serving() as httpd:
+        # the card is the listing's; the store's job is filed, so the phone port refuses the authorise (409, the laptop)
+        _as_recommended(httpd, rig.job, card)
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *rig.open_top(), {"eval": GETS},
+            {"eval": f"(() => {{ window.__reads = 0; {auth}.__mark = 1; const f = window.fetch; "
+                     "window.fetch = (u, o) => { if (String(u).indexOf('/sheet.json') >= 0) window.__reads++; "
+                     "return f(u, o); }; return 1; })()"},
+            {"eval": f"{auth}.click() || 1"},
+            {"until": f"/from the laptop/.test({NOTE}) && {auth} && !{auth}.disabled && {NOTE}", "ms": 30000},
+            {"eval": f"[{auth}.__mark === 1, window.__reads, window.__gets, {STATE}]"},
+        ])
+    v = out["values"]
+    assert "Not signed" in v[-2] and "nothing was signed" in v[-2] and "changed since" not in v[-2], v
+    assert v[-1] == [True, 0, 0, "open"], v
+    posts = [p.split(" ", 1)[0] for p in out["posts"]]
+    assert posts == [f"/cockpit/dispatch/{rig.job.id}/authorise-challenge"], posts
+    assert rig.state() == "filed"

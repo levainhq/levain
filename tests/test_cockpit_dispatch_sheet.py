@@ -28,7 +28,7 @@ from levain.consent.queue import authority_source
 from levain.consent.sign import Signer, passkey_key_source
 from levain.dispatch.jobs import DB_NAME, JobStore
 from tests.test_cockpit_sign_routes import _call, _serving
-from tests.test_dispatch_phone import SoftPasskey, _b64u, file_job, repo  # noqa: F401  (repo is a fixture)
+from tests.test_dispatch_phone import SoftPasskey, _b64u, file_job, lwp, recommended, repo  # noqa: F401  (fixtures)
 from tests.test_phone_server import _enrol
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
@@ -529,3 +529,87 @@ def test_a_job_amended_while_its_challenge_is_built_is_refused(world, tmp_path, 
         assert (status, out["error"]) == (409, "conflict") and "changed since it was shown" in out["message"], out
         assert "challenge" not in out, out
     assert _state(world, job.id) == "filed"
+
+
+# --- fix 1029-2 L3 round 1 (deepseek, complement on 2be30145) ---------------------------------------------------------
+
+def _no_phone_step(httpd: Any, monkeypatch: Any) -> "list[Any]":
+    """Every call the phone port's step receives from here on (none is the expected count)."""
+    calls: "list[Any]" = []
+    real = httpd.dispatch_sheet.phone.step
+    monkeypatch.setattr(httpd.dispatch_sheet.phone, "step", lambda *a: calls.append(a) or real(*a))
+    return calls
+
+
+def test_a_challenge_body_that_is_not_an_object_is_the_no_version_409_and_asks_the_phone_nothing(world, tmp_path,
+                                                                                              monkeypatch) -> None:
+    """deepseek: the version gate ran only for a dict body, so a list or a string went straight to the phone port.
+    Reproduced red: a list body was the phone's 400, the gate never ran."""
+    job = file_job(world)
+    with _serve(world, tmp_path) as (url, httpd):
+        calls = _no_phone_step(httpd, monkeypatch)
+        for action in ("challenge", "cancel-challenge", "authorise-challenge"):
+            for body in ([world["phone"].fp], "x", 7):
+                status, out = _call(url, f"/cockpit/dispatch/{job.id}/{action}", body)
+                assert (status, out["error"]) == (409, "conflict"), (action, body, out)
+                assert "names no listed version" in out["message"], (action, body, out)
+        for req in (None, [1], "x"):
+            from levain.dispatch.phone import DispatchRefused
+
+            with pytest.raises(DispatchRefused) as exc:
+                httpd.dispatch_sheet.step(job.id, "challenge", req)
+            assert exc.value.status == 409 and "names no listed version" in exc.value.message
+    assert calls == [] and _state(world, job.id) == "filed"
+
+
+def test_a_store_fault_at_the_version_compare_names_its_type_never_its_text(world, tmp_path, monkeypatch) -> None:
+    """deepseek: the 503 carried str(exc), which names this machine's paths and tables. Reproduced red: the path was in
+    the message."""
+    job = file_job(world)
+    with _serve(world, tmp_path) as (url, httpd):
+        def broken(_job_id: str) -> Any:
+            raise sqlite3.OperationalError("/Users/someone/.levain/consent/dispatch.db: no such table: jobs")
+
+        monkeypatch.setattr(httpd.dispatch_sheet, "row", broken)
+        calls = _no_phone_step(httpd, monkeypatch)
+        status, out = _call(url, f"/cockpit/dispatch/{job.id}/challenge",
+                            {"signer_fp": world["phone"].fp, "request_sha256": "a" * 64})
+    assert (status, out["error"]) == (503, "unavailable"), out
+    assert "OperationalError" in out["message"] and "nothing was signed" in out["message"], out
+    assert "/Users" not in out["message"] and "dispatch.db" not in out["message"] and "jobs" not in out["message"], out
+    assert calls == []
+
+
+def test_an_unreadable_row_is_never_challenged_even_on_its_own_version(world, tmp_path, monkeypatch) -> None:
+    """complement LOW 4: an unreadable row carries a version of its own; a challenge naming it passed the compare and the
+    phone port built a sign challenge for a job the sheet could not show. Reproduced red: 200 and a challenge."""
+    job = file_job(world)
+    with _serve(world, tmp_path) as (url, httpd):
+        def broken(*_a: Any, **_k: Any) -> Any:
+            raise KeyError("template")
+
+        monkeypatch.setattr(httpd.dispatch_sheet.phone, "record", broken)
+        shown = _v(url, job.id)
+        for action, body in (("challenge", {}), ("cancel-challenge", {"reason": ""})):
+            status, out = _call(url, f"/cockpit/dispatch/{job.id}/{action}",
+                                {"signer_fp": world["phone"].fp, "request_sha256": shown, **body})
+            assert (status, out["error"]) == (409, "conflict"), (action, out)
+            assert "could not be read" in out["message"] and "challenge" not in out, (action, out)
+    assert _state(world, job.id) == "filed"
+
+
+def test_a_run_pins_its_staged_change_set(lwp) -> None:  # noqa: F811
+    """complement LOW 3, verified: the version binds the card's run, not its change list, because the change list is the
+    diff of the run record's base and staged commit and a run record is written once. The store refuses both ways a
+    run's change set could move under the same run number."""
+    job = recommended(lwp, {"src/a.py": b"a = 2\n"}, onto="main")
+    assert lwp.dp.pending()[0][0]["authorise"]["run"] == 0
+    conn = sqlite3.connect(lwp.jstore.directory / DB_NAME, isolation_level=None)
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="written once"):
+            conn.execute("UPDATE run_records SET record = record || ' ' WHERE job_id = ? AND run = 0", (job.id,))
+        with pytest.raises(sqlite3.DatabaseError, match="never replaced"):
+            conn.execute("INSERT INTO run_records SELECT job_id, run, record, digest, envelope_digest, at, ticket "
+                         "FROM run_records WHERE job_id = ? AND run = 0", (job.id,))
+    finally:
+        conn.close()

@@ -142,6 +142,8 @@
                                         (c) => c.charCodeAt(0));
   // the server's words without their closing stop: the caller's sentence supplies its own punctuation
   const why = (r) => ((r.body && typeof r.body.message === "string" && r.body.message.replace(/[.\s]+$/, "")) || ("refused (HTTP " + r.status + ")"));
+  // a refusal the cockpit made because the item changed since this sheet read it (DispatchSheet.shown's words)
+  const staleReply = (r) => !!(r.body && typeof r.body.message === "string" && /changed since it was shown/.test(r.body.message));
   const usable = window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
     && !!(navigator.credentials && navigator.credentials.get);
 
@@ -271,16 +273,21 @@
   // fails says so beside it and locks every control left in the actions (the old ones were for the version that changed;
   // a draw that threw part way may have left new ones)
   function redraw() {
-    const before = $("sheet-note").textContent;
-    // from a resolved promise, so a read that throws at once is this catch's too, never an unhandled one
-    return Promise.resolve().then(readRequest).then((got) => {
+    let before = "";
+    // from a resolved promise, so a read (or a missing part of the page) that throws at once is this catch's too, never
+    // an unhandled one; the catch itself reads no part it has not checked is there
+    return Promise.resolve().then(() => {
+      const n = $("sheet-note");
+      before = n ? n.textContent : "";
+    }).then(readRequest).then((got) => {
       $("sheet-body").replaceChildren();
       $("sheet-actions").replaceChildren();
       draw(got);
     }).catch((e) => {
-      for (const c of $("sheet-actions").querySelectorAll("button, input")) c.disabled = true;
-      say((before ? before + " " : "") + "The " + noun + " could not be drawn again (" + ((e && e.name) || "error")
-          + "): reload this page before signing.", "bad");
+      const acts = $("sheet-actions");
+      if (acts) for (const c of acts.querySelectorAll("button, input")) c.disabled = true;
+      if ($("sheet-note")) say((before ? before + " " : "") + "The " + noun + " could not be drawn again ("
+          + ((e && e.name) || "error") + "): reload this page before signing.", "bad");
       tell("reload");
     });
   }
@@ -546,8 +553,10 @@
     return call(base + steps[0], body).then((c) => {
       if (!c.ok) {
         unsigned("Not signed: " + why(c));
-        // a dispatch job that changed or moved on since it was read (a 409): nothing was signed; it is read and drawn again
-        return dispatch && c.status === 409 ? "changed" : "unsigned";
+        // a dispatch job the cockpit says changed or moved on since it was read (its 409 in those words): nothing was
+        // signed; it is read and drawn again. Any other refusal, a 409 included (an authorise that needs the laptop), is
+        // a plain "not signed" in the server's words, the sheet left as it is
+        return dispatch && c.status === 409 && staleReply(c) ? "changed" : "unsigned";
       }
       if (!decodable(c.body.challenge)) return unsigned("The cockpit sent a malformed challenge");
       // an authorise lands the run and branch the SERVER builds now: before any passkey is asked, the challenge's payload

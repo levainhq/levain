@@ -594,8 +594,13 @@ class DispatchSheet:
         try:
             row = self.row(job_id)
         except (DispatchError, OSError, sqlite3.Error) as exc:
-            raise DispatchRefused(503, "unavailable", f"the dispatch store cannot answer now ({type(exc).__name__}: "
-                                                      f"{exc}): {not_done}") from None
+            # the exception's type only: its text names paths and tables, which are this machine's, not the page's
+            raise DispatchRefused(503, "unavailable", f"the dispatch store cannot answer now ({type(exc).__name__}): "
+                                                      f"{not_done}") from None
+        if row is not None and row.get("state") == "unreadable":
+            raise DispatchRefused(409, error_word(409), f"dispatch job {job_id} could not be read, so nothing is signed "
+                                                        f"from this page: read it on the laptop (levain dispatch show "
+                                                        f"{job_id}); {not_done}")
         if row is None or row.get("sha256") != version:
             raise DispatchRefused(409, error_word(409), f"dispatch job {job_id} changed since it was shown: reload and "
                                                         f"read it again; {not_done}")
@@ -608,7 +613,8 @@ class DispatchSheet:
         A challenge (sign, cancel, authorise) also carries ``request_sha256``, the row's ``sha256`` the sheet showed, as a
         plain sign request's does: it is taken off before the phone port's body is checked, and the job's version now is
         compared with it before the payload is built and again after (an amendment while it was built), each a 409 that
-        says the job changed (:meth:`shown`). One that names none is the plain route's 409 too."""
+        says the job changed (:meth:`shown`). One that names none (a body that is not an object included) is the plain
+        route's 409 too, before the phone port is asked anything."""
         from levain.consent.sign import error_word
         from levain.dispatch.phone import DispatchRefused
         from levain.dispatch.sign import sign_message
@@ -617,8 +623,8 @@ class DispatchSheet:
         if problem is not None:
             raise DispatchRefused(422, "sign_refused", problem + "; nothing was signed")
         version = None
-        if action in self._CHALLENGES and isinstance(req, dict):
-            version = req.get("request_sha256")
+        if action in self._CHALLENGES:
+            version = req.get("request_sha256") if isinstance(req, dict) else None
             if not isinstance(version, str) or not version:
                 raise DispatchRefused(409, error_word(409), f"the challenge for dispatch job {job_id} names no listed "
                                                             "version: reload and read it again; "
@@ -637,7 +643,9 @@ class DispatchSheet:
     def version(rec: "Mapping[str, Any]") -> str:
         """The version a sheet row and a card's link name one job by: its id, digest, state and lease, and the run,
         branch and tier of its authorise card (so a recommendation that moved reads as changed: a pick made on the old
-        card is never offered on the new one)."""
+        card is never offered on the new one). The card's staged change set needs no field here: it is the diff of the
+        run's stored base and staged commit, and a run record is written once (``run_records`` refuses an update and a
+        second row for the same run), so the run pins it."""
         card = rec.get("authorise") if isinstance(rec.get("authorise"), dict) else {}
         return hashlib.sha256(json.dumps([rec.get("id"), rec.get("digest"), rec.get("state"), rec.get("lease_end"),
                                           card.get("run"), card.get("onto"), card.get("tier")]).encode()).hexdigest()
