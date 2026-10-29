@@ -4516,7 +4516,8 @@
     const full = String(title || "").trim();
     for (const cand of [full, full.replace(/^[^\s:]{1,40}:\s+/, "")]) {
       const w = cand.replace(/[?.\s]+$/, "");
-      if (w && t.startsWith(w)) return t.slice(w.length).replace(/^[?.\s]+/, "");
+      // the prefix counts only at a word boundary: end of text, whitespace, or ?.: then whitespace/end ("Ship?" is not "Shipment ...")
+      if (w && t.startsWith(w) && /^(?:$|\s|[?.:](?:\s|$))/.test(t.slice(w.length))) return t.slice(w.length).replace(/^[?.:\s]+/, "");
     }
     return t;
   }
@@ -5698,7 +5699,7 @@
     }
     row.title = "open the whole request and decide there";
     row.append(text, side);
-    row.addEventListener("click", () => openNeedsFocus(it, row));
+    row.addEventListener("click", () => openNeedsFocus(row._needsItem || it, row));
     return row;
   }
   function renderNeeds(view) {
@@ -5732,6 +5733,7 @@
     // a row kept by id still shows what its item says NOW: a consent whose expiry moved (extended) takes the new clock in place;
     // one whose state changed is rebuilt
     const keep = (row, it) => {
+      row._needsItem = it;   // the click handler reads this, so a kept row (question or consent) opens its item as it is NOW
       if (it.kind !== "consent") return row;
       if (row.dataset.needsState !== undefined && row.dataset.needsState !== String(it.c.state)) return needsRow(it);
       const exp = String(it.c.expiresAt);
@@ -5826,7 +5828,6 @@
     if (!host || host.hidden) return false;
     const first = host.querySelector(".needs-row");
     if (!first || !first.offsetParent) return false;   // on Build and Memory the rows are not drawn: the bar is
-    first.tabIndex = -1;
     if (typeof first.scrollIntoView === "function") first.scrollIntoView({ block: "center", behavior: "smooth" });
     first.focus({ preventScroll: true });
     return true;

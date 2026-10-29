@@ -399,3 +399,21 @@ def test_a_kept_consent_card_takes_the_new_expiry_when_the_same_id_comes_back_ex
     got = json.loads(out[-1])
     assert got["before"] != new and got["after"] == new, got
     assert got["same"] is True, got              # the card was kept, not rebuilt
+
+
+@needs_browser
+def test_a_kept_consent_row_opens_its_focus_view_with_the_extended_expiry(tmp_path: Path, monkeypatch) -> None:
+    """L3 r1 (3 lineages): the row's click handler closed over the item as built, so an extended consent opened with the OLD expiry."""
+    _waiting(tmp_path, monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    new = "2099-06-15T12:00:00+00:00"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
+            {"until": "document.querySelector('#ck-needs .needs-consent')"},
+            {"eval": "(() => { const f = window.fetch; window.fetch = async (...a) => { const r = await f(...a);"
+                     " const t = await r.clone().text(); if (!/expires_at/.test(t)) return r;"
+                     f" return new Response(t.replace(/\"expires_at\":\\s*\"[^\"]*\"/g, '\"expires_at\": \"{new}\"'), {{status: r.status, headers: r.headers}}); }}; return 1; }})()"},
+            {"eval": "window.LevainCockpitView.refetchPanel('decisions').then(() => { document.querySelector('#ck-needs .needs-consent').click(); return 1; })"},
+            {"until": "document.querySelector('#levain-modal .needs-expires')"},
+            {"eval": "document.querySelector('#levain-modal .needs-expires').textContent"}])["values"]
+    assert "2099" in out[-1], out[-1]

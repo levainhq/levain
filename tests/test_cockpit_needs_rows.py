@@ -107,3 +107,25 @@ def test_blocks_that_begin_with_the_title_show_only_the_remainder(tmp_path: Path
     f = json.loads(vals[-1])
     assert f["blocks"] == ["blocks: The release waits on this."], f
     assert f["text"].count("Ship the fix now?") == 1, f       # the title is drawn once
+
+
+@needs_browser
+def test_blocks_strip_the_title_only_at_a_word_boundary(tmp_path: Path, monkeypatch) -> None:
+    """L3 r1 (3 lineages): `startsWith` with no boundary turned 'Ship?' + 'Shipment ...' into 'ment ...' and dropped a letter of 'Use All'."""
+    home = tmp_path / "levain_home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    (home / "consent").mkdir(parents=True, mode=0o700)
+    store = QuestionStore(home / "consent")
+    for what, blocks in (("Ship?", "Shipment is waiting on legal"), ("Use A", "Use All of it"), ("Cut it?", "Cut it: the rest waits")):
+        store.file(agent="codex", agent_session_id="s-" + what, what=what, options=[("a", "Yes"), ("b", "No")], rec="a", blocks=blocks, cwd="/w")
+    _root, src, _ids = _install(tmp_path)
+    rows = "[...document.querySelectorAll('#ck-needs .needs-row')]"
+    ready = f"{rows}.length === 3 && {rows}.every(r => /Ship|Use|Cut/.test(r.querySelector('.needs-row-title').textContent))"
+    subs = f"JSON.stringify({rows}.map(r => [r.querySelector('.needs-row-title').textContent, r.querySelector('.needs-row-sub').textContent]))"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        vals = _drive(tmp_path, f"{url}/#write_token=T", [{"emulate": SIZES[0][1]}, {"until": ready, "ms": 20000},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 600))"}, {"eval": subs}])["values"]
+    got = {t: s for t, s in json.loads(vals[-1])}
+    assert got["Ship?"] == "blocks: Shipment is waiting on legal", got
+    assert got["Use A"] == "blocks: Use All of it", got
+    assert got["Cut it?"] == "blocks: the rest waits", got
