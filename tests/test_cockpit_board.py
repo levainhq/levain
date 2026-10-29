@@ -223,3 +223,46 @@ def test_the_tell_box_behaves_under_node():
     assert len(edited) == 1 and edited[0]["words"] == "B" and edited[0]["outbox_id"] != "ph-old"   # edited words: new id
     same = out["same_pending"]["posts"]
     assert len(same) == 1 and same[0]["outbox_id"] == "ph-old" and out["same_pending"]["reads"] == 0
+
+
+def _tell_run():
+    root = Path(__file__).resolve().parent.parent
+    run = subprocess.run(["node", str(root / "tests" / "js_board_tell_harness.js"),
+                          str(root / "levain" / "templates" / "web" / "board_view.js")],
+                         capture_output=True, text=True, timeout=60, check=True)
+    return json.loads(run.stdout)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_compose_fragment_prefills_the_words_and_posts_nothing_by_itself():
+    """`#board&compose=re%20<id>%3A%20` starts the box's words: editable, focused, cursor at the end, nothing posted or read."""
+    out = _tell_run()
+    p = out["prefill"]
+    assert p["pre"]["value"] == "re c-12: " and p["pre"]["focused"] == 1 and p["pre"]["sel"] == [9, 9]
+    assert p["posts"] == [] and p["reads"] == 0 and p["pre"]["posts"] == 0 and p["pre"]["reads"] == 0   # no send by itself
+    assert out["prefill_plus"]["pre"]["value"] == "re c-12: "          # the address rewritten with "+" for spaces reads the same
+    e = out["prefill_edit"]                                             # the operator's edit goes out through the one drop route
+    assert len(e["posts"]) == 1 and e["posts"][0]["words"] == "re c-12: do it" and e["posts"][0]["outbox_id"].startswith("ph-")
+    assert out["no_hash"]["pre"]["value"] == "" and out["no_hash"]["pre"]["focused"] == 0
+    assert out["kept_wins"]["pre"]["value"] == "A"                      # an undelivered earlier drop is never overwritten
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_prefill_reads_no_storage_and_no_token():
+    """A token beside the fragment is not read specially; the prefill path touches only the box's own pending key."""
+    out = _tell_run()
+    t = out["prefill_token"]
+    assert t["pre"]["value"] == "re x: " and "SECRET123" not in json.dumps(t)
+    assert set(t["keysRead"]) <= {"levain-board-drop-pending"} and t["posts"] == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_hostile_fragment_stays_inert_plain_text():
+    """Markup is a value, never parsed; a long value is cut; a malformed % and control characters do not throw."""
+    out = _tell_run()
+    assert out["hostile_markup"]["pre"]["value"] == "<img src=x onerror=alert(1)>" and out["hostile_markup"]["posts"] == []
+    assert len(out["hostile_long"]["pre"]["value"]) == 300
+    assert isinstance(out["hostile_malformed"]["pre"]["value"], str) and out["hostile_malformed"]["posts"] == []
+    assert out["hostile_control"]["pre"]["value"] == "a b c"
+    src = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "board_view.js").read_text()
+    assert "innerHTML" not in src

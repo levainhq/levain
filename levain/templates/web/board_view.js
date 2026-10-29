@@ -103,6 +103,30 @@
     host.appendChild(wrap);
   }
 
+  // The composer prefill: `/#board&compose=re%20<card id>%3A%20` (the Board tab, the box's words started with "re <card id>: ").
+  // Plain text only: it is decoded by URLSearchParams (which never throws on a malformed %), stripped of control characters,
+  // cut at COMPOSE_MAX, and set as the textarea's VALUE. It reads no storage, posts nothing, and holds no token; the
+  // operator edits it and sends it through the one drop route like any other words.
+  var COMPOSE_MAX = 300;
+  function composePrefill(hash) {
+    try {
+      var v = new URLSearchParams(String(hash || "").replace(/^#/, "")).get("compose");
+      if (v == null) return "";
+      v = v.replace(/[\u0000-\u001f\u007f]/g, " ");
+      return v.length > COMPOSE_MAX ? v.slice(0, COMPOSE_MAX) : v;
+    } catch (e) { return ""; }
+  }
+  // once taken, the address no longer carries it (a reload does not refill words the operator sent or cleared)
+  function forgetCompose() {
+    try {
+      if (!root.history || !root.location) return;
+      var p = new URLSearchParams(String(root.location.hash || "").replace(/^#/, ""));
+      p.delete("compose");
+      var rest = p.toString();
+      root.history.replaceState(null, "", root.location.pathname + root.location.search + (rest ? "#" + rest : ""));
+    } catch (e) { /* the address stays */ }
+  }
+
   // The "tell the coordinator" box: words only, through POST /cockpit/coord/drop.
   function mountTell(doc, host, opts) {
     var f = opts.fetch || root.fetch.bind(root);
@@ -126,7 +150,12 @@
       gate.textContent = offered ? "" : "Telling the coordinator is off here: " + String(why || "the board has not said") + ".";
       gate.hidden = offered;
       words.hidden = send.hidden = !offered;
+      if (offered && wantFocus) {       // the field is shown now: focus it, cursor at the end of the prefill
+        wantFocus = false;
+        try { words.focus(); words.setSelectionRange(words.value.length, words.value.length); } catch (e) { /* focus is a convenience */ }
+      }
     }
+    var wantFocus = false;
     offer(false, "reading the board");
     var oid = newOutboxId();
     var working = false;
@@ -211,6 +240,10 @@
       words.value = left.words;
       oid = left.outbox_id;
       say.textContent = "Words kept from an earlier visit; send them again (they file once).";
+    } else {
+      // a link's `compose=` fragment part starts the words (flow's board copies/links, it never posts); never over kept words
+      var pre = composePrefill(opts.hash != null ? opts.hash : (root.location && root.location.hash));
+      if (pre) { words.value = pre; wantFocus = true; forgetCompose(); }
     }
     return { box: box, offer: offer };
   }
