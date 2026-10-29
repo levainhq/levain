@@ -59,7 +59,8 @@ def test_codex_passthrough_is_still_refused_by_name():
 
 
 #: an operator's own Claude passthrough route under another id, hand-written before one shipped (1026-10 R6)
-OPERATOR_PASS = {"route": "operator-claude-pass", "type": "subscription_passthrough", "hosts": ["api.anthropic.com"]}
+OPERATOR_PASS = {"route": "operator-claude-pass", "type": "subscription_passthrough",
+                 "hosts": ["api.anthropic.com", "platform.claude.com"]}
 
 
 def _upgraded(*extra):

@@ -503,28 +503,26 @@ def test_identity_expired_text_is_root_sourced_and_ignores_a_planted_tail(tmp_pa
 
 
 @bounded(60)
-def test_identity_unreachable_names_a_claude_route_without_the_token_host(tmp_path: Path,
-                                                                          monkeypatch: pytest.MonkeyPatch) -> None:
-    """L3 r1 (codex MED 3): an operator's own Claude passthrough route without platform.claude.com wins over the shipped
-    one, so every refresh is denied and "try again" never works; the line names the route. With the host: the plain
-    retry line."""
+def test_a_launch_with_a_claude_route_lacking_the_token_host_is_refused_before_anything_starts(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """1029 ruling (np-e5b2ebed (a)): the route is refused at load, naming the host; with the host the launch goes on
+    to the plain identity-unreachable retry line."""
     unr = json.dumps({"ok": True, "identity": {"result": "identity-unreachable"}}, sort_keys=True, separators=(",", ":"))
-    r = g3rig(tmp_path, monkeypatch, FAKE_START="idunr", FAKE_STATUS=unr)       # the rig's claude-sub lacks the host
-    assert r.run(auth="passthrough") == 1
-    assert ("the base map's Claude passthrough route claude-sub does not name platform.claude.com, which the login "
-            "refresh needs") in _said(r) and "Sign in again" not in _said(r)
-    (tmp_path / "b").mkdir()
-    r2 = g3rig(tmp_path / "b", monkeypatch, FAKE_START="idunr", FAKE_STATUS=unr)
-    p = r2.store / "routes" / "base.json"
+    r = g3rig(tmp_path, monkeypatch, FAKE_START="idunr", FAKE_STATUS=unr)
+    p = r.store / "routes" / "base.json"
     base = json.loads(p.read_text())
     for route in base["routes"]:
         if route["route"] == "claude-sub":
-            route["hosts"].append("platform.claude.com")
+            route["hosts"].remove("platform.claude.com")
     p.write_text(json.dumps(base, sort_keys=True, separators=(",", ":")))
+    assert r.run(auth="passthrough") == 1
+    assert ("refused passthrough-route-lacks-token-host: add platform.claude.com to the hosts of route claude-sub"
+            in _said(r)) and not r.verbs()
+    (tmp_path / "b").mkdir()
+    r2 = g3rig(tmp_path / "b", monkeypatch, FAKE_START="idunr", FAKE_STATUS=unr)    # the rig's claude-sub has the host
     assert r2.run(auth="passthrough") == 1
-    said = _said(r2)
     assert ("could not reach Claude's sign-in server to check slot 0's login. Nothing was launched, and the stored "
-            "login is kept. Try again.") in said and "does not name" not in said
+            "login is kept. Try again.") in _said(r2)
 
 
 @bounded(60)

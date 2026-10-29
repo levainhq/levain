@@ -665,6 +665,15 @@ def pick_routes(base: Sequence[Mapping[str, Any]], vendor: str, auth: str) -> Tu
         raise Refused(f"no-route:{auth}", f"{vendor}: the base map has no {need} route")
     if len(mine) > 1:
         raise Refused(f"route-ambiguous:{auth}", f"{vendor}: {', '.join(sorted(mine))}")
+    if vendor == "claude" and auth == "passthrough":
+        # 1029 ruling (np-e5b2ebed (a)): refuse at route load and name the host; never merge a host into his route.
+        # The login refresh POSTs to the token host through this route's tunnel, so a route without it makes every
+        # refresh fail (identity-unreachable forever).
+        route = next(r for r in base if r.get("route") == mine[0])
+        if _TOKEN_HOST not in _hosts(route):
+            rid = mine[0] if _ROUTE_ID_SAID_RE.fullmatch(mine[0]) else "(its id is not shown)"
+            raise Refused("passthrough-route-lacks-token-host",
+                          f"add {_TOKEN_HOST} to the hosts of route {rid} in the base map: the login refresh needs it")
     return tuple(sorted(set(egress))) + (mine[0],)
 
 
@@ -1553,15 +1562,6 @@ class Supervisor:
                 self.say("start refused identity-unreachable, but root's record does not say so. "
                          "Nothing was launched.")
                 return
-            rid = self._route_without_token_host()
-            if rid is not None:
-                # L3 r1 (codex MED 3): an operator's own Claude passthrough route wins over the shipped one
-                # (vendor_routes._shipped_for); one without the token host denies every refresh, so a retry never works
-                self.say(f"could not reach Claude's sign-in server to check slot {self._slot_index}'s login: the base "
-                         f"map's Claude passthrough route {rid} does not name {_TOKEN_HOST}, which the login refresh "
-                         "needs. Nothing was launched, and the stored login is kept. Add that host to the route, then "
-                         "try again.")
-                return
             self.say(f"could not reach Claude's sign-in server to check slot {self._slot_index}'s login. Nothing was "
                      "launched, and the stored login is kept. Try again.")
         except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
@@ -1569,20 +1569,6 @@ class Supervisor:
                 self.say(neutral.format(why=type(e).__name__))
             except Exception:   # noqa: BLE001 - stderr itself refused; the teardown still runs
                 pass
-
-    def _route_without_token_host(self) -> Optional[str]:
-        """The id of the base map's one Claude passthrough route when it does not name the refresh's token host, else
-        None (no map, none or several such routes, or the host is there). Best-effort: it only words a line."""
-        try:
-            base = read_base_map(self.s.base_map)   # type: ignore[arg-type]
-        except Exception:   # noqa: BLE001
-            return None
-        mine = [r for r in base if r.get("type") == _AUTH_ROUTE["passthrough"] and type(r.get("route")) is str
-                and _hosts(r) & VENDOR_HOSTS["claude"]]
-        if len(mine) != 1 or _TOKEN_HOST in _hosts(mine[0]):
-            return None
-        rid = mine[0]["route"]
-        return rid if _ROUTE_ID_SAID_RE.fullmatch(rid) else "(its id is not shown)"
 
     def _identity_refused_said(self, session: str) -> None:
         try:

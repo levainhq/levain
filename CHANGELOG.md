@@ -6,6 +6,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- **A Claude passthrough route without `platform.claude.com` is refused when the session's routes load, naming the
+  host and the route.** The login refresh goes to that host through the route's tunnel; your own passthrough route
+  replaces the shipped one, so one without it made every refresh fail. Levain never adds the host to your route; the
+  refusal says to. Other routes (brokered, Codex) are not checked.
+
 ### Added
 - **`levain session claude|codex --auth passthrough` (no `--login`) is no longer refused at launch.** The launcher
   accepts it for both vendors; if the start step then refuses because the slot's stored login answers as a different
