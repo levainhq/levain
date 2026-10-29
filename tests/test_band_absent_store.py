@@ -183,6 +183,54 @@ def test_an_authority_item_the_second_read_could_not_read_says_so_and_still_list
     assert [i["what"] for i in got["items"]] == ["Ship the sweep fix?"], got      # the question still lists; the extra cannot
 
 
+def _authority_read(monkeypatch, tmp_path, second):
+    """A store with one question and one numbered authority item (read fresh on the first read); ``second`` is what the
+    authority sources hold on every later read. Returns the payload."""
+    from levain import band_sources
+
+    store = QuestionStore(tmp_path / "consent")
+    _file(store)
+    extra = band_sources.Extra(source="sign", ref="r1", filed="2026-01-01T00:00:00Z", tag="t", what="Sign the rule?",
+                               options=("yes", "no"), rec="yes", rec_letter="a", blocks="b", origin="o")
+    armed = [False]
+
+    def read(*a, **k):
+        return second if armed[0] else band_sources.Extras(items=[extra], complete={"sign"})
+
+    shown = band_view.show
+
+    def show_then_arm(*a, **k):
+        r = shown(*a, **k)
+        armed[0] = True
+        return r
+
+    monkeypatch.setattr(band_view, "read_extras", read)
+    monkeypatch.setattr(band_view, "show", show_then_arm)
+    return band_view.band_payload(store, "cockpit:browser")
+
+
+def test_an_authority_item_whose_record_cannot_be_decoded_says_so_and_does_not_vanish_into_health(tmp_path, monkeypatch):
+    """complement MED (L3 r4): a numbered authority item still open but UNREADABLE on the second read was left out of the
+    listing and, its source being complete, out of `unknown` too: the payload omitted it with an empty note."""
+    from levain import band_sources
+
+    bad = band_sources.Extra(source="sign", ref="r1", filed="2026-01-01T00:00:00Z", tag="t",
+                             what="UNREADABLE: SIGN r1 could not be read", options=(), rec="", rec_letter=None,
+                             blocks="unknown", origin="o", unreadable="its record could not be read (JSONDecodeError)")
+    got = _authority_read(monkeypatch, tmp_path, band_sources.Extras(items=[bad], complete={"sign"}))
+    assert got["note"] == UNREAD, got
+    assert [i["what"] for i in got["items"]] == ["Ship the sweep fix?"], got
+
+
+def test_an_authority_item_closed_between_the_two_reads_sets_no_note(tmp_path, monkeypatch):
+    """The item that is simply gone (its source read in full, the row closed) is not a read failure: no note."""
+    from levain import band_sources
+
+    got = _authority_read(monkeypatch, tmp_path, band_sources.Extras(items=[], complete={"sign"}))
+    assert got["note"] == "", got
+    assert [i["what"] for i in got["items"]] == ["Ship the sweep fix?"], got
+
+
 def test_a_corrupt_question_row_says_so_and_the_other_items_still_list(tmp_path, monkeypatch):
     """complement LOW (L3 r3): _items_of swallowed a _question_of exception, so the dropped item left the note empty."""
     store = QuestionStore(tmp_path / "consent")

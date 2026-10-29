@@ -479,7 +479,8 @@ def _info_of(q: Question) -> ItemInfo:
 def _extras_of(store: QuestionStore, view: View) -> tuple[dict[int, Extra], set[int]]:
     """The authority items behind the view's numbers that are open NOW, read fresh: one that has closed since (or whose
     source cannot be read) is absent, so shorthand on it opens nothing. Second: the view's authority numbers whose
-    source could not be read in full just now (absent, but not known to be closed)."""
+    source could not be read in full just now, or whose record is still open but cannot be decoded (absent, but not known
+    to be closed)."""
     with store._peek() as conn:
         if conn is None or "band_items" not in _tables(conn):
             return {}, set()
@@ -493,7 +494,11 @@ def _extras_of(store: QuestionStore, view: View) -> tuple[dict[int, Extra], set[
         return {}, set(refs)
     open_now = {e.band_key: e for e in now.items}
     got = {n: open_now[k] for n, k in refs.items() if k in open_now and open_now[k].unreadable is None}
-    return got, {n for n, (src, _ref) in refs.items() if n not in got and src not in now.complete}
+    # unknown: its source was not read in full, OR it is still open but its record cannot be decoded (listed UNREADABLE,
+    # absent from ``got``): not known closed, so the band says it may be missing an item. One that is simply gone (absent
+    # from ``open_now`` under a fully-read source) has closed, and says nothing.
+    return got, {n for n, k in refs.items() if n not in got and (k[0] not in now.complete or
+                                                                  (k in open_now and open_now[k].unreadable is not None))}
 
 
 def _info_of_extra(e: Extra) -> ItemInfo:
