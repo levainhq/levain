@@ -419,7 +419,9 @@ def test_f7_the_cards_follow_the_live_requests_and_precede_the_resolved(tmp_path
             {"until": f"{_CARDS}.length === 1"},
             {"eval": heads},
         ])
-    assert out["values"][-1] == ["agents waiting on you", "standing rule proposals", "resolved"]
+    # the band block (S5b) leads the modal: this scenario has a live request and no questions.db yet, so the band draws
+    # its heading with the store-absent note; the three cards keep their order beneath it
+    assert out["values"][-1] == ["needs you \u00b7 the band", "agents waiting on you", "standing rule proposals", "resolved"]
 
 
 @needs_browser
