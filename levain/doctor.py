@@ -1698,8 +1698,13 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
                 return CheckResult(name, True, "not asked: run as root, CONTROL does not serve this account its "
                                    "sessions", "Run `levain doctor` as the operator to see them.", neutral=True)
             seen = {"closed": "closed to this account", "absent": "not written yet", "bad": "unreadable"}.get(beat[0])
-            why = (f"CONTROL did not answer ({status[1]}) and the reaper's pass record is {seen}" if seen
-                   else f"CONTROL did not answer ({status[1]}) and the reaper's pass record is out of date")
+            if seen:
+                state = seen
+            elif fresh is not None:     # current, but the reaper skips end_and_scrub while CONTROL is down: empty proves nothing
+                state = "current but names no held session, which proves nothing while CONTROL is down"
+            else:
+                state = "out of date"
+            why = f"CONTROL did not answer ({status[1]}) and the reaper's pass record is {state}"
             return CheckResult(name, True, f"unknown: {why}; a session stuck mid-end would not show here", warn=True)
         if beat[0] == "closed":
             return CheckResult(name, True, "none of your sessions (CONTROL shows only yours)")
@@ -1732,11 +1737,11 @@ def reap_held_lines(host: HostOS, source: str) -> tuple[str, ...]:
     prog = ("import sys; sys.path.insert(0, '" + stage + "'); "
             "from levain.slot import reaper as RP, runtime_helper as H; print(RP.Reaper(H.Seams()).run_pass())")
     return (stop,
-            f"sudo rm -rf {stage} && sudo mkdir -m 700 {stage} && sudo cp -R {source} {stage}/levain",
+            f"sudo rm -rf {stage} && sudo mkdir -m 700 {stage} && sudo cp -R {shlex.quote(source)} {stage}/levain",
             f"sudo {root_tree.ROOT_PYTHON[host]} {root_tree.PY_FLAGS} -c \"{prog}\"",
             start,
             f"sudo rm -rf {stage}",
-            layout.repair_line(host) + f" --source {source}")
+            layout.repair_line(host) + f" --source {shlex.quote(source)}")
 
 
 def _held_commands() -> str:
@@ -1746,7 +1751,8 @@ def _held_commands() -> str:
     host = "darwin" if sys.platform == "darwin" else "linux"
     src = os.path.dirname(os.path.abspath(__file__))
     steps = "\n".join(f"        {i}. {c}" for i, c in enumerate(reap_held_lines(host, src), 1))
-    return steps + "\n        If 3 fails, still run 4 and 5: the reaper stays stopped until 4. Step 6 asks for your password."
+    return steps + ("\n        If 2 or 3 fails, still run 4 and 5: the reaper stays stopped until 4, and the root copy stays until 5."
+                      "\n        If 4 fails, run it again before anything else. Step 6 asks for your password.")
 
 
 def _check_slot_services(*, host: str | None = None, store: Path | None = None, run: Path | None = None,
