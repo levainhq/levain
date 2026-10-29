@@ -202,6 +202,7 @@ def test_deliver_answer_none_for_no_answer_or_no_session(tmp_path):
 
 
 def test_deliver_answers_and_the_cli(tmp_path, monkeypatch):
+    monkeypatch.setattr("levain.consent.band.agent_session_caller", lambda: False)   # a human terminal, whatever runs this suite
     store, q = _answered(tmp_path, agent="codex")
     out = io.StringIO()
     monkeypatch.setattr("sys.stdout", out)
@@ -250,6 +251,7 @@ def test_deliver_answers_tries_one_resume_per_session(tmp_path, monkeypatch):
 
 
 def test_the_cli_says_the_answer_stands_when_delivery_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr("levain.consent.band.agent_session_caller", lambda: False)   # a human terminal, whatever runs this suite
     store = QuestionStore(tmp_path / "consent")
     store.file(agent="codex", agent_session_id=SESSION, what="q?", options=[("a", "x"), ("b", "y")], rec="a",
                blocks="z", cwd="/w")
