@@ -252,6 +252,22 @@ def test_the_tab_lists_cards_grouped_under_column_headings_and_the_modal_draws_t
 ORDER_COUNTS = ["backlog:1", "ready:0", "running:1", "waiting:0", "needs-you:1", "done:0"]
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_watchers_belong_to_the_page_and_a_failed_read_tells_them():
+    """L3 r1 (session A). The page's watchers and last model live on a bus every mounted view shares: stopping one view drops
+    no watcher, and the next view's pull reaches them. A failed read (403, 5xx, network) tells every watcher `(null, true)`
+    and clears the model; the next good pull restores it; a stopped view tells nobody; a watcher that throws wipes nothing."""
+    b = _tell_run()["bus"]
+    cols = ",".join(ORDER_COUNTS)
+    assert b["afterFirst"] == [cols]                      # the throwing watcher did not stop the first one hearing it
+    assert b["watchersAfterStop"] == 2                    # stop() dropped no watcher
+    assert b["afterRemount"] == [cols, cols]              # the new view's pull reached the old subscription
+    for bad in ("403", "500", "net"):
+        assert b["steps"][bad]["last"] == "FAILED" and b["steps"][bad]["model"] is None and b["steps"][bad]["failed"] is True, b["steps"][bad]
+    assert b["steps"]["ok"]["last"] == cols and b["steps"]["ok"]["failed"] is False and b["steps"]["ok"]["heads"] == 6, b["steps"]["ok"]
+    assert b["stoppedPullCalls"] == 0
+
+
 def _tell_run():
     root = Path(__file__).resolve().parent.parent
     run = subprocess.run(["node", str(root / "tests" / "js_board_tell_harness.js"),

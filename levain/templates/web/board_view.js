@@ -316,31 +316,42 @@
     host.append(view, tell);
     var tellBox = mountTell(doc, tell, opts);
     var timer = null, stopped = false;
-    var lastModel = null;       // the model of the last good pull: the ⤢ modal draws its columns from it
-    var watchers = [];
+    // The page's bus: the last good model and the watchers belong to the PAGE, shared by every view it mounts (the Board tab
+    // stops a view when it is left or hidden and mounts a new one when it is back; the ⤢ modal must outlive that). `bus.model`
+    // is the last good pull's model, cleared on a failed one; `bus.failed` says the latest read did not succeed.
+    var bus = opts.bus || newBus();
     function pull() {
       return f(BOARD_PATH, { cache: "no-store", headers: headers() }).then(function (res) {
-        if (res.status === 403) { view.textContent = "The board needs this page's write token."; return; }
-        if (!res.ok) { view.textContent = "The board could not be read (HTTP " + res.status + ")."; return; }
+        if (res.status === 403) { view.textContent = "The board needs this page's write token."; if (!stopped) busFail(bus); return; }
+        if (!res.ok) { view.textContent = "The board could not be read (HTTP " + res.status + ")."; if (!stopped) busFail(bus); return; }
         return res.json().then(function (b) {
           if (stopped) return;
-          var m = lastModel = boardModel(b);
+          var m = bus.model = boardModel(b);
+          bus.failed = false;
           renderGrouped(doc, view, m);
           tellBox.offer(m.tell.offered, m.tell.why);
-          watchers.slice().forEach(function (w) { w(m); });
+          busTell(bus, m, false);
         });
-      }).catch(function () { if (!stopped) view.textContent = "The board could not be reached."; });
+      }).catch(function () { if (!stopped) { view.textContent = "The board could not be reached."; busFail(bus); } });
     }
     function loop() { if (!stopped && pollMs > 0) timer = setTimeout(function () { pull().then(loop); }, pollMs); }
     pull().then(loop);
     return {
-      stop: function () { stopped = true; watchers = []; if (timer) clearTimeout(timer); tellBox.dispose(); },
+      // stopping a view drops none of the page's watchers: the next view's pull reaches them
+      stop: function () { stopped = true; if (timer) clearTimeout(timer); tellBox.dispose(); },
       pull: pull,
-      model: function () { return lastModel; },
-      // `fn(model)` after every good pull; the returned function stops it
-      watch: function (fn) { watchers.push(fn); return function () { watchers = watchers.filter(function (w) { return w !== fn; }); }; }
+      model: function () { return bus.model; },
+      // `fn(model, failed)` after every pull: `fn(model, false)` on a good one, `fn(null, true)` on a failed one; the returned function stops it
+      watch: function (fn) { return busWatch(bus, fn); }
     };
   }
+
+  function newBus() { return { model: null, failed: false, watchers: [] }; }
+  function busWatch(bus, fn) { bus.watchers.push(fn); return function () { bus.watchers = bus.watchers.filter(function (w) { return w !== fn; }); }; }
+  // one watcher's throw touches neither the others nor the board the pull just drew
+  function busTell(bus, m, failed) { bus.watchers.slice().forEach(function (w) { try { w(m, failed); } catch (_) { /* a watcher's fault stays its own */ } }); }
+  // a read that did not succeed (a 403, a 5xx, no network, the token removed): what was last read is no longer the board
+  function busFail(bus) { bus.model = null; bus.failed = true; busTell(bus, null, true); }
 
   var api = { boardModel: boardModel, journalLine: journalLine, renderBoard: renderBoard, renderGrouped: renderGrouped, mount: mount };
   root.LevainBoardView = api;
@@ -371,9 +382,10 @@
     section.appendChild(grid);
     doc.querySelector("main.frame").appendChild(section);
     var view = null;
+    var bus = newBus();       // shared by every view this page mounts (see mount)
     // ⤢ "focus this panel": the six columns, drawn by renderBoard (the same renderer), in the dashboard's own focus modal. It is
     // drawn only when the dashboard exports the way in (a page without it has no modal to open), in the panel head and never in
-    // the mounted host (the tell box holds the one button there). The modal has no tell box. Each good pull repaints it.
+    // the mounted host (the tell box holds the one button there). The modal has no tell box. Each pull repaints it: the columns on a good one, one plain line on a failed one.
     var D = root.LevainDashboard;
     if (D && typeof D.openCustom === "function") {
       var expand = el(doc, "button", "pexpand");
@@ -382,9 +394,11 @@
       expand.setAttribute("aria-label", "expand Board to a focus view");
       expand.appendChild(el(doc, "span", "pexpand-ico", "⤢"));
       var modalHost = null, unwatch = null;
-      var paint = function (m) {
+      // `failed`: the latest read did not succeed, so the columns give way to one plain line (never the last authorized queue)
+      var paint = function (m, failed) {
         modalHost.replaceChildren();
-        if (m) renderBoard(doc, modalHost, m);
+        if (failed) modalHost.appendChild(el(doc, "p", "bd-note", "the board could not be read just now"));
+        else if (m) renderBoard(doc, modalHost, m);
         else modalHost.appendChild(el(doc, "p", "bd-note", "The board has not been read yet."));
       };
       expand.addEventListener("click", function () {
@@ -394,24 +408,28 @@
           id: "ready-board", title: "Board", live: true, opener: expand,
           build: function () {      // one host per build (a dashboard refresh builds again); the pull paints the latest one
             modalHost = el(doc, "div", "bd-modal");
-            paint(view && view.model());
+            paint(bus.model, bus.failed);
             return modalHost;
           }
         });
-        if (view) unwatch = view.watch(function (m) {
-          if (modalHost && doc.body.contains(modalHost)) paint(m);
-          else if (unwatch) { unwatch(); unwatch = null; }
+        // subscribed to the page's bus, not to a view: a view stopped and remounted (the tab hidden and back) leaves this
+        // subscription standing. It ends when the modal is gone (seen on the next notice).
+        var mine = busWatch(bus, function (m, failed) {
+          if (modalHost && doc.body.contains(modalHost)) paint(m, failed);
+          else mine();
         });
+        unwatch = mine;
       });
       ph.appendChild(expand);
     }
     function sync() {
       var want = !!token() && doc.body.dataset.mode === "board" && doc.visibilityState !== "hidden";
       section.hidden = !token();
+      if (!token() && !bus.failed) busFail(bus);       // no token: what was read is not the operator's to see; an open modal says so
       if (want && !view) {
         host.replaceChildren();
         var T = root.LevainCockpitTransport;
-        view = mount(host, { headers: function () { return T ? T.headers() : {}; } });
+        view = mount(host, { bus: bus, headers: function () { return T ? T.headers() : {}; } });
       } else if (!want && view) { view.stop(); view = null; }
     }
     new root.MutationObserver(sync).observe(doc.body, { attributes: true, attributeFilter: ["data-mode"] });

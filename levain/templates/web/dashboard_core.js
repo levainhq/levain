@@ -7090,7 +7090,9 @@
     // a Needs-you card keeps its place (and any words typed into it) while the item still waits; it closes when the item is answered
     if (modalCustom) {
       if (modalCustom.page) return;   // an agent page is not tied to a waiting item
-      if (modalCustom.live) { buildModal(null); return; }   // a live view repaints from its own source and stays open
+      // a live view repaints from its own source and stays open. buildModal on an open modal is a repaint only: it keeps the one overlay (and
+      // its one keydown listener), the scroll and the focus, and swaps the body for the `build` the caller returns
+      if (modalCustom.live) { buildModal(null); return; }
       if (!needsItems(((currentView && currentView.extra_panels || {}).decisions || {}).lines).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
       return;
     }
