@@ -28,7 +28,7 @@ from levain.consent.queue import authority_source
 from levain.consent.sign import Signer, passkey_key_source
 from levain.dispatch.jobs import DB_NAME, JobStore
 from tests.test_cockpit_sign_routes import _call, _serving
-from tests.test_dispatch_phone import SoftPasskey, _b64u, file_job, repo  # noqa: F401  (repo is a fixture)
+from tests.test_dispatch_phone import SoftPasskey, _b64u, file_job, lwp, recommended, repo  # noqa: F401  (fixtures)
 from tests.test_phone_server import _enrol
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
@@ -81,6 +81,13 @@ def _state(world: Any, job_id: str) -> str:
     return JobStore(world["qdir"]).get(job_id).state
 
 
+def _v(url: str, job_id: str) -> str:
+    """The version the sheet's read shows for ``job_id`` now: the ``request_sha256`` its challenge names."""
+    status, got = _call(url, f"/cockpit/dispatch/{job_id}/sheet.json")
+    assert status == 200, got
+    return got["request"]["sha256"]
+
+
 def test_the_listing_is_empty_and_makes_no_store_then_names_a_job_with_what_a_passkey_may_do(world, tmp_path) -> None:
     """Ported: test_phone_dispatch.test_the_listing_carries_the_three_dispatch_keys_and_makes_no_store."""
     key = world["phone"]
@@ -110,7 +117,7 @@ def test_a_passkey_signs_and_cancels_over_http_and_a_replay_is_409(world, tmp_pa
     key = world["phone"]
     with _serve(world, tmp_path) as (url, _httpd):
         base = f"/cockpit/dispatch/{job.id}"
-        status, c = _call(url, base + "/challenge", {"signer_fp": key.fp})
+        status, c = _call(url, base + "/challenge", {"signer_fp": key.fp, "request_sha256": _v(url, job.id)})
         assert status == 200 and c["payload"]["job_id"] == job.id
         assert c["rp_id"] == RP and c["line"].startswith("{") and job.id in c["line"]      # the exact text signed
         answer = {"payload": c["payload"], **key.assertion(c["challenge"], PAGE)}
@@ -118,7 +125,8 @@ def test_a_passkey_signs_and_cancels_over_http_and_a_replay_is_409(world, tmp_pa
         assert (status, done["state"]) == (200, "signed"), done
         status, again = _call(url, base + "/answer", answer)
         assert (status, again["error"]) == (409, "conflict")
-        status, cc = _call(url, base + "/cancel-challenge", {"signer_fp": key.fp, "reason": "no"})
+        status, cc = _call(url, base + "/cancel-challenge", {"signer_fp": key.fp, "reason": "no",
+                                                             "request_sha256": _v(url, job.id)})
         assert status == 200 and cc["payload"]["reason"] == "no" and "cancel" in cc["line"]
         status, done = _call(url, base + "/cancel", {"payload": cc["payload"], **key.assertion(cc["challenge"], PAGE)})
         assert (status, done["state"]) == (200, "cancelled"), done
@@ -146,7 +154,7 @@ def test_the_token_opens_the_route_and_never_signs(world, tmp_path) -> None:
         assert _call(url, base + "/sheet.json", sfs="cross-site")[0] == 403
         assert _call(url, "/cockpit/dispatch.json", token=None)[0] == 403
         # the run token with a payload the server issued, and no assertion the passkey made: nothing is signed
-        c = _call(url, base + "/challenge", {"signer_fp": key.fp})[1]
+        c = _call(url, base + "/challenge", {"signer_fp": key.fp, "request_sha256": _v(url, job.id)})[1]
         forged = {"payload": c["payload"], "authenticator_data": "AAAA", "client_data_json": "AAAA", "signature": "AAAA"}
         assert _call(url, base + "/answer", forged)[0] == 422
         # an assertion over the challenge, made on another page origin, is refused too
@@ -164,7 +172,8 @@ def test_every_dispatch_route_is_503_unless_one_cockpit_is_named(world, tmp_path
     job = file_job(lone_world)
     signer = _signer(world, qdir=lone, keys=passkey_key_source(lone, RP))
     with _serve(world, tmp_path, signer=signer) as (url, _httpd):
-        status, body = _call(url, f"/cockpit/dispatch/{job.id}/challenge", {"signer_fp": world["phone"].fp})
+        status, body = _call(url, f"/cockpit/dispatch/{job.id}/challenge", {"signer_fp": world["phone"].fp,
+                                                                             "request_sha256": _v(url, job.id)})
         assert (status, body["error"]) == (503, "unavailable") and "names no cockpit" in body["message"], body
         (row,) = _call(url, "/cockpit/dispatch.json")[1]["requests"]
         assert row["signers"] == [] and "names no cockpit" in row["note"], row
@@ -185,8 +194,8 @@ def test_a_dispatch_signature_is_never_another_namespaces(world, tmp_path) -> No
     key = world["phone"]
     with _serve(world, tmp_path) as (url, _httpd):
         base = f"/cockpit/dispatch/{job.id}"
-        sc = _call(url, base + "/challenge", {"signer_fp": key.fp})[1]
-        cc = _call(url, base + "/cancel-challenge", {"signer_fp": key.fp, "reason": ""})[1]
+        sc = _call(url, base + "/challenge", {"signer_fp": key.fp, "request_sha256": _v(url, job.id)})[1]
+        cc = _call(url, base + "/cancel-challenge", {"signer_fp": key.fp, "reason": "", "request_sha256": _v(url, job.id)})[1]
         status, out = _call(url, base + "/cancel", {"payload": cc["payload"], **key.assertion(sc["challenge"], PAGE)})
         assert status == 422, out
         status, out = _call(url, base + "/answer", {"payload": sc["payload"], **key.assertion(cc["challenge"], PAGE)})
@@ -235,7 +244,7 @@ def test_the_authorise_routes_are_served_behind_the_same_gates(world, tmp_path) 
         base = f"/cockpit/dispatch/{job.id}"
         assert _call(url, base + "/authorise-challenge", {"signer_fp": key.fp}, token=None)[0] == 403
         assert _call(url, base + "/authorise", {"payload": {}}, sfs="cross-site")[0] == 403
-        status, body = _call(url, base + "/authorise-challenge", {"signer_fp": key.fp})
+        status, body = _call(url, base + "/authorise-challenge", {"signer_fp": key.fp, "request_sha256": _v(url, job.id)})
         assert (status, body["error"]) == (409, "conflict") and "from the laptop" in body["message"], body
         status, body = _call(url, base + "/authorise", {"payload": {}})
         assert (status, body["error"]) == (400, "bad_request")
@@ -416,9 +425,191 @@ def test_a_record_that_cannot_be_read_is_a_row_with_nothing_offered(world, tmp_p
 def test_a_challenge_reply_carries_the_line_for_cancel_as_for_sign(world, tmp_path) -> None:
     job = file_job(world)
     with _serve(world, tmp_path) as (url, _httpd):
-        c = _call(url, f"/cockpit/dispatch/{job.id}/cancel-challenge", {"signer_fp": world["phone"].fp, "reason": "x"})[1]
+        c = _call(url, f"/cockpit/dispatch/{job.id}/cancel-challenge", {"signer_fp": world["phone"].fp, "reason": "x",
+                                                                         "request_sha256": _v(url, job.id)})[1]
         assert c["challenge"] and _b64u(c["line"].encode())       # a line is text
         # a reason is one line of plain text, as the phone port refuses it
         status, body = _call(url, f"/cockpit/dispatch/{job.id}/cancel-challenge",
-                             {"signer_fp": world["phone"].fp, "reason": "a\nb"})
+                             {"signer_fp": world["phone"].fp, "reason": "a\nb", "request_sha256": _v(url, job.id)})
         assert status == 422 and body["error"] == "sign_refused", body
+
+
+# --- fix 1029-2 (complement, L3 of 62b45ef6..680fee95): the dispatch challenge names the version the sheet showed ------
+
+def _amended(httpd: Any, job: Any, monkeypatch: Any, digest: str = "d" * 64) -> None:
+    """The job read as amended (its contract's digest another) from here on: the phone's record, the digest swapped. The
+    store has no amend verb; the version the sheet binds is over the record, so this is the change it must catch."""
+    phone = httpd.dispatch_sheet.phone
+    real = phone.record
+
+    def record(j: Any, now: str, signers: "list[str]", note: str) -> "dict[str, Any]":
+        rec = real(j, now, signers, note)
+        if j.id == job.id:
+            rec["digest"] = digest
+        return rec
+
+    monkeypatch.setattr(phone, "record", record)
+
+
+def test_a_job_amended_between_the_sheet_read_and_the_tap_is_refused_at_challenge_time(world, tmp_path, monkeypatch) -> None:
+    """Reproduced red before the fix: the sheet posted only {signer_fp}, so a job amended after the sheet's read was
+    challenged in its NEW state and the passkey signed a change set the operator never read. Now the challenge names the
+    row's sha256 the sheet showed and a job that changed since is the plain sign route's 409, for every act."""
+    job = file_job(world)
+    key = world["phone"]
+    with _serve(world, tmp_path) as (url, httpd):
+        base = f"/cockpit/dispatch/{job.id}"
+        shown = _v(url, job.id)
+        _amended(httpd, job, monkeypatch)
+        assert _v(url, job.id) != shown
+        for action, body in (("challenge", {"signer_fp": key.fp}), ("cancel-challenge", {"signer_fp": key.fp, "reason": ""}),
+                             ("authorise-challenge", {"signer_fp": key.fp})):
+            status, out = _call(url, f"{base}/{action}", {**body, "request_sha256": shown})
+            assert (status, out["error"]) == (409, "conflict"), (action, out)
+            assert "changed since it was shown" in out["message"] and "reload" in out["message"], (action, out)
+            assert "challenge" not in out and "payload" not in out, (action, out)
+        assert "NOT cancelled" in _call(url, f"{base}/cancel-challenge",
+                                        {"signer_fp": key.fp, "reason": "", "request_sha256": shown})[1]["message"]
+        # read again, the sheet's new version is challenged
+        status, c = _call(url, base + "/challenge", {"signer_fp": key.fp, "request_sha256": _v(url, job.id)})
+        assert status == 200 and c["payload"]["job_id"] == job.id, c
+    assert _state(world, job.id) == "filed"
+
+
+def test_a_job_that_moved_on_in_the_store_is_refused_on_the_old_version(world, tmp_path) -> None:
+    """The real store: the job is signed after the sheet read it, so a cancel on the filed version is refused (its
+    version moved with its state and lease); on the version read now it is challenged."""
+    job = file_job(world)
+    key = world["phone"]
+    with _serve(world, tmp_path) as (url, _httpd):
+        base = f"/cockpit/dispatch/{job.id}"
+        filed = _v(url, job.id)
+        c = _call(url, base + "/challenge", {"signer_fp": key.fp, "request_sha256": filed})[1]
+        assert _call(url, base + "/answer", {"payload": c["payload"], **key.assertion(c["challenge"], PAGE)})[0] == 200
+        status, out = _call(url, base + "/cancel-challenge", {"signer_fp": key.fp, "reason": "", "request_sha256": filed})
+        assert (status, out["error"]) == (409, "conflict") and "changed since it was shown" in out["message"], out
+        status, out = _call(url, base + "/cancel-challenge", {"signer_fp": key.fp, "reason": "",
+                                                              "request_sha256": _v(url, job.id)})
+        assert status == 200 and out["payload"]["reason"] == "", out
+    assert _state(world, job.id) == "signed"
+
+
+def test_a_challenge_that_names_no_version_is_refused(world, tmp_path) -> None:
+    """As a plain sign request's: a challenge with no listed version (or an empty one, or not a string) is a 409."""
+    job = file_job(world)
+    key = world["phone"]
+    with _serve(world, tmp_path) as (url, _httpd):
+        base = f"/cockpit/dispatch/{job.id}"
+        for extra in ({}, {"request_sha256": ""}, {"request_sha256": 7}):
+            status, out = _call(url, base + "/challenge", {"signer_fp": key.fp, **extra})
+            assert (status, out["error"]) == (409, "conflict") and "names no listed version" in out["message"], out
+        # the key is the cockpit's, never the phone port's body: a stray key beside it is still the phone's 400
+        status, out = _call(url, base + "/challenge", {"signer_fp": key.fp, "request_sha256": _v(url, job.id), "x": 1})
+        assert (status, out["error"]) == (400, "bad_request"), out
+    assert _state(world, job.id) == "filed"
+
+
+def test_a_job_amended_while_its_challenge_is_built_is_refused(world, tmp_path, monkeypatch) -> None:
+    """The version is compared again after the payload is built: an amendment that lands between the first compare and
+    the build is refused, and the challenge built is never handed out."""
+    job = file_job(world)
+    key = world["phone"]
+    with _serve(world, tmp_path) as (url, httpd):
+        sheet = httpd.dispatch_sheet
+        real = sheet.phone.step
+
+        def step(job_id: str, action: str, req: Any) -> Any:
+            out = real(job_id, action, req)
+            _amended(httpd, job, monkeypatch)          # the job changes while this challenge was built
+            return out
+
+        monkeypatch.setattr(sheet.phone, "step", step)
+        status, out = _call(url, f"/cockpit/dispatch/{job.id}/challenge",
+                            {"signer_fp": key.fp, "request_sha256": _v(url, job.id)})
+        assert (status, out["error"]) == (409, "conflict") and "changed since it was shown" in out["message"], out
+        assert "challenge" not in out, out
+    assert _state(world, job.id) == "filed"
+
+
+# --- fix 1029-2 L3 round 1 (deepseek, complement on 2be30145) ---------------------------------------------------------
+
+def _no_phone_step(httpd: Any, monkeypatch: Any) -> "list[Any]":
+    """Every call the phone port's step receives from here on (none is the expected count)."""
+    calls: "list[Any]" = []
+    real = httpd.dispatch_sheet.phone.step
+    monkeypatch.setattr(httpd.dispatch_sheet.phone, "step", lambda *a: calls.append(a) or real(*a))
+    return calls
+
+
+def test_a_challenge_body_that_is_not_an_object_is_the_no_version_409_and_asks_the_phone_nothing(world, tmp_path,
+                                                                                              monkeypatch) -> None:
+    """deepseek: the version gate ran only for a dict body, so a list or a string went straight to the phone port.
+    Reproduced red: a list body was the phone's 400, the gate never ran."""
+    job = file_job(world)
+    with _serve(world, tmp_path) as (url, httpd):
+        calls = _no_phone_step(httpd, monkeypatch)
+        for action in ("challenge", "cancel-challenge", "authorise-challenge"):
+            for body in ([world["phone"].fp], "x", 7):
+                status, out = _call(url, f"/cockpit/dispatch/{job.id}/{action}", body)
+                assert (status, out["error"]) == (409, "conflict"), (action, body, out)
+                assert "names no listed version" in out["message"], (action, body, out)
+        for req in (None, [1], "x"):
+            from levain.dispatch.phone import DispatchRefused
+
+            with pytest.raises(DispatchRefused) as exc:
+                httpd.dispatch_sheet.step(job.id, "challenge", req)
+            assert exc.value.status == 409 and "names no listed version" in exc.value.message
+    assert calls == [] and _state(world, job.id) == "filed"
+
+
+def test_a_store_fault_at_the_version_compare_names_its_type_never_its_text(world, tmp_path, monkeypatch) -> None:
+    """deepseek: the 503 carried str(exc), which names this machine's paths and tables. Reproduced red: the path was in
+    the message."""
+    job = file_job(world)
+    with _serve(world, tmp_path) as (url, httpd):
+        def broken(_job_id: str) -> Any:
+            raise sqlite3.OperationalError("/Users/someone/.levain/consent/dispatch.db: no such table: jobs")
+
+        monkeypatch.setattr(httpd.dispatch_sheet, "row", broken)
+        calls = _no_phone_step(httpd, monkeypatch)
+        status, out = _call(url, f"/cockpit/dispatch/{job.id}/challenge",
+                            {"signer_fp": world["phone"].fp, "request_sha256": "a" * 64})
+    assert (status, out["error"]) == (503, "unavailable"), out
+    assert "OperationalError" in out["message"] and "nothing was signed" in out["message"], out
+    assert "/Users" not in out["message"] and "dispatch.db" not in out["message"] and "jobs" not in out["message"], out
+    assert calls == []
+
+
+def test_an_unreadable_row_is_never_challenged_even_on_its_own_version(world, tmp_path, monkeypatch) -> None:
+    """complement LOW 4: an unreadable row carries a version of its own; a challenge naming it passed the compare and the
+    phone port built a sign challenge for a job the sheet could not show. Reproduced red: 200 and a challenge."""
+    job = file_job(world)
+    with _serve(world, tmp_path) as (url, httpd):
+        def broken(*_a: Any, **_k: Any) -> Any:
+            raise KeyError("template")
+
+        monkeypatch.setattr(httpd.dispatch_sheet.phone, "record", broken)
+        shown = _v(url, job.id)
+        for action, body in (("challenge", {}), ("cancel-challenge", {"reason": ""})):
+            status, out = _call(url, f"/cockpit/dispatch/{job.id}/{action}",
+                                {"signer_fp": world["phone"].fp, "request_sha256": shown, **body})
+            assert (status, out["error"]) == (409, "conflict"), (action, out)
+            assert "could not be read" in out["message"] and "challenge" not in out, (action, out)
+    assert _state(world, job.id) == "filed"
+
+
+def test_a_run_pins_its_staged_change_set(lwp) -> None:  # noqa: F811
+    """complement LOW 3, verified: the version binds the card's run, not its change list, because the change list is the
+    diff of the run record's base and staged commit and a run record is written once. The store refuses both ways a
+    run's change set could move under the same run number."""
+    job = recommended(lwp, {"src/a.py": b"a = 2\n"}, onto="main")
+    assert lwp.dp.pending()[0][0]["authorise"]["run"] == 0
+    conn = sqlite3.connect(lwp.jstore.directory / DB_NAME, isolation_level=None)
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="written once"):
+            conn.execute("UPDATE run_records SET record = record || ' ' WHERE job_id = ? AND run = 0", (job.id,))
+        with pytest.raises(sqlite3.DatabaseError, match="never replaced"):
+            conn.execute("INSERT INTO run_records SELECT job_id, run, record, digest, envelope_digest, at, ticket "
+                         "FROM run_records WHERE job_id = ? AND run = 0", (job.id,))
+    finally:
+        conn.close()

@@ -28,7 +28,10 @@
 // same row shape; its options sign, cancel and authorise, each with the `signers` that may do THAT act), and its ceremony
 // the phone port's own by option: sign is .../challenge then .../answer ({signer_fp}), cancel is .../cancel-challenge then
 // .../cancel ({signer_fp, reason}, the reason typed in the box the row asks for), authorise is .../authorise-challenge then
-// .../authorise ({signer_fp}); each answer is the challenge's `payload` beside the assertion, nothing else.
+// .../authorise ({signer_fp}); each answer is the challenge's `payload` beside the assertion, nothing else. Each challenge
+// also carries `request_sha256`, the row's `sha256` this sheet showed (as a plain sign request's does): the cockpit refuses
+// it with a 409 when the job changed since, and the sheet then reads the job again and draws it afresh. Only the acts
+// DISPATCH_STEPS names are offered; any other key the row lists is not drawn and signs nothing.
 //
 // A coordinator drop (OS-2) is the same sheet at /sign/drop: its read is GET /cockpit/coord/drops.json (the phone's coord_*
 // listing keys), and it composes the drop's words and, optionally, an envelope. A plain drop is POST /cockpit/coord/drop. An
@@ -69,6 +72,7 @@
   // the dispatch ceremony's two routes by the act picked (the phone's own names)
   const DISPATCH_STEPS = { sign: ["challenge", "answer"], cancel: ["cancel-challenge", "cancel"],
                            authorise: ["authorise-challenge", "authorise"] };
+  const dispatchAct = (key) => typeof key === "string" && Object.prototype.hasOwnProperty.call(DISPATCH_STEPS, key);
   const pm = /(?:^#|&)choice=([^&]*)(?:&|$)/.exec(location.hash);
   const vm = /(?:^#|&)v=([0-9a-f]{16})(?:&|$)/.exec(location.hash);
   let pick = "";
@@ -138,6 +142,8 @@
                                         (c) => c.charCodeAt(0));
   // the server's words without their closing stop: the caller's sentence supplies its own punctuation
   const why = (r) => ((r.body && typeof r.body.message === "string" && r.body.message.replace(/[.\s]+$/, "")) || ("refused (HTTP " + r.status + ")"));
+  // a refusal the cockpit made because the item changed since this sheet read it (DispatchSheet.shown's words)
+  const staleReply = (r) => !!(r.body && typeof r.body.message === "string" && /changed since it was shown/.test(r.body.message));
   const usable = window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
     && !!(navigator.credentials && navigator.credentials.get);
 
@@ -263,11 +269,26 @@
     $("sheet-body").appendChild(card);
   }
   // the job read again and drawn afresh (an authorise whose challenge was not the card shown): its version, its card
+  // The status line (#sheet-note) is outside #sheet-body, so the "Not signed" that led here stays; a read or a draw that
+  // fails says so beside it and locks every control left in the actions (the old ones were for the version that changed;
+  // a draw that threw part way may have left new ones)
   function redraw() {
-    return readRequest().then((got) => {
+    let before = "";
+    // from a resolved promise, so a read (or a missing part of the page) that throws at once is this catch's too, never
+    // an unhandled one; the catch itself reads no part it has not checked is there
+    return Promise.resolve().then(() => {
+      const n = $("sheet-note");
+      before = n ? n.textContent : "";
+    }).then(readRequest).then((got) => {
       $("sheet-body").replaceChildren();
       $("sheet-actions").replaceChildren();
       draw(got);
+    }).catch((e) => {
+      const acts = $("sheet-actions");
+      if (acts) for (const c of acts.querySelectorAll("button, input")) c.disabled = true;
+      if ($("sheet-note")) say((before ? before + " " : "") + "The " + noun + " could not be drawn again ("
+          + ((e && e.name) || "error") + "): reload this page before signing.", "bad");
+      tell("reload");
     });
   }
 
@@ -348,7 +369,8 @@
       return b;
     };
     const lineOf = (o) => (o && typeof o.line === "string" ? o.line : "");
-    const options = Array.isArray(r.options) ? r.options : [];
+    // a dispatch row's options are only the acts this sheet has routes for (DISPATCH_STEPS): any other key is not drawn
+    const options = (Array.isArray(r.options) ? r.options : []).filter((o) => !dispatch || (o && dispatchAct(o.key)));
     // a dispatch cancel carries a reason (one line, optional) typed in the box the row asks for; it is frozen as typed
     // (trimmed) from the click on, like a write-in, and is the `words` of the run
     let reasonBox = null;
@@ -514,18 +536,28 @@
     // challenge returned beside the assertion; an undecided one is ruled (its own pair of routes), never answered
     // a dispatch job takes the phone port's own: the pair of routes of the act picked (sign, cancel, authorise), {signer_fp}
     // (a cancel's also {reason}), then the payload beside the assertion
-    const steps = dispatch ? (DISPATCH_STEPS[choice] || DISPATCH_STEPS.sign)
+    const unsigned = (m) => { say(/nothing was signed/.test(m) ? m : m + "; nothing was signed.", "bad"); return "unsigned"; };
+    // an act with no routes here signs nothing (never another act's routes in its place)
+    if (dispatch && !dispatchAct(choice)) return Promise.resolve(unsigned("Not signed: (" + String(choice).slice(0, 24) + ") is not an act this sheet signs"));
+    const steps = dispatch ? DISPATCH_STEPS[choice]
       : !consent ? ["challenge", "answer"] : r.mode === "rule" ? ["rule-challenge", "rule"] : ["challenge", "answer"];
-    const body = dispatch ? { signer_fp: fp } : consent ? { decision: choice, signer_fp: fp } : { signer_fp: fp, request_sha256: r.sha256 };
+    // a dispatch challenge, like a plain sign request's, names the version this sheet showed: the cockpit refuses a job
+    // that changed since (409), so no passkey is asked for a change set the operator did not read
+    const body = dispatch || !consent ? { signer_fp: fp, request_sha256: r.sha256 } : { decision: choice, signer_fp: fp };
     if (dispatch && choice === "cancel") body.reason = typeof words === "string" ? words : "";
     if (!consent && !dispatch && choice !== undefined) body.choice = choice;
     if (!consent && !dispatch && words !== undefined) body.write_in = words;
     let sent = false, line = "";
-    const unsigned = (m) => { say(/nothing was signed/.test(m) ? m : m + "; nothing was signed.", "bad"); return "unsigned"; };
     say(choice !== undefined ? "Asking for the challenge for (" + choice + ")…" : "Asking for the challenge…");
     flight = true;        // from the request for the challenge: the signer picker before it posts nothing
     return call(base + steps[0], body).then((c) => {
-      if (!c.ok) return unsigned("Not signed: " + why(c));
+      if (!c.ok) {
+        unsigned("Not signed: " + why(c));
+        // a dispatch job the cockpit says changed or moved on since it was read (its 409 in those words): nothing was
+        // signed; it is read and drawn again. Any other refusal, a 409 included (an authorise that needs the laptop), is
+        // a plain "not signed" in the server's words, the sheet left as it is
+        return dispatch && c.status === 409 && staleReply(c) ? "changed" : "unsigned";
+      }
       if (!decodable(c.body.challenge)) return unsigned("The cockpit sent a malformed challenge");
       // an authorise lands the run and branch the SERVER builds now: before any passkey is asked, the challenge's payload
       // must be the run, branch and tier this sheet showed; a recommendation that moved since is never signed from here
