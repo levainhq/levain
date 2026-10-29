@@ -4633,6 +4633,17 @@
   // textContent, never as HTML.
   const bandNumOf = new Map();    // question n -> band number, from the last band read: a question row leads with it
   let bandDraft = "";             // the shorthand typed and not sent: a redraw gives it back
+  let bandKeep = "";              // what the last send said about refusals and sheets: a redraw gives it back until the next send
+  // the typed words minus the pieces of the items that were recorded (a piece runs from its number to the next number)
+  function bandUnrecorded(text, recorded) {
+    const done = new Set(recorded.map((l) => (/^\d+/.exec(String(l)) || [""])[0]).filter(Boolean));
+    let cur = null;
+    return String(text).split(/[\s,;]+/).filter((tok) => {
+      const m = /^\d+/.exec(tok);
+      if (m) cur = m[0];
+      return !(cur !== null && done.has(cur));
+    }).join(" ");
+  }
   let bandGot = null;             // the last read, shared for a moment by the slots one render draws (the server takes one at a time)
   function bandFetch(fresh) {
     if (!fresh && bandGot && Date.now() - bandGot.at < 2000) return bandGot.p;
@@ -4669,9 +4680,9 @@
     bandNumOf.clear();
     for (const it of items) if (it && Number.isInteger(it.question)) bandNumOf.set(it.question, it.n);
     const kids = [];
-    if (items.length === 0 && !say && !b.note) { slot.replaceChildren(); applyBandNumbers(); return; }
+    if (items.length === 0 && !say && !bandKeep && !b.note) { slot.replaceChildren(); applyBandNumbers(); return; }
     kids.push(el("div", "ext-grouphead", "needs you · the band"));
-    const msg = el("span", "edit-msg band-msg", say || "");
+    const msg = el("span", "edit-msg band-msg", say || bandKeep);
     const controls = [];
     const box = el("input", "band-box");
     box.type = "text"; box.maxLength = 400; box.value = bandDraft; box.autocomplete = "off";
@@ -4685,11 +4696,30 @@
       if (!text) return;
       if (!canAnswer) { msg.textContent = "this page cannot answer the band now"; return; }
       for (const c of controls) c.disabled = true;
-      bandGot = null;     // the board redraws on a landed answer and reads the band again: never the look from before it
+      bandKeep = "";
+      bandGot = null;    // the board redraws on a landed answer and reads the band again: never the look from before it
       let res;
       try { res = await answerBand(text, b.store_id, b.view_id); } catch (e) { res = { ok: false, message: "the answer could not be sent" }; }
-      if (res && res.ok) { bandDraft = ""; box.value = ""; return; }   // the board re-reads and redraws the band
-      for (const c of controls) c.disabled = false;
+      for (const c of controls) c.disabled = false;     // never left waiting on a redraw that may not come
+      if (res && res.ok) {
+        // the board has re-read and redrawn the band by now (the elements above may be gone): say what the reply says on
+        // whatever is on the page, and keep the words that were not recorded
+        const d = (res.data && typeof res.data === "object") ? res.data : {};
+        const rec = Array.isArray(d.recorded) ? d.recorded : [];
+        const refused = Array.isArray(d.refused) ? d.refused : [];
+        const sheets = Array.isArray(d.sheets) ? d.sheets : [];
+        bandDraft = rec.length && (refused.length || sheets.length) ? bandUnrecorded(text, rec) : (rec.length ? "" : text);
+        bandKeep = (rec.length ? "recorded: " + rec.join(", ") : "nothing recorded")
+          + (refused.length ? " · refused: " + refused.join("; ") : "")
+          + (sheets.length ? " · " + sheets.map((s) => (/^\s*(\d+)/.exec(String(s)) || [0, "?"])[1]).join(", ")
+            + " needs your signature: sign it in Decisions" : "");
+        const live = document.querySelector("[data-band-slot] .band-msg");
+        const liveBox = document.querySelector("[data-band-slot] .band-box");
+        if (!refused.length && !sheets.length) bandKeep = "";
+        if (live) live.textContent = bandKeep;
+        if (liveBox) liveBox.value = bandDraft;
+        return;
+      }
       if (res && res.error === "stale_band") {
         // another view of the band was shown since this one: nothing was recorded; the list is read again and drawn fresh
         bandDraft = box.value;

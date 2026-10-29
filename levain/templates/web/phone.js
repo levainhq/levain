@@ -419,19 +419,34 @@
           // a different band was shown since this one: nothing was recorded; the list is redrawn from a fresh look
           bandDraft = box.value;
           box.blur();
+          buttons.forEach((b) => { b.disabled = false; });    // never left waiting on a redraw that may fail
+          box.disabled = false;
           say("the band changed since it was shown to you, so nothing was recorded. It is redrawn: check the numbers and send again.", "bad");
           return;
         }
         buttons.forEach((b) => { b.disabled = false; });
         box.disabled = false;
         if (!a.ok) return say("not answered: " + why(a), "bad");
-        bandDraft = ""; box.value = "";
         const b = a.body || {};
         const rec = Array.isArray(b.recorded) ? b.recorded : [];
         const refused = Array.isArray(b.refused) ? b.refused : [];
+        const sheets = Array.isArray(b.sheets) ? b.sheets : [];
+        // what was not recorded stays in the box (a piece runs from its number to the next number)
+        const done = new Set(rec.map((l) => (/^\d+/.exec(String(l)) || [""])[0]).filter(Boolean));
+        let cur = null;
+        bandDraft = (rec.length ? String(text).split(/[\s,;]+/).filter((tok) => {
+          const m = /^\d+/.exec(tok);
+          if (m) cur = m[0];
+          return !(cur !== null && done.has(cur));
+        }).join(" ") : text);
+        if (!refused.length && !sheets.length) bandDraft = "";
+        box.value = bandDraft;
         last = "answered the band" + (rec.length ? " (" + rec.length + ")" : "");
+        const bad = refused.length > 0 || sheets.length > 0;
         say((rec.length ? "recorded: " + rec.join(", ") : "nothing recorded")
-          + (refused.length ? " · refused: " + refused.join("; ") : ""), refused.length ? "bad" : "ok");
+          + (refused.length ? " · refused: " + refused.join("; ") : "")
+          + (sheets.length ? " · " + sheets.map((s) => (/^\s*(\d+)/.exec(String(s)) || [0, "?"])[1]).join(", ")
+            + " needs your signature: sign it on the phone's sign sheet" : ""), bad ? "bad" : "ok");
       }).catch((e) => { buttons.forEach((b) => { b.disabled = false; }); box.disabled = false; say("the page failed (" + ((e && e.name) || "error") + "); answer again, and if it was already recorded the page says so", "bad"); })
         .finally(() => { busy--; setTimeout(load, 300); });
     };

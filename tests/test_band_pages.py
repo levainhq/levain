@@ -259,3 +259,159 @@ def test_the_old_question_card_still_answers_an_item_with_no_band_number(tmp_pat
         ])
     assert out["values"][-1] is not None
     assert _answer(store, q1.n).value == "none"
+
+
+# --- L3 r2 fix round: a success reply that carries refusals or sheets is not read as plain success -------------------------
+
+def _authority(store: QuestionStore):
+    """A question that leads to a push is an authority item: its shorthand opens the existing sheet, records nothing."""
+    from levain.consent.questions import Link
+    return store.file(agent="claude_code", agent_session_id="sess-1", what="Push it?", options=[("go", "Push"), ("no", "No")],
+                      rec="go", blocks="x", cwd="/tmp/proj", link=Link("go", "push", "req-1", "qid-1"))
+
+
+TYPE_AND_SEND = ("(() => { const b = document.querySelector('%s'); b.value = '%s'; b.dispatchEvent(new Event('input')); "
+                 "document.querySelector('%s').click(); return 1; })()")
+# the page's own re-reads fail from here on (the verb post still works): a send that lands must not wait for a redraw
+BLOCK_READS = ("(() => { const f = window.fetch; window.fetch = (u, ...r) => (/\\/cockpit\\/(?!verb)|consent\\.json/.test(String(u && u.url || u)) "
+               "? Promise.reject(new TypeError('blocked')) : f(u, ...r)); return 1; })()")
+
+
+@needs_browser
+def test_a_cockpit_mixed_answer_names_the_authority_item_and_keeps_its_words(tmp_path: Path, lh) -> None:
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q1, q2 = _file(store, "Which retry policy?"), _authority(store)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        out = _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
+            DESKTOP,
+            {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
+            {"eval": HISTORY},
+            {"until": f"{BAND_ROWS} === 2 && 1", "ms": 30000},
+            {"eval": TYPE_AND_SEND % (".band-box", "1a 2a", ".band-send")},
+            {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
+            {"eval": "new Promise(r => setTimeout(r, 1500)).then(() => 1)"},
+            {"eval": "(document.querySelector('.band-msg') || {}).textContent"},
+            {"eval": "document.querySelector('.band-box').value"},
+        ])
+    v = out["values"]
+    assert _answer(store, q1.n).value == "fix" and _answer(store, q2.n) is None
+    assert "recorded: 1a" in v[-2] and "2 needs your signature" in v[-2] and "Decisions" in v[-2], v   # names the item
+    assert "2a" in v[-1] and "1a" not in v[-1], v                    # the unrecorded part stays in the box
+
+
+@needs_browser
+def test_a_cockpit_sheets_only_answer_does_not_read_as_success_and_frees_the_controls(tmp_path: Path, lh) -> None:
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    _authority(store)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        out = _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
+            DESKTOP,
+            {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
+            {"eval": HISTORY},
+            {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
+            {"eval": BLOCK_READS},
+            {"eval": TYPE_AND_SEND % (".band-box", "1a", ".band-send")},
+            {"eval": "new Promise(r => setTimeout(r, 2500)).then(() => 1)"},
+            {"eval": "(document.querySelector('.band-msg') || {}).textContent"},
+            {"eval": "document.querySelector('.band-box').value"},
+            {"eval": "document.querySelector('.band-box').disabled || document.querySelector('.band-send').disabled"},
+        ])
+    v = out["values"]
+    assert "nothing recorded" in v[-3] and "1 needs your signature" in v[-3], v
+    assert v[-2] == "1a", v
+    assert v[-1] is False, v                                         # re-enabled without waiting on a redraw that failed
+
+
+@needs_browser
+def test_a_phone_mixed_answer_names_the_authority_item_and_keeps_its_words(tmp_path: Path, lh) -> None:
+    store = QuestionStore(lh)
+    q1, q2 = _file(store, "Which retry policy?"), _authority(store)
+    with _phone(lh) as url:
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            PHONE,
+            {"until": PHONE_READY},
+            {"until": f"{PHONE_ROWS} === 2 && 1", "ms": 30000},
+            {"eval": TYPE_AND_SEND % (".band-box", "1a 2a", "[data-band] .band-send")},
+            {"until": "/recorded/.test((document.querySelector('[data-band] .note') || {}).textContent || '') && 1", "ms": 30000},
+            {"eval": "new Promise(r => setTimeout(r, 1500)).then(() => 1)"},
+            {"eval": "(document.querySelector('[data-band] .note') || {}).textContent"},
+            {"eval": "document.querySelector('.band-box').value"},
+        ])
+    v = out["values"]
+    assert _answer(store, q1.n).value == "fix" and _answer(store, q2.n) is None
+    assert "recorded: 1a" in v[-2] and "2 needs your signature" in v[-2] and "sign sheet" in v[-2], v
+    assert "2a" in v[-1] and "1a" not in v[-1], v
+
+
+@needs_browser
+def test_a_phone_sheets_only_answer_does_not_read_as_success(tmp_path: Path, lh) -> None:
+    store = QuestionStore(lh)
+    _authority(store)
+    with _phone(lh) as url:
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            PHONE,
+            {"until": PHONE_READY},
+            {"until": f"{PHONE_ROWS} === 1 && 1", "ms": 30000},
+            {"eval": TYPE_AND_SEND % (".band-box", "1a", "[data-band] .band-send")},
+            {"until": "/nothing recorded/.test((document.querySelector('[data-band] .note') || {}).textContent || '') && 1", "ms": 30000},
+            {"eval": "(document.querySelector('[data-band] .note') || {}).textContent"},
+            {"eval": "document.querySelector('[data-band] .note').className"},
+            {"eval": "document.querySelector('.band-box').value"},
+        ])
+    v = out["values"]
+    assert "1 needs your signature" in v[-3], v
+    assert "ok" not in v[-2].split(), v                              # never the success style
+    assert v[-1] == "1a", v
+
+
+@needs_browser
+def test_a_phone_stale_answer_frees_the_controls_even_when_the_redraw_fails(tmp_path: Path, lh) -> None:
+    store = QuestionStore(lh)
+    _file(store, "Which retry policy?")
+    with _phone(lh) as url:
+        def other_tab() -> None:
+            import time
+            time.sleep(7)
+            _file(store, "A newer question arrives?")
+            band_view.band_payload(store, "phone:run")
+        t = threading.Thread(target=other_tab, daemon=True)
+        t.start()
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            PHONE,
+            {"until": PHONE_READY},
+            {"until": f"{PHONE_ROWS} === 1 && 1", "ms": 30000},
+            {"eval": "(() => { const b = document.querySelector('.band-box'); b.focus(); b.value = '1a'; b.dispatchEvent(new Event('input')); return 1; })()"},
+            {"eval": "new Promise(r => setTimeout(r, 9500)).then(() => 1)"},
+            {"eval": BLOCK_READS},
+            {"eval": "(document.querySelector('[data-band] .band-send').click(), 1)"},
+            {"until": "/changed since it was shown/.test((document.querySelector('[data-band] .note') || {}).textContent || '') && 1", "ms": 30000},
+            {"eval": "new Promise(r => setTimeout(r, 1500)).then(() => 1)"},
+            {"eval": "document.querySelector('.band-box').disabled || document.querySelector('[data-band] .band-send').disabled"},
+        ])
+        t.join(timeout=5)
+    assert out["values"][-1] is False, out["values"]
+
+
+@needs_browser
+def test_a_cockpit_store_fault_shows_a_fixed_line_never_the_raw_error(tmp_path: Path, lh, monkeypatch) -> None:
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    _file(store, "Which retry policy?")
+
+    def boom(*a, **k):
+        raise OSError("disk fault at /Users/secret/path/questions.db")
+    monkeypatch.setattr(band_view, "answer_text", boom)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        out = _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
+            DESKTOP,
+            {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
+            {"eval": HISTORY},
+            {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
+            {"eval": TYPE_AND_SEND % (".band-box", "1a", ".band-send")},
+            {"until": "(document.querySelector('.band-msg') || {}).textContent && 1", "ms": 30000},
+            {"eval": "document.querySelector('.band-msg').textContent"},
+        ])
+    msg = out["values"][-1]
+    assert "/Users/secret" not in msg and "disk fault" not in msg, msg

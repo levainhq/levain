@@ -473,8 +473,10 @@
       rereadLatched();   // a re-read that never discards an open form: it defers while one is dirty, and stays owed
       return { ok: false, error: code, message: text, status: r.status };
     }
-    // `detail` is the server's own words for why (a band answer's refusal names the item it refused)
-    return { ok: false, error: code, message: text, status: r.status, detail: typeof d.message === "string" ? d.message : "" };
+    // `detail` is the server's own words for why, only for the semantic refusal of a band answer (it names the item it
+    // refused); any other fault (a 503, a 5xx) shows the fixed line, never the server's raw text
+    return { ok: false, error: code, message: text, status: r.status,
+             detail: code === "answer_refused" && r.status === 422 && typeof d.message === "string" ? d.message : "" };
   }
 
   // One write per fingerprint at a time: a second identical submit while the first is still asking, firing or
