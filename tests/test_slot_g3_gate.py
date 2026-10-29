@@ -208,7 +208,8 @@ def test_claude_differ_refuses_identity_changed_with_the_credential_back_before_
 
 def _ans(status=200, body=None):
     body = {"account": {"uuid": UUID}} if body is None else body
-    return json.dumps({"status": status, "body": body if isinstance(body, str) else json.dumps(body)}).encode() + b"\n"
+    return json.dumps({"refresh": 200, "status": status,
+                       "body": body if isinstance(body, str) else json.dumps(body)}).encode() + b"\n"
 
 
 @pytest.mark.parametrize("answer", [

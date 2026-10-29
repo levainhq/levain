@@ -53,6 +53,7 @@ from levain import unshowable
 from levain.launch import child_env
 from levain.contracts import ContractError, canon
 from levain.slot import SUDO, Refused, layout
+from levain.slot import identity_child as IC
 from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import RENDER_FORMAT, parse_stdin
 from levain.slot.vendor_hosts import VENDOR_HOSTS, _hosts
@@ -633,6 +634,9 @@ def check_repo_layer(docs: Mapping[str, Any]) -> None:
 # --- the render blob's inputs (§5.3) ---------------------------------------------------------------------------------
 
 _AUTH_ROUTE = {"brokered": "brokered", "passthrough": "subscription_passthrough"}
+#: the host the Claude identity child's refresh goes to (:data:`levain.slot.identity_child.TOKEN_ORIGIN`)
+_TOKEN_HOST = IC.TOKEN_ORIGIN[1]
+_ROUTE_ID_SAID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}", re.ASCII)
 
 
 def read_base_map(path: Path, *, read: Callable[[Path], bytes] = Path.read_bytes) -> List[Mapping[str, Any]]:
@@ -1549,6 +1553,15 @@ class Supervisor:
                 self.say("start refused identity-unreachable, but root's record does not say so. "
                          "Nothing was launched.")
                 return
+            rid = self._route_without_token_host()
+            if rid is not None:
+                # L3 r1 (codex MED 3): an operator's own Claude passthrough route wins over the shipped one
+                # (vendor_routes._shipped_for); one without the token host denies every refresh, so a retry never works
+                self.say(f"could not reach Claude's sign-in server to check slot {self._slot_index}'s login: the base "
+                         f"map's Claude passthrough route {rid} does not name {_TOKEN_HOST}, which the login refresh "
+                         "needs. Nothing was launched, and the stored login is kept. Add that host to the route, then "
+                         "try again.")
+                return
             self.say(f"could not reach Claude's sign-in server to check slot {self._slot_index}'s login. Nothing was "
                      "launched, and the stored login is kept. Try again.")
         except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
@@ -1556,6 +1569,20 @@ class Supervisor:
                 self.say(neutral.format(why=type(e).__name__))
             except Exception:   # noqa: BLE001 - stderr itself refused; the teardown still runs
                 pass
+
+    def _route_without_token_host(self) -> Optional[str]:
+        """The id of the base map's one Claude passthrough route when it does not name the refresh's token host, else
+        None (no map, none or several such routes, or the host is there). Best-effort: it only words a line."""
+        try:
+            base = read_base_map(self.s.base_map)   # type: ignore[arg-type]
+        except Exception:   # noqa: BLE001
+            return None
+        mine = [r for r in base if r.get("type") == _AUTH_ROUTE["passthrough"] and type(r.get("route")) is str
+                and _hosts(r) & VENDOR_HOSTS["claude"]]
+        if len(mine) != 1 or _TOKEN_HOST in _hosts(mine[0]):
+            return None
+        rid = mine[0]["route"]
+        return rid if _ROUTE_ID_SAID_RE.fullmatch(rid) else "(its id is not shown)"
 
     def _identity_refused_said(self, session: str) -> None:
         try:

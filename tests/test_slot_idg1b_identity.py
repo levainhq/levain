@@ -42,7 +42,7 @@ def _answer(status: int = 200, body: object = None) -> bytes:
     if body is None:
         body = {"account": {"uuid": UUID, "email_address": "x@example.invalid"}, "organization": {"uuid": "o-1"}}
     text = body if isinstance(body, str) else json.dumps(body)
-    return json.dumps({"status": status, "body": text}, sort_keys=True).encode() + b"\n"
+    return json.dumps({"refresh": 200, "status": status, "body": text}, sort_keys=True).encode() + b"\n"
 
 
 def _capture(w, la, table, answer=(0, None)):

@@ -210,7 +210,7 @@ def test_x4_deep_nesting_is_unparsable_not_a_recursion_error(out):
     """complement MED 1: RecursionError on either json.loads is ``identity-unparsable``."""
     assert len(out) <= ID.PROFILE_ANSWER_MAX
     with pytest.raises(Refused) as e:
-        ID.parse_profile_answer(0, out)
+        ID.parse_profile_answer(0, out, refreshed=False)
     assert e.value.name == "identity-unparsable"
 
 
@@ -227,7 +227,7 @@ def test_x5_the_child_line_is_ascii(tmp_path, monkeypatch):
         srv.shutdown()
         srv.server_close()
     out.encode("ascii")
-    assert ID.parse_profile_answer(code, out.encode("ascii")) == UUID
+    assert ID.parse_profile_answer(code, out.encode("ascii"), refreshed=False) == UUID
 
 
 # --- X9: no assert on the answer -----------------------------------------------------------------------------------------

@@ -436,6 +436,9 @@ G3_START = r'''    if os.environ.get("FAKE_START") == "idexp":
         os.write(1, b"slot 7 identity-changed identity-expired sign in again: levain session claude --slot 7\\n")
         line({"ok": False, "refused": "identity-expired"})
         sys.exit(1)
+    if os.environ.get("FAKE_START") == "idunr":
+        line({"ok": False, "refused": "identity-unreachable"})
+        sys.exit(1)
     if os.environ.get("FAKE_START") == "idchg":
         os.write(1, ("account %s\\n" % os.environ["FAKE_PLANTED"]).encode())
         line({"ok": False, "refused": "identity-changed"})
@@ -497,6 +500,31 @@ def test_identity_expired_text_is_root_sourced_and_ignores_a_planted_tail(tmp_pa
     assert "looks expired" not in said and "slot 7" not in said and "Nothing was launched." in said
     assert "root's record does not say so" in said and "could not be read" not in said
     assert [v["verb"] for v in r2.verbs()][-1] == "teardown"
+
+
+@bounded(60)
+def test_identity_unreachable_names_a_claude_route_without_the_token_host(tmp_path: Path,
+                                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    """L3 r1 (codex MED 3): an operator's own Claude passthrough route without platform.claude.com wins over the shipped
+    one, so every refresh is denied and "try again" never works; the line names the route. With the host: the plain
+    retry line."""
+    unr = json.dumps({"ok": True, "identity": {"result": "identity-unreachable"}}, sort_keys=True, separators=(",", ":"))
+    r = g3rig(tmp_path, monkeypatch, FAKE_START="idunr", FAKE_STATUS=unr)       # the rig's claude-sub lacks the host
+    assert r.run(auth="passthrough") == 1
+    assert ("the base map's Claude passthrough route claude-sub does not name platform.claude.com, which the login "
+            "refresh needs") in _said(r) and "Sign in again" not in _said(r)
+    (tmp_path / "b").mkdir()
+    r2 = g3rig(tmp_path / "b", monkeypatch, FAKE_START="idunr", FAKE_STATUS=unr)
+    p = r2.store / "routes" / "base.json"
+    base = json.loads(p.read_text())
+    for route in base["routes"]:
+        if route["route"] == "claude-sub":
+            route["hosts"].append("platform.claude.com")
+    p.write_text(json.dumps(base, sort_keys=True, separators=(",", ":")))
+    assert r2.run(auth="passthrough") == 1
+    said = _said(r2)
+    assert ("could not reach Claude's sign-in server to check slot 0's login. Nothing was launched, and the stored "
+            "login is kept. Try again.") in said and "does not name" not in said
 
 
 @bounded(60)

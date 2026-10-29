@@ -172,7 +172,7 @@ class Launches:
             self.identity_captures = getattr(self, "identity_captures", 0) + 1
             if self.profile_uuid is not None:      # G3: the server answers this account
                 body = json.dumps({"account": {"uuid": self.profile_uuid}})
-                return 0, json.dumps({"status": 200, "body": body}, sort_keys=True).encode() + b"\n"
+                return 0, json.dumps({"refresh": 200, "status": 200, "body": body}, sort_keys=True).encode() + b"\n"
             return 1, b'{"error":"no-token"}\n'
         return H.capture_target(argv, spec_json, cgroup, bound)
 

@@ -453,7 +453,7 @@ def test_child_sends_the_bearer_and_beta_and_root_takes_the_uuid(tmp_path, profi
     h = {k.lower(): v for k, v in headers.items()}
     assert h["authorization"] == "Bearer tok-SECRET-123" and h["anthropic-beta"] == IC.OAUTH_BETA
     assert b"tok-SECRET-123" not in out                            # the token never reaches stdout
-    assert ID.parse_profile_answer(code, out) == UUID
+    assert ID.parse_profile_answer(code, out, refreshed=False) == UUID
 
 
 @pytest.mark.parametrize("status,name", [(401, "identity-expired"), (403, "identity-expired"),
@@ -463,7 +463,7 @@ def test_non_200_is_expired_for_401_403_else_unparsable(tmp_path, profile_server
     code, out = _run_child(_creds(tmp_path), profile_server)
     assert json.loads(out) == {"status": status, "body": ""}
     with pytest.raises(Refused) as e:
-        ID.parse_profile_answer(code, out)
+        ID.parse_profile_answer(code, out, refreshed=False)
     assert e.value.name == name
 
 
