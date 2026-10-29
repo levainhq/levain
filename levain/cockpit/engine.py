@@ -72,11 +72,11 @@ SCHEMA = "levain.cockpit/2"
 # waits on a read are expressed as a part of it, so they stay inside it when it moves
 PANEL_READ_DEADLINE_S = 10.0
 ENTITY_TIMEOUT_S = 10.0
-# The twelve kinds of the kernel's vocabulary (docs/cockpit-contract.md). A provider written against
+# The kinds of the kernel's vocabulary (docs/cockpit-contract.md). A provider written against
 # levain.cockpit/1 declares an ALIAS; it is normalised to the new kind when the spec is built, so the
 # manifest only ever carries the new names.
 KINDS = ("reading", "line", "brief", "count-queue", "ambient", "status-dots", "metric-grid", "roster", "list",
-         "form", "log", "topology")
+         "form", "log", "topology", "board")
 ALIASES = {"triage-list": "list", "metric": "status-dots", "visual": "ambient", "prose": "brief"}
 # row-shaped kinds (the searchable property); list and count-queue ride the RowIn engine, roster and log
 # carry their rows inside the value
@@ -1592,6 +1592,11 @@ class Cockpit:
         if kind == "topology":
             # empty only when it read everything and found nothing: a source it could not read is not "no work"
             return not value.get("nodes") and not value.get("tasks") and not value.get("unreadable")
+        if kind == "board":
+            # empty only when the queue was read whole and every column is empty: "no queue yet", "could not be read" and a
+            # source named unreadable are content (the value says why), never "nothing here"
+            return (value.get("queue") == "ok" and not value.get("unreadable")
+                    and not any(c.get("cards") for c in value.get("columns") or ()))
         key = {"line": "lines", "status-dots": "metrics", "metric-grid": "numbers", "roster": "rows",
                "log": "rows", "ambient": "events"}.get(kind)
         if key == "events" and "visual" in value:
@@ -3182,10 +3187,60 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
     return v
 
 
+# The board kind (C12): the ready queue as six derived columns (levain.coordinator.ready.CATEGORIES, in column order; a test
+# pins the two equal, so this module need not import the coordinator). BOARD_CARDS_MAX bounds the whole value: a board is drawn
+# whole on every poll, so a provider that sends more than this much is sending a bug, and the refusal names the count.
+BOARD_CATEGORIES = ("backlog", "ready", "running", "waiting", "needs-you", "done")
+BOARD_QUEUES = ("ok", "none", "unreadable")
+BOARD_CARDS_MAX = 2000
+
+
+def _v_board(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    """The board value (levain.cockpit.board.build): ``{queue, columns: [{category, cards: [{id, title, journal?, ...}]}], unreadable?,
+    note?}``. A SHAPE check only, nothing is parsed or executed: ``columns`` is a list of objects each naming one of
+    ``BOARD_CATEGORIES`` (once), holding a list of card objects each with a non-empty string ``id`` and a string ``title``; a
+    ``journal`` is null or an object; ``queue`` is one of ``BOARD_QUEUES``; ``unreadable`` (when present) is a list of strings.
+    Every other key, on the value, a column or a card, is accepted and left alone."""
+    v = _need_obj(spec, v)
+    if v.get("queue") not in BOARD_QUEUES:
+        raise _bad(spec, "value.queue", f"must be one of {list(BOARD_QUEUES)}, got {v.get('queue')!r}")
+    if v.get("note") is not None and not _is_str(v["note"]):
+        raise _bad(spec, "value.note", "must be a string or null")
+    unreadable = v.get("unreadable")
+    if unreadable is not None and not (isinstance(unreadable, list) and all(_is_str(u) for u in unreadable)):
+        raise _bad(spec, "value.unreadable", "must be a list of strings")
+    seen: set[str] = set()
+    total = 0
+    for i, col in enumerate(_need_list(spec, v, "columns")):
+        w = f"value.columns[{i}]"
+        if col.get("category") not in BOARD_CATEGORIES:
+            raise _bad(spec, f"{w}.category", f"must be one of {list(BOARD_CATEGORIES)}, got {col.get('category')!r}")
+        if col["category"] in seen:
+            raise _bad(spec, f"{w}.category", f"{col['category']!r} is repeated")
+        seen.add(col["category"])
+        cards = col.get("cards")
+        if not isinstance(cards, list):
+            raise _bad(spec, f"{w}.cards", "must be a list")
+        total += len(cards)
+        if total > BOARD_CARDS_MAX:
+            raise _bad(spec, f"{w}.cards", f"brings the board past {BOARD_CARDS_MAX} cards")
+        for j, card in enumerate(cards):
+            c = f"{w}.cards[{j}]"
+            if not isinstance(card, dict):
+                raise _bad(spec, c, "must be an object")
+            if not _is_str(card.get("id")) or not card["id"]:
+                raise _bad(spec, f"{c}.id", "must be a non-empty string")
+            if not _is_str(card.get("title")):
+                raise _bad(spec, f"{c}.title", "must be a string")
+            if card.get("journal") is not None and not isinstance(card["journal"], dict):
+                raise _bad(spec, f"{c}.journal", "must be an object or null")
+    return v
+
+
 VALUE_VALIDATORS: dict[str, Callable[["ProviderSpec", Any], dict[str, Any]]] = {
     "reading": _v_reading, "line": _v_line, "brief": _v_brief, "ambient": _v_ambient,
     "status-dots": _v_status_dots, "metric-grid": _v_metric_grid, "roster": _v_roster, "form": _v_form,
-    "log": _v_log, "topology": _v_topology,
+    "log": _v_log, "topology": _v_topology, "board": _v_board,
 }
 
 # What a row of each row-shaped kind carries, i.e. what ``search.fields`` may name, and the default.

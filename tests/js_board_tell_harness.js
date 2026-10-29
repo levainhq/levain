@@ -81,6 +81,7 @@ async function grouped() {
   const view = walk(host);
   return {
     heads, rowIds: rows.map((n) => n.dataset.id), rowText: rows.map(text),
+    glossGrouped: gAll.filter((n) => n.className === "bd-gloss").map(text), glossBoard: cAll.filter((n) => n.className === "bd-gloss").map(text),
     groupedColsBody: gAll.filter((n) => n.className === "bd-cols" || n.className === "bd-col").length,
     boardCols: cAll.filter((n) => n.className === "bd-col").map((n) => n.dataset.category),
     boardColsBody: cAll.filter((n) => n.className === "bd-cols").length,

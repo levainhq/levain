@@ -243,6 +243,8 @@ def test_the_tab_lists_cards_grouped_under_column_headings_and_the_modal_draws_t
     assert any("seat-9" in t and "ready → running" in t for t in g["rowText"])    # a card's journal line
     assert any(t.startswith("3. Ship the sweep fix") for t in g["rowText"])       # the band card's number leads
     assert g["mountedGroupHeads"] == 6 and g["mountedColsBody"] == 0              # the mounted tab is the grouped list
+    note = "This column is the Needs you band. Answer there (`levain band`)."     # ONE sentence, both renderers draw the same one
+    assert g["glossGrouped"] == [note] and g["glossBoard"] == [note]
     assert g["mountedButtons"] == 1                                               # the tell box's Send is the only button in the host
     assert g["modelBefore"] is None and g["modelAfter"] == ORDER_COUNTS           # the handle's model() is the last pull
 

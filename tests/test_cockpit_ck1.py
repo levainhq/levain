@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -41,8 +42,11 @@ def _refused(kind: str, value: Any, *needles: str, **kw: Any) -> None:
     assert "'p'" in p["error"]       # the panel id is named
 
 
-def test_the_twelve_kinds_and_the_four_aliases() -> None:
-    assert len(KINDS) == 12 and len(set(KINDS)) == 12
+def test_the_thirteen_kinds_and_the_four_aliases() -> None:
+    """Fails when a kind is added without this count AND the contract changing: every kind has its row in the contract table."""
+    assert len(KINDS) == 13 and len(set(KINDS)) == 13 and KINDS[-1] == "board"
+    contract = (Path(__file__).resolve().parent.parent / "docs" / "cockpit-contract.md").read_text()
+    assert [k for k in KINDS if f"| `{k}` |" not in contract] == []
     assert ALIASES == {"triage-list": "list", "metric": "status-dots", "visual": "ambient", "prose": "brief"}
     assert set(ALIASES.values()) <= set(KINDS)
     assert SCHEMA == "levain.cockpit/2"

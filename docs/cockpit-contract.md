@@ -5,7 +5,9 @@ against the kind's contract and renders it; a shape it does not accept makes tha
 (naming the panel id and the field), never a half-drawn panel. This page is the contract a provider
 builds against. The kernel's schema string is `levain.cockpit/2`.
 
-## The twelve kinds
+## The kinds
+
+The list is the `KINDS` tuple in `levain/cockpit/engine.py`; this table has one row per kind (a test fails when a kind has no row).
 
 Value kinds return `Read(value=...)`. `list` and `count-queue` return `Read(rows=(RowIn, ...))`.
 Every timestamp (`as_of`, `at`) is ISO-8601.
@@ -23,6 +25,7 @@ Every timestamp (`as_of`, `at`) is ISO-8601.
 | `list` | `Read(rows=(RowIn, ...))` with `order` (a registered ordering) and `version_fields` declared on the spec; groups, facets, views and verbs as the row engine defines them | the spec lacks `order` or `version_fields`; a facet the spec did not declare |
 | `form` | `{fields: [{name, type, label?, enum?}], verb?}`; `type` is `text`, `recipient` or `date` | no fields; a repeated or empty `name`; an unknown `type`; a `recipient` field whose `enum` is not a non-empty list of non-empty strings; an `enum` on a non-recipient field |
 | `log` | `{rows: [{verb, target, actor, at}]}` | any of the four missing or empty; `at` not ISO |
+| `board` | `{queue, columns: [{category, count?, cards: [{id, title, repo?, tier?, done_line?, depends_on?, status?, status_category?, held_reason?, well_formed?, rank?, unknown_category?, journal?: {iso, who, why, source, from_category, to_category, applied_by}\|null, band?, number?, source?, blocks?}]}], unreadable?: [string], note?: string\|null}` (see the note below) | `queue` not `ok`/`none`/`unreadable`; `columns` missing or not a list of objects; a `category` outside the six or repeated; `cards` not a list of objects; a card whose `id` is not a non-empty string or whose `title` is not a string; a `journal` that is neither an object nor null; `unreadable` not a list of strings; `note` neither a string nor null; more than `BOARD_CARDS_MAX` cards |
 | `topology` | `{hub: {id, label}, groups: [{id, label, repo}], nodes: [{id, group, parent, label, agent, model, state, tool, tokens, started, last_event, rate, card}], conflicts: [{path, nodes}]|null, conflicts_total, counts: {tokens_today}, as_of, tasks: [{id, kind, label, state, waits_on, card, outcomes: [{label, at, ok}], cost: {usd, tokens, source}, workers, opened?, age_days?, heat?}], lost_if_closed: [{node, dirty, dirty_names, unpushed, branches, uncaptured_episodes, running_children}], errors?, unreadable?}` (F12_SPEC); node `state` is `waiting`/`errored`/`stalled`/`running`/`idle`, task `kind` `dispatch`/`spore`/`consent`/`question`/`unattached`, task `state` `waiting`/`stuck`/`running`/`open`/`done`/`failed` (`open` = a spore or loop with no worker; tasks may carry `opened` (iso), `age_days` (integer, the calendar days open in the provider's own day: the number the page draws, never recomputed from `opened`) and `heat` (`hot`/`warm`/`cold`/`parked`)); `conflicts` is one record per file path naming EVERY node on it (`nodes`: two or more distinct node ids) and `conflicts_total` is the number of conflicting paths before the list's cap (never below the list; the page's "N file conflicts" reads it); an `apply_patch` logs at most 32 of its paths (the rest are counted as "(+N more)"), so a conflict on a path past the 32nd is not seen (a known edge); a panel read also carries `today` (the server's calendar day, `YYYY-MM-DD`), against which the page labels TODAY / OVERDUE and counts "overdue N d"; the browser's own clock and zone decide none of it; a `parent` chain may not cycle. REPLAY (F12, optional): a provider may offer a past read, `read_at(ctx, iso)` (on its `ProviderSpec.read_at`, or as `read.read_at` on its read function), returning the same value for a past instant; the panel head then carries `replay: true` (no flag, no replay control), and `GET /cockpit/panel/<id>.json?at=<iso>` (the same route, so the same read gate and token as the live read) returns the panel at T with `at` (T as checked) and `replay: true`, the value's `as_of` = T and `replay: true` in the value. T is an ISO instant with its zone, on a whole minute, inside `[now - 14 h, now]` (`check_replay_at`); anything else, `q`/`row`/`limit` beside it, or a panel with no past read is a 400, never clamped. A past read is bounded to what was known at T (events, filings, decisions, answers, transitions stamped at or before T); a source it cannot rebuild for T is named in `unreadable` with the reason `not kept for the past` in `errors`, its fields null, never drawn as empty (Levain's: `spores`, `lost_if_closed`, `context` (node model/tokens), and, when they apply, `session_logs` (a log rotated past T), `session_records` (more records than the scan or the 50-record cap reads, so a session live at T may be missing), `conflicts`, `decisions`/`questions` (a listing that does not reach T, or the consent listing overflowed or skipped rows)); a past read is served from a short per-(panel, minute) cache and its own bounded pool (two at once, apart from the write pool; over it the panel answers an error status naming the refusal), and its `today` is T's local calendar day. Known edges of the topology past read: sessions are grouped by the repository their directory is in NOW (a directory made a repository after T groups by today's repository); a session log rotating between the reachability check and the conflict read can drop that window's edits (a microsecond race); `at`'s offset must be percent-encoded (`+` reads as a space; `Z` needs none), and a blank, repeated or `q`/`row`/`limit`-accompanied `at` is a 400 | a string carrying an invisible or format character; a label over 48 characters; a repeated id or a reference (`group`, `parent`, `workers`, `node`, a conflict's nodes) naming none; an enum outside its set; a count that is negative or not an integer; a cost with numbers but no `source`; a `path` or file name that is not a basename. `null` is "unknown" wherever allowed (`model`, `tokens`, `conflicts`, the cost fields, every count in `lost_if_closed`) and is never read as zero |
 
 Notes a provider relies on:
@@ -35,6 +38,20 @@ Notes a provider relies on:
 - **`log`**: the kernel adds a `sentence` to each row, `"<verb label> · <target>"`, from the
   manifest's verb labels (`Snoozed · spore-1238`). A verb with no label renders as its raw name.
 - **`ambient`**: the kernel stores and serves the events as sent. The renderer owns the encoding.
+- **`board`**: the ready queue as derived columns, the value levain's own `GET /cockpit/board.json` serves
+  (`levain.cockpit.board.build`); a downstream's panel declares `kind="board"` and sends that value. It is a SHAPE check:
+  the kernel parses and executes nothing, and any key it does not name (`band_hint`, `tell`, `journal_as_of_read`, a
+  card's `held_reason`, `well_formed`, `rank`, `band`, `number`, `source`, `blocks`) is accepted and left alone.
+  `queue` is `ok` (read whole), `none` (no queue made yet) or `unreadable`; `unreadable` lists the sources it could not read
+  and `note` says why, so a board that could not be read is never drawn as an empty one. Each column's `category` is one
+  of `backlog`, `ready`, `running`, `waiting`, `needs-you`, `done` (the coordinator's six, in column order; a column may be
+  left out, never repeated), its `cards` a list of objects with a non-empty string `id` and a string `title`; a card's
+  `journal` (who moved it, when, why: `{iso, who, why, source, from_category, to_category, applied_by}`) is an object or
+  null. The whole board holds at most `BOARD_CARDS_MAX` cards. It is `empty` only when the queue is `ok`, nothing is
+  `unreadable` and no column holds a card. **Two draws, one value:** the page draws the panel GROUPED, one heading per
+  column in the coordinator's order with its count and the cards as rows beneath it, and the panel's ⤢ focus modal draws the
+  six columns side by side (the renderers of `board_view.js`; with that script absent the panel says so in one line).
+  A board carries no write verb in this slice: it offers no box and posts nothing.
 
 ## Regions and zone layout
 
@@ -45,7 +62,7 @@ Notes a provider relies on:
 |---|---|---|
 | `hero` | a `reading` (at most one) and an `ambient` (at most one); the renderer draws its own clock first, the reading under it, the ambient beside it | a second reading or ambient; any other kind |
 | `brief` | `line` and `brief`, in rank order | any other kind |
-| `widgets` | one answer each: `reading`, `line`, `status-dots`, `metric-grid`, and a `list` or `count-queue` that declares `face="count"` | `brief`, `ambient`, `roster`, `log`, `form`, and a row-engine kind without `face="count"`. A widget is one answer, never a list |
+| `widgets` | one answer each: `reading`, `line`, `status-dots`, `metric-grid`, and a `list` or `count-queue` that declares `face="count"` | `brief`, `ambient`, `roster`, `log`, `form`, `board`, and a row-engine kind without `face="count"`. A widget is one answer, never a list |
 | `operate` / `mind` / `identity` | any kind | |
 
 - **`face`** is `""` (the kind's own face) or `"count"`. `"count"` is valid only on a `list` or `count-queue`, in any
@@ -170,6 +187,7 @@ that has no component for a kind: `reading` (value, unit, condition, hi/lo, age,
 `line`, `brief`, `ambient` (legend, event count, per-repo counts; a `/1` visual draws its own
 text projection), `status-dots`, `metric-grid`, `roster` (grouped, with last call or "no data"),
 `form` (fields and recipient choices), `log` (one sentence per row), `list` and `count-queue` (rows).
+`topology` and `board` have no text form in this view: it says so in one line, never a blank panel.
 A search result's `match_label` or `search_error` is drawn under the panel, an empty one included.
 
 ## The change stream

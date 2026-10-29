@@ -68,6 +68,9 @@
     return n;
   }
 
+  // The needs-you column's one sentence: said by the grouped tab and the six columns alike, so the two cannot drift.
+  function needsYouNote(model) { return "This column is the Needs you band. Answer there (`" + model.hint + "`)."; }
+
   // The queue's own state, said before any column (shared by the grouped tab and the modal's columns).
   function drawNote(doc, host, model) {
     var note = [];
@@ -89,7 +92,7 @@
       h.dataset.category = col.category;
       wrap.appendChild(h);
       if (col.category === "needs-you") {
-        wrap.appendChild(el(doc, "p", "bd-gloss", "These are the Needs you band. Answer there (`" + model.hint + "`)."));
+        wrap.appendChild(el(doc, "p", "bd-gloss", needsYouNote(model)));
       }
       if (!col.cards.length) wrap.appendChild(el(doc, "p", "bd-empty", "nothing"));
       col.cards.forEach(function (k) {
@@ -119,7 +122,7 @@
       h.appendChild(el(doc, "span", "bd-count", " " + col.cards.length));
       c.appendChild(h);
       if (col.category === "needs-you") {
-        c.appendChild(el(doc, "p", "bd-gloss", "This column is the Needs you band. Answer there (`" + model.hint + "`)."));
+        c.appendChild(el(doc, "p", "bd-gloss", needsYouNote(model)));
       }
       if (!col.cards.length) c.appendChild(el(doc, "p", "bd-empty", "nothing"));
       col.cards.forEach(function (k) {

@@ -460,6 +460,15 @@
       const waiting = Array.isArray(v.nodes) && root.LevainTopologyView && root.LevainTopologyView.waitingOnYou ? root.LevainTopologyView.waitingOnYou(v) : isNum(v.waiting) ? v.waiting : 0;   // the one function behind every "waiting on you" figure; the compact profile carries the count itself
       out.lines = [{ meta: "topology", text: n(v.nodes, v.nodes) + " sessions \u00b7 " + n(v.tasks, v.tasks) + " tasks \u00b7 " + waiting + " waiting on you" }];
       if (Array.isArray(v.nodes) && Array.isArray(v.tasks) && Array.isArray(v.groups) && isObj(v.hub)) { out.topology = v; out.typed = true; out.replay = head.replay === true || panel.replay === true; }   // typed: the page keeps a live state for it (the header lens and Build's Lost-if-closed read it)
+    } else if (kind === "board") {
+      // levain's board.json value (board_view.js draws it): the whole value rides to the painter, which turns it into the model
+      // (LevainBoardView.boardModel); the counts ride as one line for the jump box and a touch reader. Read-only: no verb, no write box.
+      need(Array.isArray(v.columns) && v.columns.every((c) => isObj(c) && typeof c.category === "string" && Array.isArray(c.cards)
+        && c.cards.every((k) => isObj(k) && typeof k.id === "string")), "board columns");
+      const total = v.columns.reduce((n, c) => n + c.cards.length, 0);
+      out.board = v;
+      out.typed = true;
+      out.lines = [{ meta: "board", text: total + " cards · " + v.columns.map((c) => c.category + " " + c.cards.length).join(" · ") }];
     } else if (kind === "form") {
       need(Array.isArray(v.fields) && v.fields.length && v.fields.every((f) => isObj(f) && typeof f.name === "string"), "form fields");
       out.form = { fields: v.fields, verb: typeof v.verb === "string" ? v.verb : "" };
@@ -1795,6 +1804,21 @@
     emptyQueued = true;
     root.setTimeout(() => { emptyQueued = false; markEmptyCards(); }, 0);
   }
+  // The board kind (board_view.js): grouped under column headings on the page, the six columns in the focus modal (the same two
+  // renderers the Board tab and its modal use). A page without the view draws one plain line, never a blank panel.
+  function paintBoard(s) {
+    const V = root.LevainBoardView;
+    if (!V || typeof V.boardModel !== "function" || typeof V.renderGrouped !== "function" || typeof V.renderBoard !== "function") {
+      s.body.appendChild(el("p", "xnote", "The board view did not load, so this board is not drawn."));
+      return;
+    }
+    try {
+      const model = V.boardModel(s.data.board);
+      if (s.modal) V.renderBoard(document, s.body, model); else V.renderGrouped(document, s.body, model);
+    } catch (e) {
+      s.body.replaceChildren(el("p", "err", "unavailable — the board could not be drawn"));
+    }
+  }
   function paintBody(s) {
     const d = s.data, sr = d.search || {};
     if (d.kind === "ambient" && !s.fault && updateSky(s, d.sky)) return;
@@ -1822,6 +1846,7 @@
       if (!d.action) s.body.appendChild(el("p", "xnote", "this form cannot send from here" + (d.form.verb ? " (" + d.form.verb + " is not offered)" : "")));
       return;
     }
+    if (d.kind === "board") { paintBoard(s); return; }
     // row-shaped: the window, or the store's answer to the query
     const nq = sendable(s.query);     // the query as the kernel would take it: a blank one is no query
     const terms = termsOf(s.query);
