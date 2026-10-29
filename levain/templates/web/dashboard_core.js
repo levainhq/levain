@@ -5203,7 +5203,8 @@
             for (const p of acts.querySelectorAll(".sign-pick")) p.remove();
             lock(!rearm);
             // a definite "nothing was signed" gives every card drawn meanwhile back; an unsure answer is signPending's now
-            // (it freezes and releases a card drawn after it); a signed one stays frozen
+            // (it freezes and releases a card drawn after it); a signed one is not given back either, and its entry is
+            // dropped here so a request filed again under the same id is not drawn frozen by an ended ceremony
             if (rearm) { const later = signInFlight.get(id); signInFlight.delete(id); if (later) for (const f of later) f(); }
             else signInFlight.delete(id);
             signListed = null;
