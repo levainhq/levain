@@ -247,6 +247,10 @@ _SIGN_ACTIONS = ("challenge", "answer", "deny")
 # ceremony): levain files the request for its own kernel signed verbs (verbs.KERNEL_COMPOSERS, c4-mut R1), the caller's
 # compose_signer for every other; without a signer it is 404.
 _SIGN_COMPOSE = "/cockpit/sign/compose"
+# ONESURFACE OS-2, the key-line family: POST /cockpit/passkey/key-line is the phone port's /passkey/key-line (a new
+# credential's SPKI -> its OpenSSH line and the laptop commands that enrol it), by the phone port's OWN method, over the
+# Signer's queue and rpId, behind the sign routes' gate. Nothing is enrolled or recorded. Served beside a Signer only.
+_KEY_LINE_ROUTE = "/cockpit/passkey/key-line"
 _COMPOSE_WAIT_S = 30.0        # how long a second compose of one draft waits for the first's compose_signer call
 # GET /cockpit/sign/<id>.json: ONE request's listing row, behind the listing's gate, so a page never reads "no longer
 # open" off a listing that stopped at its cap (Signer.row)
@@ -2129,6 +2133,21 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
+    def _key_line_post(self, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/passkey/key-line`` (OS-2): :meth:`levain.phone_server._PhoneServer.key_line` itself, run over
+        the Signer's queue and rpId (all it reads), or its refusal as ``{error, message}`` with the phone port's status."""
+        from types import SimpleNamespace
+
+        from levain.phone_server import PhoneError, _PhoneServer
+
+        signer = self.server.signer
+        if signer is None:     # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        try:
+            return _PhoneServer.key_line(SimpleNamespace(rp_id=signer.rp_id, queue_dir=signer.queue_dir), req), 200
+        except PhoneError as exc:
+            return {"error": exc.error, "message": exc.message}, exc.status
+
     def _dispatch_post(self, job_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/dispatch/<job>/<action>`` (OS-2): the dispatch sheet's reply and status, or its refusal as
         ``{error, message}`` with the phone port's status."""
@@ -3018,10 +3037,12 @@ class _Handler(GuardedHandler):
         consent = _consent_sign_route(route) if self.server.consent_sheet is not None else None
         # and the dispatch family's sign, cancel and authorise (OS-2): the same ceremony class, the same gate
         dispatch = _dispatch_sign_route(route) if self.server.dispatch_sheet is not None else None
+        # and the key-line family's key line (OS-2): the same gate
+        key_line = route == _KEY_LINE_ROUTE and self.server.signer is not None
         # and web push (OS-4): a token on every bind
         push = route in _PUSH_POST and self.server.signer is not None
-        if (sign is not None or compose or grant is not None or consent is not None or dispatch is not None or push) \
-                and not self._off_box_token_valid():
+        if (sign is not None or compose or grant is not None or consent is not None or dispatch is not None or push
+                or key_line) and not self._off_box_token_valid():
             return self._reject(403, "credential_required", "missing or invalid write token")
         if self._write_token_required() and not self._off_box_token_valid():
             return self._reject(403, "forbidden", "missing or invalid write token")
@@ -3036,7 +3057,7 @@ class _Handler(GuardedHandler):
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
-                and consent is None and dispatch is None and not push):
+                and consent is None and dispatch is None and not push and not key_line):
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -3140,6 +3161,16 @@ class _Handler(GuardedHandler):
                 # no read-only refusal applies to it
                 try:
                     payload, status = self._dispatch_post(dispatch[0], dispatch[1], req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if key_line:
+                # the phone's key-line (records nothing, enrols nothing): no read-only refusal applies to it
+                try:
+                    payload, status = self._key_line_post(req)
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
