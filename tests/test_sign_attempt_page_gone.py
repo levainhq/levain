@@ -28,6 +28,9 @@ ROW = "document.querySelector('[data-question-row]')"
 OPEN_ROW = f"({ROW}.querySelector('.consent-details').click(), 1)"
 ROW_NOTE = f"(({ROW} || document).querySelector('.sign-note') || {{}}).textContent"
 ROW_OPTIONS = f"(({ROW} || document).querySelectorAll('.sign-option')).length"
+# the "not signed:" note, the row opened again whenever it reads closed (a repaint removes the note with the open state)
+NOTE_REOPENING = (f"({ROW} && !{ROW}.querySelector('.sign-note') && {ROW}.querySelector('.consent-details').click(), "
+                  f"/not signed:/.test({ROW_NOTE}) && {ROW_NOTE})")
 # the row's note and how many options it drew, read together once the note says `re` (a board read repaints the row)
 ROW_SAYS = "({re}.test({note}) && JSON.stringify([{note}, {opts}]))"
 READS_EVERY_1500 = "window.__reads = setInterval(() => window.LevainCockpitTransport.reload(), 1500) && 1"
@@ -144,16 +147,17 @@ def test_a_facet_drawn_after_the_answer_settled_refused_says_so_and_keeps_saying
             {"eval": HISTORY},
             {"until": f"{ROW} && 1", "ms": 30000},
             {"eval": OPEN_ROW},                               # a facet drawn fresh after the answer settled
-            {"until": f"/not signed:/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
+            {"until": NOTE_REOPENING, "ms": 30000},
             {"eval": AFTER.format(ms=300)},
-            # an until, not a bare sample: a board-read repaint may have removed the note at this instant
-            {"until": f"/not signed:/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
+            # an until that reopens the row, not a bare sample or a bare wait: a board-read repaint may have removed the
+            # note at this instant along with the row's open state, and nothing else would open it again
+            {"until": NOTE_REOPENING, "ms": 30000},
             {"eval": "window.LevainCockpitTransport.reload() && 1"},                      # a repaint
             {"eval": AFTER.format(ms=2500)},
             {"eval": REOPEN_PANEL},
             {"until": f"{ROW} && 1", "ms": 30000},
             {"eval": f"({ROW}.querySelector('.sign-note') ? 1 : ({OPEN_ROW}, 1))"},
-            {"until": f"/not signed:/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
+            {"until": NOTE_REOPENING, "ms": 30000},
         ])
         go.set()
     v = out["values"]
@@ -194,7 +198,7 @@ def test_a_facet_drawn_after_the_first_pass_settle_refused_still_says_why(tmp_pa
             {"eval": HISTORY},
             {"until": f"{ROW} && 1", "ms": 30000},
             {"eval": OPEN_ROW},                               # a facet drawn fresh after the request left
-            {"until": f"/not signed:/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
+            {"until": NOTE_REOPENING, "ms": 30000},
         ])
     note = out["values"][-1]
     assert note.startswith("not signed:") and "nothing was signed" in note, out["values"]
