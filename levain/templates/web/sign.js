@@ -304,7 +304,7 @@
 
   // `busy`: the controls are locked (a ceremony runs, or an unsure one is not yet settled). `flight`: a ceremony is in
   // flight, which ends on every outcome; `active` is the request it signs
-  let busy = false, flight = false, active = null;
+  let busy = false, flight = false, unsure = false, active = null;     // `unsure`: a drop's delivery is not known
   function ended() { flight = false; closeAsked = false; }
   function offer(r, rp, signers, held) {
     const acts = $("sheet-actions");
@@ -453,14 +453,14 @@
   // close leaves
   let closeAsked = false;
   function askClose() {
-    if (coord && flight && !closeAsked) {
+    if (coord && (flight || unsure) && !closeAsked) {
       // a drop has no request to read again: the line says the outcome is not confirmed, and a second close leaves
       closeAsked = true;
       relabel("Not confirmed");
       say("Signing is still in progress, so it is not confirmed (close again to leave).", "bad");
       return tell("reload");
     }
-    if (!flight || closeAsked) return tell("close");
+    if (!(flight || (coord && unsure)) || closeAsked) return tell("close");
     closeAsked = true;
     relabel("Not confirmed");
     say("Signing is still in progress, so it is not confirmed. Checking where the request stands… (close again to leave).", "bad");
@@ -624,11 +624,10 @@
     const storeRead = got.coord_store_read === true;
     const drops = Array.isArray(got.coord_drops) ? got.coord_drops : [];
     if (typeof got.coord_note === "string" && got.coord_note) body.appendChild(el("p", "ext-meta", got.coord_note));
-    if (drops.length) {
-      const list = el("pre", "sheet-message", drops.map(dropLine).join("\n"));
-      list.id = "drop-recent";
-      body.appendChild(list);
-    }
+    const list = el("pre", "sheet-message", drops.map(dropLine).join("\n"));     // always made: the first delivery fills it
+    list.id = "drop-recent";
+    list.hidden = !drops.length;
+    body.appendChild(list);
     const words = el("textarea", "");
     words.id = "drop-words";
     words.rows = 4;
@@ -673,10 +672,26 @@
     let working = false;
     let pending = null;            // a signed drop whose reply did not come back: sent again unchanged, never re-signed
     const lock = (on) => { working = on; send.disabled = sign.disabled = on; words.disabled = on; };
+    // a drop whose answer is not known is kept in this browser BEFORE it is posted (as the phone's outbox keeps it), so a
+    // closed sheet loses nothing: the next open sends it again, unchanged (the same outbox id files once), and it leaves
+    // only on a definite answer
+    const PEND_KEY = "levain-drop-pending:" + window.location.hostname;
+    const keep = (req) => { try { window.localStorage.setItem(PEND_KEY, JSON.stringify(req)); } catch (e) { /* kept in this visit only */ } };
+    const drop0 = () => { try { window.localStorage.removeItem(PEND_KEY); } catch (e) { /* nothing kept */ } };
+    const kept = () => {
+      try {
+        const v = JSON.parse(window.localStorage.getItem(PEND_KEY) || "null");
+        return v && typeof v === "object" && typeof v.outbox_id === "string" && typeof v.words === "string" ? v : null;
+      } catch (e) { return null; }
+    };
+    let signedLine = "";
     const done = (a, plain) => {
-      lock(false);
       const d = a.body.drop || {};
       const e = a.body.envelope;
+      // a fresh store's first drop made it: its identity is held before the controls unlock, so a fast second send names it
+      if (typeof a.body.store_id === "string") storeId = a.body.store_id;
+      busy = false;
+      lock(false);
       oid = newOutboxId();
       pending = null;
       words.value = "";
@@ -684,33 +699,71 @@
       review.replaceChildren();
       acts.replaceChildren(send, sign);
       const msg = (a.body.created === false ? "already delivered" : "delivered") + " as " + String(d.drop_id || "") + " · by "
-        + (plain ? "words only" : e && e.taken ? "envelope " + e.envelope_id + " taken" : "envelope NOT taken: " + String(e && e.refused));
+        + (plain ? "words only" : e && e.taken ? "envelope " + e.envelope_id + " taken" : "envelope NOT taken: " + String((e && e.refused) || "no envelope in the reply"));
       say(msg, plain || (e && e.taken) ? "ok" : "bad");
       tell("signed");
-      return readDrops().then((g) => { if (!g.unpaired && !g.error) { const l = $("drop-recent"); const dd = Array.isArray(g.coord_drops) ? g.coord_drops : []; if (l) l.textContent = dd.map(dropLine).join("\n"); if (typeof g.coord_store_id === "string") storeId = g.coord_store_id; } });
+      return readDrops().then((g) => {
+        if (g.unpaired || g.error) return;
+        const dd = Array.isArray(g.coord_drops) ? g.coord_drops : [];
+        list.textContent = dd.map(dropLine).join("\n");
+        list.hidden = !dd.length;
+        if (typeof g.coord_store_id === "string") storeId = g.coord_store_id;
+      });
     };
     const refusal = (a, nothing) => say(nothing + ": " + why(a), "bad");
     const post = (action, req) => call("/cockpit/coord/" + action, req);
     const wordsOf = () => { const w = words.value; if (!w.trim()) { say("type your words first", "bad"); return null; } return w; };
-    const sendDrop = (req, plain) => post("drop", req).then((a) => {
-      if (a.ok) return done(a, plain);
-      if (a.status >= 400 && a.status < 500) { lock(false); return refusal(a, "the drop was not delivered"); }
-      // no whole reply, or the cockpit's own fault: it may have landed. The same drop (same outbox id) is sent again on a tap
-      pending = req;
-      say("Not sure the drop was delivered (" + why(a) + "); send it again, unchanged, to find out.", "bad");
-      const again = el("button", "dev-btn", "Send the same drop again");
-      again.type = "button";
-      again.addEventListener("click", () => { again.remove(); sendDrop(pending, plain); });
-      acts.appendChild(again);
-      return undefined;
-    });
+    // the normal controls again, the words kept: after a refusal that is final (nothing was delivered with this request)
+    const restore = () => {
+      unsure = false;
+      busy = false;
+      pending = null;
+      review.hidden = true;
+      review.replaceChildren();
+      acts.replaceChildren(send, sign);
+      $("sheet").dataset.state = "open";
+      lock(false);
+    };
+    const sendDrop = (req) => {
+      const signed = req.envelope != null;
+      keep(req);
+      lock(true);
+      const unsureNow = (why1) => {
+        // no whole reply, or the cockpit's own fault: it may have landed. The same drop (same outbox id and envelope) is sent
+        // again on a tap, and is kept for the next open
+        pending = req;
+        if (signed) { relabel("Not confirmed"); ended(); }
+        unsure = true;
+        say("Not sure the " + (signed ? "signed " : "") + "drop was delivered (" + why1 + "); send it again, unchanged, to find out.", "bad");
+        const again = el("button", "dev-btn", signed ? "Send the signed drop again" : "Send the same drop again");
+        again.type = "button";
+        again.addEventListener("click", () => { again.remove(); sendDrop(pending); });
+        acts.replaceChildren(again);
+      };
+      return post("drop", req).then((a) => {
+        if (a.ok) {
+          drop0();
+          unsure = false;
+          if (signed) { ended(); if (signedLine) signing(signedLine, "server", "Signed"); else relabel("Signed"); $("sheet").dataset.state = "signed"; }
+          return done(a, !signed);
+        }
+        if (a.status >= 400 && a.status < 500) {
+          // refused: nothing was delivered with this request (a stale signature is signed again from the review); the
+          // controls come back with the words, whether this was the first send or a retry
+          drop0();
+          if (signed) { relabel("Not signed"); ended(); }
+          restore();
+          return refusal(a, signed ? "the signed drop was not delivered; review and sign again, or send the words alone" : "the drop was not delivered");
+        }
+        return unsureNow(why(a));
+      }, (e) => unsureNow("the page failed: " + ((e && e.name) || "error")));
+    };
     send.addEventListener("click", () => {
       if (working) return;
       const w = wordsOf();
       if (w === null) return;
       if (why0) return say(why0, "bad");
-      lock(true);
-      sendDrop({ words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId }, true);
+      sendDrop({ words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId });
     });
     // what the envelope needs, said before any tap: never a ceremony that cannot verify
     const cannot = !usable ? "this browser cannot use a passkey here (needs https)"
@@ -771,22 +824,8 @@
                                    client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
                 sent = true;
                 if (cred.rawId && mine(rp)[k.fp] !== b64u(cred.rawId)) remember(rp, k.fp, b64u(cred.rawId));
-                return post("drop", { words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId, envelope: envelope }).then((a) => {
-                  if (a.ok) { ended(); if (line) signing(line, "server", "Signed"); else relabel("Signed"); $("sheet").dataset.state = "signed"; busy = false; return done(a, false); }
-                  if (a.status >= 400 && a.status < 500) {
-                    // refused: nothing was delivered with this signature (a stale one is signed again from the review)
-                    relabel("Not signed"); ended(); acts.replaceChildren(send, sign); review.hidden = true; review.replaceChildren(); release();
-                    return refusal(a, "the signed drop was not delivered");
-                  }
-                  relabel("Not confirmed"); ended();
-                  pending = { words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId, envelope: envelope };
-                  say("Not sure the signed drop was delivered (" + why(a) + "); send it again, unchanged, to find out.", "bad");
-                  const again = el("button", "dev-btn", "Send the signed drop again");
-                  again.type = "button";
-                  again.addEventListener("click", () => { again.remove(); busy = false; sendDrop(pending, false); });
-                  acts.replaceChildren(again);
-                  return undefined;
-                });
+                signedLine = line;
+                return sendDrop({ words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId, envelope: envelope });
               }, (e) => stop1("The passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed."));
             }).catch((e) => {
               const name = (e && e.name) || "error";
@@ -798,5 +837,13 @@
         });
       }).catch(() => { release(); });
     });
+    // a drop kept from an earlier visit whose answer never came: asked again now, unchanged (the outbox id files it once)
+    const left = kept();
+    if (left) {
+      words.value = left.words;
+      oid = left.outbox_id;
+      say("A drop from earlier was not confirmed; asking whether it landed…");
+      sendDrop(left);
+    }
   }
 })();

@@ -788,6 +788,19 @@ class CoordSheet:
 
         self.queue_dir, self.rp_id, self.page_origin, self.signer = Path(queue_dir), rp_id, page_origin, signer
         self.phone = CoordPhone(self.queue_dir, rp_id, page_origin, signer.keys)
+        self._gate = threading.Condition()     # close(): no new step once closed; the steps already running are waited for
+        self._closed = False
+        self._running = 0
+
+    def close(self, timeout: float = 30.0) -> None:
+        """Shutdown: refuse every new step (so no new wake starts), wait for the steps in flight, then join the wake
+        threads they started (:meth:`CoordPhone.wait_wakes`, which the phone port names for a server shutting down)."""
+        with self._gate:
+            self._closed = True
+            end = time.monotonic() + timeout
+            while self._running and time.monotonic() < end:
+                self._gate.wait(max(0.0, end - time.monotonic()))
+        self.phone.wait_wakes(timeout)
 
     def elsewhere(self) -> "str | None":
         """Why no envelope signature made on this cockpit's page can verify, or None (as :meth:`DispatchSheet.elsewhere`)."""
@@ -811,7 +824,16 @@ class CoordSheet:
         if problem is not None:
             raise CoordRefused(422, "sign_refused", problem + ("; nothing was signed" if action != "drop"
                                                                else "; the drop was not delivered"))
-        out = self.phone.step(action, req, device=_COORD_DEVICE)
+        with self._gate:
+            if self._closed:
+                raise CoordRefused(503, "closing", "the cockpit is shutting down; nothing was delivered")
+            self._running += 1
+        try:
+            out = self.phone.step(action, req, device=_COORD_DEVICE)
+        finally:
+            with self._gate:
+                self._running -= 1
+                self._gate.notify_all()
         if action == "envelope-challenge":
             out["line"] = env.sign_message(out["payload"]).decode("utf-8")
         return out
@@ -1531,6 +1553,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.stream_watcher.stop()
         if self.broker is not None:
             self.broker.stop()
+        if self.coord_sheet is not None:
+            self.coord_sheet.close()    # no new wake; the wake threads a drop started are joined before teardown
         if self.cockpit is not None:
             self.cockpit.stop()
         super().server_close()

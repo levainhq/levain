@@ -6233,15 +6233,29 @@
   }
   // the drop card: shown only while /cockpit/coord/drops.json reads (a token, a Signer, a store that answers); the Send a drop
   // button opens the sheet, which sends and signs nothing from this page
+  // the coordinator read goes through the shared bounded read queue and is held for a moment, as the dispatch read is: rapid
+  // redraws share one read
+  let dropRead = null, dropAt = 0, dropSlotNow = null;
+  function dropFetch(headers) {
+    if (dropRead && Date.now() - dropAt < PROPOSAL_TTL_MS) return dropRead;
+    dropAt = Date.now();
+    const got = consentQueued(() => fetchBounded("/cockpit/coord/drops.json", { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.coord_drops) ? b : null), () => null) : null),
+      () => null), "the drops could not be read").then((b) => {
+        if (!b || !Array.isArray(b.coord_drops)) { if (dropRead === got) dropRead = null; return null; }
+        return b;
+      });
+    dropRead = got;
+    return got;
+  }
   function dropSlot() {
     const slot = el("div", "coord-drop-slot");
     const t = window.LevainCockpitTransport;
     const headers = t && typeof t.headers === "function" ? t.headers() : {};
     if (!headers["X-Levain-Write-Token"]) return slot;
-    fetchBounded("/cockpit/coord/drops.json", { cache: "no-store", headers: headers },
-      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.coord_drops) ? b : null), () => null) : null),
-      () => null).then((b) => {
-        if (!b) return;
+    dropSlotNow = slot;
+    dropFetch(headers).then((b) => {
+        if (!b || slot !== dropSlotNow) return;     // only the slot the latest render made is filled; an older one is gone
         const row = el("div", "row consent-row coord-drop-row");
         const head = el("div", "consent-head");
         head.appendChild(el("b", "consent-tool", "drop"));

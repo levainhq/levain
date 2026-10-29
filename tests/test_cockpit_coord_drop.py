@@ -256,3 +256,64 @@ def test_the_sheet_scripts_parse_and_name_the_routes() -> None:
     for name in ("sign.js", "dashboard_core.js"):
         out = subprocess.run([node, "--check", str(ROOT / "levain/templates/web" / name)], capture_output=True, text=True)
         assert out.returncode == 0, out.stderr
+
+
+def _undeclared_assignments(src: str) -> "set[str]":
+    """Bare identifiers the script assigns but nowhere declares (let/const/var, a function or its parameters, a catch):
+    under "use strict" the first such write is a ReferenceError that ``node --check`` cannot see."""
+    import re
+
+    code = re.sub(r"//[^\n]*|/\*.*?\*/", "", src, flags=re.S)
+    code = re.sub(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', '""', code)
+    declared = set(re.findall(r"\b(?:function\s+)(\w+)", code))
+    for m in re.finditer(r"\b(?:let|const|var)\s+([^;=]*(?:=[^;]*)?)", code):
+        declared.update(re.findall(r"(?:^|,)\s*(\w+)\s*(?==|,|$)", m.group(1)))
+    for m in re.finditer(r"\b(?:let|const|var)\s+(\w+)", code):
+        declared.add(m.group(1))
+    for m in re.finditer(r"\b(?:let|const|var)\s+[^;\n]*?\b(\w+)\s*=", code):
+        declared.add(m.group(1))
+    for m in re.finditer(r"function\s*\w*\s*\(([^)]*)\)|\(([^()]*)\)\s*=>|\b(\w+)\s*=>|catch\s*\((\w+)\)", code):
+        for g in m.groups():
+            if g:
+                declared.update(re.findall(r"\w+", g))
+    for m in re.finditer(r"\b(?:let|const|var)\s+([^;]*?);", code):
+        declared.update(re.findall(r"(?:^|,)\s*(\w+)", m.group(1)))
+    assigned = set(re.findall(r"(?<![\w.$\]\)])(\w+)\s*(?:=(?![=>])|\+=|-=|\+\+|--)", code))
+    return {a for a in assigned if a not in declared and a not in ("window", "document")}
+
+
+def test_the_drop_sheet_script_assigns_no_undeclared_name() -> None:
+    """A write to an undeclared name throws under "use strict" on the first click (the L3 r1 `busy` suspicion), and a syntax
+    check passes it: every bare assignment in the sheet script names something the script declares."""
+    sign = (ROOT / "levain/templates/web/sign.js").read_text()
+    assert '"use strict"' in sign
+    assert _undeclared_assignments(sign) == set()
+    # the check sees a name whose declaration is gone
+    assert "busy" in _undeclared_assignments(sign.replace("let busy = false, ", "let ", 1))
+
+
+def test_a_drop_is_kept_before_its_post_and_the_close_and_the_store_are_guarded() -> None:
+    """The sheet's page code (no browser here): the pending drop is written to storage before the post and removed only on
+    a definite answer, an open sheet asks about a kept one, a close is guarded while delivery is unknown, a refused retry gives
+    the controls back, and the first drop's store identity is held before the controls unlock."""
+    sign = (ROOT / "levain/templates/web/sign.js").read_text()
+    send = sign[sign.index("const sendDrop = (req) =>"):]
+    assert send.index("keep(req)") < send.index('post("drop", req)')
+    assert "const left = kept();" in sign and "sendDrop(left)" in sign
+    assert "coord && (flight || unsure)" in sign
+    assert "restore();" in send and "drop0();" in send
+    done = sign[sign.index("const done = (a, plain)"):]
+    assert done.index("storeId = a.body.store_id") < done.index("lock(false)")
+    assert 'list.id = "drop-recent"' in sign and "if (drops.length) {\n      const list" not in sign
+
+
+def test_closing_the_server_refuses_new_drops_and_joins_the_wakes(world, tmp_path) -> None:
+    from levain.web_server import CoordSheet
+    with _serve(world, tmp_path) as (url, httpd):
+        sheet: CoordSheet = httpd.coord_sheet
+        status, got = _call(url, "/cockpit/coord/drop", _plain("ph-" + "d9" * 16, "wake then close", _call(url, "/cockpit/coord/drop", _plain("ph-" + "d8" * 16, "first"))[1]["store_id"]))
+        assert status == 200, got
+        sheet.close(30)
+        assert all(not w.is_alive() for w in sheet.phone._wakes)
+        status, again = _call(url, "/cockpit/coord/drop", _plain("ph-" + "da" * 16, "after close", got["store_id"]))
+        assert status == 503 and again["error"] == "closing", again
