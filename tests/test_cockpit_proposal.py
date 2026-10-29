@@ -257,7 +257,7 @@ def test_a_page_without_its_token_draws_no_card(tmp_path, monkeypatch):
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [
             {"until": TILE}, {"eval": OPEN_DECISIONS},
-            {"until": "document.querySelectorAll('#levain-modal .consent-row').length >= 1"},
+            {"until": "document.querySelectorAll('#levain-modal [data-consent-row]').length >= 1"},
             {"eval": "new Promise(r => setTimeout(() => r(document.querySelectorAll('#levain-modal [data-consent-proposal]').length), 1500))"},
         ])
     assert out["values"][-1] == 0

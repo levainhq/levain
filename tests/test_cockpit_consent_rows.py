@@ -228,13 +228,13 @@ def test_the_page_draws_a_consent_request_as_text_with_a_countdown_and_copy_butt
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /1/.test({TILE}.innerText)"},
             {"eval": OPEN_DECISIONS},
-            {"until": "document.querySelector('#levain-modal .consent-row .consent-code')"},
-            {"eval": "(() => { const m = document.getElementById('levain-modal'); const row = m.querySelector('.consent-row');"
+            {"until": "document.querySelector('#levain-modal [data-consent-row] .consent-code')"},
+            {"eval": "(() => { const m = document.getElementById('levain-modal'); const row = m.querySelector('[data-consent-row]');"
                      " return [row.querySelector('.consent-agent').textContent, row.querySelector('.consent-tool').textContent,"
                      " row.querySelector('.consent-left').textContent, row.querySelector('.consent-display').textContent,"
                      " [...row.querySelectorAll('.consent-code')].map(c => c.textContent), row.querySelectorAll('img').length,"
                      " !!window.__pwned, /agents waiting on you/i.test(m.innerText),"
-                     " [...m.querySelectorAll('.consent-row')].map(r => [r.querySelector('.consent-tool').textContent,"
+                     " [...m.querySelectorAll('[data-consent-row]')].map(r => [r.querySelector('.consent-tool').textContent,"
                      " !!r.querySelector('.consent-body')])]; })()"},
         ])["values"]
     agent, tool, left, display, cmds, imgs, pwned, grouphead, rows = out[-1]
@@ -280,8 +280,8 @@ def test_a_decided_row_has_a_details_button_and_a_malformed_body_releases_its_sl
             " window.fetch = (u, o) => { const id = ids.find(i => String(u).includes('/cockpit/consent/' + encodeURIComponent(i)));"
             " if (id && !seen.has(id)) { seen.add(id); return Promise.resolve({ ok: true, status: 200, json: () => Promise.reject(new Error('bad json')) }); }"
             " return real(u, o); }; return 1; })()")
-    rows = "[...document.querySelectorAll('#levain-modal .consent-row')].filter(x => x.querySelector('.consent-details'))"
-    tagged = "[...document.querySelectorAll('#levain-modal .consent-row[data-zq]')]"     # a read that succeeds removes its button
+    rows = "[...document.querySelectorAll('#levain-modal [data-consent-row]')].filter(x => x.querySelector('.consent-details'))"
+    tagged = "[...document.querySelectorAll('#levain-modal [data-consent-row][data-zq]')]"     # a read that succeeds removes its button
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /2/.test({TILE}.innerText)"},
@@ -311,7 +311,7 @@ def test_a_details_retry_after_a_failed_read_reuses_its_slot(tmp_path, monkeypat
     stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.__failed = []; window.fetch = (u, o) =>"
             " String(u).includes('/cockpit/consent/') && !String(u).includes('/proposals.json') && !String(u).includes('/grants.json') && n++ < 1"
             " ? (window.__failed.push(String(u)), Promise.resolve({ ok: false, status: 500 })) : real(u, o); return 1; })()")
-    row = "[...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-audit'))"
+    row = "[...document.querySelectorAll('#levain-modal [data-consent-row]')].find(x => x.querySelector('.consent-audit'))"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": TILE},                    # the one request is withdrawn, so nothing waits and the tile counts 0: it is the signal
@@ -344,12 +344,12 @@ def test_the_decisions_modal_carries_a_filter_that_narrows_by_agent_tool_and_sta
     _root, src, _ids = _install(tmp_path)
     typ = ("(v => { const i = document.querySelector('#levain-modal .xfilter-input'); i.value = v;"
            " i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })")
-    rows = "document.querySelectorAll('#levain-modal .consent-row').length"
+    rows = "document.querySelectorAll('#levain-modal [data-consent-row]').length"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /2/.test({TILE}.innerText)"},
             {"eval": OPEN_DECISIONS},
-            {"until": "document.querySelector('#levain-modal .xfilter-input') && document.querySelector('#levain-modal .consent-row')"},
+            {"until": "document.querySelector('#levain-modal .xfilter-input') && document.querySelector('#levain-modal [data-consent-row]')"},
             {"eval": rows},
             {"eval": f"{typ}('apply_patch'); {rows}"},
             {"eval": f"{typ}('codex'); {rows}"},
@@ -372,8 +372,8 @@ def test_a_reopened_decisions_modal_starts_unfiltered_even_with_a_saved_query(tm
     _root, src, _ids = _install(tmp_path)
     typ = ("(v => { const i = document.querySelector('#levain-modal .xfilter-input'); i.value = v;"
            " i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })")
-    rows = "document.querySelectorAll('#levain-modal .consent-row').length"
-    ready = "document.querySelector('#levain-modal .xfilter-input') && document.querySelector('#levain-modal .consent-row')"
+    rows = "document.querySelectorAll('#levain-modal [data-consent-row]').length"
+    ready = "document.querySelector('#levain-modal .xfilter-input') && document.querySelector('#levain-modal [data-consent-row]')"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /3/.test({TILE}.innerText)"},
@@ -381,7 +381,7 @@ def test_a_reopened_decisions_modal_starts_unfiltered_even_with_a_saved_query(tm
             {"until": ready},
             {"eval": f"{typ}('apply_patch'); {rows}"},
             {"eval": "document.querySelector('#levain-modal .modal-close, #levain-modal [aria-label=Close], #levain-modal button.x') ? (document.querySelector('#levain-modal .modal-close, #levain-modal [aria-label=Close], #levain-modal button.x').click(), 1) : (document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})), 2)"},
-            {"until": "!document.querySelector('#levain-modal .consent-row')"},
+            {"until": "!document.querySelector('#levain-modal [data-consent-row]')"},
             {"eval": OPEN_DECISIONS},
             {"until": ready},
             {"eval": rows},
@@ -398,7 +398,7 @@ def test_an_undecided_row_is_drawn_waiting_not_answered(tmp_path, monkeypatch):
                   hold=timedelta(minutes=5), event_id="u1")
     q.mark_undecided(late.id)
     _root, src, _ids = _install(tmp_path)
-    row = "document.querySelector('#levain-modal .consent-row')"
+    row = "document.querySelector('#levain-modal [data-consent-row]')"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /1/.test({TILE}.innerText)"},
