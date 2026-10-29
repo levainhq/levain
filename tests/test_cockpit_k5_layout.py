@@ -4,6 +4,9 @@ empty line gets no controls. K5_DESIGN.md is the spec."""
 from __future__ import annotations
 
 import json
+import sys
+
+import pytest
 from pathlib import Path
 
 from tests.test_cockpit_flip_parity import _drive, needs_browser
@@ -186,6 +189,89 @@ def test_the_entity_name_in_the_bar_is_not_truncated_at_1440_with_a_saved_layout
     out = _run(tmp_path, _seed("JSON.stringify({v: 1, zones: {operate: {order: ['now', 'tray']}}, collapsed: ['loops']})") + [
         {"eval": "const e = document.getElementById('entity'); [e.scrollWidth, e.clientWidth, e.textContent]"}])[-1]
     assert out[0] <= out[1], out
+
+
+# a full bar just above the stacked-layout breakpoint, in a font wider than the design's: Verdana forced on every element (inline, a <style> is blocked)
+FULL_BAR = ("(() => { %s"
+            " const n = document.getElementById('entity'); n.textContent = 'WWWWWWWWWWWWWW'; %s"
+            " const q = (s) => document.querySelector(s).getBoundingClientRect(), vw = document.documentElement, ue = document.querySelector('.masthead .unit');"
+            " ue.style.flex = 'none'; const nat = Math.round(q('.masthead .unit').width), natE = n.scrollWidth; ue.style.flex = '';"
+            " return new Promise(r => setTimeout(r, 200)).then(() => { const m = q('.masthead'), t = q('.masthead .seg'), u = q('.masthead .unit'), ro = q('.masthead .readout');"
+            " const jl = document.querySelector('.jar-label');"
+            " return { sw: vw.scrollWidth, cw: vw.clientWidth, unitLeft: Math.round(u.left), tabsRight: Math.round(t.right), readoutRight: Math.round(ro.right), mastRight: Math.round(m.right),"
+            " nameCut: n.scrollWidth > n.clientWidth, unitW: Math.round(u.width), nat, nameW: n.clientWidth, jarCut: jl ? jl.scrollWidth > jl.clientWidth : null }; }); })()")
+# the width thresholds below were measured with macOS's native font; any other platform's default font is as wide as the forced Verdana
+# (CI's Linux Chrome at 1041, under the old 1040 breakpoint, put unitLeft 455 against tabsRight 509), so there a "native" case takes the wide-font thresholds
+def _wide(font: str) -> bool:
+    return bool(font) or sys.platform != "darwin"
+
+
+VERDANA = "for (const e of document.querySelectorAll('*')) e.style.fontFamily = 'Verdana, sans-serif';"
+NO_JAR = "document.getElementById('jar').hidden = true;"
+LONG_JAR = ("const j = document.getElementById('jar'); j.hidden = false; j.innerHTML = '<svg viewBox=\"0 0 16 20\"></svg><span class=\"jar-label\">'"
+            " + 'a jar label that is far too long to fit beside the name'.repeat(3) + '</span>';")
+
+
+@needs_browser
+@pytest.mark.parametrize("font, width", [("", 1180), ("", 1240), (VERDANA, 1280), (VERDANA, 1340)], ids=["native-1180", "native-1240", "verdana-1280", "verdana-1340"])
+def test_a_full_bar_truncates_the_name_with_an_ellipsis_and_never_overflows_into_the_tabs(tmp_path: Path, width: int, font: str) -> None:
+    out = _run(tmp_path, [{"eval": FULL_BAR % (font, NO_JAR)}], width=width)[-1]
+    assert out["sw"] <= out["cw"], out                                     # nothing widens the page
+    assert out["unitLeft"] >= out["tabsRight"], out                        # the readout stays right of the tabs
+    assert out["readoutRight"] <= out["mastRight"], out
+    assert out["unitW"] <= out["nat"], out
+    assert out["unitW"] == out["nat"] or out["nameCut"], out               # a name the bar cannot hold whole ends in an ellipsis rather than being clipped off the bar
+
+
+@needs_browser
+@pytest.mark.parametrize("font, width", [("", 1400), ("", 1500), (VERDANA, 1460), (VERDANA, 1560)], ids=["native-1400", "native-1500", "verdana-1460", "verdana-1560"])
+def test_the_jar_label_gives_way_before_the_name_does(tmp_path: Path, width: int, font: str) -> None:
+    got = _run(tmp_path, [{"eval": FULL_BAR % (font, LONG_JAR)}], width=width)[-1]
+    assert got["sw"] <= got["cw"] and got["unitLeft"] >= got["tabsRight"], got
+    assert got["jarCut"] is True, got                                      # the label is what shrank (its text overflows its box: ellipsized)
+    if font or sys.platform == "darwin":                                   # the width at which a 14-W name still fits whole beside a long label is the font's
+        assert got["nat"] - got["unitW"] <= 1, got                             # while the name kept its whole width
+
+
+# the starter jar as the page draws it (renderJar's 26x34 svg + label), visible; its icon must keep its room beside the indicators
+REAL_JAR = ("const j = document.getElementById('jar'); j.hidden = false; j.innerHTML = '<svg viewBox=\"0 0 26 34\"><path d=\"M5 8 H21 V28 H5 Z\"></path></svg>"
+            "<span class=\"jar-label\">starter: 14 today</span>';")
+JAR_ICON = ("(() => { const s = document.querySelector('#jar svg').getBoundingClientRect(), i = document.querySelector('.masthead .indicators').getBoundingClientRect();"
+            " return { svgW: Math.round(s.width), svgRight: Math.round(s.right * 10) / 10, indLeft: Math.round(i.left * 10) / 10 }; })()")
+
+
+@needs_browser
+@pytest.mark.parametrize("font, width", [("", 1101), ("", 1180), (VERDANA, 1101), (VERDANA, 1180)],
+                         ids=["native-1101", "native-1180", "verdana-1101", "verdana-1180"])
+def test_the_jar_icon_keeps_its_room_and_never_overlaps_the_indicators(tmp_path: Path, width: int, font: str) -> None:
+    out = _run(tmp_path, [{"eval": FULL_BAR % (font, REAL_JAR)}, {"eval": JAR_ICON}], width=width)
+    icon = out[-1]
+    assert icon["svgW"] > 0, icon
+    assert icon["svgRight"] <= icon["indLeft"], icon                       # the icon ends before the live/status cluster begins
+
+
+# the Calm control beside the name, from just above the stacked breakpoint to a wide bar, in either font
+CALM = ("(() => { const b = document.getElementById('calmbtn'), r = b.getBoundingClientRect(); b.focus();"
+        " const cs = getComputedStyle(b), pb = getComputedStyle(b, '::before'), g = document.createElement('span'); g.textContent = '\u2248'; g.style.cssText = 'font:' + pb.font + ';letter-spacing:' + pb.letterSpacing + ';padding:0;margin:0;border:0'; b.appendChild(g); const em = g.getBoundingClientRect().width; g.remove(); return { label: cs.fontSize, w: Math.round(r.width), bound: Math.ceil(parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth) + em), name: b.getAttribute('aria-label'), title: b.title, focused: document.activeElement === b, shown: r.width > 0 }; })()")
+
+
+@needs_browser
+@pytest.mark.parametrize("font, width", [("", 1101), ("", 1180), ("", 1280), ("", 1281), ("", 1340), ("", 1440),
+                                         (VERDANA, 1101), (VERDANA, 1180), (VERDANA, 1280), (VERDANA, 1340), (VERDANA, 1440)],
+                         ids=[f"{n}-{w}" for n, w in [("native", 1101), ("native", 1180), ("native", 1280), ("native", 1281), ("native", 1340), ("native", 1440),
+                                                      ("verdana", 1101), ("verdana", 1180), ("verdana", 1280), ("verdana", 1340), ("verdana", 1440)]])
+def test_calm_beside_the_name_never_overflows_the_bar_and_keeps_its_name_as_an_icon(tmp_path: Path, width: int, font: str) -> None:
+    out = _run(tmp_path, [{"eval": FULL_BAR % (font, NO_JAR)}, {"eval": CALM}], width=width)
+    geo, calm = out[-2], out[-1]
+    assert geo["sw"] <= geo["cw"] and geo["unitLeft"] >= geo["tabsRight"] and geo["readoutRight"] <= geo["mastRight"], geo
+    if width >= (1180 if _wide(font) else 1100):
+        assert geo["unitW"] > 0, geo                                         # the name is not squeezed out entirely (it was at 1100 native with the labelled button)
+    assert calm["shown"] and calm["focused"] and calm["name"] in ("Calm off", "Calm on") and calm["title"] == calm["name"], calm
+    if width <= 1280:
+        assert calm["label"] == "0px", calm                                  # the icon form: the visible text is gone, the name stays
+        assert calm["w"] <= calm["bound"], (calm["w"], calm["bound"])                             # and the button is only its padding + the glyph's measured width, not a label-wide key
+    else:
+        assert calm["label"] != "0px" and calm["w"] > 60, calm               # wide enough for the labelled form
 
 
 @needs_browser
@@ -386,3 +472,27 @@ def test_a_store_that_refuses_removal_leaves_an_empty_layout_not_the_old_one(tmp
     ])
     assert out[-2]["left"] == ["tray", "now"], out[-2]
     assert out[-1] == [False, 0], out[-1]
+
+
+# Calm "on" in the icon band: a filled key background like the theme switch's pressed button; the labelled form (outside the band) is unchanged
+CALM_ON = ("(() => { const b = document.getElementById('calmbtn'), bg = () => getComputedStyle(b).backgroundColor;"
+           " const pressedTheme = document.querySelector('.themesw button[aria-pressed=\"true\"]');"
+           " const off = bg(), offPressed = b.getAttribute('aria-pressed'); b.click();"
+           " return new Promise(r => setTimeout(r, 500)).then(() => ({ off, offPressed, on: bg(), onPressed: b.getAttribute('aria-pressed'),"
+           " theme: pressedTheme ? getComputedStyle(pressedTheme).backgroundColor : null })); })()")
+
+
+@needs_browser
+def test_calm_on_in_the_icon_band_has_the_filled_background_of_the_theme_switchs_pressed_button(tmp_path: Path) -> None:
+    got = _run(tmp_path, [{"eval": CALM_ON}], width=1180)[-1]
+    assert got["offPressed"] == "false" and got["onPressed"] == "true", got
+    assert got["theme"], got
+    assert got["on"] != got["off"], got
+    assert got["on"] == got["theme"], got
+
+
+@needs_browser
+def test_calm_on_at_1440_keeps_the_labelled_look_with_no_filled_background(tmp_path: Path) -> None:
+    got = _run(tmp_path, [{"eval": CALM_ON}], width=1440)[-1]
+    assert got["offPressed"] == "false" and got["onPressed"] == "true", got
+    assert got["on"] == got["off"], got

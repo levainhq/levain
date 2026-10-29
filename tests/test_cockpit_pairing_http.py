@@ -504,6 +504,7 @@ def test_f5_every_pair_503_carries_retry_after_and_the_claims_closes(src, quick_
         st, out, hdrs = _call(port, "POST", "/cockpit/pair/claim", {"code": "x" * 22})
         assert (st, hdrs.get("retry-after"), hdrs.get("connection")) == (503, "2", "close"), (out, hdrs)
     with _serve(src) as (port, httpd):
+        assert httpd.broker.start() is Lifecycle.ACTIVE      # quick_wait is 0.3 s: a still-ACTIVATING broker answers 503 on a loaded runner
         for gate, path, body in ((httpd.pair_claim_gate, "/cockpit/pair/claim", {"code": "x"}),
                                  (httpd.request_gate, "/cockpit/pair/offer", {})):
             held = 0
@@ -671,3 +672,16 @@ def test_g5_a_starter_thread_that_cannot_start_is_a_503_and_is_retried(src, monk
         monkeypatch.undo()
         st, out, _ = _call(port, "GET", "/cockpit/pair/devices.json", token=T)
         assert st == 200 and out["devices"] == [], out
+
+
+def test_rq6_the_point_of_use_check_raises_without_assert(src) -> None:
+    """RQ-6 at the point of use: a paired-namespace name reaching the token loop is refused by a raise, so
+    ``python -O`` cannot strip it."""
+    with _serve(src) as (port, httpd):
+        httpd.surface_tokens["paired-d-0123456789ab"] = "x" * 40
+        handler = httpd.RequestHandlerClass
+        h = handler.__new__(handler)
+        h.server = httpd
+        h.headers = {}
+        with pytest.raises(RuntimeError, match="paired namespace"):
+            h._resolve_credential()

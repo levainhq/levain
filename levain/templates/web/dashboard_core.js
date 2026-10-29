@@ -271,6 +271,7 @@
     if (!board) return;
     proposalRead = null;   // an authoritative reload: a denial or a grant answered since must withdraw its card, not wait out the 30 s
     grantRead = null;      // and a grant revoked since leaves the grants slot
+    dispatchRead = null;   // and a dispatch job signed or cancelled since leaves the dispatch slot
     // the typed panels about to be dropped end their timers and mounts first
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.reset) window.LevainCockpitKinds.reset();
     const kept = captureKept(board);   // the rows the reader holds open, restored below once the board is drawn again
@@ -1612,11 +1613,26 @@
     // the substrate oracles (facts, never an activity counter); absent on a manifest source or an older levain
     {
       const bits = [];
-      if (h.save_age_hours != null) bits.push("last save " + (h.save_age_hours >= 1 ? Math.round(h.save_age_hours) + "h ago" : "under 1h ago"));
+      const K = typeof window !== "undefined" ? window.LevainCockpitKinds : null;
+      // the save's stamp (carried by the page's own model) draws through the shared age node so it ticks; an older model gets the text
+      const stamped = !!(h.save_at && K && K.ageSpan);
+      if (h.save_age_hours != null) bits.push(stamped ? null : "last save " + (h.save_age_hours >= 1 ? Math.round(h.save_age_hours) + "h ago" : "under 1h ago"));
       if (h.projection_converged != null) bits.push(h.projection_converged ? "projection converged" : "PROJECTION DIVERGED (" + (h.projection_note || "continuity file differs from the last wrap (edited since?)") + ")");
       else if (h.projection_note) bits.push("projection " + h.projection_note);
       if (h.audit_backlog != null) bits.push(!h.audit_backlog ? "no audit write failures recorded" : "AUDIT: " + h.audit_backlog + " audit writes failed");
-      if (bits.length) kv(p, "substrate", bits.join(" · "));
+      if (bits.length && !stamped) kv(p, "substrate", bits.join(" · "));
+      else if (bits.length) {
+        const row = el("div", "kv");
+        row.appendChild(el("span", "k", "substrate"));
+        const v = el("span", "v");
+        bits.forEach((b, i) => {
+          if (i) v.appendChild(document.createTextNode(" · "));
+          if (b === null) { v.appendChild(document.createTextNode("last save ")); v.appendChild(K.ageSpan(h.save_at)); }
+          else v.appendChild(document.createTextNode(b));
+        });
+        row.appendChild(v);
+        p.appendChild(row);
+      }
     }
     // a manifest source may not carry every figure: show only what was sent, never a made-up 0.00
     kv(p, "graduations", `${fmt(h.graduations_validated_total)} validated / ${fmt(h.graduations_demoted_total)} demoted`);
@@ -5250,13 +5266,14 @@
     if (!frame || ev.source !== frame.contentWindow || ev.origin !== window.location.origin) return;
     const what = ev.data && typeof ev.data === "object" ? ev.data.levainSheet : null;
     if (what === "ack") { clearTimeout(signSheetAsk); signSheetAsk = null; }
-    else if (what === "close") closeSignSheet();
+    else if (what === "close") { closeSignSheet(); dispatchStale(); }
     else if (what === "signed" || what === "reload") {
-      // the sheet's line stays on it until it is closed; the board under it reads again
+      // the sheet's line stays on it until it is closed; the board under it reads again, and the dispatch jobs with it
+      dispatchStale();
       rereadBoard();
     }
   });
-  window.LevainSignSheet = { open: openSignSheet, openConsent: openConsentSheet, close: closeSignSheet };
+  window.LevainSignSheet = { open: openSignSheet, openConsent: openConsentSheet, openDispatch: openDispatchSheet, openDrop: openDropSheet, close: closeSignSheet };
 
   // A signed verb's send (ActionVerb.sign): the server's compose_signer files a sign request for exactly these params, the
   // passkey signs it, and only then does the caller post the verb with `sign_request`. Resolves {ok: true, request, txn} or
@@ -6236,10 +6253,136 @@
                            ...rows.map((g) => grantCard(g, inert, signList)));
     }).catch(() => {});
   }
-  // the Decisions history's two standing-rule slots, drawn together wherever the proposals are
+  // OS-2, the dispatch family: the live dispatch jobs as cards, each act (Sign, Cancel, Authorise) a button that opens the sign
+  // sheet at /sign/dispatch/<job> with that act picked. /cockpit/dispatch.json lists them as the sheet's rows (one object per
+  // job: its message, its options each with the passkeys that may do it, the version the sheet signs on). This page signs
+  // nothing: the sheet does, through the phone port's own routes. No token, a failed read, or no job: no slot.
+  let dispatchRead = null, dispatchAt = 0;
+  function dispatchFetch() {
+    if (dispatchRead && Date.now() - dispatchAt < PROPOSAL_TTL_MS) return dispatchRead;
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? t.headers() : {};
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve(null);
+    dispatchAt = Date.now();
+    const got = consentQueued(() => fetchBounded("/cockpit/dispatch.json", { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.requests) ? b : null), () => null) : null),
+      () => null), "the dispatch jobs could not be read").then((b) => {
+        if (!b || !Array.isArray(b.requests)) { if (dispatchRead === got) dispatchRead = null; return null; }
+        return b;
+      });
+    dispatchRead = got;
+    return got;
+  }
+  // OS-2: the sheet over a dispatch job (/sign/dispatch/<job>), signed, cancelled or authorised there with a passkey
+  function openDispatchSheet(id, version, choice) {
+    if (typeof id !== "string" || !/^dj-[0-9a-f]{32}$/.test(id)) return null;
+    return openSheet("/sign/dispatch/" + encodeURIComponent(id), version, choice, "dispatch job");
+  }
+  // OS-2: the sheet over a coordinator drop (/sign/drop): words, and optionally an envelope the passkey signs there
+  function openDropSheet() {
+    return openSheet("/sign/drop", "", "", "coordinator drop");
+  }
+  // the drop card: shown only while /cockpit/coord/drops.json reads (a token, a Signer, a store that answers); the Send a drop
+  // button opens the sheet, which sends and signs nothing from this page
+  // the coordinator read goes through the shared bounded read queue and is held for a moment, as the dispatch read is: rapid
+  // redraws share one read
+  let dropRead = null, dropAt = 0, dropSlotNow = null;
+  function dropFetch(headers) {
+    if (dropRead && Date.now() - dropAt < PROPOSAL_TTL_MS) return dropRead;
+    dropAt = Date.now();
+    const got = consentQueued(() => fetchBounded("/cockpit/coord/drops.json", { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.coord_drops) ? b : null), () => null) : null),
+      () => null), "the drops could not be read").then((b) => {
+        if (!b || !Array.isArray(b.coord_drops)) { if (dropRead === got) dropRead = null; return null; }
+        return b;
+      });
+    dropRead = got;
+    return got;
+  }
+  function dropSlot() {
+    const slot = el("div", "coord-drop-slot");
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? t.headers() : {};
+    if (!headers["X-Levain-Write-Token"]) return slot;
+    dropSlotNow = slot;
+    dropFetch(headers).then((b) => {
+        if (!b || slot !== dropSlotNow) return;     // only the slot the latest render made is filled; an older one is gone
+        const row = el("div", "row consent-row coord-drop-row");
+        const head = el("div", "consent-head");
+        head.appendChild(el("b", "consent-tool", "drop"));
+        head.appendChild(el("span", "ext-meta", b.coord_drops.length + " recent from the phone port or this cockpit"));
+        row.appendChild(head);
+        const acts = el("div", "needs-actions");
+        const btn = el("button", "needs-btn", "Send a drop");
+        btn.type = "button";
+        btn.dataset.coordDrop = "open";
+        btn.title = "send words to the coordinator, optionally with an envelope your passkey signs, in the sign sheet";
+        btn.addEventListener("click", () => openDropSheet());
+        acts.appendChild(btn);
+        row.appendChild(acts);
+        if (typeof b.coord_note === "string" && b.coord_note) row.appendChild(el("div", "consent-note ext-meta", b.coord_note));
+        slot.replaceChildren(el("div", "ext-grouphead", "coordinator drop"), row);
+      }).catch(() => {});
+    return slot;
+  }
+  const DISPATCH_VERB = { sign: "Sign", cancel: "Cancel job", authorise: "Authorise" };
+  function dispatchCard(r) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const row = el("div", "row consent-row dispatch-row");
+    row.setAttribute("data-dispatch-job", sv(r.id));
+    const head = el("div", "consent-head");
+    head.appendChild(el("span", "consent-agent", sv(r.agent) || "agent"));
+    head.appendChild(el("b", "consent-tool", sv(r.id)));
+    head.appendChild(el("span", "ext-meta", "dispatch job · " + sv(r.state)));
+    if (sv(r.expires_at)) head.appendChild(el("span", "consent-left", "lease ends " + r.expires_at));
+    row.appendChild(head);
+    if (sv(r.goal)) row.appendChild(el("div", "consent-display", r.goal));
+    const acts = el("div", "needs-actions");
+    for (const o of Array.isArray(r.options) ? r.options : []) {
+      if (!o || typeof o.key !== "string" || !DISPATCH_VERB[o.key]) continue;
+      const btn = el("button", "needs-btn", DISPATCH_VERB[o.key]);
+      btn.type = "button";
+      btn.dataset.dispatchAct = o.key;
+      btn.title = o.key + " this job with your passkey, in the sign sheet";
+      btn.addEventListener("click", () => openDispatchSheet(r.id, sv(r.sha256), o.key));
+      acts.appendChild(btn);
+    }
+    if (acts.childElementCount) row.appendChild(acts);
+    if (sv(r.note)) row.appendChild(el("div", "consent-note ext-meta", r.note));
+    return row;
+  }
+  function dispatchSlot() {
+    const slot = el("div", "dispatch-slot");
+    dispatchFill(slot);
+    return slot;
+  }
+  // the newest fill OF THIS SLOT wins: an older read answering late never redraws over a newer one; a sequence per slot,
+  // so a second slot (the board's and the history's) never stops the first from filling
+  const dispatchFillSeq = new WeakMap();
+  function dispatchFill(slot) {
+    const n = (dispatchFillSeq.get(slot) || 0) + 1;
+    dispatchFillSeq.set(slot, n);
+    dispatchFetch().then((b) => {
+      if (!b || n !== dispatchFillSeq.get(slot)) return;
+      const note = typeof b.note === "string" ? b.note : "";
+      const why = typeof b.elsewhere === "string" ? b.elsewhere : "";
+      if (!b.requests.length && !note) { slot.replaceChildren(); return; }
+      const over = Number.isInteger(b.overflow) && b.overflow > 0 ? [el("div", "consent-note ext-meta", b.overflow + " more not shown")] : [];
+      slot.replaceChildren(el("div", "ext-grouphead", "dispatch jobs"), ...(note ? [el("div", "consent-note ext-meta", note)] : []),
+                           ...(why ? [el("div", "consent-note ext-meta dispatch-why", why)] : []),
+                           ...b.requests.map(dispatchCard), ...over);
+    }).catch(() => {});
+  }
+  // the sheet signed, asked for a reload, or closed: the dispatch read is dropped (as a board reload drops it) and every
+  // dispatch slot on the page reads again, so a job signed or cancelled there never stays on a card for the read's 30 s
+  function dispatchStale() {
+    dispatchRead = null;
+    for (const s of document.querySelectorAll(".dispatch-slot")) dispatchFill(s);
+  }
+  // the Decisions history's standing-rule slots (and the dispatch jobs), drawn together wherever the proposals are
   function standingSlots() {
     const f = document.createDocumentFragment();
-    f.append(proposalSlot(), grantSlot());
+    f.append(proposalSlot(), grantSlot(), dispatchSlot(), dropSlot());
     return f;
   }
 
@@ -6502,6 +6645,7 @@
     modalEpisodeQuery = "";  // a fresh open starts with the recent list, not a stale query
     proposalRead = null;     // a fresh open reads the proposals again: a denial or a grant since withdraws its card
     grantRead = null;        // and the grants again: a revoke since removes its card
+    dispatchRead = null;     // and the dispatch jobs again
     buildModal(entry);
   }
 

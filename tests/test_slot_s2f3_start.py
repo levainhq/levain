@@ -9,6 +9,7 @@ nsenter / bwrap are 2g VM rows; the exact git flag set is run here, as the test 
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -29,6 +30,7 @@ from levain.slot.root_tree import VENDOR_PREFIX
 from tests.execve_guard import refuse_real_execve, using
 from tests.test_slot_s2c_end import mine, thread_run_as
 from tests.test_slot_s2f2_runtime_helper import OP_UID, World, _blob, _prepared
+from tests.vendor_tree import vendor_installed, vendor_prefix  # noqa: F401 - autouse, the real vendor check
 
 E0 = SlotId("egress", 0)
 S0, GW0 = 899, 898          # World's _levain_s0 / _levain_gw0
@@ -119,6 +121,7 @@ class Launches:
         self.states_at_spawn: list[str] = []
         self.states_at_wait: list[str] = []
         self.killed: list[int] = []
+        self.profile_uuid: str | None = None
 
     def spawn(self, argv, spec_json, cgroup, exec_w, detach) -> int:
         pid = self.next_pid
@@ -162,6 +165,17 @@ class Launches:
     def of(self, target: str) -> list[dict]:
         return [r for r in self.spawns if r["target"] == target]
 
+    def capture(self, argv, spec_json, cgroup, bound):
+        """G1b: the Claude identity child is never really forked here; it answers no profile (``no-token``), so a
+        Claude login records ``identity-unparsable``. Every other target keeps the helper's own capture."""
+        if canon.parse(spec_json)["target"] == "identity":
+            self.identity_captures = getattr(self, "identity_captures", 0) + 1
+            if self.profile_uuid is not None:      # G3: the server answers this account
+                body = json.dumps({"account": {"uuid": self.profile_uuid}})
+                return 0, json.dumps({"status": 200, "body": body}, sort_keys=True).encode() + b"\n"
+            return 1, b'{"error":"no-token"}\n'
+        return H.capture_target(argv, spec_json, cgroup, bound)
+
 
 def _fd_open(fd: int) -> bool:
     try:
@@ -179,6 +193,7 @@ def _world(tmp_path, *, host: str = "linux") -> tuple[World, Launches, Table]:
     w.session = None
     s = w.seams
     s.spawn, s.wait, s.wait_within, s.kill = la.spawn, la.wait, la.wait_within, la.kill
+    s.capture = la.capture
     s.netns_names = lambda: {"levain-e0", "levain-e1", "levain-e2", "levain-v0"}
     s.host_links = lambda: {"/bin": "usr/bin", "/sbin": "usr/sbin", "/lib": "usr/lib", "/lib64": None}
     w.cgroups: list[str] = []
@@ -227,7 +242,23 @@ def test_active_recorded_after_exec(env):
     assert la.states_at_spawn[-1] == R.RENDERED                   # not ACTIVE before the exec
     assert la.states_at_wait[-1] == R.ACTIVE                      # ACTIVE while the vendor runs
     assert w.state(s).state == R.ACTIVE
-    assert w.steps[-9:] == ["kind", "discovery", "repo", "clone", "forwarder", "secrets", "exec", "active", "wait"]
+    assert w.steps[-10:] == ["kind", "vendor", "discovery", "repo", "clone", "forwarder", "secrets", "exec", "active",
+                             "wait"]
+
+
+def test_vendor_not_installed_refused_before_the_clone(env, monkeypatch, tmp_path):
+    """1026+8 VENDOR BINARIES: no root copy at VENDOR_PREFIX/bin/<vendor> = ``vendor-not-installed:<vendor>`` at the
+    ``vendor`` step, before the repo step and the clone (it used to surface as the wall's exec-failed errno 2)."""
+    w, la, _ = env
+    s = _rendered(w)
+    empty = tmp_path / "no-vendor-prefix"
+    (empty / "bin").mkdir(parents=True)
+    monkeypatch.setattr(SS, "vendor_ready", lambda host, vendor: SS.check_vendor_installed(host, vendor, prefix=empty))
+    line = w.main(["start", s])[1]
+    assert line["refused"] == "vendor-not-installed:claude", line
+    assert w.steps[-2:] == ["kind", "vendor"]
+    assert la.of("clone") == [] and la.of("vendor") == []
+    assert w.state(s).state == R.RENDERED
 
 
 def test_failed_exec_records_no_active(env):
@@ -583,13 +614,18 @@ def darwin_platform(monkeypatch):
     monkeypatch.setattr(wall.sys, "platform", "darwin")
 
 
-def test_passthrough_interactive_is_the_identity_gates(env):
+def test_passthrough_interactive_runs_the_identity_gate(env, monkeypatch):
+    """G3: the old ``verb-unbuilt:identity-gate`` refusal is gone: a matching account starts the vendor, and the
+    gate's step runs before the clone."""
     w, la, _ = env
+    monkeypatch.setattr(SS, "slot_owner_ok", lambda st: True)
     w.give_credential(E0)
+    la.profile_uuid = "4b8e0c1a-1d2e-4f00-9a7b-0123456789ab"
     s = _rendered(w, "egress", "interactive", "claude", "passthrough",
                   blob=_blob(routes=["claude-sub", "github"]))
-    assert w.main(["start", s])[1]["refused"] == "verb-unbuilt:identity-gate"
-    assert la.spawns == [] and not (_S(w, s) / "repo").exists()
+    assert w.main(["start", s])[1] == {"ok": True, "exit": 0}
+    assert w.steps.index("identity-gate") < w.steps.index("clone")
+    assert w.state(s).fields["identity"] == {"observed_id": la.profile_uuid, "result": "matched"}
 
 
 def test_login_passthrough_starts_with_no_keep_return(env):

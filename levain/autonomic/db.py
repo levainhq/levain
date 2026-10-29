@@ -48,8 +48,8 @@ from pathlib import Path
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 
-__all__ = ["AutonomicDB", "StoreFormatError", "STORE_FORMAT", "STORE_FORMAT_V1", "STORE_FORMAT_V2",
-           "default_store_dir", "migrate_to_v2"]
+__all__ = ["AutonomicDB", "StoreFormatError", "STORE_FORMAT", "STORE_FORMAT_V1", "STORE_FORMAT_V2", "DB_NAME",
+           "default_store_dir", "migrate_to_v2", "store_marker"]
 
 STORE_FORMAT_V1 = "levain-autonomic/1"
 # the format of a store whose bindings fire below CONFIRM only under a signed graduation policy: an older binary
@@ -104,10 +104,10 @@ class StoreFormatError(RuntimeError):
     """The database is not a store of this format (another marker, or not a store at all)."""
 
 
-def _marker(conn: sqlite3.Connection) -> str | None:
-    # the store's format marker, None when there is none (no meta table in the schema, or no format row). Whether
-    # meta exists is asked of sqlite_master, never read from an error's wording; any error of the read itself is
-    # raised as it is, never read as "no marker"
+def store_marker(conn: sqlite3.Connection) -> str | None:
+    """The store's format marker, ``None`` when there is none (no ``meta`` table in the schema, or no format row).
+    Whether ``meta`` exists is asked of ``sqlite_master``, never read from an error's wording; any error of the read
+    itself is raised as it is, never read as "no marker"."""
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone() is None:
         return None
     row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
@@ -119,7 +119,7 @@ def _check_format(conn: sqlite3.Connection) -> None:
     # opened it is refused here. A write holds the write lock from its BEGIN IMMEDIATE, so no migration commits
     # before the block's own writes; a read's snapshot starts at this, its first read, so the block reads the
     # state this check read
-    marker = _marker(conn)
+    marker = store_marker(conn)
     if marker is None:
         raise StoreFormatError("the store has no format marker")
     if marker != STORE_FORMAT:
@@ -138,7 +138,7 @@ def migrate_to_v2(conn: sqlite3.Connection) -> bool:
     together or not at all."""
     if not conn.in_transaction:
         raise RuntimeError("migrate_to_v2 runs inside its caller's write transaction")
-    marker = _marker(conn)
+    marker = store_marker(conn)
     if marker is None:
         raise StoreFormatError("the database has no store format marker: it is not migrated")
     if marker not in (STORE_FORMAT_V1, STORE_FORMAT_V2):

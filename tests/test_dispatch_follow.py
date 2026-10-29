@@ -1021,7 +1021,9 @@ def test_an_fstat_failure_reading_the_export_stops_the_follower_and_retries(stor
 
     def eio(fd):
         raise OSError(5, "Input/output error")
-    monkeypatch.setattr(X.os, "fstat", eio)
+    # only the export module sees the failure: patching os.fstat itself reaches every other thread and library in the process
+    import types
+    monkeypatch.setattr(X, "os", types.SimpleNamespace(**{**vars(os), "fstat": eio}))
     f = artifact_follower(d, export)
     with pytest.raises(F.FollowStopped) as e:
         f.step()

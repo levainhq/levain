@@ -458,6 +458,8 @@ def test_t3_probe_hosts_ordered_tuples_within_vendor_hosts_and_shipped_upstreams
         assert set(hosts) <= SV.VENDOR_HOSTS[vendor] | upstreams, vendor
     assert set(PB.PROBE_HOSTS) == set(SV.VENDOR_HOSTS)
     for r in VR.vendor_routes():          # every shipped route's upstream IS probed for each vendor it serves
+        if "upstream" not in r:           # a CONNECT route (subscription_passthrough) has hosts, no upstream
+            continue
         for vendor in [v for v in SV.VENDOR_HOSTS if SV._hosts(r) & SV.VENDOR_HOSTS[v]]:
             assert r["upstream"]["host"] in PB.PROBE_HOSTS[vendor], (r["route"], vendor)
 
@@ -699,17 +701,16 @@ def penv(tmp_path):
     pr.close()
 
 
+def _v1_entry(r):
+    """A /2 entry cut to what render reads: its id, its type and, for an egress route, its hosts (WF-1b: an egress
+    route with no hosts is refused ``base-map-malformed``)."""
+    return {"route": r["route"], "type": r["type"], **({"hosts": r["hosts"]} if r["type"] == "egress" else {})}
+
+
 def _rendered_probe(w):
-    from levain.contracts import canon
     from tests.test_slot_s2f3_start import _rendered
 
-    base = (w.L / "routes" / "base.json").read_bytes()
-    (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(
-        {"format": "levain-routes-base/1", "routes": [{"route": r["route"], "type": r["type"]}
-                                                      for r in _base_v2()["routes"]]}))
-    s = _rendered(w)          # render reads route types only; the probe reads the full /2 map
-    (w.L / "routes" / "base.json").write_bytes(base)
-    return s
+    return _rendered(w)       # on the full /2 map: render copies the session's entries into the front's file (3b-8a)
 
 
 def _record(w, slot="e0"):
@@ -804,12 +805,7 @@ def test_t6_active_session_is_probeable(penv):
     from tests.test_slot_s2f3_start import _started
 
     w, la, table, pr = penv
-    from levain.contracts import canon
-    v1 = canon.canonical_bytes({"format": "levain-routes-base/1", "routes": [
-        {"route": r["route"], "type": r["type"]} for r in _base_v2()["routes"]]})
-    (w.L / "routes" / "base.json").write_bytes(v1)
-    s = _started(w, la, table)
-    (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(_base_v2()))
+    s = _started(w, la, table)                  # on penv's full /2 map (render copies its entries, 3b-8a)
     assert w.state(s).state == "ACTIVE"
     assert w.main(["probe", s])[1]["probe"] == "closed"
 

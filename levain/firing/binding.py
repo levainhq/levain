@@ -73,6 +73,7 @@ def mark_entity_process() -> None:
     # still inherits the latch; the reverse order left this process latched and that child not
     # (codex L3 r2, reasoned: a two-statement window, so it is fixed by order, not by a test).
     os.environ[LEVAIN_ENTITY_PROCESS_ENV] = "1"
+    os.environ["LEVAIN_SEAT"] = "autonomous"   # a dispatch executor: no human turn reaches it (the band's D4 marker)
     _LATCHED = True
 
 

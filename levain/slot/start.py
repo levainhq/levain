@@ -8,9 +8,15 @@ CONTROL checks, never as a fact root acts on.
 
 ``start``, in §5.1's order, each step named for ``seams.at`` (tests observe the order and inject faults there):
 
-1. ``kind``: kind ``verifier`` answers ``verb-unbuilt:verifier`` (§5.6, session 2f); interactive passthrough answers
-   ``verb-unbuilt:identity-gate`` (the ``keep/`` return + the §7.6 gate are 2f's). A ``login`` session proceeds
-   with no ``keep/`` return: its credential is the one the vendor's login writes.
+1. ``kind``: kind ``verifier`` answers ``verb-unbuilt:verifier`` (§5.6, session 2f). A ``login`` session proceeds
+   with no ``keep/`` return: its credential is the one the vendor's login writes. An interactive passthrough
+   session runs :func:`_identity_gate` at the start of step 4, under the same lock: the slot's baseline read, the
+   parked credential returned from ``keep/`` into the session tree, the vendor's identity call recorded in the state
+   record's ``identity`` and compared with the baseline (``identity-changed`` when it differs). Any refusal there
+   precedes ``<S>/repo`` and the clone, and the credential is parked back into ``keep/``.
+   ``vendor``: root's copy of the session's vendor CLI (its install unit) in ``VENDOR_PREFIX`` is not whole
+   (:func:`check_vendor_installed`; setup and repair copy it there) = ``vendor-not-installed:<vendor>``, before any
+   clone.
 2. ``discovery``: a planted §5.5 name under ``CLAUDE_CONFIG_DIR``, ``CODEX_HOME`` or ``HOME`` is refused by name,
    from listings read through dirfds (render's check decides).
 3. ``egress-ready`` (macOS egress): wall's live pf anchor + alias check, refused by its name.
@@ -37,6 +43,10 @@ CONTROL checks, never as a fact root acts on.
 9. ``active``: CAS RENDERED -> ACTIVE; then the helper stays the vendor's parent until it exits: ``{ok, exit}``.
    A vendor that exec'd but is not recorded ACTIVE is killed with its whole domain (Linux: the session cgroup;
    macOS: every process of the slot uid), then reaped.
+10. ``identity`` (kind ``login`` only, after the vendor exits): :func:`levain.slot.identity.record_login_identity`
+   CASes what the vendor's identity call observed into the state record, for ``confirm-identity`` to read. A
+   refused CAS is noted, never the verb's answer: the login ran. Claude's call spawns its child as the slot
+   (:func:`identity_capture`, under the session END lock); Codex's spawns nothing.
 
 Steps 4-9 run under the session END lock (:func:`_start_fenced`, the spawn fence), released after the CAS's answer.
 
@@ -61,6 +71,7 @@ from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence, 
 from levain.contracts import canon
 from levain.slot import Refused, wall
 from levain.slot import end as E
+from levain.slot import identity as ID
 from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import render as RD
@@ -87,8 +98,7 @@ CLONE_S = 600.0
 
 def read_record(ctx: H.Ctx, session: str) -> Optional[R.SessionState]:
     """The state record as a HINT (§7.1: generation + ``from`` for a CAS CONTROL checks), or None when absent."""
-    data = ctx.store.read(("sessions",), f"{session}.json", trusted=False)
-    return R.parse_state(data) if data is not None else None
+    return ID.read_record(ctx, session)
 
 
 def _list_dir(ctx: H.Ctx, parts: Sequence[str]) -> List[str]:
@@ -135,6 +145,25 @@ def check_discovery(ctx: H.Ctx, a: R.Alloc) -> None:
 
 
 # --- the launch path (wall) ----------------------------------------------------------------------------------------
+
+def check_vendor_installed(host: str, vendor: str, *, prefix: Optional[Path] = None, root_uid: int = 0) -> None:
+    """Root's copy of the vendor's install unit in the vendor prefix can be run
+    (:func:`levain.slot.root_tree.unit_problem`, the one predicate doctor reads too: the binary :func:`vendor_argv`
+    execs: Claude Code's a regular file owned by root, never a link; Codex's root's link to one whole version of its
+    package, every file of it root's): else
+    ``vendor-not-installed:<vendor>``, so a missing copy is named before the clone instead of as the wall's
+    ``exec-failed: errno 2`` after it. ``root_uid``: tests pass their own uid."""
+    from levain.slot.root_tree import unit_problem
+
+    problem = unit_problem(host, vendor, prefix=prefix, root_uid=root_uid)   # type: ignore[arg-type]
+    if problem:
+        raise Refused(f"vendor-not-installed:{vendor}",
+                      f"{problem}; the install helper's setup or repair copies it there")
+
+
+#: The check :func:`start` runs at its ``vendor`` step (tests replace it: their store has no vendor prefix).
+vendor_ready: Callable[[str, str], None] = check_vendor_installed
+
 
 def vendor_argv(host: str, vendor: str, session: str) -> Tuple[str, ...]:
     """The vendor's exec: its binary under the root-owned vendor prefix (§2.1). Claude Code reads the rendered
@@ -600,8 +629,8 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     seams.at("kind")
     if a.kind == "verifier":
         raise Refused("verb-unbuilt:verifier", "a verifier session's start is §5.6, session 2f's")
-    if a.auth == "passthrough" and a.kind == "interactive":
-        raise Refused("verb-unbuilt:identity-gate", "the keep/ return + the §7.6 gate are session 2f's")
+    seams.at("vendor")
+    vendor_ready(seams.host, a.vendor)
     egress = a.slot.slot_class == "egress"
     seams.at("discovery")
     check_discovery(ctx, a)
@@ -616,7 +645,69 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     finally:
         _wake(seams)        # every release: an END that waited on the lock, or refused end-busy, is retried now
     seams.at("wait")
-    return {"exit": seams.wait(pid)}
+    code = seams.wait(pid)
+    if a.kind == "login":
+        seams.at("identity")
+        try:
+            ID.record_login_identity(ctx, a, code)
+        except Refused as e:
+            # The login ran; what it observed is not recorded, so confirm-identity yes refuses no-observed-id.
+            _note(f"identity of {a.session} not recorded: {e.name}")
+    return {"exit": code}
+
+
+#: The owner rule :func:`_identity_gate` hands ``end.return_move`` for the credential's slot-owner check; ``None`` is
+#: return_move's own (``st_uid`` is alloc's slot uid).
+slot_owner_ok: Optional[Callable[[os.stat_result], bool]] = None
+
+
+def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
+    """The interactive passthrough session's keep/ return and §7.6 compare, before the clone (DESIGN g3 §1-§2), under
+    the session END lock the caller holds: the slot's baseline read (:func:`levain.slot.identity.read_slot_baseline`),
+    the vendor's parked credential moved from ``keep/`` into the session tree (:func:`levain.slot.end.return_move`),
+    then :func:`levain.slot.identity.gate_check`. A refusal of the baseline, and the return's three refusals before
+    any move (:data:`_RETURN_UNMOVED`), move nothing. Every other failure once the return was entered (its
+    ``bad-root`` may come after its rename: L3 r1 F1), and every refusal after it, is followed by a best-effort
+    :func:`levain.slot.end.park_move` of the credential back into ``keep/`` (a no-op when it never left): a failure
+    there is noted and END's park is the backstop. No baseline is written on this path."""
+    seams = ctx.seams
+    seams.at("identity-gate")
+    baseline = ID.read_slot_baseline(ctx, a)
+    facts = end_facts(ctx, a)
+    es = end_seams(ctx, a)
+    try:
+        E.return_move(facts, slot_owner_ok=slot_owner_ok, owner_ok=es.owner_ok, fault=es.fault)
+    except Refused as e:
+        if not _return_unmoved(e.name):
+            _park_back(facts, es, a)
+        raise
+    except BaseException:
+        _park_back(facts, es, a)
+        raise
+    try:
+        if seams.host == "linux" and a.cgroup:
+            seams.make_cgroup(a.cgroup)       # no clone has made it yet; the Claude child and its forwarder join it
+        ID.gate_check(ctx, a, baseline)
+    except BaseException:
+        _park_back(facts, es, a)
+        raise
+
+
+#: ``end.return_move``'s refusals that come before any move (``no-credential:<tag>`` by its prefix).
+_RETURN_UNMOVED = ("keep-shape", "keep-return-conflict")
+
+
+def _return_unmoved(name: str) -> bool:
+    return name in _RETURN_UNMOVED or name.startswith("no-credential:")
+
+
+def _park_back(facts: E.EndFacts, es: E.EndSeams, a: R.Alloc) -> None:
+    """:func:`levain.slot.end.park_move` for a gate that refused: the one writer of ``keep/``. Never raises over the
+    refusal the caller is about to raise."""
+    try:
+        E.park_move(facts, owner_ok=es.owner_ok, fault=es.fault)
+    except Exception as e:   # noqa: BLE001 - the gate's own refusal is the answer; END's park is the backstop
+        _note(f"{a.session}: identity gate: the credential was not parked back: {_why(e)}")
 
 
 def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
@@ -637,6 +728,8 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
         raise Refused("already-started", a.session)
     if rec is None or rec.state != R.RENDERED:
         raise Refused("not-rendered", f"{a.session}: {rec.state if rec else 'no record'}")   # SECRETS' own rule
+    if a.kind == "interactive" and a.auth == "passthrough" and a.vendor in E.CREDENTIALS:
+        _identity_gate(ctx, a)
     with ctx.store.dir("live", a.session) as sfd:
         _fresh_repo(ctx, a, sfd)
 
@@ -676,25 +769,7 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
 
     if egress and seams.host == "linux":
         seams.at("forwarder")
-        spec = _spec(ctx, a, "forwarder")
-        argv, cgroup = launch(ctx, a, spec)
-        ready_r, ready_w = os.pipe()
-        fpid: Optional[int] = None
-        try:
-            try:
-                fpid = seams.spawn(argv, spec.to_json(), cgroup, ready_w, True)   # lives until the helper exits
-            finally:
-                os.close(ready_w)
-            ready = _readable(ready_r, FORWARDER_READY_S) and os.read(ready_r, 1) == wall.EXEC_OK
-        except BaseException:
-            if fpid is not None:
-                _abandon(ctx, a, fpid, "forwarder-not-ready")      # spawned, then the ready read failed
-            raise
-        finally:
-            os.close(ready_r)
-        if not ready:
-            _abandon(ctx, a, fpid, "forwarder-not-ready")
-            raise Refused("forwarder-not-ready", f"no ready byte within {FORWARDER_READY_S:g}s")
+        _spawn_forwarder(ctx, a)
 
     seams.at("secrets")
     handles = secret_env(ctx, a)
@@ -731,6 +806,149 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
         _abandon(ctx, a, pid, "active-refused")
         raise
     return pid
+
+
+def _spawn_forwarder(ctx: H.Ctx, a: R.Alloc) -> int:
+    """Linux egress (§9.1): the slot's TCP -> ``gw.sock`` relay in the netns, detached, live until the helper exits;
+    ready only on its ready byte within :data:`FORWARDER_READY_S`, else its domain is killed and ``forwarder-not-ready``.
+    Its pid (the helper's unreaped child). Runs under the session END lock."""
+    seams = ctx.seams
+    spec = _spec(ctx, a, "forwarder")
+    argv, cgroup = launch(ctx, a, spec)
+    ready_r, ready_w = os.pipe()
+    fpid: Optional[int] = None
+    try:
+        try:
+            fpid = seams.spawn(argv, spec.to_json(), cgroup, ready_w, True)   # lives until the helper exits
+        finally:
+            os.close(ready_w)
+        ready = _readable(ready_r, FORWARDER_READY_S) and os.read(ready_r, 1) == wall.EXEC_OK
+    except BaseException:
+        if fpid is not None:
+            _abandon(ctx, a, fpid, "forwarder-not-ready")      # spawned, then the ready read failed
+        raise
+    finally:
+        os.close(ready_r)
+    if not ready:
+        _abandon(ctx, a, fpid, "forwarder-not-ready")
+        raise Refused("forwarder-not-ready", f"no ready byte within {FORWARDER_READY_S:g}s")
+    return fpid  # type: ignore[return-value]
+
+
+# --- the Claude identity call's child (§7.6; 1027-18 RULINGS IG-3, G1b) ------------------------------------------------
+
+def identity_capture(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
+    """The Claude identity call's slot side (:mod:`levain.slot.identity_child`) run AS THE SLOT through wall's
+    ``identity`` target, after the login's vendor exited; its exit status and its stdout, drained by root within
+    :data:`levain.slot.identity.PROFILE_ANSWER_MAX` (the runtime helper's capture). In order, under the session END
+    lock (the spawn fence, as every spawn into the slot):
+
+    1. the alloc re-read unchanged and the record still running (ACTIVE or BRAKED), else ``identity-window`` /
+       ``not-active:<STATE>``: an END that ran since the vendor exited is never raced;
+    2. the session's kill domain ended and proven (:func:`kill_domain`, END's own kill), else ``identity-window``:
+       Linux, the forwarder start left running is a slot-uid process; macOS, launchd's per-uid agents (``distnoted``)
+       run as the slot uid and outlive the vendor (1019-s1design HANDOFF, 1026-14 RULINGS #5), and the bootout ends
+       them and the domain a vendor-registered job would start from;
+    3. no process of the slot uid (proc.py's END proof, as clone-check's window), else ``identity-window``: the slot
+       has no process left to change its credential between this read and END's park;
+    4. Linux egress: a fresh forwarder (:func:`_spawn_forwarder`), so the call reaches the passthrough tunnel;
+    5. the child, its output captured;
+    6. the kill domain ended again (the fresh forwarder reaped) and steps 2-3's proof, whether 4-5 passed or not, so
+       neither outlives the call. On a failed 4-5 a failure here is noted; after an answer it is ``identity-window``.
+
+    The login already ran, so every failure is a :class:`Refused` the caller records: a window check's (the session
+    lock's own refusals, ``session-busy`` among them, and step 1's ``not-active:<STATE>`` keep their names) is
+    ``identity-window``, a 4-5 failure (``forwarder-not-ready`` included) is ``identity-unparsable`` (root read no
+    answer).
+    """
+    seams = ctx.seams
+    try:
+        with H.session_lock(ctx, a.session):
+            return identity_capture_held(ctx, a, states=(R.ACTIVE, R.BRAKED))
+    except Refused:
+        raise
+    except Exception as e:   # noqa: BLE001 - the lock's own open or close: the login ran, so the answer is a name
+        raise Refused("identity-window", f"the session lock: {_why(e)}") from None
+    finally:
+        _wake(seams)        # an END that waited on the lock, or refused end-busy, is retried now
+
+
+def identity_capture_held(ctx: H.Ctx, a: R.Alloc, *, states: Sequence[str]) -> Tuple[int, bytes]:
+    """:func:`identity_capture` steps 1-6 with no session lock taken: the caller holds the session END lock (a second
+    ``session_lock`` would answer ``session-busy``). ``states``: the record states step 1 admits."""
+    _identity_window(ctx, a, states)
+    return _identity_child(ctx, a)
+
+
+def _why(e: BaseException) -> str:
+    if isinstance(e, Refused):
+        return e.name
+    return type(e).__name__ + (f" errno {e.errno}" if isinstance(e, OSError) else "")
+
+
+def _identity_window(ctx: H.Ctx, a: R.Alloc, states: Sequence[str] = (R.ACTIVE, R.BRAKED)) -> None:
+    """:func:`identity_capture` steps 1-3. Any failure is ``identity-window`` but the record's ``not-active:<STATE>``."""
+    try:
+        if H.read_alloc(ctx, a.session) != a:
+            raise Refused("identity-window", f"{a.session}: the alloc changed")
+        rec = read_record(ctx, a.session)
+        if rec is None or rec.state not in states:
+            raise Refused(f"not-active:{rec.state if rec else 'none'}", a.session)
+        _identity_empty(ctx, a, (), "before the call")
+    except Refused as e:
+        if e.name == "identity-window" or e.name.startswith("not-active:"):
+            raise
+        raise Refused("identity-window", _why(e)) from None
+    except Exception as e:   # noqa: BLE001 - the login ran: a named result, never a failed start
+        raise Refused("identity-window", _why(e)) from None
+
+
+def _identity_empty(ctx: H.Ctx, a: R.Alloc, children: Sequence[int], when: str) -> None:
+    """The kill domain ended (``children``, the helper's own, reaped: by the kill, else ``seams.kill``) and proven,
+    then no slot-uid process, else ``identity-window``. Raises whatever the kill or the proof raises."""
+    reaped: frozenset = frozenset()
+    try:
+        res, reaped = kill_domain(ctx, a, children)
+    finally:
+        for pid in children:
+            if pid not in reaped:
+                ctx.seams.kill(pid)
+    if not res.proven:
+        raise Refused("identity-window", f"{when}: the kill domain was not proven empty: {res.name}")
+    if not _no_slot_process(ctx, a):
+        raise Refused("identity-window", f"{when}: a slot-uid process is alive")
+
+
+def _identity_child(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
+    """:func:`identity_capture` steps 4-6."""
+    seams = ctx.seams
+    fpid: Optional[int] = None
+    try:
+        if a.slot.slot_class == "egress" and seams.host == "linux":
+            fpid = _spawn_forwarder(ctx, a)
+        spec = _spec(ctx, a, "identity")
+        argv, cgroup = launch(ctx, a, spec)
+        answer = seams.capture(argv, spec.to_json(), cgroup, ID.PROFILE_ANSWER_MAX)
+    except BaseException as e:
+        try:
+            if fpid is not None:
+                _abandon(ctx, a, fpid, "identity-unparsable")
+            else:
+                _kill_quiet(ctx, a, "identity-unparsable")
+        except Exception as ce:   # noqa: BLE001 - noted, never raised over the call's own failure
+            _note(f"{a.session}: identity-unparsable: the kill after the call failed: {_why(ce)}")
+        if isinstance(e, Exception):
+            raise Refused("identity-unparsable", _why(e)) from None
+        raise
+    try:
+        _identity_empty(ctx, a, () if fpid is None else (fpid,), "after the call")
+    except Refused as e:
+        if e.name == "identity-window":
+            raise
+        raise Refused("identity-window", f"after the call: {_why(e)}") from None
+    except Exception as e:   # noqa: BLE001 - the answer is not kept unless the slot is proven empty after it
+        raise Refused("identity-window", f"after the call: {_why(e)}") from None
+    return answer
 
 
 def _wake(seams: H.Seams) -> None:
@@ -1002,6 +1220,7 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
 __all__ = ["CheckFailed", "CheckStats", "EXEC_MARKER_S", "FORWARDER_READY_S", "FRONT_LOCK", "FRONT_LOCK_WAIT_S",
            "FRONT_REVOKED", "ID_LINE_BYTES", "IndexEntry", "LS_FILES_BOUND", "READSET_PATHS_MAX", "READSET_PATH_BYTES",
            "REVOKE_FRONT_S", "await_exec", "check_attributes", "check_discovery", "check_index", "check_worktree",
-           "clone_check", "discovery_listings", "end_facts", "end_seams", "front_lock", "hash_batches", "kill_domain",
+           "check_vendor_installed", "clone_check",
+           "discovery_listings", "end_facts", "end_seams", "front_lock", "hash_batches", "kill_domain",
            "launch", "parse_ls_files", "read_record", "remove_tree_at", "revoke", "revoke_front", "scrub_and_release",
            "secret_env", "start", "teardown", "vendor_argv"]

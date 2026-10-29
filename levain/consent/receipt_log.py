@@ -220,7 +220,7 @@ def verify(queue_dir: Path | str, *,
     the cockpit the request's agent hook verifies against, :func:`levain.consent.answering.answer_root`). Then its
     ``receipts_head`` must be the head of its size over the log as it stands. Only a current-format store holding
     its ``requests`` and ``receipts`` tables (empty or not) has a log: an empty database, a store of
-    :data:`~levain.consent.queue.PRIOR_FORMAT` (not migrated: verify never migrates) or one lacking either table
+    :data:`~levain.consent.queue.MIGRATES_FROM` (not migrated: verify never migrates) or one lacking either table
     is reported unreadable, ``receipts`` ``None``."""
     from levain.authority import AuthorityError, VerifierUnavailable, anchor_path
     from levain.consent.queue import (_FIELDS, AnswerRefused, ConsentQueue, QueueStoreError, StoreNotCurrent,

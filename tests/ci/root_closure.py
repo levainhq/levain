@@ -61,6 +61,9 @@ DYNAMIC_SITES = {
     # V13: the probe's connector child (stdlib only), built by launch_spec and matched by the stage's spec check
     "levain/slot/wall.py::launch_spec::" 'argv = module_argv(host, PROBE_MODULE, "--result-fd", str(PROBE_RESULT_FD), *probe_addrs)': ("levain.slot.probe_child",),
     "levain/slot/wall.py::_check_probe_spec::" 'prefix = module_argv(h, PROBE_MODULE, "--result-fd", str(PROBE_RESULT_FD))': ("levain.slot.probe_child",),
+    # G1b: the Claude identity call's child (stdlib only), built by launch_spec and matched by the stage's spec check
+    "levain/slot/wall.py::launch_spec::argv = module_argv(host, IDENTITY_MODULE)": ("levain.slot.identity_child",),
+    "levain/slot/wall.py::_check_identity_spec::" 'host = next((h for h in ("darwin", "linux") if s.argv == module_argv(h, IDENTITY_MODULE)': ("levain.slot.identity_child",),
     "levain/slot/wall.py::stage_argv::" 'return module_argv(host, "levain.slot.wall", "--spec-fd", str(spec_fd))': ("levain.slot.wall",),
     "levain/slot/wall.py::trampoline_argv::" 'return module_argv("darwin", "levain.slot.wall", "--exec-fd", str(exec_fd), "--", *argv)': ("levain.slot.wall",),
     # in-process ``importlib`` calls, none run by a root process (empty = no module seeded); each row's reason:
@@ -117,6 +120,7 @@ LAZY_SITES = {
     'levain/slot/control.py::Control._drop_until_acked::from levain.slot.control_client import V23_SECONDS   # lazy: a module-level import would be circular': 'root',
     # S1 3c-4: ``levain.slot.routemaps`` (CONTROL, keys) parses the dispatch route map with ``parse_routemap``
     'levain/broker/policy.py::parse_routemap::from levain.dispatch import routemap_rules as rules': 'root',
+    'levain/slot/end.py::confirmed_relogin::from levain.slot import identity as ID': 'root',
     'levain/slot/export_run.py::_store_delete::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/export_run.py::mount_path::from levain.slot import wall': 'root',
     'levain/slot/export_run.py::scope_path::from levain.slot import wall': 'root',
@@ -168,6 +172,8 @@ LAZY_SITES = {
     'levain/slot/root_tree.py::tree_steps::from levain.slot.generation import generation_id': 'root',
     'levain/slot/runtime_helper.py::_default_client::from levain.slot.control_client import ControlClient': 'root',
     'levain/slot/runtime_helper.py::_front_interlock::from levain.slot import start as SS': 'root',
+    # root: render builds the front's policy file and reads it with the front's own parser (3b-8a)
+    'levain/slot/runtime_helper.py::front_policy_bytes::from levain.broker import front as FR': 'root',
     'levain/slot/runtime_helper.py::read_operator_uid::from levain.slot.install_helper import parse_operator_record': 'root',
     'levain/slot/runtime_helper.py::_start::from levain.slot import start as SS': 'root',
     'levain/slot/runtime_helper.py::_teardown::from levain.slot import start as SS': 'root',
@@ -186,12 +192,19 @@ LAZY_SITES = {
     'levain/slot/runtime_helper.py::verify_sealed_run::from levain.slot import adopt_verify as AV': 'root',
     'levain/slot/runtime_helper.py::verify_sealed_run::from levain.slot import export_run as ER': 'root',
     'levain/slot/runtime_helper.py::verify_sealed_run::from levain.slot import importer as IM': 'root',
+    # the identity gate (1027+18 idg1): confirm-identity's handler and the baseline reader prepare runs
+    'levain/slot/runtime_helper.py::_baseline_vendor::from levain.slot import identity as ID': 'root',
+    'levain/slot/runtime_helper.py::_confirm_identity::from levain.slot import identity as ID': 'root',
+    'levain/slot/runtime_helper.py::status::from levain.slot import identity as ID': 'root',
+    # G1b: the Claude identity call spawns its child through start (identity is imported by start at module level)
+    'levain/slot/identity.py::_claude_call::from levain.slot import start as SS': 'root',
     # the root discard / restore verbs (VERB_HANDLERS, operator-uid caller; land16)
     'levain/slot/runtime_helper.py::_store_verb::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/runtime_helper.py::_store_verb::from levain.slot.root_intent import PhaseFailed': 'root',
     'levain/slot/runtime_helper.py::discard::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/runtime_helper.py::restore::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/service_boot.py::main::from levain.slot.units import services_for': 'root',
+    'levain/slot/start.py::check_vendor_installed::from levain.slot.root_tree import unit_problem': 'root',
     'levain/slot/start.py::vendor_argv::from levain.slot.layout import STORE': 'root',
     'levain/slot/start.py::vendor_argv::from levain.slot.root_tree import VENDOR_PREFIX': 'root',
     'levain/slot/store_verbs.py::retained_whole::from levain.slot import end as E': 'root',
@@ -213,6 +226,8 @@ LAZY_SITES = {
     'levain/slot/wall.py::_check_probe_spec::from levain.slot.grammar import SESSION_RE': 'root',
     'levain/slot/wall.py::_check_probe_spec::from levain.slot.layout import STORE': 'root',
     'levain/slot/wall.py::_check_probe_spec::from levain.slot.probe_child import MAX_ADDRS, probe_address': 'root',
+    'levain/slot/wall.py::_check_identity_spec::from levain.slot.grammar import SESSION_RE': 'root',
+    'levain/slot/wall.py::_check_identity_spec::from levain.slot.layout import STORE': 'root',
     'levain/slot/wall.py::module_argv::from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON, boot_path_code': 'root',
     'levain/slot/wall.py::clone_argv::from levain.slot.render import READSET_KINDS, READSET_TEMPLATE': 'root',
     'levain/slot/wall.py::clone_argv::from levain.slot.runtime_grammar import KINDS': 'root',
@@ -242,10 +257,23 @@ LAZY_SITES = {
     # operator: <- ``reset_lock`` <- ``reset_anchor`` <- ``levain/cockpit/keys.py`` (the operator's anchor reset; ``git grep -n 'reset_anchor(' -- levain``)
     'levain/authority.py::_no_live_cockpit::from levain.cockpit.broker import LOCK_NAME': 'operator',
     # root: the target is a closure member already (an import-time import of another member), so this row adds nothing to the closure; not traced further
+    'levain/authority.py::_graduation_guard_problem::from levain.autonomic.coverage import guard_problem': 'root',
     'levain/authority.py::_parse_stamp::from levain.cockpit.consent import parse_stamp': 'root',
     'levain/authority.py::_ranks::from levain.cockpit.firejournal import _CLASS_RANK': 'root',
     'levain/authority.py::_stamp::from levain.cockpit.consent import utc_stamp': 'root',
     'levain/autonomic/journal.py::RunJournal._barrier::from levain.autonomic.binding import registry_bars': 'root',
+    # root: lazy because ``schema3`` imports ``journal`` at module level (a hoist is a cycle); ``schema3`` is already a closure member through ``binding``'s import-time import, so this row adds nothing to the closure
+    'levain/autonomic/journal.py::_insert_receipt::from levain.autonomic.schema3 import close_subject': 'root',
+    # root: the same cycle and the same already-member target as ``_insert_receipt`` above
+    'levain/autonomic/journal.py::close_effect_in::from levain.autonomic.schema3 import effect_subject': 'root',
+    # root: the same cycle and the same already-member target as ``_insert_receipt`` above
+    'levain/autonomic/journal.py::_closer_of::from levain.autonomic.schema3 import _effect_key': 'root',
+    'levain/autonomic/journal.py::close_not_started_in::from levain.autonomic.schema3 import _closed, count_held, effect_subject, held_limit': 'root',
+    'levain/autonomic/journal.py::intent_in::from levain.autonomic.schema3 import effect_subject': 'root',
+    'levain/autonomic/journal.py::effect_seal_in::from levain.autonomic.schema3 import hold_decision': 'root',
+    # root: the same cycle and the same already-member target as ``_insert_receipt`` above (R15-5 S1)
+    'levain/autonomic/journal.py::RunJournal.__init__::from levain.autonomic.schema3 import AutonomicStore3': 'root',
+    'levain/autonomic/journal.py::RunJournal._intent3::from levain.autonomic.schema3 import CLOSE_STATES, CloseUnbuildable, dry_run_close, effect_subject, utc_text': 'root',
     'levain/cockpit/authority.py::RequestAuthority.capture::from levain import authority as auth': 'root',
     'levain/cockpit/authority.py::RequestAuthority.capture::from levain.cockpit.firejournal import UNINITIALISED, _meta, conn_init_hint': 'root',
     'levain/cockpit/authority.py::RequestAuthority.fence::from levain.cockpit.firejournal import authority_fence': 'root',
@@ -255,8 +283,30 @@ LAZY_SITES = {
     'levain/dispatch/contract.py::git_env::from levain.launch import child_env': 'root',
     'levain/dispatch/published.py::sync::from levain.qbroker.grants import PUBLISHED_MAX   # here: grants imports this module': 'root',
     'levain/dispatch/published.py::sync::from levain.qbroker.store import replace_file': 'root',
-    # operator: <- ``StandingPolicy.apply`` (``git grep -n 'policy.apply(' -- levain`` finds ``levain/cockpit/broker.py`` and ``verbs.py`` only) and ``classify`` / ``_validate_policy`` / ``_apply_policy_op`` (the replay, ``_step``)
-    'levain/authority.py::_tiers::from levain.cockpit.verbs import TIERS': 'operator',
+    # root: ``record_verification`` <- ``follow.EventFollower`` (the dispatch service's ``follow_run.main``)
+    'levain/dispatch/jobs.py::JobStore.record_verification::from levain.dispatch import adopt': 'root',
+    # root: ``_stored_record`` <- ``record_verification`` / ``run_records`` <- ``follow.EventFollower`` (the dispatch service)
+    'levain/dispatch/jobs.py::_stored_record::from levain.dispatch.adopt import ArtifactRecord, artifact_digest': 'root',
+    # root: ``_verified_at`` <- ``record_verification`` <- ``follow.EventFollower`` (the dispatch service)
+    'levain/dispatch/jobs.py::_verified_at::from levain.slot import records as SR': 'root',
+    # operator: ``recommend`` <- ``dispatch/cli.py`` and ``dispatch/mcp.py``; the follower never calls it
+    'levain/dispatch/jobs.py::JobStore.recommend::from levain.dispatch import adopt': 'operator',
+    # operator: ``JobStore.__init__`` calls it only for ``directory=None``; ``follow_run.main`` passes ``a.store_dir``, and ``dispatch/cli.py`` / ``control.py`` are the other callers
+    'levain/dispatch/jobs.py::default_dispatch_dir::from levain.consent.queue import default_queue_dir': 'operator',
+    # operator: ``land`` <- ``dispatch/cli.py`` (``levain dispatch land``), the only caller; the follower never lands
+    'levain/dispatch/adopt.py::_human_refusal::from levain.consent.queue import AuthoritySource': 'operator',
+    # operator: ``land`` <- ``dispatch/cli.py`` (``levain dispatch land``), the only caller; the follower never lands
+    'levain/dispatch/adopt.py::_human_refusal::from levain.dispatch.jobs import _replay': 'operator',
+    # operator: ``authorise_refusal`` <- ``land`` (``dispatch/cli.py``) and ``JobStore.authorise``, neither run by the follower
+    'levain/dispatch/adopt.py::authorise_refusal::from levain.consent.passkey import answer_signature_problem': 'operator',
+    # operator: ``floor`` <- ``land`` <- ``dispatch/cli.py`` (``levain dispatch land``)
+    'levain/dispatch/adopt.py::floor::from levain.dispatch.control import ControlStateUnavailable': 'operator',
+    # operator: ``sweep_staged`` <- ``dispatch/cli.py`` (after a land, and the sweep verb); ``record_verification`` calls ``_delete_staged``, not this
+    'levain/dispatch/adopt.py::sweep_staged::from levain.dispatch.jobs import JobStoreError': 'operator',
+    # operator: ``driver_template_digest`` <- ``doctor.py`` / ``dispatch/cli.py``; nothing the follower runs reads a driver template
+    'levain/dispatch/registry.py::driver_template_path::from levain import verifier_drivers': 'operator',
+    # operator: ``body_refusal`` <- ``dispatch/cli.py`` and ``dispatch/control.py``; the follower reads no registry
+    'levain/dispatch/registry.py::_verifier_entry_problem::from levain.verifier_drivers import output_compare': 'operator',
     # operator: <- ``_validate_egress_key`` (``_validate_grant`` <- ``_validate_policy`` / ``_apply_policy_op``, the replay: the authority replay (``_step`` <- ``_replay_entry`` <- ``snapshot``, run by ``consent.queue.AuthoritySource`` and ``cockpit.authority.RequestAuthority.capture``); the queue broker builds its ``AuthoritySnapshot`` from published signers (``qbroker.grants.contract_authority``) and runs neither (``git grep -n -e 'snapshot(' -e 'authority_source' -e 'RequestAuthority(' -- levain/qbroker`` finds none)) and ``levain/chat_egress/advert.py``
     'levain/authority.py::egress_key_host_problem::from levain.chat_egress.parse import canonical_host': 'operator',
     # operator: <- ``_validate_egress_key`` (the replay's grant validation, as ``egress_key_host_problem``) and ``levain/chat_egress/advert.py``
@@ -598,6 +648,16 @@ NOT_ROOT_TESTS = {
     "tests/test_autonomic_gate_coverage_r2.py": ("needs conftest's test_only_confined_executor fixture",
         "test_only_confined_executor", _CONFTEST_EXECUTOR),
     "tests/test_autonomic_graduation.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_attempts_readers.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_gate_v3_s2.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_gate_v3_s2f.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_gate_v3_s2fx.py": ("needs conftest's test_only_confined_executor fixture",
+        "test_only_confined_executor", _CONFTEST_EXECUTOR),
+    "tests/test_autonomic_gate_v3_s2fx2.py": ("needs conftest's test_only_confined_executor fixture",
         "test_only_confined_executor", _CONFTEST_EXECUTOR),
     "tests/test_autonomic_l3_fixes.py": ("its enrolled test key verifies only under conftest's autouse signers-owner "
                                          "fixture", "confirm_signers", _CONFTEST_SIGNERS),

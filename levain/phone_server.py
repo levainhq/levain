@@ -61,6 +61,11 @@ it; delete that file to make a new one); it is not the cockpit's write token and
 opens nothing on the cockpit. The https name is configured, never read from a request: it is the WebAuthn rpId, and a
 passkey enrolled on it signs that name's hash, which ssh-keygen checks against the key's application.
 
+``levain consent phone --redirect-to <origin>`` (ONESURFACE OS-4) runs this port as a redirect ONLY
+(:func:`run_phone_redirect`): ``/`` and ``/phone.html`` serve one page whose one script sends an old phone link
+(``#phone_token=…&sign=<id>&v=…&choice=…``) to the cockpit's sheet, ``<origin>/sign/<id>#v=…&choice=…``, dropping the
+token; every other path is 404, and no token is minted or read.
+
 Why a separate listener: a proxy's clients and the laptop's own processes share 127.0.0.1, so no header the cockpit
 reads can tell them apart (measured through ``tailscale serve`` 2026-10-16: the Host is the client's, X-Forwarded-For
 is the proxy's). A listener that serves nothing else needs no such test.
@@ -89,8 +94,8 @@ from urllib.parse import parse_qs
 from levain.http_guards import LISTEN_BACKLOG, GuardedHandler
 from levain.webpush.held import tick as held_tick
 
-__all__ = ["DEFAULT_PHONE_PORT", "PHONE_TOKEN_HEADER", "PhoneError", "make_phone_server", "run_phone_server",
-           "tailscale_name"]
+__all__ = ["DEFAULT_PHONE_PORT", "PHONE_TOKEN_HEADER", "PhoneError", "make_phone_server", "make_redirect_server",
+           "redirect_origin", "run_phone_redirect", "run_phone_server", "tailscale_name"]
 
 DEFAULT_PHONE_PORT = 7428
 PHONE_TOKEN_HEADER = "X-Levain-Phone-Token"
@@ -1425,3 +1430,152 @@ def _drop_link_file(path: Path) -> None:
             path.unlink()
     except (OSError, ValueError, AttributeError):
         pass
+
+
+# -- ONESURFACE OS-4: the old phone origin as a redirect only ---------------------------------------------------------
+
+_REDIRECT_PAGES = frozenset({"/", "/phone.html"})
+_REDIRECT_SCRIPT = "/phone_redirect.js"
+
+
+def redirect_origin(text: object) -> str:
+    """``--redirect-to``: the cockpit's bare origin by :func:`levain.consent.sign.cockpit_origin`'s one rule (the
+    rule sign links are built by). The page sends every link it is opened with there, so it is configured whole,
+    never read from a link."""
+    from levain.consent.sign import cockpit_origin
+
+    try:
+        return cockpit_origin(text)
+    except ValueError:
+        raise ValueError(f"--redirect-to: {str(text)[:80]!r} is not the cockpit's origin (https://<name>[:<port>], "
+                         "nothing after it)") from None
+
+
+def _redirect_page(origin: str) -> str:
+    """The page the old phone link opens: no data, one script, the target in a meta the script reads."""
+    import html
+
+    esc = html.escape(origin, quote=True)
+    return ('<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<meta name="referrer" content="no-referrer">'
+            f'<meta name="levain-redirect-to" content="{esc}">'
+            f'<title>levain</title><script src="{_REDIRECT_SCRIPT}"></script></head>'
+            f'<body><p>This page moved to the cockpit.</p><p><a href="{esc}/">Open the cockpit</a></p></body></html>\n')
+
+
+class _RedirectHandler(GuardedHandler):
+    """``/`` and ``/phone.html`` (the page), ``/phone_redirect.js`` (its script); 404 for everything else, and no
+    credential of any kind is read or minted."""
+
+    server_version = "levain-phone"
+
+    def _cross_site_read(self) -> bool:
+        """The cross-site refusal, less a top-level navigation to the page: the old link opened from another app
+        arrives cross-site. Its script and any fetch of the page stay refused."""
+        if not super()._cross_site_read():
+            return False
+        return not (self.command == "GET" and self.path.split("?", 1)[0] in _REDIRECT_PAGES
+                    and self.headers.get("Sec-Fetch-Mode") == "navigate"
+                    and self.headers.get("Sec-Fetch-Dest") == "document")
+
+    def _route(self, *, head: bool) -> None:
+        if self._refuse_read(head=head):
+            return
+        route = self.path.split("?", 1)[0]
+        no_referrer = [("Referrer-Policy", "no-referrer")]
+        if route in _REDIRECT_PAGES:
+            self._send(self.server.page, "text/html; charset=utf-8", head=head, headers=no_referrer)
+        elif route == _REDIRECT_SCRIPT:
+            self._send(self.server.script, "text/javascript; charset=utf-8", head=head, headers=no_referrer)
+        else:
+            self._send(b"not found: this port only opens the cockpit\n", "text/plain; charset=utf-8", status=404,
+                       head=head)
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+        self._reject(404, "not_found", "this port only opens the cockpit")
+
+
+class _RedirectServer(ThreadingHTTPServer):
+    request_queue_size = LISTEN_BACKLOG
+    daemon_threads = True
+
+    def __init__(self, address: tuple[str, int], *, name: str, origin: str) -> None:
+        from levain.web_server import load_web_asset
+
+        # both built before binding: a fault leaves no socket
+        script = load_web_asset("phone_redirect.js").encode("utf-8")
+        page = _redirect_page(origin).encode("utf-8")
+        super().__init__(address, _RedirectHandler)
+        self.allowed_hosts = _LOOPBACK_HOSTS | {str(self.server_address[0]).lower(), name}
+        self.origin = origin
+        self.page = page
+        self.script = script
+
+
+def make_redirect_server(name: str, redirect_to: str, *, host: str = "127.0.0.1",
+                         port: int = DEFAULT_PHONE_PORT) -> _RedirectServer:
+    """A bound (not yet serving) redirect-only phone port for the https name ``name``, sending every old phone link to
+    the cockpit at ``redirect_to`` (:func:`redirect_origin`). Loopback only, as the full port."""
+    from levain.consent.passkey import is_host_name
+
+    origin = redirect_origin(redirect_to)
+    if host != "localhost" and not _is_loopback_address(host):
+        raise ValueError(f"the phone port binds loopback only (a proxy you run puts it on https), not {host!r}")
+    if not is_host_name(name):
+        raise ValueError(f"refusing {str(name)[:80]!r}: the https name must be a lowercase DNS name a proxy serves "
+                         "this port on (no scheme, port or path, not an address)")
+    return _RedirectServer((host, port), name=name, origin=origin)
+
+
+def run_phone_redirect(redirect_to: str, *, name: str | None, tailscale: bool, port: int,
+                       link_file: Path | None = None) -> int:
+    """``levain consent phone --redirect-to <origin>``: serve only the redirect page until interrupted. With
+    ``link_file``, that file (0600) holds ``{"page": "<origin>/", "pid"}``, no token, and is removed when this run
+    stops."""
+    if name is None:
+        if not tailscale:
+            print("name the https name the old phone links name: --name NAME, or --tailscale", file=sys.stderr)
+            return 2
+        name, why = tailscale_name()
+        if name is None:
+            print(f"--tailscale: {why}", file=sys.stderr)
+            return 2
+    try:
+        httpd = make_redirect_server(name, redirect_to, port=port)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    bound = httpd.server_address[1]
+    print(f"levain phone port (redirect only) on http://127.0.0.1:{bound}/ for https://{name}/: every old phone "
+          f"link opens on {httpd.origin}/", flush=True)
+    import signal
+
+    def _stop(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    before = (signal.signal(signal.SIGTERM, _stop)
+              if link_file is not None and threading.current_thread() is threading.main_thread() else None)
+    try:
+        if link_file is not None:
+            from levain.consent.sign import _write_over
+
+            try:
+                _write_over(link_file, json.dumps({"page": httpd.origin + "/", "pid": os.getpid()}) + "\n")
+            except OSError as exc:
+                print(f"--link-file: cannot write {link_file}: {exc.strerror or exc}", file=sys.stderr)
+                return 1
+            print(f"  the sign links' origin is in {link_file}", flush=True)
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+        if link_file is not None:
+            _drop_link_file(link_file)
+        if before is not None:
+            signal.signal(signal.SIGTERM, before)
+    return 0

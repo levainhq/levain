@@ -19,7 +19,7 @@ from levain.slot import Refused
 
 VERBS = ("setup", "repair", "undo", "replenish", "set-retention", "set-dispatch-retain",
          "set-ceiling", "set-signers", "purge", "force-retire", "set-credential", "remove-credential", "set-limits",
-         "routes-base", "routes-trust", "enrol-authority-signer", "remove-authority-signer")
+         "routes-base", "routes-trust", "routes-egress", "enrol-authority-signer", "remove-authority-signer")
 
 #: Verbs that run with a live lease (CONTRACT §5.2); every other verb refuses ``live-lease``. The credential verbs
 #: too: keys reads a credential on demand, so a rotation takes effect on the next exchange (design 1.8 Bootstrap).
@@ -27,9 +27,10 @@ VERBS = ("setup", "repair", "undo", "replenish", "set-retention", "set-dispatch-
 #: while its lease is live (slot limits DESIGN §3).
 #: ``routes-base`` / ``routes-trust`` too (3c-9): keys re-reads ``base.json`` at every ``Q`` and CONTROL reads the trust
 #: pair at each route submission, so neither write waits for the operator's sessions to end.
+#: ``routes-egress`` too (WF-1b): one root file, as ``routes-base``.
 #: The authority signer verbs too (14b S5): one root file the coverage source re-reads at every refresh.
 LEASE_EXEMPT = frozenset({"purge", "force-retire", "set-credential", "remove-credential", "set-limits", "routes-base",
-                          "routes-trust", "enrol-authority-signer", "remove-authority-signer"})
+                          "routes-trust", "routes-egress", "enrol-authority-signer", "remove-authority-signer"})
 
 #: Q16, L3 r1 Q1: the intent marker ``routes-trust --replace`` writes in ``L/routes`` before its first move and removes
 #: after the new pair is read back. While it is there a replace is half done: CONTROL's start and keys' start refuse
@@ -318,7 +319,8 @@ def parse_install_argv(argv: Sequence[str]) -> InstallCommand:
             raise Refused("extra-argv", repr(rest[0]))
         _exact(verb, rest, 2)
         return InstallCommand(verb, source=_root_syntax(rest[1]))
-    _exact(verb, rest, 0)   # repair, undo, replenish, routes-base; set-ceiling, set-signers, set-limits, routes-trust: stdin only
+    _exact(verb, rest, 0)   # repair, undo, replenish, routes-base; set-ceiling, set-signers, set-limits, routes-trust,
+    #                         routes-egress: stdin only
     return InstallCommand(verb)
 
 

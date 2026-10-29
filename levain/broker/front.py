@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import hashlib
 import ipaddress
 import json
@@ -42,6 +43,7 @@ import os
 import re
 import signal
 import socket
+import stat
 import sys
 import threading
 import time
@@ -95,6 +97,13 @@ _ROUTE_ID = re.compile(r"^[a-z0-9-]{1,48}\Z")
 STATUS_A_S = 5.0
 #: V34: after a refusal written mid-body, the front discards the slot's remaining body for at most this long.
 DISCARD_S = 5.0
+#: 3b-8a T1 (the head's shape: a cap and one rotated file): the tunnel log's size cap. Past it the front renames the log
+#: to `<log>.1` (replacing the last one) and starts a new one, so a slot's refusal flood holds at most two caps.
+#: [judged by s3b8af1, 10-26, against no measurement]
+LOG_CAP = 4 * 1024 * 1024
+#: the log's mode whatever the umask the front inherits: its account and the dir's group (root) only.
+LOG_MODE = 0o640
+_LOG_OPEN = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 
 # --- policy ---------------------------------------------------------------------------------------------------
@@ -146,7 +155,11 @@ def load_policy(data: bytes) -> FrontPolicy:
     brokered_hosts: set[str] = set()
     brokered: dict[str, RoutePolicy] = {}
     for raw in doc["routes"]:
-        pol = parse_route(raw, source="dispatch-session" if doc["kind"] in DISPATCH_KINDS else "session")
+        # an entry is a priced map's (no per-call cap) or a `/1` map's (a per-call cap); the front enforces neither
+        # cap (keys does), so each entry is read as the format it came from.
+        per_call = isinstance(raw, dict) and "max_call_microdollars" in raw
+        pol = parse_route(raw, source="dispatch-session" if doc["kind"] in DISPATCH_KINDS else "session",
+                          per_call=per_call)
         route, typ = pol.route, pol.type
         if route in seen:
             raise PolicyError(f"route {route} twice")
@@ -345,6 +358,11 @@ def connect_target(policy: FrontPolicy, target: bytes) -> tuple[ConnectRoute, in
 
 #: the most of a refused CONNECT's host the log line carries: a DNS name's length.
 REFUSED_HOST_CAP = 253
+
+#: WF-1b (wf1a return ruling 3): an off-list refusal's line names how the operator adds a host. The agent's own error
+#: text names no host (measured by lane-wfetch on Claude Code 2.1.310: "Error: proxy refused the connection", wfetch
+#: DESIGN §1.4), so this line is where the remedy can be read.
+OFF_LIST_REMEDY = "sudo install-helper routes-egress"
 
 
 def refused_host_fields(target: object) -> dict:
@@ -1089,11 +1107,13 @@ def _keepalive(writer: asyncio.StreamWriter) -> None:
 class Front:
     def __init__(self, policy: FrontPolicy, *, log_path: Optional[Path | str] = None,
                  slot_uid: Optional[int] = None, resolve: Resolver = system_resolve,
-                 connect: Connector = open_by_address, keys_path: Optional[str] = None) -> None:
+                 connect: Connector = open_by_address, keys_path: Optional[str] = None,
+                 log_cap: int = LOG_CAP) -> None:
         self.policy = policy
         #: keys' `R/keys/front.sock`: every brokered exchange is one connection to it. None = no keys (503).
         self.keys_path = keys_path
         self.log_path = Path(log_path) if log_path is not None else None
+        self.log_cap = log_cap
         self.slot_uid = slot_uid
         self._resolve = resolve
         self._connect = connect
@@ -1104,16 +1124,51 @@ class Front:
         self.bound: Optional[tuple[str, int]] = None
 
     def _log(self, rec: dict) -> None:
-        rec = {"at": round(time.time(), 3), "session": self.policy.session, **rec}
-        line = json.dumps(rec, sort_keys=True) + "\n"
+        head = {"at": round(time.time(), 3), "session": self.policy.session}
+        line = json.dumps({**head, **rec}, sort_keys=True) + "\n"
         try:
             if self.log_path is None:
                 sys.stderr.write(line)
-            else:
-                with self.log_path.open("a", encoding="utf-8") as fh:
-                    fh.write(line)
+                return
+            data = line.encode("utf-8")
+            if len(data) > self.log_cap:      # one record past the whole cap would break the two-cap bound
+                data = (json.dumps({**head, "event": "log-record-dropped", "bytes": len(data)}, sort_keys=True)
+                        + "\n").encode("utf-8")
+            self._append(self.log_path, data)
         except OSError as e:
             print(f"levain gw-front: log write failed ({e}): {line}", file=sys.stderr, end="")
+
+    def _append(self, path: Path, data: bytes) -> None:
+        """Append ``data`` to the log: opened ``O_NOFOLLOW`` (a link there is an error, never followed), a regular
+        file only, set to LOG_MODE. When ``data`` would take a non-empty log past the cap, the log is first renamed
+        to ``<log>.1`` (replacing the previous one) and a new log made. The front is the log's only writer."""
+        fd = self._open_log(path)
+        try:
+            size = os.fstat(fd).st_size
+            if size and size + len(data) > self.log_cap:
+                os.close(fd)
+                fd = -1
+                os.replace(path, path.with_name(path.name + ".1"))
+                fd = self._open_log(path)
+            while data:
+                data = data[os.write(fd, data):]
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    @staticmethod
+    def _open_log(path: Path) -> int:
+        fd = os.open(path, _LOG_OPEN, LOG_MODE)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(errno.EINVAL, "the log is not a regular file", str(path))
+            if stat.S_IMODE(st.st_mode) != LOG_MODE:
+                os.fchmod(fd, LOG_MODE)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         if self.clients >= MAX_CONNS:
@@ -1283,9 +1338,11 @@ class Front:
 
     async def _refuse(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, r: Refused,
                       target: Optional[bytes] = None) -> None:
-        """Answer ``r`` and log it; a refused CONNECT's line also names its host (:func:`refused_host_fields`)."""
+        """Answer ``r`` and log it; a refused CONNECT's line also names its host (:func:`refused_host_fields`), and an
+        off-list one the remedy (:data:`OFF_LIST_REMEDY`)."""
         self._log({"event": "refused", "refused": r.name, "detail": r.detail,
-                   **(refused_host_fields(target) if target is not None else {})})
+                   **(refused_host_fields(target) if target is not None else {}),
+                   **({"remedy": OFF_LIST_REMEDY} if (r.name, r.detail) == ("host-not-allowed", "off-list") else {})})
         body = r.name.encode() + b"\n"
         writer.write(b"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
                      b"X-Levain-Refused: %s\r\nConnection: close\r\n\r\n%s"
@@ -1401,7 +1458,8 @@ async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[
     return 0
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def build_parser():
+    """The front's argv grammar (root's ``runtime_helper.gateway_front_args`` builds the one it is started with)."""
     import argparse
 
     ap = argparse.ArgumentParser(prog="python -m levain.broker.front")
@@ -1419,6 +1477,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--keys", required=True,
                     help="keys' R/keys/front.sock: the STATUS connection is opened after GO and the listener bound "
                          "only after keys' A; brokered exchanges go there")
+    return ap
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    ap = build_parser()
     a = ap.parse_args(argv)
     # every argument is checked before the GO fd is read: a bad one exits at once instead of after render's byte
     if a.unix is not None and a.slot_uid is None:

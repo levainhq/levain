@@ -232,7 +232,7 @@ class LevainImplementation(Implementation):
                     "mcp_fields": {tool: fields}}})
             except Exception as exc:                         # the log refused the grant: reported with its words
                 raise NotExpressible(f"a consent-mcp grant cannot cover tool {tool!r} with fields {fields}: {exc}") from None
-        queue = ConsentQueue(home / "consent", authority=log.source, clock=clock)
+        queue = ConsentQueue(home / "consent", authority=log.source, home=home, clock=clock)
         request = queue.file(agent=agent, agent_session_id="suite", tool_name=tool, tool_input=arguments, cwd=cwd,
                              hold=timedelta(minutes=5))
 

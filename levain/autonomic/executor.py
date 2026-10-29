@@ -20,7 +20,7 @@ from levain.autonomic.posture import Posture
 from levain.autonomic.risk import ActionRisk
 from levain.autonomic.trust import TrustContext
 
-__all__ = ["ActionRequest", "ExecutionResult", "Executor"]
+__all__ = ["ActionRequest", "ExecutionResult", "Executor", "OutcomeUnknown"]
 
 
 @dataclass(frozen=True)
@@ -98,12 +98,26 @@ class ExecutionResult:
     records the gate's APPROVAL; ``fired`` on the GateOutcome reflects ``ok``). ``detail`` is a
     human-readable result (e.g. the written file path); ``downstream_id`` is the id of the thing
     created/sent — the receipt's ``downstream_claim_or_action_id`` (the action the influence
-    changed)."""
+    changed).
+
+    ``outcome_unknown`` True = whether the effect happened cannot be proven (the executor raised
+    :class:`OutcomeUnknown`); the gate records it as such, never as a fire or a plain failure.
+    ``started`` False = an ``ok=False`` result that started nothing (no effect began); every result
+    that does not say so keeps the meaning every result had before the field, ``True``."""
 
     ok: bool
     detail: str = ""
     error: str | None = None
     downstream_id: str | None = None
+    outcome_unknown: bool = False
+    started: bool = True
+
+
+class OutcomeUnknown(Exception):
+    """A reserved executor's effect may or may not have happened, and the executor cannot prove which
+    (its child was started, and what is on disk afterwards is not the one expected result, or the
+    child's user could not be shown to have stopped). The effect is never run again and never counted
+    as a fire."""
 
 
 @runtime_checkable
@@ -118,7 +132,21 @@ class Executor(Protocol):
     provably runs it through levain's confinement floor, as the entity's separate hands user, never
     unconfined in the operator's process. No executor can prove that until the M2 hands wiring exists, and
     an executor's own declaration is not proof, so the gate refuses every binding effect up front
-    (``executor_not_confined``). A manual (human-present) action is not a binding effect."""
+    (``executor_not_confined``). A manual (human-present) action is not a binding effect.
+
+    Optional methods, which the gate calls only on an executor that has them:
+
+    - ``preflight(action_name, payload, *, context_id, journaled) -> str | None``: the permanent reason
+      this action can never run on this executor (an unknown action, a payload for another entity or
+      that does not match itself, a route the action may not take), or ``None``. Pure: no I/O, nothing
+      started. ``context_id`` and ``journaled`` are keyword-only, with no default.
+    - ``execute_reserved(action_name, payload, *, context_id, reservation, journaled)``: the effect,
+      run under a reservation the caller holds. A reserved executor raises only to say one of two
+      things: :class:`OutcomeUnknown` (the outcome cannot be proven) or
+      :class:`levain.autonomic.journal.EffectNotStarted` (nothing began). Raising ``EffectNotStarted``
+      after any part of the effect began breaks this contract, and the journal cannot detect it.
+    - ``last_check(reservation) -> str | None``: the last look before an effect starts; a short answer
+      (``"live"``, ``"cannot_tell"``) when something is in the way, else ``None``. Never raises."""
 
     name: str
 

@@ -22,7 +22,7 @@ from levain.cockpit.firejournal import CockpitDB
 from levain.graduation_policy import AuthorityCoverage
 
 pytest.importorskip("cryptography")
-from tests.test_authority_graduation_kind import World, grad, opt_in, renew  # noqa: E402
+from tests.test_authority_graduation_kind import World, grad, guard_file, opt_in, renew  # noqa: E402
 from tests.test_autonomic_gate_coverage import CWorld  # noqa: E402
 from tests.test_autonomic_journal_wiring import HIGH, LOW  # noqa: E402
 from tests.test_graduation_policy import write_root  # noqa: E402
@@ -67,6 +67,8 @@ class Journey:
             extra += ["--signing-key", str(self.auth.tmp / "keys" / "laptop")]
         if argv[:2] == ("policy", "create"):
             extra += ["--store-dir", str(self.store_dir)]
+            if "--guard" not in argv:
+                extra += ["--guard", str(guard_file(self.auth.tmp))]
         rc = cli.main(["binding", *argv, *extra])
         self.sync()
         return rc
@@ -198,7 +200,8 @@ def test_scenario_6_twenty_clean_fires_graduate_through_the_card_line_with_an_au
     # RULINGS_R1 item 5: the line as printed, only the key filled in: it names this engine's store and cockpit
     assert f"--store-dir {shlex.quote(str(j.store_dir))}" in line
     assert f"--data-root {shlex.quote(str(j.auth.root))}" in line
-    argv = shlex.split(line.replace("<key>", shlex.quote(str(j.auth.tmp / "keys" / "laptop"))))[1:]
+    argv = shlex.split(line.replace("<key>", shlex.quote(str(j.auth.tmp / "keys" / "laptop")))
+                       .replace("<guard.json>", shlex.quote(str(guard_file(j.auth.tmp)))))[1:]
     assert cli.main(argv) == 0
     j.sync()
     capsys.readouterr()
@@ -284,7 +287,8 @@ def test_a_card_line_copied_to_another_directory_signs_the_engines_store(j, tmp_
     assert f"--data-root {shlex.quote(str(j.auth.root.resolve()))}" in line
     (tmp_path / "B").mkdir()
     j.monkeypatch.chdir(tmp_path / "B")
-    argv = shlex.split(line.replace("<key>", shlex.quote(str(j.auth.tmp / "keys" / "laptop"))))[1:]
+    argv = shlex.split(line.replace("<key>", shlex.quote(str(j.auth.tmp / "keys" / "laptop")))
+                       .replace("<guard.json>", shlex.quote(str(guard_file(j.auth.tmp)))))[1:]
     assert cli.main(argv) == 0
     j.sync()
     capsys.readouterr()

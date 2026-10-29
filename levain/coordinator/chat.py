@@ -33,9 +33,12 @@ line; the route seam after the verdict), the bounded vendor read and interrupt, 
 CH-D1b-4 wires Claude's tripwires (§4.4; the rules are :mod:`levain.coordinator.chat_tripwires`) and the named replies
 to inbound control requests (§8.1) into the pump, and files §4.3's ``seat`` review item when a ``not_live`` latches.
 
-NOT HERE: CH-D1c's ``chat_approvals`` and ``chat_approval_events`` (the view's seam for them is named in
-:data:`CHAT_SCHEMA`, "SEAM CH-D1c"); the vendor probes themselves (CH-D2 / CH-D3); a pump thread (the launcher's loop
-over :meth:`ChatService.read_next`).
+CH-D1c-C's approval tables, their view branch and the durable cancellation writers are
+:mod:`levain.coordinator.chat_approvals` (its DDL rides :data:`CHAT_SCHEMA`, so :func:`_ensure` stays
+the one path).
+
+NOT HERE: the answer door (``attempt_answer``, CH-D1c-D); the vendor probes themselves (CH-D2 / CH-D3); a pump
+thread (the launcher's loop over :meth:`ChatService.read_next`).
 
 [seat] numbers rev 2 marks ``[seat]``: :data:`EVENT_BODY_MAX`, and rev 4's §7.6 :data:`ECHO_WINDOW`; §4.2's
 :data:`PROBE_TRIES` and :data:`PROBE_GAP`; :data:`ATTACHMENTS_MAX`, :data:`READ_DEADLINE` and
@@ -65,6 +68,7 @@ from levain.cockpit.consent import parse_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import chat_lease
 from levain.coordinator.chat_lease import TURN_LEASE_SCHEMA, TurnLease, TurnRefused, TurnView
+from levain.coordinator.chat_approvals import APPROVAL_SCHEMA, APPROVAL_VIEW_ARMS
 from levain.coordinator.chat_tripwires import (ControlReply, Trip, TripwireContext, TripwireWindow, control_line,
                                                mode_trip, reported_mode_trip)
 from levain.coordinator.driver import (CommandResult, InterruptCommand, LivenessEvidence, NotSent, SendCommand,
@@ -264,13 +268,14 @@ CHAT_SCHEMA: tuple[str, ...] = (
     "OR message_id = NEW.message_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a chat echo is never replaced'); END",
     *TURN_LEASE_SCHEMA,
+    # §2.5-§2.6 (CH-D1c-C): the approval records
+    *APPROVAL_SCHEMA,
     # §2.8: one thread in the store-wide order, over dispatch.db rows only. A message carries its latest outbox state
     # as a status, never as rows of its own; a vendor event joins the thread its worker launch holds, and a user item
     # with a chat_echoes row is "the vendor's copy of" the message echo_of names, never an outside line; a reply joins
     # once it has a gseq (the old ones are timeline()'s "before the chat record" block); an envelope joins by its
     # bind and its attenuations (one naming no thread narrows every thread the envelope is bound to). A store holding
     # an older text of this view is brought current by _ensure (ChatStore._connect runs it).
-    # SEAM CH-D1c: chat_approvals + chat_approval_events join this view when they are built (§2.5-§2.7)
     "CREATE VIEW IF NOT EXISTS chat_timeline (thread_id, gseq, kind, source, ref_id, launch_id, status, body, at, "
     "echo_of) AS "
     "SELECT m.thread_id, m.gseq, 'message', m.author_kind, m.message_id, m.launch_id, "
@@ -290,7 +295,9 @@ CHAT_SCHEMA: tuple[str, ...] = (
     "NULL FROM envelope_attenuations a WHERE a.thread_id IS NOT NULL "
     "UNION ALL SELECT b.thread_id, a.gseq, 'attenuation_' || a.kind, a.by, a.envelope_id, NULL, NULL, a.value, a.at, "
     "NULL FROM envelope_attenuations a JOIN envelope_binds b ON b.envelope_id = a.envelope_id "
-    "WHERE a.thread_id IS NULL",
+    "WHERE a.thread_id IS NULL "
+    # CH-D1c-C: the approval branch (chat_approvals + chat_approval_events), the arms are chat_approvals.py's
+    + APPROVAL_VIEW_ARMS,
 )
 # (table, column, declaration): a column a released table gains, added by _ensure when it is missing. Only
 # additive columns (nullable, or NOT NULL with a constant default; SQLite's ALTER TABLE refuses the rest). The table's

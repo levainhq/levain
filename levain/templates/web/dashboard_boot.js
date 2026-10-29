@@ -47,6 +47,10 @@
   // for daily-driver convenience on the operator's personal device; the native keychain is the
   // real fix at Lane 1.
   const WRITE_TOKEN_KEY = "levain_write_token";
+  // `storage` never fires in the document that changed the token, so every same-page set or remove announces it here
+  // for the zones that follow the token (the Threads zone); other tabs still arrive through `storage`.
+  const TOKEN_CHANGE_EVENT = "levain:write-token-change";
+  function announceTokenChange() { try { window.dispatchEvent(new Event(TOKEN_CHANGE_EVENT)); } catch (_) { /* no events */ } }
   // Set by pair.js when this browser was paired by a link: its key is a DEVICE key, so when it is refused the way back is
   // pairing again from a paired device, never typing the owner's token (P2 L3 r1 F6). MUST equal pair.js PAIRED_MARK_KEY.
   const PAIRED_MARK_KEY = "levain_paired_device";
@@ -68,6 +72,7 @@
       if (/^[\x21-\x7e]+$/.test(tok)) {
         window.localStorage.setItem(WRITE_TOKEN_KEY, tok);
         window.localStorage.removeItem(PAIRED_MARK_KEY);   // the owner's own link: this browser holds the owner's key now
+        announceTokenChange();
       }
       else console.warn("levain: the write token in the link is not a header-safe string; not stored");
     } catch (_) { /* no history or storage: the prompt still works */ }
@@ -118,12 +123,12 @@
     }
     const tok = (window.prompt("Write token (printed when this server started: on its startup line, or in the daemon's log):") || "").trim();
     if (tok) tokenDeclined = false;
-    if (tok) { try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); } catch (_) { /* ignore */ } }
+    if (tok) { try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); announceTokenChange(); } catch (_) { /* ignore */ } }
     return tok;
   }
   // Drop a stored token so the next attempt re-prompts (a mistyped / rotated token).
   function dropToken() {
-    try { window.localStorage.removeItem(WRITE_TOKEN_KEY); } catch (_) { /* ignore */ }
+    try { window.localStorage.removeItem(WRITE_TOKEN_KEY); announceTokenChange(); } catch (_) { /* ignore */ }
   }
   // Headers for a READ (GET): attach the stored off-box token OPPORTUNISTICALLY if we hold one.
   // Harmless on a loopback / read-only surface (the server skips the read gate there); REQUIRED on
@@ -853,4 +858,70 @@
     if (document.visibilityState === "visible") load({ passive: true });
   });
   load();
+})();
+
+// CH-U1a: the Build tab's Threads zone. The coordinator's threads and one thread's stream, read-only, drawn by
+// thread_view.js (LevainThreadView) over GET /cockpit/threads.json and /cockpit/thread/<id>.json. Those routes need the
+// page's write token on every bind, so the zone stays hidden on a page holding none. It polls only while the Build tab
+// is shown and the page is visible; leaving stops the poll, and coming back starts again at the thread list.
+(function () {
+  "use strict";
+  const WRITE_TOKEN_KEY = "levain_write_token";
+  let section = null, host = null, view = null;
+
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  }
+  function token() { try { return window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { return ""; } }
+
+  function build() {
+    section = el("section", "ck-zone th-zone");
+    section.dataset.zone = "threads";
+    section.dataset.modes = "build";
+    section.hidden = true;
+    const head = el("div", "zone-head");
+    head.appendChild(el("div", "zone-title", "Threads"));
+    head.appendChild(el("span", "zone-gloss", "what each coordinator thread said, in the order it happened"));
+    section.appendChild(head);
+    const grid = el("div", "ck-zgrid th-grid");
+    const panel = el("div", "panel k-list th-panel");
+    panel.dataset.modes = "build";   // dashboard.css hides a zone whose panel names no tab for the current mode
+    const ph = el("div", "phead");
+    ph.appendChild(el("h2", null, "Coordinator threads"));
+    panel.appendChild(ph);
+    host = el("div", "pbody th-body");
+    panel.appendChild(host);
+    grid.appendChild(panel);
+    section.appendChild(grid);
+    const main = document.querySelector("main.frame");
+    if (main) main.appendChild(section); else document.body.appendChild(section);
+  }
+
+  function sync() {
+    const want = !!token() && document.body.dataset.mode === "build" && document.visibilityState !== "hidden";
+    section.hidden = !token();
+    if (want && !view) {
+      host.replaceChildren();
+      const T = window.LevainCockpitTransport;
+      view = window.LevainThreadView.mount(host, { headers: () => (T ? T.headers() : {}) });
+    } else if (!want && view) {
+      view.stop();
+      view = null;
+    }
+  }
+
+  function start() {
+    if (!window.LevainThreadView || !document.querySelector("main.frame")) return;
+    build();
+    new MutationObserver(sync).observe(document.body, { attributes: true, attributeFilter: ["data-mode"] });
+    document.addEventListener("visibilitychange", sync);
+    window.addEventListener("storage", (e) => { if (e.key === WRITE_TOKEN_KEY) sync(); });
+    window.addEventListener("levain:write-token-change", sync);   // the same page's own set / remove (dashboard_boot's token handling)
+    sync();
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+  else start();
 })();

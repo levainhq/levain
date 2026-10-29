@@ -20,14 +20,15 @@ import base64
 import datetime as _dt
 import functools
 import hashlib
+import json
 from collections.abc import Callable, Iterable, Mapping
 
 import pytest
 
 import levain.autonomic.gate as _gate
 from levain.autonomic.coverage import (
-    Cover, CoverageSnapshot, CoverageView, Effect, GraduationPolicy, Uncovered, peek_snapshot, risk_dict,
-    signers_digest,
+    Cover, CoverageSnapshot, CoverageView, Effect, EffectiveCover, GraduationPolicy, Uncovered, peek_cover_snapshot,
+    risk_dict, signers_digest,
 )
 from levain.autonomic.posture import Posture
 from levain.autonomic.risk import ActionRisk
@@ -51,12 +52,28 @@ def root_file(*keys: str, namespaces: str = "levain-authority") -> bytes:
     return b"".join(f'operator namespaces="{namespaces}" {k}\n'.encode() for k in keys)
 
 
+# A complete signed guard (every entry a rationale, a kill and a drill that trips it): what every policy is signed with
+TEST_GUARD = ({"rationale": "a spoofed sender is the case this could be wrong about",
+               "kill_predicate": {"op": "==", "field": "dmarc", "value": "fail"},
+               "kill_drill": {"fields": {"dmarc": "fail"}}},)
+NO_GUARD = object()   # policy(guard=NO_GUARD): a record signed before the guard (it covers nothing)
+
+
+def terms_incarnation(record: Mapping, born: int) -> str:
+    """The incarnation the authority log gives ``record`` brought in at seq ``born`` (``levain.authority.
+    graduation_incarnation``'s formula)."""
+    terms = {k: v for k, v in record.items() if k != "expires_at"}
+    text = json.dumps(terms, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return f"{born}:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
+
+
 def policy(gid: str, actions: Mapping[str, ActionRisk], *, expires_at: _dt.datetime,
            lowest: str = "ON_LOOP", signer: str = LAPTOP, renewer: str | None = None, store_id: str = STORE,
-           triggers: list[str] | None = None, families: list[str] | None = None,
-           incarnation: str | None = None) -> GraduationPolicy:
-    """The replayed policy a ``create_grant`` of this §3 record by ``signer`` gives (``renewer``: the key of
-    the renew that last moved its expiry)."""
+           triggers: list[str] | None = None, families: list[str] | None = None, born: int = 1,
+           guard=TEST_GUARD, min_clean_fires: int | None = None) -> GraduationPolicy:
+    """The replayed policy a ``create_grant`` of this §3 record by ``signer`` at seq ``born`` gives (``renewer``: the
+    key of the renew that last moved its expiry), signed with ``guard`` (and ``min_clean_fires`` when given: the term
+    ``levain.graduation_policy.TermedGraduationPolicy`` reads)."""
     record: dict = {"id": gid, "kind": "graduation", "lowest_posture": lowest, "store_id": store_id,
                     "expires_at": expires_at.astimezone(_dt.timezone.utc).strftime(_STAMP),
                     "actions": {name: risk_dict(risk) for name, risk in actions.items()}}
@@ -64,8 +81,12 @@ def policy(gid: str, actions: Mapping[str, ActionRisk], *, expires_at: _dt.datet
         record["triggers"] = triggers
     if families is not None:
         record["families"] = families
-    return GraduationPolicy.from_record(record, incarnation=incarnation or f"inc-{gid}", born_signer=signer,
-                                        current_signer=renewer or signer)
+    if guard is not NO_GUARD:
+        record["guard"] = [dict(g) for g in guard]
+    if min_clean_fires is not None:
+        record["min_clean_fires"] = min_clean_fires
+    return GraduationPolicy.from_record(record, incarnation=terms_incarnation(record, born), born=born,
+                                        born_signer=signer, current_signer=renewer or signer)
 
 
 class TestOnlyCoverage:
@@ -121,28 +142,57 @@ class TestOnlyCoverage:
         return view
 
     def peek(self, effect: Effect, now: _dt.datetime) -> str:
+        return self.peek_cover(effect, now).value
+
+    def peek_cover(self, effect: Effect, now: _dt.datetime) -> EffectiveCover:
         self.peeks += 1
+        cached = self._cached                # the cache once,
         digest = signers_digest(self.root)   # root first,
         head = self.head                     # the head last: then only pure comparison
-        return peek_snapshot(self._cached, (head, digest, self.store_id), effect, now)
+        return peek_cover_snapshot(cached, (head, digest, self.store_id), effect, now)
+
+
+# The guard of the policies that authorize _EveryDeclaredEffect's covers (1026-21 RULINGS O-g1-8: the fire check
+# refuses a covered value no policy authorizes). Its kill is ``exists`` of a field no test event carries, so it lets
+# every event through (``exists`` on an absent field is FALSE, never UNKNOWN), and its drill carries the field, so it
+# trips.
+_NEVER_FIELD = "levain_test_only_never_present"
+EVERY_EFFECT_GUARD = ({"rationale": "test only: the gate covering every declared effect, as before the clamp",
+                       "kill_predicate": {"op": "exists", "field": _NEVER_FIELD},
+                       "kill_drill": {_NEVER_FIELD: True}},)
+_EVERY_EFFECT_EXPIRES = _dt.datetime(2099, 1, 1, tzinfo=_dt.timezone.utc)
+
+
+@functools.lru_cache(maxsize=None)
+def _every_effect_policy(action_name: str, action_risk: ActionRisk) -> GraduationPolicy:
+    # a policy signing exactly this action at exactly this risk (any trigger, any family), so the fire check's
+    # ``covered`` holds for the effect it is read for and for no other action
+    return policy("gp-test-only-every", {action_name: action_risk}, expires_at=_EVERY_EFFECT_EXPIRES,
+                  guard=EVERY_EFFECT_GUARD)
 
 
 class _EveryDeclaredEffect:
     """A view and source covering every effect whose action the manifest declares, at ON_LOOP: the rung the
-    gate decided stands (the floor can still raise it), as before the clamp."""
+    gate decided stands (the floor can still raise it), as before the clamp. Each cover names a policy signing
+    that effect's action at its risk, whose guard trips on no test event."""
 
     token = ((0, ""), "", STORE)
 
     def cover(self, effect: Effect, now: _dt.datetime) -> Cover:
         if effect.action_risk is None:
             return Cover(None, "none")
-        return Cover(Posture.ON_LOOP, "test-only@every-declared-effect")
+        p = _every_effect_policy(effect.action_name, effect.action_risk)
+        return Cover(Posture.ON_LOOP, p.cover_value, p)
 
     def refresh(self) -> CoverageView:
         return self
 
     def peek(self, effect: Effect, now: _dt.datetime) -> str:
         return self.cover(effect, now).value
+
+    def peek_cover(self, effect: Effect, now: _dt.datetime) -> EffectiveCover:
+        cover = self.cover(effect, now)
+        return EffectiveCover(cover.value, cover.posture, cover.policy)
 
 
 _EVERY_DECLARED_EFFECT = _EveryDeclaredEffect()   # one object: a policy swap hands the same source on

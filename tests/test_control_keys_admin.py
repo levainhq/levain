@@ -44,12 +44,17 @@ class FakeKeys:
         self._lsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._lsock.bind(str(path))
         self._lsock.listen(8)
-        threading.Thread(target=self._accept, daemon=True).start()
+        self._lsock.settimeout(0.2)   # the accept loop re-reads _stop; closing a listener does not wake accept on Linux
+        self._stop = threading.Event()
+        self._acceptor = threading.Thread(target=self._accept, daemon=True)
+        self._acceptor.start()
 
     def _accept(self) -> None:
-        while True:
+        while not self._stop.is_set():
             try:
                 s, _ = self._lsock.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 return
             self.conns.append(s)
@@ -71,6 +76,8 @@ class FakeKeys:
         self.conns[i].shutdown(socket.SHUT_RDWR)
 
     def close(self) -> None:
+        self._stop.set()
+        self._acceptor.join(5)
         self._lsock.close()
         for s in self.conns:
             s.close()

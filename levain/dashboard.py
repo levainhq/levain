@@ -310,6 +310,7 @@ class Health:
     # never complete). levain opens the store read-only, where anneal never builds the audit trail, so only this
     # durable counter is readable. None = could not be read.
     audit_backlog: int | None = None
+    save_at: str | None = None  # the stamp save_age_hours is counted from: a page keeps the age current from it, on its own clock
     projection_note: str | None = None  # why the projection reads diverged (a missing file vs an edit); None otherwise
 
     def __post_init__(self) -> None:
@@ -495,6 +496,7 @@ def health_oracles(
     failures = getattr(status, "audit_write_failures", None)
     return {
         "save_age_hours": age,
+        "save_at": str(raw) if age is not None else None,
         "projection_converged": converged,
         "projection_note": note,
         "audit_backlog": int(failures) if isinstance(failures, int) and not isinstance(failures, bool) else None,

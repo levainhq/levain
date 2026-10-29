@@ -54,7 +54,8 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
-from typing import IO, Any
+from types import MappingProxyType
+from typing import IO, Any, Literal
 
 from levain.authority import anchor_path
 # FILE_TOOLS, MCP_PATH_FIELDS, PolicyNotEligible and guarded_policy are re-exported: this module's names since Q2
@@ -75,6 +76,10 @@ from levain.consent.adapters.rules import (  # noqa: F401 - the rules' one home;
     GIT_STATE_FILES, _is_config_path, _is_git_config,
 )
 from levain.consent.broker_client import in_slot
+from levain.consent.contained import SANDBOX_ESCAPE_KEY as SANDBOX_ESCAPE_KEY
+from levain.consent.contained import SANDBOX_NET_TOOL as SANDBOX_NET_TOOL
+from levain.consent.contained import ContainedLaunchProof, CoreCall, core_call_of, sandbox_escape_requested, \
+    sandbox_net_tool
 from levain.consent.record import ExternalGateRequest
 
 AGENT = CLAUDE_CODE_AGENT
@@ -221,10 +226,10 @@ def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path, e
     request (14b Q5); and, when a cockpit data root is configured, its authority database (and sqlite's sidecars)
     and the authority anchor. ``home`` is the one :func:`targets_agent_config` expands ``~`` under and ``environ``
     the one whose ``LEVAIN_HOME`` names the levain home (both required: the hook binds them once at its top);
-    ``cwd``, when absolute, stands in for the workspace. A levain home the floor's
-    own predicate finds too
-    wide to deny whole (:func:`levain.firing.confinement.too_wide_to_deny`: a filesystem root, a path of two parts
-    or fewer, a shared temp directory, or one holding the home or the cwd) is named by its state directories instead
+    ``cwd``, when absolute, stands in for the workspace. A levain home the floor's own predicate finds too
+    wide to deny whole (:func:`levain.firing.confinement.too_wide_to_deny` holds the rules: a filesystem root, a path
+    of two parts or fewer, a shared temp directory, or one holding the home or the cwd; the event's cwd is passed as
+    its ``within``) is named by its state directories instead
     (:data:`levain.firing.confinement.LEVAIN_HOME_STATE_DIRS`, the floor's fallback list), or every file under it
     would be agent config. Never raises on the levain home: one that cannot be resolved is ``<home>/.levain``
     (fail closed for the store, never an outage of every tool). Bash is still never parsed: a shell write there
@@ -286,17 +291,17 @@ _DIR_PROBES = ("x", "settings.json", "hooks.json", "config.toml", USER_CONFIG_NA
 
 def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], sites: tuple[str, ...],
                      user_configs: frozenset[str], git_cache: dict[Any, Any] | None = None, *,
-                     environ: Mapping[str, str]) -> bool:
+                     user_roots: tuple[str, ...], environ: Mapping[str, str]) -> bool:
     """For an MCP tool's every-string candidates only (:func:`levain.consent.policy.mcp_config_candidates`): True
     when a server given ``target`` as a directory and a file name in another field could write agent config:
     ``target`` (``~`` expanded, joined to ``cwd``; as written and resolved) holds a file the path checks of
     :func:`targets_agent_config` tag (each of :data:`_DIR_PROBES` directly inside it, so the directory list is
     derived from those checks, never spelled twice) or directly one of ``roots`` (a protected file such as the
     authority database, :func:`protected_paths`), or its file name is ``.claude.json`` wherever it sits (a
-    server that joins a relative name to a root of its own, home among them). ``roots``, ``sites`` and
-    ``user_configs`` are the caller's, computed once. An over-match costs a gated call: the request goes to the
-    human, or, when no enrolled key can sign T3 outside ``default``, the call is refused (the
-    Q10 floor) and the agent reads why."""
+    server that joins a relative name to a root of its own, home among them). ``roots``, ``sites``,
+    ``user_configs`` and ``user_roots`` (:func:`user_site_roots`) are the caller's, computed once. An over-match
+    costs a gated call: the request goes to the human, or, when no enrolled key can sign T3 outside ``default``,
+    the call is refused (the Q10 floor) and the agent reads why."""
     raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
     if not raw.is_absolute():
         raw = Path(cwd) / raw
@@ -306,7 +311,8 @@ def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], 
         if p.name.lower() == USER_CONFIG_NAME or str(p).lower() in parents:
             return True
         for probe in _DIR_PROBES:
-            if _tags_path(p / probe, cwd, roots, sites, user_configs, git_cache, environ=environ):
+            if (_tags_path(p / probe, cwd, roots, sites, user_configs, git_cache, environ=environ)
+                    or in_user_site(p / probe, user_roots)):
                 return True
     return False
 
@@ -470,7 +476,7 @@ def _under_hooks_path(path: Path, cwd: str, cache: dict[Any, Any] | None = None,
         return True   # a path that cannot be examined (or no operator home to ask git as) is tagged
 
 
-def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bool:
+def nothing_can_decide(settings: AdapterSettings, tier: str | None = None, *, contained_shell: bool = False) -> bool:
     """No explicit word on and the cockpit the settings point at replays to no active key and no standing grant (or
     has no database, or does not replay): no grant or signed answer can verify and no hold is asked (input idle
     holds only for an enrolled key, :func:`away_hold`), so the hook
@@ -480,34 +486,56 @@ def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bo
     before any key was enrolled is not something that can decide (L3 r1 codex MED). For ``tier`` T3
     (:data:`AGENT_CONFIG_TIER`, never grant-eligible) only an active key whose class can sign a T3 allow counts;
     a standing grant never does, nor does away mode: a held T3 call that no key can sign only halts its session
-    (L3 r1 codex 6, r2)."""
+    (L3 r1 codex 6, r2). With ``contained_shell`` (:func:`decide_ex` sets it for a chat Bash call that carries its
+    launch's proof, the one call an SH1 grant can answer) an unexpired contained-shell grant counts too (L3 r1
+    complement MED)."""
+    return nothing_can_decide_why(settings, tier, contained_shell=contained_shell) is not None
+
+
+def nothing_can_decide_why(settings: AdapterSettings, tier: str | None = None, *,
+                           contained_shell: bool = False) -> str | None:
+    """Why :func:`nothing_can_decide` holds, in words for the operator, or ``None`` when something can decide. The
+    one body of that judgement: :func:`nothing_can_decide` is this being not ``None``."""
     if settings.away_mode and tier != AGENT_CONFIG_TIER:
-        return False
+        return None
     root = settings.cockpit_data_root
-    if not root or not (Path(root) / "cockpit.db").is_file():
-        return True
+    if not root:
+        return "no cockpit data root in the consent settings"
+    if not (Path(root) / "cockpit.db").is_file():
+        return "the cockpit names no ledger (no cockpit.db)"
     try:
         snap = authority_source(Path(root) / "cockpit.db", anchor=anchor_path(root))()
     except Exception:
-        return True  # an authority that does not replay verifies nothing
+        return "the cockpit's ledger does not replay"  # an authority that does not replay verifies nothing
     if tier == AGENT_CONFIG_TIER:
         from levain.consent.queue import class_covers
 
-        return not any(class_covers(key.key_class, tier) for key in snap.active_keys())
-    return not snap.active_keys() and not _a_consent_grant_in_force(snap.policy.grants.values())
+        if any(class_covers(key.key_class, tier) for key in snap.active_keys()):
+            return None
+        return "no enrolled key can sign an agent-config allow"
+    if snap.active_keys() or _a_consent_grant_in_force(snap.policy.grants.values()):
+        return None
+    if contained_shell:
+        from levain.authority import contained_shell_grant
+
+        if _a_consent_grant_in_force(snap.policy.grants.values(), kind=contained_shell_grant):
+            return None
+    return "no enrolled key and no standing grant in force"
 
 
-def _a_consent_grant_in_force(grants: Iterable[Any]) -> bool:
-    """Whether any grant is a consent grant that has not expired: the two criteria of ``grant_refusal`` that hold
-    for every request (L3 r2 codex MED: an expired or other-kind grant answers nothing)."""
+def _a_consent_grant_in_force(grants: Iterable[Any], *, kind: Callable[[Any], bool] | None = None) -> bool:
+    """Whether any grant is a consent grant (or, with ``kind``, a grant ``kind`` accepts) that has not expired: the
+    two criteria of ``grant_refusal`` that hold for every request (L3 r2 codex MED: an expired or other-kind grant
+    answers nothing)."""
     from datetime import datetime, timezone
 
     from levain.authority import consent_grant
     from levain.cockpit.consent import parse_stamp
 
+    is_kind = consent_grant if kind is None else kind
     now = datetime.now(timezone.utc)
     for grant in grants:
-        if not consent_grant(grant):
+        if not is_kind(grant):
             continue
         try:
             if now < parse_stamp(grant.get("expires_at")):
@@ -535,6 +563,34 @@ def import_site_dirs() -> tuple[str, ...]:
     if site.ENABLE_USER_SITE:
         dirs.append(site.getusersitepackages())
     return tuple({os.path.realpath(d).lower() for d in dirs if d})
+
+
+def user_site_roots(home: Path, *, environ: Mapping[str, str]) -> tuple[str, ...]:
+    """The operator's Python user-site trees :func:`in_user_site` protects, lowercased, each as written and resolved:
+    the floor's own derivation (``levain.firing.confinement.python_user_site_roots``: ``~/.local/lib``, macOS's
+    ``~/Library/Python``, an absolute ``$PYTHONUSERBASE``'s ``lib``), for ``home`` (where a ``~`` in a target
+    expands) and for :func:`operator_home`, each only when absolute. Whatever THIS interpreter's
+    ``site.ENABLE_USER_SITE`` says: a venv's is False, and the operator's other, non-venv Pythons still run a
+    ``.pth``, ``usercustomize.py`` or package planted there. ``environ`` names the operator (:func:`operator_home`)
+    and any ``$PYTHONUSERBASE``. Kept apart from :func:`import_site_dirs`, which answers only what redirects
+    this interpreter's ``import levain``."""
+    from levain.firing.confinement import python_user_site_roots  # lazy: keep this module light
+
+    out: dict[str, None] = {}
+    for h in dict.fromkeys((Path(home), operator_home(environ))):
+        if not h.is_absolute():   # an empty pw_dir is ``.``: no tree, never one relative to where the hook runs
+            continue
+        for root, _label in python_user_site_roots(h, environ)[0]:
+            for spelled in (os.path.normpath(root), os.path.realpath(root)):
+                out[spelled.lower()] = None
+    return tuple(out)
+
+
+def in_user_site(path: Path, roots: tuple[str, ...]) -> bool:
+    """``path`` (one spelling, normalised or resolved, as :func:`_tags_path` takes it) is one of ``roots``
+    (:func:`user_site_roots`) or lies under one."""
+    p = str(path).lower()
+    return any(p == r or p.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
 
 
 def _redirects_the_import(path: Path, sites: tuple[str, ...]) -> bool:
@@ -569,7 +625,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     repository of ``cwd`` or of the target (:func:`_under_hooks_path`: ``core.hooksPath`` wherever it points), and
     the user's git config files (:func:`global_git_configs`), never ``.gitignore`` or ``.gitattributes``; anything under a ``.claude-plugin/`` directory, or
     under ``hooks/`` beside one (a plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
-    it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); or any of
+    it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); anything in an
+    operator's Python user site, whatever this interpreter's own flag (:func:`in_user_site`); or any of
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
     tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and every
     other string in its input (:func:`levain.consent.policy.mcp_config_candidates`: a server can name its path in a
@@ -594,6 +651,7 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}
                       | {levain_package_dir().lower()})
         sites = import_site_dirs()
+        user_roots = user_site_roots(home, environ=environ)
         git_cache = git_cache if git_cache is not None else {}   # git asked once per repository, in one budget, per call
         home = Path(home)
         # by full path: the home's ``.claude.json`` and the user's git config files (``~/.gitconfig``,
@@ -614,10 +672,12 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         except (OSError, ValueError):
             return True
         if (_tags_path(written, cwd, roots, sites, user_configs, git_cache, environ=environ)
-                or _tags_path(resolved, cwd, roots, sites, user_configs, git_cache, environ=environ)):
+                or _tags_path(resolved, cwd, roots, sites, user_configs, git_cache, environ=environ)
+                or in_user_site(written, user_roots) or in_user_site(resolved, user_roots)):
             return True
     try:
-        return any(names_config_dir(target, cwd, home, roots, sites, user_configs, git_cache, environ=environ)
+        return any(names_config_dir(target, cwd, home, roots, sites, user_configs, git_cache, user_roots=user_roots,
+                                    environ=environ)
                    for target in extra)
     except (OSError, ValueError):
         return True
@@ -643,8 +703,9 @@ def hook_output(decision: Decision) -> dict[str, Any]:
     if decision.decision == "deny":
         verdict["message"] = f"Denied by a signed levain answer (key {decision.signer_fp})."
     out: dict[str, Any] = {"hookSpecificOutput": {"hookEventName": EVENT, "decision": verdict}}
-    if decision.via == "grant":
-        out["systemMessage"] = (f"levain: allowed by your standing consent grant {decision.grant_id} "
+    if decision.via in ("grant", "contained_shell"):
+        what = "contained-shell" if decision.via == "contained_shell" else "consent"
+        out["systemMessage"] = (f"levain: allowed by your standing {what} grant {decision.grant_id} "
                                 f"(posture {decision.posture}); `levain consent grant revoke {decision.grant_id}` "
                                 "ends it.")
     return out
@@ -746,23 +807,28 @@ RECHECK_EVERY = 1.0
 
 def hold_for_answer(queue: ConsentQueue, request: ExternalGateRequest, wait: float, *, tool_input: Any,
                     posture: str | None, still_away: Callable[[], tuple[bool, str, str]] | None = None,
+                    contained_launch: ContainedLaunchProof | None = None,
                     ) -> tuple[Decision | None, str | None]:
     """Wait up to ``wait`` seconds for a verified decision on ``request``: ``(decision, None)``, or
     ``(None, why)`` when ``still_away`` (re-read every :data:`RECHECK_EVERY` seconds) says away mode ended (the
     operator is back, or no key could sign), ``why`` its reason, or ``(None, None)`` when the wait ran out or the
     request stopped being pending. With no
     ``still_away`` it is one :meth:`ConsentQueue.await_decision` of ``wait``. The wait can run past ``wait`` by one
-    ``still_away`` call."""
+    ``still_away`` call. ``contained_launch`` is passed to every read (a contained-shell answer is delivered only
+    with the proof it was answered under); it is passed only when given, so a queue a hook caller hands in is
+    read exactly as before."""
+    proof = {} if contained_launch is None else {"contained_launch": contained_launch}
     if still_away is None:
-        return _verified(queue.await_decision(request.id, wait, tool_input=tool_input, posture=posture), request), \
-            None
+        return _verified(queue.await_decision(request.id, wait, tool_input=tool_input, posture=posture, **proof),
+                         request), None
     end = time.monotonic() + wait
     while True:
         left = end - time.monotonic()
         if left <= 0:
             return None, None
         piece, started = min(left, RECHECK_EVERY), time.monotonic()
-        got = _verified(queue.await_decision(request.id, piece, tool_input=tool_input, posture=posture), request)
+        got = _verified(queue.await_decision(request.id, piece, tool_input=tool_input, posture=posture, **proof),
+                        request)
         if got is not None:
             return got, None
         if time.monotonic() - started < piece or end - time.monotonic() <= 0:
@@ -773,14 +839,75 @@ def hold_for_answer(queue: ConsentQueue, request: ExternalGateRequest, wait: flo
             return None, why
 
 
+# --- the core result (CH-D1 §3.4): decide_ex tags every exit; decide() is its hook output -------------------
+
+@dataclass(frozen=True)
+class Decided:
+    """A verified answer for ``call``: ``decision`` passed :func:`_verified` against ``request`` (the request filed
+    for the call, or on the take path the request the take's decision names)."""
+    call: CoreCall
+    request: ExternalGateRequest
+    decision: Decision
+
+
+@dataclass(frozen=True)
+class Abstained:
+    """No answer: nothing could decide (``no_decider``, nothing filed, ``request`` ``None``, ``why`` the reason), the
+    gate's allow was taken but the request it names could not be read, twice (``take_unread``, nothing filed,
+    ``request`` ``None``, ``why`` the take's request id), or the hold ended without one (``hold_expired``: a zero hold,
+    a timeout, away mode ending, a lost withdraw race; ``request`` the filed request, ``why`` ``""``). Each becomes
+    the operator's own question."""
+    call: CoreCall
+    reason: Literal["no_decider", "hold_expired", "take_unread"]
+    request: ExternalGateRequest | None
+    why: str
+
+
+@dataclass(frozen=True)
+class Declined:
+    """A call levain refuses outright: in chat each becomes a DENY carrying :data:`DECLINE_MESSAGES` [reason],
+    never a question. ``call`` is ``None`` only when the event was too malformed to name one."""
+    call: CoreCall | None
+    reason: Literal["invalid_event", "unconfined", "sandbox_escape_requested", "egress_not_levain",
+                    "contained_launch_mismatch", "contained_delivery_refused"]
+
+
+DECLINED_REASONS = frozenset({"invalid_event", "unconfined", "sandbox_escape_requested", "egress_not_levain",
+                              "contained_launch_mismatch", "contained_delivery_refused"})
+DECLINE_MESSAGES: Mapping[str, str] = MappingProxyType({
+    "invalid_event": "levain could not read this request",
+    "unconfined": "levain refuses agent-config writes from an unconfined session",
+    "sandbox_escape_requested": "no sandbox escape in chat: run the command again without dangerouslyDisableSandbox",
+    "egress_not_levain": "this launch's network is not the one levain built, so levain opens nothing for it",
+    "contained_launch_mismatch": "levain could not match this call to the launch it came from",
+    "contained_delivery_refused": "this launch's containment changed since the answer was given; ask again"})
+
+CoreResult = Decided | Abstained | Declined
+
+
+
 def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, environ: Mapping[str, str], home: Path,
-           claude_pid: int | None = None, max_hold: float = DEFAULT_MAX_HOLD,
-           policy: Policy | None = None, clock: Callable[[], float] = time.monotonic,
-           idle: Callable[[], float | None] | None = None,
-           still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
-    """The hook's output for one event, or ``None`` for no decision. Raises on anything unexpected (after
-    withdrawing the request it filed, so no ghost stays pending); the caller (:func:`main`) turns that into no
-    decision. ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. The hold is
+           claude_pid: int | None = None, **kw: Any) -> dict[str, Any] | None:
+    """The hook's output for one event, or ``None`` for no decision: :func:`hook_output` of a :class:`Decided`
+    result of :func:`decide_ex` (called with ``launch_nonce=""`` and ``contained_launch=None``), else ``None``.
+    Raises what :func:`decide_ex` raises; the caller (:func:`main`) turns that into no decision."""
+    out = decide_ex(event, queue, settings, environ=environ, home=home, claude_pid=claude_pid, launch_nonce="",
+                    contained_launch=None, **kw)
+    return hook_output(out.decision) if isinstance(out, Decided) else None
+
+
+def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, environ: Mapping[str, str], home: Path,
+              launch_nonce: str, contained_launch: ContainedLaunchProof | None,
+              claude_pid: int | None = None, max_hold: float = DEFAULT_MAX_HOLD,
+              policy: Policy | None = None, clock: Callable[[], float] = time.monotonic,
+              idle: Callable[[], float | None] | None = None,
+              still_away: Callable[[], tuple[bool, str, str]] | None = None) -> CoreResult:
+    """The core's result for one event, tagged (:data:`CoreResult`), every result bound to the :class:`CoreCall`
+    :func:`core_call_of` computes from ``event``. ``launch_nonce`` is ``""`` for every hook caller and the launch's
+    spawn nonce for a chat call; ``contained_launch`` is ``None`` for every hook caller and the launch's SH1
+    capability (or ``None``, withheld) for a chat call. Both are required, so no caller can leave either out.
+    Raises on anything unexpected (after withdrawing the request it filed, so no ghost stays pending).
+    ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. The hold is
     :func:`away_hold` (``idle`` is its input-idle source, default the platform's); ``still_away`` (:func:`main`
     passes :func:`still_away_from`) ends a hold early when it says away mode ended (the operator is back, or no
     key could sign), leaving the native dialog to ask. ``policy``
@@ -790,65 +917,125 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, enviro
     bypass ruling 3b item 1. What
     the adapter trusts (:func:`protected_paths`) is taken from ``queue.directory``, ``settings``, ``home`` and the
     event's cwd here, never as a list from the caller, so no call can leave it out; a queue without a directory
-    raises before anything is filed."""
+    raises before anything is filed. A ``contained_launch`` that is not of the right shape, or whose spawn nonce is
+    not ``launch_nonce`` (a hook caller's ``""`` included), is ``Declined(contained_launch_mismatch)`` before
+    anything is filed. A chat call (``launch_nonce`` not ``""``) is declined before anything is
+    filed when it has no ``tool_use_id``, when it asks to leave its sandbox
+    (:func:`~levain.consent.contained.sandbox_escape_requested`: a Bash call with the :data:`SANDBOX_ESCAPE_KEY` key,
+    any value) and when it is :data:`SANDBOX_NET_TOOL` (:func:`~levain.consent.contained.sandbox_net_tool`, any
+    input); each name is also matched case-folded and namespaced; a hook caller's call is never declined for these.
+    A gate allow the take spent whose request cannot be read on a second try is ``Abstained(take_unread)``,
+    nothing filed.
+    A chat call's request is filed with ``event_source="chat"`` (its own ``chat:`` event id); a hook caller's is
+    filed exactly as before. ``contained_launch``, when given, reaches the policy answer (a contained-shell grant
+    answers only with it), the hold and the withdraw-race re-read; a chat call whose row the queue holds allowed by
+    a contained-shell grant that this call's proof cannot take delivery of is ``Declined(contained_delivery_refused)``
+    (R8-6)."""
     if getattr(queue, "directory", None) is None:
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
+    if not isinstance(launch_nonce, str):
+        raise TypeError("launch_nonce must be a string (\"\" for a hook caller)")
+    if contained_launch is not None and not isinstance(contained_launch, ContainedLaunchProof):
+        raise TypeError("contained_launch must be a ContainedLaunchProof or None")
     deadline = clock() + max(0.0, float(max_hold)) - CLEANUP_RESERVE
     if not isinstance(event, Mapping) or event.get("hook_event_name") != EVENT:
-        return None
+        return Declined(None, "invalid_event")
     tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
     session = event.get("session_id")
     if not isinstance(tool_name, str) or not tool_name or not isinstance(cwd, str) or not cwd \
             or not isinstance(session, str) or not session:
-        return None
+        return Declined(None, "invalid_event")
     if tool_input is None:
         tool_input = {}  # an MCP tool with no arguments arrives without tool_input (Q0 item 4)
-    agent_id = event.get("agent_id")
-    if isinstance(agent_id, str) and agent_id:
-        session = f"{session}#agent:{agent_id}"
+    try:
+        call = core_call_of(event, launch_nonce=launch_nonce)
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        # a chat call with no tool_use_id, or an input the digest cannot take: a non-string key, a cycle, a nesting
+        # deeper than the interpreter's stack (L3 r1 codex MED)
+        return Declined(None, "invalid_event")
+    if contained_launch is not None and (not launch_nonce or contained_launch.problem() is not None
+                                         or contained_launch.spawn_nonce != launch_nonce):
+        # the proof is this launch's or none: never another launch's, never on a hook call (L3 r1 codex HIGH)
+        return Declined(call, "contained_launch_mismatch")
+    if launch_nonce:
+        if sandbox_escape_requested(tool_name, tool_input):
+            return Declined(call, "sandbox_escape_requested")
+        if sandbox_net_tool(tool_name):
+            return Declined(call, "egress_not_levain")
+    session = call.session
     tool_use_id = event.get("tool_use_id")
     mode = event.get("permission_mode")
     posture = mode if isinstance(mode, str) and mode else None
-    if policy is None and nothing_can_decide(settings):
-        return None
-    protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
-    agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ, protected=protected)
+    # the one call an SH1 grant can answer (policy.contained_shell_refusal: exactly Bash, a chat call, a proof, never
+    # agent config); for that call agent_config is known before the no-decider gate, for every other call after it.
+    # Known agent config is judged at its own tier there: away mode and a grant decide nothing for it
+    sh1: dict[str, Any] = {}
+    agent_config: bool | None = None
+    if launch_nonce and contained_launch is not None and tool_name == "Bash":
+        protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
+        agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ,
+                                            protected=protected)
+        sh1 = {"tier": AGENT_CONFIG_TIER} if agent_config else {"contained_shell": True}
+    if policy is None and nothing_can_decide(settings, **sh1):
+        return Abstained(call, "no_decider", None, nothing_can_decide_why(settings, **sh1) or "nothing can decide")
+    if agent_config is None:
+        protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
+        agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ,
+                                            protected=protected)
     if agent_config and unconfined(cwd, home=home, environ=environ):
-        return None  # an unconfined session (Q10 D2): its dialog answers, as the gate left the call to its mode (L1-7)
+        # an unconfined session (Q10 D2): its dialog answers, as the gate left the call to its mode (L1-7)
+        return Declined(call, "unconfined")
     if agent_config:
         # the gate already asked the operator about this call and delivered an allow, and Claude Code shows its
-        # dialog anyway on a path it protects: deliver that allow once, never a second question
+        # dialog anyway on a path it protects: deliver that allow once, never a second question. The take is
+        # delivered only as the verified decision of the request it names (R7-9); any other take is no take.
         took = queue.take_gate_allow(AGENT, session, tool_name, tool_input, cwd=cwd, within=GATE_ALLOW_REUSE,
                                      posture=posture, event=EVENT)
         if took is not None:
-            return hook_output(took)
+            got_row = queue.get(took.request_id) if isinstance(took, Decision) else None
+            if got_row is None and isinstance(took, Decision):
+                # the take already spent the gate's allow: read once more, and if the request is still not there,
+                # file nothing (a second row would ask the operator again for a call they allowed: L3 r1 deepseek)
+                got_row = queue.get(took.request_id)
+                if got_row is None:
+                    return Abstained(call, "take_unread", None, took.request_id)
+            if got_row is not None:
+                taken = _verified(took, got_row[0])
+                if taken is not None:
+                    return Decided(call, got_row[0], taken)
     hold = min(away_hold(settings, AGENT, idle), max(0.0, deadline - clock()))
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER,
                          event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
                          resume=resume_meta_of(event, environ=environ, claude_pid=claude_pid),
-                         model=event.get("model"))
+                         model=event.get("model"), **({"event_source": "chat"} if launch_nonce else {}))
     settled = False
     try:
         got: Decision | None = None
         if not agent_config and request.tier != AGENT_CONFIG_TIER:
-            got = _verified(guarded_policy(request, queue, posture=posture, tool_input=tool_input, policy=policy),
-                            request)
+            got = _verified(guarded_policy(request, queue, posture=posture, tool_input=tool_input, policy=policy,
+                                           contained_launch=contained_launch), request)
         wait = min(hold, max(0.0, deadline - clock()))
         back = None
         if got is None and wait > 0:
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
-                                        still_away=still_away)
+                                        still_away=still_away, contained_launch=contained_launch)
         if got is None:
             note = f"away mode ended ({back}); the native dialog stands" if back else \
                 "the hook stopped waiting; the native dialog stands"
             # `settled` is set only after this withdraw returns: if the withdraw itself raises, the finally retries it
             if not queue.withdraw(request.id, note=note):
                 # Not pending any more: an answer may have landed between the wait and the withdraw.
-                got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
+                got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture,
+                                               **({} if contained_launch is None
+                                                  else {"contained_launch": contained_launch})), request)
         settled = True
-        return hook_output(got) if got is not None else None
+        if got is None and launch_nonce and queue.answered_via(request.id) == ("allowed", "contained_shell"):
+            # R8-6: levain allowed this row by a contained-shell grant, and this call's proof (or none) cannot take
+            # delivery of it: a deny with its own cause, never a card for a row levain already allowed
+            return Declined(call, "contained_delivery_refused")
+        return Decided(call, request, got) if got is not None else Abstained(call, "hold_expired", request, "")
     finally:
         if not settled:
             # An exception between file() and the withdraw: withdraw now so no ghost request stays answerable
@@ -1235,6 +1422,8 @@ def gate_output(decision: Decision) -> dict[str, Any]:
         how = f"your ruling on gap #{decision.gap} (key {decision.signer_fp})"
     elif decision.via == "grant":
         how = f"your standing consent grant {decision.grant_id}"
+    elif decision.via == "contained_shell":
+        how = f"your standing contained-shell grant {decision.grant_id}"
     else:
         how = f"a signed levain answer (key {decision.signer_fp})"
     return decision_output(decision.decision, how)
@@ -1372,15 +1561,21 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         context = ruling_context(queue, session)
     except Exception:
         context = None  # undelivered rulings stay for the next hook
+    # a hard stop ends the turn: an answer or notice claimed on it may never be read, so it waits for the next call
+    stopped = out is not None and out.get("continue") is False
     try:
         from levain.consent.band import question_context
 
-        # a hard stop ends the turn: an answer claimed on it may never be read, so it waits for the next call
-        stopped = out is not None and out.get("continue") is False
         answers = None if stopped else question_context(queue.directory, AGENT, session)
     except Exception:
         answers = None  # undelivered answers stay for the next hook
-    context = "\n".join(c for c in (context, answers) if c) or None
+    try:
+        from levain.band_view import gate_notice
+
+        notice = gate_notice(queue.directory, AGENT, session, cwd, environ, deliverable=not stopped)
+    except Exception:
+        notice = None  # a notice is not the gate's to fail on
+    context = "\n".join(c for c in (context, answers, notice) if c) or None
     if context:
         out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}
         spec = out["hookSpecificOutput"]

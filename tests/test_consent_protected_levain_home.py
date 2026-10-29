@@ -434,3 +434,23 @@ def test_a_levain_home_on_a_symlink_denies_the_resolved_store_write_through_the_
     store = real / "autonomic" / "autonomic.db"
     assert _installed_hook(cc, "Edit", {"file_path": str(store), "old_string": "a", "new_string": "b"}, lhome) == "deny"
     assert _installed_hook(cx, "apply_patch", _patch(store), lhome) == "deny"
+
+
+def test_a_levain_home_holding_its_venv_is_still_denied_whole(lhome, tmp_path, monkeypatch):
+    """U4 (usite L3 f1, complement + deepseek MED): the installer's layout keeps the interpreter inside the levain
+    home (``<LEVAIN_HOME>/venv``). The shared predicate must not call that home too wide, or the whole-home deny
+    falls back to the state-dir list (fail-open)."""
+    import sys
+
+    from levain.firing import confinement as cf
+
+    lh = tmp_path / "lv"
+    exe = lh / "venv" / "bin" / "python"
+    exe.parent.mkdir(parents=True)
+    exe.touch()
+    monkeypatch.setenv("LEVAIN_HOME", str(lh))
+    monkeypatch.setattr(sys, "executable", str(exe))
+    monkeypatch.setattr(sys, "prefix", str(lh / "venv"))
+    assert not cf.too_wide_to_deny(lh, lhome)
+    assert not cf._hides_the_entity(lh, lhome, tmp_path / "e", tmp_path / "e" / "workspace")
+    assert lh in cc.protected_paths(tmp_path / "q", cc.AdapterSettings(), environ=h4_env(), home=h4_home())

@@ -249,8 +249,8 @@ def test_a_user_with_a_process_running_is_live_and_one_without_is_not() -> None:
 
 
 def test_liveness_fails_closed_when_the_process_table_cannot_be_read(monkeypatch) -> None:
-    monkeypatch.setattr(ws_git.subprocess, "run",
-                        lambda *a, **k: subprocess.CompletedProcess(a, 3, "", "pgrep: cannot read"))
+    monkeypatch.setattr(ws_git.hands_live, "run_bounded",
+                        lambda argv, **k: subprocess.CompletedProcess(argv, 3, b"", b"pgrep: cannot read"))
     with pytest.raises(WsGitError, match="cannot tell"):
         ws_git.entity_session_live(4_000_017)
 
@@ -262,10 +262,10 @@ def test_on_macos_only_launchds_own_per_user_agents_do_not_count_as_live(monkeyp
     def fake_run(argv, **kw):
         if argv[0].endswith("pgrep"):
             out = state["pgrep"][0] if len(state["pgrep"]) == 1 else state["pgrep"].pop(0)
-            return subprocess.CompletedProcess(argv, 0, out, "")
-        return subprocess.CompletedProcess(argv, 0, state["ps"], "")
+            return subprocess.CompletedProcess(argv, 0, out.encode(), b"")
+        return subprocess.CompletedProcess(argv, 0, state["ps"].encode(), b"")
 
-    monkeypatch.setattr(ws_git.subprocess, "run", fake_run)
+    monkeypatch.setattr(ws_git.hands_live, "run_bounded", fake_run)
     xpc = "/System/Library/Frameworks/NetFS.framework/Versions/A/XPCServices/PlugInLibraryService.xpc/Contents/MacOS/PlugInLibraryService"
     state["ps"] = f"  101     1 /usr/sbin/cfprefsd\n  102     1 {xpc}\n"
     assert ws_git.entity_session_live(4_000_017) is False

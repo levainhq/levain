@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thread view</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; background: #14161a; color: #e6e8ec; max-width: 760px; }
+  .tv-row { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; width: 100%; text-align: left; padding: 10px 12px; margin: 0 0 6px; background: #1d2026; color: inherit; border: 1px solid #2c313a; border-radius: 8px; cursor: pointer; }
+  .tv-id { font-family: ui-monospace, monospace; font-size: 12px; }
+  .tv-state, .tv-at, .tv-latest, .tv-note { color: #98a0ad; font-size: 12px; }
+  .tv-line { border-left: 3px solid #2c313a; padding: 6px 10px; margin: 0 0 8px; background: #1a1d22; }
+  .tv-message { border-left-color: #6aa7ff; }
+  .tv-vendor_approval_request { border-left-color: #e0a84a; }
+  .tv-head { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; }
+  .tv-kind { font-weight: 600; }
+  .tv-unverified { color: #e0a84a; }
+  .tv-tool-open { color: #6ad49a; }
+  .tv-body { white-space: pre-wrap; word-break: break-word; margin: 4px 0 0; font: 13px ui-monospace, monospace; }
+  .tv-gap { background: #3a2a14; padding: 8px 10px; margin: 8px 0; border-radius: 6px; }
+  .tv-card { color: #6aa7ff; font-size: 12px; }
+  .tv-composer { margin-top: 12px; padding: 10px; border: 1px dashed #2c313a; color: #98a0ad; }
+  .tv-back { margin: 0 0 10px; }
+</style></head>
+<body><div id="host"></div>
+<script src="/thread_view.js"></script>
+<script>window.__tv = LevainThreadView.mount(document.getElementById("host"), {pollMs: 0});</script>
+</body></html>

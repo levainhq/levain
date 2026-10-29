@@ -1068,10 +1068,12 @@ def _end_cli(leader: Any, failures: list[str]) -> CliEnd:
 @dataclass
 class ChatLaunch:
     """One chat launch as the driver holds it: its egress (``chat_egress.launch.EgressLaunch``), its ``chat_tmp``
-    (the launch's private write root, design §3.3) and, once attached, its CLI child. :meth:`end` releases them."""
+    (the launch's private write root, design §3.3), its ``trust_env`` (``chat_egress.ca.trust_env`` of the CA its egress
+    was started with: the names its chat env carries) and, once attached, its CLI child. :meth:`end` releases them."""
 
     egress: Any
     chat_tmp: Path
+    trust_env: dict[str, str] = field(default_factory=dict)
     _cli: Any = field(default=None, init=False, repr=False)       # confinement._Leader over the CLI's Popen
     _ending: bool = field(default=False, init=False, repr=False)  # end() has been called
     _ended: LaunchEnd | None = field(default=None, init=False, repr=False)    # set only by a complete end
@@ -1254,7 +1256,8 @@ class ChatEgressService:
         try:
             if harness not in CHAT_HARNESSES:
                 raise ValueError(f"no chat harness {harness!r}: one of {', '.join(CHAT_HARNESSES)}")
-            ca_pem = self._ca_for(now or datetime.now(timezone.utc)).glue_pem()
+            the_ca = self._ca_for(now or datetime.now(timezone.utc))
+            ca_pem = the_ca.glue_pem()
             egress = lm.start_egress(store=self.store, launch_id=launch_id, node=self.node,
                                      srt_prefix=self.srt_prefix, events=events, ca_pem=ca_pem,
                                      routes=routes, liveness=liveness, credentials=credentials, cards=cards,
@@ -1264,7 +1267,7 @@ class ChatEgressService:
         except BaseException:
             _remove_chat_tmp(chat_tmp)
             raise
-        return ChatLaunch(egress=egress, chat_tmp=chat_tmp)
+        return ChatLaunch(egress=egress, chat_tmp=chat_tmp, trust_env=the_ca.trust_env())
 
     def _ca_for(self, now: datetime) -> Any:
         """The CA a launch at ``now`` gets: this start's, first re-minted when ``now`` is within

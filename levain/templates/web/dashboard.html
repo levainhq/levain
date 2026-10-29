@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Levain · substrate control</title>
 <link rel="stylesheet" href="/dashboard.css" />
+<!-- OS-4: the Home Screen web app a phone turns pings on in (served beside a Signer, as /sw.js is) -->
+<link rel="manifest" href="/app.webmanifest" />
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
 <!-- cockpit_view.js loads here, not at the end of the body: its first act is to set the chosen theme, so a stored light theme never
      flashes dark (the CSP forbids an inline script). Everything else in it runs when the document is ready. -->
 <script src="/cockpit_view.js"></script>
@@ -35,6 +38,7 @@
         <div class="indicators">
           <span class="stamp" id="stamp"></span>
           <button id="refresh" type="button">Sync</button>
+          <button id="calmbtn" type="button" data-calm-toggle aria-pressed="false" aria-label="Calm off" title="Calm off">Calm off</button>
           <button id="jumpbtn" type="button">Jump<kbd>⌘K</kbd></button>
         </div>
         <div class="themesw" role="group" aria-label="Theme">
@@ -46,6 +50,7 @@
     </header>
     <section class="hero" id="ck-hero" data-ck-region="hero" hidden>
       <div class="band frame" id="ck-band">
+        <button id="calmphone" type="button" data-calm-toggle aria-pressed="false">Calm off</button>
         <div class="when" id="ck-when"></div>
         <div class="band-state" id="ck-state-slot"></div>
         <div class="band-meta" id="ck-wrapline"></div>
@@ -80,5 +85,7 @@
 <script src="/cockpit_stream.js"></script>
 <script src="/dashboard_chat.js"></script>
 <script src="/devices_panel.js"></script>
+<script src="/thread_view.js"></script>
+<script src="/board_view.js"></script>
 </body>
 </html>

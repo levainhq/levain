@@ -204,7 +204,9 @@ def test_an_operational_failure_statting_the_file_is_not_unreadable(tmp_path, mo
 
     def eio(fd):
         raise OSError(5, "Input/output error")
-    monkeypatch.setattr(X.os, "fstat", eio)
+    # only the export module sees the failure: patching os.fstat itself reaches every other thread and library in the process
+    import types
+    monkeypatch.setattr(X, "os", types.SimpleNamespace(**{**vars(os), "fstat": eio}))
     with pytest.raises(X.ArtifactIOError) as e:
         X.read_artifact(tmp_path, SESSION)
     assert e.value.name == "stat"

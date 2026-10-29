@@ -7,6 +7,60 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **`levain upgrade` (hidden, like `levain session`) upgrades Levain and its root side in one command.** It runs the
+  installer that put Levain there (pip, `pip --user`, pipx or uv; it refuses and prints what to run when it cannot tell),
+  restarts itself on the new code, stops with the clean-up commands printed if a session is stuck, then runs exactly
+  `sudo <install-helper> repair --source <package>`, so the root helper's own checks (including who may write the
+  source) all still apply. It asks for your password once per run, refuses to run as root or without a terminal, and
+  `--dry-run` prints what it would run and changes nothing. It always runs the repair, even when the installer found
+  nothing newer: the repair is safe to re-run, and it is the only check of the other root rows. So every run costs a
+  password and a restart of Levain's services. The installer and sudo get only the environment they need (your
+  `PIP_*`, `UV_*`, `PIPX_*`, proxy, CA, `PYTHONUSERBASE` and session-bus settings go to the installer), never your
+  tokens or cloud keys. They run from `/`; a relative config path such as `PIP_CONFIG_FILE=./pip.conf` or
+  `NETRC=./netrc` is made absolute from your directory first. The restart onto the new code ignores the current
+  directory and gets none of your `PYTHON*` settings except `PYTHONUSERBASE` and `PYTHONNOUSERSITE`, so
+  `PYTHONPATH=.` cannot bring a local `levain/` back in. If the helper gives no result, or reports success but sudo
+  exits non-zero, it says the outcome is unknown and to run `levain upgrade --no-pip` again. The first hop from 0.11.26 is still two commands, because
+  that release has no `upgrade`: `pip install -U 'levain[isolation]'`, then `levain upgrade`. Later hops are the one
+  hidden command. It is not `levain update`, which refreshes one install directory's hooks. Covered by tests that
+  drive every path through fakes (no real installer, sudo or root helper has been run by them).
+- **`levain session claude|codex --auth passthrough` (no `--login`) is no longer refused at launch.** The launcher
+  accepts it for both vendors; if the start step then refuses because the slot's stored login answers as a different
+  account, the supervisor says which account (from Levain's own session record, never the session's terminal output)
+  and that nothing was launched. For Codex it prints first that Codex has no server-checked identity, so Levain cannot
+  tell which account the stored login belongs to (not a check). Run on a macOS VM for Claude only: a matching
+  login started Claude logged in and was parked again at the end, and a baseline naming another account was refused with
+  nothing launched and the parked login untouched. Not run: Codex, Linux, and a stored login older than about five and a
+  half hours (the token is not refreshed before the check, so an old one may be refused).
+- **A passthrough login asks whether to keep that account as the slot's baseline.** Once
+  `levain session codex --auth passthrough --login` exits, Levain shows the account from its own session record (never
+  the session's terminal output) and asks whether to keep it. Codex has no server-checked identity, so the baseline
+  records it as "not a check". `levain session claude --auth passthrough --login` asks the account server which account
+  the new login belongs to, as the session's own sandboxed account, and shows that account id when it asks. Anything
+  still running as the session's account is ended first. If the check fails in any way, the login still completes and
+  the failure is recorded by name; no baseline is offered. Run on a real macOS machine with two logins.
+- **Signing a slot in again now works.** When a second `levain session ... --auth passthrough --login` on the same slot
+  ends with your yes to its baseline question, the new login replaces the stored one. The old login is kept with that
+  session's retained work (discard, restore and purge carry it), not deleted.
+- **The cockpit's Build tab has a Threads section.** It shows the coordinator's threads and one thread's stream in the
+  order it happened, with running tool calls, approvals shown as a line pointing you to Needs you, and your own lines
+  marked unverified. It needs the page's write token and is read-only for now.
+- **Pings come from the cockpit's own origin.** The cockpit serves web push itself (service worker, manifest,
+  `/webpush/*`), behind its credential. The Devices panel turns pings on for the browser you are using: pair it, then
+  Turn on; on a phone, add the cockpit to the Home Screen and pair it from there. Only a paired device can turn pings
+  on, and a revoked device gets no ping, whatever happened to its stored subscriptions: every send checks the device
+  is still paired.
+- **Sign links open the cockpit's sheet and carry no token.** `levain.consent.sign.deep_link` builds
+  `<origin>/sign/<id>`. `levain consent phone --redirect-to <origin>` runs the old phone port as a redirect only: links
+  you already hold open the cockpit's sign sheet, and the token in them is dropped, never sent on.
+- **`levain consent canary --sandbox` checks the confinement.** It asks the agent, started through `levain session`,
+  to run one fixed probe that tries five escapes (a write in your home, a host off the allow-list, your cockpit's port,
+  a stand-in port the canary counts, a git hook in the repository the session was cloned from). The verdict comes from
+  a results file the probe signs with a per-run secret over the exact command it was given, and from what Levain sees
+  outside the session, never from the agent's screen: a retyped command reads as unclear, not as a pass. It fails on
+  any escape and on an unclear run. The check reads the agent's work, and discards its scratch session afterwards,
+  from the session the store records as cloned from the run's own commit, never from what the agent's screen says.
+  `--cockpit-url` (with `--sandbox`) names the cockpit if it is not at the default address.
 - **The cockpit signs in an overlay sheet.** A sign card opens `/sign/<id>` over the cockpit; the sheet shows the one
   request, freezes a written answer when you tap Sign and shows the exact line being signed, then the line that was
   signed. Before asking for a passkey it checks that a key enrolled for the cockpit may sign the request, and says what
@@ -130,8 +184,51 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   served on a port says where the request can be answered instead of asking for a passkey. A ruling is confirmed as soon
   as it is recorded; its delivery to the session continues on its own.
 - **The consent sheet treats a request as changed when the words an option shows, or the exact line it signs, change.**
+- **Slot sessions can fetch from a shipped list of hosts without a prompt.** Setup and repair add a shipped
+  `egress-default` route to your route map (`github.com`, `api.github.com`, `pypi.org`, `files.pythonhosted.org`); every
+  other host is still refused at the gateway, and the refusal now names how to allow it.
+- **The install helper's `routes-egress` verb sets your own extra egress hosts** (JSON on stdin; an empty list removes
+  them). They apply to sessions started afterwards. If your route map already has your own egress route for one of the
+  `egress-default` hosts (for example `pypi.org`), your route keeps it and the shipped list leaves it off; setup, repair
+  and `routes-base` say so. A map where two of your routes name the same host, a route that lists the same host twice, a
+  subscription route that names one of those `egress-default` hosts, or your own egress route that names a host the
+  shipped Claude route below also names (`claude.ai`, `platform.claude.com`) is refused when the map is merged, with
+  the route names and the fix (edit `routes/base.json`), instead of every session failing at its gateway;
+  `routes-egress` refuses to write over such a map.
+- **The cockpit has a Calm switch.** On, the agents graph and the sky stop moving and the page's animations and transitions stop, and the
+  ages on the page refresh every two minutes instead of faster, so an open cockpit tab costs the laptop far less; every
+  number, card and answer stays. It is remembered on that device. On a desktop bar too narrow for the label it shows as an
+  icon, filled while Calm is on; on a phone it sits at the right of the clock and date.
+- **A Levain session can sign in to your own Claude subscription.** The base route map now includes `claude-subscription`,
+  which lets a passthrough session reach `api.anthropic.com`, `claude.ai` and `platform.claude.com` and nothing else;
+  telemetry, error-reporting and update hosts are not included. For now a passthrough session runs only as a sign-in:
+  `levain session claude --repo PATH --auth passthrough --login`. `levain setup` and `repair` add the route to an
+  existing install; if you already have your own passthrough route for Claude, the merge keeps yours, skips the shipped
+  one, and says so each time it runs.
+- **A slot's network front keeps a log.** Each egress slot's gateway writes its tunnels and refusals to `front.log` in
+  the slot's gateway directory; the log is capped (one rotated copy), mode 0640, and never written through a link.
+- **`levain binding pause|resume|abandon <id>`.** `pause` stops a binding from firing and stops runs it already started
+  before their next action; `resume` makes a paused binding fireable again (it refuses a revoked or expired binding, and
+  a confirm-class one with no kill in its sealed guard); `abandon` stops the runs a revoked or expired binding already
+  started, and on an active or paused binding pauses it instead. Bindings do not fire yet in this build (no binding
+  driver is wired), so these set the state the driver will read. Each opens the autonomic store as it is and prints one
+  line (exit 1 with the reason when it cannot).
+- **Graduation policies carry a guard.** `levain binding policy create` needs `--guard FILE`, a JSON list of entries that
+  each give a reason the policy might be wrong, a kill (an event condition) and a drill (an example event the kill must
+  not let through). Levain prints the guard back before signing and refuses a kill it could not evaluate, a drill the
+  kill lets through, an entry missing any of the three, or a guard past the size limits. The guard is checked when the
+  policy is signed, and, once the binding driver is wired, again just before a step it covers fires (see Groundwork). Every policy created now carries a guard and is written
+  `levain-authority/3`, which an older
+  levain stops at instead of reading. A graduation policy signed without a guard no longer covers anything (its bindings
+  wait at CONFIRM again) and cannot be renewed: revoke it and create it again with `--guard`. The graduation card's
+  command line includes `--guard <guard.json>`.
 
 ### Changed
+- **The consent queue's store moves to format 5, one way.** The first consent hook call or `levain` command that opens
+  it migrates it in place (from format 3 or 4), keeping every request, signed answer and receipt. An older levain then
+  refuses that store: its hook makes no decision (the agent's own permission dialog asks), standing grants stop
+  answering, and agent-config edits are denied. There is no way back to format 4, so upgrade every levain that shares
+  the store (the hook, the cockpit, the CLI) together.
 - **A coordinator store made by an earlier version is updated the first time a `levain` command that writes to it
   opens it:** the review history gains one column, and every entry is kept as it was.
 - **`levain doctor` has an agent firewall probe row:** each agent slot's last recorded probe result, with its age and
@@ -148,7 +245,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   when it was charged no more than its hold.
 
 - **A Claude Code session's settings skip WebFetch's hostname preflight, and claude.ai connectors are off in every
-  session.** The egress hosts are not pre-allowed: an on-list WebFetch still asks first, and the gateway still decides.
+  session.** A session on an egress route is allowed WebFetch to that route's hosts without a prompt; the gateway still
+  refuses every other host.
 - **Codex sessions start with web search disabled on the command line,** so a repository's own Codex config cannot turn
   it back on.
 - **A repo settings file that sets a proxy variable** (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `ALL_PROXY`, any case)
@@ -157,6 +255,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   a plainly written address.
 
 ### Fixed
+- **A login that ended without a yes on a slot that already holds a login no longer sticks.** The session used to end
+  HELD and keep its slot leased for good. Now the stored login is left as it was, the new one is kept with the
+  session's retained work instead, and the slot is released. A session already stuck this way is released by the
+  reaper's next pass.
+- **A brokered call the vendor refuses now records the vendor's error in the gateway log** (`upstream_error` in
+  `gw.jsonl`: the error type, a short message and the request id, with any configured credential redacted), so a
+  refusal such as a 400 says why instead of only its status.
 - **Linux replenish restarts the keys service when it makes new gateway accounts, and does so after the pool is
   refilled,** so a keys failure cannot leave the pool short.
 - **Two sessions making their first call at the same moment on a fresh install could both be refused with
@@ -165,6 +270,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **A session's `budget_overrun` in CONTROL's `STATUS` goes away when the session is purged.**
 - **On an OpenRouter route, a response from another model that reports a cost above the call's hold but no token
   counts is charged that cost** (it was charged only the hold).
+- **The cockpit's top bar no longer runs over its tabs between 1041 and 1099 px wide** in a font wider than macOS's
+  system font (Linux's default font, or Verdana): up to 1100 px the bar stacks, with the tabs on a row of their own, and
+  Calm shows its icon from 1101 to 1280 px.
 - **The levain home a consent hook protects comes from the environment the hook read when it started,** the same as
   everything else on its decision path. When the hook cannot open its queue, a write to the configured cockpit's
   authority store is still refused.
@@ -175,8 +283,74 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   only once.** An activation or re-enable waits for a read in progress, so that read's interrupt never reaches a turn
   started after it. A control reply the session does not hold still latches the launch off.
 - **Chat: a Read whose path (or a launch directory) contains a NUL byte latches the launch off instead of erroring.**
+- **`levain session adopt` works on a real macOS install again.** The confined importer died at startup, before it read
+  anything, because its sandbox denied the system random device Python needs to start, so every adopt refused
+  `importer-failed:result-malformed: 'no result line'`. The importer and verifier sandboxes now allow reading
+  `/dev/urandom`.
+- **`levain session adopt` no longer refuses `bad-root` on `/var/levain/export/operator`.** The export directories are now
+  owned by root (group `levain-export` / `levain-dispatch-export`, mode 0750), as the store layout specifies. **Run the
+  install helper's `repair --source <levain package>` once after upgrading** so an existing install's directories are
+  re-owned.
+- **Setup and repair on macOS now remove extended ACLs from Levain's store directories.** A directory that an older
+  install gave to another account could keep an ACL grant (for example, to add files) after repair made it root's, and
+  Levain's trust check would not see it.
+- **macOS: after a reboot, Levain now restores pf on its own.** The `com.levain.pf` boot job turns pf on, loads Levain's
+  firewall rules and puts back the loopback addresses the egress slots use. Before, `setup` and `repair` reported the job
+  as pending and installed nothing, so every session refused to start until pf was set up again by hand. The job keeps
+  its output in `/var/log/com.levain.pf.log`. If it cannot save its pf token it gives back the reference it took and
+  launchd retries it until the token can be saved, so pf references no longer pile up; while the token's path stays
+  unwritable, the job retries on launchd's throttle.
+- **macOS: a session no longer starts while pf itself is disabled,** even when Levain's rules are loaded. The start is
+  refused with `pf-disabled`.
+- **A chat launch's network mode can only get stricter while it runs.** Turning the standing "open network" default on
+  takes effect from the next chat launch; turning it off still applies at once to launches already running. A read of
+  that setting that fails, is slow or answers too late gates only the request it was read for.
+- **`pip` can install packages in chat again.** Recent `pip` versions check certificates through the macOS system
+  verifier, which the chat sandbox cannot use, so every download failed. The chat environment now sets
+  `PIP_USE_DEPRECATED=legacy-certs`, which makes `pip` use Levain's chat certificate. A `pip` older than that option (such
+  as the 21.x that ships with Xcode's Python) refuses the setting; run it as `env -u PIP_USE_DEPRECATED pip ...`.
+- **More sandbox settings that weaken Claude Code's sandbox are refused.** A repository's `.claude/settings.json` or
+  managed settings that add Mach services (`sandbox.network.allowMachLookup`), allow Apple Events or nested user
+  namespaces, re-allow reads (`sandbox.filesystem.allowRead`) or turn filesystem isolation off
+  (`sandbox.filesystem.disabled`) are now refused by name, as `enableWeakerNetworkIsolation` already was. Allowing
+  `com.apple.trustd.agent` let a sandboxed command make macOS fetch a web address of its choosing, outside Levain's proxy.
+  Such a key holding the wrong type (for example `false` or `""` where a list belongs), or a list holding anything but
+  strings, is refused by key name instead of launching.
+- **A stuck cockpit read no longer wedges its panel until restart.** After the panel's time budget the cockpit starts a
+  fresh read, holds at most two outstanding builds per source, and a panel waiting on the stuck read gets the fresh
+  one's result. An idle store now costs the cockpit nothing (no time-derived etag, a cached view).
+- **Turning on the system's reduced-motion setting no longer switches Ambient off for good.** The sky stays still while
+  the setting is on, and the motion you chose comes back when you turn it off; Calm never writes the Ambient preference.
+- **`levain binding resume` refuses a binding whose stored record is damaged** (a hand-corrupted counter) instead of
+  making it live; pausing or revoking it still works. The pause, resume and abandon commands also read a store through a
+  read-only connection first, so a database they refuse is left exactly as it was, and refuse a `/2` store missing a
+  column.
+- **`levain doctor`'s "agent front logs" row judges what a session start would.** It asks the runtime's own walk about
+  each egress slot's front log directory (missing account, a `gw/` that is a file, a link, a wrong owner or mode fail
+  the row; a genuinely missing directory also fails it, marked upgrade-pending with the repair line), names each slot
+  under its own result, and no longer warns "could not be read" on a healthy install. A session start is refused for a
+  missing front log directory too, and names the directory that is missing.
+- **`levain binding policy create`'s read-back no longer overstates a guard.** A kill condition that hits an unexpected
+  internal error, or an event number too large for a float, now reads as a kill Levain could not evaluate, so the
+  guard is refused at signing instead of the check crashing.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- Groundwork for chat approvals: the store now has tables for each approval request a chat session raises and everything that happens to it (asked, decided, answered, cancelled), kept in the same append-only style as the rest of the chat record. Nothing in `levain` writes to them yet, so there is no change you can see. A store from 0.11.25 or later is brought up to date the first time it is opened for writing, keeping every row it already had; opening one read-only changes nothing.
+- **A contained-shell grant can answer a Levain chat launch's Bash calls.** It answers only a chat call carrying the
+  proof of the launch it was granted for, never a Claude Code or Codex hook call; it is listed, counted and revocable
+  like any standing grant, and an answer it gave stops being delivered once it is revoked. Nothing launches a chat
+  session that uses it yet (CH-D2).
+- **The autonomic store can keep every attempt of an effect (store format /3).** A retry carries the authority of the
+  attempt before it (the same grant and cover); an attempt on a held link carries the hold's current decision, names
+  who decided (a person or not) as that decision does, and fires no lower than the rung it decided. An attempt that
+  never started is closed as refused, with its reason. The store refuses an unknown actor or posture and a run with no
+  id. Nothing writes a /3 store yet.
+- **A step a graduation policy covers is checked again just before it fires.** Once the binding driver is wired, the
+  step about to run reads its cover afresh: if the cover changed since the step was decided, or cannot be read, the
+  step is held and no receipt is written. The run is refused and ended when the policy does not sign this action at this risk, cover value
+  and rung, when its guard is incomplete, or when the guard cannot be evaluated (no trigger event, or evaluating a
+  condition fails with an error). A guard kill that trips, or reads as unknown, ends the run, and the cancel names the
+  policy and the guard entry.
 - **The graduation engine behind `levain binding graduate`.** Once the binding driver is wired, it takes the steps a
   policy covers, records each, and prints the one `levain binding policy create` line for a step none covers; the steps
   already taken stay printed when a later one fails, and a binding that changed during the run (revoked, paused,
@@ -217,6 +391,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Chat checks that a worker's hooks are still live at every turn** and refuses messages while a check runs; a check
   that cannot run is retried, then turns chat off for that worker until you re-enable it. A stuck worker connection no
   longer freezes chat: a read or an interrupt that does not answer gives up after a bounded wait.
+- **Chat turns a Claude worker off, until you re-enable it, when its stream shows a permission check Levain did not
+  make:** a hook that did not run, an allow rule or a mode Levain did not set (even for a moment), a call accepted with no
+  request to you (except Levain's own gate and reads inside the worker's folder), a control message Levain cannot answer,
+  or lines the worker's stream lost while a tool call was open. When chat turns a worker off after it was live, a review
+  item says which check did it. A control message Levain refuses is answered before chat records it, so a restart never
+  leaves the worker waiting.
+- **The Codex chat connection fails closed under load.** A request whose timeout passes before it is sent is not sent
+  late, and a peer that accepts data slowly cannot stretch a send past its timeout; a send that could not start in time
+  fails only that call. An oversized message, or a WebSocket frame that breaks RFC 6455 section 5 (reserved bits or
+  opcodes, broken fragmentation), closes the connection at once instead of stalling it. Closing it always releases its
+  file descriptors, even while a session callback is stuck.
 - **Dispatch has a runner for its event follower** (`python -m levain.dispatch.follow_run`, with `--store-dir` defaulting to the dispatch store directory): it follows
   CONTROL's event stream, retries a CONTROL that is down with a growing wait, waits five minutes between retries of a
   stop no retry can fix, and stops cleanly on SIGTERM. No installed service runs it yet.

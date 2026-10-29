@@ -144,6 +144,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
         core.extend(_check_hands_isolation(install))
     core.extend(_check_floor_placeholders())
     core.extend(_check_store(install))
+    core.extend(_check_autonomic_store())
     core.extend(_check_baton(install))
     core.extend(_check_host_awake())
     core.extend(_check_cockpit_authority(install))
@@ -156,6 +157,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_dispatch_adoption_rules())
     core.extend(_check_dispatch_verifiers())
     core.extend(_check_slot_isolation())
+    core.extend(_check_vendor_copies())
     core.extend(_check_slot_limits())
     core.extend(_check_slot_keys())
     core.extend(_check_slot_services())
@@ -443,7 +445,8 @@ def _read_slot_dirs(slots: Path) -> tuple[dict[str, tuple[str, str]], list[str]]
 
 
 def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
-                          free_bytes: Any = None, now: float | None = None) -> list[CheckResult]:
+                          free_bytes: Any = None, now: float | None = None,
+                          seams: Any = None) -> list[CheckResult]:
     """Read-only rows over the isolation install's facts the OPERATOR can read (doctor runs as the operator): the
     pool's configured counts (``policy/pool``), the slots' state files (root-owned 0644 in 0755 dirs; the group is
     ``wheel`` on macOS) and the store volume's free space. Nothing is leased, probed or run as a slot user. A fact that
@@ -480,6 +483,7 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
             return [CheckResult("agent sessions", False, f"partially installed: no slots directory at {store}",
                                 "The isolation install is incomplete; its install helper repairs it.")]
         rows = _slot_rows(store, layout, R, Refused)
+        rows += _front_log_rows(store, host, layout, R, seams)
     except OSError as exc:
         rows = [CheckResult("agent slots", True, f"could not be read ({_slot_why(exc)})", warn=True)]
     else:
@@ -504,6 +508,78 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
         else:
             rows.append(CheckResult("agent store free space", True, f"{gib:.1f} GiB free"))
     return rows
+
+
+def _operator_home(*, env: Any = None, getuid: Any = None, getpwuid: Any = None) -> str:
+    """The home the vendor search starts from, resolved the way the install helper's repair resolves its operator:
+    under sudo, the account ``SUDO_UID`` names (never root's ``~``); else the account running doctor."""
+    import pwd
+
+    env = os.environ if env is None else env
+    uid = (getuid or os.getuid)()
+    sudo = env.get("SUDO_UID", "")
+    if uid == 0 and sudo.isdigit():
+        uid = int(sudo)
+    return (getpwuid or pwd.getpwuid)(uid).pw_dir
+
+
+def _check_vendor_copies(*, host: str | None = None, store: Path | None = None, home: str | None = None,
+                         state: Any = None) -> list[CheckResult]:
+    """The ``agent vendor CLIs`` row: each vendor CLI a session runs is root's copy of its install unit in
+    ``VENDOR_PREFIX`` (setup and repair make it, head ruling 1026+8), checked with the predicate start's check reads
+    and compared byte for byte with the vendor it is copied from (:func:`levain.slot.root_tree.vendor_state`, the same
+    search repair runs, from the operator's home, :func:`_operator_home`). A copy that differs is a vendor updated
+    since the last repair: sessions keep running the old one until repair re-copies it. No row when there is no
+    isolation install."""
+    from levain.slot import layout
+    from levain.slot import root_tree as RT
+
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    if store is None or not os.path.lexists(store):
+        return []
+    if home is None and state is None:
+        try:
+            home = _operator_home()
+        except (KeyError, OSError) as exc:
+            return [CheckResult("agent vendor CLIs", True, f"the operator's home could not be read ({exc})",
+                                warn=True)]
+    read = state if state is not None else (lambda name: RT.vendor_state(host, name, home))
+    parts, fix, orphan = [], [], []
+    for name in RT.VENDORS:
+        try:
+            st, detail = read(name)
+        except Exception as exc:     # V13: a probe that crashes is a row, never doctor's crash
+            st, detail = "unreadable", f"could not be read ({_slot_why(exc)})"
+        if st == "current":
+            parts.append(f"{name} current")
+        elif st == "absent":
+            parts.append(f"{name} not on this machine")
+        elif st == "stale":
+            fix.append(name)
+            parts.append(f"{name} STALE: {detail}")
+        elif st == "not-copied":
+            fix.append(name)
+            parts.append(f"{name} NOT COPIED: {detail}; its sessions are refused vendor-not-installed:{name}")
+        elif st == "bad-copy":
+            fix.append(name)
+            parts.append(f"{name} BAD COPY: {detail}; its sessions are refused vendor-not-installed:{name}")
+        elif st == "unreadable":
+            fix.append(name)
+            parts.append(f"{name} UNREADABLE: {detail}")
+        else:   # orphan
+            orphan.append(name)
+            parts.append(f"{name}: {detail}")
+    repair = f"sudo {layout.install_helper_path(host)} repair"
+    if fix:
+        return [CheckResult("agent vendor CLIs", True, "; ".join(parts), warn=True,
+                            hint=f"Run `{repair}`: it copies {', '.join(fix)} into {RT.VENDOR_PREFIX[host]} again, "
+                                 "where sessions run it.")]
+    if orphan:
+        return [CheckResult("agent vendor CLIs", True, "; ".join(parts), warn=True,
+                            hint="A copy with no vendor to compare it with keeps running as it is; repair leaves it.")]
+    return [CheckResult("agent vendor CLIs", True, "; ".join(parts))]
 
 
 def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResult]:
@@ -540,6 +616,78 @@ def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResu
                             "The pool is below its configured counts; its install helper replenishes it.")]
     return [CheckResult("agent slots", True, detail + (f"; not usable (extra): {', '.join(bad)}" if bad else "")
                         + note)]
+
+
+def _front_log_rows(store: Path, host: str, layout: Any, R: Any, seams: Any = None) -> list[CheckResult]:
+    """The ``agent front logs`` row: for each in-service egress slot, what a session start would refuse about its
+    front log dirs (``L/gw/``, ``L/gw/slot<n>/``, S1 3b-8a), asked of the runtime itself
+    (``runtime_helper.check_front_log_dirs``: render's own front-account lookup and ``prepare_front_log``'s own walk
+    up to its final open, read-only), never re-derived here. Every slot is gathered into the one row, each named
+    under its own clause only. A ``store-missing`` there is a dir that is genuinely absent (the walk raises it only on
+    ``FileNotFoundError``): an install made before the dir existed, said with the repair line. Any other refusal
+    (``bad-root``: a link, a non-directory, a wrong owner or mode; ``account-missing``, ``account-out-of-range``) is
+    said refused. What the walk cannot read is said not judged, never refused. The row's verdict is the worst real
+    one: any refusal fails it, absences alone make it upgrade-pending, unread alone warns. No egress slot: no row.
+    ``seams``: the runtime's, for tests (its ``store`` is set to ``store``); the default reads the real accounts."""
+    import dataclasses
+
+    from levain.slot import Refused
+    from levain.slot import runtime_helper as H
+    from levain.slot.ids import SlotId
+
+    found, _ignored = _read_slot_dirs(store / "slots")
+    tags = sorted((t for t, v in found.items() if t[0] == "e" and v[0] not in R.OUT_OF_SERVICE),
+                  key=lambda t: int(t[1:]))
+    if not tags:
+        return []
+    name = "agent front logs"
+    seams = H.Seams(host=host, store=store) if seams is None else dataclasses.replace(seams, store=store)
+    try:
+        st = H.Store(seams)
+    except Refused as exc:
+        if exc.name == "bad-root":
+            return [CheckResult(name, False, f"{store} is not root's alone; the runtime refuses it (bad-root), so no "
+                                "session can be started", f"Look at its owner and mode; `{layout.repair_line(host)}` "
+                                "sets them back to setup's.")]
+        # Store maps every open error of the root to store-missing; the caller saw the root there, so it is unreadable
+        return [CheckResult(name, True, f"could not be read ({_slot_why(exc)})", warn=True)]
+    absent: dict[str, list[str]] = {}       # refusal text -> tags, in the order first met
+    failed: dict[str, list[str]] = {}
+    unread: list[str] = []
+    try:
+        for t in tags:
+            try:
+                refusals = H.check_front_log_dirs(st, SlotId("egress", int(t[1:])))
+            except (OSError, LookupError) as exc:   # unreadable is said as unreadable, never as present or absent
+                unread.append(f"{t} ({_slot_why(exc)})")
+                continue
+            for r in refusals:
+                (absent if r.name == "store-missing" else failed).setdefault(f"{r.detail} ({r.name})", []).append(t)
+    finally:
+        st.close()
+
+    def said(header: str, groups: dict[str, list[str]]) -> list[str]:
+        return [header + "; ".join(f"{', '.join(ts)}: {why}" for why, ts in groups.items())] if groups else []
+
+    # each slot under its own verdict only: a slot never judged is never said refused (codex L3 r5)
+    clauses = (said("refused, so no session on them starts: ", failed)
+               + said("refused until the missing dir is made: ", absent)
+               + (["could not be checked, so not judged: " + ", ".join(unread)] if unread else []))
+    detail = ". ".join(clauses)
+    unjudged = (" What could not be checked is not judged; run the doctor again once it can read them."
+                if unread else "")
+    if failed:
+        return [CheckResult(name, False, detail,
+                            f"Look at what is named. `{layout.repair_line(host)}` sets each dir's owner and mode back "
+                            "to setup's; it does not replace a link or a file standing where a dir belongs, and it "
+                            "never makes a missing account (undo, then setup, does)." + unjudged)]
+    if absent:
+        return [CheckResult(name, False, detail,
+                            f"Run `{layout.repair_line(host)}` once (an install made before the front log moved to the "
+                            "store has none)." + unjudged, upgrade_pending=True)]
+    if unread:
+        return [CheckResult(name, True, detail, unjudged.strip(), warn=True)]
+    return [CheckResult(name, True, f"{len(tags)} egress slot(s), each with its front log directory")]
 
 
 #: V13 (O4, N10): the record root writes after each firewall probe, beside the slot's state (levain.slot.probe's
@@ -856,7 +1004,7 @@ def _keys_status_asker(run_dir: Path, budget_s: float) -> Any:
     """A callable answering CONTROL's ``KEYS-STATUS`` (3c-9 session D: keys' report of its ledger size and the
     brokered routes it serves, which the operator's account cannot read), asked on its first call only and answered
     within ``budget_s`` of that call; ``None`` for any failure (CONTROL or keys unreachable, a refusal, an answer off its shape), which a
-    row says as held by keys."""
+    row says as keys having given none to this run."""
     memo: list = []
 
     def ask() -> Any:
@@ -929,7 +1077,8 @@ def _check_spend_ledger(store: Path, keys_status: Any = lambda: None) -> CheckRe
     except PermissionError:
         told = keys_status()
         if told is None:
-            return CheckResult(name, True, "held by keys: your account cannot read its size", neutral=True)
+            return CheckResult(name, True, "held by keys: its size is read once a session has started, and keys gave "
+                               "none to this run (with no session yet, or with keys not answering)", neutral=True)
         if told["ledger_bytes"] is None:
             return CheckResult(name, True, "keys could not tell its size (it has no ledger open, or cannot stat it)",
                                neutral=True)
@@ -1036,8 +1185,9 @@ def _served_pairs(store: Path, deadline: float, keys_status: Any) -> tuple[set, 
             if said:
                 return pairs, CheckResult(name, True, "; ".join(said), warn=True), None
             return pairs, None, None
-        return set(), CheckResult(name, True, "held by keys: your account cannot read the dispatch route maps, so "
-                                  "the ceilings of their credentials are not shown",
+        return set(), CheckResult(name, True, "held by keys: this account's own read of the route maps was refused "
+                                  "and keys gave none to this run, so the ceilings of their credentials are not "
+                                  "shown (keys gives them once a session has started)",
                                   "Run `sudo levain doctor` to read them as root.", neutral=True), frozenset()
     except OSError as exc:
         return set(), CheckResult(name, True, f"dispatch route maps could not be read ({_slot_why(exc)})",
@@ -1150,12 +1300,16 @@ def _limit_verdict(name: str, lim: float | None, rem: float | None, reset: objec
 def _keys_limit_row(cred: str, name: str, held: tuple, keys_status: Any) -> CheckResult:
     """The ceiling row from keys' own report (D1: keys' refresher reads each served OpenRouter key's limit and
     ``KEYS-STATUS`` carries its last read, in microdollars, with its age), for an operator whose account cannot open
-    the credential; the held words when keys did not tell it."""
+    the credential; the held words when keys gave no report, and its own words when keys answered without this credential."""
     told = keys_status()
     entry = None if told is None else next((e for e in told["limits"] if e["credential"] == cred), None)
     if entry is None:
-        more = ("; keys' answer had no room for it" if told is not None and told["limits_truncated"] else "")
-        return CheckResult(name, True, held[0] + more, held[1], warn=True)
+        if told is None:
+            return CheckResult(name, True, held[0], held[1], warn=True)
+        # keys answered: what it left out is said as what it left out, never as keys not answering
+        said = (f"the key limit was not read: keys answered and reports no limit for {cred}"
+                + ("; keys' answer had no room for it" if told["limits_truncated"] else ""))
+        return CheckResult(name, True, said, held[1], warn=True)
     failed = entry["failed"]
     if entry["age_s"] is None:
         if failed is None:
@@ -1179,7 +1333,8 @@ def _openrouter_limit_row(store: Path, cred: str, name: str, fetch: Any, timeout
     limit resets over) and ``include_byok_in_limit`` (boolean)."""
     from levain.broker import creds, policy
 
-    held = (f"the key limit was not read: {cred} is held by keys and your account cannot open it",
+    held = (f"the key limit was not read: keys holds {cred}; its limit is read once a session has started, and keys "
+            "gave none to this run (with no session yet, or with keys not answering: see the keys service row)",
             "Set a per-key credit limit at openrouter.ai/settings/keys; Levain's authorized cap does not bound "
             "the provider's invoice by itself.")
     try:
@@ -2337,18 +2492,26 @@ def _check_confinement(install: Path) -> list[CheckResult]:
         # The host can sandbox bash, but the entity's localhost deny can still drop it or take its
         # network. `levain run` asks the SAME resolver with the same config, so the two agree.
         bash_ok, refusal, offline = resolve_localhost_deny(cfg.allow_localhost_outbound)
+        # The line `levain run` prints when $PYTHONUSERBASE puts the user site outside the floor.
+        try:
+            from levain.firing.confinement import python_userbase_note
+
+            note = python_userbase_note(Path.home())   # build_policy's home
+        except Exception:  # noqa: BLE001 — never let a diagnosis break the whole doctor run
+            note = None
+        tail = f"\n      {note}" if note else ""
         if not bash_ok:
             return [CheckResult("confinement floor", True,
                                 f"{d.provider} available, but `levain run` gets file_editor only: "
-                                f"{refusal}")]
+                                f"{refusal}{tail}")]
         if offline:
             return [CheckResult("confinement floor", True,
                                 f"{d.provider} — `levain run` gets file_editor + bash, and bash has "
                                 f"no IP network: connections back to this host are blocked by "
                                 f"removing it; {OFFLINE_RESIDUAL}. \"allow_localhost_outbound\": "
-                                f"true restores the network, with the spore-755 exposure")]
+                                f"true restores the network, with the spore-755 exposure{tail}")]
         return [CheckResult("confinement floor", True,
-                            f"{d.provider} — `levain run` gets file_editor + bash")]
+                            f"{d.provider} — `levain run` gets file_editor + bash{tail}")]
     detail = f"{d.reason} — `levain run` gets file_editor only (this is a supported configuration)"
     if d.remedy:
         detail += f"\n      → to enable the bash hand: {d.remedy}"
@@ -2620,6 +2783,74 @@ def _check_store(install: Path) -> list[CheckResult]:
         ]
     label = f"reachable ({len(tables)} table(s): {', '.join(tables[:3])}{'…' if len(tables) > 3 else ''})"
     return [CheckResult(".levain/memory.db", True, label)]
+
+
+# what each row of a levain-autonomic/3 store's INVARIANT (schema3.INVARIANT) means, in the doctor's words
+_INVARIANT_MEANS = {
+    "terminal_without_receipt": "a closed run, effect, pending or request whose receipt is missing",
+    "receipts_per_subject_gt_1": "more than one receipt for one subject",
+    "receipt_without_terminal": "a receipt whose subject never closed (the reaper adopts it when it can)",
+    "closing_left": "a close statement's mark left behind (the reaper clears it)",
+    "hold_rejected_without_run_close": "a rejected hold whose run was not closed",
+    "not_started_uncounted": "an attempt that did not start, with no held count naming it, so its retry is refused",
+    "held_at_bound_unclosed": "a held count at its bound with neither its run's close nor its request's close",
+}
+
+
+def _check_autonomic_store(store_dir: Path | None = None) -> list[CheckResult]:
+    """The autonomic store's own consistency read (R15-5 S3). The store is this user's, not the install's: the one
+    ``default_store_dir()`` names (``$LEVAIN_HOME/autonomic``, else ``~/.levain/autonomic``), the default of every
+    ``levain binding`` command's ``--store-dir``; ``store_dir`` reads another.
+      - No row without a database, for an empty one, or for a ``levain-autonomic/1`` or ``/2`` store (those are the
+        ``levain binding`` commands' to report).
+      - A ``levain-autonomic/3`` store: one FAIL row per row of its INVARIANT (``schema3.invariant``), else one row
+        naming its legacy rows (``schema3.census``) and the receipts not yet copied to the receipt file.
+      - Any other database there (a newer format, tables with no marker, a schema not this levain's): a FAIL row
+        worded by ``schema3.refuse_unless_this_v3``'s refusal.
+      - A database that cannot be opened or read, or a read that raises: a FAIL row, since an unreadable store cannot
+        be told from a corrupt one. Doctor goes on to its next check.
+    The store is read through a read-only connection, in one snapshot, and never written."""
+    from levain.autonomic import schema3
+    from levain.autonomic.db import DB_NAME, STORE_FORMAT_V1, STORE_FORMAT_V2, default_store_dir, store_marker
+
+    db = (store_dir.expanduser() if store_dir is not None else default_store_dir()) / DB_NAME
+    name = "autonomic store"
+    where = f"{db}" + (" (this user's store ($LEVAIN_HOME/autonomic), not the install's)" if store_dir is None
+                       else "")
+    conn: sqlite3.Connection | None = None
+    try:
+        try:
+            if not stat.S_ISREG(db.stat().st_mode):
+                return []
+        except FileNotFoundError:
+            return []
+        conn = sqlite3.connect(db.absolute().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=2)
+        conn.execute("BEGIN")
+        marker = store_marker(conn)
+        if marker in (STORE_FORMAT_V1, STORE_FORMAT_V2):
+            return []
+        if marker is None and conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
+            return []
+        try:
+            schema3.refuse_unless_this_v3(conn)
+        except schema3.StoreFormatError as e:
+            return [CheckResult(name, False, f"{where}: {e}")]
+        rows = schema3.invariant(conn)
+        legacy = len(schema3.census(conn))
+        unprojected = conn.execute("SELECT COUNT(*) FROM gate_receipts WHERE projected = 0").fetchone()[0]
+    except Exception as e:  # noqa: BLE001 -- one store doctor cannot read is a FAIL row, never the end of doctor
+        return [CheckResult(name, False, f"{where} cannot be read ({type(e).__name__}: {e})",
+                            "Check the file's owner and permissions; a store this user can read that still fails "
+                            "to read may be corrupt.")]
+    finally:
+        if conn is not None:
+            conn.close()
+    if rows:
+        return [CheckResult(f"{name} INVARIANT", False,
+                            f"{kind} {subject}: {_INVARIANT_MEANS.get(kind, kind)}, in {where}")
+                for kind, subject in rows]
+    return [CheckResult(name, True, f"{schema3.STORE_FORMAT_V3} at {where}: invariant holds; {legacy} legacy row(s); "
+                                    f"{unprojected} receipt(s) not yet in the receipt file")]
 
 
 def _check_cockpit_authority(install: Path) -> list[CheckResult]:
@@ -4902,6 +5133,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
     servers = mcp.get("mcpServers") if isinstance(mcp, dict) else None
     results.append(_check_band_server(
         ".mcp.json", servers.get("levain_band") if isinstance(servers, dict) else None, "claude_code"))
+    results.append(_check_band_hooks(install, "claude_code"))
     results.append(_check_dispatch_server(
         install, servers.get("levain_dispatch") if isinstance(servers, dict) else None))
 
@@ -4909,6 +5141,21 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
 
 
 BAND_ROW = "levain_band MCP registered"
+BAND_HOOKS_ROW = "NEEDS YOU band hooks"
+
+
+def _check_band_hooks(install: Path, agent: str) -> CheckResult:
+    """The band's hooks (Q17-ALL D5), per install: wired, stale or absent. Advisory (a WARN, never a FAIL): a missing
+    hook loses the display of the band, never an item (`levain band` still reads it)."""
+    from levain.band_view import band_hooks_state
+
+    state, lacking = band_hooks_state(install / "activation" / "hooks", agent)
+    if state == "wired":
+        return CheckResult(BAND_HOOKS_ROW, True, "wired: SessionStart + UserPromptSubmit + Stop verifier")
+    return CheckResult(BAND_HOOKS_ROW, True,
+                       f"{state}: {', '.join(lacking)} {'does' if len(lacking) == 1 else 'do'} not call the band "
+                       "(a seat here is not shown what waits on the operator; `levain band` still lists it)",
+                       "levain update", warn=True)
 
 
 def _check_band_server(where: str, server: object, agent: str, codex_home: Path | None = None) -> CheckResult:
@@ -5275,6 +5522,7 @@ def _check_codex(install: Path) -> list[CheckResult]:
     servers = config.get("mcp_servers")
     results.append(_check_band_server(
         "config.toml", servers.get("levain_band") if isinstance(servers, dict) else None, "codex", codex_home))
+    results.append(_check_band_hooks(install, "codex"))
 
     return results
 

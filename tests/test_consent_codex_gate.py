@@ -9,7 +9,15 @@ from datetime import datetime, timedelta, timezone
 from levain.consent import ConsentQueue, authority_source
 from levain.consent.adapters import codex as cx
 from levain.consent.ledger import Ledger
+import pytest
+
 from tests._h4 import h4_env, h4_home
+
+
+@pytest.fixture(autouse=True)
+def _no_band_notice(monkeypatch):
+    """These tests are about the latch: the band's fallback notice (an open item, no Codex band hooks) is not theirs."""
+    monkeypatch.setenv("LEVAIN_SEAT", "autonomous")
 
 
 def _event(session: str, tool_name: str, tool_input: dict, cwd: str) -> dict:

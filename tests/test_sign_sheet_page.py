@@ -815,11 +815,12 @@ def test_i1_an_open_sheet_holds_the_lease_so_a_card_tap_asks_for_no_challenge(tm
             {"eval": PARENT_X + ".click() || 1"},
             {"until": f"!{FRAME} && 1", "ms": 5000},
             {"eval": f"{CARD_OPTION_A}.click() || 1"},
-            {"until": f"/asking|confirm|challenge/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 10000, "may_timeout": True},
+            # a settle only: the virtual authenticator answers at once, so the note passes through "asking" and on to its
+            # final text between polls on a slow runner (run 40685220828); the proof the tap ran is the challenge POST below
+            {"until": f"/asking|confirm|challenge/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 5000, "may_timeout": True},
         ])
     v = out["values"]
     assert "already being asked for" in v[-5], v                   # while the sheet is up the tap does nothing
-    assert not isinstance(v[-1], dict), v                         # and after it closed the lease is back: the tap runs
     challenges = [p for p in out["posts"] if p.split(" ", 1)[0].endswith("/challenge")]
     assert len(challenges) == 1, out["posts"]
 
@@ -976,3 +977,47 @@ def test_j4_the_apps_own_modal_opened_while_the_sheet_is_up_is_not_made_inert(tm
                      "return new Promise((r) => setTimeout(() => r(d.inert), 100)); })()"},
         ])
     assert out["values"][-1] is False, out["values"]
+
+
+@needs_browser
+def test_the_real_sheet_reads_the_shape_deep_link_and_the_old_ports_redirect_emit(tmp_path: Path, monkeypatch) -> None:
+    """ONESURFACE OS-4 end to end: the link ``deep_link`` builds, and an old phone link sent through the real redirect
+    page (``phone_redirect.js``), each land on this cockpit's sheet with the pick drawn and nothing asked on load."""
+    import threading
+
+    from levain.consent.sign import deep_link
+    from levain.phone_server import make_redirect_server
+
+    rig = _Rig(tmp_path, monkeypatch)
+    sha = _sha16(rig)
+    link = deep_link(rig.origin, QRID, choice="b", version=sha)
+    assert link == f"{rig.origin}/sign/{QRID}#v={sha}&choice=b"
+    redirect = make_redirect_server("localhost", rig.origin, port=0)
+    t = threading.Thread(target=redirect.serve_forever, daemon=True)
+    t.start()
+    old = (f"http://localhost:{redirect.server_address[1]}/#phone_token=OLDTOKEN{'x' * 32}&sign={QRID}&v={sha}"
+           "&choice=b")
+    ready = f"location.pathname === '/sign/{QRID}' && {STATE} && {STATE} !== 'reading' && {STATE}"
+    keep = f"window.localStorage.setItem('levain_write_token', {json.dumps(TOK)}); "
+    seen = ["location.origin", "location.hash", "document.getElementById('sheet-picked').textContent",
+            "document.getElementById('sheet-pick').textContent", "window.__gets"]
+    try:
+        with rig.serving():
+            out = _drive(tmp_path, f"{rig.origin}/nope", [
+                DESKTOP, rig.authenticator(),
+                {"eval": f"(() => {{ {keep}location.href = {json.dumps(link)}; return 1; }})()"},
+                {"until": ready, "ms": 30000}, {"eval": SPY}, *({"eval": e} for e in seen),
+                {"eval": f"(() => {{ location.href = {json.dumps(old)}; return 1; }})()"},
+                {"until": f"location.origin === {json.dumps(rig.origin)} && {ready}", "ms": 30000},
+                {"eval": SPY}, *({"eval": e} for e in seen),
+            ])
+    finally:
+        redirect.shutdown()
+        redirect.server_close()
+        t.join(timeout=5)
+    v = out["values"]
+    for got in (v[3:8], v[11:16]):                   # the built link, then the redirected old one
+        assert got[0] == rig.origin and got[1] == "", v     # on the cockpit, the bar scrubbed
+        assert got[2] == "Sign (b)" and got[3].startswith("Your pick: (b)"), v
+        assert got[4] == 0, v                               # nothing asked of the passkey on load
+    assert not any("phone_token" in p or "OLDTOKEN" in p for p in out["posts"]), out["posts"]

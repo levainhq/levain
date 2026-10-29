@@ -50,6 +50,7 @@ class Service:
     after: tuple[str, ...]                 # §1.3 "Starts after" (names); () = boot
     restart: Literal["always", "on-failure", "one-shot"]
     hosts: tuple[HostOS, ...] = ("darwin", "linux")
+    logs: bool = False                     # macOS: stdout and stderr kept in launchd_log_path, never thrown away
 
 
 #: CONTRACT §1.3, in start order.
@@ -59,7 +60,7 @@ SERVICES: tuple[Service, ...] = (
     Service("qbroker", "QUEUE BROKER", "_levain_qbroker", ("control",), "always"),
     Service("dispatch", "dispatch", "_levain_dispatch", ("control", "keys"), "on-failure"),
     Service("reaper", "reaper", "root", ("control",), "always"),
-    Service("pf", "pf anchor", "root", (), "one-shot", hosts=("darwin",)),
+    Service("pf", "pf anchor", "root", (), "one-shot", hosts=("darwin",), logs=True),
 )
 
 
@@ -118,6 +119,13 @@ def launchd_path(svc: Service) -> Path:
     return LAUNCHD_DIR / f"{launchd_label(svc)}.plist"
 
 
+def launchd_log_path(svc: Service) -> Path:
+    """Where launchd appends a logging service's stdout and stderr (under root's ``/var/log``), so the pf one-shot's
+    "restored pf" / "not retried" line from a boot run can be read afterwards. The program keeps the file's size
+    bounded (:func:`levain.slot.services.pf.bound_log`)."""
+    return Path("/var/log") / f"{launchd_label(svc)}.log"
+
+
 def launchd_plist_text(svc: Service) -> str:
     job = {
         "Label": launchd_label(svc),
@@ -132,6 +140,8 @@ def launchd_plist_text(svc: Service) -> str:
         # (the supervisor-lock loser's) is not.
         "KeepAlive": True if svc.restart == "always" else {"SuccessfulExit": False},
     }
+    if svc.logs:
+        job["StandardOutPath"] = job["StandardErrorPath"] = str(launchd_log_path(svc))
     return plistlib.dumps(job, sort_keys=True).decode("utf-8")
 
 
@@ -346,7 +356,7 @@ def keys_start_steps(host: HostOS, *, restart: bool = False) -> list[Step]:
 
 
 __all__ = ["SERVICES", "Service", "argv", "built_services", "by_name", "install_steps", "keys_start_steps", "launchd_label",
-           "launchd_plist_text", "program_relpath", "program_source", "services_for", "start_order",
+           "launchd_log_path", "launchd_plist_text", "program_relpath", "program_source", "services_for", "start_order",
            "systemd_name", "systemd_unit_text"]
 
 

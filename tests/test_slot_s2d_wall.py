@@ -694,9 +694,46 @@ def test_macos_egress_ready_reads_the_sub_anchor():
 
     def run(argv, **kw):
         seen.append(argv)
+        if argv[:3] == ["/sbin/pfctl", "-s", "info"]:
+            return R(INFO_ENABLED)
         return R(LIVE_1C if argv[0] == "/sbin/pfctl" else LO0)
     wall.macos_egress_ready(E0, IDS["darwin"], run=run)
-    assert seen == [["/sbin/pfctl", "-a", "com.apple/levain", "-sr"], ["/sbin/ifconfig", "lo0"]]
+    assert seen == [["/sbin/pfctl", "-s", "info"], ["/sbin/pfctl", "-a", "com.apple/levain", "-sr"],
+                    ["/sbin/ifconfig", "lo0"]]
+
+
+#: ``pfctl -s info``'s status line, measured after a reboot in r3c10-vm 10-26 (levain project_memory
+#: 1026-8/pfboot raw/r2_after_reboot.txt).
+INFO_ENABLED = "Status: Enabled for 0 days 00:00:10           Debug: Urgent\n\nState Table   Total  Rate\n"
+#: The status before the boot one-shot existed (same dir, raw/m1.txt: ``Status: Disabled``).
+INFO_DISABLED = INFO_ENABLED.replace("Enabled", "Disabled")
+
+
+def test_check_pf_enabled_both_signs():
+    wall.check_pf_enabled(INFO_ENABLED)
+    for text in (INFO_DISABLED, "", "Status:Enabled\n", "Debug: Urgent Status: Enabled\n"):
+        with pytest.raises(Refused) as e:
+            wall.check_pf_enabled(text)
+        assert e.value.name == "pf-disabled"
+
+
+def test_macos_egress_ready_refuses_while_pf_is_disabled():
+    """L3 r1 codex HIGH (lane pfboot): the anchor holds every rule and lo0 the alias, but pf is off, so nothing is
+    enforced and the start is refused."""
+    class R:
+        def __init__(self, out):
+            self.returncode, self.stdout, self.stderr = 0, out, ""
+
+    def run(info):
+        def r(argv, **kw):
+            if argv[:3] == ["/sbin/pfctl", "-s", "info"]:
+                return R(info)
+            return R(LIVE_1C if argv[0] == "/sbin/pfctl" else LO0)
+        return r
+    wall.macos_egress_ready(E0, IDS["darwin"], run=run(INFO_ENABLED))
+    with pytest.raises(Refused) as e:
+        wall.macos_egress_ready(E0, IDS["darwin"], run=run(INFO_DISABLED))
+    assert e.value.name == "pf-disabled"
 
 
 @pytest.mark.parametrize("rule", ["pass out quick proto tcp from 10.0.0.1 to any", "nat on en0 from any to any",

@@ -18,6 +18,7 @@ import datetime
 import glob
 import json
 import os
+import pathlib
 import re
 import shlex
 import statistics
@@ -319,7 +320,8 @@ def classify_tool(name, inp, cwd, silent):
     if name == 'Bash':
         return classify_bash(str(inp.get('command', '')), cwd if isinstance(cwd, str) and cwd else None)
     if name in FILE_EDIT:
-        if _targets_agent_config()(name, inp, cwd if isinstance(cwd, str) else '', home=None):
+        if _targets_agent_config()(name, inp, cwd if isinstance(cwd, str) else '',
+                                    home=pathlib.Path.home(), environ=os.environ):
             return 'agent-config'
         return 'edit-outside-cwd' if _outside(inp, cwd) else 'grantable'
     if name in GRANTABLE:

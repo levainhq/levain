@@ -103,7 +103,10 @@ def test_doctor_keys_row_keeps_the_last_good_read_and_names_the_latest_failure(t
     assert "has not read this key's limit yet" in not_yet["invoice ceiling (or1)"].detail
     assert "$" not in not_yet["invoice ceiling (or1)"].detail       # never a number keys did not read
     assert cut["invoice ceiling (or1)"].detail.endswith("keys' answer had no room for it")
-    assert "held by keys" in silent["invoice ceiling (or1)"].detail
+    d = silent["invoice ceiling (or1)"]
+    assert d.warn and "keys answered" in d.detail and "or1" in d.detail      # keys answered: never "gave none"
+    for row in (d, cut["invoice ceiling (or1)"]):
+        assert "gave none" not in row.detail and "not answering" not in row.detail and "no session" not in row.detail
 
 
 def test_doctor_root_read_and_keys_report_give_one_verdict(tmp_path):

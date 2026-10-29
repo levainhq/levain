@@ -1520,6 +1520,10 @@ def main(argv: list[str] | None = None) -> int:
 
     _register_session(subparsers)
 
+    from levain.upgrade import register as _register_upgrade
+
+    _register_upgrade(subparsers)
+
     args = parser.parse_args(argv)
     from levain.launch import api_key_lifted
 
@@ -1659,13 +1663,23 @@ def _add_consent_canary_parser(consent_sub: argparse._SubParsersAction) -> None:
     canary_p.add_argument("--agent", required=True, choices=("claude_code", "codex"))
     canary_p.add_argument("--workspace", type=Path, default=None,
                           help="Scratch workspace: a new or empty directory (default: a new temporary one).")
+    canary_p.add_argument("--sandbox", action="store_true",
+                          help=("Instead, check the confinement: one model turn runs a fixed probe through "
+                                "`levain session`, which tries a fixed set of escapes; exit 1 on any escape or an "
+                                "unclear run."))
+    canary_p.add_argument("--cockpit-url", default=None, metavar="URL",
+                          help=("With --sandbox: the cockpit whose port the probe aims at (default: the address "
+                                "`levain cockpit sign --url` defaults to); loopback only."))
     canary_p.set_defaults(func=_cmd_consent_canary)
 
 
 def _cmd_consent_canary(args: argparse.Namespace) -> int:
     from levain.consent.canary import cli_canary
 
-    return cli_canary(args.agent, args.workspace)
+    if args.cockpit_url is not None and not args.sandbox:
+        print("levain consent canary: --cockpit-url only applies with --sandbox", file=sys.stderr)
+        return 2
+    return cli_canary(args.agent, args.workspace, sandbox=args.sandbox, cockpit_url=args.cockpit_url)
 
 
 def _add_consent_ledger_parser(consent_sub: argparse._SubParsersAction) -> None:
@@ -2639,6 +2653,12 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
     cs_phone.add_argument("--token-file", dest="token_file", type=Path, default=None,
                           help="Keep the phone token in FILE (mode 0600): read it from there when FILE exists, else "
                                "make one and write it, so a restart keeps the links the phone already holds.")
+    cs_phone.add_argument("--redirect-to", dest="redirect_to", default=None, metavar="ORIGIN",
+                          help="Serve ONLY a redirect: every link the phone already holds for this port opens on "
+                               "the cockpit at ORIGIN (https://<name>:<port>), a sign link on that request's sheet "
+                               "(/sign/<id>), its token dropped and never forwarded. Nothing else is served, no "
+                               "token is made, and --link-file then holds {page: ORIGIN/} only. Takes no "
+                               "--queue-dir, --sign-namespace or --token-file.")
     cs_phone.set_defaults(func=_cmd_consent_phone)
 
     from levain.consent.sign_setting import add_parser as add_signed_answers_parser
@@ -2668,10 +2688,13 @@ def _add_limits_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _add_band_parsers(subparsers: argparse._SubParsersAction) -> None:
-    """``levain ask`` and ``levain question``: the question band (``levain.consent.band``)."""
+    """``levain ask`` and ``levain question``: the question band (``levain.consent.band``); ``levain band``: the
+    NEEDS YOU band's view (``levain.band_view``)."""
+    from levain.band_view import add_parser as add_band_view_parser
     from levain.consent.band import add_parsers
 
     add_parsers(subparsers)
+    add_band_view_parser(subparsers)
 
 
 def _add_dispatch_parsers(subparsers: argparse._SubParsersAction) -> None:
@@ -2705,9 +2728,19 @@ def _sign_namespace(text: str) -> str:
 
 
 def _cmd_consent_phone(args: argparse.Namespace) -> int:
-    from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_server
+    from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_redirect, run_phone_server
 
     from levain.consent.queue import default_queue_dir
+
+    if args.redirect_to is not None:
+        full = [flag for flag, given in (("--queue-dir", args.queue_dir), ("--sign-namespace", args.sign_namespaces),
+                                         ("--token-file", args.token_file)) if given]
+        if full:
+            print(f"--redirect-to serves only the redirect: drop {', '.join(full)}", file=sys.stderr)
+            return 2
+        return run_phone_redirect(args.redirect_to, name=args.name, tailscale=args.tailscale,
+                                  port=DEFAULT_PHONE_PORT if args.port is None else args.port,
+                                  link_file=args.link_file.expanduser() if args.link_file is not None else None)
 
     # the phone port may start before any agent has filed a request: a queue with no database yet lists nothing
     qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
@@ -3399,10 +3432,12 @@ _POLICY_LOWEST = ("ON_LOOP", "COOLING_OFF")
 
 
 def _add_binding_parser(subparsers: argparse._SubParsersAction, common: object) -> None:
-    """``levain binding policy create|renew|revoke|list`` and ``levain binding graduate``; ``common`` adds the cockpit
-    commands' ``--path`` / ``--data-root``."""
+    """``levain binding policy create|renew|revoke|list``, ``levain binding graduate`` and ``levain binding
+    pause|resume|abandon``; ``common`` adds the cockpit commands' ``--path`` / ``--data-root`` (pause, resume and
+    abandon read no cockpit, so they take only ``--store-dir``)."""
     b_p = subparsers.add_parser(
-        "binding", help="Graduation policies: what may run below CONFIRM without asking, signed in the authority log.",
+        "binding", help="Graduation policies (what may run below CONFIRM without asking, signed in the authority log); "
+                        "pause, resume or abandon a binding.",
         description=(
             "A standing binding fires below CONFIRM (cooling-off or on-loop) only while a graduation policy covers "
             "each action it runs: a link in the cockpit's signed authority log, naming the actions at the risk "
@@ -3440,6 +3475,11 @@ def _add_binding_parser(subparsers: argparse._SubParsersAction, common: object) 
                         help="The autonomic store the policy is for (default: $LEVAIN_HOME/autonomic); its id is "
                              "signed into the policy, and it covers in no other store.")
     create.add_argument("--id", dest="grant_id", default=None, help="The policy's id (default: gp-<random>).")
+    create.add_argument("--guard", dest="guard_file", type=Path, required=True, metavar="FILE",
+                        help="A JSON file: the guard signed into the policy, a list of entries, each "
+                             '{"rationale": why this might be wrong, "kill_predicate": the stop-if-X, '
+                             '"kill_drill": an event the kill stops}. Every entry needs all three, and the drill must '
+                             "trip its kill; it is printed back before anything is signed.")
     create.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
                         help="An enrolled laptop-presence key, listed in root's allowed-signers file.")
     common(create)
@@ -3482,6 +3522,27 @@ def _add_binding_parser(subparsers: argparse._SubParsersAction, common: object) 
                       help="The autonomic store to check (default: $LEVAIN_HOME/autonomic), as `policy create` takes it.")
     common(grad)
     grad.set_defaults(func=_cmd_binding_graduate)
+
+    as_is = "The store is opened as it is: nothing in it is upgraded, so this works on a store with runs in flight."
+    for verb, status_help, description in (
+        ("pause", "Pause a binding: it stops firing, and runs it already started stop before their next action.",
+         "Set the binding PAUSED in the autonomic store. Runs it already started stop before their next action. "
+         + as_is),
+        ("resume", "Resume a paused binding: it fires on its next event.",
+         "Set a PAUSED binding ACTIVE in the autonomic store, if it can fire (a confirm-class binding needs a kill "
+         "in its sealed guard). Runs admitted before the pause stay stopped. A revoked or expired binding is not "
+         "resumed: create a new one. " + as_is),
+        ("abandon", "Stop the runs a revoked or expired binding already started (a one-shot is revoked when its "
+                    "run is admitted); it does not fire again.",
+         "Runs the binding already started stop before their next action; its status is not changed. For a "
+         "binding that cannot be paused because it is revoked or expired; an active or paused binding is paused "
+         "instead. " + as_is),
+    ):
+        one = b_sub.add_parser(verb, help=status_help, description=description)
+        one.add_argument("binding_id", help="The binding's id.")
+        one.add_argument("--store-dir", dest="store_dir", type=Path, default=None,
+                         help="The autonomic store (default: $LEVAIN_HOME/autonomic).")
+        one.set_defaults(func=_cmd_binding_status, binding_status=verb)
 
 
 def _policy_actions(specs: list[str]) -> dict[str, dict[str, object]]:
@@ -3575,13 +3636,31 @@ def _signed_append(args: argparse.Namespace, op: dict, now: datetime, *, policy_
         raise KeyError_(str(exc)) from None
 
 
+def _policy_guard(path: Path) -> list:
+    """The guard in ``path`` (``--guard``), refused as the log would refuse it at sign."""
+    import json
+
+    from levain.autonomic.coverage import guard_problem
+
+    try:
+        guard = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise ValueError(f"--guard {path}: not a readable JSON file ({type(exc).__name__})") from None
+    why = guard_problem(guard)
+    if why is not None:
+        raise ValueError(f"--guard {path}: {why}")
+    return guard
+
+
 def _cmd_binding_policy_create(args: argparse.Namespace) -> int:
+    import json
     import secrets
 
     from levain.cockpit.consent import utc_stamp
 
     try:
         actions = _policy_actions(args.actions)
+        guard = _policy_guard(args.guard_file)
         life = _policy_days(args.days)
         store_id = _autonomic_store_id(args.store_dir)
         if args.min_clean < 1:
@@ -3591,15 +3670,26 @@ def _cmd_binding_policy_create(args: argparse.Namespace) -> int:
         grant = {"id": gid, "kind": "graduation", "actions": actions, "lowest_posture": args.lowest,
                  "expires_at": utc_stamp(now + life), "triggers": sorted(set(args.triggers)) if args.triggers else None,
                  "families": sorted(set(args.families)) if args.families else None, "store_id": store_id,
-                 "min_clean_fires": args.min_clean}
-        print(f"lets {', '.join(sorted(actions))} run at {args.lowest} without asking, until {grant['expires_at']}.")
+                 "min_clean_fires": args.min_clean, "guard": guard}
+        # the read-back the signer reads before the signature: every dynamic line terminal-safe (1026-21 RULINGS
+        # G1-4), so a control, a bidi override or a newline in the guard file cannot hide or forge a line of it
+        print(_term_safe(f"lets {', '.join(sorted(actions))} run at {args.lowest} without asking, "
+                         f"until {grant['expires_at']}."))
+        print("its guard (checked now, when it is signed; levain does not check it at fire yet):")
+        for i, entry in enumerate(guard):
+            print(_term_safe(f"  [{i}] why it might be wrong: {entry['rationale']}"))
+            print(_term_safe(f"      kill: {json.dumps(entry['kill_predicate'], sort_keys=True)}"))
+            print(_term_safe(f"      drill (an example event the kill must catch): "
+                             f"{json.dumps(entry['kill_drill'], sort_keys=True)}"))
+        print("where several policies cover one effect, the strictest rung's policy is the one that authorizes it; "
+              "its guard is the one that was checked when it was signed.")
         print(f"warning: {_POLICY_WARNING}.")
         if args.families or args.triggers:
             print(f"--family and --trigger are {_ADVISORY}: a writer of the binding registry chooses both.")
         print(f"min clean fires {args.min_clean} ({_ADVISORY}: the engine's walk, not a limit on a writer).")
         new = _signed_append(args, {"op": "create_grant", "grant": grant}, now)
     except (ValueError, *_cockpit_refusals()) as exc:
-        print(f"policy refused: {exc}", file=sys.stderr)
+        print(_term_safe(f"policy refused: {exc}"), file=sys.stderr)
         return 1
     print(f"signed: {gid} at seq {new.seq} for {store_id}, until {grant['expires_at']}")
     print("it covers nothing until its signer is in root's allowed-signers file (levain-authority).")
@@ -3740,6 +3830,40 @@ def _graduation_blockers(store_dir: Path | None = None) -> list[str]:
         if refusal is not None:
             blockers.append(f"no executor can run a binding effect ({refusal}), so no binding fires")
     return blockers
+
+
+def _cmd_binding_status(args: argparse.Namespace) -> int:
+    """``levain binding pause|resume|abandon <id>`` (R14-9, O-75-6, R15-1) on the store opened as it is: pause is
+    :meth:`BindingStore.pause`, resume :meth:`BindingStore.ratify`, abandon :meth:`BindingStore.abandon`. One line out:
+    exit 0 on stdout, exit 1 ``not <done>: <why>`` on stderr."""
+    import sqlite3
+
+    from levain.autonomic.binding import BindingStore
+    from levain.autonomic.db import StoreFormatError, default_store_dir
+
+    verb, bid = args.binding_status, args.binding_id
+    done = {"pause": "paused", "resume": "resumed", "abandon": "abandoned"}[verb]
+    store_dir = args.store_dir.expanduser() if args.store_dir is not None else default_store_dir()
+    try:
+        store = BindingStore(store_dir, upgrade=False)
+        if verb == "resume":
+            found = store.ratify(bid)
+        else:
+            found = (store.pause if verb == "pause" else store.abandon)(bid)
+    except (ValueError, StoreFormatError, sqlite3.Error, OSError) as exc:
+        print(f"not {done}: {exc}", file=sys.stderr)
+        return 1
+    if found is None:
+        print(f"not {done}: no binding {bid}", file=sys.stderr)
+        return 1
+    if verb == "pause":
+        print(f"paused {bid}: its admitted runs are fenced (fence {found}); `levain binding resume {bid}` makes it "
+              "fire again")
+    elif verb == "resume":
+        print(f"resumed {bid}: it fires on its next event (runs admitted before the pause stay fenced)")
+    else:
+        print(f"abandoned {bid}: its admitted runs are fenced (fence {found}); it does not fire again")
+    return 0
 
 
 def _cmd_binding_graduate(args: argparse.Namespace) -> int:

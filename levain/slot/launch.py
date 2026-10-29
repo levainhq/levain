@@ -17,6 +17,9 @@ from typing import IO, Any, Callable, Optional, Sequence
 from levain.slot import Refused
 
 VENDORS = ("claude", "codex")
+#: Vendors that have an identity call in `levain.slot.identity` (not imported here: that module pulls in the root
+#: helper). tests/test_slot_g3_launch.py asserts it equals `identity.IDENTITY_CALLS`' keys.
+IDENTITY_GATED = ("claude", "codex")
 AUTHS = ("brokered", "passthrough")      # §5.1 prepare's auth, minus `none` (the none class is dispatch's)
 MAX_SLOT = 99                            # §5 preamble: slot `^[0-9]{1,2}$`; the helper checks it is configured
 
@@ -43,7 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--slot", type=_slot, default=None, metavar="N", help="Ask for this slot (default: a free one).")
     p.add_argument("--auth", choices=AUTHS, default="brokered",
                    help="brokered: Levain's gateway holds the API key (default); passthrough: the slot's own "
-                        "vendor login (with --login only, for now).")
+                        "vendor login. With --login it signs the slot in; without it the session uses the slot's stored "
+                        "login after the identity check (Codex has no server-checked identity: not a check).")
     p.add_argument("--login", action="store_true",
                    help="A login session: sign the slot in to the vendor (needs --auth passthrough).")
     return p
@@ -57,10 +61,9 @@ def parse(argv: Sequence[str]) -> Any:
         # DECISION: a login session exists to store the slot's own vendor credential (§5.1 prepare: kind `login`
         # is the passthrough first login); a brokered slot never holds one.
         raise Refused("login-needs-passthrough", "--login signs the slot in; use it with --auth passthrough")
-    if args.auth == "passthrough" and not args.login:
-        # An interactive passthrough session needs `start`'s identity gate (§5.1 confirm-identity), not built
-        # yet: refused here, before a slot is taken, rather than by `start` after one was.
-        raise Refused("passthrough-needs-identity-gate", "--auth passthrough runs only with --login for now")
+    if args.auth == "passthrough" and not args.login and args.vendor not in IDENTITY_GATED:
+        # A vendor with no identity call cannot be started on its stored login: refused here, before a slot is taken.
+        raise Refused("passthrough-needs-identity-gate", f"{args.vendor} has no identity call")
     return Request(vendor=args.vendor, repo=args.repo, auth=args.auth,
                    kind="login" if args.login else "interactive", slot=args.slot)
 
@@ -105,4 +108,4 @@ def register(subparsers: Any) -> None:
     p.set_defaults(func=lambda a: main(a.words))
 
 
-__all__ = ["AUTHS", "VENDORS", "build_parser", "main", "parse", "register"]
+__all__ = ["AUTHS", "IDENTITY_GATED", "VENDORS", "build_parser", "main", "parse", "register"]

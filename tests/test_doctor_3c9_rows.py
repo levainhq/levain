@@ -138,7 +138,7 @@ def test_ledger_in_keys_own_directory_is_unreadable_not_failed(tmp_path):
         r = _rows(store)["spend ledger"]
     finally:
         os.chmod(store / "keys", 0o700)
-    assert r.ok and not r.warn and "your account cannot read" in r.detail
+    assert r.ok and not r.warn and "held by keys" in r.detail and "once a session has started" in r.detail
 
 
 # --- the keys service -------------------------------------------------------------------------------------------
@@ -245,7 +245,7 @@ def test_openrouter_credential_held_by_keys_is_named_not_read(tmp_path):
         r = _rows(store, fetch=_fetch_returning(200, {}, calls))["invoice ceiling (orkey)"]
     finally:
         os.chmod(store / "keys", 0o700)
-    assert r.ok and r.warn and "held by keys" in r.detail and "openrouter.ai/settings/keys" in (r.hint or "")
+    assert r.ok and r.warn and "keys holds orkey" in r.detail and "openrouter.ai/settings/keys" in (r.hint or "")
     assert calls == []
 
 

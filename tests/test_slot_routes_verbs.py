@@ -76,7 +76,8 @@ def _read_map(L):
     return canon.parse((L / "routes" / "base.json").read_bytes())
 
 
-EGRESS = {"route": "pypi", "type": "egress", "hosts": ["pypi.org"]}
+#: a hand-written egress route on no host the shipped routes name (WF-1b: an egress host on another route is refused)
+EGRESS = {"route": "crates", "type": "egress", "hosts": ["crates.io"]}
 
 
 # --- the grammar --------------------------------------------------------------------------------------------------------
@@ -111,9 +112,10 @@ def test_upgrade_of_the_empty_map_ends_with_the_vendor_routes(L):
     for fmt in layout.BASE_ROUTES_FORMATS:
         _write_map(L, {"format": fmt, "routes": []})
         ids, written = IH.merge_base_routes(L / "routes")
-        assert (ids, written) == (["anthropic"], True)
+        assert (ids, written) == (["anthropic", "claude-subscription", "codex-subscription", "egress-default"], True)
         m = _parsed(L)
-        assert set(m) == {"anthropic"} and m["anthropic"].type == "brokered"
+        assert set(m) == {"anthropic", "claude-subscription", "codex-subscription", "egress-default"} and m["anthropic"].type == "brokered"
+        assert m["claude-subscription"].type == "subscription_passthrough"
         assert set(m["anthropic"].prices) == {k for k in VENDOR if k.startswith("claude-")}
         for model, price in m["anthropic"].prices.items():
             assert price == P.parse_price(model, VENDOR[model]["price"])
@@ -121,8 +123,8 @@ def test_upgrade_of_the_empty_map_ends_with_the_vendor_routes(L):
 
 
 def test_an_absent_map_is_merged_as_the_empty_one(L):
-    assert IH.merge_base_routes(L / "routes") == (["anthropic"], True)
-    assert set(_parsed(L)) == {"anthropic"}
+    assert IH.merge_base_routes(L / "routes") == (["anthropic", "claude-subscription", "codex-subscription", "egress-default"], True)
+    assert set(_parsed(L)) == {"anthropic", "claude-subscription", "codex-subscription", "egress-default"}
 
 
 def test_the_merge_is_by_route_id_and_keeps_every_other_entry(L):
@@ -131,13 +133,13 @@ def test_the_merge_is_by_route_id_and_keeps_every_other_entry(L):
     IH.merge_base_routes(L / "routes")
     routes = _read_map(L)["routes"]
     assert routes[0] == EGRESS
-    assert routes[1] == VR.anthropic_route() and len(routes) == 2
+    assert routes[1:] == VR.shipped_routes() and len(routes) == 5
 
 
 def test_a_second_merge_writes_nothing(L):
     IH.merge_base_routes(L / "routes")
     before = os.stat(L / "routes" / "base.json").st_ino
-    assert IH.merge_base_routes(L / "routes") == (["anthropic"], False)
+    assert IH.merge_base_routes(L / "routes") == (["anthropic", "claude-subscription", "codex-subscription", "egress-default"], False)
     assert os.stat(L / "routes" / "base.json").st_ino == before
 
 
@@ -207,8 +209,11 @@ def test_routes_base_through_main_writes_under_the_store(L):
     rc, out, err = _main(["routes-base"], Seams(euid=lambda: 0, host=lambda: "darwin", lock=lock, routes_base=run,
                                                 gather=_no_gather))
     assert rc == 0, err
-    assert out == {"ok": True, "verb": "routes-base", "routes": ["anthropic"], "written": True}
-    assert lock.calls == ["lock", "unlock"] and set(_parsed(L)) == {"anthropic"}
+    assert out == {"ok": True, "verb": "routes-base", "routes": ["anthropic", "claude-subscription",
+                                                                 "codex-subscription", "egress-default"],
+                   "written": True}
+    assert lock.calls == ["lock", "unlock"] and set(_parsed(L)) == {"anthropic", "claude-subscription",
+                                                                    "codex-subscription", "egress-default"}
 
 
 def test_routes_base_refuses_a_caller_who_is_not_the_operator(L):
@@ -224,8 +229,8 @@ def test_setup_and_repair_carry_the_merge_after_the_empty_map(tmp_path):
     (tmp_path / "routes").mkdir()
     (step,) = IH.base_routes_merge_steps("darwin", store=tmp_path)
     assert step.allow_fail and step.call is not None
-    assert step.call() == (True, "merged the vendor routes anthropic")
-    assert step.call() == (True, "already holds the vendor routes anthropic")
+    assert step.call() == (True, "merged the shipped routes anthropic, claude-subscription, codex-subscription, egress-default")
+    assert step.call() == (True, "already holds the shipped routes anthropic, claude-subscription, codex-subscription, egress-default")
     (tmp_path / "routes" / "base.json").write_bytes(b"[]")
     ok, why = step.call()
     assert not ok and why.startswith("base-map-malformed")

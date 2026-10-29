@@ -312,3 +312,29 @@ def test_every_shell_name_the_hook_templates_know_is_a_shell_tool_to_consent():
                 found += 1
                 assert {n.lower() for n in names} <= CONSENT_SHELL_TOOLS, path
     assert found >= 2      # both PostToolUse templates (Claude Code's and Codex's)
+
+
+def test_a_patch_into_the_operators_user_site_is_agent_config_under_a_venv(monkeypatch, tmp_path):
+    """F7, through Codex's own entry: its patch headers go through the Claude Code check."""
+    from levain.consent.adapters import claude_code as cc
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
+    target = home / ".local" / "lib" / "python3.12" / "site-packages" / "x.pth"
+    patch = {"command": f"*** Begin Patch\n*** Add File: {target}\n+import os\n*** End Patch\n"}
+    assert cx.targets_agent_config("apply_patch", patch, str(tmp_path), home=home, codex_dir=tmp_path / "cx", environ=h4_env())
+
+
+def test_a_patch_into_an_absolute_pythonuserbase_site_is_agent_config(monkeypatch, tmp_path):
+    """U1, through Codex's own entry: <PYTHONUSERBASE>/lib/.../site-packages/x.pth is agent config."""
+    from levain.consent.adapters import claude_code as cc
+
+    base = tmp_path / "opt" / "python-user"
+    monkeypatch.setenv("PYTHONUSERBASE", str(base))
+    monkeypatch.setattr(cc.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(cc, "operator_home", lambda environ: tmp_path / "elsewhere")
+    target = base / "lib" / "python3.12" / "site-packages" / "x.pth"
+    patch = {"command": f"*** Begin Patch\n*** Add File: {target}\n+import os\n*** End Patch\n"}
+    assert cx.targets_agent_config("apply_patch", patch, str(tmp_path), home=tmp_path / "home",
+                                   codex_dir=tmp_path / "cx", environ=h4_env())

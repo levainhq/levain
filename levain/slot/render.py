@@ -163,8 +163,9 @@ class RenderFacts:
     ``route_types``: route id -> its §4.1 type, for at least every route the blob names. ``var_folders``: macOS
     only, the ``/var/folders`` subtree of each uid the profile confines (egress: the slot; verifier: child and
     driver). ``term``: ``TERM`` from the supervisor, or none. ``route_hosts``: route id -> its CONNECT hosts, read
-    beside ``route_types`` from the same base map; render uses only the hosts of the blob's ``egress`` routes (the
-    ``WebFetch(domain:)`` allows), and a route the map gives no hosts here renders no allow rule."""
+    beside ``route_types`` from the same base map (``runtime_helper.base_routes``); render uses only the hosts of the
+    blob's ``egress`` routes (the ``WebFetch(domain:)`` allows), and an egress route of the blob with no hosts here is
+    refused (:func:`egress_hosts`)."""
 
     host: HostOS
     session: str
@@ -325,18 +326,21 @@ def check_facts(blob: RenderBlob, facts: RenderFacts) -> None:
 def egress_hosts(blob: RenderBlob, facts: RenderFacts) -> tuple[str, ...]:
     """The CONNECT hosts of an egress-class session's ``egress`` routes, sorted, each through the policy parser's one
     host grammar (``policy.hosts``), so no host that is not a lowercase A-label name reaches a permission rule. A
-    none-class session has none (it renders no egress rule). A route with no ``route_hosts`` entry adds none (fail
-    closed: the fetch prompts and the front decides); a ``route_hosts`` that is not a mapping of host lists, or an
-    entry that does not parse, is refused ``bad-config``."""
+    none-class session has none (it renders no egress rule). An egress route of the blob with no ``route_hosts``
+    entry, or an empty one, is refused ``egress-route-no-hosts`` (WF-1b: the base map gives every egress route its
+    hosts, so a missing list is a defect, never a session whose on-list fetches all prompt); a ``route_hosts`` that is
+    not a mapping of host lists, or an entry that does not parse, is refused ``bad-config``."""
     if facts.slot.slot_class != "egress":
         return ()
     if not isinstance(facts.route_hosts, Mapping):
         raise Refused("bad-config", "route_hosts")
     out: set[str] = set()
     for r in blob.routes:
-        if facts.route_types.get(r) != "egress" or r not in facts.route_hosts:
+        if facts.route_types.get(r) != "egress":
             continue
-        raw = facts.route_hosts[r]
+        raw = facts.route_hosts.get(r)
+        if raw is None or (isinstance(raw, (tuple, list)) and not raw):
+            raise Refused("egress-route-no-hosts", r)
         if not isinstance(raw, (tuple, list)):
             raise Refused("bad-config", f"route_hosts {r}")
         try:
@@ -902,8 +906,10 @@ def refuse_readback(expected: Mapping[str, Any], observed: Any) -> None:
 
 def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     """``docs``: repo-relative file name (``.claude/settings.json``, ``.claude/settings.local.json``) -> its parsed
-    JSON. Refused by key: every ``sandbox`` key in host_guard's ``_LOOSENING_TRUE`` that is ``true`` and every one
-    in ``_LOOSENING_NONEMPTY`` that is non-empty (the keys whose merge across layers the flag layer cannot pin),
+    JSON. Refused by key: every ``sandbox`` key in host_guard's ``_LOOSENING_TRUE`` that is ``true`` or not a bool,
+    and every one in ``_LOOSENING_NONEMPTY`` that is non-empty or not a list of strings (the keys whose merge across
+    layers the flag layer cannot pin; a ``sandbox.network`` or ``sandbox.filesystem`` that is not an object is
+    ``repo-settings-malformed``),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
     its meaning to CC is unmeasured), and an ``env`` naming the queue's vars or a :data:`PROXY_ENV` name. A
     document that is not an object is refused ``repo-settings-malformed``.
@@ -936,12 +942,31 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
         if not isinstance(sb, Mapping):
             out.append(Refused("repo-settings-malformed", f"{path}: sandbox"))
             continue
+        bad_sub = sorted(s for s in ("network", "filesystem") if s in sb and not isinstance(sb[s], Mapping))
+        for sub in bad_sub:
+            out.append(Refused("repo-settings-malformed", f"{path}: sandbox.{sub}"))
+        if bad_sub:
+            continue
+        # Exact type first (RULINGS 1026-10 Q5, host_guard's managed check's twin): a falsy non-list passed the
+        # not-empty check, and a schema type error can drop CC's sandbox block silently. The type is membership:
+        # a _LOOSENING_TRUE key is a bool, a _LOOSENING_NONEMPTY key a list of strings.
         for keys in _LOOSENING_TRUE:
-            if _get(sb, keys) is True:
+            v = _get(sb, keys)
+            if v is _MISSING:
+                continue
+            if type(v) is not bool:
+                out.append(_refused("loosening", "sandbox." + ".".join(keys),
+                                    f"{path}: must be bool, got {type(v).__name__}"))
+            elif v:
                 out.append(_refused("loosening", "sandbox." + ".".join(keys), f"{path}: true"))
         for keys in _LOOSENING_NONEMPTY:
             v = _get(sb, keys)
-            if v is not _MISSING and v:
+            if v is _MISSING:
+                continue
+            if type(v) is not list or any(type(i) is not str for i in v):
+                out.append(_refused("loosening", "sandbox." + ".".join(keys),
+                                    f"{path}: must be a list of strings, got {type(v).__name__}"))
+            elif v:
                 out.append(_refused("loosening", "sandbox." + ".".join(keys), f"{path}: not empty"))
     return out
 

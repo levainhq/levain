@@ -19,6 +19,7 @@ from levain.slot import proc as P
 from levain.slot import records as R
 from levain.slot.proc import RUN, STOP, Proc
 from tests.test_slot_s2f3_start import _rendered, _world
+from tests.vendor_tree import vendor_installed, vendor_prefix  # noqa: F401 - autouse, the real vendor check
 
 SLOT = 5001
 

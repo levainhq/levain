@@ -2,12 +2,14 @@
 ``install``, §2.2 dirs), as data rows plus the Steps that create them.
 
 A cell that names only an owner means owner : that owner's own primary group (root : the host's
-gid-0 group). A directory is made, then chowned, then chmodded, so the mode (setgid included) is
-set last and no chown can clear it.
+gid-0 group). A directory is made, then chowned, then (macOS) its extended ACL cleared, then chmodded,
+so the mode (setgid included) is set last and no chown can clear it.
 """
 from __future__ import annotations
 
+import functools
 import os
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Literal, Mapping
@@ -36,6 +38,12 @@ def runtime_helper_path(host: HostOS) -> Path:
 
 def install_helper_path(host: HostOS) -> Path:
     return HELPER_DIR[host] / "install-helper"
+
+
+def repair_line(host: HostOS) -> str:
+    """The one command that re-applies setup's rows to an existing install (a bare ``repair``): the remedy a refusal
+    or a doctor row names for a row an older install lacks."""
+    return f"sudo {install_helper_path(host)} repair"
 
 
 def service_entry_path(host: HostOS) -> Path:
@@ -93,8 +101,10 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         _root(host, L / "trash", 0o700),
         _root(host, L / "staging", 0o711),
         _root(host, L / "export", 0o755),
-        Row(L / "export" / "operator", "_levain_export", "levain-export", 0o2750),
-        Row(L / "export" / "dispatch", "_levain_export", "levain-dispatch-export", 0o2750),
+        # CONTRACT §2.1: root : the class group, 0750. Root acts in these dirs (seal-in's stale delete and probe, the
+        # publish transaction), so they are root's alone; the importer writes only below wall.EXPORT_WRITABLE.
+        Row(L / "export" / "operator", "root", "levain-export", 0o750),
+        Row(L / "export" / "dispatch", "root", "levain-dispatch-export", 0o750),
         # §2.1 gives no row for L/queue/ itself; root 0755 so the members of its two children reach them.
         _root(host, L / "queue", 0o755),
         # Both setgid: on Linux a new file takes its creator's primary group, so without it a row (the broker's
@@ -113,6 +123,8 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         # new file takes its creator's primary group (_levain_control) otherwise, and _levain_dispatch could not read it.
         Row(L / "lineage", "_levain_control", "levain-lineage", 0o2750),
         Row(L / "keys", "_levain_keys", "_levain_keys", 0o700),
+        # S1 3b-8a T1: the fronts' tunnel logs, one dir per egress slot below it (``slot_store_rows``).
+        _root(host, L / "gw", 0o755),
         _root(host, L / "routes", 0o755),
         # S1 3c-4: CONTROL writes the route maps here, keys reads them. Setgid, so every file CONTROL creates takes
         # _levain_keys: on Linux a new file takes its creator's primary group (_levain_control) otherwise, and keys
@@ -122,6 +134,34 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
     ]
 
 
+#: Stands in for the operator's account name in :func:`store_dir_row`'s lookup: the one row it owns is not root's,
+#: which is all the trust check reads.
+_ANY_OPERATOR = "<operator>"
+
+
+def admits_root(st: os.stat_result) -> bool:
+    """The trust root's store handle demands of a directory it acts below (a root row, or a per-session / per-slot dir
+    the verb that makes it gives to root): root-owned, not group- or other-writable. Every root directory row's mode
+    has no group or other write bit (tests/test_slot_layout_trust.py), so this IS each root row's own shape."""
+    return st.st_uid == 0 and not st.st_mode & 0o022
+
+
+def store_dir_row(host: HostOS, parts: Iterable[str]) -> "Row | None":
+    """The :func:`base_store_rows` directory row of ``L/<parts>``, or None for a dir no base row makes (a session's or
+    a slot's, so a trusted open of one demands the root shape; the one :func:`slot_store_rows` row that is not root's,
+    an egress slot's ``L/gw/slot<n>/``, is never opened trusted: tests/test_slot_layout_trust.py)."""
+    return _store_dir_rows(host).get(tuple(parts))
+
+
+@functools.lru_cache(maxsize=None)
+def _store_dir_rows(host: HostOS) -> Mapping[tuple, Row]:
+    """:func:`base_store_rows`' directory rows by their parts below ``L``, built once per host (the helper looks one
+    up for every component of every trusted open)."""
+    L = STORE[host]
+    return types.MappingProxyType({r.path.relative_to(L).parts: r for r in base_store_rows(host, _ANY_OPERATOR)
+                                   if r.kind == "dir"})
+
+
 def policy_rows(host: HostOS) -> list[Row]:
     """What ``setup`` needs before it writes the operator record: the store root and policy dir."""
     L = STORE[host]
@@ -129,10 +169,15 @@ def policy_rows(host: HostOS) -> list[Row]:
 
 
 def slot_store_rows(host: HostOS, slot: SlotId) -> list[Row]:
-    """``L/slots/{e,v}<n>/``, its lock, and (egress class) its ``keep/`` dir (CONTRACT §2.1)."""
+    """``L/slots/{e,v}<n>/``, its lock, and (egress class) its ``keep/`` dir (CONTRACT §2.1) and its front's log dir
+    ``L/gw/slot<n>/`` (S1 3b-8a T1): the front account's, so it can rotate its log there, group root and setgid, so a
+    log the front makes takes root's group on Linux too (macOS gives a new file its dir's group either way), never the
+    slot's; no other access, so the slot can neither list nor read it."""
     rows = [_root(host, slot.slot_dir(STORE[host]), 0o755), _root(host, slot.lock_path(STORE[host]), 0o600, "file")]
     if slot.slot_class == "egress":
         rows.append(_root(host, slot.slot_dir(STORE[host]) / "keep", 0o700))
+        rows.append(Row(STORE[host] / "gw" / f"slot{slot.index}", f"_levain_gw{slot.index}", ROOT_GROUP[host],
+                        0o2750))
     return rows
 
 
@@ -193,10 +238,14 @@ def row_steps(host: HostOS, rows: Iterable[Row]) -> list[Step]:
         else:
             # Created only when absent: a lock file is never replaced under a process holding it.
             steps.append(Step(f"create {p}", write=(r.path, "", r.mode), skip_if=(t["test"], "-e", p)))
-        steps += [
-            Step(f"own {p} as {r.owner}:{r.group}", (t["chown"], f"{r.owner}:{r.group}", p)),
-            Step(f"set {p} to {r.mode:04o}", (t["chmod"], f"{r.mode:04o}", p)),
-        ]
+        steps.append(Step(f"own {p} as {r.owner}:{r.group}", (t["chown"], f"{r.owner}:{r.group}", p)))
+        if host == "darwin":
+            # A numeric chmod leaves an extended ACL in place, and the trust check reads only owner and mode bits, so
+            # a grant an earlier owner set (add_file, delete_child) would outlive this row. Cleared after the chown:
+            # until then the old owner can still add an entry, as an owner always can. Linux: no install code reads
+            # or writes POSIX ACLs, so a Linux row has no such step.
+            steps.append(Step(f"no extended ACL on {p}", (t["chmod"], "-N", p)))
+        steps.append(Step(f"set {p} to {r.mode:04o}", (t["chmod"], f"{r.mode:04o}", p)))
     return steps
 
 

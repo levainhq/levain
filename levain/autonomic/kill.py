@@ -43,8 +43,9 @@ Two evaluation contracts, deliberately different:
   - ``assert_kill_pure`` (COMPILE-time, STRICT): RAISES ``KillImpurityError`` on any unsupported op /
     malformed node / depth-exceed / non-canonical leaf — a bad kill is REFUSED at compile, never
     minted.
-  - ``_kleene_eval`` (RUN-time, FAIL-SAFE): NEVER raises — any anomaly (even one that slipped past the
-    compile gate) degrades to ``UNKNOWN`` → trip. At fire-time a fail-safe trip beats a crashed gate.
+  - ``kill_outcome`` (RUN-time, FAIL-SAFE): NEVER raises — any anomaly (even one that slipped past the
+    compile gate, or a raise inside the evaluator, caught by its outer ``except Exception``) degrades to
+    ``UNKNOWN`` → trip. At fire-time a fail-safe trip beats a crashed gate.
 
 Stdlib-only; corpus-agnostic; pure. Imports NOTHING from flow (the anti-cycle rule).
 """
@@ -167,7 +168,8 @@ def kill_purity_error(predicate: Any, *, _depth: int = 0) -> str | None:
     if isinstance(val, float) and not math.isfinite(val):
         return f"leaf op {op!r} 'value' must be finite (a non-finite threshold never matches)"
     if op in _NUMERIC_OPS and _as_number(val) is None:
-        return f"numeric op {op!r} requires a finite-numeric 'value', got {val!r}"
+        shown = "an integer past float range" if isinstance(val, int) and not isinstance(val, bool) else repr(val)
+        return f"numeric op {op!r} requires a finite-numeric 'value', got {shown}"
     return None
 
 
@@ -195,7 +197,10 @@ def kill_outcome(predicate: Any, event: Any) -> Kleene:
     then top-level) so a drill need not carry the full event envelope."""
     if not isinstance(event, dict):
         return Kleene.UNKNOWN
-    return _kleene_eval(predicate, event, 0)
+    try:
+        return _kleene_eval(predicate, event, 0)
+    except Exception:  # an anomaly no branch anticipated: UNKNOWN is the fail-safe direction (trips)
+        return Kleene.UNKNOWN
 
 
 def kill_trips(predicate: Any, event: Any) -> bool:
@@ -207,7 +212,8 @@ def kill_trips(predicate: Any, event: Any) -> bool:
 
 
 def _kleene_eval(node: Any, event: dict[str, Any], depth: int) -> Kleene:
-    """The fail-safe three-valued evaluator. Any structural anomaly → ``UNKNOWN`` (never raises)."""
+    """The fail-safe three-valued evaluator. Any structural anomaly → ``UNKNOWN``; a raise it did not anticipate
+    is caught by :func:`kill_outcome`, which holds the never-raises contract."""
     if depth > MAX_KILL_DEPTH or not isinstance(node, dict):
         return Kleene.UNKNOWN
     op = node.get("op")
@@ -314,11 +320,17 @@ def _dig(container: Any, path: str) -> Any:
 
 def _as_number(x: Any) -> float | None:
     """Coerce to a FINITE float, or None. Bools are NOT numbers (no True==1). A numeric string
-    coerces. Mirrors ``events._as_number`` (confident-case parity)."""
+    coerces. An integer past float range
+    (JSON carries one; ``float()`` of it raises OverflowError) is None: not comparable here, so a
+    numeric leaf over it is UNKNOWN, never a raise out of the never-raises evaluator."""
     if isinstance(x, bool):
         return None
     if isinstance(x, (int, float)):
-        return float(x) if math.isfinite(x) else None
+        try:
+            f = float(x)
+        except OverflowError:
+            return None
+        return f if math.isfinite(f) else None
     if isinstance(x, str):
         try:
             f = float(x)

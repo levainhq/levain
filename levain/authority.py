@@ -10,8 +10,8 @@ A policy link is classified by RECOMPUTE: the declared op is applied to the repl
 difference is classified on its own (:func:`classify`). A declared op that disagrees with the computed
 delta is refused, and so is a link that changes nothing.
 
-A link is written :data:`FORMAT` or, when it needs a rule an older replay does not have, :data:`FORMAT_V2`; each link
-has one form (:func:`_link_format`), and the replay refuses the other.
+A link is written :data:`FORMAT` or, when it needs a rule an older replay does not have, :data:`FORMAT_V2` or
+:data:`FORMAT_V3`; each link has one form (:func:`_link_format`), and the replay refuses the others.
 
 The anchor (``anchor/authority.anchor`` in the store's data root, its directory excluded from Time Machine
 so a restore of the data root cannot roll it back with the log) is written only after a commit, so it lags
@@ -56,13 +56,15 @@ __all__ = [
     "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_MCP_FIELD_KINDS",
     "CONSENT_MCP_GRANT_KIND", "CONSENT_MCP_READ_ONLY_TOOLS",
     "CONSENT_GRANTABLE_TOOLS", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
-    "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "GRADUATION_CREATE_RANK",
+    "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "FORMAT_V3",
+    "GRADUATION_CREATE_RANK",
     "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
     "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_data_root", "anchor_path",
     "check_anchor", "classify", "foreign_anchor",
+    "CONSENT_CONTAINED_SHELL_KIND", "contained_shell_grant",
     "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
@@ -77,10 +79,15 @@ __all__ = [
 
 FORMAT = "levain-authority/1"
 # The format of a link that needs a rule a levain-authority/1 replay does not have (14b DESIGN_REV3 §7): a passkey's
-# renew or create_grant, and a link that brings in a graduation opt-in. Every other link is written FORMAT. This replay
-# takes both and holds each link to the one form :func:`_link_format` gives it; an older replay stops at the first
-# FORMAT_V2 link (its format check), so it never reads one as anything else.
+# renew or create_grant, and a link that brings in a graduation opt-in. A link that brings in a guarded graduation
+# policy is FORMAT_V3, and every other link is FORMAT. This replay takes all three and holds each link to the one form
+# :func:`_link_format` gives it; an older replay stops at the first FORMAT_V2 link (its format check), so it never
+# reads one as anything else.
 FORMAT_V2 = "levain-authority/2"
+# The format of a link that brings in a graduation policy carrying a ``guard`` (autogrant DESIGN I7, 1026-20 RULINGS
+# R13-12), whoever signs it. A replay that knows only /1 and /2 stops at it (its format check) rather than read a
+# policy whose guard it would not see; the guard is fixed with the policy's other terms, so no later link alters it.
+FORMAT_V3 = "levain-authority/3"
 RESET_FORMAT = "levain-authority-reset/1"
 RESET_NAMESPACE = "levain-authority-reset"
 ANCHOR_NAME = "authority.anchor"
@@ -240,6 +247,17 @@ _CONSENT_GRANT_FIELDS = frozenset({"id", "kind", "agent", "tools", "workspace", 
 CONSENT_MCP_GRANT_KIND = "consent-mcp"
 _CONSENT_MCP_GRANT_FIELDS = _CONSENT_GRANT_FIELDS | {"mcp_fields"}
 CONSENT_AGENTS = ("claude_code", "codex")
+# A contained-shell grant (SH1, CH-D1 §3.4 R7-1) answers a chat launch's Bash ask, but only from a launch whose
+# containment CLASS is the one it names (``containment_digest``: 64 lower hex, the launch profile's digest of
+# ``levain.consent.contained.CONTAINMENT_FORMAT``) and whose directory is inside its workspace. It is NOT a consent
+# grant (:func:`consent_grant` is false for it, so the generic grant path never sees it): only
+# ``levain.consent.policy.contained_shell_refusal`` reads it. Its terms are closed: agent ``claude_code``, tools
+# exactly ``["Bash"]``, postures exactly ``["default"]``; any change to them, the digest or the agent is a new grant.
+CONSENT_CONTAINED_SHELL_KIND = "consent-contained-shell"
+_CONTAINED_SHELL_FIELDS = frozenset({"id", "kind", "agent", "tools", "workspace", "postures", "containment_digest",
+                                     "expires_at"})
+_CONTAINED_SHELL_TERMS = {"agent": "claude_code", "tools": ["Bash"], "postures": ["default"]}
+_CONTAINMENT_DIGEST = re.compile(r"[0-9a-f]{64}")
 # A setup record (CH-D2, design §3.8.5(o) item 4, "re-attach: the setup record"): the operator names ONCE, under the
 # log's rule for a loosen (a laptop-presence key), a host whose requests from a chat launch of ``entity`` may carry a
 # credential Levain holds. It names the credential's SOURCE (a keychain item name the service reads at attach time)
@@ -422,9 +440,12 @@ _RENEW_SKEW = timedelta(minutes=10)
 # else is a revoke and a new id. It lasts at most GRADUATION_GRANT_MAX past its link, and a renew at most that past
 # its own. Created at the laptop (GRADUATION_CREATE_RANK), or by a passkey the live opt-in names
 # (GRADUATION_OPT_IN_RANK); renewed by any rank-2 key, a passkey included; revoked by any enrolled key.
+# Its ``guard`` (autogrant DESIGN D68, D75, D83) is optional in the record, so a log signed before it replays; this
+# levain signs no policy without a complete one (:func:`_graduation_guard_check`), and renews none.
 GRADUATION_KIND = "graduation"
 _GRADUATION_FIELDS = frozenset({"id", "kind", "actions", "lowest_posture", "expires_at", "triggers", "families",
                                 "store_id", "min_clean_fires"})
+_GRADUATION_OPTIONAL = frozenset({"guard"})
 _GRADUATION_ID = re.compile(r"gp-[0-9a-f]{12}")
 # the rungs a policy may lower an effect to: never ABOVE_LOOP (levain.autonomic.posture.Posture names)
 _GRADUATION_POSTURES = ("COOLING_OFF", "ON_LOOP")
@@ -488,9 +509,14 @@ def _ranks() -> Mapping[str, int]:
     return _CLASS_RANK
 
 
+# The cockpit's tier order, held here because the replay (run by root) needs it and ``levain.cockpit.verbs`` imports
+# ``levain.writes``, which imports ``anneal_memory`` (a root host has none); tests/test_consent_contained.py holds it
+# equal to ``levain.cockpit.verbs.TIERS``.
+_TIERS: tuple[str, ...] = ("C1", "T2", "T3")
+
+
 def _tiers() -> tuple[str, ...]:
-    from levain.cockpit.verbs import TIERS
-    return TIERS
+    return _TIERS
 
 
 def _stamp(when: datetime) -> str:
@@ -831,6 +857,57 @@ def _consent_grant_body(grant: Mapping[str, Any], what: str, at: datetime | None
     return _thaw(grant)
 
 
+def _validate_contained_shell_grant(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A contained-shell grant's shape (:data:`CONSENT_CONTAINED_SHELL_KIND`): exactly its fields, its closed terms,
+    a workspace a consent grant could name, a 64-lower-hex ``containment_digest``, and an expiry at most 30 days
+    past its link's time. The home and real-path checks are append-time (:func:`_consent_home_check`)."""
+    if set(grant) != _CONTAINED_SHELL_FIELDS:
+        raise AuthorityError(f"{what} (a contained-shell grant) must carry exactly "
+                             f"{', '.join(sorted(_CONTAINED_SHELL_FIELDS))}")
+    if grant["kind"] != CONSENT_CONTAINED_SHELL_KIND:
+        raise AuthorityError(f"{what}.kind must be {CONSENT_CONTAINED_SHELL_KIND!r}")
+    if not isinstance(grant["id"], str) or not grant["id"]:
+        raise AuthorityError(f"{what}.id must be a non-empty string")
+    for name, want in _CONTAINED_SHELL_TERMS.items():
+        got = grant[name]
+        if (list(got) if isinstance(got, (list, tuple)) else got) != want:
+            raise AuthorityError(f"{what}.{name} must be exactly {want!r}: a contained-shell grant answers only "
+                                 "Claude Code's Bash in the default posture")
+    if not isinstance(grant["workspace"], str) or not os.path.isabs(grant["workspace"]):
+        raise AuthorityError(f"{what}.workspace must be an absolute path")
+    problem = consent_workspace_problem(grant["workspace"])
+    if problem is not None:
+        raise AuthorityError(f"{what}: {problem}")
+    if not isinstance(grant["containment_digest"], str) or not _CONTAINMENT_DIGEST.fullmatch(
+            grant["containment_digest"]):
+        raise AuthorityError(f"{what}.containment_digest must be 64 lower-case hex characters")
+    expires = _parse_stamp(grant["expires_at"], f"{what}.expires_at")
+    if at is not None and expires - at > _CONSENT_GRANT_MAX:
+        raise AuthorityError(f"{what} may last at most 30 days past its link's time")
+    return _thaw(grant)
+
+
+def _contained_shell_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime,
+                                  n_exp: datetime) -> str:
+    """A contained-shell grant's change: ``renew`` when only the expiry moved later; ``tight`` when everything but
+    the workspace and expiry is the same, the workspace the same or under the old one, and the expiry no later;
+    anything else ``loose`` (another containment class or kind is another grant, never narrower)."""
+    keep = lambda g: _canonical(_thaw({k: v for k, v in g.items() if k not in ("workspace", "expires_at")}))  # noqa: E731
+    if keep(o) != keep(n):
+        return "loose"
+    if n["workspace"] == o["workspace"] and n_exp > o_exp:
+        return "renew"
+    narrower = isinstance(n["workspace"], str) and isinstance(o["workspace"], str) \
+        and _path_within(n["workspace"], o["workspace"])
+    return "tight" if narrower and n_exp <= o_exp else "loose"
+
+
+def contained_shell_grant(grant: Any) -> bool:
+    """Whether ``grant`` is a contained-shell grant this levain knows (:data:`CONSENT_CONTAINED_SHELL_KIND`)."""
+    return isinstance(grant, Mapping) and grant.get("kind") == CONSENT_CONTAINED_SHELL_KIND \
+        and _grant_kind(grant) is _GRANT_KINDS[CONSENT_CONTAINED_SHELL_KIND]
+
+
 def _validate_inert_grant(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
     """A grant of a kind this levain does not know (one a newer levain wrote), held INERT: only its envelope is read
     (``id`` a non-empty string, ``kind`` a :data:`_GRANT_KIND_NAME`, ``expires_at`` a stamp at most 30 days past its
@@ -877,9 +954,17 @@ def _graduation_names(items: Any, pattern: re.Pattern[str], where: str) -> None:
 
 def _validate_graduation(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
     """A graduation policy's shape (:data:`GRADUATION_KIND`). ``at``: the link's own time; the policy lasts at most
-    :data:`GRADUATION_GRANT_MAX` past it."""
-    if set(grant) != _GRADUATION_FIELDS:
-        raise AuthorityError(f"{what} (a graduation policy) must carry exactly {', '.join(sorted(_GRADUATION_FIELDS))}")
+    :data:`GRADUATION_GRANT_MAX` past it. A ``guard`` is held here only to be a list of objects: what its entries
+    must say is an append rule (:func:`_graduation_guard_check`), so a replay never refuses the log over a guard's
+    contents, and a replayed policy whose guard is not one the gate can evaluate covers nothing
+    (``levain.autonomic.coverage``)."""
+    if not _GRADUATION_FIELDS <= set(grant) or set(grant) - _GRADUATION_FIELDS - _GRADUATION_OPTIONAL:
+        raise AuthorityError(f"{what} (a graduation policy) must carry exactly {', '.join(sorted(_GRADUATION_FIELDS))}"
+                             f" (optionally {', '.join(sorted(_GRADUATION_OPTIONAL))})")
+    if "guard" in grant:
+        guard = grant["guard"]
+        if not isinstance(guard, (list, tuple)) or not all(isinstance(g, Mapping) for g in guard):
+            raise AuthorityError(f"{what}.guard must be a list of objects")
     if grant["kind"] != GRADUATION_KIND:
         raise AuthorityError(f"{what}.kind must be {GRADUATION_KIND!r}")
     if not isinstance(grant["id"], str) or not _GRADUATION_ID.fullmatch(grant["id"]):
@@ -1340,6 +1425,35 @@ def _graduation_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: dateti
     raise AuthorityError(_GRADUATION_FIXED)
 
 
+def _graduation_guard_problem(grant: Mapping[str, Any]) -> str | None:
+    # the gate's own rule for a signed guard, imported at use (only an append reaches it, never a replay)
+    from levain.autonomic.coverage import guard_problem
+    if "guard" not in grant:
+        return "it carries no guard (every graduation policy is signed with one: its kill and its drill)"
+    return guard_problem(_thaw(grant["guard"]))
+
+
+def _graduation_guard_check(grants: list[Any]) -> None:
+    """At append (DESIGN D83, 1026-20 RULINGS R13-11): a graduation policy a create or a loosen brings in carries a
+    complete guard, whatever rung it names (the rung an effect runs at is the binding's and the policy's together, so
+    only the fire knows whether it is confirm-class), every entry within the sign-time caps. Never at replay: a planted
+    policy without one replays and covers nothing."""
+    for grant in grants:
+        why = _graduation_guard_problem(grant)
+        if why is not None:
+            raise AuthorityError(f"graduation policy {str(grant.get('id'))[:80]!r} is refused at sign: {why}")
+
+
+def _graduation_renew_check(grants: list[Any], after: str) -> None:
+    """At append: a renew extends only a policy signed with a complete guard. One signed before the guard covers
+    nothing (``levain.autonomic.coverage.live``), and a renew cannot add one (its terms are fixed)."""
+    for grant in grants:
+        why = _graduation_guard_problem(grant)
+        if why is not None:
+            raise AuthorityError(f"graduation policy {str(grant.get('id'))[:80]!r} is not renewed: {why}; it covers "
+                                 "nothing, so revoke it and create another with a guard")
+
+
 def _graduation_phone_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime | None,
                              n_exp: datetime | None) -> str:
     """The opt-in has no change: every one is refused."""
@@ -1394,8 +1508,13 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
                                        renew_checks=(lambda g, after: _consent_mcp_tool_check(g, after),),
                                        consent=True, passkey_revocable=True),
     EGRESS_KEY_KIND: _GrantKind(validate=_validate_egress_key, change=_egress_key_change),
-    GRADUATION_KIND: _GrantKind(validate=_validate_graduation, change=_graduation_change, passkey_revocable=True,
-                                max_life=GRADUATION_GRANT_MAX, fixed=_GRADUATION_FIXED),
+    CONSENT_CONTAINED_SHELL_KIND: _GrantKind(validate=_validate_contained_shell_grant,
+                                             change=_contained_shell_grant_change,
+                                             append_checks=(lambda g: _consent_home_check(g),),
+                                             passkey_revocable=True),
+    GRADUATION_KIND: _GrantKind(validate=_validate_graduation, change=_graduation_change,
+                                append_checks=(_graduation_guard_check,), renew_checks=(_graduation_renew_check,),
+                                passkey_revocable=True, max_life=GRADUATION_GRANT_MAX, fixed=_GRADUATION_FIXED),
     GRADUATION_PHONE_KIND: _GrantKind(validate=_validate_graduation_phone, change=_graduation_phone_change,
                                       passkey_revocable=True, expires=False, fixed=_GRADUATION_PHONE_FIXED),
 })
@@ -1485,8 +1604,8 @@ def _parse_record(row: _Row) -> dict[str, Any]:
         raise ReplayError(seq, "the record is nested too deeply") from None
     if not canonical:
         raise ReplayError(seq, "the record is not a canonical JSON object")
-    if rec.get("format") not in (FORMAT, FORMAT_V2):
-        raise ReplayError(seq, f"the record's format is not {FORMAT} or {FORMAT_V2}")
+    if rec.get("format") not in (FORMAT, FORMAT_V2, FORMAT_V3):
+        raise ReplayError(seq, f"the record's format is not {FORMAT}, {FORMAT_V2} or {FORMAT_V3}")
     op = rec.get("op")
     if not isinstance(op, str) or op not in _OP_FIELDS:
         raise ReplayError(seq, f"unknown op {op!r}")
@@ -1602,14 +1721,15 @@ def _graduation_step_checks(old: StandingPolicy, new: StandingPolicy, keys: Mapp
 
 def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody: str) -> str:
     """The one format a link carrying ``rec`` (its op fields), signed by a key of ``signer_custody``, is written in
-    after ``policy``: :data:`FORMAT_V2` for a passkey's renew or create_grant, and for a link that brings in a
-    graduation opt-in (by create_grant or loosen); :data:`FORMAT` for every other. :func:`prepare` writes it and the
-    replay holds every link to it. Known edge, kept: a hand-made ``/1`` loosen that changes a graduation policy's
+    after ``policy``: :data:`FORMAT_V3` for a link that brings in a graduation policy carrying a ``guard`` (by
+    create_grant or loosen, whoever signs it); else :data:`FORMAT_V2` for a passkey's renew or create_grant, and for a
+    link that brings in a graduation opt-in; :data:`FORMAT` for every other. :func:`prepare` writes it and the replay
+    holds every link to it. A guard enters the log only by a ``/3`` link and never changes after it (a graduation
+    policy's terms are fixed), so a replay that stops at ``/3`` never reads a link that carries or alters a guard.
+    Known edge, kept: a hand-made ``/1`` loosen that changes a graduation policy's
     terms is refused here and replays on a levain from before ``/2`` as an inert change; that levain never fires on a
     graduation policy (a kind it does not know is inert there), so taking the link changes nothing it enforces."""
     op = rec.get("op")
-    if signer_custody == PASSKEY and op in ("renew", "create_grant"):
-        return FORMAT_V2
     if op == "create_grant":
         brought = [rec.get("grant")]
     elif op == "loosen":
@@ -1617,6 +1737,10 @@ def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody:
         brought = [g for gid, g in grants.items() if gid not in policy.grants] if isinstance(grants, Mapping) else []
     else:
         brought = []
+    if any(isinstance(g, Mapping) and g.get("kind") == GRADUATION_KIND and "guard" in g for g in brought):
+        return FORMAT_V3
+    if signer_custody == PASSKEY and op in ("renew", "create_grant"):
+        return FORMAT_V2
     if any(isinstance(g, Mapping) and g.get("kind") == GRADUATION_PHONE_KIND for g in brought):
         return FORMAT_V2
     return FORMAT

@@ -68,6 +68,9 @@ from levain.cockpit.authority import NO_LABELS, LabelKey, LabelSnapshot, Request
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 
 SCHEMA = "levain.cockpit/2"
+# the budget one panel read has before it is a fault (a provider's default ``timeout_s``, the shared-read memo's wait); other
+# waits on a read are expressed as a part of it, so they stay inside it when it moves
+PANEL_READ_DEADLINE_S = 10.0
 ENTITY_TIMEOUT_S = 10.0
 # The twelve kinds of the kernel's vocabulary (docs/cockpit-contract.md). A provider written against
 # levain.cockpit/1 declares an ALIAS; it is normalised to the new kind when the spec is built, so the
@@ -193,7 +196,7 @@ class ProviderSpec:
     # a source the substrate only creates on first use (the spore store): absent before it was ever seen is an EMPTY panel,
     # never a fault. Once seen, its disappearance is still a fault ("source disappeared").
     absent_is_empty: bool = False
-    timeout_s: float = 10.0
+    timeout_s: float = PANEL_READ_DEADLINE_S
     order: str | None = None
     # other server orders of the SAME rows, as ``(id, title, ordering)``: a triage-list's views. The
     # panel sends each view's row order (``view_rows``) and a renderer switches by it, never sorting.
@@ -288,7 +291,7 @@ class ReadContext:
     view of the substrate instead of building its own. ``fresh``: a write's read, so a source with
     its own answer cache must answer anew (``ExternalPanels.take``)."""
 
-    def __init__(self, now: datetime, *, memo_timeout_s: float = 10.0, fresh: bool = False,
+    def __init__(self, now: datetime, *, memo_timeout_s: float = PANEL_READ_DEADLINE_S, fresh: bool = False,
                  authority: RequestAuthority | None = None) -> None:
         self.now = now
         self.fresh = fresh
@@ -814,7 +817,7 @@ class Cockpit:
             face=src.face if src else "count", size=src.size if src else "medium",
             span=src.span if src else 1, tabs=src.tabs if src else "",
             refresh_every_s=src.refresh_every_s if src else None,
-            stale_after_s=src.stale_after_s if src else 900.0, timeout_s=src.timeout_s if src else 10.0,
+            stale_after_s=src.stale_after_s if src else 900.0, timeout_s=src.timeout_s if src else PANEL_READ_DEADLINE_S,
             order=DECISION_ORDER, facets=KERNEL_DECISION_FACETS | (src.facets if src else frozenset()),
             version_fields=("*",),
             # what a decisions row shows: who asks and for which tool (the title) and its state word and tier

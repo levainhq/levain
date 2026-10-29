@@ -51,7 +51,6 @@ given by absolute path or resolved on a root-owned PATH (:data:`SECURE_PATH`), n
 from __future__ import annotations
 
 import errno
-import hashlib
 import json
 import os
 import platform
@@ -66,13 +65,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
 
+from levain.hands_live import HANDS_UID_RANGE, HANDS_USER_RE, SECURE_PATH, WORKSPACE_ROOT, _secure, hands_user_name
 from levain.launch import child_env
 from levain.slot import SUDO
 
 HostOS = Literal["darwin", "linux"]
 
-#: Every name this module creates or deletes matches this; anything else is refused.
-HANDS_USER_RE = re.compile(r"^_levain_[a-z0-9]{1,12}_[0-9a-f]{6}$")
+#: Every name this module creates or deletes matches :data:`HANDS_USER_RE` (imported, one home with the
+#: automation executor, in ``levain.hands_live``); anything else is refused.
 
 #: An operator name that cannot change meaning inside a sudoers line or an ACL spec.
 OPERATOR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
@@ -86,22 +86,19 @@ HANDS_MARKER = "Levain hands user"
 #: deletion). Starts with :data:`HANDS_MARKER`, so it is still recognisably Levain's.
 RETIRED_MARKER = {"darwin": "Levain hands user (retired)", "linux": "Levain hands user,retired"}
 
-#: Where root resolves a bare program name: root-owned directories only.
-SECURE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
-
-#: Ids are taken from the top of these ranges downward, skipping any id in use or retired.
+#: Ids are taken from the top of these ranges downward, skipping any id in use or retired (the ranges'
+#: one home is :data:`HANDS_UID_RANGE`, which the automation executor checks a hands user's uid against).
 #: macOS: below 500 sorts with the system accounts; macOS 15 claimed 301-304 for new daemons and its
 #: updater deletes accounts that collide (https://github.com/NixOS/nix/issues/10892), so the low end
 #: is the dangerous end and is never reached.
-_DARWIN_IDS = range(499, 399, -1)
+_DARWIN_IDS = HANDS_UID_RANGE["darwin"]
 #: Linux: the top of the usual system-account range (SYS_UID_MAX is 999 on Debian and Fedora).
-_LINUX_IDS = range(999, 899, -1)
+_LINUX_IDS = HANDS_UID_RANGE["linux"]
 
 _SUDOERS_DIR = Path("/etc/sudoers.d")
 _SSHD_DROPIN_DIR = Path("/etc/ssh/sshd_config.d")
 _SSHD_CONFIG = Path("/etc/ssh/sshd_config")
 _LINUX_HANDS_HOME_ROOT = Path("/var/lib/levain-hands")
-WORKSPACE_ROOT = {"darwin": Path("/Users/Shared/levain"), "linux": Path("/var/lib/levain")}
 _RETIRED_IDS = {"darwin": Path("/var/db/levain/retired-hands-ids"),
                 "linux": Path("/var/lib/levain/retired-hands-ids")}
 _AT_SPOOL = {"darwin": Path("/usr/lib/cron/jobs"), "linux": Path("/var/spool/cron/atjobs")}
@@ -572,17 +569,6 @@ def egress_undo_steps(hands_user: str) -> list[Step]:
     ]
 
 
-def hands_user_name(entity_dir: Path | str) -> str:
-    """The hands user's name for this entity: a slug of the directory name plus a hash of the
-    resolved path, so two entities with the same directory name still get different users."""
-    resolved = Path(entity_dir).expanduser().resolve()
-    slug = re.sub(r"[^a-z0-9]", "", resolved.name.lower())[:12] or "entity"
-    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:6]
-    name = f"_levain_{slug}_{digest}"
-    assert HANDS_USER_RE.match(name), name
-    return name
-
-
 def hands_workspace(host: HostOS, hands_user: str) -> Path:
     return WORKSPACE_ROOT[host] / hands_user / "workspace"
 
@@ -628,7 +614,7 @@ def sudoers_text(operator: str, hands_user: str, net_group: str | None = None) -
 def _abs(name: str) -> str:
     """A program for root to run, resolved on :data:`SECURE_PATH` (the bare name if not found, so a
     plan built on a host without the tool still renders; running it then fails)."""
-    return shutil.which(name, path=SECURE_PATH) or name
+    return _secure(name)
 
 
 @dataclass(frozen=True)

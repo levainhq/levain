@@ -60,7 +60,8 @@ def policy_create_line(actions: dict[str, ActionRisk], lowest: str, days: int, f
             parts += ["--store-dir", shlex.quote(str(store))]
     if data_root is not None:
         parts += ["--data-root", shlex.quote(str(Path(data_root).expanduser().resolve()))]
-    return " ".join(parts + ["--signing-key <key>"])
+    # the guard is his to author (its kill and its drill); the line names where it goes, never a guard for him
+    return " ".join(parts + ["--guard <guard.json>", "--signing-key <key>"])
 
 
 def card_of(step: Any) -> dict[str, Any]:

@@ -18,6 +18,22 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from levain.webpush import ece, record, sender, vapid
 from levain.webpush.store import PushStore
 
+
+@pytest.fixture(autouse=True)
+def _owned_devices(monkeypatch):
+    """Every device a test here subscribes under is a row of the store's ``devices`` table, as every production
+    subscribe's is: a subscription is live only under a device its authority holds (``store.live_rows``)."""
+    real = PushStore.add_subscription
+
+    def add(self, endpoint, p256dh, auth, device_id, **kw):
+        if isinstance(device_id, str) and device_id and not device_id.startswith("paired-"):
+            with self.write() as c:
+                c.execute("INSERT OR IGNORE INTO devices (id, label, token_hash, created) VALUES (?,?,?,?)",
+                          (device_id, None, "test-" + device_id, "2026-10-27T00:00:00Z"))
+        return real(self, endpoint, p256dh, auth, device_id, **kw)
+
+    monkeypatch.setattr(PushStore, "add_subscription", add)
+
 FCM = "https://fcm.googleapis.com/fcm/send/abc"
 
 

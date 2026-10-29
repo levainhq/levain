@@ -22,7 +22,7 @@ def test_an_uncovered_step_gets_one_line_narrowed_to_its_family_at_the_target_ru
     card = card_of(step)
     fam = binding_family(b)
     assert card["command"] == (f"levain binding policy create --action deliver=LOW --lowest ON_LOOP --days {CARD_DAYS} "
-                               f"--family {fam} --store-dir {s.path} --signing-key <key>")
+                               f"--family {fam} --store-dir {s.path} --guard <guard.json> --signing-key <key>")
     assert card["from"] == "COOLING_OFF" and card["to"] == "ON_LOOP" and card["clean_count"] == 20
     assert card["actions"] == [{"link": 0, "action": "deliver", "risk": {"cls": 1, "reversible": True,
                                                                           "external": False, "financial": False},

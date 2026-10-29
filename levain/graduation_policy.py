@@ -16,6 +16,8 @@ checked against the authority anchor), root's allowed-signers file, and the id o
   code: the cached cover value, or ``cover:moved``. The anchor reads are what see a ``cockpit.db`` restored to the
   head a snapshot was built at after a later link advanced the anchor: the first sees a restore before it, the second
   one that lands between the first and the head read.
+- :meth:`AuthorityCoverage.peek_cover` is that same read, answering the policy whose cover value it is beside the
+  value (:class:`~levain.autonomic.coverage.EffectiveCover`); :meth:`~AuthorityCoverage.peek` is its value.
 
 A read that fails gives a fixed sentinel in its half of the token (:data:`UNREADABLE_DIGEST`, :data:`UNREADABLE_HEAD`),
 the same in a failed refresh and in a peek, so a peek after a failed refresh matches it and answers ``none``
@@ -26,7 +28,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -34,8 +36,8 @@ from urllib.parse import quote
 from levain import authority as _auth
 from levain.autonomic import confirm as _confirm
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
-from levain.autonomic.coverage import (COVER_MOVED, CoverageSnapshot, CoverageView, Effect, GraduationPolicy, Uncovered,
-                                       peek_snapshot, signers_digest)
+from levain.autonomic.coverage import (COVER_MOVED, CoverageSnapshot, CoverageView, Effect, EffectiveCover,
+                                       GraduationPolicy, Uncovered, peek_cover_snapshot, signers_digest)
 from levain.cockpit.firejournal import DB_NAME
 from levain.trust_anchor import trust_anchor_problem
 
@@ -57,6 +59,11 @@ _REFRESH_BUSY_TIMEOUT = 2.0
 UNREADABLE_DIGEST = "unreadable"
 UNREADABLE_HEAD: tuple[int, str] = (-1, "unreadable")
 
+_MOVED = EffectiveCover(COVER_MOVED, None, None)
+
+# the graduation grants _graduation_policy has warned have no grant_born entry (one warning per grant per process)
+_UNBORN_WARNED: set[str] = set()
+
 
 def _connect(db: Path, timeout: float) -> sqlite3.Connection:
     # read-only: the source never writes the cockpit journal (and never creates one)
@@ -67,19 +74,27 @@ def _connect(db: Path, timeout: float) -> sqlite3.Connection:
 class TermedGraduationPolicy(GraduationPolicy):
     """A replayed graduation policy with its signed ``min_clean_fires``: the clean fires the honest engine waits for
     before it graduates a binding under this policy (``levain.autonomic.graduation.graduate_due``). Advisory against
-    a writer of the levain home; the gate never reads it."""
+    a writer of the levain home; the gate never reads it.
 
-    min_clean_fires: int
+    The term has one source, the signed terms (1026-21 RULINGS G1-5, 1026-22 RULINGS G1): construction reads it from
+    them and takes no value from a caller; terms that carry none are refused (the authority log requires the term on
+    every graduation policy, so only a policy built outside it can lack one)."""
+
+    min_clean_fires: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if type(self.min_clean_fires) is not int or self.min_clean_fires < 0:
+        if "min_clean_fires" not in self._terms:
+            raise ValueError("the policy's terms carry no signed min_clean_fires")
+        signed = self._terms["min_clean_fires"]
+        if type(signed) is not int or signed < 0:
             raise ValueError("min_clean_fires is a non-negative integer")
+        object.__setattr__(self, "min_clean_fires", signed)
 
     @classmethod
-    def of(cls, policy: GraduationPolicy, *, min_clean_fires: int) -> "TermedGraduationPolicy":
-        return cls(**{f.name: getattr(policy, f.name) for f in fields(GraduationPolicy)},
-                   min_clean_fires=min_clean_fires)
+    def of(cls, policy: GraduationPolicy) -> "TermedGraduationPolicy":
+        """``policy`` with its signed ``min_clean_fires``, read from its terms."""
+        return cls(**{f.name: getattr(policy, f.name) for f in fields(GraduationPolicy) if f.init})
 
 
 def graduation_policies(state: _auth.AuthoritySnapshot) -> tuple[GraduationPolicy, ...]:
@@ -107,7 +122,12 @@ def _graduation_policy(state: _auth.AuthoritySnapshot, gid: str, grant: object) 
         return None
     incarnation = _auth.graduation_incarnation(state, gid)
     links = _auth.graduation_links(state, gid)
-    if incarnation is None or links is None:
+    born_seq = state.grant_born.get(gid)
+    if born_seq is None and gid not in _UNBORN_WARNED:
+        # a graduation grant the replay holds with no born link is a replay defect, not a revoke: say it, once
+        _UNBORN_WARNED.add(gid)
+        _log.warning("graduation policy %r covers nothing: the replay has no grant_born entry for it", gid)
+    if incarnation is None or links is None or born_seq is None:
         return None
     born_key, current_key = (state.keys.get(fp) for fp in links)
     # RULINGS_S1 item 2: a signer the log has revoked anchors nothing, whatever root's file lists
@@ -116,10 +136,10 @@ def _graduation_policy(state: _auth.AuthoritySnapshot, gid: str, grant: object) 
     born = born_key.public_key
     current = current_key.public_key if RENEW_NEEDS_ANCHOR else born
     record = _auth._thaw(grant)
-    # the log requires min_clean_fires on every graduation policy; the engine walks it
+    # the log requires min_clean_fires on every graduation policy; the engine walks it, read from the signed terms
     return TermedGraduationPolicy.of(
-        GraduationPolicy.from_record(record, incarnation=incarnation, born_signer=born, current_signer=current),
-        min_clean_fires=record.get("min_clean_fires"))
+        GraduationPolicy.from_record(record, incarnation=incarnation, born=born_seq, born_signer=born,
+                                     current_signer=current))
 
 
 class AuthorityCoverage:
@@ -280,22 +300,27 @@ class AuthorityCoverage:
         what it was built from and the anchor still admits its replay, else ``cover:moved``. For a covered snapshot
         the anchor is read before the head SELECT and again after it, and the two reads must agree: an anchor that
         advanced while the head was read (a link, then a restore of ``cockpit.db`` behind it) is ``cover:moved``.
-        A refused first read answers ``cover:moved`` without reading the head."""
+        A refused first read answers ``cover:moved`` without reading the head. The value :meth:`peek_cover` reads."""
+        return self.peek_cover(effect, now).value
+
+    def peek_cover(self, effect: Effect, now: datetime) -> EffectiveCover:
+        """:meth:`peek`'s read, answering the value with the rung and the policy that set it, all from the one cached
+        view this call read (the cache is read once, before any other read, and nothing here refreshes it)."""
         cached = self._cached
         try:
             if cached is None:
-                return COVER_MOVED
+                return _MOVED
             view, state = cached
             digest = self._digest()
             if state is None:
-                return peek_snapshot(view, (self._head(), digest, self._store_id), effect, now)
+                return peek_cover_snapshot(view, (self._head(), digest, self._store_id), effect, now)
             admits, anchor = self._anchor_admits(state)
             if not admits:
-                return COVER_MOVED
+                return _MOVED
             head = self._head()
             if not self._anchor_unchanged(anchor):
-                return COVER_MOVED
-            return peek_snapshot(view, (head, digest, self._store_id), effect, now)
+                return _MOVED
+            return peek_cover_snapshot(view, (head, digest, self._store_id), effect, now)
         except Exception as exc:  # noqa: BLE001 - forces a re-decide
             _log.warning("graduation coverage: peek failed (%s): %s", type(exc).__name__, exc)
-            return COVER_MOVED
+            return _MOVED

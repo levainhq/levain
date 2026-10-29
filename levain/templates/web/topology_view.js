@@ -954,6 +954,8 @@
     ".tv-glow .tv-neb stop.m { stop-opacity: calc(var(--_na) * .35); }",
     "@media (prefers-reduced-motion: reduce) { .tv-graph .tv-edge.live { stroke-dasharray: 5 4; stroke-linecap: round; opacity: 1; }",
     "  .tv-graph .tv-edge.live[data-seat]:not(.waiting) { stroke: var(--seat); stroke-opacity: .8; } }",
+    "html.calm .tv-graph .tv-edge.live { stroke-dasharray: 5 4; stroke-linecap: round; opacity: 1; }",
+    "html.calm .tv-graph .tv-edge.live[data-seat]:not(.waiting) { stroke: var(--seat); stroke-opacity: .8; }",
   ].join("\n");
   let graphSheet = null;
   function ensureGraphCss() {
@@ -1166,11 +1168,12 @@
     return c;
   }
   function startStreams(canvas, stage, edges, getScale, still) {
+    const calmOn = () => !!(root.document && root.document.documentElement && root.document.documentElement.classList && root.document.documentElement.classList.contains("calm"));   // the page's Calm control: the same as the OS asking
     const reduced = !!(root.matchMedia && root.matchMedia("(prefers-reduced-motion: reduce)").matches);
     const live = still ? [] : edges.filter((e) => e.rate > 0);        // a frame from the ledger draws no stream
     stage.dataset.streams = String(live.length);
     stage.dataset.particles = "0";
-    stage.dataset.motion = reduced || still ? "off" : "on";
+    stage.dataset.motion = reduced || still || calmOn() ? "off" : "on";
     if (reduced || !live.length || !canvas.getContext || typeof root.requestAnimationFrame !== "function") return null;
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
@@ -1223,6 +1226,7 @@
     const loop = (ts) => {
       if (stopped) return;
       if (!canvas.isConnected) { stopped = true; return; }
+      if (calmOn()) { park(); return; }
       const dt = Math.min(0.05, last ? (ts - last) / 1000 : 0.016);
       last = ts;
       ema = ema * 0.9 + dt * 1000 * 0.1;                                  // frame-time adaptive: long frames thin the stream
@@ -1233,11 +1237,22 @@
       if (++n % 20 === 0) { stage.dataset.particles = String(PART.length); stage.dataset.quality = quality.toFixed(2); }
       raf = root.requestAnimationFrame(loop);
     };
+    // Calm turned on mid-stream: the loop stops and the canvas clears; turned off again, the same loop resumes from a flowing stream
+    const park = () => { raf = 0; PART.length = 0; stage.dataset.motion = "off"; stage.dataset.particles = "0"; ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, canvas.width, canvas.height); };
+    const onCalm = () => {
+      if (stopped || calmOn() || raf) return;
+      stage.dataset.motion = "on"; last = 0;
+      for (let i = 0; i < 260; i++) step(0.03);
+      stage.dataset.particles = String(PART.length);
+      raf = root.requestAnimationFrame(loop);
+    };
+    if (typeof root.addEventListener === "function") root.addEventListener("levain-calm", onCalm);
     refresh();
+    if (calmOn()) return () => { stopped = true; if (typeof root.removeEventListener === "function") root.removeEventListener("levain-calm", onCalm); };   // drawn under Calm: no loop until the control turns it off
     for (let i = 0; i < 260; i++) step(0.03);                             // the stream is already flowing when the lens opens
     stage.dataset.particles = String(PART.length);
     raf = root.requestAnimationFrame(loop);
-    return () => { stopped = true; if (raf && root.cancelAnimationFrame) root.cancelAnimationFrame(raf); PART.length = 0; };
+    return () => { stopped = true; if (typeof root.removeEventListener === "function") root.removeEventListener("levain-calm", onCalm); if (raf && root.cancelAnimationFrame) root.cancelAnimationFrame(raf); PART.length = 0; };
   }
 
   let pinned = null;                                                      // the fallback pin (no agent page in the page): {id, x, y, dx, dy} in stage px

@@ -365,15 +365,19 @@ class CoordStore:
         self._woken: dict[str, str] = {}
 
     # --- store ---------------------------------------------------------------------------------------------------
-    def _statements(self, *, base: bool = False) -> tuple[str, ...]:
-        """The schema this opener makes. ``base`` is the plain coordinator's alone, without a subclass's added tables."""
+    def _statements(self, *, base: bool = False, lifecycle: bool = True) -> tuple[str, ...]:
+        """The schema this opener makes. ``base`` is the plain coordinator's alone, without a subclass's added tables.
+        ``lifecycle=False`` leaves out C13's additive tables (:meth:`_schema_current`'s reader gate)."""
         from levain.coordinator.lease import LEASE_SCHEMA
         from levain.coordinator.first_reader import FIRST_READER_SCHEMA
+        from levain.coordinator.ready import LIFECYCLE_SCHEMA
         from levain.coordinator.review import REVIEW_SCHEMA
         from levain.coordinator.teamdrafts import DRAFT_SCHEMA
 
-        # the lease is checked by every opener's coordinator writes, so its tables are every opener's
-        return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA)
+        # the lease is checked by every opener's coordinator writes, so its tables are every opener's; C13's lifecycle
+        # tables (ready items + their journal) are additive, IF NOT EXISTS, like every statement here
+        return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA,
+                *(LIFECYCLE_SCHEMA if lifecycle else ()))
 
     def _connect(self, *, create: bool = True) -> sqlite3.Connection:
         """A connection with this opener's schema ensured, once per store object (:meth:`_ensure`). ``create=False``
@@ -485,20 +489,23 @@ class CoordStore:
             raise JobStoreError(f"dispatch store directory {self.directory} is reachable by group or others "
                                 f"(mode {st.st_mode & 0o777:o}); it must be 0700")
 
-    def open_readonly(self) -> sqlite3.Connection:
+    def open_readonly(self, busy_s: float | None = None) -> sqlite3.Connection:
         """The ONE read-only connection to the coordinator's file, for every surface that only displays it (the review
         queue, "waiting on you", the morning card, the cockpit panels, the phone route). It runs the write path's
         directory rule (:meth:`_check_directory_readonly`) but never makes the directory, the file or a table: opened
         ``mode=ro`` through ``Path.as_uri()`` (a ``?`` or ``#`` in the path stays in the path) and ``query_only``, and it
         takes no write lock, so a reader never waits on the coordinator's writer. Raises :class:`StoreAbsent` when
-        there is nothing current to read; the caller closes the connection."""
+        there is nothing current to read; the caller closes the connection. ``busy_s`` (default
+        :data:`BUSY_WAIT_S`) is how long it waits on a lock: a caller on a deadline (the band's hook) passes what is
+        left of it, and a lock held past it raises SQLite's busy error."""
         self._check_directory_readonly()
         if not self.path.exists():
             raise StoreAbsent(f"no coordinator store at {self.path}")
-        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_WAIT_S,
+        wait = BUSY_WAIT_S if busy_s is None else max(0.0, min(float(busy_s), BUSY_WAIT_S))
+        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=wait,
                                isolation_level=None)
         try:
-            conn.execute(f"PRAGMA busy_timeout = {int(BUSY_WAIT_S * 1000)}")
+            conn.execute(f"PRAGMA busy_timeout = {int(wait * 1000)}")
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA query_only = ON")
             # a display reads only the base tables: a store a plain CoordStore made (team drafts) has no envelope tables
@@ -510,9 +517,12 @@ class CoordStore:
         return conn
 
     def _schema_current(self, conn: sqlite3.Connection, *, base: bool = False) -> bool:
+        """``base`` (every display's gate, and a non-creating write's): the lifecycle tables are ADDITIVE, so a store
+        made before C13 (none of them yet) is current for every reader; a writer's ensure-schema path makes them, and
+        the ready reader reads their absence as no items (:mod:`levain.coordinator.ready`)."""
         from levain.dispatch.jobs import _SCHEMA as JOB_SCHEMA, FORMAT
 
-        if not schema_present(conn, (*JOB_SCHEMA, *self._statements(base=base))) or "gseq" not in {
+        if not schema_present(conn, (*JOB_SCHEMA, *self._statements(base=base, lifecycle=not base))) or "gseq" not in {
                 r[1] for r in conn.execute("PRAGMA table_info(replies)")} \
                 or not {"replies_gseq", "replies_gseq_no_replace"} <= _names(conn):
             return False
