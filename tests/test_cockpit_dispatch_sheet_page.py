@@ -109,7 +109,8 @@ class _DispatchRig:
 @needs_ssh
 def test_a_dispatch_job_is_signed_in_the_sheet_and_the_store_verifies_it(tmp_path: Path, monkeypatch, repo) -> None:  # noqa: F811
     rig = _DispatchRig(tmp_path, monkeypatch, repo)
-    with rig.serving():
+    with rig.serving() as httpd:
+        shown = httpd.dispatch_sheet.row(rig.job.id)["sha256"]
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *rig.open_top(),
             {"eval": "document.getElementById('sheet-title').textContent"},
@@ -118,6 +119,9 @@ def test_a_dispatch_job_is_signed_in_the_sheet_and_the_store_verifies_it(tmp_pat
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"eval": "(document.getElementById('sheet-signing') || {}).textContent"},
         ])
+    # fix 1029-2: the challenge names the version the sheet showed, as a plain sign request's does
+    assert json.loads(out["posts"][0].split(" ", 1)[1]) == {"signer_fp": rig.pk.key.fingerprint,
+                                                            "request_sha256": shown}, out["posts"][0]
     v = out["values"]
     assert v[1] == "open" and v[2].startswith("dispatch"), v
     assert v[3] == "sign,cancel", v
@@ -287,13 +291,17 @@ class _AuthoriseRig(_DispatchRig):
 def test_an_authorise_whose_recommendation_moved_between_card_and_tap_signs_nothing(tmp_path: Path, monkeypatch) -> None:
     """complement MED 3: the sheet shows run 1 onto main; between the card and the tap the recommendation moves to run
     0. The authorise challenge the server builds is for run 0: the sheet compares it with the card BEFORE asking the
-    passkey, signs nothing, says so, and reads the job again (its new version, its new card)."""
+    passkey, signs nothing, says so, and reads the job again (its new version, its new card).
+
+    Since fix 1029-2 the server refuses this first (the version moved with the card); the server's compare is switched
+    off here so the sheet's own card compare, its second line, is the one tested."""
     rig = _AuthoriseRig(tmp_path, monkeypatch)
     lw = rig.lw
     main_before = lw.main()
     box = "document.getElementById('sheet-contract')"
     with rig.serving() as httpd:
         sheet = httpd.dispatch_sheet
+        sheet.shown = lambda *_a, **_k: None          # the server's version compare off: the sheet's card compare alone
         real_step = sheet.step
 
         def step(job_id: str, action: str, req: Any) -> Any:
@@ -341,6 +349,159 @@ def test_an_authorise_on_the_card_shown_lands_it(tmp_path: Path, monkeypatch) ->
     v = out["values"]
     assert str(v[3]).startswith("signed (adopted, adopted)"), v
     assert lw.main() == lw.jstore.run_record(rig.job.id, 1).staged_commit
+
+
+# --- fix 1029-2 (complement, L3 of 62b45ef6..680fee95): the version the sheet showed is what the cockpit challenges ------
+
+GETS = ("(() => { window.__gets = 0; const c = navigator.credentials, g = c.get.bind(c); "
+        "c.get = (o) => { window.__gets++; return g(o); }; return 1; })()")
+
+
+def _amend_at_first(httpd: Any, rig: Any, action: str) -> "dict[str, Any]":
+    """The job reads as amended (another contract digest) from the first ``action`` post on: the change lands between the
+    sheet's read and the tap's challenge. Returns the box whose ``"at"`` holds the version the sheet had shown."""
+    sheet = httpd.dispatch_sheet
+    phone, real_step, real_record = sheet.phone, sheet.step, sheet.phone.record
+    seen: "dict[str, Any]" = {}
+
+    def record(j: Any, now: str, signers: "list[str]", note: str) -> "dict[str, Any]":
+        rec = real_record(j, now, signers, note)
+        if seen.get("at") and j.id == rig.job.id:
+            rec["digest"] = "d" * 64
+        return rec
+
+    def step(job_id: str, act: str, req: Any) -> Any:
+        if act == action and "at" not in seen:
+            seen["at"] = sheet.row(job_id)["sha256"]
+        return real_step(job_id, act, req)
+
+    phone.record = record
+    sheet.step = step
+    return seen
+
+
+@needs_browser
+@needs_ssh
+def test_a_dispatch_job_amended_between_the_read_and_the_tap_signs_nothing_and_is_drawn_again(tmp_path: Path, monkeypatch, repo) -> None:  # noqa: F811
+    """Reproduced red before the fix: the sheet posted {signer_fp} alone, the cockpit built the challenge for the job as
+    amended, and the passkey signed it. Now the challenge names the version shown, the cockpit refuses it (409), no
+    passkey is asked, the sheet reads the job again, and a tap on the version now shown signs it."""
+    rig = _DispatchRig(tmp_path, monkeypatch, repo)
+    sign = "document.querySelector('#sheet-actions [data-choice=\"sign\"]')"
+    with rig.serving() as httpd:
+        seen = _amend_at_first(httpd, rig, "challenge")
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *rig.open_top(), {"eval": GETS},
+            {"eval": f"{sign}.click() || 1"},
+            {"until": f"/changed since it was shown/.test({NOTE}) && {STATE} === 'open' && {sign} && !{sign}.disabled "
+                      f"&& {NOTE}", "ms": 30000},
+            {"eval": "window.__gets"},
+            {"eval": f"{sign}.click() || 1"},
+            {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
+        ])
+    v = out["values"]
+    assert "nothing was signed" in v[4], v
+    assert v[5] == 0, v                                     # no passkey was asked for the amended job
+    posts = [p.split(" ", 1) for p in out["posts"]]
+    assert [p[0] for p in posts] == [f"/cockpit/dispatch/{rig.job.id}/challenge"] * 2 + [
+        f"/cockpit/dispatch/{rig.job.id}/answer"], posts
+    first, second = json.loads(posts[0][1]), json.loads(posts[1][1])
+    assert first["request_sha256"] == seen["at"] and second["request_sha256"] != seen["at"], (first, second)
+    assert rig.state() == "signed"
+
+
+@needs_browser
+@needs_ssh
+def test_a_redraw_that_cannot_be_read_says_so_and_keeps_the_controls_locked(tmp_path: Path, monkeypatch, repo) -> None:  # noqa: F811
+    """complement (same review): redraw() had no catch, so a read that failed left the sheet with no word of it. The read
+    after the refusal throws here: the refusal stays said, the failure is said beside it, and no control is live."""
+    rig = _DispatchRig(tmp_path, monkeypatch, repo)
+    sign = "document.querySelector('#sheet-actions [data-choice=\"sign\"]')"
+    with rig.serving() as httpd:
+        _amend_at_first(httpd, rig, "challenge")
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *rig.open_top(),
+            # every read of the job after the first throws at once (the page's fetch, not the server)
+            {"eval": "(() => { const f = window.fetch; window.fetch = (u, o) => { if (String(u).indexOf('/sheet.json') >= 0) "
+                     "throw new TypeError('no read'); return f(u, o); }; return 1; })()"},
+            {"eval": f"{sign}.click() || 1"},
+            {"until": f"/could not be drawn again/.test({NOTE}) && {NOTE}", "ms": 30000},
+            {"eval": "[...document.querySelectorAll('#sheet-actions button, #sheet-actions input')].every(c => c.disabled)"},
+        ])
+    v = out["values"]
+    assert "changed since it was shown" in v[4] and "nothing was signed" in v[4] and "reload this page" in v[4], v
+    assert v[5] is True, v
+    assert rig.state() == "filed"
+
+
+@needs_browser
+@needs_ssh
+def test_an_authorise_whose_card_moved_is_refused_by_the_cockpit_before_any_passkey(tmp_path: Path, monkeypatch) -> None:
+    """The server's compare on: the recommendation moves between the card and the tap, the authorise challenge names the
+    card's version, the cockpit refuses it, no passkey is asked, and the sheet draws the moved card."""
+    rig = _AuthoriseRig(tmp_path, monkeypatch)
+    lw = rig.lw
+    main_before = lw.main()
+    box = "document.getElementById('sheet-contract')"
+    with rig.serving() as httpd:
+        sheet = httpd.dispatch_sheet
+        real_step = sheet.step
+
+        def step(job_id: str, action: str, req: Any) -> Any:
+            if action == "authorise-challenge":
+                sheet.phone._proposal = lambda _store, _job: ("main", 0)
+            return real_step(job_id, action, req)
+
+        sheet.step = step
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *rig.open_top(), {"eval": GETS},
+            {"eval": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]').click() || 1"},
+            {"until": f"/changed since it was shown/.test({NOTE}) && {STATE} === 'open' && "
+                      f"/Authorise run 0 onto main/.test({box}.textContent) && {NOTE}", "ms": 30000},
+            {"eval": "window.__gets"},
+        ])
+    v = out["values"]
+    assert "nothing was signed" in v[4], v
+    assert v[5] == 0, v
+    posts = [p.split(" ", 1) for p in out["posts"]]
+    assert [p[0] for p in posts] == [f"/cockpit/dispatch/{rig.job.id}/authorise-challenge"], posts
+    assert "request_sha256" in json.loads(posts[0][1]), posts
+    assert lw.jstore.get(rig.job.id).state == "recommended" and lw.main() == main_before
+
+
+@needs_browser
+@needs_ssh
+def test_an_option_the_sheet_has_no_routes_for_is_never_drawn_or_picked(tmp_path: Path, monkeypatch, repo) -> None:  # noqa: F811
+    """complement (same review): an unknown option key fell back to the sign routes. A row listing one (here "zap") draws
+    only the acts the sheet has routes for, and a link that picks it offers no one-tap sign."""
+    rig = _DispatchRig(tmp_path, monkeypatch, repo)
+    with rig.serving() as httpd:
+        sheet = httpd.dispatch_sheet
+        real_row = sheet.row
+
+        def row(job_id: str) -> Any:
+            r = real_row(job_id)
+            if r is not None:
+                r["options"].append({"key": "zap", "text": "Zap", "signers": list(r["signers"]), "line": "zap it"})
+            return r
+
+        sheet.row = row
+        v16 = real_row(rig.job.id)["sha256"][:16]
+        path = f"/sign/dispatch/{rig.job.id}"
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(),
+            {"eval": f"(() => {{ window.localStorage.setItem('levain_write_token', {json.dumps(TOK)}); "
+                     f"location.href = '{path}#v={v16}&choice=zap'; return 1; }})()"},
+            {"until": f"location.pathname === '{path}' && {STATE} && {STATE} !== 'reading' && {STATE}", "ms": 30000},
+            {"eval": "[...document.querySelectorAll('#sheet-actions [data-choice]')].map(b => b.dataset.choice).join(',')"},
+            {"eval": "!!document.getElementById('sheet-picked')"},
+            {"eval": "(document.getElementById('sheet-pick-miss') || {}).textContent || ''"},
+            {"eval": "/zap it/.test(document.getElementById('sheet-body').textContent)"},
+        ])
+    v = out["values"]
+    assert v[1] == "open" and v[2] == "sign,cancel" and v[3] is False, v
+    assert "not on this item" in v[4] and v[5] is False, v
+    assert out["posts"] == [] and rig.state() == "filed"
 
 
 @needs_browser
