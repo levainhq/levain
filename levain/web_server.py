@@ -114,6 +114,7 @@ from levain.cockpit.routes import VARY as COCKPIT_VARY
 from levain.cockpit.routes import handle_get as handle_cockpit_get
 from levain.cockpit.routes import EVENTS_PATH, is_cockpit_path
 from levain.cockpit import stream as cockpit_stream
+from levain.cockpit import board as cockpit_board
 from levain.cockpit import threads as cockpit_threads
 from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb,
                                   record_served_verbs, retier)
@@ -1092,6 +1093,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/sign.js": ("sign.js", "text/javascript; charset=utf-8"),
     # The thread view (CH-U1a): the Build tab's Threads zone, over GET /cockpit/threads.json and /cockpit/thread/<id>.json.
     "/thread_view.js": ("thread_view.js", "text/javascript; charset=utf-8"),
+    # The read-only ready-queue board (C12): the Board tab's zone, over GET /cockpit/board.json.
+    "/board_view.js": ("board_view.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -1129,6 +1132,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
     _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, _COORD_LIST, _COORD_SHEET,
+    cockpit_board.BOARD_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
 _RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
@@ -2506,6 +2510,36 @@ class _Handler(GuardedHandler):
         self._send(cockpit_threads.encode(payload), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
+    def _serve_board(self, *, head: bool) -> None:
+        """``GET /cockpit/board.json`` (C12): the ready queue's read-only board (:func:`levain.cockpit.board.build`), behind
+        the thread record's gate (a surface token on every bind). Read-only: the coordinator store is opened read-only and
+        no live coordinator is needed; a store never made is ``queue: "none"``, one that cannot be read is named in
+        ``unreadable``. No POST reaches it (the write routes are a closed set)."""
+        if not self._off_box_token_valid():
+            self._send(json.dumps({"error": "forbidden", "message": (
+                f"the board needs this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
+            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
+                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            return
+        if not self.server.request_gate.acquire(blocking=False):
+            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            return
+        try:
+            reader = self.server.consent_reader
+            directory = None
+            if hasattr(reader, "directory"):
+                from levain.consent.queue import default_queue_dir
+
+                directory = reader.directory if reader.directory is not None else default_queue_dir()
+            payload = cockpit_board.build(directory, getattr(self.server, "question_store", None))
+        except Exception as exc:  # noqa: BLE001 - never a dead connection
+            payload = {"error": "board_unreadable", "message": f"the board could not be built ({type(exc).__name__})"}
+        finally:
+            self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8",
+                   status=500 if "error" in payload else 200, head=head,
+                   headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
     def _serve_session_log(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/session/<stem>.json``: one agent session's transcript (``session_log.read_session``). The
         consent body's gate: reached only through ``_route``, then a surface token on every bind, judged by
@@ -2848,6 +2882,9 @@ class _Handler(GuardedHandler):
             return
         if cockpit_threads.is_threads_path(path):
             self._serve_threads(path, head=head)
+            return
+        if path == cockpit_board.BOARD_PATH:
+            self._serve_board(head=head)
             return
 
         if is_cockpit_path(path):
