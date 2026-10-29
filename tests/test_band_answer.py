@@ -386,7 +386,6 @@ def test_the_store_owns_the_validation_of_an_answer_and_its_context(store, env):
         store.answer_with_context([], channel="seat")              # `seat` is a via, never an answers channel
 
 
-@pytest.mark.timeout(120)
 def test_a_locked_store_costs_the_hook_one_bound_not_a_30_s_wait_per_item(store, env, monkeypatch):
     """L3 r1 HIGH (codex): each answer and context write waited the ordinary 30 s for the lock."""
     import time

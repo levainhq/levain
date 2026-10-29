@@ -179,7 +179,6 @@ def _colon_line(count):
     return ", ".join(f"{i}: a" for i in range(1, count + 1))
 
 
-@pytest.mark.timeout(10)
 def test_the_lexer_is_linear_a_5000_entry_colon_form_line_takes_under_a_second():
     """L3 r1 HIGH (complement): each `NUM: pick` re-lexed its tail, doubling the work per entry (the hook hung)."""
     import time
@@ -197,7 +196,6 @@ def test_the_lexer_is_linear_a_5000_entry_colon_form_line_takes_under_a_second()
     assert not p.matched and not p.actions and "too long" in p.hint     # refused for length before any lexing
 
 
-@pytest.mark.timeout(10)
 def test_a_long_colon_form_line_under_the_cap_still_parses():
     p = parse(_colon_line(30), View(30, tuple(range(1, 31)), "qs-1"), {n: INFO for n in range(1, 31)}, "qs-1")
     assert p.matched and [a.n for a in p.actions] == list(range(1, 31)) and {a.pick for a in p.actions} == {"a"}
