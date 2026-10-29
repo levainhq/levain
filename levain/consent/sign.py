@@ -864,7 +864,9 @@ def _begin_attempt(queue_dir: Path, request_id: str, attempt: str, namespace: st
                           "signed", 503) from None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.write(fd, text.encode("utf-8"))
+        data = memoryview(text.encode("utf-8"))
+        while data:                                  # a short write is finished, never linked truncated
+            data = data[os.write(fd, data):]
         os.fsync(fd)
         os.link(tmp, path)
         _fsync_dir(path.parent)
@@ -1538,7 +1540,11 @@ class Signer:
                                       503) from None
                 continue
             if found.get("state") == "pending":
-                found = _settle_orphan(self.queue_dir, request_id, attempt) or found
+                try:
+                    found = _settle_orphan(self.queue_dir, request_id, attempt) or found
+                except (OSError, SignRefused) as exc:
+                    _log.warning("attempt %s on %s was not settled: %s", attempt, request_id, exc)
+                    found = {"state": "unknown"}     # honest: it says nothing either way
             if found.get("state") != "pending" or time.monotonic() >= deadline:
                 break
             time.sleep(_ATTEMPT_POLL_S)

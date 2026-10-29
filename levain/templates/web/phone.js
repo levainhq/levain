@@ -115,10 +115,10 @@
       askAttempt(id, pend).then((st) => {
         if (signUnsettled.get(id) !== pend || (st.state !== "signed" && st.state !== "refused")) return;
         signUnsettled.delete(id);
-        if (st.state === "signed") {
-          last = "signed " + (st.choice ? "(" + st.choice + ") " : "") + id + " (its reply was lost; the port confirmed it)";
-          setTimeout(load, 0);
-        }
+        last = st.state === "signed"
+          ? "signed " + (st.choice ? "(" + st.choice + ") " : "") + id + " (its reply was lost; the port confirmed it)"
+          : refusedText(st);
+        setTimeout(load, 0);
       }).finally(() => signAsking.delete(id));
     }
     const waiting = rows.length + gaps.length + signs.length + asks.length + jobs.length;

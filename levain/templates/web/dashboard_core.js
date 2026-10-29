@@ -5003,6 +5003,7 @@
       .then((st) => {
         if (st.state === "signed") {
           signPending.delete(id);
+          signSettledIds.add(id);
           const chose = typeof st.choice === "string" && st.choice ? st.choice : choice;
           const by = typeof st.signer_fp === "string" && st.signer_fp ? st.signer_fp : fp;
           const ns = typeof st.namespace === "string" && st.namespace ? " in " + st.namespace : "";
@@ -5012,6 +5013,7 @@
         }
         if (st.state === "refused") {
           signPending.delete(id);
+          signSettledIds.add(id);
           const why = typeof st.reason === "string" && st.reason ? st.reason.replace(/[.\s]+$/, "") : "refused";
           say("not signed: " + why + (/nothing was signed/.test(why) ? "" : "; nothing was signed") + ": sign it again", "bad");
           return { done: "unsigned" };
@@ -5203,7 +5205,7 @@
             // a definite "nothing was signed" gives every card drawn meanwhile back; an unsure answer is signPending's now
             // (it freezes and releases a card drawn after it); a signed one stays frozen
             if (rearm) { const later = signInFlight.get(id); signInFlight.delete(id); if (later) for (const f of later) f(); }
-            else if (done !== "signed") signInFlight.delete(id);
+            else signInFlight.delete(id);
             signListed = null;
             // a signed (or not-knowable) answer may have closed the request: the board reads again (a row its caller has
             // answered leaves). A definite "nothing was signed" changed nothing, so nothing is read again under the operator

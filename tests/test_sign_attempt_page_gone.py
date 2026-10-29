@@ -154,3 +154,85 @@ def test_a_facet_drawn_after_the_answer_settled_refused_says_so_and_keeps_saying
     for note in (v[11], v[13], v[-1]):
         assert note.startswith("not signed:") and "nothing was signed" in note, v
     assert rig.nothing_signed(QRID)
+
+
+# the first POST ending in `tail` is answered 503 by the page itself: it never reaches the cockpit, so the page does not
+# know whether it signed (the first-pass settle, signSettle, asks the cockpit by the attempt id)
+CARD_ANSWER_503 = ("(() => {{ const real = window.fetch; let armed = true; window.fetch = function (u, o) {{ "
+                   "if (armed && String(u).endsWith({tail})) {{ armed = false; "
+                   "return Promise.resolve(new Response('{{}}', {{status: 503}})); }} "
+                   "return real.apply(this, arguments); }}; return 1; }})()")
+
+
+@needs_browser
+@needs_ssh
+def test_a_facet_drawn_after_the_first_pass_settle_refused_still_says_why(tmp_path: Path, monkeypatch) -> None:
+    """L3 r1 deepseek MED: signSettle's own `refused` (the first pass, not the board-read retry) did not mark the outcome
+    settled, so a card drawn after the request left the listing said only "no longer open"."""
+    rig = _Rig(tmp_path, monkeypatch)
+    real = type(rig.signer).attempt
+
+    def attempt(self, request_id: str, req: Any) -> Any:
+        out = real(self, request_id, req)
+        if out["state"] == "refused":                 # the request leaves the listing once it is settled refused
+            (rig.qdir / "sign" / f"{request_id}.json").unlink(missing_ok=True)
+        return out
+
+    monkeypatch.setattr(type(rig.signer), "attempt", attempt)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"eval": CARD_ANSWER_503.format(tail=json.dumps("/answer"))},
+            {"eval": f"{OPTION_B}.click() || 1"},
+            {"eval": AFTER.format(ms=3000)},
+            {"eval": HISTORY},
+            {"until": f"{ROW} && 1", "ms": 30000},
+            {"eval": OPEN_ROW},                               # a facet drawn fresh after the request left
+            {"until": f"/not signed|no longer open/.test({ROW_NOTE}) && {ROW_NOTE}", "ms": 30000},
+        ])
+    note = out["values"][-1]
+    assert note.startswith("not signed:") and "nothing was signed" in note, out["values"]
+    assert rig.nothing_signed(QRID)
+
+
+@needs_browser
+@needs_ssh
+def test_a_signed_request_leaves_nothing_frozen_behind_for_a_reused_id(tmp_path: Path, monkeypatch) -> None:
+    """L3 r1 deepseek LOW: a signed outcome left its signInFlight entry for the life of the page, so the same request id
+    filed again drew a card frozen by a ceremony that ended long ago."""
+    import shutil
+    import threading
+    import time
+
+    from tests.test_cockpit_sign_card import _write_request
+    from tests.test_cockpit_sign_card_r5 import BUTTONS
+
+    rig = _Rig(tmp_path, monkeypatch)
+    d = rig.qdir / "sign"
+    saved = (d / f"{QRID}.json").read_text()
+
+    def refile() -> None:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not (d / f"{QRID}.signed.json").exists():
+            time.sleep(0.1)
+        time.sleep(1.0)
+        for f in d.glob(f"{QRID}.*"):                 # the request is filed again, open, under the same id
+            f.unlink(missing_ok=True)
+        (d / f".{QRID}.re").write_text(saved)
+        (d / f".{QRID}.re").replace(d / f"{QRID}.json")
+
+    with rig.serving():
+        t = threading.Thread(target=refile, daemon=True)
+        t.start()
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"eval": f"{OPTION_B}.click() || 1"},
+            {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
+            {"eval": AFTER.format(ms=3500)},                  # the request is filed again meanwhile
+            {"eval": "window.LevainCockpitTransport.reload() && 1"},
+            {"eval": "(document.querySelector('#levain-modal .modal-close') && document.querySelector('#levain-modal .modal-close').click(), 1)"},
+            {"until": f"({STRIP_FACET}) && {BUTTONS}", "ms": 30000},   # opened again: a card drawn fresh
+        ])
+        t.join(5)
+    buttons = out["values"][-1]
+    assert buttons and not any(buttons), out["values"]

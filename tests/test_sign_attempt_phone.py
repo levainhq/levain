@@ -142,3 +142,50 @@ def test_the_deep_link_sign_button_is_frozen_too_while_the_port_verifies(tmp_pat
         go.set()
     v = out["values"]
     assert v[-1] == [True], v
+
+
+@needs_browser
+@needs_ssh
+def test_a_refusal_that_settles_after_the_request_left_the_list_is_told_to_the_status_line(tmp_path: Path, port: _Port,
+                                                                                         monkeypatch) -> None:
+    """L3 r1 (codex MED, deepseek LOW 7): an unsettled answer whose request had left the list was dropped without a word
+    when the port later said refused; only `signed` was told."""
+    import levain.authority as authority
+    from levain.consent import sign as signmod
+    from levain.consent.sign import SignRefused
+
+    _file(port.qdir, RID)
+    go = threading.Event()
+
+    def held(*a, **k):
+        go.wait(60)
+        raise SignRefused("the signature did not verify: nothing was signed", 400)
+
+    real = type(port.srv.signer).attempt
+
+    def attempt(self, request_id, req):
+        out = real(self, request_id, req)
+        if out["state"] == "pending":                       # the request leaves the list while its answer still verifies
+            (port.qdir / "sign" / f"{request_id}.json").unlink(missing_ok=True)
+        return out
+
+    monkeypatch.setattr(authority, "verify_link_sig", held)
+    monkeypatch.setattr(signmod, "ATTEMPT_WAIT_S", 0.5)
+    monkeypatch.setattr(type(port.srv.signer), "attempt", attempt)
+    timer = threading.Timer(9.0, go.set)
+    timer.daemon = True
+    timer.start()
+    try:
+        out = _drive(tmp_path, port.url + f"#phone_token={TOK}", [
+            PHONE, port.authenticator(), LISTED,
+            {"eval": SENT_THEN_LOST.format(tail=ANSWER)},
+            {"eval": f"{OPTION_B}.click() || 1"},
+            {"until": f"/still verifying/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 30000},
+            {"until": "/not signed/.test(document.getElementById('status').textContent) && "
+                      "document.getElementById('status').textContent", "ms": 40000},
+        ])
+    finally:
+        go.set()
+    status = out["values"][-1]
+    assert "did not verify" in status and "nothing was signed" in status, status
+    assert _signed(port.qdir, RID) is None
