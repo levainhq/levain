@@ -1561,15 +1561,21 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         context = ruling_context(queue, session)
     except Exception:
         context = None  # undelivered rulings stay for the next hook
+    # a hard stop ends the turn: an answer or notice claimed on it may never be read, so it waits for the next call
+    stopped = out is not None and out.get("continue") is False
     try:
         from levain.consent.band import question_context
 
-        # a hard stop ends the turn: an answer claimed on it may never be read, so it waits for the next call
-        stopped = out is not None and out.get("continue") is False
         answers = None if stopped else question_context(queue.directory, AGENT, session)
     except Exception:
         answers = None  # undelivered answers stay for the next hook
-    context = "\n".join(c for c in (context, answers) if c) or None
+    try:
+        from levain.band_view import gate_notice
+
+        notice = gate_notice(queue.directory, AGENT, session, cwd, environ, deliverable=not stopped)
+    except Exception:
+        notice = None  # a notice is not the gate's to fail on
+    context = "\n".join(c for c in (context, answers, notice) if c) or None
     if context:
         out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}
         spec = out["hookSpecificOutput"]

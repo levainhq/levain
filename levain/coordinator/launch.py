@@ -306,6 +306,12 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         f"--option KEY --token N {tail}` (or `--text WORDS`);",
         f"- leave the rest to him: `{lv} coord escalate N --why WHY --token N {tail}`.",
         "",
+        "## The band",
+        "",
+        "You are an attended seat, so the NEEDS YOU band is shown to you on every turn: end every reply with it "
+        "exactly as Levain gave it (never renumber, reorder, drop or answer its items), and say what each blocks. "
+        "The band is rendered for you by Levain; you never fetch or recompute it.",
+        "",
         "## Away and budgets",
         "",
         f"- when a drop says he is away (\"closing my eyes\"): `{lv} coord away DROP_ID --token N {tail}`. It sets away "
@@ -554,7 +560,7 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
     try:
         from levain.launch import child_env
 
-        env = child_env()
+        env = child_env(seat="attended")      # the coordinator is attachable: the band's D4 marker
         exe = shutil.which("claude", path=env.get("PATH"))
         if exe is None:
             return fail("claude is not on PATH")
@@ -608,7 +614,7 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
 def _harness() -> tuple[str | None, dict[str, str]]:
     from levain.launch import child_env
 
-    env = child_env()
+    env = child_env(seat="attended")
     return shutil.which("claude", path=env.get("PATH")), env
 
 

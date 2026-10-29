@@ -5133,6 +5133,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
     servers = mcp.get("mcpServers") if isinstance(mcp, dict) else None
     results.append(_check_band_server(
         ".mcp.json", servers.get("levain_band") if isinstance(servers, dict) else None, "claude_code"))
+    results.append(_check_band_hooks(install, "claude_code"))
     results.append(_check_dispatch_server(
         install, servers.get("levain_dispatch") if isinstance(servers, dict) else None))
 
@@ -5140,6 +5141,21 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
 
 
 BAND_ROW = "levain_band MCP registered"
+BAND_HOOKS_ROW = "NEEDS YOU band hooks"
+
+
+def _check_band_hooks(install: Path, agent: str) -> CheckResult:
+    """The band's hooks (Q17-ALL D5), per install: wired, stale or absent. Advisory (a WARN, never a FAIL): a missing
+    hook loses the display of the band, never an item (`levain band` still reads it)."""
+    from levain.band_view import band_hooks_state
+
+    state, lacking = band_hooks_state(install / "activation" / "hooks", agent)
+    if state == "wired":
+        return CheckResult(BAND_HOOKS_ROW, True, "wired: SessionStart + UserPromptSubmit + Stop verifier")
+    return CheckResult(BAND_HOOKS_ROW, True,
+                       f"{state}: {', '.join(lacking)} {'does' if len(lacking) == 1 else 'do'} not call the band "
+                       "(a seat here is not shown what waits on the operator; `levain band` still lists it)",
+                       "levain update", warn=True)
 
 
 def _check_band_server(where: str, server: object, agent: str, codex_home: Path | None = None) -> CheckResult:
@@ -5506,6 +5522,7 @@ def _check_codex(install: Path) -> list[CheckResult]:
     servers = config.get("mcp_servers")
     results.append(_check_band_server(
         "config.toml", servers.get("levain_band") if isinstance(servers, dict) else None, "codex", codex_home))
+    results.append(_check_band_hooks(install, "codex"))
 
     return results
 
