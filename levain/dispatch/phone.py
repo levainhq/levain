@@ -156,18 +156,20 @@ class DispatchPhone:
         from levain.dispatch import DispatchError
         from levain.dispatch.jobs import TERMINAL
 
-        store = self._store()
-        job = None if store is None else store.get(job_id)
-        if job is None:
-            return None
         try:
+            store = self._store()
+            job = None if store is None else store.get(job_id)
+            if job is None:
+                return None
             if job.state in TERMINAL:
                 return None
             signers, note = self._signers()
             rec = self.record(job, utc_stamp(self._clock()), list(signers), note)
-        except (DispatchError, ValueError, KeyError, TypeError, IndexError, AttributeError):
+            return {"state": rec["state"], "sha256": self.version(rec)}
+        except (sqlite3.Error, OSError, DispatchError):
+            raise                                   # a store fault: shown() answers it as a 503
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError):
             return {"state": "unreadable", "sha256": ""}
-        return {"state": rec["state"], "sha256": self.version(rec)}
 
     def shown(self, job_id: str, action: str, version: str,
               row: "Callable[[str], dict[str, Any] | None] | None" = None) -> None:

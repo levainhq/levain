@@ -414,7 +414,7 @@ def test_putting_the_page_away_dismisses_an_open_picker_and_polling_resumes(worl
     assert not out["values"][9].startswith("pick a passkey"), out           # no instruction left over a gone picker
 
 
-# --- 1029-5: the card's challenge names the version it showed; only a stale 409 redraws ---------------------------------
+# --- 1029-5: the card's challenge names the version it showed; any 409 redraws ---------------------------------
 
 def _counting(httpd) -> "list[int]":
     """The listing reads the server serves from here on (the card's redraw is one more)."""
@@ -449,16 +449,15 @@ def test_the_challenge_carries_the_listed_version_and_a_stale_409_redraws_the_ca
     assert JobStore(world["qdir"]).get(job.id).state == "filed"
 
 
-@needs_browser
-def test_a_409_that_is_not_the_stale_one_is_a_plain_not_signed_and_the_card_is_kept(world, tmp_path: Path) -> None:
+def _a_409_with(world, tmp_path: Path, message: str) -> "tuple[dict, int]":
     from levain.dispatch.phone import DispatchRefused
 
-    job = file_job(world)
+    file_job(world)
     with _serve(world["qdir"], world["qdir"]) as (base, httpd):
         reads = _counting(httpd)
 
         def refuse(*_a):
-            raise DispatchRefused(409, "conflict", "dispatch job is not filed: something else is the matter")
+            raise DispatchRefused(409, "conflict", message)
 
         httpd.dispatch.step = refuse
         url = base.replace("127.0.0.1", "localhost")
@@ -468,10 +467,18 @@ def test_a_409_that_is_not_the_stale_one_is_a_plain_not_signed_and_the_card_is_k
             {"eval": SIGN_TAP},
             {"until": f"/^Not signed/i.test({NOTE}) && {NOTE}", "ms": 8000},
             {"eval": "new Promise(r => setTimeout(() => r(1), 2600))"},
-            {"eval": f"[{NOTE}, [...document.querySelectorAll('article.dispatch .acts button')].map(b => b.disabled)]"},
         ])
-        after = len(reads)
-    note, disabled = out["values"][-1]
-    assert "something else is the matter" in note and not any(disabled), out["values"]
-    assert after == 1, after                                                      # no redraw: the one read at load
-    assert JobStore(world["qdir"]).get(job.id).state == "filed"
+        return out, len(reads)
+
+
+@needs_browser
+def test_a_different_409_also_redraws_the_list(world, tmp_path: Path) -> None:
+    out, after = _a_409_with(world, tmp_path, "dispatch job is not filed: something else is the matter")
+    assert after >= 2, (after, out)                                               # the load's read, and the redraw's
+
+
+@needs_browser
+def test_a_409_that_the_job_was_cancelled_meanwhile_rereads_the_list(world, tmp_path: Path) -> None:
+    """The card was shown as filed, the job was cancelled meanwhile: the challenge's 409 says so and the list is re-read."""
+    out, after = _a_409_with(world, tmp_path, "dispatch job is cancelled, which is final")
+    assert after >= 2, (after, out)
