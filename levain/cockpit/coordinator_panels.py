@@ -1,6 +1,7 @@
-"""levain.cockpit.coordinator_panels: the cockpit's two coordinator panels (C4-b review queue, C6-b morning card).
+"""levain.cockpit.coordinator_panels: the cockpit's coordinator panels (C4-b review queue, C6-b morning card; the status
+panel is :mod:`levain.cockpit.coordinator_status`, registered here by the same discoverer).
 
-Both are READ-ONLY views over the coordinator store (``dispatch.db`` in the dispatch directory) and draw what
+All are READ-ONLY views over the coordinator store (``dispatch.db`` in the dispatch directory) and draw what
 ``levain.coordinator`` already computes: the queue is :func:`levain.coordinator.review.list_items`, the "waiting on
 you" line is :func:`levain.coordinator.review.waiting_on_you` and the morning card is
 :func:`levain.coordinator.morning.card`, the data ``levain coord morning`` prints. Nothing here recomputes any of
@@ -276,7 +277,12 @@ def coordinator_discoverer(directory: Callable[[], Path | str | None], *,
                 return Read(rows=(_unreadable(e),))
             return Read(rows=rows, note=None)
 
+        from levain.cockpit import coordinator_status
+
         return [
+            ProviderSpec(coordinator_status.COORD_STATUS_ID, "list", "Coordinator", "gate",
+                         coordinator_status.status_reader(directory, clock), region="operate", rank=20,
+                         order="legacy.source", version_fields=("*",), size="medium", span=1),
             ProviderSpec(MORNING_ID, "list", "Coordinator morning card", "gate", morning_read, region="operate",
                          rank=21, order="legacy.source", version_fields=("*",), size="medium", span=1,
                          empty="Nothing waits after the night."),
