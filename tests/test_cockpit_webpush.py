@@ -354,12 +354,17 @@ def test_the_cockpits_own_key_is_told_to_pair_first_and_keeps_nothing(rig, tmp_p
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token={T}", _panel(T, _sub(8), [
             {"until": "document.querySelector('.dev-note') && !document.querySelector('.dev-note').hidden"
                       " && document.querySelector('.dev-note').textContent", "ms": 20000},
+            # the refusal is said on the pings row itself, which survives the re-render (the note sits below the pair form);
+            # waited for, because the note is set before the finally's pings() has re-rendered the row
+            {"until": f"{_ROW}.querySelector('.dev-meta').textContent.startsWith(\"off: pings need\")"
+                      f" && {_ROW}.querySelector('.dev-meta').textContent", "ms": 20000},
             {"eval": f"{_ROW}.querySelector('button').textContent"},
         ]))
         assert PushStore(qdir).live_subscriptions() == []
     v = out["values"]
     assert v[3].startswith("Pings need this browser's own key"), v
-    assert v[4] == "Turn on", v                                  # the browser's subscription was dropped too
+    assert v[4].startswith("off: pings need this browser's own key"), v
+    assert v[5] == "Turn on", v                                  # the browser's subscription was dropped too
 
 
 @needs_browser
