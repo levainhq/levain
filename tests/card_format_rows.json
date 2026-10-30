@@ -1,0 +1,46 @@
+{
+ "np-ab37059b": {
+  "id": "np-ab37059b",
+  "repo": "flow",
+  "what": "Your rulings are in the backup-detection design, and it is ready for your read before its build.",
+  "stopped": "Your rulings are in the backup-detection design, and it is ready for your read before its build. I need your yes on how it lets the estate fail. WHAT: Your 4a + Q1a Q2c Q3a Q4a are absorbed. STEP1's I3a row now has the VPS run backup only (no forget or prune) on both repositories, with your §9 (c) encrypted volume. I3b design v5.3 went through round 5 (three lineages, all NOT CLEAN) and three narrow fix verifies; the last one returned complement CLEAN and codex fixed on 3 of 4, and the 4th was a one-line arithmetic fix I checked myself, not a seat. Landed on flow main 6ea7ed58. The build brief is written and goes to the desk; it follows I3a and I4. What only you can settle, in one read of the page: - Backups are kept forever until a retention design exists, so B2 and argushub storage only grow. - The 21-day \"every pack read\" promise holds only under the declared upload rate and caps, and \"reachable\" means a live counting reader exists (§4.2, §8). - Closing an alarm needs your cockpit passkey signature (derived from your 10-26 \"one mobile signer\" ruling). The page states that it keeps out an agent shell, but not a root shell or the checker itself. - Apple push + your iPhone stay an uncovered common mode (your Q2c), caught by a weekly drill. Later, not now: your declared backup maxima (largest honest backup, backups per day) set the caps before the first drill. Page: ~/Desktop/i3b-design-v5/I3B_DESIGN_DRAFT.html  http://missinglayer.tail1c8687.ts.net:7460/desktop/i3b-design-v5/I3B_DESIGN_DRAFT.html (build order: I3B_BUILD_BRIEF.html beside it) OPTIONS: (a) accept the failure shape as written; the build brief stands · (b) accept, but change one named item (say which) before the build · (c) hold: talk it through first REC: a BLOCKS: the I3b build's acceptance drills and its caps. Nothing runs before I3a and I4 anyway, and build step 1 (pure fixtures) does not need this.",
+  "options": [
+   {
+    "key": "a",
+    "text": "accept the failure shape as written; the build brief stands"
+   },
+   {
+    "key": "b",
+    "text": "accept, but change one named item (say which) before the build"
+   },
+   {
+    "key": "c",
+    "text": "hold: talk it through first"
+   }
+  ],
+  "rec": "a",
+  "message": "flow needs-phill answer\nitem: np-ab37059b\nrow_version: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nrepo: flow\nasked: Your rulings are in the backup-detection design, and it is ready for your read before its build.\nstopped: Your rulings are in the backup-detection design, and it is ready for your read before its build. I need your yes on how it lets the estate fail. WHAT: Your 4a + Q1a Q2c Q3a Q4a are absorbed. STEP1's I3a row now has the VPS run backup only (no forget or prune) on both repositories, with your §9 (c) encrypted volume. I3b design v5.3 went through round 5 (three lineages, all NOT CLEAN) and three narrow fix verifies; the last one returned complement CLEAN and codex fixed on 3 of 4, and the 4th was a one-line arithmetic fix I checked myself, not a seat. Landed on flow main 6ea7ed58. The build brief is written and goes to the desk; it follows I3a and I4. What only you can settle, in one read of the page: - Backups are kept forever until a retention design exists, so B2 and argushub storage only grow. - The 21-day \"every pack read\" promise holds only under the declared upload rate and caps, and \"reachable\" means a live counting reader exists (§4.2, §8). - Closing an alarm needs your cockpit passkey signature (derived from your 10-26 \"one mobile signer\" ruling). The page states that it keeps out an agent shell, but not a root shell or the checker itself. - Apple push + your iPhone stay an uncovered common mode (your Q2c), caught by a weekly drill. Later, not now: your declared backup maxima (largest honest backup, backups per day) set the caps before the first drill. Page: ~/Desktop/i3b-design-v5/I3B_DESIGN_DRAFT.html  http://missinglayer.tail1c8687.ts.net:7460/desktop/i3b-design-v5/I3B_DESIGN_DRAFT.html (build order: I3B_BUILD_BRIEF.html beside it) OPTIONS: (a) accept the failure shape as written; the build brief stands · (b) accept, but change one named item (say which) before the build · (c) hold: talk it through first REC: a BLOCKS: the I3b build's acceptance drills and its caps. Nothing runs before I3a and I4 anyway, and build step 1 (pure fixtures) does not need this.\nrecommended: (a) accept the failure shape as written; the build brief stands\nnonce: 9a1f03bc\nfiled: 2026-10-30T14:00:00Z"
+ },
+ "np-b70bec0b": {
+  "id": "np-b70bec0b",
+  "repo": "nemo-operans",
+  "what": "Cost-parity page: the Oct 4 correction note is in your voice on a page bylined flow. Sign the note as yours?",
+  "stopped": "that one note (the other 14 fixes are live)",
+  "options": [
+   {
+    "key": "a",
+    "text": "sign the note '- Phill', keep flow's byline on the essay"
+   },
+   {
+    "key": "b",
+    "text": "rewrite the note in flow's voice"
+   },
+   {
+    "key": "c",
+    "text": "leave it"
+   }
+  ],
+  "rec": "a",
+  "message": "flow needs-phill answer\nitem: np-b70bec0b\nrow_version: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nrepo: nemo-operans\nasked: Cost-parity page: the Oct 4 correction note is in your voice on a page bylined flow. Sign the note as yours?\nstopped: that one note (the other 14 fixes are live)\nrecommended: (a) sign the note '- Phill', keep flow's byline on the essay\nnonce: 9a1f03bc\nfiled: 2026-10-30T14:00:00Z"
+ }
+}

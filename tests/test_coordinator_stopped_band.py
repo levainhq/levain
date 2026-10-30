@@ -37,7 +37,7 @@ def _all(qdir):
 @pytest.fixture
 def pings(monkeypatch):
     sent: list[str] = []
-    monkeypatch.setattr(band, "_send_ping", lambda agent, q, qdir, extra="": sent.append(q.id) or True)
+    monkeypatch.setattr(band, "_send_ping", lambda agent, q, qdir, extra="", kind="question": sent.append(q.id) or True)
     return sent
 
 

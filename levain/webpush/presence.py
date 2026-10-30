@@ -78,8 +78,9 @@ LOCK_NAME = ".presence.lock"
 LOG_MAX_BYTES = 1 << 20   # past this the log is rotated to ``LOG_NAME + ".1"``
 # urgent = a ping about a request that holds an agent until the operator answers: the hook's wait (``consent``, the
 # default kind: the permission hook, the publish gate, the limits), the push gate's wait (``push``) and the asking-again
-# of a request still pending (``reping``). Every other kind (``question``, ``ruling``, ``summary``) waits for the rule.
-URGENT_KINDS = frozenset({"consent", "push", "reping"})
+# of a request still pending (``reping``), and the rows the coordinator raises to him (``attention``, C11 Q1 (c): passes
+# ``quiet``, never ``sleep``). Every other kind (``question``, ``ruling``, ``summary``) waits for the rule.
+URGENT_KINDS = frozenset({"consent", "push", "reping", "attention"})
 FILE_NAME = "presence.json"
 _MAX_BYTES = 4096
 _DURATION = re.compile(r"^(\d{1,4})\s*(m|min|mins|minutes?|h|hr|hrs|hours?)?$", re.I)

@@ -188,6 +188,21 @@ _PAIR_VERIFY_SLOTS = 4            # paired lookups in flight, taken before the b
 _PAIR_WAIT_S = 3.0                # how long a paired request waits on a starting broker before its 503 (RT-4, RU-4)
 _PAIR_TOKEN_LEN = (16, 128)       # a header outside this length (or the header-safe shape) is never looked up (RT-3)
 _UNSET: Any = object()            # the per-request credential cache's empty mark (RS-1)
+# A browser paired by its own Turn on is labelled from its User-Agent by these words only (first match wins, so the
+# tokens a browser's UA also carries come after its own): the label is never the header's text
+_UA_BROWSERS = (("Edg", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"), ("FxiOS/", "Firefox"),
+                ("CriOS/", "Chrome"), ("Chrome/", "Chrome"), ("Safari/", "Safari"))
+_UA_SYSTEMS = (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android"), ("CrOS", "ChromeOS"),
+               ("Mac OS X", "macOS"), ("Windows", "Windows"), ("Linux", "Linux"))
+
+
+def _browser_label(user_agent: str) -> str:
+    """``this browser (<browser> on <system>)``, each part a fixed word from the tables above, or plain ``this
+    browser`` when neither is named."""
+    ua = user_agent[:512]
+    short = " on ".join(word for table in (_UA_BROWSERS, _UA_SYSTEMS)
+                        for word in [next((w for tok, w in table if tok in ua), None)] if word)
+    return f"this browser ({short})" if short else "this browser"
 
 
 def _journal_holds_paired_devices(data_root: Path) -> bool:
@@ -1109,8 +1124,12 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/pair": ("pair.html", "text/html; charset=utf-8"),
     "/pair.js": ("pair.js", "text/javascript; charset=utf-8"),
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
+    # An old phone link (the phone port shared this origin before the cockpit took it): see the file's header.
+    "/legacy_phone_link.js": ("legacy_phone_link.js", "text/javascript; charset=utf-8"),
     # The sign sheet's script (OS-1): its page is GET /sign/<id>, served by _route beside a Signer.
     "/sign.js": ("sign.js", "text/javascript; charset=utf-8"),
+    # The sign sheet's card parser (a pure file, shared by name with node's test): loaded before /sign.js.
+    "/card_format.js": ("card_format.js", "text/javascript; charset=utf-8"),
     # The thread view (CH-U1a): the Build tab's Threads zone, over GET /cockpit/threads.json and /cockpit/thread/<id>.json.
     "/thread_view.js": ("thread_view.js", "text/javascript; charset=utf-8"),
     # The read-only ready-queue board (C12): the Board tab's zone, over GET /cockpit/board.json.
@@ -1118,8 +1137,9 @@ _ASSETS: dict[str, tuple[str, str]] = {
 }
 
 
-# ONESURFACE OS-4: web push on this origin (levain.webpush.routes), served beside a Signer, whose queue holds the push
-# store. The worker, manifest and icons are app shell (token-free, no data); the two reads and three writes need a
+# ONESURFACE OS-4: web push on this origin (levain.webpush.routes). The worker, manifest and icons are app shell
+# (token-free, no data) and always served; the rest is served beside a Signer, whose queue holds the push
+# store. The two reads and three writes need a
 # token on every bind; the phone port's own pairing (/webpush/pair, /webpush/pair/redeem) is not served here: this
 # origin pairs through /pair.
 _PUSH_GET = frozenset({"/webpush/key", "/webpush/record"})
@@ -1649,10 +1669,12 @@ class _Handler(GuardedHandler):
         refused anyway (X-Frame-Options DENY). The sign sheet ``GET /sign/<id>`` is the same class (OS-1: a sign link
         opened from a message or a mail page; a static shell whose reads are same-origin and gated), exact raw path too;
         a cross-site frame of it is refused here, its own-origin frame is what its headers admit. The consent sheet
-        ``GET /sign/consent/<id>`` (OS-2) is the same shell over a consent request, admitted alike."""
+        ``GET /sign/consent/<id>`` (OS-2) is the same shell over a consent request, admitted alike. The bare ``GET /`` is the
+        dashboard shell, which carries ``legacy_phone_link.js``: an old phone link opened from a message or a mail page
+        arrives cross-site and must reach that script to land on its sign sheet (W1a); exact raw path, no query."""
         page = self.path.split("?", 1)[0]
         return (self.command == "GET"
-                and (self.path == "/pair" or _sheet_id(page) is not None or _consent_sheet_id(page) is not None
+                and (self.path == "/pair" or self.path == "/" or _sheet_id(page) is not None or _consent_sheet_id(page) is not None
                      or _dispatch_sheet_id(page) is not None or page == _COORD_SHEET)
                 and self.headers.get("Sec-Fetch-Site") == "cross-site"
                 and self.headers.get("Sec-Fetch-Mode") == "navigate"
@@ -2103,14 +2125,15 @@ class _Handler(GuardedHandler):
         record, behind :meth:`_sign_read_admitted`."""
         from levain.webpush import routes as push_routes
 
-        queue = self.server.signer.queue_dir
         if not read:
-            status, body, ctype = push_routes.handle("GET", path, {}, b"", queue_dir=queue, authorized=False,
+            # the app shell reads no queue: it is served with or without a Signer
+            status, body, ctype = push_routes.handle("GET", path, {}, b"", queue_dir=Path("."), authorized=False,
                                                      device_id=None) or (404, b"not found\n", "text/plain")
             self._send(body, ctype, status=status, head=head)
             return
         if not self._sign_read_admitted(head=head, what="push reads"):
             return
+        queue = self.server.signer.queue_dir
         try:
             try:
                 got = push_routes.handle("GET", path, {}, b"", queue_dir=queue, authorized=True,
@@ -2126,22 +2149,65 @@ class _Handler(GuardedHandler):
             self.server.request_gate.release()
 
     def _push_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any] | bytes, int]":
-        """A web push POST (OS-4), its credential already checked: only a PAIRED device subscribes (a surface token
-        has no revoke that could stop the pings), and every subscription is stored under the device's credential
-        name, with this cockpit's journal as its device's authority: the send asks the journal whether the device is
-        live (:func:`levain.webpush.store.live_rows`), so a revoke stops its pings whether or not :meth:`_retire_push`
-        ran, and the subscribe asks it again inside its own write."""
-        from levain.webpush import routes as push_routes
-
+        """A web push POST (OS-4), its credential already checked. Every subscription is stored under a PAIRED
+        device's credential name, with this cockpit's journal as its device's authority: the send asks the journal
+        whether the device is live (:func:`levain.webpush.store.live_rows`), so a revoke stops its pings whether or
+        not :meth:`_retire_push` ran, and the subscribe asks it again inside its own write. A subscribe under any
+        other credential pairs this browser first (:meth:`_pair_and_subscribe`)."""
         name = str(self._credential()["name"])
         if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
-            return {"error": "device_required", "message": "turn pings on from a paired device: pair it from the "
-                    "Devices panel first"}, 403
+            return self._pair_and_subscribe(raw, name)
+        got = self._push_handle(route, raw, name)
+        return got[1], got[0]
+
+    def _push_handle(self, route: str, raw: bytes, device_id: str) -> "tuple[int, bytes, str]":
+        from levain.webpush import routes as push_routes
+
         broker = self.server.broker
         got = push_routes.handle("POST", route, {}, raw, queue_dir=self.server.signer.queue_dir, authorized=True,
-                                 device_id=name, journal=broker.data_root if broker is not None else None)
+                                 device_id=device_id, journal=broker.data_root if broker is not None else None)
         if got is None:                 # every route in _PUSH_POST is one of handle's
             raise RuntimeError(f"push route {route} not handled")
+        return got
+
+    def _pair_and_subscribe(self, raw: bytes, minted_by: str) -> "tuple[dict[str, Any] | bytes, int]":
+        """Turn on from a credential that is not a paired device's: the browser is paired on the spot by the same
+        journal calls an offer and its claim make (``mint_offer`` by ``minted_by``, then ``redeem_offer``), so a
+        credential pair/offer refuses is refused here with pair/offer's answer, and the pings are subscribed under
+        the new device. The answer carries ``device_id`` and its ``token`` ONCE, as the claim's does. A body
+        ``handle`` would refuse is refused before anything is minted; a subscribe that fails after the mint revokes
+        the new device (the ledger has no delete), so no live device is left without its pings."""
+        from levain.webpush import routes as push_routes
+
+        bad = push_routes.subscription_refusal(raw)
+        if bad is not None:
+            return bad[1], bad[0]
+        now = datetime.now(timezone.utc)
+        label = _browser_label(self.headers.get("User-Agent", ""))
+        payload, status = self._pair_call(lambda db: {"claimed": db.redeem_offer(
+            db.mint_offer(label=label, minted_by=minted_by, now=now), now=now)})
+        if status != 200:
+            return payload, status
+        if payload["claimed"] is None:      # a code minted a moment ago is live; only a journal fault lands here
+            return {"error": "internal", "message": "the pairing for this browser was not claimed"}, 500
+        device, token = payload["claimed"]
+        try:
+            got = self._push_handle(_PUSH_SUBSCRIBE, raw, PAIRED_PREFIX + device)
+        except Exception as exc:  # noqa: BLE001 - the new device is revoked below, then the fault is the answer
+            _log.warning("pings turn-on: subscribe after pairing failed", exc_info=True)
+            got = 500, json.dumps({"error": "internal", "message": type(exc).__name__}).encode("utf-8"), "json"
+        if got[0] == 200:
+            out = json.loads(got[1])
+            out.update(device_id=device, token=token)
+            return out, 200
+        undone, ustatus = self._pair_call(
+            lambda db: {"revoked": db.revoke_devices([device], by=minted_by, now=now)})
+        if ustatus == 200:
+            with self.server.pair_epoch_lock:   # after the commit, as every revoke (RU-3)
+                self.server.pair_epoch += 1
+        else:
+            _log.warning("pings turn-on: device %s minted for a failed subscribe was not revoked: %s",
+                         device, undone.get("error"))
         return got[1], got[0]
 
     def _retire_push(self, device_ids: "list[str]", now: datetime) -> "str | None":
@@ -2891,8 +2957,9 @@ class _Handler(GuardedHandler):
         if dispatch_read is not None or path == _DISPATCH_LIST:     # its reads ride the sign listing's gate exactly
             self._serve_dispatch_sheet(dispatch_read, head=head)
             return
-        # Web push (OS-4), beside a Signer only: the app shell token-free, the reads on the sign reads' own gate
-        if self.server.signer is not None and path in _push_static():
+        # Web push (OS-4): the app shell (worker, manifest, icons) token-free and always served, the reads beside a
+        # Signer only, on the sign reads' own gate
+        if path in _push_static():
             self._serve_push(path, head=head)
             return
         if self.server.signer is not None and path in _PUSH_GET:

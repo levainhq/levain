@@ -2659,6 +2659,35 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .pair-veil { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: var(--sp-6); box-sizing: border-box; background: var(--bg); }
 .pair-actions .dev-btn { min-height: var(--hit-min, 44px); }
 
+/* the sign sheet's message: wrapped, never one line a page wide; the card format (card_format.js) for a needs-phill card */
+.sheet-message { margin: 0 0 var(--sp-4); white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-meta)/1.6 var(--mono); color: var(--text); }
+.card-meta { margin: 0 0 var(--sp-2); font: var(--fw-semibold) var(--fs-micro)/1.4 var(--round); color: var(--faint); overflow-wrap: anywhere; }
+.pair-card .card-headline { margin: 0 0 var(--sp-5); font: var(--fw-bold) var(--fs-title)/1.3 var(--round); color: var(--text); overflow-wrap: anywhere; }
+.card-signed, .card-detail { margin: 0 0 var(--sp-4); }
+.card-signed > summary, .card-detail > summary { cursor: pointer; min-height: var(--hit-min, 44px); display: flex; align-items: center; color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--sans); }
+.card-detail > summary { color: var(--text); font-size: var(--fs-body); border-top: 1px solid var(--hair); padding-top: var(--sp-3); }
+.card-signed .sheet-message { margin-top: var(--sp-3); }
+.card-detail-body { padding-top: var(--sp-3); }
+.card-sec { margin: 0 0 var(--sp-5); }
+.card-label { margin: 0 0 var(--sp-2); font: var(--fw-bold) var(--fs-micro)/1.3 var(--sans); font-variant-caps: all-small-caps; letter-spacing: .08em; color: var(--label); }
+.card-label-top { margin-top: var(--sp-2); }
+.pair-card .card-p { margin: 0 0 var(--sp-3); color: var(--text); overflow-wrap: anywhere; }
+.card-list { margin: 0 0 var(--sp-3); padding-left: var(--sp-5); color: var(--text); font: var(--fw-regular) var(--fs-body)/1.5 var(--sans); }
+.card-list li { margin: 0 0 var(--sp-2); overflow-wrap: anywhere; }
+/* the answers: full-width rows with their whole text, the recommended one first in green and marked */
+.pair-actions.card-rows { flex-direction: column; flex-wrap: nowrap; align-items: stretch; margin-bottom: var(--sp-5); }
+.pair-actions.card-rows .dev-btn { display: block; width: 100%; height: auto; text-align: left; white-space: normal; overflow-wrap: anywhere; line-height: 1.45; padding: var(--sp-3) var(--sp-4); }
+.pair-actions.card-rows .card-key { display: inline-block; min-width: 2.2em; margin-right: var(--sp-2); font-weight: var(--fw-bold); color: var(--label); }
+.pair-actions.card-rows .sheet-rec { order: -1; border-color: var(--ok); color: var(--ok); }
+.pair-actions.card-rows .sheet-rec .card-key { color: var(--ok); }
+.pair-actions.card-rows .sheet-rec::after { content: "Rec"; margin-left: var(--sp-3); padding: 1px var(--sp-2); border: 1px solid var(--ok); border-radius: var(--r-sm); font-size: var(--fs-micro); font-weight: var(--fw-bold); white-space: nowrap; }
+.sheet-line { overflow-wrap: anywhere; }
+/* the same card in the cockpit's focus view (a needs-phill question signed through its request): the sheet's anatomy */
+.needs-card-head .card-headline { margin: 0 0 var(--sp-4); font: var(--fw-bold) var(--fs-title)/1.3 var(--round); color: var(--text); overflow-wrap: anywhere; }
+.needs-card-head .consent-display { margin-top: var(--sp-3); white-space: pre-wrap; overflow-wrap: anywhere; }
+.sign-facet .card-detail { margin-top: var(--sp-4); }
+.sign-facet .card-p { margin: 0 0 var(--sp-3); color: var(--text); overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-body)/1.5 var(--sans); }
+
 /* a review queue row's "yours to clear" line: its own line, wrapped whole, so the command it names is never cut */
 .review-mine { display: block; white-space: normal; overflow-wrap: anywhere; }
 body.ke .row:has(> .clause.clampable) > .ext-meta.review-mine:not(.clause):not(.clause-toggle):not(.ck-rowaddr):not(.verb-actions) {
