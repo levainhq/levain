@@ -208,13 +208,15 @@ class Rendered(NamedTuple):
     """One render: the text, the ``closed`` band numbers it carries, the band numbers of the open items shown with a
     number, the header's ``band@`` high-water mark (0 when nothing was numbered), and the render's generation (its
     start, ``time.time_ns()``: what orders two views of one viewer, whatever order they are committed in), and whether
-    an authority source was not read (``failed``: the text then carries its ``! not read`` line)."""
+    an authority source was not read (``failed``: the text then carries its ``! not read`` line), and whether an open
+    item has no number yet (``pending``: the text lists it as ``new (number pending)``)."""
     text: str
     closed: list[int]
     shown: list[int]
     hwm: int
     gen: int
     failed: bool = False
+    pending: bool = False
 
 
 def render_with_closed(store: QuestionStore | None = None) -> tuple[str, list[int]]:
@@ -328,7 +330,8 @@ def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sq
         except Exception:                     # one item that will not render never drops the band (D13)
             lines.append(f"{label} UNREADABLE: {key[0]} {key[1]} could not be read (listed, never dropped)")
     lines.extend(f"! not read: {why} (items from it are missing, not closed)" for why in extras.failed)
-    return Rendered("\n".join(lines), [n for n, _ in closed_all], shown, hwm, gen, bool(extras.failed))
+    return Rendered("\n".join(lines), [n for n, _ in closed_all], shown, hwm, gen, bool(extras.failed),
+                    len(shown) < len(entries))
 
 
 def render(store: QuestionStore | None = None) -> str:
@@ -735,9 +738,11 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
                                       if i < len(_LETTERS)], "rec": e.rec_letter, "question": None})
     # an item that was not read (a transient lock on queue.db: the first read or the second; a question row that cannot be
     # decoded): the items listed are the ones that were read, and the band says so, as the text render's "! not read" line
-    # does: never a healthy band that is missing items
+    # does: never a healthy band that is missing items. The bound view is not the one this show recorded (its record
+    # skipped on a busy lock, so an older view is bound): its list differs from what was shown, and the band says so.
     return {"seen_through": view.seen_through, "store_id": view.store_id, "view_id": view_id, "items": items,
-            "note": _UNREAD_NOTE if (shown.failed or extras_failed or dropped) else ""}
+            "note": _UNREAD_NOTE if (shown.failed or shown.pending or extras_failed or dropped
+                                     or sorted(view.open_list) != sorted(shown.shown)) else ""}
 
 
 class StaleBand(ValueError):

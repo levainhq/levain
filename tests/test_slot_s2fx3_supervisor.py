@@ -521,8 +521,10 @@ def test_a_launch_with_a_claude_route_lacking_the_token_host_is_refused_before_a
     (tmp_path / "b").mkdir()
     r2 = g3rig(tmp_path / "b", monkeypatch, FAKE_START="idunr", FAKE_STATUS=unr)    # the rig's claude-sub has the host
     assert r2.run(auth="passthrough") == 1
-    assert ("could not reach Claude's sign-in server to check slot 0's login. Nothing was launched, and the stored "
-            "login is kept. Try again.") in _said(r2)
+    said2 = _said(r2)
+    assert ("the login for slot 0 could not be refreshed and checked; nothing was launched; run `levain doctor` or "
+            "try again, and if it repeats, sign in again") in said2
+    assert "sign-in server" not in said2 and "stored login is kept" not in said2
 
 
 @bounded(60)

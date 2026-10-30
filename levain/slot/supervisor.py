@@ -1559,9 +1559,12 @@ class Supervisor:
                 pass
 
     def _identity_unreachable(self, session: str) -> None:
-        """``start`` refused ``identity-unreachable`` (the login could not be refreshed and checked: a network or
-        server failure, never a dead login): routed like :meth:`_identity_expired`, so the retry text is said only when
-        root's ``status`` record also says ``identity-unreachable``. It never tells him to sign in again."""
+        """``start`` refused ``identity-unreachable`` (the login could not be refreshed and checked): routed like
+        :meth:`_identity_expired`, so the retry text is said only when root's ``status`` record also says
+        ``identity-unreachable``. The name is root's catch-all for every refresh outcome without an answer of its own
+        (a network failure, but also a 200 that could not be used, an abandoned exchange, a local pre-request failure),
+        and the record carries no detail, so the text claims neither a network failure nor a kept login; it tells him
+        to retry and, only if that repeats, to sign in again."""
         neutral = ("start refused identity-unreachable, but root's record could not be read ({why}). "
                    "Nothing was launched.")
         try:
@@ -1574,8 +1577,8 @@ class Supervisor:
                 self.say("start refused identity-unreachable, but root's record does not say so. "
                          "Nothing was launched.")
                 return
-            self.say(f"could not reach Claude's sign-in server to check slot {self._slot_index}'s login. Nothing was "
-                     "launched, and the stored login is kept. Try again.")
+            self.say(f"the login for slot {self._slot_index} could not be refreshed and checked; nothing was launched; "
+                     "run `levain doctor` or try again, and if it repeats, sign in again")
         except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
             try:
                 self.say(neutral.format(why=type(e).__name__))
