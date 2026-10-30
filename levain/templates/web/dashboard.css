@@ -2748,3 +2748,60 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
 .band-msg { flex: 1 1 100%; overflow-wrap: anywhere; }
 /* the band's options are always drawn (the row-verb rule that shows a row's verbs on hover is not theirs) */
 .band-options { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-2); }
+
+/* OS-3: THE NARROW LAYOUT. The phone's views (Needs you, Board, Notifications, Grants, Drop, the state line) are this page's own
+   content, laid out for a thumb under the page's existing 720px break; the wider layout draws none of this. The page keeps its
+   design language: what changes is the order (what waits on him comes before the graph), one strip that jumps to each view, and
+   hit areas. The strip is hidden here and shown only in the narrow block, so a wide page never sees it. */
+.ck-phonetabs { display: none; }
+@media (max-width: 720px) {
+  /* the hero's two children (the band, the sky card) join the deck's column so the needs strip can sit between them: the state
+     line first, then what waits on him, then the sky. Every moved block has an explicit order; the rest keep document order.
+     The hero draws no box of its own (display block is all it sets), so its flatten loses no padding, margin or paint; a box
+     style added to it would need the deck's gap to carry it here. */
+  body.ke .deck > .masthead { order: -4; }
+  body.ke .ck-phonetabs { order: -3; }
+  body.ke .hero:not([hidden]) { display: contents; }
+  body.ke .hero > .band { order: -2; }
+  body.ke .ck-needs, body.ke .ck-notes { order: -1; }
+  /* a view the strip jumps to stops under the sticky strip, never behind it */
+  body.ke #ck-needs, body.ke #ck-state-slot, body.ke .panel[data-ck-panel="tray"], body.ke .panel[data-ck-panel="notifications"] { scroll-margin-top: calc(var(--hit-min) + var(--sp-4)); }
+  body.ke .ck-phonetabs {
+    display: flex; gap: 0; position: sticky; top: 0; z-index: 5;
+    padding: 0 var(--gutter-ke); background: var(--base); border-bottom: 1px solid var(--hair);
+    overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none;
+  }
+  body.ke .ck-phonetabs::-webkit-scrollbar { display: none; }
+  body.ke .ck-phonetabs button {
+    flex: 1 1 auto; min-height: var(--hit-min); padding: 0 var(--sp-2); white-space: nowrap;
+    background: none; border: 0; border-radius: var(--r-md); color: var(--label); cursor: pointer;
+    font: var(--fw-semibold) var(--fs-meta) var(--round);
+  }
+  body.ke .skycol { margin-top: var(--sec); }   /* the sky now follows the needs strip, not the band: the one section space between them */
+  body.ke .ck-phonetabs button:active { background: var(--card-2); color: var(--text); }
+  /* the Decisions view's rows (the open request, a standing grant, the drop): the command takes the row's width and its button
+     the line under it at a thumb's height, in place of a button squeezing a wrapped command into a sliver beside it */
+  body.ke .modal-body .consent-cmd { flex-direction: column; align-items: flex-start; }
+  body.ke .modal-body .consent-cmd > .consent-code { align-self: stretch; }
+  body.ke .modal-body .consent-cmd > button { margin-left: 0; }
+  body.ke .modal-body .consent-copy, body.ke .modal-body .consent-sheet-open,
+  body.ke .modal-body .needs-btn, body.ke .modal-body .undo-btn { min-height: var(--hit-min); }
+  body.ke .modal-body .tray-dump-btn { min-height: var(--hit-min); }
+  body.ke .modal-body .ext-grouphead, body.ke .modal-body .coord-drop-slot { scroll-margin-top: calc(var(--hit-min) + var(--sp-3)); }   /* under the view's sticky filter */
+}
+/* touch: a control that is small to the eye keeps its size and grows its HIT AREA through a pseudo-element, as the row verbs do
+   above, so a card does not change height. The area is the control's own box, centred, and at least the hit minimum in each
+   direction: a control already that large gains nothing, one narrower or shorter grows evenly about its centre */
+@media (pointer: coarse) {
+  body.ke .needs-history, body.ke .tray-dump-btn, body.ke .state-edit, body.ke .tv-seg-b, body.ke .tv-live, body.ke .ck-lay-btn { position: relative; }
+  body.ke .needs-history::after, body.ke .tray-dump-btn::after, body.ke .state-edit::after, body.ke .tv-seg-b::after,
+  body.ke .tv-live::after, body.ke .ck-lay-btn::after {
+    content: ""; position: absolute; top: 50%; left: 50%; width: 100%; height: 100%;
+    min-width: var(--hit-min); min-height: var(--hit-min); transform: translate(-50%, -50%);
+  }
+  /* the layout buttons sit in a row, so their areas would share ground: the gap between neighbours is what makes each centre the hit
+     minimum from the next, and the areas then meet without overlapping (the drawn size and the head's height stay as they are) */
+  body.ke .ck-lay { gap: calc(var(--hit-min) - var(--ctl-row)); }
+  body.ke .panel .phead:has(> .src.fresh) .ck-lay-up, body.ke .panel .phead:has(> .src.fresh) .ck-lay-down,
+  body.ke .panel .phead:has(> .src.fresh) .ck-lay-fold { margin-left: calc(var(--hit-min) - var(--ctl-row) - var(--sp-3)); }
+}
