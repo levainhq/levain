@@ -1652,10 +1652,12 @@ class _Handler(GuardedHandler):
         refused anyway (X-Frame-Options DENY). The sign sheet ``GET /sign/<id>`` is the same class (OS-1: a sign link
         opened from a message or a mail page; a static shell whose reads are same-origin and gated), exact raw path too;
         a cross-site frame of it is refused here, its own-origin frame is what its headers admit. The consent sheet
-        ``GET /sign/consent/<id>`` (OS-2) is the same shell over a consent request, admitted alike."""
+        ``GET /sign/consent/<id>`` (OS-2) is the same shell over a consent request, admitted alike. The bare ``GET /`` is the
+        dashboard shell, which carries ``legacy_phone_link.js``: an old phone link opened from a message or a mail page
+        arrives cross-site and must reach that script to land on its sign sheet (W1a); exact raw path, no query."""
         page = self.path.split("?", 1)[0]
         return (self.command == "GET"
-                and (self.path == "/pair" or _sheet_id(page) is not None or _consent_sheet_id(page) is not None
+                and (self.path == "/pair" or self.path == "/" or _sheet_id(page) is not None or _consent_sheet_id(page) is not None
                      or _dispatch_sheet_id(page) is not None or page == _COORD_SHEET)
                 and self.headers.get("Sec-Fetch-Site") == "cross-site"
                 and self.headers.get("Sec-Fetch-Mode") == "navigate"

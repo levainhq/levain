@@ -104,3 +104,20 @@ def test_the_old_listener_redirects_to_the_bare_origin_the_cockpit_now_serves() 
     calls = _calls(f"https://localhost/#phone_token={SECRET}&sign={RID}&v={V}", "https://box.ts.net")
     assert calls == [["replaceState", "/"], ["replace", f"https://box.ts.net/sign/{RID}#v={V}"]], calls
     assert SECRET not in json.dumps(calls)
+
+
+def test_an_old_phone_link_opened_cross_site_still_reaches_the_landing_page(home, tmp_path) -> None:
+    """L3 r1 (codex HIGH): a link tapped in a message or a mail page is a cross-site top-level navigation to ``/``; the
+    shared read preamble refused it before the page that moves the link could load."""
+    nav = {"Host": RP, "Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
+    with _serving(tmp_path / "inst", signer=_signer(home), extra_hosts=[RP]) as (url, _httpd):
+        def get(path: str, headers: "dict[str, str]") -> int:
+            try:
+                with urlopen(Request(url + path, headers=headers), timeout=10) as r:
+                    return r.status
+            except HTTPError as exc:
+                return exc.code
+        assert get("/", nav) == 200
+        assert get("/?x=1", nav) == 403                                  # exact raw path only
+        assert get("/", {**nav, "Sec-Fetch-Dest": "iframe"}) == 403      # a cross-site frame stays refused
+        assert get("/cockpit/board.json", nav) == 403                    # no other path opens
