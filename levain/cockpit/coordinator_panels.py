@@ -5,7 +5,9 @@ All are READ-ONLY views over the coordinator store (``dispatch.db`` in the dispa
 ``levain.coordinator`` already computes: the queue is :func:`levain.coordinator.review.list_items`, the "waiting on
 you" line is :func:`levain.coordinator.review.waiting_on_you` and the morning card is
 :func:`levain.coordinator.morning.card`, the data ``levain coord morning`` prints. Nothing here recomputes any of
-them, and nothing here decides anything: every row names the command that does, which is yours.
+them, and nothing here decides anything: every row names the command that does, which is yours. The status panel
+offers Start, Stop and Hold (:data:`levain.cockpit.coordinator_status.COORD_VERBS`); their writes are
+:mod:`levain.cockpit.coordinator_verbs`', registered by the server, never a read here.
 
 The panels exist only while the coordinator's tables are in ``dispatch.db`` (a discoverer registered with ``retire``;
 the file alone proves nothing, the job store shares it): an install that never used the coordinator draws neither,
@@ -282,7 +284,8 @@ def coordinator_discoverer(directory: Callable[[], Path | str | None], *,
         return [
             ProviderSpec(coordinator_status.COORD_STATUS_ID, "list", "Coordinator", "gate",
                          coordinator_status.status_reader(directory, clock), region="operate", rank=20,
-                         order="legacy.source", version_fields=("*",), size="medium", span=1),
+                         order="legacy.source", version_fields=("*",), size="medium", span=1,
+                         verbs=coordinator_status.COORD_VERBS),
             ProviderSpec(MORNING_ID, "list", "Coordinator morning card", "gate", morning_read, region="operate",
                          rank=21, order="legacy.source", version_fields=("*",), size="medium", span=1,
                          empty="Nothing waits after the night."),
