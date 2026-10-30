@@ -62,11 +62,12 @@ def _signed(src: Any, qdir: Path) -> Iterator[tuple[int, Any]]:
         t.join(timeout=5)
 
 
-def test_without_a_signer_no_push_route_is_served(rig) -> None:
+def test_without_a_signer_only_the_app_shell_is_served(rig) -> None:
     src, _ = rig
     with _serve(src) as (port, _):
-        for path in ("/sw.js", "/app.webmanifest", "/webpush/key"):
-            assert _call(port, "GET", path, token=T)[0] == 404, path
+        for path in ("/sw.js", "/app.webmanifest", "/icon-192.png", "/apple-touch-icon.png"):
+            assert _call(port, "GET", path)[0] == 200, path          # W1a: the shell needs no Signer and no token
+        assert _call(port, "GET", "/webpush/key", token=T)[0] == 404
         assert _call(port, "POST", "/webpush/subscribe", _sub(), token=T)[0] == 404
 
 
