@@ -26,6 +26,9 @@ def register(subparsers) -> None:
     t = common(sub.add_parser("test", help="Send a test ping to every live subscription."))
     t.add_argument("--title", default="levain ping test")
     t.add_argument("--body", default="This is a test from `levain ping test`; it asks nothing of you.")
+    t.add_argument("--device", default=None, metavar="d-ID",
+                   help="Send only to this paired device's subscriptions (a cockpit device id, as `levain cockpit "
+                        "pair --list` prints it).")
     t.set_defaults(func=_test)
     r = common(sub.add_parser("record", help="The notification record: pings, their deliveries and opens."))
     r.add_argument("--json", action="store_true")
@@ -154,7 +157,10 @@ def _test(args: argparse.Namespace) -> int:
     from levain.webpush import sender
 
     qdir = _qdir(args)
-    results = sender.send(qdir, kind="test", ref=None, title=args.title, body=args.body)
+    device = args.device
+    if device is not None and not device.startswith("paired-"):
+        device = "paired-" + device
+    results = sender.send(qdir, kind="test", ref=None, title=args.title, body=args.body, device=device)
     if not results:
         print("no live subscription: turn notifications on from the phone page first")
         return 1

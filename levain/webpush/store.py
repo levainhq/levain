@@ -68,22 +68,25 @@ def paired_device_live(journal: "str | Path | None", device_id: str) -> bool:
     return row is not None and row[0] is None
 
 
-def live_rows(conn: sqlite3.Connection, *, first: bool = False) -> list[dict[str, Any]]:
+def live_rows(conn: sqlite3.Connection, *, first: bool = False, device: str | None = None) -> list[dict[str, Any]]:
     """The live subscriptions, by the one rule every reader uses (the gate's :func:`levain.webpush.live` and the
     send's :meth:`PushStore.live_subscriptions`): not retired, and its device live in its own authority, a row of
     ``devices`` not revoked, or for a ``paired-`` device, unrevoked in the cockpit journal the row names, asked now.
-    A device no authority holds is not live. ``first`` stops at the first live one."""
+    A device no authority holds is not live. ``first`` stops at the first live one; ``device`` keeps only that
+    device's rows, so only they reach the per-device liveness check."""
     out: list[dict[str, Any]] = []
     asked: dict[tuple[Any, str], bool] = {}
     for r in conn.execute("SELECT s.*, d.id AS _dev, d.revoked_at AS _dev_revoked FROM subscriptions s "
-                          "LEFT JOIN devices d ON d.id = s.device_id WHERE s.retired_at IS NULL ORDER BY s.id"):
+                          "LEFT JOIN devices d ON d.id = s.device_id WHERE s.retired_at IS NULL "
+                          + ("" if device is None else "AND s.device_id = ? ") + "ORDER BY s.id",
+                          () if device is None else (device,)):
         row = dict(r)
         dev, dev_revoked = row.pop("_dev"), row.pop("_dev_revoked")
-        device = row.get("device_id") or ""
-        if device.startswith(PAIRED_PREFIX):
-            key = (row.get("journal"), device)
+        owner = row.get("device_id") or ""
+        if owner.startswith(PAIRED_PREFIX):
+            key = (row.get("journal"), owner)
             if key not in asked:
-                asked[key] = paired_device_live(row.get("journal"), device)
+                asked[key] = paired_device_live(row.get("journal"), owner)
             ok = asked[key]
         else:
             ok = dev is not None and dev_revoked is None
@@ -280,10 +283,10 @@ class PushStore:
             return c.execute("UPDATE subscriptions SET retired_at = ? WHERE endpoint = ? AND retired_at IS NULL",
                              (now_stamp(), endpoint)).rowcount > 0
 
-    def live_subscriptions(self) -> list[dict[str, Any]]:
+    def live_subscriptions(self, *, device: str | None = None) -> list[dict[str, Any]]:
         # a subscription whose device was revoked is not live even if a revoke left its row unretired (live_rows)
         with self.read() as c:
-            return live_rows(c)
+            return live_rows(c, device=device)
 
     # --- the record ----------------------------------------------------------------------------------
     def add_ping(self, kind: str, ref: str | None, title: str, body: str, command: bool | None = None, *,

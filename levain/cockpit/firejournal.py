@@ -46,6 +46,8 @@ from levain.cockpit.consent import (
     record_sha256,
     utc_stamp,
 )
+from levain.cockpit.shortcode import (SHORT_ALPHABET, SHORT_LENGTH, SHORT_MAX_FAILURES, SHORT_PAIRING_TTL,
+                                       display_short, normalize_short)
 from levain.autonomic.durable_sqlite import MIN_SQLITE, open_durable, read_transaction, write_transaction
 
 _OPERATION_ID = re.compile(r"cp[0-9a-f]{32}")
@@ -139,6 +141,12 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS pair_offers ("
     " code_hash TEXT PRIMARY KEY, label TEXT NOT NULL, minted_by TEXT NOT NULL,"
     " expires TEXT NOT NULL, used_at TEXT)",
+    # the typed short code (W1b): at most ONE row, so "newest only" and "a new mint clears the misses" are one statement,
+    # and a short code is never a row ``redeem_offer`` can read. ``label`` is NOT NULL: a redemption copies it into
+    # ``paired_devices.label``
+    "CREATE TABLE IF NOT EXISTS pair_short_offer ("
+    " slot INTEGER PRIMARY KEY CHECK (slot = 1), code_hash TEXT NOT NULL, label TEXT NOT NULL,"
+    " minted_by TEXT NOT NULL, expires TEXT NOT NULL, used_at TEXT, misses INTEGER NOT NULL DEFAULT 0)",
     # who may sign is a verified replay of this log (levain.authority), never a stored projection
     AUTHORITY_SCHEMA,
     "CREATE INDEX IF NOT EXISTS pendings_waiting ON pendings (state, expires_at)",
@@ -1148,6 +1156,58 @@ class CockpitDB:
                          (device_id, row["label"], _sha256(token), stamp, row["minted_by"]))
         return device_id, token
 
+    def mint_short_offer(self, *, label: Any, minted_by: str, now: datetime) -> str:
+        """A typed pairing code (8 Crockford characters, ``SHORT_PAIRING_TTL``) minted by ``minted_by``, returned in
+        its display form ``XXXX-XXXX``. It replaces the one row of ``pair_short_offer``, so only the newest redeems and
+        its misses restart; ``pair_offers`` is never touched. The label is cleaned as :meth:`mint_offer` cleans it."""
+        import secrets
+
+        clean = _clean_label(label)
+        if not isinstance(minted_by, str) or not minted_by or ":" in minted_by:
+            raise PairingError(f"minted_by {minted_by!r} is empty or holds ':'")
+        code = "".join(secrets.choice(SHORT_ALPHABET) for _ in range(SHORT_LENGTH))
+        with self.write() as conn:
+            if _device_revoked(conn, minted_by):
+                raise DeviceRevoked(f"{minted_by} is revoked: it mints no offer")
+            conn.execute("INSERT OR REPLACE INTO pair_short_offer (slot, code_hash, label, minted_by, expires, used_at, "
+                         "misses) VALUES (1, ?, ?, ?, ?, NULL, 0)",
+                         (_sha256(code), clean, minted_by, utc_stamp(now + SHORT_PAIRING_TTL)))
+        return display_short(code)
+
+    def redeem_short(self, code: Any, *, now: datetime) -> "tuple[str, str] | None":
+        """Spend the live short code: ``(device_id, token)``, or None for anything else. A malformed code, and a
+        journal with no live short row, are answered from a read (no write lock). Under the write lock the row is
+        re-read and re-checked; a wrong code adds one miss, and the ``SHORT_MAX_FAILURES``th kills the code."""
+        import hmac
+        import secrets
+
+        typed = normalize_short(code)
+        if typed is None:
+            return None
+        stamp = utc_stamp(now)
+        with self.read() as conn:
+            seen = conn.execute("SELECT used_at, expires, misses FROM pair_short_offer WHERE slot = 1").fetchone()
+        if seen is None or seen["used_at"] is not None or seen["expires"] <= stamp or seen["misses"] >= SHORT_MAX_FAILURES:
+            return None
+        with self.write() as conn:
+            row = conn.execute("SELECT code_hash, label, minted_by, expires, used_at, misses FROM pair_short_offer "
+                               "WHERE slot = 1").fetchone()
+            if (row is None or row["used_at"] is not None or row["expires"] <= stamp
+                    or row["misses"] >= SHORT_MAX_FAILURES):
+                return None
+            if _device_revoked(conn, row["minted_by"]):
+                return None
+            if not hmac.compare_digest(_sha256(typed), row["code_hash"]):
+                conn.execute("UPDATE pair_short_offer SET misses = misses + 1 WHERE slot = 1")
+                return None
+            conn.execute("UPDATE pair_short_offer SET used_at = ? WHERE slot = 1", (stamp,))
+            token = secrets.token_urlsafe(32)
+            device_id = "d-" + secrets.token_hex(6)
+            conn.execute("INSERT INTO paired_devices (id, label, token_hash, created, last_seen, revoked_at, "
+                         "paired_by) VALUES (?, ?, ?, ?, NULL, NULL, ?)",
+                         (device_id, row["label"], _sha256(token), stamp, row["minted_by"]))
+        return device_id, token
+
     def verify_device(self, token: str, *, now: datetime) -> str | None:
         """The id of the unrevoked device ``token`` belongs to, or None (unknown or revoked): one indexed lookup of
         its SHA-256, a read and nothing else. ``now`` is unused here (kept for the caller's one clock); the
@@ -1223,6 +1283,8 @@ class CockpitDB:
                     continue
                 name = PAIRED_PREFIX + member
                 conn.execute("UPDATE pair_offers SET expires = ? WHERE minted_by = ? AND used_at IS NULL "
+                             "AND expires > ?", (stamp, name, stamp))
+                conn.execute("UPDATE pair_short_offer SET expires = ? WHERE minted_by = ? AND used_at IS NULL "
                              "AND expires > ?", (stamp, name, stamp))
                 conn.execute("INSERT OR IGNORE INTO tokens (name, generation) VALUES (?, 1)", (name,))
                 (gen,) = conn.execute("SELECT generation FROM tokens WHERE name = ?", (name,)).fetchone()

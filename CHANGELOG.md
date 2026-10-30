@@ -6,6 +6,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+- **The cockpit's owner key opens nothing off the box.** On a server bound to anything but loopback, and on a loopback
+  server reached through a proxy (an extra host, a forwarded-for or Tailscale header), a request carrying the owner
+  key is answered as if it carried no credential. Its 403 now says `"auth": "pair"` (a loopback request says
+  `"auth": "owner"`), and the manifest's `transport` gains `owner_key`, so a page knows to ask for a pairing code
+  rather than the key. `levain serve` no longer prints the owner key or puts it in the unlocked link on an
+  off-loopback bind; it prints how to pair a device instead. Not run by hand against a real proxied cockpit.
+
 ### Fixed
 - **A cockpit with no question store no longer draws the Needs you band, or a note that it could not be recorded.** An
   absent `questions.db` (no file, or an empty one) draws nothing in the band: no heading and no note, because nothing was
@@ -25,6 +33,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   refusal says to. Other routes (brokered, Codex) are not checked.
 
 ### Added
+- **Short pairing codes for the cockpit, and a test ping.** `POST /cockpit/pair/offer {"short": true}` mints a typed
+  code (`XXXX-XXXX`, one use, 10 minutes, five wrong tries kill it, a newer short code replaces it) and
+  `POST /cockpit/pair/claim {"short": "<typed>"}` spends it; the link form is unchanged and a code of one kind never
+  redeems as the other. `levain cockpit pair --short` mints one on the box; `--list` shows the paired devices and
+  `--revoke <id> [<id> ...]` revokes devices and the devices they paired, both reading the journal directly with no
+  cockpit credential. `GET /cockpit/pair/devices.json` rows carry `subscribed`. `POST /webpush/test` sends a test
+  ping to the calling paired device's subscriptions only, and `levain ping test --device d-...` does the same from the
+  box. Covered by tests; not run against a real phone.
 - **Every presence word an agent sets, replaces or is refused now leaves a row you can read.** `levain ping log` prints
   `<queue dir>/webpush/presence.log.jsonl` (who, which role, the word, the quote, the word it found, the outcome); an agent's
   write is not made when its row cannot be written, your own word always goes through. `levain coord morning` adds a
