@@ -178,8 +178,9 @@ def _presence(qdir: Path) -> dict[str, Any] | None:
     from levain.webpush import presence
 
     word = presence.read_word(qdir)
-    setter = word if word is not None and "by" in word else None
-    cutoff = time.time() - PRESENCE_WINDOW_SECS
+    now = time.time()
+    setter = word if word is not None and "by" in word and not presence.is_expired(word, now) else None
+    cutoff = now - PRESENCE_WINDOW_SECS
     recent = [r for r in presence.read_log(qdir) if r["ts"] >= cutoff and isinstance(r.get("by"), dict)]
     refused = sum(1 for r in recent if r["outcome"] == "refused")
     if setter is None and not refused:
