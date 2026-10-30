@@ -722,8 +722,11 @@
     const wantsToken = !!(manifest && manifest.transport && manifest.transport.write_token_required === true
       && cred && cred.class === "none");
     if (wantsToken && !passive && !tokenDeclined) {
-      if (promptForToken()) manifest = await authedReadJson("/cockpit/manifest.json");
-      else { tokenDeclined = true; if (storedToken() === usedToken) dropToken(); }   // not a newer token another tab (or an earlier page of this tab) stored meanwhile
+      // a newer token stored meanwhile (another tab, an earlier page of this tab) is read with, never prompted over: the prompt
+      // itself drops a paired device's token first, so the comparison has to come before it
+      if (storedToken() !== usedToken) manifest = await authedReadJson("/cockpit/manifest.json");
+      else if (promptForToken()) manifest = await authedReadJson("/cockpit/manifest.json");
+      else { tokenDeclined = true; if (storedToken() === usedToken) dropToken(); }   // a decline drops the token it read with, not a newer one
     }
     const fetchedAt = Date.now();
     const ids = Object.keys(manifest.panels);

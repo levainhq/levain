@@ -64,6 +64,7 @@ let id = 0; const pend = new Map(); const posts = []; const trail = [];   // tra
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
+  if (trail.length > 50) trail.shift();          // a page refused in a loop keeps its last 50
   if (d.method === "Page.javascriptDialogOpening") trail.push(`dialog declined: ${d.params.type} ${String(d.params.message).slice(0, 80)}`);
   if (d.method === "Network.requestWillBeSent" && d.params.request.method === "POST") {
     posts.push(d.params.request.url.replace(/^https?:\/\/[^/]+/, "") + " " + (d.params.request.postData || ""));
