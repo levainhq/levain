@@ -158,6 +158,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_dispatch_verifiers())
     core.extend(_check_slot_isolation())
     core.extend(_check_vendor_copies())
+    core.extend(_check_slot_homes())
     core.extend(_check_slot_limits())
     core.extend(_check_slot_keys())
     core.extend(_check_slot_services())
@@ -580,6 +581,79 @@ def _check_vendor_copies(*, host: str | None = None, store: Path | None = None, 
         return [CheckResult("agent vendor CLIs", True, "; ".join(parts), warn=True,
                             hint="A copy with no vendor to compare it with keeps running as it is; repair leaves it.")]
     return [CheckResult("agent vendor CLIs", True, "; ".join(parts))]
+
+
+_SLOT_HOMES = "agent slot homes"
+_SLOT_HOMES_FIX = "Run `levain upgrade --no-pip`: its repair makes the vendor home and points the accounts at it."
+
+
+def _check_slot_homes(*, host: str | None = None, store: Path | None = None, getpwnam: Any = None,
+                      lstat: Any = None, listdir: Any = None) -> list[CheckResult]:
+    """The ``agent slot homes`` row (macOS, R7): every in-service slot account a vendor CLI runs as
+    (``accounts.vendor_runs_as``) has the root-owned ``L/vendorhome`` as its directory-record home, and that tree is
+    root's, 0755, not a link, its ``Library/Preferences`` empty. With a ``/var/empty`` home Codex's managed-preferences
+    sync fails, so a ChatGPT-login session fails ``account/read`` -32603. Read as the operator; a fact that cannot be
+    read is a warning, never green. No row on Linux or with no isolation install."""
+    import pwd
+
+    from levain.slot import accounts as A
+    from levain.slot import layout
+    from levain.slot import records as R
+    from levain.slot.ids import SlotId
+
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    home = layout.vendor_home(host)
+    store = store if store is not None else layout.STORE.get(host)
+    if home is None or store is None or not os.path.lexists(store):
+        return []
+    if store != layout.STORE[host]:
+        home = store / home.relative_to(layout.STORE[host])
+    getpwnam = getpwnam or pwd.getpwnam
+    lstat = lstat or os.lstat
+    listdir = listdir or os.listdir
+    try:
+        tags, _ignored = _read_slot_dirs(store / "slots")
+    except OSError as exc:
+        return [CheckResult(_SLOT_HOMES, True, f"the slots could not be read ({_slot_why(exc)})", warn=True)]
+    names = [n for tag, (kind, _) in tags.items() if kind not in R.OUT_OF_SERVICE
+             for n in SlotId("egress" if tag[0] == "e" else "none", int(tag[1:])).accounts if A.vendor_runs_as(n)]
+    tree: list[str] = []
+    try:
+        for p in (home, home / "Library", home / "Library" / "Preferences"):
+            try:
+                st = lstat(str(p))
+            except FileNotFoundError:
+                tree.append(f"{p} is missing")
+                break
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o755:
+                tree.append(f"{p} is not a root-owned 0755 directory")
+        else:
+            inside = listdir(str(home / "Library" / "Preferences"))
+            if inside:
+                tree.append(f"{home / 'Library' / 'Preferences'} is not empty ({', '.join(sorted(inside)[:3])})")
+    except OSError as exc:
+        return [CheckResult(_SLOT_HOMES, True, f"{home} could not be read ({_slot_why(exc)})", warn=True)]
+    wrong, unread = [], []
+    for n in names:
+        try:
+            got = getpwnam(n).pw_dir
+        except (KeyError, OSError) as exc:
+            unread.append(f"{n} ({type(exc).__name__})")
+            continue
+        if got != str(home):
+            wrong.append(f"{n} home is {got}")
+    if unread:
+        return [CheckResult(_SLOT_HOMES, True, f"the account record of {', '.join(unread)} could not be read",
+                            warn=True)]
+    if tree or wrong:
+        detail = "; ".join(tree + wrong)
+        if wrong:
+            detail += ": Codex sessions with a ChatGPT login fail -32603"
+        return [CheckResult(_SLOT_HOMES, True, detail, warn=True, hint=_SLOT_HOMES_FIX)]
+    if not names:
+        return [CheckResult(_SLOT_HOMES, True, f"no in-service slot account; {home} is in place")]
+    return [CheckResult(_SLOT_HOMES, True, f"{len(names)} vendor accounts have {home} (root's, empty)")]
 
 
 def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResult]:

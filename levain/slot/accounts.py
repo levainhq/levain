@@ -1,8 +1,9 @@
 """Account and group plans per OS (CONTRACT §1.1, §1.2), as :class:`~levain.firing.hands.Step` lists.
 
 Every account: a primary group of its own name with ``gid == uid``, no login shell, password locked,
-hidden (macOS) or in the system range (Linux), no home. Supplementary membership is EXACTLY the
-§1.2 table, derived per account by :func:`supplementary_groups`.
+hidden (macOS) or in the system range (Linux). Its home is ``NO_HOME``, except on macOS the accounts that exec a
+vendor CLI (:func:`vendor_home_of`), whose home is root's empty ``L/vendorhome``. Supplementary membership is EXACTLY
+the §1.2 table, derived per account by :func:`supplementary_groups`.
 """
 from __future__ import annotations
 
@@ -11,7 +12,8 @@ from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
 
 from levain.firing.hands import HostOS, Step, _abs, _absent, _darwin_leave_groups, _nologin
 from levain.slot import Refused
-from levain.slot.ids import SINGLETONS, SLOT_NAME_RE, Allocation, is_levain_account
+from levain.slot.ids import SINGLETONS, SLOT_NAME_RE, Allocation, SlotId, is_levain_account
+from levain.slot.layout import vendor_home
 
 if TYPE_CHECKING:
     from levain.slot.removal import Live
@@ -22,6 +24,28 @@ SLOT_MARKER = "Levain session account"
 SLOT_RETIRED_MARKER = {"darwin": "Levain session account (retired)", "linux": "Levain session account,retired"}
 
 NO_HOME = {"darwin": "/var/empty", "linux": "/nonexistent"}
+
+#: The slot-name prefixes of the accounts a session execs a vendor CLI as: an egress slot's ``_levain_s<n>`` and a
+#: verifier pair's child ``_levain_c<n>`` (``ids._PREFIXES``). Fronts and drivers never exec one.
+VENDOR_PREFIXES = ("s", "c")
+
+
+def vendor_runs_as(name: str) -> bool:
+    """Whether a session execs a vendor CLI as ``name`` (:data:`VENDOR_PREFIXES`)."""
+    m = SLOT_NAME_RE.fullmatch(name)
+    return m is not None and is_levain_account(name) and m.group(1) in VENDOR_PREFIXES
+
+
+def vendor_home_of(host: HostOS, name: str) -> str | None:
+    """The home ``name``'s directory record holds when it is not ``NO_HOME``: on macOS, ``layout.vendor_home`` for an
+    account a vendor runs as (R7: Codex's managed-preferences sync fails with a ``/var/empty`` home, and a ChatGPT
+    login's ``account/read`` then fails -32603). None for every other account and on Linux."""
+    home = vendor_home(host)
+    return str(home) if home is not None and vendor_runs_as(name) else None
+
+
+def home_of(host: HostOS, name: str) -> str:
+    return vendor_home_of(host, name) or NO_HOME[host]
 
 #: CONTRACT §1.2: the shared groups each singleton is in. A primary group stays its account's only: keys gives its
 #: admin socket a group itself (not root), which only a member may do, so that socket's group is the shared
@@ -114,7 +138,8 @@ def account_steps(host: HostOS, accounts: Sequence[Account]) -> list[Step]:
                 Step(f"make {a.name}'s own group its primary group",
                      (*_DSCL, "-create", u, "PrimaryGroupID", str(a.gid))),
                 Step(f"give {a.name} no login shell", (*_DSCL, "-create", u, "UserShell", "/usr/bin/false")),
-                Step(f"give {a.name} no home", (*_DSCL, "-create", u, "NFSHomeDirectory", NO_HOME[host])),
+                Step(f"give {a.name} the root-owned vendor home" if vendor_home_of(host, a.name)
+                     else f"give {a.name} no home", (*_DSCL, "-create", u, "NFSHomeDirectory", home_of(host, a.name))),
                 Step(f"label {a.name}", (*_DSCL, "-create", u, "RealName", SLOT_MARKER)),
                 Step(f"hide {a.name} from the login window", (*_DSCL, "-create", u, "IsHidden", "1")),
                 Step(f"give {a.name} no password", (*_DSCL, "-create", u, "Password", "*")),
@@ -136,6 +161,30 @@ def account_steps(host: HostOS, accounts: Sequence[Account]) -> list[Step]:
             ]
         else:
             raise Refused("unsupported-host", repr(host))
+    return steps
+
+
+#: ``$1`` = the account. pkill exits 1 when no process matched: a user with no cfprefsd running has nothing to re-read,
+#: so that is success; 2 (bad options) and 3 (internal error) stay failures.
+_END_CFPREFSD = '/usr/bin/pkill -u "$1" -x cfprefsd; [ "$?" -le 1 ]'
+
+
+def vendor_home_steps(host: HostOS, slots: Iterable[SlotId]) -> list[Step]:
+    """Repair's re-point (R8, after the rows that make ``L/vendorhome``): each in-service slot's vendor-running account
+    (:func:`vendor_runs_as`) gets the home :func:`account_steps` gives a fresh one, then the directory cache is
+    flushed once and each such account's cfprefsd is ended, so the next session resolves the new home. Every step is
+    idempotent: an account already pointed is pointed again. It changes one attribute of accounts repair has already
+    proved live (``install_helper._check_rendered_accounts``); repair still creates and removes none. Linux: none."""
+    if vendor_home(host) is None:
+        return []
+    names = [n for s in slots for n in s.accounts if vendor_runs_as(n)]
+    if not names:
+        return []
+    steps = [Step(f"point {n}'s home at the root-owned vendor home",
+                  (*_DSCL, "-create", f"/Users/{n}", "NFSHomeDirectory", home_of(host, n))) for n in names]
+    steps.append(Step("flush the directory cache, so the new homes are read", ("/usr/bin/dscacheutil", "-flushcache")))
+    steps += [Step(f"end {n}'s cfprefsd, so it re-reads the home (none running is success)",
+                   ("/bin/sh", "-c", _END_CFPREFSD, "sh", n)) for n in names]
     return steps
 
 
@@ -231,9 +280,9 @@ def tombstone_steps(host: HostOS, name: str) -> list[Step]:
 
 
 __all__ = ["Account", "Group", "LeaveGroupsStep", "OPERATOR_GROUPS", "SINGLETONS", "SLOT_MARKER", "SLOT_RETIRED_MARKER",
-           "accounts_of", "account_steps", "group_members", "membership_pairs",
+           "VENDOR_PREFIXES", "accounts_of", "account_steps", "group_members", "home_of", "membership_pairs",
            "membership_steps", "revive_steps", "shared_group_steps", "shared_groups_of", "supplementary_groups",
-           "tombstone_steps"]
+           "tombstone_steps", "vendor_home_of", "vendor_home_steps", "vendor_runs_as"]
 
 
 # --- row 33 R1b: removal by the RECORDED identity (§1.1 table rows 3-5) -------------------------------------------

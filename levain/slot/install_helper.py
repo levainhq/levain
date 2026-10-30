@@ -56,7 +56,8 @@ from levain.slot.intent import (INSTALL_LOCK, INTENT_PATH, Intent, install_lock,
 from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Group, account_steps, accounts_of,
                                   membership_pairs, membership_steps, revive_steps,
                                   shared_group_steps, shared_groups_of, member_state, group_state, uid_retires,
-                                  account_state, remove_member_steps, remove_group_steps, remove_account_steps)
+                                  account_state, remove_member_steps, remove_group_steps, remove_account_steps,
+                                  vendor_home_steps)
 from levain.slot.grammar import (KEY_TYPE_NAMES, LEASE_EXEMPT, PUBLIC_KEY_RE, ROUTES_REPLACE_INTENT, SESSION_RE, VERBS,
                                  InstallCommand, check_roots, parse_install_argv)
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
@@ -1736,7 +1737,9 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     steps += F("R7", [*membership_steps(host, missing_pairs),                                     # R7
                       *removals("R7")])             # R1b: members, then groups (gid retired first), then accounts
     steps += F("R8", [*removals("R8"),              # R1b: the confinement kinds' removals first, then the re-render
-                      *row_steps(host, rows), *reserve_steps(host), *base_routes_steps(host),     # R8
+                      # R7 (macOS): the vendor accounts re-pointed at L/vendorhome once the rows have made it
+                      *row_steps(host, rows), *vendor_home_steps(host, slots),
+                      *reserve_steps(host), *base_routes_steps(host),     # R8
                       *base_routes_merge_steps(host),
                       *single_filesystem_steps(host, slots), *confinement])
     if rf.current != target:
