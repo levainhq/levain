@@ -1564,6 +1564,7 @@
     for (const old of document.querySelectorAll("#ck-hero > .ck-region-err")) old.remove();   // a clean hero render clears its last error line
     guardRegion("the hero", () => renderHero(view, byId), regionErr("ck-hero", false), restoreHero);
     guardRegion("the brief", () => renderBriefRegion(view, byId), regionErr("ck-brief", true), restoreState);
+    guardRegion("the coordinator drop", () => renderDropHero(), regionErr("ck-drop", false));
     guardRegion("the needs strip", () => renderNeeds(view), regionErr("ck-needs", true));
     guardRegion("the notes strip", () => renderNotes(view), regionErr("ck-notes", true));
     guardRegion("the widgets", () => renderWidgets(view, byId), regionErr("ck-widgets", true));
@@ -6637,51 +6638,197 @@
     return openSheet("/sign/dispatch/" + encodeURIComponent(id), version, choice, "dispatch job");
   }
   // OS-2: the sheet over a coordinator drop (/sign/drop): words, and optionally an envelope the passkey signs there
-  function openDropSheet() {
-    return openSheet("/sign/drop", "", "", "coordinator drop");
+  function openDropSheet(words) {
+    // the typed words reach the sheet through this tab's session storage (same origin, no length limit, never in the address);
+    // the sheet reads them once and removes them
+    try { if (typeof words === "string" && words) window.sessionStorage.setItem(DROP_PREFILL_KEY, words); } catch (e) { /* the sheet opens empty */ }
+    const got = openSheet("/sign/drop", "", "", "coordinator drop");
+    if (!got) { try { window.sessionStorage.removeItem(DROP_PREFILL_KEY); } catch (e) { /* nothing kept */ } }
+    return got;
   }
-  // the drop card: shown only while /cockpit/coord/drops.json reads (a token, a Signer, a store that answers); the Send a drop
-  // button opens the sheet, which sends and signs nothing from this page
-  // the coordinator read goes through the shared bounded read queue and is held for a moment, as the dispatch read is: rapid
-  // redraws share one read
-  let dropRead = null, dropAt = 0, dropSlotNow = null;
-  function dropFetch(headers) {
-    if (dropRead && Date.now() - dropAt < PROPOSAL_TTL_MS) return dropRead;
+  // ---- the coordinator drop: the HERO of the home page (Phill 10-30), drawn inside #ck-hero under the now band. An inline
+  // composer, not a button that opens a sheet. Send posts through /cockpit/coord/drop, the route the /sign/drop sheet posts to,
+  // with the same request (words, outbox_id, sent_at, store_id) and the same kept-before-posted rule; an envelope needs the
+  // passkey, which signs on the sheet only, so "Add an envelope" opens the sheet with the words.
+  const DROP_PREFILL_KEY = "levain-drop-prefill";
+  const dropPendKey = () => "levain-drop-pending:" + window.location.hostname;   // the sheet's own key: one kept drop for both
+  const dropKept = () => {
+    try {
+      const v = JSON.parse(window.localStorage.getItem(dropPendKey()) || "null");
+      return v && typeof v === "object" && typeof v.outbox_id === "string" && typeof v.words === "string" ? v : null;
+    } catch (e) { return null; }
+  };
+  const dropKeep = (req) => { try { window.localStorage.setItem(dropPendKey(), JSON.stringify(req)); } catch (e) { /* kept in this visit only */ } };
+  const dropForget = () => { try { window.localStorage.removeItem(dropPendKey()); } catch (e) { /* nothing kept */ } };
+  const dropStamp = () => new Date().toISOString().replace(/\.(\d{3})Z$/, ".$1000Z");   // the store's fixed-width UTC form
+  const dropOutboxId = () => {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    return "ph-" + Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  };
+  const DROP_RECENT_SHOWN = 3;
+  // the read goes through the shared bounded read queue and is held for a moment: rapid redraws share one read. Resolves to
+  // {body} or {why} (one line saying what is missing), never to nothing.
+  let dropRead = null, dropAt = 0;
+  function dropFetch(headers, fresh) {
+    if (!fresh && dropRead && Date.now() - dropAt < PROPOSAL_TTL_MS) return dropRead;
     dropAt = Date.now();
     const got = consentQueued(() => fetchBounded("/cockpit/coord/drops.json", { cache: "no-store", headers: headers },
-      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.coord_drops) ? b : null), () => null) : null),
-      () => null), "the drops could not be read").then((b) => {
-        if (!b || !Array.isArray(b.coord_drops)) { if (dropRead === got) dropRead = null; return null; }
-        return b;
+      (res) => {
+        if (res.status === 404) return { why: "This cockpit has no coordinator store to send to (no signing is set up here)." };
+        if (res.status === 403) return { why: "Sign in to send: this cockpit refused this browser's token." };
+        if (!res.ok) return { why: "The coordinator could not be read (HTTP " + res.status + ")." };
+        return res.json().then((b) => (b && Array.isArray(b.coord_drops) ? { body: b } : { why: "The coordinator's answer was not a drop list." }),
+                               () => ({ why: "The coordinator's answer could not be read." }));
+      },
+      () => ({ why: "The coordinator could not be reached." })), "the drops could not be read").then((r) => {
+        const out = r && (r.body || r.why) ? r : { why: ((r && r.error) || "The coordinator could not be read") + "." };
+        if (!out.body && dropRead === got) dropRead = null;      // a failed read is asked again at the next draw
+        return out;
       });
     dropRead = got;
     return got;
   }
-  function dropSlot() {
-    const slot = el("div", "coord-drop-slot");
+  function dropWhen(d) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(typeof d.sent_at === "string" ? d.sent_at : "");
+    return m ? m[2] + "-" + m[3] + " " + m[4] + ":" + m[5] + "Z" : "";
+  }
+  function dropRow(d) {
+    const row = el("div", "drop-recent-row");
+    row.dataset.dropId = typeof d.drop_id === "string" ? d.drop_id : "";
+    row.appendChild(el("span", "drop-when ext-meta", dropWhen(d)));
+    const first = typeof d.words === "string" ? d.words.split("\n")[0].slice(0, 100) : "";
+    row.appendChild(el("span", "drop-words-first", first));
+    const stages = Array.isArray(d.receipts) ? d.receipts.map((r) => r && r.stage).filter((x) => typeof x === "string") : [];
+    const how = d.envelope_id ? "signed" : d.envelope_refused ? "envelope not taken" : "unsigned";
+    row.appendChild(el("span", "drop-state ext-meta", how + " · " + (stages.join(", ") || "no receipt yet")));
+    return row;
+  }
+  function dropHeroBuild(host) {
+    const ui = { oid: null, storeId: null, storeRead: false, can: false, shown: false, working: false, drops: [] };
+    const head = el("div", "needs-headline");
+    head.appendChild(el("h3", null, "Drop to the coordinator"));
+    ui.say = el("span", "needs-gloss drop-note", "");
+    head.appendChild(ui.say);
+    const words = el("textarea", "drop-words");
+    words.id = "ck-drop-words";
+    words.placeholder = "words for the coordinator";
+    words.setAttribute("aria-label", "your words for the coordinator");
+    const acts = el("div", "needs-actions drop-actions");
+    const send = el("button", "needs-btn needs-primary", "Send");
+    send.type = "button";
+    send.dataset.coordDrop = "send";
+    const env = el("button", "needs-btn", "Add an envelope");
+    env.type = "button";
+    env.dataset.coordDrop = "envelope";
+    env.title = "sign an envelope with your passkey: opens the drop sheet with these words";
+    acts.append(send, env);
+    ui.receipt = el("p", "drop-receipt ext-meta", "");
+    ui.receipt.setAttribute("role", "status");
+    ui.recent = el("div", "drop-recent");
+    host.replaceChildren(head, words, acts, ui.receipt, ui.recent);
+    Object.assign(ui, { words, send, env });
+    const paint = (msg, bad) => { ui.receipt.textContent = msg; ui.receipt.classList.toggle("bad", !!bad); };
+    const lock = (on) => { ui.working = on; send.disabled = env.disabled = words.disabled = on || !ui.can; };
+    ui.paint = paint;
+    ui.lock = lock;
+    env.addEventListener("click", () => { if (ui.can) openDropSheet(words.value); });
+    send.addEventListener("click", () => {
+      if (ui.working || !ui.can) return;
+      const w = words.value;
+      if (!w.trim()) { paint("Type your words first.", true); words.focus(); return; }
+      const t = window.LevainCockpitTransport;
+      const headers = Object.assign({}, t && typeof t.headers === "function" ? t.headers() : {}, { "Content-Type": "application/json" });
+      // held for these words: a send whose answer was lost goes again with the same id and files once
+      const req = { words: w, outbox_id: ui.oid || (ui.oid = dropOutboxId()), sent_at: dropStamp(), store_id: ui.storeId };
+      dropKeep(req);
+      lock(true);
+      paint("Sending…", false);
+      const unsure = (why) => {
+        paint("Not sure the drop was delivered (" + why + "). Send again, unchanged, to find out.", true);
+        lock(false);
+      };
+      fetchBounded("/cockpit/coord/drop", { method: "POST", cache: "no-store", headers: headers, body: JSON.stringify(req) },
+        (res) => res.json().then((b) => ({ status: res.status, ok: res.ok, body: b && typeof b === "object" ? b : {} }),
+                                 () => ({ status: res.status, ok: res.ok, body: {} })),
+        () => ({ status: 0, ok: false, body: {} })).then((a) => {
+        if (a.ok) {
+          dropForget();
+          ui.oid = null;
+          if (typeof a.body.store_id === "string") ui.storeId = a.body.store_id;
+          const d = a.body.drop || {};
+          const first = w.split("\n")[0].trim().slice(0, 80) + (w.length > 80 || w.includes("\n") ? "…" : "");
+          words.value = "";
+          words.style.height = "";
+          paint((a.body.created === false ? "Already delivered: " : "Sent to the coordinator: ") + "“" + first + "” · words only · " + String(d.drop_id || ""), false);
+          lock(false);
+          words.focus();
+          dropRefresh(host, true);
+        } else if (a.status >= 400 && a.status < 500) {
+          dropForget();     // refused: nothing was delivered with this request; the words stay
+          ui.oid = null;
+          const m = typeof a.body.message === "string" && a.body.message ? a.body.message.replace(/[.\s]+$/, "") : "refused (HTTP " + a.status + ")";
+          paint("The drop was not delivered: " + m + ".", true);
+          lock(false);
+        } else {
+          unsure(a.status ? "HTTP " + a.status : "no reply");
+        }
+      });
+    });
+    host.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && ev.target === words) { ev.preventDefault(); send.click(); } });
+    const left = dropKept();
+    if (left) {       // a drop from an earlier visit whose answer never came: its words are in the box, to send unchanged
+      words.value = left.words;
+      ui.oid = left.outbox_id;
+      paint("A drop from earlier was not confirmed. Send it again, unchanged, to find out.", true);
+    }
+    host._drop = ui;
+    return ui;
+  }
+  // one draw of the hero from one read; the box and its words are never rebuilt under the reader
+  function dropHeroDraw(host, r) {
+    const ui = host._drop;
+    const body = r && r.body ? r.body : null;
+    ui.storeRead = !!body && body.coord_store_read === true;
+    ui.storeId = body && typeof body.coord_store_id === "string" ? body.coord_store_id : null;
+    ui.can = ui.storeRead;
+    const note = !body ? (r && r.why) || "The coordinator could not be read."
+      : !ui.storeRead ? (typeof body.coord_note === "string" && body.coord_note ? body.coord_note : "Still reading which Levain answers here; reload.")
+      : typeof body.coord_note === "string" ? body.coord_note : "";
+    ui.say.textContent = note;
+    ui.say.classList.toggle("bad", !ui.can);
+    ui.send.disabled = ui.env.disabled = ui.words.disabled = ui.working || !ui.can;
+    host.classList.toggle("drop-off", !ui.can);
+    const drops = body ? body.coord_drops : [];
+    ui.drops = drops;
+    const rows = drops.map(dropRow);
+    const shown = ui.shown ? rows : rows.slice(0, DROP_RECENT_SHOWN);
+    const kids = shown.slice();
+    if (rows.length > DROP_RECENT_SHOWN) {
+      const more = el("button", "needs-history drop-more", ui.shown ? "show fewer" : "show " + (rows.length - DROP_RECENT_SHOWN) + " more");
+      more.type = "button";
+      more.addEventListener("click", () => { ui.shown = !ui.shown; dropHeroDraw(host, r); });
+      kids.push(more);
+    }
+    ui.recent.replaceChildren(...kids);
+  }
+  function dropRefresh(host, fresh) {
     const t = window.LevainCockpitTransport;
     const headers = t && typeof t.headers === "function" ? t.headers() : {};
-    if (!headers["X-Levain-Write-Token"]) return slot;
-    dropSlotNow = slot;
-    dropFetch(headers).then((b) => {
-        if (!b || slot !== dropSlotNow) return;     // only the slot the latest render made is filled; an older one is gone
-        const row = el("div", "row consent-row coord-drop-row");
-        const head = el("div", "consent-head");
-        head.appendChild(el("b", "consent-tool", "drop"));
-        head.appendChild(el("span", "ext-meta", b.coord_drops.length + " recent from the phone port or this cockpit"));
-        row.appendChild(head);
-        const acts = el("div", "needs-actions");
-        const btn = el("button", "needs-btn", "Send a drop");
-        btn.type = "button";
-        btn.dataset.coordDrop = "open";
-        btn.title = "send words to the coordinator, optionally with an envelope your passkey signs, in the sign sheet";
-        btn.addEventListener("click", () => openDropSheet());
-        acts.appendChild(btn);
-        row.appendChild(acts);
-        if (typeof b.coord_note === "string" && b.coord_note) row.appendChild(el("div", "consent-note ext-meta", b.coord_note));
-        slot.replaceChildren(el("div", "ext-grouphead", "coordinator drop"), row);
-      }).catch(() => {});
-    return slot;
+    if (!headers["X-Levain-Write-Token"]) {
+      dropHeroDraw(host, { why: "Sign in to send: this browser holds no cockpit token." });
+      return Promise.resolve();
+    }
+    return dropFetch(headers, fresh).then((r) => { if (host.isConnected) dropHeroDraw(host, r); }).catch(() => {});
+  }
+  // drawn on every KE render, whatever the read says: the hero is never silently absent
+  function renderDropHero() {
+    const host = document.getElementById("ck-drop");
+    if (!host) return;
+    for (const old of host.querySelectorAll(":scope > .ck-region-err")) old.remove();
+    if (!host._drop) dropHeroBuild(host);
+    host.hidden = false;
+    dropRefresh(host, false);
   }
   const DISPATCH_VERB = { sign: "Sign", cancel: "Cancel job", authorise: "Authorise" };
   function dispatchCard(r) {
@@ -6740,7 +6887,7 @@
   // the Decisions history's standing-rule slots (and the dispatch jobs), drawn together wherever the proposals are
   function standingSlots() {
     const f = document.createDocumentFragment();
-    f.append(proposalSlot(), grantSlot(), dispatchSlot(), dropSlot());
+    f.append(proposalSlot(), grantSlot(), dispatchSlot());   // the drop is the home page's hero (renderDropHero), not a slot here
     return f;
   }
 
@@ -7313,7 +7460,8 @@
   }
 
   // OS-3, the narrow page's strip: one tap goes to the phone view's content. Needs you, Board and Notifications are blocks on this
-  // page; Grants and Drop are drawn inside the Decisions view, so their tabs open it and take the reader to their own slot. That
+  // page, and so is Drop (the hero under the band: its tab scrolls there and focuses the box); Grants are drawn inside the
+  // Decisions view, so that tab opens it and takes the reader to its own slot. That
   // view fills as its reads answer (queued, each up to the fetch deadline), so the wait is for the POPULATED node, bounded by a
   // deadline a little past the read's own; a view with nothing to show (no standing grant, a read that failed) is left where the
   // slot is, or at its top when it has none.
@@ -7324,12 +7472,8 @@
   };
   const PHONE_JUMP_WAIT_MS = CONSENT_FETCH_TIMEOUT_MS + 5000, PHONE_JUMP_STEP_MS = 150, PHONE_JUMP_STEADY = 2;
   // `slot`: where the tab's section sits once it is drawn; `filled`: the same node once its read has filled it (the grants heading
-  // exists only with a grant under it; the drop slot exists empty from the first paint and holds its row after its read)
+  // exists only with a grant under it)
   function phoneJumpFind(which, overlay) {
-    if (which === "drop") {
-      const slot = overlay.querySelector(".coord-drop-slot");
-      return { slot: slot, filled: slot && slot.querySelector(".coord-drop-row") ? slot : null };
-    }
     const head = Array.from(overlay.querySelectorAll(".ext-grouphead")).find((h) => /standing grants/i.test(h.textContent)) || null;
     return { slot: head, filled: head };
   }
@@ -7359,7 +7503,18 @@
   }
   function phoneJump(which, opener) {
     const run = ++phoneJumpRun;
-    if (which === "grants" || which === "drop") {
+    if (which === "drop") {       // the drop is the home page's hero: the tab scrolls to its box, no view to open
+      const host = document.getElementById("ck-drop");
+      if (!host) return;
+      window.requestAnimationFrame(() => {
+        if (run !== phoneJumpRun) return;
+        host.scrollIntoView({ block: "start" });
+        const ta = host._drop && host._drop.words;
+        if (ta && !ta.disabled) ta.focus({ preventScroll: true });
+      });
+      return;
+    }
+    if (which === "grants") {
       if (!document.getElementById("levain-modal") && !openDecisionsHistory(opener)) return;
       const overlay = document.getElementById("levain-modal");
       // opening can close a view it could not build, which ends the run: the wait starts from the run as it stands once the view is up

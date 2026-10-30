@@ -2801,10 +2801,10 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
   body.ke .deck > .masthead { order: -4; }
   body.ke .ck-phonetabs { order: -3; }
   body.ke .hero:not([hidden]) { display: contents; }
-  body.ke .hero > .band { order: -2; }
+  body.ke .hero > .band, body.ke .hero > .ck-drop { order: -2; }   /* the drop follows the band in document order */
   body.ke .ck-needs, body.ke .ck-notes { order: -1; }
   /* a view the strip jumps to stops under the sticky strip, never behind it */
-  body.ke #ck-needs, body.ke #ck-state-slot, body.ke .panel[data-ck-panel="tray"], body.ke .panel[data-ck-panel="notifications"] { scroll-margin-top: calc(var(--hit-min) + var(--sp-4)); }
+  body.ke #ck-needs, body.ke #ck-drop, body.ke #ck-state-slot, body.ke .panel[data-ck-panel="tray"], body.ke .panel[data-ck-panel="notifications"] { scroll-margin-top: calc(var(--hit-min) + var(--sp-4)); }
   body.ke .ck-phonetabs {
     display: flex; gap: 0; position: sticky; top: 0; z-index: 5;
     padding: 0 var(--gutter-ke); background: var(--base); border-bottom: 1px solid var(--hair);
@@ -2826,7 +2826,7 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
   body.ke .modal-body .consent-copy, body.ke .modal-body .consent-sheet-open,
   body.ke .modal-body .needs-btn, body.ke .modal-body .undo-btn { min-height: var(--hit-min); }
   body.ke .modal-body .tray-dump-btn { min-height: var(--hit-min); }
-  body.ke .modal-body .ext-grouphead, body.ke .modal-body .coord-drop-slot { scroll-margin-top: calc(var(--hit-min) + var(--sp-3)); }   /* under the view's sticky filter */
+  body.ke .modal-body .ext-grouphead { scroll-margin-top: calc(var(--hit-min) + var(--sp-3)); }   /* under the view's sticky filter */
 }
 /* touch: a control that is small to the eye keeps its size and grows its HIT AREA through a pseudo-element, as the row verbs do
    above, so a card does not change height. The area is the control's own box, centred, and at least the hit minimum in each
@@ -2849,7 +2849,31 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
    boxes, full width of the sheet/card, ~8 rows, grows with its content (card_format.js installFieldGrow is the iOS fallback),
    16px so iOS Safari does not zoom. The write-in answers are one line by contract (a signed write-in may not hold a newline),
    so they get the same width and font, not the rows. */
-body :is(#drop-words, .question-words, .bd-tell textarea) { display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box;
+body :is(#drop-words, .drop-words, .question-words, .bd-tell textarea) { display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box;
   min-height: 12em; padding: var(--sp-3) var(--sp-4); font-size: 16px; line-height: 1.45; resize: vertical; field-sizing: content; }
 body :is(.sheet-write-in, .sign-write-in) { grid-column: 1 / -1; display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box; min-height: 44px; font-size: 16px; }
 body .state-input { font-size: 16px; }
+
+/* The coordinator drop, the hero of the home page: an inline composer directly under the now band (Phill 10-30: "front and
+   center", "the whole idea is to make working from the cockpit ... easy, and attractive"). Neutral emphasis, no accent: the accent
+   is spent on what waits on him. The box takes the one free-text rule above (.drop-words). */
+body.ke .ck-drop.frame { padding-inline: 0; margin-inline: var(--gutter-ke); margin-top: var(--sec); display: flex; flex-direction: column; gap: var(--sp-3); }
+body.ke .ck-drop[hidden] { display: none; }
+body.ke .ck-drop .needs-headline h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
+body.ke .ck-drop .drop-note.bad { color: var(--text); }
+body.ke .ck-drop .drop-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
+body.ke .ck-drop .needs-primary { color: var(--base); background: var(--text); border-color: var(--text); min-width: 96px; }
+body.ke .ck-drop .needs-primary:hover { background: var(--text); opacity: .88; }
+body.ke .ck-drop button:disabled, body.ke .ck-drop textarea:disabled { opacity: .5; cursor: default; }
+body.ke .ck-drop .drop-receipt { margin: 0; min-height: 1.2em; overflow-wrap: anywhere; }
+body.ke .ck-drop .drop-receipt.bad { color: var(--text); }
+body.ke .ck-drop .drop-recent { display: flex; flex-direction: column; }
+body.ke .ck-drop .drop-recent-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: var(--sp-4); align-items: baseline; padding: var(--sp-2) 0; border-top: 1px solid var(--hair); }
+body.ke .ck-drop .drop-words-first { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+body.ke .ck-drop .drop-more { align-self: flex-start; margin-top: var(--sp-2); }
+@media (max-width: 720px) {
+  body.ke .ck-drop .drop-recent-row { grid-template-columns: minmax(0, 1fr) auto; }
+  body.ke .ck-drop .drop-recent-row .drop-when { grid-column: 1 / -1; }
+  body.ke .ck-drop .needs-btn { min-height: var(--hit-min); }
+  body.ke .ck-drop .drop-actions .needs-btn { flex: 1 1 0; }
+}

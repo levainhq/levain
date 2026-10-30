@@ -761,6 +761,11 @@
     words.placeholder = "your words";
     words.setAttribute("aria-label", "your words");
     body.appendChild(words);
+    // words typed in the cockpit's drop box and handed over by "Add an envelope" (dashboard_core.js openDropSheet): read once
+    try {
+      const pre = window.sessionStorage.getItem("levain-drop-prefill");
+      if (pre) { words.value = pre; window.sessionStorage.removeItem("levain-drop-prefill"); }
+    } catch (e) { /* the sheet opens empty */ }
     const det = el("details", "");
     det.id = "drop-env";
     det.appendChild(el("summary", "", "sign an envelope"));
