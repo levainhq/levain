@@ -3871,6 +3871,17 @@ def make_server(
         team_v, team_e = team_verbs(source.install_root)
         extra_verbs.update(team_v)
         extra_effects.update(team_e)
+    if source.write_scope is not None:
+        # C10 S3: Start / Stop / Hold on the Coordinator panel, over the directory that panel reads. The directory is read
+        # on each call (the consent reader is attached below), and a caller's verb under one of these names is refused.
+        from levain.cockpit import coordinator_status
+        from levain.cockpit.providers import _dispatch_dir
+
+        coord_v = coordinator_status.status_verbs(lambda: _dispatch_dir(getattr(httpd, "consent_reader", None)))
+        clash = sorted(n for n in coord_v if n in extra_verbs or n in extra_effects)
+        if clash:
+            raise ValueError(f"refusing extra_verbs/extra_effects {clash}: those names are the Coordinator panel's verbs")
+        extra_verbs.update(coord_v)
     stray = sorted(v for v in extra_effects if v not in extra_verbs)
     if stray:
         raise ValueError(f"refusing extra_effects {stray}: each must name a verb in extra_verbs")

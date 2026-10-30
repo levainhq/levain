@@ -3,6 +3,7 @@
 browser). The verbs are fired directly and through a real cockpit server that registers them."""
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
 import threading
@@ -284,12 +285,20 @@ def test_hold_voids_a_pending_launch_and_holds_the_lease_for_thirty_minutes(stor
 
 
 # --- the server: registration, the manifest, the write token -------------------------------------------------------
-def _serving(tmp_path, qdir, **kw):
+@contextlib.contextmanager
+def _serving(tmp_path, qdir, specs=None, **kw):
+    """A write-scoped serve: it registers the verbs itself, over the directory its consent reader names (the fixture's).
+    ``specs`` (or seams in ``kw``) replace what the serve builds, through the one function it builds them with."""
+    from unittest import mock
+
+    from levain.cockpit import coordinator_status as cs
     from tests.test_cockpit_k2a import _install, _serve
 
+    real = cs.status_verbs
     _root, src, _ids = _install(tmp_path)
-    return _serve(src, surface_tokens={"browser": "T"}, install_class="reported",
-                  extra_verbs=status_verbs(lambda: qdir, **kw))
+    with mock.patch.object(cs, "status_verbs", (lambda d, **k: specs) if specs is not None else (lambda d, **k: real(d, **{**kw, **k}))):
+        with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as pair:
+            yield pair
 
 
 def _panel(url: str) -> dict:
@@ -320,15 +329,14 @@ def test_the_verbs_are_offered_by_the_panel_and_listed_in_the_manifest(store, qd
             HOLD_VERB: ("Hold it myself", "C1", "cockpit", [])}
 
 
-def test_a_server_that_registers_none_offers_none(store, qdir, tmp_path):
+def test_a_caller_cannot_take_a_coordinator_verbs_name(store, qdir, tmp_path):
     from tests.test_cockpit_k2a import _install, _serve
 
     _root, src, _ids = _install(tmp_path)
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        panel = _panel(url)
-        assert panel["rows"] and (panel.get("actions") or []) == []
-        status, body = _post_verb(url, START_VERB)
-        assert (status, body["error"]) == (404, "unknown_verb"), body
+    mine = status_verbs(lambda: qdir)
+    with pytest.raises(ValueError, match="those names are the Coordinator panel's verbs"):
+        with _serve(src, surface_tokens={"browser": "T"}, install_class="reported", extra_verbs={START_VERB: mine[START_VERB]}):
+            pass
 
 
 @pytest.mark.parametrize("verb", COORD_VERBS)
@@ -346,10 +354,7 @@ def test_every_verb_is_refused_without_the_write_token_and_writes_nothing(store,
 def test_start_through_the_server_starts_the_coordinator_and_a_second_says_why(store, qdir, fake, live_hook, clock,
                                                                                tmp_path):
     v = _verbs(qdir, clock)
-    from tests.test_cockpit_k2a import _install, _serve
-
-    _root, src, _ids = _install(tmp_path)
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported", extra_verbs=v.specs()) as (url, _h):
+    with _serving(tmp_path, qdir, specs=v.specs()) as (url, _h):
         _panel(url)
         status, out = _post_verb(url, START_VERB, key="s1")
         assert (status, out.get("ok")) == (200, True), out
