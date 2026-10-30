@@ -53,7 +53,8 @@ from typing import Any, NamedTuple
 from levain.band_shorthand import ItemInfo, Parse, Refusal, View, parse
 from levain.band_sources import Extra, Extras, NotOffered, read_extras, sheet_text
 from levain.cockpit.consent import utc_stamp
-from levain.consent.questions import HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select, read_deadline
+from levain.consent.questions import (HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select, open_ended_of,
+                                     read_deadline)
 
 __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
            "band_hooks_state", "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed",
@@ -119,7 +120,7 @@ def _short(text: str, limit: int) -> str:
 
 def _item_lines(label: str, q: Question, compact: bool) -> list[str]:
     """One item: ``label`` is its number (``7.``) or ``new (number pending):``."""
-    if q.open_ended:                       # no options, no rec: only words answer it
+    if open_ended_of(q):                   # no options, no rec: only words answer it
         if compact:
             return [f"{label} [{_tag(q)}] {_short(q.what, _COMPACT_WHAT)} · open question: answer in words"]
         return [f"{label} [{_tag(q)}] {q.what}", "    open question: answer in your own words",
@@ -765,7 +766,7 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
             items.append({"n": n, "kind": info.kind, "tag": _tag(q), "what": q.what, "blocks": q.blocks,
                           "options": [{"letter": _LETTERS[i], "label": lab} for i, (_, lab) in enumerate(q.options)
                                       if i < len(_LETTERS)], "rec": info.rec_letter, "question": q.n,
-                          "open_ended": q.open_ended})
+                          "open_ended": open_ended_of(q)})
         elif e is not None:
             items.append({"n": n, "kind": "authority", "tag": e.tag, "what": e.what, "blocks": e.blocks,
                           "options": [{"letter": _LETTERS[i], "label": lab} for i, lab in enumerate(e.options)
@@ -786,7 +787,7 @@ def _foreign_payload(store: Any, shown: Rendered) -> dict[str, Any]:
     items = [{"n": q.n, "kind": "information", "tag": _tag(q), "what": q.what, "blocks": q.blocks,
               "options": [{"letter": _LETTERS[i], "label": lab} for i, (_, lab) in enumerate(q.options)
                           if i < len(_LETTERS)], "rec": _info_of(q).rec_letter, "question": q.n,
-              "open_ended": q.open_ended}
+              "open_ended": open_ended_of(q)}
              for q in _foreign_open(store)]
     return {"seen_through": max((i["n"] for i in items), default=None), "store_id": FOREIGN_STORE_ID,
             "view_id": FOREIGN_VIEW_ID, "items": items, "note": _UNREAD_NOTE if shown.failed else ""}

@@ -29,11 +29,11 @@ def test_a_4933_char_block_cannot_cut_the_options_or_the_answer_line(tmp_path):
     store = QuestionStore(tmp_path / "consent")
     q = _file(store, options=opts, rec="k2", blocks="b" * 4933, what="w" * 900)
     text = band._ping_text("claude_code", q, tmp_path / "consent", 3)
-    pushed = text[:4000]                                  # what webpush/sender.spawn keeps
+    pushed = text                                         # whole: it fits the push layer (band._ping_fits)
     for k, label in opts:
         assert f"{k}) {label}" in pushed or f"{k}) option" in pushed
     assert "Answer: levain question answer 1" in pushed and pushed.rstrip().endswith("(full text on the card)")
-    assert len(text) <= 4000 - 120                         # room left for a held ping's extra line
+    assert band._ping_fits()(text)
     assert text.index("Options:") < text.index("Answer:") < text.index("Blocks:")
 
 
@@ -56,7 +56,7 @@ def test_six_longest_labels_still_keep_every_key_and_the_answer(tmp_path):
     store = QuestionStore(tmp_path / "consent")
     q = _file(store, options=opts, rec="k0", what="w" * 1000, blocks="x")
     text = band._ping_text("claude_code", q, tmp_path / "consent", 1)
-    assert len(text) <= 3800 + len("\nBlocks: x.")
+    assert band._ping_fits()(text)
     assert all(f"k{i}) " in text for i in range(6)) and "Answer: levain question answer 1" in text
 
 
@@ -70,7 +70,7 @@ def test_blocks_is_checked_against_its_own_cap_only(tmp_path):
 def test_an_open_question_files_with_no_options_and_no_rec(tmp_path):
     store = QuestionStore(tmp_path / "consent")
     q = _open(store)
-    assert q.options == () and q.rec == "" and q.open_ended
+    assert list(q.options) == [] and q.rec == "" and q.open_ended
     assert not _file(store).open_ended
 
 
@@ -109,7 +109,7 @@ def test_ask_open_files_and_names_no_option(tmp_path, monkeypatch):
                      monkeypatch, env={"CLAUDE_CODE_SESSION_ID": SESSION})
     assert code == 0, out
     q = QuestionStore(qdir).get(1)
-    assert q.open_ended and q.options == () and q.rec == ""
+    assert q.open_ended and not q.options and q.rec == ""
 
 
 @pytest.mark.parametrize("argv, why", [
@@ -205,3 +205,172 @@ def test_the_asker_rec_of_an_open_question_says_so(tmp_path):
     q = _open(QuestionStore(tmp_path / "consent"))
     rec = deliver._asker_rec(q)
     assert rec.startswith("none: an open question, answered in words") and len(rec) <= review._REC_MAX
+
+
+# --- L3 r1 fixes ---------------------------------------------------------------------------------------------
+class _Child:
+    def __init__(self, sink):
+        self.stdin, self._sink = self, sink
+
+    def write(self, data):
+        self._sink.append(data)
+
+    def close(self):
+        pass
+
+
+def _through_the_push(monkeypatch, tmp_path, q, extra=""):
+    """The ping as the phone gets it: _send_ping -> claude_code.notify -> sender.spawn's stdin (Popen faked) ->
+    sender.build_payload, the way the child's deliver() calls it. Returns (body sent, body in the push payload)."""
+    from types import SimpleNamespace
+
+    from levain import webpush
+    from levain.webpush import presence, sender
+
+    got = []
+    monkeypatch.setattr(webpush, "live", lambda cwd: True)
+    monkeypatch.setattr(presence, "should_push", lambda cwd, kind: SimpleNamespace(push=True, by=None))
+    monkeypatch.setattr(sender.subprocess, "Popen", lambda *a, **k: _Child(got))
+    monkeypatch.setattr(band_view, "number_for_ping", lambda store, qid: 3)
+    assert band._send_ping("claude_code", q, tmp_path / "consent", extra)
+    (data,) = got
+    f = json.loads(data)
+    payload = json.loads(sender.build_payload(f["title"], f["body"], f["ref"] or "question", f["url"], 10 ** 12))
+    return f["body"], payload["body"]
+
+
+@pytest.mark.parametrize("ch", ["\U0001F600", "é", '"', "w"])
+@pytest.mark.parametrize("extra", ["", "\nThe coordinator has not read it in 10 minutes; it waits on you."])
+def test_the_push_layer_never_cuts_the_options_or_the_answer_line(tmp_path, monkeypatch, ch, extra):
+    # codex MED: a 1,000-emoji what and six 600-emoji labels were a 3,800-CHARACTER ping but ~14 KB serialized
+    opts = [(f"k{i}", ch * 600) for i in range(6)]
+    store = QuestionStore(tmp_path / "consent")
+    q = _file(store, options=opts, rec="k1", what=ch * 1000, blocks=ch * 6000)
+    sent, pushed = _through_the_push(monkeypatch, tmp_path, q, extra)
+    assert pushed == sent                                   # nothing cut by spawn or build_payload
+    assert "Options: k0) " in pushed and all(f"k{i}) " in pushed for i in range(6)) and "(rec)" in pushed
+    assert "Answer: levain question answer 1" in pushed and pushed.endswith(extra or "(full text on the card)")
+
+
+def test_the_push_layer_never_cuts_an_open_questions_answer_line(tmp_path, monkeypatch):
+    store = QuestionStore(tmp_path / "consent")
+    q = _open(store, what="\U0001F600" * 1000, blocks="\U0001F600" * 6000)
+    sent, pushed = _through_the_push(monkeypatch, tmp_path, q)
+    assert pushed == sent and "answer in your own words" in pushed and "--text" in pushed
+
+
+def test_a_short_ping_goes_whole_through_the_push(tmp_path, monkeypatch):
+    store = QuestionStore(tmp_path / "consent")
+    sent, pushed = _through_the_push(monkeypatch, tmp_path, _file(store), "\nX.")
+    assert pushed == sent and sent.startswith("claude_code asks (band 3, question #1): merge the branch?")
+    assert sent.endswith("Blocks: the merge.\nX.")
+
+
+class _OldQuestion:
+    """The Question shape before `open_ended` (a foreign store's own type)."""
+
+    def __init__(self, n, options, rec):
+        self.n, self.id, self.agent, self.agent_session_id = n, f"np-{n:08d}", "desk", "-"
+        self.what, self.options, self.rec, self.blocks = f"question {n}", options, rec, "the lane"
+        self.cwd, self.filed_at, self.answer, self.link, self.sign_request = "/tmp/x", "2026-10-30T10:00:00Z", None, None, None
+
+
+class _OldStore:
+    def __init__(self):
+        self.rows = [_OldQuestion(4, (("a", "yes"), ("b", "no")), "a"), _OldQuestion(5, (), "")]
+
+    def open_questions(self, agent=None):
+        return list(self.rows)
+
+    def recent(self, limit=50):
+        return list(self.rows)[:limit]
+
+    def get(self, ref):
+        return next((q for q in self.rows if str(ref).lstrip("#") in (str(q.n), q.id)), None)
+
+    def answer(self, ref, *, option=None, text=None, channel):
+        raise AssertionError("not answered here")
+
+
+def test_a_foreign_store_of_the_old_question_shape_still_renders_and_pays_out(tmp_path):
+    # codex MED: no `open_ended` attribute rendered UNREADABLE, then band_payload raised AttributeError
+    store = _OldStore()
+    r = band_view.show(store, "cockpit:web")
+    assert "UNREADABLE" not in r.text and "rec: a" in r.text and "open question: answer in your own words" in r.text
+    p = band_view.band_payload(store, "cockpit:web")
+    assert [(i["n"], i["open_ended"]) for i in p["items"]] == [(4, False), (5, True)]
+
+
+@pytest.mark.parametrize("flag", ["false", "true", 1, 0, None])
+def test_open_ended_must_be_a_bool(tmp_path, flag):
+    store = QuestionStore(tmp_path / "consent")
+    with pytest.raises(ConsentError, match="open_ended must be True or False"):
+        _file(store, open_ended=flag)
+    with pytest.raises(ConsentError, match="open_ended must be True or False"):
+        store.check(agent="claude_code", agent_session_id=SESSION, what="w", options=[], rec="", blocks="b",
+                    cwd="/work/proj", open_ended=flag)
+    assert store.open_questions() == []
+
+
+@pytest.mark.parametrize("options", [{"a": "x"}, {}, "ab", "", None, 0, [("a", "x")], ({"key": "a", "label": "x"},)])
+def test_an_open_question_refuses_any_options_but_an_empty_list(tmp_path, options):
+    store = QuestionStore(tmp_path / "consent")
+    with pytest.raises(ConsentError, match="an open question takes no options"):
+        _open(store, options=options)
+    assert store.open_questions() == []
+
+
+@pytest.mark.parametrize("options", [[], ()])
+@pytest.mark.parametrize("rec", ["", None])
+def test_an_open_question_takes_an_empty_list_and_no_rec(tmp_path, options, rec):
+    store = QuestionStore(tmp_path / "consent")
+    assert _open(store, options=options, rec=rec).open_ended
+
+
+def test_an_open_question_takes_the_default_options(tmp_path):
+    store = QuestionStore(tmp_path / "consent")
+    q = store.file(agent="claude_code", agent_session_id=SESSION, cwd="/work/proj", what="w?", blocks="b",
+                   open_ended=True)
+    assert q.open_ended and not q.options
+
+
+@pytest.mark.parametrize("rec", ["a", " ", 0, False, []])
+def test_an_open_question_refuses_any_rec_but_empty(tmp_path, rec):
+    store = QuestionStore(tmp_path / "consent")
+    with pytest.raises(ConsentError, match="an open question takes no rec"):
+        _open(store, rec=rec)
+    assert store.open_questions() == []
+
+
+def test_ask_open_with_would_push_is_refused_before_any_push_request(tmp_path, monkeypatch):
+    monkeypatch.setattr(band, "_file_push_request", lambda *a, **k: pytest.fail("no push request is filed"))
+    qdir = tmp_path / "consent"
+    code, out = _run(["ask", "--what", "q?", "--open", "--blocks", "z", "--would-push", "sha", "--remote", "o",
+                      "--branch", "m", "--queue-dir", str(qdir)], monkeypatch, env={"CLAUDE_CODE_SESSION_ID": SESSION})
+    assert code == 2 and "--open" in out and "--would-push" in out and "nothing was filed" in out
+    assert QuestionStore(qdir).open_questions() == []
+
+
+def test_file_question_refuses_open_with_would_push_for_every_door(tmp_path, monkeypatch):
+    monkeypatch.setattr(band, "_file_push_request", lambda *a, **k: pytest.fail("no push request is filed"))
+    q, text = band.file_question("claude_code", SESSION, "q?", [], "", "z", tmp_path / "consent",
+                                 would_push=("sha", (".", "o", "m")), open_ended=True)
+    assert q is None and "nothing was filed" in text and "open question" in text
+
+
+def test_the_first_reader_names_an_open_question_before_a_link():
+    from types import SimpleNamespace
+
+    from levain.coordinator import first_reader
+
+    q = SimpleNamespace(answer=None, link=SimpleNamespace(option="a", request_id="r-1"), open_ended=True)
+    r = first_reader._verdict(None, None, "2026-10-30T10:00:00Z", q, None)
+    assert not r.may_answer and "open question" in r.why
+
+
+def test_ask_open_with_an_empty_rec_files_as_the_store_takes_it(tmp_path, monkeypatch):
+    qdir = tmp_path / "consent"
+    code, out = _run(["ask", "--what", "q?", "--open", "--rec", "", "--blocks", "z", "--queue-dir", str(qdir)],
+                     monkeypatch, env={"CLAUDE_CODE_SESSION_ID": SESSION})
+    assert code == 0, out
+    assert QuestionStore(qdir).get(1).open_ended

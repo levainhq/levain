@@ -178,12 +178,12 @@ def _verdict(store: Any, conn: sqlite3.Connection, now: str, q: Any, authority: 
 
     if q.answer is not None:
         return no("the operator has answered it")
-    if q.link is not None:
-        return no(f"option {q.link.option} is tied to consent request {q.link.request_id}: that is the operator's "
-                  "ruling, never the coordinator's")
     if q.open_ended:
         return no("an open question has no options to know: only the operator answers it, in words, so it is "
                   "escalated, never answered by the coordinator")
+    if q.link is not None:
+        return no(f"option {q.link.option} is tied to consent request {q.link.request_id}: that is the operator's "
+                  "ruling, never the coordinator's")
     ln = lease.by_harness_session(conn, q.agent_session_id)
     if ln is None:
         return no("the asking session is not one Levain started, so no envelope covers it")

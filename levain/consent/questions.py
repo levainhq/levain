@@ -147,6 +147,12 @@ class Question:
         return not self.options
 
 
+def open_ended_of(q: Any) -> bool:
+    """:attr:`Question.open_ended` for any question-shaped object, a foreign store's own type of the older shape
+    (no ``open_ended``) included: there the same rule, no options."""
+    return bool(getattr(q, "open_ended", not q.options))
+
+
 @dataclass(frozen=True)
 class Link:
     """An option of a question tied to the consent request levain filed, undecided, for the call that option leads
@@ -494,11 +500,15 @@ class QuestionStore:
         options (a system source's acknowledgement is one; an agent's question offers a choice). ``open_ended``: the
         question is filed with NO options and NO rec (an open question, answered in words); one option is still
         refused, and so is an option or a rec beside ``open_ended``."""
+        if not isinstance(open_ended, bool):
+            raise ConsentError(f"open_ended must be True or False: {open_ended!r}")
         if open_ended:
-            if isinstance(options, (list, tuple)) and len(options) > 0:
-                raise ConsentError("an open question takes no options: give none, or file a question with 2 to "
-                                   f"{_OPTIONS_MAX}")
-            if rec not in (None, ""):
+            # exactly an empty list or tuple: anything else (a dict, a string, None, a list with options) is refused,
+            # never dropped
+            if not isinstance(options, (list, tuple)) or len(options) > 0:
+                raise ConsentError("an open question takes no options (an empty list): give none, or file a question "
+                                   f"with 2 to {_OPTIONS_MAX}")
+            if not (rec is None or (isinstance(rec, str) and rec == "")):
                 raise ConsentError("an open question takes no rec: there is no option to recommend")
             options, rec = [], ""
         if agent not in AGENTS:

@@ -267,7 +267,7 @@ def _send_ping(agent: str, q: Question, qdir: Path, extra: str = "", kind: str =
         from levain.consent.questions import QuestionStore
 
         n = band_view.number_for_ping(QuestionStore(qdir), q.id)
-        return bool(send(adapter.load_settings(qdir), _ping_text(agent, q, qdir, n) + extra, cwd=qdir,
+        return bool(send(adapter.load_settings(qdir), _ping_text(agent, q, qdir, n, extra), cwd=qdir,
                          kind=kind, ref=f"question:{q.n}"))
     except Exception:  # noqa: BLE001 - see the docstring
         return False
@@ -362,50 +362,83 @@ def _queue_dir(args: argparse.Namespace) -> Path:
     return args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
 
 
-# characters a ping's text may take: the push body is cut at 4000 (levain.webpush.sender.spawn), and a held ping appends
-# a line of up to ~120 after this text
-_PING_BUDGET = 3800
 _FULL_TEXT = "… (full text on the card)"
 
 
-def _ping_text(agent: str, q: Question, qdir: Path, band_n: int | None = None) -> str:
+def _ping_fits() -> Callable[[str], bool]:
+    """Whether a ping's whole text reaches the phone uncut, measured the way the push layer measures it: the
+    serialized UTF-8 bytes :func:`levain.webpush.sender.build_payload` fits the body into (with the title, tag and
+    url ``claude_code.notify`` sends and the widest tag and ping id), and the ASCII-escaped JSON
+    :func:`levain.webpush.sender.spawn` writes to its child, which it halves past its own limit."""
+    from levain.webpush import ece, sender
+
+    envelope = {"title": "levain", "body": "", "tag": "question:" + "9" * 12, "url": "/?view=needs", "ping": 10 ** 12}
+    body_bytes = ece.MAX_PLAINTEXT - len(sender._dumps(envelope))
+    stdin = {"title": "levain", "body": "", "ref": "question:" + "9" * 12, "url": "/?view=needs", "command": False,
+             "push": True, "hold": "active"}
+    stdin_room = sender._SPAWN_STDIN_MAX - len(json.dumps(stdin))
+
+    def fits(text: str) -> bool:
+        body = text[len("levain: "):] if text.startswith("levain: ") else text   # what notify sends as the body
+        return (len(body) <= 4000 and sender._jlen(body) <= body_bytes
+                and len(json.dumps(body)) - 2 <= stdin_room)
+    return fits
+
+
+def _cut(text: str, n: int) -> str:
+    return text if len(text) <= n else text[:max(n - 1, 0)].rstrip() + "…"
+
+
+def _longest(build: Callable[[int], str], top: int, fits: Callable[[str], bool]) -> int:
+    """The largest n in 0..top with ``fits(build(n))``, else 0 (``build`` grows with n)."""
+    lo, hi = 0, top
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(build(mid)):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _ping_text(agent: str, q: Question, qdir: Path, band_n: int | None = None, extra: str = "") -> str:
     """The ping: its first line says who asks what in plain words (a lock screen shows only that), with the band
     number first when it has one (``band_n``; the source tag ``question #n`` stays). The answer command names the
     store's directory unless it is the default one, so it answers this question, not another store's question of
-    the same number."""
+    the same number. ``extra`` ends it. The options and the answer line always reach the phone: ``what`` and the
+    labels are shortened to one common length only when they would not fit with them, and Blocks goes last with
+    only the room left (:func:`_ping_fits`). The store and every card keep the whole text."""
     import shlex
 
     from levain.consent.queue import default_queue_dir
 
+    fits = _ping_fits()
     where = "" if Path(qdir) == default_queue_dir() else f" --queue-dir {shlex.quote(str(qdir))}"
     tag = f"band {band_n}, question #{q.n}" if band_n is not None else f"question #{q.n}"
-    head = f"levain: {agent} asks ({tag}): {q.what}"
     if q.open_ended:
-        middle = ["An open question: answer in your own words.",
-                  f"Answer: levain question answer {q.n}{where} --text \"...\"."]
+        answer = ("An open question: answer in your own words.\n"
+                  f"Answer: levain question answer {q.n}{where} --text \"...\".")
     else:
         answer = f"Answer: levain question answer {q.n}{where} --option <key> (or --text \"...\")."
-        labels = [label for _, label in q.options]
-        # the options and the answer line are what the operator acts on: they come first and are kept whole, and the
-        # label of an option is shortened only when they alone would not fit the budget
-        fixed = len(head) + len(answer) + len("Options: .") + 4 * len(labels) + 40
-        shown = [k + ") " + label + (" (rec)" if k == q.rec else "") for k, label in q.options]
-        if fixed + sum(len(s) for s in shown) > _PING_BUDGET:
-            each = max(40, (_PING_BUDGET - fixed) // len(labels) - len(" (rec)") - 6)
-            shown = [f"{k}) {label if len(label) <= each else label[:each - 1] + '…'}"
-                     f"{' (rec)' if k == q.rec else ''}" for k, label in q.options]
-        middle = [f"Options: {'; '.join(shown)}.", answer]
-    text = "\n".join([head, *middle])
-    # the Blocks part goes LAST and takes only the room that is left: the push body is cut at 4000 characters
-    # (webpush/sender.spawn), and the cut must never fall on the options or the answer line. The store and every
-    # card keep the whole text.
-    room = _PING_BUDGET - len(text) - len("\nBlocks: ")
-    if len(q.blocks) + 1 <= room:
-        return f"{text}\nBlocks: {q.blocks}."
-    cut = room - len(_FULL_TEXT)
+
+    def core(n: int) -> str:
+        head = f"levain: {agent} asks ({tag}): {_cut(q.what, n)}"
+        if q.open_ended:
+            return f"{head}\n{answer}"
+        shown = "; ".join(f"{k}) {_cut(label, n)}{' (rec)' if k == q.rec else ''}" for k, label in q.options)
+        return f"{head}\nOptions: {shown}.\n{answer}"
+
+    longest = max([len(q.what), *(len(label) for _, label in q.options)])
+    text = core(longest)
+    if not fits(text + "\nBlocks:" + _FULL_TEXT + extra):
+        text = core(_longest(lambda n: core(n) + "\nBlocks:" + _FULL_TEXT + extra, longest, fits))
+    whole = f"{text}\nBlocks: {q.blocks}.{extra}"
+    if fits(whole):
+        return whole
+    cut = _longest(lambda n: f"{text}\nBlocks: {q.blocks[:n].rstrip()}{_FULL_TEXT}{extra}", len(q.blocks), fits)
     if cut >= 40:
-        return f"{text}\nBlocks: {q.blocks[:cut].rstrip()}{_FULL_TEXT}"
-    return f"{text}\nBlocks:{_FULL_TEXT}"
+        return f"{text}\nBlocks: {q.blocks[:cut].rstrip()}{_FULL_TEXT}{extra}"
+    return f"{text}\nBlocks:{_FULL_TEXT}{extra}"
 
 
 def _coordinator_session(qdir: Path, session: str) -> bool | None:
@@ -484,6 +517,10 @@ def _push_state(agent: str, qdir: Path, request_id: str) -> str:
     return "missing" if got is None else got[1]
 
 
+_OPEN_PUSH = ("--open files an open question, which has no option for --would-push to tie a push to: file a "
+              "question with options to tie one, or ask in words without --would-push")
+
+
 def file_question(agent: str, session: str, what: str, options: list[tuple[str, str]], rec: str, blocks: str,
                   qdir: Path, *, no_session_hint: str = "(pass --session)",
                   session_source: str = "--session", own_session: bool = False,
@@ -509,6 +546,8 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
         if _SUBAGENT in session:
             raise ValueError(f"{session_source} must name the main session (no #agent: part): only its hooks "
                              "receive answers")
+        if would_push is not None and open_ended:
+            raise ValueError(_OPEN_PUSH)
         if would_push is not None and would_push[0] not in {k for k, _ in options}:
             raise ValueError(f"--would-push names {would_push[0]!r}, which is not one of the options")
         try:
@@ -653,9 +692,12 @@ def run_ask(args: argparse.Namespace, out: Any = None) -> int:
         qdir = _queue_dir(args)
         options = _options(args.option)
         if args.open:
-            if options or args.rec is not None:
+            # the same rule as QuestionStore.check: an empty --rec is no rec
+            if options or args.rec not in (None, ""):
                 raise ValueError("--open files an open question: give no --option and no --rec (it is answered in "
                                  "words)")
+            if args.would_push is not None:
+                raise ValueError(_OPEN_PUSH)
         elif args.rec is None:
             raise ValueError("--rec KEY is required (the key of the option you recommend), or file an open question "
                              "with --open and no options")
