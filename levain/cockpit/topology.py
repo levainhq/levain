@@ -301,15 +301,16 @@ def _edit_paths(install_root: Path, stem: str, cwd: str, now: datetime, window_s
 
 def _node_state(waiting: bool, age_s: float, last_kind: str | None) -> str:
     """WAITING (a record) > STALLED (mid-turn and silent) > RUNNING > IDLE (quiet past the Sessions panel's Active
-    line, or its turn ended in a reply). Silence with no log is never STALLED: nothing says the turn is open."""
+    line, or its turn ended in a reply). Silence with no log is never STALLED: nothing says the turn is open. A
+    coordinator wake (``wake``) opens a turn as a prompt does, and its ``wake_reply`` ends it."""
     from levain.cockpit.providers import SESSION_ACTIVE_S
 
     if waiting:
         return "waiting"
-    if age_s >= SESSION_ACTIVE_S or last_kind == "reply":
+    if age_s >= SESSION_ACTIVE_S or last_kind in ("reply", "wake_reply"):
         return "idle"
     if age_s >= STALL_S:
-        return "stalled" if last_kind in ("prompt", "tool") else "idle"
+        return "stalled" if last_kind in ("prompt", "tool", "wake") else "idle"
     return "running"
 
 
