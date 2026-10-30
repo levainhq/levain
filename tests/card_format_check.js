@@ -54,16 +54,59 @@ check(eq(C.words(C.sections("Approved deployment is blocked", "Approve")), ["App
   "a headline that is only a word-prefix drops nothing");
 
 // 3. the signed message of each real row is a card, and its asked/stopped are the row's
+// the sign request a row's message comes in, as flow files it (needs_phill_sign: namespace, options, recommended)
+const req = (r, extra) => Object.assign({ namespace: "flow-needs-phill", message: r.message, options: r.options, recommended: r.rec }, extra || {});
 for (const r of [long, short]) {
-  const card = C.parseMessage(r.message);
-  check(card && card.asked === r.what && card.stopped === r.stopped && card.item === r.id && card.repo === r.repo, r.id + ": message parses to the row's own fields");
+  const card = C.parseMessage(r.message, req(r));
+  check(card && card.asked === r.what && card.stopped === r.stopped && card.item === r.id && card.repo === r.repo && card.recommended === r.rec,
+    r.id + ": message parses to the row's own fields");
 }
-check(C.parseMessage("Ship the sweep fix tonight or hold it?\nnonce: 9a1f") === null, "a plain sign message is not a card");
-check(C.parseMessage("tool: Write\nfile: /w/a.txt") === null, "a consent effect block is not a card");
+check(C.parseMessage("Ship the sweep fix tonight or hold it?\nnonce: 9a1f", req(long)) === null, "a plain sign message is not a card");
+check(C.parseMessage("tool: Write\nfile: /w/a.txt", req(long)) === null, "a consent effect block is not a card");
+
+// 3b. a message the verifier's grammar does not read exactly is NOT a card (it is drawn whole and visible): L3 r1 cases,
+// each first run against the old parser, which returned a card for all of them (codex HIGH, complement MED#2/LOW#4)
+const lines = short.message.split("\n");          // header, item, row_version, repo, asked, stopped, recommended, nonce, filed
+const withLines = (at, add) => lines.slice(0, at).concat(add, lines.slice(at)).join("\n");
+const notCard = (msg, what, extra) => check(C.parseMessage(msg, req(short, Object.assign({ message: msg }, extra || {}))) === null, what);
+notCard(withLines(6, ["effect: delete production data"]), "an unknown line (effect:) after stopped is not a card");
+notCard(withLines(7, ["effect: delete production data"]), "an unknown line between the rec and nonce is not a card");
+notCard(withLines(4, ["asked: harmless"]), "a duplicate asked: is not a card");
+notCard(withLines(6, ["and also wipe the disk"]), "a multi-line stopped value is not a card");
+notCard(withLines(6, [""]), "a blank line inside the fields is not a card");
+notCard(short.message + "\n", "a trailing empty line is not a card");
+notCard(lines.filter((l) => !l.startsWith("nonce: ")).join("\n"), "a missing nonce is not a card");
+notCard(lines.filter((l) => !l.startsWith("stopped: ")).join("\n"), "a missing stopped is not a card");
+notCard(withLines(7, ["option (A): delete it"]), "an option line outside the key domain is not a card");
+notCard(withLines(7, ["option (a): x", "option (a): y"]), "a repeated option key is not a card");
+notCard(withLines(7, ["option (z): delete it"]), "option lines that are not the request's options are not a card");
+notCard(short.message.replace("recommended: (a)", "recommended: a"), "a recommended line not (<key>) <text> is not a card");
+notCard(short.message.replace("recommended: (a)", "recommended: (z)"), "a recommendation that is no option is not a card");
+notCard(short.message.replace("keep flow's byline", "drop flow's byline"), "a recommendation whose text is not its option's is not a card");
+notCard(short.message, "the request's recommended disagreeing with the signed one is not a card", { recommended: "b" });
+notCard(lines.filter((l) => !l.startsWith("recommended: ")).join("\n"), "a request rec with no signed rec is not a card");
+notCard(short.message, "another namespace is not a card", { namespace: "levain-sign" });
+check(C.parseMessage(short.message) === null, "no request: not a card");
+// the signed rec stands when the request carries none (an older request); a CRLF message reads as its LF twin
+const noJsonRec = C.parseMessage(short.message, req(short, { recommended: undefined }));
+check(noJsonRec && noJsonRec.recommended === "a", "the signed recommendation is the card's when the request names none");
+const crlf = C.parseMessage(short.message.replace(/\n/g, "\r\n"), req(short));
+check(crlf && crlf.asked === short.what && crlf.stopped === short.stopped, "a CRLF message reads as its LF twin");
+// signed option lines (a button cut one): read when they are the request's keys in order, and they are what the OPTIONS
+// prose is compared with, so the full text is shown once (deepseek MED#2)
+const full = withLines(7, short.options.map((o) => "option (" + o.key + "): " + o.text + " in full"));
+const fc = C.parseMessage(full, req(short, { message: full }));
+check(fc && fc.optionLines.map((o) => o.key).join() === "a,b,c", "signed option lines in the request's order are read");
+check(C.fullOptions(fc, short.options) === fc.optionLines && C.fullOptions(C.parseMessage(short.message, req(short)), short.options) === short.options,
+  "fullOptions: the signed lines when present, else the buttons");
+const proseFull = { label: "OPTIONS", blocks: [{ kind: "paragraph", text: fc.optionLines.map((o) => "(" + o.key + ") " + o.text).join(" · ") }] };
+check(C.repeatsRows(proseFull, C.fullOptions(fc, short.options), fc.recommended) && !C.repeatsRows(proseFull, short.options, fc.recommended),
+  "OPTIONS prose equal to the signed full lines is left out (it was kept against the cut buttons and drawn twice)");
+check(C.optionRows("(a) x·(b) y").length === 2, "options split on a · with no spaces around it");
 
 // 4. invariant over the whole message: every word of asked + stopped is shown by the headline, the headline's rest, or a section
 for (const r of [long, short]) {
-  const card = C.parseMessage(r.message);
+  const card = C.parseMessage(r.message, req(r));
   const hd = C.headline(card.asked);
   const shown = sourceWords(hd.head)
     .concat(cardWords(hd.rest ? C.sections(hd.rest) : []))

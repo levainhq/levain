@@ -11,16 +11,19 @@
   const collapse = (s) => String(s).split(/\s+/).filter(Boolean).join(" ");
   const tokens = (s) => String(s).split(/\s+/).filter(Boolean);
 
-  // An all-caps run of 1-3 words (3+ letters in all) ending in a colon, followed by a space or the end.
-  const LABEL = /(?<![A-Za-z0-9])([A-Z][A-Z0-9'+/&-]+(?: [A-Z0-9][A-Z0-9'+/&-]+){0,2}):(?=\s|$)/g;
-  // A paragraph break where a sentence ends and the next opens with a short "Label words: " lead.
-  const BREAK = /(?<=[.!?])\s+(?=[A-Z][^.:]{0,30}: )/g;
+  // An all-caps run of 1-3 words (3+ letters in all) ending in a colon, followed by a space or the end, not preceded by a
+  // letter or digit. No lookbehind (Safari before 16.4 cannot parse one): the preceding character is group 1 and is not
+  // part of the label.
+  const LABEL = /(^|[^A-Za-z0-9])([A-Z][A-Z0-9'+/&-]+(?: [A-Z0-9][A-Z0-9'+/&-]+){0,2}):(?=\s|$)/g;
+  // A paragraph break where a sentence ends and the next opens with a short "Label words: " lead. Group 1 is the
+  // sentence's closing mark, which stays with its sentence.
+  const BREAK = /([.!?])\s+(?=[A-Z][^.:]{0,30}: )/g;
 
   function labelMatches(s) {
     const out = [];
     for (const m of s.matchAll(LABEL)) {
-      if ((m[1].match(/[A-Za-z]/g) || []).length < 3) continue;
-      out.push({ label: m[1], start: m.index, end: m.index + m[0].length });
+      if ((m[2].match(/[A-Za-z]/g) || []).length < 3) continue;
+      out.push({ label: m[2], start: m.index + m[1].length, end: m.index + m[0].length });
     }
     return out;
   }
@@ -29,7 +32,7 @@
     const parts = [];
     let last = 0;
     for (const m of text.matchAll(BREAK)) {
-      parts.push(text.slice(last, m.index));
+      parts.push(text.slice(last, m.index + 1));
       last = m.index + m[0].length;
     }
     parts.push(text.slice(last));
@@ -82,8 +85,9 @@
     return out;
   }
 
-  // The headline of a text: its first sentence, and the rest. No sentence end inside the first 200 characters: all headline,
-  // never cut (a text over 200 characters is cut at a space near 160).
+  // The headline of a text: up to its first sentence end that falls 20 or more characters in (a shorter opening sentence,
+  // "Yes.", stays in the headline with what follows it), and the rest. No such end inside the first 200 characters: all
+  // headline, never cut (a text over 200 characters is cut at a space near 160).
   function headline(text) {
     const t = collapse(text);
     for (const m of t.matchAll(/[.!?](?=\s)/g)) {
@@ -102,8 +106,8 @@
   // in that shape, so a caller shows it as written.
   function optionRows(text) {
     const rows = [];
-    for (const part of collapse(text).split(" · ")) {
-      const m = /^\(([A-Za-z])\)\s*(.+)$/.exec(part);
+    for (const part of collapse(text).split(/\s*·\s*/)) {
+      const m = /^\(([a-z0-9]{1,8})\)\s*(.+)$/.exec(part);
       if (!m) return [];
       rows.push({ key: m[1], text: m[2].trim() });
     }
@@ -136,27 +140,61 @@
     return false;
   }
 
-  // The signed message of a needs-phill card is `flow needs-phill answer` then `key: value` lines (flow's
-  // needs_phill_sign._message). Null when the text is not that shape, so any other message is drawn as written.
-  const HEADER = "flow needs-phill answer";
-  function parseMessage(message) {
-    if (typeof message !== "string") return null;
-    const lines = message.split("\n");
-    if (lines[0] !== HEADER) return null;
-    const card = { repo: "", item: "", asked: null, stopped: null, recommended: "", optionLines: [] };
-    for (const line of lines.slice(1)) {
-      let m;
-      if ((m = /^asked: (.*)$/.exec(line))) card.asked = m[1];
-      else if ((m = /^stopped: (.*)$/.exec(line))) card.stopped = m[1];
-      else if ((m = /^repo: (.*)$/.exec(line))) card.repo = m[1];
-      else if ((m = /^item: (.*)$/.exec(line))) card.item = m[1];
-      else if ((m = /^recommended: (.*)$/.exec(line))) card.recommended = m[1];
-      else if ((m = /^option \(([a-z0-9]{1,8})\): (.*)$/.exec(line))) card.optionLines.push({ key: m[1], text: m[2] });
-    }
-    return card.asked === null ? null : card;
+  // The options whose text the card shows in full, the one answer both the "Options, in full" panel and the OPTIONS
+  // prose under Stopped are decided by: the signed option lines when the message carries them, else the buttons.
+  function fullOptions(card, options) {
+    return card.optionLines.length ? card.optionLines : (options || []);
   }
 
-  const api = { collapse, sections, headline, optionRows, words, repeatsRows, parseMessage };
+  // The signed message of a needs-phill card, in the exact grammar flow's verifier reads (needs_phill_sign._message and
+  // parse_verified): `flow needs-phill answer`, then item, row_version, repo, asked, stopped, an optional
+  // `recommended: (<key>) <text>`, any `option (<key>): <text>` lines (each key once), then nonce and filed, one line each,
+  // in that order and nothing else. A trailing \r on a line is taken off. `request` is the sign request the message came
+  // in: its namespace must be "flow-needs-phill" (the namespace flow files every needs-phill answer under), the signed
+  // recommendation must be one of its options (key and text) and agree with its `recommended`, and signed option lines
+  // must be its options' keys in order. Null for anything else, so the sheet draws the message as written, whole and
+  // visible: the card never shows a reading of a message that differs from what is signed.
+  const HEADER = "flow needs-phill answer";
+  const NAMESPACE = "flow-needs-phill";
+  const HEAD_FIELDS = ["item", "row_version", "repo", "asked", "stopped"];
+  const TAIL_FIELDS = ["nonce", "filed"];
+  const REC_LINE = /^recommended: \(([a-z0-9]{1,8})\) (.+)$/;      // the key domain is levain's option key, [a-z0-9]{1,8}
+  const OPTION_LINE = /^option \(([a-z0-9]{1,8})\): (.+)$/;
+  function parseMessage(message, request) {
+    if (typeof message !== "string" || !request || typeof request !== "object" || request.namespace !== NAMESPACE) return null;
+    const lines = message.split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+    const n = HEAD_FIELDS.length, t = TAIL_FIELDS.length;
+    if (lines.length < 1 + n + t || lines[0] !== HEADER) return null;
+    const got = {};
+    const fields = HEAD_FIELDS.concat(TAIL_FIELDS);
+    const at = lines.slice(1, 1 + n).concat(lines.slice(lines.length - t));
+    for (let i = 0; i < fields.length; i++) {
+      if (!at[i].startsWith(fields[i] + ": ")) return null;
+      got[fields[i]] = at[i].slice(fields[i].length + 2);
+    }
+    let mid = lines.slice(1 + n, lines.length - t);
+    let recKey = "", recText = null;
+    if (mid.length && mid[0].startsWith("recommended: ")) {
+      const m = REC_LINE.exec(mid[0]);
+      if (!m) return null;
+      recKey = m[1];
+      recText = m[2];
+      mid = mid.slice(1);
+    }
+    const optionLines = [];
+    for (const line of mid) {
+      const m = OPTION_LINE.exec(line);
+      if (!m || optionLines.some((o) => o.key === m[1])) return null;
+      optionLines.push({ key: m[1], text: m[2] });
+    }
+    const options = Array.isArray(request.options) ? request.options : [];
+    if (recKey && !options.some((o) => o && o.key === recKey && o.text === recText)) return null;
+    if (request.recommended !== undefined && request.recommended !== null && request.recommended !== recKey) return null;
+    if (optionLines.length && (optionLines.length !== options.length || optionLines.some((o, i) => !options[i] || options[i].key !== o.key))) return null;
+    return { repo: got.repo, item: got.item, asked: got.asked, stopped: got.stopped, recommended: recKey, optionLines: optionLines };
+  }
+
+  const api = { collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);
