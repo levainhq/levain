@@ -55,12 +55,10 @@ def test_band_text_and_payload_number_by_the_stores_own_n():
     assert [i["question"] for i in p["items"]] == [7, 11]
 
 
-def test_answer_text_goes_through_the_stores_own_answer():
+def test_a_foreign_store_band_is_read_only_and_answers_record_nothing():
     store = ForeignStore()
     p = band_view.band_payload(store, "cockpit:web")
-    done = band_view.answer_text(store, "7b", viewer="cockpit:web", channel="cockpit",
-                                 store_id=p["store_id"], view_id=p["view_id"])
-    assert store.answered == [("np-bbbb2222", "b", None, "cockpit")]
-    assert done.answered == ("np-bbbb2222",) and done.recorded
-    with pytest.raises(band_view.StaleBand):
-        band_view.answer_text(store, "7a", viewer="cockpit:web", channel="cockpit", store_id="other", view_id=p["view_id"])
+    with pytest.raises(ValueError, match="nothing was recorded"):
+        band_view.answer_text(store, "7b", viewer="cockpit:web", channel="cockpit",
+                              store_id=p["store_id"], view_id=p["view_id"])
+    assert store.answered == []

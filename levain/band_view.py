@@ -144,12 +144,6 @@ def _foreign_open(store: Any) -> list[Question]:
     return sorted(store.open_questions(), key=lambda q: (q.n, q.id))
 
 
-def _foreign_by_n(store: Any) -> dict[int, Question]:
-    qs = _foreign_open(store)
-    twice = {q.n for q in qs if sum(1 for o in qs if o.n == q.n) > 1}
-    return {q.n: q for q in qs if q.n not in twice}
-
-
 def _read(store: QuestionStore) -> tuple[list[tuple[str, Question | None]], dict[str, int], list[tuple[int, str]]]:
     """(the open questions oldest first as ``(id, question)`` with ``None`` for one that cannot be read, the numbers
     allocated so far by ref, the numbered items whose question has since been answered and not yet shown closed), from
@@ -791,40 +785,6 @@ def _foreign_payload(store: Any, shown: Rendered) -> dict[str, Any]:
             "view_id": FOREIGN_VIEW_ID, "items": items, "note": _UNREAD_NOTE if shown.failed else ""}
 
 
-def _foreign_answer(store: Any, text: str, *, channel: str) -> Applied:
-    """:func:`answer_text` for a foreign store: the shorthand is parsed against the store's open questions now and each
-    recorded through the store's OWN ``answer(ref, option=|text=, channel=)``, as the cockpit's ``question_answer`` verb
-    does; no sidecar, no view. An item the store refuses is refused for itself."""
-    questions = _foreign_by_n(store)
-    view = View(max(questions, default=0), tuple(sorted(questions)), FOREIGN_STORE_ID)
-    plan = parse(text, view, {n: _info_of(q) for n, q in questions.items()}, FOREIGN_STORE_ID)
-    if not plan.matched or plan.rest.strip():
-        raise ValueError(plan.hint or "the whole text must be band answers, e.g. `1a, 2: rec`; nothing was recorded")
-    recorded: list[str] = []
-    refused = [r.reason for r in plan.refused] + [f"{s.n}: this store has no signing sheet; nothing opened"
-                                                  for s in plan.sheets]
-    ids: list[str] = []
-    for act in plan.actions:
-        q = questions.get(act.n)
-        try:
-            if q is None:
-                raise ValueError(f"{act.n} was not open in the band you saw; nothing recorded for it")
-            if act.text is not None:
-                store.answer(q.id, text=act.text, channel=channel)
-            else:
-                store.answer(q.id, option=q.options[_LETTERS.index(act.pick or "")][0], channel=channel)
-        except Exception as exc:                  # one item's refusal never costs the others
-            refused.append(f"{act.n}: {exc}")
-        else:
-            recorded.append(act.label)
-            ids.append(q.id)
-    try:
-        echo = format_echo(recorded, refused, channel, plan.hint, [])
-    except Exception:
-        echo = "[Levain band answer] recorded: " + (", ".join(recorded) or "nothing")
-    return Applied(recorded, refused, echo, (), tuple(ids))
-
-
 class StaleBand(ValueError):
     """The band an answer names (``store_id``, ``view_id``) is not the one this viewer was last shown."""
 
@@ -863,9 +823,10 @@ def answer_text(store: QuestionStore, text: str, *, viewer: str, channel: str, s
     if channel not in ("cockpit", "phone"):
         raise ValueError(f"a surface answers on the cockpit or the phone, not {channel!r}")
     if _foreign(store):
-        if store_id != FOREIGN_STORE_ID or view_id != FOREIGN_VIEW_ID:
-            raise StaleBand(_STALE)
-        return _foreign_answer(store, text, channel=channel)
+        # The band of a foreign store is a READ: its numbers are the host's own (up to ten digits, wider than the shorthand
+        # takes), its signed cards refuse an unsigned answer, and it hands levain no view to bind an answer to. Its
+        # questions are answered where the host answers them (the cards, the signing sheet), so nothing is recorded here.
+        raise ValueError("this cockpit's questions are answered on their own cards, not by band shorthand; nothing was recorded")
     view = _view_by_id(store, viewer, view_id)
     if view is None:                                  # no view of this viewer's to plan from; the store is checked below
         raise StaleBand(_STALE)
