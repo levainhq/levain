@@ -3627,6 +3627,7 @@ def make_server(
     signer: "Signer | None" = None,
     extra_hosts: "Iterable[str] | None" = None,
     compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None,
+    coordinator_verbs: bool = False,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -3663,6 +3664,10 @@ def make_server(
     downstream T2/T3 verb applies through, and its ``canonical_effect``), which the broker fires. One
     naming a verb outside ``extra_verbs`` or a kernel verb, or failing ``Broker.check_downstream``,
     raises ``ValueError`` before binding. A T2/T3 downstream verb with none answers ``not_built``.
+
+    ``coordinator_verbs`` says a coordinator watcher runs beside this server: only then, over a write scope, are the
+    Coordinator panel's Start / Stop / Hold registered (a caller's verb or effect under one of their names is then a
+    ``ValueError``). Without a watcher a Stop would end the launch's record while its session ran on.
 
     Non-loopback binding (a LAN / Tailscale IP) is governed by the source's nature:
     - a READ-ONLY, NO-INSTALL source (``write_scope is None`` AND ``install_root is None`` —
@@ -3871,13 +3876,22 @@ def make_server(
         team_v, team_e = team_verbs(source.install_root)
         extra_verbs.update(team_v)
         extra_effects.update(team_e)
-    if source.write_scope is not None:
-        # C10 S3: Start / Stop / Hold on the Coordinator panel, over the directory that panel reads. The directory is read
-        # on each call (the consent reader is attached below), and a caller's verb under one of these names is refused.
+    if coordinator_verbs and source.write_scope is not None:
+        # C10 S3: Start / Stop / Hold on the Coordinator panel, over the directory that panel reads, only beside the
+        # watcher that stops a released session and retries a pending launch. The directory is read on each call (the
+        # consent reader is attached below), and a caller's verb under one of these names is refused.
         from levain.cockpit import coordinator_status
         from levain.cockpit.providers import _dispatch_dir
 
-        coord_v = coordinator_status.status_verbs(lambda: _dispatch_dir(getattr(httpd, "consent_reader", None)))
+        def coord_dir() -> Any:
+            # a call before the server is bound resolves as a server with no consent reader does
+            try:
+                reader = getattr(httpd, "consent_reader", None)
+            except NameError:
+                reader = None
+            return _dispatch_dir(reader)
+
+        coord_v = coordinator_status.status_verbs(coord_dir)
         clash = sorted(n for n in coord_v if n in extra_verbs or n in extra_effects)
         if clash:
             raise ValueError(f"refusing extra_verbs/extra_effects {clash}: those names are the Coordinator panel's verbs")
@@ -4242,7 +4256,9 @@ def run_web_server(
             return 1
 
     try:
-        httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class)
+        # the Coordinator panel's verbs exactly when the watcher below runs beside this server
+        httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class,
+                            coordinator_verbs=write)
     except ValueError as exc:  # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback
         print(str(exc), file=sys.stderr)
         return 1

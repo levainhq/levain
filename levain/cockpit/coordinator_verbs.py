@@ -3,7 +3,7 @@
 Each is an act the coordinator already has, fired from the panel; nothing here adds state or a rule.
 
 - **Start** does what a drop with no holder does: :meth:`CoordStore.coord_wake` writes a ``pending`` coordinator launch
-  and its ``bootstrap`` claim, and a daemon thread runs :func:`levain.coordinator.launch.launch_session` on it, the
+  and its ``bootstrap`` claim, and a thread runs :func:`levain.coordinator.launch.launch_session` on it, the
   shape :meth:`levain.coordinator.phone.CoordPhone._wake` has (the reply never waits on a spawn). Start first reads the
   state the panel draws (:func:`levain.cockpit.coordinator_status._read_status`, on the read-only connection): any word
   but ``wake`` is refused with the panel's own line (``<word>: <why>``) and nothing is written, so Start in ``backoff``
@@ -125,6 +125,10 @@ class CoordinatorVerbs:
         if launch is None:
             # another writer moved the store between the read and the wake's own transaction
             word, why = self._state(store)
+            if word == "wake":
+                # it has moved back to a state that would accept: a refusal naming "wake" would contradict itself
+                raise EditError("unavailable", 503, "the coordinator store changed under the start; try again; "
+                                                    "nothing was started", {"state": word, "why": why})
             raise EditError("refused", 409, f"{word}: {why}", {"state": word, "why": why})
         started = self._start_thread(store, launch.launch_id)
         said = (f"coordinator launch {launch.launch_id} asked for; it is starting now and the panel shows how it went"
@@ -137,22 +141,38 @@ class CoordinatorVerbs:
         store = self._store()
         ended = self._write(store.coord_release, "nothing was released")
         held = None if ended is None else {"holder": ended.holder, "token": ended.token}
-        said = ("released" + ("" if ended is None else f" {ended.holder}'s lease (token {ended.token})")
-                + "; pending launches are voided and running coordinator launches ended; the serve's watcher stops "
-                  "the session on its next pass")
+        # the lease's holder is the launch's session key, not a person, so the line names the token only; the
+        # release voids and ends launches whether or not a lease was held
+        said = (("the coordinator lease was released" if ended is None else
+                 f"the coordinator lease (token {ended.token}) was released")
+                + "; any pending coordinator launch is voided, any running one ended, and the watcher stops its "
+                  "session on its next pass")
         return {"released": held, "said": said}
 
     def hold(self, _scope: Any, _params: dict[str, Any], _target: dict[str, Any], _confirm: bool) -> dict[str, Any]:
         store = self._store()
         token = self._write(lambda: store.coord_take(hold=HOLD), "nothing was taken")
-        held = self._write(store.coord_lease, "the hold was taken")
-        until = held.until if held is not None and held.token == token else None
+        # The take has committed. Nothing below raises: a refusal releases the fire's idempotency reservation, so a
+        # retry under the same key would take a second lease and void this one. A follow-up read that fails or shows
+        # another lease is said as it is, with no claim of a hold this fire could not confirm.
+        try:
+            held = store.coord_lease()
+        except Exception as exc:  # noqa: BLE001 - the take stands whatever this read does
+            return {"token": token, "until": None,
+                    "said": f"the coordinator lease was taken (token {token}); it could not be read back now "
+                            f"({type(exc).__name__}), so the panel shows how long it holds"}
+        if held is None or getattr(held, "token", None) != token:
+            gone = "released" if held is None else "superseded by another take or claim"
+            return {"token": token, "until": None,
+                    "said": f"the coordinator lease was taken (token {token}) and is already {gone}; drops do not "
+                            "queue for this hold"}
+        until = getattr(held, "until", None)
         return {"token": token, "until": until,
                 "said": f"you hold the coordinator lease until {until} (token {token}); drops queue for you"}
 
     # --- the start thread --------------------------------------------------------------------------------------------
     def _start_thread(self, store: Any, launch_id: str) -> bool:
-        """Start ``launch_id`` on a daemon thread; whether the thread started. A thread that cannot start leaves the
+        """Start ``launch_id`` on its own thread; whether the thread started. A thread that cannot start leaves the
         launch pending for the watcher, which starts every pending launch nobody claimed."""
         launcher = self._launcher
         if launcher is None:
@@ -177,10 +197,14 @@ class CoordinatorVerbs:
                 pass
 
         try:
-            t = threading.Thread(target=run, name=f"levain-coord-start-{launch_id}", daemon=True)
+            # Not a daemon: every harness call a launch makes is bounded by its own timeout, so a process exiting
+            # mid-start waits for the launch to settle (active, or failed with its session stopped) instead of being
+            # killed between a spawn and its record. Started under the lock and listed only once running, so the
+            # list never holds a thread that a join would refuse or that the prune would drop while it is starting.
+            t = threading.Thread(target=run, name=f"levain-coord-start-{launch_id}", daemon=False)
             with self._lock:
+                t.start()
                 self._starts = [w for w in self._starts if w.is_alive()] + [t]
-            t.start()
         except Exception:  # noqa: BLE001 - the wake has committed; the watcher is the launch's other starter
             with self._lock:
                 self._starts = [w for w in self._starts if w.is_alive()]
@@ -192,6 +216,8 @@ class CoordinatorVerbs:
         with self._lock:
             starts = list(self._starts)
         for t in starts:
+            if t.ident is None:      # never started: there is nothing to wait for
+                continue
             t.join(timeout)
 
     # --- the registration --------------------------------------------------------------------------------------------
