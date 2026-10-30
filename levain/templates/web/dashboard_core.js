@@ -7278,6 +7278,43 @@
     }
   }
 
+  // OS-3, the narrow page's strip: one tap goes to the phone view's content. Needs you, Board and Notifications are blocks on this
+  // page; Grants and Drop are drawn inside the Decisions view, so their tabs open it and take the reader to their own slot. That
+  // view fills as its reads answer, so the wait for the slot is bounded: a view with nothing to show (no standing grant) is left
+  // open at its top.
+  const PHONE_JUMP_TARGET = {
+    needs: "#ck-needs:not([hidden])",
+    board: ".panel[data-ck-panel=\"tray\"]",
+    notes: ".panel[data-ck-panel=\"notifications\"]",
+  };
+  const PHONE_JUMP_IN_VIEW = { grants: "#levain-modal .ext-grouphead", drop: "#levain-modal .coord-drop-slot" };
+  // The slot is scrolled to again until the view stops growing above it (two looks at the same height), so a row that fills in
+  // after the slot appeared does not leave the reader short of it.
+  function phoneJumpInView(which, tries, lastTop) {
+    const found = which === "drop" ? document.querySelector(PHONE_JUMP_IN_VIEW.drop)
+      : Array.from(document.querySelectorAll(PHONE_JUMP_IN_VIEW.grants)).find((h) => /standing grants/i.test(h.textContent));
+    if (found && found.getClientRects().length) {
+      if (lastTop !== undefined && Math.abs(found.getBoundingClientRect().top - lastTop) < 1) return;   // it stayed where the last scroll put it
+      found.scrollIntoView({ block: "start" });
+      lastTop = found.getBoundingClientRect().top;
+    }
+    if (tries > 0) window.setTimeout(() => phoneJumpInView(which, tries - 1, lastTop), 150);
+  }
+  function phoneJump(which, opener) {
+    if (which === "grants" || which === "drop") {
+      if (!document.getElementById("levain-modal") && !openDecisionsHistory(opener)) return;
+      phoneJumpInView(which, 20);
+      return;
+    }
+    const sel = PHONE_JUMP_TARGET[which];
+    const target = sel ? document.querySelector(sel) : null;
+    if (target) target.scrollIntoView({ block: "start" });
+  }
+  document.addEventListener("click", (ev) => {
+    const b = ev.target && ev.target.closest ? ev.target.closest("[data-phone-jump]") : null;
+    if (b) phoneJump(b.dataset.phoneJump, b);
+  });
+
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };

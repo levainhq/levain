@@ -48,6 +48,14 @@
         </div>
       </div>
     </header>
+    <!-- The narrow page's views, one jump each (drawn only under the stylesheet's 720px break; dashboard_core.js wires the clicks). -->
+    <nav class="ck-phonetabs" id="ck-phonetabs" aria-label="Views">
+      <button type="button" data-phone-jump="needs">Needs you</button>
+      <button type="button" data-phone-jump="board">Board</button>
+      <button type="button" data-phone-jump="notes">Notifications</button>
+      <button type="button" data-phone-jump="grants">Grants</button>
+      <button type="button" data-phone-jump="drop">Drop</button>
+    </nav>
     <section class="hero" id="ck-hero" data-ck-region="hero" hidden>
       <div class="band frame" id="ck-band">
         <button id="calmphone" type="button" data-calm-toggle aria-pressed="false">Calm off</button>
