@@ -312,3 +312,146 @@ def test_the_sheet_and_the_hero_derive_the_one_kept_key_the_same_way() -> None:
     core, sign = (root / "dashboard_core.js").read_text(), (root / "sign.js").read_text()
     want = '"levain-drop-pending:" + window.location.hostname'
     assert want in core and want in sign, "the hero and the sheet must build the kept-drop key the same way"
+    assert 'dropPendKey() + ":" + id' in core and 'PEND_KEY + ":" + id' in sign, "and the per-outbox-id key the same way"
+
+
+# ---- L3 r2 (1030-42): pending requests are kept per outbox id, the sheet's "reload", the grow of a programmatic value, the failure colour ----
+
+SIGNED_ID = "ph-" + "ab" * 16
+SIGNED = {"words": "signed earlier", "outbox_id": SIGNED_ID, "sent_at": "2026-10-30T12:00:00.123000Z", "store_id": "store-from-before", "envelope": {"kind": "kept"}}
+EARLIER = "document.querySelector('#ck-drop .drop-earlier').textContent"
+
+
+def _seed(rec: dict) -> str:
+    return f"localStorage.setItem({PEND} + ':' + {json.dumps(rec['outbox_id'])}, {json.dumps(json.dumps(rec))});"
+
+
+KEYS = "JSON.stringify({t: 'keys', keys: Object.keys(localStorage).filter(k => k.indexOf('levain-drop-pending:') === 0).sort(), box: document.getElementById('ck-drop-words').value, earlier: " + EARLIER + "})"
+
+
+@needs_browser
+@needs_ssh
+def test_a_new_drop_never_overwrites_a_restored_signed_pending_one_and_the_signed_one_comes_back_whole(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _seed(SIGNED)}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
+             _type("something else entirely"), CLICK_SEND, {"posts": 1, "ms": 15000}, {"until": "/^Sent/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
+             {"eval": KEYS}, CLICK_SEND, {"posts": 2, "ms": 15000}]
+    with rig.serving():
+        out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    new, again = _posted(out)
+    assert new["words"] == "something else entirely" and "envelope" not in new and new["outbox_id"] != SIGNED_ID, new
+    k = _tagged(out)["keys"]
+    assert len(k["keys"]) == 1 and k["keys"][0].endswith(":" + SIGNED_ID), k      # the new one answered and left; the signed one is still kept
+    assert k["box"] == "signed earlier" and "not confirmed earlier" in k["earlier"], k       # and it is back in the box, to send unchanged
+    assert again == SIGNED, again                                                            # whole: envelope and store included
+
+
+@needs_browser
+@needs_ssh
+def test_an_unanswered_new_drop_leaves_the_older_pending_one_kept_and_counted(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _seed(SIGNED) + LOSE_FIRST_REPLY}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
+             _type("lost reply"), CLICK_SEND, {"posts": 1, "ms": 15000}, {"until": RECEIPT_DONE + " && /^Not sure/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
+             {"eval": KEYS}]
+    with rig.serving():
+        out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    k = _tagged(out)["keys"]
+    assert len(k["keys"]) == 2 and any(x.endswith(SIGNED_ID) for x in k["keys"]), k
+    assert k["earlier"] == "1 earlier drop not confirmed.", k
+
+
+def _reply(envelope: dict) -> str:
+    body = {"created": True, "drop": {"drop_id": "d-1"}, "store_id": "s1", "envelope": envelope}
+    return ("(() => { const f = window.fetch; window.fetch = function (u, o) { const url = typeof u === 'string' ? u : (u && u.url) || '';"
+            " if (o && o.method === 'POST' && url.indexOf('/cockpit/coord/drop') >= 0) return Promise.resolve(new Response(" + json.dumps(json.dumps(body)) + ", {status: 200, headers: {'Content-Type': 'application/json'}}));"
+            " return f.apply(this, arguments); }; })();")
+
+
+@needs_browser
+@needs_ssh
+@pytest.mark.parametrize("envelope,says,bad", [({"taken": True, "envelope_id": "env-1"}, "envelope env-1 taken", False),
+                                               ({"taken": False, "refused": "stale signature"}, "envelope NOT taken: stale signature", True)])
+def test_a_resent_signed_request_says_what_became_of_its_envelope_not_words_only(envelope: dict, says: str, bad: bool, tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _seed(SIGNED) + _reply(envelope)}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
+             CLICK_SEND, {"until": "/^Sent/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
+             {"eval": "JSON.stringify({t: 'r', text: document.querySelector('#ck-drop .drop-receipt').textContent, bad: document.querySelector('#ck-drop .drop-receipt').classList.contains('bad')})"}]
+    with rig.serving():
+        out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    r = _tagged(out)["r"]
+    assert says in r["text"] and "words only" not in r["text"] and r["bad"] is bad, r
+
+
+@needs_browser
+@needs_ssh
+def test_the_sheets_reload_message_reads_the_drops_again_not_from_the_cache(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    count = ("(() => { const f = window.fetch; window.__gets = 0; window.fetch = function (u, o) { const url = typeof u === 'string' ? u : (u && u.url) || '';"
+             " if (url.indexOf('/cockpit/coord/drops.json') >= 0) window.__gets++; return f.apply(this, arguments); }; })();")
+    msg = ("(() => { const fr = document.querySelector('#levain-sign-sheet-frame, iframe[title=\"coordinator drop\"]'); window.__before = window.__gets;"
+           " window.dispatchEvent(new MessageEvent('message', {data: {levainSheet: 'reload'}, origin: location.origin, source: fr.contentWindow})); return 1; })()")
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": count}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
+             {"eval": "window.LevainSignSheet.openDrop(''); 1"}, {"eval": msg}, {"eval": "new Promise(r => setTimeout(r, 700)).then(() => 1)"},
+             {"eval": "JSON.stringify({t: 'g', before: window.__before, after: window.__gets})"}]
+    with rig.serving():
+        out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    g = _tagged(out)["g"]
+    assert g.get("after", 0) > g.get("before", 99), (g, out["values"][-4:])
+
+
+NO_FIELD_SIZING = ("document.addEventListener('DOMContentLoaded', () => { const s = document.createElement('style');"
+                   " s.textContent = 'textarea { field-sizing: fixed !important; }'; document.head.appendChild(s); });")
+LONG = "\n".join(f"line {i} of the words kept from an earlier visit" for i in range(40))
+
+
+@needs_browser
+@needs_ssh
+def test_restored_words_grow_the_box_where_the_browser_has_no_field_sizing(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    rec = dict(SIGNED, words=LONG)
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _seed(rec) + NO_FIELD_SIZING}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
+             {"eval": f"JSON.stringify({{t: 'h', style: {BOX}.style.height, fits: {BOX}.offsetHeight >= {BOX}.scrollHeight}})"}]
+    with rig.serving():
+        out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    h = _tagged(out)["h"]
+    assert h["style"].endswith("px") and h["fits"], h
+
+
+@needs_browser
+@needs_ssh
+def test_words_handed_to_the_sheet_grow_its_box_where_the_browser_has_no_field_sizing(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    frame = "document.querySelector('#levain-sign-sheet-frame, iframe[title=\"coordinator drop\"]')"
+    box = f"({frame} && {frame}.contentDocument && {frame}.contentDocument.getElementById('drop-words'))"
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": NO_FIELD_SIZING}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
+             {"eval": f"window.LevainSignSheet.openDrop({json.dumps(LONG)}); 1"}, {"until": f"{box} && {box}.value.length > 100", "ms": 30000},
+             {"eval": f"JSON.stringify({{t: 'h', style: {box}.style.height, fits: {box}.offsetHeight >= {box}.scrollHeight}})"}]
+    with rig.serving():
+        out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    h = _tagged(out)["h"]
+    assert h["style"].endswith("px") and h["fits"], h
+
+
+@needs_browser
+@needs_ssh
+def test_the_drop_sheet_asks_about_a_pending_request_kept_under_its_own_outbox_id(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    plain = {"words": "kept by the hero", "outbox_id": "ph-" + "cd" * 16, "sent_at": "2026-10-30T12:00:00.123000Z", "store_id": None}
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
+             {"eval": _seed(plain).replace("localStorage", "window.localStorage") + " window.LevainSignSheet.openDrop(''); 1"}, {"posts": 1, "ms": 30000}]
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    assert [p["outbox_id"] for p in _posted(out)] == [plain["outbox_id"]], out["posts"]
+
+
+def test_the_failure_lines_of_the_hero_take_the_theme_danger_colour_not_the_text_colour() -> None:
+    css = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.css").read_text()
+    for sel in ("body.ke .ck-drop .drop-note.bad", "body.ke .ck-drop .drop-receipt.bad"):
+        rule = css[css.index(sel):].split("}", 1)[0]
+        assert "color: var(--bad)" in rule, rule
+
+
+def test_the_hero_commits_its_state_before_it_registers_the_keydown_listener() -> None:
+    core = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard_core.js").read_text()
+    build = core[core.index("function dropHeroBuild(host)"):core.index("function dropHeroDraw(host, r)")]
+    assert build.index("host._drop = ui;") < build.index('host.addEventListener("keydown"'), "a failed build must leave no listener behind"

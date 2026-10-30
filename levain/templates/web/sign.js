@@ -761,10 +761,11 @@
     words.placeholder = "your words";
     words.setAttribute("aria-label", "your words");
     body.appendChild(words);
+    const grow = (t) => { const f = window.LevainCardFormat; if (f && typeof f.grow === "function") f.grow(t); };      // a programmatic value fires no input event
     // words typed in the cockpit's drop box and handed over by "Add an envelope" (dashboard_core.js openDropSheet): read once
     try {
       const pre = window.sessionStorage.getItem("levain-drop-prefill");
-      if (pre) { words.value = pre; window.sessionStorage.removeItem("levain-drop-prefill"); }
+      if (pre) { words.value = pre; grow(words); window.sessionStorage.removeItem("levain-drop-prefill"); }
     } catch (e) { /* the sheet opens empty */ }
     const det = el("details", "");
     det.id = "drop-env";
@@ -807,14 +808,30 @@
     // a drop whose answer is not known is kept in this browser BEFORE it is posted (as the phone's outbox keeps it), so a
     // closed sheet loses nothing: the next open sends it again, unchanged (the same outbox id files once), and it leaves
     // only on a definite answer
+    // one record per outbox id, so a new drop never overwrites one whose answer is unknown (the cockpit's hero keeps the same way)
     const PEND_KEY = "levain-drop-pending:" + window.location.hostname;
-    const keep = (req) => { try { window.localStorage.setItem(PEND_KEY, JSON.stringify(req)); } catch (e) { /* kept in this visit only */ } };
-    const drop0 = () => { try { window.localStorage.removeItem(PEND_KEY); } catch (e) { /* nothing kept */ } };
-    const kept = () => {
+    const pendKey = (id) => PEND_KEY + ":" + id;
+    const keep = (req) => { try { window.localStorage.setItem(pendKey(req.outbox_id), JSON.stringify(req)); } catch (e) { /* kept in this visit only */ } };
+    const drop0 = (req) => {
       try {
-        const v = JSON.parse(window.localStorage.getItem(PEND_KEY) || "null");
-        return v && typeof v === "object" && typeof v.outbox_id === "string" && typeof v.words === "string" ? v : null;
-      } catch (e) { return null; }
+        window.localStorage.removeItem(pendKey(req.outbox_id));
+        const old = JSON.parse(window.localStorage.getItem(PEND_KEY) || "null");      // a record an earlier build kept under the bare key
+        if (old && old.outbox_id === req.outbox_id) window.localStorage.removeItem(PEND_KEY);
+      } catch (e) { /* nothing kept */ }
+    };
+    // the newest unresolved one; the others stay kept, for the cockpit's hero
+    const kept = () => {
+      const all = [];
+      try {
+        for (let i = 0; i < window.localStorage.length; i++) {
+          const k = window.localStorage.key(i);
+          if (k !== PEND_KEY && !(k && k.indexOf(PEND_KEY + ":") === 0)) continue;
+          const v = JSON.parse(window.localStorage.getItem(k) || "null");
+          if (v && typeof v === "object" && typeof v.outbox_id === "string" && typeof v.words === "string") all.push(v);
+        }
+      } catch (e) { /* nothing kept */ }
+      all.sort((a, b) => String(b.sent_at || "").localeCompare(String(a.sent_at || "")));
+      return all.length ? all[0] : null;
     };
     let signedLine = "";
     const done = (a, plain) => {
@@ -874,7 +891,7 @@
       };
       return post("drop", req).then((a) => {
         if (a.ok) {
-          drop0();
+          drop0(req);
           unsure = false;
           if (signed) { ended(); if (signedLine) signing(signedLine, "server", "Signed"); else relabel("Signed"); $("sheet").dataset.state = "signed"; }
           return done(a, !signed);
@@ -882,7 +899,7 @@
         if (a.status >= 400 && a.status < 500) {
           // refused: nothing was delivered with this request (a stale signature is signed again from the review); the
           // controls come back with the words, whether this was the first send or a retry
-          drop0();
+          drop0(req);
           if (signed) { relabel("Not signed"); ended(); }
           restore();
           return refusal(a, signed ? "the signed drop was not delivered; review and sign again, or send the words alone" : "the drop was not delivered");
@@ -973,6 +990,7 @@
     const left = kept();
     if (left) {
       words.value = left.words;
+      grow(words);
       oid = left.outbox_id;
       say("A drop from earlier was not confirmed; asking whether it landed…");
       sendDrop(left);

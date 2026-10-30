@@ -2860,13 +2860,15 @@ body .state-input { font-size: 16px; }
 body.ke .ck-drop.frame { padding-inline: 0; margin-inline: var(--gutter-ke); margin-top: var(--sec); display: flex; flex-direction: column; gap: var(--sp-3); }
 body.ke .ck-drop[hidden] { display: none; }
 body.ke .ck-drop .needs-headline h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
-body.ke .ck-drop .drop-note.bad { color: var(--text); }
+body.ke .ck-drop .drop-note.bad { color: var(--bad); }
 body.ke .ck-drop .drop-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
 body.ke .ck-drop .needs-primary { color: var(--base); background: var(--text); border-color: var(--text); min-width: 96px; }
 body.ke .ck-drop .needs-primary:hover { background: var(--text); opacity: .88; }
 body.ke .ck-drop button:disabled, body.ke .ck-drop textarea:disabled { opacity: .5; cursor: default; }
 body.ke .ck-drop .drop-receipt { margin: 0; min-height: 1.2em; overflow-wrap: anywhere; }
-body.ke .ck-drop .drop-receipt.bad { color: var(--text); }
+body.ke .ck-drop .drop-receipt.bad { color: var(--bad); }
+body.ke .ck-drop .drop-earlier { margin: 0; overflow-wrap: anywhere; }
+body.ke .ck-drop .drop-earlier:empty { display: none; }
 body.ke .ck-drop .drop-recent { display: flex; flex-direction: column; }
 body.ke .ck-drop .drop-recent-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: var(--sp-4); align-items: baseline; padding: var(--sp-2) 0; border-top: 1px solid var(--hair); }
 body.ke .ck-drop .drop-words-first { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
