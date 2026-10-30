@@ -6,6 +6,18 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+- **The Claude Code coordinator no longer loads your user-level Claude Code layer.** A coordinator session now starts
+  with `--setting-sources project,local` and auto-memory off, so your `~/.claude` settings, hooks, `CLAUDE.md` and
+  memory stay out of its context (measured on a cold turn: about 53K new cache tokens and $0.214 before, 9K and $0.038
+  with the flag). Its own install's project and local settings, including the consent hook, still apply. To put your
+  layer back, run `levain coord agent --user-scope on` (it keeps the agent, model and directory; `--user-scope off`
+  returns to the default, and `levain coord agent claude --user-scope on` sets both at once). `levain coord status`
+  and its `--json` show the choice (`user layer: off (project settings only)`). A store from before this change reads as
+  off. With the layer off, a `disableAllHooks` that lives only in your user settings no longer refuses the coordinator
+  launch, since the session never reads that file; `disableAllHooks` in the coordinator's own or an ancestor project
+  still refuses. Covered by tests of the spawn argv and the setting.
+
 ### Fixed
 - **On macOS, a Codex session signed in with a ChatGPT subscription runs in a slot instead of failing with
   `account/read -32603`.** Codex syncs its managed preferences at start, and a slot account whose home was `/var/empty`

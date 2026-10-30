@@ -163,7 +163,7 @@ def workdir(tmp_path):
 @pytest.fixture
 def live_hook(monkeypatch):
     """The hook check passes (the real check against a real install is test_coord_agent_sets_up_the_install)."""
-    monkeypatch.setattr(cl, "hook_live", lambda d: (True, "wired to this install"))
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (True, "wired to this install"))
 
 
 @pytest.fixture
@@ -204,7 +204,9 @@ def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_
     assert not any("please fix the flaky test" in a for a in argv)
     # exactly the measured argv, plus the model, plus the prompt naming the brief; never --session-id or a bypass
     assert argv[:7] == ["--bg", "-n", name, "--permission-mode", "default", "--model", "haiku"]
-    assert len(argv) == 8 and str(brief) in argv[7]
+    # the default: the user layer stays out (project + local settings only, auto-memory off), flags before the prompt
+    assert argv[7:11] == ["--setting-sources", "project,local", "--settings", '{"autoMemoryEnabled":false}']
+    assert len(argv) == 12 and str(brief) in argv[11]
     assert not any(a in ("--session-id", "--bare", "--dangerously-skip-permissions") or "bypass" in a for a in argv)
     spawn = next(c for c in fake.calls() if c["argv"][:1] == ["--bg"])
     assert spawn["cwd"] == str(workdir.resolve())
@@ -357,7 +359,7 @@ def test_a_directory_whose_hook_is_not_live_refuses(qdir, tmp_path, fake, monkey
     assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
     assert rows(qdir, "SELECT count(*) FROM launch_spawns") == [(0,)]
     # fixed while it is still pending, the same launch starts
-    monkeypatch.setattr(cl, "hook_live", lambda d: (True, "wired to this install"))
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (True, "wired to this install"))
     assert cl.launch_session(store, launch_id).started
 
 
@@ -1104,7 +1106,7 @@ def test_a_session_found_gone_loses_its_brief_in_the_same_pass(store, fake, live
 
 
 def test_a_refusal_before_the_spawn_claim_is_one_line_too(store, fake, monkeypatch):
-    monkeypatch.setattr(cl, "hook_live", lambda d: (False, "first line\nsecond\tline ‮"))
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (False, "first line\nsecond\tline ‮"))
     got = cl.launch_session(store, woken(store))
     assert "\n" not in got.refusal and "first line second line" in got.refusal and "‮" not in got.refusal
 
@@ -1131,7 +1133,8 @@ def test_hooks_turned_off_by_a_settings_file_refuse_the_launch(tmp_home, qdir, f
     # G1: doctor's real check of a real install; the consent hook row still reads "wired", a later row says off
     from levain import doctor
 
-    _main(qdir, capsys, "coord", "agent", "claude")
+    # a user-level file reaches the coordinator only with --user-scope on (the default no longer loads it)
+    _main(qdir, capsys, "coord", "agent", "claude", *(["--user-scope", "on"] if scope == "user" else []))
     target = (tmp_home / ".levain" / "coordinator").resolve()
     assert cl.hook_live(target)[0]
     f = tmp_home / ".claude" / "settings.json" if scope == "user" else target / ".claude" / "settings.local.json"
@@ -1377,3 +1380,108 @@ def test_every_levain_verb_the_brief_names_passes_the_coordinators_door(store, f
     assert {("coord", "questions"), ("coord", "answer"), ("coord", "escalate"), ("coord", "claim")} <= paths
     refused = sorted(p for p in paths if p not in door.DOOR)
     assert not refused, f"the brief names verbs the coordinator's door refuses: {refused}"
+
+
+# --- 1030-42: the coordinator spawns without your user layer unless --user-scope on -----------------------------
+def _spawn_argv_and_sha(store, fake, qdir):
+    launch_id = woken(store, "layers")
+    assert cl.launch_session(store, launch_id).started
+    argv = fake.spawns()[-1]
+    (sha,) = rows(qdir, "SELECT argv_sha256 FROM launch_events WHERE launch_id = ? AND kind = 'active'", launch_id)
+    return argv, sha[0]
+
+
+def test_user_scope_off_is_the_default_and_on_restores_the_old_argv(store, fake, live_hook, qdir, workdir):
+    assert store.coord_setting().user_scope is False
+    off_argv, off_sha = _spawn_argv_and_sha(store, fake, qdir)
+    assert off_argv.index("--setting-sources") < off_argv.index("--settings") < len(off_argv) - 1
+    assert off_argv[off_argv.index("--setting-sources") + 1] == "project,local"
+    assert off_argv[off_argv.index("--settings") + 1] == '{"autoMemoryEnabled":false}'
+    assert len(off_argv) == 12 and off_sha.startswith("sha256:")
+
+
+def test_user_scope_on_spawns_with_neither_flag(qdir, workdir, fake, live_hook):
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    argv, _sha = _spawn_argv_and_sha(s, fake, qdir)
+    assert argv[:7] == ["--bg", "-n", argv[2], "--permission-mode", "default", "--model", "haiku"]
+    assert len(argv) == 8 and "--setting-sources" not in argv and "--settings" not in argv
+
+
+def test_the_recorded_argv_sha_differs_between_on_and_off(qdir, workdir, fake, live_hook, tmp_path):
+    shas = {}
+    for scope in (False, True):
+        q = tmp_path / f"q-{scope}"
+        q.mkdir(mode=0o700)
+        s = CoordStore(q)
+        s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=scope)
+        argv, sha = _spawn_argv_and_sha(s, fake, q)
+        shas[scope] = (argv, sha)
+    assert "--setting-sources" in shas[False][0] and "--settings" in shas[False][0]
+    assert "--setting-sources" not in shas[True][0] and "--settings" not in shas[True][0]
+    assert shas[False][1] != shas[True][1]
+
+
+def test_a_pre_existing_store_reads_as_off_and_keeps_its_row(tmp_path):
+    q = tmp_path / "old"
+    q.mkdir(mode=0o700)
+    s = CoordStore(q)
+    s.coord_setting()                                   # makes the store with the current schema
+    c = sqlite3.connect(q / "dispatch.db")
+    try:
+        # coord_settings as it was before user_scope: no column, one standing row (its triggers go with the table)
+        c.execute("DROP TABLE coord_settings")
+        c.execute("CREATE TABLE coord_settings (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, "
+                  "agent TEXT NOT NULL, model TEXT, cwd TEXT, by TEXT NOT NULL, at TEXT NOT NULL)")
+        c.execute("INSERT INTO gseq (at) VALUES ('2026-01-01T00:00:00Z')")
+        c.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, by, at) VALUES (1, 'claude', 'haiku', '/x', "
+                  "'operator', '2026-01-01T00:00:00Z')")
+        c.commit()
+        row = lease.setting(c)                          # a reader on the old format, before any writer migrates it
+    finally:
+        c.close()
+    assert (row.agent, row.model, row.user_scope) == ("claude", "haiku", False)
+    fresh = CoordStore(q)                               # a writer's opener migrates, the old row reads off
+    got = fresh.coord_setting()
+    assert (got.agent, got.model, got.user_scope) == ("claude", "haiku", False)
+    assert fresh.coord_set_agent("claude", model="haiku", cwd="/x", user_scope=True).user_scope is True
+    assert fresh.coord_set_agent("claude", model="sonnet", cwd="/x").user_scope is True      # None keeps the choice
+    assert fresh.coord_set_agent("none").user_scope is False
+
+
+def test_coord_status_says_the_user_layer(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    text = _main(qdir, capsys, "coord", "status").out
+    assert "user layer: off (project settings only)" in text
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["setting"]["user_scope"] is False
+    out = _main(qdir, capsys, "coord", "agent", "claude", "--user-scope", "on").out
+    assert "user layer: on" in out
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["setting"]["user_scope"] is True
+    s = CoordStore(qdir).coord_setting()
+    # --user-scope alone keeps the agent, model and directory
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")
+    t = CoordStore(qdir).coord_setting()
+    assert (t.agent, t.model, t.cwd, t.user_scope) == (s.agent, s.model, s.cwd, False)
+    # a bad value, no agent and nothing, and --user-scope on none, are refused
+    with pytest.raises(SystemExit) as bad:
+        _main(qdir, capsys, "coord", "agent", "claude", "--user-scope", "maybe")
+    assert bad.value.code == 2
+    _main(qdir, capsys, "coord", "agent", rc=1)
+    _main(qdir, capsys, "coord", "agent", "none", "--user-scope", "on", rc=1)
+
+
+def test_a_user_level_disable_all_hooks_is_not_consulted_without_user_scope(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    user = tmp_home / ".claude"
+    user.mkdir(exist_ok=True)
+    (user / "settings.json").write_text('{"disableAllHooks": true}')
+    live, detail = cl.hook_live(target, user_scope=True)
+    assert not live and "turned off by" in detail
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert live, detail
+    assert "project,local only" in detail and "user-level disableAllHooks is not consulted" in detail
+    # a project-level file still refuses, with or without the user layer
+    (target / ".claude" / "settings.local.json").write_text('{"disableAllHooks": true}')
+    assert not cl.hook_live(target, user_scope=False)[0]

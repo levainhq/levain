@@ -1222,6 +1222,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
         print(f"levain coord {cmd}: {exc}", file=sys.stderr)
         return 1
     lines = [_lease_line(st["lease"]), f"next drop: {st['wake']} ({st['why']})"]
+    if st.get("setting"):
+        lines.append(user_layer_text(st["setting"]))
     for ln in st["launches"]:
         lines.append(f"  {ln['launch_id']}  {ln['role']}  {ln['harness']}  {ln['state']} ({ln['cause']})  "
                      f"session {ln['session_key']}  asked {ln['at']}")
@@ -1229,13 +1231,38 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
     return 0
 
 
+def user_layer_text(setting: Any) -> str:
+    """The setting's user-layer line, as ``coord agent`` and ``coord status`` say it (a Setting or its dict)."""
+    agent, on = (setting["agent"], setting.get("user_scope")) if isinstance(setting, dict) else (
+        setting.agent, setting.user_scope)
+    if agent != "claude":
+        return "user layer: not applicable (not a claude coordinator)"
+    if on:
+        return "user layer: on (your user settings, hooks, CLAUDE.md and auto-memory load too)"
+    return "user layer: off (project settings only)"
+
+
 def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
     """``levain coord agent``: for claude, the directory is made a Levain install for Claude Code first when it is not
     one (``levain init``, non-interactive), and the setting is recorded only once its consent hook is live; codex is
     :func:`_coord_agent_codex`. Either workspace goes in the coordinator record before the setting names it."""
-    if args.agent == "none":
+    user_scope = None if args.user_scope is None else args.user_scope == "on"
+    if args.agent is None:
+        # `levain coord agent --user-scope on|off` alone: the standing setting is kept whole, only the layer choice moves
+        if user_scope is None:
+            raise CoordError("name an agent (claude, codex or none), or give --user-scope on|off to change only that")
         if args.cwd is not None or args.model is not None:
-            raise CoordError("agent none takes no --model and no --cwd")
+            raise CoordError("--user-scope alone keeps the agent, model and directory; name the agent to change them")
+        was = store.coord_setting()
+        if was is None or was.agent == "none":
+            raise CoordError("no coordinator agent is set (levain coord agent claude sets one)")
+        got = store.coord_set_agent(was.agent, model=was.model, cwd=was.cwd, user_scope=user_scope)
+        _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "user_scope": got.user_scope},
+              f"coordinator agent: {got.agent}; {user_layer_text(got)}")
+        return 0
+    if args.agent == "none":
+        if args.cwd is not None or args.model is not None or user_scope is not None:
+            raise CoordError("agent none takes no --model, no --cwd and no --user-scope")
         store.coord_set_agent("none")
         _emit(out, args.json, {"agent": "none"}, "coordinator agent: none (drops queue for you; nothing launches)")
         return 0
@@ -1250,8 +1277,10 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     from levain.coordinator.launch import default_coordinator_dir, setup_install, trust_remedy
 
     log = sys.stderr if args.json else out
+    standing = store.coord_setting()
+    effective = user_scope if user_scope is not None else (standing is not None and standing.user_scope)
     target, live, detail = setup_install(args.cwd or default_coordinator_dir(),
-                                         emit=lambda line: print(line, file=log, flush=True))
+                                         emit=lambda line: print(line, file=log, flush=True), user_scope=effective)
     if not live:
         raise CoordError(f"not set: the consent hook is not live in {target}: {detail}")
     if not door.marked(target):
@@ -1263,10 +1292,12 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
                          f"workspace; leave out --cwd to use {default_coordinator_dir()}, or name a missing or empty "
                          "directory for Levain to set up")
     _record_workspace(target)
-    got = store.coord_set_agent("claude", model=args.model, cwd=str(target))
+    got = store.coord_set_agent("claude", model=args.model, cwd=str(target), user_scope=user_scope)
     remedy = trust_remedy(target)
-    _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "trust": remedy},
+    _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "user_scope": got.user_scope,
+                           "trust": remedy},
           f"coordinator agent: claude{f' ({got.model})' if got.model else ''} in {got.cwd}\n"
+          f"{user_layer_text(got)}\n"
           "Claude Code starts a session only in a directory you trusted; run this once and accept the trust prompt:\n"
           f"{remedy}")
     return 0
@@ -1439,11 +1470,13 @@ def _coord_agent_codex(args: argparse.Namespace, out: Any, store: EnvelopeStore)
     operator's own Codex install, never his hooks file), then it is recorded and the setting written."""
     from levain.coordinator import codex_launch
 
+    if args.user_scope is not None:
+        raise CoordError("--user-scope is for a claude coordinator (a Codex coordinator loads its own config)")
     target, ready, detail = codex_launch.setup(args.cwd)
     if not ready:
         raise CoordError(f"not set: {detail}")
     _record_workspace(target)
-    got = store.coord_set_agent("codex", model=args.model, cwd=str(target))
+    got = store.coord_set_agent("codex", model=args.model, cwd=str(target), user_scope=False)
     _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "detail": detail},
           f"coordinator agent: codex{f' ({got.model})' if got.model else ''} in {got.cwd}\n{detail}")
     return 0
@@ -1605,7 +1638,11 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "--adapter codex). Either workspace is put in Levain's coordinator record, which the coordinator's "
                     "door reads. none: drops only queue for you. Levain never edits a harness's trust list: run the "
                     "printed line once and trust the directory.")
-    ca.add_argument("agent", choices=("claude", "codex", "none"))
+    ca.add_argument("agent", nargs="?", default=None, choices=("claude", "codex", "none"))
+    ca.add_argument("--user-scope", choices=("on", "off"), default=None, dest="user_scope",
+                    help="claude: whether the coordinator also loads your user-level Claude Code settings, hooks, "
+                         "CLAUDE.md and auto-memory (default off: it loads the project and local layers only). Alone "
+                         "(no agent) it changes only this and keeps the standing agent, model and directory.")
     ca.add_argument("--cwd", type=Path, default=None, metavar="DIR",
                     help="The directory the coordinator runs in (default: <levain home>/coordinator, or "
                          "coordinator-codex): a missing or empty one, which Levain sets up, or a coordinator "

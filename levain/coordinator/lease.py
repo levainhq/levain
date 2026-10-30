@@ -125,6 +125,7 @@ LEASE_SCHEMA: tuple[str, ...] = (
     # model and no directory, a harness always a directory
     "CREATE TABLE IF NOT EXISTS coord_settings (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, "
     f"agent TEXT NOT NULL CHECK ({_in('agent', SETTING_AGENTS)}), model TEXT, cwd TEXT, "
+    "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), "
     "by TEXT NOT NULL CHECK (by = 'operator'), at TEXT NOT NULL, "
     "CHECK ((agent = 'none' AND model IS NULL AND cwd IS NULL) OR (agent != 'none' AND cwd IS NOT NULL)))",
     # pid: the levain process that won the spawn (the session's own process is the harness's, known only after)
@@ -237,6 +238,7 @@ class Setting:
     model: str | None
     cwd: str | None      # resolved: the directory a coordinator session runs in
     at: str
+    user_scope: bool = False    # True: the session also loads your user-level Claude Code settings; False: project, local
 
 
 def _plus(now: str, delta: timedelta) -> str:
@@ -717,8 +719,18 @@ def _idle(conn: sqlite3.Connection, now: str) -> tuple[Launch | None, list[Launc
 # --- the coordinator setting and the spawn ----------------------------------------------------------------------
 def setting(conn: sqlite3.Connection) -> Setting | None:
     """The latest coordinator setting, or None when you never set one."""
-    r = conn.execute("SELECT agent, model, cwd, at FROM coord_settings ORDER BY seq DESC LIMIT 1").fetchone()
-    return None if r is None else Setting(*r)
+    # a store made before user_scope has no such column until a writer's opener migrates it: it reads as OFF
+    col = "user_scope" if "user_scope" in {c[1] for c in conn.execute("PRAGMA table_info(coord_settings)")} else "0"
+    r = conn.execute(f"SELECT agent, model, cwd, at, {col} FROM coord_settings ORDER BY seq DESC LIMIT 1").fetchone()
+    return None if r is None else Setting(r[0], r[1], r[2], r[3], bool(r[4]))
+
+
+def migrate_settings(conn: sqlite3.Connection) -> None:
+    """The additive migration: ``coord_settings`` gains ``user_scope``, 0 (off) on every row written before it. Runs in
+    the opener's schema transaction, like the replies' sequence."""
+    if "user_scope" not in {c[1] for c in conn.execute("PRAGMA table_info(coord_settings)")}:
+        conn.execute("ALTER TABLE coord_settings ADD COLUMN user_scope INTEGER NOT NULL DEFAULT 0 "
+                     "CHECK (user_scope IN (0, 1))")
 
 
 def check_model(model: object) -> str | None:
@@ -732,9 +744,10 @@ def check_model(model: object) -> str | None:
 
 
 def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | None = None,
-              cwd: str | None = None) -> Setting:
+              cwd: str | None = None, user_scope: bool | None = None) -> Setting:
     """Record your coordinator setting (writer: you only). ``cwd`` is stored as given, which the caller has resolved
-    (Claude Code keys a directory's trust on its real path); agent ``none`` takes neither model nor directory."""
+    (Claude Code keys a directory's trust on its real path); agent ``none`` takes neither model nor directory.
+    ``user_scope`` None keeps the standing setting's (off when there is none); agent ``none`` is always off."""
     if agent not in SETTING_AGENTS:
         raise _refused(f"the coordinator agent is one of {', '.join(SETTING_AGENTS)}")
     if agent == "none":
@@ -742,8 +755,13 @@ def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | No
             raise _refused("agent none takes no --model and no --cwd")
     elif not isinstance(cwd, str) or not cwd.startswith("/"):
         raise _refused("a coordinator agent runs in a directory: an absolute path")
-    conn.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, by, at) VALUES (?, ?, ?, ?, 'operator', ?)",
-                 (next_gseq(conn, now), agent, check_model(model), _line("cwd", cwd), now))
+    if user_scope is None:
+        was = setting(conn)
+        user_scope = was is not None and was.user_scope
+    conn.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, user_scope, by, at) "
+                 "VALUES (?, ?, ?, ?, ?, 'operator', ?)",
+                 (next_gseq(conn, now), agent, check_model(model), _line("cwd", cwd),
+                  int(bool(user_scope) and agent != "none"), now))
     return setting(conn)
 
 
