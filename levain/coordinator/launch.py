@@ -291,12 +291,24 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         f"- Keep it while you work: `{lv} coord beat --token N {tail}` (each beat holds it "
         f"{int(LEASE_TTL.total_seconds() // 60)} more minutes).",
         f"- See it: `{lv} coord status {tail}`.",
-        f"- Hand it back when you stop: `{lv} coord release --by coordinator --token N {tail}`.",
+        f"- Hand it back when you stop, ONLY as the very last step and as its own command, after every split, note and "
+        f"escalate has returned (never between them, never in the same batch of commands): "
+        f"`{lv} coord release --by coordinator --token N {tail}`. A release run beside the writes ends your lease under "
+        "them and they are refused.",
         "",
         "## Your writes",
         "",
-        f"Every write goes `--by coordinator --token N {tail}`:",
+        f"Every write goes `--by coordinator --token N {tail}`. Prefer the forms that need no shell quoting: write the "
+        "text to a file with your Write tool (inside your workspace) or pipe it on stdin, then run ONE short command. "
+        "Type each flag out in full on the command; never keep flags in a shell variable (zsh does not split it).",
         "",
+        f"- split a drop, quoting-free: write `{{\"drop_id\": \"DROP_ID\", \"threads\": [{{\"kind\": \"note\", "
+        f"\"title\": \"one line\"}}]}}` to a file, then `{lv} drops split --json-file PATH --by coordinator "
+        f"--token N {tail}` (or the same JSON on stdin: `--stdin`);",
+        f"- note, quoting-free: `{lv} drops note DROP_ID --text-file PATH --by coordinator --token N {tail}` "
+        "(`--stdin` reads it from stdin); `coord escalate N`, `coord answer N`, `thread set ID FIELD` and `thread add "
+        "DROP_ID` take the same `--text-file PATH` / `--stdin`, and `thread state ID STATE` takes `--cause-file PATH`;",
+        "- the older quoted forms still work:",
         f"- split a drop into threads: `{lv} drops split DROP_ID --thread KIND:TITLE --by coordinator --token N "
         f"{tail}` (KIND is work, ask, note or relay; one intent per thread);",
         f"- a drop that needs nothing (read, nothing to do): `{lv} drops note DROP_ID --why \"one line\" --by "

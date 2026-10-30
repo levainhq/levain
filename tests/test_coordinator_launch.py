@@ -1733,3 +1733,159 @@ def test_drops_show_escapes_a_noted_why_and_survives_a_receipt_with_no_why(store
     assert "\x1b" not in out.out and "noted" in out.out
     out = _main(qdir, capsys, "drops", "show", d2.drop_id)
     assert "noted" in out.out
+
+
+# --- quoting-free coordinator verbs (1030-42 verbs; shadow 10-30: two of three real coordinators misfired) -----------
+HOSTILE = "it's \"quoted\" $HOME `date` \\ backslash; ünïcode ✓ 日本"
+
+
+def _held(store):
+    ln = started(store)
+    return store.coord_claim(ln.launch_id, ln.session_key)
+
+
+def test_a_hostile_note_why_goes_through_a_file_and_stdin_as_typed(store, qdir, fake, live_hook, capsys, tmp_path,
+                                                                    monkeypatch):
+    import io
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(f), "--by", "coordinator", "--token", str(token))
+    assert [r.body["why"] for r in store.drop_receipts(d1.drop_id) if r.body.get("stage") == "noted"] == [HOSTILE]
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO((HOSTILE + "\n").encode("utf-8"))))
+    _main(qdir, capsys, "drops", "note", d2.drop_id, "--stdin", "--by", "coordinator", "--token", str(token))
+    assert [r.body["why"] for r in store.drop_receipts(d2.drop_id) if r.body.get("stage") == "noted"] == [HOSTILE]
+
+
+def test_an_oversized_or_two_way_text_is_refused_by_the_same_limits(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    big = tmp_path / "big.txt"
+    big.write_text("x" * 201, encoding="utf-8")                                   # the --why limit is 200
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(big), "--token", str(token), rc=1)
+    assert "1 to 200 characters" in out.err
+    huge = tmp_path / "huge.txt"
+    huge.write_text("x" * 100_000, encoding="utf-8")                              # the read itself is bounded
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(huge), "--token", str(token), rc=1)
+    assert "holds more than" in out.err
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--why", "a", "--text-file", str(big), "--token", str(token),
+                rc=1)
+    assert "name the text once" in out.err
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--token", str(token), rc=1)
+    assert "say why" in out.err
+    bad = tmp_path / "bad.bin"
+    bad.write_bytes(b"\xff\xfe")
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(bad), "--token", str(token), rc=1)
+    assert "not UTF-8" in out.err
+
+
+def test_a_whole_split_is_one_json_document_with_hostile_titles(store, qdir, fake, live_hook, capsys, tmp_path,
+                                                                 monkeypatch):
+    """The 10-30 misfire: three splits in one shell line with the flags in a variable zsh did not split."""
+    import io
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    doc = tmp_path / "split.json"
+    doc.write_text(json.dumps({"drop_id": d1.drop_id,
+                               "threads": [{"kind": "work", "title": HOSTILE}, {"kind": "note", "title": "n", "about": "@1"}]}),
+                   encoding="utf-8")
+    out = _main(qdir, capsys, "drops", "split", "--json-file", str(doc), "--by", "coordinator", "--token", str(token))
+    assert "split into 2 threads" in out.out
+    titles = {t.title for t in store.threads()}
+    assert HOSTILE in titles and "n" in titles
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(json.dumps(
+        {"threads": [{"kind": "note", "title": HOSTILE + " 2"}]}).encode("utf-8"))))
+    out = _main(qdir, capsys, "drops", "split", d2.drop_id, "--stdin", "--by", "coordinator", "--token", str(token))
+    assert "split into 1 thread" in out.out and HOSTILE + " 2" in {t.title for t in store.threads()}
+
+
+def test_a_json_split_is_refused_by_the_same_checks_as_the_flags(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    doc = tmp_path / "split.json"
+    for body, why in ((json.dumps({"drop_id": d1.drop_id, "threads": [{"kind": "work", "title": "x" * 201}]}), "1 to 200"),
+                      (json.dumps({"drop_id": d1.drop_id, "threads": [{"kind": "bogus", "title": "x"}]}), "KIND:TITLE"),
+                      ("{not json", "not JSON"),
+                      (json.dumps({"drop_id": d1.drop_id, "extra": 1}), "only"),
+                      (json.dumps({"threads": []}), "drop_id")):
+        doc.write_text(body, encoding="utf-8")
+        out = _main(qdir, capsys, "drops", "split", "--json-file", str(doc), "--by", "coordinator", "--token", str(token),
+                    rc=1)
+        assert why in out.err, (body, out.err)
+    out = _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:t", "--json-file", str(doc),
+                "--by", "coordinator", "--token", str(token), rc=1)
+    assert "carries every thread itself" in out.err
+    assert store.threads() == []                                                   # nothing was written
+
+
+def test_the_old_flags_still_work_unchanged(store, qdir, fake, live_hook, capsys):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:Shadow probe", "--by", "coordinator",
+          "--token", str(token))
+    _main(qdir, capsys, "drops", "note", d2.drop_id, "--why", "fyi", "--by", "coordinator", "--token", str(token))
+    t = store.threads()[0]
+    _main(qdir, capsys, "thread", "set", t.thread_id, "title", "renamed", "--by", "coordinator", "--token", str(token))
+    _main(qdir, capsys, "thread", "state", t.thread_id, "done", "--cause", "done", "--by", "coordinator",
+          "--token", str(token))
+    assert store.thread_view(t.thread_id)[0].title == "renamed"
+
+
+def test_thread_set_state_and_add_take_hostile_text_from_a_file(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:first", "--by", "coordinator", "--token", str(token))
+    t = store.threads()[0]
+    f = tmp_path / "v.txt"
+    f.write_text(HOSTILE, encoding="utf-8")
+    _main(qdir, capsys, "thread", "set", t.thread_id, "title", "--text-file", str(f), "--by", "coordinator",
+          "--token", str(token))
+    assert store.thread_view(t.thread_id)[0].title == HOSTILE
+    out = _main(qdir, capsys, "thread", "set", t.thread_id, "title", "--by", "coordinator", "--token", str(token), rc=1)
+    assert "give the new value" in out.err
+    c = tmp_path / "c.txt"
+    c.write_text("because " + HOSTILE, encoding="utf-8")
+    _main(qdir, capsys, "thread", "state", t.thread_id, "done", "--cause-file", str(c), "--by", "coordinator",
+          "--token", str(token))
+    f.write_text("note:" + HOSTILE + " added", encoding="utf-8")
+    _main(qdir, capsys, "thread", "add", d1.drop_id, "--text-file", str(f), "--by", "coordinator", "--token", str(token))
+    assert HOSTILE + " added" in {x.title for x in store.threads()}
+
+
+def test_escalate_and_answer_take_their_text_from_a_file(store, qdir, tmp_path, monkeypatch):
+    import argparse
+
+    from levain.coordinator import cli as ccli
+
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    ns = argparse.Namespace(text_file=f, stdin=False)
+    assert ccli._text_input(ns, None, "--why") == HOSTILE and ccli._text_input(
+        argparse.Namespace(text_file=None, stdin=False), "inline", "--why") == "inline"
+    p = argparse.ArgumentParser()
+    ccli.add_parsers(p.add_subparsers(dest="command"))
+    for argv in (["coord", "escalate", "6", "--text-file", str(f), "--token", "1"],
+                 ["coord", "escalate", "6", "--stdin", "--token", "1"],
+                 ["coord", "answer", "6", "--text-file", str(f), "--token", "1"],
+                 ["coord", "answer", "6", "--stdin", "--token", "1"]):
+        got = p.parse_args(argv)
+        assert got.coord_cmd in ("escalate", "answer")
+
+
+def test_the_brief_leads_with_the_quoting_free_forms_and_one_unmistakable_release_rule(store, fake, live_hook):
+    got = cl.launch_session(store, woken(store))
+    text = cl.brief_path(store.launch(got.launch_id)).read_text()
+    assert "Prefer the forms that need no shell quoting" in text
+    assert "never keep flags in a shell variable (zsh does not split it)" in text
+    writes = text.split("## Your writes")[1].split("##")[0]
+    assert writes.index("--json-file PATH") < writes.index("the older quoted forms still work")
+    assert f"drops note DROP_ID --text-file PATH --by coordinator --token N --queue-dir " in writes
+    lease_part = text.split("## The lease")[1].split("## Your writes")[0]
+    assert "ONLY as the very last step and as its own command, after every split, note and escalate has returned" in lease_part

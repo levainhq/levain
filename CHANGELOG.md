@@ -7,6 +7,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Fixed
+- **The coordinator's verbs take their text without shell quoting.** Shadow 10-30: two of three real coordinators
+  misfired on their own shell lines (flags kept in a variable that zsh does not split, then a `coord release` run in the
+  same batch as the writes, which ended the lease under them). `drops note`, `coord escalate`, `coord answer`, `thread
+  set` and `thread add` take `--text-file PATH` or `--stdin` (strict UTF-8, one trailing newline dropped, read under a
+  byte cap, then the verb's own limit); `thread state` and `thread set` take `--cause-file PATH`; `drops split` takes
+  the whole split as one JSON document (`--json-file PATH` or `--stdin`:
+  `{"drop_id", "threads": [{"kind", "title", "about"?}], "attach": [{"kind", "thread"}]}`) through the same checks as
+  `--thread` and `--attach`. Every old flag works as before. The coordinator brief shows these forms first, says never
+  to keep flags in a shell variable, and says to release the lease only as the last step, as its own command.
 - **A coordinator's turn ends on a status line, and a drop that needs nothing gets a receipt.** The coordinator brief
   now carries an end-of-turn rule: the last line of its words is one `coordinator:` status line (what it did, how many
   items it escalated), never a question or "waits on you" (a coordinator that ended on an escalation sat in the agent

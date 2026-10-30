@@ -145,6 +145,49 @@ def _read_words(args: argparse.Namespace) -> str:
     return " ".join(args.words)
 
 
+def _read_input(path: Path | None) -> str:
+    """All of a file (``path``) or of stdin (``None``) as strict UTF-8 text, read under the byte cap a WORDS_MAX-character
+    text can take (the verb's own validator then applies its own, smaller limit), one trailing newline dropped, so
+    ``echo why | levain ... --stdin`` gives the same text as ``--why why``."""
+    cap = WORDS_MAX * 4 + 2
+    if path is None:
+        raw = sys.stdin.buffer.read(cap + 1)
+    else:
+        with open(path, "rb") as fh:
+            raw = fh.read(cap + 1)
+    if len(raw) > cap:
+        raise CoordError(f"{'stdin' if path is None else str(path)} holds more than {WORDS_MAX} characters")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise CoordError(f"{'stdin' if path is None else str(path)} is not UTF-8 text") from None
+    if text.endswith("\r\n"):
+        return text[:-2]
+    return text[:-1] if text.endswith("\n") else text
+
+
+def _text_input(args: argparse.Namespace, inline: str | None, flag: str) -> str | None:
+    """A verb's one free-text value: the inline ``flag`` as typed, or ``--text-file PATH`` / ``--stdin`` (no shell
+    quoting). Naming two of the three is refused; naming none returns ``None`` (the caller says what is missing)."""
+    path = getattr(args, "text_file", None)
+    use_stdin = bool(getattr(args, "stdin", False))
+    given = [n for n, v in ((flag, inline is not None), ("--text-file", path is not None), ("--stdin", use_stdin)) if v]
+    if len(given) > 1:
+        raise CoordError(f"name the text once: {', '.join(given)} were all given")
+    if path is not None:
+        return _read_input(path)
+    if use_stdin:
+        return _read_input(None)
+    return inline
+
+
+def _text_flags(p: argparse.ArgumentParser | Any) -> None:
+    """``--text-file`` and ``--stdin``: the quoting-free spellings of a verb's free text (a group or a parser)."""
+    p.add_argument("--text-file", dest="text_file", type=Path, default=None, metavar="PATH",
+                   help="Read the text from this file (no shell quoting).")
+    p.add_argument("--stdin", action="store_true", help="Read the text from stdin (no shell quoting).")
+
+
 def run_drop(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
@@ -961,23 +1004,70 @@ def _parse_attach(spec: str) -> Part:
     return Part(kind=kind, attach=thread_id)
 
 
+def _split_doc(text: str, positional: str | None) -> tuple[str, list[Part]]:
+    """One JSON document for a whole split: ``{"drop_id": ID, "threads": [{"kind", "title", "about"?}, ...],
+    "attach": [{"kind", "thread"}, ...]}``. Each entry goes through the same checks as ``--thread KIND:TITLE`` and
+    ``--attach KIND:THREAD``; ``about`` is a thread id or ``@N`` as for ``--about``."""
+    try:
+        doc = json.loads(text)
+    except ValueError as exc:
+        raise CoordError(f"the split document is not JSON: {str(exc)[:120]}") from None
+    if not isinstance(doc, dict) or set(doc) - {"drop_id", "threads", "attach"}:
+        raise CoordError('the split document is an object with only "drop_id", "threads" and "attach"')
+    drop_id = doc.get("drop_id", positional)
+    if not isinstance(drop_id, str) or not drop_id or (positional is not None and drop_id != positional):
+        raise CoordError('the split document names its drop as "drop_id" (and it must match DROP_ID when both are given)')
+    parts: list[Part] = []
+    for key, fields in (("threads", ("kind", "title", "about")), ("attach", ("kind", "thread"))):
+        rows = doc.get(key, [])
+        if not isinstance(rows, list):
+            raise CoordError(f'"{key}" is a list')
+        for row in rows:
+            if not isinstance(row, dict) or set(row) - set(fields) or not isinstance(row.get("kind"), str):
+                raise CoordError(f'each of "{key}" is an object with {", ".join(fields)} (kind required)')
+            if key == "threads":
+                part = _parse_part(f"{row['kind']}:{row.get('title') if isinstance(row.get('title'), str) else ''}")
+                about = row.get("about")
+                if about is not None and not isinstance(about, str):
+                    raise CoordError('"about" is a thread id or @N')
+                if about is not None:
+                    if part.kind == "work":
+                        raise CoordError('"about" applies to a new ask, note or relay thread, not a work thread')
+                    part = Part(part.kind, part.title, about=about)
+                parts.append(part)
+            else:
+                thread = row.get("thread")
+                parts.append(_parse_attach(f"{row['kind']}:{thread if isinstance(thread, str) else ''}"))
+    return drop_id, parts
+
+
 def run_split(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
         store = _store(args)
-        parts = [_parse_part(s) for s in args.thread]
-        if args.about is not None:
+        drop_id = args.drop_id
+        if args.json_file is not None or args.stdin:
+            if args.thread or args.attach or args.about is not None:
+                raise CoordError("a JSON split carries every thread itself; leave out --thread, --attach and --about")
+            if args.json_file is not None and args.stdin:
+                raise CoordError("name the JSON once: --json-file or --stdin")
+            drop_id, parts = _split_doc(_read_input(args.json_file), args.drop_id)
+        elif args.drop_id is None:
+            raise CoordError("name the drop (DROP_ID), or give the whole split as JSON (--json-file PATH or --stdin)")
+        else:
+            parts = [_parse_part(s) for s in args.thread]
+        if args.json_file is None and not args.stdin and args.about is not None:
             if all(p.kind == "work" for p in parts):
                 raise CoordError("--about applies to a new ask, note or relay thread; this split names none")
             parts = [Part(p.kind, p.title, about=None if p.kind == "work" else args.about) for p in parts]
         parts += [_parse_attach(a) for a in args.attach]
-        threads = store.split(args.drop_id, parts, by=args.by, token=args.token)
+        threads = store.split(drop_id, parts, by=args.by, token=args.token)
     except _REFUSED as exc:
         print(f"levain drops split: {exc}", file=sys.stderr)
         return 1
     n = len(threads)
     _emit(out, args.json, [_thread_row(t) for t in threads],
-          f"drop receipt: {args.drop_id} split into {n} thread{'s' if n != 1 else ''}\n"
+          f"drop receipt: {drop_id} split into {n} thread{'s' if n != 1 else ''}\n"
           + "\n".join(_thread_line(t) for t in threads))
     return 0
 
@@ -985,12 +1075,15 @@ def run_split(args: argparse.Namespace, out: Any = None) -> int:
 def run_note(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
-        _store(args).note(args.drop_id, args.why, token=args.token)
+        why = _text_input(args, args.why, "--why")
+        if why is None:
+            raise CoordError("say why: --why TEXT, --text-file PATH or --stdin")
+        _store(args).note(args.drop_id, why, token=args.token)
     except _REFUSED as exc:
         print(f"levain drops note: {exc}", file=sys.stderr)
         return 1
-    _emit(out, args.json, {"drop_id": args.drop_id, "stage": "noted", "why": args.why},
-          f"drop receipt: {args.drop_id} noted: {args.why}")
+    _emit(out, args.json, {"drop_id": args.drop_id, "stage": "noted", "why": why},
+          f"drop receipt: {args.drop_id} noted: {why}")
     return 0
 
 
@@ -1112,6 +1205,10 @@ def run_thread(args: argparse.Namespace, out: Any = None) -> int:
                     + "\n".join(f"    #{e[0]} {e[1]} = {e[2]}  [{e[4]}: {e[3]}]" for e in events))
             _emit(out, args.json, obj, text)
             return 0
+        if cmd in ("state", "set") and getattr(args, "cause_file", None) is not None:
+            if args.cause:
+                raise CoordError("name the cause once: --cause or --cause-file")
+            args.cause = _read_input(args.cause_file)
         if cmd == "state":
             t = store.set_state(args.thread_id, args.state, by=args.by, cause=args.cause, token=args.token)
         elif cmd == "merge":
@@ -1121,13 +1218,18 @@ def run_thread(args: argparse.Namespace, out: Any = None) -> int:
         elif cmd == "add":
             if args.about is not None and args.attach:
                 raise CoordError("--about names what a NEW thread concerns; an attach joins an existing one")
-            part = _parse_attach(args.attach) if args.attach else _parse_part(args.thread)
+            spec = _text_input(args, args.thread, "--thread") if not args.attach else None
+            if args.attach and (args.text_file is not None or args.stdin):
+                raise CoordError("name the thread once: --attach, or --thread / --text-file / --stdin")
+            part = _parse_attach(args.attach) if args.attach else _parse_part(spec or "")
             if args.about is not None:
                 part = Part(part.kind, part.title, about=args.about)
             t = store.add(args.drop_id, part, by=args.by, token=args.token)
         else:   # set
-            t = store.set_field(args.thread_id, args.field, args.value, by=args.by, cause=args.cause,
-                                token=args.token)
+            value = _text_input(args, args.value, "VALUE")
+            if value is None:
+                raise CoordError("give the new value: VALUE, --text-file PATH or --stdin")
+            t = store.set_field(args.thread_id, args.field, value, by=args.by, cause=args.cause, token=args.token)
     except _REFUSED as exc:
         print(f"levain thread {args.thread_cmd}: {exc}", file=sys.stderr)
         return 1
@@ -1347,7 +1449,10 @@ def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore
     if cmd == "escalate":
         from levain.consent.band import release_held_pings
 
-        reply_id = fr.escalate(store, args.ref, args.why, token=args.token)
+        why = _text_input(args, args.why, "--why")
+        if why is None:
+            raise CoordError("say why: --why TEXT, --text-file PATH or --stdin")
+        reply_id = fr.escalate(store, args.ref, why, token=args.token)
         released = release_held_pings(store.directory)        # a ping held for it goes now (C5-1)
         _emit(out, args.json, {"reply_id": reply_id, "pings": released},
               f"escalated: question {args.ref} waits on the operator (ANSWER {reply_id}); the question is untouched"
@@ -1374,7 +1479,8 @@ def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore
         head = _head_reader(args, store)
     except _faults():
         head = None
-    item, reply_id = fr.answer(store, args.ref, option=args.option, text=args.text, token=args.token,
+    item, reply_id = fr.answer(store, args.ref, option=args.option,
+                           text=_text_input(args, args.text, "--text"), token=args.token,
                                authority_source=(lambda: _band_snapshot(args, store)[0]) if head is not None
                                else (lambda: None), authority_head=head)
     _emit(out, args.json, {"item_id": item.item_id, "reply_id": reply_id},
@@ -1557,7 +1663,12 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ds = subparsers.add_parser("drops", help="Your drops: list, show, and split (the coordinator's door).")
     d_sub = ds.add_subparsers(dest="drops_cmd", required=True)
     sp = d_sub.add_parser("split", help="Name the threads a drop becomes (the coordinator's door).")
-    sp.add_argument("drop_id")
+    sp.add_argument("drop_id", nargs="?", default=None,
+                    help="The drop (or leave it out and name it as drop_id in the JSON).")
+    sp.add_argument("--json-file", dest="json_file", type=Path, default=None, metavar="PATH",
+                    help='The whole split as one JSON document read from this file (no shell quoting): '
+                         '{"drop_id": ID, "threads": [{"kind", "title", "about"?}], "attach": [{"kind", "thread"}]}.')
+    sp.add_argument("--stdin", action="store_true", help="The same JSON document, read from stdin.")
     sp.add_argument("--thread", action="append", default=[], metavar="KIND:TITLE",
                     help=f"A new thread holding the drop; KIND is one of {', '.join(KINDS)}. Repeatable.")
     sp.add_argument("--attach", action="append", default=[], metavar="KIND:THREAD",
@@ -1572,7 +1683,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
 
     nt = d_sub.add_parser("note", help="Mark a drop read with nothing to do (the coordinator's terminal receipt).")
     nt.add_argument("drop_id")
-    nt.add_argument("--why", required=True, metavar="ONE_LINE", help="Why it needs nothing; shown beside the drop.")
+    nt.add_argument("--why", default=None, metavar="ONE_LINE", help="Why it needs nothing; shown beside the drop.")
+    _text_flags(nt)
     nt.add_argument("--by", default="coordinator", choices=("coordinator",))
     token(nt)
     common(nt)
@@ -1602,6 +1714,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     tst.add_argument("--by", default="operator", choices=("operator", "coordinator"))
     token(tst)
     tst.add_argument("--cause", default="")
+    tst.add_argument("--cause-file", dest="cause_file", type=Path, default=None, metavar="PATH",
+                     help="Read the cause from this file (no shell quoting).")
     common(tst)
     tm = t_sub.add_parser("merge", help="Fold OTHER into INTO (one intent the split cut in two).")
     tm.add_argument("into")
@@ -1620,6 +1734,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     g = ta.add_mutually_exclusive_group(required=True)
     g.add_argument("--thread", metavar="KIND:TITLE")
     g.add_argument("--attach", metavar="KIND:THREAD")
+    _text_flags(g)
     ta.add_argument("--about", default=None, metavar="THREAD")
     ta.add_argument("--by", default="operator", choices=("operator", "coordinator"))
     token(ta)
@@ -1627,10 +1742,13 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     tf = t_sub.add_parser("set", help="Re-kind, re-title or set the repo of a thread.")
     tf.add_argument("thread_id")
     tf.add_argument("field", choices=("kind", "title", "repo"))
-    tf.add_argument("value")
+    tf.add_argument("value", nargs="?", default=None)
+    _text_flags(tf)
     tf.add_argument("--by", default="operator", choices=("operator", "coordinator"))
     token(tf)
     tf.add_argument("--cause", default="")
+    tf.add_argument("--cause-file", dest="cause_file", type=Path, default=None, metavar="PATH",
+                    help="Read the cause from this file (no shell quoting).")
     common(tf)
     for p in (tl, ts, tst, tm, td, ta, tf):
         p.set_defaults(func=run_thread)
@@ -1709,11 +1827,15 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     pick = can.add_mutually_exclusive_group(required=True)
     pick.add_argument("--option", default=None, help="The option KEY you pick.")
     pick.add_argument("--text", default=None, help="Your answer in your own words.")
+    pick.add_argument("--text-file", dest="text_file", type=Path, default=None, metavar="PATH",
+                      help="Your answer, read from this file (no shell quoting).")
+    pick.add_argument("--stdin", action="store_true", help="Your answer, read from stdin.")
     can.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
     can.add_argument("--data-root", dest="data_root", type=Path, default=None, help=band_root)
     ces = c_sub.add_parser("escalate", help="Leave a seat's question to the operator (an ANSWER waiting on him).")
     ces.add_argument("ref", help="The question's number or id.")
-    ces.add_argument("--why", required=True, help="Why it is the operator's, one line.")
+    ces.add_argument("--why", default=None, help="Why it is the operator's, one line.")
+    _text_flags(ces)
     ces.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
     cmo = c_sub.add_parser(
         "morning", help="The morning card: away, what waits UNDECIDED, thread budgets, what waits on you.",
