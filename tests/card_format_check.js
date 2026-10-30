@@ -92,16 +92,19 @@ const noJsonRec = C.parseMessage(short.message, req(short, { recommended: undefi
 check(noJsonRec && noJsonRec.recommended === "a", "the signed recommendation is the card's when the request names none");
 const crlf = C.parseMessage(short.message.replace(/\n/g, "\r\n"), req(short));
 check(crlf && crlf.asked === short.what && crlf.stopped === short.stopped, "a CRLF message reads as its LF twin");
-// signed option lines (a button cut one): read when they are the request's keys in order, and they are what the OPTIONS
-// prose is compared with, so the full text is shown once (deepseek MED#2)
-const full = withLines(7, short.options.map((o) => "option (" + o.key + "): " + o.text + " in full"));
+// signed option lines: read only when they are the request's keys in order AND its exact option texts (flow's verifier
+// compares the signed option text to the row's own), and then they are what the OPTIONS prose is compared with, so the
+// full text is shown once (deepseek MED#2, L3 r2 deepseek MED)
+const full = withLines(7, short.options.map((o) => "option (" + o.key + "): " + o.text));
+notCard(withLines(7, short.options.map((o, i) => "option (" + o.key + "): " + (i === 0 ? "harmless wording" : o.text))),
+  "a signed option line whose text is not the request's option text is not a card (the panel would show other words than the button signs)");
 const fc = C.parseMessage(full, req(short, { message: full }));
 check(fc && fc.optionLines.map((o) => o.key).join() === "a,b,c", "signed option lines in the request's order are read");
 check(C.fullOptions(fc, short.options) === fc.optionLines && C.fullOptions(C.parseMessage(short.message, req(short)), short.options) === short.options,
   "fullOptions: the signed lines when present, else the buttons");
 const proseFull = { label: "OPTIONS", blocks: [{ kind: "paragraph", text: fc.optionLines.map((o) => "(" + o.key + ") " + o.text).join(" · ") }] };
-check(C.repeatsRows(proseFull, C.fullOptions(fc, short.options), fc.recommended) && !C.repeatsRows(proseFull, short.options, fc.recommended),
-  "OPTIONS prose equal to the signed full lines is left out (it was kept against the cut buttons and drawn twice)");
+check(C.repeatsRows(proseFull, C.fullOptions(fc, short.options), fc.recommended),
+  "OPTIONS prose equal to the signed option lines is left out of Stopped (drawn once)");
 check(C.optionRows("(a) x·(b) y").length === 2, "options split on a · with no spaces around it");
 
 // 4. invariant over the whole message: every word of asked + stopped is shown by the headline, the headline's rest, or a section

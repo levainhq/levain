@@ -214,7 +214,8 @@
   function clearCard() {
     cardView = null;
     for (const n of document.querySelectorAll("[data-card]")) n.remove();
-    $("sheet-actions").classList.remove("card-rows");
+    const acts = $("sheet-actions");
+    if (acts) acts.classList.remove("card-rows");
   }
   function drawCardHead(body, card, msg) {
     const F = window.LevainCardFormat;
@@ -252,6 +253,8 @@
     const F = window.LevainCardFormat;
     const rec = card.recommended;
     const full = F.fullOptions(card, options);     // one decision: what the OPTIONS prose is compared to, and the panel
+    const stale = $("sheet-detail");
+    if (stale) stale.remove();
     const det = el("details", "card-detail");
     det.id = "sheet-detail";
     det.dataset.card = "detail";

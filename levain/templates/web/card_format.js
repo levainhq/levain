@@ -190,7 +190,7 @@
     const options = Array.isArray(request.options) ? request.options : [];
     if (recKey && !options.some((o) => o && o.key === recKey && o.text === recText)) return null;
     if (request.recommended !== undefined && request.recommended !== null && request.recommended !== recKey) return null;
-    if (optionLines.length && (optionLines.length !== options.length || optionLines.some((o, i) => !options[i] || options[i].key !== o.key))) return null;
+    if (optionLines.length && (optionLines.length !== options.length || optionLines.some((o, i) => !options[i] || options[i].key !== o.key || options[i].text !== o.text))) return null;
     return { repo: got.repo, item: got.item, asked: got.asked, stopped: got.stopped, recommended: recKey, optionLines: optionLines };
   }
 
