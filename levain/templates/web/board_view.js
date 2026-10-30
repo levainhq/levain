@@ -321,6 +321,8 @@
     // is the last good pull's model, cleared on a failed one; `bus.failed` says the latest read did not succeed.
     var bus = opts.bus || newBus();
     function pull() {
+      // a stopped view takes no sequence number: its request must not invalidate the mounted view's in-flight one
+      if (stopped) return Promise.resolve();
       // a per-bus sequence number, taken at request start: only the LATEST request's answer (good or failed) is applied, so a
       // slow older response never overwrites a newer one (the poll and a caller's `pull()` can overlap)
       var seq = bus.seq = (bus.seq || 0) + 1;
@@ -370,8 +372,7 @@
   // modal says "not read yet", never the stale line); the next mounted view pulls. A failure from a bad READ is left alone.
   function busToken(bus, has) {
     if (!has) {
-      if (!bus.failed) busFail(bus);
-      bus.lacked = true;
+      if (!bus.failed) { busFail(bus); bus.lacked = true; }       // `lacked` names a failure THIS gone-token caused
     } else if (bus.lacked) {
       bus.lacked = false;
       bus.failed = false;

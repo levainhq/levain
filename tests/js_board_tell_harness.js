@@ -120,8 +120,8 @@ async function bus() {
     steps[m] = { last: calls[calls.length - 1], model: two.h.model() && "set", failed: shared.failed, panel: two.host.children[0].textContent.slice(0, 40), heads: walk(two.host).filter((n) => n.className === "grp-head").length };
   }
   one.h.stop(); two.h.stop();
-  mode = 403; const before = calls.length; await two.h.pull();      // a stopped view's failed read tells nobody
-  return { afterFirst, watchersAfterStop, afterRemount, steps, stoppedPullCalls: calls.length - before, thrower: typeof thrower };
+  mode = 403; const before = calls.length; const seq0 = shared.seq; await two.h.pull();      // a stopped view's failed read tells nobody
+  return { afterFirst, watchersAfterStop, afterRemount, steps, stoppedPullCalls: calls.length - before, stoppedPullSeqMoved: shared.seq !== seq0, thrower: typeof thrower };
 }
 // L3 r1 (codex MED): a failed read retires the Send box, keeps the typed words, and the next good read re-offers it.
 async function tellFollowsTheRead() {
@@ -190,6 +190,10 @@ async function tokenTransitions() {
   shared.failed = true; calls.length = 0;
   V.busToken(shared, true);
   out.readFailureKept = { failed: shared.failed, calls: calls.slice() };
+  // L3 r2: a bus ALREADY failed by a bad read is not failed by the token, so the token going and coming back leaves it failed
+  shared.failed = true; shared.lacked = false; calls.length = 0;
+  V.busToken(shared, false); V.busToken(shared, true);
+  out.readFailureSurvivesTokenCycle = { failed: shared.failed, calls: calls.slice() };
   return out;
 }
 (async () => {

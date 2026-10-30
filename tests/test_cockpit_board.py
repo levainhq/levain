@@ -266,6 +266,7 @@ def test_the_watchers_belong_to_the_page_and_a_failed_read_tells_them():
         assert b["steps"][bad]["last"] == "FAILED" and b["steps"][bad]["model"] is None and b["steps"][bad]["failed"] is True, b["steps"][bad]
     assert b["steps"]["ok"]["last"] == cols and b["steps"]["ok"]["failed"] is False and b["steps"]["ok"]["heads"] == 6, b["steps"]["ok"]
     assert b["stoppedPullCalls"] == 0
+    assert b["stoppedPullSeqMoved"] is False              # L3 r2: a stopped view's pull takes no sequence number
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
@@ -310,6 +311,7 @@ def test_the_token_removed_fails_the_bus_and_its_return_clears_it():
     assert t["removedAgain"]["calls"] == ["model", "FAILED"]
     assert t["returned"]["failed"] is False and t["returned"]["model"] is None and t["returned"]["calls"] == ["model", "FAILED", "null"]
     assert t["readFailureKept"] == {"failed": True, "calls": []}
+    assert t["readFailureSurvivesTokenCycle"] == {"failed": True, "calls": []}      # L3 r2: the token did not cause that failure
 
 
 def _tell_run():
@@ -385,3 +387,19 @@ def test_a_compose_link_followed_in_an_open_cockpit_fills_only_an_idle_empty_box
     assert out["hashchange_edited"]["pre"]["value"] == "mine"                   # unsent edits are never overwritten
     assert out["hashchange_kept"]["pre"]["value"] == "A"                        # nor kept words
     assert out["hashchange_fill"]["handlers"] == 1
+
+
+def test_a_card_field_is_made_display_safe_and_bounded_at_the_source_so_the_kernel_validator_never_refuses_the_board():
+    """L3 r2 (complement MED). A projected row's title or a long done line carries a bidi override or runs past the kernel's
+    limit: `_card` shows the character marked and cuts the text, and the board value the kernel then checks is accepted."""
+    from levain.cockpit import engine
+    assert board.TEXT_MAX == engine.BOARD_TEXT_MAX
+    card = board._card({"id": "np-1", "repo": "flow", "title": "re‮gnihtemos", "done_line": "x" * (board.TEXT_MAX + 50),
+                        "status_category": "ready"}, None)
+    assert "‮" not in card["title"] and "<U+202E>" in card["title"].replace("⟨", "<").replace("⟩", ">")
+    assert len(card["done_line"]) == board.TEXT_MAX and card["repo"] == "flow" and card["id"] == "np-1"
+    spec = SimpleNamespace(id="b", kind="board")
+    value = {"schema": 1, "generated": "2026-10-29T20:00:00-04:00", "queue": "ok", "unreadable": [], "note": None,
+             "columns": [{"category": c, "count": 1 if c == "ready" else 0, "cards": [card] if c == "ready" else []}
+                         for c in board.CATEGORIES]}
+    assert engine._v_board(spec, value) is value

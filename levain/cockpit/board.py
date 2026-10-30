@@ -12,9 +12,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from levain.cockpit.display_safe import visible
 from levain.coordinator import ready
 
 BOARD_PATH = "/cockpit/board.json"
+TEXT_MAX = 1000        # the kernel's board validator refuses a longer card field (engine.BOARD_TEXT_MAX; one test pins them equal)
 CATEGORIES = ready.CATEGORIES
 BAND_HINT = "levain band"
 NO_QUEUE = "no queue yet"
@@ -36,9 +38,17 @@ def _line(rec: Mapping[str, Any] | None) -> dict[str, Any] | None:
     return {k: rec.get(k) for k in ("iso", "who", "why", "source", "from_category", "to_category", "applied_by")}
 
 
+def _text(value: Any) -> Any:
+    """A card's drawn text made display-safe and bounded here, so one bad field is shown marked and cut, never a reason for the
+    kernel's board validator to refuse the whole board."""
+    return visible(value)[:TEXT_MAX] if isinstance(value, str) else value
+
+
 def _card(item: Mapping[str, Any], rec: Mapping[str, Any] | None) -> dict[str, Any]:
     card = {k: item.get(k) for k in ("id", "repo", "title", "done_line", "tier", "depends_on", "status", "status_category",
                                     "declared_category", "held_reason", "well_formed", "rank", "unknown_category")}
+    for k in ("id", "repo", "title", "done_line"):
+        card[k] = _text(card[k])
     card["journal"] = _line(rec)
     return card
 
@@ -60,7 +70,7 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
         if q is None:
             card.update(title="UNREADABLE: this band item could not be read", unreadable=True)
         else:
-            card.update(title=str(q.what)[:_WHAT_MAX], source=band_view._tag(q), blocks=q.blocks, filed_at=q.filed_at)
+            card.update(title=_text(str(q.what)[:_WHAT_MAX]), source=band_view._tag(q), blocks=q.blocks, filed_at=q.filed_at)
         cards.append(card)
     return cards, None
 
