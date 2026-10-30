@@ -7,12 +7,84 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Fixed
+- **A cockpit with no question store no longer draws the Needs you band, or a note that it could not be recorded.** An
+  absent `questions.db` (no file, or an empty one) draws nothing in the band: no heading and no note, because nothing was
+  ever filed. A store that has content but cannot be read, is locked or lacks its identity row keeps its "the band could
+  not be recorded just now" line. The band also says it may be missing items when an authority source could not be read, when a second
+  read of an item failed, or when a question row or an authority item's record cannot be decoded; such a read is never
+  drawn as an absent store. The Board tab's Needs you column likewise reports nothing, instead of "could not be read",
+  for a cockpit that hosts no question store, or whose store file is absent or empty; a store that exists but fails to
+  read is still reported. Covered by tests,
+  including a real-browser test for the absent and unreadable cases; not run by hand on a real machine.
+- **`levain upgrade` run from a source tree with no installed `dist-info` refuses with "Could not tell how Levain was
+  installed"** (its message says to upgrade it your usual way, then run `levain upgrade --no-pip`) instead of printing `internal error:
+  PackageNotFoundError`. Covered by a test; not run by hand.
 - **A Claude passthrough route without `platform.claude.com` is refused when the session's routes load, naming the
   host and the route.** The login refresh goes to that host through the route's tunnel; your own passthrough route
   replaces the shipped one, so one without it made every refresh fail. Levain never adds the host to your route; the
   refusal says to. Other routes (brokered, Codex) are not checked.
 
 ### Added
+- **An agent session can set your `away` or `remote` presence, only when it quotes your words.** `levain ping away`
+  or `remote` run inside an agent session needs `--said "<what you told it>"` (the coordinator needs it for every
+  word it may set); with no words, or with words over 300 characters, the command is refused and nothing changes. The record keeps the agent, its session and the quote, and `levain ping status` adds
+  "set by <agent> <session> from your words: <quote>" (the coordinator's own session is named as such). A seat may set
+  only `away` and `remote`; the coordinator may also set `quiet` and `sleep`. `back` and `loud` stay yours, and no
+  agent session can replace a standing `loud`: while it stands, every word an agent tries to set is refused. A session that is detected but cannot be named refuses and sets nothing.
+  Run from your own terminal (no agent session above it), any word works as before. Known edge: the role comes from
+  the session id in the caller's environment under one user id, so a seat that sets the coordinator's session id is
+  recorded as the coordinator and may set `quiet` or `sleep`; the record shows intent and does not stop a process that
+  lies about its environment. Covered by tests; not run by hand on a real machine.
+- **The cockpit has a Coordinator panel.** It shows the coordinator's wake state and the reason `levain coord
+  status` gives for it, verbatim, then who holds the lease and until when, the coordinator setting, and the latest
+  launches with their cause. The state is one of `held`, `launching`, `idle`, `unset`, `backoff`, `stopped` or `wake`.
+  The panel's reads open the store read-only; its buttons (next entry) write. A lapse or a pending launch's expiry that is due but not yet written is applied
+  to an in-memory copy, so the state row matches the CLI's, and the lease and launch rows say the write is not
+  recorded. Covered by tests, including a real-browser test with one fixture store per wake state.
+- **The Coordinator panel has Start, Stop and Hold.** Start asks for a coordinator now by the rules a drop runs (it
+  waits out a backoff and starts nothing while the coordinator is stopped) and starts it at once; a Start
+  that the coordinator's state refuses names that state and its reason, as the panel shows it. Stop releases the
+  coordinator lease, voids a pending launch and ends a running one, and the serve's watcher stops that launch's
+  session on its next pass. Hold takes the lease for 30 minutes: a pending launch is voided, a running launch ends
+  the same way (the watcher stops its session on its next pass), and drops queue for you. A retry of the same tap
+  repeats nothing, and a Hold whose lease cannot be read back says so instead of failing. The three buttons exist only
+  on a serve that runs the watcher. An embedding server that runs its own watcher asks for them with
+  `make_server(coordinator_verbs=True)` over a writable source.
+  Covered by tests, including real-browser
+  tests; not run by hand on a real machine, and a real session stopped from the panel has not been watched.
+- **`levain serve --write` supervises the coordinator.** While the serve is up it runs the pass `levain coord watch`
+  runs, every 30 seconds: it starts a pending launch nobody started, ends a launch whose session is gone, beats the
+  live holder's lease and stops the session of a launch that is over. It reads the directory the Coordinator panel
+  reads, and a directory with no coordinator store is not watched and not created. A pass and a hand-run `levain coord
+  watch` take one lock, so they never stop the same thing twice. A pass that faults is one line in the serve log, and a
+  pass whose lines repeat the previous pass's is not logged again, so a standing refusal such as "claude is not on PATH" is logged when it starts and when it changes. A launch finds `claude` on
+  the PATH a login unit gives the serve. Covered by tests; a real serve under launchd stopping a real session has not
+  been run by hand. Known edges: the serve's daemon unit does not carry `LEVAIN_HOME` (only `install-feeds` does), so
+  every store under the levain home that a daemon-installed serve reads, the Coordinator panel's, its buttons' and the
+  pass's included, is the default one, `~/.levain`; a hand-run `levain coord watch --once` exits 0 when the serve's
+  pass held the lock.
+- **The cockpit's Board tab groups the ready queue under column headings, and the panel's ⤢ view draws the six columns.**
+  The columns are backlog, ready, running, waiting, needs-you and done, each heading with its count. A downstream panel
+  can declare the new `board` value kind with levain's `board.json` value; the kernel checks its shape only. That
+  panel draws grouped on the page and as six columns in ⤢, carries a filter box and a count (the whole board's size, or
+  "k of n" while a query is typed), and keeps its typed query across a refresh. The box narrows cards, never columns,
+  and its query is shared by the panel and its ⤢ view, so ⤢ opens already filtered. A card draws its done line ("done
+  when: ...") and `depends_on` ("after: ...") when it has them; a card with no journal record draws no journal line. If
+  the board cannot be read, the open ⤢ view says so in one line instead of showing the last board. Covered by tests,
+  including real-browser tests of the grouped tab; not run against a downstream's live board.
+- **The needs-you band is on the cockpit's Decisions panel and the phone's Needs-you list.** Items carry band numbers; a
+  tap on an option or a shorthand box answers by number. An answer made against a view that has since changed is
+  refused, and the panel redraws and says why. The answer path accepts human channels only. On the phone, a followed
+  sign link stays first and the band card follows it. Covered by tests (real Chrome for the pages); not run by hand.
+- **The phone's dispatch card names the version it showed when you sign or cancel.** If the request changed after the
+  card was drawn, the challenge is refused with a 409 "changed since it was shown" and the list is redrawn; any other
+  409 on a challenge also shows "not signed" or "not cancelled" and redraws. Covered by tests; not run by hand.
+- **BOUND, slice 1: a classifier and ledger columns for what a vendor's sandbox refused inside a call that ran.** The
+  consent ledger gains `bound`, `bound_denials` and `bound_classes`, added in place with the ledger format unchanged.
+  It informs and never authorises, and it stores a class and a count, never a URL, host, path or stderr line. It
+  matches only strings measured in a real run; any other denial text reads `unknown`. Known edges: a Codex tool
+  response is one string, so a command printing the phrase on stdout reads `touched` there; a Codex patch the sandbox
+  rejected may fire no post event and so has no row. Covered by tests.
 - **The shipped base map carries a `codex-subscription` passthrough route** (hosts `api.openai.com`, `auth.openai.com`,
   `chatgpt.com`), so `levain session codex --auth passthrough` no longer refuses `no-route:passthrough` for want of a route.
   This adds the route only; it does not claim Codex passthrough works inside a session.
