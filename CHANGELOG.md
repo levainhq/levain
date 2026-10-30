@@ -63,6 +63,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   every store under the levain home that a daemon-installed serve reads, the Coordinator panel's, its buttons' and the
   pass's included, is the default one, `~/.levain`; a hand-run `levain coord watch --once` exits 0 when the serve's
   pass held the lock.
+- **A stopped coordinator puts one item on the Needs you band.** When three launches in a row have died, nothing
+  launches until you look; the watcher files one band item per stop and pings once, with the panel's own reason. Its
+  one option, `seen`, only records that you saw it: the action is the Coordinator panel's Stop or Hold, and a Stop,
+  Hold or Start pressed there closes the item. An item you have answered is not filed again while the same stop
+  stands, and a new run of deaths after a take or release files a new one. A coordinator whose setting names no
+  harness Levain knows still files it, under Claude Code's name. Covered by tests; a real stopped coordinator on the
+  band and the phone has not been run by hand. Known edges: a stop cleared from the command line leaves the item open
+  until you answer it, because no answer channel is Levain's own; and a Stop, Hold or Start landing in the instant a
+  pass is filing can still send one ping for a stop that has just ended.
 - **The cockpit's Board tab groups the ready queue under column headings, and the panel's ⤢ view draws the six columns.**
   The columns are backlog, ready, running, waiting, needs-you and done, each heading with its count. A downstream panel
   can declare the new `board` value kind with levain's `board.json` value; the kernel checks its shape only. That
