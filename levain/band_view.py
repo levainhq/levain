@@ -126,10 +126,31 @@ def _item_lines(label: str, q: Question, compact: bool) -> list[str]:
     return [f"{label} [{_tag(q)}] {q.what}", f"    {opts}", f"    rec: {rec} · blocks: {q.blocks} · asked by question #{q.n}"]
 
 
+FOREIGN_STORE_ID = "foreign"
+FOREIGN_VIEW_ID = 0
+
+
+def _foreign(store: Any) -> bool:
+    """A store with no ``_peek`` is not a levain :class:`QuestionStore` but a QuestionStore-SHAPED reader a host injects
+    (flow's ``NeedsQuestions``: ``open_questions`` / ``recent`` / ``get`` / ``answer`` over its own log, no sqlite).
+    The band reads it through those public methods only, numbers by the store's own ``q.n``, and keeps no band
+    view, number or sidecar in it (levain cannot write into it)."""
+    return not hasattr(store, "_peek")
+
+
+def _foreign_open(store: Any) -> list[Question]:
+    """The foreign store's open questions, oldest number first. A number two open questions share names neither (the
+    same rule as the store's own ``get``): both stay listed, but neither can be answered by shorthand."""
+    return sorted(store.open_questions(), key=lambda q: (q.n, q.id))
+
+
 def _read(store: QuestionStore) -> tuple[list[tuple[str, Question | None]], dict[str, int], list[tuple[int, str]]]:
     """(the open questions oldest first as ``(id, question)`` with ``None`` for one that cannot be read, the numbers
     allocated so far by ref, the numbered items whose question has since been answered and not yet shown closed), from
-    one read-only snapshot. No store: nothing."""
+    one read-only snapshot. No store: nothing. A foreign store: its public ``open_questions``, numbered by its own ``q.n``."""
+    if _foreign(store):
+        qs = _foreign_open(store)
+        return [(q.id, q) for q in qs], {q.id: q.n for q in qs}, []
     with store._peek() as conn:
         if conn is None:
             return [], {}, []
@@ -274,8 +295,11 @@ def render_full(store: QuestionStore | None = None, *, deadline: float | None = 
 
 def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sqlite3.Connection | None) -> Rendered:
     items, numbers, closed = _read(store)
+    foreign = _foreign(store)
     try:
-        extras = read_extras(store.directory, store._clock, deadline=deadline, coord_conn=coord_conn)
+        # a foreign store has no directory of levain's own: no authority sources are read from it, none are claimed
+        extras = Extras() if foreign else read_extras(store.directory, store._clock, deadline=deadline,
+                                                      coord_conn=coord_conn)
     except Exception as exc:  # noqa: BLE001 - the questions still render; the band says the sources were not read
         extras = Extras(failed=[f"authority sources: {type(exc).__name__}"])
     extra_numbers, extra_closed = _extra_state(store, extras) if extras.items or extras.complete else ({}, [])
@@ -694,6 +718,8 @@ def show(store: QuestionStore, viewer: str, deadline: float | None = None) -> Re
     high-water mark differs from its last one (:func:`record_view` ``dedupe``), so a poll loop grows nothing. An answer
     from this viewer binds to this view (D7). The Board is a status look, not an answer surface: it never calls this."""
     r = render_full(store, deadline=deadline)
+    if _foreign(store):
+        return r                              # nothing to record a view in: the foreign payload binds to the open list itself
     record_view(store, viewer, r.hwm, r.shown, deadline=deadline, gen=r.gen, dedupe=True)
     return r
 
@@ -707,6 +733,8 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
     the numbered open items (``kind`` is ``information`` or ``authority``: shorthand records only the first; an
     authority item opens its existing signing sheet). Shows the band to ``viewer`` first (:func:`show`)."""
     shown = show(store, viewer, deadline)
+    if _foreign(store):
+        return _foreign_payload(store, shown)
     got = _newest_view(store, viewer)
     if got is None:                               # no view to bind to: which of two facts is it?
         if not shown.failed and _store_absent(store):   # no store file (or an empty one) AND every source read: nothing
@@ -743,6 +771,18 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
     return {"seen_through": view.seen_through, "store_id": view.store_id, "view_id": view_id, "items": items,
             "note": _UNREAD_NOTE if (shown.failed or shown.pending or extras_failed or dropped
                                      or sorted(view.open_list) != sorted(shown.shown)) else ""}
+
+
+def _foreign_payload(store: Any, shown: Rendered) -> dict[str, Any]:
+    """:func:`band_payload` for a foreign store: its open questions numbered by their own ``q.n``, bound to the fixed
+    ``FOREIGN_STORE_ID`` / ``FOREIGN_VIEW_ID`` (no view is recorded in a store levain cannot write to; the answer
+    re-reads the open set, so a question answered since is refused for itself)."""
+    items = [{"n": q.n, "kind": "information", "tag": _tag(q), "what": q.what, "blocks": q.blocks,
+              "options": [{"letter": _LETTERS[i], "label": lab} for i, (_, lab) in enumerate(q.options)
+                          if i < len(_LETTERS)], "rec": _info_of(q).rec_letter, "question": q.n}
+             for q in _foreign_open(store)]
+    return {"seen_through": max((i["n"] for i in items), default=None), "store_id": FOREIGN_STORE_ID,
+            "view_id": FOREIGN_VIEW_ID, "items": items, "note": _UNREAD_NOTE if shown.failed else ""}
 
 
 class StaleBand(ValueError):
@@ -782,6 +822,11 @@ def answer_text(store: QuestionStore, text: str, *, viewer: str, channel: str, s
     since, not open in the view) come back in ``Applied.refused``."""
     if channel not in ("cockpit", "phone"):
         raise ValueError(f"a surface answers on the cockpit or the phone, not {channel!r}")
+    if _foreign(store):
+        # The band of a foreign store is a READ: its numbers are the host's own (up to ten digits, wider than the shorthand
+        # takes), its signed cards refuse an unsigned answer, and it hands levain no view to bind an answer to. Its
+        # questions are answered where the host answers them (the cards, the signing sheet), so nothing is recorded here.
+        raise ValueError("this cockpit's questions are answered on their own cards, not by band shorthand; nothing was recorded")
     view = _view_by_id(store, viewer, view_id)
     if view is None:                                  # no view of this viewer's to plan from; the store is checked below
         raise StaleBand(_STALE)
