@@ -4283,11 +4283,15 @@ def run_web_server(
         # accepts it — opening before the blocking call is correct.
         _open_browser(url, unlocked)
 
+    from levain.coordinator.supervise import Watcher     # C10 S1: a writable serve supervises the coordinator
+    watcher = Watcher().start() if write else None
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
     finally:
+        if watcher is not None:
+            watcher.stop()
         httpd.server_close()
         if chat_host is not None:
             chat_host.shutdown()
