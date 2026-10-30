@@ -188,6 +188,21 @@ _PAIR_VERIFY_SLOTS = 4            # paired lookups in flight, taken before the b
 _PAIR_WAIT_S = 3.0                # how long a paired request waits on a starting broker before its 503 (RT-4, RU-4)
 _PAIR_TOKEN_LEN = (16, 128)       # a header outside this length (or the header-safe shape) is never looked up (RT-3)
 _UNSET: Any = object()            # the per-request credential cache's empty mark (RS-1)
+# A browser paired by its own Turn on is labelled from its User-Agent by these words only (first match wins, so the
+# tokens a browser's UA also carries come after its own): the label is never the header's text
+_UA_BROWSERS = (("Edg", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"), ("FxiOS/", "Firefox"),
+                ("CriOS/", "Chrome"), ("Chrome/", "Chrome"), ("Safari/", "Safari"))
+_UA_SYSTEMS = (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android"), ("CrOS", "ChromeOS"),
+               ("Mac OS X", "macOS"), ("Windows", "Windows"), ("Linux", "Linux"))
+
+
+def _browser_label(user_agent: str) -> str:
+    """``this browser (<browser> on <system>)``, each part a fixed word from the tables above, or plain ``this
+    browser`` when neither is named."""
+    ua = user_agent[:512]
+    short = " on ".join(word for table in (_UA_BROWSERS, _UA_SYSTEMS)
+                        for word in [next((w for tok, w in table if tok in ua), None)] if word)
+    return f"this browser ({short})" if short else "this browser"
 
 
 def _journal_holds_paired_devices(data_root: Path) -> bool:
@@ -2134,22 +2149,65 @@ class _Handler(GuardedHandler):
             self.server.request_gate.release()
 
     def _push_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any] | bytes, int]":
-        """A web push POST (OS-4), its credential already checked: only a PAIRED device subscribes (a surface token
-        has no revoke that could stop the pings), and every subscription is stored under the device's credential
-        name, with this cockpit's journal as its device's authority: the send asks the journal whether the device is
-        live (:func:`levain.webpush.store.live_rows`), so a revoke stops its pings whether or not :meth:`_retire_push`
-        ran, and the subscribe asks it again inside its own write."""
-        from levain.webpush import routes as push_routes
-
+        """A web push POST (OS-4), its credential already checked. Every subscription is stored under a PAIRED
+        device's credential name, with this cockpit's journal as its device's authority: the send asks the journal
+        whether the device is live (:func:`levain.webpush.store.live_rows`), so a revoke stops its pings whether or
+        not :meth:`_retire_push` ran, and the subscribe asks it again inside its own write. A subscribe under any
+        other credential pairs this browser first (:meth:`_pair_and_subscribe`)."""
         name = str(self._credential()["name"])
         if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
-            return {"error": "device_required", "message": "turn pings on from a paired device: pair it from the "
-                    "Devices panel first"}, 403
+            return self._pair_and_subscribe(raw, name)
+        got = self._push_handle(route, raw, name)
+        return got[1], got[0]
+
+    def _push_handle(self, route: str, raw: bytes, device_id: str) -> "tuple[int, bytes, str]":
+        from levain.webpush import routes as push_routes
+
         broker = self.server.broker
         got = push_routes.handle("POST", route, {}, raw, queue_dir=self.server.signer.queue_dir, authorized=True,
-                                 device_id=name, journal=broker.data_root if broker is not None else None)
+                                 device_id=device_id, journal=broker.data_root if broker is not None else None)
         if got is None:                 # every route in _PUSH_POST is one of handle's
             raise RuntimeError(f"push route {route} not handled")
+        return got
+
+    def _pair_and_subscribe(self, raw: bytes, minted_by: str) -> "tuple[dict[str, Any] | bytes, int]":
+        """Turn on from a credential that is not a paired device's: the browser is paired on the spot by the same
+        journal calls an offer and its claim make (``mint_offer`` by ``minted_by``, then ``redeem_offer``), so a
+        credential pair/offer refuses is refused here with pair/offer's answer, and the pings are subscribed under
+        the new device. The answer carries ``device_id`` and its ``token`` ONCE, as the claim's does. A body
+        ``handle`` would refuse is refused before anything is minted; a subscribe that fails after the mint revokes
+        the new device (the ledger has no delete), so no live device is left without its pings."""
+        from levain.webpush import routes as push_routes
+
+        bad = push_routes.subscription_refusal(raw)
+        if bad is not None:
+            return bad[1], bad[0]
+        now = datetime.now(timezone.utc)
+        label = _browser_label(self.headers.get("User-Agent", ""))
+        payload, status = self._pair_call(lambda db: {"claimed": db.redeem_offer(
+            db.mint_offer(label=label, minted_by=minted_by, now=now), now=now)})
+        if status != 200:
+            return payload, status
+        if payload["claimed"] is None:      # a code minted a moment ago is live; only a journal fault lands here
+            return {"error": "internal", "message": "the pairing for this browser was not claimed"}, 500
+        device, token = payload["claimed"]
+        try:
+            got = self._push_handle(_PUSH_SUBSCRIBE, raw, PAIRED_PREFIX + device)
+        except Exception as exc:  # noqa: BLE001 - the new device is revoked below, then the fault is the answer
+            _log.warning("pings turn-on: subscribe after pairing failed", exc_info=True)
+            got = 500, json.dumps({"error": "internal", "message": type(exc).__name__}).encode("utf-8"), "json"
+        if got[0] == 200:
+            out = json.loads(got[1])
+            out.update(device_id=device, token=token)
+            return out, 200
+        undone, ustatus = self._pair_call(
+            lambda db: {"revoked": db.revoke_devices([device], by=minted_by, now=now)})
+        if ustatus == 200:
+            with self.server.pair_epoch_lock:   # after the commit, as every revoke (RU-3)
+                self.server.pair_epoch += 1
+        else:
+            _log.warning("pings turn-on: device %s minted for a failed subscribe was not revoked: %s",
+                         device, undone.get("error"))
         return got[1], got[0]
 
     def _retire_push(self, device_ids: "list[str]", now: datetime) -> "str | None":

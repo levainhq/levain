@@ -20,6 +20,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `levain coord status`, `drops list|show` and `thread list|show` no longer create `dispatch.db` or `awake.lock`, or
   add tables to a dispatch-only `dispatch.db`; they print `no coordinator store here` (`coord status --json` keeps its
   keys, with `"store": null`).
+- **On macOS, a Codex session signed in with a ChatGPT subscription runs in a slot instead of failing with
+  `account/read -32603`.** Codex syncs its managed preferences at start, and a slot account whose home was `/var/empty`
+  could not. The slot accounts that run vendor CLIs now have a root-owned, empty home, `L/vendorhome`, made by setup,
+  repair and replenish; the session also gets `SSL_CERT_FILE=/etc/ssl/cert.pem`, so Codex's TLS reaches chatgpt.com from
+  inside the slot. `levain doctor` gains an `agent slot homes` row: an install from before this change reports upgrade
+  pending (and exits that way) until `levain upgrade --no-pip` runs; a wrong owner, mode or a non-empty
+  `Library/Preferences` reports broken. Run once in a macOS test VM with a real ChatGPT login (two turns answered); not
+  run on Linux, where nothing changes.
 - **A cockpit with no question store no longer draws the Needs you band, or a note that it could not be recorded.** An
   absent `questions.db` (no file, or an empty one) draws nothing in the band: no heading and no note, because nothing was
   ever filed. A store that has content but cannot be read, is locked or lacks its identity row keeps its "the band could
@@ -175,10 +183,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   order it happened, with running tool calls, approvals shown as a line pointing you to Needs you, and your own lines
   marked unverified. It needs the page's write token and is read-only for now.
 - **Pings come from the cockpit's own origin.** The cockpit serves web push itself (service worker, manifest,
-  `/webpush/*`), behind its credential. The Devices panel turns pings on for the browser you are using: pair it, then
-  Turn on; on a phone, add the cockpit to the Home Screen and pair it from there. Only a paired device can turn pings
-  on, and a revoked device gets no ping, whatever happened to its stored subscriptions: every send checks the device
-  is still paired.
+  `/webpush/*`), behind its credential. The Devices panel turns pings on for the browser you are using with one tap
+  on Turn on: a browser holding the cockpit's own key is paired on the spot, keeps its new device key, and shows up in
+  the Devices list as "this browser (…)" with a Revoke; on a phone, add the cockpit to the Home Screen and pair it from
+  there. Every subscription belongs to a paired device, and a revoked device gets no ping, whatever happened to its
+  stored subscriptions: every send checks the device is still paired.
 - **Sign links open the cockpit's sheet and carry no token.** `levain.consent.sign.deep_link` builds
   `<origin>/sign/<id>`. `levain consent phone --redirect-to <origin>` runs the old phone port as a redirect only: links
   you already hold open the cockpit's sign sheet, and the token in them is dropped, never sent on.
