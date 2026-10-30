@@ -90,9 +90,10 @@ NO_STORE = "no coordinator store here"
 
 
 def _no_store(store: EnvelopeStore) -> bool:
-    """True when the store's file does not exist: a read-only verb says so and makes nothing (no directory, no
-    dispatch.db, no awake.lock). A file that exists is read as before."""
-    return not store.path.exists()
+    """True when no coordinator store is here (:meth:`CoordStore.coordinator_present`, which opens nothing for
+    writing): a read-only verb says so and makes nothing (no directory, no dispatch.db, no awake.lock, no tables in a
+    dispatch-only file)."""
+    return not store.coordinator_present()
 
 
 def _drop_row(d: Drop) -> dict[str, Any]:
@@ -1219,6 +1220,20 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
                 from levain.coordinator.launch import launch_session
 
                 got = launch_session(store, ln.launch_id)
+            elif store.coord_status()["wake"] == "idle":
+                # a coordinator running without the lease: you asked, so a done one is replaced (the watcher's listing)
+                from levain.coordinator.launch import wake_idle
+
+                got, line = wake_idle(store)
+                st = store.coord_status()
+                st["started"] = None if got is None else {"started": got.started, "attach": got.attach,
+                                                          "refusal": got.refusal, "remedy": got.remedy}
+                if got is None:
+                    st["why"] = line
+                    _emit(out, args.json, st, f"no launch asked for: {line}")
+                    return 1
+                _emit(out, args.json, st, f"{line}\n{_outcome_text(got)}")
+                return 0 if got.started else 1
             st = store.coord_status()
             st["started"] = None if got is None else {"started": got.started, "attach": got.attach,
                                                       "refusal": got.refusal, "remedy": got.remedy}
@@ -1240,7 +1255,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
                 return 0
             return 0
         if _no_store(store):
-            _emit(out, args.json, {"store": None, "why": NO_STORE}, NO_STORE)
+            _emit(out, args.json, {"store": None, "lease": None, "wake": "unset", "why": NO_STORE, "setting": None,
+                                   "launches": []}, NO_STORE)
             return 0
         st = store.coord_status()
     except _REFUSED as exc:
@@ -1620,7 +1636,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     cc = c_sub.add_parser("claim", help="An active coordinator session claims a lease nobody holds.")
     cc.add_argument("--launch", required=True, metavar="LAUNCH_ID")
     cc.add_argument("--session", required=True, metavar="SESSION_KEY")
-    cw = c_sub.add_parser("wake", help="Ask for a coordinator now, by the rules a drop runs (after a backoff).")
+    cw = c_sub.add_parser("wake", help="Ask for a coordinator now, by the rules a drop runs (after a backoff); a "
+                                       "claude coordinator running without the lease whose session is done is "
+                                       "ended and a fresh one started.")
     ca = c_sub.add_parser(
         "agent", help="Choose the coordinator a drop launches: claude or codex (each in its own workspace), or none.",
         description="claude: drops with no coordinator start a Claude Code session in DIR (default "

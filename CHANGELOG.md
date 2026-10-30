@@ -10,12 +10,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **A drop that lands while a coordinator sits done is acted on at the next watcher pass, not an hour later.** A
   coordinator that split its drop, released the lease and stayed listed (`claude --bg`, state `done`) kept the
   coordinator slot as `idle`, so drops filed after it sat unread until `LEASE_TTL + IDLE_GRACE`. `levain coord watch`
-  (its serve thread included) now ends a `done` claude coordinator when a drop newer than its last coordinator write is
-  unsplit (cause `lost the lease`, no death when it wrote), stops its session and starts a fresh coordinator in the same
-  pass, whose brief quotes the drop. A coordinator not `done` is untouched; a Codex coordinator and a drop with no
-  watcher running still wait out the grace. A question filed with no live lease was never held, so it pings at filing
-  (no ten-minute escalation applies to it). `levain coord status`, `drops list|show` and `thread list|show` no longer
-  create `dispatch.db` or `awake.lock` in a queue directory that has none; they print `no coordinator store here`.
+  (its serve thread included) now ends a `done` claude coordinator when an unsplit drop was delivered after its spawn
+  claim (its brief quotes every drop before that), with cause `replaced while done`, never a death, stops its session
+  and starts a fresh coordinator in the same pass, whose brief quotes the drop. The fresh launch is newer than the drop,
+  so one drop replaces at most one coordinator. `levain coord wake` does the same at once for a done claude
+  coordinator running without the lease (no drop needed), and otherwise says why and names `levain coord release`. A
+  coordinator not `done` is untouched; a Codex coordinator and a drop with no watcher running still wait out the grace.
+  A question filed with no live lease was never held, so it pings at filing (no ten-minute escalation applies to it).
+  `levain coord status`, `drops list|show` and `thread list|show` no longer create `dispatch.db` or `awake.lock`, or
+  add tables to a dispatch-only `dispatch.db`; they print `no coordinator store here` (`coord status --json` keeps its
+  keys, with `"store": null`).
 - **A cockpit with no question store no longer draws the Needs you band, or a note that it could not be recorded.** An
   absent `questions.db` (no file, or an empty one) draws nothing in the band: no heading and no note, because nothing was
   ever filed. A store that has content but cannot be read, is locked or lacks its identity row keeps its "the band could
