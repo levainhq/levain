@@ -715,7 +715,7 @@ class CoordStore:
             self._split_done(conn, drop_id, touched, now)
             return [self._thread(conn, t) for t in touched]
 
-    def note(self, drop_id: str, why: str, *, token: object) -> None:
+    def note(self, drop_id: str, why: str, *, token: object) -> str:
         """The coordinator's terminal "read, nothing to do" for a drop: an append-only ``noted`` drop receipt carrying
         ``why`` (one line), written under the lease like a split. It stands in for a split everywhere a drop is
         counted as unseen or queued, and the drop stays visible with its reason. A drop already split or already
@@ -730,6 +730,7 @@ class CoordStore:
                 raise CoordError(f"drop {drop_id} is already noted")
             self._reply(conn, None, "drop_receipt", "drops", drop_id,
                         {"stage": "noted", "drop_id": drop_id, "why": why, "threads": []}, now)
+        return why
 
     def add(self, drop_id: str, part: Part, *, by: str = "operator", token: object = None) -> Thread:
         """Put an already-split drop into one more thread (a new one, or an existing open one): the receipt's one-tap
@@ -1124,7 +1125,11 @@ class CoordStore:
             ids = [r[0] for r in conn.execute("SELECT drop_id FROM drops ORDER BY rowid DESC LIMIT ?", (limit,))]
             out: list[tuple[Drop, str | None]] = []
             for d in ids:
-                why = next((str(r.body.get("why", "")) for r in self._receipts(conn, d, "noted")), None)
+                got = self._receipts(conn, d, None)
+                # noted, and not split since: a drop the coordinator later split is a split drop, not a noted one
+                why = next((str(r.body.get("why", "")) for r in got if r.body.get("stage") == "noted"), None)
+                if any(r.body.get("stage") in ("split", "resplit") for r in got):
+                    why = None
                 out.append((self._drop(conn, d), why))
             return out
 

@@ -1889,3 +1889,38 @@ def test_the_brief_leads_with_the_quoting_free_forms_and_one_unmistakable_releas
     assert f"drops note DROP_ID --text-file PATH --by coordinator --token N --queue-dir " in writes
     lease_part = text.split("## The lease")[1].split("## Your writes")[0]
     assert "ONLY as the very last step and as its own command, after every split, note and escalate has returned" in lease_part
+
+
+# --- L3 r2 LOWs on the brief branch (1030-42 verbs) ---------------------------------------------------------------
+def test_a_drop_split_after_it_was_noted_no_longer_lists_as_noted(store, qdir, fake, live_hook, capsys):
+    from levain.coordinator.store import Part
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    store.note(d1.drop_id, "read it", token=token)
+    store.note(d2.drop_id, "read it too", token=token)
+    store.split(d1.drop_id, [Part("work", "changed my mind")], by="coordinator", token=token)
+    whys = {d.drop_id: w for d, w in store.drops_noted(limit=10) if d.drop_id in (d1.drop_id, d2.drop_id)}
+    assert whys == {d1.drop_id: None, d2.drop_id: "read it too"}
+    out = _main(qdir, capsys, "drops", "list").out
+    assert f"{d2.drop_id}" in out and out.count("[noted:") == 1
+
+
+def test_note_returns_the_saved_why_and_the_cli_echoes_that(store, qdir, fake, live_hook, capsys):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    assert store.note(d1.drop_id, "  padded  ", token=token) == "  padded  "
+    saved = [r.body["why"] for r in store.drop_receipts(d1.drop_id) if r.body.get("stage") == "noted"]
+    assert saved == ["  padded  "]
+
+
+def test_a_noted_receipt_renders_as_noted_on_the_phone_not_as_zero_threads():
+    from levain.coordinator import phone as ph
+
+    r = type("R", (), {"body": {"stage": "noted", "why": "an fyi", "threads": []}, "at": "2026-10-30T10:00:00Z"})()
+    row = ph.CoordPhone._receipt(r) if hasattr(ph, "CoordPhone") else None
+    assert row is not None and row["stage"] == "noted" and row["why"] == "an fyi"
+    js = (Path(__file__).parent.parent / "levain" / "templates" / "web" / "phone.js").read_text()
+    assert 'noted: "noted"' in js
+    assert 'if (!receipts.some((r) => r.stage === "split" || r.stage === "noted"))' in js

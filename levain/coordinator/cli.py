@@ -1078,7 +1078,7 @@ def run_note(args: argparse.Namespace, out: Any = None) -> int:
         why = _text_input(args, args.why, "--why")
         if why is None:
             raise CoordError("say why: --why TEXT, --text-file PATH or --stdin")
-        _store(args).note(args.drop_id, why, token=args.token)
+        why = _store(args).note(args.drop_id, why, token=args.token)
     except _REFUSED as exc:
         print(f"levain drops note: {exc}", file=sys.stderr)
         return 1
