@@ -146,7 +146,7 @@ def test_vendor_env_exact():
     # dispatch: no own loopback; codex brokered: no ANTHROPIC_BASE_URL (its base URL is the provider block)
     blob, facts = egress(kind="dispatch", vendor="codex")
     env = rd.render_env(blob, facts)["slot"]
-    assert set(env) == BASE_KEYS | PROXY_KEYS
+    assert set(env) == BASE_KEYS | PROXY_KEYS | {"SSL_CERT_FILE"}
     assert rd.secret_env_names(blob, facts) == ("OPENAI_API_KEY",)
     # passthrough: no base URL, no token
     blob, facts = egress(auth="passthrough", kind="login")
@@ -175,6 +175,20 @@ def test_vendor_env_exact():
     assert envs["driver"] == {"HOME": f"{L}/driver", "USER": "_levain_v1", "LOGNAME": "_levain_v1",
                               "PATH": envs["child"]["PATH"], "TMPDIR": f"{L}/driver"}
     assert rd.secret_env_names(blob, facts) == ()
+
+
+def test_codex_on_macos_gets_the_os_ca_file():
+    """R7 (r3c10-vm 10-30): with no SSL_CERT_FILE every Codex chatgpt.com tunnel broke after the server's
+    certificate (rustls-native-certs could not reach securityd from the slot); with /etc/ssl/cert.pem a
+    passthrough turn ran. Codex on macOS only, every kind and auth; never Claude, never Linux (unmeasured there)."""
+    for kind, auth in itertools.product(("interactive", "login", "dispatch"), ("brokered", "passthrough")):
+        blob, facts = egress(vendor="codex", kind=kind, auth=auth)
+        assert rd.render_env(blob, facts)["slot"]["SSL_CERT_FILE"] == "/etc/ssl/cert.pem", (kind, auth)
+        assert "SSL_CERT_FILE=/etc/ssl/cert.pem\n" in rd.render(blob, facts).file("root/env").data.decode()
+        blob, facts = egress(vendor="claude", kind=kind, auth=auth)
+        assert "SSL_CERT_FILE" not in rd.render_env(blob, facts)["slot"], (kind, auth)
+    blob, facts = egress("linux", vendor="codex", auth="passthrough")
+    assert "SSL_CERT_FILE" not in rd.render_env(blob, facts)["slot"]
 
 
 def test_env_file_is_exactly_the_env():
@@ -681,7 +695,7 @@ def _digest(r) -> str:
 GOLD_DIGESTS = {
     ("darwin", "claude", "egress"): "18f9a25ffabf303f",
     ("darwin", "claude", "none"): "dd0f5dad5c38e0b8",
-    ("darwin", "codex", "egress"): "24cbf6f8faa1bac0",
+    ("darwin", "codex", "egress"): "d261401cde64acea",   # R7: + SSL_CERT_FILE in root/env
     ("darwin", "codex", "none"): "7441ce40b3226c61",
     ("linux", "claude", "egress"): "9a6f5684256bdd1c",
     ("linux", "claude", "none"): "c9796d76e53b1d57",
