@@ -76,6 +76,24 @@ h2 { margin: 0 0 var(--sp-3); font: 600 11px/1 var(--round); letter-spacing: var
 .req.agent-note .note-detail { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--label); margin-top: var(--sp-2); }
 .notes-head { margin-top: var(--sp-6, 24px); }
 .req.sign .display { user-select: text; }   /* a statement to be signed: selectable, so it can be copied out and checked */
+/* a needs-phill card (card_format.js): headline, the signed text one tap away, Detail after the option rows */
+.req.sign .card-head { margin-top: var(--sp-4); }
+.req.sign .card-meta { margin: 0 0 var(--sp-2); font: 600 12px/1.4 var(--round); color: var(--meta); overflow-wrap: anywhere; }
+.req.sign .card-headline { margin: 0 0 var(--sp-4); font: 700 17px/1.35 var(--round); letter-spacing: normal; text-transform: none;
+                           color: var(--text); overflow-wrap: anywhere; }
+.req.sign .card-signed, .req.sign .card-detail { margin: 0 0 var(--sp-4); }
+.req.sign .card-signed > summary, .req.sign .card-detail > summary { cursor: pointer; min-height: var(--hit-min); display: flex;
+                           align-items: center; color: var(--label); font: 600 13px/1.4 var(--round); }
+.req.sign .card-detail { margin-top: var(--sp-4); }
+.req.sign .card-detail > summary { color: var(--text); font-size: 15px; border-top: 1px solid var(--hair); padding-top: var(--sp-3); }
+.req.sign .card-detail-body { padding-top: var(--sp-3); }
+.req.sign .card-sec { margin: 0 0 var(--sp-5); }
+.req.sign .card-label { margin: 0 0 var(--sp-2); font: 700 11px/1.3 var(--round); letter-spacing: var(--track-caps);
+                        text-transform: uppercase; color: var(--label); }
+.req.sign .card-label-top { margin-top: var(--sp-2); }
+.req.sign .card-p { margin: 0 0 var(--sp-3); line-height: 1.5; color: var(--text); overflow-wrap: anywhere; }
+.req.sign .card-list { margin: 0 0 var(--sp-3); padding-left: var(--sp-5); line-height: 1.5; color: var(--text); }
+.req.sign .card-list li { margin: 0 0 var(--sp-2); overflow-wrap: anywhere; }
 .row.dispatch { border-top: 2px solid var(--accent); }   /* a dispatch job waits on you as a request does */
 .row.dispatch .display { user-select: text; }
 .row.dispatch summary { min-height: var(--hit-min); padding: var(--sp-3) 0; box-sizing: border-box; cursor: pointer;

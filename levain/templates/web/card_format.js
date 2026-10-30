@@ -1,4 +1,5 @@
-// The CARD FORMAT for a needs-phill item's long text (Phill 10-30, "8a"): pure layout parsing, no DOM. It only SPLITS the
+// The CARD FORMAT for a needs-phill item's long text (Phill 10-30, "8a"): layout parsing, then the card's DOM builders
+// (drawHead, drawDetail), shared by every surface that draws the card; node runs only the parsing. It only SPLITS the
 // text the desk wrote and never changes a word. The only things it takes off are the structural tokens that become layout:
 // a label's colon, a " - " list marker, and a " · " separator under OPTIONS. Ported from the iOS app's NPCard.swift
 // (the reference); tests/card_format_check.js pins the invariant against real rows.
@@ -194,7 +195,67 @@
     return { repo: got.repo, item: got.item, asked: got.asked, stopped: got.stopped, recommended: recKey, optionLines: optionLines };
   }
 
-  const api = { collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage };
+  // ---- the card's DOM, one builder for every surface that draws it (the sheet, the phone app, the cockpit's focus view).
+  // Text only, never HTML. The caller places the nodes and gives them its own ids; nothing here reads the page.
+  function node(tag, cls, text) {
+    const n = root.document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  }
+  // meta (repo · item), the headline, and `msg` (the caller's node holding the message, exactly as signed) collapsed under
+  // "Signed text, exactly as signed"
+  function drawHead(card, msg) {
+    const box = node("div", "card-head");
+    const meta = [card.repo, card.item].filter((x) => x).join(" · ");
+    if (meta) box.appendChild(node("p", "card-meta", meta));
+    box.appendChild(node("h2", "card-headline", headline(card.asked).head));
+    const raw = node("details", "card-signed");
+    raw.appendChild(node("summary", "", "Signed text, exactly as signed"));
+    raw.appendChild(msg);
+    box.appendChild(raw);
+    return box;
+  }
+  function drawSections(into, secs) {
+    for (const s of secs) {
+      const sec = node("div", "card-sec");
+      if (s.label) sec.appendChild(node("div", "card-label", s.label));
+      for (const b of s.blocks) {
+        if (b.kind === "paragraph") { if (b.text) sec.appendChild(node("p", "card-p", b.text)); continue; }
+        sec.appendChild(node("p", "card-p", b.lead));
+        const ul = node("ul", "card-list");
+        for (const i of b.items) ul.appendChild(node("li", "", i));
+        sec.appendChild(ul);
+      }
+      into.appendChild(sec);
+    }
+  }
+  // Detail, collapsed: the rest of the question, the stop (less an OPTIONS/REC section that only repeats the rows), and the
+  // signed options in full. `rec` is the card's own, the signed message's recommendation (parseMessage refused a request
+  // that disagrees with it); `options` are the request's option rows
+  function drawDetail(card, options) {
+    const rec = card.recommended;
+    const full = fullOptions(card, options);     // one decision: what the OPTIONS prose is compared to, and the panel
+    const det = node("details", "card-detail");
+    det.appendChild(node("summary", "", "Detail"));
+    const inner = node("div", "card-detail-body");
+    const rest = headline(card.asked).rest;
+    if (rest) drawSections(inner, sections(rest));
+    if (card.stopped) {
+      inner.appendChild(node("div", "card-label card-label-top", "Stopped"));
+      drawSections(inner, sections(card.stopped, card.asked).filter((s) => !repeatsRows(s, full, rec)));
+    }
+    if (card.optionLines.length) {
+      const sec = node("div", "card-sec");
+      sec.appendChild(node("div", "card-label", "Options, in full"));
+      for (const o of full) sec.appendChild(node("p", "card-p", "(" + o.key + ") " + o.text + (o.key === rec ? " — Rec" : "")));
+      inner.appendChild(sec);
+    }
+    det.appendChild(inner);
+    return det;
+  }
+
+  const api = { collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, drawHead, drawDetail };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);
