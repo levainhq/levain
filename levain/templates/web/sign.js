@@ -199,6 +199,8 @@
     try { const m = mine(rp); delete m[fp]; window.localStorage.setItem(mapKey(rp), JSON.stringify(m)); } catch (e) { /* kept nowhere */ }
   }
 
+  let cardView = null;           // the needs-phill card the sheet is drawing (set by draw, read by offer), else null
+
   // ---- read the request, then draw it ----
   if (!id) { head("Not a " + noun, "This link names no " + noun + "."); return; }
   if (consent || dispatch || coord) { document.title = "Levain · " + (consent ? "consent" : dispatch ? "dispatch" : "drop"); $("sheet-title").textContent = Noun; $("sheet-msg").textContent = "Reading the " + noun + "…"; }
@@ -206,7 +208,78 @@
   if (coord) readDrops().then(drawDrop);
   else readRequest().then(draw);
 
+  // ---- the card: headline now, Detail below the option rows ----
+  // The card is two nodes, both marked data-card: #sheet-card (meta, headline, the signed text) above the controls and
+  // #sheet-detail below them. clearCard takes every such node off and forgets the card, first thing in every draw.
+  function clearCard() {
+    cardView = null;
+    for (const n of document.querySelectorAll("[data-card]")) n.remove();
+    const acts = $("sheet-actions");
+    if (acts) acts.classList.remove("card-rows");
+  }
+  function drawCardHead(body, card, msg) {
+    const F = window.LevainCardFormat;
+    const box = el("div", "card-head");
+    box.id = "sheet-card";
+    box.dataset.card = "head";
+    const meta = [card.repo, card.item].filter((x) => x).join(" \u00B7 ");
+    if (meta) box.appendChild(el("p", "card-meta", meta));
+    const h = el("h2", "card-headline", F.headline(card.asked).head);
+    h.id = "sheet-headline";
+    box.appendChild(h);
+    const raw = el("details", "card-signed");
+    raw.id = "sheet-signed";
+    raw.appendChild(el("summary", "", "Signed text, exactly as signed"));
+    raw.appendChild(msg);
+    box.appendChild(raw);
+    body.appendChild(box);
+  }
+  function cardSections(into, secs) {
+    for (const s of secs) {
+      const sec = el("div", "card-sec");
+      if (s.label) sec.appendChild(el("div", "card-label", s.label));
+      for (const b of s.blocks) {
+        if (b.kind === "paragraph") { if (b.text) sec.appendChild(el("p", "card-p", b.text)); continue; }
+        sec.appendChild(el("p", "card-p", b.lead));
+        const ul = el("ul", "card-list");
+        for (const i of b.items) ul.appendChild(el("li", "", i));
+        sec.appendChild(ul);
+      }
+      into.appendChild(sec);
+    }
+  }
+  // `rec` is the card's own, the signed message's recommendation (parseMessage refused a request that disagrees with it)
+  function drawCardDetail(card, options) {
+    const F = window.LevainCardFormat;
+    const rec = card.recommended;
+    const full = F.fullOptions(card, options);     // one decision: what the OPTIONS prose is compared to, and the panel
+    const stale = $("sheet-detail");
+    if (stale) stale.remove();
+    const det = el("details", "card-detail");
+    det.id = "sheet-detail";
+    det.dataset.card = "detail";
+    det.appendChild(el("summary", "", "Detail"));
+    const inner = el("div", "card-detail-body");
+    const rest = F.headline(card.asked).rest;
+    if (rest) cardSections(inner, F.sections(rest));
+    if (card.stopped) {
+      inner.appendChild(el("div", "card-label card-label-top", "Stopped"));
+      cardSections(inner, F.sections(card.stopped, card.asked).filter((s) => !F.repeatsRows(s, full, rec)));
+    }
+    if (card.optionLines.length) {
+      const sec = el("div", "card-sec");
+      sec.appendChild(el("div", "card-label", "Options, in full"));
+      for (const o of full) sec.appendChild(el("p", "card-p", "(" + o.key + ") " + o.text + (o.key === rec ? " \u2014 Rec" : "")));
+      inner.appendChild(sec);
+    }
+    det.appendChild(inner);
+    const sheet = $("sheet"), note = $("sheet-note");
+    if (note && note.parentNode === sheet) sheet.insertBefore(det, note);
+    else sheet.appendChild(det);
+  }
+
   function draw(got) {
+    clearCard();
     if (got.unpaired) return unpaired(true);
     if (got.closed) {
       $("sheet").dataset.state = "closed";
@@ -231,7 +304,15 @@
     head(r.title || Noun, r.requester ? "From " + r.requester : "");
     const body = $("sheet-body");
     if (r.refused) { $("sheet").dataset.state = "refused"; return body.appendChild(el("p", "", "Not signable: " + r.refused)); }
-    const msg = body.appendChild(el("pre", "sheet-message", typeof r.message === "string" ? r.message : ""));
+    const msg = el("pre", "sheet-message", typeof r.message === "string" ? r.message : "");
+    // a needs-phill card is drawn as headline, option rows, then a collapsed Detail (card_format.js, ported from the iOS app's
+    // NPCard); its signed text stays whole, one tap away, above the controls. Any other message, and any needs-phill
+    // message parseMessage does not read exactly (it returns null), is one visible block.
+    const card = !dispatch && !consent && window.LevainCardFormat ? window.LevainCardFormat.parseMessage(r.message, r) : null;
+    cardView = card;
+    $("sheet-actions").classList.toggle("card-rows", !!card);
+    if (card) drawCardHead(body, card, msg);
+    else body.appendChild(msg);
     // a dispatch job is shown whole (every path, every change): its box scrolls, it is never cut to fit
     if (dispatch) { msg.id = "sheet-contract"; msg.tabIndex = 0; Object.assign(msg.style, { maxHeight: "50vh", overflow: "auto" }); }
     if (r.expires_at) body.appendChild(el("p", "ext-meta", "Open until " + r.expires_at));
@@ -419,7 +500,8 @@
     if (!options.length && !dispatch) acts.appendChild(button("Sign with your passkey", po ? "" : "dev-primary", () => run(undefined, undefined)));
     for (const o of options) {
       if (!o || typeof o.key !== "string") continue;
-      const b = button("(" + o.key + ") " + String(o.text), o.key === r.recommended ? "sheet-rec" : "", tap(o));
+      const b = button("(" + o.key + ") " + String(o.text), o.key === (cardView ? cardView.recommended : r.recommended) ? "sheet-rec" : "", tap(o));
+      if (cardView) b.replaceChildren(el("span", "card-key", "(" + o.key + ")"), " " + String(o.text));      // same text, the key set off
       b.title = "signs: " + String(o.line);
       b.dataset.choice = o.key;
       acts.appendChild(b);
@@ -442,6 +524,7 @@
         run(String(wi.key), w, (typeof wi.line === "string" ? wi.line : "(" + String(wi.key) + "): ") + w);
       }));
     }
+    if (cardView) drawCardDetail(cardView, options);
     if (options.length) {
       const lines = el("div", "ext-meta", dispatch ? "Each act signs the payload the cockpit builds for it (shown above the tap):"
         : "Each option signs the message with its line appended:");

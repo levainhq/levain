@@ -40,7 +40,13 @@ def main() -> int:
             return 0
         message = payload.get("last_assistant_message")
         if isinstance(message, str) and message:
-            hook.session_log(payload.get("session_id"), "reply", message)
+            kind = "reply"
+            try:
+                from levain.band_view import turn_log_kind
+                kind = turn_log_kind(payload, "reply")      # "wake_reply" for a coordinator wake
+            except Exception:
+                pass
+            hook.session_log(payload.get("session_id"), kind, message)
     except Exception:
         pass
     try:

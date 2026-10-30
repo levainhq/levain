@@ -1,7 +1,7 @@
 """levain.cockpit.session_log — one agent session's transcript, read back for the token-gated cockpit route (Q8).
 
 The hooks append ``<install>/.levain/sessions/<stem>.log.jsonl`` beside the Q7 registry file ``<stem>.json``, one
-line per event (DESIGN_Q8.md, the Contract): ``{"v": 1, "at", "kind": "prompt"|"reply"|"tool", "text", "cut"}``.
+line per event (DESIGN_Q8.md, the Contract): ``{"v": 1, "at", "kind": "prompt"|"reply"|"tool"|"wake"|"wake_reply", "text", "cut"}``.
 This reader is a display, never an authority: nothing here decides anything. Every read is bounded (the registry
 file through the Q7 reader, the log's last :data:`LOG_TAIL` bytes), never follows a symlink, and never writes.
 
@@ -27,7 +27,7 @@ __all__ = ["LOG_TAIL", "EVENTS_SHOWN", "STEM", "read_session"]
 LOG_TAIL = 256 * 1024               # bytes of the log read from its end; the hooks keep it near this size
 EVENTS_SHOWN = 300                  # the newest events returned
 STEM = re.compile(r"[0-9a-f]{24}")
-EVENT_KINDS = ("prompt", "reply", "tool")
+EVENT_KINDS = ("prompt", "reply", "tool", "wake", "wake_reply")
 
 
 def _tail(path: Path) -> bytes | None:

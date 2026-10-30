@@ -110,3 +110,20 @@ def test_an_open_transcript_survives_a_redraw_of_the_modal(tmp_path, monkeypatch
         ])
     got = json.loads(out[-1])
     assert "still here" in got["text"] and got["btn"] == "refresh", got
+
+
+@needs_browser
+def test_a_coordinator_wake_and_its_reply_are_labelled_as_such_never_as_his_words(tmp_path, monkeypatch):
+    """C11 S1 (codex MED 3): the two kinds were unknown to the page and drew as tool lines."""
+    root, src = _fixture(tmp_path, monkeypatch)
+    _log(root, [
+        {"at": "2026-10-15T10:00:00Z", "kind": "wake", "text": "[levain wake ln-0]\nYou are Levain's coordinator"},
+        {"at": "2026-10-15T10:00:05Z", "kind": "wake_reply", "text": "wake: nothing needs you"},
+    ])
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _open_modal(f"{url}/#write_token=T", tmp_path, [
+            {"eval": f"{ROW_CC}.querySelector('.sess-tx-btn').click(); 1"},
+            {"until": f"{ROW_CC}.querySelector('.sess-ev')"},
+            {"eval": f"JSON.stringify([...{ROW_CC}.querySelectorAll('.sess-kind')].map(k => k.textContent))"},
+        ])
+    assert json.loads(out[-1])[:2] == ["wake", "wake reply"], out[-1]

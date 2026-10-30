@@ -56,11 +56,13 @@ def test_the_sheet_is_a_static_shell_whose_one_script_is_the_cockpits_own(sheet)
     status, hdrs, body = _raw(sheet["url"], SHEET)
     assert status == 200 and hdrs["content-type"].startswith("text/html")
     page = body.decode()
-    assert re.findall(r"<script\b[^>]*>", page) == ['<script src="/sign.js">']     # no inline script
-    assert re.search(r"<script src=\"/sign.js\">\s*</script>", page)
+    assert re.findall(r"<script\b[^>]*>", page) == ['<script src="/card_format.js">', '<script src="/sign.js">']   # no inline script
+    assert re.search(r"<script src=\"/card_format.js\">\s*</script>\s*<script src=\"/sign.js\">\s*</script>", page)
     assert TOK not in page and RID not in page          # no token, no request data: those come from the gated read
     status, hdrs, js = _raw(sheet["url"], "/sign.js")
     assert status == 200 and hdrs["content-type"].startswith("text/javascript") and b"/cockpit/sign/" in js
+    status, hdrs, js = _raw(sheet["url"], "/card_format.js")
+    assert status == 200 and hdrs["content-type"].startswith("text/javascript") and b"parseMessage" in js
 
 
 def test_only_the_sheet_may_be_framed_and_only_by_its_own_origin(sheet) -> None:

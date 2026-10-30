@@ -73,8 +73,9 @@ def test_a_pair_link_opened_from_another_site_loads_and_nothing_else_widens(src)
         for mode, dest in (("cors", "empty"), ("no-cors", "empty"), ("no-cors", "iframe"), ("navigate", "iframe")):
             st, _o, _h2 = _call(port, "GET", "/pair", headers={**NAV, "Sec-Fetch-Mode": mode, "Sec-Fetch-Dest": dest})
             assert st == 403, (mode, dest, st)
-        # no other route is widened by a navigation's headers: the cockpit page, the claim script, a data read, HEAD /pair
-        for method, path in (("GET", "/"), ("GET", "/pair.js"), ("GET", "/cockpit/manifest.json"),
+        # no other route is widened by a navigation's headers: the claim script, a data read, HEAD /pair. The bare "/" is
+        # admitted on purpose (W1a: an old phone link lands there); "/" with a query stays refused.
+        for method, path in (("GET", "/?x=1"), ("GET", "/pair.js"), ("GET", "/cockpit/manifest.json"),
                              ("GET", "/pair/"), ("GET", "/pair?x=1"), ("HEAD", "/pair")):
             st, _o, _h2 = _call(port, method, path, headers=NAV)
             assert st == 403, (method, path, st)

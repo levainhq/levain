@@ -6209,7 +6209,7 @@
     if (!headers || !headers["X-Levain-Write-Token"]) return Promise.resolve({ error: SESS_NO_TOKEN });
     return consentQueued(() => sessionFetch(stem, headers, 1), SESS_BAD_READ, row);   // the consent fetches' two-at-a-time queue: a long Sessions list cannot stampede the server
   }
-  const SESS_KIND = { prompt: "you", reply: "agent", tool: "tool", consent: "consent" };
+  const SESS_KIND = { prompt: "you", reply: "agent", tool: "tool", consent: "consent", wake: "wake", wake_reply: "wake reply" };
   function sessionWhen(iso) {
     const ms = Date.parse(iso);
     return Number.isFinite(ms) ? new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
