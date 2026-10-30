@@ -547,7 +547,7 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
 # episode stands, and a later stop is a new item. Closing takes the base, so every episode's open item closes.
 # An answer here records only: the panel's Start, Stop and Hold are what act, so the one option is an acknowledgement
 COORDINATOR_STOPPED_KEY = "levain-coordinator-stopped"
-_STOPPED_OPTIONS = (("seen", "Seen: I will press Start, Stop or Hold on the cockpit's Coordinator panel"),)
+_STOPPED_OPTIONS = (("seen", "Seen: I will press Stop or Hold on the cockpit's Coordinator panel"),)
 
 
 def file_coordinator_stopped(qdir: Path | str, agent: str, why: str, episode: str,
@@ -567,7 +567,7 @@ def file_coordinator_stopped(qdir: Path | str, agent: str, why: str, episode: st
             what="The coordinator stopped after three deaths in a row; nothing launches until you act on the "
                  "Coordinator panel.",
             options=list(_STOPPED_OPTIONS), rec="seen",
-            blocks=f"every new coordinator launch, until you press Start, Stop or Hold on the cockpit's Coordinator "
+            blocks=f"every new coordinator launch, until you press Stop or Hold on the cockpit's Coordinator "
                    f"panel (an answer here only records). {text}"[:300],
             cwd=os.path.abspath(str(qdir)), held_by=ANSWER_CHANNELS)
         if not filed:

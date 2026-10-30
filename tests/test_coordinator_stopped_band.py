@@ -57,10 +57,10 @@ def test_three_deaths_file_exactly_one_open_item_with_the_point_and_the_why(stor
     assert len(q.what.splitlines()[0]) < 120 and q.what.startswith("The coordinator stopped after three deaths")
     assert "nothing launches until you act on the Coordinator panel" in q.what
     assert why in q.blocks and q.agent == "claude_code"
-    assert "Start, Stop or Hold on the cockpit's Coordinator panel" in q.blocks
+    assert "Stop or Hold on the cockpit's Coordinator panel" in q.blocks
     # an answer records only: the one option acknowledges, and the panel's verbs are named as where the action is
     (opt,) = q.options
-    assert opt[0] == "seen" and q.rec == "seen" and "Start, Stop or Hold" in opt[1] and "Coordinator panel" in opt[1]
+    assert opt[0] == "seen" and q.rec == "seen" and "Stop or Hold" in opt[1] and "Coordinator panel" in opt[1]
     assert len(_all(qdir)) == 1
 
 
@@ -85,7 +85,7 @@ def test_the_item_is_an_ordinary_numbered_open_item_in_the_band_view(store, qdir
     assert band_view.run_band(argparse.Namespace(queue_dir=qdir)) == 0
     out = capsys.readouterr().out
     assert out.startswith("NEEDS YOU") and "1. [" in out and "The coordinator stopped after three deaths" in out
-    assert "Seen: I will press Start, Stop or Hold" in out
+    assert "Seen: I will press Stop or Hold" in out
     con = sqlite3.connect(qdir / "questions.db")
     assert con.execute("SELECT n, source FROM band_items").fetchall() == [(1, "question")]
 
