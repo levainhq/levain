@@ -253,9 +253,10 @@ def _coordinator_lines(directory: Path | str, agent: str, session: str) -> list[
         return []
 
 
-def _send_ping(agent: str, q: Question, qdir: Path, extra: str = "") -> bool:
-    """Ping the operator about question ``q`` through the agent's notify seam; False when nothing was sent. Never
-    raises: a ping is a ping."""
+def _send_ping(agent: str, q: Question, qdir: Path, extra: str = "", kind: str = "question") -> bool:
+    """Ping the operator about question ``q`` through the agent's notify seam; False when nothing was sent. ``kind`` is
+    ``question`` for a seat's item and ``attention`` for a row the coordinator raises (it passes presence ``quiet``).
+    Never raises: a ping is a ping."""
     try:
         adapter = _agents()[agent]
         send = getattr(adapter, "notify", _agents()["claude_code"].notify)   # Codex shares Claude Code's notify seam
@@ -266,7 +267,7 @@ def _send_ping(agent: str, q: Question, qdir: Path, extra: str = "") -> bool:
 
         n = band_view.number_for_ping(QuestionStore(qdir), q.id)
         return bool(send(adapter.load_settings(qdir), _ping_text(agent, q, qdir, n) + extra, cwd=qdir,
-                         kind="question", ref=f"question:{q.n}"))
+                         kind=kind, ref=f"question:{q.n}"))
     except Exception:  # noqa: BLE001 - see the docstring
         return False
 
@@ -285,7 +286,8 @@ def release_held_pings(directory: Path | str) -> list[str]:
     for q, cause in due:
         extra = ("\nThe coordinator escalated it to you." if cause == "escalated" else
                  f"\nThe coordinator has not read it in {minutes} minutes; it waits on you.")
-        pinged = _send_ping(q.agent, q, Path(directory), extra)
+        # an escalation is the coordinator putting the row in front of him (attention); an unread release is not
+        pinged = _send_ping(q.agent, q, Path(directory), extra, "attention" if cause == "escalated" else "question")
         lines.append(f"question #{q.n} ({cause}): the operator was {'pinged' if pinged else 'NOT pinged'}")
     return lines
 
@@ -373,6 +375,16 @@ def _ping_text(agent: str, q: Question, qdir: Path, band_n: int | None = None) -
     tag = f"band {band_n}, question #{q.n}" if band_n is not None else f"question #{q.n}"
     return (f"levain: {agent} asks ({tag}): {q.what}\nOptions: {opts}.\nBlocks: {q.blocks}.\n"
             f"Answer: levain question answer {q.n}{where} --option <key> (or --text \"...\").")
+
+
+def _coordinator_session(qdir: Path, session: str) -> bool:
+    """True when ``session`` is a harness session Levain started as the coordinator. A fault reads False (a seat)."""
+    try:
+        from levain.coordinator.first_reader import is_coordinator_session
+
+        return is_coordinator_session(qdir, session)
+    except Exception:  # noqa: BLE001 - a fault leaves the question a seat's: held as before
+        return False
 
 
 def _hold(qdir: Path, question_id: str) -> bool:
@@ -504,14 +516,17 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     _release_quietly(qdir)                       # earlier held pings now due go first (C5-1)
     # C5-1: while a coordinator holds a live lease it reads first and the ping is held; a question tied to a consent
     # request is the operator's ruling alone and is never held
-    held = link is None and _hold(qdir, q.id)
+    # a question the coordinator files about its own work is never held behind its own first read: it pings at once
+    # as `attention`
+    own = _coordinator_session(qdir, session)
+    held = link is None and not own and _hold(qdir, q.id)
     pinged = False
     if not held:
         extra = ""
         if state == "undecided":                 # the ping claims the tap only on a state actually read
             extra = (f"\nOption {link.option} is tied to the {push_words}: picking it on the phone page with a "
                      "passkey also allows that push (or rule it with `levain consent rule`).")
-        pinged = _send_ping(agent, q, qdir, extra)
+        pinged = _send_ping(agent, q, qdir, extra, "attention" if own else "question")
     where = ("the answer arrives in your context at a later tool call" if session != NO_SESSION else
              "no session was found in your environment, so the answer will be recorded but not delivered to you "
              + no_session_hint)
@@ -574,7 +589,7 @@ def file_coordinator_stopped(qdir: Path | str, agent: str, why: str, episode: st
             return None
         if still is not None and not still():
             return None
-        _send_ping(agent, q, Path(qdir))
+        _send_ping(agent, q, Path(qdir), kind="attention")
         return q
     except Exception:  # noqa: BLE001 - see the docstring
         return None
