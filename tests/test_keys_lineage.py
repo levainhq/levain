@@ -42,8 +42,7 @@ INTERACTIVE = dict(CLAIMS)
 
 
 def _h621_landed() -> bool:
-    """H6-21 (a null `model_answered` on a refused / released row) is CONTROL's fix in the 6b round, on another lane:
-    until it merges, CONTROL quarantines such a row by `model_answered` (it is still acked and drains)."""
+    """H6-21: True when `RECORD_CHECKS["model_answered"]` accepts a null on a refused / released row."""
     return LN.RECORD_CHECKS["model_answered"](None)
 
 

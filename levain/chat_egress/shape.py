@@ -1,7 +1,6 @@
 """R-10's path shape: the decider's ONE path-shape function (design §3.8.5(o), R15-19-5, R15-21-2, R15-18-Q3).
 
-Nothing here ever returns a query value, and the glue logs no path at all (R15-21-2): this module is the only place a
-request path becomes loggable text.
+Nothing here ever returns a query value, and the glue logs no path at all (R15-21-2).
 
 KEYED host (the route snapshot holds a record): a segment is literal only if it is (a) a segment of a declared repo
 path of that route (item 4; compared in R-2's canonical form) or (b) in GIT_VOCABULARY (exact case); every other

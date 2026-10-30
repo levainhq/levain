@@ -56,7 +56,7 @@ def test_every_old_phone_path_has_a_landing_on_the_cockpits_one_origin(home, tmp
         for shell in ("/sw.js", "/app.webmanifest", "/icon-192.png", "/icon-512.png", "/badge-96.png",
                       "/apple-touch-icon.png"):
             assert _get(url, shell, token=None)[0] == 200, shell
-        # the old page's own files and its data reads have no landing: the old page was their only caller
+        # the old page's own files and its data reads have no landing
         for gone in ("/phone.html", "/phone.js", "/phone.css", "/phone_app.js", "/phone_app.css", "/consent.json",
                      "/coord.json", f"/sign/{RID}/state", "/app/state.json", "/app/board.json"):
             assert _get(url, gone)[0] == 404, gone

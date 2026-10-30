@@ -293,9 +293,9 @@ LAZY_SITES = {
     'levain/dispatch/jobs.py::JobStore.recommend::from levain.dispatch import adopt': 'operator',
     # operator: ``JobStore.__init__`` calls it only for ``directory=None``; ``follow_run.main`` passes ``a.store_dir``, and ``dispatch/cli.py`` / ``control.py`` are the other callers
     'levain/dispatch/jobs.py::default_dispatch_dir::from levain.consent.queue import default_queue_dir': 'operator',
-    # operator: ``land`` <- ``dispatch/cli.py`` (``levain dispatch land``), the only caller; the follower never lands
+    # operator: ``land`` is the operator's (``levain dispatch land``)
     'levain/dispatch/adopt.py::_human_refusal::from levain.consent.queue import AuthoritySource': 'operator',
-    # operator: ``land`` <- ``dispatch/cli.py`` (``levain dispatch land``), the only caller; the follower never lands
+    # operator: ``land`` is the operator's (``levain dispatch land``)
     'levain/dispatch/adopt.py::_human_refusal::from levain.dispatch.jobs import _replay': 'operator',
     # operator: ``authorise_refusal`` <- ``land`` (``dispatch/cli.py``) and ``JobStore.authorise``, neither run by the follower
     'levain/dispatch/adopt.py::authorise_refusal::from levain.consent.passkey import answer_signature_problem': 'operator',

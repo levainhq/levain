@@ -1376,7 +1376,7 @@ def _limit_figure(v: Any) -> str:
 
 def _limit_lines() -> tuple[str, dict[tuple[str, str], dict[str, Any]]]:
     """Per (agent, session id), the budget line the Q13 limits panel reports: its worst metric, whether the session is
-    counted at all, whether it is halted. ``levain.consent.limits.panel`` is another lane's. Returns ``(state, lines)``:
+    counted at all, whether it is halted. Returns ``(state, lines)``:
     ``absent`` (no such module or no ``panel``: no row draws a limits line), ``unreadable`` (it exists and raised or
     answered junk: a budget nobody is watching, said on every row, never drawn as health) or ``ok``."""
     import importlib
