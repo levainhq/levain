@@ -3194,7 +3194,7 @@ BOARD_CATEGORIES = ("backlog", "ready", "running", "waiting", "needs-you", "done
 BOARD_QUEUES = ("ok", "none", "unreadable")
 BOARD_CARDS_MAX = 2000
 # A card's `id`, `title`, `repo` and `done_line` are drawn as text, so each is display-safe (no invisible or format character: a
-# bidi override reorders what the operator reads) and at most this long (the coordinator's own longest field, a done line, is 1000).
+# bidi override reorders what the operator reads) and at most this long.
 BOARD_TEXT_MAX = 1000
 
 
