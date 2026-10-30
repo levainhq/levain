@@ -769,7 +769,7 @@ def _single_flight(directory: Path) -> Iterator[bool]:
         return
     try:
         try:
-            # a store never written has no directory yet: it is made private, and the pass refuses one not this user's
+            # a store never written has no directory yet: it is made private
             os.makedirs(key, mode=0o700, exist_ok=True)
             fd = os.open(os.path.join(key, WATCH_LOCK),
                          os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
