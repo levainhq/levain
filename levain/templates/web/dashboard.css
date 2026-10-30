@@ -2716,6 +2716,9 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
 .bd-card { margin: 0 0 var(--sp-3); padding: var(--sp-3) var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-sm); overflow-wrap: anywhere; }
 .bd-title { font: var(--fw-semibold) var(--fs-meta)/1.4 var(--sans); color: var(--text); }
 .bd-journal { margin-top: var(--sp-2); }
+/* a card's done line is its point: readable text, not micro mono; what it comes after is the quiet line under it */
+.bd-done { margin-top: var(--sp-1); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--text); }
+.bd-deps { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
 /* the tab's grouped list: a .grp-head per column, the cards as plain rows under it (the six-column body above is the modal's) */
 .bd-groups .grp-head { margin-top: var(--sp-4); }
 .bd-groups .grp-head:first-child { margin-top: 0; }
