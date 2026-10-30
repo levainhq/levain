@@ -66,8 +66,10 @@ _KEY = re.compile(r"[a-z0-9][a-z0-9_-]{0,15}")
 _OPTIONS_MIN, _OPTIONS_MAX = 2, 6
 _SESSION_MAX = 256
 _WHAT_MAX = 1000
-_LABEL_MAX = 200
-_BLOCKS_MAX = 300
+# bounds, not a style: the longest option label and "stopped" analysis in the 991 needs-phill rows flow filed are 525
+# and 4,933 characters, and every surface shows a question's whole text (the push body alone is fitted)
+_LABEL_MAX = 600
+_BLOCKS_MAX = 6000
 _TEXT_MAX = 4000
 _N_MAX = 2 ** 63 - 1                     # SQLite's INTEGER
 # how long the hook's read and its claim together wait on a lock another writer holds, by the wall clock: past it

@@ -67,7 +67,7 @@ def raw(store: QuestionStore) -> sqlite3.Connection:
     dict(options=[("a" * 17, "x"), ("b", "y")]),
     dict(options=[("a", ""), ("b", "y")]),
     dict(options=[("a", "x\ny"), ("b", "y")]),
-    dict(options=[("a", "x" * 201), ("b", "y")]),
+    dict(options=[("a", "x" * 601), ("b", "y")]),
     dict(options=[{"key": "a", "label": "x", "extra": 1}, ("b", "y")]),
     dict(options="ab"),
     dict(rec="zzz"),
@@ -75,7 +75,7 @@ def raw(store: QuestionStore) -> sqlite3.Connection:
     dict(rec=None),
     dict(blocks=""),
     dict(blocks=None),
-    dict(blocks="x" * 301),
+    dict(blocks="x" * 6001),
     dict(blocks="a\nb"),
     dict(resume=["not", "an", "object"]),
     dict(resume={"x": object()}),
@@ -84,6 +84,12 @@ def test_file_refusals_write_nothing(store, over):
     with pytest.raises(ConsentError):
         ask(store, **over)
     assert store.open_questions() == []
+
+
+def test_a_whole_analysis_files_whole(store):
+    blocks, label = "b" * 6000, "l" * 600
+    q = ask(store, blocks=blocks, options=[("a", label), ("b", "y")])
+    assert q.blocks == blocks and q.options[0][1] == label
 
 
 def test_missing_rec_and_blocks_refused(store):
