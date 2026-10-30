@@ -111,3 +111,20 @@ def test_another_seats_question_is_still_held_while_a_coordinator_holds_the_leas
     q, text = d.ask()
     assert "not pinged yet" in text and wire.spawned == []
     assert d.rows("SELECT question_id FROM held_pings") == [(q.id,)]
+
+
+def test_a_faulted_coordinator_lookup_sends_at_once_as_a_plain_question_and_holds_nothing(rig, monkeypatch):
+    """L3 r1 (codex MED, deepseek MED): a lookup fault read False, so a coordinator's own ask sat in held_pings and later went
+    out muted. A fault is its own answer: no `attention` (nothing is proven) and no hold behind a first read."""
+    d, wire = rig
+    d.coordinator()
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(fr, "is_coordinator_session", boom)
+    _say(d, "quiet")
+    q, text = band.file_question("claude_code", "sess-coord", "which of the two?", [("a", "one"), ("b", "two")], "a",
+                                 "the pick", d.dir)
+    assert q is not None and "not pinged yet" not in text
+    assert wire.spawned == [("question", False, "quiet")]
+    assert d.rows("SELECT COUNT(*) FROM held_pings") == [(0,)]

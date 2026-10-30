@@ -377,14 +377,15 @@ def _ping_text(agent: str, q: Question, qdir: Path, band_n: int | None = None) -
             f"Answer: levain question answer {q.n}{where} --option <key> (or --text \"...\").")
 
 
-def _coordinator_session(qdir: Path, session: str) -> bool:
-    """True when ``session`` is a harness session Levain started as the coordinator. A fault reads False (a seat)."""
+def _coordinator_session(qdir: Path, session: str) -> bool | None:
+    """True when ``session`` is a harness session Levain started as the coordinator, False when it is not, None when
+    the lookup faulted (the caller neither grants the coordinator's `attention` nor holds the ping behind a first read)."""
     try:
         from levain.coordinator.first_reader import is_coordinator_session
 
         return is_coordinator_session(qdir, session)
-    except Exception:  # noqa: BLE001 - a fault leaves the question a seat's: held as before
-        return False
+    except Exception:  # noqa: BLE001 - a fault is its own answer: sent at once as a plain question
+        return None
 
 
 def _hold(qdir: Path, question_id: str) -> bool:
@@ -519,14 +520,14 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     # a question the coordinator files about its own work is never held behind its own first read: it pings at once
     # as `attention`
     own = _coordinator_session(qdir, session)
-    held = link is None and not own and _hold(qdir, q.id)
+    held = link is None and own is False and _hold(qdir, q.id)
     pinged = False
     if not held:
         extra = ""
         if state == "undecided":                 # the ping claims the tap only on a state actually read
             extra = (f"\nOption {link.option} is tied to the {push_words}: picking it on the phone page with a "
                      "passkey also allows that push (or rule it with `levain consent rule`).")
-        pinged = _send_ping(agent, q, qdir, extra, "attention" if own else "question")
+        pinged = _send_ping(agent, q, qdir, extra, "attention" if own and link is None else "question")
     where = ("the answer arrives in your context at a later tool call" if session != NO_SESSION else
              "no session was found in your environment, so the answer will be recorded but not delivered to you "
              + no_session_hint)
