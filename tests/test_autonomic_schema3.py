@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from levain.autonomic import Posture
+from levain.autonomic import Posture, agent_tables
 from levain.autonomic import db as vdb
 from levain.autonomic import durable_sqlite
 from levain.autonomic import schema3 as s
@@ -138,6 +138,8 @@ def _v2_store_then_steps(d) -> str:
     """V's own /2 store, then the /3 DDL step (what an upgrade runs before its stamp and backfill)."""
     c = sqlite3.connect(d / vdb.DB_NAME, isolation_level=None)
     c.execute("BEGIN IMMEDIATE")
+    for table in reversed(agent_tables.AGENT_TABLES):    # a /2 store before the agent tables (A0 §3.5; R-A3)
+        c.execute(f"DROP TABLE {table}")
     s.ddl_v3(c)
     s.triggers_v3(c)
     out = s.fingerprint(c)

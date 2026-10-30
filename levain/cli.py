@@ -640,6 +640,10 @@ def main(argv: list[str] | None = None) -> int:
     _add_band_parsers(subparsers)
     _add_dispatch_parsers(subparsers)
     _add_coordinator_parsers(subparsers)
+    from levain.agents.cli import add_parsers as _add_agents_parsers
+    _add_agents_parsers(subparsers)
+    from levain.dream.cli import add_parsers as _add_dream_parsers
+    _add_dream_parsers(subparsers)
 
     run_p = subparsers.add_parser(
         "run",
