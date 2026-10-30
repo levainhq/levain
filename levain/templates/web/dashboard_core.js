@@ -7280,40 +7280,72 @@
 
   // OS-3, the narrow page's strip: one tap goes to the phone view's content. Needs you, Board and Notifications are blocks on this
   // page; Grants and Drop are drawn inside the Decisions view, so their tabs open it and take the reader to their own slot. That
-  // view fills as its reads answer, so the wait for the slot is bounded: a view with nothing to show (no standing grant) is left
-  // open at its top.
+  // view fills as its reads answer (queued, each up to the fetch deadline), so the wait is for the POPULATED node, bounded by a
+  // deadline a little past the read's own; a view with nothing to show (no standing grant, a read that failed) is left where the
+  // slot is, or at its top when it has none.
   const PHONE_JUMP_TARGET = {
     needs: "#ck-needs:not([hidden])",
     board: ".panel[data-ck-panel=\"tray\"]",
     notes: ".panel[data-ck-panel=\"notifications\"]",
   };
-  const PHONE_JUMP_IN_VIEW = { grants: "#levain-modal .ext-grouphead", drop: "#levain-modal .coord-drop-slot" };
-  // The slot is scrolled to again until the view stops growing above it (two looks at the same height), so a row that fills in
-  // after the slot appeared does not leave the reader short of it.
-  function phoneJumpInView(which, tries, lastTop) {
-    const found = which === "drop" ? document.querySelector(PHONE_JUMP_IN_VIEW.drop)
-      : Array.from(document.querySelectorAll(PHONE_JUMP_IN_VIEW.grants)).find((h) => /standing grants/i.test(h.textContent));
-    if (found && found.getClientRects().length) {
-      if (lastTop !== undefined && Math.abs(found.getBoundingClientRect().top - lastTop) < 1) return;   // it stayed where the last scroll put it
-      found.scrollIntoView({ block: "start" });
-      lastTop = found.getBoundingClientRect().top;
+  const PHONE_JUMP_WAIT_MS = CONSENT_FETCH_TIMEOUT_MS + 5000, PHONE_JUMP_STEP_MS = 150, PHONE_JUMP_STEADY = 2;
+  // one run at a time: a newer tap, or the reader's own touch or wheel, ends the run in flight, so nothing yanks the view back
+  let phoneJumpRun = 0;
+  // `slot`: where the tab's section sits once it is drawn; `filled`: the same node once its read has filled it (the grants heading
+  // exists only with a grant under it; the drop slot exists empty from the first paint and holds its row after its read)
+  function phoneJumpFind(which) {
+    if (which === "drop") {
+      const slot = document.querySelector("#levain-modal .coord-drop-slot");
+      return { slot: slot, filled: slot && slot.querySelector(".coord-drop-row") ? slot : null };
     }
-    if (tries > 0) window.setTimeout(() => phoneJumpInView(which, tries - 1, lastTop), 150);
+    const head = Array.from(document.querySelectorAll("#levain-modal .ext-grouphead")).find((h) => /standing grants/i.test(h.textContent)) || null;
+    return { slot: head, filled: head };
+  }
+  const phoneJumpDrawn = (n) => !!n && n.getClientRects().length > 0;
+  // The filled node is scrolled to again until the view stops growing above it (steady looks at the same height), so a row that
+  // fills in after the node appeared does not leave the reader short of it.
+  function phoneJumpInView(which, run, deadline, seen) {
+    if (run !== phoneJumpRun || !document.getElementById("levain-modal")) return;
+    const f = phoneJumpFind(which);
+    let top = seen ? seen.top : undefined, steady = seen ? seen.steady : 0;
+    if (phoneJumpDrawn(f.filled)) {
+      const now = f.filled.getBoundingClientRect().top;
+      steady = top !== undefined && Math.abs(now - top) < 1 ? steady + 1 : 0;
+      if (steady >= PHONE_JUMP_STEADY) return;
+      if (steady === 0) f.filled.scrollIntoView({ block: "start" });
+      top = f.filled.getBoundingClientRect().top;
+    } else if (!seen && phoneJumpDrawn(f.slot)) {
+      f.slot.scrollIntoView({ block: "start" });   // the slot is there before its read answers: the tap shows the move at once
+    }
+    if (Date.now() < deadline) {
+      window.setTimeout(() => phoneJumpInView(which, run, deadline, { top: top, steady: steady }), PHONE_JUMP_STEP_MS);
+    } else if (!phoneJumpDrawn(f.filled) && phoneJumpDrawn(f.slot)) {
+      f.slot.scrollIntoView({ block: "start" });   // never filled: the slot is where the reader lands
+    }
   }
   function phoneJump(which, opener) {
+    const run = ++phoneJumpRun;
     if (which === "grants" || which === "drop") {
       if (!document.getElementById("levain-modal") && !openDecisionsHistory(opener)) return;
-      phoneJumpInView(which, 20);
+      phoneJumpInView(which, run, Date.now() + PHONE_JUMP_WAIT_MS);
       return;
     }
     const sel = PHONE_JUMP_TARGET[which];
     const target = sel ? document.querySelector(sel) : null;
-    if (target) target.scrollIntoView({ block: "start" });
+    if (!target) return;
+    // a panel the saved tab hides has no box to scroll to: its tab is shown first, and the scroll waits for the layout frame
+    const K = window.LevainCockpitKinds;
+    if (K && typeof K.revealTab === "function") K.revealTab(target);
+    window.requestAnimationFrame(() => {
+      const t = target.isConnected ? target : document.querySelector(sel);
+      if (run === phoneJumpRun && t) t.scrollIntoView({ block: "start" });
+    });
   }
   document.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest ? ev.target.closest("[data-phone-jump]") : null;
     if (b) phoneJump(b.dataset.phoneJump, b);
   });
+  for (const type of ["touchstart", "wheel"]) document.addEventListener(type, () => { phoneJumpRun++; }, { passive: true, capture: true });
 
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };

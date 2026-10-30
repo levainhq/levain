@@ -57,7 +57,9 @@ def drive_touch(tmp_path: Path, url: str, steps: list) -> dict:
     d = tmp_path / "touch_driver"
     d.mkdir()
     (d / "_page_drive.mjs").write_text(patched)
-    (d / "chrome_flags.json").write_text((DRIVE.parent / "chrome_flags.json").read_text())
+    for sibling in DRIVE.parent.iterdir():   # everything the driver may read beside itself (its flags file, any module it imports)
+        if sibling.is_file() and sibling.suffix in (".json", ".mjs", ".js") and sibling.name != DRIVE.name:
+            (d / sibling.name).write_text(sibling.read_text())
     f = d / "steps.json"
     f.write_text(json.dumps(steps))
     res = run_driver([NODE, str(d / "_page_drive.mjs"), CHROME, url, str(f)], timeout=300)

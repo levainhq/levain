@@ -2756,7 +2756,9 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
 .ck-phonetabs { display: none; }
 @media (max-width: 720px) {
   /* the hero's two children (the band, the sky card) join the deck's column so the needs strip can sit between them: the state
-     line first, then what waits on him, then the sky. Every moved block has an explicit order; the rest keep document order. */
+     line first, then what waits on him, then the sky. Every moved block has an explicit order; the rest keep document order.
+     The hero draws no box of its own (display block is all it sets), so its flatten loses no padding, margin or paint; a box
+     style added to it would need the deck's gap to carry it here. */
   body.ke .deck > .masthead { order: -4; }
   body.ke .ck-phonetabs { order: -3; }
   body.ke .hero:not([hidden]) { display: contents; }
@@ -2788,11 +2790,13 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
   body.ke .modal-body .ext-grouphead, body.ke .modal-body .coord-drop-slot { scroll-margin-top: calc(var(--hit-min) + var(--sp-3)); }   /* under the view's sticky filter */
 }
 /* touch: a control that is small to the eye keeps its size and grows its HIT AREA through a pseudo-element, as the row verbs do
-   above, so a card does not change height; the areas grow upward and downward only, so neighbours in a row never overlap */
+   above, so a card does not change height. The area is the control's own box, centred, and at least the hit minimum in each
+   direction: a control already that large gains nothing, one narrower or shorter grows evenly about its centre */
 @media (pointer: coarse) {
   body.ke .needs-history, body.ke .tray-dump-btn, body.ke .state-edit, body.ke .tv-seg-b, body.ke .tv-live, body.ke .ck-lay-btn { position: relative; }
   body.ke .needs-history::after, body.ke .tray-dump-btn::after, body.ke .state-edit::after, body.ke .tv-seg-b::after,
   body.ke .tv-live::after, body.ke .ck-lay-btn::after {
-    content: ""; position: absolute; inset: -10px 0;
+    content: ""; position: absolute; top: 50%; left: 50%; width: 100%; height: 100%;
+    min-width: var(--hit-min); min-height: var(--hit-min); transform: translate(-50%, -50%);
   }
 }
