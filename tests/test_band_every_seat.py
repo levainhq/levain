@@ -195,8 +195,12 @@ def test_verifier_unwritable_claim_fails_open(qdir, store, monkeypatch):
     e = env(qdir)
     ask(store)
     deliver(store, e=e)
-    (qdir / "band_stop").write_text("a file where the claim directory goes")
-    assert stop("s1", "no band", e) is None                            # cannot record the claim: no block
+    # the prompt hook's turn record made the directory (C11 r1): a directory the claim cannot be created in
+    (qdir / "band_stop").chmod(0o500)
+    try:
+        assert stop("s1", "no band", e) is None                        # cannot record the claim: no block
+    finally:
+        (qdir / "band_stop").chmod(0o700)
 
 
 def test_verifier_is_per_viewer(qdir, store, monkeypatch):

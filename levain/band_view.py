@@ -905,17 +905,26 @@ def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> st
     return "since your last message: " + " · ".join(parts)
 
 
-def is_autonomous(session_id: str, queue_dir: Path | str | None = None,
-                  environ: Mapping[str, str] | None = None, busy_s: float | None = None) -> bool:
-    """Whether no human turn can reach this seat (D4). The first fact found decides: (1) the Levain launch row of the
-    harness session (a coordinator is attended; a worker is not: the only worker Levain launches is the dispatch
-    executor, and the row carries no worker kind, so a ``session`` worker will need its kind read here when its
-    brief lands); (2) the ``LEVAIN_SEAT=autonomous|attended`` marker Levain sets on the processes it starts (or the
-    user on their own script); (3) neither: NOT autonomous (fail-safe: a band shown where nobody reads it costs tokens,
-    a band missing from a human seat drops questions). Grants and posture never decide it. ``busy_s`` (default
-    HOOK_BUSY_MS) bounds the wait on a held coordinator store; past it there is no launch fact."""
+class SeatFact(NamedTuple):
+    """What the launch row and the seat marker say about a harness session: ``autonomous``, and the launch's ``role``
+    and ``launch_id`` (``None`` for a session with no launch row)."""
+    autonomous: bool
+    role: str | None = None
+    launch_id: str | None = None
+
+
+def seat_fact(session_id: str, queue_dir: Path | str | None = None,
+              environ: Mapping[str, str] | None = None, busy_s: float | None = None) -> SeatFact:
+    """Whether no human turn can reach this seat (D4), with the launch row it was read from. The first fact found
+    decides: (1) the Levain launch row of the harness session (a coordinator is attended; a worker is not: the only
+    worker Levain launches is the dispatch executor, and the row carries no worker kind, so a ``session`` worker will
+    need its kind read here when its brief lands); (2) the ``LEVAIN_SEAT=autonomous|attended`` marker Levain sets on
+    the processes it starts (or the user on their own script); (3) neither: NOT autonomous (fail-safe: a band shown
+    where nobody reads it costs tokens, a band missing from a human seat drops questions). Grants and posture never
+    decide it. ``busy_s`` (default HOOK_BUSY_MS) bounds the wait on a held coordinator store; past it there is no
+    launch fact."""
     if "#agent:" in session_id:
-        return True                           # a subagent never renders: the band belongs to the session's main thread
+        return SeatFact(True)                 # a subagent never renders: the band belongs to the session's main thread
     try:
         from levain.coordinator import lease
         from levain.coordinator.store import CoordStore
@@ -926,12 +935,44 @@ def is_autonomous(session_id: str, queue_dir: Path | str | None = None,
             conn.close()
     except Exception:                         # no coordinator store, or not one to read: no launch fact
         ln = None
+    return _fact_of(ln, environ)
+
+
+def _fact_of(ln: Any, environ: Mapping[str, str] | None) -> SeatFact:
+    """:func:`seat_fact`'s decision from a launch row already read (or ``None``)."""
     if ln is not None and ln.role == "coordinator":
-        return False
+        return SeatFact(False, ln.role, getattr(ln, "launch_id", None))
     if ln is not None and ln.role == "worker":
-        return True
+        return SeatFact(True, ln.role, getattr(ln, "launch_id", None))
     env = os.environ if environ is None else environ
-    return env.get("LEVAIN_SEAT") == "autonomous"      # "attended", anything else or unset: a seat a human reaches
+    return SeatFact(env.get("LEVAIN_SEAT") == "autonomous")   # "attended", anything else or unset: a seat a human reaches
+
+
+def is_autonomous(session_id: str, queue_dir: Path | str | None = None,
+                  environ: Mapping[str, str] | None = None, busy_s: float | None = None) -> bool:
+    """Whether no human turn can reach this seat: :func:`seat_fact`'s ``autonomous``."""
+    return seat_fact(session_id, queue_dir, environ, busy_s).autonomous
+
+
+def wake_marker(launch_id: str) -> str:
+    """The first line of a coordinator launch's first prompt (``launch._prompt``): it names the launch."""
+    return f"[levain wake {launch_id}]"
+
+
+WAKE_LINE = "wake: act and record; the operator is not waiting on this turn"
+_WAKE_PREFIX = "[levain wake ln-"
+
+
+def turn_kind(prompt: Any, fact: SeatFact, environ: Mapping[str, str]) -> str:
+    """``coordinator-wake`` (the prompt's first line is exactly the marker of the launch row this session has, and
+    that row is a coordinator's), ``relay`` (:func:`_is_relay`: another Levain-written line, whatever the seat) or
+    ``operator``. Provenance plus role, never a text prefix alone: the marker on any other session is the operator's."""
+    if not isinstance(prompt, str):
+        return "operator"
+    first = prompt.lstrip().split("\n", 1)[0].strip()
+    if fact.role == "coordinator" and fact.launch_id and first == wake_marker(fact.launch_id):
+        return "coordinator-wake"
+    return "relay" if _is_relay(prompt, environ) else "operator"
 
 
 def _seat_gets_band(payload: Any, environ: Mapping[str, str], deadline: float | None = None) -> bool:
@@ -956,7 +997,11 @@ def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None, agent: s
     recorded and refused and the viewer's delta. Call ``commit()`` only once the text was DELIVERED: it records the
     ``closed`` notices as shown and the viewer's view row (D7). ``("", no-op)`` for an autonomous or id-less seat, an
     empty band or ANY error before anything was recorded; it never raises (``commit`` neither). A render that fails
-    AFTER an answer was recorded still returns the echo: what was recorded is said."""
+    AFTER an answer was recorded still returns the echo: what was recorded is said. The turn is classified ONCE
+    (:func:`_turn_fact`) and that fact is the turn record the Stop hook and the transcript read (:func:`_write_turn`),
+    written as soon as the session is known, before the hook's other returns. A coordinator wake returns only :data:`WAKE_LINE` with a no-op commit. A
+    coordinator session's viewer is the role (:data:`COORDINATOR_VIEWER`), and its ``commit()`` only stages the view
+    for the Stop hook (:func:`_stop_coordinator`)."""
     t0 = time.monotonic()
     # ONE bound for the whole hook (S3 fix round 2, codex 4/5): the launch-row read, every snapshot (questions and
     # the authority sources), the answers' write, a first-time setup, the render's numbering, then the view row.
@@ -972,12 +1017,22 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
         from levain.consent.queue import queue_dir_for
 
         env = os.environ if environ is None else environ
-        if not _seat_gets_band(payload, env, deadline):
+        session = payload.get("session_id") if isinstance(payload, dict) else None
+        if not isinstance(session, str) or not session:
+            return "", _no_commit                 # nobody's seat (`levain verify-hooks`, a malformed payload)
+        directory = queue_dir_for(env)
+        fact = _turn_fact(session, payload.get("prompt"), directory, env, agent, max(0.0, deadline - time.monotonic()))
+        _write_turn(directory, session, fact, payload.get("prompt"))
+        if not fact.band:
             return "", _no_commit
-        store = QuestionStore(queue_dir_for(env))
-        viewer = f"{agent}:{payload['session_id']}"
+        store = QuestionStore(directory)
     except Exception:
         return "", _no_commit
+    viewer, coord = fact.viewer, fact.coord
+    if fact.kind == "coordinator-wake":
+        return WAKE_LINE, _no_commit                # silent: no parse, no render, no view, no `closed` notice
+    if coord:
+        _clear_staged(directory, session)        # a turn of this session that never reached Stop leaves no view to commit
     echo = ""
     try:
         echo = _seat_answer(store, viewer, payload.get("prompt"), env, deadline)
@@ -1004,6 +1059,9 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
         text = echo + ("\n" + text if text else "")
 
     def commit() -> None:
+        if coord:                             # the coordinator's view is the Stop hook's to commit, after the reply verifies
+            _stage_view(directory, session, r, block)
+            return
         try:
             mark_closed_shown(store, r.closed)
         except Exception:
@@ -1014,6 +1072,249 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
             pass
 
     return text, commit
+
+
+COORDINATOR_VIEWER = "coordinator"
+
+
+class TurnFact(NamedTuple):
+    """One hook call's classification, from ONE launch-row read (:func:`_turn_fact`): the turn ``kind``
+    (:func:`turn_kind`), the band ``viewer``, whether that is the coordinator's role viewer (``coord``: its view is
+    staged at the prompt and committed at Stop) and whether the seat gets the band at all (``band``)."""
+    kind: str
+    viewer: str
+    coord: bool
+    band: bool
+
+
+def _marker_id(prompt: Any) -> str | None:
+    """The launch id a prompt's first line names as a wake marker (:func:`wake_marker`), or ``None``."""
+    if not isinstance(prompt, str):
+        return None
+    first = prompt.lstrip().split("\n", 1)[0].strip()
+    if not first.startswith(_WAKE_PREFIX) or not first.endswith("]"):
+        return None
+    return first[len("[levain wake "):-1]
+
+
+def _turn_fact(session: str, prompt: Any, directory: Path | str, env: Mapping[str, str], agent: str,
+               busy_s: float | None) -> TurnFact:
+    """The turn's one fact. ONE open of the coordinator store, waiting at most ``busy_s``: the session's launch row
+    and, for a prompt whose first line is a wake marker, the launch the marker names. The marker is the launch's
+    provenance, because ``claude --bg`` (and Codex's ``turn/start``) submit the first prompt before
+    ``launch_activate`` binds the session to its launch: a wake is the marker of a COORDINATOR launch that is unbound
+    or bound to this session, on a session bound to no other launch. Anything unreadable: no launch fact, so no wake
+    and the per-session viewer (the turn gets today's band). Never raises for a store that cannot be read."""
+    if "#agent:" in session:
+        return TurnFact("operator", f"{agent}:{session}", False, False)     # a subagent never renders
+    own = named = None
+    want = _marker_id(prompt)
+    try:
+        from levain.coordinator import lease
+        from levain.coordinator.store import CoordStore
+
+        conn = CoordStore(directory).open_readonly(busy_s=HOOK_BUSY_MS / 1000 if busy_s is None else busy_s)
+        try:
+            own = lease.by_harness_session(conn, session)
+            if want is not None:
+                named = lease.launch(conn, want)
+        finally:
+            conn.close()
+    except Exception:                         # no coordinator store, or not one to read: no launch fact
+        own = named = None
+    if (named is not None and named.role == "coordinator"
+            and named.harness_session_id in (None, session)
+            and (own is None or own.launch_id == named.launch_id)):
+        kind = turn_kind(prompt, SeatFact(False, named.role, named.launch_id), env)
+        if kind == "coordinator-wake":
+            return TurnFact(kind, COORDINATOR_VIEWER, True, True)
+    fact = _fact_of(own, env)
+    kind = turn_kind(prompt, SeatFact(fact.autonomous), env)   # no launch to wake: operator or relay
+    if fact.role == "coordinator":
+        return TurnFact(kind, COORDINATOR_VIEWER, True, True)
+    return TurnFact(kind, f"{agent}:{session}", False, not fact.autonomous)
+
+
+def _session_file(directory: Path | str, session: str, suffix: str) -> Path:
+    import hashlib
+
+    return Path(directory) / "band_stop" / f"s-{hashlib.sha256(session.encode()).hexdigest()[:24]}.{suffix}"
+
+
+def _replace(f: Path, data: str) -> None:
+    f.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
+    tmp.write_text(data)
+    os.replace(tmp, f)
+
+
+def _remove_if(f: Path, expect: bytes | None) -> None:
+    """Compare-and-delete: remove ``f`` only while it still holds ``expect`` (``None``: whatever it holds). The file is
+    renamed aside first; a record that replaced the one read is put back, unless a newer one took its place
+    meanwhile (that one is kept). Never raises."""
+    try:
+        aside = f.with_name(f"{f.name}.{os.getpid()}.del")
+        try:
+            os.rename(f, aside)
+        except FileNotFoundError:
+            return
+        if expect is not None and aside.read_bytes() != expect:
+            try:
+                os.link(aside, f)              # not the record read: back in place, unless a newer one took it
+            except FileExistsError:
+                pass
+        aside.unlink()
+    except Exception:
+        pass
+
+
+def _stage_view(directory: Path | str, session: str, r: "Rendered", block: str) -> None:
+    """Keep the view a coordinator turn was just shown for its Stop hook to commit: one record per SESSION (two
+    coordinator sessions alive at once never share one), replaced atomically. Never raises."""
+    try:
+        _replace(_session_file(directory, session, "staged"),
+                 json.dumps({"session": session, "hwm": r.hwm, "shown": list(r.shown), "gen": r.gen,
+                             "closed": list(r.closed), "block": block}))
+    except Exception:
+        pass
+
+
+def _clear_staged(directory: Path | str, session: str, expect: bytes | None = None) -> None:
+    _remove_if(_session_file(directory, session, "staged"), expect)
+
+
+def _read_staged(directory: Path | str, session: str) -> tuple[dict, bytes] | None:
+    """The staged view of ``session`` with the bytes it was read from (for :func:`_clear_staged`), or ``None`` (none,
+    unreadable, another session's)."""
+    try:
+        raw = _session_file(directory, session, "staged").read_bytes()
+        rec = json.loads(raw)
+        if rec["session"] != session:
+            return None
+        return ({"hwm": int(rec["hwm"]), "shown": [int(n) for n in rec["shown"]], "gen": int(rec["gen"]),
+                 "closed": [int(n) for n in rec["closed"]], "block": str(rec["block"])}, raw)
+    except Exception:
+        return None
+
+
+def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, payload: dict, message: str,
+                      deadline: float | None = None) -> str | None:
+    """The coordinator viewer's Stop: the view this session's prompt hook staged commits only once the reply reprints
+    it (:func:`_reprint_check`), so a turn that never produced a verified reply leaves the cursor where it was and the
+    next reply repeats the delta. A view with nothing open still verifies when it carries a block (``NEEDS YOU · 0
+    open`` and its delta). One block per view, as on every seat; the continuation that carries the reprint commits.
+    The stage is removed by compare-and-delete: only the record this Stop read."""
+    session = payload["session_id"]
+    got = _read_staged(directory, session)
+    if got is None:
+        return None
+    st, raw = got
+    ok = True
+    missing: list[int] = []
+    if st["shown"] or st["block"]:
+        missing, altered = _reprint_check(View(st["hwm"], tuple(st["shown"]), None), st["block"], message)
+        ok = not missing and not altered
+    if ok:
+        try:
+            mark_closed_shown(store, st["closed"])
+        except Exception:
+            pass
+        try:
+            record_view(store, viewer, st["hwm"], st["shown"], deadline=deadline, gen=st["gen"], block=st["block"])
+        except Exception:
+            pass
+        _clear_staged(directory, session, raw)
+        return None
+    if payload.get("stop_hook_active") or not _claim_retry(directory, viewer, st["gen"]):
+        return None
+    return _reprint_reason(missing)
+
+
+def _reprint_reason(missing: list[int]) -> str:
+    what = ("the items " + ", ".join(str(n) for n in missing)) if missing else "the band as given (header line or items altered)"
+    return (f"[Levain NEEDS YOU band] Your reply dropped {what} of the NEEDS YOU band you were given. Reprint the "
+            "whole band once, exactly as Levain gave it (the band@ line and every numbered item, unchanged), at "
+            "the end of your reply. Do not answer or renumber any item.")
+
+
+def _prompt_sha(prompt: Any) -> str | None:
+    import hashlib
+
+    return hashlib.sha256(prompt.encode()).hexdigest()[:24] if isinstance(prompt, str) else None
+
+
+def _write_turn(directory: Path | str, session: str, fact: TurnFact, prompt: Any) -> None:
+    """The turn record (``{kind, viewer, coord, band, session, at, sha}``, one file per session, replaced atomically):
+    this prompt's :class:`TurnFact`, which the Stop hook and the transcript read instead of deciding again. ``sha``
+    names the prompt it was written for. A record lives until its own session's Stop removes it (a live coordinator
+    launch keeps its record while another launch prompts); a record nobody removed is collected by age
+    (:func:`_gc_turns`). Never raises."""
+    try:
+        f = _session_file(directory, session, "turn.rec")
+        _replace(f, json.dumps({"kind": fact.kind, "viewer": fact.viewer, "coord": fact.coord, "band": fact.band,
+                                "session": session, "at": time.time_ns(), "sha": _prompt_sha(prompt)}))
+        _gc_turns(f)
+    except Exception:
+        pass
+
+
+TURN_RECORD_MAX_AGE_S = 24 * 3600
+
+
+def _gc_turns(keep: Path) -> None:
+    """Remove turn records older than a day (a session that died before its Stop). Age is the only test: a live
+    session's record is never judged by another session's prompt. Never raises."""
+    try:
+        cutoff = time.time() - TURN_RECORD_MAX_AGE_S
+        for old in keep.parent.glob("s-*.turn.rec"):
+            if old != keep and old.stat().st_mtime < cutoff:
+                old.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _read_turn(directory: Path | str, session: str) -> tuple[dict, bytes] | None:
+    """This session's turn record with its bytes, or ``None`` (missing, unreadable, malformed, another session's)."""
+    try:
+        raw = _session_file(directory, session, "turn.rec").read_bytes()
+        rec = json.loads(raw)
+        if (rec["session"] != session or not isinstance(rec["kind"], str) or not isinstance(rec["viewer"], str)
+                or type(rec["coord"]) is not bool or type(rec["band"]) is not bool or type(rec["at"]) is not int):
+            return None
+        return rec, raw
+    except Exception:
+        return None
+
+
+def _fresh_wake(directory: Path | str, session: str, rec: dict | None) -> bool:
+    """True only when ``rec`` (this session's turn record) says ``coordinator-wake`` and no view this session staged
+    is as new as it (a later turn's render whose own record was never written makes the wake stale). Both clocks are
+    ``time.time_ns()``: the record's ``at`` and a render's ``gen`` (:func:`render_full`)."""
+    if rec is None or rec["kind"] != "coordinator-wake":
+        return False
+    got = _read_staged(directory, session)
+    return got is None or got[0]["gen"] < rec["at"]
+
+
+def turn_log_kind(payload: Any, kind: str, environ: Mapping[str, str] | None = None, agent: str = "claude_code") -> str:
+    """The transcript kind for this turn's line: ``wake`` for a prompt (``kind="prompt"``) or ``wake_reply`` for a
+    reply (``kind="reply"``) when the turn is a coordinator wake, else ``kind``. It reads the turn record only, never
+    a store: for a prompt, a wake record written for this very prompt (its ``sha``); for a reply, the Stop hook's own
+    test (:func:`_fresh_wake`). Never raises."""
+    try:
+        from levain.consent.queue import queue_dir_for
+
+        env = os.environ if environ is None else environ
+        session = payload["session_id"]
+        directory = queue_dir_for(env)
+        got = _read_turn(directory, session)
+        rec = got[0] if got is not None else None
+        if kind == "prompt":
+            sha = _prompt_sha(payload.get("prompt"))
+            return "wake" if rec is not None and rec["kind"] == "coordinator-wake" and sha and rec.get("sha") == sha else kind
+        return "wake_reply" if _fresh_wake(directory, session, rec) else kind
+    except Exception:
+        return kind
 
 
 def hook_contract(payload: Any, environ: Mapping[str, str] | None = None, agent: str = "claude_code") -> str:
@@ -1119,39 +1420,69 @@ def hook_stop(payload: Any, environ: Mapping[str, str] | None = None, agent: str
     view (what the UserPromptSubmit hook delivered): the reply must reprint the rendered band, header line and every
     item line in order (:func:`_reprint_check`). BOUNDED: never when the harness says the stop is already a
     continuation (``stop_hook_active``), at most one block per view (:func:`_claim_retry`), and FAIL OPEN on anything
-    unreadable (no view, a non-text reply, an autonomous seat, a busy or missing store). Never raises, never writes the
-    operator's data."""
+    unreadable (no view, a non-text reply, an autonomous seat, a busy or missing store). Which turn this was, and its
+    viewer, come from the turn record its prompt hook wrote (:func:`_read_turn`), never decided again; a missing or
+    unreadable record is decided by one launch-row read and VERIFIES. The one skip beyond those: a fresh
+    coordinator-wake record (:func:`_fresh_wake`). A coordinator session is checked against the view its prompt hook
+    staged, which commits here (:func:`_stop_coordinator`). Every store read and the view's write wait within ONE bound
+    (HOOK_BUSY_MS); the ``closed`` notices' write keeps its own (:func:`mark_closed_shown`). A turn that ends here
+    removes its record (compare-and-delete). Never raises, never writes the operator's data beyond
+    that commit."""
+    deadline = time.monotonic() + HOOK_BUSY_MS / 1000
+    with read_deadline(deadline):
+        return _hook_stop(payload, environ, agent, deadline)
+
+
+def _hook_stop(payload: Any, environ: Mapping[str, str] | None, agent: str, deadline: float) -> str | None:
     try:
         from levain.consent.queue import queue_dir_for
 
-        if not isinstance(payload, dict) or payload.get("stop_hook_active"):
+        if not isinstance(payload, dict):
             return None
         message = payload.get("last_assistant_message")
-        if not isinstance(message, str):
+        session = payload.get("session_id")
+        if not isinstance(message, str) or not isinstance(session, str) or not session:
             return None
         env = os.environ if environ is None else environ
-        if not _seat_gets_band(payload, env):
-            return None
         directory = queue_dir_for(env)
-        store = QuestionStore(directory)
-        viewer = f"{agent}:{payload['session_id']}"
-        got = _view_row(store, viewer)
-        if got is None:
-            return None
-        view, gen, block = got
-        if not view.open_list:
-            return None
-        missing, altered = _reprint_check(view, block, message)
-        if not missing and not altered:
-            return None
-        if not _claim_retry(directory, viewer, gen):
-            return None
-        what = ("the items " + ", ".join(str(n) for n in missing)) if missing else "the band as given (header line or items altered)"
-        return (f"[Levain NEEDS YOU band] Your reply dropped {what} of the NEEDS YOU band you were given. Reprint the "
-                "whole band once, exactly as Levain gave it (the band@ line and every numbered item, unchanged), at "
-                "the end of your reply. Do not answer or renumber any item.")
+        got = _read_turn(directory, session)
+        if got is not None:
+            rec, raw = got
+            fact = TurnFact(rec["kind"], rec["viewer"], rec["coord"], rec["band"])
+        else:
+            rec = raw = None
+            fact = _turn_fact(session, None, directory, env, agent, max(0.0, deadline - time.monotonic()))
+        out = _stop_turn(directory, fact, rec, payload, message, deadline)
+        if out is None and raw is not None:
+            _remove_if(_session_file(directory, session, "turn.rec"), raw)    # the turn ended: its record is spent
+        return out
     except Exception:
         return None
+
+
+def _stop_turn(directory: Path | str, fact: TurnFact, rec: dict | None, payload: dict, message: str,
+               deadline: float) -> str | None:
+    if not fact.band:
+        return None
+    if _fresh_wake(directory, payload["session_id"], rec):
+        return None                                      # a coordinator wake: nobody is waiting on this reply
+    store = QuestionStore(directory)
+    if fact.coord:
+        return _stop_coordinator(directory, store, fact.viewer, payload, message, deadline)
+    if payload.get("stop_hook_active"):
+        return None
+    got = _view_row(store, fact.viewer)
+    if got is None:
+        return None
+    view, gen, block = got
+    if not view.open_list:
+        return None
+    missing, altered = _reprint_check(view, block, message)
+    if not missing and not altered:
+        return None
+    if not _claim_retry(directory, fact.viewer, gen):
+        return None
+    return _reprint_reason(missing)
 
 
 BAND_MARK = "levain.band_view"
