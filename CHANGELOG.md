@@ -51,8 +51,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   time, no temp file left, the baseline unchanged); a file holding one account's access token beside another account's
   refresh token was refused `identity-changed` with nothing launched; a refresh token already spent was refused
   `identity-expired` from a real HTTP 400 `invalid_grant`. A login whose access token had really expired was started
-  once (10-29 19:11 ET, same macOS VM, Claude only): Claude started logged in with no prompt. The stored login was
-  refreshed in place and its refresh token rotated. Not run: Codex, Linux. Known edges: a refresh that succeeds but whose
+  once (10-29 19:11 ET, same macOS VM, Claude only): Claude started logged in with no prompt, and across that start the
+  stored login was rewritten atomically with a rotated refresh token. That run did not separate Levain's exchange from
+  Claude's own refresh. Not run: Codex, Linux. Known edges: a refresh that succeeds but whose
   exchange then stalls past 60 s keeps the old, now dead token (sign in again), and the start says `identity-unreachable`
   ("try again") for it, so the retry meets `identity-expired`; `identity-unreachable` is also said
   for an oversized credential, where a retry cannot succeed; a profile call that fails after a good refresh is named
