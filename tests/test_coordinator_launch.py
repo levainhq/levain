@@ -693,7 +693,7 @@ def test_a_listed_working_holder_silent_past_two_ttls_lapses(store, fake, live_h
         assert any(line.startswith(f"lease {token} held by {ln.launch_id}: beat") for line in cl.watch_once(store))
     clock[0] += timedelta(minutes=20)                   # t+80: silent 80 min, listed and working all along
     lines = cl.watch_once(store)
-    assert any("it wrote nothing as coordinator in 60 min, not beaten" in line for line in lines), lines
+    assert any("it wrote nothing as coordinator in the last 60 min" in line for line in lines), lines
     clock[0] += timedelta(minutes=20)                   # past the until the t+60 beat gave
     assert not store.coord_lease().live
     assert not any("beat to" in line for line in cl.watch_once(store))
@@ -1626,3 +1626,62 @@ def test_coord_wake_with_an_unreadable_listing_says_so(store, qdir, fake, live_h
     out = _main(qdir, capsys, "coord", "wake", rc=1)
     assert "could not be read" in out.out and "levain coord release" in out.out
     assert store.launch(ln.launch_id).state == "active"
+
+
+# --- the turn's last line, and a drop that needs nothing (1030-42 brief lane) ------------------------------------
+def test_the_written_brief_ends_the_turn_on_a_coordinator_status_line(store, fake, live_hook):
+    """Shadow 10-30: a coordinator that ended on "escalated questions #2-#5 ... each waits on you" sat in the agent
+    view as waiting for the operator. The brief carries the end-of-turn rule, quoted."""
+    got = cl.launch_session(store, woken(store))
+    text = cl.brief_path(store.launch(got.launch_id)).read_text()
+    assert "ONE status line beginning `coordinator:`" in text
+    assert "never a question, never \"waits on you\"" in text
+    assert "coord escalate" in text.split("## How your turn ends")[1].split("##")[0]
+    assert "release the lease" in text
+
+
+def test_a_noted_drop_is_not_unseen_not_requoted_and_shows_noted(store, qdir, fake, live_hook, clock, capsys):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d2, _ = store.accept_drop("fyi: nothing to do here", surface="cli")
+    store.note(d2.drop_id, "an fyi, nothing to act on", token=token)
+    store.coord_release(token, by="coordinator")
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease.unseen_drop(conn, lease.launch(conn, ln.launch_id)) is None
+    finally:
+        conn.close()
+    clock[0] += timedelta(seconds=30)
+    lines = cl.watch_once(store)
+    assert not any(lease.REPLACED in line for line in lines) and len(fake.spawns()) == 1       # no replacement
+    assert d2.drop_id not in cl._brief_text(store, ln)                                          # not re-quoted
+    out = _main(qdir, capsys, "drops", "list")
+    assert f"{d2.drop_id}" in out.out and '[noted: "an fyi, nothing to act on"]' in out.out
+    out = _main(qdir, capsys, "drops", "show", d2.drop_id)
+    assert "noted" in out.out and "an fyi, nothing to act on" in out.out
+
+
+def test_only_the_lease_holder_notes_and_split_and_noted_exclude_each_other(store, qdir, fake, live_hook, clock, capsys):
+    from levain.coordinator.store import CoordError, Part
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "why", token=token + 1)                      # not the live lease's token
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "why", token=None)
+    store.split(d2.drop_id, [Part("work", "w")], by="coordinator", token=token)
+    with pytest.raises(CoordError, match="already split"):
+        store.note(d2.drop_id, "why", token=token)                          # a split drop is not noted
+    store.note(d1.drop_id, "read it", token=token)
+    with pytest.raises(CoordError, match="already noted"):
+        store.note(d1.drop_id, "again", token=token)
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--why", "x", "--token", str(token), rc=1)
+    assert "already noted" in out.err
+    store.coord_release(token, by="coordinator")
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "after release", token=token)               # a lapsed lease writes nothing

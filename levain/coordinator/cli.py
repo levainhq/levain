@@ -982,6 +982,26 @@ def run_split(args: argparse.Namespace, out: Any = None) -> int:
     return 0
 
 
+def run_note(args: argparse.Namespace, out: Any = None) -> int:
+    out = out or sys.stdout
+    try:
+        _store(args).note(args.drop_id, args.why, token=args.token)
+    except _REFUSED as exc:
+        print(f"levain drops note: {exc}", file=sys.stderr)
+        return 1
+    _emit(out, args.json, {"drop_id": args.drop_id, "stage": "noted", "why": args.why},
+          f"drop receipt: {args.drop_id} noted: {args.why}")
+    return 0
+
+
+def _noted(store: Any, drop_id: str) -> str | None:
+    """The why of a drop's ``noted`` receipt, or None."""
+    for r in store.drop_receipts(drop_id):
+        if r.body.get("stage") == "noted":
+            return str(r.body.get("why", ""))
+    return None
+
+
 def run_drop_show(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
@@ -998,7 +1018,9 @@ def run_drop_show(args: argparse.Namespace, out: Any = None) -> int:
     text = (f"{drop.drop_id}  {drop.surface}  received {drop.received_at}, {_where(drop)}\n"
             f"  words (verbatim, data): {_shown(drop.words)}\n"
             + ("\n".join(_thread_line(t) for t in threads) if threads else "  not split yet")
-            + "\n  drop receipts: " + ", ".join(f"{r.body.get('stage')} {r.at}" for r in receipts))
+            + "\n  drop receipts: " + ", ".join(
+                f"{r.body.get('stage')} {r.at}" + (f" ({r.body['why']})" if r.body.get("stage") == "noted" else "")
+                for r in receipts))
     _emit(out, args.json, obj, text)
     return 0
 
@@ -1062,8 +1084,10 @@ def run_drop_list(args: argparse.Namespace, out: Any = None) -> int:
     except _REFUSED as exc:
         print(f"levain drops list: {exc}", file=sys.stderr)
         return 1
-    _emit(out, args.json, [_drop_row(d) for d in drops],
-          "\n".join(f"{d.drop_id}  {d.received_at}  {_shown(d.words[:80])}" for d in drops)
+    whys = {d.drop_id: _noted(store, d.drop_id) for d in drops}
+    _emit(out, args.json, [{**_drop_row(d), "noted": whys[d.drop_id]} for d in drops],
+          "\n".join(f"{d.drop_id}  {d.received_at}  {_shown(d.words[:80])}"
+                     + ("" if whys[d.drop_id] is None else f"  [noted: {_shown(whys[d.drop_id])}]") for d in drops)
           or "no drops")
     return 0
 
@@ -1552,6 +1576,14 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     token(sp)
     common(sp)
     sp.set_defaults(func=run_split)
+
+    nt = d_sub.add_parser("note", help="Mark a drop read with nothing to do (the coordinator's terminal receipt).")
+    nt.add_argument("drop_id")
+    nt.add_argument("--why", required=True, metavar="ONE_LINE", help="Why it needs nothing; shown beside the drop.")
+    nt.add_argument("--by", default="coordinator", choices=("coordinator",))
+    token(nt)
+    common(nt)
+    nt.set_defaults(func=run_note)
 
     sh = d_sub.add_parser("show", help="One drop: its words, its threads, its drop receipts.")
     sh.add_argument("drop_id")

@@ -7,6 +7,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Fixed
+- **A coordinator's turn ends on a status line, and a drop that needs nothing gets a receipt.** The coordinator brief
+  now carries an end-of-turn rule: the last line of its words is one `coordinator:` status line (what it did, how many
+  items it escalated), never a question or "waits on you" (a coordinator that ended on an escalation sat in the agent
+  view as "waiting for answers" for ~50 minutes); escalations go through `levain coord escalate` or the band's ask
+  tool. New verb `levain drops note DROP_ID --why "one line" --by coordinator --token N` writes an append-only `noted`
+  drop receipt (lease-fenced, refused on a split drop). A noted drop is not re-quoted in a brief, not counted as unseen
+  (no replacement coordinator), not a "Drop not split" review item, and shows `[noted: why]` in `levain drops list` and
+  `drops show`. The `levain coord watch` line for a silent holder now says its window is the service-beat window, not a
+  bare "60 min".
 - **A drop that lands while a coordinator sits done is acted on at the next watcher pass, not an hour later.** A
   coordinator that split its drop, released the lease and stayed listed (`claude --bg`, state `done`) kept the
   coordinator slot as `idle`, so drops filed after it sat unread until `LEASE_TTL + IDLE_GRACE`. `levain coord watch`

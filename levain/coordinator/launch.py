@@ -257,10 +257,10 @@ def trust_remedy(directory: str | Path) -> str:
 
 # --- the brief (L8) ----------------------------------------------------------------------------------------------
 def _queued(store: CoordStore) -> list[Any]:
-    """The newest drops not yet split, oldest first, at most BRIEF_DROPS."""
+    """The newest drops neither split nor noted, oldest first, at most BRIEF_DROPS."""
     out = []
     for d in store.drops(limit=200):
-        if not any(r.body.get("stage") == "split" for r in store.drop_receipts(d.drop_id)):
+        if not any(r.body.get("stage") in ("split", "noted") for r in store.drop_receipts(d.drop_id)):
             out.append(d)
         if len(out) == BRIEF_DROPS:
             break
@@ -299,6 +299,9 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "",
         f"- split a drop into threads: `{lv} drops split DROP_ID --thread KIND:TITLE --by coordinator --token N "
         f"{tail}` (KIND is work, ask, note or relay; one intent per thread);",
+        f"- a drop that needs nothing (read, nothing to do): `{lv} drops note DROP_ID --why \"one line\" --by "
+        f"coordinator --token N {tail}`; it is never quoted again and never counts as unseen. A split drop is not "
+        "noted;",
         f"- move or fix a thread: `{lv} thread state|set|merge|detach|add ... --by coordinator --token N {tail}`;",
         f"- read: `{lv} drops list {tail}`, `{lv} drops show DROP_ID {tail}`, `{lv} thread list {tail}`.",
         "",
@@ -322,8 +325,18 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "",
         "A wake is the exception: your first prompt begins `[levain wake ln-...]`. Nobody is waiting on that turn, so "
         "Levain shows you no band on it and does not check your reply for one. Act and record; if something needs him, "
-        "file it (`coord escalate`), never narrate it. End a wake with ONE status line (for example "
-        "`wake: split d-41 into 2 threads; nothing needs you`).",
+        "file it (`coord escalate`), never narrate it.",
+        "",
+        "## How your turn ends",
+        "",
+        "Your words are the last thing in a session the operator may see in his agent view, where a question or "
+        "\"waits on you\" reads as a blocker that reached no surface he answers from. So the last line of your own "
+        "words, on every turn, is ONE status line beginning `coordinator:` that says what you did and how many items "
+        "you escalated, for example `coordinator: split d-41 into 2 threads, noted d-42; 1 escalated`. It is never a "
+        "message to the operator, never a question, never \"waits on you\". Every escalation goes through the verb "
+        f"that pings (`{lv} coord escalate`, or the band's ask tool), never through your last line. When the work is "
+        f"done, release the lease (`{lv} coord release`) and end your turn with that line"
+        " (on an attended turn the band Levain gave you follows it, unchanged).",
         "",
         "## Away and budgets",
         "",
@@ -949,7 +962,8 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
                     got = store.coord_service_beat(held.token)
                     lines.append(f"lease {held.token} held by {holder.launch_id}: beat to {got.until}" if got else
                                  f"lease {held.token} held by {holder.launch_id}: it wrote nothing as coordinator "
-                                 f"in {_minutes(lease_mod.SERVICE_BEAT_WINDOW)} min, not beaten (the lease lapses "
+                                 f"in the last {_minutes(lease_mod.SERVICE_BEAT_WINDOW)} min (the watcher beats "
+                                 f"only a holder that wrote within that window), not beaten (the lease lapses "
                                  f"at {held.until})")
                 except (CoordError, sqlite3.Error) as exc:          # it moved on since it was read: nothing to keep
                     lines.append(f"lease {held.token}: not beaten ({exc})")
