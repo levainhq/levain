@@ -4295,11 +4295,13 @@ def run_web_server(
     except KeyboardInterrupt:
         print("\nstopped.")
     finally:
-        httpd.server_close()
-        if chat_host is not None:
-            chat_host.shutdown()
-        if watcher is not None:
-            watcher.stop()
+        try:
+            httpd.server_close()
+            if chat_host is not None:
+                chat_host.shutdown()
+        finally:
+            if watcher is not None:      # stopped last, and whatever the closes above raised
+                watcher.stop()
     return 0
 
 

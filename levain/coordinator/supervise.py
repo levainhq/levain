@@ -64,7 +64,6 @@ class Watcher:
         self.every = every
         self._emit = emit
         self._stop = threading.Event()
-        self._gate = threading.Lock()       # the decision to begin a pass and the decision to stop are one step each
         self._thread: threading.Thread | None = None
         self._last: list[str] | None = None
         self._migrated = False
@@ -90,9 +89,9 @@ class Watcher:
         return self
 
     def stop(self, timeout: float = _STOP_WAIT) -> bool:
-        """End the thread; whether it ended within ``timeout`` (a pass in flight is waited for that long)."""
-        with self._gate:
-            self._stop.set()
+        """End the thread; whether it ended within ``timeout``. No pass is begun once the event is set; a pass that began
+        in the instant before it is the pass in flight, and is waited for up to ``timeout``."""
+        self._stop.set()
         t = self._thread
         if t is None or t is threading.current_thread():
             return True
@@ -101,10 +100,7 @@ class Watcher:
 
     def _run(self) -> None:
         # the first pass runs at once: a serve restarted mid-run picks up the coordinator it left without a wait
-        while True:
-            with self._gate:
-                if self._stop.is_set():
-                    break
+        while not self._stop.is_set():
             self.run_pass()
             if self._stop.wait(self.every):
                 break
