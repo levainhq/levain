@@ -46,18 +46,21 @@ import os
 import sqlite3
 import sys
 import time
-from collections.abc import Callable, Mapping
+import urllib.parse
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Protocol
 
 from levain.band_shorthand import ItemInfo, Parse, Refusal, View, parse
 from levain.band_sources import Extra, Extras, NotOffered, read_extras, sheet_text
-from levain.cockpit.consent import utc_stamp
+from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent.questions import HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select, read_deadline
 
 __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
            "band_hooks_state", "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed",
-           "run_band", "run_band_answer"]
+           "run_band", "run_band_answer", "AnswerCommitted", "AuthorityItem", "BandSnapshot", "PickNotOffered",
+           "QUESTION_VERSION_FIELDS", "VersionMoved", "VersionedQuestionStore", "answer_item", "answerable",
+           "subject_for", "subject_version", "summary"]
 
 COMPACT_AFTER = 12
 _COMPACT_WHAT = 100
@@ -386,7 +389,7 @@ def _store_absent(store: QuestionStore) -> bool:
 
 def record_view(store: QuestionStore, viewer: str, seen_through: int, open_list: list[int],
                 deadline: float | None = None, gen: int | None = None, block: str | None = None,
-                dedupe: bool = False) -> None:
+                dedupe: bool = False) -> int | None:
     """Store what ``viewer`` was just shown (D7), in one bounded write (by ``deadline``, ``time.monotonic()``; the hook
     passes its own start + the bound, so a busy store costs the hook one bound in all). ``gen``: the render's
     generation (:class:`Rendered`; default now); the viewer's last view is the greatest gen, so a render committed
@@ -394,39 +397,40 @@ def record_view(store: QuestionStore, viewer: str, seen_through: int, open_list:
     nothing open (no row per empty prompt). A busy lock records nothing (the viewer's next answer is then refused
     as bound to an older view or to none: safe, never wrong). ``block``: the rendered band text of the view, kept
     (same transaction) for the Stop verifier. ``dedupe`` (a polling surface, :func:`show`; S5a decision A (c)): the
-    view is written only when the viewer's last one differs in open list or high-water mark, so a poll loop adds no
-    row, and an unchanged view takes no write lock at all (decided on a read-only snapshot; two pollers racing may
-    each write one equal row, which is harmless)."""
+    view is written only when the viewer's newest one differs in store, open list or high-water mark, so a poll loop
+    adds no row. Both skips are decided on the newest row as the write transaction sees it.
+
+    Returns the ``band_views.seq`` this call bound the viewer to: the new row's, or, on a dedupe or empty-view skip,
+    the row it was compared with (equal to what this call was given). ``None`` only when the lock stayed busy or the
+    store has no id."""
     sid = _store_id_of(store)
     if sid is None:
-        return
-    if dedupe:
-        last = last_view(store, viewer)
-        if (last is not None and last.store_id == sid and list(last.open_list) == sorted(open_list)
-                and last.seen_through == int(seen_through)):
-            return
+        return None
     gen = int(gen if gen is not None else time.time_ns())
     try:
         with store._write_by(deadline if deadline is not None else time.monotonic() + HOOK_BUSY_MS / 1000) as conn:
             for stmt in BAND_SCHEMA:
                 conn.execute(stmt)
-            if not open_list:
-                # The empty-view dedupe is decided INSIDE the write transaction, against the newest view by gen as
-                # the transaction sees it: a render that committed a nonempty view first is never skipped past.
-                row = conn.execute("SELECT open_list, store_id FROM band_views WHERE viewer = ? "
-                                   "ORDER BY gen DESC, seq DESC LIMIT 1", (viewer,)).fetchone()
-                if row is not None and row[1] == sid and not json.loads(row[0]):
-                    return
-            conn.execute("INSERT INTO band_views (viewer, seen_through, open_list, store_id, at, gen) "
-                         "VALUES (?, ?, ?, ?, ?, ?)",
-                         (viewer, int(seen_through), json.dumps(sorted(open_list)), sid,
-                          utc_stamp(_now_utc(store._clock)), gen))
+            row = conn.execute(_NEWEST_VIEW, (viewer,)).fetchone()
+            if row is not None and row[3] == sid:
+                had = json.loads(row[2])
+                if not open_list and not had:
+                    return int(row[0])
+                if dedupe and had == sorted(open_list) and int(row[1]) == int(seen_through):
+                    return int(row[0])
+            cur = conn.execute("INSERT INTO band_views (viewer, seen_through, open_list, store_id, at, gen) "
+                               "VALUES (?, ?, ?, ?, ?, ?)",
+                               (viewer, int(seen_through), json.dumps(sorted(open_list)), sid,
+                                utc_stamp(_now_utc(store._clock)), gen))
+            seq = cur.lastrowid
             if block and open_list:
                 conn.execute("INSERT OR IGNORE INTO band_view_blocks (viewer, gen, block) VALUES (?, ?, ?)",
                              (viewer, gen, block))
+            return int(seq) if seq is not None else None
     except sqlite3.OperationalError as exc:
         if not _busy(exc):
             raise
+        return None
 
 
 _NEWEST_VIEW = "SELECT seq, seen_through, open_list, store_id FROM band_views WHERE viewer = ? ORDER BY gen DESC, seq DESC LIMIT 1"
@@ -500,7 +504,7 @@ def _items_read(store: QuestionStore, view: View) -> tuple[dict[int, Question], 
 def _info_of(q: Question) -> ItemInfo:
     # a question with a Link is an authority item (design §5): shorthand records nothing on it (S3 routes it)
     rec = next((_LETTERS[i] for i, (k, _) in enumerate(q.options) if k == q.rec and i < len(_LETTERS)), None)
-    return ItemInfo("authority" if q.link is not None else "information", min(len(q.options), len(_LETTERS)), rec)
+    return ItemInfo(_question_kind(q), min(len(q.options), len(_LETTERS)), rec)
 
 
 def _extras_of(store: QuestionStore, view: View) -> tuple[dict[int, Extra], set[int]]:
@@ -725,64 +729,291 @@ def show(store: QuestionStore, viewer: str, deadline: float | None = None) -> Re
 
 
 _UNREAD_NOTE = "a decision source could not be read just now: the band may be missing items"
+_PENDING_NOTE = "number pending"
 
 
-def band_payload(store: QuestionStore, viewer: str, deadline: float | None = None) -> dict[str, Any]:
+# --- W2: the three reads. One snapshot under both the summary and the presentation ------------------------------------
+QUESTION_VERSION_FIELDS = ("id", "what", "options", "rec", "blocks", "link", "sign_request", "answered")
+_VERSION_MAX = 128
+_HEADLINE = 140
+
+
+class VersionMoved(Exception):
+    """The item an answer names is not the one the person was shown: its version moved, or it is gone or answered.
+    Nothing was recorded. (Deliberately not a ``ValueError``: ``ConsentError`` is one, and no catch order may misfile it.)"""
+
+
+class AuthorityItem(Exception):
+    """The item signs on its own card: an unsigned answer records nothing. Not a ``ValueError``, see :class:`VersionMoved`."""
+
+
+class PickNotOffered(Exception):
+    """``pick`` names a letter the item does not offer. Not a ``ValueError``, see :class:`VersionMoved`."""
+
+
+class AnswerCommitted(Exception):
+    """A host's answer committed, and its own delivery failed after it: ``answer`` is what was recorded, ``warning`` the
+    host's words. Said as a warning, never as a refusal. Not a ``ValueError``, see :class:`VersionMoved`."""
+
+    def __init__(self, answer: Any, warning: str) -> None:
+        super().__init__(warning)
+        self.answer = answer
+        self.warning = warning
+
+
+class VersionedQuestionStore(Protocol):
+    """What a host store offers for the versioned answer (flow's ``NeedsQuestions``, once its desk adds both methods)."""
+
+    def question_versions(self, qs: Sequence[Question]) -> Mapping[str, str | None]: ...
+
+    def answer_versioned(self, question_id: str, version: str, *, option: str | None = None,
+                         text: str | None = None, channel: str) -> Any: ...
+
+
+def answerable(store: Any) -> bool:
+    """A levain store answers a versioned row itself; a foreign host does only when it offers both capabilities."""
+    return (not _foreign(store)) or (callable(getattr(store, "answer_versioned", None))
+                                      and callable(getattr(store, "question_versions", None)))
+
+
+def _question_fields(q: Question) -> dict[str, Any]:
+    """The one dict a question's version is taken over (``QUESTION_VERSION_FIELDS`` names its keys)."""
+    link = None if q.link is None else (q.link.option, q.link.kind, q.link.request_id)
+    return {"id": q.id, "what": q.what, "options": [list(o) for o in q.options], "rec": q.rec, "blocks": q.blocks,
+            "link": link, "sign_request": q.sign_request,
+            "answered": q.answer.answered_at if q.answer is not None else "open"}
+
+
+def _question_kind(q: Question) -> str:
+    """``authority`` for a question with a ``link`` or a ``sign_request`` (it signs on its own card), else ``information``."""
+    return "authority" if q.link is not None or q.sign_request is not None else "information"
+
+
+def subject_version(q: Question) -> str:
+    """A levain-store question's concurrency token, computed over a :class:`Question` value only."""
+    from levain.cockpit.engine import row_version_of
+
+    return row_version_of(_question_fields(q), QUESTION_VERSION_FIELDS)
+
+
+def _extra_version(e: Extra) -> str:
+    """An authority item's token: the tuple ``apply_plan`` compares to decide an item moved."""
+    from levain.cockpit.engine import row_version_of
+
+    return row_version_of({"source": e.source, "options": e.options, "menu": e.data.get("menu"),
+                           "version": e.data.get("version")}, ("source", "options", "menu", "version"))
+
+
+def _version_ok(v: Any) -> bool:
+    return isinstance(v, str) and 0 < len(v) <= _VERSION_MAX and all(c.isascii() and (c.isalnum() or c in "_-") for c in v)
+
+
+def _sheet_href(prefix: str, ident: Any) -> str:
+    return prefix + urllib.parse.quote(str(ident), safe="")
+
+
+def _question_sign_action(q: Question) -> dict[str, Any]:
+    if q.sign_request is not None:
+        return {"do": "sign", "ceremony": "sign", "href": _sheet_href("/sign/", q.sign_request)}
+    return {"do": "sign", "ceremony": "question_rule", "href": None}      # a linked option signs on the phone sheet
+
+
+def _extra_sign_action(e: Extra) -> dict[str, Any]:
+    if e.source == "extend":
+        return {"do": "sign", "ceremony": "extend", "href": None}
+    if e.source == "sign" and e.data.get("menu"):                           # a levain sign request: its own sheet
+        return {"do": "sign", "ceremony": "sign", "href": _sheet_href("/sign/", e.data.get("request_id", e.ref))}
+    return {"do": "sign", "ceremony": e.source,                             # a consent request (UNDECIDED or its SIGN)
+            "href": _sheet_href("/sign/consent/", e.data.get("request_id", e.ref))}
+
+
+_ANSWER_ACTION = {"do": "answer", "verb": "item_answer"}
+
+
+@dataclasses.dataclass(frozen=True)
+class BandSnapshot:
+    """One read of the open items, under both the summary and the presentation. ``entries``: ``(key, item)`` for every
+    item that could be read, in band order (numbered first); ``item`` is the band.json item (``n`` is ``None`` for one
+    not numbered yet). ``queue`` hashes each entry's ``(subject, kind, actions)`` and nothing viewer-dependent.
+    ``shown``/``hwm``/``gen``: what a view records. ``failed``: an authority source was not read."""
+    entries: tuple[tuple[dict[str, str], dict[str, Any]], ...]
+    queue: str
+    note: str
+    pending: bool
+    failed: bool
+    store_id: str | None
+    shown: tuple[int, ...]
+    hwm: int
+    gen: int
+    read_only: bool
+
+    def numbered(self) -> list[dict[str, Any]]:
+        return [it for _, it in self.entries if it["n"] is not None]
+
+
+def _queue_of(entries: Sequence[tuple[dict[str, str], dict[str, Any]]]) -> str:
+    from levain.cockpit.engine import row_version_of
+
+    rows = sorted(([it["subject"], it["kind"], it["actions"]] for _, it in entries),
+                  key=lambda r: json.dumps(r, sort_keys=True, default=str))
+    return row_version_of({"entries": rows}, ("entries",))
+
+
+def _question_item(q: Question, n: int | None, version: str | None, can_answer: bool) -> tuple[dict[str, str], dict[str, Any]]:
+    info = _info_of(q)
+    actions = ([_question_sign_action(q)] if info.kind == "authority"
+               else [dict(_ANSWER_ACTION)] if can_answer and version is not None else [])
+    item = {"n": n, "kind": info.kind, "tag": _tag(q), "what": q.what, "blocks": q.blocks,
+            "options": [{"letter": _LETTERS[i], "label": lab} for i, (_, lab) in enumerate(q.options) if i < len(_LETTERS)],
+            "rec": info.rec_letter, "question": q.n,
+            "subject": {"kind": "question", "id": q.id, "version": version}, "actions": actions}
+    return {"source": "question", "id": q.id}, item
+
+
+def _extra_item(e: Extra, n: int | None) -> tuple[dict[str, str], dict[str, Any]]:
+    kind, ident = e.band_key
+    item = {"n": n, "kind": "authority", "tag": e.tag, "what": e.what, "blocks": e.blocks,
+            "options": [{"letter": _LETTERS[i], "label": lab} for i, lab in enumerate(e.options) if i < len(_LETTERS)],
+            "rec": e.rec_letter, "question": None,
+            "subject": {"kind": kind, "id": ident, "version": _extra_version(e)}, "actions": [_extra_sign_action(e)]}
+    return {"source": kind, "id": ident}, item
+
+
+def _finish(entries: list[tuple[dict[str, str], dict[str, Any]]], *, unread: bool, pending: bool, failed: bool,
+            store_id: str | None, shown: list[int], hwm: int, gen: int, read_only: bool) -> BandSnapshot:
+    note = _UNREAD_NOTE if unread else _PENDING_NOTE if pending else ""
+    return BandSnapshot(tuple(entries), _queue_of(entries), note, pending, failed, store_id, tuple(shown), hwm, gen,
+                        read_only)
+
+
+def _snapshot(store: Any, *, writable: bool, deadline: float | None = None) -> BandSnapshot:
+    """Read the open items once. It takes no viewer: recording a view is ``band_payload``'s, after this, so nothing
+    viewer-dependent can reach ``queue``. Numbers the items that have none (D3: a headline is a show)."""
+    gen = time.time_ns()                      # before the reads: a later snapshot has a greater gen
+    deadline = deadline if deadline is not None else time.monotonic() + HOOK_BUSY_MS / 1000
+    with read_deadline(deadline):
+        if _foreign(store):
+            return _foreign_snapshot(store, writable, gen)
+        return _native_snapshot(store, writable, gen, deadline)
+
+
+def _foreign_snapshot(store: Any, writable: bool, gen: int) -> BandSnapshot:
+    open_qs = _foreign_open(store)
+    can = answerable(store)
+    versions: Mapping[str, str | None] = {}
+    unread = False
+    if can:
+        try:
+            versions = store.question_versions(open_qs)
+        except Exception:  # noqa: BLE001 - every item is then unanswerable and the band says so; the read is still 200
+            unread = True
+    entries = []
+    for q in open_qs:
+        v = versions.get(q.id)
+        entries.append(_question_item(q, q.n, v if _version_ok(v) else None, writable and can))
+    nums = [q.n for q in open_qs]
+    return _finish(entries, unread=unread, pending=False, failed=False, store_id=FOREIGN_STORE_ID, shown=nums,
+                   hwm=max(nums, default=0), gen=gen, read_only=not (writable and can))
+
+
+def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: float) -> BandSnapshot:
+    items, numbers, closed = _read(store)
+    try:
+        extras = read_extras(store.directory, store._clock, deadline=deadline)
+    except Exception as exc:  # noqa: BLE001 - the questions still list; the band says the sources were not read
+        extras = Extras(failed=[f"authority sources: {type(exc).__name__}"])
+    extra_numbers, extra_closed = _extra_state(store, extras) if extras.items or extras.complete else ({}, [])
+    filed: dict[tuple[str, str], str] = {}
+    last = ""
+    for i, q in items:                        # a row that cannot be read takes its neighbour's time: its place holds
+        last = q.filed_at if q is not None else last
+        filed[("question", i)] = last
+    order_in: list[tuple[tuple[str, str], Question | Extra | None]] = [(("question", i), q) for i, q in items]
+    for e in extras.items:
+        if e.band_key in filed:
+            continue                          # one item per band key: its underlying request is listed once
+        order_in.append((e.band_key, e))
+        filed[e.band_key] = e.filed
+    new = [k for k, _ in order_in if (numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)) is None]
+    new.sort(key=lambda k: filed.get(k, ""))
+    if new:                                   # a queue that is all numbered takes no write lock
+        try:
+            got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline)
+        except Exception:  # noqa: BLE001 - those items stay unnumbered and the snapshot says so, as number_for_ping does
+            got = {}
+        numbers = {**numbers, **{k: v for k, v in got.items() if isinstance(k, str)}}
+        extra_numbers = {**extra_numbers, **{k: v for k, v in got.items() if isinstance(k, tuple)}}
+
+    def number_of(k: tuple[str, str]) -> int | None:
+        return numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)
+
+    order = sorted(range(len(order_in)), key=lambda p: (number_of(order_in[p][0]) is None,
+                                                        number_of(order_in[p][0]) or 0, p))
+    shown = [n for p in order if (n := number_of(order_in[p][0])) is not None]
+    hwm = max([*shown, *(n for n, _ in closed), *(n for n, _ in extra_closed)], default=0)
+    entries: list[tuple[dict[str, str], dict[str, Any]]] = []
+    dropped = False
+    for p in order:
+        key, obj = order_in[p]
+        if obj is None or (isinstance(obj, Extra) and obj.unreadable is not None):
+            dropped = True                    # listed in the text band, never in a payload: said, not drawn as health
+        elif isinstance(obj, Extra):
+            entries.append(_extra_item(obj, number_of(key)))
+        else:
+            entries.append(_question_item(obj, number_of(key), subject_version(obj), writable))
+    return _finish(entries, unread=dropped or bool(extras.failed), pending=len(shown) < len(order_in),
+                   failed=bool(extras.failed), store_id=_store_id_of(store), shown=shown, hwm=hwm, gen=gen,
+                   read_only=not writable)
+
+
+def summary(store: Any, *, writable: bool = True, deadline: float | None = None) -> dict[str, Any]:
+    """The summary read (``GET /cockpit/needs.json``): counts, headlines, kinds, stable keys and ``queue``. It records
+    no view and carries nothing to bind an answer to. Its only levain write is numbering the items that had no number."""
+    snap = _snapshot(store, writable=writable, deadline=deadline)
+    items = [{"key": key, "n": it["n"], "kind": it["kind"], "headline": _short(it["what"], _HEADLINE), "tag": it["tag"]}
+             for key, it in snap.entries]
+    return {"schema": 1, "store_id": snap.store_id, "count": len(items), "queue": snap.queue, "items": items,
+            "note": _UNREAD_NOTE if snap.note else "", "queue": snap.queue, "read_only": snap.read_only}
+
+
+def subject_for(store: Any, kind: str, ref: str) -> dict[str, Any] | None:
+    """The ``{kind, id, version}`` subject of the open item with band key ``(kind, ref)``, or ``None`` (W5a's push)."""
+    for key, it in _snapshot(store, writable=True).entries:
+        if key["source"] == kind and key["id"] == ref:
+            return dict(it["subject"])
+    return None
+
+
+def band_payload(store: Any, viewer: str, deadline: float | None = None, writable: bool = True) -> dict[str, Any]:
     """What a surface lists of the band for ``viewer``: the binding an answer must carry back (``store_id`` and
-    ``view_id``, the recorded view this listing is; ``seen_through`` is that view's ``band@`` mark, for display) and
-    the numbered open items (``kind`` is ``information`` or ``authority``: shorthand records only the first; an
-    authority item opens its existing signing sheet). Shows the band to ``viewer`` first (:func:`show`)."""
-    shown = show(store, viewer, deadline)
+    ``view_id``, the view THIS call recorded or matched; ``seen_through`` is that view's ``band@`` mark, for display),
+    the numbered open items (``kind`` is ``information`` or ``authority``; each carries its ``subject`` and ``actions``)
+    and ``queue``. One snapshot: the view recorded, the items and ``queue`` describe the same read."""
+    snap = _snapshot(store, writable=writable, deadline=deadline)
     if _foreign(store):
-        return _foreign_payload(store, shown)
-    got = _newest_view(store, viewer)
-    if got is None:                               # no view to bind to: which of two facts is it?
-        if not shown.failed and _store_absent(store):   # no store file (or an empty one) AND every source read: nothing
+        return _foreign_payload(store, snap)
+    view_id = record_view(store, viewer, snap.hwm, list(snap.shown), deadline=deadline, gen=snap.gen, dedupe=True)
+    if view_id is None:                           # no view to bind to: which of two facts is it?
+        if not snap.failed and _store_absent(store):   # no store file (or an empty one) AND every source read: nothing
             #                                       was ever filed, so nothing needed a view; a read-only look, the poll set nothing up
-            return {"seen_through": None, "store_id": None, "view_id": None, "items": [], "store": "absent"}
+            return {"seen_through": None, "store_id": None, "view_id": None, "items": [], "store": "absent",
+                    "queue": snap.queue, "read_only": snap.read_only}
         # a store that exists whose view could not be stored (a lock held, a write failing), or an authority source
         # that was not read (its "! not read" line is in the text): said, never drawn as health
         return {"seen_through": None, "store_id": None, "view_id": None, "items": [],
-                "note": "the band could not be recorded just now"}
-    view, view_id = got
-    questions, dropped = _items_read(store, view)
-    extras_failed = False
-    try:
-        extras, unknown = _extras_of(store, view)
-        extras_failed = bool(unknown)         # an authority number whose source the second read could not read: omitted, not closed
-    except Exception:  # noqa: BLE001 - the questions still list; the authority items are not, and the note says so
-        extras, extras_failed = {}, True
-    items: list[dict[str, Any]] = []
-    for n in view.open_list:
-        q, e = questions.get(n), extras.get(n)
-        if q is not None and q.answer is None:
-            info = _info_of(q)
-            items.append({"n": n, "kind": info.kind, "tag": _tag(q), "what": q.what, "blocks": q.blocks,
-                          "options": [{"letter": _LETTERS[i], "label": lab} for i, (_, lab) in enumerate(q.options)
-                                      if i < len(_LETTERS)], "rec": info.rec_letter, "question": q.n})
-        elif e is not None:
-            items.append({"n": n, "kind": "authority", "tag": e.tag, "what": e.what, "blocks": e.blocks,
-                          "options": [{"letter": _LETTERS[i], "label": lab} for i, lab in enumerate(e.options)
-                                      if i < len(_LETTERS)], "rec": e.rec_letter, "question": None})
-    # an item that was not read (a transient lock on queue.db: the first read or the second; a question row that cannot be
-    # decoded): the items listed are the ones that were read, and the band says so, as the text render's "! not read" line
-    # does: never a healthy band that is missing items. The bound view is not the one this show recorded (its record
-    # skipped on a busy lock, so an older view is bound): its list differs from what was shown, and the band says so.
-    return {"seen_through": view.seen_through, "store_id": view.store_id, "view_id": view_id, "items": items,
-            "note": _UNREAD_NOTE if (shown.failed or shown.pending or extras_failed or dropped
-                                     or sorted(view.open_list) != sorted(shown.shown)) else ""}
+                "note": "the band could not be recorded just now", "queue": snap.queue, "read_only": snap.read_only}
+    return {"seen_through": snap.hwm, "store_id": snap.store_id, "view_id": view_id, "items": snap.numbered(),
+            "note": snap.note, "queue": snap.queue, "read_only": snap.read_only}
 
 
-def _foreign_payload(store: Any, shown: Rendered) -> dict[str, Any]:
+def _foreign_payload(store: Any, snap: BandSnapshot) -> dict[str, Any]:
     """:func:`band_payload` for a foreign store: its open questions numbered by their own ``q.n``, bound to the fixed
     ``FOREIGN_STORE_ID`` / ``FOREIGN_VIEW_ID`` (no view is recorded in a store levain cannot write to; the answer
     re-reads the open set, so a question answered since is refused for itself)."""
-    items = [{"n": q.n, "kind": "information", "tag": _tag(q), "what": q.what, "blocks": q.blocks,
-              "options": [{"letter": _LETTERS[i], "label": lab} for i, (_, lab) in enumerate(q.options)
-                          if i < len(_LETTERS)], "rec": _info_of(q).rec_letter, "question": q.n}
-             for q in _foreign_open(store)]
+    items = [it for _, it in snap.entries]
     return {"seen_through": max((i["n"] for i in items), default=None), "store_id": FOREIGN_STORE_ID,
-            "view_id": FOREIGN_VIEW_ID, "items": items, "note": _UNREAD_NOTE if shown.failed else ""}
+            "view_id": FOREIGN_VIEW_ID, "items": items, "note": _UNREAD_NOTE if snap.note else "", "queue": snap.queue,
+            "read_only": snap.read_only}
 
 
 class StaleBand(ValueError):
@@ -836,6 +1067,76 @@ def answer_text(store: QuestionStore, text: str, *, viewer: str, channel: str, s
     return apply_plan(store, plan, questions, viewer=viewer, via=channel, seen_through=view.seen_through,
                       deadline=deadline, extras=extras, channel=channel,
                       require=_still_newest(viewer, store_id, view_id))
+
+
+def _still_version(subject: Mapping[str, Any]) -> Callable[[sqlite3.Connection], None]:
+    """The versioned answer's check, run INSIDE its write transaction: it loads the row over the transaction's own
+    ``conn`` (a second connection would not see it) and recomputes the version. The row gone, answered or changed is
+    :class:`VersionMoved`; then a question that signs on its own card is :class:`AuthorityItem`."""
+    def check(conn: sqlite3.Connection) -> None:
+        q = QuestionStore._by_ref(conn, subject["id"])
+        if q is None or q.id != subject["id"] or q.answer is not None or subject_version(q) != subject["version"]:
+            raise VersionMoved("the item changed since it was shown to you, so nothing was recorded")
+        if _question_kind(q) == "authority":
+            raise AuthorityItem("this item signs on its own card; nothing was recorded")
+    return check
+
+
+def _key_of(q: Question, pick: str | None, text: str | None) -> tuple[str | None, str | None]:
+    """``(option key, text)`` for a displayed letter on ``q`` (the key is the one at that letter's position)."""
+    if text is not None:
+        return None, text
+    i = _LETTERS.find(pick or "")
+    if len(pick or "") != 1 or i < 0 or i >= min(len(q.options), len(_LETTERS)):
+        raise PickNotOffered("pick is not offered")
+    return q.options[i][0], None
+
+
+def answer_item(store: Any, subject: Mapping[str, Any], *, pick: str | None, text: str | None, channel: str,
+                viewer: str) -> Applied:
+    """Answer ONE item by its subject, its version and the displayed letter ``pick`` (or free ``text``): no view is
+    needed, so another tab's look cannot make it stale. The version is checked inside the write, so of two concurrent
+    answers exactly one wins. :class:`VersionMoved` (409), :class:`AuthorityItem` (422) and :class:`PickNotOffered`
+    (400) write nothing; a per-entry refusal of the store is raised as its ``ConsentError``. A foreign host decides
+    its own answerability (``question_versions`` / ``answer_versioned``); its :class:`AnswerCommitted` passes through."""
+    if channel not in ("cockpit", "phone"):
+        raise ValueError(f"a surface answers on the cockpit or the phone, not {channel!r}")
+    if subject.get("kind") != "question":
+        raise AuthorityItem("this item signs on its own card; nothing was recorded")
+    if _foreign(store):
+        return _answer_foreign(store, subject, pick, text, channel)
+    q = store.get(subject["id"])
+    if q is None or q.id != subject["id"] or subject_version(q) != subject["version"]:
+        raise VersionMoved("the item changed since it was shown to you, so nothing was recorded")
+    if _question_kind(q) == "authority":
+        raise AuthorityItem("this item signs on its own card; nothing was recorded")
+    option, said = _key_of(q, pick, text)
+    entry: dict[str, Any] = {"ref": q.id, "via": channel, "viewer": viewer, "seen_through": None, "note": None}
+    if option is not None:
+        entry["option"] = option
+    else:
+        entry["text"] = said
+    (result,) = store.answer_with_context([entry], channel=channel, schema=BAND_SCHEMA, require=_still_version(subject))
+    if isinstance(result, ConsentError):
+        raise result
+    label = pick if option is not None else "text"
+    return Applied([label], [], format_echo([label], [], channel), (), (q.id,))
+
+
+def _answer_foreign(store: Any, subject: Mapping[str, Any], pick: str | None, text: str | None, channel: str) -> Applied:
+    if not answerable(store):
+        raise ValueError("this cockpit's questions are answered on their own cards; nothing was recorded")
+    q = store.get(subject["id"])
+    try:
+        current = store.question_versions([q]).get(q.id) if q is not None else None
+    except Exception:  # noqa: BLE001 - a host that cannot say counts as one that will not let a tap answer
+        current = None
+    if q is None or q.id != subject["id"] or current is None or current != subject["version"]:
+        raise VersionMoved("the item changed since it was shown to you, so nothing was recorded")
+    option, said = _key_of(q, pick, text)
+    store.answer_versioned(q.id, subject["version"], option=option, text=said, channel=channel)
+    label = pick if option is not None else "text"
+    return Applied([label], [], format_echo([label], [], channel), (), ())
 
 
 def deliver_recorded(store: QuestionStore, done: Applied) -> None:
