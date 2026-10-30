@@ -1136,14 +1136,14 @@ def _answer_foreign(store: Any, subject: Mapping[str, Any], pick: str | None, te
     q = store.get(subject["id"])
     if q is None or q.id != subject["id"] or q.answer is not None:
         raise VersionMoved("the item changed since it was shown to you, so nothing was recorded")
+    if _question_kind(q) == "authority":      # drawn with a sign action only: refused before the host is asked
+        raise AuthorityItem("this item signs on its own card; nothing was recorded")
     try:
         current = store.question_versions([q]).get(q.id)
     except Exception:  # noqa: BLE001 - a host that cannot say counts as one that will not let a tap answer
         current = None
     if current is None or current != subject["version"]:
         raise VersionMoved("the item changed since it was shown to you, so nothing was recorded")
-    if _question_kind(q) == "authority":      # drawn with a sign action only: a host that versions it is not asked
-        raise AuthorityItem("this item signs on its own card; nothing was recorded")
     option, said = _key_of(q, pick, text)
     store.answer_versioned(q.id, subject["version"], option=option, text=said, channel=channel)
     label = pick if option is not None else "text"

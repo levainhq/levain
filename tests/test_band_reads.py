@@ -268,7 +268,11 @@ def test_r1_f1_a_foreign_authority_or_answered_row_never_reaches_the_host_write(
             answer(host, {"kind": "question", "id": qid, "version": v})
     with pytest.raises(band_view.VersionMoved):
         answer(host, {"kind": "question", "id": "np-3", "version": "v3"})
-    assert host.answered == []
+    # L3 r2: flow's host gives a signed row no version; the refusal still names the authority, not a move
+    quiet = Host([signed], {})
+    with pytest.raises(band_view.AuthorityItem):
+        answer(quiet, {"kind": "question", "id": "np-1", "version": "v1"})
+    assert host.answered == [] and quiet.answered == []
 
 
 def test_r1_f2_both_or_neither_of_pick_and_text_is_refused_before_any_store_access(store):
