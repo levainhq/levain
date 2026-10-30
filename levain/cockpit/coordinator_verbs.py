@@ -244,5 +244,6 @@ class CoordinatorVerbs:
                                 "serve's watcher then stops the session", reversible=False, fire=self.stop, **c1),
             HOLD_VERB: VerbSpec(HOLD_VERB, "Hold it myself", f"you take the coordinator lease for "
                                 f"{int(HOLD.total_seconds() // 60)} minutes: a pending launch is voided, a running "
-                                "coordinator ends, and drops queue for you", reversible=False, fire=self.hold, **c1),
+                                "launch ends and the serve's watcher stops its session, and drops queue for you",
+                                reversible=False, fire=self.hold, **c1),
         }
