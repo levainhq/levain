@@ -73,7 +73,6 @@ coordinator's own install there refuses its floor (fail-closed).
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -634,7 +633,11 @@ def _harness() -> tuple[str | None, dict[str, str]]:
     if exe is not None:
         return exe, env
     have = [p for p in env.get("PATH", os.defpath).split(os.pathsep) if p]
-    extra = [d for d in _harness_dirs() if d not in have]
+    try:
+        fallback = _harness_dirs()
+    except Exception:  # noqa: BLE001 - a lookup that cannot name the directories is "not on PATH", as it always was
+        fallback = ()
+    extra = [d for d in fallback if d not in have]
     exe = shutil.which("claude", path=os.pathsep.join(extra)) if extra else None
     if exe is None:
         return None, env
@@ -761,6 +764,8 @@ def _single_flight(directory: Path) -> Iterator[bool]:
     stop it again. The lock is ``<store directory>/coord-watch.lock`` under ``flock``, released when its descriptor
     closes, a killed process's included. A lock that cannot be opened raises: an unlocked pass is the double stop
     this lock exists to prevent."""
+    import fcntl     # POSIX only: imported here so the rest of this module loads where it is absent
+
     key = os.path.realpath(directory)
     with _PASS_LOCKS_GUARD:
         mine = _PASS_LOCKS.setdefault(key, threading.Lock())
