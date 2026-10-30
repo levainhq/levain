@@ -1,8 +1,9 @@
-"""levain.agents.store — the one opener and the one writer of the agent tables (A0 r6 §3.5, §3.7).
+"""levain.agents.store — the one opener and the one writer of the agent tables (A0 r7 §3.5, §3.7).
 
 ``open_agent_store`` refuses what an agent must not run on and hands back an :class:`AgentStore` whose every
-connection has ``PRAGMA recursive_triggers = ON``, so a REPLACE's implicit delete fires the ``_keep`` triggers on
-``agent_specs`` and ``agent_bars`` (A0 §4.2). The refusals:
+connection has ``PRAGMA recursive_triggers = ON``. A REPLACE over a spec's or a bar's declared key is refused by
+the ``_no_replace`` triggers on any connection; the pragma is what makes a REPLACE that collides only on the implicit
+``rowid`` fire the ``_keep`` triggers (A0 r7 §4.2). The schema is checked once, at open (A0 r7 §6.12). The refusals:
 
 - a ``levain-autonomic/3`` store: agents run on ``/2`` until the agent-proof slice (R15-5) lands; the store is read
   through a read-only connection and nothing is created or changed;
@@ -45,9 +46,11 @@ class _AgentDB(AutonomicDB):
 
 
 def _refusal(reason: str, marker: str | None) -> str:
-    return (f"{reason}: the agent tables in this store are not the ones this levain writes; restore `{DB_NAME}` "
-            f"from a backup made by this version, or run the levain that wrote marker "
-            f"{marker if marker is not None else '(none)'}")
+    head = (f"{reason}: the agent tables in this store are not the ones this levain writes; restore `{DB_NAME}` "
+            f"from a backup made by this version")
+    if marker is None:    # no marker names a writer, so a backup is the only way out
+        return head + "; no agent_schema marker names the levain that wrote them"
+    return head + f", or run the levain that wrote marker {marker}"
 
 
 class AgentStore:

@@ -89,7 +89,9 @@ def test_agent_objects_with_no_marker_are_refused_and_nothing_is_repaired(tmp_pa
     with pytest.raises(AgentStoreRefused, match="agent objects with no agent_schema marker") as e:
         open_agent_store(d)
     assert "restore `autonomic.db` from a backup made by this version" in str(e.value)
-    assert "marker (none)" in str(e.value)
+    # r7 (complement F0 L3 r1 LOW): no marker names a writer, so the text does not tell him to run one
+    assert "run the levain that wrote" not in str(e.value)
+    assert "no agent_schema marker names the levain that wrote them" in str(e.value)
     assert master(d / DB_NAME) == before      # not recreated: the trigger is still missing, no marker written
     c = sqlite3.connect(d / DB_NAME)
     assert c.execute("SELECT 1 FROM meta WHERE key = 'agent_schema'").fetchone() is None
@@ -105,7 +107,7 @@ def test_a_marked_store_with_a_dropped_trigger_is_refused_and_reopened_it_still_
             open_agent_store(d)
         text = str(e.value)
         assert "agent_occurrences_one_fire" in text
-        assert "run the levain that wrote marker levain-agent-schema/1" in text
+        assert "run the levain that wrote marker levain-agent-schema/2" in text
     assert not any(r[1] == "agent_occurrences_one_fire" for r in master(d / DB_NAME))
 
 
@@ -122,11 +124,11 @@ def test_a_weakened_trigger_body_is_refused(tmp_path):
 def test_an_unknown_marker_is_refused_and_named(tmp_path):
     d = tmp_path / "m2"
     open_agent_store(d)
-    edit(d, "UPDATE meta SET value = 'levain-agent-schema/2' WHERE key = 'agent_schema'")
+    edit(d, "UPDATE meta SET value = 'levain-agent-schema/3' WHERE key = 'agent_schema'")
     with pytest.raises(AgentStoreRefused) as e:
         open_agent_store(d)
-    assert "unknown agent schema marker 'levain-agent-schema/2'" in str(e.value)
-    assert "run the levain that wrote marker levain-agent-schema/2" in str(e.value)
+    assert "unknown agent schema marker 'levain-agent-schema/3'" in str(e.value)
+    assert "run the levain that wrote marker levain-agent-schema/3" in str(e.value)
 
 
 def test_a_refusal_touches_agents_only_the_autonomic_db_still_opens(tmp_path):
@@ -163,10 +165,10 @@ def test_replace_of_a_spec_and_of_an_open_bar_is_refused_on_the_store_connection
         c.execute("INSERT INTO agent_bars (bar_id, agent_id, barred_at, head_seq_at_bar) VALUES ('ab-1','ag-1',?,5)",
                   (NOW,))
     with s.write() as c:
-        with pytest.raises(sqlite3.DatabaseError, match="agent specs are never deleted"):
+        with pytest.raises(sqlite3.DatabaseError, match="a spec is never replaced"):
             c.execute("INSERT OR REPLACE INTO agent_specs VALUES ('ag-1', 1, 's9', 'r1', '{\"x\":1}', ?)", (NOW,))
     with s.write() as c:
-        with pytest.raises(sqlite3.DatabaseError, match="bars are closed, never deleted"):
+        with pytest.raises(sqlite3.DatabaseError, match="a bar is never replaced"):
             c.execute("INSERT OR REPLACE INTO agent_bars (bar_id, agent_id, barred_at, head_seq_at_bar)"
                       " VALUES ('ab-2','ag-1',?,6)", (NOW,))
     with s.read() as c:
@@ -186,7 +188,7 @@ def run_cli(capsys, *argv: str) -> tuple[int, str, str]:
 def test_levain_agents_passes_a_clean_store(tmp_path, capsys):
     rc, out, err = run_cli(capsys, "--store-dir", str(tmp_path / "ok"))
     assert rc == 0 and err == ""
-    assert out.startswith("agent schema levain-agent-schema/1: ok")
+    assert out.startswith("agent schema levain-agent-schema/2: ok")
 
 
 def test_levain_agents_refuses_a_3_store(tmp_path, capsys):

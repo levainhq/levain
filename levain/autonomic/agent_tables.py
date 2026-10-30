@@ -1,6 +1,6 @@
-"""levain.autonomic.agent_tables — the agent DDL, its triggers and the agent schema marker (A0 r6 §3.5, §3.7, §4.2).
+"""levain.autonomic.agent_tables — the agent DDL, its triggers and the agent schema marker (A0 r7 §3.5, §3.7, §4.2).
 
-A leaf: stdlib ``sqlite3`` only. It holds the eight agent tables, one index and twelve ``BEFORE`` triggers of the
+A leaf: stdlib ``sqlite3`` only. It holds the eight agent tables, one index and the ``BEFORE`` triggers of the
 ``autonomic.db`` store, as ``AGENT_OBJECT_DDL``, and the checks over them:
 
 - :func:`create_agent_objects` runs the DDL and touches no other table (so a reference store needs no ``meta``);
@@ -19,7 +19,8 @@ __all__ = ["AGENT_SCHEMA", "AGENT_TABLES", "AGENT_TRIGGERS", "AGENT_OBJECT_DDL",
            "ddl_agents", "agent_master", "reference_master", "has_agent_object", "agent_marker",
            "check_agent_schema"]
 
-AGENT_SCHEMA = "levain-agent-schema/1"
+# /1 named A0 r6's twelve-trigger text (F0 r1, never merged); a store carrying it is refused as an unknown marker
+AGENT_SCHEMA = "levain-agent-schema/2"
 
 AGENT_TABLES = ("agent_settings", "agent_roles", "agents", "agent_specs", "agent_occurrences", "agent_bars",
                 "agent_slots", "agent_reservations")
@@ -27,7 +28,8 @@ AGENT_TABLES = ("agent_settings", "agent_roles", "agents", "agent_specs", "agent
 AGENT_TRIGGERS = ("agent_occurrences_frozen", "agent_occurrences_identity", "agent_occurrences_launch_epoch",
                   "agent_occurrences_prelaunch", "agent_occurrences_launch_immutable", "agent_occurrences_insert",
                   "agent_occurrences_one_fire", "agent_occurrences_keep", "agent_specs_frozen", "agent_specs_keep",
-                  "agent_bars_keep", "agent_bars_closed_frozen")
+                  "agent_bars_keep", "agent_bars_closed_frozen", "agent_occurrences_transition",
+                  "agent_occurrences_epoch", "agent_specs_no_replace", "agent_bars_no_replace", "agent_bars_identity")
 
 AGENT_OBJECT_DDL: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS agent_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -63,7 +65,7 @@ AGENT_OBJECT_DDL: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS agent_reservations (occurrence_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,"
     " window_key TEXT NOT NULL, reserved_usd_micros INTEGER NOT NULL, debited_usd_micros INTEGER,"
     " state TEXT NOT NULL CHECK (state IN ('open','settled')), settled_reason TEXT)",
-    # the twelve triggers; each BEFORE, each RAISE(ABORT) (which ignores the statement's OR clause)
+    # the triggers; each BEFORE, each RAISE(ABORT) (which ignores the statement's OR clause)
     "CREATE TRIGGER IF NOT EXISTS agent_occurrences_frozen BEFORE UPDATE ON agent_occurrences"
     " WHEN OLD.state NOT IN ('admitted','launched')"
     " BEGIN SELECT RAISE(ABORT, 'agent occurrence is terminal'); END",
@@ -108,6 +110,26 @@ AGENT_OBJECT_DDL: tuple[str, ...] = (
     "CREATE TRIGGER IF NOT EXISTS agent_bars_closed_frozen BEFORE UPDATE ON agent_bars"
     " WHEN OLD.closed_at IS NOT NULL"
     " BEGIN SELECT RAISE(ABORT, 'a closed bar is never changed'); END",
+    # r7 (F0 L3 r1): the A0 §2.5 transition table, the epoch's direction, and REPLACE bounded on every connection
+    "CREATE TRIGGER IF NOT EXISTS agent_occurrences_transition BEFORE UPDATE ON agent_occurrences"
+    " WHEN (OLD.state = 'admitted' AND NEW.state NOT IN ('admitted','launched','skipped-no-input',"
+    "'skipped-budget','stopped','missed'))"
+    " OR (OLD.state = 'launched' AND NEW.state NOT IN ('launched','done','failed','stopped'))"
+    " BEGIN SELECT RAISE(ABORT, 'not a step of the occurrence state machine'); END",
+    "CREATE TRIGGER IF NOT EXISTS agent_occurrences_epoch BEFORE UPDATE ON agent_occurrences"
+    " WHEN NEW.epoch < OLD.epoch"
+    " BEGIN SELECT RAISE(ABORT, 'an occurrence epoch never goes down'); END",
+    "CREATE TRIGGER IF NOT EXISTS agent_specs_no_replace BEFORE INSERT ON agent_specs"
+    " WHEN EXISTS (SELECT 1 FROM agent_specs WHERE (agent_id = NEW.agent_id AND version = NEW.version)"
+    " OR spec_hash = NEW.spec_hash)"
+    " BEGIN SELECT RAISE(ABORT, 'a spec is never replaced'); END",
+    "CREATE TRIGGER IF NOT EXISTS agent_bars_no_replace BEFORE INSERT ON agent_bars"
+    " WHEN EXISTS (SELECT 1 FROM agent_bars WHERE bar_id = NEW.bar_id"
+    " OR (NEW.closed_at IS NULL AND closed_at IS NULL AND agent_id = NEW.agent_id))"
+    " BEGIN SELECT RAISE(ABORT, 'a bar is never replaced'); END",
+    "CREATE TRIGGER IF NOT EXISTS agent_bars_identity BEFORE UPDATE ON agent_bars"
+    " WHEN NEW.bar_id IS NOT OLD.bar_id OR NEW.agent_id IS NOT OLD.agent_id"
+    " BEGIN SELECT RAISE(ABORT, 'bar identity is immutable'); END",
 )
 
 _MasterRow = tuple[str, str, str, "str | None"]
@@ -129,7 +151,7 @@ def ddl_agents(conn: sqlite3.Connection) -> None:
 
 def agent_master(conn: sqlite3.Connection) -> list[_MasterRow]:
     """The ``sqlite_master`` rows of every agent object: a row whose table is one of the eight agent tables or
-    whose name is one of the twelve trigger names (SQLite's own ``sqlite_autoindex_*`` rows of those tables count,
+    whose name is in :data:`AGENT_TRIGGERS` (SQLite's own ``sqlite_autoindex_*`` rows of those tables count,
     with their NULL ``sql``)."""
     query = ("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name IN ({}) OR name IN ({}) "
              "ORDER BY type, name").format(",".join("?" * len(AGENT_TABLES)), ",".join("?" * len(AGENT_TRIGGERS)))

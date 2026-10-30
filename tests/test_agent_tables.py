@@ -1,4 +1,4 @@
-"""F0: the agent DDL, its twelve triggers and the agent schema check (A0 r6 §3.5, §3.7, §4.2).
+"""F0: the agent DDL, its seventeen triggers and the agent schema check (A0 r7 §3.5, §3.7, §4.2).
 
 Built from ``a0_scratch/r6_schema_run.py`` (A0 §1.5), whose checks are asserted here against ``levain.autonomic.agent_tables``
 itself: each trigger refuses its own bad write with its own message and is the only refusal on that write; the legitimate
@@ -17,7 +17,7 @@ from levain.autonomic import agent_tables as at
 from levain.autonomic.db import DB_NAME, AutonomicDB
 
 # `sha256("\n".join(AGENT_OBJECT_DDL))`. The compare in check_agent_schema is byte-exact against these constants.
-DDL_SHA256 = "c9221077bf1fa8fdd49f617b44cd17b0b7ce563cead18e597eea0368b0c01d0c"
+DDL_SHA256 = "2fc46682884787619f53aca1a0a1c6e53e82cb9ec5d497138cd04868c5fb456e"
 
 NOW = "2026-10-30T18:00:00Z"
 
@@ -28,8 +28,8 @@ def test_the_agent_ddl_is_pinned():
 
 
 def test_the_object_names_are_the_spec():
-    assert len(at.AGENT_TABLES) == 8 and len(at.AGENT_TRIGGERS) == 12
-    assert at.AGENT_SCHEMA == "levain-agent-schema/1"
+    assert len(at.AGENT_TABLES) == 8 and len(at.AGENT_TRIGGERS) == 17
+    assert at.AGENT_SCHEMA == "levain-agent-schema/2"
     ref = at.reference_master()
     assert sorted(r[1] for r in ref if r[0] == "trigger") == sorted(at.AGENT_TRIGGERS)
     assert sorted(r[1] for r in ref if r[0] == "table") == sorted(at.AGENT_TABLES)
@@ -177,10 +177,18 @@ def test_agent_objects_with_no_marker_are_refused_and_nothing_is_created(good, t
 
 def test_an_unknown_marker_is_refused(good, tmp_path):
     t = tampered(good, tmp_path, "marker2", [
-        "UPDATE meta SET value = 'levain-agent-schema/2' WHERE key = 'agent_schema'"])
+        "UPDATE meta SET value = 'levain-agent-schema/3' WHERE key = 'agent_schema'"])
     reason = at.check_agent_schema(t)
     assert reason is not None and reason.startswith("unknown agent schema marker")
-    assert "'levain-agent-schema/2'" in reason
+    assert "'levain-agent-schema/3'" in reason
+    t.close()
+
+
+def test_a_store_made_under_a0_r6s_marker_is_refused_as_unknown(good, tmp_path):
+    """/1 named the twelve-trigger text F0 r1 wrote; this binary does not know it, so it refuses and names it."""
+    t = tampered(good, tmp_path, "marker1", [
+        "UPDATE meta SET value = 'levain-agent-schema/1' WHERE key = 'agent_schema'"])
+    assert at.check_agent_schema(t) == "unknown agent schema marker 'levain-agent-schema/1'"
     t.close()
 
 
@@ -322,6 +330,18 @@ TRIGGER_CASES = {
     "agent_bars_keep": ("DELETE FROM agent_bars WHERE bar_id='ab-open'", (), "bars are closed, never deleted"),
     "agent_bars_closed_frozen": ("UPDATE agent_bars SET last_error='stale_head' WHERE bar_id='ab-closed'", (),
                                  "a closed bar is never changed"),
+    # r7 (F0 L3 r1, each reproduced as accepted before its trigger existed)
+    "agent_occurrences_transition": ("UPDATE agent_occurrences SET state='admitted' WHERE occurrence_id='o-run'", (),
+                                     "not a step of the occurrence state machine"),
+    "agent_occurrences_epoch": ("UPDATE agent_occurrences SET epoch=epoch-1 WHERE occurrence_id='o-run'", (),
+                                "an occurrence epoch never goes down"),
+    # the tconn connection has recursive_triggers off, as a plain AutonomicDB connection does
+    "agent_specs_no_replace": ("INSERT OR REPLACE INTO agent_specs VALUES ('ag-1', 1, 's9', 'r1', '{\"evil\":1}', ?)",
+                               (NOW,), "a spec is never replaced"),
+    "agent_bars_no_replace": ("INSERT OR REPLACE INTO agent_bars (bar_id, agent_id, barred_at, head_seq_at_bar)"
+                              " VALUES ('ab-2','ag-1',?,6)", (NOW,), "a bar is never replaced"),
+    "agent_bars_identity": ("UPDATE agent_bars SET agent_id='ag-7' WHERE bar_id='ab-open'", (),
+                            "bar identity is immutable"),
 }
 
 
@@ -400,10 +420,54 @@ def test_the_bar_close_guarded_by_closed_at_touches_no_row_after_an_abandon(tcon
 
 
 def test_one_open_bar_per_agent(tconn):
+    """The trigger refuses a second open bar first; the partial unique index stays as the open-bar lookup and still
+    refuses it with the trigger dropped."""
     ins = "INSERT INTO agent_bars (bar_id, agent_id, barred_at, head_seq_at_bar) VALUES (?, 'ag-1', ?, 5)"
     tconn.execute(ins, ("ab-1", NOW))
+    assert refused(tconn, ins, ("ab-2", NOW)) == "a bar is never replaced"
+    tconn.execute("DROP TRIGGER agent_bars_no_replace")
     e = refused(tconn, ins, ("ab-2", NOW))
     assert e is not None and "UNIQUE constraint failed" in e
+
+
+def test_every_step_of_the_a0_transition_table_is_accepted_and_no_other(tconn):
+    """A0 §2.5's table, whole: from admitted and from launched, each listed target is accepted and each other one is
+    refused by agent_occurrences_transition (launched -> admitted and -> a skip state were accepted before r7)."""
+    allowed = {"admitted": {"admitted", "launched", "skipped-no-input", "skipped-budget", "stopped", "missed"},
+               "launched": {"launched", "done", "failed", "stopped"}}
+    states = ("admitted", "launched", "done", "failed", "stopped", "skipped-no-input", "skipped-overlap",
+              "skipped-budget", "missed")
+    for i, (start, ok) in enumerate(allowed.items()):
+        for j, to in enumerate(states):
+            oid = f"o-{i}-{j}"
+            tconn.execute(*occ(oid))
+            if start == "launched":
+                tconn.execute(LAUNCH, (NOW, oid))
+            launch_cols = (", launch_epoch=epoch, link_id='al-1', link_incarnation='inc', launched_at='t'"
+                           if start == "admitted" and to == "launched" else "")
+            end = "" if to in ("admitted", "launched") else ", reason='r', ended_at='t'"
+            e = refused(tconn, f"UPDATE agent_occurrences SET state='{to}'{launch_cols}{end} WHERE occurrence_id=?",
+                        (oid,))
+            if to in ok:
+                assert e is None, (start, to, e)
+            else:
+                assert e == "not a step of the occurrence state machine", (start, to, e)
+
+
+def test_a_bar_raised_epoch_cannot_be_written_back_after_an_abandon(tconn):
+    """codex F0 L3 r1 HIGH: launch_epoch 0, a bar raises epoch to 1, the bar is abandoned, a stale full-row write puts
+    epoch 0 back so fence_now would equal the launch fence again. Refused; the raise itself is accepted."""
+    tconn.execute(*occ("o-e"))
+    tconn.execute(LAUNCH, (NOW, "o-e"))
+    tconn.execute("INSERT INTO agent_bars (bar_id, agent_id, barred_at, head_seq_at_bar) VALUES ('ab-e','ag-1',?,5)",
+                  (NOW,))
+    tconn.execute("UPDATE agent_occurrences SET epoch=epoch+1 WHERE agent_id='ag-1' AND state IN ('admitted','launched')")
+    tconn.execute("UPDATE agent_bars SET closed_at=?, reason='abandoned' WHERE bar_id='ab-e' AND closed_at IS NULL",
+                  (NOW,))
+    assert refused(tconn, "UPDATE agent_occurrences SET epoch=0, lease_until=? WHERE occurrence_id='o-e'",
+                   (NOW,)) == "an occurrence epoch never goes down"
+    assert tconn.execute("SELECT epoch, launch_epoch FROM agent_occurrences WHERE occurrence_id='o-e'"
+                         ).fetchone() == (1, 0)
 
 
 # ------------------------------------------------------------------ REPLACE
@@ -438,21 +502,30 @@ def _replace_spec_and_bar(p):
     return e_spec, spec_now[0], e_bar, n
 
 
-def test_replace_swaps_a_spec_and_deletes_an_open_bar_with_the_pragma_off_the_bypass_store_py_closes(tmp_path):
-    p = connect(tmp_path / "off.db")
+@pytest.mark.parametrize("pragma", [0, 1])
+def test_replace_of_a_spec_and_a_bar_is_refused_with_the_pragma_off_and_on(tmp_path, pragma):
+    """r6 closed this with the pragma on store.py's connections only; with it off (a plain AutonomicDB connection) the
+    REPLACE swapped the spec and deleted the open bar. r7's _no_replace triggers refuse it on any connection."""
+    p = connect(tmp_path / f"rep{pragma}.db")
     at.create_agent_objects(p)
-    p.execute("PRAGMA recursive_triggers = 0")
+    p.execute(f"PRAGMA recursive_triggers = {pragma}")
     e_spec, spec_now, e_bar, n = _replace_spec_and_bar(p)
-    assert (e_spec, spec_now) == (None, "s9")    # the bypass, reproduced
-    assert (e_bar, n) == (None, 0)
+    assert (e_spec, spec_now) == ("a spec is never replaced", "s1")
+    assert (e_bar, n) == ("a bar is never replaced", 1)
     p.close()
 
 
-def test_replace_of_a_spec_and_a_bar_is_refused_with_the_pragma_on(tmp_path):
-    p = connect(tmp_path / "on.db")
-    at.create_agent_objects(p)
-    p.execute("PRAGMA recursive_triggers = 1")
-    e_spec, spec_now, e_bar, n = _replace_spec_and_bar(p)
-    assert (e_spec, spec_now) == ("agent specs are never deleted", "s1")
-    assert (e_bar, n) == ("bars are closed, never deleted", 1)
-    p.close()
+def test_a_replace_colliding_only_on_rowid_is_what_the_pragma_still_closes(tmp_path):
+    """The residue the keyed triggers leave (A0 r7 §4.2): a REPLACE naming an existing rowid deletes that row with no
+    DELETE trigger unless recursive_triggers is on, which store.py sets on every connection."""
+    out = {}
+    for pragma in (0, 1):
+        p = connect(tmp_path / f"rowid{pragma}.db")
+        at.create_agent_objects(p)
+        p.execute(f"PRAGMA recursive_triggers = {pragma}")
+        p.execute("INSERT INTO agent_specs VALUES ('ag-1', 1, 's1', 'r1', '{}', ?)", (NOW,))
+        rid = p.execute("SELECT rowid FROM agent_specs").fetchone()[0]
+        out[pragma] = refused(p, "INSERT OR REPLACE INTO agent_specs (rowid, agent_id, version, spec_hash, role_hash,"
+                                 " spec, created_at) VALUES (?, 'ag-1', 7, 's7', 'r1', '{}', ?)", (rid, NOW))
+        p.close()
+    assert out == {0: None, 1: "agent specs are never deleted"}
