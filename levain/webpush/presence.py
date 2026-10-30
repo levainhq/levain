@@ -35,22 +35,29 @@ its environment.
 The consent hook's own away mode (:mod:`levain.consent.away`) is a different setting (whether the hook holds a request
 for a signed answer) and is not read or changed here.
 
+Every call to :func:`set_word`, a refusal included, leaves one row in ``<queue_dir>/webpush/presence.log.jsonl``
+(append-only, rotated to ``.1`` past 1 MiB; ``levain ping log``): who, in which role, the word, the quote, the
+word it found, and the outcome.
+
 Stdlib only.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
 import re
 import stat
+import sys
 import time
+from contextlib import contextmanager
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 __all__ = ["ACTIVE_WINDOW_SECS", "AWAY_GRACE_SECS", "DEFAULT_SECS", "MAX_SECS", "SLEEP_BLIND_SECS", "URGENT_KINDS", "WORDS", "Decision",
-           "PresenceError", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "read_word", "set_word", "should_push"]
+           "PresenceError", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "set_word", "should_push"]
 
 ACTIVE_WINDOW_SECS = 5 * 60
 AWAY_GRACE_SECS = 3 * 60
@@ -65,6 +72,10 @@ COORDINATOR_WORDS = SEAT_WORDS + ("quiet", "sleep")
 ROLES = ("seat", "coordinator")
 _SAID_MAX = 300
 _FIELD_MAX = 200
+_WHY_MAX = 300
+LOG_NAME = "presence.log.jsonl"
+LOCK_NAME = ".presence.lock"
+LOG_MAX_BYTES = 1 << 20   # past this the log is rotated to ``LOG_NAME + ".1"``
 # urgent = a ping about a request that holds an agent until the operator answers: the hook's wait (``consent``, the
 # default kind: the permission hook, the publish gate, the limits), the push gate's wait (``push``) and the asking-again
 # of a request still pending (``reping``). Every other kind (``question``, ``ruling``, ``summary``) waits for the rule.
@@ -229,25 +240,101 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
     :class:`PresenceError` for an unknown word, a bad duration, or a directory or file that is not safe to write.
     ``by`` (a seat's or the coordinator's identity, see :func:`check_setter`) and ``said`` (his words) are for an agent
     setting a word for him: both are checked before anything is read or written, and recorded with the word. With
-    ``by`` unset the call is the operator's own and records nothing more."""
+    ``by`` unset the call is the operator's own and records nothing more.
+
+    Every call leaves one row in the presence log (:func:`read_log`), a refusal included. A setter's row is written
+    before the word and a row that cannot be written refuses the write; the operator's own row is written after, and a
+    failure to write it is reported on stderr and never stops his word.
+
+    The whole call (read the word on file, plan, log row, write, outcome row) runs under one interprocess lock, so a
+    word set meanwhile is read, never overwritten. A setter that cannot take the lock is refused; the operator's own
+    word goes through without it."""
+    with _locked(queue_dir, strict=by is not None):
+        return _set_word(queue_dir, word, duration, now, by, said)
+
+
+@contextmanager
+def _locked(queue_dir: Path | str, *, strict: bool):
+    """Hold the presence lock (a ``flock`` on a lock file beside ``presence.json``). ``strict``: failing to take it
+    raises :class:`PresenceError`; else it is reported on stderr and the body runs unlocked."""
+    d = Path(queue_dir) / "webpush"
+    fd = None
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise PresenceError(f"{d} is not a directory of this user's")
+        fd = os.open(d / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise PresenceError(f"{d / LOCK_NAME} is not a file of this user's")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except (OSError, PresenceError) as e:
+        if fd is not None:
+            os.close(fd)
+        fd = None
+        if strict:
+            raise PresenceError(f"presence lock not taken: {e}") from e
+        print(f"levain ping: presence lock not taken: {e}", file=sys.stderr)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float | None, by: dict | None,
+              said: str | None) -> dict | None:
+    ts = time.time() if now is None else now
+    prior = read_word(queue_dir)
+    row = _log_row(ts, word, duration, by, said, prior)
+    try:
+        action, rec, why = _plan(word, duration, ts, prior, by, said)
+    except PresenceError as e:
+        _log_best_effort(queue_dir, {**row, "outcome": "refused", "why": _clean(str(e), _WHY_MAX)})
+        raise
+    row["outcome"] = "set" if action != "keep" else "unchanged"
+    if rec is not None and "until" in rec:
+        row["until"] = rec["until"]
+    if why:
+        row["why"] = why
+    if by is not None:
+        try:
+            _log(queue_dir, row)
+        except PresenceError as e:
+            raise PresenceError(f"{e}: a setter's write with no record is not made") from e
+    try:
+        if action == "write":
+            _write(queue_dir, rec)
+        elif action == "clear":
+            _write(queue_dir, None)
+    except PresenceError as e:
+        _log_best_effort(queue_dir, {**row, "outcome": "refused", "why": _clean(str(e), _WHY_MAX)})
+        raise
+    if by is None:
+        _log_best_effort(queue_dir, row)
+    return rec if action == "write" else (None if action == "clear" else prior)
+
+
+def _plan(word: str, duration: str | None, ts: float, prior: dict | None, by: dict | None,
+          said: str | None) -> tuple[str, dict | None, str]:
+    """What a call does, with nothing read or written: ``(action, record, note)``, action ``write`` (the record is the
+    word), ``clear`` (no word stands after) or ``keep`` (the word on file stays, the note says why). Raises
+    :class:`PresenceError` for a refusal."""
     if word not in WORDS:
         raise PresenceError(f"{word!r} is not a presence word (one of: {', '.join(WORDS)})")
     quote = check_setter(word, by, said) if by is not None else None
-    ts = time.time() if now is None else now
-    prior = read_word(queue_dir)
     if by is not None and _active(prior, "loud", ts):
         raise PresenceError("`loud` is the operator's standing word; a seat cannot replace it "
                             "(the operator says `loud off` himself)")
     if word == "loud" and (duration or "").strip().lower() == "off":
         if _active(prior, "loud", ts) or (prior and prior["word"] == "loud"):
-            _write(queue_dir, None)
-            return None
-        return prior
+            return "clear", None, "loud off"
+        return "keep", None, "loud off: no loud was standing"
     if word == "back" and _active(prior, "loud", ts):
-        return prior
+        return "keep", None, "back leaves a standing loud"
     if word == "back":
-        _write(queue_dir, None)
-        return None
+        return "clear", None, ""
     if word not in TIMED and duration:
         raise PresenceError(f"`{word}` takes no duration")
     rec: dict = {"word": word, "ts": ts}
@@ -257,8 +344,120 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
         rec["by"] = {"agent": _clean(by.get("agent"), _FIELD_MAX), "session": _clean(by.get("session"), _FIELD_MAX),
                      "role": by["role"]}
         rec["said"] = quote
-    _write(queue_dir, rec)
-    return rec
+    return "write", rec, ""
+
+
+def _log_row(ts: float, word: object, duration: str | None, by: object, said: object, prior: dict | None) -> dict:
+    """The row's fields known before the call is decided: who, which role, the word given, the quote, the word it found."""
+    row: dict = {"ts": ts, "word": _clean(word, 40), "prior": {"word": prior["word"]} if prior else {}}
+    if prior and "by" in prior:
+        row["prior"]["by"] = prior["by"]
+    if _clean(duration, 40):
+        row["duration"] = _clean(duration, 40)
+    if by is not None:
+        who = by if isinstance(by, dict) else {}
+        row["by"] = {"agent": _clean(who.get("agent"), _FIELD_MAX), "session": _clean(who.get("session"), _FIELD_MAX),
+                     "role": _clean(who.get("role"), 20)}
+        row["said"] = _clean(said, _SAID_MAX)
+    return row
+
+
+def _log_best_effort(queue_dir: Path | str, row: dict) -> None:
+    try:
+        _log(queue_dir, row)
+    except Exception as e:  # noqa: BLE001 - the operator's word, and the refusal being raised, are not blocked by a row
+        print(f"levain ping: presence log not written: {e}", file=sys.stderr)
+
+
+def _log(queue_dir: Path | str, row: dict) -> None:
+    """Append one row to the presence log (the caller holds the presence lock). Raises :class:`PresenceError` when it
+    cannot be written whole. A log that passes :data:`LOG_MAX_BYTES` is rotated: it becomes ``LOG_NAME + ".1"``,
+    replacing the one before, and the next row starts a new file."""
+    d = Path(queue_dir) / "webpush"
+    path = d / LOG_NAME
+    line = (json.dumps(row, separators=(",", ":")) + "\n").encode("utf-8")
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise PresenceError(f"{d} is not a directory of this user's")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                raise PresenceError(f"{path} is not a file of this user's")
+            view = memoryview(line)
+            while view:   # a short write is not a row
+                n = os.write(fd, view)
+                if n <= 0:
+                    raise OSError("short write")
+                view = view[n:]
+            size = st.st_size + len(line)
+        finally:
+            os.close(fd)
+        if size > LOG_MAX_BYTES:
+            os.replace(path, d / (LOG_NAME + ".1"))
+    except OSError as e:
+        raise PresenceError(f"presence log not written: {e}") from e
+
+
+def log_line(r: dict) -> str:
+    """One log row as a line: when, outcome, the word, who set it and on what quote, and what it found or why not."""
+    by = r.get("by")
+    who = "operator" if not isinstance(by, dict) else f"{by.get('role', '')} {by.get('agent', '')} {by.get('session', '')}".strip()
+    prior = r.get("prior") if isinstance(r.get("prior"), dict) else {}
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(r['ts']))} {str(r['outcome']).upper()} {r.get('word', '')}"
+    if r.get("duration"):
+        line += f" {r['duration']}"
+    line += f" by {who}"
+    if r.get("said"):
+        line += f' on "{r["said"]}"'
+    line += f" (found: {prior.get('word', 'no word')})"
+    return line + (f": {r['why']}" if r.get("why") else "")
+
+
+def _read_tail(path: Path) -> list[dict]:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return []
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return []
+        start = max(0, st.st_size - 2 * LOG_MAX_BYTES)
+        raw = os.pread(fd, st.st_size - start, start)
+    finally:
+        os.close(fd)
+    lines = raw.splitlines()
+    if start:
+        lines = lines[1:]   # the first line is cut
+    rows = []
+    for ln in lines:
+        try:
+            r = json.loads(ln.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            continue
+        ts = r.get("ts") if isinstance(r, dict) else None
+        if (isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts) and 0 <= ts < 1e11
+                and r.get("outcome") in ("set", "refused", "unchanged")):
+            rows.append(r)
+    return rows
+
+
+def read_log(queue_dir: Path | str | None, *, limit: int | None = None) -> list[dict]:
+    """The presence log, oldest first: the rotated file, then the live one (the newest ``limit`` rows when given). A
+    missing or unreadable file is no rows, and a line that is not a row is skipped."""
+    if queue_dir is None:
+        return []
+    d = Path(queue_dir) / "webpush"
+    rows = _read_tail(d / (LOG_NAME + ".1")) + _read_tail(d / LOG_NAME)
+    return rows if limit is None else rows[-limit:] if limit > 0 else []
+
+
+def is_expired(word: dict | None, now: float) -> bool:
+    """Whether ``word`` is a timed word (quiet, loud, remote) whose time has run out."""
+    return bool(word and word["word"] in TIMED and not _active(word, word["word"], now))
 
 
 def _write(queue_dir: Path | str, rec: dict | None) -> None:
