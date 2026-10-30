@@ -22,7 +22,7 @@
   // cockpit's own key), so every subscription has a revoke above it. The worker (/sw.js) keeps the key to record an
   // open, and is told to send it under this page's header (H), on every read, so a re-paired browser hands it the new one.
   const PUSH_OK = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
-  let pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
+  let pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false, refusedMsg = "";
   const b64uToBytes = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
                                              (c) => c.charCodeAt(0));
 
@@ -180,8 +180,11 @@
     const t = token(), w = reg && (reg.active || reg.waiting || reg.installing);
     if (t && w) w.postMessage({ type: "levain-token", token: t, header: H });
   }
+  // Where the browser withholds the push API (a plain-http address that is not localhost has no service worker), the row
+  // still shows when the cockpit serves push, and says why, instead of vanishing or a toggle that cannot work
+  const INSECURE_SAY = "off: this browser only offers pings on https or localhost, and this address is neither. Open the cockpit at its https address.";
   async function pings() {
-    if (!PUSH_OK) return;
+    if (!PUSH_OK && window.isSecureContext !== false) return;
     if (!pushAsked) {
       pushAsked = true;
       try {
@@ -192,6 +195,7 @@
     }
     if (!pushKey) return;                               // this cockpit serves no web push: no row
     pingRow.hidden = false;
+    if (!PUSH_OK) { pingBtn.disabled = true; pingState.textContent = INSECURE_SAY; return; }
     const reg = await registration();
     giveToken(reg);
     const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
@@ -199,11 +203,12 @@
     pingBtn.textContent = sub ? "Turn off" : "Turn on";
     pingBtn.setAttribute("aria-label", sub ? "Turn pings off on this browser" : "Turn pings on for this browser");
     pingState.textContent = sub ? "on: a sign request or a question pings this browser"
+      : refusedMsg ? refusedMsg
       : Notification.permission === "denied" ? "off: this browser blocks notifications from this page"
       : "off: turn on to be pinged here when the cockpit needs you";
   }
   async function turnOn() {
-    pingBtn.disabled = true; say("");
+    pingBtn.disabled = true; say(""); refusedMsg = "";
     let sub = null;
     try {
       // the permission prompt must come straight from the tap, so it is the first thing this handler does
@@ -219,9 +224,12 @@
       if (res.status !== 200) {
         // a browser subscription the cockpit does not hold would read "on" and never ping
         await sub.unsubscribe().catch(() => {});
-        say(res.data.error === "device_required"
-          ? "Pings need this browser's own key: make a pairing link above, open it in this browser, then turn pings on."
-          : "Could not turn pings on (" + (res.data.message || res.status) + ").");
+        if (res.data.error === "device_required") {
+          // the cockpit's own key is refused by design: say it on the row (the note sits below the pairing form), kept
+          // past the re-render in the finally
+          refusedMsg = "off: pings need this browser's own key. Make a pairing link below, open it in this browser, then turn pings on.";
+          say("Pings need this browser's own key: make a pairing link below, open it in this browser, then turn pings on.");
+        } else say("Could not turn pings on (" + (res.data.message || res.status) + ").");
         return;
       }
       giveToken(reg);

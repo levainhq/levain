@@ -355,11 +355,14 @@ def test_the_cockpits_own_key_is_told_to_pair_first_and_keeps_nothing(rig, tmp_p
             {"until": "document.querySelector('.dev-note') && !document.querySelector('.dev-note').hidden"
                       " && document.querySelector('.dev-note').textContent", "ms": 20000},
             {"eval": f"{_ROW}.querySelector('button').textContent"},
+            # the refusal is said on the pings row itself, which survives the re-render (the note sits below the pair form)
+            {"eval": f"{_ROW}.querySelector('.dev-meta').textContent"},
         ]))
         assert PushStore(qdir).live_subscriptions() == []
     v = out["values"]
     assert v[3].startswith("Pings need this browser's own key"), v
     assert v[4] == "Turn on", v                                  # the browser's subscription was dropped too
+    assert v[5].startswith("off: pings need this browser's own key"), v
 
 
 @needs_browser
