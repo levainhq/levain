@@ -453,3 +453,17 @@ def test_an_open_item_whose_number_is_pending_is_said_in_the_note_not_dropped_si
         holder.close()
     assert [i["what"] for i in got["items"]] == ["Q-one?"], got
     assert got["note"] == band_view._UNREAD_NOTE, got
+
+
+def test_a_skipped_view_record_with_an_older_view_bound_is_said_in_the_note(tmp_path, monkeypatch):
+    """L3 r1 (codex): Q-two is numbered, then the view record is skipped on a busy lock, so the older view [1] is bound
+    and the payload lists one item with ``pending`` false; the band must still say it may be missing items."""
+    store = QuestionStore(tmp_path / "consent")
+    store.file(agent="claude_code", agent_session_id="s1", what="Q-one?", options=OPTS, rec="hold", blocks="a", cwd="/w")
+    assert band_view.band_payload(store, "cockpit:browser")["note"] == ""
+    store.file(agent="claude_code", agent_session_id="s2", what="Q-two?", options=OPTS, rec="hold", blocks="b", cwd="/w")
+    band_view.render_full(store)                                              # numbers Q-two (a committed write)
+    monkeypatch.setattr(band_view, "record_view", lambda *a, **k: None)      # the record skipped on a busy lock
+    got = band_view.band_payload(store, "cockpit:browser")
+    assert [i["what"] for i in got["items"]] == ["Q-one?"], got
+    assert got["note"] == band_view._UNREAD_NOTE, got

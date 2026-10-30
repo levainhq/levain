@@ -254,7 +254,7 @@ def _held_lines(host: str, pkg: str) -> Optional[Sequence[str]]:
 def _held_note() -> str:
     from levain import doctor
 
-    return getattr(doctor, "REAP_HELD_NOTE", "")
+    return getattr(doctor, "REAP_HELD_NOTE", "If a step fails, still run 4 and 5: step 1 has stopped the reaper.")
 
 
 def _current_generation(host: str) -> Optional[str]:

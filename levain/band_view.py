@@ -738,9 +738,11 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
                                       if i < len(_LETTERS)], "rec": e.rec_letter, "question": None})
     # an item that was not read (a transient lock on queue.db: the first read or the second; a question row that cannot be
     # decoded): the items listed are the ones that were read, and the band says so, as the text render's "! not read" line
-    # does: never a healthy band that is missing items
+    # does: never a healthy band that is missing items. The bound view is not the one this show recorded (its record
+    # skipped on a busy lock, so an older view is bound): its list differs from what was shown, and the band says so.
     return {"seen_through": view.seen_through, "store_id": view.store_id, "view_id": view_id, "items": items,
-            "note": _UNREAD_NOTE if (shown.failed or shown.pending or extras_failed or dropped) else ""}
+            "note": _UNREAD_NOTE if (shown.failed or shown.pending or extras_failed or dropped
+                                     or sorted(view.open_list) != sorted(shown.shown)) else ""}
 
 
 class StaleBand(ValueError):
