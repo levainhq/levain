@@ -1115,6 +1115,19 @@ class CoordStore:
             ids = [r[0] for r in conn.execute("SELECT drop_id FROM drops ORDER BY rowid DESC LIMIT ?", (limit,))]
             return [self._drop(conn, d) for d in ids]
 
+    def drops_noted(self, limit: int = 50) -> list[tuple[Drop, str | None]]:
+        """The newest ``limit`` drops, each with the why of its ``noted`` receipt (None when not noted), read in ONE
+        transaction: one snapshot, one open."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise CoordError("limit is 1 to 1000")
+        with read_transaction(self._connect) as conn:
+            ids = [r[0] for r in conn.execute("SELECT drop_id FROM drops ORDER BY rowid DESC LIMIT ?", (limit,))]
+            out: list[tuple[Drop, str | None]] = []
+            for d in ids:
+                why = next((str(r.body.get("why", "")) for r in self._receipts(conn, d, "noted")), None)
+                out.append((self._drop(conn, d), why))
+            return out
+
     def thread(self, thread_id: str) -> Thread:
         with read_transaction(self._connect) as conn:
             return self._must_thread(conn, thread_id)

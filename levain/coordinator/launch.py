@@ -335,7 +335,8 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "you escalated, for example `coordinator: split d-41 into 2 threads, noted d-42; 1 escalated`. It is never a "
         "message to the operator, never a question, never \"waits on you\". Every escalation goes through the verb "
         f"that pings (`{lv} coord escalate`, or the band's ask tool), never through your last line. When the work is "
-        f"done, release the lease (`{lv} coord release`) and end your turn with that line"
+        f"done, release the lease (`{lv} coord release --by coordinator --token N {tail}`) and end your turn with "
+        "that line"
         " (on an attended turn the band Levain gave you follows it, unchanged).",
         "",
         "## Away and budgets",

@@ -1685,3 +1685,51 @@ def test_only_the_lease_holder_notes_and_split_and_noted_exclude_each_other(stor
     store.coord_release(token, by="coordinator")
     with pytest.raises(CoordError):
         store.note(d1.drop_id, "after release", token=token)               # a lapsed lease writes nothing
+
+
+def test_the_briefs_release_line_runs_as_the_coordinator_and_ends_the_lease(store, qdir, fake, live_hook, capsys):
+    """L3 r1: the end-of-turn rule named a bare `coord release` (defaults --by operator, no token, no --queue-dir)."""
+    got = cl.launch_session(store, woken(store))
+    ln = store.launch(got.launch_id)
+    text = cl.brief_path(ln).read_text()
+    section = text.split("## How your turn ends")[1].split("##")[0]
+    cmd = re.search(r"`([^`]*coord release[^`]*)`", section).group(1)
+    argv = shlex.split(cmd)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    argv = [str(token) if a == "N" else a for a in argv]
+    from levain.cli import main
+
+    assert main(argv[argv.index("coord"):]) == 0, capsys.readouterr()
+    held = store.coord_status()["lease"]
+    assert held is None or not held["live"]
+
+
+def test_drops_list_is_one_snapshot_and_a_store_error_is_a_refusal(store, qdir, monkeypatch, capsys):
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    opens = []
+    real = store._connect
+    monkeypatch.setattr(store, "_connect", lambda *a, **k: (opens.append(1), real(*a, **k))[1])
+    pairs = store.drops_noted(limit=10)
+    assert len(opens) == 1 and [d.drop_id for d, _ in pairs] == [d2.drop_id, d1.drop_id]
+    from levain.coordinator.store import CoordStore as CS
+
+    def boom(self, limit=50):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(CS, "drops_noted", boom)
+    out = _main(qdir, capsys, "drops", "list", rc=1)
+    assert "levain drops list:" in out.err and "Traceback" not in out.err
+
+
+def test_drops_show_escapes_a_noted_why_and_survives_a_receipt_with_no_why(store, qdir, capsys):
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    with store._write() as (conn, now):
+        store._reply(conn, None, "drop_receipt", "drops", d1.drop_id,
+                     {"stage": "noted", "drop_id": d1.drop_id, "why": "x\x1b[2Jy"}, now)
+        store._reply(conn, None, "drop_receipt", "drops", d2.drop_id, {"stage": "noted", "drop_id": d2.drop_id}, now)
+    out = _main(qdir, capsys, "drops", "show", d1.drop_id)
+    assert "\x1b" not in out.out and "noted" in out.out
+    out = _main(qdir, capsys, "drops", "show", d2.drop_id)
+    assert "noted" in out.out

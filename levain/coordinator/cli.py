@@ -994,14 +994,6 @@ def run_note(args: argparse.Namespace, out: Any = None) -> int:
     return 0
 
 
-def _noted(store: Any, drop_id: str) -> str | None:
-    """The why of a drop's ``noted`` receipt, or None."""
-    for r in store.drop_receipts(drop_id):
-        if r.body.get("stage") == "noted":
-            return str(r.body.get("why", ""))
-    return None
-
-
 def run_drop_show(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
@@ -1019,7 +1011,7 @@ def run_drop_show(args: argparse.Namespace, out: Any = None) -> int:
             f"  words (verbatim, data): {_shown(drop.words)}\n"
             + ("\n".join(_thread_line(t) for t in threads) if threads else "  not split yet")
             + "\n  drop receipts: " + ", ".join(
-                f"{r.body.get('stage')} {r.at}" + (f" ({r.body['why']})" if r.body.get("stage") == "noted" else "")
+                f"{r.body.get('stage')} {r.at}" + (f" ({_shown(str(r.body.get('why', '')))})" if r.body.get("stage") == "noted" else "")
                 for r in receipts))
     _emit(out, args.json, obj, text)
     return 0
@@ -1080,11 +1072,12 @@ def run_drop_list(args: argparse.Namespace, out: Any = None) -> int:
         if _no_store(store):
             _emit(out, args.json, [], NO_STORE)
             return 0
-        drops = store.drops(limit=args.limit)
+        pairs = store.drops_noted(limit=args.limit)
     except _REFUSED as exc:
         print(f"levain drops list: {exc}", file=sys.stderr)
         return 1
-    whys = {d.drop_id: _noted(store, d.drop_id) for d in drops}
+    drops = [d for d, _ in pairs]
+    whys = {d.drop_id: w for d, w in pairs}
     _emit(out, args.json, [{**_drop_row(d), "noted": whys[d.drop_id]} for d in drops],
           "\n".join(f"{d.drop_id}  {d.received_at}  {_shown(d.words[:80])}"
                      + ("" if whys[d.drop_id] is None else f"  [noted: {_shown(whys[d.drop_id])}]") for d in drops)
