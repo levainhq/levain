@@ -143,7 +143,7 @@ class CoordinatorVerbs:
         held = None if ended is None else {"holder": ended.holder, "token": ended.token}
         # the lease's holder is the launch's session key, not a person, so the line names the token only; the
         # release voids and ends launches whether or not a lease was held
-        said = (("the coordinator lease was released" if ended is None else
+        said = (("there was no coordinator lease to release" if ended is None else
                  f"the coordinator lease (token {ended.token}) was released")
                 + "; any pending coordinator launch is voided, any running one ended, and the watcher stops its "
                   "session on its next pass")

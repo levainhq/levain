@@ -318,7 +318,7 @@ def test_stop_then_one_watcher_pass_stops_the_session(store, qdir, fake, live_ho
     assert out["said"].startswith(f"the coordinator lease (token {out['released']['token']}) was released; ")
     assert store.coord_lease() is None
     again = _fire(v, STOP_VERB)
-    assert again["released"] is None and again["said"].startswith("the coordinator lease was released; ")
+    assert again["released"] is None and again["said"].startswith("there was no coordinator lease to release; ")
     lines = cl.watch_once(store)
     assert fake.stops() == [["stop", HID]]
     assert any(line.startswith(f"launch {lid} ended (operator release)") for line in lines), lines
