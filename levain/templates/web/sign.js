@@ -217,62 +217,21 @@
     const acts = $("sheet-actions");
     if (acts) acts.classList.remove("card-rows");
   }
+  // the nodes are card_format.js's (one builder for the sheet, the phone app and the cockpit); the ids are this page's
   function drawCardHead(body, card, msg) {
-    const F = window.LevainCardFormat;
-    const box = el("div", "card-head");
+    const box = window.LevainCardFormat.drawHead(card, msg);
     box.id = "sheet-card";
     box.dataset.card = "head";
-    const meta = [card.repo, card.item].filter((x) => x).join(" \u00B7 ");
-    if (meta) box.appendChild(el("p", "card-meta", meta));
-    const h = el("h2", "card-headline", F.headline(card.asked).head);
-    h.id = "sheet-headline";
-    box.appendChild(h);
-    const raw = el("details", "card-signed");
-    raw.id = "sheet-signed";
-    raw.appendChild(el("summary", "", "Signed text, exactly as signed"));
-    raw.appendChild(msg);
-    box.appendChild(raw);
+    box.querySelector(".card-headline").id = "sheet-headline";
+    box.querySelector(".card-signed").id = "sheet-signed";
     body.appendChild(box);
   }
-  function cardSections(into, secs) {
-    for (const s of secs) {
-      const sec = el("div", "card-sec");
-      if (s.label) sec.appendChild(el("div", "card-label", s.label));
-      for (const b of s.blocks) {
-        if (b.kind === "paragraph") { if (b.text) sec.appendChild(el("p", "card-p", b.text)); continue; }
-        sec.appendChild(el("p", "card-p", b.lead));
-        const ul = el("ul", "card-list");
-        for (const i of b.items) ul.appendChild(el("li", "", i));
-        sec.appendChild(ul);
-      }
-      into.appendChild(sec);
-    }
-  }
-  // `rec` is the card's own, the signed message's recommendation (parseMessage refused a request that disagrees with it)
   function drawCardDetail(card, options) {
-    const F = window.LevainCardFormat;
-    const rec = card.recommended;
-    const full = F.fullOptions(card, options);     // one decision: what the OPTIONS prose is compared to, and the panel
     const stale = $("sheet-detail");
     if (stale) stale.remove();
-    const det = el("details", "card-detail");
+    const det = window.LevainCardFormat.drawDetail(card, options);
     det.id = "sheet-detail";
     det.dataset.card = "detail";
-    det.appendChild(el("summary", "", "Detail"));
-    const inner = el("div", "card-detail-body");
-    const rest = F.headline(card.asked).rest;
-    if (rest) cardSections(inner, F.sections(rest));
-    if (card.stopped) {
-      inner.appendChild(el("div", "card-label card-label-top", "Stopped"));
-      cardSections(inner, F.sections(card.stopped, card.asked).filter((s) => !F.repeatsRows(s, full, rec)));
-    }
-    if (card.optionLines.length) {
-      const sec = el("div", "card-sec");
-      sec.appendChild(el("div", "card-label", "Options, in full"));
-      for (const o of full) sec.appendChild(el("p", "card-p", "(" + o.key + ") " + o.text + (o.key === rec ? " \u2014 Rec" : "")));
-      inner.appendChild(sec);
-    }
-    det.appendChild(inner);
     const sheet = $("sheet"), note = $("sheet-note");
     if (note && note.parentNode === sheet) sheet.insertBefore(det, note);
     else sheet.appendChild(det);
@@ -308,7 +267,8 @@
     // a needs-phill card is drawn as headline, option rows, then a collapsed Detail (card_format.js, ported from the iOS app's
     // NPCard); its signed text stays whole, one tap away, above the controls. Any other message, and any needs-phill
     // message parseMessage does not read exactly (it returns null), is one visible block.
-    const card = !dispatch && !consent && window.LevainCardFormat ? window.LevainCardFormat.parseMessage(r.message, r) : null;
+    const F = window.LevainCardFormat;
+    const card = !dispatch && !consent && F && typeof F.drawHead === "function" ? F.parseMessage(r.message, r) : null;
     cardView = card;
     $("sheet-actions").classList.toggle("card-rows", !!card);
     if (card) drawCardHead(body, card, msg);

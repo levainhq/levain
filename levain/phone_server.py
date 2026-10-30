@@ -106,7 +106,9 @@ _STATIC = {"/": ("phone.html", "text/html; charset=utf-8"),
            "/phone.js": ("phone.js", "text/javascript; charset=utf-8"),
            "/phone.css": ("phone.css", "text/css; charset=utf-8"),
            "/phone_app.js": ("phone_app.js", "text/javascript; charset=utf-8"),
-           "/phone_app.css": ("phone_app.css", "text/css; charset=utf-8")}
+           "/phone_app.css": ("phone_app.css", "text/css; charset=utf-8"),
+           # the needs-phill card's parser and builders, the sign sheet's own file, loaded before /phone.js
+           "/card_format.js": ("card_format.js", "text/javascript; charset=utf-8")}
 _CONSENT_PREFIX = "/consent/"
 _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")      # the cockpit's consent-body id shape
 _ACTIONS = ("challenge", "answer", "rule-challenge", "rule")

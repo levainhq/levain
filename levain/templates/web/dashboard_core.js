@@ -4545,6 +4545,7 @@
     }
     const options = Array.isArray(b.options) ? b.options : [];
     const parts = [];
+    let head = null;     // the focus view's title, blocks and REC lines: a needs-phill sign card is drawn in their place
     if (card) {
       parts.push(el("div", "needs-q-title", sv(b.what)));
       const more = blocksBeyondTitle(sv(b.what), sv(b.blocks));
@@ -4555,6 +4556,7 @@
         rl.append(el("span", "needs-rec-tag", "REC"), document.createTextNode(" " + sv(b.rec) + (recOpt && sv(recOpt.label) ? ". " + sv(recOpt.label) : "")));
         parts.push(rl);
       }
+      head = parts.slice();
     } else {
       parts.push(el("pre", "consent-display", sv(b.what)));
       const facts = el("div", "consent-facts");
@@ -4573,7 +4575,7 @@
     if (open && q.sign) {
       // answered by a signature (DESIGN_SIGN D5): the sign request's own options are the buttons, and no unsigned answer is
       // drawn beside them (an unsigned tap on a row its caller asked to be signed is refused there, never his word)
-      const facet = signFacet(q.sign);
+      const facet = signFacet(q.sign, head);
       slot.replaceChildren(...parts);
       if (card) { const bottom = el("div", "needs-actions needs-qa needs-sign"); bottom.appendChild(facet); card.appendChild(bottom); }
       else slot.appendChild(facet);
@@ -5240,8 +5242,16 @@
       host.appendChild(no);
     });
   }
-  // the card's part for request `id`: a note line, then the request's own buttons, filled once the listing answers
-  function signFacet(id) {
+  // the card card_format.js reads from sign request `r`, or null (not a needs-phill message it reads exactly, the parser
+  // not loaded, or one that throws): null leaves the question's own lines as they are
+  function signCardOf(r) {
+    const F = window.LevainCardFormat;
+    if (!F || typeof F.parseMessage !== "function" || typeof F.drawHead !== "function") return null;
+    try { return F.parseMessage(r.message, r); } catch (e) { return null; }
+  }
+  // the card's part for request `id`: a note line, then the request's own buttons, filled once the listing answers.
+  // `head`: the focus view's question lines a needs-phill card replaces (signCardOf), else none
+  function signFacet(id, head) {
     const wrap = el("div", "sign-facet");
     wrap.dataset.signRequest = id;
     const note = el("div", "sign-note ext-meta", "reading the sign request…");
@@ -5287,6 +5297,15 @@
       }
       if (kept && kept[2] !== (r.sha256 || "")) signNotes.delete(id);
       if (r.refused) return show("not signable: " + r.refused, "bad");
+      // the focus view's needs-phill card (card_format.js, the sheet's rule and builders): drawn in place of the question's
+      // title, blocks and REC lines (`head`), the signed text whole one tap away above the buttons, Detail after them
+      const nc = head && head.length && head[0].parentNode ? signCardOf(r) : null;
+      if (nc) {
+        const box = window.LevainCardFormat.drawHead(nc, el("pre", "consent-display", r.message));
+        box.classList.add("needs-card-head");
+        head[0].before(box);
+        for (const n of head) n.remove();
+      }
       const say = (text, kind) => { signNotes.set(id, [text, kind || "", r.sha256 || ""]); show(text, kind); };
       const signers = Array.isArray(r.signers) ? r.signers : [];
       const k = signNotes.get(id);
@@ -5390,7 +5409,7 @@
         acts.appendChild(b);
       }
       for (const o of options) {
-        const rec = o && o.key === r.recommended;
+        const rec = o && o.key === (nc ? nc.recommended : r.recommended);      // a card's rec is the signed one
         const b = el("button", "undo-btn question-option sign-option" + (rec ? " question-rec" : ""), "(" + String(o.key) + ") " + String(o.text));
         b.type = "button";
         b.title = "sign: " + String(o.line);
@@ -5434,6 +5453,7 @@
         signInFlight.get(id).add(() => { lock(false); if (freeze) freeze.release(); });
       }
       wrap.appendChild(acts);
+      if (nc) wrap.appendChild(window.LevainCardFormat.drawDetail(nc, options));
       if (unsettled) {          // the last answer may still sign: nothing here is offered until the cockpit settles it
         lock(true);
         for (const x of acts.querySelectorAll("input")) x.readOnly = x.disabled = true;

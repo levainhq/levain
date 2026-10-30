@@ -807,6 +807,13 @@
   // refused); a request the server refused (a character that can show differently from its bytes, a malformed file)
   // shows only why, and can be denied. A note kept across redraws belongs to the version it was made on: a changed
   // file drops it, and what the server says of the request now (refused, no passkey) is shown, never kept
+  // the card card_format.js reads from a sign request, or null (not a needs-phill message it reads exactly, no parser
+  // loaded, or one that throws): null draws the message whole, as before
+  function needsCard(r) {
+    const F = window.LevainCardFormat;
+    if (!F || typeof F.parseMessage !== "function" || typeof F.drawHead !== "function") return null;
+    try { return F.parseMessage(r.message, r); } catch (e) { return null; }
+  }
   function signCard(r, signNote, linked) {
     const card = el("article", "req sign" + (linked ? " linked" : ""));
     const head = el("div", "req-head");
@@ -821,9 +828,13 @@
     const kept = notes.get(key);
     if (r.refused) show("not signable: " + r.refused, "bad");
     else if (kept) show(kept[0], kept[1]);
+    // a needs-phill message card_format.js reads exactly is drawn as the sheet draws it: headline, the signed text
+    // collapsed above the controls, Detail after them. Any other message, or no parser loaded, is one visible block
+    const nc = r.refused ? null : needsCard(r);
     if (!r.refused) {
       if (r.requester) card.appendChild(el("div", "where", "from " + r.requester));
-      card.appendChild(el("pre", "display", typeof r.message === "string" ? r.message : ""));
+      const msg = el("pre", "display", typeof r.message === "string" ? r.message : "");
+      card.appendChild(nc ? window.LevainCardFormat.drawHead(nc, msg) : msg);
       if (r.expires_at) card.appendChild(el("div", "where", "until " + r.expires_at));
     }
     const actions = el("div", "actions");
@@ -884,7 +895,7 @@
         actions.appendChild(b);
       }
       for (const o of options) {
-        const rec = o.key === r.recommended;
+        const rec = o.key === (nc ? nc.recommended : r.recommended);      // a card's rec is the signed one
         const b = el("button", "allow option" + (rec ? " recommended" : ""), "(" + o.key + ") " + o.text);
         if (rec) b.appendChild(el("span", "rec", "recommended"));
         b.type = "button";
@@ -949,7 +960,9 @@
     d.type = "button";
     d.addEventListener("click", () => signDeny(r, say));
     actions.appendChild(d);
-    card.append(actions, note);
+    card.append(actions);
+    if (nc) card.appendChild(window.LevainCardFormat.drawDetail(nc, options));
+    card.appendChild(note);
     // an answer whose reply was lost and that the port had not settled may still sign: nothing that signs is offered,
     // and the port is asked about it again; a settled answer redraws the list
     const pend = signUnsettled.get(r.id);

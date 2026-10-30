@@ -258,7 +258,8 @@ def test_the_recommended_option_is_marked_never_selected(tmp_path: Path, passkey
     assert "recommended 'z' is not one of the request's option keys" in rows["np-rec00002-aaaa"]["refused"]
     js = (Path(__file__).parents[1] / "levain" / "templates" / "web" / "phone.js").read_text()
     card = js[js.index("function signCard("):js.index("function signWith(")]
-    assert 'o.key === r.recommended' in card and '" recommended"' in card and 'el("span", "rec", "recommended")' in card
+    # a needs-phill card marks the signed message's rec (card_format.js parseMessage refuses a request disagreeing with it)
+    assert 'o.key === (nc ? nc.recommended : r.recommended)' in card and '" recommended"' in card and 'el("span", "rec", "recommended")' in card
     assert not any(w in card for w in (".focus(", "autofocus", ".checked", ".click()", ".selected", "aria-pressed"))
     rec = sign("np-rec00001-aaaa", "a")     # the recommendation is not signed: the bytes are option (a)'s alone
     signed = json.loads((tmp_path / "sign" / "np-rec00001-aaaa.signed.json").read_text())["signed_message"]
