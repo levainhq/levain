@@ -35,13 +35,32 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   the session id in the caller's environment under one user id, so a seat that sets the coordinator's session id is
   recorded as the coordinator and may set `quiet` or `sleep`; the record shows intent and does not stop a process that
   lies about its environment. Covered by tests; not run by hand on a real machine.
-- **The cockpit has a read-only Coordinator panel.** It shows the coordinator's wake state and the reason `levain coord
+- **The cockpit has a Coordinator panel.** It shows the coordinator's wake state and the reason `levain coord
   status` gives for it, verbatim, then who holds the lease and until when, the coordinator setting, and the latest
   launches with their cause. The state is one of `held`, `launching`, `idle`, `unset`, `backoff`, `stopped` or `wake`.
   The panel opens the store read-only. A lapse or a pending launch's expiry that is due but not yet written is applied
   to an in-memory copy, so the state row matches the CLI's, and the lease and launch rows say the write is not
-  recorded. Covered by tests, including a real-browser test with one fixture store per wake state; it has no buttons
-  (Start, Stop and Hold are not in it).
+  recorded. Covered by tests, including a real-browser test with one fixture store per wake state. Its buttons are the
+  next entry.
+- **The Coordinator panel has Start, Stop and Hold.** Start asks for a coordinator now by the rules a drop runs (it
+  waits out a backoff and starts nothing while the coordinator is stopped) and starts it; a Start that is refused
+  names the panel's own state and reason. Stop releases the coordinator lease, voids a pending launch and ends a
+  running one, and the serve's watcher stops that launch's session on its next pass. Hold takes the lease for 30
+  minutes: a pending launch is voided, a running coordinator ends, and drops queue for you. A retry of the same tap
+  repeats nothing, and a Hold whose lease cannot be read back says so instead of failing. The three buttons exist only
+  on a serve that runs the watcher; an embedding server that runs its own passes `make_server(coordinator_verbs=True)`.
+  Covered by tests, including real-browser
+  tests; not run by hand on a real machine, and a real session stopped from the panel has not been watched.
+- **`levain serve --write` supervises the coordinator.** While the serve is up it runs the pass `levain coord watch`
+  runs, every 30 seconds: it starts a pending launch nobody started, ends a launch whose session is gone, beats the
+  live holder's lease and stops the session of a launch that is over. It reads the directory the Coordinator panel
+  reads, and a directory with no coordinator store is not watched and not created. A pass and a hand-run `levain coord
+  watch` take one lock, so they never stop the same thing twice. A pass that faults is one line in the serve log, and a
+  standing refusal such as "claude is not on PATH" is logged once and again when it changes. A launch finds `claude` on
+  the PATH a login unit gives the serve. Covered by tests; a real serve under launchd stopping a real session has not
+  been run by hand. Known edges: the serve's daemon unit does not carry `LEVAIN_HOME` (only `install-feeds` does), so
+  a daemon-installed serve reads the default store; a hand-run `levain coord watch --once` exits 0 when the serve's
+  pass held the lock.
 - **The cockpit's Board tab groups the ready queue under column headings, and the panel's ⤢ view draws the six columns.**
   The columns are backlog, ready, running, waiting, needs-you and done, each heading with its count. A downstream panel
   can declare the new `board` value kind with levain's `board.json` value; the kernel checks its shape only. That
