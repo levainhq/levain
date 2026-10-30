@@ -7,7 +7,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Fixed
-- **A cockpit with no question store no longer draws the Needs you band, or a line saying it could not be read.** An
+- **A cockpit with no question store no longer draws the Needs you band, or a note that it could not be recorded.** An
   absent `questions.db` (no file, or an empty one) draws nothing in the band: no heading and no note, because nothing was
   ever filed. A store that has content but cannot be read, is locked or lacks its identity row keeps its "the band could
   not be recorded just now" line. The band also says it may be missing items when an authority source could not be read, when a second
