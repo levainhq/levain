@@ -1246,23 +1246,29 @@ def _prompt_sha(prompt: Any) -> str | None:
 def _write_turn(directory: Path | str, session: str, fact: TurnFact, prompt: Any) -> None:
     """The turn record (``{kind, viewer, coord, band, session, at, sha}``, one file per session, replaced atomically):
     this prompt's :class:`TurnFact`, which the Stop hook and the transcript read instead of deciding again. ``sha``
-    names the prompt it was written for. A coordinator session's record replaces the previous coordinator session's,
-    which is removed. Never raises."""
+    names the prompt it was written for. A record lives until its own session's Stop removes it (a live coordinator
+    launch keeps its record while another launch prompts); a record nobody removed is collected by age
+    (:func:`_gc_turns`). Never raises."""
     try:
         f = _session_file(directory, session, "turn.rec")
         _replace(f, json.dumps({"kind": fact.kind, "viewer": fact.viewer, "coord": fact.coord, "band": fact.band,
                                 "session": session, "at": time.time_ns(), "sha": _prompt_sha(prompt)}))
-        if fact.coord:
-            owner = _claim_file(directory, COORDINATOR_VIEWER).with_name(
-                _claim_file(directory, COORDINATOR_VIEWER).name + ".turn-owner")
-            try:
-                prev = owner.read_text().strip()
-            except FileNotFoundError:
-                prev = ""
-            if prev != f.name:
-                _replace(owner, f.name)
-                if prev.startswith("s-") and prev.endswith(".turn.rec") and "/" not in prev:
-                    _remove_if(f.with_name(prev), None)
+        _gc_turns(f)
+    except Exception:
+        pass
+
+
+TURN_RECORD_MAX_AGE_S = 24 * 3600
+
+
+def _gc_turns(keep: Path) -> None:
+    """Remove turn records older than a day (a session that died before its Stop). Age is the only test: a live
+    session's record is never judged by another session's prompt. Never raises."""
+    try:
+        cutoff = time.time() - TURN_RECORD_MAX_AGE_S
+        for old in keep.parent.glob("s-*.turn.rec"):
+            if old != keep and old.stat().st_mtime < cutoff:
+                old.unlink(missing_ok=True)
     except Exception:
         pass
 

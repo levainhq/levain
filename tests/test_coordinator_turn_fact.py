@@ -147,14 +147,21 @@ def test_a_second_coordinator_session_keeps_the_firsts_staged_view(rig):
     assert json.loads(rig.stop("done", sid=SID_B) or "{}").get("decision") == "block"  # and B's own stage survived A's Stop
 
 
-def test_a_new_coordinator_session_removes_the_previous_turn_record(rig):
-    """complement 3: one turn record per coordinator launch, never removed."""
-    rig.ups("hello coordinator")
+def test_a_new_coordinator_session_keeps_a_live_launchs_turn_record_and_age_collects_a_dead_one(rig):
+    """L3 r2 codex HIGH: launch B's prompt deleted launch A's still-live record, so A's Stop (with a transient launch-row
+    fault) classed A as attended and let a band-dropping reply pass. A record leaves with its own Stop, or by age."""
+    import os
+    rig.ups("hello coordinator")                                    # A
     second_launch(rig)
-    rig.ups("hi", sid=SID_B)
+    rig.ups("hi", sid=SID_B)                                        # B prompts while A is live
+    recs = sorted((rig.qdir / "band_stop").glob("s-*.turn.rec"))
+    assert len(recs) == 2                                           # A's record survived B's prompt
+    old = recs[0]
+    os.utime(old, (1, 1))                                           # a record nobody removed, a day old
     second_launch(rig, sid="sess-coord-launch-c")
     rig.ups("hey", sid="sess-coord-launch-c")
-    assert len(list((rig.qdir / "band_stop").glob("*.turn.*"))) == 1
+    left = sorted((rig.qdir / "band_stop").glob("s-*.turn.rec"))
+    assert old not in left and len(left) == 2
 
 
 def test_the_transcript_kind_reads_no_store(rig, monkeypatch):
