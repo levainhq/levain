@@ -1,6 +1,6 @@
 // The CARD FORMAT for a needs-phill item's long text (Phill 10-30, "8a"): pure layout parsing, no DOM. It only SPLITS the
 // text the desk wrote and never changes a word. The only things it takes off are the structural tokens that become layout:
-// a label's colon, a " - " list marker, and a " · " separator under OPTIONS. Ported from flowConnect's Shared/NPCard.swift
+// a label's colon, a " - " list marker, and a " · " separator under OPTIONS. Ported from the iOS app's NPCard.swift
 // (the reference); tests/card_format_check.js pins the invariant against real rows.
 //
 // The shape the desk writes: a headline sentence, then `WHAT: ... OPTIONS: (a) x · (b) y REC: a BLOCKS: ...`, with a
