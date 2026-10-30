@@ -60,9 +60,12 @@ for (let i = 0; i < 80 && !targets; i++) { try { targets = await (await fetch(`h
 if (!targets) { console.error("chrome never answered"); done(2); }
 const ws = new WebSocket(targets.find((t) => t.type === "page").webSocketDebuggerUrl);
 await new Promise((r) => ws.addEventListener("open", r));
-let id = 0; const pend = new Map(); const posts = [];
+let id = 0; const pend = new Map(); const posts = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
+  if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
+  if (trail.length > 50) trail.shift();          // a page refused in a loop keeps its last 50
+  if (d.method === "Page.javascriptDialogOpening") trail.push(`dialog declined: ${d.params.type} ${String(d.params.message).slice(0, 80)}`);
   if (d.method === "Network.requestWillBeSent" && d.params.request.method === "POST") {
     posts.push(d.params.request.url.replace(/^https?:\/\/[^/]+/, "") + " " + (d.params.request.postData || ""));
   }
@@ -104,7 +107,9 @@ const shotOnTimeout = async (n) => {
     writeFileSync(p, Buffer.from(r.result.data, "base64"));
     console.error(`screenshot at the timeout: ${p}`);
     const t = await evaluateOutcome("document.body.innerText", 3000);
-    if (typeof t.value === "string") writeFileSync(p.replace(/\.png$/, ".txt"), t.value);
+    // the page's own state beside its text: which tab, which address, which kept keys (a timeout names where the page was)
+    const st = await evaluateOutcome("JSON.stringify({mode: document.body.dataset.mode, hash: location.hash, ready: document.readyState, local: Object.keys(localStorage), session: Object.keys(sessionStorage), savedMode: (() => { try { return [localStorage, sessionStorage].map((x) => Object.keys(x).filter((k) => /mode/i.test(k)).map((k) => k + '=' + x.getItem(k))); } catch (e) { return String(e); } })()})", 3000);
+    if (typeof t.value === "string") writeFileSync(p.replace(/\.png$/, ".txt"), "PAGE STATE: " + (typeof st.value === "string" ? st.value : JSON.stringify(st)) + "\nREFUSALS AND PROMPTS: " + JSON.stringify(trail) + "\n" + t.value);
   } catch {}
 };
 let authenticatorId = null;   // the virtual authenticator an `authenticator` step made (a `user_verified` step changes it)
@@ -165,7 +170,10 @@ for (const s of steps) {
     let v = null, lastError = null;
     for (;;) {
       // an error outcome never satisfies the wait (a context destroyed by a navigation is transient: keep polling)
-      const o = await evaluateOutcome(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`, Math.max(deadline - Date.now(), 250));
+      // each poll gets a slice of the deadline, not all of it: an evaluate sent while the page navigates can go unanswered
+      // for good (CI run 40994737528: one such call held the whole 20 s), and the next poll finds the new document
+      // (so a promise-returning `until` must settle inside one slice, 3 s; the longest in tests/ is 1.5 s)
+      const o = await evaluateOutcome(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`, Math.min(Math.max(deadline - Date.now(), 250), 3000));
       if ("error" in o) { lastError = o.error; v = null; } else v = o.value;
       if (v || Date.now() >= deadline) break;
       await sleep(100);

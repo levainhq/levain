@@ -714,6 +714,7 @@
 
   let heldNext = null;
   async function loadManifestView(passive) {
+    const usedToken = storedToken();      // the credential this read goes out with: a decline drops that one, never a newer one
     let manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
     // A writable install that wants a token and read the manifest without one (a loopback read needs none)
     // would draw every action refused. Ask for the token now, then read again as that credential.
@@ -721,8 +722,11 @@
     const wantsToken = !!(manifest && manifest.transport && manifest.transport.write_token_required === true
       && cred && cred.class === "none");
     if (wantsToken && !passive && !tokenDeclined) {
-      if (promptForToken()) manifest = await authedReadJson("/cockpit/manifest.json");
-      else { tokenDeclined = true; dropToken(); }
+      // a newer token stored meanwhile (another tab, an earlier page of this tab) is read with, never prompted over: the prompt
+      // itself drops a paired device's token first, so the comparison has to come before it
+      if (storedToken() !== usedToken) manifest = await authedReadJson("/cockpit/manifest.json");
+      else if (promptForToken()) manifest = await authedReadJson("/cockpit/manifest.json");
+      else { tokenDeclined = true; if (storedToken() === usedToken) dropToken(); }   // a decline drops the token it read with, not a newer one
     }
     const fetchedAt = Date.now();
     const ids = Object.keys(manifest.panels);
