@@ -169,3 +169,78 @@ def test_the_transcript_is_found_by_its_session_record_else_by_the_session_id(tm
     sub.mkdir(parents=True)
     assert quote.locate_transcript("claude_code", SID, [sub]) == far   # the record, found from a subdirectory
     assert quote.locate_transcript("claude_code", "../../etc/passwd", [sub]) is None
+
+
+def test_a_turn_or_a_drop_dated_in_the_future_is_not_evidence(tmp_path):
+    tx = _write(tmp_path / "t.jsonl", [_claude(NOW + 3600, "I am heading out for the evening"),
+                                        _claude(NOW + 60, "back on the train in a minute")])
+    assert not quote.match_transcript(tx, "claude_code", "heading out for the evening", now=NOW).verified   # an hour ahead
+    assert quote.match_transcript(tx, "claude_code", "back on the train", now=NOW).verified   # inside the clock skew
+    db = sqlite3.connect(tmp_path / "dispatch.db")
+    db.execute("CREATE TABLE drops (drop_id TEXT PRIMARY KEY, words TEXT, received_at TEXT)")
+    db.execute("INSERT INTO drops VALUES ('d-f', 'closing my eyes now, hold everything', ?)", (_iso(NOW + 3600),))
+    db.commit()
+    db.close()
+    m = quote.match_drop(tmp_path, "d-f", "hold everything", now=NOW)
+    assert not m.verified and "future" in m.why
+
+
+def test_a_lookup_that_fails_is_an_unverified_quote_never_a_traceback(tmp_path, monkeypatch):
+    monkeypatch.setattr(band, "agent_process", lambda: "claude_code")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SID)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    from levain.coordinator import first_reader
+    monkeypatch.setattr(first_reader, "is_coordinator_session", lambda directory, sess: False)
+    q = tmp_path / "q"
+    q.mkdir()
+    gone = tmp_path / "cwd-gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()   # the seat's working directory was removed under it
+    ns = argparse.Namespace(queue_dir=q, word="away", duration=None, said="heading out for the evening", drop=None)
+    assert cli._word(ns) == 0
+    assert read_word(q)["word"] == "away" and read_word(q)["verified"] is False
+    monkeypatch.chdir(tmp_path)
+
+    proj = tmp_path / "claude" / "projects" / "-x"
+    proj.mkdir(parents=True)
+    real_exists = quote.Path.exists
+    vanished = proj / f"{SID}.jsonl"   # globbed, then removed before its stat
+    monkeypatch.setattr(quote.Path, "glob", lambda self, pat: iter([vanished]))
+    monkeypatch.setattr(quote.Path, "exists", lambda self: True if self == vanished else real_exists(self))
+    m = quote.match("claude_code", SID, "heading out for the evening", now=NOW, roots=[tmp_path / "work"])
+    assert not m.verified
+
+    def no_home():
+        raise RuntimeError("Could not determine home directory")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    monkeypatch.setattr(quote.Path, "home", staticmethod(no_home))
+    m = quote.match("claude_code", SID, "heading out for the evening", now=NOW, roots=[tmp_path / "work"])
+    assert not m.verified and "RuntimeError" in m.why
+
+
+def test_a_seat_set_word_from_before_the_check_reads_as_unverified(tmp_path):
+    set_word(tmp_path, "away", by=SEAT, said="heading out now", now=NOW - 100,
+             match=quote.Match(True, NOW - 200, "the quote is in an operator turn of the transcript"))
+    path = tmp_path / "webpush" / presence.FILE_NAME
+    rec = json.loads(path.read_text())
+    del rec["verified"]   # the record a seat wrote before P2
+    path.write_text(json.dumps(rec))
+    assert describe(tmp_path, idle=lambda: 10.0).endswith("heading out now (unverified)")
+    assert read_word(tmp_path)["verified"] is False
+
+
+def test_an_over_long_line_is_counted_in_the_reason_and_a_cut_first_line_is_dropped_whole(tmp_path, monkeypatch):
+    monkeypatch.setattr(quote, "_LINE_CAP", 400)
+    big = _claude(NOW - 300, "heading out for the evening " + "x" * 600)
+    tx = _write(tmp_path / "t.jsonl", [big, _claude(NOW - 200, "some other turn entirely")])
+    m = quote.match_transcript(tx, "claude_code", "heading out for the evening", now=NOW)
+    assert not m.verified and "1 over-long line" in m.why
+    turn = json.dumps(_claude(NOW - 100, "closing my eyes now, hold everything"))
+    cut = "y" * 401 + turn   # one line; the window starts inside it, and its tail past one _LINE_CAP is valid JSON
+    path = tmp_path / "cut.jsonl"
+    path.write_text("{}\n" + cut + "\n" + json.dumps(_claude(NOW - 50, "a later turn of his")) + "\n")
+    monkeypatch.setattr(quote, "MAX_BYTES", path.stat().st_size - 4)   # the tail starts one byte into the cut line
+    assert not quote.match_transcript(path, "claude_code", "hold everything", now=NOW).verified
+    assert quote.match_transcript(path, "claude_code", "a later turn of his", now=NOW).verified

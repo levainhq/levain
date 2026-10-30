@@ -108,9 +108,16 @@ def _evidence(by: dict, said: str | None, qdir: Path, drop: str | None):
 
     from levain.webpush import quote
 
-    roots = [Path(p) for p in (os.environ.get("CLAUDE_PROJECT_DIR"), os.getcwd()) if p and os.path.isabs(p)]
-    return quote.match(by["agent"], by["session"], said or "", now=time.time(), roots=roots, directory=qdir,
-                       drop=drop if by["role"] == "coordinator" else None)
+    try:
+        cwd = os.getcwd()
+    except OSError:   # the working directory was removed: that root is dropped
+        cwd = None
+    roots = [Path(p) for p in (os.environ.get("CLAUDE_PROJECT_DIR"), cwd) if p and os.path.isabs(p)]
+    try:
+        return quote.match(by["agent"], by["session"], said or "", now=time.time(), roots=roots, directory=qdir,
+                           drop=drop if by["role"] == "coordinator" else None)
+    except (OSError, RuntimeError, ValueError) as e:
+        return quote.Match(False, None, f"transcript check failed ({type(e).__name__})")
 
 
 def _word(args: argparse.Namespace) -> int:

@@ -133,8 +133,9 @@ def _provenance(got: dict) -> dict:
     agent, session = _clean(by.get("agent"), _FIELD_MAX), _clean(by.get("session"), _FIELD_MAX)
     if not agent:
         return {}
+    # a record from before the quote check carries no ``verified``: it was never checked
     return {"by": {"agent": agent, "session": session, "role": by["role"]}, "said": said,
-            **({"verified": got["verified"]} if isinstance(got.get("verified"), bool) else {})}
+            "verified": got.get("verified") is True}
 
 
 def _valid(got: object) -> dict | None:
@@ -546,6 +547,6 @@ def describe(queue_dir: Path | str, *, now: float | None = None,
     if word is not None and "by" in word:
         by = word["by"]
         who = f"{by['agent']} {by['session']}".strip()
-        flag = " (unverified)" if word.get("verified") is False else ""
+        flag = " (unverified)" if word.get("verified") is not True else ""
         line += f"; set by {'the coordinator ' if by['role'] == 'coordinator' else ''}{who} from your words: {word['said']}{flag}"
     return line

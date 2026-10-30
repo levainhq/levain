@@ -17,15 +17,18 @@ What counts as an operator turn:
   and never as a prompt. The drop's ``received_at`` is when he said it.
 
 The quote matches when, after case and whitespace are folded, it is at least :data:`MIN_CHARS` long and a substring of
-one of the last :data:`TURNS` operator turns, and that turn is no more than :data:`WINDOW_SECS` old. A transcript that
-is missing, unreadable, oversized beyond :data:`MAX_BYTES` (its tail is read) or of an unknown agent is a
-:class:`Match` with ``verified`` False and the reason, never an error: the cheap error stays cheap.
+one of the last :data:`TURNS` operator turns, and that turn is no more than :data:`WINDOW_SECS` old and no more than
+:data:`SKEW_SECS` in the future (a turn or drop dated ahead of the clock is not evidence). A transcript that is missing,
+unreadable, oversized beyond :data:`MAX_BYTES` (its tail is read) or of an unknown agent, and a lookup that fails
+(a removed working directory, no home directory, a file gone between listing and reading), is a :class:`Match` with
+``verified`` False and the reason, never an error: the cheap error stays cheap.
 
 Stdlib only.
 """
 from __future__ import annotations
 
 import collections
+import contextlib
 import hashlib
 import json
 import os
@@ -36,12 +39,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-__all__ = ["MAX_BYTES", "MIN_CHARS", "Match", "TURNS", "WINDOW_SECS", "locate_transcript", "match", "match_drop",
-           "match_transcript"]
+__all__ = ["MAX_BYTES", "MIN_CHARS", "Match", "SKEW_SECS", "TURNS", "WINDOW_SECS", "locate_transcript", "match",
+           "match_drop", "match_transcript"]
 
 MIN_CHARS = 12
 TURNS = 20
 WINDOW_SECS = 6 * 3600
+SKEW_SECS = 120
 MAX_BYTES = 128 << 20
 _LINE_CAP = 1 << 20
 _SID = re.compile(r"[A-Za-z0-9_-]{8,80}")
@@ -116,31 +120,45 @@ def _codex_turn(d: dict) -> tuple[float, str] | None:
     return (at, text) if text and at is not None else None
 
 
+def _in_window(now: float, at: float) -> bool:
+    return -SKEW_SECS <= now - at <= WINDOW_SECS
+
+
+def _drain(fh) -> None:
+    """Read to the end of the current line, in :data:`_LINE_CAP` pieces."""
+    while True:
+        rest = fh.readline(_LINE_CAP)
+        if not rest or rest.endswith(b"\n"):
+            return
+
+
 def _lines(path: Path):
-    """The transcript's lines (bytes), at most :data:`MAX_BYTES` of its tail, a line over :data:`_LINE_CAP` skipped."""
+    """The transcript's lines (bytes), at most :data:`MAX_BYTES` of its tail; a line over :data:`_LINE_CAP` is skipped
+    and yields ``None`` in its place, so the caller can count it. The cut first line of a tail is dropped whole."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise OSError("not a regular file")
+        fh = os.fdopen(fd, "rb")   # owns fd from here
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise
+    with fh:
         start = max(0, st.st_size - MAX_BYTES)
-        with os.fdopen(os.dup(fd), "rb") as fh:
-            fh.seek(start)
-            if start:
-                fh.readline(_LINE_CAP)   # the cut first line
-            while True:
-                line = fh.readline(_LINE_CAP + 1)
-                if not line:
-                    return
-                if len(line) > _LINE_CAP and not line.endswith(b"\n"):
-                    while True:
-                        rest = fh.readline(_LINE_CAP)
-                        if not rest or rest.endswith(b"\n"):
-                            break
-                    continue
-                yield line
-    finally:
-        os.close(fd)
+        fh.seek(start)
+        if start:
+            _drain(fh)   # the cut first line
+        while True:
+            line = fh.readline(_LINE_CAP + 1)
+            if not line:
+                return
+            if len(line) > _LINE_CAP and not line.endswith(b"\n"):
+                _drain(fh)
+                yield None
+                continue
+            yield line
 
 
 def match_transcript(path: Path | str, agent: str, said: str, *, now: float) -> Match:
@@ -152,8 +170,12 @@ def match_transcript(path: Path | str, agent: str, said: str, *, now: float) -> 
         return _no(f"no transcript reader for agent {agent!r}")
     turn = _claude_turn if agent == "claude_code" else _codex_turn
     turns: collections.deque[tuple[float, str]] = collections.deque(maxlen=TURNS)
+    long = 0
     try:
         for line in _lines(Path(path)):
+            if line is None:
+                long += 1
+                continue
             if not any(tok in line for tok in _FILTER[agent]):
                 continue
             try:
@@ -165,17 +187,21 @@ def match_transcript(path: Path | str, agent: str, said: str, *, now: float) -> 
                 turns.append(got)
     except OSError as e:
         return _no(f"transcript unreadable ({type(e).__name__})")
+    skipped = f" ({long} over-long lines skipped)" if long else ""
     if not turns:
-        return _no("no operator turn in the transcript")
-    hits = [at for at, text in turns if now - at <= WINDOW_SECS and needle in _fold(text)]
+        return _no(f"no operator turn in the transcript{skipped}")
+    hits = [at for at, text in turns if _in_window(now, at) and needle in _fold(text)]
     if hits:
         return Match(True, max(hits), "the quote is in an operator turn of the transcript")
     return _no(f"the quote is in none of the last {min(len(turns), TURNS)} operator turns within "
-               f"{WINDOW_SECS // 3600} h")
+               f"{WINDOW_SECS // 3600} h{skipped}")
 
 
 def match_drop(directory: Path | str, drop_id: str, said: str, *, now: float) -> Match:
-    """Find ``said`` in the words of drop ``drop_id`` in the coordinator store under ``directory`` (read-only)."""
+    """Find ``said`` in the words of drop ``drop_id`` in the coordinator store under ``directory`` (read-only).
+
+    Any row in ``drops`` is trusted as his words: a process under the same uid could write one. Like the rest of this
+    module, the check records intent; it is not a boundary."""
     needle = _fold(said)
     if len(needle) < MIN_CHARS:
         return _no(f"the quote is under {MIN_CHARS} characters")
@@ -190,13 +216,15 @@ def match_drop(directory: Path | str, drop_id: str, said: str, *, now: float) ->
             row = conn.execute("SELECT words, received_at FROM drops WHERE drop_id = ?", (drop_id,)).fetchone()
         finally:
             conn.close()
-    except sqlite3.Error as e:
+    except (sqlite3.Error, OSError) as e:
         return _no(f"the coordinator store cannot be read ({type(e).__name__})")
     if row is None:
         return _no(f"no drop {drop_id}")
     at = _stamp(row[1])
     if at is None:
         return _no(f"drop {drop_id} has no readable time")
+    if now - at < -SKEW_SECS:
+        return _no(f"drop {drop_id} is dated in the future")
     if now - at > WINDOW_SECS:
         return _no(f"drop {drop_id} is older than {WINDOW_SECS // 3600} h")
     if needle not in _fold(str(row[0])):
@@ -233,10 +261,16 @@ def locate_transcript(agent: str, session: str, roots: list[Path]) -> Path | Non
     if agent == "claude_code":   # the session's working directory is not this process's: the id names the file
         cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
         base = Path(cfg) if cfg and os.path.isabs(cfg) else Path.home() / ".claude"
-        hits = sorted(base.glob(f"projects/*/{session}.jsonl"), key=lambda p: p.stat().st_mtime if p.exists() else 0)
-        hits = [h for h in hits if h.is_file() and not h.is_symlink()]
-        if hits:
-            return hits[-1]
+        dated = []
+        for h in base.glob(f"projects/*/{session}.jsonl"):
+            try:
+                st = h.lstat()   # a file gone since the listing is skipped
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                dated.append((st.st_mtime, h))
+        if dated:
+            return max(dated, key=lambda t: t[0])[1]
     return None
 
 
@@ -244,8 +278,13 @@ def match(agent: str, session: str, said: str, *, now: float, roots: list[Path] 
           directory: Path | str | None = None, drop: str | None = None) -> Match:
     """The strongest evidence for ``said`` from the setter's transcript and, for the coordinator, the named drop:
     verified when either finds it (the newer ``said_at`` wins), else the transcript's reason."""
-    path = locate_transcript(agent, session, roots or [])
-    got = match_transcript(path, agent, said, now=now) if path is not None else _no("no transcript found for the session")
+    try:
+        path = locate_transcript(agent, session, roots or [])
+    except (OSError, RuntimeError, ValueError) as e:   # no home directory, a root that cannot be listed
+        got = _no(f"transcript check failed ({type(e).__name__})")
+    else:
+        got = (match_transcript(path, agent, said, now=now) if path is not None
+               else _no("no transcript found for the session"))
     if drop and directory is not None:
         other = match_drop(directory, drop, said, now=now)
         if other.verified and (not got.verified or (other.said_at or 0.0) > (got.said_at or 0.0)):
