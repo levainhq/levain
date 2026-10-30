@@ -542,6 +542,49 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     return q, text
 
 
+# the coordinator's own item: filed once while open under this key, closed by the panel's Start, Stop or Hold
+COORDINATOR_STOPPED_KEY = "levain-coordinator-stopped"
+_STOPPED_OPTIONS = [("hold", "Hold it myself: you take the coordinator lease"),
+                    ("stop", "Stop: release the coordinator, the next drop asks for a fresh one")]
+
+
+def file_coordinator_stopped(qdir: Path | str, agent: str, why: str) -> Question | None:
+    """Put the coordinator's stop on the band: one open item, however many deaths follow the third. ``agent`` is the
+    band's name for the coordinator's harness, ``why`` the panel's own text for the state. The item is numbered by the
+    band when it is first shown, as every item is. Its ping goes out once, with the item. Returns the item when this
+    call filed it, ``None`` when one was already open or nothing could be written; never raises (the death that
+    called it is already recorded)."""
+    try:
+        text = _plain_line(why)
+        q, filed = QuestionStore(qdir).file_once(
+            agent=agent, key=COORDINATOR_STOPPED_KEY,
+            what="The coordinator stopped after three deaths in a row; nothing launches until you look.",
+            options=_STOPPED_OPTIONS, rec="stop", blocks=f"every new coordinator launch. {text}"[:300],
+            cwd=os.path.abspath(str(qdir)))
+        if not filed:
+            return None
+        _send_ping(agent, q, Path(qdir))
+        return q
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None
+
+
+def _plain_line(text: str) -> str:
+    return " ".join(str(text).split())[:600]
+
+
+def close_coordinator_stopped(qdir: Path | str, *, option: str | None = None, text: str | None = None
+                              ) -> Question | None:
+    """Close the coordinator's open stop item through the band's answer write, as the operator's own act from the
+    cockpit: ``option`` (``hold`` or ``stop``) when the verb he pressed is one of the item's options, else ``text``
+    saying which verb it was. ``None`` when none is open. Never raises: the verb that called it has already changed
+    the coordinator."""
+    try:
+        return QuestionStore(qdir).close_open(COORDINATOR_STOPPED_KEY, option=option, text=text, channel="cockpit")
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None
+
+
 def run_ask(args: argparse.Namespace, out: Any = None) -> int:
     """``levain ask``: file the question, ping, return at once."""
     out = out if out is not None else sys.stdout

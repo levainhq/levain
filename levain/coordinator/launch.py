@@ -481,7 +481,35 @@ def _harness_id(row: dict[str, Any]) -> str | None:
     return None
 
 
+_BAND_AGENT = {"claude": "claude_code", "codex": "codex"}
+
+
+def _note_stopped(store: CoordStore) -> None:
+    """When the deaths on record have made the coordinator ``stopped``, put it on the band (one open item, however
+    often this runs). Never raises: it follows a death that is already written, and the next pass tries again."""
+    try:
+        st = store.coord_status()
+        chosen = st.get("setting")
+        agent = _BAND_AGENT.get(chosen["agent"]) if isinstance(chosen, dict) else None
+        if st.get("wake") != "stopped" or agent is None:
+            return
+        from levain.consent.band import file_coordinator_stopped
+
+        file_coordinator_stopped(store.directory, agent, str(st.get("why", "")))
+    except Exception:  # noqa: BLE001 - see the docstring
+        return
+
+
 def launch_session(store: CoordStore, launch_id: str) -> Outcome:
+    """:func:`_launch_session`, then the band is told when the launch that did not start made the coordinator
+    ``stopped``."""
+    out = _launch_session(store, launch_id)
+    if not out.started:
+        _note_stopped(store)
+    return out
+
+
+def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
     """Start launch ``launch_id``'s session (see the module docstring for the steps). Every way it does not start is
     an :class:`Outcome` with ``started`` False and the refusal; the launch is written ``failed`` with that cause
     whenever this call held the spawn. The checks that need no spawn (its directory, the hook, the briefs directory)
@@ -746,6 +774,7 @@ def watch_once(store: CoordStore) -> list[str]:
         try:
             _watch_pass(store, lines)
         finally:
+            _note_stopped(store)                                   # never raises
             lines.extend(release_held_pings(store.directory))      # never raises
     return lines
 

@@ -53,6 +53,14 @@ def _faults() -> tuple[type[BaseException], ...]:
     return (sqlite3.Error, OSError, JobStoreError)
 
 
+def _close_stopped(store: Any, *, option: str | None = None, text: str | None = None) -> None:
+    """A verb that changed the coordinator closes its open ``stopped`` item on the band, through the band's own
+    answer write (a refusal raised before this call closes nothing)."""
+    from levain.consent.band import close_coordinator_stopped
+
+    close_coordinator_stopped(store.directory, option=option, text=text)
+
+
 class CoordinatorVerbs:
     """Start, Stop and Hold over the coordinator store in ``directory()`` (the dispatch directory the panel reads, named on
     each fire). ``clock`` is the instant the panel's state is judged at and the store's clock; ``launcher`` starts a
@@ -126,6 +134,7 @@ class CoordinatorVerbs:
             # another writer moved the store between the read and the wake's own transaction
             word, why = self._state(store)
             raise EditError("refused", 409, f"{word}: {why}", {"state": word, "why": why})
+        _close_stopped(store, text="Start pressed on the cockpit's Coordinator panel")
         started = self._start_thread(store, launch.launch_id)
         said = (f"coordinator launch {launch.launch_id} asked for; it is starting now and the panel shows how it went"
                 if started else
@@ -136,6 +145,7 @@ class CoordinatorVerbs:
     def stop(self, _scope: Any, _params: dict[str, Any], _target: dict[str, Any], _confirm: bool) -> dict[str, Any]:
         store = self._store()
         ended = self._write(store.coord_release, "nothing was released")
+        _close_stopped(store, option="stop")
         held = None if ended is None else {"holder": ended.holder, "token": ended.token}
         said = ("released" + ("" if ended is None else f" {ended.holder}'s lease (token {ended.token})")
                 + "; pending launches are voided and running coordinator launches ended; the serve's watcher stops "
@@ -145,6 +155,7 @@ class CoordinatorVerbs:
     def hold(self, _scope: Any, _params: dict[str, Any], _target: dict[str, Any], _confirm: bool) -> dict[str, Any]:
         store = self._store()
         token = self._write(lambda: store.coord_take(hold=HOLD), "nothing was taken")
+        _close_stopped(store, option="hold")
         held = self._write(store.coord_lease, "the hold was taken")
         until = held.until if held is not None and held.token == token else None
         return {"token": token, "until": until,

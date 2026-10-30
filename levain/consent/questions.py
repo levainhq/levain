@@ -487,6 +487,46 @@ class QuestionStore:
         the agent's session needs, stored as given: unsigned, never authority. ``link`` ties one of its options to
         the consent request already filed for that option's call (its ``question_id`` is ignored: it is this
         question), written in the same transaction, so a question never names a link it does not have."""
+        return self._file(False, agent=agent, agent_session_id=agent_session_id, what=what, options=options, rec=rec,
+                          blocks=blocks, cwd=cwd, resume=resume, link=link)[0]
+
+    def file_once(self, *, agent: str, key: str, what: str, options: Any, rec: str, blocks: str, cwd: str
+                  ) -> tuple[Question, bool]:
+        """File a question a system source raises for a standing condition, once while it is open. ``key`` names the
+        source in the question's session field (no session's hook ever claims it); the check and the insert run in one
+        write transaction, so two writers racing file one. Returns ``(question, filed)``: the open question that
+        holds ``key`` already when there is one (``filed`` False), else the one just filed."""
+        return self._file(True, agent=agent, agent_session_id=key, what=what, options=options, rec=rec, blocks=blocks,
+                          cwd=cwd, resume=None, link=None)
+
+    def close_open(self, key: str, *, option: str | None = None, text: str | None = None, channel: str
+                   ) -> Question | None:
+        """Answer the open question :meth:`file_once` filed under ``key`` with exactly one of ``option`` or ``text``,
+        by the rules :meth:`answer` holds. ``None`` when none is open (nothing written)."""
+        if (option is None) == (text is None):
+            raise ConsentError("answer with exactly one of an option key or free text")
+        if channel not in ANSWER_CHANNELS:
+            raise ConsentError(f"channel must be one of {', '.join(ANSWER_CHANNELS)}: {channel!r}")
+        if text is not None and (not text.strip() or len(text) > _TEXT_MAX or "\x00" in text):
+            raise ConsentError(f"text must be 1 to {_TEXT_MAX} characters, not only whitespace, with no NUL")
+        with self._peek() as conn:
+            if conn is None:
+                return None
+        with self._write() as conn:
+            row = conn.execute(f"{_select(conn)} WHERE a.question_id IS NULL AND q.agent_session_id = ? "
+                               "ORDER BY q.n LIMIT 1", (key,)).fetchone()
+            if row is None:
+                return None
+            q = self._question_of(row)
+            if option is not None and option not in {k for k, _ in q.options}:
+                raise ConsentError(f"{option!r} is not an option of question #{q.n}")
+            kind, value = ("option", option) if option is not None else ("text", text)
+            conn.execute("INSERT INTO answers (question_id, kind, value, channel, answered_at) VALUES (?, ?, ?, ?, ?)",
+                         (q.id, kind, value, channel, utc_stamp(_now_utc(self._clock))))
+        return q
+
+    def _file(self, once: bool, *, agent: str, agent_session_id: str, what: str, options: Any, rec: str, blocks: str,
+              cwd: str, resume: dict[str, Any] | None, link: Link | None) -> tuple[Question, bool]:
         what, opts, blocks = self.check(agent=agent, agent_session_id=agent_session_id, what=what, options=options,
                                         rec=rec, blocks=blocks, cwd=cwd)
         try:
@@ -506,6 +546,11 @@ class QuestionStore:
         qid = "q-" + os.urandom(12).hex()
         stamp = utc_stamp(_now_utc(self._clock))
         with self._write() as conn:
+            if once:
+                row = conn.execute(f"{_select(conn)} WHERE a.question_id IS NULL AND q.agent_session_id = ? "
+                                   "ORDER BY q.n LIMIT 1", (agent_session_id,)).fetchone()
+                if row is not None:
+                    return self._question_of(row), False
             conn.execute("INSERT INTO questions (id, agent, agent_session_id, what, options, rec, blocks, cwd, "
                          "filed_at, resume) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                          (qid, agent, agent_session_id, what, json.dumps(opts, ensure_ascii=False), rec, blocks,
@@ -516,7 +561,7 @@ class QuestionStore:
                              (qid, link.option, link.kind, link.request_id, link.queue_id, stamp))
             made = self._by_ref(conn, qid)
         assert made is not None
-        return made
+        return made, True
 
     def get(self, ref: Any) -> Question | None:
         """A question by its id (``q-…``), its number, or ``#n`` / ``n`` as a string; ``None`` if there is none."""
