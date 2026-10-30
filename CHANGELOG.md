@@ -7,6 +7,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Fixed
+- **On macOS, a Codex session signed in with a ChatGPT subscription runs in a slot instead of failing with
+  `account/read -32603`.** Codex syncs its managed preferences at start, and a slot account whose home was `/var/empty`
+  could not. The slot accounts that run vendor CLIs now have a root-owned, empty home, `L/vendorhome`, made by setup,
+  repair and replenish; the session also gets `SSL_CERT_FILE=/etc/ssl/cert.pem`, so Codex's TLS reaches chatgpt.com from
+  inside the slot. `levain doctor` gains an `agent slot homes` row: an install from before this change reports upgrade
+  pending (and exits that way) until `levain upgrade --no-pip` runs; a wrong owner, mode or a non-empty
+  `Library/Preferences` reports broken. Run once in a macOS test VM with a real ChatGPT login (two turns answered); not
+  run on Linux, where nothing changes.
 - **A cockpit with no question store no longer draws the Needs you band, or a note that it could not be recorded.** An
   absent `questions.db` (no file, or an empty one) draws nothing in the band: no heading and no note, because nothing was
   ever filed. A store that has content but cannot be read, is locked or lacks its identity row keeps its "the band could
