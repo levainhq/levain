@@ -1751,7 +1751,10 @@
     const sr = data.search || {};
     const rowKind = data.kind === "list" || data.kind === "count-queue" || data.kind === "roster" || data.kind === "log";
     s.searchable = rowKind && sr.on === true && !(ctx && ctx.widget);
-    if (!s.searchable) s.query = "";     // a filter saved for a panel that has no filter box must not filter it
+    // a board carries the box on its panel face and in its focus view, and keeps the saved query on both (one query per panel, as
+    // setQuery shares it), so a refresh that rebuilds the state never drops what is being typed
+    const boardBox = data.kind === "board" && !(ctx && ctx.widget);
+    if (!s.searchable && !boardBox) s.query = "";     // a filter saved for a panel that has no filter box must not filter it
     s.carry = root.LevainDashboard && root.LevainDashboard.buildKept ? root.LevainDashboard.buildKept() : null;
     s.shape = shapeOf(ctx && ctx.entry ? ctx.entry : { title: s.title }, data);
     if (data.kind === "count-queue") {
@@ -1764,14 +1767,12 @@
     }
     // the focus view of a long metric list carries the same filter box a long list does (and starts unfiltered: a saved query would hide metrics)
     const metricsOf = data.kind === "status-dots" ? data.metrics : data.kind === "metric-grid" ? data.numbers : null;
-    // a board (the board kind) always carries the box, on the panel face and in its focus view: it is as long as its queue is
-    s.filterable = (!!(ctx && ctx.modal) && !(ctx && ctx.widget) && Array.isArray(metricsOf) && metricsOf.length >= FILTER_MIN)
-      || (data.kind === "board" && !(ctx && ctx.widget));
+    s.filterable = (!!(ctx && ctx.modal) && !(ctx && ctx.widget) && Array.isArray(metricsOf) && metricsOf.length >= FILTER_MIN) || boardBox;
     // a fresh open starts unfiltered; the SAME open modal rebuilt by a refresh keeps the query being typed in it
-    // (a count-face panel's modal is the same: a saved query would hide a newly waiting row behind "1 of 3"); a board's panel face
-    // keeps its own the same way
-    if (s.filterable || (s.searchable && s.modal && data.face === "count")) {
-      const prev = Array.from(states).find((o) => !!o.modal === !!s.modal && o.pid === data.pid && o.body.isConnected && (o.filterable || o.searchable));
+    // (a count-face panel's modal is the same: a saved query would hide a newly waiting row behind "1 of 3"). A board is neither:
+    // its query is the saved one.
+    if ((s.filterable && !boardBox) || (s.searchable && s.modal && data.face === "count")) {
+      const prev = Array.from(states).find((o) => o.modal && o.pid === data.pid && o.body.isConnected && (o.filterable || o.searchable));
       s.query = prev ? prev.query : "";
     }
     if (s.searchable || s.filterable) p.appendChild(buildFilter(s));
@@ -1813,6 +1814,7 @@
     const V = root.LevainBoardView;
     if (!V || typeof V.boardModel !== "function" || typeof V.renderGrouped !== "function" || typeof V.renderBoard !== "function"
         || typeof V.filterModel !== "function" || typeof V.countLabel !== "function") {
+      if (s.countEl) s.countEl.textContent = "";
       s.body.appendChild(el("p", "xnote", "The board view did not load, so this board is not drawn."));
       return;
     }
@@ -1822,6 +1824,7 @@
       if (s.countEl) s.countEl.textContent = V.countLabel(f);
       if (s.modal) V.renderBoard(document, s.body, f.model); else V.renderGrouped(document, s.body, f.model);
     } catch (e) {
+      if (s.countEl) s.countEl.textContent = "";      // a count never stands beside a board that is not drawn
       s.body.replaceChildren(el("p", "err", "unavailable — the board could not be drawn"));
     }
   }

@@ -142,6 +142,23 @@ def test_the_text_fields_refuse_an_invisible_character_and_a_runaway_length() ->
     assert _panel(ok)["status"] == "ok"
 
 
+def test_a_depends_on_is_a_bounded_list_of_bounded_display_safe_ids() -> None:
+    """L3 r1 (codex MED). `depends_on` is drawn as a line of ids, so the kernel bounds it: null or a list of at most
+    BOARD_DEPENDS_MAX non-empty, display-safe strings of at most BOARD_TEXT_MAX characters."""
+    from levain.cockpit.engine import BOARD_DEPENDS_MAX, BOARD_TEXT_MAX
+    where = "value.columns[1].cards[0].depends_on"
+    _refused(_value(ready=[_card("x", depends_on="flow:a")]), where, "list")
+    _refused(_value(ready=[_card("x", depends_on=[{"id": "a"}])]), where + "[0]", "string")
+    _refused(_value(ready=[_card("x", depends_on=["a", None])]), where + "[1]", "string")
+    _refused(_value(ready=[_card("x", depends_on=[""])]), where + "[0]", "non-empty")
+    _refused(_value(ready=[_card("x", depends_on=["a‮b"])]), where + "[0]", "display-safe")
+    _refused(_value(ready=[_card("x", depends_on=["d" * (BOARD_TEXT_MAX + 1)])]), where + "[0]", str(BOARD_TEXT_MAX))
+    _refused(_value(ready=[_card("x", depends_on=[f"d{i}" for i in range(BOARD_DEPENDS_MAX + 1)])]), where, str(BOARD_DEPENDS_MAX))
+    ok = _value(ready=[_card("x", depends_on=[f"d{i}" for i in range(BOARD_DEPENDS_MAX)]), _card("y", depends_on=None),
+                       _card("z", depends_on=[])])
+    assert _panel(ok)["status"] == "ok"
+
+
 def test_a_compact_read_of_a_board_is_counts_and_a_link_not_the_cards() -> None:
     """L3 r1 (complement LOW #4). The phone's compact profile reduces a board as it reduces a topology: per-column counts, the
     queue's own state, and the link to the full read; no card goes out."""
@@ -310,6 +327,11 @@ def test_a_board_kind_panel_carries_a_filter_and_a_count_and_draws_no_line_for_a
             {"until": f"{panel}.querySelectorAll('.bd-row').length === 1"},
             {"eval": facts(pnl)},
             {"shot": str(shots / "board_filter_face_typed.png")},
+            # a refresh that rebuilds the panel keeps what was typed (L3 r1): the old node is gone, the query and the narrowing stay
+            {"eval": f"window.__old = {panel}; document.getElementById('refresh').click(); 1"},
+            {"until": f"{panel} && {panel} !== window.__old && {panel}.querySelector('.xfilter-input') && 1"},
+            {"until": f"{panel}.querySelectorAll('.bd-row').length === 1"},
+            {"eval": "JSON.stringify({kept: document.querySelector('[data-ck-panel=boardkind] .xfilter-input').value})"},
             {"eval": f"({typ})({json.dumps('[data-ck-panel=boardkind] .xfilter-input')}, '')"},
             {"until": f"{panel}.querySelectorAll('.bd-row').length === 5"},
             {"eval": f"{panel}.querySelector('.phead .pexpand').click(); 1"},
@@ -328,6 +350,8 @@ def test_a_board_kind_panel_carries_a_filter_and_a_count_and_draws_no_line_for_a
     assert face["done"].count("done when: outbox cut and pushed") == 1 and len(face["done"]) == 5, face          # the done line is drawn
     assert face["deps"] == ["after: flow:a"], face                                                                 # and what a card comes after
     assert narrowed["rows"] == 1 and narrowed["heads"] == 6 and narrowed["count"] == "1 of 5", narrowed             # narrows cards, keeps columns
+    kept = json.loads(next(x for x in out["values"] if isinstance(x, str) and x.startswith('{"kept"')))
+    assert kept == {"kept": "reader"}, kept                                                                        # a refresh keeps the query
     assert modal_all["deps"] == ["after: flow:a"] and len(modal_all["done"]) == 5, modal_all
     assert modal_all["rows"] == 5 and modal_all["journal"] == 0 and modal_all["heads"] == 6 and modal_all["count"] == "5 cards", modal_all
     assert modal_narrow["rows"] == 1 and modal_narrow["heads"] == 6 and modal_narrow["count"] == "1 of 5", modal_narrow   # folds case

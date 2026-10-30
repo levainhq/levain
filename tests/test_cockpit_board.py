@@ -418,3 +418,6 @@ def test_the_filter_matches_folded_text_with_every_term_and_counts_cards_and_a_c
     assert f["miss"]["ids"] == [] and f["miss"]["label"] == "0 of 3" and f["miss"]["cols"] == 6
     assert f["band"]["ids"] == ["q-1"]                                 # a Needs-you band card is filtered like any other
     assert f["noJournal"] == "" and f["journal"].startswith("as of read: desk")
+    g = f["folded2"]
+    assert g["marks"] == 1 and g["deps"] == ["x", "5"] and g["label"] == 1 and g["after"] == 1, g
+    assert g["colKeys"] == ["cards", "category"], g                    # a filtered column keeps every key the model gave it
