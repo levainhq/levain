@@ -145,7 +145,8 @@ def test_the_serve_runs_the_watcher_while_it_is_up_and_ends_it_with_the_serve(st
 
     ln = started(store)
     store.coord_release()
-    monkeypatch.setattr(supervise, "default_store", lambda: store)
+    asked: list = []
+    monkeypatch.setattr(supervise, "default_store", lambda directory=None: asked.append(directory) or store)
     passed = threading.Event()
     real = cl.watch_once
 
@@ -163,6 +164,9 @@ def test_the_serve_runs_the_watcher_while_it_is_up_and_ends_it_with_the_serve(st
         write_token = None
         closed = False
 
+        class consent_reader:                           # the directory the Coordinator panel and its verbs read
+            directory = tmp_path / "panel-dir"
+
         def serve_forever(self):
             assert passed.wait(30)                      # the serve is up; no terminal watcher runs
             raise KeyboardInterrupt
@@ -174,13 +178,14 @@ def test_the_serve_runs_the_watcher_while_it_is_up_and_ends_it_with_the_serve(st
     assert ws.run_web_server(tmp_path, open_browser=False, write=True) == 0
     assert fake.stops() == [["stop", HID]] and store.launch(ln.launch_id).state == "ended"
     assert _Httpd.closed and watcher_threads() == []
+    assert asked and set(asked) == {tmp_path / "panel-dir"}        # the watcher reads where the panel reads
 
 
 def test_a_read_only_serve_runs_no_watcher(tmp_path, monkeypatch):
     import levain.web_server as ws
 
     calls = []
-    monkeypatch.setattr(supervise, "default_store", lambda: calls.append(1))
+    monkeypatch.setattr(supervise, "default_store", lambda directory=None: calls.append(1))
     monkeypatch.setattr(ws, "_resolve_source", lambda p: _source(tmp_path))
 
     class _Httpd:
@@ -570,3 +575,72 @@ def test_under_launchds_minimal_path_a_claude_nowhere_refuses_in_the_serve_log(s
 def test_a_claude_on_path_is_taken_as_it_is(fake):
     exe, env = cl._harness()
     assert exe == str(fake.dir / "claude") and env["PATH"] == os.environ["PATH"]
+
+
+# --- L3 r1: the store probe, the stop gate, a standing fault, a faulted setting check --------------------------------
+def test_a_file_with_only_the_job_stores_tables_is_no_coordinator_store_and_the_probe_makes_none(tmp_path):
+    from levain.dispatch.jobs import DB_NAME, JobStore
+
+    d = tmp_path / "q"
+    JobStore(d)._connect()                    # the job store's own file, made the way it makes it
+    assert (d / DB_NAME).exists()
+    assert supervise.default_store(d) is None
+    con = sqlite3.connect(str(d / DB_NAME))
+    try:
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        con.close()
+    assert not any(t.startswith("coord") for t in tables), tables       # the probe added no coordinator table
+
+
+def test_a_store_the_coordinator_has_used_is_found_in_its_directory(store):
+    found = supervise.default_store(store.directory)
+    assert found is not None and Path(found.directory) == Path(store.directory)
+
+
+def test_a_stop_that_has_returned_lets_no_pass_begin(store, monkeypatch):
+    calls = []
+    monkeypatch.setattr(cl, "watch_once", lambda s: calls.append(1) or [])
+    w = supervise.Watcher(lambda: store, every=0.01, emit=lambda l: None)
+    assert w.stop(5)                           # stopped before it ever started
+    w.start()
+    assert w.stop(5)
+    time.sleep(0.1)
+    assert calls == [] and watcher_threads() == []
+
+
+def test_a_standing_fault_is_one_line_until_it_changes(store, monkeypatch):
+    seen = []
+
+    def once(s):
+        seen.append(1)
+        raise RuntimeError("lock refused")
+
+    monkeypatch.setattr(cl, "watch_once", once)
+    out: list[str] = []
+    w = supervise.Watcher(lambda: store, every=0.02, emit=out.append).start()
+    try:
+        assert w.wait_passes(4, 30)
+    finally:
+        assert w.stop(10)
+    assert len(seen) >= 4 and out == ["watch pass faulted (RuntimeError: lock refused); next pass in 0.02s"]
+
+
+def test_a_setting_check_that_faulted_is_tried_again_on_the_next_pass(store, monkeypatch):
+    tries = []
+
+    def migrate(s):
+        tries.append(1)
+        if len(tries) == 1:
+            raise RuntimeError("dispatch.db locked")
+        return ["workspace moved"]
+
+    monkeypatch.setattr(cl, "migrate_setting", migrate)
+    monkeypatch.setattr(cl, "watch_once", lambda s: [])
+    out: list[str] = []
+    w = supervise.Watcher(lambda: store, every=0.02, emit=out.append).start()
+    try:
+        assert w.wait_passes(4, 30)
+    finally:
+        assert w.stop(10)
+    assert len(tries) == 2 and "workspace moved" in out        # the second try succeeded, and it is the last

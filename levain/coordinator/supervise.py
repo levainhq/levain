@@ -24,6 +24,7 @@ from __future__ import annotations
 import sys
 import threading
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 __all__ = ["DEFAULT_EVERY", "Watcher", "default_store"]
@@ -33,14 +34,19 @@ _STOP_WAIT = 30.0             # seconds stop() waits for a pass in flight before
 _THREAD_NAME = "levain-coord-watcher"
 
 
-def default_store() -> Any:
-    """The coordinator store a hand-run ``levain coord watch`` watches by default, or None when it was never made (a
-    read makes none)."""
+def default_store(directory: Any = None) -> Any:
+    """The coordinator store in ``directory`` (None: the default a hand-run ``levain coord watch`` watches), or None
+    while the coordinator's tables are not in its file. ``dispatch.db`` is the job store's file too, so the file proves
+    nothing: the store's own read-only opener is the probe, and it creates nothing."""
     from levain.coordinator.envelopes import EnvelopeStore
-    from levain.dispatch.jobs import DB_NAME
+    from levain.coordinator.store import StoreAbsent
 
-    store = EnvelopeStore(None)
-    return store if (store.directory / DB_NAME).exists() else None
+    store = EnvelopeStore(None if directory is None else Path(directory))
+    try:
+        store.open_readonly().close()
+    except StoreAbsent:
+        return None
+    return store
 
 
 def _to_log(line: str) -> None:
@@ -58,6 +64,7 @@ class Watcher:
         self.every = every
         self._emit = emit
         self._stop = threading.Event()
+        self._gate = threading.Lock()       # the decision to begin a pass and the decision to stop are one step each
         self._thread: threading.Thread | None = None
         self._last: list[str] | None = None
         self._migrated = False
@@ -84,7 +91,8 @@ class Watcher:
 
     def stop(self, timeout: float = _STOP_WAIT) -> bool:
         """End the thread; whether it ended within ``timeout`` (a pass in flight is waited for that long)."""
-        self._stop.set()
+        with self._gate:
+            self._stop.set()
         t = self._thread
         if t is None or t is threading.current_thread():
             return True
@@ -93,7 +101,10 @@ class Watcher:
 
     def _run(self) -> None:
         # the first pass runs at once: a serve restarted mid-run picks up the coordinator it left without a wait
-        while not self._stop.is_set():
+        while True:
+            with self._gate:
+                if self._stop.is_set():
+                    break
             self.run_pass()
             if self._stop.wait(self.every):
                 break
@@ -109,9 +120,10 @@ class Watcher:
                 lines += self._migrate_once(launch, store)
                 lines += launch.watch_once(store)
         except Exception as exc:  # noqa: BLE001 - one bad pass never ends the watcher (the serve's exit still does)
-            self._last = None
-            self._safe_emit(f"watch pass faulted ({type(exc).__name__}: {str(exc)[:300]}); next pass in "
-                            f"{self.every:g}s")
+            fault = f"watch pass faulted ({type(exc).__name__}: {str(exc)[:300]}); next pass in {self.every:g}s"
+            if self._last != [fault]:
+                self._safe_emit(fault)
+            self._last = [fault]
             lines = None
         else:
             if lines and lines != self._last:
@@ -126,12 +138,14 @@ class Watcher:
 
     def _migrate_once(self, launch: Any, store: Any) -> list[str]:
         """What a hand-run ``levain coord watch`` does before its first pass: check the coordinator setting's workspace,
-        once per watcher and not before a store exists. A fault in it is a line, and the passes still run."""
+        once per watcher and not before a store exists. A fault in it is a line, the passes still run, and the check is tried
+        again on the next pass."""
         if self._migrated:
             return []
-        self._migrated = True
         try:
-            return list(launch.migrate_setting(store))
+            out = list(launch.migrate_setting(store))
+            self._migrated = True
+            return out
         except Exception as exc:  # noqa: BLE001 - the passes still run; the launch re-checks the record anyway
             return [f"the coordinator setting's workspace could not be checked ({type(exc).__name__}: {str(exc)[:300]})"]
 
