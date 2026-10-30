@@ -89,8 +89,8 @@ class Watcher:
         return self
 
     def stop(self, timeout: float = _STOP_WAIT) -> bool:
-        """End the thread; whether it ended within ``timeout``. No pass is begun once the event is set; a pass that began
-        in the instant before it is the pass in flight, and is waited for up to ``timeout``."""
+        """End the thread; whether it ended within ``timeout``. At most one pass can begin after the event is set (the
+        loop checked it just before); that pass is the pass in flight, and is waited for up to ``timeout``."""
         self._stop.set()
         t = self._thread
         if t is None or t is threading.current_thread():
