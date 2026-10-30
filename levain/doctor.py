@@ -1744,9 +1744,8 @@ def reap_held_lines(host: HostOS, source: str) -> tuple[str, ...]:
             layout.repair_line(host) + f" --source {shlex.quote(source)}")
 
 
-# The recovery note under :func:`reap_held_lines`' steps, ONE text for `levain doctor` and `levain upgrade` (which
-# looks it up by name, as it does `reap_held_lines`). Only step 3 reads the copy; step 1 has already stopped the
-# reaper, so a failed 2 or 3 must not leave it stopped.
+# The recovery note under :func:`reap_held_lines`' steps, the one text doctor and upgrade both print. Only step 3
+# reads the copy; step 1 has already stopped the reaper, so a failed 2 or 3 must not leave it stopped.
 REAP_HELD_NOTE = ("If 2 fails, still run 4 (the reaper must not stay stopped) and 5, then look at why: only 3 needs "
                   "the copy. If 3 fails, still run 4 and 5. If 4 fails, run it again before 5.")
 
