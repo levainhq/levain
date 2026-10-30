@@ -86,25 +86,30 @@ def test_the_modal_draws_a_needs_phill_sign_request_as_the_card(tmp_path: Path, 
     assert v[6] == 0, "the question's title, blocks and REC lines are replaced by the card"
     assert v[7].startswith("(a) "), v
     assert v[8] is True and v[11] is True, v
-    assert "Stopped" in v[10] and "BLOCKS" in v[10], v
+    assert "Blocks" in v[10] and "Options" in v[10], v
 
 
 @needs_browser
 @needs_ssh
-def test_a_message_the_card_cannot_read_exactly_leaves_the_modal_as_it_was(tmp_path: Path, monkeypatch) -> None:
-    """An extra signed line (``effect:``) is no card: the question's own title, blocks and REC lines stay, no card nodes."""
+def test_a_message_the_strict_grammar_refuses_is_a_loose_card_with_the_exact_text_open(tmp_path: Path, monkeypatch) -> None:
+    """An extra signed line (``effect:``) is refused by the strict grammar (what is signed is unchanged). The modal still
+    draws the headline and sections, with the exact signed text OPEN, effect line included, above the buttons."""
     rig = _Rig(tmp_path, monkeypatch)
     lines = LONG["message"].split("\n")
-    _refile(rig, "\n".join(lines[:6] + ["effect: delete production data"] + lines[6:]))
+    odd = "\n".join(lines[:6] + ["effect: delete production data"] + lines[6:])
+    _refile(rig, odd)
     with rig.serving() as (url, _h):
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, *_open(rig, url),
-            {"eval": f"document.querySelectorAll('{M} .card-head, {M} .card-detail, {M} .card-signed').length"},
-            {"eval": f"document.querySelectorAll('{M} .needs-q-blocks, {M} .needs-rec').length"},
-            {"eval": f"document.querySelector('{M} .needs-q-title').textContent"},
+            {"until": f"document.querySelector('{M} .card-headline')", "ms": 15000},
+            {"eval": f"document.querySelector('{M} .card-signed').open"},
+            {"eval": f"document.querySelector('{M} .card-signed pre').textContent"},
+            {"eval": f"document.querySelectorAll('{M} .needs-q-title').length"},
+            {"eval": f"document.querySelectorAll('{M} .card-detail').length"},
+            {"eval": "document.documentElement.scrollWidth <= window.innerWidth"},
         ])
-    v = out["values"][-3:]
-    assert v[0] == 0 and v[1] == 2 and v[2] == "Ship the sweep fix tonight or hold it?", v
+    v = out["values"][-5:]
+    assert v == [True, odd, 0, 1, True], v
 
 
 @needs_browser

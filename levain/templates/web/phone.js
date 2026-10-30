@@ -812,7 +812,7 @@
   function needsCard(r) {
     const F = window.LevainCardFormat;
     if (!F || typeof F.parseMessage !== "function" || typeof F.drawHead !== "function") return null;
-    try { return F.parseMessage(r.message, r); } catch (e) { return null; }
+    try { return F.parseMessage(r.message, r) || (typeof F.looseCard === "function" ? F.looseCard(r.message, r) : null); } catch (e) { return null; }
   }
   function signCard(r, signNote, linked) {
     const card = el("article", "req sign" + (linked ? " linked" : ""));

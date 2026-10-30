@@ -268,7 +268,7 @@
     // NPCard); its signed text stays whole, one tap away, above the controls. Any other message, and any needs-phill
     // message parseMessage does not read exactly (it returns null), is one visible block.
     const F = window.LevainCardFormat;
-    const card = !dispatch && !consent && F && typeof F.drawHead === "function" ? F.parseMessage(r.message, r) : null;
+    const card = !dispatch && !consent && F && typeof F.drawHead === "function" ? (F.parseMessage(r.message, r) || (typeof F.looseCard === "function" ? F.looseCard(r.message, r) : null)) : null;
     cardView = card;
     $("sheet-actions").classList.toggle("card-rows", !!card);
     if (card) drawCardHead(body, card, msg);

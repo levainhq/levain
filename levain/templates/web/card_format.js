@@ -195,6 +195,30 @@
     return { repo: got.repo, item: got.item, asked: got.asked, stopped: got.stopped, recommended: recKey, optionLines: optionLines };
   }
 
+  // A needs-phill message the strict grammar refuses (an extra signed line, a recommendation its request does not carry)
+  // still has a headline and a stop text to read: this reads those lines only, for DISPLAY, and marks the result `loose`.
+  // It is never what is signed or what the buttons follow (the request's own recommendation is the card's), and the
+  // caller draws the exact signed text open beside it. Null for anything that is not a flow needs-phill message.
+  function looseCard(message, request) {
+    if (typeof message !== "string" || !request || typeof request !== "object" || request.namespace !== NAMESPACE) return null;
+    const lines = message.split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+    if (lines[0] !== HEADER) return null;
+    const got = {};
+    let signedRec = null;
+    for (const l of lines.slice(1)) {
+      const m = /^(item|repo|asked|stopped): (.*)$/.exec(l);
+      if (m && got[m[1]] !== undefined) return null;     // a key twice: which one is read would be a guess
+      if (m) got[m[1]] = m[2];
+      const r = /^recommended: \(([a-z0-9]{1,8})\) /.exec(l);
+      if (r) signedRec = r[1];
+    }
+    if (!got.asked) return null;
+    // the request's recommendation marks the rows only where the signed message does not name another one
+    let rec = typeof request.recommended === "string" ? request.recommended : "";
+    if (signedRec !== null && signedRec !== rec) rec = "";
+    return { repo: got.repo || "", item: got.item || "", asked: got.asked, stopped: got.stopped || "", recommended: rec, optionLines: [], loose: true };
+  }
+
   // ---- the card's DOM, one builder for every surface that draws it (the sheet, the phone app, the cockpit's focus view).
   // Text only, never HTML. The caller places the nodes and gives them its own ids; nothing here reads the page.
   function node(tag, cls, text) {
@@ -211,24 +235,87 @@
     if (meta) box.appendChild(node("p", "card-meta", meta));
     box.appendChild(node("h2", "card-headline", headline(card.asked).head));
     const raw = node("details", "card-signed");
+    if (card.loose) raw.open = true;     // a message the strict grammar refused: the exact signed text stays in view
     raw.appendChild(node("summary", "", "Signed text, exactly as signed"));
     raw.appendChild(msg);
     box.appendChild(raw);
     return box;
   }
+  // "WHAT" -> "What": a section's label as a heading
+  const titleCase = (l) => String(l).toLowerCase().replace(/(^|[ /-])([a-z])/g, (m, a, b) => a + b.toUpperCase());
+  // a paragraph that is a " · " run of two or more items is a list (R2); every word stays, only the separators go
+  function dotItems(text) {
+    const parts = String(text).split(" · ").map((x) => x.trim());
+    return parts.length >= 2 && parts.every((x) => x) ? parts : null;
+  }
+  function list(items) {
+    const ul = node("ul", "card-list");
+    for (const i of items) ul.appendChild(node("li", "", i));
+    return ul;
+  }
   function drawSections(into, secs) {
     for (const s of secs) {
       const sec = node("div", "card-sec");
-      if (s.label) sec.appendChild(node("div", "card-label", s.label));
+      if (s.label) sec.appendChild(node("h3", "card-label", titleCase(s.label)));
       for (const b of s.blocks) {
-        if (b.kind === "paragraph") { if (b.text) sec.appendChild(node("p", "card-p", b.text)); continue; }
-        sec.appendChild(node("p", "card-p", b.lead));
-        const ul = node("ul", "card-list");
-        for (const i of b.items) ul.appendChild(node("li", "", i));
-        sec.appendChild(ul);
+        if (b.kind === "paragraph") {
+          if (!b.text) continue;
+          const dots = dotItems(b.text);
+          sec.appendChild(dots ? list(dots) : node("p", "card-p", b.text));
+          continue;
+        }
+        if (b.lead) sec.appendChild(node("p", "card-p", b.lead));
+        sec.appendChild(list(b.items));
       }
       into.appendChild(sec);
     }
+  }
+  // the structured options as rows, "(a) text", the recommended one marked "Rec" with the REC section's reason under it
+  function drawOptionRows(rows, rec, why) {
+    const sec = node("div", "card-sec card-options");
+    sec.appendChild(node("h3", "card-label", "Options"));
+    const ul = node("ul", "card-opts");
+    for (const o of rows) {
+      const li = node("li", "card-opt" + (o.key === rec ? " card-opt-rec" : ""));
+      const row = node("div", "card-opt-row");
+      row.appendChild(node("span", "card-opt-key", "(" + o.key + ")"));
+      row.appendChild(node("span", "card-opt-text", o.text));
+      if (o.key === rec) row.appendChild(node("span", "card-rec-mark", "Rec"));
+      li.appendChild(row);
+      if (o.key === rec && why) li.appendChild(node("p", "card-opt-why", why));
+      ul.appendChild(li);
+    }
+    sec.appendChild(ul);
+    return sec;
+  }
+  // `REC: a (reason)` -> the reason after the key when the key is `rec`, else null
+  function recReason(section, rec) {
+    if (!section || section.label !== "REC" || !rec || section.blocks.some((b) => b.kind !== "paragraph")) return null;
+    const m = /^\(?([a-z0-9]{1,8})\)?(?:[.:,;]|\s|$)\s*([\s\S]*)$/i.exec(section.blocks.map((b) => b.text).join(" ").trim());
+    return m && m[1] === rec ? m[2].trim() : null;
+  }
+  // one display of a long text, for every surface (R1-R3): the lead paragraph (off when it repeats `dropping`), one headed
+  // section per label, lists for " - " and " · " runs, and the options once as rows from `options` ({key, text|label}) with
+  // the recommended one marked and the REC reason under it. An OPTIONS section that does not match the rows stays drawn.
+  // Display only: every word of `text` is drawn but the structural tokens.
+  function drawBody(into, text, dropping, options, rec) {
+    const rows = (options || []).map((o) => ({ key: String(o.key), text: String(o.text !== undefined ? o.text : o.label) }));
+    const all = sections(text || "", dropping);
+    let why = null;
+    let secs = all;
+    let at = -1;     // where the rows go: where the prose OPTIONS/REC sat
+    if (rows.length) {
+      const rs = all.find((x) => x.label === "REC");
+      why = recReason(rs, rec);
+      const first = all.findIndex((x) => x.label === "OPTIONS" || x.label === "REC");
+      const gone = (x) => repeatsRows(x, rows, rec) || (why !== null && x === rs);
+      secs = all.filter((x) => !gone(x));
+      at = first < 0 ? -1 : all.slice(0, first).filter((x) => !gone(x)).length;
+    }
+    drawSections(into, at < 0 ? secs : secs.slice(0, at));
+    if (rows.length) into.appendChild(drawOptionRows(rows, rec, why));
+    if (at >= 0) drawSections(into, secs.slice(at));
+    return into;
   }
   // Detail, collapsed: the rest of the question, the stop (less an OPTIONS/REC section that only repeats the rows), and the
   // signed options in full. `rec` is the card's own, the signed message's recommendation (parseMessage refused a request
@@ -241,21 +328,12 @@
     const inner = node("div", "card-detail-body");
     const rest = headline(card.asked).rest;
     if (rest) drawSections(inner, sections(rest));
-    if (card.stopped) {
-      inner.appendChild(node("div", "card-label card-label-top", "Stopped"));
-      drawSections(inner, sections(card.stopped, card.asked).filter((s) => !repeatsRows(s, full, rec)));
-    }
-    if (card.optionLines.length) {
-      const sec = node("div", "card-sec");
-      sec.appendChild(node("div", "card-label", "Options, in full"));
-      for (const o of full) sec.appendChild(node("p", "card-p", "(" + o.key + ") " + o.text + (o.key === rec ? " — Rec" : "")));
-      inner.appendChild(sec);
-    }
+    drawBody(inner, card.stopped || "", card.asked, full, rec);
     det.appendChild(inner);
     return det;
   }
 
-  const api = { collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, drawHead, drawDetail };
+  const api = { collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, drawHead, drawDetail, drawBody };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);

@@ -4531,6 +4531,13 @@
     }
     return t;
   }
+  // a question's long text drawn by card_format.js: headed sections, lists, and the options once as rows (text only); null when
+  // the module is not loaded or throws, and the caller draws the one line it drew before
+  function questionText(text, dropping, options, rec) {
+    const F = window.LevainCardFormat;
+    if (!F || typeof F.drawBody !== "function" || !text) return null;
+    try { return F.drawBody(el("div", "card-body needs-q-body"), text, dropping, options, rec); } catch (e) { return null; }
+  }
   // `card` (the Needs-you strip's card) draws the mock's anatomy: the question as a bold title, "blocks: ...", then "REC key. words";
   // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
   function drawQuestionBody(q, slot, b, card) {
@@ -4549,7 +4556,7 @@
     if (card) {
       parts.push(el("div", "needs-q-title", sv(b.what)));
       const more = blocksBeyondTitle(sv(b.what), sv(b.blocks));
-      if (more) parts.push(el("div", "ext-meta needs-q-blocks", "blocks: " + more));
+      if (more) parts.push(questionText(more, null, options, sv(b.rec)) || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
       const recOpt = options.find((o) => o && sv(o.key) === sv(b.rec));
       if (sv(b.rec)) {
         const rl = el("div", "needs-rec");
@@ -4561,7 +4568,9 @@
       parts.push(el("pre", "consent-display", sv(b.what)));
       const facts = el("div", "consent-facts");
       facts.appendChild(el("span", "ext-meta", "recommends " + sv(b.rec)));
-      facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
+      const formatted = questionText(sv(b.blocks), null, options, sv(b.rec));
+      if (formatted) facts.appendChild(formatted);
+      else facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
       parts.push(facts);
     }
     const a = b.answer && typeof b.answer === "object" ? b.answer : null;
@@ -5247,7 +5256,7 @@
   function signCardOf(r) {
     const F = window.LevainCardFormat;
     if (!F || typeof F.parseMessage !== "function" || typeof F.drawHead !== "function") return null;
-    try { return F.parseMessage(r.message, r); } catch (e) { return null; }
+    try { return F.parseMessage(r.message, r) || (typeof F.looseCard === "function" ? F.looseCard(r.message, r) : null); } catch (e) { return null; }
   }
   // the card's part for request `id`: a note line, then the request's own buttons, filled once the listing answers.
   // `head`: the focus view's question lines a needs-phill card replaces (signCardOf), else none

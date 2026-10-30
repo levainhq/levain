@@ -1,0 +1,264 @@
+[
+ {
+  "row": {
+   "ts": 1793386024.216015,
+   "iso": "2026-10-30T14:47:04",
+   "event": "add",
+   "id": "np-7ccb104e",
+   "repo": "flow",
+   "what": "Please put a recovery copy of the new VPS backup password in your password manager (1 minute, only you can).",
+   "stopped": "Please put a recovery copy of the new VPS backup password in your password manager (1 minute, only you can). WHAT: I minted the restic password for the VPS's two backup repositories into the laptop login keychain (service `flow-backup-restic`, account `vps`). If the laptop keychain is lost, the VPS backups cannot be decrypted without a second copy. STEPS: Keychain Access -> search `flow-backup-restic` -> show password, copy it into your password manager as \"flow VPS restic\". Check it against fingerprint sha256:6c347d163f324b79 (first 16 hex of the sha256 of the password). Never paste it anywhere else. OPTIONS: (a) do it now \u00b7 (b) before the first real backup (I hold the timers until you say done) REC: a BLOCKS: enabling the timers (my gate); everything up to repo-init proceeds meanwhile.",
+   "seat": "1030+29 flow-seat",
+   "dated": null,
+   "origin_key": "npk-e4c3e936f3014941bd46c3848440947d",
+   "owner_install": "flow-3ce2832a8fe94ea7",
+   "options": [
+    {
+     "key": "a",
+     "text": "do it now"
+    },
+    {
+     "key": "b",
+     "text": "before the first real backup (I hold the timers until you say done)"
+    }
+   ],
+   "rec": "a"
+  },
+  "message": "flow needs-phill answer\nitem: np-7ccb104e\nrow_version: v1\nrepo: flow\nasked: Please put a recovery copy of the new VPS backup password in your password manager (1 minute, only you can).\nstopped: Please put a recovery copy of the new VPS backup password in your password manager (1 minute, only you can). WHAT: I minted the restic password for the VPS's two backup repositories into the laptop login keychain (service `flow-backup-restic`, account `vps`). If the laptop keychain is lost, the VPS backups cannot be decrypted without a second copy. STEPS: Keychain Access -> search `flow-backup-restic` -> show password, copy it into your password manager as \"flow VPS restic\". Check it against fingerprint sha256:6c347d163f324b79 (first 16 hex of the sha256 of the password). Never paste it anywhere else. OPTIONS: (a) do it now \u00b7 (b) before the first real backup (I hold the timers until you say done) REC: a BLOCKS: enabling the timers (my gate); everything up to repo-init proceeds meanwhile.\nrecommended: (a) do it now\nnonce: nnnnnnnnnnnnnnnn\nfiled: 2026-10-30T20:00:00Z",
+  "request": {
+   "namespace": "flow-needs-phill",
+   "options": [
+    {
+     "key": "a",
+     "text": "do it now"
+    },
+    {
+     "key": "b",
+     "text": "before the first real backup (I hold the timers until you say done)"
+    }
+   ],
+   "recommended": "a"
+  }
+ },
+ {
+  "row": {
+   "ts": 1793387457.429891,
+   "iso": "2026-10-30T15:10:57",
+   "event": "add",
+   "id": "np-fe6969d8",
+   "repo": "flow",
+   "what": "Please revoke the B2 key `flow-step1-admin` (B2 console, 1 minute); I am done with it and deleted its file.",
+   "stopped": "Please revoke the B2 key `flow-step1-admin` (B2 console, 1 minute); I am done with it and deleted its file. WHAT: the account-wide admin key you created for the VPS backup setup (it can delete keys and buckets). It was used only from the laptop for b2-plan/apply/verify and two drills; nothing of it ever reached the VPS. The file ~/ClientData/flow-step1/b2-admin.env is deleted. STEPS: B2 console -> App Keys -> `flow-step1-admin` -> Delete. Do NOT touch `flow-vps-restic-i3a` (the VPS's scoped key, in use) or the laptop backup key. OPTIONS: (a) revoke now \u00b7 (b) leave it REC: a BLOCKS: nothing.",
+   "seat": "1030+29 flow-seat",
+   "dated": null,
+   "origin_key": "npk-d5c8c3e1b67e4f1193860c927f9586d7",
+   "owner_install": "flow-3ce2832a8fe94ea7",
+   "options": [
+    {
+     "key": "a",
+     "text": "revoke now"
+    },
+    {
+     "key": "b",
+     "text": "leave it"
+    }
+   ],
+   "rec": "a"
+  },
+  "message": "flow needs-phill answer\nitem: np-fe6969d8\nrow_version: v1\nrepo: flow\nasked: Please revoke the B2 key `flow-step1-admin` (B2 console, 1 minute); I am done with it and deleted its file.\nstopped: Please revoke the B2 key `flow-step1-admin` (B2 console, 1 minute); I am done with it and deleted its file. WHAT: the account-wide admin key you created for the VPS backup setup (it can delete keys and buckets). It was used only from the laptop for b2-plan/apply/verify and two drills; nothing of it ever reached the VPS. The file ~/ClientData/flow-step1/b2-admin.env is deleted. STEPS: B2 console -> App Keys -> `flow-step1-admin` -> Delete. Do NOT touch `flow-vps-restic-i3a` (the VPS's scoped key, in use) or the laptop backup key. OPTIONS: (a) revoke now \u00b7 (b) leave it REC: a BLOCKS: nothing.\nrecommended: (a) revoke now\nnonce: nnnnnnnnnnnnnnnn\nfiled: 2026-10-30T20:00:00Z",
+  "request": {
+   "namespace": "flow-needs-phill",
+   "options": [
+    {
+     "key": "a",
+     "text": "revoke now"
+    },
+    {
+     "key": "b",
+     "text": "leave it"
+    }
+   ],
+   "recommended": "a"
+  }
+ },
+ {
+  "row": {
+   "ts": 1793387642.115745,
+   "iso": "2026-10-30T15:14:02",
+   "event": "add",
+   "id": "np-8d618749",
+   "repo": "flow",
+   "what": "Step 1 I3a soak length before migrate-finalize: it shreds the pre-migration plaintext copy (/home/anneal/tenants.i3a-premigrate) on the Linode system disk after a hash proof. Linode system-disk backups go back on only after this.",
+   "stopped": "migrate-finalize, then Linode backups re-enable",
+   "seat": null,
+   "dated": null,
+   "origin_key": "npk-cf784d2c8a324e6a8160e45fce5b07cb",
+   "owner_install": "flow-3ce2832a8fe94ea7",
+   "options": [
+    {
+     "key": "a",
+     "text": "24 h: finalize Sat 10-31 after 14:45 EDT"
+    },
+    {
+     "key": "b",
+     "text": "48 h: finalize Sun 11-01 after 14:45"
+    },
+    {
+     "key": "c",
+     "text": "72 h"
+    }
+   ],
+   "rec": "a"
+  },
+  "message": "flow needs-phill answer\nitem: np-8d618749\nrow_version: v1\nrepo: flow\nasked: Step 1 I3a soak length before migrate-finalize: it shreds the pre-migration plaintext copy (/home/anneal/tenants.i3a-premigrate) on the Linode system disk after a hash proof. Linode system-disk backups go back on only after this.\nstopped: migrate-finalize, then Linode backups re-enable\nrecommended: (a) 24 h: finalize Sat 10-31 after 14:45 EDT\nnonce: nnnnnnnnnnnnnnnn\nfiled: 2026-10-30T20:00:00Z",
+  "request": {
+   "namespace": "flow-needs-phill",
+   "options": [
+    {
+     "key": "a",
+     "text": "24 h: finalize Sat 10-31 after 14:45 EDT"
+    },
+    {
+     "key": "b",
+     "text": "48 h: finalize Sun 11-01 after 14:45"
+    },
+    {
+     "key": "c",
+     "text": "72 h"
+    }
+   ],
+   "recommended": "a"
+  }
+ },
+ {
+  "row": {
+   "ts": 1793390692.68591,
+   "iso": "2026-10-30T16:04:52",
+   "event": "add",
+   "id": "np-482b89b3",
+   "repo": "blackjack",
+   "what": "BJE grades every play against a 6-deck S17 chart, but Justin plays double deck H17: should v1.6 add rule-aware charts?",
+   "stopped": "BJE grades every play against a 6-deck S17 chart, but Justin plays double deck H17: should v1.6 add rule-aware charts? WHAT: the basic-strategy chart (src/engine/strategy-data.ts, \"Rules: 6-deck, Dealer Stands on Soft 17\") is the only chart; only DAS has an overlay. Deck count and H17 change basic strategy (e.g. double-deck doubles 9v2 and A,8v6 H17; H17 doubles 11vA). Justin's emails: \"mostly interested in double deck\", and he had H17 selected. Today his correct double-deck basic plays get marked WRONG in practice, and Test Out would score them as errors, the exact thing he wants graded. The H17 dealer bug itself is fixed (6498bdb, with late surrender which was also ignored); this is the next layer of the same class. OPTIONS: (a) v1.6 adds rule-aware basic strategy: 1/2/4-8 decks x S17/H17 x DAS x LS, transcribed from a published source (Wizard of Odds tables), each cell tested against the source \u00b7 (b) v1.6 keeps the one 6-deck S17 chart and the UI says so; rule-aware charts go to v1.7 \u00b7 (c) (a) for double deck + 6-deck only (his game + the default), single deck later REC: a. Test Out exists to grade him against his own game; a grader that marks correct plays wrong breaks trust on hand one. It's table data plus one lookup seam, the same overlay shape the DAS fix already uses. BLOCKS: only the chart work. I'm continuing settable IRC, RC deviations with category groups, and RC ramp bands meanwhile (none depend on it).",
+   "seat": "1030+36 blackjack-seat",
+   "dated": null,
+   "origin_key": "npk-a37ac0dbdee54db98dbb5b79d1c755fc",
+   "owner_install": "flow-3ce2832a8fe94ea7",
+   "options": [
+    {
+     "key": "a",
+     "text": "v1.6 adds rule-aware basic strategy: 1/2/4-8 decks x S17/H17 x DAS x LS, transcribed from a published source (Wizard of Odds tables), each cell tested against the source"
+    },
+    {
+     "key": "b",
+     "text": "v1.6 keeps the one 6-deck S17 chart and the UI says so; rule-aware charts go to v1.7"
+    },
+    {
+     "key": "c",
+     "text": "(a) for double deck + 6-deck only (his game + the default), single deck later"
+    }
+   ],
+   "rec": "a"
+  },
+  "message": "flow needs-phill answer\nitem: np-482b89b3\nrow_version: v1\nrepo: blackjack\nasked: BJE grades every play against a 6-deck S17 chart, but Justin plays double deck H17: should v1.6 add rule-aware charts?\nstopped: BJE grades every play against a 6-deck S17 chart, but Justin plays double deck H17: should v1.6 add rule-aware charts? WHAT: the basic-strategy chart (src/engine/strategy-data.ts, \"Rules: 6-deck, Dealer Stands on Soft 17\") is the only chart; only DAS has an overlay. Deck count and H17 change basic strategy (e.g. double-deck doubles 9v2 and A,8v6 H17; H17 doubles 11vA). Justin's emails: \"mostly interested in double deck\", and he had H17 selected. Today his correct double-deck basic plays get marked WRONG in practice, and Test Out would score them as errors, the exact thing he wants graded. The H17 dealer bug itself is fixed (6498bdb, with late surrender which was also ignored); this is the next layer of the same class. OPTIONS: (a) v1.6 adds rule-aware basic strategy: 1/2/4-8 decks x S17/H17 x DAS x LS, transcribed from a published source (Wizard of Odds tables), each cell tested against the source \u00b7 (b) v1.6 keeps the one 6-deck S17 chart and the UI says so; rule-aware charts go to v1.7 \u00b7 (c) (a) for double deck + 6-deck only (his game + the default), single deck later REC: a. Test Out exists to grade him against his own game; a grader that marks correct plays wrong breaks trust on hand one. It's table data plus one lookup seam, the same overlay shape the DAS fix already uses. BLOCKS: only the chart work. I'm continuing settable IRC, RC deviations with category groups, and RC ramp bands meanwhile (none depend on it).\nrecommended: (a) v1.6 adds rule-aware basic strategy: 1/2/4-8 decks x S17/H17 x DAS x LS, transcribed from a published source (Wizard of Odds tables), each cell tested against the source\nnonce: nnnnnnnnnnnnnnnn\nfiled: 2026-10-30T20:00:00Z",
+  "request": {
+   "namespace": "flow-needs-phill",
+   "options": [
+    {
+     "key": "a",
+     "text": "v1.6 adds rule-aware basic strategy: 1/2/4-8 decks x S17/H17 x DAS x LS, transcribed from a published source (Wizard of Odds tables), each cell tested against the source"
+    },
+    {
+     "key": "b",
+     "text": "v1.6 keeps the one 6-deck S17 chart and the UI says so; rule-aware charts go to v1.7"
+    },
+    {
+     "key": "c",
+     "text": "(a) for double deck + 6-deck only (his game + the default), single deck later"
+    }
+   ],
+   "recommended": "a"
+  }
+ },
+ {
+  "row": {
+   "ts": 1793391150.337954,
+   "iso": "2026-10-30T16:12:30",
+   "event": "add",
+   "id": "np-c44a0271",
+   "repo": "flow",
+   "what": "noon desk check: 1030+31 built it as a plain script with no model call, not the 'claude -p --bare' run its brief named, because every claim it checks is mechanical (its weak half is how a claim is worded). Keep it as a script?",
+   "stopped": "nothing; the script is live on flow main 2590534b",
+   "seat": null,
+   "dated": null,
+   "origin_key": "npk-053c5033bdfa4c9086cb612edc2aa14e",
+   "owner_install": "flow-3ce2832a8fe94ea7",
+   "options": [
+    {
+     "key": "a",
+     "text": "keep the script (no model cost)"
+    },
+    {
+     "key": "b",
+     "text": "add a claude -p --bare pass for claim wording"
+    }
+   ],
+   "rec": "a"
+  },
+  "message": "flow needs-phill answer\nitem: np-c44a0271\nrow_version: v1\nrepo: flow\nasked: noon desk check: 1030+31 built it as a plain script with no model call, not the 'claude -p --bare' run its brief named, because every claim it checks is mechanical (its weak half is how a claim is worded). Keep it as a script?\nstopped: nothing; the script is live on flow main 2590534b\nrecommended: (a) keep the script (no model cost)\nnonce: nnnnnnnnnnnnnnnn\nfiled: 2026-10-30T20:00:00Z",
+  "request": {
+   "namespace": "flow-needs-phill",
+   "options": [
+    {
+     "key": "a",
+     "text": "keep the script (no model cost)"
+    },
+    {
+     "key": "b",
+     "text": "add a claude -p --bare pass for claim wording"
+    }
+   ],
+   "recommended": "a"
+  }
+ },
+ {
+  "row": {
+   "ts": 1793392165.606335,
+   "iso": "2026-10-30T16:29:25",
+   "event": "add",
+   "id": "np-33e53967",
+   "repo": "flow",
+   "what": "The cockpit now signs on the bare address: please sign this card from your phone to prove it, before Sunday's care report.",
+   "stopped": "The cockpit now signs on the bare address: please sign this card from your phone to prove it, before Sunday's care report. WHAT: open https://missinglayer.tail1c8687.ts.net (no port) on your phone, find THIS card, tap an answer and approve with Face ID. Since 16:28 port 443 serves the cockpit (it used to be the old levain phone page) and signing is on there. A scratch run already proved the whole care-report signature in a real browser with a test passkey. The one thing no instrument here can do is your phone, your passkey and Face ID on the real address. Your passkey's site name is unchanged (same name, no port), so it should just work. The page's write token is stored per address, so the first visit may ask for it once; the desk can send you the link by our own means (`cockpit_https.py link`, never pasted in a log). The old :8443 address still works for reading until this card is signed; then I retire it. OPTIONS: (a) signed on the bare address, it worked \u00b7 (b) it failed or something looked wrong (say what) REC: a (tap it from the bare address, Face ID approves it, and that tap IS the test) BLOCKS: retiring the old :8443 door, and confidence for Sunday's first signed care report (Nov 1). Nothing else waits on it: the cockpit reads and signs now.",
+   "seat": "1030+35 flow-seat",
+   "dated": null,
+   "origin_key": "npk-859e87c62e0a4603b6e41eb1ca804b1d",
+   "owner_install": "flow-3ce2832a8fe94ea7",
+   "options": [
+    {
+     "key": "a",
+     "text": "signed on the bare address, it worked"
+    },
+    {
+     "key": "b",
+     "text": "it failed or something looked wrong (say what)"
+    }
+   ],
+   "rec": "a"
+  },
+  "message": "flow needs-phill answer\nitem: np-33e53967\nrow_version: v1\nrepo: flow\nasked: The cockpit now signs on the bare address: please sign this card from your phone to prove it, before Sunday's care report.\nstopped: The cockpit now signs on the bare address: please sign this card from your phone to prove it, before Sunday's care report. WHAT: open https://missinglayer.tail1c8687.ts.net (no port) on your phone, find THIS card, tap an answer and approve with Face ID. Since 16:28 port 443 serves the cockpit (it used to be the old levain phone page) and signing is on there. A scratch run already proved the whole care-report signature in a real browser with a test passkey. The one thing no instrument here can do is your phone, your passkey and Face ID on the real address. Your passkey's site name is unchanged (same name, no port), so it should just work. The page's write token is stored per address, so the first visit may ask for it once; the desk can send you the link by our own means (`cockpit_https.py link`, never pasted in a log). The old :8443 address still works for reading until this card is signed; then I retire it. OPTIONS: (a) signed on the bare address, it worked \u00b7 (b) it failed or something looked wrong (say what) REC: a (tap it from the bare address, Face ID approves it, and that tap IS the test) BLOCKS: retiring the old :8443 door, and confidence for Sunday's first signed care report (Nov 1). Nothing else waits on it: the cockpit reads and signs now.\nrecommended: (a) signed on the bare address, it worked\nnonce: nnnnnnnnnnnnnnnn\nfiled: 2026-10-30T20:00:00Z",
+  "request": {
+   "namespace": "flow-needs-phill",
+   "options": [
+    {
+     "key": "a",
+     "text": "signed on the bare address, it worked"
+    },
+    {
+     "key": "b",
+     "text": "it failed or something looked wrong (say what)"
+    }
+   ],
+   "recommended": "a"
+  }
+ }
+]

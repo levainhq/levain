@@ -2669,11 +2669,21 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .card-signed .sheet-message { margin-top: var(--sp-3); }
 .card-detail-body { padding-top: var(--sp-3); }
 .card-sec { margin: 0 0 var(--sp-5); }
-.card-label { margin: 0 0 var(--sp-2); font: var(--fw-bold) var(--fs-micro)/1.3 var(--sans); font-variant-caps: all-small-caps; letter-spacing: .08em; color: var(--label); }
+.card-label { margin: 0 0 var(--sp-2); font: var(--fw-bold) var(--fs-body)/1.3 var(--sans); letter-spacing: normal; text-transform: none; font-variant-caps: normal; color: var(--text); }
 .card-label-top { margin-top: var(--sp-2); }
 .pair-card .card-p { margin: 0 0 var(--sp-3); color: var(--text); overflow-wrap: anywhere; }
 .card-list { margin: 0 0 var(--sp-3); padding-left: var(--sp-5); color: var(--text); font: var(--fw-regular) var(--fs-body)/1.5 var(--sans); }
 .card-list li { margin: 0 0 var(--sp-2); overflow-wrap: anywhere; }
+.needs-card .card-p, .needs-q-body .card-p { margin: 0 0 var(--sp-3); color: var(--text); overflow-wrap: anywhere; line-height: 1.5; }
+.needs-q-body { min-width: 0; }
+.card-opts { list-style: none; margin: 0 0 var(--sp-3); padding: 0; }
+.card-opt { margin: 0 0 var(--sp-3); padding: var(--sp-2) var(--sp-3); border: 1px solid var(--hair); border-radius: var(--r-sm); }
+.card-opt-rec { border-color: var(--ok); }
+.card-opt-row { display: flex; gap: var(--sp-3); align-items: baseline; line-height: 1.45; font: var(--fw-regular) var(--fs-body)/1.45 var(--sans); }
+.card-opt-key { font-weight: var(--fw-bold); color: var(--label); flex: none; }
+.card-opt-text { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--text); }
+.card-rec-mark { flex: none; padding: 1px var(--sp-2); border: 1px solid var(--ok); border-radius: var(--r-sm); font: var(--fw-bold) var(--fs-micro)/1.4 var(--sans); color: var(--ok); }
+.card-opt-why { margin: var(--sp-2) 0 0; color: var(--label); overflow-wrap: anywhere; line-height: 1.45; }
 /* the answers: full-width rows with their whole text, the recommended one first in green and marked */
 .pair-actions.card-rows { flex-direction: column; flex-wrap: nowrap; align-items: stretch; margin-bottom: var(--sp-5); }
 .pair-actions.card-rows .dev-btn { display: block; width: 100%; height: auto; text-align: left; white-space: normal; overflow-wrap: anywhere; line-height: 1.45; padding: var(--sp-3) var(--sp-4); }

@@ -121,12 +121,12 @@ def test_a_needs_phill_card_on_the_phone_is_headline_rows_then_collapsed_detail_
     assert v[7] == "|".join(f"({o['key']}) {o['text']}" + ("recommended" if o["key"] == LONG["rec"] else "")
                             for o in LONG["options"]), v[7]
     assert v[8] == 1 and v[9] is True and v[10] == 0, v
-    assert v[12] is True and "Stopped" in v[13] and "BLOCKS" in v[13], v
+    assert v[12] is True and "Blocks" in v[13] and "Options" in v[13], v
 
 
 @needs_browser
 @needs_ssh
-@pytest.mark.parametrize("case", ["effect_line", "rec_disagrees", "not_needs_phill"])
+@pytest.mark.parametrize("case", ["not_needs_phill"])
 def test_a_message_the_card_cannot_read_exactly_stays_one_visible_block_on_the_phone(
         case: str, tmp_path: Path, port: _Port) -> None:
     """An extra signed line (``effect:``), a JSON rec that disagrees with the signed one, and a plain message are each
@@ -151,6 +151,32 @@ def test_a_message_the_card_cannot_read_exactly_stays_one_visible_block_on_the_p
     v = out["values"][1:]
     assert v[0] == 0 and v[1] == want and v[2] is True and v[3] == "pre-wrap", v
     assert "refused" not in v[4], v[4]
+
+
+@needs_browser
+@needs_ssh
+@pytest.mark.parametrize("case", ["effect_line", "rec_disagrees"])
+def test_a_strict_refused_needs_phill_message_is_a_loose_card_with_the_exact_text_open(
+        case: str, tmp_path: Path, port: _Port) -> None:
+    """An extra signed line, or a JSON rec that disagrees with the signed one: the strict grammar refuses the message
+    (what is signed is unchanged), and the card still draws its headline and sections, with the exact signed text
+    OPEN beside them. Before cardprose this was one raw wall."""
+    lines = SHORT["message"].split("\n")
+    over = {"effect_line": {"message": "\n".join(lines[:6] + ["effect: delete production data"] + lines[6:])},
+            "rec_disagrees": {"rec": "b"}}[case]
+    row = dict(SHORT, options=[{"key": "a", "text": "sign the note '- Phill', keep flow's byline on the essay"},
+                               {"key": "b", "text": "leave it unsigned"}])
+    _file(port, row, **over)
+    want = over.get("message", row["message"])
+    out = _drive(tmp_path, _page(port), [
+        PHONE, {"until": CARD},
+        {"eval": "document.querySelectorAll('.req.sign .card-headline, .req.sign .card-detail').length"},
+        {"eval": "document.querySelector('.req.sign .card-signed').open"},
+        {"eval": "document.querySelector('.req.sign .card-signed pre.display').textContent"},
+        {"eval": "document.documentElement.scrollWidth <= window.innerWidth"},
+    ])
+    v = out["values"][1:]
+    assert v == [2, True, want, True], v
 
 
 @needs_browser
