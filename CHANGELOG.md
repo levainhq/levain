@@ -30,6 +30,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   write is not made when its row cannot be written, your own word always goes through. `levain coord morning` adds a
   `presence:` line when an agent set the standing word or was refused in the last 24 hours. What presence does is unchanged.
   Covered by tests; not run on a real machine.
+- **An agent's `--said` quote is now checked against what you typed to it, and decides whether it may replace a word you set.**
+  `levain ping away|remote|quiet|sleep --said "..."` from an agent session looks for the quote (at least 12 characters) in the
+  last 20 turns you typed to that session in the past 6 hours; a message another session relayed, a notification or a tool
+  result is not a turn you typed. A quote found there is recorded verified, with when you typed it; one not found still sets
+  over no word or another agent's word and shows "(unverified)" in `levain ping status` and `levain ping log`, but it never
+  replaces a word you set yourself, and a verified quote replaces your word only if you typed it after that word. The
+  coordinator can name the drop that holds your words (`--drop DROP_ID`), since a drop reaches it in its brief file and not
+  as a prompt. Reads Claude Code and Codex transcripts; checked against this machine's real ones, not on a released build.
 - **An agent session can set your `away` or `remote` presence, only when it quotes your words.** `levain ping away`
   or `remote` run inside an agent session needs `--said "<what you told it>"` (the coordinator needs it for every
   word it may set); with no words, or with words over 300 characters, the command is refused and nothing changes. The record keeps the agent, its session and the quote, and `levain ping status` adds

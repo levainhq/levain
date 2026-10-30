@@ -28,7 +28,9 @@ need costs one notification, a ping he needed and never got costs the day. This 
 A word may carry who set it. A seat the operator told ("heading out") may set only :data:`SEAT_WORDS`, and the
 coordinator only :data:`COORDINATOR_WORDS`; every other word, and a standing ``loud`` (no setter replaces it), stays his.
 A setter's write is refused unless it names an agent and quotes his words, and the record keeps the setter and the quote
-beside the word. The setter's role comes from the caller's session
+beside the word. A setter replaces a word the operator set himself only when its quote is found in what he typed
+(:mod:`levain.webpush.quote`) after that word; any other quote sets over no word or another agent's word, marked
+unverified. The setter's role comes from the caller's session
 identity, which is a label under one uid and not a boundary: it records intent, it does not stop a process that hides
 its environment.
 
@@ -129,7 +131,10 @@ def _provenance(got: dict) -> dict:
     if not isinstance(by, dict) or not said or by.get("role") not in ROLES:
         return {}
     agent, session = _clean(by.get("agent"), _FIELD_MAX), _clean(by.get("session"), _FIELD_MAX)
-    return {"by": {"agent": agent, "session": session, "role": by["role"]}, "said": said} if agent else {}
+    if not agent:
+        return {}
+    return {"by": {"agent": agent, "session": session, "role": by["role"]}, "said": said,
+            **({"verified": got["verified"]} if isinstance(got.get("verified"), bool) else {})}
 
 
 def _valid(got: object) -> dict | None:
@@ -235,13 +240,15 @@ def check_setter(word: str, by: dict | None, said: str | None) -> str:
 
 
 def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, now: float | None = None,
-             by: dict | None = None, said: str | None = None) -> dict | None:
+             by: dict | None = None, said: str | None = None, match: object = None) -> dict | None:
     """Write ``word`` (``duration`` for quiet, loud and remote; ``loud off`` clears a loud). Returns what is on file
     after, ``None`` when no word stands. ``back`` leaves a standing ``loud`` alone and returns it. Raises
     :class:`PresenceError` for an unknown word, a bad duration, or a directory or file that is not safe to write.
     ``by`` (a seat's or the coordinator's identity, see :func:`check_setter`) and ``said`` (his words) are for an agent
     setting a word for him: both are checked before anything is read or written, and recorded with the word. With
-    ``by`` unset the call is the operator's own and records nothing more.
+    ``by`` unset the call is the operator's own and records nothing more. ``match`` (a
+    :class:`levain.webpush.quote.Match`) says whether the quote is in what he typed; with none, it is unverified.
+    A setter replaces a word he set himself only on a verified quote he typed after that word (:func:`_plan`).
 
     Every call leaves one row in the presence log (:func:`read_log`), a refusal included. A setter's row is written
     before the word and a row that cannot be written refuses the write; the operator's own row is written after, and a
@@ -251,7 +258,7 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
     word set meanwhile is read, never overwritten. A setter that cannot take the lock is refused; the operator's own
     word goes through without it."""
     with _locked(queue_dir, strict=by is not None):
-        return _set_word(queue_dir, word, duration, now, by, said)
+        return _set_word(queue_dir, word, duration, now, by, said, match)
 
 
 @contextmanager
@@ -285,12 +292,17 @@ def _locked(queue_dir: Path | str, *, strict: bool):
 
 
 def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float | None, by: dict | None,
-              said: str | None) -> dict | None:
+              said: str | None, match: object) -> dict | None:
     ts = time.time() if now is None else now
     prior = read_word(queue_dir)
     row = _log_row(ts, word, duration, by, said, prior)
+    ev = _evidence(match) if by is not None else None
+    if ev is not None:
+        row["verified"] = ev[0]
+        if ev[1] is not None:
+            row["said_at"] = ev[1]
     try:
-        action, rec, why = _plan(word, duration, ts, prior, by, said)
+        action, rec, why = _plan(word, duration, ts, prior, by, said, ev)
     except PresenceError as e:
         _log_best_effort(queue_dir, {**row, "outcome": "refused", "why": _clean(str(e), _WHY_MAX)})
         raise
@@ -317,8 +329,17 @@ def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float
     return rec if action == "write" else (None if action == "clear" else prior)
 
 
+def _evidence(match: object) -> tuple[bool, float | None, str]:
+    """``(verified, said_at, why)`` from a :class:`levain.webpush.quote.Match`; no match is unverified."""
+    verified = getattr(match, "verified", False) is True
+    at = getattr(match, "said_at", None)
+    at = float(at) if verified and isinstance(at, (int, float)) and not isinstance(at, bool) and math.isfinite(at) else None
+    why = _clean(getattr(match, "why", "") or "no transcript check ran", _WHY_MAX)
+    return verified and at is not None, at, why
+
+
 def _plan(word: str, duration: str | None, ts: float, prior: dict | None, by: dict | None,
-          said: str | None) -> tuple[str, dict | None, str]:
+          said: str | None, ev: tuple[bool, float | None, str] | None = None) -> tuple[str, dict | None, str]:
     """What a call does, with nothing read or written: ``(action, record, note)``, action ``write`` (the record is the
     word), ``clear`` (no word stands after) or ``keep`` (the word on file stays, the note says why). Raises
     :class:`PresenceError` for a refusal."""
@@ -328,6 +349,19 @@ def _plan(word: str, duration: str | None, ts: float, prior: dict | None, by: di
     if by is not None and _active(prior, "loud", ts):
         raise PresenceError("`loud` is the operator's standing word; a seat cannot replace it "
                             "(the operator says `loud off` himself)")
+    note = ""
+    if by is not None:
+        ev = ev or (False, None, "no transcript check ran")
+        if prior is not None and "by" not in prior and not is_expired(prior, ts):   # his own standing word
+            at = time.strftime("%H:%M", time.localtime(prior["ts"]))
+            if not ev[0]:
+                raise PresenceError(f"he set `{prior['word']}` himself at {at} and your quote is not in your transcript "
+                                    f"({ev[2]}); he ends it himself")
+            if ev[1] <= prior["ts"]:
+                raise PresenceError(f"he set `{prior['word']}` himself at {at}, after the sentence you quote; "
+                                    "he ends it himself")
+        elif not ev[0]:
+            note = f"unverified: {ev[2]}"
     if word == "loud" and (duration or "").strip().lower() == "off":
         if _active(prior, "loud", ts) or (prior and prior["word"] == "loud"):
             return "clear", None, "loud off"
@@ -345,7 +379,8 @@ def _plan(word: str, duration: str | None, ts: float, prior: dict | None, by: di
         rec["by"] = {"agent": _clean(by.get("agent"), _FIELD_MAX), "session": _clean(by.get("session"), _FIELD_MAX),
                      "role": by["role"]}
         rec["said"] = quote
-    return "write", rec, ""
+        rec["verified"] = ev[0]
+    return "write", rec, note
 
 
 def _log_row(ts: float, word: object, duration: str | None, by: object, said: object, prior: dict | None) -> dict:
@@ -412,7 +447,7 @@ def log_line(r: dict) -> str:
         line += f" {r['duration']}"
     line += f" by {who}"
     if r.get("said"):
-        line += f' on "{r["said"]}"'
+        line += f' on "{r["said"]}"' + (" (unverified)" if r.get("verified") is False else "")
     line += f" (found: {prior.get('word', 'no word')})"
     return line + (f": {r['why']}" if r.get("why") else "")
 
@@ -511,5 +546,6 @@ def describe(queue_dir: Path | str, *, now: float | None = None,
     if word is not None and "by" in word:
         by = word["by"]
         who = f"{by['agent']} {by['session']}".strip()
-        line += f"; set by {'the coordinator ' if by['role'] == 'coordinator' else ''}{who} from your words: {word['said']}"
+        flag = " (unverified)" if word.get("verified") is False else ""
+        line += f"; set by {'the coordinator ' if by['role'] == 'coordinator' else ''}{who} from your words: {word['said']}{flag}"
     return line
