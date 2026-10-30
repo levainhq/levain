@@ -65,10 +65,7 @@ def test_the_parser_never_changes_a_word_on_real_rows() -> None:
 @needs_browser
 @needs_ssh
 def test_the_card_shots(tmp_path: Path, monkeypatch) -> None:
-    shots = os.environ.get("CARDFMT_SHOTS")
-    if not shots:
-        pytest.skip("CARDFMT_SHOTS names the folder the screenshots go to")
-    folder = Path(shots)
+    folder = Path(os.environ.get("CARDFMT_SHOTS") or tmp_path / "shots")     # CARDFMT_SHOTS keeps them; the browser job allows no skip
     folder.mkdir(parents=True, exist_ok=True)
     stem = os.environ.get("CARDFMT_STEM", "after")
     rig = _Rig(tmp_path, monkeypatch)
