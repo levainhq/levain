@@ -86,7 +86,9 @@ def test_marker_is_the_prompts_first_line(rig):
 
 def test_f1_a_wake_spends_no_delta(rig):
     q1 = rig.ask("Pick a DB")
-    assert "first band on this seat" in rig.ups("hello coordinator")
+    first = rig.ups("hello coordinator")
+    assert "first band on this seat" in first
+    assert rig.stop(first[first.find("NEEDS YOU"):]) == ""      # S2: a coordinator's view commits at its verified Stop
     rig.qs.answer(q1.id, option="a", channel="cli")
     rig.ask("Ship it?")
     ctx = rig.ups(rig.wake)

@@ -994,7 +994,8 @@ def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None, agent: s
     empty band or ANY error before anything was recorded; it never raises (``commit`` neither). A render that fails
     AFTER an answer was recorded still returns the echo: what was recorded is said. A coordinator wake
     (:func:`turn_kind`) returns only :data:`WAKE_LINE` with a no-op commit, and leaves the turn-kind record the Stop
-    hook reads."""
+    hook reads. A coordinator session's viewer is the role (:data:`COORDINATOR_VIEWER`), and its ``commit()`` only
+    stages the view for the Stop hook (:func:`_stop_coordinator`)."""
     t0 = time.monotonic()
     # ONE bound for the whole hook (S3 fix round 2, codex 4/5): the launch-row read, every snapshot (questions and
     # the authority sources), the answers' write, a first-time setup, the render's numbering, then the view row.
@@ -1014,13 +1015,15 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
             return "", _no_commit
         directory = queue_dir_for(env)
         store = QuestionStore(directory)
-        viewer = f"{agent}:{payload['session_id']}"
+        viewer, coord = _viewer_of(payload, env, directory, agent, max(0.0, deadline - time.monotonic()))
     except Exception:
         return "", _no_commit
     if _coordinator_wake(payload, env, directory, deadline):
         _write_turn(directory, viewer, payload["session_id"], "wake")
         return WAKE_LINE, _no_commit                # silent: no parse, no render, no view, no `closed` notice
     _write_turn(directory, viewer, payload["session_id"], "operator", only_if_present=True)
+    if coord:
+        _clear_staged(directory, viewer)         # a turn that never reached Stop leaves no view behind to commit
     echo = ""
     try:
         echo = _seat_answer(store, viewer, payload.get("prompt"), env, deadline)
@@ -1047,6 +1050,9 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
         text = echo + ("\n" + text if text else "")
 
     def commit() -> None:
+        if coord:                             # the coordinator's view is the Stop hook's to commit, after the reply verifies
+            _stage_view(directory, viewer, payload["session_id"], r, block)
+            return
         try:
             mark_closed_shown(store, r.closed)
         except Exception:
@@ -1057,6 +1063,104 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
             pass
 
     return text, commit
+
+
+COORDINATOR_VIEWER = "coordinator"
+
+
+def _viewer_of(payload: Any, env: Mapping[str, str], directory: Path | str, agent: str,
+               busy_s: float | None = None) -> tuple[str, bool]:
+    """``(viewer, coordinator)``: the band viewer of this hook call. A session whose launch row is a coordinator's
+    (:func:`seat_fact`) is the role :data:`COORDINATOR_VIEWER` whatever launch or agent it is, so its delta survives a
+    new launch; every other seat is ``agent:session_id``, as before. A launch row that cannot be read is no coordinator."""
+    session = payload["session_id"]
+    try:
+        if seat_fact(session, directory, env, busy_s).role == "coordinator":
+            return COORDINATOR_VIEWER, True
+    except Exception:
+        pass
+    return f"{agent}:{session}", False
+
+
+def _staged_path(directory: Path | str, viewer: str) -> Path:
+    f = _claim_file(directory, viewer)
+    return f.with_name(f"{f.name}.staged")
+
+
+def _stage_view(directory: Path | str, viewer: str, session: str, r: "Rendered", block: str) -> None:
+    """Keep the view a coordinator turn was just shown for its Stop hook to commit (one record per viewer, replaced
+    atomically; it names the session). Never raises."""
+    try:
+        f = _staged_path(directory, viewer)
+        f.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"session": session, "hwm": r.hwm, "shown": list(r.shown), "gen": r.gen,
+                                   "closed": list(r.closed), "block": block}))
+        os.replace(tmp, f)
+    except Exception:
+        pass
+
+
+def _clear_staged(directory: Path | str, viewer: str) -> None:
+    try:
+        _staged_path(directory, viewer).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _read_staged(directory: Path | str, viewer: str, session: str) -> dict | None:
+    """The staged view of ``session`` on ``viewer``, or ``None`` (none, unreadable, another session's)."""
+    try:
+        rec = json.loads(_staged_path(directory, viewer).read_text())
+        if rec["session"] != session:
+            return None
+        return {"hwm": int(rec["hwm"]), "shown": [int(n) for n in rec["shown"]], "gen": int(rec["gen"]),
+                "closed": [int(n) for n in rec["closed"]], "block": str(rec["block"])}
+    except Exception:
+        return None
+
+
+def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, payload: dict, message: str) -> str | None:
+    """The coordinator viewer's Stop: the view its prompt hook staged commits only once the reply reprints it
+    (:func:`_reprint_check`), so a turn that never produced a verified reply leaves the cursor where it was and the
+    next reply repeats the delta. A view with nothing open still verifies when it carries a block (``NEEDS YOU · 0
+    open`` and its delta). One block per view, as on every seat; the continuation that carries the reprint commits."""
+    session = payload["session_id"]
+    got = _view_row(store, viewer)
+    st = _read_staged(directory, viewer, session)
+    newest = max(got[1] if got is not None else 0, st["gen"] if st is not None else 0)   # a wake record older than a render is stale
+    if _fresh_wake(directory, viewer, session, newest):
+        return None                                      # a coordinator wake: nobody is waiting on this reply
+    if st is None:
+        return None
+    ok = True
+    missing: list[int] = []
+    if st["shown"] or st["block"]:
+        missing, altered = _reprint_check(View(st["hwm"], tuple(st["shown"]), None), st["block"], message)
+        ok = not missing and not altered
+    if ok:
+        try:
+            mark_closed_shown(store, st["closed"])
+        except Exception:
+            pass
+        try:
+            record_view(store, viewer, st["hwm"], st["shown"], gen=st["gen"], block=st["block"])
+        except Exception:
+            pass
+        _clear_staged(directory, viewer)
+        return None
+    if payload.get("stop_hook_active") or not _claim_retry(directory, viewer, st["gen"]):
+        return None
+    return _reprint_reason(missing)
+
+
+def _reprint_reason(missing: list[int]) -> str:
+    what = ("the items " + ", ".join(str(n) for n in missing)) if missing else "the band as given (header line or items altered)"
+    return (f"[Levain NEEDS YOU band] Your reply dropped {what} of the NEEDS YOU band you were given. Reprint the "
+            "whole band once, exactly as Levain gave it (the band@ line and every numbered item, unchanged), at "
+            "the end of your reply. Do not answer or renumber any item.")
 
 
 def _coordinator_wake(payload: Any, env: Mapping[str, str], directory: Path | str, deadline: float) -> bool:
@@ -1117,7 +1221,7 @@ def turn_log_kind(payload: Any, kind: str, environ: Mapping[str, str] | None = N
         env = os.environ if environ is None else environ
         session = payload["session_id"]
         directory = queue_dir_for(env)
-        viewer = f"{agent}:{session}"
+        viewer, _ = _viewer_of(payload, env, directory, agent)
         if kind == "prompt":
             rec = json.loads(_turn_path(directory, viewer, session).read_text())
             return "wake" if rec["kind"] == "wake" and rec["session"] == session else kind
@@ -1232,12 +1336,13 @@ def hook_stop(payload: Any, environ: Mapping[str, str] | None = None, agent: str
     item line in order (:func:`_reprint_check`). BOUNDED: never when the harness says the stop is already a
     continuation (``stop_hook_active``), at most one block per view (:func:`_claim_retry`), and FAIL OPEN on anything
     unreadable (no view, a non-text reply, an autonomous seat, a busy or missing store). The one skip beyond those: a
-    fresh coordinator-wake record (:func:`_fresh_wake`); a missing, stale or foreign record verifies. Never raises,
-    never writes the operator's data."""
+    fresh coordinator-wake record (:func:`_fresh_wake`); a missing, stale or foreign record verifies. A coordinator
+    session is checked against the view its prompt hook staged, which commits here (:func:`_stop_coordinator`). Never
+    raises, never writes the operator's data beyond that commit."""
     try:
         from levain.consent.queue import queue_dir_for
 
-        if not isinstance(payload, dict) or payload.get("stop_hook_active"):
+        if not isinstance(payload, dict):
             return None
         message = payload.get("last_assistant_message")
         if not isinstance(message, str):
@@ -1247,7 +1352,11 @@ def hook_stop(payload: Any, environ: Mapping[str, str] | None = None, agent: str
             return None
         directory = queue_dir_for(env)
         store = QuestionStore(directory)
-        viewer = f"{agent}:{payload['session_id']}"
+        viewer, coord = _viewer_of(payload, env, directory, agent)
+        if coord:
+            return _stop_coordinator(directory, store, viewer, payload, message)
+        if payload.get("stop_hook_active"):
+            return None
         got = _view_row(store, viewer)
         if got is None:
             return None
@@ -1261,10 +1370,7 @@ def hook_stop(payload: Any, environ: Mapping[str, str] | None = None, agent: str
             return None
         if not _claim_retry(directory, viewer, gen):
             return None
-        what = ("the items " + ", ".join(str(n) for n in missing)) if missing else "the band as given (header line or items altered)"
-        return (f"[Levain NEEDS YOU band] Your reply dropped {what} of the NEEDS YOU band you were given. Reprint the "
-                "whole band once, exactly as Levain gave it (the band@ line and every numbered item, unchanged), at "
-                "the end of your reply. Do not answer or renumber any item.")
+        return _reprint_reason(missing)
     except Exception:
         return None
 
