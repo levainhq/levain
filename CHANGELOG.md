@@ -9,14 +9,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Fixed
 - **A cockpit with no question store no longer draws the Needs you band, or a line saying it could not be read.** An
   absent `questions.db` (no file, or an empty one) draws nothing in the band: no heading and no note, because nothing was
-  ever filed. A store that exists but cannot be read, is locked or lacks its identity row keeps its "could not be
-  recorded" line. The band also says it may be missing items when an authority source could not be read, when a second
+  ever filed. A store that has content but cannot be read, is locked or lacks its identity row keeps its "the band could
+  not be recorded just now" line. The band also says it may be missing items when an authority source could not be read, when a second
   read of an item failed, or when a question row or an authority item's record cannot be decoded; such a read is never
   drawn as an absent store. The Board tab's Needs you column likewise reports nothing, instead of "could not be read",
-  for a cockpit that hosts no question store; a store that exists but fails to read is still reported. Covered by tests,
+  for a cockpit that hosts no question store, or whose store file is absent or empty; a store that exists but fails to
+  read is still reported. Covered by tests,
   including a real-browser test for the absent and unreadable cases; not run by hand on a real machine.
-- **`levain upgrade` run from a source tree with no installed `dist-info` refuses with its "cannot tell how Levain was
-  installed" message** instead of printing `internal error: PackageNotFoundError`. Covered by a test; not run by hand.
+- **`levain upgrade` run from a source tree with no installed `dist-info` refuses with "Could not tell how Levain was
+  installed"** (upgrade it your usual way, then run `levain upgrade --no-pip`) instead of printing `internal error:
+  PackageNotFoundError`. Covered by a test; not run by hand.
 - **A Claude passthrough route without `platform.claude.com` is refused when the session's routes load, naming the
   host and the route.** The login refresh goes to that host through the route's tunnel; your own passthrough route
   replaces the shipped one, so one without it made every refresh fail. Levain never adds the host to your route; the
@@ -24,14 +26,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Added
 - **An agent session can set your `away` or `remote` presence, only when it quotes your words.** `levain ping away`
-  or `remote` run inside an agent session needs `--said "<what you told it>"`; with no words, or with words over 300
-  characters, nothing changes. The record keeps the agent, its session and the quote, and `levain ping status` adds
+  or `remote` run inside an agent session needs `--said "<what you told it>"` (the coordinator needs it for every
+  word it may set); with no words, or with words over 300 characters, nothing changes. The record keeps the agent, its session and the quote, and `levain ping status` adds
   "set by <agent> <session> from your words: <quote>" (the coordinator's own session is named as such). A seat may set
   only `away` and `remote`; the coordinator may also set `quiet` and `sleep`. `back` and `loud` stay yours, and no
   agent session can replace a standing `loud`. A session that is detected but cannot be named refuses and sets nothing.
   Run from your own terminal (no agent session above it), any word works as before. Known edge: the role comes from
-  the caller's session identity under one user id, so it records intent and does not stop a process that hides its
-  environment. Covered by tests; not run by hand on a real machine.
+  the session id in the caller's environment under one user id, so a seat that sets the coordinator's session id is
+  recorded as the coordinator and may set `quiet` or `sleep`; the record shows intent and does not stop a process that
+  lies about its environment. Covered by tests; not run by hand on a real machine.
 - **The cockpit has a read-only Coordinator panel.** It shows the coordinator's wake state and the reason `levain coord
   status` gives for it, verbatim, then who holds the lease and until when, the coordinator setting, and the latest
   launches with their cause. The state is one of `held`, `launching`, `idle`, `unset`, `backoff`, `stopped` or `wake`.
