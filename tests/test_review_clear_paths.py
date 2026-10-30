@@ -53,6 +53,7 @@ def test_a_plain_reopen_of_a_yours_to_clear_item_is_allowed(tmp_path: Path) -> N
 from levain.cockpit.coordinator_panels import REVIEW_ID  # noqa: E402
 from tests.test_cockpit_k2a import _install  # noqa: E402
 from tests.test_cockpit_pairing_http import PROXY, T, _call, _pair, _serve  # noqa: E402
+FC = "review-paths-surface-token-0123456789"      # a named surface (the shared token that never clears), honoured proxied (W1b L-1)
 
 
 @pytest.fixture
@@ -67,7 +68,7 @@ def served(tmp_path: Path, monkeypatch):
     plain, _ = review.file_item(store, "seat", {"text": "seat lane-a died"}, dedupe_key="a")
     mine, _ = review.file_item(store, "doubt", {"text": "the receipt does not match"}, dedupe_key="b",
                                authority_relevant=True)
-    with _serve(src) as (port, _httpd):
+    with _serve(src, surface_tokens={"browser": T, "flowconnect": FC}) as (port, _httpd):
         yield port, store, plain, mine
 
 
@@ -101,8 +102,8 @@ def test_the_review_rows_name_their_state_and_offer_clear_only_on_a_plain_open_i
 
 def test_the_shared_surface_token_never_clears_and_says_why(served) -> None:
     port, store, plain, _mine = served
-    row = _rows(port, T)[f"review:{plain.item_id}"]
-    st, out = _fire(port, T, "review_clear", row)
+    row = _rows(port, FC)[f"review:{plain.item_id}"]
+    st, out = _fire(port, FC, "review_clear", row)
     assert (st, out.get("error")) == (403, "device_required"), out
     assert "paired device" in out["message"]
     assert review.get_item(store, plain.item_id).state == "open"

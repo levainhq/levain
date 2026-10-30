@@ -106,7 +106,7 @@ def test_a_paired_token_over_the_proxied_path_fires_hold_like_the_phone_does(src
     v = _verbs(qdir, clock, launcher=_held_back)
     with _serving(src, v.specs()) as (port, _h):
         _discover(port)
-        _dev, tok = _pair(port, proxied=True)
+        _dev, tok = _pair(port)     # the owner key pairs on loopback only (L-1); the device token then goes proxied
         st, out, _ = _fire_http(port, HOLD_VERB, tok, "h1", headers=PROXY)
     assert (st, out.get("ok")) == (200, True), out
     assert store.coord_lease().token == out["result"]["token"]
