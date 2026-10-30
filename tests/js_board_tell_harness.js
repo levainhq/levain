@@ -196,9 +196,17 @@ async function tokenTransitions() {
   out.readFailureSurvivesTokenCycle = { failed: shared.failed, calls: calls.slice() };
   return out;
 }
+// The filter box's match and count, and the journal line's absence: over BODY (3 cards: backlog, running, needs-you).
+function filtering() {
+  const m = V.boardModel(BODY);
+  const pick = (q) => { const f = V.filterModel(m, q); return { label: V.countLabel(f), ids: f.model.columns.flatMap((c) => c.cards.map((k) => k.id)), cols: f.model.columns.length, same: f.model === m }; };
+  return { none: pick(""), blank: pick("   "), folded: pick("LATER  c"), journalWords: pick("took it"), and: pick("land levain"), miss: pick("zzz"), band: pick("sweep"),
+    noJournal: V.journalLine(null), journal: V.journalLine({ who: "desk", iso: "t", to_category: "ready", why: "queued it." }) };
+}
 (async () => {
   const on = { offered: true, why: null };
   const out = {};
+  out.filtering = filtering();
   out.grouped = await grouped();
   out.bus = await bus();
   out.tellFollows = await tellFollowsTheRead();

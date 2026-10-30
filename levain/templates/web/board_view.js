@@ -23,9 +23,10 @@
     return "ph-" + Array.prototype.map.call(b, function (x) { return ("0" + x.toString(16)).slice(-2); }).join("");
   }
 
-  // The journal line of one card: "who · when · why", or the plain absence (a state change with no record is a defect).
+  // The journal line of one card: "who · when · why". A card with no record draws no line: absence is the ordinary case for a
+  // card nothing here ever moved (a projected seat or CI row, a downstream's own cards), so a line saying so reads as a fault.
   function journalLine(j) {
-    if (!j) return "no journal record (as of read)";
+    if (!j) return "";
     var move = j.from_category ? j.from_category + " → " + j.to_category : "added as " + j.to_category;
     var by = j.who ? String(j.who) : "unknown";
     if (j.source === "operator-proposal" && j.applied_by) by += " (applied by " + j.applied_by + ")";
@@ -53,6 +54,8 @@
               tier: k.tier || "", held: k.held_reason || "", number: k.number == null ? null : k.number,
               band: k.band === true, source: k.source || "", blocks: k.blocks || "",
               malformed: k.well_formed === false, unknownCategory: k.unknown_category || "",
+              done: k.done_line == null ? "" : String(k.done_line),
+              dependsOn: Array.isArray(k.depends_on) ? k.depends_on.map(String) : [],
               journal: k.band ? "" : journalLine(k.journal)
             };
           })
@@ -61,11 +64,49 @@
     };
   }
 
+  // The filter box's match, shared with the cockpit's own filter (case and accent folded, every term must hit): the text a
+  // reader sees on a card, so what they type is what they can find.
+  function fold(s) { return String(s).normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase(); }
+  function termsOf(q) { return fold(q || "").split(/\s+/).filter(Boolean); }
+  function hayOf(col, k) {
+    return fold([col.category, k.number != null ? k.number : "", k.title, k.repo, k.tier, k.source, k.id, k.held, k.blocks,
+      k.unknownCategory, k.done, k.dependsOn.join(" "), k.journal].filter(function (x) { return x !== "" && x != null; }).join(" "));
+  }
+  // The model narrowed to the cards a query matches (the columns stay, so a column with no match still says so), with the
+  // counts a count label needs: `total` over the whole board, `shown` after the filter. No terms: the model itself, whole.
+  function filterModel(model, query) {
+    var terms = termsOf(query);
+    var total = 0;
+    model.columns.forEach(function (c) { total += c.cards.length; });
+    if (!terms.length) return { model: model, total: total, shown: total, filtered: false };
+    var shown = 0;
+    var columns = model.columns.map(function (c) {
+      var cards = c.cards.filter(function (k) {
+        var h = hayOf(c, k);
+        return terms.every(function (t) { return h.indexOf(t) >= 0; });
+      });
+      shown += cards.length;
+      return { category: c.category, cards: cards };
+    });
+    var out = {};
+    Object.keys(model).forEach(function (key) { out[key] = model[key]; });
+    out.columns = columns;
+    return { model: out, total: total, shown: shown, filtered: true };
+  }
+  function countLabel(f) { return f.filtered ? f.shown + " of " + f.total : f.total + (f.total === 1 ? " card" : " cards"); }
+
   function el(doc, tag, cls, text) {
     var n = doc.createElement(tag);
     if (cls) n.className = cls;
     if (text != null) n.textContent = text;
     return n;
+  }
+
+  // What a card is FOR and what it waits on: its done line (the point of a work card) and the ids it comes after, each drawn only
+  // when the card has one, as text.
+  function drawPlan(doc, host, k) {
+    if (k.done) host.appendChild(el(doc, "div", "bd-done", "done when: " + k.done));
+    if (k.dependsOn.length) host.appendChild(el(doc, "div", "bd-deps", "after: " + k.dependsOn.join(", ")));
   }
 
   // The needs-you column's one sentence: said by the grouped tab and the six columns alike, so the two cannot drift.
@@ -101,10 +142,11 @@
         row.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + k.title));
         var meta = [k.repo, k.tier, k.source, k.id].filter(Boolean).join(" · ");
         if (meta) row.appendChild(el(doc, "div", "bd-meta", meta));
+        drawPlan(doc, row, k);
         if (k.held) row.appendChild(el(doc, "div", "bd-held", "held: " + k.held));
         if (k.malformed) row.appendChild(el(doc, "div", "bd-held", "not well formed (no done line or tier)"));
         if (k.unknownCategory) row.appendChild(el(doc, "div", "bd-held", "unknown category: " + k.unknownCategory));
-        if (!k.band) row.appendChild(el(doc, "div", "bd-journal", k.journal));
+        if (!k.band && k.journal) row.appendChild(el(doc, "div", "bd-journal", k.journal));
         wrap.appendChild(row);
       });
     });
@@ -131,10 +173,11 @@
         card.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + k.title));
         var meta = [k.repo, k.tier, k.source, k.id].filter(Boolean).join(" · ");
         if (meta) card.appendChild(el(doc, "div", "bd-meta", meta));
+        drawPlan(doc, card, k);
         if (k.held) card.appendChild(el(doc, "div", "bd-held", "held: " + k.held));
         if (k.malformed) card.appendChild(el(doc, "div", "bd-held", "not well formed (no done line or tier)"));
         if (k.unknownCategory) card.appendChild(el(doc, "div", "bd-held", "unknown category: " + k.unknownCategory));
-        if (!k.band) card.appendChild(el(doc, "div", "bd-journal", k.journal));
+        if (!k.band && k.journal) card.appendChild(el(doc, "div", "bd-journal", k.journal));
         c.appendChild(card);
       });
       wrap.appendChild(c);
@@ -380,7 +423,7 @@
     }
   }
 
-  var api = { boardModel: boardModel, journalLine: journalLine, renderBoard: renderBoard, renderGrouped: renderGrouped, mount: mount, busToken: busToken };
+  var api = { boardModel: boardModel, filterModel: filterModel, countLabel: countLabel, journalLine: journalLine, renderBoard: renderBoard, renderGrouped: renderGrouped, mount: mount, busToken: busToken };
   root.LevainBoardView = api;
 
   // The Board tab's zone (the thread view's mounting idiom): hidden on a page holding no write token; polls only while the

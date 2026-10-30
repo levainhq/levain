@@ -1764,11 +1764,14 @@
     }
     // the focus view of a long metric list carries the same filter box a long list does (and starts unfiltered: a saved query would hide metrics)
     const metricsOf = data.kind === "status-dots" ? data.metrics : data.kind === "metric-grid" ? data.numbers : null;
-    s.filterable = !!(ctx && ctx.modal) && !(ctx && ctx.widget) && Array.isArray(metricsOf) && metricsOf.length >= FILTER_MIN;
+    // a board (the board kind) always carries the box, on the panel face and in its focus view: it is as long as its queue is
+    s.filterable = (!!(ctx && ctx.modal) && !(ctx && ctx.widget) && Array.isArray(metricsOf) && metricsOf.length >= FILTER_MIN)
+      || (data.kind === "board" && !(ctx && ctx.widget));
     // a fresh open starts unfiltered; the SAME open modal rebuilt by a refresh keeps the query being typed in it
-    // (a count-face panel's modal is the same: a saved query would hide a newly waiting row behind "1 of 3")
+    // (a count-face panel's modal is the same: a saved query would hide a newly waiting row behind "1 of 3"); a board's panel face
+    // keeps its own the same way
     if (s.filterable || (s.searchable && s.modal && data.face === "count")) {
-      const prev = Array.from(states).find((o) => o.modal && o.pid === data.pid && o.body.isConnected && (o.filterable || o.searchable));
+      const prev = Array.from(states).find((o) => !!o.modal === !!s.modal && o.pid === data.pid && o.body.isConnected && (o.filterable || o.searchable));
       s.query = prev ? prev.query : "";
     }
     if (s.searchable || s.filterable) p.appendChild(buildFilter(s));
@@ -1808,13 +1811,16 @@
   // renderers the Board tab and its modal use). A page without the view draws one plain line, never a blank panel.
   function paintBoard(s) {
     const V = root.LevainBoardView;
-    if (!V || typeof V.boardModel !== "function" || typeof V.renderGrouped !== "function" || typeof V.renderBoard !== "function") {
+    if (!V || typeof V.boardModel !== "function" || typeof V.renderGrouped !== "function" || typeof V.renderBoard !== "function"
+        || typeof V.filterModel !== "function" || typeof V.countLabel !== "function") {
       s.body.appendChild(el("p", "xnote", "The board view did not load, so this board is not drawn."));
       return;
     }
     try {
-      const model = V.boardModel(s.data.board);
-      if (s.modal) V.renderBoard(document, s.body, model); else V.renderGrouped(document, s.body, model);
+      // the box narrows the cards, never the columns; its count is the whole board's size, or "k of n" while a query is typed
+      const f = V.filterModel(V.boardModel(s.data.board), s.query);
+      if (s.countEl) s.countEl.textContent = V.countLabel(f);
+      if (s.modal) V.renderBoard(document, s.body, f.model); else V.renderGrouped(document, s.body, f.model);
     } catch (e) {
       s.body.replaceChildren(el("p", "err", "unavailable — the board could not be drawn"));
     }
@@ -1835,7 +1841,7 @@
       if (!s.fitting && s.p && s.body.isConnected) fitWidget(s); else paintWidget(s, s.body);
       return;
     }
-    if (s.filterable) { paintFiltered(s); return; }
+    if (s.filterable && d.kind !== "board") { paintFiltered(s); return; }
     if (d.kind === "status-dots") { paintStatusDots(s.body, d.metrics || []); if (!(d.metrics || []).length && !s.ctx.alerted) s.body.appendChild(el("p", "empty", d.empty)); return; }
     if (d.kind === "reading") { paintReading(s.body, d.reading); return; }
     if (d.kind === "metric-grid") { paintGrid(s.body, d.numbers); return; }

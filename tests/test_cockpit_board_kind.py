@@ -268,3 +268,66 @@ def test_a_board_kind_panel_says_so_when_the_board_view_did_not_load(tmp_path: P
         ])
     got = json.loads(out["values"][-1])
     assert got["heads"] == 0 and "board view did not load" in got["text"], got
+
+
+@needs_browser
+def test_a_board_kind_panel_carries_a_filter_and_a_count_and_draws_no_line_for_a_card_with_no_journal(tmp_path: Path) -> None:
+    """The desk's two flow-board findings (10-29). A downstream's cards carry no journal (the ordinary case), so no card draws a
+    journal line saying so; and the board, on its panel face and in its ⤢ modal, carries the shared filter box with a count
+    ("N cards", "k of N" while typing) that narrows the cards and never the columns."""
+    from levain.cockpit.providers import build_default_cockpit
+
+    value = _value(backlog=[_card("flow:a", title="Land the reader", status_category="backlog")],
+                   ready=[_card("flow:b", title="Cut the outbox", done_line="outbox cut and pushed", depends_on=["flow:a"]), _card("flow:c", title="Review the sweep", repo="flow")],
+                   running=[_card("flow:d", title="Wire the emitter", status_category="running")],
+                   done=[_card("flow:e", title="Ship the readout", status_category="done")])
+    shots = Path(os.environ.get("LEVAIN_BOARD_SHOTS") or tmp_path)
+    shots.mkdir(parents=True, exist_ok=True)
+    _root, src, _ids = _install(tmp_path)
+    ck = build_default_cockpit(src)
+    ck.register(_board_provider(value))
+    panel = "document.querySelector('[data-ck-panel=boardkind]')"
+    typ = ("(sel, v) => { const i = document.querySelector(sel); i.value = v;"
+           " i.dispatchEvent(new Event('input', {bubbles: true})); return 1; }")
+    box = f"{panel} .xfilter-input"
+    mbox = "#levain-modal .xfilter-input"
+    def facts(root: str) -> str:
+        return (f"JSON.stringify({{n: '{root}'.length, rows: document.querySelectorAll('{root} .bd-row, {root} .bd-card').length, "
+                f"journal: document.querySelectorAll('{root} .bd-journal').length, "
+                f"done: [...document.querySelectorAll('{root} .bd-done')].map(d => d.textContent), "
+                f"deps: [...document.querySelectorAll('{root} .bd-deps')].map(d => d.textContent), "
+                f"heads: document.querySelectorAll('{root} .grp-head, {root} .bd-col').length, "
+                f"count: (document.querySelector('{root} .xfilter-count') || {{}}).textContent}})")
+    pnl = "[data-ck-panel=boardkind]"
+    with _Served(src, cockpit=ck, surface_tokens={"browser": "T"}, install_class="reported") as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1440, "h": 1000, "dpr": 1}},
+            {"until": f"{panel} && {panel}.querySelectorAll('.grp-head').length === 6 && {panel}.querySelector('.xfilter-input') && 1"},
+            {"eval": facts(pnl)},
+            {"eval": f"{panel}.scrollIntoView(); 1"},
+            {"shot": str(shots / "board_filter_face_all.png")},
+            {"eval": f"({typ})({json.dumps('[data-ck-panel=boardkind] .xfilter-input')}, 'reader')"},
+            {"until": f"{panel}.querySelectorAll('.bd-row').length === 1"},
+            {"eval": facts(pnl)},
+            {"shot": str(shots / "board_filter_face_typed.png")},
+            {"eval": f"({typ})({json.dumps('[data-ck-panel=boardkind] .xfilter-input')}, '')"},
+            {"until": f"{panel}.querySelectorAll('.bd-row').length === 5"},
+            {"eval": f"{panel}.querySelector('.phead .pexpand').click(); 1"},
+            {"until": f"{MODAL} && {MODAL}.querySelectorAll('.bd-col').length === 6 && {MODAL}.querySelector('.xfilter-input') && 1"},
+            {"until": SETTLED},
+            {"eval": facts("#levain-modal")},
+            {"shot": str(shots / "board_filter_modal_all.png")},
+            {"eval": f"({typ})({json.dumps(mbox)}, 'OUTBOX')"},
+            {"until": f"{MODAL}.querySelectorAll('.bd-card').length === 1"},
+            {"eval": facts("#levain-modal")},
+            {"shot": str(shots / "board_filter_modal_typed.png")},
+        ])
+    got = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"n"')]
+    face, narrowed, modal_all, modal_narrow = got
+    assert face["rows"] == 5 and face["journal"] == 0 and face["heads"] == 6 and face["count"] == "5 cards", face     # no journal line, a count
+    assert face["done"].count("done when: outbox cut and pushed") == 1 and len(face["done"]) == 5, face          # the done line is drawn
+    assert face["deps"] == ["after: flow:a"], face                                                                 # and what a card comes after
+    assert narrowed["rows"] == 1 and narrowed["heads"] == 6 and narrowed["count"] == "1 of 5", narrowed             # narrows cards, keeps columns
+    assert modal_all["deps"] == ["after: flow:a"] and len(modal_all["done"]) == 5, modal_all
+    assert modal_all["rows"] == 5 and modal_all["journal"] == 0 and modal_all["heads"] == 6 and modal_all["count"] == "5 cards", modal_all
+    assert modal_narrow["rows"] == 1 and modal_narrow["heads"] == 6 and modal_narrow["count"] == "1 of 5", modal_narrow   # folds case
