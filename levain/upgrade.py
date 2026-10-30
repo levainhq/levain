@@ -245,10 +245,16 @@ def _held_row() -> Any:
 def _held_lines(host: str, pkg: str) -> Optional[Sequence[str]]:
     from levain import doctor
 
-    # Intent: print doctor's own clean-up commands for a held session. Doctor gains `reap_held_lines` in another
-    # change; until it is present this returns None and `_held_stop` sends the operator to `levain doctor` instead.
+    # Intent: print doctor's own clean-up commands for a held session. Looked up by name as a version-skew guard: a
+    # doctor without `reap_held_lines` returns None and `_held_stop` sends the operator to `levain doctor` instead.
     fn = getattr(doctor, "reap_held_lines", None)
     return None if fn is None else fn(host, pkg)
+
+
+def _held_note() -> str:
+    from levain import doctor
+
+    return getattr(doctor, "REAP_HELD_NOTE", "")
 
 
 def _current_generation(host: str) -> Optional[str]:
@@ -425,7 +431,9 @@ def _held_stop(s: Seams, pkg: str) -> Optional[Refusal]:
     else:
         lines.append("Run these, in order, as root. Nothing here ran them:")
         lines += [f"  {i}. {c}" for i, c in enumerate(list(cmds)[:5], 1)]
-        lines.append("If 3 fails, still run 4 and 5.")
+        note = _held_note()
+        if note:
+            lines.append(note)
     lines.append("Then run `levain upgrade` again; it runs the repair (step 6) for you.")
     return Refusal("\n".join(lines), EXIT_HELD)
 

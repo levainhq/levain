@@ -435,3 +435,21 @@ def test_the_settle_marker_is_cleared_while_a_read_is_pending_and_a_throwing_dra
             {"eval": "document.querySelector('#levain-modal [data-band-slot]').textContent"},
         ])
     assert "could not be drawn" in out["values"][-1], out["values"][-1]               # said on the page, not drawn as health
+
+
+def test_an_open_item_whose_number_is_pending_is_said_in_the_note_not_dropped_silently(tmp_path):
+    """diogenes-20261030-020624: a write lock held at the deadline leaves Q-two's number pending; the text lists it as
+    ``new (number pending)`` but the payload bound to the older view, listed one item and said nothing."""
+    store = QuestionStore(tmp_path / "consent")
+    store.file(agent="claude_code", agent_session_id="s1", what="Q-one?", options=OPTS, rec="hold", blocks="a", cwd="/w")
+    assert band_view.band_payload(store, "cockpit:browser")["note"] == ""     # the view [1] is recorded
+    store.file(agent="claude_code", agent_session_id="s2", what="Q-two?", options=OPTS, rec="hold", blocks="b", cwd="/w")
+    holder = sqlite3.connect(store.path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        got = band_view.band_payload(store, "cockpit:browser", deadline=time.monotonic() + 0.4)
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert [i["what"] for i in got["items"]] == ["Q-one?"], got
+    assert got["note"] == band_view._UNREAD_NOTE, got

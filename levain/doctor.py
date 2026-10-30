@@ -1744,15 +1744,19 @@ def reap_held_lines(host: HostOS, source: str) -> tuple[str, ...]:
             layout.repair_line(host) + f" --source {shlex.quote(source)}")
 
 
+# The recovery note under :func:`reap_held_lines`' steps, ONE text for `levain doctor` and `levain upgrade` (which
+# looks it up by name, as it does `reap_held_lines`). Only step 3 reads the copy; step 1 has already stopped the
+# reaper, so a failed 2 or 3 must not leave it stopped.
+REAP_HELD_NOTE = ("If 2 fails, still run 4 (the reaper must not stay stopped) and 5, then look at why: only 3 needs "
+                  "the copy. If 3 fails, still run 4 and 5. If 4 fails, run it again before 5.")
+
+
 def _held_commands() -> str:
     """The numbered commands of :func:`reap_held_lines`, for the package this doctor runs from."""
-    from levain.slot import layout
-
     host = "darwin" if sys.platform == "darwin" else "linux"
     src = os.path.dirname(os.path.abspath(__file__))
     steps = "\n".join(f"        {i}. {c}" for i, c in enumerate(reap_held_lines(host, src), 1))
-    return steps + ("\n        If 2 fails, stop and look at why: steps 3-5 need the copy. If 3 fails, still run 4 and 5."
-                      "\n        If 4 fails, run it again before 5. Step 6 asks for your password.")
+    return steps + f"\n        {REAP_HELD_NOTE} Step 6 asks for your password."
 
 
 def _check_slot_services(*, host: str | None = None, store: Path | None = None, run: Path | None = None,

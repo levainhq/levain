@@ -684,3 +684,16 @@ def test_missing_dist_info_refuses_not_internal_error(env, capsys):
     rc = U.run_upgrade(seams=seams)
     out = capsys.readouterr().out
     assert rc == 1 and "Could not tell how Levain was installed" in out and "internal error" not in out
+
+
+def test_the_held_stop_and_doctors_commands_carry_the_one_recovery_note(env, capsys):
+    """diogenes-20261030-d9d96f470451 + -8378bb223985: one note under the five commands, in `levain doctor` and in
+    `levain upgrade`; only step 3 reads the copy, so a failed 2 still runs 4 (the reaper must not stay stopped)."""
+    from levain import doctor
+
+    assert "If 2 fails, still run 4" in doctor.REAP_HELD_NOTE and "only 3 needs the copy" in doctor.REAP_HELD_NOTE
+    assert "steps 3-5 need the copy" not in doctor.REAP_HELD_NOTE
+    assert doctor.REAP_HELD_NOTE in doctor._held_commands()
+    env.held = SimpleNamespace(name="agent held sessions", ok=False, detail="1 stuck mid-end: s1 at stop")
+    rc, out = env.run(capsys, no_pip=True)
+    assert rc == 3 and doctor.REAP_HELD_NOTE in out
