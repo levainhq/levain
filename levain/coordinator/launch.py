@@ -167,12 +167,14 @@ _PROJECT_LAYERS = "project,local"
 
 
 def _layer_args(user_scope: bool) -> list[str]:
-    """The Claude Code flags that keep your user layer (user settings, hooks, CLAUDE.md, auto-memory) out of a session
+    """The Claude Code flags that keep your user layer (user settings, hooks, CLAUDE.md) out of a session
     Levain starts: none when ``user_scope`` is on. The one home of the rule, for the coordinator and later a worker."""
     if user_scope:
         return []
     # both forms (one comma-joined argument, inline JSON) were accepted by four real `claude --bg` runs on Claude Code
-    # 2.1.314 (1030-42 dietrun)
+    # 2.1.314 (1030-42 dietrun). Measured 10-30 on 2.1.314: with `--setting-sources project,local` those four runs
+    # answered NOT IN CONTEXT for a fact only in the user's ~/.claude/CLAUDE.md and for a canary string, so the user
+    # CLAUDE.md was not injected. Re-measure after a Claude Code upgrade.
     return ["--setting-sources", _PROJECT_LAYERS, "--settings", '{"autoMemoryEnabled":false}']
 
 
@@ -204,10 +206,9 @@ def hook_live(directory: Path, *, user_scope: bool) -> tuple[bool, str]:
     layers = "all layers (user, project, local)" if user_scope else f"{_PROJECT_LAYERS} only"
     note = f"; the coordinator loads {layers}"
     if off is not None and not user_scope:
-        try:
-            files = {f.resolve() for f in doctor._hooks_off_files(Path(directory), "claude-code")}
-        except Exception:  # noqa: BLE001 - unreadable: the row stands as doctor reported it
-            files = set()
+        # doctor has no public form of this lookup; a rename there raises here (tested), never a silent refusal. The
+        # helper itself skips a file it cannot read or parse.
+        files = {f.resolve() for f in doctor._hooks_off_files(Path(directory), "claude-code")}
         if files and files <= _user_settings_files():
             off, note = None, note + " (user-level disableAllHooks is not consulted)"
     for row in rows:

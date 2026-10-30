@@ -1238,7 +1238,7 @@ def user_layer_text(setting: Any) -> str:
     if agent != "claude":
         return "user layer: not applicable (not a claude coordinator)"
     if on:
-        return "user layer: on (your user settings, hooks, CLAUDE.md and auto-memory load too)"
+        return "user layer: on (the coordinator loads your user settings, hooks and CLAUDE.md)"
     return "user layer: off (project settings only)"
 
 
@@ -1651,7 +1651,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ca.add_argument("agent", nargs="?", default=None, choices=("claude", "codex", "none"))
     ca.add_argument("--user-scope", choices=("on", "off"), default=None, dest="user_scope",
                     help="claude: whether the coordinator also loads your user-level Claude Code settings, hooks, "
-                         "CLAUDE.md and auto-memory (default off: it loads the project and local layers only). Alone "
+                         "CLAUDE.md (default off: it loads the project and local layers only). Alone "
                          "(no agent) it changes only this and keeps the standing agent, model and directory.")
     ca.add_argument("--cwd", type=Path, default=None, metavar="DIR",
                     help="The directory the coordinator runs in (default: <levain home>/coordinator, or "

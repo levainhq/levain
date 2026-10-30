@@ -1431,8 +1431,11 @@ def test_a_pre_existing_store_reads_as_off_and_keeps_its_row(tmp_path):
     try:
         # coord_settings as it was before user_scope: no column, one standing row (its triggers go with the table)
         c.execute("DROP TABLE coord_settings")
-        c.execute("CREATE TABLE coord_settings (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, "
-                  "agent TEXT NOT NULL, model TEXT, cwd TEXT, by TEXT NOT NULL, at TEXT NOT NULL)")
+        # the production DDL minus only the new column, so the agent/cwd and by CHECKs are the real ones
+        (prod,) = [d for d in lease.LEASE_SCHEMA if "TABLE IF NOT EXISTS coord_settings" in d]
+        col = "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), "
+        assert col in prod
+        c.execute(prod.replace(col, "").replace("IF NOT EXISTS ", ""))
         c.execute("INSERT INTO gseq (at) VALUES ('2026-01-01T00:00:00Z')")
         c.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, by, at) VALUES (1, 'claude', 'haiku', '/x', "
                   "'operator', '2026-01-01T00:00:00Z')")
@@ -1456,7 +1459,7 @@ def test_coord_status_says_the_user_layer(tmp_home, qdir, fake, capsys):
     js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
     assert js["setting"]["user_scope"] is False
     out = _main(qdir, capsys, "coord", "agent", "claude", "--user-scope", "on").out
-    assert "user layer: on" in out
+    assert "user layer: on" in out and "auto-memory" not in out       # auto-memory was never measured under --bg
     assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["setting"]["user_scope"] is True
     s = CoordStore(qdir).coord_setting()
     # --user-scope alone keeps the agent, model and directory
@@ -1589,3 +1592,18 @@ def test_a_user_level_disable_all_hooks_through_a_symlinked_home_is_not_consulte
     live, detail = cl.hook_live(target, user_scope=False)
     assert live, detail
     assert not cl.hook_live(target, user_scope=True)[0]
+
+
+def test_a_missing_hooks_off_helper_fails_loud_not_as_a_refusal(tmp_path, tmp_home, qdir, fake, capsys, monkeypatch):
+    from levain import doctor
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    assert cl.hook_live(target, user_scope=False)[0]                    # user-only file: not consulted
+    rows_now = doctor._check_claude_code(target)                         # doctor's own rows survive the rename
+    monkeypatch.setattr(doctor, "_check_claude_code", lambda _d: rows_now)
+    monkeypatch.delattr(doctor, "_hooks_off_files")                      # a rename in doctor
+    with pytest.raises(AttributeError):
+        cl.hook_live(target, user_scope=False)
