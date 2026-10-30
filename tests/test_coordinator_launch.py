@@ -1377,3 +1377,252 @@ def test_every_levain_verb_the_brief_names_passes_the_coordinators_door(store, f
     assert {("coord", "questions"), ("coord", "answer"), ("coord", "escalate"), ("coord", "claim")} <= paths
     refused = sorted(p for p in paths if p not in door.DOOR)
     assert not refused, f"the brief names verbs the coordinator's door refuses: {refused}"
+
+
+# --- a drop that lands while a done coordinator idles (1030-42; the shadow day, 10-30 17:33) --------------------
+def _released_and_done(store, fake, clock):
+    """The measured case: a coordinator woke on drop 1, split it, released its lease and sits listed, state done."""
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d1, _ = store.accept_drop("first drop", surface="cli")
+    store.split(d1.drop_id, [Part("work", "w1")], by="coordinator", token=token)
+    store.coord_release(token, by="coordinator")
+    fake.flag("done")
+    clock[0] += timedelta(minutes=3)
+    return ln
+
+
+def test_a_drop_after_a_done_coordinator_released_gets_a_fresh_coordinator_in_one_pass(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)
+    d2, _ = store.accept_drop("drop after the release", surface="cli")
+    assert store.coord_status()["wake"] == "idle" and store.coord_status()["lease"] is None     # the measured state
+    clock[0] += timedelta(seconds=30)
+    lines = cl.watch_once(store)
+    assert any(line.startswith(f"launch {ln.launch_id} ended: {lease.REPLACED}") for line in lines), lines
+    assert any(line.startswith(f"launch {ln.launch_id} ended ({lease.REPLACED}): claude stop {HID}") for line in lines)
+    assert len(fake.spawns()) == 2
+    fresh = [x for x in store.launches_active() if x.launch_id != ln.launch_id]
+    assert len(fresh) == 1 and store.launch(ln.launch_id).state == "ended"
+    brief = cl.brief_path(fresh[0]).read_text()
+    assert d2.drop_id in brief and "drop after the release" in brief          # its brief quotes the waiting drop
+    # the fresh one has not yet written and the drop is older than its activation: later passes leave it alone
+    for _ in range(2):
+        clock[0] += timedelta(seconds=30)
+        cl.watch_once(store)
+    assert len(fake.spawns()) == 2 and [x.launch_id for x in store.launches_active()] == [fresh[0].launch_id]
+
+
+def test_a_replaced_coordinator_that_wrote_is_no_death(store, fake, live_hook, clock):
+    from levain.coordinator import lease as lease_mod
+
+    ln = _released_and_done(store, fake, clock)
+    store.accept_drop("drop after the release", surface="cli")
+    cl.watch_once(store)
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease_mod.launch_death(conn, lease_mod.launch(conn, ln.launch_id)) is False
+    finally:
+        conn.close()
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_a_working_coordinator_without_the_lease_is_not_replaced(store, fake, live_hook, clock):
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    store.coord_release(token, by="coordinator")                        # the fake lists it working (no done flag)
+    store.accept_drop("a drop while it works", surface="cli")
+    lines = cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and fake.stops() == []
+    assert store.launch(ln.launch_id).state == "active" and not any(lease.REPLACED in x for x in lines)
+
+
+def test_a_done_coordinator_that_already_saw_every_drop_is_not_replaced(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)         # drop 1 was split before the release: nothing unseen waits
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and store.launch(ln.launch_id).state == "active"
+
+
+def test_a_drop_the_done_coordinator_never_saw_is_replaced_even_with_its_lease_live(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    store.coord_claim(ln.launch_id, ln.session_key)      # it holds a live lease and went done without releasing
+    fake.flag("done")
+    clock[0] += timedelta(minutes=2)
+    store.accept_drop("a drop for the done holder", surface="cli")
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended" and len(fake.spawns()) == 2
+
+
+# --- L3 r1 (1030-42): the unseen rule, the replacement is no death, the uncapped in-transaction check -------------
+def test_a_coordinator_that_never_wrote_then_done_is_replaced_and_its_successor_starts(store, fake, live_hook, clock):
+    # codex HIGH 1's reproduction: active, never claimed or wrote, done, then a drop it never saw
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=2)
+    store.accept_drop("a drop for the silent coordinator", surface="cli")
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).cause == lease.REPLACED, lines
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease.launch_death(conn, lease.launch(conn, ln.launch_id)) is False
+    finally:
+        conn.close()
+    fresh = [x for x in store.launches_active() if x.launch_id != ln.launch_id]
+    assert len(fresh) == 1 and len(fake.spawns()) == 2, lines
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_a_coordinator_writing_after_the_drop_without_reading_it_is_still_replaced(store, fake, live_hook, clock):
+    # codex HIGH 2 / complement MED 1: a later beat or release is no evidence the drop was seen
+    from datetime import timedelta
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    clock[0] += timedelta(seconds=10)
+    store.accept_drop("lands mid-turn", surface="cli")
+    clock[0] += timedelta(seconds=10)
+    store.coord_beat(token)
+    store.coord_release(token, by="coordinator")
+    fake.flag("done")
+    clock[0] += timedelta(seconds=10)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).cause == lease.REPLACED and len(fake.spawns()) == 2
+
+
+def test_one_replacement_per_drop_a_replacement_that_leaves_the_drop_unsplit_is_not_replaced(
+        store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    a = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    d, _ = store.accept_drop("the drop after A", surface="cli")
+    cl.watch_once(store)
+    (b,) = [x for x in store.launches_active() if x.launch_id != a.launch_id]
+    assert store.launch(a.launch_id).cause == lease.REPLACED
+    # B went done too and never split d (the fake still lists the one session done): d is older than B's start
+    for _ in range(3):
+        clock[0] += timedelta(minutes=1)
+        lines = cl.watch_once(store)
+        assert not any(lease.REPLACED in x and "ended:" in x for x in lines), lines
+    assert store.launch(b.launch_id).state == "active" and len(fake.spawns()) == 2
+    assert not any(r.body.get("stage") == "split" for r in store.drop_receipts(d.drop_id))
+
+
+def test_the_unseen_check_is_uncapped_201_drops_the_oldest_unsplit(store, fake, live_hook, clock):
+    # codex MED 3: the newest 200 split by you, the oldest (after the coordinator's start) left unsplit
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    fake.flag("done")
+    drops = []
+    for i in range(201):
+        clock[0] += timedelta(milliseconds=5)
+        drops.append(store.accept_drop(f"drop {i}", surface="cli")[0])
+    for d in drops[1:]:
+        store.split(d.drop_id, [Part("note", "n")])
+    got = store.launch_replace_done(ln.launch_id)
+    assert got is not None and got[0].cause == lease.REPLACED
+
+
+def test_a_split_between_the_listing_and_the_transaction_ends_nothing(store, fake, live_hook, clock, monkeypatch):
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    d, _ = store.accept_drop("split by you at the last moment", surface="cli")
+    real = store.launch_replace_done
+
+    def split_first(launch_id, **kw):
+        store.split(d.drop_id, [Part("work", "w")])          # you split it after the watcher read the listing
+        return real(launch_id, **kw)
+
+    monkeypatch.setattr(store, "launch_replace_done", split_first)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active" and len(fake.spawns()) == 1 and fake.stops() == []
+
+
+def test_replacing_stops_at_the_first_fresh_launch(monkeypatch):
+    # complement LOW 3: two done coordinators, one fresh launch: the second is never ended with none to follow it
+    from types import SimpleNamespace
+
+    a = SimpleNamespace(launch_id="ln-a", role="coordinator", harness_session_id="sa")
+    b = SimpleNamespace(launch_id="ln-b", role="coordinator", harness_session_id="sb")
+    asked: list[str] = []
+
+    def replace(launch_id, **kw):
+        asked.append(launch_id)
+        return SimpleNamespace(launch_id=launch_id, cause=lease.REPLACED), SimpleNamespace(launch_id="ln-new",
+                                                                                           harness="claude")
+
+    st = SimpleNamespace(launch_replace_done=replace)
+    lines: list[str] = []
+    fresh = cl._replace_done(st, [a, b], {"sa": {"state": "done"}, "sb": {"state": "done"}}, lines)
+    assert fresh == ["ln-new"] and asked == ["ln-a"]
+
+
+def test_a_fault_starting_the_fresh_coordinator_is_a_line_and_the_briefs_still_go(store, fake, live_hook, clock,
+                                                                                   monkeypatch):
+    # complement LOW 2
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    store.accept_drop("a drop", surface="cli")
+    brief = cl.brief_path(ln)
+    assert brief.exists()
+
+    def boom(st, launch_id):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(cl, "launch_session", boom)
+    lines = cl.watch_once(store)
+    assert any("not started: the start faulted (OperationalError" in x for x in lines), lines
+    assert not brief.exists() and f"launch {ln.launch_id} ended: its brief removed" in lines
+
+
+# --- levain coord wake reaches an idle released coordinator (desk 1 / flow-shadow addendum) ----------------------
+def test_coord_wake_replaces_a_done_coordinator_running_without_the_lease(store, qdir, fake, live_hook, clock, capsys):
+    ln = _released_and_done(store, fake, clock)
+    assert store.coord_status()["wake"] == "idle"
+    out = _main(qdir, capsys, "coord", "wake")
+    assert f"launch {ln.launch_id} ended: {lease.REPLACED} (claude stop {HID}: stopped {HID})" in out.out, out.out
+    assert f"claude attach {HID}" in out.out
+    assert store.launch(ln.launch_id).cause == lease.REPLACED and len(fake.spawns()) == 2
+    assert [c for c in fake.stops()] == [["stop", HID]]
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_coord_wake_leaves_a_working_coordinator_and_names_the_way_out(store, qdir, fake, live_hook, clock, capsys):
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    store.coord_release(token, by="coordinator")                 # the fake lists it working
+    out = _main(qdir, capsys, "coord", "wake", rc=1)
+    assert "no launch asked for:" in out.out and "not done" in out.out and "levain coord release" in out.out
+    assert store.launch(ln.launch_id).state == "active" and len(fake.spawns()) == 1 and fake.stops() == []
+
+
+def test_coord_wake_with_an_unreadable_listing_says_so(store, qdir, fake, live_hook, clock, capsys):
+    ln = _released_and_done(store, fake, clock)
+    fake.flag("agents_fail")
+    out = _main(qdir, capsys, "coord", "wake", rc=1)
+    assert "could not be read" in out.out and "levain coord release" in out.out
+    assert store.launch(ln.launch_id).state == "active"

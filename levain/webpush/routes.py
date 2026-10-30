@@ -95,6 +95,29 @@ def _body_json(body: bytes) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
+def _subscription(body: bytes) -> "tuple[dict, None] | tuple[None, tuple[int, bytes, str]]":
+    """A subscribe body as ``(obj, None)``, its endpoint normalised, or ``(None, the 400 it earns)``."""
+    obj = _body_json(body)
+    keys = obj.get("keys") if obj else None
+    endpoint = valid_endpoint(obj.get("endpoint")) if obj else None
+    if endpoint is None:
+        return None, _err(400, "bad_endpoint", "the endpoint must be an https URL on a known push service")
+    try:
+        p256dh, auth = keys["p256dh"], keys["auth"]
+        ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ece.b64d(p256dh))
+        if len(ece.b64d(auth)) != 16:
+            raise ValueError("auth")
+    except (TypeError, KeyError, ValueError):
+        return None, _err(400, "bad_keys", "keys.p256dh must be a P-256 point and keys.auth 16 bytes, base64url")
+    return {**obj, "endpoint": endpoint}, None
+
+
+def subscription_refusal(body: bytes) -> tuple[int, bytes, str] | None:
+    """The 400 ``handle`` would answer this subscribe body with, or None when it is one ``handle`` stores (the cockpit
+    asks before it pairs a browser, so a bad body mints nothing)."""
+    return _subscription(body)[1]
+
+
 def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path | str, authorized: bool,
            device_id: str | None, journal: Path | str | None = None) -> tuple[int, bytes, str] | None:
     """``journal``: the cockpit data root whose pairing journal holds ``device_id`` when it is a ``paired-`` device
@@ -157,18 +180,10 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
         return _json(200, {"code": code, "short": short,
                            "short_ttl_seconds": int(devices.SHORT_PAIRING_TTL.total_seconds())})
     if method == "POST" and path == "/webpush/subscribe":
-        obj = _body_json(body)
-        keys = obj.get("keys") if obj else None
-        endpoint = valid_endpoint(obj.get("endpoint")) if obj else None
-        if endpoint is None:
-            return _err(400, "bad_endpoint", "the endpoint must be an https URL on a known push service")
-        try:
-            p256dh, auth = keys["p256dh"], keys["auth"]
-            ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ece.b64d(p256dh))
-            if len(ece.b64d(auth)) != 16:
-                raise ValueError("auth")
-        except (TypeError, KeyError, ValueError):
-            return _err(400, "bad_keys", "keys.p256dh must be a P-256 point and keys.auth 16 bytes, base64url")
+        obj, refusal = _subscription(body)
+        if refusal is not None:
+            return refusal
+        endpoint, p256dh, auth = obj["endpoint"], obj["keys"]["p256dh"], obj["keys"]["auth"]
         if device_id is not None:
             try:
                 return _json(200, {"id": store.add_subscription(endpoint, p256dh, auth, device_id, journal=journal)})

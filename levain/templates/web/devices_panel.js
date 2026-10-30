@@ -18,11 +18,13 @@
   let running = null, rerun = false, gone = false, refused = "";
   const READ_TIMEOUT_MS = 20000;
   // ONESURFACE OS-4: pings for THIS browser. The row appears only where the cockpit serves web push (GET /webpush/key
-  // answers, beside a Signer). Only a paired device's key may subscribe (the server answers 403 device_required to the
-  // cockpit's own key), so every subscription has a revoke above it. The worker (/sw.js) keeps the key to record an
-  // open, and is told to send it under this page's header (H), on every read, so a re-paired browser hands it the new one.
+  // answers, beside a Signer). Every subscription is a paired device's, so it has a revoke above it: Turn on under the
+  // cockpit's own key pairs this browser on the spot, and the page keeps the device key it is handed (as pair.js keeps a
+  // claimed one) and uses it from then on. The worker (/sw.js) keeps the key to record an open, and is told to send it
+  // under this page's header (H), on every read, so a re-paired browser hands it the new one.
+  const PAIRED_MARK_KEY = "levain_paired_device";   // MUST equal pair.js / dashboard_boot.js PAIRED_MARK_KEY
   const PUSH_OK = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
-  let pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false, refusedMsg = "";
+  let pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
   const b64uToBytes = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
                                              (c) => c.charCodeAt(0));
 
@@ -203,12 +205,11 @@
     pingBtn.textContent = sub ? "Turn off" : "Turn on";
     pingBtn.setAttribute("aria-label", sub ? "Turn pings off on this browser" : "Turn pings on for this browser");
     pingState.textContent = sub ? "on: a sign request or a question pings this browser"
-      : refusedMsg ? refusedMsg
       : Notification.permission === "denied" ? "off: this browser blocks notifications from this page"
       : "off: turn on to be pinged here when the cockpit needs you";
   }
   async function turnOn() {
-    pingBtn.disabled = true; say(""); refusedMsg = "";
+    pingBtn.disabled = true; say("");
     let sub = null;
     try {
       // the permission prompt must come straight from the tap, so it is the first thing this handler does
@@ -224,16 +225,22 @@
       if (res.status !== 200) {
         // a browser subscription the cockpit does not hold would read "on" and never ping
         await sub.unsubscribe().catch(() => {});
-        if (res.data.error === "device_required") {
-          // the cockpit's own key is refused by design: say it on the row (the note sits below the pairing form), kept
-          // past the re-render in the finally
-          refusedMsg = "off: pings need this browser's own key. Make a pairing link below, open it in this browser, then turn pings on.";
-          say("Pings need this browser's own key: make a pairing link below, open it in this browser, then turn pings on.");
-        } else say("Could not turn pings on (" + (res.data.message || res.status) + ").");
+        say("Could not turn pings on (" + (res.data.message || res.status) + ").");
         return;
       }
+      // the cockpit paired this browser: keep its device key where pair.js keeps a claimed one, then use it
+      const minted = typeof res.data.token === "string" && /^[\x21-\x7e]+$/.test(res.data.token) ? res.data.token : "";
+      let kept = !minted;
+      if (minted) {
+        try { window.localStorage.setItem(WRITE_TOKEN_KEY, minted); kept = true; } catch (_) { /* said below */ }
+        if (kept) {
+          try { window.localStorage.setItem(PAIRED_MARK_KEY, "1"); } catch (_) { /* the key is kept; the mark is not */ }
+          try { window.dispatchEvent(new Event("levain:write-token-change")); } catch (_) { /* no events */ }
+        }
+      }
       giveToken(reg);
-      say("Pings are on for this browser.");
+      say(kept ? "Pings are on for this browser." : "Pings are on for this browser, but it could not keep its own key (storage is blocked here); revoke its row to stop them.");
+      if (minted) refresh();
     } catch (e) {
       if (sub) await sub.unsubscribe().catch(() => {});
       say("Could not turn pings on: " + ((e && e.message) || e));

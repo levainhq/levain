@@ -1,7 +1,8 @@
 """ONESURFACE OS-4: web push on the cockpit's own origin. The service worker, manifest and icons are token-free (they
 carry no data, and a browser fetches them without the page's credential); every ``/webpush/*`` data route needs the
-cockpit's credential on every bind; only a PAIRED device may subscribe, so every subscription has a revoke that stops
-it; revoking the device in the cockpit retires its subscriptions; the phone port's own pairing is not served here."""
+cockpit's credential on every bind; every subscription is a PAIRED device's, so it has a revoke that stops it (Turn on
+under the cockpit's own key pairs the browser on the spot); revoking the device in the cockpit retires its
+subscriptions; the phone port's own pairing is not served here."""
 from __future__ import annotations
 
 import base64
@@ -45,12 +46,12 @@ def rig(tmp_path: Path) -> tuple[Any, Path]:
 
 
 @contextmanager
-def _signed(src: Any, qdir: Path) -> Iterator[tuple[int, Any]]:
+def _signed(src: Any, qdir: Path, install_class: "str | None" = "reported") -> Iterator[tuple[int, Any]]:
     """The cockpit served with a Signer over ``qdir`` (no passkeys enrolled), pinned to this server's own page."""
     port = _free_port()
     signer = Signer(qdir, (NS,), "localhost", lambda: {})
     signer.page_origin = f"http://localhost:{port}"
-    httpd = make_server(src, host="127.0.0.1", port=port, surface_tokens={"browser": T}, install_class="reported",
+    httpd = make_server(src, host="127.0.0.1", port=port, surface_tokens={"browser": T}, install_class=install_class,
                         signer=signer)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
@@ -106,8 +107,6 @@ def test_the_phone_ports_own_pairing_is_not_served_on_the_cockpit(rig) -> None:
 def test_only_a_paired_device_subscribes_and_its_revoke_stops_its_pings(rig) -> None:
     src, qdir = rig
     with _signed(src, qdir) as (port, _):
-        st, out, _ = _call(port, "POST", "/webpush/subscribe", _sub(1), token=T)
-        assert st == 403 and out["error"] == "device_required", out      # a surface token has no revoke
         dev, tok = _pair(port)
         other_dev, other_tok = _pair(port, label="phone")
         st, out, _ = _call(port, "POST", "/webpush/subscribe", _sub(2), token=tok, headers=PROXY)
@@ -120,6 +119,78 @@ def test_only_a_paired_device_subscribes_and_its_revoke_stops_its_pings(rig) -> 
         live = {s["endpoint"]: s["device_id"] for s in PushStore(qdir).live_subscriptions()}
         assert live == {_sub(3)["endpoint"]: PAIRED_PREFIX + other_dev}
         assert _call(port, "GET", "/webpush/key", token=tok)[0] == 403
+
+
+_MAC_CHROME = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/130.0.0.0 Safari/537.36")
+
+
+def _devices(port: int) -> dict[str, dict[str, Any]]:
+    st, out, _ = _call(port, "GET", "/cockpit/pair/devices.json", token=T)
+    assert st == 200, out
+    return {d["id"]: d for d in out["devices"]}
+
+
+def test_turn_on_under_the_cockpits_own_key_pairs_this_browser_and_its_revoke_stops_the_pings(rig) -> None:
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _):
+        st, out, hdrs = _call(port, "POST", "/webpush/subscribe", _sub(1), token=T,
+                              headers={"User-Agent": _MAC_CHROME})
+        assert st == 200 and isinstance(out["id"], int), out
+        assert hdrs["cache-control"] == "no-store"                   # the token is handed back once, as the claim's
+        dev, tok = out["device_id"], out["token"]
+        row = _devices(port)[dev]
+        assert (row["label"], row["paired_by"], row["revoked_at"]) == ("this browser (Chrome on macOS)", "browser", None)
+        assert [s["device_id"] for s in PushStore(qdir).live_subscriptions()] == [PAIRED_PREFIX + dev]
+        # the key it was handed is an ordinary paired device's: its own subscribe is the paired one, no second device
+        st, again, _ = _call(port, "POST", "/webpush/subscribe", _sub(1), token=tok)
+        assert st == 200 and "token" not in again and set(_devices(port)) == {dev}, again
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": dev}, token=T)
+        assert st == 200 and out["revoked"] == [dev], out
+        assert PushStore(qdir).live_subscriptions() == []
+        assert _call(port, "GET", "/webpush/key", token=tok)[0] == 403
+
+
+def test_a_cockpit_that_cannot_pair_refuses_turn_on_with_the_offers_own_answer(rig) -> None:
+    from levain.dashboard import SubstrateSource
+
+    src, qdir = rig
+    read_only = SubstrateSource(anneal=src.anneal, write_scope=None, context_json=src.context_json)
+    for source, install_class in ((read_only, "reported"), (src, None)):
+        with _signed(source, qdir, install_class=install_class) as (port, _):
+            offer = _call(port, "POST", "/cockpit/pair/offer", {}, token=T)[:2]
+            got = _call(port, "POST", "/webpush/subscribe", _sub(1), token=T)[:2]
+            assert offer[0] in (403, 404) and got == offer, (install_class, offer, got)
+        assert PushStore(qdir).live_subscriptions() == []
+
+
+def test_a_bad_body_mints_nothing_and_a_subscribe_failing_after_the_mint_leaves_no_live_device(rig, monkeypatch) -> None:
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _):
+        st, out, _ = _call(port, "POST", "/webpush/subscribe", {"endpoint": "https://evil.example/x"}, token=T)
+        assert (st, out["error"]) == (400, "bad_endpoint") and _devices(port) == {}, out
+
+        def broken(*a, **k):
+            raise OSError("push store unwritable")
+
+        monkeypatch.setattr(PushStore, "add_subscription", broken)
+        st, out, _ = _call(port, "POST", "/webpush/subscribe", _sub(1), token=T)
+        assert (st, out["error"]) == (500, "internal") and "token" not in out, out
+        rows = list(_devices(port).values())
+        assert len(rows) == 1 and rows[0]["revoked_at"] is not None, rows      # the ledger revokes, it never deletes
+        assert PushStore(qdir).live_subscriptions() == []
+
+
+def test_the_browser_label_is_fixed_words_never_the_header() -> None:
+    from levain.web_server import _browser_label
+
+    assert _browser_label(_MAC_CHROME) == "this browser (Chrome on macOS)"
+    assert _browser_label("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like "
+                          "Gecko) Version/18.0 Mobile/15E148 Safari/604.1") == "this browser (Safari on iPhone)"
+    assert _browser_label("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0") == "this browser (Edge on Windows)"
+    assert _browser_label("<script>" * 500) == "this browser"
+    assert _browser_label("") == "this browser"
 
 
 def test_an_open_is_recorded_under_the_device_that_opened_it(rig) -> None:
@@ -348,24 +419,29 @@ def test_the_devices_panel_turns_pings_on_for_a_paired_browser(rig, pushes, tmp_
 
 
 @needs_browser
-def test_the_cockpits_own_key_is_told_to_pair_first_and_keeps_nothing(rig, tmp_path) -> None:
-
+def test_one_tap_under_the_cockpits_own_key_pairs_this_browser_and_lists_it(rig, pushes, tmp_path) -> None:
     src, qdir = rig
     with _signed(src, qdir) as (port, _):
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token={T}", _panel(T, _sub(8), [
-            {"until": "document.querySelector('.dev-note') && !document.querySelector('.dev-note').hidden"
+            {"until": f"{_ROW}.querySelector('button').textContent === 'Turn off'", "ms": 20000},
+            # the Devices list is read again under the new key and shows this browser's row, with its Revoke
+            {"until": "[...document.querySelectorAll('.dev-row')].some((r) => r.textContent.includes('this browser (')"
+                      " && r.querySelector('button.dev-btn'))"
                       " && document.querySelector('.dev-note').textContent", "ms": 20000},
-            # the refusal is said on the pings row itself, which survives the re-render (the note sits below the pair form);
-            # waited for, because the note is set before the finally's pings() has re-rendered the row
-            {"until": f"{_ROW}.querySelector('.dev-meta').textContent.startsWith(\"off: pings need\")"
-                      f" && {_ROW}.querySelector('.dev-meta').textContent", "ms": 20000},
-            {"eval": f"{_ROW}.querySelector('button').textContent"},
+            {"eval": "[localStorage.getItem('levain_write_token'), localStorage.getItem('levain_paired_device')]"},
+            {"until": f"{_WORKER_KV}.then((r) => Array.isArray(r) && r[1] !== {T!r} && r)", "ms": 20000},
         ]))
-        assert PushStore(qdir).live_subscriptions() == []
+        live = PushStore(qdir).live_subscriptions()
+        assert len(live) == 1 and live[0]["device_id"].startswith(PAIRED_PREFIX), live
+        dev = live[0]["device_id"][len(PAIRED_PREFIX):]
+        assert _devices(port)[dev]["revoked_at"] is None
+        assert _notify(qdir) is True
     v = out["values"]
-    assert v[3].startswith("Pings need this browser's own key"), v
-    assert v[4].startswith("off: pings need this browser's own key"), v
-    assert v[5] == "Turn on", v                                  # the browser's subscription was dropped too
+    assert v[4] == "Pings are on for this browser.", v
+    kept, mark = v[5]
+    assert kept != T and mark == "1", v                         # the page holds the device key now, as pair.js keeps one
+    assert v[6] == ["X-Levain-Write-Token", kept], v           # and its worker sends opens under it
+    assert pushes == [_sub(8)["endpoint"]]
 
 
 @needs_browser

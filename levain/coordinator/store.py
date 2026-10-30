@@ -516,6 +516,34 @@ class CoordStore:
             raise
         return conn
 
+    def coordinator_present(self) -> bool:
+        """Whether a coordinator store is here, read without making or migrating anything: the directory rule read
+        with ``lstat``, the file opened ``mode=ro`` and ``query_only``, True when it holds the coordinator's
+        ``threads`` table (an older format still counts: a writer brings it current). False for no directory, no file,
+        or a dispatch-only file; a directory that breaks the rule raises, as every opener's does."""
+        try:
+            self._check_directory_readonly()
+        except StoreAbsent:
+            return False
+        if not self.path.exists():
+            return False
+        # measured: a mode=ro open of a WAL file with no -wal beside it makes -wal and -shm. With none there, nothing
+        # is uncommitted outside the main file, so it is read immutable (no lock, no side file); with one there, a
+        # connection is or was open, and the plain read-only open reads through it
+        live = Path(str(self.path) + "-wal").exists()
+        try:
+            conn = sqlite3.connect(self.path.resolve().as_uri() + ("?mode=ro" if live else "?mode=ro&immutable=1"),
+                                   uri=True, timeout=BUSY_WAIT_S, isolation_level=None)
+        except sqlite3.OperationalError:
+            if not self.path.exists():          # removed between the check and the open
+                return False
+            raise
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            return "threads" in _names(conn)
+        finally:
+            conn.close()
+
     def _schema_current(self, conn: sqlite3.Connection, *, base: bool = False) -> bool:
         """``base`` (every display's gate, and a non-creating write's): the lifecycle tables are ADDITIVE, so a store
         made before C13 (none of them yet) is current for every reader; a writer's ensure-schema path makes them, and
@@ -1007,6 +1035,19 @@ class CoordStore:
 
         with self._write() as (conn, now):
             return lease.end_unlisted(conn, now, launch_id)
+
+    def launch_replace_done(self, launch_id: str, *, asked: bool = False) -> Any:
+        """``launch_id``'s session was listed done (:func:`levain.coordinator.lease.replace_done`; ``asked``: your
+        ``levain coord wake``, which needs no unseen drop): ``(ended launch, the fresh coordinator launch the same
+        transaction asked for or None)``, or None when nothing was replaced. The unseen-drop check, the end and the
+        wake are one transaction, so a split or a second drop cannot slip between them."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            ended = lease.replace_done(conn, now, launch_id, asked=asked)
+            if ended is None:
+                return None
+            return ended, lease.wake(conn, now)
 
     def coord_lease(self) -> Any:
         """The lease as it stands (live or past its until), or None; nothing written."""
