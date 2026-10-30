@@ -148,7 +148,7 @@ def test_a_server_without_a_write_scope_has_no_coordinator_verbs_and_writes_noth
             assert not set(COORD_VERBS) & set(httpd.extra_verbs)
             before = _snapshot(qdir)
             st, out, _ = _fire_http(port, verb, T, "k1")
-            assert st != 200 and out.get("ok") is not True, out
+            assert (st, out.get("error")) == (422, "read_only"), (st, out)
             assert _snapshot(qdir) == before
 
 
