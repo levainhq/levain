@@ -10,7 +10,13 @@ and calls ``lease.status`` on it directly. A lapse or an expiry that is due but 
 only when one is due, the snapshot is copied into memory, the coordinator's own ``_lapse_if_past`` and
 ``_expire_pending`` run on the copy, and the state word and its ``why`` come from there, so the state row is the word
 ``coord_status`` would report. The lease and launch rows keep what the store holds and say the write is not recorded.
-Start, Stop and Hold are a later session's verbs; this panel names the CLI line that does each act.
+
+The panel offers Start, Stop and Hold (C10 S3), each a downstream panel ``VerbSpec`` a server registers through
+``VerbRegistry.register_downstream`` (:func:`status_verbs`); their bodies are :mod:`levain.cockpit.coordinator_verbs`.
+**Start** does what a drop with no holder does, **Stop** is your ``release``, **Hold it myself** is your ``take`` for
+:data:`levain.cockpit.coordinator_verbs.HOLD`. A server that registers none of them draws the panel with no action.
+They belong beside a coordinator watcher (``make_server(coordinator_verbs=True)``): Stop ends the launch's record and
+Start may leave a launch pending, and only the watcher stops that session or retries that launch.
 """
 from __future__ import annotations
 
@@ -23,9 +29,31 @@ from levain.cockpit.consent import utc_stamp
 from levain.cockpit.engine import ReadContext
 from levain.cockpit.results import Read, Result, RowIn
 
-__all__ = ["COORD_STATUS_ID", "status_reader"]
+__all__ = ["COORD_STATUS_ID", "COORD_VERBS", "HOLD_VERB", "START_VERB", "STOP_VERB", "register_status_verbs",
+           "status_reader", "status_verbs"]
 
 COORD_STATUS_ID = "coord-status"
+START_VERB = "coord_start"
+STOP_VERB = "coord_stop"
+HOLD_VERB = "coord_hold"
+# what the panel offers; a verb the server did not register is dropped from the offer by the kernel's own rule
+COORD_VERBS = (START_VERB, STOP_VERB, HOLD_VERB)
+
+
+def status_verbs(directory: Callable[[], Path | str | None], **kw: Any) -> dict[str, Any]:
+    """The panel's verbs over the store in ``directory()`` (the directory the panel reads), keyed by name, for
+    ``make_server(coordinator_verbs=True)``. ``kw`` are :class:`levain.cockpit.coordinator_verbs.CoordinatorVerbs`' seams."""
+    from levain.cockpit.coordinator_verbs import CoordinatorVerbs
+
+    return CoordinatorVerbs(directory, **kw).specs()
+
+
+def register_status_verbs(registry: Any, directory: Callable[[], Path | str | None], **kw: Any) -> dict[str, Any]:
+    """Register :func:`status_verbs` on a :class:`levain.cockpit.verbs.VerbRegistry` as downstream verbs; returns them."""
+    specs = status_verbs(directory, **kw)
+    for name, spec in specs.items():
+        registry.register_downstream(name, spec)
+    return specs
 
 
 def _read_status(store: Any, now: datetime) -> dict[str, Any]:

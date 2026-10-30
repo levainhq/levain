@@ -44,6 +44,9 @@ Claude Code's own trust prompt is yours: Levain never reads or writes ``~/.claud
 pending launches nobody started, ends the launches whose sessions are gone, beats the lease of the coordinator whose
 session is listed, not done and writing, and stops the sessions of launches that are over. A pending launch so has a
 starter wherever it is written: ``levain drop`` and ``levain coord wake`` start their own, the watcher every other.
+Two watchers may run at once (a serve's thread and a hand-run watch): one pass at a time holds the store's lock.
+``claude`` is looked for on this process's PATH, then in the
+directories a login unit's PATH is built from, so a serve under launchd's minimal PATH still finds it.
 
 [seat] choices (C3b, 1020+50): the session name ``levain-<role>-<launch hex>``; the retry of the read back
 (:data:`READBACK_TRIES` x :data:`READBACK_DELAY`); the spawn and agents-call timeouts; the brief quotes at most
@@ -82,8 +85,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -112,6 +116,7 @@ UNLISTED_RECHECK = 2.0        # seconds: a launch ends unlisted only when two re
 _OURS = re.compile(r"levain-(coordinator|worker)-([0-9a-f]{32})")      # session_name's shape
 _OVER = ("ended", "failed", "expired")
 _BRIEF = re.compile(r"(ln-[0-9a-f]{32})\.md")                          # brief_path's file name
+WATCH_LOCK = "coord-watch.lock"     # in the store's directory: one watcher pass at a time over that store
 
 
 @dataclass(frozen=True)
@@ -476,7 +481,73 @@ def _harness_id(row: dict[str, Any]) -> str | None:
     return None
 
 
+_BAND_AGENT = {"claude": "claude_code", "codex": "codex"}
+
+
+def _stop_episode(store: CoordStore) -> str | None:
+    """What names the stop the coordinator is in: the launch id of the FIRST death of the run the wake rule counts
+    (since you last looked, or a coordinator last ran). A death that follows the third leaves it unchanged, so one stop
+    stays one item; your take or release ends the run, so the next stop names another death. ``None`` when no death
+    is counted (the state moved under this read)."""
+    from levain.autonomic.durable_sqlite import read_transaction
+
+    with read_transaction(store.open_readonly) as conn:
+        looked = lease_mod._looked(conn)
+        first = None
+        # newest end first; the run ends at the first launch that did not die, and one nobody tried to start is skipped
+        for (launch_id,) in conn.execute(
+                "SELECT l.launch_id FROM launches l WHERE l.role = 'coordinator' AND l.gseq > ? ORDER BY "
+                "(SELECT MAX(e.gseq) FROM launch_events e WHERE e.launch_id = l.launch_id) DESC", (looked,)).fetchall():
+            death = lease_mod.launch_death(conn, lease_mod._launch_row(conn, "launch_id", launch_id))
+            if death is False:
+                break
+            if death:
+                first = launch_id
+        return first
+
+
+def _note_stopped(store: CoordStore) -> None:
+    """When the deaths on record have made the coordinator ``stopped``, put it on the band: one item per stop episode
+    however often this runs, and none again for an episode the operator answered. The state is read once more after
+    a filing and before its ping, so a verb or a CLI act that ended the stop meanwhile pings nobody. Any other state
+    touches the band not at all. Never raises: it follows a death that is already written, and the next pass tries
+    again."""
+    try:
+        from levain.consent import band
+
+        st = store.coord_status()
+        if st.get("wake") != "stopped":
+            # closing an item here would be Levain's act, and every answer channel names a person's
+            return
+        episode = _stop_episode(store)
+        if episode is None:
+            return
+        chosen = st.get("setting")
+        # an agent the band has no name for still files: a stop nobody is told of is worse than a ping to Claude Code
+        agent = _BAND_AGENT.get(chosen.get("agent") if isinstance(chosen, dict) else None, "claude_code")
+
+        def still() -> bool:
+            # a re-read that fails says nothing against the stop just read: the item and its ping stand
+            try:
+                return store.coord_status().get("wake") == "stopped" and _stop_episode(store) == episode
+            except Exception:  # noqa: BLE001
+                return True
+
+        band.file_coordinator_stopped(store.directory, agent, str(st.get("why", "")), episode, still=still)
+    except Exception:  # noqa: BLE001 - see the docstring
+        return
+
+
 def launch_session(store: CoordStore, launch_id: str) -> Outcome:
+    """:func:`_launch_session`, then the band is told when the launch that did not start made the coordinator
+    ``stopped``."""
+    out = _launch_session(store, launch_id)
+    if not out.started:
+        _note_stopped(store)
+    return out
+
+
+def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
     """Start launch ``launch_id``'s session (see the module docstring for the steps). Every way it does not start is
     an :class:`Outcome` with ``started`` False and the refusal; the launch is written ``failed`` with that cause
     whenever this call held the spawn. The checks that need no spawn (its directory, the hook, the briefs directory)
@@ -520,12 +591,10 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
         _brief_dir(ln)
     except (CoordError, OSError) as exc:
         return left(f"the launch's briefs directory refused ({type(exc).__name__}: {str(exc)[:300]})")
-    from levain.launch import child_env
-
-    if shutil.which("claude", path=child_env().get("PATH")) is None:
-        return left("claude is not on PATH")
     exe_, env_ = _harness()
-    held = _handover_blocked(store, exe_ or "claude", env_)
+    if exe_ is None:
+        return left("claude is not on PATH")
+    held = _handover_blocked(store, exe_, env_)
     if held:
         return left(f"{held}; retried when it is gone")
     got, why = store.launch_claim_spawn(launch_id, os.getpid())
@@ -558,12 +627,10 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
         return _stop_named(exe, name, real, cwd=mgmt, env=env)
 
     try:
-        from levain.launch import child_env
-
-        env = child_env(seat="attended")      # the coordinator is attachable: the band's D4 marker
-        exe = shutil.which("claude", path=env.get("PATH"))
-        if exe is None:
+        found, env = _harness()
+        if found is None:
             return fail("claude is not on PATH")
+        exe = found
         brief = _write_brief(store, got)
         name = session_name(got)
         argv = [exe, "--bg", "-n", name, "--permission-mode", "default",
@@ -611,11 +678,36 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
 
 
 # --- the watcher (levain coord watch) ----------------------------------------------------------------------------
+def _harness_dirs() -> tuple[str, ...]:
+    """Where ``claude`` is looked for when this process's PATH lacks it: the user-local bin and the standard
+    directories a login unit's PATH is built from. A serve that launchd or systemd started with its minimal PATH so
+    finds the harness wherever an install puts it, instead of every start and stop refusing."""
+    from levain.daemon import _BASE_PATH_DIRS
+
+    return (str(Path.home() / ".local" / "bin"), *_BASE_PATH_DIRS)
+
+
 def _harness() -> tuple[str | None, dict[str, str]]:
+    """The ``claude`` every start, list and stop runs, and the environment it runs in: :func:`levain.launch.child_env`
+    marked attended (the coordinator is attachable: the band's D4 marker). When its PATH lacks ``claude``, the
+    :func:`_harness_dirs` it does not name are appended to it and searched, so the harness also finds its own
+    interpreter there (an npm install's ``node`` sits beside it)."""
     from levain.launch import child_env
 
     env = child_env(seat="attended")
-    return shutil.which("claude", path=env.get("PATH")), env
+    exe = shutil.which("claude", path=env.get("PATH"))
+    if exe is not None:
+        return exe, env
+    have = [p for p in env.get("PATH", os.defpath).split(os.pathsep) if p]
+    try:
+        fallback = _harness_dirs()
+    except Exception:  # noqa: BLE001 - a lookup that cannot name the directories is "not on PATH", as it always was
+        fallback = ()
+    extra = [d for d in fallback if d not in have]
+    exe = shutil.which("claude", path=os.pathsep.join(extra)) if extra else None
+    if exe is None:
+        return None, env
+    return exe, {**env, "PATH": os.pathsep.join([*have, *extra])}
 
 
 def _observed(exe: str, env: dict[str, str], cwd: str) -> list[dict[str, Any]] | None:
@@ -706,15 +798,68 @@ def watch_once(store: CoordStore) -> list[str]:
 
     Any other row in the list is never read further. When the list cannot be read, (b)-(d) do nothing: an unread list
     is no evidence of anything. A list read with no row is a listing like any other (L3 r1 G2): an active launch
-    missing from it, and from a second read UNLISTED_RECHECK seconds later, ends."""
+    missing from it, and from a second read UNLISTED_RECHECK seconds later, ends.
+
+    The whole pass, (f) included, runs under the store's single-flight lock (:func:`_single_flight`, C10 S1): while
+    another pass over the same store runs, in this process or another, this one does nothing and says so. Two
+    watchers so never interleave their reads and stops, and (b)'s two reads stay one pass's own."""
     from levain.consent.band import release_held_pings
 
     lines: list[str] = []
-    try:
-        _watch_pass(store, lines)
-    finally:
-        lines.extend(release_held_pings(store.directory))      # never raises
+    with _single_flight(Path(store.directory)) as held:
+        if not held:
+            return [f"another watcher pass is running over {store.directory}: this pass did nothing"]
+        try:
+            _watch_pass(store, lines)
+        finally:
+            _note_stopped(store)                                   # never raises
+            lines.extend(release_held_pings(store.directory))      # never raises
     return lines
+
+
+# one in-process lock per store directory, beside the file lock: the file lock alone would leave two threads of one
+# process to the platform's flock semantics, which a network filesystem may give per process
+_PASS_LOCKS: dict[str, threading.Lock] = {}
+_PASS_LOCKS_GUARD = threading.Lock()
+
+
+@contextlib.contextmanager
+def _single_flight(directory: Path) -> Iterator[bool]:
+    """Hold the store's watcher lock for one pass: True when this pass holds it, False when another pass (a thread
+    here, or another process: the serve's watcher and a hand-run ``levain coord watch``) holds it now. A busy lock is
+    skipped, never waited for: a pass run right after another would list a session the first just asked to stop and
+    stop it again. The lock is ``<store directory>/coord-watch.lock`` under ``flock``, released when its descriptor
+    closes, a killed process's included. A lock that cannot be opened raises: an unlocked pass is the double stop
+    this lock exists to prevent."""
+    import fcntl     # POSIX only: imported here so the rest of this module loads where it is absent
+
+    key = os.path.realpath(directory)
+    with _PASS_LOCKS_GUARD:
+        mine = _PASS_LOCKS.setdefault(key, threading.Lock())
+    if not mine.acquire(blocking=False):
+        yield False
+        return
+    try:
+        try:
+            # a store never written has no directory yet: it is made private
+            os.makedirs(key, mode=0o700, exist_ok=True)
+            fd = os.open(os.path.join(key, WATCH_LOCK),
+                         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
+        except OSError as exc:
+            raise CoordError(f"the watcher's lock in {key} could not be opened ({exc})") from exc
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            except OSError as exc:
+                raise CoordError(f"the watcher's lock in {key} could not be taken ({exc})") from exc
+            yield True
+        finally:
+            os.close(fd)            # closing the descriptor releases the flock
+    finally:
+        mine.release()
 
 
 def _watch_pass(store: CoordStore, lines: list[str]) -> None:
