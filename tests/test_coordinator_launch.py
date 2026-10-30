@@ -1136,7 +1136,7 @@ def test_hooks_turned_off_by_a_settings_file_refuse_the_launch(tmp_home, qdir, f
     # a user-level file reaches the coordinator only with --user-scope on (the default no longer loads it)
     _main(qdir, capsys, "coord", "agent", "claude", *(["--user-scope", "on"] if scope == "user" else []))
     target = (tmp_home / ".levain" / "coordinator").resolve()
-    assert cl.hook_live(target)[0]
+    assert cl.hook_live(target, user_scope=True)[0]
     f = tmp_home / ".claude" / "settings.json" if scope == "user" else target / ".claude" / "settings.local.json"
     f.parent.mkdir(parents=True, exist_ok=True)
     data = json.loads(f.read_text()) if f.is_file() else {}
@@ -1144,7 +1144,7 @@ def test_hooks_turned_off_by_a_settings_file_refuse_the_launch(tmp_home, qdir, f
     checked = doctor._check_claude_code(target)
     (hook,) = [r for r in checked if r.name == cl.HOOK_ROW]
     assert hook.detail.startswith("wired to this install")          # the trap: wired, and still not running
-    live, why = cl.hook_live(target)
+    live, why = cl.hook_live(target, user_scope=True)
     assert not live and "turned off by" in why and str(f) in why
     store = CoordStore(qdir)
     d, _ = store.accept_drop("hooks are off", surface="cli")
@@ -1485,3 +1485,107 @@ def test_a_user_level_disable_all_hooks_is_not_consulted_without_user_scope(tmp_
     # a project-level file still refuses, with or without the user layer
     (target / ".claude" / "settings.local.json").write_text('{"disableAllHooks": true}')
     assert not cl.hook_live(target, user_scope=False)[0]
+
+
+# --- 1030-42 L3 r1 fixes ---------------------------------------------------------------------------------------
+def test_the_layer_flags_are_the_comma_form_as_one_argument():
+    # measured accepted by a real `claude --bg` on Claude Code 2.1.314 (1030-42 dietrun): one comma argument, inline JSON
+    assert cl._layer_args(False) == ["--setting-sources", "project,local", "--settings", '{"autoMemoryEnabled":false}']
+    assert cl._layer_args(True) == []
+
+
+@pytest.mark.parametrize("asked", [False, True])
+def test_a_pending_launch_spawns_with_the_layer_it_was_asked_under(qdir, workdir, fake, live_hook, asked):
+    # codex r1 HIGH: a drop wakes under one choice, the operator flips it before the watcher starts the launch
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=asked)
+    launch_id = woken(s, "race")
+    assert s.launch(launch_id).user_scope is asked
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=not asked)
+    assert cl.launch_session(s, launch_id).started
+    argv = fake.spawns()[-1]
+    assert ("--setting-sources" in argv) is (not asked) and ("--settings" in argv) is (not asked)
+
+
+def test_a_launch_asked_for_before_the_column_reads_as_off(qdir, workdir):
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    launch_id = woken(s, "old")
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        c.execute("ALTER TABLE launches DROP COLUMN user_scope")        # launches as it was before the column
+        c.commit()
+        assert lease.launch(c, launch_id).user_scope is False           # a reader before any writer migrates it
+    finally:
+        c.close()
+    fresh = CoordStore(qdir)                                            # a writer's opener adds it, 0 on the old row
+    assert fresh.launch(launch_id).user_scope is False
+    assert rows(qdir, "SELECT user_scope FROM launches WHERE launch_id = ?", launch_id) == [(0,)]
+
+
+def test_user_scope_never_sticks_to_a_non_claude_setting(qdir, workdir, capsys):
+    s = CoordStore(qdir)
+    s.coord_set_agent("codex", cwd=str(workdir.resolve()))
+    out = _main(qdir, capsys, "coord", "agent", "--user-scope", "on", rc=1)
+    assert "claude" in out.err and s.coord_setting().user_scope is False
+    # the store never writes a 1 on a non-claude row, so a later `coord agent claude` has nothing to inherit
+    assert s.coord_set_agent("codex", cwd=str(workdir.resolve()), user_scope=True).user_scope is False
+    assert rows(qdir, "SELECT user_scope FROM coord_settings ORDER BY seq DESC LIMIT 1") == [(0,)]
+    assert s.coord_set_agent("claude", cwd=str(workdir.resolve())).user_scope is False
+    # a codex row that carries a 1 anyway (written before this fix) reads as off and is not inherited
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        c.execute("INSERT INTO gseq (at) VALUES ('2026-01-01T00:00:00Z')")
+        g = c.execute("SELECT MAX(rowid) FROM gseq").fetchone()[0]
+        c.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, user_scope, by, at) VALUES "
+                  "(?, 'codex', NULL, ?, 1, 'operator', '2026-01-01T00:00:00Z')", (g, str(workdir.resolve())))
+        c.commit()
+    finally:
+        c.close()
+    assert s.coord_setting().user_scope is False
+    assert s.coord_set_agent("claude", cwd=str(workdir.resolve())).user_scope is False
+
+
+def test_a_scope_only_change_never_undoes_a_concurrent_change(qdir, workdir, capsys, monkeypatch):
+    # codex r1 MED: the scope-only write read the row in one transaction and wrote its replacement in another
+    CoordStore(qdir).coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    real, fired = lease.setting, []
+
+    def interleave(conn):
+        got = real(conn)
+        if not fired:
+            fired.append(threading.Thread(target=lambda: CoordStore(qdir).coord_set_agent("none")))
+            fired[0].start()
+            fired[0].join(1.0)          # finishes at once unless the scope change holds the write lock
+        return got
+
+    monkeypatch.setattr(lease, "setting", interleave)
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")
+    fired[0].join(30)
+    monkeypatch.setattr(lease, "setting", real)
+    # the later `agent none` stands (a stale scope-only copy would have re-enabled the claude coordinator)
+    assert rows(qdir, "SELECT agent, user_scope FROM coord_settings ORDER BY seq") == [
+        ("claude", 1), ("claude", 0), ("none", 0)]
+
+
+def test_turning_the_layer_on_refuses_when_a_user_level_file_turns_hooks_off(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    out = _main(qdir, capsys, "coord", "agent", "--user-scope", "on", rc=1)
+    assert "turned off by" in out.err and CoordStore(qdir).coord_setting().user_scope is False
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")      # turning it off checks nothing new
+
+
+def test_a_user_level_disable_all_hooks_through_a_symlinked_home_is_not_consulted(tmp_path, tmp_home, qdir, fake,
+                                                                                 capsys, monkeypatch):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    link = tmp_path / "home-link"
+    link.symlink_to(tmp_home)
+    monkeypatch.setenv("HOME", str(link))
+    target = (link / ".levain" / "coordinator").resolve()
+    (link / ".claude").mkdir(exist_ok=True)
+    (link / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert live, detail
+    assert not cl.hook_live(target, user_scope=True)[0]

@@ -1253,10 +1253,20 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
             raise CoordError("name an agent (claude, codex or none), or give --user-scope on|off to change only that")
         if args.cwd is not None or args.model is not None:
             raise CoordError("--user-scope alone keeps the agent, model and directory; name the agent to change them")
-        was = store.coord_setting()
-        if was is None or was.agent == "none":
-            raise CoordError("no coordinator agent is set (levain coord agent claude sets one)")
-        got = store.coord_set_agent(was.agent, model=was.model, cwd=was.cwd, user_scope=user_scope)
+        checked = None
+        if user_scope:
+            # turning it on: the hook check the next launch runs, now, so the refusal is this command's and not every
+            # launch's (a user-level disableAllHooks the off setting was not consulting)
+            from levain.coordinator.launch import hook_live
+
+            was = store.coord_setting()
+            if was is not None and was.agent == "claude":
+                live, detail = hook_live(Path(was.cwd), user_scope=True)
+                if not live:
+                    raise CoordError(f"not set: with your user layer the consent hook is not live in {was.cwd}: "
+                                     f"{detail}")
+                checked = was.cwd
+        got = store.coord_set_user_scope(user_scope, cwd=checked)
         _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "user_scope": got.user_scope},
               f"coordinator agent: {got.agent}; {user_layer_text(got)}")
         return 0

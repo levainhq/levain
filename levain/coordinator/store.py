@@ -884,6 +884,14 @@ class CoordStore:
         with self._write() as (conn, now):
             return lease.set_agent(conn, now, agent, model=model, cwd=cwd, user_scope=user_scope)
 
+    def coord_set_user_scope(self, user_scope: bool, *, cwd: str | None = None) -> Any:
+        """Only the standing claude setting's user-layer choice, read and replaced in one transaction
+        (:func:`levain.coordinator.lease.set_user_scope`)."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.set_user_scope(conn, now, user_scope, cwd=cwd)
+
     def coord_setting(self) -> Any:
         from levain.coordinator import lease
 

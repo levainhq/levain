@@ -13,8 +13,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   with the flag). Its own install's project and local settings, including the consent hook, still apply. To put your
   layer back, run `levain coord agent --user-scope on` (it keeps the agent, model and directory; `--user-scope off`
   returns to the default, and `levain coord agent claude --user-scope on` sets both at once). `levain coord status`
-  and its `--json` show the choice (`user layer: off (project settings only)`). A store from before this change reads as
-  off. With the layer off, a `disableAllHooks` that lives only in your user settings no longer refuses the coordinator
+  and its `--json` show the choice (`user layer: off (project settings only)`). A launch keeps the choice it was asked
+  under: changing it while a launch waits to start changes the next one. `--user-scope` alone needs a claude
+  coordinator, and turning it on refuses, with the reason, when a `disableAllHooks` in your user settings would stop
+  every launch. A store from before this change reads as off. With the layer off, a `disableAllHooks` that lives only in your user settings no longer refuses the coordinator
   launch, since the session never reads that file; `disableAllHooks` in the coordinator's own or an ancestor project
   still refuses. Covered by tests of the spawn argv and the setting.
 

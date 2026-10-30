@@ -171,17 +171,20 @@ def _layer_args(user_scope: bool) -> list[str]:
     Levain starts: none when ``user_scope`` is on. The one home of the rule, for the coordinator and later a worker."""
     if user_scope:
         return []
+    # both forms (one comma-joined argument, inline JSON) were accepted by four real `claude --bg` runs on Claude Code
+    # 2.1.314 (1030-42 dietrun)
     return ["--setting-sources", _PROJECT_LAYERS, "--settings", '{"autoMemoryEnabled":false}']
 
 
 def _user_settings_files() -> set[Path]:
-    """The user-level Claude Code settings files (``$CLAUDE_CONFIG_DIR`` and ``~/.claude``), as doctor reads them."""
+    """The user-level Claude Code settings files (``$CLAUDE_CONFIG_DIR`` and ``~/.claude``), resolved: doctor also
+    lists the same file by its real path when the workspace sits under a symlinked home."""
     dirs = ([Path(os.environ["CLAUDE_CONFIG_DIR"])] if os.environ.get("CLAUDE_CONFIG_DIR") else []) + [
         Path.home() / ".claude"]
-    return {d / "settings.json" for d in dirs}
+    return {(d / "settings.json").resolve() for d in dirs}
 
 
-def hook_live(directory: Path, *, user_scope: bool = True) -> tuple[bool, str]:
+def hook_live(directory: Path, *, user_scope: bool) -> tuple[bool, str]:
     """Doctor's own Claude Code check of ``directory`` (never a re-derivation): ``(True, detail)`` when its
     ``Claude Code consent hook`` row reads "wired to this install" AND no ``Claude Code hooks`` row of the same check
     fails "turned off by" (``disableAllHooks``); else ``(False, why)``. With ``user_scope`` False (the coordinator's
@@ -202,9 +205,7 @@ def hook_live(directory: Path, *, user_scope: bool = True) -> tuple[bool, str]:
     note = f"; the coordinator loads {layers}"
     if off is not None and not user_scope:
         try:
-            from levain import doctor
-
-            files = set(doctor._hooks_off_files(Path(directory), "claude-code"))
+            files = {f.resolve() for f in doctor._hooks_off_files(Path(directory), "claude-code")}
         except Exception:  # noqa: BLE001 - unreadable: the row stands as doctor reported it
             files = set()
         if files and files <= _user_settings_files():
@@ -623,11 +624,7 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
 
     if not ln.cwd or not Path(ln.cwd).is_dir():
         return left(f"the launch's directory {ln.cwd!r} is not a directory")
-    try:
-        chosen = store.coord_setting()
-    except (CoordError, OSError, sqlite3.Error) as exc:
-        return left(f"the coordinator setting could not be read ({type(exc).__name__}: {str(exc)[:300]})")
-    user_scope = chosen is not None and chosen.user_scope
+    user_scope = ln.user_scope       # the choice the launch was asked under (L3 r1), never the setting's now
     live, detail = hook_live(Path(ln.cwd), user_scope=user_scope)
     if not live:
         return left(f"the consent hook is not live in {ln.cwd}: {detail}")
