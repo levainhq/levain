@@ -254,9 +254,9 @@ def _line(name: str, value: Any, low: int, high: int) -> str:
     return value
 
 
-def _options_of(raw: Any) -> list[dict[str, str]]:
-    if not isinstance(raw, (list, tuple)) or not _OPTIONS_MIN <= len(raw) <= _OPTIONS_MAX:
-        raise ConsentError(f"options must be a list of {_OPTIONS_MIN} to {_OPTIONS_MAX} options")
+def _options_of(raw: Any, fewest: int = _OPTIONS_MIN) -> list[dict[str, str]]:
+    if not isinstance(raw, (list, tuple)) or not fewest <= len(raw) <= _OPTIONS_MAX:
+        raise ConsentError(f"options must be a list of {fewest} to {_OPTIONS_MAX} options")
     out: list[dict[str, str]] = []
     for item in raw:
         if isinstance(item, dict):
@@ -273,6 +273,20 @@ def _options_of(raw: Any) -> list[dict[str, str]]:
     if len({o["key"] for o in out}) != len(out):
         raise ConsentError("option keys must be unique")
     return out
+
+
+def _answer_of(option: Any, text: Any) -> tuple[str, str]:
+    """``(kind, value)`` of an answer given as exactly one of an option key or free text, or the refusal: the rules
+    every answering path holds before it reads the question."""
+    if (option is None) == (text is None):
+        raise ConsentError("answer with exactly one of an option key or free text")
+    if text is not None:
+        if not isinstance(text, str) or not text.strip() or len(text) > _TEXT_MAX or "\x00" in text:
+            raise ConsentError(f"text must be 1 to {_TEXT_MAX} characters, not only whitespace, with no NUL")
+        return "text", text
+    if not isinstance(option, str):
+        raise ConsentError("option must be a key")
+    return "option", option
 
 
 def _parse_ref(ref: Any) -> tuple[str, Any] | None:
@@ -464,10 +478,11 @@ class QuestionStore:
 
     # --- filing and reading --------------------------------------------------------------------------
     @staticmethod
-    def check(*, agent: str, agent_session_id: str, what: Any, options: Any, rec: Any, blocks: Any, cwd: Any
-              ) -> tuple[str, list[dict[str, str]], str]:
+    def check(*, agent: str, agent_session_id: str, what: Any, options: Any, rec: Any, blocks: Any, cwd: Any,
+              fewest: int = _OPTIONS_MIN) -> tuple[str, list[dict[str, str]], str]:
         """:meth:`file`'s refusals, run alone (``levain ask`` runs them before it files anything else): raises
-        :class:`ConsentError`, else the cleaned ``what``, options and ``blocks``."""
+        :class:`ConsentError`, else the cleaned ``what``, options and ``blocks``. ``fewest``: the least number of
+        options (a system source's acknowledgement is one; an agent's question offers a choice)."""
         if agent not in AGENTS:
             raise ConsentError(f"agent must be one of {', '.join(AGENTS)}: {agent!r}")
         if (not isinstance(agent_session_id, str) or not 0 < len(agent_session_id) <= _SESSION_MAX
@@ -476,7 +491,7 @@ class QuestionStore:
         if not isinstance(cwd, str) or not cwd or not os.path.isabs(cwd) or _has_control(cwd, selectors=False):
             raise ConsentError("cwd must be an absolute path")
         what = _line("what", what, 1, _WHAT_MAX)
-        opts = _options_of(options)
+        opts = _options_of(options, fewest)
         if not isinstance(rec, str) or rec not in {o["key"] for o in opts}:
             raise ConsentError("rec is required and must be one of the option keys")
         return what, opts, _line("blocks", blocks, 1, _BLOCKS_MAX)
@@ -490,45 +505,71 @@ class QuestionStore:
         return self._file(False, agent=agent, agent_session_id=agent_session_id, what=what, options=options, rec=rec,
                           blocks=blocks, cwd=cwd, resume=resume, link=link)[0]
 
-    def file_once(self, *, agent: str, key: str, what: str, options: Any, rec: str, blocks: str, cwd: str
-                  ) -> tuple[Question, bool]:
+    def file_once(self, *, agent: str, key: str, what: str, options: Any, rec: str, blocks: str, cwd: str,
+                  held_by: tuple[str, ...] = ()) -> tuple[Question, bool]:
         """File a question a system source raises for a standing condition, once while it is open. ``key`` names the
         source in the question's session field (no session's hook ever claims it); the check and the insert run in one
-        write transaction, so two writers racing file one. Returns ``(question, filed)``: the open question that
-        holds ``key`` already when there is one (``filed`` False), else the one just filed."""
+        write transaction, so two writers racing file one. ``held_by``: answer channels whose answer under ``key``
+        holds it as an open question does (a person who acknowledged the condition is not asked again under the same
+        key). A system source may offer a single option (an acknowledgement). A read-only snapshot is asked first, so
+        a key already held takes no write lock. Returns ``(question, filed)``: the question that holds ``key``
+        already when there is one (``filed`` False), else the one just filed."""
+        self.check(agent=agent, agent_session_id=key, what=what, options=options, rec=rec, blocks=blocks, cwd=cwd,
+                   fewest=1)
+        with self._peek() as conn:
+            held = None if conn is None else self._holding(conn, key, held_by)
+        if held is not None:
+            return held, False
         return self._file(True, agent=agent, agent_session_id=key, what=what, options=options, rec=rec, blocks=blocks,
-                          cwd=cwd, resume=None, link=None)
+                          cwd=cwd, resume=None, link=None, held_by=held_by, fewest=1)
+
+    def _holding(self, conn: sqlite3.Connection, key: str, held_by: tuple[str, ...]) -> Question | None:
+        """The question that holds ``key`` (see :meth:`file_once`): an open one first, else one answered through a
+        channel in ``held_by``."""
+        marks = ", ".join("?" for _ in held_by)
+        answered = f" OR a.channel IN ({marks})" if held_by else ""
+        row = conn.execute(f"{_select(conn)} WHERE q.agent_session_id = ? AND (a.question_id IS NULL{answered}) "
+                           "ORDER BY a.question_id IS NOT NULL, q.n LIMIT 1", (key, *held_by)).fetchone()
+        return None if row is None else self._question_of(row)
 
     def close_open(self, key: str, *, option: str | None = None, text: str | None = None, channel: str
-                   ) -> Question | None:
-        """Answer the open question :meth:`file_once` filed under ``key`` with exactly one of ``option`` or ``text``,
-        by the rules :meth:`answer` holds. ``None`` when none is open (nothing written)."""
-        if (option is None) == (text is None):
-            raise ConsentError("answer with exactly one of an option key or free text")
+                   ) -> list[Question]:
+        """Answer every open question :meth:`file_once` filed under ``key`` or under ``key:<anything>`` (one source,
+        one key per episode of its condition) with exactly one of ``option`` or ``text``, by the rules :meth:`answer`
+        holds: a person's act on ``channel``. A read-only snapshot is asked first, so with none open nothing takes the
+        write lock; returns the questions closed (none: nothing written)."""
+        kind, value = _answer_of(option, text)
         if channel not in ANSWER_CHANNELS:
             raise ConsentError(f"channel must be one of {', '.join(ANSWER_CHANNELS)}: {channel!r}")
-        if text is not None and (not text.strip() or len(text) > _TEXT_MAX or "\x00" in text):
-            raise ConsentError(f"text must be 1 to {_TEXT_MAX} characters, not only whitespace, with no NUL")
+        where = ("a.question_id IS NULL AND (q.agent_session_id = ? OR substr(q.agent_session_id, 1, ?) = ?) "
+                 "ORDER BY q.n")
+        args = (key, len(key) + 1, key + ":")
         with self._peek() as conn:
-            if conn is None:
-                return None
+            if conn is None or conn.execute(f"{_select(conn)} WHERE {where} LIMIT 1", args).fetchone() is None:
+                return []
         with self._write() as conn:
-            row = conn.execute(f"{_select(conn)} WHERE a.question_id IS NULL AND q.agent_session_id = ? "
-                               "ORDER BY q.n LIMIT 1", (key,)).fetchone()
-            if row is None:
-                return None
-            q = self._question_of(row)
-            if option is not None and option not in {k for k, _ in q.options}:
-                raise ConsentError(f"{option!r} is not an option of question #{q.n}")
-            kind, value = ("option", option) if option is not None else ("text", text)
-            conn.execute("INSERT INTO answers (question_id, kind, value, channel, answered_at) VALUES (?, ?, ?, ?, ?)",
-                         (q.id, kind, value, channel, utc_stamp(_now_utc(self._clock))))
-        return q
+            closed = [self._question_of(r) for r in conn.execute(f"{_select(conn)} WHERE {where}", args).fetchall()]
+            stamp = utc_stamp(_now_utc(self._clock))
+            for q in closed:
+                self._record(conn, q, kind, value, channel, stamp)
+        return closed
+
+    @staticmethod
+    def _record(conn: sqlite3.Connection, q: Question, kind: str, value: str, channel: str, stamp: str) -> None:
+        """Write ``q``'s one answer, refusing a second one and an option key it does not offer: the one answer write
+        every answering path shares."""
+        if q.answer is not None:
+            raise ConsentError(f"question #{q.n} was already answered at {q.answer.answered_at}")
+        if kind == "option" and value not in {k for k, _ in q.options}:
+            raise ConsentError(f"{value!r} is not an option of question #{q.n}")
+        conn.execute("INSERT INTO answers (question_id, kind, value, channel, answered_at) VALUES (?, ?, ?, ?, ?)",
+                     (q.id, kind, value, channel, stamp))
 
     def _file(self, once: bool, *, agent: str, agent_session_id: str, what: str, options: Any, rec: str, blocks: str,
-              cwd: str, resume: dict[str, Any] | None, link: Link | None) -> tuple[Question, bool]:
+              cwd: str, resume: dict[str, Any] | None, link: Link | None, held_by: tuple[str, ...] = (),
+              fewest: int = _OPTIONS_MIN) -> tuple[Question, bool]:
         what, opts, blocks = self.check(agent=agent, agent_session_id=agent_session_id, what=what, options=options,
-                                        rec=rec, blocks=blocks, cwd=cwd)
+                                        rec=rec, blocks=blocks, cwd=cwd, fewest=fewest)
         try:
             resume_json = None if resume is None else json.dumps(resume, ensure_ascii=False)
         except (TypeError, ValueError) as exc:
@@ -547,10 +588,9 @@ class QuestionStore:
         stamp = utc_stamp(_now_utc(self._clock))
         with self._write() as conn:
             if once:
-                row = conn.execute(f"{_select(conn)} WHERE a.question_id IS NULL AND q.agent_session_id = ? "
-                                   "ORDER BY q.n LIMIT 1", (agent_session_id,)).fetchone()
-                if row is not None:
-                    return self._question_of(row), False
+                held = self._holding(conn, agent_session_id, held_by)
+                if held is not None:
+                    return held, False
             conn.execute("INSERT INTO questions (id, agent, agent_session_id, what, options, rec, blocks, cwd, "
                          "filed_at, resume) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                          (qid, agent, agent_session_id, what, json.dumps(opts, ensure_ascii=False), rec, blocks,
@@ -595,24 +635,14 @@ class QuestionStore:
             raise ConsentError("answer with exactly one of an option key or free text")
         if channel not in ANSWER_CHANNELS:
             raise ConsentError(f"channel must be one of {', '.join(ANSWER_CHANNELS)}: {channel!r}")
-        if text is not None and (not isinstance(text, str) or not text.strip() or len(text) > _TEXT_MAX
-                                 or "\x00" in text):
-            raise ConsentError(f"text must be 1 to {_TEXT_MAX} characters, not only whitespace, with no NUL")
-        if option is not None and not isinstance(option, str):
-            raise ConsentError("option must be a key")
+        kind, value = _answer_of(option, text)
         with self._write() as conn:
             q = self._by_ref(conn, ref)
             if q is None:
                 raise ConsentError(f"no such question: {ref!r}")
-            if q.answer is not None:
-                raise ConsentError(f"question #{q.n} was already answered at {q.answer.answered_at}")
-            if option is not None and option not in {k for k, _ in q.options}:
-                raise ConsentError(f"{option!r} is not an option of question #{q.n}")
-            kind, value = ("option", option) if option is not None else ("text", text)
             stamp = utc_stamp(_now_utc(self._clock))
-            conn.execute("INSERT INTO answers (question_id, kind, value, channel, answered_at) VALUES (?, ?, ?, ?, ?)",
-                         (q.id, kind, value, channel, stamp))
-        return Answer(q.id, kind, value, channel, stamp)  # type: ignore[arg-type]
+            self._record(conn, q, kind, value, channel, stamp)
+        return Answer(q.id, kind, value, channel, stamp)
 
     def answer_with_context(self, entries: list[dict[str, Any]], *, channel: str, schema: tuple[str, ...] = (),
                             deadline: float | None = None,
@@ -644,14 +674,7 @@ class QuestionStore:
                 try:
                     option, text, via, note = e.get("option"), e.get("text"), e.get("via"), e.get("note")
                     viewer, seen = e.get("viewer"), e.get("seen_through")
-                    if (option is None) == (text is None):
-                        raise ConsentError("answer with exactly one of an option key or free text")
-                    if text is not None and (not isinstance(text, str) or not text.strip() or len(text) > _TEXT_MAX
-                                             or "\x00" in text):
-                        raise ConsentError(f"text must be 1 to {_TEXT_MAX} characters, not only whitespace, "
-                                           "with no NUL")
-                    if option is not None and not isinstance(option, str):
-                        raise ConsentError("option must be a key")
+                    kind, value = _answer_of(option, text)
                     if via not in ("seat", "cli", "cockpit", "phone"):
                         raise ConsentError(f"via must be seat, cli, cockpit or phone: {via!r}")
                     if viewer is not None and (not isinstance(viewer, str) or "\x00" in viewer):
@@ -663,13 +686,7 @@ class QuestionStore:
                     q = self._by_ref(conn, e.get("ref"))
                     if q is None:
                         raise ConsentError(f"no such question: {e.get('ref')!r}")
-                    if q.answer is not None:
-                        raise ConsentError(f"question #{q.n} was already answered at {q.answer.answered_at}")
-                    if option is not None and option not in {k for k, _ in q.options}:
-                        raise ConsentError(f"{option!r} is not an option of question #{q.n}")
-                    kind, value = ("option", option) if option is not None else ("text", text)
-                    conn.execute("INSERT INTO answers (question_id, kind, value, channel, answered_at) "
-                                 "VALUES (?, ?, ?, ?, ?)", (q.id, kind, value, channel, stamp))
+                    self._record(conn, q, kind, value, channel, stamp)
                     conn.execute("INSERT INTO answer_context (question_id, via, viewer, seen_through, note) "
                                  "VALUES (?, ?, ?, ?, ?)", (q.id, via, viewer, seen, note))
                 except (ConsentError, sqlite3.IntegrityError) as exc:
@@ -678,7 +695,7 @@ class QuestionStore:
                     out.append(exc if isinstance(exc, ConsentError) else ConsentError(str(exc)))
                     continue
                 conn.execute("RELEASE answer_entry")
-                out.append(Answer(q.id, kind, value, channel, stamp))  # type: ignore[arg-type]
+                out.append(Answer(q.id, kind, value, channel, stamp))
         return out
 
     # --- delivery ------------------------------------------------------------------------------------

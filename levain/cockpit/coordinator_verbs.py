@@ -53,12 +53,12 @@ def _faults() -> tuple[type[BaseException], ...]:
     return (sqlite3.Error, OSError, JobStoreError)
 
 
-def _close_stopped(store: Any, *, option: str | None = None, text: str | None = None) -> None:
+def _close_stopped(store: Any, verb: str) -> None:
     """A verb that changed the coordinator closes its open ``stopped`` item on the band, through the band's own
-    answer write (a refusal raised before this call closes nothing)."""
+    answer write, with text naming the verb (a refusal raised before this call closes nothing)."""
     from levain.consent.band import close_coordinator_stopped
 
-    close_coordinator_stopped(store.directory, option=option, text=text)
+    close_coordinator_stopped(store.directory, verb)
 
 
 class CoordinatorVerbs:
@@ -138,7 +138,7 @@ class CoordinatorVerbs:
                 raise EditError("unavailable", 503, "the coordinator store changed under the start; try again; "
                                                     "nothing was started", {"state": word, "why": why})
             raise EditError("refused", 409, f"{word}: {why}", {"state": word, "why": why})
-        _close_stopped(store, text="Start pressed on the cockpit's Coordinator panel")
+        _close_stopped(store, "Start")
         started = self._start_thread(store, launch.launch_id)
         said = (f"coordinator launch {launch.launch_id} asked for; it is starting now and the panel shows how it went"
                 if started else
@@ -149,7 +149,7 @@ class CoordinatorVerbs:
     def stop(self, _scope: Any, _params: dict[str, Any], _target: dict[str, Any], _confirm: bool) -> dict[str, Any]:
         store = self._store()
         ended = self._write(store.coord_release, "nothing was released")
-        _close_stopped(store, option="stop")
+        _close_stopped(store, "Stop")
         held = None if ended is None else {"holder": ended.holder, "token": ended.token}
         # the lease's holder is the launch's session key, not a person, so the line names the token only; the
         # release voids and ends launches whether or not a lease was held
@@ -162,7 +162,7 @@ class CoordinatorVerbs:
     def hold(self, _scope: Any, _params: dict[str, Any], _target: dict[str, Any], _confirm: bool) -> dict[str, Any]:
         store = self._store()
         token = self._write(lambda: store.coord_take(hold=HOLD), "nothing was taken")
-        _close_stopped(store, option="hold")
+        _close_stopped(store, "Hold")
         # The take has committed. Nothing below raises: a refusal releases the fire's idempotency reservation, so a
         # retry under the same key would take a second lease and void this one. A follow-up read that fails or shows
         # another lease is said as it is, with no claim of a hold this fire could not confirm.

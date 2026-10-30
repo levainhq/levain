@@ -484,18 +484,56 @@ def _harness_id(row: dict[str, Any]) -> str | None:
 _BAND_AGENT = {"claude": "claude_code", "codex": "codex"}
 
 
-def _note_stopped(store: CoordStore) -> None:
-    """When the deaths on record have made the coordinator ``stopped``, put it on the band (one open item, however
-    often this runs). Never raises: it follows a death that is already written, and the next pass tries again."""
-    try:
-        st = store.coord_status()
-        chosen = st.get("setting")
-        agent = _BAND_AGENT.get(chosen["agent"]) if isinstance(chosen, dict) else None
-        if st.get("wake") != "stopped" or agent is None:
-            return
-        from levain.consent.band import file_coordinator_stopped
+def _stop_episode(store: CoordStore) -> str | None:
+    """What names the stop the coordinator is in: the launch id of the FIRST death of the run the wake rule counts
+    (since you last looked, or a coordinator last ran). A death that follows the third leaves it unchanged, so one stop
+    stays one item; your take or release ends the run, so the next stop names another death. ``None`` when no death
+    is counted (the state moved under this read)."""
+    from levain.autonomic.durable_sqlite import read_transaction
 
-        file_coordinator_stopped(store.directory, agent, str(st.get("why", "")))
+    with read_transaction(store.open_readonly) as conn:
+        looked = lease_mod._looked(conn)
+        first = None
+        # newest end first; the run ends at the first launch that did not die, and one nobody tried to start is skipped
+        for (launch_id,) in conn.execute(
+                "SELECT l.launch_id FROM launches l WHERE l.role = 'coordinator' AND l.gseq > ? ORDER BY "
+                "(SELECT MAX(e.gseq) FROM launch_events e WHERE e.launch_id = l.launch_id) DESC", (looked,)).fetchall():
+            death = lease_mod.launch_death(conn, lease_mod._launch_row(conn, "launch_id", launch_id))
+            if death is False:
+                break
+            if death:
+                first = launch_id
+        return first
+
+
+def _note_stopped(store: CoordStore) -> None:
+    """When the deaths on record have made the coordinator ``stopped``, put it on the band: one item per stop episode
+    however often this runs, and none again for an episode the operator answered. The state is read once more after
+    a filing and before its ping, so a verb or a CLI act that ended the stop meanwhile pings nobody. Any other state
+    touches the band not at all. Never raises: it follows a death that is already written, and the next pass tries
+    again."""
+    try:
+        from levain.consent import band
+
+        st = store.coord_status()
+        if st.get("wake") != "stopped":
+            # closing an item here would be Levain's act, and every answer channel names a person's
+            return
+        episode = _stop_episode(store)
+        if episode is None:
+            return
+        chosen = st.get("setting")
+        # an agent the band has no name for still files: a stop nobody is told of is worse than a ping to Claude Code
+        agent = _BAND_AGENT.get(chosen.get("agent") if isinstance(chosen, dict) else None, "claude_code")
+
+        def still() -> bool:
+            # a re-read that fails says nothing against the stop just read: the item and its ping stand
+            try:
+                return store.coord_status().get("wake") == "stopped" and _stop_episode(store) == episode
+            except Exception:  # noqa: BLE001
+                return True
+
+        band.file_coordinator_stopped(store.directory, agent, str(st.get("why", "")), episode, still=still)
     except Exception:  # noqa: BLE001 - see the docstring
         return
 

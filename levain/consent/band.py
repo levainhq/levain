@@ -67,7 +67,7 @@ import os
 import re
 import sqlite3
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -75,7 +75,7 @@ from typing import Any
 
 from levain import unshowable
 from levain.cockpit.consent import ConsentError
-from levain.consent.questions import Link, Question, QuestionStore, QuestionStoreError
+from levain.consent.questions import ANSWER_CHANNELS, Link, Question, QuestionStore, QuestionStoreError
 
 __all__ = ["AGENT_LINE", "ANSWER_TAIL", "KNOW_TAIL", "NO_SESSION", "QUOTED_NOTE", "add_parsers", "answer_line", "ask_resume_meta",
            "deliver_answer", "deliver_answers", "file_question", "know_line", "question_context", "release_held_pings",
@@ -542,26 +542,37 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     return q, text
 
 
-# the coordinator's own item: filed once while open under this key, closed by the panel's Start, Stop or Hold
+# the coordinator's own item. Its key is this base, a colon and the stop episode (the death that began the run that
+# stopped it), so one episode files one item: an item the operator acknowledged is not filed again while that
+# episode stands, and a later stop is a new item. Closing takes the base, so every episode's open item closes.
+# An answer here records only: the panel's Start, Stop and Hold are what act, so the one option is an acknowledgement
 COORDINATOR_STOPPED_KEY = "levain-coordinator-stopped"
-_STOPPED_OPTIONS = [("hold", "Hold it myself: you take the coordinator lease"),
-                    ("stop", "Stop: release the coordinator, the next drop asks for a fresh one")]
+_STOPPED_OPTIONS = (("seen", "Seen: I will press Start, Stop or Hold on the cockpit's Coordinator panel"),)
 
 
-def file_coordinator_stopped(qdir: Path | str, agent: str, why: str) -> Question | None:
-    """Put the coordinator's stop on the band: one open item, however many deaths follow the third. ``agent`` is the
-    band's name for the coordinator's harness, ``why`` the panel's own text for the state. The item is numbered by the
+def file_coordinator_stopped(qdir: Path | str, agent: str, why: str, episode: str,
+                             still: Callable[[], bool] | None = None) -> Question | None:
+    """Put the coordinator's stop on the band: one item per stop episode, however many deaths follow the third and
+    however often this runs, and none again for an episode the operator has answered. ``agent`` is the band's name
+    for the coordinator's harness, ``why`` the panel's own text for the state, ``episode`` what names the stop.
+    ``still``: asked once after the item is filed and before its ping; False (the coordinator left ``stopped`` while
+    this filed) sends no ping. The item then stays open: only a person's answer closes an item (no answer channel is
+    Levain's own), so the operator's acknowledgement or the panel's next verb closes it. The item is numbered by the
     band when it is first shown, as every item is. Its ping goes out once, with the item. Returns the item when this
-    call filed it, ``None`` when one was already open or nothing could be written; never raises (the death that
-    called it is already recorded)."""
+    call filed it and pinged, ``None`` otherwise; never raises (the death that called it is already recorded)."""
     try:
         text = _plain_line(why)
         q, filed = QuestionStore(qdir).file_once(
-            agent=agent, key=COORDINATOR_STOPPED_KEY,
-            what="The coordinator stopped after three deaths in a row; nothing launches until you look.",
-            options=_STOPPED_OPTIONS, rec="stop", blocks=f"every new coordinator launch. {text}"[:300],
-            cwd=os.path.abspath(str(qdir)))
+            agent=agent, key=f"{COORDINATOR_STOPPED_KEY}:{episode}",
+            what="The coordinator stopped after three deaths in a row; nothing launches until you act on the "
+                 "Coordinator panel.",
+            options=list(_STOPPED_OPTIONS), rec="seen",
+            blocks=f"every new coordinator launch, until you press Start, Stop or Hold on the cockpit's Coordinator "
+                   f"panel (an answer here only records). {text}"[:300],
+            cwd=os.path.abspath(str(qdir)), held_by=ANSWER_CHANNELS)
         if not filed:
+            return None
+        if still is not None and not still():
             return None
         _send_ping(agent, q, Path(qdir))
         return q
@@ -573,16 +584,15 @@ def _plain_line(text: str) -> str:
     return " ".join(str(text).split())[:600]
 
 
-def close_coordinator_stopped(qdir: Path | str, *, option: str | None = None, text: str | None = None
-                              ) -> Question | None:
-    """Close the coordinator's open stop item through the band's answer write, as the operator's own act from the
-    cockpit: ``option`` (``hold`` or ``stop``) when the verb he pressed is one of the item's options, else ``text``
-    saying which verb it was. ``None`` when none is open. Never raises: the verb that called it has already changed
-    the coordinator."""
+def close_coordinator_stopped(qdir: Path | str, verb: str) -> list[Question]:
+    """Close every open stop item as the operator's own act from the cockpit, through the band's answer write, with
+    text naming the panel ``verb`` he pressed (the item's one option is an acknowledgement, not a verb). Returns the
+    items closed. Never raises: the verb that called it has already changed the coordinator."""
     try:
-        return QuestionStore(qdir).close_open(COORDINATOR_STOPPED_KEY, option=option, text=text, channel="cockpit")
+        return QuestionStore(qdir).close_open(
+            COORDINATOR_STOPPED_KEY, text=f"{verb} pressed on the cockpit's Coordinator panel", channel="cockpit")
     except Exception:  # noqa: BLE001 - see the docstring
-        return None
+        return []
 
 
 def run_ask(args: argparse.Namespace, out: Any = None) -> int:
