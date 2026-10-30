@@ -56,7 +56,7 @@
               malformed: k.well_formed === false, unknownCategory: k.unknown_category || "",
               done: k.done_line == null ? "" : String(k.done_line),
               dependsOn: Array.isArray(k.depends_on)
-                ? k.depends_on.filter(function (x) { return typeof x === "string" || typeof x === "number"; }).slice(0, 50).map(String) : [],
+                ? k.depends_on.filter(function (x) { return (typeof x === "string" && x !== "") || typeof x === "number"; }).slice(0, 50).map(String) : [],
               journal: k.band ? "" : journalLine(k.journal)
             };
           })
@@ -71,8 +71,8 @@
   function termsOf(q) { return fold(q || "").split(/\s+/).filter(Boolean); }
   function hayOf(col, k) {
     return fold([col.category, k.number != null ? k.number : "", k.title, k.repo, k.tier, k.source, k.id, k.held, k.blocks,
-      k.unknownCategory, k.done && "done when " + k.done, k.dependsOn.length ? "after " + k.dependsOn.join(" ") : "",
-      k.held && "held " + k.held, k.malformed ? "not well formed" : "", k.journal].filter(function (x) { return x !== "" && x != null; }).join(" "));
+      k.unknownCategory, k.done && "done when: " + k.done, k.dependsOn.length ? "after: " + k.dependsOn.join(", ") : "",
+      k.held && "held: " + k.held, k.malformed ? "not well formed" : "", k.journal].filter(function (x) { return x !== "" && x != null; }).join(" "));
   }
   // The model narrowed to the cards a query matches (the columns stay, so a column with no match still says so), with the
   // counts a count label needs: `total` over the whole board, `shown` after the filter. No terms: the model itself, whole.

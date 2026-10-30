@@ -1769,8 +1769,8 @@
     const metricsOf = data.kind === "status-dots" ? data.metrics : data.kind === "metric-grid" ? data.numbers : null;
     s.filterable = (!!(ctx && ctx.modal) && !(ctx && ctx.widget) && Array.isArray(metricsOf) && metricsOf.length >= FILTER_MIN) || boardBox;
     // a fresh open starts unfiltered; the SAME open modal rebuilt by a refresh keeps the query being typed in it
-    // (a count-face panel's modal is the same: a saved query would hide a newly waiting row behind "1 of 3"). A board is neither:
-    // its query is the saved one.
+    // (a count-face panel's modal is the same: a saved query would hide a newly waiting row behind "1 of 3"). A board is the
+    // exception: face and modal share its saved query, so a board's modal opens on whatever the face is filtered to.
     if ((s.filterable && !boardBox) || (s.searchable && s.modal && data.face === "count")) {
       const prev = Array.from(states).find((o) => o.modal && o.pid === data.pid && o.body.isConnected && (o.filterable || o.searchable));
       s.query = prev ? prev.query : "";

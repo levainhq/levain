@@ -144,18 +144,17 @@ def test_the_text_fields_refuse_an_invisible_character_and_a_runaway_length() ->
 
 def test_a_depends_on_is_a_bounded_list_of_bounded_display_safe_ids() -> None:
     """L3 r1 (codex MED). `depends_on` is drawn as a line of ids, so the kernel bounds it: null or a list of at most
-    BOARD_DEPENDS_MAX non-empty, display-safe strings of at most BOARD_TEXT_MAX characters."""
+    BOARD_DEPENDS_MAX display-safe strings of at most BOARD_TEXT_MAX characters."""
     from levain.cockpit.engine import BOARD_DEPENDS_MAX, BOARD_TEXT_MAX
     where = "value.columns[1].cards[0].depends_on"
     _refused(_value(ready=[_card("x", depends_on="flow:a")]), where, "list")
     _refused(_value(ready=[_card("x", depends_on=[{"id": "a"}])]), where + "[0]", "string")
     _refused(_value(ready=[_card("x", depends_on=["a", None])]), where + "[1]", "string")
-    _refused(_value(ready=[_card("x", depends_on=[""])]), where + "[0]", "non-empty")
     _refused(_value(ready=[_card("x", depends_on=["a‮b"])]), where + "[0]", "display-safe")
     _refused(_value(ready=[_card("x", depends_on=["d" * (BOARD_TEXT_MAX + 1)])]), where + "[0]", str(BOARD_TEXT_MAX))
     _refused(_value(ready=[_card("x", depends_on=[f"d{i}" for i in range(BOARD_DEPENDS_MAX + 1)])]), where, str(BOARD_DEPENDS_MAX))
     ok = _value(ready=[_card("x", depends_on=[f"d{i}" for i in range(BOARD_DEPENDS_MAX)]), _card("y", depends_on=None),
-                       _card("z", depends_on=[])])
+                       _card("z", depends_on=[]), _card("w", depends_on=[""])])     # an empty id is drawn as nothing, never a refusal
     assert _panel(ok)["status"] == "ok"
 
 

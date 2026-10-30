@@ -205,7 +205,7 @@ function filtering() {
   const m2 = V.boardModel({ queue: "ok", columns: [{ category: "ready", cards: [{ id: "h", title: "\u05e9\u05c1\u05b8\u05dc\u05d5\u05b9\u05dd", done_line: "tests pass", depends_on: [{ a: 1 }, "x", 5, null] }] }] });
   const ready2 = (f) => f.model.columns.find((c) => c.category === "ready").cards.length;
   const folded2 = { marks: ready2(V.filterModel(m2, "\u05e9\u05dc\u05d5\u05dd")), deps: m2.columns.find((c) => c.category === "ready").cards[0].dependsOn,
-    label: ready2(V.filterModel(m2, "done when")), after: ready2(V.filterModel(m2, "after x")), colKeys: Object.keys(V.filterModel(m, "land").model.columns[0]).sort() };
+    label: ready2(V.filterModel(m2, "done when: tests")), after: ready2(V.filterModel(m2, "after: x")), colKeys: Object.keys(V.filterModel(m, "land").model.columns[0]).sort() };
   return { folded2, none: pick(""), blank: pick("   "), folded: pick("LATER  c"), journalWords: pick("took it"), and: pick("land levain"), miss: pick("zzz"), band: pick("sweep"),
     noJournal: V.journalLine(null), journal: V.journalLine({ who: "desk", iso: "t", to_category: "ready", why: "queued it." }) };
 }
