@@ -40,8 +40,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   launches with their cause. The state is one of `held`, `launching`, `idle`, `unset`, `backoff`, `stopped` or `wake`.
   The panel's reads open the store read-only; its buttons (next entry) write. A lapse or a pending launch's expiry that is due but not yet written is applied
   to an in-memory copy, so the state row matches the CLI's, and the lease and launch rows say the write is not
-  recorded. Covered by tests, including a real-browser test with one fixture store per wake state. Its buttons are the
-  next entry.
+  recorded. Covered by tests, including a real-browser test with one fixture store per wake state.
 - **The Coordinator panel has Start, Stop and Hold.** Start asks for a coordinator now by the rules a drop runs (it
   waits out a backoff and starts nothing while the coordinator is stopped) and starts it at once; a Start
   that the coordinator's state refuses names that state and its reason, as the panel shows it. Stop releases the
@@ -49,7 +48,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   session on its next pass. Hold takes the lease for 30 minutes: a pending launch is voided, a running launch ends
   the same way (the watcher stops its session on its next pass), and drops queue for you. A retry of the same tap
   repeats nothing, and a Hold whose lease cannot be read back says so instead of failing. The three buttons exist only
-  on a serve that runs the watcher; an embedding server that runs its own passes `make_server(coordinator_verbs=True)` over a writable source.
+  on a serve that runs the watcher. An embedding server that runs its own watcher asks for them with
+  `make_server(coordinator_verbs=True)` over a writable source.
   Covered by tests, including real-browser
   tests; not run by hand on a real machine, and a real session stopped from the panel has not been watched.
 - **`levain serve --write` supervises the coordinator.** While the serve is up it runs the pass `levain coord watch`
@@ -60,8 +60,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   pass whose lines repeat the previous pass's is not logged again, so a standing refusal such as "claude is not on PATH" is logged when it starts and when it changes. A launch finds `claude` on
   the PATH a login unit gives the serve. Covered by tests; a real serve under launchd stopping a real session has not
   been run by hand. Known edges: the serve's daemon unit does not carry `LEVAIN_HOME` (only `install-feeds` does), so
-  every store a daemon-installed serve reads, the Coordinator panel, its buttons and the pass included, is the default
-  one; a hand-run `levain coord watch --once` exits 0 when the serve's
+  every store under the levain home that a daemon-installed serve reads, the Coordinator panel's, its buttons' and the
+  pass's included, is the default one, `~/.levain`; a hand-run `levain coord watch --once` exits 0 when the serve's
   pass held the lock.
 - **The cockpit's Board tab groups the ready queue under column headings, and the panel's ⤢ view draws the six columns.**
   The columns are backlog, ready, running, waiting, needs-you and done, each heading with its count. A downstream panel
