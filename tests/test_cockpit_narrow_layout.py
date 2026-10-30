@@ -60,20 +60,24 @@ def test_a_phone_gets_the_strip_the_needs_first_and_a_jump_to_each_page_view(tmp
 
 
 # the Decisions view's reads answer late: the page's own fetch is held 4.5 s for the two the strip's tabs wait on, longer than a
-# short fixed window would wait
-SLOW_READS = ("(() => { const f = window.fetch.bind(window); window.fetch = (u, o) => /\\/cockpit\\/(consent\\/grants|coord\\/drops)\\.json/.test(String(u))"
-              " ? new Promise(r => setTimeout(r, 4500)).then(() => f(u, o)) : f(u, o); return 1; })()")
+# short fixed window would wait. It runs as an init script (the page is loaded again under it), so the page's first render and its
+# cached reads already pass through it; each held read keeps its start and the moment it was let go.
+SLOW_READS = ("(() => { const f = window.fetch.bind(window); window.__slow = [];"
+              " window.fetch = (u, o) => { if (!/\\/cockpit\\/(consent\\/grants|coord\\/drops)\\.json/.test(String(u))) return f(u, o);"
+              " const rec = { start: Date.now(), release: 0 }; window.__slow.push(rec);"
+              " return new Promise(r => setTimeout(r, 4500)).then(() => { rec.release = Date.now(); return f(u, o); }); }; })();")
 
 
 def _in_view(which: str, find: str) -> list:
     """Click one of the Decisions-view tabs with the reads held, wait for the POPULATED node `find` (a JS expression), give the jump
-    time to settle, and read where that node sits in the view's scrolling body."""
-    return [SETTLE, {"eval": SLOW_READS}, {"eval": f"document.querySelector('[data-phone-jump={which}]').click(); 1"},
+    time to settle, and read where that node sits in the view's scrolling body, with how many held reads were still held at the tap."""
+    return [SETTLE, {"eval": f"window.__tap = Date.now(); document.querySelector('[data-phone-jump={which}]').click(); 1"},
             {"until": find, "ms": 30000}, {"eval": "new Promise(r => setTimeout(r, 900)).then(() => 1)"},
             {"eval": f"(() => {{ const e = {find}; const bodyEl = document.querySelector('#levain-modal .modal-body'); const body = bodyEl.getBoundingClientRect();"
                      f" const r = e.getBoundingClientRect(); return JSON.stringify({{ which: '{which}', open: !!document.getElementById('levain-modal'),"
                      f" populated: r.height > 0, inBody: r.top >= body.top - 1 && r.top < body.bottom - 40, top: Math.round(r.top), bodyTop: Math.round(body.top),"
-                     f" bodyH: Math.round(body.height), scrolled: Math.round(bodyEl.scrollTop), scrollH: bodyEl.scrollHeight }}); }})()"}]
+                     f" bodyH: Math.round(body.height), scrolled: Math.round(bodyEl.scrollTop), scrollH: bodyEl.scrollHeight,"
+                     f" heldAtTap: window.__slow.filter(s => s.release - window.__tap >= 3000).length }}); }})()"}]
 
 
 @needs_browser
@@ -82,9 +86,10 @@ def test_the_grants_tab_opens_the_decisions_view_at_the_standing_grants(tmp_path
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
     find = "[...document.querySelectorAll('#levain-modal .ext-grouphead')].find(h => /standing grants/.test(h.textContent))"
-    steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, *_in_view("grants", find)]
+    steps = [*PHONE_TOUCH, {"init": SLOW_READS}, {"until": NEEDS, "ms": 30000}, *_in_view("grants", find)]
     with rig.serving():
         got = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")]
+    assert got[-1]["heldAtTap"] >= 1, json.dumps(got[-1])   # a read was still held when the tab was tapped: the jump had to wait for it
     assert got[-1]["open"] and got[-1]["populated"] and got[-1]["inBody"] and got[-1]["scrolled"] > 0, json.dumps(got[-1])
 
 
@@ -94,10 +99,33 @@ def test_the_drop_tab_opens_the_decisions_view_at_the_populated_coordinator_drop
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
     find = "document.querySelector('#levain-modal .coord-drop-slot .coord-drop-row')"   # the drop's row, not the slot that exists empty
-    steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, *_in_view("drop", find)]
+    steps = [*PHONE_TOUCH, {"init": SLOW_READS}, {"until": NEEDS, "ms": 30000}, *_in_view("drop", find)]
     with rig.serving():
         got = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")]
+    assert got[-1]["heldAtTap"] >= 1, json.dumps(got[-1])   # the drop read was still held when the tab was tapped: the jump had to wait for it
     assert got[-1]["open"] and got[-1]["populated"] and got[-1]["inBody"] and got[-1]["scrolled"] > 0, json.dumps(got[-1])
+
+
+@needs_browser
+@needs_ssh
+def test_a_view_closed_and_opened_again_is_not_scrolled_by_the_wait_of_the_one_before(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    url = f"{rig.origin}/#write_token={TOK}"
+    row = "document.querySelector('#levain-modal .coord-drop-slot .coord-drop-row')"
+    reopen = ("(() => { const first = document.getElementById('levain-modal');"
+              " first.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));"
+              " const closed = !document.getElementById('levain-modal'); window.LevainNeeds.history(null);"
+              " const second = document.getElementById('levain-modal');"
+              " return JSON.stringify({ step: 'reopen', closed, opened: !!second, another: !!second && second !== first }); })()")
+    steps = [*PHONE_TOUCH, {"init": SLOW_READS}, {"until": NEEDS, "ms": 30000}, SETTLE,
+             {"eval": "document.querySelector('[data-phone-jump=drop]').click(); 1"},   # the tap opens the view; its wait for the held read begins
+             {"eval": reopen}, {"until": row, "ms": 30000}, {"eval": "new Promise(r => setTimeout(r, 900)).then(() => 1)"},
+             {"eval": "JSON.stringify({ step: 'after', scrolled: Math.round(document.querySelector('#levain-modal .modal-body').scrollTop) })"}]
+    with rig.serving():
+        got = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")]
+    assert got[0] == {"step": "reopen", "closed": True, "opened": True, "another": True}, got   # the second view really is another one
+    # the row is in the second view, and the first tap's wait, which saw it fill, left that view where it opened
+    assert got[1] == {"step": "after", "scrolled": 0}, got
 
 
 def _hidden_jump(mode: str, which: str, panel: str) -> list:

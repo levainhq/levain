@@ -177,6 +177,9 @@
   let modalPending = null;
   let modalAwaiting = false;
   let modalGen = 0;
+  // The narrow page's jump into the Decisions view runs one wait at a time: a newer tap, the reader's own touch or wheel, or the
+  // view closing ends the run in flight, so nothing yanks the view back. Declared here because closeModal ends it.
+  let phoneJumpRun = 0;
 
   // The starter jar (masthead): rise level = today's episodes against the entity's own typical
   // day (view.jar, counts from its store); a typical day sits at the dashed mark. A bubble
@@ -7114,6 +7117,7 @@
     questionBodies.clear();
     consentBodies.clear();   // request bodies (commands, working directories) are not kept past the view
     consentGen++;
+    phoneJumpRun++;
     pruneModalKinds();
     document.body.classList.remove("modal-open");
     modalKey = null;
@@ -7289,24 +7293,24 @@
     notes: ".panel[data-ck-panel=\"notifications\"]",
   };
   const PHONE_JUMP_WAIT_MS = CONSENT_FETCH_TIMEOUT_MS + 5000, PHONE_JUMP_STEP_MS = 150, PHONE_JUMP_STEADY = 2;
-  // one run at a time: a newer tap, or the reader's own touch or wheel, ends the run in flight, so nothing yanks the view back
-  let phoneJumpRun = 0;
   // `slot`: where the tab's section sits once it is drawn; `filled`: the same node once its read has filled it (the grants heading
   // exists only with a grant under it; the drop slot exists empty from the first paint and holds its row after its read)
-  function phoneJumpFind(which) {
+  function phoneJumpFind(which, overlay) {
     if (which === "drop") {
-      const slot = document.querySelector("#levain-modal .coord-drop-slot");
+      const slot = overlay.querySelector(".coord-drop-slot");
       return { slot: slot, filled: slot && slot.querySelector(".coord-drop-row") ? slot : null };
     }
-    const head = Array.from(document.querySelectorAll("#levain-modal .ext-grouphead")).find((h) => /standing grants/i.test(h.textContent)) || null;
+    const head = Array.from(overlay.querySelectorAll(".ext-grouphead")).find((h) => /standing grants/i.test(h.textContent)) || null;
     return { slot: head, filled: head };
   }
   const phoneJumpDrawn = (n) => !!n && n.getClientRects().length > 0;
   // The filled node is scrolled to again until the view stops growing above it (steady looks at the same height), so a row that
   // fills in after the node appeared does not leave the reader short of it.
-  function phoneJumpInView(which, run, deadline, seen) {
-    if (run !== phoneJumpRun || !document.getElementById("levain-modal")) return;
-    const f = phoneJumpFind(which);
+  // The run belongs to the one view the tap opened (or found open): a view closed and opened again is another view, whose own
+  // navigation the old wait must not act on.
+  function phoneJumpInView(which, run, overlay, deadline, seen) {
+    if (run !== phoneJumpRun || document.getElementById("levain-modal") !== overlay) return;
+    const f = phoneJumpFind(which, overlay);
     let top = seen ? seen.top : undefined, steady = seen ? seen.steady : 0;
     if (phoneJumpDrawn(f.filled)) {
       const now = f.filled.getBoundingClientRect().top;
@@ -7318,7 +7322,7 @@
       f.slot.scrollIntoView({ block: "start" });   // the slot is there before its read answers: the tap shows the move at once
     }
     if (Date.now() < deadline) {
-      window.setTimeout(() => phoneJumpInView(which, run, deadline, { top: top, steady: steady }), PHONE_JUMP_STEP_MS);
+      window.setTimeout(() => phoneJumpInView(which, run, overlay, deadline, { top: top, steady: steady }), PHONE_JUMP_STEP_MS);
     } else if (!phoneJumpDrawn(f.filled) && phoneJumpDrawn(f.slot)) {
       f.slot.scrollIntoView({ block: "start" });   // never filled: the slot is where the reader lands
     }
@@ -7327,7 +7331,9 @@
     const run = ++phoneJumpRun;
     if (which === "grants" || which === "drop") {
       if (!document.getElementById("levain-modal") && !openDecisionsHistory(opener)) return;
-      phoneJumpInView(which, run, Date.now() + PHONE_JUMP_WAIT_MS);
+      const overlay = document.getElementById("levain-modal");
+      // opening can close a view it could not build, which ends the run: the wait starts from the run as it stands once the view is up
+      if (overlay) phoneJumpInView(which, phoneJumpRun, overlay, Date.now() + PHONE_JUMP_WAIT_MS);
       return;
     }
     const sel = PHONE_JUMP_TARGET[which];

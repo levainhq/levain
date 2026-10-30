@@ -14,7 +14,7 @@ from tests.test_cockpit_narrow_layout_rig import (DESKTOP, NEEDS, PHONE_TOUCH, S
                                                   needs_browser, needs_ssh)
 
 HIT_MIN = 44   # the stylesheet's --hit-min
-GRANTS_HEAD ="[...document.querySelectorAll('#levain-modal .ext-grouphead')].find(h => /standing grants/.test(h.textContent))"
+GRANTS_HEAD = "[...document.querySelectorAll('#levain-modal .ext-grouphead')].find(h => /standing grants/.test(h.textContent))"
 NOTES = "[...document.querySelectorAll('.card, .panel, section, div')].find(e => /^Notification record/.test(e.textContent.trim()) && e.textContent.length < 400)"
 
 
@@ -34,8 +34,11 @@ METRICS = """(() => { const root = %s; const vw = document.documentElement.clien
     .map(e => (e.className || e.tagName) + ':' + Math.round(e.getBoundingClientRect().right)).slice(0, 12);
   const hit = [...root.querySelectorAll('.needs-history, .tray-dump-btn, .state-edit, .tv-seg-b, .tv-live, .ck-lay-btn')].filter(b => b.getClientRects().length)
     .map(b => { const r = b.getBoundingClientRect(), a = getComputedStyle(b, '::after');
-      return { c: String(b.className), w: Math.max(r.width, parseFloat(a.width) || 0), h: Math.max(r.height, parseFloat(a.height) || 0) }; });
-  return JSON.stringify({ vw, scrollW: document.documentElement.scrollWidth, wide, small: small.slice(0, 40), hit }); })()"""
+      const w = Math.max(r.width, parseFloat(a.width) || 0), h = Math.max(r.height, parseFloat(a.height) || 0), cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      return { c: String(b.className), w, h, l: cx - w / 2, r: cx + w / 2, t: cy - h / 2, b: cy + h / 2 }; });
+  const overlap = []; for (let i = 0; i < hit.length; i++) for (let j = i + 1; j < hit.length; j++) { const p = hit[i], q = hit[j];
+    if (Math.min(p.r, q.r) - Math.max(p.l, q.l) > 1 && Math.min(p.b, q.b) - Math.max(p.t, q.t) > 1) overlap.push(p.c + ' x ' + q.c); }
+  return JSON.stringify({ vw, scrollW: document.documentElement.scrollWidth, wide, small: small.slice(0, 40), hit, overlap: overlap.slice(0, 12) }); })()"""
 
 
 def shoot(tmp_path: Path, monkeypatch: Any, out_dir: Path, prefix: str) -> dict:
@@ -81,6 +84,7 @@ def test_the_cockpit_draws_every_phone_tab_at_a_phone_and_a_desktop_width(tmp_pa
         assert m["wide"] == [], m   # nothing drawn past the right edge but the parts that scroll on their own
         short = [h for h in m["hit"] if h["w"] < HIT_MIN or h["h"] < HIT_MIN]
         assert not short, short   # a named control's effective target (its box or its hit-area pseudo-element) is a thumb's in both directions
+        assert m["overlap"] == [], m["overlap"]   # and no two of them share ground: a tap near one's edge is never taken by its neighbour
     assert metrics[0]["hit"], metrics[0]   # the page draws at least one of them, so the check above is not empty
     for name in ("390", "1440", "1440_decisions", "390_needs", "390_state", "390_board", "390_notes", "390_decisions", "390_grants",
                  "390_drop", "390_drop_card"):

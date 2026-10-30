@@ -52,8 +52,14 @@ def drive_touch(tmp_path: Path, url: str, steps: list) -> dict:
     marker = "  } else if (s.emulate !== undefined) {"
     text = DRIVE.read_text()
     assert marker in text, "the shared driver's step chain moved: the touch step needs a new anchor"
+    # `{"init": js}`: the script runs in every document the page loads from here on, and the page is loaded again so that its first
+    # render, its first reads included, already runs under it (a script set after the page started cannot reach what the first
+    # render cached). The wait is for the new document's own sign, which the old one cannot show.
+    init = ('  } else if (s.init !== undefined) {\n    await send("Page.addScriptToEvaluateOnNewDocument", { source: "window.__levainInit = 1;" + s.init });\n'
+            '    await send("Page.reload", {});\n'
+            '    for (const end = Date.now() + 15000; Date.now() < end;) { await sleep(200); if (await evaluate("window.__levainInit === 1 && document.readyState") === "complete") break; }\n')
     patched = text.replace(marker, '  } else if (s.touch !== undefined) {\n    await send("Emulation.setTouchEmulationEnabled", { enabled: !!s.touch, maxTouchPoints: 5 });\n'
-                           '    await sleep(300);\n' + marker, 1)
+                           '    await sleep(300);\n' + init + marker, 1)
     d = tmp_path / "touch_driver"
     d.mkdir()
     (d / "_page_drive.mjs").write_text(patched)
