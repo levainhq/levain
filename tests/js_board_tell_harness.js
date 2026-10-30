@@ -196,9 +196,23 @@ async function tokenTransitions() {
   out.readFailureSurvivesTokenCycle = { failed: shared.failed, calls: calls.slice() };
   return out;
 }
+// The filter box's match and count, and the journal line's absence: over BODY (3 cards: backlog, running, needs-you).
+function filtering() {
+  const m = V.boardModel(BODY);
+  const pick = (q) => { const f = V.filterModel(m, q); return { label: V.countLabel(f), ids: f.model.columns.flatMap((c) => c.cards.map((k) => k.id)), cols: f.model.columns.length, same: f.model === m }; };
+  // L3 r1: every combining mark folds (a pointed Hebrew title matches the unpointed query); a depends_on entry that is no string or
+  // number is dropped, never drawn as "[object Object]"; the label words a card shows are searchable
+  const m2 = V.boardModel({ queue: "ok", columns: [{ category: "ready", cards: [{ id: "h", title: "\u05e9\u05c1\u05b8\u05dc\u05d5\u05b9\u05dd", done_line: "tests pass", depends_on: [{ a: 1 }, "x", 5, null] }] }] });
+  const ready2 = (f) => f.model.columns.find((c) => c.category === "ready").cards.length;
+  const folded2 = { marks: ready2(V.filterModel(m2, "\u05e9\u05dc\u05d5\u05dd")), deps: m2.columns.find((c) => c.category === "ready").cards[0].dependsOn,
+    label: ready2(V.filterModel(m2, "done when: tests")), after: ready2(V.filterModel(m2, "after: x")), colKeys: Object.keys(V.filterModel(m, "land").model.columns[0]).sort() };
+  return { folded2, none: pick(""), blank: pick("   "), folded: pick("LATER  c"), journalWords: pick("took it"), and: pick("land levain"), miss: pick("zzz"), band: pick("sweep"),
+    noJournal: V.journalLine(null), journal: V.journalLine({ who: "desk", iso: "t", to_category: "ready", why: "queued it." }) };
+}
 (async () => {
   const on = { offered: true, why: null };
   const out = {};
+  out.filtering = filtering();
   out.grouped = await grouped();
   out.bus = await bus();
   out.tellFollows = await tellFollowsTheRead();

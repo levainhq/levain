@@ -403,3 +403,21 @@ def test_a_card_field_is_made_display_safe_and_bounded_at_the_source_so_the_kern
              "columns": [{"category": c, "count": 1 if c == "ready" else 0, "cards": [card] if c == "ready" else []}
                          for c in board.CATEGORIES]}
     assert engine._v_board(spec, value) is value
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_filter_matches_folded_text_with_every_term_and_counts_cards_and_a_card_with_no_journal_says_nothing():
+    """The filter narrows cards (never columns) by case- and accent-folded text, every term must hit; its count is the board's
+    size, or "k of n" under a query; a blank query is no query; a card with no journal draws no journal line."""
+    f = _tell_run()["filtering"]
+    assert f["none"] == {"label": "3 cards", "ids": ["levain:c", "levain:a", "q-1"], "cols": 6, "same": True}
+    assert f["blank"]["label"] == "3 cards" and f["blank"]["same"] is True
+    assert f["folded"]["ids"] == ["levain:c"] and f["folded"]["label"] == "1 of 3" and f["folded"]["cols"] == 6
+    assert f["journalWords"]["ids"] == ["levain:a"]                   # a card's journal words are searchable
+    assert f["and"]["ids"] == ["levain:a"]                             # every term must hit: "land" AND "levain"
+    assert f["miss"]["ids"] == [] and f["miss"]["label"] == "0 of 3" and f["miss"]["cols"] == 6
+    assert f["band"]["ids"] == ["q-1"]                                 # a Needs-you band card is filtered like any other
+    assert f["noJournal"] == "" and f["journal"].startswith("as of read: desk")
+    g = f["folded2"]
+    assert g["marks"] == 1 and g["deps"] == ["x", "5"] and g["label"] == 1 and g["after"] == 1, g
+    assert g["colKeys"] == ["cards", "category"], g                    # a filtered column keeps every key the model gave it

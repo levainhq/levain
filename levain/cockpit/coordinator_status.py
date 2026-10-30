@@ -15,6 +15,8 @@ The panel offers Start, Stop and Hold (C10 S3), each a downstream panel ``VerbSp
 ``VerbRegistry.register_downstream`` (:func:`status_verbs`); their bodies are :mod:`levain.cockpit.coordinator_verbs`.
 **Start** does what a drop with no holder does, **Stop** is your ``release``, **Hold it myself** is your ``take`` for
 :data:`levain.cockpit.coordinator_verbs.HOLD`. A server that registers none of them draws the panel with no action.
+They belong beside a coordinator watcher (``make_server(coordinator_verbs=True)``): Stop ends the launch's record and
+Start may leave a launch pending, and only the watcher stops that session or retries that launch.
 """
 from __future__ import annotations
 
@@ -40,7 +42,7 @@ COORD_VERBS = (START_VERB, STOP_VERB, HOLD_VERB)
 
 def status_verbs(directory: Callable[[], Path | str | None], **kw: Any) -> dict[str, Any]:
     """The panel's verbs over the store in ``directory()`` (the directory the panel reads), keyed by name, for
-    ``make_server(extra_verbs=...)``. ``kw`` are :class:`levain.cockpit.coordinator_verbs.CoordinatorVerbs`' seams."""
+    ``make_server(coordinator_verbs=True)``. ``kw`` are :class:`levain.cockpit.coordinator_verbs.CoordinatorVerbs`' seams."""
     from levain.cockpit.coordinator_verbs import CoordinatorVerbs
 
     return CoordinatorVerbs(directory, **kw).specs()

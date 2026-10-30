@@ -3196,6 +3196,7 @@ BOARD_CARDS_MAX = 2000
 # A card's `id`, `title`, `repo` and `done_line` are drawn as text, so each is display-safe (no invisible or format character: a
 # bidi override reorders what the operator reads) and at most this long.
 BOARD_TEXT_MAX = 1000
+BOARD_DEPENDS_MAX = 50       # a card's `depends_on` is drawn as a line of ids: a bounded list of bounded, display-safe strings (an empty one is drawn as nothing)
 
 
 def _v_board(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
@@ -3245,6 +3246,13 @@ def _v_board(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
                     raise _bad(spec, f"{c}.{k}", f"is longer than {BOARD_TEXT_MAX} characters")
                 if visible(x) != x:
                     raise _bad(spec, f"{c}.{k}", "carries an invisible or format character (send it through display_safe.visible)")
+            deps = card.get("depends_on")
+            if deps is not None:
+                if not isinstance(deps, list) or len(deps) > BOARD_DEPENDS_MAX:
+                    raise _bad(spec, f"{c}.depends_on", f"must be a list of at most {BOARD_DEPENDS_MAX} ids")
+                for d, dep in enumerate(deps):
+                    if not _is_str(dep) or len(dep) > BOARD_TEXT_MAX or visible(dep) != dep:
+                        raise _bad(spec, f"{c}.depends_on[{d}]", f"must be a display-safe string no longer than {BOARD_TEXT_MAX} characters")
             if card.get("journal") is not None and not isinstance(card["journal"], dict):
                 raise _bad(spec, f"{c}.journal", "must be an object or null")
     return v
