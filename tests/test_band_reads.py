@@ -256,3 +256,66 @@ def test_golden_one_row_has_one_version_on_every_path_answered_marker_included(s
     assert answered.answer is not None
     assert band_view.subject_version(answered) == band_view.subject_version(store.get(q.id))
     assert band_view.subject_version(answered) != band_view.subject_version(via_conn)
+
+
+# --- L3 r1 fixes (1030-34-w2a r1): each from the failing case, run failing first ------------------------------------
+def test_r1_f1_a_foreign_authority_or_answered_row_never_reaches_the_host_write():
+    signed, linked = fq(7, "np-1", sign_request="rq-1"), fq(8, "np-2", link=Link("a", "push", "rq-2", "np-2"))
+    done = fq(9, "np-3", answer=Answer("np-3", "option", "a", "cli", "2026-10-30T10:01:00Z"))
+    host = Host([signed, linked, done], {"np-1": "v1", "np-2": "v2", "np-3": "v3"})   # a host that versions them all
+    for qid, v in (("np-1", "v1"), ("np-2", "v2")):
+        with pytest.raises(band_view.AuthorityItem):
+            answer(host, {"kind": "question", "id": qid, "version": v})
+    with pytest.raises(band_view.VersionMoved):
+        answer(host, {"kind": "question", "id": "np-3", "version": "v3"})
+    assert host.answered == []
+
+
+def test_r1_f2_both_or_neither_of_pick_and_text_is_refused_before_any_store_access(store):
+    q = ask(store)
+    s = subject_of(store, q)
+    before = counts(store)
+    for pick, text in (("a", "override"), (None, None)):
+        with pytest.raises(ValueError):
+            band_view.answer_item(store, s, pick=pick, text=text, channel="cockpit", viewer=VIEWER)
+    assert counts(store) == before and store.get(q.id).answer is None
+
+
+def test_r1_f3_the_summary_says_number_pending_as_the_payload_does(store, monkeypatch):
+    ask(store)
+    monkeypatch.setattr(band_view, "_number", lambda *a, **k: {})        # the lock was busy: nothing numbered
+    assert band_view.summary(store)["note"] == band_view._PENDING_NOTE
+
+
+def test_r1_f4_an_empty_view_skip_binds_a_row_with_the_calls_mark(store):
+    store.answer(ask(store).id, option="fix", channel="cli")             # a store with an id and nothing open
+    first = band_view.record_view(store, "v", 1, [])
+    second = band_view.record_view(store, "v", 2, [])
+    third = band_view.record_view(store, "v", 2, [])
+    with sqlite3.connect(store.path) as c:
+        marks = dict(c.execute("SELECT seq, seen_through FROM band_views WHERE viewer = 'v'").fetchall())
+    assert marks[first] == 1 and marks[second] == 2 and third == second
+
+
+def test_r1_f5_a_foreign_row_with_no_number_reads_without_a_crash():
+    host = Host([fq(None, "np-1"), fq(4, "np-2")], {"np-1": "v1", "np-2": "v2"})
+    assert band_view.summary(host)["count"] == 2
+    p = band_view.band_payload(host, VIEWER)
+    assert p["seen_through"] == 4 and len(p["items"]) == 2
+
+
+def test_r1_f7_a_held_write_lock_refuses_the_answer_within_the_bound(store):
+    import time
+    q = ask(store)
+    s = subject_of(store, q)
+    holder = sqlite3.connect(store.path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError):
+            answer(store, s)
+        assert time.monotonic() - t0 < band_view.HOOK_BUSY_MS / 1000 + 3
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert store.get(q.id).answer is None

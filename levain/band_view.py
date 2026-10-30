@@ -144,7 +144,7 @@ def _foreign(store: Any) -> bool:
 def _foreign_open(store: Any) -> list[Question]:
     """The foreign store's open questions, oldest number first. A number two open questions share names neither (the
     same rule as the store's own ``get``): both stay listed, but neither can be answered by shorthand."""
-    return sorted(store.open_questions(), key=lambda q: (q.n, q.id))
+    return sorted(store.open_questions(), key=lambda q: (q.n is None, q.n or 0, q.id))   # an unnumbered row last
 
 
 def _read(store: QuestionStore) -> tuple[list[tuple[str, Question | None]], dict[str, int], list[tuple[int, str]]]:
@@ -398,10 +398,11 @@ def record_view(store: QuestionStore, viewer: str, seen_through: int, open_list:
     as bound to an older view or to none: safe, never wrong). ``block``: the rendered band text of the view, kept
     (same transaction) for the Stop verifier. ``dedupe`` (a polling surface, :func:`show`; S5a decision A (c)): the
     view is written only when the viewer's newest one differs in store, open list or high-water mark, so a poll loop
-    adds no row. Both skips are decided on the newest row as the write transaction sees it.
+    adds no row. Both skips are decided on the newest row as the write transaction sees it, and both need its
+    high-water mark to be ``seen_through``.
 
     Returns the ``band_views.seq`` this call bound the viewer to: the new row's, or, on a dedupe or empty-view skip,
-    the row it was compared with (equal to what this call was given). ``None`` only when the lock stayed busy or the
+    the row it was compared with. ``None`` only when the lock stayed busy or the
     store has no id."""
     sid = _store_id_of(store)
     if sid is None:
@@ -414,7 +415,7 @@ def record_view(store: QuestionStore, viewer: str, seen_through: int, open_list:
             row = conn.execute(_NEWEST_VIEW, (viewer,)).fetchone()
             if row is not None and row[3] == sid:
                 had = json.loads(row[2])
-                if not open_list and not had:
+                if not open_list and not had and int(row[1]) == int(seen_through):
                     return int(row[0])
                 if dedupe and had == sorted(open_list) and int(row[1]) == int(seen_through):
                     return int(row[0])
@@ -911,7 +912,7 @@ def _foreign_snapshot(store: Any, writable: bool, gen: int) -> BandSnapshot:
     for q in open_qs:
         v = versions.get(q.id)
         entries.append(_question_item(q, q.n, v if _version_ok(v) else None, writable and can))
-    nums = [q.n for q in open_qs]
+    nums = [q.n for q in open_qs if q.n is not None]
     return _finish(entries, unread=unread, pending=False, failed=False, store_id=FOREIGN_STORE_ID, shown=nums,
                    hwm=max(nums, default=0), gen=gen, read_only=not (writable and can))
 
@@ -973,7 +974,7 @@ def summary(store: Any, *, writable: bool = True, deadline: float | None = None)
     items = [{"key": key, "n": it["n"], "kind": it["kind"], "headline": _short(it["what"], _HEADLINE), "tag": it["tag"]}
              for key, it in snap.entries]
     return {"schema": 1, "store_id": snap.store_id, "count": len(items), "queue": snap.queue, "items": items,
-            "note": _UNREAD_NOTE if snap.note else "", "queue": snap.queue, "read_only": snap.read_only}
+            "note": snap.note, "read_only": snap.read_only}
 
 
 def subject_for(store: Any, kind: str, ref: str) -> dict[str, Any] | None:
@@ -1011,8 +1012,8 @@ def _foreign_payload(store: Any, snap: BandSnapshot) -> dict[str, Any]:
     ``FOREIGN_STORE_ID`` / ``FOREIGN_VIEW_ID`` (no view is recorded in a store levain cannot write to; the answer
     re-reads the open set, so a question answered since is refused for itself)."""
     items = [it for _, it in snap.entries]
-    return {"seen_through": max((i["n"] for i in items), default=None), "store_id": FOREIGN_STORE_ID,
-            "view_id": FOREIGN_VIEW_ID, "items": items, "note": _UNREAD_NOTE if snap.note else "", "queue": snap.queue,
+    return {"seen_through": snap.hwm if snap.shown else None, "store_id": FOREIGN_STORE_ID,
+            "view_id": FOREIGN_VIEW_ID, "items": items, "note": snap.note, "queue": snap.queue,
             "read_only": snap.read_only}
 
 
@@ -1097,10 +1098,15 @@ def answer_item(store: Any, subject: Mapping[str, Any], *, pick: str | None, tex
     """Answer ONE item by its subject, its version and the displayed letter ``pick`` (or free ``text``): no view is
     needed, so another tab's look cannot make it stale. The version is checked inside the write, so of two concurrent
     answers exactly one wins. :class:`VersionMoved` (409), :class:`AuthorityItem` (422) and :class:`PickNotOffered`
-    (400) write nothing; a per-entry refusal of the store is raised as its ``ConsentError``. A foreign host decides
-    its own answerability (``question_versions`` / ``answer_versioned``); its :class:`AnswerCommitted` passes through."""
+    (400) write nothing, as does ``ValueError`` for both or neither of ``pick`` / ``text``; a per-entry refusal of the
+    store is raised as its ``ConsentError``, and a write lock held past ``HOOK_BUSY_MS`` as SQLite's busy error. A
+    foreign host decides its own answerability (``question_versions`` / ``answer_versioned``), except that a row
+    whose ``get()`` carries a ``link`` or ``sign_request`` is :class:`AuthorityItem` before the host is asked; its
+    :class:`AnswerCommitted` passes through."""
     if channel not in ("cockpit", "phone"):
         raise ValueError(f"a surface answers on the cockpit or the phone, not {channel!r}")
+    if (pick is None) == (text is None):
+        raise ValueError("an answer is exactly one of a pick or a text; nothing was recorded")
     if subject.get("kind") != "question":
         raise AuthorityItem("this item signs on its own card; nothing was recorded")
     if _foreign(store):
@@ -1116,7 +1122,8 @@ def answer_item(store: Any, subject: Mapping[str, Any], *, pick: str | None, tex
         entry["option"] = option
     else:
         entry["text"] = said
-    (result,) = store.answer_with_context([entry], channel=channel, schema=BAND_SCHEMA, require=_still_version(subject))
+    (result,) = store.answer_with_context([entry], channel=channel, schema=BAND_SCHEMA, require=_still_version(subject),
+                                          deadline=time.monotonic() + HOOK_BUSY_MS / 1000)
     if isinstance(result, ConsentError):
         raise result
     label = pick if option is not None else "text"
@@ -1127,12 +1134,16 @@ def _answer_foreign(store: Any, subject: Mapping[str, Any], pick: str | None, te
     if not answerable(store):
         raise ValueError("this cockpit's questions are answered on their own cards; nothing was recorded")
     q = store.get(subject["id"])
+    if q is None or q.id != subject["id"] or q.answer is not None:
+        raise VersionMoved("the item changed since it was shown to you, so nothing was recorded")
     try:
-        current = store.question_versions([q]).get(q.id) if q is not None else None
+        current = store.question_versions([q]).get(q.id)
     except Exception:  # noqa: BLE001 - a host that cannot say counts as one that will not let a tap answer
         current = None
-    if q is None or q.id != subject["id"] or current is None or current != subject["version"]:
+    if current is None or current != subject["version"]:
         raise VersionMoved("the item changed since it was shown to you, so nothing was recorded")
+    if _question_kind(q) == "authority":      # drawn with a sign action only: a host that versions it is not asked
+        raise AuthorityItem("this item signs on its own card; nothing was recorded")
     option, said = _key_of(q, pick, text)
     store.answer_versioned(q.id, subject["version"], option=option, text=said, channel=channel)
     label = pick if option is not None else "text"
