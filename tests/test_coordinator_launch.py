@@ -1255,6 +1255,7 @@ def test_the_watcher_removes_the_brief_once_its_launch_is_over(store, fake, live
 
 # --- the pin (C0 §3.4) -----------------------------------------------------------------------------------------
 from tests.test_coordinator_envelope import _lease, ctx, keys, repo, snapshot, structured_thread  # noqa: E402,F401
+from tests.test_coordinator_first_reader import band  # noqa: E402,F401
 
 
 def test_a_one_thread_worker_is_pinned_to_its_threads_head_envelope(ctx, structured_thread):
@@ -1809,7 +1810,7 @@ def test_a_json_split_is_refused_by_the_same_checks_as_the_flags(store, qdir, fa
     d1, _ = store.accept_drop("one", surface="cli")
     doc = tmp_path / "split.json"
     for body, why in ((json.dumps({"drop_id": d1.drop_id, "threads": [{"kind": "work", "title": "x" * 201}]}), "1 to 200"),
-                      (json.dumps({"drop_id": d1.drop_id, "threads": [{"kind": "bogus", "title": "x"}]}), "KIND:TITLE"),
+                      (json.dumps({"drop_id": d1.drop_id, "threads": [{"kind": "bogus", "title": "x"}]}), "exactly one of"),
                       ("{not json", "not JSON"),
                       (json.dumps({"drop_id": d1.drop_id, "extra": 1}), "only"),
                       (json.dumps({"threads": []}), "drop_id")):
@@ -1924,3 +1925,74 @@ def test_a_noted_receipt_renders_as_noted_on_the_phone_not_as_zero_threads():
     js = (Path(__file__).parent.parent / "levain" / "templates" / "web" / "phone.js").read_text()
     assert 'noted: "noted"' in js
     assert 'if (!receipts.some((r) => r.stage === "split" || r.stage === "noted"))' in js
+
+
+# --- L3 r1 (1030-47) on the JSON split and the text files ------------------------------------------------------------
+def _split_refused(body, why):
+    from levain.coordinator import cli as ccli
+    from levain.coordinator.store import CoordError
+
+    with pytest.raises(CoordError, match=why):
+        ccli._split_doc(body, None)
+
+
+def test_a_json_split_refuses_a_key_named_twice_at_any_level():
+    _split_refused('{"drop_id": "D", "threads": [], "threads": []}', "twice")
+    _split_refused('{"drop_id": "D", "threads": [{"kind": "note", "title": "a", "title": "b"}]}', "'title' twice")
+
+
+def test_a_deeply_nested_json_split_is_a_refusal_not_a_traceback():
+    _split_refused("[" * 100_000, "nested too deeply")
+
+
+def test_a_json_split_row_kind_is_exactly_a_kind_and_a_colon_cannot_mangle_it():
+    _split_refused('{"drop_id": "D", "threads": [{"kind": "note:x", "title": "t"}]}', "exactly one of")
+    _split_refused('{"drop_id": "D", "attach": [{"kind": "note:x", "thread": "T"}]}', "exactly one of")
+    _split_refused('{"drop_id": "D", "attach": [{"kind": "note", "thread": "a:b"}]}', 'without ":"')
+    from levain.coordinator import cli as ccli
+
+    _, parts = ccli._split_doc('{"drop_id": "D", "threads": [{"kind": "note", "title": "a: b"}]}', None)
+    assert parts[0].title == "a: b"
+
+
+def test_a_json_split_with_no_parts_is_refused_by_name():
+    _split_refused('{"drop_id": "D"}', "names no threads")
+    _split_refused('{"drop_id": "D", "threads": []}', "names no threads")
+
+
+def test_a_json_split_names_the_field_with_a_wrong_type():
+    for row, why in (({"kind": "note", "title": 5}, '"title"'), ({"kind": "note", "title": ""}, '"title"'),
+                     ({"kind": "note", "title": "t", "about": 3}, '"about"'),
+                     ({"kind": "note", "title": "t", "about": ""}, '"about"')):
+        _split_refused(json.dumps({"drop_id": "D", "threads": [row]}), why)
+    _split_refused(json.dumps({"drop_id": "D", "attach": [{"kind": "note", "thread": 7}]}), '"thread"')
+
+
+def test_a_utf8_bom_in_an_input_file_is_dropped(tmp_path):
+    from levain.coordinator import cli as ccli
+
+    f = tmp_path / "bom.json"
+    f.write_bytes(b"\xef\xbb\xbf" + b'{"drop_id": "D", "threads": [{"kind": "note", "title": "t"}]}\n')
+    assert ccli._split_doc(ccli._read_input(f), None)[0] == "D"
+
+
+def test_escalate_with_a_hostile_text_file_stores_it_as_typed(band, monkeypatch, tmp_path, capsys):
+    from levain.cli import main
+    from levain.coordinator import cli as ccli
+
+    q = band.ask()
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    monkeypatch.setattr(ccli, "_store", lambda args: band.store)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-coord")
+    from levain.coordinator import door
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    door.record(ws)
+    monkeypatch.chdir(ws)
+    rc = main(["coord", "escalate", str(q.n), "--text-file", str(f), "--token", str(band.token),
+               "--queue-dir", str(band.store.directory)])
+    assert rc == 0, capsys.readouterr().err
+    bodies = [json.loads(r[0]) for r in band.c.rows("SELECT body FROM replies WHERE kind = 'answer'")]
+    assert [b["why"] for b in bodies] == [HOSTILE]

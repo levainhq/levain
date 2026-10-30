@@ -158,7 +158,7 @@ def _read_input(path: Path | None) -> str:
     if len(raw) > cap:
         raise CoordError(f"{'stdin' if path is None else str(path)} holds more than {WORDS_MAX} characters")
     try:
-        text = raw.decode("utf-8")
+        text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise CoordError(f"{'stdin' if path is None else str(path)} is not UTF-8 text") from None
     if text.endswith("\r\n"):
@@ -1004,12 +1004,24 @@ def _parse_attach(spec: str) -> Part:
     return Part(kind=kind, attach=thread_id)
 
 
+def _no_dup_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in seen:
+            raise CoordError(f"the split document names {k!r} twice")
+        seen[k] = v
+    return seen
+
+
 def _split_doc(text: str, positional: str | None) -> tuple[str, list[Part]]:
     """One JSON document for a whole split: ``{"drop_id": ID, "threads": [{"kind", "title", "about"?}, ...],
     "attach": [{"kind", "thread"}, ...]}``. Each entry goes through the same checks as ``--thread KIND:TITLE`` and
-    ``--attach KIND:THREAD``; ``about`` is a thread id or ``@N`` as for ``--about``."""
+    ``--attach KIND:THREAD``; ``about`` is a thread id or ``@N`` as for ``--about``. A key named twice, at any level, is
+    refused."""
     try:
-        doc = json.loads(text)
+        doc = json.loads(text, object_pairs_hook=_no_dup_keys)
+    except RecursionError:
+        raise CoordError("the split document is nested too deeply") from None
     except ValueError as exc:
         raise CoordError(f"the split document is not JSON: {str(exc)[:120]}") from None
     if not isinstance(doc, dict) or set(doc) - {"drop_id", "threads", "attach"}:
@@ -1023,21 +1035,29 @@ def _split_doc(text: str, positional: str | None) -> tuple[str, list[Part]]:
         if not isinstance(rows, list):
             raise CoordError(f'"{key}" is a list')
         for row in rows:
-            if not isinstance(row, dict) or set(row) - set(fields) or not isinstance(row.get("kind"), str):
+            if not isinstance(row, dict) or set(row) - set(fields):
                 raise CoordError(f'each of "{key}" is an object with {", ".join(fields)} (kind required)')
+            kind = row.get("kind")
+            if not isinstance(kind, str) or kind not in KINDS:
+                raise CoordError(f'"kind" in "{key}" is exactly one of {", ".join(KINDS)} (got {str(kind)[:80]!r})')
             if key == "threads":
-                part = _parse_part(f"{row['kind']}:{row.get('title') if isinstance(row.get('title'), str) else ''}")
+                title = row.get("title")
+                if not isinstance(title, str) or not title.strip():
+                    raise CoordError('"title" is a non-empty string')
                 about = row.get("about")
-                if about is not None and not isinstance(about, str):
-                    raise CoordError('"about" is a thread id or @N')
                 if about is not None:
-                    if part.kind == "work":
+                    if not isinstance(about, str) or not about:
+                        raise CoordError('"about" is a thread id or @N (a non-empty string)')
+                    if kind == "work":
                         raise CoordError('"about" applies to a new ask, note or relay thread, not a work thread')
-                    part = Part(part.kind, part.title, about=about)
-                parts.append(part)
+                parts.append(Part(kind, title.strip(), about=about))
             else:
                 thread = row.get("thread")
-                parts.append(_parse_attach(f"{row['kind']}:{thread if isinstance(thread, str) else ''}"))
+                if not isinstance(thread, str) or not thread or ":" in thread:
+                    raise CoordError('"thread" is a thread id (a non-empty string without ":")')
+                parts.append(Part(kind=kind, attach=thread))
+    if not parts:
+        raise CoordError('the split document names no threads: give "threads" or "attach" at least one entry')
     return drop_id, parts
 
 
