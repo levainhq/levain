@@ -813,23 +813,26 @@
     const pendKey = (id) => PEND_KEY + ":" + id;
     const keep = (req) => { try { window.localStorage.setItem(pendKey(req.outbox_id), JSON.stringify(req)); } catch (e) { /* kept in this visit only */ } };
     const drop0 = (req) => {
+      try { window.localStorage.removeItem(pendKey(req.outbox_id)); } catch (e) { /* nothing kept */ }
       try {
-        window.localStorage.removeItem(pendKey(req.outbox_id));
         const old = JSON.parse(window.localStorage.getItem(PEND_KEY) || "null");      // a record an earlier build kept under the bare key
         if (old && old.outbox_id === req.outbox_id) window.localStorage.removeItem(PEND_KEY);
-      } catch (e) { /* nothing kept */ }
+      } catch (e) { /* a malformed legacy value is left alone */ }
     };
     // the newest unresolved one; the others stay kept, for the cockpit's hero
     const kept = () => {
-      const all = [];
-      try {
-        for (let i = 0; i < window.localStorage.length; i++) {
+      const seen = new Map();
+      let n = 0;
+      try { n = window.localStorage.length; } catch (e) { return null; }
+      for (let i = 0; i < n; i++) {
+        try {
           const k = window.localStorage.key(i);
           if (k !== PEND_KEY && !(k && k.indexOf(PEND_KEY + ":") === 0)) continue;
-          const v = JSON.parse(window.localStorage.getItem(k) || "null");
-          if (v && typeof v === "object" && typeof v.outbox_id === "string" && typeof v.words === "string") all.push(v);
-        }
-      } catch (e) { /* nothing kept */ }
+          const v = JSON.parse(window.localStorage.getItem(k) || "null");      // a malformed value is skipped, never the scan
+          if (v && typeof v === "object" && typeof v.outbox_id === "string" && typeof v.words === "string" && !seen.has(v.outbox_id)) seen.set(v.outbox_id, v);
+        } catch (e) { /* this entry only */ }
+      }
+      const all = Array.from(seen.values());
       all.sort((a, b) => String(b.sent_at || "").localeCompare(String(a.sent_at || "")));
       return all.length ? all[0] : null;
     };

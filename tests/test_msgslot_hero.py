@@ -455,3 +455,57 @@ def test_the_hero_commits_its_state_before_it_registers_the_keydown_listener() -
     core = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard_core.js").read_text()
     build = core[core.index("function dropHeroBuild(host)"):core.index("function dropHeroDraw(host, r)")]
     assert build.index("host._drop = ui;") < build.index('host.addEventListener("keydown"'), "a failed build must leave no listener behind"
+
+
+# ---- L3 r3 (1030-42): one malformed kept entry, a bare+:id pair, a read that fails after a lost reply ------------------------------------
+
+OLDER = dict(SIGNED, words="older kept", outbox_id="ph-" + "cd" * 16, sent_at="2026-10-29T12:00:00.123000Z", envelope=None)
+BAD_FIRST = f"localStorage.setItem({PEND} + ':ph-bad', '{{not json');"
+BARE_TWIN = f"localStorage.setItem({PEND}, {json.dumps(json.dumps(OLDER))});"      # the legacy bare key holding the same request as its :id key
+
+
+@needs_browser
+@needs_ssh
+def test_one_malformed_kept_entry_hides_neither_valid_pending_drop_and_a_bare_twin_counts_once(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    init = BAD_FIRST + _seed(OLDER) + _seed(SIGNED) + BARE_TWIN
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": init}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, {"eval": KEYS}]
+    with rig.serving():
+        out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    k = _tagged(out)["keys"]
+    assert k["box"] == "signed earlier", k                           # the newest valid one is back in the box
+    assert "1 earlier drop not confirmed." in k["earlier"], k        # the other valid one, counted once: the bare twin is the same request
+    assert any(x.endswith(":ph-bad") for x in k["keys"]), k          # the malformed value is skipped, not deleted
+
+
+@needs_browser
+@needs_ssh
+def test_the_sheet_restores_a_valid_kept_drop_past_a_malformed_entry(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    frame = "document.querySelector('#levain-sign-sheet-frame, iframe[title=\"coordinator drop\"]')"
+    box = f"({frame} && {frame}.contentDocument && {frame}.contentDocument.getElementById('drop-words'))"
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": BAD_FIRST + _seed(OLDER)}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
+             {"eval": "window.LevainSignSheet.openDrop(''); 1"}, {"until": f"{box} && {box}.value === 'older kept'", "ms": 30000},
+             {"eval": "JSON.stringify({t: 'ok', v: 1})"}]
+    with rig.serving():
+        out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    assert _tagged(out)["ok"]["v"] == 1
+
+
+@needs_browser
+@needs_ssh
+def test_a_read_that_fails_after_a_lost_reply_does_not_leave_send_dead(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    # the cockpit transport throws on its next headers() call once the lost reply has been seen: the read the failed send starts fails
+    arm = ("(() => { const t = window.LevainCockpitTransport; const h = t.headers.bind(t); let armed = 0; const f = window.fetch;"
+           " window.fetch = function (u, o) { const url = typeof u === 'string' ? u : (u && u.url) || '';"
+           " if (o && o.method === 'POST' && url.indexOf('/cockpit/coord/drop') >= 0 && !armed) { armed = 1; return f.apply(this, arguments).then(() => { throw new TypeError('reply lost'); }); }"
+           " return f.apply(this, arguments); };"
+           " t.headers = function () { if (armed === 1) { armed = 2; throw new Error('read failed'); } return h(); }; })();")
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, {"eval": arm + " 1"},
+             _type("land c-15"), CLICK_SEND, {"posts": 1, "ms": 15000},
+             {"until": RECEIPT_DONE + " && /^Not sure/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
+             {"eval": "new Promise(r => setTimeout(r, 600)).then(() => 1)"}, CLICK_SEND, {"posts": 2, "ms": 15000}]
+    with rig.serving():
+        out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    assert len(_posted(out)) == 2, out["posts"]

@@ -6662,27 +6662,29 @@
   const dropGrow = (t) => { const f = window.LevainCardFormat; if (f && typeof f.grow === "function") f.grow(t); };   // a programmatic value fires no input event
   // every kept request, newest first (a record an earlier build kept under the bare key counts too)
   const dropKeptAll = () => {
-    const all = [];
-    try {
-      const pre = dropPendKey();
-      for (let i = 0; i < window.localStorage.length; i++) {
+    const seen = new Map();
+    let n = 0;
+    try { n = window.localStorage.length; } catch (e) { return []; }
+    const pre = dropPendKey();
+    for (let i = 0; i < n; i++) {
+      try {
         const k = window.localStorage.key(i);
         if (k !== pre && !(k && k.indexOf(pre + ":") === 0)) continue;
-        const v = JSON.parse(window.localStorage.getItem(k) || "null");
-        if (v && typeof v === "object" && typeof v.outbox_id === "string" && typeof v.words === "string") all.push(v);
-      }
-    } catch (e) { /* nothing kept */ }
-    return all.sort((a, b) => String(b.sent_at || "").localeCompare(String(a.sent_at || "")));
+        const v = JSON.parse(window.localStorage.getItem(k) || "null");      // one malformed value is skipped (left in place), never the scan
+        if (v && typeof v === "object" && typeof v.outbox_id === "string" && typeof v.words === "string" && !seen.has(v.outbox_id)) seen.set(v.outbox_id, v);   // the bare key and the :id key of one request count once
+      } catch (e) { /* this entry only */ }
+    }
+    return Array.from(seen.values()).sort((a, b) => String(b.sent_at || "").localeCompare(String(a.sent_at || "")));
   };
   // true when the request is kept; false when storage refuses (quota, disabled, a private window): the send goes on, and the
   // request is held in the page (ui.req) for as long as it lives
   const dropKeep = (req) => { try { window.localStorage.setItem(dropPendKeyOf(req.outbox_id), JSON.stringify(req)); return true; } catch (e) { return false; } };
   const dropForget = (req) => {
+    try { window.localStorage.removeItem(dropPendKeyOf(req.outbox_id)); } catch (e) { /* nothing kept */ }
     try {
-      window.localStorage.removeItem(dropPendKeyOf(req.outbox_id));
       const old = JSON.parse(window.localStorage.getItem(dropPendKey()) || "null");
       if (old && old.outbox_id === req.outbox_id) window.localStorage.removeItem(dropPendKey());
-    } catch (e) { /* nothing kept */ }
+    } catch (e) { /* a malformed legacy value is left alone */ }
   };
   // what the sheet says of the envelope the reply carries
   const dropHow = (req, b) => {
@@ -6813,7 +6815,8 @@
         earlierLine();
         lock(false);
         // the drop may have made the store: new words must name it, so a send waits for this read (ui.reading)
-        const reading = ui.reading = dropRefresh(host, true).then(() => { if (ui.reading === reading) ui.reading = null; });
+        const clear = () => { if (ui.reading === reading) ui.reading = null; };      // on both outcomes: a read that fails never leaves Send waiting
+        const reading = ui.reading = Promise.resolve().then(() => dropRefresh(host, true)).then(clear, clear);
       };
       fetchBounded("/cockpit/coord/drop", { method: "POST", cache: "no-store", headers: headers, body: JSON.stringify(req) },
         (res) => res.json().then((b) => ({ status: res.status, ok: res.ok, body: b && typeof b === "object" ? b : {} }),
