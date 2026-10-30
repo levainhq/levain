@@ -167,6 +167,30 @@ def _band(qdir: Path, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     return {"text": r.text, "shown": r.shown, "error": None}
 
 
+PRESENCE_WINDOW_SECS = 24 * 3600
+
+
+def _presence(qdir: Path) -> dict[str, Any] | None:
+    """What an agent did to his presence word: the standing word when a seat or the coordinator set it, and the refusals
+    in the last :data:`PRESENCE_WINDOW_SECS` from the presence log. ``None`` when there is neither."""
+    import time
+
+    from levain.webpush import presence
+
+    word = presence.read_word(qdir)
+    now = time.time()
+    setter = word if word is not None and "by" in word and not presence.is_expired(word, now) else None
+    cutoff = now - PRESENCE_WINDOW_SECS
+    recent = [r for r in presence.read_log(qdir) if r["ts"] >= cutoff and isinstance(r.get("by"), dict)]
+    refused = sum(1 for r in recent if r["outcome"] == "refused")
+    if setter is None and not refused:
+        return None
+    out: dict[str, Any] = {"word": None, "by": None, "said": None, "at": None, "agent_rows": len(recent), "refused": refused}
+    if setter is not None:
+        out.update(word=setter["word"], by=setter["by"], said=setter["said"], at=setter["ts"])
+    return out
+
+
 def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Sequence[review.Item] | None = None,
          review_total: int | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """The morning card's data (display only; see the module docstring). Every section of the coordinator's store is
@@ -223,7 +247,12 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
                   "authority_relevant": i.authority_relevant, "text": str(i.body.get("text", ""))[:_FIELD]}
                  for i in queue]
     band = _band(qdir, conn)
-    return {"at": now, "away": away, "band": band, "any_away": any(a.get("away") for a in away.values()),
+    try:
+        pres = _presence(qdir)
+    except Exception as exc:  # noqa: BLE001 - named on the card
+        pres = None
+        errors.append(f"presence: {type(exc).__name__}: {exc}"[:_FIELD])
+    return {"at": now, "presence": pres, "away": away, "band": band, "any_away": any(a.get("away") for a in away.values()),
             "undecided": undecided, "budgets": budgets, "waiting": waiting, "delivery_ran": review.last_pass(conn), "review": items_out,
             "review_total": len(items_out) if review_total is None else review_total, "errors": errors}
 
@@ -233,6 +262,14 @@ def render(c: dict[str, Any]) -> str:
     L = [f"morning card, {c['at']}"]
     b = c.get("band") or {"text": "", "error": "the card carries no band"}
     L.append(f"NEEDS YOU band: could not render ({b['error']})" if b["error"] else b["text"] or "NEEDS YOU · nothing open")
+    pr = c.get("presence")
+    if pr:
+        import time
+
+        what = "no word of an agent's stands" if pr["word"] is None else (
+            f"`{pr['word']}` set by {'the coordinator ' if pr['by']['role'] == 'coordinator' else ''}"
+            f"{pr['by']['agent']} {pr['by']['session']} at {time.strftime('%H:%M', time.localtime(pr['at']))} from your words: {pr['said']}")
+        L.append(f"presence: {what}; {pr['agent_rows']} agent write(s) in 24 h, {pr['refused']} refused (levain ping log)")
     away = [a for a, s in c["away"].items() if s.get("away")]
     unknown = [a for a, s in c["away"].items() if s.get("away") is None]
     L.append("away: " + (f"ON for {', '.join(away)}: SIGNs wait UNDECIDED; leaving takes your signature "
