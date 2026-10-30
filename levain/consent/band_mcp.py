@@ -38,15 +38,19 @@ TOOL: dict[str, Any] = {
         "type": "object",
         "properties": {
             "what": {"type": "string", "description": "The question, one line."},
-            "options": {"type": "array", "minItems": 2, "maxItems": 6,
-                        "description": "The choices (2-6). key: lowercase a-z, 0-9, _ or -, up to 16 characters.",
+            "options": {"type": "array", "maxItems": 6,
+                        "description": "The choices (2-6; none only with open: true). key: lowercase a-z, 0-9, _ or "
+                                       "-, up to 16 characters.",
                         "items": {"type": "object",
                                   "properties": {"key": {"type": "string"}, "label": {"type": "string"}},
                                   "required": ["key", "label"], "additionalProperties": False}},
-            "rec": {"type": "string", "description": "The key of the option you recommend."},
+            "rec": {"type": "string", "description": "The key of the option you recommend (omit with open: true)."},
             "blocks": {"type": "string", "description": "What waits on the answer, one line."},
+            "open": {"type": "boolean",
+                     "description": "true files an OPEN question: no options and no rec, answered only in the "
+                                    "operator's own words. Default false."},
         },
-        "required": ["what", "options", "rec", "blocks"],
+        "required": ["what", "blocks"],
         "additionalProperties": False,
     },
 }
@@ -77,23 +81,29 @@ class _RpcError(Exception):
         self.code, self.message = code, message
 
 
-def _arguments(raw: Any) -> tuple[str, list[tuple[str, str]], str, str]:
+def _arguments(raw: Any) -> tuple[str, list[tuple[str, str]], str, str, bool]:
     """The ``ask`` arguments, shape-checked (a wrong shape is the caller's protocol error; whether the options are
-    acceptable is the store's call, and its refusal comes back as the tool's own error)."""
+    acceptable is the store's call, and its refusal comes back as the tool's own error). The last is ``open``: an
+    open question carries no options and no rec."""
     if not isinstance(raw, dict):
         raise _RpcError(INVALID_PARAMS, "arguments must be an object")
-    missing = [k for k in ("what", "options", "rec", "blocks") if k not in raw]
+    is_open = raw.get("open", False)
+    if not isinstance(is_open, bool):
+        raise _RpcError(INVALID_PARAMS, "open must be true or false")
+    need = ("what", "blocks") if is_open else ("what", "options", "rec", "blocks")
+    missing = [k for k in need if k not in raw]
     if missing:
         raise _RpcError(INVALID_PARAMS, f"missing arguments: {', '.join(missing)}")
     for k in ("what", "rec", "blocks"):
-        if not isinstance(raw[k], str):
+        if k in raw and not isinstance(raw[k], str):
             raise _RpcError(INVALID_PARAMS, f"{k} must be a string")
-    opts = raw["options"]
+    opts = raw.get("options", [])
     if not isinstance(opts, list) or not all(
             isinstance(o, dict) and isinstance(o.get("key"), str) and isinstance(o.get("label"), str) for o in opts):
         raise _RpcError(INVALID_PARAMS, "options must be an array of {key, label} strings")
     # key and label both stripped, as `levain ask --option KEY=LABEL` strips them (band._options)
-    return raw["what"], [(o["key"].strip(), o["label"].strip()) for o in opts], raw["rec"], raw["blocks"]
+    return (raw["what"], [(o["key"].strip(), o["label"].strip()) for o in opts], raw.get("rec", ""), raw["blocks"],
+            is_open)
 
 
 _META_SESSION_KEYS = ("threadId", "sessionId")
@@ -116,7 +126,7 @@ def _meta_session(params: dict[str, Any]) -> str | None:
 
 
 def _ask(agent: str, params: dict[str, Any]) -> dict[str, Any]:
-    what, options, rec, blocks = _arguments(params.get("arguments"))
+    what, options, rec, blocks, is_open = _arguments(params.get("arguments"))
     session, source = _meta_session(params), _META_SOURCE
     if session is None:
         env = os.environ
@@ -127,7 +137,7 @@ def _ask(agent: str, params: dict[str, Any]) -> dict[str, Any]:
 
     q, text = band.file_question(agent, session, what, options, rec, blocks, default_queue_dir(),
                                  no_session_hint="(neither this call nor this server's environment names a session)",
-                                 session_source=source, own_session=source == _META_SOURCE)
+                                 session_source=source, own_session=source == _META_SOURCE, open_ended=is_open)
     return {"content": [{"type": "text", "text": text}], "isError": q is None}
 
 

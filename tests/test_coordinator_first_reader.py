@@ -211,6 +211,23 @@ def test_a_know_is_not_delivered_once_the_operator_has_answered(band):
     assert "coordinator" not in text and "(via phone): option b" in text
 
 
+def test_an_open_question_is_only_escalated_never_answered_by_the_coordinator(band):
+    q = band.qs.file(agent="claude_code", agent_session_id=SEAT, what="how should the importer treat a gap?",
+                     rec="", blocks="the importer", cwd=band.c.path, open_ended=True)
+    (r,) = fr.read_band(band.store, authority=band.c.snap)
+    assert r.may_answer is False and "escalated, never answered by the coordinator" in r.why
+    with pytest.raises(CoordError, match="escalate question #1: an open question"):
+        band.answer(q, option=None, text="treat it as null")
+    with pytest.raises(CoordError, match="has no option"):
+        band.answer(q, option="a")
+    assert band.reads() == [] and band.qs.get(q.id).answer is None
+    reply_id = fr.escalate(band.store, q.id, "an open question: only he answers it", token=band.token)
+    waiting = review.waiting_on_you(band.store, sign_open=lambda _r: None,
+                                    answer_open=review.question_open(band.store.directory))
+    assert waiting["threads"][band.thread.thread_id][0]["reply_id"] == reply_id
+    assert band.reads() == [(q.id, "escalated")]
+
+
 def test_an_option_the_question_does_not_have_is_refused(band):
     with pytest.raises(CoordError, match="has no option"):
         band.answer(band.ask(), option="zz")

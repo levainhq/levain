@@ -819,7 +819,7 @@ class _PhoneServer(ThreadingHTTPServer):
             return [], 0, f"{type(exc).__name__}: {exc}"
         rows = [{"n": q.n, "id": q.id, "agent": q.agent, "session": q.agent_session_id, "what": q.what,
                  "options": [{"key": k, "label": label} for k, label in q.options], "rec": q.rec, "blocks": q.blocks,
-                 "filed_at": q.filed_at,
+                 "open_ended": q.open_ended, "filed_at": q.filed_at,
                  # the push an option leads to; ``card`` (the undecided request, as the undecided list shows it) is
                  # added by the listing only while that request is undecided
                  "link": None if q.link is None else {"option": q.link.option, "kind": q.link.kind,

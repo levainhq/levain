@@ -1978,7 +1978,7 @@ class _Handler(GuardedHandler):
                     status, payload = 200, {
                         "n": q.n, "agent": q.agent, "what": q.what,
                         "options": [{"key": k, "label": label} for k, label in q.options],
-                        "rec": q.rec, "blocks": q.blocks, "filed_at": q.filed_at,
+                        "rec": q.rec, "blocks": q.blocks, "open_ended": q.open_ended, "filed_at": q.filed_at,
                         "answer": None if a is None else {"kind": a.kind, "value": a.value, "channel": a.channel,
                                                           "answered_at": a.answered_at}}
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it

@@ -6,7 +6,22 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **An OPEN question: `levain ask --open`.** A question filed with no options and no recommendation, answered only in the
+  operator's own words (`levain question answer N --text`, the cockpit's and the phone's write-in box, band shorthand
+  `N: words`). `--open` takes no `--option` and no `--rec` (both refused beside it); the `ask` MCP tool takes `open: true`
+  with only `what` and `blocks`; one option is still refused. An option key or a rec letter on an open question is
+  refused, the band and `levain question list` show it as "open question: answer in your own words" with no rec,
+  the ping carries no option rows, the coordinator can only escalate it (never answer it as a KNOW), and it is never
+  held behind the coordinator's first read. The JSON of the band, the cockpit's question body, the phone's list and
+  `levain question show --json` carry `open_ended`. The cockpit's and the phone's page scripts are routed separately.
+
 ### Changed
+- **The ping puts what you act on first.** A question ping is now the question, its options, the answer command, and
+  only then the blocks, which take the room left under a 3,800-character budget and end "(full text on the card)" when
+  cut. Before, a long blocks text (now up to 6,000 characters) could push the options and the answer line past the
+  4,000 characters a notification keeps. The store and every card still hold the whole text. The `ask` MCP tool's
+  schema now requires only `what` and `blocks` (options and rec are required unless `open` is true, checked in code).
 - **`levain ask` takes a whole analysis.** A question's `--blocks` text now holds up to 6,000 characters (was 300) and an option
   label up to 600 (was 200). The caps are sized from the longest items a real caller filed (4,933 and 525 characters), and
   the cockpit, the phone page and the band show a question's text whole. Still refused: a block or label with a line break,

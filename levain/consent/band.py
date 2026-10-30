@@ -89,7 +89,8 @@ NO_SESSION = "levain-ask"
 AGENT_LINE = ("When you need the operator's judgement and can keep working on something else, run `levain ask "
               "--what \"<the question, one line>\" --option <key>=<label> --option <key>=<label> --rec <key> "
               "--blocks \"<what waits on the answer>\"` (2-6 options; keys lowercase a-z, 0-9, _ or -), or the "
-              "levain_band `ask` tool with the same four fields, and carry on "
+              "levain_band `ask` tool with the same four fields (or, when the answer is not a choice you can list, "
+              "`--open` with no options and no --rec: the operator answers in words), and carry on "
               "with what it does not block; the answer arrives in your context at a later tool call. Do not do what "
               "it blocks until then. If nothing else is unblocked, say so in your reply and end your turn: do not "
               "poll for the answer.")
@@ -361,6 +362,12 @@ def _queue_dir(args: argparse.Namespace) -> Path:
     return args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
 
 
+# characters a ping's text may take: the push body is cut at 4000 (levain.webpush.sender.spawn), and a held ping appends
+# a line of up to ~120 after this text
+_PING_BUDGET = 3800
+_FULL_TEXT = "… (full text on the card)"
+
+
 def _ping_text(agent: str, q: Question, qdir: Path, band_n: int | None = None) -> str:
     """The ping: its first line says who asks what in plain words (a lock screen shows only that), with the band
     number first when it has one (``band_n``; the source tag ``question #n`` stays). The answer command names the
@@ -370,11 +377,35 @@ def _ping_text(agent: str, q: Question, qdir: Path, band_n: int | None = None) -
 
     from levain.consent.queue import default_queue_dir
 
-    opts = "; ".join(f"{k}) {label}{' (rec)' if k == q.rec else ''}" for k, label in q.options)
     where = "" if Path(qdir) == default_queue_dir() else f" --queue-dir {shlex.quote(str(qdir))}"
     tag = f"band {band_n}, question #{q.n}" if band_n is not None else f"question #{q.n}"
-    return (f"levain: {agent} asks ({tag}): {q.what}\nOptions: {opts}.\nBlocks: {q.blocks}.\n"
-            f"Answer: levain question answer {q.n}{where} --option <key> (or --text \"...\").")
+    head = f"levain: {agent} asks ({tag}): {q.what}"
+    if q.open_ended:
+        middle = ["An open question: answer in your own words.",
+                  f"Answer: levain question answer {q.n}{where} --text \"...\"."]
+    else:
+        answer = f"Answer: levain question answer {q.n}{where} --option <key> (or --text \"...\")."
+        labels = [label for _, label in q.options]
+        # the options and the answer line are what the operator acts on: they come first and are kept whole, and the
+        # label of an option is shortened only when they alone would not fit the budget
+        fixed = len(head) + len(answer) + len("Options: .") + 4 * len(labels) + 40
+        shown = [k + ") " + label + (" (rec)" if k == q.rec else "") for k, label in q.options]
+        if fixed + sum(len(s) for s in shown) > _PING_BUDGET:
+            each = max(40, (_PING_BUDGET - fixed) // len(labels) - len(" (rec)") - 6)
+            shown = [f"{k}) {label if len(label) <= each else label[:each - 1] + '…'}"
+                     f"{' (rec)' if k == q.rec else ''}" for k, label in q.options]
+        middle = [f"Options: {'; '.join(shown)}.", answer]
+    text = "\n".join([head, *middle])
+    # the Blocks part goes LAST and takes only the room that is left: the push body is cut at 4000 characters
+    # (webpush/sender.spawn), and the cut must never fall on the options or the answer line. The store and every
+    # card keep the whole text.
+    room = _PING_BUDGET - len(text) - len("\nBlocks: ")
+    if len(q.blocks) + 1 <= room:
+        return f"{text}\nBlocks: {q.blocks}."
+    cut = room - len(_FULL_TEXT)
+    if cut >= 40:
+        return f"{text}\nBlocks: {q.blocks[:cut].rstrip()}{_FULL_TEXT}"
+    return f"{text}\nBlocks:{_FULL_TEXT}"
 
 
 def _coordinator_session(qdir: Path, session: str) -> bool | None:
@@ -456,7 +487,8 @@ def _push_state(agent: str, qdir: Path, request_id: str) -> str:
 def file_question(agent: str, session: str, what: str, options: list[tuple[str, str]], rec: str, blocks: str,
                   qdir: Path, *, no_session_hint: str = "(pass --session)",
                   session_source: str = "--session", own_session: bool = False,
-                  would_push: tuple[str, tuple[str, str, str]] | None = None) -> tuple[Question | None, str]:
+                  would_push: tuple[str, tuple[str, str, str]] | None = None, open_ended: bool = False
+                  ) -> tuple[Question | None, str]:
     """File one question, ping, and say so: the one path under ``levain ask`` and the ``ask`` MCP tool, so the
     refusals, the ping, the resume meta and the wording are the same for both. Returns the question (``None`` when
     it was refused or could not be written) and the text the caller shows the agent; ``no_session_hint`` is what
@@ -486,7 +518,7 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
         if would_push is not None:
             # validated here before the push request is filed, so a malformed question files nothing at all
             QuestionStore.check(agent=agent, agent_session_id=session, what=what, options=options, rec=rec,
-                                blocks=blocks, cwd=os.path.abspath(os.getcwd()))
+                                blocks=blocks, cwd=os.path.abspath(os.getcwd()), open_ended=open_ended)
             link, push_words, gap, call = _file_push_request(agent, session, would_push[0], would_push[1], qdir)
     except (ValueError, ConsentError, QuestionStoreError, OSError, subprocess.SubprocessError, QueueStoreError,
             AuthorityError, VerifierUnavailable) as exc:
@@ -497,7 +529,8 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
         return None, f"levain ask: a store could not be written, so nothing was filed ({exc}); try again"
     try:
         q = QuestionStore(qdir).file(agent=agent, agent_session_id=session, what=what, options=options, rec=rec,
-                                     blocks=blocks, cwd=os.path.abspath(os.getcwd()), resume=resume, link=link)
+                                     blocks=blocks, cwd=os.path.abspath(os.getcwd()), resume=resume, link=link,
+                                     open_ended=open_ended)
     except Exception as exc:  # noqa: BLE001 - whatever stopped it, a push filed before it is named, never hidden
         if link is None and not isinstance(exc, (ValueError, ConsentError, QuestionStoreError, OSError,
                                                   sqlite3.Error)):
@@ -520,7 +553,8 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     # a question the coordinator files about its own work is never held behind its own first read: it pings at once
     # as `attention`
     own = _coordinator_session(qdir, session)
-    held = link is None and own is False and _hold(qdir, q.id)
+    # an open question is never held either: the coordinator can only escalate it, so a hold would only delay the ping
+    held = link is None and own is False and not q.open_ended and _hold(qdir, q.id)
     pinged = False
     if not held:
         extra = ""
@@ -618,6 +652,13 @@ def run_ask(args: argparse.Namespace, out: Any = None) -> int:
         agent, session = _agent_and_session(args.agent, args.session)
         qdir = _queue_dir(args)
         options = _options(args.option)
+        if args.open:
+            if options or args.rec is not None:
+                raise ValueError("--open files an open question: give no --option and no --rec (it is answered in "
+                                 "words)")
+        elif args.rec is None:
+            raise ValueError("--rec KEY is required (the key of the option you recommend), or file an open question "
+                             "with --open and no options")
         push = (args.repo, args.remote, args.branch)
         if args.would_push is None and any(v is not None for v in push):
             raise ValueError("--repo, --remote and --branch go with --would-push KEY")
@@ -628,7 +669,8 @@ def run_ask(args: argparse.Namespace, out: Any = None) -> int:
     except (ValueError, ConsentError, QuestionStoreError, OSError) as exc:
         print(f"levain ask: refused, nothing was filed: {exc}", file=out, flush=True)
         return EXIT_REFUSED
-    q, text = file_question(agent, session, args.what, options, args.rec, args.blocks, qdir, would_push=would_push)
+    q, text = file_question(agent, session, args.what, options, args.rec or "", args.blocks, qdir,
+                            would_push=would_push, open_ended=args.open)
     print(text, file=out, flush=True)
     return EXIT_OK if q is not None else EXIT_REFUSED
 
@@ -636,7 +678,7 @@ def run_ask(args: argparse.Namespace, out: Any = None) -> int:
 def _row(q: Question) -> dict[str, Any]:
     return {"n": q.n, "id": q.id, "agent": q.agent, "session": q.agent_session_id, "what": q.what,
             "options": [{"key": k, "label": label} for k, label in q.options], "rec": q.rec, "blocks": q.blocks,
-            "cwd": q.cwd, "filed_at": q.filed_at,
+            "open_ended": q.open_ended, "cwd": q.cwd, "filed_at": q.filed_at,
             "answer": None if q.answer is None else {"kind": q.answer.kind, "value": q.answer.value,
                                                      "channel": q.answer.channel, "at": q.answer.answered_at},
             "link": None if q.link is None else {"option": q.link.option, "kind": q.link.kind,
@@ -652,6 +694,8 @@ def _show(q: Question) -> str:
              f"answered {q.answer.answered_at} by {q.answer.channel}: "
              + (f"option {q.answer.value}" if q.answer.kind == "option" else json.dumps(q.answer.value,
                                                                                           ensure_ascii=False)))
+    if q.open_ended:
+        opts = "    (an open question: answer it in your own words, `--text`)"
     return f"#{q.n} [{q.agent}] {q.what}\n{opts}\n    blocks: {q.blocks}\n    {state}"
 
 
@@ -720,13 +764,16 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     a = subparsers.add_parser(
         "ask", help="Ask the operator a question and keep working (the question band).",
         description="File a question for the operator: what you need, 2-6 options (KEY=LABEL), the one you "
-                    "recommend and what it blocks. The operator is pinged; this returns at once. The answer "
+                    "recommend and what it blocks (or --open: no options, answered in words). The operator is pinged; this returns at once. The answer "
                     "arrives in the asking session's context at a later tool call, once. An answer authorises "
                     "nothing: a gated call still goes through levain's gate. Exit 0 filed, 2 refused.")
     a.add_argument("--what", required=True, help="The question, one line.")
     a.add_argument("--option", action="append", default=[], metavar="KEY=LABEL",
                    help="An option (repeat, 2-6). KEY: a-z, 0-9, _ or -, up to 16 characters.")
-    a.add_argument("--rec", required=True, help="The KEY of the option you recommend.")
+    a.add_argument("--rec", default=None, help="The KEY of the option you recommend (required unless --open).")
+    a.add_argument("--open", action="store_true",
+                   help="File an OPEN question: no options and no --rec, answered only in the operator's own words. "
+                        "Use it when the answer is not a choice among options you can list.")
     a.add_argument("--blocks", required=True, help="What waits on the answer, one line.")
     a.add_argument("--agent", default=None, choices=_AGENT_NAMES,
                    help="Which agent asks (default: read from the agent's environment).")

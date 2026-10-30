@@ -51,7 +51,7 @@ def test_a_conversation_over_a_pipe_files_the_question_with_its_session(tmp_path
     assert replies[0]["result"]["protocolVersion"] == "2025-06-18"
     assert replies[0]["result"]["capabilities"] == {"tools": {}}
     tool = replies[1]["result"]["tools"][0]
-    assert tool["name"] == "ask" and tool["inputSchema"]["required"] == ["what", "options", "rec", "blocks"]
+    assert tool["name"] == "ask" and tool["inputSchema"]["required"] == ["what", "blocks"]
     call = replies[2]["result"]
     assert call["isError"] is False
     text = call["content"][0]["text"]

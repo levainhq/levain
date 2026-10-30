@@ -81,7 +81,9 @@ def _asker_rec(q: Any) -> str:
     never past :data:`review._REC_MAX` (a long label is cut, never the record refused), ``none`` when the question
     names no rec it has."""
     keys = [k for k, _ in q.options]
-    if q.rec in keys and keys.index(q.rec) < 6:
+    if q.open_ended:
+        head = "none: an open question, answered in words"
+    elif q.rec in keys and keys.index(q.rec) < 6:
         i = keys.index(q.rec)
         head = f"{'abcdef'[i]}: {q.options[i][1]}"
     else:

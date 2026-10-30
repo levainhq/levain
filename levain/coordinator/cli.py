@@ -1301,7 +1301,7 @@ def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore
         obj = [{"n": r.question.n, "id": r.question.id, "agent": r.question.agent,
                 "session": r.question.agent_session_id, "what": r.question.what,
                 "options": [{"key": k, "label": v} for k, v in r.question.options], "rec": r.question.rec,
-                "blocks": r.question.blocks, "may_answer": r.may_answer, "why": r.why, "launch_id": r.launch_id,
+                "open_ended": r.question.open_ended, "blocks": r.question.blocks, "may_answer": r.may_answer, "why": r.why, "launch_id": r.launch_id,
                 "thread_id": r.thread_id, "envelope_id": r.envelope_id} for r in rows]
         lines = [f"#{r.question.n} {json.dumps(r.question.what, ensure_ascii=False)}\n  "
                  + ("MAY ANSWER as a KNOW: " if r.may_answer else "ESCALATE: ") + r.why for r in rows]

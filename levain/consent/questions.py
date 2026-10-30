@@ -3,7 +3,8 @@
 An agent files a question (:meth:`QuestionStore.file`): what it asks, two to six options (a key and a label each),
 the option it recommends, and what the answer blocks. Every one of those is required: a question with no
 recommendation or no stated block is refused, since the operator reads it between other things and needs both to
-rule fast. The operator answers once (:meth:`QuestionStore.answer`), by an option key or by free text kept
+rule fast. The one exception is the OPEN question (``open_ended``): no options and no rec, a question only words
+answer. The operator answers once (:meth:`QuestionStore.answer`), by an option key or by free text kept
 VERBATIM, from the CLI, the phone or the cockpit. The answer's text is then delivered back to the agent's session
 exactly once, by the session's next hook (:meth:`QuestionStore.claim_answers_for`) or by a resume that carries it as
 its prompt (:meth:`QuestionStore.lease_answers_for`, settled by :meth:`QuestionStore.settle_resume`): the same claim
@@ -138,6 +139,12 @@ class Question:
     # the levain sign request (levain.consent.sign) a caller filed for this question, by id: the cockpit row then
     # carries `sign: {"request": <id>}` and the page signs the request's own options. The kernel's store sets none
     sign_request: str | None = None
+
+    @property
+    def open_ended(self) -> bool:
+        """An OPEN-ENDED question: filed with no options and no rec, answered only in the operator's words. Every
+        surface shows its text whole with a write-in box, no option rows and no rec."""
+        return not self.options
 
 
 @dataclass(frozen=True)
@@ -481,10 +488,19 @@ class QuestionStore:
     # --- filing and reading --------------------------------------------------------------------------
     @staticmethod
     def check(*, agent: str, agent_session_id: str, what: Any, options: Any, rec: Any, blocks: Any, cwd: Any,
-              fewest: int = _OPTIONS_MIN) -> tuple[str, list[dict[str, str]], str]:
+              fewest: int = _OPTIONS_MIN, open_ended: bool = False) -> tuple[str, list[dict[str, str]], str]:
         """:meth:`file`'s refusals, run alone (``levain ask`` runs them before it files anything else): raises
         :class:`ConsentError`, else the cleaned ``what``, options and ``blocks``. ``fewest``: the least number of
-        options (a system source's acknowledgement is one; an agent's question offers a choice)."""
+        options (a system source's acknowledgement is one; an agent's question offers a choice). ``open_ended``: the
+        question is filed with NO options and NO rec (an open question, answered in words); one option is still
+        refused, and so is an option or a rec beside ``open_ended``."""
+        if open_ended:
+            if isinstance(options, (list, tuple)) and len(options) > 0:
+                raise ConsentError("an open question takes no options: give none, or file a question with 2 to "
+                                   f"{_OPTIONS_MAX}")
+            if rec not in (None, ""):
+                raise ConsentError("an open question takes no rec: there is no option to recommend")
+            options, rec = [], ""
         if agent not in AGENTS:
             raise ConsentError(f"agent must be one of {', '.join(AGENTS)}: {agent!r}")
         if (not isinstance(agent_session_id, str) or not 0 < len(agent_session_id) <= _SESSION_MAX
@@ -493,19 +509,20 @@ class QuestionStore:
         if not isinstance(cwd, str) or not cwd or not os.path.isabs(cwd) or _has_control(cwd, selectors=False):
             raise ConsentError("cwd must be an absolute path")
         what = _line("what", what, 1, _WHAT_MAX)
-        opts = _options_of(options, fewest)
-        if not isinstance(rec, str) or rec not in {o["key"] for o in opts}:
+        opts = [] if open_ended else _options_of(options, fewest)
+        if not open_ended and (not isinstance(rec, str) or rec not in {o["key"] for o in opts}):
             raise ConsentError("rec is required and must be one of the option keys")
         return what, opts, _line("blocks", blocks, 1, _BLOCKS_MAX)
 
-    def file(self, *, agent: str, agent_session_id: str, what: str, options: Any, rec: str, blocks: str, cwd: str,
-             resume: dict[str, Any] | None = None, link: Link | None = None) -> Question:
+    def file(self, *, agent: str, agent_session_id: str, what: str, options: Any = (), rec: str = "", blocks: str,
+             cwd: str, resume: dict[str, Any] | None = None, link: Link | None = None,
+             open_ended: bool = False) -> Question:
         """File a question, refusing anything malformed with nothing written. ``resume`` is what a later resume of
         the agent's session needs, stored as given: unsigned, never authority. ``link`` ties one of its options to
         the consent request already filed for that option's call (its ``question_id`` is ignored: it is this
         question), written in the same transaction, so a question never names a link it does not have."""
         return self._file(False, agent=agent, agent_session_id=agent_session_id, what=what, options=options, rec=rec,
-                          blocks=blocks, cwd=cwd, resume=resume, link=link)[0]
+                          blocks=blocks, cwd=cwd, resume=resume, link=link, open_ended=open_ended)[0]
 
     def file_once(self, *, agent: str, key: str, what: str, options: Any, rec: str, blocks: str, cwd: str,
                   held_by: tuple[str, ...] = ()) -> tuple[Question, bool]:
@@ -562,6 +579,8 @@ class QuestionStore:
         every answering path shares."""
         if q.answer is not None:
             raise ConsentError(f"question #{q.n} was already answered at {q.answer.answered_at}")
+        if kind == "option" and q.open_ended:
+            raise ConsentError(f"question #{q.n} is an open question with no options: answer it in words")
         if kind == "option" and value not in {k for k, _ in q.options}:
             raise ConsentError(f"{value!r} is not an option of question #{q.n}")
         conn.execute("INSERT INTO answers (question_id, kind, value, channel, answered_at) VALUES (?, ?, ?, ?, ?)",
@@ -569,9 +588,11 @@ class QuestionStore:
 
     def _file(self, once: bool, *, agent: str, agent_session_id: str, what: str, options: Any, rec: str, blocks: str,
               cwd: str, resume: dict[str, Any] | None, link: Link | None, held_by: tuple[str, ...] = (),
-              fewest: int = _OPTIONS_MIN) -> tuple[Question, bool]:
+              fewest: int = _OPTIONS_MIN, open_ended: bool = False) -> tuple[Question, bool]:
         what, opts, blocks = self.check(agent=agent, agent_session_id=agent_session_id, what=what, options=options,
-                                        rec=rec, blocks=blocks, cwd=cwd, fewest=fewest)
+                                        rec=rec, blocks=blocks, cwd=cwd, fewest=fewest, open_ended=open_ended)
+        if open_ended:
+            rec = ""                                  # the column is NOT NULL: an open question stores no rec as ""
         try:
             resume_json = None if resume is None else json.dumps(resume, ensure_ascii=False)
         except (TypeError, ValueError) as exc:

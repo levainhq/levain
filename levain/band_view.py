@@ -119,6 +119,11 @@ def _short(text: str, limit: int) -> str:
 
 def _item_lines(label: str, q: Question, compact: bool) -> list[str]:
     """One item: ``label`` is its number (``7.``) or ``new (number pending):``."""
+    if q.open_ended:                       # no options, no rec: only words answer it
+        if compact:
+            return [f"{label} [{_tag(q)}] {_short(q.what, _COMPACT_WHAT)} · open question: answer in words"]
+        return [f"{label} [{_tag(q)}] {q.what}", "    open question: answer in your own words",
+                f"    blocks: {q.blocks} · asked by question #{q.n}"]
     rec = next((_LETTERS[i] for i, (k, _) in enumerate(q.options) if k == q.rec), q.rec)
     if compact:
         return [f"{label} [{_tag(q)}] {_short(q.what, _COMPACT_WHAT)} · rec: {rec}"]
@@ -759,7 +764,8 @@ def band_payload(store: QuestionStore, viewer: str, deadline: float | None = Non
             info = _info_of(q)
             items.append({"n": n, "kind": info.kind, "tag": _tag(q), "what": q.what, "blocks": q.blocks,
                           "options": [{"letter": _LETTERS[i], "label": lab} for i, (_, lab) in enumerate(q.options)
-                                      if i < len(_LETTERS)], "rec": info.rec_letter, "question": q.n})
+                                      if i < len(_LETTERS)], "rec": info.rec_letter, "question": q.n,
+                          "open_ended": q.open_ended})
         elif e is not None:
             items.append({"n": n, "kind": "authority", "tag": e.tag, "what": e.what, "blocks": e.blocks,
                           "options": [{"letter": _LETTERS[i], "label": lab} for i, lab in enumerate(e.options)
@@ -779,7 +785,8 @@ def _foreign_payload(store: Any, shown: Rendered) -> dict[str, Any]:
     re-reads the open set, so a question answered since is refused for itself)."""
     items = [{"n": q.n, "kind": "information", "tag": _tag(q), "what": q.what, "blocks": q.blocks,
               "options": [{"letter": _LETTERS[i], "label": lab} for i, (_, lab) in enumerate(q.options)
-                          if i < len(_LETTERS)], "rec": _info_of(q).rec_letter, "question": q.n}
+                          if i < len(_LETTERS)], "rec": _info_of(q).rec_letter, "question": q.n,
+              "open_ended": q.open_ended}
              for q in _foreign_open(store)]
     return {"seen_through": max((i["n"] for i in items), default=None), "store_id": FOREIGN_STORE_ID,
             "view_id": FOREIGN_VIEW_ID, "items": items, "note": _UNREAD_NOTE if shown.failed else ""}
