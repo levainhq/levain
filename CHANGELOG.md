@@ -25,6 +25,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   refusal says to. Other routes (brokered, Codex) are not checked.
 
 ### Added
+- **Every presence word an agent sets, replaces or is refused now leaves a row you can read.** `levain ping log` prints
+  `<queue dir>/webpush/presence.log.jsonl` (who, which role, the word, the quote, the word it found, the outcome); an agent's
+  write is not made when its row cannot be written, your own word always goes through. `levain coord morning` adds a
+  `presence:` line when an agent set the standing word or was refused in the last 24 hours. What presence does is unchanged.
+  Covered by tests; not run on a real machine.
 - **An agent session can set your `away` or `remote` presence, only when it quotes your words.** `levain ping away`
   or `remote` run inside an agent session needs `--said "<what you told it>"` (the coordinator needs it for every
   word it may set); with no words, or with words over 300 characters, the command is refused and nothing changes. The record keeps the agent, its session and the quote, and `levain ping status` adds
