@@ -592,8 +592,10 @@ def _check_slot_homes(*, host: str | None = None, store: Path | None = None, get
     """The ``agent slot homes`` row (macOS, R7): every in-service slot account a vendor CLI runs as
     (``accounts.vendor_runs_as``) has the root-owned ``L/vendorhome`` as its directory-record home, and that tree is
     root's, 0755, not a link, its ``Library/Preferences`` empty. With a ``/var/empty`` home Codex's managed-preferences
-    sync fails, so a ChatGPT-login session fails ``account/read`` -32603. Read as the operator; a fact that cannot be
-    read is a warning, never green. No row on Linux or with no isolation install."""
+    sync fails, so a ChatGPT-login session fails ``account/read`` -32603. Read as the operator. A confirmed mismatch
+    fails the row: upgrade-pending when it is what an install from before R7 has (the tree absent, an account at
+    ``NO_HOME``), broken otherwise. A fact that cannot be read is a warning, never green. No row on Linux or with no
+    isolation install."""
     import pwd
 
     from levain.slot import accounts as A
@@ -618,39 +620,54 @@ def _check_slot_homes(*, host: str | None = None, store: Path | None = None, get
         return [CheckResult(_SLOT_HOMES, True, f"the slots could not be read ({_slot_why(exc)})", warn=True)]
     names = [n for tag, (kind, _) in tags.items() if kind not in R.OUT_OF_SERVICE
              for n in SlotId("egress" if tag[0] == "e" else "none", int(tag[1:])).accounts if A.vendor_runs_as(n)]
-    tree: list[str] = []
-    try:
-        for p in (home, home / "Library", home / "Library" / "Preferences"):
-            try:
-                st = lstat(str(p))
-            except FileNotFoundError:
-                tree.append(f"{p} is missing")
-                break
-            if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o755:
-                tree.append(f"{p} is not a root-owned 0755 directory")
+    # Each finding is one of three: pending (what an install from before R7 has: the tree absent, an account at
+    # NO_HOME; `levain upgrade --no-pip` applies it), broken (a tree or home wrong otherwise), unread (not judged).
+    pending: list[str] = []
+    broken: list[str] = []
+    unread: list[str] = []
+    prefs = home / "Library" / "Preferences"
+    for p in (home, home / "Library", prefs):
+        try:
+            st = lstat(str(p))
+        except FileNotFoundError:
+            pending.append(f"{p} is missing")
+            break
+        except OSError as exc:
+            unread.append(f"{p} could not be read ({_slot_why(exc)})")
+            break
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o755:
+            broken.append(f"{p} is not a root-owned 0755 directory")
+            break       # nothing below a wrong entry is read: its finding is the one to report
+    else:
+        try:
+            inside = listdir(str(prefs))
+        except OSError as exc:
+            unread.append(f"{prefs} could not be read ({_slot_why(exc)})")
         else:
-            inside = listdir(str(home / "Library" / "Preferences"))
             if inside:
-                tree.append(f"{home / 'Library' / 'Preferences'} is not empty ({', '.join(sorted(inside)[:3])})")
-    except OSError as exc:
-        return [CheckResult(_SLOT_HOMES, True, f"{home} could not be read ({_slot_why(exc)})", warn=True)]
-    wrong, unread = [], []
+                broken.append(f"{prefs} is not empty ({', '.join(sorted(inside)[:3])})")
+    wrong = False
     for n in names:
         try:
             got = getpwnam(n).pw_dir
         except (KeyError, OSError) as exc:
-            unread.append(f"{n} ({type(exc).__name__})")
+            unread.append(f"the account record of {n} could not be read ({type(exc).__name__})")
             continue
         if got != str(home):
-            wrong.append(f"{n} home is {got}")
+            wrong = True
+            (pending if got == A.NO_HOME[host] else broken).append(f"{n} home is {got}")
+    detail = "; ".join(broken + pending) + (": Codex sessions with a ChatGPT login fail -32603" if wrong else "")
+    detail = "; ".join([detail] * bool(detail) + unread)
+    if broken:
+        return [CheckResult(_SLOT_HOMES, False, detail,
+                            f"Look at what is named. `{layout.repair_line(host)}` (which `levain upgrade --no-pip` "
+                            "runs) sets the tree's owner and mode back and points the accounts at it; it does not "
+                            "empty Library/Preferences or replace a file or link standing where a dir belongs.")]
+    if pending:
+        return [CheckResult(_SLOT_HOMES, False, detail, _SLOT_HOMES_FIX, upgrade_pending=True)]
     if unread:
-        return [CheckResult(_SLOT_HOMES, True, f"the account record of {', '.join(unread)} could not be read",
-                            warn=True)]
-    if tree or wrong:
-        detail = "; ".join(tree + wrong)
-        if wrong:
-            detail += ": Codex sessions with a ChatGPT login fail -32603"
-        return [CheckResult(_SLOT_HOMES, True, detail, warn=True, hint=_SLOT_HOMES_FIX)]
+        return [CheckResult(_SLOT_HOMES, True, detail, "What could not be read is not judged; run the doctor again "
+                            "once it can read it.", warn=True)]
     if not names:
         return [CheckResult(_SLOT_HOMES, True, f"no in-service slot account; {home} is in place")]
     return [CheckResult(_SLOT_HOMES, True, f"{len(names)} vendor accounts have {home} (root's, empty)")]

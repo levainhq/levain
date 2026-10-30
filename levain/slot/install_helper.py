@@ -72,7 +72,8 @@ from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, ba
                                 parse_pool_config, policy_limits_path, policy_rows, pool_config_row, pool_config_steps,
                                 pool_config_undo_steps, reserve_row, reserve_steps, roots_steps, row_steps,
                                 run_dir_undo_steps, single_filesystem_steps, slot_rows, tmpfiles_steps,
-                                tmpfiles_undo_steps, ungroup_steps, entry_state, remove_entry_steps)
+                                tmpfiles_undo_steps, ungroup_steps, entry_state, remove_entry_steps,
+                                vendor_home_rows)
 from levain.slot.sudoers import (INSTALL_SUDOERS, RUNTIME_SUDOERS, config_check_step, dropin_state,
                                  remove_dropin_steps, sudoers_paths, sudoers_steps)
 
@@ -1038,6 +1039,8 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
         alloc = allocate(host, egress=new["egress"], verifier=new["none"], used=facts.used_ids,
                          retired=facts.retired)
     made = accounts_of(alloc)
+    # R7 (macOS): the home the new vendor accounts' records name, made before them, as setup and repair make it.
+    home_rows = vendor_home_rows(host)
     rows = slot_rows(host, alloc.slots)
     resumed = set(alloc.slots)
     in_service = tuple(s for s in (SlotId(cls, i) for cls in ("egress", "none") for i in live.get(cls, ()))  # type: ignore[arg-type]
@@ -1057,6 +1060,7 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
     steps = [
         # FIRST (§25): the slots this run makes, so a run that dies part-way resumes them, never spends more.
         intent_write_step(host, intent),
+        *row_steps(host, home_rows),
         *account_steps(host, made),
         *membership_steps(host, membership_pairs(made, None)),
         *row_steps(host, rows),
@@ -1070,7 +1074,7 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
         intent_remove_step(host),   # LAST, after the confinement steps
     ]
     check_tools(facts, steps, verb="replenish")
-    return InstallPlan("replenish", host, tuple(steps), alloc, made, (), tuple(rows), (), facts.retired,
+    return InstallPlan("replenish", host, tuple(steps), alloc, made, (), tuple(home_rows + rows), (), facts.retired,
                        intent=intent)
 
 

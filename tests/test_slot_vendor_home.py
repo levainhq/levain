@@ -137,6 +137,23 @@ def test_repair_repoints_only_in_service_vendor_accounts_after_the_rows(tmp_path
     assert all(not s.skip_if and not s.allow_fail for s in points)
 
 
+def test_replenish_makes_the_vendor_home_before_its_new_accounts_name_it(tmp_path: Path):
+    # L3 r1 (codex MED): a store whose L/vendorhome is gone got new s/c accounts pointing at a missing dir
+    from tests.test_repair_plan import SLOT_UIDS, _pre_change
+    from levain.slot.install_helper import plan_replenish
+
+    facts, _ = _pre_change(tmp_path)
+    plan = plan_replenish(parse_install_argv(["replenish"]), facts, slots=2, verifier_slots=1,
+                          live={"egress": (0,), "none": (0,)}, accounts=SLOT_UIDS)
+    whys = [s.why for s in plan.steps]
+    homes = [i for i, s in enumerate(plan.steps) if "NFSHomeDirectory" in s.argv and s.argv[-1] == HOME]
+    assert [plan.steps[i].argv[3] for i in homes] == ["/Users/_levain_s1"]
+    for p in (HOME, f"{HOME}/Library", f"{HOME}/Library/Preferences"):
+        for w in (f"create {p}", f"set {p} to 0755", f"own {p} as root:wheel"):
+            assert whys.index(w) < min(homes)
+    assert whys.index(f"create {HOME}") > 0 and whys[0].startswith("journal what this replenish")   # the journal stays FIRST
+
+
 def test_vendor_home_steps_scope():
     slots = [SlotId("egress", 2), SlotId("none", 1)]
     names = [s.argv[3] for s in vendor_home_steps("darwin", slots) if "NFSHomeDirectory" in s.argv]
@@ -213,27 +230,75 @@ def test_doctor_slot_homes_row(tmp_path: Path):
     [ok] = _row(store, right)
     assert ok.name == "agent slot homes" and ok.ok and not ok.warn and "3 vendor accounts" in ok.detail
     [old] = _row(store, {**right, "_levain_s1": "/var/empty"})
-    assert old.warn and "_levain_s1 home is /var/empty" in old.detail and "-32603" in old.detail
+    assert not old.ok and "_levain_s1 home is /var/empty" in old.detail and "-32603" in old.detail
     assert old.hint and "levain upgrade --no-pip" in old.hint
     for exc in (KeyError("_levain_s0"), OSError(5, "io")):
         [unread] = _row(store, exc)
         assert unread.warn and "could not be read" in unread.detail
     (store / "vendorhome" / "Library" / "Preferences" / "com.openai.codex.plist").write_text("")
     [dirty] = _row(store, right)
-    assert dirty.warn and "is not empty" in dirty.detail and dirty.hint
+    assert not dirty.ok and "is not empty" in dirty.detail and dirty.hint
 
 
 def test_doctor_slot_homes_tree_must_be_roots_0755(tmp_path: Path):
     store = _store(tmp_path / "a", {"e0": "reusable"})
     right = {"_levain_s0": str(store / "vendorhome")}
     [mine] = _row(store, right, lstat=os.lstat)                 # owned by the test's uid, not root
-    assert mine.warn and "not a root-owned 0755 directory" in mine.detail
+    assert not mine.ok and "not a root-owned 0755 directory" in mine.detail
     (store / "vendorhome" / "Library").chmod(0o775)
     [wide] = _row(store, right)
-    assert wide.warn and f"{store / 'vendorhome' / 'Library'} is not a root-owned 0755" in wide.detail
+    assert not wide.ok and f"{store / 'vendorhome' / 'Library'} is not a root-owned 0755" in wide.detail
     gone = _store(tmp_path / "b", {"e0": "reusable"}, tree=False)
     [missing] = _row(gone, {"_levain_s0": str(gone / "vendorhome")})
-    assert missing.warn and "is missing" in missing.detail and "levain upgrade --no-pip" in missing.hint
+    assert not missing.ok and "is missing" in missing.detail and "levain upgrade --no-pip" in missing.hint
+
+
+def test_doctor_slot_homes_confirmed_mismatch_fails_unread_warns(tmp_path: Path):
+    # L3 r1 (codex MED): a confirmed mismatch is a failing row, so `levain doctor` does not exit 0 on a host whose Codex
+    # sessions fail -32603. What an install from before R7 has (accounts at /var/empty, no tree) is upgrade-pending; a
+    # tree or home that is wrong otherwise is broken; a fact that cannot be read stays a warning.
+    store = _store(tmp_path / "a", {"e0": "reusable"})
+    home = str(store / "vendorhome")
+    [old] = _row(store, {"_levain_s0": "/var/empty"})
+    assert (old.ok, old.upgrade_pending) == (False, True) and "levain upgrade --no-pip" in old.hint
+    gone = _store(tmp_path / "b", {"e0": "reusable"}, tree=False)
+    [missing] = _row(gone, {"_levain_s0": "/var/empty"})
+    assert (missing.ok, missing.upgrade_pending) == (False, True) and "is missing" in missing.detail
+    [elsewhere] = _row(store, {"_levain_s0": "/private/tmp/r7roothome"})
+    assert (elsewhere.ok, elsewhere.upgrade_pending) == (False, False) and "-32603" in elsewhere.detail
+    (store / "vendorhome" / "Library").chmod(0o775)
+    [wide] = _row(store, {"_levain_s0": home})
+    assert (wide.ok, wide.upgrade_pending) == (False, False) and wide.hint
+    (store / "vendorhome" / "Library").chmod(0o755)
+    (store / "vendorhome" / "Library" / "Preferences" / "com.openai.codex.plist").write_text("")
+    [dirty] = _row(store, {"_levain_s0": home})
+    assert (dirty.ok, dirty.upgrade_pending) == (False, False) and "does not empty" in dirty.hint
+    [unread] = _row(_store(tmp_path / "c", {"e0": "reusable"}), KeyError("_levain_s0"))
+    assert unread.ok and unread.warn
+    # a confirmed mismatch beside an unread fact still fails, and says both
+    def one_unread(n):
+        raise OSError(5, "io")
+    [both] = doctor._check_slot_homes(host="darwin", store=gone, getpwnam=one_unread, lstat=_as_root)
+    assert not both.ok and "is missing" in both.detail and "could not be read" in both.detail
+
+
+def test_doctor_slot_homes_a_bad_entry_keeps_its_finding_and_the_account_checks(tmp_path: Path):
+    # L3 r1 (all three seats): once an entry is wrong the walk stops, and listdir's own error is a finding, so the
+    # precise diagnosis, the fix hint and the per-account checks are never lost to a generic "could not be read"
+    store = _store(tmp_path / "a", {"e0": "reusable"}, tree=False)
+    (store / "vendorhome").mkdir()
+    (store / "vendorhome" / "Library").write_text("")                    # a file where a dir belongs
+    [r] = _row(store, {"_levain_s0": "/var/empty"})
+    assert not r.ok and f"{store / 'vendorhome' / 'Library'} is not a root-owned 0755 directory" in r.detail
+    assert "_levain_s0 home is /var/empty" in r.detail and r.hint
+    good = _store(tmp_path / "b", {"e0": "reusable"})
+
+    def no_read(p):
+        raise PermissionError(13, "Permission denied")
+    [r2] = _row(good, {"_levain_s0": "/var/empty"}, listdir=no_read)
+    assert not r2.ok and "could not be read" in r2.detail and "_levain_s0 home is /var/empty" in r2.detail
+    [r3] = _row(good, {"_levain_s0": str(good / "vendorhome")}, listdir=no_read)
+    assert r3.ok and r3.warn and "Preferences could not be read" in r3.detail
 
 
 def test_doctor_slot_homes_no_row_on_linux_or_without_an_install(tmp_path: Path):
