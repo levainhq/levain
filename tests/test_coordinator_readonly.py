@@ -253,3 +253,19 @@ def test_a_closed_thread_is_not_an_open_thread_on_the_card(tmp_path: Path) -> No
     finally:
         conn.close()
     assert ids == [] and morning.card(store)["budgets"] == []
+
+
+def test_the_read_only_coord_verbs_make_nothing_in_a_queue_dir_with_no_store(tmp_path: Path, capsys) -> None:
+    # the shadow finding (10-30 17:08): `levain coord status --queue-dir <dir>` made dispatch.db and awake.lock
+    from levain.cli import main
+
+    d = _dir(tmp_path)
+    for argv, rc in ((["coord", "status"], 0), (["drops", "list"], 0), (["thread", "list"], 0),
+                     (["drops", "show", "d-none"], 1), (["thread", "show", "t-none"], 1)):
+        assert main([*argv, "--queue-dir", str(d)]) == rc, argv
+        capsys.readouterr()
+        assert sorted(p.name for p in d.iterdir()) == [], (argv, list(d.iterdir()))
+    assert main(["coord", "status", "--queue-dir", str(d)]) == 0
+    assert "no coordinator store here" in capsys.readouterr().out
+    gone = tmp_path / "never-made"
+    assert main(["coord", "status", "--queue-dir", str(gone)]) == 0 and not gone.exists()

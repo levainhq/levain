@@ -1008,6 +1008,20 @@ class CoordStore:
         with self._write() as (conn, now):
             return lease.end_unlisted(conn, now, launch_id)
 
+    def launch_replace_done(self, launch_id: str, newest_unsplit: str) -> Any:
+        """The watcher saw ``launch_id``'s session done while a drop it never saw waits
+        (:func:`levain.coordinator.lease.replace_done`): ``(ended launch, the fresh coordinator launch the same
+        transaction asked for or None)``, or None when nothing was replaced. One transaction, so no second drop can
+        wake beside it."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            ended = lease.replace_done(conn, now, launch_id, newest_unsplit)
+            if ended is None:
+                return None
+            lease._lapse_if_past(conn, now)
+            return ended, lease.wake(conn, now)
+
     def coord_lease(self) -> Any:
         """The lease as it stands (live or past its until), or None; nothing written."""
         from levain.coordinator import lease

@@ -86,6 +86,15 @@ def _store(args: argparse.Namespace) -> EnvelopeStore:
     return EnvelopeStore(d)
 
 
+NO_STORE = "no coordinator store here"
+
+
+def _no_store(store: EnvelopeStore) -> bool:
+    """True when the store's file does not exist: a read-only verb says so and makes nothing (no directory, no
+    dispatch.db, no awake.lock). A file that exists is read as before."""
+    return not store.path.exists()
+
+
 def _drop_row(d: Drop) -> dict[str, Any]:
     return {"drop_id": d.drop_id, "surface": d.surface, "outbox_id": d.outbox_id, "words": d.words,
             "words_sha256": d.words_sha256, "sent_at": d.sent_at, "received_at": d.received_at,
@@ -976,6 +985,9 @@ def run_drop_show(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
         store = _store(args)
+        if _no_store(store):
+            print(f"levain drops show: {NO_STORE}", file=sys.stderr)
+            return 1
         drop, threads, receipts = store.drop_view(args.drop_id)
     except _REFUSED as exc:
         print(f"levain drops show: {exc}", file=sys.stderr)
@@ -1041,7 +1053,11 @@ def _chat_subparsers(subparsers: argparse._SubParsersAction) -> argparse._SubPar
 def run_drop_list(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
-        drops = _store(args).drops(limit=args.limit)
+        store = _store(args)
+        if _no_store(store):
+            _emit(out, args.json, [], NO_STORE)
+            return 0
+        drops = store.drops(limit=args.limit)
     except _REFUSED as exc:
         print(f"levain drops list: {exc}", file=sys.stderr)
         return 1
@@ -1056,6 +1072,12 @@ def run_thread(args: argparse.Namespace, out: Any = None) -> int:
     try:
         store = _store(args)
         cmd = args.thread_cmd
+        if cmd in ("list", "show") and _no_store(store):
+            if cmd == "show":
+                print(f"levain thread show: {NO_STORE}", file=sys.stderr)
+                return 1
+            _emit(out, args.json, [], NO_STORE)
+            return 0
         if cmd == "list":
             threads = store.threads(include_closed=args.all)
             _emit(out, args.json, [_thread_row(t) for t in threads],
@@ -1216,6 +1238,9 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
                 watch(store, every=args.every, emit=lambda line: print(line, file=out, flush=True))
             except KeyboardInterrupt:
                 return 0
+            return 0
+        if _no_store(store):
+            _emit(out, args.json, {"store": None, "why": NO_STORE}, NO_STORE)
             return 0
         st = store.coord_status()
     except _REFUSED as exc:

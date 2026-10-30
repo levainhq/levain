@@ -584,6 +584,33 @@ def end_unlisted(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch |
     return end_launch(conn, now, launch_id, "ended", cause)
 
 
+def last_coordinator_write(conn: sqlite3.Connection, ln: Launch) -> str:
+    """When ``ln``'s session last wrote as coordinator (a claim, beat, release or fenced write of its own; never the
+    service's beats), else when its launch went ``active``."""
+    return conn.execute(
+        "SELECT MAX(t) FROM (SELECT at AS t FROM launch_events WHERE launch_id = ? AND kind = 'active' "
+        "UNION ALL SELECT at AS t FROM lease_events WHERE holder = ? AND by = 'coordinator')",
+        (ln.launch_id, ln.session_key)).fetchone()[0]
+
+
+def replace_done(conn: sqlite3.Connection, now: str, launch_id: str, newest_unsplit: str) -> Launch | None:
+    """A coordinator whose session the watcher saw ``done`` (a finished turn, listed, not working) while a drop it never
+    saw waits: its launch is written ``ended``, cause ``lost the lease`` (its lease, if it still held one, released
+    with it; :func:`launch_death` counts that as a death only when it never wrote as coordinator), and the caller's
+    :func:`wake` then asks for a fresh coordinator. ``newest_unsplit`` is the ``received_at`` of the newest drop not
+    split: the launch is replaced only when that came after the session's last coordinator write, so a coordinator that
+    already saw the drop and left it is not replaced for it again. None, nothing written, when the launch is no longer
+    an active coordinator or nothing newer than its last write waits."""
+    ln = launch(conn, launch_id)
+    if ln is None or ln.state != "active" or ln.role != "coordinator" or newest_unsplit <= last_coordinator_write(conn, ln):
+        return None
+    _launch_event(conn, now, launch_id, "ended", "lost the lease")
+    held = lease(conn, now)
+    if held is not None and held.holder == ln.session_key:
+        _event(conn, now, "release", held.holder, token=held.token, until=None, cause="launch ended", by="service")
+    return _launch_row(conn, "launch_id", launch_id)
+
+
 def unspawned(conn: sqlite3.Connection) -> list[Launch]:
     """Pending launches no process has claimed the spawn of, oldest first."""
     return [ln for ln in _in_state(conn, "pending") if conn.execute(
@@ -843,7 +870,8 @@ def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
         # would fight it at claim time, so drops queue for it, until IDLE_GRACE ends the wait
         return "idle", (f"coordinator launch {waited.launch_id} is running without the lease; it claims again "
                         f"(levain coord claim) by {_idle_until(conn, waited)}, or the next drop after that ends it "
-                        "and asks for a fresh coordinator")
+                        "and asks for a fresh coordinator; `levain coord watch` replaces it at its next pass once "
+                        "its session is done and a drop it did not see waits")
     for ln in _in_state(conn, "pending", "coordinator"):
         if now < ln.until:
             return "launching", f"coordinator launch {ln.launch_id} is pending until {ln.until}"

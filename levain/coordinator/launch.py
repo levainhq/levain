@@ -62,8 +62,9 @@ directory refused, claude not on PATH) is no death: the launch stays pending, ea
 queue's settings file is created once: when your main install made it, the coordinator's install keeps it, and its
 grants verify against that install's cockpit (init warns and continues). Your user-scope Claude Code settings, hooks
 and CLAUDE.md imports load into the coordinator's session too (doctor checks the install's wiring and that no settings
-file turns hooks off, not the rest of the effective settings). Drops that arrive while a done coordinator still holds
-the lease wait up to LEASE_TTL + IDLE_GRACE; handing a new drop into a running session is not built. A crashed spawn
+file turns hooks off, not the rest of the effective settings). A drop that arrives while a done claude coordinator is listed waits at most one watch pass:
+the watcher ends that coordinator and starts a fresh one (a Codex coordinator, and a drop path with no watcher running, still wait
+up to LEASE_TTL + IDLE_GRACE); handing a drop into a running session is not built. A crashed spawn
 winner is not retried: its launch expires at LAUNCH_TTL and counts as a death. A session the read back listed in
 another directory than the launch's is not stopped (a name alone is not Levain's evidence); the launch fails and that
 session is yours to look at. The coordinator's directory under the levain home is one the hands floor denies by name
@@ -784,6 +785,9 @@ def watch_once(store: CoordStore) -> list[str]:
       (b) an ``active`` claude launch whose session ``claude agents --json`` lists in neither of two reads
           :data:`UNLISTED_RECHECK` seconds apart is written ``ended``: ``0 turns`` for a coordinator that wrote
           nothing as coordinator since it went active (a death), else ``gone``;
+      (b2) an ``active`` coordinator whose row is ``done`` while a drop newer than its last coordinator write is
+          unsplit is ended (cause ``lost the lease``) and a fresh coordinator asked for in that transaction
+          (:func:`_replace_done`); the fresh one is started at the end of the pass, once (d) stopped the done one;
       (c) the coordinator holding the live lease gets a SERVICE beat only while its session is listed, its row's
           ``state`` is not ``done`` (a finished turn stays listed, idle and done, until stopped), and it wrote as
           coordinator within ``SERVICE_BEAT_WINDOW`` (the store checks that in the beat's transaction). Listed is
@@ -927,6 +931,7 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
             continue
         if ended is not None:
             lines.append(f"launch {ln.launch_id} ended: {ended.cause} (its session is no longer listed)")
+    fresh = _replace_done(store, active, listed, lines)
     held = store.coord_lease()
     if held is not None and held.live and held.holder != "operator":
         holder = next((ln for ln in active if ln.session_key == held.holder), None)
@@ -958,8 +963,49 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
         stopped.add(hid)
         lines.append(f"launch {ln.launch_id} {ln.state} ({ln.cause}): "
                      f"{_stop(exe, hid, cwd=str(store.directory), env=env)}")
+    # the fresh coordinators start after (d) stopped the done ones they replace
+    for launch_id in fresh:
+        got = launch_session(store, launch_id)
+        lines.append(f"launch {got.launch_id} started: {got.attach}" if got.started
+                     else f"launch {got.launch_id} not started: {got.refusal}"
+                          + (f" (run once: {got.remedy})" if got.remedy else ""))
     # again after this pass's own ends, so a session found gone above loses its brief in the same pass (L3 r2)
     lines.extend(_remove_briefs(store))
+
+
+def _replace_done(store: CoordStore, active: list[Any], listed: dict[str, dict[str, Any]], lines: list[str]) -> list[str]:
+    """Step (b2) of :func:`watch_once`: every ``active`` coordinator whose listed row is ``done`` while a drop it has
+    not seen waits is ended (:meth:`CoordStore.launch_replace_done`) and a fresh coordinator asked for in the same
+    transaction. Returns the fresh launches' ids, for the pass to start once (d) has stopped the done sessions. A
+    coordinator not ``done`` (mid-turn, may claim again) is never touched."""
+    done = [ln for ln in active if ln.role == "coordinator" and
+            (listed.get(ln.harness_session_id) or {}).get("state") == "done"]
+    if not done:
+        return []
+    try:
+        queued = _queued(store)
+    except (CoordError, sqlite3.Error) as exc:
+        lines.append(f"done coordinators not replaced: the queued drops could not be read ({exc})")
+        return []
+    if not queued:
+        return []
+    fresh: list[str] = []
+    for ln in done:
+        try:
+            got = store.launch_replace_done(ln.launch_id, max(d.received_at for d in queued))
+        except (CoordError, sqlite3.Error) as exc:
+            lines.append(f"launch {ln.launch_id}: done with a drop waiting, and it could not be replaced ({exc})")
+            continue
+        if got is None:
+            continue
+        ended, new = got
+        lines.append(f"launch {ended.launch_id} ended: {ended.cause} (its session is done and a drop it did not see "
+                     "waits)")
+        if new is not None and new.harness == "claude":
+            fresh.append(new.launch_id)
+        elif new is not None:
+            lines.append(f"launch {new.launch_id}: a {new.harness} launch, left pending for its starter")
+    return fresh
 
 
 def _minutes(delta: Any) -> int:

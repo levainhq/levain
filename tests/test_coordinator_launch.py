@@ -1377,3 +1377,87 @@ def test_every_levain_verb_the_brief_names_passes_the_coordinators_door(store, f
     assert {("coord", "questions"), ("coord", "answer"), ("coord", "escalate"), ("coord", "claim")} <= paths
     refused = sorted(p for p in paths if p not in door.DOOR)
     assert not refused, f"the brief names verbs the coordinator's door refuses: {refused}"
+
+
+# --- a drop that lands while a done coordinator idles (1030-42; the shadow day, 10-30 17:33) --------------------
+def _released_and_done(store, fake, clock):
+    """The measured case: a coordinator woke on drop 1, split it, released its lease and sits listed, state done."""
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d1, _ = store.accept_drop("first drop", surface="cli")
+    store.split(d1.drop_id, [Part("work", "w1")], by="coordinator", token=token)
+    store.coord_release(token, by="coordinator")
+    fake.flag("done")
+    clock[0] += timedelta(minutes=3)
+    return ln
+
+
+def test_a_drop_after_a_done_coordinator_released_gets_a_fresh_coordinator_in_one_pass(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)
+    d2, _ = store.accept_drop("drop after the release", surface="cli")
+    assert store.coord_status()["wake"] == "idle" and store.coord_status()["lease"] is None     # the measured state
+    clock[0] += timedelta(seconds=30)
+    lines = cl.watch_once(store)
+    assert any(line.startswith(f"launch {ln.launch_id} ended: lost the lease") for line in lines), lines
+    assert any(line.startswith(f"launch {ln.launch_id} ended (lost the lease): claude stop {HID}") for line in lines)
+    assert len(fake.spawns()) == 2
+    fresh = [x for x in store.launches_active() if x.launch_id != ln.launch_id]
+    assert len(fresh) == 1 and store.launch(ln.launch_id).state == "ended"
+    brief = cl.brief_path(fresh[0]).read_text()
+    assert d2.drop_id in brief and "drop after the release" in brief          # its brief quotes the waiting drop
+    # the fresh one has not yet written and the drop is older than its activation: later passes leave it alone
+    for _ in range(2):
+        clock[0] += timedelta(seconds=30)
+        cl.watch_once(store)
+    assert len(fake.spawns()) == 2 and [x.launch_id for x in store.launches_active()] == [fresh[0].launch_id]
+
+
+def test_a_replaced_coordinator_that_wrote_is_no_death(store, fake, live_hook, clock):
+    from levain.coordinator import lease as lease_mod
+
+    ln = _released_and_done(store, fake, clock)
+    store.accept_drop("drop after the release", surface="cli")
+    cl.watch_once(store)
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease_mod.launch_death(conn, lease_mod.launch(conn, ln.launch_id)) is False
+    finally:
+        conn.close()
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_a_working_coordinator_without_the_lease_is_not_replaced(store, fake, live_hook, clock):
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    store.coord_release(token, by="coordinator")                        # the fake lists it working (no done flag)
+    store.accept_drop("a drop while it works", surface="cli")
+    lines = cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and fake.stops() == []
+    assert store.launch(ln.launch_id).state == "active" and not any("lost the lease" in x for x in lines)
+
+
+def test_a_done_coordinator_that_already_saw_every_drop_is_not_replaced(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)         # drop 1 was split before the release: nothing unseen waits
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and store.launch(ln.launch_id).state == "active"
+
+
+def test_a_drop_the_done_coordinator_never_saw_is_replaced_even_with_its_lease_live(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    store.coord_claim(ln.launch_id, ln.session_key)      # it holds a live lease and went done without releasing
+    fake.flag("done")
+    clock[0] += timedelta(minutes=2)
+    store.accept_drop("a drop for the done holder", surface="cli")
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended" and len(fake.spawns()) == 2
