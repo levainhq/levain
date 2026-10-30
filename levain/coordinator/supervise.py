@@ -60,6 +60,7 @@ class Watcher:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last: list[str] | None = None
+        self._migrated = False
         self._passes = 0
         self._counted = threading.Condition()
 
@@ -103,7 +104,10 @@ class Watcher:
             from levain.coordinator import launch
 
             store = (self._opener or default_store)()
-            lines = [] if store is None else launch.watch_once(store)
+            lines: list[str] = []
+            if store is not None:
+                lines += self._migrate_once(launch, store)
+                lines += launch.watch_once(store)
         except Exception as exc:  # noqa: BLE001 - one bad pass never ends the watcher (the serve's exit still does)
             self._last = None
             self._safe_emit(f"watch pass faulted ({type(exc).__name__}: {str(exc)[:300]}); next pass in "
@@ -119,6 +123,17 @@ class Watcher:
                 self._passes += 1
                 self._counted.notify_all()
         return lines
+
+    def _migrate_once(self, launch: Any, store: Any) -> list[str]:
+        """What a hand-run ``levain coord watch`` does before its first pass: check the coordinator setting's workspace,
+        once per watcher and not before a store exists. A fault in it is a line, and the passes still run."""
+        if self._migrated:
+            return []
+        self._migrated = True
+        try:
+            return list(launch.migrate_setting(store))
+        except Exception as exc:  # noqa: BLE001 - the passes still run; the launch re-checks the record anyway
+            return [f"the coordinator setting's workspace could not be checked ({type(exc).__name__}: {str(exc)[:300]})"]
 
     def _safe_emit(self, line: str) -> None:
         try:

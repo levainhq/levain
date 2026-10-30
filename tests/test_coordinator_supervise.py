@@ -410,6 +410,47 @@ def test_a_faulting_pass_is_logged_and_the_next_one_runs(store, monkeypatch):
     assert "fine" in out[1:]
 
 
+def test_the_setting_is_checked_once_before_the_first_pass_as_a_hand_run_watch_does(store, monkeypatch):
+    order = []
+    monkeypatch.setattr(cl, "migrate_setting", lambda s: order.append("migrate") or ["workspace moved"])
+    monkeypatch.setattr(cl, "watch_once", lambda s: order.append("pass") or [])
+    out: list[str] = []
+    w = supervise.Watcher(lambda: store, every=0.05, emit=out.append).start()
+    try:
+        assert w.wait_passes(3, 30)
+    finally:
+        assert w.stop(10)
+    assert order[:2] == ["migrate", "pass"] and order.count("migrate") == 1 and out[0] == "workspace moved"
+
+
+def test_a_setting_check_that_faults_is_a_line_and_the_passes_still_run(store, monkeypatch):
+    def boom(s):
+        raise RuntimeError("setting unreadable")
+
+    monkeypatch.setattr(cl, "migrate_setting", boom)
+    monkeypatch.setattr(cl, "watch_once", lambda s: ["ran"])
+    out: list[str] = []
+    w = supervise.Watcher(lambda: store, every=0.05, emit=out.append).start()
+    try:
+        assert w.wait_passes(2, 30)
+    finally:
+        assert w.stop(10)
+    assert out[0] == "the coordinator setting's workspace could not be checked (RuntimeError: setting unreadable)"
+    assert "ran" in out
+
+
+def test_no_store_means_no_setting_check_until_one_exists(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cl, "migrate_setting", lambda s: seen.append("migrate") or [])
+    monkeypatch.setattr(cl, "watch_once", lambda s: [])
+    w = supervise.Watcher(lambda: None, every=0.05, emit=lambda l: None).start()
+    try:
+        assert w.wait_passes(2, 30)
+    finally:
+        assert w.stop(10)
+    assert seen == []
+
+
 def test_an_opener_that_faults_is_logged_and_a_log_that_faults_ends_nothing(store, monkeypatch):
     opened = []
 
