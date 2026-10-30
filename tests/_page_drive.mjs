@@ -167,6 +167,7 @@ for (const s of steps) {
       // an error outcome never satisfies the wait (a context destroyed by a navigation is transient: keep polling)
       // each poll gets a slice of the deadline, not all of it: an evaluate sent while the page navigates can go unanswered
       // for good (CI run 40994737528: one such call held the whole 20 s), and the next poll finds the new document
+      // (so a promise-returning `until` must settle inside one slice, 3 s; the longest in tests/ is 1.5 s)
       const o = await evaluateOutcome(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`, Math.min(Math.max(deadline - Date.now(), 250), 3000));
       if ("error" in o) { lastError = o.error; v = null; } else v = o.value;
       if (v || Date.now() >= deadline) break;
