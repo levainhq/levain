@@ -58,6 +58,10 @@ def register(subparsers) -> None:
                             "COORDINATOR_WORDS. (Use --said=\"-text\" if the quote starts with a dash.)")
         w.set_defaults(func=_word, word=word)
     common(sub.add_parser("status", help="Whether a ping is pushed now, and why.")).set_defaults(func=_status)
+    lg = common(sub.add_parser("log", help="Every presence word set or refused: who, which role, the quote, the outcome."))
+    lg.add_argument("--limit", type=int, default=50, help="The newest N rows (default 50).")
+    lg.add_argument("--json", action="store_true")
+    lg.set_defaults(func=_log)
 
 
 def _qdir(args: argparse.Namespace) -> Path:
@@ -117,6 +121,20 @@ def _status(args: argparse.Namespace) -> int:
     from levain.webpush import presence
 
     print(presence.describe(_qdir(args)))
+    return 0
+
+
+def _log(args: argparse.Namespace) -> int:
+    from levain.webpush import presence
+
+    rows = presence.read_log(_qdir(args), limit=args.limit)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no presence word has been set or refused")
+    for r in rows:
+        print(presence.log_line(r))
     return 0
 
 
