@@ -1109,6 +1109,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/pair": ("pair.html", "text/html; charset=utf-8"),
     "/pair.js": ("pair.js", "text/javascript; charset=utf-8"),
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
+    # An old phone link (the phone port shared this origin before the cockpit took it): see the file's header.
+    "/legacy_phone_link.js": ("legacy_phone_link.js", "text/javascript; charset=utf-8"),
     # The sign sheet's script (OS-1): its page is GET /sign/<id>, served by _route beside a Signer.
     "/sign.js": ("sign.js", "text/javascript; charset=utf-8"),
     # The thread view (CH-U1a): the Build tab's Threads zone, over GET /cockpit/threads.json and /cockpit/thread/<id>.json.
@@ -1118,8 +1120,9 @@ _ASSETS: dict[str, tuple[str, str]] = {
 }
 
 
-# ONESURFACE OS-4: web push on this origin (levain.webpush.routes), served beside a Signer, whose queue holds the push
-# store. The worker, manifest and icons are app shell (token-free, no data); the two reads and three writes need a
+# ONESURFACE OS-4: web push on this origin (levain.webpush.routes). The worker, manifest and icons are app shell
+# (token-free, no data) and always served; the rest is served beside a Signer, whose queue holds the push
+# store. The two reads and three writes need a
 # token on every bind; the phone port's own pairing (/webpush/pair, /webpush/pair/redeem) is not served here: this
 # origin pairs through /pair.
 _PUSH_GET = frozenset({"/webpush/key", "/webpush/record"})
@@ -2103,14 +2106,15 @@ class _Handler(GuardedHandler):
         record, behind :meth:`_sign_read_admitted`."""
         from levain.webpush import routes as push_routes
 
-        queue = self.server.signer.queue_dir
         if not read:
-            status, body, ctype = push_routes.handle("GET", path, {}, b"", queue_dir=queue, authorized=False,
+            # the app shell reads no queue: it is served with or without a Signer
+            status, body, ctype = push_routes.handle("GET", path, {}, b"", queue_dir=Path("."), authorized=False,
                                                      device_id=None) or (404, b"not found\n", "text/plain")
             self._send(body, ctype, status=status, head=head)
             return
         if not self._sign_read_admitted(head=head, what="push reads"):
             return
+        queue = self.server.signer.queue_dir
         try:
             try:
                 got = push_routes.handle("GET", path, {}, b"", queue_dir=queue, authorized=True,
@@ -2891,8 +2895,9 @@ class _Handler(GuardedHandler):
         if dispatch_read is not None or path == _DISPATCH_LIST:     # its reads ride the sign listing's gate exactly
             self._serve_dispatch_sheet(dispatch_read, head=head)
             return
-        # Web push (OS-4), beside a Signer only: the app shell token-free, the reads on the sign reads' own gate
-        if self.server.signer is not None and path in _push_static():
+        # Web push (OS-4): the app shell (worker, manifest, icons) token-free and always served, the reads beside a
+        # Signer only, on the sign reads' own gate
+        if path in _push_static():
             self._serve_push(path, head=head)
             return
         if self.server.signer is not None and path in _PUSH_GET:
