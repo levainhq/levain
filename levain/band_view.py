@@ -905,17 +905,26 @@ def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> st
     return "since your last message: " + " · ".join(parts)
 
 
-def is_autonomous(session_id: str, queue_dir: Path | str | None = None,
-                  environ: Mapping[str, str] | None = None, busy_s: float | None = None) -> bool:
-    """Whether no human turn can reach this seat (D4). The first fact found decides: (1) the Levain launch row of the
-    harness session (a coordinator is attended; a worker is not: the only worker Levain launches is the dispatch
-    executor, and the row carries no worker kind, so a ``session`` worker will need its kind read here when its
-    brief lands); (2) the ``LEVAIN_SEAT=autonomous|attended`` marker Levain sets on the processes it starts (or the
-    user on their own script); (3) neither: NOT autonomous (fail-safe: a band shown where nobody reads it costs tokens,
-    a band missing from a human seat drops questions). Grants and posture never decide it. ``busy_s`` (default
-    HOOK_BUSY_MS) bounds the wait on a held coordinator store; past it there is no launch fact."""
+class SeatFact(NamedTuple):
+    """What the launch row and the seat marker say about a harness session: ``autonomous``, and the launch's ``role``
+    and ``launch_id`` (``None`` for a session with no launch row)."""
+    autonomous: bool
+    role: str | None = None
+    launch_id: str | None = None
+
+
+def seat_fact(session_id: str, queue_dir: Path | str | None = None,
+              environ: Mapping[str, str] | None = None, busy_s: float | None = None) -> SeatFact:
+    """Whether no human turn can reach this seat (D4), with the launch row it was read from. The first fact found
+    decides: (1) the Levain launch row of the harness session (a coordinator is attended; a worker is not: the only
+    worker Levain launches is the dispatch executor, and the row carries no worker kind, so a ``session`` worker will
+    need its kind read here when its brief lands); (2) the ``LEVAIN_SEAT=autonomous|attended`` marker Levain sets on
+    the processes it starts (or the user on their own script); (3) neither: NOT autonomous (fail-safe: a band shown
+    where nobody reads it costs tokens, a band missing from a human seat drops questions). Grants and posture never
+    decide it. ``busy_s`` (default HOOK_BUSY_MS) bounds the wait on a held coordinator store; past it there is no
+    launch fact."""
     if "#agent:" in session_id:
-        return True                           # a subagent never renders: the band belongs to the session's main thread
+        return SeatFact(True)                 # a subagent never renders: the band belongs to the session's main thread
     try:
         from levain.coordinator import lease
         from levain.coordinator.store import CoordStore
@@ -927,11 +936,38 @@ def is_autonomous(session_id: str, queue_dir: Path | str | None = None,
     except Exception:                         # no coordinator store, or not one to read: no launch fact
         ln = None
     if ln is not None and ln.role == "coordinator":
-        return False
+        return SeatFact(False, ln.role, getattr(ln, "launch_id", None))
     if ln is not None and ln.role == "worker":
-        return True
+        return SeatFact(True, ln.role, getattr(ln, "launch_id", None))
     env = os.environ if environ is None else environ
-    return env.get("LEVAIN_SEAT") == "autonomous"      # "attended", anything else or unset: a seat a human reaches
+    return SeatFact(env.get("LEVAIN_SEAT") == "autonomous")   # "attended", anything else or unset: a seat a human reaches
+
+
+def is_autonomous(session_id: str, queue_dir: Path | str | None = None,
+                  environ: Mapping[str, str] | None = None, busy_s: float | None = None) -> bool:
+    """Whether no human turn can reach this seat: :func:`seat_fact`'s ``autonomous``."""
+    return seat_fact(session_id, queue_dir, environ, busy_s).autonomous
+
+
+def wake_marker(launch_id: str) -> str:
+    """The first line of a coordinator launch's first prompt (``launch._prompt``): it names the launch."""
+    return f"[levain wake {launch_id}]"
+
+
+WAKE_LINE = "wake: act and record; the operator is not waiting on this turn"
+_WAKE_PREFIX = "[levain wake ln-"
+
+
+def turn_kind(prompt: Any, fact: SeatFact, environ: Mapping[str, str]) -> str:
+    """``coordinator-wake`` (the prompt's first line is exactly the marker of the launch row this session has, and
+    that row is a coordinator's), ``relay`` (:func:`_is_relay`: another Levain-written line, whatever the seat) or
+    ``operator``. Provenance plus role, never a text prefix alone: the marker on any other session is the operator's."""
+    if not isinstance(prompt, str):
+        return "operator"
+    first = prompt.lstrip().split("\n", 1)[0].strip()
+    if fact.role == "coordinator" and fact.launch_id and first == wake_marker(fact.launch_id):
+        return "coordinator-wake"
+    return "relay" if _is_relay(prompt, environ) else "operator"
 
 
 def _seat_gets_band(payload: Any, environ: Mapping[str, str], deadline: float | None = None) -> bool:
@@ -956,7 +992,9 @@ def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None, agent: s
     recorded and refused and the viewer's delta. Call ``commit()`` only once the text was DELIVERED: it records the
     ``closed`` notices as shown and the viewer's view row (D7). ``("", no-op)`` for an autonomous or id-less seat, an
     empty band or ANY error before anything was recorded; it never raises (``commit`` neither). A render that fails
-    AFTER an answer was recorded still returns the echo: what was recorded is said."""
+    AFTER an answer was recorded still returns the echo: what was recorded is said. A coordinator wake
+    (:func:`turn_kind`) returns only :data:`WAKE_LINE` with a no-op commit, and leaves the turn-kind record the Stop
+    hook reads."""
     t0 = time.monotonic()
     # ONE bound for the whole hook (S3 fix round 2, codex 4/5): the launch-row read, every snapshot (questions and
     # the authority sources), the answers' write, a first-time setup, the render's numbering, then the view row.
@@ -974,10 +1012,15 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
         env = os.environ if environ is None else environ
         if not _seat_gets_band(payload, env, deadline):
             return "", _no_commit
-        store = QuestionStore(queue_dir_for(env))
+        directory = queue_dir_for(env)
+        store = QuestionStore(directory)
         viewer = f"{agent}:{payload['session_id']}"
     except Exception:
         return "", _no_commit
+    if _coordinator_wake(payload, env, directory, deadline):
+        _write_turn(directory, viewer, payload["session_id"], "wake")
+        return WAKE_LINE, _no_commit                # silent: no parse, no render, no view, no `closed` notice
+    _write_turn(directory, viewer, payload["session_id"], "operator", only_if_present=True)
     echo = ""
     try:
         echo = _seat_answer(store, viewer, payload.get("prompt"), env, deadline)
@@ -1014,6 +1057,75 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
             pass
 
     return text, commit
+
+
+def _coordinator_wake(payload: Any, env: Mapping[str, str], directory: Path | str, deadline: float) -> bool:
+    """Whether this UserPromptSubmit is a coordinator wake (:func:`turn_kind`). The launch row is read only for a
+    prompt that starts like the marker, so no other turn pays for it. Any error: not a wake (the turn gets today's
+    band)."""
+    try:
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or not prompt.lstrip().startswith(_WAKE_PREFIX):
+            return False
+        fact = seat_fact(payload["session_id"], directory, env, max(0.0, deadline - time.monotonic()))
+        return turn_kind(prompt, fact, env) == "coordinator-wake"
+    except Exception:
+        return False
+
+
+def _turn_path(directory: Path | str, viewer: str, session: str) -> Path:
+    import hashlib
+
+    f = _claim_file(directory, viewer)
+    return f.with_name(f"{f.name}.turn.{hashlib.sha256(session.encode()).hexdigest()[:24]}")
+
+
+def _write_turn(directory: Path | str, viewer: str, session: str, kind: str, only_if_present: bool = False) -> None:
+    """The turn-kind record the Stop hook reads (``{kind, at, session}``, one file per session, replaced atomically).
+    ``only_if_present``: rewrite a record that exists and write none otherwise, so a turn after a wake supersedes the
+    wake's record without every turn of every seat writing one. Never raises."""
+    try:
+        f = _turn_path(directory, viewer, session)
+        if only_if_present and not f.exists():
+            return
+        f.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"kind": kind, "at": time.time_ns(), "session": session}))
+        os.replace(tmp, f)
+    except Exception:
+        pass
+
+
+def _fresh_wake(directory: Path | str, viewer: str, session: str, view_gen: int) -> bool:
+    """True only when the session's turn record says ``wake``, names this session and is newer than the viewer's
+    newest view (``view_gen``). A missing, unreadable, stale or foreign record is False: the reply is verified."""
+    try:
+        rec = json.loads(_turn_path(directory, viewer, session).read_text())
+        return (rec["kind"] == "wake" and rec["session"] == session and type(rec["at"]) is int
+                and rec["at"] > view_gen)
+    except Exception:
+        return False
+
+
+def turn_log_kind(payload: Any, kind: str, environ: Mapping[str, str] | None = None, agent: str = "claude_code") -> str:
+    """The transcript kind for this turn's line: ``wake`` for a prompt (``kind="prompt"``) or ``wake_reply`` for a
+    reply (``kind="reply"``) when the turn is a coordinator wake, else ``kind``. For a prompt it reads the record
+    UserPromptSubmit just wrote; for a reply it applies the Stop hook's own freshness test. Never raises."""
+    try:
+        from levain.consent.queue import queue_dir_for
+
+        env = os.environ if environ is None else environ
+        session = payload["session_id"]
+        directory = queue_dir_for(env)
+        viewer = f"{agent}:{session}"
+        if kind == "prompt":
+            rec = json.loads(_turn_path(directory, viewer, session).read_text())
+            return "wake" if rec["kind"] == "wake" and rec["session"] == session else kind
+        got = _view_row(QuestionStore(directory), viewer)
+        gen = got[1] if got is not None else 0
+        return "wake_reply" if _fresh_wake(directory, viewer, session, gen) else kind
+    except Exception:
+        return kind
 
 
 def hook_contract(payload: Any, environ: Mapping[str, str] | None = None, agent: str = "claude_code") -> str:
@@ -1119,8 +1231,9 @@ def hook_stop(payload: Any, environ: Mapping[str, str] | None = None, agent: str
     view (what the UserPromptSubmit hook delivered): the reply must reprint the rendered band, header line and every
     item line in order (:func:`_reprint_check`). BOUNDED: never when the harness says the stop is already a
     continuation (``stop_hook_active``), at most one block per view (:func:`_claim_retry`), and FAIL OPEN on anything
-    unreadable (no view, a non-text reply, an autonomous seat, a busy or missing store). Never raises, never writes the
-    operator's data."""
+    unreadable (no view, a non-text reply, an autonomous seat, a busy or missing store). The one skip beyond those: a
+    fresh coordinator-wake record (:func:`_fresh_wake`); a missing, stale or foreign record verifies. Never raises,
+    never writes the operator's data."""
     try:
         from levain.consent.queue import queue_dir_for
 
@@ -1139,6 +1252,8 @@ def hook_stop(payload: Any, environ: Mapping[str, str] | None = None, agent: str
         if got is None:
             return None
         view, gen, block = got
+        if _fresh_wake(directory, viewer, payload["session_id"], gen):
+            return None                                  # a coordinator wake: nobody is waiting on this reply
         if not view.open_list:
             return None
         missing, altered = _reprint_check(view, block, message)

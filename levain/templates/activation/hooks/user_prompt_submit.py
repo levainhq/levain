@@ -192,7 +192,13 @@ def main() -> int:
         # Transcript line (Q8): the operator's prompt, for the cockpit's read-only view.
         try:
             if isinstance(prompt, str):
-                hook.session_log(session_id, "prompt", prompt)
+                kind = "prompt"
+                try:
+                    from levain.band_view import turn_log_kind
+                    kind = turn_log_kind(payload, "prompt")     # "wake" for a coordinator wake: not his words
+                except Exception:
+                    pass
+                hook.session_log(session_id, kind, prompt)
         except Exception:
             pass
     except Exception:
