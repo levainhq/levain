@@ -247,6 +247,24 @@ def _install_answers() -> dict[str, str]:
     return answers
 
 
+def _bring_read_rule(target: Path, emit: Callable[[str], None]) -> str:
+    """A coordinator install an earlier release made lacks the bare ``Read`` allow rule: the adapter refresh `levain
+    update` runs (settings and hooks, never the carrier) adds it under the install's lock, an operator's own rules
+    kept and a second run a no-op. A refresh that cannot settle leaves the rule pending; ``coord status`` says so."""
+    from levain import install as inst
+
+    try:
+        with inst.install_lock(target, create=False):
+            inst.refresh_adapter(target, apply=True, emit=lambda line: print(line, file=sys.stderr, flush=True),
+                                 carrier=False)
+    except Exception as exc:  # noqa: BLE001 - the launch goes on; the pending state stays visible in `coord status`
+        return f"; the Read allow rule is still pending ({type(exc).__name__}: {str(exc)[:200]})"
+    if inst.coordinator_read_rule_pending(target):
+        return f"; the Read allow rule is still pending (run: levain update --path {shlex.quote(str(target))})"
+    emit(f"added the Read allow rule to {target}'s project settings")
+    return "; the Read allow rule was added"
+
+
 def setup_install(directory: Path, *, emit: Callable[[str], None] = print,
                   user_scope: bool = False) -> tuple[Path, bool, str]:
     """Make ``directory`` a Levain install for Claude Code unless its consent hook is live already:
@@ -259,6 +277,8 @@ def setup_install(directory: Path, *, emit: Callable[[str], None] = print,
     target = Path(directory).expanduser().resolve()
     live, detail = hook_live(target, user_scope=user_scope)
     if live:
+        if inst.coordinator_read_rule_pending(target):
+            detail += _bring_read_rule(target, emit)
         return target, True, detail
     if not inst._is_safe_install_target(target):
         return target, False, (f"{target} holds files and is not a Levain install with a live consent hook "

@@ -19,6 +19,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -1222,8 +1223,17 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
         print(f"levain coord {cmd}: {exc}", file=sys.stderr)
         return 1
     lines = [_lease_line(st["lease"]), f"next drop: {st['wake']} ({st['why']})"]
+    st["install_upgrade_pending"] = False
     if st.get("setting"):
         lines.append(user_layer_text(st["setting"]))
+        cwd = st["setting"].get("cwd")
+        if st["setting"].get("agent") == "claude" and cwd:
+            from levain.install import coordinator_read_rule_pending
+
+            if coordinator_read_rule_pending(Path(cwd)):
+                st["install_upgrade_pending"] = True
+                lines.append(f"coordinator install: upgrade pending (no Read allow rule, so a read outside its "
+                             f"workspace waits on a prompt); run: levain update --path {shlex.quote(str(cwd))}")
     for ln in st["launches"]:
         lines.append(f"  {ln['launch_id']}  {ln['role']}  {ln['harness']}  {ln['state']} ({ln['cause']})  "
                      f"session {ln['session_key']}  asked {ln['at']}")

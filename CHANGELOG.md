@@ -7,6 +7,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Changed
+- **The Claude Code coordinator's own install now allows `Read`.** With your user layer left out, the `Read` rule in
+  your own settings is gone too, so a read of a file outside the coordinator's workspace stopped at a prompt nobody
+  answers. Its install's project settings now carry a bare `Read` allow, so it can read any file your own account can.
+  Write, Edit, WebFetch and every shell command other than its own `coord`, `drops` and `thread` verbs still ask. Only
+  the coordinator's own install gets the rule; a `levain init` for your sessions does not. The rule is the same with
+  `--user-scope on`, where your own rules apply as well. An older coordinator install gets the rule the next time
+  `levain coord agent claude` runs, or from `levain update --path <the coordinator directory>`; both keep any rule you
+  added and a second run changes nothing. Until then `levain coord status` says `coordinator install: upgrade pending`
+  (and `install_upgrade_pending` in `--json`).
 - **The Claude Code coordinator no longer loads your user-level Claude Code layer.** A coordinator session now starts
   with `--setting-sources project,local` and auto-memory off, so your `~/.claude` settings, hooks, `CLAUDE.md` and
   memory stay out of its context (measured on a cold turn: about 53K new cache tokens and $0.214 before, 9K and $0.038

@@ -1607,3 +1607,56 @@ def test_a_missing_hooks_off_helper_fails_loud_not_as_a_refusal(tmp_path, tmp_ho
     monkeypatch.delattr(doctor, "_hooks_off_files")                      # a rename in doctor
     with pytest.raises(AttributeError):
         cl.hook_live(target, user_scope=False)
+
+
+def test_the_coordinator_install_allows_a_bare_read_and_no_other_file_tool(tmp_home, qdir, tmp_path, capsys):
+    # 1030-42 (np-5396be49 "5b"): under --setting-sources project,local the user's own `Read` allow is gone and a Read
+    # outside the workspace stopped at a prompt nobody answers; the coordinator install's project settings carry it
+    from levain import install as inst
+
+    def allow(d):
+        return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    rules = allow(target)
+    assert rules.count("Read") == 1
+    assert not [r for r in rules if r.split("(")[0] in ("Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Bash")
+                and not r.startswith("Bash(")], rules
+    assert not [r for r in rules if r.startswith("Bash(") and not r.endswith(":*)")], rules
+    # a plain `levain init` never gains it
+    plain = tmp_path / "plain"
+    answers = tmp_path / "answers.json"
+    answers.write_text(json.dumps(cl._install_answers()))
+    assert inst.run_init(plain, "claude-code", force=False, answers_file=answers, default_grants="no") == 0
+    assert "Read" not in allow(plain.resolve())
+    assert inst.coordinator_read_rule_pending(plain.resolve()) is False       # not a coordinator: nothing pending
+    assert inst.coordinator_read_rule_pending(target) is False
+
+
+def test_an_older_coordinator_install_is_brought_to_the_read_rule_once(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    def allow(d):
+        return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+
+    with monkeypatch.context() as m:
+        m.setattr(inst, "COORDINATOR_READ_ALLOW", ())                          # the install as an earlier release made it
+        _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    assert "Read" not in allow(target)
+    assert inst.coordinator_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "upgrade pending" in status and "levain update --path" in status
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["install_upgrade_pending"] is True
+    # an operator's own rule survives, and `coord agent claude` (the path a coordinator launch setup takes) adds Read once
+    doc = json.loads((target / ".claude" / "settings.json").read_text())
+    _main(qdir, capsys, "coord", "agent", "claude")
+    got = allow(target)
+    assert got.count("Read") == 1 and inst.coordinator_read_rule_pending(target) is False
+    assert all(r in got for r in doc["permissions"]["allow"])
+    assert "upgrade pending" not in _main(qdir, capsys, "coord", "status").out
+    again = (target / ".claude" / "settings.json").read_bytes()
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert (target / ".claude" / "settings.json").read_bytes() == again        # the second run changes nothing
+    assert allow(target).count("Read") == 1

@@ -2782,6 +2782,26 @@ def coordinator_allow(python_path: str) -> tuple[str, ...]:
     return tuple(f"Bash({command} {verb}:*)" for verb in COORDINATOR_VERBS)
 
 
+# A bare `Read` (np-5396be49 "5b", 1030-42): the coordinator starts without the user layer, so the user's own `Read`
+# allow is not loaded and a Read outside the workspace stopped at a prompt nobody answers. Read only: Write, Edit,
+# WebFetch and Bash outside the three verbs above still ask. Held apart from coordinator_allow, which is the Bash
+# rules the brief and the Codex rule file spell.
+COORDINATOR_READ_ALLOW = ("Read",)
+
+
+def coordinator_read_rule_pending(install: Path) -> bool:
+    """True when ``install`` is a Claude Code coordinator install whose project settings lack the rules
+    :data:`COORDINATOR_READ_ALLOW` names (an install an earlier release made): `levain update --path` brings it.
+    False for any other install, and for settings that cannot be read (nothing to say about them here)."""
+    if persisted_role(install) != "coordinator" or effective_adapter(install) != "claude-code":
+        return False
+    try:
+        allow = json.loads((install / ".claude" / "settings.json").read_text(encoding="utf-8"))["permissions"]["allow"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return isinstance(allow, list) and any(rule not in allow for rule in COORDINATOR_READ_ALLOW)
+
+
 def coordinator_deny() -> tuple[str, ...]:
     """The coordinator's Claude Code deny rules: no edit of its own record (the file that marks its workspace for
     the door) or that file's lock, wherever the door reads one. Claude Code consults ``Edit(path)`` rules for every
@@ -2953,7 +2973,7 @@ def _apply_role(settings_text: str, role: str | None, python_path: str) -> str:
     allow = perms.setdefault("allow", []) if isinstance(perms, dict) else None
     if not isinstance(allow, list):
         raise InitError("the rendered Claude Code settings carry a permissions.allow that is not a list")
-    allow.extend(rule for rule in coordinator_allow(python_path) if rule not in allow)
+    allow.extend(rule for rule in (*coordinator_allow(python_path), *COORDINATOR_READ_ALLOW) if rule not in allow)
     deny = perms.setdefault("deny", [])
     if not isinstance(deny, list):
         raise InitError("the rendered Claude Code settings carry a permissions.deny that is not a list")
