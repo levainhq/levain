@@ -3,6 +3,7 @@
 // answer. This page decides nothing: every refusal shown is the server's own words.
 (function () {
   "use strict";
+  if (window.LevainCardFormat && typeof window.LevainCardFormat.installFieldGrow === "function") window.LevainCardFormat.installFieldGrow();
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls;
                                    if (text != null) n.textContent = text; return n; };

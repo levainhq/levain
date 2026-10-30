@@ -189,3 +189,9 @@ textarea.words { width: 100%; box-sizing: border-box; margin-top: var(--sp-4); f
 .band-bar { display: flex; gap: var(--sp-4); align-items: center; margin-top: var(--sp-5); }
 .band-box { flex: 1 1 auto; min-width: 0; box-sizing: border-box; min-height: 44px; padding: 0 var(--sp-4); font: 16px/1.2 var(--mono);
   color: inherit; background: transparent; border: 1px solid var(--hair-2); border-radius: 10px; }
+
+/* Free-text fields (Phill 10-30): one rule for the multi-line boxes (same as dashboard.css), full width, ~8 rows, growing,
+   16px against iOS zoom; the one-line write-in and reason inputs get the width and font only. */
+body :is(textarea.words, textarea.drop-words, .stateline textarea) { display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box;
+  min-height: 12em; font-size: 16px; line-height: 1.45; resize: vertical; field-sizing: content; }
+body :is(.req.sign input.write-in, .row.dispatch input.reason) { width: 100%; box-sizing: border-box; font-size: 16px; }

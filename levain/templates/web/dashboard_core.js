@@ -26,6 +26,7 @@
 
 (function () {
   "use strict";
+  if (window.LevainCardFormat && typeof window.LevainCardFormat.installFieldGrow === "function") window.LevainCardFormat.installFieldGrow();
 
   // ---- tiny DOM helpers (textContent only — never innerHTML on store data) ----
   const el = (tag, cls, text) => {

@@ -333,7 +333,23 @@
     return det;
   }
 
-  const api = { collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, drawHead, drawDetail, drawBody };
+  // Free-text fields (the Drop box, the question and coordinator boxes, the phone's words and state line) grow with what is
+  // typed. CSS `field-sizing: content` does it where the browser has it; this is the fallback that works on iOS Safari
+  // today: one delegated listener, height from scrollHeight on input. Safe to call from every surface (once per page).
+  const FREE_TEXT = "textarea#drop-words, textarea.drop-words, textarea.words, textarea.question-words, .bd-tell textarea, .stateline textarea";
+  function installFieldGrow() {
+    const doc = root.document;
+    if (!doc || doc._levainFieldGrow) return;
+    doc._levainFieldGrow = true;
+    doc.addEventListener("input", (ev) => {
+      const t = ev.target;
+      if (!t || t.tagName !== "TEXTAREA" || !t.matches(FREE_TEXT)) return;
+      t.style.height = "auto";
+      t.style.height = (t.scrollHeight + (t.offsetHeight - t.clientHeight)) + "px";
+    });
+  }
+
+  const api = { installFieldGrow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, drawHead, drawDetail, drawBody };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);

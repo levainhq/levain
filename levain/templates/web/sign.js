@@ -46,6 +46,7 @@
 // phone's own. The bytes signed are the server's; the line shown is the challenge's own `line`.
 (function () {
   "use strict";
+  if (window.LevainCardFormat && typeof window.LevainCardFormat.installFieldGrow === "function") window.LevainCardFormat.installFieldGrow();
 
   const WRITE_TOKEN_KEY = "levain_write_token";     // dashboard_boot.js's key: the cockpit's own token in this browser
   const PAIRED_MARK_KEY = "levain_paired_device";   // pair.js's mark: this browser holds a paired device's key

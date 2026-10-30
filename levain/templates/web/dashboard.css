@@ -2844,3 +2844,12 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
   body.ke .panel .phead:has(> .src.fresh) .ck-lay-up, body.ke .panel .phead:has(> .src.fresh) .ck-lay-down,
   body.ke .panel .phead:has(> .src.fresh) .ck-lay-fold { margin-left: calc(var(--hit-min) - var(--ctl-row) - var(--sp-3)); }
 }
+
+/* Free-text fields (Phill 10-30: the Drop box was ~20 columns by 4 rows, impossible to type in): ONE rule for the multi-line
+   boxes, full width of the sheet/card, ~8 rows, grows with its content (card_format.js installFieldGrow is the iOS fallback),
+   16px so iOS Safari does not zoom. The write-in answers are one line by contract (a signed write-in may not hold a newline),
+   so they get the same width and font, not the rows. */
+body :is(#drop-words, .question-words, .bd-tell textarea) { display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box;
+  min-height: 12em; padding: var(--sp-3) var(--sp-4); font-size: 16px; line-height: 1.45; resize: vertical; field-sizing: content; }
+body :is(.sheet-write-in, .sign-write-in) { grid-column: 1 / -1; display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box; min-height: 44px; font-size: 16px; }
+body .state-input { font-size: 16px; }
