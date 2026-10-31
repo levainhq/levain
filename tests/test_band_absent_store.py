@@ -138,80 +138,46 @@ def test_a_recorded_view_whose_sources_all_read_carries_no_note(tmp_path):
 
 
 def test_a_failed_authority_items_read_says_so_and_still_lists_the_questions(tmp_path, monkeypatch):
-    """The same class as the unread source: _extras_of raising used to leave the note empty, so both clients drew a healthy
-    band missing the authority items. The question items still list, and the note says the band may be missing items."""
+    """The same class as the unread source: the authority read raising used to leave the note empty, so both clients drew a
+    healthy band missing the authority items. The question items still list, and the note says the band may be missing items."""
     store = QuestionStore(tmp_path / "consent")
     _file(store)
 
     def boom(*a, **k):
         raise RuntimeError("authority items could not be read")
 
-    monkeypatch.setattr(band_view, "_extras_of", boom)
+    monkeypatch.setattr(band_view, "read_extras", boom)
     got = band_view.band_payload(store, "cockpit:browser")
     assert got["note"] == UNREAD, got
     assert got["view_id"] is not None and len(got["items"]) == 1 and got.get("store") != "absent", got
 
 
-def test_an_authority_item_the_second_read_could_not_read_says_so_and_still_lists_the_questions(tmp_path, monkeypatch):
-    """codex OPEN (L3 r3): _extras_of turns a failed authority-source read into ({}, unknown) WITHOUT raising, and
-    band_payload discarded the unknown numbers: the view numbered an authority item, the second read failed, the item was
-    omitted and the note stayed empty (a healthy band that is missing an item)."""
+def test_an_authority_read_that_reports_a_failed_source_says_so_and_still_lists_the_questions(tmp_path, monkeypatch):
+    """The one read does not raise: it returns the sources it could read and a ``failed`` line for the one it could not
+    (a locked queue.db). The band lists the questions and says it may be missing items; it never draws a healthy band."""
     from levain import band_sources
 
     store = QuestionStore(tmp_path / "consent")
     _file(store)
-    extra = band_sources.Extra(source="consent", ref="c1", filed="2026-01-01T00:00:00Z", tag="t", what="Sign the rule?",
-                               options=("yes", "no"), rec="yes", rec_letter="a", blocks="b", origin="o")
-    armed = [False]
-
-    def read(*a, **k):
-        if armed[0]:
-            raise OSError("queue.db is locked")           # the first read (the shown view) saw the item; this one cannot
-        return band_sources.Extras(items=[extra])
-
-    shown = band_view.show
-
-    def show_then_arm(*a, **k):
-        r = shown(*a, **k)
-        armed[0] = True
-        return r
-
-    monkeypatch.setattr(band_view, "read_extras", read)
-    monkeypatch.setattr(band_view, "show", show_then_arm)
+    monkeypatch.setattr(band_view, "read_extras", lambda *a, **k: band_sources.Extras(failed=["sign: queue.db is locked"]))
     got = band_view.band_payload(store, "cockpit:browser")
     assert got["note"] == UNREAD, got
     assert [i["what"] for i in got["items"]] == ["Ship the sweep fix?"], got      # the question still lists; the extra cannot
 
 
-def _authority_read(monkeypatch, tmp_path, second):
-    """A store with one question and one numbered authority item (read fresh on the first read); ``second`` is what the
-    authority sources hold on every later read. Returns the payload."""
+def _authority_read(monkeypatch, tmp_path, held):
+    """A store with one question; ``held`` is what the authority sources hold on the one read. Returns the payload."""
     from levain import band_sources
 
     store = QuestionStore(tmp_path / "consent")
     _file(store)
-    extra = band_sources.Extra(source="sign", ref="r1", filed="2026-01-01T00:00:00Z", tag="t", what="Sign the rule?",
-                               options=("yes", "no"), rec="yes", rec_letter="a", blocks="b", origin="o")
-    armed = [False]
-
-    def read(*a, **k):
-        return second if armed[0] else band_sources.Extras(items=[extra], complete={"sign"})
-
-    shown = band_view.show
-
-    def show_then_arm(*a, **k):
-        r = shown(*a, **k)
-        armed[0] = True
-        return r
-
-    monkeypatch.setattr(band_view, "read_extras", read)
-    monkeypatch.setattr(band_view, "show", show_then_arm)
+    monkeypatch.setattr(band_view, "read_extras", lambda *a, **k: held)
     return band_view.band_payload(store, "cockpit:browser")
 
 
 def test_an_authority_item_whose_record_cannot_be_decoded_says_so_and_does_not_vanish_into_health(tmp_path, monkeypatch):
-    """complement MED (L3 r4): a numbered authority item still open but UNREADABLE on the second read was left out of the
-    listing and, its source being complete, out of `unknown` too: the payload omitted it with an empty note."""
+    """complement MED (L3 r4): an authority item still open but UNREADABLE was left out of the listing and, its source
+    being complete, out of the note too: the payload omitted it with an empty note."""
     from levain import band_sources
 
     bad = band_sources.Extra(source="sign", ref="r1", filed="2026-01-01T00:00:00Z", tag="t",
@@ -222,8 +188,8 @@ def test_an_authority_item_whose_record_cannot_be_decoded_says_so_and_does_not_v
     assert [i["what"] for i in got["items"]] == ["Ship the sweep fix?"], got
 
 
-def test_an_authority_item_closed_between_the_two_reads_sets_no_note(tmp_path, monkeypatch):
-    """The item that is simply gone (its source read in full, the row closed) is not a read failure: no note."""
+def test_an_authority_source_read_in_full_with_nothing_open_sets_no_note(tmp_path, monkeypatch):
+    """A source read in full that holds nothing open is not a read failure: no note, the question lists."""
     from levain import band_sources
 
     got = _authority_read(monkeypatch, tmp_path, band_sources.Extras(items=[], complete={"sign"}))
@@ -232,27 +198,19 @@ def test_an_authority_item_closed_between_the_two_reads_sets_no_note(tmp_path, m
 
 
 def test_a_corrupt_question_row_says_so_and_the_other_items_still_list(tmp_path, monkeypatch):
-    """complement LOW (L3 r3): _items_of swallowed a _question_of exception, so the dropped item left the note empty."""
+    """complement LOW (L3 r3): a question row that cannot be decoded was dropped from the listing and left the note empty."""
     store = QuestionStore(tmp_path / "consent")
     _file(store)
     store.file(agent="claude_code", agent_session_id="s2", what="Rotate the key?", options=OPTS, rec="ship",
                blocks="the key", cwd="/w")
     real = QuestionStore._question_of                     # a staticmethod: the plain function
-    shown = band_view.show
-    armed = [False]
-
-    def show_then_arm(*a, **k):
-        r = shown(*a, **k)                                # the render read both rows fine; the listing's read cannot decode one
-        armed[0] = True
-        return r
 
     def question_of(row):
         q = real(row)
-        if armed[0] and q.what == "Ship the sweep fix?":
+        if q.what == "Ship the sweep fix?":
             raise ValueError("corrupt options json")
         return q
 
-    monkeypatch.setattr(band_view, "show", show_then_arm)
     monkeypatch.setattr(QuestionStore, "_question_of", staticmethod(question_of))
     got = band_view.band_payload(store, "cockpit:browser")
     assert got["note"] == UNREAD, got
@@ -437,9 +395,10 @@ def test_the_settle_marker_is_cleared_while_a_read_is_pending_and_a_throwing_dra
     assert "could not be drawn" in out["values"][-1], out["values"][-1]               # said on the page, not drawn as health
 
 
-def test_an_open_item_whose_number_is_pending_is_said_in_the_note_not_dropped_silently(tmp_path):
-    """diogenes-20261030-020624: a write lock held at the deadline leaves Q-two's number pending; the text lists it as
-    ``new (number pending)`` but the payload bound to the older view, listed one item and said nothing."""
+def test_a_busy_write_lock_records_no_view_and_the_band_says_so_instead_of_listing_a_stale_one(tmp_path):
+    """diogenes-20261030-020624: a write lock held at the deadline leaves Q-two's number pending and its view unrecorded.
+    One snapshot, one view: with no view to bind, the payload lists nothing and says the band could not be recorded; it
+    never binds an older view that lists one item and says nothing."""
     store = QuestionStore(tmp_path / "consent")
     store.file(agent="claude_code", agent_session_id="s1", what="Q-one?", options=OPTS, rec="hold", blocks="a", cwd="/w")
     assert band_view.band_payload(store, "cockpit:browser")["note"] == ""     # the view [1] is recorded
@@ -451,13 +410,13 @@ def test_an_open_item_whose_number_is_pending_is_said_in_the_note_not_dropped_si
     finally:
         holder.execute("ROLLBACK")
         holder.close()
-    assert [i["what"] for i in got["items"]] == ["Q-one?"], got
-    assert got["note"] == band_view._UNREAD_NOTE, got
+    assert got["items"] == [] and got["view_id"] is None, got
+    assert got["note"] == NOTE, got
 
 
-def test_a_skipped_view_record_with_an_older_view_bound_is_said_in_the_note(tmp_path, monkeypatch):
-    """L3 r1 (codex): Q-two is numbered, then the view record is skipped on a busy lock, so the older view [1] is bound
-    and the payload lists one item with ``pending`` false; the band must still say it may be missing items."""
+def test_a_skipped_view_record_binds_no_older_view_and_the_band_says_so(tmp_path, monkeypatch):
+    """L3 r1 (codex): Q-two is numbered, then the view record is skipped on a busy lock. The payload binds no view and
+    lists no item (an older view [1] is never reused), and the band says it could not be recorded."""
     store = QuestionStore(tmp_path / "consent")
     store.file(agent="claude_code", agent_session_id="s1", what="Q-one?", options=OPTS, rec="hold", blocks="a", cwd="/w")
     assert band_view.band_payload(store, "cockpit:browser")["note"] == ""
@@ -465,5 +424,5 @@ def test_a_skipped_view_record_with_an_older_view_bound_is_said_in_the_note(tmp_
     band_view.render_full(store)                                              # numbers Q-two (a committed write)
     monkeypatch.setattr(band_view, "record_view", lambda *a, **k: None)      # the record skipped on a busy lock
     got = band_view.band_payload(store, "cockpit:browser")
-    assert [i["what"] for i in got["items"]] == ["Q-one?"], got
-    assert got["note"] == band_view._UNREAD_NOTE, got
+    assert got["items"] == [] and got["view_id"] is None, got
+    assert got["note"] == NOTE, got

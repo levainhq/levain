@@ -448,4 +448,6 @@ def test_an_empty_band_writes_its_view_once_not_on_every_prompt(store, env):
     prompt(env, "hello")                                          # the closed notice: a view with nothing open
     for _ in range(4):
         assert prompt(env, "hello") == ""
-    assert _views(store) == [(1, "[1]"), (1, "[]")]
+    # once per mark, not per prompt: the delivered notice drops the mark to 0, and a skipped view must carry the
+    # call's mark (W2-A L3 r1 F4), so that is one more row, then none
+    assert _views(store) == [(1, "[1]"), (1, "[]"), (0, "[]")]

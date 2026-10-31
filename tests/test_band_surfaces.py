@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -175,19 +176,41 @@ def test_the_phone_listing_carries_the_band_with_its_binding_and_numbers_on_show
     assert len(views(store, "phone:run")) == 1
 
 
-def test_an_unchanged_poll_takes_no_write_lock_at_all(qdir, monkeypatch):
+def test_an_unchanged_poll_takes_the_lock_but_records_no_new_view_row(qdir):
+    """DESIGN 2.4: an unchanged poll takes the write lock (the dedupe is one comparison inside the write) and records
+    nothing: the band_views count and max seq are unchanged and the view_id answered is the existing one."""
     store = QuestionStore(qdir)
     ask(store)
     with serving(qdir) as base:
-        call(base + "/consent.json")
-
-        def no_write(*a, **k):
-            raise AssertionError("a poll of an unchanged band took the write lock")
-
-        monkeypatch.setattr(QuestionStore, "_write_by", no_write)
-        monkeypatch.setattr(QuestionStore, "_write", no_write)
+        first = call(base + "/consent.json")[1]["band"]
+        with sqlite3.connect(store.path) as c:
+            before = c.execute("SELECT COUNT(*), MAX(seq) FROM band_views").fetchone()
         status, body = call(base + "/consent.json")
+        with sqlite3.connect(store.path) as c:
+            after = c.execute("SELECT COUNT(*), MAX(seq) FROM band_views").fetchone()
     assert status == 200 and body["band"]["seen_through"] == 1
+    assert before == after and before[0] == 1, (before, after)
+    assert body["band"]["view_id"] == first["view_id"] == before[1]
+
+
+def test_a_poll_against_a_busy_write_lock_records_nothing_and_still_answers(qdir):
+    store = QuestionStore(qdir)
+    ask(store)
+    band_view.band_payload(store, "phone:run")
+    ask(store, "Second?")                                 # the band changed: a poll now wants to record a new view
+    with sqlite3.connect(store.path) as c:
+        before = c.execute("SELECT COUNT(*), MAX(seq) FROM band_views").fetchone()
+    holder = sqlite3.connect(store.path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        got = band_view.band_payload(store, "phone:run", deadline=time.monotonic() + 0.4)
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    with sqlite3.connect(store.path) as c:
+        after = c.execute("SELECT COUNT(*), MAX(seq) FROM band_views").fetchone()
+    assert before == after, (before, after)               # nothing was recorded
+    assert got["view_id"] is None and got["note"], got    # and it answered, saying so
 
 
 def test_post_band_answer_records_phone_channel_with_its_context_and_the_seat_sees_it_closed(qdir, _no_delivery):
