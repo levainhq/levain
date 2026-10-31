@@ -262,3 +262,18 @@ def test_cli_words_write_the_word_and_status_says_why(tmp_path, capsys, monkeypa
     for w in ("sleep", "away", "remote", "back"):
         assert _cli(tmp_path, w) == 0
     assert _cli(tmp_path, "status") == 0
+
+
+def test_a_short_write_does_not_truncate_the_word(tmp_path, monkeypatch):
+    """The word is replaced whole from a temp file; a write that takes only part of the bytes must be continued, not
+    renamed into place as a half-written (unreadable) word."""
+    real = os.write
+
+    def short(fd, data):
+        return real(fd, bytes(data)[:3])
+
+    monkeypatch.setattr(presence.os, "write", short)
+    presence._write(tmp_path, {"word": "away", "ts": NOW})
+    monkeypatch.undo()
+    assert presence.read_word(tmp_path) is not None
+    assert presence.read_word(tmp_path)["word"] == "away"
