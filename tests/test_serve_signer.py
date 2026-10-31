@@ -339,6 +339,39 @@ def test_an_unreadable_queue_exits_1_in_one_line(tmp_path: Path, settled: list[P
     assert sorted(p.name for p in q.rglob("*")) == [] and settled == []
 
 
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root writes any directory")
+def test_a_readable_but_unwritable_queue_exits_1_before_the_signer_settles_anything(
+        tmp_path: Path, settled: list[Path], no_bind: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """L3 r2 (deepseek LOW): the Signer settles orphaned attempts in the queue at construction, so a queue it cannot
+    write must be refused before it is built, not half-settled."""
+    root = _install(tmp_path)[0]
+    q = _queue(tmp_path)
+    q.chmod(0o500)
+    try:
+        rc = ws.run_web_server(root, port=0, open_browser=False, write=True, sign_queue_dir=q, sign_host=HOST)
+    finally:
+        q.chmod(0o700)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and str(q) in err and "not readable and writable" in err and "Traceback" not in err
+    assert settled == []
+
+
+def test_a_symlink_loop_as_the_queue_exits_1_in_one_line(tmp_path: Path, settled: list[Path], no_bind: None,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    """L3 r2 (codex): Path.resolve() on a symlink cycle raises RuntimeError on Python 3.12; it is a refusal, not a
+    traceback (on 3.13 the same path reads as one that does not exist: either way one line and exit 1)."""
+    root = _install(tmp_path)[0]
+    a, b = tmp_path / "loop-a", tmp_path / "loop-b"
+    a.symlink_to(b)
+    b.symlink_to(a)
+    rc = ws.run_web_server(root, port=0, open_browser=False, write=True, sign_queue_dir=a, sign_host=HOST)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and "Traceback" not in err
+    assert settled == []
+
+
 def test_an_os_error_building_the_signer_is_one_line_not_a_traceback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                                     capsys: pytest.CaptureFixture[str]) -> None:
     root = _install(tmp_path)[0]

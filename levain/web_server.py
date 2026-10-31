@@ -4425,7 +4425,7 @@ def run_web_server(
             return 1
         try:
             signer = _serve_signer(sign_queue_dir, sign_host)
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, RuntimeError) as exc:     # RuntimeError: Path.resolve() on a symlink loop, Python 3.12
             print(f"refusing the signing pages: {exc}", file=sys.stderr)
             return 1
 
@@ -4543,8 +4543,8 @@ def _serve_signer(queue_dir: Path, host: str) -> "Signer":
         raise ValueError(f"--sign-queue-dir {qdir} does not exist (the consent queue is never created here)")
     if not qdir.is_dir():
         raise ValueError(f"--sign-queue-dir {qdir} is not a directory")
-    if not os.access(qdir, os.R_OK | os.X_OK):
-        raise ValueError(f"--sign-queue-dir {qdir} is not readable")
+    if not os.access(qdir, os.R_OK | os.W_OK | os.X_OK):   # the Signer settles orphaned attempts in it at construction
+        raise ValueError(f"--sign-queue-dir {qdir} is not readable and writable")
     signer = _Signer(qdir, (), host, passkey_key_source(qdir, host))
     signer.page_origin = f"https://{host}"
     return signer
