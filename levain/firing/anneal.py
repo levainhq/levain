@@ -54,8 +54,9 @@ DEFAULT_WRAP_NUDGE_THRESHOLD = 12
 
 
 # Episode identity: the three metadata keys a per-agent episode carries. Recall filters on ``agent`` after a
-# time read, so the stamp is the whole of an agent's memory boundary; a malformed one is refused at the
-# door rather than stored as an episode no recall will ever find.
+# time read, so the stamp decides which episodes an agent's recall returns. It is a label the firing writes,
+# not an authentication: who may hold a firing stamped as an agent is the authority layer's question. A
+# malformed stamp is refused at the door rather than stored as an episode no recall will ever find.
 IDENTITY_AGENT_KEY = "agent"
 IDENTITY_ROLE_KEY = "role"
 IDENTITY_RUN_KEY = "run"
@@ -258,6 +259,9 @@ class AnnealFiring:
         # so a fork or reload rebuilds a firing that stamps exactly as the original did.
         if identity is not None and not isinstance(identity, dict):
             raise ValueError("identity must be a dict of agent/run/role")
+        if identity is not None and set(identity) - set(IDENTITY_KEYS):
+            # a misspelled key would otherwise vanish and the episodes lose that provenance silently
+            raise ValueError(f"identity keys are {", ".join(IDENTITY_KEYS)}; got {sorted(identity)}")
         self._identity = (
             episode_identity(identity.get(IDENTITY_AGENT_KEY), identity.get(IDENTITY_RUN_KEY),
                              identity.get(IDENTITY_ROLE_KEY))

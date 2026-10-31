@@ -263,3 +263,8 @@ def test_k8_shapes_come_from_their_owners():
     from levain.firing import anneal
     assert anneal._IDENT_AGENT_ID is AGENT_ID and anneal._IDENT_SPAWN_NAME is ROLE_NAME
     assert episode_identity(spawn_namespace("reviewer"), "r")["agent"] == "@spawn/reviewer"
+
+
+def test_r4_an_identity_with_an_unknown_key_is_refused(tmp_path):
+    with pytest.raises(ValueError):
+        AnnealFiring(episodic_path=_store_path(tmp_path), identity={"agent": A, "run": "r", "role_hash": "x"})
