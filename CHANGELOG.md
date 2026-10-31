@@ -616,6 +616,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   guard is refused at signing instead of the check crashing.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- Groundwork for named agents: a role registry. `levain agents role add <file>` registers a role (name, brief template with typed slots, ceiling, model, harness, executor) under a content hash and a version, and refuses a file with an unknown field, naming it; `levain agents role show <name>` prints it. Nothing runs a role yet, and no role is signed: authorisation comes through the agent link.
 - Groundwork for chat approvals: the store now has tables for each approval request a chat session raises and everything that happens to it (asked, decided, answered, cancelled), kept in the same append-only style as the rest of the chat record. Nothing in `levain` writes to them yet, so there is no change you can see. A store from 0.11.25 or later is brought up to date the first time it is opened for writing, keeping every row it already had; opening one read-only changes nothing.
 - **A contained-shell grant can answer a Levain chat launch's Bash calls.** It answers only a chat call carrying the
   proof of the launch it was granted for, never a Claude Code or Codex hook call; it is listed, counted and revocable
