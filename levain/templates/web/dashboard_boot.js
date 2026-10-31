@@ -57,6 +57,9 @@
   // The page's own cap on concurrent panel reads (see the batch in the board read below).
   const PANEL_READ_CONCURRENCY = 4;
   let writeTokenRequired = false;
+  // What a missing token is answered with, from the server: "pair" (this request cannot use the owner key: pair the device by a
+  // short code) or "owner" (a loopback page: the owner's own token is typed, as before). "" until a 403 body or the manifest says.
+  let tokenAuth = "";
 
   // K2a: `levain serve` opens the page with the write token in the URL FRAGMENT (never sent to the server).
   // Take it, keep it, and strip it from the address bar, leaving any chat_token for the chat panel.
@@ -108,17 +111,82 @@
     h.id = "ck-unpaired-t";
     h.textContent = "This device was unpaired";
     const p = document.createElement("p");
-    p.textContent = "Pair it again from a paired device: open the cockpit there, then Devices, Pair a device, and open the link here.";
+    p.textContent = "Pair it again from a paired device: open the cockpit there, then Devices, Show a code and type it here, or Make a link and open it here.";
     card.append(brand, h, p);
     veil.appendChild(card);
     document.body.appendChild(veil);
+  }
+  // W1b: the pair card, for a page whose server will not take the owner key (off the box). It asks for the short code a paired
+  // device or the desk shows and hands it to pair_card.js, which claims it; the card never holds a token itself.
+  function showPairCard() {
+    const old = document.getElementById("ck-unpaired");
+    if (old) old.remove();
+    const veil = document.createElement("div");
+    veil.id = "ck-unpaired";
+    veil.className = "pair-veil";
+    veil.setAttribute("role", "dialog");
+    veil.setAttribute("aria-labelledby", "ck-pair-t");
+    const card = document.createElement("div");
+    card.className = "pair-card";
+    const brand = document.createElement("div");
+    brand.className = "pair-brand";
+    const dot = document.createElement("span");
+    dot.className = "pair-dot";
+    brand.append(dot, "Levain");
+    const h = document.createElement("h1");
+    h.id = "ck-pair-t";
+    h.textContent = "Pair this device";
+    const p = document.createElement("p");
+    p.textContent = "Type the code shown on a paired device (Devices, Show a code) or by the desk.";
+    const form = document.createElement("form");
+    form.className = "pair-form";
+    const input = document.createElement("input");
+    input.className = "dev-label pair-code";
+    input.type = "text";
+    input.maxLength = 14;
+    input.placeholder = "XXXX-XXXX";
+    input.autocomplete = "one-time-code";
+    input.autocapitalize = "characters";
+    input.spellcheck = false;
+    input.setAttribute("autocorrect", "off");
+    input.setAttribute("aria-label", "Pairing code");
+    const msg = document.createElement("p");
+    msg.className = "pair-msg";
+    msg.setAttribute("role", "status");
+    msg.hidden = true;
+    const actions = document.createElement("div");
+    actions.className = "pair-actions";
+    const go = document.createElement("button");
+    go.type = "submit";
+    go.className = "dev-btn dev-primary";
+    go.textContent = "Pair";
+    actions.appendChild(go);
+    form.append(input, msg, actions);
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const claimer = window.levainPairCard;
+      if (!claimer) { msg.textContent = "The pairing script did not load. Reload the page."; msg.hidden = false; return; }
+      go.disabled = true; msg.hidden = true;
+      try { await claimer.claim(input.value, { card: card, form: form, message: msg }); }
+      finally { if (go.isConnected) go.disabled = false; }
+    });
+    card.append(brand, h, p, form);
+    veil.appendChild(card);
+    document.body.appendChild(veil);
+    try { input.focus(); } catch (_) { /* no focus */ }
   }
   function promptForToken() {
     if (pairedDevice()) {
       // never the owner-token prompt on a paired device: drop the dead key so a new pair link claims without asking
       tokenDeclined = true;
       dropToken();
-      showUnpaired();
+      if (tokenAuth === "pair") showPairCard(); else showUnpaired();
+      return "";
+    }
+    if (tokenAuth === "pair") {
+      // off the box the owner key opens nothing: never window.prompt for it, draw the pair card
+      tokenDeclined = true;
+      showPairCard();
       return "";
     }
     const tok = (window.prompt("Write token (printed when this server started: on its startup line, or in the daemon's log):") || "").trim();
@@ -155,7 +223,12 @@
   // message ("missing or invalid write token") and is DUPLICATED in an embedder's own frontend — tighten
   // the regex in one place and you must mirror it in the other repo, or the prompt/drop silently drifts.
   async function isTokenReject(res) {
-    try { const d = await res.json(); return /token/i.test((d && d.message) || ""); }
+    try {
+      const d = await res.json();
+      const rejected = /token/i.test((d && d.message) || "");
+      if (rejected && d && (d.auth === "pair" || d.auth === "owner")) tokenAuth = d.auth;   // W1b: what the server would accept here
+      return rejected;
+    }
     catch (_) { return false; }
   }
 
@@ -719,6 +792,7 @@
     // A writable install that wants a token and read the manifest without one (a loopback read needs none)
     // would draw every action refused. Ask for the token now, then read again as that credential.
     const cred = manifest && manifest.credential;
+    if (manifest && manifest.transport && typeof manifest.transport.owner_key === "boolean") tokenAuth = manifest.transport.owner_key ? "owner" : "pair";
     const wantsToken = !!(manifest && manifest.transport && manifest.transport.write_token_required === true
       && cred && cred.class === "none");
     if (wantsToken && !passive && !tokenDeclined) {

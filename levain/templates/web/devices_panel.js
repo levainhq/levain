@@ -20,8 +20,8 @@
   // ONESURFACE OS-4: pings for THIS browser. The row appears only where the cockpit serves web push (GET /webpush/key
   // answers, beside a Signer). Every subscription is a paired device's, so it has a revoke above it: Turn on under the
   // cockpit's own key pairs this browser on the spot, and the page keeps the device key it is handed (as pair.js keeps a
-  // claimed one) and uses it from then on. The worker (/sw.js) keeps the key to record an open, and is told to send it
-  // under this page's header (H), on every read, so a re-paired browser hands it the new one.
+  // claimed one) and uses it from then on. The worker (/sw.js) holds no key: it marks a tapped
+  // notification and pair_card.js, which holds the page's key, records the open.
   const PAIRED_MARK_KEY = "levain_paired_device";   // MUST equal pair.js / dashboard_boot.js PAIRED_MARK_KEY
   const PUSH_OK = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
   let pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
@@ -97,10 +97,14 @@
     labelIn.type = "text"; labelIn.maxLength = 40; labelIn.placeholder = "name the new device";
     labelIn.setAttribute("aria-label", "Name for the new device");
     labelIn.autocomplete = "off";
-    const go = el("button", "dev-btn dev-primary", "Pair a device");
+    // two ways to pair: a link (a browser tab or a laptop opens it) or a short code (a Home Screen app types it)
+    const go = el("button", "dev-btn dev-primary", "Make a link");
     go.type = "submit";
-    form.appendChild(labelIn); form.appendChild(go);
-    form.addEventListener("submit", (e) => { e.preventDefault(); offer(go); });
+    const code = el("button", "dev-btn", "Show a code");
+    code.type = "button";
+    code.addEventListener("click", () => offer(code, true));
+    form.appendChild(labelIn); form.appendChild(go); form.appendChild(code);
+    form.addEventListener("submit", (e) => { e.preventDefault(); offer(go, false); });
     body.appendChild(form);
     offerBox = el("div", "dev-link"); offerBox.hidden = true;
     body.appendChild(offerBox);
@@ -139,6 +143,8 @@
       b.setAttribute("aria-label", "Revoke " + named(d));
       b.addEventListener("click", () => revoke(d, b));
       r.appendChild(b);
+      // from devices.json `subscribed`: any live push subscription under this device
+      meta.appendChild(document.createTextNode(" · " + (d.subscribed ? "pings on" : "pings off")));
     }
     return r;
   }
@@ -177,11 +183,6 @@
   function registration() {
     return navigator.serviceWorker.getRegistration("/").catch(() => null);
   }
-  // The worker keeps the key it sends with an open; told the header every time, so it never falls back to another port's
-  function giveToken(reg) {
-    const t = token(), w = reg && (reg.active || reg.waiting || reg.installing);
-    if (t && w) w.postMessage({ type: "levain-token", token: t, header: H });
-  }
   // Where the browser withholds the push API (a plain-http address that is not localhost has no service worker), the row
   // still shows when the cockpit serves push, and says why, instead of vanishing or a toggle that cannot work
   const INSECURE_SAY = "off: this browser only offers pings on https or localhost, and this address is neither. Open the cockpit at its https address.";
@@ -199,7 +200,6 @@
     pingRow.hidden = false;
     if (!PUSH_OK) { pingBtn.disabled = true; pingState.textContent = INSECURE_SAY; return; }
     const reg = await registration();
-    giveToken(reg);
     const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
     pingBtn.dataset.on = sub ? "1" : "";
     pingBtn.textContent = sub ? "Turn off" : "Turn on";
@@ -238,7 +238,6 @@
           try { window.dispatchEvent(new Event("levain:write-token-change")); } catch (_) { /* no events */ }
         }
       }
-      giveToken(reg);
       say(kept ? "Pings are on for this browser." : "Pings are on for this browser, but it could not keep its own key (storage is blocked here); revoke its row to stop them.");
       if (minted) refresh();
     } catch (e) {
@@ -274,17 +273,21 @@
     return running;
   }
 
-  async function offer(btn) {
+  async function offer(btn, short) {
     btn.disabled = true; say("");
+    const what = short ? "a pairing code" : "a pairing link";
     try {
       const label = (labelIn.value || "").trim();
-      const res = await api("POST", "/cockpit/pair/offer", label ? { label: label } : {});
-      if (res.status !== 200 || !res.data.pair_path) {
-        say(res.status === 503 ? "The cockpit is busy. Try again in a moment." : "Could not make a pairing link (" + (res.data.message || res.status) + ").");
+      const body = label ? { label: label } : {};
+      if (short) body.short = true;
+      const res = await api("POST", "/cockpit/pair/offer", body);
+      const shown = short ? typeof res.data.short === "string" : !!res.data.pair_path;
+      if (res.status !== 200 || !shown) {
+        say(res.status === 503 ? "The cockpit is busy. Try again in a moment." : "Could not make " + what + " (" + (res.data.message || res.status) + ").");
         return;
       }
-      const url = location.origin + res.data.pair_path;
-      showLink(url, res.data.expires_in_s || 600);
+      if (short) showCode(res.data.short, res.data.short_ttl_seconds || 600);
+      else showLink(location.origin + res.data.pair_path, res.data.expires_in_s || 600);
       labelIn.value = "";
       refresh();
     } catch (_) {
@@ -292,7 +295,29 @@
     } finally { btn.disabled = false; }
   }
 
+  // The short code, large, with a countdown; a new one replaces any code shown before (the server keeps one live code).
+  let codeTimer = null;
+  function showCode(code, secs) {
+    if (codeTimer) clearInterval(codeTimer);
+    offerBox.replaceChildren();
+    offerBox.hidden = false;
+    offerBox.appendChild(el("div", "dev-link-h", "Type this code on the new device"));
+    offerBox.appendChild(el("div", "dev-code", code));
+    const left = el("div", "dev-link-n");
+    offerBox.appendChild(left);
+    offerBox.appendChild(el("div", "dev-link-n", "Works once. This replaces any code shown before."));
+    const end = Date.now() + secs * 1000;
+    const tick = () => {
+      const s = Math.max(0, Math.round((end - Date.now()) / 1000));
+      left.textContent = s ? "Expires in " + Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0") : "This code has expired. Show a new one.";
+      if (!s) { clearInterval(codeTimer); codeTimer = null; }
+    };
+    tick();
+    codeTimer = setInterval(tick, 1000);
+  }
+
   function showLink(url, secs) {
+    if (codeTimer) { clearInterval(codeTimer); codeTimer = null; }
     offerBox.replaceChildren();
     offerBox.hidden = false;
     offerBox.appendChild(el("div", "dev-link-h", "Open this link on the new device"));

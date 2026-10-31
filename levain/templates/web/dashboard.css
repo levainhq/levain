@@ -2658,6 +2658,10 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .pair-actions[hidden] { display: none; }
 .pair-veil { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: var(--sp-6); box-sizing: border-box; background: var(--bg); }
 .pair-actions .dev-btn { min-height: var(--hit-min, 44px); }
+.pair-code { width: 100%; box-sizing: border-box; margin: 0 0 var(--sp-3); text-align: center; letter-spacing: .25em; text-transform: uppercase; font: var(--fw-bold) var(--fs-title)/1.2 var(--mono); }
+.pair-msg { margin: 0 0 var(--sp-3); color: var(--text); font: var(--fw-regular) var(--fs-body)/1.5 var(--sans); overflow-wrap: anywhere; }
+.pair-msg[hidden] { display: none; }
+.dev-code { margin: 0 0 var(--sp-2); font: var(--fw-bold) var(--fs-title)/1.2 var(--mono); letter-spacing: .2em; color: var(--text); user-select: all; }
 
 /* the sign sheet's message: wrapped, never one line a page wide; the card format (card_format.js) for a needs-phill card */
 .sheet-message { margin: 0 0 var(--sp-4); white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-meta)/1.6 var(--mono); color: var(--text); }
