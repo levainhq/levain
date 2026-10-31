@@ -102,7 +102,7 @@ def test_the_manifest_names_the_transport_from_the_substrate_views_flags(tmp_pat
     ro = dataclasses.replace(SubstrateSource.local(root), write_scope=None)
     with _serve(ro) as (url, _httpd):
         man = _get(f"{url}/cockpit/manifest.json")
-    assert man["transport"] == {"writable": False, "write_token_required": False, "owner_key": True}
+    assert man["transport"] == {"writable": False, "write_token_required": False, "owner_key": False}
 
 
 def test_the_transport_is_in_the_manifest_etag(rig) -> None:
