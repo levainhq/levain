@@ -290,11 +290,11 @@ def test_a_revoke_voids_an_earlier_incarnation(world):
     gone = world.link(revoke_agent())
     assert auth.agent_last_revoke(gone, AGENT, STORE) == gone.seq
     assert auth.agent_link_incarnation(gone, "al-000000000001") is None
-    assert auth.agent_link_arms(gone, "al-000000000001") is False       # no standing link
+    assert auth.agent_link_arms(gone, "al-000000000001", now=gone.head_at) is False       # no standing link
     again = create(world, 1)                                             # the same id signed again
     new = auth.agent_link_incarnation(again, "al-000000000001")
     assert new is not None and new != old and new.startswith(f"{again.seq}:")
-    assert auth.agent_link_arms(again, "al-000000000001") is True
+    assert auth.agent_link_arms(again, "al-000000000001", now=again.head_at) is True
     assert auth.agent_last_revoke(again, AGENT, STORE) == gone.seq      # the revoke stays on the record
     assert auth.agent_last_revoke(again, OTHER_AGENT, STORE) == 0
     # a renew keeps the incarnation
@@ -324,19 +324,19 @@ def test_a_link_prepared_before_a_revoke_agent_cannot_be_appended_after_it(world
 def test_a_link_born_at_or_below_the_last_revoke_or_a_closed_bar_never_arms(world):
     snap = create(world, 1)
     born = snap.grant_born["al-000000000001"]
-    assert auth.agent_link_arms(snap, "al-000000000001") is True
+    assert auth.agent_link_arms(snap, "al-000000000001", now=snap.head_at) is True
     # a closed bar's revoke_seq at or above the birth: the link never arms; below it, it does
-    assert auth.agent_link_arms(snap, "al-000000000001", closed_bar_revoke_seq=born) is False
-    assert auth.agent_link_arms(snap, "al-000000000001", closed_bar_revoke_seq=born + 5) is False
-    assert auth.agent_link_arms(snap, "al-000000000001", closed_bar_revoke_seq=born - 1) is True
+    assert auth.agent_link_arms(snap, "al-000000000001", now=snap.head_at, closed_bar_revoke_seq=born) is False
+    assert auth.agent_link_arms(snap, "al-000000000001", now=snap.head_at, closed_bar_revoke_seq=born + 5) is False
+    assert auth.agent_link_arms(snap, "al-000000000001", now=snap.head_at, closed_bar_revoke_seq=born - 1) is True
     # the same for the agent's own last revoke_agent (a state the replay cannot produce with the link still standing,
     # so it is made by hand to hold the comparison)
     for last, expect in ((born, False), (born + 3, False), (born - 1, True)):
         marked = replace(snap, agent_revoked={(AGENT, STORE): last})
-        assert auth.agent_link_arms(marked, "al-000000000001") is expect, last
+        assert auth.agent_link_arms(marked, "al-000000000001", now=marked.head_at) is expect, last
     # fails closed on anything that is not a standing agent link, and on a bar seq that is no integer
-    assert auth.agent_link_arms(snap, "al-ffffffffffff") is False
-    assert auth.agent_link_arms(snap, "al-000000000001", closed_bar_revoke_seq=None) is False
+    assert auth.agent_link_arms(snap, "al-ffffffffffff", now=snap.head_at) is False
+    assert auth.agent_link_arms(snap, "al-000000000001", now=snap.head_at, closed_bar_revoke_seq=None) is False
 
 
 def test_an_agent_link_has_fixed_terms_and_only_a_renew_changes_it(world):
@@ -350,3 +350,126 @@ def test_an_agent_link_has_fixed_terms_and_only_a_renew_changes_it(world):
     other = world.state().policy.as_dict()
     other["grants"]["al-000000000001"] = {**link(world, 1), "kind": "unknown-kind"}
     assert world.refused({"op": "loosen", "policy": other})
+
+
+# --- review round 1: only a renew moves a link, arming is bounded by time ---------------------------------------------
+
+AGENT_RENEW_ONLY = "an agent link's expiry and terms move only by its own renew link"
+
+
+def test_only_a_renew_moves_an_existing_agent_links_expiry(world):
+    # a loosen that also brings in another grant computes to LOOSEN, which would skip renew's lapse rule and bring a
+    # lapsed link back under its old born seq and incarnation; it is refused at append and at replay, live or lapsed
+    first = create(world, 1, days=1)
+    world.clock.now += timedelta(days=2)
+    policy = world.state().policy.as_dict()
+    policy["grants"]["al-000000000001"]["expires_at"] = utc_stamp(world.clock.now + timedelta(days=20))
+    policy["grants"]["al-000000000002"] = link(world, 2)
+    assert AGENT_RENEW_ONLY in world.refused({"op": "loosen", "policy": policy})
+    db = world.plant({"op": "loosen", "policy": policy}, fmt=V4)
+    assert AGENT_RENEW_ONLY in world.replay_verdict(db)
+    # a live link's expiry is no different: moved inside a loosen, refused
+    create(world, 3)
+    live = world.state().policy.as_dict()
+    live["grants"]["al-000000000003"]["expires_at"] = utc_stamp(world.clock.now + timedelta(days=29, hours=23))
+    live["grants"]["al-000000000004"] = link(world, 4)
+    assert AGENT_RENEW_ONLY in world.refused({"op": "loosen", "policy": live})
+    # nor shortened by a loosen (the kind refuses any change but a later expiry before the step checks run)
+    short = world.state().policy.as_dict()
+    short["grants"]["al-000000000003"]["expires_at"] = utc_stamp(world.clock.now + timedelta(days=1))
+    short["grants"]["al-000000000004"] = link(world, 4)
+    assert "an agent link's terms are fixed: sign a new link" in world.refused({"op": "loosen", "policy": short})
+    # the lapsed link is never renewed either; it comes back only as a new link: a create, with a new incarnation
+    at = world.clock.now + timedelta(minutes=1)
+    assert "has expired" in world.refused({"op": "renew", "grant_id": "al-000000000001",
+                                           "expires_at": utc_stamp(at + timedelta(days=10)),
+                                           "signed_at": utc_stamp(at)})
+    old = auth.agent_link_incarnation(first, "al-000000000001")
+    world.link({"op": "revoke_grant", "grant_id": "al-000000000001"})
+    again = create(world, 1)
+    assert auth.agent_link_incarnation(again, "al-000000000001") != old
+    # a loosen that leaves every agent link as it was still goes through
+    keep = world.state().policy.as_dict()
+    keep["grants"]["al-000000000005"] = link(world, 5)
+    assert "al-000000000005" in world.link({"op": "loosen", "policy": keep}).policy.grants
+
+
+def test_an_expired_or_not_yet_valid_link_never_arms(world):
+    snap = create(world, 1, days=2)
+    at = snap.head_at
+    expires = auth._parse_stamp(snap.policy.grants["al-000000000001"]["expires_at"], "expires_at")
+    assert auth.agent_link_arms(snap, "al-000000000001", now=at) is True
+    assert auth.agent_link_arms(snap, "al-000000000001", now=expires - timedelta(seconds=1)) is True
+    # the boundary instant: at its expiry a link is no longer live (the shape every expiry in the log has)
+    assert auth.agent_link_arms(snap, "al-000000000001", now=expires) is False
+    assert auth.agent_link_arms(snap, "al-000000000001", now=expires + timedelta(days=20)) is False
+    # whatever the bar says
+    assert auth.agent_link_arms(snap, "al-000000000001", now=expires, closed_bar_revoke_seq=0) is False
+    # a clock behind the log's head cannot rule out a time before the link's own: it does not arm
+    assert auth.agent_link_arms(snap, "al-000000000001", now=at - timedelta(seconds=1)) is False
+    # a now that is no aware datetime fails closed, and so does a negative bar seq
+    from datetime import datetime
+    for bad in (None, "2026-01-01T00:00:00Z", at.replace(tzinfo=None), datetime.min):
+        assert auth.agent_link_arms(snap, "al-000000000001", now=bad) is False, bad
+    assert auth.agent_link_arms(snap, "al-000000000001", now=at, closed_bar_revoke_seq=-1) is False
+    with pytest.raises(TypeError):
+        auth.agent_link_arms(snap, "al-000000000001")            # now is required: no reader forgets the clock
+
+
+def test_a_renew_already_expired_at_its_signing_time_or_past_max_life_is_refused(world):
+    create(world, 1, days=1)
+    # signed after the link lapsed, its new expiry past the old one: the lapse rule refuses it
+    world.clock.now += timedelta(days=1, minutes=5)
+    at = world.clock.now + timedelta(minutes=1)
+    assert "has expired" in world.refused({"op": "renew", "grant_id": "al-000000000001",
+                                           "expires_at": utc_stamp(at + timedelta(minutes=1)),
+                                           "signed_at": utc_stamp(at)})
+    # a renew landing at or before its own signing time cannot be built from a live link (it must move the expiry
+    # later than one still ahead), and one past max_life is refused at the boundary plus a second
+    create(world, 2, days=1)
+    at = world.clock.now + timedelta(minutes=1)
+    assert "must move the grant's expiry later" in world.refused(
+        {"op": "renew", "grant_id": "al-000000000002", "expires_at": utc_stamp(at), "signed_at": utc_stamp(at)})
+    at = world.clock.now + timedelta(minutes=1)
+    assert "at most 30 days" in world.refused(
+        {"op": "renew", "grant_id": "al-000000000002",
+         "expires_at": utc_stamp(at + auth.AGENT_LINK_MAX + timedelta(seconds=1)), "signed_at": utc_stamp(at)})
+    at = world.clock.now + timedelta(minutes=1)
+    renewed = world.link({"op": "renew", "grant_id": "al-000000000002",
+                          "expires_at": utc_stamp(at + auth.AGENT_LINK_MAX), "signed_at": utc_stamp(at)})
+    assert renewed.policy.grants["al-000000000002"]["expires_at"] == utc_stamp(at + auth.AGENT_LINK_MAX)
+    # a renew written by hand with signed_at off its own at is refused at replay
+    later = world.clock.now + timedelta(days=1)
+    db = world.plant({"op": "renew", "grant_id": "al-000000000002", "expires_at": utc_stamp(later + timedelta(days=29)),
+                      "signed_at": utc_stamp(later)}, fmt=V1)
+    assert "signed_at must equal its at" in world.replay_verdict(db)
+
+
+def test_a_link_brought_in_already_expired_is_refused(world):
+    # a create refuses one; a loosen that brings one in is held to the same rule
+    assert "must expire after the link that creates it" in world.refused(
+        {"op": "create_grant", "grant": link(world, 1, days=-1)})
+    policy = world.state().policy.as_dict()
+    policy["grants"]["al-000000000001"] = link(world, 1, days=0)
+    assert "must expire after the link that brings it in" in world.refused({"op": "loosen", "policy": policy})
+
+
+def test_a_revoke_grant_of_an_agents_last_link_does_not_set_agent_revoked(world):
+    # A0 §3.2's invariant 2 names the agent's last revoke_agent; a revoke_grant removes one link and is no agent revoke,
+    # so a later link of the agent arms (its own born seq is above the removed one's anyway)
+    create(world, 1)
+    gone = world.link({"op": "revoke_grant", "grant_id": "al-000000000001"})
+    assert auth.agent_links(gone, AGENT, STORE) == []
+    assert auth.agent_last_revoke(gone, AGENT, STORE) == 0 and dict(gone.agent_revoked) == {}
+    again = create(world, 2)
+    assert auth.agent_link_arms(again, "al-000000000002", now=again.head_at) is True
+
+
+def test_a_repo_reaching_into_git_and_a_non_finite_guard_are_refused(world):
+    for repo in ("/x/.git", "/x/.GIT/modules/y"):
+        caps = {"harness": "claude", "model": "m", "where": [{"repo": repo, "paths": ["."]}], "lands": [],
+                "pushes": [], "publishes": []}
+        assert "never reaches into .git" in world.refused({"op": "create_grant",
+                                                           "grant": link(world, 1, capabilities=caps)}), repo
+    for bad in (float("nan"), float("inf")):
+        assert "finite JSON" in world.refused({"op": "create_grant", "grant": link(world, 1, guard=[{"v": bad}])})

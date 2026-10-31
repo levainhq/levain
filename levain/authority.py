@@ -1513,6 +1513,8 @@ _AGENT_PATH_MAX = 4096
 # money in integer micro-dollars and counts: bounded so a typo cannot sign an effectively unlimited gauge
 _AGENT_INT_MAX = 10**12
 _AGENT_LINK_FIXED = "an agent link's terms are fixed: sign a new link"
+_AGENT_LINK_RENEW_ONLY = ("an agent link's expiry and terms move only by its own renew link, never inside another op: "
+                          "renew it while it is live, or sign a new link")
 
 
 def _agent_text(value: Any, what: str, high: int, *, empty: bool = False) -> str:
@@ -1548,6 +1550,8 @@ def _agent_capabilities(caps: Any, what: str) -> None:
         repo = _agent_text(w["repo"], f"{what}.where[{i}].repo", _AGENT_PATH_MAX)
         if not repo.startswith("/") or "\\" in repo or any(seg in ("", ".", "..") for seg in repo[1:].split("/")):
             raise AuthorityError(f"{what}.where[{i}].repo is an absolute path in its normal form")
+        if any(seg.casefold() == ".git" for seg in repo[1:].split("/")):
+            raise AuthorityError(f"{what}.where[{i}].repo names {repo[:80]!r}: a repo never reaches into .git")
         if repo in seen_repos:
             raise AuthorityError(f"{what}.where names a repo twice")
         seen_repos.add(repo)
@@ -1595,6 +1599,8 @@ def _validate_agent_link(grant: Mapping[str, Any], what: str, at: datetime | Non
     guard = grant["guard"]
     if not isinstance(guard, (list, tuple)) or not all(isinstance(g, Mapping) for g in guard):
         raise AuthorityError(f"{what}.guard must be a list of objects")
+    if not _finite_json(grant):
+        raise AuthorityError(f"{what} must be finite JSON (no NaN or Infinity)")
     return _thaw(grant)
 
 
@@ -1625,13 +1631,24 @@ def agent_last_revoke(state: AuthoritySnapshot, agent_id: str, agent_store_id: s
     return state.agent_revoked.get((agent_id, agent_store_id), 0)
 
 
-def agent_link_arms(state: AuthoritySnapshot, link_id: str, *, closed_bar_revoke_seq: int = 0) -> bool:
-    """Invariant 2 (A0 §3.2): whether link ``link_id`` was born after its agent's last ``revoke_agent`` and after
-    ``closed_bar_revoke_seq`` (the highest ``revoke_seq`` of a closed bar of that agent, the caller's to read: the bar
-    is local state, not the log's). Fails closed: False for an id that is no standing agent link, or one with no born
-    seq. Says nothing of expiry or signer standing; those are the reader's."""
+def agent_link_arms(state: AuthoritySnapshot, link_id: str, *, now: datetime, closed_bar_revoke_seq: int = 0) -> bool:
+    """Invariant 2 (A0 §3.2), bounded by time: whether link ``link_id`` is unexpired at ``now`` (its ``expires_at``
+    after ``now``, the shape of every expiry in the log), ``now`` is no earlier than the log's head (a clock behind a
+    link already read cannot rule out a time before the link's own), and the link was born after its agent's last
+    ``revoke_agent`` and after ``closed_bar_revoke_seq`` (the highest ``revoke_seq`` of a closed bar of that agent,
+    the caller's to read: the bar is local state, not the log's). Fails closed: False for an id that is no standing
+    agent link, one with no born seq, a ``now`` that is no aware datetime, or a bar seq that is no integer at or above
+    zero. Says nothing of signer standing; that is the reader's."""
     grant, born = state.policy.grants.get(link_id), state.grant_born.get(link_id)
-    if not agent_link(grant) or born is None or type(closed_bar_revoke_seq) is not int:
+    if not agent_link(grant) or born is None or type(closed_bar_revoke_seq) is not int or closed_bar_revoke_seq < 0:
+        return False
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        return False
+    try:
+        if (state.head_at is not None and now < state.head_at) \
+                or now >= _parse_stamp(grant["expires_at"], "expires_at"):
+            return False
+    except (AuthorityError, OverflowError):
         return False
     return born > agent_last_revoke(state, grant["agent_id"], grant["store_id"]) and born > closed_bar_revoke_seq
 
@@ -1909,6 +1926,20 @@ def _graduation_step_checks(old: StandingPolicy, new: StandingPolicy, keys: Mapp
                 raise AuthorityError(f"the graduation opt-in names {fp}, which is not an active passkey key")
 
 
+def _agent_link_step_checks(old: StandingPolicy, new: StandingPolicy, op: str, at: datetime) -> None:
+    """The agent-link rules a policy link (op ``op``, stamped ``at``) is judged by against the state: an existing
+    link changes only in a ``renew`` link, which alone holds the lapse rule and the renew caps (inside a loosen that
+    also adds a grant, an extension computes to LOOSEN and would bring a lapsed link back under its old born seq and
+    incarnation); and a link any op brings in expires after the link that brings it in."""
+    for gid, g in old.grants.items():
+        n = new.grants.get(gid)
+        if op != "renew" and agent_link(g) and n is not None and _canonical(_thaw(n)) != _canonical(_thaw(g)):
+            raise AuthorityError(_AGENT_LINK_RENEW_ONLY)
+    for gid, g in new.grants.items():
+        if gid not in old.grants and agent_link(g) and _parse_stamp(g["expires_at"], "expires_at") <= at:
+            raise AuthorityError("an agent link must expire after the link that brings it in")
+
+
 def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody: str) -> str:
     """The one format a link carrying ``rec`` (its op fields), signed by a key of ``signer_custody``, is written in
     after ``policy``: :data:`FORMAT_V4` for a link that brings in an agent link or carries ``revoke_agent``, tested
@@ -2043,6 +2074,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 raise AuthorityError(f"a {signer.key_class} key cannot sign this {op}")
             if isinstance(need, StandingPolicy):
                 _graduation_step_checks(state.policy, need, keys, op)
+                _agent_link_step_checks(state.policy, need, op, at)
             want = _link_format(state.policy, rec, signer.custody)
             if rec["format"] != want:
                 raise AuthorityError(f"this {op} link carries {rec['format']}; a link like it is written {want}")
