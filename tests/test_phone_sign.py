@@ -95,32 +95,6 @@ def test_a_passkey_origin_is_exactly_the_https_name(tmp_path: Path) -> None:
         _client_origin(cdj("http://localhost:x"), "localhost")
 
 
-def test_on_localhost_a_passkey_page_is_exactly_the_phone_ports_own_origin(tmp_path: Path) -> None:
-    """Reproduced before the fix: a recorded assertion whose page was ``http://localhost:3000`` converted without a
-    refusal for a phone port bound on another port (every localhost port and both schemes passed), so another
-    program's page on this machine could ask the passkey for a signature levain accepts."""
-    from levain.consent.passkey import public_key_line, to_sshsig
-    from levain.phone_server import make_phone_server
-
-    fix = json.loads((Path(__file__).parent / "fixtures" / "passkey_assertion_virtual.json").read_text())
-    key = public_key_line(bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200") +
-                          bytes.fromhex(fix["pub_point_hex"]), "localhost")
-    auth, der = bytes.fromhex(fix["authData_hex"]), bytes.fromhex(fix["sig_der_hex"])
-    srv = make_phone_server(tmp_path, "localhost", port=0)
-    try:
-        own = srv.page_origin
-        assert own == f"http://localhost:{srv.server_address[1]}" and srv.signer.page_origin == own
-        recorded = json.loads(fix["clientDataJSON"])["origin"]
-        for page in ("http://localhost:3000", "https://" + own.split("://")[1], recorded):
-            if page == own:
-                continue
-            cdj = fix["clientDataJSON"].replace(recorded, page).encode()
-            with pytest.raises(PasskeyError, match="exactly: scheme, name and port"):
-                to_sshsig(key, auth, cdj, der, namespace=fix["namespace"], page_origin=own)
-        to_sshsig(key, auth, fix["clientDataJSON"].replace(recorded, own).encode(), der, namespace=fix["namespace"],
-                  page_origin=own)
-    finally:
-        srv.server_close()
 
 
 def test_a_request_changed_or_expired_while_its_signature_verifies_is_never_recorded(tmp_path: Path,

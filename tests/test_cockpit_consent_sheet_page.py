@@ -32,7 +32,7 @@ from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_sign_card import DESKTOP, TOK, _free_port, needs_ssh
 from tests.test_cockpit_sign_origin import NS, _Passkey
-from tests.test_phone_server import _enrol
+from tests._phone_fixtures import _enrol
 
 STATE = "document.getElementById('sheet').dataset.state"
 NOTE = "document.getElementById('sheet-note').textContent"

@@ -282,56 +282,12 @@ def _listing(base, token):
         return json.loads(r.read())
 
 
-def device_token(qdir: Path) -> str:
-    """A paired device's token, minted and redeemed as the page's pairing does (levain.webpush.devices)."""
-    from datetime import datetime, timezone
-
-    from levain.webpush import devices
-    from levain.webpush.store import PushStore
-
-    conn = PushStore(qdir).connection()
-    try:
-        now = datetime.now(timezone.utc)
-        _dev, token = devices.redeem(conn, devices.mint_pairing(conn, "phone", now), now)
-    finally:
-        conn.close()
-    return token
 
 
-def test_the_drop_route_needs_a_paired_device_and_delivers_through_the_server(world) -> None:
-    from tests.test_phone_dispatch import _serve
-
-    body = {"words": "from the couch", "outbox_id": "ph-" + "5" * 32, "sent_at": SENT, "store_id": None}
-    dev = device_token(world["qdir"])
-    with _serve(world["qdir"], world["qdir"]) as (base, _):
-        assert _post(base, "/coord/drop", body, "wrong")[0] == 403
-        status, got = _post(base, "/coord/drop", body, dev)
-        assert status == 200 and got["created"] is True and got["drop"]["surface"] == "phone"
-        assert got["store_id"] == EnvelopeStore(world["qdir"]).store_id()
-        status, again = _post(base, "/coord/drop", {**body, "store_id": got["store_id"]}, dev)
-        assert status == 200 and again["created"] is False
-        listed = _listing(base, dev)
-    assert [d["drop_id"] for d in listed["coord_drops"]] == [got["drop"]["drop_id"]]
-    assert listed["coord_store_id"] == got["store_id"]
 
 
 # --- 6. fix1 (coordphone L3 r1), each row fail-first --------------------------------------------------------------------
 
-@pytest.mark.parametrize("action", ["drop", "envelope-review", "envelope-challenge"])
-def test_r1_the_run_token_is_refused_on_every_coordinator_route_and_writes_nothing(world, action) -> None:
-    # codex HIGH: the transient run token is a transport gate for the queue, never a paired device
-    from tests.test_phone_dispatch import _serve
-    from tests.test_phone_server import _TOK
-
-    repo_path = str(world["repo"][0])
-    bodies = {"drop": {"words": "w", "outbox_id": "ph-" + "6" * 32, "sent_at": SENT, "store_id": None},
-              "envelope-review": {"words": "w", "outbox_id": "ph-" + "6" * 32, "signer_fp": world["phone"].fp,
-                                  "store_id": None, "spec": {"where": [{"repo": repo_path, "paths": ["."]}]}},
-              "envelope-challenge": {"review_id": "rv-" + "0" * 32}}
-    with _serve(world["qdir"], world["qdir"]) as (base, _):
-        status, got = _post(base, f"/coord/{action}", bodies[action], _TOK)
-    assert status == 403 and got["error"] == "device_required", got
-    assert not (world["qdir"] / DB_NAME).exists()
 
 
 def test_r1_a_step_with_no_device_is_refused(world) -> None:
@@ -555,20 +511,6 @@ def test_r8_the_default_launcher_is_the_cli_s_own_launch_session(world) -> None:
     assert coord_for(world)._launcher is launch_session
 
 
-def test_r8_through_the_server_the_real_launch_session_records_its_refusal(world, tmp_path) -> None:
-    # the exact call `levain drop` makes, on an install whose hook is not live: nothing starts, the receipt says why
-    from tests.test_phone_dispatch import _serve
-
-    _coord_set(world, tmp_path)
-    dev = device_token(world["qdir"])
-    sid_now = EnvelopeStore(world["qdir"]).store_id()
-    with _serve(world["qdir"], world["qdir"]) as (base, httpd):
-        status, got = _post(base, "/coord/drop", {"words": "wake from the phone", "outbox_id": "ph-" + "c8" * 16,
-                                                  "sent_at": SENT, "store_id": sid_now}, dev)
-        assert status == 200 and got["woken"] is not None, got
-        httpd.coord.wait_wakes(30)
-    (w,) = _wakes(world, got["drop"]["drop_id"])
-    assert w["launch_id"] == got["woken"] and w["started"] is False and w["said"], w
 
 
 def test_r4_the_store_strict_carry_answers_a_resend_before_checking_its_carrier(world) -> None:

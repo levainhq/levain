@@ -187,16 +187,6 @@ def test_the_cli_shows_and_sets_it(tmp_path: Path, capsys) -> None:
     assert json.loads(capsys.readouterr().out) == {"signed_answers": "off", "source": "file", "note": ""}
 
 
-def test_a_kept_token_survives_a_restart(tmp_path: Path) -> None:
-    """The 1020+36 restart minted a new token and the phone's open page lost its link: --token-file keeps it."""
-    from levain.phone_server import _kept_token
-
-    path = tmp_path / "token"
-    first = _kept_token(path)
-    assert _kept_token(path) == first and oct(path.stat().st_mode & 0o777) == "0o600"
-    path.write_text("short\n")
-    with pytest.raises(ValueError, match="holds no token"):
-        _kept_token(path)
 
 
 def test_an_answer_for_option_a_after_a_challenge_for_b_records_nothing(tmp_path: Path, passkey) -> None:
@@ -222,14 +212,6 @@ def test_an_option_padded_with_spaces_is_refused(tmp_path: Path, passkey) -> Non
     assert "space" in row["refused"]
 
 
-def test_a_token_file_readable_by_others_is_refused(tmp_path: Path) -> None:
-    from levain.phone_server import _kept_token
-
-    path = tmp_path / "token"
-    path.write_text("x" * 43 + "\n")
-    path.chmod(0o644)
-    with pytest.raises(ValueError, match="readable by others"):
-        _kept_token(path)
 
 
 def test_the_link_file_goes_when_its_run_stops(tmp_path: Path) -> None:

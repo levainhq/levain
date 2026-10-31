@@ -190,16 +190,29 @@ def test_the_cli_runs_the_redirect_mode(monkeypatch) -> None:
 
     calls: list = []
     monkeypatch.setattr(phone_server, "run_phone_redirect", lambda *a, **kw: calls.append((a, kw)) or 0)
-    monkeypatch.setattr(phone_server, "run_phone_server", lambda *a, **kw: pytest.fail("the full port ran"))
     assert main(["consent", "phone", "--name", "box.ts.net", "--redirect-to", "https://box.ts.net:8443"]) == 0
     (args, kw), = calls
     assert args == ("https://box.ts.net:8443",) and kw["name"] == "box.ts.net"
 
 
+def test_the_old_run_token_is_refused_consent_phone_needs_redirect_to(capsys) -> None:
+    """W1b: the phone port's run token is gone. `levain consent phone` without --redirect-to refuses before binding
+    anything, and --token-file no longer parses."""
+    from levain.cli import main
+
+    assert main(["consent", "phone", "--name", "b.ts.net"]) == 2
+    err = capsys.readouterr().err
+    assert "--redirect-to" in err and "levain cockpit pair" in err
+    with pytest.raises(SystemExit) as parsed:
+        main(["consent", "phone", "--name", "b.ts.net", "--token-file", "/tmp/x"])
+    assert parsed.value.code == 2
+    capsys.readouterr()
+
+
 def test_the_cli_refuses_redirect_with_the_full_ports_options(capsys) -> None:
     from levain.cli import main
 
-    for extra in (["--token-file", "/tmp/x"], ["--sign-namespace", "flow-np"], ["--queue-dir", "/tmp"]):
+    for extra in (["--sign-namespace", "flow-np"], ["--queue-dir", "/tmp"]):
         assert main(["consent", "phone", "--name", "b.ts.net", "--redirect-to", "https://b.ts.net:8443", *extra]) == 2
         assert "--redirect-to" in capsys.readouterr().err
 
