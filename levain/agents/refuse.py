@@ -12,8 +12,11 @@ is rule 3's first half: an unknown field or a wrong type raises there. Here:
 3. a role that does not resolve (the first half is the parse).
 4. a name held by a live (not retired) agent. A spawned instance holds a name in ``@spawn/``; F0 has no table for
    instances, so that half of the rule has nothing to read and is not enforced here.
-5. an empty ceiling, or one that says "all" (the role's ceiling): any spelling in ``_ALL`` (everything, any, ``*``,
-   ``/``, ``.``, ``~``, ``$HOME`` ...) or a blank entry, in ``lands``, ``pushes``, ``publishes`` or ``where``.
+5. an empty ceiling, or one that says "all" (the role's ceiling), in ``lands``, ``pushes``, ``publishes`` or
+   ``where``: a blank entry, a word for all (all, everything, any, anything), or an entry that is nothing but
+   wildcard and root characters once runs of ``*`` are collapsed and trailing slashes and dots stripped (``*``,
+   ``**/*``, ``*.*``, ``/``, ``.``, ``~/``), optionally after a home or drive root (``$HOME``, ``%USERPROFILE%``,
+   ``C:\\``): see :func:`all_spelling`.
 6. a schedule with no zone while the install has no default zone (the message names ``levain agents zone``); a feeder
    cycle.
 (d) review is a DERIVED flag: required when the role calls a model or acts outward (``pushes`` or ``publishes`` of its
@@ -28,17 +31,22 @@ refinement agree, the review flag is the derived flag, and a refused row has a r
 """
 from __future__ import annotations
 
+import re
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 __all__ = ["Refusal", "check_spec", "refinement_of", "derived_flags", "ceiling_problem", "audit_verdicts",
-           "AuditError", "ZONE_VERB"]
+           "AuditError", "ZONE_VERB", "all_spelling"]
 
 ZONE_VERB = "levain agents zone <IANA>"
-# the spellings of "all" rule 5 refuses (compared stripped and case-folded); a blank entry is refused beside them
-_ALL = frozenset({"all", "*", "**", "/", "/*", "/**", "everything", "any", "anything", ".", "./", "~", "~/",
-                  "$home", "$home/", "${home}"})
+# rule 5: the words for "all", and the characters an entry may be made of and still name nothing in particular
+_ALL_WORDS = frozenset({"all", "everything", "any", "anything"})
+_ROOT_CHARS = frozenset("*?/\\.~")
+# a root that names a whole tree: a home or system env var in any of the shells' spellings, or a drive letter
+_ROOT_VARS = "home|userprofile|homepath|homedrive|systemdrive|systemroot"
+_ROOT_PREFIX = re.compile(rf"\$(?:{_ROOT_VARS})\b|\$\{{(?:{_ROOT_VARS})\}}|%(?:{_ROOT_VARS})%|[a-z]:")
 
 
 @dataclass(frozen=True)
@@ -72,15 +80,25 @@ def derived_flags(role: Mapping[str, Any]) -> dict[str, bool]:
     return {"calls_model": model, "acts_outward": outward, "review_required": model or outward}
 
 
+def all_spelling(value: Any) -> bool:
+    """True when one non-blank ceiling entry says "all": a word for it, or only wildcard and root characters after
+    collapsing runs of ``*`` and stripping trailing slashes and dots, optionally behind a home or drive root."""
+    text = re.sub(r"\*+", "*", str(value).strip().casefold()).rstrip("/\\.")
+    if text in _ALL_WORDS:
+        return True
+    root = _ROOT_PREFIX.match(text)
+    return all(c in _ROOT_CHARS for c in (text[root.end():] if root else text))
+
+
 def _says_all(value: Any) -> str | None:
     """Why one ceiling entry is refused: blank (it names nothing, and reads as everything) or a spelling of 'all'."""
-    text = str(value).strip().lower()
+    text = str(value).strip()
     if not text:
         return "has an empty entry"
-    if text == "all":
+    if text.casefold() == "all":
         return "says 'all'"
-    if text in _ALL:
-        return f"says {str(value).strip()!r}, a spelling of 'all'"
+    if all_spelling(text):
+        return f"says {text[:60]!r}, a spelling of 'all'"
     return None
 
 
@@ -118,38 +136,55 @@ def _win_problem(spec: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _chain_problem(name: str, spec: Mapping[str, Any], lookup: Mapping[str, Mapping[str, Any]],
-                   seen: tuple[str, ...]) -> str | None:
-    """Refinement (b): None when every downstream of an inherited win ends in a real win."""
-    for down in spec.get("feeds") or []:
+_END = object()
+
+
+def _chain_problem(name: str, spec: Mapping[str, Any], lookup: Mapping[str, Mapping[str, Any]]) -> str | None:
+    """Refinement (b): None when every downstream of an inherited win ends in a real win. Depth-first with an
+    explicit stack and a visited set: no recursion limit on a long chain, and a stage reached by two paths is judged
+    once (a cycle is rule 6's finding, not a win finding)."""
+    visited = {name}
+    stack = [iter(spec.get("feeds") or [])]
+    while stack:
+        down = next(stack[-1], _END)
+        if down is _END:
+            stack.pop()
+            continue
         other = lookup.get(down)
         if other is None:
             return f"inherited win ends at {down}, which is not registered (register the downstream first)"
-        if down in seen:
-            continue                      # a cycle is rule 6's finding, not a win finding
+        if down in visited:
+            continue
+        visited.add(down)
         if _win_problem(other):
             return f"inherited win ends at {down}, which has no win"
         if other["win"]["kind"] == "inherited":
             if not other.get("feeds"):
                 return (f"inherited win ends at {down}, whose own win is inherited and which feeds nothing: a chain "
                         f"must end in an agent whose own win is real, not inherited")
-            sub = _chain_problem(down, other, lookup, seen + (down,))
-            if sub:
-                return sub
+            stack.append(iter(other["feeds"]))
     return None
 
 
 def _cycle(name: str, lookup: Mapping[str, Mapping[str, Any]]) -> list[str] | None:
-    def walk(node: str, path: list[str]) -> list[str] | None:
+    """The shortest feeder path from ``name`` back to itself, or None. Breadth-first with a visited set: each agent
+    is expanded once, so neither a long chain nor a dense group costs more than one pass."""
+    parent: dict[str, str | None] = {name: None}
+    todo = deque([name])
+    while todo:
+        node = todo.popleft()
         for nxt in (lookup.get(node) or {}).get("feeds") or []:
             if nxt == name:
-                return path + [nxt]
-            if nxt not in path:
-                found = walk(nxt, path + [nxt])
-                if found:
-                    return found
-        return None
-    return walk(name, [name])
+                path = [nxt]
+                back: str | None = node
+                while back is not None:
+                    path.append(back)
+                    back = parent[back]
+                return path[::-1]
+            if nxt not in parent:
+                parent[nxt] = node
+                todo.append(nxt)
+    return None
 
 
 def check_spec(spec: Mapping[str, Any], *, role: Mapping[str, Any] | None, default_zone: str | None,
@@ -190,7 +225,7 @@ def check_spec(spec: Mapping[str, Any], *, role: Mapping[str, Any] | None, defau
             out.append(Refusal("1", "win.kind 'inherited' is for a member of a feeder group: feeds is empty "
                                     "(refinement b)"))
         else:
-            chain = _chain_problem(name, spec, group, (name,))
+            chain = _chain_problem(name, spec, group)
             if chain:
                 out.append(Refusal("1", chain))
     if outp and outp["class"] == "recovery" and win and win["kind"] != "verified-restore":
@@ -237,18 +272,41 @@ class AuditError(ValueError):
     """A row of the audit file is incoherent."""
 
 
+_ROW_FIELDS = ("id", "class", "refinement", "review", "verdict", "reasons")
+_REVIEW_FLAGS = ("calls_model", "acts_outward", "required")
+
+
+def _audit_row(i: int, row: Any) -> tuple[Any, ...]:
+    """The fields of audit row ``i``, each of the shape the coherence checks read; any other shape is an AuditError
+    naming the row (never a KeyError or TypeError out of a check)."""
+    if not isinstance(row, dict):
+        raise AuditError(f"audit row {i} is a {type(row).__name__}, not an object")
+    missing = [k for k in _ROW_FIELDS if k not in row]
+    if missing:
+        raise AuditError(f"audit row {i} is missing {', '.join(missing)}: {str(row)[:80]}")
+    jid, review, reasons = row["id"], row["review"], row["reasons"]
+    if not isinstance(jid, str) or not jid:
+        raise AuditError(f"audit row {i}: id {str(jid)[:40]!r} is not a non-empty string")
+    if not isinstance(review, dict):
+        raise AuditError(f"{jid} (audit row {i}): review is a {type(review).__name__}, not an object")
+    for flag in _REVIEW_FLAGS:
+        if not isinstance(review.get(flag), bool):
+            raise AuditError(f"{jid} (audit row {i}): review.{flag} is {str(review.get(flag))[:20]!r}, not true or "
+                             f"false")
+    if not isinstance(reasons, list) or not all(
+            isinstance(r, list) and len(r) == 2 and all(isinstance(x, str) for x in r) for r in reasons):
+        raise AuditError(f"{jid} (audit row {i}): reasons is not a list of [rule, text] string pairs")
+    return jid, row["class"], row["refinement"], review, row["verdict"], reasons
+
+
 def audit_verdicts(doc: Any) -> dict[str, Any]:
     """The R1-AUDIT fixture's per-job verdicts: ``{"jobs": {id: {verdict, class, refinement, review_required,
     reason}}}``. The verdict is the audit's own (see the module docstring); incoherent rows raise AuditError."""
     if not isinstance(doc, dict) or not isinstance(doc.get("jobs"), list):
         raise AuditError("not an audit file: no 'jobs' list")
     jobs: dict[str, Any] = {}
-    for row in doc["jobs"]:
-        try:
-            jid, cls, ref = row["id"], row["class"], row["refinement"]
-            review, verdict, reasons = row["review"], row["verdict"], row["reasons"]
-        except (KeyError, TypeError):
-            raise AuditError(f"an audit row is missing a field: {str(row)[:80]}") from None
+    for i, row in enumerate(doc["jobs"]):
+        jid, cls, ref, review, verdict, reasons = _audit_row(i, row)
         if jid in jobs:
             raise AuditError(f"job {jid!r} appears twice")
         if cls not in ("push", "corpus", "recovery"):

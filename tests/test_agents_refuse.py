@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -437,3 +438,148 @@ def test_the_audit_checks_fail_on_the_broken_shapes():
         with pytest.raises(AuditError, match=needle):
             audit_verdicts(bad)
     audit_verdicts(doc)
+
+
+# ---- L3 round 1 -----------------------------------------------------------------------------------------------
+def test_a_tampered_role_row_is_refused_like_role_show_refuses_it(store, tmp_path, capsys):
+    spec = row(store, "job_sync_check")                                     # pins local-role
+    with store.write() as conn:
+        for (t,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'agent_roles'"
+                                 ).fetchall():
+            conn.execute(f'DROP TRIGGER "{t}"')
+        text = conn.execute("SELECT spec FROM agent_roles WHERE role_hash = ?",
+                            (spec["role"]["role_hash"],)).fetchone()[0]
+        conn.execute("UPDATE agent_roles SET spec = ? WHERE role_hash = ?",
+                     (text.replace("local data", "other data"), spec["role"]["role_hash"]))
+    f = tmp_path / "s.json"
+    f.write_text(json.dumps(spec))
+    assert main(["agents", "--store-dir", str(store.directory), "register", "--from", str(f)]) == 1
+    out = capsys.readouterr().out
+    assert "rule 3: the store's role row is refused" in out and "does not hash to its role_hash" in out
+    assert "is not registered" not in out
+    assert stored_specs(store) == {}
+
+
+@pytest.mark.parametrize("patch,needle", [
+    (lambda r: r.update(review=None), "review is a NoneType"),
+    (lambda r: r["review"].pop("calls_model"), "review.calls_model"),
+    (lambda r: r["review"].update(acts_outward="no"), "review.acts_outward is 'no'"),
+    (lambda r: r["review"].update(required=1), "review.required"),
+    (lambda r: r.update(verdict="refused", reasons="1: no win"), "reasons is not a list"),
+    (lambda r: r.update(verdict="refused", reasons=[["1"]]), "reasons is not a list"),
+    (lambda r: r.update(verdict="refused", reasons=[[1, "x"]]), "reasons is not a list"),
+    (lambda r: r.update(id=["x"]), "audit row 0: id"),
+    (lambda r: r.pop("verdict"), "audit row 0 is missing verdict"),
+])
+def test_every_malformed_audit_row_is_an_audit_error_naming_the_row(patch, needle, tmp_path, capsys):
+    doc = json.loads((FIX / "audit_subset.json").read_text())
+    patch(doc["jobs"][0])
+    with pytest.raises(AuditError, match=re.escape(needle)):
+        audit_verdicts(doc)
+    f = tmp_path / "a.json"
+    f.write_text(json.dumps(doc))
+    assert main(["agents", "--store-dir", str(tmp_path / "s"), "register", "--warn", "--from", str(f)]) == 1
+    assert needle in capsys.readouterr().err
+    doc["jobs"][0] = 7
+    with pytest.raises(AuditError, match="audit row 0 is a int"):
+        audit_verdicts(doc)
+
+
+def _inherited(feeds):
+    return {"feeds": feeds, "win": {"kind": "inherited", "check": ""}}
+
+
+def test_a_long_chain_is_judged_without_recursion():
+    from levain.agents.refuse import _chain_problem, _cycle
+    n = 5000
+    look = {f"n{i}": _inherited([f"n{i + 1}"]) for i in range(n)}
+    look[f"n{n}"] = {"feeds": [], "win": {"kind": "verifier", "check": "x"}}
+    assert _cycle("n0", look) is None and _chain_problem("n0", look["n0"], look) is None
+    look[f"n{n}"] = _inherited(["n0"])
+    assert _cycle("n0", look) == [f"n{i}" for i in range(n + 1)] + ["n0"]
+
+
+class _Counting(dict):
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.calls = 0
+
+    def get(self, key, default=None):
+        self.calls += 1
+        return super().get(key, default)
+
+
+def test_a_dense_feeder_dag_is_walked_once_not_once_per_path():
+    from levain.agents.refuse import _chain_problem, _cycle
+    layers = 14                                       # 2**14 paths through two-wide, fully joined layers
+    look = _Counting({f"l{i}{s}": _inherited([f"l{i + 1}a", f"l{i + 1}b"]) for i in range(layers) for s in "ab"})
+    look.update({f"l{layers}{s}": {"feeds": [], "win": {"kind": "verifier", "check": "x"}} for s in "ab"})
+    assert _cycle("l0a", look) is None and look.calls <= 4 * layers
+    look.calls = 0
+    assert _chain_problem("l0a", look["l0a"], look) is None and look.calls <= 8 * layers
+
+
+@pytest.mark.parametrize("entry,says_all", [
+    ("*", True), ("**", True), ("***", True), ("**/*", True), ("*/*", True), ("*.*", True), ("/", True),
+    ("//", True), ("/*", True), ("/**/", True), (".", True), ("./", True), ("..", True), ("~", True), ("~/", True),
+    ("~/*", True), ("?", True), ("C:\\", True), ("c:/", True), ("D:\\*", True), ("%USERPROFILE%", True),
+    ("%userprofile%\\", True), ("$HOME", True), ("$HOME/**", True), ("${HOME}", True), ("all", True),
+    ("ALL", True), ("everything", True), ("Any", True), ("anything", True),
+    ("src", False), ("/home", False), ("~/src", False), ("*.py", False), ("$HOME/projects", False),
+    ("C:\\work", False), ("local data", False), ("phone", False), ("all-hands notes", False), ("$HOMEWORK", False),
+])
+def test_rule_5_all_spellings_table(entry, says_all):
+    from levain.agents.refuse import all_spelling, ceiling_problem
+    assert all_spelling(entry) is says_all
+    problem = ceiling_problem({"lands": ["local data"], "pushes": [entry]})
+    assert (problem is not None) is says_all, problem
+    if says_all:
+        assert "ceiling.pushes[0]" in problem and "'all'" in problem
+
+
+def test_an_output_label_collision_drops_no_entry(store, tmp_path, capsys):
+    good = row(store, "job_push_check")
+    junk = {"name": "job_push_check#2", "colour": "red"}                  # unparsable: labelled by its name
+    assert main(["agents", "--store-dir", str(store.directory), "register", "--warn", "--json", "--from",
+                 put(tmp_path, [good, junk, good])]) == 0
+    got = json.loads(capsys.readouterr().out)["jobs"]
+    assert set(got) == {"job_push_check", "job_push_check#2", "job_push_check#1"}
+    assert "unknown field 'colour'" in got["job_push_check#2"]["reasons"][0]
+
+
+def _foreign(store_dir, *sqls):
+    import sqlite3
+    store_dir.mkdir()
+    c = sqlite3.connect(store_dir / "autonomic.db")
+    for s in sqls:
+        c.execute(s)
+    c.commit()
+    c.close()
+
+
+@pytest.mark.parametrize("sqls,needle", [
+    (["CREATE TABLE stuff (x)"], "no store format marker"),
+    (["CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", "INSERT INTO meta VALUES ('format', 'other/9')"],
+     "'other/9'"),
+])
+def test_warn_refuses_a_foreign_database_and_an_unknown_marker(tmp_path, capsys, sqls, needle):
+    _foreign(tmp_path / "s", *sqls)
+    spec = copy.deepcopy(SPECS["job_sync_check"])
+    f = tmp_path / "x.json"
+    f.write_text(json.dumps(spec))
+    before = (tmp_path / "s" / "autonomic.db").read_bytes()
+    for extra in (["--warn"], []):
+        assert main(["agents", "--store-dir", str(tmp_path / "s"), "register", "--from", str(f), *extra]) == 1
+        assert needle in capsys.readouterr().err
+        if extra:                                         # --warn reads through a read-only connection
+            assert (tmp_path / "s" / "autonomic.db").read_bytes() == before
+
+
+def test_warn_on_an_empty_database_file_reads_an_empty_registry(tmp_path, capsys):
+    _foreign(tmp_path / "s")
+    spec = copy.deepcopy(SPECS["job_sync_check"])
+    spec["role"]["role_hash"] = "0" * 64
+    f = tmp_path / "x.json"
+    f.write_text(json.dumps(spec))
+    assert main(["agents", "--store-dir", str(tmp_path / "s"), "register", "--warn", "--from", str(f)]) == 0
+    assert "is not registered" in capsys.readouterr().out
