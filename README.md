@@ -406,7 +406,12 @@ The keys directory (`<levain home>/keys`) is denied to an entity's bash and file
 
 The phone reaches levain through the cockpit, and only after you pair it. Put an https proxy you trust in front of the cockpit (`tailscale serve`, for example), open the cockpit on the phone, and type the code `levain cockpit pair --short` prints (`XXXX-XXXX`) into the cockpit's pair card. `levain cockpit pair --url https://<name>:<port>` prints a link instead. Either one pairs one device, once, within 10 minutes, and `levain cockpit pair` prints the code or link only to a terminal unless you pass `--print`, since anyone who reads it can pair.
 
-A passkey is enrolled and used on the cockpit's own pages: the cockpit makes it, the laptop enrols it as a `display-phone` key (a passkey never enrols itself), and the cockpit's sheets sign a consent answer or a late ruling with it. The queue checks that signature with `ssh-keygen`, as for an answer signed in the terminal. Those pages are served only by a cockpit started with a signing queue, and `levain serve` does not start one in this build; until it does, answer at the desk with `levain consent answer`.
+A passkey is enrolled and used on the cockpit's own pages: the cockpit makes it, the laptop enrols it as a `display-phone` key (a passkey never enrols itself), and the cockpit's sheets sign a consent answer or a late ruling with it. The queue checks that signature with `ssh-keygen`, as for an answer signed in the terminal. Those pages are served only by a cockpit started with a signing queue and the https name your proxy serves it on: `levain serve --write --sign-queue-dir <the consent queue> --sign-host <name>`, and `--sign-port <port>` when the name is not on 443 (the page origin leaves 443 out). The name is the one the passkey is made for. The options need `--write`, since the pages ride the cockpit's tokens, and are refused beside `--chat`; the phone signs with the token it was paired with, never the owner key. Until a cockpit is started that way, answer at the desk with `levain consent answer`.
+
+```
+levain serve --write --sign-queue-dir <the consent queue> --sign-host <name>
+tailscale serve --bg --https=443 http://127.0.0.1:7420
+```
 
 `levain consent phone` is kept for compatibility only. With `--redirect-to <the cockpit's origin>` it serves one redirect page on the old phone port (7428 by default), so a link the phone already holds opens on the cockpit (a sign link opens on that request's sheet, with any token it carried dropped). It serves nothing else, makes no token and prints no link, and without `--redirect-to` it refuses. With Tailscale:
 

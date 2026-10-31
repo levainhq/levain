@@ -4340,6 +4340,9 @@ def run_web_server(
     max_iterations: int | None = None,
     turn_seconds: float | None = None,
     install_class: str | None = None,
+    sign_queue_dir: "Path | None" = None,
+    sign_host: str | None = None,
+    sign_port: int = 443,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
 
@@ -4356,6 +4359,13 @@ def run_web_server(
     ``chat`` (``--chat``, repeatable) also serves the chat routes over those entities
     (:class:`levain.chat.ChatHost`); unlike the dashboard, that drives an agent with hands, read-only
     or not.
+
+    ``sign_queue_dir`` with ``sign_host`` (``--sign-queue-dir``, ``--sign-host``, ``--sign-port``) hosts the cockpit's
+    passkey signing pages over that consent queue: a :class:`levain.consent.sign.Signer` for the https name a reverse
+    proxy on this machine serves (:func:`_serve_signer`), handed to ``make_server`` with that name as its
+    ``extra_hosts``. ``make_server`` keeps every check it has on both (a read-only serve has no write token, so it
+    refuses them); its words are printed and the return is 1, as for a refused bind. Without the pair, nothing
+    differs from a serve that never had them.
 
     Returns nonzero only if the store is unreachable before the server starts, a ``--chat``
     entity is refused, or the bind fails (e.g. the port is in use) — mirroring ``levain dashboard`` /
@@ -4393,10 +4403,17 @@ def run_web_server(
             print(chat_err, file=sys.stderr)
             return 1
 
+    if (sign_queue_dir is None) != (sign_host is None):
+        print("--sign-queue-dir and --sign-host go together: pass both or neither", file=sys.stderr)
+        return 2
+    sign_kw: dict[str, Any] = {}
     try:
+        if sign_host is not None and sign_queue_dir is not None:
+            signer = _serve_signer(sign_queue_dir, sign_host, sign_port)
+            sign_kw = {"signer": signer, "extra_hosts": frozenset({sign_host})}
         # the Coordinator panel's verbs exactly when the watcher below runs beside this server
         httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class,
-                            coordinator_verbs=write)
+                            coordinator_verbs=write, **sign_kw)
     except ValueError as exc:  # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback
         print(str(exc), file=sys.stderr)
         return 1
@@ -4444,6 +4461,8 @@ def run_web_server(
         print("  the owner key works only on loopback; pair a device: levain cockpit pair --short", flush=True)
     if unlocked != url:
         print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
+    if sign_kw:
+        print(f"  signing: {sign_kw['signer'].page_origin} (queue {sign_kw['signer'].queue_dir})", flush=True)
 
     if open_browser:
         # The listening socket is already bound (ThreadingHTTPServer binds in
@@ -4471,6 +4490,20 @@ def run_web_server(
             if watcher is not None:      # stopped last, and whatever the closes above raised
                 watcher.stop()
     return 0
+
+
+def _serve_signer(queue_dir: Path, host: str, port: int) -> "Signer":
+    """The Signer ``levain serve --sign-queue-dir DIR --sign-host NAME`` hosts: the consent queue's sign requests, no
+    namespaces (this cockpit signs consent and sign-request cards, not foreign statements), the passkeys enrolled on
+    ``host`` in that queue's cockpit, and the page origin a browser writes for the proxied name: ``https://NAME`` on
+    443 (a browser leaves the default port out and levain refuses it written) or ``https://NAME:PORT``. A name or
+    origin ``make_server`` cannot take is its ``ValueError``, raised there."""
+    from levain.consent.sign import Signer as _Signer, passkey_key_source
+
+    qdir = Path(queue_dir).expanduser().resolve()
+    signer = _Signer(qdir, (), host, passkey_key_source(qdir, host))
+    signer.page_origin = f"https://{host}" if port == 443 else f"https://{host}:{port}"
+    return signer
 
 
 def _build_chat_host(
