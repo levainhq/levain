@@ -272,29 +272,22 @@ def pytest_unconfigure(config):
 SPAWN_PATH_MODULES = {
     "test_page_drive_reap.py": "tests the driver's Chrome launch and reaping itself",
     "test_page_drive_contract.py": "tests the driver's launch and its own contract",
+    "test_page_drive_shared.py": "tests the shared Chrome and the driver's fallback from it, and starts its own",
 }
 SPAWN_PATH_TESTS: dict[str, str] = {}
 
 
 @pytest.fixture(autouse=True)
 def _shared_chrome_for_page_drive(request, monkeypatch):
-    """A test that drives a page through tests/_page_drive.mjs gets the session's shared Chrome (LEVAIN_DRIVE_CDP_PORT) unless
-    it is on the spawn path; every other test has the variable removed, so an ambient one never reaches it."""
+    """Every driver call goes through tests/_page_drive_run.py, which asks for the session's shared Chrome (and starts it on
+    first need) when LEVAIN_DRIVE_SHARE=1. This fixture only says whether a test may share: it never reads test sources, and
+    removes any ambient port, so a test that does not drive a page never starts the Chrome."""
     monkeypatch.delenv("LEVAIN_DRIVE_CDP_PORT", raising=False)
+    monkeypatch.delenv("LEVAIN_DRIVE_SHARE", raising=False)
     path = getattr(request.module, "__file__", None)
     if not path or os.path.basename(path) in SPAWN_PATH_MODULES or request.node.name.split("[")[0] in SPAWN_PATH_TESTS:
         return
-    try:
-        source = Path(path).read_text(encoding="utf-8", errors="replace")
-        uses_driver = "_page_drive" in source or "test_cockpit_flip_parity" in source   # the latter owns the shared _drive
-    except OSError:
-        return
-    if not uses_driver:
-        return
-    from tests import _shared_chrome
-    shared = _shared_chrome.port()
-    if shared is not None:
-        monkeypatch.setenv("LEVAIN_DRIVE_CDP_PORT", str(shared))
+    monkeypatch.setenv("LEVAIN_DRIVE_SHARE", "1")
 
 
 @pytest.fixture(autouse=True)
