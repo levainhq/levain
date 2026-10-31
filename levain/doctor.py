@@ -24,6 +24,7 @@ install is otherwise indistinguishable from a working one.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -4590,11 +4591,19 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     *"the previous docstring's confidence is what kept anyone from looking."* Pack-owned
     hooks are now resolved against `.levain/manifest.json` — see the comment in the body.
     """
+    return _hook_freshness(install)[0]
+
+
+def _hook_freshness(install: Path) -> tuple[list[CheckResult], frozenset[str] | None]:
+    """:func:`_check_hook_freshness`'s rows, and the hook scripts (relative to ``activation/hooks/``) found to differ
+    from the package: an empty set when none do, ``None`` when the comparison could not be made (an incoherent
+    install, unreadable pack provenance, an error). The one freshness checker; :func:`install_band_wiring` reads the
+    set for the band's scripts."""
     from levain.install import _base_activation_root, _templates_root, effective_adapter
 
     hooks_dir = install / "activation" / "hooks"
     if not hooks_dir.is_dir():
-        return []  # hookless adapter, or a layout failure the layout check owns
+        return [], frozenset()  # hookless adapter, or a layout failure the layout check owns
 
     # A hooks/ dir with no coherent adapter identity is an INCOHERENT install, and
     # `run_doctor`'s adapter-detection block owns it — it emits
@@ -4613,7 +4622,7 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     # not in" class this release shipped to fix.
     adapter = effective_adapter(install)
     if adapter is None:
-        return []
+        return [], None
 
     # ⚠ PACK-OWNED HOOKS ARE NOT BASE HOOKS, AND COMPARING THEM AGAINST BASE WAS THE
     # SAME DEFECT 0.4.1 SHIPPED TO FIX — one release later, for a different population.
@@ -4703,7 +4712,7 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
                     f"the usual cause), or re-onboard with `levain init --force --path {install}`. "
                     "Base-adapter hooks are still compared; only the pack layer is dark.",
                 )
-            ]
+            ], None
         for prov in provs:
             for rel, digest in prov.files.items():
                 if rel.startswith(_PREFIX) and rel.endswith(".py"):
@@ -4723,7 +4732,7 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
         with _templates_root() as templates_root:
             shipped_root = _base_activation_root(adapter, templates_root) / "hooks"
             if not shipped_root.is_dir() and not pack_hooks:
-                return []  # no base hooks tree and no pack hooks; nothing to compare
+                return [], frozenset()  # no base hooks tree and no pack hooks; nothing to compare
             # `rglob`, not `glob`: base is now read in the SAME relative-path space the
             # pack keys use, so a nested hook on either side lands on one key and the
             # union below is well defined.
@@ -4777,7 +4786,7 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
                 ):
                     stale.append(rel)
     except (OSError, UnicodeError, RuntimeError) as e:
-        return [CheckResult("hook freshness", False, f"could not compare: {e}")]
+        return [CheckResult("hook freshness", False, f"could not compare: {e}")], None
 
     # ⚖ WHICH KIND OF DIFFERENT (L2 HIGH, reproduced 2026-09-13: a hook with an appended
     # `os.system(...)` exited 6 under "post-upgrade step"). The package comparison above
@@ -4816,7 +4825,7 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
                     f".levain/backups/activation/ first, hooks and all (an old copy is removed "
                     f"only when it provably holds no edits).",
                 )
-            ]
+            ], frozenset(stale)
         for rel in sorted(set(stale)):
             entry = (receipt_files or {}).get(f"hooks/{rel}")
             if entry is None:
@@ -4846,7 +4855,7 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
                 f".levain/backups/activation/ first, hooks and all (an old copy is removed "
                 f"only when it provably holds no edits).",
             )
-        ]
+        ], frozenset(stale)
     if stale:
         return [
             CheckResult(
@@ -4867,8 +4876,8 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
                 f"you to merge.",
                 upgrade_pending=True,
             )
-        ]
-    return [CheckResult("hook freshness", True, "hook scripts match the package")]
+        ], frozenset(stale)
+    return [CheckResult("hook freshness", True, "hook scripts match the package")], frozenset()
 
 
 def _check_context_surface(install: Path, carrier: Path) -> list[CheckResult]:
@@ -5103,7 +5112,10 @@ def _entries_for(entries: Any, install: Path, script: str) -> list:
     return entries
 
 
-def _check_claude_code(install: Path) -> list[CheckResult]:
+def _check_claude_code(install: Path, user_band: bool = True) -> list[CheckResult]:
+    """Doctor's Claude Code rows for ``install``. ``user_band`` False leaves out the user-level band row (a
+    coordinator launch: the coordinator runs at an install whose own band it checks, so that row decides nothing
+    there and its probe would only cost the launch time)."""
     results: list[CheckResult] = []
     results.append(CheckResult("CLAUDE.md", True, "present"))
     results.extend(_check_carrier_freshness(install, install / "CLAUDE.md"))
@@ -5282,7 +5294,8 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
     results.append(_check_band_server(
         ".mcp.json", servers.get("levain_band") if isinstance(servers, dict) else None, "claude_code"))
     results.append(_check_band_hooks(install, "claude_code"))
-    results.append(_check_user_band_hooks())
+    if user_band:
+        results.append(_check_user_band_hooks())
     results.append(_check_dispatch_server(
         install, servers.get("levain_dispatch") if isinstance(servers, dict) else None))
 
@@ -5313,75 +5326,222 @@ def _check_user_band_hooks() -> CheckResult:
                        f"`{USER_BAND_FIX}`)", neutral=True)
 
 
-def _band_hook_python(install: Path, agent: str, codex_home: Path | None = None) -> str | None:
-    """The interpreter the band's UserPromptSubmit hook runs for this install, read from the settings file that wires
-    it (Claude Code: the install's ``.claude/settings.json`` or ``settings.local.json``; Codex: ``hooks.json`` of
-    ``codex_home``). ``None``: no file names that hook for this install (the wiring rows say so)."""
+class BandWiring(tuple):
+    """``(state, detail, command)`` of :func:`install_band_wiring`: ``state`` is ``wired``, ``stale`` or ``absent``;
+    ``command`` is the UserPromptSubmit command that runs the band (``None`` unless one was found)."""
+
+    def __new__(cls, state: str, detail: str, command: str | None = None) -> "BandWiring":
+        return tuple.__new__(cls, (state, detail, command))
+
+    state = property(lambda self: self[0])
+    detail = property(lambda self: self[1])
+    command = property(lambda self: self[2])
+
+
+# The band's events and the install script each runs. A SessionStart group must fire on a fresh start.
+BAND_EVENTS = (("SessionStart", "session_start.py"), ("UserPromptSubmit", "user_prompt_submit.py"),
+               ("Stop", "stop.py"))
+
+
+def _band_settings_files(project: Path, agent: str, codex_home: Path | None) -> list[Path]:
+    """The files whose hooks the agent loads for a session in ``project``: Claude Code's project settings for a
+    session started there (:func:`levain.host_guard.cc_project_settings_files`: ``settings.json`` from that folder
+    only, ``settings.local.json`` at the repository root); Codex's one ``hooks.json``."""
     if agent == "codex":
         home = codex_home if codex_home is not None else Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-        files = [home / "hooks.json"]
-    else:
-        files = [install / ".claude" / "settings.json", install / ".claude" / "settings.local.json"]
-    for f in files:
-        try:
-            tree = json.loads(f.read_text(encoding="utf-8"))
-            entries = (tree.get("hooks") or {}).get("UserPromptSubmit") or []
-            if _hook_command_targets(entries, install, "user_prompt_submit.py"):
-                return _extract_command_python(entries)
-        except (OSError, ValueError, AttributeError):
+        return [home / "hooks.json"]
+    from levain.host_guard import cc_project_settings_files
+
+    local, shared = cc_project_settings_files(project)
+    return [*local, shared]
+
+
+def _band_registration(hooks: Any, event: str, script: Path, project: Path) -> str | None:
+    """The first command under ``event`` that runs ``script`` (resolved; ``${CLAUDE_PROJECT_DIR}`` read as
+    ``project``, as Claude Code expands it), else ``None``. A SessionStart group must match a fresh start."""
+    entries = hooks.get(event) if isinstance(hooks, dict) else None
+    for group in entries if isinstance(entries, list) else []:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
             continue
+        matcher = group.get("matcher")
+        if event == "SessionStart" and matcher not in (None, "", "*") and (
+                not isinstance(matcher, str) or "startup" not in matcher.split("|")):
+            continue
+        for h in group["hooks"]:
+            if not isinstance(h, dict) or not isinstance(h.get("command"), str):
+                continue
+            try:
+                tokens = shlex.split(h["command"])
+            except ValueError:
+                continue
+            if any(_hook_token_path(tok, project) == script for tok in tokens[1:]):
+                return h["command"]
     return None
 
 
+def install_band_wiring(install: Path | str, project_dir: Path | str | None = None, agent: str = "claude_code",
+                        codex_home: Path | None = None) -> BandWiring:
+    """THE answer to "is this install's NEEDS YOU band wired for a session in ``project_dir``?" (default: the
+    install itself), from facts only: the settings the agent loads there (:func:`_band_settings_files`) register
+    SessionStart, UserPromptSubmit and Stop to run this install's ``session_start.py``, ``user_prompt_submit.py``
+    and ``stop.py``, and those scripts match the package (:func:`_hook_freshness`, the one freshness check). A Codex
+    install's hooks do nothing for a session outside it unless its scope is global. ``wired`` | ``stale`` (part of
+    it: ``levain update`` fixes it) | ``absent`` (none of it applies there). Doctor's band row, the coordinator
+    launch, the user-level band's stand-down and the gate's notice all ask this; none derives it again."""
+    install = Path(install)
+    project = Path(project_dir) if project_dir is not None else install
+    hooks_dir = install / "activation" / "hooks"
+    try:
+        root, here = install.resolve(), project.resolve()
+    except (OSError, RuntimeError):
+        return BandWiring("absent", f"{project} cannot be resolved")
+    if agent == "codex" and here != root:
+        try:
+            here.relative_to(root)
+        except ValueError:
+            if _configured_scope(install) != "global":
+                return BandWiring("absent", f"{project} is outside {install}, and its Codex hooks do nothing there")
+    found: dict[str, str] = {}
+    where: Path | None = None
+    files = _band_settings_files(project, agent, codex_home)
+    for f in files:
+        try:
+            tree = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        hooks = tree.get("hooks") if isinstance(tree, dict) else None
+        for event, script in BAND_EVENTS:
+            if event in found:
+                continue
+            try:
+                cmd = _band_registration(hooks, event, (hooks_dir / script).resolve(), project)
+            except (OSError, RuntimeError):
+                cmd = None
+            if cmd is not None:
+                found[event] = cmd
+                where = where or f
+    names = [s for _, s in BAND_EVENTS]
+    present = [s for s in names if (hooks_dir / s).is_file()]
+    shown = " or ".join(str(f) for f in files)
+    if not found:
+        return BandWiring("absent", f"no SessionStart, UserPromptSubmit or Stop hook in {shown} runs this install's "
+                                    "band scripts")
+    missing = [e for e, _ in BAND_EVENTS if e not in found]
+    if missing:
+        return BandWiring("stale", f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} not registered to "
+                                   f"run this install's band script in {shown}", found.get("UserPromptSubmit"))
+    gone = [s for s in names if s not in present]
+    if gone:
+        return BandWiring("absent" if not present else "stale", f"{', '.join(gone)} missing from {hooks_dir}",
+                          found["UserPromptSubmit"])
+    _rows, stale = _hook_freshness(install)
+    if stale is None:
+        why = _rows[0].detail if _rows else "no adapter (CLAUDE.md or AGENTS.md) to compare against"
+        return BandWiring("stale", f"the band scripts could not be compared with the package ({why})",
+                          found["UserPromptSubmit"])
+    old = [s for s in names if s in stale]
+    if old:
+        return BandWiring("stale", f"{', '.join(old)} {'differs' if len(old) == 1 else 'differ'} from the package's",
+                          found["UserPromptSubmit"])
+    return BandWiring("wired", f"SessionStart + UserPromptSubmit + Stop verifier in {where}",
+                      found["UserPromptSubmit"])
+
+
+def band_probe_spec(command: str) -> tuple[str, tuple[str, ...], tuple[str, ...]] | None:
+    """``(interpreter, its flags, modules to import)`` for the import probe of a hook command, read from the command
+    itself so the probe starts Python as the hook does: the flags before the entry (``-EP`` for a ``-m`` hook) and,
+    for ``-m <module>``, that module beside ``levain.band_view``. ``None``: the command cannot be read."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    flags: list[str] = []
+    modules = ["levain.band_view"]
+    rest = tokens[1:]
+    while rest and rest[0].startswith("-") and rest[0] not in ("-m", "-c", "-"):
+        flags.append(rest.pop(0))
+    if len(rest) >= 2 and rest[0] == "-m":
+        modules.insert(0, rest[1])
+    return tokens[0], tuple(flags), tuple(modules)
+
+
 _BAND_PROBE_TIMEOUT = 20.0
+_PROBE_CACHE: list[dict[tuple[Any, ...], str | None]] = []
 
 
-def _band_import_problem(python: str) -> str | None:
-    """Why ``python`` cannot import ``levain.band_view`` (the hooks swallow a failed import, so the band is dropped
-    without a sound), else ``None``. Run from an empty directory (a checkout in the working directory never stands
-    in for an install) with the caller's environment, as a hook sees it, bounded by a timeout."""
-    import subprocess
+@contextlib.contextmanager
+def band_probe_once():
+    """Within this block each distinct import probe runs once (a coordinator launch checks the band more than once).
+    Nested inside another, it keeps the outer one's results."""
+    if _PROBE_CACHE:
+        yield
+        return
+    _PROBE_CACHE.append({})
+    try:
+        yield
+    finally:
+        _PROBE_CACHE.pop()
+
+
+def _band_import_problem(python: str, flags: Sequence[str] = (), modules: Sequence[str] = ("levain.band_view",)
+                         ) -> str | None:
+    """Why ``python`` started with ``flags`` cannot import ``modules`` (the hooks swallow a failed import, so the
+    band is dropped without a sound), else ``None``. Run from an empty directory (a checkout in the working
+    directory never stands in for an install) with the caller's environment, as a hook sees it, bounded by a
+    timeout. Inside :func:`band_probe_once` a probe already run is answered from its result."""
+    key = (python, tuple(flags), tuple(modules))
+    if _PROBE_CACHE and key in _PROBE_CACHE[-1]:
+        return _PROBE_CACHE[-1][key]
+    problem = _run_band_probe(python, tuple(flags), tuple(modules))
+    if _PROBE_CACHE:
+        _PROBE_CACHE[-1][key] = problem
+    return problem
+
+
+def _run_band_probe(python: str, flags: tuple[str, ...], modules: tuple[str, ...]) -> str | None:
     import tempfile
 
     if not _python_resolvable(python):
         return f"{python} is not a runnable interpreter"
     from levain.launch import child_env
 
+    what = " and ".join(modules)
     try:
         with tempfile.TemporaryDirectory() as empty:
-            r = subprocess.run([python, "-c", "import levain.band_view"], cwd=empty, capture_output=True,
-                               text=True, timeout=_BAND_PROBE_TIMEOUT, env=child_env())
+            r = subprocess.run([python, *flags, "-c", "; ".join(f"import {m}" for m in modules)], cwd=empty,
+                               capture_output=True, text=True, timeout=_BAND_PROBE_TIMEOUT, env=child_env())
     except subprocess.TimeoutExpired:
-        return f"{python} did not import levain.band_view within {_BAND_PROBE_TIMEOUT:.0f}s"
+        return f"{python} did not import {what} within {_BAND_PROBE_TIMEOUT:.0f}s"
     except OSError as exc:
         return f"{python} could not run ({type(exc).__name__}: {exc})"
     if r.returncode != 0:
         last = (r.stderr.strip().splitlines() or ["exit " + str(r.returncode)])[-1][:200]
-        return f"{python} cannot import levain.band_view ({last})"
+        return f"{python}{' ' + ' '.join(flags) if flags else ''} cannot import {what} ({last})"
     return None
 
 
 def _check_band_hooks(install: Path, agent: str, codex_home: Path | None = None) -> CheckResult:
-    """The band's hooks (Q17-ALL D5), per install: wired, stale or absent, and the interpreter they run can import
-    ``levain.band_view``. A FAIL when the scripts are missing or stale or that import fails: the hooks swallow a
-    failed import, so a seat here would be shown no band and nothing would say so (the coordinator launch refuses on
-    this same row)."""
-    from levain.band_view import band_hooks_state
-
-    state, lacking = band_hooks_state(install / "activation" / "hooks", agent)
-    if state != "wired":
+    """The band's hooks (Q17-ALL D5), per install: :func:`install_band_wiring` for a session started at the install,
+    and the interpreter the UserPromptSubmit hook runs can import the band, started as that hook starts it. A FAIL
+    otherwise: the hooks swallow a failed import, so a seat here would be shown no band and nothing would say so
+    (the coordinator launch refuses on this same row)."""
+    w = install_band_wiring(install, None, agent, codex_home)
+    if w.state != "wired":
         return CheckResult(BAND_HOOKS_ROW, False,
-                           f"{state}: {', '.join(lacking)} {'does' if len(lacking) == 1 else 'do'} not call the band "
-                           "(a seat here is not shown what waits on the operator; `levain band` still lists it)",
+                           f"{w.state}: {w.detail} (a seat here is not shown what waits on the operator; "
+                           "`levain band` still lists it)", "levain update")
+    spec = band_probe_spec(w.command or "")
+    if spec is None:
+        return CheckResult(BAND_HOOKS_ROW, False, f"the UserPromptSubmit command cannot be read: {w.command}",
                            "levain update")
-    py = _band_hook_python(install, agent, codex_home)
-    problem = _band_import_problem(py) if py else None
+    problem = _band_import_problem(*spec)
     if problem:
         return CheckResult(BAND_HOOKS_ROW, False,
                            f"{problem}: the band hooks run there and drop the band silently when the import fails",
                            "levain update (from the python levain is installed in) re-resolves the interpreter")
-    return CheckResult(BAND_HOOKS_ROW, True, "wired: SessionStart + UserPromptSubmit + Stop verifier"
-                       + (f", {py} imports levain.band_view" if py else ""))
+    return CheckResult(BAND_HOOKS_ROW, True, f"wired: {w.detail}, {spec[0]} imports levain.band_view")
 
 
 def _check_band_server(where: str, server: object, agent: str, codex_home: Path | None = None) -> CheckResult:

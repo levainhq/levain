@@ -27,9 +27,20 @@ HOOKS = {"claude_code": TEMPLATES / "activation" / "hooks",
 SID = "sess-cold"
 
 
+BAND_SCRIPTS = ("session_start.py", "user_prompt_submit.py", "stop.py")
+# the line of each band script that actually reaches the band; each script also names levain.band_view in a comment
+BAND_CALL = {"session_start.py": "from levain.band_view import hook_contract",
+             "user_prompt_submit.py": "from levain.band_view import hook_prompt",
+             "stop.py": "from levain.band_view import hook_stop"}
+
+
 class Rig:
-    def __init__(self, tmp: Path, monkeypatch):
+    def __init__(self, tmp: Path, monkeypatch, capsys):
         self.tmp = tmp
+        self.capsys = capsys
+        from levain import host_guard
+
+        monkeypatch.setattr(host_guard, "load_managed_settings", lambda platform=None: [])
         self.home = tmp / "home"
         self.cfg = tmp / "claude-cfg"
         self.codex = tmp / "codex-home"
@@ -47,19 +58,40 @@ class Rig:
         for k in ("LEVAIN_SEAT", "LEVAIN_HOOK_SUPPRESS", "LEVAIN_SCOPE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT"):
             monkeypatch.delenv(k, raising=False)
         self.settings = self.cfg / "settings.json"
+        # an interpreter that imports this checkout's levain when started as the user hooks start it (-EP drops
+        # PYTHONPATH, and the test interpreter may only find this checkout through it)
+        self.py = tmp / "hook-python"
+        self.py.write_text(f'#!/bin/sh\nif [ "$1" = "-EP" ]; then shift; set -- -P "$@"; fi\n'
+                           f'PYTHONPATH={shlex.quote(str(SRC))} exec {shlex.quote(sys.executable)} "$@"\n')
+        self.py.chmod(0o755)
 
     def ask(self, what="Which retry policy?"):
         return QuestionStore(self.qdir).file(agent="claude_code", agent_session_id="other-seat", what=what,
                                              options=[("a", "yes"), ("b", "no")], rec="a", blocks="x", cwd=str(self.home))
 
-    def make_install(self, agent="claude_code", wired=True):
+    def make_install(self, agent="claude_code"):
+        """A real install (``levain init`` with an answer file): its hooks registered where init puts them."""
+        from levain.install import run_init
+        from tests.test_init_answers import _filled
+
         inst = self.tmp / f"install-{agent}"
-        shutil.copytree(HOOKS[agent], inst / "activation" / "hooks")
-        if not wired:
-            for n in ("session_start.py", "user_prompt_submit.py", "stop.py"):
-                p = inst / "activation" / "hooks" / n
-                p.write_text(p.read_text().replace("levain.band_view", "levain.gone"))
+        af = self.tmp / f"{agent}-answers.json"
+        self.capsys.readouterr()                                # _filled reads the template from captured output
+        af.write_text(json.dumps(_filled(self.capsys)), encoding="utf-8")
+        assert run_init(inst, "codex" if agent == "codex" else "claude-code", force=False, answers_file=af) == 0
+        self.capsys.readouterr()
         return inst
+
+    @staticmethod
+    def cut_band_calls(inst):
+        """Each band script with its real call taken out and its comments kept (an edit, or an older release)."""
+        for n in BAND_SCRIPTS:
+            f = inst / "activation" / "hooks" / n
+            text = f.read_text()
+            assert BAND_CALL[n] in text
+            name = BAND_CALL[n].rsplit(" ", 1)[1]
+            f.write_text(text.replace(BAND_CALL[n], f"{name} = lambda *a, **k: None"))
+            assert "levain.band_view" in f.read_text()
 
     def verb(self, *args, capsys=None):
         return main(["band", "hooks", *args])
@@ -93,8 +125,8 @@ class Rig:
 
 
 @pytest.fixture
-def rig(tmp_path, monkeypatch):
-    return Rig(tmp_path, monkeypatch)
+def rig(tmp_path, monkeypatch, capsys):
+    return Rig(tmp_path, monkeypatch, capsys)
 
 
 def ctx(out: str) -> str:
@@ -162,8 +194,7 @@ def test_a_settings_file_it_cannot_parse_is_refused_untouched(rig, capsys, bad):
 
 def test_status_reads_the_receipt_and_the_live_settings(rig, capsys):
     assert rig.verb("status") == 0 and "not installed" in capsys.readouterr().out
-    rig.verb("install")
-    capsys.readouterr()
+    assert band_hook.install(python=str(rig.py))[0] == 0
     assert rig.verb("status") == 0
     out = capsys.readouterr().out
     assert "installed" in out and str(rig.settings) in out and levain.__version__ in out
@@ -237,7 +268,7 @@ def test_the_command_is_quiet_when_its_interpreter_or_module_is_gone(rig):
         assert band_hook.install(python=str(py))[0] == 0
         row = doctor._check_user_band_hooks()
         assert not row.ok and row.hint == "levain band hooks install"
-        assert ("not a runnable interpreter" if py == gone else "cannot import levain.band_view") in row.detail
+        assert ("not a runnable interpreter" if py == gone else "cannot import levain.band_hook") in row.detail
     # the check can fail: the command without its tail is the notice Claude Code would show
     bare = band_hook.command_for(str(gone), "UserPromptSubmit").replace(band_hook.QUIET_TAIL, "")
     p = subprocess.run(["/bin/sh", "-c", bare], input="{}", capture_output=True, text=True, timeout=30)
@@ -270,32 +301,32 @@ def test_the_entry_renders_the_band_outside_any_install_and_its_stop_verifies(ri
     assert ok == "" or json.loads(ok).get("decision") != "block"
 
 
-def test_the_entry_stands_down_inside_an_install_whose_band_hooks_are_wired(rig):
+def test_the_entry_stands_down_for_a_session_started_at_an_install_whose_band_is_wired(rig):
     rig.ask()
     rig.verb("install")
-    inst = rig.make_install(wired=True)
+    inst = rig.make_install()
     inside = inst / "work" / "sub"
     inside.mkdir(parents=True)
+    at = {"CLAUDE_PROJECT_DIR": str(inst)}                     # started at the install, working below it
     before = rig.views()
-    assert rig.run_entry("SessionStart", {"source": "startup"}, inside) == ""
-    assert rig.run_entry("UserPromptSubmit", {"prompt": "hello"}, inside) == ""
-    assert rig.run_entry("Stop", {"last_assistant_message": "x", "stop_hook_active": False}, inside) == ""
+    assert rig.run_entry("SessionStart", {"source": "startup"}, inside, at) == ""
+    assert rig.run_entry("UserPromptSubmit", {"prompt": "hello"}, inside, at) == ""
+    assert rig.run_entry("Stop", {"last_assistant_message": "x", "stop_hook_active": False}, inside, at) == ""
     assert rig.views() == before                                              # no view was taken
-    # the check can fail: the same directory with STALE band scripts is not covered, so the user-level band shows
-    for n in ("session_start.py", "user_prompt_submit.py", "stop.py"):
-        f = inst / "activation" / "hooks" / n
-        f.write_text(f.read_text().replace("levain.band_view", "levain.gone"))
-    assert "NEEDS YOU" in ctx(rig.run_entry("UserPromptSubmit", {"prompt": "hello"}, inside))
+    # the check can fail: the same session with band scripts whose real call is gone is not covered
+    rig.cut_band_calls(inst)
+    assert "NEEDS YOU" in ctx(rig.run_entry("UserPromptSubmit", {"prompt": "hello"}, inside, at))
 
 
 def test_one_band_not_two_when_the_install_hook_and_the_user_hook_both_run(rig):
     rig.ask()
     rig.verb("install")
-    inst = rig.make_install(wired=True)
+    inst = rig.make_install()
     inside = inst / "x"
     inside.mkdir()
-    own = ctx(rig.run_script("claude_code", "user_prompt_submit.py", {"prompt": "hi"}, inside, inst))
-    user = ctx(rig.run_entry("UserPromptSubmit", {"prompt": "hi"}, inside))
+    at = {"CLAUDE_PROJECT_DIR": str(inst)}
+    own = ctx(rig.run_script("claude_code", "user_prompt_submit.py", {"prompt": "hi"}, inside, inst, at))
+    user = ctx(rig.run_entry("UserPromptSubmit", {"prompt": "hi"}, inside, at))
     assert (own + user).count("NEEDS YOU · ") == 1 and user == ""
     # and outside the install only the user-level one shows
     assert ctx(rig.run_script("claude_code", "user_prompt_submit.py", {"prompt": "hi"}, rig.outside, inst)) == ""
@@ -369,20 +400,115 @@ def test_a_headless_session_without_a_launch_row_is_left_alone(rig):
     assert band_hook.stands_down("c-1", {**rig.env, "CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}) is False
 
 
-def test_the_entry_stands_down_when_the_project_dir_is_a_wired_install_whatever_the_cwd(rig):
+# --- "is this install's band wired?" has one answer (doctor.install_band_wiring) ----------------------------------
+def _registrations_out(inst, events=band_hook.EVENTS):
+    """Take this install's band registrations for ``events`` out of its project settings; the scripts stay."""
+    f = inst / ".claude" / "settings.json"
+    doc = json.loads(f.read_text())
+    for ev in events:
+        doc["hooks"][ev] = [g for g in doc["hooks"][ev]
+                            if not any(n in json.dumps(g) for n in BAND_SCRIPTS)]
+    f.write_text(json.dumps(doc, indent=2))
+
+
+def test_a_session_started_in_a_subfolder_loads_none_of_the_install_hooks_so_the_user_band_shows(rig):
+    # complement #6: Claude Code reads a project's .claude/settings.json from the folder a session starts in only;
+    # this install keeps its hooks there (not a git root), so a session started in inst/work runs none of them
     rig.ask()
     rig.verb("install")
-    inst = rig.make_install(wired=True)
+    inst = rig.make_install()
+    assert json.loads((inst / ".claude" / "settings.json").read_text())["hooks"]["UserPromptSubmit"]
     proj = inst / "work"
     proj.mkdir()
-    assert _three(rig, "p-1", {"CLAUDE_PROJECT_DIR": str(proj)}) == ["", "", ""]
-    assert _three(rig, "p-2", {"CLAUDE_PROJECT_DIR": str(inst)}) == ["", "", ""]
-    # the check can fail: a project dir that is no install, and one whose band scripts are stale, get the band
-    assert "NEEDS YOU" in ctx(_three(rig, "p-3", {"CLAUDE_PROJECT_DIR": str(rig.home)})[1])
-    for n in ("session_start.py", "user_prompt_submit.py", "stop.py"):
-        f = inst / "activation" / "hooks" / n
-        f.write_text(f.read_text().replace("levain.band_view", "levain.gone"))
-    assert "NEEDS YOU" in ctx(_three(rig, "p-4", {"CLAUDE_PROJECT_DIR": str(proj)})[1])
+    out = _three(rig, "p-1", {"CLAUDE_PROJECT_DIR": str(proj)})
+    assert "NEEDS YOU band" in ctx(out[0]) and ctx(out[1]).startswith("NEEDS YOU · 1 open")
+    assert _three(rig, "p-2", {"CLAUDE_PROJECT_DIR": str(inst)}, cwd=proj) == ["", "", ""]   # started at the install
+    assert "NEEDS YOU" in ctx(_three(rig, "p-3", {"CLAUDE_PROJECT_DIR": str(rig.home)})[1])  # no install at all
+    assert doctor.install_band_wiring(inst, proj).state == "absent"
+    assert doctor.install_band_wiring(inst).state == "wired"
+
+
+def test_a_subfolder_session_is_covered_when_the_install_hooks_sit_in_the_git_roots_local_file(rig, monkeypatch):
+    # ... and where they sit in .claude/settings.local.json at the repository root, Claude Code loads them for a
+    # session started anywhere below it (host_guard.cc_project_settings_files): there the install shows the band
+    from levain import host_guard
+
+    monkeypatch.setattr(host_guard, "cc_levain_hooks_file",
+                        lambda ws: Path(os.path.abspath(ws)) / ".claude" / "settings.local.json")
+    rig.ask()
+    rig.verb("install")
+    inst = rig.make_install()
+    (inst / ".git").mkdir()
+    local = json.loads((inst / ".claude" / "settings.local.json").read_text())
+    assert any(str(inst) in json.dumps(g) for g in local["hooks"]["UserPromptSubmit"])     # absolute script paths
+    proj = inst / "work"
+    proj.mkdir()
+    assert _three(rig, "l-1", {"CLAUDE_PROJECT_DIR": str(proj)}) == ["", "", ""]
+    assert doctor.install_band_wiring(inst, proj).state == "wired"
+
+
+def test_scripts_present_but_registrations_removed_is_not_wired(rig):
+    # codex #4: the scripts on disk are no evidence the hooks run
+    rig.ask()
+    rig.verb("install")
+    inst = rig.make_install()
+    at = {"CLAUDE_PROJECT_DIR": str(inst)}
+    assert _three(rig, "r-1", at) == ["", "", ""]
+    _registrations_out(inst)
+    assert all((inst / "activation" / "hooks" / n).is_file() for n in BAND_SCRIPTS)
+    assert "NEEDS YOU" in ctx(_three(rig, "r-2", at)[1])
+    row = doctor._check_band_hooks(inst, "claude_code")
+    assert not row.ok and row.detail.startswith("absent") and row.hint == "levain update"
+    w = doctor.install_band_wiring(inst)
+    assert w.state == "absent" and "no SessionStart, UserPromptSubmit or Stop hook" in w.detail
+
+
+def test_a_script_whose_band_call_is_gone_but_whose_comment_remains_is_not_wired(rig):
+    # codex #5: a script that only mentions levain.band_view in a comment never renders the band
+    rig.ask()
+    rig.verb("install")
+    inst = rig.make_install()
+    rig.cut_band_calls(inst)
+    assert "NEEDS YOU" in ctx(_three(rig, "c-1", {"CLAUDE_PROJECT_DIR": str(inst)})[1])
+    row = doctor._check_band_hooks(inst, "claude_code")
+    assert not row.ok and row.detail.startswith("stale") and row.hint == "levain update"
+    w = doctor.install_band_wiring(inst)
+    assert w.state == "stale" and "differ from the package" in w.detail
+
+
+def test_a_missing_user_prompt_submit_registration_fails_doctor(rig):
+    # codex #3: doctor once passed the row when it found no interpreter to probe
+    inst = rig.make_install()
+    assert doctor._check_band_hooks(inst, "claude_code").ok
+    _registrations_out(inst, ["UserPromptSubmit"])
+    row = doctor._check_band_hooks(inst, "claude_code")
+    assert not row.ok and "UserPromptSubmit" in row.detail and row.hint == "levain update"
+    w = doctor.install_band_wiring(inst)
+    assert w.state == "stale" and w.detail.startswith("UserPromptSubmit is not registered")
+
+
+def test_a_codex_install_band_is_wired_inside_it_and_absent_outside_it_unless_global(rig):
+    inst = rig.make_install("codex")
+    assert doctor.install_band_wiring(inst, None, "codex", rig.codex).state == "wired"
+    assert doctor.install_band_wiring(inst, inst / "sub", "codex", rig.codex).state == "wired"
+    w = doctor.install_band_wiring(inst, rig.outside, "codex", rig.codex)
+    assert w.state == "absent" and "outside" in w.detail
+    (inst / ".levain" / "config.json").write_text(json.dumps({"scope": "global"}))
+    assert doctor.install_band_wiring(inst, rig.outside, "codex", rig.codex).state == "wired"
+
+
+# --- the headless rule -----------------------------------------------------------------------------------------
+@pytest.mark.parametrize("entry,silent", [("claude-vscode", False), ("claude-desktop", False), ("cli", False),
+                                          ("", False), ("sdk-cli", True), ("sdk-ts", True), ("sdk-py", True)])
+def test_only_an_sdk_entrypoint_stands_down(rig, entry, silent):
+    assert band_hook.stands_down("e-1", {**rig.env, "CLAUDE_CODE_ENTRYPOINT": entry}) is silent
+
+
+def test_an_ide_session_is_shown_the_band(rig):
+    rig.ask()
+    rig.verb("install")
+    out = _three(rig, "ide-1", {"CLAUDE_CODE_ENTRYPOINT": "claude-vscode"})
+    assert ctx(out[1]).startswith("NEEDS YOU · 1 open")
 
 
 # --- Codex ---------------------------------------------------------------------------------------------------
@@ -419,7 +545,7 @@ def test_the_codex_band_is_not_doubled_inside_its_own_install(rig):
 def test_doctor_row_not_installed_is_info_installed_passes_and_broken_fails(rig):
     row = doctor._check_user_band_hooks()
     assert row.name == doctor.USER_BAND_ROW and row.ok and row.neutral and "levain band hooks install" in row.detail
-    rig.verb("install")
+    assert band_hook.install(python=str(rig.py))[0] == 0
     row = doctor._check_user_band_hooks()
     assert row.ok and not row.neutral and not row.warn and row.detail.startswith("installed")
     doc = json.loads(rig.settings.read_text())
@@ -474,3 +600,142 @@ def test_the_panel_holds_a_failed_band_check_for_the_ttl_and_passes_the_launcher
     assert calls == [launcher_home]
     cs.band_row(setting, now=161.0)                      # past the TTL: checked again
     assert calls == [launcher_home, launcher_home]
+
+
+# --- round 2: remove and install never lose the operator's file, and say what they could not do ------------------
+def test_remove_leaves_a_symlink_made_after_install_and_never_deletes_its_target(rig):
+    assert not rig.settings.exists()
+    assert rig.verb("install") == 0
+    assert json.loads((rig.lv / "band_hooks.json").read_text())["created_file"] is True
+    dot = rig.tmp / "dotfiles"
+    dot.mkdir()
+    target = dot / "claude.json"
+    target.write_text(rig.settings.read_text())          # the operator moves the file into dotfiles and links it back
+    rig.settings.unlink()
+    rig.settings.symlink_to(target)
+    assert rig.verb("remove") == 0
+    assert target.is_file() and json.loads(target.read_text()) == {}
+    assert rig.settings.is_symlink() and os.readlink(rig.settings) == str(target)
+
+
+@pytest.mark.parametrize("text", ["", "   \n", "\n\n", "\t"])
+def test_a_blank_settings_file_comes_back_byte_for_byte(rig, text):
+    rig.settings.write_bytes(text.encode())
+    for _ in range(2):
+        assert rig.verb("install") == 0
+    assert rig.verb("remove") == 0
+    assert rig.settings.read_bytes() == text.encode()
+
+
+@pytest.fixture
+def locked():
+    """chmod a directory read-only for the test, and back."""
+    held = []
+
+    def lock(d):
+        d.chmod(0o500)
+        held.append(d)
+
+    yield lock
+    for d in held:
+        d.chmod(0o700)
+
+
+def test_install_puts_the_settings_back_when_the_receipt_cannot_be_written(rig, capsys, locked):
+    original = (json.dumps(UNRELATED, indent=2) + "\n").encode()
+    rig.settings.write_bytes(original)
+    locked(rig.lv)
+    assert rig.verb("install") == 1
+    err = capsys.readouterr().err
+    assert "receipt" in err and "could not be written" in err and "put back as it was" in err
+    assert "Traceback" not in err
+    assert rig.settings.read_bytes() == original and not (rig.lv / "band_hooks.json").exists()
+    rig.settings.unlink()                                # a file install would have created is not left behind
+    assert rig.verb("install") == 1 and not rig.settings.exists()
+
+
+def test_install_into_a_settings_directory_it_cannot_write_is_a_refusal(rig, capsys, locked):
+    locked(rig.cfg)
+    assert rig.verb("install") == 1
+    err = capsys.readouterr().err
+    assert "cannot be written" in err and "Traceback" not in err and not (rig.lv / "band_hooks.json").exists()
+
+
+def test_remove_that_cannot_write_the_settings_fails_and_keeps_the_receipt(rig, capsys, locked):
+    rig.settings.write_text(json.dumps(UNRELATED, indent=2) + "\n")
+    assert rig.verb("install") == 0
+    capsys.readouterr()
+    locked(rig.cfg)
+    assert rig.verb("remove") == 1
+    err = capsys.readouterr().err
+    assert "could not be written" in err and "receipt" in err and "Traceback" not in err
+    assert (rig.lv / "band_hooks.json").exists() and "levain.band_hook" in rig.settings.read_text()
+
+
+def test_remove_says_when_the_receipt_cannot_be_removed(rig, capsys, locked):
+    assert rig.verb("install") == 0
+    capsys.readouterr()
+    locked(rig.lv)
+    assert rig.verb("remove") == 1
+    err = capsys.readouterr().err
+    assert "could not be removed" in err and str(rig.lv / "band_hooks.json") in err
+    assert not rig.settings.exists()                     # the settings file was still cleaned
+
+
+def test_remove_cleans_one_file_when_the_other_does_not_parse(rig, monkeypatch, capsys):
+    rig.settings.write_text(json.dumps(UNRELATED, indent=2) + "\n")
+    assert rig.verb("install") == 0
+    moved = rig.tmp / "claude-cfg-2"
+    moved.mkdir()
+    (moved / "settings.json").write_text("{not json")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(moved))
+    capsys.readouterr()
+    assert rig.verb("remove") == 1
+    err = capsys.readouterr().err
+    assert str(moved / "settings.json") in err and "refused" in err
+    assert json.loads(rig.settings.read_text()) == UNRELATED                     # the receipt's file was cleaned
+    assert (moved / "settings.json").read_text() == "{not json"
+
+
+def test_update_refreshes_the_receipts_settings_file_and_never_writes_a_new_one(rig, monkeypatch):
+    assert band_hook.install(python="/old/venv/bin/python")[0] == 0
+    moved = rig.tmp / "claude-cfg-2"
+    moved.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(moved))
+    line = band_hook.refresh_after_update()
+    assert not (moved / "settings.json").exists()
+    assert str(rig.settings) in line and str(moved / "settings.json") in line and "levain band hooks remove" in line
+    assert "/old/venv" not in rig.settings.read_text() and sys.executable in rig.settings.read_text()
+    assert json.loads((rig.lv / "band_hooks.json").read_text())["settings"] == str(rig.settings)
+
+
+def test_the_probe_starts_python_as_the_hook_does(rig):
+    # an interpreter that finds levain only through PYTHONPATH: the hook's -E drops it, so the band never imports
+    nosite = rig.tmp / "nosite-python"
+    nosite.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -S "$@"\n')
+    nosite.chmod(0o755)
+    assert os.environ["PYTHONPATH"] == str(SRC)
+    assert doctor._band_import_problem(str(nosite)) is None                  # started as the probe once started it
+    assert band_hook.install(python=str(nosite))[0] == 0
+    state, detail = band_hook.user_band_state()
+    assert state == "broken" and f"{nosite} -EP cannot import levain.band_hook" in detail
+    assert band_hook.install(python=str(rig.py))[0] == 0
+    assert band_hook.user_band_state()[0] == "installed"
+
+
+def test_a_codex_coordinator_outside_the_owning_install_needs_the_user_band(rig, monkeypatch):
+    # codex #2: outside the install whose hooks Codex runs, those hooks take the outside branch, which shows the band
+    # only once `levain band hooks install` wrote its receipt
+    from levain.coordinator import codex_launch as cx
+
+    owner = rig.make_install("codex")
+    monkeypatch.setattr(cx, "codex_home", lambda: rig.codex)
+    monkeypatch.setattr(cx, "hook_live", lambda d: (True, "wired to this install"))
+    ws = rig.lv / "coordinator-codex"
+    ws.mkdir()
+    live, why = cx.global_hook_live(ws)
+    assert not live and "the coordinator would show no NEEDS YOU band" in why
+    assert why.endswith("Fix: `levain band hooks install`") and str(ws) in why
+    assert cx.workspace_band_problem(owner, owner / "sub") is None        # inside: the install's own check answers
+    assert band_hook.install(python=str(rig.py))[0] == 0
+    assert cx.global_hook_live(ws)[0]

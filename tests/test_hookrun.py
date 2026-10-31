@@ -119,8 +119,9 @@ def test_doctor_warns_on_another_interpreter_and_never_runs_it(make_install, tmp
     cj.write_text(cj.read_text().replace(json.dumps(sys.executable)[1:-1], str(fake)))
     rows = py_rows()
     assert len(rows) == 2 and all(r.ok and r.warn and "not this levain's interpreter" in r.detail for r in rows), rows
-    # doctor never runs a hook script: the only run is the band import probe (Q17-COLD), `-c import levain.band_view`
-    assert set(marker.read_text().splitlines() if marker.exists() else []) <= {"-c import levain.band_view"}
+    # doctor never runs a hook script: the only run is the band import probe (Q17-COLD), started as the hook starts
+    assert set(marker.read_text().splitlines() if marker.exists() else []) <= {
+        "-EP -c import levain.hookrun; import levain.band_view"}
 
 
 def test_a_pack_hook_imports_a_sibling_module(tmp_path):

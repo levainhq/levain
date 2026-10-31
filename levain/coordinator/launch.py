@@ -229,7 +229,8 @@ def hook_live(directory: Path, *, user_scope: bool) -> tuple[bool, str]:
     if not (Path(directory) / "CLAUDE.md").is_file():
         return False, f"{directory} is not a Levain install for Claude Code (no CLAUDE.md)"
     try:
-        rows = doctor._check_claude_code(Path(directory))
+        with doctor.band_probe_once():
+            rows = doctor._check_claude_code(Path(directory), user_band=False)
     except Exception as exc:  # noqa: BLE001 - a check that cannot run is a refusal, never a pass
         return False, f"doctor could not check {directory} ({type(exc).__name__}: {str(exc)[:200]})"
     # ruled (L3 r1 G1): a wired hook is not a running one. doctor reports an effective `disableAllHooks: true` (any
@@ -662,8 +663,11 @@ def _note_stopped(store: CoordStore) -> None:
 
 def launch_session(store: CoordStore, launch_id: str) -> Outcome:
     """:func:`_launch_session`, then the band is told when the launch that did not start made the coordinator
-    ``stopped``."""
-    out = _launch_session(store, launch_id)
+    ``stopped``. Each band import probe runs once for the launch (:func:`levain.doctor.band_probe_once`)."""
+    from levain import doctor
+
+    with doctor.band_probe_once():
+        out = _launch_session(store, launch_id)
     if not out.started:
         _note_stopped(store)
     return out

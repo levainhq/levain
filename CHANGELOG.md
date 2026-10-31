@@ -33,21 +33,31 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **`levain band hooks install | remove | status`: the NEEDS YOU band in every session, opt-in.** Writes band-only
   SessionStart, UserPromptSubmit and Stop hooks to your user-level Claude Code settings (`$CLAUDE_CONFIG_DIR` or
   `~/.claude`), merged beside your own hooks, with a receipt (`<levain home>/band_hooks.json`). They carry no posture,
-  spores, recall or consent, and stand down inside an install whose band hooks are wired (by the session's directory
-  or its project directory), for autonomous seats, and in a headless session (`claude -p`) that has no Levain launch
-  row. The Stop hook may hold a turn once to have the band reprinted. The hook command records the interpreter path;
+  spores, recall or consent, and stand down where an install's own band hooks run for the session: the project
+  settings Claude Code loads for that session register the install's SessionStart, UserPromptSubmit and Stop band
+  scripts and those scripts match the package (a session started in a subfolder of an install whose hooks sit in its
+  `settings.json` loads none of them, so it gets the user-level band). They also stand down for autonomous seats and
+  in a headless session (`claude -p` and the SDKs) that has no Levain launch row; an IDE or desktop session keeps the
+  band. The Stop hook may hold a turn once to have the band reprinted. The hook command records the interpreter path;
   `levain update` re-writes it, and a missing interpreter stays quiet in the session while doctor fails its row.
   `levain band hooks status` shows the state. `remove` takes out levain's band hook handlers (found by their module)
-  and leaves the rest of the file as it was; a symlinked settings file stays a symlink (its target is edited); a
-  settings file that does not parse is refused untouched. After install the
-  Codex hooks also show the band outside their install (the coordinator's workspace). `levain doctor` has a row for it
+  and leaves the rest of the file as it was (a blank file comes back as it was); a symlinked settings file stays a
+  symlink (its target is edited, never deleted); a settings file that does not parse is refused untouched and named,
+  and the other is still cleaned. A receipt or settings file that cannot be written is a refusal with a message:
+  install puts the settings file back when its receipt cannot be written, and `remove` exits 1 and keeps the receipt
+  until every file is clean. `levain update` re-writes the hooks in the file the receipt names and says when Claude
+  Code's settings have moved. After install the Codex hooks also show the band outside their install (the
+  coordinator's workspace). `levain doctor` has a row for it
   (not installed is info, installed but broken fails) and the Coordinator panel names the command when the Codex band
   cannot render. This is the one exception to "Levain never touches your global Claude Code configuration".
 - **The coordinator will not start without a working NEEDS YOU band, and `levain doctor` fails when the band cannot
   render.** The coordinator launch (Claude Code and Codex) now refuses, before it starts anything, when the install's
-  band hook scripts are missing or stale or the interpreter the hooks run cannot import `levain.band_view` (the hooks
-  swallow a failed import, so the band used to vanish silently). The refusal names what is missing and the fix
-  (`levain update --path <install>`). Doctor's "NEEDS YOU band hooks" row is a FAIL, not a warning, in those cases, and
+  SessionStart, UserPromptSubmit or Stop band hook is not registered, its band scripts are missing or differ from the
+  package, or the interpreter the hooks run, started as the hook starts it, cannot import the band (the hooks swallow
+  a failed import, so the band used to vanish silently). The refusal names what is missing and the fix
+  (`levain update --path <install>`). A Codex coordinator whose workspace is outside the install whose hooks Codex
+  runs is refused until the user-level band is installed (`levain band hooks install`). Doctor's "NEEDS YOU band
+  hooks" row is a FAIL, not a warning, in those cases, and
   the cockpit's Coordinator panel shows one line with the fix command.
 - **The ping puts what you act on first.** A question ping is now the question, its options, the answer command, and
   only then the blocks, which take the room left and end "(full text on the card)" when cut. The room is measured in

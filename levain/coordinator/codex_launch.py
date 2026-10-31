@@ -231,7 +231,33 @@ def global_hook_live(workspace: Path) -> tuple[bool, str]:
         return False, (f"{codex_home() / 'hooks.json'} is not one a Levain install wrote, so no Levain consent hook "
                        "runs in a Codex session: `levain init --adapter codex` in your own install first")
     live, detail = hook_live(owner)
+    if live:
+        band = workspace_band_problem(owner, workspace)
+        if band is not None:
+            from levain import band_hook
+
+            return False, f"{band}; the coordinator would show no NEEDS YOU band. Fix: `{band_hook.INSTALL_COMMAND}`"
     return live, f"{owner}: {detail}"
+
+
+def workspace_band_problem(owner: Path, workspace: Path) -> str | None:
+    """Why a Codex coordinator in ``workspace`` would be shown no NEEDS YOU band although ``owner`` (the install whose
+    hooks Codex runs) passes its own band check, else ``None``. Outside ``owner`` its hooks do nothing (unless its
+    scope is global: :func:`levain.doctor.install_band_wiring` decides), and the band then renders only through the
+    user-level band, which runs only once ``levain band hooks install`` wrote its receipt. A workspace inside
+    ``owner`` is ``owner``'s own band check's to answer (:func:`hook_live`), so ``None`` here."""
+    from levain import band_hook, doctor
+
+    try:
+        Path(workspace).resolve().relative_to(Path(owner).resolve())
+        return None
+    except (OSError, RuntimeError, ValueError):
+        pass
+    w = doctor.install_band_wiring(owner, workspace, "codex", codex_home())
+    if w.state == "wired" or band_hook.read_receipt() is not None:
+        return None
+    return (f"the coordinator's workspace {workspace} gets no band from {owner} ({w.detail}) and the user-level "
+            "band is not installed")
 
 
 def _workspace_ready(directory: Path) -> tuple[bool, str]:

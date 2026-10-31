@@ -160,21 +160,16 @@ def band_row(setting: dict[str, Any] | None, now: float | None = None) -> RowIn 
         return None
     install, agent = found
     if agent == "codex":
-        # The Codex coordinator's workspace is outside the install that owns the machine-wide hooks: its install
-        # hooks no-op there, so the band renders only through the opt-in user-level band.
         from levain import band_hook
         from levain.coordinator import codex_launch
 
         work = Path((setting or {}).get("cwd") or codex_launch.default_directory())
         try:
-            work.resolve().relative_to(Path(install).resolve())
-            outside = False
-        except (OSError, ValueError):
-            outside = True
-        if outside and band_hook.read_receipt() is None:
-            return _row("band", "NEEDS YOU band cannot render",
-                        "the coordinator's workspace is outside the install whose hooks Codex runs",
-                        f" · fix: {band_hook.INSTALL_COMMAND}")
+            outside = codex_launch.workspace_band_problem(Path(install), work)
+        except Exception:
+            outside = None
+        if outside is not None:
+            return _row("band", "NEEDS YOU band cannot render", outside, f" · fix: {band_hook.INSTALL_COMMAND}")
     key, t = f"{install}|{agent}", time.monotonic() if now is None else now
     hit = _band_cache.get(key)
     if hit is None or t - hit[0] >= _BAND_TTL:

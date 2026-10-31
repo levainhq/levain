@@ -15,9 +15,14 @@ choice: `levain band hooks install` writes three **band-only** hooks (the NEEDS
 YOU band, nothing else: no posture, spores, recall or consent) into your
 user-level Claude Code settings so the band shows in every session, not only
 inside an install. It is opt-in and keeps a receipt under the Levain home. The
-hooks stand down inside an install whose own band hooks are wired (the band
-never shows twice), for autonomous seats, and in a headless session
-(`claude -p`) that Levain did not launch. The Stop hook may hold a turn once to
+hooks stand down where an install's own band hooks run for the session (the
+band never shows twice): Claude Code loads an install's hooks for a session
+started at the install folder, or in a subfolder when they sit in the
+repository root's `.claude/settings.local.json`, and only when its
+SessionStart, UserPromptSubmit and Stop hooks are registered and its band
+scripts match the package. They also stand down for autonomous seats and in a
+headless session (`claude -p` and the SDKs) that Levain did not launch; an IDE
+or desktop session keeps the band. The Stop hook may hold a turn once to
 have the band reprinted. The hook command records the path of the Python
 interpreter it was installed from; `levain update` re-writes it after an
 upgrade, and a missing interpreter stays quiet in the session while

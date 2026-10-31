@@ -60,7 +60,7 @@ from levain.consent.questions import (HOOK_BUSY_MS, Question, QuestionStore, _no
                                      read_deadline)
 
 __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
-           "band_hooks_state", "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed",
+           "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed", "session_band_state",
            "run_band", "run_band_answer", "AnswerCommitted", "AuthorityItem", "BandSnapshot", "PickNotOffered",
            "QUESTION_VERSION_FIELDS", "VersionMoved", "VersionedQuestionStore", "answer_item", "answerable",
            "subject_for", "subject_version", "summary"]
@@ -1881,26 +1881,6 @@ def _stop_turn(directory: Path | str, fact: TurnFact, rec: dict | None, payload:
     return _reprint_reason(missing)
 
 
-BAND_MARK = "levain.band_view"
-
-
-def band_hooks_state(hooks_dir: Path | str, agent: str = "claude_code") -> tuple[str, list[str]]:
-    """``(state, scripts lacking the band)`` of an install's ``activation/hooks``: ``wired`` (every required script
-    calls :mod:`levain.band_view`), ``stale`` (some do: an older copy beside a newer one; ``levain update`` fixes it)
-    or ``absent`` (none, or no directory). Required, for Claude Code and Codex alike: SessionStart, UserPromptSubmit and
-    the Stop verifier (a Stop hook of either can block once with ``{"decision": "block", "reason": ...}``)."""
-    names = ["session_start.py", "user_prompt_submit.py", "stop.py"]
-    lacking = []
-    for n in names:
-        try:
-            has = BAND_MARK in (Path(hooks_dir) / n).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            has = False
-        if not has:
-            lacking.append(n)
-    return ("wired" if not lacking else "absent" if len(lacking) == len(names) else "stale"), lacking
-
-
 def _codex_hooks_dir(environ: Mapping[str, str], cwd: str | None) -> Path | None:
     """The ``activation/hooks`` directory Codex's own ``hooks.json`` names for UserPromptSubmit: ``$CODEX_HOME`` (or
     ``~/.codex``), then a ``.codex/hooks.json`` of the working directory or a parent. ``None``: none names one."""
@@ -1942,6 +1922,27 @@ def _find_hooks_dir(agent: str, cwd: str | None, environ: Mapping[str, str]) -> 
     return None
 
 
+def session_band_state(agent: str, cwd: str | None, environ: Mapping[str, str]) -> str:
+    """``wired`` | ``stale`` | ``absent``: whether the band hooks of the install a session would run are wired for that
+    session, answered by :func:`levain.doctor.install_band_wiring` (the one answer). The install is found as
+    :func:`_find_hooks_dir` finds it: for Claude Code from the project dir (``CLAUDE_PROJECT_DIR``, else ``cwd``),
+    which also decides which project settings Claude Code loads; for Codex from its own hooks.json, for a session
+    in ``cwd``."""
+    from levain.doctor import install_band_wiring
+
+    if agent == "codex":
+        hooks = _codex_hooks_dir(environ, cwd)
+        project = cwd
+        home: Path | None = Path(environ.get("CODEX_HOME") or Path.home() / ".codex")
+    else:
+        project = environ.get("CLAUDE_PROJECT_DIR") or cwd
+        hooks = _find_hooks_dir(agent, project, {})
+        home = None
+    if hooks is None or not project:
+        return "absent"
+    return install_band_wiring(hooks.parent.parent, project, agent, home).state
+
+
 def gate_notice(directory: Path | str, agent: str, session: str | None, cwd: str | None,
                 environ: Mapping[str, str] | None = None, deliverable: bool = True) -> str | None:
     """The gate's fallback line (D5): a seat with the consent gate but no band hook gets, ONCE per session, one line in
@@ -1958,10 +1959,6 @@ def gate_notice(directory: Path | str, agent: str, session: str | None, cwd: str
             return None
         if is_autonomous(session, directory, env):
             return None
-        hooks = _find_hooks_dir(agent, cwd, env)
-        state = band_hooks_state(hooks, agent)[0] if hooks is not None else "absent"
-        if state == "wired":
-            return None
         store = QuestionStore(directory)
         items, _, _ = _read(store)
         n = len(items)
@@ -1973,6 +1970,9 @@ def gate_notice(directory: Path | str, agent: str, session: str | None, cwd: str
         except Exception:                     # an unreadable authority source: the questions still count, said so
             partial = True
         if n == 0:
+            return None
+        state = session_band_state(agent, cwd, env)       # after the count: nothing open is the common case
+        if state == "wired":
             return None
         if not _claim_retry(directory, viewer, 1):
             return None

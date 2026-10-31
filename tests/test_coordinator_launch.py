@@ -1604,7 +1604,7 @@ def test_a_missing_hooks_off_helper_fails_loud_not_as_a_refusal(tmp_path, tmp_ho
     (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
     assert cl.hook_live(target, user_scope=False)[0]                    # user-only file: not consulted
     rows_now = doctor._check_claude_code(target)                         # doctor's own rows survive the rename
-    monkeypatch.setattr(doctor, "_check_claude_code", lambda _d: rows_now)
+    monkeypatch.setattr(doctor, "_check_claude_code", lambda _d, **_k: rows_now)
     monkeypatch.delattr(doctor, "_hooks_off_files")                      # a rename in doctor
     with pytest.raises(AttributeError):
         cl.hook_live(target, user_scope=False)
@@ -2573,7 +2573,53 @@ def test_band_problem_reads_doctors_row_for_codex_too(tmp_path):
     hooks.mkdir(parents=True)
     for n in ("session_start.py", "user_prompt_submit.py", "stop.py"):
         (hooks / n).write_text("from levain.band_view import x\n")
-    assert cl.band_problem(None, tmp_path, "codex") is None
+    # scripts that name the band are not a band: nothing registers them (a fresh install passes: test_band_every_seat)
+    bad = cl.band_problem(None, tmp_path, "codex")
+    assert bad is not None and "absent" in bad
+
+
+def test_a_coordinator_whose_user_prompt_submit_registration_is_gone_is_refused_and_doctor_fails(
+        tmp_home, qdir, fake, capsys):
+    # codex #3: with the scripts on disk and the UserPromptSubmit registration gone, doctor once found no interpreter
+    # to probe and passed the row, and the launch did not read the settings row: a coordinator with no per-prompt band
+    from levain import doctor
+    from levain.host_guard import cc_levain_hooks_file
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    assert cl.hook_live(target, user_scope=False)[0]
+    f = cc_levain_hooks_file(target)
+    doc = json.loads(f.read_text())
+    doc["hooks"]["UserPromptSubmit"] = [g for g in doc["hooks"]["UserPromptSubmit"]
+                                        if "user_prompt_submit.py" not in json.dumps(g)]
+    f.write_text(json.dumps(doc, indent=2))
+    assert all((target / "activation" / "hooks" / n).is_file()
+               for n in ("session_start.py", "user_prompt_submit.py", "stop.py"))
+    (row,) = [r for r in doctor._check_claude_code(target) if r.name == doctor.BAND_HOOKS_ROW]
+    assert not row.ok and "UserPromptSubmit is not registered" in row.detail and row.hint == "levain update"
+    live, why = cl.hook_live(target, user_scope=False)
+    assert not live and "NEEDS YOU band hooks" in why and f"levain update --path {target}" in why
+    got = _launch_pending(qdir)
+    assert not got.started and "NEEDS YOU band" in got.refusal and fake.spawns() == []
+
+
+def test_a_launch_runs_each_band_import_probe_once(tmp_home, qdir, fake, capsys, monkeypatch):
+    # deepseek #5: the launch checked the band twice, each time spawning the hook's interpreter
+    from levain import doctor
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    runs = []
+    real = doctor._run_band_probe
+    monkeypatch.setattr(doctor, "_run_band_probe", lambda *a: runs.append(a) or real(*a))
+    assert cl.hook_live(target, user_scope=False)[0]
+    assert len(runs) == 1                                    # the install's band only: the user-level row is not run
+    runs.clear()
+    with doctor.band_probe_once():
+        for _ in range(3):
+            assert cl.hook_live(target, user_scope=False)[0]
+    assert len(runs) == 1
+    runs.clear()
+    _launch_pending(qdir)
+    assert len(runs) == 1
 
 
 def test_a_stale_band_install_is_refused_naming_levain_update_and_update_clears_it(tmp_home, qdir, fake, capsys):
