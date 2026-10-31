@@ -2399,11 +2399,14 @@
     else applyMode("board", true);
   }
   // The Work lens's open loop: its row in the Open loops panel (on the tab that shows that panel), scrolled to and lit.
+  // Finds the row first: with no such row on the page nothing moves and the caller says so (false); null when the row is there but would not unfold.
   function openLoop(sporeId) {
-    const L = root.LevainLoops, panel = document.querySelector('[data-ck-panel="loops"]');
-    if (!L || !panel) return;
-    revealTab(panel);
-    L.go(sporeId);
+    const L = root.LevainLoops;
+    if (!L) return false;
+    const row = L.find(sporeId);
+    if (!row) return false;
+    revealTab(row.closest(".panel"));
+    return L.go(sporeId) ? true : null;
   }
   // The topology panel's state, read once for the header lens and the Sessions card alike. The panel is hidden on the page (the header draws it), so a
   // fault is the header's to say, three ways: a failed fetch (ts.fault), an error record the kernel sent (data.error), or the page's own

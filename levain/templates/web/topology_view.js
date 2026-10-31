@@ -455,7 +455,7 @@
       c.tabIndex = 0;
       c.title = c.title + " \u00b7 open its page";
       c.addEventListener("click", (ev) => { ev.stopPropagation(); openAgentPage(v, n, c); });
-      c.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); ev.stopPropagation(); openAgentPage(v, n, c); } });
+      c.addEventListener("keydown", (ev) => { if (ev.repeat) return; if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); ev.stopPropagation(); openAgentPage(v, n, c); } });
     }
     return c;
   }
@@ -463,14 +463,26 @@
   function openLoopCard(node, t, opts) {
     if (!opts || typeof opts.openLoop !== "function" || typeof t.id !== "string" || t.id.indexOf("spore:") !== 0 || t.id.length <= 6) return;
     const sid = t.id.slice(6);
+    const title = node.querySelector(".tv-task-t");
     node.classList.add("tv-open");
-    node.setAttribute("role", "button");
-    node.tabIndex = 0;
     node.dataset.loop = sid;
-    node.title = "open this loop in Open loops";
-    const go = () => opts.openLoop(sid);
-    node.addEventListener("click", (ev) => { if (!(ev.target.closest && ev.target.closest("a,button:not(.tv-open)"))) go(); });
-    node.addEventListener("keydown", (ev) => { if (ev.target === node && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); go(); } });
+    const said = "open this loop in Open loops";
+    node.title = said;
+    // the title is the one focusable control (a card that is itself a button would hold the worker chips inside a button); a tap anywhere else
+    // on the card still opens it. The page says whether the row was there: false = not in Open loops now, null = it would not unfold.
+    const go = () => {
+      const r = opts.openLoop(sid);
+      node.title = r === false ? "not in Open loops now" : r === null ? "finish the open edit first" : said;
+    };
+    if (title) {
+      title.setAttribute("role", "button");
+      title.tabIndex = 0;
+      title.addEventListener("keydown", (ev) => { if (ev.repeat) return; if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); ev.stopPropagation(); go(); } });
+    }
+    node.addEventListener("click", (ev) => {
+      const hit = ev.target.closest && ev.target.closest(".tv-chip, a, button, [role=button]");
+      if (!hit || hit === title) go();
+    });
   }
   function taskCard(t, byId, lost, opts, v) {
     const c = el("article", "tv-task " + t.state + (t.kind === "unattached" ? " tv-loose" : ""));

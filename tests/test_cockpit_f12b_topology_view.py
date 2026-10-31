@@ -320,6 +320,7 @@ def _paint_with(value: dict, page: bool, loop: bool) -> str:
 
 CHIP = TV + ".querySelector('.tv-task[data-task=\"spore:spore-017\"] .tv-chip')"
 LOOP = TV + ".querySelector('.tv-task[data-task=\"spore:spore-017\"]')"
+LOOP_TITLE = LOOP + ".querySelector('.tv-task-t')"
 KEY = "new KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true})"
 
 
@@ -347,10 +348,11 @@ def test_without_the_agent_page_a_chip_stays_a_plain_span(tmp_path, monkeypatch)
 @needs_browser
 def test_an_open_loop_card_calls_open_loop_with_its_spore_id_by_click_and_by_key(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    probe = "JSON.stringify({role: %s.getAttribute('role'), tab: %s.tabIndex, loop: window.__loop})" % (LOOP, LOOP)
+    probe = "JSON.stringify({role: %s.getAttribute('role'), tab: %s.tabIndex, title: %s.getAttribute('role'), loop: window.__loop})" % (LOOP, LOOP, LOOP_TITLE)
     out = _run(tmp_path, src, [{"eval": _paint_with(_work_value(), True, True)}, {"eval": LOOP + ".click(); 1"}, {"eval": probe},
-                               {"eval": "window.__loop = null; " + LOOP + ".dispatchEvent(" + KEY + "); 1"}, {"eval": "window.__loop"}])
-    assert json.loads(out[-3]) == {"role": "button", "tab": 0, "loop": "spore-017"}, out
+                               {"eval": "window.__loop = null; " + LOOP_TITLE + ".dispatchEvent(" + KEY + "); 1"}, {"eval": "window.__loop"}])
+    # the card is not itself a button (its chips would sit inside one): its title is the control
+    assert json.loads(out[-3]) == {"role": None, "tab": -1, "title": "button", "loop": "spore-017"}, out
     assert out[-1] == "spore-017", out
 
 
@@ -392,3 +394,132 @@ def test_the_work_lens_open_loop_scrolls_to_and_lights_the_row_in_open_loops(tmp
     assert before["lit"] is False and before["spore"] and before["card"] == before["spore"], before
     assert "timeout" not in json.dumps(out[-2]), out
     assert json.loads(out[-1]) == [before["spore"], True], out
+
+
+# --- the jump to an open loop: find before moving, unfold through the panel's own paths, land on the row --------------------
+
+
+def _spores(root: Path, n: int) -> None:
+    from datetime import datetime
+
+    from anneal_memory.spores import SporeStore
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    for i in range(n):
+        store.add(type="task", text=f"loop number {i} about the ledger rounding guard", tier="hot", domain="ledgerline", today=datetime.now().astimezone().date())
+
+
+PAGE_ROW = "document.querySelector('[data-ck-panel=\"loops\"]:not(.modal *) .row[data-spore]')"
+LOOPS = "document.querySelector('[data-ck-panel=\"loops\"]')"
+CARD = TV + ".querySelector('.tv-task[data-kind=spore]')"
+
+
+def _to_work(tmp_path, src, steps, first=DESKTOP):
+    ready = [{"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
+             {"until": TV + " && " + TV + ".querySelector('.tv-task[data-kind=spore].tv-open')"}, {"until": PAGE_ROW}]
+    return _run(tmp_path, src, ready + steps, first)[len(ready) + 1:]
+
+
+@needs_browser
+def test_a_collapsed_loops_card_is_expanded_through_its_own_control_and_the_row_lit(tmp_path, monkeypatch):
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spore(root)
+    out = _to_work(tmp_path, src, [
+        {"eval": LOOPS + ".querySelector('.ck-lay-fold').click(); " + LOOPS + ".classList.contains('ck-collapsed')"},
+        {"eval": "JSON.stringify([window.LevainLoops.go(" + PAGE_ROW + ".dataset.spore), " + LOOPS + ".classList.contains('ck-collapsed'), "
+                 + PAGE_ROW + ".classList.contains('tv-lit'), !!" + PAGE_ROW + ".getClientRects().length])"}])
+    assert out[0] is True, out
+    assert json.loads(out[1]) == [True, False, True, True], out
+
+
+@needs_browser
+def test_a_card_that_will_not_unfold_lights_nothing_and_says_false(tmp_path, monkeypatch):
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spore(root)
+    out = _to_work(tmp_path, src, [
+        {"eval": LOOPS + ".querySelector('.ck-lay-fold').click(); " + LOOPS + ".querySelector('.ck-lay-fold').disabled = true; 1"},
+        {"eval": "JSON.stringify([window.LevainLoops.go(" + PAGE_ROW + ".dataset.spore), " + LOOPS + ".classList.contains('ck-collapsed'), "
+                 + PAGE_ROW + ".classList.contains('tv-lit')])"}])
+    assert json.loads(out[1]) == [False, True, False], out
+
+
+@needs_browser
+def test_a_folded_row_is_shown_through_the_folds_own_pin_with_its_heading_and_the_count_right(tmp_path, monkeypatch):
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spores(root, 40)
+    rows = LOOPS + ".querySelectorAll('.row[data-spore]')"
+    probe = ("(() => { const hid = [...%s].filter(r => r.dataset.folded); const t = hid[hid.length - 1]; if (!t) return null; "
+             "window.__t = t.dataset.spore; return [hid.length, (%s.querySelector('.more-foot') || {}).textContent]; })()") % (rows, LOOPS)
+    out = _to_work(tmp_path, src, [
+        {"until": probe},
+        {"eval": "JSON.stringify([window.LevainLoops.go(window.__t), [...%s].find(r => r.dataset.spore === window.__t).classList.contains('tv-lit'), "
+                 "!![...%s].find(r => r.dataset.spore === window.__t).getClientRects().length, [...%s].filter(r => r.dataset.folded).length, "
+                 "(%s.querySelector('.more-foot') || {}).textContent, [...%s].filter(r => r.dataset.spore === window.__t)[0].classList.contains('row-expanded')])"
+                 % (rows, rows, rows, LOOPS, rows)}])
+    first = json.loads(out[0]) if isinstance(out[0], str) else out[0]
+    after = json.loads(out[1])
+    assert after[:3] == [True, True, True], after
+    assert after[3] < first[0], (first, after)                         # the pin stopped the fold cutting at or above the row: fewer are hidden
+    assert after[5] is True, after
+
+
+@needs_browser
+def test_a_filter_that_hides_the_row_is_cleared_through_the_bar_and_the_row_lit(tmp_path, monkeypatch):
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spore(root)
+    inp = LOOPS + ".querySelector('.ep-search-input')"
+    out = _to_work(tmp_path, src, [
+        {"eval": "window.__id = " + PAGE_ROW + ".dataset.spore; " + inp + ".value = 'zzz-no-such'; " + inp + ".dispatchEvent(new Event('input', {bubbles: true})); " + "!!" + PAGE_ROW},
+        {"eval": "JSON.stringify([window.LevainLoops.go(window.__id), " + inp + ".value, " + PAGE_ROW + ".classList.contains('tv-lit')])"},
+        # a query that matches nothing and a row that is not there: the person's query stays
+        {"eval": inp + ".value = 'keep me'; " + inp + ".dispatchEvent(new Event('input', {bubbles: true})); JSON.stringify([!!window.LevainLoops.find('spore-nope'), " + inp + ".value])"}])
+    assert out[0] is False, out                       # the filter hid the row
+    assert json.loads(out[1]) == [True, "", True], out
+    assert json.loads(out[2]) == [False, "keep me"], out
+
+
+@needs_browser
+def test_an_absent_row_moves_nothing_and_the_card_says_so(tmp_path, monkeypatch):
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spore(root)
+    out = _to_work(tmp_path, src, [
+        {"eval": "window.__mode = document.body.dataset.mode; " + PAGE_ROW + ".remove(); " + CARD + ".click(); "
+                 "JSON.stringify([document.body.dataset.mode === window.__mode, " + CARD + ".title, !!document.querySelector('.tv-lit[data-spore]')])"}])
+    assert json.loads(out[0]) == [True, "not in Open loops now", False], out
+
+
+@needs_browser
+def test_a_second_tap_keeps_the_full_highlight_and_focus_lands_on_the_row(tmp_path, monkeypatch):
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spore(root)
+    wait = "new Promise(r => setTimeout(r, %d))"
+    out = _to_work(tmp_path, src, [
+        {"eval": "(async () => { " + CARD + ".click(); await " + wait % 1300 + "; " + CARD + ".click(); await " + wait % 1400 + "; "
+                 "return JSON.stringify([" + PAGE_ROW + ".classList.contains('tv-lit'), document.activeElement === " + PAGE_ROW + ", " + PAGE_ROW + ".tabIndex]); })()"},
+        {"eval": "(async () => { await " + wait % 1500 + "; return " + PAGE_ROW + ".classList.contains('tv-lit'); })()"}])
+    assert json.loads(out[0]) == [True, True, -1], out    # lit at 2.7 s: the first tap's timer (2.6 s) did not end it
+    assert out[1] is False, out                           # and it does end
+
+
+@needs_browser
+def test_enter_on_the_loop_title_opens_it_and_a_chip_tap_does_not_open_the_loop(tmp_path, monkeypatch):
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spore(root)
+    out = _to_work(tmp_path, src, [
+        {"eval": CARD + ".querySelector('.tv-task-t').dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true})); "
+                 + PAGE_ROW + ".classList.contains('tv-lit')"},
+        {"eval": PAGE_ROW + ".classList.remove('tv-lit'); " + CARD + ".querySelector('.tv-task-t').dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', repeat: true, bubbles: true})); "
+                 + PAGE_ROW + ".classList.contains('tv-lit')"}])
+    assert out == [True, False], out                       # a held key does not re-fire it
+
+
+@needs_browser
+def test_focus_returns_to_the_live_chip_when_the_agent_page_closes_after_a_repaint(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    chip = TV + ".querySelector('.tv-task[data-task=\"t-run\"] .tv-chip')"
+    out = _run(tmp_path, src, [
+        {"eval": _paint(_value())}, {"eval": "window.__old = " + chip + "; window.__old.click(); 1"},
+        {"until": "document.querySelector('.agent-page')"},
+        {"eval": _paint(_value())},                       # the repaint replaces the chip that opened the page
+        {"eval": "(document.getElementById('levain-modal') || document).dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); "
+                 "JSON.stringify([document.body.contains(window.__old), document.activeElement === " + chip + "])"}])
+    assert json.loads(out[-1]) == [False, True], out
