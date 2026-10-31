@@ -1604,7 +1604,7 @@ def test_a_missing_hooks_off_helper_fails_loud_not_as_a_refusal(tmp_path, tmp_ho
     (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
     assert cl.hook_live(target, user_scope=False)[0]                    # user-only file: not consulted
     rows_now = doctor._check_claude_code(target)                         # doctor's own rows survive the rename
-    monkeypatch.setattr(doctor, "_check_claude_code", lambda _d: rows_now)
+    monkeypatch.setattr(doctor, "_check_claude_code", lambda _d, **_k: rows_now)
     monkeypatch.delattr(doctor, "_hooks_off_files")                      # a rename in doctor
     with pytest.raises(AttributeError):
         cl.hook_live(target, user_scope=False)
@@ -2497,3 +2497,152 @@ def test_escalate_with_a_hostile_text_file_stores_it_as_typed(band, monkeypatch,
     assert rc == 0, capsys.readouterr().err
     bodies = [json.loads(r[0]) for r in band.c.rows("SELECT body FROM replies WHERE kind = 'answer'")]
     assert [b["why"] for b in bodies] == [HOSTILE]
+
+
+# --- Q17-COLD: a coordinator whose NEEDS YOU band cannot render is not started ------------------------------------
+def _breakable_install(tmp_home, qdir, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    return (tmp_home / ".levain" / "coordinator").resolve()
+
+
+def _launch_pending(qdir):
+    store = CoordStore(qdir)
+    store.accept_drop("band check", surface="cli")
+    return cl.launch_session(store, store.pending_coordinator().launch_id)
+
+
+def test_a_coordinator_whose_band_scripts_are_gone_is_refused_and_doctor_fails(tmp_home, qdir, fake, capsys):
+    from levain import doctor
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    (row,) = [r for r in doctor._check_claude_code(target) if r.name == doctor.BAND_HOOKS_ROW]
+    assert row.ok, row                                   # everything wired: doctor passes
+    assert cl.hook_live(target, user_scope=False)[0]     # ... and so does the launch's check
+    for n in ("session_start.py", "user_prompt_submit.py", "stop.py"):
+        (target / "activation" / "hooks" / n).unlink()
+    (row,) = [r for r in doctor._check_claude_code(target) if r.name == doctor.BAND_HOOKS_ROW]
+    assert not row.ok and not row.warn and row.detail.startswith("absent") and row.hint == "levain update"
+    live, why = cl.hook_live(target, user_scope=False)
+    assert not live and "NEEDS YOU band hooks" in why and f"levain update --path {target}" in why
+    got = _launch_pending(qdir)
+    assert not got.started and "NEEDS YOU band" in got.refusal
+    assert fake.spawns() == []                           # nothing was started
+
+
+def test_a_coordinator_whose_hook_interpreter_cannot_import_the_band_is_refused(tmp_home, qdir, fake, capsys):
+    from levain import doctor
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    # an interpreter with no levain on its path: it runs, and every band hook swallows the failed import
+    bare = tmp_home / "bare-python"
+    bare.write_text("#!/bin/sh\necho \"ModuleNotFoundError: No module named 'levain'\" >&2\nexit 1\n")
+    bare.chmod(0o755)
+    settings = target / ".claude" / "settings.json"
+    text = settings.read_text()
+    assert json.dumps(sys.executable)[1:-1] in text
+    settings.write_text(text.replace(json.dumps(sys.executable)[1:-1], str(bare)))
+    (row,) = [r for r in doctor._check_claude_code(target) if r.name == doctor.BAND_HOOKS_ROW]
+    assert not row.ok and "cannot import levain.band_view" in row.detail and str(bare) in row.detail
+    live, why = cl.hook_live(target, user_scope=False)
+    assert not live and "cannot import levain.band_view" in why and "Fix:" in why
+    got = _launch_pending(qdir)
+    assert not got.started and "NEEDS YOU band" in got.refusal and fake.spawns() == []
+    # the shown fix puts it right
+    settings.write_text(text)
+    assert cl.hook_live(target, user_scope=False)[0]
+
+
+def test_the_cockpit_panel_shows_one_line_when_the_band_cannot_render(tmp_home, qdir, fake, capsys, monkeypatch):
+    from levain.cockpit import coordinator_status as cs
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    setting = {"agent": "claude", "cwd": str(target)}
+    monkeypatch.setattr(cs, "_band_cache", {})
+    assert cs.band_row(setting) is None
+    (target / "activation" / "hooks" / "stop.py").write_text("pass\n")
+    monkeypatch.setattr(cs, "_band_cache", {})
+    row = cs.band_row(setting)
+    assert row is not None and "NEEDS YOU band cannot render" in str(row) and f"levain update --path {target}" in str(row)
+
+
+def test_band_problem_reads_doctors_row_for_codex_too(tmp_path):
+    # the Codex launch's hook check calls this same function with its rows; a workspace with no band scripts is refused
+    bad = cl.band_problem(None, tmp_path, "codex")
+    assert bad is not None and "absent" in bad and f"levain update --path {tmp_path}" in bad
+    hooks = tmp_path / "activation" / "hooks"
+    hooks.mkdir(parents=True)
+    for n in ("session_start.py", "user_prompt_submit.py", "stop.py"):
+        (hooks / n).write_text("from levain.band_view import x\n")
+    # scripts that name the band are not a band: nothing registers them (a fresh install passes: test_band_every_seat)
+    bad = cl.band_problem(None, tmp_path, "codex")
+    assert bad is not None and "absent" in bad
+
+
+def test_a_coordinator_whose_user_prompt_submit_registration_is_gone_is_refused_and_doctor_fails(
+        tmp_home, qdir, fake, capsys):
+    # codex #3: with the scripts on disk and the UserPromptSubmit registration gone, doctor once found no interpreter
+    # to probe and passed the row, and the launch did not read the settings row: a coordinator with no per-prompt band
+    from levain import doctor
+    from levain.host_guard import cc_levain_hooks_file
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    assert cl.hook_live(target, user_scope=False)[0]
+    f = cc_levain_hooks_file(target)
+    doc = json.loads(f.read_text())
+    doc["hooks"]["UserPromptSubmit"] = [g for g in doc["hooks"]["UserPromptSubmit"]
+                                        if "user_prompt_submit.py" not in json.dumps(g)]
+    f.write_text(json.dumps(doc, indent=2))
+    assert all((target / "activation" / "hooks" / n).is_file()
+               for n in ("session_start.py", "user_prompt_submit.py", "stop.py"))
+    (row,) = [r for r in doctor._check_claude_code(target) if r.name == doctor.BAND_HOOKS_ROW]
+    assert not row.ok and "UserPromptSubmit is not registered" in row.detail and row.hint == "levain update"
+    live, why = cl.hook_live(target, user_scope=False)
+    assert not live and "NEEDS YOU band hooks" in why and f"levain update --path {target}" in why
+    got = _launch_pending(qdir)
+    assert not got.started and "NEEDS YOU band" in got.refusal and fake.spawns() == []
+
+
+def test_a_launch_runs_each_band_import_probe_once(tmp_home, qdir, fake, capsys, monkeypatch):
+    # deepseek #5: the launch checked the band twice, each time spawning the hook's interpreter
+    from levain import doctor
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    runs = []
+    real = doctor._run_band_probe
+    monkeypatch.setattr(doctor, "_run_band_probe", lambda *a: runs.append(a) or real(*a))
+    assert cl.hook_live(target, user_scope=False)[0]
+    assert len(runs) == 1                                    # the install's band only: the user-level row is not run
+    runs.clear()
+    with doctor.band_probe_once():
+        for _ in range(3):
+            assert cl.hook_live(target, user_scope=False)[0]
+    assert len(runs) == 1
+    runs.clear()
+    _launch_pending(qdir)
+    assert len(runs) == 1
+
+
+def test_a_stale_band_install_is_refused_naming_levain_update_and_update_clears_it(tmp_home, qdir, fake, capsys):
+    # an install from a release whose stop.py did not call the band: unedited (the activation receipt says levain wrote
+    # it), so `levain update` refreshes it
+    import hashlib
+
+    from levain.install import activation_receipt_path
+    from levain.update import run_update
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    old = b"# an older release's stop hook\n"
+    (target / "activation" / "hooks" / "stop.py").write_bytes(old)
+    rp = activation_receipt_path(target)
+    data = json.loads(rp.read_text())
+    data["files"]["hooks/stop.py"]["installed"] = hashlib.sha256(old).hexdigest()
+    rp.write_text(json.dumps(data))
+    live, why = cl.hook_live(target, user_scope=False)
+    assert not live and "stale" in why and f"Fix: `levain update --path {target}`" in why
+    got = _launch_pending(qdir)
+    assert not got.started and f"levain update --path {target}" in got.refusal and fake.spawns() == []
+    lines: list[str] = []
+    run_update(target, no_pip=True, emit=lines.append)
+    assert (target / "activation" / "hooks" / "stop.py").read_bytes() != old
+    assert cl.band_problem(None, target, "claude_code") is None, lines
+    assert cl.hook_live(target, user_scope=False)[0]

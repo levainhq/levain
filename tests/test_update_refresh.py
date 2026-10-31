@@ -1013,3 +1013,21 @@ def test_codex_pair_undo_names_a_config_removed_meanwhile(tmp_path, monkeypatch)
     kept = list(config.parent.glob(".config.toml.levain-prior.*"))
     assert len(kept) == 1 and "/old" in kept[0].read_text()
     assert any("was removed by something else" in n and str(kept[0]) in n for n in notes)
+
+
+def test_update_rewrites_the_user_level_band_hooks_interpreter_and_says_so(make_install, tmp_path, monkeypatch):
+    import sys
+
+    from levain import band_hook
+    from levain.update import run_update
+
+    install = make_install()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-cfg"))
+    lines: list[str] = []
+    assert run_update(install, no_pip=True, emit=lines.append) == 0
+    assert not any("band hooks" in ln for ln in lines) and band_hook.read_receipt() is None   # never opted in
+    assert band_hook.install(python="/old/venv/bin/python")[0] == 0
+    lines.clear()
+    assert run_update(install, no_pip=True, emit=lines.append) == 0
+    assert band_hook.read_receipt()["python"] == sys.executable
+    assert any("user-level band hooks re-written" in ln and sys.executable in ln for ln in lines), lines
