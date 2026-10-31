@@ -598,7 +598,7 @@
     if (!hero || !brief || !widgets) return;
     hero.hidden = brief.hidden = widgets.hidden = !on;
     const dropHost = document.getElementById("ck-drop");
-    if (dropHost && !on) dropHost.hidden = true;   // the Send box sits outside the hero now: it leaves with the KE page, and the next KE render (renderDropHero) shows it again
+    if (dropHost && !on) dropHost.hidden = true;   // the Send box sits under the Needs-you row, outside #ck-hero: it leaves with the KE page, and the next KE render (renderDropHero) shows it again
     const needsHost = document.getElementById("ck-needs");
     if (needsHost && !on) clearNeeds(needsHost);   // the strip is drawn only by the KE page, and only while something waits (renderNeeds)
     const notesHost = document.getElementById("ck-notes");
@@ -5621,7 +5621,7 @@
       // the sheet's line stays on it until it is closed; the board under it reads again, and the dispatch jobs with it
       dispatchStale();
       rereadBoard();
-      dropReload();      // a drop the sheet filed or could not confirm (either may have made the store): the hero reads again, not from its cache
+      dropReload();      // a drop the sheet filed or could not confirm (either may have made the store): the drop card reads again, not from its cache
     }
   });
   window.LevainSignSheet = { open: openSignSheet, openConsent: openConsentSheet, openDispatch: openDispatchSheet, openDrop: openDropSheet, close: closeSignSheet };
@@ -6652,7 +6652,7 @@
     return got;
   }
   function dropPrefillClear() { try { window.sessionStorage.removeItem(DROP_PREFILL_KEY); } catch (e) { /* nothing kept */ } }
-  // ---- the coordinator drop: the HERO of the home page (Phill 10-30), drawn inside #ck-hero under the now band. An inline
+  // ---- the coordinator drop: a card on the home page (Phill 10-30), drawn under the Needs-you row, outside #ck-hero. An inline
   // composer, not a button that opens a sheet. Send posts through /cockpit/coord/drop, the route the /sign/drop sheet posts to,
   // with the same request (words, outbox_id, sent_at, store_id) and the same kept-before-posted rule; an envelope needs the
   // passkey, which signs on the sheet only, so "Add an envelope" opens the sheet with the words.
@@ -6769,7 +6769,9 @@
     ui.receipt.setAttribute("role", "status");
     ui.earlier = el("p", "drop-earlier ext-meta", "");
     ui.recent = el("div", "drop-recent");
-    host.replaceChildren(head, words, acts, ui.receipt, ui.earlier, ui.recent);
+    const main = el("div", "drop-main");      // the composer is one left-column element, so the card's grid has two children whatever the list's length
+    main.append(head, words, acts, ui.receipt, ui.earlier);
+    host.replaceChildren(main, ui.recent);
     Object.assign(ui, { words, send, env });
     // what is still unconfirmed besides the request in the box: each stays retryable through the same Send, one at a time,
     // newest first (the next one comes into the box when the one in it is answered)
@@ -6858,7 +6860,7 @@
     host.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && ev.target === words) { ev.preventDefault(); send.click(); } });      // after the commit above, so a failed build leaves none
     return ui;
   }
-  // one draw of the hero from one read; the box and its words are never rebuilt under the reader
+  // one draw of the drop card from one read; the box and its words are never rebuilt under the reader
   function dropHeroDraw(host, r) {
     const ui = host._drop;
     const body = r && r.body ? r.body : null;
@@ -6899,13 +6901,13 @@
       dropHeroDraw(host, r);
     }).catch(() => {});
   }
-  // the hero reads again now (a drop was filed on the sheet, which may have made the store)
+  // the drop card reads again now (a drop was filed on the sheet, which may have made the store)
   function dropReload() {
     dropRead = null;
     const host = document.getElementById("ck-drop");
     if (host && host._drop) dropRefresh(host, true);
   }
-  // drawn on every KE render, whatever the read says: the hero is never silently absent
+  // drawn on every KE render, whatever the read says: the drop card (under the Needs-you row, outside #ck-hero) is never silently absent
   function renderDropHero() {
     const host = document.getElementById("ck-drop");
     if (!host) return;
@@ -6974,7 +6976,7 @@
   // the Decisions history's standing-rule slots (and the dispatch jobs), drawn together wherever the proposals are
   function standingSlots() {
     const f = document.createDocumentFragment();
-    f.append(proposalSlot(), grantSlot(), dispatchSlot());   // the drop is the home page's hero (renderDropHero), not a slot here
+    f.append(proposalSlot(), grantSlot(), dispatchSlot());   // the drop is its own card under the Needs-you row (renderDropHero), not a slot here
     return f;
   }
 
@@ -7547,7 +7549,7 @@
   }
 
   // OS-3, the narrow page's strip: one tap goes to the phone view's content. Needs you, Board and Notifications are blocks on this
-  // page, and so is Drop (the hero under the band: its tab scrolls there and focuses the box); Grants are drawn inside the
+  // page, and so is Drop (the card under the Needs-you row: its tab scrolls there and focuses the box); Grants are drawn inside the
   // Decisions view, so that tab opens it and takes the reader to its own slot. That
   // view fills as its reads answer (queued, each up to the fetch deadline), so the wait is for the POPULATED node, bounded by a
   // deadline a little past the read's own; a view with nothing to show (no standing grant, a read that failed) is left where the
@@ -7590,7 +7592,7 @@
   }
   function phoneJump(which, opener) {
     const run = ++phoneJumpRun;
-    if (which === "drop") {       // the drop is the home page's hero: the tab scrolls to its box, no view to open
+    if (which === "drop") {       // the drop is a card under the Needs-you row: the tab scrolls to its box, no view to open
       const host = document.getElementById("ck-drop");
       if (!host) return;
       window.requestAnimationFrame(() => {

@@ -170,6 +170,35 @@ def test_recent_drops_list_collapses_past_three_and_no_drop_row_is_left_in_the_c
     assert got["strip"] == {"t": "strip", "slot": 0, "hero": 1}, got["strip"]      # the Decisions view holds no drop row; the hero is the one copy
 
 
+GAPS = ("(() => { const h = document.getElementById('ck-drop'); const s = ['.needs-headline', '.drop-words', '.drop-actions', '.drop-receipt', '.drop-earlier'];"
+        " const b = s.map(x => h.querySelector(x).getBoundingClientRect()); const g = []; for (let i = 1; i < b.length; i++) g.push(Math.round(b[i].top - b[i - 1].bottom));"
+        " return JSON.stringify({t: 'TAG', gaps: g, kids: h.children.length, recent: Math.round(h.querySelector('.drop-recent').getBoundingClientRect().height),"
+        " left: Math.round(h.querySelector('.drop-main').getBoundingClientRect().height)}); })()")
+
+
+@needs_browser
+@needs_ssh
+def test_an_expanded_recent_list_taller_than_the_composer_does_not_move_the_composers_rows(tmp_path: Path, monkeypatch) -> None:
+    """The recent column is one of the card's two children, so however tall it grows the left column's gaps are what they were."""
+    rig = FullRig(tmp_path, monkeypatch)
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}]
+    for i in range(4):
+        steps += [_type(f"drop number {i}"), CLICK_SEND, {"until": RECEIPT_DONE + f" && {BOX}.value === '' && !{BOX}.disabled", "ms": 20000}]
+    fill = ("(() => { const h = document.getElementById('ck-drop'); h.querySelector('.drop-earlier').textContent = '1 earlier drop not confirmed.'; return 1; })()")
+    # the clones go in and the gaps are read in ONE evaluation, so a redraw of the list cannot land between them
+    grow = ("(() => { const r = document.querySelector('#ck-drop .drop-recent'); const row = r.querySelector('.drop-recent-row');"
+            " for (let i = 0; i < 12; i++) r.insertBefore(row.cloneNode(true), r.querySelector('.drop-more')); return " + GAPS.replace("TAG", "after") + "; })()")
+    steps += [{"until": "document.querySelector('#ck-drop .drop-more')", "ms": 20000}, {"eval": fill}, {"eval": GAPS.replace("TAG", "before")},
+              {"eval": "document.querySelector('#ck-drop .drop-more').click(); 1"}, {"eval": grow}]
+    with rig.serving():
+        got = _tagged(_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", steps))
+    before, after = got["before"], got["after"]
+    assert after["recent"] > after["left"] + 200, got                  # the list really is taller than the composer
+    assert after["gaps"] == before["gaps"] and after["left"] == before["left"], got   # ...and the composer's rows did not move
+    assert all(g <= 24 for g in after["gaps"]), got                    # natural gaps, no spread
+    assert after["kids"] == 2, got                                     # the composer and the recent column are the card's only children
+
+
 @needs_browser
 @needs_ssh
 def test_without_a_token_the_hero_still_draws_and_says_to_sign_in(tmp_path: Path, monkeypatch) -> None:
