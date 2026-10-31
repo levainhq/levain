@@ -593,3 +593,56 @@ def test_low_a_saved_phase_without_a_composed_hash_records_nothing(scratch):
     res = rc.recover(scratch, occ(scratch, "o1"))
     assert "no composed text hash" in " ".join(res.notes)
     assert not sn.read_manifest(occ(scratch, "o1"))["post_files"]
+
+
+# --------------------------------------------------------------------------------------------------- fix3 (L3 round 2)
+
+def test_f1_a_group_whose_leader_exited_is_never_signalled_by_number(scratch, tmp_path):
+    # the leader exits on TERM; a member ignores it. Nothing holds the leader's number any more, so recovery must not
+    # send the group a signal by that number: it reports not-confirmed and the member is still alive
+    argv = ["sh", "-c", '(trap "" TERM; sleep 300) & trap "exit 0" TERM; wait', "sh", "--add-dir",
+            str(occ(scratch, "o1"))]
+    p = _spawn_leader(argv, tmp_path)
+    try:
+        _record_child(scratch, "o1", p, argv)
+        res = rc.recover(scratch, occ(scratch, "o1"), term_wait=1.0, kill_wait=0.5)
+        assert res.child == "not-confirmed" and not res.settled
+        assert os.killpg(p.pid, 0) is None                             # the member lives: it was not KILLed
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(p.pid, signal.SIGKILL)
+
+
+def _saving_without_proof(scratch, **drop):
+    dream(scratch, "o1", _VALID)
+    m = sn.read_manifest(occ(scratch, "o1"))
+    m["post_files"], m["wrap_id"] = None, None
+    sn._write_manifest(occ(scratch, "o1"), m)
+    p = prog(scratch, "o1")
+    p.update(phase="saving", wrap_id=None)
+    for k in drop:
+        p.pop(k, None)
+    (occ(scratch, "o1") / "progress.json").write_text(json.dumps(p))
+
+
+def test_f2_no_recorded_token_adopts_no_wrap_even_when_the_hash_matches(scratch):
+    _saving_without_proof(scratch, wrap_token=None)
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert not res.settled and res.reason == rc.UNKNOWN_COMMIT
+    assert "ownership cannot be proven" in res.card["his"][0]
+    assert not (occ(scratch, "o1") / rc.RECOVERY_RECORD).exists()
+    assert not sn.read_manifest(occ(scratch, "o1"))["post_files"]
+
+
+def test_f2_a_legacy_row_without_a_pair_id_is_never_proof_even_with_a_token(scratch):
+    import sqlite3
+    _saving_without_proof(scratch)
+    con = sqlite3.connect(scratch)
+    for (name,) in con.execute("select name from sqlite_master where type = 'trigger' and tbl_name = 'wraps'").fetchall():
+        con.execute(f"drop trigger {name}")
+    con.execute("update wraps set pair_id = NULL")
+    con.commit()
+    con.close()
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert res.reason == rc.UNKNOWN_COMMIT and res.card["his"]
+    assert not sn.read_manifest(occ(scratch, "o1"))["post_files"]

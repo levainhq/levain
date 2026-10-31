@@ -458,7 +458,7 @@ def test_the_verbs_roll_back_and_drill_a_store_copy(scratch, capsys):
     assert dcli.run_dream_rollback(_args(occurrence="o2", store_dir=d, who="cli", json=True)) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["outcome"] == "rolled-back" and out["card"]["dedupe_key"] == "dream-rollback:o2"
-    assert dcli.run_dream_rollback(_args(occurrence="o2", store_dir=d, who="cli", json=False)) == 1
+    assert dcli.run_dream_rollback(_args(occurrence="o2", store_dir=d, who="cli", json=False)) == 0
     assert "already-reverted" in capsys.readouterr().out
     assert dcli.run_dream_rollback(_args(occurrence="nope", store_dir=d, who="cli", json=False)) == 2
 
@@ -625,3 +625,44 @@ def test_low_a_bare_occurrence_id_is_never_read_as_a_directory_of_the_working_di
     assert got == (scratch.parent / "dream" / "o2").resolve()
     got, err = dcli._occurrence_dir(scratch, "./o2")                   # an explicit path is still a path
     assert got == (here / "o2").resolve()
+
+
+# --------------------------------------------------------------------------------------------------- fix3 (L3 round 2)
+
+@pytest.mark.parametrize("arg", ["..", ".", "", "../x", "a/../b", "~"])
+def test_f3_dot_forms_and_empty_ids_are_refused_with_the_accepted_forms(scratch, tmp_path, monkeypatch, arg):
+    two_dreams(scratch)
+    monkeypatch.chdir(tmp_path)
+    got, err = dcli._occurrence_dir(scratch, arg)
+    assert got is None and "Accepted" in err and "occurrence id" in err
+
+
+def test_f3_a_dot_prefixed_bare_name_is_an_id_not_a_path(scratch, tmp_path, monkeypatch):
+    two_dreams(scratch)
+    (tmp_path / ".o2").mkdir()
+    monkeypatch.chdir(tmp_path)
+    got, err = dcli._occurrence_dir(scratch, ".o2")
+    assert got is None and "no such occurrence" in err                 # looked for under <store>/dream/, not the cwd
+    got, err = dcli._occurrence_dir(scratch, str(occ(scratch, "o2")))
+    assert got == occ(scratch, "o2").resolve()
+
+
+def test_f4_a_rerun_after_the_card_was_lost_prints_the_same_card_and_exits_zero(scratch, capsys):
+    two_dreams(scratch)
+    d = str(scratch.parent)
+    capsys.readouterr()
+    assert dcli.run_dream_rollback(_args(occurrence="o2", store_dir=d, who="cli", json=True)) == 0
+    first = json.loads(capsys.readouterr().out)["card"]               # the process "crashed" before anyone filed this
+    assert dcli.run_dream_rollback(_args(occurrence="o2", store_dir=d, who="other", json=True)) == 0
+    again = json.loads(capsys.readouterr().out)
+    assert again["outcome"] == "already-reverted" and again["card"] == first
+    assert dcli.run_dream_rollback(_args(occurrence="o2", store_dir=d, who="cli", json=False)) == 0
+    out = capsys.readouterr().out
+    assert "already-reverted" in out and "dream-rollback:o2" in out
+
+
+def test_low_take_refuses_a_store_with_no_readable_id(scratch, tmp_path, monkeypatch):
+    from anneal_memory import Store
+    monkeypatch.setattr(Store, "store_id", "", raising=False)
+    with Store(str(scratch), section_schema=None) as s, pytest.raises(sn.SnapshotRefused, match="store id"):
+        sn.take(s, tmp_path / "occ")
