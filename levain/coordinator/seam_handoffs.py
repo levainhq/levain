@@ -2,7 +2,7 @@
 
 A handoff is what a coordinator leaves at a seam (a rotation, the operator leaving, a dream) so the next one starts
 from a cut rather than a guess. The C13 pattern (``ready.py``): an append-only table, written by one lease-fenced
-writer, with triggers that refuse what the writer already refuses. ``coord close`` (the CLI) is a later slice; this is
+writer, with triggers that refuse the malformed shapes the writer refuses. The lease fence lives in :func:`close` only, as in C13: no trigger checks the lease, so a raw INSERT is not fenced. ``coord close`` (the CLI) is a later slice; this is
 the Python API under it. The ``state_line`` trigger is a floor, not an equal: it refuses a line that is empty after
 ASCII whitespace, and the writer refuses one that is empty after any Unicode whitespace.
 
