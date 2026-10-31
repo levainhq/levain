@@ -149,25 +149,22 @@ def test_a_shared_chrome_that_fails_setup_falls_back_to_a_spawned_one_within_the
 # ---- a killed pytest leaves no shared Chrome and no profile ----------------------------------------------------------------------
 
 CHILD = """
-import os, sys, time
+import json, os, sys, time
 sys.path.insert(0, {root!r})
 from tests import _shared_chrome
 port = _shared_chrome.port()
-print(port, _shared_chrome._profile, _shared_chrome._proc.pid, flush=True)
+print(json.dumps([port, _shared_chrome._profile, _shared_chrome._proc.pid if _shared_chrome._proc else None]), flush=True)
 time.sleep(120)
 """
 
 
 def _group_alive(pgid: int) -> bool:
-    """Whether any process is left in Chrome's process group (it leads its own group). Read by pid, never by a
-    command line: ps output on Linux CI does not reliably carry Chrome's full argv."""
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    """Whether Chrome's process group (it leads its own session) has a member that is not a zombie: read by pid,
+    never by a command line, which ps on Linux CI does not reliably carry; a zombie left under a PID 1 that does
+    not reap is not a live Chrome."""
+    from levain.firing.confinement import group_live_proc
+
+    return group_live_proc(pgid)
 
 
 def _start_child(tmp_path: Path):
@@ -175,11 +172,16 @@ def _start_child(tmp_path: Path):
     script.write_text(CHILD.format(root=str(ROOT)))
     p = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True, cwd=ROOT,
                          env={**os.environ, "PYTHONPATH": str(ROOT)})
-    line = p.stdout.readline().split()
-    if not line or line[0] == "None":
+    raw = p.stdout.readline()
+    try:
+        port, profile, pid = json.loads(raw)
+    except ValueError:
+        p.kill(); p.wait()
+        raise AssertionError(f"the child printed no startup record: {raw!r}") from None
+    if port is None or pid is None:
         p.kill(); p.wait()
         pytest.skip("the shared Chrome could not start here")
-    return p, line[1], int(line[2])
+    return p, profile, int(pid)
 
 
 def _gone(profile: str, pgid: int, bound: float = 15.0) -> bool:
