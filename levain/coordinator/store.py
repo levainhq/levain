@@ -1324,6 +1324,16 @@ class CoordStore:
             out = [self._thread(conn, t) for t in ids]
         return out if include_closed else [t for t in out if t.state != "closed"]
 
+    def thread_activity(self) -> dict[str, str]:
+        """``thread_id -> its latest activity``: the newest ``at`` among the thread's creation, its revisions, its events
+        (state, kind, title, repo) and the replies filed to it. Every one is the store's fixed-width UTC stamp, so the
+        text sorts in time order."""
+        with read_transaction(self._connect) as conn:
+            return {r[0]: r[1] for r in conn.execute(
+                "SELECT thread_id, MAX(at) FROM (SELECT thread_id, created_at AS at FROM threads "
+                "UNION ALL SELECT thread_id, at FROM thread_revisions UNION ALL SELECT thread_id, at FROM thread_events "
+                "UNION ALL SELECT thread_id, at FROM replies WHERE thread_id IS NOT NULL) GROUP BY thread_id")}
+
     def threads_of(self, drop_id: str) -> list[Thread]:
         with read_transaction(self._connect) as conn:
             self._must_drop(conn, drop_id)

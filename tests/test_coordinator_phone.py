@@ -740,3 +740,37 @@ def test_f5_the_store_a_fresh_install_s_review_made_is_the_one_its_challenge_bin
     with pytest.raises(CoordRefused) as exc:
         cp.step("envelope-challenge", {"review_id": r["review_id"]}, device=DEV)
     assert (exc.value.status, exc.value.error) == (409, "other_store")
+
+
+# --- 11. the envelope form's pre-pick is the first folder listed: the folder of the most recently active thread --------
+
+def test_coord_repos_lists_the_folder_of_the_most_recently_active_thread_first(world) -> None:
+    cp = coord_for(world)
+    d = drop(cp, "an old job and a new one", "ph-" + "e2" * 16)["drop"]
+    clock = _Clock(datetime.now(timezone.utc))
+    store = EnvelopeStore(world["qdir"], clock=clock)
+    old, new = store.split(d["drop_id"], [Part(kind="work", title="the old job"), Part(kind="work", title="the new job")])
+    clock.t += timedelta(minutes=1)
+    store.set_field(old.thread_id, "repo", "/work/old")
+    clock.t += timedelta(minutes=1)
+    store.set_field(new.thread_id, "repo", "/work/current")
+    assert cp.listing()["coord_repos"] == ["/work/current", "/work/old"]       # the newer activity first, not the older row
+    # activity, not creation: the older thread touched last is first
+    clock.t += timedelta(minutes=1)
+    store.set_field(old.thread_id, "title", "the old job, picked up again")
+    assert cp.listing()["coord_repos"] == ["/work/old", "/work/current"]
+
+
+# --- 11. L3 r2 codex: the review says when the server read it, from the clock read that set its hard stop -------------
+
+def test_f6_the_review_reply_carries_the_stop_computed_from_the_read(world, monkeypatch) -> None:
+    from levain.cockpit.consent import utc_stamp
+    from levain.coordinator import cli as ccli
+
+    at =datetime(2026, 10, 31, 9, 15, 42, 123456, tzinfo=timezone.utc)
+    monkeypatch.setattr(ccli, "_tick", lambda: at)
+    cp = coord_for(world)
+    r = review(world, cp, "read at a known instant", "ph-" + "a6" * 16, _land_spec(str(world["repo"][0])))
+    read = at.replace(microsecond=0)
+    assert r["stop_at"] == utc_stamp(read + timedelta(hours=2)), r["stop_at"]
+    assert json.loads(r["body_text"])["issued_at"] == utc_stamp(read)

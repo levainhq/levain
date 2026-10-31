@@ -1132,6 +1132,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/sign.js": ("sign.js", "text/javascript; charset=utf-8"),
     # The sign sheet's card parser (a pure file, shared by name with node's test): loaded before /sign.js.
     "/card_format.js": ("card_format.js", "text/javascript; charset=utf-8"),
+    # The envelope form the sign sheet draws (a pure file, one copy): loaded before /sign.js.
+    "/envelope_form.js": ("envelope_form.js", "text/javascript; charset=utf-8"),
     # The thread view (CH-U1a): the Build tab's Threads zone, over GET /cockpit/threads.json and /cockpit/thread/<id>.json.
     "/thread_view.js": ("thread_view.js", "text/javascript; charset=utf-8"),
     # The read-only ready-queue board (C12): the Board tab's zone, over GET /cockpit/board.json.

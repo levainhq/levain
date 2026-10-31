@@ -5517,19 +5517,20 @@
     if (typeof id !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(id)) return null;
     return openSheet("/sign/consent/" + encodeURIComponent(id), version, choice, "consent request");
   }
-  function openSheet(path, version, choice, what) {
+  // `heading`: the modal's title when it should not be `what` (which names the frame for assistive tech)
+  function openSheet(path, version, choice, what, heading) {
     closeSignSheet();
     if (signBusy) return null;
     signBusy++;
     signSheetLease = true;
     try {
-      return buildSignSheet(path, version, choice, what);
+      return buildSignSheet(path, version, choice, what, heading);
     } catch (e) {
       closeSignSheet();   // a build that threw gives back the lease and whatever it had made inert
       return null;
     }
   }
-  function buildSignSheet(path, version, choice, what) {
+  function buildSignSheet(path, version, choice, what, heading) {
     let frag = typeof version === "string" && /^[0-9a-f]{16}/.test(version) ? "v=" + version.slice(0, 16) : "";
     if (frag && typeof choice === "string" && /^[a-z0-9]{1,8}$/.test(choice)) frag += "&choice=" + choice;
     const veil = el("div", "modal-overlay");
@@ -5539,7 +5540,7 @@
     veil.setAttribute("aria-label", what);
     const box = el("div", "modal");
     const head = el("div", "modal-head");
-    head.appendChild(el("h2", "", what.charAt(0).toUpperCase() + what.slice(1)));
+    head.appendChild(el("h2", "", heading || what.charAt(0).toUpperCase() + what.slice(1)));
     const x = el("button", "modal-close", "×");
     x.type = "button";
     x.setAttribute("aria-label", "close the sign sheet");
@@ -5552,6 +5553,8 @@
     frame.referrerPolicy = "no-referrer";
     frame.src = path + (frag ? "#" + frag : "");
     Object.assign(frame.style, { width: "100%", height: "min(80vh, 680px)", border: "0", display: "block", background: "transparent" });
+    // the envelope form is the modal's whole body: the modal takes the room it has and the frame fills it
+    if (path === "/sign/drop") { box.classList.add("modal-sheet"); frame.style.height = "auto"; }
     box.append(head, frame);
     veil.appendChild(box);
     veil.addEventListener("keydown", (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); askCloseSignSheet(); } });
@@ -6729,7 +6732,7 @@
     // the sheet reads them once and removes them
     // (set after openSheet, which closes any sheet first and so clears the key; the frame loads later than this returns;
     // closeSignSheet and an edit of the box clear it again, so a sheet that never reads it leaves nothing behind)
-    const got = openSheet("/sign/drop", "", "", "coordinator drop");
+    const got = openSheet("/sign/drop", "", "", "coordinator drop", "Add an envelope");
     if (got && typeof words === "string" && words) { try { window.sessionStorage.setItem(DROP_PREFILL_KEY, words); } catch (e) { /* the sheet opens empty */ } }
     return got;
   }

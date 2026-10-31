@@ -59,6 +59,16 @@
     return n;
   };
   const framed = window.parent !== window;           // only this origin may frame the sheet (its frame-ancestors)
+  // the drop sheet inside the cockpit's modal IS the modal's body: no card, no brand line, no title of its own (the modal's
+  // heading names it), the full width. Opened on its own (the phone) it keeps the card.
+  const embedded = framed && location.pathname === "/sign/drop";
+  if (embedded) {
+    document.body.classList.add("sheet-embedded");
+    const h1 = document.getElementById("sheet-title");
+    if (h1) h1.hidden = true;
+    const brand = document.querySelector(".pair-brand");
+    if (brand) brand.hidden = true;
+  }
 
   // ---- the link ----
   const consentPath = /^\/sign\/consent\/([^/]{1,480})$/.exec(location.pathname);
@@ -742,7 +752,7 @@
     const body = $("sheet-body");
     body.replaceChildren();
     $("sheet-actions").replaceChildren();
-    head("Drop", "Words for the coordinator, delivered as a drop; optionally with an envelope your passkey signs.");
+    head("Drop", "Say what you want done, where it may work and how big a job it is. You sign once, with your passkey.");
     const origin = typeof got.origin === "string" ? got.origin : "";
     const rp = typeof got.rp_id === "string" && got.rp_id ? got.rp_id : window.location.hostname;
     const held = got.credentials && typeof got.credentials === "object" ? got.credentials : {};
@@ -754,57 +764,98 @@
     const list = el("pre", "sheet-message", drops.map(dropLine).join("\n"));     // always made: the first delivery fills it
     list.id = "drop-recent";
     list.hidden = !drops.length;
-    body.appendChild(list);
+    const grow = (t) => { const f = window.LevainCardFormat; if (f && typeof f.grow === "function") f.grow(t); };      // a programmatic value fires no input event
+    // the form is laid out in two columns (one on a phone): your words, where, landing | size, what you sign, the buttons
+    const grid = el("div", "env-grid");
+    const colL = el("div", "env-col"), colR = el("div", "env-col");
+    grid.append(colL, colR);
+    body.appendChild(grid);
     const words = el("textarea", "");
     words.id = "drop-words";
     words.rows = 4;
-    words.placeholder = "your words";
+    words.placeholder = "what you want done";
     words.setAttribute("aria-label", "your words");
-    body.appendChild(words);
-    const grow = (t) => { const f = window.LevainCardFormat; if (f && typeof f.grow === "function") f.grow(t); };      // a programmatic value fires no input event
     // words typed in the cockpit's drop box and handed over by "Add an envelope" (dashboard_core.js openDropSheet): read once
     try {
       const pre = window.sessionStorage.getItem("levain-drop-prefill");
       if (pre) { words.value = pre; grow(words); window.sessionStorage.removeItem("levain-drop-prefill"); }
     } catch (e) { /* the sheet opens empty */ }
-    const det = el("details", "");
-    det.id = "drop-env";
-    det.appendChild(el("summary", "", "sign an envelope"));
-    const field = (id, label, node) => { node.id = id; const l = el("label", "ext-meta", label + " "); l.appendChild(node); det.appendChild(l); det.appendChild(el("br")); return node; };
-    const repo = field("drop-repo", "repo", el("input"));
-    repo.type = "text";
-    repo.setAttribute("list", "drop-repos");
-    const repos = el("datalist");
-    repos.id = "drop-repos";
-    for (const r of Array.isArray(got.coord_repos) ? got.coord_repos : []) if (typeof r === "string") { const o = el("option"); o.value = r; repos.appendChild(o); }
-    det.appendChild(repos);
-    const onto = field("drop-onto", "land onto", el("input"));
-    onto.type = "text";
-    onto.placeholder = "main";
-    const stop = field("drop-stop", "stop after", el("select"));
-    for (const h of ["1h", "2h", "4h", "8h", "12h", "24h"]) { const o = el("option", "", h); if (h === "2h") o.selected = true; stop.appendChild(o); }
-    const nums = {};
-    for (const k of ["calls", "tokens", "hours"]) { const n = field("drop-" + k, k, el("input")); n.type = "number"; n.min = "0"; n.placeholder = "0"; nums[k] = n; }
-    body.appendChild(det);
-    const review = el("pre", "sheet-message");
-    review.id = "drop-review";
-    review.hidden = true;
-    body.appendChild(review);
+    const keyBox = el("div", "env-keybox");
+    keyBox.hidden = true;
     const acts = $("sheet-actions");
     acts.hidden = false;
-    const send = el("button", "dev-btn", "Send drop");
+    const send = el("button", "dev-btn", "Send words only");
     send.type = "button";
     send.id = "drop-send";
-    const sign = el("button", "dev-btn dev-primary", "Sign envelope with passkey");
+    const sign = el("button", "dev-btn dev-primary", "Sign with your passkey");
     sign.type = "button";
     sign.id = "drop-sign";
-    acts.append(send, sign);
-    $("sheet").dataset.state = "open";
-    const why0 = !storeRead ? "still reading which Levain answers here; reload" : "";
+    sign.disabled = true;
+    acts.append(sign, send);
+    // beside the buttons: why Sign is off, what each button does, and what comes after signing
+    const signWhy = el("p", "env-hint env-why");
+    signWhy.id = "drop-sign-why";
+    const buttonNotes = el("div", "env-notes");
+    const sendNote = el("p", "env-hint", "Send words only: sends your words with no limits attached.");
+    sendNote.id = "drop-send-note";
+    send.setAttribute("aria-describedby", sendNote.id);
+    buttonNotes.append(sendNote, el("p", "env-hint", "Sign, then the coordinator may start work inside these limits."));
     let oid = newOutboxId();       // held for these words: a resend after a lost reply files once, never twice
+    let cannot = "";
+    const why0 = !storeRead ? "still reading which Levain answers here; reload" : "";
+    // The store this sheet is bound to. Every reply that names a store passes through here: a reply may SET the identity only
+    // while the page holds none, and a different one named while one is held stops the sheet (it is never re-bound: that
+    // would sign into, or send to, a store the person never opened the sheet for).
+    const MOVED = "This sheet was opened for a different Levain store than the one answering now. Reload the page to see the current store; nothing more can be signed or sent here.";
+    let moved = "";
+    const otherStore = (id) => typeof id === "string" && storeId !== null && id !== storeId;
+    const refuseOther = () => { moved = MOVED; form.stop(MOVED); };
+    // the fields, the spec and the review are the shared form's (envelope_form.js); this page passes how a review is asked for
+    const form = window.LevainEnvelopeForm.create({
+      words: words, wordsGroup: true, left: colL, right: colR, lockRoots: [grid], repos: got.coord_repos, sign: sign, signWhy: signWhy, why: why,
+      storeId: () => storeId,
+      // asked only after a review sent with no store id: a store identity the page already holds is never replaced
+      refreshStore: () => readDrops().then((g) => {
+        if (!g || typeof g.coord_store_id !== "string") return;
+        if (storeId === null) storeId = g.coord_store_id;
+        else if (otherStore(g.coord_store_id)) refuseOther();
+      }),
+      blocked: () => moved || (cannot ? "Envelope: " + cannot : why0),
+      review: (req) => {
+        const k = keyNow();
+        return post("envelope-review", { words: req.words, outbox_id: oid, spec: req.spec, signer_fp: k.fp, store_id: storeId }).then((c) => {
+          // a fresh install's review made the store: only then does a null identity take the reply's
+          if (c.ok && storeId === null && c.body.store_created === true && typeof c.body.store_id === "string") storeId = c.body.store_id;
+          else if (c.ok && otherStore(c.body.store_id)) {
+            refuseOther();
+            return { ok: false, status: 409, body: { error: "other_store", message: MOVED }, k: k };
+          }
+          c.k = k;
+          return c;
+        });
+      },
+    });
+    const bar = el("div", "env-bar");      // the reason and the buttons, kept together (and held at the bottom of a phone-width page)
+    bar.append(signWhy, acts);
+    form.foot.append(keyBox, bar, buttonNotes, $("sheet-note"));
+    // the sheet is a live region for its progress lines; the form inside it is not, or "Reading…" would be read out on every keystroke (the form announces a settled review itself)
+    grid.setAttribute("aria-live", "off");
+    $("sheet-note").setAttribute("aria-live", "polite");
+    body.appendChild(list);
+    if (words.value) grow(words);      // sized once it is in the page: a box that is not laid out yet measures nothing
+    $("sheet").dataset.state = "open";
     let working = false;
     let pending = null;            // a signed drop whose reply did not come back: sent again unchanged, never re-signed
-    const lock = (on) => { working = on; send.disabled = sign.disabled = on; words.disabled = on; };
+    const queue = (ms) => form.queue(ms);
+    const changed = () => form.changed();
+    let ksel = null;               // the signing key's picker, when this device holds several
+    const lock = (on) => {
+      working = on;
+      send.disabled = on;
+      if (ksel) ksel.disabled = on;          // the key a signing under way uses is the one shown
+      words.disabled = on;
+      form.lock(on);
+    };
     // a drop whose answer is not known is kept in this browser BEFORE it is posted (as the phone's outbox keeps it), so a
     // closed sheet loses nothing: the next open sends it again, unchanged (the same outbox id files once), and it leaves
     // only on a definite answer
@@ -840,26 +891,32 @@
     const done = (a, plain) => {
       const d = a.body.drop || {};
       const e = a.body.envelope;
-      // a fresh store's first drop made it: its identity is held before the controls unlock, so a fast second send names it
-      if (typeof a.body.store_id === "string") storeId = a.body.store_id;
+      // a fresh store's first drop made it: its identity is held before the controls unlock, so a fast second send names it.
+      // A drop answered by a store other than the one held (a kept drop sent again after the store changed) is reported as
+      // delivered there, and the sheet stops: it is never re-bound to the store that answered
+      const other = otherStore(a.body.store_id);
+      if (storeId === null && typeof a.body.store_id === "string") storeId = a.body.store_id;
+      if (other) refuseOther();
       busy = false;
       lock(false);
       oid = newOutboxId();
       pending = null;
       words.value = "";
-      review.hidden = true;
-      review.replaceChildren();
-      acts.replaceChildren(send, sign);
+      acts.replaceChildren(sign, send);
+      queue(0);
       const msg = (a.body.created === false ? "already delivered" : "delivered") + " as " + String(d.drop_id || "") + " · by "
         + (plain ? "words only" : e && e.taken ? "envelope " + e.envelope_id + " taken" : "envelope NOT taken: " + String((e && e.refused) || "no envelope in the reply"));
-      say(msg, plain || (e && e.taken) ? "ok" : "bad");
+      if (other) say(msg + "; but by a different Levain store than this sheet was opened for. Reload the page to see the current store; nothing more can be signed or sent here.", "bad");
+      else say(msg, plain || (e && e.taken) ? "ok" : "bad");
       tell("signed");
       return readDrops().then((g) => {
         if (g.unpaired || g.error) return;
         const dd = Array.isArray(g.coord_drops) ? g.coord_drops : [];
         list.textContent = dd.map(dropLine).join("\n");
         list.hidden = !dd.length;
-        if (typeof g.coord_store_id === "string") storeId = g.coord_store_id;
+        // the store this sheet is bound to is kept: a listing that names another one never re-binds it, and stops the sheet
+        if (storeId === null && typeof g.coord_store_id === "string") storeId = g.coord_store_id;
+        else if (otherStore(g.coord_store_id) && !moved) refuseOther();
       });
     };
     const refusal = (a, nothing) => say(nothing + ": " + why(a), "bad");
@@ -870,11 +927,10 @@
       unsure = false;
       busy = false;
       pending = null;
-      review.hidden = true;
-      review.replaceChildren();
-      acts.replaceChildren(send, sign);
+      acts.replaceChildren(sign, send);
       $("sheet").dataset.state = "open";
       lock(false);
+      queue(0);
     };
     const sendDrop = (req) => {
       const signed = req.envelope != null;
@@ -915,80 +971,78 @@
       const w = wordsOf();
       if (w === null) return;
       if (why0) return say(why0, "bad");
+      if (moved) return say(moved, "bad");
       sendDrop({ words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId });
     });
     // what the envelope needs, said before any tap: never a ceremony that cannot verify
-    const cannot = !usable ? "this browser cannot use a passkey here (needs https)"
+    cannot = !usable ? "this browser cannot use a passkey here (needs https)"
       : origin !== window.location.origin ? "this page cannot use your passkey: sign on " + (origin || "the cockpit's https page")
       : typeof got.elsewhere === "string" && got.elsewhere ? got.elsewhere
       : !signers.length ? (got.coord_signer_note || "no passkey enrolled for " + rp + " can sign an envelope") : "";
-    if (cannot) { const n = el("p", "ext-meta", "Envelope: " + cannot); n.id = "drop-sign-note"; body.appendChild(n); sign.disabled = true; sign.dataset.cannot = "1"; }
+    if (cannot) { const n = el("p", "ext-meta", "Envelope: " + cannot); n.id = "drop-sign-note"; form.foot.insertBefore(n, bar); sign.disabled = true; }
+
+    // ---- the passkey this device signs with: the one it holds; a choice only when it holds several ----
+    const localKeys = mine(rp);
+    const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(localKeys, fp));
+    const pool = known.length ? known : signers;
+    let keyFp = pool[0];
+    if (pool.length > 1) {
+      ksel = el("select");
+      ksel.id = "drop-key";
+      ksel.setAttribute("aria-label", "the passkey to sign with");
+      for (const fp of pool) { const o = el("option", "", fp.slice(0, 18) + "…"); o.value = fp; o.title = fp; ksel.appendChild(o); }
+      ksel.addEventListener("change", () => { keyFp = ksel.value; changed(); });
+      keyBox.append(el("span", "env-flabel", "Signing key"), ksel);
+      keyBox.hidden = false;
+    }
+    const keyNow = () => {
+      const local = mine(rp);
+      return Object.prototype.hasOwnProperty.call(local, keyFp) ? { fp: keyFp, rawId: local[keyFp], local: true }
+        : { fp: keyFp, rawId: held[keyFp] && typeof held[keyFp].credential_id === "string" ? held[keyFp].credential_id : null, local: false };
+    };
+
+    // the form (envelope_form.js) holds the review the button signs; a change to the form retires it
     sign.addEventListener("click", () => {
-      if (working || cannot) return;
-      const w = wordsOf();
-      if (w === null) return;
-      const r = repo.value.trim(), ont = onto.value.trim();
-      if (!r) { det.open = true; return say("name the repo the envelope lets it work in", "bad"); }
-      if (why0) return say(why0, "bad");
-      const n = (k) => { const v = nums[k].value.trim(); return v === "" ? 0 : Number(v); };
-      const spec = { where: [{ repo: r, paths: ["."] }], lands: ont ? [{ repo: r, onto: ont }] : [], stop: stop.value,
-                     budget: { tool_calls: n("calls"), tokens: n("tokens"), hours: n("hours") } };
+      const c = form.current();
+      if (working || cannot || !c) return;
+      const k = c.reply.k;
       lock(true);
       busy = true;
-      const release = () => { busy = false; lock(false); };
-      whom(rp, signers, held, acts).then((k) => {
-        if (!k) { release(); return undefined; }
-        say("Building the envelope to sign…");
-        return post("envelope-review", { words: w, outbox_id: oid, spec: spec, signer_fp: k.fp, store_id: storeId }).then((c) => {
-          if (!c.ok) { release(); return refusal(c, "Nothing to sign"); }
-          // a fresh install's review made the store: only then does a null identity take the reply's
-          if (storeId === null && c.body.store_created === true && typeof c.body.store_id === "string") storeId = c.body.store_id;
-          review.textContent = (Array.isArray(c.body.view) ? c.body.view.join("\n") : "") + "\n\nenvelope digest: " + String(c.body.digest || "");
-          review.hidden = false;
-          review.tabIndex = 0;
-          say("Read the envelope, then sign it.");
-          const go = el("button", "dev-btn dev-primary", "Sign with your passkey");
-          go.type = "button";
-          const no = el("button", "dev-btn", "Dismiss");
-          no.type = "button";
-          acts.replaceChildren(go, no);
-          no.addEventListener("click", () => { review.hidden = true; review.replaceChildren(); acts.replaceChildren(send, sign); say("Not signed; your words are still here."); release(); });
-          go.addEventListener("click", () => {
-            go.disabled = no.disabled = true;
-            let sent = false;
-            flight = true;
-            const stop1 = (m) => { relabel("Not signed"); ended(); say(m, "bad"); go.disabled = no.disabled = false; };
-            post("envelope-challenge", { review_id: c.body.review_id }).then((ch) => {
-              if (!ch.ok) return stop1("Not signed: " + why(ch) + "; nothing was signed.");
-              if (!decodable(ch.body.challenge)) return stop1("The cockpit sent a malformed challenge; nothing was signed.");
-              const line = typeof ch.body.line === "string" ? ch.body.line : "";
-              if (line) signing(line, "server", "Signing");
-              say("Confirm with your passkey to sign…" + (line ? " " + line : ""));
-              const allow = k.rawId && decodable(k.rawId) ? unb64u(k.rawId) : null;
-              const ask = (aid) => {
-                const pk = { challenge: unb64u(ch.body.challenge), rpId: ch.body.rp_id, userVerification: "required", timeout: 60000 };
-                if (aid) pk.allowCredentials = [{ type: "public-key", id: aid }];
-                return navigator.credentials.get({ publicKey: pk });
-              };
-              return ask(allow).catch((e) => { if (!(e && e.name === "NotAllowedError" && allow && k.local)) throw e; return ask(null); }).then((cred) => {
-                say("Sending the signed drop…");
-                const envelope = { body_text: c.body.body_text, payload: ch.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
-                                   client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
-                sent = true;
-                if (cred.rawId && mine(rp)[k.fp] !== b64u(cred.rawId)) remember(rp, k.fp, b64u(cred.rawId));
-                signedLine = line;
-                return sendDrop({ words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId, envelope: envelope });
-              }, (e) => stop1("The passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed."));
-            }).catch((e) => {
-              const name = (e && e.name) || "error";
-              if (sent) { relabel("Not confirmed"); ended(); say("Not sure the signed drop was delivered (the page failed: " + name + ").", "bad"); return; }
-              stop1("The page failed (" + name + "); nothing was signed.");
-            });
+      flight = true;
+      say("Confirm with your passkey to sign…");
+      // a refusal before any passkey tap: nothing was signed; the review is asked for again when the server no longer holds it
+      const stop1 = (m, again) => { relabel("Not signed"); ended(); say(m, "bad"); busy = false; lock(false); if (again) queue(0); };
+      post("envelope-challenge", { review_id: c.id }).then((ch) => {
+        if (!ch.ok) return stop1("Not signed: " + why(ch) + "; nothing was signed.", ch.status === 409);
+        if (otherStore(ch.body.store_id)) { stop1("Not signed: the challenge came from a different Levain store than this sheet was opened for; nothing was signed."); return refuseOther(); }
+        if (!decodable(ch.body.challenge)) return stop1("The cockpit sent a malformed challenge; nothing was signed.");
+        const line = typeof ch.body.line === "string" ? ch.body.line : "";
+        if (line) signing(line, "server", "Signing");
+        say("Confirm with your passkey to sign…" + (line ? " " + line : ""));
+        const allow = k.rawId && decodable(k.rawId) ? unb64u(k.rawId) : null;
+        const ask = (aid) => {
+          const pk = { challenge: unb64u(ch.body.challenge), rpId: ch.body.rp_id, userVerification: "required", timeout: 60000 };
+          if (aid) pk.allowCredentials = [{ type: "public-key", id: aid }];
+          return navigator.credentials.get({ publicKey: pk });
+        };
+        let sent = false;
+        return ask(allow).catch((e) => { if (!(e && e.name === "NotAllowedError" && allow && k.local)) throw e; return ask(null); }).then((cred) => {
+          say("Sending the signed drop…");
+          const envelope = { body_text: c.body_text, payload: ch.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
+                             client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
+          sent = true;
+          if (cred.rawId && mine(rp)[k.fp] !== b64u(cred.rawId)) remember(rp, k.fp, b64u(cred.rawId));
+          signedLine = line;
+          return sendDrop({ words: c.words, outbox_id: oid, sent_at: stamp(), store_id: storeId, envelope: envelope });
+        }, (e) => stop1("The passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed."))
+          .catch((e) => {
+            const name = (e && e.name) || "error";
+            if (sent) { relabel("Not confirmed"); ended(); say("Not sure the signed drop was delivered (the page failed: " + name + ").", "bad"); return undefined; }
+            return stop1("The page failed (" + name + "); nothing was signed.");
           });
-          return undefined;
-        });
-      }).catch(() => { release(); });
+      }, () => stop1("The page failed (the cockpit did not answer); nothing was signed."));
     });
+    form.start();
     // a drop kept from an earlier visit whose answer never came: asked again now, unchanged (the outbox id files it once)
     const left = kept();
     if (left) {
