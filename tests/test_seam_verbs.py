@@ -666,6 +666,23 @@ def test_k2_a_handoff_body_nested_past_the_recursion_limit_is_unreadable_not_a_t
     assert "handoff 1 body is unreadable" in run(qdir, capsys, "handoff", "show", "--json", rc=1).err
 
 
+def test_r5_a_body_deeper_than_the_bound_is_refused_in_every_format_and_the_writers_shape_fits(world, qdir, tmp_path,
+                                                                                                capsys):
+    from levain.coordinator import seam_verbs
+
+    run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path)), "--request-id", "r1",
+        "--token", str(world.token))
+    _rewrite_writer(world, "previous-session")
+    stored = json.loads(sql(world, "SELECT body FROM seam_handoffs")[0][0])
+    assert seam_verbs._depth(stored) <= seam_verbs._BODY_DEPTH_MAX           # a real written body is inside the bound
+    # nested just under the interpreter's limit: deep enough that an encoder with a deeper wrapper would overflow
+    deep = json.dumps({"state_line": "x", "notes": "n"})[:-1] + ', "z": ' + "[" * 993 + '"z"' + "]" * 993 + "}"
+    sql(world, "UPDATE seam_handoffs SET body = ?", deep)
+    for fmt in ((), ("--md",), ("--json",)):
+        err = run(qdir, capsys, "handoff", "show", *fmt, rc=1).err
+        assert "nests deeper than" in err and "Traceback" not in err
+
+
 def test_k3_a_literal_bracket_is_ordinary_text_to_the_cut():
     from levain.coordinator import seam
 

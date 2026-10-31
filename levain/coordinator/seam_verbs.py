@@ -19,7 +19,7 @@ from levain import unshowable
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.coordinator import lease as _leases
 from levain.coordinator import seam_handoffs, seam_open
-from levain.coordinator.seam import open_brief, verbose_lines
+from levain.coordinator.seam import _trim, open_brief, verbose_lines
 from levain.coordinator.seam_build import build
 from levain.coordinator.store import CoordError, StoreAbsent
 
@@ -272,6 +272,22 @@ def _render_plain(h: Any, body: dict[str, Any]) -> str:
     return "\n".join(L)
 
 
+_BODY_DEPTH_MAX = 8
+
+
+def _depth(value: Any) -> int:
+    """How deeply ``value`` nests lists and dicts, walked without recursion (a scalar is 0)."""
+    deepest, stack = 0, [(value, 0)]
+    while stack:
+        v, d = stack.pop()
+        if isinstance(v, dict):
+            v = list(v.values())
+        if isinstance(v, list):
+            deepest = max(deepest, d + 1)
+            stack.extend((x, d + 1) for x in v)
+    return deepest
+
+
 def run_handoff_show(args: argparse.Namespace, out: Any, store: Any) -> int:
     h = seam_handoffs.latest(store) if args.handoff_id is None else seam_handoffs.get(store, args.handoff_id)
     if h is None:
@@ -284,14 +300,16 @@ def run_handoff_show(args: argparse.Namespace, out: Any, store: Any) -> int:
         body = json.loads(h.body)
         if not isinstance(body, dict):
             raise ValueError(f"the body is JSON {type(body).__name__}, not an object")
+        if _depth(body) > _BODY_DEPTH_MAX:
+            # a bound, not an encoder probe: far past any shape the writer accepts, and nothing deeper reaches the
+            # recursive marker or any json encoder
+            raise ValueError(f"the body nests deeper than {_BODY_DEPTH_MAX}")
         # rendered whatever the format, so a body the text views cannot read is refused in --json too
         text = render(_Shown(h), _marked(body))
-        if args.json:
-            json.dumps(body)         # a body too deep for the encoder is refused here, never a traceback from _emit
     except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
         reason = f"missing key {exc}" if isinstance(exc, KeyError) else f"{type(exc).__name__}: {exc}"
         raise CoordError(f"handoff {h.handoff_id} body is unreadable: "
-                         f"{unshowable.mark(reason[:160], allow='')}") from None
+                         f"{_trim(unshowable.mark(reason, allow=''), 160)}") from None
     _emit(out, args.json, {"handoff_id": h.handoff_id, "kind": h.seam_kind, "written_at": h.written_at,
                            "writer": h.writer, "covers_gseq": h.covers_gseq, "prev_handoff_id": h.prev_handoff_id,
                            "body": body}, text)
