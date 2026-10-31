@@ -353,7 +353,7 @@ def test_doctor_band_hooks_row(tmp_path):
     assert r.ok and not r.warn and "wired" in r.detail
     _hooks_dir(tmp_path / "b", wired=False)
     r = doctor._check_band_hooks(tmp_path / "b", "claude_code")
-    assert r.ok and r.warn and r.detail.startswith("absent") and r.hint == "levain update"
+    assert not r.ok and r.detail.startswith("absent") and r.hint == "levain update"   # a FAIL: no band shown
     d = _hooks_dir(tmp_path / "c", wired=True)
     (d / "stop.py").write_text("pass\n")
     assert doctor._check_band_hooks(tmp_path / "c", "claude_code").detail.startswith("stale")

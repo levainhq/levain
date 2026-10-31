@@ -30,6 +30,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `levain question show --json` carry `open_ended`. The cockpit's page script is routed separately.
 
 ### Changed
+- **The coordinator will not start without a working NEEDS YOU band, and `levain doctor` fails when the band cannot
+  render.** The coordinator launch (Claude Code and Codex) now refuses, before it starts anything, when the install's
+  band hook scripts are missing or stale or the interpreter the hooks run cannot import `levain.band_view` (the hooks
+  swallow a failed import, so the band used to vanish silently). The refusal names what is missing and the fix
+  (`levain update --path <install>`). Doctor's "NEEDS YOU band hooks" row is a FAIL, not a warning, in those cases, and
+  the cockpit's Coordinator panel shows one line with the fix command.
 - **The ping puts what you act on first.** A question ping is now the question, its options, the answer command, and
   only then the blocks, which take the room left and end "(full text on the card)" when cut. The room is measured in
   the bytes the phone push carries (emoji and accented text take more than one), and the question and the option

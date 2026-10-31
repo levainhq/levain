@@ -114,12 +114,13 @@ def test_doctor_warns_on_another_interpreter_and_never_runs_it(make_install, tmp
     fake = tmp_path / "fake" / "bin" / "python"
     fake.parent.mkdir(parents=True)
     marker = tmp_path / "ran.txt"
-    fake.write_text(f"#!/bin/sh\necho ran >> {marker}\n")
+    fake.write_text(f"#!/bin/sh\necho \"$@\" >> {marker}\n")
     fake.chmod(0o755)
     cj.write_text(cj.read_text().replace(json.dumps(sys.executable)[1:-1], str(fake)))
     rows = py_rows()
     assert len(rows) == 2 and all(r.ok and r.warn and "not this levain's interpreter" in r.detail for r in rows), rows
-    assert not marker.exists()  # doctor inspects a hook file; it never runs what it names
+    # doctor never runs a hook script: the only run is the band import probe (Q17-COLD), `-c import levain.band_view`
+    assert set(marker.read_text().splitlines() if marker.exists() else []) <= {"-c import levain.band_view"}
 
 
 def test_a_pack_hook_imports_a_sibling_module(tmp_path):

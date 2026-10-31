@@ -5292,18 +5292,73 @@ BAND_ROW = "levain_band MCP registered"
 BAND_HOOKS_ROW = "NEEDS YOU band hooks"
 
 
-def _check_band_hooks(install: Path, agent: str) -> CheckResult:
-    """The band's hooks (Q17-ALL D5), per install: wired, stale or absent. Advisory (a WARN, never a FAIL): a missing
-    hook loses the display of the band, never an item (`levain band` still reads it)."""
+def _band_hook_python(install: Path, agent: str, codex_home: Path | None = None) -> str | None:
+    """The interpreter the band's UserPromptSubmit hook runs for this install, read from the settings file that wires
+    it (Claude Code: the install's ``.claude/settings.json`` or ``settings.local.json``; Codex: ``hooks.json`` of
+    ``codex_home``). ``None``: no file names that hook for this install (the wiring rows say so)."""
+    if agent == "codex":
+        home = codex_home if codex_home is not None else Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        files = [home / "hooks.json"]
+    else:
+        files = [install / ".claude" / "settings.json", install / ".claude" / "settings.local.json"]
+    for f in files:
+        try:
+            tree = json.loads(f.read_text(encoding="utf-8"))
+            entries = (tree.get("hooks") or {}).get("UserPromptSubmit") or []
+            if _hook_command_targets(entries, install, "user_prompt_submit.py"):
+                return _extract_command_python(entries)
+        except (OSError, ValueError, AttributeError):
+            continue
+    return None
+
+
+_BAND_PROBE_TIMEOUT = 20.0
+
+
+def _band_import_problem(python: str) -> str | None:
+    """Why ``python`` cannot import ``levain.band_view`` (the hooks swallow a failed import, so the band is dropped
+    without a sound), else ``None``. Run from an empty directory (a checkout in the working directory never stands
+    in for an install) with the caller's environment, as a hook sees it, bounded by a timeout."""
+    import subprocess
+    import tempfile
+
+    if not _python_resolvable(python):
+        return f"{python} is not a runnable interpreter"
+    try:
+        with tempfile.TemporaryDirectory() as empty:
+            r = subprocess.run([python, "-c", "import levain.band_view"], cwd=empty, capture_output=True,
+                               text=True, timeout=_BAND_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return f"{python} did not import levain.band_view within {_BAND_PROBE_TIMEOUT:.0f}s"
+    except OSError as exc:
+        return f"{python} could not run ({type(exc).__name__}: {exc})"
+    if r.returncode != 0:
+        last = (r.stderr.strip().splitlines() or ["exit " + str(r.returncode)])[-1][:200]
+        return f"{python} cannot import levain.band_view ({last})"
+    return None
+
+
+def _check_band_hooks(install: Path, agent: str, codex_home: Path | None = None) -> CheckResult:
+    """The band's hooks (Q17-ALL D5), per install: wired, stale or absent, and the interpreter they run can import
+    ``levain.band_view``. A FAIL when the scripts are missing or stale or that import fails: the hooks swallow a
+    failed import, so a seat here would be shown no band and nothing would say so (the coordinator launch refuses on
+    this same row)."""
     from levain.band_view import band_hooks_state
 
     state, lacking = band_hooks_state(install / "activation" / "hooks", agent)
-    if state == "wired":
-        return CheckResult(BAND_HOOKS_ROW, True, "wired: SessionStart + UserPromptSubmit + Stop verifier")
-    return CheckResult(BAND_HOOKS_ROW, True,
-                       f"{state}: {', '.join(lacking)} {'does' if len(lacking) == 1 else 'do'} not call the band "
-                       "(a seat here is not shown what waits on the operator; `levain band` still lists it)",
-                       "levain update", warn=True)
+    if state != "wired":
+        return CheckResult(BAND_HOOKS_ROW, False,
+                           f"{state}: {', '.join(lacking)} {'does' if len(lacking) == 1 else 'do'} not call the band "
+                           "(a seat here is not shown what waits on the operator; `levain band` still lists it)",
+                           "levain update")
+    py = _band_hook_python(install, agent, codex_home)
+    problem = _band_import_problem(py) if py else None
+    if problem:
+        return CheckResult(BAND_HOOKS_ROW, False,
+                           f"{problem}: the band hooks run there and drop the band silently when the import fails",
+                           "levain update (from the python levain is installed in) re-resolves the interpreter")
+    return CheckResult(BAND_HOOKS_ROW, True, "wired: SessionStart + UserPromptSubmit + Stop verifier"
+                       + (f", {py} imports levain.band_view" if py else ""))
 
 
 def _check_band_server(where: str, server: object, agent: str, codex_home: Path | None = None) -> CheckResult:
@@ -5670,7 +5725,7 @@ def _check_codex(install: Path) -> list[CheckResult]:
     servers = config.get("mcp_servers")
     results.append(_check_band_server(
         "config.toml", servers.get("levain_band") if isinstance(servers, dict) else None, "codex", codex_home))
-    results.append(_check_band_hooks(install, "codex"))
+    results.append(_check_band_hooks(install, "codex", codex_home))
 
     return results
 

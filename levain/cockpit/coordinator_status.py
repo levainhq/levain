@@ -126,6 +126,49 @@ def status_rows(st: dict[str, Any], now: datetime | None = None) -> tuple[RowIn,
     return tuple(rows)
 
 
+_BAND_TTL = 60.0
+_band_cache: dict[str, tuple[float, tuple[str, str] | None]] = {}
+
+
+def _band_install(setting: dict[str, Any] | None) -> tuple[Path, str] | None:
+    """``(install whose band hooks the coordinator runs, agent)``, or ``None`` when there is no install to check."""
+    from levain.coordinator.launch import default_coordinator_dir
+
+    agent = str((setting or {}).get("agent") or "claude")
+    if agent == "codex":
+        from levain import host_guard
+        from levain.coordinator import codex_launch
+
+        work = Path((setting or {}).get("cwd") or codex_launch.default_directory())
+        owner = host_guard.codex_hooks_owner(work, codex_launch.codex_home())
+        return (Path(owner), "codex") if owner is not None else None
+    install = Path((setting or {}).get("cwd") or default_coordinator_dir())
+    return (install, "claude_code") if (install / "CLAUDE.md").is_file() else None
+
+
+def band_row(setting: dict[str, Any] | None, now: float | None = None) -> RowIn | None:
+    """One line when the coordinator's NEEDS YOU band cannot render, naming the fix command; ``None`` when it can, or
+    when there is no coordinator install yet. Doctor's own band row decides (:func:`levain.coordinator.launch.band_failure`);
+    the answer is held for a minute because the check runs the hook's interpreter."""
+    import time
+
+    from levain.cockpit.coordinator_panels import _row
+    from levain.coordinator.launch import band_failure
+
+    found = _band_install(setting)
+    if found is None:
+        return None
+    install, agent = found
+    key, t = f"{install}|{agent}", time.monotonic() if now is None else now
+    hit = _band_cache.get(key)
+    if hit is None or t - hit[0] >= _BAND_TTL:
+        hit = (t, band_failure(None, install, agent))
+        _band_cache[key] = hit
+    if hit[1] is None:
+        return None
+    return _row("band", "NEEDS YOU band cannot render", hit[1][0], f" · fix: {hit[1][1]}")
+
+
 def status_reader(directory: Callable[[], Path | str | None], clock: Callable[[], datetime] | None = None,
                   ) -> Callable[[ReadContext], Result]:
     """The panel's read callable: a store that cannot be read is its error row, never a raise."""
@@ -141,7 +184,14 @@ def status_reader(directory: Callable[[], Path | str | None], clock: Callable[[]
             if store is None:
                 return Read(rows=())
             try:
-                rows = status_rows(_read_status(store, now), now)
+                st = _read_status(store, now)
+                rows = status_rows(st, now)
+                try:
+                    band = band_row(st.get("setting"))
+                except Exception:       # the line is a courtesy: never the reason the panel does not draw
+                    band = None
+                if band is not None:
+                    rows = rows[:1] + (band,) + rows[1:]
             except StoreAbsent:
                 # gone between the probe and the read: the same read as no store. A file that is still there and was
                 # refused (a schema that is not current) is a store that cannot be read: its error row, not the empty read

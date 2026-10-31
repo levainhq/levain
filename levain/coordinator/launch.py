@@ -189,6 +189,33 @@ def _user_settings_files() -> set[Path]:
     return {(d / "settings.json").resolve() for d in dirs}
 
 
+def band_failure(rows: list | None, directory: Path, agent: str) -> tuple[str, str] | None:
+    """``(what is wrong, the command that fixes it)`` when a coordinator in ``directory`` could not show the NEEDS YOU
+    band, else ``None``: doctor's own ``NEEDS YOU band hooks`` row (taken from ``rows`` when the check ran it, else
+    run here; never a second checker) failing."""
+    from levain import doctor
+
+    row = next((r for r in rows or () if r.name == doctor.BAND_HOOKS_ROW), None)
+    if row is None:
+        try:
+            row = doctor._check_band_hooks(Path(directory), agent)
+        except Exception as exc:  # noqa: BLE001 - a check that cannot run is a refusal, never a pass
+            return (f"{doctor.BAND_HOOKS_ROW}: not checked ({type(exc).__name__}: {str(exc)[:200]})",
+                    f"levain doctor --path {directory}")
+    if row.ok:
+        return None
+    fix = f"levain update --path {directory}" if (row.hint or "").startswith("levain update") else "levain doctor"
+    return f"{row.name}: {row.detail}", fix
+
+
+def band_problem(rows: list | None, directory: Path, agent: str) -> str | None:
+    """:func:`band_failure` as the refusal text: a coordinator that cannot render the band is not started."""
+    bad = band_failure(rows, directory, agent)
+    if bad is None:
+        return None
+    return f"{bad[0]}; the coordinator would show no NEEDS YOU band. Fix: `{bad[1]}`"
+
+
 def hook_live(directory: Path, *, user_scope: bool) -> tuple[bool, str]:
     """Doctor's own Claude Code check of ``directory`` (never a re-derivation): ``(True, detail)`` when its
     ``Claude Code consent hook`` row reads "wired to this install" AND no ``Claude Code hooks`` row of the same check
@@ -223,6 +250,9 @@ def hook_live(directory: Path, *, user_scope: bool) -> tuple[bool, str]:
                 return False, f"{HOOK_ROW}: {row.detail}"
             if off is not None:
                 return False, f"{HOOK_ROW}: {row.detail}, but {_HOOKS_ROW}: {off.detail}"
+            band = band_problem(rows, Path(directory), "claude_code")
+            if band is not None:
+                return False, band
             return True, row.detail + note
     failed = next((r for r in rows if not r.ok), None)
     why = f"{failed.name}: {failed.detail}" if failed is not None else "doctor reports no consent hook row"

@@ -203,6 +203,11 @@ def hook_live(directory: Path) -> tuple[bool, str]:
         return False, f"{CONSENT_ROW}: {consent.detail}"
     if not gate.ok or not gate.detail.startswith(_GATE_TRUSTED):
         return False, f"{GATE_ROW}: {gate.detail}"
+    from levain.coordinator.launch import band_problem
+
+    band = band_problem(rows, Path(directory), "codex")
+    if band is not None:
+        return False, band
     return True, consent.detail
 
 
