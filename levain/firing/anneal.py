@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from levain.agents.role import ROLE_NAME
+from levain.agents.spec import AGENT_ID
 from levain.firing.contract import CaptureRequest, InjectRequest, register_firing, select_directive
 from levain.firing.encoding import RECEIPT_KEY as _ENCODING_RECEIPT_KEY
 from levain.firing.binding import LEVAIN_ENTITY_PROCESS_ENV, entity_process_latched
@@ -58,7 +60,11 @@ IDENTITY_AGENT_KEY = "agent"
 IDENTITY_ROLE_KEY = "role"
 IDENTITY_RUN_KEY = "run"
 IDENTITY_KEYS = (IDENTITY_AGENT_KEY, IDENTITY_ROLE_KEY, IDENTITY_RUN_KEY)
-_IDENT_AGENT = re.compile(r"ag-[0-9a-f]{32}|@spawn/[a-z][a-z0-9-]{0,47}")
+# The agent-id and spawn-name shapes are owned by the agent registry; a second copy here would drift from the
+# one recall and the registry validate against.
+_IDENT_AGENT_ID = AGENT_ID
+_IDENT_SPAWN_NAME = ROLE_NAME
+_SPAWN_PREFIX = "@spawn/"
 _IDENT_ROLE = re.compile(r"[0-9a-f]{64}")
 _IDENT_RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
@@ -67,7 +73,10 @@ def episode_identity(agent: str, run: str, role: str | None = None) -> dict[str,
     """The metadata stamp for one agent's episode: ``agent`` (an ``ag-<32 hex>`` id or ``@spawn/<role>``),
     ``run`` (the occurrence or launch id) and, when the agent runs a role, ``role`` (its 64-hex hash).
     Raises ``ValueError`` on a malformed field: a stamp recall cannot match is data loss in waiting."""
-    if not isinstance(agent, str) or not _IDENT_AGENT.fullmatch(agent):
+    if not isinstance(agent, str) or not (
+        _IDENT_AGENT_ID.fullmatch(agent)
+        or (agent.startswith(_SPAWN_PREFIX) and _IDENT_SPAWN_NAME.fullmatch(agent[len(_SPAWN_PREFIX):]))
+    ):
         raise ValueError("agent must be ag-<32 hex> or @spawn/<role name>")
     if not isinstance(run, str) or not _IDENT_RUN.fullmatch(run):
         raise ValueError("run must be 1-128 characters of [A-Za-z0-9._:-], starting alphanumeric")
@@ -245,8 +254,10 @@ class AnnealFiring:
     ) -> None:
         self.constitution = constitution
         # The identity is validated now and re-stamped over whatever metadata a capture carries, so a caller
-        # cannot write an episode as another agent. Not serialized across a fork (the child rebuilds
-        # defaults), the same limit the constitution has.
+        # cannot write an episode as another agent. It rides the condenser's serialized data (beside the kind),
+        # so a fork or reload rebuilds a firing that stamps exactly as the original did.
+        if identity is not None and not isinstance(identity, dict):
+            raise ValueError("identity must be a dict of agent/run/role")
         self._identity = (
             episode_identity(identity.get(IDENTITY_AGENT_KEY), identity.get(IDENTITY_RUN_KEY),
                              identity.get(IDENTITY_ROLE_KEY))
@@ -354,9 +365,11 @@ class AnnealFiring:
             # wraps table), so persist the adapter's session id as metadata provenance instead of
             # dropping it silently.
             meta = dict(req.metadata or {})
+            # Only a stamped firing may write the reserved keys: the firing's stamp wins, and an unstamped
+            # firing writes none, so a caller's claim to be some agent is never passed through to the store.
+            for key in IDENTITY_KEYS:
+                meta.pop(key, None)
             if self._identity is not None:
-                for key in IDENTITY_KEYS:  # the firing's stamp wins; a stale key from the caller is dropped
-                    meta.pop(key, None)
                 meta.update(self._identity)
             if req.session_id:
                 meta.setdefault("vagus_session_id", req.session_id)
@@ -435,5 +448,5 @@ class AnnealEntityFiring(AnnealFiring):
         return self._entity_paths()[1]
 
 
-register_firing("anneal", AnnealFiring)
-register_firing("anneal_entity", AnnealEntityFiring, takes_entity=True)
+register_firing("anneal", AnnealFiring, takes_identity=True)
+register_firing("anneal_entity", AnnealEntityFiring, takes_entity=True, takes_identity=True)

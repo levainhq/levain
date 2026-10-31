@@ -8,13 +8,20 @@ Recall is three steps, in this order, and the order is the point:
 
 Capping before filtering is the failure this shape exists to refuse: a quiet agent's few episodes would be
 pushed out of a fixed-size page by a busy neighbour's, and recall would report an empty memory that is not
-empty. The time read therefore pages through the whole window, bounded by ``max_scan`` rows; if the bound is
-hit the result says so (``truncated``) instead of passing a partial read off as complete.
+empty. The time read is ONE call to the store, bounded by ``max_scan`` rows and by both ends of the window, so
+it is a single read snapshot: paging by offset over a store other agents are writing to duplicates or skips
+rows. If the bound is hit the result says so (``truncated``) instead of passing a partial read off as complete.
+
+The window is a string-order bound on the stored timestamps, not an exact instant. Superseded episodes are not
+returned: anneal hides what a newer episode replaced, and "what the agent currently knows" is the question
+recall answers.
 
 No anneal schema change: the identity rides in episode metadata (see ``levain.firing.anneal``).
 """
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,17 +32,35 @@ from levain.firing.anneal import IDENTITY_AGENT_KEY, episode_identity
 DEFAULT_WINDOW_DAYS = 30
 DEFAULT_LIMIT = 20
 DEFAULT_MAX_SCAN = 50_000
-_PAGE = 500
+_STAMP = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 
 @dataclass(frozen=True)
 class AgentRecall:
-    """What recall found. ``scanned`` is the rows the time read covered; ``truncated`` is True when
-    ``max_scan`` stopped the read before the window was exhausted, so an absence is not proof of absence."""
+    """What recall found. ``scanned`` is the rows the time read covered. ``truncated`` is True when
+    ``max_scan`` stopped the read before the window was exhausted AND fewer than ``limit`` matches were found,
+    so an absence (or a short answer) is not proof. ``unreadable`` counts the rows whose metadata could not be
+    read as a mapping: they are counted, never silently dropped."""
 
     episodes: tuple[Any, ...]
     scanned: int
     truncated: bool
+    unreadable: int = 0
+
+
+def _metadata_of(ep: Any) -> Mapping | None:
+    """The episode's metadata as a mapping, ``None`` if it has none, ``ValueError`` if it cannot be read."""
+    meta = ep.metadata
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            raise ValueError("metadata is not JSON") from None
+    if meta is None:
+        return None
+    if not isinstance(meta, Mapping):
+        raise ValueError("metadata is not a mapping")
+    return meta
 
 
 def recall_agent_episodes(
@@ -47,33 +72,33 @@ def recall_agent_episodes(
     max_scan: int = DEFAULT_MAX_SCAN,
     now: datetime | None = None,
 ) -> AgentRecall:
-    """Recall ``agent``'s episodes from an open anneal ``Store`` (read-only is enough)."""
+    """Recall ``agent``'s episodes from an open anneal ``Store`` (read-only is enough). ``now`` must be
+    timezone-aware (any zone; it is converted to UTC): a naive one is refused, not guessed at."""
     episode_identity(agent, "x")  # validates the agent id's shape; the run is a placeholder
-    if window_days < 1 or limit < 1 or max_scan < 1:
-        raise ValueError("window_days, limit and max_scan must each be at least 1")
-    end = now or datetime.now(timezone.utc)
-    since = (end - timedelta(days=window_days)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    if (not isinstance(window_days, int) or isinstance(window_days, bool) or window_days < 1
+            or limit < 1 or max_scan < 1):
+        raise ValueError("window_days, limit and max_scan must each be an integer of at least 1")
+    end = now if now is not None else datetime.now(timezone.utc)
+    if not isinstance(end, datetime) or end.tzinfo is None:
+        raise ValueError("now must be a timezone-aware datetime")
+    end = end.astimezone(timezone.utc)
+    since = (end - timedelta(days=window_days)).strftime(_STAMP)
+    until = end.strftime(_STAMP)
+    res = store.recall(since=since, until=until, limit=max_scan)
+    rows = res.episodes
     kept: list[Any] = []
-    scanned = 0
-    truncated = False
-    offset = 0
-    while True:
-        page_size = min(_PAGE, max_scan - scanned)
-        res = store.recall(since=since, limit=page_size, offset=offset)
-        rows = res.episodes
-        scanned += len(rows)
-        offset += len(rows)
-        for ep in rows:
-            meta = ep.metadata
-            if isinstance(meta, dict) and meta.get(IDENTITY_AGENT_KEY) == agent:
-                kept.append(ep)
-        if offset >= res.total_matching or not rows:
-            break
-        if scanned >= max_scan:
-            truncated = True
-            break
-    # store.recall is newest-first, so the head of ``kept`` is the newest.
-    return AgentRecall(episodes=tuple(kept[:limit]), scanned=scanned, truncated=truncated)
+    unreadable = 0
+    for ep in rows:  # newest first, as the store returns them
+        try:
+            meta = _metadata_of(ep)
+        except ValueError:
+            unreadable += 1
+            continue
+        if meta is not None and meta.get(IDENTITY_AGENT_KEY) == agent:
+            kept.append(ep)
+    truncated = res.total_matching > len(rows) and len(kept) < limit
+    return AgentRecall(episodes=tuple(kept[:limit]), scanned=len(rows), truncated=truncated,
+                       unreadable=unreadable)
 
 
 def recall_agent_episodes_at(episodic_path: Path, agent: str, **kwargs: Any) -> AgentRecall:

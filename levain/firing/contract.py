@@ -175,14 +175,23 @@ _FIRING_REGISTRY: dict[str, Callable[..., FiringContract]] = {}
 # handed no entity, so a zero-arg factory (the stub, a third party's) keeps working when the
 # condenser that rebuilds it carries one.
 _ENTITY_FIRING_KINDS: set[str] = set()
+# Kinds whose factory takes ``identity`` (the episode stamp). Asking any other kind to carry one is refused:
+# a stamp the rebuilt firing silently dropped would write episodes no agent's recall can find.
+_IDENTITY_FIRING_KINDS: set[str] = set()
 
 
 def register_firing(
-    kind: str, factory: Callable[..., FiringContract], *, takes_entity: bool = False
+    kind: str, factory: Callable[..., FiringContract], *, takes_entity: bool = False,
+    takes_identity: bool = False,
 ) -> None:
     """Register a ``FiringContract`` factory under a serializable ``kind``. ``takes_entity``: the
-    factory accepts ``entity_dir`` (an isolated per-entity firing)."""
+    factory accepts ``entity_dir`` (an isolated per-entity firing). ``takes_identity``: it accepts
+    ``identity`` (the per-agent episode stamp)."""
     _FIRING_REGISTRY[kind] = factory
+    if takes_identity:
+        _IDENTITY_FIRING_KINDS.add(kind)
+    else:
+        _IDENTITY_FIRING_KINDS.discard(kind)
     if takes_entity:
         _ENTITY_FIRING_KINDS.add(kind)
     else:
@@ -203,7 +212,9 @@ _LAZY_FIRING_MODULES: dict[str, str] = {
 }
 
 
-def build_firing(kind: str, *, entity_dir: str | None = None) -> FiringContract:
+def build_firing(
+    kind: str, *, entity_dir: str | None = None, identity: dict[str, str] | None = None
+) -> FiringContract:
     """Rebuild a ``FiringContract`` from its registered kind (used on fork / reload).
 
     ``entity_dir`` is the per-conversation entity an isolated kind serves (spore-438). It travels as
@@ -212,6 +223,9 @@ def build_firing(kind: str, *, entity_dir: str | None = None) -> FiringContract:
     whatever the process-global channel last said. It reaches only a kind registered with
     ``takes_entity=True``; any other kind serves no entity and is built zero-arg. ``None`` keeps the
     zero-argument rebuild.
+
+    ``identity`` is the per-agent episode stamp. Like ``entity_dir`` it travels as serialized data on the
+    condenser, so a rebuilt firing stamps exactly as the original did; a kind that cannot carry one refuses it.
 
     A kind may live in an OPTIONAL leaf that self-registers on import (e.g. the anneal leaf
     ``vagus.firing.anneal``). If ``kind`` isn't registered yet but is a BLESSED leaf
@@ -232,9 +246,14 @@ def build_firing(kind: str, *, entity_dir: str | None = None) -> FiringContract:
         raise ValueError(
             f"unknown firing kind {kind!r}; registered: {sorted(_FIRING_REGISTRY)}"
         )
-    if entity_dir is None or kind not in _ENTITY_FIRING_KINDS:
-        return factory()
-    return factory(entity_dir=entity_dir)
+    kwargs: dict[str, object] = {}
+    if entity_dir is not None and kind in _ENTITY_FIRING_KINDS:
+        kwargs["entity_dir"] = entity_dir
+    if identity is not None:
+        if kind not in _IDENTITY_FIRING_KINDS:
+            raise ValueError(f"firing kind {kind!r} cannot carry an episode identity")
+        kwargs["identity"] = identity
+    return factory(**kwargs)
 
 
 # --- Slice 1 STUB implementation ----------------------------------------------------
