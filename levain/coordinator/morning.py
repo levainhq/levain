@@ -187,7 +187,9 @@ def _presence(qdir: Path) -> dict[str, Any] | None:
         return None
     out: dict[str, Any] = {"word": None, "by": None, "said": None, "at": None, "agent_rows": len(recent), "refused": refused}
     if setter is not None:
-        out.update(word=setter["word"], by=setter["by"], said=setter["said"], at=setter["ts"])
+        # ``verified`` is True only when the quote was found in what he wrote; a record with no ``verified`` reads as not
+        out.update(word=setter["word"], by=setter["by"], said=setter["said"], at=setter["ts"],
+                   verified=setter.get("verified") is True)
     return out
 
 
@@ -268,7 +270,8 @@ def render(c: dict[str, Any]) -> str:
 
         what = "no word of an agent's stands" if pr["word"] is None else (
             f"`{pr['word']}` set by {'the coordinator ' if pr['by']['role'] == 'coordinator' else ''}"
-            f"{pr['by']['agent']} {pr['by']['session']} at {time.strftime('%H:%M', time.localtime(pr['at']))} from your words: {pr['said']}")
+            f"{pr['by']['agent']} {pr['by']['session']} at {time.strftime('%H:%M', time.localtime(pr['at']))} from your words: {pr['said']}"
+            f"{'' if pr.get('verified') is True else ' (unverified)'}")
         L.append(f"presence: {what}; {pr['agent_rows']} agent write(s) in 24 h, {pr['refused']} refused (levain ping log)")
     away = [a for a, s in c["away"].items() if s.get("away")]
     unknown = [a for a, s in c["away"].items() if s.get("away") is None]

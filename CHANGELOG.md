@@ -55,6 +55,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   still refuses. Covered by tests of the spawn argv and the setting.
 
 ### Fixed
+- **The morning card marks a presence word whose quote was not verified.** `_presence` dropped the `verified` flag the
+  quote check puts on every word an agent sets, so the card showed an agent's word as if it were the operator's. The
+  card's presence block now carries `verified` (true only when the quote was found in what he wrote; a record from before
+  the check reads as not verified), and `levain coord morning` appends `(unverified)` after the quote, as `levain ping
+  status` does. No setter: the block is unchanged.
 - **The coordinator's verbs take their text without shell quoting.** Shadow 10-30: two of three real coordinators
   misfired on their own shell lines (flags kept in a variable that zsh does not split, then a `coord release` run in the
   same batch as the writes, which ended the lease under them). `drops note`, `coord escalate`, `coord answer`, `thread
