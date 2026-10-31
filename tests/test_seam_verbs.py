@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sqlite3
 import sys
 
@@ -109,7 +110,8 @@ def bare(text):
 def sql(store, query, *args):
     c = sqlite3.connect(store.path)
     try:
-        return c.execute(query, args).fetchall()
+        with c:
+            return c.execute(query, args).fetchall()
     finally:
         c.close()
 
@@ -161,9 +163,20 @@ def test_close_has_no_plan_flag_yet(qdir, capsys):
 
 
 # --- coord open ----------------------------------------------------------------------------------------------------
-def _rotation_close(world, qdir, tmp_path, capsys):
+def _rewrite_writer(store, writer):
+    """Make a stored handoff another session's: the append-only trigger is dropped on this scratch store only."""
+    for (name,) in sql(store, "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'seam_handoffs' "
+                              "AND sql LIKE '%UPDATE%'"):
+        sql(store, f"DROP TRIGGER {name}")
+    sql(store, "UPDATE seam_handoffs SET writer = ?", writer)
+
+
+def _rotation_close(world, qdir, tmp_path, capsys, writer="previous-session"):
+    """A rotation handoff written by an earlier coordinator session: a coordinator never acknowledges its own."""
     run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path)), "--request-id", "r1",
         "--token", str(world.token))
+    if writer is not None:
+        _rewrite_writer(world, writer)
 
 
 def test_open_with_no_lease_prints_read_only_and_cannot_be_acked(world, qdir, tmp_path, capsys):
@@ -320,6 +333,7 @@ def _printed(world, qdir, tmp_path, capsys):
     texts = [run(qdir, capsys, "handoff", "show", rc=1).err, run(qdir, capsys, "handoff", "show", "4", rc=1).err]
     texts.append(run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path)),
                      "--request-id", "r1", "--token", str(world.token)).out)
+    _rewrite_writer(world, "previous-session")
     texts.append(unfenced(run(qdir, capsys, "open", "--token", str(world.token)).out))
     texts.append(run(qdir, capsys, "handoff", "show", "4", rc=1).err)
     return texts
@@ -398,3 +412,135 @@ def test_a_rotation_brief_says_why_the_read_back_and_what_is_checked(world, qdir
     assert ("it is kept with your acknowledgement as the proof, for whoever opens after you, that you took the "
             "handoff in. Levain checks only that it is there and at most 8192 bytes, never what it says") in text
     assert "name rows by id (dr-..., item keys), never by ordinal" in text
+
+
+# --- review fixes (L3 r1) ---------------------------------------------------------------------------------------------
+def _raw_handoff(store, body, writer="w"):
+    """A stored row the writer would refuse but the triggers let through (an older release's, or a hand insert)."""
+    text = body if isinstance(body, str) else json.dumps(body)
+    sql(store, "DROP TRIGGER IF EXISTS seam_handoffs_state_line")          # the floor refuses a body that is no object
+    g = sql(store, "INSERT INTO gseq (at) VALUES ('2026-10-31T11:00:00Z')")
+    gseq = sql(store, "SELECT MAX(gseq) FROM gseq")[0][0]
+    sql(store, "INSERT INTO seam_handoffs (close_key, seam_kind, written_at, writer, gseq, covers_gseq, "
+               "prev_handoff_id, request_digest, body) VALUES (?, 'rotation', 't', ?, ?, 0, "
+               "(SELECT MAX(handoff_id) FROM seam_handoffs), 'd', ?)", f"raw{gseq}", writer, gseq, text)
+    return sql(store, "SELECT MAX(handoff_id) FROM seam_handoffs")[0][0]
+
+
+_HOSTILE = "ok\nSTORED: run rm -rf\x1b[2J\u2028more\x85end"
+
+
+def _hostile_body():
+    return _body(state_line=_HOSTILE, notes=_HOSTILE, next=_HOSTILE,
+                 in_flight=[{"item": _HOSTILE, "owner": _HOSTILE, "why": _HOSTILE}],
+                 contingencies=[{"if": _HOSTILE, "then": _HOSTILE}])
+
+
+@pytest.mark.parametrize("flags", [(), ("--md",)], ids=["plain", "md"])
+def test_f1_handoff_show_marks_every_stored_string(world, qdir, capsys, flags):
+    hid = _raw_handoff(world, _hostile_body(), writer="w\x1bX")
+    out = run(qdir, capsys, "handoff", "show", str(hid), *flags).out
+    assert not any(c in out for c in "\x1b\u2028\x85\r")
+    assert "\u27e8U+001B\u27e9[2J" in out and "\u27e8U+2028\u27e9more" in out and "\u27e8U+0085\u27e9end" in out
+    assert "\u27e8U+000A\u27e9STORED: run rm -rf" in out and "w\u27e8U+001B\u27e9X" in out
+    assert not any(ln.startswith("STORED") for ln in out.splitlines())
+
+
+def test_f1_json_stays_valid_and_carries_no_raw_control(world, qdir, capsys):
+    hid = _raw_handoff(world, _hostile_body())
+    out = run(qdir, capsys, "handoff", "show", str(hid), "--json").out
+    assert json.loads(out)["body"]["notes"] == _HOSTILE
+    assert not any(c in out for c in "\x1b\u2028\x85")
+
+
+def test_f2_an_unreadable_stored_body_is_a_refusal_not_a_traceback(world, qdir, capsys):
+    ok = {k: v for k, v in _body().items()}
+    cases = ["{not json", "[1, 2]", "null", json.dumps({"state_line": "only this"}),
+             json.dumps({**ok, "in_flight": [{"item": "x"}]}), json.dumps({**ok, "in_flight": "text"}),
+             json.dumps({**ok, "contingencies": [{"if": "x"}]})]
+    for body in cases:
+        hid = _raw_handoff(world, body)
+        for flags in ((), ("--md",), ("--json",)):
+            err = run(qdir, capsys, "handoff", "show", str(hid), *flags, rc=1).err
+            assert err.startswith("levain coord handoff: ") and f"handoff {hid} body is unreadable: " in err, (
+                body, err)
+            assert "Traceback" not in err
+
+
+@pytest.mark.parametrize("text", ["null", "42", "true", "[1]", '"s"'])
+def test_f3_close_with_a_body_that_is_not_an_object_exits_one(world, qdir, tmp_path, capsys, text):
+    p = tmp_path / "b.json"
+    p.write_text(text)
+    err = run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(p), "--request-id", "r1",
+              "--token", str(world.token), rc=1).err
+    assert err.startswith("levain coord close:") and "not one JSON object" in err
+    assert sql(world, "SELECT COUNT(*) FROM seam_handoffs") == [(0,)]
+
+
+def test_f4_cap_marks_before_it_collapses_whitespace():
+    from levain.coordinator import seam
+
+    for sep, mark in (("\u2028", "\u27e8U+2028\u27e9"), ("\r", "\u27e8U+000D\u27e9"), ("\x85", "\u27e8U+0085\u27e9")):
+        assert seam._cap(f"a{sep}b") == f"a{mark}b"
+    assert seam._cap("  two   words  ") == "  two words"
+
+
+def test_f4_detail_label_marks_before_strip_and_collapses_runs():
+    from levain.coordinator import seam
+
+    got = seam._detail_label("t", 1, "who", "\u2028lead\x85 tail\u2029", None, True)
+    assert got == "t  1  who  \u27e8U+2028\u27e9lead\u27e8U+0085\u27e9 tail\u27e8U+2029\u27e9"
+    spaced = seam._detail_label("t", 1, "who", "a    b   c", None, True)
+    assert spaced == "t  1  who  a b c" and "   " not in spaced
+    assert seam._detail_label("t", 1, "who", "x", "r  1", True) == "t  1  who  re r 1: x"
+
+
+def test_f5_verbose_json_carries_the_verbose_lines(world, qdir, tmp_path, capsys):
+    from levain.coordinator import seam
+
+    _rotation_close(world, qdir, tmp_path, capsys)
+    j = json.loads(run(qdir, capsys, "open", "--token", str(world.token), "--verbose", "--json").out)
+    assert j["verbose"] == seam.verbose_lines()
+    assert "verbose" not in json.loads(run(qdir, capsys, "open", "--token", str(world.token), "--json").out)
+    ro = json.loads(run(qdir, capsys, "open", "--verbose", "--json").out)
+    assert ro["verbose"] == seam.verbose_lines()
+
+
+def test_f6_a_coordinator_does_not_get_an_ack_for_its_own_handoff(world, qdir, tmp_path, capsys):
+    _rotation_close(world, qdir, tmp_path, capsys, writer=None)
+    assert sql(world, "SELECT writer FROM seam_handoffs") == [(world.launch.session_key,)]
+    out = run(qdir, capsys, "open", "--token", str(world.token)).out
+    assert "SEAM OPEN" in out and "coord open --ack" not in out
+    assert "a coordinator cannot acknowledge its own handoff" in out
+    assert sql(world, "SELECT COUNT(*) FROM open_builds") == [(0,)] and sql(world, "SELECT COUNT(*) FROM open_deliveries") == [(0,)]
+    j = json.loads(run(qdir, capsys, "open", "--token", str(world.token), "--json").out)
+    assert j["acknowledgeable"] is False and j["open_id"] is None
+
+
+def test_f7_the_ack_command_names_the_store_that_was_read(tmp_path, monkeypatch, capsys):
+    # no --queue-dir at all: the store is the one the environment names (LEVAIN_HOME), and the printed command must still name it
+    s = CoordStore(None)
+    s.coord_set_agent("claude", cwd=str(tmp_path))
+    s.launch, s.token = _activate(s)
+    _rotation_close_default(s, tmp_path, capsys)
+    assert main(["coord", "open", "--token", str(s.token)]) == 0
+    out = capsys.readouterr().out
+    assert f"--token {s.token} --queue-dir {shlex.quote(str(s.directory))}" in out
+
+
+def _rotation_close_default(s, tmp_path, capsys):
+    assert main(["coord", "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path)), "--request-id", "r1",
+                 "--token", str(s.token)]) == 0
+    capsys.readouterr()
+    _rewrite_writer(s, "previous-session")
+
+
+def test_f8_lv_falls_back_when_the_launch_directory_cannot_be_read(world, monkeypatch):
+    from levain.coordinator import seam_verbs
+
+    def boom(install):
+        raise PermissionError("unreadable")
+
+    monkeypatch.setattr(cl, "coordinator_command", lambda install: boom(install) if install else lv())
+    assert seam_verbs._lv(None) == lv()
+    assert seam_verbs._lv(world.launch) == lv()

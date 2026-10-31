@@ -98,8 +98,9 @@ class Brief:
 
 
 def _cap(line: str, n: int = _LINE) -> str:
-    text = str(line)
-    indent = text[: len(text) - len(text.lstrip())] if "\n" not in text else ""
+    raw = str(line)
+    text = _clean(raw)                   # marked first: a stored U+2028, CR or NEL must not vanish into a space below
+    indent = text[: len(text) - len(text.lstrip())] if "\n" not in raw else ""
     text = indent + " ".join(text.split())
     return text if len(text) <= n else text[: n - 1] + "…"
 
@@ -111,6 +112,12 @@ def _clean(text: str) -> str:
     and Unicode line or paragraph separator with them: one stored field can never become two lines of the brief, so
     no stored text can start a line of its own."""
     return unshowable.mark(text, allow="")
+
+
+def _clean_keep_newlines(text: str) -> str:
+    """:func:`_clean` that leaves the newline (the one character a label is cut at); every other unshowable character,
+    U+2028, CR and NEL included, is marked before any split or strip can turn it into a space."""
+    return unshowable.mark(text, allow="\n")
 
 
 def _age(now: datetime, stamp: str) -> str:
@@ -401,13 +408,14 @@ def _detail_label(tag: str, row_id: Any, who: Any, text: Any, ref: Any, named: b
     hidden separator shows as its mark rather than ending the label silently."""
     if not named:
         return tag
-    first = next((ln for ln in str(text or "").split("\n") if ln.strip()), "")
-    label = _clean(first.strip())
+    first = next((ln for ln in _clean_keep_newlines(str(text or "")).split("\n") if ln.strip()), "")
+    label = " ".join(first.split())          # runs of whitespace collapse: the two-space column separator stays unique
     if ref is not None:
-        label = f"re {_clean(str(ref))}" + (f": {label}" if label else "")
+        label = f"re {' '.join(_clean(str(ref)).split())}" + (f": {label}" if label else "")
     if len(label) > _LABEL:
         label = label[: _LABEL - 1] + "…"
-    fields = [tag, _clean(str(row_id)) if row_id is not None else "-", _clean(str(who)) if who is not None else "-"]
+    fields = [tag, " ".join(_clean(str(row_id)).split()) if row_id is not None else "-",
+              " ".join(_clean(str(who)).split()) if who is not None else "-"]
     return "  ".join([*fields, label] if label else fields)
 
 

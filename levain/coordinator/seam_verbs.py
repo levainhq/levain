@@ -15,6 +15,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from levain import unshowable
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.coordinator import lease as _leases
 from levain.coordinator import seam_handoffs, seam_open
@@ -38,7 +39,13 @@ def _once(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _emit(out: Any, as_json: bool, obj: Any, text: str) -> None:
-    out.write((json.dumps(obj, ensure_ascii=False, indent=2) if as_json else text) + "\n")
+    if as_json:
+        # ensure_ascii=False keeps text readable, but U+2028, U+2029 and NEL are line breaks to a terminal and a
+        # reader of the stream: written as escapes they stay inside their JSON strings
+        text = json.dumps(obj, ensure_ascii=False, indent=2)
+        for ch in ("\u2028", "\u2029", "\x85"):
+            text = text.replace(ch, f"\\u{ord(ch):04x}")
+    out.write(text + "\n")
 
 
 def open_kind(store: Any) -> str:
@@ -53,11 +60,9 @@ def _lv(launch: Any) -> str:
     the directory this runs in (a coordinator's session runs its commands from its own install)."""
     from levain.coordinator.launch import coordinator_command
 
-    if launch is not None:
-        return coordinator_command(launch.cwd)
     try:
-        return coordinator_command(Path.cwd())
-    except OSError:                  # a directory removed under the process: no install to read the rule from
+        return coordinator_command(Path.cwd() if launch is None else launch.cwd)
+    except OSError:                  # a directory removed or unreadable: no install to read the rule from
         return coordinator_command(None)
 
 
@@ -68,8 +73,10 @@ def _fenced(body: str) -> str:
     return f"~~~ OPEN {fence}\n{body}\n~~~ END OPEN {fence}"
 
 
-def _tail(args: argparse.Namespace) -> str:
-    return f" --queue-dir {shlex.quote(str(args.queue_dir.expanduser()))}" if args.queue_dir is not None else ""
+def _tail(store: Any) -> str:
+    """The store this read used, spelled as the launch brief spells it: from the store's own directory, so a queue
+    directory that came from the environment names the store the ack will run against."""
+    return f" --queue-dir {shlex.quote(str(store.directory))}"
 
 
 def _prev_line(handoff: Any) -> str:
@@ -87,6 +94,9 @@ def run_close(args: argparse.Namespace, out: Any, store: Any) -> int:
     except ValueError as exc:
         raise CoordError(f"the handoff body {args.body_file} is not one JSON object with each key once "
                          f"({str(exc)[:120]}); write it with keys {', '.join(seam_handoffs.BODY_KEYS)}") from None
+    if not isinstance(body, dict):
+        raise CoordError(f"the handoff body {args.body_file} is not one JSON object with each key once (it is "
+                         f"JSON {type(body).__name__}); write it with keys {', '.join(seam_handoffs.BODY_KEYS)}")
     h = seam_handoffs.close(store, kind=args.kind, body=body, request_id=args.request_id,
                             prev_handoff_id=args.prev_handoff_id, token=args.token)
     lv = _lv(_active(store, args.token)[0])
@@ -142,26 +152,31 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
     if args.read_back_file is not None:
         raise CoordError("--read-back-file goes with --ack OPEN_ID: it is the read-back an acknowledgement carries")
     launch, why = _active(store, args.token)
-    tail = _tail(args)
+    tail = _tail(store)
     handoff = seam_handoffs.latest(store)
     built = None
     note = ""
     if launch is not None:
         built = _own_launch_build(store, launch)
-        if built is None and handoff is not None and handoff.seam_kind == "rotation":
+        if built is None and handoff is not None and handoff.writer == launch.session_key:
+            note = (f"a coordinator cannot acknowledge its own handoff (this launch wrote handoff {handoff.handoff_id}): "
+                    "printed read-only; the coordinator after you opens it")
+        elif built is None and handoff is not None and handoff.seam_kind == "rotation":
             built = build(store, kind="rotation", signal_kind="rotation", signal_key=str(handoff.handoff_id),
                           queue_dir=args.queue_dir, token=args.token)
-        if built is None:
+        if built is None and not note:
             note = ("no open is built for this launch and the latest handoff is "
                     f"{'absent' if handoff is None else handoff.seam_kind + ' (its builder is a later slice)'}: "
                     "printed read-only, so it cannot be acknowledged")
     else:
         note = f"printed read-only and cannot be acknowledged ({why})"
-    extra = "".join(f"\n{ln}" for ln in verbose_lines()) if getattr(args, "verbose", False) else ""
+    verbose = verbose_lines() if getattr(args, "verbose", False) else None
+    extra = "".join(f"\n{ln}" for ln in verbose or ())
+    more_json = {} if verbose is None else {"verbose": verbose}
     if built is None:
         text, brief = _readonly_text(store, args)
         _emit(out, args.json, {"open_id": None, "acknowledgeable": False, "why": note, "body": text,
-                               "prev_handoff_id": None if handoff is None else handoff.handoff_id},
+                               "prev_handoff_id": None if handoff is None else handoff.handoff_id, **more_json},
               f"{_fenced(text)}{extra}\n\n--\n{note}\n{_prev_line(handoff)}")
         if args.token is not None and launch is None:
             # the operator's plain read (no --token) is not a refusal; a token given and not honoured is one
@@ -174,7 +189,8 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
     more = ("; PATH holds your restatement of the handoff in your own words (required on a "
             f"{built.seam_kind} open)") if needs else ""
     _emit(out, args.json, {"open_id": built.open_id, "kind": built.seam_kind, "acknowledgeable": True, "body": built.body,
-                           "ack": ack, "prev_handoff_id": None if handoff is None else handoff.handoff_id},
+                           "ack": ack, "prev_handoff_id": None if handoff is None else handoff.handoff_id,
+                           **more_json},
           f"{_fenced(built.body)}{extra}\n\n--\nopen {built.open_id} ({built.seam_kind}), built {built.built_at}; it "
           "is the open stored for you, so running coord open again prints it unchanged\n"
           f"acknowledge it, which moves the Since window past what it showed: {ack}{more}\n{_prev_line(handoff)}")
@@ -202,6 +218,30 @@ def _ack(args: argparse.Namespace, out: Any, store: Any) -> int:
            f"open {open_id} was already acknowledged by {session}; nothing changed (the window starts after gseq "
            f"{cursor})"))
     return 0
+
+
+def _marked(value: Any) -> Any:
+    """``value`` with every string in it (keys of nothing: the body's own strings) marked, recursively: a stored
+    newline, escape or line separator shows as a ``⟨U+XXXX⟩`` mark and can never start a line of its own."""
+    if isinstance(value, str):
+        return unshowable.mark(value, allow="")
+    if isinstance(value, list):
+        return [_marked(v) for v in value]
+    if isinstance(value, dict):
+        return {unshowable.mark(str(k), allow=""): _marked(v) for k, v in value.items()}
+    return value
+
+
+class _Shown:
+    """A handoff row's printed fields, every stored string marked."""
+
+    def __init__(self, h: Any) -> None:
+        self.handoff_id = h.handoff_id
+        self.seam_kind = _marked(h.seam_kind)
+        self.written_at = _marked(h.written_at)
+        self.writer = _marked(h.writer)
+        self.covers_gseq = h.covers_gseq
+        self.prev_handoff_id = h.prev_handoff_id
 
 
 def _render_md(h: Any, body: dict[str, Any]) -> str:
@@ -237,8 +277,18 @@ def run_handoff_show(args: argparse.Namespace, out: Any, store: Any) -> int:
         raise CoordError(f"no handoff exists yet (a coordinator writes one with `{lv} coord close`)"
                          if args.handoff_id is None else
                          f"there is no handoff {args.handoff_id} (`{lv} coord handoff show` shows the latest)")
-    body = json.loads(h.body)
+    render = _render_md if args.md else _render_plain
+    try:
+        body = json.loads(h.body)
+        if not isinstance(body, dict):
+            raise ValueError(f"the body is JSON {type(body).__name__}, not an object")
+        # rendered whatever the format, so a body the text views cannot read is refused in --json too
+        text = render(_Shown(h), _marked(body))
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        reason = f"missing key {exc}" if isinstance(exc, KeyError) else f"{type(exc).__name__}: {exc}"
+        raise CoordError(f"handoff {h.handoff_id} body is unreadable: "
+                         f"{unshowable.mark(reason, allow='')[:160]}") from None
     _emit(out, args.json, {"handoff_id": h.handoff_id, "kind": h.seam_kind, "written_at": h.written_at,
                            "writer": h.writer, "covers_gseq": h.covers_gseq, "prev_handoff_id": h.prev_handoff_id,
-                           "body": body}, (_render_md if args.md else _render_plain)(h, body))
+                           "body": body}, text)
     return 0
