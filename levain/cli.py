@@ -2628,15 +2628,12 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                            help="An install directory whose ledger's cockpit/ is that data root (as --data-root).")
     cs_answer.set_defaults(func=_cmd_consent_answer)
     cs_phone = cs_sub.add_parser(
-        "phone", help="Answer consent requests from a phone with a passkey (serves the phone port).",
-        description="Serve a small consent page on its own loopback port, for an https proxy you run (for example "
-                    "`tailscale serve`) to put on your tailnet. From the phone you see what each agent asked and "
-                    "answer it with a passkey, which the queue verifies like a terminal answer. A passkey is a "
-                    "display-phone key: it can allow a T2 request and deny any; a T3 allow stays on the laptop. "
-                    "The page also makes the phone's passkey and shows the laptop command that enrols it (a "
-                    "passkey never enrols itself). Nothing else is served there: not the cockpit, not your "
-                    "install. The printed link carries this server's token; anyone holding it can read the "
-                    "waiting requests until it stops, and none can answer without an enrolled passkey.")
+        "phone", help="Serve the old phone port's redirect to the cockpit (--redirect-to is required).",
+        description="Serve ONLY a redirect page on its own loopback port, for an https proxy you run (for example "
+                    "`tailscale serve`): every link the phone already holds for this port opens on the cockpit "
+                    "at --redirect-to. The phone port's run token and its token-gated data routes are gone "
+                    "(W1b): a phone pairs to the cockpit with `levain cockpit pair`. Without --redirect-to this "
+                    "command refuses.")
     cs_phone.add_argument("--name", default=None,
                           help="The https name your proxy serves the phone port on (it becomes the passkey's "
                                "name, so keep it: a passkey made on one name never answers on another).")
@@ -2645,31 +2642,15 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                                "`tailscale serve` line. Changes nothing in Tailscale itself.")
     cs_phone.add_argument("--port", type=int, default=None,
                           help=f"The loopback port (default {_phone_port_default()}).")
-    cs_phone.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
-                          help=queue_help + " Dispatch jobs are read from the same directory: file them with "
-                          "`levain dispatch file --dispatch-dir` set to it.")
-    cs_phone.add_argument("--sign-namespace", dest="sign_namespaces", action="append", default=None,
-                          type=_sign_namespace, metavar="NS",
-                          help="Also list the sign requests filed in the queue's sign/ directory in namespace NS "
-                               "(repeatable), for a user-verified passkey signature (Face ID, Touch ID or the device "
-                               "passcode, as the authenticator reports it). levain checks user verification; a "
-                               "caller's `ssh-keygen -Y verify -n NS` checks the key, the message and the namespace "
-                               "only. The queue dir's claude_code.json must name the cockpit (cockpit_data_root). A "
-                               "namespace beginning 'levain', one levain verifies in, or git, file or email is "
-                               "refused.")
     cs_phone.add_argument("--link-file", dest="link_file", type=Path, default=None,
-                          help="Also write this run's page link and phone token to FILE (JSON, mode 0600), for a "
-                               "caller that builds a link straight onto one sign request's card (#sign=<id>); removed "
-                               "when this run stops. Its token changes every run unless --token-file keeps it.")
-    cs_phone.add_argument("--token-file", dest="token_file", type=Path, default=None,
-                          help="Keep the phone token in FILE (mode 0600): read it from there when FILE exists, else "
-                               "make one and write it, so a restart keeps the links the phone already holds.")
+                          help="Also write the cockpit origin this run redirects to into FILE (JSON "
+                               "{page, pid}, mode 0600, no token), for a caller that builds a sign link onto it; "
+                               "removed when this run stops.")
     cs_phone.add_argument("--redirect-to", dest="redirect_to", default=None, metavar="ORIGIN",
                           help="Serve ONLY a redirect: every link the phone already holds for this port opens on "
                                "the cockpit at ORIGIN (https://<name>:<port>), a sign link on that request's sheet "
-                               "(/sign/<id>), its token dropped and never forwarded. Nothing else is served, no "
-                               "token is made, and --link-file then holds {page: ORIGIN/} only. Takes no "
-                               "--queue-dir, --sign-namespace or --token-file.")
+                               "(/sign/<id>), its token dropped and never forwarded. Nothing else is served and no "
+                               "token is made. Required.")
     cs_phone.set_defaults(func=_cmd_consent_phone)
 
     from levain.consent.sign_setting import add_parser as add_signed_answers_parser
@@ -2729,37 +2710,17 @@ def _phone_port_default() -> int:
     return DEFAULT_PHONE_PORT
 
 
-def _sign_namespace(text: str) -> str:
-    from levain.consent.sign import namespace_problem
-
-    problem = namespace_problem(text)
-    if problem is not None:
-        raise argparse.ArgumentTypeError(problem)
-    return text
-
-
 def _cmd_consent_phone(args: argparse.Namespace) -> int:
-    from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_redirect, run_phone_server
+    from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_redirect
 
-    from levain.consent.queue import default_queue_dir
-
-    if args.redirect_to is not None:
-        full = [flag for flag, given in (("--queue-dir", args.queue_dir), ("--sign-namespace", args.sign_namespaces),
-                                         ("--token-file", args.token_file)) if given]
-        if full:
-            print(f"--redirect-to serves only the redirect: drop {', '.join(full)}", file=sys.stderr)
-            return 2
-        return run_phone_redirect(args.redirect_to, name=args.name, tailscale=args.tailscale,
-                                  port=DEFAULT_PHONE_PORT if args.port is None else args.port,
-                                  link_file=args.link_file.expanduser() if args.link_file is not None else None)
-
-    # the phone port may start before any agent has filed a request: a queue with no database yet lists nothing
-    qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
-    return run_phone_server(qdir, name=args.name, tailscale=args.tailscale,
-                            port=DEFAULT_PHONE_PORT if args.port is None else args.port,
-                            sign_namespaces=tuple(dict.fromkeys(args.sign_namespaces or ())),
-                            link_file=args.link_file.expanduser() if args.link_file is not None else None,
-                            token_file=args.token_file.expanduser() if args.token_file is not None else None)
+    if args.redirect_to is None:
+        print("levain consent phone serves only the redirect now: pass --redirect-to <the cockpit's origin>. The "
+              "phone port's run token is gone; pair a phone to the cockpit with `levain cockpit pair`.",
+              file=sys.stderr)
+        return 2
+    return run_phone_redirect(args.redirect_to, name=args.name, tailscale=args.tailscale,
+                              port=DEFAULT_PHONE_PORT if args.port is None else args.port,
+                              link_file=args.link_file.expanduser() if args.link_file is not None else None)
 
 
 def _consent_queue_dir(args: argparse.Namespace) -> Path:

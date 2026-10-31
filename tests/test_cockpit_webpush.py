@@ -207,11 +207,6 @@ def test_an_open_is_recorded_under_the_device_that_opened_it(rig) -> None:
     assert [o.get("device_id") for o in opened] == [PAIRED_PREFIX + dev], rec
 
 
-def test_the_worker_sends_the_credential_under_the_header_its_page_named() -> None:
-    sw = (Path(__file__).resolve().parents[1] / "levain" / "webpush" / "static" / "sw.js").read_text()
-    assert "'X-Levain-Write-Token'" in sw and "'X-Levain-Phone-Token'" in sw
-
-
 # --- fix round 1: one liveness rule, checked against the cockpit's pairing journal at send time ---------------------
 
 @pytest.fixture

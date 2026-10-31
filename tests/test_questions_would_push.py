@@ -12,7 +12,6 @@ from levain.consent import band, push_gate
 from levain.consent.queue import AnswerRefused, ConsentQueue
 from levain.consent.questions import QuestionStore
 from levain.consent.record import RULING_NAMESPACE, ruling_message
-from levain.phone_server import PhoneError, make_phone_server
 from tests.test_consent_queue import authority, keys  # noqa: F401 - the shared fixtures
 from tests._h4 import h4_home
 
@@ -57,21 +56,6 @@ def _take(w):
     return w["queue"].take_ruled_allow("claude_code", S, push_gate.PUSH_TOOL, w["call"], cwd=w["call"]["repo"])
 
 
-def test_would_push_files_the_push_undecided_first_and_links_it_to_the_option(world):
-    q, text = world["ask"]()
-    assert q is not None and q.link is not None and q.link.option == "a", text
-    request, state = world["queue"].get(q.link.request_id)
-    assert (state, request.tier, request.tool_name) == ("undecided", push_gate.PUSH_TIER, push_gate.PUSH_TOOL)
-    assert world["queue"].is_halted("claude_code", S) is None          # nothing was refused to the agent
-    assert QuestionStore(world["qdir"]).get(q.n).link == q.link and q.link.queue_id == world["queue"].queue_id
-    srv = make_phone_server(world["qdir"], "localhost", port=0, dispatch_dir=world["qdir"])
-    try:
-        listing = srv.listing()
-    finally:
-        srv.server_close()
-    row = next(r for r in listing["questions"] if r["n"] == q.n)
-    assert row["link"]["card"]["id"] == q.link.request_id                  # shown inside its question
-    assert all(u["id"] != q.link.request_id for u in listing["undecided"])  # and not twice
 
 
 def test_the_answer_alone_allows_nothing_and_a_ruled_allow_is_taken_once(world, keys):  # noqa: F811
@@ -97,49 +81,6 @@ def test_a_replayed_or_tampered_ruling_is_refused_and_moves_nothing(world, keys)
         world["queue"].answer_late(q.link.request_id, payload, sig)
 
 
-def test_the_one_tap_route_records_the_answer_only_after_the_ruling_verifies(world, monkeypatch):
-    q, _ = world["ask"]()
-    srv = make_phone_server(world["qdir"], "localhost", port=0, dispatch_dir=world["qdir"])
-    good = world["queue"].ruling_payload(q.link.request_id, "allow", "SHA256:x")
-    body = {"option": "a", "payload": good, "authenticator_data": "AAAA", "client_data_json": "AAAA",
-            "signature": "AAAA"}
-    try:
-        for bad in ({**body, "option": "b"}, {**body, "payload": {**good, "decision": "deny"}},
-                    {**body, "payload": {**good, "request_id": "pend-other"}}, body):   # the last: no passkey signs it
-            with pytest.raises(PhoneError) as exc:
-                srv.question_rule(q.n, bad)
-            assert exc.value.status in (400, 422)
-            assert world["store"].get(q.n).answer is None
-        order = []
-        monkeypatch.setattr(srv, "rule_step", lambda rid, action, req, deliver=True: order.append(
-            ("ruled", rid, deliver, world["store"].get(q.n).answer)) or {"decision": "allow", "signer_fp": "fp"})
-        monkeypatch.setattr(srv, "_deliver_answer_later", lambda store, qid: lambda timeout: {"route": "hook"})
-        out = srv.question_rule(q.n, body)
-    finally:
-        srv.server_close()
-    assert order == [("ruled", q.link.request_id, False, None)]          # the ruling first, no second delivery
-    assert out["answered"] == q.n and world["store"].get(q.n).answer.channel == "phone"
-    # a link any uid writer forges onto ANOTHER session's push is neither shown in the question nor ruled from it
-    other, _ = band.file_question("claude_code", "sess-other", "Push?", [("a", "x"), ("b", "y")], "a", "z",
-                                  world["qdir"], would_push=("a", (world["call"]["repo"],
-                                                                   world["call"]["remote"], "main")))
-    plain, _ = band.file_question("claude_code", S, "Docs?", [("a", "x"), ("b", "y")], "a", "z", world["qdir"])
-    conn = sqlite3.connect(world["qdir"] / "questions.db", isolation_level=None)
-    conn.execute("INSERT INTO question_links (question_id, option, kind, request_id, queue_id, created_at) VALUES "
-                 "(?, 'a', 'push', ?, ?, '2026-10-19T00:00:00Z')", (plain.id, other.link.request_id,
-                                                                    other.link.queue_id))
-    conn.close()
-    srv = make_phone_server(world["qdir"], "localhost", port=0, dispatch_dir=world["qdir"])
-    try:
-        forged = {**body, "payload": world["queue"].ruling_payload(other.link.request_id, "allow", "SHA256:x")}
-        with pytest.raises(PhoneError) as exc:
-            srv.question_rule(plain.n, forged)
-        listing = srv.listing()
-    finally:
-        srv.server_close()
-    assert exc.value.status == 422 and "own session" in exc.value.message
-    assert next(r for r in listing["questions"] if r["n"] == plain.n)["link"]["card"] is None
-    assert any(u["id"] == other.link.request_id for u in listing["undecided"])
 
 
 def test_a_store_from_before_q3_reads_with_no_links_and_takes_one_on_its_next_write(world):

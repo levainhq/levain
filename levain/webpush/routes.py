@@ -10,14 +10,12 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from datetime import datetime, timezone
-
-from levain.webpush import devices, ece, vapid
-from levain.webpush.store import DeviceNotLive, PushStore
+from levain.webpush import ece, vapid
+from levain.webpush.store import PAIRED_PREFIX, DeviceNotLive, PushStore
 
 STATIC = Path(__file__).resolve().parent / "static"
 _STATIC_FILES = {
@@ -31,7 +29,6 @@ _STATIC_FILES = {
 STATIC_PATHS = frozenset(_STATIC_FILES)
 MAX_BODY = 8192
 MAX_ENDPOINT = 2048
-_PAIR_CODE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 _HOST = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 JSON = "application/json"
 
@@ -124,38 +121,9 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
     (the cockpit's caller), stored with its subscription and asked again inside the subscribe's write."""
     if method == "GET" and path in _STATIC_FILES:
         name, ctype = _STATIC_FILES[path]
-        data = (STATIC / name).read_bytes()
-        if path == "/app.webmanifest":
-            pair = query.get("pair")
-            pair = pair[0] if isinstance(pair, list) and pair else pair
-            if isinstance(pair, str) and _PAIR_CODE.match(pair):
-                manifest = json.loads(data)
-                manifest["start_url"] = "/?pair=" + quote(pair, safe="")
-                data = json.dumps(manifest, indent=2).encode("utf-8")
-        return 200, data, ctype
+        return 200, (STATIC / name).read_bytes(), ctype
     if not path.startswith("/webpush/"):
         return None
-    if method == "POST" and path == "/webpush/pair/redeem":
-        # the installed app has no credential yet: the one-time code is the credential. ``{"code"}`` is the long code
-        # the manifest carries, ``{"short"}`` the one the operator typed
-        obj = _body_json(body)
-        conn = PushStore(queue_dir).connection()
-        try:
-            now = datetime.now(timezone.utc)
-            if obj is not None and "short" in obj:
-                got = devices.redeem_short(conn, obj.get("short"), now)
-            else:
-                got = devices.redeem(conn, obj.get("code") if obj else None, now)
-        finally:
-            conn.close()
-        if got is None:
-            # the same words for both codes and every reason, and no count of the tries left
-            return _err(403, "bad_code", "the pairing code is unknown, spent or expired")
-        if got[0] == devices.LOCKED:
-            seconds = int(got[1])
-            return _json(429, {"error": "locked", "message": f"too many wrong codes; try again in "
-                               f"{max(1, -(-seconds // 60))} min", "retry_after": seconds})
-        return _json(200, {"device_id": got[0], "token": got[1]})
     if not authorized:
         return _err(403, "credential_required", "this page's credential is needed")
     store = PushStore(queue_dir)
@@ -166,36 +134,22 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
         from levain.webpush import record as rec
 
         return _json(200, {"pings": rec.record(Path(queue_dir), store.record(limit=rec.SHOWN))})
-    if method == "POST" and path == "/webpush/pair":
-        obj = _body_json(body) or {}
-        # both codes: the long one rides the manifest where a browser carries it into the installed app, the short one
-        # is typed where it does not
-        conn = store.connection()
-        try:
-            now = datetime.now(timezone.utc)
-            code = devices.mint_pairing(conn, obj.get("label"), now)
-            short = devices.mint_short_pairing(conn, obj.get("label"), now)
-        finally:
-            conn.close()
-        return _json(200, {"code": code, "short": short,
-                           "short_ttl_seconds": int(devices.SHORT_PAIRING_TTL.total_seconds())})
     if method == "POST" and path == "/webpush/subscribe":
         obj, refusal = _subscription(body)
         if refusal is not None:
             return refusal
         endpoint, p256dh, auth = obj["endpoint"], obj["keys"]["p256dh"], obj["keys"]["auth"]
-        if device_id is not None:
-            try:
-                return _json(200, {"id": store.add_subscription(endpoint, p256dh, auth, device_id, journal=journal)})
-            except DeviceNotLive:
-                return _err(403, "credential_required", "this device was revoked")
-        # the run token is not a device: the page that turns pings on becomes one, so a revoke can stop them; an
-        # endpoint a live device already owns stays its own, and the page keeps the token it holds
-        sid, minted = store.subscribe_unowned(endpoint, p256dh, auth, obj.get("label"), datetime.now(timezone.utc))
-        out: dict = {"id": sid}
-        if minted is not None:
-            out.update(device_id=minted[0], token=minted[1])
-        return _json(200, out)
+        if not isinstance(device_id, str) or not device_id.startswith(PAIRED_PREFIX):
+            # only a paired device subscribes: no credential without a device (the owner key included) becomes one
+            return _err(403, "credential_required", "only a paired device turns pings on")
+        if not journal:
+            # the device is paired; the caller failed to say which pairing journal holds it (a server bug, not the
+            # phone's fault, so not the 403 a phone with no pairing gets)
+            return _err(500, "no_pairing_journal", "the server named no pairing journal for this paired device")
+        try:
+            return _json(200, {"id": store.add_subscription(endpoint, p256dh, auth, device_id, journal=journal)})
+        except DeviceNotLive:
+            return _err(403, "credential_required", "this device was revoked")
     if method == "POST" and path == "/webpush/unsubscribe":
         obj = _body_json(body)
         endpoint = valid_endpoint(obj.get("endpoint")) if obj else None

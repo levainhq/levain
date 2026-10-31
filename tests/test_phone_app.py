@@ -4,16 +4,12 @@ phone pairs, and what the phone port's seam lets each credential reach. Built fr
 from __future__ import annotations
 
 import json
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from levain.phone_app import PhoneApp, PhoneAppError
-from levain.webpush import devices
-from levain.webpush.store import PushStore
 
 
 @pytest.fixture
@@ -81,53 +77,8 @@ def test_phone_sets_the_state_line_and_works_the_tray_only_as_the_kernel_allows(
         assert exc.value.status == 403
 
 
-def test_a_pairing_code_turns_into_one_revocable_device(tmp_path: Path):
-    conn = PushStore(tmp_path).connection()
-    now = datetime.now(timezone.utc)
-    code = devices.mint_pairing(conn, "phone", now)
-    dev, token = devices.redeem(conn, code, now)
-    assert devices.redeem(conn, code, now) is None                          # once
-    assert devices.verify(conn, token, now) == dev
-    late = devices.mint_pairing(conn, "late", now)
-    assert devices.redeem(conn, late, now + timedelta(hours=25)) is None    # expired
-    codes = [devices.mint_pairing(conn, f"n{i}", now) for i in range(devices.OPEN_PAIRINGS_KEPT + 2)]
-    assert devices.redeem(conn, codes[0], now) is None                      # past the newest few, by mint order
-    assert devices.redeem(conn, codes[-1], now) is not None
-    assert devices.revoke(conn, dev, now) and devices.verify(conn, token, now) is None
 
 
-def test_the_phone_port_seam_gates_each_route_by_credential(install):
-    from levain.phone_server import PHONE_TOKEN_HEADER, make_phone_server
-    import threading
-
-    _inst, qdir = install
-    httpd = make_phone_server(qdir, "localhost", port=0, token="run-token-for-test", dispatch_dir=qdir)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = f"http://localhost:{httpd.server_address[1]}"
-
-    def call(path: str, token: str | None, body: dict | None = None) -> tuple[int, dict]:
-        req = urllib.request.Request(base + path, method="POST" if body is not None else "GET",
-                                     data=json.dumps(body).encode() if body is not None else None,
-                                     headers={"Content-Type": "application/json", "Origin": base,
-                                              **({PHONE_TOKEN_HEADER: token} if token else {})})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return r.status, json.loads(r.read() or b"{}")
-        except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read() or b"{}")
-
-    try:
-        assert call("/app/board.json", None)[0] == 403
-        status, code = call("/webpush/pair", "run-token-for-test", {"label": "phone"})
-        assert status == 200
-        status, dev = call("/webpush/pair/redeem", None, {"code": code["code"]})
-        assert status == 200
-        assert call("/app/board.json", dev["token"])[0] == 200               # the device token opens the app routes
-        assert call("/webpush/pair", dev["token"], {"label": "clone"})[0] == 403   # and never mints a device
-        assert call("/webpush/pair/redeem", None, {"code": code["code"]})[0] == 403  # a spent code
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
 
 
 def _raise_on_the_laptop(inst: Path, tmp_path: Path, verb: str) -> Path:
