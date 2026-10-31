@@ -470,7 +470,8 @@ def spawn_draft(text: object) -> dict[str, Any]:
 
 def spawn_record(text: object) -> dict[str, Any]:
     """The parsed spawn record a launch's ``role_ref`` holds, or a :class:`LeaseRefused` naming what is wrong. The
-    shape only: that ``role_hash`` is the role's hash is :func:`levain.agents.instantiate.verified_record`'s check."""
+    shape only: the role is re-hashed when the store writes the record (:func:`_complete_spawn`) and again by
+    :func:`levain.agents.instantiate.verified_record` at every read that builds a brief."""
     rec = _spawn_text(text, _SPAWN_KEYS, "a launch's role_ref")
     scope = rec["scope"]
     if type(rec["depth"]) is not int or not 1 <= rec["depth"] <= MAX_SPAWN_DEPTH \
@@ -736,7 +737,9 @@ def activate(conn: sqlite3.Connection, now: str, launch_id: str, *, harness_sess
     which commits) and the reason returned: ``(launch, None)`` on activation, ``(launch, reason)`` when refused.
 
     THE PIN (C0 §3.4): a worker launch whose threads are exactly ``[T]`` records T's head envelope at this moment on
-    its ``active`` row, in this transaction; it and every job it files run under that envelope, which later
+    its ``active`` row, in this transaction (a SPAWNED worker records the envelope its stored scope was cut from, so
+    its brief and its pin name the same one; a spawned worker whose thread is no longer open work is written failed
+    here, :func:`_refuse_spawn`); it and every job it files run under that envelope, which later
     successors and attenuations can only narrow. A coordinator launch and a thread with no envelope pin nothing (no
     envelope authority); a pending worker holding several threads is refused here (:func:`refuse_several`). The pin is the head as bound, live or not: whether
     it is still in force is the predicate's question at each use (§4.5), never this one's."""
@@ -1043,7 +1046,8 @@ def claim_spawn(conn: sqlite3.Connection, now: str, launch_id: str, pid: int) ->
     """The one-spawner compare-and-set, inside the caller's ``BEGIN IMMEDIATE``: ``(launch, None)`` when this process
     may start the launch's session (its latest event is ``pending``, ``now`` is before its ``until``, its token is
     still the live lease's, and nobody claimed the spawn before), else ``(launch, why)`` and nothing to spawn. A launch
-    past its until is written ``expired`` and one whose lease is gone ``failed``, as :func:`activate` would."""
+    past its until is written ``expired`` and one whose lease is gone ``failed``, as :func:`activate` would; so is a
+    spawned worker whose record or thread no longer allows it (:func:`_refuse_spawn`)."""
     ln = _must_launch(conn, launch_id)
     if ln.state != "pending":
         return ln, f"launch {launch_id} is {ln.state}, not pending"
