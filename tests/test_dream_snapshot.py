@@ -129,7 +129,9 @@ def test_a_second_dream_snapshots_the_text_the_first_one_wrote(scratch):
 def test_the_content_hash_oracle_is_the_plain_sha_of_the_saved_text(scratch):
     r = dream(scratch, "o1", _VALID)
     prog = json.loads((occ(scratch, "o1") / "progress.json").read_text())
-    assert sn.wraps_after(scratch, 0) == [(r.wrap_id, prog["composed_sha256"])]
+    ((wid, h, pair),) = sn.wraps_after(scratch, 0)
+    assert (wid, h) == (r.wrap_id, prog["composed_sha256"])
+    assert pair.startswith(prog["wrap_token"][:12] + "-")                     # the commit identity is the token's
     assert sn.wraps_after(scratch, r.wrap_id) == []
 
 

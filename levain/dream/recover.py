@@ -36,6 +36,10 @@ KILLED_BEFORE_SAVE = "killed-before-save"
 KILLED_IN_SAVE = "killed-in-save"
 WRAP_CLEARED = "wrap-cleared"
 UNKNOWN_COMMIT = "unknown-commit"
+WRAP_OPEN_UNATTRIBUTED = "wrap-open-unattributed"
+STORE_MISMATCH = "store-mismatch"
+#: the flag the executor passes the compose child to name the occurrence dir (its argv is recorded in progress.json)
+ADD_DIR_FLAG = "--add-dir"
 COMMITTED_NOT_RECORDED = "recovered: committed, not recorded"
 COMMITTED_AFTER_STOP = "recovered: committed after stop"
 DIED_BEFORE_CARD = "recovered: died between the effect and the card"
@@ -76,7 +80,8 @@ def _group_gone(pgid: int) -> bool | None:
 
 def _identity_matches(pid: int, started: Any, argv: Any, occ_dir: Path) -> bool | None:
     """Does the process at ``pid`` still look like the recorded compose child: same start time, same command line, and
-    the command line carries this occurrence's dir. True = it matches; False = a live process is there that does not
+    this occurrence's dir is the value of the recorded ``--add-dir`` argument (an exact argv element, never a substring
+    or a basename: ``o1`` must not match ``o10``). True = it matches; False = a live process is there that does not
     (the recorded one has ended); None = ``ps`` could not be read."""
     from levain.consent.delivery import process_identity
 
@@ -94,14 +99,24 @@ def _identity_matches(pid: int, started: Any, argv: Any, occ_dir: Path) -> bool 
     want = " ".join(str(a) for a in argv) if isinstance(argv, list) else ""
     if " ".join(want.split()) != " ".join(ident[1].split()):
         return False
-    return str(occ_dir) in ident[1] or occ_dir.name in ident[1]
+    return _names_occurrence(argv, occ_dir)
+
+
+def _names_occurrence(argv: Any, occ_dir: Path) -> bool:
+    if not isinstance(argv, list):
+        return False
+    for flag, value in zip(argv, argv[1:]):
+        if flag == ADD_DIR_FLAG and isinstance(value, str) and \
+                (value == str(occ_dir) or os.path.realpath(value) == os.path.realpath(occ_dir)):
+            return True
+    return False
 
 
 def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = TERM_WAIT_S,
                      kill_wait: float = KILL_WAIT_S) -> tuple[str, list[str]]:
     """End the compose child ``progress.json`` names, if it outlived its fire. A signal goes to a process whose
     identity was checked just before it, never to a stored integer: SIGTERM to the group, then (identity re-checked)
-    SIGKILL, and only ``ProcessLookupError`` on the group counts as ended. Returns ``(state, notes)``, ``state`` one of
+    SIGKILL (while the group still exists), and only ``ProcessLookupError`` on the group counts as ended. Returns ``(state, notes)``, ``state`` one of
     ``none-recorded``, ``ended`` (no process of ours is left), ``not-confirmed`` (no signal could safely be sent, or the
     group was not seen gone)."""
     pid = prog.get("child_pid")
@@ -119,16 +134,29 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = 
         return "not-confirmed", [f"child pid {pid}: the leader is gone or is another program now, but its process "
                                  "group is not seen gone; no signal was sent (the leader cannot be identified)"]
     try:
-        os.killpg(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
+        leads = os.getpgid(pid) == pid
+    except ProcessLookupError:
+        leads = None                          # gone since the identity check: the group probe below says the rest
+    except OSError:
+        leads = False
+    if leads is False:
+        # the executor starts the child as its own group leader. A process that is not one is not what was recorded,
+        # and a group signal would miss it (or hit another group): no signal, and never "ended"
+        return "not-confirmed", [f"child pid {pid}: is not a process-group leader; no signal was sent"]
+    if leads:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
     deadline = time.monotonic() + term_wait
     while time.monotonic() < deadline and _group_gone(pid) is not True:
         time.sleep(0.05)
+    if _group_gone(pid) is False:
+        # the group id is held while any member lives, so it still names the group that took the TERM even when its
+        # leader has exited and a member ignored the signal
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pid, signal.SIGKILL)
     if _group_gone(pid) is not True:
-        if _identity_matches(pid, started, argv, occ_dir) is True:  # re-checked: only the same process is killed
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(pid, signal.SIGKILL)
         deadline = time.monotonic() + kill_wait
         while time.monotonic() < deadline and _group_gone(pid) is not True:
             time.sleep(0.05)
@@ -154,9 +182,42 @@ def _card(kind: str, reason: str, occ: str, *, his: list[str] | None = None) -> 
 
 
 def _record(occ_dir: Path, res: RecoverResult) -> RecoverResult:
-    if res.settled:
-        with contextlib.suppress(OSError):
-            _sn._write_json(occ_dir / RECOVERY_RECORD, res.as_dict())
+    """Write the settled result. It is the idempotency record, so a result that could not be written, or that leaves a
+    compose child not seen ended, is NOT settled: a rerun repeats the cleanup instead of returning a stale record."""
+    if not res.settled:
+        return res
+    if res.child == "not-confirmed":
+        res.settled = False
+        res.notes.append("the compose child was not confirmed ended, so recovery is not recorded; rerun it once the "
+                         "process can be checked")
+        return res
+    try:
+        _sn._write_json(occ_dir / RECOVERY_RECORD, res.as_dict())
+    except OSError as exc:
+        res.settled = False
+        res.notes.append(f"the recovery record could not be written ({type(exc).__name__}: {exc}); rerun recover")
+    return res
+
+
+def _open_state(store: Any) -> str:
+    """``idle``, ``open`` or ``unreadable`` for the store's wrap, asked of the store itself."""
+    try:
+        return "open" if store.get_wrap_started_at() else "idle"
+    except Exception:  # noqa: BLE001
+        return "unreadable"
+
+
+def _unattributed(occ: str, res: RecoverResult, state: str) -> RecoverResult:
+    """A wrap is open (or cannot be read) and no token proves it is this dream's: never settled, never cancelled."""
+    res.reason, res.settled = WRAP_OPEN_UNATTRIBUTED, False
+    res.wrap = "open-unattributed" if state == "open" else "unreadable"
+    what = ("a wrap is open on the store" if state == "open" else "the store's wrap state cannot be read")
+    res.notes.append(f"{what}, and this occurrence recorded no wrap token, so ownership cannot be proven; nothing "
+                     "was cancelled and the occurrence stays unsettled")
+    res.card = _card("failed", WRAP_OPEN_UNATTRIBUTED, occ, his=[
+        f"{what.capitalize()}, and dream {occ} never recorded the token of the wrap it opened, so recovery cannot tell "
+        "whether it is that dream's. Nothing was cancelled. Check what is running; if nothing is, cancel the wrap "
+        "with anneal and run recover again."])
     return res
 
 
@@ -204,6 +265,12 @@ def _recover_locked(db: Path, occ_dir: Path, prog: dict[str, Any], state: str, c
 
     occ, phase, token = occ_dir.name, prog.get("phase"), prog.get("wrap_token")
     stopped = state == "stopped"
+    if (occ_dir / _sn.SNAP_DIR / _sn.MANIFEST).exists():
+        manifest = _sn.read_manifest(occ_dir)
+        why = ("the snapshot manifest cannot be read, so it cannot be shown to be of this store." if manifest is None
+               else _sn.store_identity_problem(db, manifest))
+        if why:
+            return RecoverResult("none", STORE_MISMATCH, notes=[why + " Nothing was changed."], settled=False)
     try:
         store = Store(str(db), section_schema=None)
     except Exception as exc:  # noqa: BLE001 — an unreadable store settles nothing
@@ -212,7 +279,13 @@ def _recover_locked(db: Path, occ_dir: Path, prog: dict[str, Any], state: str, c
         child, notes = end_orphan_child(prog, occ_dir, term_wait=term_wait, kill_wait=kill_wait)
         res = RecoverResult("none", "", notes=notes, child=child)
         if phase in (None, "composing"):
-            res.wrap = _cancel(store, token, _w)
+            if not token:
+                state_ = _open_state(store)
+                if state_ != "idle":
+                    return _unattributed(occ, res, state_)
+                res.wrap = "none_open"
+            else:
+                res.wrap = _cancel(store, token, _w)
             if res.wrap == "failed":
                 res.notes.append("our wrap could not be cancelled; the next consolidate will find it in progress")
                 res.settled = False
@@ -234,9 +307,9 @@ def _recover_locked(db: Path, occ_dir: Path, prog: dict[str, Any], state: str, c
 
 def _cancel(store: Any, token: Any, _w: Any) -> str:
     """Cancel our wrap by token: ``cancelled``, ``none_open`` or ``failed`` (anneal's compare-and-swap; another
-    token's wrap is never cleared)."""
+    token's wrap is never cleared). Needs a token: without one ownership is unprovable and the caller does not ask."""
     if not token:
-        return "none_open"
+        return "failed"
     return _w._cancel_outcome(store, token)
 
 
@@ -253,6 +326,10 @@ def _open_ours(store: Any, token: Any) -> bool | None:
 def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], res: RecoverResult, stopped: bool,
                     _w: Any) -> RecoverResult:
     occ, token = occ_dir.name, prog.get("wrap_token")
+    if not token:
+        state_ = _open_state(store)
+        if state_ != "idle":
+            return _unattributed(occ, res, state_)
     open_ours = _open_ours(store, token)
     if open_ours is None:
         res.reason, res.settled = "store-unreadable", False
@@ -276,13 +353,20 @@ def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], r
         res.ending, res.reason = ("stopped", "wrap-cleared") if stopped else ("failed", WRAP_CLEARED)
         return _record(occ_dir, res)
     composed = prog.get("composed_sha256")
-    ours = [w for w, h in moved if composed and h == composed]
+    ours = [w for w, h, pid in moved if _is_ours(h, pid, composed, token, len(moved))]
+    if len(ours) > 1:
+        res.reason, res.settled = UNKNOWN_COMMIT, False
+        res.card = _card("failed", UNKNOWN_COMMIT, occ, his=[
+            f"More than one completed wrap ({ours}) matches this dream's saved text and commit identity. Recovery "
+            "will not pick one. The text was not touched and no rollback is offered."])
+        res.notes.append("two wraps match this dream's commit; nothing is adopted and the occurrence stays unsettled")
+        return res
     if not ours or ours[-1] != moved[-1][0]:
         # a hash that is not ours, one that cannot be read, or ours with another wrap after it: nothing is adopted on
         # a guess, and the operator reads an integrity item
         res.ending, res.reason = "failed", UNKNOWN_COMMIT
         res.card = _card("failed", UNKNOWN_COMMIT, occ, his=[
-            f"anneal completed wrap(s) {[w for w, _ in moved]} after this dream began, and none of them can be shown "
+            f"anneal completed wrap(s) {[w for w, *_ in moved]} after this dream began, and none of them can be shown "
             "to be this dream's save (hash differs or is unreadable, or another wrap followed it). The text was not "
             "touched and no rollback is offered."])
         return _record(occ_dir, res)
@@ -305,9 +389,25 @@ def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], r
         m = _sn.read_manifest(occ_dir)
         if not (m and m.get("post_files")):  # already recorded is fine; anything else is a note, not a failure
             res.notes.append(f"post files not recorded: {exc}")
+    except Exception as exc:  # noqa: BLE001 — a write that failed leaves the commit unrecorded: retry, do not trace
+        res.notes.append(f"post files could not be written ({type(exc).__name__}: {exc}); rerun recover")
+        res.reason, res.settled = (COMMITTED_AFTER_STOP if stopped else COMMITTED_NOT_RECORDED), False
+        return res
     res.ending, res.reason = ("stopped" if stopped else "done"), reason
     res.card = _card("consolidated", reason, occ)
     return _record(occ_dir, res)
+
+
+def _is_ours(content_hash: str | None, pair_id: str | None, composed: Any, token: Any, n_moved: int) -> bool:
+    """Is this completed wrap this dream's commit? Its text hash must be the composed hash, AND its commit identity must
+    be ours: anneal's pair id starts with the first 12 of the wrap token. A row with no pair id (a legacy store) counts
+    only when it is the sole wrap since the dream began. A hash alone is not identity: another writer can save the same
+    text."""
+    if not (composed and content_hash == composed):
+        return False
+    if pair_id:
+        return bool(token) and str(pair_id).startswith(f"{str(token)[:12]}-")
+    return n_moved == 1
 
 
 def _recover_saved(db: Path, occ_dir: Path, prog: dict[str, Any], res: RecoverResult, stopped: bool,
@@ -315,10 +415,18 @@ def _recover_saved(db: Path, occ_dir: Path, prog: dict[str, Any], res: RecoverRe
     occ = occ_dir.name
     m = _sn.read_manifest(occ_dir)
     if m is not None and not m.get("post_files"):
-        try:
-            _sn.record_post_for(db, occ_dir, prog.get("wrap_id"), composed_sha256=prog.get("composed_sha256"))
-        except _sn.SnapshotRefused as exc:
-            res.notes.append(f"post files not recorded: {exc}")
+        if not prog.get("composed_sha256"):
+            res.notes.append("post files not recorded: progress.json holds no composed text hash, so the live text "
+                             "cannot be shown to be the dream's")
+        else:
+            try:
+                _sn.record_post_for(db, occ_dir, prog.get("wrap_id"), composed_sha256=prog.get("composed_sha256"))
+            except _sn.SnapshotRefused as exc:
+                res.notes.append(f"post files not recorded: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                res.notes.append(f"post files could not be written ({type(exc).__name__}: {exc}); rerun recover")
+                res.settled = False
+                return res
     reason = COMMITTED_AFTER_STOP if stopped else DIED_BEFORE_CARD
     res.ending, res.reason = ("stopped" if stopped else "done"), reason
     res.card = None if card_filed else _card("consolidated", reason, occ)

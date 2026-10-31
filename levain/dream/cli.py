@@ -181,7 +181,9 @@ def run_dream_run(args: argparse.Namespace) -> int:
 def _occurrence_dir(store_path: Path, occurrence: str) -> tuple[Path | None, str]:
     """The occurrence dir named by ``occurrence`` (an id under ``<store dir>/dream/``, or a path), refused if it
     resolves inside the operator's live store."""
-    if os.sep in occurrence or Path(occurrence).expanduser().is_dir():
+    # A bare name is an id under the store's dream dir, never a directory of the same name in the working dir. Only an
+    # argument that looks like a path (a separator, or a leading . or ~) is read as one.
+    if os.sep in occurrence or (os.altsep and os.altsep in occurrence) or occurrence[:1] in (".", "~"):
         occ = Path(occurrence).expanduser().resolve()
     else:
         occ = (store_path.parent / "dream" / occurrence).resolve()
@@ -236,7 +238,11 @@ def run_dream_recover(args: argparse.Namespace) -> int:
             print(f"  {n}")
         if res.card:
             print(f"  card to file: {res.card['kind']} / {res.card['reason']}  (remedy: {res.card['remedy']})")
-    return 0 if res.ending != "none" else 1
+    if not res.settled or res.ending == "none":
+        print(f"levain dream recover: UNSETTLED ({res.reason or 'nothing changed'}). Nothing here is finished: "
+              f"fix what the notes above name, then run `levain dream recover {args.occurrence} --store-dir "
+              f"{args.store_dir}` again.", file=sys.stderr if args.json else sys.stdout)
+    return 0 if (res.settled and res.ending != "none") else 1
 
 
 def run_dream_drill(args: argparse.Namespace) -> int:

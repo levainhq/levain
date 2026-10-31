@@ -264,7 +264,7 @@ SLEEP_FIRE = textwrap.dedent('''\
     class SleepMind:
         name, source, unit, model, has_child = "sleep", "x", "tokens", "x", False
         def compose(self, req):
-            argv = ["sh", "-c", "sleep 300; true", str(req.occ_dir)]
+            argv = ["sh", "-c", "sleep 300; true", "sh", "--add-dir", str(req.occ_dir)]
             p = subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.4)
             ident = process_identity(p.pid)

@@ -58,6 +58,16 @@ def _now() -> str:
     return _dt.datetime.now().astimezone().isoformat(timespec="microseconds")
 
 
+def _taken(m: Mapping[str, Any]) -> _dt.datetime:
+    """``taken_at`` as an aware instant. Local-offset strings do not sort as text across a DST change; an unreadable
+    stamp sorts first (it is never taken to be later than a readable one)."""
+    try:
+        t = _dt.datetime.fromisoformat(str(m.get("taken_at")))
+    except ValueError:
+        return _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+    return t if t.tzinfo else t.astimezone()
+
+
 def sha256_file(path: Path) -> str | None:
     """sha256 of a file's bytes, or None when it does not exist."""
     if not path.is_file():
@@ -97,28 +107,34 @@ def format_version(db_path: Path | str) -> int | None:
         return None
 
 
-def wraps_after(db_path: Path | str, after: int | None) -> list[tuple[int, str | None]] | None:
-    """``(id, content_hash)`` of every completed wrap with an id past ``after``, oldest first; None when unreadable.
+def wraps_after(db_path: Path | str, after: int | None) -> list[tuple[int, str | None, str | None]] | None:
+    """``(id, content_hash, pair_id)`` of every completed wrap with an id past ``after``, oldest first; None when
+    unreadable.
 
     ``content_hash`` is the plain sha256 of the continuity text that wrap saved (anneal stores it at the commit, the
-    recovery oracle). ``Store.get_wrap_history`` does not expose it, so the column is read directly; a legacy row
-    without one reads ``None``."""
+    recovery oracle). ``pair_id`` is anneal's commit identity, ``<first 12 of the wrap token>-<random>``: a hash alone
+    can match two wraps that saved identical text, the pair id cannot. ``Store.get_wrap_history`` exposes neither, so
+    the columns are read directly; a legacy row without one reads ``None``."""
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
-            rows = con.execute("select id, content_hash from wraps where id > ? order by id",
+            rows = con.execute("select id, content_hash, pair_id from wraps where id > ? order by id",
                                (after if after is not None else 0,)).fetchall()
         finally:
             con.close()
     except sqlite3.Error:
         return None
-    return [(int(r[0]), r[1]) for r in rows]
+    return [(int(r[0]), r[1], r[2]) for r in rows]
 
 
 def _write_json(path: Path, doc: Mapping[str, Any]) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")  # two writers never share a temp name
+    try:
+        tmp.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -276,27 +292,30 @@ def snapshots(root: Path | str) -> list[tuple[str, dict[str, Any]]]:
         m = read_manifest(root / n)
         if m is not None:
             out.append((n, m))
-    out.sort(key=lambda t: (str(t[1].get("taken_at")), t[0]))
+    out.sort(key=lambda t: (_taken(t[1]), t[0]))
     return out
 
 
 def prune_snapshots(root: Path | str, *, keep: int = KEEP_SNAPSHOTS, protect: str | None = None) -> list[str]:
     """Delete ``snap/`` of every occurrence under ``root`` except the newest ``keep`` that consolidated. A snapshot with
     no post record is removed only when it is older than the oldest kept one and its ``progress.json`` is not
-    ``saving`` (an unsettled save is recovery's, which needs the manifest); ``protect`` is never removed. Returns the
+    ``saving`` (an unsettled save is recovery's, which needs the manifest; once recovery has recorded its result the
+    snapshot is ordinary debris); ``protect`` is never removed. Returns the
     occurrence names pruned."""
     root = Path(root)
     allsnaps = snapshots(root)
     consolidated = [(n, m) for n, m in allsnaps if m.get("post_files")]
     kept = {n for n, _ in consolidated[-keep:]} if keep > 0 else set()
-    floor = min((str(m.get("taken_at")) for n, m in consolidated if n in kept), default=None)
+    floor = min((_taken(m) for n, m in consolidated if n in kept), default=None)
     pruned: list[str] = []
     for n, m in allsnaps:
         if n in kept or n == protect:
             continue
         if not m.get("post_files"):
             prog = _read_json(root / n / "progress.json") or {}
-            if prog.get("phase") == "saving" or floor is None or str(m.get("taken_at")) >= floor:
+            rec = _read_json(root / n / "recovery.json") or {}
+            unsettled_save = prog.get("phase") == "saving" and rec.get("ending") not in ("failed", "done", "stopped")
+            if unsettled_save or floor is None or _taken(m) >= floor:
                 continue
         shutil.rmtree(root / n / SNAP_DIR, ignore_errors=True)
         pruned.append(n)
@@ -354,12 +373,25 @@ def _store_id(db: Path) -> str | None:
         return None
 
 
+def store_identity_problem(db: Path | str, m: Mapping[str, Any]) -> str | None:
+    """Why the snapshot ``m`` cannot be shown to belong to the store at ``db``, or None. A missing or unreadable id on
+    EITHER side is a problem, not a pass: identical text hashes in two stores must never let one overwrite the other."""
+    want, have = m.get("store_id"), _store_id(Path(db))
+    if not want:
+        return "the snapshot records no store id, so it cannot be shown to be of this store."
+    if not have:
+        return "this store's id cannot be read, so the snapshot cannot be shown to be of it."
+    if want != have:
+        return f"the snapshot is of store {want}, this store is {have}."
+    return None
+
+
 def _later_blocker(occ_dir: Path, m: Mapping[str, Any]) -> str | None:
     """A rollback is one step, and only the newest consolidating dream's. Why a sibling occurrence taken AFTER this one
     forbids it, or None."""
-    me = (str(m.get("taken_at")), occ_dir.name)
+    me = (_taken(m), occ_dir.name)
     for n, other in snapshots(occ_dir.parent):
-        if n == occ_dir.name or (str(other.get("taken_at")), n) <= me:
+        if n == occ_dir.name or (_taken(other), n) <= me:
             continue
         if other.get("reverted_at") or other.get("revert_started_at"):
             return (f"a later dream ({n}) was rolled back; a rollback is one step, and undoing this one as well "
@@ -399,9 +431,9 @@ def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dic
     if m is None:
         return _refused("no-snapshot", f"there is no snapshot under {occ_dir / SNAP_DIR}.")
     snap = occ_dir / SNAP_DIR
-    sid = _store_id(db)
-    if m.get("store_id") and sid and m["store_id"] != sid:
-        return _refused("store-mismatch", f"the snapshot is of store {m['store_id']}, this store is {sid}.")
+    why = store_identity_problem(db, m)
+    if why:
+        return _refused("store-mismatch", why)
     if m.get("reverted_at"):
         return _refused("already-reverted", f"this dream was already rolled back at {m['reverted_at']}.")
     if _wrap_open(db):
@@ -461,12 +493,20 @@ def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dic
 
 def _finish(occ_dir: Path, m: dict[str, Any], who: str, restored: list[str],
             file_card: Callable[[dict[str, Any]], Any] | None, *, finished: bool) -> RollbackResult:
-    m["reverted_at"] = _now()
-    _write_manifest(occ_dir, m)
-    _write_json(occ_dir / ROLLBACK_RECORD, {"who": who, "at": m["reverted_at"], "files": restored,
-                                            "finished_an_interrupted_rollback": finished, "limit": LIMIT})
+    # ``reverted_at`` is the LAST durable marker: it says the record and the card are both out. A rerun after a crash
+    # (or a card that did not go) finds it unset, reuses the record already written and finishes the rest.
+    rec_path = occ_dir / ROLLBACK_RECORD
+    prior = _read_json(rec_path)
+    if prior and prior.get("at"):
+        at, restored = str(prior["at"]), list(prior.get("files") or [])
+        finished = bool(prior.get("finished_an_interrupted_rollback", finished))
+        who = str(prior.get("who") or who)
+    else:
+        at = _now()
+        _write_json(rec_path, {"who": who, "at": at, "files": restored,
+                               "finished_an_interrupted_rollback": finished, "limit": LIMIT})
     card = {"kind": "rolled-back", "dedupe_key": f"dream-rollback:{occ_dir.name}", "occurrence": occ_dir.name,
-            "who": who, "at": m["reverted_at"], "files": restored, "limit": LIMIT}
+            "who": who, "at": at, "files": restored, "limit": LIMIT}
     res = RollbackResult("finished" if finished else "rolled-back", "", restored=restored,
                          undo_dir=str(occ_dir / UNDO_DIR), card=card)
     res.message = (f"{'finished the interrupted rollback of' if finished else 'rolled back'} {occ_dir.name}: "
@@ -475,8 +515,12 @@ def _finish(occ_dir: Path, m: dict[str, Any], who: str, restored: list[str],
     if file_card is not None:
         try:
             file_card(card)
-        except Exception as exc:  # noqa: BLE001 — the text is already restored: the card is the next step's to retry
+        except Exception as exc:  # noqa: BLE001 — the text is already restored; a rerun refiles the card
             res.card_error = f"{type(exc).__name__}: {exc}"
+            res.message += f" The card was not filed ({res.card_error}); run the rollback again to file it."
+            return res
+    m["reverted_at"] = at
+    _write_manifest(occ_dir, m)
     return res
 
 
@@ -485,7 +529,8 @@ def _finish(occ_dir: Path, m: dict[str, Any], who: str, restored: list[str],
 @dataclass
 class DrillResult:
     """``outcome``: ``ok`` (every applicable step passed), ``failed`` (a step failed: an attention row) or
-    ``no-snapshot`` (a fresh install: not a failure). A step is ``ok``, ``failed`` or ``skipped`` (with why)."""
+    ``no-snapshot`` (a fresh install: not a failure) or ``deferred`` (a dream or another writer holds the store, so
+    the live store could not be copied consistently; nothing is recorded and the drill stays due). A step is ``ok``, ``failed`` or ``skipped`` (with why)."""
     outcome: str
     snapshot: str | None = None
     steps: list[dict[str, str]] = field(default_factory=list)
@@ -509,6 +554,8 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
     own guard is then doing its job. The result is written to ``<root>/drill.json`` for the gauge."""
     from anneal_memory import Store
     from levain.dream.executor import _copy_store
+
+    from levain import wrap as _w
 
     db, root = Path(store_path).resolve(), Path(root)
     res = DrillResult("no-snapshot", at=_now())
@@ -545,18 +592,28 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
     try:
         sdir = scratch / "store"
         sdir.mkdir()
+        handle = _w._lock_wrap_file(db.parent / "wrap.lock")
+        if handle is _w._ANOTHER_WRAP_RUNNING:
+            return _deferred(res, "a consolidate holds the store's wrap lock, so the live store cannot be copied "
+                                  "consistently")
         try:
             copy_db = _copy_store(db, sdir)
         except (OSError, sqlite3.Error) as exc:
             _step(res, "restore", "failed", f"the live store could not be copied: {type(exc).__name__}: {exc}")
             return _drill_done(res, root, write_result, failed=True)
+        finally:
+            _w._unlock_wrap(handle)
         socc = scratch / "occs" / name
         (socc / SNAP_DIR).mkdir(parents=True)
         for e in m["files"].values():
             if e["sha256"] is not None:
                 shutil.copy2(snap / e["name"], socc / SNAP_DIR / e["name"])
-        _write_manifest(socc, {**m, "store_db": str(copy_db), "revert_started_at": None, "reverted_at": None})
+        # the revert markers stay as the real manifest has them: a finished rollback then refuses on the copy as
+        # ``already-reverted`` (skipped), instead of the copy reading "nothing to roll back" (a false failure)
+        _write_manifest(socc, {**m, "store_db": str(copy_db)})
         rb = rollback(copy_db, socc, who="drill")
+        if rb.outcome == "refused" and rb.code in ("wrap-open", "lock-held"):
+            return _deferred(res, f"{rb.code}: a dream is running on the store")
         if rb.outcome == "refused" and rb.code in ("foreign-write", "later-dream", "already-reverted"):
             _step(res, "restore", "skipped", f"{rb.code}: the live store is past this dream, and the rollback guard "
                                              f"refused it on the copy (as designed). {rb.message}")
@@ -582,6 +639,13 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     return _drill_done(res, root, write_result)
+
+
+def _deferred(res: DrillResult, why: str) -> DrillResult:
+    """A drill that could not look at a consistent live store says so and records nothing, so it stays due."""
+    res.outcome = "deferred"
+    res.steps.append({"name": "restore", "status": "skipped", "detail": f"deferred: {why}"})
+    return res
 
 
 def _drill_done(res: DrillResult, root: Path, write: bool, *, failed: bool = False) -> DrillResult:
