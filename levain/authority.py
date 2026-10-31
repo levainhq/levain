@@ -1491,7 +1491,7 @@ def _graduation_phone_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: 
 # a stored one would move the incarnation on every renew). It lasts at most AGENT_LINK_MAX past its link, and a renew
 # at most that past its own. ``store_id`` here is the AUTONOMIC store's id (the record's own base ``store_id`` is the
 # cockpit's); a reader holds it to the store it reads. ``guard`` is the guard itself, not a hash. Nothing here reads
-# the autonomic store: whether a link is live for a launch is a reader's question (levain.agent_authority).
+# the autonomic store: whether a link is live for a launch is a reader's question (levain.agent_authority, a later slice: BUILD_PLAN P5c-1).
 AGENT_LINK_KIND = "agent-link"
 AGENT_LINK_MAX = _CONSENT_GRANT_MAX
 _AGENT_LINK_FIELDS = frozenset({"id", "kind", "agent_id", "store_id", "spec_hash", "role_hash", "binding_id",
