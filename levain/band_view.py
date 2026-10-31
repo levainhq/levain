@@ -54,6 +54,7 @@ from typing import Any, NamedTuple, Protocol
 
 from levain.band_shorthand import ItemInfo, Parse, Refusal, View, parse
 from levain.band_sources import Extra, Extras, NotOffered, read_extras, sheet_text
+from levain.coordinator.review import require_aware_now
 from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent.questions import (HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select, open_ended_of,
                                      read_deadline)
@@ -189,7 +190,7 @@ def _busy(exc: sqlite3.OperationalError) -> bool:
     return code is not None and (code & 0xFF) in (5, 6)
 
 
-def _number(store: QuestionStore, refs: list[Any], deadline: float) -> dict[Any, int]:
+def _number(store: QuestionStore, refs: list[Any], deadline: float, now: datetime | None = None) -> dict[Any, int]:
     """Number every ``refs`` that has no number yet (in the order given), in ONE write transaction waited for until
     ``deadline``. A ref is a question id, or ``(source, ref)`` for another source; the result is keyed as given. The numbers come back read under the lock, so two writers never number a ref twice. The lock still
     busy at the deadline: nothing written, nothing returned (``new (number pending)``); any other error is raised."""
@@ -199,7 +200,7 @@ def _number(store: QuestionStore, refs: list[Any], deadline: float) -> dict[Any,
         with store._write_by(deadline) as conn:
             for stmt in BAND_SCHEMA:
                 conn.execute(stmt)
-            stamp = utc_stamp(_now_utc(store._clock))
+            stamp = utc_stamp(now if now is not None else _now_utc(store._clock))   # ``now`` given: no clock is read
             got: dict[Any, int] = {}
             for key in refs:
                 source, ref = key if isinstance(key, tuple) else ("question", key)
@@ -300,6 +301,7 @@ def render_full(store: QuestionStore | None = None, *, deadline: float | None = 
     listed ``new (number pending):`` and nothing is written (the default numbers it, one bounded write). ``now`` (an
     aware datetime; default ``None`` = the wall clock): every expiry of the authority sources is judged at it and none
     of their clocks is read (only ``Rendered.gen`` still reads ``time.time_ns()``, which is not part of the text)."""
+    require_aware_now(now, "render_full")        # before any read
     store = store if store is not None else QuestionStore()
     gen = time.time_ns()                      # before the snapshot: a later render has a greater gen
     deadline = deadline if deadline is not None else time.monotonic() + HOOK_BUSY_MS / 1000
@@ -332,7 +334,7 @@ def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sq
     new = [k for k, _ in entries if (numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)) is None]
     new.sort(key=lambda k: filed.get(k, ""))              # each source's own filed time; a stable sort keeps ties
     if new and numbering:
-        got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline)
+        got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline, now)
         numbers = {**numbers, **{k: v for k, v in got.items() if isinstance(k, str)}}
         extra_numbers = {**extra_numbers, **{k: v for k, v in got.items() if isinstance(k, tuple)}}
 
@@ -953,7 +955,7 @@ def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: f
     new.sort(key=lambda k: filed.get(k, ""))
     if new and numbering:                     # a queue that is all numbered takes no write lock
         try:
-            got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline)
+            got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline, now)
         except Exception:  # noqa: BLE001 - those items stay unnumbered and the snapshot says so, as number_for_ping does
             got = {}
         numbers = {**numbers, **{k: v for k, v in got.items() if isinstance(k, str)}}
@@ -1041,6 +1043,7 @@ def band_snapshot_readonly(store: Any, deadline: float | None = None, *, now: da
     index); it does not degrade to an empty band. A caller that must not fail on it (``open_brief``) catches
     ``Exception`` and says the band could not be read. WAL sidecars (``-wal``/``-shm``) are touched by any sqlite
     reader: "no write" means no row, table or file of levain's own."""
+    require_aware_now(now, "band_snapshot_readonly")   # before any read, outside the sources' per-source catch
     snap = _snapshot(store, writable=False, deadline=deadline, numbering=False, now=now, coord_conn=coord_conn)
     return {"seen_through": snap.hwm if snap.shown else None, "store_id": snap.store_id, "view_id": None,
             "items": [it for _, it in snap.entries], "note": snap.note, "queue": snap.queue,

@@ -363,3 +363,54 @@ def test_readonly_band_of_an_unreadable_questions_store_raises_it_and_the_card_s
     finally:
         os.chmod(qdir, 0o700)
         os.chmod(qs.path, 0o600)
+
+
+# ------------------------------------------------------------- 4. a naive now is refused at every entry, before any read
+def _naive():
+    return datetime(2026, 10, 31, 12, 0)
+
+
+@pytest.mark.parametrize("entry", ["band_snapshot_readonly", "render_full", "read_extras", "sign_request_menu",
+                                   "queue_request_open", "waiting_on_you", "card"])
+def test_every_entry_that_takes_now_refuses_a_naive_one_before_any_read(world, entry):
+    from levain import band_sources
+    from levain.coordinator import review
+
+    st, qs, qdir = world
+    before = _bytes(qdir)
+    calls = {
+        "band_snapshot_readonly": lambda n: band_view.band_snapshot_readonly(qs, now=n),
+        "render_full": lambda n: band_view.render_full(qs, now=n),
+        "read_extras": lambda n: band_sources.read_extras(qdir, now=n),
+        "sign_request_menu": lambda n: band_sources.sign_request_menu(qdir, "req-1", now=n),
+        "queue_request_open": lambda n: review.queue_request_open(qdir, now=n),
+        "waiting_on_you": lambda n: review.waiting_on_you(st, sign_open=lambda r: None, answer_open=lambda r: None,
+                                                          now=n),
+        "card": lambda n: morning.card(st, queue_dir=qdir, now=n),
+    }
+    with pytest.raises(CoordError, match=rf"{entry}\(now=\) must be an aware datetime"):
+        calls[entry](_naive())
+    with pytest.raises(CoordError, match="aware datetime"):
+        calls[entry]("2026-10-31T12:00:00+00:00")           # not a datetime at all
+    assert _bytes(qdir) == before
+    if entry not in ("sign_request_menu", "queue_request_open", "waiting_on_you"):
+        assert calls[entry](NOW) is not None                # an aware now still works
+    else:
+        calls[entry](NOW)
+
+
+def test_render_full_with_now_numbers_from_now_and_reads_no_store_clock(world):
+    st, qs, qdir = world
+
+    def boom():
+        raise AssertionError("the store clock was read")
+
+    qs._clock = boom
+    r = band_view.render_full(qs, now=NOW)                  # numbering left at its default (True)
+    assert r.shown == [1]
+    c = sqlite3.connect(qs.path)
+    try:
+        assert [x[0] for x in c.execute("SELECT numbered_at FROM band_items")] == ["2026-10-31T12:00:00Z"] \
+            or [x[0] for x in c.execute("SELECT numbered_at FROM band_items")][0].startswith("2026-10-31T12:00:00")
+    finally:
+        c.close()

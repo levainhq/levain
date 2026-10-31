@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from levain.coordinator.review import NO_REC
+from levain.coordinator.review import NO_REC, require_aware_now
 
 __all__ = ["Extra", "Extras", "NO_REC", "NotOffered", "TOKEN", "UnsafeValue", "consent_rule_command", "read_extras",
            "rec_letter_of", "sheet_text", "sign_request_menu", "SOURCES"]
@@ -234,6 +234,7 @@ def read_extras(queue_dir: Path | str, clock: Any = None, *, deadline: float | N
     replaces ``clock``."""
     from levain.consent.questions import current_read_deadline
 
+    require_aware_now(now, "read_extras")      # before any read
     if now is not None:
         clock = lambda: now  # noqa: E731
     qdir = Path(queue_dir)
@@ -393,6 +394,7 @@ def sign_request_menu(qdir: Path | str, request_id: object, *, now: Any = None) 
 
     from levain.consent import sign
 
+    require_aware_now(now, "sign_request_menu")   # before any read
     if not isinstance(request_id, str):
         return None
     try:

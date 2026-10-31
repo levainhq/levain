@@ -217,6 +217,7 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
     and ``time.time_ns()`` (the band render's ``gen``, not part of the card). Two reads of the same stores at the same
     ``now`` are equal. ``queue.db`` is read in its own short read-only connection inside ``waiting_on_you``; the
     sqlite WAL sidecars (``-wal``/``-shm``) are touched by any reader, as ever."""
+    review.require_aware_now(now, "card")         # the very first act: before any connection opens or any read
     if conn is None:
         with read_transaction(store.open_readonly) as own:
             return card(store, queue_dir=queue_dir, items=items, review_total=review_total, conn=own, now=now)
@@ -241,8 +242,6 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
         stamp = store._stamp()
         epoch = None
     else:
-        if now.tzinfo is None or now.utcoffset() is None:
-            raise CoordError("card(now=) must be an aware datetime")
         stamp = utc_stamp(now)
         epoch = now.timestamp()
     now = stamp

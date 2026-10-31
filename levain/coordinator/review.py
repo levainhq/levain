@@ -637,6 +637,15 @@ def file_know(store: CoordStore, thread_id: str | None, text: str, *, by: str = 
 
 
 # --- waiting on you (derived, never stored; C0 §2) ---------------------------------------------------------------
+def require_aware_now(now: object, entry: str = "card") -> None:
+    """The one check every public entry that takes ``now=`` runs BEFORE any read: a non-None ``now`` must be an aware
+    datetime, else :class:`CoordError` (a naive one would reach an aware-vs-naive comparison later and be swallowed
+    per record into a quietly partial result)."""
+    offset = getattr(now, "utcoffset", None)      # duck-typed: a datetime (or a subclass of one), nothing else has it
+    if now is not None and (not callable(offset) or getattr(now, "tzinfo", None) is None or offset() is None):
+        raise CoordError(f"{entry}(now=) must be an aware datetime")
+
+
 def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] | None = None,
                        conn: sqlite3.Connection | None = None,
                        now: datetime | None = None) -> Callable[[str], bool | None]:
@@ -649,9 +658,9 @@ def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] |
     rule is judged at, in place of any clock read (it wins over ``clock``)."""
     from levain.consent.queue import ConsentQueue
 
+    require_aware_now(now, "queue_request_open")   # before any read: a naive now is refused here, not at the read
     path = Path(queue_dir) / "queue.db"
     if now is not None:
-        utc_stamp(now)                            # an aware datetime only (a naive one is refused here, not at the read)
         fixed = now
         clock = lambda: fixed  # noqa: E731
     read_now = clock if clock is not None else (lambda: datetime.now(timezone.utc))
@@ -704,6 +713,8 @@ def waiting_on_you(store: CoordStore, *, sign_open: Callable[[str], bool | None]
     transaction a caller already holds. ``now`` (an aware datetime; default ``None`` = the store's clock): the instant a
     budget-extension SIGN's expiry is judged at, so the answer is a function of the stores and ``now``."""
     from levain.coordinator import budget
+
+    require_aware_now(now, "waiting_on_you")
 
     def read(c: sqlite3.Connection) -> tuple[list[Any], dict[str, Any]]:
         got = c.execute("SELECT reply_id, thread_id, kind, ref_id, body, ref_store FROM replies WHERE kind IN "
