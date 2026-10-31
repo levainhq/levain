@@ -29,7 +29,7 @@ from levain.consent.sign import Signer, passkey_key_source
 from levain.dispatch.jobs import DB_NAME, JobStore
 from tests.test_cockpit_sign_routes import _call, _serving
 from tests.test_dispatch_phone import SoftPasskey, _b64u, file_job, lwp, recommended, repo  # noqa: F401  (fixtures)
-from tests.test_phone_server import _enrol
+from tests._phone_fixtures import _enrol
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 

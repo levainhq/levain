@@ -21,7 +21,7 @@ LAYOUT = """(() => { const q = (s) => document.querySelector(s);
   const strip = q('#ck-phonetabs'); const cs = getComputedStyle(strip);
   return JSON.stringify({ display: cs.display, position: cs.position, tabs: [...strip.querySelectorAll('button')].map(b => b.dataset.phoneJump),
     tabH: Math.min(...[...strip.querySelectorAll('button')].map(b => Math.round(b.getBoundingClientRect().height))),
-    stripFits: strip.scrollWidth <= strip.clientWidth, stripTop: top(strip), band: top(q('#ck-band')), needs: top(q('#ck-needs')), sky: top(q('#ck-skycard')), scrollW: document.documentElement.scrollWidth,
+    stripFits: strip.scrollWidth <= strip.clientWidth, stripTop: top(strip), band: top(q('#ck-band')), needs: top(q('#ck-needs')), drop: top(q('#ck-drop')), sky: top(q('#ck-skycard')), scrollW: document.documentElement.scrollWidth,
     vw: document.documentElement.clientWidth, heroDisplay: getComputedStyle(q('#ck-hero')).display, heroBox: heroBox(q('#ck-hero')) }); })()"""
 
 
@@ -52,6 +52,8 @@ def test_a_phone_gets_the_strip_the_needs_first_and_a_jump_to_each_page_view(tmp
     assert layout["heroDisplay"] == "contents" and layout["heroBox"] == "0px 0px 0px 0px 0px 0px 0px 0px rgba(0, 0, 0, 0) none", layout
     # the state line (the band), then what waits on him, then the graph
     assert layout["stripTop"] < layout["band"] < layout["needs"] < layout["sky"], layout
+    # the drop sits directly under the strip (Phill 10-30), before the graph
+    assert layout["needs"] < layout["drop"] < layout["sky"], layout
     # the board and notification tabs land their block below the sticky strip; needs is at the top already
     for which in ("board", "notes"):
         j = jumps[which]
@@ -95,15 +97,17 @@ def test_the_grants_tab_opens_the_decisions_view_at_the_standing_grants(tmp_path
 
 @needs_browser
 @needs_ssh
-def test_the_drop_tab_opens_the_decisions_view_at_the_populated_coordinator_drop(tmp_path: Path, monkeypatch) -> None:
+def test_the_drop_tab_scrolls_to_the_hero_box_and_focuses_it_with_no_view_opened(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
-    find = "document.querySelector('#levain-modal .coord-drop-slot .coord-drop-row')"   # the drop's row, not the slot that exists empty
-    steps = [*PHONE_TOUCH, {"init": SLOW_READS}, {"until": NEEDS, "ms": 30000}, *_in_view("drop", find)]
+    steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, {"until": "document.querySelector('#ck-drop-words:not(:disabled)')", "ms": 30000}, SETTLE,
+             {"eval": "window.scrollTo(0, 2500); 1"}, {"eval": "document.querySelector('[data-phone-jump=drop]').click(); 1"},
+             {"eval": "new Promise(r => setTimeout(r, 900)).then(() => 1)"},
+             {"eval": "JSON.stringify({ top: Math.round(document.getElementById('ck-drop').getBoundingClientRect().top), modal: !!document.getElementById('levain-modal'),"
+                      " focused: document.activeElement === document.getElementById('ck-drop-words') })"}]
     with rig.serving():
-        got = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")]
-    assert got[-1]["heldAtTap"] >= 1, json.dumps(got[-1])   # the drop read was still held when the tab was tapped: the jump had to wait for it
-    assert got[-1]["open"] and got[-1]["populated"] and got[-1]["inBody"] and got[-1]["scrolled"] > 0, json.dumps(got[-1])
+        got = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")][-1]
+    assert got["modal"] is False and got["focused"] is True and 40 <= got["top"] < 140, got   # below the sticky strip, box focused
 
 
 @needs_browser
@@ -111,14 +115,14 @@ def test_the_drop_tab_opens_the_decisions_view_at_the_populated_coordinator_drop
 def test_a_view_closed_and_opened_again_is_not_scrolled_by_the_wait_of_the_one_before(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
-    row = "document.querySelector('#levain-modal .coord-drop-slot .coord-drop-row')"
+    row = "[...document.querySelectorAll('#levain-modal .ext-grouphead')].find(h => /standing grants/.test(h.textContent))"
     reopen = ("(() => { const first = document.getElementById('levain-modal');"
               " first.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));"
               " const closed = !document.getElementById('levain-modal'); window.LevainNeeds.history(null);"
               " const second = document.getElementById('levain-modal');"
               " return JSON.stringify({ step: 'reopen', closed, opened: !!second, another: !!second && second !== first }); })()")
     steps = [*PHONE_TOUCH, {"init": SLOW_READS}, {"until": NEEDS, "ms": 30000}, SETTLE,
-             {"eval": "document.querySelector('[data-phone-jump=drop]').click(); 1"},   # the tap opens the view; its wait for the held read begins
+             {"eval": "document.querySelector('[data-phone-jump=grants]').click(); 1"},   # the tap opens the view; its wait for the held read begins
              {"eval": reopen}, {"until": row, "ms": 30000}, {"eval": "new Promise(r => setTimeout(r, 900)).then(() => 1)"},
              {"eval": "JSON.stringify({ step: 'after', scrolled: Math.round(document.querySelector('#levain-modal .modal-body').scrollTop) })"}]
     with rig.serving():

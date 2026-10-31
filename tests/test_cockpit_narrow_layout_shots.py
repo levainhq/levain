@@ -54,15 +54,15 @@ def shoot(tmp_path: Path, monkeypatch: Any, out_dir: Path, prefix: str) -> dict:
         phone += _look(out_dir, f"{prefix}_390_board", "document.querySelector('.panel[data-ck-panel=\"tray\"]')")
         phone += _look(out_dir, f"{prefix}_390_notes", NOTES)
         phone += [{"eval": OPEN_DECISIONS}, {"until": "document.querySelector('#levain-modal [data-consent-grant]')", "ms": 30000},
-                  {"until": "document.querySelector('#levain-modal [data-coord-drop]')", "ms": 30000}, SETTLE,
+                  {"until": "document.querySelector('#ck-drop [data-coord-drop]')", "ms": 30000}, SETTLE,
                   {"eval": METRICS % "document.getElementById('levain-modal')"}]
         phone += _look(out_dir, f"{prefix}_390_decisions", "document.querySelector('#levain-modal .modal-body')")
         phone += _look(out_dir, f"{prefix}_390_grants", GRANTS_HEAD)
-        phone += _look(out_dir, f"{prefix}_390_drop", "document.querySelector('#levain-modal .coord-drop-slot')")
-        phone += _look(out_dir, f"{prefix}_390_drop_card", "document.querySelector('#levain-modal .coord-drop-row')")
+        phone += _look(out_dir, f"{prefix}_390_drop", "document.getElementById('ck-drop')")
+        phone += _look(out_dir, f"{prefix}_390_drop_card", "document.querySelector('#ck-drop .drop-actions')")
         out["phone"] = drive_touch(tmp_path, url, phone)["values"]
         desktop = [DESKTOP, {"until": NEEDS, "ms": 30000}, SETTLE, {"shot": str(out_dir / f"{prefix}_1440.png"), "full": True},
-                   {"eval": OPEN_DECISIONS}, {"until": "document.querySelector('#levain-modal [data-coord-drop]')", "ms": 30000}, SETTLE,
+                   {"eval": OPEN_DECISIONS}, {"until": "document.querySelector('#ck-drop [data-coord-drop]')", "ms": 30000}, SETTLE,
                    {"shot": str(out_dir / f"{prefix}_1440_decisions.png"), "full": False}]
         out["desktop"] = _drive(tmp_path, url, desktop)["values"]
     return out

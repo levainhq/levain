@@ -20,7 +20,7 @@
 //                                            a cancelled Face ID as the page sees it); nothing is collected
 //   {"key": "<key>"}                        one trusted key press (down, then up) to the focused element; nothing is collected
 // App content that loads asynchronously is not waited for: put an `until` step before the `shot`.
-// A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...]} as JSON on stdout.
+// A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...], "dialogs": ["<type>: <message>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,7 +35,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
 const prof = mkdtempSync(join(tmpdir(), "levain-page-drive-"));
 const chromeFlags = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "chrome_flags.json"), "utf8")).flags;
-const chrome = spawn(chromePath, [...chromeFlags, `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
+// LEVAIN_DRIVE_CHROME_FLAGS: a JSON array of extra Chrome flags (a test that must reach the server under a proxied name)
+const extraFlags = process.env.LEVAIN_DRIVE_CHROME_FLAGS ? JSON.parse(process.env.LEVAIN_DRIVE_CHROME_FLAGS) : [];
+const chrome = spawn(chromePath, [...chromeFlags, ...extraFlags, `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
   "--no-first-run", "--window-size=1440,1000", "about:blank"], { stdio: "ignore" });
 // the Python runner gives the driver its own TMPDIR (levain-run-*); a parent that died leaves that for the driver to remove
 const scratch = /\/levain-run-[^/]+\/?$/.test(tmpdir()) ? tmpdir() : null;
@@ -60,11 +62,12 @@ for (let i = 0; i < 80 && !targets; i++) { try { targets = await (await fetch(`h
 if (!targets) { console.error("chrome never answered"); done(2); }
 const ws = new WebSocket(targets.find((t) => t.type === "page").webSocketDebuggerUrl);
 await new Promise((r) => ws.addEventListener("open", r));
-let id = 0; const pend = new Map(); const posts = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
+let id = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
   if (trail.length > 50) trail.shift();          // a page refused in a loop keeps its last 50
+  if (d.method === "Page.javascriptDialogOpening") dialogs.push(`${d.params.type}: ${String(d.params.message)}`);
   if (d.method === "Page.javascriptDialogOpening") trail.push(`dialog declined: ${d.params.type} ${String(d.params.message).slice(0, 80)}`);
   if (d.method === "Network.requestWillBeSent" && d.params.request.method === "POST") {
     posts.push(d.params.request.url.replace(/^https?:\/\/[^/]+/, "") + " " + (d.params.request.postData || ""));
@@ -189,5 +192,5 @@ for (const s of steps) {
     values.push(await evaluate(s.eval));
   }
 }
-process.stdout.write(JSON.stringify({ values, posts }));
+process.stdout.write(JSON.stringify({ values, posts, dialogs }));
 ws.close(); done(0);

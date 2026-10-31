@@ -93,15 +93,16 @@ def test_the_manifest_names_the_transport_from_the_substrate_views_flags(tmp_pat
     with _serve(src, surface_tokens={"browser": "T"}) as (url, _httpd):
         man = _get(f"{url}/cockpit/manifest.json", token="T")
         sub = _get(f"{url}/substrate.json", token="T")
-    assert man["transport"] == {"writable": sub["writable"], "write_token_required": sub["write_token_required"]}
-    assert man["transport"] == {"writable": True, "write_token_required": True}
+    assert {k: man["transport"][k] for k in ("writable", "write_token_required")} == {
+        "writable": sub["writable"], "write_token_required": sub["write_token_required"]}
+    assert man["transport"] == {"writable": True, "write_token_required": True, "owner_key": True}
     assert man["schema"] == "levain.cockpit/2"
 
     root, _src, _ids = _install(tmp_path / "r")
     ro = dataclasses.replace(SubstrateSource.local(root), write_scope=None)
     with _serve(ro) as (url, _httpd):
         man = _get(f"{url}/cockpit/manifest.json")
-    assert man["transport"] == {"writable": False, "write_token_required": False}
+    assert man["transport"] == {"writable": False, "write_token_required": False, "owner_key": False}
 
 
 def test_the_transport_is_in_the_manifest_etag(rig) -> None:

@@ -88,12 +88,20 @@ h2 { margin: 0 0 var(--sp-3); font: 600 11px/1 var(--round); letter-spacing: var
 .req.sign .card-detail > summary { color: var(--text); font-size: 15px; border-top: 1px solid var(--hair); padding-top: var(--sp-3); }
 .req.sign .card-detail-body { padding-top: var(--sp-3); }
 .req.sign .card-sec { margin: 0 0 var(--sp-5); }
-.req.sign .card-label { margin: 0 0 var(--sp-2); font: 700 11px/1.3 var(--round); letter-spacing: var(--track-caps);
-                        text-transform: uppercase; color: var(--label); }
+.req.sign .card-label { margin: 0 0 var(--sp-2); font: 700 14px/1.3 var(--round); letter-spacing: normal; text-transform: none;
+                        color: var(--text); }
 .req.sign .card-label-top { margin-top: var(--sp-2); }
 .req.sign .card-p { margin: 0 0 var(--sp-3); line-height: 1.5; color: var(--text); overflow-wrap: anywhere; }
 .req.sign .card-list { margin: 0 0 var(--sp-3); padding-left: var(--sp-5); line-height: 1.5; color: var(--text); }
 .req.sign .card-list li { margin: 0 0 var(--sp-2); overflow-wrap: anywhere; }
+.req.sign .card-opts { list-style: none; margin: 0 0 var(--sp-3); padding: 0; }
+.req.sign .card-opt { margin: 0 0 var(--sp-3); padding: var(--sp-2) var(--sp-3); border: 1px solid var(--hair); border-radius: var(--r-md); }
+.req.sign .card-opt-rec { border-color: var(--hair-2); background: var(--card-2); }
+.req.sign .card-opt-row { display: flex; gap: var(--sp-3); align-items: baseline; line-height: 1.45; }
+.req.sign .card-opt-key { font-weight: 700; color: var(--label); flex: none; }
+.req.sign .card-opt-text { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--text); }
+.req.sign .card-rec-mark { flex: none; padding: 1px var(--sp-2); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: 700 11px/1.4 var(--round); color: var(--label); }
+.req.sign .card-opt-why { margin: var(--sp-2) 0 0; line-height: 1.45; color: var(--label); overflow-wrap: anywhere; }
 .row.dispatch { border-top: 2px solid var(--accent); }   /* a dispatch job waits on you as a request does */
 .row.dispatch .display { user-select: text; }
 .row.dispatch summary { min-height: var(--hit-min); padding: var(--sp-3) 0; box-sizing: border-box; cursor: pointer;
@@ -181,3 +189,9 @@ textarea.words { width: 100%; box-sizing: border-box; margin-top: var(--sp-4); f
 .band-bar { display: flex; gap: var(--sp-4); align-items: center; margin-top: var(--sp-5); }
 .band-box { flex: 1 1 auto; min-width: 0; box-sizing: border-box; min-height: 44px; padding: 0 var(--sp-4); font: 16px/1.2 var(--mono);
   color: inherit; background: transparent; border: 1px solid var(--hair-2); border-radius: 10px; }
+
+/* Free-text fields (Phill 10-30): one rule for the multi-line boxes (same as dashboard.css), full width, ~8 rows, growing,
+   16px against iOS zoom; the one-line write-in and reason inputs get the width and font only. */
+body :is(textarea.words, textarea.drop-words, .stateline textarea) { display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box;
+  min-height: 12em; font-size: 16px; line-height: 1.45; resize: vertical; field-sizing: content; }
+body :is(.req.sign input.write-in, .row.dispatch input.reason) { width: 100%; box-sizing: border-box; font-size: 16px; }

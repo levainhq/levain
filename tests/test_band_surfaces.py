@@ -10,11 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import threading
 import time
-import urllib.error
-import urllib.request
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -22,7 +18,6 @@ import pytest
 from levain import band_view
 from levain.consent import band
 from levain.consent.questions import QuestionStore
-from levain.phone_server import PHONE_TOKEN_HEADER, make_phone_server
 
 _TOK = "phone-band-token"
 OPTS = [("fix", "fixed 30 s"), ("exp", "exponential"), ("none", "fail loud")]
@@ -64,17 +59,6 @@ def views(store: QuestionStore, viewer: str | None = None) -> list:
                          (viewer,)).fetchall()
 
 
-@contextmanager
-def serving(qdir: Path):
-    httpd = make_phone_server(qdir, "localhost", port=0, token=_TOK, dispatch_dir=qdir)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{httpd.server_address[1]}"
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=5)
 
 
 def bind(b: dict) -> dict:
@@ -82,20 +66,6 @@ def bind(b: dict) -> dict:
     return {"store_id": b["store_id"], "view_id": b["view_id"]}
 
 
-def call(url: str, body: object = None, *, token: str | None = _TOK):
-    h = {}
-    if token is not None:
-        h[PHONE_TOKEN_HEADER] = token
-    data = None
-    if body is not None:
-        data = json.dumps(body).encode()
-        h["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=h, method="POST" if data is not None else "GET")
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return r.status, json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode())
 
 
 # --- apply_plan takes the channel -------------------------------------------------------------------------
@@ -160,20 +130,6 @@ def test_the_seat_hook_still_records_a_view_per_prompt(qdir):
 
 
 # --- the phone: the band payload and POST /band/answer ------------------------------------------------------
-def test_the_phone_listing_carries_the_band_with_its_binding_and_numbers_on_show(qdir):
-    store = QuestionStore(qdir)
-    ask(store)
-    with serving(qdir) as base:
-        status, body = call(base + "/consent.json")
-        assert status == 200
-        b = body["band"]
-        assert b["seen_through"] == 1 and b["store_id"] == store.store_id and isinstance(b["view_id"], int)
-        (item,) = b["items"]
-        assert item["n"] == 1 and item["kind"] == "information" and item["rec"] == "b"
-        assert [o["letter"] for o in item["options"]] == ["a", "b", "c"]
-        for _ in range(3):
-            call(base + "/consent.json")
-    assert len(views(store, "phone:run")) == 1
 
 
 def test_an_unchanged_poll_takes_the_lock_but_records_no_new_view_row(qdir):
@@ -181,16 +137,15 @@ def test_an_unchanged_poll_takes_the_lock_but_records_no_new_view_row(qdir):
     nothing: the band_views count and max seq are unchanged and the view_id answered is the existing one."""
     store = QuestionStore(qdir)
     ask(store)
-    with serving(qdir) as base:
-        first = call(base + "/consent.json")[1]["band"]
-        with sqlite3.connect(store.path) as c:
-            before = c.execute("SELECT COUNT(*), MAX(seq) FROM band_views").fetchone()
-        status, body = call(base + "/consent.json")
-        with sqlite3.connect(store.path) as c:
-            after = c.execute("SELECT COUNT(*), MAX(seq) FROM band_views").fetchone()
-    assert status == 200 and body["band"]["seen_through"] == 1
+    first = band_view.band_payload(store, "phone:run")
+    with sqlite3.connect(store.path) as c:
+        before = c.execute("SELECT COUNT(*), MAX(seq) FROM band_views").fetchone()
+    again = band_view.band_payload(store, "phone:run")
+    with sqlite3.connect(store.path) as c:
+        after = c.execute("SELECT COUNT(*), MAX(seq) FROM band_views").fetchone()
+    assert again["seen_through"] == 1
     assert before == after and before[0] == 1, (before, after)
-    assert body["band"]["view_id"] == first["view_id"] == before[1]
+    assert again["view_id"] == first["view_id"] == before[1]
 
 
 def test_a_poll_against_a_busy_write_lock_records_nothing_and_still_answers(qdir):
@@ -211,107 +166,6 @@ def test_a_poll_against_a_busy_write_lock_records_nothing_and_still_answers(qdir
         after = c.execute("SELECT COUNT(*), MAX(seq) FROM band_views").fetchone()
     assert before == after, (before, after)               # nothing was recorded
     assert got["view_id"] is None and got["note"], got    # and it answered, saying so
-
-
-def test_post_band_answer_records_phone_channel_with_its_context_and_the_seat_sees_it_closed(qdir, _no_delivery):
-    store = QuestionStore(qdir)
-    q = ask(store)
-    env = {"LEVAIN_HOME": str(qdir.parent)}
-    _t, commit = band_view.hook_prompt({"session_id": "seat1"}, env)       # the seat was shown the band
-    commit()
-    with serving(qdir) as base:
-        b = call(base + "/consent.json")[1]["band"]
-        status, body = call(base + "/band/answer", {"text": "1b", **bind(b)})
-        assert status == 200, body
-        assert body["recorded"] == ["1b"] and body["refused"] == []
-    a = store.get(q.n).answer
-    assert (a.kind, a.value, a.channel) == ("option", "exp", "phone")
-    with sqlite3.connect(store.path) as c:
-        ctx = c.execute("SELECT via, viewer, seen_through FROM answer_context WHERE question_id = ?", (q.id,)).fetchone()
-    assert ctx == ("phone", "phone:run", 1)
-    text, commit = band_view.hook_prompt({"session_id": "seat1"}, env)
-    commit()
-    assert "closed 1 (answered via phone)" in text
-    assert _no_delivery == [q.id]
-
-
-def test_post_band_answer_refuses_another_store_and_a_claimed_view_it_never_recorded(qdir):
-    store = QuestionStore(qdir)
-    q = ask(store)
-    with serving(qdir) as base:
-        b = call(base + "/consent.json")[1]["band"]
-        s, body = call(base + "/band/answer", {"text": "1a", **bind(b), "store_id": "another-store"})
-        assert s == 409 and body["error"] == "stale_band"
-        s, body = call(base + "/band/answer", {"text": "1a", **bind(b), "view_id": b["view_id"] + 5})
-        assert s == 409 and body["error"] == "stale_band"
-    assert store.get(q.n).answer is None
-
-
-def test_post_band_answer_before_any_listing_has_no_view_and_records_nothing(qdir):
-    store = QuestionStore(qdir)
-    q = ask(store)
-    with serving(qdir) as base:
-        s, body = call(base + "/band/answer", {"text": "1a", "store_id": store.store_id, "view_id": 1})
-    assert s == 409 and body["error"] == "stale_band"
-    assert store.get(q.n).answer is None
-
-
-def test_post_band_answer_needs_the_token_and_exactly_its_keys(qdir):
-    store = QuestionStore(qdir)
-    q = ask(store)
-    with serving(qdir) as base:
-        b = call(base + "/consent.json")[1]["band"]
-        good = {"text": "1a", **bind(b)}
-        assert call(base + "/band/answer", good, token=None)[0] == 403
-        assert call(base + "/band/answer", good, token="wrong")[0] == 403
-        assert call(base + "/band/answer", {**good, "via": "seat"})[0] == 400
-        assert call(base + "/band/answer", {"text": "1a"})[0] == 400
-        assert call(base + "/band/answer", {**good, "view_id": str(b["view_id"])})[0] == 400
-        assert call(base + "/band/answer", {**good, "view_id": True})[0] == 400
-        old = {"text": "1a", "seen_through": b["seen_through"], "store_id": b["store_id"]}   # the r1 binding
-        assert call(base + "/band/answer", old)[0] == 400
-    assert store.get(q.n).answer is None
-
-
-def test_post_band_answer_whole_text_must_parse_and_a_second_answer_is_refused(qdir):
-    store = QuestionStore(qdir)
-    q = ask(store)
-    with serving(qdir) as base:
-        b = call(base + "/consent.json")[1]["band"]
-        s, body = call(base + "/band/answer", {"text": "yes please ship it", **bind(b)})
-        assert s == 422 and body["error"] == "answer_refused"
-        assert store.get(q.n).answer is None
-        assert call(base + "/band/answer", {"text": "1a", **bind(b)})[0] == 200
-        s, body = call(base + "/band/answer", {"text": "1b", **bind(b)})
-        assert s == 422 and body["refused"]
-    assert store.get(q.n).answer.value == "fix"
-
-
-def test_a_relay_line_is_never_a_band_answer_on_the_phone(qdir):
-    """Q1 (a): a relayed turn is no operator answer. The phone route takes the operator's typing only; a line Levain
-    itself wrote is not band shorthand and records nothing."""
-    store = QuestionStore(qdir)
-    q = ask(store)
-    with serving(qdir) as base:
-        b = call(base + "/consent.json")[1]["band"]
-        s, _ = call(base + "/band/answer", {"text": "levain: an answer was recorded 1a", **bind(b)})
-    assert s == 422 and store.get(q.n).answer is None
-
-
-def test_an_authority_item_is_never_answered_by_the_shorthand_route(qdir):
-    store = QuestionStore(qdir)
-    q = ask(store)
-    from levain.consent.questions import Link
-    # a question that leads to a push is an authority item: shorthand opens its sheet, records nothing
-    q2 = store.file(agent="claude_code", agent_session_id="sess-1", what="Push it?", options=[("go", "Push"), ("no", "No")],
-                    rec="go", blocks="x", cwd="/tmp/proj", link=Link("go", "push", "req-1", "qid-1"))
-    with serving(qdir) as base:
-        b = call(base + "/consent.json")[1]["band"]
-        kinds = {i["n"]: i["kind"] for i in b["items"]}
-        assert kinds == {1: "information", 2: "authority"}
-        s, body = call(base + "/band/answer", {"text": "2a", **bind(b)})
-    assert body.get("recorded", []) == []
-    assert store.get(q2.n).answer is None and store.get(q.n).answer is None
 
 
 # --- L3 r1 fix round: the view an answer names, checked inside the write ------------------------------------------
@@ -394,23 +248,6 @@ def test_an_answer_from_a_view_that_lost_an_item_with_seen_through_unchanged_is_
     assert band_view.answer_text(store, "2a", viewer="phone:run", channel="phone", **bind(v2)).recorded == ["2a"]
 
 
-@pytest.mark.parametrize("fault", [sqlite3.OperationalError("disk I/O error"),
-                                   sqlite3.DatabaseError("database disk image is malformed"),
-                                   OSError(28, "No space left on device")])
-def test_a_store_write_failure_is_503_on_the_phone_never_a_refusal(qdir, monkeypatch, fault):
-    """codex MED 4: an infrastructure failure inside the answer's write reaches the 503 handler."""
-    store = QuestionStore(qdir)
-    q = ask(store)
-
-    def faulting(self, *a, **k):
-        raise fault
-
-    with serving(qdir) as base:
-        b = call(base + "/consent.json")[1]["band"]
-        monkeypatch.setattr(QuestionStore, "answer_with_context", faulting)
-        s, body = call(base + "/band/answer", {"text": "1a", **bind(b)})
-    assert s == 503 and body["error"] == "unavailable", body
-    assert store.get(q.n).answer is None
 
 
 def _band_tables(store: QuestionStore) -> dict[str, int]:
@@ -420,15 +257,6 @@ def _band_tables(store: QuestionStore) -> dict[str, int]:
                 for t in ("band_items", "band_views") if t in have}
 
 
-def test_head_consent_json_never_shows_the_band(qdir):
-    """codex MED 3 (the HEAD half): HEAD delivers no body, so it numbers nothing and records no view."""
-    store = QuestionStore(qdir)
-    ask(store)
-    with serving(qdir) as base:
-        req = urllib.request.Request(base + "/consent.json", headers={PHONE_TOKEN_HEADER: _TOK}, method="HEAD")
-        with urllib.request.urlopen(req, timeout=20) as r:
-            assert r.status == 200
-    assert _band_tables(store) in ({}, {"band_items": 0, "band_views": 0})
 
 
 def test_the_real_lock_held_past_the_bound_is_raised_never_a_refusal(qdir):
