@@ -9,17 +9,22 @@ import pytest
 from levain.coordinator import morning
 from levain.webpush import presence
 from levain.webpush.presence import PresenceError, read_log, read_word, set_word
+from levain.webpush.quote import Match
 
 SEAT = {"agent": "claude_code", "session": "s-1", "role": "seat"}
 COORD = {"agent": "claude_code", "session": "c-1", "role": "coordinator"}
 T = time.time() - 1800.0   # inside the card's 24 h window
 
 
+def said(at: float) -> Match:
+    return Match(True, at, "test: the quote is in an operator turn")
+
+
 def test_each_word_a_setter_replaces_stays_on_record_and_the_card_names_the_setter(tmp_path):
     set_word(tmp_path, "quiet", duration="2h", now=T)
-    set_word(tmp_path, "away", by=SEAT, said="anything at all", now=T + 60)
+    set_word(tmp_path, "away", by=SEAT, said="anything at all", now=T + 60, match=said(T + 30))
     set_word(tmp_path, "sleep", now=T + 120)
-    set_word(tmp_path, "remote", by=COORD, said="I am on the train", now=T + 180)
+    set_word(tmp_path, "remote", by=COORD, said="I am on the train", now=T + 180, match=said(T + 150))
     rows = read_log(tmp_path)
     assert [(r["word"], r["outcome"], r["prior"].get("word")) for r in rows] == [
         ("quiet", "set", None), ("away", "set", "quiet"), ("sleep", "set", "away"), ("remote", "set", "sleep")]
@@ -51,7 +56,7 @@ def test_an_unwritable_log_refuses_a_setter_and_not_the_operator(tmp_path, capsy
     set_word(tmp_path, "quiet", duration="10m", now=T)
     before = (tmp_path / "webpush" / presence.FILE_NAME).read_text()
     with pytest.raises(PresenceError, match="no record is not made"):
-        set_word(tmp_path, "away", by=SEAT, said="heading out", now=T + 60)
+        set_word(tmp_path, "away", by=SEAT, said="heading out", now=T + 60, match=said(T + 30))
     assert (tmp_path / "webpush" / presence.FILE_NAME).read_text() == before
     assert read_word(tmp_path)["word"] == "quiet"
     assert set_word(tmp_path, "sleep", now=T + 120)["word"] == "sleep"   # his own word goes through
@@ -63,7 +68,8 @@ def test_past_the_size_bound_the_log_rotates_and_reads_back_newest_first_kept(tm
     for i in range(40):
         set_word(tmp_path, "remote", duration=f"{i + 1}m", by=SEAT, said=f"word {i}", now=T + i)
     d = tmp_path / "webpush"
-    assert (d / (presence.LOG_NAME + ".1")).stat().st_size < 3000 and (d / presence.LOG_NAME).stat().st_size < 3000
+    assert (d / (presence.LOG_NAME + ".1")).stat().st_size < 3000
+    assert not (d / presence.LOG_NAME).exists() or (d / presence.LOG_NAME).stat().st_size < 3000
     rows = read_log(tmp_path)
     assert 2 <= len(rows) < 40 and rows[-1]["said"] == "word 39"
     assert [r["said"] for r in rows] == [f"word {i}" for i in range(40 - len(rows), 40)]
