@@ -8,7 +8,8 @@ row, and nothing else.
 
 Both render first (a read), then write in one transaction that re-checks its anchor, returns the stored build when the
 signal was already built (a duplicate signal is the same build, never a second one), and inserts. The rendered body is
-stored whole, so a build that died before delivery is re-sent faithfully. Stdlib only.
+stored whole, so a build that died before delivery is re-sent faithfully. A degraded brief (its store read failed) and
+a body the column cannot hold are refused before the write opens, so a retry reads the stores again. Stdlib only.
 """
 from __future__ import annotations
 
@@ -34,11 +35,26 @@ def _check(kind: Any, signal_kind: Any, signal_key: Any) -> None:
         raise CoordError("an open's signal key is non-empty text")
 
 
-def _insert(conn: Any, now: str, brief: Brief, signal_kind: str, signal_key: str) -> OpenBuild:
+def _storable(brief: Brief) -> bytes:
+    """The body's bytes, or :class:`CoordError` before the write transaction opens: a brief whose store read failed
+    (stored, it would be returned for its signal for good), and a body the column cannot hold."""
+    if brief.degraded:
+        raise CoordError(f"the brief's store read failed ({brief.degraded}); a degraded brief is never stored, so "
+                         "nothing was written and a retry builds it again")
+    try:
+        body = brief.text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise CoordError(f"the brief's body is not encodable text ({exc.reason}); nothing was written") from None
+    if len(body) > BODY_CAP:
+        raise CoordError(f"the brief's body is {len(body)} bytes, over the cap of {BODY_CAP}; nothing was written")
+    return body
+
+
+def _insert(conn: Any, now: str, brief: Brief, body: bytes, signal_kind: str, signal_key: str) -> OpenBuild:
     return insert_build(conn, now, seam_kind=brief.kind, signal_kind=signal_kind, signal_key=signal_key,
                         cursor_gseq=brief.cursor_gseq, shown_through_gseq=brief.shown_through_gseq,
-                        handoff_id=brief.handoff_id, body=brief.text,
-                        body_sha256=hashlib.sha256(brief.text.encode("utf-8")).hexdigest(), cuts=brief.unsequenced_cuts)
+                        handoff_id=brief.handoff_id, body=brief.text, body_sha256=hashlib.sha256(body).hexdigest(),
+                        cuts=brief.unsequenced_cuts)
 
 
 def starter_build(store: CoordStore, launch_id: Any, *, pid: Any, kind: str, queue_dir: Path | str | None) -> OpenBuild:
@@ -46,17 +62,23 @@ def starter_build(store: CoordStore, launch_id: Any, *, pid: Any, kind: str, que
     ``launch``, key the launch id: a second call is the same build. Refused with nothing written unless ALL of these
     hold in the write transaction: the launch exists and is a coordinator's, its latest event is ``pending``,
     ``launch_spawns.pid`` is this starter's pid, ``now`` is before its ``until``, and the live lease's token is the one
-    the launch was asked for under. It inherits none of ``claim_spawn``'s writes: no ``expired``, no ``failed``, no
-    spawn row, no lapse, so a refusal leaves the store as it found it."""
+    the launch was asked for under. It runs ``claim_spawn``'s several-threads check (:func:`lease.refuse_several`) and
+    inherits none of its writes: no ``expired``, no ``failed``, no spawn row, no lapse, so a refusal leaves the store
+    as it found it."""
     if not isinstance(launch_id, str) or not isinstance(pid, int) or isinstance(pid, bool):
         raise CoordError("a starter build names its launch id (text) and its own pid (a number)")
     _check(kind, "launch", launch_id)
     store._connect().close()          # the store a writer brings current: the read below must see the open tables
     brief = open_brief(store, queue_dir, kind, store._clock())
+    body = _storable(brief)
     with store._write() as (conn, now):
         ln = _leases.launch(conn, launch_id)
         if ln is None:
             raise LeaseRefused(f"there is no launch {launch_id}; nothing was written")
+        # the spawn claim's own check; its `failed` row is rolled back with the refusal, as every refusal here is
+        several = _leases.refuse_several(conn, now, ln)
+        if several is not None:
+            raise LeaseRefused(f"{several[1]}; nothing was written")
         if ln.role != "coordinator":
             raise LeaseRefused(f"launch {launch_id} is a {ln.role}'s, and an open is a coordinator's; nothing was written")
         if ln.state != "pending":
@@ -71,19 +93,22 @@ def starter_build(store: CoordStore, launch_id: Any, *, pid: Any, kind: str, que
         if held is None or not held.live or held.token != ln.token:
             raise LeaseRefused(f"launch {launch_id} was asked for under lease token {ln.token}, which is not the live "
                                "lease's; nothing was written")
-        return _insert(conn, now, brief, "launch", launch_id)
+        return _insert(conn, now, brief, body, "launch", launch_id)
 
 
 def build(store: CoordStore, *, kind: str, signal_kind: str, signal_key: str, queue_dir: Path | str | None,
           token: Any, body_cap: int = BODY_CAP) -> OpenBuild:
     """Every build but the cold start's: fenced by the lease token and :func:`active_coordinator_fence` (the operator's
     lease is refused). A signal already built returns its build and writes nothing but the fence's own record of the
-    write."""
+    write. ``body_cap`` can only lower the cap: it is clamped to :data:`BODY_CAP`, the column's own."""
     _check(kind, signal_kind, signal_key)
     if token is None or not isinstance(token, int) or isinstance(token, bool):
         raise CoordError("a build needs the coordinator's identity (the live lease token); nothing was written")
+    if not isinstance(body_cap, int) or isinstance(body_cap, bool):
+        raise CoordError("a build's body cap is a number of bytes")
     store._connect().close()
-    brief = open_brief(store, queue_dir, kind, store._clock(), body_cap=body_cap)
+    brief = open_brief(store, queue_dir, kind, store._clock(), body_cap=min(body_cap, BODY_CAP))
+    body = _storable(brief)
     with store._write("coordinator", token) as (conn, now):
         active_coordinator_fence(conn, now, token, "an open build")
-        return _insert(conn, now, brief, signal_kind, signal_key)
+        return _insert(conn, now, brief, body, signal_kind, signal_key)

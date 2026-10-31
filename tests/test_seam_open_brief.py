@@ -51,6 +51,7 @@ def world(tmp_path):
     got, why = s.launch_activate(ln["launch_id"], harness_session_id="probe-A")
     assert why is None and got.state == "active"
     s.session_key = got.session_key
+    s.launch_id = got.launch_id
     s.qdir = _dir(tmp_path, "q")
     return s
 
@@ -67,7 +68,10 @@ def _build(s, key="k1", kind="operator", **kw):
     return seam_build.build(s, kind=kind, signal_kind="silence", signal_key=key, queue_dir=s.qdir, token=_token(s), **kw)
 
 
-def _ack(s, open_id, **kw):
+def _ack(s, open_id, deliver=True, **kw):
+    # an acknowledgement is of a brief that was handed over: the helper delivers first unless told not to
+    if deliver:
+        seam_open.record_delivery(s, open_id, "light_verb")
     return seam_open.acknowledge(s, open_id, token=_token(s), **kw)
 
 
@@ -447,3 +451,211 @@ def test_every_open_table_is_append_only_and_the_build_is_bounded(world):
         _raw(world, "INSERT OR REPLACE INTO open_builds (seam_kind, signal_kind, signal_key, cursor_gseq, "
                     "shown_through_gseq, requires_ack, body, body_sha256, built_at) VALUES ('light', 'silence', 'ok', "
                     "0, 0, 1, 'y', 'h', 't')")
+
+
+# --- review fixes: a degraded brief, the ack's preconditions, the records, the cap -----------------------------------
+def _counts(s):
+    return {t: _sql(s, f"SELECT COUNT(*) FROM {t}")[0][0] for t in
+            ("open_builds", "open_deliveries", "open_acks", "open_unsequenced_cuts", "arrival_signals", "lease_events",
+             "launch_events", "gseq")}
+
+
+def _fail_once(monkeypatch, module, name, exc):
+    real = getattr(module, name)
+    calls = []
+
+    def flaky(*a, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise exc
+        return real(*a, **kw)
+
+    monkeypatch.setattr(module, name, flaky)
+
+
+def test_a_brief_whose_store_read_failed_is_never_stored_and_a_retry_builds_it_whole(world, monkeypatch):
+    _fail_once(monkeypatch, seam, "_counted_head", sqlite3.OperationalError("disk I/O error"))
+    before = _counts(world)
+    with pytest.raises(CoordError, match="store: cannot-derive: disk I/O error"):
+        _build(world, "flaky")
+    assert _counts(world) == before
+    b = _build(world, "flaky")
+    assert "store: cannot-derive" not in b.body and b.cursor_gseq > 0 and "Since (gseq 0 to" in b.body
+
+
+def test_a_cold_start_whose_store_read_failed_is_never_stored(pending, monkeypatch):
+    pending.launch_claim_spawn(pending.launch_id, os.getpid())
+    _fail_once(monkeypatch, seam, "_counted_head", sqlite3.OperationalError("disk I/O error"))
+    before = _footprint(pending)
+    with pytest.raises(CoordError, match="cannot-derive"):
+        _starter(pending)
+    assert _footprint(pending) == before
+    b = _starter(pending)
+    assert "store: cannot-derive" not in b.body and b.cursor_gseq > 0
+
+
+def test_a_detail_read_that_fails_degrades_the_brief_and_the_build_refuses_it(world, monkeypatch):
+    def broken(*a, **kw):
+        raise RuntimeError("detail broke")
+
+    monkeypatch.setattr(seam, "_detail", broken)
+    b = _brief(world)
+    assert b.degraded and "Since: cannot-derive (RuntimeError: detail broke)" in b.text.splitlines()
+    assert b.shown_through_gseq == 0 and b.cursor_gseq > 0                   # nothing of the window was read
+    before = _counts(world)
+    with pytest.raises(CoordError, match="detail broke"):
+        _build(world, "d")
+    assert _counts(world) == before
+
+
+def test_an_ack_of_a_build_never_delivered_is_refused(world):
+    b = _build(world, "undelivered")
+    before = _counts(world)
+    with pytest.raises(CoordError, match="never delivered"):
+        _ack(world, b.open_id, deliver=False)
+    assert _counts(world) == before
+
+
+def test_an_ack_of_another_launchs_build_is_refused(world):
+    other = "ln-" + "0" * 32
+    b = seam_build.build(world, kind="operator", signal_kind="launch", signal_key=other, queue_dir=world.qdir,
+                         token=_token(world))
+    seam_open.record_delivery(world, b.open_id, "launch_brief")
+    before = _counts(world)
+    with pytest.raises(CoordError, match=f"built for launch {other}"):
+        _ack(world, b.open_id, deliver=False)
+    assert _counts(world) == before
+
+
+def test_a_delivered_build_of_the_acking_launch_moves_the_cursor(world):
+    b = seam_build.build(world, kind="operator", signal_kind="launch", signal_key=world.launch_id,
+                         queue_dir=world.qdir, token=_token(world))
+    seam_open.record_delivery(world, b.open_id, "launch_brief")
+    assert _ack(world, b.open_id, deliver=False) == (b.open_id, world.session_key, True)
+    with sqlite3.connect(world.path) as c:
+        assert seam_open.acked_cursor(c) == (b.shown_through_gseq, b.open_id) and b.shown_through_gseq > 0
+
+
+def test_an_arrival_outside_a_write_transaction_is_refused(world):
+    c = sqlite3.connect(world.path, isolation_level=None)
+    try:
+        with pytest.raises(CoordError, match="write transaction"):
+            seam_open.record_arrival(c, "2026-10-31T12:00:00Z", agent="a", mark_id=1, queue_id="q")
+    finally:
+        c.close()
+    assert _sql(world, "SELECT COUNT(*) FROM arrival_signals") == [(0,)]
+
+
+class _MissFirstLookup:
+    """A connection whose first arrival lookup sees nothing: the shape of a racing writer between the read and the
+    insert."""
+
+    def __init__(self, conn):
+        self.conn, self.missed = conn, False
+
+    @property
+    def in_transaction(self):
+        return self.conn.in_transaction
+
+    def execute(self, sql, args=()):
+        if not self.missed and sql.startswith("SELECT signal_id FROM arrival_signals"):
+            self.missed = True
+            return self.conn.execute("SELECT 1 WHERE 0")
+        return self.conn.execute(sql, args)
+
+
+def test_an_arrival_whose_duplicate_the_lookup_missed_returns_the_stored_one(world):
+    with world._write("coordinator", _token(world)) as (conn, now):
+        first = seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")
+    gseq = _sql(world, "SELECT COUNT(*) FROM gseq")
+    with world._write("coordinator", _token(world)) as (conn, now):
+        again = seam_open.record_arrival(_MissFirstLookup(conn), now, agent="a", mark_id="1", queue_id="other-q")
+    assert again == (first[0], False)
+    assert _sql(world, "SELECT COUNT(*) FROM arrival_signals") == [(1,)]
+    assert _sql(world, "SELECT COUNT(*) FROM gseq")[0][0] == gseq[0][0] + 1       # only the fence's own write record
+
+
+def _counted_rows(s, n):
+    c = sqlite3.connect(s.path)
+    try:
+        with c:
+            for i in range(n):
+                g = c.execute("INSERT INTO gseq (at) VALUES ('2026-10-31T11:00:00Z')").lastrowid
+                c.execute("INSERT INTO drops (drop_id, surface, outbox_id, words, words_sha256, sent_at, received_at, "
+                          "source_how, gseq) VALUES (?, 'cli', ?, 'w', 'h', 't', 't', 'none', ?)",
+                          (f"dr-{i:032x}", f"bulk-{i}", g))
+    finally:
+        c.close()
+
+
+def test_a_cap_over_the_column_cap_is_clamped_and_a_non_ascii_brief_is_cut_in_bytes(world, monkeypatch):
+    monkeypatch.setattr(seam, "DETAIL_ROWS_MAX", 6000)
+    seam_handoffs.close(world, kind="operator", body={**HANDOFF, "notes": "€" * 4000}, request_id="big",
+                        prev_handoff_id=None, token=_token(world))
+    _counted_rows(world, 4000)
+    full = _brief(world, body_cap=10 * seam_open.BODY_CAP)
+    assert len(full.text.encode()) > seam_open.BODY_CAP                    # the brief this store renders uncut
+    b = _build(world, "big", body_cap=10 * seam_open.BODY_CAP)
+    size = len(b.body.encode("utf-8"))
+    assert size <= seam_open.BODY_CAP and size > len(b.body)             # bytes, not characters
+    assert b.shown_through_gseq < b.cursor_gseq
+    assert "  notes: " + "€" * 4000 in b.body.splitlines()                 # the handoff is never cut
+
+
+@pytest.mark.parametrize("text", ["x" * (seam_open.BODY_CAP + 1), "a lone surrogate \ud800"], ids=["over", "surrogate"])
+def test_a_body_the_column_cannot_hold_is_a_coord_error_and_nothing_is_written(world, monkeypatch, text):
+    monkeypatch.setattr(seam_build, "open_brief", lambda *a, **kw: seam.Brief("operator", text, "t", 0, 0, None))
+    before = _counts(world)
+    with pytest.raises(CoordError, match="body"):
+        _build(world, "odd")
+    assert _counts(world) == before
+
+
+def test_a_stored_build_of_another_kind_is_refused(world):
+    a = _build(world, "same", kind="operator")
+    with pytest.raises(CoordError, match="operator"):
+        _build(world, "same", kind="rotation")
+    assert _sql(world, "SELECT open_id, seam_kind FROM open_builds") == [(a.open_id, "operator")]
+
+
+def test_a_cold_start_runs_the_several_threads_check_and_writes_nothing(pending):
+    from levain.coordinator import lease
+    from levain.coordinator.store import Part
+
+    d = pending.accept_drop("two pieces of work", surface="cli")[0]
+    t1, t2 = pending.split(d.drop_id, [Part("work", "one"), Part("work", "two")])
+    with pending._write() as (conn, now):
+        tok = lease.lease(conn, now).token
+        worker = lease._pending(conn, now, token=tok, harness="claude", role="worker",
+                                threads=[t1.thread_id, t2.thread_id], model=None, cwd=None, cause="requested")
+    before = _footprint(pending)
+    with pytest.raises(LeaseRefused, match="a worker holds one thread"):
+        _starter(pending, launch_id=worker.launch_id)
+    assert _footprint(pending) == before
+
+
+def test_a_live_lease_held_by_an_active_worker_writes_no_open_record(world):
+    from levain.coordinator.store import Part
+
+    d = world.accept_drop("work for a worker", surface="cli")[0]
+    (t,) = world.split(d.drop_id, [Part("work", "w")])
+    wl = world.launch_request(_token(world), harness="claude", role="worker", threads=[t.thread_id])
+    got, why = world.launch_activate(wl.launch_id, harness_session_id="probe-W")
+    assert why is None and got.state == "active" and got.role == "worker"
+    b = _build(world, "w")
+    seam_open.record_delivery(world, b.open_id, "light_verb")
+    c = sqlite3.connect(world.path)
+    try:
+        with c:
+            g = c.execute("INSERT INTO gseq (at) VALUES ('2026-10-31T12:00:00Z')").lastrowid
+            tok = c.execute("INSERT INTO lease_events (gseq, kind, token, holder, until, cause, by, at) VALUES "
+                            "(?, 'claim', NULL, ?, '2099-01-01T00:00:00Z', 'probe', 'coordinator', "
+                            "'2026-10-31T12:00:00Z')", (g, got.session_key)).lastrowid
+    finally:
+        c.close()
+    before = _counts(world)
+    with pytest.raises(LeaseRefused, match="active coordinator launch"):
+        seam_open.acknowledge(world, b.open_id, token=tok)
+    with pytest.raises(LeaseRefused, match="active coordinator launch"):
+        seam_build.build(world, kind="light", signal_kind="silence", signal_key="w2", queue_dir=world.qdir, token=tok)
+    assert _counts(world) == before

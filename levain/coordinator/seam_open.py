@@ -7,6 +7,7 @@ A build is the rendered brief a coordinator was handed at a seam (:mod:`levain.c
 * **Cursor rule.** The window "since you left" opens at ``MAX(shown_through_gseq)`` over ACKED builds (``0`` when none),
   and, per migrated table, at the highest unsequenced rowid an acked build showed (``open_unsequenced_cuts``). A build
   or a delivery nobody acknowledged moves nothing, and the next brief lists it as never acknowledged (at-least-once).
+  Only a DELIVERED build is acknowledged, and a build whose signal names a launch only by that launch.
   The MAX never regresses: a later ack of an older, smaller build cannot pull it back.
 * **The fence.** :func:`active_coordinator_fence` is the lease fence plus one rule: the holder is an ACTIVE COORDINATOR
   LAUNCH's session key. ``coord take`` makes a lease held by ``operator`` that passes the plain fence with no session
@@ -25,14 +26,16 @@ from levain.coordinator import lease as _leases
 from levain.coordinator.lease import Launch, Lease, LeaseRefused
 from levain.coordinator.store import GSEQ_TABLES, CoordError, CoordStore, _append_only, next_gseq
 
-__all__ = ["BODY_CAP", "DELIVERY_SURFACES", "OPEN_SCHEMA", "OpenBuild", "SEAM_KINDS", "SIGNAL_KINDS",
-           "acked_cursor", "acked_cuts", "acknowledge", "active_coordinator_fence", "open_tables_present",
+__all__ = ["BODY_CAP", "DELIVERY_SURFACES", "LAUNCH_SIGNALS", "OPEN_SCHEMA", "OpenBuild", "SEAM_KINDS",
+           "SIGNAL_KINDS", "acked_cursor", "acked_cuts", "acknowledge", "active_coordinator_fence", "open_tables_present",
            "record_arrival", "record_delivery"]
 
 #: the seams an open is built for; ``light`` is an open with no handoff behind it
 SEAM_KINDS = ("rotation", "operator", "dream", "light")
 #: what fired a build; (signal_kind, signal_key) is unique, so one signal is one build
 SIGNAL_KINDS = ("launch", "away_off", "silence", "rotation", "dream")
+#: the signal kinds whose key is a launch id: such a build is acknowledged only by that launch
+LAUNCH_SIGNALS = ("launch",)
 DELIVERY_SURFACES = ("launch_brief", "light_verb")
 #: the rendered brief, in bytes. Levain's own number, a guess until a coordinator has read a real one
 BODY_CAP = 65536
@@ -164,10 +167,14 @@ def insert_build(conn: sqlite3.Connection, now: str, *, seam_kind: str, signal_k
                  cursor_gseq: int, shown_through_gseq: int, handoff_id: int | None, body: str, body_sha256: str,
                  cuts: dict[str, int]) -> OpenBuild:
     """The ONE insert of a build and its unsequenced cuts, inside the caller's (already fenced or revalidated) write
-    transaction. A build of a signal already built returns the stored one and writes nothing."""
+    transaction. A build of a signal already built returns the stored one and writes nothing; one stored for a seam of
+    another kind is refused, never handed back as this seam's."""
     stored = build_row(conn.execute(f"SELECT {_BUILD_COLUMNS} FROM open_builds WHERE signal_kind = ? AND "
                                     "signal_key = ?", (signal_kind, signal_key)).fetchone())
     if stored is not None:
+        if stored.seam_kind != seam_kind:
+            raise CoordError(f"signal {signal_kind} {signal_key} was built as a {stored.seam_kind} open (#"
+                             f"{stored.open_id}), not a {seam_kind} one; nothing was written")
         return stored
     cur = conn.execute(
         "INSERT INTO open_builds (seam_kind, signal_kind, signal_key, cursor_gseq, shown_through_gseq, handoff_id, "
@@ -184,8 +191,13 @@ def acknowledge(store: CoordStore, open_id: Any, *, token: Any, read_back: Any =
     """The acknowledging write, and the home of the cursor rule: ``(open_id, reader_session, newly)``. Fenced by
     :func:`active_coordinator_fence`: the reader session is the active launch's own key. ``read_back`` is the
     successor's restatement of the handoff, REQUIRED on a rotation or dream build and optional otherwise. A repeat by
-    the same session writes nothing (``newly`` False). The window moves to the build's ``shown_through_gseq``, no
-    further, so rows a truncated brief did not show come back in the next one."""
+    the same session writes nothing (``newly`` False) and keeps the FIRST read-back: a different ``read_back`` on a
+    repeat is ignored, not stored and not compared. The window moves to the build's ``shown_through_gseq``, no
+    further, so rows a truncated brief did not show come back in the next one.
+
+    Refused with nothing written unless the build was DELIVERED (an ``open_deliveries`` row: an ack of a brief nobody
+    was handed would move the window past rows nobody saw) and, when its signal names a launch
+    (:data:`LAUNCH_SIGNALS`), that launch is the acking one."""
     if not isinstance(open_id, int) or isinstance(open_id, bool):
         raise CoordError("an acknowledgement names an open build by its id")
     if read_back is not None and (not isinstance(read_back, str) or "\x00" in read_back):
@@ -195,9 +207,16 @@ def acknowledge(store: CoordStore, open_id: Any, *, token: Any, read_back: Any =
         _held, launch = active_coordinator_fence(conn, now, token, "an acknowledgement")
         if not open_tables_present(conn):
             raise CoordError("this store holds no open builds")
-        built = conn.execute("SELECT seam_kind FROM open_builds WHERE open_id = ?", (open_id,)).fetchone()
+        built = conn.execute("SELECT seam_kind, signal_kind, signal_key FROM open_builds WHERE open_id = ?",
+                             (open_id,)).fetchone()
         if built is None:
             raise CoordError(f"there is no open build {open_id}")
+        if conn.execute("SELECT 1 FROM open_deliveries WHERE open_id = ?", (open_id,)).fetchone() is None:
+            raise CoordError(f"open build {open_id} was never delivered, and only a brief that was handed over is "
+                             "acknowledged; nothing was written")
+        if built[1] in LAUNCH_SIGNALS and built[2] != launch.launch_id:
+            raise CoordError(f"open build {open_id} was built for launch {built[2]}, and launch {launch.launch_id} "
+                             "acknowledges only its own; nothing was written")
         if conn.execute("SELECT 1 FROM open_acks WHERE open_id = ? AND reader_session = ?",
                         (open_id, launch.session_key)).fetchone() is not None:
             return open_id, launch.session_key, False
@@ -210,7 +229,12 @@ def acknowledge(store: CoordStore, open_id: Any, *, token: Any, read_back: Any =
 
 def record_delivery(store: CoordStore, open_id: Any, surface: Any) -> bool:
     """Evidence that a build was handed over (``launch_brief``: a file given to a harness session; ``light_verb``:
-    printed to stdout). Moves nothing: no token, no cursor. True when written, False for a repeat."""
+    printed to stdout). True when written, False for a repeat; an open id with no build is refused.
+
+    A delivery row is a PRECONDITION of the fenced acknowledgement (:func:`acknowledge` refuses a build with none),
+    and it is written by the process that hands the brief over: a cold start's starter, which holds no lease yet, or
+    a verb printing to the operator. That is why it carries no token. It moves no cursor itself: the ack that follows
+    it is fenced and is the only write that moves the window."""
     if surface not in DELIVERY_SURFACES:
         raise CoordError(f"a delivery surface is {', '.join(DELIVERY_SURFACES)}, not {surface!r}")
     if not isinstance(open_id, int) or isinstance(open_id, bool):
@@ -230,15 +254,37 @@ def record_delivery(store: CoordStore, open_id: Any, surface: Any) -> bool:
 def record_arrival(conn: sqlite3.Connection, now: str, *, agent: Any, mark_id: Any, queue_id: Any) -> tuple[int, bool]:
     """One verified leave an open consumed, inside the caller's write transaction (the caller holds the fence, or is
     the cold start's starter): ``(signal_id, newly)``. The same ``(agent, mark_id)`` is one signal; a repeat returns it
-    and takes no new ``gseq``. The verification of the leave is the caller's (S4)."""
+    and takes no new ``gseq``. The key is ``(agent, mark_id)`` alone, ``mark_id`` compared as text (``7`` and ``"7"``
+    are one mark): ``queue_id`` is NOT part of it, so a repeat naming another queue returns the first signal and its
+    queue. The verification of the leave is the caller's (S4).
+
+    ``arrival_signals`` is counted, so a connection outside a transaction is refused (each statement would commit on
+    its own). A duplicate the lookup missed (an insert refused on the key) is undone to a savepoint, gseq included,
+    and the stored signal returned."""
+    if not conn.in_transaction:
+        raise CoordError("an arrival signal is recorded inside the caller's write transaction; nothing was written")
     for name, value in (("agent", agent), ("mark_id", mark_id), ("queue_id", queue_id)):
         if not isinstance(value, (str, int)) or isinstance(value, bool) or not str(value).strip() or "\x00" in str(value):
             raise CoordError(f"an arrival signal's {name} is a non-empty text or number")
     agent, mark_id, queue_id = str(agent), str(mark_id), str(queue_id)
-    row = conn.execute("SELECT signal_id FROM arrival_signals WHERE agent = ? AND mark_id = ?",
-                       (agent, mark_id)).fetchone()
+
+    def stored() -> Any:
+        return conn.execute("SELECT signal_id FROM arrival_signals WHERE agent = ? AND mark_id = ?",
+                            (agent, mark_id)).fetchone()
+
+    row = stored()
     if row is not None:
         return row[0], False
-    cur = conn.execute("INSERT INTO arrival_signals (agent, mark_id, queue_id, ingested_at, gseq) VALUES (?, ?, ?, ?, ?)",
-                       (agent, mark_id, queue_id, now, next_gseq(conn, now)))
+    conn.execute("SAVEPOINT arrival_signal")
+    try:
+        cur = conn.execute("INSERT INTO arrival_signals (agent, mark_id, queue_id, ingested_at, gseq) VALUES "
+                           "(?, ?, ?, ?, ?)", (agent, mark_id, queue_id, now, next_gseq(conn, now)))
+    except sqlite3.IntegrityError:
+        conn.execute("ROLLBACK TO SAVEPOINT arrival_signal")
+        conn.execute("RELEASE SAVEPOINT arrival_signal")
+        row = stored()
+        if row is None:
+            raise
+        return row[0], False
+    conn.execute("RELEASE SAVEPOINT arrival_signal")
     return cur.lastrowid, True

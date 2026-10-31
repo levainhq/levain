@@ -18,6 +18,13 @@ the card are never cut; the Since detail (one line per counted row, in gseq orde
 ``shown_through_gseq`` is the gseq of the last row actually rendered, so an acknowledgement advances the window no
 further and the rows not shown return in the next brief. The unsequenced class is one line per table and is never cut.
 
+**A degraded brief is shown, never stored.** When the store read fails (the whole read, or the Since window) the brief
+says so and carries ``degraded``; the writers refuse it, so a retry reads again rather than finding a stub for good.
+
+Known edges: a ``body_cap`` barely above the never-cut size fits no detail line, so the brief shows none and its ack
+cannot move the cursor; a brief whose never-cut sections exceed the cap (:class:`BriefTooBig`) is never built, so
+its signal never opens and its caller (S3) must surface that.
+
 This module reads and renders; it writes nothing (the band read is the non-recording one). Stdlib only.
 """
 from __future__ import annotations
@@ -60,6 +67,9 @@ class Brief:
     handoff_id: int | None
     unsequenced_cuts: dict[str, int] = field(default_factory=dict)    # table -> highest unsequenced rowid shown
     omitted_rows: int = 0            # counted rows in the window the detail did not reach
+    # the store read that failed, and why; None when the cut and the window were read. A degraded brief may be shown,
+    # never stored: a stored build is returned for its signal for good, so a retry must be free to read again
+    degraded: str | None = None
 
 
 def _cap(line: str, n: int = _LINE) -> str:
@@ -109,7 +119,7 @@ def open_brief(store: CoordStore, queue_dir: Path | str | None, kind: str, now: 
     why = "absent: there is no coordinator store here" if absent else f"cannot-derive: {reason}"
     text = "\n".join([f"SEAM OPEN {kind}, read {read_at}", f"store: {why}", "cursor: none (no cut was read)",
                       _scope_line(read_at), f"Not built: {NOT_BUILT}"])
-    return Brief(kind, text, read_at, 0, 0, None)
+    return Brief(kind, text, read_at, 0, 0, None, degraded=f"store: {why}")
 
 
 def _scope_line(read_at: str) -> str:
@@ -130,12 +140,17 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
     head_lines = _header(conn, kind, read_at, head, floor, floor_open, handoff)
     handoff_lines = _guard("Handoff", lambda: _handoff_section(conn, handoff, sources, head))
     counts: dict[str, int] = {}
+    rows: list[tuple[int, str]] = []
     since_failed = False
     try:
+        # the counts and the detail are one read of the window: either failing leaves the window unread
         counts = _counts(conn, sources, floor, head)
         since_lines = _since_lines(floor, head, counts)
-    except Exception as exc:  # noqa: BLE001 - named in the brief; an ack of a window nobody read moves nothing
+        if counts:
+            rows = _detail(conn, sources, floor, head)
+    except Exception as exc:  # noqa: BLE001 - named in the brief and in `degraded`, which a writer refuses to store
         since_failed = True
+        counts, rows = {}, []
         since_lines = [f"Since: cannot-derive ({type(exc).__name__}: {_cap(exc, 160)})"]
     total = sum(counts.values())
     unseq_lines, cuts = _unsequenced(conn, present, acked_cuts(conn))
@@ -162,7 +177,6 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
     shown = head
     omitted = 0
     if total and not since_failed:
-        rows = _detail(conn, sources, floor, head)
         used = 0
         last = floor
         for g, label in rows:
@@ -182,7 +196,7 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
         shown = floor            # nothing was read of the window: an ack moves nothing
     text_lines = [*head_lines, *handoff_lines, *since_lines, *detail, *unseq_lines, *rest, _scope_line(read_at)]
     return Brief(kind, "\n".join(text_lines), read_at, head, shown, None if handoff is None else handoff.handoff_id,
-                 cuts, omitted)
+                 cuts, omitted, degraded=since_lines[0] if since_failed else None)
 
 
 def _latest_handoff(conn: sqlite3.Connection, present: set[str]) -> Any:
