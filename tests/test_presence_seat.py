@@ -36,7 +36,7 @@ def test_a_seat_sets_away_and_remote_on_his_words_and_the_record_names_it(tmp_pa
 def test_status_says_who_set_it_and_from_what_words(tmp_path):
     set_word(tmp_path, "away", by=SEAT, said="heading out")
     line = describe(tmp_path, idle=_idle)
-    assert line.endswith("; set by claude_code abc12345-seat from your words: heading out")
+    assert line.endswith("; set by claude_code abc12345-seat from your words: heading out (unverified)")
 
 
 @pytest.mark.parametrize("word", ["quiet", "sleep", "loud", "back"])

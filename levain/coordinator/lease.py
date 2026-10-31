@@ -73,6 +73,9 @@ BUDGET_CROSSED = "budget crossed"
 # activation (C6 L3 r1 B1): C0 §3.4 gives such a launch no envelope authority, so no budget can meter it, and nothing
 # launches past a crossed budget. A refusal, never a death
 SEVERAL_THREADS = "a worker holds one thread"
+# a done coordinator the watcher (a drop it never saw waits) or your `levain coord wake` ended so a fresh one starts:
+# a stop, never a death, so the wake in the same transaction is never put into backoff by it (1030-42 L3 r1)
+REPLACED = "replaced while done"
 ROLES = ("coordinator", "worker")
 SETTING_AGENTS = (*HARNESSES, "none")
 _LEASE_BY = ("operator", "coordinator", "service")
@@ -94,7 +97,7 @@ SERVICE_BEAT_WINDOW = 2 * LEASE_TTL
 _MODEL = re.compile(r"[A-Za-z0-9._\[\]][A-Za-z0-9._\[\]-]*")
 # causes the store writes itself; a caller's end_launch never takes one, so no caller can relabel a death
 _SERVICE_CAUSES = ("takeover", "operator release", "lease lost before active", "pending past until",
-                   "lost the lease", BUDGET_CROSSED, SEVERAL_THREADS)
+                   "lost the lease", BUDGET_CROSSED, SEVERAL_THREADS, REPLACED)
 MAX_DEATHS = 3
 
 _LAUNCH_ID = re.compile(r"ln-[0-9a-f]{32}")
@@ -597,6 +600,42 @@ def end_unlisted(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch |
     return end_launch(conn, now, launch_id, "ended", cause)
 
 
+def unseen_drop(conn: sqlite3.Connection, ln: Launch) -> str | None:
+    """The oldest drop ``ln``'s session never saw, or None: a drop with no ``split`` receipt (yours or a
+    coordinator's) delivered AFTER the launch's spawn claim, in the store-wide order (gseq, never a clock). Its brief
+    is written after that claim and quotes every unsplit drop delivered before it, so only a later drop is one it may
+    never have read. A fresh launch's claim is newer than the drop that replaced its predecessor, so the same drop
+    never replaces it: one replacement per drop, by construction. Uncapped, in the caller's transaction."""
+    start = conn.execute(
+        "SELECT COALESCE((SELECT gseq FROM launch_spawns WHERE launch_id = ?), "
+        "(SELECT gseq FROM launch_events WHERE launch_id = ? AND kind = 'active'))",
+        (ln.launch_id, ln.launch_id)).fetchone()[0]
+    if start is None:
+        return None
+    row = conn.execute(
+        "SELECT r.ref_id FROM replies r WHERE r.ref_store = 'drops' AND r.kind = 'drop_receipt' "
+        "AND json_extract(r.body, '$.stage') = 'delivered' AND r.gseq > ? AND NOT EXISTS (SELECT 1 FROM replies s "
+        "WHERE s.ref_store = 'drops' AND s.ref_id = r.ref_id AND s.kind = 'drop_receipt' "
+        "AND json_extract(s.body, '$.stage') = 'split') ORDER BY r.gseq LIMIT 1", (start,)).fetchone()
+    return None if row is None else row[0]
+
+
+def replace_done(conn: sqlite3.Connection, now: str, launch_id: str, *, asked: bool = False) -> Launch | None:
+    """A coordinator whose session is ``done`` (a finished turn, listed, not working; the caller read the listing)
+    is written ``ended``, cause :data:`REPLACED` (no death), its lease released if it still held one, so the caller's
+    :func:`wake` in this transaction asks for a fresh coordinator. The watcher replaces it only while
+    :func:`unseen_drop` names a drop; ``asked`` (your ``levain coord wake``) needs none. None, nothing written, when
+    the launch is no longer an active coordinator, or no unseen drop waits and you did not ask."""
+    ln = launch(conn, launch_id)
+    if ln is None or ln.state != "active" or ln.role != "coordinator" or not asked and unseen_drop(conn, ln) is None:
+        return None
+    _launch_event(conn, now, launch_id, "ended", REPLACED)
+    held = lease(conn, now)
+    if held is not None and held.holder == ln.session_key:
+        _event(conn, now, "release", held.holder, token=held.token, until=None, cause="launch ended", by="service")
+    return _launch_row(conn, "launch_id", launch_id)
+
+
 def unspawned(conn: sqlite3.Connection) -> list[Launch]:
     """Pending launches no process has claimed the spawn of, oldest first."""
     return [ln for ln in _in_state(conn, "pending") if conn.execute(
@@ -833,8 +872,9 @@ def launch_death(conn: sqlite3.Connection, ln: Launch) -> bool | None:
     # writing as coordinator died idle
     wrote = _wrote_since(conn, ln.session_key)
     died = ln.state in ("failed", "expired") and ln.cause not in ("lease lost before active", BUDGET_CROSSED,
-                                                                       SEVERAL_THREADS) \
+                                                                       SEVERAL_THREADS, REPLACED) \
         or ln.state == "ended" and (ln.cause == "0 turns" or ln.cause == "lost the lease" and not wrote)
+    # REPLACED (ended): its session finished a turn and was ended to make room, never a death, written or not
     if not died:
         return False
     if ln.state in ("failed", "expired") and conn.execute(
@@ -887,7 +927,8 @@ def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
         # would fight it at claim time, so drops queue for it, until IDLE_GRACE ends the wait
         return "idle", (f"coordinator launch {waited.launch_id} is running without the lease; it claims again "
                         f"(levain coord claim) by {_idle_until(conn, waited)}, or the next drop after that ends it "
-                        "and asks for a fresh coordinator")
+                        "and asks for a fresh coordinator; once its session is done, `levain coord wake` replaces "
+                        "it, and `levain coord watch` does at its next pass when a drop it never saw waits")
     for ln in _in_state(conn, "pending", "coordinator"):
         if now < ln.until:
             return "launching", f"coordinator launch {ln.launch_id} is pending until {ln.until}"

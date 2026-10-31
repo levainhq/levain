@@ -253,3 +253,46 @@ def test_a_closed_thread_is_not_an_open_thread_on_the_card(tmp_path: Path) -> No
     finally:
         conn.close()
     assert ids == [] and morning.card(store)["budgets"] == []
+
+
+def test_the_read_only_coord_verbs_make_nothing_in_a_queue_dir_with_no_store(tmp_path: Path, capsys) -> None:
+    # the shadow finding (10-30 17:08): `levain coord status --queue-dir <dir>` made dispatch.db and awake.lock
+    from levain.cli import main
+
+    d = _dir(tmp_path)
+    for argv, rc in ((["coord", "status"], 0), (["drops", "list"], 0), (["thread", "list"], 0),
+                     (["drops", "show", "d-none"], 1), (["thread", "show", "t-none"], 1)):
+        assert main([*argv, "--queue-dir", str(d)]) == rc, argv
+        capsys.readouterr()
+        assert sorted(p.name for p in d.iterdir()) == [], (argv, list(d.iterdir()))
+    assert main(["coord", "status", "--queue-dir", str(d)]) == 0
+    assert "no coordinator store here" in capsys.readouterr().out
+    gone = tmp_path / "never-made"
+    assert main(["coord", "status", "--queue-dir", str(gone)]) == 0 and not gone.exists()
+
+
+def test_a_dispatch_only_store_reads_as_no_coordinator_store_and_nothing_changes(tmp_path: Path, capsys) -> None:
+    # codex MED 4: a JobStore file with no coordinator tables is neither migrated nor given an awake.lock
+    import json
+
+    from levain.cli import main
+    from levain.dispatch.jobs import JobStore
+
+    d = _dir(tmp_path)
+    JobStore(d)._connect().close()
+
+    def snap() -> dict[str, tuple[int, int]]:
+        return {p.name: (p.stat().st_mtime_ns, p.stat().st_size) for p in d.iterdir()}
+
+    before = snap()
+    raw = (d / DB_NAME).read_bytes()
+    for argv, rc in ((["coord", "status"], 0), (["drops", "list"], 0), (["thread", "list"], 0),
+                     (["drops", "show", "d-none"], 1), (["thread", "show", "t-none"], 1)):
+        assert main([*argv, "--queue-dir", str(d)]) == rc, argv
+        capsys.readouterr()
+        assert snap() == before, argv
+    assert (d / DB_NAME).read_bytes() == raw
+    assert main(["coord", "status", "--json", "--queue-dir", str(d)]) == 0
+    got = json.loads(capsys.readouterr().out)
+    assert got["store"] is None and got["lease"] is None and got["wake"] == "unset" and got["launches"] == []
+    assert "no coordinator store here" in got["why"] and snap() == before

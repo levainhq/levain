@@ -33,6 +33,19 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   still refuses. Covered by tests of the spawn argv and the setting.
 
 ### Fixed
+- **A drop that lands while a coordinator sits done is acted on at the next watcher pass, not an hour later.** A
+  coordinator that split its drop, released the lease and stayed listed (`claude --bg`, state `done`) kept the
+  coordinator slot as `idle`, so drops filed after it sat unread until `LEASE_TTL + IDLE_GRACE`. `levain coord watch`
+  (its serve thread included) now ends a `done` claude coordinator when an unsplit drop was delivered after its spawn
+  claim (its brief quotes every drop before that), with cause `replaced while done`, never a death, stops its session
+  and starts a fresh coordinator in the same pass, whose brief quotes the drop. The fresh launch is newer than the drop,
+  so one drop replaces at most one coordinator. `levain coord wake` does the same at once for a done claude
+  coordinator running without the lease (no drop needed), and otherwise says why and names `levain coord release`. A
+  coordinator not `done` is untouched; a Codex coordinator and a drop with no watcher running still wait out the grace.
+  A question filed with no live lease was never held, so it pings at filing (no ten-minute escalation applies to it).
+  `levain coord status`, `drops list|show` and `thread list|show` no longer create `dispatch.db` or `awake.lock`, or
+  add tables to a dispatch-only `dispatch.db`; they print `no coordinator store here` (`coord status --json` keeps its
+  keys, with `"store": null`).
 - **On macOS, a Codex session signed in with a ChatGPT subscription runs in a slot instead of failing with
   `account/read -32603`.** Codex syncs its managed preferences at start, and a slot account whose home was `/var/empty`
   could not. The slot accounts that run vendor CLIs now have a root-owned, empty home, `L/vendorhome`, made by setup,
@@ -64,6 +77,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   write is not made when its row cannot be written, your own word always goes through. `levain coord morning` adds a
   `presence:` line when an agent set the standing word or was refused in the last 24 hours. What presence does is unchanged.
   Covered by tests; not run on a real machine.
+- **An agent's `--said` quote is now checked against what you typed to it, and decides whether it may replace a word you set.**
+  `levain ping away|remote|quiet|sleep --said "..."` from an agent session looks for the quote (at least 12 characters) in the
+  last 20 turns you typed to that session in the past 6 hours; a message another session relayed, a notification or a tool
+  result is not a turn you typed. A quote found there is recorded verified, with when you typed it; one not found still sets
+  over no word or another agent's word and shows "(unverified)" in `levain ping status` and `levain ping log`, but it never
+  replaces a word you set yourself, and a verified quote replaces your word only if you typed it after that word. The
+  coordinator can name the drop that holds your words (`--drop DROP_ID`), since a drop reaches it in its brief file and not
+  as a prompt. Reads Claude Code and Codex transcripts; checked against this machine's real ones, not on a released build.
 - **An agent session can set your `away` or `remote` presence, only when it quotes your words.** `levain ping away`
   or `remote` run inside an agent session needs `--said "<what you told it>"` (the coordinator needs it for every
   word it may set); with no words, or with words over 300 characters, the command is refused and nothing changes. The record keeps the agent, its session and the quote, and `levain ping status` adds
