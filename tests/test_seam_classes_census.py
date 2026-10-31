@@ -209,7 +209,7 @@ def _insert_sites_without_gseq(text: str) -> list[tuple[str, str]]:
 
 
 def test_every_insert_into_a_gseq_table_names_gseq() -> None:
-    sources = {p.name: p.read_text() for p in sorted(_COORD_SRC.glob("*.py"))}
+    sources = {str(p.relative_to(_COORD_SRC)): p.read_text() for p in sorted(_COORD_SRC.rglob("*.py"))}
     found = {t: 0 for t in GSEQ_TABLES}
     for text in sources.values():                                  # the scan is not vacuous: every table has a site
         for t in GSEQ_TABLES:
