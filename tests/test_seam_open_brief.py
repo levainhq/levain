@@ -855,6 +855,11 @@ def _shared(gseqs):
 
 def test_no_two_counted_rows_share_a_gseq_after_a_mixed_run(world):
     _close(world)
+    # the handoff is an earlier session's: a launch never acknowledges a build of the handoff it wrote itself
+    for (name,) in _sql(world, "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'seam_handoffs' "
+                               "AND sql LIKE '%UPDATE%'"):
+        _raw(world, f"DROP TRIGGER {name}")
+    _raw(world, "UPDATE seam_handoffs SET writer = 'earlier-session'")
     world.accept_drop("a second drop", surface="cli")
     with world._write("coordinator", _token(world)) as (conn, now):
         seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")
@@ -989,3 +994,13 @@ def test_only_a_section_that_says_nothing_folds(world):
                                   ["Board: 0 items"], ["Band: cannot-derive (x)"], ["Card: cannot-derive (y)"])
     assert unread == ["Band: cannot-derive (x)", "Card: cannot-derive (y)",
                       "Empty (0 each): unsequenced rows, unacknowledged opens, board items"]
+
+
+def test_g4_the_card_renderer_writes_no_tab_or_newline_of_its_own(world):
+    # a tab or newline is marked now: a card line the renderer itself writes must carry neither
+    QuestionStore(world.qdir).file(agent="claude_code", agent_session_id="s", what="Which?",
+                                   options=[("a", "A"), ("b", "B")], rec="a", blocks="x", cwd="/tmp")
+    lines = _brief(world).text.splitlines()
+    card = lines.index("Card (store parts in the cut, queue parts read at the brief's time):")
+    own = lines[card:]
+    assert len(own) > 1 and not any("⟨U+0009⟩" in ln or "⟨U+000A⟩" in ln for ln in own)

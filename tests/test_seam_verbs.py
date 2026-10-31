@@ -544,3 +544,89 @@ def test_f8_lv_falls_back_when_the_launch_directory_cannot_be_read(world, monkey
     monkeypatch.setattr(cl, "coordinator_command", lambda install: boom(install) if install else lv())
     assert seam_verbs._lv(None) == lv()
     assert seam_verbs._lv(world.launch) == lv()
+
+
+# --- review fixes (L3 r2) ---------------------------------------------------------------------------------------------
+_RAW = "a\x9b2J b\x7f c‮evil d  e\x85 f\x1b"
+
+
+def test_g1_json_output_is_ascii_and_round_trips(world, qdir, capsys):
+    hid = _raw_handoff(world, _body(notes=_RAW))
+    out = run(qdir, capsys, "handoff", "show", str(hid), "--json").out
+    assert out.isascii() and not any(c in out for c in "\x9b\x7f‮ \x85\x1b")
+    assert json.loads(out)["body"]["notes"] == _RAW
+
+
+def test_g2_a_deeply_nested_close_body_is_a_refusal(world, qdir, tmp_path, capsys):
+    p = tmp_path / "deep.json"
+    p.write_text("[" * 60000)
+    err = run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(p), "--request-id", "r1",
+              "--token", str(world.token), rc=1).err
+    assert err.startswith("levain coord close:") and "Traceback" not in err
+    assert sql(world, "SELECT COUNT(*) FROM seam_handoffs") == [(0,)]
+
+
+def test_g3_a_cut_never_leaves_half_a_mark():
+    from levain.coordinator import seam
+
+    mark = "⟨U+0001⟩"
+    label = seam._detail_label("t", 1, "w", "a" * 58 + "\x01tail", None, True)
+    assert label == "t  1  w  " + "a" * 58 + "…"
+    assert "⟨" not in label
+    capped = seam._cap("a" * 238 + "\x01tail")
+    assert capped == "a" * 238 + "…"
+    whole = seam._cap("a" * 200 + "\x01" + "b" * 100)            # a cut after a whole mark keeps it
+    assert mark in whole and whole.endswith("…") and whole.count("⟨") == whole.count("⟩")
+    assert seam._cap("a" * 230 + "\x01") == "a" * 230 + mark       # fits: nothing cut
+
+
+def test_g5_a_failure_after_the_commit_still_reports_the_close(world, qdir, tmp_path, capsys, monkeypatch):
+    from levain.coordinator import seam_verbs
+
+    def boom(store, token):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(seam_verbs, "_active", boom)
+    out = run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path)),
+              "--request-id", "r1", "--token", str(world.token)).out
+    assert out.startswith("closed: handoff 1 (rotation)") and f"({lv()} coord open" in out
+    assert sql(world, "SELECT COUNT(*) FROM seam_handoffs") == [(1,)]
+
+
+def test_g6_the_close_hint_names_the_store(tmp_path, capsys):
+    s = CoordStore(None)
+    s.coord_set_agent("claude", cwd=str(tmp_path))
+    s.launch, s.token = _activate(s)
+    assert main(["coord", "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path)), "--request-id", "r1",
+                 "--token", str(s.token)]) == 0
+    out = capsys.readouterr().out
+    assert f"({lv()} coord open --queue-dir {shlex.quote(str(s.directory))})" in out
+
+
+def test_g7_an_ack_by_the_handoffs_own_writer_is_refused(world, qdir, tmp_path, capsys):
+    from levain.coordinator import seam_build
+
+    _rotation_close(world, qdir, tmp_path, capsys, writer=None)       # written by this launch itself
+    b = seam_build.build(world, kind="rotation", signal_kind="rotation", signal_key="1", queue_dir=qdir,
+                         token=world.token)                           # the race shape: a build the verb path refuses
+    seam_open.record_delivery(world, b.open_id, "light_verb", recipient=world.launch.launch_id)
+    rb = tmp_path / "rb.txt"
+    rb.write_text("my own handoff")
+    err = run(qdir, capsys, "open", "--ack", str(b.open_id), "--read-back-file", str(rb), "--token",
+              str(world.token), rc=1).err
+    assert "a coordinator cannot acknowledge its own handoff" in err
+    assert sql(world, "SELECT COUNT(*) FROM open_acks") == [(0,)]
+
+
+def test_g8_an_existing_launch_build_is_what_open_prints(pending, qdir, capsys):
+    pending.launch_claim_spawn(pending.launch_id, os.getpid())
+    cl._brief_text(pending, pending.launch(pending.launch_id))
+    cl.record_brief_delivery(pending, pending.launch_id)
+    assert sql(pending, "SELECT signal_kind FROM open_builds") == [("launch",)]
+    got, why = pending.launch_activate(pending.launch_id, harness_session_id="h")
+    assert why is None
+    tok = str(pending.coord_status()["lease"]["token"])
+    out = run(qdir, capsys, "open", "--token", tok).out
+    assert "SEAM OPEN light" in out and f"coord open --ack 1 --token {tok} --queue-dir" in out
+    assert "open 1 (light)" in out and "no open is built" not in out
+    assert sql(pending, "SELECT COUNT(*) FROM open_builds") == [(1,)]

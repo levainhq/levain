@@ -102,7 +102,17 @@ def _cap(line: str, n: int = _LINE) -> str:
     text = _clean(raw)                   # marked first: a stored U+2028, CR or NEL must not vanish into a space below
     indent = text[: len(text) - len(text.lstrip())] if "\n" not in raw else ""
     text = indent + " ".join(text.split())
-    return text if len(text) <= n else text[: n - 1] + "…"
+    return text if len(text) <= n else _trim(text, n - 1) + "…"
+
+
+def _trim(text: str, n: int) -> str:
+    """``text[:n]``, except a cut that lands inside a ``⟨U+XXXX⟩`` mark is moved back to before the mark's opening
+    bracket, so a mark is shown whole or not at all."""
+    head = text[:n]
+    start = head.rfind("\u27e8")
+    if start != -1 and "\u27e9" not in head[start:]:
+        return head[:start]
+    return head
 
 
 def _clean(text: str) -> str:
@@ -405,7 +415,8 @@ _LABEL = 60
 def _detail_label(tag: str, row_id: Any, who: Any, text: Any, ref: Any, named: bool) -> str:
     """One detail row's fields after its gseq, two spaces apart: ``table[:kind]  row id  who  label``. The label is the
     first non-blank line of the stored text, cleaned, then cut to :data:`_LABEL` characters; cleaning first means a
-    hidden separator shows as its mark rather than ending the label silently."""
+    hidden separator shows as its mark rather than ending the label silently, and the cut (:func:`_trim`) never
+    leaves half a mark."""
     if not named:
         return tag
     first = next((ln for ln in _clean_keep_newlines(str(text or "")).split("\n") if ln.strip()), "")
@@ -413,7 +424,7 @@ def _detail_label(tag: str, row_id: Any, who: Any, text: Any, ref: Any, named: b
     if ref is not None:
         label = f"re {' '.join(_clean(str(ref)).split())}" + (f": {label}" if label else "")
     if len(label) > _LABEL:
-        label = label[: _LABEL - 1] + "…"
+        label = _trim(label, _LABEL - 1) + "…"
     fields = [tag, " ".join(_clean(str(row_id)).split()) if row_id is not None else "-",
               " ".join(_clean(str(who)).split()) if who is not None else "-"]
     return "  ".join([*fields, label] if label else fields)

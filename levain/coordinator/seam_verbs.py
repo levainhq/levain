@@ -40,11 +40,9 @@ def _once(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _emit(out: Any, as_json: bool, obj: Any, text: str) -> None:
     if as_json:
-        # ensure_ascii=False keeps text readable, but U+2028, U+2029 and NEL are line breaks to a terminal and a
-        # reader of the stream: written as escapes they stay inside their JSON strings
-        text = json.dumps(obj, ensure_ascii=False, indent=2)
-        for ch in ("\u2028", "\u2029", "\x85"):
-            text = text.replace(ch, f"\\u{ord(ch):04x}")
+        # ensure_ascii escapes every non-ASCII character (each C1 control, bidi override and line or paragraph
+        # separator included) and DEL is the one ASCII control json leaves raw: nothing but printable ASCII reaches a terminal
+        text = json.dumps(obj, ensure_ascii=True, indent=2).replace("\x7f", "\\u007f")
     out.write(text + "\n")
 
 
@@ -91,19 +89,22 @@ def run_close(args: argparse.Namespace, out: Any, store: Any) -> int:
     text = _read_file(args.body_file, _BODY_FILE_MAX, "the handoff body")
     try:
         body = json.loads(text, object_pairs_hook=_once)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise CoordError(f"the handoff body {args.body_file} is not one JSON object with each key once "
-                         f"({str(exc)[:120]}); write it with keys {', '.join(seam_handoffs.BODY_KEYS)}") from None
+                         f"({type(exc).__name__ if isinstance(exc, RecursionError) else str(exc)[:120]}); write it with keys {', '.join(seam_handoffs.BODY_KEYS)}") from None
     if not isinstance(body, dict):
         raise CoordError(f"the handoff body {args.body_file} is not one JSON object with each key once (it is "
                          f"JSON {type(body).__name__}); write it with keys {', '.join(seam_handoffs.BODY_KEYS)}")
     h = seam_handoffs.close(store, kind=args.kind, body=body, request_id=args.request_id,
                             prev_handoff_id=args.prev_handoff_id, token=args.token)
-    lv = _lv(_active(store, args.token)[0])
+    try:
+        lv = _lv(_active(store, args.token)[0])
+    except Exception:                # the handoff is committed: a failed read of the lease only changes the spelling
+        lv = _lv(None)
     _emit(out, args.json, {"handoff_id": h.handoff_id, "kind": h.seam_kind, "writer": h.writer, "gseq": h.gseq,
                            "covers_gseq": h.covers_gseq, "prev_handoff_id": h.prev_handoff_id},
           f"closed: handoff {h.handoff_id} ({h.seam_kind}) written by {h.writer}, covering counted rows through gseq "
-          f"{h.covers_gseq}\nthe next coordinator opens from it ({lv} coord open); a retry of this close names "
+          f"{h.covers_gseq}\nthe next coordinator opens from it ({lv} coord open{_tail(store)}); a retry of this close names "
           f"request id {h.close_key!r} again")
     return 0
 

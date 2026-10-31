@@ -240,9 +240,14 @@ def acknowledge(store: CoordStore, open_id: Any, *, token: Any, read_back: Any =
         _held, launch = active_coordinator_fence(conn, now, token, "an acknowledgement")
         if not open_tables_present(conn):
             raise CoordError("this store holds no open builds")
-        built = conn.execute("SELECT seam_kind FROM open_builds WHERE open_id = ?", (open_id,)).fetchone()
+        built = conn.execute("SELECT seam_kind, handoff_id FROM open_builds WHERE open_id = ?", (open_id,)).fetchone()
         if built is None:
             raise CoordError(f"there is no open build {open_id}")
+        wrote = None if built[1] is None else conn.execute("SELECT writer FROM seam_handoffs WHERE handoff_id = ?",
+                                                           (built[1],)).fetchone()
+        if wrote is not None and wrote[0] == launch.session_key:
+            raise CoordError("a coordinator cannot acknowledge its own handoff (this launch wrote the handoff open "
+                             f"{open_id} was built from); nothing was written")
         recipients = [r[0] for r in conn.execute("SELECT DISTINCT recipient_launch_id FROM open_deliveries WHERE "
                                                  "open_id = ? ORDER BY recipient_launch_id", (open_id,))]
         if not recipients:
