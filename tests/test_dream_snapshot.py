@@ -719,3 +719,100 @@ def test_k4_the_drill_releases_the_wrap_lock_before_it_hashes_and_checks_integri
     monkeypatch.setattr(sn, "sha256_file", probe)
     res = sn.drill(scratch, scratch.parent / "dream")
     assert res.outcome == "ok" and seen == [True]
+
+
+# --------------------------------------------------------------------------------------------------- fix6 (L3 round 5)
+
+@pytest.fixture
+def lock_ledger(monkeypatch):
+    """Every wrap-lock handle taken and not yet released (an in-process re-acquire cannot show a leak)."""
+    from levain import wrap as w
+    out: list = []
+    real_lock, real_unlock = w._lock_wrap_file, w._unlock_wrap
+
+    def lock(*a, **k):
+        h = real_lock(*a, **k)
+        if h is not w._ANOTHER_WRAP_RUNNING:
+            out.append(h)
+        return h
+
+    def unlock(h):
+        if h in out:
+            out.remove(h)
+        return real_unlock(h)
+    monkeypatch.setattr(w, "_lock_wrap_file", lock)
+    monkeypatch.setattr(w, "_unlock_wrap", unlock)
+    return out
+
+
+@pytest.mark.parametrize("exc", [OSError("disk full"), sqlite3.OperationalError("locked"), KeyError("boom")])
+def test_j1_a_copy_that_raises_never_leaves_the_wrap_lock_held(scratch, monkeypatch, lock_ledger, exc):
+    from levain.dream import executor as ex_
+    two_dreams(scratch)
+
+    def boom(*a, **k):
+        raise exc
+    monkeypatch.setattr(ex_, "_copy_store", boom)
+    try:
+        res = sn.drill(scratch, scratch.parent / "dream")
+        assert res.outcome == "failed" and res.steps[-1]["name"] == "restore"
+    except KeyError:
+        assert isinstance(exc, KeyError)                 # a non-OSError may propagate, but never with the lock held
+    assert lock_ledger == []
+
+
+def test_j1_a_failure_in_the_snapshot_copy_loop_releases_the_lock_too(scratch, monkeypatch, lock_ledger):
+    two_dreams(scratch)
+    real = sn.shutil.copy2
+
+    def boom(*a, **k):
+        raise RuntimeError("not an OSError")
+    monkeypatch.setattr(sn.shutil, "copy2", boom)
+    with pytest.raises(RuntimeError):
+        sn.drill(scratch, scratch.parent / "dream")
+    monkeypatch.setattr(sn.shutil, "copy2", real)
+    assert lock_ledger == []
+
+
+def test_j1_the_restore_copy_failing_still_hashes_and_checks_the_snapshot(scratch, monkeypatch):
+    from levain.dream import executor as ex_
+    two_dreams(scratch)
+    monkeypatch.setattr(ex_, "_copy_store", lambda *a, **k: (_ for _ in ()).throw(OSError("full")))
+    res = sn.drill(scratch, scratch.parent / "dream")
+    names = [(s["name"], s["status"]) for s in res.steps]
+    assert names[:2] == [("hash", "ok"), ("integrity", "ok")] and names[-1] == ("restore", "failed")
+
+
+def test_j2_a_short_copy_is_never_reported_as_a_corrupt_snapshot(scratch, monkeypatch):
+    two_dreams(scratch)
+    real = sn.shutil.copy2
+
+    def short(src, dst, *a, **k):
+        real(src, dst, *a, **k)
+        data = Path(dst).read_bytes()
+        Path(dst).write_bytes(data[: len(data) // 2])
+        return dst
+    monkeypatch.setattr(sn.shutil, "copy2", short)
+    res = sn.drill(scratch, scratch.parent / "dream")
+    hashed = [s for s in res.steps if s["name"] == "hash"]
+    assert hashed and hashed[0]["status"] == "ok"        # the originals are intact, so the snapshot is not corrupt
+
+
+def test_j3_a_lock_or_scratch_failure_is_a_failed_drill_not_a_traceback(scratch, monkeypatch, lock_ledger):
+    from levain import wrap as w
+    two_dreams(scratch)
+    real = w._lock_wrap_file
+
+    def deny(*a, **k):
+        raise PermissionError("no lock for you")
+    monkeypatch.setattr(w, "_lock_wrap_file", deny)
+    res = sn.drill(scratch, scratch.parent / "dream")
+    assert res.outcome == "failed" and "wrap lock" in res.steps[-1]["detail"]
+    monkeypatch.setattr(w, "_lock_wrap_file", real)
+
+    def nospace(*a, **k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(sn.tempfile, "mkdtemp", nospace)
+    res = sn.drill(scratch, scratch.parent / "dream")
+    assert res.outcome == "failed" and "scratch" in res.steps[-1]["detail"]
+    assert lock_ledger == []

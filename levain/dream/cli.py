@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import os
+import shlex
 import sys
 import time
 import uuid
@@ -251,10 +252,13 @@ def run_dream_recover(args: argparse.Namespace) -> int:
             print(f"  {n}")
         if res.card:
             print(f"  card to file: {res.card['kind']} / {res.card['reason']}  (remedy: {res.card['remedy']})")
+            for line in res.card.get("his", []):
+                if line not in res.notes:
+                    print(f"  for you: {line}")
     if not res.settled or res.ending == "none":
         print(f"levain dream recover: UNSETTLED ({res.reason or 'nothing changed'}). Nothing here is finished: "
-              f"fix what the notes above name, then run `levain dream recover {args.occurrence} --store-dir "
-              f"{args.store_dir}` again.", file=sys.stderr if args.json else sys.stdout)
+              f"fix what the notes above name, then run `levain dream recover {shlex.quote(args.occurrence)} --store-dir "
+              f"{shlex.quote(args.store_dir)}` again.", file=sys.stderr if args.json else sys.stdout)
     return 0 if (res.settled and res.ending != "none") else 1
 
 

@@ -767,3 +767,41 @@ def test_k3_a_card_already_filed_is_not_rebuilt_for_a_child_not_confirmed(scratc
     assert first.child == "not-confirmed" and first.card["reason"] == "child-not-confirmed"
     again = rc.recover(scratch, occ(scratch, "o1"), card_filed=True, term_wait=0.1, kill_wait=0.1)
     assert again.child == "not-confirmed" and again.card is None
+
+
+# --------------------------------------------------------------------------------------------------- fix6 (L3 round 5)
+
+def test_j4_the_by_hand_command_names_the_occurrence_and_store_as_the_operator_types_them(tmp_path):
+    store = tmp_path / "my store"
+    inside = store / "dream" / "o 1"
+    cmd = rc._by_hand(77, inside, store)
+    assert f"levain dream recover 'o 1' --store-dir '{store}'" in cmd
+    elsewhere = tmp_path / "else where" / "o2"
+    cmd = rc._by_hand(77, elsewhere, store)
+    assert f"levain dream recover '{elsewhere}' --store-dir '{store}'" in cmd
+
+
+def test_j4_every_not_confirmed_child_prints_its_remedy_with_the_store(scratch, monkeypatch, capsys):
+    import argparse
+    from levain.dream import cli as dcli
+    occ(scratch, "o1").mkdir(parents=True)
+    (occ(scratch, "o1") / "progress.json").write_text(json.dumps(
+        {"phase": "composing", "wrap_token": uuid.uuid4().hex, "child_pid": 2 ** 22 + 778,
+         "child_started_at": "Mon Jan  1 00:00:00 2001", "child_argv": ["x"]}))
+    monkeypatch.setattr(rc, "_identity_matches", lambda *a: None)              # the process table cannot be read
+    ns = argparse.Namespace(occurrence="o1", store_dir=str(scratch.parent), state="launched", card_filed=False,
+                            json=False)
+    assert dcli.run_dream_recover(ns) == 1
+    out = capsys.readouterr().out
+    pg = 2 ** 22 + 778
+    assert f"kill -KILL -{pg}" in out and f"--store-dir {scratch.parent}" in out and "for you:" in out
+
+
+def test_j5_a_saving_phase_refusal_files_the_same_unsettled_kind_as_the_other_unsettled_cards(scratch, monkeypatch):
+    _saving_without_proof(scratch)
+
+    def refuse(*a, **k):
+        raise sn.SnapshotRefused("refused for the test")
+    monkeypatch.setattr(sn, "record_post_for", refuse)
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert not res.settled and res.card["kind"] == "failed"

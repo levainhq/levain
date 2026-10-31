@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shlex
 import signal
 import time
 from dataclasses import dataclass, field
@@ -112,13 +113,29 @@ def _names_occurrence(argv: Any, occ_dir: Path) -> bool:
     return False
 
 
-def _by_hand(pgid: int, occ: str) -> str:
+def _rerun_command(occ_dir: Path, store_dir: Path | None) -> str:
+    """The recover command exactly as the operator must type it: the occurrence as a bare id only when it sits under
+    ``<store>/dream/`` (otherwise its full path), the store named whenever it is known, each part shell-quoted."""
+    occ = occ_dir.name
+    if store_dir is not None:
+        try:
+            if occ_dir.resolve().parent != (Path(store_dir).resolve() / "dream"):
+                occ = str(occ_dir)
+        except OSError:
+            occ = str(occ_dir)
+    cmd = f"levain dream recover {shlex.quote(occ)}"
+    if store_dir is not None:
+        cmd += f" --store-dir {shlex.quote(str(store_dir))}"
+    return cmd
+
+
+def _by_hand(pgid: int, occ_dir: Path, store_dir: Path | None = None) -> str:
     """The exact manual remedy for a compose group recovery will not signal by number."""
     return (f"Check process group {pgid} with `ps -g {pgid} -o pid,command`; if it still lists the compose program, "
-            f"end it with `kill -KILL -{pgid}`; then rerun `levain dream recover {occ}`")
+            f"end it with `kill -KILL -{pgid}`; then rerun `{_rerun_command(occ_dir, store_dir)}`")
 
 
-def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = TERM_WAIT_S,
+def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, store_dir: Path | None = None, term_wait: float = TERM_WAIT_S,
                      kill_wait: float = KILL_WAIT_S) -> tuple[str, list[str]]:
     """End the compose child ``progress.json`` names, if it outlived its fire. A signal goes to a process whose
     identity was checked just before it, never to a stored integer: SIGTERM to the group, then SIGKILL only while the
@@ -133,7 +150,8 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = 
     started, argv = prog.get("child_started_at"), prog.get("child_argv")
     m = _identity_matches(pid, started, argv, occ_dir)
     if m is None:
-        return "not-confirmed", [f"child pid {pid}: the process table could not be read; no signal was sent"]
+        return "not-confirmed", [f"child pid {pid}: the process table could not be read; no signal was sent. "
+                                 f"{_by_hand(pid, occ_dir, store_dir)}"]
     if m is False:
         from levain.consent.delivery import process_identity
         ident = process_identity(pid)
@@ -147,11 +165,11 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = 
         if ident is not None:
             return "not-confirmed", [f"child pid {pid}: a live process holds that number with the recorded start time "
                                      f"but not the recorded command line; no signal was sent. "
-                                     f"{_by_hand(pid, occ_dir.name)}"]
+                                     f"{_by_hand(pid, occ_dir, store_dir)}"]
         if _group_gone(pid):
             return "ended", [f"child pid {pid}: no longer running"]
         return "not-confirmed", [f"child pid {pid}: the leader is gone but its process group is not seen gone; no "
-                                 f"signal was sent. {_by_hand(pid, occ_dir.name)}"]
+                                 f"signal was sent. {_by_hand(pid, occ_dir, store_dir)}"]
     try:
         leads = os.getpgid(pid) == pid
     except ProcessLookupError:
@@ -161,7 +179,8 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = 
     if leads is False:
         # the executor starts the child as its own group leader. A process that is not one is not what was recorded,
         # and a group signal would miss it (or hit another group): no signal, and never "ended"
-        return "not-confirmed", [f"child pid {pid}: is not a process-group leader; no signal was sent"]
+        return "not-confirmed", [f"child pid {pid}: is not a process-group leader; no signal was sent. "
+                                 f"{_by_hand(pid, occ_dir, store_dir)}"]
     if leads:
         try:
             os.killpg(pid, signal.SIGTERM)
@@ -184,7 +203,7 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = 
         notes.append(f"child pid {pid}: ended")
         return "ended", notes
     return "not-confirmed", [f"child pid {pid}: signalled but its group was not seen gone (a group whose leader has "
-                             f"exited is not signalled by number). {_by_hand(pid, occ_dir.name)}"]
+                             f"exited is not signalled by number). {_by_hand(pid, occ_dir, store_dir)}"]
 
 
 # --------------------------------------------------------------------------------------------------------- recover
@@ -280,8 +299,8 @@ def recover(store_path: Path | str, occ_dir: Path | str, *, state: str = "launch
     if res.child == "not-confirmed":
         pid = prog.get("child_pid")
         line = (f"The compose child (process group {pid}) was not confirmed ended and was not signalled by number. "
-                f"{_by_hand(pid, occ_dir.name)}.") if type(pid) is int else \
-            "The compose child was not confirmed ended; check what is running, then rerun `levain dream recover`."
+                f"{_by_hand(pid, occ_dir, db.parent)}.") if type(pid) is int else \
+            f"The compose child was not confirmed ended; check what is running, then rerun `{_rerun_command(occ_dir, db.parent)}`."
         if res.card is None and card_filed:
             pass                               # this occurrence's card exists already: no second one
         elif res.card is None:
@@ -309,7 +328,7 @@ def _recover_locked(db: Path, occ_dir: Path, prog: dict[str, Any], state: str, c
     except Exception as exc:  # noqa: BLE001 — an unreadable store settles nothing
         return RecoverResult("none", "store-unreadable", notes=[f"{type(exc).__name__}: {exc}"], settled=False)
     try:
-        child, notes = end_orphan_child(prog, occ_dir, term_wait=term_wait, kill_wait=kill_wait)
+        child, notes = end_orphan_child(prog, occ_dir, store_dir=db.parent, term_wait=term_wait, kill_wait=kill_wait)
         res = RecoverResult("none", "", notes=notes, child=child)
         if phase in (None, "composing"):
             if not token:
@@ -421,7 +440,7 @@ def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], r
                          + (f"Its unrenamed files: {tmps}; " if tmps else "")
                          + "finish anneal's rename by hand (mv the .md.tmp and .json.tmp into place), then rerun "
                          "recover. No post record was written, so a rollback is refused until then.")
-        res.card = _card("consolidated", reason, occ)
+        res.card = _card("failed", reason, occ)
         res.settled = False
         return res
     try:
@@ -432,7 +451,7 @@ def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], r
             res.notes.append(f"post files not recorded: {exc}; recovery is not settled, so a rerun can finish")
             res.ending, res.reason = ("stopped" if stopped else "done"), (COMMITTED_AFTER_STOP if stopped
                                                                          else COMMITTED_NOT_RECORDED)
-            res.card = _card("consolidated", res.reason, occ)
+            res.card = _card("failed", res.reason, occ)
             res.settled = False
             return res
     except Exception as exc:  # noqa: BLE001 — a write that failed leaves the commit unrecorded: retry, do not trace

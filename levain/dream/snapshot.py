@@ -574,75 +574,91 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
 
     db, root = Path(store_path).resolve(), Path(root)
     res = DrillResult("no-snapshot", at=_now())
-    # one lock covers choosing the snapshot, reading its manifest, hashing, and copying both the snapshot files and the
-    # live store: a dream finishing between any two of those would otherwise leave the drill checking a stale snapshot
-    handle = _w._lock_wrap_file(db.parent / "wrap.lock")
-    if handle is _w._ANOTHER_WRAP_RUNNING:
-        return _deferred(res, "a consolidate holds the store's wrap lock, so the live store cannot be copied "
-                              "consistently")
-    held = [handle]
-
-    def release() -> None:
-        if held:
-            _w._unlock_wrap(held.pop())
-
     scratch: Path | None = None
     try:
-        snaps = snapshots(root)
-        if not snaps:
-            return _drill_done(res, root, write_result)
-        name, m = snaps[-1]
-        occ = root / name
-        res.snapshot, res.outcome = name, "ok"
-        snap = occ / SNAP_DIR
-        # the lock covers only choosing, reading and copying: the hash and the integrity check run on the scratch
-        # copies after it is released, so a large store does not hold every dream off for that long
-        scratch = Path(tempfile.mkdtemp(prefix="levain-dream-drill-"))
-        sdir = scratch / "store"
-        sdir.mkdir()
-        socc = scratch / "occs" / name
-        (socc / SNAP_DIR).mkdir(parents=True)
-        bdir = scratch / "backup"
-        bdir.mkdir()
+        # the scratch dirs exist before the lock is taken, so a setup failure can never leave the lock held
+        try:
+            scratch = Path(tempfile.mkdtemp(prefix="levain-dream-drill-"))
+            sdir = scratch / "store"
+            sdir.mkdir()
+            bdir = scratch / "backup"
+            bdir.mkdir()
+        except OSError as exc:
+            _step(res, "setup", "failed", f"no scratch directory: {type(exc).__name__}: {exc}")
+            return _drill_done(res, root, write_result, failed=True)
+        # one lock covers choosing the snapshot, reading its manifest, and copying both the snapshot files and the
+        # live store: a dream finishing between any two of those would otherwise leave the drill checking a stale one
+        try:
+            handle = _w._lock_wrap_file(db.parent / "wrap.lock")
+        except OSError as exc:
+            _step(res, "setup", "failed", f"the wrap lock could not be opened: {type(exc).__name__}: {exc}")
+            return _drill_done(res, root, write_result, failed=True)
+        if handle is _w._ANOTHER_WRAP_RUNNING:
+            return _deferred(res, "a consolidate holds the store's wrap lock, so the live store cannot be copied "
+                                  "consistently")
+        held = [handle]
+
+        def release() -> None:
+            if held:
+                _w._unlock_wrap(held.pop())
+
         copy_db: Path | None = None
         copy_err: str | None = None
+        restore_err: str | None = None
         try:
-            for e in m["files"].values():
-                if e["sha256"] is not None:
-                    shutil.copy2(snap / e["name"], socc / SNAP_DIR / e["name"])
-            shutil.copy2(snap / DB_BACKUP, bdir / DB_BACKUP)
-        except OSError as exc:
-            copy_err = f"{type(exc).__name__}: {exc}"
-        if copy_err is None and m.get("post_files"):
+            snaps = snapshots(root)
+            if not snaps:
+                return _drill_done(res, root, write_result)
+            name, m = snaps[-1]
+            occ = root / name
+            res.snapshot, res.outcome = name, "ok"
+            snap = occ / SNAP_DIR
+            # the lock covers only choosing, reading and copying: the hash runs on the originals and the integrity
+            # check on the scratch copy after it is released, so a large store does not hold every dream off
+            socc = scratch / "occs" / name
+            (socc / SNAP_DIR).mkdir(parents=True)
             try:
-                copy_db = _copy_store(db, sdir)
-            except (OSError, sqlite3.Error) as exc:
-                _step(res, "restore", "failed", f"the live store could not be copied: {type(exc).__name__}: {exc}")
-                return _drill_done(res, root, write_result, failed=True)
-        release()
+                for e in m["files"].values():
+                    if e["sha256"] is not None:
+                        shutil.copy2(snap / e["name"], socc / SNAP_DIR / e["name"])
+                shutil.copy2(snap / DB_BACKUP, bdir / DB_BACKUP)
+            except OSError as exc:
+                copy_err = f"{type(exc).__name__}: {exc}"
+            if copy_err is None and m.get("post_files"):
+                try:
+                    copy_db = _copy_store(db, sdir)
+                except (OSError, sqlite3.Error) as exc:
+                    restore_err = f"the live store could not be copied: {type(exc).__name__}: {exc}"
+        finally:
+            release()
+        # the hash reads the ORIGINAL snapshot files (read-only), so a short or failed copy is never reported as a
+        # corrupt snapshot
         try:
-            if copy_err is not None:
-                bad = [copy_err]
-            else:
-                bad = [e["name"] for e in m["files"].values() if e["sha256"] is not None
-                       and sha256_file(socc / SNAP_DIR / e["name"]) != e["sha256"]]
-                if sha256_file(bdir / DB_BACKUP) != m.get("db_backup_sha256"):
-                    bad.append(DB_BACKUP)
+            bad = [e["name"] for e in m["files"].values() if e["sha256"] is not None
+                   and sha256_file(snap / e["name"]) != e["sha256"]]
+            if sha256_file(occ / SNAP_DIR / DB_BACKUP) != m.get("db_backup_sha256"):
+                bad.append(DB_BACKUP)
         except OSError as exc:
             bad = [f"{type(exc).__name__}: {exc}"]
         if _step(res, "hash", "failed" if bad else "ok", f"does not match the manifest: {bad}" if bad
                  else "every snapshot file and the db backup match their manifest hashes") == "failed":
             return _drill_done(res, root, write_result, failed=True)
         try:
-            con = sqlite3.connect(f"file:{bdir / DB_BACKUP}?mode=ro", uri=True)
-            try:
-                verdict = [r[0] for r in con.execute("pragma integrity_check")]
-            finally:
-                con.close()
+            if copy_err is not None:
+                verdict = [f"the scratch copy failed: {copy_err}"]
+            else:
+                con = sqlite3.connect(f"file:{bdir / DB_BACKUP}?mode=ro", uri=True)
+                try:
+                    verdict = [r[0] for r in con.execute("pragma integrity_check")]
+                finally:
+                    con.close()
         except sqlite3.Error as exc:
             verdict = [f"{type(exc).__name__}: {exc}"]
         ok = verdict == ["ok"]
         if _step(res, "integrity", "ok" if ok else "failed", "integrity_check: ok" if ok else f"{verdict[:3]}") == "failed":
+            return _drill_done(res, root, write_result, failed=True)
+        if restore_err is not None:
+            _step(res, "restore", "failed", restore_err)
             return _drill_done(res, root, write_result, failed=True)
         if not m.get("post_files") or copy_db is None:
             _step(res, "restore", "skipped", "the snapshot has no post-save record, so a rollback of it is refused by design")
@@ -677,7 +693,6 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
             _step(res, "open", "failed", f"{type(exc).__name__}: {exc}")
             return _drill_done(res, root, write_result, failed=True)
     finally:
-        release()
         if scratch is not None:
             shutil.rmtree(scratch, ignore_errors=True)
     return _drill_done(res, root, write_result)
