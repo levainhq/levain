@@ -21,7 +21,7 @@ LAYOUT = """(() => { const q = (s) => document.querySelector(s);
   const strip = q('#ck-phonetabs'); const cs = getComputedStyle(strip);
   return JSON.stringify({ display: cs.display, position: cs.position, tabs: [...strip.querySelectorAll('button')].map(b => b.dataset.phoneJump),
     tabH: Math.min(...[...strip.querySelectorAll('button')].map(b => Math.round(b.getBoundingClientRect().height))),
-    stripFits: strip.scrollWidth <= strip.clientWidth, stripTop: top(strip), band: top(q('#ck-band')), needs: top(q('#ck-needs')), sky: top(q('#ck-skycard')), scrollW: document.documentElement.scrollWidth,
+    stripFits: strip.scrollWidth <= strip.clientWidth, stripTop: top(strip), band: top(q('#ck-band')), needs: top(q('#ck-needs')), drop: top(q('#ck-drop')), sky: top(q('#ck-skycard')), scrollW: document.documentElement.scrollWidth,
     vw: document.documentElement.clientWidth, heroDisplay: getComputedStyle(q('#ck-hero')).display, heroBox: heroBox(q('#ck-hero')) }); })()"""
 
 
@@ -52,6 +52,8 @@ def test_a_phone_gets_the_strip_the_needs_first_and_a_jump_to_each_page_view(tmp
     assert layout["heroDisplay"] == "contents" and layout["heroBox"] == "0px 0px 0px 0px 0px 0px 0px 0px rgba(0, 0, 0, 0) none", layout
     # the state line (the band), then what waits on him, then the graph
     assert layout["stripTop"] < layout["band"] < layout["needs"] < layout["sky"], layout
+    # the drop sits directly under the strip (Phill 10-30), before the graph
+    assert layout["needs"] < layout["drop"] < layout["sky"], layout
     # the board and notification tabs land their block below the sticky strip; needs is at the top already
     for which in ("board", "notes"):
         j = jumps[which]

@@ -52,24 +52,24 @@ RECEIPT_DONE = "(document.querySelector('#ck-drop .drop-receipt') || {}).textCon
 @needs_browser
 @needs_ssh
 @pytest.mark.parametrize("view", ["390", "1280"])
-def test_the_drop_is_the_hero_under_the_now_band_above_everything_else(view: str, tmp_path: Path, monkeypatch) -> None:
+def test_the_drop_sits_directly_under_the_needs_you_row_above_the_work_regions(view: str, tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     probe = ("(() => { const top = (s) => { const e = document.querySelector(s); return e && e.getClientRects().length ? Math.round(e.getBoundingClientRect().top + window.scrollY) : null; };"
              " const bot = (s) => { const e = document.querySelector(s); return e ? Math.round(e.getBoundingClientRect().bottom + window.scrollY) : null; };"
              " const box = document.getElementById('ck-drop-words').getBoundingClientRect(); const host = document.getElementById('ck-drop').getBoundingClientRect();"
-             " return JSON.stringify({t: 'pos', bandBottom: bot('#ck-band'), drop: top('#ck-drop'), needs: top('#ck-needs'), brief: top('#ck-brief'), tray: top('.panel[data-ck-panel=\"tray\"]'),"
+             " return JSON.stringify({t: 'pos', bandBottom: bot('#ck-band'), drop: top('#ck-drop'), needs: top('#ck-needs'), needsBottom: bot('#ck-needs'), brief: top('#ck-brief'), tray: top('.panel[data-ck-panel=\"tray\"]'),"
              " sky: top('#ck-skycard'), boxW: box.width, hostW: host.width, boxH: box.height, over: document.documentElement.scrollWidth > window.innerWidth,"
-             " buttons: [...document.querySelectorAll('#ck-drop button')].map(b => b.textContent), insideHero: !!document.querySelector('#ck-hero > #ck-drop') }); })()")
+             " buttons: [...document.querySelectorAll('#ck-drop button')].map(b => b.textContent), afterNeeds: !!document.querySelector('#ck-needs + #ck-drop'), insideHero: !!document.querySelector('#ck-hero #ck-drop') }); })()")
     with rig.serving():
         out = _drive_view(view, tmp_path, f"{rig.origin}/#write_token={TOK}",
                           [{"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, SETTLE, {"eval": probe}, _shot(tmp_path, f"{view}_home")])
     p = _tagged(out)["pos"]
-    assert p["insideHero"] and not p["over"], p
-    assert p["drop"] is not None and p["bandBottom"] <= p["drop"], p                        # directly under the now band
-    assert p["drop"] < p["needs"] < p["tray"], p                                            # above the strip, the work regions...
+    assert p["afterNeeds"] and not p["insideHero"] and not p["over"], p                    # the next element after the strip in the document, outside the hero
+    assert p["bandBottom"] <= p["needs"] and p["needsBottom"] <= p["drop"], p               # under the band, and under the strip (the document order is the narrow order too)
+    assert p["drop"] < p["tray"], p                                                         # above the work regions...
     assert p["brief"] is None or p["drop"] < p["brief"], p                                  # ...and the brief
-    assert p["sky"] is None or p["drop"] < p["sky"] or view == "390", p                     # (the narrow page draws the sky after the strip)
-    assert p["boxW"] >= 0.9 * p["hostW"] - 2 and p["boxH"] >= 150, p                      # the one free-text rule: full width, ~8 rows
+    assert p["sky"] is None or (p["sky"] < p["needs"] if view == "1280" else p["needs"] < p["sky"]), p   # the desktop sky card sits above the strip; the narrow page draws it after
+    assert p["boxW"] >= (0.55 if view == "1280" else 0.85) * p["hostW"] and p["boxH"] >= 150, p   # the free-text rule: the box fills its card (a side column of drops beside it from 1100px), ~8 rows
     assert p["buttons"][:2] == ["Send", "Add an envelope"], p
 
 
@@ -301,7 +301,7 @@ def test_the_hero_box_and_its_typed_words_survive_the_cockpit_re_render(tmp_path
     redrawn = "(() => { const w = document.getElementById('ck-when'); return w && w.firstChild && !w.firstChild.__gen; })()"
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, _type("typed, not sent"), {"eval": mark},
              {"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"}, {"until": redrawn, "ms": 20000}, SETTLE,
-             {"eval": f"JSON.stringify({{t: 'kept', same: {BOX}.__mark === 1, value: {BOX}.value, inHero: !!document.querySelector('#ck-hero > #ck-drop')}})"}]
+             {"eval": f"JSON.stringify({{t: 'kept', same: {BOX}.__mark === 1, value: {BOX}.value, inHero: !!document.querySelector('#ck-needs + #ck-drop')}})"}]
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
     assert _tagged(out)["kept"] == {"t": "kept", "same": True, "value": "typed, not sent", "inHero": True}, _tagged(out)["kept"]
