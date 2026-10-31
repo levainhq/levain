@@ -143,9 +143,9 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
             # only a paired device subscribes: no credential without a device (the owner key included) becomes one
             return _err(403, "credential_required", "only a paired device turns pings on")
         if not journal:
-            # the device is paired; the caller failed to say which pairing journal holds it (a server bug, not the
-            # phone's fault, so not the 403 a phone with no pairing gets)
-            return _err(500, "no_pairing_journal", "the server named no pairing journal for this paired device")
+            # the device is paired; this server names no pairing journal for it (a cockpit run without a broker), so
+            # pings cannot be turned on here: unavailable, not the 403 a phone with no pairing gets and not a 500 fault
+            return _err(503, "no_pairing_journal", "this cockpit names no pairing journal, so pings cannot be turned on here")
         try:
             return _json(200, {"id": store.add_subscription(endpoint, p256dh, auth, device_id, journal=journal)})
         except DeviceNotLive:
