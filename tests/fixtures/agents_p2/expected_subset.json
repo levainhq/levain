@@ -1,0 +1,46 @@
+{
+ "jobs": {
+  "job_sync_check": {
+   "verdict": "pass",
+   "class": "push",
+   "refinement": null,
+   "review_required": false
+  },
+  "job_push_check": {
+   "verdict": "pass",
+   "class": "push",
+   "refinement": null,
+   "review_required": true
+  },
+  "job_corpus_reader": {
+   "verdict": "refused",
+   "class": "corpus",
+   "refinement": "a",
+   "review_required": false
+  },
+  "job_feeder_member": {
+   "verdict": "refused",
+   "class": "push",
+   "refinement": "b",
+   "review_required": false
+  },
+  "job_snapshot": {
+   "verdict": "pass",
+   "class": "recovery",
+   "refinement": "c",
+   "review_required": true
+  },
+  "job_proposer": {
+   "verdict": "refused",
+   "class": "corpus",
+   "refinement": "a",
+   "review_required": true
+  },
+  "job_composer": {
+   "verdict": "pass",
+   "class": "push",
+   "refinement": null,
+   "review_required": true
+  }
+ }
+}

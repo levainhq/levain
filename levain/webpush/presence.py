@@ -514,10 +514,22 @@ def _write(queue_dir: Path | str, rec: dict | None) -> None:
         tmp = d / f".{FILE_NAME}.{os.getpid()}.{time.time_ns()}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
-            os.write(fd, json.dumps(rec).encode("utf-8"))
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
+            try:
+                view = memoryview(json.dumps(rec).encode("utf-8"))
+                while view:   # a short write would rename a half word into place
+                    n = os.write(fd, view)
+                    if n <= 0:
+                        raise OSError("short write")
+                    view = view[n:]
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except BaseException:
+            try:   # a failed write leaves no orphan temp file behind; the word in place is untouched
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
     except OSError as e:
         raise PresenceError(f"presence word not written: {e}") from e
 

@@ -35,7 +35,8 @@ from levain.agents.store import AgentStore
 from levain.authority import _canonical
 
 __all__ = ["RoleError", "ROLE_FIELDS", "ROLE_NAME", "parse_role", "parse_role_text", "canonical_role", "role_hash",
-           "instance_ceiling", "spawn_namespace", "add_role", "get_role", "latest_version"]
+           "instance_ceiling", "spawn_namespace", "add_role", "get_role", "latest_version",
+           "role_by_hash"]
 
 ROLE_HASH_PREFIX = b"levain-rolespec/1\n"
 ROLE_NAME = re.compile(r"[a-z][a-z0-9-]{0,47}")
@@ -199,6 +200,11 @@ def _check_row(column_name: Any, digest: str, version: Any, text: Any) -> dict[s
     and is that role's canonical text, and it names the row's name column. Raise :class:`RoleError` otherwise."""
     if not isinstance(text, str):
         raise RoleError(f"role {column_name!r} v{version}: the stored spec is a {type(text).__name__}, not text")
+    try:
+        _version(version)
+    except RoleError:
+        raise RoleError(f"role {column_name!r}: the stored version {version!r} is not an integer from 1 to "
+                        f"{MAX_VERSION}") from None
     role = parse_role_text(text)
     if role_hash(role) != digest or _canonical(role) != text:
         raise RoleError(f"role {column_name!r} v{version}: the stored text does not hash to its role_hash")
@@ -251,6 +257,14 @@ def get_role(store: AgentStore, name: str, version: int | None = None) -> tuple[
         raise RoleError(f"no role named {name!r}" + (f" at version {version}" if version is not None else ""))
     digest, ver, text = row
     return digest, ver, _check_row(name, digest, ver, text)
+
+
+def role_by_hash(store: AgentStore, digest: str) -> dict[str, Any] | None:
+    """The role whose role_hash is ``digest``, or None when no role has it. The row passes the same checks as every
+    other read of a stored role (:func:`_check_row`): a row that fails them raises :class:`RoleError`."""
+    with store.read() as conn:
+        row = conn.execute("SELECT name, version, spec FROM agent_roles WHERE role_hash = ?", (digest,)).fetchone()
+    return None if row is None else _check_row(row[0], digest, row[1], row[2])
 
 
 def latest_version(store: AgentStore, name: str) -> int | None:
