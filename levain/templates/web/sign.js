@@ -724,15 +724,6 @@
     });
   }
   // ---- the drop sheet (OS-2, /sign/drop) ----
-  // The sizes an envelope is offered in. These numbers are starting points judged by the head on 2026-10-31, with no
-  // measurement behind them yet: tune them here, they are the only place a preset's numbers live. `stop` is the hard end;
-  // `hours` are ACTIVE agent hours (not the clock); `tool_calls` and `tokens` (fresh: input + output + cache writes) are the
-  // budget gauge, which pauses new work when crossed and asks for an extension.
-  const SIZES = {
-    quick:    { label: "Quick",    stop: "2h",  hours: 1, tool_calls: 200,  tokens: 2000000 },
-    standard: { label: "Standard", stop: "8h",  hours: 3, tool_calls: 800,  tokens: 8000000 },
-    long:     { label: "Long",     stop: "24h", hours: 8, tool_calls: 2500, tokens: 25000000 },
-  };
   const stamp = () => new Date().toISOString().replace(/\.(\d{3})Z$/, ".$1000Z");   // the store's fixed-width UTC form
   const newOutboxId = () => {
     const b = new Uint8Array(16);
@@ -779,177 +770,16 @@
     const colL = el("div", "env-col"), colR = el("div", "env-col");
     grid.append(colL, colR);
     body.appendChild(grid);
-    // a group: a legend, one hint line, a slot for the server's refusal when it names this group, then its controls
-    const group = (gid, title, hint) => {
-      const g = el("fieldset", "env-group");
-      g.id = gid;
-      g.appendChild(el("legend", "env-label", title));
-      if (hint) g.appendChild(el("p", "env-hint", hint));
-      const err = el("p", "env-err");
-      err.hidden = true;
-      err.setAttribute("role", "alert");
-      g.appendChild(err);
-      g.err = err;
-      return g;
-    };
-    const gWords = group("env-words", "Your words");
     const words = el("textarea", "");
     words.id = "drop-words";
     words.rows = 4;
     words.placeholder = "what you want done";
     words.setAttribute("aria-label", "your words");
-    gWords.appendChild(words);
     // words typed in the cockpit's drop box and handed over by "Add an envelope" (dashboard_core.js openDropSheet): read once
     try {
       const pre = window.sessionStorage.getItem("levain-drop-prefill");
       if (pre) { words.value = pre; grow(words); window.sessionStorage.removeItem("levain-drop-prefill"); }
     } catch (e) { /* the sheet opens empty */ }
-
-    // ---- where it may work: a picker over the folders this store knows, "Another folder…" last ----
-    const gRepo = group("env-repo", "Where it may work", "The repo the coordinator may change. Nothing outside it.");
-    const repoList = (Array.isArray(got.coord_repos) ? got.coord_repos : []).filter((r) => typeof r === "string" && r);
-    const OTHER = "\u0000other";
-    const baseName = (p) => p.replace(/\/+$/, "").split("/").pop() || p;
-    const repo = el("input");           // the typed path: shown only for "Another folder…" (or when no folder is known)
-    repo.id = "drop-repo";
-    repo.type = "text";
-    repo.placeholder = "/Users/you/project";
-    repo.setAttribute("aria-label", "the full path of a folder");
-    const repoOther = el("div", "env-other");
-    repoOther.append(repo, el("p", "env-hint", "the full path of a folder on this machine, e.g. /Users/you/project"));
-    let repoSel = repoList.length ? repoList[0] : OTHER;     // the listing puts the threads' own folders first; the only one is the first
-    let repoPaint = () => undefined;
-    const setRepo = (v) => { repoSel = v; repoOther.hidden = v !== OTHER; repoPaint(); };
-    if (repoList.length) {
-      const choices = repoList.concat([OTHER]);
-      if (repoList.length <= 4) {
-        const grp = el("div", "env-opts");
-        grp.id = "drop-repo-pick";
-        grp.setAttribute("role", "radiogroup");
-        grp.setAttribute("aria-label", "where it may work");
-        const radios = [];
-        for (const v of choices) {
-          const lab = el("label", "env-opt");
-          const rb = el("input");
-          rb.type = "radio";
-          rb.name = "drop-repo-pick";
-          rb.value = v;
-          rb.addEventListener("change", () => { if (rb.checked) { setRepo(v); changed(); } });
-          const t = el("span", "env-opt-t");
-          t.appendChild(el("span", "env-opt-name", v === OTHER ? "Another folder…" : baseName(v)));
-          if (v !== OTHER) t.appendChild(el("span", "ext-meta env-opt-sub", v));
-          lab.append(rb, t);
-          grp.appendChild(lab);
-          radios.push(rb);
-        }
-        repoPaint = () => { for (const rb of radios) rb.checked = rb.value === repoSel; };
-        gRepo.appendChild(grp);
-      } else {
-        const sel = el("select");
-        sel.id = "drop-repo-pick";
-        sel.setAttribute("aria-label", "where it may work");
-        for (const v of choices) { const o = el("option", "", v === OTHER ? "Another folder…" : baseName(v) + " — " + v); o.value = v; sel.appendChild(o); }
-        sel.addEventListener("change", () => { setRepo(sel.value); changed(); });
-        repoPaint = () => { sel.value = repoSel; };
-        gRepo.appendChild(sel);
-      }
-    }
-    gRepo.appendChild(repoOther);
-    setRepo(repoSel);
-    repo.addEventListener("input", () => changed());
-
-    // ---- landing: radios, never on by default ----
-    const gLand = group("env-land", "Landing", "Landing lets it merge finished, reviewed work onto that branch by itself.");
-    let landSel = "none";
-    const onto = el("input");           // a bare branch name, for "Land onto another branch…"
-    onto.id = "drop-onto";
-    onto.type = "text";
-    onto.placeholder = "branch name, e.g. release";
-    onto.setAttribute("aria-label", "the branch to land onto");
-    const ontoWrap = el("div", "env-other");
-    ontoWrap.hidden = true;
-    ontoWrap.appendChild(onto);
-    for (const [v, text] of [["none", "Don't land — it works on a branch and you merge"], ["main", "Land finished work onto main"], ["other", "Land onto another branch…"]]) {
-      const lab = el("label", "env-opt");
-      const rb = el("input");
-      rb.type = "radio";
-      rb.name = "drop-land";
-      rb.id = "drop-land-" + v;
-      rb.value = v;
-      rb.checked = v === landSel;
-      rb.addEventListener("change", () => { if (rb.checked) { landSel = v; ontoWrap.hidden = v !== "other"; changed(); } });
-      lab.append(rb, el("span", "env-opt-t", text));
-      gLand.appendChild(lab);
-    }
-    gLand.appendChild(ontoWrap);
-    onto.addEventListener("input", () => changed());
-
-    // ---- size: presets, and Custom (the one fold) ----
-    const gSize = group("env-size", "Size", "How long it may run and how much it may do.");
-    const seg = el("div", "env-seg");
-    seg.id = "drop-size";
-    seg.setAttribute("role", "radiogroup");
-    seg.setAttribute("aria-label", "size");
-    const sizeBtns = {};
-    for (const k of Object.keys(SIZES).concat(["custom"])) {
-      const b = el("button", "env-seg-btn", k === "custom" ? "Custom" : SIZES[k].label);
-      b.type = "button";
-      b.id = "drop-size-" + k;
-      b.setAttribute("role", "radio");
-      b.addEventListener("click", () => { selectSize(k); });
-      sizeBtns[k] = b;
-      seg.appendChild(b);
-    }
-    const sizeLine = el("p", "env-hint");
-    sizeLine.id = "drop-size-line";
-    const custom = el("div", "env-custom");
-    custom.id = "drop-custom";
-    const stop = el("select");
-    const nums = {};
-    const infield = (fid, label, hint, node) => {
-      const w = el("label", "env-field");
-      node.id = fid;
-      w.append(el("span", "env-flabel", label), node, el("span", "env-hint", hint));
-      custom.appendChild(w);
-      return node;
-    };
-    infield("drop-stop", "Ends by", "a hard end: after this the envelope is void", stop);
-    for (const h of ["1h", "2h", "4h", "8h", "12h", "24h"]) stop.appendChild(el("option", "", h));
-    for (const [k, label, hint] of [["hours", "Active hours", "time agents are actually working, not the clock"], ["calls", "Tool calls", "each command, file read or edit counts one"],
-                                    ["tokens", "Fresh tokens", "model input + output; cache reads are not counted"]]) {
-      const n = infield("drop-" + k, label, hint, el("input"));
-      n.type = "number";
-      n.min = "0";
-      n.setAttribute("aria-label", label.toLowerCase());
-      n.addEventListener("input", () => changed());
-      nums[k] = n;
-    }
-    stop.addEventListener("change", () => changed());
-    let size = "standard";
-    const selectSize = (k) => {
-      size = k;
-      if (k !== "custom") {
-        // the raw fields follow the preset chosen, so Custom opens on real numbers and never on blanks
-        const p = SIZES[k];
-        stop.value = p.stop;
-        nums.hours.value = String(p.hours);
-        nums.calls.value = String(p.tool_calls);
-        nums.tokens.value = String(p.tokens);
-        sizeLine.textContent = p.label + ": ends by " + p.stop + " at the latest, " + p.hours + (p.hours === 1 ? " active hour" : " active hours") + ", "
-          + p.tool_calls.toLocaleString("en-US") + " tool calls, " + (p.tokens / 1e6) + "M fresh tokens.";
-      } else sizeLine.textContent = "Set each limit yourself; the boxes start from the size you last picked.";
-      custom.hidden = k !== "custom";
-      for (const [bk, b] of Object.entries(sizeBtns)) b.setAttribute("aria-checked", bk === k ? "true" : "false");
-      changed();
-    };
-    gSize.append(seg, sizeLine, custom, el("p", "env-hint", "Reaching a limit pauses new work and asks you to extend it; nothing running is killed."));
-
-    // ---- what you sign: the server's own reading of the envelope, fetched as the form changes ----
-    const gSum = group("env-sum", "What you sign");
-    const review = el("pre", "sheet-message env-summary");
-    review.id = "drop-review";
-    review.setAttribute("aria-live", "polite");
-    gSum.appendChild(review);
     const keyBox = el("div", "env-keybox");
     keyBox.hidden = true;
     const acts = $("sheet-actions");
@@ -962,24 +792,36 @@
     sign.id = "drop-sign";
     sign.disabled = true;
     acts.append(sign, send);
-    colL.append(gWords, gRepo, gLand);
-    colR.append(gSize, gSum, keyBox, acts, $("sheet-note"));
+    let oid = newOutboxId();       // held for these words: a resend after a lost reply files once, never twice
+    let cannot = "";
+    const why0 = !storeRead ? "still reading which Levain answers here; reload" : "";
+    // the fields, the spec and the review are the shared form's (envelope_form.js); this page passes how a review is asked for
+    const form = window.LevainEnvelopeForm.create({
+      words: words, wordsGroup: true, left: colL, right: colR, lockRoots: [grid], repos: got.coord_repos, sign: sign, why: why,
+      blocked: () => (cannot ? "Envelope: " + cannot : why0),
+      review: (req) => {
+        const k = keyNow();
+        return post("envelope-review", { words: req.words, outbox_id: oid, spec: req.spec, signer_fp: k.fp, store_id: storeId }).then((c) => {
+          // a fresh install's review made the store: only then does a null identity take the reply's
+          if (c.ok && storeId === null && c.body.store_created === true && typeof c.body.store_id === "string") storeId = c.body.store_id;
+          c.k = k;
+          return c;
+        });
+      },
+    });
+    colR.append(keyBox, acts, $("sheet-note"));
     body.appendChild(list);
     if (words.value) grow(words);      // sized once it is in the page: a box that is not laid out yet measures nothing
     $("sheet").dataset.state = "open";
-    const why0 = !storeRead ? "still reading which Levain answers here; reload" : "";
-    let oid = newOutboxId();       // held for these words: a resend after a lost reply files once, never twice
     let working = false;
     let pending = null;            // a signed drop whose reply did not come back: sent again unchanged, never re-signed
-    let current = null;            // the review the button signs: {id, body_text, k, words}; null whenever the form has changed since
-    let seq = 0, timer = null;
-    const syncSign = () => { sign.disabled = working || !!sign.dataset.cannot || !current; };
+    const queue = (ms) => form.queue(ms);
+    const changed = () => form.changed();
     const lock = (on) => {
       working = on;
       send.disabled = on;
       words.disabled = on;
-      for (const n of grid.querySelectorAll("input, select, textarea, .env-seg button")) n.disabled = on;
-      syncSign();
+      form.lock(on);
     };
     // a drop whose answer is not known is kept in this browser BEFORE it is posted (as the phone's outbox keeps it), so a
     // closed sheet loses nothing: the next open sends it again, unchanged (the same outbox id files once), and it leaves
@@ -1092,11 +934,11 @@
       sendDrop({ words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId });
     });
     // what the envelope needs, said before any tap: never a ceremony that cannot verify
-    const cannot = !usable ? "this browser cannot use a passkey here (needs https)"
+    cannot = !usable ? "this browser cannot use a passkey here (needs https)"
       : origin !== window.location.origin ? "this page cannot use your passkey: sign on " + (origin || "the cockpit's https page")
       : typeof got.elsewhere === "string" && got.elsewhere ? got.elsewhere
       : !signers.length ? (got.coord_signer_note || "no passkey enrolled for " + rp + " can sign an envelope") : "";
-    if (cannot) { const n = el("p", "ext-meta", "Envelope: " + cannot); n.id = "drop-sign-note"; colR.insertBefore(n, acts); sign.disabled = true; sign.dataset.cannot = "1"; }
+    if (cannot) { const n = el("p", "ext-meta", "Envelope: " + cannot); n.id = "drop-sign-note"; colR.insertBefore(n, acts); sign.disabled = true; }
 
     // ---- the passkey this device signs with: the one it holds; a choice only when it holds several ----
     const localKeys = mine(rp);
@@ -1118,83 +960,11 @@
         : { fp: keyFp, rawId: held[keyFp] && typeof held[keyFp].credential_id === "string" ? held[keyFp].credential_id : null, local: false };
     };
 
-    // ---- the form as the spec the server reads: the same four keys (where, lands, stop, budget) and shapes as ever ----
-    // {spec, words} when the form is complete, else {bad: what is missing}; the preset's numbers come from SIZES, Custom's from its boxes
-    const specNow = () => {
-      const w = words.value;
-      if (!w.trim()) return { bad: "Add your words to see what you would sign." };
-      const r = repoSel === OTHER ? repo.value.trim() : repoSel;
-      if (!r) return { bad: "Name the folder it may work in (its full path)." };
-      if (r.charAt(0) !== "/") return { bad: "The folder is a full path, starting with /." };
-      let lands = [];
-      if (landSel === "main") lands = [{ repo: r, onto: "main" }];
-      else if (landSel === "other") {
-        const b = onto.value.trim();
-        if (!b) return { bad: "Name the branch it may land onto." };
-        lands = [{ repo: r, onto: b }];
-      }
-      let stopV, budget;
-      if (size === "custom") {
-        const vals = {};
-        for (const k of ["hours", "calls", "tokens"]) {
-          const t = nums[k].value.trim();
-          if (t === "" || !Number.isFinite(Number(t)) || Number(t) < 0) return { bad: "Fill in every limit under Custom (a typed 0 means none allowed)." };
-          vals[k] = Number(t);
-        }
-        stopV = stop.value;
-        budget = { tool_calls: vals.calls, tokens: vals.tokens, hours: vals.hours };
-      } else {
-        const p = SIZES[size];
-        stopV = p.stop;
-        budget = { tool_calls: p.tool_calls, tokens: p.tokens, hours: p.hours };
-      }
-      return { words: w, spec: { where: [{ repo: r, paths: ["."] }], lands: lands, stop: stopV, budget: budget } };
-    };
-    const clearErrs = () => { for (const g of [gWords, gRepo, gLand, gSize, gSum]) { g.err.hidden = true; g.err.textContent = ""; } };
-    // the server's refusal beside the field it names (its own words); one that names none sits under the summary
-    const groupFor = (m) => /\bland|onto|branch|merge/i.test(m) ? gLand : /repo|path|folder|where|absolute|outside/i.test(m) ? gRepo
-      : /budget|token|hours|tool.?calls|stop|lifetime|span|expire|too long/i.test(m) ? gSize : /words|drop|empty/i.test(m) ? gWords : gSum;
-    const showReview = (text, wait) => { review.textContent = text; review.classList.toggle("env-wait", !!wait); };
-    // any change to the form: the review in hand is no longer the form's, and a new one is asked for once the typing settles
-    const queue = (ms) => {
-      current = null;
-      seq += 1;
-      clearTimeout(timer);
-      clearErrs();
-      syncSign();
-      if (working || cannot) { showReview(cannot ? "Envelope: " + cannot : "", true); return; }
-      if (why0) { showReview(why0, true); return; }
-      const v = specNow();
-      if (v.bad) { showReview(v.bad, true); return; }
-      showReview("Reading what you would sign…", true);
-      const mineSeq = seq;
-      timer = setTimeout(() => {
-        if (working || mineSeq !== seq) return;
-        const k = keyNow();
-        post("envelope-review", { words: v.words, outbox_id: oid, spec: v.spec, signer_fp: k.fp, store_id: storeId }).then((c) => {
-          if (mineSeq !== seq) return;              // the form moved on while this was read: the newer one speaks
-          if (!c.ok) {
-            const m = why(c);
-            showReview("This cannot be signed yet.", true);
-            const g = groupFor(m);
-            g.err.textContent = m;
-            g.err.hidden = false;
-            return;
-          }
-          // a fresh install's review made the store: only then does a null identity take the reply's
-          if (storeId === null && c.body.store_created === true && typeof c.body.store_id === "string") storeId = c.body.store_id;
-          current = { id: c.body.review_id, body_text: c.body.body_text, k: k, words: v.words };
-          showReview(Array.isArray(c.body.view) ? c.body.view.join("\n") : "", false);
-          syncSign();
-        });
-      }, ms === undefined ? 500 : ms);
-    };
-    function changed() { queue(); }
-    words.addEventListener("input", () => changed());
+    // the form (envelope_form.js) holds the review the button signs; a change to the form retires it
     sign.addEventListener("click", () => {
-      if (working || cannot || !current) return;
-      const c = current;
-      const k = c.k;
+      const c = form.current();
+      if (working || cannot || !c) return;
+      const k = c.reply.k;
       lock(true);
       busy = true;
       flight = true;
@@ -1230,7 +1000,7 @@
           });
       }, () => stop1("The page failed (the cockpit did not answer); nothing was signed."));
     });
-    selectSize("standard");
+    form.start();
     // a drop kept from an earlier visit whose answer never came: asked again now, unchanged (the outbox id files it once)
     const left = kept();
     if (left) {
