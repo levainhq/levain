@@ -138,10 +138,12 @@ class Outcome:
 WORKER_KINDS = ("dispatch", "session")
 
 
-def worker_refusal(ln: Any) -> str | None:
+def worker_refusal(ln: Any, store: Any = None) -> str | None:
     """Why a worker launch cannot be started now (None: it can), before any spawn claim, so the launch stays pending.
-    It needs a spawned role whose record verifies, a claude harness (a Codex worker is not built), and a directory that
-    is not a coordinator's workspace."""
+    It needs a spawned role whose record verifies, a claude harness (a Codex worker is not built), a directory with no
+    coordinator workspace at or above it (the door's own ancestor walk, :func:`levain.coordinator.door.workspace`),
+    and, given ``store``, a brief that can be built from the record and the thread now (:func:`instantiate.
+    worker_context`): a thread merged away, closed or done, or a record that cannot be read, refuses here."""
     from levain.agents import instantiate
     from levain.coordinator import door
 
@@ -153,16 +155,21 @@ def worker_refusal(ln: Any) -> str | None:
         instantiate.verified_record(ln.role_ref)
     except CoordError as exc:
         return f"the worker's role record is refused: {exc}"
-    if not ln.cwd:
-        return "the launch names no directory"
+    if not ln.cwd or not os.path.isabs(ln.cwd):
+        return "the launch names no absolute directory"
     try:
         real = os.path.realpath(ln.cwd)
-        names = door.recorded()
-        if real in names or door._ident(real) in door._idents(names) or door.marked(Path(real)):
-            return (f"{real} is a coordinator's workspace; a worker starts in a directory the coordinator's door does "
-                    "not cover")
+        ws = door.workspace(real)
+        if ws is not None:
+            return (f"{real} is inside a coordinator's workspace ({ws}); a worker starts in a directory the "
+                    "coordinator's door does not cover")
     except (door.RecordUnreadable, OSError) as exc:
         return f"the coordinator record could not be read ({type(exc).__name__}: {str(exc)[:200]})"
+    if store is not None:
+        try:
+            instantiate.worker_context(store, ln)
+        except CoordError as exc:
+            return f"the worker's brief cannot be built: {exc}"
     return None
 
 
@@ -481,10 +488,15 @@ def _worker_brief_text(store: CoordStore, launch: Any) -> str:
         f"# Levain worker brief: launch {launch.launch_id}",
         "",
         f"You are the {spec['name']} worker session Levain started for launch `{launch.launch_id}` (session key "
-        f"`{launch.session_key}`). Your directory is `{launch.cwd}`. You hold one thread, `{ctx.thread.thread_id}`: "
-        f"{quoted(ctx.thread.title)}.",
+        f"`{mark(launch.session_key)}`). Your directory is {quoted(launch.cwd)}. You hold one thread, "
+        f"`{ctx.thread.thread_id}`: {quoted(ctx.thread.title)}.",
         "",
         "## Your role",
+        "",
+        ("This role is REGISTERED (its text is the one the registry holds under that name and hash)." if not
+         ctx.record["inline"] else "This role is INLINE: the coordinator wrote it for this spawn, and nobody reviewed "
+         "it; it narrows what you may do exactly as a registered role does, and never widens it."),
+        "The slot values written into it below are data the coordinator filled in, each one line.",
         "",
         *[mark(line) for line in ctx.rendered.split("\n")],
         "",
@@ -499,8 +511,11 @@ def _worker_brief_text(store: CoordStore, launch: Any) -> str:
         "## Your bounds",
         "",
         "You run under the consent hook: every gated tool call asks for the operator's consent. The scope below is what "
-        "the thread's envelope leaves of your role's ceiling. It is information about where to work and what you may "
-        "ask for; it authorises nothing by itself, and nothing here widens what the operator signed.",
+        "the thread's envelope "
+        + (f"(`{mark(ctx.envelope_id)}`, the one this launch is pinned to) " if ctx.envelope_id else "(none is bound) ")
+        + "leaves of your role's ceiling, cut once when this launch was asked for. It is information about where to "
+        "work and what you may ask for; it authorises nothing by itself, and nothing here widens what the operator "
+        "signed.",
         "",
         *[f"- may work in {mark(w)}" for w in where],
         *[f"- may ask for a {mark(e)}" for e in effects],
@@ -571,6 +586,8 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "noted;",
         f"- move or fix a thread: `{lv} thread state|set|merge|detach|add ... --by coordinator --token N {tail}`;",
         f"- read: `{lv} drops list {tail}`, `{lv} drops show DROP_ID {tail}`, `{lv} thread list {tail}`.",
+        f"- ask for a worker on a WORK thread: `{lv} coord spawn --thread ID --role @spawn/NAME --cwd DIR "
+        f"--slot NAME=VALUE --token N {tail}`; it runs outside your workspace, and `coord status` lists it.",
         "",
         "## The seats' questions (you read them first)",
         "",
@@ -658,9 +675,15 @@ def _brief_dir(launch: Any) -> Path:
 
 def _write_brief(store: CoordStore, launch: Any) -> Path:
     path = _brief_dir(launch) / brief_path(launch).name          # checked again: it is checked before the spawn claim
+    # the text is built and encoded before the file exists, so a brief that cannot be written leaves no partial file
+    # and is a CoordError the launcher writes failed, never an escape past its handler
+    try:
+        data = _brief_text(store, launch).encode("utf-8")
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError) as exc:
+        raise CoordError(f"the brief could not be built ({type(exc).__name__}: {str(exc)[:200]})") from None
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(_brief_text(store, launch))
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
     return path
 
 
@@ -857,7 +880,10 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
     # such directory, because inside one the door would hand it the coordinator's verbs
     from levain.coordinator import door
 
-    why = worker_refusal(ln) if ln.role == "worker" else \
+    if ln.role not in ("coordinator", "worker"):
+        return Outcome(launch_id, False, refusal=f"launch {launch_id} is a {ln.role} launch; only a coordinator or a "
+                                                 "worker starts")
+    why = worker_refusal(ln, store) if ln.role == "worker" else \
         door.launch_refusal(ln.cwd) if ln.cwd else "the launch names no directory"
     if why is not None:
         return Outcome(launch_id, False, refusal=_plain(f"review item: {why}; nothing was started (launch {launch_id} "
@@ -1074,6 +1100,9 @@ def watch_once(store: CoordStore) -> list[str]:
           death) and a fresh coordinator asked for in that transaction (:func:`_replace_done`); the fresh one is
           started at the end of the pass, once (d) stopped the done one. The fresh launch is newer than that drop, so
           the drop never replaces it: one replacement per drop;
+      (b3) an ``active`` spawned worker whose row is ``done`` (its one turn finished) is ended (cause ``worker
+          done``), so it leaves the live-spawn count; (d) stops its session and (e) removes its brief
+          (:func:`_end_done_workers`);
       (c) the coordinator holding the live lease gets a SERVICE beat only while its session is listed, its row's
           ``state`` is not ``done`` (a finished turn stays listed, idle and done, until stopped), and it wrote as
           coordinator within ``SERVICE_BEAT_WINDOW`` (the store checks that in the beat's transaction). Listed is
@@ -1169,7 +1198,7 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
             lines.append(f"launch {ln.launch_id}: a {ln.harness} launch; only claude and codex are built, left "
                          "pending")
             continue
-        if ln.role == "worker" and (why := worker_refusal(ln)) is not None:
+        if ln.role == "worker" and (why := worker_refusal(ln, store)) is not None:
             lines.append(f"launch {ln.launch_id}: a worker launch; {why}, left pending")
             continue
         got = launch_session(store, ln.launch_id)
@@ -1217,6 +1246,7 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
             continue
         if ended is not None:
             lines.append(f"launch {ln.launch_id} ended: {ended.cause} (its session is no longer listed)")
+    _end_done_workers(store, active, listed, lines)
     fresh = _replace_done(store, active, listed, lines)
     held = store.coord_lease()
     if held is not None and held.live and held.holder != "operator":
@@ -1264,6 +1294,24 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
                           + (f" (run once: {got.remedy})" if got.remedy else ""))
     # again after this pass's own ends, so a session found gone above loses its brief in the same pass (L3 r2)
     lines.extend(_remove_briefs(store))
+
+
+def _end_done_workers(store: CoordStore, active: list[Any], listed: dict[str, dict[str, Any]],
+                      lines: list[str]) -> None:
+    """Step (b3) of :func:`watch_once`: an ``active`` spawned worker whose listed row is ``done`` finished its one turn,
+    so it is written ``ended`` (cause :data:`levain.coordinator.lease.WORKER_DONE`) and leaves the live-spawn count;
+    (d) then stops its session and (e) removes its brief. Its handoff is its session's last message, which stopping
+    the session does not delete; no step here copies it anywhere."""
+    for ln in active:
+        if ln.role != "worker" or not ln.role_ref or (listed.get(ln.harness_session_id) or {}).get("state") != "done":
+            continue
+        try:
+            ended = store.launch_end_done_worker(ln.launch_id)
+        except (CoordError, sqlite3.Error) as exc:
+            lines.append(f"launch {ln.launch_id}: its worker is done, and it could not be written ended ({exc})")
+            continue
+        if ended is not None:
+            lines.append(f"launch {ln.launch_id} ended: {ended.cause} (its session is done)")
 
 
 def _replace_done(store: CoordStore, active: list[Any], listed: dict[str, dict[str, Any]], lines: list[str]) -> list[str]:

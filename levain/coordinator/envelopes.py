@@ -48,7 +48,7 @@ from levain.dispatch.adopt import GitFault, branch_problem
 from levain.dispatch.contract import MAX_LIFETIME, git_env
 
 __all__ = ["ATTENUATIONS", "ENVELOPE_SCHEMA", "NARROW_KEYS", "NOT_IN_FORCE", "Envelope", "EnvelopeConflict",
-           "EnvelopeStale", "EnvelopeStore", "dropped_effects", "narrow_scope"]
+           "EnvelopeStale", "EnvelopeStore", "narrow_scope"]
 
 ATTENUATIONS = ("kill", "stop_earlier", "drop_effect", "thread_done")
 NOT_IN_FORCE = ("before S1 places the control principal the coordinator grants nothing (C0 §2): this effect is a "
@@ -116,7 +116,7 @@ def narrow_scope(scope: Mapping[str, Any], ceiling: Mapping[str, Any]) -> dict[s
     role's ceiling, key by key, and never widened (a pure function; it reads no store and grants nothing).
 
     - ``where``: a ceiling that names it keeps only the repos it names, each with the paths both cover; a ceiling that
-      does not name it leaves ``where`` as the envelope has it (the role has no opinion on place).
+      does not name it leaves NO ``where`` (an absent key grants nothing, as it does for the effects below).
     - ``lands`` / ``pushes`` / ``publishes``: an irreversible effect stays only when the ceiling names its repo (its
       package, for a publish); a list the ceiling does not name is emptied, so a role that never mentions an effect is
       never granted it.
@@ -128,16 +128,15 @@ def narrow_scope(scope: Mapping[str, Any], ceiling: Mapping[str, Any]) -> dict[s
     if unknown:
         raise CoordError(f"a role ceiling names {sorted(unknown)[0]!r}, which is not one of {list(NARROW_KEYS)}")
     out = {k: v for k, v in scope.items()}
-    if "where" in ceiling:
-        by_repo = {w["repo"]: list(w["paths"]) for w in ceiling["where"]}
-        where = []
-        for w in scope.get("where", []):
-            if w["repo"] not in by_repo:
-                continue
-            paths = _narrow_paths(w["paths"], by_repo[w["repo"]])
-            if paths:
-                where.append({"repo": w["repo"], "paths": paths})
-        out["where"] = where
+    by_repo = {w["repo"]: list(w["paths"]) for w in ceiling.get("where", ())}
+    where = []
+    for w in scope.get("where", []):
+        if w["repo"] not in by_repo:
+            continue
+        paths = _narrow_paths(w["paths"], by_repo[w["repo"]])
+        if paths:
+            where.append({"repo": w["repo"], "paths": paths})
+    out["where"] = where
     for kind in env.EFFECT_LISTS:
         named = set(ceiling.get(kind, ()))
         out[kind] = [e for e in scope.get(kind, []) if _effect_target(kind, e) in named]
@@ -154,16 +153,6 @@ def _assert_not_wider(scope: Mapping[str, Any], out: Mapping[str, Any]) -> None:
         have = [env.effect_identity(kind, e) for e in scope.get(kind, [])]
         if any(env.effect_identity(kind, e) not in have for e in out.get(kind, [])):
             raise CoordError(f"a narrowing held a {kind} effect the envelope lacks: refused")
-
-
-def dropped_effects(scope: Mapping[str, Any], narrowed: Mapping[str, Any]) -> list[str]:
-    """The effect identities ``scope`` holds that ``narrowed`` does not: the values of the ``drop_effect`` rows that
-    record a narrowing in the envelope's own append-only table (:meth:`EnvelopeStore.attenuate`)."""
-    out = []
-    for kind in env.EFFECT_LISTS:
-        keep = {env.effect_identity(kind, e) for e in narrowed.get(kind, [])}
-        out += [i for i in (env.effect_identity(kind, e) for e in scope.get(kind, [])) if i not in keep]
-    return out
 
 
 class EnvelopeConflict(CoordError):
@@ -560,18 +549,21 @@ class EnvelopeStore(CoordStore):
         with read_transaction(self._connect) as conn:
             return self._effective(conn, envelope_id, thread_id)
 
-    def _effective(self, conn: sqlite3.Connection, envelope_id: str, thread_id: str) -> dict[str, Any]:
-        stored = self._envelope(conn, envelope_id)
+    @classmethod
+    def _effective(cls, conn: sqlite3.Connection, envelope_id: str, thread_id: str) -> dict[str, Any]:
+        """:meth:`effective` on the caller's connection (a class method: the spawn request reads it inside its own
+        write transaction, wherever the store object is)."""
+        stored = cls._envelope(conn, envelope_id)
         if stored is None:
             raise CoordError(f"no envelope {str(envelope_id)[:40]}")
-        rows = self._attenuations(conn, envelope_id, thread_id)
+        rows = cls._attenuations(conn, envelope_id, thread_id)
         out = dict(stored.body)
         if any(k in ("kill", "thread_done") for k, _v in rows):
             return {**out, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": out["issued_at"]}
         dropped = {v for k, v in rows if k == "drop_effect"}
         for k in env.EFFECT_LISTS:
             out[k] = [e for e in stored.body[k] if env.effect_identity(k, e) not in dropped]
-        out["stop_at"] = utc_stamp(self._stop(stored, rows))
+        out["stop_at"] = utc_stamp(cls._stop(stored, rows))
         return out
 
     # --- liveness and the ceiling (C0 §4.5) ----------------------------------------------------------------------

@@ -1189,6 +1189,12 @@ class CoordStore:
             budget.file_sign(self, conn, now, g)
         return lease.launch(conn, launch_id), g.refusal
 
+    def launch_end_done_worker(self, launch_id: str) -> Any:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.end_done_worker(conn, now, launch_id)
+
     def launch_end(self, launch_id: str, kind: str, cause: str) -> Any:
         from levain.coordinator import lease
 
