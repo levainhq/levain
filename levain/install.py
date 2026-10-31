@@ -2798,6 +2798,8 @@ def _coordinator_settings(install: Path) -> tuple[str, Any, str]:
         text = path.read_text(encoding="utf-8")
     except OSError as e:
         return "", None, f"{path} cannot be read ({e.strerror or e})"
+    except UnicodeError as e:                    # a non-UTF-8 file: the same problem, never a crash (L3 readrule r2)
+        return "", None, f"{path} cannot be read (not UTF-8: {type(e).__name__})"
     try:
         doc = json.loads(text)
     except (ValueError, RecursionError) as e:

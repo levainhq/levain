@@ -16,7 +16,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `levain coord agent claude` runs, or from `levain update --path <the coordinator directory>`: only the one entry is
   added to `permissions.allow` (made if missing), every other byte of the file kept, a hand-edited one included, and a
   second run changes nothing. Until then `levain coord status` says `coordinator install: upgrade pending` (and
-  `install_upgrade_pending` in `--json`). A settings file that is missing or unreadable, is not a JSON object, or whose
+  `install_upgrade_pending` in `--json`). A settings file that is missing or unreadable (not UTF-8 included), is not a JSON object, or whose
   `permissions` is not an object or `permissions.allow` not a list, is never written: `coord status` says `coordinator install: settings unreadable` with the reason (and
   `install_settings_problem` in `--json`), and the rule is yours to add by hand.
 - **The Claude Code coordinator no longer loads your user-level Claude Code layer.** A coordinator session now starts

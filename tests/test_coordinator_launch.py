@@ -1801,6 +1801,39 @@ def test_the_merge_inserts_one_entry_into_any_layout(tmp_home, qdir, monkeypatch
     assert json.loads(new)["permissions"]["allow"] == [*before["permissions"]["allow"], "Read"]
 
 
+def test_a_non_utf8_settings_file_is_pending_reported_and_never_written(tmp_home, qdir, monkeypatch, capsys):
+    # L3 readrule r2 (complement + codex): a non-UTF-8 file raised UnicodeDecodeError out of the reader and crashed
+    # coord status, the launch setup and the update refresh
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_bytes(b"\xff\xfe")
+    assert inst.coordinator_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "coordinator install: settings unreadable" in status and "cannot be read" in status, status
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True and "cannot be read" in js["install_settings_problem"]
+    with pytest.raises(inst.InitError):
+        inst.add_coordinator_read_rule(target)
+    # the launch setup: doctor's hook check reads the same file first and refuses (no live hook), never a traceback
+    out = _main(qdir, capsys, "coord", "agent", "claude", rc=1)
+    assert "consent hook is not live" in out.err and "Traceback" not in out.err
+    from levain.coordinator.launch import _bring_read_rule
+    said: list[str] = []
+    _bring_read_rule(target, said.append)                                  # the merge step itself says, never raises
+    assert len(said) == 1 and "Read allow rule is still missing" in said[0] and "cannot be read" in said[0]
+    # the update refresh's Read-rule step. host_guard.agent_pin_status reads the same file first and raises
+    # UnicodeDecodeError there too (not this module's reader; routed), so it is stubbed to reach the step
+    from levain import host_guard
+    monkeypatch.setattr(host_guard, "agent_pin_status", lambda _root: None)
+    said = []
+    with inst.install_lock(target, create=False):
+        inst.refresh_adapter(target, apply=True, emit=said.append, carrier=False)
+    assert any("Read allow rule is still missing" in s for s in said), said
+    assert f.read_bytes() == b"\xff\xfe"                                   # never written
+
+
 def test_a_missing_settings_file_is_pending_and_never_created(tmp_home, qdir, monkeypatch, capsys):
     from levain import install as inst
 
