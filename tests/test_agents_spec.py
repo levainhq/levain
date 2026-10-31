@@ -45,7 +45,7 @@ def reg(store, job, **kw):
 
 
 def test_hash_matches_the_formula_and_ignores_key_order():
-    final = finalize_spec(spec("disk_floor"), ZONE)
+    final = finalize_spec(spec("job_push_check"), ZONE)
     want = hashlib.sha256(b"levain-agentspec/1\n" + _canonical({"agent_id": AID, "spec": final}).encode()).hexdigest()
     assert spec_hash(AID, final) == want
     shuffled = json.loads(json.dumps(final), object_pairs_hook=lambda p: dict(reversed(p)))
@@ -59,7 +59,7 @@ def test_hash_matches_the_formula_and_ignores_key_order():
     lambda s: s.update(feeds=["x"]), lambda s: s["trigger"].update(window={"start": "22:00", "end": "04:00"}),
 ])
 def test_any_field_change_moves_the_hash(mutate):
-    base = finalize_spec(spec("disk_floor"), ZONE)
+    base = finalize_spec(spec("job_push_check"), ZONE)
     other = copy.deepcopy(base)
     mutate(other)
     assert spec_hash(AID, base) != spec_hash(AID, other)
@@ -67,11 +67,11 @@ def test_any_field_change_moves_the_hash(mutate):
 
 
 def test_defaults_are_written_out_and_only_1_0_values_parse():
-    s = finalize_spec(spec("disk_floor"), ZONE)
+    s = finalize_spec(spec("job_push_check"), ZONE)
     assert (s["overlap"], s["missed"], s["placement"], s["memory"], s["on_failure"], s["feeds"]) == \
         ("skip", "skip", "local", "stateless", {"pause_after": 2}, [])
     for bad in ({"overlap": "queue"}, {"missed": "once_on_wake"}, {"placement": "vps"}, {"memory": "x"}):
-        raw = copy.deepcopy(SPECS["disk_floor"])
+        raw = copy.deepcopy(SPECS["job_push_check"])
         raw["role"]["role_hash"] = "0" * 64
         raw.update(bad)
         with pytest.raises(SpecError, match=next(iter(bad))):
@@ -81,41 +81,41 @@ def test_defaults_are_written_out_and_only_1_0_values_parse():
 @pytest.mark.parametrize("cron", ["* * * *", "60 * * * *", "* 24 * * *", "*/0 * * * *", "a b c d e"])
 def test_bad_cron_is_refused(cron):
     with pytest.raises(SpecError, match="cron"):
-        spec("disk_floor", trigger={"kind": "schedule", "cron": cron, "zone": ZONE})
+        spec("job_push_check", trigger={"kind": "schedule", "cron": cron, "zone": ZONE})
 
 
 @pytest.mark.parametrize("cron", ["mon jan * * *", "0 jan * * *", "0 0 mon * *", "0 0 * mon *", "0 0 * * jan"])
 def test_cron_names_only_in_their_own_field(cron):
     with pytest.raises(SpecError, match="cron"):
-        spec("disk_floor", trigger={"kind": "schedule", "cron": cron, "zone": ZONE})
+        spec("job_push_check", trigger={"kind": "schedule", "cron": cron, "zone": ZONE})
 
 
 def test_cron_names_where_they_belong_parse():
-    assert spec("disk_floor", trigger={"kind": "schedule", "cron": "0 7 * jan-mar mon-fri", "zone": ZONE})[
+    assert spec("job_push_check", trigger={"kind": "schedule", "cron": "0 7 * jan-mar mon-fri", "zone": ZONE})[
         "trigger"]["cron"] == "0 7 * jan-mar mon-fri"
 
 
 def test_window_and_zone_are_checked():
-    ok = spec("disk_floor", trigger={"kind": "schedule", "cron": "*/20 22-23,0-3 * * *", "zone": ZONE,
+    ok = spec("job_push_check", trigger={"kind": "schedule", "cron": "*/20 22-23,0-3 * * *", "zone": ZONE,
                                      "window": {"start": "22:00", "end": "04:00"}})
     assert ok["trigger"]["window"] == {"start": "22:00", "end": "04:00"}
     with pytest.raises(SpecError, match="window"):
-        spec("disk_floor", trigger={"kind": "schedule", "cron": "* * * * *", "window": {"start": "25:00", "end": "04:00"}})
+        spec("job_push_check", trigger={"kind": "schedule", "cron": "* * * * *", "window": {"start": "25:00", "end": "04:00"}})
     with pytest.raises(SpecError, match="trigger.zone"):
-        spec("disk_floor", trigger={"kind": "schedule", "cron": "* * * * *", "zone": "Mars/Olympus"})
+        spec("job_push_check", trigger={"kind": "schedule", "cron": "* * * * *", "zone": "Mars/Olympus"})
 
 
 def test_register_versions_are_immutable_and_idempotent(store):
-    a, h1, v, created = reg(store, "disk_floor")
+    a, h1, v, created = reg(store, "job_push_check")
     assert a.startswith("ag-") and len(a) == 35 and v == 1 and created
-    assert reg(store, "disk_floor") == (a, h1, 1, False)
+    assert reg(store, "job_push_check") == (a, h1, 1, False)
     with pytest.raises(SpecError, match="--revise"):
-        reg(store, "disk_floor", stop_at=7200)
-    a2, h2, v2, created2 = register_spec(store, spec("disk_floor", stop_at=7200), ZONE, revise=True)
+        reg(store, "job_push_check", stop_at=7200)
+    a2, h2, v2, created2 = register_spec(store, spec("job_push_check", stop_at=7200), ZONE, revise=True)
     assert (a2, v2, created2) == (a, 2, True) and h2 != h1
-    got = get_agent(store, "disk_floor")
+    got = get_agent(store, "job_push_check")
     assert got["version"] == 2 and got["versions"] == [1, 2] and got["spec"]["stop_at"] == 7200
-    assert get_agent(store, "disk_floor", 1)["spec_hash"] == h1
+    assert get_agent(store, "job_push_check", 1)["spec_hash"] == h1
     with store.write() as conn:
         for sql in ("UPDATE agent_specs SET spec = 'x'", "DELETE FROM agent_specs"):
             with pytest.raises(sqlite3.DatabaseError):
@@ -123,11 +123,11 @@ def test_register_versions_are_immutable_and_idempotent(store):
 
 
 def test_a_revert_to_an_earlier_version_is_refused_naming_it(store, tmp_path, capsys):
-    a, *_ = reg(store, "disk_floor")
-    register_spec(store, spec("disk_floor", stop_at=7200), ZONE, revise=True)
+    a, *_ = reg(store, "job_push_check")
+    register_spec(store, spec("job_push_check", stop_at=7200), ZONE, revise=True)
     with pytest.raises(SpecError, match=f"version 1 of agent {a}.*written once and never again"):
-        register_spec(store, spec("disk_floor"), ZONE, revise=True)
-    raw = copy.deepcopy(SPECS["disk_floor"])
+        register_spec(store, spec("job_push_check"), ZONE, revise=True)
+    raw = copy.deepcopy(SPECS["job_push_check"])
     raw["role"]["role_hash"] = role_hash(ROLES["notify-role"])
     f = tmp_path / "v1.json"
     f.write_text(json.dumps(raw))
@@ -136,7 +136,7 @@ def test_a_revert_to_an_earlier_version_is_refused_naming_it(store, tmp_path, ca
         out = capsys.readouterr().out
         assert f"rule 4: the content is version 1 of agent {a}" in out and "IntegrityError" not in out
         assert "retire" in out and "--revise" in out
-    assert get_agent(store, "disk_floor")["versions"] == [1, 2]
+    assert get_agent(store, "job_push_check")["versions"] == [1, 2]
 
 
 def test_mint_agent_id_shape():
@@ -145,7 +145,7 @@ def test_mint_agent_id_shape():
 
 
 def test_the_stored_text_is_rehashed_on_read(store):
-    a, *_ = reg(store, "disk_floor")
+    a, *_ = reg(store, "job_push_check")
     with store.write() as conn:
         conn.execute("DROP TRIGGER agent_specs_frozen")
         conn.execute("UPDATE agent_specs SET spec = replace(spec, '3600', '1')")
@@ -162,21 +162,21 @@ def axes(store, name):
 
 
 def test_a_pause_survives_everything_except_resume(store):
-    a, *_ = reg(store, "disk_floor")
-    set_operation(store, "disk_floor", "paused")
-    assert axes(store, "disk_floor") == ("registered", "paused")
-    reg(store, "disk_floor")                                                     # re-register, same content
-    register_spec(store, spec("disk_floor", stop_at=90), ZONE, revise=True)      # a new version (an edit)
-    assert axes(store, "disk_floor") == ("registered", "paused")
-    set_operation(store, "disk_floor", "paused")                                 # pausing twice changes nothing
-    retire_agent(store, "disk_floor")
+    a, *_ = reg(store, "job_push_check")
+    set_operation(store, "job_push_check", "paused")
+    assert axes(store, "job_push_check") == ("registered", "paused")
+    reg(store, "job_push_check")                                                     # re-register, same content
+    register_spec(store, spec("job_push_check", stop_at=90), ZONE, revise=True)      # a new version (an edit)
+    assert axes(store, "job_push_check") == ("registered", "paused")
+    set_operation(store, "job_push_check", "paused")                                 # pausing twice changes nothing
+    retire_agent(store, "job_push_check")
     assert axes(store, a) == ("retired", "paused")                               # retire leaves operation alone
     set_operation(store, a, "active")
     assert axes(store, a) == ("retired", "active")
 
 
 def test_resume_is_the_only_clear_and_resets_the_failure_streak(store):
-    a, *_ = reg(store, "disk_floor")
+    a, *_ = reg(store, "job_push_check")
     with store.write() as conn:
         conn.execute("UPDATE agents SET operation='paused', failure_streak=2 WHERE agent_id=?", (a,))
     assert get_agent(store, a)["failure_streak"] == 2
@@ -188,19 +188,19 @@ def test_resume_is_the_only_clear_and_resets_the_failure_streak(store):
 def test_resume_touches_only_members_it_moves(store):
     feeder_store(store)
     with store.write() as conn:
-        conn.execute("UPDATE agents SET operation='paused', failure_streak=2 WHERE name='email_sensor_argus'")
-        conn.execute("UPDATE agents SET failure_streak=1 WHERE name='email_classifier_argus'")   # active, not paused
-    out = {a["name"]: changed for a, changed in set_operation(store, "email_sensor_argus", "active")}
-    assert out == {"email_sensor_argus": True, "email_classifier_argus": False, "email_event_reconciler": False}
-    assert get_agent(store, "email_classifier_argus")["failure_streak"] == 1      # untouched
-    assert get_agent(store, "email_sensor_argus")["failure_streak"] == 0          # moved from paused: reset
+        conn.execute("UPDATE agents SET operation='paused', failure_streak=2 WHERE name='job_feeder_member'")
+        conn.execute("UPDATE agents SET failure_streak=1 WHERE name='job_feeder_downstream'")   # active, not paused
+    out = {a["name"]: changed for a, changed in set_operation(store, "job_feeder_member", "active")}
+    assert out == {"job_feeder_member": True, "job_feeder_downstream": False, "job_corpus_reader": False}
+    assert get_agent(store, "job_feeder_downstream")["failure_streak"] == 1      # untouched
+    assert get_agent(store, "job_feeder_member")["failure_streak"] == 0          # moved from paused: reset
 
 
 def test_a_retire_and_re_register_is_a_new_agent_that_starts_active(store):
-    a, *_ = reg(store, "disk_floor")
-    set_operation(store, "disk_floor", "paused")
+    a, *_ = reg(store, "job_push_check")
+    set_operation(store, "job_push_check", "paused")
     retire_agent(store, a)
-    b, *_ = reg(store, "disk_floor")
+    b, *_ = reg(store, "job_push_check")
     assert b != a and axes(store, b) == ("registered", "active") and axes(store, a) == ("retired", "paused")
 
 
@@ -212,44 +212,44 @@ def test_can_fire_needs_all_three_axes():
 
 
 def feeder_store(store):
-    for job in ("email_classifier_argus", "email_event_reconciler"):
-        reg(store, job, **({"win": {"kind": "verifier", "check": "attested"}} if "reconciler" in job else {}))
-    reg(store, "email_sensor_argus")
-    reg(store, "disk_floor")
+    for job in ("job_feeder_downstream", "job_corpus_reader"):
+        reg(store, job, **({"win": {"kind": "verifier", "check": "attested"}} if job == "job_corpus_reader" else {}))
+    reg(store, "job_feeder_member")
+    reg(store, "job_push_check")
 
 
 def test_a_feeder_group_pauses_and_resumes_together(store):
     feeder_store(store)
-    names = {g["name"] for g in feeder_group(store, "email_classifier_argus")}
-    assert names == {"email_classifier_argus", "email_event_reconciler", "email_sensor_argus"}
-    out = set_operation(store, "email_classifier_argus", "paused")
+    names = {g["name"] for g in feeder_group(store, "job_feeder_downstream")}
+    assert names == {"job_feeder_downstream", "job_corpus_reader", "job_feeder_member"}
+    out = set_operation(store, "job_feeder_downstream", "paused")
     assert {a["name"] for a, changed in out if changed} == names
     ops = {a["name"]: a["operation"] for a in list_agents(store)}
-    assert ops["disk_floor"] == "active" and {ops[n] for n in names} == {"paused"}
-    set_operation(store, "email_sensor_argus", "active")
+    assert ops["job_push_check"] == "active" and {ops[n] for n in names} == {"paused"}
+    set_operation(store, "job_feeder_member", "active")
     assert {a["operation"] for a in list_agents(store)} == {"active"}
 
 
 def test_retire_lists_the_reader_and_the_group_and_frees_the_name(store):
     feeder_store(store)
-    agent, reader, left = retire_agent(store, "email_sensor_argus")
-    assert agent["registration"] == "retired" and reader == "email_classifier_argus"
-    assert left == ["email_classifier_argus", "email_event_reconciler"]      # what the retirement leaves behind
-    agent2, reader2, left2 = retire_agent(store, "email_classifier_argus")
-    assert reader2 == "email_actuator_argus" and left2 == []      # the sensor, its only link, is retired
-    assert [a["name"] for a in list_agents(store)] == ["disk_floor", "email_event_reconciler"]
+    agent, reader, left = retire_agent(store, "job_feeder_member")
+    assert agent["registration"] == "retired" and reader == "job_feeder_downstream"
+    assert left == ["job_corpus_reader", "job_feeder_downstream"]      # what the retirement leaves behind
+    agent2, reader2, left2 = retire_agent(store, "job_feeder_downstream")
+    assert reader2 == "job_actuator" and left2 == []      # the feeder member, its only link, is retired
+    assert [a["name"] for a in list_agents(store)] == ["job_corpus_reader", "job_push_check"]
     assert len(list_agents(store, include_retired=True)) == 4
     with pytest.raises(SpecError, match="already retired"):
         retire_agent(store, agent["agent_id"])
-    with pytest.raises(SpecError, match="no live agent named 'email_sensor_argus'; retired"):
-        get_agent(store, "email_sensor_argus")
+    with pytest.raises(SpecError, match="no live agent named 'job_feeder_member'; retired"):
+        get_agent(store, "job_feeder_member")
 
 
 def test_cli_verbs_round_trip(tmp_path, capsys):
     d = ["agents", "--store-dir", str(tmp_path / "store")]
     s = open_agent_store(tmp_path / "store")
     add_role(s, ROLES["notify-role"])
-    raw = copy.deepcopy(SPECS["disk_floor"])
+    raw = copy.deepcopy(SPECS["job_push_check"])
     raw["role"]["role_hash"] = role_hash(ROLES["notify-role"])
     f = tmp_path / "s.json"
     f.write_text(json.dumps(raw))
@@ -257,18 +257,18 @@ def test_cli_verbs_round_trip(tmp_path, capsys):
     assert "registered" in capsys.readouterr().out
     assert main([*d, "register", "--from", str(f)]) == 0
     assert "already registered" in capsys.readouterr().out
-    assert main([*d, "list"]) == 0 and "disk_floor" in capsys.readouterr().out
-    assert main([*d, "show", "disk_floor"]) == 0
+    assert main([*d, "list"]) == 0 and "job_push_check" in capsys.readouterr().out
+    assert main([*d, "show", "job_push_check"]) == 0
     shown = capsys.readouterr().out
     assert "review: required" in shown and "acts_outward=True" in shown and '"stop_at": 3600' in shown
-    assert main([*d, "pause", "disk_floor"]) == 0 and "paused" in capsys.readouterr().out
-    assert main([*d, "pause", "disk_floor"]) == 0 and "(already)" in capsys.readouterr().out
-    assert main([*d, "resume", "disk_floor"]) == 0 and "active" in capsys.readouterr().out
-    assert main([*d, "retire", "disk_floor"]) == 0 and "retired" in capsys.readouterr().out
+    assert main([*d, "pause", "job_push_check"]) == 0 and "paused" in capsys.readouterr().out
+    assert main([*d, "pause", "job_push_check"]) == 0 and "(already)" in capsys.readouterr().out
+    assert main([*d, "resume", "job_push_check"]) == 0 and "active" in capsys.readouterr().out
+    assert main([*d, "retire", "job_push_check"]) == 0 and "retired" in capsys.readouterr().out
     assert main([*d, "list"]) == 0 and capsys.readouterr().out == ""
     assert main([*d, "show", "nobody"]) == 1 and "no agent" in capsys.readouterr().err
     raw["stop_at"] = 5
     f.write_text(json.dumps(raw))
     assert main([*d, "register", "--from", str(f), "--warn"]) == 0
-    assert "pass     disk_floor" in capsys.readouterr().out
+    assert "pass     job_push_check" in capsys.readouterr().out
     assert main([*d, "list"]) == 0 and capsys.readouterr().out == ""            # --warn stored nothing

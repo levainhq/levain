@@ -1,6 +1,6 @@
 {
- "vendored_sync_check": {
-  "name": "vendored_sync_check",
+ "job_sync_check": {
+  "name": "job_sync_check",
   "role": {
    "name": "local-role",
    "role_hash": "0000000000000000000000000000000000000000000000000000000000000000"
@@ -26,8 +26,8 @@
    "check": "exit code of the sync script"
   }
  },
- "disk_floor": {
-  "name": "disk_floor",
+ "job_push_check": {
+  "name": "job_push_check",
   "role": {
    "name": "notify-role",
    "role_hash": "0000000000000000000000000000000000000000000000000000000000000000"
@@ -38,8 +38,8 @@
   },
   "output": {
    "class": "push",
-   "destination": "Phill's phone via send_push",
-   "reader": "Phill",
+   "destination": "the operator's phone via a push",
+   "reader": "the operator",
    "moment": "on a low-space tick"
   },
   "trigger": {
@@ -50,11 +50,11 @@
   "stop_at": 3600,
   "win": {
    "kind": "human",
-   "check": "Phill sees the push"
+   "check": "the operator sees the push"
   }
  },
- "email_classifier_argus": {
-  "name": "email_classifier_argus",
+ "job_feeder_downstream": {
+  "name": "job_feeder_downstream",
   "role": {
    "name": "model-role",
    "role_hash": "0000000000000000000000000000000000000000000000000000000000000000"
@@ -66,7 +66,7 @@
   "output": {
    "class": "push",
    "destination": "action signals",
-   "reader": "email_actuator_argus",
+   "reader": "job_actuator",
    "moment": "each run"
   },
   "trigger": {
@@ -80,8 +80,8 @@
    "check": "compute_anomalies"
   }
  },
- "email_event_reconciler": {
-  "name": "email_event_reconciler",
+ "job_corpus_reader": {
+  "name": "job_corpus_reader",
   "role": {
    "name": "local-role",
    "role_hash": "0000000000000000000000000000000000000000000000000000000000000000"
@@ -93,7 +93,7 @@
   "output": {
    "class": "corpus",
    "destination": "events.db",
-   "reader": "binding_view.py events.replay (query path)"
+   "reader": "the events replay (query path)"
   },
   "trigger": {
    "kind": "schedule",
@@ -102,20 +102,20 @@
   },
   "stop_at": 3600
  },
- "email_sensor_argus": {
-  "name": "email_sensor_argus",
+ "job_feeder_member": {
+  "name": "job_feeder_member",
   "role": {
    "name": "local-role",
    "role_hash": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "input": {
-   "source": "argushub IMAP envelopes",
+   "source": "a mailbox's envelopes",
    "liveness": "fresh within 1d"
   },
   "output": {
    "class": "push",
    "destination": "signals.db",
-   "reader": "email_classifier_argus",
+   "reader": "job_feeder_downstream",
    "moment": "each run"
   },
   "trigger": {
@@ -129,23 +129,23 @@
    "check": ""
   },
   "feeds": [
-   "email_classifier_argus",
-   "email_event_reconciler"
+   "job_feeder_downstream",
+   "job_corpus_reader"
   ]
  },
- "memory_snapshot": {
-  "name": "memory_snapshot",
+ "job_snapshot": {
+  "name": "job_snapshot",
   "role": {
    "name": "notify-role",
    "role_hash": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "input": {
-   "source": "neocortex, episodic, spores",
+   "source": "the memory files",
    "liveness": "fresh within 1d"
   },
   "output": {
    "class": "recovery",
-   "destination": "snapshot tarball, scp to argushub",
+   "destination": "snapshot tarball, scp to a second host",
    "reader": "the restore drill",
    "moment": "every run",
    "drill_cadence": 86400
@@ -158,23 +158,23 @@
   "stop_at": 3600,
   "win": {
    "kind": "verified-restore",
-   "check": "verify_anneal extracts the tarball"
+   "check": "the restore check extracts the tarball"
   }
  },
- "harness_proposer": {
-  "name": "harness_proposer",
+ "job_proposer": {
+  "name": "job_proposer",
   "role": {
    "name": "model-role",
    "role_hash": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "input": {
-   "source": "agent spores",
+   "source": "agent notes",
    "liveness": "fresh within 1d"
   },
   "output": {
    "class": "corpus",
-   "destination": "spores",
-   "reader": "harness_proposer.py report (query path)"
+   "destination": "notes",
+   "reader": "the proposer's report (query path)"
   },
   "trigger": {
    "kind": "schedule",

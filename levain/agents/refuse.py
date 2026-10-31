@@ -21,9 +21,9 @@ is rule 3's first half: an unknown field or a wrong type raises there. Here:
 (e) the one default zone per install fills a zone-less schedule (``spec.finalize_spec``).
 ``stop_at`` (A0 §2.3, §5.10): a spec with no ``stop_at`` is refused, naming it.
 
-:func:`audit_verdicts` reads the R1-AUDIT fixture (flow's amended audit, one row per job). A row carries a class, a
-refinement, the review flags and flow's own verdict; those rows hold no AgentSpec (no input, output or win text to
-re-judge), so the verdict is flow's, and what this module adds is the checks that the row is coherent: the class and
+:func:`audit_verdicts` reads an R1-AUDIT file (a deployment's amended audit, one row per job). A row carries a class, a
+refinement, the review flags and the audit's own verdict; those rows hold no AgentSpec (no input, output or win text to
+re-judge), so the verdict is the audit's, and what this module adds is the checks that the row is coherent: the class and
 refinement agree, the review flag is the derived flag, and a refused row has a reason.
 """
 from __future__ import annotations

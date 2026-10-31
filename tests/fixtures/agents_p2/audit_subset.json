@@ -1,9 +1,9 @@
 {
  "jobs": [
   {
-   "id": "vendored_sync_check",
-   "name": "Vendored Cross-Repo Sync Check",
-   "machine": "laptop",
+   "id": "job_sync_check",
+   "name": "Sync check",
+   "machine": "host-a",
    "class": "push",
    "refinement": null,
    "review": {
@@ -16,9 +16,9 @@
    "reasons": []
   },
   {
-   "id": "disk_floor",
-   "name": "Disk Floor (free-space alarm)",
-   "machine": "laptop",
+   "id": "job_push_check",
+   "name": "Push check",
+   "machine": "host-a",
    "class": "push",
    "refinement": null,
    "review": {
@@ -33,9 +33,9 @@
    "reasons": []
   },
   {
-   "id": "email_event_reconciler",
-   "name": "Email Event Reconciler",
-   "machine": "argus",
+   "id": "job_corpus_reader",
+   "name": "Corpus reader",
+   "machine": "host-b",
    "class": "corpus",
    "refinement": "a",
    "review": {
@@ -53,9 +53,9 @@
    ]
   },
   {
-   "id": "email_sensor_argus",
-   "name": "Email Sensor (argushub IMAP envelope poller)",
-   "machine": "argus",
+   "id": "job_feeder_member",
+   "name": "Feeder member",
+   "machine": "host-b",
    "class": "push",
    "refinement": "b",
    "review": {
@@ -68,14 +68,14 @@
    "reasons": [
     [
      "1",
-     "inherited win ends at email_event_reconciler, which has no win"
+     "inherited win ends at job_corpus_reader, which has no win"
     ]
    ]
   },
   {
-   "id": "memory_snapshot",
-   "name": "Memory Snapshot (neocortex + episodic + spores, restore-verified)",
-   "machine": "laptop",
+   "id": "job_snapshot",
+   "name": "Snapshot (restore-verified)",
+   "machine": "host-a",
    "class": "recovery",
    "refinement": "c",
    "review": {
@@ -90,9 +90,9 @@
    "reasons": []
   },
   {
-   "id": "dream",
-   "name": "Dream (autonomous consolidation)",
-   "machine": "laptop",
+   "id": "job_composer",
+   "name": "Composer (model-backed)",
+   "machine": "host-a",
    "class": "push",
    "refinement": null,
    "review": {
@@ -100,16 +100,16 @@
     "calls_model": true,
     "acts_outward": false,
     "basis": [
-     "calls a model: the script mentions 'claude -p'"
+     "calls a model: the script runs a model CLI"
     ]
    },
    "verdict": "pass",
    "reasons": []
   },
   {
-   "id": "harness_proposer",
-   "name": "Self-improving harness (propose-only)",
-   "machine": "laptop",
+   "id": "job_proposer",
+   "name": "Proposer (propose-only)",
+   "machine": "host-a",
    "class": "corpus",
    "refinement": "a",
    "review": {
@@ -117,7 +117,7 @@
     "calls_model": true,
     "acts_outward": false,
     "basis": [
-     "calls a model: the script mentions 'credit_lane'"
+     "calls a model: the script names a model lane"
     ]
    },
    "verdict": "refused",
