@@ -1189,11 +1189,26 @@ class CoordStore:
             budget.file_sign(self, conn, now, g)
         return lease.launch(conn, launch_id), g.refusal
 
-    def launch_end_done_worker(self, launch_id: str) -> Any:
+    def launch_end_done_worker(self, launch_id: str, *, handoff: str | None = None, why: str | None = None) -> Any:
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
-            return lease.end_done_worker(conn, now, launch_id)
+            return lease.end_done_worker(conn, now, launch_id, handoff=handoff, why=why)
+
+    def launch_handoff(self, token: object, launch_id: str) -> dict[str, Any]:
+        """The handoff spawned worker ``launch_id`` left (:func:`levain.coordinator.lease.worker_handoff`), read by the
+        lease holder: ``token`` is fenced in the read's own transaction, and nothing is written."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            lease.fence(conn, now, token)
+            return lease.worker_handoff(conn, launch_id)
+
+    def launch_refuse_worker(self, launch_id: str) -> Any:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.refuse_unstarted_worker(conn, now, launch_id)
 
     def launch_end(self, launch_id: str, kind: str, cause: str) -> Any:
         from levain.coordinator import lease

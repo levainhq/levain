@@ -62,7 +62,7 @@ __all__ = [
     "check_model", "claim", "by_harness_session", "claim_spawn", "end_done_worker", "end_launch", "end_unlisted", "fence", "launch",
     "lease", "launches", "LaunchThread", "mark_swept", "over_unswept", "record_thread", "record_write", "release",
     "request_launch", "spawn_draft", "spawn_record", "spawn_thread_refusal", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
-    "wake_state",
+    "wake_state", "HANDOFF_MAX", "refuse_unstarted_worker", "worker_handoff",
 ]
 
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
@@ -156,8 +156,17 @@ LEASE_SCHEMA: tuple[str, ...] = (
     # a launch that is over whose session the watcher saw not running: it leaves the watcher's over list for good
     "CREATE TABLE IF NOT EXISTS launch_sweeps (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), "
     "gseq INTEGER NOT NULL UNIQUE, cause TEXT NOT NULL, at TEXT NOT NULL)",
+    # a done spawned worker's handoff (P3: output = the handoff), written in the transaction that ends it, before its
+    # session is stopped: its final message, or why there is none
+    "CREATE TABLE IF NOT EXISTS launch_handoffs (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), "
+    "gseq INTEGER NOT NULL UNIQUE, handoff TEXT, why TEXT, at TEXT NOT NULL, "
+    "CHECK (handoff IS NOT NULL OR why IS NOT NULL))",
     *_append_only("launch_threads", "a launch thread"),
     *_append_only("launch_sweeps", "a launch sweep"),
+    *_append_only("launch_handoffs", "a worker handoff"),
+    "CREATE TRIGGER IF NOT EXISTS launch_handoffs_no_replace BEFORE INSERT ON launch_handoffs WHEN EXISTS (SELECT 1 "
+    "FROM launch_handoffs WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a worker handoff is written once'); END",
     "CREATE TRIGGER IF NOT EXISTS launch_threads_no_replace BEFORE INSERT ON launch_threads WHEN EXISTS (SELECT 1 "
     "FROM launch_threads WHERE seq = NEW.seq OR gseq = NEW.gseq) "
     "BEGIN SELECT RAISE(ABORT, 'a launch thread is never replaced'); END",
@@ -425,6 +434,8 @@ SPAWN_PREFIX = "@spawn/"
 MAX_SPAWN_DEPTH = 2
 MAX_SPAWNS_LIVE = 4
 ROLE_REF_MAX = 16 * 1024
+# [seat] the most of a done worker's final message the store keeps, in bytes
+HANDOFF_MAX = 64 * 1024
 # what the caller writes: the role, its slot values, the DONE line and the parent it names
 _DRAFT_KEYS = frozenset({"spawn", "role_hash", "inline", "role", "slots", "done", "parent_launch_id"})
 # what the store adds in the request's own transaction, never taken from the caller: the depth from the parent's
@@ -490,7 +501,11 @@ def _complete_spawn(conn: sqlite3.Connection, draft: dict[str, Any], *, harness:
                     threads: Sequence[str], cwd: str | None) -> str:
     """The spawn record for ``draft``, every derived field read in the caller's transaction: the role re-hashed and
     held to the launch's harness and model; the one thread live WORK holding a drop; the depth from an ACTIVE parent
-    worker's own record; and the scope cut from ONE envelope head (its id kept, so the activation pins that one)."""
+    worker's own record; and the scope cut from ONE envelope head (its id kept, so the activation pins that one).
+
+    The depth is the lineage the lease holder DECLARES: a worker holds no lease token and no door verb, so every
+    request comes through the lease holder, and one that names no parent is depth 1. It is not a bound a caller
+    cannot get around; the lease and the live-spawn cap (:data:`MAX_SPAWNS_LIVE`) are what bind."""
     from levain.agents import role as role_mod
     from levain.coordinator.envelopes import EnvelopeStore, narrow_scope
     from levain.coordinator.store import CoordStore
@@ -708,14 +723,60 @@ def _refuse_spawn(conn: sqlite3.Connection, now: str, ln: Launch) -> tuple[Launc
     return _launch_row(conn, "launch_id", ln.launch_id), f"launch {ln.launch_id}: {why}"
 
 
-def end_done_worker(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch | None:
-    """A spawned worker whose session the harness lists as ``done`` (its one turn finished): ``ended``, cause
-    :data:`WORKER_DONE`, so it leaves the live-spawn count and the watcher stops its session and removes its brief.
-    None, nothing written, when it is not an active spawned worker any more."""
+def end_done_worker(conn: sqlite3.Connection, now: str, launch_id: str, *, handoff: str | None = None,
+                    why: str | None = None) -> Launch | None:
+    """A spawned worker whose one turn finished: ``ended``, cause :data:`WORKER_DONE`, so it leaves the live-spawn
+    count and the watcher stops its session and removes its brief. Its ``handoff`` (its final message), or ``why`` it
+    has none, is written to ``launch_handoffs`` in the same transaction, so it outlives the session; a handoff longer
+    than :data:`HANDOFF_MAX` bytes keeps its head and says so. None, nothing written, when it is not an active spawned
+    worker any more."""
     ln = launch(conn, launch_id)
     if ln is None or ln.state != "active" or ln.role != "worker" or not ln.role_ref:
         return None
+    if handoff is not None:
+        raw = handoff.encode("utf-8", "replace")
+        if len(raw) > HANDOFF_MAX:
+            handoff = raw[:HANDOFF_MAX].decode("utf-8", "ignore")
+            why = f"the handoff is cut to its first {HANDOFF_MAX} bytes"
+        else:
+            handoff = raw.decode("utf-8")
+    elif why is None:
+        why = "no final message was read"
+    if why is not None:
+        why = " ".join(unshowable.mark(why, allow="").split())[:_LINE_MAX]
     _launch_event(conn, now, launch_id, "ended", WORKER_DONE)
+    conn.execute("INSERT INTO launch_handoffs (launch_id, gseq, handoff, why, at) VALUES (?, ?, ?, ?, ?)",
+                 (launch_id, next_gseq(conn, now), handoff, why, now))
+    return _launch_row(conn, "launch_id", launch_id)
+
+
+def worker_handoff(conn: sqlite3.Connection, launch_id: str) -> dict[str, Any]:
+    """The handoff spawned worker ``launch_id`` left (``launch_id``, ``handoff``, ``why``, ``at``), or a
+    :class:`LeaseRefused` naming why there is none to read: no such launch, not a spawned worker, or one that has
+    not ended done."""
+    ln = _must_launch(conn, launch_id)
+    if ln.role != "worker" or not ln.role_ref:
+        raise _refused(f"launch {launch_id} is not a spawned worker; only a spawned worker leaves a handoff")
+    if not _has_column(conn, "launch_handoffs", "handoff"):
+        raise _refused("this store holds no worker handoffs yet")
+    r = conn.execute("SELECT handoff, why, at FROM launch_handoffs WHERE launch_id = ?", (launch_id,)).fetchone()
+    if r is None:
+        raise _refused(f"worker launch {launch_id} is {ln.state} ({ln.cause}) and left no handoff; one is written "
+                       "when its turn finishes")
+    return {"launch_id": launch_id, "handoff": r[0], "why": r[1], "at": r[2]}
+
+
+def refuse_unstarted_worker(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch | None:
+    """A pending spawned worker its launcher refused before any spawn claim (it can never start as asked): written
+    ``failed``, cause :data:`SPAWN_REFUSED`, in the caller's transaction, so it leaves the live-spawn count at once
+    instead of at :data:`LAUNCH_TTL`. None, nothing written, for any other launch, or one whose spawn a process has
+    claimed meanwhile."""
+    ln = launch(conn, launch_id)
+    if ln is None or ln.state != "pending" or ln.role != "worker" or not ln.role_ref:
+        return None
+    if conn.execute("SELECT 1 FROM launch_spawns WHERE launch_id = ?", (launch_id,)).fetchone() is not None:
+        return None
+    _launch_event(conn, now, launch_id, "failed", SPAWN_REFUSED)
     return _launch_row(conn, "launch_id", launch_id)
 
 

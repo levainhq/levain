@@ -1329,6 +1329,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             tok = store.coord_claim(args.launch, args.session)
             _emit(out, args.json, {"token": tok}, f"claimed: token {tok}")
             return 0
+        if cmd == "handoff" and args.handoff_cmd == "worker":
+            return _coord_worker_handoff(args, out, store)
         if cmd in ("close", "open", "handoff"):
             from levain.coordinator import seam_verbs
 
@@ -1673,6 +1675,21 @@ def _coord_spawn(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
           f"asked for worker launch {ln.launch_id} ({rec['spawn']}{', inline' if rec['inline'] else ''}, depth "
           f"{rec['depth']}) on thread {args.thread} in {cwd}: {ln.state} until {ln.until}; `levain coord watch` or "
           f"`levain coord launch {ln.launch_id}` starts it")
+    return 0
+
+
+def _coord_worker_handoff(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord handoff worker LAUNCH_ID --token N`` (P3): the handoff a done spawned worker left, read by the lease
+    holder (:meth:`CoordStore.launch_handoff`). Its text is the worker's own words, shown with every hidden character
+    marked, line breaks kept."""
+    got = store.launch_handoff(args.token, args.launch_id)
+    text = None if got["handoff"] is None else unshowable.mark(got["handoff"], allow="\n\t")
+    head = f"worker launch {got['launch_id']}: handoff kept {got['at']}"
+    if text is None:
+        body = f"{head}; no final message: {got['why']}"
+    else:
+        body = f"{head}" + (f" ({got['why']})" if got["why"] else "") + f"\n\n{text}"
+    _emit(out, args.json, {**got, "handoff": text}, body)
     return 0
 
 
@@ -2081,10 +2098,13 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         "spawn", help="Ask for one worker on a WORK thread, from a registered role (@spawn/NAME) or an inline one.",
         description="The worker runs the role's brief with your slot values, in DIR (outside every coordinator "
                     "workspace), under the consent hook. Its scope is the thread's envelope cut down to the role's "
-                    "ceiling, once, when it is asked for; nothing about the thread's envelope changes. A spawned "
-                    f"worker may spawn one more (--parent), never deeper, and at most "
-                    f"{_spawn_caps()[1]} are asked for or running at once. `levain coord watch` or "
-                    "`levain coord launch LAUNCH_ID` starts it, and `levain coord status` lists it.")
+                    "ceiling, once, when it is asked for; nothing about the thread's envelope changes. --parent "
+                    f"declares the lineage (the active spawned worker this one is for; at most {_spawn_caps()[0]} "
+                    "deep by what you declare): a worker holds no token and no coordinator verb, so you are the "
+                    "only spawner, and what binds is your lease and the cap of "
+                    f"{_spawn_caps()[1]} asked for or running at once. `levain coord watch` or "
+                    "`levain coord launch LAUNCH_ID` starts it, `levain coord status` lists it, and "
+                    "`levain coord handoff worker LAUNCH_ID` reads its final message once its turn is done.")
     csp.add_argument("--thread", required=True, metavar="THREAD", help="The WORK thread the worker holds.")
     who = csp.add_mutually_exclusive_group(required=True)
     who.add_argument("--role", default=None, metavar="@spawn/NAME", help="A registered role.")
@@ -2140,6 +2160,12 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                                          "id (dr-..., item keys), never by ordinal.")
     chs.add_argument("handoff_id", nargs="?", type=int, default=None, metavar="HANDOFF_ID")
     chs.add_argument("--md", action="store_true", help="Render as markdown.")
+    chw = chn_sub.add_parser("worker", help="A done spawned worker's handoff: its final message (the lease holder's).",
+                             description="Prints the final message a spawned worker left when its turn finished, kept "
+                                         "when the watcher ended it, before its session was stopped; or why it left "
+                                         "none. The read is fenced by your lease token and writes nothing.")
+    chw.add_argument("launch_id", metavar="LAUNCH_ID")
+    chw.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
     cbu = c_sub.add_parser(
         "budget", help="Each thread's budget against what its sessions used (Q13's counts): the gauge.",
         description="The budget is the thread's head envelope's; usage is Q13's count of the worker sessions pinned to "
@@ -2171,7 +2197,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     for p in (rvl, rvc, rvo, rvf):
         common(p)
         p.set_defaults(func=run_coord)
-    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs):
+    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs, chw):
         common(p)
         p.set_defaults(func=run_coord)
 

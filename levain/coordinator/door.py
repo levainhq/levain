@@ -53,6 +53,8 @@ DOOR: frozenset[tuple[str, ...]] = frozenset({
     ("coord", "reply"),
     # one worker for a WORK thread (P3), fenced by the lease token; the store derives its scope and depth
     ("coord", "spawn"),
+    # a done spawned worker's handoff, its final message, read back under the lease token (P3); it writes nothing
+    ("coord", "handoff", "worker"),
     # the display-only list a work delta's "+N more" line points at; it makes nothing
     ("coord", "log"),
     # the seam (C15 S3): its open and the acknowledgement of it, the handoff it leaves, and reading one back

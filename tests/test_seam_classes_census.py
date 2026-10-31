@@ -65,7 +65,7 @@ def test_the_classes_do_not_overlap() -> None:
 def test_every_table_of_the_maximal_database_is_in_exactly_one_class(maximal: Path) -> None:
     tables = _tables(maximal)
     assert "sqlite_sequence" in tables and sc.EXEMPT["sqlite_sequence"] == "SQLite's own"
-    assert len(tables) == 62 and len(set(tables)) == 62           # 54 of the census, SQLite's own, S0's bounds table, S1's handoffs and S2b's five
+    assert len(tables) == 63 and len(set(tables)) == 63           # the census's 54, SQLite's, S0, S1, S2b's five, P3
     # `_r4` is the transient name of the review events' rebuild: gone by commit, so a finished store holds none
     assert not [t for t in tables if t.endswith("_r4")]
     known = sc.COUNTED | sc.INFRASTRUCTURE | set(sc.EXEMPT)
@@ -152,7 +152,7 @@ def _declared(statements: tuple[str, ...]) -> list[tuple[str, str]]:
 def test_the_name_scan_reads_every_statement_and_catches_a_seeded_duplicate() -> None:
     # the lists as measured: every statement names an object (268 in all), so the scan below skips nothing
     assert {k: (len(v), len(_declared(v))) for k, v in _DISPATCH_DB_LISTS.items()} == {
-        "dispatch.jobs._SCHEMA": (57, 57), "store.SCHEMA": (28, 28), "lease.LEASE_SCHEMA": (29, 29),
+        "dispatch.jobs._SCHEMA": (57, 57), "store.SCHEMA": (28, 28), "lease.LEASE_SCHEMA": (33, 33),
         "teamdrafts.DRAFT_SCHEMA": (9, 9), "review.REVIEW_SCHEMA": (15, 15),
         "first_reader.FIRST_READER_SCHEMA": (16, 16), "ready.LIFECYCLE_SCHEMA": (10, 10),
         "work_delta.OPERATOR_VIEWS_SCHEMA": (4, 4), "store.SEAM_SCHEMA": (4, 4),

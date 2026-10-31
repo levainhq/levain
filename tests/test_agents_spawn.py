@@ -278,7 +278,7 @@ def test_a_slot_cannot_forge_a_brief_section(store, fake, live_hook, wdir, spawn
     assert cl.launch_session(store, ln.launch_id).started
     brief = (wdir / ".levain" / "briefs" / f"{ln.launch_id}.md").read_text()
     assert [x for x in brief.splitlines() if x.startswith("## ")] == [
-        "## Your role", "## What you are for", "## Your bounds", "## Your handoff", "## The drop behind your thread"]
+        "## Your role", "## What you are for", "## Your bounds", "## Your handoff", "## The drops behind your thread"]
     assert not any(x.startswith("- may work in /") for x in brief.splitlines())
 
 
@@ -289,7 +289,7 @@ def test_a_worker_does_not_start_in_a_coordinator_workspace(store, fake, live_ho
         ln = spawn(store, store.coord_take(), t.thread_id, cwd.resolve())
         got = cl.launch_session(store, ln.launch_id)
         assert not got.started and "inside a coordinator's workspace" in got.refusal, got
-        assert store.launch(ln.launch_id).state == "pending"
+        assert store.launch(ln.launch_id).state == "failed"            # refused before start: no slot held
     assert fake.spawns() == []
 
 
@@ -335,12 +335,17 @@ def test_a_worker_whose_thread_closed_after_it_was_asked_for_is_refused_before_t
     ln = spawn(store, token, t.thread_id, wdir)
     store.set_state(t.thread_id, "closed", by="operator")
     lines = cl.watch_once(store)
-    assert any(f"launch {ln.launch_id}: a worker launch; the worker's brief cannot be built" in x for x in lines), lines
+    assert any(f"launch {ln.launch_id}: a worker launch; the worker's brief cannot be built" in x
+               and "written failed" in x for x in lines), lines
     assert rows(store.directory, "SELECT count(*) FROM launch_spawns") == [(0,)] and fake.spawns() == []
-    # the claim itself re-reads the thread: the launch is written failed, so it leaves the live count
-    got, why = store.launch_claim_spawn(ln.launch_id, 1)
-    assert "no longer open work" in why and store.launch(ln.launch_id).state == "failed"
-    assert store.launch(ln.launch_id).cause == lease.SPAWN_REFUSED
+    assert store.launch(ln.launch_id).state == "failed" and store.launch(ln.launch_id).cause == lease.SPAWN_REFUSED
+    # a claim racing the watcher re-reads the thread itself: the launch is written failed, so it leaves the live count
+    _d, t2 = a_thread(store, "the second")
+    raced = spawn(store, token, t2.thread_id, wdir)
+    store.set_state(t2.thread_id, "closed", by="operator")
+    got, why = store.launch_claim_spawn(raced.launch_id, 1)
+    assert "no longer open work" in why and store.launch(raced.launch_id).state == "failed"
+    assert store.launch(raced.launch_id).cause == lease.SPAWN_REFUSED
     assert rows(store.directory, "SELECT count(*) FROM launch_spawns") == [(0,)]
 
 
@@ -435,13 +440,14 @@ def test_depth_is_derived_from_an_active_parents_own_record(store, wdir, spawn):
         spawn(store, token, t4.thread_id, wdir, parent_launch=parent.launch_id)
 
 
-def test_done_workers_end_and_a_fifth_spawn_is_accepted(store, fake, live_hook, wdir, spawn):  # noqa: F811
+def test_done_workers_end_and_a_fifth_spawn_is_accepted(store, fake, live_hook, wdir, spawn, cfg):  # noqa: F811
     token = store.coord_take()
     made = []
     for i in range(lease.MAX_SPAWNS_LIVE):
         _d, t = a_thread(store, f"job {i}")
         ln = spawn(store, token, t.thread_id, wdir, slots={"topic": str(i)})
         made.append(_activate(store, ln, f"sid-worker-{i}"))
+        _transcript(cfg, f"sid-worker-{i}", [_ASKED, _said(f"job {i} done\nDONE: yes")])
     _d, t5 = a_thread(store, "the fifth")
     with pytest.raises(inst.SpawnRefused, match=f"at most {lease.MAX_SPAWNS_LIVE}"):
         spawn(store, token, t5.thread_id, wdir)
@@ -478,7 +484,7 @@ def test_the_brief_states_the_stored_scope_and_the_pin_is_its_envelope(ctx, fake
     d, _fresh, body, _signed = ctx.structured("make the readme say hello, and land it")
     (t,) = store.split(d.drop_id, [Part("work", "hello")])
     only_readme = role("scribe", ceiling={"where": [{"repo": ctx.path, "paths": ["README"]}]})
-    ln = spawn(store, store.coord_take(), t.thread_id, wdir, inline=only_readme)
+    ln = spawn(store, store.coord_take(), t.thread_id, ctx.path, inline=only_readme)      # the where's repo top
     rec = lease.spawn_record(ln.role_ref)
     assert rec["envelope_id"] == body["envelope_id"] and rec["drop_id"] == d.drop_id
     assert rec["scope"]["where"] == [{"repo": ctx.path, "paths": ["README"]}] and rec["scope"]["lands"] == []
@@ -486,7 +492,7 @@ def test_the_brief_states_the_stored_scope_and_the_pin_is_its_envelope(ctx, fake
     assert context.scope == rec["scope"] and context.spec["scope"] == rec["scope"]
     got = cl.launch_session(store, ln.launch_id)
     assert got.started, got
-    brief = (wdir / ".levain" / "briefs" / f"{ln.launch_id}.md").read_text()
+    brief = (Path(ctx.path) / ".levain" / "briefs" / f"{ln.launch_id}.md").read_text()
     assert f"may work in {ctx.path}: README" in brief and "(none: no land, push or publish)" in brief
     assert body["envelope_id"] in brief
     assert store.launch(ln.launch_id).pinned_envelope_id == body["envelope_id"]
@@ -524,8 +530,8 @@ def test_a_thread_with_no_envelope_gets_the_empty_scope(store, wdir, spawn):
     _d, t = a_thread(store)
     ln = spawn(store, store.coord_take(), t.thread_id, wdir)
     rec = lease.spawn_record(ln.role_ref)
-    assert rec["envelope_id"] is None and rec["scope"] == inst.EMPTY_SCOPE
-    assert inst.worker_context(store, ln).scope == inst.EMPTY_SCOPE
+    assert rec["envelope_id"] is None and rec["scope"] == {"lands": [], "publishes": [], "pushes": [], "where": []}
+    assert inst.worker_context(store, ln).scope == rec["scope"]
 
 
 def test_the_first_reader_holds_a_spawned_worker_to_its_stored_scope(ctx, wdir, spawn):
@@ -652,3 +658,155 @@ def test_no_spawn_code_reads_the_envelope_authority_readers():
     for rel in ("levain/agents/instantiate.py", "levain/coordinator/launch.py"):
         text = (Path(__file__).resolve().parent.parent / rel).read_text(encoding="utf-8")
         assert not _callers_in(rel, text), rel
+
+
+# --- fix 2: the handoff, a finished turn, every drop, the where, a refusal before start, path slots ------------------
+def _transcript(cfg, sid, records):
+    """A Claude Code transcript for session ``sid`` under config directory ``cfg``, in the record shape a finished
+    session writes (``type``, ``isSidechain``, ``message`` with ``stop_reason`` and content blocks)."""
+    d = cfg / "projects" / "-scratch-worker"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{sid}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+
+def _said(text, *, stop="end_turn", mid="m-last", blocks=None):
+    return {"type": "assistant", "isSidechain": False, "message": {
+        "id": mid, "role": "assistant", "stop_reason": stop,
+        "content": blocks if blocks is not None else [{"type": "text", "text": text}]}}
+
+
+_ASKED = {"type": "user", "isSidechain": False, "message": {"role": "user", "content": "go"}}
+
+
+@pytest.fixture
+def cfg(tmp_path, monkeypatch):
+    d = tmp_path / "claude-config"
+    d.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(d))
+    return d
+
+
+def _done_listing(fake, pairs, wdir):
+    fake.others([OTHER] + [{"id": f"w{i}", "sessionId": sid, "name": cl.session_name(ln), "cwd": str(wdir),
+                            "kind": "background", "state": "done", "status": "idle"}
+                           for i, (ln, sid) in enumerate(pairs)])
+
+
+def test_a_done_workers_handoff_is_readable_after_it_is_stopped(store, qdir, fake, live_hook, wdir, spawn, cfg,
+                                                                 capsys):  # noqa: F811
+    token = store.coord_take()
+    _d, t = a_thread(store)
+    ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-handoff")
+    _d2, t2 = a_thread(store, "the second job")
+    quiet = _activate(store, spawn(store, token, t2.thread_id, wdir), "sid-quiet")
+    _transcript(cfg, "sid-handoff", [_ASKED, _said("", stop=None, mid="m-last",
+                                                   blocks=[{"type": "thinking", "thinking": "hm"}]),
+                                     _said("I wrote the greeting.\nDONE: README says hello")])
+    _transcript(cfg, "sid-quiet", [_ASKED, _said("", blocks=[{"type": "thinking", "thinking": "nothing to say"}])])
+    _done_listing(fake, [(ln, "sid-handoff"), (quiet, "sid-quiet")], wdir)
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended" and len(fake.stops()) == 2, lines
+    got = store.launch_handoff(token, ln.launch_id)
+    assert got["handoff"] == "I wrote the greeting.\nDONE: README says hello" and got["why"] is None
+    none = store.launch_handoff(token, quiet.launch_id)
+    assert none["handoff"] is None and "no text" in none["why"]
+    # the lease holder reads it through its door; a token that is not the live lease's reads nothing
+    assert ("coord", "handoff", "worker") in door.DOOR
+    out = _main(qdir, capsys, "coord", "handoff", "worker", ln.launch_id, "--token", str(token))
+    assert "DONE: README says hello" in out.out
+    out = _main(qdir, capsys, "coord", "handoff", "worker", quiet.launch_id, "--token", str(token))
+    assert "no final message" in out.out and "no text" in out.out
+    with pytest.raises(lease.LeaseRefused, match="not the live lease"):
+        store.launch_handoff(token + 1, ln.launch_id)
+
+
+def test_only_a_finished_turn_ends_a_worker(store, fake, live_hook, wdir, spawn, cfg):  # noqa: F811
+    token = store.coord_take()
+    made = []
+    for i, records in enumerate((
+            # a tool call waiting on its answer (a consent prompt): the turn is not over
+            [_ASKED, _said("", stop="tool_use", blocks=[{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}])],
+            # a reply that a new prompt followed: a turn in progress
+            [_ASKED, _said("first"), _ASKED],
+            None)):                                                  # no transcript at all: nothing proves it is done
+        _d, t = a_thread(store, f"job {i}")
+        ln = _activate(store, spawn(store, token, t.thread_id, wdir, slots={"topic": str(i)}), f"sid-wait-{i}")
+        if records is not None:
+            _transcript(cfg, f"sid-wait-{i}", records)
+        made.append(ln)
+    _done_listing(fake, [(ln, f"sid-wait-{i}") for i, ln in enumerate(made)], wdir)
+    lines = cl.watch_once(store)
+    for ln in made:
+        assert store.launch(ln.launch_id).state == "active", lines
+        assert any(x.startswith(f"launch {ln.launch_id}: listed done") and "not ended" in x for x in lines), lines
+    assert fake.stops() == []
+
+
+def test_the_brief_names_every_drop_on_the_thread(store, fake, live_hook, wdir, spawn):  # noqa: F811
+    d1, t = a_thread(store, "make the readme say hello")
+    d2, _ = store.accept_drop("and say goodbye too", surface="cli")
+    store.split(d2.drop_id, [Part("work", attach=t.thread_id)], by="operator")
+    ln = spawn(store, store.coord_take(), t.thread_id, wdir)
+    assert cl.launch_session(store, ln.launch_id).started
+    brief = (wdir / ".levain" / "briefs" / f"{ln.launch_id}.md").read_text()
+    assert f"`{d1.drop_id}`" in brief and f"`{d2.drop_id}`" in brief
+    assert "make the readme say hello" in brief and "and say goodbye too" in brief
+
+
+def test_a_worker_runs_inside_its_scopes_where(ctx, fake, live_hook, wdir, spawn):  # noqa: F811
+    store = ctx.store
+    store.coord_set_agent("claude", model="haiku", cwd=str(wdir.parent))
+    d, _fresh, _body, _signed = ctx.structured("make the readme say hello, and land it")
+    (t,) = store.split(d.drop_id, [Part("work", "hello")])
+    whole = role("scribe", ceiling={"where": [{"repo": ctx.path, "paths": ["."]}]})
+    token = store.coord_take()
+    outside = spawn(store, token, t.thread_id, wdir, inline=whole)
+    got = cl.launch_session(store, outside.launch_id)
+    assert not got.started and "outside the scope's where" in got.refusal, got
+    assert store.launch(outside.launch_id).state == "failed" and fake.spawns() == []
+    inside = spawn(store, token, t.thread_id, ctx.path, inline=whole)
+    assert cl.worker_refusal(inside, store) is None
+    # a where that names only a file: the repo's top is still where its worker runs, a directory beside it is not
+    readme = role("scribe", ceiling={"where": [{"repo": ctx.path, "paths": ["README"]}]})
+    top = spawn(store, token, t.thread_id, ctx.path, inline=readme)
+    assert cl.worker_refusal(top, store) is None
+    sub = Path(ctx.path) / "docs"
+    sub.mkdir(exist_ok=True)
+    below = spawn(store, token, t.thread_id, sub, inline=readme)
+    assert "outside the scope's where" in cl.worker_refusal(below, store)
+
+
+def test_a_worker_refused_before_start_leaves_pending_at_once(store, fake, live_hook, wdir, spawn):  # noqa: F811
+    token = store.coord_take()
+    made = []
+    for i in range(lease.MAX_SPAWNS_LIVE):
+        _d, t = a_thread(store, f"job {i}")
+        made.append(spawn(store, token, t.thread_id, wdir, slots={"topic": str(i)}))
+        store.set_state(t.thread_id, "closed", by="operator")
+    lines = cl.watch_once(store)
+    for ln in made:
+        assert store.launch(ln.launch_id).state == "failed", lines
+        assert store.launch(ln.launch_id).cause == lease.SPAWN_REFUSED
+    assert fake.spawns() == [] and rows(store.directory, "SELECT count(*) FROM launch_spawns") == [(0,)]
+    _d, t = a_thread(store, "the fifth")
+    assert spawn(store, token, t.thread_id, wdir).state == "pending"       # the refused ones hold no slot
+
+
+def test_the_stop_time_is_guidance(store, fake, live_hook, wdir, spawn):  # noqa: F811
+    _d, t = a_thread(store)
+    ln = spawn(store, store.coord_take(), t.thread_id, wdir)
+    assert cl.launch_session(store, ln.launch_id).started
+    brief = (wdir / ".levain" / "briefs" / f"{ln.launch_id}.md").read_text()
+    assert "aim to end your work within 120 minutes" in brief and "nothing stops you" in brief
+
+
+@pytest.mark.parametrize("bad", ["/etc/passwd", "..", "a/../b", "../a", "a/..", "/"])
+def test_a_path_slot_is_relative_with_no_parent_step(bad):
+    r = role(slots={"where": "path"}, template="Edit {where}.")
+    with pytest.raises(inst.SpawnRefused, match="relative path"):
+        inst.render_brief(r, {"where": bad})
+    assert inst.render_brief(r, {"where": "docs/a..b.md"}) == "Edit docs/a..b.md."
+
+
+def test_the_unread_empty_scope_constant_is_gone():
+    assert not hasattr(inst, "EMPTY_SCOPE")

@@ -43,13 +43,13 @@ from levain.coordinator import lease as lease_mod
 from levain.coordinator.store import CoordError
 
 __all__ = ["MAX_SPAWN_DEPTH", "MAX_SPAWNS_LIVE", "SpawnRefused", "WorkerContext", "ephemeral_spec", "make_draft",
-           "parse_spawn_ref", "render_brief", "resolve_role", "spawn_worker", "verified_record", "worker_context"]
+           "parse_spawn_ref", "render_brief", "resolve_role", "spawn_worker", "verified_record", "where_refusal",
+           "worker_context"]
 
 MAX_SPAWN_DEPTH = lease_mod.MAX_SPAWN_DEPTH
 MAX_SPAWNS_LIVE = lease_mod.MAX_SPAWNS_LIVE
 # [seat] a spawned worker's stop time, in seconds, when the caller names none
 DEFAULT_STOP_S = 2 * 60 * 60
-EMPTY_SCOPE: dict[str, Any] = {"lands": [], "publishes": [], "pushes": [], "where": []}
 _EPHEMERAL = "ephemeral"
 
 
@@ -112,7 +112,8 @@ def _one_line(text: str) -> str:
 
 def render_brief(role: Mapping[str, Any], slots: Mapping[str, Any]) -> str:
     """The role's brief template with the caller's slot values written in. Exactly the declared slots, each of its
-    declared type (``str``, ``int`` or ``path``, never a bool); a text value is UTF-8 with no hidden character, and is
+    declared type (``str``, ``int`` or ``path``, never a bool; a path is relative, with no ``..`` step, so it names no
+    place outside the directory the worker is given); a text value is UTF-8 with no hidden character, and is
     written as one marked line (:func:`_one_line`): the template is the role's instruction text, a slot value is
     data."""
     declared = role["brief"]["slots"]
@@ -136,8 +137,8 @@ def render_brief(role: Mapping[str, Any], slots: Mapping[str, Any]) -> str:
             raise SpawnRefused(f"slot {name!r} is not UTF-8 text") from None
         if unshowable.first_hidden(v, allow="\n\t", selectors=False) is not None:
             raise SpawnRefused(f"slot {name!r} holds a character that cannot be shown")
-        if kind == "path" and ("\x00" in v or "\n" in v):
-            raise SpawnRefused(f"slot {name!r} is one path")
+        if kind == "path" and ("\x00" in v or "\n" in v or v.startswith("/") or ".." in v.split("/")):
+            raise SpawnRefused(f"slot {name!r} is one relative path, with no '..' step")
         values[name] = _one_line(v)
     return role["brief"]["template"].format_map(values)
 
@@ -181,16 +182,19 @@ def verified_record(text: object) -> dict[str, Any]:
 
 
 def ephemeral_spec(role: Mapping[str, Any], digest: str, *, drop_id: str, thread_id: str, title: str,
-                   done: str | None, scope: Mapping[str, Any], stop_s: int = DEFAULT_STOP_S) -> dict[str, Any]:
-    """The worker's AgentSpec, never registered: input = the drop, output = the handoff to the coordinator, win = the
-    ready item's ``DONE:`` line (the thread's title when the item names none). The three parts go through the
-    registry spec's own parsers, so they are the shapes a registered spec would hold."""
+                   done: str | None, scope: Mapping[str, Any], stop_s: int = DEFAULT_STOP_S,
+                   more_drops: tuple[str, ...] = ()) -> dict[str, Any]:
+    """The worker's AgentSpec, never registered: input = the drop (and ``more_drops``, the thread's other drops),
+    output = the handoff to the coordinator, win = the ready item's ``DONE:`` line (the thread's title when the item
+    names none). The three parts go through the registry spec's own parsers, so they are the shapes a registered spec
+    would hold. ``stop_at`` is guidance the brief states; nothing ends the worker at that time."""
     name = role_mod.spawn_namespace(role["name"])
     win = done if done else f"the thread is done: {title}"
+    source = f"drop {drop_id}" + (f" and drops {', '.join(more_drops)}" if more_drops else "")
     return {
         "name": name, "kind": _EPHEMERAL, "role": {"name": role["name"], "role_hash": digest},
-        "input": spec_mod._input({"source": f"drop {drop_id}",
-                                  "liveness": "the drop is the operator's words as the thread holds them"}),
+        "input": spec_mod._input({"source": source,
+                                  "liveness": "the drops are the operator's words as the thread holds them"}),
         "output": spec_mod._output({"class": "corpus", "destination": f"thread {thread_id}",
                                     "reader": "coordinator", "moment": "when the worker ends"}),
         "win": spec_mod._win({"kind": "human", "check": win}),
@@ -200,20 +204,21 @@ def ephemeral_spec(role: Mapping[str, Any], digest: str, *, drop_id: str, thread
 
 
 class WorkerContext:
-    """What the worker brief is built from, for one launch: the record, the role's rendered brief, the ephemeral spec
-    and the scope the store cut, at request time, from the one envelope it names."""
+    """What the worker brief is built from, for one launch: the record, the role's rendered brief, the ephemeral spec,
+    the scope the store cut, at request time, from the one envelope it names, and every drop the WORK thread holds
+    now (``drops``: ``(drop_id, words)``, the record's own drop first)."""
 
     def __init__(self, record: dict[str, Any], rendered: str, spec: dict[str, Any], scope: dict[str, Any],
-                 envelope_id: str | None, drop_id: str, thread: Any, words: str) -> None:
+                 envelope_id: str | None, drop_id: str, thread: Any, drops: list[tuple[str, str]]) -> None:
         self.record, self.rendered, self.spec, self.scope = record, rendered, spec, scope
-        self.envelope_id, self.drop_id, self.thread, self.words = envelope_id, drop_id, thread, words
+        self.envelope_id, self.drop_id, self.thread, self.drops = envelope_id, drop_id, thread, drops
 
 
 def worker_context(store: Any, launch: Any) -> WorkerContext:
     """The context of spawned-worker launch ``launch``, from its stored record (scope, envelope, drop) and the thread's
-    title. Anything that cannot be built (no record, a record that does not verify, no single thread, a thread that is
-    not open work holding the record's drop) is a :class:`SpawnRefused`, so a launcher refuses it before its spawn
-    claim."""
+    title and drops. Anything that cannot be built (no record, a record that does not verify, no single thread, a
+    thread that is not open work holding the record's drop) is a :class:`SpawnRefused`, so a launcher refuses it before
+    its spawn claim."""
     if not getattr(launch, "role_ref", None):
         raise SpawnRefused(f"launch {launch.launch_id} carries no spawned role")
     record = verified_record(launch.role_ref)
@@ -224,17 +229,39 @@ def worker_context(store: Any, launch: Any) -> WorkerContext:
         if thread.kind != "work" or thread.state not in lease_mod.LIVE_THREAD_STATES \
                 or record["drop_id"] not in thread.members:
             raise SpawnRefused(f"thread {thread.thread_id} is no longer open work holding drop {record['drop_id']}")
+        more = tuple(m for m in thread.members if m != record["drop_id"])
         spec = ephemeral_spec(record["role"], record["role_hash"], drop_id=record["drop_id"],
                               thread_id=thread.thread_id, title=thread.title, done=record["done"],
-                              scope=record["scope"])
+                              scope=record["scope"], more_drops=more)
         rendered = render_brief(record["role"], record["slots"])
-        words = store.drop(record["drop_id"]).words
+        drops = [(i, store.drop(i).words) for i in (record["drop_id"], *more)]
     except SpawnRefused:
         raise
     except (CoordError, KeyError, TypeError, ValueError, AttributeError) as exc:
         raise SpawnRefused(f"the worker's brief cannot be built ({type(exc).__name__}: {str(exc)[:200]})") from None
     return WorkerContext(record, rendered, spec, copy.deepcopy(record["scope"]), record["envelope_id"],
-                         record["drop_id"], thread, words)
+                         record["drop_id"], thread, drops)
+
+
+def where_refusal(real_cwd: str, scope: Mapping[str, Any]) -> str | None:
+    """Why a worker may not run in ``real_cwd`` (a resolved directory) under ``scope`` (None: it may). A scope with no
+    ``where`` sets no bound here. Otherwise the directory must be a ``where`` repo's top, or lie inside a directory
+    that repo's paths name (``.`` is the whole repo, ``dir/`` a directory): a path that names one file keeps the
+    worker at the repo's top, never in a directory beside the file."""
+    where = scope.get("where") or []
+    if not where:
+        return None
+    for w in where:
+        top = w["repo"].rstrip("/") or "/"
+        if real_cwd == top:
+            return None
+        if not real_cwd.startswith(top + "/"):
+            continue
+        rel = real_cwd[len(top) + 1:]
+        if any(p == "." or (p.endswith("/") and (rel + "/").startswith(p)) for p in w["paths"]):
+            return None
+    named = "; ".join(f"{w['repo']}: {', '.join(w['paths'])}" for w in where)
+    return f"{real_cwd} is outside the scope's where ({named[:400]}); a worker runs inside what its scope names"
 
 
 def spawn_worker(store: Any, token: int, *, thread_id: str, cwd: str, ref: str | None = None,
@@ -242,7 +269,10 @@ def spawn_worker(store: Any, token: int, *, thread_id: str, cwd: str, ref: str |
                  agent_store: Any = None, harness: str | None = None, model: str | None = None,
                  parent_launch: str | None = None, done: str | None = None) -> Any:
     """Ask for a worker on ``thread_id`` under the lease holder's ``token``. ``parent_launch`` names the ACTIVE spawned
-    worker that is spawning this one (the store derives the depth from its record). ``harness`` and ``model`` default
+    worker that is spawning this one, and the store derives the depth from its record. A worker holds no lease token
+    and no door verb, so the only spawner is the lease holder: the depth is the LINEAGE THE LEASE HOLDER DECLARES (a
+    request that names no parent is depth 1), not a bound a caller cannot get around. What binds is the lease and the
+    cap on live spawns (:data:`MAX_SPAWNS_LIVE`). ``harness`` and ``model`` default
     to the role's own, and one that names another is refused. Returns the pending launch; the watcher or ``levain
     coord launch`` starts it. Every refusal is a :class:`SpawnRefused` and leaves nothing written."""
     role, digest, is_inline = resolve_role(agent_store, ref=ref, inline=inline)
