@@ -175,22 +175,24 @@ def _consent(qdir: Path, conn: sqlite3.Connection | None = None) -> list[dict[st
 
 def _records(qdir: Path, clock: Any = None, *, deadline: float | None = None,
              coord_conn: sqlite3.Connection | None = None, queue_conn: sqlite3.Connection | None = None,
-             questions_conn: sqlite3.Connection | None = None) -> tuple[dict[str, Any], dict[str, str]]:
+             questions_conn: sqlite3.Connection | None = None,
+             now: Any = None) -> tuple[dict[str, Any], dict[str, str]]:
     """``(waiting_on_you's answer, reply_id -> filed time)`` of the coordinator's store; empty when there is none.
     ``coord_conn``: a coordinator snapshot the caller holds (the morning card's), else one of our own whose lock wait
-    is capped by ``deadline``. The queue and question stores are each read through the ONE snapshot passed in."""
+    is capped by ``deadline``. The queue and question stores are each read through the ONE snapshot passed in.
+    ``now`` (an aware datetime, default ``None``): every expiry in the read is judged at it (see :func:`read_extras`)."""
     from levain.autonomic.durable_sqlite import read_transaction
     from levain.coordinator import review
     from levain.coordinator.store import CoordStore, StoreAbsent
 
     store = CoordStore(qdir, clock=clock) if clock is not None else CoordStore(qdir)
-    sign_open = review.queue_request_open(qdir, clock=clock, conn=queue_conn) if queue_conn is not None \
+    sign_open = review.queue_request_open(qdir, clock=clock, conn=queue_conn, now=now) if queue_conn is not None \
         else (lambda _rid: None)                  # no queue.db: the request's state cannot be read (unresolved)
     answer_open = review.question_open(qdir, conn=questions_conn) if questions_conn is not None \
         else (lambda _qid: None)
 
     def read(conn: sqlite3.Connection) -> tuple[dict[str, Any], dict[str, str]]:
-        w = review.waiting_on_you(store, sign_open=sign_open, answer_open=answer_open, conn=conn)
+        w = review.waiting_on_you(store, sign_open=sign_open, answer_open=answer_open, conn=conn, now=now)
         # a row with no time (NULL ``at``) sorts first rather than failing the whole source
         at = {r[0]: ("" if r[1] is None else str(r[1]))
               for r in conn.execute("SELECT reply_id, at FROM replies WHERE kind = 'sign'")}
@@ -219,16 +221,21 @@ def _why(what: str, exc: BaseException) -> str:
 
 
 def read_extras(queue_dir: Path | str, clock: Any = None, *, deadline: float | None = None,
-                coord_conn: sqlite3.Connection | None = None) -> Extras:
+                coord_conn: sqlite3.Connection | None = None, now: Any = None) -> Extras:
     """Read the three authority sources, each on its own: one that cannot be read lands in ``failed`` and the others
     are still listed. ``clock`` (a callable giving an aware datetime) stands in for now. Read-only.
 
     ``deadline`` (``time.monotonic()``, the hook's ONE bound): every store is opened once, as one snapshot, its lock
     wait capped to what is left; a store still held past it lands in ``failed`` ("! not read"), never a stalled
     prompt. ``coord_conn``: the coordinator snapshot a caller already holds (the morning card), read instead of a
-    second one."""
+    second one. ``now`` (an aware datetime; default ``None`` = today's behaviour: ``clock`` where it is read, the wall
+    clock for a sign request's expiry): every expiry of the read (a consent request's hold, a budget SIGN's, a sign
+    request's) is judged at ``now`` and no clock is read, so the result is a function of the stores and ``now``; it
+    replaces ``clock``."""
     from levain.consent.questions import current_read_deadline
 
+    if now is not None:
+        clock = lambda: now  # noqa: E731
     qdir = Path(queue_dir)
     if deadline is None:
         deadline = current_read_deadline()        # the hook's one bound, when this read runs under it
@@ -249,14 +256,14 @@ def read_extras(queue_dir: Path | str, clock: Any = None, *, deadline: float | N
         try:
             questions_conn = stack.enter_context(_snapshot(qdir / "questions.db", deadline))
             w, at = _records(qdir, clock, deadline=deadline, coord_conn=coord_conn, queue_conn=queue_conn,
-                             questions_conn=questions_conn)
+                             questions_conn=questions_conn, now=now)
             threads = {r["reply_id"]: t for t, rs in w["threads"].items() for r in rs}
             unresolved_ids = {str(r.get("reply_id")) for r in w["unresolved"]}
             for rec in sorted([*_recs(w), *w["unresolved"]],
                               key=lambda r: (at.get(r.get("reply_id")) or "", str(r.get("reply_id")))):
                 try:
                     _one_record(rec, str(rec.get("reply_id")) in unresolved_ids, threads, at, undecided, qdir, out,
-                                pointed, queue_conn)
+                                pointed, queue_conn, now)
                 except Exception as exc:  # noqa: BLE001 - one record that cannot be read is listed, never the source lost
                     if rec.get("kind") == "answer":
                         continue                  # an escalation that cannot be read: its question is still listed
@@ -307,8 +314,9 @@ def _unreadable_sign(rec: Mapping[str, Any], at: Mapping[str, str], why: str) ->
 
 def _one_record(rec: dict[str, Any], unresolved: bool, threads: dict[str, str], at: dict[str, str],
                 undecided: dict[str, dict[str, Any]], qdir: Path, out: Extras, pointed: set[str],
-                queue_conn: sqlite3.Connection | None = None) -> None:
-    """One coordinator record onto ``out``: an ANSWER rides its question, a SIGN or budget SIGN is an item."""
+                queue_conn: sqlite3.Connection | None = None, now: Any = None) -> None:
+    """One coordinator record onto ``out``: an ANSWER rides its question, a SIGN or budget SIGN is an item. ``now``:
+    the instant a sign request's expiry is judged at (default ``None``: the wall clock)."""
     from levain.coordinator import budget
 
     if rec["kind"] == "answer":
@@ -350,7 +358,7 @@ def _one_record(rec: dict[str, Any], unresolved: bool, threads: dict[str, str], 
         blocks = f"thread {_line(thread, 80)}" if thread else "the gated call"
         origin = (f"consent request {_line(rec['ref_id'], 120)}"
                   + (f" (gap #{_line(data['gap'], 20)})" if data["gap"] else "") + (", undecided" if u else ""))
-        menu = sign_request_menu(qdir, rec["ref_id"]) if not unresolved else None
+        menu = sign_request_menu(qdir, rec["ref_id"], now=now) if not unresolved else None
         if menu is not None:                      # a levain sign request: ITS options, ITS deny, by explicit key
             options = menu["labels"]
             data.update({k: menu[k] for k in ("menu", "version", "texts", "no_letters")})
@@ -369,7 +377,7 @@ def _one_record(rec: dict[str, Any], unresolved: bool, threads: dict[str, str], 
         pointed.add(rec["ref_id"])                # listed by this SIGN: its UNDECIDED request is not listed again
 
 
-def sign_request_menu(qdir: Path | str, request_id: object) -> dict[str, Any] | None:
+def sign_request_menu(qdir: Path | str, request_id: object, *, now: Any = None) -> dict[str, Any] | None:
     """The band's menu for the levain sign request filed under ``request_id``, or ``None`` when there is no such
     request file. Built from the request's OWN options (S3 fix round 2, codex 2):
 
@@ -379,7 +387,8 @@ def sign_request_menu(qdir: Path | str, request_id: object) -> dict[str, Any] | 
     - a request that cannot be signed (refused, expired, already decided) or whose options do not fit the band's six
       letters: NO letters (``no_letters`` says why); it is settled on the cockpit's sign sheet itself.
 
-    ``version`` is the request file's SHA-256 the menu was read from: a pick on a file changed since opens nothing."""
+    ``version`` is the request file's SHA-256 the menu was read from: a pick on a file changed since opens nothing.
+    ``now`` (an aware datetime; default ``None`` = the wall clock): the instant the request's expiry is judged at."""
     from datetime import datetime, timezone
 
     from levain.consent import sign
@@ -398,7 +407,7 @@ def sign_request_menu(qdir: Path | str, request_id: object) -> dict[str, Any] | 
         return {**base, "no_letters": "the sign request cannot be signed (it is malformed): deny it on its sheet"}
     if state != "open":
         return {**base, "no_letters": f"the sign request is already {state}"}
-    if req.expires_at is not None and req.expires_at <= datetime.now(timezone.utc):
+    if req.expires_at is not None and req.expires_at <= (now if now is not None else datetime.now(timezone.utc)):
         return {**base, "no_letters": "the sign request has expired: nothing can be signed"}
     if not req.options:
         return {**base, "menu": (("sign", None), ("deny", None)), "labels": ("sign it", "deny it (nothing is signed)")}

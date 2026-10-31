@@ -155,15 +155,19 @@ def _thread_of(conn: sqlite3.Connection, store: CoordStore, request_id: str, ses
     return ln.threads[0] if ln is not None and ln.role == "worker" and len(ln.threads) == 1 else None
 
 
-def _band(qdir: Path, conn: sqlite3.Connection | None = None, numbering: bool = True) -> dict[str, Any]:
+def _band(qdir: Path, conn: sqlite3.Connection | None = None, numbering: bool = True,
+          now: datetime | None = None) -> dict[str, Any]:
     """The NEEDS YOU band as the card carries it: ``{"text", "shown", "error"}``. Showing the band numbers its items
-    (a first show, as ``levain band`` does); a band that cannot be rendered is said, never an empty band. ``conn``:
-    the card's own coordinator snapshot, so the band and "waiting on you" are read from the same one."""
+    (a first show, as ``levain band`` does) ONLY when ``numbering`` is true (the default); with ``numbering=False``
+    nothing is written and an item with no number is listed ``new (number pending):``. A band that cannot be
+    rendered is said, never an empty band. ``conn``: the card's own coordinator snapshot, so the band and "waiting
+    on you" are read from the same one. ``now`` (an aware datetime; default ``None`` = the wall clock): the instant
+    every expiry in the band is judged at."""
     from levain import band_view
     from levain.consent.questions import QuestionStore
 
     try:
-        r = band_view.render_full(QuestionStore(qdir), coord_conn=conn, numbering=numbering)
+        r = band_view.render_full(QuestionStore(qdir), coord_conn=conn, numbering=numbering, now=now)
     except Exception as exc:  # noqa: BLE001 - named on the card
         return {"text": "", "shown": [], "error": f"{type(exc).__name__}: {exc}"[:_FIELD]}
     return {"text": r.text, "shown": r.shown, "error": None}
@@ -206,7 +210,13 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
     read the queue again. ``review_total`` is the queue's open count when ``items`` is only a page of it (the card
     then counts the queue, not the page). ``now`` (an aware datetime; default ``None`` = the store's clock and the
     wall clock, as ever): the card stamps from it and the presence window is read at it, so the card is a pure
-    function of what it reads; given, the band is read WITHOUT numbering its items (nothing is written)."""
+    function of what it reads; given, the band is read WITHOUT numbering its items (nothing is written).
+
+    With ``now`` given, no wall-clock value reaches the output: every expiry (the budget SIGNs', the consent hold's, a
+    sign request's) is judged at ``now``, and the only clock reads left are ``time.monotonic()`` (the lock-wait bound)
+    and ``time.time_ns()`` (the band render's ``gen``, not part of the card). Two reads of the same stores at the same
+    ``now`` are equal. ``queue.db`` is read in its own short read-only connection inside ``waiting_on_you``; the
+    sqlite WAL sidecars (``-wal``/``-shm``) are touched by any reader, as ever."""
     if conn is None:
         with read_transaction(store.open_readonly) as own:
             return card(store, queue_dir=queue_dir, items=items, review_total=review_total, conn=own, now=now)
@@ -226,6 +236,7 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
         undecided = []
         errors.append(f"undecided: {exc}"[:_FIELD])
     budgets: list[dict[str, Any]] = []
+    at_dt = now                                   # the caller's aware datetime, or None for the store's clock
     if now is None:
         stamp = store._stamp()
         epoch = None
@@ -252,8 +263,8 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
         row["sign"] = None if sign is None else {"reply_id": sign[0], "open": budget.sign_open(conn, ref, now)}
         budgets.append(row)
     budgets.sort(key=lambda b: (not b["refusal"], b["thread_id"]))
-    waiting = review.waiting_on_you(store, sign_open=review.queue_request_open(qdir),
-                                    answer_open=review.question_open(qdir), conn=conn)
+    waiting = review.waiting_on_you(store, sign_open=review.queue_request_open(qdir, now=at_dt),
+                                    answer_open=review.question_open(qdir), conn=conn, now=at_dt)
     try:
         queue = review.list_items(store, conn=conn) if items is None else [i for i in items if i.state == "open"]
     except (sqlite3.Error, CoordError) as exc:
@@ -262,7 +273,7 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
     items_out = [{"item_id": i.item_id, "feed": i.feed, "thread_id": i.thread_id,
                   "authority_relevant": i.authority_relevant, "text": str(i.body.get("text", ""))[:_FIELD]}
                  for i in queue]
-    band = _band(qdir, conn, numbering=epoch is None)
+    band = _band(qdir, conn, numbering=epoch is None, now=at_dt)
     try:
         pres = _presence(qdir, epoch)
     except Exception as exc:  # noqa: BLE001 - named on the card

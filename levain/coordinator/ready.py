@@ -458,7 +458,16 @@ def list_ready(store: CoordStore | Path | str, *, all: bool = False, repo: str |
     the seat roster, CI waits: C12 reads those), derived. Without ``all``, only effectively-ready items. A store that
     cannot be read is named in ``unreadable`` (never "nothing waiting"); a store that was never made is no items.
     ``conn``: a read-only connection whose read transaction the caller already holds; the board is read on it (no
-    second open, one snapshot with the caller's other sections). Default ``None``: the board opens its own."""
+    second open, one snapshot with the caller's other sections). Default ``None``: the board opens its own.
+
+    With ``conn`` the board is a pure function of the store and ``generated``, so ``generated`` is REQUIRED (a
+    ``CoordError`` otherwise: the board must be stamped by the caller, never by this function's wall clock). ``conn`` is
+    trusted: it is not checked to be read-only or to be this store's, and the caller does the table-presence check
+    (a connection whose database has no board tables reads as an EMPTY board, NOT as ``unreadable``: only the default
+    path's ``open_readonly`` names a missing or foreign store, so a caller that holds the connection opened it through
+    ``store.open_readonly`` and has already had that answer)."""
+    if conn is not None and not generated:
+        raise CoordError("list_ready(conn=) needs generated: the board must be stamped by the caller")
     st = _store_of(store)
     merged: dict[str, Any] = dict(sources or {})
     given = merged.pop("unreadable", ())

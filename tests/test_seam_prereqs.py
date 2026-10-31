@@ -12,7 +12,7 @@ from levain import band_view
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.consent.questions import QuestionStore
 from levain.coordinator import morning, ready
-from levain.coordinator.store import CoordStore
+from levain.coordinator.store import CoordError, CoordStore
 
 OPTS = [("a", "A"), ("b", "B")]
 NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
@@ -174,3 +174,192 @@ def test_list_ready_with_conn_reads_the_callers_snapshot_not_a_later_write(world
         held = ready.list_ready(st, all=True, generated="g", conn=conn)
     assert [i["id"] for i in held["items"]] == ["x1"]
     assert [i["id"] for i in ready.list_ready(st, all=True, generated="g")["items"]] == ["x1", "x2"]
+
+
+# ---------------------------------------------------------------------- 4. no wall clock reaches the output
+# the real world of a busy morning: an open question, an UNDECIDED consent request with a coordinator SIGN on it (and a
+# levain sign request file of the same id, so the sign-menu expiry is judged), a budget-extension SIGN, a review item.
+import json
+import sys
+import datetime as _dt
+from datetime import timedelta
+
+from levain.consent import sign
+from levain.contracts.namespaces import REVIEW_CLEAR_NAMESPACE
+from levain.coordinator import review
+from tests.test_band_authority import ask, human_terminal, night, qdir, undecided  # noqa: F401 - fixtures
+from tests.test_band_authority import cq  # noqa: F401
+from tests.test_consent_queue import keys  # noqa: F401 - fixtures
+from tests.test_coordinator_envelope import ctx, repo, snapshot  # noqa: F401 - fixtures
+
+
+class WallClockRead(BaseException):
+    """BaseException on purpose: no `except Exception` in the band, the card or the sources can swallow it."""
+
+
+def _no_wall_clock(monkeypatch):
+    """Every ``datetime.now()`` / ``utcnow()`` / ``today()`` and ``time.time()`` raises: the ``datetime`` name of every
+    levain module that holds the real class (and the stdlib module's own, for a function-local import) is replaced by a
+    subclass whose clock reads raise. ``time.monotonic()`` and ``time.time_ns()`` stay: neither reaches an output."""
+    real = _dt.datetime
+
+    class Boom(real):
+        @classmethod
+        def now(cls, tz=None):
+            raise WallClockRead("datetime.now() read")
+
+        @classmethod
+        def utcnow(cls):
+            raise WallClockRead("datetime.utcnow() read")
+
+        @classmethod
+        def today(cls):
+            raise WallClockRead("datetime.today() read")
+
+    def boom():
+        raise WallClockRead("time.time() read")
+
+    for name, mod in list(sys.modules.items()):
+        if name.startswith(("levain", "tests")) and getattr(mod, "datetime", None) is real:
+            monkeypatch.setattr(mod, "datetime", Boom)
+    monkeypatch.setattr(_dt, "datetime", Boom)
+    monkeypatch.setattr(time, "time", boom)
+
+
+def _clone_request(qdir, src, new_id):
+    """A second row in ``queue.db`` with ``new_id``, a copy of the request ``src`` (the SIGN's request, whose sign file
+    the sign menu reads, is a consent request of its own id)."""
+    with sqlite3.connect(qdir / "queue.db") as c:
+        cols = [r[1] for r in c.execute("PRAGMA table_info(requests)")]
+        row = dict(zip(cols, c.execute("SELECT * FROM requests WHERE id = ?", (src,)).fetchone()))
+        row["id"] = new_id
+        c.execute(f"INSERT INTO requests ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                  [row[k] for k in cols])
+
+
+@pytest.fixture
+def busy(night, cq, qdir):  # noqa: F811
+    qs = QuestionStore(qdir)                                  # the DEFAULT clock: the wall clock
+    ask(qs, "rename helper?")
+    req = undecided(cq, night)                                # an UNDECIDED request with a coordinator SIGN on it
+    review.push_sign(night.store, night.T, req.id, "land thread", rec="a: tests green")
+    live = cq.file(agent="claude_code", agent_session_id="sess-live", tool_name="Bash",
+                   tool_input={"command": "echo live"}, cwd=night.c.path, hold=timedelta(hours=3))   # a PENDING one
+    lv = sign.file_levain_request(qdir, REVIEW_CLEAR_NAMESPACE, "levain review clear rv-" + "ab" * 16 + " open none",
+                                  title="t", ttl_s=10 * 365 * 86400)    # open far past T: its expiry is judged
+    _clone_request(qdir, live.id, lv)                         # and a SIGN on it: the sign menu reads its file
+    review.push_sign(night.store, night.T, lv, "clear the item", rec="a: signed on the sheet")
+    night.calls(7)                                            # past its budget: a budget-extension SIGN
+    night.leg()
+    review.file_know(night.store, night.T, "the coordinator noticed a thing", by="service")
+    return CoordStore(night.store.directory), qs, qdir        # a CoordStore on the DEFAULT clock too
+
+
+def test_card_band_and_ready_read_no_wall_clock_and_are_byte_identical(busy, monkeypatch):
+    st, qs, qdir = busy
+    T = datetime(2026, 10, 20, 13, 0, tzinfo=timezone.utc)      # an hour into the budget fixture's world (its stop is ahead)
+    # everything lazily imported is imported BEFORE the clock is taken away (a lazy import under the patch would keep it)
+    morning.card(st, queue_dir=qdir, now=T)
+    band_view.band_snapshot_readonly(qs, now=T)
+    _no_wall_clock(monkeypatch)
+    cards = [morning.card(st, queue_dir=qdir, now=T) for _ in range(2)]
+    bands = [band_view.band_snapshot_readonly(qs, now=T) for _ in range(2)]
+    with read_transaction(st.open_readonly) as c:
+        board = [ready.list_ready(st, all=True, generated="g", conn=c) for _ in range(2)]
+    for pair in (cards, bands, board):
+        assert json.dumps(pair[0], sort_keys=True) == json.dumps(pair[1], sort_keys=True)
+    c = cards[0]
+    # the world is not empty: the question, the SIGN on the request (its menu judged at T), the extension SIGN, the item
+    assert c["errors"] == [] and c["band"]["error"] is None
+    assert "rename helper?" in c["band"]["text"] and "extend a thread budget" in c["band"]["text"]
+    assert "SIGN: land thread" in c["band"]["text"] and "NEEDS YOU · 4 open" in c["band"]["text"]
+    assert len(c["review"]) == 1 and c["waiting"]["threads"]
+    assert {i["kind"] for i in bands[0]["items"]} >= {"information", "authority"} and len(bands[0]["items"]) == 4
+    assert bands[0]["failed"] is False and bands[0]["note"] != "" and bands[0]["pending"] is True
+
+
+def test_the_same_probe_fails_without_now(busy, monkeypatch):
+    st, qs, qdir = busy
+    morning.card(st, queue_dir=qdir)                 # the lazy imports, with the clock still there
+    _no_wall_clock(monkeypatch)
+    with pytest.raises(WallClockRead):
+        morning.card(st, queue_dir=qdir)
+    with pytest.raises(WallClockRead):
+        band_view.band_snapshot_readonly(qs)
+
+
+# ------------------------------------------------------------------ 2/3/6. the connection, the stamp, the edges
+def test_readonly_band_with_coord_conn_opens_no_second_coordinator_read(busy, monkeypatch):
+    st, qs, qdir = busy
+    T = datetime(2026, 10, 20, 13, 0, tzinfo=timezone.utc)
+    opens = []
+    real = st.open_readonly
+    monkeypatch.setattr(CoordStore, "open_readonly", lambda self, *a, **k: opens.append(1) or real(*a, **k))
+    own = band_view.band_snapshot_readonly(qs, now=T)
+    assert opens                                            # the default path opens its own coordinator read
+    opens.clear()
+    with read_transaction(st.open_readonly) as conn:
+        n = len(opens)
+        shared = band_view.band_snapshot_readonly(qs, now=T, coord_conn=conn)
+        assert len(opens) == n                              # none more: the caller's transaction is read
+    assert json.dumps(shared, sort_keys=True) == json.dumps(own, sort_keys=True)
+
+
+def test_card_hands_its_connection_and_now_to_the_band(busy, monkeypatch):
+    st, qs, qdir = busy
+    T = datetime(2026, 10, 20, 13, 0, tzinfo=timezone.utc)
+    seen = {}
+    real = band_view.render_full
+    monkeypatch.setattr(band_view, "render_full", lambda *a, **k: seen.update(k) or real(*a, **k))
+    morning.card(st, queue_dir=qdir, now=T)
+    assert seen["now"] == T and seen["numbering"] is False and seen["coord_conn"] is not None
+
+
+def test_list_ready_with_conn_refuses_to_stamp_itself(world):
+    st, qs, qdir = world
+    with read_transaction(st.open_readonly) as conn:
+        for missing in (None, ""):
+            with pytest.raises(CoordError, match="generated"):
+                ready.list_ready(st, all=True, generated=missing, conn=conn)
+    assert ready.list_ready(st, all=True)["generated"]       # no conn: the board stamps itself, as ever
+
+
+def test_list_ready_with_conn_trusts_the_connection_a_tableless_one_reads_empty(tmp_path):
+    """Documented in the docstring: with ``conn`` the caller does the table-presence check (the default path names a
+    store it cannot open as ``unreadable``; a bare connection to a database with no board tables is just empty)."""
+    (tmp_path / "dispatch").mkdir(mode=0o700)
+    st = CoordStore(tmp_path / "dispatch")
+    c = sqlite3.connect(":memory:")
+    c.execute("BEGIN")
+    out = ready.list_ready(st, all=True, generated="g", conn=c)
+    assert out["items"] == [] and out["unreadable"] == []
+
+
+def test_card_with_now_on_a_pre_band_store_creates_no_band_table(world):
+    st, qs, qdir = world
+    before = _bytes(qdir)
+    assert _tables(qs).isdisjoint({"band_items", "band_views", "band_closed_shown"})
+    morning.card(st, queue_dir=qdir, now=NOW)
+    assert _tables(qs).isdisjoint({"band_items", "band_views", "band_closed_shown"}) and _bytes(qdir) == before
+
+
+def test_readonly_band_of_an_unreadable_questions_store_raises_it_and_the_card_says_it(world):
+    import os
+
+    from levain.consent.questions import QuestionStoreError
+
+    st, qs, qdir = world
+    try:
+        os.chmod(qdir, 0o555)                               # reachable by group or others: QuestionStore refuses it
+        with pytest.raises(QuestionStoreError):
+            band_view.band_snapshot_readonly(qs)
+        c = morning.card(st, queue_dir=qdir, now=NOW)       # the card names it, never raises it
+        assert c["band"]["error"].startswith("QuestionStoreError")
+        os.chmod(qdir, 0o500)
+        os.chmod(qs.path, 0o400)                            # a read-only file: sqlite would write its WAL index
+        with pytest.raises(sqlite3.OperationalError):
+            band_view.band_snapshot_readonly(qs)
+        assert morning.card(st, queue_dir=qdir, now=NOW)["band"]["error"].startswith("OperationalError")
+    finally:
+        os.chmod(qdir, 0o700)
+        os.chmod(qs.path, 0o600)
